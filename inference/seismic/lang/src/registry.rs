@@ -7,14 +7,16 @@
 //!
 //! W1 owns the interning over the existing `intrinsics` and `repr` tables.
 
+pub use crate::external_tables::RepackTable;
 use crate::ids::{CapabilityId, IntrinsicId, RepresentationConversionId, RepresentationId};
 use crate::types::DType;
 use magnitude_ggml::Encoding;
 
 pub use crate::repr::{
     CodeInterpretation, CodeKind, CoefficientAxes, CoefficientKind, DecodeAxes, DecodeComponent,
-    DecodeRecipe, DecodeStep, DecodeTemp, FloatCodeFormat, GRID_SIGN_BITS, GRID_VALUES, GridCodes,
-    LocalCodes, MinimumSign, OperandRecipe, PlaneEncoding, PlaneField, PlaneSchema, QuantizedComponent, ScaleEncoding,
+    DecodeRecipe, DecodeStep, DecodeTemp, FloatCodeFormat, GridCodes, LocalCodes, LookupTable,
+    MinimumSign, OperandRecipe, PlaneEncoding, PlaneField, PlaneSchema, QuantizedComponent,
+    ScaleEncoding, GRID_SIGN_BITS, GRID_VALUES,
 };
 
 /// Backends are a closed set.
@@ -69,6 +71,17 @@ impl BackendName {
         }
     }
 
+    /// The dialect of the backend's native sources; `None` for the CPU,
+    /// whose native implementations are Rust.
+    pub const fn source_dialect(self) -> Option<SourceDialect> {
+        match self {
+            BackendName::Cpu => None,
+            BackendName::Metal => Some(SourceDialect::Metal),
+            BackendName::Cuda => Some(SourceDialect::Cuda),
+            BackendName::Vulkan => Some(SourceDialect::Vulkan),
+        }
+    }
+
     /// Whether the backend is a compiler target for planned code (portable
     /// bodies and `lower … for` bodies). A native-only backend runs only
     /// authored `native` implementations.
@@ -80,10 +93,21 @@ impl BackendName {
     }
 }
 
+/// The source dialect of a backend's native implementations: the sources a
+/// build validates against their ABI and the runtime renders a prefix for
+/// (MSL, CUDA C++, GLSL). A CPU native implementation is Rust compiled into
+/// the embedding crate, so it has none ([`BackendName::source_dialect`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SourceDialect {
+    Metal,
+    Cuda,
+    Vulkan,
+}
+
 /// Revision of the whole registry. Any semantic change to a primitive,
 /// capability, intrinsic, or representation changes this string, and with it
 /// every cache identity.
-pub const REGISTRY_REVISION: &str = "seismic-registry-v15";
+pub const REGISTRY_REVISION: &str = "seismic-registry-v16";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapabilityInfo {
@@ -403,6 +427,10 @@ impl RepresentationForm {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExternalPacketLayout {
     pub packet_size: u32,
+    /// The alignment every packet of a stored tensor has, which a tensor of
+    /// the representation starts at (allocations, and views at offsets,
+    /// are checked against it): kernels read a source packet in units of
+    /// at most this many bytes.
     pub packet_alignment: u32,
     pub logical_group: u32,
     pub packing_axis: PackingAxis,
@@ -416,10 +444,30 @@ pub struct RepresentationConversion {
     pub id: RepresentationConversionId,
     pub source: RepresentationId,
     pub destination: RepresentationId,
+    /// The source's packets (its `RepresentationKind::External`).
+    pub source_layout: &'static ExternalPacketLayout,
+    /// The destination's layout.
+    pub destination_layout: ConversionLayout,
     /// Source packet -> the destination representation's packet form.
     pub recipe: PacketRepackRecipe,
-    /// How converted packets are placed in the destination layout.
-    pub kind: ConversionKind,
+}
+
+/// The layout of a conversion's destination: its `RepresentationKind`,
+/// which is packed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConversionLayout {
+    Packet(&'static PackedPacketLayout),
+    Rows(&'static PackedRowLayout),
+}
+
+impl ConversionLayout {
+    /// The destination's packet form.
+    pub fn packet(self) -> &'static PackedPacketLayout {
+        match self {
+            Self::Packet(packet) => packet,
+            Self::Rows(rows) => &rows.packet,
+        }
+    }
 }
 
 impl RepresentationConversion {
@@ -431,11 +479,8 @@ impl RepresentationConversion {
     /// conversion quiets a signaling NaN where the host reference widens its
     /// bits. Each such field has the high bit of its exponent cleared.
     pub fn admit_source(&self, packets: &mut [u8]) {
-        let RepresentationKind::External(source) = &representation_info(self.source).kind else {
-            unreachable!("a registered conversion's source is external storage")
-        };
         let fields = self.recipe.converted_f16_fields();
-        for packet in packets.chunks_exact_mut(source.packet_size as usize) {
+        for packet in packets.chunks_exact_mut(self.source_layout.packet_size as usize) {
             for field in &fields {
                 let bit = (field + 14) as usize;
                 packet[bit / 8] &= !(1 << (bit % 8));
@@ -444,17 +489,20 @@ impl RepresentationConversion {
     }
 }
 
-/// The placement of a conversion's packets in its destination layout.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ConversionKind {
-    /// One source packet becomes one resident packet (`packet` layout).
-    Packet,
-    /// One source packet becomes one group column of each plane of its row
-    /// (`rows16`).
-    Row,
-    /// The source packets of `rows` rows at one group column become one
-    /// row tile, whose code planes are permuted across those rows (`mma16`).
-    RowTile { rows: u32 },
+/// `count` deterministic pseudo-random bytes from `seed` (xorshift):
+/// arbitrary source bytes, which [`RepresentationConversion::admit_source`]
+/// brings into a conversion's domain. For tests (`fixtures`).
+#[cfg(any(test, feature = "fixtures"))]
+pub fn pseudo_random_bytes(seed: u64, count: usize) -> Vec<u8> {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ seed;
+    (0..count)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
 }
 
 /// Exact, validated ownership for one external packet -> resident packet-form
@@ -481,7 +529,12 @@ impl PacketRepackRecipe {
                 | RepackExpr::I32ToF32(value)
                 | RepackExpr::ScaleF32 { value, .. } => collect(value, fields),
                 RepackExpr::Lookup { index, .. } => collect(index, fields),
-                RepackExpr::BitOr(left, right) | RepackExpr::MultiplyF32(left, right) => {
+                RepackExpr::BitOr(left, right)
+                | RepackExpr::MultiplyF32(left, right)
+                | RepackExpr::NegateIf {
+                    value: left,
+                    sign: right,
+                } => {
                     collect(left, fields);
                     collect(right, fields);
                 }
@@ -546,7 +599,14 @@ pub enum RepackExpr {
     /// expression whose range lies within the table.
     Lookup {
         index: Box<RepackExpr>,
-        table: &'static [i32],
+        table: RepackTable,
+    },
+    /// The integer `value`, negated (two's complement) where the one-bit
+    /// integer `sign` is 1: a sign kept apart from a magnitude, so a table
+    /// holds magnitudes only.
+    NegateIf {
+        value: Box<RepackExpr>,
+        sign: Box<RepackExpr>,
     },
 }
 
@@ -852,6 +912,10 @@ pub enum RowPlaneRole {
 
 impl RowPlaneRole {
     pub const ALL: [Self; 4] = [Self::Codes, Self::High, Self::Scales, Self::Supers];
+    /// The roles of the planes holding codes: those of
+    /// [`RowPlaneContent::Codes`], `Grids` and `Records`
+    /// ([`RowPlaneInfo::role`]).
+    pub const CODES: [Self; 2] = [Self::Codes, Self::High];
 
     pub const fn name(self) -> &'static str {
         match self {
@@ -1023,16 +1087,12 @@ impl PackedRowLayout {
         let stride = geometry.stride;
         let offset = geometry.offsets[plane];
         match self.layout {
-            Layout::Rows16 => (row * stride + offset) * 8 + column * bits,
-            Layout::Rows8 => {
+            Layout::Rows16 | Layout::Rows8 => {
                 let group = u64::from(self.packet.group);
-                let group_bytes = u64::from(self.planes[plane].bytes_per_group);
-                let local = column % group;
-                let byte = row / 8 * stride * 8
-                    + offset * 8
-                    + column / group * group_bytes * 8
-                    + row % 8 * group_bytes;
-                byte * 8 + local * bits
+                let byte = self
+                    .share_byte(geometry, row, column / group, plane)
+                    .expect("a rows16 or rows8 share is its bytes");
+                byte * 8 + column % group * bits
             }
             Layout::Rows32 => interleaved(
                 ROWS32_TILE_ROWS,
@@ -1061,6 +1121,45 @@ impl PackedRowLayout {
             }
             Layout::Packet => unreachable!("a row layout is never `packet`"),
         }
+    }
+
+    /// The first byte of storage group `packet`'s share of row plane
+    /// `plane` of stored row `row` (its `bytes_per_group` bytes, one after
+    /// another), in the layouts that keep a share's bytes together: every
+    /// plane of `rows16` and `rows8` (whose tile holds a group's shares of
+    /// its rows one after another), and the group planes of `rows32` and
+    /// `mma16`. `None` for a code plane of `rows32` or `mma16`
+    /// (`code_bit`).
+    pub fn share_byte(
+        &self,
+        geometry: &RowGeometry,
+        row: u64,
+        packet: u64,
+        plane: usize,
+    ) -> Option<u64> {
+        let group_bytes = u64::from(self.planes[plane].bytes_per_group);
+        let (stride, offset, tile) = (geometry.stride, geometry.offsets[plane], self.tile_rows());
+        let groups = matches!(self.planes[plane].content, RowPlaneContent::Groups { .. });
+        Some(match self.layout {
+            Layout::Rows16 | Layout::Rows8 => {
+                row / tile * stride * tile
+                    + offset * tile
+                    + packet * group_bytes * tile
+                    + row % tile * group_bytes
+            }
+            // A tile's group plane is `[row][plane bytes of a row]`: every
+            // row's groups are contiguous, and the tile's rows follow one
+            // another.
+            Layout::Rows32 if groups => {
+                row / tile * stride * tile
+                    + offset * tile
+                    + row % tile * geometry.bytes_per_row[plane]
+                    + packet * group_bytes
+            }
+            Layout::Mma16 if groups => row * stride + offset + packet * group_bytes,
+            Layout::Rows32 | Layout::Mma16 => return None,
+            Layout::Packet => unreachable!("a row layout is never `packet`"),
+        })
     }
 
     /// Bytes of one storage group's entries in a `records` tile: its 16 rows'
@@ -1105,33 +1204,33 @@ impl PackedRowLayout {
         }
     }
 
-    /// Absolute bit holding bit `bit` of packet-form plane `plane` of packet
-    /// (storage group) `packet` of stored row `row`.
-    pub fn packet_bit(
-        &self,
-        geometry: &RowGeometry,
-        row: u64,
-        packet: u64,
-        plane: usize,
-        bit: u32,
-    ) -> u64 {
-        let first = packet * u64::from(self.packet.group);
+    /// The row plane holding bit `bit` of packet-form plane `plane`, and the
+    /// bit of one storage group's share of that plane holding it. A code
+    /// plane's share is the group's columns in order, `bits` each (as a
+    /// `rows16` row holds them): plane 0's codes sliced into code planes, or
+    /// its vector-code entries kept whole in a grids or records plane (an
+    /// entry is its columns' bits), and a carried plane's bit `j` of field
+    /// `f` at the carried bit of entry `j` of the field's group. A groups
+    /// plane's share is its listed packet planes' bytes in list order; a
+    /// records plane's share is its entries, then its factors' bytes in list
+    /// order.
+    pub fn group_bit(&self, plane: usize, bit: u32) -> (usize, u32) {
         let entries = self.planes.iter().position(|candidate| {
             matches!(
                 candidate.content,
                 RowPlaneContent::Grids { .. } | RowPlaneContent::Records { .. }
             )
         });
-        // Plane 0's codes are sliced into code planes, or its vector-code
-        // entries kept whole in a grids plane, each an entry's columns.
         if plane == 0 {
             let code_bits = self.packet.planes[0].entry_bits;
             let (code, code_bit) = (bit / code_bits, bit % code_bits);
             if let Some(index) = entries {
-                let column = first + u64::from(code * GRID_VALUES);
-                return self.code_bit(geometry, index, row, column) + u64::from(code_bit);
+                return (
+                    index,
+                    code * GRID_VALUES * self.column_bits(index) + code_bit,
+                );
             }
-            let (index, shift) = self
+            return self
                 .planes
                 .iter()
                 .enumerate()
@@ -1139,16 +1238,22 @@ impl PackedRowLayout {
                     RowPlaneContent::Codes { shift, bits }
                         if (shift..shift + bits).contains(&code_bit) =>
                     {
-                        Some((index, shift))
+                        Some((index, code * bits + code_bit - shift))
                     }
                     _ => None,
                 })
                 .expect("every code bit has one row code plane");
-            return self.code_bit(geometry, index, row, first + u64::from(code))
-                + u64::from(code_bit - shift);
         }
-        // Carried coefficient codes: bit `j` of field `f` at the carried bit
-        // of entry `j` of the field's group.
+        // The bytes of `planes` before `plane`'s, when it is one of them.
+        let prefix = |planes: &[u32]| {
+            let position = planes.iter().position(|member| *member as usize == plane)?;
+            Some(
+                planes[..position]
+                    .iter()
+                    .map(|member| self.packet.planes[*member as usize].bytes_per_group)
+                    .sum::<u32>(),
+            )
+        };
         if let Some(index) = entries {
             let (carried, factors) = match &self.planes[index].content {
                 RowPlaneContent::Grids { carried, .. } => (*carried, None),
@@ -1157,87 +1262,95 @@ impl PackedRowLayout {
                 } => (Some(*carried), Some(factors)),
                 _ => unreachable!(),
             };
+            let bits = self.column_bits(index);
             if carried == Some(plane as u32) {
                 let codes = &self.packet.planes[plane];
                 let (field, j) = (bit / codes.entry_bits, bit % codes.entry_bits);
                 let entry = field * (codes.group / GRID_VALUES) + j;
-                let column = first + u64::from(entry * GRID_VALUES);
-                return self.code_bit(geometry, index, row, column)
-                    + u64::from(self.grid().carried_bit());
+                return (
+                    index,
+                    entry * GRID_VALUES * bits + self.grid().carried_bit(),
+                );
             }
             if let Some(factors) = factors {
-                let position = factors
-                    .iter()
-                    .position(|member| *member as usize == plane)
+                let prefix = prefix(factors)
                     .expect("every packet plane of a records layout is in its record");
-                let prefix = factors[..position]
-                    .iter()
-                    .map(|member| u64::from(self.packet.planes[*member as usize].bytes_per_group))
-                    .sum::<u64>();
-                let width = factors
-                    .iter()
-                    .map(|member| u64::from(self.packet.planes[*member as usize].bytes_per_group))
-                    .sum::<u64>();
-                let byte = self.record_byte(geometry, row, packet, Record::Factors, |r| {
-                    (2 * (r % 8) + r / 8) * width + prefix + u64::from(bit / 8)
-                });
-                return byte * 8 + u64::from(bit % 8);
+                return (index, self.packet.group * bits + prefix * 8 + bit);
             }
         }
-        let (index, prefix) = self
-            .planes
+        self.planes
             .iter()
             .enumerate()
             .find_map(|(index, candidate)| match &candidate.content {
-                RowPlaneContent::Groups { planes, .. } => {
-                    let position = planes.iter().position(|member| *member as usize == plane)?;
-                    let prefix = planes[..position]
-                        .iter()
-                        .map(|member| {
-                            u64::from(self.packet.planes[*member as usize].bytes_per_group)
-                        })
-                        .sum::<u64>();
-                    Some((index, prefix))
-                }
+                RowPlaneContent::Groups { planes, .. } => Some((index, prefix(planes)? * 8 + bit)),
                 RowPlaneContent::Codes { .. }
                 | RowPlaneContent::Grids { .. }
                 | RowPlaneContent::Records { .. } => None,
             })
-            .expect("every packet plane has one row plane");
-        let group_bytes = u64::from(self.planes[index].bytes_per_group);
-        let byte = match self.layout {
-            Layout::Rows8 => {
-                let tile = self.tile_rows();
-                row / tile * geometry.stride * tile
-                    + geometry.offsets[index] * tile
-                    + packet * group_bytes * tile
-                    + row % tile * group_bytes
-                    + prefix
+            .expect("every packet plane has one row plane")
+    }
+
+    /// Bits a column of code plane `plane` holds.
+    pub(crate) fn column_bits(&self, plane: usize) -> u32 {
+        match self.planes[plane].content {
+            RowPlaneContent::Codes { bits, .. }
+            | RowPlaneContent::Grids { bits, .. }
+            | RowPlaneContent::Records { bits, .. } => bits,
+            RowPlaneContent::Groups { .. } => {
+                panic!("row plane `{}` holds no codes", self.planes[plane].name)
             }
-            // A tile's group plane is `[row][plane bytes of a row]`: every
-            // row's groups are contiguous, and the tile's rows follow one
-            // another.
-            Layout::Rows32 => {
-                let tile = self.tile_rows();
-                row / tile * geometry.stride * tile
-                    + geometry.offsets[index] * tile
-                    + row % tile * geometry.bytes_per_row[index]
-                    + packet * group_bytes
-                    + prefix
-            }
-            Layout::Rows16 | Layout::Mma16 => {
-                row * geometry.stride + geometry.offsets[index] + packet * group_bytes + prefix
-            }
-            Layout::Packet => unreachable!("a row layout is never `packet`"),
+        }
+    }
+
+    /// Absolute bit holding bit `bit` of packet-form plane `plane` of packet
+    /// (storage group) `packet` of stored row `row`: its storage group's
+    /// share bit (`group_bit`) placed by the layout.
+    pub fn packet_bit(
+        &self,
+        geometry: &RowGeometry,
+        row: u64,
+        packet: u64,
+        plane: usize,
+        bit: u32,
+    ) -> u64 {
+        let (index, share) = self.group_bit(plane, bit);
+        // A code plane's share bit: its column's code bit.
+        let code = |bits: u32| {
+            let column = packet * u64::from(self.packet.group) + u64::from(share / bits);
+            self.code_bit(geometry, index, row, column) + u64::from(share % bits)
         };
-        byte * 8 + u64::from(bit)
+        match &self.planes[index].content {
+            RowPlaneContent::Codes { bits, .. } | RowPlaneContent::Grids { bits, .. } => {
+                code(*bits)
+            }
+            RowPlaneContent::Records { bits, .. } if share < self.packet.group * bits => {
+                code(*bits)
+            }
+            RowPlaneContent::Records { bits, factors, .. } => {
+                let width = factors
+                    .iter()
+                    .map(|member| u64::from(self.packet.planes[*member as usize].bytes_per_group))
+                    .sum::<u64>();
+                let within = share - self.packet.group * bits;
+                let byte = self.record_byte(geometry, row, packet, Record::Factors, |r| {
+                    (2 * (r % 8) + r / 8) * width + u64::from(within / 8)
+                });
+                byte * 8 + u64::from(within % 8)
+            }
+            RowPlaneContent::Groups { .. } => {
+                let byte = self
+                    .share_byte(geometry, row, packet, index)
+                    .expect("a group plane's share is its bytes");
+                byte * 8 + u64::from(share)
+            }
+        }
     }
 
     /// Whether bit `bit` of packet-form plane `plane` holds information the
     /// layout places. A carried grid representation's packet entries keep
     /// their carried bits zero: the layout's entries hold the coefficient
     /// codes there instead.
-    fn occupies(&self, plane: usize, bit: u32) -> bool {
+    pub fn occupies(&self, plane: usize, bit: u32) -> bool {
         !(plane == 0
             && self
                 .carried()
@@ -1450,6 +1563,10 @@ pub fn representation_conversion_info(
     id: RepresentationConversionId,
 ) -> &'static RepresentationConversion {
     internals::representation_conversion_info(id)
+}
+/// Every registered conversion, in id order.
+pub fn representation_conversions() -> &'static [RepresentationConversion] {
+    internals::representation_conversions()
 }
 /// A GGUF source the registry converts from: its ggml type, the type's
 /// blocks one source packet holds, its storage name, and the resident
@@ -1793,7 +1910,9 @@ pub(crate) mod internals {
         /// Every row of one capability sharing one name, in declaration order.
         overloads: Vec<(CapabilityId, &'static str, Vec<IntrinsicId>)>,
         representations: Vec<RepresentationInfo>,
-        conversions: Vec<RepresentationConversion>,
+        /// Built from the representations once they are static
+        /// ([`conversions`]): a conversion holds its endpoints' layouts.
+        conversions: OnceLock<Vec<RepresentationConversion>>,
     }
 
     fn build() -> Tables {
@@ -1847,6 +1966,13 @@ pub(crate) mod internals {
                 .expect("a GGUF source packet fits u32 values");
             (source.name, packet_size, logical_group, source.resident)
         });
+        // A GGUF packet is declared aligned to the largest power of two, to
+        // 4 (the widest unit a kernel reads a source packet in), dividing
+        // its size. Device allocations are aligned further; a tensor's data
+        // in its file starts at a multiple of `general.alignment`, any power
+        // of two, so a view of the file's pages that falls short is not
+        // made, and the importer uploads the tensor instead (the engine's
+        // `ImportSource::acquire`).
         for (name, packet_size, logical_group, _) in external_specs {
             representations.push(RepresentationInfo {
                 id: RepresentationId::new(representations.len() as u32),
@@ -1855,7 +1981,7 @@ pub(crate) mod internals {
                 layout: Layout::Packet,
                 kind: RepresentationKind::External(ExternalPacketLayout {
                     packet_size,
-                    packet_alignment: 1,
+                    packet_alignment: crate::repack::alignment(packet_size).min(4),
                     logical_group,
                     packing_axis: PackingAxis::Last,
                 }),
@@ -1891,59 +2017,6 @@ pub(crate) mod internals {
                         operands,
                     });
                 }
-            }
-        }
-        let mut conversions: Vec<RepresentationConversion> = Vec::new();
-        for (source_name, _, _, destination_name) in external_specs {
-            let source = representations
-                .iter()
-                .find(|representation| representation.name == source_name)
-                .expect("registered external representation is present")
-                .id;
-            for destination in representations
-                .iter()
-                .filter(|representation| representation.representation == destination_name)
-            {
-                let (packet, kind) = match &destination.kind {
-                    RepresentationKind::Packed(packet) => (packet, ConversionKind::Packet),
-                    RepresentationKind::PackedRows(rows) => (
-                        &rows.packet,
-                        match rows.layout {
-                            Layout::Rows16 => ConversionKind::Row,
-                            Layout::Rows8 => ConversionKind::RowTile { rows: 8 },
-                            Layout::Rows32 => ConversionKind::RowTile {
-                                rows: ROWS32_TILE_ROWS as u32,
-                            },
-                            Layout::Mma16 => ConversionKind::RowTile {
-                                rows: MMA_TILE_ROWS as u32,
-                            },
-                            Layout::Packet => unreachable!("a row layout is never `packet`"),
-                        },
-                    ),
-                    RepresentationKind::Dense(_) | RepresentationKind::External(_) => {
-                        panic!("external conversion destination is not packed")
-                    }
-                };
-                let recipe = external_repack_recipe(source_name, packet);
-                validate_repack_recipe(
-                    representations[source.index()].kind.clone(),
-                    packet,
-                    &recipe,
-                );
-                assert!(
-                    conversions.iter().all(|conversion| {
-                        conversion.source != source || conversion.destination != destination.id
-                    }),
-                    "external representation `{source_name}` has more than one conversion into `{}`",
-                    destination.name
-                );
-                conversions.push(RepresentationConversion {
-                    id: RepresentationConversionId::new(conversions.len() as u32),
-                    source,
-                    destination: destination.id,
-                    recipe,
-                    kind,
-                });
             }
         }
         let dense_id = |dtype: DType| RepresentationId::new(u32::from(dtype.ordinal()));
@@ -2080,8 +2153,57 @@ pub(crate) mod internals {
             intrinsic_ranges,
             overloads,
             representations,
-            conversions,
+            conversions: OnceLock::new(),
         }
+    }
+
+    /// The registered conversions between `representations`: of each
+    /// external source into every element of its resident representation.
+    fn conversions(
+        representations: &'static [RepresentationInfo],
+    ) -> Vec<RepresentationConversion> {
+        let mut conversions: Vec<RepresentationConversion> = Vec::new();
+        for gguf in GGUF_SOURCES {
+            let source = representations
+                .iter()
+                .find(|representation| representation.name == gguf.name)
+                .expect("registered external representation is present");
+            let RepresentationKind::External(source_layout) = &source.kind else {
+                panic!("representation conversion source is not external storage")
+            };
+            for destination in representations
+                .iter()
+                .filter(|representation| representation.representation == gguf.resident)
+            {
+                let destination_layout = match &destination.kind {
+                    RepresentationKind::Packed(packet) => ConversionLayout::Packet(packet),
+                    RepresentationKind::PackedRows(rows) => ConversionLayout::Rows(rows),
+                    RepresentationKind::Dense(_) | RepresentationKind::External(_) => {
+                        panic!("external conversion destination is not packed")
+                    }
+                };
+                let packet = destination_layout.packet();
+                let recipe = external_repack_recipe(gguf.name, packet);
+                validate_repack_recipe(source_layout, packet, &recipe);
+                assert!(
+                    conversions.iter().all(|conversion| {
+                        conversion.source != source.id || conversion.destination != destination.id
+                    }),
+                    "external representation `{}` has more than one conversion into `{}`",
+                    gguf.name,
+                    destination.name
+                );
+                conversions.push(RepresentationConversion {
+                    id: RepresentationConversionId::new(conversions.len() as u32),
+                    source: source.id,
+                    destination: destination.id,
+                    source_layout,
+                    destination_layout,
+                    recipe,
+                });
+            }
+        }
+        conversions
     }
 
     /// The physical planes of one packed representation, per storage group.
@@ -2398,7 +2520,7 @@ pub(crate) mod internals {
     fn e2m1_positive_zero(bit: u32) -> RepackExpr {
         RepackExpr::Lookup {
             index: Box::new(RepackExpr::SourceBits { bit, width: 4 }),
-            table: &crate::external_tables::E2M1_POSITIVE_ZERO,
+            table: RepackTable::E2m1PositiveZero,
         }
     }
 
@@ -2758,27 +2880,23 @@ pub(crate) mod internals {
                                         bits: 8,
                                     }),
                                 );
-                                let sign = RepackExpr::SourceBits {
-                                    bit: (74 + 4 * block + group) * 8 + slot,
-                                    width: 1,
-                                };
-                                let index = RepackExpr::OffsetI32 {
-                                    value: Box::new(RepackExpr::ShiftLeft {
-                                        value: Box::new(RepackExpr::BitOr(
-                                            Box::new(point),
-                                            Box::new(RepackExpr::ShiftLeft {
-                                                value: Box::new(sign),
-                                                bits: 9,
-                                            }),
-                                        )),
-                                        bits: 2,
+                                let magnitude = RepackExpr::Lookup {
+                                    index: Box::new(RepackExpr::OffsetI32 {
+                                        value: Box::new(RepackExpr::ShiftLeft {
+                                            value: Box::new(point),
+                                            bits: 2,
+                                        }),
+                                        offset: (slot % 4) as i32,
                                     }),
-                                    offset: (slot % 4) as i32,
+                                    table: RepackTable::Iq3sMagnitudes,
                                 };
                                 RepackExpr::OffsetI32 {
-                                    value: Box::new(RepackExpr::Lookup {
-                                        index: Box::new(index),
-                                        table: &crate::external_tables::IQ3S_SIGNED_MAGNITUDES,
+                                    value: Box::new(RepackExpr::NegateIf {
+                                        value: Box::new(magnitude),
+                                        sign: Box::new(RepackExpr::SourceBits {
+                                            bit: (74 + 4 * block + group) * 8 + slot,
+                                            width: 1,
+                                        }),
                                     }),
                                     offset: 32,
                                 }
@@ -2945,20 +3063,11 @@ pub(crate) mod internals {
     }
 
     fn validate_repack_recipe(
-        source: RepresentationKind,
+        source: &ExternalPacketLayout,
         destination: &PackedPacketLayout,
         recipe: &PacketRepackRecipe,
     ) {
-        let RepresentationKind::External(source) = source else {
-            panic!("representation conversion source is not external storage")
-        };
         assert!(source.packet_size > 0, "external packet size is zero");
-        assert!(
-            source.packet_alignment > 0
-                && source.packet_alignment.is_power_of_two()
-                && source.packet_size % source.packet_alignment == 0,
-            "external packet alignment is invalid"
-        );
         assert_eq!(
             source.logical_group, destination.group,
             "representation conversion is not one logical packet to one resident packet"
@@ -3011,13 +3120,22 @@ pub(crate) mod internals {
                     validate_expr(index, source_bits);
                     let (min, max) = integer_range(index);
                     assert!(
-                        min >= 0 && max < table.len() as i64,
+                        min >= 0 && max < table.values().len() as i64,
                         "representation conversion indexes outside its lookup table"
                     );
                 }
                 RepackExpr::BitOr(left, right) | RepackExpr::MultiplyF32(left, right) => {
                     validate_expr(left, source_bits);
                     validate_expr(right, source_bits);
+                }
+                RepackExpr::NegateIf { value, sign } => {
+                    validate_expr(value, source_bits);
+                    validate_expr(sign, source_bits);
+                    let (min, max) = integer_range(sign);
+                    assert!(
+                        min >= 0 && max <= 1,
+                        "representation conversion negates by something other than one bit"
+                    );
                 }
             }
         }
@@ -3109,9 +3227,25 @@ pub(crate) mod internals {
                 (min + i64::from(*offset), max + i64::from(*offset))
             }
             RepackExpr::Lookup { table, .. } => (
-                i64::from(*table.iter().min().expect("a lookup table has entries")),
-                i64::from(*table.iter().max().expect("a lookup table has entries")),
+                i64::from(
+                    *table
+                        .values()
+                        .iter()
+                        .min()
+                        .expect("a lookup table has entries"),
+                ),
+                i64::from(
+                    *table
+                        .values()
+                        .iter()
+                        .max()
+                        .expect("a lookup table has entries"),
+                ),
             ),
+            RepackExpr::NegateIf { value, .. } => {
+                let (min, max) = integer_range(value);
+                (min.min(-max), max.max(-min))
+            }
             RepackExpr::F16ToF32(_)
             | RepackExpr::I32ToF32(_)
             | RepackExpr::MultiplyF32(..)
@@ -3187,15 +3321,20 @@ pub(crate) mod internals {
         source: RepresentationId,
         destination: RepresentationId,
     ) -> Option<&'static RepresentationConversion> {
-        tables()
-            .conversions
+        representation_conversions()
             .iter()
             .find(|conversion| conversion.source == source && conversion.destination == destination)
+    }
+    pub(super) fn representation_conversions() -> &'static [RepresentationConversion] {
+        let tables = tables();
+        tables
+            .conversions
+            .get_or_init(|| conversions(&tables.representations))
     }
     pub(super) fn representation_conversion_info(
         id: RepresentationConversionId,
     ) -> &'static RepresentationConversion {
-        tables().conversions.get(id.index()).unwrap_or_else(|| {
+        representation_conversions().get(id.index()).unwrap_or_else(|| {
             panic!("StaticRegistry produced a RepresentationConversionId outside its conversion table (§13.3.1)")
         })
     }
@@ -3208,7 +3347,7 @@ pub(crate) mod internals {
             Table::Capability => t.capabilities.len(),
             Table::Intrinsic => t.intrinsics.len(),
             Table::Representation => t.representations.len(),
-            Table::RepresentationConversion => t.conversions.len(),
+            Table::RepresentationConversion => representation_conversions().len(),
         }
     }
     pub(super) fn declared_name(name: &str) -> Option<&'static str> {
@@ -3508,21 +3647,28 @@ mod tests {
     #[test]
     fn resident_conversions_are_keyed_by_source_and_destination() {
         let q4_k = representation("gguf_q4_k").unwrap();
-        for (layout, name, kind) in [
-            (Layout::Packet, "q4k", ConversionKind::Packet),
-            (Layout::Rows16, "q4k@rows16", ConversionKind::Row),
-            (
-                Layout::Mma16,
-                "q4k@mma16",
-                ConversionKind::RowTile { rows: 16 },
-            ),
+        // The destination's packet form, or its row layout's tile rows.
+        for (layout, name, tile_rows) in [
+            (Layout::Packet, "q4k", None),
+            (Layout::Rows16, "q4k@rows16", Some(1)),
+            (Layout::Mma16, "q4k@mma16", Some(16)),
         ] {
             let destination = storage("q4k", layout).unwrap();
             assert_eq!(destination, representation(name).unwrap());
-            assert_eq!(
-                representation_conversion(q4_k, destination).unwrap().kind,
-                kind
-            );
+            let conversion = representation_conversion(q4_k, destination).unwrap();
+            match conversion.destination_layout {
+                ConversionLayout::Packet(packet) => {
+                    assert_eq!(tile_rows, None);
+                    assert_eq!(
+                        RepresentationKind::Packed(packet.clone()),
+                        representation_info(destination).kind
+                    );
+                }
+                ConversionLayout::Rows(rows) => {
+                    assert_eq!(Some(rows.tile_rows()), tile_rows);
+                    assert_eq!(rows.layout, layout);
+                }
+            }
         }
         // An external source converts into every element of its resident
         // representation, each recipe in every layout, once; nothing else

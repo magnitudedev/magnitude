@@ -734,6 +734,23 @@ pub mod tensor {
             })
         }
 
+        /// Whether a canonical-layout tensor of `representation` and
+        /// `extents` over a region's bytes from `byte_offset` keeps the
+        /// layout's alignment, which a kernel reading it assumes: a region
+        /// starts at a host page, so its bytes from an offset are aligned as
+        /// the offset is (to the page).
+        pub fn keeps_alignment(
+            representation: RepresentationId,
+            extents: &[u64],
+            byte_offset: u64,
+        ) -> Result<bool, TensorError> {
+            let layout = layout::canonical(representation, extents)?;
+            Ok(byte_offset.is_multiple_of(layout.alignment))
+        }
+
+        /// A canonical-layout tensor of `representation` and `extents` over
+        /// the region's bytes from `byte_offset`, which must keep the
+        /// layout's alignment ([`Self::keeps_alignment`]).
         pub fn tensor(
             &self,
             representation: RepresentationId,
@@ -754,6 +771,12 @@ pub mod tensor {
                 return Err(TensorError::HostRegion(
                     "tensor view exceeds mapped region".into(),
                 ));
+            }
+            if !Self::keeps_alignment(representation, extents, byte_offset)? {
+                return Err(TensorError::Region(RegionError::Unaligned {
+                    offset: byte_offset,
+                    alignment: layout.alignment,
+                }));
             }
             Ok(TensorInner::new_view(
                 self.device.clone(),

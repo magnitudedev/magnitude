@@ -257,7 +257,7 @@ pub struct NativeCoverage {
 mod internals {
     use super::*;
     use seismic_lang::checked::{ElementSummary, ElementTarget, NativeElementCoverage};
-    use seismic_lang::registry::{self, RepresentationInfo};
+    use seismic_lang::registry::{self, RepresentationInfo, SourceDialect};
     use std::collections::HashSet;
     use std::fs;
 
@@ -401,25 +401,25 @@ mod internals {
                 let source = module
                     .native_asset(entry.id, backend)
                     .expect("shared loader captures native assets");
-                let extension = match backend {
-                    // CPU assets are Rust, compiled into the embedding crate
-                    // from their authored path, so compiler diagnostics and
-                    // tools point at the authored file.
-                    BackendName::Cpu => {
-                        let files = captured
-                            .iter()
-                            .find(|asset| asset.entry == entry.id && asset.backend == backend)
-                            .expect("shared loader captures every native asset");
-                        cpu = Some(CpuAsset {
-                            definition,
-                            path: files.asset.path.clone(),
-                            text: source,
-                        });
-                        continue;
-                    }
-                    BackendName::Metal => "metal",
-                    BackendName::Cuda => "cu",
-                    BackendName::Vulkan => "comp",
+                // CPU assets are Rust, compiled into the embedding crate from
+                // their authored path, so compiler diagnostics and tools point
+                // at the authored file.
+                let Some(dialect) = backend.source_dialect() else {
+                    let files = captured
+                        .iter()
+                        .find(|asset| asset.entry == entry.id && asset.backend == backend)
+                        .expect("shared loader captures every native asset");
+                    cpu = Some(CpuAsset {
+                        definition,
+                        path: files.asset.path.clone(),
+                        text: source,
+                    });
+                    continue;
+                };
+                let extension = match dialect {
+                    SourceDialect::Metal => "metal",
+                    SourceDialect::Cuda => "cu",
+                    SourceDialect::Vulkan => "comp",
                 };
                 fs::write(output.join(format!("{}.{extension}", entry.name)), source)
                     .map_err(BuildError::Io)?;
@@ -430,28 +430,28 @@ mod internals {
                 // Included files are validated against the including entry's
                 // ABI, exactly like the asset itself. The ABI is independent
                 // of the file, so build its symbol set once for this entry.
-                let allowed = native_abi_symbols(entry, definition, backend);
+                let allowed = native_abi_symbols(entry, definition, dialect);
                 for file in std::iter::once(&files.asset).chain(&files.includes) {
                     validate_native_abi(entry, &allowed, &file.path, &file.text)?;
-                    if backend == BackendName::Vulkan {
+                    if dialect == SourceDialect::Vulkan {
                         validate_vulkan_reserved(entry, &file.path, &file.text)?;
                     }
                 }
                 if definition.launch_scoped()
-                    && matches!(backend, BackendName::Metal | BackendName::Cuda)
+                    && matches!(dialect, SourceDialect::Metal | SourceDialect::Cuda)
                 {
                     validate_launch_templates(
                         entry,
                         definition,
-                        backend,
+                        dialect,
                         &files.asset.path,
                         source,
                     )?;
                 }
-                match backend {
-                    BackendName::Metal => validate_metal_buffer_slots(entry, definition)?,
-                    BackendName::Vulkan => validate_vulkan_kernels(entry, definition, source)?,
-                    BackendName::Cpu | BackendName::Cuda => {}
+                match dialect {
+                    SourceDialect::Metal => validate_metal_buffer_slots(entry, definition)?,
+                    SourceDialect::Vulkan => validate_vulkan_kernels(entry, definition, source)?,
+                    SourceDialect::Cuda => {}
                 }
             }
             if any {
@@ -491,7 +491,7 @@ mod internals {
     fn validate_launch_templates(
         entry: &EntryInfo,
         definition: &NativeImplementation,
-        backend: seismic_lang::registry::BackendName,
+        dialect: SourceDialect,
         path: &std::path::Path,
         source: &str,
     ) -> Result<(), BuildError> {
@@ -509,10 +509,10 @@ mod internals {
                     let [(qualifier, offset), (void, _), (name, _)] = triple else {
                         unreachable!()
                     };
-                    let matches = match backend {
-                        BackendName::Metal => *qualifier == "kernel" && *void == "void",
-                        BackendName::Cuda => *qualifier == "__global__" && *void == "void",
-                        BackendName::Cpu | BackendName::Vulkan => false,
+                    let matches = match dialect {
+                        SourceDialect::Metal => *qualifier == "kernel" && *void == "void",
+                        SourceDialect::Cuda => *qualifier == "__global__" && *void == "void",
+                        SourceDialect::Vulkan => false,
                     };
                     (matches && *name == launch.kernel).then_some(*offset)
                 })
@@ -581,8 +581,10 @@ mod internals {
                 let header = source[at + "template".len()..*kernel_at].trim();
                 // A CUDA kernel may declare its launch bounds between its
                 // template header and `__global__`.
-                let header = match (backend, header.rfind("__launch_bounds__")) {
-                    (BackendName::Cuda, Some(bounds)) if header.ends_with(')') => header[..bounds].trim_end(),
+                let header = match (dialect, header.rfind("__launch_bounds__")) {
+                    (SourceDialect::Cuda, Some(bounds)) if header.ends_with(')') => {
+                        header[..bounds].trim_end()
+                    }
                     _ => header,
                 };
                 let body = header.strip_prefix('<')?.strip_suffix('>')?;
@@ -768,9 +770,8 @@ mod internals {
     fn native_abi_symbols(
         entry: &EntryInfo,
         definition: &NativeImplementation,
-        backend: seismic_lang::registry::BackendName,
+        dialect: SourceDialect,
     ) -> HashSet<String> {
-        use seismic_lang::registry::BackendName;
         let mut symbols = HashSet::new();
         symbols.insert("SEISMIC_BUFFER_SCALAR_RESULTS".to_owned());
         if !definition.launch_scoped() {
@@ -794,8 +795,8 @@ mod internals {
                 native_macro(&scratch.name)
             ));
         }
-        match backend {
-            BackendName::Cuda => {
+        match dialect {
+            SourceDialect::Cuda => {
                 symbols.insert("SEISMIC_BUFFER_WORDS".to_owned());
                 for symbol in [
                     "SEISMIC_KERNEL_PARAMS",
@@ -812,7 +813,7 @@ mod internals {
             }
             // Vulkan words live in the argument block, read through
             // `seismic_words`; there is no words buffer.
-            BackendName::Vulkan => {
+            SourceDialect::Vulkan => {
                 for symbol in [
                     "SEISMIC_PTR",
                     "SEISMIC_READONLY",
@@ -840,12 +841,9 @@ mod internals {
                     symbols.insert(format!("SEISMIC_STATIC_{}", native_macro(dimension)));
                 }
             }
-            BackendName::Metal => {
+            SourceDialect::Metal => {
                 symbols.insert("SEISMIC_BUFFER_WORDS".to_owned());
                 symbols.insert("SEISMIC_HAS_TENSOR_OPS".to_owned());
-            }
-            BackendName::Cpu => {
-                symbols.insert("SEISMIC_BUFFER_WORDS".to_owned());
             }
         }
         for dimension in &entry.dimensions {
@@ -857,6 +855,69 @@ mod internals {
                 &format!("SEISMIC_ELEMENT_{}", native_macro(element)),
                 registry::representations().iter(),
             );
+        }
+        // A registered conversion between two bound elements, as its word
+        // form (the runtime ABI's `render_conversion`): the table and its
+        // span where it is evaluated at compile time, else the word form as
+        // code (`vulkan::render_conversion_code`): its units, and each group
+        // role's share; and CUDA's tile plans.
+        let evaluated = seismic_lang::repack::evaluates_tables(dialect);
+        for from in &entry.element_parameters {
+            for to in &entry.element_parameters {
+                let prefix = format!(
+                    "SEISMIC_CONVERSION_{}_{}",
+                    native_macro(from),
+                    native_macro(to)
+                );
+                symbols.insert(format!("{prefix}_WORDS"));
+                if evaluated {
+                    for suffix in ["TABLE", "STACK", "DIRECTORY", "CLASSES", "CLASS_COUNT"] {
+                        symbols.insert(format!("{prefix}_{suffix}"));
+                    }
+                } else {
+                    symbols.insert(format!("{prefix}_UNIT"));
+                    for role in registry::RowPlaneRole::ALL
+                        .into_iter()
+                        .filter(|role| !registry::RowPlaneRole::CODES.contains(role))
+                    {
+                        symbols.insert(format!("{prefix}_{}_SHARE", native_macro(role.name())));
+                    }
+                }
+                // CUDA's tile plans.
+                if dialect == SourceDialect::Cuda {
+                    for suffix in [
+                        "PLAN_SEGMENTS",
+                        "PLAN_SEGMENT_FIRST",
+                        "RUN_POSITIONS",
+                        "RUN_FIRST",
+                        "FIXED_POSITIONS",
+                        "STAGE_WORDS",
+                    ] {
+                        symbols.insert(format!("{prefix}_{suffix}"));
+                    }
+                }
+                for role in registry::RowPlaneRole::ALL {
+                    let role = native_macro(role.name());
+                    if evaluated {
+                        symbols.insert(format!("{prefix}_{role}_WORD"));
+                    }
+                    symbols.insert(format!("{prefix}_{role}_BYTES"));
+                }
+                // The code planes' segments of their span.
+                for role in registry::RowPlaneRole::CODES {
+                    let role = native_macro(role.name());
+                    if evaluated {
+                        symbols.insert(format!("{prefix}_{role}_FIRST"));
+                    }
+                    symbols.insert(format!("{prefix}_{role}_UNIT_WORDS"));
+                }
+                symbols.insert(prefix);
+            }
+        }
+        if evaluated {
+            for op in seismic_lang::repack::WordOp::ALL {
+                symbols.insert(format!("SEISMIC_REPACK_OP_{}", op.name()));
+            }
         }
 
         for (ordinal, parameter) in entry.parameters.iter().enumerate() {
@@ -991,6 +1052,12 @@ mod internals {
                         native_macro(layout.layout.as_str())
                     ));
                     symbols.insert(format!("{prefix}_ROW_STRIDE_BYTES"));
+                    // Row planes by role (`render_row_roles`).
+                    for role in registry::RowPlaneRole::ALL {
+                        let role = native_macro(role.name());
+                        symbols.insert(format!("{prefix}_ROW_{role}"));
+                        symbols.insert(format!("{prefix}_ROW_{role}_BYTES"));
+                    }
                     for suffix in [
                         "ROW_GROUPS",
                         "GROUP_MULTIPLE",

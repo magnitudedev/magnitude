@@ -3,6 +3,7 @@
 //! its decoded value; the physical plane structure here feeds the registry's
 //! `RepresentationInfo`, the reference decoder, and the decode recipe.
 
+use crate::external_tables::RepackTable;
 use crate::types::DType;
 use magnitude_ggml::tables;
 
@@ -302,6 +303,24 @@ pub struct GridCodes {
     pub entry_bits: u32,
     /// The ggml grid: byte `j` of point `i` is the magnitude of its lane `j`.
     pub grid: &'static tables::Grid,
+}
+
+/// A constant table a kernel's code looks up: a conversion recipe's
+/// registered table (`RepackExpr::Lookup`), or a grid's magnitudes
+/// ([`GridCodes::magnitudes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LookupTable {
+    Repack(RepackTable),
+    Grid(&'static GridCodes),
+}
+
+impl LookupTable {
+    pub fn values(self) -> &'static [i32] {
+        match self {
+            Self::Repack(table) => table.values(),
+            Self::Grid(grid) => grid.magnitudes(),
+        }
+    }
 }
 
 /// Values one grid entry codes.

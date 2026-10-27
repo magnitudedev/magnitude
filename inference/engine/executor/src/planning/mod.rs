@@ -46,7 +46,7 @@ pub use weights::{
     resident_element, resident_elements, resident_layout, source_element,
 };
 
-pub(crate) use weights::{activation_dtype, packing_residue, packing_run};
+pub(crate) use weights::{activation_dtype, elements, packing_residue, packing_run};
 use weights::{
     planned_element, planned_readout, planned_scalable, source_import_peak_bytes,
     weight_bytes_by_component,

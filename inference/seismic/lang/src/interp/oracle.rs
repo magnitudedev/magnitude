@@ -16,7 +16,10 @@ use crate::intrinsics::{
     AtomicOp, CombineLaw, PrimitiveId, ReduceIdentity, ReduceOp, reduce_schema,
 };
 use crate::reference_math::ReferenceScalar;
-use crate::registry::{self, PlaneRepackRecipe, RepackExpr, RepresentationKind};
+use crate::registry::{
+    self, ConversionLayout, PlaneRepackRecipe, RepackExpr, RepresentationConversion,
+    RepresentationKind,
+};
 use crate::types::DType;
 use num_bigint::BigInt;
 use num_traits::{Euclid, ToPrimitive, Zero};
@@ -1419,23 +1422,31 @@ fn convert_owned_encoded(
 /// The canonical destination bytes of registered conversion `conversion`
 /// applied to the canonical source bytes of a tensor of `shape`: every source
 /// packet through the recipe into the destination representation's packet
-/// form, then placed by the destination layout.
+/// form ([`packet_forms`]), then placed by the destination layout.
 pub(crate) fn repack_bytes(
     conversion: RepresentationConversionId,
     shape: &[usize],
     source_bytes: &[u8],
 ) -> Vec<u8> {
     let conversion = registry::representation_conversion_info(conversion);
-    let source_layout = match &registry::representation_info(conversion.source).kind {
-        RepresentationKind::External(layout) => layout,
-        _ => unreachable!("registered conversion source is not external"),
-    };
-    let destination_kind = &registry::representation_info(conversion.destination).kind;
-    let destination_layout = match destination_kind {
-        RepresentationKind::Packed(layout) => layout,
-        RepresentationKind::PackedRows(layout) => &layout.packet,
-        _ => unreachable!("registered conversion destination is not packed"),
-    };
+    let forms = packet_forms(conversion, source_bytes);
+    match conversion.destination_layout {
+        ConversionLayout::Rows(layout) => layout.place(
+            &shape
+                .iter()
+                .map(|extent| *extent as u64)
+                .collect::<Vec<_>>(),
+            &forms,
+        ),
+        ConversionLayout::Packet(_) => forms,
+    }
+}
+
+/// The packet forms of the source packets `source_bytes` through
+/// `conversion`'s recipe, one after another.
+pub(crate) fn packet_forms(conversion: &RepresentationConversion, source_bytes: &[u8]) -> Vec<u8> {
+    let source_layout = conversion.source_layout;
+    let destination_layout = conversion.destination_layout.packet();
     let packet_count = source_bytes.len() / source_layout.packet_size as usize;
     let mut destination = vec![0u8; packet_count * destination_layout.packet_size as usize];
     for packet in 0..packet_count {
@@ -1477,17 +1488,7 @@ pub(crate) fn repack_bytes(
             }
         }
     }
-    // `destination` is the packet form; a row layout places it.
-    match destination_kind {
-        RepresentationKind::PackedRows(layout) => layout.place(
-            &shape
-                .iter()
-                .map(|extent| *extent as u64)
-                .collect::<Vec<_>>(),
-            &destination,
-        ),
-        _ => destination,
-    }
+    destination
 }
 
 fn eval_repack(expression: &RepackExpr, source: &[u8]) -> ReferenceScalar {
@@ -1541,7 +1542,13 @@ fn eval_repack(expression: &RepackExpr, source: &[u8]) -> ReferenceScalar {
         .unwrap(),
         RepackExpr::Lookup { index, table } => {
             let index = scalar::cast(DType::I32, eval_repack(index, source)).bits();
-            ReferenceScalar::I32(table[index as usize])
+            ReferenceScalar::I32(table.values()[index as usize])
+        }
+        RepackExpr::NegateIf { value, sign } => {
+            // An I32's bits are its low 32.
+            let value = scalar::cast(DType::I32, eval_repack(value, source)).bits() as u32;
+            let sign = scalar::cast(DType::I32, eval_repack(sign, source)).bits() as u32;
+            ReferenceScalar::I32(crate::repack::negate_if(value, sign) as i32)
         }
     }
 }

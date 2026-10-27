@@ -156,9 +156,7 @@ impl NativeStateProgram {
                         .get(copy.plane_index)
                         .ok_or_else(|| invalid("copy plane is outside pinned history"))?;
                     let shape = plane.extents();
-                    let width = shape[1..]
-                        .iter()
-                        .try_fold(1u64, |n, extent| n.checked_mul(*extent))
+                    let width = crate::planning::elements(&shape[1..])
                         .ok_or_else(|| invalid("state plane width overflow"))?;
                     let view = plane.reshape(&[shape[0], 1, width]).map_err(device)?;
                     let class = StateCopyGraphClass {

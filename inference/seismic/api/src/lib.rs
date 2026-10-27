@@ -560,16 +560,13 @@ impl Element {
             _ => 1,
         }
     }
-    /// Host reference of the registered conversion from `source` into this
-    /// storage over a tensor of `shape`. `None` when no conversion is
-    /// registered or `bytes` is not the source's canonical byte count.
+    /// The host's repack of a tensor of `shape` by the registered
+    /// conversion from `source` into this storage (`cpu::repack::convert`).
+    /// `None` when no conversion is registered or `bytes` is not the
+    /// source's canonical byte count.
     pub fn repack_host(self, source: Element, shape: &[u64], bytes: &[u8]) -> Option<Vec<u8>> {
         let conversion = seismic_lang::registry::representation_conversion(source.0, self.0)?;
-        let shape = shape
-            .iter()
-            .map(|extent| usize::try_from(*extent).ok())
-            .collect::<Option<Vec<_>>>()?;
-        seismic_lang::interp::repack(conversion.id, &shape, bytes)
+        seismic_native_cpu::repack::convert(conversion, shape, bytes)
     }
     /// `bytes`, arbitrary bytes of whole packets of `source`, brought into
     /// the domain of the registered conversion from `source` into this
@@ -578,12 +575,10 @@ impl Element {
     /// conversion is registered or `bytes` is not whole source packets.
     pub fn repack_source(self, source: Element, mut bytes: Vec<u8>) -> Option<Vec<u8>> {
         let conversion = seismic_lang::registry::representation_conversion(source.0, self.0)?;
-        let seismic_lang::registry::RepresentationKind::External(layout) =
-            &seismic_lang::registry::representation_info(source.0).kind
-        else {
-            return None;
-        };
-        if bytes.len() % layout.packet_size as usize != 0 {
+        if !bytes
+            .len()
+            .is_multiple_of(conversion.source_layout.packet_size as usize)
+        {
             return None;
         }
         conversion.admit_source(&mut bytes);
@@ -755,6 +750,24 @@ impl ReadOnlyMappedRegion {
             .map(|inner| Self { inner })
     }
 
+    /// Whether a tensor of `element` and `extents` over a region's bytes
+    /// from `byte_offset` keeps the element's alignment: a region starts at
+    /// a host page, so its bytes are aligned as their offset is.
+    pub fn keeps_alignment(
+        element: Element,
+        extents: &[u64],
+        byte_offset: u64,
+    ) -> Result<bool, TensorError> {
+        seismic_runtime::api::tensor::MappedRegionInner::keeps_alignment(
+            element.id(),
+            extents,
+            byte_offset,
+        )
+    }
+
+    /// A tensor of `element` and `extents` over the region's bytes from
+    /// `byte_offset`, which must keep the element's alignment
+    /// ([`Self::keeps_alignment`]).
     pub fn tensor(
         &self,
         element: Element,

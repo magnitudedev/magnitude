@@ -17,6 +17,7 @@ pub mod expr;
 pub mod failure;
 pub mod ids;
 pub mod registry;
+pub mod repack;
 
 mod check;
 mod external_tables;

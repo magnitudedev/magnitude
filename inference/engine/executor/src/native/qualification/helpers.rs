@@ -543,9 +543,7 @@ pub(super) fn semantic_ones(
     entry: &'static str,
     bindings: &str,
 ) -> Result<Tensor, CatalogFailure> {
-    let count = extents
-        .iter()
-        .try_fold(1_u64, |count, extent| count.checked_mul(*extent))
+    let count = crate::planning::elements(extents)
         .ok_or_else(|| qualification_dynamic(entry, bindings, "fixture extent overflow"))?;
     let count = usize::try_from(count)
         .map_err(|_| qualification_dynamic(entry, bindings, "fixture extent exceeds usize"))?;

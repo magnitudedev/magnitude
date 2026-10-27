@@ -11,3 +11,6 @@ seismic-lang.workspace = true
 [build-dependencies]
 magnitude-ggml.workspace = true
 seismic-lang.workspace = true
+
+[dev-dependencies]
+seismic-lang = { workspace = true, features = ["fixtures"] }

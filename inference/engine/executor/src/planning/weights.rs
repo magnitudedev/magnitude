@@ -890,6 +890,13 @@ impl ModelLoadPlan {
     }
 }
 
+/// The elements of a tensor of `extents`; `None` beyond `u64`.
+pub(crate) fn elements(extents: &[u64]) -> Option<u64> {
+    extents
+        .iter()
+        .try_fold(1u64, |count, extent| count.checked_mul(*extent))
+}
+
 pub(super) fn source_import_peak_bytes(source_bytes: u64) -> Result<u64, String> {
     if source_bytes == 0 {
         return Ok(0);

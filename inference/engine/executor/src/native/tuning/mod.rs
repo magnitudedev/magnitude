@@ -2559,9 +2559,7 @@ impl TuningInputs<'_, '_> {
 }
 
 fn element_count(extents: &[u64]) -> Result<usize, String> {
-    extents
-        .iter()
-        .try_fold(1u64, |count, extent| count.checked_mul(*extent))
+    crate::planning::elements(extents)
         .and_then(|count| usize::try_from(count).ok())
         .ok_or_else(|| "tuning tensor size overflows".to_owned())
 }

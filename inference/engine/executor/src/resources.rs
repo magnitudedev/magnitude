@@ -45,12 +45,33 @@ pub(crate) enum ImportSource {
 }
 
 impl ImportSource {
+    /// Whether `weight`'s import reads `stored` in place on `device`: the
+    /// device reads mapped pages ([`ImportWindow::serves`]), the weight is
+    /// uploaded as stored, and its bytes in the file keep its source's
+    /// alignment (a GGUF tensor starts at a multiple of its file's
+    /// `general.alignment`, any power of two; a window maps whole pages, so
+    /// its view of the bytes is aligned as their file offset is).
+    pub(crate) fn reads_in_place(
+        weight: &WeightPlan,
+        stored: &Stored,
+        device: &Device,
+    ) -> Result<bool, AllocationError> {
+        Ok(ImportWindow::serves(device)
+            && !weight.host_prepared()
+            && ReadOnlyMappedRegion::keeps_alignment(
+                weight.source,
+                &[source_count(weight)?],
+                stored.file_range().1,
+            )
+            .map_err(AllocationError::Tensor)?)
+    }
+
     /// The source of `weight`'s import on `device`, the one way every
-    /// import takes it, a load's and a tuning unit's alike. A weight
-    /// uploaded as stored is a view of `window` where one is given: the
-    /// artifact's own pages, which the process's footprint does not count.
-    /// Any other is an upload of the weight's source bytes on the device,
-    /// not yet written
+    /// import takes it, a load's and a tuning unit's alike. A weight read
+    /// in place ([`Self::reads_in_place`]) is a view of `window` where one
+    /// is given: the artifact's own pages, which the process's footprint
+    /// does not count. Any other is an upload of the weight's source bytes
+    /// on the device, not yet written
     /// ([`crate::programs::native_import::fill_staged_source`] writes it).
     pub(crate) fn acquire(
         weight: &WeightPlan,
@@ -58,21 +79,9 @@ impl ImportSource {
         window: Option<&ImportWindow>,
         device: &Device,
     ) -> Result<Self, AllocationError> {
-        let count = weight
-            .shape
-            .iter()
-            .try_fold(1u64, |count, extent| count.checked_mul(*extent))
-            .ok_or_else(|| {
-                AllocationError::Plan(InvariantError {
-                    context: "import source",
-                    detail: "weight element count overflows".into(),
-                })
-            })?;
+        let count = source_count(weight)?;
         match window {
-            // A transformed or dequantized weight uploads the host's
-            // prepared bytes; only an unprepared one can read its stored
-            // range in place.
-            Some(window) if !weight.host_prepared() => {
+            Some(window) if Self::reads_in_place(weight, stored, device)? => {
                 Ok(Self::Mapped(window.tensor(stored, weight, count)?))
             }
             // SAFETY: the importer fills this exact tensor before binding
@@ -101,6 +110,16 @@ impl ImportSource {
             Self::Mapped(tensor) | Self::Staged(tensor) => tensor,
         }
     }
+}
+
+/// The elements of `weight`'s source (and of its upload).
+fn source_count(weight: &WeightPlan) -> Result<u64, AllocationError> {
+    crate::planning::elements(&weight.shape).ok_or_else(|| {
+        AllocationError::Plan(InvariantError {
+            context: "import source",
+            detail: "weight element count overflows".into(),
+        })
+    })
 }
 
 /// One page-rounded artifact range charged once and shared by the source
@@ -156,8 +175,9 @@ impl ImportWindow {
     }
 
     /// Whether `device` reads an artifact's mapped pages in place: where it
-    /// does, a weight uploaded as stored is imported from a window and
-    /// nowhere else.
+    /// does, a weight uploaded as stored whose bytes there keep its source's
+    /// alignment is imported from a window and nowhere else; any other is
+    /// uploaded ([`ImportSource::reads_in_place`]).
     pub(crate) fn serves(device: &Device) -> bool {
         cfg!(unix) && device.backend() == BackendName::Metal
     }
@@ -428,21 +448,17 @@ impl ResourceAllocator {
         if !execution.weights().any(|planned| planned == weight) {
             return Err(invalid("weight is absent from the execution plan"));
         }
-        let count = weight
-            .shape
-            .iter()
-            .try_fold(1u64, |count, extent| count.checked_mul(*extent))
+        let count = crate::planning::elements(&weight.shape)
             .ok_or_else(|| invalid("weight element count overflows"))?;
         if weight.source_bytes > execution.resources().qualification_peak_bytes() {
             return Err(invalid(
                 "source upload exceeds admitted startup transient bytes",
             ));
         }
-        // A weight imported alone, where the device reads mapped pages in
-        // place, has a window of its own range; its source view keeps the
-        // mapping.
+        // A weight imported alone and read in place has a window of its own
+        // range; its source view keeps the mapping.
         let own = match window {
-            None if ImportWindow::serves(device) && !weight.host_prepared() => {
+            None if ImportSource::reads_in_place(weight, stored, device)? => {
                 let (file, start, end) = stored_range(stored)?;
                 Some(ImportWindow::new(execution, device, file, start, end)?)
             }

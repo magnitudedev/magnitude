@@ -208,6 +208,7 @@ fn metal_repack_matches_the_registered_conversion_for_every_format_and_layout() 
     repack_matches_the_registered_conversion(
         &device(seismic::BackendName::Metal).unwrap(),
         &[
+            seismic::Layout::Packet,
             seismic::Layout::Rows16,
             seismic::Layout::Mma16,
             seismic::Layout::Rows32,
@@ -216,12 +217,110 @@ fn metal_repack_matches_the_registered_conversion_for_every_format_and_layout() 
     );
 }
 
+/// The Metal repack's time and source read rate over a 4096 x 4096 tensor
+/// of every GGUF source, into its packet form and the Metal resident
+/// layout (`repack_timing`).
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "timing"]
+fn metal_repack_timing() {
+    repack_timing(
+        &device(seismic::BackendName::Metal).unwrap(),
+        &[seismic::Layout::Packet, seismic::Layout::Rows32],
+    );
+}
+
+/// The Vulkan repack's time and source read rate over a 4096 x 4096 tensor
+/// of every GGUF source, into the Vulkan resident layout (`repack_timing`).
+#[test]
+#[ignore = "timing"]
+fn vulkan_repack_timing() {
+    if let Some(device) = device(seismic::BackendName::Vulkan) {
+        repack_timing(&device, &[seismic::Layout::Rows16]);
+    }
+}
+
+/// The CUDA repack's time and source read rate over a 4096 x 4096 tensor
+/// of every GGUF source, into its packet form and both CUDA resident
+/// layouts (`repack_timing`).
+#[test]
+#[ignore = "timing"]
+fn cuda_repack_timing() {
+    if let Some(device) = device(seismic::BackendName::Cuda) {
+        repack_timing(
+            &device,
+            &[
+                seismic::Layout::Packet,
+                seismic::Layout::Rows16,
+                seismic::Layout::Mma16,
+            ],
+        );
+    }
+}
+
+/// The repack's time and source read rate on `device` over a 4096 x 4096
+/// tensor of every GGUF source, into each of `layouts`: the best of eleven
+/// batches of 20 repacks.
+fn repack_timing(device: &seismic::Device, layouts: &[seismic::Layout]) {
+    let shape = [1, 4096, 4096];
+    for (source_element, operands) in conversions() {
+        let length = source_element.canonical_byte_len(&shape).unwrap();
+        let source =
+            seismic::Tensor::from_host(device, source_element, &shape, &source_bytes(length, 7))
+                .unwrap();
+        for &layout in layouts {
+            let destination = source_element.converted(layout, operands).unwrap();
+            let kernel = repack_weight::native_for_device_with(
+                device,
+                repack_weight::Elements {
+                    E: source_element,
+                    U: destination,
+                },
+                &seismic::NativeSpecialization::new(),
+            )
+            .unwrap();
+            let mut result = seismic::Tensor::zeros(device, destination, &shape).unwrap();
+            const CALLS: u32 = 20;
+            let best = (0..12)
+                .map(|_| {
+                    let mut batch = seismic::NativeTensorBatch::new(device);
+                    for _ in 0..CALLS {
+                        batch
+                            .push(
+                                &kernel,
+                                repack_weight::Args { source: &source },
+                                repack_weight::OutputArgs { value: &mut result },
+                            )
+                            .unwrap();
+                    }
+                    let started = std::time::Instant::now();
+                    batch.submit().unwrap().wait().unwrap();
+                    started.elapsed() / CALLS
+                })
+                .skip(1)
+                .min()
+                .unwrap();
+            println!(
+                "{:>18} -> {:<16} {:>8.1} us {:>7.1} GB/s",
+                source_element.name(),
+                destination.name(),
+                best.as_secs_f64() * 1e6,
+                length as f64 / best.as_secs_f64() / 1e9
+            );
+        }
+    }
+}
+
 #[test]
 fn cuda_repack_matches_the_registered_conversion_for_every_format_and_layout() {
     if let Some(device) = device(seismic::BackendName::Cuda) {
         repack_matches_the_registered_conversion(
             &device,
-            &[seismic::Layout::Rows16, seismic::Layout::Mma16],
+            &[
+                seismic::Layout::Packet,
+                seismic::Layout::Rows16,
+                seismic::Layout::Mma16,
+            ],
             true,
         );
     }

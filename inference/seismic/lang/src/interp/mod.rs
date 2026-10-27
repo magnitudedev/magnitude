@@ -14,6 +14,8 @@ mod scalar;
 mod tensor;
 pub mod value;
 
+#[cfg(test)]
+pub(crate) use oracle::packet_forms;
 pub use tensor::{TensorData, round_to};
 pub use value::Value;
 
