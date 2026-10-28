@@ -902,8 +902,15 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
       }
     })
 
-    const startup = application.pipe(
-      Effect.timeout(Duration.minutes(5)),
+    // An engine download or a wait to retry it keeps reporting progress; only silence means startup is stuck.
+    const startupSilence = lifecycle.changes.pipe(
+      Stream.timeoutFail(
+        () => new Cause.TimeoutException("ACN startup reported no progress for 5 minutes"),
+        Duration.minutes(5),
+      ),
+      Stream.runDrain,
+    )
+    const startup = Effect.raceFirst(application, startupSilence.pipe(Effect.zipRight(Effect.never))).pipe(
       Effect.tapErrorCause((cause) => lifecycle.beginStopping({
         reason: "startup-failed",
         detail: acnStartupFailureDetail(cause),

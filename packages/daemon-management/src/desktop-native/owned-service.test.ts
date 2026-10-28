@@ -122,6 +122,21 @@ describe("desktop-owned service supervision", () => {
     yield* f.service.shutdown
   })))
 
+  it("keeps a startup that keeps reporting past five minutes and stops one that falls silent", async () => run(Effect.gen(function* () {
+    const f = yield* setup
+    const starting = Schema.decodeUnknownSync(MagnitudeHealthResponseSchema)({ ...health, state: { _tag: "Starting", activity: "Resolving" } })
+    yield* Queue.offer(f.events, { _tag: "Booted", pid: 42 })
+    for (let minute = 0; minute < 12; minute++) {
+      yield* Queue.offer(f.events, { _tag: "Health", health: starting })
+      yield* TestClock.adjust("1 minute")
+    }
+    expect((yield* f.service.state)._tag).toBe("Starting")
+    expect(yield* Ref.get(f.stops)).toBe(0)
+    yield* TestClock.adjust("5 minutes")
+    expect(yield* Ref.get(f.stops)).toBe(1)
+    yield* f.service.shutdown
+  })))
+
   it("never admits mismatched health", async () => run(Effect.gen(function* () {
     const f = yield* setup
     const waiter = yield* f.service.awaitReady.pipe(Effect.either, Effect.forkScoped)

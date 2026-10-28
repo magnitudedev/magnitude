@@ -1,7 +1,7 @@
 import { Starting, Ready, Failed, CleanupFailed, Stopping, Stopped, OwnedServiceState } from "@magnitudedev/sdk/desktop-host"
 import { type ApplicationOwnerState, type MagnitudeHealthResponse, type OwnerReply, type OwnerRequest } from "@magnitudedev/acn-protocol"
 import { FSM } from "@magnitudedev/utils"
-import { Cause, Clock, Deferred, Effect, Exit, Fiber, Option, Queue, Ref, Schema, Stream, SubscriptionRef } from "effect"
+import { Cause, Clock, Deferred, Duration, Effect, Exit, Fiber, Option, Queue, Ref, Schema, Stream, SubscriptionRef } from "effect"
 import { OwnedChildSpawner, type OwnedChild, type OwnedChildCommand } from "./owned-child"
 
 const states = { Starting, Ready, Failed, CleanupFailed, Stopping, Stopped }
@@ -39,6 +39,8 @@ export interface OwnerAgent {
   readonly handle: (request: OwnerRequest) => Effect.Effect<{ readonly reply: OwnerReply; readonly afterReply: Effect.Effect<void> }>
 }
 
+const STARTUP_SILENCE_LIMIT_MILLIS = 5 * 60_000
+
 /** One application-scoped supervisor; observers and renderer lifetimes do not own it. */
 export const makeOwnedService = (command: OwnedChildCommand, rpcVersion: number, owner: OwnerAgent) => Effect.gen(function* () {
   const spawner = yield* OwnedChildSpawner
@@ -64,6 +66,7 @@ export const makeOwnedService = (command: OwnedChildCommand, rpcVersion: number,
     const ready = yield* Deferred.make<void>()
     const stoppingDetail = yield* Ref.make(Option.none<string>())
     const permanentFailure = yield* Ref.make(false)
+    const lastStartupReport = yield* Ref.make(yield* Clock.currentTimeMillis)
     const observe = child.events.pipe(Stream.runForEach(event => Effect.gen(function* () {
       if (event._tag === "Booted") {
         if (event.pid !== child.identity.pid || (yield* Ref.get(admitted))) {
@@ -108,11 +111,19 @@ export const makeOwnedService = (command: OwnedChildCommand, rpcVersion: number,
         yield* Ref.set(permanentFailure, permanent)
         return yield* permanent ? new ServiceStartupRefused({ message }) : new ServiceChildProtocolFailed({ message })
       } else if (health.state._tag === "Starting") {
+        yield* Ref.set(lastStartupReport, yield* Clock.currentTimeMillis)
         yield* change(state => state._tag === "Starting" ? machine.hold(state, { attempt: number, health: Option.some(health) }) : state)
       }
     })), Effect.zipRight(Effect.fail(new ServiceChildProtocolFailed({ message: "Service control stream ended" }))))
-    const startupDeadline = Deferred.await(ready).pipe(
-      Effect.timeoutFail({ duration: "5 minutes", onTimeout: () => new ServiceStartupTimedOut({}) }),
+    // A long engine download or a wait to retry it keeps reporting; only silence means startup is stuck.
+    const startupSilence = Effect.gen(function* () {
+      for (;;) {
+        const silent = (yield* Clock.currentTimeMillis) - (yield* Ref.get(lastStartupReport))
+        if (silent >= STARTUP_SILENCE_LIMIT_MILLIS) return yield* new ServiceStartupTimedOut({})
+        yield* Effect.sleep(Duration.millis(STARTUP_SILENCE_LIMIT_MILLIS - silent))
+      }
+    })
+    const startupDeadline = Effect.raceFirst(Deferred.await(ready), startupSilence).pipe(
       Effect.zipRight(Effect.never),
     )
     return yield* Effect.raceFirst(observe, Effect.raceFirst(
