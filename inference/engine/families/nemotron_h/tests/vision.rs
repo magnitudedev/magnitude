@@ -15,8 +15,8 @@ use magnitude_family_common::headers::{self, add_tensor, remove_tensor, reshape_
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, FamilyError, ImportTransform, MarkerTokens, ModelDefinition,
     ModelFamily, PositionSampling, RowRange, TokenPlan, VisionActivation, VisionAttentionScale,
-    VisionAttentionSpan, VisionDescription, VisionNorm, VisionResampling, VisionResize, VisionStem,
-    VisionUp,
+    VisionAttentionSpan, VisionDescription, VisionNorm, VisionOperator, VisionResampling,
+    VisionResize, VisionStem, VisionUp,
 };
 use magnitude_family_nemotron_h::{
     inputs::spatial_controls, inspect_components, projector::describe_projector, NemotronHFamily,
@@ -89,6 +89,7 @@ fn check(vision: &VisionDescription, fused: bool) {
     assert_eq!(frames[0].name, "v.patch_embd.weight");
     assert_eq!(frames[0].shape, [1280, 3, 16, 16]);
     assert!(bias.is_none() && norm.is_none());
+    let positions = positions.as_ref().expect("position table");
     assert_eq!(
         positions.sampling,
         PositionSampling::CroppedSquare { side: 128 }
@@ -109,7 +110,9 @@ fn check(vision: &VisionDescription, fused: bool) {
     );
     assert_eq!(vision.stem.registers(), 10);
     for (index, block) in vision.blocks.iter().enumerate() {
-        let attention = &block.attention;
+        let VisionOperator::Attention(attention) = &block.operator else {
+            panic!("C-RADIO blocks attend");
+        };
         assert_eq!((attention.heads, attention.width), (16, 80));
         assert_eq!(attention.rotary_base, None);
         assert_eq!(attention.scale, VisionAttentionScale::InverseSqrtWidth);
@@ -140,12 +143,12 @@ fn check(vision: &VisionDescription, fused: bool) {
             }
         }
         assert!(attention.output.bias.is_some());
-        for norm in [&block.attention_norm, &block.feedforward_norm] {
+        for norm in [&block.operator_norm, &block.feedforward_norm] {
             assert!(
                 matches!(norm, VisionNorm::Layer { epsilon, .. } if (epsilon - 1e-6).abs() < 1e-12)
             );
         }
-        assert!(block.attention_post_norm.is_none() && block.feedforward_post_norm.is_none());
+        assert!(block.operator_post_norm.is_none() && block.feedforward_post_norm.is_none());
         assert_eq!(block.feedforward.activation, VisionActivation::GeluErf);
         let VisionUp::Plain(up) = &block.feedforward.up else {
             panic!("a plain feed-forward");
@@ -297,10 +300,8 @@ fn positions_sample_the_cropped_square_grid() {
             .iter()
             .all(|c| *c == [0, 0]));
         assert!(controls.window_ranges().is_empty());
-        let (indices, coefficients) = (
-            controls.interpolation_indices(),
-            controls.interpolation_coefficients(),
-        );
+        let blend = controls.position_blend().expect("position blend");
+        let (indices, coefficients) = (&blend.indices, &blend.coefficients);
         // Rows arrive 2 × 2 cell by cell.
         let mut row = 0;
         for cell_row in 0..h / 2 {
@@ -324,10 +325,9 @@ fn positions_sample_the_cropped_square_grid() {
     }
     // A grid the table's size reads its rows exactly.
     let controls = spatial_controls(&definition, [1, 128, 128]).unwrap();
-    assert!(controls.interpolation_coefficients()[0]
-        .iter()
-        .all(|c| *c == 1.0));
-    assert_eq!(&controls.interpolation_indices()[0][..4], &[0, 1, 128, 129]);
+    let blend = controls.position_blend().expect("position blend");
+    assert!(blend.coefficients[0].iter().all(|c| *c == 1.0));
+    assert_eq!(&blend.indices[0][..4], &[0, 1, 128, 129]);
     assert!(spatial_controls(&definition, [1, 3, 4]).is_err());
 }
 

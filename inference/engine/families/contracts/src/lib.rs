@@ -44,14 +44,14 @@ pub use images::{
 };
 pub use inputs::{
     InputPreparationError, ModelInputAdapter, PreparedModelInput, PreparedVisionInput, TokenPlan,
-    VisionSpatialControls,
+    VisionPositionBlend, VisionSpatialControls,
 };
 pub use vision::{
     CellReduction, LinearClamp, LinearPart, MergerStage, NormPart, PositionSampling, Standardize,
     VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock,
-    VisionDescription, VisionFeedForward, VisionLinear, VisionLinearSite, VisionMerger, VisionNorm,
-    VisionNormSite, VisionPositions, VisionPreprocessing, VisionResampling, VisionResize,
-    VisionStem, VisionUp, VisionWeight,
+    VisionDescription, VisionFeedForward, VisionGatedConvolution, VisionLinear, VisionLinearSite,
+    VisionMerger, VisionNorm, VisionNormSite, VisionOperator, VisionPositions, VisionPreprocessing,
+    VisionResampling, VisionResize, VisionStem, VisionUp, VisionWeight,
 };
 
 /// Stable identity selected by a family adapter after artifact recognition.

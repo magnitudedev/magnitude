@@ -7,7 +7,7 @@ use crate::ARCHITECTURE;
 use magnitude_artifacts::BoundaryRule;
 use magnitude_family_contracts::{
     ImageMarkers, InputPreparationError, ModelDefinition, PositionSampling, SequentialImageInput,
-    VisionSpatialControls,
+    VisionPositionBlend, VisionSpatialControls,
 };
 
 /// The text one image renders as: the image row between its markers, which
@@ -54,7 +54,12 @@ pub fn spatial_controls(
         .vision
         .as_ref()
         .ok_or(InputPreparationError::UnsupportedMedia)?;
-    let PositionSampling::CroppedSquare { side } = vision.stem.positions().sampling else {
+    let PositionSampling::CroppedSquare { side } = vision
+        .stem
+        .positions()
+        .ok_or(InputPreparationError::VisionGeometry)?
+        .sampling
+    else {
         return Err(InputPreparationError::VisionGeometry);
     };
     let side = usize::try_from(side).map_err(|_| InputPreparationError::VisionGeometry)?;
@@ -96,8 +101,10 @@ pub fn spatial_controls(
     VisionSpatialControls::new(
         (0..rows).collect(),
         vec![[0, 0]; rows],
-        indices,
-        coefficients,
+        Some(VisionPositionBlend {
+            indices,
+            coefficients,
+        }),
         Vec::new(),
     )
 }

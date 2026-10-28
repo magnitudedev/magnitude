@@ -1853,9 +1853,27 @@ impl<'a> Preparation<'a> {
                 A: binding.activation
             }
         );
-        let output = self
-            .spec
-            .tuned(&mut self.tuning, &ShortConvOutputTuning { binding, scopes })?;
+        let output = match binding.tail {
+            SublayerTail::Residual => self
+                .spec
+                .tuned(
+                    &mut self.tuning,
+                    &ShortConvOutputTuning {
+                        binding,
+                        scopes,
+                    },
+                )?
+                .map(SublayerOutput::Residual),
+            SublayerTail::PostNorm { norm, .. } => self
+                .post_norm(
+                    WeightKind::RecurrentOutput,
+                    binding.output,
+                    binding.activation,
+                    norm,
+                    scopes,
+                )?
+                .map(SublayerOutput::PostNorm),
+        };
         Ok(match (project, rows, output) {
             (Some(project), Some(rows), Some(output)) => Some(ShortConvKernels {
                 project,
@@ -3400,6 +3418,14 @@ impl<'a> Preparation<'a> {
                     attention,
                     vision_attention::Elements {
                         A: element!(vision_attention, "A"),
+                    }
+                ),
+                VisionEntry::GatedConvolution => prepare!(
+                    vision_gated_convolution,
+                    gated_convolution,
+                    vision_gated_convolution::Elements {
+                        A: element!(vision_gated_convolution, "A"),
+                        KE: element!(vision_gated_convolution, "KE"),
                     }
                 ),
                 VisionEntry::Pool => prepare!(

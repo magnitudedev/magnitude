@@ -2,6 +2,8 @@
   "LiquidAI/LFM2.5-2.6B-GGUF": "b421ad1d549afeda6a0fb2ad3a697cb5a7879adc",
   "LiquidAI/LFM2.5-24B-A2B-GGUF": "0912d33141f77e10705345a6732bfd83f0252fdc",
   "LiquidAI/LFM2.5-8B-A1B-GGUF": "dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0",
+  "LiquidAI/LFM3-1.7B-GGUF": "b3f2ae5d73cd3c91bf40e8ba752c648aa05dffdf",
+  "LiquidAI/LFM3-VL-2B-GGUF": "7c3b4a43c9023e80bf234fec5e826a3365c8dda8",
   "ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF": "88d7ce0b0fa385c5108866ce5d33690927531a37",
   "magnitudedev/LFM2.5-2.6B-DSpark-GGUF": "60103108e36ef66c2591c2b1ea3e6530a4e2c3b0",
   "magnitudedev/LFM2.5-8B-A1B-DSpark-GGUF": "0e2ce447c266c98603073cf9927a56130b9dca43",

@@ -51,13 +51,18 @@ __device__ __forceinline__ float relu_squared(float value) {
     return __fmul_rn(positive, positive);
 }
 
+__device__ __forceinline__ float silu(float value) {
+    return value / (1.0f + expf(-value));
+}
+
 // The activation of `vision_linear`: 1 tanh GELU, 2 erf GELU, 3 quick GELU,
-// 4 squared ReLU.
+// 4 squared ReLU, 5 SiLU.
 __device__ __forceinline__ float activate(int code, float value) {
     return code == 1 ? gelu_tanh(value)
          : code == 2 ? gelu_erf(value)
          : code == 3 ? gelu_quick(value)
-                     : relu_squared(value);
+         : code == 4 ? relu_squared(value)
+                     : silu(value);
 }
 
 // ---------------------------------------------------------------------------
@@ -360,8 +365,9 @@ __device__ __forceinline__ void prepare_head(const u8 *source, u8 *target, bool 
 }
 
 // ---------------------------------------------------------------------------
-// Non-causal attention over the [rows, 3, H, WP] operand rows (queries and
-// keys prepared, zero past the head width W). A block owns ATTEND_ROWS query
+// Non-causal attention over the [rows, H + 2KV, WP] operand rows (the query,
+// then key, then value heads; queries and keys prepared, zero past the head
+// width W); query head h reads key and value head h / group. A block owns ATTEND_ROWS query
 // rows of one head, 16 per warp, and walks the keys of its rows' spans in
 // tiles of KEYS staged by cp.async in two stages: scores = Q K^T on the
 // tensor cores (Q's fragments in registers), scaled into the exp2 domain in
@@ -398,16 +404,18 @@ __device__ __forceinline__ void attend_stage(u16 *tile, const u8 *qkv, u64 row_s
 
 template <class A, u32 W, u32 WP>
 __device__ __forceinline__ void attend(AttendShared<WP> &shared, const u8 *qkv, u8 *out, u32 rows, u32 heads,
-                                       float scale, const int *spans) {
+                                       u32 group, float scale, const int *spans) {
     static_assert(A::bytes == 2, "vision attention requires a bf16 or f16 activation element");
     constexpr u32 PITCH = AttendShared<WP>::PITCH;
     constexpr u32 ATTEND_KEYS = AttendShared<WP>::KEYS;
     constexpr u32 DK = WP / 16;          // k16 steps over the head width
     constexpr u32 KN = ATTEND_KEYS / 8;  // n8 score tiles per key tile
     constexpr u32 DN = WP / 8;           // n8 output tiles
-    const u64 width = (u64)heads * WP;
-    const u64 row_stride = 3 * width;
     const u32 head = blockIdx.y;
+    const u64 kv_heads = heads / group;
+    const u64 row_stride = ((u64)heads + 2 * kv_heads) * WP;
+    const u64 key_column = ((u64)heads + head / group) * WP;
+    const u64 value_column = key_column + kv_heads * WP;
     const u32 first_row = blockIdx.x * ATTEND_ROWS;
     const u32 lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const u32 g = lane / 4, t = lane % 4;
@@ -439,8 +447,8 @@ __device__ __forceinline__ void attend(AttendShared<WP> &shared, const u8 *qkv, 
     }
 
     attend_stage<WP>(shared.q, qkv, row_stride, (u64)head * WP, first_row, ATTEND_ROWS, rows);
-    attend_stage<WP>(shared.k[0], qkv, row_stride, width + (u64)head * WP, walk_first, ATTEND_KEYS, rows);
-    attend_stage<WP>(shared.v[0], qkv, row_stride, 2 * width + (u64)head * WP, walk_first, ATTEND_KEYS, rows);
+    attend_stage<WP>(shared.k[0], qkv, row_stride, key_column, walk_first, ATTEND_KEYS, rows);
+    attend_stage<WP>(shared.v[0], qkv, row_stride, value_column, walk_first, ATTEND_KEYS, rows);
     seismic_cp_async_commit();
 
     u32 q[DK][4];
@@ -459,9 +467,8 @@ __device__ __forceinline__ void attend(AttendShared<WP> &shared, const u8 *qkv, 
         const u32 stage = tile % 2;
         if (tile + 1 < tiles) {
             const u32 next = walk_first + (tile + 1) * ATTEND_KEYS;
-            attend_stage<WP>(shared.k[1 - stage], qkv, row_stride, width + (u64)head * WP, next, ATTEND_KEYS, rows);
-            attend_stage<WP>(shared.v[1 - stage], qkv, row_stride, 2 * width + (u64)head * WP, next, ATTEND_KEYS,
-                             rows);
+            attend_stage<WP>(shared.k[1 - stage], qkv, row_stride, key_column, next, ATTEND_KEYS, rows);
+            attend_stage<WP>(shared.v[1 - stage], qkv, row_stride, value_column, next, ATTEND_KEYS, rows);
         }
         seismic_cp_async_commit();
         seismic_cp_async_wait<1>();

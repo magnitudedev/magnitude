@@ -2288,7 +2288,7 @@ mod tests {
         use magnitude_artifacts::ArtifactIdentity;
         use magnitude_family_contracts::{
             ActivationDType, CellReduction, MergerStage, PositionSampling, VisionActivation,
-            VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock,
+            VisionAttention, VisionOperator, VisionAttentionScale, VisionAttentionSpan, VisionBlock,
             VisionDescription, VisionFeedForward, VisionLinear, VisionMerger, VisionNorm,
             VisionPositions, VisionPreprocessing, VisionResampling, VisionResize, VisionStem,
             VisionUp, WeightDescriptor,
@@ -2330,18 +2330,19 @@ mod tests {
                     stored("patch.1", &[128, 3, 2, 2]),
                 ],
                 bias: Some(stored("patch.bias", &[128])),
-                positions: VisionPositions {
+                positions: Some(VisionPositions {
                     table: stored("position", &[16, 128]),
                     sampling: PositionSampling::AlignedCorners { side: 4 },
-                },
+                }),
                 norm: None,
                 registers: None,
             },
             window: None,
             blocks: vec![VisionBlock {
-                attention_norm: layer_norm("ln1", 128),
-                attention: VisionAttention {
+                operator_norm: layer_norm("ln1", 128),
+                operator: VisionOperator::Attention(VisionAttention {
                     heads: 1,
+                    kv_heads: 1,
                     width: 128,
                     query: linear("q", 128, 128),
                     key: linear("k", 128, 128),
@@ -2353,8 +2354,8 @@ mod tests {
                     scale: VisionAttentionScale::InverseSqrtWidth,
                     span: VisionAttentionSpan::Full,
                     output: linear("o", 128, 128),
-                },
-                attention_post_norm: None,
+                }),
+                operator_post_norm: None,
                 feedforward_norm: layer_norm("ln2", 128),
                 feedforward: VisionFeedForward {
                     up: VisionUp::Plain(linear("up", 128, 128)),
@@ -2388,14 +2389,17 @@ mod tests {
         radio.stem = VisionStem::Patch {
             frames: vec![stored("patch.0", &[128, 3, 2, 2])],
             bias: None,
-            positions: VisionPositions {
+            positions: Some(VisionPositions {
                 table: stored("position", &[16, 128]),
                 sampling: PositionSampling::CroppedSquare { side: 4 },
-            },
+            }),
             norm: None,
             registers: Some(stored("registers", &[3, 128])),
         };
-        radio.blocks[0].attention.rotary_base = None;
+        let VisionOperator::Attention(attention) = &mut radio.blocks[0].operator else {
+            unreachable!("the fixture block attends")
+        };
+        attention.rotary_base = None;
         radio.merger = VisionMerger {
             norm: None,
             reduction: CellReduction::Concatenate,

@@ -6,8 +6,8 @@ use magnitude_artifacts::{
     media::{DType, MAX_PREPARED_BYTES, PreparedMedia, PreparedTensor},
 };
 use magnitude_family_contracts::{
-    InputPreparationError, ModelDefinition, ModelInputAdapter, PositionSampling,
-    PreparedModelInput, PreparedVisionInput, TokenPlan, VisionSpatialControls,
+    InputPreparationError, ModelDefinition, ModelInputAdapter, PositionSampling, PreparedModelInput,
+    PreparedVisionInput, TokenPlan, VisionPositionBlend, VisionSpatialControls,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, btree_map::Entry};
@@ -113,7 +113,12 @@ impl ModelInputAdapter for QwenInputAdapter {
             .ok()
             .filter(|value| *value > 0)
             .ok_or(InputPreparationError::VisionGeometry)?;
-        let PositionSampling::AlignedCorners { side } = vision.stem.positions().sampling else {
+        let PositionSampling::AlignedCorners { side } = vision
+            .stem
+            .positions()
+            .ok_or(InputPreparationError::VisionGeometry)?
+            .sampling
+        else {
             return Err(InputPreparationError::VisionGeometry);
         };
         let table_side = usize::try_from(side)
@@ -389,8 +394,10 @@ pub fn spatial_controls(
     VisionSpatialControls::new(
         (0..rows).collect(),
         coordinates,
-        indices,
-        coefficients,
+        Some(VisionPositionBlend {
+            indices,
+            coefficients,
+        }),
         Vec::new(),
     )
 }

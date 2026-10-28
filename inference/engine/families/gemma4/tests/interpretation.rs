@@ -10,7 +10,8 @@ use magnitude_family_contracts::{
     ActivationFunction, CellReduction, EmbeddingScale, FeedForwardUp, HistoryDomain,
     ImportTransform, InputNorm, KeyValue, MediaRowAttention, ModelDefinition, ModelInputAdapter,
     Operator, OutputForm, PositionSampling, Rotary, SublayerIndex, TokenPlan, ValueNorm,
-    ValueSource, VisionActivation, VisionAttentionScale, VisionResize, VisionStem, VisionUp,
+    ValueSource, VisionActivation, VisionAttentionScale, VisionOperator, VisionResize, VisionStem,
+    VisionUp,
 };
 use magnitude_family_gemma4::{describe_projector, inputs, inspect_components, recognize};
 
@@ -371,16 +372,18 @@ fn encoder_projectors_bind_sandwich_blocks_pooling_and_axial_rotary() {
         );
         assert_eq!(vision.preprocessing.mean, [0.5; 3]);
         assert_eq!(
-            vision.stem.positions().sampling,
+            vision.stem.positions().expect("position table").sampling,
             PositionSampling::Axes { length: 10240 }
         );
         let block = &vision.blocks[0];
-        let attention = &block.attention;
+        let VisionOperator::Attention(attention) = &block.operator else {
+            panic!("Gemma 4 vision blocks attend");
+        };
         let width = hidden / heads;
         assert_eq!((attention.heads, attention.width), (heads, width));
         assert_eq!(attention.scale, VisionAttentionScale::Unit);
         assert_eq!(attention.rotary_base, Some(100.0));
-        assert!(attention.value_norm.is_some() && block.attention_post_norm.is_some());
+        assert!(attention.value_norm.is_some() && block.operator_post_norm.is_some());
         assert_eq!(attention.query.clamp.is_some(), clipped, "{model}");
         assert!(matches!(block.feedforward.up, VisionUp::Gated { .. }));
         assert_eq!(block.feedforward.activation, VisionActivation::GeluTanh);
@@ -428,7 +431,7 @@ fn the_unified_projector_is_a_normalized_patch_projection() {
     assert_eq!(vision.patch_row_width().unwrap(), 6912);
     assert!(matches!(vision.stem, VisionStem::NormalizedPatch { .. }));
     assert_eq!(
-        vision.stem.positions().sampling,
+        vision.stem.positions().expect("position table").sampling,
         PositionSampling::Axes { length: 1120 }
     );
     assert_eq!(describe_projector(&projector, 2560).unwrap_err().to_string(),

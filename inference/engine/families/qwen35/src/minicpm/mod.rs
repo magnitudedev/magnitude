@@ -7,7 +7,7 @@ use magnitude_family_common::{Tensors, architecture_keys};
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, MergerStage, PositionSampling, VisionActivation,
     VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock, VisionDescription,
-    VisionFeedForward, VisionLinear, VisionMerger, VisionNorm, VisionPositions,
+    VisionFeedForward, VisionLinear, VisionMerger, VisionNorm, VisionOperator, VisionPositions,
     VisionPreprocessing, VisionResampling, VisionResize, VisionStem, VisionUp, checked_product,
 };
 
@@ -146,7 +146,7 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
                 .bind("v.patch_embd.weight", &[hidden, 3, patch, patch])?,
         ],
         bias: Some(r.tensors.bind("v.patch_embd.bias", &[hidden])?),
-        positions,
+        positions: Some(positions),
         norm: None,
         registers: None,
     };
@@ -154,9 +154,10 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
     for layer in 0..depth {
         let p = format!("v.blk.{layer}");
         blocks.push(VisionBlock {
-            attention_norm: r.norm(&format!("{p}.ln1"), hidden)?,
-            attention: VisionAttention {
+            operator_norm: r.norm(&format!("{p}.ln1"), hidden)?,
+            operator: VisionOperator::Attention(VisionAttention {
                 heads,
+                kv_heads: heads,
                 width: hidden / heads,
                 query: r.linear(&format!("{p}.attn_q"), hidden, hidden)?,
                 key: r.linear(&format!("{p}.attn_k"), hidden, hidden)?,
@@ -168,8 +169,8 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
                 scale: VisionAttentionScale::InverseSqrtWidth,
                 span: VisionAttentionSpan::Full,
                 output: r.linear(&format!("{p}.attn_out"), hidden, hidden)?,
-            },
-            attention_post_norm: None,
+            }),
+            operator_post_norm: None,
             feedforward_norm: r.norm(&format!("{p}.ln2"), hidden)?,
             feedforward: VisionFeedForward {
                 up: VisionUp::Plain(r.linear(&format!("{p}.ffn_up"), intermediate, hidden)?),

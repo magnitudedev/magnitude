@@ -1285,21 +1285,32 @@ fn qualify_short_conv(
             slab_banks: 2,
         })
         .map_err(|error| qualification_dynamic("short_conv_rows", &label, error))?
-        .value
-        .reshape(&[1, 1, shape.channels])
-        .map_err(|error| qualification_dynamic("short_conv_rows", &label, error))?;
-    let result = kernels
-        .output
-        .call(attention_output::Args {
-            hidden: hidden_residual,
-            inject: &semantic_zeros(device, Element::f32(), &[1, 0], "attention_output", &label)?,
-            gated: &gated,
-            output_weight: &output,
-            output_scale: &unit_scale(device, &kernels.output, "OS", "attention_output", &label)?,
-            output_bound: &any_row_bound(device, &kernels.output, "OB", "attention_output", &label)?,
-        })
-        .map_err(|error| qualification_dynamic("attention_output", &label, error))?
         .value;
+    let result = match (&kernels.output, binding.tail) {
+        (SublayerOutput::Residual(output_kernel), SublayerTail::Residual) => output_kernel
+            .call(attention_output::Args {
+                hidden: hidden_residual,
+                inject: &semantic_zeros(device, Element::f32(), &[1, 0], "attention_output", &label)?,
+                gated: &gated
+                    .reshape(&[1, 1, shape.channels])
+                    .map_err(|error| qualification_dynamic("short_conv_rows", &label, error))?,
+                output_weight: &output,
+                output_scale: &unit_scale(device, output_kernel, "OS", "attention_output", &label)?,
+                output_bound: &any_row_bound(device, output_kernel, "OB", "attention_output", &label)?,
+            })
+            .map_err(|error| qualification_dynamic("attention_output", &label, error))?
+            .value,
+        (SublayerOutput::PostNorm(tail), SublayerTail::PostNorm { norm, .. }) => {
+            qualify_post_norm(device, tail, hidden_residual, &gated, &output, norm, &label)?
+        }
+        _ => {
+            return Err(qualification_dynamic(
+                "attention_output",
+                &label,
+                "short convolution output entries disagree with the binding's tail",
+            ));
+        }
+    };
     require_f32_values(&result, hidden_values, "attention_output", &label)
 }
 

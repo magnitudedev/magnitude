@@ -9,7 +9,7 @@ use magnitude_family_common::{architecture_keys, rotary, Tensors};
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, ImportTransform, MergerStage, PositionSampling,
     VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock,
-    VisionDescription, VisionFeedForward, VisionLinear, VisionMerger, VisionNorm,
+    VisionDescription, VisionFeedForward, VisionLinear, VisionMerger, VisionNorm, VisionOperator,
     VisionPositions, VisionPreprocessing, VisionResampling, VisionResize, VisionStem, VisionUp,
 };
 
@@ -152,9 +152,10 @@ pub fn describe_projector(
         let p = format!("v.blk.{index}.");
         let global = index + 1 == depth || (index + 1) % GLOBAL_PERIOD == 0;
         blocks.push(VisionBlock {
-            attention_norm: layer_norm(&mut t, &format!("{p}ln1"))?,
-            attention: VisionAttention {
+            operator_norm: layer_norm(&mut t, &format!("{p}ln1"))?,
+            operator: VisionOperator::Attention(VisionAttention {
                 heads,
+                kv_heads: heads,
                 width,
                 query: linear(&mut t, &format!("{p}attn_q"), hidden, hidden, rotary.clone())?,
                 key: linear(&mut t, &format!("{p}attn_k"), hidden, hidden, rotary.clone())?,
@@ -170,8 +171,8 @@ pub fn describe_projector(
                     VisionAttentionSpan::Window
                 },
                 output: linear(&mut t, &format!("{p}attn_out"), hidden, hidden, Vec::new())?,
-            },
-            attention_post_norm: None,
+            }),
+            operator_post_norm: None,
             feedforward_norm: layer_norm(&mut t, &format!("{p}ln2"))?,
             feedforward: VisionFeedForward {
                 up: VisionUp::Plain(linear(
@@ -226,10 +227,10 @@ pub fn describe_projector(
         stem: VisionStem::Patch {
             frames: vec![frame],
             bias: None,
-            positions: VisionPositions {
+            positions: Some(VisionPositions {
                 table,
                 sampling: PositionSampling::PixelCenters { side },
-            },
+            }),
             norm: Some(pre_norm),
             registers: None,
         },
