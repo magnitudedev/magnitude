@@ -1,5 +1,13 @@
 # @magnitudedev/cli
 
+## 0.2.13
+
+### Patch Changes
+
+- [`bb3f182`](https://github.com/magnitudedev/magnitude/commit/bb3f18270352322b83850c59d5a818737fec4119) Thanks [@anerli](https://github.com/anerli)! - The Discover page and model cards no longer flash back to assessing every few seconds after startup.
+
+- [`bb3f182`](https://github.com/magnitudedev/magnitude/commit/bb3f18270352322b83850c59d5a818737fec4119) Thanks [@anerli](https://github.com/anerli)! - LFM3-1.7B and LFM3-VL-2B are now in the catalog, in Q4 QAT, Q6 and Q8. LFM3-VL-2B accepts images.
+
 ## 0.2.12
 
 ### Patch Changes
