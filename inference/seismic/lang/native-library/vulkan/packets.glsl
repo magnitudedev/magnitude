@@ -233,14 +233,14 @@ void packets_set_group(inout packets_packet packet, uint g, float scale, const b
 // high plane of HIGH, a code's bits one byte of four (`packets_codes`), or a
 // grid code's entries: four of LOW bits a packet.
 
-// The code planes this file reads: 2- and 4-bit low planes (a high plane of
-// up to two bits joins a 4-bit one), 8-bit low planes, and 16- or 24-bit
-// grid entries.
+// The code planes this file reads: 2-bit low planes (with a high plane of
+// up to one bit), 4-bit low planes (up to two), 8-bit low planes, and 16- or
+// 24-bit grid entries.
 #define PACKETS_READS_PLANES(AXES) (AXES(SEISMIC_AXIS_FORM) != SEISMIC_FORM_ROWS \
     || (AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) == 0 \
         && (AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 16 || AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 24)) \
     || (AXES(SEISMIC_AXIS_CODES) != SEISMIC_CODES_GRID \
-        && ((AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 2 && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) == 0) \
+        && ((AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 2 && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) <= 1) \
             || (AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 4 && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) <= 2) \
             || (AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 8 && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) == 0))))
 #if !PACKETS_ALL(PACKETS_READS_PLANES)
@@ -764,9 +764,18 @@ void packets_decode(const int kind, packets_packet packet, uint step, const bool
 #endif
 #if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 2)
     if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS) == 2) {
-        // Step `step`'s eight codes: bits 16 (step % 2).. of word step / 2.
+        // Step `step`'s eight codes: bits 16 (step % 2).. of word step / 2,
+        // and their high bits at bit 2.
         uint e, o;
         packets_split_crumbs((packet.low[step >> 1] >> (16u * (step & 1u))) & 0xffffu, e, o);
+#if PACKETS_ANY(SEISMIC_AXIS_CODE_HIGH_BITS, 1)
+        if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_HIGH_BITS) == 1) {
+            uint he, ho;
+            packets_split_high1((packet.high.x >> (8u * step)) & 0xffu, he, ho);
+            e |= he >> 2u;
+            o |= ho >> 2u;
+        }
+#endif
         even = packets_interpret(kind, e, centred);
         odd = packets_interpret(kind, o, centred);
         return;

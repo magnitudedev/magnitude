@@ -132,6 +132,71 @@ fn source_bytes(length: u64, seed: u32) -> Vec<u8> {
         .collect()
 }
 
+/// A GGUF Q6_K block of factor `d`, sub-block scales `scales` (per 16
+/// values) and codes `codes` (`q + 32`, per value), as ggml lays it out:
+/// ql[128] | qh[64] | scales[16] | d.
+fn q6_k_block(d: [u8; 2], scales: [i8; 16], codes: [u8; 256]) -> Vec<u8> {
+    let mut block = vec![0u8; 210];
+    for (position, code) in codes.iter().enumerate() {
+        let (half, rest) = (position / 128, position % 128);
+        let (quarter, l) = (rest / 32, rest % 32);
+        block[half * 64 + l + 32 * (quarter % 2)] |= (code & 15) << (4 * (quarter / 2));
+        block[128 + half * 32 + l] |= (code >> 4) << (2 * quarter);
+    }
+    for (j, scale) in scales.iter().enumerate() {
+        block[192 + j] = *scale as u8;
+    }
+    block[208..].copy_from_slice(&d);
+    block
+}
+
+/// Q3_K blocks decode, in every layout, to exactly the values of their Q6_K
+/// re-expression (q6k, the form they were held in before q3k): Q3_K's
+/// `d (s - 32) q` is Q6_K's with scale `s - 32` and code `q + 32`.
+#[test]
+fn q3_k_decodes_as_its_q6_k_reexpression() {
+    let encoding = magnitude_ggml::Encoding::Q3K;
+    let reexpress = |block: &[u8]| {
+        let scales = std::array::from_fn(|j| {
+            let low = (block[96 + j % 8] >> (4 * (j / 8))) & 15;
+            let high = (block[104 + j % 4] >> (2 * (j / 4))) & 3;
+            (low | (high << 4)) as i8 - 32
+        });
+        let codes = std::array::from_fn(|p| {
+            let low = (block[32 + 32 * (p / 128) + p % 32] >> (2 * (p % 128 / 32))) & 3;
+            let high = (block[p % 32] >> (p / 32)) & 1;
+            low + 4 * high - 4 + 32
+        });
+        q6_k_block([block[108], block[109]], scales, codes)
+    };
+    let source = seismic::Element::gguf_source(encoding, 256).unwrap();
+    let (vectors, _) = reference_vectors(encoding);
+    let bytes = [vectors, source_bytes(64 * encoding.block_bytes(), 7)].concat();
+    let shape = [bytes.len() as u64 / encoding.block_bytes(), 256];
+    let reexpressed = bytes
+        .chunks_exact(encoding.block_bytes() as usize)
+        .flat_map(reexpress)
+        .collect::<Vec<_>>();
+    let q6k = seismic::Element::stored("q6k", seismic::Layout::Packet).unwrap();
+    let q6_k = seismic::Element::named("gguf_q6_k").unwrap();
+    let expected = q6k
+        .decode_host(&shape, &q6k.repack_host(q6_k, &shape, &reexpressed).unwrap())
+        .unwrap();
+    for layout in seismic::Layout::ALL {
+        let element = source.converted(layout, seismic::OperandRecipe::Rounded).unwrap();
+        let values = element
+            .decode_host(&shape, &element.repack_host(source, &shape, &bytes).unwrap())
+            .unwrap();
+        assert_eq!(
+            values.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            "{} -> {}",
+            source.name(),
+            element.name()
+        );
+    }
+}
+
 #[test]
 fn k_quant_six_bit_locals_decode_as_gguf_defines_them() {
     // These coefficient bytes exercise both GGUF's low six-bit groups and

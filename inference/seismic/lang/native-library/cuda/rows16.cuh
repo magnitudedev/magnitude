@@ -51,16 +51,16 @@ struct Planes {
 // LOW (i % (8 / LOW)) of byte i / (8 / LOW).
 template <u32 LOW, u32 HIGH> __device__ __forceinline__ u32 code(const Planes &w, const u8 *row, u64 i) {
     static_assert(LOW == 2 || LOW == 4 || LOW == 8, "a low plane of 2, 4 or 8 bits");
-    static_assert(LOW == 4 || HIGH == 0, "a high plane joins a nibble low plane");
+    static_assert(LOW == 8 ? HIGH == 0 : HIGH <= LOW / 2, "a high plane of up to LOW / 2 bits joins a sub-byte low plane");
     if constexpr (LOW == 8)
         return u8_at(row + w.codes + i);
     // log2 of the codes a byte holds.
     constexpr u32 PER = LOW == 4 ? 1 : 2;
     u32 code = (u8_at(row + w.codes + (i >> PER)) >> (LOW * (u32)(i & ((1u << PER) - 1u)))) & ((1u << LOW) - 1u);
     if constexpr (HIGH == 1)
-        code |= ((u8_at(row + w.high + (i >> 3)) >> (u32)(i & 7u)) & 1u) << 4;
+        code |= ((u8_at(row + w.high + (i >> 3)) >> (u32)(i & 7u)) & 1u) << LOW;
     else if constexpr (HIGH == 2)
-        code |= ((u8_at(row + w.high + (i >> 2)) >> (2 * (u32)(i & 3u))) & 3u) << 4;
+        code |= ((u8_at(row + w.high + (i >> 2)) >> (2 * (u32)(i & 3u))) & 3u) << LOW;
     return code;
 }
 

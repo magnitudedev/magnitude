@@ -1595,7 +1595,7 @@ const fn gguf_source_spec(
 }
 
 const GGUF_SOURCES: [GgufSource; 19] = [
-    gguf_source_spec(Encoding::Q3K, 1, "gguf_q3_k", "q6k"),
+    gguf_source_spec(Encoding::Q3K, 1, "gguf_q3_k", "q3k"),
     gguf_source_spec(Encoding::Iq3S, 1, "gguf_iq3_s", "q6k"),
     gguf_source_spec(Encoding::Q4K, 1, "gguf_q4_k", "q4k"),
     gguf_source_spec(Encoding::Q5K, 1, "gguf_q5_k", "q5k"),
@@ -1949,17 +1949,16 @@ pub(crate) mod internals {
         }
         // (external source, packet bytes, packet values, resident
         // representation). A source whose every value the resident
-        // representation holds exactly converts into it: Q3_K's
-        // `d * (s - 32) * q` (six-bit `s`, `q` in [-4, 3], sixteen-value
-        // sub-blocks) is q6k's `d * s' * (c - 32)` with `s' = s - 32` and
-        // `c = q + 32`; IQ3_S's `d * (1 + 2 s) * ±g` (four-bit `s` per 32
-        // values, odd grid magnitude `g` <= 15) is q6k's with `s' = 1 + 2 s`
-        // and `c = 32 ± g`. An IQ4_NL packet is eight consecutive 32-value
-        // blocks (one iq4g32 storage group), each block's f16 scale widened
-        // exactly; an IQ4_NL block alone (`gguf_iq4_nl_block`, the rows of a
-        // table whose width is a multiple of 32 but not of 256, held as
-        // stored) is an iq4g32s packet. Q4_0, Q4_1, Q5_0, Q5_1, MXFP4 and
-        // NVFP4 move their codes and scale fields bit for bit into
+        // representation holds exactly converts into it: IQ3_S's
+        // `d * (1 + 2 s) * ±g` (four-bit `s` per 32 values, odd grid
+        // magnitude `g` <= 15) is q6k's `d * s' * (c - 32)` with
+        // `s' = 1 + 2 s` and `c = 32 ± g`. An IQ4_NL packet is eight
+        // consecutive 32-value blocks (one iq4g32 storage group), each
+        // block's f16 scale widened exactly; an IQ4_NL block alone
+        // (`gguf_iq4_nl_block`, the rows of a table whose width is a
+        // multiple of 32 but not of 256, held as stored) is an iq4g32s
+        // packet. Q4_0, Q4_1, Q5_0, Q5_1, MXFP4, NVFP4, Q2_K and Q3_K move
+        // their codes and coefficient fields bit for bit into
         // representations of their own.
         let external_specs = GGUF_SOURCES.map(|source| {
             let packet_size = u32::try_from(source.encoding.block_bytes() * source.blocks)
@@ -2827,55 +2826,41 @@ pub(crate) mod internals {
             }
             "gguf_q3_k" => {
                 // block_q3_K: hmask[32] | qs[64] | scales[12] | d (f16).
-                // Value p: low bits `(qs[32 (p / 128) + p % 32] >> 2 (p % 128 / 32)) & 3`,
-                // high bit `(hmask[p % 32] >> (p / 32)) & 1`, q = low + 4 high - 4;
-                // the q6k code is q + 32.
+                // Value p's code is its low bits `qs[32 (p / 128) + p % 32]
+                // >> 2 (p % 128 / 32)` and its high bit `hmask[p % 32] >>
+                // (p / 32)`, 3 bits a value; ggml's `q - 4 (1 - h)` is that
+                // code offset by 4.
                 push(plane(
                     "words",
-                    PlaneRepackRecipe::PackedEntries(
-                        (0..256)
-                            .map(|p| RepackExpr::OffsetI32 {
-                                value: Box::new(RepackExpr::BitOr(
-                                    Box::new(RepackExpr::SourceBits {
-                                        bit: (32 + (p / 128) * 32 + p % 32) * 8
-                                            + (p % 128 / 32) * 2,
-                                        width: 2,
-                                    }),
-                                    Box::new(RepackExpr::ShiftLeft {
-                                        value: Box::new(RepackExpr::SourceBits {
-                                            bit: (p % 32) * 8 + p / 32,
-                                            width: 1,
-                                        }),
-                                        bits: 2,
-                                    }),
-                                )),
-                                offset: 28,
+                    PlaneRepackRecipe::BitRoutes(
+                        (0..256 * 3)
+                            .map(|bit| {
+                                let (position, code_bit) = (bit / 3, bit % 3);
+                                if code_bit < 2 {
+                                    (32 + (position / 128) * 32 + position % 32) * 8
+                                        + (position % 128 / 32) * 2
+                                        + code_bit
+                                } else {
+                                    (position % 32) * 8 + position / 32
+                                }
                             })
                             .collect(),
                     ),
                 ));
-                // Six-bit scale s of sub-block j: low four bits
-                // `scales[j % 8] >> 4 (j / 8)`, high two bits
-                // `scales[8 + j % 4] >> 2 (j / 4)`; the q6k coefficient is s - 32.
+                // Sub-block j's six-bit scale code (offset by 32): low four
+                // bits `scales[j % 8] >> 4 (j / 8)`, high two bits
+                // `scales[8 + j % 4] >> 2 (j / 4)`.
                 push(plane(
                     "coefficients",
-                    PlaneRepackRecipe::PackedEntries(
-                        (0..16)
-                            .map(|j| RepackExpr::OffsetI32 {
-                                value: Box::new(RepackExpr::BitOr(
-                                    Box::new(RepackExpr::SourceBits {
-                                        bit: (96 + j % 8) * 8 + 4 * (j / 8),
-                                        width: 4,
-                                    }),
-                                    Box::new(RepackExpr::ShiftLeft {
-                                        value: Box::new(RepackExpr::SourceBits {
-                                            bit: (104 + j % 4) * 8 + 2 * (j / 4),
-                                            width: 2,
-                                        }),
-                                        bits: 4,
-                                    }),
-                                )),
-                                offset: -32,
+                    PlaneRepackRecipe::BitRoutes(
+                        (0..16 * 6)
+                            .map(|bit| {
+                                let (j, code_bit) = (bit / 6, bit % 6);
+                                if code_bit < 4 {
+                                    (96 + j % 8) * 8 + 4 * (j / 8) + code_bit
+                                } else {
+                                    (104 + j % 4) * 8 + 2 * (j / 4) + code_bit - 4
+                                }
                             })
                             .collect(),
                     ),

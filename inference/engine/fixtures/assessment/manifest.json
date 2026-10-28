@@ -131,7 +131,7 @@
     },
     {
       "name": "qwen35-q3km",
-      "description": "Qwen3.5 4B Q3_K_M: Q3_K tensors held widened as q6k; binds its built-in MTP head.",
+      "description": "Qwen3.5 4B Q3_K_M: Q3_K tensors held as q3k; binds its built-in MTP head.",
       "target": [
         {
           "header": "headers/Qwen3.5-4B-Q3_K_M.gguf.gz",

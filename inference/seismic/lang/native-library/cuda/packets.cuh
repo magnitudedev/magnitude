@@ -253,12 +253,12 @@ __device__ __forceinline__ float f16_at(const u8 *address) {
 // 256-code superblocks, so a superblock's four k-blocks always exist and its
 // high plane is fetched warp-coalesced. `W` is the decoder value (its base,
 // stride and planes).
-// LOW-bit codes of a 2- or 4-bit low plane, with a 1-bit high plane or none.
-// A lane chunk of a k-block is 4 LOW bytes of the low plane (and 4 bytes of
-// a 1-bit high plane); a step's word holds its eight slots, LOW bits each
-// (`step_word`). A 2-bit plane's `step_word` spreads its step to the 4-bit
-// slot form, each slot's code in the low bits of its nibble, so every read
-// below is the nibble form's.
+// LOW-bit codes of a 2- or 4-bit low plane, with a 1-bit high plane (bit LOW
+// of a code) or none. A lane chunk of a k-block is 4 LOW bytes of the low
+// plane (and 4 bytes of a 1-bit high plane); a step's word holds its eight
+// slots, LOW bits each (`step_word`). A 2-bit plane's `step_word` spreads its
+// step to the 4-bit slot form, each slot's code in the low bits of its
+// nibble, so every read below is the nibble form's.
 template <u32 LOW> struct LowPlane;
 template <> struct LowPlane<4> {
     typedef uint4 Words;
@@ -279,7 +279,6 @@ template <> struct LowPlane<2> {
 template <int LOW, int HIGH, bool WHOLE> struct Planes {
     static_assert(LOW == 2 || LOW == 4, "a sub-byte low plane of 2 or 4 bits");
     static_assert(HIGH <= 1, "a 2-bit high plane needs rows of whole superblocks (Planes<4, 2, true>)");
-    static_assert(LOW == 4 || HIGH == 0, "a high plane joins a nibble low plane");
     static constexpr int BITS = LOW + HIGH;
     typedef LowPlane<(u32)LOW> L;
     // Low-plane bytes of a lane chunk and of a tile's k-block, and the 16 B
@@ -352,7 +351,7 @@ template <int LOW, int HIGH, bool WHOLE> struct Planes {
         u32 pair = (L::step_word(raw.low, step) >> (4 * i)) & 0x000F000Fu;
         if constexpr (HIGH == 1) {
             const u32 bits = raw.high >> (8 * step + i);
-            pair |= ((bits << 4) & 0x10u) | ((bits << 16) & 0x100000u);
+            pair |= ((bits << LOW) & (1u << LOW)) | ((bits << (12 + LOW)) & (1u << (16 + LOW)));
         }
         return pair;
     }
@@ -361,10 +360,10 @@ template <int LOW, int HIGH, bool WHOLE> struct Planes {
         S8Pair pair = s8_nibbles(L::step_word(raw.low, step));
         if constexpr (HIGH == 1) {
             const u32 bits = raw.high >> (8 * step);
-            pair.row_g |= ((bits & 1u) << 4) | (((bits >> 4) & 1u) << 12) | (((bits >> 2) & 1u) << 20) |
-                          (((bits >> 6) & 1u) << 28);
-            pair.row_g8 |= (((bits >> 1) & 1u) << 4) | (((bits >> 5) & 1u) << 12) | (((bits >> 3) & 1u) << 20) |
-                           (((bits >> 7) & 1u) << 28);
+            pair.row_g |= ((bits & 1u) << LOW) | (((bits >> 4) & 1u) << (8 + LOW)) |
+                          (((bits >> 2) & 1u) << (16 + LOW)) | (((bits >> 6) & 1u) << (24 + LOW));
+            pair.row_g8 |= (((bits >> 1) & 1u) << LOW) | (((bits >> 5) & 1u) << (8 + LOW)) |
+                           (((bits >> 3) & 1u) << (16 + LOW)) | (((bits >> 7) & 1u) << (24 + LOW));
         }
         return pair;
     }
@@ -372,7 +371,7 @@ template <int LOW, int HIGH, bool WHOLE> struct Planes {
     __device__ static __forceinline__ u32 code(const Raw &raw, int step, u32 slot) {
         u32 value = (L::step_word(raw.low, step) >> (4 * slot)) & 15u;
         if constexpr (HIGH == 1)
-            value |= ((raw.high >> (8 * step + slot)) & 1u) << 4;
+            value |= ((raw.high >> (8 * step + slot)) & 1u) << LOW;
         return value;
     }
     // GEMM staging: the 16 B chunks of one tile's k-block, low plane first.

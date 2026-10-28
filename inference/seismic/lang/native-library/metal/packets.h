@@ -187,6 +187,35 @@ struct Planes<2, 0> {
     }
 };
 
+// 2-bit codes under a 1-bit high plane (bit 2 of a code).
+template <>
+struct Planes<2, 1> {
+    struct words {
+        uint2 low;
+        uint high;
+    };
+    static words load(device const uchar *row, Rows16 layout, uint p) {
+        words w;
+        w.low = *reinterpret_cast<device const uint2 *>(layout.at(row, layout.codes, 8ul, p));
+        w.high = *reinterpret_cast<device const uint *>(layout.at(row, layout.high, 4ul, p));
+        return w;
+    }
+    template <uint MASK>
+    static void floats(thread const words &w, uint step, half offset, thread float4 &even, thread float4 &odd) {
+        uint e, o, he, ho;
+        split_crumbs(Planes<2, 0>::field(Planes<2, 0>::words{w.low}, step), e, o);
+        split_high1((w.high >> (8u * step)) & 0xffu, he, ho);
+        even = byte_floats((e | (he >> 2)) ^ MASK, offset);
+        odd = byte_floats((o | (ho >> 2)) ^ MASK, offset);
+    }
+    template <uint MASK>
+    static uint pair(thread const words &w, uint step, uint j) {
+        uint b = (Planes<2, 0>::field(Planes<2, 0>::words{w.low}, step) >> (4u * j)) & 0xfu;
+        uint h = (w.high >> (8u * step + 2u * j)) & 3u;
+        return ((b & 3u) | ((h & 1u) << 2) | (((b >> 2) | ((h >> 1) << 2)) << 16)) ^ (MASK & 0x00ff00ffu);
+    }
+};
+
 template <>
 struct Planes<4, 0> {
     struct words {

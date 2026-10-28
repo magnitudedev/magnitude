@@ -57,10 +57,12 @@ pub enum Format {
     Iq2Xxs,
     /// GGUF Q2_K, resident as q2k.
     Q2K,
+    /// GGUF Q3_K, resident as q3k.
+    Q3K,
 }
 
 impl Format {
-    pub const ALL: [Format; 16] = [
+    pub const ALL: [Format; 17] = [
         Format::Q4K,
         Format::Q5K,
         Format::Q6K,
@@ -77,6 +79,7 @@ impl Format {
         Format::Iq3Xxs,
         Format::Iq2Xxs,
         Format::Q2K,
+        Format::Q3K,
     ];
     pub fn external(self) -> &'static str {
         match self {
@@ -95,6 +98,7 @@ impl Format {
             Format::Iq3Xxs => "gguf_iq3_xxs",
             Format::Iq2Xxs => "gguf_iq2_xxs",
             Format::Q2K => "gguf_q2_k",
+            Format::Q3K => "gguf_q3_k",
         }
     }
     pub fn representation(self) -> &'static str {
@@ -115,6 +119,7 @@ impl Format {
             Format::Iq3Xxs => "iq3xxs",
             Format::Iq2Xxs => "iq2xxs",
             Format::Q2K => "q2k",
+            Format::Q3K => "q3k",
         }
     }
     /// Whether the CUDA GEMM keeps this format's codes exact and scales its
@@ -219,6 +224,12 @@ impl Format {
                 block.extend((0..16 + 64).map(|_| rng.byte()));
                 block.extend(f16(rng.uniform(0.0005, 0.003)));
                 block.extend(f16(rng.uniform(0.0, 0.002)));
+            }
+            Format::Q3K => {
+                // High bits, low codes and scale bytes, then d (values
+                // reach d * 32 * 4).
+                block.extend((0..32 + 64 + 12).map(|_| rng.byte()));
+                block.extend(f16(rng.uniform(0.0001, 0.0005)));
             }
         }
         block

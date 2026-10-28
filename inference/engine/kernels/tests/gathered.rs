@@ -217,10 +217,11 @@ fn stored_rows_decode_the_rows_their_directory_names() {
     }
 }
 
-/// Rows of a 256-value block encoding (Q2_K), 256 wide.
+/// Rows of the 256-value block encodings Q2_K and Q3_K, 256 wide.
 #[test]
 fn stored_rows_decode_k_quant_rows() {
     stored_rows_match("gguf_q2_k", "q2k@rows16", None, 256);
+    stored_rows_match("gguf_q3_k", "q3k@rows16", None, 256);
 }
 
 fn stored_rows_match(source: &str, resident: &str, as_stored: Option<bool>, width: usize) {

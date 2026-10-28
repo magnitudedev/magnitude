@@ -154,13 +154,14 @@ enum Repr {
     Iq3xxs,
     Iq2xxs,
     Q2k,
+    Q3k,
 }
 
 /// The vector-coded formats (256-value GGUF blocks).
 const GRID_REPRS: [Repr; 3] = [Repr::Iq2xs, Repr::Iq3xxs, Repr::Iq2xxs];
 
 /// The k-quant formats imported from GGUF blocks of 256 values.
-const K_QUANT_REPRS: [Repr; 1] = [Repr::Q2k];
+const K_QUANT_REPRS: [Repr; 2] = [Repr::Q2k, Repr::Q3k];
 
 /// The formats with a representation of their own, imported from GGUF.
 const GGUF_REPRS: [Repr; 8] = [
@@ -200,6 +201,7 @@ impl Repr {
             Repr::Iq3xxs => "iq3xxs",
             Repr::Iq2xxs => "iq2xxs",
             Repr::Q2k => "q2k",
+            Repr::Q3k => "q3k",
         }
     }
     /// The GGUF source of a representation built from GGUF blocks, with its
@@ -217,6 +219,7 @@ impl Repr {
             Repr::Iq3xxs => Some(("gguf_iq3_xxs", 98, 256)),
             Repr::Iq2xxs => Some(("gguf_iq2_xxs", 66, 256)),
             Repr::Q2k => Some(("gguf_q2_k", 84, 256)),
+            Repr::Q3k => Some(("gguf_q3_k", 110, 256)),
             _ => None,
         }
     }
@@ -311,7 +314,8 @@ fn planes(repr: Repr, k: usize) -> Planes {
         | Repr::Iq2xs
         | Repr::Iq3xxs
         | Repr::Iq2xxs
-        | Repr::Q2k => {
+        | Repr::Q2k
+        | Repr::Q3k => {
             unreachable!("{repr:?} takes the registry's geometry (`gguf_weight`)")
         }
     }
@@ -541,7 +545,8 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
             | Repr::Iq2xs
             | Repr::Iq3xxs
             | Repr::Iq2xxs
-            | Repr::Q2k => {
+            | Repr::Q2k
+            | Repr::Q3k => {
                 unreachable!("built by `gguf_weight`")
             }
         }
@@ -614,6 +619,8 @@ fn gguf_bytes(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -> V
                 block[..2].copy_from_slice(&f16_bits(factor / 40.0).to_le_bytes())
             }
             Repr::Iq3xxs => block[..2].copy_from_slice(&f16_bits(factor / 120.0).to_le_bytes()),
+            // d: values reach d 32 4.
+            Repr::Q3k => block[108..110].copy_from_slice(&f16_bits(factor / 128.0).to_le_bytes()),
             // d and dmin: values reach d 15 3 and dmin 15.
             Repr::Q2k => {
                 block[80..82].copy_from_slice(&f16_bits(factor / 45.0).to_le_bytes());
@@ -3426,7 +3433,10 @@ fn dense_output_k_quant_formats_match_their_portable_body_and_the_host_reference
 #[test]
 fn dense_expand_k_quant_formats_match_their_portable_body() {
     for device in devices() {
-        dense_expand_matches_its_portable_body_on(&device, &[(Repr::Q2k, Repr::Q2k)]);
+        dense_expand_matches_its_portable_body_on(
+            &device,
+            &[(Repr::Q2k, Repr::Q2k), (Repr::Q3k, Repr::Q3k)],
+        );
     }
 }
 
@@ -4945,7 +4955,7 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference() {
     let check = ReadoutCheck {
         v: 1000,
         d: 512,
-        reprs: &[Repr::Q6k, Repr::Q4k, Repr::Q8, Repr::Q2k, Repr::Q4g32],
+        reprs: &[Repr::Q6k, Repr::Q4k, Repr::Q8, Repr::Q2k, Repr::Q4g32, Repr::Q3k],
         output_classes: &ROW_CLASSES,
         mappings: &MAPPINGS,
         softcap: 0.0,
@@ -5520,6 +5530,7 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
         Repr::Q8,
         Repr::Iq4,
         Repr::Q2k,
+        Repr::Q3k,
         Repr::Bf16,
     ] {
         let table = weight(repr, v, d, 90, 8.0);
@@ -6206,8 +6217,9 @@ fn no_inject(device: &seismic::Device, rows: u64) -> seismic::Tensor {
 /// `dense_output`'s time per call on every device this host has, over the
 /// projection shapes of Gemma 4 E2B Q2_K_P (H x F: its gate/up 12288 x 1536
 /// and 6144 x 1536, query 2048 x 1536, key 256 x 1536, per-layer projection
-/// 1536 x 256), for q2k and the existing forms nearest it in bits (iq2xxs,
-/// iq2xs) and q4k and q4g32s, at one row (the GEMV) and at 512 (the GEMM):
+/// 1536 x 256), for q2k and q3k, the existing forms nearest them in bits
+/// (iq2xxs, iq2xs), q4k and q4g32s, and q6k (the form Q3_K was held in
+/// before q3k), at one row (the GEMV) and at 512 (the GEMM):
 /// per form the best over `MAPPINGS` of the best of eleven batches of 20
 /// calls.
 #[test]
@@ -6235,7 +6247,7 @@ fn dense_output_timing_at_model_shapes() {
                 let down_scale = f32_tensor(device, &[0], &[]);
                 let down_bound = absent_bound(device);
                 let mut line = format!("{:>7} {h:>5} x {f:>4} M {rows:>3}:", device.backend().as_str());
-                for repr in [Repr::Q2k, Repr::Iq2xxs, Repr::Iq2xs, Repr::Q4k, Repr::Q4g32s] {
+                for repr in [Repr::Q2k, Repr::Q3k, Repr::Iq2xxs, Repr::Iq2xs, Repr::Q4k, Repr::Q4g32s, Repr::Q6k] {
                     // Bytes alone: a time does not read the values.
                     let weight = match repr.gguf_source() {
                         Some(_) => resident_tensor(

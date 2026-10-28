@@ -932,8 +932,8 @@ fn a_kernel_call_outside_its_domain_names_the_kernel_and_its_statics() {
     assert!(!statics.is_empty());
 }
 
-/// Memory is charged as stored after import: Q3_K weights are held widened
-/// as q6k, so a Q3_K file is charged as its Q6_K twin though it is smaller.
+/// Memory is charged as stored after import: IQ3_S weights are held widened
+/// as q6k, so an IQ3_S file is charged as its Q6_K twin though it is smaller.
 #[test]
 fn widened_weights_are_charged_as_resident() {
     let scratch = Scratch::new("widened");
@@ -967,11 +967,11 @@ fn widened_weights_are_charged_as_resident() {
             .collect::<Vec<_>>();
         (stored, required)
     };
-    let (q3k_stored, q3k_required) = charged(Encoding::Q3K, "q3k.gguf");
+    let (iq3s_stored, iq3s_required) = charged(Encoding::Iq3S, "iq3s.gguf");
     let (q6k_stored, q6k_required) = charged(Encoding::Q6K, "q6k.gguf");
-    assert!(q3k_stored < q6k_stored);
-    assert_eq!(q3k_required, q6k_required);
-    assert!(q3k_required.iter().all(|required| *required > q6k_stored));
+    assert!(iq3s_stored < q6k_stored);
+    assert_eq!(iq3s_required, q6k_required);
+    assert!(iq3s_required.iter().all(|required| *required > q6k_stored));
 }
 
 /// A shared real-header fixture (`fixtures/assessment/headers`),
