@@ -231,6 +231,12 @@ fn stored_rows_decode_k_quant_rows() {
     }
 }
 
+/// Rows of vector codes with a high part (IQ2_S), 256 wide.
+#[test]
+fn stored_rows_decode_grid_rows() {
+    stored_rows_match("gguf_iq2_s", "iq2s@rows16", None, 256);
+}
+
 fn stored_rows_match(source: &str, resident: &str, as_stored: Option<bool>, width: usize) {
     let (rows, slots, buckets) = (300usize, 24usize, 64usize);
     let mut random = Random(41);

@@ -1228,10 +1228,12 @@ template <class W> struct nvfp4_operands<W, decltype(void(W::NVFP4_OPERANDS))> {
 };
 
 // ---------------------------------------------------------------------------
-// Vector-coded weights (the registry's grid codes: iq2xs, iq3xxs, iq2xxs). An
-// entry of the grids plane codes eight values: grid indices name their
-// magnitudes (<seismic/tables.cuh>), and seven sign bits, completed by an
-// eighth of even parity, their signs. Entries cannot be split across fragment lanes, so a
+// Vector-coded weights (the registry's grid codes: iq2xs, iq3xxs, iq2xxs,
+// iq2s). An entry codes eight values: grid indices name their magnitudes
+// (<seismic/tables.cuh>), and eight sign bits, or seven completed by an
+// eighth of even parity, their signs; its whole bytes are in the grids
+// plane, a high part below a byte in the high plane, laid out as the grids
+// plane is. Entries cannot be split across fragment lanes, so a
 // tile's grids plane (iq2xs, iq3xxs; iq2xxs's `mma16` storage is records,
 // below) is [k-block][row][k-block bytes] (registry
 // `PackedRowLayout::code_bit`): lane (g, t) reads the k-block bytes of rows
@@ -1242,20 +1244,32 @@ template <class W> struct nvfp4_operands<W, decltype(void(W::NVFP4_OPERANDS))> {
 // 16-bit operands and s8 fragments. Their coefficients are hierarchical
 // (`Hier`). Rows hold whole 256-value groups.
 
-// The eight lane sign bits of an entry's seven: the eighth makes the count
-// of set bits even.
-__device__ __forceinline__ u32 grid_signs(u32 signs) { return signs | ((__popc(signs) & 1u) << 7); }
+// The eight lane sign bits of an entry's SIGNS: eight, or seven and an
+// eighth that makes the count of set bits even.
+template <int SIGNS> __device__ __forceinline__ u32 grid_signs(u32 signs) {
+    static_assert(SIGNS == 7 || SIGNS == 8, "eight signs, or seven and their parity");
+    if constexpr (SIGNS == 7)
+        return (signs & 127u) | ((__popc(signs & 127u) & 1u) << 7);
+    else
+        return signs & 255u;
+}
 
 // Four sign bits as four 0x00 / 0xff bytes (bit i to byte i).
 __device__ __forceinline__ u32 sign_bytes(u32 bits) { return ((bits * 0x00204081u) & 0x01010101u) * 0xFFu; }
 
-// A grids plane's entries `Entries<BYTES>`: a row's k-block holds eight
-// BYTES-byte entries, WORDS words; entry e at bit 8 BYTES e
-// (`GridCodes::entry`). `read` is one entry at an address.
-template <int BYTES> struct Entries;
+// A grids plane's entries `Entries<BYTES, HIGH>`: a row's k-block holds
+// eight entries of BYTES whole bytes, LOW_WORDS words, entry e at bit 8 BYTES
+// e, and with HIGH their HIGH bits more each in the high plane
+// (`registry::RowPlaneContent::GridHigh`), the row's WORDS words then being
+// the low words and a word of the high bits; `entry` is entry e of them.
+// `read` is one whole-byte entry at an address.
+template <int BYTES, int HIGH = 0> struct Entries;
 template <> struct Entries<2> {
     static constexpr int BYTES = 2;
+    static constexpr int HIGH = 0;
     static constexpr int WORDS = 4;
+    static constexpr int LOW_WORDS = WORDS;
+    __device__ static __forceinline__ u32 entry(const u32 (&w)[WORDS], int e) { return bits_of<16>(w, 16 * (u32)e); }
     __device__ static __forceinline__ u32 read(const u8 *at) { return *reinterpret_cast<const u16 *>(at); }
     __device__ static __forceinline__ void load(const u8 *global, u32 (&w)[WORDS]) {
         const uint4 v = seismic_ld_nc_v4(global);
@@ -1268,7 +1282,10 @@ template <> struct Entries<2> {
 };
 template <> struct Entries<3> {
     static constexpr int BYTES = 3;
+    static constexpr int HIGH = 0;
     static constexpr int WORDS = 6;
+    static constexpr int LOW_WORDS = WORDS;
+    __device__ static __forceinline__ u32 entry(const u32 (&w)[WORDS], int e) { return bits_of<24>(w, 24 * (u32)e); }
     __device__ static __forceinline__ u32 read(const u8 *at) {
         return (u32)at[0] | ((u32)at[1] << 8) | ((u32)at[2] << 16);
     }
@@ -1288,9 +1305,44 @@ template <> struct Entries<3> {
     }
 };
 
+// Entries of BYTES whole bytes with HIGH bits more each: a row's k-block's
+// whole bytes (`Entries<BYTES>`), then the word of its eight entries' high
+// bits, entry e's at bit HIGH e (a k-block's HIGH bytes of the high plane).
+template <int BYTES_, int HIGH_> struct Entries {
+    static_assert(HIGH_ > 0 && HIGH_ <= 4, "a k-block's eight high parts are one word");
+    typedef Entries<BYTES_> E;
+    static constexpr int BYTES = BYTES_;
+    static constexpr int HIGH = HIGH_;
+    static constexpr int LOW_WORDS = E::WORDS;
+    static constexpr int WORDS = LOW_WORDS + 1;
+    __device__ static __forceinline__ u32 entry(const u32 (&w)[WORDS], int e) {
+        return bits_of<8 * BYTES>(w, 8 * BYTES * (u32)e) | (((w[LOW_WORDS] >> (HIGH * e)) & ((1u << HIGH) - 1u))
+                                                           << (8 * BYTES));
+    }
+    __device__ static __forceinline__ u32 read(const u8 *at) { return E::read(at); }
+    __device__ static __forceinline__ void load(const u8 *global, u32 (&w)[WORDS]) {
+        E::load(global, reinterpret_cast<u32(&)[LOW_WORDS]>(w));
+    }
+    __device__ static __forceinline__ void load_shared(const u8 *shared, u32 (&w)[WORDS]) {
+        E::load_shared(shared, reinterpret_cast<u32(&)[LOW_WORDS]>(w));
+    }
+    // The k-block's high bits at `at` (global or shared): HIGH bytes, at a
+    // multiple of HIGH.
+    __device__ static __forceinline__ void load_high(const u8 *at, u32 (&w)[WORDS]) {
+        if constexpr (HIGH == 1)
+            w[LOW_WORDS] = *at;
+        else if constexpr (HIGH == 2)
+            w[LOW_WORDS] = *reinterpret_cast<const u16 *>(at);
+        else if constexpr (HIGH == 4)
+            w[LOW_WORDS] = *reinterpret_cast<const u32 *>(at);
+        else
+            w[LOW_WORDS] = (u32)at[0] | ((u32)at[1] << 8) | ((u32)at[2] << 16);
+    }
+};
+
 // An entry's grid points (`grids::table<GRID>`, LANES values a point, its
-// first INDEX_BITS-bit index lowest) and its seven explicit signs, which
-// follow the indices.
+// first INDEX_BITS-bit index lowest) and its signs, which follow the
+// indices.
 template <u32 GRID, int INDEX_BITS, int LANES> struct Points;
 template <u32 GRID_, int INDEX_BITS> struct Points<GRID_, INDEX_BITS, 8> {
     static constexpr int LANES = 8;
@@ -1322,8 +1374,8 @@ template <u32 GRID_, int INDEX_BITS> struct Points<GRID_, INDEX_BITS, 4> {
     }
 };
 
-// A grid code of entries E and points Pts.
-template <class E, class Pts> struct GridCodes {
+// A grid code of entries E, points Pts and SIGNS sign bits.
+template <class E, class Pts, int SIGNS> struct GridCodes {
     typedef E entries;
     typedef Pts points;
     static constexpr int WORDS = E::WORDS;       // words of a row's k-block entries
@@ -1331,11 +1383,9 @@ template <class E, class Pts> struct GridCodes {
     __device__ static __forceinline__ void load_shared(const u8 *shared, u32 (&w)[WORDS]) {
         E::load_shared(shared, w);
     }
-    __device__ static __forceinline__ u32 signs(u32 entry) { return grid_signs((entry >> Pts::SIGNS) & 127u); }
+    __device__ static __forceinline__ u32 signs(u32 entry) { return grid_signs<SIGNS>(entry >> Pts::SIGNS); }
     // Entry e of a row's k-block words.
-    __device__ static __forceinline__ u32 entry(const u32 (&w)[WORDS], int e) {
-        return bits_of<8 * E::BYTES>(w, 8 * E::BYTES * (u32)e);
-    }
+    __device__ static __forceinline__ u32 entry(const u32 (&w)[WORDS], int e) { return E::entry(w, e); }
     // Lanes 2t, 2t + 1 of entry e: their magnitudes (bytes 0, 1) and sign
     // bits (bits 0, 1).
     __device__ static __forceinline__ u32 lanes(const u32 (&w)[WORDS], int e, u32 t, u32 &signs_) {
@@ -1351,11 +1401,11 @@ template <class E, class Pts> struct GridCodes {
     }
 };
 
-// The grid code of a packed element's grid axes: entries of LOW / 8 bytes
-// (no high plane) and points of INDEX_BITS-bit indices, LANES values each.
-template <u32 LOW, u32 HIGH, u32 GRID, u32 INDEX_BITS, u32 LANES> struct GridCodesOf {
-    static_assert(HIGH == 0, "grid entries have no high plane");
-    typedef GridCodes<Entries<(int)LOW / 8>, Points<GRID, (int)INDEX_BITS, (int)LANES>> type;
+// The grid code of a packed element's grid axes: entries of LOW / 8 whole
+// bytes and HIGH bits more, points of INDEX_BITS-bit indices, LANES values
+// each, and SIGNS sign bits.
+template <u32 LOW, u32 HIGH, u32 GRID, u32 INDEX_BITS, u32 LANES, u32 SIGNS> struct GridCodesOf {
+    typedef GridCodes<Entries<(int)LOW / 8, (int)HIGH>, Points<GRID, (int)INDEX_BITS, (int)LANES>, (int)SIGNS> type;
 };
 
 // Grid code planes (`Packed<GridPlanes<G>, Twos, K>`): the grids plane of
@@ -1363,8 +1413,11 @@ template <u32 LOW, u32 HIGH, u32 GRID, u32 INDEX_BITS, u32 LANES> struct GridCod
 // complement 8-bit codes (`Twos`), so they read as 8-bit codes.
 template <class G> struct GridPlanes {
     static constexpr int BITS = 8;
-    // Bytes of a row's k-block of entries.
-    static constexpr int KBLOCK_BYTES = 4 * G::WORDS;
+    // Bytes of a row's k-block of entries' whole bytes, and of their high
+    // part (`Entries`), laid out alike: a tile's k-block is its rows', row
+    // by row.
+    static constexpr int KBLOCK_BYTES = 4 * G::entries::LOW_WORDS;
+    static constexpr int HIGH_BYTES = G::entries::HIGH;
     // A lane's entries of one k-block: rows g and g + 8, and its t.
     struct Raw {
         u32 g[G::WORDS];
@@ -1376,6 +1429,11 @@ template <class G> struct GridPlanes {
         const u64 row = (kblock * 16 + lane / 4) * KBLOCK_BYTES;
         G::load(w.low.chunk(w.base, w.stride, tile, row), raw.g);
         G::load(w.low.chunk(w.base, w.stride, tile, row + 8 * KBLOCK_BYTES), raw.g8);
+        if constexpr (HIGH_BYTES != 0) {
+            const u64 high = (kblock * 16 + lane / 4) * HIGH_BYTES;
+            G::entries::load_high(w.high.chunk(w.base, w.stride, tile, high), raw.g);
+            G::entries::load_high(w.high.chunk(w.base, w.stride, tile, high + 8 * HIGH_BYTES), raw.g8);
+        }
         raw.t = lane % 4;
         return raw;
     }
@@ -1413,15 +1471,24 @@ template <class G> struct GridPlanes {
         slots(raw, step, low, high);
         return slot_code(low, high, slot);
     }
-    // A tile's k-block is its 16 rows' k-block bytes, row by row.
-    static constexpr int CHUNKS = KBLOCK_BYTES;
+    // A tile's k-block is its 16 rows' k-block bytes, row by row, then their
+    // high parts' (the rows' HIGH_BYTES 16-byte chunks).
+    static constexpr int CHUNKS = KBLOCK_BYTES + HIGH_BYTES;
     template <class W> __device__ static __forceinline__ const u8 *chunk_source(const W &w, u64 tile, u64 kblock, u32 chunk) {
+        if constexpr (HIGH_BYTES != 0)
+            if (chunk >= (u32)KBLOCK_BYTES)
+                return w.high.chunk(w.base, w.stride, tile, kblock * 16 * HIGH_BYTES + (chunk - KBLOCK_BYTES) * 16);
         return w.low.chunk(w.base, w.stride, tile, kblock * 16 * KBLOCK_BYTES + chunk * 16);
     }
     __device__ static __forceinline__ Raw from_shared(const u8 *staged, u32 lane) {
         Raw raw;
         G::load_shared(staged + (lane / 4) * KBLOCK_BYTES, raw.g);
         G::load_shared(staged + (lane / 4 + 8) * KBLOCK_BYTES, raw.g8);
+        if constexpr (HIGH_BYTES != 0) {
+            const u8 *high = staged + 16 * KBLOCK_BYTES + (lane / 4) * HIGH_BYTES;
+            G::entries::load_high(high, raw.g);
+            G::entries::load_high(high + 8 * HIGH_BYTES, raw.g8);
+        }
         raw.t = lane % 4;
         return raw;
     }
@@ -1981,8 +2048,8 @@ template <class K, u32 LOW> struct ScaledGemm {
 // The decoder of code axes CODES .. LANES under coefficients K
 // (`PACKETS_COEFFICIENTS`), RECORDS when the layout holds the codes in
 // records (`_PLANE_RECORDS`).
-template <u32 CODES, u32 LOW, u32 HIGH, int OFFSET, u32 TABLE, u32 GRID, u32 INDEX_BITS, u32 LANES, class K, bool RECORDS,
-          bool OPERANDS>
+template <u32 CODES, u32 LOW, u32 HIGH, int OFFSET, u32 TABLE, u32 GRID, u32 INDEX_BITS, u32 LANES, u32 SIGNS, class K,
+          bool RECORDS, bool OPERANDS>
 struct Decoder {
     static_assert(!RECORDS, "only grid codes are held in records");
     typedef Packed<Planes<(int)LOW, (int)HIGH, K::STORAGE % 256 == 0>, typename CodesOf<CODES, OFFSET, TABLE>::type, K,
@@ -1991,12 +2058,12 @@ struct Decoder {
 };
 // A grid code under its coefficients: with carried coefficient codes, the
 // `mma16` records, else the grids plane (multiplied through the scaled GEMM).
-template <u32 LOW, u32 HIGH, int OFFSET, u32 TABLE, u32 GRID, u32 INDEX_BITS, u32 LANES, class K, bool RECORDS,
-          bool OPERANDS>
-struct Decoder<SEISMIC_CODES_GRID, LOW, HIGH, OFFSET, TABLE, GRID, INDEX_BITS, LANES, K, RECORDS, OPERANDS> {
+template <u32 LOW, u32 HIGH, int OFFSET, u32 TABLE, u32 GRID, u32 INDEX_BITS, u32 LANES, u32 SIGNS, class K,
+          bool RECORDS, bool OPERANDS>
+struct Decoder<SEISMIC_CODES_GRID, LOW, HIGH, OFFSET, TABLE, GRID, INDEX_BITS, LANES, SIGNS, K, RECORDS, OPERANDS> {
     static_assert(!OPERANDS, "grid codes have no NVFP4 operands");
     static_assert(RECORDS == IsCarried<K>::value, "mma16 holds carried coefficient codes in records, and only those");
-    typedef typename GridCodesOf<LOW, HIGH, GRID, INDEX_BITS, LANES>::type Codes;
+    typedef typename GridCodesOf<LOW, HIGH, GRID, INDEX_BITS, LANES, SIGNS>::type Codes;
     typedef typename Select<RECORDS, Records<Codes, K>, Packed<GridPlanes<Codes>, Twos, K, true>>::type type;
 };
 
@@ -2038,8 +2105,8 @@ template <class W> __device__ __forceinline__ void row_values16(const W &w, u64 
     packets::Decoder<ELEMENT_CAT(P, _CODES), ELEMENT_CAT(P, _CODE_LOW_BITS), ELEMENT_CAT(P, _CODE_HIGH_BITS), \
                      ELEMENT_CAT(P, _CODES_OFFSET), ELEMENT_CAT(P, _CODES_TABLE), ELEMENT_CAT(P, _CODES_GRID),     \
                      ELEMENT_CAT(P, _CODES_GRID_INDEX_BITS), ELEMENT_CAT(P, _CODES_GRID_LANES),                  \
-                     PACKETS_COEFFICIENTS(P), ELEMENT_HAS(P, _PLANE_RECORDS) != 0,                               \
-                     ELEMENT_HAS(P, _OPERANDS_NVFP4) != 0>::type
+                     ELEMENT_CAT(P, _CODES_GRID_SIGNS), PACKETS_COEFFICIENTS(P),                                 \
+                     ELEMENT_HAS(P, _PLANE_RECORDS) != 0, ELEMENT_HAS(P, _OPERANDS_NVFP4) != 0>::type
 #define PACKETS_MAKE(TYPE, P, pointer)                                                                   \
     TYPE {                                                                                               \
         packets::Rows {                                                                                  \

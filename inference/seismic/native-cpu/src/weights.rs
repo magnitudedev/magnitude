@@ -25,7 +25,7 @@ use crate::element::{bf16_to_f32, f16_to_f32, Dense};
 use crate::quant::{Q8Block, Q8_BLOCK};
 use crate::reduce::{combine, LANES};
 use magnitude_ggml::tables;
-use seismic_lang::registry::{Layout, RepresentationInfo, RepresentationKind, RowPlaneRole};
+use seismic_lang::registry::{GridSigns, Layout, RepresentationInfo, RepresentationKind, RowPlaneRole};
 use std::marker::PhantomData;
 
 /// Values of one packet.
@@ -789,16 +789,27 @@ impl Planes<8, 0, Twos> {
     }
 }
 
-/// Grid codes (`registry::GridCodes`): `BYTES`-byte entries of grid `GRID`
-/// (its position in `tables::GRIDS`), one per eight values, each holding
-/// `8 / lanes` `INDEX_BITS`-bit point indices, first lowest, then seven sign
-/// bits completed by an eighth of even parity. The value at lane `j` of an
-/// entry is byte `j % lanes` of its point `j / lanes`, negated by sign `j`.
+/// Grid codes (`registry::GridCodes`): entries of grid `GRID` (its position
+/// in `tables::GRIDS`), one per eight values, `BYTES` whole bytes in the
+/// codes plane and `HIGH` bits more in the high plane, each holding
+/// `8 / lanes` `INDEX_BITS`-bit point indices, first lowest, then `SIGNS`
+/// sign bits (8, or 7 completed by an eighth of even parity). The value at
+/// lane `j` of an entry is byte `j % lanes` of its point `j / lanes`, negated
+/// by sign `j`.
 #[derive(Clone, Copy, Debug)]
-pub struct Grid<const GRID: usize, const INDEX_BITS: u32, const BYTES: usize>;
+pub struct Grid<
+    const GRID: usize,
+    const INDEX_BITS: u32,
+    const BYTES: usize,
+    const HIGH: u32,
+    const SIGNS: u32,
+>;
 
-impl<const GRID: usize, const INDEX_BITS: u32, const BYTES: usize> Grid<GRID, INDEX_BITS, BYTES> {
+impl<const GRID: usize, const INDEX_BITS: u32, const BYTES: usize, const HIGH: u32, const SIGNS: u32>
+    Grid<GRID, INDEX_BITS, BYTES, HIGH, SIGNS>
+{
     const POINTS: tables::GridPoints = tables::GRIDS[GRID].points;
+    const SIGN_MODE: GridSigns = GridSigns::of_bits(SIGNS);
     /// The greatest magnitude of a point lane.
     const MAGNITUDE: i32 = {
         let mut greatest = 0u8;
@@ -821,25 +832,41 @@ impl<const GRID: usize, const INDEX_BITS: u32, const BYTES: usize> Grid<GRID, IN
         greatest as i32
     };
 
-    /// Entry `e` of the storage group of `at`.
+    /// Entry `e` of the storage group of `at`: its whole bytes, then its
+    /// high bits.
     #[inline(always)]
     unsafe fn entry(at: At, e: usize) -> u32 {
-        let at = unsafe { at.plane(RowPlaneRole::Codes).add(BYTES * e) };
-        (0..BYTES).fold(0, |entry, byte| {
-            entry | (u32::from(unsafe { *at.add(byte) }) << (8 * byte))
-        })
+        let low = unsafe { at.plane(RowPlaneRole::Codes).add(BYTES * e) };
+        let low = (0..BYTES).fold(0, |entry, byte| {
+            entry | (u32::from(unsafe { *low.add(byte) }) << (8 * byte))
+        });
+        if HIGH == 0 {
+            return low;
+        }
+        let bit = HIGH as usize * e;
+        let high = unsafe { at.plane(RowPlaneRole::High).add(bit / 8) };
+        let mut bits = u32::from(unsafe { *high });
+        if bit % 8 + HIGH as usize > 8 {
+            bits |= u32::from(unsafe { *high.add(1) }) << 8;
+        }
+        low | (((bits >> (bit % 8)) & ((1 << HIGH) - 1)) << (8 * BYTES))
+    }
+
+    /// The eight lane signs of `entry` (`GridSigns::lanes`).
+    #[inline(always)]
+    fn signs(entry: u32) -> u32 {
+        Self::SIGN_MODE.lanes((entry >> (8 / Self::POINTS.lanes() * INDEX_BITS)) & ((1 << SIGNS) - 1))
     }
 }
 
 /// The eight values one grid entry gives: `point`'s magnitudes (byte `j` the
-/// lane-`j` magnitude), negated where the seven sign bits `signs` and their
-/// even-parity eighth are set. Bit `j` of the signs becomes byte `j` of a
-/// mask; a magnitude is below 128, so `(m ^ 0xff) + 1 = -m` bytewise without
-/// carries.
+/// lane-`j` magnitude), negated where the eight lane signs `signs` are set.
+/// Bit `j` of the signs becomes byte `j` of a mask; a magnitude is below
+/// 128, so `(m ^ 0xff) + 1 = -m` bytewise without carries.
 #[inline(always)]
 fn grid_values(point: u64, signs: u32) -> [i8; 8] {
     const ONES: u64 = 0x0101_0101_0101_0101;
-    let signs = u64::from(signs | ((signs.count_ones() & 1) << 7));
+    let signs = u64::from(signs);
     let spread = signs.wrapping_mul(ONES) & 0x8040_2010_0804_0201;
     let negative = (spread.wrapping_add(0x7f7f_7f7f_7f7f_7f7f) >> 7) & ONES;
     ((point ^ (negative * 0xff)).wrapping_add(negative))
@@ -847,8 +874,8 @@ fn grid_values(point: u64, signs: u32) -> [i8; 8] {
         .map(|byte| byte as i8)
 }
 
-impl<const GRID: usize, const INDEX_BITS: u32, const BYTES: usize> Codes
-    for Grid<GRID, INDEX_BITS, BYTES>
+impl<const GRID: usize, const INDEX_BITS: u32, const BYTES: usize, const HIGH: u32, const SIGNS: u32>
+    Codes for Grid<GRID, INDEX_BITS, BYTES, HIGH, SIGNS>
 {
     const LEAST: i32 = -Self::MAGNITUDE;
     const GREATEST: i32 = Self::MAGNITUDE;
@@ -859,17 +886,14 @@ impl<const GRID: usize, const INDEX_BITS: u32, const BYTES: usize> Codes
         let mut values = [0i8; PACKET];
         for e in 0..PACKET / 8 {
             let entry = unsafe { Self::entry(at, 4 * at.packet + e) };
-            let (point, signs) = match Self::POINTS {
-                tables::GridPoints::Lanes8(points) => {
-                    (points[(entry & mask) as usize], entry >> INDEX_BITS)
-                }
-                tables::GridPoints::Lanes4(points) => (
+            let point = match Self::POINTS {
+                tables::GridPoints::Lanes8(points) => points[(entry & mask) as usize],
+                tables::GridPoints::Lanes4(points) => {
                     u64::from(points[(entry & mask) as usize])
-                        | (u64::from(points[((entry >> INDEX_BITS) & mask) as usize]) << 32),
-                    entry >> (2 * INDEX_BITS),
-                ),
+                        | (u64::from(points[((entry >> INDEX_BITS) & mask) as usize]) << 32)
+                }
             };
-            values[8 * e..8 * e + 8].copy_from_slice(&grid_values(point, signs & 127));
+            values[8 * e..8 * e + 8].copy_from_slice(&grid_values(point, Self::signs(entry)));
         }
         values
     }

@@ -44,6 +44,9 @@
 // then the high codes'.
 #define CODES_WORDS SEISMIC_CONVERSION_E_U_CODES_UNIT_WORDS
 #define HIGH_WORDS SEISMIC_CONVERSION_E_U_HIGH_UNIT_WORDS
+// A high role outside the span (a grid entry's high part, below a byte a
+// column) is a share of its group, placed as the group roles' are.
+#define HIGH_GROUP_SHARE (HIGH_WORDS == 0 && SEISMIC_CONVERSION_E_U_HIGH_BYTES != 0)
 
 // `bytes` bytes of the record words `words` from word `first` at `place`,
 // aligned as `bytes` bytes from a 16-byte aligned plane are (a unit's share
@@ -115,6 +118,10 @@ void repack_weight() {
     // computed, then each role's share stored.
     if (within == 0u) {
         SEISMIC_CONVERSION_E_U_FIXED(packet, words);
+#if HIGH_GROUP_SHARE
+        store(row + SEISMIC_RESULT_0_ROW_HIGH + group * SEISMIC_CONVERSION_E_U_HIGH_BYTES, words,
+            SEISMIC_CONVERSION_E_U_HIGH_WORD, SEISMIC_CONVERSION_E_U_HIGH_BYTES);
+#endif
         store(row + SEISMIC_RESULT_0_ROW_SCALES + group * SEISMIC_CONVERSION_E_U_SCALES_BYTES, words,
             SEISMIC_CONVERSION_E_U_SCALES_WORD, SEISMIC_CONVERSION_E_U_SCALES_BYTES);
         store(row + SEISMIC_RESULT_0_ROW_SUPERS + group * SEISMIC_CONVERSION_E_U_SUPERS_BYTES, words,

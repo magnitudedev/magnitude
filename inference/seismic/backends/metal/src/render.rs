@@ -27,8 +27,8 @@ use seismic_ir::physical_target::KernelEmissionLayout;
 use seismic_ir::storage::LaunchLocalKind;
 use seismic_lang::intrinsics::{AtomicOp, MathOp, ReduceOp};
 use seismic_lang::registry::{
-    CodeInterpretation, DecodeStep, FloatCodeFormat, GridCodes, LookupTable, PlaneEncoding,
-    PlaneRepackRecipe, RepackExpr, RepresentationKind, GRID_SIGN_BITS,
+    CodeInterpretation, DecodeStep, FloatCodeFormat, GridCodes, GridSigns, LookupTable,
+    PlaneEncoding, PlaneRepackRecipe, RepackExpr, RepresentationKind,
 };
 use seismic_lang::types::DType;
 use std::collections::BTreeMap;
@@ -1860,12 +1860,16 @@ fn grid_code(raw: &str, lane: &str, grid: &GridCodes, table: &str) -> String {
         "{table}[({index}) * {lanes}u + (({lane}) & {}u)]",
         lanes - 1
     );
+    let bits = grid.signs.bits();
     let signs = format!(
         "((uint({raw}) >> {}u) & {}u)",
-        grid.indices() * grid.index_bits(),
-        (1u32 << GRID_SIGN_BITS) - 1
+        grid.sign_bit(),
+        (1u32 << bits) - 1
     );
-    let signs = format!("({signs} | ((popcount({signs}) & 1u) << {GRID_SIGN_BITS}u))");
+    let signs = match grid.signs {
+        GridSigns::Explicit8 => signs,
+        GridSigns::ParityPlus7 => format!("({signs} | ((popcount({signs}) & 1u) << {bits}u))"),
+    };
     format!("(((({signs}) >> ({lane})) & 1u) != 0u ? -int({magnitude}) : int({magnitude}))")
 }
 

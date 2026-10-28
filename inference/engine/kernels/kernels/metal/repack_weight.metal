@@ -45,6 +45,9 @@ static_assert(GROUP % TILE_COLUMNS == 0, "a tile lies in one group");
 #define CODES_WORDS SEISMIC_CONVERSION_E_U_CODES_UNIT_WORDS
 #define HIGH_WORDS SEISMIC_CONVERSION_E_U_HIGH_UNIT_WORDS
 #define UNIT_WORDS (CODES_WORDS + HIGH_WORDS)
+// A high role outside the span (a grid entry's high part, below a byte a
+// column) is a share of its group, placed at the group's first tile.
+#define HIGH_GROUP_SHARE (HIGH_WORDS == 0 && SEISMIC_CONVERSION_E_U_HIGH_BYTES != 0)
 
 // Helpers are inlined before they are optimized: optimized alone, their
 // bodies are general in the constants every call site gives them.
@@ -226,6 +229,23 @@ ALWAYS_INLINE void place_fragments(device uchar *destination, constant ulong *se
     store(out, value, 2 * bits, 2 * bits < 16 ? 2 * bits : 16);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
+
+#if HIGH_GROUP_SHARE
+// The group high share at `words` of row `lane` of the tile at `row0`,
+// placed as its entries are (`PackedRowLayout::code_bit`): the tile's
+// sequence is [k-block][row][the k-block's high bytes].
+ALWAYS_INLINE void place_high(device uchar *destination, constant ulong *seismic_words, ulong b, ulong row0,
+                              uint lane, uint group, thread const uint *words) {
+    constexpr uint kblocks = GROUP / 64, piece = ROLE_BYTES(HIGH) / kblocks;
+    static_assert(GROUP % 64 == 0 && ROLE_BYTES(HIGH) % kblocks == 0, "a group's k-blocks hold its high bytes alike");
+    for (uint q = 0; q < kblocks; ++q)
+        for (uint i = 0; i < piece; ++i) {
+            const uint at = q * piece + i;
+            *tile_plane_byte(destination, seismic_words, b, row0, (ulong(group * kblocks + q) * TILE_ROWS + lane) * piece + i,
+                             SEISMIC_RESULT_0_ROW_HIGH_BYTES, SEISMIC_RESULT_0_ROW_HIGH) = uchar(words[at / 4] >> (8 * (at % 4)));
+        }
+}
+#endif
 #else
 // A code plane's `words` (`bits` a column, a constant) of the tile's 32
 // columns of stored row `n`: one unit of its plane, stored in units of
@@ -328,6 +348,15 @@ kernel void repack_weight(
         } else {
             for (uint word = 0; word < SEISMIC_CONVERSION_E_U_WORDS; ++word) words[word] = 0;
         }
+#if HIGH_GROUP_SHARE
+#if defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16)
+        place_high(destination, seismic_words, b, row0, lane, group, words + ROLE_WORD(HIGH));
+#else
+        store(plane_group(destination, seismic_words, b, n, SEISMIC_RESULT_0_ROW_HIGH, SEISMIC_RESULT_0_ROW_HIGH_BYTES,
+                          ROLE_BYTES(HIGH), group),
+              words + ROLE_WORD(HIGH), ROLE_BYTES(HIGH), SEISMIC_CONVERSION_E_U_HIGH_REST_ALIGNMENT);
+#endif
+#endif
         store(plane_group(destination, seismic_words, b, n, SEISMIC_RESULT_0_ROW_SCALES,
                           SEISMIC_RESULT_0_ROW_SCALES_BYTES, ROLE_BYTES(SCALES), group),
               words + ROLE_WORD(SCALES), ROLE_BYTES(SCALES), ROLE_ALIGNMENT(SCALES));

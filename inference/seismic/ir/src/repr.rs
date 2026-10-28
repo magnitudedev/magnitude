@@ -399,6 +399,13 @@ representation!(IQ2XXSRows16, "iq2xxs", Rows16, F32, 2);
 representation!(IQ2XXSRows8, "iq2xxs", Rows8, F32, 2);
 representation!(IQ2XXSRows32, "iq2xxs", Rows32, F32, 2);
 representation!(IQ2XXSMma16, "iq2xxs", Mma16, F32, 1);
+// iq2s entries have a part below a byte: row layouts hold `grids` and
+// `grids_hi`.
+representation!(IQ2S, "iq2s", F32, 3);
+representation!(IQ2SRows16, "iq2s", Rows16, F32, 4);
+representation!(IQ2SRows8, "iq2s", Rows8, F32, 4);
+representation!(IQ2SRows32, "iq2s", Rows32, F32, 4);
+representation!(IQ2SMma16, "iq2s", Mma16, F32, 4);
 // NVFP4's W4A4 elements: nvfp4g16's storage, NVFP4 rows as operands.
 representation!(NVFP4G16A4, "nvfp4g16a4", F32, 2);
 representation!(NVFP4G16A4Rows16, "nvfp4g16a4", Rows16, F32, 2);
@@ -503,6 +510,10 @@ pub fn with_representation<V: RepresentationVisitor>(
         ("iq2xxs", registry::Layout::Rows8) => return visitor.visit::<IQ2XXSRows8>(),
         ("iq2xxs", registry::Layout::Rows32) => return visitor.visit::<IQ2XXSRows32>(),
         ("iq2xxs", registry::Layout::Mma16) => return visitor.visit::<IQ2XXSMma16>(),
+        ("iq2s", registry::Layout::Rows16) => return visitor.visit::<IQ2SRows16>(),
+        ("iq2s", registry::Layout::Rows8) => return visitor.visit::<IQ2SRows8>(),
+        ("iq2s", registry::Layout::Rows32) => return visitor.visit::<IQ2SRows32>(),
+        ("iq2s", registry::Layout::Mma16) => return visitor.visit::<IQ2SMma16>(),
         (_, registry::Layout::Packet) => {}
         (other, layout) => panic!(
             "registry storage `{other}` in layout `{}` has no type-level marker",
@@ -536,6 +547,7 @@ pub fn with_representation<V: RepresentationVisitor>(
         "iq2xs" => visitor.visit::<IQ2XS>(),
         "iq3xxs" => visitor.visit::<IQ3XXS>(),
         "iq2xxs" => visitor.visit::<IQ2XXS>(),
+        "iq2s" => visitor.visit::<IQ2S>(),
         other => panic!("registry representation `{other}` has no type-level marker"),
     }
 }

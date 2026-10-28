@@ -698,7 +698,7 @@ pub fn code_recipe(
 /// word operations: the grid is finite registry data, expanded into
 /// comparisons and selections before kernel closure like a code table.
 pub fn grid_code_recipe(grid: &'static crate::registry::GridCodes) -> Arc<ReferenceRecipe> {
-    use crate::registry::GRID_SIGN_BITS;
+    use crate::registry::GridSigns;
     cached_recipe(RecipeKey::GridCode(grid), || {
         let b = Recipe::default();
         let entry = b.input(0, DType::U32);
@@ -751,25 +751,32 @@ pub fn grid_code_recipe(grid: &'static crate::registry::GridCodes) -> Arc<Refere
             ),
             b.u(0xff),
         );
-        // Seven sign bits and their even-parity eighth.
+        // The eight lane signs: eight sign bits, or seven and their
+        // even-parity eighth.
+        let sign_bits = grid.signs.bits();
         let signs = b.word(
             WordOp::And,
-            b.word(WordOp::Shr, entry, b.u(grid.indices() * grid.index_bits())),
-            b.u((1 << GRID_SIGN_BITS) - 1),
+            b.word(WordOp::Shr, entry, b.u(grid.sign_bit())),
+            b.u((1 << sign_bits) - 1),
         );
-        let mut parity = signs;
-        for fold in [4, 2, 1] {
-            parity = b.word(WordOp::Xor, parity, b.word(WordOp::Shr, parity, b.u(fold)));
-        }
-        let signs = b.word(
-            WordOp::Or,
-            signs,
-            b.word(
-                WordOp::Shl,
-                b.word(WordOp::And, parity, b.u(1)),
-                b.u(GRID_SIGN_BITS),
-            ),
-        );
+        let signs = match grid.signs {
+            GridSigns::Explicit8 => signs,
+            GridSigns::ParityPlus7 => {
+                let mut parity = signs;
+                for fold in [4, 2, 1] {
+                    parity = b.word(WordOp::Xor, parity, b.word(WordOp::Shr, parity, b.u(fold)));
+                }
+                b.word(
+                    WordOp::Or,
+                    signs,
+                    b.word(
+                        WordOp::Shl,
+                        b.word(WordOp::And, parity, b.u(1)),
+                        b.u(sign_bits),
+                    ),
+                )
+            }
+        };
         let negative = b.word(WordOp::And, b.word(WordOp::Shr, signs, lane), b.u(1));
         let code = b.select(
             b.word_cmp(CmpOp::Eq, negative, b.u(1)),

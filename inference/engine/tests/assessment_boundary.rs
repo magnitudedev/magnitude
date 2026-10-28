@@ -771,7 +771,7 @@ fn a_drafter_with_unsupported_weights_names_them() {
     let scratch = Scratch::new("drafter-weights");
     let target = llama().write(&scratch.file("target.gguf"));
     let mut draft = dflash(HIDDEN);
-    draft.encode("blk.0.ffn_up.weight", Encoding::Iq2S);
+    draft.encode("blk.0.ffn_up.weight", Encoding::Q8K);
     let draft = draft.write(&scratch.file("draft.gguf"));
     let PreparedModelAssessment::Planned { facts, .. } = prepared(&ModelPackagePaths {
         draft: Some(draft),
@@ -781,13 +781,13 @@ fn a_drafter_with_unsupported_weights_names_them() {
         panic!("the target plans without the drafter");
     };
     let DrafterVerdict::Rejected(rejection) = facts.drafter else {
-        panic!("IQ2_S is not imported: {:?}", facts.drafter);
+        panic!("Q8_K is not imported: {:?}", facts.drafter);
     };
     assert_eq!(
         rejection.reasons,
         [UnsupportedReason::WeightTypes {
             types: vec![WeightTypeCount {
-                ggml_type: "IQ2_S".into(),
+                ggml_type: "Q8_K".into(),
                 tensor_count: 1
             }]
         }]

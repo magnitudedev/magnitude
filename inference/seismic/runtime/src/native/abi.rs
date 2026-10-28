@@ -933,6 +933,9 @@ fn render_representation(
                             ));
                         }
                     }
+                    registry::RowPlaneContent::GridHigh { bits, .. } => {
+                        out.push_str(&format!("#define {plane_prefix}_ENTRY_BITS {bits}\n"))
+                    }
                     registry::RowPlaneContent::Groups { .. } => {}
                 }
             }
@@ -1010,8 +1013,9 @@ impl Axis for registry::CodeKind {
 
 /// A code interpretation's axis values: the interpretation, its offset, its
 /// codebook (`SEISMIC_CODEBOOK_<NAME>`), and its grid (`SEISMIC_GRID_<NAME>`)
-/// with the grid's index bits and values a point; 0 where it has none (and
-/// every value 0 for no interpretation).
+/// with the grid's index bits, values a point and sign bits
+/// (`GridSigns::bits`: 8, or 7 with their even-parity eighth); 0 where it has
+/// none (and every value 0 for no interpretation).
 struct Interpretation {
     codes: Option<registry::CodeKind>,
     offset: i32,
@@ -1019,6 +1023,7 @@ struct Interpretation {
     grid: String,
     index_bits: u32,
     lanes: u32,
+    signs: u32,
 }
 
 impl Interpretation {
@@ -1030,6 +1035,7 @@ impl Interpretation {
             grid: "0".to_owned(),
             index_bits: 0,
             lanes: 0,
+            signs: 0,
         }
     }
 
@@ -1055,6 +1061,7 @@ impl Interpretation {
                 grid: id("GRID", grid.grid.name),
                 index_bits: grid.index_bits(),
                 lanes: grid.lanes(),
+                signs: grid.signs.bits(),
                 ..kind
             },
         }
@@ -1171,7 +1178,7 @@ impl Coded {
 /// The decode axes of a packed row-layout element, each defined as
 /// `<prefix>_<AXIS>` (`render_representation`), in the order of the axes
 /// tuple (`render_axes_tuple`).
-const CODING_AXES: [(&str, fn(&Coded) -> String); 20] = [
+const CODING_AXES: [(&str, fn(&Coded) -> String); 21] = [
     ("CODE_LOW_BITS", |c| c.low.to_string()),
     ("CODE_HIGH_BITS", |c| c.high.to_string()),
     ("CODES", |c| c.code.codes()),
@@ -1180,6 +1187,7 @@ const CODING_AXES: [(&str, fn(&Coded) -> String); 20] = [
     ("CODES_GRID", |c| c.code.grid.clone()),
     ("CODES_GRID_INDEX_BITS", |c| c.code.index_bits.to_string()),
     ("CODES_GRID_LANES", |c| c.code.lanes.to_string()),
+    ("CODES_GRID_SIGNS", |c| c.code.signs.to_string()),
     ("CODES_EXPONENT", |c| c.code_exponent.to_string()),
     ("COEFF", |c| c.coeff.constant()),
     ("COEFF_SCALE", |c| c.scale.constant()),
@@ -1620,10 +1628,24 @@ mod tests {
                     ("CODES_GRID", "SEISMIC_GRID_IQ2XXS"),
                     ("CODES_GRID_INDEX_BITS", "8"),
                     ("CODES_GRID_LANES", "8"),
+                    ("CODES_GRID_SIGNS", "7"),
                     ("COEFF", "SEISMIC_COEFF_HIER"),
                     ("COEFF_LOCAL_BITS", "4"),
                     ("COEFF_LOCAL", "SEISMIC_CODES_ODD"),
                     ("COEFF_CARRIED", "15"),
+                ][..],
+            ),
+            (
+                "iq2s@rows16",
+                &[
+                    ("CODE_LOW_BITS", "16"),
+                    ("CODE_HIGH_BITS", "2"),
+                    ("CODES_GRID", "SEISMIC_GRID_IQ2S"),
+                    ("CODES_GRID_INDEX_BITS", "10"),
+                    ("CODES_GRID_SIGNS", "8"),
+                    ("COEFF_GROUP", "16"),
+                    ("COEFF_EXPONENT", "-3"),
+                    ("COEFF_CARRIED", "0"),
                 ][..],
             ),
         ] {

@@ -50,13 +50,15 @@ fn packed(id: seismic_lang::ids::RepresentationId, storage: u32) -> String {
     let axes = registry::decode_axes(id).expect("packed storage has decode axes");
     let codes = match &axes.code {
         CodeInterpretation::Grid(grid) => format!(
-            "Grid<{}, {}, {}>",
+            "Grid<{}, {}, {}, {}, {}>",
             magnitude_ggml::tables::GRIDS
                 .iter()
                 .position(|known| *known == grid.grid)
                 .expect("a ggml grid"),
             grid.index_bits(),
-            axes.low / 8
+            axes.low / 8,
+            axes.high,
+            grid.signs.bits()
         ),
         code => format!(
             "Planes<{}, {}, {}>",

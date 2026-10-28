@@ -54,6 +54,7 @@ struct Rows16 {
     uint r;
     ulong scales_row;
     ulong supers_row;
+    ulong high_row;
 
     // Row `n`'s base (its tile's first row) from the tensor's `base`.
     device const uchar *base_of(device const uchar *base, ulong n) const {
@@ -80,6 +81,11 @@ struct Rows16 {
     }
     device const uchar *super_at(device const uchar *row, ulong offset) const {
         return (row + supers * tile + ulong(r * uint(supers_row))) + ulong(uint(offset));
+    }
+    // The same for a high plane placed as a coefficient plane: a grid
+    // entry's high bits (`registry::RowPlaneContent::GridHigh`).
+    device const uchar *high_at(device const uchar *row, ulong offset) const {
+        return (row + high * tile + ulong(r * uint(high_row))) + ulong(uint(offset));
     }
 };
 
@@ -368,13 +374,14 @@ inline uint plane_bits(device const uchar *plane, uint bit) {
     }
 }
 
-// Grid entries: a packet's four BYTES-byte entries, the code plane of a grid
-// code (`Grid`), entry `step` the step's.
-template <uint BYTES>
+// Grid entries: a packet's four entries of BYTES whole bytes in the codes
+// plane and HIGH bits more in the high plane, the code plane of a grid code
+// (`Grid`), entry `step` the step's.
+template <uint BYTES, uint HIGH>
 struct Entries;
 
 template <>
-struct Entries<2> {
+struct Entries<2, 0> {
     typedef uint2 words;
     static words load(device const uchar *row, Rows16 layout, uint p) {
         return *reinterpret_cast<device const uint2 *>(layout.at(row, layout.codes, 8ul, p));
@@ -383,13 +390,31 @@ struct Entries<2> {
 };
 
 template <>
-struct Entries<3> {
+struct Entries<3, 0> {
     typedef uint3 words;
     static words load(device const uchar *row, Rows16 layout, uint p) {
         return uint3(*reinterpret_cast<device const packed_uint3 *>(layout.at(row, layout.codes, 12ul, p)));
     }
     // Entry `step` at bit 24 * step of the packet's three words.
     static uint entry(words e, uint step) { return word_bits<24>(e, 24u * step); }
+};
+
+// Entries with HIGH bits each in the high plane, a group's placed as its
+// coefficients are: the packet's whole bytes (`low`) and their high bits.
+template <uint BYTES, uint HIGH>
+struct Entries {
+    static_assert(HIGH > 0u && HIGH < 8u, "a high part below a byte");
+    typedef Entries<BYTES, 0> E;
+    struct words {
+        typename E::words low;
+        uint high;
+    };
+    static words load(device const uchar *row, Rows16 layout, uint p) {
+        return words{E::load(row, layout, p), plane_bits<4u * HIGH>(layout.high_at(row, 0ul), p * (4u * HIGH))};
+    }
+    static uint entry(thread const words &e, uint step) {
+        return E::entry(e.low, step) | (((e.high >> (HIGH * step)) & ((1u << HIGH) - 1u)) << (8u * BYTES));
+    }
 };
 
 // Interpretations of codes: a step's codes (`codes`) and the exact values of
@@ -449,7 +474,8 @@ struct Table {
 
 // Grid codes (`registry::GridCodes`): an entry's LANES-value grid points
 // (`grids::table<GRID>`, its first INDEX_BITS-bit index lowest) and, past its
-// indices, seven sign bits completed by an eighth of even parity.
+// indices, SIGNS sign bits: eight, or seven completed by an eighth of even
+// parity.
 template <uint GRID, uint INDEX_BITS, uint LANES>
 struct Points;
 
@@ -469,15 +495,22 @@ struct Points<GRID, INDEX_BITS, 4> {
     }
 };
 
-// The eight lane sign bits of an entry's seven: the eighth makes the count of
-// set bits even.
-inline uint grid_signs(uint signs) { return signs | ((popcount(signs) & 1u) << 7); }
+// The eight lane sign bits of an entry's SIGNS: eight, or seven and an
+// eighth that makes the count of set bits even.
+template <uint SIGNS>
+inline uint grid_signs(uint signs) {
+    static_assert(SIGNS == 7u || SIGNS == 8u, "eight signs, or seven and their parity");
+    if constexpr (SIGNS == 7u)
+        return (signs & 127u) | ((popcount(signs & 127u) & 1u) << 7);
+    else
+        return signs & 255u;
+}
 
-template <uint GRID, uint INDEX_BITS, uint LANES>
+template <uint GRID, uint INDEX_BITS, uint LANES, uint SIGNS>
 struct Grid {
     static constant constexpr int zero = 0;
     typedef Points<GRID, INDEX_BITS, LANES> points;
-    static uint signs(uint entry) { return grid_signs((entry >> points::signs) & 127u); }
+    static uint signs(uint entry) { return grid_signs<SIGNS>(entry >> points::signs); }
     // The eight signed codes of `entry` (lanes 0..3 in x, 4..7 in y).
     template <typename P>
     static void codes(thread const typename P::words &w, uint step, thread float4 &even, thread float4 &odd) {
@@ -1092,34 +1125,33 @@ struct PlanesOf {
 };
 template <uint LOW, uint HIGH>
 struct PlanesOf<SEISMIC_CODES_GRID, LOW, HIGH> {
-    static_assert(HIGH == 0, "grid entries are one plane");
-    typedef Entries<LOW / 8u> type;
+    typedef Entries<LOW / 8u, HIGH> type;
 };
 
 // The interpretation of BITS-bit codes.
-template <uint CODES, uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES>
+template <uint CODES, uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES, uint SIGNS>
 struct InterpretationOf;
-template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES>
-struct InterpretationOf<SEISMIC_CODES_UNSIGNED, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES> {
+template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES, uint SIGNS>
+struct InterpretationOf<SEISMIC_CODES_UNSIGNED, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES, SIGNS> {
     typedef Unsigned type;
 };
-template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES>
-struct InterpretationOf<SEISMIC_CODES_OFFSET, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES> {
+template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES, uint SIGNS>
+struct InterpretationOf<SEISMIC_CODES_OFFSET, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES, SIGNS> {
     typedef Offset<OFFSET> type;
 };
-template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES>
-struct InterpretationOf<SEISMIC_CODES_TWOS, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES> {
+template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES, uint SIGNS>
+struct InterpretationOf<SEISMIC_CODES_TWOS, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES, SIGNS> {
     static_assert(BITS == 8, "two's complement codes are bytes");
     typedef Twos type;
 };
-template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES>
-struct InterpretationOf<SEISMIC_CODES_TABLE, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES> {
+template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES, uint SIGNS>
+struct InterpretationOf<SEISMIC_CODES_TABLE, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES, SIGNS> {
     static_assert(BITS == 4, "codebook codes are nibbles");
     typedef Table<TABLE> type;
 };
-template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES>
-struct InterpretationOf<SEISMIC_CODES_GRID, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES> {
-    typedef Grid<GRID, INDEX_BITS, LANES> type;
+template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES, uint SIGNS>
+struct InterpretationOf<SEISMIC_CODES_GRID, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES, SIGNS> {
+    typedef Grid<GRID, INDEX_BITS, LANES, SIGNS> type;
 };
 
 template <uint SCALE>
@@ -1167,7 +1199,8 @@ struct CoefficientsOf<SEISMIC_COEFF_HIER, CODES, SCALE, BIAS, BIAS_SIGN, GROUP, 
     packets::Packet<                                                                                            \
         packets::PlanesOf<ELEMENT_CAT(P, _CODES), ELEMENT_CAT(P, _CODE_LOW_BITS), ELEMENT_CAT(P, _CODE_HIGH_BITS)>::type, \
         packets::InterpretationOf<ELEMENT_CAT(P, _CODES), ELEMENT_CAT(P, _CODE_LOW_BITS) + ELEMENT_CAT(P, _CODE_HIGH_BITS), \
-            ELEMENT_CAT(P, _CODES_OFFSET), ELEMENT_CAT(P, _CODES_TABLE), ELEMENT_CAT(P, _CODES_GRID), ELEMENT_CAT(P, _CODES_GRID_INDEX_BITS), ELEMENT_CAT(P, _CODES_GRID_LANES)>::type, \
+            ELEMENT_CAT(P, _CODES_OFFSET), ELEMENT_CAT(P, _CODES_TABLE), ELEMENT_CAT(P, _CODES_GRID), ELEMENT_CAT(P, _CODES_GRID_INDEX_BITS), ELEMENT_CAT(P, _CODES_GRID_LANES), \
+            ELEMENT_CAT(P, _CODES_GRID_SIGNS)>::type, \
         packets::CoefficientsOf<ELEMENT_CAT(P, _COEFF), ELEMENT_CAT(P, _CODES), ELEMENT_CAT(P, _COEFF_SCALE),         \
             ELEMENT_CAT(P, _COEFF_BIAS), ELEMENT_CAT(P, _COEFF_BIAS_SIGN), ELEMENT_CAT(P, _COEFF_GROUP),            \
             ELEMENT_CAT(P, _LOGICAL_GROUP),                                                                     \
@@ -1177,7 +1210,7 @@ struct CoefficientsOf<SEISMIC_COEFF_HIER, CODES, SCALE, BIAS, BIAS_SIGN, GROUP, 
 #define PACKETS_ROWS(P)                                                                                \
     packets::Rows16 { ELEMENT_CAT(P, _ROW_STRIDE_BYTES), ELEMENT_CAT(P, _ROW_CODES), ELEMENT_CAT(P, _ROW_HIGH), \
         ELEMENT_CAT(P, _ROW_SCALES), ELEMENT_CAT(P, _ROW_SUPERS), ELEMENT_CAT(P, _TILE_ROWS), 0,            \
-        ELEMENT_CAT(P, _ROW_SCALES_BYTES), ELEMENT_CAT(P, _ROW_SUPERS_BYTES) }
+        ELEMENT_CAT(P, _ROW_SCALES_BYTES), ELEMENT_CAT(P, _ROW_SUPERS_BYTES), ELEMENT_CAT(P, _ROW_HIGH_BYTES) }
 #define PACKETS_DENSE(P) packets::Dense<element::Of<ELEMENT_KIND(P)>::type>
 #define PACKETS_ROWS16_DENSE(E, k) packets::Rows16 { ulong(k) * E::bytes, 0, 0, 0, 0, 1, 0 }
 

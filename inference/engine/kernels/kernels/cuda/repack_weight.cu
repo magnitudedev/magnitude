@@ -54,6 +54,9 @@ static_assert(GROUP % TILE_COLUMNS == 0, "a tile lies in one group");
 #define CODES_WORDS SEISMIC_CONVERSION_E_U_CODES_UNIT_WORDS
 #define HIGH_WORDS SEISMIC_CONVERSION_E_U_HIGH_UNIT_WORDS
 #define UNIT_WORDS (CODES_WORDS + HIGH_WORDS)
+// A high role outside the span (a grid entry's high part, below a byte a
+// column) is a share of its group, placed at the group's first tile.
+#define HIGH_GROUP_SHARE (HIGH_WORDS == 0 && SEISMIC_CONVERSION_E_U_HIGH_BYTES != 0)
 #define WORDS SEISMIC_CONVERSION_E_U_WORDS
 
 // `words` words padded to an odd number (each lane's row of a shared array of
@@ -456,6 +459,25 @@ __device__ __forceinline__ void place_fragments(const Tile &tile, u8 *destinatio
               value, 2 * bits, 2 * bits < 16 ? 2 * bits : 16);
     }
 }
+
+#if HIGH_GROUP_SHARE
+// The group high share at `words` of the lane's row, placed as its entries
+// are (`PackedRowLayout::code_bit`): an mma16 tile's sequence is
+// [k-block][row][the k-block's high bytes].
+__device__ __forceinline__ void place_high(const Tile &tile, u8 *destination, const u32 *words) {
+    constexpr u32 kblocks = GROUP / 64, piece = ROLE_BYTES(HIGH) / kblocks;
+    static_assert(GROUP % 64 == 0 && ROLE_BYTES(HIGH) % kblocks == 0, "a group's k-blocks hold its high bytes alike");
+    const seismic_words_t &seismic_words_value = tile.seismic_words_value;
+    const u32 r = tile.lane % MMA_ROWS;
+    for (u32 q = 0; q < kblocks; ++q)
+        for (u32 i = 0; i < piece; ++i) {
+            const u32 at = q * piece + i;
+            *tile_plane_byte(destination, tile.seismic_words_value, tile.b, tile.row0 + tile.lane - r,
+                             (u64(tile.packet * kblocks + q) * MMA_ROWS + r) * piece + i, SEISMIC_RESULT_0_ROW_HIGH_BYTES,
+                             SEISMIC_RESULT_0_ROW_HIGH) = u8(words[at / 4] >> (8 * (at % 4)));
+        }
+}
+#endif
 #endif
 
 extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
@@ -526,6 +548,14 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
                   ROLE_BYTES(SCALES), ROLE_ALIGNMENT(SCALES));
             store(row + SEISMIC_RESULT_0_ROW_SUPERS + tile.packet * ROLE_BYTES(SUPERS), words + ROLE_WORD(SUPERS),
                   ROLE_BYTES(SUPERS), ROLE_ALIGNMENT(SUPERS));
+#if HIGH_GROUP_SHARE
+#if defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16)
+            place_high(tile, destination, words + ROLE_WORD(HIGH));
+#else
+            store(row + SEISMIC_RESULT_0_ROW_HIGH + tile.packet * ROLE_BYTES(HIGH), words + ROLE_WORD(HIGH),
+                  ROLE_BYTES(HIGH), SEISMIC_CONVERSION_E_U_HIGH_REST_ALIGNMENT);
+#endif
+#endif
         }
     }
 

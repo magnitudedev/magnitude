@@ -203,7 +203,7 @@
     },
     {
       "name": "qwen35-iq2m",
-      "description": "Qwen3.5 4B UD-IQ2_M: IQ2_S tensors have no import.",
+      "description": "Qwen3.5 4B UD-IQ2_M: IQ2_S, IQ3_XXS, IQ3_S, Q2_K, Q3_K, Q4_K, Q5_K and Q8_0 tensors. Binds its built-in MTP head.",
       "target": [
         {
           "header": "headers/Qwen3.5-4B-UD-IQ2_M.gguf.gz",
@@ -213,19 +213,9 @@
         }
       ],
       "expected": {
-        "target": {
-          "unsupported": [
-            {
-              "WeightTypes": {
-                "types": [
-                  {
-                    "ggml_type": "IQ2_S",
-                    "tensor_count": 89
-                  }
-                ]
-              }
-            }
-          ]
+        "target": "supported",
+        "drafter": {
+          "bound": "mtp"
         }
       }
     },

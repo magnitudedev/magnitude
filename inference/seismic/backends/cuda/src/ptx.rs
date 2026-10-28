@@ -15,7 +15,7 @@ use seismic_ir::storage::LaunchLocalKind;
 use seismic_lang::intrinsics::{AtomicOp, MathOp, ReduceOp};
 use seismic_lang::registry::{
     CodeInterpretation, DecodeStep, FloatCodeFormat, GridCodes, LookupTable, PlaneEncoding,
-    PlaneInfo, PlaneRepackRecipe, RepackExpr, GRID_SIGN_BITS,
+    PlaneInfo, PlaneRepackRecipe, RepackExpr, GridSigns,
 };
 use seismic_lang::types::DType;
 use seismic_native_target::{DeviceDescription, NativeCompilationError};
@@ -2167,20 +2167,17 @@ impl<'a> Emitter<'a> {
         self.line(format!("mad.wide.u32 {address}, {slot}, 4, {base};"));
         let magnitude = self.t32();
         self.line(format!("ld.const.s32 {magnitude}, [{address}];"));
+        let bits = grid.signs.bits();
         let signs = self.t32();
-        self.line(format!(
-            "shr.b32 {signs}, {raw}, {};",
-            grid.indices() * grid.index_bits()
-        ));
-        self.line(format!(
-            "and.b32 {signs}, {signs}, {};",
-            (1u32 << GRID_SIGN_BITS) - 1
-        ));
-        let parity = self.t32();
-        self.line(format!("popc.b32 {parity}, {signs};"));
-        self.line(format!("and.b32 {parity}, {parity}, 1;"));
-        self.line(format!("shl.b32 {parity}, {parity}, {GRID_SIGN_BITS};"));
-        self.line(format!("or.b32 {signs}, {signs}, {parity};"));
+        self.line(format!("shr.b32 {signs}, {raw}, {};", grid.sign_bit()));
+        self.line(format!("and.b32 {signs}, {signs}, {};", (1u32 << bits) - 1));
+        if grid.signs == GridSigns::ParityPlus7 {
+            let parity = self.t32();
+            self.line(format!("popc.b32 {parity}, {signs};"));
+            self.line(format!("and.b32 {parity}, {parity}, 1;"));
+            self.line(format!("shl.b32 {parity}, {parity}, {bits};"));
+            self.line(format!("or.b32 {signs}, {signs}, {parity};"));
+        }
         let bit = self.t32();
         self.line(format!("shr.b32 {bit}, {signs}, {lane};"));
         self.line(format!("and.b32 {bit}, {bit}, 1;"));

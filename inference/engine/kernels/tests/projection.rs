@@ -155,10 +155,11 @@ enum Repr {
     Iq2xxs,
     Q2k,
     Q3k,
+    Iq2s,
 }
 
 /// The vector-coded formats (256-value GGUF blocks).
-const GRID_REPRS: [Repr; 3] = [Repr::Iq2xs, Repr::Iq3xxs, Repr::Iq2xxs];
+const GRID_REPRS: [Repr; 4] = [Repr::Iq2xs, Repr::Iq3xxs, Repr::Iq2xxs, Repr::Iq2s];
 
 /// The k-quant formats imported from GGUF blocks of 256 values.
 const K_QUANT_REPRS: [Repr; 2] = [Repr::Q2k, Repr::Q3k];
@@ -197,6 +198,7 @@ impl Repr {
             Repr::Iq2xxs => "iq2xxs",
             Repr::Q2k => "q2k",
             Repr::Q3k => "q3k",
+            Repr::Iq2s => "iq2s",
         }
     }
     /// The GGUF source of a representation built from GGUF blocks, with its
@@ -216,6 +218,7 @@ impl Repr {
             Repr::Iq2xxs => Some(("gguf_iq2_xxs", 66, 256)),
             Repr::Q2k => Some(("gguf_q2_k", 84, 256)),
             Repr::Q3k => Some(("gguf_q3_k", 110, 256)),
+            Repr::Iq2s => Some(("gguf_iq2_s", 82, 256)),
             _ => None,
         }
     }
@@ -308,7 +311,8 @@ fn planes(repr: Repr, k: usize) -> Planes {
         | Repr::Iq3xxs
         | Repr::Iq2xxs
         | Repr::Q2k
-        | Repr::Q3k => {
+        | Repr::Q3k
+        | Repr::Iq2s => {
             unreachable!("{repr:?} takes the registry's geometry (`gguf_weight`)")
         }
     }
@@ -527,7 +531,8 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
             | Repr::Iq3xxs
             | Repr::Iq2xxs
             | Repr::Q2k
-            | Repr::Q3k => {
+            | Repr::Q3k
+            | Repr::Iq2s => {
                 unreachable!("built by `gguf_weight`")
             }
         }
@@ -598,7 +603,7 @@ fn gguf_bytes(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -> V
                 }
             }
             // d: values reach d (2 s + 1) 43 / 8 and d (2 s + 1) 62 / 4.
-            Repr::Iq2xs | Repr::Iq2xxs => {
+            Repr::Iq2xs | Repr::Iq2xxs | Repr::Iq2s => {
                 block[..2].copy_from_slice(&f16_bits(factor / 40.0).to_le_bytes())
             }
             Repr::Iq3xxs => block[..2].copy_from_slice(&f16_bits(factor / 120.0).to_le_bytes()),
@@ -3396,8 +3401,8 @@ fn dense_output_gguf_formats_match_their_portable_body_and_the_host_reference() 
     }
 }
 
-/// IQ2_XS, IQ3_XXS and IQ2_XXS weights, imported into their vector-coded
-/// representations.
+/// IQ2_XS, IQ3_XXS, IQ2_XXS and IQ2_S weights, imported into their
+/// vector-coded representations.
 #[test]
 fn dense_output_grid_formats_match_their_portable_body_and_the_host_reference() {
     for device in devices() {
@@ -3428,7 +3433,7 @@ fn dense_expand_grid_formats_match_their_portable_body() {
     for device in devices() {
         dense_expand_matches_its_portable_body_on(
             &device,
-            &[(Repr::Iq2xs, Repr::Iq3xxs), (Repr::Iq2xxs, Repr::Iq2xxs)],
+            &[(Repr::Iq2xs, Repr::Iq3xxs), (Repr::Iq2xxs, Repr::Iq2xxs), (Repr::Iq2s, Repr::Iq2s)],
         );
     }
 }
@@ -4938,7 +4943,7 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference() {
     let check = ReadoutCheck {
         v: 1000,
         d: 512,
-        reprs: &[Repr::Q6k, Repr::Q4k, Repr::Q8, Repr::Q2k, Repr::Q4g32, Repr::Q3k],
+        reprs: &[Repr::Q6k, Repr::Q4k, Repr::Q8, Repr::Q2k, Repr::Q4g32, Repr::Q3k, Repr::Iq2s],
         output_classes: &ROW_CLASSES,
         mappings: &MAPPINGS,
         softcap: 0.0,
@@ -5514,6 +5519,7 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
         Repr::Iq4xs,
         Repr::Q2k,
         Repr::Q3k,
+        Repr::Iq2s,
         Repr::Bf16,
     ] {
         let table = weight(repr, v, d, 90, 8.0);
@@ -6230,7 +6236,7 @@ fn dense_output_timing_at_model_shapes() {
                 let down_scale = f32_tensor(device, &[0], &[]);
                 let down_bound = absent_bound(device);
                 let mut line = format!("{:>7} {h:>5} x {f:>4} M {rows:>3}:", device.backend().as_str());
-                for repr in [Repr::Q2k, Repr::Q3k, Repr::Iq2xxs, Repr::Iq2xs, Repr::Q4k, Repr::Q4g32s, Repr::Q6k] {
+                for repr in [Repr::Q2k, Repr::Q3k, Repr::Iq2s, Repr::Iq2xxs, Repr::Iq2xs, Repr::Q4k, Repr::Q4g32s, Repr::Q6k] {
                     // Bytes alone: a time does not read the values.
                     let weight = match repr.gguf_source() {
                         Some(_) => resident_tensor(

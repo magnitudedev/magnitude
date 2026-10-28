@@ -14,7 +14,7 @@
 use crate::external_tables::RepackTable;
 use crate::registry::{
     ConversionLayout, PackedPacketLayout, PacketRepackRecipe, PlaneRepackRecipe, RepackExpr,
-    RepresentationConversion, RowPlaneRole,
+    RepresentationConversion, RowPlaneContent, RowPlaneRole,
 };
 use crate::types::DType;
 use std::sync::OnceLock;
@@ -968,21 +968,25 @@ impl WordTable {
                     codes.offset.is_multiple_of(4),
                     "a packet form's codes start at a word"
                 );
-                assert!(
-                    (codes.bytes_per_group * 8).is_multiple_of(packet.group),
-                    "a packet form's codes are whole bits a column"
-                );
+                // Codes of whole bits a column are placed in units; others
+                // (grid entries with a part below a byte) are words of the
+                // packet like the rest.
+                let segments = if (codes.bytes_per_group * 8).is_multiple_of(packet.group) {
+                    vec![WordSegment {
+                        role: RowPlaneRole::Codes,
+                        first: codes.offset / 4,
+                        unit_words: codes.bytes_per_group * 8 / packet.group,
+                    }]
+                } else {
+                    Vec::new()
+                };
                 Self::compile(
                     recipe,
                     packet,
                     packet.packet_size.div_ceil(4),
                     |plane, bit| Some(packet.planes[plane].offset * 8 + bit),
                     Vec::new(),
-                    vec![WordSegment {
-                        role: RowPlaneRole::Codes,
-                        first: codes.offset / 4,
-                        unit_words: codes.bytes_per_group * 8 / packet.group,
-                    }],
+                    segments,
                 )
             }
             ConversionLayout::Rows(rows) => {
@@ -995,7 +999,12 @@ impl WordTable {
                     if let Some(index) = rows.planes.iter().position(|plane| plane.role() == role) {
                         let bytes = rows.planes[index].bytes_per_group;
                         roles.push((role, words, bytes));
-                        if RowPlaneRole::CODES.contains(&role) {
+                        // Column codes are placed in units; a grid
+                        // entry's high part is placed as a group's bytes.
+                        if !matches!(
+                            rows.planes[index].content,
+                            RowPlaneContent::Groups { .. } | RowPlaneContent::GridHigh { .. }
+                        ) {
                             segments.push(WordSegment {
                                 role,
                                 first: words,

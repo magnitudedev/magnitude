@@ -291,18 +291,56 @@ impl CodeInterpretation {
 
 /// Vector codes (the GGUF IQ grids): one entry codes `GRID_VALUES`
 /// consecutive values. It holds `GRID_VALUES / lanes` grid indices of
-/// `index_bits` each, first index lowest, then `GRID_SIGN_BITS` sign bits;
-/// an eighth sign bit makes the count of set signs even (ggml's
-/// `ksigns_iq2xs`). The code of the value at `lane` is the grid magnitude
-/// for that lane, negated when its sign bit is set: byte `lane % lanes` of
-/// `points[index lane / lanes]`. An entry is `entry_bits` wide, whole bytes
-/// (so every layout addresses entries bytewise); bits past the signs are
-/// zero.
+/// `index_bits` each, first index lowest, then the sign bits of its `signs`
+/// mode. The code of the value at `lane` is the grid magnitude for that
+/// lane, negated when its sign is set: byte `lane % lanes` of
+/// `points[index lane / lanes]`. An entry is `entry_bits` wide: a row layout
+/// stores its whole bytes in its `grids` plane and the rest, below a byte,
+/// in its `high` plane (`RowPlaneContent::GridHigh`); bits past the signs
+/// are zero.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct GridCodes {
     pub entry_bits: u32,
     /// The ggml grid: byte `j` of point `i` is the magnitude of its lane `j`.
     pub grid: &'static tables::Grid,
+    pub signs: GridSigns,
+}
+
+/// How a grid entry signs its eight values: sign `j` negates lane `j`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GridSigns {
+    /// Seven sign bits and an eighth that makes the count of set signs
+    /// even (ggml's `ksigns_iq2xs`).
+    ParityPlus7,
+    /// Eight sign bits (ggml's IQ2_S and IQ3_S sign bytes).
+    Explicit8,
+}
+
+impl GridSigns {
+    /// The mode whose entries hold `bits` sign bits.
+    pub const fn of_bits(bits: u32) -> Self {
+        match bits {
+            7 => Self::ParityPlus7,
+            8 => Self::Explicit8,
+            _ => panic!("eight signs, or seven and their parity"),
+        }
+    }
+
+    /// Sign bits an entry holds.
+    pub const fn bits(self) -> u32 {
+        match self {
+            Self::ParityPlus7 => 7,
+            Self::Explicit8 => 8,
+        }
+    }
+
+    /// The eight lane signs of an entry's `bits()` sign bits `signs`.
+    pub const fn lanes(self, signs: u32) -> u32 {
+        match self {
+            Self::ParityPlus7 => signs | ((signs.count_ones() & 1) << 7),
+            Self::Explicit8 => signs,
+        }
+    }
 }
 
 /// A constant table a kernel's code looks up: a conversion recipe's
@@ -325,8 +363,6 @@ impl LookupTable {
 
 /// Values one grid entry codes.
 pub const GRID_VALUES: u32 = 8;
-/// Explicit sign bits of one grid entry.
-pub const GRID_SIGN_BITS: u32 = 7;
 
 impl GridCodes {
     /// The grid's points.
@@ -351,12 +387,16 @@ impl GridCodes {
         GRID_VALUES / self.lanes()
     }
 
+    /// The first entry bit past its indices: its signs.
+    pub const fn sign_bit(&self) -> u32 {
+        self.indices() * self.index_bits()
+    }
+
     /// Bits of one entry.
     pub const fn entry_bits(&self) -> u32 {
         assert!(
-            self.entry_bits % 8 == 0
-                && self.entry_bits >= self.indices() * self.index_bits() + GRID_SIGN_BITS,
-            "a grid entry is whole bytes holding its indices and signs"
+            self.entry_bits >= self.carried_bit(),
+            "a grid entry holds its indices and signs"
         );
         self.entry_bits
     }
@@ -366,7 +406,7 @@ impl GridCodes {
     /// places, in its row layouts, bit `j` of a group's coefficient code at
     /// this bit of the group's entry `j`; the packet form keeps it zero.
     pub const fn carried_bit(&self) -> u32 {
-        self.indices() * self.index_bits() + GRID_SIGN_BITS
+        self.sign_bit() + self.signs.bits()
     }
 
     /// The code of the value at `lane` (< `GRID_VALUES`) of `entry`.
@@ -374,9 +414,8 @@ impl GridCodes {
         let index_mask = (1u32 << self.index_bits()) - 1;
         let index = (entry >> (self.index_bits() * (lane / self.lanes()))) & index_mask;
         let magnitude = self.points().byte(index as usize, lane % self.lanes());
-        let signs = (entry >> (self.index_bits() * self.indices())) & ((1 << GRID_SIGN_BITS) - 1);
-        let signs = signs | ((signs.count_ones() & 1) << GRID_SIGN_BITS);
-        if (signs >> lane) & 1 == 0 {
+        let signs = (entry >> self.sign_bit()) & ((1 << self.signs.bits()) - 1);
+        if (self.signs.lanes(signs) >> lane) & 1 == 0 {
             i32::from(magnitude)
         } else {
             -i32::from(magnitude)
@@ -1377,21 +1416,52 @@ pub(crate) const REPRS: &[Repr] = &[
             carried: false,
         },
     },
+    // GGUF IQ2_S: vector codes of eight values (a 10-bit index of the
+    // 1024-point iq2s grid and 8 sign bits, an 18-bit entry whose top two
+    // sign bits are in the high plane), an odd 4-bit scale `2 s + 1` per 16
+    // and one f16 factor `d` per 256 scaled by 2^-3: ggml's
+    // `d (0.5 + s) / 4` exactly, 82 bytes per 256 values as in GGUF.
+    Repr {
+        name: "iq2s",
+        packing_axis: PackingAxisRule::Last,
+        group: 16,
+        bits: IQ2S_CODES.entry_bits(),
+        code: CodeInterpretation::Grid(&IQ2S_CODES),
+        float_code: None,
+        coefficients: Coefficients::Hierarchical {
+            factor_group: 256,
+            factor_dtype: DType::F16,
+            factor_exponent: -3,
+            bits: 4,
+            interpretation: CodeInterpretation::Odd,
+            minimum: None,
+            carried: false,
+        },
+    },
 ];
 
 pub(crate) static IQ2XS_CODES: GridCodes = GridCodes {
     entry_bits: 16,
     grid: &tables::IQ2XS,
+    signs: GridSigns::ParityPlus7,
 };
 
 pub(crate) static IQ3XXS_CODES: GridCodes = GridCodes {
     entry_bits: 24,
     grid: &tables::IQ3XXS,
+    signs: GridSigns::ParityPlus7,
 };
 
 pub(crate) static IQ2XXS_CODES: GridCodes = GridCodes {
     entry_bits: 16,
     grid: &tables::IQ2XXS,
+    signs: GridSigns::ParityPlus7,
+};
+
+pub(crate) static IQ2S_CODES: GridCodes = GridCodes {
+    entry_bits: 18,
+    grid: &tables::IQ2S,
+    signs: GridSigns::Explicit8,
 };
 
 pub(crate) fn lookup(name: &str) -> Option<&'static Repr> {
@@ -1611,7 +1681,9 @@ impl Repr {
             None => (self.code.clone(), 0),
         };
         let (low, high) = match code {
-            CodeInterpretation::Grid(_) => (self.bits, 0),
+            // An entry's whole bytes, and the rest below a byte
+            // (`RowPlaneContent::GridHigh`).
+            CodeInterpretation::Grid(_) => (self.bits / 8 * 8, self.bits % 8),
             _ => crate::registry::code_planes(self.bits).expect("a packed code width"),
         };
         let coefficients = match &self.coefficients {
