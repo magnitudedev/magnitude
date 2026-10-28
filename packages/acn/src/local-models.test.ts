@@ -105,7 +105,7 @@ describe("local model serving projection", () => {
       speculativeMethod: Option.none(),
     } as unknown as ReadyModel
 
-    const assessment = coordinatedAssessment(snapshot, 1, "catalog", modelId)
+    const assessment = coordinatedAssessment(snapshot, "catalog", modelId)
     expect(assessment?._tag).toBe("Assessed")
     if (assessment?._tag !== "Assessed") return
     const state = catalogModelServingState(ready, assessment, { intelligenceScore: 50, fidelityRank: 40 })
@@ -139,7 +139,7 @@ describe("local model serving projection", () => {
 describe("automatic assessment projection", () => {
   const modelId = ModelIdSchema.make("test-model:gguf:q4")
 
-  it("keeps pending work and stale source revisions assessing", () => {
+  it("keeps a pending slice assessing", () => {
     const pending = {
       revision: 1,
       environmentId: "environment",
@@ -147,8 +147,7 @@ describe("automatic assessment projection", () => {
       catalog: { _tag: "Pending", sourceRevision: 1 },
       custom: { _tag: "Pending", sourceRevision: 1 },
     } as unknown as ModelAssessmentsSnapshot
-    expect(coordinatedAssessment(pending, 1, "catalog", modelId)).toBeUndefined()
-    expect(coordinatedAssessment(pending, 2, "catalog", modelId)).toBeUndefined()
+    expect(coordinatedAssessment(pending, "catalog", modelId)).toBeUndefined()
   })
 
   it("drops exact targets", () => {
@@ -166,7 +165,7 @@ describe("automatic assessment projection", () => {
       },
       custom: { _tag: "Pending", sourceRevision: 1 },
     } as unknown as ModelAssessmentsSnapshot
-    expect(coordinatedAssessment(targetFailure, 1, "catalog", modelId)).toEqual({ _tag: "Dropped" })
+    expect(coordinatedAssessment(targetFailure, "catalog", modelId)).toEqual({ _tag: "Dropped" })
     expect(assessmentTargetVisible({ _tag: "Dropped" })).toBe(false)
   })
 
@@ -204,8 +203,8 @@ describe("automatic assessment projection", () => {
       custom: { _tag: "Pending", sourceRevision: 1 },
     } as unknown as ModelAssessmentsSnapshot
 
-    expect(coordinatedAssessment(snapshot, 1, "catalog", modelId)?._tag).toBe("Assessed")
-    expect(coordinatedAssessment(snapshot, 1, "catalog", badId)).toEqual({ _tag: "Dropped" })
+    expect(coordinatedAssessment(snapshot, "catalog", modelId)?._tag).toBe("Assessed")
+    expect(coordinatedAssessment(snapshot, "catalog", badId)).toEqual({ _tag: "Dropped" })
   })
 
   it("carries the machine's measurement progress into a pending speed", () => {
@@ -239,7 +238,7 @@ describe("automatic assessment projection", () => {
       },
       custom: { _tag: "Pending", sourceRevision: 1 },
     } as unknown as ModelAssessmentsSnapshot
-    const coordinated = coordinatedAssessment(snapshot, 1, "catalog", modelId)
+    const coordinated = coordinatedAssessment(snapshot, "catalog", modelId)
     expect(coordinated?._tag === "Assessed" && coordinated.assessment._tag === "Fits"
       && coordinated.assessment.performance).toEqual({
       _tag: "Pending",
@@ -341,7 +340,7 @@ describe("local model preparation projection", () => {
     })
   })
 
-  it("does not unlock on completed assessment state for an older source snapshot", () => {
+  it("stays complete across a source revision the assessments have not caught up to", () => {
     expect(projectLocalModelPreparation(
       { ...sources(true, 2, 1), localModelsRevision: 2 },
       {
@@ -361,7 +360,7 @@ describe("local model preparation projection", () => {
       } as unknown as ModelAssessmentsSnapshot,
     )).toEqual({
       discovery: { complete: true, modelsFound: 1 },
-      assessment: { complete: false, settledModels: 3, totalModels: 3 },
+      assessment: { complete: true, settledModels: 3, totalModels: 3 },
     })
   })
 })

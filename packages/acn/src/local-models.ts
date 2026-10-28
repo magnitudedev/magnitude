@@ -103,14 +103,13 @@ const failure = (code: string, message: string, retryable = false): ModelFailure
 
 const assessmentDomainProgress = (
   domain: ModelAssessmentDomainSnapshot,
-  sourceRevision: number,
 ): { readonly complete: boolean; readonly settledModels: number; readonly totalModels: number } => {
   switch (domain._tag) {
     case "Available": {
       const totalModels = domain.entries.length
       const settledModels = domain.entries.filter(({ state }) => state._tag !== "Assessing").length
       return {
-        complete: domain.sourceRevision === sourceRevision && settledModels === totalModels,
+        complete: settledModels === totalModels,
         settledModels,
         totalModels,
       }
@@ -127,8 +126,8 @@ export const projectLocalModelPreparation = (
     complete: source.reconciliationComplete,
     modelsFound: source.customModels.length,
   }
-  const catalog = assessmentDomainProgress(assessments.catalog, source.catalogRevision)
-  const custom = assessmentDomainProgress(assessments.custom, source.localModelsRevision)
+  const catalog = assessmentDomainProgress(assessments.catalog)
+  const custom = assessmentDomainProgress(assessments.custom)
   return {
     discovery,
     assessment: {
@@ -202,12 +201,11 @@ export const projectAssessment = (
 
 export const coordinatedAssessment = (
   snapshot: ModelAssessmentsSnapshot,
-  sourceRevision: number,
   source: "catalog" | "custom",
   modelId: ModelId,
 ): CoordinatedLocalModelAssessment | undefined => {
   const domain: ModelAssessmentDomainSnapshot = snapshot[source]
-  if (domain.sourceRevision !== sourceRevision || domain._tag === "Pending") return undefined
+  if (domain._tag === "Pending") return undefined
   const entry = domain.entries.find(({ subject }) => subject.modelId === modelId)
   if (entry === undefined || entry.state._tag === "Assessing") return undefined
   if (entry.state._tag === "Dropped") return { _tag: "Dropped" }
@@ -702,10 +700,10 @@ export const projectLocalModels = (inputs: LocalModelsInputs): LocalModelsState 
   })
   const custom = source.customModels.map((entry) => customInputs(
     entry,
-    coordinatedAssessment(assessment, source.localModelsRevision, "custom", entry.id),
+    coordinatedAssessment(assessment, "custom", entry.id),
   ))
   const catalog = source.catalogModels.flatMap((entry) => {
-    const coordinated = coordinatedAssessment(assessment, source.catalogRevision, "catalog", entry.id)
+    const coordinated = coordinatedAssessment(assessment, "catalog", entry.id)
     return assessmentTargetVisible(coordinated)
       ? [catalogModel(entry, latestOperation.get(entry.id), removals.get(entry.id), coordinated, runtime, config.hidden)]
       : []
