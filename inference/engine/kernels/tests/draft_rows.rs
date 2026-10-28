@@ -3,7 +3,8 @@
 //! `mma16`): the embedding table and the combine weight are GGUF packets
 //! repacked to that layout, and the result is checked against a host model of
 //! the entry's contract. The table takes every form a target embedding table
-//! a draft head reads is stored in (Q8_0, Q4_0, Q4_K, Q6_K, Q2_K, BF16).
+//! a draft head reads is stored in (Q8_0, Q4_0, Q4_1, Q4_K, Q6_K, Q2_K,
+//! BF16).
 
 use magnitude_kernels::{draft_rows, repack_weight};
 use seismic::{Device, Element, Layout, NativeSpecialization, Tensor};
@@ -50,6 +51,7 @@ fn resident_q8(device: &Device) -> Element {
 enum TableForm {
     Q8_0,
     Q4_0,
+    Q4_1,
     Q4K,
     Q6K,
     Q2K,
@@ -68,7 +70,15 @@ struct GgufBlocks {
 }
 
 impl TableForm {
-    const ALL: [TableForm; 6] = [Self::Q8_0, Self::Q4_0, Self::Q4K, Self::Q6K, Self::Q2K, Self::Bf16];
+    const ALL: [TableForm; 7] = [
+        Self::Q8_0,
+        Self::Q4_0,
+        Self::Q4_1,
+        Self::Q4K,
+        Self::Q6K,
+        Self::Q2K,
+        Self::Bf16,
+    ];
 
     fn gguf(self) -> Option<GgufBlocks> {
         let blocks = |external, resident, block_bytes, block_values, scales| GgufBlocks {
@@ -81,6 +91,7 @@ impl TableForm {
         match self {
             Self::Q8_0 => Some(blocks("gguf_q8_0", "q8g32s", 34, 32, &[(0, 127.0)])),
             Self::Q4_0 => Some(blocks("gguf_q4_0", "q4g32s", 18, 32, &[(0, 8.0)])),
+            Self::Q4_1 => Some(blocks("gguf_q4_1", "q4g32", 20, 32, &[(0, 15.0), (2, 1.0)])),
             Self::Q4K => Some(blocks(
                 "gguf_q4_k",
                 "q4k",

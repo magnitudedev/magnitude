@@ -1711,6 +1711,8 @@ enum Experts {
     Iq2Xxs,
     /// Every expert weight q2k (Q2_K).
     Q2k,
+    /// Every expert weight q4g32 (Q4_1).
+    Q4g32,
 }
 
 /// The 35B-A3B storage mix at reduced width: expert weights per `Experts`,
@@ -1760,6 +1762,7 @@ impl PackedBlock {
             Experts::Grid => ["iq2xs", "iq3xxs", "iq2xs"],
             Experts::Iq2Xxs => ["iq2xxs"; 3],
             Experts::Q2k => ["q2k"; 3],
+            Experts::Q4g32 => ["q4g32"; 3],
         };
         let expert_weight = |which: usize, shape: &[u64], seed: u32| match experts {
             Experts::Bf16 => bf16_weight(device, shape, seed),
@@ -2082,11 +2085,11 @@ fn native_decode_expand_and_output_match_reference_with_iq2_xxs_experts() {
 }
 
 /// Experts in the representations of Q4_0, MXFP4, Q5_1, NVFP4, Q5_0, IQ2_XS,
-/// IQ3_XXS and Q2_K.
+/// IQ3_XXS, Q2_K and Q4_1.
 #[test]
 fn native_decode_expand_and_output_match_reference_with_coded_experts() {
     for device in devices() {
-        for experts in [Experts::Coded, Experts::Fp4, Experts::Fp4A4, Experts::Grid, Experts::Q2k] {
+        for experts in [Experts::Coded, Experts::Fp4, Experts::Fp4A4, Experts::Grid, Experts::Q2k, Experts::Q4g32] {
             native_decode_expand_and_output_match_reference_rows(
                 &device,
                 PackedBlock::new(&device, experts),

@@ -1067,13 +1067,14 @@ pub(crate) const REPRS: &[Repr] = &[
         code: CodeInterpretation::Unsigned,
         float_code: None,
     },
+    // GGUF Q4_1: unsigned 4-bit codes, one f16 scale and one f16 min per 32.
     Repr {
         name: "q4g32",
         packing_axis: PackingAxisRule::Last,
         group: 32,
         bits: 4,
         coefficients: Coefficients::Direct {
-            dtype: DType::F32,
+            dtype: DType::F16,
             bias: true,
             packet_group: 32,
         },

@@ -211,6 +211,7 @@ fn stored_rows_decode_the_rows_their_directory_names() {
         ("gguf_q4_0", "q4g32s@rows16", None),
         ("gguf_q5_0", "q5g32s@rows16", None),
         ("gguf_q5_1", "q5g32@rows16", None),
+        ("gguf_q4_1", "q4g32@rows16", None),
     ] {
         stored_rows_match(source, resident, as_stored, 160);
     }

@@ -39,8 +39,10 @@ pub enum Format {
     Q8,
     /// GGUF IQ4_XS, resident as iq4g32.
     Iq4,
-    /// GGUF Q4_0, Q5_0, Q5_1, MXFP4, NVFP4 (representations of their own).
+    /// GGUF Q4_0, Q4_1, Q5_0, Q5_1, MXFP4, NVFP4 (representations of their
+    /// own).
     Q4_0,
+    Q4_1,
     Q5_0,
     Q5_1,
     Mxfp4,
@@ -58,13 +60,14 @@ pub enum Format {
 }
 
 impl Format {
-    pub const ALL: [Format; 15] = [
+    pub const ALL: [Format; 16] = [
         Format::Q4K,
         Format::Q5K,
         Format::Q6K,
         Format::Q8,
         Format::Iq4,
         Format::Q4_0,
+        Format::Q4_1,
         Format::Q5_0,
         Format::Q5_1,
         Format::Mxfp4,
@@ -83,6 +86,7 @@ impl Format {
             Format::Q8 => "gguf_q8_0",
             Format::Iq4 => "gguf_iq4_xs",
             Format::Q4_0 => "gguf_q4_0",
+            Format::Q4_1 => "gguf_q4_1",
             Format::Q5_0 => "gguf_q5_0",
             Format::Q5_1 => "gguf_q5_1",
             Format::Mxfp4 => "gguf_mxfp4",
@@ -101,6 +105,7 @@ impl Format {
             Format::Q8 => "q8g32s",
             Format::Iq4 => "iq4g32",
             Format::Q4_0 => "q4g32s",
+            Format::Q4_1 => "q4g32",
             Format::Q5_0 => "q5g32s",
             Format::Q5_1 => "q5g32",
             Format::Mxfp4 => "mxfp4g32",
@@ -119,6 +124,7 @@ impl Format {
         matches!(
             self,
             Format::Q4_0
+                | Format::Q4_1
                 | Format::Q5_0
                 | Format::Q5_1
                 | Format::Mxfp4
@@ -164,6 +170,11 @@ impl Format {
             }
             Format::Q4_0 => {
                 block.extend(f16(rng.uniform(0.0005, 0.003)));
+                block.extend((0..16).map(|_| rng.byte()));
+            }
+            Format::Q4_1 => {
+                block.extend(f16(rng.uniform(0.0005, 0.003)));
+                block.extend(f16(-rng.uniform(0.005, 0.02)));
                 block.extend((0..16).map(|_| rng.byte()));
             }
             Format::Q5_0 => {
@@ -214,7 +225,12 @@ impl Format {
     }
     pub fn block_values(self) -> usize {
         match self {
-            Format::Q8 | Format::Q4_0 | Format::Q5_0 | Format::Q5_1 | Format::Mxfp4 => 32,
+            Format::Q8
+            | Format::Q4_0
+            | Format::Q4_1
+            | Format::Q5_0
+            | Format::Q5_1
+            | Format::Mxfp4 => 32,
             Format::Nvfp4 | Format::Nvfp4A4 => 64,
             _ => 256,
         }

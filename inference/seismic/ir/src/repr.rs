@@ -324,18 +324,21 @@ representation!(Q5G32, "q5g32", F32, 3);
 representation!(MXFP4G32, "mxfp4g32", F32, 2);
 representation!(NVFP4G16, "nvfp4g16", F32, 2);
 representation!(Q4G32SRows16, "q4g32s", Rows16, F32, 2);
+representation!(Q4G32Rows16, "q4g32", Rows16, F32, 2);
 representation!(IQ4G32SRows16, "iq4g32s", Rows16, F32, 2);
 representation!(Q5G32SRows16, "q5g32s", Rows16, F32, 3);
 representation!(Q5G32Rows16, "q5g32", Rows16, F32, 3);
 representation!(MXFP4G32Rows16, "mxfp4g32", Rows16, F32, 2);
 representation!(NVFP4G16Rows16, "nvfp4g16", Rows16, F32, 2);
 representation!(Q4G32SRows8, "q4g32s", Rows8, F32, 2);
+representation!(Q4G32Rows8, "q4g32", Rows8, F32, 2);
 representation!(IQ4G32SRows8, "iq4g32s", Rows8, F32, 2);
 representation!(Q5G32SRows8, "q5g32s", Rows8, F32, 3);
 representation!(Q5G32Rows8, "q5g32", Rows8, F32, 3);
 representation!(MXFP4G32Rows8, "mxfp4g32", Rows8, F32, 2);
 representation!(NVFP4G16Rows8, "nvfp4g16", Rows8, F32, 2);
 representation!(Q4G32SMma16, "q4g32s", Mma16, F32, 2);
+representation!(Q4G32Mma16, "q4g32", Mma16, F32, 2);
 representation!(IQ4G32SMma16, "iq4g32s", Mma16, F32, 2);
 representation!(Q5G32SMma16, "q5g32s", Mma16, F32, 3);
 representation!(Q5G32Mma16, "q5g32", Mma16, F32, 3);
@@ -352,6 +355,7 @@ representation!(Q6KRows8, "q6k", Rows8, F32, 4);
 representation!(Q8G32SRows8, "q8g32s", Rows8, F32, 2);
 representation!(IQ4G32Rows8, "iq4g32", Rows8, F32, 2);
 representation!(Q4G32SRows32, "q4g32s", Rows32, F32, 2);
+representation!(Q4G32Rows32, "q4g32", Rows32, F32, 2);
 representation!(IQ4G32SRows32, "iq4g32s", Rows32, F32, 2);
 representation!(Q5G32SRows32, "q5g32s", Rows32, F32, 3);
 representation!(Q5G32Rows32, "q5g32", Rows32, F32, 3);
@@ -442,6 +446,7 @@ pub fn with_representation<V: RepresentationVisitor>(
         ("q8g32s", registry::Layout::Rows32) => return visitor.visit::<Q8G32SRows32>(),
         ("iq4g32", registry::Layout::Rows32) => return visitor.visit::<IQ4G32Rows32>(),
         ("q4g32s", registry::Layout::Rows32) => return visitor.visit::<Q4G32SRows32>(),
+        ("q4g32", registry::Layout::Rows32) => return visitor.visit::<Q4G32Rows32>(),
         ("iq4g32s", registry::Layout::Rows32) => return visitor.visit::<IQ4G32SRows32>(),
         ("q5g32s", registry::Layout::Rows32) => return visitor.visit::<Q5G32SRows32>(),
         ("q5g32", registry::Layout::Rows32) => return visitor.visit::<Q5G32Rows32>(),
@@ -457,18 +462,21 @@ pub fn with_representation<V: RepresentationVisitor>(
         ("q2k", registry::Layout::Rows32) => return visitor.visit::<Q2KRows32>(),
         ("q2k", registry::Layout::Mma16) => return visitor.visit::<Q2KMma16>(),
         ("q4g32s", registry::Layout::Rows16) => return visitor.visit::<Q4G32SRows16>(),
+        ("q4g32", registry::Layout::Rows16) => return visitor.visit::<Q4G32Rows16>(),
         ("iq4g32s", registry::Layout::Rows16) => return visitor.visit::<IQ4G32SRows16>(),
         ("q5g32s", registry::Layout::Rows16) => return visitor.visit::<Q5G32SRows16>(),
         ("q5g32", registry::Layout::Rows16) => return visitor.visit::<Q5G32Rows16>(),
         ("mxfp4g32", registry::Layout::Rows16) => return visitor.visit::<MXFP4G32Rows16>(),
         ("nvfp4g16", registry::Layout::Rows16) => return visitor.visit::<NVFP4G16Rows16>(),
         ("q4g32s", registry::Layout::Rows8) => return visitor.visit::<Q4G32SRows8>(),
+        ("q4g32", registry::Layout::Rows8) => return visitor.visit::<Q4G32Rows8>(),
         ("iq4g32s", registry::Layout::Rows8) => return visitor.visit::<IQ4G32SRows8>(),
         ("q5g32s", registry::Layout::Rows8) => return visitor.visit::<Q5G32SRows8>(),
         ("q5g32", registry::Layout::Rows8) => return visitor.visit::<Q5G32Rows8>(),
         ("mxfp4g32", registry::Layout::Rows8) => return visitor.visit::<MXFP4G32Rows8>(),
         ("nvfp4g16", registry::Layout::Rows8) => return visitor.visit::<NVFP4G16Rows8>(),
         ("q4g32s", registry::Layout::Mma16) => return visitor.visit::<Q4G32SMma16>(),
+        ("q4g32", registry::Layout::Mma16) => return visitor.visit::<Q4G32Mma16>(),
         ("iq4g32s", registry::Layout::Mma16) => return visitor.visit::<IQ4G32SMma16>(),
         ("q5g32s", registry::Layout::Mma16) => return visitor.visit::<Q5G32SMma16>(),
         ("q5g32", registry::Layout::Mma16) => return visitor.visit::<Q5G32Mma16>(),

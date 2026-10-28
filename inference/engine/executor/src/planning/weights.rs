@@ -2440,6 +2440,7 @@ mod stored_table_tests {
             (Encoding::Iq4Nl, 18, "iq4g32s", 96, 2_764_800),
             (Encoding::Q8_0, 34, "q8g32s", 176, 2_848_581),
             (Encoding::Q4_0, 18, "q4g32s", 96, 2_764_800),
+            (Encoding::Q4_1, 20, "q4g32", 112, 2_633_142),
             (Encoding::Q5_0, 22, "q5g32s", 128, 2_534_400),
             (Encoding::Q5_1, 24, "q5g32", 144, 2_457_600),
             (Encoding::Mxfp4, 17, "mxfp4g32", 96, 2_611_200),

@@ -664,6 +664,11 @@ fn pattern_source(representation: &str) -> Option<(Element, Vec<u8>)> {
             unit_packet(18, &[(0, &[0x00, 0x3c]), (2, &[0x99; 16])]),
         ),
         // Codes 1, d = 1 and minimum m = 0.
+        "q4g32" => (
+            "gguf_q4_1",
+            unit_packet(20, &[(0, &[0x00, 0x3c]), (4, &[0x11; 16])]),
+        ),
+        // Codes 1, d = 1 and minimum m = 0.
         "q5g32" => (
             "gguf_q5_1",
             unit_packet(24, &[(0, &[0x00, 0x3c]), (8, &[0x11; 16])]),
@@ -870,8 +875,8 @@ mod tests {
     fn repeated_pattern_block_matches_the_whole_conversion() {
         let mut compared = Vec::new();
         for representation in [
-            "q8g32s", "q5g32s", "q4k", "q5k", "q6k", "iq4g32", "q4g32s", "q5g32", "mxfp4g32",
-            "nvfp4g16", "iq2xs", "iq3xxs", "iq2xxs",
+            "q8g32s", "q5g32s", "q4k", "q5k", "q6k", "iq4g32", "q4g32s", "q4g32", "q5g32",
+            "mxfp4g32", "nvfp4g16", "iq2xs", "iq3xxs", "iq2xxs",
         ] {
             let (source, packet) = pattern_source(representation).unwrap();
             for layout in [Layout::Packet, Layout::Rows16, Layout::Rows8, Layout::Mma16] {
@@ -904,8 +909,8 @@ mod tests {
     #[test]
     fn every_packed_representation_has_a_unit_fixture() {
         let representations = [
-            "q8g32s", "q4k", "q5k", "q6k", "iq4g32", "q4g32s", "q5g32s", "q5g32", "mxfp4g32",
-            "nvfp4g16", "nvfp4g16a4", "iq2xs", "iq3xxs", "iq2xxs",
+            "q8g32s", "q4k", "q5k", "q6k", "iq4g32", "q4g32s", "q4g32", "q5g32s", "q5g32",
+            "mxfp4g32", "nvfp4g16", "nvfp4g16a4", "iq2xs", "iq3xxs", "iq2xxs",
         ];
         for representation in representations {
             let stored = Element::stored(representation, Layout::Packet).unwrap();

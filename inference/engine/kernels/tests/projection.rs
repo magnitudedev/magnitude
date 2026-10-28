@@ -142,6 +142,7 @@ enum Repr {
     // Built from GGUF blocks through the registry's conversion
     // (`gguf_weight`).
     Q4g32s,
+    Q4g32,
     Iq4g32s,
     Q5g32s,
     Q5g32,
@@ -162,8 +163,9 @@ const GRID_REPRS: [Repr; 3] = [Repr::Iq2xs, Repr::Iq3xxs, Repr::Iq2xxs];
 const K_QUANT_REPRS: [Repr; 1] = [Repr::Q2k];
 
 /// The formats with a representation of their own, imported from GGUF.
-const GGUF_REPRS: [Repr; 7] = [
+const GGUF_REPRS: [Repr; 8] = [
     Repr::Q4g32s,
+    Repr::Q4g32,
     Repr::Iq4g32s,
     Repr::Q5g32s,
     Repr::Q5g32,
@@ -187,6 +189,7 @@ impl Repr {
             Repr::Iq4 => "iq4g32",
             Repr::Bf16 => "bf16",
             Repr::Q4g32s => "q4g32s",
+            Repr::Q4g32 => "q4g32",
             Repr::Iq4g32s => "iq4g32s",
             Repr::Q5g32s => "q5g32s",
             Repr::Q5g32 => "q5g32",
@@ -204,6 +207,7 @@ impl Repr {
     fn gguf_source(self) -> Option<(&'static str, usize, usize)> {
         match self {
             Repr::Q4g32s => Some(("gguf_q4_0", 18, 32)),
+            Repr::Q4g32 => Some(("gguf_q4_1", 20, 32)),
             Repr::Iq4g32s => Some(("gguf_iq4_nl_block", 18, 32)),
             Repr::Q5g32s => Some(("gguf_q5_0", 22, 32)),
             Repr::Q5g32 => Some(("gguf_q5_1", 24, 32)),
@@ -297,6 +301,7 @@ fn planes(repr: Repr, k: usize) -> Planes {
         }
         Repr::Bf16 => at = 2 * k,
         Repr::Q4g32s
+        | Repr::Q4g32
         | Repr::Iq4g32s
         | Repr::Q5g32s
         | Repr::Q5g32
@@ -526,6 +531,7 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
                 }
             }
             Repr::Q4g32s
+            | Repr::Q4g32
             | Repr::Iq4g32s
             | Repr::Q5g32s
             | Repr::Q5g32
@@ -586,6 +592,10 @@ fn gguf_bytes(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -> V
             // d: the table's values reach 127 d.
             Repr::Iq4g32s => block[..2].copy_from_slice(&f16_bits(factor / 128.0).to_le_bytes()),
             Repr::Q5g32s => block[..2].copy_from_slice(&f16_bits(factor / 16.0).to_le_bytes()),
+            Repr::Q4g32 => {
+                block[..2].copy_from_slice(&f16_bits(factor / 8.0).to_le_bytes());
+                block[2..4].copy_from_slice(&f16_bits(-factor).to_le_bytes());
+            }
             Repr::Q5g32 => {
                 block[..2].copy_from_slice(&f16_bits(factor / 16.0).to_le_bytes());
                 block[2..4].copy_from_slice(&f16_bits(-factor).to_le_bytes());
@@ -3331,6 +3341,7 @@ fn packing_bound_matches_its_portable_body() {
             Repr::Iq4g32s,
             Repr::Q5g32s,
             Repr::Q5g32,
+            Repr::Q4g32,
         ] {
             let (rows, k) = (40, 512);
             let w = weight(repr, rows, k, 17, 1.0);
@@ -3386,8 +3397,8 @@ fn dense_output_iq4_matches_its_portable_body_and_the_host_reference() {
     }
 }
 
-/// Q4_0, Q5_0, Q5_1, MXFP4 and NVFP4 weights, imported into representations
-/// of their own.
+/// Q4_0, Q4_1, Q5_0, Q5_1, MXFP4 and NVFP4 weights, imported into
+/// representations of their own.
 #[test]
 fn dense_output_gguf_formats_match_their_portable_body_and_the_host_reference() {
     for device in devices() {
@@ -3442,6 +3453,7 @@ fn dense_expand_gguf_formats_match_their_portable_body() {
                 (Repr::Nvfp4, Repr::Nvfp4),
                 (Repr::Nvfp4A4, Repr::Nvfp4A4),
                 (Repr::Q5g32s, Repr::Q5g32),
+                (Repr::Q4g32, Repr::Q4g32),
             ],
         );
     }
@@ -4933,7 +4945,7 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference() {
     let check = ReadoutCheck {
         v: 1000,
         d: 512,
-        reprs: &[Repr::Q6k, Repr::Q4k, Repr::Q8, Repr::Q2k],
+        reprs: &[Repr::Q6k, Repr::Q4k, Repr::Q8, Repr::Q2k, Repr::Q4g32],
         output_classes: &ROW_CLASSES,
         mappings: &MAPPINGS,
         softcap: 0.0,

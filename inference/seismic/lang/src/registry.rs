@@ -1594,7 +1594,7 @@ const fn gguf_source_spec(
     }
 }
 
-const GGUF_SOURCES: [GgufSource; 18] = [
+const GGUF_SOURCES: [GgufSource; 19] = [
     gguf_source_spec(Encoding::Q3K, 1, "gguf_q3_k", "q6k"),
     gguf_source_spec(Encoding::Iq3S, 1, "gguf_iq3_s", "q6k"),
     gguf_source_spec(Encoding::Q4K, 1, "gguf_q4_k", "q4k"),
@@ -1604,6 +1604,7 @@ const GGUF_SOURCES: [GgufSource; 18] = [
     gguf_source_spec(Encoding::Iq4Nl, 8, "gguf_iq4_nl", "iq4g32"),
     gguf_source_spec(Encoding::Iq4Xs, 1, "gguf_iq4_xs", "iq4g32"),
     gguf_source_spec(Encoding::Q4_0, 1, "gguf_q4_0", "q4g32s"),
+    gguf_source_spec(Encoding::Q4_1, 1, "gguf_q4_1", "q4g32"),
     gguf_source_spec(Encoding::Iq4Nl, 1, "gguf_iq4_nl_block", "iq4g32s"),
     gguf_source_spec(Encoding::Q5_0, 1, "gguf_q5_0", "q5g32s"),
     gguf_source_spec(Encoding::Q5_1, 1, "gguf_q5_1", "q5g32"),
@@ -1957,9 +1958,9 @@ pub(crate) mod internals {
         // blocks (one iq4g32 storage group), each block's f16 scale widened
         // exactly; an IQ4_NL block alone (`gguf_iq4_nl_block`, the rows of a
         // table whose width is a multiple of 32 but not of 256, held as
-        // stored) is an iq4g32s packet. Q4_0, Q5_0, Q5_1, MXFP4 and NVFP4
-        // move their codes and scale fields bit for bit into representations
-        // of their own.
+        // stored) is an iq4g32s packet. Q4_0, Q4_1, Q5_0, Q5_1, MXFP4 and
+        // NVFP4 move their codes and scale fields bit for bit into
+        // representations of their own.
         let external_specs = GGUF_SOURCES.map(|source| {
             let packet_size = u32::try_from(source.encoding.block_bytes() * source.blocks)
                 .expect("a GGUF source packet fits u32 bytes");
@@ -2992,17 +2993,20 @@ pub(crate) mod internals {
                     ),
                 ));
             }
-            "gguf_q4_0" | "gguf_iq4_nl_block" => {
-                // block_q4_0 and one block_iq4_nl: d (f16) | qs[16]. Value p
-                // is the low (p < 16) or high nibble of qs[p % 16]; d moves
-                // bit for bit.
+            "gguf_q4_0" | "gguf_iq4_nl_block" | "gguf_q4_1" => {
+                // block_q4_0 and one block_iq4_nl: d (f16) | qs[16];
+                // block_q4_1: d | m (f16) | qs[16]. Value p is the low
+                // (p < 16) or high nibble of qs[p % 16]; d and m move bit
+                // for bit.
+                let minimum = source_name == "gguf_q4_1";
+                let header = if minimum { 4 } else { 2 };
                 push(plane(
                     "words",
                     PlaneRepackRecipe::BitRoutes(
                         (0..128)
                             .map(|bit| {
                                 let position = bit / 4;
-                                (2 + position % 16) * 8 + (position / 16) * 4 + bit % 4
+                                (header + position % 16) * 8 + (position / 16) * 4 + bit % 4
                             })
                             .collect(),
                     ),
@@ -3011,6 +3015,12 @@ pub(crate) mod internals {
                     "scale",
                     PlaneRepackRecipe::BitRoutes(direct_bits(0, 2)),
                 ));
+                if minimum {
+                    push(plane(
+                        "bias",
+                        PlaneRepackRecipe::BitRoutes(direct_bits(2, 2)),
+                    ));
+                }
             }
             "gguf_mxfp4" => {
                 // block_mxfp4: e (E8M0) | qs[16]. Value p is the low (p < 16)
@@ -3818,6 +3828,7 @@ mod tests {
             ("nvfp4g16@mma16", 1),
             ("q5g32s@mma16", 4),
             ("q5g32@mma16", 4),
+            ("q4g32@mma16", 2),
         ] {
             assert_eq!(row_layout(name).group_multiple, multiple, "{name}");
         }
