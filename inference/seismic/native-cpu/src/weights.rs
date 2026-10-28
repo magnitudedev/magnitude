@@ -268,6 +268,29 @@ impl<E: Dense> Format for DenseRows<E> {
         let first = b * Q8_BLOCK;
         let valid = (k - first).min(Q8_BLOCK);
         let mut out = [[0.0f32; M]; R];
+        if valid == Q8_BLOCK {
+            // A whole block: each packet widens once for every activation
+            // block and accumulates in the tier's vectors, value `i` into lane
+            // `i % LANES` in index order as below.
+            for (row, out) in rows.iter().zip(&mut out) {
+                let mut lanes = [[0.0f32; LANES]; M];
+                for local in 0..Q8_BLOCK / PACKET {
+                    let mut values = [0.0f32; PACKET];
+                    unsafe { Self::decode::<MODE>(row, b * (Q8_BLOCK / PACKET) + local, k, &mut values) };
+                    for (lanes, x) in lanes.iter_mut().zip(x.iter()) {
+                        let mut codes = [0.0f32; PACKET];
+                        for (code, x) in codes.iter_mut().zip(&x.codes[PACKET * local..]) {
+                            *code = f32::from(*x);
+                        }
+                        unsafe { accumulate::<MODE>(lanes, &values, &codes) };
+                    }
+                }
+                for ((out, lanes), x) in out.iter_mut().zip(lanes).zip(x.iter()) {
+                    *out = x.d * combine(lanes);
+                }
+            }
+            return out;
+        }
         for (row, out) in rows.iter().zip(&mut out) {
             let values = unsafe {
                 std::slice::from_raw_parts(row.start.cast::<E::Storage>().add(first), valid)
@@ -1095,7 +1118,9 @@ const fn shifted<C: Codes>(limit: i32) -> bool {
 /// The exact integer dots of the first `packets` packets of `block` with
 /// each activation block of `x`: `[m][h][local]`, per `GROUP`-value
 /// coefficient group of a packet (the whole packet in `h = 0` when a group
-/// covers it).
+/// covers it), as `f32`: a dot of 32 products of at most 128 x 255 is below
+/// 2^24 in magnitude, so its `f32` is exact, and it converts in the vectors
+/// that reduce it.
 #[inline(always)]
 unsafe fn packet_dots<
     C: Codes,
@@ -1107,31 +1132,56 @@ unsafe fn packet_dots<
     block: &Block,
     packets: usize,
     x: [&Q8Block; M],
-) -> [[[i32; 8]; 2]; M] {
+) -> [[[f32; 8]; 2]; M] {
     let halves = const { groups_per_packet(GROUP) };
-    let mut exact = [[[0i32; 8]; 2]; M];
+    let mut exact = [[[0.0f32; 8]; 2]; M];
     #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
     {
         use std::arch::aarch64::*;
+        // A packet's products are four lanes; pairwise adds reduce four
+        // packets' into one vector of their sums, which stays a vector (no
+        // lane-by-lane reduction into general registers).
+        let zero = unsafe { vdupq_n_s32(0) };
+        let mut unpaired = [[zero; 2]; M];
+        let mut pairs = [[[zero; 4]; 2]; M];
         for local in packets_of(packets) {
             let weights = unsafe { C::neon(block.at::<STORAGE>(local)) };
             for m in 0..M {
                 let activations = x[m].codes[PACKET * local..].as_ptr();
                 let (first, second) =
                     unsafe { (vld1q_s8(activations), vld1q_s8(activations.add(16))) };
-                let zero = unsafe { vdupq_n_s32(0) };
-                if halves == 2 {
-                    exact[m][0][local] =
-                        unsafe { vaddvq_s32(packed_neon::sdot(zero, weights[0], first)) };
-                    exact[m][1][local] =
-                        unsafe { vaddvq_s32(packed_neon::sdot(zero, weights[1], second)) };
+                let products = if halves == 2 {
+                    [
+                        packed_neon::sdot(zero, weights[0], first),
+                        packed_neon::sdot(zero, weights[1], second),
+                    ]
                 } else {
                     let products = packed_neon::sdot(
                         packed_neon::sdot(zero, weights[0], first),
                         weights[1],
                         second,
                     );
-                    exact[m][0][local] = unsafe { vaddvq_s32(products) };
+                    [products, zero]
+                };
+                for h in 0..halves {
+                    if local % 2 == 0 {
+                        unpaired[m][h] = products[h];
+                    } else {
+                        pairs[m][h][local / 2] = unsafe { vpaddq_s32(unpaired[m][h], products[h]) };
+                    }
+                }
+            }
+        }
+        for m in 0..M {
+            for h in 0..halves {
+                if packets % 2 == 1 {
+                    pairs[m][h][packets / 2] = unsafe { vpaddq_s32(unpaired[m][h], zero) };
+                }
+                let pairs = pairs[m][h];
+                unsafe {
+                    let quads = [vpaddq_s32(pairs[0], pairs[1]), vpaddq_s32(pairs[2], pairs[3])];
+                    vst1q_f32(exact[m][h].as_mut_ptr(), vcvtq_f32_s32(quads[0]));
+                    vst1q_f32(exact[m][h].as_mut_ptr().add(4), vcvtq_f32_s32(quads[1]));
                 }
             }
         }
@@ -1153,10 +1203,10 @@ unsafe fn packet_dots<
                 let (first, second) = packed_x86::halves8(products);
                 if halves == 1 {
                     let whole = _mm256_add_epi32(first, second);
-                    _mm256_storeu_si256(exact[m][0].as_mut_ptr().cast(), whole);
+                    _mm256_storeu_ps(exact[m][0].as_mut_ptr(), _mm256_cvtepi32_ps(whole));
                 } else {
-                    _mm256_storeu_si256(exact[m][0].as_mut_ptr().cast(), first);
-                    _mm256_storeu_si256(exact[m][1].as_mut_ptr().cast(), second);
+                    _mm256_storeu_ps(exact[m][0].as_mut_ptr(), _mm256_cvtepi32_ps(first));
+                    _mm256_storeu_ps(exact[m][1].as_mut_ptr(), _mm256_cvtepi32_ps(second));
                 }
             }
         }
@@ -1169,7 +1219,7 @@ unsafe fn packet_dots<
             let dots = scalar_dots::<M, GROUP, MODE>(&values, x, local);
             for m in 0..M {
                 for h in 0..halves {
-                    exact[m][h][local] = dots[m][h];
+                    exact[m][h][local] = dots[m][h] as f32;
                 }
             }
         }
@@ -1440,7 +1490,7 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32> C
                 for m in 0..M {
                     for h in 0..halves {
                         let (scale, bias) = coefficients[h];
-                        sums[m] = scale.mul_add(exact[m][h][local] as f32, sums[m]);
+                        sums[m] = scale.mul_add(exact[m][h][local], sums[m]);
                         if BIAS {
                             let codes = activation_sum(x[m], local, h, halves == 1);
                             sums[m] = bias.mul_add(codes as f32, sums[m]);
