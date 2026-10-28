@@ -7,6 +7,7 @@ import torch
 
 from magnitude_references.families.gemma4 import Gemma4Reference
 from magnitude_references.families.lfm2 import Lfm2Reference
+from magnitude_references.families.lfm3 import Lfm3Reference
 from magnitude_references.families.llama import LlamaReference
 from magnitude_references.families.muse import MuseReference
 from magnitude_references.families.nemotron_h import NemotronHReference
@@ -21,6 +22,7 @@ REFERENCES: dict[str, tuple[str, type[Reference]]] = {
     "llama": ("llama", LlamaReference),
     "lfm2": ("lfm2", Lfm2Reference),
     "lfm2moe": ("lfm2", Lfm2Reference),
+    "lfm3": ("lfm3", Lfm3Reference),
     "muse-glimmer": ("muse", MuseReference),
     "gemma4": ("gemma4", Gemma4Reference),
     "nemotron_h_moe": ("nemotron_h", NemotronHReference),

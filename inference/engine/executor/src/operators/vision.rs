@@ -12,9 +12,9 @@
 use crate::error::PlanError;
 use magnitude_family_contracts::{
     CellReduction, LinearPart, NormPart, VisionActivation, VisionAttentionScale,
-    VisionAttentionSpan, VisionBlock, VisionDescription, VisionLinear, VisionLinearSite,
-    VisionNorm, VisionNormSite, VisionStem, VisionUp, VisionWeight, WeightKind, WeightRole,
-    WeightScope,
+    VisionAttentionSpan, VisionBlock, VisionDescription, VisionGatedConvolution, VisionLinear,
+    VisionLinearSite, VisionNorm, VisionNormSite, VisionOperator, VisionStem, VisionUp,
+    VisionWeight, WeightKind, WeightRole, WeightScope,
 };
 use seismic::Element;
 
@@ -26,6 +26,7 @@ pub enum VisionEntry {
     Linear,
     Clamp,
     Attention,
+    GatedConvolution,
     Pool,
     Position,
     /// The decoder's sandwich-norm tail (`post_norm_residual`).
@@ -70,7 +71,7 @@ pub enum VisionOperands {
         frame: WeightRole,
         next_frame: Option<WeightRole>,
         bias: Option<WeightRole>,
-        table: WeightRole,
+        table: Option<WeightRole>,
     },
     Norm {
         source: VisionValue,
@@ -112,6 +113,12 @@ pub enum VisionOperands {
         log_base: f32,
         epsilon: f32,
         unit_scale: bool,
+    },
+    /// `A(A(conv(value)) * gate)` over the image's patch grid.
+    GatedConvolution {
+        value: VisionValue,
+        gate: VisionValue,
+        kernel: WeightRole,
     },
     Pool {
         source: VisionValue,
@@ -161,6 +168,9 @@ pub struct VisionProgram {
     /// merge order.
     pub coordinates: bool,
     pub windows: bool,
+    /// The kernel side of the tower's gated convolutions, whose neighbour
+    /// table the graph reads.
+    pub convolution: Option<u64>,
 }
 
 impl VisionProgram {
@@ -186,6 +196,7 @@ fn activation_code(activation: VisionActivation) -> i32 {
         VisionActivation::GeluErf => 2,
         VisionActivation::GeluQuick => 3,
         VisionActivation::ReluSquared => 4,
+        VisionActivation::Silu => 5,
     }
 }
 
@@ -409,6 +420,70 @@ impl Builder<'_> {
         ))
     }
 
+    /// `C ⊙ conv(B ⊙ X)` of `normalized`: the gated input published by the
+    /// value projection's gate epilogue, the output gate, then the
+    /// convolution.
+    fn gated_convolution(
+        &mut self,
+        normalized: VisionValue,
+        hidden: u64,
+        convolution: &VisionGatedConvolution,
+        scope: WeightScope,
+    ) -> Result<VisionValue, PlanError> {
+        let (a, patches) = (self.activation, VisionRows::Patches);
+        let input_gate = self.linear(
+            normalized,
+            patches,
+            hidden,
+            &convolution.input_gate,
+            scope,
+            VisionLinearSite::ConvolutionInputGate,
+            a,
+            None,
+            None,
+            0,
+        )?;
+        let value = self.linear(
+            normalized,
+            patches,
+            hidden,
+            &convolution.value,
+            scope,
+            VisionLinearSite::ConvolutionValue,
+            a,
+            None,
+            Some(input_gate),
+            0,
+        )?;
+        let gate = self.linear(
+            normalized,
+            patches,
+            hidden,
+            &convolution.output_gate,
+            scope,
+            VisionLinearSite::ConvolutionOutputGate,
+            a,
+            None,
+            None,
+            0,
+        )?;
+        let kernel = role(scope, VisionWeight::ConvolutionKernel);
+        let side = convolution.side();
+        let elements = vec![("A", a), ("KE", self.element(Some(kernel))?)];
+        let statics = vec![("H", hidden), ("T", side * side)];
+        Ok(self.push(
+            VisionEntry::GatedConvolution,
+            elements,
+            statics,
+            hidden,
+            VisionOperands::GatedConvolution {
+                value,
+                gate,
+                kernel,
+            },
+        ))
+    }
+
     fn block(
         &mut self,
         h: VisionValue,
@@ -419,109 +494,125 @@ impl Builder<'_> {
         let scope = block_scope(index)?;
         let (a, f32e) = (self.activation, Element::f32());
         let patches = VisionRows::Patches;
-        let attention = &block.attention;
         let normalized = self.norm(
             h,
             patches,
             1,
             hidden,
-            &block.attention_norm,
+            &block.operator_norm,
             scope,
-            VisionNormSite::AttentionInput,
+            VisionNormSite::OperatorInput,
             a,
             false,
             false,
         )?;
-        let inner = attention.heads * attention.width;
-        let query = self.linear(
-            normalized,
-            patches,
-            hidden,
-            &attention.query,
-            scope,
-            VisionLinearSite::Query,
-            a,
-            None,
-            None,
-            0,
-        )?;
-        let key = self.linear(
-            normalized,
-            patches,
-            hidden,
-            &attention.key,
-            scope,
-            VisionLinearSite::Key,
-            a,
-            None,
-            None,
-            0,
-        )?;
-        let value = self.linear(
-            normalized,
-            patches,
-            hidden,
-            &attention.value,
-            scope,
-            VisionLinearSite::Value,
-            a,
-            None,
-            None,
-            0,
-        )?;
-        let epsilons = [
-            attention.query_norm.as_ref().map(|norm| norm.epsilon),
-            attention.key_norm.as_ref().map(|norm| norm.epsilon),
-            attention.value_norm.as_ref().map(|norm| norm.epsilon),
-        ];
-        let mut present = epsilons.iter().flatten();
-        let epsilon = present.next().copied();
-        if present.any(|other| Some(*other) != epsilon) {
-            return Err(unsupported("vision head norms with different epsilons"));
-        }
-        let query_norm = attention
-            .query_norm
-            .as_ref()
-            .map(|_| role(scope, VisionWeight::QueryNorm));
-        let key_norm = attention
-            .key_norm
-            .as_ref()
-            .map(|_| role(scope, VisionWeight::KeyNorm));
-        let elements = vec![("A", a)];
-        let statics = vec![
-            ("H", attention.heads),
-            ("P", attention.width / 4),
-            ("NQ", u64::from(query_norm.is_some())),
-            ("NV", u64::from(attention.value_norm.is_some())),
-            ("WS", 1),
-        ];
-        let attended = self.push(
-            VisionEntry::Attention,
-            elements,
-            statics,
-            inner,
-            VisionOperands::Attention {
-                query,
-                key,
-                value,
-                query_norm,
-                key_norm,
-                value_norm: attention.value_norm.is_some(),
-                span: attention.span,
-                log_base: attention.rotary_base.map_or(0.0, f64::ln) as f32,
-                // Unread without head norms.
-                epsilon: epsilon.unwrap_or(0.0) as f32,
-                unit_scale: attention.scale == VisionAttentionScale::Unit,
-            },
-        );
-        let h = match &block.attention_post_norm {
+        let (mixed, inner, output, site) = match &block.operator {
+            VisionOperator::Attention(attention) => {
+                let inner = attention.heads * attention.width;
+                let query = self.linear(
+                    normalized,
+                    patches,
+                    hidden,
+                    &attention.query,
+                    scope,
+                    VisionLinearSite::Query,
+                    a,
+                    None,
+                    None,
+                    0,
+                )?;
+                let key = self.linear(
+                    normalized,
+                    patches,
+                    hidden,
+                    &attention.key,
+                    scope,
+                    VisionLinearSite::Key,
+                    a,
+                    None,
+                    None,
+                    0,
+                )?;
+                let value = self.linear(
+                    normalized,
+                    patches,
+                    hidden,
+                    &attention.value,
+                    scope,
+                    VisionLinearSite::Value,
+                    a,
+                    None,
+                    None,
+                    0,
+                )?;
+                let epsilons = [
+                    attention.query_norm.as_ref().map(|norm| norm.epsilon),
+                    attention.key_norm.as_ref().map(|norm| norm.epsilon),
+                    attention.value_norm.as_ref().map(|norm| norm.epsilon),
+                ];
+                let mut present = epsilons.iter().flatten();
+                let epsilon = present.next().copied();
+                if present.any(|other| Some(*other) != epsilon) {
+                    return Err(unsupported("vision head norms with different epsilons"));
+                }
+                let query_norm = attention
+                    .query_norm
+                    .as_ref()
+                    .map(|_| role(scope, VisionWeight::QueryNorm));
+                let key_norm = attention
+                    .key_norm
+                    .as_ref()
+                    .map(|_| role(scope, VisionWeight::KeyNorm));
+                let elements = vec![("A", a)];
+                let statics = vec![
+                    ("KV", attention.kv_heads),
+                    ("G", attention.heads / attention.kv_heads),
+                    ("P", attention.width / 4),
+                    ("NQ", u64::from(query_norm.is_some())),
+                    ("NV", u64::from(attention.value_norm.is_some())),
+                    ("WS", 1),
+                ];
+                let attended = self.push(
+                    VisionEntry::Attention,
+                    elements,
+                    statics,
+                    inner,
+                    VisionOperands::Attention {
+                        query,
+                        key,
+                        value,
+                        query_norm,
+                        key_norm,
+                        value_norm: attention.value_norm.is_some(),
+                        span: attention.span,
+                        log_base: attention.rotary_base.map_or(0.0, f64::ln) as f32,
+                        // Unread without head norms.
+                        epsilon: epsilon.unwrap_or(0.0) as f32,
+                        unit_scale: attention.scale == VisionAttentionScale::Unit,
+                    },
+                );
+                (
+                    attended,
+                    inner,
+                    &attention.output,
+                    VisionLinearSite::AttentionOutput,
+                )
+            }
+            VisionOperator::GatedConvolution(convolution) => (
+                self.gated_convolution(normalized, hidden, convolution, scope)?,
+                hidden,
+                &convolution.output,
+                VisionLinearSite::ConvolutionOutput,
+            ),
+        };
+        let h = match &block.operator_post_norm {
             None => self.linear(
-                attended,
+                mixed,
                 patches,
                 inner,
-                &attention.output,
+                output,
                 scope,
-                VisionLinearSite::AttentionOutput,
+                site,
                 f32e,
                 Some(h),
                 None,
@@ -529,16 +620,7 @@ impl Builder<'_> {
             )?,
             Some(norm) => {
                 let projected = self.linear(
-                    attended,
-                    patches,
-                    inner,
-                    &attention.output,
-                    scope,
-                    VisionLinearSite::AttentionOutput,
-                    f32e,
-                    None,
-                    None,
-                    0,
+                    mixed, patches, inner, output, scope, site, f32e, None, None, 0,
                 )?;
                 self.post_norm(
                     h,
@@ -546,7 +628,7 @@ impl Builder<'_> {
                     hidden,
                     norm,
                     scope,
-                    VisionNormSite::AttentionOutput,
+                    VisionNormSite::OperatorOutput,
                 )?
             }
         };
@@ -670,7 +752,7 @@ pub(crate) fn vision_program(
         VisionStem::Patch {
             frames,
             bias,
-            positions: _,
+            positions,
             norm,
             registers: register_table,
         } => {
@@ -690,11 +772,12 @@ pub(crate) fn vision_program(
                 _ => return Err(unsupported("vision patch stem frame count")),
             };
             let bias = bias.as_ref().map(|_| role(vision, VisionWeight::PatchBias));
+            let table = positions.as_ref().map(|_| table);
             let elements = vec![
                 ("W0", b.element(Some(frame))?),
                 ("W1", b.element(next_frame)?),
                 ("B", b.element(bias)?),
-                ("PE", b.element(Some(table))?),
+                ("PE", b.element(table)?),
             ];
             let statics = vec![
                 ("C", preprocessing.channels),
@@ -702,6 +785,7 @@ pub(crate) fn vision_program(
                 ("P", preprocessing.patch),
                 ("H", hidden),
                 ("NB", u64::from(bias.is_some())),
+                ("NT", u64::from(table.is_some())),
             ];
             let h = b.push(
                 VisionEntry::PatchStem,
@@ -824,6 +908,24 @@ pub(crate) fn vision_program(
     }
     if registers > 0 && windows {
         return Err(unsupported("vision register rows with windowed attention"));
+    }
+    // Every gated convolution reads one neighbour table over the image's
+    // patch rows.
+    let mut sides = description
+        .blocks
+        .iter()
+        .filter_map(|block| match &block.operator {
+            VisionOperator::GatedConvolution(convolution) => Some(convolution.side()),
+            VisionOperator::Attention(_) => None,
+        });
+    let convolution = sides.next();
+    if sides.any(|side| Some(side) != convolution) {
+        return Err(unsupported("vision convolutions of different kernel sides"));
+    }
+    if convolution.is_some() && (registers > 0 || windows) {
+        return Err(unsupported(
+            "vision convolutions with register rows or windowed attention",
+        ));
     }
     // The merger reads the tower's patch rows, past its register rows.
     let patch_rows = |value: VisionValue| match value {
@@ -1012,7 +1114,11 @@ pub(crate) fn vision_program(
         cell_rows,
         registers,
         pixel_width,
-        coordinates: !description.blocks.is_empty(),
+        coordinates: description
+            .blocks
+            .iter()
+            .any(|block| matches!(block.operator, VisionOperator::Attention(_))),
         windows,
+        convolution,
     })
 }

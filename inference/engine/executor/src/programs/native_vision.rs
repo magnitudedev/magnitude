@@ -20,8 +20,8 @@ use crate::{
 };
 use magnitude_family_contracts::{VisionAttentionSpan, VisionDescription, WeightRole};
 use magnitude_kernels::{
-    post_norm_residual, vision_attention, vision_clamp, vision_linear, vision_norm,
-    vision_patch_stem, vision_pool, vision_position,
+    post_norm_residual, vision_attention, vision_clamp, vision_gated_convolution, vision_linear,
+    vision_norm, vision_patch_stem, vision_pool, vision_position,
 };
 use seismic::{
     BackendName, BoundNativeGraphPlan, Device, Element, NativeGraph, NativeGraphClassSlice,
@@ -88,6 +88,10 @@ trait VisionBindings<G: GraphDraft> {
         &self,
         kernel: &VisionKernel,
     ) -> Result<G::Binding<'_, vision_attention::Entry>, GraphError>;
+    fn gated_convolution(
+        &self,
+        kernel: &VisionKernel,
+    ) -> Result<G::Binding<'_, vision_gated_convolution::Entry>, GraphError>;
     fn pool(&self, kernel: &VisionKernel)
     -> Result<G::Binding<'_, vision_pool::Entry>, GraphError>;
     fn position(
@@ -137,6 +141,12 @@ impl VisionBindings<NativeGraph> for VisionKernels {
     ) -> Result<&NativeKernel<vision_attention::Entry>, GraphError> {
         prepared(&self.attention, kernel)
     }
+    fn gated_convolution(
+        &self,
+        kernel: &VisionKernel,
+    ) -> Result<&NativeKernel<vision_gated_convolution::Entry>, GraphError> {
+        prepared(&self.gated_convolution, kernel)
+    }
     fn pool(&self, kernel: &VisionKernel) -> Result<&NativeKernel<vision_pool::Entry>, GraphError> {
         prepared(&self.pool, kernel)
     }
@@ -180,6 +190,9 @@ impl VisionBindings<NativeGraphMetadata> for VisionProgramPlan {
         planned_elements(self, kernel)
     }
     fn attention(&self, kernel: &VisionKernel) -> Result<&[(&str, Element)], GraphError> {
+        planned_elements(self, kernel)
+    }
+    fn gated_convolution(&self, kernel: &VisionKernel) -> Result<&[(&str, Element)], GraphError> {
         planned_elements(self, kernel)
     }
     fn pool(&self, kernel: &VisionKernel) -> Result<&[(&str, Element)], GraphError> {
@@ -270,6 +283,7 @@ struct VisionGraphPorts {
     window_spans: Option<NativePort>,
     image_spans: Option<NativePort>,
     order: Option<NativePort>,
+    neighbors: Option<NativePort>,
     weights: Vec<(WeightRole, NativePort)>,
     constants: Vec<GraphConstant>,
     features: WorkflowTensor,
@@ -293,6 +307,7 @@ struct Draft<'b, G: GraphDraft, B: VisionBindings<G>> {
     window_spans: Option<NativePort>,
     image_spans: Option<NativePort>,
     order: Option<NativePort>,
+    neighbors: Option<NativePort>,
     weights: Vec<(WeightRole, NativePort)>,
     constants: Vec<(Constant, GraphConstant)>,
 }
@@ -448,7 +463,10 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                 table,
             } => {
                 let (c, s, p, h) = (statics("C")?, statics("S")?, statics("P")?, statics("H")?);
-                let l = self.table_rows(*table, h)?;
+                let l = match table {
+                    Some(table) => self.table_rows(*table, h)?,
+                    None => 0,
+                };
                 let dims = [
                     ("M", rows),
                     ("C", c),
@@ -457,6 +475,7 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                     ("H", h),
                     ("L", l),
                     ("NB", statics("NB")?),
+                    ("NT", statics("NT")?),
                 ];
                 let binding = self.bindings.patch_stem(kernel)?;
                 let pixels = self.graph.input_for(binding, "pixels", &dims)?;
@@ -468,7 +487,10 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                     None => self.empty(Constant::EmptyF32, &[h, c, p, p])?,
                 };
                 let bias = self.rows_of(*bias, &[h])?;
-                let table = self.weight(*table, &[l, h])?;
+                let table = match table {
+                    Some(table) => self.weight(*table, &[l, h])?,
+                    None => self.empty(Constant::EmptyF32, &[h])?,
+                };
                 let value = self
                     .graph
                     .enqueue::<vision_patch_stem::Entry>(
@@ -645,11 +667,12 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                 epsilon,
                 unit_scale,
             } => {
-                let (heads, quarter) = (statics("H")?, statics("P")?);
-                let width = 4 * quarter;
+                let (kv_heads, group, quarter) = (statics("KV")?, statics("G")?, statics("P")?);
+                let (heads, width) = (kv_heads * group, 4 * quarter);
                 let dims = [
                     ("M", rows),
-                    ("H", heads),
+                    ("KV", kv_heads),
+                    ("G", group),
                     ("P", quarter),
                     ("NQ", statics("NQ")?),
                     ("NV", statics("NV")?),
@@ -669,10 +692,9 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                     *spans = Some(self.graph.input_for(binding, "spans", &dims)?);
                 }
                 let spans = input_view(spans, &[1, rows, 2])?;
-                let shape = [rows, heads, width];
-                let query = self.value(*query, &shape)?;
-                let key = self.value(*key, &shape)?;
-                let value = self.value(*value, &shape)?;
+                let query = self.value(*query, &[rows, heads, width])?;
+                let key = self.value(*key, &[rows, kv_heads, width])?;
+                let value = self.value(*value, &[rows, kv_heads, width])?;
                 let query_norm = self.rows_of(*query_norm, &[width])?;
                 let key_norm = self.rows_of(*key_norm, &[width])?;
                 let value_norm = if *value_norm {
@@ -697,6 +719,34 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                             log_base: *log_base,
                             epsilon: *epsilon,
                             unit_scale: i32::from(*unit_scale),
+                        },
+                    )?
+                    .value
+            }
+            VisionOperands::GatedConvolution {
+                value,
+                gate,
+                kernel: weights,
+            } => {
+                let (h, taps) = (statics("H")?, statics("T")?);
+                let dims = [("M", rows), ("H", h), ("T", taps)];
+                let binding = self.bindings.gated_convolution(kernel)?;
+                if self.neighbors.is_none() {
+                    self.neighbors = Some(self.graph.input_for(binding, "neighbors", &dims)?);
+                }
+                let neighbors = input_view(&self.neighbors, &[rows, taps])?;
+                let value = self.value(*value, &[rows, h])?;
+                let gate = self.value(*gate, &[rows, h])?;
+                let weights = self.weight(*weights, &[h, taps])?;
+                self.graph
+                    .enqueue::<vision_gated_convolution::Entry>(
+                        binding,
+                        &dims,
+                        vision_gated_convolution::WorkflowArgs {
+                            value: (&value).into(),
+                            gate: (&gate).into(),
+                            weight: (&weights).into(),
+                            neighbors: (&neighbors).into(),
                         },
                     )?
                     .value
@@ -843,6 +893,7 @@ fn vision_graph_draft<G: GraphDraft, B: VisionBindings<G>>(
         window_spans: None,
         image_spans: None,
         order: None,
+        neighbors: None,
         weights: Vec::new(),
         constants,
     };
@@ -864,6 +915,7 @@ fn vision_graph_draft<G: GraphDraft, B: VisionBindings<G>>(
         || draft.window_spans.is_some() != program.windows
         || draft.order.is_some() != program.windows
         || draft.register_blend.is_some() != (program.registers > 0)
+        || draft.neighbors.is_some() != program.convolution.is_some()
     {
         return Err("the vision program's inputs disagree with its invocations".into());
     }
@@ -878,6 +930,7 @@ fn vision_graph_draft<G: GraphDraft, B: VisionBindings<G>>(
             window_spans: draft.window_spans,
             image_spans: draft.image_spans,
             order: draft.order,
+            neighbors: draft.neighbors,
             weights: draft.weights,
             constants: draft
                 .constants
@@ -1048,18 +1101,29 @@ impl NativeVisionProgram {
         let padding = class
             .checked_sub(real)
             .ok_or_else(|| invalid("vision image exceeds its class"))?;
-        let indices = spatial.interpolation_indices();
-        let indices = std::iter::repeat_n(0, registers * indices.len())
-            .chain((0..real).flat_map(|row| indices.iter().map(move |plane| plane[row])))
-            .chain(std::iter::repeat_n(0, padding * indices.len()))
-            .flat_map(i32::to_le_bytes)
-            .collect::<Vec<_>>();
-        let coefficients = spatial.interpolation_coefficients();
-        let coefficients = std::iter::repeat_n(0.0, registers * coefficients.len())
-            .chain((0..real).flat_map(|row| coefficients.iter().map(move |plane| plane[row])))
-            .chain(std::iter::repeat_n(0.0, padding * coefficients.len()))
-            .flat_map(f32::to_le_bytes)
-            .collect::<Vec<_>>();
+        // A tower without a position table blends nothing: its blend inputs
+        // have no rows.
+        let (indices, coefficients) = match spatial.position_blend() {
+            Some(blend) => (
+                std::iter::repeat_n(0, registers * blend.indices.len())
+                    .chain(
+                        (0..real)
+                            .flat_map(|row| blend.indices.iter().map(move |plane| plane[row])),
+                    )
+                    .chain(std::iter::repeat_n(0, padding * blend.indices.len()))
+                    .flat_map(i32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+                std::iter::repeat_n(0.0, registers * blend.coefficients.len())
+                    .chain(
+                        (0..real)
+                            .flat_map(|row| blend.coefficients.iter().map(move |plane| plane[row])),
+                    )
+                    .chain(std::iter::repeat_n(0.0, padding * blend.coefficients.len()))
+                    .flat_map(f32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
         // `attended` bounds the register rows.
         let register_indices = (0..registers as i32)
             .flat_map(|row| [row, 0, 0, 0])
@@ -1102,6 +1166,18 @@ impl NativeVisionProgram {
             .into_iter()
             .flat_map(i32::to_le_bytes)
             .collect::<Vec<_>>();
+        let neighbors = match prepared.convolution {
+            Some(side) => {
+                let [_, height, width] = input.grid();
+                convolution_neighbors(
+                    spatial.attention_coordinates(),
+                    [height, width],
+                    side,
+                    class,
+                )?
+            }
+            None => Vec::new(),
+        };
         let pixels = input.pixels().data();
         let pixel_row = pixels.len() / real.max(1);
         let pixels = std::iter::repeat_n(0, registers * pixel_row)
@@ -1127,10 +1203,50 @@ impl NativeVisionProgram {
                     window_spans: &window_spans,
                     image_spans: &image_spans,
                     order: &order,
+                    neighbors: &neighbors,
                 },
             )?
             .features)
     }
+}
+
+/// The tower row holding each of the `side`² taps (raster order of the
+/// window centred on the row) of every row of a class of `class` rows, or
+/// -1 past the image's edges and for padding rows. Image rows are placed on
+/// the `[height, width]` patch grid by their rotary coordinates.
+fn convolution_neighbors(
+    coordinates: &[[i32; 2]],
+    [height, width]: [usize; 2],
+    side: u64,
+    class: usize,
+) -> Result<Vec<u8>, SubmitError> {
+    let side = usize::try_from(side).map_err(|_| invalid("vision convolution side exceeds usize"))?;
+    let reach = side / 2;
+    let place = |[y, x]: [i32; 2]| {
+        let (y, x) = (usize::try_from(y).ok()?, usize::try_from(x).ok()?);
+        (y < height && x < width).then_some((y, x))
+    };
+    let mut grid = vec![-1i32; height * width];
+    for (row, &coordinate) in coordinates.iter().enumerate() {
+        let (y, x) = place(coordinate).ok_or_else(|| invalid("vision row lies off its grid"))?;
+        grid[y * width + x] =
+            i32::try_from(row).map_err(|_| invalid("vision rows exceed i32"))?;
+    }
+    let mut neighbors = Vec::with_capacity(class * side * side);
+    for &coordinate in coordinates {
+        let (y, x) = place(coordinate).ok_or_else(|| invalid("vision row lies off its grid"))?;
+        for dy in 0..side {
+            for dx in 0..side {
+                let (ny, nx) = ((y + dy).checked_sub(reach), (x + dx).checked_sub(reach));
+                neighbors.push(match (ny, nx) {
+                    (Some(ny), Some(nx)) if ny < height && nx < width => grid[ny * width + nx],
+                    _ => -1,
+                });
+            }
+        }
+    }
+    neighbors.resize(class * side * side, -1);
+    Ok(neighbors.into_iter().flat_map(i32::to_le_bytes).collect())
 }
 
 struct PreparedVisionGraph {
@@ -1146,6 +1262,8 @@ pub struct PreparedVisionGraphs {
     family: NativeGraphFamily,
     /// Register rows ahead of each image's patch rows.
     registers: u64,
+    /// The kernel side of the tower's gated convolutions.
+    convolution: Option<u64>,
 }
 
 pub(crate) struct BoundVisionGraphs {
@@ -1165,6 +1283,7 @@ pub(crate) struct VisionGraphUploads<'a> {
     pub window_spans: &'a [u8],
     pub image_spans: &'a [u8],
     pub order: &'a [u8],
+    pub neighbors: &'a [u8],
 }
 
 pub(crate) struct VisionGraphResult {
@@ -1223,6 +1342,7 @@ impl PreparedVisionGraphs {
             variants,
             family,
             registers: program.registers,
+            convolution: program.convolution,
         })
     }
 
@@ -1303,6 +1423,7 @@ impl PreparedVisionGraphs {
             (ports.window_spans.as_ref(), uploads.window_spans),
             (ports.image_spans.as_ref(), uploads.image_spans),
             (ports.order.as_ref(), uploads.order),
+            (ports.neighbors.as_ref(), uploads.neighbors),
         ] {
             if let Some(port) = port {
                 active.write_input(port, bytes).map_err(device)?;
@@ -1363,5 +1484,42 @@ impl VisionProgram for NativeVisionProgram {
         };
         let (core, workspace, _) = launch.into_submission_parts();
         Ok(ReadySubmission::new(core, workspace, features))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::convolution_neighbors;
+
+    fn decode(bytes: &[u8]) -> Vec<i32> {
+        bytes
+            .chunks_exact(4)
+            .map(|word| i32::from_le_bytes(word.try_into().unwrap()))
+            .collect()
+    }
+
+    /// A 4 × 4 patch grid held in 2 × 2 cell order: each row's 3 × 3 window
+    /// (raster order) names the tower rows of its grid neighbours, -1 past
+    /// the edges, and padding rows read nothing.
+    #[test]
+    fn neighbours_follow_the_grid_through_cell_order() {
+        let mut coordinates = Vec::new();
+        for cell_y in 0..2 {
+            for cell_x in 0..2 {
+                for (dy, dx) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                    coordinates.push([2 * cell_y + dy, 2 * cell_x + dx]);
+                }
+            }
+        }
+        let class = coordinates.len() + 2;
+        let neighbors = decode(&convolution_neighbors(&coordinates, [4, 4], 3, class).unwrap());
+        assert_eq!(neighbors.len(), class * 9);
+        let window = |row: usize| &neighbors[row * 9..][..9];
+        // (0, 0): only the lower-right 2 × 2 of its window is on the grid.
+        assert_eq!(window(0), [-1, -1, -1, -1, 0, 1, -1, 2, 3]);
+        // (1, 1): its lower-right neighbour (2, 2) opens the fourth cell.
+        assert_eq!(window(3), [0, 1, 4, 2, 3, 6, 8, 9, 12]);
+        assert!(neighbors[16 * 9..].iter().all(|tap| *tap == -1));
+        assert!(convolution_neighbors(&[[4, 0]], [4, 4], 3, 1).is_err());
     }
 }

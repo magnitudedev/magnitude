@@ -23,14 +23,14 @@ use magnitude_artifacts::{
     gguf::{Directory, Value},
     Package, PackageIdentity,
 };
-use magnitude_family_common::{HeaderError, Metadata, Tensors};
+use magnitude_family_common::{rotary, HeaderError, Metadata, Tensors};
 use magnitude_family_contracts::{
     checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Branch,
     BranchOutput, Decoder, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm,
     ExpertSelection, FamilyId, FeedForwardUp, HeadNorm, HistoryDomain, HistoryReads,
     ImportTransform, InputNorm, InputSemantics, KeyValue, MediaRowAttention, ModelDefinition,
     Operator, OutputForm, PerLayerEntry, PerLayerInput, ResidualForm, RmsNorm, Rotary,
-    RotaryDivisors, RotaryPair, RouteNormalization, RoutedFfn, Router, RouterInput, RowRange,
+    RouteNormalization, RoutedFfn, Router, RouterInput, RowRange,
     ScoreFunction, Sublayer, SublayerIndex,
     UnweightedRms, ValueNorm, ValueSource, WeightDescriptor,
 };
@@ -143,37 +143,6 @@ fn window_media_rows(per_layer_inputs: bool) -> MediaRowAttention {
     }
 }
 
-/// NEOX rotary over a whole head: pair `p` rotates dimensions
-/// `(p, p + pairs)` at `base^(-p / pairs)` for the first `rotated` pairs; the
-/// other pairs have frequency zero (exact pass-through). `divisors` is the
-/// stored per-pair divisor table the frequencies were derived from, checked
-/// at load against the unscaled frequencies.
-fn rotary(
-    width: u64,
-    base: f64,
-    rotated: u64,
-    divisors: Option<WeightDescriptor>,
-) -> Result<Rotary, Error> {
-    let pairs = width / 2;
-    if !width.is_multiple_of(2) || rotated == 0 || rotated > pairs || base <= 1.0 {
-        return Err(invalid("invalid Gemma rotary geometry"));
-    }
-    let bases: Vec<f64> = (0..pairs)
-        .map(|pair| base.powf(-(pair as f64) / pairs as f64))
-        .collect();
-    Ok(Rotary::Table {
-        pairs: bases
-            .iter()
-            .enumerate()
-            .map(|(pair, base)| RotaryPair {
-                frequency: if (pair as u64) < rotated { *base } else { 0.0 },
-                amplitude: 1.0,
-            })
-            .collect(),
-        divisors: divisors.map(|weight| RotaryDivisors { weight, bases }),
-    })
-}
-
 /// The geometry of window layers: whole heads rotated at the window base,
 /// reading the last `attention.sliding_window` rows.
 fn window_geometry(m: &Metadata, media_rows: MediaRowAttention) -> Result<KindGeometry, Error> {
@@ -187,7 +156,7 @@ fn window_geometry(m: &Metadata, media_rows: MediaRowAttention) -> Result<KindGe
     }
     Ok(KindGeometry {
         width,
-        rotary: rotary(width, m.positive_number("rope.freq_base_swa")?, width / 2, None)?,
+        rotary: rotary::table(width, width, m.positive_number("rope.freq_base_swa")?)?,
         domain: HistoryDomain::Window {
             tokens: m.integer("attention.sliding_window")?,
         },
@@ -210,11 +179,11 @@ fn full_geometry(m: &Metadata, b: &mut Tensors) -> Result<KindGeometry, Error> {
     let divisors = b.bind("rope_freqs.weight", &[width / 2])?;
     Ok(KindGeometry {
         width,
-        rotary: rotary(
+        rotary: rotary::zero_tail(
             width,
             m.positive_number("rope.freq_base")?,
             width / 2 / FULL_ROTATED_PAIR_FRACTION,
-            Some(divisors),
+            divisors,
         )?,
         domain: HistoryDomain::Token,
         media_rows: MediaRowAttention::Causal,

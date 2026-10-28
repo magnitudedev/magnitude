@@ -30,11 +30,13 @@ fn vision_patch_stem_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, grou
     // SAFETY: each work item writes its own row of the scratch.
     let blended = unsafe { cx.scratch_blended().slice_mut::<f32>(4 * row * h, h) };
     blended.fill(0.0);
-    for corner in 0..4 {
-        table.decode_row(indices.get([row, corner]) as usize, decoded);
-        let coefficient = coefficients.get([row, corner]);
-        for (target, value) in blended.iter_mut().zip(decoded.iter()) {
-            *target += value * coefficient;
+    if cx.dim_nt() == 1 {
+        for corner in 0..4 {
+            table.decode_row(indices.get([0, row, corner]) as usize, decoded);
+            let coefficient = coefficients.get([0, row, corner]);
+            for (target, value) in blended.iter_mut().zip(decoded.iter()) {
+                *target += value * coefficient;
+            }
         }
     }
 }

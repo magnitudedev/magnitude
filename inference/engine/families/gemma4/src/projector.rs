@@ -10,8 +10,8 @@ use magnitude_family_contracts::{
     CellReduction, ImportTransform, LinearClamp, MergerStage, PositionSampling, RmsNorm,
     Standardize, UnweightedRms, VisionActivation, VisionAttention, VisionAttentionScale,
     VisionAttentionSpan, VisionBlock, VisionDescription, VisionFeedForward, VisionLinear,
-    VisionMerger, VisionNorm, VisionPositions, VisionPreprocessing, VisionResampling, VisionResize,
-    VisionStem, VisionUp, WeightDescriptor, ActivationDType,
+    VisionMerger, VisionNorm, VisionOperator, VisionPositions, VisionPreprocessing,
+    VisionResampling, VisionResize, VisionStem, VisionUp, WeightDescriptor, ActivationDType,
 };
 
 /// The released vision configuration's facts the header does not record:
@@ -218,9 +218,10 @@ fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<VisionDescription,
         let query = reader.linear(&format!("{p}attn_q"), hidden, hidden)?;
         let key = reader.linear(&format!("{p}attn_k"), hidden, hidden)?;
         blocks.push(VisionBlock {
-            attention_norm: rms(reader.tensor(&format!("{p}ln1.weight"), &[hidden])?),
-            attention: VisionAttention {
+            operator_norm: rms(reader.tensor(&format!("{p}ln1.weight"), &[hidden])?),
+            operator: VisionOperator::Attention(VisionAttention {
                 heads,
+                kv_heads: heads,
                 width,
                 query: VisionLinear {
                     weight: permuted(query.weight, &order),
@@ -250,8 +251,8 @@ fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<VisionDescription,
                 scale: VisionAttentionScale::Unit,
                 span: VisionAttentionSpan::Full,
                 output: reader.linear(&format!("{p}attn_out"), hidden, hidden)?,
-            },
-            attention_post_norm: Some(rms(
+            }),
+            operator_post_norm: Some(rms(
                 reader.tensor(&format!("{p}attn_post_norm.weight"), &[hidden])?
             )),
             feedforward_norm: rms(reader.tensor(&format!("{p}ln2.weight"), &[hidden])?),
@@ -296,7 +297,7 @@ fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<VisionDescription,
         stem: VisionStem::Patch {
             frames: vec![reader.tensor("v.patch_embd.weight", &[hidden, 3, patch, patch])?],
             bias: None,
-            positions: table,
+            positions: Some(table),
             norm: None,
             registers: None,
         },

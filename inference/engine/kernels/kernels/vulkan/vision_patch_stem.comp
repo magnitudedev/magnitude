@@ -82,7 +82,8 @@ void vision_patch_stem_last() {
     const bool two = SEISMIC_DIM_S == 1;
     const vision_epilogue out_ = vision_stem(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
         SEISMIC_DIM_NB == 1, SEISMIC_PTR(SEISMIC_BUFFER_BIAS), BIAS_KIND,
-        two ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIAL) : 0ul, uint64_t(h), SEISMIC_PTR(SEISMIC_BUFFER_TABLE),
+        two ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIAL) : 0ul, uint64_t(h),
+        SEISMIC_DIM_NT == 1 ? SEISMIC_PTR(SEISMIC_BUFFER_TABLE) : 0ul,
         TABLE_KIND, SEISMIC_PTR(SEISMIC_BUFFER_INDICES), SEISMIC_PTR(SEISMIC_BUFFER_COEFFICIENTS));
     if (two) {
         const projection_weights w = vision_weights(SEISMIC_PTR(SEISMIC_BUFFER_NEXT_FRAME_WEIGHT),

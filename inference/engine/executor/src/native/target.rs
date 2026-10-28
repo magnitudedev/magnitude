@@ -485,5 +485,5 @@ pub struct StateSpaceKernels {
 pub struct ShortConvKernels {
     pub project: NativeKernel<short_conv_project::Entry>,
     pub rows: NativeKernel<short_conv_rows::Entry>,
-    pub output: NativeKernel<attention_output::Entry>,
+    pub output: SublayerOutput<NativeKernel<attention_output::Entry>>,
 }

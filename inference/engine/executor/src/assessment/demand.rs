@@ -1041,10 +1041,8 @@ impl DecodeDemand {
                         },
                     )?;
                     recurrent_component += 1;
-                    step.call(
-                        output,
-                        projection(&[weight(WeightKind::RecurrentOutput, binding.output)?])?,
-                    )?;
+                    let projected = weight(WeightKind::RecurrentOutput, binding.output)?;
+                    tail(&mut step, binding.tail, output, projected, weight)?;
                 }
                 // The segmented projection, the step over the layer's
                 // recurrent bank (window, delta and tape components), in the

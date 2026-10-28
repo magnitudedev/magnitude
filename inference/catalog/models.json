@@ -366,6 +366,68 @@
       }
     },
     {
+      "id": "lfm3-1.7b",
+      "displayName": "Liquid LFM3 1.7B",
+      "description": "Compact hybrid Liquid model for fast on-device agents and tool use, with a quantization-aware distilled (QAD) Q4.",
+      "releaseDate": "2026-10-27",
+      "parameterization": { "architecture": "dense", "totalParameters": 1728801536 },
+      "support": { "level": "supported" },
+      "sources": [
+        {
+          "repository": "LiquidAI/LFM3-1.7B-GGUF",
+          "variants": [{"variantId": "gguf:q4-qat", "format": "QAD-Q4_0", "variantLabel": "Q4 QAT", "fidelityRank": 40, "quantizationAware": true}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "license": "lfm1.0"
+        }
+      ],
+      "artificialAnalysis": {
+        "score": 14.0,
+        "provenance": {
+          "kind": "estimate",
+          "target": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-10-27",
+          "methodology": "Scaled two measured anchors, MiniCPM5 2B (12.5) and Qwen3.5 9B (11.2), by the geometric mean of LFM3 1.7B benchmark ratios against each on the Intelligence Index components in Liquid AI's release comparison: AutomationBench, Terminal-Bench 2.1, SciCode, Humanity's Last Exam (no tools), AA-Omniscience accuracy and non-hallucination, and AA-LCR. The scaled estimates are approximately 18.7 and 10.5; their geometric mean rounds to 14.0. The anchors disagree widely, mostly on AutomationBench and Terminal-Bench, so this is a loose estimate. This is an estimated Intelligence Index, not a measured score.",
+          "evidenceUrls": [
+            "https://huggingface.co/LiquidAI/LFM3-1.7B",
+            "https://artificialanalysis.ai/models/minicpm5-2b",
+            "https://artificialanalysis.ai/models/qwen3-5-9b"
+          ]
+        }
+      }
+    },
+    {
+      "id": "lfm3-vl-2b",
+      "displayName": "Liquid LFM3-VL 2B",
+      "description": "Compact Liquid vision-language model for on-device image understanding and agents, with a quantization-aware distilled (QAD) Q4.",
+      "releaseDate": "2026-10-27",
+      "parameterization": { "architecture": "dense", "totalParameters": 1918181888 },
+      "support": { "level": "supported" },
+      "sources": [
+        {
+          "repository": "LiquidAI/LFM3-VL-2B-GGUF",
+          "variants": [{"variantId": "gguf:q4-qat", "format": "QAD-Q4_0", "variantLabel": "Q4 QAT", "fidelityRank": 40, "quantizationAware": true}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "projector": {"path": "mmproj-LFM3-VL-2B-BF16.gguf"},
+          "license": "lfm1.0"
+        }
+      ],
+      "artificialAnalysis": {
+        "score": 12.8,
+        "provenance": {
+          "kind": "estimate",
+          "target": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-10-27",
+          "methodology": "Liquid AI publishes only multimodal results for LFM3-VL 2B. Scaled the Artificial Analysis estimates of the three compared models it publishes, Qwen3.5 4B (13.1), Gemma 4 E2B (7.8) and Gemma 4 12B (14.2), by the geometric mean of LFM3-VL 2B's thinking-mode ratios against each over the ten category averages of Liquid AI's release comparison. The scaled estimates are approximately 13.3, 11.1 and 14.1; their geometric mean rounds to 12.8. The categories are multimodal, so this is a multimodal proxy for the Intelligence Index, not a measured language score.",
+          "evidenceUrls": [
+            "https://huggingface.co/LiquidAI/LFM3-VL-2B",
+            "https://artificialanalysis.ai/models/qwen3-5-4b",
+            "https://artificialanalysis.ai/models/gemma-4-e2b",
+            "https://artificialanalysis.ai/models/gemma-4-12b"
+          ]
+        }
+      }
+    },
+    {
       "id": "minicpm5-1b",
       "displayName": "MiniCPM5 1B",
       "description": "Compact dense model for on-device reasoning and tool use.",

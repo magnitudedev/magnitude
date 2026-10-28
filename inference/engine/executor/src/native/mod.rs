@@ -75,8 +75,8 @@ use magnitude_kernels::{
     routed_experts_up, routed_gate_up, routed_group, routed_output, routed_route,
     routed_route_shared, routed_scatter, routed_select, routed_up, sample_rows, shape_rows,
     short_conv_project, short_conv_rows, state_space_chunk, state_space_gate, state_space_step,
-    vision_attention, vision_clamp, vision_linear, vision_norm, vision_patch_stem, vision_pool,
-    vision_position,
+    vision_attention, vision_clamp, vision_gated_convolution, vision_linear, vision_norm,
+    vision_patch_stem, vision_pool, vision_position,
 };
 use seismic::{BackendName, DType, Device, Element, NativeKernel, Tensor};
 use std::{collections::HashMap, fmt};

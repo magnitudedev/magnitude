@@ -6,7 +6,8 @@ use magnitude_artifacts::{
 use magnitude_family_contracts::{
     FamilyError, FamilyInputAdapter, ImageCrop, InputPreparationError, MarkerTokens,
     ModelDefinition, ModelInputAdapter, PositionSampling, PreparedModelInput, PreparedVisionInput,
-    TokenPlan, VisionResize, VisionSpatialControls, image_crop_identity, image_crops,
+    TokenPlan, VisionPositionBlend, VisionResize, VisionSpatialControls, image_crop_identity,
+    image_crops,
 };
 use std::collections::{BTreeMap, btree_map::Entry};
 
@@ -108,13 +109,15 @@ pub fn spatial_controls(
     VisionSpatialControls::new(
         (0..rows).collect(),
         vec![[0, 0]; rows],
-        [indices, vec![0; rows], vec![0; rows], vec![0; rows]],
-        [
-            vec![1.0; rows],
-            vec![0.0; rows],
-            vec![0.0; rows],
-            vec![0.0; rows],
-        ],
+        Some(VisionPositionBlend {
+            indices: [indices, vec![0; rows], vec![0; rows], vec![0; rows]],
+            coefficients: [
+                vec![1.0; rows],
+                vec![0.0; rows],
+                vec![0.0; rows],
+                vec![0.0; rows],
+            ],
+        }),
         Vec::new(),
     )
 }
@@ -209,7 +212,12 @@ impl ModelInputAdapter for CanvasInput {
         let VisionResize::Slices { max_slices, .. } = vision.preprocessing.resize else {
             return Err(InputPreparationError::VisionGeometry);
         };
-        let PositionSampling::Buckets { side } = vision.stem.positions().sampling else {
+        let PositionSampling::Buckets { side } = vision
+            .stem
+            .positions()
+            .ok_or(InputPreparationError::VisionGeometry)?
+            .sampling
+        else {
             return Err(InputPreparationError::VisionGeometry);
         };
         let (processor, crops, layouts) = match media {

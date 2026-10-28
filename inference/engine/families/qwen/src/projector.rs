@@ -6,8 +6,9 @@ use magnitude_family_common::Tensors;
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, ImportTransform, MergerStage, PositionSampling, RowRange,
     VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock,
-    VisionDescription, VisionFeedForward, VisionLinear, VisionMerger, VisionNorm, VisionPositions,
-    VisionPreprocessing, VisionResampling, VisionResize, VisionStem, VisionUp, WeightDescriptor,
+    VisionDescription, VisionFeedForward, VisionLinear, VisionMerger, VisionNorm, VisionOperator,
+    VisionPositions, VisionPreprocessing, VisionResampling, VisionResize, VisionStem, VisionUp,
+    WeightDescriptor,
 };
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -167,12 +168,13 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
             clamp: None,
         };
         blocks.push(VisionBlock {
-            attention_norm: layer_norm(
+            operator_norm: layer_norm(
                 weight("ln1.weight", &[hidden])?,
                 weight("ln1.bias", &[hidden])?,
             ),
-            attention: VisionAttention {
+            operator: VisionOperator::Attention(VisionAttention {
                 heads,
+                kv_heads: heads,
                 width: hidden / heads,
                 query: split(0),
                 key: split(1),
@@ -188,8 +190,8 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
                     bias: Some(weight("attn_out.bias", &[hidden])?),
                     clamp: None,
                 },
-            },
-            attention_post_norm: None,
+            }),
+            operator_post_norm: None,
             feedforward_norm: layer_norm(
                 weight("ln2.weight", &[hidden])?,
                 weight("ln2.bias", &[hidden])?,
@@ -256,10 +258,10 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
         stem: VisionStem::Patch {
             frames: patch_frames,
             bias: Some(patch_bias),
-            positions: VisionPositions {
+            positions: Some(VisionPositions {
                 table,
                 sampling: PositionSampling::AlignedCorners { side: table_side },
-            },
+            }),
             norm: None,
             registers: None,
         },
