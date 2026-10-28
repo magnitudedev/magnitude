@@ -17,8 +17,9 @@ use seismic_lang::expr::SymbolValue;
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry;
-use seismic_lang::repack::{alignment, WordTable};
+use seismic_lang::repack::WordTable;
 
+mod conversion;
 #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
 pub(crate) mod vulkan;
 
@@ -34,20 +35,6 @@ pub(crate) enum Dialect {
     /// Vulkan is not built on macOS; its prefix still renders in tests there.
     #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
     Vulkan(vulkan::VulkanFeatures),
-}
-
-impl Dialect {
-    /// Whether the dialect evaluates a conversion's word table at compile
-    /// time (`seismic_lang::repack::evaluates_tables`); Vulkan's GLSL takes
-    /// the word form as code (`vulkan::render_conversion_code`).
-    fn evaluates_tables(self) -> bool {
-        seismic_lang::repack::evaluates_tables(match self {
-            Self::Metal(_) => registry::SourceDialect::Metal,
-            Self::Cuda(_) => registry::SourceDialect::Cuda,
-            #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-            Self::Vulkan(_) => registry::SourceDialect::Vulkan,
-        })
-    }
 }
 
 /// The Metal device features a native source tests as `SEISMIC_HAS_<NAME>`,
@@ -356,7 +343,6 @@ fn render_source_with(
             dialect,
         );
     }
-    let mut converts = false;
     for (from, source) in bindings.iter() {
         for (to, destination) in bindings.iter() {
             if let Some(conversion) = registry::representation_conversion(source, destination) {
@@ -370,19 +356,7 @@ fn render_source_with(
                     conversion,
                     dialect,
                 );
-                converts = true;
             }
-        }
-    }
-    // The op codes of every conversion's word form, `SEISMIC_REPACK_OP_<NAME>`,
-    // where the table is evaluated.
-    if converts && dialect.evaluates_tables() {
-        for op in seismic_lang::repack::WordOp::ALL {
-            prefix.push_str(&format!(
-                "#define SEISMIC_REPACK_OP_{} {}\n",
-                op.name(),
-                op.code()
-            ));
         }
     }
     if let Some(kernel) = forming {
@@ -697,17 +671,23 @@ fn render_static_rows(
 
 /// The row planes a native library addresses by role
 /// (`RowPlaneInfo::role`), every role defined, 0 where the layout has none:
-/// `_ROW_<ROLE>` (row offset) and `_ROW_<ROLE>_BYTES` (bytes per row).
+/// `_ROW_<ROLE>` (row offset), `_ROW_<ROLE>_BYTES` (bytes per row) and
+/// `_ROW_<ROLE>_TAIL` (the gap from its end to the next plane's start, or
+/// the row's end, as the layout places them).
 fn render_row_roles(out: &mut String, prefix: &str, rows: &registry::PackedRowLayout, dialect: Dialect) {
     for role in registry::RowPlaneRole::ALL {
         let role_name = native_macro(role.name());
-        match rows.planes.iter().find(|plane| plane.role() == role) {
-            Some(plane) => out.push_str(&format!(
-                "#define {prefix}_ROW_{role_name} {prefix}_PLANE_{name}_ROW_OFFSET\n#define {prefix}_ROW_{role_name}_BYTES {prefix}_PLANE_{name}_BYTES_PER_ROW\n",
-                name = native_macro(plane.name)
+        match rows.planes.iter().position(|plane| plane.role() == role) {
+            Some(index) => out.push_str(&format!(
+                "#define {prefix}_ROW_{role_name} {prefix}_PLANE_{name}_ROW_OFFSET\n#define {prefix}_ROW_{role_name}_BYTES {prefix}_PLANE_{name}_BYTES_PER_ROW\n#define {prefix}_ROW_{role_name}_TAIL ({next} - ({prefix}_PLANE_{name}_ROW_OFFSET + {prefix}_PLANE_{name}_BYTES_PER_ROW))\n",
+                name = native_macro(rows.planes[index].name),
+                next = rows.planes.get(index + 1).map_or_else(
+                    || format!("{prefix}_ROW_STRIDE_BYTES"),
+                    |next| format!("{prefix}_PLANE_{}_ROW_OFFSET", native_macro(next.name))
+                ),
             )),
             None => out.push_str(&format!(
-                "#define {prefix}_ROW_{role_name} {zero}\n#define {prefix}_ROW_{role_name}_BYTES {zero}\n",
+                "#define {prefix}_ROW_{role_name} {zero}\n#define {prefix}_ROW_{role_name}_BYTES {zero}\n#define {prefix}_ROW_{role_name}_TAIL {zero}\n",
                 zero = literal(dialect, 0)
             )),
         }
@@ -748,23 +728,14 @@ fn render_symbolic_rows(
     render_row_roles(out, prefix, rows, dialect);
 }
 
-/// The registered conversion between two bound elements, as its word form
-/// (`seismic_lang::repack::WordTable`, whose docs give the table's format): for
-/// every dialect the flag, `_WORDS`, a record's words; for a row layout, per
-/// row-plane role (`RowPlaneRole::ALL`) `_<ROLE>_BYTES`, its share's bytes (0
-/// without the role); and per code role (codes and high; the `packet` layout's
-/// codes are its plane 0) `_<ROLE>_UNIT_WORDS`, a unit's words of the code
-/// planes' span (`WordSpan`). Metal and CUDA, which evaluate the table at
-/// compile time, also take `_TABLE`, the table's words as a list of literals
-/// each dialect's array initializer takes; `_STACK`, the words of an
-/// evaluation's stack (0 without values, when no evaluation is instantiated);
-/// per row-plane role `_<ROLE>_WORD`, its share's first record word (0 without
-/// the role); and the span's `_DIRECTORY`, `_CLASSES`, `_CLASS_COUNT` and per
-/// code role `_<ROLE>_FIRST`. CUDA also takes its kernel's tile plans
-/// (`render_tile_plans`). Vulkan, whose GLSL evaluates no table at compile
-/// time, takes the word form as code (`vulkan::render_conversion_code`). The op
-/// codes the table's op words hold are the Metal or CUDA source's, once
-/// (`render_source_with`).
+/// A registered conversion between two bound elements, as the word form
+/// (`WordTable`) of its recipe: `{prefix}` defined, `{prefix}_WORDS` the
+/// record's words; for a row layout per group role (`RowPlaneRole::ALL`)
+/// `{prefix}_{ROLE}_WORD` and `_BYTES`, its share's first record word and
+/// bytes (0 and 0 without the role); per code role `{prefix}_{ROLE}_FIRST`
+/// and `_UNIT_WORDS` (`WordSpan`); the alignments a kernel stores the
+/// record's bytes in (`render_record_alignments`); then the word form as
+/// code (`conversion::render_conversion_code`).
 fn render_conversion(
     out: &mut String,
     prefix: &str,
@@ -772,21 +743,8 @@ fn render_conversion(
     dialect: Dialect,
 ) {
     let words = WordTable::of(conversion);
-    let evaluated = dialect.evaluates_tables();
     out.push_str(&format!("#define {prefix} 1\n"));
-    if evaluated {
-        let table = words
-            .table()
-            .iter()
-            .map(|word| format!("{word:#x}u"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        out.push_str(&format!("#define {prefix}_TABLE {table}\n"));
-    }
     out.push_str(&format!("#define {prefix}_WORDS {}\n", words.words()));
-    if evaluated {
-        out.push_str(&format!("#define {prefix}_STACK {}\n", words.depth()));
-    }
     if !words.roles().is_empty() {
         for role in registry::RowPlaneRole::ALL {
             let (first, bytes) = words
@@ -795,22 +753,13 @@ fn render_conversion(
                 .find(|(candidate, _, _)| *candidate == role)
                 .map_or((0, 0), |(_, first, bytes)| (*first, *bytes));
             let role = native_macro(role.name());
-            if evaluated {
-                out.push_str(&format!("#define {prefix}_{role}_WORD {first}\n"));
-            }
+            out.push_str(&format!("#define {prefix}_{role}_WORD {first}\n"));
             out.push_str(&format!("#define {prefix}_{role}_BYTES {bytes}\n"));
         }
     }
-    // The code planes' span: its unit directory, class list and class
-    // count, and per code role its segment's first record word and a unit's
-    // words (0 and 0 without the role).
+    // Per code role its segment of the span: its first record word and a
+    // unit's words (0 and 0 without the role).
     let span = words.span();
-    if evaluated {
-        out.push_str(&format!(
-            "#define {prefix}_DIRECTORY {}\n#define {prefix}_CLASSES {}\n#define {prefix}_CLASS_COUNT {}\n",
-            span.directory, span.classes, span.class_count
-        ));
-    }
     for role in registry::RowPlaneRole::CODES {
         let (first, unit_words) = span
             .segments
@@ -818,168 +767,80 @@ fn render_conversion(
             .find(|segment| segment.role == role)
             .map_or((0, 0), |segment| (segment.first, segment.unit_words));
         let role = native_macro(role.name());
-        if evaluated {
-            out.push_str(&format!("#define {prefix}_{role}_FIRST {first}\n"));
-        }
+        out.push_str(&format!("#define {prefix}_{role}_FIRST {first}\n"));
         out.push_str(&format!(
             "#define {prefix}_{role}_UNIT_WORDS {unit_words}\n"
         ));
     }
-    if let Dialect::Cuda(_) = dialect {
-        render_tile_plans(out, prefix, words, conversion.source_layout);
-    }
-    #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-    if !evaluated {
-        vulkan::render_conversion_code(out, prefix, words, conversion.source_layout);
-    }
+    render_record_alignments(out, prefix, words, conversion.destination_layout);
+    conversion::render_conversion_code(out, prefix, words, conversion.source_layout, dialect);
 }
 
-/// The CUDA kernel's tile plans of a conversion's word form (`WordTable`):
-/// the source bytes a warp stages for a tile and where, laid out here so the
-/// kernel's front end evaluates no plan. A tile's words, a unit's (plan `c`
-/// for a unit of class `c`, its representative's block) or at a group's
-/// first tile the fixed words (plan `_CLASS_COUNT`, the fixed blocks), read
-/// some of its rows' source bytes: part 0, the bytes of runs that stay where
-/// the table puts them, and part 1 + s, the representative's bytes of the
-/// runs of slot s, which a unit moves by s's byte displacement. A run's
-/// bytes are its group's members', from the lowest to the highest, so a
-/// member's staged bits lie as far from its representative's as in the
-/// packet (a unit moves each member within the bytes it spans). The warp
-/// stages exactly those, coalesced, part by part, each maximal run of used
-/// bytes (a segment) at a position aligned to its copy unit: the widest
-/// that the source's packet alignment (at most 4, the widest unit a kernel
-/// reads a source packet in), the segment's first byte and length and its
-/// part's displacements allow.
-///
-/// `_PLAN_SEGMENTS` are the segments, each `{part, first byte, length,
-/// position, copy unit}`, plan by plan from `_PLAN_SEGMENT_FIRST[plan]`
-/// (one more entry, their end); `_RUN_POSITIONS` the staged bit of each run
-/// a class's representative visits, in visiting order, class by class from
-/// `_RUN_FIRST[class]` (one more entry, their end); `_FIXED_POSITIONS` the
-/// staged byte of each source byte the fixed words read (0 for any other);
-/// `_STAGE_WORDS` the words of a staged row, the most any plan stages (the
-/// kernel pads a row of a shared array to odd words, so each starts in its
-/// own bank).
-fn render_tile_plans(
+/// The widest unit (`repack::alignment`, to 16 bytes) each range of record
+/// bytes a kernel stores together keeps: its start, its length and its
+/// destination's alignment allow. For a row layout, per role
+/// (`RowPlaneRole::ALL`, from a row plane's 16-byte-aligned start)
+/// `{prefix}_{ROLE}_ALIGNMENT`: a code role's unit's words, a group role's
+/// share; and per code role `{prefix}_{ROLE}_REST_ALIGNMENT`: its share's
+/// bytes past its units' words (an mma16 record's factors). For the packet
+/// layout (from a packet's start): `{prefix}_CODES_ALIGNMENT`, a unit's
+/// codes; `{prefix}_LEADING_ALIGNMENT` and `{prefix}_TRAILING_ALIGNMENT`,
+/// the record's bytes before and after the codes (to the packet's end).
+fn render_record_alignments(
     out: &mut String,
     prefix: &str,
     words: &WordTable,
-    source: &registry::ExternalPacketLayout,
+    layout: registry::ConversionLayout,
 ) {
-    let packet_size = source.packet_size;
+    use seismic_lang::repack::alignment;
     let span = words.span();
-    let mut segments = Vec::new();
-    let mut segment_first = Vec::new();
-    let mut positions: Vec<Vec<u32>> = Vec::new();
-    let mut fixed = Vec::new();
-    let mut most = 0;
-    for class in (0..span.class_count).map(Some).chain([None]) {
-        let blocks = match class {
-            Some(class) => vec![words.class(class).representative],
-            None => (span.units..words.blocks()).collect(),
-        };
-        // Each run's part and first bit, and the bytes each part uses.
-        let mut used: Vec<Vec<bool>> = Vec::new();
-        let mut visits = Vec::new();
-        for block in blocks {
-            let mut run = 0;
-            for group in words.groups(block) {
-                for (source, parameter) in group.runs() {
-                    let part = class.map_or(0, |class| {
-                        let entry = words.class(class).entry(run);
-                        if entry.still {
-                            0
-                        } else {
-                            1 + entry.slot as usize
-                        }
-                    });
-                    // Its members' first bits (a unit moves each within the
-                    // bytes it spans).
-                    let firsts = (0..group.count).map(|member| {
-                        source
-                            .bit
-                            .wrapping_add(group.displacement(member, parameter) as u32)
-                    });
-                    let low = firsts.clone().min().unwrap() / 8;
-                    let high = (firsts.max().unwrap() + source.length - 1) / 8;
-                    if used.len() <= part {
-                        used.resize(part + 1, vec![false; packet_size as usize]);
-                    }
-                    used[part][low as usize..=high as usize].fill(true);
-                    visits.push((part, source.bit));
-                    run += 1;
-                }
-            }
+    let segment = |role| {
+        span.segments
+            .iter()
+            .find(|segment| segment.role == role)
+            .map_or((0, 0), |segment| (segment.first, segment.unit_words))
+    };
+    match layout {
+        registry::ConversionLayout::Packet(packet) => {
+            let size = packet.packet_size;
+            let (first, unit_words) = segment(registry::RowPlaneRole::Codes);
+            let end = 4 * (first + span.units * unit_words);
+            let stored = (4 * words.words()).min(size);
+            let base = alignment(size).min(alignment(4 * first));
+            out.push_str(&format!(
+                "#define {prefix}_CODES_ALIGNMENT {}\n#define {prefix}_LEADING_ALIGNMENT {}\n#define {prefix}_TRAILING_ALIGNMENT {}\n",
+                base.min(alignment(4 * unit_words)),
+                base,
+                alignment(size)
+                    .min(alignment(end))
+                    .min(alignment(stored.checked_sub(end).expect("the codes are within the packet"))),
+            ));
         }
-        segment_first.push(segments.len());
-        let mut position = vec![vec![0u32; packet_size as usize]; used.len()];
-        let mut cursor = 0u32;
-        for (part, used) in used.iter().enumerate() {
-            // The alignment of every byte displacement the class's units give
-            // the part's slot.
-            let moved = class
-                .filter(|_| part > 0)
-                .map_or(16, |class| words.slot_alignment(class, part as u32 - 1));
-            for byte in 0..packet_size {
-                if !used[byte as usize] {
-                    continue;
+        registry::ConversionLayout::Rows(_) => {
+            for role in registry::RowPlaneRole::ALL {
+                let bytes = words
+                    .roles()
+                    .iter()
+                    .find(|(candidate, _, _)| *candidate == role)
+                    .map_or(0, |(_, _, bytes)| *bytes);
+                let name = native_macro(role.name());
+                if registry::RowPlaneRole::CODES.contains(&role) {
+                    let (_, unit_words) = segment(role);
+                    out.push_str(&format!(
+                        "#define {prefix}_{name}_ALIGNMENT {}\n#define {prefix}_{name}_REST_ALIGNMENT {}\n",
+                        alignment(4 * unit_words),
+                        alignment(
+                            bytes
+                                .checked_sub(4 * span.units * unit_words)
+                                .expect("a code role's share holds its units' words")
+                        ),
+                    ));
+                } else {
+                    out.push_str(&format!("#define {prefix}_{name}_ALIGNMENT {}\n", alignment(bytes)));
                 }
-                if byte == 0 || !used[byte as usize - 1] {
-                    let length = (byte..packet_size)
-                        .take_while(|at| used[*at as usize])
-                        .count() as u32;
-                    let unit = [byte, length, moved]
-                        .into_iter()
-                        .map(alignment)
-                        .fold(source.packet_alignment, u32::min);
-                    cursor = cursor.div_ceil(unit) * unit;
-                    segments.push([part as u32, byte, length, cursor, unit]);
-                }
-                position[part][byte as usize] = cursor;
-                cursor += 1;
-            }
-        }
-        most = most.max(cursor);
-        match class {
-            Some(_) => positions.push(
-                visits
-                    .into_iter()
-                    .map(|(part, bit)| 8 * position[part][bit as usize / 8] + bit % 8)
-                    .collect(),
-            ),
-            // (Every byte 0 where the fixed words read none.)
-            None => {
-                fixed = position
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| vec![0; packet_size as usize])
             }
         }
     }
-    segment_first.push(segments.len());
-    let list = |values: &mut dyn Iterator<Item = String>| values.collect::<Vec<_>>().join(", ");
-    out.push_str(&format!(
-        "#define {prefix}_PLAN_SEGMENTS {}\n#define {prefix}_PLAN_SEGMENT_FIRST {}\n",
-        list(
-            &mut segments
-                .iter()
-                .map(|[part, first, length, position, unit]| {
-                    format!("{{{part}, {first}, {length}, {position}, {unit}}}")
-                })
-        ),
-        list(&mut segment_first.iter().map(|first| format!("{first}"))),
-    ));
-    let mut first = 0;
-    out.push_str(&format!(
-        "#define {prefix}_RUN_POSITIONS {}\n#define {prefix}_RUN_FIRST {}\n#define {prefix}_FIXED_POSITIONS {}\n#define {prefix}_STAGE_WORDS {}\n",
-        list(&mut positions.iter().flatten().map(|position| format!("{position}"))),
-        list(&mut positions.iter().map(Vec::len).chain([0]).map(|runs| {
-            first += runs;
-            format!("{}", first - runs)
-        })),
-        list(&mut fixed.iter().map(|position| format!("{position}"))),
-        most.div_ceil(4),
-    ));
 }
 
 fn render_representation(
@@ -1971,11 +1832,8 @@ void probe() {
     uint words[SEISMIC_CONVERSION_E_U_WORDS];
     SEISMIC_CONVERSION_E_U_UNIT(packet, gl_WorkGroupID.z, words);
     uint value = words[0];
-    uint shares[SEISMIC_CONVERSION_E_U_WORDS];
-    SEISMIC_CONVERSION_E_U_SCALES_SHARE(packet, shares);
-    value |= shares[0];
-    SEISMIC_CONVERSION_E_U_SUPERS_SHARE(packet, shares);
-    value |= shares[0];
+    SEISMIC_CONVERSION_E_U_FIXED(packet, words);
+    value |= words[SEISMIC_CONVERSION_E_U_WORDS - 1];
     seismic_u32(uint64_t(gl_WorkGroupID.y) * 4ul).v = value;
 }
 ";

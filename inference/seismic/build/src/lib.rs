@@ -857,11 +857,9 @@ mod internals {
             );
         }
         // A registered conversion between two bound elements, as its word
-        // form (the runtime ABI's `render_conversion`): the table and its
-        // span where it is evaluated at compile time, else the word form as
-        // code (`vulkan::render_conversion_code`): its units, and each group
-        // role's share; and CUDA's tile plans.
-        let evaluated = seismic_lang::repack::evaluates_tables(dialect);
+        // form as code (the runtime ABI's `render_conversion`): its units and
+        // fixed words, its layout's shares, span and store alignments, and
+        // CUDA's stage (its row, tile and lanes) and fixed words' loads.
         for from in &entry.element_parameters {
             for to in &entry.element_parameters {
                 let prefix = format!(
@@ -869,54 +867,28 @@ mod internals {
                     native_macro(from),
                     native_macro(to)
                 );
-                symbols.insert(format!("{prefix}_WORDS"));
-                if evaluated {
-                    for suffix in ["TABLE", "STACK", "DIRECTORY", "CLASSES", "CLASS_COUNT"] {
-                        symbols.insert(format!("{prefix}_{suffix}"));
-                    }
-                } else {
-                    symbols.insert(format!("{prefix}_UNIT"));
-                    for role in registry::RowPlaneRole::ALL
-                        .into_iter()
-                        .filter(|role| !registry::RowPlaneRole::CODES.contains(role))
-                    {
-                        symbols.insert(format!("{prefix}_{}_SHARE", native_macro(role.name())));
-                    }
+                for suffix in ["WORDS", "UNIT", "FIXED", "LEADING_ALIGNMENT", "TRAILING_ALIGNMENT"] {
+                    symbols.insert(format!("{prefix}_{suffix}"));
                 }
-                // CUDA's tile plans.
                 if dialect == SourceDialect::Cuda {
-                    for suffix in [
-                        "PLAN_SEGMENTS",
-                        "PLAN_SEGMENT_FIRST",
-                        "RUN_POSITIONS",
-                        "RUN_FIRST",
-                        "FIXED_POSITIONS",
-                        "STAGE_WORDS",
-                    ] {
+                    for suffix in ["STAGE_WORDS", "TILE_ROWS", "LANES", "FIXED_LOADS", "FIXED_LOAD"] {
                         symbols.insert(format!("{prefix}_{suffix}"));
                     }
                 }
                 for role in registry::RowPlaneRole::ALL {
                     let role = native_macro(role.name());
-                    if evaluated {
-                        symbols.insert(format!("{prefix}_{role}_WORD"));
-                    }
+                    symbols.insert(format!("{prefix}_{role}_WORD"));
                     symbols.insert(format!("{prefix}_{role}_BYTES"));
+                    symbols.insert(format!("{prefix}_{role}_ALIGNMENT"));
                 }
                 // The code planes' segments of their span.
                 for role in registry::RowPlaneRole::CODES {
                     let role = native_macro(role.name());
-                    if evaluated {
-                        symbols.insert(format!("{prefix}_{role}_FIRST"));
-                    }
+                    symbols.insert(format!("{prefix}_{role}_FIRST"));
                     symbols.insert(format!("{prefix}_{role}_UNIT_WORDS"));
+                    symbols.insert(format!("{prefix}_{role}_REST_ALIGNMENT"));
                 }
                 symbols.insert(prefix);
-            }
-        }
-        if evaluated {
-            for op in seismic_lang::repack::WordOp::ALL {
-                symbols.insert(format!("SEISMIC_REPACK_OP_{}", op.name()));
             }
         }
 
@@ -1057,6 +1029,7 @@ mod internals {
                         let role = native_macro(role.name());
                         symbols.insert(format!("{prefix}_ROW_{role}"));
                         symbols.insert(format!("{prefix}_ROW_{role}_BYTES"));
+                        symbols.insert(format!("{prefix}_ROW_{role}_TAIL"));
                     }
                     for suffix in [
                         "ROW_GROUPS",

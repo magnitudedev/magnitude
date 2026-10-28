@@ -7,10 +7,10 @@
 // whose docs give the table's format), emitted as SEISMIC_CONVERSION_E_U_*,
 // gives every 32-bit word of a source packet's record, the packet's storage
 // group's share of each row plane, as the OR of pieces: runs of source bits
-// or bits of values its postfix ops compute. The Vulkan prefix renders it as
-// code (SEISMIC_CONVERSION_E_U_UNIT, a unit of the code planes' words, and
-// SEISMIC_CONVERSION_E_U_<ROLE>_SHARE, a group role's share); this kernel
-// places records in rows16.
+// or bits of values its postfix ops compute. The prefix renders it as code
+// (SEISMIC_CONVERSION_E_U_UNIT, a unit of the code planes' words, and
+// SEISMIC_CONVERSION_E_U_FIXED, the other words: the group roles' shares);
+// this kernel places records in rows16.
 //
 // Each workgroup (32 invocations) places one row tile: 16 rows x 32
 // columns. Every group is a multiple of 32, so a tile covers a whole packet
@@ -81,6 +81,12 @@ uint64_t row_base(uint64_t destination, uint64_t b, uint64_t n) {
     return destination + (b * SEISMIC_RESULT_0_STRIDE_0 + n * SEISMIC_RESULT_0_STRIDE_1) * SEISMIC_RESULT_0_ROW_STRIDE_BYTES;
 }
 
+// `count` bytes at `place`, zero.
+void zero_bytes(uint64_t place, uint64_t count) {
+    for (uint64_t at = 0ul; at < count; ++at)
+        element_u8_put(place + at, 0u);
+}
+
 void repack_weight() {
     const uint64_t source = SEISMIC_PTR(SEISMIC_BUFFER_SOURCE);
     const uint64_t destination = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
@@ -105,34 +111,24 @@ void repack_weight() {
     store(row + SEISMIC_RESULT_0_ROW_CODES + uint64_t(unit) * (4u * CODES_WORDS), words, 0u, 4u * CODES_WORDS);
     store(row + SEISMIC_RESULT_0_ROW_HIGH + uint64_t(unit) * (4u * HIGH_WORDS), words, CODES_WORDS, 4u * HIGH_WORDS);
 
-    // Group planes, once per group (at its first tile): each role's share
-    // computed, then stored.
+    // Group planes, once per group (at its first tile): the fixed words
+    // computed, then each role's share stored.
     if (within == 0u) {
-        SEISMIC_CONVERSION_E_U_SCALES_SHARE(packet, words);
-        store(row + SEISMIC_RESULT_0_ROW_SCALES + group * SEISMIC_CONVERSION_E_U_SCALES_BYTES, words, 0u,
-            SEISMIC_CONVERSION_E_U_SCALES_BYTES);
-        SEISMIC_CONVERSION_E_U_SUPERS_SHARE(packet, words);
-        store(row + SEISMIC_RESULT_0_ROW_SUPERS + group * SEISMIC_CONVERSION_E_U_SUPERS_BYTES, words, 0u,
-            SEISMIC_CONVERSION_E_U_SUPERS_BYTES);
+        SEISMIC_CONVERSION_E_U_FIXED(packet, words);
+        store(row + SEISMIC_RESULT_0_ROW_SCALES + group * SEISMIC_CONVERSION_E_U_SCALES_BYTES, words,
+            SEISMIC_CONVERSION_E_U_SCALES_WORD, SEISMIC_CONVERSION_E_U_SCALES_BYTES);
+        store(row + SEISMIC_RESULT_0_ROW_SUPERS + group * SEISMIC_CONVERSION_E_U_SUPERS_BYTES, words,
+            SEISMIC_CONVERSION_E_U_SUPERS_WORD, SEISMIC_CONVERSION_E_U_SUPERS_BYTES);
     }
 
     // Alignment tails of every plane, from its end to the next plane's start
     // (or the row's end), at the row's last stored tile.
     if (column0 + TILE_COLUMNS == stored_columns) {
-        const uint64_t offsets[4] = uint64_t[](SEISMIC_RESULT_0_ROW_CODES, SEISMIC_RESULT_0_ROW_HIGH,
-            SEISMIC_RESULT_0_ROW_SCALES, SEISMIC_RESULT_0_ROW_SUPERS);
-        const uint64_t lengths[4] = uint64_t[](SEISMIC_RESULT_0_ROW_CODES_BYTES, SEISMIC_RESULT_0_ROW_HIGH_BYTES,
-            SEISMIC_RESULT_0_ROW_SCALES_BYTES, SEISMIC_RESULT_0_ROW_SUPERS_BYTES);
-        [[unroll]] for (uint role = 0u; role < 4u; ++role) {
-            if (lengths[role] == 0ul)
-                continue;
-            const uint64_t end = offsets[role] + lengths[role];
-            uint64_t next = SEISMIC_RESULT_0_ROW_STRIDE_BYTES;
-            [[unroll]] for (uint other = 0u; other < 4u; ++other)
-                if (lengths[other] != 0ul && offsets[other] >= end)
-                    next = min(next, offsets[other]);
-            for (uint64_t at = end; at < next; ++at)
-                element_u8_put(row + at, 0u);
-        }
+        zero_bytes(row + SEISMIC_RESULT_0_ROW_CODES + SEISMIC_RESULT_0_ROW_CODES_BYTES, SEISMIC_RESULT_0_ROW_CODES_TAIL);
+        zero_bytes(row + SEISMIC_RESULT_0_ROW_HIGH + SEISMIC_RESULT_0_ROW_HIGH_BYTES, SEISMIC_RESULT_0_ROW_HIGH_TAIL);
+        zero_bytes(row + SEISMIC_RESULT_0_ROW_SCALES + SEISMIC_RESULT_0_ROW_SCALES_BYTES,
+            SEISMIC_RESULT_0_ROW_SCALES_TAIL);
+        zero_bytes(row + SEISMIC_RESULT_0_ROW_SUPERS + SEISMIC_RESULT_0_ROW_SUPERS_BYTES,
+            SEISMIC_RESULT_0_ROW_SUPERS_TAIL);
     }
 }

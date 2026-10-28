@@ -22,9 +22,7 @@ use std::path::{Path, PathBuf};
 
 /// Seismic's native library: `(name, text)`, included as `<seismic/<name>>`. A
 /// name's extension selects its backend (`.h` Metal, `.cuh` CUDA, `.glsl`
-/// Vulkan). A `shared/` text is the same for several backends: each of their
-/// names is its backend's prelude (defining the dialect's qualifiers), then
-/// the shared text.
+/// Vulkan).
 pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
     (
         "element.h",
@@ -35,13 +33,6 @@ pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
         include_str!("../native-library/metal/packets.h"),
     ),
     ("slab.h", include_str!("../native-library/metal/slab.h")),
-    (
-        "repack.h",
-        concat!(
-            include_str!("../native-library/metal/repack.h"),
-            include_str!("../native-library/shared/repack.h"),
-        ),
-    ),
     ("tables.h", include_str!(concat!(env!("OUT_DIR"), "/tables.h"))),
     (
         "element.cuh",
@@ -59,13 +50,6 @@ pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
     (
         "rows16.cuh",
         include_str!("../native-library/cuda/rows16.cuh"),
-    ),
-    (
-        "repack.cuh",
-        concat!(
-            include_str!("../native-library/cuda/repack.cuh"),
-            include_str!("../native-library/shared/repack.h"),
-        ),
     ),
     (
         "element.glsl",

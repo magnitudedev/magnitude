@@ -7,13 +7,14 @@
 //! The CPU executes the values as compiled by `seismic_native_cpu`'s repack
 //! programs, which move a whole execution of packets in vector steps. A GPU
 //! executes the recipe's word form ([`WordTable`]): every word of one source
-//! packet's record as runs of source bits and bits of computed values, one
-//! constant table a kernel receives through the native ABI.
+//! packet's record as runs of source bits and bits of computed values, which
+//! the native ABI evaluates into each dialect's code (no kernel reads the
+//! table).
 
 use crate::external_tables::RepackTable;
 use crate::registry::{
     ConversionLayout, PackedPacketLayout, PacketRepackRecipe, PlaneRepackRecipe, RepackExpr,
-    RepresentationConversion, RowPlaneRole, SourceDialect,
+    RepresentationConversion, RowPlaneRole,
 };
 use crate::types::DType;
 use std::sync::OnceLock;
@@ -384,10 +385,9 @@ impl<'a> PacketValues<'a> {
     }
 }
 
-/// Declares [`WordOp`] from one list: its variants in code order, and each
-/// one's ABI name.
+/// Declares [`WordOp`] from one list: its variants in code order.
 macro_rules! word_ops {
-    ($($op:ident => $name:literal,)*) => {
+    ($($op:ident,)*) => {
         /// The op of a [`WordTable`] op word, by code.
         #[repr(u32)]
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -397,29 +397,22 @@ macro_rules! word_ops {
 
         impl WordOp {
             /// Every op, in code order.
-            pub const ALL: [Self; [$($name),*].len()] = [$(Self::$op),*];
-
-            /// The op's name in the native ABI (`SEISMIC_REPACK_OP_<NAME>`).
-            pub const fn name(self) -> &'static str {
-                match self {
-                    $(Self::$op => $name,)*
-                }
-            }
+            pub const ALL: [Self; [$(Self::$op),*].len()] = [$(Self::$op),*];
         }
     };
 }
 
 word_ops! {
-    Field => "FIELD",
-    ShiftLeft => "SHIFT_LEFT",
-    Or => "OR",
-    Offset => "OFFSET",
-    F16ToF32 => "F16_TO_F32",
-    I32ToF32 => "I32_TO_F32",
-    MultiplyF32 => "MULTIPLY_F32",
-    ScaleF32 => "SCALE_F32",
-    Lookup => "LOOKUP",
-    NegateIf => "NEGATE_IF",
+    Field,
+    ShiftLeft,
+    Or,
+    Offset,
+    F16ToF32,
+    I32ToF32,
+    MultiplyF32,
+    ScaleF32,
+    Lookup,
+    NegateIf,
 }
 
 impl WordOp {
@@ -672,21 +665,10 @@ struct GroupDraft {
 
 /// The largest power of two, to 16, dividing `bytes` (16 for 0): the
 /// alignment a byte offset or length keeps, to the widest unit a kernel
-/// moves. Kernels evaluate it at compile time too (`repack::alignment` in
-/// `native-library/shared/repack.h`), over constants they cannot receive.
+/// moves. The repack kernels receive it for the record's bytes they store
+/// as ABI macros (the native ABI's record alignments).
 pub fn alignment(bytes: u32) -> u32 {
     1 << bytes.trailing_zeros().min(4)
-}
-
-/// Whether sources of `dialect` evaluate a word table at compile time
-/// (Metal's and CUDA's C++, whose front ends run `constexpr` code over it):
-/// their sources take the table, its span and the op codes. Vulkan's GLSL
-/// evaluates no table; it takes the word form as code.
-pub fn evaluates_tables(dialect: SourceDialect) -> bool {
-    match dialect {
-        SourceDialect::Metal | SourceDialect::Cuda => true,
-        SourceDialect::Vulkan => false,
-    }
 }
 
 /// A group's word ([`Group`]): its representative's word (its index in the
@@ -722,13 +704,12 @@ impl GroupWord {
 /// Members are in order of their words. Every member's run spans as many
 /// bytes as the representative's.
 ///
-/// Metal and CUDA compile a group of more than one member as one loop over
-/// its members, which their compilers unroll: their front ends then
-/// instantiate one member's code, not each's, and the unrolled code is the
-/// members' (measured: compile time falls by half, runtime equal to the
-/// members emitted one by one). Vulkan's generator emits every member: GLSL
-/// has no front end to spare, and NVIDIA's driver leaves `[[unroll]]` loops
-/// rolled (measured: q4_k rows16 43 → 130 µs).
+/// Metal's and CUDA's code gathers members placed alike into nested loops
+/// whose parameters are affine in their counters, which their compilers
+/// unroll (the runtime's `conversion::Code`): their front ends then compile
+/// one member's code, not each's. Vulkan's generator emits every member:
+/// NVIDIA's driver leaves `[[unroll]]` loops rolled (measured: q4_k rows16
+/// 43 → 130 µs).
 #[derive(Clone, Copy, Debug)]
 pub struct Group<'a> {
     pub piece: Piece,
@@ -856,8 +837,8 @@ impl WordUnit<'_> {
 
 /// The word form of a conversion: the form a GPU executes, a thread at a
 /// time computing any word of the record of one source packet. It is one
-/// constant table of words, read alike by the threads converting one
-/// packet column (a broadcast load).
+/// table of words, which the native ABI evaluates, once per conversion,
+/// into each dialect's code.
 ///
 /// The record is what the destination places per source packet: the packet
 /// form, for the `packet` layout; for a row layout, the storage group's
@@ -895,13 +876,12 @@ impl WordUnit<'_> {
 ///   (first, with their count `<< 16`; each a run of source bits), and the
 ///   offset.
 ///
-/// A value is evaluated as its ops' postfix over a stack of at most
-/// [`depth`](Self::depth) words. [`Group`], [`Piece`], [`SourceRun`],
-/// [`WordStep`], [`WordClass`] and [`WordUnit`] read the format. Routes'
-/// and fields' bits are merged into runs, so a word costs, per run, the
-/// source bytes it spans and a shift and mask; pieces that differ only by
-/// displacement share one representative, so a block's code is its
-/// groups', not its pieces'.
+/// A value is its ops' postfix over a stack of words. [`Group`], [`Piece`],
+/// [`SourceRun`], [`WordStep`], [`WordClass`] and [`WordUnit`] read the
+/// format. Routes' and fields' bits are merged into runs, so a word costs,
+/// per run, the source bytes it spans and a shift and mask; pieces that
+/// differ only by displacement share one representative, so a block's code
+/// is its groups', not its pieces'.
 ///
 /// It differs from the CPU's program (`seismic_native_cpu`), which moves
 /// the bytes of a whole execution of packets in vector steps and evaluates
@@ -913,7 +893,6 @@ pub struct WordTable {
     table: Vec<u32>,
     words: u32,
     blocks: u32,
-    depth: u32,
     roles: Vec<(RowPlaneRole, u32, u32)>,
     span: WordSpan,
     /// The lookup tables the values read, as laid out, in table order.
@@ -953,9 +932,9 @@ pub struct WordTable {
 pub struct WordSpan {
     pub segments: Vec<WordSegment>,
     pub units: u32,
-    pub classes: u32,
+    classes: u32,
     pub class_count: u32,
-    pub directory: u32,
+    directory: u32,
 }
 
 /// A code plane's words in a [`WordSpan`]'s units.
@@ -1484,11 +1463,6 @@ impl WordTable {
             table,
             words,
             blocks: blocks.len() as u32,
-            depth: used
-                .iter()
-                .map(|value| values.computed[*value].depth as u32)
-                .max()
-                .unwrap_or(0),
             roles,
             span,
             lookups: lookup_of,
@@ -1616,18 +1590,14 @@ impl WordTable {
     }
 
     /// The table, as the type's docs describe it.
-    pub fn table(&self) -> &[u32] {
+    #[cfg(test)]
+    fn table(&self) -> &[u32] {
         &self.table
     }
 
     /// Words of one source packet's record.
     pub fn words(&self) -> u32 {
         self.words
-    }
-
-    /// The deepest stack a value's evaluation reaches (0 without values).
-    pub fn depth(&self) -> u32 {
-        self.depth
     }
 
     /// For a row layout, per row plane in `RowPlaneRole::ALL` order: its
@@ -1664,14 +1634,6 @@ impl WordTable {
         } else {
             units + 2 * (block - units)
         }) as usize
-    }
-
-    /// The fixed block whose first record word is `word` (a role's share
-    /// starts one).
-    pub fn fixed_block(&self, word: u32) -> u32 {
-        (self.span.units..self.blocks)
-            .find(|block| self.block_words(*block)[0] == word)
-            .expect("a fixed block starts at the word")
     }
 
     /// The record words of block `block`, in order: a unit's words segment
@@ -1826,8 +1788,8 @@ mod tests {
     use crate::registry::{self, ConversionLayout, PlaneRepackRecipe, RepresentationConversion};
 
     /// The words of block `block` of the source packet `packet` by the word
-    /// table `words`, executed as its docs describe (as a GPU kernel
-    /// executes it), each source bit it reads the bit `at` gives for it and
+    /// table `words`, executed as its docs describe (as the code the native
+    /// ABI generates from it computes them), each source bit it reads the bit `at` gives for it and
     /// its run: the index of the representative's run it is a member's, in
     /// the order the span's docs visit runs.
     fn block_words_at(
@@ -1924,9 +1886,9 @@ mod tests {
 
     /// In every registered conversion's word table, the units of a class
     /// read their values in their representative's pattern: two groups of
-    /// a unit read one value exactly where the representative's do, so a
-    /// kernel that evaluates each of the representative's values once (as
-    /// Vulkan's code does) evaluates each of the unit's once.
+    /// a unit read one value exactly where the representative's do, so code
+    /// that evaluates each of the representative's values once (as every
+    /// dialect's generated code does) evaluates each of the unit's once.
     #[test]
     fn units_of_a_class_read_values_in_one_pattern() {
         for conversion in registry::representation_conversions() {
