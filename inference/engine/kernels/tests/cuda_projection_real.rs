@@ -130,6 +130,8 @@ impl Gguf {
             11 => Format::Q3K,
             22 => Format::Iq2S,
             21 => Format::Iq3S,
+            19 => Format::Iq1S,
+            29 => Format::Iq1M,
             other => panic!("{name}: GGUF type {other}"),
         };
         let k = dims[0] as usize;
@@ -151,6 +153,8 @@ impl Gguf {
             Format::Q2K => 84,
             Format::Q3K | Format::Iq3S => 110,
             Format::Iq2S => 82,
+            Format::Iq1S => 50,
+            Format::Iq1M => 56,
         };
         let row_bytes = k / format.block_values() * block_bytes;
         let start = self.data + offset + first * row_bytes;

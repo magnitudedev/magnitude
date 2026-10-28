@@ -88,7 +88,15 @@ template <class G, class K> struct Grid : Planes {
     typedef typename G::entries E;
     typedef typename G::points Pts;
     static constexpr bool CARRIED_LOCALS = packets::IsCarried<K>::value;
-    static_assert(!K::BIAS, "grid codes take no bias");
+    // Entry k of the row at `row`.
+    __device__ __forceinline__ u32 entry_at(const u8 *row, u64 k) const {
+        u32 entry = E::read(row + codes + E::BYTES * k);
+        if constexpr (E::HIGH != 0) {
+            const u64 bit = k * E::HIGH;
+            entry |= ((u8_at(row + high + bit / 8) >> (u32)(bit % 8)) & ((1u << E::HIGH) - 1u)) << (8 * E::BYTES);
+        }
+        return entry;
+    }
     // A group's entries, and the words they fill.
     static constexpr u32 ENTRIES = K::GROUP / 8;
     static constexpr int WORDS = (int)(ENTRIES * E::BYTES / 4);
@@ -100,7 +108,15 @@ template <class G, class K> struct Grid : Planes {
         const u64 group = i / K::GROUP;
         float scale, bias;
         u32 entry;
-        if constexpr (CARRIED_LOCALS) {
+        if constexpr (CARRIED_LOCALS && E::HIGH != 0) {
+            u32 field = 0u;
+#pragma unroll
+            for (u32 j = 0; j < K::WIDTH; ++j)
+                field |= ((entry_at(row, group * ENTRIES + j) >> K::CARRIED) & 1u) << j;
+            const u32 fields[1] = {field};
+            K::form(fields, 0, K::factors(K::factor_word(row + supers, i >> 8)), scale, bias);
+            entry = entry_at(row, i >> 3);
+        } else if constexpr (CARRIED_LOCALS) {
             // The group's entries, loaded as words once: their carried bits
             // and the element's own entry.
             const u8 *first = row + codes + group * (ENTRIES * E::BYTES);
@@ -116,7 +132,7 @@ template <class G, class K> struct Grid : Planes {
             K::form(fields, 0, K::factors(K::factor_word(row + supers, i >> 8)), scale, bias);
             entry = packets::bits_of<8 * E::BYTES>(w, 8 * E::BYTES * (u32)((i >> 3) % ENTRIES));
         } else {
-            entry = E::read(row + codes + E::BYTES * (i >> 3));
+            entry = entry_at(row, i >> 3);
             K::at(row + scales, row + supers, group, scale, bias);
         }
         if constexpr (E::HIGH != 0) {
@@ -128,21 +144,30 @@ template <class G, class K> struct Grid : Planes {
             entry |= ((high >> (bit & 7u)) & ((1u << E::HIGH) - 1u)) << (8 * E::BYTES);
         }
         const uint2 point = Pts::point(entry);
-        const u32 signs = G::signs(entry);
         const u32 word = lane < 4 ? point.x : point.y;
-        const float magnitude = float((word >> (8 * (lane % 4))) & 0xffu);
-        return scale * ((signs >> lane) & 1u ? -magnitude : magnitude);
+        if constexpr (G::SIGNED) {
+            const float code = float((int)(signed char)((G::codes(word, entry) >> (8 * (lane % 4))) & 0xffu));
+            return K::BIAS ? __fmaf_rn(scale, code, -bias) : scale * code;
+        } else {
+            static_assert(!K::BIAS, "magnitude grid codes take no bias");
+            const u32 signs = G::signs(entry);
+            const float magnitude = float((word >> (8 * (lane % 4))) & 0xffu);
+            return scale * ((signs >> lane) & 1u ? -magnitude : magnitude);
+        }
     }
 };
 
 // The gather decoder of a packed element's emitted decode axes.
-template <u32 CODES, u32 LOW, u32 HIGH, int OFFSET, u32 TABLE, u32 GRID, u32 INDEX_BITS, u32 LANES, u32 SIGNS, class K>
+template <u32 CODES, u32 LOW, u32 HIGH, int OFFSET, u32 TABLE, u32 GRID, u32 INDEX_BITS, u32 LANES, u32 SIGNS,
+          u32 DELTA_BIT, u32 DELTA, class K>
 struct Decoder {
     typedef Packed<LOW, HIGH, typename packets::CodesOf<CODES, OFFSET, TABLE>::type, K> type;
 };
-template <u32 LOW, u32 HIGH, int OFFSET, u32 TABLE, u32 GRID, u32 INDEX_BITS, u32 LANES, u32 SIGNS, class K>
-struct Decoder<SEISMIC_CODES_GRID, LOW, HIGH, OFFSET, TABLE, GRID, INDEX_BITS, LANES, SIGNS, K> {
-    typedef Grid<typename packets::GridCodesOf<LOW, HIGH, GRID, INDEX_BITS, LANES, SIGNS>::type, K> type;
+template <u32 LOW, u32 HIGH, int OFFSET, u32 TABLE, u32 GRID, u32 INDEX_BITS, u32 LANES, u32 SIGNS, u32 DELTA_BIT,
+          u32 DELTA, class K>
+struct Decoder<SEISMIC_CODES_GRID, LOW, HIGH, OFFSET, TABLE, GRID, INDEX_BITS, LANES, SIGNS, DELTA_BIT, DELTA, K> {
+    typedef Grid<typename packets::GridCodesOf<LOW, HIGH, GRID, INDEX_BITS, LANES, SIGNS, DELTA_BIT, DELTA>::type, K>
+        type;
 };
 
 } // namespace rows16
@@ -156,7 +181,8 @@ typedef Decoder<ELEMENT_CAT(ROWS16_T, _CODES), ELEMENT_CAT(ROWS16_T, _CODE_LOW_B
                 ELEMENT_CAT(ROWS16_T, _CODE_HIGH_BITS), ELEMENT_CAT(ROWS16_T, _CODES_OFFSET),
                 ELEMENT_CAT(ROWS16_T, _CODES_TABLE), ELEMENT_CAT(ROWS16_T, _CODES_GRID),
                 ELEMENT_CAT(ROWS16_T, _CODES_GRID_INDEX_BITS), ELEMENT_CAT(ROWS16_T, _CODES_GRID_LANES),
-                ELEMENT_CAT(ROWS16_T, _CODES_GRID_SIGNS), PACKETS_COEFFICIENTS(ROWS16_T)>::type T;
+                ELEMENT_CAT(ROWS16_T, _CODES_GRID_SIGNS), ELEMENT_CAT(ROWS16_T, _CODES_GRID_DELTA_BIT),
+                ELEMENT_CAT(ROWS16_T, _CODES_GRID_DELTA), PACKETS_COEFFICIENTS(ROWS16_T)>::type T;
 } // namespace rows16
 #define ROWS16_T_AT(pointer)                                                                                   \
     rows16::T {                                                                                               \

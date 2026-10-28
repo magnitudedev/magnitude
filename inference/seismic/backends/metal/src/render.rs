@@ -1804,6 +1804,10 @@ fn interpret_code(raw: &str, bits: u32, interpretation: &CodeInterpretation) -> 
         }
         CodeInterpretation::Offset(offset) => format!("(int({raw}) - {offset})"),
         CodeInterpretation::Odd => format!("int(2u * uint({raw}) + 1u)"),
+        CodeInterpretation::SignedOdd => {
+            let odd = format!("int(2u * (uint({raw}) & {}u) + 1u)", (1u32 << (bits - 1)) - 1);
+            format!("(((uint({raw}) >> {}u) & 1u) != 0u ? -{odd} : {odd})", bits - 1)
+        }
         CodeInterpretation::Table(codebook) => {
             let table = codebook.values;
             let mut expression = table[0].to_string();
@@ -1827,7 +1831,7 @@ fn plane_lane(coords: &[String], group: u32) -> String {
 }
 
 /// The code of the value at `lane` of vector-code entry `raw`
-/// (`GridCodes::code`), reading the grid's magnitudes from `table`.
+/// (`GridCodes::code`), reading the grid's lane values from `table`.
 fn grid_code(raw: &str, lane: &str, grid: &GridCodes, table: &str) -> String {
     let lanes = grid.lanes();
     let index = format!(
@@ -1836,21 +1840,35 @@ fn grid_code(raw: &str, lane: &str, grid: &GridCodes, table: &str) -> String {
         lanes.trailing_zeros(),
         (1u32 << grid.index_bits()) - 1
     );
-    let magnitude = format!(
-        "{table}[({index}) * {lanes}u + (({lane}) & {}u)]",
+    let value = format!(
+        "int({table}[({index}) * {lanes}u + (({lane}) & {}u)])",
         lanes - 1
     );
-    let bits = grid.signs.bits();
-    let signs = format!(
-        "((uint({raw}) >> {}u) & {}u)",
-        grid.sign_bit(),
-        (1u32 << bits) - 1
-    );
-    let signs = match grid.signs {
-        GridSigns::Explicit8 => signs,
-        GridSigns::ParityPlus7 => format!("({signs} | ((popcount({signs}) & 1u) << {bits}u))"),
+    let value = match grid.signs {
+        GridSigns::None => value,
+        signs => {
+            let bits = signs.bits();
+            let explicit = format!(
+                "((uint({raw}) >> {}u) & {}u)",
+                grid.sign_bit(),
+                (1u32 << bits) - 1
+            );
+            let signs = match signs {
+                GridSigns::ParityPlus7 => {
+                    format!("({explicit} | ((popcount({explicit}) & 1u) << {bits}u))")
+                }
+                _ => explicit,
+            };
+            format!("(((({signs}) >> ({lane})) & 1u) != 0u ? -{value} : {value})")
+        }
     };
-    format!("(((({signs}) >> ({lane})) & 1u) != 0u ? -int({magnitude}) : int({magnitude}))")
+    match grid.delta {
+        Some(exponent) => format!(
+            "((({value}) << {exponent}) + (((uint({raw}) >> {}u) & 1u) != 0u ? -1 : 1))",
+            grid.delta_bit()
+        ),
+        None => value,
+    }
 }
 
 fn float_code_function(format: FloatCodeFormat) -> &'static str {

@@ -234,11 +234,13 @@ void packets_set_group(inout packets_packet packet, uint g, float scale, const b
 // grid code's entries: four of LOW bits a packet.
 
 // The code planes this file reads: 2-bit low planes (with a high plane of
-// up to one bit), 4-bit low planes (up to two), 8-bit low planes, and 16- or
-// 24-bit grid entries with a high part below a byte or none.
+// up to one bit), 4-bit low planes (up to two), 8-bit low planes, and 8-,
+// 16- or 24-bit grid entries with a high part below a byte or none.
 #define PACKETS_READS_PLANES(AXES) (AXES(SEISMIC_AXIS_FORM) != SEISMIC_FORM_ROWS \
     || (AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) < 8 \
         && (AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 16 || AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 24)) \
+    || (AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID && AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 8 \
+        && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) == 4) \
     || (AXES(SEISMIC_AXIS_CODES) != SEISMIC_CODES_GRID \
         && ((AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 2 && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) <= 1) \
             || (AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 4 && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) <= 2) \
@@ -364,10 +366,25 @@ vec4 packets_interpret(const int kind, uint bytes, const bool centred) {
 // held in a packet's `high.x`.
 #define PACKETS_GRID_HIGH(AXES) (AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS \
     && AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) != 0)
+// Whether slot axes `AXES` are grid codes of signed points (no sign bits,
+// `CODES_GRID_SIGNS` 0), with a delta where `CODES_GRID_DELTA_BIT` is not 0:
+// a code is then 2^DELTA times the value, plus 1, or minus 1 with the delta
+// set.
+#define PACKETS_SIGNED_GRID(AXES) (AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS \
+    && AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID && AXES(SEISMIC_AXIS_CODES_GRID_SIGNS) == 0)
+// Whether slot axes `AXES` have a signed bias (`COEFF_SIGNED_BIAS`: a sign
+// bit after each scale code, the bias the scale times
+// 2^COEFF_SIGNED_EXPONENT, negated with it set).
+#define PACKETS_SIGNED_BIAS(AXES) (AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS \
+    && AXES(SEISMIC_AXIS_COEFF_SIGNED_BIAS) != 0)
 
 #if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
 // Entry `step` of a packet's four entries (`LOW` bits each).
 uint packets_grid_entry(const int kind, uvec4 entries, uint step) {
+#if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 8)
+    if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS) == 8)
+        return (entries.x >> (8u * step)) & 0xffu;
+#endif
 #if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 24)
     if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS) == 24) {
         const uint word = (3u * step) >> 2, shift = (24u * step) & 31u;
@@ -445,6 +462,23 @@ uint packets_grid_signs_shift(const int kind) {
     return uint(PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_GRID_INDEX_BITS))
         * (8u / uint(PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_GRID_LANES)));
 }
+
+#if PACKETS_SOME(PACKETS_SIGNED_GRID)
+// The eight codes of `entry`'s signed point, its delta applied, as
+// (0,2,4,6), (1,3,5,7).
+void packets_grid_signed_codes(const int kind, uvec2 point, uint entry, out vec4 even, out vec4 odd) {
+    const vec4 low = vec4(unpack8(int(point.x))), high = vec4(unpack8(int(point.y)));
+    even = vec4(low.x, low.z, high.x, high.z);
+    odd = vec4(low.y, low.w, high.y, high.w);
+    const uint delta_bit = uint(PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_GRID_DELTA_BIT));
+    if (delta_bit != 0u) {
+        const float scale = float(1u << uint(PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_GRID_DELTA)));
+        const float delta = ((entry >> delta_bit) & 1u) != 0u ? -1.0 : 1.0;
+        even = even * scale + delta;
+        odd = odd * scale + delta;
+    }
+}
+#endif
 
 // The eight lane signs of `entry` (`registry::GridSigns`): its eight sign
 // bits, or seven and an eighth that makes the count of set bits even.
@@ -542,8 +576,9 @@ vec2 packets_scale_pair_at(const int scale, uint64_t at) {
 // A packet's local field bits (its groups' scale codes, and minimum codes,
 // of a coefficient group of 16 or 32: two groups or one), so that no `#if`
 // divides.
-#define PACKETS_FIELD_BITS(AXES) (AXES(SEISMIC_AXIS_COEFF_LOCAL_BITS) * (1 + AXES(SEISMIC_AXIS_COEFF_BIAS)) \
-    * (1 + (AXES(SEISMIC_AXIS_COEFF_GROUP) == 16)))
+#define PACKETS_FIELD_BITS(AXES) ((AXES(SEISMIC_AXIS_COEFF_LOCAL_BITS) \
+    * (1 + (AXES(SEISMIC_AXIS_COEFF_BIAS) != 0 && AXES(SEISMIC_AXIS_COEFF_SIGNED_BIAS) == 0)) \
+    + AXES(SEISMIC_AXIS_COEFF_SIGNED_BIAS)) * (1 + (AXES(SEISMIC_AXIS_COEFF_GROUP) == 16)))
 // Whether a field of F bits read from the plane fits the reader's four
 // bytes: it starts at a multiple of F's lowest set bit (at most 8) within a
 // byte, so it reaches F + 8 - that bit (`packets_coefficients`), at most 32.
@@ -552,9 +587,9 @@ vec2 packets_scale_pair_at(const int scale, uint64_t at) {
 // The coefficient structures this file reads: direct ones per 16 values or a
 // multiple of 32 (with a bias, each group's scale then its bias), and
 // hierarchical ones per 16 or 32 values whose local codes are unsigned, two's
-// complement, offset or odd, either carried (without a minimum) by at most a
-// group's grid entries or in the scales plane, a packet's field below a word
-// and within the reader's four bytes.
+// complement, offset or odd, either carried (without a minimum, with or
+// without a signed bias) by at most a group's grid entries or in the scales
+// plane, a packet's field below a word and within the reader's four bytes.
 #define PACKETS_READS_COEFFICIENTS(AXES) (AXES(SEISMIC_AXIS_FORM) != SEISMIC_FORM_ROWS \
     || (AXES(SEISMIC_AXIS_COEFF) == SEISMIC_COEFF_DIRECT \
         && (AXES(SEISMIC_AXIS_COEFF_GROUP) == 16 || AXES(SEISMIC_AXIS_COEFF_GROUP) % 32 == 0) \
@@ -568,8 +603,9 @@ vec2 packets_scale_pair_at(const int scale, uint64_t at) {
         && ((AXES(SEISMIC_AXIS_COEFF_CARRIED) == 0 \
                 && PACKETS_FIELD_BITS(AXES) < 32 && PACKETS_FIELD_SPANS(PACKETS_FIELD_BITS(AXES))) \
             || (AXES(SEISMIC_AXIS_COEFF_CARRIED) != 0 && AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID \
-                && AXES(SEISMIC_AXIS_COEFF_BIAS) == 0 \
-                && 8 * AXES(SEISMIC_AXIS_COEFF_LOCAL_BITS) <= AXES(SEISMIC_AXIS_COEFF_GROUP)))))
+                && (AXES(SEISMIC_AXIS_COEFF_BIAS) == 0 || AXES(SEISMIC_AXIS_COEFF_SIGNED_BIAS) != 0) \
+                && 8 * (AXES(SEISMIC_AXIS_COEFF_LOCAL_BITS) + AXES(SEISMIC_AXIS_COEFF_SIGNED_BIAS)) \
+                    <= AXES(SEISMIC_AXIS_COEFF_GROUP)))))
 #if !PACKETS_ALL(PACKETS_READS_COEFFICIENTS)
 #error "packets: a weight slot's coefficients are of a structure this file does not read"
 #endif
@@ -628,18 +664,30 @@ void packets_coefficients(const int kind, uint64_t row, packets_rows16 geometry,
 #endif
 #if PACKETS_ANY(SEISMIC_AXIS_COEFF, SEISMIC_COEFF_HIER)
     if (coeff == SEISMIC_COEFF_HIER) {
+        // Whether groups have a minimum code under a minimum factor (a bias
+        // that is no signed bias).
+#if PACKETS_SOME(PACKETS_SIGNED_BIAS)
+        const bool signed_bias = PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_SIGNED_BIAS) != 0;
+#define PACKETS_MINIMUM (bias && !signed_bias)
+#else
+#define PACKETS_MINIMUM bias
+#endif
         const uint per = uint(PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_FACTOR_GROUP)) / 32u; // packets a factor
-        const uint64_t factors = row + geometry.supers + uint64_t(bias ? 2u * bytes : bytes) * uint64_t(p / per);
+        const uint64_t factors = row + geometry.supers + uint64_t(PACKETS_MINIMUM ? 2u * bytes : bytes) * uint64_t(p / per);
         const int exponent = PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_EXPONENT);
         // The scale factor and the minimum factor after it, one load.
-        const vec2 stored = bias ? packets_scale_pair_at(scale, factors) : vec2(packets_scale_at(scale, factors), 0.0);
+        const vec2 stored = PACKETS_MINIMUM ? packets_scale_pair_at(scale, factors) : vec2(packets_scale_at(scale, factors), 0.0);
         const float factor = exponent + code_exponent != 0 ? ldexp(stored.x, exponent + code_exponent) : stored.x;
-        const float minimum = bias ? float(PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_BIAS_SIGN))
+        const float minimum = PACKETS_MINIMUM ? float(PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_BIAS_SIGN))
             * (exponent != 0 ? ldexp(stored.y, exponent) : stored.y) : 0.0;
         // The packet's local field: per group a scale code, then its minimum
-        // code, LOCAL_BITS each.
+        // code, LOCAL_BITS each, or its signed bias's sign bit.
         const uint bits = uint(PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_LOCAL_BITS));
+#if PACKETS_SOME(PACKETS_SIGNED_BIAS)
+        const uint width = signed_bias ? bits + 1u : bits * (bias ? 2u : 1u), mask = (1u << bits) - 1u;
+#else
         const uint width = bits * (bias ? 2u : 1u), mask = (1u << bits) - 1u;
+#endif
         uint field = 0u;
 #if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
         if (PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_CARRIED) != 0) {
@@ -649,7 +697,11 @@ void packets_coefficients(const int kind, uint64_t row, packets_rows16 geometry,
             [[unroll]] for (uint g = 0u; g < 2u; ++g) {
                 if (g < groups) {
                     [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+#if PACKETS_SOME(PACKETS_SIGNED_BIAS)
+                        if (j < width)
+#else
                         if (j < bits)
+#endif
                             field |= ((packets_grid_code(kind, packet, g * (4u / groups) + j) >> carried) & 1u)
                                 << (g * width + j);
                     }
@@ -683,10 +735,20 @@ void packets_coefficients(const int kind, uint64_t row, packets_rows16 geometry,
         }
         [[unroll]] for (uint g = 0u; g < 2u; ++g) {
             if (g < groups) {
+#if PACKETS_SOME(PACKETS_SIGNED_BIAS)
+                if (signed_bias) {
+                    const float scale_g = factor * packets_local_value(kind, (field >> (g * width)) & mask);
+                    const float signed_g = ldexp(scale_g, PACKETS_AXIS(kind, SEISMIC_AXIS_COEFF_SIGNED_EXPONENT));
+                    packets_set_group(packet, g, scale_g, true,
+                        ((field >> (g * width + bits)) & 1u) != 0u ? -signed_g : signed_g);
+                    continue;
+                }
+#endif
                 packets_set_group(packet, g, factor * packets_local_value(kind, (field >> (g * width)) & mask), bias,
                     bias ? minimum * packets_local_value(kind, (field >> (g * width + bits)) & mask) : 0.0);
             }
         }
+#undef PACKETS_MINIMUM
     }
 #endif
 }
@@ -729,12 +791,15 @@ packets_packet packets_load(const int kind, uint64_t row, packets_rows16 geometr
         packet.low = uvec4(element_u32_at(codes), element_u32_at(codes + 4ul), element_u32_at(codes + 8ul), 0u);
 #endif
 #if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 4) || PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 8)
-    if (low == 4u || low == 8u)
+    if (low == 4u || (low == 8u && !grid))
         packet.low = element_uvec4_at(codes);
 #endif
 #if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 8)
-    if (low == 8u)
+    if (low == 8u && !grid)
         packet.second = element_uvec4_at(codes + 16ul);
+    // Byte grid entries: a packet's four bytes.
+    if (low == 8u && grid)
+        packet.low = uvec4(element_u32_at(codes), 0u, 0u, 0u);
 #endif
 #if PACKETS_SOME(PACKETS_GRID_HIGH)
     // Grid entries' high bits: 4 `high` bits at bit 4 `high` p of the row's
@@ -798,6 +863,12 @@ void packets_decode(const int kind, packets_packet packet, uint step, const bool
 #if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_GRID)
     if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID) {
         const uint entry = packets_grid_code(kind, packet, step);
+#if PACKETS_SOME(PACKETS_SIGNED_GRID)
+        if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_GRID_SIGNS) == 0) {
+            packets_grid_signed_codes(kind, packets_grid_point(kind, entry), entry, even, odd);
+            return;
+        }
+#endif
         packets_grid_codes(packets_grid_point(kind, entry), packets_grid_signs(kind, entry), even, odd);
         return;
     }

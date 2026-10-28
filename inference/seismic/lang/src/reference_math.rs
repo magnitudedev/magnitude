@@ -667,6 +667,15 @@ pub fn code_recipe(
             CodeInterpretation::Odd => {
                 b.word(WordOp::Add, b.word(WordOp::Shl, raw, b.u(1)), b.u(1))
             }
+            CodeInterpretation::SignedOdd => {
+                let low = b.word(WordOp::And, raw, b.u(mask >> 1));
+                let odd = b.word(WordOp::Add, b.word(WordOp::Shl, low, b.u(1)), b.u(1));
+                b.select(
+                    b.word_cmp(CmpOp::Eq, b.word(WordOp::Shr, raw, b.u(bits - 1)), b.u(0)),
+                    odd,
+                    b.word(WordOp::Sub, b.u(0), odd),
+                )
+            }
             CodeInterpretation::Table(codebook) => {
                 let table = codebook.values;
                 assert_eq!(
@@ -723,7 +732,7 @@ pub fn grid_code_recipe(grid: &'static crate::registry::GridCodes) -> Arc<Refere
             b.word(WordOp::Shr, entry, shift),
             b.u((1 << grid.index_bits()) - 1),
         );
-        // The point's magnitudes as two words of four lanes each.
+        // The point's lanes as two words of four bytes each.
         let half = |high: bool| {
             let word = |point: u64| (if high { point >> 32 } else { point }) as u32;
             let mut value = b.u(word(grid.points().point(0)));
@@ -742,7 +751,7 @@ pub fn grid_code_recipe(grid: &'static crate::registry::GridCodes) -> Arc<Refere
         } else {
             half(false)
         };
-        let magnitude = b.word(
+        let byte = b.word(
             WordOp::And,
             b.word(
                 WordOp::Shr,
@@ -751,39 +760,59 @@ pub fn grid_code_recipe(grid: &'static crate::registry::GridCodes) -> Arc<Refere
             ),
             b.u(0xff),
         );
-        // The eight lane signs: eight sign bits, or seven and their
-        // even-parity eighth.
-        let sign_bits = grid.signs.bits();
-        let signs = b.word(
-            WordOp::And,
-            b.word(WordOp::Shr, entry, b.u(grid.sign_bit())),
-            b.u((1 << sign_bits) - 1),
-        );
-        let signs = match grid.signs {
-            GridSigns::Explicit8 => signs,
-            GridSigns::ParityPlus7 => {
-                let mut parity = signs;
-                for fold in [4, 2, 1] {
-                    parity = b.word(WordOp::Xor, parity, b.word(WordOp::Shr, parity, b.u(fold)));
-                }
-                b.word(
-                    WordOp::Or,
-                    signs,
-                    b.word(
-                        WordOp::Shl,
-                        b.word(WordOp::And, parity, b.u(1)),
-                        b.u(sign_bits),
-                    ),
+        // A magnitude signed by its lane's sign bit (eight sign bits, or
+        // seven and their even-parity eighth), or a two's complement byte
+        // sign-extended.
+        let value = match grid.signs {
+            GridSigns::None => b.word(WordOp::Sub, b.word(WordOp::Xor, byte, b.u(0x80)), b.u(0x80)),
+            signs => {
+                let bits = signs.bits();
+                let explicit = b.word(
+                    WordOp::And,
+                    b.word(WordOp::Shr, entry, b.u(grid.sign_bit())),
+                    b.u((1 << bits) - 1),
+                );
+                let signs = match signs {
+                    GridSigns::ParityPlus7 => {
+                        let mut parity = explicit;
+                        for fold in [4, 2, 1] {
+                            parity =
+                                b.word(WordOp::Xor, parity, b.word(WordOp::Shr, parity, b.u(fold)));
+                        }
+                        b.word(
+                            WordOp::Or,
+                            explicit,
+                            b.word(WordOp::Shl, b.word(WordOp::And, parity, b.u(1)), b.u(bits)),
+                        )
+                    }
+                    _ => explicit,
+                };
+                let negative = b.word(WordOp::And, b.word(WordOp::Shr, signs, lane), b.u(1));
+                b.select(
+                    b.word_cmp(CmpOp::Eq, negative, b.u(1)),
+                    b.word(WordOp::Sub, b.u(0), byte),
+                    byte,
                 )
             }
         };
-        let negative = b.word(WordOp::And, b.word(WordOp::Shr, signs, lane), b.u(1));
-        let code = b.select(
-            b.word_cmp(CmpOp::Eq, negative, b.u(1)),
-            b.word(WordOp::Sub, b.u(0), magnitude),
-            magnitude,
-        );
-        let out = b.typed(code, DType::I32);
+        // A delta's code: `2^e value + 1`, `- 1` with the delta bit set.
+        let value = match grid.delta {
+            Some(exponent) => {
+                let scaled = b.word(WordOp::Shl, value, b.u(exponent));
+                let set = b.word(
+                    WordOp::And,
+                    b.word(WordOp::Shr, entry, b.u(grid.delta_bit())),
+                    b.u(1),
+                );
+                b.select(
+                    b.word_cmp(CmpOp::Eq, set, b.u(1)),
+                    b.word(WordOp::Sub, scaled, b.u(1)),
+                    b.word(WordOp::Add, scaled, b.u(1)),
+                )
+            }
+            None => value,
+        };
+        let out = b.typed(value, DType::I32);
         b.finish(out)
     })
 }

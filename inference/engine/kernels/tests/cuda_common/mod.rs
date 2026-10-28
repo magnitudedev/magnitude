@@ -63,10 +63,14 @@ pub enum Format {
     Iq2S,
     /// GGUF IQ3_S, resident as iq3s (vector codes with a high part).
     Iq3S,
+    /// GGUF IQ1_S and IQ1_M (vector codes of signed points, representations
+    /// of their own).
+    Iq1S,
+    Iq1M,
 }
 
 impl Format {
-    pub const ALL: [Format; 19] = [
+    pub const ALL: [Format; 21] = [
         Format::Q4K,
         Format::Q5K,
         Format::Q6K,
@@ -86,6 +90,8 @@ impl Format {
         Format::Q3K,
         Format::Iq2S,
         Format::Iq3S,
+        Format::Iq1S,
+        Format::Iq1M,
     ];
     pub fn external(self) -> &'static str {
         match self {
@@ -107,6 +113,8 @@ impl Format {
             Format::Q3K => "gguf_q3_k",
             Format::Iq2S => "gguf_iq2_s",
             Format::Iq3S => "gguf_iq3_s",
+            Format::Iq1S => "gguf_iq1_s",
+            Format::Iq1M => "gguf_iq1_m",
         }
     }
     pub fn representation(self) -> &'static str {
@@ -130,6 +138,8 @@ impl Format {
             Format::Q3K => "q3k",
             Format::Iq2S => "iq2s",
             Format::Iq3S => "iq3s",
+            Format::Iq1S => "iq1s",
+            Format::Iq1M => "iq1m",
         }
     }
     /// Whether the CUDA GEMM keeps this format's codes exact and scales its
@@ -150,6 +160,8 @@ impl Format {
                 | Format::Iq2Xxs
                 | Format::Iq2S
                 | Format::Iq3S
+                | Format::Iq1S
+                | Format::Iq1M
         )
     }
     pub fn resident(self) -> Element {
@@ -254,6 +266,23 @@ impl Format {
                 // bits, signs and scale nibbles.
                 block.extend(f16(rng.uniform(0.00005, 0.0003)));
                 block.extend((0..64 + 8 + 32 + 4).map(|_| rng.byte()));
+            }
+            Format::Iq1S => {
+                // d (values reach d * 15 * 9 / 8), 32 low index bytes, eight
+                // high-index, scale and sign words.
+                block.extend(f16(rng.uniform(0.001, 0.005)));
+                block.extend((0..32 + 16).map(|_| rng.byte()));
+            }
+            Format::Iq1M => {
+                // 32 low index bytes, 16 high-index and delta bytes, then four
+                // scale words whose top nibbles are d (values reach
+                // d * 15 * 9 / 8).
+                block.extend((0..32 + 16 + 8).map(|_| rng.byte()));
+                let d = f16_bits(rng.uniform(0.001, 0.005));
+                for word in 0..4 {
+                    let at = 48 + 2 * word + 1;
+                    block[at] = (block[at] & 0x0f) | (((d >> (4 * word)) as u8 & 0x0f) << 4);
+                }
             }
         }
         block

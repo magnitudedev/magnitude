@@ -157,10 +157,13 @@ enum Repr {
     Q3k,
     Iq2s,
     Iq3s,
+    Iq1s,
+    Iq1m,
 }
 
 /// The vector-coded formats (256-value GGUF blocks).
-const GRID_REPRS: [Repr; 5] = [Repr::Iq2xs, Repr::Iq3xxs, Repr::Iq2xxs, Repr::Iq2s, Repr::Iq3s];
+const GRID_REPRS: [Repr; 7] =
+    [Repr::Iq2xs, Repr::Iq3xxs, Repr::Iq2xxs, Repr::Iq2s, Repr::Iq3s, Repr::Iq1s, Repr::Iq1m];
 
 /// The k-quant formats imported from GGUF blocks of 256 values.
 const K_QUANT_REPRS: [Repr; 2] = [Repr::Q2k, Repr::Q3k];
@@ -201,6 +204,8 @@ impl Repr {
             Repr::Q3k => "q3k",
             Repr::Iq2s => "iq2s",
             Repr::Iq3s => "iq3s",
+            Repr::Iq1s => "iq1s",
+            Repr::Iq1m => "iq1m",
         }
     }
     /// The GGUF source of a representation built from GGUF blocks, with its
@@ -222,6 +227,8 @@ impl Repr {
             Repr::Q3k => Some(("gguf_q3_k", 110, 256)),
             Repr::Iq2s => Some(("gguf_iq2_s", 82, 256)),
             Repr::Iq3s => Some(("gguf_iq3_s", 110, 256)),
+            Repr::Iq1s => Some(("gguf_iq1_s", 50, 256)),
+            Repr::Iq1m => Some(("gguf_iq1_m", 56, 256)),
             _ => None,
         }
     }
@@ -316,7 +323,9 @@ fn planes(repr: Repr, k: usize) -> Planes {
         | Repr::Q2k
         | Repr::Q3k
         | Repr::Iq2s
-        | Repr::Iq3s => {
+        | Repr::Iq3s
+        | Repr::Iq1s
+        | Repr::Iq1m => {
             unreachable!("{repr:?} takes the registry's geometry (`gguf_weight`)")
         }
     }
@@ -537,7 +546,9 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
             | Repr::Q2k
             | Repr::Q3k
             | Repr::Iq2s
-            | Repr::Iq3s => {
+            | Repr::Iq3s
+            | Repr::Iq1s
+            | Repr::Iq1m => {
                 unreachable!("built by `gguf_weight`")
             }
         }
@@ -620,6 +631,16 @@ fn gguf_bytes(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -> V
             Repr::Q2k => {
                 block[80..82].copy_from_slice(&f16_bits(factor / 45.0).to_le_bytes());
                 block[82..84].copy_from_slice(&f16_bits(factor / 30.0).to_le_bytes());
+            }
+            // d: values reach d 15 (1 + 1/8).
+            Repr::Iq1s => block[..2].copy_from_slice(&f16_bits(factor / 17.0).to_le_bytes()),
+            // d's nibbles are the top nibbles of the four scale words.
+            Repr::Iq1m => {
+                let d = f16_bits(factor / 17.0);
+                for word in 0..4 {
+                    let at = 48 + 2 * word + 1;
+                    block[at] = (block[at] & 0x0f) | (((d >> (4 * word)) as u8 & 0x0f) << 4);
+                }
             }
             _ => unreachable!("{repr:?} is not imported from GGUF"),
         }
@@ -3440,7 +3461,7 @@ fn dense_expand_grid_formats_match_their_portable_body() {
     for device in devices() {
         dense_expand_matches_its_portable_body_on(
             &device,
-            &[(Repr::Iq2xs, Repr::Iq3xxs), (Repr::Iq2xxs, Repr::Iq2xxs), (Repr::Iq2s, Repr::Iq2s), (Repr::Iq3s, Repr::Iq3s)],
+            &[(Repr::Iq2xs, Repr::Iq3xxs), (Repr::Iq2xxs, Repr::Iq2xxs), (Repr::Iq2s, Repr::Iq2s), (Repr::Iq3s, Repr::Iq3s), (Repr::Iq1s, Repr::Iq1m)],
         );
     }
 }
@@ -5528,6 +5549,8 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
         Repr::Q3k,
         Repr::Iq2s,
         Repr::Iq3s,
+        Repr::Iq1s,
+        Repr::Iq1m,
         Repr::Bf16,
     ] {
         let table = weight(repr, v, d, 90, 8.0);

@@ -4,7 +4,7 @@
 //! repacked to that layout, and the result is checked against a host model of
 //! the entry's contract. The table takes every form a target embedding table
 //! a draft head reads is stored in (Q8_0, Q4_0, Q4_1, Q4_K, Q6_K, Q2_K,
-//! Q3_K, IQ4_XS, IQ2_S, IQ3_S, BF16).
+//! Q3_K, IQ4_XS, IQ2_S, IQ3_S, IQ1_S, BF16).
 
 use magnitude_kernels::{draft_rows, repack_weight};
 use seismic::{Device, Element, Layout, NativeSpecialization, Tensor};
@@ -59,6 +59,7 @@ enum TableForm {
     Iq4Xs,
     Iq2S,
     Iq3S,
+    Iq1S,
     Bf16,
 }
 
@@ -74,7 +75,7 @@ struct GgufBlocks {
 }
 
 impl TableForm {
-    const ALL: [TableForm; 11] = [
+    const ALL: [TableForm; 12] = [
         Self::Q8_0,
         Self::Q4_0,
         Self::Q4_1,
@@ -85,6 +86,7 @@ impl TableForm {
         Self::Iq4Xs,
         Self::Iq2S,
         Self::Iq3S,
+        Self::Iq1S,
         Self::Bf16,
     ];
 
@@ -121,6 +123,8 @@ impl TableForm {
             Self::Iq2S => Some(blocks("gguf_iq2_s", "iq2s", 82, 256, &[(0, 31.0 * 43.0 / 8.0)])),
             // d times an odd scale code to 31 and a magnitude to 15.
             Self::Iq3S => Some(blocks("gguf_iq3_s", "iq3s", 110, 256, &[(0, 31.0 * 15.0)])),
+            // d: codes reach 15 (1 + 1/8).
+            Self::Iq1S => Some(blocks("gguf_iq1_s", "iq1s", 50, 256, &[(0, 17.0)])),
             Self::Bf16 => None,
         }
     }

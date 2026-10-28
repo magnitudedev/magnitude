@@ -9,7 +9,7 @@
 //! in index order to a macro.
 
 use seismic_lang::registry::{
-    self, CodeInterpretation, CoefficientAxes, Layout, LocalCodes, MinimumSign, RepresentationKind,
+    self, CodeInterpretation, CoefficientAxes, Layout, LocalBias, LocalCodes, RepresentationKind,
     ScaleEncoding,
 };
 use seismic_lang::types::DType;
@@ -23,7 +23,9 @@ fn interpretation(interpretation: &CodeInterpretation) -> String {
         CodeInterpretation::Offset(offset) => format!("codes::Offset<{offset}>"),
         CodeInterpretation::Odd => "codes::Odd".to_owned(),
         CodeInterpretation::Table(codebook) => format!("codes::Table<{}>", codebook_id(codebook)),
-        CodeInterpretation::Grid(_) => panic!("a grid is a code component, not an interpretation"),
+        CodeInterpretation::Grid(_) | CodeInterpretation::SignedOdd => {
+            panic!("{interpretation:?} is no interpretation component")
+        }
     }
 }
 
@@ -50,7 +52,7 @@ fn packed(id: seismic_lang::ids::RepresentationId, storage: u32) -> String {
     let axes = registry::decode_axes(id).expect("packed storage has decode axes");
     let codes = match &axes.code {
         CodeInterpretation::Grid(grid) => format!(
-            "Grid<{}, {}, {}, {}, {}>",
+            "Grid<{}, {}, {}, {}, {}, {}, {}>",
             magnitude_ggml::tables::GRIDS
                 .iter()
                 .position(|known| *known == grid.grid)
@@ -58,7 +60,9 @@ fn packed(id: seismic_lang::ids::RepresentationId, storage: u32) -> String {
             grid.index_bits(),
             axes.low / 8,
             axes.high,
-            grid.signs.bits()
+            grid.signs.bits(),
+            grid.delta.map_or(0, |_| grid.delta_bit()),
+            grid.delta.unwrap_or(0)
         ),
         code => format!(
             "Planes<{}, {}, {}>",
@@ -94,19 +98,36 @@ fn packed(id: seismic_lang::ids::RepresentationId, storage: u32) -> String {
                     bit,
                     bits,
                     interpretation: local,
-                } => format!(
-                    "Carried<{bit}, {}, {}, {bits}>",
-                    axes.low / 8,
-                    self::interpretation(local)
-                ),
+                    bias,
+                } => {
+                    let (signed, exponent) = match bias {
+                        None => (false, 0),
+                        Some(LocalBias::Signed { exponent }) => (true, *exponent),
+                        Some(LocalBias::Minimum(_)) => panic!("entries carry no minimum code"),
+                    };
+                    format!(
+                        "Carried<{bit}, {}, {}, {}, {bits}, {signed}, {exponent}>",
+                        axes.low / 8,
+                        axes.high,
+                        self::interpretation(local)
+                    )
+                }
                 LocalCodes::Plane {
                     bits,
                     interpretation: local,
-                    minimum,
+                    bias,
                 } => format!(
                     "Scales<{}, {bits}, {}>",
                     self::interpretation(local),
-                    minimum.map_or(0, MinimumSign::value)
+                    match bias {
+                        None => 0,
+                        Some(LocalBias::Minimum(sign)) => sign.value(),
+                        Some(LocalBias::Signed { .. }) => {
+                            panic!(
+                                "a signed bias's sign bit is carried (no form has it in a scales plane)"
+                            )
+                        }
+                    }
                 ),
             };
             format!(

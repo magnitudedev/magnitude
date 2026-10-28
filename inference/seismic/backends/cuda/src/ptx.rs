@@ -2049,6 +2049,19 @@ impl<'a> Emitter<'a> {
                 self.line(format!("add.s32 {out}, {raw}, {};", -*offset))
             }
             CodeInterpretation::Odd => self.line(format!("mad.lo.u32 {out}, {raw}, 2, 1;")),
+            CodeInterpretation::SignedOdd => {
+                let low = self.t32();
+                self.line(format!("and.b32 {low}, {raw}, {};", (1u32 << (bits - 1)) - 1));
+                self.line(format!("mad.lo.u32 {low}, {low}, 2, 1;"));
+                let negated = self.t32();
+                self.line(format!("neg.s32 {negated}, {low};"));
+                let sign = self.t32();
+                self.line(format!("shr.b32 {sign}, {raw}, {};", bits - 1));
+                self.line(format!("and.b32 {sign}, {sign}, 1;"));
+                let negative = self.pred();
+                self.line(format!("setp.ne.u32 {negative}, {sign}, 0;"));
+                self.line(format!("selp.s32 {out}, {negated}, {low}, {negative};"));
+            }
             CodeInterpretation::Table(codebook) => {
                 let table = codebook.values;
                 self.line(format!("mov.s32 {out}, {};", table[0]));
@@ -2107,31 +2120,48 @@ impl<'a> Emitter<'a> {
         self.line(format!("mov.u64 {base}, seismic_lookup{ordinal};"));
         let address = self.t64();
         self.line(format!("mad.wide.u32 {address}, {slot}, 4, {base};"));
-        let magnitude = self.t32();
-        self.line(format!("ld.const.s32 {magnitude}, [{address}];"));
-        let bits = grid.signs.bits();
-        let signs = self.t32();
-        self.line(format!("shr.b32 {signs}, {raw}, {};", grid.sign_bit()));
-        self.line(format!("and.b32 {signs}, {signs}, {};", (1u32 << bits) - 1));
-        if grid.signs == GridSigns::ParityPlus7 {
-            let parity = self.t32();
-            self.line(format!("popc.b32 {parity}, {signs};"));
-            self.line(format!("and.b32 {parity}, {parity}, 1;"));
-            self.line(format!("shl.b32 {parity}, {parity}, {bits};"));
-            self.line(format!("or.b32 {signs}, {signs}, {parity};"));
+        let value = self.t32();
+        self.line(format!("ld.const.s32 {value}, [{address}];"));
+        let value = match grid.signs {
+            GridSigns::None => value,
+            signs => {
+                let bits = signs.bits();
+                let signs_word = self.t32();
+                self.line(format!("shr.b32 {signs_word}, {raw}, {};", grid.sign_bit()));
+                self.line(format!("and.b32 {signs_word}, {signs_word}, {};", (1u32 << bits) - 1));
+                if signs == GridSigns::ParityPlus7 {
+                    let parity = self.t32();
+                    self.line(format!("popc.b32 {parity}, {signs_word};"));
+                    self.line(format!("and.b32 {parity}, {parity}, 1;"));
+                    self.line(format!("shl.b32 {parity}, {parity}, {bits};"));
+                    self.line(format!("or.b32 {signs_word}, {signs_word}, {parity};"));
+                }
+                let bit = self.t32();
+                self.line(format!("shr.b32 {bit}, {signs_word}, {lane};"));
+                self.line(format!("and.b32 {bit}, {bit}, 1;"));
+                let negated = self.t32();
+                self.line(format!("neg.s32 {negated}, {value};"));
+                let negative = self.pred();
+                self.line(format!("setp.ne.u32 {negative}, {bit}, 0;"));
+                let out = self.t32();
+                self.line(format!("selp.s32 {out}, {negated}, {value}, {negative};"));
+                out
+            }
+        };
+        match grid.delta {
+            Some(exponent) => {
+                let delta = self.t32();
+                self.line(format!("shr.b32 {delta}, {raw}, {};", grid.delta_bit()));
+                self.line(format!("and.b32 {delta}, {delta}, 1;"));
+                // +1, or -1 with the delta bit set: 1 - 2 bit.
+                self.line(format!("mad.lo.s32 {delta}, {delta}, -2, 1;"));
+                let out = self.t32();
+                self.line(format!("shl.b32 {out}, {value}, {exponent};"));
+                self.line(format!("add.s32 {out}, {out}, {delta};"));
+                out
+            }
+            None => value,
         }
-        let bit = self.t32();
-        self.line(format!("shr.b32 {bit}, {signs}, {lane};"));
-        self.line(format!("and.b32 {bit}, {bit}, 1;"));
-        let negated = self.t32();
-        self.line(format!("neg.s32 {negated}, {magnitude};"));
-        let negative = self.pred();
-        self.line(format!("setp.ne.u32 {negative}, {bit}, 0;"));
-        let out = self.t32();
-        self.line(format!(
-            "selp.s32 {out}, {negated}, {magnitude}, {negative};"
-        ));
-        out
     }
     /// E8M0: the exponent byte is the F32 exponent field (2^(raw - 127));
     /// raw 0 is the F32 subnormal 2^-127 and raw 255 is NaN.

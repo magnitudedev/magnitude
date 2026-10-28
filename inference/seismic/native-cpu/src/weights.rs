@@ -793,9 +793,11 @@ impl Planes<8, 0, Twos> {
 /// in `tables::GRIDS`), one per eight values, `BYTES` whole bytes in the
 /// codes plane and `HIGH` bits more in the high plane, each holding
 /// `8 / lanes` `INDEX_BITS`-bit point indices, first lowest, then `SIGNS`
-/// sign bits (8, or 7 completed by an eighth of even parity). The value at
-/// lane `j` of an entry is byte `j % lanes` of its point `j / lanes`, negated
-/// by sign `j`.
+/// sign bits (8, or 7 completed by an eighth of even parity, over
+/// magnitudes; 0 for signed points), then, where `DELTA_BIT` is not 0, the
+/// delta bit there. The value at lane `j` of an entry is byte `j % lanes` of
+/// its point `j / lanes`, negated by sign `j`, then `2^DELTA` times it plus
+/// 1, or minus 1 with the delta bit set, with a delta.
 #[derive(Clone, Copy, Debug)]
 pub struct Grid<
     const GRID: usize,
@@ -803,33 +805,49 @@ pub struct Grid<
     const BYTES: usize,
     const HIGH: u32,
     const SIGNS: u32,
+    const DELTA_BIT: u32,
+    const DELTA: u32,
 >;
 
-impl<const GRID: usize, const INDEX_BITS: u32, const BYTES: usize, const HIGH: u32, const SIGNS: u32>
-    Grid<GRID, INDEX_BITS, BYTES, HIGH, SIGNS>
+impl<
+        const GRID: usize,
+        const INDEX_BITS: u32,
+        const BYTES: usize,
+        const HIGH: u32,
+        const SIGNS: u32,
+        const DELTA_BIT: u32,
+        const DELTA: u32,
+    > Grid<GRID, INDEX_BITS, BYTES, HIGH, SIGNS, DELTA_BIT, DELTA>
 {
     const POINTS: tables::GridPoints = tables::GRIDS[GRID].points;
     const SIGN_MODE: GridSigns = GridSigns::of_bits(SIGNS);
-    /// The greatest magnitude of a point lane.
+    /// The greatest magnitude of a code.
     const MAGNITUDE: i32 = {
-        let mut greatest = 0u8;
+        let mut greatest = 0i32;
         let mut index = 0;
         while index < Self::POINTS.len() {
             let mut lane = 0;
             while lane < Self::POINTS.lanes() {
                 let byte = Self::POINTS.byte(index, lane);
-                if byte > greatest {
-                    greatest = byte;
+                let value = match Self::SIGN_MODE {
+                    GridSigns::None => byte as i8 as i32,
+                    GridSigns::ParityPlus7 | GridSigns::Explicit8 => byte as i32,
+                }
+                .abs();
+                if value > greatest {
+                    greatest = value;
                 }
                 lane += 1;
             }
             index += 1;
         }
-        assert!(
-            greatest <= i8::MAX as u8,
-            "grid magnitudes fit a signed byte"
-        );
-        greatest as i32
+        let greatest = if DELTA_BIT != 0 {
+            (greatest << DELTA) + 1
+        } else {
+            greatest
+        };
+        assert!(greatest <= i8::MAX as i32, "grid codes fit a signed byte");
+        greatest
     };
 
     /// Entry `e` of the storage group of `at`: its whole bytes, then its
@@ -852,10 +870,28 @@ impl<const GRID: usize, const INDEX_BITS: u32, const BYTES: usize, const HIGH: u
         low | (((bits >> (bit % 8)) & ((1 << HIGH) - 1)) << (8 * BYTES))
     }
 
-    /// The eight lane signs of `entry` (`GridSigns::lanes`).
+    /// The eight values of `entry`.
     #[inline(always)]
-    fn signs(entry: u32) -> u32 {
-        Self::SIGN_MODE.lanes((entry >> (8 / Self::POINTS.lanes() * INDEX_BITS)) & ((1 << SIGNS) - 1))
+    fn entry_values(entry: u32) -> [i8; 8] {
+        let mask = (1u32 << INDEX_BITS) - 1;
+        let point = match Self::POINTS {
+            tables::GridPoints::Lanes8(points) => points[(entry & mask) as usize],
+            tables::GridPoints::Lanes4(points) => {
+                u64::from(points[(entry & mask) as usize])
+                    | (u64::from(points[((entry >> INDEX_BITS) & mask) as usize]) << 32)
+            }
+        };
+        let values = if SIGNS == 0 {
+            point.to_le_bytes().map(|byte| byte as i8)
+        } else {
+            let signs = (entry >> (8 / Self::POINTS.lanes() * INDEX_BITS)) & ((1 << SIGNS) - 1);
+            grid_values(point, Self::SIGN_MODE.lanes(signs))
+        };
+        if DELTA_BIT == 0 {
+            return values;
+        }
+        let delta = if (entry >> DELTA_BIT) & 1 == 0 { 1 } else { -1 };
+        values.map(|value| (value << DELTA) + delta)
     }
 }
 
@@ -874,26 +910,25 @@ fn grid_values(point: u64, signs: u32) -> [i8; 8] {
         .map(|byte| byte as i8)
 }
 
-impl<const GRID: usize, const INDEX_BITS: u32, const BYTES: usize, const HIGH: u32, const SIGNS: u32>
-    Codes for Grid<GRID, INDEX_BITS, BYTES, HIGH, SIGNS>
+impl<
+        const GRID: usize,
+        const INDEX_BITS: u32,
+        const BYTES: usize,
+        const HIGH: u32,
+        const SIGNS: u32,
+        const DELTA_BIT: u32,
+        const DELTA: u32,
+    > Codes for Grid<GRID, INDEX_BITS, BYTES, HIGH, SIGNS, DELTA_BIT, DELTA>
 {
     const LEAST: i32 = -Self::MAGNITUDE;
     const GREATEST: i32 = Self::MAGNITUDE;
 
     #[inline(always)]
     unsafe fn values(at: At) -> [i8; PACKET] {
-        let mask = (1u32 << INDEX_BITS) - 1;
         let mut values = [0i8; PACKET];
         for e in 0..PACKET / 8 {
             let entry = unsafe { Self::entry(at, 4 * at.packet + e) };
-            let point = match Self::POINTS {
-                tables::GridPoints::Lanes8(points) => points[(entry & mask) as usize],
-                tables::GridPoints::Lanes4(points) => {
-                    u64::from(points[(entry & mask) as usize])
-                        | (u64::from(points[((entry >> INDEX_BITS) & mask) as usize]) << 32)
-                }
-            };
-            values[8 * e..8 * e + 8].copy_from_slice(&grid_values(point, Self::signs(entry)));
+            values[8 * e..8 * e + 8].copy_from_slice(&Self::entry_values(entry));
         }
         values
     }
@@ -1544,12 +1579,28 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32> C
     }
 }
 
+/// The bias of hierarchical coefficients (`registry::LocalBias`), as a
+/// minimum term: its code times a minimum factor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bias {
+    None,
+    /// A minimum code under the stored minimum factor, its term of sign
+    /// `sign` (-1 or 1).
+    Minimum {
+        sign: i32,
+    },
+    /// The scale code signed by the group's sign bit, under the scale factor
+    /// times `2^exponent`.
+    Signed {
+        exponent: i32,
+    },
+}
+
 /// The local codes of hierarchical coefficients: per coefficient group a
-/// scale code (and with a minimum a minimum code).
+/// scale code (and with a bias its minimum code).
 pub trait Locals: Copy + Send + Sync + 'static {
-    /// The sign of the minimum's term in a value's bias: -1 or 1, or 0
-    /// without a minimum.
-    const MIN_SIGN: i32;
+    /// How the bias's minimum code enters a value.
+    const BIAS: Bias;
 
     /// The (scale, minimum) codes' values of `GROUP`-value coefficient group
     /// `local` of the storage group of `at`; the minimum is 0 without one.
@@ -1579,7 +1630,7 @@ pub trait Locals: Copy + Send + Sync + 'static {
 /// Local codes in the scales plane: per coefficient group a `BITS`-bit
 /// scale code (then, with a minimum of sign `MIN_SIGN`, a minimum code) read
 /// through `L`, group `j`'s at bit `j BITS (1 + minimum)` of its storage
-/// group's bytes.
+/// group's bytes. (A sign bit of a signed bias is carried, `Carried`.)
 #[derive(Clone, Copy, Debug)]
 pub struct Scales<L, const BITS: u32, const MIN_SIGN: i32>(PhantomData<L>);
 
@@ -1626,7 +1677,11 @@ impl<L: Interpretation, const BITS: u32, const MIN_SIGN: i32> Scales<L, BITS, MI
 }
 
 impl<L: Interpretation, const BITS: u32, const MIN_SIGN: i32> Locals for Scales<L, BITS, MIN_SIGN> {
-    const MIN_SIGN: i32 = MIN_SIGN;
+    const BIAS: Bias = if Self::MIN {
+        Bias::Minimum { sign: MIN_SIGN }
+    } else {
+        Bias::None
+    };
 
     #[inline(always)]
     unsafe fn block<const GROUP: usize>(at: At) -> [[(i32, i32); 2]; 8] {
@@ -1671,28 +1726,63 @@ impl<L: Interpretation, const BITS: u32, const MIN_SIGN: i32> Locals for Scales<
     }
 }
 
-/// Local scale codes carried by grid entries of `ENTRY_BYTES` bytes: bit
-/// `j` of a group's `BITS`-bit code at bit `BIT` of the group's entry `j`,
-/// read through `L`.
+/// Local scale codes carried by grid entries of `ENTRY_BYTES` whole bytes
+/// and `HIGH` high bits (`Grid`): bit `j` of a group's `BITS`-bit code at
+/// bit `BIT` of the group's entry `j`, read through `L`, and with `SIGNED`
+/// the sign bit of its signed bias (`Bias::Signed`, of `EXPONENT`) past it.
 #[derive(Clone, Copy, Debug)]
-pub struct Carried<const BIT: u32, const ENTRY_BYTES: usize, L, const BITS: u32>(PhantomData<L>);
+pub struct Carried<
+    const BIT: u32,
+    const ENTRY_BYTES: usize,
+    const HIGH: u32,
+    L,
+    const BITS: u32,
+    const SIGNED: bool,
+    const EXPONENT: i32,
+>(PhantomData<L>);
 
-impl<const BIT: u32, const ENTRY_BYTES: usize, L: Interpretation, const BITS: u32> Locals
-    for Carried<BIT, ENTRY_BYTES, L, BITS>
+impl<
+        const BIT: u32,
+        const ENTRY_BYTES: usize,
+        const HIGH: u32,
+        L: Interpretation,
+        const BITS: u32,
+        const SIGNED: bool,
+        const EXPONENT: i32,
+    > Locals for Carried<BIT, ENTRY_BYTES, HIGH, L, BITS, SIGNED, EXPONENT>
 {
-    const MIN_SIGN: i32 = 0;
+    const BIAS: Bias = if SIGNED {
+        Bias::Signed { exponent: EXPONENT }
+    } else {
+        Bias::None
+    };
 
     #[inline(always)]
     unsafe fn read<const GROUP: usize>(at: At, local: usize) -> (i32, i32) {
-        let entries = unsafe {
-            at.plane(RowPlaneRole::Codes)
-                .add(ENTRY_BYTES * (GROUP / 8) * local)
-        };
-        let (byte, bit) = (BIT as usize / 8, BIT % 8);
-        let code = (0..BITS as usize).fold(0u32, |code, j| {
-            code | (((u32::from(unsafe { *entries.add(ENTRY_BYTES * j + byte) }) >> bit) & 1) << j)
+        let width = BITS + u32::from(SIGNED);
+        let first = (GROUP / 8) * local;
+        // Bit `BIT` of an entry: in its whole bytes, or `BIT - 8 bytes` of
+        // its high bits.
+        let low = 8 * ENTRY_BYTES as u32;
+        let code = (0..width as usize).fold(0u32, |code, j| {
+            let entry = first + j;
+            let set = if BIT < low {
+                let at = unsafe { at.plane(RowPlaneRole::Codes).add(ENTRY_BYTES * entry) };
+                (u32::from(unsafe { *at.add(BIT as usize / 8) }) >> (BIT % 8)) & 1
+            } else {
+                let bit = HIGH as usize * entry + (BIT - low) as usize;
+                let at = unsafe { at.plane(RowPlaneRole::High).add(bit / 8) };
+                (u32::from(unsafe { *at }) >> (bit % 8)) & 1
+            };
+            code | (set << j)
         });
-        (L::value::<BITS>(code), 0)
+        let scale = L::value::<BITS>(code & ((1 << BITS) - 1));
+        let minimum = if SIGNED && (code >> BITS) & 1 != 0 {
+            -scale
+        } else {
+            scale
+        };
+        (scale, if SIGNED { minimum } else { 0 })
     }
 }
 
@@ -1700,7 +1790,7 @@ impl<const BIT: u32, const ENTRY_BYTES: usize, L: Interpretation, const BITS: u3
 /// group (the factor group) a factor of encoding `F` (then with a minimum a
 /// minimum factor) in the supers plane, scaled by `2^EXPONENT`; per `GROUP`
 /// values local codes `L`. A value's scale is `factor * 2^CODE_EXPONENT *
-/// scale code` and its bias `L::MIN_SIGN * minimum factor * minimum code`. A
+/// scale code` and its bias `±minimum factor * minimum code` (`L::BIAS`). A
 /// quantized dot sums `scale code * products` (and `minimum code *
 /// activation sums`) over the factor group exactly, then combines
 /// `factor * scaled ± minimum factor * minimums` once.
@@ -1712,16 +1802,21 @@ pub struct Hier<F, const EXPONENT: i32, const CODE_EXPONENT: i32, L, const GROUP
 impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const GROUP: usize>
     Hier<F, EXPONENT, CODE_EXPONENT, L, GROUP>
 {
-    /// Whether the coefficients have a minimum.
-    const MIN: bool = L::MIN_SIGN != 0;
+    /// Whether the coefficients have a minimum term.
+    const MIN: bool = !matches!(L::BIAS, Bias::None);
+    /// Whether the supers plane stores a minimum factor.
+    const STORED_MIN: bool = matches!(L::BIAS, Bias::Minimum { .. });
+    /// Whether the minimum term is subtracted.
+    const NEGATE: bool = matches!(L::BIAS, Bias::Minimum { sign: -1 });
 
     /// The scale factor (`factor * 2^(EXPONENT + CODE_EXPONENT)`) and the
-    /// minimum factor (the stored minimum factor times `2^EXPONENT`) of the
-    /// storage group of `at`.
+    /// minimum factor (the stored minimum factor times `2^EXPONENT`, or the
+    /// scale factor times a signed bias's `2^exponent`) of the storage group
+    /// of `at`.
     #[inline(always)]
     unsafe fn factors(at: At) -> (f32, f32) {
         let supers = at.plane(RowPlaneRole::Supers);
-        let minimum = if Self::MIN {
+        let minimum = if Self::STORED_MIN {
             unsafe { F::read(supers.add(F::BYTES)) }
         } else {
             0.0
@@ -1729,15 +1824,17 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         Self::factors_of(unsafe { F::read(supers) }, minimum)
     }
 
-    /// [`Hier::factors`] of the stored factor and minimum factor.
+    /// [`Hier::factors`] of the stored factor and minimum factor (read
+    /// only with a stored minimum).
     #[inline(always)]
     fn factors_of(factor: f32, minimum: f32) -> (f32, f32) {
-        let minimum = if Self::MIN {
-            scaled::<EXPONENT>(minimum)
-        } else {
-            0.0
+        let factor = scaled::<CODE_EXPONENT>(scaled::<EXPONENT>(factor));
+        let minimum = match L::BIAS {
+            Bias::None => 0.0,
+            Bias::Minimum { .. } => scaled::<EXPONENT>(minimum),
+            Bias::Signed { exponent } => factor * 2.0f32.powi(exponent),
         };
-        (scaled::<CODE_EXPONENT>(scaled::<EXPONENT>(factor)), minimum)
+        (factor, minimum)
     }
 
     /// [`Hier::factors`] of the eight lanes of the rows8 tile whose lane 0
@@ -1754,7 +1851,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
             row.groups[RowPlaneRole::Supers as usize],
         );
         let mut fields = [[0.0f32; 8]; 2];
-        for (field, values) in fields.iter_mut().enumerate().take(1 + Self::MIN as usize) {
+        for (field, values) in fields.iter_mut().enumerate().take(1 + Self::STORED_MIN as usize) {
             let first = unsafe { supers.add(F::BYTES * field) };
             #[cfg(target_arch = "aarch64")]
             unsafe {
@@ -2080,7 +2177,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
     fn coefficient(factors: (f32, f32), (scale, minimum): (i32, i32)) -> (f32, f32) {
         let bias = if Self::MIN {
             let bias = factors.1 * minimum as f32;
-            if L::MIN_SIGN < 0 {
+            if Self::NEGATE {
                 -bias
             } else {
                 bias
@@ -2091,14 +2188,14 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         (factors.0 * scale as f32, bias)
     }
 
-    /// `factor * scaled + L::MIN_SIGN * minimum * minimums`, the minimum
+    /// `factor * scaled ± minimum * minimums` (`L::BIAS`), the minimum
     /// term's product rounded on its own.
     #[inline(always)]
     fn combine(factors: (f32, f32), scaled: i32, minimums: i32) -> f32 {
         let scaled = factors.0 * scaled as f32;
         if !Self::MIN {
             scaled
-        } else if L::MIN_SIGN < 0 {
+        } else if Self::NEGATE {
             scaled - factors.1 * minimums as f32
         } else {
             scaled + factors.1 * minimums as f32

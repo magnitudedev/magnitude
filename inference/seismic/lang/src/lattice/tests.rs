@@ -140,6 +140,14 @@ fn plane_value(encoding: &PlaneEncoding, raw: u32) -> f64 {
             }
             CodeInterpretation::Offset(offset) => f64::from(raw) - f64::from(*offset),
             CodeInterpretation::Odd => f64::from(2 * raw + 1),
+            CodeInterpretation::SignedOdd => {
+                let odd = f64::from(2 * (raw & ((1 << (bits - 1)) - 1)) + 1);
+                if raw >> (bits - 1) == 1 {
+                    -odd
+                } else {
+                    odd
+                }
+            }
             CodeInterpretation::Table(codebook) => f64::from(codebook.values[raw as usize]),
             // An entry of vector codes is no one value: it is its raw bits.
             CodeInterpretation::Grid(_) => f64::from(raw),

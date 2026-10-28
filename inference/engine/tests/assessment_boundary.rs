@@ -353,13 +353,13 @@ fn every_unsupported_weight_type_is_counted() {
     let mut gguf = llama();
     gguf.encode("blk.0.ffn_up.weight", Encoding::Q8K);
     gguf.encode("blk.1.ffn_up.weight", Encoding::Q8K);
-    gguf.encode("blk.1.ffn_gate.weight", Encoding::Iq1M);
+    gguf.encode("blk.1.ffn_gate.weight", Encoding::Q8_1);
     assert_eq!(
         refusal(&gguf, "weights").reasons,
         [UnsupportedReason::WeightTypes {
             types: vec![
                 WeightTypeCount {
-                    ggml_type: "IQ1_M".into(),
+                    ggml_type: "Q8_1".into(),
                     tensor_count: 1
                 },
                 WeightTypeCount {

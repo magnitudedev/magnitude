@@ -1013,9 +1013,11 @@ impl Axis for registry::CodeKind {
 
 /// A code interpretation's axis values: the interpretation, its offset, its
 /// codebook (`SEISMIC_CODEBOOK_<NAME>`), and its grid (`SEISMIC_GRID_<NAME>`)
-/// with the grid's index bits, values a point and sign bits
-/// (`GridSigns::bits`: 8, or 7 with their even-parity eighth); 0 where it has
-/// none (and every value 0 for no interpretation).
+/// with the grid's index bits, values a point, sign bits
+/// (`GridSigns::bits`: 8, 7 with their even-parity eighth, or 0 for signed
+/// points) and delta (`GridCodes::delta`: its entry bit, 0 for none, and
+/// exponent); 0 where it has none (and every value 0 for no
+/// interpretation).
 struct Interpretation {
     codes: Option<registry::CodeKind>,
     offset: i32,
@@ -1024,6 +1026,8 @@ struct Interpretation {
     index_bits: u32,
     lanes: u32,
     signs: u32,
+    delta_bit: u32,
+    delta: u32,
 }
 
 impl Interpretation {
@@ -1036,6 +1040,8 @@ impl Interpretation {
             index_bits: 0,
             lanes: 0,
             signs: 0,
+            delta_bit: 0,
+            delta: 0,
         }
     }
 
@@ -1048,7 +1054,8 @@ impl Interpretation {
         match code {
             registry::CodeInterpretation::Unsigned
             | registry::CodeInterpretation::TwosComplement
-            | registry::CodeInterpretation::Odd => kind,
+            | registry::CodeInterpretation::Odd
+            | registry::CodeInterpretation::SignedOdd => kind,
             registry::CodeInterpretation::Offset(offset) => Self {
                 offset: *offset,
                 ..kind
@@ -1062,6 +1069,8 @@ impl Interpretation {
                 index_bits: grid.index_bits(),
                 lanes: grid.lanes(),
                 signs: grid.signs.bits(),
+                delta_bit: grid.delta.map_or(0, |_| grid.delta_bit()),
+                delta: grid.delta.unwrap_or(0),
                 ..kind
             },
         }
@@ -1092,9 +1101,11 @@ impl Axis for registry::ScaleEncoding {
 /// the ABI's flat values, 0 where its coefficients have none: a direct
 /// coefficient's scale is `scale`; a hierarchical one's factor is `scale`,
 /// its local codes are `local_bits`-bit `local`, its minimum's sign is
-/// `bias_sign` (1 without one), and carried local codes sit at entry bit
-/// `carried_bit`, which is past the entry's indices and signs (0: none
-/// carried).
+/// `bias_sign` (1 without one), a signed bias (`LocalBias::Signed`, a sign
+/// bit past the scale code) is `signed_bias` with its exponent
+/// `signed_exponent`, and carried local codes sit at entry bit
+/// `carried_bit`, which is past the entry's indices, signs and delta (0:
+/// none carried).
 struct Coded {
     low: u32,
     high: u32,
@@ -1104,6 +1115,8 @@ struct Coded {
     scale: registry::ScaleEncoding,
     bias: bool,
     bias_sign: i32,
+    signed_bias: bool,
+    signed_exponent: i32,
     group: u32,
     factor_group: u32,
     exponent: i32,
@@ -1124,6 +1137,8 @@ impl Coded {
             scale,
             bias,
             bias_sign: 1,
+            signed_bias: false,
+            signed_exponent: 0,
             group,
             factor_group: 0,
             exponent: 0,
@@ -1147,28 +1162,34 @@ impl Coded {
                     exponent: *exponent,
                     ..flat(axes.coefficients.kind(), *factor, false, *group)
                 };
-                match locals {
+                let (bits, interpretation, bias, carried_bit) = match locals {
                     registry::LocalCodes::Plane {
                         bits,
                         interpretation,
-                        minimum,
-                    } => Self {
-                        bias: minimum.is_some(),
-                        bias_sign: minimum.map_or(1, registry::MinimumSign::value),
-                        local_bits: *bits,
-                        local: Interpretation::of(interpretation),
-                        ..hierarchical
-                    },
+                        bias,
+                    } => (bits, interpretation, bias, 0),
                     registry::LocalCodes::Carried {
                         bit,
                         bits,
                         interpretation,
-                    } => Self {
-                        local_bits: *bits,
-                        local: Interpretation::of(interpretation),
-                        carried_bit: *bit,
-                        ..hierarchical
+                        bias,
+                    } => (bits, interpretation, bias, *bit),
+                };
+                Self {
+                    bias: bias.is_some(),
+                    bias_sign: match bias {
+                        Some(registry::LocalBias::Minimum(sign)) => sign.value(),
+                        Some(registry::LocalBias::Signed { .. }) | None => 1,
                     },
+                    signed_bias: matches!(bias, Some(registry::LocalBias::Signed { .. })),
+                    signed_exponent: match bias {
+                        Some(registry::LocalBias::Signed { exponent }) => *exponent,
+                        Some(registry::LocalBias::Minimum(_)) | None => 0,
+                    },
+                    local_bits: *bits,
+                    local: Interpretation::of(interpretation),
+                    carried_bit,
+                    ..hierarchical
                 }
             }
         }
@@ -1178,7 +1199,7 @@ impl Coded {
 /// The decode axes of a packed row-layout element, each defined as
 /// `<prefix>_<AXIS>` (`render_representation`), in the order of the axes
 /// tuple (`render_axes_tuple`).
-const CODING_AXES: [(&str, fn(&Coded) -> String); 21] = [
+const CODING_AXES: [(&str, fn(&Coded) -> String); 25] = [
     ("CODE_LOW_BITS", |c| c.low.to_string()),
     ("CODE_HIGH_BITS", |c| c.high.to_string()),
     ("CODES", |c| c.code.codes()),
@@ -1188,11 +1209,17 @@ const CODING_AXES: [(&str, fn(&Coded) -> String); 21] = [
     ("CODES_GRID_INDEX_BITS", |c| c.code.index_bits.to_string()),
     ("CODES_GRID_LANES", |c| c.code.lanes.to_string()),
     ("CODES_GRID_SIGNS", |c| c.code.signs.to_string()),
+    ("CODES_GRID_DELTA_BIT", |c| c.code.delta_bit.to_string()),
+    ("CODES_GRID_DELTA", |c| c.code.delta.to_string()),
     ("CODES_EXPONENT", |c| c.code_exponent.to_string()),
     ("COEFF", |c| c.coeff.constant()),
     ("COEFF_SCALE", |c| c.scale.constant()),
     ("COEFF_BIAS", |c| u32::from(c.bias).to_string()),
     ("COEFF_BIAS_SIGN", |c| c.bias_sign.to_string()),
+    ("COEFF_SIGNED_BIAS", |c| {
+        u32::from(c.signed_bias).to_string()
+    }),
+    ("COEFF_SIGNED_EXPONENT", |c| c.signed_exponent.to_string()),
     ("COEFF_GROUP", |c| c.group.to_string()),
     ("COEFF_FACTOR_GROUP", |c| c.factor_group.to_string()),
     ("COEFF_EXPONENT", |c| c.exponent.to_string()),
@@ -1588,8 +1615,9 @@ mod tests {
     }
 
     /// A row element's decode axes, one form of each coefficient kind: q4k
-    /// (hierarchical, a minimum), q8g32s (direct, no local codes) and iq2xxs
-    /// (a grid carrying its local codes).
+    /// (hierarchical, a minimum), q8g32s (direct, no local codes), iq2xxs
+    /// (a grid carrying its local codes), iq1s (signed points with a high
+    /// part, carrying a scale and its signed bias) and iq1m (a delta code).
     #[test]
     fn prefix_names_the_decode_axes_of_row_storage() {
         for (representation, axes) in [
@@ -1645,6 +1673,37 @@ mod tests {
                     ("CODES_GRID_SIGNS", "8"),
                     ("COEFF_GROUP", "16"),
                     ("COEFF_EXPONENT", "-3"),
+                    ("COEFF_CARRIED", "0"),
+                ][..],
+            ),
+            (
+                "iq1s@rows16",
+                &[
+                    ("CODE_LOW_BITS", "8"),
+                    ("CODE_HIGH_BITS", "4"),
+                    ("CODES_GRID", "SEISMIC_GRID_IQ1S"),
+                    ("CODES_GRID_INDEX_BITS", "11"),
+                    ("CODES_GRID_SIGNS", "0"),
+                    ("CODES_GRID_DELTA_BIT", "0"),
+                    ("COEFF_BIAS", "1"),
+                    ("COEFF_SIGNED_BIAS", "1"),
+                    ("COEFF_SIGNED_EXPONENT", "-3"),
+                    ("COEFF_LOCAL_BITS", "3"),
+                    ("COEFF_CARRIED", "11"),
+                ][..],
+            ),
+            (
+                "iq1m@rows16",
+                &[
+                    ("CODE_LOW_BITS", "8"),
+                    ("CODE_HIGH_BITS", "4"),
+                    ("CODES_GRID_SIGNS", "0"),
+                    ("CODES_GRID_DELTA_BIT", "11"),
+                    ("CODES_GRID_DELTA", "3"),
+                    ("COEFF_BIAS", "0"),
+                    ("COEFF_SIGNED_BIAS", "0"),
+                    ("COEFF_EXPONENT", "-3"),
+                    ("COEFF_GROUP", "16"),
                     ("COEFF_CARRIED", "0"),
                 ][..],
             ),

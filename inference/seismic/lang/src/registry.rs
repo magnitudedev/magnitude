@@ -14,9 +14,9 @@ use magnitude_ggml::Encoding;
 
 pub use crate::repr::{
     CodeInterpretation, CodeKind, CoefficientAxes, CoefficientKind, DecodeAxes, DecodeComponent,
-    DecodeRecipe, DecodeStep, DecodeTemp, FloatCodeFormat, GridCodes, GridSigns, LocalCodes,
-    LookupTable, MinimumSign, OperandRecipe, PlaneEncoding, PlaneField, PlaneRead, PlaneSchema,
-    QuantizedComponent, ScaleEncoding, ScaledCodes, GRID_VALUES,
+    DecodeRecipe, DecodeStep, DecodeTemp, FloatCodeFormat, GridCodes, GridSigns, LocalBias,
+    LocalCodes, LookupTable, MinimumSign, OperandRecipe, PlaneEncoding, PlaneField, PlaneRead,
+    PlaneSchema, QuantizedComponent, ScaleEncoding, ScaledCodes, GRID_VALUES,
 };
 
 /// Backends are a closed set.
@@ -1642,7 +1642,7 @@ const fn gguf_source_spec(
     }
 }
 
-const GGUF_SOURCES: [GgufSource; 19] = [
+const GGUF_SOURCES: [GgufSource; 21] = [
     gguf_source_spec(Encoding::Q3K, "gguf_q3_k", "q3k"),
     gguf_source_spec(Encoding::Iq3S, "gguf_iq3_s", "iq3s"),
     gguf_source_spec(Encoding::Q4K, "gguf_q4_k", "q4k"),
@@ -1662,6 +1662,8 @@ const GGUF_SOURCES: [GgufSource; 19] = [
     gguf_source_spec(Encoding::Iq2Xxs, "gguf_iq2_xxs", "iq2xxs"),
     gguf_source_spec(Encoding::Q2K, "gguf_q2_k", "q2k"),
     gguf_source_spec(Encoding::Iq2S, "gguf_iq2_s", "iq2s"),
+    gguf_source_spec(Encoding::Iq1S, "gguf_iq1_s", "iq1s"),
+    gguf_source_spec(Encoding::Iq1M, "gguf_iq1_m", "iq1m"),
 ];
 
 /// The external storage `encoding` is read as: its registered source;
@@ -2375,8 +2377,9 @@ pub(crate) mod internals {
             content: RowPlaneContent::Codes { shift, bits },
         };
         let mut planes = match (&words.encoding, words.entry_bits) {
-            // A carried grid representation's `mma16` tile is records.
-            (_, bits) if layout == Layout::Mma16 && carried.is_some() => {
+            // A carried grid representation of whole-byte entries has an
+            // `mma16` tile of records.
+            (_, bits) if layout == Layout::Mma16 && carried.is_some() && bits % 8 == 0 => {
                 assert!(
                     bits == 16 && group == 256 && repr.group == 32,
                     "`{}` records hold 256 values of 16-bit entries, groups of 32",
@@ -2858,6 +2861,92 @@ pub(crate) mod internals {
                 push(plane(
                     "scale_factor",
                     PlaneRepackRecipe::BitRoutes(direct_bits(0, 2)),
+                ));
+            }
+            "gguf_iq1_s" => {
+                // block_iq1_s: d (f16) | qs[32] (the low byte of each entry's
+                // 11-bit grid index) | qh[8] (u16, one per 32 values: the
+                // high three index bits of its four entries, then the 3-bit
+                // scale and the delta sign). Entry `e` is
+                // `qs[e] | (qh[e / 4] >> 3 (e % 4) & 7) << 8`; group `g`'s
+                // coefficient field is `qh[g] >> 12`, scale then sign.
+                push(plane(
+                    "words",
+                    PlaneRepackRecipe::PackedEntries(
+                        (0..32)
+                            .map(|entry| {
+                                RepackExpr::BitOr(
+                                    Box::new(RepackExpr::SourceBits {
+                                        bit: (2 + entry) * 8,
+                                        width: 8,
+                                    }),
+                                    Box::new(RepackExpr::ShiftLeft {
+                                        value: Box::new(RepackExpr::SourceBits {
+                                            bit: (34 + 2 * (entry / 4)) * 8 + 3 * (entry % 4),
+                                            width: 3,
+                                        }),
+                                        bits: 8,
+                                    }),
+                                )
+                            })
+                            .collect(),
+                    ),
+                ));
+                push(plane(
+                    "coefficients",
+                    PlaneRepackRecipe::BitRoutes(
+                        (0..32)
+                            .map(|bit| (34 + 2 * (bit / 4)) * 8 + 12 + bit % 4)
+                            .collect(),
+                    ),
+                ));
+                push(plane(
+                    "scale_factor",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(0, 2)),
+                ));
+            }
+            "gguf_iq1_m" => {
+                // block_iq1_m: qs[32] (the low byte of each entry's 11-bit
+                // grid index) | qh[16] (a nibble an entry, low first: its
+                // high three index bits, then the delta sign) | scales[8]
+                // (four u16: four 3-bit scales of 16 values each, then a
+                // nibble of the f16 d, its lowest first). Entry `e` is
+                // `qs[e] | qh nibble e << 8`, bit for bit.
+                push(plane(
+                    "words",
+                    PlaneRepackRecipe::BitRoutes(
+                        (0..384)
+                            .map(|bit| {
+                                let (entry, bit) = (bit / 12, bit % 12);
+                                if bit < 8 {
+                                    entry * 8 + bit
+                                } else {
+                                    (32 + entry / 2) * 8 + 4 * (entry % 2) + bit - 8
+                                }
+                            })
+                            .collect(),
+                    ),
+                ));
+                push(plane(
+                    "coefficients",
+                    PlaneRepackRecipe::BitRoutes(
+                        (0..48)
+                            .map(|bit| {
+                                let (group, bit) = (bit / 3, bit % 3);
+                                (48 + 2 * (group / 4)) * 8 + 3 * (group % 4) + bit
+                            })
+                            .collect(),
+                    ),
+                ));
+                // d's nibble `k` is bits 12..16 of scales word `k`; the
+                // representation scales it by 2^-3.
+                push(plane(
+                    "scale_factor",
+                    PlaneRepackRecipe::BitRoutes(
+                        (0..16)
+                            .map(|bit| (48 + 2 * (bit / 4)) * 8 + 12 + bit % 4)
+                            .collect(),
+                    ),
                 ));
             }
             "gguf_q8_0" => {

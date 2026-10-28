@@ -411,6 +411,18 @@ representation!(IQ2SRows16, "iq2s", Rows16, F32, 4);
 representation!(IQ2SRows8, "iq2s", Rows8, F32, 4);
 representation!(IQ2SRows32, "iq2s", Rows32, F32, 4);
 representation!(IQ2SMma16, "iq2s", Mma16, F32, 4);
+// iq1s carries its coefficient fields in its entries: row layouts hold
+// `grids`, `grids_hi` and `supers`.
+representation!(IQ1S, "iq1s", F32, 3);
+representation!(IQ1SRows16, "iq1s", Rows16, F32, 3);
+representation!(IQ1SRows8, "iq1s", Rows8, F32, 3);
+representation!(IQ1SRows32, "iq1s", Rows32, F32, 3);
+representation!(IQ1SMma16, "iq1s", Mma16, F32, 3);
+representation!(IQ1M, "iq1m", F32, 3);
+representation!(IQ1MRows16, "iq1m", Rows16, F32, 4);
+representation!(IQ1MRows8, "iq1m", Rows8, F32, 4);
+representation!(IQ1MRows32, "iq1m", Rows32, F32, 4);
+representation!(IQ1MMma16, "iq1m", Mma16, F32, 4);
 // NVFP4's W4A4 elements: nvfp4g16's storage, NVFP4 rows as operands.
 representation!(NVFP4G16A4, "nvfp4g16a4", F32, 2);
 representation!(NVFP4G16A4Rows16, "nvfp4g16a4", Rows16, F32, 2);
@@ -523,6 +535,14 @@ pub fn with_representation<V: RepresentationVisitor>(
         ("iq2s", registry::Layout::Rows8) => return visitor.visit::<IQ2SRows8>(),
         ("iq2s", registry::Layout::Rows32) => return visitor.visit::<IQ2SRows32>(),
         ("iq2s", registry::Layout::Mma16) => return visitor.visit::<IQ2SMma16>(),
+        ("iq1s", registry::Layout::Rows16) => return visitor.visit::<IQ1SRows16>(),
+        ("iq1s", registry::Layout::Rows8) => return visitor.visit::<IQ1SRows8>(),
+        ("iq1s", registry::Layout::Rows32) => return visitor.visit::<IQ1SRows32>(),
+        ("iq1s", registry::Layout::Mma16) => return visitor.visit::<IQ1SMma16>(),
+        ("iq1m", registry::Layout::Rows16) => return visitor.visit::<IQ1MRows16>(),
+        ("iq1m", registry::Layout::Rows8) => return visitor.visit::<IQ1MRows8>(),
+        ("iq1m", registry::Layout::Rows32) => return visitor.visit::<IQ1MRows32>(),
+        ("iq1m", registry::Layout::Mma16) => return visitor.visit::<IQ1MMma16>(),
         (_, registry::Layout::Packet) => {}
         (other, layout) => panic!(
             "registry storage `{other}` in layout `{}` has no type-level marker",
@@ -558,6 +578,8 @@ pub fn with_representation<V: RepresentationVisitor>(
         "iq2xxs" => visitor.visit::<IQ2XXS>(),
         "iq3s" => visitor.visit::<IQ3S>(),
         "iq2s" => visitor.visit::<IQ2S>(),
+        "iq1s" => visitor.visit::<IQ1S>(),
+        "iq1m" => visitor.visit::<IQ1M>(),
         other => panic!("registry representation `{other}` has no type-level marker"),
     }
 }
