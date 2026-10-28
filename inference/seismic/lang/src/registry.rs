@@ -524,17 +524,11 @@ impl PacketRepackRecipe {
                     RepackExpr::SourceBits { bit, .. } => fields.push(*bit),
                     _ => unreachable!("a validated recipe widens a source field"),
                 },
-                RepackExpr::ShiftLeft { value, .. }
-                | RepackExpr::OffsetI32 { value, .. }
-                | RepackExpr::I32ToF32(value)
-                | RepackExpr::ScaleF32 { value, .. } => collect(value, fields),
+                RepackExpr::ShiftLeft { value, .. } | RepackExpr::ScaleF32 { value, .. } => {
+                    collect(value, fields)
+                }
                 RepackExpr::Lookup { index, .. } => collect(index, fields),
-                RepackExpr::BitOr(left, right)
-                | RepackExpr::MultiplyF32(left, right)
-                | RepackExpr::NegateIf {
-                    value: left,
-                    sign: right,
-                } => {
+                RepackExpr::BitOr(left, right) => {
                     collect(left, fields);
                     collect(right, fields);
                 }
@@ -582,13 +576,7 @@ pub enum RepackExpr {
         bits: u8,
     },
     BitOr(Box<RepackExpr>, Box<RepackExpr>),
-    OffsetI32 {
-        value: Box<RepackExpr>,
-        offset: i32,
-    },
     F16ToF32(Box<RepackExpr>),
-    I32ToF32(Box<RepackExpr>),
-    MultiplyF32(Box<RepackExpr>, Box<RepackExpr>),
     /// `value * 2^exponent`: exact for a widened binary16 `value`, whose
     /// every multiple by a small power of two is a normal `f32`.
     ScaleF32 {
@@ -600,13 +588,6 @@ pub enum RepackExpr {
     Lookup {
         index: Box<RepackExpr>,
         table: RepackTable,
-    },
-    /// The integer `value`, negated (two's complement) where the one-bit
-    /// integer `sign` is 1: a sign kept apart from a magnitude, so a table
-    /// holds magnitudes only.
-    NegateIf {
-        value: Box<RepackExpr>,
-        sign: Box<RepackExpr>,
     },
 }
 
@@ -1663,7 +1644,7 @@ const fn gguf_source_spec(
 
 const GGUF_SOURCES: [GgufSource; 19] = [
     gguf_source_spec(Encoding::Q3K, "gguf_q3_k", "q3k"),
-    gguf_source_spec(Encoding::Iq3S, "gguf_iq3_s", "q6k"),
+    gguf_source_spec(Encoding::Iq3S, "gguf_iq3_s", "iq3s"),
     gguf_source_spec(Encoding::Q4K, "gguf_q4_k", "q4k"),
     gguf_source_spec(Encoding::Q5K, "gguf_q5_k", "q5k"),
     gguf_source_spec(Encoding::Q6K, "gguf_q6_k", "q6k"),
@@ -2010,13 +1991,9 @@ pub(crate) mod internals {
         }
         // (external source, packet bytes, packet values, resident
         // representation). A source whose every value the resident
-        // representation holds exactly converts into it: IQ3_S's
-        // `d * (1 + 2 s) * ±g` (four-bit `s` per 32 values, odd grid
-        // magnitude `g` <= 15) is q6k's `d * s' * (c - 32)` with
-        // `s' = 1 + 2 s` and `c = 32 ± g`. Q4_0, Q4_1, IQ4_NL, IQ4_XS, Q5_0,
-        // Q5_1, MXFP4, NVFP4, Q2_K and Q3_K move their codes and
-        // coefficient fields bit for bit into
-        // representations of their own.
+        // representation holds exactly converts into it: each moves its
+        // codes and coefficient fields bit for bit into a representation of
+        // its own.
         let external_specs = GGUF_SOURCES.map(|source| {
             let packet_size = u32::try_from(source.encoding.block_bytes())
                 .expect("a GGUF source packet fits u32 bytes");
@@ -2978,77 +2955,37 @@ pub(crate) mod internals {
                 ));
             }
             "gguf_iq3_s" => {
-                // block_iq3_s: d (f16) | qs[64] | qh[8] | signs[32] | scales[4].
-                // Value p of 32-value sub-block b = p / 32, w = p % 32, in
-                // eight-value group l = w / 8 at t = w % 8: grid point
-                // `qs[8 b + 2 l + t / 4] | ((qh[b] >> (2 l + t / 4)) & 1) << 8`,
-                // magnitude byte `t % 4` of that point, negated when bit t of
-                // `signs[4 b + l]` is set; the q6k code is that value + 32.
+                // block_iq3_s: d (f16) | qs[64] | qh[8] | signs[32] |
+                // scales[4]. Entry `e` (values 8e..8e+8, its two four-value
+                // grid points) is its 9-bit indices `qs[2e + i] | (qh[e / 4]
+                // >> 2 (e % 4) + i & 1) << 8`, first lowest, then its signs
+                // `signs[e]`, bit for bit.
                 push(plane(
                     "words",
-                    PlaneRepackRecipe::PackedEntries(
-                        (0..256)
-                            .map(|p| {
-                                let (block, within) = (p / 32, p % 32);
-                                let (group, slot) = (within / 8, within % 8);
-                                let point = RepackExpr::BitOr(
-                                    Box::new(RepackExpr::SourceBits {
-                                        bit: (2 + 8 * block + 2 * group + slot / 4) * 8,
-                                        width: 8,
-                                    }),
-                                    Box::new(RepackExpr::ShiftLeft {
-                                        value: Box::new(RepackExpr::SourceBits {
-                                            bit: (66 + block) * 8 + 2 * group + slot / 4,
-                                            width: 1,
-                                        }),
-                                        bits: 8,
-                                    }),
-                                );
-                                let magnitude = RepackExpr::Lookup {
-                                    index: Box::new(RepackExpr::OffsetI32 {
-                                        value: Box::new(RepackExpr::ShiftLeft {
-                                            value: Box::new(point),
-                                            bits: 2,
-                                        }),
-                                        offset: (slot % 4) as i32,
-                                    }),
-                                    table: RepackTable::Iq3sMagnitudes,
-                                };
-                                RepackExpr::OffsetI32 {
-                                    value: Box::new(RepackExpr::NegateIf {
-                                        value: Box::new(magnitude),
-                                        sign: Box::new(RepackExpr::SourceBits {
-                                            bit: (74 + 4 * block + group) * 8 + slot,
-                                            width: 1,
-                                        }),
-                                    }),
-                                    offset: 32,
+                    PlaneRepackRecipe::BitRoutes(
+                        (0..32 * 26)
+                            .map(|bit| {
+                                let (entry, bit) = (bit / 26, bit % 26);
+                                match bit {
+                                    0..18 => {
+                                        let (index, bit) = (bit / 9, bit % 9);
+                                        if bit < 8 {
+                                            (2 + 2 * entry + index) * 8 + bit
+                                        } else {
+                                            (66 + entry / 4) * 8 + 2 * (entry % 4) + index
+                                        }
+                                    }
+                                    _ => (74 + entry) * 8 + bit - 18,
                                 }
                             })
                             .collect(),
                     ),
                 ));
-                // Both sixteen-value halves of 32-value sub-block b take
-                // `1 + 2 s`, s the four bits `scales[b / 2] >> 4 (b % 2)`.
+                // Sub-block b's 4-bit scale code `scales[b / 2] >> 4 (b % 2)`
+                // (ggml's `1 + 2 s`, the odd code).
                 push(plane(
                     "coefficients",
-                    PlaneRepackRecipe::PackedEntries(
-                        (0..16)
-                            .map(|half| {
-                                let block = half / 2;
-                                RepackExpr::OffsetI32 {
-                                    value: Box::new(RepackExpr::ShiftLeft {
-                                        value: Box::new(RepackExpr::SourceBits {
-                                            bit: (106 + block / 2) * 8 + 4 * (block % 2),
-                                            width: 4,
-                                        }),
-                                        bits: 1,
-                                    }),
-                                    offset: 1,
-                                }
-                            })
-                            .collect(),
-                    ),
+                    PlaneRepackRecipe::BitRoutes(direct_bits(106, 4)),
                 ));
                 push(plane(
                     "scale_factor",
@@ -3207,9 +3144,7 @@ pub(crate) mod internals {
                     );
                     validate_expr(value, source_bits);
                 }
-                RepackExpr::ShiftLeft { value, .. }
-                | RepackExpr::OffsetI32 { value, .. }
-                | RepackExpr::I32ToF32(value) => validate_expr(value, source_bits),
+                RepackExpr::ShiftLeft { value, .. } => validate_expr(value, source_bits),
                 RepackExpr::ScaleF32 { value, exponent } => {
                     // Every widened binary16 times 2^±8 is a normal f32.
                     assert!(
@@ -3226,18 +3161,9 @@ pub(crate) mod internals {
                         "representation conversion indexes outside its lookup table"
                     );
                 }
-                RepackExpr::BitOr(left, right) | RepackExpr::MultiplyF32(left, right) => {
+                RepackExpr::BitOr(left, right) => {
                     validate_expr(left, source_bits);
                     validate_expr(right, source_bits);
-                }
-                RepackExpr::NegateIf { value, sign } => {
-                    validate_expr(value, source_bits);
-                    validate_expr(sign, source_bits);
-                    let (min, max) = integer_range(sign);
-                    assert!(
-                        min >= 0 && max <= 1,
-                        "representation conversion negates by something other than one bit"
-                    );
                 }
             }
         }
@@ -3324,10 +3250,6 @@ pub(crate) mod internals {
                 );
                 (left_min.max(right_min), left_max + right_max)
             }
-            RepackExpr::OffsetI32 { value, offset } => {
-                let (min, max) = integer_range(value);
-                (min + i64::from(*offset), max + i64::from(*offset))
-            }
             RepackExpr::Lookup { table, .. } => (
                 i64::from(
                     *table
@@ -3344,14 +3266,7 @@ pub(crate) mod internals {
                         .expect("a lookup table has entries"),
                 ),
             ),
-            RepackExpr::NegateIf { value, .. } => {
-                let (min, max) = integer_range(value);
-                (min.min(-max), max.max(-min))
-            }
-            RepackExpr::F16ToF32(_)
-            | RepackExpr::I32ToF32(_)
-            | RepackExpr::MultiplyF32(..)
-            | RepackExpr::ScaleF32 { .. } => {
+            RepackExpr::F16ToF32(_) | RepackExpr::ScaleF32 { .. } => {
                 panic!("a packed-entry conversion value is floating")
             }
         }

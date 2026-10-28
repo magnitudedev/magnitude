@@ -231,10 +231,11 @@ fn stored_rows_decode_k_quant_rows() {
     }
 }
 
-/// Rows of vector codes with a high part (IQ2_S), 256 wide.
+/// Rows of vector codes with a high part (IQ2_S, IQ3_S), 256 wide.
 #[test]
 fn stored_rows_decode_grid_rows() {
     stored_rows_match("gguf_iq2_s", "iq2s@rows16", None, 256);
+    stored_rows_match("gguf_iq3_s", "iq3s@rows16", None, 256);
 }
 
 fn stored_rows_match(source: &str, resident: &str, as_stored: Option<bool>, width: usize) {

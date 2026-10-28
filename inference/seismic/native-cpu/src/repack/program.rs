@@ -35,9 +35,7 @@
 //! ([`RepackExecutor::run`]).
 
 use seismic_lang::registry::{self, RepresentationConversion};
-use seismic_lang::repack::{
-    negate_if, slot, PacketBit, PacketValues, RepackOp, RepackShape, STACK,
-};
+use seismic_lang::repack::{slot, PacketBit, PacketValues, RepackOp, RepackShape, STACK};
 use std::num::NonZeroU32;
 
 /// Bytes of a vector step: an output block, a term's input window, a
@@ -185,14 +183,12 @@ struct ByteMoves {
 /// The `count` values of one shape. Value `v` is the low `bytes` (1, 2 or
 /// 4) bytes of value slot bytes `values + v * bytes`; its field of op
 /// `Field { prefix, width }` is field slot bytes
-/// `fields + prefix * count + v * slot(width)`, its offset of op
-/// `Offset { offset }` the program's offset `offsets + offset * count + v`.
+/// `fields + prefix * count + v * slot(width)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ValueGroup {
     shape: u32,
     count: u32,
     fields: u32,
-    offsets: u32,
     values: u32,
     bytes: u32,
 }
@@ -231,7 +227,6 @@ pub struct RepackProgram {
     shapes: Vec<RepackShape>,
     ops: Vec<RepackOp>,
     groups: Vec<ValueGroup>,
-    offsets: Vec<i32>,
     /// Bytes of the field slots (whole blocks) and of the value slots.
     field_bytes: u32,
     value_bytes: u32,
@@ -1119,13 +1114,6 @@ impl RepackProgram {
         fn members(packets: u32, of_shape: &[usize]) -> impl Iterator<Item = (u32, usize)> + '_ {
             (0..packets).flat_map(move |p| of_shape.iter().map(move |v| (p, *v)))
         }
-        let mut offsets = Vec::new();
-        for (group, of_shape) in &groups {
-            for offset in 0..shapes[group.shape as usize].offsets as usize {
-                offsets
-                    .extend(members(packets, of_shape).map(|(_, v)| computed[v].offsets[offset]));
-            }
-        }
         let mut slots = vec![0u32; computed.len() * packets as usize];
         let mut field_inputs: Vec<Option<u32>> = vec![None; field_bytes as usize * 8];
         for (group, of_shape) in &groups {
@@ -1197,7 +1185,6 @@ impl RepackProgram {
             shapes: values.shapes().to_vec(),
             ops: values.ops().to_vec(),
             groups: groups.into_iter().map(|(group, _)| group).collect(),
-            offsets,
             field_bytes,
             value_bytes,
             fields: ByteMoves::of(&field_inputs, &input_starts, &[0]),
@@ -1238,7 +1225,7 @@ impl RepackProgram {
         let values = PacketValues::of(&conversion.recipe, conversion.destination_layout.packet());
         let computed = values.computed();
         let mut groups = Vec::new();
-        let (mut fields, mut offsets, mut value_bytes) = (0u32, 0u32, 0u32);
+        let (mut fields, mut value_bytes) = (0u32, 0u32);
         for (index, shape) in values.shapes().iter().enumerate() {
             let of_shape = (0..computed.len())
                 .filter(|v| computed[*v].shape == index)
@@ -1256,14 +1243,12 @@ impl RepackProgram {
                     shape: index as u32,
                     count,
                     fields,
-                    offsets,
                     values: value_bytes,
                     bytes,
                 },
                 of_shape,
             ));
             fields = fields.checked_add(count.checked_mul(shape.fields)?)?;
-            offsets = offsets.checked_add(count.checked_mul(shape.offsets)?)?;
             value_bytes = value_bytes.checked_add(count.checked_mul(bytes)?)?;
         }
         // The field slots end at a block: their move writes whole blocks.
@@ -1355,15 +1340,9 @@ impl RepackProgram {
                             .iter()
                             .all(|op| match op {
                                 RepackOp::Field { width, .. } => slot(*width) == 1,
-                                RepackOp::ShiftLeft { .. }
-                                | RepackOp::Or
-                                | RepackOp::Offset { .. }
-                                | RepackOp::NegateIf => true,
+                                RepackOp::ShiftLeft { .. } | RepackOp::Or => true,
                                 RepackOp::Lookup { table } => table.values().len() <= 256,
-                                RepackOp::F16ToF32
-                                | RepackOp::I32ToF32
-                                | RepackOp::MultiplyF32
-                                | RepackOp::ScaleF32 { .. } => false,
+                                RepackOp::F16ToF32 | RepackOp::ScaleF32 { .. } => false,
                             })
                 })
                 .collect(),
@@ -1969,22 +1948,6 @@ impl RepackExecutor<'_> {
                         *value |= other;
                     }
                 }
-                RepackOp::NegateIf => {
-                    height -= 1;
-                    let (low, high) = stack.split_at_mut(height);
-                    for (value, sign) in low[height - 1][..lanes].iter_mut().zip(&high[0]) {
-                        // Exact on bytes: xor and a wrapping add commute
-                        // with taking the low byte.
-                        *value = negate_if(u32::from(*value), u32::from(*sign)) as u8;
-                    }
-                }
-                RepackOp::Offset { offset } => {
-                    let at = group.offsets as usize + offset as usize * count + start;
-                    let offsets = &self.program.offsets[at..at + lanes];
-                    for (value, offset) in stack[height - 1][..lanes].iter_mut().zip(offsets) {
-                        *value = value.wrapping_add(*offset as u8);
-                    }
-                }
                 RepackOp::Lookup { table } => match prepared {
                     // A block of lanes at a time; a lane past `lanes`
                     // looks up whatever it holds.
@@ -2010,10 +1973,9 @@ impl RepackExecutor<'_> {
                         }
                     }
                 },
-                RepackOp::F16ToF32
-                | RepackOp::I32ToF32
-                | RepackOp::MultiplyF32
-                | RepackOp::ScaleF32 { .. } => unreachable!("a bytewise shape has no f32 op"),
+                RepackOp::F16ToF32 | RepackOp::ScaleF32 { .. } => {
+                    unreachable!("a bytewise shape has no f32 op")
+                }
             }
         }
         let at = group.values as usize + start;
@@ -2053,43 +2015,12 @@ impl RepackExecutor<'_> {
                     }
                     height -= 1;
                 }
-                RepackOp::NegateIf => {
-                    let (low, operand) = low.split_at_mut(height - 1);
-                    let operand = operand[0].as_chunks::<CHUNK>().0;
-                    for (chunk, sign) in top(low).zip(operand) {
-                        *chunk = std::array::from_fn(|lane| negate_if(chunk[lane], sign[lane]));
-                    }
-                    height -= 1;
-                }
-                RepackOp::Offset { offset } => {
-                    let at = group.offsets as usize + offset as usize * count + start;
-                    let offsets = &self.program.offsets[at..at + lanes];
-                    let column = low.last_mut().expect("an offset has an operand");
-                    for (value, offset) in column[..lanes].iter_mut().zip(offsets) {
-                        *value = value.wrapping_add(*offset as u32);
-                    }
-                }
                 RepackOp::F16ToF32 => {
                     for chunk in top(low) {
                         for words in chunk.as_chunks_mut::<4>().0 {
                             vector::widen_halves(words);
                         }
                     }
-                }
-                RepackOp::I32ToF32 => {
-                    for chunk in top(low) {
-                        *chunk = chunk.map(|value| (value as i32 as f32).to_bits());
-                    }
-                }
-                RepackOp::MultiplyF32 => {
-                    let (low, operand) = low.split_at_mut(height - 1);
-                    let operand = operand[0].as_chunks::<CHUNK>().0;
-                    for (chunk, other) in top(low).zip(operand) {
-                        *chunk = std::array::from_fn(|lane| {
-                            (f32::from_bits(chunk[lane]) * f32::from_bits(other[lane])).to_bits()
-                        });
-                    }
-                    height -= 1;
                 }
                 RepackOp::ScaleF32 { .. } => {
                     let Prepared::Factor(factor) = prepared else {

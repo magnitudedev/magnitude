@@ -1752,22 +1752,9 @@ impl Emitter<'_, '_> {
                 let right = self.repack_expression(source_packet, right);
                 self.builder.ins().bor(left, right)
             }
-            RepackExpr::OffsetI32 { value, offset } => {
-                let value = self.repack_expression(source_packet, value);
-                self.builder.ins().iadd_imm(value, i64::from(*offset))
-            }
             RepackExpr::F16ToF32(value) => {
                 let value = self.repack_expression(source_packet, value);
                 self.call(HostImport::F16Load, &[value])
-            }
-            RepackExpr::I32ToF32(value) => {
-                let value = self.repack_expression(source_packet, value);
-                self.builder.ins().fcvt_from_sint(types::F32, value)
-            }
-            RepackExpr::MultiplyF32(left, right) => {
-                let left = self.repack_expression(source_packet, left);
-                let right = self.repack_expression(source_packet, right);
-                self.builder.ins().fmul(left, right)
             }
             RepackExpr::ScaleF32 { value, exponent } => {
                 let value = self.repack_expression(source_packet, value);
@@ -1788,14 +1775,6 @@ impl Emitter<'_, '_> {
                 self.builder
                     .ins()
                     .load(types::I32, MemFlags::trusted().with_readonly(), address, 0)
-            }
-            RepackExpr::NegateIf { value, sign } => {
-                // `(value ^ -sign) + sign`: `-value` where `sign` is 1.
-                let value = self.repack_expression(source_packet, value);
-                let sign = self.repack_expression(source_packet, sign);
-                let mask = self.builder.ins().ineg(sign);
-                let flipped = self.builder.ins().bxor(value, mask);
-                self.builder.ins().iadd(flipped, sign)
             }
         }
     }

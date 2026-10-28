@@ -212,13 +212,14 @@ fn q6_k_block(d: [u8; 2], scales: [i8; 16], codes: [u8; 256]) -> Vec<u8> {
     block
 }
 
-/// Q3_K blocks decode, in every layout, to exactly the values of their Q6_K
-/// re-expression (q6k, the form they were held in before q3k): Q3_K's
-/// `d (s - 32) q` is Q6_K's with scale `s - 32` and code `q + 32`.
+/// Q3_K and IQ3_S blocks decode, in every layout, to exactly the values of
+/// their Q6_K re-expression (q6k, the form they were held in before they had
+/// their own): Q3_K's `d (s - 32) q` is Q6_K's with scale `s - 32` and code
+/// `q + 32`, IQ3_S's `d (1 + 2 s) (±g)` Q6_K's with scale `1 + 2 s` and code
+/// `32 ± g`.
 #[test]
-fn q3_k_decodes_as_its_q6_k_reexpression() {
-    let encoding = magnitude_ggml::Encoding::Q3K;
-    let reexpress = |block: &[u8]| {
+fn three_bit_formats_decode_as_their_q6_k_reexpression() {
+    let q3_k = |block: &[u8]| {
         let scales = std::array::from_fn(|j| {
             let low = (block[96 + j % 8] >> (4 * (j / 8))) & 15;
             let high = (block[104 + j % 4] >> (2 * (j / 4))) & 3;
@@ -231,31 +232,55 @@ fn q3_k_decodes_as_its_q6_k_reexpression() {
         });
         q6_k_block([block[108], block[109]], scales, codes)
     };
-    let source = seismic::Element::gguf_source(encoding).unwrap();
-    let (vectors, _) = reference_vectors(encoding);
-    let bytes = [vectors, source_bytes(64 * encoding.block_bytes(), 7)].concat();
-    let shape = [bytes.len() as u64 / encoding.block_bytes(), 256];
-    let reexpressed = bytes
-        .chunks_exact(encoding.block_bytes() as usize)
-        .flat_map(reexpress)
-        .collect::<Vec<_>>();
+    let iq3_s = |block: &[u8]| {
+        let scales =
+            std::array::from_fn(|j| 1 + 2 * ((block[106 + j / 4] >> (4 * (j / 2 % 2))) & 15) as i8);
+        let codes = std::array::from_fn(|p| {
+            let (entry, lane) = (p / 8, p % 8);
+            let which = lane / 4;
+            let index = usize::from(block[2 + 2 * entry + which])
+                | usize::from((block[66 + entry / 4] >> (2 * (entry % 4) + which)) & 1) << 8;
+            let magnitude = magnitude_ggml::tables::IQ3S
+                .points
+                .byte(index, (lane % 4) as u32) as i8;
+            let negative = (block[74 + entry] >> lane) & 1 == 1;
+            (32 + if negative { -magnitude } else { magnitude }) as u8
+        });
+        q6_k_block([block[0], block[1]], scales, codes)
+    };
     let q6k = seismic::Element::stored("q6k", seismic::Layout::Packet).unwrap();
     let q6_k = seismic::Element::named("gguf_q6_k").unwrap();
-    let expected = q6k
-        .decode_host(&shape, &q6k.repack_host(q6_k, &shape, &reexpressed).unwrap())
-        .unwrap();
-    for layout in seismic::Layout::ALL {
-        let element = source.converted(layout, seismic::OperandRecipe::Rounded).unwrap();
-        let values = element
-            .decode_host(&shape, &element.repack_host(source, &shape, &bytes).unwrap())
+    for (encoding, reexpress) in [
+        (
+            magnitude_ggml::Encoding::Q3K,
+            &q3_k as &dyn Fn(&[u8]) -> Vec<u8>,
+        ),
+        (magnitude_ggml::Encoding::Iq3S, &iq3_s),
+    ] {
+        let source = seismic::Element::gguf_source(encoding).unwrap();
+        let (vectors, _) = reference_vectors(encoding);
+        let bytes = [vectors, source_bytes(64 * encoding.block_bytes(), 7)].concat();
+        let shape = [bytes.len() as u64 / encoding.block_bytes(), 256];
+        let reexpressed = bytes
+            .chunks_exact(encoding.block_bytes() as usize)
+            .flat_map(reexpress)
+            .collect::<Vec<_>>();
+        let expected = q6k
+            .decode_host(&shape, &q6k.repack_host(q6_k, &shape, &reexpressed).unwrap())
             .unwrap();
-        assert_eq!(
-            values.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
-            expected.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
-            "{} -> {}",
-            source.name(),
-            element.name()
-        );
+        for layout in seismic::Layout::ALL {
+            let element = source.converted(layout, seismic::OperandRecipe::Rounded).unwrap();
+            let values = element
+                .decode_host(&shape, &element.repack_host(source, &shape, &bytes).unwrap())
+                .unwrap();
+            assert_eq!(
+                values.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                "{} -> {}",
+                source.name(),
+                element.name()
+            );
+        }
     }
 }
 

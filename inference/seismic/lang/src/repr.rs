@@ -1416,6 +1416,28 @@ pub(crate) const REPRS: &[Repr] = &[
             carried: false,
         },
     },
+    // GGUF IQ3_S: vector codes of eight values (two 9-bit indices of the
+    // 512-point iq3s grid of four-value points and 8 sign bits, a 26-bit
+    // entry whose top two sign bits are in the high plane), an odd 4-bit
+    // scale `2 s + 1` per 32 and one f16 factor `d` per 256: ggml's
+    // `d (1 + 2 s)` exactly, 110 bytes per 256 values as in GGUF.
+    Repr {
+        name: "iq3s",
+        packing_axis: PackingAxisRule::Last,
+        group: 32,
+        bits: IQ3S_CODES.entry_bits(),
+        code: CodeInterpretation::Grid(&IQ3S_CODES),
+        float_code: None,
+        coefficients: Coefficients::Hierarchical {
+            factor_group: 256,
+            factor_dtype: DType::F16,
+            factor_exponent: 0,
+            bits: 4,
+            interpretation: CodeInterpretation::Odd,
+            minimum: None,
+            carried: false,
+        },
+    },
     // GGUF IQ2_S: vector codes of eight values (a 10-bit index of the
     // 1024-point iq2s grid and 8 sign bits, an 18-bit entry whose top two
     // sign bits are in the high plane), an odd 4-bit scale `2 s + 1` per 16
@@ -1456,6 +1478,12 @@ pub(crate) static IQ2XXS_CODES: GridCodes = GridCodes {
     entry_bits: 16,
     grid: &tables::IQ2XXS,
     signs: GridSigns::ParityPlus7,
+};
+
+pub(crate) static IQ3S_CODES: GridCodes = GridCodes {
+    entry_bits: 26,
+    grid: &tables::IQ3S,
+    signs: GridSigns::Explicit8,
 };
 
 pub(crate) static IQ2S_CODES: GridCodes = GridCodes {

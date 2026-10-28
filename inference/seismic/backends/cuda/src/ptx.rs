@@ -73,16 +73,11 @@ fn repack_expression_nodes(expression: &RepackExpr) -> u64 {
     match expression {
         RepackExpr::SourceBits { .. } => 1,
         RepackExpr::ShiftLeft { value, .. }
-        | RepackExpr::OffsetI32 { value, .. }
         | RepackExpr::F16ToF32(value)
-        | RepackExpr::I32ToF32(value)
         | RepackExpr::ScaleF32 { value, .. } => 1 + repack_expression_nodes(value),
-        RepackExpr::BitOr(left, right)
-        | RepackExpr::MultiplyF32(left, right)
-        | RepackExpr::NegateIf {
-            value: left,
-            sign: right,
-        } => 1 + repack_expression_nodes(left) + repack_expression_nodes(right),
+        RepackExpr::BitOr(left, right) => {
+            1 + repack_expression_nodes(left) + repack_expression_nodes(right)
+        }
         RepackExpr::Lookup { index, .. } => 1 + repack_expression_nodes(index),
     }
 }
@@ -92,16 +87,9 @@ fn repack_lookup_tables(expression: &RepackExpr, tables: &mut Vec<LookupTable>) 
     match expression {
         RepackExpr::SourceBits { .. } => {}
         RepackExpr::ShiftLeft { value, .. }
-        | RepackExpr::OffsetI32 { value, .. }
         | RepackExpr::F16ToF32(value)
-        | RepackExpr::I32ToF32(value)
         | RepackExpr::ScaleF32 { value, .. } => repack_lookup_tables(value, tables),
-        RepackExpr::BitOr(left, right)
-        | RepackExpr::MultiplyF32(left, right)
-        | RepackExpr::NegateIf {
-            value: left,
-            sign: right,
-        } => {
+        RepackExpr::BitOr(left, right) => {
             repack_lookup_tables(left, tables);
             repack_lookup_tables(right, tables);
         }
@@ -1890,15 +1878,6 @@ impl<'a> Emitter<'a> {
                 self.line(format!("or.b32 {output}, {left}, {right};"));
                 RepackValue::Integer(output)
             }
-            RepackExpr::OffsetI32 { value, offset } => {
-                let RepackValue::Integer(value) = self.repack_expression(source_packet, value)
-                else {
-                    panic!("closed CUDA repack offsets a floating value")
-                };
-                let output = self.t32();
-                self.line(format!("add.s32 {output}, {value}, {offset};"));
-                RepackValue::Integer(output)
-            }
             RepackExpr::F16ToF32(value) => {
                 let RepackValue::Integer(value) = self.repack_expression(source_packet, value)
                 else {
@@ -1908,26 +1887,6 @@ impl<'a> Emitter<'a> {
                 self.line(format!("cvt.u16.u32 {half}, {value};"));
                 let output = self.f32();
                 self.line(format!("cvt.f32.f16 {output}, {half};"));
-                RepackValue::Float(output)
-            }
-            RepackExpr::I32ToF32(value) => {
-                let RepackValue::Integer(value) = self.repack_expression(source_packet, value)
-                else {
-                    panic!("closed CUDA repack converts an already-floating i32 value")
-                };
-                let output = self.f32();
-                self.line(format!("cvt.rn.f32.s32 {output}, {value};"));
-                RepackValue::Float(output)
-            }
-            RepackExpr::MultiplyF32(left, right) => {
-                let RepackValue::Float(left) = self.repack_expression(source_packet, left) else {
-                    panic!("closed CUDA repack multiply has a non-floating left operand")
-                };
-                let RepackValue::Float(right) = self.repack_expression(source_packet, right) else {
-                    panic!("closed CUDA repack multiply has a non-floating right operand")
-                };
-                let output = self.f32();
-                self.line(format!("mul.rn.f32 {output}, {left}, {right};"));
                 RepackValue::Float(output)
             }
             RepackExpr::ScaleF32 { value, exponent } => {
@@ -1957,23 +1916,6 @@ impl<'a> Emitter<'a> {
                 self.line(format!("mad.wide.u32 {address}, {index}, 4, {base};"));
                 let output = self.t32();
                 self.line(format!("ld.const.s32 {output}, [{address}];"));
-                RepackValue::Integer(output)
-            }
-            RepackExpr::NegateIf { value, sign } => {
-                let RepackValue::Integer(value) = self.repack_expression(source_packet, value)
-                else {
-                    panic!("closed CUDA repack negates a floating value")
-                };
-                let RepackValue::Integer(sign) = self.repack_expression(source_packet, sign) else {
-                    panic!("closed CUDA repack negates by a floating sign")
-                };
-                // `(value ^ -sign) + sign`: `-value` where `sign` is 1.
-                let mask = self.t32();
-                self.line(format!("neg.s32 {mask}, {sign};"));
-                let flipped = self.t32();
-                self.line(format!("xor.b32 {flipped}, {value}, {mask};"));
-                let output = self.t32();
-                self.line(format!("add.s32 {output}, {flipped}, {sign};"));
                 RepackValue::Integer(output)
             }
         }

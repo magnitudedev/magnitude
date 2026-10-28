@@ -399,8 +399,13 @@ representation!(IQ2XXSRows16, "iq2xxs", Rows16, F32, 2);
 representation!(IQ2XXSRows8, "iq2xxs", Rows8, F32, 2);
 representation!(IQ2XXSRows32, "iq2xxs", Rows32, F32, 2);
 representation!(IQ2XXSMma16, "iq2xxs", Mma16, F32, 1);
-// iq2s entries have a part below a byte: row layouts hold `grids` and
-// `grids_hi`.
+// iq3s and iq2s entries have a part below a byte: row layouts hold `grids`
+// and `grids_hi`.
+representation!(IQ3S, "iq3s", F32, 3);
+representation!(IQ3SRows16, "iq3s", Rows16, F32, 4);
+representation!(IQ3SRows8, "iq3s", Rows8, F32, 4);
+representation!(IQ3SRows32, "iq3s", Rows32, F32, 4);
+representation!(IQ3SMma16, "iq3s", Mma16, F32, 4);
 representation!(IQ2S, "iq2s", F32, 3);
 representation!(IQ2SRows16, "iq2s", Rows16, F32, 4);
 representation!(IQ2SRows8, "iq2s", Rows8, F32, 4);
@@ -510,6 +515,10 @@ pub fn with_representation<V: RepresentationVisitor>(
         ("iq2xxs", registry::Layout::Rows8) => return visitor.visit::<IQ2XXSRows8>(),
         ("iq2xxs", registry::Layout::Rows32) => return visitor.visit::<IQ2XXSRows32>(),
         ("iq2xxs", registry::Layout::Mma16) => return visitor.visit::<IQ2XXSMma16>(),
+        ("iq3s", registry::Layout::Rows16) => return visitor.visit::<IQ3SRows16>(),
+        ("iq3s", registry::Layout::Rows8) => return visitor.visit::<IQ3SRows8>(),
+        ("iq3s", registry::Layout::Rows32) => return visitor.visit::<IQ3SRows32>(),
+        ("iq3s", registry::Layout::Mma16) => return visitor.visit::<IQ3SMma16>(),
         ("iq2s", registry::Layout::Rows16) => return visitor.visit::<IQ2SRows16>(),
         ("iq2s", registry::Layout::Rows8) => return visitor.visit::<IQ2SRows8>(),
         ("iq2s", registry::Layout::Rows32) => return visitor.visit::<IQ2SRows32>(),
@@ -547,6 +556,7 @@ pub fn with_representation<V: RepresentationVisitor>(
         "iq2xs" => visitor.visit::<IQ2XS>(),
         "iq3xxs" => visitor.visit::<IQ3XXS>(),
         "iq2xxs" => visitor.visit::<IQ2XXS>(),
+        "iq3s" => visitor.visit::<IQ3S>(),
         "iq2s" => visitor.visit::<IQ2S>(),
         other => panic!("registry representation `{other}` has no type-level marker"),
     }

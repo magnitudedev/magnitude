@@ -159,15 +159,6 @@ impl Spelling {
         }
     }
 
-    /// The float bits of the integer `bits` (two's complement).
-    fn i32_to_f32(self, bits: &str) -> String {
-        match self {
-            #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-            Self::Glsl => format!("floatBitsToUint(float(int({bits})))"),
-            Self::Msl => format!("as_type<uint>(float(as_type<int>({bits})))"),
-            Self::Cuda => format!("__float_as_uint(__int2float_rn((int)({bits})))"),
-        }
-    }
 
     /// `value` (32 bits, sign-extended from bit `32 - high`).
     fn sign_extended(self, value: &str, high: u32) -> String {
@@ -650,18 +641,17 @@ struct Moved {
 
 /// A piece of a block's member, placed (looped code, `Code::placed_block`):
 /// its record bit and the bits of its value it places (a source run's own
-/// bits: from 0), the runs it reads and its value's offsets.
+/// bits: from 0) and the runs it reads.
 #[derive(Clone)]
 struct Placement {
     /// Its value's record (the first of the block's with its ops: a
-    /// record's runs and offsets are a member's parameters); `None` for a
-    /// source run's bits.
+    /// record's runs are a member's parameters); `None` for a source run's
+    /// bits.
     record: Option<u32>,
     bit: i64,
     from: u32,
     length: u32,
     reads: Vec<Read>,
-    offsets: Vec<i64>,
 }
 
 /// A run a placement reads: its slot where a unit moves it (and whether by
@@ -685,9 +675,7 @@ impl Placement {
             && next.record == self.record
             && match self.record {
                 Some(_) => {
-                    next.from == self.from + self.length
-                        && next.reads == self.reads
-                        && next.offsets == self.offsets
+                    next.from == self.from + self.length && next.reads == self.reads
                 }
                 None => {
                     let (read, following) = (self.reads[0], next.reads[0]);
@@ -698,13 +686,12 @@ impl Placement {
 
     /// The pieces placed alike, up to where they read and place: the same
     /// value's bits, from runs of the same slots and lengths.
-    fn shape(&self) -> (Option<u32>, u32, u32, Vec<(Option<(u32, bool)>, u32)>, usize) {
+    fn shape(&self) -> (Option<u32>, u32, u32, Vec<(Option<(u32, bool)>, u32)>) {
         (
             self.record,
             self.from,
             self.length,
             self.reads.iter().map(|read| (read.slot, read.length)).collect(),
-            self.offsets.len(),
         )
     }
 
@@ -713,13 +700,9 @@ impl Placement {
         self.reads.iter().map(|read| read.slot).collect()
     }
 
-    /// Where its value comes from: its reads' addresses and its offsets.
+    /// Where its value comes from: its reads' addresses.
     fn source(&self) -> Vec<i64> {
-        self.reads
-            .iter()
-            .map(|read| read.at)
-            .chain(self.offsets.iter().copied())
-            .collect()
+        self.reads.iter().map(|read| read.at).collect()
     }
 }
 
@@ -760,7 +743,7 @@ const STAGE_BATCH: usize = 16;
 /// Blocks' code: its lines. Vulkan's is straight-line, each source word and
 /// value once (NVIDIA's driver leaves `[[unroll]]` loops rolled). Metal's
 /// and CUDA's place pieces (`placed_block`): those placed alike whose record
-/// bits, reads and offsets are affine in their order as nested loops, which
+/// bits and reads are affine in their order as nested loops, which
 /// their compilers unroll, so their front ends compile one member's code,
 /// not each's.
 struct Code<'a> {
@@ -780,7 +763,7 @@ struct Code<'a> {
     lines: Vec<String>,
     /// The values evaluated, each once: each its record, the slots its runs
     /// move by, and where it comes from (straight-line code: its member's
-    /// displacements of the value's runs and offsets; placed code:
+    /// displacements of the value's runs; placed code:
     /// `Placement::source`). With each, the width of its bits (those above
     /// are zero).
     values: Vec<(ValueKey, u32)>,
@@ -1111,14 +1094,14 @@ impl<'a> Code<'a> {
 
     /// A local holding member `m` of `group`'s value whose record is at
     /// `record` (straight-line code): its postfix ops, visiting its runs,
-    /// its runs and offsets displaced; evaluated on first use, once.
+    /// its runs displaced; evaluated on first use, once.
     #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
     fn value(&mut self, group: Group, record: u32, m: u32) -> (String, u32) {
-        let parameters = self.parameters(group);
+        let runs = group.runs().len() as u32;
         let key = (
             record,
-            (0..group.runs().len()).map(|run| self.slot(self.visited + run)).collect(),
-            (2..parameters)
+            (0..runs as usize).map(|run| self.slot(self.visited + run)).collect(),
+            (2..2 + runs)
                 .map(|parameter| i64::from(group.displacement(m, parameter)))
                 .collect::<Vec<_>>(),
         );
@@ -1126,19 +1109,13 @@ impl<'a> Code<'a> {
             return (format!("v{index}"), self.values[index].1);
         }
         let mut parameter = 2;
-        let result = self.evaluate(record, |code, step| {
+        let result = self.evaluate(record, |code, bit, length| {
             parameter += 1;
             let delta = group.displacement(m, parameter - 1);
-            match step {
-                Operand::Run(bit, length) => (
-                    code.source_run(bit.wrapping_add(delta as u32), length),
-                    u32::MAX >> (32 - length),
-                ),
-                Operand::Offset(offset) => {
-                    let offset = offset.wrapping_add(delta as u32);
-                    (format!("{offset}u"), offset)
-                }
-            }
+            (
+                code.source_run(bit.wrapping_add(delta as u32), length),
+                u32::MAX >> (32 - length),
+            )
         });
         (self.local_value(key, &result), result.1)
     }
@@ -1151,24 +1128,13 @@ impl<'a> Code<'a> {
         name
     }
 
-    /// The parameters of `group`'s members: the word, the shift, then its
-    /// runs' first bits and its value's offsets.
-    fn parameters(&self, group: Group) -> u32 {
-        2 + group.runs().len() as u32
-            + match group.piece.bits {
-                PieceBits::Source(_) => 0,
-                PieceBits::Value { record, .. } => self
-                    .words
-                    .steps(record)
-                    .filter(|step| matches!(step, WordStep::Offset(_)))
-                    .count() as u32,
-            }
-    }
-
     /// The value whose record is at `record`: its postfix ops, each source
-    /// run and offset by `operand` (in op order: its text and the largest
-    /// value it can be); with the width of its bits (those above are zero).
-    fn evaluate(&mut self, record: u32, mut operand: impl FnMut(&mut Self, Operand) -> (String, u32)) -> (String, u32) {
+    /// run (its representative's first bit and length) by `operand` (in op
+    /// order: its text and the largest value it can be); with the width of
+    /// its bits (those above are zero). Placed code takes its members' runs
+    /// from their placements; only straight-line code (Vulkan's) reads the
+    /// representative's.
+    fn evaluate(&mut self, record: u32, mut operand: impl FnMut(&mut Self, u32, u32) -> (String, u32)) -> (String, u32) {
         let spelling = self.spelling();
         let mut stack: Vec<(String, u32)> = Vec::new();
         for step in self.words.steps(record) {
@@ -1181,7 +1147,7 @@ impl<'a> Code<'a> {
                             pieces
                                 .iter()
                                 .map(|piece| {
-                                    let (bits, _) = operand(self, Operand::Run(piece.bit, piece.length));
+                                    let (bits, _) = operand(self, piece.bit, piece.length);
                                     placed(bits, piece.length, 0, piece.length, piece.shift)
                                 })
                                 .collect::<Vec<_>>()
@@ -1190,30 +1156,16 @@ impl<'a> Code<'a> {
                         pieces.iter().map(|piece| piece.shift + piece.length).max().unwrap_or(0),
                     )
                 }
-                WordStep::Offset(offset) => {
-                    // The offset the code adds: its member's (displaced),
-                    // the widest the code adds.
-                    let (text, largest) = operand(self, Operand::Offset(offset));
-                    let (value, width) = stack.pop().expect("an operand");
-                    (format!("({value} + {text})"), 32.min(width.max(32 - largest.leading_zeros()) + 1))
-                }
-                WordStep::Or | WordStep::MultiplyF32 | WordStep::NegateIf => {
+                WordStep::Or => {
                     let (right, right_width) = stack.pop().expect("an operand");
                     let (left, left_width) = stack.pop().expect("an operand");
-                    match step {
-                        WordStep::Or => (format!("({left} | {right})"), left_width.max(right_width)),
-                        WordStep::MultiplyF32 => (spelling.f32_multiply(&left, &right), 32),
-                        // `-value` where the sign is 1: `(value ^ -sign) + sign`
-                        // (`seismic_lang::repack::negate_if`).
-                        _ => (format!("(({left} ^ (0u - {right})) + {right})"), 32),
-                    }
+                    (format!("({left} | {right})"), left_width.max(right_width))
                 }
                 WordStep::ShiftLeft(bits) => {
                     let (value, width) = stack.pop().expect("an operand");
                     (format!("({value} << {bits}u)"), 32.min(width + bits))
                 }
                 WordStep::F16ToF32 => (spelling.f16_to_f32(&stack.pop().expect("an operand").0), 32),
-                WordStep::I32ToF32 => (spelling.i32_to_f32(&stack.pop().expect("an operand").0), 32),
                 // Times 2^exponent, a normal float built from its exponent
                 // bits.
                 WordStep::ScaleF32(exponent) => (
@@ -1265,12 +1217,8 @@ impl<'a> Code<'a> {
         let mut records: Vec<(u32, Vec<String>)> = Vec::new();
         for group in words.groups(block) {
             let runs = group.runs();
-            let parameters = self.parameters(group);
-            let offsets = (2..parameters)
-                .filter(|parameter| runs.iter().all(|(_, run)| run != parameter))
-                .collect::<Vec<_>>();
-            let (record, from, base) = match group.piece.bits {
-                PieceBits::Source(_) => (None, 0, Vec::new()),
+            let (record, from) = match group.piece.bits {
+                PieceBits::Source(_) => (None, 0),
                 PieceBits::Value { record, bit } => (
                     Some({
                         let ops = value_ops(words, record);
@@ -1283,13 +1231,6 @@ impl<'a> Code<'a> {
                         }
                     }),
                     bit,
-                    words
-                        .steps(record)
-                        .filter_map(|step| match step {
-                            WordStep::Offset(offset) => Some(i64::from(offset)),
-                            _ => None,
-                        })
-                        .collect(),
                 ),
             };
             for m in 0..group.count {
@@ -1312,11 +1253,6 @@ impl<'a> Code<'a> {
                                 length: run.length,
                             }
                         })
-                        .collect(),
-                    offsets: offsets
-                        .iter()
-                        .zip(&base)
-                        .map(|(parameter, offset)| offset + i64::from(group.displacement(m, *parameter)))
                         .collect(),
                 });
             }
@@ -1482,25 +1418,11 @@ impl<'a> Code<'a> {
                 match self.values.iter().position(|(known, _)| !looped && *known == key) {
                     Some(index) => (format!("v{index}"), self.values[index].1),
                     None => {
-                        // Runs and offsets come in op order, each the next of
-                        // its kind.
+                        // Runs come in op order.
                         let mut reads = piece.reads.iter().copied().zip(sources.iter().cloned());
-                        let mut offsets = sources[piece.reads.len()..].iter();
-                        let value = self.evaluate(record, |code, operand| match operand {
-                            Operand::Run(_, length) => {
-                                let (read, at) = reads.next().expect("a value's runs are read");
-                                (code.read(read, &at, looped), u32::MAX >> (32 - length))
-                            }
-                            Operand::Offset(_) => {
-                                let offset = offsets.next().expect("a value's offsets are given");
-                                let largest = offset
-                                    .values()
-                                    .into_iter()
-                                    .map(|value| value as u32)
-                                    .max()
-                                    .expect("an offset has members");
-                                (offset.text(), largest)
-                            }
+                        let value = self.evaluate(record, |code, _, length| {
+                            let (read, at) = reads.next().expect("a value's runs are read");
+                            (code.read(read, &at, looped), u32::MAX >> (32 - length))
                         });
                         match looped {
                             true => {
@@ -1661,7 +1583,7 @@ impl<'a> Code<'a> {
 }
 
 /// The ops of the value whose record is at `record`, but for its runs'
-/// first bits and its offsets.
+/// first bits.
 fn value_ops(words: &WordTable, record: u32) -> Vec<String> {
     words
         .steps(record)
@@ -1670,20 +1592,9 @@ fn value_ops(words: &WordTable, record: u32) -> Vec<String> {
                 "field {:?}",
                 pieces.into_iter().map(|piece| (piece.length, piece.shift)).collect::<Vec<_>>()
             ),
-            WordStep::Offset(_) => String::from("offset"),
             step => format!("{step:?}"),
         })
         .collect()
-}
-
-/// An operand of a value's ops: a source run (its representative's first
-/// bit and length) or an offset (the representative's). Placed code takes
-/// its members' from their placements; only straight-line code (Vulkan's)
-/// reads the representative's.
-#[cfg_attr(all(target_os = "macos", not(test), not(feature = "coverage")), allow(dead_code))]
-enum Operand {
-    Run(u32, u32),
-    Offset(u32),
 }
 
 /// `members` (each member's parameters, in order) as nested loops, from

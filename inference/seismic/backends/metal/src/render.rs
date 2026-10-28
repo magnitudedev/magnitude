@@ -1752,21 +1752,9 @@ fn repack_expression(expression: &RepackExpr, source: &str, lookups: &mut Lookup
             repack_expression(left, source, lookups),
             repack_expression(right, source, lookups)
         ),
-        RepackExpr::OffsetI32 { value, offset } => format!(
-            "(int({}) + int({offset}))",
-            repack_expression(value, source, lookups)
-        ),
         RepackExpr::F16ToF32(value) => format!(
             "float(as_type<half>(ushort({})))",
             repack_expression(value, source, lookups)
-        ),
-        RepackExpr::I32ToF32(value) => {
-            format!("float(int({}))", repack_expression(value, source, lookups))
-        }
-        RepackExpr::MultiplyF32(left, right) => format!(
-            "f32_mul(float({}), float({}))",
-            repack_expression(left, source, lookups),
-            repack_expression(right, source, lookups)
         ),
         RepackExpr::ScaleF32 { value, exponent } => format!(
             "f32_mul(float({}), as_type<float>({:#010x}u))",
@@ -1778,14 +1766,6 @@ fn repack_expression(expression: &RepackExpr, source: &str, lookups: &mut Lookup
             format!(
                 "{}[uint({index})]",
                 lookups.name(LookupTable::Repack(*table))
-            )
-        }
-        RepackExpr::NegateIf { value, sign } => {
-            // `(value ^ -sign) + sign`: `-value` where `sign` is 1.
-            let sign = repack_expression(sign, source, lookups);
-            format!(
-                "int((uint({}) ^ (0u - uint({sign}))) + uint({sign}))",
-                repack_expression(value, source, lookups)
             )
         }
     }
