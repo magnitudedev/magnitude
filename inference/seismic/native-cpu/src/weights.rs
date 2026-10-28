@@ -1687,6 +1687,22 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         factors
     }
 
+    /// The scale codes of packet `at`'s halves (its one group's in both
+    /// with one group a packet), read where used.
+    ///
+    /// # Safety
+    /// As [`Locals::read`].
+    #[inline(always)]
+    unsafe fn packet_scales(at: At) -> [i32; 2] {
+        let first = unsafe { L::read::<GROUP>(at, at.local::<GROUP>(0)).0 };
+        let second = if groups_per_packet(GROUP) == 1 {
+            first
+        } else {
+            unsafe { L::read::<GROUP>(at, at.local::<GROUP>(1)).0 }
+        };
+        [first, second]
+    }
+
     /// One row's [`Coefficients::dot_q8`] over the block's first
     /// `packets` packets, with the activation blocks' code sums `sums`.
     #[inline(always)]
@@ -1700,6 +1716,10 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         let halves = const { groups_per_packet(GROUP) };
         let whole = halves == 1;
         let group = At::group(row, b);
+        // The block's codes, read once: the minimum terms', and the scale
+        // codes that x86 broadcasts from memory (a load operand). NEON reads
+        // each packet's scale codes where used instead: its broadcast from a
+        // general register replaces the block's round trip through memory.
         let codes = unsafe { L::block::<GROUP>(group) };
         let mut scaled = [0i32; M];
         let mut minimums = [0i32; M];
@@ -1715,10 +1735,13 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
         unsafe {
             use std::arch::aarch64::*;
-            let mut lanes = [vdupq_n_s32(0); M];
+            // Each half accumulates in its own lanes: one multiply-add per
+            // half, which the compiler cannot reassociate into a multiply,
+            // a multiply-add and an add.
+            let mut lanes = [[vdupq_n_s32(0); 2]; M];
             for local in packets_of(packets) {
                 let weights = C::neon(group.packet(local));
-                let [first_codes, second_codes] = codes[local];
+                let [first_code, second_code] = Self::packet_scales(group.packet(local));
                 let zero = vdupq_n_s32(0);
                 for (lanes, x) in lanes.iter_mut().zip(x.iter()) {
                     let activations = x.codes[PACKET * local..].as_ptr();
@@ -1729,23 +1752,23 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                             weights[1],
                             second,
                         );
-                        *lanes = vmlaq_n_s32(*lanes, products, first_codes.0);
+                        lanes[0] = vmlaq_n_s32(lanes[0], products, first_code);
                     } else {
-                        *lanes = vmlaq_n_s32(
-                            *lanes,
+                        lanes[0] = vmlaq_n_s32(
+                            lanes[0],
                             packed_neon::sdot(zero, weights[0], first),
-                            first_codes.0,
+                            first_code,
                         );
-                        *lanes = vmlaq_n_s32(
-                            *lanes,
+                        lanes[1] = vmlaq_n_s32(
+                            lanes[1],
                             packed_neon::sdot(zero, weights[1], second),
-                            second_codes.0,
+                            second_code,
                         );
                     }
                 }
             }
-            for (scaled, lanes) in scaled.iter_mut().zip(lanes) {
-                *scaled += vaddvq_s32(lanes);
+            for (scaled, [first, second]) in scaled.iter_mut().zip(lanes) {
+                *scaled += vaddvq_s32(vaddq_s32(first, second));
             }
         }
         #[cfg(target_arch = "x86_64")]
@@ -1838,15 +1861,6 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                 }
             }
         }
-        let scales = |at: At| unsafe {
-            let first = L::read::<GROUP>(at, at.local::<GROUP>(0)).0;
-            let second = if whole {
-                first
-            } else {
-                L::read::<GROUP>(at, at.local::<GROUP>(1)).0
-            };
-            [first, second]
-        };
         let mut scaled = [0i32; 8];
         #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
         unsafe {
@@ -1860,7 +1874,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                 for r in 0..8 {
                     let at = at.lane(r, row);
                     let weights = C::neon(at);
-                    let [first_scale, second_scale] = scales(at);
+                    let [first_scale, second_scale] = Self::packet_scales(at);
                     if whole {
                         let products = packed_neon::sdot(
                             packed_neon::sdot(zero, weights[0], first),
@@ -1896,7 +1910,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                 let at = group.packet(local);
                 for r in 0..8 {
                     let at_r = at.lane(r, row);
-                    let [first, second] = scales(at_r);
+                    let [first, second] = Self::packet_scales(at_r);
                     let scales = if whole {
                         _mm256_set1_epi16(first as i16)
                     } else {
