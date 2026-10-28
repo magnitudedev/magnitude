@@ -874,14 +874,55 @@ pub trait Scale: Copy + Send + Sync + 'static {
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn read8(first: *const u8, stride: usize) -> std::arch::x86_64::__m256 {
-        let mut scales = [0.0f32; 8];
-        for (r, scale) in scales.iter_mut().enumerate() {
-            *scale = unsafe { Self::read(first.add(r * stride)) };
-        }
+        let scales = unsafe { read8_each::<Self>(first, stride) };
         unsafe { std::arch::x86_64::_mm256_loadu_ps(scales.as_ptr()) }
+    }
+
+    /// [`Scale::read8`]'s NEON form: lanes 0..4 and 4..8.
+    ///
+    /// # Safety
+    /// Each addresses `BYTES` bytes.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn read8_neon(
+        first: *const u8,
+        stride: usize,
+    ) -> [std::arch::aarch64::float32x4_t; 2] {
+        use std::arch::aarch64::*;
+        let scales = unsafe { read8_each::<Self>(first, stride) };
+        unsafe { [vld1q_f32(scales.as_ptr()), vld1q_f32(scales.as_ptr().add(4))] }
     }
 }
 
+/// The eight scales of [`Scale::read8`], each read alone.
+///
+/// # Safety
+/// As [`Scale::read8_neon`].
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline(always)]
+unsafe fn read8_each<S: Scale>(first: *const u8, stride: usize) -> [f32; 8] {
+    let mut scales = [0.0f32; 8];
+    for (r, scale) in scales.iter_mut().enumerate() {
+        *scale = unsafe { S::read(first.add(r * stride)) };
+    }
+    scales
+}
+
+impl scales::F16 {
+    /// The eight stored words at `first`, `stride` bytes apart.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[inline(always)]
+    unsafe fn words8(first: *const u8, stride: usize) -> [u16; 8] {
+        let mut words = [0u16; 8];
+        for (r, word) in words.iter_mut().enumerate() {
+            *word = unsafe { read(first.add(r * stride)) };
+        }
+        words
+    }
+}
+
+/// Eight scales widen as one vector (`Dense::widen_*`), straight from the
+/// plane where they are adjacent.
 impl Scale for scales::F16 {
     const BYTES: usize = 2;
     #[inline(always)]
@@ -889,18 +930,29 @@ impl Scale for scales::F16 {
         f16_to_f32(unsafe { read(at) })
     }
 
-    /// Adjacent scales widen in one vector.
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn read8(first: *const u8, stride: usize) -> std::arch::x86_64::__m256 {
+        type Widen = crate::element::F16;
         if stride == Self::BYTES {
-            return unsafe { <crate::element::F16 as Dense>::widen_x86(first.cast()) };
+            return unsafe { Widen::widen_x86(first.cast()) };
         }
-        let mut scales = [0.0f32; 8];
-        for (r, scale) in scales.iter_mut().enumerate() {
-            *scale = f16_to_f32(unsafe { read(first.add(r * stride)) });
+        let words = unsafe { Self::words8(first, stride) };
+        unsafe { Widen::widen_x86(words.as_ptr()) }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn read8_neon(
+        first: *const u8,
+        stride: usize,
+    ) -> [std::arch::aarch64::float32x4_t; 2] {
+        type Widen = crate::element::F16;
+        if stride == Self::BYTES {
+            return unsafe { Widen::widen_neon(first.cast()) };
         }
-        unsafe { std::arch::x86_64::_mm256_loadu_ps(scales.as_ptr()) }
+        let words = unsafe { Self::words8(first, stride) };
+        unsafe { Widen::widen_neon(words.as_ptr()) }
     }
 }
 
@@ -1581,13 +1633,58 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
     #[inline(always)]
     unsafe fn factors(at: At) -> (f32, f32) {
         let supers = at.plane(RowPlaneRole::Supers);
-        let factor = scaled::<EXPONENT>(unsafe { F::read(supers) });
         let minimum = if Self::MIN {
-            scaled::<EXPONENT>(unsafe { F::read(supers.add(F::BYTES)) })
+            unsafe { F::read(supers.add(F::BYTES)) }
         } else {
             0.0
         };
-        (scaled::<CODE_EXPONENT>(factor), minimum)
+        Self::factors_of(unsafe { F::read(supers) }, minimum)
+    }
+
+    /// [`Hier::factors`] of the stored factor and minimum factor.
+    #[inline(always)]
+    fn factors_of(factor: f32, minimum: f32) -> (f32, f32) {
+        let minimum = if Self::MIN {
+            scaled::<EXPONENT>(minimum)
+        } else {
+            0.0
+        };
+        (scaled::<CODE_EXPONENT>(scaled::<EXPONENT>(factor)), minimum)
+    }
+
+    /// [`Hier::factors`] of the eight lanes of the rows8 tile whose lane 0
+    /// is `row`, `group` its storage group: lane `r`'s fields are `r` supers
+    /// groups further on, so each field's eight read as one vector.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "dotprod"),
+        target_arch = "x86_64"
+    ))]
+    #[inline(always)]
+    unsafe fn tile_factors(row: &Row, group: At) -> [(f32, f32); 8] {
+        let (supers, stride) = (
+            group.plane(RowPlaneRole::Supers),
+            row.groups[RowPlaneRole::Supers as usize],
+        );
+        let mut fields = [[0.0f32; 8]; 2];
+        for (field, values) in fields.iter_mut().enumerate().take(1 + Self::MIN as usize) {
+            let first = unsafe { supers.add(F::BYTES * field) };
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                use std::arch::aarch64::*;
+                let [low, high] = F::read8_neon(first, stride);
+                vst1q_f32(values.as_mut_ptr(), low);
+                vst1q_f32(values.as_mut_ptr().add(4), high);
+            }
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                std::arch::x86_64::_mm256_storeu_ps(values.as_mut_ptr(), F::read8(first, stride));
+            }
+        }
+        let mut factors = [(0.0, 0.0); 8];
+        for (r, factors) in factors.iter_mut().enumerate() {
+            *factors = Self::factors_of(fields[0][r], fields[1][r]);
+        }
+        factors
     }
 
     /// One row's [`Coefficients::dot_q8`] over the block's first
@@ -1828,10 +1925,10 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                 scaled[r] += sums[r];
             }
         }
+        let factors = unsafe { Self::tile_factors(row, group) };
         let mut out = [0.0f32; 8];
         for r in 0..8 {
-            let factors = unsafe { Self::factors(group.lane(r, row)) };
-            out[r] = x.d * Self::combine(factors, scaled[r], minimums[r]);
+            out[r] = x.d * Self::combine(factors[r], scaled[r], minimums[r]);
         }
         out
     }
