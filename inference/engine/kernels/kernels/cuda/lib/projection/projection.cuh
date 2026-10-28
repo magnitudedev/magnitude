@@ -1495,12 +1495,14 @@ __device__ __forceinline__ void gemm_tile_half(float acc[Shape::MI][2][4], const
 #pragma unroll
         for (int local = 0; local < 2; ++local)
             w.template decode<Operand>(raw, 2 * half + local, r[local]);
-        // One partial product per coefficient group: both steps of the half
-        // for 32-code groups, each step for 16-code groups.
-        constexpr int FOLDS = 2 / STEPS;
+        // One partial product per coefficient group the half meets: both
+        // steps of the half for groups of 32 codes or more, each step for
+        // 16-code groups.
+        constexpr int FOLD_STEPS = STEPS < 2 ? STEPS : 2;
+        constexpr int FOLDS = 2 / FOLD_STEPS;
 #pragma unroll
         for (int fold = 0; fold < FOLDS; ++fold) {
-            const int group = (2 * half) / STEPS + fold;
+            const int group = (2 * half + fold * FOLD_STEPS) / STEPS;
             // The C columns of this lane: weight rows h * 8 + 2t + c, with
             // their (scale, -bias).
             float2 k[2][2];
@@ -1515,7 +1517,7 @@ __device__ __forceinline__ void gemm_tile_half(float acc[Shape::MI][2][4], const
                 // sum(x) of the group per C row (every column equal).
                 float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-                for (int local = fold * STEPS; local < (fold + 1) * STEPS; ++local) {
+                for (int local = fold * FOLD_STEPS; local < (fold + 1) * FOLD_STEPS; ++local) {
                     const u32 b0[2] = {r[local][0], r[local][2]};
                     const u32 b1[2] = {r[local][1], r[local][3]};
                     Operand::mma(p[0], a[local][mi], b0);
@@ -1997,7 +1999,8 @@ __device__ __forceinline__ void gemm_tile_s8(float acc[Shape::MI][2][4], const W
     const typename W::Raw raw = w.from_shared(staged_tile, lane);
     // A biased 16-code group's bias term: d_x times the exact sum of its 16
     // activation codes (every column of the half-masked s8 MMA against
-    // all-ones weights), where a 32-code group takes the staged d_x sum q_x.
+    // all-ones weights), where a group of 32 codes or more takes the staged
+    // d_x sum q_x.
     auto fold_bias16 = [&](int group, int h, int part) {
         const u32 ones[2] = {part == 0 ? 0x01010101u : 0u, part == 1 ? 0x01010101u : 0u};
 #pragma unroll
@@ -2029,7 +2032,7 @@ __device__ __forceinline__ void gemm_tile_s8(float acc[Shape::MI][2][4], const W
                     for (int r = 0; r < 2; ++r) {
                         float &value = acc[mi][half][2 * r + c];
                         value = seismic_fma_rn(k.x, x[h][mi][r].x * gemm_s8_product(p[mi][half][2 * r + c]), value);
-                        if constexpr (W::BIAS && W::GROUP == 32)
+                        if constexpr (W::BIAS && W::GROUP >= 32)
                             value = seismic_fma_rn(k.y, x[h][mi][r].y, value);
                     }
             }
@@ -2038,7 +2041,8 @@ __device__ __forceinline__ void gemm_tile_s8(float acc[Shape::MI][2][4], const W
     for (int h = 0; h < 2; ++h) {
         const S8Pair first = w.s8(raw, 2 * h);
         const S8Pair second = w.s8(raw, 2 * h + 1);
-        if constexpr (W::GROUP == 32) {
+        if constexpr (W::GROUP >= 32) {
+            // Half h's 32 codes, of group 32 h / GROUP.
             const u32 b0[2] = {first.row_g, second.row_g};
             const u32 b1[2] = {first.row_g8, second.row_g8};
             int p[Shape::MI][2][4];
@@ -2050,9 +2054,9 @@ __device__ __forceinline__ void gemm_tile_s8(float acc[Shape::MI][2][4], const W
                 seismic_mma_m16n8k32_s8(p[mi][0], a[h][mi], b0);
                 seismic_mma_m16n8k32_s8(p[mi][1], a[h][mi], b1);
             }
-            fold(p, h, h);
+            fold(p, 32 * h / W::GROUP, h);
         } else {
-            static_assert(W::GROUP == 16, "groups of 16 or 32 codes");
+            static_assert(W::GROUP == 16, "groups of 16 codes, or of 32 or more");
 #pragma unroll
             for (int part = 0; part < 2; ++part) {
                 const S8Pair &step = part == 0 ? first : second;

@@ -1093,6 +1093,10 @@ pub const KVALUES_IQ4NL: [i8; 16] = [
 pub const KVALUES_MXFP4: [i8; 16] = [
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 ];
+/// ggml `dequantize_row_q1_0`'s values of a code bit: a clear bit is
+/// `-d`, a set one `+d`.
+pub const KVALUES_Q1_0: [i8; 2] = [-1, 1];
+
 /// A grid's points: four one-byte lanes to a `u32` point, or eight to a
 /// `u64` one, lane `j` in byte `j`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1161,5 +1165,7 @@ pub const IQ4NL: Codebook = Codebook { name: "iq4nl", values: &KVALUES_IQ4NL };
 /// E2M1 doubled, except that code 8 (E2M1 −0) is +0.
 pub const MXFP4: Codebook = Codebook { name: "mxfp4", values: &KVALUES_MXFP4 };
 
+pub const Q1_0: Codebook = Codebook { name: "q1_0", values: &KVALUES_Q1_0 };
+
 /// Every ggml codebook; a codebook's position here identifies it.
-pub const CODEBOOKS: [&Codebook; 2] = [&IQ4NL, &MXFP4];
+pub const CODEBOOKS: [&Codebook; 3] = [&IQ4NL, &MXFP4, &Q1_0];

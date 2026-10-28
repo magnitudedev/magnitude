@@ -245,6 +245,18 @@ fn stored_rows_decode_grid_rows() {
     }
 }
 
+/// Rows of the 1- and 2-bit encodings (Q1_0, TQ2_0, TQ1_0), 256 wide.
+#[test]
+fn stored_rows_decode_low_bit_rows() {
+    for (source, resident) in [
+        ("gguf_q1_0", "q1g128@rows16"),
+        ("gguf_tq2_0", "q2g256@rows16"),
+        ("gguf_tq1_0", "q2g256@rows16"),
+    ] {
+        stored_rows_match(source, resident, None, 256);
+    }
+}
+
 fn stored_rows_match(source: &str, resident: &str, as_stored: Option<bool>, width: usize) {
     let (rows, slots, buckets) = (300usize, 24usize, 64usize);
     let mut random = Random(41);

@@ -326,8 +326,9 @@ struct packing_layout<packets::Planes<4, 0>, packets::Table<ID>, 1> {
 // with two runs the runs' scales 32767 / 64. The fold takes a sum of at most
 // 1 of the first and a code sum / 64 below 128 of the second, so 512 |scale|
 // + 128 |min term| bounds what it multiplies (`reach`). `available` where
-// the codes are integers, a block of two runs has no min term and the run
-// of a 256-column block's factors is one factor group's or eight packets'.
+// the codes are integers, a run is one coefficient group (of at most 32
+// columns), a block of two runs has no min term and the run of a 256-column
+// block's factors is one factor group's or eight packets'.
 // The registry states the same rule as `IntegerCodes::packing_run`
 // (`seismic/api`), by which the planner plans a packing bound.
 template <typename K, uint CENTRE, uint OFFSET>
@@ -390,9 +391,9 @@ template <typename S, uint GROUP, bool BIAS, uint STORAGE, uint CENTRE, uint OFF
 struct packing_factors<packets::Direct<S, GROUP, BIAS, STORAGE, 0>, CENTRE, OFFSET> {
     typedef packets::Direct<S, GROUP, BIAS, STORAGE, 0> K;
     static constant constexpr bool biased = BIAS || CENTRE != OFFSET;
-    // Served where a block of two runs has no min term and a 256-column
-    // block holds whole groups.
-    static constant constexpr bool available = (K::groups == 1 || !biased) && 256u % GROUP == 0u;
+    // Served where a run is one group of a 32-column block and a block of
+    // two runs has no min term.
+    static constant constexpr bool available = (K::groups == 1 || !biased) && GROUP <= 32u;
     // A 256-column block's share of the supers plane, from its first
     // group's scale: a packet's place in it is its index in the block.
     static device const uchar *block_supers(device const uchar *row, Rows16 layout, uint block) {

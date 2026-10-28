@@ -67,10 +67,13 @@ pub enum Format {
     /// of their own).
     Iq1S,
     Iq1M,
+    /// GGUF Q1_0 and TQ2_0, resident as q1g128 and q2g256.
+    Q1_0,
+    Tq2_0,
 }
 
 impl Format {
-    pub const ALL: [Format; 21] = [
+    pub const ALL: [Format; 23] = [
         Format::Q4K,
         Format::Q5K,
         Format::Q6K,
@@ -92,6 +95,8 @@ impl Format {
         Format::Iq3S,
         Format::Iq1S,
         Format::Iq1M,
+        Format::Q1_0,
+        Format::Tq2_0,
     ];
     pub fn external(self) -> &'static str {
         match self {
@@ -115,6 +120,8 @@ impl Format {
             Format::Iq3S => "gguf_iq3_s",
             Format::Iq1S => "gguf_iq1_s",
             Format::Iq1M => "gguf_iq1_m",
+            Format::Q1_0 => "gguf_q1_0",
+            Format::Tq2_0 => "gguf_tq2_0",
         }
     }
     pub fn representation(self) -> &'static str {
@@ -140,6 +147,8 @@ impl Format {
             Format::Iq3S => "iq3s",
             Format::Iq1S => "iq1s",
             Format::Iq1M => "iq1m",
+            Format::Q1_0 => "q1g128",
+            Format::Tq2_0 => "q2g256",
         }
     }
     /// Whether the CUDA GEMM keeps this format's codes exact and scales its
@@ -162,6 +171,7 @@ impl Format {
                 | Format::Iq3S
                 | Format::Iq1S
                 | Format::Iq1M
+                | Format::Q1_0
         )
     }
     pub fn resident(self) -> Element {
@@ -284,6 +294,16 @@ impl Format {
                     block[at] = (block[at] & 0x0f) | (((d >> (4 * word)) as u8 & 0x0f) << 4);
                 }
             }
+            Format::Q1_0 => {
+                // d (values are ±d), then 128 code bits.
+                block.extend(f16(rng.uniform(0.0005, 0.003)));
+                block.extend((0..16).map(|_| rng.byte()));
+            }
+            Format::Tq2_0 => {
+                // 256 2-bit codes (values reach 2 d), then d.
+                block.extend((0..64).map(|_| rng.byte()));
+                block.extend(f16(rng.uniform(0.0005, 0.003)));
+            }
         }
         block
     }
@@ -296,6 +316,7 @@ impl Format {
             | Format::Q5_1
             | Format::Mxfp4 => 32,
             Format::Nvfp4 | Format::Nvfp4A4 => 64,
+            Format::Q1_0 => 128,
             _ => 256,
         }
     }

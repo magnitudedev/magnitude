@@ -1768,6 +1768,12 @@ fn repack_expression(expression: &RepackExpr, source: &str, lookups: &mut Lookup
                 lookups.name(LookupTable::Repack(*table))
             )
         }
+        // `seismic_lang::repack::base3_digit`.
+        RepackExpr::Base3Digit { value, digit } => format!(
+            "int((((uint({}) * {}u) & 0xffu) * 3u) >> 8)",
+            repack_expression(value, source, lookups),
+            3u32.pow(u32::from(*digit))
+        ),
     }
 }
 

@@ -524,9 +524,9 @@ impl PacketRepackRecipe {
                     RepackExpr::SourceBits { bit, .. } => fields.push(*bit),
                     _ => unreachable!("a validated recipe widens a source field"),
                 },
-                RepackExpr::ShiftLeft { value, .. } | RepackExpr::ScaleF32 { value, .. } => {
-                    collect(value, fields)
-                }
+                RepackExpr::ShiftLeft { value, .. }
+                | RepackExpr::ScaleF32 { value, .. }
+                | RepackExpr::Base3Digit { value, .. } => collect(value, fields),
                 RepackExpr::Lookup { index, .. } => collect(index, fields),
                 RepackExpr::BitOr(left, right) => {
                     collect(left, fields);
@@ -588,6 +588,14 @@ pub enum RepackExpr {
     Lookup {
         index: Box<RepackExpr>,
         table: RepackTable,
+    },
+    /// Digit `digit` (the first 0) of the base-3 fraction whose eight bits
+    /// are the low byte of the integer `value`: `((value 3^digit mod 256)
+    /// 3) >> 8`, in 0..=2 (`seismic_lang::repack::base3_digit`). Five
+    /// digits a byte, as ggml packs ternary codes (TQ1_0).
+    Base3Digit {
+        value: Box<RepackExpr>,
+        digit: u8,
     },
 }
 
@@ -1642,7 +1650,7 @@ const fn gguf_source_spec(
     }
 }
 
-const GGUF_SOURCES: [GgufSource; 21] = [
+const GGUF_SOURCES: [GgufSource; 24] = [
     gguf_source_spec(Encoding::Q3K, "gguf_q3_k", "q3k"),
     gguf_source_spec(Encoding::Iq3S, "gguf_iq3_s", "iq3s"),
     gguf_source_spec(Encoding::Q4K, "gguf_q4_k", "q4k"),
@@ -1664,6 +1672,9 @@ const GGUF_SOURCES: [GgufSource; 21] = [
     gguf_source_spec(Encoding::Iq2S, "gguf_iq2_s", "iq2s"),
     gguf_source_spec(Encoding::Iq1S, "gguf_iq1_s", "iq1s"),
     gguf_source_spec(Encoding::Iq1M, "gguf_iq1_m", "iq1m"),
+    gguf_source_spec(Encoding::Q1_0, "gguf_q1_0", "q1g128"),
+    gguf_source_spec(Encoding::Tq2_0, "gguf_tq2_0", "q2g256"),
+    gguf_source_spec(Encoding::Tq1_0, "gguf_tq1_0", "q2g256"),
 ];
 
 /// The external storage `encoding` is read as: its registered source;
@@ -2690,6 +2701,72 @@ pub(crate) mod internals {
                     PlaneRepackRecipe::BitRoutes(direct_bits(82, 2)),
                 ));
             }
+            "gguf_q1_0" => {
+                // block_q1_0: d (f16) | qs[16]. Value p's code is bit p % 8
+                // of qs[p / 8]; d moves bit for bit.
+                push(plane(
+                    "words",
+                    PlaneRepackRecipe::BitRoutes((0..128).map(|bit| 16 + bit).collect()),
+                ));
+                push(plane(
+                    "scale",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(0, 2)),
+                ));
+            }
+            "gguf_tq2_0" => {
+                // block_tq2_0: qs[64] | d (f16). Value p's code is at bit
+                // 2 ((p % 128) / 32) of `qs[32 (p / 128) + p % 32]`, as in
+                // Q2_K.
+                push(plane(
+                    "words",
+                    PlaneRepackRecipe::BitRoutes(
+                        (0..512)
+                            .map(|bit| {
+                                let position = bit / 2;
+                                let source_byte = (position / 128) * 32 + position % 32;
+                                source_byte * 8 + (position % 128 / 32) * 2 + bit % 2
+                            })
+                            .collect(),
+                    ),
+                ));
+                push(plane(
+                    "scale",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(64, 2)),
+                ));
+            }
+            "gguf_tq1_0" => {
+                // block_tq1_0: qs[48] | qh[4] | d (f16), five base-3 digits
+                // a byte of qs and four of qh (`dequantize_row_tq1_0`).
+                // Values 0..160 are digit p / 32 of qs[p % 32]; 160..240
+                // digit (p - 160) / 16 of qs[32 + (p - 160) % 16]; 240..256
+                // digit (p - 240) / 4 of qh[(p - 240) % 4]. The digit is the
+                // ternary code q2g256 stores.
+                push(plane(
+                    "words",
+                    PlaneRepackRecipe::PackedEntries(
+                        (0..256u32)
+                            .map(|p| {
+                                let (byte, digit) = match p {
+                                    0..160 => (p % 32, p / 32),
+                                    160..240 => (32 + (p - 160) % 16, (p - 160) / 16),
+                                    _ => (48 + (p - 240) % 4, (p - 240) / 4),
+                                };
+                                RepackExpr::Base3Digit {
+                                    value: Box::new(RepackExpr::SourceBits {
+                                        bit: byte * 8,
+                                        width: 8,
+                                    }),
+                                    digit: digit as u8,
+                                }
+                            })
+                            .collect(),
+                    ),
+                ));
+                push(plane(
+                    "scale",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(52, 2)),
+                ));
+            }
             "gguf_q6_k" => {
                 push(plane(
                     "words",
@@ -3234,6 +3311,13 @@ pub(crate) mod internals {
                     validate_expr(value, source_bits);
                 }
                 RepackExpr::ShiftLeft { value, .. } => validate_expr(value, source_bits),
+                RepackExpr::Base3Digit { value, digit } => {
+                    validate_expr(value, source_bits);
+                    assert!(
+                        *digit < crate::repack::BASE3_DIGITS,
+                        "representation conversion reads a base-3 digit past a byte's"
+                    );
+                }
                 RepackExpr::ScaleF32 { value, exponent } => {
                     // Every widened binary16 times 2^±8 is a normal f32.
                     assert!(
@@ -3355,6 +3439,7 @@ pub(crate) mod internals {
                         .expect("a lookup table has entries"),
                 ),
             ),
+            RepackExpr::Base3Digit { .. } => (0, 2),
             RepackExpr::F16ToF32(_) | RepackExpr::ScaleF32 { .. } => {
                 panic!("a packed-entry conversion value is floating")
             }

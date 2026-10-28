@@ -463,10 +463,12 @@ impl IntegerCodes {
 
     /// The columns of one run of a packing bound over these codes, the
     /// columns that share a scale, where the token-packing projection forms
-    /// serve them: a block of runs shorter than its 32 columns has no term
-    /// beside its scaled codes (Metal's `packing_factors::available`).
+    /// serve them: a run is one coefficient group of a 32-column block
+    /// (groups of at most 32 columns), and a block of runs shorter than its
+    /// 32 columns has no term beside its scaled codes (Metal's
+    /// `packing_factors::available`).
     pub fn packing_run(&self) -> Option<u64> {
-        (self.group >= 32 || !self.biased()).then_some(self.group)
+        (self.group <= 32 && (self.group == 32 || !self.biased())).then_some(self.group)
     }
 }
 

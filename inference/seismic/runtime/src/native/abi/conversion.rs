@@ -1165,6 +1165,12 @@ impl<'a> Code<'a> {
                     let (value, width) = stack.pop().expect("an operand");
                     (format!("({value} << {bits}u)"), 32.min(width + bits))
                 }
+                // Digit `digit` of the base-3 fraction in the low byte, in
+                // 0..=2 (`seismic_lang::repack::base3_digit`).
+                WordStep::Base3Digit(digit) => {
+                    let (value, _) = stack.pop().expect("an operand");
+                    (format!("(((({value} * {}u) & 0xffu) * 3u) >> 8u)", 3u32.pow(digit)), 2)
+                }
                 WordStep::F16ToF32 => (spelling.f16_to_f32(&stack.pop().expect("an operand").0), 32),
                 // Times 2^exponent, a normal float built from its exponent
                 // bits.

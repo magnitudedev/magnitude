@@ -44,6 +44,25 @@ pub enum RepackOp {
     Lookup {
         table: RepackTable,
     },
+    /// Digit `digit` of the base-3 fraction in the value's low byte
+    /// ([`base3_digit`]).
+    Base3Digit {
+        digit: u32,
+    },
+}
+
+/// The base-3 digits a byte holds: `3^5 = 243 <= 256`.
+pub const BASE3_DIGITS: u8 = 5;
+
+/// Digit `digit` (the first 0) of the base-3 fraction whose eight bits are
+/// `value`'s low byte, as every executor computes
+/// [`RepackOp::Base3Digit`]: the byte times `3^digit` keeps the fraction
+/// past the digit's predecessors (mod 256), and times 3 its integer part is
+/// the digit, in 0..=2. ggml's `dequantize_row_tq1_0` unpacks ternary codes
+/// so; it is exact for every byte.
+#[inline]
+pub fn base3_digit(value: u32, digit: u32) -> u32 {
+    ((value.wrapping_mul(3u32.pow(digit)) & 0xff) * 3) >> 8
 }
 
 /// A program shape: `ops[ops..ops + length]`, reading fields of `fields`
@@ -199,6 +218,13 @@ impl Flat {
             RepackExpr::Lookup { index, table } => {
                 integer(self.push(index, height));
                 self.ops.push(RepackOp::Lookup { table: *table });
+                Type::Integer
+            }
+            RepackExpr::Base3Digit { value, digit } => {
+                integer(self.push(value, height));
+                self.ops.push(RepackOp::Base3Digit {
+                    digit: u32::from(*digit),
+                });
                 Type::Integer
             }
         }
@@ -360,6 +386,7 @@ word_ops! {
     F16ToF32,
     ScaleF32,
     Lookup,
+    Base3Digit,
 }
 
 impl WordOp {
@@ -378,6 +405,7 @@ impl RepackOp {
             Self::F16ToF32 => WordOp::F16ToF32,
             Self::ScaleF32 { .. } => WordOp::ScaleF32,
             Self::Lookup { .. } => WordOp::Lookup,
+            Self::Base3Digit { .. } => WordOp::Base3Digit,
         }
     }
 }
@@ -510,12 +538,15 @@ pub enum WordStep<'a> {
     /// Multiply by `2^exponent`.
     ScaleF32(i32),
     Lookup(WordLookup),
+    /// [`base3_digit`] of this digit.
+    Base3Digit(u32),
 }
 
 /// The op word of `op`, whose lookup's table lies at `lookup`.
 fn encode_op(op: RepackOp, lookup: impl Fn(RepackTable) -> WordLookup) -> u32 {
     let immediate = match op {
         RepackOp::ShiftLeft { bits } => bits,
+        RepackOp::Base3Digit { digit } => digit,
         RepackOp::ScaleF32 { exponent } => exponent as u32 & 0x0fff_ffff,
         RepackOp::Lookup { table } => {
             let WordLookup { first, shift } = lookup(table);
@@ -578,6 +609,7 @@ impl<'a> Iterator for WordSteps<'a> {
                 first: immediate & 0xfffff,
                 shift: immediate >> 20,
             }),
+            WordOp::Base3Digit => WordStep::Base3Digit(immediate),
         })
     }
 }
@@ -796,7 +828,8 @@ impl WordUnit<'_> {
 /// - A value's record is two words: the index of its first op, with their
 ///   count `<< 16`; the index of its first operand.
 /// - An op is its code ([`WordOp`]) in bits 0..4 and an immediate in
-///   4..32: `ShiftLeft`'s bits, `ScaleF32`'s exponent (two's complement),
+///   4..32: `ShiftLeft`'s bits, `Base3Digit`'s digit, `ScaleF32`'s
+///   exponent (two's complement),
 ///   `Lookup`'s table (the index of its first word, with log2 of its entry
 ///   bytes `<< 20`; entries are signed, little-endian). `Field`
 ///   takes the value's next operand: the pieces of a field (first, with
@@ -1712,7 +1745,7 @@ fn structure(table: &[u32], unit: u32) -> (Vec<u32>, Vec<u32>, Vec<Vec<u32>>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Group, PieceBits, WordLookup, WordStep, WordTable};
+    use super::{base3_digit, Group, PieceBits, WordLookup, WordStep, WordTable};
     use crate::registry::{self, ConversionLayout, PlaneRepackRecipe, RepresentationConversion};
 
     /// The words of block `block` of the source packet `packet` by the word
@@ -1763,6 +1796,7 @@ mod tests {
                             .fold(0, |value, bits| value | bits),
                     ),
                     WordStep::ShiftLeft(bits) => stack[top] <<= bits,
+                    WordStep::Base3Digit(digit) => stack[top] = base3_digit(stack[top], digit),
                     WordStep::Or => {
                         let right = stack.pop().unwrap();
                         *stack.last_mut().unwrap() |= right;

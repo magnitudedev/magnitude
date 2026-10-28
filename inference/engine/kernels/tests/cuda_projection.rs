@@ -187,6 +187,13 @@ fn cuda_dense_expand_k_quant_matches_host_model() {
     dense_expand_cases(&[Format::Q2K, Format::Q3K], 19);
 }
 
+/// Q1_0 and TQ2_0 gate/up weights, resident as q1g128 and q2g256 (a direct
+/// scale per 128 and 256 codes).
+#[test]
+fn cuda_dense_expand_low_bit_matches_host_model() {
+    dense_expand_cases(&[Format::Q1_0, Format::Tq2_0], 23);
+}
+
 fn dense_expand_cases(formats: &[Format], seed: u64) {
     let Some(device) = cuda() else { return };
     let mut rng = Rng(seed);
@@ -344,12 +351,10 @@ fn cuda_gemm_row_bands_match_host_model() {
     let mapping = rotations[0];
     for format in Format::ALL {
         // The output projects K codes onto f rows: 704 (11 k-blocks, a
-        // partial last superblock) where the format's blocks allow it.
-        let k = if format.block_values() == 256 {
-            1280
-        } else {
-            704
-        };
+        // partial last superblock) where the format's blocks divide it, else
+        // five whole blocks (a partial last tile).
+        let block = format.block_values();
+        let k = if 704 % block == 0 { 704 } else { 5 * block };
         let gate = weight(&device, format, f, h, &mut rng);
         let up = weight(&device, format, f, h, &mut rng);
         let down = weight(&device, format, f, k, &mut rng);

@@ -381,6 +381,16 @@ representation!(Q3KRows16, "q3k", Rows16, F32, 4);
 representation!(Q3KRows8, "q3k", Rows8, F32, 4);
 representation!(Q3KRows32, "q3k", Rows32, F32, 4);
 representation!(Q3KMma16, "q3k", Mma16, F32, 4);
+representation!(Q1G128, "q1g128", F32, 2);
+representation!(Q1G128Rows16, "q1g128", Rows16, F32, 2);
+representation!(Q1G128Rows8, "q1g128", Rows8, F32, 2);
+representation!(Q1G128Rows32, "q1g128", Rows32, F32, 2);
+representation!(Q1G128Mma16, "q1g128", Mma16, F32, 2);
+representation!(Q2G256, "q2g256", F32, 2);
+representation!(Q2G256Rows16, "q2g256", Rows16, F32, 2);
+representation!(Q2G256Rows8, "q2g256", Rows8, F32, 2);
+representation!(Q2G256Rows32, "q2g256", Rows32, F32, 2);
+representation!(Q2G256Mma16, "q2g256", Mma16, F32, 2);
 // Vector codes: row layouts keep whole entries in `grids`.
 representation!(IQ2XS, "iq2xs", F32, 3);
 representation!(IQ3XXS, "iq3xxs", F32, 3);
@@ -494,6 +504,14 @@ pub fn with_representation<V: RepresentationVisitor>(
         ("q3k", registry::Layout::Rows8) => return visitor.visit::<Q3KRows8>(),
         ("q3k", registry::Layout::Rows32) => return visitor.visit::<Q3KRows32>(),
         ("q3k", registry::Layout::Mma16) => return visitor.visit::<Q3KMma16>(),
+        ("q1g128", registry::Layout::Rows16) => return visitor.visit::<Q1G128Rows16>(),
+        ("q1g128", registry::Layout::Rows8) => return visitor.visit::<Q1G128Rows8>(),
+        ("q1g128", registry::Layout::Rows32) => return visitor.visit::<Q1G128Rows32>(),
+        ("q1g128", registry::Layout::Mma16) => return visitor.visit::<Q1G128Mma16>(),
+        ("q2g256", registry::Layout::Rows16) => return visitor.visit::<Q2G256Rows16>(),
+        ("q2g256", registry::Layout::Rows8) => return visitor.visit::<Q2G256Rows8>(),
+        ("q2g256", registry::Layout::Rows32) => return visitor.visit::<Q2G256Rows32>(),
+        ("q2g256", registry::Layout::Mma16) => return visitor.visit::<Q2G256Mma16>(),
         ("q4g32s", registry::Layout::Rows16) => return visitor.visit::<Q4G32SRows16>(),
         ("q4g32", registry::Layout::Rows16) => return visitor.visit::<Q4G32Rows16>(),
         ("iq4g32s", registry::Layout::Rows16) => return visitor.visit::<IQ4G32SRows16>(),
@@ -564,6 +582,8 @@ pub fn with_representation<V: RepresentationVisitor>(
         "q6k" => visitor.visit::<Q6K>(),
         "q2k" => visitor.visit::<Q2K>(),
         "q3k" => visitor.visit::<Q3K>(),
+        "q1g128" => visitor.visit::<Q1G128>(),
+        "q2g256" => visitor.visit::<Q2G256>(),
         "q8g32s" => visitor.visit::<Q8G32S>(),
         "iq4xs" => visitor.visit::<IQ4XS>(),
         "q8g32" => visitor.visit::<Q8G32>(),

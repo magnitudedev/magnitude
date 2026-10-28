@@ -159,6 +159,8 @@ enum Repr {
     Iq3s,
     Iq1s,
     Iq1m,
+    Q1g128,
+    Q2g256,
 }
 
 /// The vector-coded formats (256-value GGUF blocks).
@@ -167,6 +169,9 @@ const GRID_REPRS: [Repr; 7] =
 
 /// The k-quant formats imported from GGUF blocks of 256 values.
 const K_QUANT_REPRS: [Repr; 2] = [Repr::Q2k, Repr::Q3k];
+
+/// The 1- and 2-bit formats of one direct scale per block (Q1_0, TQ2_0).
+const LOW_BIT_REPRS: [Repr; 2] = [Repr::Q1g128, Repr::Q2g256];
 
 /// The formats with a representation of their own, imported from GGUF.
 const GGUF_REPRS: [Repr; 8] = [
@@ -206,6 +211,8 @@ impl Repr {
             Repr::Iq3s => "iq3s",
             Repr::Iq1s => "iq1s",
             Repr::Iq1m => "iq1m",
+            Repr::Q1g128 => "q1g128",
+            Repr::Q2g256 => "q2g256",
         }
     }
     /// The GGUF source of a representation built from GGUF blocks, with its
@@ -229,6 +236,8 @@ impl Repr {
             Repr::Iq3s => Some(("gguf_iq3_s", 110, 256)),
             Repr::Iq1s => Some(("gguf_iq1_s", 50, 256)),
             Repr::Iq1m => Some(("gguf_iq1_m", 56, 256)),
+            Repr::Q1g128 => Some(("gguf_q1_0", 18, 128)),
+            Repr::Q2g256 => Some(("gguf_tq2_0", 66, 256)),
             _ => None,
         }
     }
@@ -325,7 +334,9 @@ fn planes(repr: Repr, k: usize) -> Planes {
         | Repr::Iq2s
         | Repr::Iq3s
         | Repr::Iq1s
-        | Repr::Iq1m => {
+        | Repr::Iq1m
+        | Repr::Q1g128
+        | Repr::Q2g256 => {
             unreachable!("{repr:?} takes the registry's geometry (`gguf_weight`)")
         }
     }
@@ -548,7 +559,9 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
             | Repr::Iq2s
             | Repr::Iq3s
             | Repr::Iq1s
-            | Repr::Iq1m => {
+            | Repr::Iq1m
+            | Repr::Q1g128
+            | Repr::Q2g256 => {
                 unreachable!("built by `gguf_weight`")
             }
         }
@@ -642,6 +655,10 @@ fn gguf_bytes(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -> V
                     block[at] = (block[at] & 0x0f) | (((d >> (4 * word)) as u8 & 0x0f) << 4);
                 }
             }
+            // d: values are ±d.
+            Repr::Q1g128 => block[..2].copy_from_slice(&f16_bits(factor).to_le_bytes()),
+            // d: values reach 2 d.
+            Repr::Q2g256 => block[64..66].copy_from_slice(&f16_bits(factor / 2.0).to_le_bytes()),
             _ => unreachable!("{repr:?} is not imported from GGUF"),
         }
         external.extend(block);
@@ -3456,6 +3473,24 @@ fn dense_expand_k_quant_formats_match_their_portable_body() {
     }
 }
 
+/// Q1_0 and TQ2_0 weights, imported into q1g128 and q2g256.
+#[test]
+fn dense_output_low_bit_formats_match_their_portable_body_and_the_host_reference() {
+    for device in devices() {
+        dense_output_matches_its_portable_body_and_the_host_reference_on(&device, &LOW_BIT_REPRS);
+    }
+}
+
+#[test]
+fn dense_expand_low_bit_formats_match_their_portable_body() {
+    for device in devices() {
+        dense_expand_matches_its_portable_body_on(
+            &device,
+            &[(Repr::Q1g128, Repr::Q2g256), (Repr::Q2g256, Repr::Q1g128)],
+        );
+    }
+}
+
 #[test]
 fn dense_expand_grid_formats_match_their_portable_body() {
     for device in devices() {
@@ -4971,7 +5006,18 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference() {
     let check = ReadoutCheck {
         v: 1000,
         d: 512,
-        reprs: &[Repr::Q6k, Repr::Q4k, Repr::Q8, Repr::Q2k, Repr::Q4g32, Repr::Q3k, Repr::Iq2s, Repr::Iq3s],
+        reprs: &[
+            Repr::Q6k,
+            Repr::Q4k,
+            Repr::Q8,
+            Repr::Q2k,
+            Repr::Q4g32,
+            Repr::Q3k,
+            Repr::Iq2s,
+            Repr::Iq3s,
+            Repr::Q1g128,
+            Repr::Q2g256,
+        ],
         output_classes: &ROW_CLASSES,
         mappings: &MAPPINGS,
         softcap: 0.0,
@@ -5551,6 +5597,8 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
         Repr::Iq3s,
         Repr::Iq1s,
         Repr::Iq1m,
+        Repr::Q1g128,
+        Repr::Q2g256,
         Repr::Bf16,
     ] {
         let table = weight(repr, v, d, 90, 8.0);

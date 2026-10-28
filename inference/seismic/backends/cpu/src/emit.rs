@@ -1776,6 +1776,18 @@ impl Emitter<'_, '_> {
                     .ins()
                     .load(types::I32, MemFlags::trusted().with_readonly(), address, 0)
             }
+            RepackExpr::Base3Digit { value, digit } => {
+                // `((value 3^digit mod 256) 3) >> 8`
+                // (`seismic_lang::repack::base3_digit`).
+                let value = self.repack_expression(source_packet, value);
+                let moved = self
+                    .builder
+                    .ins()
+                    .imul_imm(value, i64::from(3u32.pow(u32::from(*digit))));
+                let fraction = self.builder.ins().band_imm(moved, 0xff);
+                let tripled = self.builder.ins().imul_imm(fraction, 3);
+                self.builder.ins().ushr_imm(tripled, 8)
+            }
         }
     }
 

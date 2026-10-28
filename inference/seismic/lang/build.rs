@@ -7,7 +7,8 @@
 //! `codebooks::table<ID>::values()` (Vulkan `GRIDS_TABLE_<ID>`,
 //! `CODEBOOKS_TABLE_<ID>`). A `u32` grid point is one
 //! word and a `u64` point its (low, high) words; codebook values are exact
-//! floats. A 16-value codebook also has a dialect's own forms of its values:
+//! floats. A codebook also has a dialect's own forms of its values over its
+//! sixteen codes (fewer padded with zeros):
 //! on Metal each code byte's two values + 128 (`codebooks::pairs<ID>`: the
 //! low nibble's in the low byte), on CUDA its values as little-endian s8
 //! words (`codebooks::words<ID>`: `W0`..`W3`, values 4w..4w + 3 in word w)
@@ -69,7 +70,7 @@ struct Dialect {
     /// The binding of table `id` of `space` to array `space::name` of type
     /// `ty`.
     bind: fn(space: Space, id: usize, name: &str, ty: &str) -> String,
-    /// A 16-value codebook's dialect forms.
+    /// A codebook's dialect forms, its values padded to sixteen.
     sixteen: fn(id: usize, name: &str, values: [i8; 16]) -> String,
     /// A grid's dialect forms.
     grid: fn(id: usize, points: GridPoints) -> String,
@@ -324,9 +325,12 @@ fn main() {
                 text += dialect.close;
                 text += &(dialect.bind)(Space::Codebooks, index + 1, codebook.name, ty);
             }
-            if let Ok(values) = <[i8; 16]>::try_from(codebook.values) {
-                text += &(dialect.sixteen)(index + 1, codebook.name, values);
-            }
+            // Codes index only their codebook's values, so a codebook of
+            // fewer than 16 (Q1_0's two) takes the forms padded with zeros.
+            assert!(codebook.values.len() <= 16, "a codebook of at most 4-bit codes");
+            let mut values = [0i8; 16];
+            values[..codebook.values.len()].copy_from_slice(codebook.values);
+            text += &(dialect.sixteen)(index + 1, codebook.name, values);
             text += "\n";
         }
         text += dialect.end;

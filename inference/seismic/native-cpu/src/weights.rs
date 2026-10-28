@@ -457,12 +457,19 @@ impl Interpretation for Odd {
 }
 
 impl<const ID: usize> Table<ID> {
+    /// The codebook's values (of codes of at most 4 bits).
+    const LEN: usize = {
+        let len = tables::CODEBOOKS[ID].values.len();
+        assert!(len <= 16, "a codebook of at most 4-bit codes");
+        len
+    };
+    /// The values padded with zeros to sixteen, a 16-byte lookup table
+    /// (codes index only the codebook's own).
     const VALUES: [i8; 16] = {
         let values = tables::CODEBOOKS[ID].values;
-        assert!(values.len() == 16, "a 4-bit codebook");
         let mut out = [0i8; 16];
         let mut i = 0;
-        while i < 16 {
+        while i < Self::LEN {
             out[i] = values[i];
             i += 1;
         }
@@ -471,7 +478,7 @@ impl<const ID: usize> Table<ID> {
     const LEAST: i8 = {
         let mut least = Self::VALUES[0];
         let mut i = 1;
-        while i < 16 {
+        while i < Self::LEN {
             if Self::VALUES[i] < least {
                 least = Self::VALUES[i];
             }
@@ -482,7 +489,7 @@ impl<const ID: usize> Table<ID> {
     const GREATEST: i8 = {
         let mut greatest = Self::VALUES[0];
         let mut i = 1;
-        while i < 16 {
+        while i < Self::LEN {
             if Self::VALUES[i] > greatest {
                 greatest = Self::VALUES[i];
             }
@@ -589,8 +596,8 @@ impl<const LOW: u32, const HIGH: u32, I> Planes<LOW, HIGH, I> {
     unsafe fn raw(at: At) -> [u8; PACKET] {
         const {
             assert!(
-                matches!(LOW, 2 | 4) && HIGH <= 2,
-                "a 2- or 4-bit low plane and a high plane of at most 2 bits"
+                matches!(LOW, 1 | 2 | 4) && HIGH <= 2,
+                "a 1-, 2- or 4-bit low plane and a high plane of at most 2 bits"
             )
         };
         let per_byte = (8 / LOW) as usize;
@@ -714,8 +721,11 @@ impl<const LOW: u32, const HIGH: u32, const C: i32> Codes for Planes<LOW, HIGH, 
     }
 }
 
-impl<const ID: usize> Codes for Planes<4, 0, Table<ID>> {
-    const LEAST: i32 = Table::<ID>::LEAST as i32;
+impl<const LOW: u32, const ID: usize> Codes for Planes<LOW, 0, Table<ID>> {
+    const LEAST: i32 = {
+        assert!(1 << LOW == Table::<ID>::LEN, "a code names each of its codebook's values");
+        Table::<ID>::LEAST as i32
+    };
     const GREATEST: i32 = Table::<ID>::GREATEST as i32;
 
     #[inline(always)]
@@ -723,7 +733,7 @@ impl<const ID: usize> Codes for Planes<4, 0, Table<ID>> {
         let raw = unsafe { Self::raw(at) };
         let mut values = [0i8; PACKET];
         for i in 0..PACKET {
-            values[i] = Table::<ID>::value::<4>(u32::from(raw[i])) as i8;
+            values[i] = Table::<ID>::value::<LOW>(u32::from(raw[i])) as i8;
         }
         values
     }
@@ -2409,9 +2419,13 @@ mod packed_neon {
     /// `bytes` addresses the packet's `4 LOW` code bytes.
     #[inline(always)]
     pub(super) unsafe fn codes<const LOW: u32>(bytes: *const u8, high: u32) -> [int8x16_t; 2] {
-        const { assert!(LOW == 2 || LOW == 4, "a 2- or 4-bit low plane") };
+        const { assert!(matches!(LOW, 1 | 2 | 4), "a 1-, 2- or 4-bit low plane") };
         unsafe {
-            let (first, second) = if LOW == 4 {
+            let (first, second) = if LOW == 1 {
+                // Code 8i + j is bit j of byte i.
+                let word: u32 = super::read(bytes);
+                (high_bits::<0>(word as u16), high_bits::<0>((word >> 16) as u16))
+            } else if LOW == 4 {
                 let packed = vld1q_u8(bytes);
                 let low = vandq_u8(packed, vdupq_n_u8(15));
                 let upper = vshrq_n_u8(packed, 4);
@@ -2613,9 +2627,12 @@ mod packed_x86 {
     /// order: code `(8 / LOW) i + j` is bits `LOW j ..` of byte `i`.
     #[inline(always)]
     pub(super) unsafe fn codes<const LOW: u32>(bytes: *const u8) -> __m256i {
-        const { assert!(LOW == 2 || LOW == 4, "a 2- or 4-bit low plane") };
+        const { assert!(matches!(LOW, 1 | 2 | 4), "a 1-, 2- or 4-bit low plane") };
         unsafe {
-            if LOW == 4 {
+            if LOW == 1 {
+                // Code 8i + j is bit j of byte i: 1 in byte 8i + j.
+                high_bits::<0>(super::read(bytes))
+            } else if LOW == 4 {
                 let packed = _mm_loadu_si128(bytes.cast());
                 let mask = _mm_set1_epi8(15);
                 let low = _mm_and_si128(packed, mask);

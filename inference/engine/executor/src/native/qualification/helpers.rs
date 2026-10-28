@@ -698,6 +698,45 @@ fn pattern_source(representation: &str) -> Option<(Element, Vec<u8>)> {
         // Grid points 0 (every magnitude 1), no signs, scale codes 0 (odd
         // scale 1) and d = 1.
         "iq3s" => ("gguf_iq3_s", unit_packet(110, &[(0, &[0x00, 0x3c])])),
+        // Grid point 1029 (every value 0, its index's low byte 5 and high
+        // bits 4) with the delta +1/8, scale codes 0 (odd scale 1) and
+        // d = 8: 8 * 1 * (0 + 1/8).
+        "iq1s" => (
+            "gguf_iq1_s",
+            unit_packet(
+                50,
+                &[
+                    (0, &[0x00, 0x48]),
+                    (2, &[0x05; 32]),
+                    (34, &[0x24, 0x09, 0x24, 0x09, 0x24, 0x09, 0x24, 0x09]),
+                    (42, &[0x24, 0x09, 0x24, 0x09, 0x24, 0x09, 0x24, 0x09]),
+                ],
+            ),
+        ),
+        // The same point and delta, scale codes 0 and d = 8, whose nibbles
+        // are the scale words' top ones.
+        "iq1m" => (
+            "gguf_iq1_m",
+            unit_packet(
+                56,
+                &[(0, &[0x05; 32]), (32, &[0x44; 16]), (48, &[0, 0, 0, 0, 0, 0x80, 0, 0x40])],
+            ),
+        ),
+        // Codes 1 at sub-block scales 1 and minima 0, d = 1 and dmin = 0.
+        "q2k" => (
+            "gguf_q2_k",
+            unit_packet(84, &[(0, &[0x01; 16]), (16, &[0x55; 64]), (80, &[0x00, 0x3c])]),
+        ),
+        // Every code bit set (value +1) and d = 1.
+        "q1g128" => (
+            "gguf_q1_0",
+            unit_packet(18, &[(0, &[0x00, 0x3c]), (2, &[0xff; 16])]),
+        ),
+        // Codes 2 (value 2 - 1) and d = 1.
+        "q2g256" => (
+            "gguf_tq2_0",
+            unit_packet(66, &[(0, &[0xaa; 64]), (64, &[0x00, 0x3c])]),
+        ),
         // Table code 8 (value 1) at sub-scale 33 - 32 = 1 and d = 1.
         "iq4xs" => (
             "gguf_iq4_xs",
@@ -882,7 +921,8 @@ mod tests {
         let mut compared = Vec::new();
         for representation in [
             "q8g32s", "q5g32s", "q4k", "q5k", "q6k", "iq4xs", "q4g32s", "q4g32", "q5g32",
-            "mxfp4g32", "nvfp4g16", "iq2xs", "iq3xxs", "iq2xxs", "iq2s", "iq3s",
+            "mxfp4g32", "nvfp4g16", "iq2xs", "iq3xxs", "iq2xxs", "iq2s", "iq3s", "q2k", "q1g128",
+            "q2g256", "iq1s", "iq1m",
         ] {
             let (source, packet) = pattern_source(representation).unwrap();
             for layout in [Layout::Packet, Layout::Rows16, Layout::Rows8, Layout::Mma16] {
@@ -916,18 +956,17 @@ mod tests {
     fn every_packed_representation_has_a_unit_fixture() {
         let representations = [
             "q8g32s", "q4k", "q5k", "q6k", "iq4xs", "q4g32s", "q4g32", "q5g32s", "q5g32",
-            "mxfp4g32", "nvfp4g16", "nvfp4g16a4", "iq2xs", "iq3xxs", "iq2xxs", "iq2s", "iq3s",
+            "mxfp4g32", "nvfp4g16", "nvfp4g16a4", "iq2xs", "iq3xxs", "iq2xxs", "iq2s", "iq3s", "q2k",
+            "q1g128", "q2g256", "iq1s", "iq1m",
         ];
         for representation in representations {
             let stored = Element::stored(representation, Layout::Packet).unwrap();
             let (source, packet) = pattern_source(stored.representation())
                 .unwrap_or_else(|| panic!("{representation} has no fixture"));
-            // Whole 256-value GGUF blocks where the source has them.
-            let columns = if source.logical_group() == Some(256) {
-                512
-            } else {
-                704
-            };
+            // Whole source blocks: two 256-value ones, and one more of a
+            // shorter source block (a partial 256-value block).
+            let group = source.logical_group().unwrap();
+            let columns = 512 + if group < 256 { group } else { 0 };
             for layout in Layout::ALL {
                 let element = Element::stored(representation, layout).unwrap();
                 let extents = [3, columns];

@@ -113,6 +113,20 @@ inline void split_high1(uint field, thread uint &even, thread uint &odd) {
     odd = (t & 0x02020202u) << 3;
 }
 
+// The same for an 8-bit field of 1-bit codes, in bit 0.
+inline void split_bits(uint field, thread uint &even, thread uint &odd) {
+    split_high1(field, even, odd);
+    even >>= 4;
+    odd >>= 4;
+}
+
+// An 8-bit field of 1-bit codes as eight nibbles: bit j moved to bit 4j.
+inline uint spread_bits(uint field) {
+    uint t = (field | (field << 12)) & 0x000f000fu;
+    t = (t | (t << 6)) & 0x03030303u;
+    return (t | (t << 3)) & 0x11111111u;
+}
+
 inline void split_nibbles(uint word, thread uint &even, thread uint &odd) {
     even = word & 0x0f0f0f0fu;
     odd = (word >> 4) & 0x0f0f0f0fu;
@@ -153,8 +167,8 @@ constexpr float power2() {
 // high plane of HIGH. `floats` yields a step's codes, their bytes with `mask`
 // flipped, as exact floats less `offset - 1024`; `pair` the step's codes 2j
 // and 2j + 1, the second in bits 16.., with `mask` flipped alike; `nibbles`
-// the step's eight 4-bit codes as one word and `nibble_pair` its byte j (two
-// codes), the indices a codebook reads.
+// the step's eight codes (of at most 4 bits), one nibble each, as one word
+// and `nibble_pair` its byte j (two codes), the indices a codebook reads.
 template <uint LOW, uint HIGH>
 struct Planes;
 
@@ -166,6 +180,37 @@ struct CodeRange<Planes<LOW, HIGH>> {
     static constant constexpr uint largest = (1u << (LOW + HIGH)) - 1u;
 };
 
+
+template <>
+struct Planes<1, 0> {
+    struct words {
+        uint low;
+    };
+    static words load(device const uchar *row, Rows16 layout, uint p) {
+        words w;
+        w.low = *reinterpret_cast<device const uint *>(layout.at(row, layout.codes, 4ul, p));
+        return w;
+    }
+    // Step `step`'s eight codes: byte `step` of the word.
+    static uint field(thread const words &w, uint step) { return (w.low >> (8u * step)) & 0xffu; }
+    template <uint MASK>
+    static void floats(thread const words &w, uint step, half offset, thread float4 &even, thread float4 &odd) {
+        uint e, o;
+        split_bits(field(w, step), e, o);
+        even = byte_floats(e ^ MASK, offset);
+        odd = byte_floats(o ^ MASK, offset);
+    }
+    template <uint MASK>
+    static uint pair(thread const words &w, uint step, uint j) {
+        uint b = (field(w, step) >> (2u * j)) & 3u;
+        return ((b & 1u) | ((b >> 1) << 16)) ^ (MASK & 0x00ff00ffu);
+    }
+    static uint nibbles(thread const words &w, uint step) { return spread_bits(field(w, step)); }
+    static uint nibble_pair(thread const words &w, uint step, uint j) {
+        uint b = (field(w, step) >> (2u * j)) & 3u;
+        return (b & 1u) | ((b >> 1) << 4);
+    }
+};
 
 template <>
 struct Planes<2, 0> {
@@ -466,7 +511,8 @@ inline void table_codes(constant float *table, uint word, thread float4 &even, t
         table[word >> 28]);
 }
 
-// Codebook ID's 4-bit codes (`codebooks::table<ID>`, exact integers).
+// Codebook ID's codes of at most 4 bits, read as nibbles
+// (`codebooks::table<ID>`, exact integers).
 template <uint ID>
 struct Table {
     static constant constexpr int zero = 0;
@@ -1194,7 +1240,7 @@ struct InterpretationOf<SEISMIC_CODES_TWOS, BITS, OFFSET, TABLE, GRID, INDEX_BIT
 };
 template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES, uint SIGNS, uint DELTA_BIT, uint DELTA>
 struct InterpretationOf<SEISMIC_CODES_TABLE, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES, SIGNS, DELTA_BIT, DELTA> {
-    static_assert(BITS == 4, "codebook codes are nibbles");
+    static_assert(BITS <= 4, "codebook codes are at most nibbles");
     typedef Table<TABLE> type;
 };
 template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES, uint SIGNS, uint DELTA_BIT, uint DELTA>

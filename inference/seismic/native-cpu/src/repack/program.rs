@@ -35,7 +35,7 @@
 //! ([`RepackExecutor::run`]).
 
 use seismic_lang::registry::{self, RepresentationConversion};
-use seismic_lang::repack::{slot, PacketBit, PacketValues, RepackOp, RepackShape, STACK};
+use seismic_lang::repack::{base3_digit, slot, PacketBit, PacketValues, RepackOp, RepackShape, STACK};
 use std::num::NonZeroU32;
 
 /// Bytes of a vector step: an output block, a term's input window, a
@@ -1340,7 +1340,7 @@ impl RepackProgram {
                             .iter()
                             .all(|op| match op {
                                 RepackOp::Field { width, .. } => slot(*width) == 1,
-                                RepackOp::ShiftLeft { .. } | RepackOp::Or => true,
+                                RepackOp::ShiftLeft { .. } | RepackOp::Or | RepackOp::Base3Digit { .. } => true,
                                 RepackOp::Lookup { table } => table.values().len() <= 256,
                                 RepackOp::F16ToF32 | RepackOp::ScaleF32 { .. } => false,
                             })
@@ -1941,6 +1941,12 @@ impl RepackExecutor<'_> {
                         *value = (u32::from(*value) << bits) as u8;
                     }
                 }
+                // Exact on bytes: the digit reads the low byte alone.
+                RepackOp::Base3Digit { digit } => {
+                    for value in &mut stack[height - 1][..lanes] {
+                        *value = base3_digit(u32::from(*value), digit) as u8;
+                    }
+                }
                 RepackOp::Or => {
                     height -= 1;
                     let (low, high) = stack.split_at_mut(height);
@@ -2005,6 +2011,11 @@ impl RepackExecutor<'_> {
                 RepackOp::ShiftLeft { bits } => {
                     for chunk in top(low) {
                         *chunk = chunk.map(|value| value << bits);
+                    }
+                }
+                RepackOp::Base3Digit { digit } => {
+                    for chunk in top(low) {
+                        *chunk = chunk.map(|value| base3_digit(value, digit));
                     }
                 }
                 RepackOp::Or => {

@@ -3,23 +3,28 @@
 //! drafter verdict and the shape fingerprint.
 //!
 //! Header checks are exercised through [`kernel_inventory`], which admits and
-//! plans a package without a device. Drafter verdicts need a selected
-//! device; they run on the CPU backend, which every build has.
+//! plans a package without a device. Drafter verdicts and memory need a
+//! selected device; they run on the CPU backend, which every build has.
 
 use magnitude_artifacts::gguf::Encoding;
 use magnitude_engine::{
     assessment::{
-        header_refusal, kernel_inventory, prepare_model_assessment, AssessmentStructure,
-        DrafterVerdict, HeaderExtent, KernelInventory, ModelFacts, ModelPackagePaths,
+        assess_model, header_refusal, kernel_inventory, prepare_model_assessment,
+        AssessmentSetup, AssessmentStructure, DrafterVerdict, HeaderExtent, KernelInventory,
+        Measurements, ModelAssessment, ModelExecution, ModelFacts, ModelPackagePaths,
         PreparedModelAssessment, ProjectorVerdict, SpeculativeMethod,
     },
     error::{UnsupportedModel, UnsupportedReason, WeightTypeCount},
     fingerprint::ModelFingerprint,
-    options::{standard_service_limits, ModelMethod, ModelPolicy},
+    options::{standard_service_limits, ModelMethod, ModelPolicy, PROFILE_SEQUENCES},
 };
-use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
+use magnitude_executor::{
+    assessment::ExecutionFit,
+    platform::{DeviceRequest, MemoryReserves},
+};
 use seismic::BackendName;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 enum Meta {
     U32(u32),
@@ -690,6 +695,14 @@ fn cpu_structure() -> AssessmentStructure {
     .unwrap_or_else(|error| panic!("the CPU backend is selectable: {error}"))
 }
 
+/// The CPU backend before any measurement: fit is assessed, speed is pending.
+fn cpu_setup() -> AssessmentSetup {
+    AssessmentSetup {
+        structure: Arc::new(cpu_structure()),
+        measurements: Measurements::Pending,
+    }
+}
+
 fn prepared(package: &ModelPackagePaths) -> PreparedModelAssessment {
     prepare_model_assessment(package, &cpu_structure())
         .unwrap_or_else(|error| panic!("operational failure: {error}"))
@@ -917,6 +930,49 @@ fn a_kernel_call_outside_its_domain_names_the_kernel_and_its_statics() {
     assert_eq!(backend, "cpu");
     assert!(!entry.is_empty());
     assert!(!statics.is_empty());
+}
+
+/// Memory is charged as stored after import: TQ1_0 weights are held widened
+/// as q2g256, TQ2_0's form, so a TQ1_0 file is charged as its TQ2_0 twin
+/// though it is smaller.
+#[test]
+fn widened_weights_are_charged_as_resident() {
+    let scratch = Scratch::new("widened");
+    let charged = |encoding: Encoding, name: &str| {
+        let mut gguf = llama();
+        let mut stored = 0;
+        for block in 0..BLOCKS {
+            for role in ["ffn_gate", "ffn_up", "ffn_down"] {
+                let tensor = format!("blk.{block}.{role}.weight");
+                gguf.encode(&tensor, encoding);
+                stored += FEED_FORWARD * HIDDEN / encoding.block_elements()
+                    * encoding.block_bytes();
+            }
+        }
+        let target = gguf.write(&scratch.file(name));
+        let ModelAssessment::Assessed {
+            execution:
+                ModelExecution::Fits {
+                    fit: ExecutionFit { domains, .. },
+                    ..
+                },
+            ..
+        } = assess_model(&package(target), &cpu_setup(), &[], PROFILE_SEQUENCES)
+            .unwrap_or_else(|error| panic!("operational failure: {error}"))
+        else {
+            panic!("{name} fits");
+        };
+        let required = domains
+            .iter()
+            .map(|domain| domain.required_bytes)
+            .collect::<Vec<_>>();
+        (stored, required)
+    };
+    let (tq1_stored, tq1_required) = charged(Encoding::Tq1_0, "tq1_0.gguf");
+    let (tq2_stored, tq2_required) = charged(Encoding::Tq2_0, "tq2_0.gguf");
+    assert!(tq1_stored < tq2_stored);
+    assert_eq!(tq1_required, tq2_required);
+    assert!(tq1_required.iter().all(|required| *required > tq2_stored));
 }
 
 /// A shared real-header fixture (`fixtures/assessment/headers`),

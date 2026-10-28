@@ -1549,6 +1549,38 @@ pub(crate) const REPRS: &[Repr] = &[
             carried: false,
         },
     },
+    // GGUF Q1_0: one-bit codes naming -1 or +1, one f16 scale per 128:
+    // ggml's `±d` exactly.
+    Repr {
+        name: "q1g128",
+        packing_axis: PackingAxisRule::Last,
+        group: 128,
+        bits: 1,
+        code: CodeInterpretation::Table(&tables::Q1_0),
+        float_code: None,
+        coefficients: Coefficients::Direct {
+            dtype: DType::F16,
+            bias: false,
+            packet_group: 128,
+        },
+    },
+    // GGUF TQ2_0 and TQ1_0: ternary codes stored as 2-bit codes offset by 1,
+    // one f16 scale per 256: ggml's `(q - 1) d` exactly. TQ1_0's base-3
+    // packing (1.6875 bits a value) is resident at 2.0625 (+22%), so both
+    // share one decoder.
+    Repr {
+        name: "q2g256",
+        packing_axis: PackingAxisRule::Last,
+        group: 256,
+        bits: 2,
+        code: CodeInterpretation::Offset(1),
+        float_code: None,
+        coefficients: Coefficients::Direct {
+            dtype: DType::F16,
+            bias: false,
+            packet_group: 256,
+        },
+    },
 ];
 
 pub(crate) static IQ2XS_CODES: GridCodes = GridCodes {

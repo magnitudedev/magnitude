@@ -254,17 +254,28 @@ __device__ __forceinline__ float f16_at(const u8 *address) {
 // so a superblock's four k-blocks always exist and its high plane is fetched
 // warp-coalesced. `W` is the decoder value (its base,
 // stride and planes).
-// LOW-bit codes of a 2- or 4-bit low plane, with a 1-bit high plane (bit LOW
-// of a code) or none. A lane chunk of a k-block is 4 LOW bytes of the low
+// LOW-bit codes of a 1-, 2- or 4-bit low plane, with a 1-bit high plane (bit
+// LOW of a code) or none. A lane chunk of a k-block is 4 LOW bytes of the low
 // plane (and 4 bytes of a 1-bit high plane); a step's word holds its eight
-// slots, LOW bits each (`step_word`). A 2-bit plane's `step_word` spreads its
-// step to the 4-bit slot form, each slot's code in the low bits of its
+// slots, LOW bits each (`step_word`). A narrower plane's `step_word` spreads
+// its step to the 4-bit slot form, each slot's code in the low bits of its
 // nibble, so every read below is the nibble form's.
 template <u32 LOW> struct LowPlane;
 template <> struct LowPlane<4> {
     typedef uint4 Words;
     __device__ static __forceinline__ Words load(const u8 *at) { return seismic_ld_nc_na_v4(at); }
     __device__ static __forceinline__ u32 step_word(const Words &low, int step) { return word_of(low, step); }
+};
+template <> struct LowPlane<1> {
+    typedef u32 Words;
+    __device__ static __forceinline__ Words load(const u8 *at) { return seismic_ld_nc_na_u32(at); }
+    // Step s's 8 bits (byte s), slot j's code moved from bit j to bit 4j.
+    __device__ static __forceinline__ u32 step_word(const Words &low, int step) {
+        u32 x = (low >> (8 * step)) & 0xFFu;
+        x = (x | (x << 12)) & 0x000F000Fu;
+        x = (x | (x << 6)) & 0x03030303u;
+        return (x | (x << 3)) & 0x11111111u;
+    }
 };
 template <> struct LowPlane<2> {
     typedef uint2 Words;
@@ -278,7 +289,7 @@ template <> struct LowPlane<2> {
     }
 };
 template <int LOW, int HIGH, bool SUPERBLOCKS> struct Planes {
-    static_assert(LOW == 2 || LOW == 4, "a sub-byte low plane of 2 or 4 bits");
+    static_assert(LOW == 1 || LOW == 2 || LOW == 4, "a sub-byte low plane of 1, 2 or 4 bits");
     static_assert(HIGH <= 1, "a 2-bit high plane needs rows of whole superblocks (Planes<4, 2, true>)");
     static constexpr int BITS = LOW + HIGH;
     typedef LowPlane<(u32)LOW> L;
@@ -340,10 +351,9 @@ template <int LOW, int HIGH, bool SUPERBLOCKS> struct Planes {
         }
         return raw;
     }
-    // The step's eight 4-bit low codes, one nibble a slot (a codebook's
-    // indices).
+    // The step's eight low codes, one nibble a slot (a codebook's indices).
     __device__ static __forceinline__ u32 nibbles(const Raw &raw, int step) {
-        static_assert(LOW == 4, "codebook indices are nibbles");
+        static_assert(HIGH == 0, "codebook indices are a low plane's codes");
         return L::step_word(raw.low, step);
     }
     // Register i's two codes of step `step` (slots 2i, 2i + 1, in bits 0..
@@ -770,10 +780,11 @@ struct Twos : TwosCode<8> {
     }
 };
 
-// Codebook ID's codes, read from a step's 4-bit nibbles: s8 table values.
+// Codebook ID's codes, read from a step's nibbles (codes of at most 4 bits,
+// a codebook of at most sixteen values): s8 table values.
 template <u32 ID> struct Table {
     typedef typename CodebookOf<ID>::type B;
-    template <int BITS> static constexpr bool READS = BITS == 4;
+    template <int BITS> static constexpr bool READS = BITS <= 4;
     __device__ static __forceinline__ float value(u32 code) { return (float)(int)(signed char)B::values(code); }
     template <class O, class P> __device__ static __forceinline__ void decode(const typename P::Raw &raw, int step,
                                                                            u32 (&a)[4]) {
@@ -805,11 +816,22 @@ template <class C, bool BIAS> __device__ __forceinline__ float coded_value(u32 c
 
 // Direct coefficients: a scale S (with BIAS a bias after it) per GROUP
 // codes, rows holding whole storage groups of STORAGE codes; GROUPS a
-// 64-code k-block.
+// 64-code k-block, or one where a group spans k-blocks (GROUP of 128 or 256:
+// each of its k-blocks takes its scale).
 template <class S, int GROUP_, bool BIAS_, int STORAGE_, int CODE_EXPONENT> struct Direct {
     static constexpr int GROUP = GROUP_;
-    static_assert(64 % GROUP == 0, "a k-block holds whole groups");
-    static constexpr int GROUPS = 64 / GROUP;
+    static_assert(64 % GROUP == 0 || (GROUP % 64 == 0 && 256 % GROUP == 0),
+                  "a k-block holds whole groups, or a superblock whole k-block spanning ones");
+    static constexpr int GROUPS = GROUP <= 64 ? 64 / GROUP : 1;
+    // The group (of the row's, or from k-block 0 of a superblock's) of group
+    // `group` of k-block `kblock`: a k-block's groups follow its
+    // predecessors', or a group spans GROUP / 64 k-blocks.
+    template <class T> __host__ __device__ static constexpr T group_of(T kblock, int group) {
+        if constexpr (GROUP <= 64)
+            return kblock * GROUPS + group;
+        else
+            return kblock / (GROUP / 64);
+    }
     static constexpr bool BIAS = BIAS_;
     static constexpr int STORAGE = STORAGE_;
     // Bytes of a group's coefficients, and of a superblock's (256 codes),
@@ -821,8 +843,13 @@ template <class S, int GROUP_, bool BIAS_, int STORAGE_, int CODE_EXPONENT> stru
     // Staged where its scales stage (`StagedScales`) and its words copy in
     // 16 B chunks.
     static constexpr bool GEMV_STAGED = StagedScales<S>::value && BLOCK_BYTES % 16 == 0;
-    static_assert(BLOCK_BYTES == 8 || BLOCK_BYTES % 16 == 0, "a superblock's coefficients are 8 B or whole 16 B");
-    static constexpr int BLOCK_WORDS = BLOCK_BYTES / 4;
+    static_assert(BLOCK_BYTES == 2 || BLOCK_BYTES == 4 || BLOCK_BYTES == 8 || BLOCK_BYTES % 16 == 0,
+                  "a superblock's coefficients are 2, 4 or 8 B or whole 16 B");
+    static constexpr int BLOCK_WORDS = (BLOCK_BYTES + 3) / 4;
+    // Byte `at` of a superblock's coefficients within the aligned word
+    // holding its first (rows and their planes are 16 B aligned): nonzero
+    // only for 2-byte superblocks.
+    __host__ __device__ static constexpr u64 phase(u64 superblock) { return superblock * BLOCK_BYTES % 4; }
     // Byte offset of group g's scale; its bias follows it.
     __host__ __device__ static constexpr u64 scale_offset(u64 g) { return g * GROUP_BYTES; }
     __device__ static __forceinline__ float scaled(float scale) { return times_power2<CODE_EXPONENT>(scale); }
@@ -835,13 +862,12 @@ template <class S, int GROUP_, bool BIAS_, int STORAGE_, int CODE_EXPONENT> stru
     template <class W>
     __device__ static __forceinline__ void coefficient(const W &w, u64 row, u64 kblock, int group, float &scale,
                                                        float &bias) {
-        at(w.base + row * w.stride + w.scales, w.base + row * w.stride + w.supers,
-           kblock * GROUPS + (u64)group, scale, bias);
+        at(w.base + row * w.stride + w.scales, w.base + row * w.stride + w.supers, group_of(kblock, group), scale,
+           bias);
     }
-    // Group g of a superblock's coefficient words (its first group's at
-    // byte 0).
-    __device__ static __forceinline__ void decode(const u32 *words, int g, float &scale, float &bias) {
-        const u64 at = scale_offset((u64)g);
+    // The group whose scale is at byte `at` of a superblock's coefficient
+    // words.
+    __device__ static __forceinline__ void decode_at(const u32 *words, u64 at, float &scale, float &bias) {
         scale = scaled(S::decode(words[at / 4] >> (8 * (at % 4))));
         if constexpr (BIAS) {
             const u64 b = at + S::BYTES;
@@ -849,6 +875,11 @@ template <class S, int GROUP_, bool BIAS_, int STORAGE_, int CODE_EXPONENT> stru
         } else {
             bias = 0.0f;
         }
+    }
+    // Group g of a superblock's coefficient words (its first group's at
+    // byte 0).
+    __device__ static __forceinline__ void decode(const u32 *words, int g, float &scale, float &bias) {
+        decode_at(words, scale_offset((u64)g), scale, bias);
     }
     // The coefficient words of one superblock of rows g, g+8, 16 B a load
     // (8 B for 8), past the first 16 B where the row's supers plane holds
@@ -860,7 +891,11 @@ template <class S, int GROUP_, bool BIAS_, int STORAGE_, int CODE_EXPONENT> stru
         words[4 * c] = v.x, words[4 * c + 1] = v.y, words[4 * c + 2] = v.z, words[4 * c + 3] = v.w;
     }
     __device__ static __forceinline__ void load(const u8 *fields, u64 superblock, u64 supers_bytes, u32 (&words)[BLOCK_WORDS]) {
-        if constexpr (BLOCK_BYTES == 8) {
+        if constexpr (BLOCK_BYTES < 8) {
+            // The aligned word holding them, their first byte moved to 0.
+            const u64 at = phase(superblock);
+            words[0] = seismic_ld_nc_u32(fields - at) >> (8 * at);
+        } else if constexpr (BLOCK_BYTES == 8) {
             const uint2 v = seismic_ld_nc_v2(fields);
             words[0] = v.x;
             words[1] = v.y;
@@ -894,7 +929,7 @@ template <class S, int GROUP_, bool BIAS_, int STORAGE_, int CODE_EXPONENT> stru
             } else {
 #pragma unroll
                 for (int group = 0; group < GROUPS; ++group)
-                    decode(block.words[r], q * GROUPS + group, c.scale[r][group], c.bias[r][group]);
+                    decode(block.words[r], group_of(q, group), c.scale[r][group], c.bias[r][group]);
             }
         }
     }
@@ -934,18 +969,19 @@ template <class S, int GROUP_, bool BIAS_, int STORAGE_, int CODE_EXPONENT> stru
                     reinterpret_cast<const uint4 *>(shared + (lane / 4 + 8 * r) * pitch + superblock * BLOCK_BYTES)[c]);
         return block;
     }
-    // GEMM staging: the superblock's coefficient words. A word's first
-    // k-block is that of the first group whose scale or bias it holds.
+    // GEMM staging: the superblock's coefficient words, from the aligned
+    // word holding its first byte (`phase`). A word's first k-block is that
+    // of the first group whose scale or bias it holds.
     static constexpr int SUPER_WORDS = BLOCK_WORDS;
     template <class W> __device__ static __forceinline__ const u8 *super_word(const W &w, u64 row, u64 superblock, int word) {
-        return w.base + row * w.stride + w.supers + superblock * BLOCK_BYTES + 4 * word;
+        return w.base + row * w.stride + w.supers + superblock * BLOCK_BYTES - phase(superblock) + 4 * word;
     }
     __host__ __device__ static constexpr int word_kblock(int word) {
         return (int)((u64)(4 * word) / GROUP_BYTES * GROUP / 64);
     }
     __device__ static __forceinline__ void staged_coefficient(const u32 *words, u64 kblock, int group, float &scale,
                                                               float &bias) {
-        decode(words, (int)(kblock % 4) * GROUPS + group, scale, bias);
+        decode_at(words, phase(kblock / 4) + scale_offset((u64)group_of((int)(kblock % 4), group)), scale, bias);
     }
 };
 
@@ -1263,8 +1299,10 @@ template <class P, int GROUP> struct OrderOf<P, GROUP, decltype((void)sizeof(typ
 template <class P, class C, class K, bool SCALED, bool OPERANDS = false>
 struct Packed : Rows, Select<K::BIAS, None, typename OrderOf<P, K::GROUP>::type>::type {
     static_assert(C::template READS<P::BITS>, "the interpretation reads codes of the planes' width (Linear: below "
-                                              "8 bits, Twos: 8, Table: 4)");
-    static constexpr int GROUP = K::GROUP;
+                                              "8 bits, Twos: 8, Table: at most 4)");
+    // The codes of a coefficient group within a k-block: the k-block's
+    // where K's groups span k-blocks (`Direct` of more than 64 codes).
+    static constexpr int GROUP = 64 / K::GROUPS;
     static constexpr int GROUPS = K::GROUPS;
     static constexpr bool BIAS = K::BIAS;
     static constexpr bool DENSE = false;

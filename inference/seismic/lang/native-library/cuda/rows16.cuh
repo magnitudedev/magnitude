@@ -6,7 +6,8 @@
 //
 // In `rows16` every row holds its planes one after another at fixed offsets
 // (the emitted `_ROW_*` roles). Element i's code is bits of the code planes
-// (`registry::code_planes`: crumb i % 4 of byte i / 4 of a 2-bit low plane,
+// (`registry::code_planes`: bit i % 8 of byte i / 8 of a 1-bit low plane,
+// crumb i % 4 of byte i / 4 of a 2-bit one,
 // nibble i & 1 of byte i / 2 of a 4-bit one, byte i of an 8-bit one, bit i or bits 2i, 2i + 1 of a 1- or 2-bit high
 // plane) or of the vector-code entry holding it (one per eight elements);
 // its coefficients keep the registry's per-row placement, as in `mma16`,
@@ -50,12 +51,12 @@ struct Planes {
 // a sub-byte low plane holds 8 / LOW codes a byte, element i's at bit
 // LOW (i % (8 / LOW)) of byte i / (8 / LOW).
 template <u32 LOW, u32 HIGH> __device__ __forceinline__ u32 code(const Planes &w, const u8 *row, u64 i) {
-    static_assert(LOW == 2 || LOW == 4 || LOW == 8, "a low plane of 2, 4 or 8 bits");
+    static_assert(LOW == 1 || LOW == 2 || LOW == 4 || LOW == 8, "a low plane of 1, 2, 4 or 8 bits");
     static_assert(LOW == 8 ? HIGH == 0 : HIGH <= LOW / 2, "a high plane of up to LOW / 2 bits joins a sub-byte low plane");
     if constexpr (LOW == 8)
         return u8_at(row + w.codes + i);
     // log2 of the codes a byte holds.
-    constexpr u32 PER = LOW == 4 ? 1 : 2;
+    constexpr u32 PER = LOW == 4 ? 1 : LOW == 2 ? 2 : 3;
     u32 code = (u8_at(row + w.codes + (i >> PER)) >> (LOW * (u32)(i & ((1u << PER) - 1u)))) & ((1u << LOW) - 1u);
     if constexpr (HIGH == 1)
         code |= ((u8_at(row + w.high + (i >> 3)) >> (u32)(i & 7u)) & 1u) << LOW;

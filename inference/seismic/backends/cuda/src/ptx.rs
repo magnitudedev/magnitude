@@ -74,7 +74,8 @@ fn repack_expression_nodes(expression: &RepackExpr) -> u64 {
         RepackExpr::SourceBits { .. } => 1,
         RepackExpr::ShiftLeft { value, .. }
         | RepackExpr::F16ToF32(value)
-        | RepackExpr::ScaleF32 { value, .. } => 1 + repack_expression_nodes(value),
+        | RepackExpr::ScaleF32 { value, .. }
+        | RepackExpr::Base3Digit { value, .. } => 1 + repack_expression_nodes(value),
         RepackExpr::BitOr(left, right) => {
             1 + repack_expression_nodes(left) + repack_expression_nodes(right)
         }
@@ -88,7 +89,8 @@ fn repack_lookup_tables(expression: &RepackExpr, tables: &mut Vec<LookupTable>) 
         RepackExpr::SourceBits { .. } => {}
         RepackExpr::ShiftLeft { value, .. }
         | RepackExpr::F16ToF32(value)
-        | RepackExpr::ScaleF32 { value, .. } => repack_lookup_tables(value, tables),
+        | RepackExpr::ScaleF32 { value, .. }
+        | RepackExpr::Base3Digit { value, .. } => repack_lookup_tables(value, tables),
         RepackExpr::BitOr(left, right) => {
             repack_lookup_tables(left, tables);
             repack_lookup_tables(right, tables);
@@ -1916,6 +1918,26 @@ impl<'a> Emitter<'a> {
                 self.line(format!("mad.wide.u32 {address}, {index}, 4, {base};"));
                 let output = self.t32();
                 self.line(format!("ld.const.s32 {output}, [{address}];"));
+                RepackValue::Integer(output)
+            }
+            RepackExpr::Base3Digit { value, digit } => {
+                let RepackValue::Integer(value) = self.repack_expression(source_packet, value)
+                else {
+                    panic!("closed CUDA repack reads a base-3 digit of a floating value")
+                };
+                // `((value 3^digit mod 256) 3) >> 8`
+                // (`seismic_lang::repack::base3_digit`).
+                let moved = self.t32();
+                self.line(format!(
+                    "mul.lo.u32 {moved}, {value}, {};",
+                    3u32.pow(u32::from(*digit))
+                ));
+                let fraction = self.t32();
+                self.line(format!("and.b32 {fraction}, {moved}, 255;"));
+                let tripled = self.t32();
+                self.line(format!("mul.lo.u32 {tripled}, {fraction}, 3;"));
+                let output = self.t32();
+                self.line(format!("shr.u32 {output}, {tripled}, 8;"));
                 RepackValue::Integer(output)
             }
         }

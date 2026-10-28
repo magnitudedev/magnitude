@@ -1526,6 +1526,10 @@ fn eval_repack(expression: &RepackExpr, source: &[u8]) -> ReferenceScalar {
             let index = scalar::cast(DType::I32, eval_repack(index, source)).bits();
             ReferenceScalar::I32(table.values()[index as usize])
         }
+        RepackExpr::Base3Digit { value, digit } => {
+            let value = scalar::cast(DType::I32, eval_repack(value, source)).bits() as u32;
+            ReferenceScalar::I32(crate::repack::base3_digit(value, u32::from(*digit)) as i32)
+        }
     }
 }
 
