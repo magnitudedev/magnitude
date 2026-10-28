@@ -183,9 +183,14 @@ impl Dense for F16 {
     unsafe fn widen_neon(values: *const u16) -> [std::arch::aarch64::float32x4_t; 2] {
         use std::arch::aarch64::*;
         unsafe {
+            // The sign and magnitude separate on the eight 16-bit words at
+            // once, and each widens with its shift in one instruction.
             let words = vld1q_u16(values);
-            let widen = |value: uint32x4_t| {
-                let magnitude = vshlq_n_u32::<13>(vandq_u32(value, vdupq_n_u32(0x7fff)));
+            let (magnitudes, signs) = (
+                vandq_u16(words, vdupq_n_u16(0x7fff)),
+                vandq_u16(words, vdupq_n_u16(0x8000)),
+            );
+            let widen = |magnitude: uint32x4_t, sign: uint32x4_t| {
                 let exponent = vandq_u32(magnitude, vdupq_n_u32(0x0f80_0000));
                 let normal = vaddq_u32(magnitude, vdupq_n_u32(0x3800_0000));
                 let special = vaddq_u32(normal, vdupq_n_u32(0x3800_0000));
@@ -198,12 +203,17 @@ impl Dense for F16 {
                     special,
                     vbslq_u32(vceqzq_u32(exponent), subnormal, normal),
                 );
-                let sign = vshlq_n_u32::<16>(vandq_u32(value, vdupq_n_u32(0x8000)));
                 vreinterpretq_f32_u32(vorrq_u32(bits, sign))
             };
             [
-                widen(vmovl_u16(vget_low_u16(words))),
-                widen(vmovl_high_u16(words)),
+                widen(
+                    vshll_n_u16::<13>(vget_low_u16(magnitudes)),
+                    vshll_n_u16::<16>(vget_low_u16(signs)),
+                ),
+                widen(
+                    vshll_high_n_u16::<13>(magnitudes),
+                    vshll_high_n_u16::<16>(signs),
+                ),
             ]
         }
     }
