@@ -16,6 +16,11 @@ export type IcnPreparationEvent =
       readonly event: ArtifactInstallationEvent
     }
   | { readonly _tag: "Starting" }
+  | {
+      readonly _tag: "Retrying"
+      readonly message: string
+      readonly retryAtMillis: number
+    }
 
 export interface IcnPreparationReporter {
   readonly report: (event: IcnPreparationEvent) => Effect.Effect<void>

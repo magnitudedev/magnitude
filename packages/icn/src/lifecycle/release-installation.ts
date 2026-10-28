@@ -23,7 +23,7 @@ import {
 } from "@magnitudedev/release"
 import { IcnPreparationReporter } from "./preparation.js"
 import { installationLoaderEnvironment, installationNativePath } from "./installation-environment.js"
-import { Data, Effect, Fiber, Option, Schema, Stream } from "effect"
+import { Clock, Data, Duration, Effect, Either, Fiber, Option, Schema, Stream } from "effect"
 
 export class ReleaseIcnInstallationError extends Data.TaggedError(
   "ReleaseIcnInstallationError"
@@ -54,7 +54,7 @@ export const acquisitionError = (baseUrl: string) => (cause: ReleaseAcquisitionE
   const detail = cause.message.replace(/^release endpoint returned /, "").replace(/^release /, "")
   const host = URL.canParse(baseUrl) ? ` from ${new URL(baseUrl).host}` : ""
   const advice = /^HTTP (404|410)$/.test(detail) ? "This release isn't available for download. Update Magnitude, or try again later."
-    : cause.transient ? "Check your internet connection and try again."
+    : cause.transient ? "Check your internet connection."
     : "The release host refused the download. Try again later."
   // The download already retried what was transient; what remains won't change on a restart.
   return installationError("acquire", `Magnitude couldn't download its inference engine (${detail}${host}). ${advice}`, !cause.transient)
@@ -274,6 +274,32 @@ const declareInstallation = (
     return installation
   })
 
+const FIRST_ACQUISITION_RETRY_MILLIS = 5_000
+const LAST_ACQUISITION_RETRY_MILLIS = 120_000
+
+/**
+ * An engine that couldn't be downloaded or unpacked is acquired again in this process, with growing
+ * waits, since the download resumes where it stopped. Only a stop that starting again can't fix ends
+ * startup; restarting the whole service for anything else would only repeat the same attempt sooner.
+ */
+export const retryAcquisition = <A, R>(
+  acquisition: Effect.Effect<A, ReleaseIcnInstallationError, R>
+): Effect.Effect<A, ReleaseIcnInstallationError, R | IcnPreparationReporter> =>
+  Effect.gen(function* () {
+    const reporter = yield* IcnPreparationReporter
+    let delay = FIRST_ACQUISITION_RETRY_MILLIS
+    for (;;) {
+      const result = yield* Effect.either(acquisition)
+      if (Either.isRight(result)) return result.right
+      const error = result.left
+      if (error.stage !== "acquire" || error.permanent) return yield* Effect.fail(error)
+      const retryAtMillis = (yield* Clock.currentTimeMillis) + delay
+      yield* reporter.report({ _tag: "Retrying", message: error.message, retryAtMillis })
+      yield* Effect.sleep(Duration.millis(delay))
+      delay = Math.min(delay * 2, LAST_ACQUISITION_RETRY_MILLIS)
+    }
+  })
+
 export const resolveReleaseIcnInstallation = (
   version: string,
   dataDir: string,
@@ -293,13 +319,13 @@ export const resolveReleaseIcnInstallation = (
     const reporter = yield* IcnPreparationReporter
     const host = currentHost()
     const releaseRoot = path.join(dataDir, "releases")
-    const release = yield* acquireRelease(
+    const release = yield* retryAcquisition(acquireRelease(
       baseUrl,
       version,
       path.join(releaseRoot, "manifests", version)
     ).pipe(
       Effect.mapError(acquisitionError(baseUrl))
-    )
+    ))
     const bundleSizes = yield* releaseBundleSizes(
       release.manifest,
       host,
@@ -317,7 +343,7 @@ export const resolveReleaseIcnInstallation = (
     const artifactRoot = path.join(releaseRoot, "artifacts", version, host)
     const prepare = Effect.suspend(() =>
       Effect.gen(function* () {
-        const root = yield* ensureArtifact(baseUrl, version, artifact, artifactRoot, host)
+        const root = yield* retryAcquisition(ensureArtifact(baseUrl, version, artifact, artifactRoot, host))
         const native = yield* readIdentity(root, artifact)
         return yield* declareInstallation(root, native)
       })

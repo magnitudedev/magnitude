@@ -6,7 +6,7 @@ import { formatLocalModelDisplayName, localModelResidency } from "@magnitudedev/
 import type { ApplicationOwner } from "@magnitudedev/sdk/desktop-host"
 import { Command, CommandExecutor, FetchHttpClient, FileSystem, HttpClient, HttpClientResponse } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
-import { Effect, Option } from "effect"
+import { Clock, Effect, Option } from "effect"
 import { MAC_SERVER_LABEL, MAC_SERVER_PLIST } from "@magnitudedev/daemon-management/desktop-native"
 import { AcnHealthResponseSchema, type AcnHealthResponse } from "@magnitudedev/sdk"
 import { isIP } from "node:net"
@@ -31,7 +31,19 @@ interface ServiceStatusPresentation {
   readonly failing: Option.Option<ServerFailing>
   readonly loaded: Option.Option<boolean>
   readonly elsewhere: Option.Option<Elsewhere>
+  readonly retrying: Option.Option<StartupRetry>
 }
+
+/** A startup step that failed and runs again on its own, as the service reported it when status was read. */
+interface StartupRetry {
+  readonly message: string
+  readonly inSeconds: number
+}
+
+const startupRetry = (health: AcnHealthResponse, now: number): Option.Option<StartupRetry> =>
+  health.state._tag === "Starting"
+    ? Option.map(health.state.retry, retry => ({ message: retry.message, inSeconds: Math.max(0, Math.ceil((retry.retryAtMillis - now) / 1000)) }))
+    : Option.none()
 
 /**
  * A service answering on this profile's port that this account can't observe or control: another
@@ -142,21 +154,22 @@ const ownStatus = desktopApplication.observe.pipe(
       : Effect.succeed(Option.none<ServerReach>())
     const failing = (server: boolean) => server && process.platform === "linux" && state?._tag !== "Ready" ? readServerFailing : Effect.succeed(Option.none<ServerFailing>())
     const loaded = (server: boolean) => server && process.platform === "darwin" && Option.isNone(snapshot) ? readMacServerLoaded : Effect.succeed(Option.none<boolean>())
-    return Effect.all({ model: activeModel, reach, server: isServerSetUp.pipe(Effect.flatMap(server => Effect.all({ server: Effect.succeed(server), failing: failing(server), loaded: loaded(server) }))), login: Option.isSome(snapshot) && snapshot.value.owner._tag === "Desktop" ? readDesktopLoginStartup.pipe(Effect.map(state => state._tag === "Enabled" ? Option.some(true) : state._tag === "Disabled" ? Option.some(false) : Option.none<boolean>()), Effect.orElseSucceed(() => Option.none<boolean>())) : Effect.succeed(Option.none<boolean>()) }, { concurrency: "unbounded" }).pipe(Effect.map(({ model, login, reach, server: { server, failing, loaded } }): ServiceStatusPresentation => ({
+    return Effect.all({ model: activeModel, reach, now: Clock.currentTimeMillis, server: isServerSetUp.pipe(Effect.flatMap(server => Effect.all({ server: Effect.succeed(server), failing: failing(server), loaded: loaded(server) }))), login: Option.isSome(snapshot) && snapshot.value.owner._tag === "Desktop" ? readDesktopLoginStartup.pipe(Effect.map(state => state._tag === "Enabled" ? Option.some(true) : state._tag === "Disabled" ? Option.some(false) : Option.none<boolean>()), Effect.orElseSucceed(() => Option.none<boolean>())) : Effect.succeed(Option.none<boolean>()) }, { concurrency: "unbounded" }).pipe(Effect.map(({ model, login, reach, now, server: { server, failing, loaded } }): ServiceStatusPresentation => ({
       status: state?._tag ?? "Stopped", address: serviceAddress,
       version: state?._tag === "Ready" ? Option.some(String(state.health.version)) : Option.none(),
       startsAutomaticallyOnLogin: login, activeModel: model,
       owner: Option.map(snapshot, value => value.owner), reach, server, failing, loaded, elsewhere: Option.none(),
+      retrying: state?._tag === "Starting" ? Option.flatMap(state.health, health => startupRetry(health, now)) : Option.none(),
     })))
   }),
 )
 
 const publicServiceStatus = ownStatus.pipe(Effect.flatMap(status => Option.isSome(status.owner) ? Effect.succeed(status)
-  : readElsewhere.pipe(Effect.map(Option.match({
+  : Effect.all([readElsewhere, Clock.currentTimeMillis]).pipe(Effect.map(([found, now]) => Option.match(found, {
     onNone: () => status,
     onSome: ({ health, elsewhere }): ServiceStatusPresentation => ({
       ...status, status: health.state._tag, version: Option.some(String(health.version)), failing: Option.none(),
-      elsewhere: Option.some(elsewhere),
+      elsewhere: Option.some(elsewhere), retrying: startupRetry(health, now),
     }),
   })))))
 
@@ -177,6 +190,8 @@ const listeningAddress = (status: ServiceStatusPresentation) => {
 export const renderStatus =(status: ServiceStatusPresentation, platform: NodeJS.Platform = process.platform): string => [
   "Magnitude service",
   `  Runtime         ${status.status}`,
+  ...Option.match(status.retrying, { onNone: () => [], onSome: retry => [
+    `  Retrying        ${retry.message} Trying again ${retry.inSeconds === 0 ? "now" : `in ${retry.inSeconds} s`}.`] }),
   `  Owner           ${ownerName(status)}`,
   ...(Option.isSome(status.owner) && status.owner.value._tag === "Desktop" ? [
     `  Tray            ${status.owner.value.tray._tag === "Unavailable" ? `Unavailable · ${status.owner.value.tray.message}` : status.owner.value.tray._tag}`,

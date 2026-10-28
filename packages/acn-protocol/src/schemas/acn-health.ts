@@ -59,9 +59,20 @@ export const AcnStoppingReasonSchema = Schema.Literal(
 );
 export type AcnStoppingReason = typeof AcnStoppingReasonSchema.Type;
 
+/** A step of startup that failed and runs again at `retryAtMillis`, such as an engine download during an outage. */
+export const AcnStartupRetrySchema = Schema.Struct({
+  message: NonEmptyString,
+  retryAtMillis: NonNegativeSafeInteger,
+});
+export type AcnStartupRetry = typeof AcnStartupRetrySchema.Type;
+
 export class AcnStarting extends Schema.TaggedClass<AcnStarting>()("Starting", {
   activity: AcnStartupActivitySchema,
   progress: Schema.optionalWith(AcnStartupProgressSchema, {
+    as: "Option",
+    exact: true,
+  }),
+  retry: Schema.optionalWith(AcnStartupRetrySchema, {
     as: "Option",
     exact: true,
   }),

@@ -6,7 +6,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { nativeWindowsJobOwnerLayer, nativeWindowsPrivatePipesLayer } from "@magnitudedev/utils/windows-native";
 import { WindowsIcnChildSpawner } from "./windows-child";
-import { Duration, Effect, Layer, Option, Ref, Schema } from "effect";
+import { Clock, Duration, Effect, Layer, Option, Ref, Schema } from "effect";
 import type { LocalModelsConfiguration } from "@magnitudedev/icn-protocol/schemas";
 import { EMPTY_CUSTOM_MODELS_CONFIG, MagnitudeStorage, resolveUsableModelStoreLocation } from "@magnitudedev/storage";
 import {
@@ -265,6 +265,14 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
                     artifactProgress(event.event, current.plan.value)
                   )
                 );
+              }
+              case "Retrying": {
+                const seconds = Math.max(1, Math.round((event.retryAtMillis - (yield* Clock.currentTimeMillis)) / 1000));
+                yield* Effect.logWarning(`${event.message} Retrying in ${seconds} s.`);
+                return yield* lifecycle.reportRetrying({
+                  message: event.message,
+                  retryAtMillis: event.retryAtMillis,
+                });
               }
               case "Starting": {
                 const current = yield* Ref.get(state);

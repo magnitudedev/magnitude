@@ -28,6 +28,7 @@ describe("ACN identity", () => {
             _tag: "Starting",
             activity: "Resolving",
             progress: Option.none(),
+            retry: Option.none(),
           },
           "owner-1",
           1234
@@ -55,6 +56,7 @@ describe("ACN identity", () => {
               unit: "Bytes",
               attempt: Option.some(1),
             }),
+            retry: Option.none(),
           },
           "owner-1",
           1234
