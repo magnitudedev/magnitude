@@ -24,6 +24,7 @@ pub use seismic_lang::checked::{
     NativeParameter, NativeScratch, NativeSpecialization, NativeSpecializationError,
 };
 pub use seismic_lang::precision::{Limit, PrecisionPolicy, SpecialPolicy, Tolerance};
+pub use seismic_native_cpu::repack::ScaledCodeRows;
 /// Numerical comparison helpers used by validation frontends.
 pub mod testing {
     pub use seismic_compiler::numerics::{compare_element, ElementComparison};
@@ -167,6 +168,7 @@ pub mod native_cpu {
 
 pub use seismic_lang::expr::{BigInt, BigUint};
 pub use seismic_lang::ids::StableEntryId;
+pub use seismic_lang::reference_math::conversion::exact_f64;
 pub use seismic_lang::registry::{f16_bits, f16_to_f32, BackendName, Layout, OperandRecipe};
 pub use seismic_lang::types::DType;
 /// The Seismic CPU library every CPU native kernel builds on.
@@ -457,6 +459,28 @@ impl Element {
     pub fn stored(storage: &str, layout: Layout) -> Option<Element> {
         seismic_lang::registry::storage(storage, layout).map(Element)
     }
+    /// The external storage rows of `width` stored values of `encoding`
+    /// are read as, when the registry converts from it.
+    pub fn gguf_source(encoding: magnitude_ggml::Encoding, width: u64) -> Option<Element> {
+        seismic_lang::registry::gguf_source(encoding, width).map(Element)
+    }
+    /// Every external (artifact-format) storage the registry converts from.
+    pub fn external_sources() -> impl Iterator<Item = Element> {
+        seismic_lang::registry::representations()
+            .iter()
+            .filter(|info| {
+                matches!(
+                    info.kind,
+                    seismic_lang::registry::RepresentationKind::External(_)
+                )
+            })
+            .map(|info| Element(info.id))
+    }
+    /// The storage this external source's registered conversion writes in
+    /// `layout` for products taking `operands`; `None` when it has none.
+    pub fn converted(&self, layout: Layout, operands: OperandRecipe) -> Option<Element> {
+        seismic_lang::registry::conversion_destination(self.0, layout, operands).map(Element)
+    }
     /// How products over this element take their activation operands
     /// (`operands(W)`).
     pub fn operand_recipe(&self) -> OperandRecipe {
@@ -538,16 +562,13 @@ impl Element {
             _ => 1,
         }
     }
-    /// Host reference of the registered conversion from `source` into this
-    /// storage over a tensor of `shape`. `None` when no conversion is
-    /// registered or `bytes` is not the source's canonical byte count.
+    /// The host's repack of a tensor of `shape` by the registered
+    /// conversion from `source` into this storage (`cpu::repack::convert`).
+    /// `None` when no conversion is registered or `bytes` is not the
+    /// source's canonical byte count.
     pub fn repack_host(self, source: Element, shape: &[u64], bytes: &[u8]) -> Option<Vec<u8>> {
         let conversion = seismic_lang::registry::representation_conversion(source.0, self.0)?;
-        let shape = shape
-            .iter()
-            .map(|extent| usize::try_from(*extent).ok())
-            .collect::<Option<Vec<_>>>()?;
-        seismic_lang::interp::repack(conversion.id, &shape, bytes)
+        seismic_native_cpu::repack::convert(conversion, shape, bytes)
     }
     /// `bytes`, arbitrary bytes of whole packets of `source`, brought into
     /// the domain of the registered conversion from `source` into this
@@ -556,12 +577,10 @@ impl Element {
     /// conversion is registered or `bytes` is not whole source packets.
     pub fn repack_source(self, source: Element, mut bytes: Vec<u8>) -> Option<Vec<u8>> {
         let conversion = seismic_lang::registry::representation_conversion(source.0, self.0)?;
-        let seismic_lang::registry::RepresentationKind::External(layout) =
-            &seismic_lang::registry::representation_info(source.0).kind
-        else {
-            return None;
-        };
-        if bytes.len() % layout.packet_size as usize != 0 {
+        if !bytes
+            .len()
+            .is_multiple_of(conversion.source_layout.packet_size as usize)
+        {
             return None;
         }
         conversion.admit_source(&mut bytes);
@@ -587,6 +606,20 @@ impl Element {
         }
         .ok()?;
         data.values().ok()
+    }
+    /// Rows of `columns` values stored as `source`, through the registered
+    /// conversion of `source` into this storage, whose values are integer
+    /// codes times one stored scale (`ScaledCodeRows::admit`), placed by
+    /// [`ScaledCodeRows::placement`]. `None` when no conversion is
+    /// registered, this storage's values are not such codes, or the rows
+    /// are not whole packets of `source`.
+    pub fn scaled_code_rows(
+        self,
+        source: Element,
+        columns: std::num::NonZeroU32,
+    ) -> Option<ScaledCodeRows> {
+        let conversion = seismic_lang::registry::representation_conversion(source.0, self.0)?;
+        ScaledCodeRows::admit(conversion, columns)
     }
     fn id(&self) -> RepresentationId {
         self.0
@@ -733,6 +766,24 @@ impl ReadOnlyMappedRegion {
             .map(|inner| Self { inner })
     }
 
+    /// Whether a tensor of `element` and `extents` over a region's bytes
+    /// from `byte_offset` keeps the element's alignment: a region starts at
+    /// a host page, so its bytes are aligned as their offset is.
+    pub fn keeps_alignment(
+        element: Element,
+        extents: &[u64],
+        byte_offset: u64,
+    ) -> Result<bool, TensorError> {
+        seismic_runtime::api::tensor::MappedRegionInner::keeps_alignment(
+            element.id(),
+            extents,
+            byte_offset,
+        )
+    }
+
+    /// A tensor of `element` and `extents` over the region's bytes from
+    /// `byte_offset`, which must keep the element's alignment
+    /// ([`Self::keeps_alignment`]).
     pub fn tensor(
         &self,
         element: Element,

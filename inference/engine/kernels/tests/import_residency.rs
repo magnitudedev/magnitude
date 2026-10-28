@@ -18,455 +18,93 @@ fn dense_bytes(name: &str, values: &[f32]) -> Vec<u8> {
     }
 }
 
-/// GGUF sources and their resident representations.
-const FORMATS: [(&str, &str); 18] = [
-    ("gguf_iq4_nl_block", "iq4g32s"),
-    ("gguf_iq2_xs", "iq2xs"),
-    ("gguf_iq3_xxs", "iq3xxs"),
-    ("gguf_iq2_xxs", "iq2xxs"),
-    ("gguf_q8_0", "q8g32s"),
-    ("gguf_q3_k", "q6k"),
-    ("gguf_q4_k", "q4k"),
-    ("gguf_q5_k", "q5k"),
-    ("gguf_q6_k", "q6k"),
-    ("gguf_iq3_s", "q6k"),
-    ("gguf_iq4_nl", "iq4g32"),
-    ("gguf_iq4_xs", "iq4g32"),
-    ("gguf_q4_0", "q4g32s"),
-    ("gguf_q5_0", "q5g32s"),
-    ("gguf_q5_1", "q5g32"),
-    ("gguf_mxfp4", "mxfp4g32"),
-    ("gguf_nvfp4", "nvfp4g16"),
-    ("gguf_nvfp4", "nvfp4g16a4"),
-];
-
-/// ggml's `dequantize_row_q3_K` for one 110-byte block, in its operation
-/// order: `dl = d * (scale - 32)`, then `dl * q`.
-fn ggml_q3_k(block: &[u8]) -> Vec<f32> {
-    let d = f16_value(u16::from_le_bytes([block[108], block[109]]));
-    let (hmask, qs, packed) = (&block[..32], &block[32..96], &block[96..108]);
-    let mut aux = [0u32; 4];
-    for (word, bytes) in aux.iter_mut().zip(packed.chunks_exact(4)) {
-        *word = u32::from_le_bytes(bytes.try_into().unwrap());
-    }
-    let tmp = aux[2];
-    let (kmask1, kmask2) = (0x0303_0303u32, 0x0f0f_0f0fu32);
-    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
-    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-    aux[0] = (aux[0] & kmask2) | ((tmp & kmask1) << 4);
-    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-    let scales: Vec<i8> = aux
-        .iter()
-        .flat_map(|word| word.to_le_bytes())
-        .map(|byte| byte as i8)
-        .collect();
-    let mut out = Vec::with_capacity(256);
-    let mut scale = 0;
-    for half in 0..2 {
-        let q = &qs[half * 32..];
-        for j in 0..4 {
-            let (shift, mask) = (2 * j, 1u8 << (4 * half + j));
-            for part in 0..2 {
-                let dl = d * f32::from(scales[scale] - 32);
-                scale += 1;
-                for l in 16 * part..16 * part + 16 {
-                    let low = ((q[l] >> shift) & 3) as i8;
-                    let value = low - if hmask[l] & mask != 0 { 0 } else { 4 };
-                    out.push(dl * f32::from(value));
-                }
-            }
-        }
-    }
-    out
+/// Every conversion the registry declares: each GGUF source with each
+/// operand recipe its conversion writes an element for.
+fn conversions() -> Vec<(seismic::Element, seismic::OperandRecipe)> {
+    seismic::Element::external_sources()
+        .flat_map(|source| {
+            seismic::OperandRecipe::ALL
+                .into_iter()
+                .filter(move |operands| source.converted(seismic::Layout::Packet, *operands).is_some())
+                .map(move |operands| (source, operands))
+        })
+        .collect()
 }
 
-/// ggml's `dequantize_row_iq4_nl` for one 18-byte block.
-fn ggml_iq4_nl(block: &[u8]) -> Vec<f32> {
-    const VALUES: [i8; 16] = [
-        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
-    ];
-    let d = f16_value(u16::from_le_bytes([block[0], block[1]]));
-    let qs = &block[2..18];
-    let low = qs
-        .iter()
-        .map(|q| d * f32::from(VALUES[usize::from(q & 15)]));
-    let high = qs
-        .iter()
-        .map(|q| d * f32::from(VALUES[usize::from(q >> 4)]));
-    low.chain(high).collect()
+/// The reference blocks of `tests/support/gguf_vectors/<TYPE>.bin`
+/// (`tests/support/gguf_reference.py vectors`): their bytes and gguf-py's
+/// dequantization of them.
+fn reference_vectors(encoding: magnitude_ggml::Encoding) -> (Vec<u8>, Vec<f32>) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/support/gguf_vectors")
+        .join(format!("{}.bin", encoding.ggml_name()));
+    let file = std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    let blocks = u64::from(u32::from_le_bytes(file[..4].try_into().unwrap()));
+    let bytes = (blocks * encoding.block_bytes()) as usize;
+    let values = file[4 + bytes..]
+        .chunks_exact(4)
+        .map(|value| f32::from_le_bytes(value.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(values.len() as u64, blocks * encoding.block_elements(), "{}", path.display());
+    (file[4..4 + bytes].to_vec(), values)
 }
 
-/// ggml's `ksigns_iq2xs`: seven sign bits and their even-parity eighth.
-fn ggml_ksigns(index: u32) -> u8 {
-    (index | ((index.count_ones() & 1) << 7)) as u8
-}
-
-/// ggml's `dequantize_row_iq2_xs` for one 74-byte block, in its operation
-/// order: `db = d * (0.5 + s) * 0.25`, then `db * grid * sign`.
-fn ggml_iq2_xs(block: &[u8]) -> Vec<f32> {
-    let d = f16_value(u16::from_le_bytes([block[0], block[1]]));
-    let qs = |i: usize| u16::from_le_bytes([block[2 + 2 * i], block[3 + 2 * i]]);
-    let scales = &block[66..74];
-    let mut out = Vec::with_capacity(256);
-    for ib32 in 0..8 {
-        let db = [
-            d * (0.5 + f32::from(scales[ib32] & 0xf)) * 0.25,
-            d * (0.5 + f32::from(scales[ib32] >> 4)) * 0.25,
-        ];
-        for l in 0..4 {
-            let q = qs(4 * ib32 + l);
-            let grid = seismic_lang::grids::IQ2XS_GRID[usize::from(q & 511)].to_le_bytes();
-            let signs = ggml_ksigns(u32::from(q >> 9));
-            for j in 0..8 {
-                let sign = if signs & (1 << j) != 0 { -1.0 } else { 1.0 };
-                out.push(db[l / 2] * f32::from(grid[j]) * sign);
-            }
-        }
-    }
-    out
-}
-
-/// ggml's `dequantize_row_iq3_xxs` for one 98-byte block, in its operation
-/// order: `db = d * (0.5 + s) * 0.5`, then `db * grid * sign`.
-fn ggml_iq3_xxs(block: &[u8]) -> Vec<f32> {
-    let d = f16_value(u16::from_le_bytes([block[0], block[1]]));
-    let mut out = Vec::with_capacity(256);
-    for ib32 in 0..8 {
-        let qs = &block[2 + 8 * ib32..10 + 8 * ib32];
-        let aux = u32::from_le_bytes(block[66 + 4 * ib32..70 + 4 * ib32].try_into().unwrap());
-        let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
-        for l in 0..4 {
-            let signs = ggml_ksigns((aux >> (7 * l)) & 127);
-            let grid1 = seismic_lang::grids::IQ3XXS_GRID[usize::from(qs[2 * l])].to_le_bytes();
-            let grid2 = seismic_lang::grids::IQ3XXS_GRID[usize::from(qs[2 * l + 1])].to_le_bytes();
-            let mut values = [0.0f32; 8];
-            for j in 0..4 {
-                let sign = |bit: usize| if signs & (1 << bit) != 0 { -1.0 } else { 1.0 };
-                values[j] = db * f32::from(grid1[j]) * sign(j);
-                values[j + 4] = db * f32::from(grid2[j]) * sign(j + 4);
-            }
-            out.extend(values);
-        }
-    }
-    out
-}
-
-/// ggml's `dequantize_row_iq2_xxs` for one 66-byte block, in its operation
-/// order: `db = d * (0.5 + s) * 0.25`, then `db * grid * sign`.
-fn ggml_iq2_xxs(block: &[u8]) -> Vec<f32> {
-    let d = f16_value(u16::from_le_bytes([block[0], block[1]]));
-    let mut out = Vec::with_capacity(256);
-    for ib32 in 0..8 {
-        let qs = &block[2 + 8 * ib32..6 + 8 * ib32];
-        let aux = u32::from_le_bytes(block[6 + 8 * ib32..10 + 8 * ib32].try_into().unwrap());
-        let db = d * (0.5 + (aux >> 28) as f32) * 0.25;
-        for l in 0..4 {
-            let grid = seismic_lang::grids::IQ2XXS_GRID[usize::from(qs[l])].to_le_bytes();
-            let signs = ggml_ksigns((aux >> (7 * l)) & 127);
-            for j in 0..8 {
-                let sign = if signs & (1 << j) != 0 { -1.0 } else { 1.0 };
-                out.push(db * f32::from(grid[j]) * sign);
-            }
-        }
-    }
-    out
-}
-
-/// IQ2_XS, IQ3_XXS and IQ2_XXS have representations of their own whose
-/// vector codes are ggml's grid entries: every stored value decodes, in every
-/// layout, to ggml's own dequantization bit for bit, over blocks reaching
-/// every grid point and sign pattern.
+/// Every GGUF source the registry converts from imports, in every layout and
+/// for every operand recipe, to exactly the reference dequantization of its
+/// type's vectors, in rows of 128 values (of one source packet, when
+/// wider).
 #[test]
-fn iq2_xs_iq3_xxs_and_iq2_xxs_import_exactly_as_ggml_dequantizes() {
-    let blocks = 64u64;
-    for (source_name, resident, block_bytes, reference) in [
-        (
-            "gguf_iq2_xs",
-            "iq2xs",
-            74usize,
-            ggml_iq2_xs as fn(&[u8]) -> Vec<f32>,
-        ),
-        ("gguf_iq3_xxs", "iq3xxs", 98, ggml_iq3_xxs),
-        ("gguf_iq2_xxs", "iq2xxs", 66, ggml_iq2_xxs),
-    ] {
-        let mut bytes = source_bytes(blocks * block_bytes as u64, 13);
-        for (index, block) in bytes.chunks_exact_mut(block_bytes).enumerate() {
-            // A finite scale, and the vector codes walking every grid index
-            // and sign pattern across the blocks.
-            block[..2].copy_from_slice(&0x3555u16.to_le_bytes());
-            if source_name == "gguf_iq2_xs" {
-                for slot in 0..32 {
-                    let code = ((index * 32 + slot) as u32).wrapping_mul(40_503) as u16;
-                    block[2 + 2 * slot..4 + 2 * slot].copy_from_slice(&code.to_le_bytes());
-                }
-            } else if source_name == "gguf_iq2_xxs" {
-                // Each sub-block's four grid indices, then its four sign
-                // groups and its scale, walking every index, sign group and
-                // scale across the blocks.
-                for ib32 in 0..8 {
-                    let at = 2 + 8 * ib32;
-                    let mut aux = (((index * 8 + ib32) % 16) as u32) << 28;
-                    for l in 0..4 {
-                        let slot = index * 32 + 4 * ib32 + l;
-                        block[at + l] = slot as u8;
-                        aux |= ((slot as u32 * 5) & 127) << (7 * l);
-                    }
-                    block[at + 4..at + 8].copy_from_slice(&aux.to_le_bytes());
-                }
-            } else {
-                for slot in 0..64 {
-                    block[2 + slot] = (index * 64 + slot) as u8;
-                }
-            }
-        }
-        let expected: Vec<f32> = bytes
-            .chunks_exact(block_bytes)
-            .flat_map(reference)
-            .collect();
-        let source = seismic::Element::named(source_name).unwrap();
-        let shape = [2, blocks / 2 * 256];
+fn every_gguf_source_imports_as_the_reference_dequantizes() {
+    for (source, operands) in conversions() {
+        let width = source.logical_group().unwrap().max(128);
+        let encoding = magnitude_ggml::Encoding::ALL
+            .into_iter()
+            .find(|encoding| seismic::Element::gguf_source(*encoding, width) == Some(source))
+            .unwrap_or_else(|| panic!("{} is no encoding's source", source.name()));
+        let (bytes, reference) = reference_vectors(encoding);
+        let shape = [reference.len() as u64 / width, width];
         for layout in seismic::Layout::ALL {
-            let element = seismic::Element::stored(resident, layout).unwrap();
+            let element = source.converted(layout, operands).unwrap();
             let stored = element.repack_host(source, &shape, &bytes).unwrap();
             let values = element.decode_host(&shape, &stored).unwrap();
             assert_eq!(
-                values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                expected
-                    .iter()
-                    .map(|v| f64::from(*v).to_bits())
-                    .collect::<Vec<_>>(),
-                "{source_name} -> {}",
+                values.iter().map(|value| (*value as f32).to_bits()).collect::<Vec<_>>(),
+                reference.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                "{} -> {}",
+                source.name(),
                 element.name()
             );
         }
     }
 }
 
-fn f16_value(bits: u16) -> f32 {
-    let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
-    let exponent = i32::from((bits >> 10) & 0x1f);
-    let mantissa = f32::from(bits & 0x3ff);
-    assert!(exponent < 31, "reference blocks use finite scales");
-    if exponent == 0 {
-        sign * mantissa * 2f32.powi(-24)
-    } else {
-        sign * (1.0 + mantissa / 1024.0) * 2f32.powi(exponent - 15)
-    }
-}
-
-/// Q3_K and IQ4_NL have no resident representation of their own: they import
-/// into q6k and iq4g32. That is exact only if every stored value decodes to
-/// ggml's own dequantization bit for bit, in every layout, including the
-/// extremes (scale -32 with q = -4 is +128 d, outside int8, and each
-/// sixteen-value sub-block keeps its own scale).
-#[test]
-fn q3_k_and_iq4_nl_import_exactly_as_ggml_dequantizes() {
-    let rows = 3u64;
-    let k = 512u64;
-    // Q3_K: pseudo-random blocks plus one block of every extreme: all
-    // scales 0 (s - 32 = -32) with every q = -4 (low 0, high clear), and
-    // all scales 63 with q = 3.
-    let mut q3 = source_bytes(rows * (k / 256) * 110, 7);
-    for block in q3.chunks_exact_mut(110) {
-        block[108..110].copy_from_slice(&0x3555u16.to_le_bytes());
-    }
-    q3[..108].fill(0);
-    q3[110..142].fill(0xff);
-    q3[142..206].fill(0xff);
-    q3[206..218].fill(0xff);
-    let q3_reference: Vec<f32> = q3.chunks_exact(110).flat_map(ggml_q3_k).collect();
-    assert!(
-        q3_reference[..256]
-            .iter()
-            .all(|v| *v == 128.0 * f16_value(0x3555))
-    );
-    assert!(
-        q3_reference[256..512]
-            .iter()
-            .all(|v| *v == 93.0 * f16_value(0x3555))
-    );
-    // IQ4_NL: eight blocks per packet, each block with its own finite scale.
-    let mut nl = source_bytes(rows * (k / 32) * 18, 11);
-    for block in nl.chunks_exact_mut(18) {
-        block[1] &= 0xbb;
-    }
-    let nl_reference: Vec<f32> = nl.chunks_exact(18).flat_map(ggml_iq4_nl).collect();
-    for (source_name, resident, bytes, reference) in [
-        ("gguf_q3_k", "q6k", &q3, &q3_reference),
-        ("gguf_iq4_nl", "iq4g32", &nl, &nl_reference),
-    ] {
-        let source = seismic::Element::named(source_name).unwrap();
-        let shape = [rows, k];
-        assert_eq!(
-            source.canonical_byte_len(&shape).unwrap(),
-            bytes.len() as u64
-        );
-        for layout in seismic::Layout::ALL {
-            let element = seismic::Element::stored(resident, layout).unwrap();
-            let stored = element.repack_host(source, &shape, bytes).unwrap();
-            let values = element.decode_host(&shape, &stored).unwrap();
-            assert_eq!(
-                values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                reference
-                    .iter()
-                    .map(|v| f64::from(*v).to_bits())
-                    .collect::<Vec<_>>(),
-                "{source_name} -> {}",
-                element.name()
-            );
-        }
-    }
-}
-
-/// IQ4_NL rows whose width is not a multiple of 256 (a 640-wide expert down)
-/// import as single blocks into iq4g32s and decode, in every layout, to
-/// exactly ggml's `dequantize_row_iq4_nl`, block scales included.
-#[test]
-fn iq4_nl_blocks_of_640_wide_rows_import_exactly_as_ggml_dequantizes() {
-    let (rows, k) = (3u64, 640u64);
-    let mut bytes = source_bytes(rows * (k / 32) * 18, 17);
-    for block in bytes.chunks_exact_mut(18) {
-        // A finite f16 scale.
-        block[1] &= 0xbb;
-    }
-    let reference: Vec<f32> = bytes.chunks_exact(18).flat_map(ggml_iq4_nl).collect();
-    let source = seismic::Element::named("gguf_iq4_nl_block").unwrap();
-    let shape = [rows, k];
-    assert_eq!(source.canonical_byte_len(&shape).unwrap(), bytes.len() as u64);
-    for layout in seismic::Layout::ALL {
-        let element = seismic::Element::stored("iq4g32s", layout).unwrap();
-        let stored = element.repack_host(source, &shape, &bytes).unwrap();
-        let values = element.decode_host(&shape, &stored).unwrap();
-        assert_eq!(
-            values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            reference
-                .iter()
-                .map(|v| f64::from(*v).to_bits())
-                .collect::<Vec<_>>(),
-            "gguf_iq4_nl_block -> {}",
-            element.name()
-        );
-    }
-}
-
-/// The formats imported into another format's representation decode, in
-/// every layout, to exactly the values ggml's reference dequantization (gguf-py
-/// `quants.dequantize`) produces for 64 pseudo-random blocks, whose f16 scale
-/// is set to 0x3555: an FNV-1a digest of those values' f32 bits. The IQ3_S
-/// blocks reach every grid point and sign. Regenerate a digest with gguf-py
-/// over `golden_bytes(blocks * block_bytes, 12345)`.
-#[test]
-fn exact_imports_match_the_gguf_reference_dequantization() {
-    for (source_name, resident, block_bytes, block_values, scale_offset, digest) in [
-        ("gguf_q3_k", "q6k", 110, 256, 108, 0x8a3b_79aa_c79e_9c25u64),
-        ("gguf_iq3_s", "q6k", 110, 256, 0, 0x35ce_a941_f3e6_18c5),
-        ("gguf_iq4_nl", "iq4g32", 18, 32, 0, 0xf925_723c_01ab_1e25),
-    ] {
-        let blocks = 64u64;
-        let mut bytes = golden_bytes(blocks * block_bytes, 12345);
-        for block in bytes.chunks_exact_mut(block_bytes as usize) {
-            block[scale_offset..scale_offset + 2].copy_from_slice(&0x3555u16.to_le_bytes());
-        }
-        let source = seismic::Element::named(source_name).unwrap();
-        let shape = [1, blocks * block_values];
-        for layout in seismic::Layout::ALL {
-            let element = seismic::Element::stored(resident, layout).unwrap();
-            let stored = element.repack_host(source, &shape, &bytes).unwrap();
-            let values = element.decode_host(&shape, &stored).unwrap();
-            let actual = values.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, value| {
-                (hash ^ u64::from((*value as f32).to_bits())).wrapping_mul(0x0100_0000_01b3)
-            });
-            assert_eq!(actual, digest, "{source_name} -> {}", element.name());
-        }
-    }
-}
-
-/// The formats with a representation of their own (Q4_0, Q5_0, Q5_1, MXFP4,
-/// NVFP4) decode, in every layout, to exactly llama.cpp's reference
-/// dequantization (`dequantize_row_*` of ggml-quants.c at 18443257a30c) of 64
-/// blocks of `golden_bytes(.., 12345)` whose scale fields are made finite: the
-/// FNV-1a digests `tests/support/gguf_codec_reference.py --digests` prints (gguf-py
-/// `quants.dequantize` gives the same values). Q5_1's `x0 * d + m` is rounded
-/// once, as C compilers contract it.
-#[test]
-fn own_representation_imports_match_llama_cpp_dequantization() {
-    for (source_name, resident, block_bytes, block_values, digest) in [
-        (
-            "gguf_q4_0",
-            "q4g32s",
-            18usize,
-            32u64,
-            0xb5c2_5214_8b2d_eb25u64,
-        ),
-        ("gguf_q5_0", "q5g32s", 22, 32, 0x1fe5_1e4c_22ed_9325),
-        ("gguf_q5_1", "q5g32", 24, 32, 0x63c4_5260_7d3e_19d9),
-        ("gguf_mxfp4", "mxfp4g32", 17, 32, 0xd827_1dd4_f8ce_c325),
-        ("gguf_nvfp4", "nvfp4g16", 36, 64, 0xa417_0901_6b8f_6325),
-        // W4A4's element: the same storage, so the same bytes.
-        ("gguf_nvfp4", "nvfp4g16a4", 36, 64, 0xa417_0901_6b8f_6325),
-    ] {
-        let blocks = 64u64;
-        let mut bytes = golden_bytes(blocks * block_bytes as u64, 12345);
-        for block in bytes.chunks_exact_mut(block_bytes) {
-            // Finite scales: f16 exponents below 31, no E8M0 or UE4M3 NaN code.
-            match source_name {
-                "gguf_q4_0" | "gguf_q5_0" => block[1] &= 0xbf,
-                "gguf_q5_1" => {
-                    block[1] &= 0xbf;
-                    block[3] &= 0xbf;
-                }
-                "gguf_mxfp4" if block[0] == 0xff => block[0] = 0xfe,
-                "gguf_nvfp4" => {
-                    for scale in &mut block[..4] {
-                        if *scale & 0x7f == 0x7f {
-                            *scale -= 1;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        let source = seismic::Element::named(source_name).unwrap();
-        let shape = [1, blocks * block_values];
-        for layout in seismic::Layout::ALL {
-            let element = seismic::Element::stored(resident, layout).unwrap();
-            let stored = element.repack_host(source, &shape, &bytes).unwrap();
-            let values = element.decode_host(&shape, &stored).unwrap();
-            let actual = values.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, value| {
-                (hash ^ u64::from((*value as f32).to_bits())).wrapping_mul(0x0100_0000_01b3)
-            });
-            assert_eq!(actual, digest, "{source_name} -> {}", element.name());
-        }
-    }
-}
-
-/// Real tensors of released GGUF files (Gemma Q4_0, Nemotron Q5_0 / Q5_1 /
-/// MXFP4 / NVFP4) import, in every layout, to exactly the reference
-/// dequantization of their blocks. The dump comes from
-/// `tests/support/gguf_codec_reference.py --gguf <file> --dump <dir>`, named by
+/// Real tensors of released GGUF files import, in every layout, to exactly
+/// the reference dequantization of their blocks. The dump comes from
+/// `tests/support/gguf_reference.py dump <file> <dir>`, named by
 /// `CODEC_REAL_DIR`.
 #[test]
-#[ignore = "needs CODEC_REAL_DIR, a real-tensor dump of tests/support/gguf_codec_reference.py"]
+#[ignore = "needs CODEC_REAL_DIR, a real-tensor dump of tests/support/gguf_reference.py"]
 fn real_gguf_tensors_import_as_the_reference_dequantizes() {
     let directory =
         std::path::PathBuf::from(std::env::var("CODEC_REAL_DIR").expect("CODEC_REAL_DIR"));
     let index = std::fs::read_to_string(directory.join("index.tsv")).unwrap();
     for line in index.lines() {
         let fields = line.split('\t').collect::<Vec<_>>();
-        let [source_name, rows, k, stem] = fields.as_slice() else {
+        let [type_name, rows, k, stem] = fields.as_slice() else {
             panic!("index line `{line}`")
         };
         let shape = [rows.parse::<u64>().unwrap(), k.parse::<u64>().unwrap()];
         let blocks = std::fs::read(directory.join(format!("{stem}.blocks"))).unwrap();
         let reference = std::fs::read(directory.join(format!("{stem}.values"))).unwrap();
-        let source = seismic::Element::named(source_name).unwrap();
-        let resident = FORMATS
-            .iter()
-            .find(|(name, _)| name == source_name)
-            .unwrap()
-            .1;
+        let encoding = magnitude_ggml::Encoding::ALL
+            .into_iter()
+            .find(|encoding| encoding.ggml_name() == *type_name)
+            .unwrap_or_else(|| panic!("type `{type_name}`"));
+        let source = seismic::Element::gguf_source(encoding, shape[1]).unwrap();
         for layout in seismic::Layout::ALL {
-            let element = seismic::Element::stored(resident, layout).unwrap();
+            let element = source
+                .converted(layout, seismic::OperandRecipe::Rounded)
+                .unwrap();
             let stored = element.repack_host(source, &shape, &blocks).unwrap();
             let values = element.decode_host(&shape, &stored).unwrap();
             let mismatches = values
@@ -481,14 +119,6 @@ fn real_gguf_tensors_import_as_the_reference_dequantizes() {
         }
         println!("{stem}: {shape:?} exact in every layout");
     }
-}
-
-/// Every byte of a full range: byte `i` is the top byte of
-/// `(i * 2654435761 + seed) mod 2^32`.
-fn golden_bytes(length: u64, seed: u32) -> Vec<u8> {
-    (0..length as u32)
-        .map(|index| (index.wrapping_mul(2_654_435_761).wrapping_add(seed) >> 24) as u8)
-        .collect()
 }
 
 /// Deterministic source bytes whose f16 factors are finite (so every decoded
@@ -578,6 +208,7 @@ fn metal_repack_matches_the_registered_conversion_for_every_format_and_layout() 
     repack_matches_the_registered_conversion(
         &device(seismic::BackendName::Metal).unwrap(),
         &[
+            seismic::Layout::Packet,
             seismic::Layout::Rows16,
             seismic::Layout::Mma16,
             seismic::Layout::Rows32,
@@ -586,12 +217,110 @@ fn metal_repack_matches_the_registered_conversion_for_every_format_and_layout() 
     );
 }
 
+/// The Metal repack's time and source read rate over a 4096 x 4096 tensor
+/// of every GGUF source, into its packet form and the Metal resident
+/// layout (`repack_timing`).
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "timing"]
+fn metal_repack_timing() {
+    repack_timing(
+        &device(seismic::BackendName::Metal).unwrap(),
+        &[seismic::Layout::Packet, seismic::Layout::Rows32],
+    );
+}
+
+/// The Vulkan repack's time and source read rate over a 4096 x 4096 tensor
+/// of every GGUF source, into the Vulkan resident layout (`repack_timing`).
+#[test]
+#[ignore = "timing"]
+fn vulkan_repack_timing() {
+    if let Some(device) = device(seismic::BackendName::Vulkan) {
+        repack_timing(&device, &[seismic::Layout::Rows16]);
+    }
+}
+
+/// The CUDA repack's time and source read rate over a 4096 x 4096 tensor
+/// of every GGUF source, into its packet form and both CUDA resident
+/// layouts (`repack_timing`).
+#[test]
+#[ignore = "timing"]
+fn cuda_repack_timing() {
+    if let Some(device) = device(seismic::BackendName::Cuda) {
+        repack_timing(
+            &device,
+            &[
+                seismic::Layout::Packet,
+                seismic::Layout::Rows16,
+                seismic::Layout::Mma16,
+            ],
+        );
+    }
+}
+
+/// The repack's time and source read rate on `device` over a 4096 x 4096
+/// tensor of every GGUF source, into each of `layouts`: the best of eleven
+/// batches of 20 repacks.
+fn repack_timing(device: &seismic::Device, layouts: &[seismic::Layout]) {
+    let shape = [1, 4096, 4096];
+    for (source_element, operands) in conversions() {
+        let length = source_element.canonical_byte_len(&shape).unwrap();
+        let source =
+            seismic::Tensor::from_host(device, source_element, &shape, &source_bytes(length, 7))
+                .unwrap();
+        for &layout in layouts {
+            let destination = source_element.converted(layout, operands).unwrap();
+            let kernel = repack_weight::native_for_device_with(
+                device,
+                repack_weight::Elements {
+                    E: source_element,
+                    U: destination,
+                },
+                &seismic::NativeSpecialization::new(),
+            )
+            .unwrap();
+            let mut result = seismic::Tensor::zeros(device, destination, &shape).unwrap();
+            const CALLS: u32 = 20;
+            let best = (0..12)
+                .map(|_| {
+                    let mut batch = seismic::NativeTensorBatch::new(device);
+                    for _ in 0..CALLS {
+                        batch
+                            .push(
+                                &kernel,
+                                repack_weight::Args { source: &source },
+                                repack_weight::OutputArgs { value: &mut result },
+                            )
+                            .unwrap();
+                    }
+                    let started = std::time::Instant::now();
+                    batch.submit().unwrap().wait().unwrap();
+                    started.elapsed() / CALLS
+                })
+                .skip(1)
+                .min()
+                .unwrap();
+            println!(
+                "{:>18} -> {:<16} {:>8.1} us {:>7.1} GB/s",
+                source_element.name(),
+                destination.name(),
+                best.as_secs_f64() * 1e6,
+                length as f64 / best.as_secs_f64() / 1e9
+            );
+        }
+    }
+}
+
 #[test]
 fn cuda_repack_matches_the_registered_conversion_for_every_format_and_layout() {
     if let Some(device) = device(seismic::BackendName::Cuda) {
         repack_matches_the_registered_conversion(
             &device,
-            &[seismic::Layout::Rows16, seismic::Layout::Mma16],
+            &[
+                seismic::Layout::Packet,
+                seismic::Layout::Rows16,
+                seismic::Layout::Mma16,
+            ],
             true,
         );
     }
@@ -682,15 +411,15 @@ fn repack_matches_the_registered_conversion(
     records: bool,
 ) {
     let device = device.clone();
-    for (source_name, resident) in FORMATS {
-        let source_element = seismic::Element::named(source_name).unwrap();
+    for (source_element, operands) in conversions() {
+        let source_name = source_element.name();
         let group = source_element.logical_group().unwrap();
         for shape in [[1, 17, 3 * group], [3, 5, 2 * group - 8], [2, 16, group]] {
             let length = source_element.canonical_byte_len(&shape).unwrap();
             let bytes = source_bytes(length, shape[1] as u32);
             let source =
                 seismic::Tensor::from_host(&device, source_element, &shape, &bytes).unwrap();
-            let packet = seismic::Element::stored(resident, seismic::Layout::Packet).unwrap();
+            let packet = source_element.converted(seismic::Layout::Packet, operands).unwrap();
             let expected_values = packet
                 .decode_host(
                     &shape,
@@ -698,7 +427,7 @@ fn repack_matches_the_registered_conversion(
                 )
                 .unwrap();
             for &layout in layouts {
-                let destination = seismic::Element::stored(resident, layout).unwrap();
+                let destination = source_element.converted(layout, operands).unwrap();
                 if !records && has_records(destination) {
                     continue;
                 }

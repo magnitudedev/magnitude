@@ -598,7 +598,7 @@ impl Shared {
     /// The slot row of the row `stored` as stored (`row_conversion`).
     fn convert(&self, stored: &[u8], slot: &mut [u8]) {
         let width = self.width;
-        let packets = width.div_ceil(self.conversion.group as u64);
+        let packets = width.div_ceil(self.conversion.group() as u64);
         // SAFETY: `stored` is a read range of `row_bytes`, one row of
         // `width` values as stored, and `slot` a buffer of `slot_bytes`, one
         // resident row: each a one-row tensor.
@@ -607,13 +607,13 @@ impl Shared {
                 stored.as_ptr(),
                 &[1, width],
                 &[packets, 1],
-                self.conversion.source,
+                self.conversion.source(),
             );
             let to = Packed::from_tensor(
                 slot.as_mut_ptr(),
                 &[1, width],
                 &[1, 1],
-                self.conversion.target,
+                self.conversion.target(),
             );
             seismic::cpu::repack::rows(&from, &to, 0..1);
         }

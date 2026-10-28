@@ -14,8 +14,8 @@ use seismic_ir::physical_target::{
 use seismic_ir::storage::LaunchLocalKind;
 use seismic_lang::intrinsics::{AtomicOp, MathOp, ReduceOp};
 use seismic_lang::registry::{
-    CodeInterpretation, DecodeStep, FloatCodeFormat, GRID_SIGN_BITS, GridCodes, PlaneEncoding,
-    PlaneInfo, PlaneRepackRecipe, RepackExpr,
+    CodeInterpretation, DecodeStep, FloatCodeFormat, GridCodes, LookupTable, PlaneEncoding,
+    PlaneInfo, PlaneRepackRecipe, RepackExpr, GRID_SIGN_BITS,
 };
 use seismic_lang::types::DType;
 use seismic_native_target::{DeviceDescription, NativeCompilationError};
@@ -77,15 +77,18 @@ fn repack_expression_nodes(expression: &RepackExpr) -> u64 {
         | RepackExpr::F16ToF32(value)
         | RepackExpr::I32ToF32(value)
         | RepackExpr::ScaleF32 { value, .. } => 1 + repack_expression_nodes(value),
-        RepackExpr::BitOr(left, right) | RepackExpr::MultiplyF32(left, right) => {
-            1 + repack_expression_nodes(left) + repack_expression_nodes(right)
-        }
+        RepackExpr::BitOr(left, right)
+        | RepackExpr::MultiplyF32(left, right)
+        | RepackExpr::NegateIf {
+            value: left,
+            sign: right,
+        } => 1 + repack_expression_nodes(left) + repack_expression_nodes(right),
         RepackExpr::Lookup { index, .. } => 1 + repack_expression_nodes(index),
     }
 }
 
 /// Every lookup table `expression` reads, in first-use order.
-fn repack_lookup_tables(expression: &RepackExpr, tables: &mut Vec<&'static [i32]>) {
+fn repack_lookup_tables(expression: &RepackExpr, tables: &mut Vec<LookupTable>) {
     match expression {
         RepackExpr::SourceBits { .. } => {}
         RepackExpr::ShiftLeft { value, .. }
@@ -93,13 +96,19 @@ fn repack_lookup_tables(expression: &RepackExpr, tables: &mut Vec<&'static [i32]
         | RepackExpr::F16ToF32(value)
         | RepackExpr::I32ToF32(value)
         | RepackExpr::ScaleF32 { value, .. } => repack_lookup_tables(value, tables),
-        RepackExpr::BitOr(left, right) | RepackExpr::MultiplyF32(left, right) => {
+        RepackExpr::BitOr(left, right)
+        | RepackExpr::MultiplyF32(left, right)
+        | RepackExpr::NegateIf {
+            value: left,
+            sign: right,
+        } => {
             repack_lookup_tables(left, tables);
             repack_lookup_tables(right, tables);
         }
         RepackExpr::Lookup { index, table } => {
             repack_lookup_tables(index, tables);
-            if !tables.iter().any(|known| std::ptr::eq(*known, *table)) {
+            let table = LookupTable::Repack(*table);
+            if !tables.contains(&table) {
                 tables.push(table);
             }
         }
@@ -136,7 +145,7 @@ struct Emitter<'a> {
     temp_bound: u64,
     uses_nvfp4: bool,
     /// Module-scope constant tables the kernel's conversions look up.
-    lookup_tables: Vec<&'static [i32]>,
+    lookup_tables: Vec<LookupTable>,
 }
 
 impl<'a> Emitter<'a> {
@@ -247,16 +256,12 @@ impl<'a> Emitter<'a> {
                             .flat_map(|recipe| recipe.steps().to_vec())
                             .filter_map(|step| match step {
                                 DecodeStep::InterpretGridCode { grid, .. } => {
-                                    Some(grid.magnitudes())
+                                    Some(LookupTable::Grid(grid))
                                 }
                                 _ => None,
                             });
                     for table in grids {
-                        if !self
-                            .lookup_tables
-                            .iter()
-                            .any(|known| std::ptr::eq(*known, table))
-                        {
+                        if !self.lookup_tables.contains(&table) {
                             self.lookup_tables.push(table);
                         }
                     }
@@ -279,6 +284,7 @@ impl<'a> Emitter<'a> {
         }
         self.raw(".extern .shared .align 16 .b8 seismic_shared[];");
         for (index, table) in self.lookup_tables.clone().into_iter().enumerate() {
+            let table = table.values();
             let values = table
                 .iter()
                 .map(i32::to_string)
@@ -1943,7 +1949,7 @@ impl<'a> Emitter<'a> {
                 let ordinal = self
                     .lookup_tables
                     .iter()
-                    .position(|known| std::ptr::eq(*known, *table))
+                    .position(|known| *known == LookupTable::Repack(*table))
                     .expect("every lookup table is collected before emission");
                 let base = self.t64();
                 self.line(format!("mov.u64 {base}, seismic_lookup{ordinal};"));
@@ -1951,6 +1957,23 @@ impl<'a> Emitter<'a> {
                 self.line(format!("mad.wide.u32 {address}, {index}, 4, {base};"));
                 let output = self.t32();
                 self.line(format!("ld.const.s32 {output}, [{address}];"));
+                RepackValue::Integer(output)
+            }
+            RepackExpr::NegateIf { value, sign } => {
+                let RepackValue::Integer(value) = self.repack_expression(source_packet, value)
+                else {
+                    panic!("closed CUDA repack negates a floating value")
+                };
+                let RepackValue::Integer(sign) = self.repack_expression(source_packet, sign) else {
+                    panic!("closed CUDA repack negates by a floating sign")
+                };
+                // `(value ^ -sign) + sign`: `-value` where `sign` is 1.
+                let mask = self.t32();
+                self.line(format!("neg.s32 {mask}, {sign};"));
+                let flipped = self.t32();
+                self.line(format!("xor.b32 {flipped}, {value}, {mask};"));
+                let output = self.t32();
+                self.line(format!("add.s32 {output}, {flipped}, {sign};"));
                 RepackValue::Integer(output)
             }
         }
@@ -2083,7 +2106,9 @@ impl<'a> Emitter<'a> {
             CodeInterpretation::Offset(offset) => {
                 self.line(format!("add.s32 {out}, {raw}, {};", -*offset))
             }
-            CodeInterpretation::Table(table) => {
+            CodeInterpretation::Odd => self.line(format!("mad.lo.u32 {out}, {raw}, 2, 1;")),
+            CodeInterpretation::Table(codebook) => {
+                let table = codebook.values;
                 self.line(format!("mov.s32 {out}, {};", table[0]));
                 for (index, value) in table.iter().copied().enumerate().skip(1) {
                     let p = self.pred();
@@ -2112,30 +2137,29 @@ impl<'a> Emitter<'a> {
     }
 
     fn grid_code(&mut self, raw: &str, lane: &str, grid: &'static GridCodes) -> String {
-        let table = grid.magnitudes();
         let ordinal = self
             .lookup_tables
             .iter()
-            .position(|known| std::ptr::eq(*known, table))
+            .position(|known| *known == LookupTable::Grid(grid))
             .expect("every grid table is collected before emission");
         let shift = self.t32();
         self.line(format!(
             "shr.b32 {shift}, {lane}, {};",
-            grid.lanes.trailing_zeros()
+            grid.lanes().trailing_zeros()
         ));
-        self.line(format!("mul.lo.u32 {shift}, {shift}, {};", grid.index_bits));
+        self.line(format!("mul.lo.u32 {shift}, {shift}, {};", grid.index_bits()));
         let index = self.t32();
         self.line(format!("shr.b32 {index}, {raw}, {shift};"));
         self.line(format!(
             "and.b32 {index}, {index}, {};",
-            (1u32 << grid.index_bits) - 1
+            (1u32 << grid.index_bits()) - 1
         ));
         let sub = self.t32();
-        self.line(format!("and.b32 {sub}, {lane}, {};", grid.lanes - 1));
+        self.line(format!("and.b32 {sub}, {lane}, {};", grid.lanes() - 1));
         let slot = self.t32();
         self.line(format!(
             "mad.lo.u32 {slot}, {index}, {}, {sub};",
-            grid.lanes
+            grid.lanes()
         ));
         let base = self.t64();
         self.line(format!("mov.u64 {base}, seismic_lookup{ordinal};"));
@@ -2146,7 +2170,7 @@ impl<'a> Emitter<'a> {
         let signs = self.t32();
         self.line(format!(
             "shr.b32 {signs}, {raw}, {};",
-            grid.indices() * grid.index_bits
+            grid.indices() * grid.index_bits()
         ));
         self.line(format!(
             "and.b32 {signs}, {signs}, {};",

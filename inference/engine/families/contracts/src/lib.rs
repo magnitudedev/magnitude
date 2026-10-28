@@ -101,6 +101,15 @@ impl WeightDescriptor {
         }
     }
 
+    /// The progressive plane and code depth the descriptor places: its
+    /// sole transform's, if that is `ImportTransform::Progressive`.
+    pub fn progressive(&self) -> Option<(ProgressivePlane, ProgressiveCodeDepth)> {
+        match self.transforms[..] {
+            [ImportTransform::Progressive { plane, depth }] => Some((plane, depth)),
+            _ => None,
+        }
+    }
+
     /// The logical shape `transforms` make of a stored tensor of `stored`
     /// shape.
     pub fn transformed_shape(&self, stored: &[u64]) -> Result<Vec<u64>, DefinitionError> {
@@ -165,17 +174,18 @@ impl WeightDescriptor {
                     }
                 }
                 ImportTransform::Progressive { plane, depth } => {
-                    let [rows, columns] = shape[..] else {
-                        return Err(DefinitionError::new(format!(
-                            "{:?} is not a matrix of whole 32-value groups",
-                            self.name
-                        )));
+                    let whole = || {
+                        DefinitionError::new(format!(
+                            "{:?} is not a matrix of whole {}-value groups",
+                            self.name,
+                            ProgressivePlane::GROUP
+                        ))
                     };
-                    if !columns.is_multiple_of(32) {
-                        return Err(DefinitionError::new(format!(
-                            "{:?} is not a matrix of whole 32-value groups",
-                            self.name
-                        )));
+                    let [rows, columns] = shape[..] else {
+                        return Err(whole());
+                    };
+                    if !columns.is_multiple_of(ProgressivePlane::GROUP) {
+                        return Err(whole());
                     }
                     shape = plane.shape(rows, columns, *depth);
                 }
@@ -248,6 +258,11 @@ impl ProgressiveCodeDepth {
     pub const fn coarse_bits(self) -> u8 {
         self.bits() / 2
     }
+    /// The bit planes of `ProgressivePlane::Rest`: the bits below the coarse
+    /// ones and the next.
+    pub const fn rest_planes(self) -> u8 {
+        self.bits() - self.coarse_bits() - 1
+    }
 }
 
 /// The activations a second-level-scaled (NVFP4) weight's products take, as
@@ -291,16 +306,17 @@ impl ProgressivePlane {
         Self::Radius,
     ];
 
+    /// Values per group: the planes hold one scale, and one word of each bit
+    /// plane, per group.
+    pub const GROUP: u64 = 32;
+
     /// The plane's shape for a `[rows, columns]` matrix.
     pub fn shape(self, rows: u64, columns: u64, depth: ProgressiveCodeDepth) -> Vec<u64> {
+        let groups = columns / Self::GROUP;
         match self {
-            Self::Top => vec![rows, columns / 32, u64::from(depth.coarse_bits())],
-            Self::Next | Self::Scales => vec![rows, columns / 32],
-            Self::Rest => vec![
-                rows,
-                columns / 32,
-                u64::from(depth.bits() - depth.coarse_bits() - 1),
-            ],
+            Self::Top => vec![rows, groups, u64::from(depth.coarse_bits())],
+            Self::Next | Self::Scales => vec![rows, groups],
+            Self::Rest => vec![rows, groups, u64::from(depth.rest_planes())],
             Self::Radius => vec![rows, 2],
         }
     }

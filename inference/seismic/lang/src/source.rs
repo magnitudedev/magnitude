@@ -33,7 +33,7 @@ pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
         include_str!("../native-library/metal/packets.h"),
     ),
     ("slab.h", include_str!("../native-library/metal/slab.h")),
-    ("grids.h", include_str!("../native-library/metal/grids.h")),
+    ("tables.h", include_str!(concat!(env!("OUT_DIR"), "/tables.h"))),
     (
         "element.cuh",
         include_str!("../native-library/cuda/element.cuh"),
@@ -44,8 +44,8 @@ pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
     ),
     ("slab.cuh", include_str!("../native-library/cuda/slab.cuh")),
     (
-        "grids.cuh",
-        include_str!("../native-library/cuda/grids.cuh"),
+        "tables.cuh",
+        include_str!(concat!(env!("OUT_DIR"), "/tables.cuh")),
     ),
     (
         "rows16.cuh",
@@ -64,8 +64,8 @@ pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
         include_str!("../native-library/vulkan/slab.glsl"),
     ),
     (
-        "grids.glsl",
-        include_str!("../native-library/vulkan/grids.glsl"),
+        "tables.glsl",
+        include_str!(concat!(env!("OUT_DIR"), "/tables.glsl")),
     ),
 ];
 
@@ -597,33 +597,6 @@ mod tests {
         root.canonicalize().expect("canonical fixture")
     }
 
-    /// Every backend's grid tables are the registry's points: an IQ2_XS or
-    /// IQ2_XXS point as its (low, high) words, an IQ3_XXS point as one word.
-    #[test]
-    fn native_grids_are_the_registrys() {
-        let words = |points: &'static [u64]| {
-            points
-                .iter()
-                .flat_map(|point| [*point & 0xffff_ffff, *point >> 32])
-        };
-        let expected = words(&crate::grids::IQ2XS_GRID)
-            .chain(crate::grids::IQ3XXS_GRID.iter().copied())
-            .chain(words(&crate::grids::IQ2XXS_GRID))
-            .collect::<Vec<_>>();
-        for name in ["grids.h", "grids.cuh", "grids.glsl"] {
-            let (_, text) = NATIVE_LIBRARY
-                .iter()
-                .find(|(library, _)| *library == name)
-                .expect("a grids header per backend");
-            let words = text
-                .split(|c: char| !c.is_ascii_alphanumeric())
-                .filter_map(|token| token.strip_prefix("0x"))
-                .map(|digits| u64::from_str_radix(digits.trim_end_matches('u'), 16).unwrap())
-                .collect::<Vec<_>>();
-            assert_eq!(words, expected, "{name}");
-        }
-    }
-
     fn asset(root: &Path, text: &str) -> NativeAssetFile {
         let path = root.join("metal/kernel.metal");
         std::fs::write(&path, text).expect("asset");
@@ -735,7 +708,7 @@ mod tests {
             "#include <seismic/element.h>\nLIB\n",
         )
         .unwrap();
-        // packets.h includes element.h and grids.h itself; each library file
+        // packets.h includes element.h and tables.h itself; each library file
         // is inlined once.
         let asset = asset(
             &root,
@@ -746,7 +719,7 @@ mod tests {
             includes,
             library,
         } = expand_includes(&asset, "h", &[root.clone()]).unwrap();
-        assert_eq!(library, ["packets.h", "element.h", "grids.h"]);
+        assert_eq!(library, ["packets.h", "element.h", "tables.h"]);
         assert_eq!(
             includes.len(),
             1,

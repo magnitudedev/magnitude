@@ -2240,6 +2240,7 @@ version = "0.1.0"
 dependencies = [
  "image",
  "libc",
+ "magnitude-ggml",
  "serde",
  "sha2 0.11.0",
 ]
@@ -2474,6 +2475,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnitude-ggml"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "magnitude-grammar"
 version = "0.1.0"
 dependencies = [
@@ -2519,6 +2527,7 @@ dependencies = [
 name = "magnitude-kernels"
 version = "0.1.0"
 dependencies = [
+ "magnitude-ggml",
  "seismic",
  "seismic-build",
  "seismic-lang",
@@ -4109,6 +4118,7 @@ dependencies = [
 name = "seismic"
 version = "0.1.0"
 dependencies = [
+ "magnitude-ggml",
  "seismic-compiler",
  "seismic-lang",
  "seismic-measure",
@@ -4222,6 +4232,7 @@ name = "seismic-lang"
 version = "0.1.0"
 dependencies = [
  "dunce",
+ "magnitude-ggml",
  "num-bigint",
  "num-traits",
  "postcard",
@@ -4260,6 +4271,7 @@ dependencies = [
 name = "seismic-native-cpu"
 version = "0.1.0"
 dependencies = [
+ "magnitude-ggml",
  "seismic-lang",
 ]
 

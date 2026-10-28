@@ -286,7 +286,8 @@ macro_rules! registry_id {
         pub struct $name(u32);
         impl $name {
             pub(crate) const fn new(index: u32) -> Self { Self(index) }
-            pub(crate) const fn index(self) -> usize { self.0 as usize }
+            /// The identity's position in its registry table.
+            pub const fn index(self) -> usize { self.0 as usize }
         }
         impl fmt::Debug for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

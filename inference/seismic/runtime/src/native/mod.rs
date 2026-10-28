@@ -512,8 +512,8 @@ pub(crate) fn on_device(
 /// products (AVX2, AVX-512 or VNNI), a projection with a packed weight
 /// operand defaults to its `INT8` form: it quantizes the staged rows to Q8
 /// blocks and runs the representation's integer dot, and the F32 form is
-/// the challenger. Elsewhere (x86-64-v2, NEON, dense weights, GPUs) the
-/// declaration's defaults stand.
+/// the challenger. Elsewhere (x86-64-v2, NEON, dense weights, weights that
+/// multiply NVFP4 operand rows, GPUs) the declaration's defaults stand.
 pub(crate) fn device_defaults(
     device: &DeviceInner,
     mut implementation: NativeImplementation,
@@ -529,9 +529,8 @@ pub(crate) fn device_defaults(
         return implementation;
     };
     let packed = bindings.iter().any(|(_, representation)| {
-        let name = seismic_lang::registry::representation_info(representation).name;
-        seismic_native_cpu::components::resolve(tier, name)
-            .is_some_and(|kernels| kernels.dense_bytes == 0)
+        seismic_native_cpu::WeightOperand::of(tier, representation)
+            .is_some_and(|operand| operand.dense_bytes().is_none() && !operand.nvfp4_operands())
     });
     if !packed {
         return implementation;

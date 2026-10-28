@@ -127,8 +127,8 @@ kernel void dense_expand_batch(DENSE_EXPAND_ARGUMENTS,
     DENSE_EXPAND_OPERANDS;
     projection::Plain<activation, projection::AllRows> x{normalized,
         SEISMIC_DIM_H, 1, uint(SEISMIC_DIM_H), {}};
-    if constexpr (projection::matrix_codes<packets::W0>::available
-        && projection::matrix_codes<packets::W1>::available && SEISMIC_DIM_H % 256 == 0) {
+    if constexpr (projection::matrix_form<packets::W0>::available
+        && projection::matrix_form<packets::W1>::available && SEISMIC_DIM_H % 256 == 0) {
         projection::gemv_matrix_paired<packets::W0, packets::W1, BATCH_PARTS>(x, out,
             gate, up, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H),
             tile, shared, simdgroups, sg, lane);

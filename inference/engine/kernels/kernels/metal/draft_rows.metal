@@ -50,12 +50,11 @@ inline void draft_join(
         typename packets::W0::packet packet = rows.packet(token, p);
         for (uint step = 0; step < 4; ++step) {
             float4 even, odd;
-            packets::W0::codes(packet, step, even, odd);
+            packets::W0::exact_values(packet, step, even, odd);
             for (uint i = 0; i < 8; ++i) {
                 const uint column = 32u * p + 8u * step + i;
                 if (column < width) {
-                    const float code = (i & 1u) ? odd[i >> 1] : even[i >> 1];
-                    const float value = activation::round(packets::W0::value(packet, step, code));
+                    const float value = activation::round((i & 1u) ? odd[i >> 1] : even[i >> 1]);
                     joined[column] = activation::store(value);
                     embedding_squares = metal::fma(value, value, embedding_squares);
                 }
@@ -117,12 +116,11 @@ kernel void draft_rows(DRAFT_ROWS_ARGUMENTS,
             typename packets::W1::packet packet = weights.packet(output, p);
             for (uint step = 0; step < 4; ++step) {
                 float4 even, odd;
-                packets::W1::codes(packet, step, even, odd);
+                packets::W1::values(packet, step, even, odd);
                 for (uint i = 0; i < 8; ++i) {
                     const uint column = 32u * p + 8u * step + i;
                     if (column < inputs) {
-                        const float code = (i & 1u) ? odd[i >> 1] : even[i >> 1];
-                        sum = metal::fma(packets::W1::value(packet, step, code),
+                        sum = metal::fma((i & 1u) ? odd[i >> 1] : even[i >> 1],
                             activation::load(joined[column]), sum);
                     }
                 }

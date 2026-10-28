@@ -95,15 +95,8 @@ pub(crate) fn fill_staged_source(
         let bytes = source
             .read(offset, length)
             .map_err(|error| transfer(error.to_string()))?;
-        let bytes = crate::import_transforms::upload_bytes(
-            &plan.descriptor,
-            stored.shape(),
-            plan.source,
-            stored.packed_encoding(),
-            plan.upload,
-            bytes,
-        )
-        .map_err(transfer)?;
+        let bytes = crate::import_transforms::upload_bytes(plan, stored.shape(), bytes)
+            .map_err(transfer)?;
         if upload.byte_len() != bytes.len() as u64 {
             return Err(transfer(
                 "transformed source byte length differs from its tensor".into(),
@@ -272,9 +265,7 @@ fn import_view(extents: &[u64]) -> Result<[u64; 3], SubmitError> {
         .split_last()
         .ok_or_else(|| invariant("a resident weight has rank zero".into()))?;
     let (&n, matrices) = leading.split_last().unwrap_or((&1, &[]));
-    let b = matrices
-        .iter()
-        .try_fold(1_u64, |count, extent| count.checked_mul(*extent))
+    let b = crate::planning::elements(matrices)
         .ok_or_else(|| invariant("resident matrix count overflowed".into()))?;
     Ok([b, n, k])
 }
@@ -480,6 +471,123 @@ mod tests {
             bound: None,
         };
         import_into(&repack, &source, &resident, None).unwrap();
+        assert_eq!(
+            resident.read_to_host().unwrap(),
+            resident_element
+                .repack_host(source_element, &shape, &bytes)
+                .unwrap()
+        );
+    }
+
+    /// A GGUF whose `general.alignment` is 1 can place a tensor at an odd
+    /// file offset, off its source packets' declared alignment: its import
+    /// uploads it rather than viewing the mapped pages, and converts it
+    /// exactly.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_source_off_its_alignment_in_the_file_is_uploaded() {
+        use crate::resources::{ImportSource, ImportWindow};
+        use magnitude_artifacts::gguf::{Encoding, GgufArtifact};
+        use std::fs;
+
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        let Ok(device) = catalog.open_backend(BackendName::Metal) else {
+            return;
+        };
+        let source_element = Element::named("gguf_q5_k").unwrap();
+        let resident_element = Element::stored("q5k", seismic::Layout::Rows16).unwrap();
+        let shape = [17_u64, 512];
+        let bytes = (0..17 * 2 * 176)
+            .map(|index: usize| (index as u8).wrapping_mul(29).wrapping_add(7))
+            .collect::<Vec<_>>();
+        // The header, its one tensor's data right after it: a key name
+        // whose length makes the header's an odd number of bytes.
+        let header = |key: &str| {
+            let string =
+                |text: &str| [&(text.len() as u64).to_le_bytes()[..], text.as_bytes()].concat();
+            [
+                &b"GGUF"[..],
+                &3u32.to_le_bytes(),
+                &1u64.to_le_bytes(),
+                &1u64.to_le_bytes(),
+                &string(key),
+                &4u32.to_le_bytes(),
+                &1u32.to_le_bytes(),
+                &string("weight"),
+                &2u32.to_le_bytes(),
+                &512u64.to_le_bytes(),
+                &17u64.to_le_bytes(),
+                &(Encoding::Q5K as u32).to_le_bytes(),
+                &0u64.to_le_bytes(),
+            ]
+            .concat()
+        };
+        let mut file = header("general.alignment");
+        assert!(
+            file.len() % 2 == 1,
+            "the tensor's data starts at an odd offset"
+        );
+        file.extend_from_slice(&bytes);
+        let path = std::env::temp_dir().join(format!(
+            "magnitude-unaligned-import-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, file).unwrap();
+        let artifact = GgufArtifact::open(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let descriptor = magnitude_family_contracts::WeightDescriptor {
+            name: "weight".into(),
+            shape: shape.to_vec(),
+            transforms: Vec::new(),
+        };
+        let stored = Stored::from_gguf(&artifact, &descriptor).unwrap();
+        assert_eq!(stored.file_range().1 % 2, 1);
+        let weight = crate::WeightPlan {
+            role: magnitude_family_contracts::WeightRole {
+                scope: magnitude_family_contracts::WeightScope::Target,
+                kind: magnitude_family_contracts::WeightKind::OutputNorm,
+            },
+            component: crate::ArtifactComponent {
+                kind: crate::ArtifactComponentKind::Target,
+                identity: artifact.identity(),
+            },
+            source: source_element,
+            upload: source_element,
+            resident: resident_element,
+            shape: shape.to_vec(),
+            descriptor,
+            source_bytes: bytes.len() as u64,
+            resident_bytes: Tensor::canonical_layout(resident_element, &shape)
+                .unwrap()
+                .0,
+            scale: None,
+            bound: 0,
+            streamed: None,
+        };
+        let window = ImportWindow::of(&device, &stored).unwrap();
+        let mut source = ImportSource::acquire(&weight, &stored, Some(&window), &device).unwrap();
+        let upload = source.staged_mut().expect("the source is uploaded");
+        fill_staged_source(&stored, &weight, upload).unwrap();
+        // SAFETY: the packed import writes every resident byte before readback.
+        let resident = unsafe { Tensor::uninitialized(&device, resident_element, &shape) }.unwrap();
+        let kernel = repack_weight::native_for_device_with(
+            &device,
+            repack_weight::Elements {
+                E: source_element,
+                U: resident_element,
+            },
+            &seismic::NativeSpecialization::new(),
+        )
+        .unwrap();
+        let repack = AttestedImport::Repack {
+            repack: kernel,
+            bound: None,
+        };
+        import_into(&repack, source.tensor(), &resident, None).unwrap();
         assert_eq!(
             resident.read_to_host().unwrap(),
             resident_element

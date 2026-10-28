@@ -109,14 +109,13 @@ struct EagerDense {
             k.w[i] = at[i];
         return k;
     }
-    static void codes(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
+    // Step `step`'s eight values: the stored elements.
+    static void values(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
         E::split8(k.w[step], even, odd);
     }
-    static float scale(thread const packet &, uint) { return 1.0f; }
-    static float bias(thread const packet &, uint) { return 0.0f; }
 };
 template <>
-inline void EagerDense<element::F32>::codes(thread const packet &k, uint step, thread float4 &even,
+inline void EagerDense<element::F32>::values(thread const packet &k, uint step, thread float4 &even,
     thread float4 &odd) {
     const float4 a = as_type<float4>(k.w[2 * step]), b = as_type<float4>(k.w[2 * step + 1]);
     even = float4(a.x, a.z, b.x, b.z);
@@ -146,7 +145,7 @@ inline void column(thread const In &in, thread const projection::Weights<W> &w, 
         const typename W::packet packet = w.packet(index, p);
         PROJECTION_UNROLL
         for (uint step = 0; step < 4; ++step)
-            projection::gemv_weights<W>(packet, step, we[step], wo[step]);
+            W::values(packet, step, we[step], wo[step]);
         PROJECTION_UNROLL
         for (uint m = 0; m < 8; ++m) {
             if (m < rows) {

@@ -9,22 +9,40 @@
 //! beside the weight (`WeightPlan::scale`) and entries apply it to their F32
 //! accumulator.
 
-use magnitude_artifacts::gguf::Encoding;
 use magnitude_family_contracts::{
-    ImportTransform, ProgressiveCodeDepth, ScaledActivations, WeightDescriptor,
+    ImportTransform, ProgressiveCodeDepth, ProgressivePlane, ScaledActivations, WeightDescriptor,
 };
 use seismic::Element;
 
 /// Whether the importer can apply `descriptor`'s transforms to a tensor
-/// stored as `encoding` with `stored` shape, and the logical shape they
-/// produce. Checked at plan time, so an unsupported transform makes the
-/// model's plan fail rather than its load.
+/// stored as `source` with `stored` shape, making the shape `descriptor`
+/// declares: [`admit_transforms`], checked against it.
 pub(crate) fn admit(
     descriptor: &WeightDescriptor,
     stored: &[u64],
-    encoding: Encoding,
+    source: Element,
 ) -> Result<Vec<u64>, String> {
-    let dense = matches!(encoding, Encoding::F32 | Encoding::F16 | Encoding::BF16);
+    let shape = admit_transforms(descriptor, stored, source)?;
+    if shape != descriptor.shape {
+        return Err(format!(
+            "{:?}: stored shape {stored:?} transforms to {shape:?}, not {:?}",
+            descriptor.name, descriptor.shape
+        ));
+    }
+    Ok(shape)
+}
+
+/// Whether the importer can apply `descriptor`'s transforms to a tensor
+/// stored as `source` with `stored` shape (whatever shape `descriptor`
+/// declares), and the logical shape they produce. Checked at plan time, so
+/// an unsupported transform makes the model's plan fail rather than its
+/// load.
+pub(crate) fn admit_transforms(
+    descriptor: &WeightDescriptor,
+    stored: &[u64],
+    source: Element,
+) -> Result<Vec<u64>, String> {
+    let dense = source.dtype().is_some();
     let mut shape = stored.to_vec();
     for transform in &descriptor.transforms {
         match transform {
@@ -36,10 +54,11 @@ pub(crate) fn admit(
                     descriptor.name
                 ));
             }
-            ImportTransform::Scale { .. } if encoding != Encoding::F32 => {
+            ImportTransform::Scale { .. } if source != Element::f32() => {
                 return Err(format!(
-                    "{:?}: a scale is exact only on F32 storage, not {encoding:?}",
-                    descriptor.name
+                    "{:?}: a scale is exact only on F32 storage, not {}",
+                    descriptor.name,
+                    source.name()
                 ));
             }
             ImportTransform::ScaleByTensor { tensor, .. }
@@ -61,17 +80,13 @@ pub(crate) fn admit(
                     descriptor.name
                 ));
             }
-            ImportTransform::Progressive { depth, .. }
-                if !matches!(
-                    (depth, encoding),
-                    (ProgressiveCodeDepth::Four, Encoding::Q4_0)
-                        | (ProgressiveCodeDepth::Eight, Encoding::Q8_0)
-                ) || descriptor.transforms.len() != 1 =>
-            {
-                return Err(format!(
-                    "{:?}: a progressive plane must match its Q4_0 or Q8_0 source depth and be its only transform",
-                    descriptor.name
-                ));
+            ImportTransform::Progressive { .. } => {
+                if placement(descriptor, stored, source)?.is_none() {
+                    return Err(format!(
+                        "{:?}: a progressive plane must be its descriptor's only transform",
+                        descriptor.name
+                    ));
+                }
             }
             _ => {}
         }
@@ -82,13 +97,47 @@ pub(crate) fn admit(
         .transformed_shape(&shape)
         .map_err(|error| error.to_string())?;
     }
-    if shape != descriptor.shape {
-        return Err(format!(
-            "{:?}: stored shape {stored:?} transforms to {shape:?}, not {:?}",
-            descriptor.name, descriptor.shape
-        ));
-    }
     Ok(shape)
+}
+
+/// The progressive placement at `depth` of a tensor stored as `source` with
+/// `stored` shape: the one admission of a progressive matrix. `None` unless
+/// it is a matrix whose columns are nonzero and fit `u32`, and whose rows
+/// are whole packets of codes of `depth` that every plane's placement
+/// places ([`Placement::of`](crate::progressive::Placement::of)).
+pub(crate) fn progressive_matrix(
+    depth: ProgressiveCodeDepth,
+    stored: &[u64],
+    source: Element,
+) -> Option<crate::progressive::Placement> {
+    let [_, columns] = stored else {
+        return None;
+    };
+    let columns = std::num::NonZeroU32::new(u32::try_from(*columns).ok()?)?;
+    crate::progressive::Placement::of(depth, source, columns)
+}
+
+/// The progressive plane `descriptor` places
+/// ([`WeightDescriptor::progressive`]) of a matrix stored as `source` with
+/// `stored` shape, and its placement, if it places one, as
+/// [`admit_transforms`] admits it at plan time.
+pub(crate) fn placement(
+    descriptor: &WeightDescriptor,
+    stored: &[u64],
+    source: Element,
+) -> Result<Option<(ProgressivePlane, crate::progressive::Placement)>, String> {
+    let Some((plane, depth)) = descriptor.progressive() else {
+        return Ok(None);
+    };
+    let placement = progressive_matrix(depth, stored, source).ok_or_else(|| {
+        format!(
+            "{:?}: a progressive plane must place a matrix (columns nonzero and within \
+             u32) of whole packets of codes of its depth, whose placed rows' bit \
+             positions are within u32",
+            descriptor.name
+        )
+    })?;
+    Ok(Some((plane, placement)))
 }
 
 /// The logical source bytes of a tensor stored as `source` with `stored`
@@ -154,55 +203,25 @@ pub(crate) fn apply(
     Ok(bytes)
 }
 
-/// The bytes the importer uploads for a weight stored as `source` (packed as
-/// `encoding`, or dense) with `stored` shape: the transformed bytes in
-/// `upload`, the plan's upload representation. A packed weight whose upload
-/// differs from its source is dequantized exactly to F32; a progressive
-/// plane is placed from the stored Q8_0 rows (`crate::progressive`).
+/// The bytes the importer uploads for `plan`'s weight, stored with `stored`
+/// shape: the transformed bytes in the plan's upload representation. A
+/// packed weight whose upload differs from its source is dequantized
+/// exactly to F32; a progressive plane is placed from the codes of the
+/// stored rows ([`placement`]).
 pub(crate) fn upload_bytes(
-    descriptor: &WeightDescriptor,
+    plan: &crate::WeightPlan,
     stored: &[u64],
-    source: Element,
-    encoding: Option<Encoding>,
-    upload: Element,
     bytes: Vec<u8>,
 ) -> Result<Vec<u8>, String> {
-    if let [ImportTransform::Progressive { plane, depth }] = descriptor.transforms[..] {
-        let [rows, columns] = stored else {
-            return Err(format!(
-                "{:?}: a progressive plane places a matrix",
-                descriptor.name
-            ));
-        };
-        if !matches!(
-            (depth, encoding),
-            (ProgressiveCodeDepth::Four, Some(Encoding::Q4_0))
-                | (ProgressiveCodeDepth::Eight, Some(Encoding::Q8_0))
-        ) {
-            return Err(format!(
-                "{:?}: progressive code depth differs from source",
-                descriptor.name
-            ));
-        }
-        return Ok(crate::progressive::plane(
-            plane,
-            &bytes,
-            to_usize(*rows)?,
-            to_usize(*columns)?,
-            depth.bits(),
-        ));
+    if let Some((plane, placement)) = placement(&plan.descriptor, stored, plan.source)? {
+        return Ok(crate::progressive::plane(plane, &placement, &bytes));
     }
+    let (descriptor, source, upload) = (&plan.descriptor, plan.source, plan.upload);
     let transformed = apply(descriptor, stored, source, bytes)?;
     if upload == source {
         return Ok(transformed);
     }
-    let encoding = encoding.ok_or_else(|| {
-        format!(
-            "{:?}: a dequantized weight is stored dense",
-            descriptor.name
-        )
-    })?;
-    dequantize(encoding, source, &descriptor.shape, &transformed)
+    dequantize(source, &descriptor.shape, &transformed)
 }
 
 /// The stored tensor holding `descriptor`'s second-level scale, when it has
@@ -272,28 +291,15 @@ fn to_usize(value: u64) -> Result<usize, String> {
 }
 
 /// The F32 little-endian values of a `shape` tensor stored packed as
-/// `encoding` (`source` bytes): the registered conversion into the canonical
-/// packet representation, then its reference decode. Exact: a packed value
-/// (a scale times a code) is an F32 value.
-pub(crate) fn dequantize(
-    encoding: Encoding,
-    source: Element,
-    shape: &[u64],
-    bytes: &[u8],
-) -> Result<Vec<u8>, String> {
-    let width = shape.last().copied().unwrap_or(1);
-    // The values alone: the activations a product takes do not change them.
-    let packet = crate::resident_element(
-        encoding,
-        ScaledActivations::Rounded,
-        width,
-        seismic::DType::F32,
-        seismic::Layout::Packet,
-    )
-    .ok_or_else(|| format!("{encoding:?} has no packet representation"))?;
+/// `source` (`bytes`): the registered conversion into the canonical packet
+/// representation, then its reference decode. Exact: a packed value (a
+/// scale times a code) is an F32 value.
+pub(crate) fn dequantize(source: Element, shape: &[u64], bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let packet = crate::planning::value_packets(source)
+        .ok_or_else(|| format!("{} has no packet representation", source.name()))?;
     let canonical = packet
         .repack_host(source, shape, bytes)
-        .ok_or_else(|| format!("{encoding:?} has no conversion into {}", packet.name()))?;
+        .ok_or_else(|| format!("{} has no conversion into {}", source.name(), packet.name()))?;
     let values = packet
         .decode_host(shape, &canonical)
         .ok_or_else(|| format!("{} does not decode on the host", packet.name()))?;
@@ -329,7 +335,7 @@ mod tests {
         let stored = [2, 3, 2];
         let transforms = vec![ImportTransform::Rows(RowRange { start: 1, rows: 2 })];
         let weight = descriptor(&[2, 2, 2], transforms);
-        assert_eq!(admit(&weight, &stored, Encoding::F32).unwrap(), [2, 2, 2]);
+        assert_eq!(admit(&weight, &stored, Element::f32()).unwrap(), [2, 2, 2]);
         let values = (0..12).map(|value| value as f32).collect::<Vec<_>>();
         let out = apply(&weight, &stored, Element::f32(), f32s(&values)).unwrap();
         assert_eq!(out, f32s(&[2., 3., 4., 5., 8., 9., 10., 11.]));
@@ -343,7 +349,7 @@ mod tests {
             vec![ImportTransform::PermuteRows { order: vec![1, 0] }],
         );
         let q8 = Element::named("gguf_q8_0").unwrap();
-        admit(&weight, &stored, Encoding::Q8_0).unwrap();
+        admit(&weight, &stored, q8).unwrap();
         // One Q8_0 block (34 bytes) per row; rows tagged by their first byte.
         let bytes = (0..4u8).flat_map(|row| vec![row; 34]).collect::<Vec<_>>();
         let out = apply(&weight, &stored, q8, bytes).unwrap();
@@ -354,8 +360,8 @@ mod tests {
     #[test]
     fn scales_multiply_f32_once_and_reject_other_storage() {
         let weight = descriptor(&[2], vec![ImportTransform::Scale { factor: 0.5 }]);
-        assert!(admit(&weight, &[2], Encoding::BF16).is_err());
-        admit(&weight, &[2], Encoding::F32).unwrap();
+        assert!(admit(&weight, &[2], Element::bf16()).is_err());
+        admit(&weight, &[2], Element::f32()).unwrap();
         let out = apply(&weight, &[2], Element::f32(), f32s(&[3.0, -1.0])).unwrap();
         assert_eq!(out, f32s(&[1.5, -0.5]));
     }
@@ -363,10 +369,10 @@ mod tests {
     #[test]
     fn flattening_keeps_bytes_and_second_level_scales_stay_apart_from_them() {
         let flat = descriptor(&[8], vec![ImportTransform::Flatten]);
-        assert_eq!(admit(&flat, &[2, 4], Encoding::F32).unwrap(), [8]);
+        assert_eq!(admit(&flat, &[2, 4], Element::f32()).unwrap(), [8]);
         let table = descriptor(&[2, 4], vec![ImportTransform::DropUnitAxis]);
-        assert_eq!(admit(&table, &[1, 2, 4], Encoding::F32).unwrap(), [2, 4]);
-        assert!(admit(&table, &[2, 2, 4], Encoding::F32).is_err());
+        assert_eq!(admit(&table, &[1, 2, 4], Element::f32()).unwrap(), [2, 4]);
+        assert!(admit(&table, &[2, 2, 4], Element::f32()).is_err());
         let values = f32s(&[1., 2., 3., 4., 5., 6., 7., 8.]);
         assert_eq!(
             apply(&table, &[1, 2, 4], Element::f32(), values.clone()).unwrap(),
@@ -377,14 +383,14 @@ mod tests {
             activations: ScaledActivations::Rounded,
         };
         let scaled = descriptor(&[2, 32], vec![scale()]);
-        assert_eq!(admit(&scaled, &[2, 32], Encoding::Q8_0).unwrap(), [2, 32]);
+        let q8 = Element::named("gguf_q8_0").unwrap();
+        assert_eq!(admit(&scaled, &[2, 32], q8).unwrap(), [2, 32]);
         assert_eq!(scale_tensor(&scaled), Some("w.scale"));
         let bytes = vec![7u8; 68];
-        let q8 = Element::named("gguf_q8_0").unwrap();
         assert_eq!(apply(&scaled, &[2, 32], q8, bytes.clone()).unwrap(), bytes);
         // A flattened matrix has no matrices to scale; one scale per weight.
         let flattened = descriptor(&[64], vec![scale(), ImportTransform::Flatten]);
-        assert!(admit(&flattened, &[2, 32], Encoding::F32).is_err());
+        assert!(admit(&flattened, &[2, 32], Element::f32()).is_err());
         let twice = descriptor(
             &[2, 32],
             vec![
@@ -395,7 +401,7 @@ mod tests {
                 },
             ],
         );
-        assert!(admit(&twice, &[2, 32], Encoding::Q8_0).is_err());
+        assert!(admit(&twice, &[2, 32], q8).is_err());
     }
 
     /// A Q8_0 block (an f16 scale, then 32 int8 codes) dequantizes to the
@@ -405,7 +411,7 @@ mod tests {
         let mut bytes = 0x3800_u16.to_le_bytes().to_vec(); // 0.5
         bytes.extend((-16i8..16).map(|code| code as u8));
         let source = Element::named("gguf_q8_0").unwrap();
-        let values = dequantize(Encoding::Q8_0, source, &[1, 32], &bytes).unwrap();
+        let values = dequantize(source, &[1, 32], &bytes).unwrap();
         let values = values
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))

@@ -239,13 +239,9 @@ impl Repr {
     }
 }
 
-/// The row layout `device`'s native kernels read packed weights in: `rows32`
-/// on Metal, `rows16` elsewhere (Vulkan, and the CPU's `rows16` entries).
+/// The row layout `device`'s native kernels read packed weights in.
 fn resident_layout(device: &Device) -> registry::Layout {
-    match device.backend() {
-        BackendName::Metal => registry::Layout::Rows32,
-        _ => registry::Layout::Rows16,
-    }
+    device.backend().resident_layout()
 }
 
 /// Plane byte offsets of one row, in the frozen rows16 order.
@@ -371,9 +367,6 @@ impl Weight {
     /// This weight in `device`'s resident layout.
     fn tensor(&self, device: &Device) -> Tensor {
         self.tensor_in(device, resident_layout(device))
-    }
-    fn tensor_rows8(&self, device: &Device) -> Tensor {
-        self.tensor_in(device, registry::Layout::Rows8)
     }
     /// The host-built `rows16` bytes placed in `layout` through the
     /// registry's packet form.
@@ -2343,11 +2336,7 @@ fn dense_output_native_arithmetic(
         device,
         dense_output::Elements {
             A: act.element(),
-            DW: if is_cpu(device) && down.repr != Repr::Bf16 {
-                Element::stored(down.repr.name(), registry::Layout::Rows8).unwrap()
-            } else {
-                down.repr.resident(&device)
-            },
+            DW: down.repr.resident(&device),
         },
         &specialization,
     )
@@ -2356,11 +2345,7 @@ fn dense_output_native_arithmetic(
         .call(dense_output::Args {
             residual: &f32_tensor(device, &[rows, h], residual),
             product: &act_tensor(device, act, &[out_rows.len(), f], product),
-            down_weight: &if is_cpu(device) {
-                down.tensor_rows8(device)
-            } else {
-                down.tensor(device)
-            },
+            down_weight: &down.tensor(device),
             out_rows: &i32_tensor(device, &[out_rows.len()], out_rows),
             down_scale: &f32_tensor(device, &[0], &[]),
             down_bound: &absent_bound(device),

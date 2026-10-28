@@ -496,7 +496,7 @@ template <class W> struct GemvPermuted<W, decltype((void)W::GEMV_PERMUTED)> {
 };
 
 // Whether a weight's GEMV stages its tiles' coefficient fields in shared
-// memory (`W::GEMV_STAGED`, see `Coded4::stage`).
+// memory (`W::GEMV_STAGED`, see `packets::Direct::stage`).
 template <class W, class = void> struct GemvStaged {
     static constexpr bool value = false;
 };
@@ -1709,8 +1709,8 @@ __device__ __forceinline__ void gemm_tile_fp4(float acc[Shape::MI][2][4], const 
 template <class Shape, class Weights>
 __device__ __forceinline__ void gemm_multiply_fp4(float (&acc)[2][Shape::NJ][Shape::MI][2][4],
                                                   const Weights &weights, int stage, u64 index, u32 warp, u32 lane) {
-    static_assert(Same<decltype(weights.wa), packets::Nvfp4Of<true>>::value &&
-                      (!Weights::PAIR || Same<decltype(weights.wb), packets::Nvfp4Of<true>>::value),
+    static_assert(packets::nvfp4_operands<decltype(weights.wa)>::value &&
+                      (!Weights::PAIR || packets::nvfp4_operands<decltype(weights.wb)>::value),
                   "FP4 tensor operations multiply W4A4 NVFP4 weights");
     constexpr int PITCH = Shape::template A_PITCH<false>;
     constexpr int MI = Shape::MI;

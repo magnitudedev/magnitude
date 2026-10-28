@@ -34,19 +34,14 @@ impl TuningWeightSource for Package {
             Stored::from_gguf(artifact, &weight.descriptor).map_err(|error| error.to_string())?;
         let bytes = crate::programs::native_import::stored_source_bytes(&stored)
             .map_err(|error| error.to_string())?;
-        crate::import_transforms::upload_bytes(
-            &weight.descriptor,
-            stored.shape(),
-            weight.source,
-            stored.packed_encoding(),
-            weight.upload,
-            bytes,
-        )
+        crate::import_transforms::upload_bytes(weight, stored.shape(), bytes)
     }
 
     /// The source as the load's own importer takes it
     /// ([`ImportSource::acquire`]): a view of the artifact's mapped pages
-    /// where the device reads them in place, and otherwise an upload
+    /// where the import reads them in place
+    /// ([`ImportSource::reads_in_place`]: the device reads mapped pages and
+    /// the bytes keep the source's alignment), and otherwise an upload
     /// written from the stored range a block at a time. Tuning's import of
     /// a weight therefore holds on the host what the load's import of it
     /// holds, and no copy of the source besides.
@@ -54,7 +49,7 @@ impl TuningWeightSource for Package {
         let artifact = artifact(self, weight.component)?;
         let stored =
             Stored::from_gguf(artifact, &weight.descriptor).map_err(|error| error.to_string())?;
-        let window = (ImportWindow::serves(device) && !weight.host_prepared())
+        let window = ImportSource::reads_in_place(weight, &stored, device)?
             .then(|| ImportWindow::of(device, &stored))
             .transpose()?;
         let mut source = ImportSource::acquire(weight, &stored, window.as_ref(), device)?;
@@ -107,10 +102,7 @@ impl TuningWeightSource for ZeroTuningWeights {
 }
 
 fn logical_count(shape: &[u64]) -> Result<u64, String> {
-    shape
-        .iter()
-        .try_fold(1u64, |count, extent| count.checked_mul(*extent))
-        .ok_or_else(|| "weight element count overflows".to_owned())
+    crate::planning::elements(shape).ok_or_else(|| "weight element count overflows".to_owned())
 }
 
 /// The load plan's weight of one role.

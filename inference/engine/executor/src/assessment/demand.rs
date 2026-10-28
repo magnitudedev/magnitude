@@ -183,16 +183,12 @@ fn demand_error(message: impl Into<String>) -> AssessmentError {
 
 /// The logical elements of a weight.
 fn elements(weight: &WeightPlan) -> Result<u64, AssessmentError> {
-    weight
-        .shape
-        .iter()
-        .try_fold(1u64, |elements, extent| elements.checked_mul(*extent))
-        .ok_or_else(|| {
-            demand_error(format!(
-                "weight {:?} elements overflow",
-                weight.descriptor.name
-            ))
-        })
+    crate::planning::elements(&weight.shape).ok_or_else(|| {
+        demand_error(format!(
+            "weight {:?} elements overflow",
+            weight.descriptor.name
+        ))
+    })
 }
 
 /// The FLOPs of one row through `weight`, a matrix: a multiply and an add

@@ -1396,9 +1396,7 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         let recipe = registry::representation_conversion_info(conversion);
         assert_eq!(source.backing().representation(), recipe.source);
         assert_eq!(destination_view.representation(), recipe.destination);
-        let RepresentationKind::Packed(layout) =
-            &registry::representation_info(recipe.destination).kind
-        else {
+        let registry::ConversionLayout::Packet(layout) = recipe.destination_layout else {
             panic!(
                 "registered representation conversion destination is not resident packed storage"
             )

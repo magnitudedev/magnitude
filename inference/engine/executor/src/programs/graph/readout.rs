@@ -1330,7 +1330,7 @@ pub(crate) fn progressive_projection<'a, G: GraphDraft + 'a>(
         ("D", hidden),
         parts,
         normalized,
-        ("P", planes.depth.bits() as u64 / 2 - 1),
+        ("P", u64::from(planes.depth.rest_planes())),
     ];
     let Some(radius) = planes.radius else {
         let logits = graph
@@ -1390,7 +1390,7 @@ pub(crate) fn progressive_projection<'a, G: GraphDraft + 'a>(
         ("O", rows.projected),
         ("V", vocabulary),
         ("D", hidden),
-        ("P", planes.depth.bits() as u64 / 2 - 1),
+        ("P", u64::from(planes.depth.rest_planes())),
     ];
     let second = graph.enqueue::<readout_refine_rows::Entry>(
         entries.refine,
@@ -1483,7 +1483,7 @@ fn head_topology<'a, G: GraphDraft + 'a>(
         normalized,
     ];
     if let Some(depth) = plans.depth() {
-        dimensions.push(("P", depth.bits() as u64 / 2 - 1));
+        dimensions.push(("P", u64::from(depth.rest_planes())));
     }
     let certified = matches!(
         class.kind,

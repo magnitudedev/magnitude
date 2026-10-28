@@ -27,11 +27,7 @@ fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
 
 fn packed_stages_on(device: &seismic::Device) {
     let q8_external = seismic::Element::named("gguf_q8_0").unwrap();
-    let layout = match device.backend() {
-        seismic::BackendName::Cuda => seismic::Layout::Mma16,
-        seismic::BackendName::Metal => seismic::Layout::Rows32,
-        _ => seismic::Layout::Rows16,
-    };
+    let layout = device.backend().resident_layout();
     let q8 = seismic::Element::stored("q8g32s", layout).unwrap();
     let bf16 = seismic::Element::bf16();
     // One key and one value head of width 32 over a 32-wide hidden row, at

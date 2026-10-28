@@ -709,7 +709,7 @@ impl<'a> Preparation<'a> {
             return Ok(None);
         };
         let vocabulary = stored_vocabulary.min(self.vocabulary);
-        let [_, _, low_planes] = rest.shape[..] else {
+        let Some(depth) = rest.progressive_depth() else {
             return Ok(None);
         };
         let (parts, norm_extent) = model.readout_form(norm_scope, hidden).map_err(|outcome| {
@@ -741,7 +741,7 @@ impl<'a> Preparation<'a> {
             hidden,
             parts,
             norm_extent,
-            low_planes,
+            depth,
             scale_extent,
         };
         let [top, levels @ ..] = recipe.digests(device)?;

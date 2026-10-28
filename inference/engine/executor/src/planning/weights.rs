@@ -15,7 +15,7 @@ use magnitude_family_contracts::{
     WeightRole, WeightScope,
 };
 use magnitude_state::KvCodec;
-use seismic::{BackendName, DType, Element, Layout};
+use seismic::{BackendName, DType, Element, Layout, OperandRecipe};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -172,10 +172,7 @@ impl WeightPlan {
 
     /// The source code depth retained by a progressive placement.
     pub(crate) fn progressive_depth(&self) -> Option<ProgressiveCodeDepth> {
-        match self.descriptor.transforms[..] {
-            [ImportTransform::Progressive { depth, .. }] => Some(depth),
-            _ => None,
-        }
+        self.descriptor.progressive().map(|(_, depth)| depth)
     }
 
     /// The shape of the stored tensor this weight is made of: `shape`, with
@@ -890,6 +887,13 @@ impl ModelLoadPlan {
     }
 }
 
+/// The elements of a tensor of `extents`; `None` beyond `u64`.
+pub(crate) fn elements(extents: &[u64]) -> Option<u64> {
+    extents
+        .iter()
+        .try_fold(1u64, |count, extent| count.checked_mul(*extent))
+}
+
 pub(super) fn source_import_peak_bytes(source_bytes: u64) -> Result<u64, String> {
     if source_bytes == 0 {
         return Ok(0);
@@ -1273,31 +1277,37 @@ impl ModelLoadPlan {
             for weight in weights {
                 // The views' full pass serves every row the bounded levels
                 // do not. It is measured against the packed projection's
-                // only for Q8_0 projections without a soft cap, so only
-                // those are offered.
-                let width = weight.shape.last().copied().unwrap_or(1);
-                let depth = (Some(weight.source) == source_element(Encoding::Q8_0, width))
-                    .then_some(ProgressiveCodeDepth::Eight);
+                // only for 8-bit codes (Q8_0 projections) without a soft
+                // cap, so only those are offered.
+                let depth = ProgressiveCodeDepth::Eight;
                 let admitted = weight.role.kind == WeightKind::Output
                     && weight.role.scope == WeightScope::Target
                     && definition.decoder.exit.softcap.is_none_or(|cap| cap == 0.0)
                     && !indexed.contains(&weight.role.scope)
                     && weight.scale.is_none()
                     && weight.descriptor.transforms.is_empty()
-                    && weight.upload == weight.source
-                    && weight.shape.len() == 2
-                    && weight.shape[1].is_multiple_of(32);
-                let Some(depth) = depth.filter(|_| admitted) else {
+                    && weight.upload == weight.source;
+                let placed = crate::import_transforms::progressive_matrix(
+                    depth,
+                    &weight.shape,
+                    weight.source,
+                )
+                .is_some();
+                if !(admitted && placed) {
                     continue;
-                };
+                }
                 for plane in ProgressivePlane::ALL {
-                    let descriptor = WeightDescriptor {
+                    let mut descriptor = WeightDescriptor {
                         transforms: vec![ImportTransform::Progressive { plane, depth }],
                         ..weight.descriptor.clone()
                     };
-                    let shape = descriptor
-                        .transformed_shape(&weight.shape)
-                        .map_err(|error| error.to_string())?;
+                    // The weight has no transforms: its shape is as stored.
+                    let shape = crate::import_transforms::admit_transforms(
+                        &descriptor,
+                        &weight.shape,
+                        weight.source,
+                    )?;
+                    descriptor.shape = shape.clone();
                     let element = crate::progressive::element(plane);
                     views.push(WeightPlan {
                         role: WeightRole {
@@ -1310,10 +1320,7 @@ impl ModelLoadPlan {
                         resident: element,
                         source_bytes: representation_bytes(element, &shape)?,
                         resident_bytes: representation_bytes(element, &shape)?,
-                        descriptor: WeightDescriptor {
-                            shape: shape.clone(),
-                            ..descriptor
-                        },
+                        descriptor,
                         shape,
                         scale: None,
                         bound: 0,
@@ -1896,32 +1903,27 @@ fn push_weight(
                 descriptor.name
             )
         })?;
+    let width = stored.shape.last().copied().unwrap_or(1);
+    let source = source_element(stored.encoding, width)
+        .ok_or_else(|| format!("unsupported source encoding {:?}", stored.encoding))?;
     // The logical shape the importer's exact transforms make of the stored
     // tensor (the stored shape when there are none).
-    let logical = crate::import_transforms::admit(descriptor, &stored.shape, stored.encoding)?;
+    let logical = crate::import_transforms::admit(descriptor, &stored.shape, source)?;
     let role = WeightRole { scope, kind };
     // Projector weights keep their stored dense element: the vision kernels
     // read f32, f16 and bf16 matrices and vectors directly, and converting
     // f16 matrices or f32 biases to the activation dtype only loses bits.
-    let width = stored.shape.last().copied().unwrap_or(1);
-    let stored_dense = source_element(stored.encoding, width).and_then(Element::dtype);
+    let stored_dense = source.dtype();
     let dense_resident = match (role.kind, stored_dense) {
         (WeightKind::Vision(_), Some(dtype)) => dtype,
         _ => resident_dtype(role, form.activation),
     };
-    if operators::is_fixed_dense_role(kind)
-        && !matches!(
-            stored.encoding,
-            Encoding::F32 | Encoding::F16 | Encoding::BF16
-        )
-    {
+    if operators::is_fixed_dense_role(kind) && stored_dense.is_none() {
         return Err(format!(
             "fixed-f32 weight {scope:?}/{kind:?} cannot use packed source encoding {:?}",
             stored.encoding
         ));
     }
-    let source = source_element(stored.encoding, width)
-        .ok_or_else(|| format!("unsupported source encoding {:?}", stored.encoding))?;
     // Packed projector weights become dense in the activation dtype: the GPU
     // vision kernels read dense weights only. The host dequantizes them
     // exactly to F32 and the device rounds once to the activation dtype.
@@ -2163,69 +2165,32 @@ pub fn streamed_layout(layout: Layout) -> Layout {
 }
 
 /// The layout resident packed weights use for an execution path on a device
-/// backend (spec S1/E7). Native kernels read the backend's execution layout:
-/// Metal `rows32`, Vulkan `rows16`, CUDA `mma16`; native CPU kernels read `rows8`, while every planned
-/// (compiled) kernel reads the `packet` layout.
+/// backend (spec S1/E7): native kernels read the backend's own
+/// (`BackendName::resident_layout`), every planned (compiled) kernel the
+/// `packet` layout.
 pub fn resident_layout(path: ExecutionPath, backend: BackendName) -> Layout {
-    match (path, backend) {
-        (ExecutionPath::Native, BackendName::Metal) => Layout::Rows32,
-        (ExecutionPath::Native, BackendName::Vulkan) => Layout::Rows16,
-        (ExecutionPath::Native, BackendName::Cuda) => Layout::Mma16,
-        (ExecutionPath::Native, BackendName::Cpu) => Layout::Rows8,
-        (ExecutionPath::Planned, _) => Layout::Packet,
+    match path {
+        ExecutionPath::Native => backend.resident_layout(),
+        ExecutionPath::Planned => Layout::Packet,
     }
 }
 
 /// The external storage of an artifact encoding whose rows hold `width`
-/// values (the stored last axis).
-///
-/// IQ4_NL is stored as 32-value blocks, but the registry converts a source
-/// packet into one resident packet: eight blocks reach iq4g32 (256-value
-/// groups, f32 scales; its kernels are the qualified ones for IQ4) only as
-/// one 256-value `gguf_iq4_nl` packet. So rows whose width is a multiple of
-/// 256 read that packet, and every other width reads single blocks
-/// (`gguf_iq4_nl_block`, into iq4g32s). This is the one place the width
-/// chooses an IQ4_NL tensor's forms: `resident_element` follows the source
-/// chosen here.
+/// values (the stored last axis): its dense element, or the registry's
+/// source of such rows (`None` when the registry has none). IQ4_NL rows
+/// whose width is a multiple of 256 read eight-block packets (into iq4g32),
+/// others single blocks (into iq4g32s).
 pub fn source_element(encoding: Encoding, width: u64) -> Option<Element> {
     match encoding {
-        Encoding::Iq4Nl if !width.is_multiple_of(256) => Element::named("gguf_iq4_nl_block"),
         Encoding::F32 => Some(Element::dense(DType::F32)),
         Encoding::F16 => Some(Element::dense(DType::F16)),
         Encoding::BF16 => Some(Element::dense(DType::BF16)),
-        Encoding::Q8_0 => Element::named("gguf_q8_0"),
-        Encoding::Q3K => Element::named("gguf_q3_k"),
-        Encoding::Q4K => Element::named("gguf_q4_k"),
-        Encoding::Q5K => Element::named("gguf_q5_k"),
-        Encoding::Q6K => Element::named("gguf_q6_k"),
-        Encoding::Iq2Xxs => Element::named("gguf_iq2_xxs"),
-        Encoding::Iq2Xs => Element::named("gguf_iq2_xs"),
-        Encoding::Iq3Xxs => Element::named("gguf_iq3_xxs"),
-        Encoding::Iq3S => Element::named("gguf_iq3_s"),
-        Encoding::Iq4Nl => Element::named("gguf_iq4_nl"),
-        Encoding::Iq4Xs => Element::named("gguf_iq4_xs"),
-        Encoding::Q4_0 => Element::named("gguf_q4_0"),
-        Encoding::Q5_0 => Element::named("gguf_q5_0"),
-        Encoding::Q5_1 => Element::named("gguf_q5_1"),
-        Encoding::Mxfp4 => Element::named("gguf_mxfp4"),
-        Encoding::Nvfp4 => Element::named("gguf_nvfp4"),
-        _ => None,
+        _ => Element::gguf_source(encoding, width),
     }
 }
 
-/// The one map from an artifact encoding to resident storage: dense
-/// encodings become `dense`; packed encodings become their representation
-/// (from the source format) in `layout` (from the device backend). A
-/// format without its own representation imports exactly into one that
-/// holds every value it encodes: Q3_K and IQ3_S into q6k (an f16
-/// super-scale times an int8 sixteen-value sub-block scale times a code in
-/// [-32, 31]), IQ4_NL into iq4g32 (same table) or, read as single blocks
-/// (`source_element`), into iq4g32s. NVFP4's per-tensor F32 `.scale` is a
-/// separate tensor; its representation holds the block values, in the
-/// element of the activations its producer calibrated it for
-/// (`ScaledActivations`): W4A16's `nvfp4g16`, W4A4's `nvfp4g16a4`. Only
-/// NVFP4 weights take NVFP4 operands. `width` is the stored rows' width, as
-/// `source_element` takes it.
+/// The resident storage of an artifact encoding: that of its source
+/// (`source_element`, of rows of `width` values) by [`resident_storage`].
 pub fn resident_element(
     encoding: Encoding,
     activations: ScaledActivations,
@@ -2233,33 +2198,42 @@ pub fn resident_element(
     dense: DType,
     layout: Layout,
 ) -> Option<Element> {
-    let representation = match (encoding, activations) {
-        (Encoding::Nvfp4, ScaledActivations::Nvfp4) => "nvfp4g16a4",
-        (_, ScaledActivations::Nvfp4) => return None,
-        (Encoding::F32 | Encoding::F16 | Encoding::BF16, _) => {
-            return Some(Element::dense(dense));
-        }
-        (Encoding::Iq4Nl, _)
-            if source_element(encoding, width)?.name() == "gguf_iq4_nl_block" =>
-        {
-            "iq4g32s"
-        }
-        (Encoding::Q8_0, _) => "q8g32s",
-        (Encoding::Q3K | Encoding::Iq3S | Encoding::Q6K, _) => "q6k",
-        (Encoding::Q4K, _) => "q4k",
-        (Encoding::Q5K, _) => "q5k",
-        (Encoding::Iq2Xxs, _) => "iq2xxs",
-        (Encoding::Iq2Xs, _) => "iq2xs",
-        (Encoding::Iq3Xxs, _) => "iq3xxs",
-        (Encoding::Iq4Nl | Encoding::Iq4Xs, _) => "iq4g32",
-        (Encoding::Q4_0, _) => "q4g32s",
-        (Encoding::Q5_0, _) => "q5g32s",
-        (Encoding::Q5_1, _) => "q5g32",
-        (Encoding::Mxfp4, _) => "mxfp4g32",
-        (Encoding::Nvfp4, _) => "nvfp4g16",
-        _ => return None,
+    resident_storage(source_element(encoding, width)?, activations, dense, layout)
+}
+
+/// The packet storage holding the values alone of a matrix stored as
+/// `source` (the activations a product takes do not change them): its
+/// resident storage for rounded activations, decoding to F32, in the packet
+/// layout, where a row's packets are consecutive bytes.
+pub(crate) fn value_packets(source: Element) -> Option<Element> {
+    resident_storage(
+        source,
+        ScaledActivations::Rounded,
+        DType::F32,
+        Layout::Packet,
+    )
+}
+
+/// The one map from a stored source element to resident storage: dense
+/// sources become `dense`; packed sources become what the registry's
+/// conversion of the source writes in `layout` (from the device backend)
+/// for the activations the weight's producer calibrated it for
+/// (`ScaledActivations`). NVFP4's per-tensor F32 `.scale` is a separate
+/// tensor; its W4A4 storage alone takes NVFP4 operands.
+fn resident_storage(
+    source: Element,
+    activations: ScaledActivations,
+    dense: DType,
+    layout: Layout,
+) -> Option<Element> {
+    if source.dtype().is_some() {
+        return (activations == ScaledActivations::Rounded).then_some(Element::dense(dense));
+    }
+    let operands = match activations {
+        ScaledActivations::Rounded => OperandRecipe::Rounded,
+        ScaledActivations::Nvfp4 => OperandRecipe::Nvfp4Rows,
     };
-    Element::stored(representation, layout)
+    source.converted(layout, operands)
 }
 
 /// Every element a weight can be resident as in `layout`: the image of
@@ -2353,78 +2327,48 @@ mod representation_byte_tests {
         assert_eq!(representation_bytes(q6, &[1, 256]).unwrap(), 224);
     }
 
+    /// The registry owns the encoding map: every GGUF source it converts
+    /// from is an artifact encoding's, and every encoding with a source is
+    /// resident in every layout, a dense one in the activation dtype and a
+    /// packed one as its conversion writes it, in W4A4's NVFP4-operand
+    /// element only where the conversion has one (sharing its storage).
     #[test]
-    fn one_map_chooses_representation_from_format_and_layout_from_backend() {
-        for (path, backend, layout) in [
-            (ExecutionPath::Native, BackendName::Metal, Layout::Rows32),
-            (ExecutionPath::Native, BackendName::Vulkan, Layout::Rows16),
-            (ExecutionPath::Native, BackendName::Cuda, Layout::Mma16),
-            (ExecutionPath::Native, BackendName::Cpu, Layout::Rows8),
-            (ExecutionPath::Planned, BackendName::Metal, Layout::Packet),
-        ] {
-            assert_eq!(resident_layout(path, backend), layout);
+    fn the_registry_owns_the_encoding_map() {
+        let widths = [256, 32];
+        let reached: HashSet<Element> = Encoding::ALL
+            .into_iter()
+            .flat_map(|encoding| widths.map(|width| source_element(encoding, width)))
+            .flatten()
+            .collect();
+        for source in Element::external_sources() {
+            assert!(reached.contains(&source), "{} is no encoding's source", source.name());
         }
-        for (encoding, representation) in [
-            (Encoding::Q8_0, "q8g32s"),
-            (Encoding::Q3K, "q6k"),
-            (Encoding::Q4K, "q4k"),
-            (Encoding::Q5K, "q5k"),
-            (Encoding::Q6K, "q6k"),
-            (Encoding::Iq3S, "q6k"),
-            (Encoding::Iq2Xxs, "iq2xxs"),
-            (Encoding::Iq2Xs, "iq2xs"),
-            (Encoding::Iq3Xxs, "iq3xxs"),
-            (Encoding::Iq4Nl, "iq4g32"),
-            (Encoding::Iq4Xs, "iq4g32"),
-            (Encoding::Q4_0, "q4g32s"),
-            (Encoding::Q5_0, "q5g32s"),
-            (Encoding::Q5_1, "q5g32"),
-            (Encoding::Mxfp4, "mxfp4g32"),
-            (Encoding::Nvfp4, "nvfp4g16"),
-        ] {
-            for layout in Layout::ALL {
-                let element =
-                    resident_element(encoding, ScaledActivations::Rounded, 2560, DType::BF16, layout)
-                        .unwrap();
-                assert_eq!(
-                    (element.representation(), element.layout()),
-                    (representation, layout)
-                );
-                // Only NVFP4 weights take NVFP4 operands: W4A4's element
-                // is nvfp4g16's storage.
-                let w4a4 =
-                    resident_element(encoding, ScaledActivations::Nvfp4, 2560, DType::BF16, layout);
-                match encoding {
-                    Encoding::Nvfp4 => {
-                        let w4a4 = w4a4.unwrap();
-                        assert_eq!(w4a4, Element::stored("nvfp4g16a4", layout).unwrap());
-                        assert_eq!((w4a4.representation(), w4a4.layout()), (representation, layout));
+        for encoding in Encoding::ALL {
+            for width in widths {
+                let Some(source) = source_element(encoding, width) else {
+                    continue;
+                };
+                for layout in Layout::ALL {
+                    let resident = |activations| {
+                        resident_element(encoding, activations, width, DType::BF16, layout)
+                    };
+                    let rounded = resident(ScaledActivations::Rounded).unwrap();
+                    let w4a4 = resident(ScaledActivations::Nvfp4);
+                    if source.dtype().is_some() {
+                        assert_eq!((rounded, w4a4), (Element::bf16(), None));
+                        continue;
                     }
-                    _ => assert_eq!(w4a4, None),
+                    assert_eq!(rounded.layout(), layout);
+                    assert_eq!(rounded.operand_recipe(), OperandRecipe::Rounded);
+                    if let Some(w4a4) = w4a4 {
+                        assert_eq!(w4a4.operand_recipe(), OperandRecipe::Nvfp4Rows);
+                        assert_eq!(
+                            (w4a4.representation(), w4a4.layout()),
+                            (rounded.representation(), layout)
+                        );
+                    }
                 }
             }
-        }
-        assert_eq!(
-            resident_element(
-                Encoding::F16,
-                ScaledActivations::Rounded,
-                2560,
-                DType::BF16,
-                Layout::Rows16
-            ),
-            Some(Element::bf16())
-        );
-        for encoding in [Encoding::Q1_0, Encoding::I32] {
-            assert_eq!(
-                resident_element(
-                    encoding,
-                    ScaledActivations::Rounded,
-                    2560,
-                    DType::BF16,
-                    Layout::Rows16
-                ),
-                None
-            );
         }
     }
 

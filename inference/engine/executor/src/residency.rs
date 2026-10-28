@@ -173,14 +173,6 @@ impl Stored {
         }
     }
 
-    /// The artifact encoding of a packed tensor.
-    pub(crate) fn packed_encoding(&self) -> Option<Encoding> {
-        match self {
-            Self::Dense(_) => None,
-            Self::GgmlBlocks { encoding, .. } => Some(*encoding),
-        }
-    }
-
     pub fn source_element(&self) -> Option<Element> {
         match self {
             Self::Dense(tensor) => Some(Element::dense(tensor.dtype)),
@@ -707,8 +699,8 @@ impl ResidencyStore {
     }
 
     /// Imports a plane of a progressive weight (`ImportTransform::Progressive`):
-    /// the host places it from the stored Q8_0 rows, and the device holds the
-    /// placed bytes as they are.
+    /// the host places it from the codes of the stored rows, and the device
+    /// holds the placed bytes as they are.
     pub(crate) fn import_progressive(
         &mut self,
         artifact: &GgufArtifact,
@@ -746,15 +738,8 @@ impl ResidencyStore {
         let stored = source.stored();
         let bytes = crate::programs::native_import::stored_source_bytes(stored)
             .map_err(|error| invalid(error.to_string()))?;
-        let bytes = crate::import_transforms::upload_bytes(
-            descriptor,
-            stored.shape(),
-            planned.source,
-            stored.packed_encoding(),
-            planned.upload,
-            bytes,
-        )
-        .map_err(invalid)?;
+        let bytes = crate::import_transforms::upload_bytes(&planned, stored.shape(), bytes)
+            .map_err(invalid)?;
         let tensor = Tensor::from_host(&self.device, planned.resident, &planned.shape, &bytes)
             .map_err(|error| WeightImportError::Device(error.to_string()))?;
         let weight = ResidentWeight {
@@ -1554,46 +1539,6 @@ fn validate_dense(stored: &StoredTensor) -> Result<usize, WeightImportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magnitude_family_contracts::ScaledActivations;
-
-    #[test]
-    fn catalog_encoding_map_is_exact() {
-        for encoding in [
-            Encoding::Q8_0,
-            Encoding::Q3K,
-            Encoding::Q4K,
-            Encoding::Q5K,
-            Encoding::Q6K,
-            Encoding::Iq2Xxs,
-            Encoding::Iq2Xs,
-            Encoding::Iq3Xxs,
-            Encoding::Iq3S,
-            Encoding::Iq4Nl,
-            Encoding::Iq4Xs,
-            Encoding::Q4_0,
-            Encoding::Q5_0,
-            Encoding::Q5_1,
-            Encoding::Mxfp4,
-            Encoding::Nvfp4,
-        ] {
-            assert!(source_element(encoding, 2560).is_some());
-            for layout in seismic::Layout::ALL {
-                let rounded = ScaledActivations::Rounded;
-                assert!(resident_element(encoding, rounded, 2560, DType::BF16, layout).is_some());
-            }
-        }
-        for encoding in [Encoding::Q1_0, Encoding::I32] {
-            assert!(source_element(encoding, 2560).is_none());
-            assert!(resident_element(
-                encoding,
-                ScaledActivations::Rounded,
-                2560,
-                DType::BF16,
-                seismic::Layout::Rows16
-            )
-            .is_none());
-        }
-    }
 
     #[test]
     fn checked_element_count_rejects_invalid_shapes() {

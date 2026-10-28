@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 image = { version = "=0.25.8", default-features = false, features = ["jpeg", "png", "webp"] }
+magnitude-ggml.workspace = true
 serde = { workspace = true, features = ["rc"] }
 sha2 = "=0.11.0"
 

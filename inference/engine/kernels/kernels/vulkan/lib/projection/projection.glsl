@@ -606,7 +606,7 @@ void projection_gemv_accumulate(const int wk, const int uk, const bool paired, c
             }
         }
     }
-#if PACKETS_ANY(PACKETS_BIASED_KINDS)
+#if PACKETS_ANY_BIASED
     if (packets_biased(wk) || (paired && packets_biased(uk))) {
         [[unroll]] for (uint m = 0u; m < maxm; ++m) {
             if (m < m_rows) {
@@ -886,9 +886,9 @@ void projection_gemm_load_b_of(const int kind, const uint threads, projection_we
     }
 }
 
-// Decode the staged packets (scale * code + bias, rounded to f16). Local row
-// r of this tensor becomes B row tile_row0 + r * spacing (a paired tile
-// interleaves gate and up rows); B starts at uvec4 `b_word`.
+// Decode the staged packets (their values, `packets_values`, rounded to
+// f16). Local row r of this tensor becomes B row tile_row0 + r * spacing (a
+// paired tile interleaves gate and up rows); B starts at uvec4 `b_word`.
 void projection_gemm_store_b_of(const int kind, const uint threads, projection_gemm_b regs, const uint count,
     uint tile_row0, uint spacing, uint b_word) {
     [[unroll]] for (uint j = 0u; j < projection_gemm_b_items(count, threads); ++j) {
@@ -898,15 +898,9 @@ void projection_gemm_store_b_of(const int kind, const uint threads, projection_g
             continue;
         const uint at = b_word + (tile_row0 + local * spacing) * (PROJECTION_GEMM_LDA / 8u) + 2u * within;
         if (regs.valid[j]) {
-            const float scale = packets_scale(kind, regs.packet[j], 2u * within);
-            const float bias = packets_bias(kind, regs.packet[j], packets_groups(kind) == 1u ? 0u : within);
             [[unroll]] for (uint s = 0u; s < 2u; ++s) {
                 vec4 even, odd;
-                packets_codes(kind, regs.packet[j], 2u * within + s, even, odd);
-                [[unroll]] for (uint i = 0u; i < 4u; ++i) {
-                    even[i] = seismic_fma_rn(scale, even[i], bias);
-                    odd[i] = seismic_fma_rn(scale, odd[i], bias);
-                }
+                packets_values(kind, regs.packet[j], 2u * within + s, even, odd);
                 seismic_shared_uvec4[at + s] = element_pack8(ELEMENT_F16, even, odd);
             }
         } else {
@@ -917,8 +911,8 @@ void projection_gemm_store_b_of(const int kind, const uint threads, projection_g
 }
 
 // The weight staging of a kind that may be chosen per workgroup (a segmented
-// launch, see the file header): one preprocessor group per kind a slot
-// binds, each a constant-kind staging.
+// launch, see the file header): one preprocessor group per distinct kind the
+// slots bind, each a constant-kind staging.
 #define PROJECTION_GEMM_LOAD_B(KIND) \
     if (kind == KIND) { \
         projection_gemm_load_b_of(KIND, threads, w, first, count, rows, k0, k, regs); \
@@ -932,111 +926,33 @@ void projection_gemm_store_b_of(const int kind, const uint threads, projection_g
 
 void projection_gemm_load_b(int kind, const uint threads, projection_weights w, uint first, const uint count,
     uint rows, uint k0, uint k, out projection_gemm_b regs) {
-#if PACKETS_HOLDS(PACKETS_Q4K)
-    PROJECTION_GEMM_LOAD_B(PACKETS_Q4K)
+#if defined(KERNEL_W0)
+    PROJECTION_GEMM_LOAD_B(PACKETS_W0)
 #endif
-#if PACKETS_HOLDS(PACKETS_Q5K)
-    PROJECTION_GEMM_LOAD_B(PACKETS_Q5K)
+#if defined(KERNEL_W1) && PACKETS_W1 != PACKETS_W0
+    PROJECTION_GEMM_LOAD_B(PACKETS_W1)
 #endif
-#if PACKETS_HOLDS(PACKETS_Q6K)
-    PROJECTION_GEMM_LOAD_B(PACKETS_Q6K)
+#if defined(KERNEL_W2) && PACKETS_W2 != PACKETS_W0 && PACKETS_W2 != PACKETS_W1
+    PROJECTION_GEMM_LOAD_B(PACKETS_W2)
 #endif
-#if PACKETS_HOLDS(PACKETS_Q8)
-    PROJECTION_GEMM_LOAD_B(PACKETS_Q8)
-#endif
-#if PACKETS_HOLDS(PACKETS_IQ4)
-    PROJECTION_GEMM_LOAD_B(PACKETS_IQ4)
-#endif
-#if PACKETS_HOLDS(PACKETS_IQ4S)
-    PROJECTION_GEMM_LOAD_B(PACKETS_IQ4S)
-#endif
-#if PACKETS_HOLDS(PACKETS_Q4G32S)
-    PROJECTION_GEMM_LOAD_B(PACKETS_Q4G32S)
-#endif
-#if PACKETS_HOLDS(PACKETS_MXFP4)
-    PROJECTION_GEMM_LOAD_B(PACKETS_MXFP4)
-#endif
-#if PACKETS_HOLDS(PACKETS_NVFP4)
-    PROJECTION_GEMM_LOAD_B(PACKETS_NVFP4)
-#endif
-#if PACKETS_HOLDS(PACKETS_Q5G32S)
-    PROJECTION_GEMM_LOAD_B(PACKETS_Q5G32S)
-#endif
-#if PACKETS_HOLDS(PACKETS_Q5G32)
-    PROJECTION_GEMM_LOAD_B(PACKETS_Q5G32)
-#endif
-#if PACKETS_HOLDS(PACKETS_IQ2XS)
-    PROJECTION_GEMM_LOAD_B(PACKETS_IQ2XS)
-#endif
-#if PACKETS_HOLDS(PACKETS_IQ3XXS)
-    PROJECTION_GEMM_LOAD_B(PACKETS_IQ3XXS)
-#endif
-#if PACKETS_HOLDS(PACKETS_IQ2XXS)
-    PROJECTION_GEMM_LOAD_B(PACKETS_IQ2XXS)
-#endif
-#if PACKETS_HOLDS(PACKETS_BF16)
-    PROJECTION_GEMM_LOAD_B(PACKETS_BF16)
-#endif
-#if PACKETS_HOLDS(PACKETS_F16)
-    PROJECTION_GEMM_LOAD_B(PACKETS_F16)
-#endif
-#if PACKETS_HOLDS(PACKETS_F32)
-    PROJECTION_GEMM_LOAD_B(PACKETS_F32)
+#if defined(KERNEL_W3) && PACKETS_W3 != PACKETS_W0 && PACKETS_W3 != PACKETS_W1 && PACKETS_W3 != PACKETS_W2
+    PROJECTION_GEMM_LOAD_B(PACKETS_W3)
 #endif
 }
 
 void projection_gemm_store_b(int kind, const uint threads, projection_gemm_b regs, const uint count,
     uint tile_row0, uint spacing, uint b_word) {
-#if PACKETS_HOLDS(PACKETS_Q4K)
-    PROJECTION_GEMM_STORE_B(PACKETS_Q4K)
+#if defined(KERNEL_W0)
+    PROJECTION_GEMM_STORE_B(PACKETS_W0)
 #endif
-#if PACKETS_HOLDS(PACKETS_Q5K)
-    PROJECTION_GEMM_STORE_B(PACKETS_Q5K)
+#if defined(KERNEL_W1) && PACKETS_W1 != PACKETS_W0
+    PROJECTION_GEMM_STORE_B(PACKETS_W1)
 #endif
-#if PACKETS_HOLDS(PACKETS_Q6K)
-    PROJECTION_GEMM_STORE_B(PACKETS_Q6K)
+#if defined(KERNEL_W2) && PACKETS_W2 != PACKETS_W0 && PACKETS_W2 != PACKETS_W1
+    PROJECTION_GEMM_STORE_B(PACKETS_W2)
 #endif
-#if PACKETS_HOLDS(PACKETS_Q8)
-    PROJECTION_GEMM_STORE_B(PACKETS_Q8)
-#endif
-#if PACKETS_HOLDS(PACKETS_IQ4)
-    PROJECTION_GEMM_STORE_B(PACKETS_IQ4)
-#endif
-#if PACKETS_HOLDS(PACKETS_IQ4S)
-    PROJECTION_GEMM_STORE_B(PACKETS_IQ4S)
-#endif
-#if PACKETS_HOLDS(PACKETS_Q4G32S)
-    PROJECTION_GEMM_STORE_B(PACKETS_Q4G32S)
-#endif
-#if PACKETS_HOLDS(PACKETS_MXFP4)
-    PROJECTION_GEMM_STORE_B(PACKETS_MXFP4)
-#endif
-#if PACKETS_HOLDS(PACKETS_NVFP4)
-    PROJECTION_GEMM_STORE_B(PACKETS_NVFP4)
-#endif
-#if PACKETS_HOLDS(PACKETS_Q5G32S)
-    PROJECTION_GEMM_STORE_B(PACKETS_Q5G32S)
-#endif
-#if PACKETS_HOLDS(PACKETS_Q5G32)
-    PROJECTION_GEMM_STORE_B(PACKETS_Q5G32)
-#endif
-#if PACKETS_HOLDS(PACKETS_IQ2XS)
-    PROJECTION_GEMM_STORE_B(PACKETS_IQ2XS)
-#endif
-#if PACKETS_HOLDS(PACKETS_IQ3XXS)
-    PROJECTION_GEMM_STORE_B(PACKETS_IQ3XXS)
-#endif
-#if PACKETS_HOLDS(PACKETS_IQ2XXS)
-    PROJECTION_GEMM_STORE_B(PACKETS_IQ2XXS)
-#endif
-#if PACKETS_HOLDS(PACKETS_BF16)
-    PROJECTION_GEMM_STORE_B(PACKETS_BF16)
-#endif
-#if PACKETS_HOLDS(PACKETS_F16)
-    PROJECTION_GEMM_STORE_B(PACKETS_F16)
-#endif
-#if PACKETS_HOLDS(PACKETS_F32)
-    PROJECTION_GEMM_STORE_B(PACKETS_F32)
+#if defined(KERNEL_W3) && PACKETS_W3 != PACKETS_W0 && PACKETS_W3 != PACKETS_W1 && PACKETS_W3 != PACKETS_W2
+    PROJECTION_GEMM_STORE_B(PACKETS_W3)
 #endif
 }
 
@@ -1221,7 +1137,7 @@ vec2 projection_gemm_pair(inout projection_gemm_acc acc, const uint wn, uint q) 
         * vec2(seismic_shared_f32[scratch + 2u * pair], seismic_shared_f32[scratch + 2u * pair + 1u]);
 #else
     // Pair q's two accumulators are 2 q and 2 q + 1, written over `q` itself
-    // (`packets_kquant_coefficients`).
+    // (`packets_coefficients`).
     const uint block = q / 16u, within = q % 16u;
     const uint at = 2u * q;
     return acc.scale[4u * (block / (wn / 32u)) + within / 4u] * vec2(acc.c[at], acc.c[at + 1u]);

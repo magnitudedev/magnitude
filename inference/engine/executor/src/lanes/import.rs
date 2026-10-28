@@ -101,11 +101,7 @@ impl ValidatedImportLaunch {
         inputs: ImportLaunchInputs,
         domain: &ResourceDomainId,
     ) -> Result<Self, (ImportLaunchInputs, InvariantError)> {
-        let count = inputs
-            .plan
-            .shape
-            .iter()
-            .try_fold(1u64, |count, extent| count.checked_mul(*extent));
+        let count = crate::planning::elements(&inputs.plan.shape);
         let source_tensor = inputs.workspace.source();
         let source_matches = source_tensor.element() == inputs.plan.upload
             && count.is_some_and(|count| source_tensor.extents() == [count])

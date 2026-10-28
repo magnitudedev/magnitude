@@ -664,17 +664,21 @@ pub fn code_recipe(
                 b.word(WordOp::Sub, b.word(WordOp::Xor, raw, sign), sign)
             }
             CodeInterpretation::Offset(offset) => b.word(WordOp::Sub, raw, b.u(*offset as u32)),
-            CodeInterpretation::Table(table) => {
+            CodeInterpretation::Odd => {
+                b.word(WordOp::Add, b.word(WordOp::Shl, raw, b.u(1)), b.u(1))
+            }
+            CodeInterpretation::Table(codebook) => {
+                let table = codebook.values;
                 assert_eq!(
                     table.len() as u64,
                     1u64 << bits,
                     "code table must cover its codes"
                 );
-                let mut value = b.u(table[0] as u32);
+                let mut value = b.u(i32::from(table[0]) as u32);
                 for (i, &entry) in table.iter().enumerate().skip(1) {
                     value = b.select(
                         b.word_cmp(CmpOp::Eq, raw, b.u(i as u32)),
-                        b.u(entry as u32),
+                        b.u(i32::from(entry) as u32),
                         value,
                     );
                 }
@@ -699,8 +703,8 @@ pub fn grid_code_recipe(grid: &'static crate::registry::GridCodes) -> Arc<Refere
         let b = Recipe::default();
         let entry = b.input(0, DType::U32);
         let lane = b.input(1, DType::U32);
-        let lane_shift = grid.lanes.trailing_zeros();
-        assert_eq!(1 << lane_shift, grid.lanes, "grid lanes are a power of two");
+        let lane_shift = grid.lanes().trailing_zeros();
+        assert_eq!(1 << lane_shift, grid.lanes(), "grid lanes are a power of two");
         // The index this lane reads: index `lane / lanes` of the entry.
         let mut shift = b.u(0);
         for which in 1..grid.indices() {
@@ -710,30 +714,30 @@ pub fn grid_code_recipe(grid: &'static crate::registry::GridCodes) -> Arc<Refere
                     b.word(WordOp::Shr, lane, b.u(lane_shift)),
                     b.u(which),
                 ),
-                b.u(which * grid.index_bits),
+                b.u(which * grid.index_bits()),
                 shift,
             );
         }
         let index = b.word(
             WordOp::And,
             b.word(WordOp::Shr, entry, shift),
-            b.u((1 << grid.index_bits) - 1),
+            b.u((1 << grid.index_bits()) - 1),
         );
         // The point's magnitudes as two words of four lanes each.
         let half = |high: bool| {
             let word = |point: u64| (if high { point >> 32 } else { point }) as u32;
-            let mut value = b.u(word(grid.points[0]));
-            for (i, &point) in grid.points.iter().enumerate().skip(1) {
+            let mut value = b.u(word(grid.points().point(0)));
+            for i in 1..grid.points().len() {
                 value = b.select(
                     b.word_cmp(CmpOp::Eq, index, b.u(i as u32)),
-                    b.u(word(point)),
+                    b.u(word(grid.points().point(i))),
                     value,
                 );
             }
             value
         };
-        let sub = b.word(WordOp::And, lane, b.u(grid.lanes - 1));
-        let point = if grid.lanes > 4 {
+        let sub = b.word(WordOp::And, lane, b.u(grid.lanes() - 1));
+        let point = if grid.lanes() > 4 {
             b.select(b.word_cmp(CmpOp::Lt, sub, b.u(4)), half(false), half(true))
         } else {
             half(false)
@@ -750,7 +754,7 @@ pub fn grid_code_recipe(grid: &'static crate::registry::GridCodes) -> Arc<Refere
         // Seven sign bits and their even-parity eighth.
         let signs = b.word(
             WordOp::And,
-            b.word(WordOp::Shr, entry, b.u(grid.indices() * grid.index_bits)),
+            b.word(WordOp::Shr, entry, b.u(grid.indices() * grid.index_bits())),
             b.u((1 << GRID_SIGN_BITS) - 1),
         );
         let mut parity = signs;

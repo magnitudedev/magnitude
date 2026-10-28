@@ -60,19 +60,17 @@ struct ProgressiveTop {
         float scale;
         float bias;
     };
-    static void codes(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
+    // Step `step`'s eight values, fma(scale, H, bias), and two of them.
+    static void values(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
         uint e, o;
         split_nibbles(k.low[step], e, o);
-        even = unsigned_bytes(e);
-        odd = unsigned_bytes(o);
+        even = metal::fma(float4(k.scale), unsigned_bytes(e), float4(k.bias));
+        odd = metal::fma(float4(k.scale), unsigned_bytes(o), float4(k.bias));
     }
-    static float2 pair(thread const packet &k, uint step, uint j) {
+    static float2 pair_values(thread const packet &k, uint step, uint j) {
         uint b = (k.low[step] >> (8u * j)) & 0xffu;
-        return code_pair((b & 15u) | ((b >> 4) << 16), 1024.0h);
+        return metal::fma(float2(k.scale), code_pair((b & 15u) | ((b >> 4) << 16), 1024.0h), float2(k.bias));
     }
-    static float scale(thread const packet &k, uint) { return k.scale; }
-    static float bias(thread const packet &k, uint) { return k.bias; }
-    static float value(thread const packet &k, uint, float code) { return metal::fma(k.scale, code, k.bias); }
 };
 
 // The exact view: the offset-binary codes u of every plane, as c = u - 128,
@@ -93,20 +91,19 @@ struct ProgressiveExact {
         even = ((high & 0x0f0f0f0fu) << PROGRESSIVE_HALF_BITS) | (low & 0x0f0f0f0fu);
         odd = ((high & 0xf0f0f0f0u) >> (4u - PROGRESSIVE_HALF_BITS)) | ((low >> 4) & 0x0f0f0f0fu);
     }
-    static void codes(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
+    // Step `step`'s eight values, s c, and two of them.
+    static void values(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
         uint e, o;
         bytes(k, step, e, o);
-        even = byte_floats(e, half(1024u + PROGRESSIVE_OFFSET));
-        odd = byte_floats(o, half(1024u + PROGRESSIVE_OFFSET));
+        even = k.scale * byte_floats(e, half(1024u + PROGRESSIVE_OFFSET));
+        odd = k.scale * byte_floats(o, half(1024u + PROGRESSIVE_OFFSET));
     }
-    static float2 pair(thread const packet &k, uint step, uint j) {
+    static float2 pair_values(thread const packet &k, uint step, uint j) {
         uint e, o;
         bytes(k, step, e, o);
-        return code_pair(((e >> (8u * j)) & 0xffu) | (((o >> (8u * j)) & 0xffu) << 16), half(1024u + PROGRESSIVE_OFFSET));
+        return k.scale
+            * code_pair(((e >> (8u * j)) & 0xffu) | (((o >> (8u * j)) & 0xffu) << 16), half(1024u + PROGRESSIVE_OFFSET));
     }
-    static float scale(thread const packet &k, uint) { return k.scale; }
-    static float bias(thread const packet &, uint) { return 0.0f; }
-    static float value(thread const packet &k, uint, float code) { return k.scale * code; }
 };
 
 } // namespace packets

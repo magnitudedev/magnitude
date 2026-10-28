@@ -139,7 +139,8 @@ fn plane_value(encoding: &PlaneEncoding, raw: u32) -> f64 {
                     }
             }
             CodeInterpretation::Offset(offset) => f64::from(raw) - f64::from(*offset),
-            CodeInterpretation::Table(table) => f64::from(table[raw as usize]),
+            CodeInterpretation::Odd => f64::from(2 * raw + 1),
+            CodeInterpretation::Table(codebook) => f64::from(codebook.values[raw as usize]),
             // An entry of vector codes is no one value: it is its raw bits.
             CodeInterpretation::Grid(_) => f64::from(raw),
         },
@@ -608,10 +609,13 @@ fn level_tables_order_codes_by_decoded_value() {
     assert_eq!(step_of(&twos, 0x80, true), Step::To(0x81));
 
     // A table whose values are neither ordered nor distinct.
-    const TABLE: &[i32] = &[3, -1, 7, 0, 3, -5, 7, 2];
+    static TABLE: magnitude_ggml::tables::Codebook = magnitude_ggml::tables::Codebook {
+        name: "unordered",
+        values: &[3, -1, 7, 0, 3, -5, 7, 2],
+    };
     let table = Steps::of(&PlaneEncoding::Packed {
         bits: 3,
-        interpretation: CodeInterpretation::Table(TABLE),
+        interpretation: CodeInterpretation::Table(&TABLE),
     })
     .unwrap();
     // Ascending levels: -5 (5), -1 (1), 0 (3), 2 (7), 3 (0, 4), 7 (2, 6).

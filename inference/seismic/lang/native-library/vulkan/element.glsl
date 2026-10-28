@@ -62,6 +62,7 @@ void element_u32_put(uint64_t address, uint value) { seismic_u32(address).v = va
 void element_i32_put(uint64_t address, int value) { seismic_i32(address).v = value; }
 void element_f32_put(uint64_t address, float value) { seismic_f32(address).v = value; }
 void element_uvec4_put(uint64_t address, uvec4 value) { seismic_uvec4(address).v = value; }
+void element_uvec2_put(uint64_t address, uvec2 value) { seismic_uvec2(address).v = value; }
 
 // Element `index` of an i32 tensor (index maps, token ids).
 int element_i32_index(uint64_t base, uint64_t index) { return element_i32_at(base + index * 4ul); }

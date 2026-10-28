@@ -61,6 +61,7 @@ layout(buffer_reference, scalar, buffer_reference_align = 2) buffer seismic_u16 
 layout(buffer_reference, scalar, buffer_reference_align = 4) buffer seismic_u32 { uint v; };
 layout(buffer_reference, scalar, buffer_reference_align = 4) buffer seismic_i32 { int v; };
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer seismic_u64 { uint64_t v; };
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer seismic_uvec2 { uvec2 v; };
 layout(buffer_reference, scalar, buffer_reference_align = 16) buffer seismic_uvec4 { uvec4 v; };
 
 // Conversions. bf16 rounds to nearest even in integer code (NaN becomes the

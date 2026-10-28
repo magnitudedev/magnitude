@@ -1780,11 +1780,22 @@ impl Emitter<'_, '_> {
                 let index = self.repack_expression(source_packet, index);
                 let index = self.builder.ins().uextend(types::I64, index);
                 let offset = self.builder.ins().imul_imm(index, 4);
-                let base = self.builder.ins().iconst(types::I64, table.as_ptr() as i64);
+                let base = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, table.values().as_ptr() as i64);
                 let address = self.builder.ins().iadd(base, offset);
                 self.builder
                     .ins()
                     .load(types::I32, MemFlags::trusted().with_readonly(), address, 0)
+            }
+            RepackExpr::NegateIf { value, sign } => {
+                // `(value ^ -sign) + sign`: `-value` where `sign` is 1.
+                let value = self.repack_expression(source_packet, value);
+                let sign = self.repack_expression(source_packet, sign);
+                let mask = self.builder.ins().ineg(sign);
+                let flipped = self.builder.ins().bxor(value, mask);
+                self.builder.ins().iadd(flipped, sign)
             }
         }
     }

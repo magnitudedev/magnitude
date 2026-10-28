@@ -65,10 +65,15 @@ struct Segments {
     Scaling::wrap(Store{SEISMIC_PTR(RESULT), STRIDE, 0}, projection::scale_factor(SEISMIC_PTR(SCALE), EXTENT, 0, 0), \
                   1.0f)
 
-__device__ __forceinline__ void project_zero(const Out &out, unsigned M, unsigned long long columns,
-                                              unsigned row_start, unsigned row_count,
-                                              unsigned long long column_start, unsigned column_count,
-                                              unsigned tid, unsigned threads) {
+// Zeroes the results of query or gate segment `segment` (0 or 1) in a block
+// of rows and columns. Its rows and result are selected by value: indexing
+// `Segments` at a runtime segment would place all of it, weights included,
+// in local memory, written by every thread of every launch.
+__device__ __forceinline__ void project_zero(const Segments &s, int segment, unsigned M, unsigned row_start,
+                                              unsigned row_count, unsigned long long column_start,
+                                              unsigned column_count, unsigned tid, unsigned threads) {
+    const Out out = segment == 0 ? s.out[0] : s.out[1];
+    const unsigned long long columns = segment == 0 ? s.rows[0] : s.rows[1];
     for (unsigned item = tid; item < row_count * column_count; item += threads) {
         const unsigned row = row_start + item / column_count;
         const unsigned long long column = column_start + item % column_count;
@@ -96,8 +101,8 @@ __device__ __forceinline__ void project_gemv(const Pro &pro, projection::u8 *row
     const int segment = projection::locate_segment(group, groups);
     if (project_mode != 0 && segment < 2) {
         seismic_dependency_start();
-        project_zero(s.out[segment], M, s.rows[segment], 0, M, group * Shape::TPW * 16,
-                     Shape::TPW * 16, threadIdx.x % (32 * Shape::KSPLIT), 32 * Shape::KSPLIT);
+        project_zero(s, segment, M, 0, M, group * Shape::TPW * 16, Shape::TPW * 16,
+                     threadIdx.x % (32 * Shape::KSPLIT), 32 * Shape::KSPLIT);
         return;
     }
     // Every other warp runs `x` (block-collective at M = 1), including a
@@ -141,9 +146,8 @@ __device__ __forceinline__ void project_gemm(const projection::u8 *staged, const
         projection::gemm_columns(s.rows[2]), projection::gemm_columns(s.rows[3])};
     const int segment = projection::locate_segment(column, columns);
     if (project_mode != 0 && segment < 2) {
-        project_zero(s.out[segment], M, s.rows[segment],
-                     projection::gemm_band<Shape>() * Shape::BM, Shape::BM,
-                     column * 128, 128, threadIdx.x, Shape::THREADS);
+        project_zero(s, segment, M, projection::gemm_band<Shape>() * Shape::BM, Shape::BM, column * 128, 128,
+                     threadIdx.x, Shape::THREADS);
         return;
     }
     switch (segment) {

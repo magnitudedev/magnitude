@@ -131,11 +131,9 @@ kernel void routed_route_gemm(
                 typename packets::W0::packet packet = router_rows.packet(uint(expert), uint(source0 / 32));
                 for (uint step = 0; step < 4; ++step) {
                     float4 even, odd;
-                    packets::W0::codes(packet, step, even, odd);
+                    packets::W0::values(packet, step, even, odd);
                     for (uint i = 0; i < 8; ++i) {
-                        const float code = (i & 1u) ? odd[i >> 1] : even[i >> 1];
-                        experts_tile[(32 * packet_in_tile + 8 * step + i) * route_pitch + r] =
-                            packets::W0::value(packet, step, code);
+                        experts_tile[(32 * packet_in_tile + 8 * step + i) * route_pitch + r] = (i & 1u) ? odd[i >> 1] : even[i >> 1];
                     }
                 }
             } else {

@@ -1396,14 +1396,9 @@ fn host_reference_matches_portable_decode_body() {
 // ---------------------------------------------------------------------------
 // Packed weights in the rows16 layout.
 
-/// The resident row layout of the device's backend: `mma16` on CUDA,
-/// `rows16` on Metal.
+/// The resident row layout of the device's backend.
 fn resident_layout(device: &seismic::Device) -> registry::Layout {
-    match device.backend() {
-        seismic::BackendName::Cuda => registry::Layout::Mma16,
-        seismic::BackendName::Metal => registry::Layout::Rows32,
-        _ => registry::Layout::Rows16,
-    }
+    device.backend().resident_layout()
 }
 
 /// A weight of `representation` in the device's resident row layout with

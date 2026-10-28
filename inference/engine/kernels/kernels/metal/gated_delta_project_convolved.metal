@@ -253,7 +253,7 @@ template <typename W, uint BATCH_ROWS, uint PARTS, bool COLUMNS, typename In, ty
 inline void convolved_project_segment(thread const In &in, thread const Out &out,
     thread const projection::Weights<W> &w, uint m_rows, uint rows, uint k, uint tile,
     threadgroup uchar *shared, uint simdgroups, uint sg, uint lane) {
-    if constexpr (projection::matrix_codes<W>::available && SEISMIC_DIM_H % 256 == 0) {
+    if constexpr (projection::matrix_form<W>::available && SEISMIC_DIM_H % 256 == 0) {
         if constexpr (COLUMNS)
             projection::gemv_matrix_columns<W, PARTS>(in, out, w, m_rows, rows, k,
                 tile, shared, simdgroups, sg, lane);

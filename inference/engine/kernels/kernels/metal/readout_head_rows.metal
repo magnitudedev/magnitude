@@ -96,7 +96,7 @@ kernel void readout_head_rows_batch(HEAD_ROWS_ARGUMENTS,
     uint lane [[thread_index_in_simdgroup]]) {
     HEAD_ROWS_OPERANDS;
     projection::Plain<activation, projection::AllRows> x{normalized, k, 1, k, {}};
-    if constexpr (projection::matrix_codes<packets::W0>::available) {
+    if constexpr (projection::matrix_form<packets::W0>::available) {
         projection::gemv_matrix<packets::W0, BATCH_PARTS>(x, out, w,
             uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_V), k, tile, shared, simdgroups, sg, lane);
         return;

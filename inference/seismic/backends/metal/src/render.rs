@@ -27,8 +27,8 @@ use seismic_ir::physical_target::KernelEmissionLayout;
 use seismic_ir::storage::LaunchLocalKind;
 use seismic_lang::intrinsics::{AtomicOp, MathOp, ReduceOp};
 use seismic_lang::registry::{
-    CodeInterpretation, DecodeStep, FloatCodeFormat, GRID_SIGN_BITS, GridCodes, PlaneEncoding,
-    PlaneRepackRecipe, RepackExpr, RepresentationKind,
+    CodeInterpretation, DecodeStep, FloatCodeFormat, GridCodes, LookupTable, PlaneEncoding,
+    PlaneRepackRecipe, RepackExpr, RepresentationKind, GRID_SIGN_BITS,
 };
 use seismic_lang::types::DType;
 use std::collections::BTreeMap;
@@ -195,16 +195,12 @@ pub(crate) fn render(
 /// after the kernel so rendered kernels sharing one library stay distinct.
 struct LookupTables {
     prefix: String,
-    tables: Vec<&'static [i32]>,
+    tables: Vec<LookupTable>,
 }
 
 impl LookupTables {
-    fn name(&mut self, table: &'static [i32]) -> String {
-        let index = match self
-            .tables
-            .iter()
-            .position(|known| std::ptr::eq(*known, table))
-        {
+    fn name(&mut self, table: LookupTable) -> String {
+        let index = match self.tables.iter().position(|known| *known == table) {
             Some(index) => index,
             None => {
                 self.tables.push(table);
@@ -217,6 +213,7 @@ impl LookupTables {
     fn declarations(&self) -> String {
         let mut source = String::new();
         for (index, table) in self.tables.iter().enumerate() {
+            let table = table.values();
             let values = table
                 .iter()
                 .map(i32::to_string)
@@ -802,7 +799,7 @@ impl<'a> Renderer<'a> {
                         DecodeStep::InterpretGridCode {
                             raw, lane, grid, ..
                         } => {
-                            let table = self.lookups.borrow_mut().name(grid.magnitudes());
+                            let table = self.lookups.borrow_mut().name(LookupTable::Grid(grid));
                             grid_code(
                                 &temps[recipe.ordinal(*raw)],
                                 &temps[recipe.ordinal(*lane)],
@@ -1778,7 +1775,18 @@ fn repack_expression(expression: &RepackExpr, source: &str, lookups: &mut Lookup
         ),
         RepackExpr::Lookup { index, table } => {
             let index = repack_expression(index, source, lookups);
-            format!("{}[uint({index})]", lookups.name(table))
+            format!(
+                "{}[uint({index})]",
+                lookups.name(LookupTable::Repack(*table))
+            )
+        }
+        RepackExpr::NegateIf { value, sign } => {
+            // `(value ^ -sign) + sign`: `-value` where `sign` is 1.
+            let sign = repack_expression(sign, source, lookups);
+            format!(
+                "int((uint({}) ^ (0u - uint({sign}))) + uint({sign}))",
+                repack_expression(value, source, lookups)
+            )
         }
     }
 }
@@ -1815,7 +1823,9 @@ fn interpret_code(raw: &str, bits: u32, interpretation: &CodeInterpretation) -> 
             format!("(int(uint({raw}) << {shift}u) >> {shift}u)")
         }
         CodeInterpretation::Offset(offset) => format!("(int({raw}) - {offset})"),
-        CodeInterpretation::Table(table) => {
+        CodeInterpretation::Odd => format!("int(2u * uint({raw}) + 1u)"),
+        CodeInterpretation::Table(codebook) => {
+            let table = codebook.values;
             let mut expression = table[0].to_string();
             for (index, value) in table.iter().copied().enumerate().skip(1) {
                 expression = format!("(uint({raw}) == {index}u ? {value} : {expression})");
@@ -1839,12 +1849,12 @@ fn plane_lane(coords: &[String], group: u32) -> String {
 /// The code of the value at `lane` of vector-code entry `raw`
 /// (`GridCodes::code`), reading the grid's magnitudes from `table`.
 fn grid_code(raw: &str, lane: &str, grid: &GridCodes, table: &str) -> String {
-    let lanes = grid.lanes;
+    let lanes = grid.lanes();
     let index = format!(
         "((uint({raw}) >> ({}u * (({lane}) >> {}u))) & {}u)",
-        grid.index_bits,
+        grid.index_bits(),
         lanes.trailing_zeros(),
-        (1u32 << grid.index_bits) - 1
+        (1u32 << grid.index_bits()) - 1
     );
     let magnitude = format!(
         "{table}[({index}) * {lanes}u + (({lane}) & {}u)]",
@@ -1852,7 +1862,7 @@ fn grid_code(raw: &str, lane: &str, grid: &GridCodes, table: &str) -> String {
     );
     let signs = format!(
         "((uint({raw}) >> {}u) & {}u)",
-        grid.indices() * grid.index_bits,
+        grid.indices() * grid.index_bits(),
         (1u32 << GRID_SIGN_BITS) - 1
     );
     let signs = format!("({signs} | ((popcount({signs}) & 1u) << {GRID_SIGN_BITS}u))");

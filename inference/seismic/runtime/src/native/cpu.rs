@@ -308,18 +308,7 @@ fn calls<'l>(
                 .name
             });
             storages.push(storage);
-            weights.push(
-                seismic_native_cpu::components::resolve(route.tier, storage).map(|kernels| {
-                    let info = seismic_lang::registry::representation_info(
-                        element.expect("a resolved weight representation is registered"),
-                    );
-                    WeightOperand {
-                        kernels,
-                        nvfp4_operands: info.operands
-                            == seismic_lang::registry::OperandRecipe::Nvfp4Rows,
-                    }
-                }),
-            );
+            weights.push(element.and_then(|element| WeightOperand::of(route.tier, element)));
         }
         let scalars = typed_buffer::<Cpu, Executor>(&dispatch.kernel.scalars)
             .data_pointer()
