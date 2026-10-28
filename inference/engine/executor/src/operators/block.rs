@@ -894,11 +894,10 @@ pub(crate) fn class_constants_of(
         }
     }
     // The empty inject of an output entry joining a single stream
-    // (`Join::inject`): a mixer's output projection (an attention mixer's
-    // unless it ends in a post-norm tail), and the fused routed tail.
+    // (`Join::inject`): a mixer's output projection unless it ends in a
+    // post-norm tail, and the fused routed tail.
     let mixer_joins = matches!(paired.mixer_input, SublayerSource::Norm(_))
-        && (!matches!(paired.mixer, Mixer::Attention(_))
-            || post_norm_epsilon(paired.mixer_output).is_none());
+        && post_norm_epsilon(paired.mixer_output).is_none();
     let feed_forward_joins = paired.feed_forward.is_some_and(|sublayer| {
         matches!(sublayer.op, FeedForward::Routed(_))
             && matches!(sublayer.input, Some(SublayerSource::Norm(_)))
