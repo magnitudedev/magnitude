@@ -346,6 +346,13 @@ pub enum ClosedOpView<'a, B: PhysicalDialect> {
         a: ClosedValue,
         b: ClosedValue,
     },
+    /// The U32 word of entry `index & table.index_mask()` of a constant
+    /// table (`ReferenceNode::Lookup`).
+    Lookup {
+        out: ClosedValue,
+        table: seismic_lang::registry::LookupTable,
+        index: ClosedValue,
+    },
     Logic {
         op: LogicOp,
         out: ClosedBoolValue,
@@ -660,6 +667,11 @@ pub enum Op<B: PhysicalDialect> {
         a: ErasedValue,
         b: ErasedValue,
     },
+    Lookup {
+        out: ErasedValue,
+        table: seismic_lang::registry::LookupTable,
+        index: ErasedValue,
+    },
     Logic {
         op: LogicOp,
         out: ErasedValue,
@@ -812,6 +824,7 @@ impl<B: PhysicalDialect> Op<B> {
             | Self::ScalarFromBits { out, .. }
             | Self::Cmp { out, .. }
             | Self::Select { out, .. }
+            | Self::Lookup { out, .. }
             | Self::Logic { out, .. }
             | Self::Not { out, .. }
             | Self::Geometry { out, .. }

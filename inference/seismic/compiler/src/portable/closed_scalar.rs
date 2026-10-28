@@ -46,6 +46,8 @@ pub(super) enum Node {
     FromBits(Term, DType),
     /// A word of the other width (`ReferenceNode::Resize`).
     Resize(Term, DType),
+    /// A constant table's entry (`ReferenceNode::Lookup`).
+    Lookup(seismic_lang::registry::LookupTable, Term),
     NaturalFromWord(Term, DType),
     WordFromNatural(Term, DType),
     NaturalAdd(Term, Term),
@@ -186,7 +188,8 @@ impl Terms {
                 | Node::NaturalFromWord(value, _)
                 | Node::WordFromNatural(value, _)
                 | Node::NaturalDiv(value, _)
-                | Node::NaturalRem(value, _) => pending.push(*value),
+                | Node::NaturalRem(value, _)
+                | Node::Lookup(_, value) => pending.push(*value),
                 Node::PackedBits { bit, .. } => pending.push(*bit),
                 Node::Read(place) => pending.push(place.byte),
             }
@@ -221,6 +224,7 @@ impl Terms {
                     Node::Bits(a) => self.node(Node::Bits(get(a))),
                     Node::FromBits(a, dtype) => self.node(Node::FromBits(get(a), dtype)),
                     Node::Resize(a, dtype) => self.node(Node::Resize(get(a), dtype)),
+                    Node::Lookup(table, index) => self.lookup(table, get(index)),
                     Node::NaturalFromWord(a, dtype) => {
                         self.node(Node::NaturalFromWord(get(a), dtype))
                     }
@@ -296,6 +300,18 @@ impl Terms {
             Node::Constant(ReferenceScalar::Bool(true)) => yes,
             Node::Constant(ReferenceScalar::Bool(false)) => no,
             _ => self.node(Node::Select(condition, yes, no)),
+        }
+    }
+    pub(super) fn lookup(
+        &mut self,
+        table: seismic_lang::registry::LookupTable,
+        index: Term,
+    ) -> Term {
+        match self.nodes[index.0] {
+            Node::Constant(ReferenceScalar::U32(index)) => {
+                self.scalar(ReferenceScalar::U32(table.entry(index) as u32))
+            }
+            _ => self.node(Node::Lookup(table, index)),
         }
     }
     pub(super) fn and(&mut self, a: Term, b: Term) -> Term {
@@ -461,6 +477,7 @@ impl Terms {
                 ReferenceNode::Bits { value } => self.bits(get(value), value.ty()),
                 ReferenceNode::FromBits { value, dtype } => self.from_bits(get(value), dtype),
                 ReferenceNode::Resize { value, dtype } => self.node(Node::Resize(get(value), dtype)),
+                ReferenceNode::Lookup { table, index } => self.lookup(table, get(index)),
             };
             values.push(value);
         }
@@ -1136,6 +1153,9 @@ impl<'a> Analysis<'a> {
                     Op::Select { out, cond, a, b } => {
                         Some((*out, self.terms.select(get(cond)?, get(a)?, get(b)?)))
                     }
+                    Op::Lookup { out, table, index } => {
+                        Some((*out, self.terms.lookup(*table, get(index)?)))
+                    }
                     Op::Logic { op, out, a, b } => {
                         let value = match op {
                             ops::LogicOp::And => self.terms.and(get(a)?, get(b)?),
@@ -1279,6 +1299,7 @@ impl<'a> Analysis<'a> {
                             | Op::VectorFromLanes { .. }
                             | Op::Cmp { .. }
                             | Op::Select { .. }
+                            | Op::Lookup { .. }
                             | Op::Logic { .. }
                             | Op::Not { .. }
                     ) =>

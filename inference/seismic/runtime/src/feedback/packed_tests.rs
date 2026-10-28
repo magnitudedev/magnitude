@@ -10,7 +10,21 @@ fn packed_reads(backend: registry::BackendName) {
         path: "packed-field-read.seismic".into(),
         text: "fn probe[N](x: &tensor[N] Q) -> tensor[N] f32:\n    let mut result = tensor[N] f32\n    parallel for i in 0..N:\n        result[i] = f32(x[i])\n    return result\n".into(),
     }])).unwrap();
-    for name in ["q4g64", "q4k", "q5k", "q6k", "iq4xs", "nvfp4_e2m1_block16"] {
+    for name in [
+        "q4g64",
+        "q4k",
+        "q5k",
+        "q6k",
+        "iq4xs",
+        "nvfp4_e2m1_block16",
+        "iq2xxs",
+        "iq2xs",
+        "iq2s",
+        "iq3xxs",
+        "iq3s",
+        "iq1s",
+        "iq1m",
+    ] {
         let representation = registry::representation(name).unwrap();
         let registry::RepresentationKind::Packed(layout) =
             &registry::representation_info(representation).kind
@@ -99,4 +113,10 @@ fn cpu_packed_fields_use_the_shared_scalar_recipe() {
 #[ignore = "requires Metal device"]
 fn metal_packed_fields_use_the_shared_scalar_recipe() {
     packed_reads(registry::BackendName::Metal);
+}
+
+#[test]
+#[ignore = "requires CUDA device"]
+fn cuda_packed_fields_use_the_shared_scalar_recipe() {
+    packed_reads(registry::BackendName::Cuda);
 }

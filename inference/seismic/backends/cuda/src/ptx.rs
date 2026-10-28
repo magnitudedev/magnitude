@@ -256,6 +256,11 @@ impl<'a> Emitter<'a> {
                         }
                     }
                 }
+                Op::Lookup { table, .. } => {
+                    if !self.lookup_tables.contains(table) {
+                        self.lookup_tables.push(*table);
+                    }
+                }
                 Op::Branch {
                     then, otherwise, ..
                 } => {
@@ -542,6 +547,24 @@ impl<'a> Emitter<'a> {
                         self.v(a.value),
                         self.v(b.value)
                     ));
+                }
+                ClosedOpView::Lookup { out, table, index } => {
+                    let ordinal = self
+                        .lookup_tables
+                        .iter()
+                        .position(|known| *known == table)
+                        .expect("every lookup table is collected before emission");
+                    let entry = self.t32();
+                    self.line(format!(
+                        "and.b32 {entry}, {}, {};",
+                        self.v(index.value),
+                        table.index_mask()
+                    ));
+                    let base = self.t64();
+                    self.line(format!("mov.u64 {base}, seismic_lookup{ordinal};"));
+                    let address = self.t64();
+                    self.line(format!("mad.wide.u32 {address}, {entry}, 4, {base};"));
+                    self.line(format!("ld.const.u32 {}, [{address}];", self.v(out.value)));
                 }
                 ClosedOpView::Logic { op, out, a, b } => self.line(format!(
                     "{}.b32 {}, {}, {};",
@@ -3799,7 +3822,8 @@ fn op_values<B: seismic_ir::physical_target::PhysicalDialect>(op: &Op<B>) -> Vec
         | Op::Bitcast { out, a, .. }
         | Op::ScalarBits { out, a }
         | Op::ScalarFromBits { out, a }
-        | Op::Not { out, a } => vec![*out, *a],
+        | Op::Not { out, a }
+        | Op::Lookup { out, index: a, .. } => vec![*out, *a],
         Op::Fma { out, a, b, c } => vec![*out, *a, *b, *c],
         Op::VectorFromLanes { out, lanes } => {
             let mut values = vec![*out];

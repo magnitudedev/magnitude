@@ -319,6 +319,8 @@ pub fn operation_cost<
             cost![demand(class, lanes(arena, a.ty), Latency)]
         }
         ClosedOpView::Select { .. } => cost![one(arena, CONTROL, Latency)],
+        // A decode table's entry, read from constant memory.
+        ClosedOpView::Lookup { .. } => cost![one(arena, REPRESENTATION, Latency)],
         ClosedOpView::Logic { .. } | ClosedOpView::Not { .. } => {
             cost![one(arena, INTEGER, Latency)]
         }

@@ -250,6 +250,8 @@ pub(crate) fn operation_cost(
         ClosedOpView::ScalarBits { .. }
         | ClosedOpView::ScalarFromBits { .. }
         | ClosedOpView::ReadPlaneLane { .. } => one(arena, INTEGER, Latency),
+        // A decode table's entry, read from the process's static table.
+        ClosedOpView::Lookup { .. } => one(arena, REPRESENTATION, Latency),
         ClosedOpView::Constant { out, .. }
         | ClosedOpView::Unary { out, .. }
         | ClosedOpView::Binary { out, .. }

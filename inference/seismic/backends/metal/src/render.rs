@@ -1104,6 +1104,15 @@ impl<'a> Renderer<'a> {
                 );
                 self.assign(raw(out), expression, lines);
             }
+            ClosedOpView::Lookup { out, table, index } => {
+                let name = self.lookups.borrow_mut().name(table);
+                let expression = format!(
+                    "uint({name}[{} & {}u])",
+                    self.name(raw(index)),
+                    table.index_mask()
+                );
+                self.assign(raw(out), expression, lines);
+            }
             ClosedOpView::Logic { op, out, a, b } => {
                 let symbol = match op {
                     LogicOp::And => "&&",

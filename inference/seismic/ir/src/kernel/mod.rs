@@ -463,6 +463,11 @@ impl<B: PhysicalDialect> Kernel<B> {
                 a: value(*a),
                 b: value(*b),
             },
+            Op::Lookup { out, table, index } => Closed::Lookup {
+                out: value(*out),
+                table: *table,
+                index: value(*index),
+            },
             Op::Logic { op, out, a, b } => Closed::Logic {
                 op: *op,
                 out: boolean(*out),

@@ -378,6 +378,24 @@ impl LookupTable {
             Self::Grid(grid) => grid.point_values(),
         }
     }
+
+    /// The mask a kernel's lookup (`ReferenceNode::Lookup`) reduces its
+    /// index by: the table's length is a power of two, so every index names
+    /// an entry.
+    pub fn index_mask(self) -> u32 {
+        let length = self.values().len();
+        assert!(
+            length.is_power_of_two(),
+            "a looked-up table has a power-of-two length"
+        );
+        (length - 1) as u32
+    }
+
+    /// The entry a kernel's lookup of `index` reads: entry `index` modulo the
+    /// table's length.
+    pub fn entry(self, index: u32) -> i32 {
+        self.values()[(index & self.index_mask()) as usize]
+    }
 }
 
 /// Values one grid entry codes.

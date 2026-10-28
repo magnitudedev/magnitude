@@ -585,6 +585,30 @@ impl Emitter<'_, '_> {
                     let value = self.builder.ins().select(condition, a, b);
                     self.define(out.value, value);
                 }
+                ClosedOpView::Lookup { out, table, index } => {
+                    // Registered tables are process-lifetime statics and the
+                    // JIT runs in this process, so the table is addressed
+                    // directly.
+                    let index = self.value(index.value);
+                    let index = self
+                        .builder
+                        .ins()
+                        .band_imm(index, i64::from(table.index_mask()));
+                    let index = self.builder.ins().uextend(types::I64, index);
+                    let offset = self.builder.ins().ishl_imm(index, 2);
+                    let base = self
+                        .builder
+                        .ins()
+                        .iconst(types::I64, table.values().as_ptr() as i64);
+                    let address = self.builder.ins().iadd(base, offset);
+                    let value = self.builder.ins().load(
+                        types::I32,
+                        MemFlags::trusted().with_readonly(),
+                        address,
+                        0,
+                    );
+                    self.define(out.value, value);
+                }
                 ClosedOpView::Logic { op, out, a, b } => {
                     let a = self.value(a.value());
                     let b = self.value(b.value());
