@@ -71,7 +71,7 @@ export const DiscoverState = Schema.Struct({
   search: Schema.String,
   filter: Schema.Literal("all", "fits"),
   lab: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
-  sort: Schema.Literal("recommended", "name", "smallest", "largest"),
+  sort: Schema.Literal("recommended", "name", "fastest", "smartest", "smallest", "largest"),
   machineExpanded: Schema.Boolean,
   selectedModel: Schema.optionalWith(CatalogFormModelIdSchema, { as: "Option", exact: true }),
   recommendedScroll: Schema.Number,

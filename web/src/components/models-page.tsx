@@ -1,6 +1,6 @@
 import type { ReactNode } from "react"
 import { Option } from "effect"
-import { formatLocalModelDisplayName, localModelIsInstalled, useLocalModelCommandStatus, useLocalModelMutations, type ApplicationPage } from "@magnitudedev/client-common"
+import { formatLocalModelDisplayName, localModelEstimatedTokensPerSecond, localModelFacts, localModelIsInstalled, useLocalModelCommandStatus, useLocalModelMutations, type ApplicationPage } from "@magnitudedev/client-common"
 import type { CustomLocalModel, CustomModelAcquisitionState, LocalModel } from "@magnitudedev/sdk"
 import { HiddenModels, UnhideButton } from "./local-model-lists"
 import { ErrorNotice, NoticeAction } from "./error-notice"
@@ -11,6 +11,10 @@ import type { AddDialogRequest } from "./add-model-dialog"
 /** A catalog or added model's download and the one-time optimization that follows it. */
 export const acquiring = (acquisition: CustomModelAcquisitionState) =>
   acquisition._tag === "Installing" || acquisition._tag === "Updating" || acquisition._tag === "Optimizing"
+
+/** Higher values first; models without one (unrated, or no speed estimate) after every model with one. */
+const descendingKnown = (a: Option.Option<number>, b: Option.Option<number>): number =>
+  Option.isSome(a) && Option.isSome(b) ? b.value - a.value : Number(Option.isNone(a)) - Number(Option.isNone(b))
 
 /**
  * Catalog and My Models' list: `selected` is what the filter and lab selects leave, which the search
@@ -36,7 +40,13 @@ export const selectModels = ({ library, hidden, filter, lab, search, sort }: {
   const visible = selected.filter(model => `${formatLocalModelDisplayName(model)} ${modelLab(model)?.name ?? ""} ${model._tag === "Catalog" ? model.presentation.description : model.presentation.sourceLabel}`.toLowerCase().includes(query))
   if (sort !== "recommended") visible.sort((a, b) => {
     const byName = formatLocalModelDisplayName(a).localeCompare(formatLocalModelDisplayName(b), undefined, { numeric: true }) || a.modelId.localeCompare(b.modelId)
-    return sort === "smallest" ? a.storageBytes - b.storageBytes || byName : sort === "largest" ? b.storageBytes - a.storageBytes || byName : byName
+    switch (sort) {
+      case "fastest": return descendingKnown(localModelEstimatedTokensPerSecond(a), localModelEstimatedTokensPerSecond(b)) || byName
+      case "smartest": return descendingKnown(localModelFacts(a).intelligence, localModelFacts(b).intelligence) || byName
+      case "smallest": return a.storageBytes - b.storageBytes || byName
+      case "largest": return b.storageBytes - a.storageBytes || byName
+      default: return byName
+    }
   })
   return { selected, visible }
 }

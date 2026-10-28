@@ -299,7 +299,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
     : [{ value: "all", label: "All models" }, { value: "fits", label: "Fits my machine" }]
   const sortOptions = [
     ...(!installedOnly ? [{ value: "recommended", label: "Recommended" }] : []),
-    { value: "name", label: "Name A–Z" }, { value: "smallest", label: "Smallest download" }, { value: "largest", label: "Largest download" },
+    { value: "name", label: "Name A–Z" }, { value: "fastest", label: "Fastest (estimated)" }, { value: "smartest", label: "Most intelligent" }, { value: "smallest", label: "Smallest download" }, { value: "largest", label: "Largest download" },
   ]
   const [myFilter, setMyFilter] = useState("all")
   const [myLab, setMyLab] = useState<ModelLab | null>(null)
@@ -323,7 +323,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const setLab = (lab: ModelLab | null) => installedOnly ? setMyLab(lab) : updateDiscovery({ lab: Option.fromNullable(lab?.name) })
   const setSort = (sort: string) => {
     if (installedOnly) setMySort(sort)
-    else if (sort === "recommended" || sort === "name" || sort === "smallest" || sort === "largest") updateDiscovery({ sort })
+    else if (sort === "recommended" || sort === "name" || sort === "fastest" || sort === "smartest" || sort === "smallest" || sort === "largest") updateDiscovery({ sort })
   }
   const setView = (view: "recommended" | "all") => updateDiscovery({ view, search: view === "recommended" ? "" : discovery.search })
   const preference = useAtomValue(session.rankingPreference)

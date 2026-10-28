@@ -146,6 +146,14 @@ export const performanceRangeSpeedLabel = (
   }
 }
 
+/** The estimated decode speed at the depth models are compared at; none unless the model fits and its speed is estimated. */
+export const localModelEstimatedTokensPerSecond = (model: LocalModel): Option.Option<number> => {
+  const serving = Option.getOrUndefined(localModelServingState(model))
+  if (serving?._tag !== "Assessed" || serving.assessment._tag !== "Fits" || serving.assessment.performance._tag !== "Estimated") return Option.none()
+  const { performance, profile } = serving.assessment
+  return Option.some(nearestSample(performance.samples, Math.min(50_000, profile.contextLength)).estimatedTokensPerSecond)
+}
+
 export const localModelRadarAxes = (
   model: LocalModel
 ): Option.Option<LocalModelRadarAxes> => {
@@ -155,7 +163,6 @@ export const localModelRadarAxes = (
   }
 
   const assessment = serving.assessment
-  const comparisonContext = Math.min(50_000, assessment.profile.contextLength)
   const catalog = model._tag === "Catalog" ? Option.some(model.catalogData) : Option.none()
   const speculation = Option.getOrElse(localModelSpeculativeMethodLabel(model), () => "None")
   const variant = String(model.presentation.variantLabel)
@@ -175,12 +182,7 @@ export const localModelRadarAxes = (
       }),
     },
     {
-      // The estimate nearest the comparison depth; none while speed is pending or unavailable.
-      value: assessment.performance._tag === "Estimated"
-        ? Option.some(normalizeLocalModelRadarSpeed(
-            nearestSample(assessment.performance.samples, comparisonContext).estimatedTokensPerSecond,
-          ))
-        : Option.none(),
+      value: Option.map(localModelEstimatedTokensPerSecond(model), normalizeLocalModelRadarSpeed),
       label: "SPEED",
       detail: performanceRangeSpeedLabel(assessment.performance, assessment.profile.contextLength),
     },
