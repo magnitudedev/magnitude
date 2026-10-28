@@ -29,6 +29,8 @@ pub enum VisionActivation {
     GeluQuick,
     /// `max(x, 0)²`.
     ReluSquared,
+    /// `x σ(x)`.
+    Silu,
 }
 
 /// How an image is resized before it is cut into patches.
@@ -336,13 +338,14 @@ impl VisionLinear {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum VisionStem {
     /// A convolution of each frame's pixels (Qwen3-VL: two frames of one
-    /// still image), an optional bias, the position table, then an optional
-    /// norm of the result (Muse Glimmer's pre-norm).
+    /// still image), an optional bias, the position table when the tower has
+    /// one (LFM3-VL places patches by rotary alone), then an optional norm of
+    /// the result (Muse Glimmer's pre-norm).
     Patch {
         /// `[H, C, patch, patch]` per frame.
         frames: Vec<WeightDescriptor>,
         bias: Option<WeightDescriptor>,
-        positions: VisionPositions,
+        positions: Option<VisionPositions>,
         norm: Option<VisionNorm>,
         /// Learned rows `[R, H]` ahead of the image's patch rows (C-RADIO's
         /// class and register tokens): every block attends over them with
@@ -369,9 +372,11 @@ impl VisionStem {
         }
     }
 
-    pub fn positions(&self) -> &VisionPositions {
+    /// The learned position table, when the tower has one.
+    pub fn positions(&self) -> Option<&VisionPositions> {
         match self {
-            Self::Patch { positions, .. } | Self::NormalizedPatch { positions, .. } => positions,
+            Self::Patch { positions, .. } => positions.as_ref(),
+            Self::NormalizedPatch { positions, .. } => Some(positions),
         }
     }
 
@@ -408,6 +413,8 @@ pub enum VisionAttentionSpan {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VisionAttention {
     pub heads: u64,
+    /// Key and value heads; query head `h` reads head `h / (heads / kv_heads)`.
+    pub kv_heads: u64,
     /// Head width W, a multiple of 4.
     pub width: u64,
     pub query: VisionLinear,
@@ -450,14 +457,47 @@ impl VisionFeedForward {
     }
 }
 
-/// One transformer block: `x += post(attention(norm(x)))`, then
+/// A gated depthwise 2-D convolution over each image's patch grid (LFM3-VL):
+/// `y = output(C ⊙ conv(B ⊙ X))` with `B`, `C`, `X` the three input
+/// projections, `conv` the `k × k` per-channel kernel over the raster grid
+/// with zero padding `k / 2` (a cross-correlation, PyTorch's `conv2d`), no
+/// biases.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VisionGatedConvolution {
+    /// `B`, `[H, H]`.
+    pub input_gate: VisionLinear,
+    /// `C`, `[H, H]`.
+    pub output_gate: VisionLinear,
+    /// `X`, `[H, H]`.
+    pub value: VisionLinear,
+    /// `[H, 1, k, k]`, `k` odd.
+    pub kernel: WeightDescriptor,
+    /// `[H, H]`.
+    pub output: VisionLinear,
+}
+
+impl VisionGatedConvolution {
+    /// The kernel side `k`.
+    pub fn side(&self) -> u64 {
+        self.kernel.shape.last().copied().unwrap_or(0)
+    }
+}
+
+/// The token mixer of a vision block.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum VisionOperator {
+    Attention(VisionAttention),
+    GatedConvolution(VisionGatedConvolution),
+}
+
+/// One tower block: `x += post(operator(norm(x)))`, then
 /// `x += post(feed_forward(norm(x)))`; an absent post-norm adds the
 /// sublayer's output directly.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VisionBlock {
-    pub attention_norm: VisionNorm,
-    pub attention: VisionAttention,
-    pub attention_post_norm: Option<VisionNorm>,
+    pub operator_norm: VisionNorm,
+    pub operator: VisionOperator,
+    pub operator_post_norm: Option<VisionNorm>,
     pub feedforward_norm: VisionNorm,
     pub feedforward: VisionFeedForward,
     pub feedforward_post_norm: Option<VisionNorm>,
@@ -530,8 +570,8 @@ pub enum VisionNormSite {
     Stem,
     StemProjection,
     StemPosition,
-    AttentionInput,
-    AttentionOutput,
+    OperatorInput,
+    OperatorOutput,
     FeedForwardInput,
     FeedForwardOutput,
     Merger,
@@ -553,6 +593,10 @@ pub enum VisionLinearSite {
     Key,
     Value,
     AttentionOutput,
+    ConvolutionInputGate,
+    ConvolutionOutputGate,
+    ConvolutionValue,
+    ConvolutionOutput,
     Gate,
     Up,
     Down,
@@ -591,6 +635,8 @@ pub enum VisionWeight {
     },
     QueryNorm,
     KeyNorm,
+    /// A gated convolution's per-channel kernel.
+    ConvolutionKernel,
     StandardizeBias,
     StandardizeScale,
 }
@@ -742,7 +788,9 @@ impl VisionDescription {
                 if let Some(bias) = bias {
                     expect_shape(bias, &[hidden], "vision patch bias")?;
                 }
-                positions.validate(hidden)?;
+                if let Some(positions) = positions {
+                    positions.validate(hidden)?;
+                }
                 if let Some(norm) = norm {
                     norm.validate(hidden, "vision stem norm")?;
                 }
@@ -813,11 +861,13 @@ impl VisionDescription {
         Ok(())
     }
 
-    fn validate_block(&self, block: &VisionBlock) -> Result<(), DefinitionError> {
+    fn validate_attention(&self, attention: &VisionAttention) -> Result<(), DefinitionError> {
         let hidden = self.hidden;
-        let attention = &block.attention;
         let inner = checked_product(&[attention.heads, attention.width])?;
+        let kv_inner = checked_product(&[attention.kv_heads, attention.width])?;
         if attention.heads == 0
+            || attention.kv_heads == 0
+            || attention.heads % attention.kv_heads != 0
             || attention.width == 0
             || attention.width % 4 != 0
             || attention
@@ -828,16 +878,9 @@ impl VisionDescription {
         {
             return Err(DefinitionError::new("invalid vision attention"));
         }
-        block
-            .attention_norm
-            .validate(hidden, "vision attention norm")?;
-        for (linear, role) in [
-            (&attention.query, "vision query"),
-            (&attention.key, "vision key"),
-            (&attention.value, "vision value"),
-        ] {
-            linear.validate(inner, hidden, role)?;
-        }
+        attention.query.validate(inner, hidden, "vision query")?;
+        attention.key.validate(kv_inner, hidden, "vision key")?;
+        attention.value.validate(kv_inner, hidden, "vision value")?;
         for norm in [&attention.query_norm, &attention.key_norm]
             .into_iter()
             .flatten()
@@ -852,8 +895,42 @@ impl VisionDescription {
         attention
             .output
             .validate(hidden, inner, "vision attention output")?;
-        if let Some(norm) = &block.attention_post_norm {
-            norm.validate(hidden, "vision attention post-norm")?;
+        Ok(())
+    }
+
+    fn validate_block(&self, block: &VisionBlock) -> Result<(), DefinitionError> {
+        let hidden = self.hidden;
+        block
+            .operator_norm
+            .validate(hidden, "vision operator norm")?;
+        match &block.operator {
+            VisionOperator::Attention(attention) => self.validate_attention(attention)?,
+            VisionOperator::GatedConvolution(convolution) => {
+                for (linear, role) in [
+                    (&convolution.input_gate, "vision convolution input gate"),
+                    (&convolution.output_gate, "vision convolution output gate"),
+                    (&convolution.value, "vision convolution value"),
+                ] {
+                    linear.validate(hidden, hidden, role)?;
+                }
+                let side = convolution.side();
+                if side % 2 == 0 {
+                    return Err(DefinitionError::new(
+                        "a vision convolution kernel has an odd side",
+                    ));
+                }
+                expect_shape(
+                    &convolution.kernel,
+                    &[hidden, 1, side, side],
+                    "vision convolution kernel",
+                )?;
+                convolution
+                    .output
+                    .validate(hidden, hidden, "vision convolution output")?;
+            }
+        }
+        if let Some(norm) = &block.operator_post_norm {
+            norm.validate(hidden, "vision operator post-norm")?;
         }
         block
             .feedforward_norm
@@ -904,7 +981,9 @@ impl VisionDescription {
                 if let Some(bias) = bias {
                     out.push((role(vision, VisionWeight::PatchBias), bias));
                 }
-                out.push((role(vision, VisionWeight::Position), &positions.table));
+                if let Some(positions) = positions {
+                    out.push((role(vision, VisionWeight::Position), &positions.table));
+                }
                 if let Some(norm) = norm {
                     norm.weights(vision, VisionNormSite::Stem, &mut out);
                 }
@@ -928,30 +1007,55 @@ impl VisionDescription {
         }
         for (index, block) in self.blocks.iter().enumerate() {
             let scope = WeightScope::VisionBlock(u32_index(index));
-            let attention = &block.attention;
             block
-                .attention_norm
-                .weights(scope, VisionNormSite::AttentionInput, &mut out);
-            attention
-                .query
-                .weights(scope, VisionLinearSite::Query, &mut out);
-            attention
-                .key
-                .weights(scope, VisionLinearSite::Key, &mut out);
-            attention
-                .value
-                .weights(scope, VisionLinearSite::Value, &mut out);
-            if let Some(norm) = &attention.query_norm {
-                out.push((role(scope, VisionWeight::QueryNorm), &norm.weight));
+                .operator_norm
+                .weights(scope, VisionNormSite::OperatorInput, &mut out);
+            match &block.operator {
+                VisionOperator::Attention(attention) => {
+                    attention
+                        .query
+                        .weights(scope, VisionLinearSite::Query, &mut out);
+                    attention
+                        .key
+                        .weights(scope, VisionLinearSite::Key, &mut out);
+                    attention
+                        .value
+                        .weights(scope, VisionLinearSite::Value, &mut out);
+                    if let Some(norm) = &attention.query_norm {
+                        out.push((role(scope, VisionWeight::QueryNorm), &norm.weight));
+                    }
+                    if let Some(norm) = &attention.key_norm {
+                        out.push((role(scope, VisionWeight::KeyNorm), &norm.weight));
+                    }
+                    attention
+                        .output
+                        .weights(scope, VisionLinearSite::AttentionOutput, &mut out);
+                }
+                VisionOperator::GatedConvolution(convolution) => {
+                    convolution.input_gate.weights(
+                        scope,
+                        VisionLinearSite::ConvolutionInputGate,
+                        &mut out,
+                    );
+                    convolution.output_gate.weights(
+                        scope,
+                        VisionLinearSite::ConvolutionOutputGate,
+                        &mut out,
+                    );
+                    convolution
+                        .value
+                        .weights(scope, VisionLinearSite::ConvolutionValue, &mut out);
+                    out.push((
+                        role(scope, VisionWeight::ConvolutionKernel),
+                        &convolution.kernel,
+                    ));
+                    convolution
+                        .output
+                        .weights(scope, VisionLinearSite::ConvolutionOutput, &mut out);
+                }
             }
-            if let Some(norm) = &attention.key_norm {
-                out.push((role(scope, VisionWeight::KeyNorm), &norm.weight));
-            }
-            attention
-                .output
-                .weights(scope, VisionLinearSite::AttentionOutput, &mut out);
-            if let Some(norm) = &block.attention_post_norm {
-                norm.weights(scope, VisionNormSite::AttentionOutput, &mut out);
+            if let Some(norm) = &block.operator_post_norm {
+                norm.weights(scope, VisionNormSite::OperatorOutput, &mut out);
             }
             block
                 .feedforward_norm

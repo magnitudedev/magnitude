@@ -828,7 +828,12 @@ impl AttestedPrograms {
                 {
                     bytes += bytes!(short_conv_project)
                         + bytes!(short_conv_rows)
-                        + bytes!(attention_output)
+                        + match binding.tail {
+                            SublayerTail::Residual => bytes!(attention_output),
+                            SublayerTail::PostNorm { .. } => {
+                                bytes!(project_rows) + bytes!(post_norm_residual)
+                            }
+                        }
                 }
                 _ => {}
             }
@@ -1028,6 +1033,7 @@ impl AttestedPrograms {
                     VisionEntry::Linear => bytes!(vision_linear),
                     VisionEntry::Clamp => bytes!(vision_clamp),
                     VisionEntry::Attention => bytes!(vision_attention),
+                    VisionEntry::GatedConvolution => bytes!(vision_gated_convolution),
                     VisionEntry::Pool => bytes!(vision_pool),
                     VisionEntry::Position => bytes!(vision_position),
                     VisionEntry::PostNormResidual => bytes!(post_norm_residual),
@@ -1991,6 +1997,7 @@ impl AttestedPrograms {
             charge!(vision.linear.values());
             charge!(vision.clamp.values());
             charge!(vision.attention.values());
+            charge!(vision.gated_convolution.values());
             charge!(vision.pool.values());
             charge!(vision.position.values());
             charge!(vision.post_norm.values());
@@ -2536,7 +2543,7 @@ impl AttestedPrograms {
                 AttestedMixer::ShortConv(handles) => {
                     charge!(&handles.project);
                     charge!(&handles.rows);
-                    charge!(&handles.output);
+                    tail!(&handles.output);
                 }
             }
             if let Some(feed_forward) = &block.feed_forward {
@@ -2737,6 +2744,9 @@ impl AttestedPrograms {
                 charge!(kernel);
             }
             for kernel in kernels.attention.values() {
+                charge!(kernel);
+            }
+            for kernel in kernels.gated_convolution.values() {
                 charge!(kernel);
             }
             for kernel in kernels.pool.values() {

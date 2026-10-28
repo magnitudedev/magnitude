@@ -4,7 +4,9 @@
 //! dimensions is permuted into this pairing at import.
 
 use crate::{HeaderError, Metadata};
-use magnitude_family_contracts::{ImportTransform, Rotary, RotaryPair};
+use magnitude_family_contracts::{
+    ImportTransform, Rotary, RotaryDivisors, RotaryPair, WeightDescriptor,
+};
 use std::f64::consts::PI;
 
 /// Rotary over the first `rotated` dimensions of a `width`-wide head: pair
@@ -13,6 +15,44 @@ pub fn table(rotated: u64, width: u64, base: f64) -> Result<Rotary, HeaderError>
     pairs(rotated, width, base, |_, frequency| RotaryPair {
         frequency,
         amplitude: 1.0,
+    })
+}
+
+/// Rotary over a whole `width`-wide head whose first `rotated` pairs turn at
+/// the frequencies of the whole width, `base^(-2p/width)`, and whose other
+/// pairs have frequency zero (exact pass-through). The checkpoint stores the
+/// split only as the per-pair `divisors` (1 for rotated pairs, 1e30 for the
+/// rest), `[width/2]` F32, which the importer checks against this table.
+pub fn zero_tail(
+    width: u64,
+    base: f64,
+    rotated: u64,
+    divisors: WeightDescriptor,
+) -> Result<Rotary, HeaderError> {
+    let pairs = width / 2;
+    if !width.is_multiple_of(2) || rotated == 0 || rotated > pairs || base <= 1.0 {
+        return Err(HeaderError::Rotary {
+            rotated: 2 * rotated,
+            width,
+            base,
+        });
+    }
+    let bases: Vec<f64> = (0..pairs)
+        .map(|pair| base.powf(-(pair as f64) / pairs as f64))
+        .collect();
+    Ok(Rotary::Table {
+        pairs: bases
+            .iter()
+            .enumerate()
+            .map(|(pair, base)| RotaryPair {
+                frequency: if (pair as u64) < rotated { *base } else { 0.0 },
+                amplitude: 1.0,
+            })
+            .collect(),
+        divisors: Some(RotaryDivisors {
+            weight: divisors,
+            bases,
+        }),
     })
 }
 

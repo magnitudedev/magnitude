@@ -9,7 +9,8 @@
 //!    publication, `short_conv_rows` (one computation for every row class:
 //!    each row is independent);
 //! 3. the output projection plus the residual, `attention_output` over one
-//!    head of `channels` channels.
+//!    head of `channels` channels, or for a post-norm sublayer the
+//!    projection normalized into the residual (`operators::output`).
 //!
 //! The bank holds one component, the F32 window of `u` rows, which is also
 //! the layer's tape; slots and versions follow the recurrent contract, so
@@ -17,8 +18,9 @@
 
 pub(crate) mod graph;
 
+use crate::SublayerTail;
 use crate::error::PlanError;
-use magnitude_family_contracts::ShortConv;
+use magnitude_family_contracts::{OutputForm, ShortConv};
 use seismic::Element;
 
 /// Every static axis of a short convolution over a `hidden`-wide residual.
@@ -101,6 +103,8 @@ pub struct ShortConvBinding {
     pub value: Element,
     pub output: Element,
     pub activation: Element,
+    /// How the output projection joins the residual.
+    pub tail: SublayerTail,
 }
 
 /// The short convolutions the entries implement: at least one tap before
@@ -133,6 +137,7 @@ pub(super) fn shape_key(conv: &ShortConv) -> String {
 /// projection bound with an accumulator-scale port (every projection's).
 pub(super) fn binding(
     conv: &ShortConv,
+    output: &OutputForm,
     hidden: u64,
     lookup: impl Fn(magnitude_family_contracts::WeightKind) -> Result<Element, PlanError>,
     scalable: impl Fn(
@@ -150,5 +155,6 @@ pub(super) fn binding(
         value: projection(WeightKind::ShortConvValue)?,
         output: projection(WeightKind::RecurrentOutput)?,
         activation,
+        tail: super::tail(output, &lookup)?,
     })
 }

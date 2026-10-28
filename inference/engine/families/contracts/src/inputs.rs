@@ -1,6 +1,6 @@
 //! Closed numerical input after family interpretation.
 
-use crate::ModelDefinition;
+use crate::{ModelDefinition, VisionPositions};
 use magnitude_artifacts::{
     media::{DType, PreparedMedia, PreparedTensor},
     InputLayout, TokenId,
@@ -43,25 +43,31 @@ impl TokenPlan {
 /// by an encoder stage, one entry per tower row. Tower row `r` holds the
 /// processor's patch row `patch_order[r]` (the identity unless the tower
 /// attends within windows); its rotary coordinates are
-/// `attention_coordinates[r]`; its position-table value is the blend of the
-/// four table rows `interpolation_indices[·][r]` with the matching
-/// coefficients; a windowed layer lets it attend to the tower rows
-/// `window_ranges[r]` (`[start, end)`, empty without windows).
+/// `attention_coordinates[r]`; its position-table value, when the tower has a
+/// table, is `position_blend`'s blend for row `r`; a windowed layer lets it
+/// attend to the tower rows `window_ranges[r]` (`[start, end)`, empty without
+/// windows).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VisionSpatialControls {
     patch_order: Vec<usize>,
     attention_coordinates: Vec<[i32; 2]>,
-    interpolation_indices: [Vec<i32>; 4],
-    interpolation_coefficients: [Vec<f32>; 4],
+    position_blend: Option<VisionPositionBlend>,
     window_ranges: Vec<[i32; 2]>,
+}
+
+/// The position-table value of each tower row: the blend of the four table
+/// rows `indices[·][r]` with the matching `coefficients[·][r]`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VisionPositionBlend {
+    pub indices: [Vec<i32>; 4],
+    pub coefficients: [Vec<f32>; 4],
 }
 
 impl VisionSpatialControls {
     pub fn new(
         patch_order: Vec<usize>,
         attention_coordinates: Vec<[i32; 2]>,
-        interpolation_indices: [Vec<i32>; 4],
-        interpolation_coefficients: [Vec<f32>; 4],
+        position_blend: Option<VisionPositionBlend>,
         window_ranges: Vec<[i32; 2]>,
     ) -> Result<Self, InputPreparationError> {
         let rows = patch_order.len();
@@ -80,14 +86,17 @@ impl VisionSpatialControls {
             || attention_coordinates
                 .iter()
                 .any(|coordinate| coordinate.iter().any(|value| *value < 0))
-            || interpolation_indices
-                .iter()
-                .any(|indices| indices.len() != rows || indices.iter().any(|index| *index < 0))
-            || interpolation_coefficients.iter().any(|coefficients| {
-                coefficients.len() != rows
-                    || coefficients
-                        .iter()
-                        .any(|coefficient| !coefficient.is_finite() || *coefficient < 0.0)
+            || position_blend.as_ref().is_some_and(|blend| {
+                blend
+                    .indices
+                    .iter()
+                    .any(|indices| indices.len() != rows || indices.iter().any(|index| *index < 0))
+                    || blend.coefficients.iter().any(|coefficients| {
+                        coefficients.len() != rows
+                            || coefficients
+                                .iter()
+                                .any(|coefficient| !coefficient.is_finite() || *coefficient < 0.0)
+                    })
             })
             || (!window_ranges.is_empty() && window_ranges.len() != rows)
             || window_ranges.iter().enumerate().any(|(row, &[start, end])| {
@@ -102,8 +111,7 @@ impl VisionSpatialControls {
         Ok(Self {
             patch_order,
             attention_coordinates,
-            interpolation_indices,
-            interpolation_coefficients,
+            position_blend,
             window_ranges,
         })
     }
@@ -116,12 +124,8 @@ impl VisionSpatialControls {
         &self.attention_coordinates
     }
 
-    pub fn interpolation_indices(&self) -> &[Vec<i32>; 4] {
-        &self.interpolation_indices
-    }
-
-    pub fn interpolation_coefficients(&self) -> &[Vec<f32>; 4] {
-        &self.interpolation_coefficients
+    pub fn position_blend(&self) -> Option<&VisionPositionBlend> {
+        self.position_blend.as_ref()
     }
 
     pub fn window_ranges(&self) -> &[[i32; 2]] {
@@ -158,7 +162,7 @@ impl PreparedVisionInput {
             .ok()
             .and_then(|width| usize::try_from(width).ok())
             .ok_or(InputPreparationError::VisionGeometry)?;
-        let table_rows = vision.stem.positions().rows();
+        let table_rows = vision.stem.positions().map(VisionPositions::rows);
         let merge = usize::try_from(vision.preprocessing.merge)
             .ok()
             .filter(|merge| *merge > 0)
@@ -183,10 +187,14 @@ impl PreparedVisionInput {
                     .iter()
                     .enumerate()
                     .any(|(row, source)| row != *source))
-            || spatial
-                .interpolation_indices()
-                .iter()
-                .any(|indices| indices.iter().any(|index| *index as u64 >= table_rows))
+            || match (table_rows, spatial.position_blend()) {
+                (Some(table_rows), Some(blend)) => blend
+                    .indices
+                    .iter()
+                    .any(|indices| indices.iter().any(|index| *index as u64 >= table_rows)),
+                (None, None) => false,
+                (Some(_), None) | (None, Some(_)) => true,
+            }
         {
             return Err(InputPreparationError::VisionGeometry);
         }
@@ -357,8 +365,7 @@ impl PreparedModelInput {
                 let VisionSpatialControls {
                     patch_order,
                     attention_coordinates,
-                    interpolation_indices,
-                    interpolation_coefficients,
+                    position_blend,
                     window_ranges,
                 } = image.spatial;
                 let image = PreparedVisionInput::new(
@@ -368,8 +375,7 @@ impl PreparedModelInput {
                     VisionSpatialControls::new(
                         patch_order,
                         attention_coordinates,
-                        interpolation_indices,
-                        interpolation_coefficients,
+                        position_blend,
                         window_ranges,
                     )?,
                 )?;

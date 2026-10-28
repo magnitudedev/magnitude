@@ -85,23 +85,30 @@ impl<'a> QualificationView<'a> {
             match kernel.entry {
                 VisionEntry::PatchStem => {
                     let entry = "vision_patch_stem";
-                    let (c, s, p, h, nb) = (
+                    let (c, s, p, h, nb, nt) = (
                         statics("C")?,
                         statics("S")?,
                         statics("P")?,
                         statics("H")?,
                         statics("NB")?,
+                        statics("NT")?,
                     );
-                    let table_shape = self.weight_shape(
-                        WeightScope::Vision,
-                        WeightKind::Vision(VisionWeight::Position),
-                        entry,
-                    )?;
-                    let l = table_shape.iter().product::<u64>() / h;
+                    let l = if nt == 1 {
+                        let table_shape = self.weight_shape(
+                            WeightScope::Vision,
+                            WeightKind::Vision(VisionWeight::Position),
+                            entry,
+                        )?;
+                        table_shape.iter().product::<u64>() / h
+                    } else {
+                        0
+                    };
                     let bias_values = pattern(h, 7, 0);
                     let table_row = pattern(h, 5, 1);
                     let mut table_values = vec![0.0; (l * h) as usize];
-                    table_values[..h as usize].copy_from_slice(&table_row);
+                    if nt == 1 {
+                        table_values[..h as usize].copy_from_slice(&table_row);
+                    }
                     let result = prepared(&kernels.patch_stem, kernel, entry, label)?
                         .call(vision_patch_stem::Args {
                             pixels: &zeros(entry, Element::f32(), &[rows, c, 1 + s, p, p])?,
@@ -116,15 +123,15 @@ impl<'a> QualificationView<'a> {
                             table: &values(entry, element("PE")?, &[l, h], &table_values)?,
                             indices: &semantic_i32(
                                 device,
-                                &[rows, 4],
-                                &[0, 1, 2, 3].repeat(rows as usize),
+                                &[nt, rows, 4],
+                                &[0, 1, 2, 3].repeat((nt * rows) as usize),
                                 entry,
                                 label,
                             )?,
                             coefficients: &semantic_f32(
                                 device,
-                                &[rows, 4],
-                                &[1.0, 0.0, 0.0, 0.0].repeat(rows as usize),
+                                &[nt, rows, 4],
+                                &[1.0, 0.0, 0.0, 0.0].repeat((nt * rows) as usize),
                                 entry,
                                 label,
                             )?,
@@ -134,7 +141,14 @@ impl<'a> QualificationView<'a> {
                     let row = table_row
                         .iter()
                         .zip(&bias_values)
-                        .map(|(table, bias)| if nb == 1 { bias + table } else { *table })
+                        .map(|(table, bias)| {
+                            let table = if nt == 1 { *table } else { 0.0 };
+                            if nb == 1 {
+                                bias + table
+                            } else {
+                                table
+                            }
+                        })
                         .collect::<Vec<_>>();
                     require_values(&result, &repeated(&row, rows), entry, label)?;
                 }
@@ -282,8 +296,9 @@ impl<'a> QualificationView<'a> {
                 }
                 VisionEntry::Attention => {
                     let entry = "vision_attention";
-                    let (heads, quarter, nq, nv, ws) = (
-                        statics("H")?,
+                    let (kv_heads, group, quarter, nq, nv, ws) = (
+                        statics("KV")?,
+                        statics("G")?,
                         statics("P")?,
                         statics("NQ")?,
                         statics("NV")?,
@@ -291,15 +306,24 @@ impl<'a> QualificationView<'a> {
                     );
                     let width = 4 * quarter;
                     let activation = element("A")?;
-                    let shape = [rows, heads, width];
+                    let shared = [rows, kv_heads, width];
                     // Every row holds the same values, so a uniform
-                    // attention returns them.
-                    let value_row = pattern(heads * width, 7, 0);
+                    // attention returns them, each query head its group's.
+                    let value_row = pattern(kv_heads * width, 7, 0);
+                    let attended_row = value_row
+                        .chunks(width as usize)
+                        .flat_map(|head| head.repeat(group as usize))
+                        .collect::<Vec<_>>();
                     let result = prepared(&kernels.attention, kernel, entry, label)?
                         .call(vision_attention::Args {
-                            query: &zeros(entry, activation, &shape)?,
-                            key: &zeros(entry, activation, &shape)?,
-                            value: &values(entry, activation, &shape, &repeated(&value_row, rows))?,
+                            query: &zeros(entry, activation, &[rows, kv_heads * group, width])?,
+                            key: &zeros(entry, activation, &shared)?,
+                            value: &values(
+                                entry,
+                                activation,
+                                &shared,
+                                &repeated(&value_row, rows),
+                            )?,
                             query_norm: &semantic_ones(
                                 device,
                                 Element::f32(),
@@ -338,8 +362,62 @@ impl<'a> QualificationView<'a> {
                     if nv == 1 {
                         require_finite_nonzero(&result, entry, label)?;
                     } else {
-                        require_values(&result, &repeated(&value_row, rows), entry, label)?;
+                        require_values(&result, &repeated(&attended_row, rows), entry, label)?;
                     }
+                }
+                VisionEntry::GatedConvolution => {
+                    let entry = "vision_gated_convolution";
+                    let (h, taps) = (statics("H")?, statics("T")?);
+                    let activation = element("A")?;
+                    // Each row reads itself through the centre tap and the
+                    // next row through tap 0, both of weight one, and a unit
+                    // gate: twice its (uniform) row.
+                    let centre = taps / 2;
+                    let value_row = pattern(h, 7, 0);
+                    let mut weights = vec![0.0; (h * taps) as usize];
+                    for channel in 0..h as usize {
+                        weights[channel * taps as usize] = 1.0;
+                        weights[channel * taps as usize + centre as usize] = 1.0;
+                    }
+                    let neighbors = (0..rows as i32)
+                        .flat_map(|row| {
+                            (0..taps).map(move |tap| match tap {
+                                0 => (row + 1) % rows as i32,
+                                tap if tap == centre => row,
+                                _ => -1,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let result = prepared(&kernels.gated_convolution, kernel, entry, label)?
+                        .call(vision_gated_convolution::Args {
+                            value: &values(
+                                entry,
+                                activation,
+                                &[rows, h],
+                                &repeated(&value_row, rows),
+                            )?,
+                            gate: &values(
+                                entry,
+                                activation,
+                                &[rows, h],
+                                &vec![1.0; (rows * h) as usize],
+                            )?,
+                            weight: &values(entry, element("KE")?, &[h, taps], &weights)?,
+                            neighbors: &semantic_i32(
+                                device,
+                                &[rows, taps],
+                                &neighbors,
+                                entry,
+                                label,
+                            )?,
+                        })
+                        .map_err(|error| qualification_dynamic(entry, label, error))?
+                        .value;
+                    let doubled = value_row
+                        .iter()
+                        .map(|value| 2.0 * value)
+                        .collect::<Vec<_>>();
+                    require_values(&result, &repeated(&doubled, rows), entry, label)?;
                 }
                 VisionEntry::Pool => {
                     let entry = "vision_pool";

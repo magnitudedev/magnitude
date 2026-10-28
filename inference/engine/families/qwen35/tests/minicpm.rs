@@ -4,7 +4,8 @@ use magnitude_artifacts::{
 };
 use magnitude_family_common::headers;
 use magnitude_family_contracts::{
-    FamilyError, MarkerTokens, ModelDefinition, PositionSampling, TokenPlan, VisionResize,
+    FamilyError, MarkerTokens, ModelDefinition, PositionSampling, TokenPlan, VisionOperator,
+    VisionResize,
 };
 use magnitude_family_qwen35::{inspect_components, minicpm};
 
@@ -37,10 +38,14 @@ fn both_released_projectors_bind_the_exact_tower_and_merger() {
         assert!(
             v.blocks
                 .iter()
-                .all(|b| b.attention.rotary_base.is_none() && b.attention.query_norm.is_none())
+                .all(|b| matches!(
+                    &b.operator,
+                    VisionOperator::Attention(attention)
+                        if attention.rotary_base.is_none() && attention.query_norm.is_none()
+                ))
         );
         assert_eq!(
-            v.stem.positions().sampling,
+            v.stem.positions().expect("position table").sampling,
             PositionSampling::Buckets { side: 70 }
         );
         assert!(v.merger.norm.is_some() && v.merger.projection_norm.is_some());
@@ -175,10 +180,11 @@ fn crop_positions_share_the_canvas_and_repeated_crops_share_encoding() {
 fn learned_bucket_indices_and_cell_order_are_exact() {
     let s = minicpm::inputs::spatial_controls([1, 4, 4], 70).unwrap();
     assert_eq!(
-        &s.interpolation_indices()[0][..8],
+        &s.position_blend().expect("position blend").indices[0][..8],
         &[0, 17, 1190, 1207, 35, 52, 1225, 1242]
     );
-    assert!(s.interpolation_coefficients()[0].iter().all(|c| *c == 1.));
+    let coefficients = &s.position_blend().expect("position blend").coefficients;
+    assert!(coefficients[0].iter().all(|c| *c == 1.));
     assert!(s.attention_coordinates().iter().all(|c| *c == [0, 0]));
     assert!(minicpm::inputs::spatial_controls([1, 3, 4], 70).is_err());
 }

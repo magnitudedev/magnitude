@@ -1001,9 +1001,14 @@ pub(crate) fn mixer_slot(
         Mixer::StateSpace(operator) => {
             Slot::StateSpace(state_space::binding(operator, hidden, lookup, scalable, activation)?)
         }
-        Mixer::ShortConv(operator) => {
-            Slot::ShortConv(short_conv::binding(operator, hidden, lookup, &scalable, activation)?)
-        }
+        Mixer::ShortConv(operator) => Slot::ShortConv(short_conv::binding(
+            operator,
+            paired.mixer_output,
+            hidden,
+            lookup,
+            &scalable,
+            activation,
+        )?),
     })
 }
 
@@ -1112,8 +1117,9 @@ pub(crate) fn paired_block(block: &Block) -> Result<PairedBlock<'_>, PlanError> 
         }
         op => return Err(unsupported_operator(op, "mixer")),
     };
-    // Post-norm tails exist for the attention and dense output projections.
-    if !matches!(mixer_op, Mixer::Attention(_)) && !joins(&mixer.output) {
+    // Post-norm tails exist for the attention, short-convolution and dense
+    // output projections.
+    if !matches!(mixer_op, Mixer::Attention(_) | Mixer::ShortConv(_)) && !joins(&mixer.output) {
         return Err(PlanError::Unsupported(
             "sublayer post-norm after this operator",
         ));

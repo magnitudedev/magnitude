@@ -1,17 +1,20 @@
-//! Short-convolution (LFM2) block graph: the normed `u = B⊙X | C`
+//! Short-convolution (LFM2, LFM3) block graph: the normed `u = B⊙X | C`
 //! projection rows, the gated convolution over the layer's window with its
-//! publication, and the output projection plus residual
+//! publication, and the output projection plus residual, or for a post-norm
+//! sublayer the projection normalized into the residual
 //! (`operators::short_conv`). Slots and versions follow the recurrent
 //! contract, so the block binds the recurrent control ports; its bank is the
 //! window alone.
 
 use crate::operators::Join;
 use crate::operators::gated_delta::graph::RecurrentControlPorts;
+use crate::operators::output::{CheckedPostNormEntries, PostNormShape, TailEntries, post_norm};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::{WeightPort, packed_weight, scaled_weight, weight};
 use crate::{
-    ModelLoadPlan, ShortConvBinding, ShortConvShape, StateResourcePlan, native::ShortConvKernels,
+    ModelLoadPlan, ShortConvBinding, ShortConvShape, StateResourcePlan, SublayerTail,
+    native::ShortConvKernels,
 };
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{attention_output, short_conv_project, short_conv_rows};
@@ -20,7 +23,7 @@ use seismic::{Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTen
 pub(crate) struct ShortConvGraphEntries<'a, G: GraphDraft + 'a> {
     pub project: G::Binding<'a, short_conv_project::Entry>,
     pub rows: G::Binding<'a, short_conv_rows::Entry>,
-    pub output: G::Binding<'a, attention_output::Entry>,
+    pub output: TailEntries<'a, G, attention_output::Entry>,
 }
 
 impl<'a> From<&'a ShortConvKernels> for ShortConvGraphEntries<'a, NativeGraph> {
@@ -28,7 +31,7 @@ impl<'a> From<&'a ShortConvKernels> for ShortConvGraphEntries<'a, NativeGraph> {
         Self {
             project: &kernels.project,
             rows: &kernels.rows,
-            output: &kernels.output,
+            output: (&kernels.output).into(),
         }
     }
 }
@@ -38,6 +41,7 @@ pub(crate) struct CheckedShortConvEntries {
     project: [(&'static str, Element); 5],
     rows: [(&'static str, Element); 1],
     output: [(&'static str, Element); 2],
+    post_norm: Option<CheckedPostNormEntries>,
 }
 
 impl CheckedShortConvEntries {
@@ -52,6 +56,14 @@ impl CheckedShortConvEntries {
             ],
             rows: [("A", binding.activation)],
             output: [("OW", binding.output), ("A", binding.activation)],
+            post_norm: match binding.tail {
+                SublayerTail::Residual => None,
+                SublayerTail::PostNorm { norm, .. } => Some(CheckedPostNormEntries::new(
+                    binding.output,
+                    binding.activation,
+                    norm,
+                )),
+            },
         }
     }
 
@@ -59,7 +71,10 @@ impl CheckedShortConvEntries {
         ShortConvGraphEntries {
             project: &self.project,
             rows: &self.rows,
-            output: &self.output,
+            output: match &self.post_norm {
+                None => TailEntries::Residual(&self.output[..]),
+                Some(post_norm) => TailEntries::PostNorm(post_norm.entries()),
+            },
         }
     }
 }
@@ -72,6 +87,10 @@ pub(crate) struct ShortConvBlock {
     pub shape: ShortConvShape,
     /// The input norm's epsilon.
     pub epsilon: f32,
+    /// The post-norm's epsilon and the output scale, read only by a
+    /// post-norm tail.
+    pub post_norm_epsilon: f32,
+    pub post_norm_scale: f32,
     /// Index of this layer's window in the store's recurrent components.
     pub component_index: usize,
 }
@@ -180,31 +199,58 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
             },
         )?
         .value;
-    // One output head of every channel.
-    let gated = gated.reshape(&[block.rows, 1, shape.channels]);
-    let inject = join.inject(graph, block.rows, constants)?;
-    let output = graph
-        .enqueue(
-            kernels.output,
-            &[
-                shape.output_dimensions(block.rows).as_slice(),
-                &[
-                    ("OS", output.operands.scale.extent),
-                    ("OB", output.operands.bound.extent),
-                ],
-            ]
-            .concat(),
-            attention_output::WorkflowArgs {
-                hidden: hidden.into(),
-                inject: (&inject).into(),
-                gated: (&gated).into(),
-                output_weight: (&output.weight).into(),
-                output_scale: (&output.operands.scale.tensor).into(),
-                output_bound: (&output.operands.bound.tensor).into(),
-            },
-        )?
-        .value;
-    Ok((output, window, controls))
+    let mixed = match kernels.output {
+        TailEntries::Residual(entry) => {
+            // One output head of every channel.
+            let gated = gated.reshape(&[block.rows, 1, shape.channels]);
+            let inject = join.inject(graph, block.rows, constants)?;
+            graph
+                .enqueue(
+                    entry,
+                    &[
+                        shape.output_dimensions(block.rows).as_slice(),
+                        &[
+                            ("OS", output.operands.scale.extent),
+                            ("OB", output.operands.bound.extent),
+                        ],
+                    ]
+                    .concat(),
+                    attention_output::WorkflowArgs {
+                        hidden: hidden.into(),
+                        inject: (&inject).into(),
+                        gated: (&gated).into(),
+                        output_weight: (&output.weight).into(),
+                        output_scale: (&output.operands.scale.tensor).into(),
+                        output_bound: (&output.operands.bound.tensor).into(),
+                    },
+                )?
+                .value
+        }
+        TailEntries::PostNorm(entries) => {
+            let norm = weight(graph, WeightKind::PostNorm)?;
+            let out_rows = GraphConstant::identity_for_class(graph, block.rows, Some("M"))?;
+            let mixed = post_norm(
+                graph,
+                entries,
+                hidden,
+                (&gated).into(),
+                &output,
+                &norm,
+                out_rows.port().tensor(),
+                PostNormShape {
+                    rows: block.rows,
+                    out: block.rows,
+                    inputs: shape.channels,
+                    outputs: shape.hidden,
+                },
+                block.post_norm_epsilon,
+                block.post_norm_scale,
+            )?;
+            constants.push(out_rows);
+            mixed
+        }
+    };
+    Ok((mixed, window, controls))
 }
 
 #[cfg(test)]
@@ -235,8 +281,10 @@ mod tests {
     /// An LFM2-shaped decoder: short-convolution blocks (the fused `in_proj`
     /// split into B, C, X rows) with a dense and a routed feed-forward, and
     /// an ungated NEOX attention block with a routed feed-forward (sigmoid
-    /// scores ranked with a selection bias, no shared expert).
-    fn lfm2() -> (ModelDefinition, PackageManifest) {
+    /// scores ranked with a selection bias, no shared expert). With
+    /// `post_norm` the short convolutions normalize their output before the
+    /// residual add (LFM3's sandwich norm).
+    fn lfm2(post_norm: bool) -> (ModelDefinition, PackageManifest) {
         let mut tensors = Vec::new();
         let mut offset = 0;
         let mut tensor = |name: String, shape: Vec<u64>| {
@@ -285,7 +333,11 @@ mod tests {
                     convolution: tensor(name("shortconv.conv"), vec![HIDDEN, 3]),
                     output: tensor(name("shortconv.out_proj"), vec![HIDDEN, HIDDEN]),
                 })),
-                output: OutputForm::Residual,
+                output: if post_norm {
+                    OutputForm::PostNorm(rms(tensor(name("post_attention_norm"), vec![HIDDEN])))
+                } else {
+                    OutputForm::Residual
+                },
             }
         };
         let conv = [short_conv(0), short_conv(2)];
@@ -437,10 +489,17 @@ mod tests {
 
     /// Short-convolution blocks plan with a one-component bank each, and
     /// their graphs (the checked metadata route of the production fragment)
-    /// certify on every backend at every row class.
+    /// certify on every backend at every row class, joining the residual
+    /// directly or through a post-norm.
     #[test]
     fn short_convolution_blocks_plan_and_certify_on_every_backend() {
-        let (definition, manifest) = lfm2();
+        for post_norm in [false, true] {
+            short_convolution_blocks_plan_and_certify(post_norm);
+        }
+    }
+
+    fn short_convolution_blocks_plan_and_certify(post_norm: bool) {
+        let (definition, manifest) = lfm2(post_norm);
         definition.validate().unwrap();
         let limits = ResourceLimits {
             max_launch_rows: 64,
@@ -470,7 +529,11 @@ mod tests {
             .unwrap();
             let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
             let blocks = plan.target().blocks();
-            assert!(matches!(blocks[0].mixer(), MixerProgramSlot::ShortConv(_)));
+            assert!(matches!(
+                blocks[0].mixer(),
+                MixerProgramSlot::ShortConv(binding)
+                    if matches!(binding.tail, crate::SublayerTail::PostNorm { .. }) == post_norm
+            ));
             assert!(matches!(
                 blocks[0].feed_forward(),
                 Some(FeedForwardProgramSlot::Dense(_))

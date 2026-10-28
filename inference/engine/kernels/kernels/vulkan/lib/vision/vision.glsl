@@ -73,7 +73,7 @@ float vision_gelu_quick(float value) {
 //           y = Y(projection), plus residual[m, n] (F32) when bound
 //   Stem    y = ((partial[m, n] when bound) + acc [+ bias[n]]) + blended,
 //           F32, with blended the four table corners times their
-//           coefficients summed in order
+//           coefficients summed in order (zero without a table)
 
 #define VISION_LINEAR 0
 #define VISION_STEM 1
@@ -95,7 +95,7 @@ struct vision_epilogue {
     bool clamped;           // Linear
     float minimum;
     float maximum;
-    uint64_t table;         // Stem: the position table [L, columns]
+    uint64_t table;         // Stem: the position table [L, columns], or 0
     int table_kind;
     uint64_t indices;       // Stem: [M, 4] i32
     uint64_t coefficients;  // Stem: [M, 4] F32
@@ -120,11 +120,16 @@ float vision_relu_squared(float value) {
     return positive * positive;
 }
 
+float vision_silu(float value) {
+    return seismic_div_rn(value, 1.0 + precise_exp(-value));
+}
+
 float vision_activate(int code, float value) {
     return code == 1 ? vision_gelu_tanh(value)
          : code == 2 ? vision_gelu_erf(value)
          : code == 3 ? vision_gelu_quick(value)
-                     : vision_relu_squared(value);
+         : code == 4 ? vision_relu_squared(value)
+                     : vision_silu(value);
 }
 
 void vision_put(vision_epilogue out_, uint m, uint n, float value) {
@@ -151,10 +156,12 @@ void vision_put(vision_epilogue out_, uint m, uint n, float value) {
         if (out_.biased)
             projected = projected + element_at(out_.bias_kind, out_.bias, n);
         float blended = 0.0;
-        [[unroll]] for (uint i = 0u; i < 4u; ++i) {
-            const int index = element_i32_at(out_.indices + (uint64_t(m) * 4ul + i) * 4ul);
-            blended += element_at(out_.table_kind, out_.table, uint64_t(index) * out_.residual0 + n)
-                * element_f32_at(out_.coefficients + (uint64_t(m) * 4ul + i) * 4ul);
+        if (out_.table != 0ul) {
+            [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+                const int index = element_i32_at(out_.indices + (uint64_t(m) * 4ul + i) * 4ul);
+                blended += element_at(out_.table_kind, out_.table, uint64_t(index) * out_.residual0 + n)
+                    * element_f32_at(out_.coefficients + (uint64_t(m) * 4ul + i) * 4ul);
+            }
         }
         element_f32_put(out_.y + at * 4ul, projected + blended);
     }
@@ -270,19 +277,21 @@ void vision_prepare_head(const int act, uint64_t source, uint64_t target, bool n
 // query rows, head), 16 query rows per subgroup, keys streamed in
 // FLASH_KEYS-row tiles, one online-softmax pass of `lib/attention/flash.glsl`
 // per VISION_WINDOW output columns. `operands` are the f16 rows
-// [3][heads][padded][wp] (zero past the head width w); the output row r of
+// [heads + 2 * (heads / group)][padded][wp]: the query, then key, then value
+// head rows (zero past the head width w), query head h reading key and value
+// head h / group; the output row r of
 // head h is A at out_[r * heads * w + h * w ..], rounded from F32. Scores
 // are scaled by `score_scale`. Without `spans` (0) every row attends to every
 // row; with them row r attends to rows [spans[2r], spans[2r + 1]), the
 // workgroup walking the union of its rows' spans. Shared: the K/V tile
 // (FLASH_KEYS x (wp + 8) f16), then FLASH_SCRATCH_FLOATS floats per subgroup.
-void vision_attend(const int act, uint64_t operands, uint64_t out_, uint rows, uint padded, uint heads, const uint w,
-    const uint wp, float score_scale, uint64_t spans, uint tile, uint head) {
+void vision_attend(const int act, uint64_t operands, uint64_t out_, uint rows, uint padded, uint heads,
+    const uint group, const uint w, const uint wp, float score_scale, uint64_t spans, uint tile, uint head) {
     const uint lane = SEISMIC_LANE;
-    const uint64_t plane = uint64_t(heads) * padded * wp * 2ul;   // bytes of one of Q, K, V
-    const uint64_t head_rows = uint64_t(head) * padded * wp * 2ul;
-    const uint64_t keys = operands + plane + head_rows;
-    const uint64_t values = operands + 2ul * plane + head_rows;
+    const uint64_t head_bytes = uint64_t(padded) * wp * 2ul;   // bytes of one head's rows
+    const uint64_t head_rows = uint64_t(head) * head_bytes;
+    const uint64_t keys = operands + uint64_t(heads + head / group) * head_bytes;
+    const uint64_t values = keys + uint64_t(heads / group) * head_bytes;
     const uint block_row = tile * VISION_ATTEND_ROWS + 16u * SEISMIC_SUBGROUP;
     const uint64_t block_queries = operands + head_rows + uint64_t(block_row) * wp * 2ul;
     const uint scratch = (FLASH_KEYS * flash_pitch(wp)) / 2u + SEISMIC_SUBGROUP * FLASH_SCRATCH_FLOATS;

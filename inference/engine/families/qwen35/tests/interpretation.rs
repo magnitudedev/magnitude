@@ -9,7 +9,7 @@ use magnitude_artifacts::{
 use magnitude_family_contracts::{
     AttentionGate, GateFunction, HeadComponent, HeadHistory, HeadInput, ImportTransform, InputNorm,
     ModelInputAdapter, Operator, OutputForm, PositionSampling, RecurrentHeadMapping, RowRange,
-    TokenPlan, VisionResize,
+    TokenPlan, VisionOperator, VisionResize,
 };
 use magnitude_family_qwen::describe_projector;
 use magnitude_family_qwen::inputs::{QwenImageTokens, QwenInputAdapter};
@@ -597,7 +597,7 @@ fn projector_description_validates_roles_and_fused_qkv_ranges() {
     let projector = projector();
     let vision = describe_projector(&projector).unwrap();
     assert_eq!(
-        vision.stem.positions().sampling,
+        vision.stem.positions().expect("position table").sampling,
         PositionSampling::AlignedCorners { side: 2 }
     );
     assert_eq!(vision.stem.frames(), 2);
@@ -613,7 +613,9 @@ fn projector_description_validates_roles_and_fused_qkv_ranges() {
     assert_eq!(processor.merge, 2);
     assert_eq!(processor.frames, 2);
     // The fused QKV projection and its bias are imported as three row ranges.
-    let attention = &vision.blocks[0].attention;
+    let VisionOperator::Attention(attention) = &vision.blocks[0].operator else {
+        panic!("Qwen vision blocks attend");
+    };
     for (part, linear) in [&attention.query, &attention.key, &attention.value]
         .into_iter()
         .enumerate()

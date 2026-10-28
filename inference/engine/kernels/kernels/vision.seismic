@@ -28,12 +28,13 @@
 
 
 # The patch stem: the patch convolution of the first frame and of S further
-# frames, B bias rows (NB <= 1), plus the blend of four position-table rows.
-fn vision_patch_stem[M, C, S, P, H, L, NB](pixels: &tensor[M, C, 1 + S, P, P] f32,
+# frames, B bias rows (NB <= 1), plus, with NT = 1, the blend of four
+# position-table rows (NT = 0: a tower placing patches by rotary alone).
+fn vision_patch_stem[M, C, S, P, H, L, NB, NT](pixels: &tensor[M, C, 1 + S, P, P] f32,
     frame_weight: &tensor[H, C, P, P] W0, next_frame_weight: &tensor[S, H, C, P, P] W1,
-    bias: &tensor[NB, H] B, table: &tensor[L, H] PE, indices: &tensor[M, 4] i32,
-    coefficients: &tensor[M, 4] f32) -> tensor[M, H] f32
-    where S >= 0 and NB >= 0:
+    bias: &tensor[NB, H] B, table: &tensor[L, H] PE, indices: &tensor[NT, M, 4] i32,
+    coefficients: &tensor[NT, M, 4] f32) -> tensor[M, H] f32
+    where S >= 0 and NB >= 0 and NT >= 0 and L >= 0:
     let mut result = tensor[M, H] f32
     parallel for row in 0..M:
         parallel for output in 0..H:
@@ -50,8 +51,9 @@ fn vision_patch_stem[M, C, S, P, H, L, NB](pixels: &tensor[M, C, 1 + S, P, P] f3
             for bias_row in 0..NB:
                 value = value + f32(bias[bias_row, output])
             let mut blended = f32(0.0)
-            for corner in 0..4:
-                blended = blended + f32(table[indices[row, corner], output]) * coefficients[row, corner]
+            for blend in 0..NT:
+                for corner in 0..4:
+                    blended = blended + f32(table[indices[blend, row, corner], output]) * coefficients[blend, row, corner]
             result[row, output] = value + blended
     return result
 
@@ -60,8 +62,8 @@ fn vision_patch_stem[M, C, S, P, H, L, NB](pixels: &tensor[M, C, 1 + S, P, P] f3
 # convert the pixels to 16-bit GEMM rows of Kp = ceil_div(C · P · P, 8) · 8
 # (the pad zero).
 native vision_patch_stem for metal from "metal/vision_patch_stem.metal":
-    static (C, S, P, H, NB)
-    where S <= 1 and NB <= 1
+    static (C, S, P, H, NB, NT)
+    where S <= 1 and NB <= 1 and NT <= 1
     scratch partial bytes (M * H * 4)
     launch vision_patch_stem_first when S == 1:
         threadgroups (ceil_div(H, 64), ceil_div(M, 64), 1)
@@ -71,8 +73,8 @@ native vision_patch_stem for metal from "metal/vision_patch_stem.metal":
         threads_per_threadgroup (128, 1, 1)
 
 native vision_patch_stem for cuda from "cuda/vision_patch_stem.cu":
-    static (C, S, P, H, NB)
-    where S <= 1 and NB <= 1 and H % 2 == 0
+    static (C, S, P, H, NB, NT)
+    where S <= 1 and NB <= 1 and NT <= 1 and H % 2 == 0
     scratch converted bytes (M * (1 + S) * ceil_div(C * P * P, 8) * 8 * 2)
     scratch partial bytes (M * H * 4)
     launch vision_patch_stem_convert:
@@ -91,8 +93,8 @@ native vision_patch_stem for cuda from "cuda/vision_patch_stem.cu":
 # (grid-stride over pieces of 8, the x grid capped at the 65535-group
 # floor), L2/L3 the frame GEMMs.
 native vision_patch_stem for vulkan from "vulkan/vision_patch_stem.comp":
-    static (C, S, P, H, NB)
-    where S <= 1 and NB <= 1
+    static (C, S, P, H, NB, NT)
+    where S <= 1 and NB <= 1 and NT <= 1
     scratch converted bytes (M * (1 + S) * ceil_div(C * P * P, 8) * 8 * 2)
     scratch partial bytes (M * H * 4)
     launch vision_patch_stem_convert:
@@ -196,7 +198,7 @@ native vision_norm for cpu from "cpu/vision_norm.rs":
 #   activation 0, NG = 0: plus the NR residual rows (NR <= 1, F32), published
 #   to Y;
 #   activation 1 (tanh GELU), 2 (erf GELU), 3 (quick GELU), 4 (squared
-#   ReLU): Y(act(A(value)));
+#   ReLU), 5 (SiLU): Y(act(A(value)));
 #   NG = 1 (activation 0): Y(A(value) * gate), the up half of a GLU whose
 #   gate projection published A(act(A(gate))).
 fn vision_linear[M, N, K, NB, NR, NG, NC](x: &tensor[M, K] A, weight: &tensor[N, K] W,
@@ -235,6 +237,8 @@ fn vision_linear[M, N, K, NB, NR, NG, NC](x: &tensor[M, K] A, weight: &tensor[N,
             if activation == 4:
                 let positive = max(a, 0.0)
                 sum = positive * positive
+            if activation == 5:
+                sum = a / (1.0 + exp(-a))
             for gated in 0..NG:
                 sum = a * f32(gate[gated, row, output])
             for residual_row in 0..NR:
@@ -332,41 +336,44 @@ fn vision_rotate[P](source: &tensor[4 * P] f32, coordinates: &tensor[2] i32,
 
 # Non-causal attention of every patch row over the keys of its span: every
 # row (WS = 0) or the rows spans[0, row] = [start, end) (WS = 1, a window).
+# The KV * G query heads read their key and value heads in groups: query
+# head h reads key and value head h / G (G = 1 is one each).
 # Queries and keys are RMS-normalized per head with their NQ weight rows
 # (`head_norm`), then rotated; values are RMS-normalized with the NV unit
 # rows (weightless). The prepared operands are published to A. The score
 # scale is 1 / sqrt(4P), or 1 when `unit_scale` is nonzero.
-fn vision_attention[M, H, P, NQ, NV, WS](query: &tensor[M, H, 4 * P] A,
-    key: &tensor[M, H, 4 * P] A, value: &tensor[M, H, 4 * P] A,
+fn vision_attention[M, KV, G, P, NQ, NV, WS](query: &tensor[M, KV * G, 4 * P] A,
+    key: &tensor[M, KV, 4 * P] A, value: &tensor[M, KV, 4 * P] A,
     query_norm: &tensor[NQ, 4 * P] f32, key_norm: &tensor[NQ, 4 * P] f32,
     value_norm: &tensor[NV, 4 * P] f32, coordinates: &tensor[M, 2] i32,
     spans: &tensor[WS, M, 2] i32, log_base: f32, epsilon: f32,
-    unit_scale: i32) -> tensor[M, H, 4 * P] A
-    where NQ >= 0 and NV >= 0 and WS >= 0:
-    let mut prepared_query = tensor[M, H, 4 * P] A
-    let mut prepared_key = tensor[M, H, 4 * P] A
-    let mut prepared_value = tensor[M, H, 4 * P] A
+    unit_scale: i32) -> tensor[M, KV * G, 4 * P] A
+    where KV >= 1 and G >= 1 and NQ >= 0 and NV >= 0 and WS >= 0:
+    let mut prepared_query = tensor[M, KV * G, 4 * P] A
+    let mut prepared_key = tensor[M, KV * G, 4 * P] A
+    let mut prepared_value = tensor[M, KV * G, 4 * P] A
     parallel for row in 0..M:
-        parallel for head in 0..H:
+        parallel for head in 0..KV * G:
             let mut q = head_norm(query[row, head], query_norm, epsilon)
-            let mut k = head_norm(key[row, head], key_norm, epsilon)
+            let shared = head / G
+            let mut k = head_norm(key[row, shared], key_norm, epsilon)
             if log_base != 0.0:
                 q = vision_rotate[P = P](q, coordinates[row], log_base)
                 k = vision_rotate[P = P](k, coordinates[row], log_base)
             prepared_query[row, head] = q
             prepared_key[row, head] = k
-            prepared_value[row, head] = head_norm(value[row, head], value_norm, epsilon)
+            prepared_value[row, head] = head_norm(value[row, shared], value_norm, epsilon)
     let mut scale = rsqrt(f32(4 * P))
     if unit_scale != 0:
         scale = 1.0
-    let mut out = tensor[M, H, 4 * P] A
+    let mut out = tensor[M, KV * G, 4 * P] A
     parallel for row in 0..M:
         let mut first = i32(0)
         let mut end = i32(M)
         for window in 0..WS:
             first = spans[window, row, 0]
             end = spans[window, row, 1]
-        parallel for head in 0..H:
+        parallel for head in 0..KV * G:
             let mut maximum = tensor[1] f32
             let mut denominator = tensor[1] f32
             let mut acc = tensor[1, 4 * P] f32
@@ -380,62 +387,114 @@ fn vision_attention[M, H, P, NQ, NV, WS](query: &tensor[M, H, 4 * P] A,
                 out[row, head, j] = acc[0, j] / denominator[0]
     return out
 
-# GPU: the prepare launch writes each row's prepared queries, keys and values
-# as operand rows of WP = ceil_div(4P, 16) · 16 columns (the pad zero); the
-# attend launch runs 64 query rows of one head per threadgroup over the keys
-# of their spans. Metal: [M, 3, H, WP] rows, whole 64-row query tiles
-# allocated.
+# GPU: the prepare launch writes each row's prepared query heads, then key
+# heads, then value heads (H + 2KV head rows, H = KV * G) as operand rows of
+# WP = ceil_div(4P, 16) · 16 columns (the pad zero); the attend launch runs 64
+# query rows of one head per threadgroup over the keys of their spans, query
+# head h reading key and value head h / G. Metal: [M, H + 2KV, WP] rows, whole
+# 64-row query tiles allocated.
 native vision_attention for metal from "metal/vision_attention.metal":
-    static (H, P, NQ, NV, WS)
+    static (KV, G, P, NQ, NV, WS)
     where NQ <= 1 and NV <= 1 and WS <= 1
-    scratch operands bytes (ceil_div(M, 64) * 64 * 3 * H * ceil_div(4 * P, 16) * 16 * 2)
+    scratch operands bytes (ceil_div(M, 64) * 64 * (KV * G + 2 * KV) * ceil_div(4 * P, 16) * 16 * 2)
     launch vision_attention_prepare:
-        threadgroups (ceil_div(M * H * 3, 8), 1, 1)
+        threadgroups (ceil_div(M * (KV * G + 2 * KV), 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch vision_attention_attend:
-        threadgroups (ceil_div(M, 64), H, 1)
+        threadgroups (ceil_div(M, 64), KV * G, 1)
         threads_per_threadgroup (256, 1, 1)
 
 # CUDA: the attend block's staged tiles fit 48 KiB of static shared memory
 # up to WP = 112 (64-key tiles to WP = 64, 32-key tiles above).
 native vision_attention for cuda from "cuda/vision_attention.cu":
-    static (H, P, NQ, NV, WS)
+    static (KV, G, P, NQ, NV, WS)
     where NQ <= 1 and NV <= 1 and WS <= 1 and ceil_div(4 * P, 16) * 16 <= 112
-    scratch operands bytes (M * 3 * H * ceil_div(4 * P, 16) * 16 * 2)
+    scratch operands bytes (M * (KV * G + 2 * KV) * ceil_div(4 * P, 16) * 16 * 2)
     launch vision_attention_prepare:
-        threadgroups (ceil_div(M * H * 3, 8), 1, 1)
+        threadgroups (ceil_div(M * (KV * G + 2 * KV), 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch vision_attention_attend:
-        threadgroups (ceil_div(M, 64), H, 1)
+        threadgroups (ceil_div(M, 64), KV * G, 1)
         threads_per_threadgroup (128, 1, 1)
 
-# Vulkan: f16 operand rows [3][H][ceil_div(M, 64) * 64][WP] (rounded to A
+# Vulkan: f16 operand rows [H + 2KV][ceil_div(M, 64) * 64][WP] (rounded to A
 # first; zero past the last row); 16 query rows per subgroup, 32-key tiles.
 native vision_attention for vulkan from "vulkan/vision_attention.comp":
-    static (H, P, NQ, NV, WS)
+    static (KV, G, P, NQ, NV, WS)
     where NQ <= 1 and NV <= 1 and WS <= 1 and 4 * P <= 256
-    scratch operands bytes (3 * H * ceil_div(M, 64) * 64 * ceil_div(4 * P, 16) * 16 * 2)
+    scratch operands bytes ((KV * G + 2 * KV) * ceil_div(M, 64) * 64 * ceil_div(4 * P, 16) * 16 * 2)
     launch vision_attention_prepare:
-        threadgroups (ceil_div(M, 64) * 64, ceil_div(3 * H, 8), 1)
+        threadgroups (ceil_div(M, 64) * 64, ceil_div(KV * G + 2 * KV, 8), 1)
         threads_per_threadgroup (256, 1, 1)
     launch vision_attention_attend:
-        threadgroups (ceil_div(M, 64), H, 1)
+        threadgroups (ceil_div(M, 64), KV * G, 1)
         threads_per_threadgroup (128, 1, 1)
         shared_bytes (64 * (ceil_div(4 * P, 16) * 16 + 8) + 8192)
 
-# CPU: the prepare launch normalizes and rotates each row's heads into F32
-# scratch (published values rounded to A); the attend launch runs one query
+# CPU: the prepare launch normalizes and rotates each row's H + 2KV head rows
+# into F32 scratch (published values rounded to A); the attend launch runs one query
 # row of one head over its span.
 native vision_attention for cpu from "cpu/vision_attention.rs":
-    scratch operands bytes (M * 3 * H * 4 * P * 4)
+    scratch operands bytes (M * (KV * G + 2 * KV) * 4 * P * 4)
     launch vision_attention_prepare:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (4 * P * 4)
     launch vision_attention_attend:
-        threadgroups (M, H, 1)
+        threadgroups (M, KV * G, 1)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes ((M + 4 * P) * 4)
+
+
+# The gated depthwise 2-D convolution of each image's patch grid (LFM3-VL):
+# row r, channel c publishes A(A(sum) * gate[r, c]) with sum the F32 sum, in
+# tap order, of weight[c, t] * value[neighbors[r, t], c] over the T = k * k
+# taps of the k x k window (raster order) whose neighbour is present
+# (neighbors[r, t] >= 0; zero padding past the image's edges). `value` is
+# the gated input B * X and `gate` the output gate C, both published to A;
+# the neighbour table names the tower row holding each tap.
+fn vision_gated_convolution[M, H, T](value: &tensor[M, H] A, gate: &tensor[M, H] A,
+    weight: &tensor[H, T] KE, neighbors: &tensor[M, T] i32) -> tensor[M, H] A:
+    let mut convolved = tensor[M, H] A
+    parallel for row in 0..M:
+        parallel for channel in 0..H:
+            let mut sum = f32(0.0)
+            for tap in 0..T:
+                let source = neighbors[row, tap]
+                if source >= 0:
+                    sum = fma(f32(value[source, channel]), f32(weight[channel, tap]), sum)
+            convolved[row, channel] = sum
+    let mut result = tensor[M, H] A
+    parallel for row in 0..M:
+        parallel for channel in 0..H:
+            result[row, channel] = f32(convolved[row, channel]) * f32(gate[row, channel])
+    return result
+
+# GPU: one thread per value.
+native vision_gated_convolution for metal from "metal/vision_gated_convolution.metal":
+    static (H, T)
+    launch vision_gated_convolution:
+        threadgroups (ceil_div(M * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native vision_gated_convolution for cuda from "cuda/vision_gated_convolution.cu":
+    static (H, T)
+    launch vision_gated_convolution:
+        threadgroups (ceil_div(M * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native vision_gated_convolution for vulkan from "vulkan/vision_gated_convolution.comp":
+    static (H, T)
+    launch vision_gated_convolution:
+        threadgroups (min(ceil_div(M * H, 256), 65535), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CPU: one work item per row, its neighbour rows widened once.
+native vision_gated_convolution for cpu from "cpu/vision_gated_convolution.rs":
+    launch vision_gated_convolution:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (((T + 1) * H + T) * 4)
 
 
 # The mean of each cell's G contiguous F32 rows, as the released pooler

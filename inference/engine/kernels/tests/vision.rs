@@ -13,8 +13,8 @@
 //! the result's RMS.
 
 use magnitude_kernels::{
-    vision_attention, vision_clamp, vision_linear, vision_norm, vision_patch_stem, vision_pool,
-    vision_position,
+    vision_attention, vision_clamp, vision_gated_convolution, vision_linear, vision_norm,
+    vision_patch_stem, vision_pool, vision_position,
 };
 use seismic::{Device, Element, NativeSpecialization, Tensor};
 use seismic_lang::{
@@ -302,20 +302,23 @@ const EPSILON: f32 = 1e-6;
 // ---------------------------------------------------------------------------
 // Tests.
 
-/// The two-frame biased stem (the Qwen form) and single-frame unbiased ones
+/// The two-frame biased stem (the Qwen form), single-frame unbiased ones
 /// with F32 weights (Gemma 4's 16-pixel patches, Muse Glimmer's 14-pixel
-/// ones, whose depth 588 is no whole GEMM step).
+/// ones, whose depth 588 is no whole GEMM step), and the two-frame unbiased
+/// stem without a position table (LFM3-VL).
 #[test]
 fn patch_stem_matches_its_portable_body() {
     let module = module();
     let (rows, channels, hidden, table_rows) = (5usize, 3usize, 64usize, 49usize);
     for device in devices() {
-        for (frames, biased, patch, weights) in [
-            (2usize, true, 16usize, DType::F16),
-            (1, false, 16, DType::F32),
-            (1, false, 14, DType::F32),
+        for (frames, biased, patch, weights, positioned) in [
+            (2usize, true, 16usize, DType::F16, true),
+            (1, false, 16, DType::F32, true),
+            (1, false, 14, DType::F32, true),
+            (2, false, 16, DType::F16, false),
         ] {
-            let (s, nb) = (frames - 1, usize::from(biased));
+            let (s, nb, nt) = (frames - 1, usize::from(biased), usize::from(positioned));
+            let table_rows = table_rows * nt;
             let mut rng = Rng::new(21);
             let pixels = Host::random(
                 DType::F32,
@@ -332,11 +335,14 @@ fn patch_stem_matches_its_portable_body() {
             );
             let bias = Host::rows(DType::F32, nb, &[hidden], 0.1, 0.0, &mut rng);
             let table = Host::random(DType::F32, &[table_rows, hidden], 0.5, &mut rng);
-            let indices = Host::ints(&[rows, 4], (0..rows * 4).map(|i| i * 5 % table_rows));
+            let indices = Host::ints(
+                &[nt, rows, 4],
+                (0..nt * rows * 4).map(|i| i * 5 % table_rows.max(1)),
+            );
             let coefficients = Host::new(
                 DType::F32,
-                &[rows, 4],
-                (0..rows * 4)
+                &[nt, rows, 4],
+                (0..nt * rows * 4)
                     .map(|_| (rng.symmetric() + 1.0) / 2.0)
                     .collect(),
             );
@@ -375,6 +381,7 @@ fn patch_stem_matches_its_portable_body() {
                         ("P", patch),
                         ("H", hidden),
                         ("NB", nb),
+                        ("NT", nt),
                     ],
                 ),
             )
@@ -394,7 +401,7 @@ fn patch_stem_matches_its_portable_body() {
                 .value;
             relative_error(
                 &format!(
-                    "vision_patch_stem {:?} S{s} NB{nb} P{patch} {weights:?}",
+                    "vision_patch_stem {:?} S{s} NB{nb} NT{nt} P{patch} {weights:?}",
                     device.backend()
                 ),
                 &read_values(&result),
@@ -511,6 +518,7 @@ fn linear_matches_its_portable_body() {
         (true, false, false, false, 2, DType::F16, DType::F16, 128),
         (false, false, false, false, 3, DType::F32, DType::F16, 128),
         (false, false, false, false, 4, DType::F16, DType::F16, 128),
+        (false, false, false, false, 5, DType::F16, DType::F16, 128),
         (false, false, true, false, 0, DType::F16, DType::F16, 128),
         (true, true, false, true, 0, DType::F32, DType::F16, 128),
         (true, false, false, false, 0, DType::F16, DType::F32, 136),
@@ -654,24 +662,31 @@ fn clamp_matches_its_portable_body() {
 #[test]
 fn attention_matches_its_portable_body() {
     check_attention_forms(&[
-        (2usize, 16usize, false, false, false, false, true),
-        (2, 18, true, true, false, true, true),
-        (1, 16, false, false, true, false, true),
-        (1, 24, false, false, true, false, true),
+        (2usize, 1usize, 16usize, false, false, false, false, true),
+        (2, 1, 18, true, true, false, true, true),
+        (1, 1, 16, false, false, true, false, true),
+        (1, 1, 24, false, false, true, false, true),
+        // LFM3-VL: two query heads per key and value head.
+        (2, 2, 16, true, false, false, false, true),
     ]);
 }
 
 #[test]
 fn learned_position_attention_matches_its_portable_body() {
     // SigLIP: 72-column heads, learned positions, no rotary or head norm.
-    check_attention_forms(&[(2, 18, false, false, false, false, false)]);
+    check_attention_forms(&[(2, 1, 18, false, false, false, false, false)]);
 }
 
-fn check_attention_forms(forms: &[(usize, usize, bool, bool, bool, bool, bool)]) {
+/// Forms (key/value heads, query heads per key/value head, P, head norms,
+/// value norm, windows, unit scale, rotary).
+#[allow(clippy::type_complexity)]
+fn check_attention_forms(forms: &[(usize, usize, usize, bool, bool, bool, bool, bool)]) {
     let module = module();
     let rows = 100usize;
     for device in devices() {
-        for &(heads, quarter, head_norms, value_norm, windows, unit_scale, rotary) in forms {
+        for &(kv_heads, group, quarter, head_norms, value_norm, windows, unit_scale, rotary) in forms
+        {
+            let heads = kv_heads * group;
             let width = 4 * quarter;
             let (nq, nv, ws) = (
                 usize::from(head_norms),
@@ -679,10 +694,10 @@ fn check_attention_forms(forms: &[(usize, usize, bool, bool, bool, bool, bool)])
                 usize::from(windows),
             );
             let mut rng = Rng::new(25);
-            let shape = [rows, heads, width];
-            let query = Host::random(DType::F16, &shape, 2.0, &mut rng);
-            let key = Host::random(DType::F16, &shape, 2.0, &mut rng);
-            let value = Host::random(DType::F16, &shape, 1.0, &mut rng);
+            let shared = [rows, kv_heads, width];
+            let query = Host::random(DType::F16, &[rows, heads, width], 2.0, &mut rng);
+            let key = Host::random(DType::F16, &shared, 2.0, &mut rng);
+            let value = Host::random(DType::F16, &shared, 1.0, &mut rng);
             let query_norm = Host::rows(DType::F32, nq, &[width], 0.3, 1.0, &mut rng);
             let key_norm = Host::rows(DType::F32, nq, &[width], 0.3, 1.0, &mut rng);
             let value_norm = Host::new(DType::F32, &[nv, width], vec![1.0; nv * width]);
@@ -721,7 +736,8 @@ fn check_attention_forms(forms: &[(usize, usize, bool, bool, bool, bool, bool)])
                 &specialization_on(
                     &device,
                     &[
-                        ("H", heads),
+                        ("KV", kv_heads),
+                        ("G", group),
                         ("P", quarter),
                         ("NQ", nq),
                         ("NV", nv),
@@ -749,13 +765,97 @@ fn check_attention_forms(forms: &[(usize, usize, bool, bool, bool, bool, bool)])
                 .value;
             relative_error(
                 &format!(
-                    "vision_attention {:?} W{width} NQ{nq} NV{nv} WS{ws} unit {unit_scale}",
+                    "vision_attention {:?} KV{kv_heads} G{group} W{width} NQ{nq} NV{nv} WS{ws} unit {unit_scale}",
                     device.backend()
                 ),
                 &read_values(&result),
                 &expected,
                 5e-3,
                 5e-4,
+            );
+        }
+    }
+}
+
+/// The gated 3 × 3 convolution over a 6 × 8 grid held in 2 × 2 cell order
+/// (LFM3-VL), with F32 and f16 kernels; padding rows past the grid read no
+/// neighbour.
+#[test]
+fn gated_convolution_matches_its_portable_body() {
+    let module = module();
+    let (height, width, padding, hidden, side) = (6usize, 8usize, 4usize, 96usize, 3usize);
+    let (rows, taps) = (height * width + padding, side * side);
+    // Tower row of each grid cell, cell by cell.
+    let mut grid = vec![0usize; height * width];
+    let mut row = 0;
+    for cell_y in 0..height / 2 {
+        for cell_x in 0..width / 2 {
+            for (dy, dx) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                grid[(2 * cell_y + dy) * width + 2 * cell_x + dx] = row;
+                row += 1;
+            }
+        }
+    }
+    let mut neighbors = vec![-1i64; rows * taps];
+    for y in 0..height {
+        for x in 0..width {
+            for tap in 0..taps {
+                let (ny, nx) = ((y + tap / side).checked_sub(1), (x + tap % side).checked_sub(1));
+                if let (Some(ny), Some(nx)) = (ny, nx) {
+                    if ny < height && nx < width {
+                        neighbors[grid[y * width + x] * taps + tap] = grid[ny * width + nx] as i64;
+                    }
+                }
+            }
+        }
+    }
+    let neighbors = Host::new(
+        DType::I32,
+        &[rows, taps],
+        neighbors.into_iter().map(|value| value as f32).collect(),
+    );
+    for device in devices() {
+        for weights in [DType::F32, DType::F16] {
+            let mut rng = Rng::new(31);
+            let value = Host::random(DType::F16, &[rows, hidden], 1.0, &mut rng);
+            let gate = Host::random(DType::F16, &[rows, hidden], 1.0, &mut rng);
+            let kernel_weights = Host::random(weights, &[hidden, taps], 0.5, &mut rng);
+            let expected = interpret(
+                &module,
+                "vision_gated_convolution",
+                &[("A", DType::F16), ("KE", weights)],
+                &[
+                    Input::Tensor(&value),
+                    Input::Tensor(&gate),
+                    Input::Tensor(&kernel_weights),
+                    Input::Tensor(&neighbors),
+                ],
+            );
+            let kernel = vision_gated_convolution::native_for_device_with(
+                &device,
+                vision_gated_convolution::Elements {
+                    A: Element::f16(),
+                    KE: kernel_weights.element(),
+                },
+                &specialization_on(&device, &[("H", hidden), ("T", taps)]),
+            )
+            .unwrap();
+            let t = |host: &Host| host.tensor(&device);
+            let result = kernel
+                .call(vision_gated_convolution::Args {
+                    value: &t(&value),
+                    gate: &t(&gate),
+                    weight: &t(&kernel_weights),
+                    neighbors: &t(&neighbors),
+                })
+                .unwrap()
+                .value;
+            relative_error(
+                &format!("vision_gated_convolution {:?} {weights:?}", device.backend()),
+                &read_values(&result),
+                &expected,
+                2e-3,
+                2e-4,
             );
         }
     }

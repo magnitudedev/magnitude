@@ -47,8 +47,8 @@ struct Partial {
     }
 };
 
-// ((partial) + product (+ bias)) + the four table corners scaled by their
-// coefficients, summed in order.
+// ((partial) + product (+ bias)) + (with NT = 1) the four table corners
+// scaled by their coefficients, summed in order.
 struct Stem {
     float *y;
     u64 stride;
@@ -65,9 +65,12 @@ struct Stem {
         if constexpr (SEISMIC_DIM_NB == 1)
             projected = projected + element::at<BiasElement>(bias, n);
         float blended = 0.0f;
+        if constexpr (SEISMIC_DIM_NT == 1) {
 #pragma unroll
-        for (u32 i = 0; i < 4; ++i)
-            blended += element::at<TableElement>(table, (u64)indices[m * 4 + i] * columns + n) * coefficients[m * 4 + i];
+            for (u32 i = 0; i < 4; ++i)
+                blended +=
+                    element::at<TableElement>(table, (u64)indices[m * 4 + i] * columns + n) * coefficients[m * 4 + i];
+        }
         return projected + blended;
     }
     __device__ __forceinline__ void operator()(u32 m, u32 n, float first, float second) const {

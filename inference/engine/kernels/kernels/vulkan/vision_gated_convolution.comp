@@ -1,0 +1,36 @@
+// vision_gated_convolution: one invocation per value (grid-stride), the taps
+// summed in tap order in F32 over the neighbours present, published to A,
+// then times the gate and published again.
+#include "lib/core/activation.glsl"
+
+#if defined(SEISMIC_WEIGHT_REPRESENTATION_BF16)
+#define WEIGHT_KIND ELEMENT_BF16
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F16)
+#define WEIGHT_KIND ELEMENT_F16
+#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F32)
+#define WEIGHT_KIND ELEMENT_F32
+#else
+#error "unsupported vision_gated_convolution weight representation"
+#endif
+
+void vision_gated_convolution() {
+    const uint64_t columns = SEISMIC_DIM_H;
+    const uint64_t total = SEISMIC_DIM_M * columns;
+    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
+    for (uint64_t index = gl_GlobalInvocationID.x; index < total; index += step) {
+        const uint64_t row = index / columns, channel = index % columns;
+        float sum = 0.0;
+        for (uint tap = 0u; tap < uint(SEISMIC_DIM_T); ++tap) {
+            const int source = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_NEIGHBORS)
+                + (row * SEISMIC_NEIGHBORS_STRIDE_0 + tap) * 4ul);
+            if (source >= 0)
+                sum = fma(element_at(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_VALUE),
+                              uint64_t(source) * SEISMIC_VALUE_STRIDE_0 + channel),
+                    element_at(WEIGHT_KIND, SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), channel * SEISMIC_WEIGHT_STRIDE_0 + tap),
+                    sum);
+        }
+        const float convolved = element_round(ELEMENT_ACT, sum);
+        element_put(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), row * SEISMIC_RESULT_0_STRIDE_0 + channel,
+            convolved * element_at(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_GATE), row * SEISMIC_GATE_STRIDE_0 + channel));
+    }
+}

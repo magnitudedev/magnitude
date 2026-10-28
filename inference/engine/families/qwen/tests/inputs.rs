@@ -26,16 +26,17 @@ fn spatial_controls_follow_merge_group_order_and_normalized_bilinear_weights() {
             [1, 3]
         ]
     );
+    let blend = controls.position_blend().expect("position blend");
     for row in 0..16 {
-        let sum = controls
-            .interpolation_coefficients()
+        let sum = blend
+            .coefficients
             .iter()
             .map(|plane| plane[row])
             .sum::<f32>();
         assert!((sum - 1.0).abs() <= f32::EPSILON * 4.0);
         assert!(
-            controls
-                .interpolation_indices()
+            blend
+                .indices
                 .iter()
                 .all(|plane| (0..16).contains(&plane[row]))
         );

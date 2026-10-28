@@ -5,7 +5,7 @@
 use magnitude_artifacts::BoundaryRule;
 use magnitude_family_contracts::{
     ImageMarkers, InputPreparationError, ModelDefinition, PositionSampling, SequentialImageInput,
-    VisionSpatialControls,
+    VisionPositionBlend, VisionSpatialControls,
 };
 
 /// The text one image renders as: the patch row between the image markers,
@@ -48,7 +48,12 @@ fn spatial_controls(
         .vision
         .as_ref()
         .ok_or(InputPreparationError::UnsupportedMedia)?;
-    let PositionSampling::PixelCenters { side } = vision.stem.positions().sampling else {
+    let PositionSampling::PixelCenters { side } = vision
+        .stem
+        .positions()
+        .ok_or(InputPreparationError::VisionGeometry)?
+        .sampling
+    else {
         return Err(InputPreparationError::VisionGeometry);
     };
     let (side, window, merge) = (
@@ -93,5 +98,13 @@ fn spatial_controls(
             }
         }
     }
-    VisionSpatialControls::new(patch_order, coordinates, indices, coefficients, window_ranges)
+    VisionSpatialControls::new(
+        patch_order,
+        coordinates,
+        Some(VisionPositionBlend {
+            indices,
+            coefficients,
+        }),
+        window_ranges,
+    )
 }

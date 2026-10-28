@@ -129,8 +129,14 @@ pub fn relu_squared(value: f32) -> f32 {
     positive * positive
 }
 
+/// SiLU: `x / (1 + exp(-x))`.
+#[inline(always)]
+pub fn silu(value: f32) -> f32 {
+    value / (1.0 + (-value).exp())
+}
+
 /// The activation of `vision_linear`'s code (1 tanh, 2 erf, 3 quick GELU,
-/// 4 squared ReLU).
+/// 4 squared ReLU, 5 SiLU).
 #[inline(always)]
 pub fn activate(code: i32, value: f32) -> f32 {
     match code {
@@ -138,6 +144,7 @@ pub fn activate(code: i32, value: f32) -> f32 {
         2 => gelu_erf(value),
         3 => gelu_quick(value),
         4 => relu_squared(value),
+        5 => silu(value),
         _ => unreachable!("activation code {code}"),
     }
 }

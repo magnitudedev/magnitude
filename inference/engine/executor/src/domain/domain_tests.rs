@@ -1096,10 +1096,10 @@ fn vision_definition() -> ModelDefinition {
                 stored("patch.1", &[128, 3, 2, 2]),
             ],
             bias: None,
-            positions: VisionPositions {
+            positions: Some(VisionPositions {
                 table: stored("position", &[16, 128]),
                 sampling: PositionSampling::AlignedCorners { side: 4 },
-            },
+            }),
             norm: None,
             registers: None,
         },
@@ -1125,7 +1125,9 @@ fn vision_input(placements: &[(usize, &str)], count: usize) -> PreparedModelInpu
         BoundaryRule, InputLayout, InputSpan,
         media::{DType, PreparedTensor},
     };
-    use magnitude_family_contracts::{PreparedVisionInput, TokenPlan, VisionSpatialControls};
+    use magnitude_family_contracts::{
+        PreparedVisionInput, TokenPlan, VisionPositionBlend, VisionSpatialControls,
+    };
     let definition = vision_definition();
     let image = || {
         let pixels = PreparedTensor::new(
@@ -1138,8 +1140,10 @@ fn vision_input(placements: &[(usize, &str)], count: usize) -> PreparedModelInpu
         let spatial = VisionSpatialControls::new(
             (0..4).collect(),
             vec![[0, 0]; 4],
-            std::array::from_fn(|_| vec![0; 4]),
-            std::array::from_fn(|_| vec![0.25; 4]),
+            Some(VisionPositionBlend {
+                indices: std::array::from_fn(|_| vec![0; 4]),
+                coefficients: std::array::from_fn(|_| vec![0.25; 4]),
+            }),
             Vec::new(),
         )
         .unwrap();

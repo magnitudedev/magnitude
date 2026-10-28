@@ -68,13 +68,18 @@ inline float relu_squared(float value) {
     return positive * positive;
 }
 
+inline float silu(float value) {
+    return value / (1.0f + metal::precise::exp(-value));
+}
+
 // The activation of `vision_linear`: 1 tanh GELU, 2 erf GELU, 3 quick GELU,
-// 4 squared ReLU.
+// 4 squared ReLU, 5 SiLU.
 inline float activate(int code, float value) {
     return code == 1 ? gelu_tanh(value)
          : code == 2 ? gelu_erf(value)
          : code == 3 ? gelu_quick(value)
-                     : relu_squared(value);
+         : code == 4 ? relu_squared(value)
+                     : silu(value);
 }
 
 // ---------------------------------------------------------------------------
@@ -207,8 +212,9 @@ inline void prepare_head(device const typename A::storage *source, device typena
 // spans in tiles of ATTEND_KEYS: K and V staged in threadgroup memory, scores =
 // Q K^T on the matrix units (Q's fragments held in registers), scaled into the
 // exp2 domain in F32, the online softmax, and the F32 output accumulated from
-// probabilities rounded to half. `qkv` is the [rows, 3, H, WP] operand rows
-// (queries and keys prepared, zero past the head width W); rows past `rows` of
+// probabilities rounded to half. `qkv` is the [rows, H + 2KV, WP] operand rows
+// (the query, then key, then value heads; queries and keys prepared, zero past
+// the head width W); rows past `rows` of
 // the last query tile are read (the buffer holds whole tiles) but never
 // stored. Without `spans` every row attends to every row; with them row r
 // attends to rows [spans[2r], spans[2r + 1]), the tile walking the union of
@@ -237,15 +243,19 @@ inline void attend_stage(threadgroup S *staged, device const S *qkv, ulong row_s
 }
 
 template <typename S, uint W, uint WP>
-inline void attend(device const S *qkv, device S *out, uint rows, uint heads, float scale,
+inline void attend(device const S *qkv, device S *out, uint rows, uint heads, uint group, float scale,
     device const int *spans, threadgroup S *keys, threadgroup S *values, threadgroup uint *bounds, uint tile,
     uint head, uint thread_index, uint simd, uint lane) {
     constexpr uint THREADS = ATTEND_ROWS * 4;
     constexpr uint PITCH = attend_pitch<WP>();
     constexpr uint DB = WP / 8;
     constexpr uint KB = ATTEND_KEYS / 8;
-    const ulong width = ulong(heads) * WP;
-    const ulong row_stride = 3 * width;
+    // Operand rows hold the query heads, then the key heads, then the value
+    // heads; query head h reads key and value head h / group.
+    const ulong kv_heads = heads / group;
+    const ulong row_stride = (ulong(heads) + 2 * kv_heads) * WP;
+    const ulong key_column = (ulong(heads) + head / group) * WP;
+    const ulong value_column = key_column + kv_heads * WP;
     const float scale2 = scale * 1.4426950408889634f;
 
     // This lane's fragment coordinates: row fm, columns fn and fn + 1.
@@ -285,9 +295,8 @@ inline void attend(device const S *qkv, device S *out, uint rows, uint heads, fl
 
     for (uint first = walk_first; first < walk_end; first += ATTEND_KEYS) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        attend_stage<S, WP, THREADS>(keys, qkv, row_stride, width + ulong(head) * WP, first, rows, thread_index);
-        attend_stage<S, WP, THREADS>(values, qkv, row_stride, 2 * width + ulong(head) * WP, first, rows,
-            thread_index);
+        attend_stage<S, WP, THREADS>(keys, qkv, row_stride, key_column, first, rows, thread_index);
+        attend_stage<S, WP, THREADS>(values, qkv, row_stride, value_column, first, rows, thread_index);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         simdgroup_matrix<float, 8, 8> scores[KB];
@@ -383,7 +392,7 @@ inline void attend_load_rows(threadgroup float *published, uint lane, float valu
 }
 
 template <typename S, uint W, uint WP>
-inline void attend_tensor(device const S *qkv, device S *out, uint rows, uint heads, float scale,
+inline void attend_tensor(device const S *qkv, device S *out, uint rows, uint heads, uint group, float scale,
     device const int *spans, threadgroup S *keys, threadgroup S *values, threadgroup uint *bounds,
     threadgroup float *slots, uint tile, uint head, uint thread_index, uint simd, uint lane) {
     constexpr uint THREADS = ATTEND_ROWS * 4;
@@ -407,8 +416,12 @@ inline void attend_tensor(device const S *qkv, device S *out, uint rows, uint he
         mpp::tensor_ops::matmul2d_descriptor(ROWS, WP, KEYS, false, false, false,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
         metal::execution_simdgroup> output_op;
-    const ulong width = ulong(heads) * WP;
-    const ulong row_stride = 3 * width;
+    // Operand rows hold the query heads, then the key heads, then the value
+    // heads; query head h reads key and value head h / group.
+    const ulong kv_heads = heads / group;
+    const ulong row_stride = (ulong(heads) + 2 * kv_heads) * WP;
+    const ulong key_column = (ulong(heads) + head / group) * WP;
+    const ulong value_column = key_column + kv_heads * WP;
     const float scale2 = scale * 1.4426950408889634f;
     const bool computes = simd < ATTEND_ROWS / ROWS;
     const uint owner = computes ? simd : 0;
@@ -458,9 +471,8 @@ inline void attend_tensor(device const S *qkv, device S *out, uint rows, uint he
 
     for (uint first = walk_first; first < walk_end; first += KEYS) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        attend_stage<S, WP, THREADS>(keys, qkv, row_stride, width + ulong(head) * WP, first, rows, thread_index);
-        attend_stage<S, WP, THREADS>(values, qkv, row_stride, 2 * width + ulong(head) * WP, first, rows,
-            thread_index);
+        attend_stage<S, WP, THREADS>(keys, qkv, row_stride, key_column, first, rows, thread_index);
+        attend_stage<S, WP, THREADS>(values, qkv, row_stride, value_column, first, rows, thread_index);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (!computes)
             continue;

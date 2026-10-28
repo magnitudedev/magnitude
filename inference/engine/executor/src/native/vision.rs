@@ -1,7 +1,7 @@
 use crate::{CatalogFailure, VisionEntry, VisionKernel};
 use magnitude_kernels::{
-    post_norm_residual, vision_attention, vision_clamp, vision_linear, vision_norm,
-    vision_patch_stem, vision_pool, vision_position,
+    post_norm_residual, vision_attention, vision_clamp, vision_gated_convolution, vision_linear,
+    vision_norm, vision_patch_stem, vision_pool, vision_position,
 };
 use seismic::{Element, NativeKernel};
 use std::collections::HashMap;
@@ -34,6 +34,8 @@ pub struct VisionKernels {
     pub(crate) linear: HashMap<VisionKernel, NativeKernel<vision_linear::Entry>>,
     pub(crate) clamp: HashMap<VisionKernel, NativeKernel<vision_clamp::Entry>>,
     pub(crate) attention: HashMap<VisionKernel, NativeKernel<vision_attention::Entry>>,
+    pub(crate) gated_convolution:
+        HashMap<VisionKernel, NativeKernel<vision_gated_convolution::Entry>>,
     pub(crate) pool: HashMap<VisionKernel, NativeKernel<vision_pool::Entry>>,
     pub(crate) position: HashMap<VisionKernel, NativeKernel<vision_position::Entry>>,
     pub(crate) post_norm: HashMap<VisionKernel, NativeKernel<post_norm_residual::Entry>>,
@@ -48,6 +50,7 @@ impl VisionKernels {
             VisionEntry::Linear => self.linear.contains_key(kernel),
             VisionEntry::Clamp => self.clamp.contains_key(kernel),
             VisionEntry::Attention => self.attention.contains_key(kernel),
+            VisionEntry::GatedConvolution => self.gated_convolution.contains_key(kernel),
             VisionEntry::Pool => self.pool.contains_key(kernel),
             VisionEntry::Position => self.position.contains_key(kernel),
             VisionEntry::PostNormResidual => self.post_norm.contains_key(kernel),

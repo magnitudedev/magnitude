@@ -3,10 +3,10 @@ use magnitude_artifacts::{
     ArtifactIdentity, InputLayout, PackageIdentity, TokenId,
 };
 use magnitude_family_contracts::{
-    AttentionGate, CellReduction, ExitNorm, GateFunction, GateGranularity, HeadNorm,
-    HistoryDomain, ImportTransform, InputNorm, KeyValue, ModelDefinition, ModelFamily, Operator,
-    OutputForm, PositionSampling, Rotary, TokenPlan, ValueSource, VisionAttentionSpan, VisionNorm,
-    VisionResampling, VisionResize, WeightDescriptor,
+    AttentionGate, CellReduction, ExitNorm, GateFunction, GateGranularity, HeadNorm, HistoryDomain,
+    ImportTransform, InputNorm, KeyValue, ModelDefinition, ModelFamily, Operator, OutputForm,
+    PositionSampling, Rotary, TokenPlan, ValueSource, VisionAttentionSpan, VisionNorm,
+    VisionOperator, VisionResampling, VisionResize, WeightDescriptor,
 };
 use magnitude_family_common::headers;
 use magnitude_family_muse_glimmer::{inspect_components, recognize, MuseGlimmerFamily};
@@ -260,7 +260,7 @@ fn the_projector_windows_sparse_layers_and_shuffles_channel_outer() {
     assert_eq!(vision.window, Some(32));
     assert_eq!(vision.stem.frames(), 1);
     assert_eq!(
-        vision.stem.positions().sampling,
+        vision.stem.positions().expect("position table").sampling,
         PositionSampling::PixelCenters { side: 32 }
     );
     assert_eq!(
@@ -274,7 +274,12 @@ fn the_projector_windows_sparse_layers_and_shuffles_channel_outer() {
         .blocks
         .iter()
         .enumerate()
-        .filter(|(_, block)| block.attention.span == VisionAttentionSpan::Full)
+        .filter(|(_, block)| {
+            matches!(
+                &block.operator,
+                VisionOperator::Attention(attention) if attention.span == VisionAttentionSpan::Full
+            )
+        })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     assert_eq!(
@@ -283,7 +288,9 @@ fn the_projector_windows_sparse_layers_and_shuffles_channel_outer() {
     );
     // llama.cpp's adjacent rotary pairs are reordered on q/k rows and biases.
     let order: Vec<u64> = (0..48).map(|i| 2 * i).chain((0..48).map(|i| 2 * i + 1)).collect();
-    let attention = &vision.blocks[0].attention;
+    let VisionOperator::Attention(attention) = &vision.blocks[0].operator else {
+        panic!("Muse Glimmer vision blocks attend");
+    };
     for linear in [&attention.query, &attention.key] {
         assert_eq!(transforms(&linear.weight), [ImportTransform::PermuteRows { order: order.clone() }]);
         assert_eq!(

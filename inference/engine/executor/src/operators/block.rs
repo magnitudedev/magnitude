@@ -559,6 +559,9 @@ impl BlockSublayers<'_> {
                         shape: ShortConvShape::of(geometry.hidden, operator)
                             .map_err(|error| error.to_string())?,
                         epsilon,
+                        post_norm_epsilon: post_norm_epsilon(paired.mixer_output)
+                            .unwrap_or_default() as f32,
+                        post_norm_scale: output_scales.mixer,
                         component_index,
                     },
                 )?;

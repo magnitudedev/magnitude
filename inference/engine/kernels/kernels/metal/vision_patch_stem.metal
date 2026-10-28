@@ -46,8 +46,8 @@ struct output_partial {
     }
 };
 
-// ((partial) + product (+ bias)) + the four table corners scaled by their
-// coefficients, summed in order.
+// ((partial) + product (+ bias)) + (with NT = 1) the four table corners
+// scaled by their coefficients, summed in order.
 struct output_stem {
     device float *y;
     ulong stride;
@@ -64,9 +64,10 @@ struct output_stem {
         if (SEISMIC_DIM_NB == 1)
             projected = projected + element::at<bias_element>(bias, n);
         float blended = 0.0f;
-        for (uint i = 0; i < 4; ++i)
-            blended += element::at<table_element>(table, ulong(indices[m * 4 + i]) * columns + n)
-                * coefficients[m * 4 + i];
+        if (SEISMIC_DIM_NT == 1)
+            for (uint i = 0; i < 4; ++i)
+                blended += element::at<table_element>(table, ulong(indices[m * 4 + i]) * columns + n)
+                    * coefficients[m * 4 + i];
         y[ulong(m) * stride + n] = projected + blended;
     }
     void store2(uint m, uint n, float first, float second) const {
