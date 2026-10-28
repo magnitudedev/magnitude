@@ -5,7 +5,7 @@ import { Option } from "effect"
 import { useMemo } from "react"
 import { Atom, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { InfoIcon } from "@phosphor-icons/react"
-import { useAgentClient, localModelRadarAxes, localModelSpeedTooltip, useLocalInferenceHardware } from "@magnitudedev/client-common"
+import { useAgentClient, localModelQuantizationAware, localModelRadarAxes, localModelSpeedTooltip, quantizationAwareTooltip, useLocalInferenceHardware } from "@magnitudedev/client-common"
 import { ActionTooltip } from "./ui/tooltip"
 import { type HardwarePhoto } from "./hardware-photos"
 import { HardwareSummary } from "./machine-summary"
@@ -16,6 +16,13 @@ import type { LocalModel } from "@magnitudedev/sdk"
 /** An estimated speed's small slate info icon, explaining what the estimate leaves out. */
 export function SpeedInfo() {
   return <ActionTooltip label={localModelSpeedTooltip} trigger={<button type="button" aria-label={localModelSpeedTooltip} className="inline-flex rounded-sm text-slate-400 hover:text-slate-600 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-500 dark:hover:text-slate-300"><InfoIcon aria-hidden="true" className="size-3" /></button>} />
+}
+
+/** A quantization-aware model's small slate info icon, explaining what QAT means. A non-interactive trigger, so it
+ * can sit inside a row that is itself a button. */
+export function QuantizationAwareInfo({ model, className = "" }: { model: LocalModel; className?: string }) {
+  if (!localModelQuantizationAware(model)) return null
+  return <ActionTooltip label={quantizationAwareTooltip} trigger={<span role="img" aria-label={quantizationAwareTooltip} className={`inline-flex shrink-0 text-slate-400 hover:text-slate-600 dark:text-slate-500 dark:hover:text-slate-300 ${className}`}><InfoIcon aria-hidden="true" className="size-3" /></span>} />
 }
 
 /** The five-axis capability profile for any model; a custom model's intelligence is never rated, so that axis stays empty. */

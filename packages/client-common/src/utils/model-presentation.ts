@@ -35,6 +35,14 @@ export const formatLocalModelDisplayName = (
   Option.some(model.presentation.variantLabel),
 )
 
+/** Whether a model's weights were trained at the precision they ship in; only the catalog knows this. */
+export const localModelQuantizationAware = (model: LocalModel): boolean =>
+  model._tag === "Catalog" && model.catalogData.quantizationAware
+
+/** The explanation behind a quantization-aware model's info icon. */
+export const quantizationAwareTooltip =
+  "QAT (quantization-aware training): trained at this precision, so it keeps close to full quality at a smaller size."
+
 /** The label a catalog model carries when its release does not promise full support. */
 export const catalogSupportLabel = (support: CatalogSupport): Option.Option<string> => {
   switch (support._tag) {

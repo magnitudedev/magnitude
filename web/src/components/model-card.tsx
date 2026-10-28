@@ -14,7 +14,7 @@ import { ActionTooltip, TooltipProvider } from "./ui/tooltip"
 import { ConfirmDialog } from "./confirm-dialog"
 import { ErrorNotice, NoticeAction } from "./error-notice"
 import { HuggingFaceLogo, ModelLogo } from "./model-logo"
-import { SpeedInfo } from "./discovery-visuals"
+import { QuantizationAwareInfo, SpeedInfo } from "./discovery-visuals"
 import { DrafterPickerDialog } from "./drafter-list"
 import { customModelSource } from "./custom-model-details"
 import { removalConfirmation } from "./model-remove-action"
@@ -214,7 +214,7 @@ export function ModelCard({ model, models, page, replacing, hardware, onFindOthe
       <div className="min-w-0 flex-1">
         <h2 title={name} className="flex min-w-0 items-baseline gap-2 font-sans text-[15px] font-medium leading-6 tracking-normal">
           <span className="min-w-0 truncate">{model.presentation.displayName}</span>
-          <span className="shrink-0 text-xs font-normal text-slate-500 dark:text-slate-400">{model.presentation.variantLabel}</span>
+          <span className="inline-flex shrink-0 items-center gap-1.5 text-xs font-normal text-slate-500 dark:text-slate-400">{model.presentation.variantLabel}<QuantizationAwareInfo model={model} /></span>
           {sourceBadge}
         </h2>
         <p className="truncate text-xs text-slate-500">{modelSubtitle(model, models, page)}</p>

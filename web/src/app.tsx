@@ -60,7 +60,7 @@ import { ConfirmDialog } from "./components/confirm-dialog"
 import { signOut, useDisconnectWarning, useRemoteAccess, viewerPlatform } from "./remote-access"
 import { useNarrowViewport } from "./lib/viewport"
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "./components/ui/alert-dialog"
-import { HardwareOverview, ModelRadar } from "./components/discovery-visuals"
+import { HardwareOverview, ModelRadar, QuantizationAwareInfo } from "./components/discovery-visuals"
 import { SettingsStatus } from "./components/settings-status"
 import { HarnessConnections, type CommandModel } from "./components/harness-connections"
 import { HarnessSetupList } from "./components/harness-setup"
@@ -270,6 +270,7 @@ function Recommendations({ models, active }: { models: readonly CatalogLocalMode
             onMouseLeave={({ currentTarget }) => currentTarget.removeAttribute("title")}
           >{model.presentation.displayName}{"\u00a0"}</span>
           <span className="shrink-0 whitespace-nowrap text-xs font-normal text-slate-500">{model.presentation.variantLabel}</span>
+          <QuantizationAwareInfo model={model} className="ml-1" />
         </span>
         {"residencyState" in model.acquisitionState && model.acquisitionState.residencyState._tag === "Failed" && <ModelLoadFailureIndicator failure={model.acquisitionState.residencyState.failure} />}
       </button>)}</div>
