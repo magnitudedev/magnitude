@@ -3,11 +3,12 @@
 use super::*;
 
 /// A preparation-time batch of independent native calls on one device. Each
-/// call keeps its own arguments and result allocations; implementations may
-/// share scratch because their launches execute in submission order.
+/// call keeps its own arguments and result allocations; the calls share one
+/// scratch arena because their launches execute in submission order.
 pub(crate) struct NativeTensorBatch {
     device: Arc<DeviceInner>,
     calls: Vec<(Arc<NativePrepared>, NativeBoundCall)>,
+    scratch: ScratchArena,
 }
 
 impl NativeTensorBatch {
@@ -15,6 +16,7 @@ impl NativeTensorBatch {
         Self {
             device,
             calls: Vec::new(),
+            scratch: ScratchArena::default(),
         }
     }
 
@@ -38,13 +40,7 @@ impl NativeTensorBatch {
                 crate::api::WorkflowError::HostBoundaryRequired,
             ));
         }
-        let call = {
-            let mut standalone = kernel
-                .standalone
-                .lock()
-                .expect("native standalone-call lock poisoned");
-            kernel.prepare_call(&mut standalone, args, Some(outputs))?
-        };
+        let call = kernel.prepare_call(&mut self.scratch, args, Some(outputs))?;
         self.calls.push((kernel.clone(), call));
         Ok(())
     }

@@ -163,7 +163,10 @@ fn each_launch(
                 .iter()
                 .map(|(allocation, offset)| (typed_buffer::<Cuda, Executor>(allocation), *offset)),
         );
-        let scalars = typed_buffer::<Cuda, Executor>(&dispatch.kernel.scalars);
+        let scalars = dispatch
+            .kernel
+            .scalar_slots()
+            .map(|slots| (typed_buffer::<Cuda, Executor>(slots), 0));
         for (function, launch) in dispatch.launches.iter().enumerate() {
             let launch = launch.map(|launch| {
                 let (module, module_function) = launches.launch(function);
@@ -172,7 +175,7 @@ fn each_launch(
                     function: module_function,
                     buffers: &typed,
                     words: dispatch.word_bytes,
-                    scalar_results: (scalars, 0),
+                    scalar_results: scalars,
                     grid: launch.groups,
                     block: launch.threads,
                     shared_bytes: launch.shared_bytes,

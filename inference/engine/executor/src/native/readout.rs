@@ -13,23 +13,3 @@ pub enum ProjectionKernels {
         progressive: ProgressiveReadoutKernels,
     },
 }
-
-impl ProjectionKernels {
-    pub(crate) fn invocation_workspace_bytes(&self) -> u128 {
-        match self {
-            Self::RawPacked(kernel) => u128::from(kernel.invocation_workspace_bytes()),
-            Self::PreparedPacked(kernel) => u128::from(kernel.invocation_workspace_bytes()),
-            Self::Qualified {
-                packed,
-                progressive,
-                ..
-            } => {
-                packed.invocation_workspace_bytes()
-                    + u128::from(progressive.top.invocation_workspace_bytes())
-                    + u128::from(progressive.refine.invocation_workspace_bytes())
-                    + u128::from(progressive.exact.invocation_workspace_bytes())
-                    + u128::from(progressive.planes.invocation_workspace_bytes())
-            }
-        }
-    }
-}

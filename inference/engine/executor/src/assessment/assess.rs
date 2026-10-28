@@ -121,8 +121,7 @@ pub fn prepare_execution_assessment(
     .map_err(AssessmentError::Memory)?;
     let fit_context_tokens = u32::try_from(terms.fit_depth)
         .map_err(|_| AssessmentError::Memory("fit depth exceeds u32".into()))?;
-    let header = AssessmentHeaderBounds::derive(definition, draft.load(), policy.codec(), backend)
-        .map_err(AssessmentError::Memory)?;
+    let header = AssessmentHeaderBounds::derive(draft.load()).map_err(AssessmentError::Memory)?;
     let state = ResourcePlanner::state_plan(
         definition,
         draft.load(),

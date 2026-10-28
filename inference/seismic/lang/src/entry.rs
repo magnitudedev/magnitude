@@ -558,6 +558,31 @@ pub struct ResultLeaf {
     pub value: SemanticValueId,
 }
 
+/// A result's class as a native entry's scalar-result slots see it: a
+/// tensor is published in a buffer and occupies no slot word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResultClass {
+    Tensor,
+    Scalar,
+    Index,
+    Range,
+}
+
+impl ResultClass {
+    /// The bytes of one scalar-result slot word.
+    pub const WORD_BYTES: u64 = 8;
+
+    /// The slot words a result of this class occupies: one for a scalar or
+    /// an index, two for a range (its start, then its end).
+    pub const fn scalar_words(self) -> usize {
+        match self {
+            Self::Tensor => 0,
+            Self::Scalar | Self::Index => 1,
+            Self::Range => 2,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResultKind {
     Tensor {
@@ -571,6 +596,17 @@ pub enum ResultKind {
     Range {
         bound: NatExpr,
     },
+}
+
+impl ResultKind {
+    pub fn class(&self) -> ResultClass {
+        match self {
+            Self::Tensor { .. } => ResultClass::Tensor,
+            Self::Scalar(_) => ResultClass::Scalar,
+            Self::Index { .. } => ResultClass::Index,
+            Self::Range { .. } => ResultClass::Range,
+        }
+    }
 }
 
 /// Alias contract between parameters, proved from the source (§8.2).

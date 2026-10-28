@@ -1379,9 +1379,9 @@ pub unsafe trait Entry: 'static {
     /// Typed symbolic results returned while constructing a workflow.
     type WorkflowResults;
     const NAME: &'static str;
-    /// Fixed device bytes for one prepared direct native entry's ABI words
-    /// and scalar-result storage, including each buffer's one-byte minimum.
-    const NATIVE_INVOCATION_WORKSPACE_BYTES: u64;
+    /// Fixed device bytes one prepared direct native entry holds: its
+    /// scalar-result slots, none without scalar results.
+    const NATIVE_SCALAR_RESULT_BYTES: u64;
     /// The checked module this entry belongs to.
     fn module() -> Result<&'static generated::Module, CheckedBundleError>;
     fn resolve(module: &generated::Module) -> Result<generated::EntryToken, CheckedBundleError>;
@@ -3427,23 +3427,10 @@ impl<E: Entry> Kernel<E> {
 }
 
 impl<E: Entry> NativeKernel<E> {
-    /// Identity of the prepared storage shared by clones and by typed slots.
-    /// Intended for ownership accounting; it has no cross-process meaning.
-    #[doc(hidden)]
-    pub fn prepared_storage_identity(&self) -> usize {
-        Arc::as_ptr(&self.inner) as usize
-    }
-
-    /// Allocation-free planning charge before this checked specialization is
-    /// prepared. The value is generated from its checked entry schema.
-    pub const fn planned_invocation_workspace_bytes() -> u64 {
-        E::NATIVE_INVOCATION_WORKSPACE_BYTES
-    }
-
-    /// Fixed device storage charged when this checked native specialization
-    /// is prepared. Calls reuse it and do not allocate ABI or scalar buffers.
-    pub fn invocation_workspace_bytes(&self) -> u64 {
-        self.inner.invocation_workspace_bytes()
+    /// The device storage this prepared specialization holds: its
+    /// scalar-result slots ([`Entry::NATIVE_SCALAR_RESULT_BYTES`]).
+    pub fn scalar_result_bytes(&self) -> u64 {
+        self.inner.scalar_result_bytes()
     }
 
     fn prepare(
@@ -3462,15 +3449,9 @@ impl<E: Entry> NativeKernel<E> {
             specialization,
             cpu,
         )
-        .map(|inner| {
-            debug_assert_eq!(
-                inner.invocation_workspace_bytes(),
-                E::NATIVE_INVOCATION_WORKSPACE_BYTES
-            );
-            Self {
-                inner: Arc::new(inner),
-                marker: std::marker::PhantomData,
-            }
+        .map(|inner| Self {
+            inner: Arc::new(inner),
+            marker: std::marker::PhantomData,
         })
         .map_err(LoadError::from_prepare)
     }

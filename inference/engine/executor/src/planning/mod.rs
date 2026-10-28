@@ -610,7 +610,6 @@ pub(crate) mod tests {
             .unwrap();
         let copy = programs.state_graphs().unwrap();
         let plan = ResourcePlanner::plan_with_state(
-            device.backend(),
             state,
             &target,
             &readout,

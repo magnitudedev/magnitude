@@ -5,7 +5,8 @@
 
 use seismic::measure::{measure, Measure, Stop};
 use seismic::{
-    Availability, BackendName, CallError, Device, Devices, Element, Exclusion, InvocationError,
+    Availability, BackendName, CallError, Device, Devices, Element, Exclusion, ExecutionError,
+    InvocationError,
     NativeGraphFamily, NativeSpecialization, NumericalRequirement, Outcome, SearchPlan,
     SearchSettings, Stage, StorageKind, Strategy, SurveyPlan, Tensor, TraceDetail, TuneError,
     TuningInitializer, TuningMethod, TuningPoint, UnitPlan,
@@ -1857,30 +1858,68 @@ fn a_host_read_before_completion_returns_the_final_bytes() {
     }
 }
 
-/// S8: a standalone call's scratch comes from the prepared kernel's
-/// invocation workspace, which reports it.
+/// The device storage one standalone call claims while it runs beyond its
+/// results: the least headroom above the device's charge under which it
+/// succeeds (a smaller one refuses its allocation), less its results'
+/// bytes. The call's scratch is its own, so the charge is back where it was
+/// once the call and its results are gone.
+fn standalone_scratch_bytes(
+    device: &Device,
+    call: impl Fn() -> Result<Tensor, CallError>,
+) -> u64 {
+    let before = device.storage_usage(StorageKind::Device).charged;
+    let results = call().unwrap().storage_bytes();
+    assert_eq!(device.storage_usage(StorageKind::Device).charged, before);
+    // `high` admits the call, `low` refuses it.
+    let (mut low, mut high) = (0u64, 1u64 << 20);
+    while low + 1 < high {
+        let headroom = (low + high) / 2;
+        device.set_storage_limit(StorageKind::Device, Some(before + headroom));
+        match call() {
+            Ok(_) => high = headroom,
+            Err(CallError::Execution(ExecutionError::AllocationCapacity { .. })) => low = headroom,
+            Err(error) => panic!("{:?}: {error}", device.backend()),
+        }
+    }
+    device.set_storage_limit(StorageKind::Device, None);
+    assert_eq!(device.storage_usage(StorageKind::Device).charged, before);
+    high - results
+}
+
+/// S8: a standalone call's scratch is its own, released when the call ends;
+/// the prepared kernel holds only its scalar-result slots.
 #[test]
-fn standalone_scratch_is_charged_to_the_invocation_workspace() {
+fn standalone_scratch_is_the_calls_own() {
     for device in devices() {
         let kernel = split_sum::native_for_device(
             &device,
             &statics(64).with_param("PARTS", 4).with_param("WIDTH", 32),
         )
         .unwrap();
-        let before = kernel.invocation_workspace_bytes();
+        let before = kernel.scalar_result_bytes();
         let x = f32_tensor(&device, &[64], &exact_values(64));
-        for _ in 0..2 {
-            let value = kernel.call(split_sum::Args { x: &x }).unwrap().value;
-            assert_eq!(read_f32(&value), [exact_values(64).iter().sum::<f32>()]);
-            // The reserved sync range, then four f32 partials, reused by the
-            // second call.
-            assert_eq!(
-                kernel.invocation_workspace_bytes(),
-                before + SYNC_RESERVE + 16,
-                "{:?}",
-                device.backend()
-            );
-        }
+        let call = || {
+            kernel
+                .call(split_sum::Args { x: &x })
+                .map(|results| results.value)
+        };
+        assert_eq!(
+            read_f32(&call().unwrap()),
+            [exact_values(64).iter().sum::<f32>()]
+        );
+        // The reserved sync range, then four f32 partials.
+        assert_eq!(
+            standalone_scratch_bytes(&device, call),
+            SYNC_RESERVE + 16,
+            "{:?}",
+            device.backend()
+        );
+        assert_eq!(
+            kernel.scalar_result_bytes(),
+            before,
+            "{:?}",
+            device.backend()
+        );
     }
 }
 
@@ -2325,32 +2364,20 @@ fn inactive_launches_are_exempt_from_device_limits() {
 fn inactive_scratch_is_charged_the_minimum() {
     for device in devices() {
         let kernel = gated(&device, 64);
-        let before = kernel.invocation_workspace_bytes();
-        let call = |n: u64| {
+        let scratch = |n: u64| {
             let values = exact_values(n as usize);
             let x = f32_tensor(&device, &[n], &values);
-            let value = kernel.call(gated_sum::Args { x: &x }).unwrap().value;
+            let call = || kernel.call(gated_sum::Args { x: &x }).map(|results| results.value);
             assert_eq!(
-                read_f32(&value),
+                read_f32(&call().unwrap()),
                 [portable_gated_sum(&values)],
                 "{:?} N {n}",
                 device.backend()
             );
+            standalone_scratch_bytes(&device, call)
         };
-        call(10);
-        assert_eq!(
-            kernel.invocation_workspace_bytes(),
-            before + SYNC_RESERVE + 1,
-            "{:?}",
-            device.backend()
-        );
-        call(200);
-        assert_eq!(
-            kernel.invocation_workspace_bytes(),
-            before + SYNC_RESERVE + 800,
-            "{:?}",
-            device.backend()
-        );
+        assert_eq!(scratch(10), SYNC_RESERVE + 1, "{:?}", device.backend());
+        assert_eq!(scratch(200), SYNC_RESERVE + 800, "{:?}", device.backend());
 
         let workspace = |n: u64| {
             let mut graph = device.native_graph();

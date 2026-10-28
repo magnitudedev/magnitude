@@ -310,9 +310,10 @@ fn calls<'l>(
             storages.push(storage);
             weights.push(element.and_then(|element| WeightOperand::of(route.tier, element)));
         }
-        let scalars = typed_buffer::<Cpu, Executor>(&dispatch.kernel.scalars)
-            .data_pointer()
-            .cast::<u64>();
+        // An entry without scalar results is passed no slots.
+        let scalars = dispatch.kernel.scalar_slots().map_or(std::ptr::null_mut(), |slots| {
+            typed_buffer::<Cpu, Executor>(slots).data_pointer().cast::<u64>()
+        });
         calls.push((dispatch, first..pointers.len(), scalars));
     }
     calls

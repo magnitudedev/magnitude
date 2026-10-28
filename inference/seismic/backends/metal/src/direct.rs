@@ -54,8 +54,9 @@ pub struct DirectLaunch<'a> {
     pub pipeline: &'a DirectPipeline,
     pub buffers: &'a [(&'a MetalBuffer, u64)],
     pub words: &'a [u8],
-    /// Scalar-result slots, bound after the words.
-    pub scalar_results: (&'a MetalBuffer, u64),
+    /// Scalar-result slots, bound after the words; nothing is bound there
+    /// for an entry without scalar results.
+    pub scalar_results: Option<(&'a MetalBuffer, u64)>,
     pub threadgroups: [u64; 3],
     pub threads_per_threadgroup: [u64; 3],
     pub threadgroup_bytes: u64,
@@ -516,8 +517,8 @@ fn encode_launch(
             launch.buffers.len(),
         );
         encoder.setBuffer_offset_atIndex(
-            Some(launch.scalar_results.0.raw()),
-            launch.scalar_results.1 as usize,
+            launch.scalar_results.map(|(buffer, _)| buffer.raw()),
+            launch.scalar_results.map_or(0, |(_, offset)| offset as usize),
             launch.buffers.len() + 1,
         );
     }

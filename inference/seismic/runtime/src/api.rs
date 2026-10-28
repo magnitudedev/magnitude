@@ -1996,8 +1996,8 @@ pub mod kernel {
     }
 
     impl NativePreparedAny {
-        pub fn invocation_workspace_bytes(&self) -> u64 {
-            self.inner.invocation_workspace_bytes()
+        pub fn scalar_result_bytes(&self) -> u64 {
+            self.inner.scalar_result_bytes()
         }
         pub fn artifact(&self) -> &crate::native::NativeArtifactIdentity {
             self.inner.artifact()

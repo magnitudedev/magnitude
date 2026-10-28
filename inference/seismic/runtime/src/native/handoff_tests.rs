@@ -101,7 +101,7 @@ fn abandoned_native_handoff_does_not_keep_the_device_alive() {
     };
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "handoff-lifetime.seismic".into(),
-        text: "fn project[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut y = tensor[N] f32\n    for i in 0..N:\n        y[i] = x[i]\n    return y\n\nnative project for cpu from \"project.rs\":\n    static (N)\n    launch project:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".into(),
+        text: "fn project[N](x: &tensor[N] f32) -> f32:\n    return x[0]\n\nnative project for cpu from \"project.rs\":\n    static (N)\n    launch project:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".into(),
     }])).unwrap();
     let devices = crate::devices::Devices::discover(&[]).unwrap();
     let device = devices.open_backend(BackendName::Cpu).unwrap();
@@ -125,6 +125,9 @@ fn abandoned_native_handoff_does_not_keep_the_device_alive() {
         .next()
         .unwrap()
         .scalars
+        .as_ref()
+        .expect("a scalar result has slots")
+        .slots
         .clone();
     let served = NativePrepared::prepare(
         &device,
@@ -136,8 +139,9 @@ fn abandoned_native_handoff_does_not_keep_the_device_alive() {
     )
     .unwrap();
     assert!(device.chosen.lock().unwrap().is_empty());
-    assert!(Arc::ptr_eq(&handed_scalars, &served.scalars));
-    assert!(!Arc::ptr_eq(&formed.scalars, &served.scalars));
+    let slots = |kernel: &NativePrepared| kernel.scalar_slots().expect("a scalar result has slots").clone();
+    assert!(Arc::ptr_eq(&handed_scalars, &slots(&served)));
+    assert!(!Arc::ptr_eq(&slots(&formed), &slots(&served)));
     assert_eq!(formed.artifact, served.artifact);
     served.hand_off().unwrap();
     drop(handed_scalars);
@@ -181,7 +185,7 @@ fn a_promotion_withdraws_the_handoff_it_replaces_and_serving_takes_the_last() {
     };
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "handoff-promotion.seismic".into(),
-        text: "fn project[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut y = tensor[N] f32\n    for i in 0..N:\n        y[i] = x[i]\n    return y\n\nnative project for cpu from \"project.rs\":\n    static (N)\n    launch project:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".into(),
+        text: "fn project[N](x: &tensor[N] f32) -> f32:\n    return x[0]\n\nnative project for cpu from \"project.rs\":\n    static (N)\n    launch project:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".into(),
     }])).unwrap();
     let devices = crate::devices::Devices::discover(&[]).unwrap();
     let device = devices.open_backend(BackendName::Cpu).unwrap();
@@ -199,7 +203,7 @@ fn a_promotion_withdraws_the_handoff_it_replaces_and_serving_takes_the_last() {
         .unwrap()
     };
     let held = |kernel: &NativePrepared| {
-        Arc::downgrade(&device.chosen.lock().unwrap()[&kernel.handoff].scalars)
+        Arc::downgrade(&device.chosen.lock().unwrap()[&kernel.handoff].scalars.as_ref().expect("a scalar result has slots").slots)
     };
     let choices = [form(8), form(16), form(32), form(64)];
     choices[0].hand_off().unwrap();
@@ -218,7 +222,7 @@ fn a_promotion_withdraws_the_handoff_it_replaces_and_serving_takes_the_last() {
     let last = held(&choices[3]);
     let served = form(64);
     assert!(device.chosen.lock().unwrap().is_empty());
-    assert!(Arc::ptr_eq(&last.upgrade().unwrap(), &served.scalars));
+    assert!(Arc::ptr_eq(&last.upgrade().unwrap(), served.scalar_slots().unwrap()));
     drop(served);
     assert!(last.upgrade().is_none());
 }

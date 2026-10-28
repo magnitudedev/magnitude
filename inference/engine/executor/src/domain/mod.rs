@@ -658,7 +658,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         for charge in [
             self.family.target_weight_bytes()?,
-            self.family.prepared_program_bytes()?,
+            self.family.prepared_program_bytes(),
             self.family.target_constant_bytes()?,
         ] {
             bytes = bytes

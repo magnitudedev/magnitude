@@ -687,7 +687,10 @@ fn each_launch(
                 .iter()
                 .map(|(allocation, offset)| (vulkan_buffer(allocation), *offset)),
         );
-        let scalars = vulkan_buffer(&dispatch.kernel.scalars);
+        let scalars = dispatch
+            .kernel
+            .scalar_slots()
+            .map(|slots| (vulkan_buffer(slots), 0));
         for (ordinal, launch) in dispatch.launches.iter().enumerate() {
             let launch = launch.map(|launch| {
                 let (module, function) = launches.launch(ordinal);
@@ -696,7 +699,7 @@ fn each_launch(
                     function,
                     buffers: &typed,
                     words: dispatch.word_bytes,
-                    scalar_results: (scalars, 0),
+                    scalar_results: scalars,
                     groups: launch.groups,
                 }
             });

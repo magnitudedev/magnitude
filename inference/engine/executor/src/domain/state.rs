@@ -276,7 +276,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let optional_weights = head_weights
             .checked_add(vision_weights)
             .ok_or("optional resident charge overflows")?;
-        let prepared_programs = self.family.prepared_program_bytes()?;
+        let prepared_programs = self.family.prepared_program_bytes();
         let bound_constants = self.family.bound_constant_bytes()?;
         let external_pins = self
             .target_store

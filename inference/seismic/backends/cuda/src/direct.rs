@@ -144,7 +144,9 @@ pub struct DirectLaunch<'a> {
     pub buffers: &'a [(&'a Buffer, u64)],
     /// The argument words, passed by value as one struct parameter.
     pub words: &'a [u8],
-    pub scalar_results: (&'a Buffer, u64),
+    /// Scalar-result slots, passed after the words; a null pointer for an
+    /// entry without scalar results.
+    pub scalar_results: Option<(&'a Buffer, u64)>,
     pub grid: [u64; 3],
     pub block: [u64; 3],
     pub shared_bytes: u64,
@@ -199,7 +201,11 @@ impl FormedLaunch {
                 .iter()
                 .map(|(buffer, offset)| buffer.pointer() + offset),
         );
-        pointers.push(launch.scalar_results.0.pointer() + launch.scalar_results.1);
+        pointers.push(
+            launch
+                .scalar_results
+                .map_or(0, |(buffer, offset)| buffer.pointer() + offset),
+        );
         // The prefix declares at least one word, so an entry without words
         // still passes one zeroed word.
         let words = if launch.words.is_empty() {

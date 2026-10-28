@@ -52,8 +52,8 @@ pub enum PreparationError {
     TargetDomainUnrepresentable(String),
     SolverResourceExhausted(SolverBudgetReport),
     NativeCompilation(NativeCompilationError),
-    /// A direct native entry could not reserve its fixed invocation storage.
-    NativeWorkspaceAllocation(String),
+    /// A direct native entry could not reserve its scalar-result slots.
+    NativeScalarSlotAllocation(String),
     /// A direct native specialization does not match its declaration, or the
     /// entry has no native implementation for the device's backend.
     NativeSpecialization(String),
@@ -236,7 +236,7 @@ impl fmt::Display for PreparationError {
                 r.phase, r.work_units
             ),
             Self::NativeCompilation(e) => write!(f, "native compilation failed: {e}"),
-            Self::NativeWorkspaceAllocation(s) => write!(f, "native invocation workspace: {s}"),
+            Self::NativeScalarSlotAllocation(s) => write!(f, "native scalar-result slots: {s}"),
             Self::NativeBufferSlots { entry, slots, limit } => write!(
                 f,
                 "native implementation of `{entry}` binds {slots} buffers; the backend admits {limit}"

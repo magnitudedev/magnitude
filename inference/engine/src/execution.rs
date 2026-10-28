@@ -186,13 +186,11 @@ fn plan_on_device(
             .map_err(|error| platform_error(PlatformError::Memory(error)))?,
         held: None,
     };
-    // Preparation allocates fixed invocation buffers and runs qualification
+    // Preparation holds the programs' device storage and runs qualification
     // fixtures before any model weights are imported. It is part of startup,
     // so it must claim its peak through the same heap as later allocations.
-    let workspace = AttestedPrograms::planned_invocation_workspace_bytes(draft.programs(), backend)
-        .map_err(|error| internal(format!("program preparation workspace: {error:?}")))?;
     let qualification = AttestedPrograms::qualification_peak_bytes(draft.load()).map_err(internal)?;
-    let preparation_peak = workspace
+    let preparation_peak = AttestedPrograms::DEVICE_BYTES
         .checked_add(qualification)
         .ok_or_else(|| internal("program preparation peak byte count overflows"))?;
     startup.claim("program preparation", preparation_peak, 0)?;
@@ -424,7 +422,7 @@ fn prepare(
         .map_err(|error| LoadError::from(classify_plan(error, backend)))?;
     if draft.load().readout_choices() != programs.readout_choices() {
         programs
-            .discard_readout_choices(draft.programs())
+            .discard_readout_choices()
             .map_err(|error| LoadError::from(classify_plan(error, backend)))?;
     }
     let tuned = programs.tuned();
@@ -517,7 +515,6 @@ pub(crate) fn build(
         )
         .map_err(internal)?;
     let resources = ResourcePlanner::plan_with_state(
-        opened.device().backend(),
         state,
         &target_graphs,
         &target_readout_graphs,

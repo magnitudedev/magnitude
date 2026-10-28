@@ -1158,7 +1158,6 @@ impl ResourcePlanner {
     }
 
     pub fn plan_with_state(
-        backend: BackendName,
         state: StateResourcePlan,
         target_graphs: &PreparedTargetGraphs,
         target_readout_graphs: &PreparedTargetReadoutGraphs,
@@ -1166,7 +1165,6 @@ impl ResourcePlanner {
         vision_graphs: Option<&PreparedVisionGraphs>,
         state_graphs: &PreparedStateCopyGraphs,
     ) -> Result<ResourcePlan, String> {
-        let definition = &state.definition;
         let load = &state.load;
         let limits = state.limits;
         let capacity_bytes = state.capacity_bytes;
@@ -1218,13 +1216,6 @@ impl ResourcePlanner {
         .flatten()
         .collect::<Vec<_>>();
         let scratch = graph_scratch_bytes(&charges)?;
-        let prepared_programs = crate::AttestedPrograms::planned_invocation_workspace_bytes(
-            &load
-                .program_plan(definition, state.codec)
-                .map_err(|error| error.to_string())?,
-            backend,
-        )
-        .map_err(|error| error.to_string())?;
         let [target_weights, head_weights, vision_weights] = weight_bytes_by_component(load)?;
         let bytes = ResourceBytes {
             target_weights,
@@ -1232,7 +1223,7 @@ impl ResourcePlanner {
             vision_weights,
             history: state.history_bytes,
             recurrent_banks: state.recurrent_banks_bytes,
-            prepared_programs,
+            prepared_programs: crate::AttestedPrograms::DEVICE_BYTES,
             scratch,
         };
         let required = bytes.total()?;

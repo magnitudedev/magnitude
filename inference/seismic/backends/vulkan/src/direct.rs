@@ -25,7 +25,9 @@ pub struct DirectLaunch<'a> {
     pub buffers: &'a [(&'a Buffer, u64)],
     /// The argument words, little-endian.
     pub words: &'a [u8],
-    pub scalar_results: (&'a Buffer, u64),
+    /// Scalar-result slots, addressed after the buffers; address 0 for an
+    /// entry without scalar results.
+    pub scalar_results: Option<(&'a Buffer, u64)>,
     pub groups: [u64; 3],
 }
 
@@ -72,9 +74,10 @@ impl Arguments {
         for (buffer, offset) in launch.buffers {
             block.extend_from_slice(&(buffer.address() + offset).to_le_bytes());
         }
-        block.extend_from_slice(
-            &(launch.scalar_results.0.address() + launch.scalar_results.1).to_le_bytes(),
-        );
+        let scalar_results = launch
+            .scalar_results
+            .map_or(0, |(buffer, offset)| buffer.address() + offset);
+        block.extend_from_slice(&scalar_results.to_le_bytes());
         block.extend_from_slice(launch.words);
         let bytes = block.len() as u64;
         if bytes > ARGUMENT_CHUNK_BYTES {

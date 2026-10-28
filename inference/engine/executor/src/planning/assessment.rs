@@ -3,7 +3,7 @@
 //! The standard assessment workload is one conversation at the fit depth
 //! `min(context_limit, 100_000)` on a clean load. Its charge is composed of
 //! exact header terms (resident weights, history at the fit depth, recurrent
-//! banks, native invocation storage) and upper bounds taken from the same
+//! banks, the prepared programs' owner) and upper bounds taken from the same
 //! checked class enumeration and slot multipliers production preparation
 //! uses (graph pools and bound constants, the startup qualification/import
 //! peak). The load planner and the state layout remain the authorities for
@@ -46,13 +46,12 @@ pub struct AssessmentMemoryTerms {
 }
 
 /// Upper bounds for every nonresident charge of a clean load. The prepared
-/// resource bound covers all steady native holdings (invocation storage,
-/// graph workspace, output, upload regions, bound constants, recorded graphs
-/// and the worker's device bytes); the startup
-/// bound covers the additional qualification/import peak; the component
-/// bound is the import peak of an optional component a served request
-/// loads; the staging bound is the host upload peak of a dedicated device's
-/// imports.
+/// resource bound covers all steady native holdings (the prepared programs'
+/// owner, graph workspace, output, upload regions, bound constants, recorded
+/// graphs and the worker's device bytes); the startup bound covers the
+/// additional qualification/import peak; the component bound is the import
+/// peak of an optional component a served request loads; the staging bound
+/// is the host upload peak of a dedicated device's imports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AssessmentMemoryBounds {
     pub prepared_resource_bytes: u64,
@@ -309,16 +308,14 @@ pub struct SealedGraphHostBytes {
     pub at_least: u64,
 }
 
-/// Header-derived charges that are known before graph formation. Prepared
-/// native invocation storage is exact; the startup charge is the same
-/// qualification/import upper bound used by the production resource planner;
-/// the component charge is the import window an optional head or vision
-/// component claims beside its weights when a request first needs it
-/// (`DomainState::component_growth`); the staging charge is the largest
-/// selected source tensor's import window.
+/// Header-derived charges that are known before graph formation. The startup
+/// charge is the same qualification/import upper bound used by the production
+/// resource planner; the component charge is the import window an optional
+/// head or vision component claims beside its weights when a request first
+/// needs it (`DomainState::component_growth`); the staging charge is the
+/// largest selected source tensor's import window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AssessmentHeaderBounds {
-    pub prepared_program_bytes: u64,
     pub startup_additional_bytes: u64,
     pub component_upload_bytes: u64,
     pub staging_upload_bytes: u64,
@@ -627,18 +624,7 @@ impl AssessmentGraphResourceBounds {
 }
 
 impl AssessmentHeaderBounds {
-    pub fn derive(
-        definition: &ModelDefinition,
-        load: &ModelLoadPlan,
-        codec: KvCodec,
-        backend: BackendName,
-    ) -> Result<Self, String> {
-        let programs = load
-            .program_plan(definition, codec)
-            .map_err(|error| error.to_string())?;
-        let prepared_program_bytes =
-            AttestedPrograms::planned_invocation_workspace_bytes(&programs, backend)
-                .map_err(|error| error.to_string())?;
+    pub fn derive(load: &ModelLoadPlan) -> Result<Self, String> {
         let largest_source = load
             .weights()
             .map(|weight| weight.source_bytes)
@@ -651,7 +637,6 @@ impl AssessmentHeaderBounds {
             .head_upload_peak_bytes()?
             .max(load.vision_upload_peak_bytes()?);
         Ok(Self {
-            prepared_program_bytes,
             startup_additional_bytes,
             component_upload_bytes,
             staging_upload_bytes: import_peak,
@@ -669,8 +654,7 @@ impl AssessmentHeaderBounds {
         device_process: DeviceProcessBytes,
     ) -> Result<AssessmentMemoryBounds, String> {
         Ok(AssessmentMemoryBounds {
-            prepared_resource_bytes: self
-                .prepared_program_bytes
+            prepared_resource_bytes: AttestedPrograms::DEVICE_BYTES
                 .checked_add(graph.total_bytes)
                 .and_then(|bytes| bytes.checked_add(graph.recorded_graph_bytes))
                 .and_then(|bytes| bytes.checked_add(device_process.bytes().ok()?))
@@ -2617,17 +2601,7 @@ mod tests {
             .is_err()
         );
 
-        let header =
-            AssessmentHeaderBounds::derive(&definition, &load, KvCodec::Dense, BackendName::Cpu)
-                .unwrap();
-        assert_eq!(
-            header.prepared_program_bytes,
-            AttestedPrograms::planned_invocation_workspace_bytes(
-                &load.program_plan(&definition, KvCodec::Dense).unwrap(),
-                BackendName::Cpu
-            )
-            .unwrap()
-        );
+        let header = AssessmentHeaderBounds::derive(&load).unwrap();
         assert_eq!(
             header.startup_additional_bytes,
             AttestedPrograms::qualification_peak_bytes(&load)
@@ -2683,7 +2657,7 @@ mod tests {
         assert_eq!(bounds.device_process, device_process);
         assert_eq!(
             bounds.prepared_resource_bytes,
-            header.prepared_program_bytes + graph.total_bytes + device_process.bytes().unwrap()
+            AttestedPrograms::DEVICE_BYTES + graph.total_bytes + device_process.bytes().unwrap()
         );
         assert_eq!(
             bounds.startup_additional_bytes,

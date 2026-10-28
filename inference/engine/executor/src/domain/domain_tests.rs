@@ -190,7 +190,6 @@ fn fixture_of(
         )
         .unwrap();
     let resources_plan = ResourcePlanner::plan_with_state(
-        device.backend(),
         state,
         &target_graphs,
         &target_readout_graphs,
@@ -481,7 +480,7 @@ impl ProgramFamily for TestFamily {
     }
     fn unbind_optional(&mut self) {}
 
-    fn prepared_program_bytes(&self) -> Result<u64, &'static str> {
+    fn prepared_program_bytes(&self) -> u64 {
         self.programs.device_storage_bytes()
     }
     fn submit_target(

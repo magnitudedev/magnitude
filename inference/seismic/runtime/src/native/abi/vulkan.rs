@@ -339,7 +339,7 @@ void main() {
                 function: 0,
                 buffers: &[],
                 words: &[],
-                scalar_results: (&data, 0),
+                scalar_results: Some((&data, 0)),
                 groups: [u64::from(count.div_ceil(64)), 1, 1],
             })
             .expect("launch");
@@ -509,7 +509,7 @@ void main() {
                 function: 0,
                 buffers: &[],
                 words: &[],
-                scalar_results: (&data, 0),
+                scalar_results: Some((&data, 0)),
                 groups: [u64::from(count.div_ceil(64)), 1, 1],
             })
             .expect("launch");

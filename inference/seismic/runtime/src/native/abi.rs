@@ -184,11 +184,7 @@ pub(crate) fn scalar_word_count(schema: &CallSchema) -> usize {
     schema
         .results()
         .iter()
-        .map(|result| match &result.kind {
-            ResultKind::Range { .. } => 2,
-            ResultKind::Scalar(_) | ResultKind::Index { .. } => 1,
-            ResultKind::Tensor { .. } => 0,
-        })
+        .map(|result| result.kind.class().scalar_words())
         .sum()
 }
 
@@ -485,11 +481,7 @@ fn render_source_with(
             prefix.push_str(&format!(
                 "#define SEISMIC_RESULT_{ordinal}_WORD {scalar_word}\n"
             ));
-            scalar_word += if matches!(result.kind, ResultKind::Range { .. }) {
-                2
-            } else {
-                1
-            };
+            scalar_word += result.kind.class().scalar_words();
         }
     }
     let runtime_parameters = if forming.is_some() {

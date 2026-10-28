@@ -207,13 +207,7 @@ impl NativePreparationCache {
         let recipe_states = ReadoutRecipeStates::default();
         let mut spec = Specializer::new(device);
         let import = imports(&mut spec, plan)?;
-        let owner = Tensor::zeros(device, Element::u32(), &[1]).map_err(|error| {
-            CatalogFailure::Preparation {
-                entry: "catalog_owner",
-                bindings: "A=u32".into(),
-                outcome: error.to_string(),
-            }
-        })?;
+        let owner = AttestedPrograms::owner(device)?;
         let epsilon = epsilon(tuning.definition)?;
         let invocations = invocation_demand(
             device,

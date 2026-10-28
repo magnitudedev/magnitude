@@ -74,8 +74,8 @@ use seismic_lang::checked::{
     CheckedModule, NativeCondition, NativeImplementation, NativeNatExpr, NativeSpecialization,
 };
 use seismic_lang::entry::{
-    CallSchema, CheckedProgramSubject, ElementBindings, LogicalEntry, ParameterKind, ResultKind,
-    TensorAccess,
+    CallSchema, CheckedProgramSubject, ElementBindings, LogicalEntry, ParameterKind, ResultClass,
+    ResultKind, TensorAccess,
 };
 use seismic_lang::expr::compiled::{CompiledNat, InvocationValues};
 use seismic_lang::expr::{SymbolId, SymbolValue};
@@ -100,6 +100,17 @@ pub(crate) enum NativeResult {
     Scalar(seismic_lang::types::DType),
     Index,
     Range,
+}
+
+impl NativeResult {
+    fn class(&self) -> ResultClass {
+        match self {
+            Self::Tensor { .. } => ResultClass::Tensor,
+            Self::Scalar(_) => ResultClass::Scalar,
+            Self::Index => ResultClass::Index,
+            Self::Range => ResultClass::Range,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -163,7 +174,7 @@ impl NativeQueue {
 /// its ABI slot.
 const MINIMUM_SCRATCH_BYTES: u64 = 1;
 
-/// Bytes at the start of every non-empty scratch arena (the standalone arena
+/// Bytes at the start of every non-empty scratch arena (a standalone call's
 /// and every graph workspace that places anything) reserved for `sync`
 /// scratch; a graph that places nothing needs no workspace. Nothing else is ever placed
 /// there, arenas are zeroed when allocated, and every call restores its sync
@@ -346,21 +357,50 @@ pub struct NativePrepared {
     /// constant canonical strides (S10), with those strides.
     canonical_parameters: Vec<(usize, Vec<u64>)>,
     results: Vec<NativeResult>,
-    scalar_words: usize,
-    /// Scalar-result slots. Graph nodes publish no scalars, so only
-    /// standalone calls write them; `standalone` serializes those calls.
-    scalars: Arc<Allocation>,
-    standalone: Mutex<Standalone>,
-    scalar_bytes: u64,
+    /// Scalar-result slots, of an entry with scalar results. Graph nodes
+    /// publish no scalars, so only standalone calls write them.
+    scalars: Option<ScalarSlots>,
     artifact: NativeArtifactIdentity,
     route: NativeRoute,
+}
+
+/// The device words an entry's scalar results are written to
+/// ([`abi::scalar_word_count`]): held only by an entry with scalar results.
+pub(crate) struct ScalarSlots {
+    slots: Arc<Allocation>,
+    words: usize,
+    /// Standalone calls share the slots: it serializes their placement,
+    /// reset, execution and read.
+    calls: Mutex<()>,
+}
+
+impl ScalarSlots {
+    /// The slots of `words` scalar-result words on `device`; none for none.
+    fn allocate(device: &Arc<DeviceInner>, words: usize) -> Result<Option<Self>, ExecutionError> {
+        match words {
+            0 => Ok(None),
+            words => Ok(Some(Self {
+                slots: device.allocate(Self::bytes_of(words), ResultClass::WORD_BYTES)?,
+                words,
+                calls: Mutex::new(()),
+            })),
+        }
+    }
+
+    fn bytes_of(words: usize) -> u64 {
+        words as u64 * ResultClass::WORD_BYTES
+    }
+
+    fn bytes(&self) -> u64 {
+        Self::bytes_of(self.words)
+    }
 }
 
 /// Formed resources awaiting serving preparation. This lives on the device,
 /// so it must not own a prepared kernel's strong reference back to that device.
 pub(crate) struct NativeHandoff {
     route: NativeRoute,
-    scalars: Arc<Allocation>,
+    scalars: Option<ScalarSlots>,
     artifact: NativeArtifactIdentity,
 }
 
@@ -1087,7 +1127,7 @@ impl NativePrepared {
         &self,
         previous: Option<&NativePrepared>,
     ) -> Result<(), ExecutionError> {
-        let scalars = self.public_device.allocate(self.scalar_bytes, 8)?;
+        let scalars = ScalarSlots::allocate(&self.public_device, self.scalar_words())?;
         let served = NativeHandoff {
             scalars,
             artifact: self.artifact.clone(),
@@ -1553,13 +1593,12 @@ impl NativePrepared {
                     .map(|strides| (ordinal, strides))
             })
             .collect();
-        let scalar_bytes = (scalar_words as u64 * 8).max(1);
         let (route, artifact, scalars) = if let Some(formed) = handed_off {
             (formed.route, formed.artifact, formed.scalars)
         } else {
             let (route, artifact) = form()?;
-            let scalars = device.allocate(scalar_bytes, 8).map_err(|error| {
-                PrepareError::Preparation(PreparationError::NativeWorkspaceAllocation(
+            let scalars = ScalarSlots::allocate(device, scalar_words).map_err(|error| {
+                PrepareError::Preparation(PreparationError::NativeScalarSlotAllocation(
                     error.to_string(),
                 ))
             })?;
@@ -1577,10 +1616,7 @@ impl NativePrepared {
             statics,
             canonical_parameters,
             results,
-            scalar_words,
             scalars,
-            standalone: Mutex::new(Standalone::default()),
-            scalar_bytes,
             artifact,
             route,
         }))
@@ -1598,16 +1634,22 @@ impl NativePrepared {
     pub(crate) fn schema(&self) -> &CallSchema {
         self.logical.schema()
     }
-    /// Device storage this prepared implementation holds for its calls:
-    /// the scalar-result slots, fixed at preparation, and the standalone
-    /// scratch arena, which grows to the largest standalone call's scratch.
-    pub(crate) fn invocation_workspace_bytes(&self) -> u64 {
-        self.scalar_bytes
-            + self
-                .standalone
-                .lock()
-                .expect("native standalone-call lock poisoned")
-                .bytes()
+    /// Device storage this prepared implementation holds for its calls: its
+    /// scalar-result slots, none without scalar results. A standalone call's
+    /// scratch is its own, released when the call ends.
+    pub(crate) fn scalar_result_bytes(&self) -> u64 {
+        self.scalars.as_ref().map_or(0, ScalarSlots::bytes)
+    }
+
+    /// The words of its scalar results.
+    fn scalar_words(&self) -> usize {
+        self.scalars.as_ref().map_or(0, |scalars| scalars.words)
+    }
+
+    /// Its scalar-result slots, as a launch binds them: none for an entry
+    /// without scalar results.
+    pub(crate) fn scalar_slots(&self) -> Option<&Arc<Allocation>> {
+        self.scalars.as_ref().map(|scalars| &scalars.slots)
     }
     pub(crate) fn result_count(&self) -> u32 {
         u32::try_from(self.results.len()).expect("native result ordinal space exhausted")
@@ -1999,11 +2041,12 @@ impl NativePrepared {
         self.call_with(args, None, commit)
     }
 
-    /// Validate a standalone call, place its results and its scratch (in the
-    /// standalone scratch arena), and fix its executable form.
+    /// Validate a standalone call, place its results and its scratch (in
+    /// `arena`, which the calls placed together share), and fix its
+    /// executable form.
     fn prepare_call(
         &self,
-        standalone: &mut Standalone,
+        arena: &mut ScratchArena,
         args: EncodedArgs,
         outputs: Option<EncodedOutputs>,
     ) -> Result<NativeBoundCall, CallError> {
@@ -2061,7 +2104,7 @@ impl NativePrepared {
         } else {
             place_scratch(&shape.scratch)
         };
-        let arena = standalone.scratch(&self.public_device, scratch_end)?;
+        let arena = arena.holding(&self.public_device, scratch_end)?;
 
         let schema = self.schema();
         let mut buffers = Vec::new();
@@ -2088,7 +2131,7 @@ impl NativePrepared {
             }
             access.push((arena, true));
         }
-        access.push((self.scalars.clone(), true));
+        access.extend(self.scalar_slots().map(|slots| (slots.clone(), true)));
         Ok(NativeBoundCall {
             results,
             buffers,
@@ -2112,19 +2155,14 @@ impl NativePrepared {
         outputs: Option<EncodedOutputs>,
         commit: impl FnOnce(),
     ) -> Result<DecodedResults, CallError> {
-        // Standalone calls of this implementation share its scalar-result
-        // slots and scratch arena; the guard covers their placement, reset,
-        // execution and read.
-        let mut standalone = self
-            .standalone
-            .lock()
-            .expect("native standalone-call lock poisoned");
-        let call = self.prepare_call(&mut standalone, args, outputs)?;
-        let scalars = &self.scalars;
-        {
-            let _host = scalars.acquire(true);
-            write_zeros(scalars.storage(), self.scalar_bytes).map_err(CallError::Execution)?;
-        }
+        let _slots = self.scalars.as_ref().map(|scalars| {
+            scalars
+                .calls
+                .lock()
+                .expect("native scalar-result slots lock poisoned")
+        });
+        let call = self.prepare_call(&mut ScratchArena::default(), args, outputs)?;
+        self.reset_scalar_results()?;
         commit();
         let calls = [call];
         StandaloneCalls {
@@ -2137,20 +2175,23 @@ impl NativePrepared {
     }
 
     fn reset_scalar_results(&self) -> Result<(), CallError> {
-        if self.scalar_bytes != 0 {
-            let _host = self.scalars.acquire(true);
-            write_zeros(self.scalars.storage(), self.scalar_bytes).map_err(CallError::Execution)?;
+        if let Some(scalars) = &self.scalars {
+            let _host = scalars.slots.acquire(true);
+            write_zeros(scalars.slots.storage(), scalars.bytes()).map_err(CallError::Execution)?;
         }
         Ok(())
     }
 
     fn read_call_results(&self, call: &NativeBoundCall) -> Result<DecodedResults, CallError> {
-        let scalars = &self.scalars;
-        let mut scalar_bytes = vec![0u8; self.scalar_words * 8];
-        scalars
-            .acquire(false)
-            .read(scalars, 0, &mut scalar_bytes)
-            .map_err(CallError::Execution)?;
+        let mut scalar_bytes = Vec::new();
+        if let Some(scalars) = &self.scalars {
+            scalar_bytes.resize(scalars.bytes() as usize, 0);
+            scalars
+                .slots
+                .acquire(false)
+                .read(&scalars.slots, 0, &mut scalar_bytes)
+                .map_err(CallError::Execution)?;
+        }
         let mut offset = 0usize;
         let mut tensors = call.results.iter().cloned();
         let mut decoded = Vec::with_capacity(self.results.len());
@@ -2159,48 +2200,38 @@ impl NativePrepared {
                 NativeResult::Tensor { .. } => decoded.push(DecodedValue::Tensor(
                     tensors.next().expect("native result tensor count changed"),
                 )),
-                NativeResult::Scalar(dtype) => {
-                    decoded.push(DecodedValue::Scalar(scalar_value(
-                        *dtype,
-                        read_word(&scalar_bytes, offset),
-                    )));
-                    offset += 1;
-                }
-                NativeResult::Index => {
-                    decoded.push(DecodedValue::Scalar(ArgumentValue::Index(
-                        read_word(&scalar_bytes, offset).into(),
-                    )));
-                    offset += 1;
-                }
-                NativeResult::Range => {
-                    decoded.push(DecodedValue::Scalar(ArgumentValue::Range {
-                        start: read_word(&scalar_bytes, offset).into(),
-                        end: read_word(&scalar_bytes, offset + 1).into(),
-                    }));
-                    offset += 2;
-                }
+                NativeResult::Scalar(dtype) => decoded.push(DecodedValue::Scalar(scalar_value(
+                    *dtype,
+                    read_word(&scalar_bytes, offset),
+                ))),
+                NativeResult::Index => decoded.push(DecodedValue::Scalar(ArgumentValue::Index(
+                    read_word(&scalar_bytes, offset).into(),
+                ))),
+                NativeResult::Range => decoded.push(DecodedValue::Scalar(ArgumentValue::Range {
+                    start: read_word(&scalar_bytes, offset).into(),
+                    end: read_word(&scalar_bytes, offset + 1).into(),
+                })),
             }
+            offset += result.class().scalar_words();
         }
         Ok(DecodedResults::new(decoded))
     }
 }
 
-/// Device storage of standalone calls beyond the scalar-result slots: one
-/// scratch arena, grown to the largest standalone call's scratch and reused
-/// by every later one (the device queue orders its users).
+/// The scratch of standalone calls placed together (one call, a batch, a
+/// tuning point): one arena, grown to the largest call's scratch and reused
+/// by every later one (the device queue orders its users). Each placed call
+/// keeps the arena it was placed in, so the storage lives as long as the
+/// calls do, never as long as their kernel.
 #[derive(Default)]
-struct Standalone {
+pub(crate) struct ScratchArena {
     scratch: Option<Arc<Allocation>>,
 }
 
-impl Standalone {
-    fn bytes(&self) -> u64 {
-        self.scratch.as_ref().map_or(0, |arena| arena.bytes())
-    }
-
+impl ScratchArena {
     /// The arena, holding at least `bytes`; `None` when the call has no
     /// scratch.
-    fn scratch(
+    fn holding(
         &mut self,
         device: &Arc<DeviceInner>,
         bytes: u64,
@@ -2585,7 +2616,10 @@ fn encode(
                     typed.extend(buffers.iter().map(|(allocation, offset)| {
                         (typed_buffer::<Metal, Executor>(allocation), *offset)
                     }));
-                    let scalars = typed_buffer::<Metal, Executor>(&dispatch.kernel.scalars);
+                    let scalars = dispatch
+                        .kernel
+                        .scalar_slots()
+                        .map(|slots| (typed_buffer::<Metal, Executor>(slots), 0));
                     for ordinal in dispatch
                         .kernel
                         .implementation
@@ -2601,7 +2635,7 @@ fn encode(
                                 pipeline,
                                 buffers: &typed,
                                 words: dispatch.word_bytes,
-                                scalar_results: (scalars, 0),
+                                scalar_results: scalars,
                                 threadgroups: launch.groups,
                                 threads_per_threadgroup: launch.threads,
                                 threadgroup_bytes: launch.shared_bytes,
@@ -2781,9 +2815,9 @@ fn scalar_value(dtype: seismic_lang::types::DType, value: u64) -> ArgumentValue 
 }
 
 fn read_word(bytes: &[u8], word: usize) -> u64 {
-    let start = word * 8;
+    let start = word * ResultClass::WORD_BYTES as usize;
     u64::from_le_bytes(
-        bytes[start..start + 8]
+        bytes[start..start + ResultClass::WORD_BYTES as usize]
             .try_into()
             .expect("native scalar word"),
     )

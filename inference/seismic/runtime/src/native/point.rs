@@ -29,7 +29,9 @@ use super::graph::{
     NativeGraphBindings, NativeGraphCompletion, NativeGraphOutputs, NativeGraphPlan,
     NativeGraphSequence, NativeGraphSlot,
 };
-use super::{CallError, NativeBoundCall, NativePrepared, NativeSubmission, StandaloneCalls};
+use super::{
+    CallError, NativeBoundCall, NativePrepared, NativeSubmission, ScratchArena, StandaloneCalls,
+};
 use crate::api::device::DeviceInner;
 use crate::api::kernel::{EncodedArgs, EncodedOutputs};
 use crate::api::tensor::TensorInner;
@@ -148,7 +150,8 @@ impl KernelPoint {
     /// `copies`. Results of each argument set are allocated once and reused
     /// by every pass, a copy's being its source's, or taken from `outputs`
     /// (and added to it) where a caller shares results among the placements
-    /// of one point; scratch is the standalone arena.
+    /// of one point; the point's calls share one scratch arena, held while
+    /// the point is.
     pub(crate) fn place(
         kernel: &Arc<NativePrepared>,
         rotation: Vec<EncodedArgs>,
@@ -168,28 +171,23 @@ impl KernelPoint {
             encoded
         };
         let mut calls: Vec<NativeBoundCall> = Vec::with_capacity(own + copies.len());
-        {
-            let mut standalone = kernel
-                .standalone
-                .lock()
-                .expect("native standalone-call lock poisoned");
-            for (index, args) in rotation.into_iter().chain(copies).enumerate() {
-                let supplied = if index < own {
-                    outputs
-                        .as_ref()
-                        .and_then(|pool| pool.get(index))
-                        .map(|tensors| encoded(tensors))
-                } else {
-                    Some(encoded(&calls[index % own].results))
-                };
-                let call = kernel.prepare_call(&mut standalone, args, supplied)?;
-                if let Some(pool) = outputs.as_mut() {
-                    if index < own && index == pool.len() {
-                        pool.push(call.results.clone());
-                    }
+        let mut scratch = ScratchArena::default();
+        for (index, args) in rotation.into_iter().chain(copies).enumerate() {
+            let supplied = if index < own {
+                outputs
+                    .as_ref()
+                    .and_then(|pool| pool.get(index))
+                    .map(|tensors| encoded(tensors))
+            } else {
+                Some(encoded(&calls[index % own].results))
+            };
+            let call = kernel.prepare_call(&mut scratch, args, supplied)?;
+            if let Some(pool) = outputs.as_mut() {
+                if index < own && index == pool.len() {
+                    pool.push(call.results.clone());
                 }
-                calls.push(call);
             }
+            calls.push(call);
         }
         let mut distinct = HashSet::new();
         for call in &calls[..own] {

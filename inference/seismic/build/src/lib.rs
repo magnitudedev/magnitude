@@ -257,6 +257,7 @@ pub struct NativeCoverage {
 mod internals {
     use super::*;
     use seismic_lang::checked::{ElementSummary, ElementTarget, NativeElementCoverage};
+    use seismic_lang::entry::ResultClass;
     use seismic_lang::registry::{self, RepresentationInfo, SourceDialect};
     use std::collections::HashSet;
     use std::fs;
@@ -1297,20 +1298,16 @@ mod internals {
             "    const NAME: &'static str = {:?};\n",
             entry.name
         ));
+        // Argument words travel by value; a prepared native implementation
+        // owns only its scalar-result slots, none without scalar results.
         let scalar_words = entry
             .results
             .iter()
-            .map(|result| match &result.kind {
-                ResultSummaryKind::Range => 2,
-                ResultSummaryKind::Scalar(_) | ResultSummaryKind::Index => 1,
-                ResultSummaryKind::Tensor { .. } => 0,
-            })
+            .map(|result| result.kind.class().scalar_words() as u64)
             .sum::<u64>();
-        // Argument words travel by value; a prepared native implementation
-        // owns only its scalar-result slots.
-        let invocation_workspace_bytes = (scalar_words * 8).max(1);
         out.push_str(&format!(
-            "    const NATIVE_INVOCATION_WORKSPACE_BYTES: u64 = {invocation_workspace_bytes};\n"
+            "    const NATIVE_SCALAR_RESULT_BYTES: u64 = {};\n",
+            scalar_words * ResultClass::WORD_BYTES
         ));
         out.push_str("    fn module() -> Result<&'static seismic::generated::Module, seismic::CheckedBundleError> { super::module() }\n");
         out.push_str(&format!(

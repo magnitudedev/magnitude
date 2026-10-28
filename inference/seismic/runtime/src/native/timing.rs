@@ -69,8 +69,8 @@ impl Slotted for PointTiming<'_> {
 impl<'a> PointTiming<'a> {
     /// Validate and place every call of `rotation`, then of its cold
     /// `copies` ([`super::point::cold_copies`]). Results of each argument
-    /// set are allocated once and reused by every sample; scratch is the
-    /// standalone arena.
+    /// set are allocated once and reused by every sample; the calls share
+    /// one scratch arena, held while the timing is.
     pub(crate) fn new(
         kernel: &Arc<NativePrepared>,
         rotation: Vec<EncodedArgs>,

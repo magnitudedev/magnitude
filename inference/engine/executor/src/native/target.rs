@@ -180,29 +180,6 @@ pub enum ReadoutHeadKernels {
     },
 }
 
-impl ReadoutHeadKernels {
-    pub(crate) fn invocation_workspace_bytes(&self) -> u128 {
-        match self {
-            Self::Packed { head, selected } => {
-                u128::from(head.invocation_workspace_bytes())
-                    + u128::from(selected.invocation_workspace_bytes())
-            }
-            Self::Qualified {
-                packed,
-                progressive,
-                ..
-            } => packed.invocation_workspace_bytes() + progressive_workspace_bytes(progressive),
-        }
-    }
-}
-
-fn progressive_workspace_bytes(kernels: &ProgressiveReadoutKernels) -> u128 {
-    u128::from(kernels.top.invocation_workspace_bytes())
-        + u128::from(kernels.refine.invocation_workspace_bytes())
-        + u128::from(kernels.exact.invocation_workspace_bytes())
-        + u128::from(kernels.planes.invocation_workspace_bytes())
-}
-
 /// A progressive head's certified levels and its full exact pass.
 #[derive(Clone, Debug)]
 pub struct ProgressiveReadoutKernels {
@@ -271,17 +248,6 @@ pub enum SelectedPrefillKernel {
     AffineK8V4(NativeKernel<attention_prefill_k8v4::Entry>),
 }
 
-impl SelectionKernels {
-    pub fn invocation_workspace_bytes(&self) -> u64 {
-        self.project.invocation_workspace_bytes()
-            + self.select.invocation_workspace_bytes()
-            + match &self.prefill {
-                SelectedPrefillKernel::Dense(kernel) => kernel.invocation_workspace_bytes(),
-                SelectedPrefillKernel::AffineK8V4(kernel) => kernel.invocation_workspace_bytes(),
-            }
-    }
-}
-
 /// A sublayer's output entries by its `SublayerTail`: the operator's own
 /// output projection plus residual (`K`), or the F32 projection and the
 /// post-norm row op.
@@ -295,18 +261,6 @@ pub enum SublayerOutput<K> {
 pub struct PostNormKernels {
     pub project: NativeKernel<project_rows::Entry>,
     pub residual: NativeKernel<post_norm_residual::Entry>,
-}
-
-impl<E: seismic::Entry> SublayerOutput<NativeKernel<E>> {
-    pub fn invocation_workspace_bytes(&self) -> u64 {
-        match self {
-            Self::Residual(kernel) => kernel.invocation_workspace_bytes(),
-            Self::PostNorm(kernels) => {
-                kernels.project.invocation_workspace_bytes()
-                    + kernels.residual.invocation_workspace_bytes()
-            }
-        }
-    }
 }
 
 /// The fused attention entries of one history codec: `decode` for decode row
@@ -337,60 +291,6 @@ pub enum AttentionHistoryKernels {
         /// (`StateResourcePlan::lists_history_tiles`).
         prefill_listed: Option<NativeKernel<attention_prefill_k8v4::Entry>>,
     },
-}
-
-impl AttentionHistoryKernels {
-    pub fn invocation_workspace_bytes(&self) -> u64 {
-        match self {
-            Self::Dense {
-                append,
-                decode,
-                verify,
-                prefill,
-            } => {
-                append.invocation_workspace_bytes()
-                    + decode.invocation_workspace_bytes().max(
-                        verify
-                            .as_ref()
-                            .map_or(0, |kernel| kernel.invocation_workspace_bytes()),
-                    )
-                    + prefill.invocation_workspace_bytes()
-            }
-            Self::AffineK8V4 {
-                append,
-                decode,
-                verify,
-                verify_four,
-                verify_eight,
-                prefill,
-                prefill_listed,
-            } => {
-                append.invocation_workspace_bytes()
-                    + decode
-                        .invocation_workspace_bytes()
-                        .max(
-                            verify
-                                .as_ref()
-                                .map_or(0, NativeKernel::invocation_workspace_bytes),
-                        )
-                        .max(
-                            verify_four
-                                .as_ref()
-                                .map_or(0, NativeKernel::invocation_workspace_bytes),
-                        )
-                        .max(
-                            verify_eight
-                                .as_ref()
-                                .map_or(0, NativeKernel::invocation_workspace_bytes),
-                        )
-                    + prefill.invocation_workspace_bytes().max(
-                        prefill_listed
-                            .as_ref()
-                            .map_or(0, NativeKernel::invocation_workspace_bytes),
-                    )
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug)]

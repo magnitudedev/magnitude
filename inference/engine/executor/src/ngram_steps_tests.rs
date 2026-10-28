@@ -324,7 +324,6 @@ fn load(
         )
         .unwrap();
     let resources_plan = ResourcePlanner::plan_with_state(
-        device.backend(),
         state,
         &target_graphs,
         &target_readout_graphs,

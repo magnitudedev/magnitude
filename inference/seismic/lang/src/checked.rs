@@ -18,7 +18,7 @@
 //!
 //! W1 owns the internals behind `internals::Module`.
 
-use crate::entry::{ElementBindings, LogicalEntry};
+use crate::entry::{ElementBindings, LogicalEntry, ResultClass};
 use crate::ids::{EntryId, ModuleHash, RepresentationId, StableEntryId};
 use crate::registry::{self, BackendName, RepresentationAccess, RepresentationKind};
 use crate::span::Span;
@@ -2642,6 +2642,17 @@ pub enum ResultSummaryKind {
     Scalar(DType),
     Index,
     Range,
+}
+
+impl ResultSummaryKind {
+    pub fn class(&self) -> ResultClass {
+        match self {
+            Self::Tensor { .. } => ResultClass::Tensor,
+            Self::Scalar(_) => ResultClass::Scalar,
+            Self::Index => ResultClass::Index,
+            Self::Range => ResultClass::Range,
+        }
+    }
 }
 
 pub(crate) mod internals {

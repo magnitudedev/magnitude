@@ -253,6 +253,25 @@ impl<'a> Tuning<'a> {
     }
 }
 
+/// Prepare program entry `entry` at `specialization` on `device`: every
+/// kernel the prepared programs hold is formed here. A program entry
+/// publishes its results as tensors, so a prepared one holds no device
+/// storage of its own (scalar-result slots) and the programs hold only their
+/// owner (`AttestedPrograms::DEVICE_BYTES`).
+pub(super) fn prepare_program<E: Entry>(
+    device: &Device,
+    entry: BoundEntry<E>,
+    specialization: &NativeSpecialization,
+) -> Result<NativeKernel<E>, seismic::LoadError> {
+    const {
+        assert!(
+            E::NATIVE_SCALAR_RESULT_BYTES == 0,
+            "a program entry has no scalar results"
+        )
+    };
+    entry.prepare(device, specialization)
+}
+
 fn failure(entry: &'static str, bindings: &str, outcome: String) -> CatalogFailure {
     CatalogFailure::Preparation {
         entry,
@@ -417,8 +436,7 @@ impl<'a> Specializer<'a> {
         specialization: &NativeSpecialization,
     ) -> Result<Option<NativeKernel<E>>, CatalogFailure> {
         match &mut self.mode {
-            Mode::Prepare(device) => entry
-                .prepare(device, specialization)
+            Mode::Prepare(device) => prepare_program(device, entry, specialization)
                 .map(Some)
                 .map_err(|error| failure(E::NAME, bindings, error.to_string())),
             Mode::Count | Mode::CountUntuned(..) => Ok(None),

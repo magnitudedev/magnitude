@@ -28,7 +28,7 @@
 //! recipe and the worst (Nemotron, prose-continue) is break-even.
 
 use super::{ComposedCensus, ComposedContender, PointShape, TuningInputs, TuningKey};
-use crate::native::specialization::entry_statics;
+use crate::native::specialization::{entry_statics, prepare_program};
 use crate::native::{CatalogFailure, ProgressiveReadoutKernels, ProjectionKernels};
 use crate::{KernelCache, TuningCacheKey};
 use magnitude_family_contracts::{ProgressiveCodeDepth, ProgressivePlane, WeightKind, WeightScope};
@@ -242,12 +242,12 @@ impl ReadoutRecipe {
         self,
         device: &seismic::Device,
     ) -> Result<NativeKernel<readout_features_rows::Entry>, CatalogFailure> {
-        readout_features_rows::native_for_device_with(
+        prepare_program(
             device,
-            readout_features_rows::Elements {
+            readout_features_rows::native_entry_with(readout_features_rows::Elements {
                 NW: self.norm,
                 A: self.activation,
-            },
+            }),
             &self.statics::<readout_features_rows::Entry>(device)?,
         )
         .map_err(fail)
@@ -273,42 +273,46 @@ impl ReadoutRecipe {
 
     /// Form the recipe's four programs, to the end.
     fn form(self, device: &seismic::Device) -> Result<QualifiedRecipe, CatalogFailure> {
-        let top = readout_top_rows::native_for_device_with(
+        let top = prepare_program(
             device,
-            readout_top_rows::Elements {
+            readout_top_rows::native_entry_with(readout_top_rows::Elements {
                 NW: self.norm,
                 A: self.activation,
-            },
+            }),
             &declared_defaults::<readout_top_rows::Entry>(
                 device,
                 &self.statics::<readout_top_rows::Entry>(device)?,
             )?,
         )
         .map_err(fail)?;
-        let refine = readout_refine_rows::native_for_device_with(
+        let refine = prepare_program(
             device,
-            readout_refine_rows::Elements { A: self.activation },
+            readout_refine_rows::native_entry_with(readout_refine_rows::Elements {
+                A: self.activation,
+            }),
             &declared_defaults::<readout_refine_rows::Entry>(
                 device,
                 &self.statics::<readout_refine_rows::Entry>(device)?,
             )?,
         )
         .map_err(fail)?;
-        let exact = readout_exact_rows::native_for_device_with(
+        let exact = prepare_program(
             device,
-            readout_exact_rows::Elements { A: self.activation },
+            readout_exact_rows::native_entry_with(readout_exact_rows::Elements {
+                A: self.activation,
+            }),
             &declared_defaults::<readout_exact_rows::Entry>(
                 device,
                 &self.statics::<readout_exact_rows::Entry>(device)?,
             )?,
         )
         .map_err(fail)?;
-        let planes = readout_planes_rows::native_for_device_with(
+        let planes = prepare_program(
             device,
-            readout_planes_rows::Elements {
+            readout_planes_rows::native_entry_with(readout_planes_rows::Elements {
                 NW: self.norm,
                 A: self.activation,
-            },
+            }),
             &declared_defaults::<readout_planes_rows::Entry>(
                 device,
                 &self.statics::<readout_planes_rows::Entry>(device)?,
@@ -333,24 +337,24 @@ impl ReadoutRecipe {
         specialization: &NativeSpecialization,
     ) -> Result<ProjectionKernels, CatalogFailure> {
         if self.prepared {
-            readout_project_rows::native_for_device_with(
+            prepare_program(
                 device,
-                readout_project_rows::Elements {
+                readout_project_rows::native_entry_with(readout_project_rows::Elements {
                     OW: self.weight,
                     A: self.activation,
-                },
+                }),
                 specialization,
             )
             .map(ProjectionKernels::PreparedPacked)
             .map_err(fail)
         } else {
-            readout_head_rows::native_for_device_with(
+            prepare_program(
                 device,
-                readout_head_rows::Elements {
+                readout_head_rows::native_entry_with(readout_head_rows::Elements {
                     NW: self.norm,
                     OW: self.weight,
                     A: self.activation,
-                },
+                }),
                 specialization,
             )
             .map(ProjectionKernels::RawPacked)
