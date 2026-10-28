@@ -112,7 +112,7 @@ export interface HarnessConnectionOptions {
   readonly canonicalModel?: (modelId: ProviderModelId) => Effect.Effect<ProviderModelId>
   readonly paths?: HarnessConnectionPaths
   readonly serviceEndpoint?: string
-  readonly detect?: (connector: HarnessConnector) => Effect.Effect<Option.Option<HarnessInstallation>>
+  readonly detect?: (connector: HarnessConnector) => Effect.Effect<Option.Option<HarnessInstallation>, never, CommandExecutor.CommandExecutor>
   readonly resolveModels?: Effect.Effect<ReadonlyArray<HarnessModel>, unknown, HttpClient.HttpClient>
   readonly now?: () => Date
   readonly registry?: HarnessConnectorRegistry
@@ -249,6 +249,7 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
         id: connector.id,
         name: connector.name,
         installed: Option.isSome(installation),
+        version: Option.flatMapNullable(installation, ({ version }) => version),
         managed: entry !== undefined,
         inspection,
         configurationFiles: connector.configurationFiles,

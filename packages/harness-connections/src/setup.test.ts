@@ -32,7 +32,7 @@ describe("browser harness setup", () => {
   for (const harness of HARNESS_PRIORITY) for (const platform of ["darwin", "linux", "win32"] as const satisfies readonly SetupPlatform[]) for (const remote of [true, false]) {
     it(`${harness} on ${platform}${remote ? " from another device" : " on the server"}`, () => {
       const setup = describeHarnessSetup({ harness, models: [model], model, platform, origin, key: remote ? Option.some(key) : Option.none(), updatedAt })
-      expect(setup.runCommand).toBe(harnessCommand(harness, model.id, platform))
+      expect(setup.runCommand).toBe(harnessCommand(harness, model.id, platform, Option.none()))
       expect(setup.prompt).toContain(setup.runCommand)
       expect(setup.prompt).toContain(model.id)
       expect(setup.docsUrl).toBe(`https://docs.magnitude.dev/integrations/${harness}`)

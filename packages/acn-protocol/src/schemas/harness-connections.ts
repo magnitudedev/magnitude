@@ -29,6 +29,7 @@ export const HarnessConnectionStatus = Schema.Struct({
   id: HarnessIdSchema,
   name: Schema.String,
   installed: Schema.Boolean,
+  version: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
   managed: Schema.Boolean,
   inspection: ConnectionInspection,
   configurationFiles: Schema.Array(Schema.String),

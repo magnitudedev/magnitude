@@ -67,6 +67,7 @@ export const makeOpenCodeConnector = (paths: HarnessConnectionPaths, baseUrl = O
   id: "opencode",
   name: "OpenCode",
   executable: "opencode",
+  versionArguments: ["--version"],
   skillInstallationTarget: "shared-agents",
   configurationFiles: openCodeConfigurationFiles(paths),
   selectedModel: readOpenCodeConfiguration(paths).pipe(Effect.map((configuration) =>

@@ -1,4 +1,4 @@
-import { Brand } from "effect"
+import { Brand, Option, Schema } from "effect"
 import type { ProviderModelId } from "@magnitudedev/ai/provider/model"
 import type { HarnessId } from "./schemas/harness-connections"
 
@@ -7,11 +7,27 @@ export const shellArgument = (value: string, platform: string): string => /^[a-z
   ? value
   : `'${value.replaceAll("'", platform === "win32" ? "''" : "'\\''")}'`
 
-export const harnessCommand = (harness: HarnessId, model: ProviderModelId, platform: string): string => {
+const encodeOpenCodeModelConfiguration = Schema.encodeSync(Schema.parseJson(Schema.Struct({ model: Schema.String })))
+
+/** OpenCode 1.x, when the installed version says so; an unknown version is assumed current. */
+const isOpenCodeV1 = (version: Option.Option<string>) => Option.exists(version, (value) => /^1\./.test(value))
+
+/**
+ * OpenCode 2's TUI dropped `--model` and attaches to a shared background service that keeps the configuration
+ * of whichever launch started it, so the model is pinned with inline configuration on a private `--standalone` server.
+ */
+const openCodeV2Command = (model: ProviderModelId, platform: string): string => {
+  const configuration = shellArgument(encodeOpenCodeModelConfiguration({ model: `magnitude/${model}` }), platform)
+  return platform === "win32"
+    ? `$env:OPENCODE_CONFIG_CONTENT=${configuration}; opencode --standalone`
+    : `OPENCODE_CONFIG_CONTENT=${configuration} opencode --standalone`
+}
+
+export const harnessCommand = (harness: HarnessId, model: ProviderModelId, platform: string, version: Option.Option<string>): string => {
   const argv = (() => {
     switch (Brand.unbranded(harness)) {
       case "pi": return ["pi", "--provider", "magnitude", "--model", model]
-      case "opencode": return ["opencode", "--model", `magnitude/${model}`]
+      case "opencode": return isOpenCodeV1(version) ? ["opencode", "--model", `magnitude/${model}`] : undefined
       case "hermes": return ["hermes", "--provider", "custom:magnitude", "--model", model]
       case "codex": return ["codex", "-c", "model_provider=magnitude", "--model", `magnitude-local/${model}`]
       case "claude-code": return ["claude", "--model", `anthropic-local/${model}`]
@@ -21,7 +37,7 @@ export const harnessCommand = (harness: HarnessId, model: ProviderModelId, platf
       case "openclaw": return ["openclaw", "tui"]
     }
   })()
-  return argv.map(arg => shellArgument(arg, platform)).join(" ")
+  return argv === undefined ? openCodeV2Command(model, platform) : argv.map(arg => shellArgument(arg, platform)).join(" ")
 }
 
 const installationUrls: Record<Brand.Brand.Unbranded<HarnessId>, string> = {

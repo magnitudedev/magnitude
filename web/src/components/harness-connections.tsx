@@ -1,7 +1,7 @@
 import { ErrorNotice } from "./error-notice"
 import { pageLayout } from "./page-layout"
 import type { HarnessConnectionStatus, HarnessId } from "@magnitudedev/sdk"
-import { Brand } from "effect"
+import { Brand, Option } from "effect"
 import { useMemo, useState } from "react"
 import type { ProviderModelId } from "@magnitudedev/sdk"
 import { harnessCommand, harnessInstallationUrl } from "@magnitudedev/sdk"
@@ -54,7 +54,7 @@ export function HarnessConnections({ connections, busy, canConnect, onConnect, o
           </div>
         </div>
               {installed && row.inspection._tag === "Unavailable" && <ErrorNotice title="Couldn’t verify this connection" description="The agent’s configuration could not be read or validated. Check it before reconnecting." className="mt-2" />}
-        {installed && row.inspection._tag === "Connected" && <div className="mt-4 border-t border-slate-200 pt-4 text-sm text-slate-500 dark:border-slate-750"><HarnessCommand harness={row.id} name={row.name} models={models} defaultModel={defaultModel} platform={platform} /><div className="relative mt-3 text-xs"><details className="group"><summary className="w-fit cursor-pointer list-none hover:text-slate-700 dark:hover:text-slate-300 [&::-webkit-details-marker]:hidden"><span aria-hidden="true" className="mr-1 inline-block transition-transform group-open:rotate-90">▸</span>Configuration files</summary><ul className="mt-2 space-y-1">{row.configurationFiles.map(file => <li key={file} className="break-all font-mono text-xs">{file}</li>)}</ul></details>{models.length > 0 && <span className="mt-2 block text-slate-500 md:absolute md:right-0 md:top-0 md:mt-0 md:max-w-[calc(100%-9rem)] md:truncate md:text-right">Run this in {platform === "win32" ? "PowerShell" : "your terminal"} from your project folder.</span>}</div></div>}
+        {installed && row.inspection._tag === "Connected" && <div className="mt-4 border-t border-slate-200 pt-4 text-sm text-slate-500 dark:border-slate-750"><HarnessCommand harness={row.id} name={row.name} version={row.version} models={models} defaultModel={defaultModel} platform={platform} /><div className="relative mt-3 text-xs"><details className="group"><summary className="w-fit cursor-pointer list-none hover:text-slate-700 dark:hover:text-slate-300 [&::-webkit-details-marker]:hidden"><span aria-hidden="true" className="mr-1 inline-block transition-transform group-open:rotate-90">▸</span>Configuration files</summary><ul className="mt-2 space-y-1">{row.configurationFiles.map(file => <li key={file} className="break-all font-mono text-xs">{file}</li>)}</ul></details>{models.length > 0 && <span className="mt-2 block text-slate-500 md:absolute md:right-0 md:top-0 md:mt-0 md:max-w-[calc(100%-9rem)] md:truncate md:text-right">Run this in {platform === "win32" ? "PowerShell" : "your terminal"} from your project folder.</span>}</div></div>}
 
       </article>})}</div>
     </section>
@@ -64,11 +64,11 @@ export function HarnessConnections({ connections, busy, canConnect, onConnect, o
 
 export interface CommandModel { readonly id: ProviderModelId; readonly label: string }
 
-export function HarnessCommand({ harness, name, models, defaultModel, platform }: { harness: HarnessId; name: string; models: readonly CommandModel[]; defaultModel: ProviderModelId | undefined; platform: string }) {
+export function HarnessCommand({ harness, name, version, models, defaultModel, platform }: { harness: HarnessId; name: string; version: Option.Option<string>; models: readonly CommandModel[]; defaultModel: ProviderModelId | undefined; platform: string }) {
   const [selection, setSelection] = useState<string | null>(null)
   const selected = models.find(model => model.id === selection) ?? models.find(model => model.id === defaultModel) ?? models[0]
   if (!selected) return <p>Download a compatible model to get a command for this agent.</p>
-  const command = harnessCommand(harness, selected.id, platform)
+  const command = harnessCommand(harness, selected.id, platform, version)
   return <div className="space-y-2">
     <div className="flex min-w-0 flex-col items-stretch gap-2 md:flex-row md:items-center md:gap-3"><div className="flex min-w-0 max-w-full shrink-0 items-center gap-2 md:max-w-[35%]"><Select items={models.map(model => ({ value: model.id, label: model.label }))} value={selected.id} onValueChange={setSelection}><SelectTrigger variant="inline" aria-label={`${name} model`} className="min-w-0 max-w-full py-1 text-slate-800 dark:text-slate-200"><SelectValue className="min-w-0"><span className="truncate" title={selected.label}>{selected.label}</span></SelectValue></SelectTrigger><SelectContent className="w-max min-w-64 max-w-[calc(100vw-2rem)]">{models.map(model => <SelectItem key={model.id} value={model.id}>{model.label}</SelectItem>)}</SelectContent></Select></div>
     <CopyCommand key={command} command={command} label={`Copy ${name} command`} />

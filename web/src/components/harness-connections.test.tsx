@@ -75,7 +75,7 @@ it("shows model commands only for connected installations", () => {
 
 it("uses an available fallback instead of a removed default", () => {
   const model = Schema.decodeUnknownSync(ProviderModelIdSchema)("available-Q8")
-  const html = renderToStaticMarkup(<TooltipProvider><HarnessCommand harness={installed.id} name="Pi" models={[{ id: model, label: "Available (Q8)" }]} defaultModel={Schema.decodeUnknownSync(ProviderModelIdSchema)("removed-Q4")} platform="win32" /></TooltipProvider>)
+  const html = renderToStaticMarkup(<TooltipProvider><HarnessCommand harness={installed.id} name="Pi" version={Option.none()} models={[{ id: model, label: "Available (Q8)" }]} defaultModel={Schema.decodeUnknownSync(ProviderModelIdSchema)("removed-Q4")} platform="win32" /></TooltipProvider>)
   expect(html).toContain("--model available-Q8")
   expect(html).not.toContain("removed-Q4")
 })
@@ -89,9 +89,10 @@ it("shows download guidance without a copy action when no model is available", (
 
 it("keeps OpenClaw model selection separate from its terminal command", () => {
   const model = Schema.decodeUnknownSync(ProviderModelIdSchema)("gemma-4-e2b-it-qat:gguf:q4")
-  const html = renderToStaticMarkup(<TooltipProvider><HarnessCommand harness={missing.id} name="OpenClaw" models={[{ id: model, label: "Gemma (Q4)" }]} defaultModel={model} platform="darwin" /></TooltipProvider>)
+  const html = renderToStaticMarkup(<TooltipProvider><HarnessCommand harness={missing.id} name="OpenClaw" version={Option.none()} models={[{ id: model, label: "Gemma (Q4)" }]} defaultModel={model} platform="darwin" /></TooltipProvider>)
   expect(html).toContain("openclaw tui")
   expect(html).toContain("/model magnitude/gemma-4-e2b-it-qat:gguf:q4")
   expect(html).not.toContain("--model")
   expect(html).toContain("inside it")
 })
+

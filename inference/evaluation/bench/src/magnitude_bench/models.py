@@ -46,7 +46,9 @@ def catalog_reference(reference: str) -> str:
     entries = {entry["id"]: entry for entry in json.loads(CATALOG.read_text())["models"]}
     if model not in entries:
         raise ValueError(f"{model} is not a catalog model")
-    variants = [item["variantId"] for item in entries[model]["variants"]]
+    variants = [
+        item["variantId"] for source in entries[model]["sources"] for item in source["variants"]
+    ]
     if variant not in variants:
         raise ValueError(f"{model} has no variant {variant}; choose from {', '.join(variants)}")
     return reference

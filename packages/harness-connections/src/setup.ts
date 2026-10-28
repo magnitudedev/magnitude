@@ -211,7 +211,7 @@ const checkCommand = (platform: SetupPlatform, origin: string, key: Option.Optio
  */
 export const describeHarnessSetup = (target: HarnessSetupTarget): HarnessSetup => {
   const setup = plan(target)
-  const runCommand = harnessCommand(target.harness, target.model.id, target.platform)
+  const runCommand = harnessCommand(target.harness, target.model.id, target.platform, Option.none())
   const files = setup.files.map((file, index) => [
     `${index + 1}. ${file.path} — ${file.purpose}`,
     "```" + file.format,

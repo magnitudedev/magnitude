@@ -44,7 +44,7 @@ describe("connections command contract", () => {
   })
 
   it("distinguishes configuration integrity from installation", () => {
-    const common = { configurationFiles: [], plugin: Option.none(), managed: false }
+    const common = { configurationFiles: [], plugin: Option.none(), version: Option.none(), managed: false }
     const output = renderConnections([
       { ...common, id: HarnessIdSchema.make("codex"), name: "Codex", installed: true, inspection: { _tag: "Connected" } },
       { ...common, id: HarnessIdSchema.make("claude-code"), name: "Claude Code", installed: true, inspection: { _tag: "Disconnected", reason: "Settings changed" } },
@@ -66,7 +66,7 @@ describe("connections command contract", () => {
   ])("preserves configuration status when the executable is missing: %s", (inspection, status) => {
     const output = renderConnections([{
       id: HarnessIdSchema.make("claude-code"), name: "Claude Code", installed: false,
-      configurationFiles: [], plugin: Option.none(), managed: false, inspection,
+      configurationFiles: [], plugin: Option.none(), version: Option.none(), managed: false, inspection,
     }])
     expect(output).toContain("Not installed")
     expect(output).toContain(status)
