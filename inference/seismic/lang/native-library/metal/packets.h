@@ -700,12 +700,15 @@ struct Direct {
     }
 };
 
-// WORDS consecutive little-endian words, shifted right as one value
-// (`shift`), with their lowest word (`low`) and their bits
-// [BITS index, BITS (index + 1)) (`field`, BITS < 32). No words (`Run<0>`)
-// are a run of nothing.
+// WORDS consecutive little-endian words, loaded from an aligned word
+// (`load`) or made of words (`of`), shifted right as one value by BITS
+// (`shift`) or by a runtime count below 32 (`shift_by`), with their lowest
+// word (`low`) and their bits [BITS index, BITS (index + 1)) (`field`,
+// BITS < 32). No words (`Run<0>`) are a run of nothing.
 template <uint WORDS>
 struct Run;
+// Word `low` shifted right by `s` < 32 with the low bits of `high` above it.
+inline uint funnel(uint low, uint high, uint s) { return (low >> s) | ((high << 1u) << (31u - s)); }
 template <>
 struct Run<0> {
     struct words {};
@@ -714,8 +717,10 @@ template <>
 struct Run<1> {
     typedef uint words;
     static words load(device const uchar *at) { return *reinterpret_cast<device const uint *>(at); }
+    static words of(thread const uint *w) { return w[0]; }
     template <uint BITS>
     static words shift(words w) { return w >> BITS; }
+    static words shift_by(words w, uint s) { return w >> s; }
     static uint low(words w) { return w; }
     template <uint BITS>
     static uint field(words w, uint index) { return (w >> (BITS * index)) & ((1u << BITS) - 1u); }
@@ -724,8 +729,10 @@ template <>
 struct Run<2> {
     typedef uint2 words;
     static words load(device const uchar *at) { return uint2(*reinterpret_cast<device const packed_uint2 *>(at)); }
+    static words of(thread const uint *w) { return uint2(w[0], w[1]); }
     template <uint BITS>
     static words shift(words w) { return uint2((w.x >> BITS) | (w.y << (32u - BITS)), w.y >> BITS); }
+    static words shift_by(words w, uint s) { return uint2(funnel(w.x, w.y, s), w.y >> s); }
     static uint low(words w) { return w.x; }
     template <uint BITS>
     static uint field(words w, uint index) {
@@ -736,10 +743,12 @@ template <>
 struct Run<3> {
     typedef uint3 words;
     static words load(device const uchar *at) { return uint3(*reinterpret_cast<device const packed_uint3 *>(at)); }
+    static words of(thread const uint *w) { return uint3(w[0], w[1], w[2]); }
     template <uint BITS>
     static words shift(words w) {
         return uint3((w.x >> BITS) | (w.y << (32u - BITS)), (w.y >> BITS) | (w.z << (32u - BITS)), w.z >> BITS);
     }
+    static words shift_by(words w, uint s) { return uint3(funnel(w.x, w.y, s), funnel(w.y, w.z, s), w.z >> s); }
     static uint low(words w) { return w.x; }
     template <uint BITS>
     static uint field(words w, uint index) {
@@ -750,10 +759,14 @@ template <>
 struct Run<4> {
     typedef uint4 words;
     static words load(device const uchar *at) { return uint4(*reinterpret_cast<device const packed_uint4 *>(at)); }
+    static words of(thread const uint *w) { return uint4(w[0], w[1], w[2], w[3]); }
     template <uint BITS>
     static words shift(words w) {
         return uint4((w.x >> BITS) | (w.y << (32u - BITS)), (w.y >> BITS) | (w.z << (32u - BITS)),
             (w.z >> BITS) | (w.w << (32u - BITS)), w.w >> BITS);
+    }
+    static words shift_by(words w, uint s) {
+        return uint4(funnel(w.x, w.y, s), funnel(w.y, w.z, s), funnel(w.z, w.w, s), w.w >> s);
     }
     static uint low(words w) { return w.x; }
     template <uint BITS>
@@ -767,9 +780,10 @@ struct Run<4> {
 // `FS` (and a minimum factor) per FACTOR_GROUP values: scale = factor
 // 2^(EXPONENT + CODE_EXPONENT) L(scale code) and bias = BIAS_SIGN minimum
 // factor 2^EXPONENT L(minimum code). A packet's codes are one `field` of
-// `field_bits`, in the scales plane, where each factor group's fields fill
-// whole words, or, where CARRIED_BIT is not 0, bit j of a group's code at
-// bit CARRIED_BIT of its entry j.
+// `field_bits`, in the scales plane, where factor groups' fields follow one
+// another (a factor group's need not fill whole words), or, where
+// CARRIED_BIT is not 0, bit j of a group's code at bit CARRIED_BIT of its
+// entry j.
 template <typename FS, uint FACTOR_GROUP, int EXPONENT, int CODE_EXPONENT, uint LOCAL_BITS, typename L,
     uint GROUP, bool MIN, int BIAS_SIGN, uint CARRIED_BIT>
 struct Hier {
@@ -783,11 +797,19 @@ struct Hier {
     static constant constexpr uint width = LOCAL_BITS * (MIN ? 2u : 1u);
     static constant constexpr uint field_bits = width * groups;
     static_assert(field_bits < 32u, "a packet's field is below a word: a run shifts by it");
-    // Packets a factor group, and the whole words of its fields in the
-    // scales plane (none when its entries carry them).
+    // Packets a factor group, the bits of its fields in the scales plane
+    // (`span`), and the words a factor group's fields are read in (none when
+    // its entries carry them). Where the span fills whole words a row's
+    // share of the plane is whole words, and so are a factor group's
+    // fields; otherwise they start at a multiple of the span's lowest set
+    // bit (at most 8) within a byte of a share that need not start a word,
+    // so they are read as the `bytes` they reach, 8 less that bit past the
+    // span.
     static constant constexpr uint packets = FACTOR_GROUP / 32u;
-    static constant constexpr uint words = carries ? 0u : packets * field_bits / 32u;
-    static_assert(carries || packets * field_bits % 32u == 0, "a factor group's fields fill whole words");
+    static constant constexpr uint span = packets * field_bits;
+    static constant constexpr uint lead = (span & (0u - span)) < 8u ? (span & (0u - span)) : 8u;
+    static constant constexpr uint bytes = span % 32u == 0u ? span / 8u : (span + 8u - lead + 7u) / 8u;
+    static constant constexpr uint words = carries ? 0u : (bytes + 3u) / 4u;
     // A factor group's factors, as the coefficients of one group: the scale
     // factor 2^(EXPONENT + CODE_EXPONENT) (`scale(0)`) and, MIN, the BIAS_SIGN
     // minimum factor 2^EXPONENT (`bias(0)`).
@@ -837,8 +859,8 @@ struct Hier {
         return field;
     }
     // A packet's field: carried by its entries `w` (`P`) or in the scales
-    // plane, where factor groups' fields fill whole words one after
-    // another, so packet p's is at bit `field_bits` p of the row's share.
+    // plane, where factor groups' fields follow one another, so packet p's
+    // is at bit `field_bits` p of the row's share.
     template <typename P>
     static uint field(device const uchar *row, Rows16 layout, uint p, thread const typename P::words &w) {
         if constexpr (carries)
@@ -854,10 +876,22 @@ struct Hier {
     // A run over a factor group's packets from packet p on: its fields from
     // packet p's lowest (no words when its entries carry them), and its factors. `next` takes
     // the next packet's field. `group_fields` are factor group f's fields
-    // whole, packet b's `field_of` them.
+    // whole (shifted to bit 0 where they do not start a word), packet b's
+    // `field_of` them.
     typedef Run<words> fields;
     static typename fields::words group_fields(device const uchar *row, Rows16 layout, uint f) {
-        return fields::load(layout.scale_at(row, ulong(f) * (4u * words)));
+        if constexpr (span % 32u == 0u) {
+            return fields::load(layout.scale_at(row, ulong(f) * (4u * words)));
+        } else {
+            const uint bit = f * span;
+            device const uchar *at = layout.scale_at(row, ulong(bit >> 3));
+            uint w[words];
+            for (uint i = 0; i < words; ++i)
+                w[i] = 0u;
+            for (uint i = 0; i < bytes; ++i)
+                w[i / 4u] |= uint(at[i]) << (8u * (i % 4u));
+            return fields::shift_by(fields::of(w), bit & 7u);
+        }
     }
     static uint field_of(typename fields::words w, uint b) { return fields::template field<field_bits>(w, b); }
     struct run {

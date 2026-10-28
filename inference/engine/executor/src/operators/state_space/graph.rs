@@ -295,7 +295,7 @@ mod tests {
         let mut offset = 0;
         let mut tensor = |name: String, shape: Vec<u64>| {
             let mut stored = |name: String, shape: Vec<u64>, encoding: Encoding| {
-                let nbytes = source_element(encoding, *shape.last().unwrap())
+                let nbytes = source_element(encoding)
                     .unwrap()
                     .canonical_byte_len(&shape)
                     .unwrap();

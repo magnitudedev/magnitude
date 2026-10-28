@@ -66,7 +66,7 @@
 # result depends on it but a packed form's, whose error it lowers; B is
 # static on every backend. On Metal a bound offers the packed form's wider
 # residue (`RESIDUE` 2: one more bit of top sum, half the top token's step),
-# which applies only to weights whose values are 8 bits (Q8_0 and iq4g32): a
+# which applies only to weights whose values are 8 bits (Q8_0 and the IQ4 codebook's): a
 # tuning unit of other weights fixes `RESIDUE` at 1.
 fn dense_expand[M, O, H, F, GS, US, GB, UB](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
     gate_weight: &tensor[F, H] GW, up_weight: &tensor[F, H] UW,
@@ -239,9 +239,9 @@ fn dense_output[M, O, H, F, DS, DB](residual: &tensor[M, H] f32,
     return result
 
 # PACK selects the token-packing GEMM past 64 rows (`gemm_packed`, Q4_K,
-# Q5_K, Q6_K, q4g32s, Q8_0 or iq4g32 weights on a device without tensor operations, and in
+# Q5_K, Q6_K, q4g32s, Q8_0 or IQ4 codebook weights on a device without tensor operations, and in
 # `dense_expand` a gate and an up weight one operand serves: Q4_K, Q5_K and
-# q4g32s together, both Q6_K, or Q8_0 and iq4g32 together; other weights and devices run the staged tile, with
+# q4g32s together, both Q6_K, or Q8_0 and IQ4 codebook weights together; other weights and devices run the staged tile, with
 # its results, in the `unpacked` launch, and each launch of the other path
 # returns at once): the activations become integer codes per (row, 32 columns)
 # and two rows share one F32 matrix operand against the weights' stored codes,
@@ -256,7 +256,7 @@ fn dense_output[M, O, H, F, DS, DB](residual: &tensor[M, H] f32,
 # launched, so the form's configurations do not multiply another's. Its
 # scratch is transient, per call: the packed operand (`packed`, 2 bytes per
 # padded row and column, plus one step read ahead), the rows' scales and code
-# sums, or for Q8_0 and iq4g32 the rows' scales and the RESIDUE low bit
+# sums, or for Q8_0 and IQ4 codebook weights the rows' scales and the RESIDUE low bit
 # planes of their codes (`token_factors`, 4 bytes per padded row and 32
 # columns, 8 with two planes; RESIDUE 2 takes a packing bound) and the
 # weights' block scales and biases (`weight_factors`, 4 bytes per weight row

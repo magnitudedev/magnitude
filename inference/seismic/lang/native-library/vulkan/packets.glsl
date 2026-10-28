@@ -522,8 +522,7 @@ vec2 packets_scale_pair_at(const int scale, uint64_t at) {
 // hierarchical ones per 16 or 32 values whose local codes are unsigned, two's
 // complement, offset or odd, either carried (without a minimum) by at most a
 // group's grid entries or in the scales plane, a packet's field below a word
-// and within the reader's four bytes, and a factor group's fields filling
-// whole words.
+// and within the reader's four bytes.
 #define PACKETS_READS_COEFFICIENTS(AXES) (AXES(SEISMIC_AXIS_FORM) != SEISMIC_FORM_ROWS \
     || (AXES(SEISMIC_AXIS_COEFF) == SEISMIC_COEFF_DIRECT \
         && (AXES(SEISMIC_AXIS_COEFF_GROUP) == 16 || AXES(SEISMIC_AXIS_COEFF_GROUP) % 32 == 0) \
@@ -535,8 +534,7 @@ vec2 packets_scale_pair_at(const int scale, uint64_t at) {
             || AXES(SEISMIC_AXIS_COEFF_LOCAL) == SEISMIC_CODES_OFFSET \
             || AXES(SEISMIC_AXIS_COEFF_LOCAL) == SEISMIC_CODES_ODD) \
         && ((AXES(SEISMIC_AXIS_COEFF_CARRIED) == 0 \
-                && PACKETS_FIELD_BITS(AXES) < 32 && PACKETS_FIELD_SPANS(PACKETS_FIELD_BITS(AXES)) \
-                && AXES(SEISMIC_AXIS_COEFF_FACTOR_GROUP) * PACKETS_FIELD_BITS(AXES) % 1024 == 0) \
+                && PACKETS_FIELD_BITS(AXES) < 32 && PACKETS_FIELD_SPANS(PACKETS_FIELD_BITS(AXES))) \
             || (AXES(SEISMIC_AXIS_COEFF_CARRIED) != 0 && AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID \
                 && AXES(SEISMIC_AXIS_COEFF_BIAS) == 0 \
                 && 8 * AXES(SEISMIC_AXIS_COEFF_LOCAL_BITS) <= AXES(SEISMIC_AXIS_COEFF_GROUP)))))
@@ -628,7 +626,7 @@ void packets_coefficients(const int kind, uint64_t row, packets_rows16 geometry,
         } else
 #endif
         {
-            // A factor group's fields fill whole words, so the packet's field
+            // Factor groups' fields follow one another, so the packet's field
             // is at bit `width groups` p of the plane, addressed by `p`
             // itself (see above): a 16-bit field is one aligned load, any
             // other the bytes its widest span reaches. A field starts at a

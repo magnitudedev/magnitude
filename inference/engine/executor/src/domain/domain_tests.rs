@@ -2003,7 +2003,7 @@ fn failed_table_read(name: &str) -> (std::path::PathBuf, crate::programs::Stored
     let table = Arc::new(
         StoredTable::new(
             &device,
-            seismic::Element::named("gguf_iq4_nl_block").unwrap(),
+            seismic::Element::named("gguf_iq4_nl").unwrap(),
             seismic::Element::named("iq4g32s@rows16").unwrap(),
             ROWS,
             160,

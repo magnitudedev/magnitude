@@ -137,10 +137,10 @@ enum Repr {
     Q5k,
     Q6k,
     Q8,
-    Iq4,
     Bf16,
     // Built from GGUF blocks through the registry's conversion
     // (`gguf_weight`).
+    Iq4xs,
     Q4g32s,
     Q4g32,
     Iq4g32s,
@@ -175,11 +175,6 @@ const GGUF_REPRS: [Repr; 8] = [
     Repr::Nvfp4A4,
 ];
 
-/// The iq4g32 code table (the registry's `iq4g32` interpretation).
-const IQ4_TABLE: [i8; 16] = [
-    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
-];
-
 impl Repr {
     fn name(self) -> &'static str {
         match self {
@@ -187,7 +182,7 @@ impl Repr {
             Repr::Q5k => "q5k",
             Repr::Q6k => "q6k",
             Repr::Q8 => "q8g32s",
-            Repr::Iq4 => "iq4g32",
+            Repr::Iq4xs => "iq4xs",
             Repr::Bf16 => "bf16",
             Repr::Q4g32s => "q4g32s",
             Repr::Q4g32 => "q4g32",
@@ -208,9 +203,10 @@ impl Repr {
     /// block bytes and values.
     fn gguf_source(self) -> Option<(&'static str, usize, usize)> {
         match self {
+            Repr::Iq4xs => Some(("gguf_iq4_xs", 136, 256)),
             Repr::Q4g32s => Some(("gguf_q4_0", 18, 32)),
             Repr::Q4g32 => Some(("gguf_q4_1", 20, 32)),
-            Repr::Iq4g32s => Some(("gguf_iq4_nl_block", 18, 32)),
+            Repr::Iq4g32s => Some(("gguf_iq4_nl", 18, 32)),
             Repr::Q5g32s => Some(("gguf_q5_0", 22, 32)),
             Repr::Q5g32 => Some(("gguf_q5_1", 24, 32)),
             Repr::Mxfp4 => Some(("gguf_mxfp4", 17, 32)),
@@ -298,12 +294,9 @@ fn planes(repr: Repr, k: usize) -> Planes {
             planes.codes = place(k);
             planes.supers = place(2 * (k / 32));
         }
-        Repr::Iq4 => {
-            planes.codes = place(k / 2);
-            planes.supers = place(4 * (k / 32));
-        }
         Repr::Bf16 => at = 2 * k,
-        Repr::Q4g32s
+        Repr::Iq4xs
+        | Repr::Q4g32s
         | Repr::Q4g32
         | Repr::Iq4g32s
         | Repr::Q5g32s
@@ -513,19 +506,6 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
                     }
                 }
             }
-            Repr::Iq4 => {
-                for group in 0..k / 32 {
-                    let factor = scale / 64.0 * (0.5 + rng.uniform());
-                    row[p.supers + 4 * group..p.supers + 4 * group + 4]
-                        .copy_from_slice(&factor.to_le_bytes());
-                    for i in 0..32 {
-                        let column = 32 * group + i;
-                        let code = rng.below(16);
-                        put_bits(&mut row[p.codes..], 4 * column, 4, code);
-                        out[column] = factor * f32::from(IQ4_TABLE[code as usize]);
-                    }
-                }
-            }
             Repr::Bf16 => {
                 for column in 0..k {
                     let value = bf16_round(rng.symmetric() * scale);
@@ -534,7 +514,8 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
                     out[column] = value;
                 }
             }
-            Repr::Q4g32s
+            Repr::Iq4xs
+            | Repr::Q4g32s
             | Repr::Q4g32
             | Repr::Iq4g32s
             | Repr::Q5g32s
@@ -594,7 +575,9 @@ fn gguf_bytes(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -> V
         let factor = scale * (0.5 + rng.uniform());
         match repr {
             Repr::Q4g32s => block[..2].copy_from_slice(&f16_bits(factor / 8.0).to_le_bytes()),
-            // d: the table's values reach 127 d.
+            // d: the table's values reach 127 d (32 d (ls - 32) under IQ4_XS's
+            // six-bit local scales).
+            Repr::Iq4xs => block[..2].copy_from_slice(&f16_bits(factor / 4096.0).to_le_bytes()),
             Repr::Iq4g32s => block[..2].copy_from_slice(&f16_bits(factor / 128.0).to_le_bytes()),
             Repr::Q5g32s => block[..2].copy_from_slice(&f16_bits(factor / 16.0).to_le_bytes()),
             Repr::Q4g32 => {
@@ -1634,7 +1617,7 @@ fn attention_project_statics(
 
 #[test]
 fn rows16_builder_matches_the_registry_layout_and_decode() {
-    for repr in [Repr::Q4k, Repr::Q5k, Repr::Q6k, Repr::Q8, Repr::Iq4] {
+    for repr in [Repr::Q4k, Repr::Q5k, Repr::Q6k, Repr::Q8] {
         let k = 512;
         let w = weight(repr, 3, k, 1, 1.0);
         let info = registry::representation_info(repr.storage());
@@ -1777,11 +1760,11 @@ fn dense_expand_matches_its_portable_body() {
     }
 }
 
-/// IQ4_XS / IQ4_NL weights are resident as iq4g32 (the table decode).
+/// IQ4_XS weights are resident as iq4xs (the table decode).
 #[test]
 fn dense_expand_iq4_matches_its_portable_body() {
     for device in devices() {
-        dense_expand_matches_its_portable_body_on(&device, &[(Repr::Iq4, Repr::Iq4)]);
+        dense_expand_matches_its_portable_body_on(&device, &[(Repr::Iq4xs, Repr::Iq4xs)]);
     }
 }
 
@@ -1857,7 +1840,7 @@ fn dense_expand_matches_the_host_reference_across_row_classes_on(device: &Device
         (Act::Bf16, Repr::Q4k, Repr::Q4k),
         (Act::Bf16, Repr::Q5k, Repr::Q6k),
         (Act::Bf16, Repr::Q8, Repr::Bf16),
-        (Act::Bf16, Repr::Iq4, Repr::Q4k),
+        (Act::Bf16, Repr::Iq4xs, Repr::Q4k),
         (Act::F16, Repr::Q4k, Repr::Q4k),
     ] {
         let gate = weight(gate_repr, f, h, 21, 1.0);
@@ -2103,7 +2086,7 @@ fn metal_tall_gemm_is_bit_identical_to_the_staged_tiles() {
         Repr::Q5k,
         Repr::Q6k,
         Repr::Q8,
-        Repr::Iq4,
+        Repr::Iq4xs,
         Repr::Bf16,
     ] {
         let (h, f) = (256, 200);
@@ -2608,7 +2591,7 @@ fn project_rows_native(
 
 /// Metal's tall and PACK forms of the plain projection: the tall tile gives
 /// the staged tile's bits; the PACK form differs from them by the packed
-/// form's error over Q4_K, Q5_K, Q6_K, q4g32s, Q8_0 or iq4g32 weights.
+/// form's error over Q4_K, Q5_K, Q6_K, q4g32s, Q8_0 or IQ4 codebook weights.
 #[test]
 fn metal_tall_and_packed_project_rows_agree_with_the_staged_form() {
     let Some(device) = devices()
@@ -2625,7 +2608,7 @@ fn metal_tall_and_packed_project_rows_agree_with_the_staged_form() {
         Repr::Q6k,
         Repr::Q4g32s,
         Repr::Q8,
-        Repr::Iq4,
+        Repr::Iq4xs,
         Repr::Iq4g32s,
     ] {
         let (outputs, k) = (192, 1024);
@@ -2721,7 +2704,7 @@ fn dense_output_packed(
 
 /// Metal's PACK form of the down projection: integer activation codes per
 /// (row, 32 columns), two rows packed per operand element against the exact
-/// Q4_K, Q5_K, Q6_K, q4g32s, Q8_0 or iq4g32 codes. Its results differ from the staged
+/// Q4_K, Q5_K, Q6_K, q4g32s, Q8_0 or IQ4 codebook codes. Its results differ from the staged
 /// form's by the activation rounding, the packed accumulator's rounding and
 /// the F16 fold.
 #[test]
@@ -2740,7 +2723,7 @@ fn metal_packed_dense_output_agrees_with_the_staged_form() {
         Repr::Q6k,
         Repr::Q4g32s,
         Repr::Q8,
-        Repr::Iq4,
+        Repr::Iq4xs,
         Repr::Iq4g32s,
     ] {
         let (outputs, k) = (192, 1024);
@@ -2816,7 +2799,7 @@ fn metal_packed_dense_output_agrees_with_the_staged_form() {
 /// Metal's PACK form of the paired gate/up projection, as for the down
 /// projection: the GLU outputs differ from the staged form's by the packed
 /// form's error with gate and up weights one packed operand serves (Q4_K,
-/// Q5_K and q4g32s together, both Q6_K, or Q8_0 and iq4g32 together), and are
+/// Q5_K and q4g32s together, both Q6_K, or Q8_0 and IQ4 codebook weights together), and are
 /// the staged tile's bit for bit otherwise.
 #[test]
 fn metal_packed_dense_expand_agrees_with_the_staged_form() {
@@ -2835,8 +2818,8 @@ fn metal_packed_dense_expand_agrees_with_the_staged_form() {
         (Repr::Q4g32s, Repr::Q4g32s, true),
         (Repr::Q4g32s, Repr::Q4k, true),
         (Repr::Q8, Repr::Q8, true),
-        (Repr::Iq4, Repr::Iq4, true),
-        (Repr::Iq4, Repr::Q8, true),
+        (Repr::Iq4xs, Repr::Iq4xs, true),
+        (Repr::Iq4xs, Repr::Q8, true),
         (Repr::Iq4g32s, Repr::Iq4g32s, true),
         (Repr::Q4k, Repr::Q6k, false),
         (Repr::Q8, Repr::Q4k, false),
@@ -2987,7 +2970,7 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
         .map(|i| weight(project_reprs[i], project_rows[i], d, 181 + i as u64, 1.0))
         .collect::<Vec<_>>();
     let (outputs, heads, width) = (128, 8, 64);
-    let out_weights = [Repr::Q5k, Repr::Q4k, Repr::Q6k, Repr::Q8, Repr::Iq4]
+    let out_weights = [Repr::Q5k, Repr::Q4k, Repr::Q6k, Repr::Q8, Repr::Iq4xs]
         .map(|repr| weight(repr, outputs, heads * width, 185, 1.0));
     let (nk, nv, head_width) = (1, 2, 32);
     let recurrent_reprs = [Repr::Q5k, Repr::Q4k, Repr::Q8, Repr::Bf16];
@@ -3343,7 +3326,7 @@ fn packing_bound_matches_its_portable_body() {
             Repr::Q5k,
             Repr::Q6k,
             Repr::Q8,
-            Repr::Iq4,
+            Repr::Iq4xs,
             Repr::Q4g32s,
             Repr::Iq4g32s,
             Repr::Q5g32s,
@@ -3400,7 +3383,7 @@ fn dense_output_matches_its_portable_body_and_the_host_reference() {
 #[test]
 fn dense_output_iq4_matches_its_portable_body_and_the_host_reference() {
     for device in devices() {
-        dense_output_matches_its_portable_body_and_the_host_reference_on(&device, &[Repr::Iq4]);
+        dense_output_matches_its_portable_body_and_the_host_reference_on(&device, &[Repr::Iq4xs]);
     }
 }
 
@@ -3948,7 +3931,7 @@ fn dense_entries_at_4b_geometry_match_the_host_reference_and_single_rows_on(devi
 
 /// Which cases a segmented projection check runs: the small and 4B
 /// geometries over every mapping, the scoped launches, or the IQ4_NL
-/// single-block weights.
+/// weights at a K that is not a multiple of 256.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cases {
     Checked,
@@ -3963,7 +3946,7 @@ fn recurrent_project_matches_its_portable_body_and_the_host_reference() {
     }
 }
 
-/// QKV and alpha weights in the IQ4_NL single-block form (iq4g32s) beside
+/// QKV and alpha weights in the IQ4_NL form (iq4g32s) beside
 /// weights of other kinds in one segmented launch.
 #[test]
 fn recurrent_project_over_iq4_blocks_matches_its_portable_body_and_the_host_reference() {
@@ -4278,7 +4261,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference() {
     }
 }
 
-/// Query and value weights in the IQ4_NL single-block form (iq4g32s, rows
+/// Query and value weights in the IQ4_NL form (iq4g32s, rows
 /// whose width is not a multiple of 256) beside a key weight of another
 /// kind in one segmented launch, and an iq4g32s output projection.
 #[test]
@@ -5528,7 +5511,7 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
         Repr::Q4k,
         Repr::Q5k,
         Repr::Q8,
-        Repr::Iq4,
+        Repr::Iq4xs,
         Repr::Q2k,
         Repr::Q3k,
         Repr::Bf16,

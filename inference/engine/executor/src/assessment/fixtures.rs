@@ -54,7 +54,6 @@ pub(crate) fn costs() -> super::ExecutorCosts {
                         crate::resident_element(
                             *encoding,
                             activations,
-                            4096,
                             seismic::DType::BF16,
                             layout,
                         )
@@ -277,7 +276,7 @@ pub(crate) fn declared_model(
         } else {
             Encoding::F32
         };
-        let nbytes = source_element(encoding, *shape.last().unwrap())
+        let nbytes = source_element(encoding)
             .unwrap()
             .canonical_byte_len(&shape)
             .unwrap();

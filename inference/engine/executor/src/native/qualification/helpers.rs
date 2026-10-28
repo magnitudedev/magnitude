@@ -693,7 +693,7 @@ fn pattern_source(representation: &str) -> Option<(Element, Vec<u8>)> {
         // d = 1: d / 8 * 1 * 8.
         "iq2xxs" => ("gguf_iq2_xxs", unit_packet(66, &[(0, &[0x00, 0x3c])])),
         // Table code 8 (value 1) at sub-scale 33 - 32 = 1 and d = 1.
-        "iq4g32" => (
+        "iq4xs" => (
             "gguf_iq4_xs",
             unit_packet(
                 136,
@@ -875,7 +875,7 @@ mod tests {
     fn repeated_pattern_block_matches_the_whole_conversion() {
         let mut compared = Vec::new();
         for representation in [
-            "q8g32s", "q5g32s", "q4k", "q5k", "q6k", "iq4g32", "q4g32s", "q4g32", "q5g32",
+            "q8g32s", "q5g32s", "q4k", "q5k", "q6k", "iq4xs", "q4g32s", "q4g32", "q5g32",
             "mxfp4g32", "nvfp4g16", "iq2xs", "iq3xxs", "iq2xxs",
         ] {
             let (source, packet) = pattern_source(representation).unwrap();
@@ -896,7 +896,7 @@ mod tests {
             }
         }
         // Every production row layout of every fixture format was compared.
-        for representation in ["q8g32s", "q4k", "q5k", "q6k", "iq4g32"] {
+        for representation in ["q8g32s", "q4k", "q5k", "q6k", "iq4xs"] {
             assert!(
                 compared.contains(&(representation, Layout::Rows16)),
                 "{representation} rows16 was not compared: {compared:?}"
@@ -909,7 +909,7 @@ mod tests {
     #[test]
     fn every_packed_representation_has_a_unit_fixture() {
         let representations = [
-            "q8g32s", "q4k", "q5k", "q6k", "iq4g32", "q4g32s", "q4g32", "q5g32s", "q5g32",
+            "q8g32s", "q4k", "q5k", "q6k", "iq4xs", "q4g32s", "q4g32", "q5g32s", "q5g32",
             "mxfp4g32", "nvfp4g16", "nvfp4g16a4", "iq2xs", "iq3xxs", "iq2xxs",
         ];
         for representation in representations {

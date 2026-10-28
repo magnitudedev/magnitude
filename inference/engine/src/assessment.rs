@@ -1038,14 +1038,12 @@ fn unsupported_weights<'a>(
 ) -> Option<UnsupportedModel> {
     let mut counts = BTreeMap::<&'static str, u32>::new();
     for (tensor, residency) in tensors {
-        let width = tensor.shape.last().copied().unwrap_or(1);
-        let imported = source_element(tensor.encoding, width).is_some()
+        let imported = source_element(tensor.encoding).is_some()
             && match residency {
                 // Every encoding with a resident element has a W4A16 one.
                 Residency::Packed => resident_element(
                     tensor.encoding,
                     ScaledActivations::Rounded,
-                    width,
                     DType::F32,
                     layout,
                 )

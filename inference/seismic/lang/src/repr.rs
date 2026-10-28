@@ -1145,18 +1145,25 @@ pub(crate) const REPRS: &[Repr] = &[
         code: CodeInterpretation::TwosComplement,
         float_code: None,
     },
+    // GGUF IQ4_XS: the IQ4 codebook, a 6-bit local scale code offset by 32
+    // per 32 values under one f16 factor `d` per 256: ggml's
+    // `d (ls - 32) kvalues_iq4nl[q]` exactly.
     Repr {
-        name: "iq4g32",
+        name: "iq4xs",
         packing_axis: PackingAxisRule::Last,
         group: 32,
         bits: 4,
-        coefficients: Coefficients::Direct {
-            dtype: DType::F32,
-            bias: false,
-            packet_group: 256,
-        },
         code: CodeInterpretation::Table(&tables::IQ4NL),
         float_code: None,
+        coefficients: Coefficients::Hierarchical {
+            factor_group: 256,
+            factor_dtype: DType::F16,
+            factor_exponent: 0,
+            bits: 6,
+            interpretation: CodeInterpretation::Offset(32),
+            minimum: None,
+            carried: false,
+        },
     },
     Repr {
         name: "q8g32",
@@ -1185,8 +1192,6 @@ pub(crate) const REPRS: &[Repr] = &[
         code: CodeInterpretation::Unsigned,
         float_code: Some(FloatCodeFormat::E2M1),
     },
-    // The 4-bit coded families (plan: c4g{16,32}) are a codebook, a group
-    // and a scale kind; `iq4g32` above is the IQ4 codebook with f32 scales.
     // GGUF Q4_0: codes offset by 8, one f16 scale per 32.
     Repr {
         name: "q4g32s",
@@ -1201,9 +1206,7 @@ pub(crate) const REPRS: &[Repr] = &[
         code: CodeInterpretation::Offset(8),
         float_code: None,
     },
-    // A GGUF IQ4_NL block: the IQ4 codebook, one f16 scale per 32, packets
-    // of 32 values (`iq4g32` above keeps eight blocks per packet with their
-    // scales widened).
+    // GGUF IQ4_NL: the IQ4 codebook, one f16 scale per 32.
     Repr {
         name: "iq4g32s",
         packing_axis: PackingAxisRule::Last,

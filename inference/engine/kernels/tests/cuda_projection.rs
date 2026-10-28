@@ -156,7 +156,7 @@ fn cuda_dense_expand_matches_host_model() {
     dense_expand_cases(&[Format::Q4K, Format::Q5K, Format::Q6K, Format::Q8], 7);
 }
 
-/// IQ4_XS / IQ4_NL weights are resident as iq4g32.
+/// IQ4_XS weights are resident as iq4xs.
 #[test]
 fn cuda_dense_expand_iq4_matches_host_model() {
     dense_expand_cases(&[Format::Iq4], 9);

@@ -174,7 +174,7 @@ impl Format {
             Self::Q5K => "q5k",
             Self::Q6K => "q6k",
             Self::Q8 => "q8g32s",
-            Self::Iq4 => "iq4g32",
+            Self::Iq4 => "iq4xs",
         }
     }
     fn block_values(self) -> usize {

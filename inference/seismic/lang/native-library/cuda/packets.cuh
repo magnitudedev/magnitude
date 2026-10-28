@@ -248,10 +248,11 @@ __device__ __forceinline__ float f16_at(const u8 *address) {
 // (operands, s8 values and the code term of `apply`) and coefficients K
 // (scales and biases, with their staging). SCALED selects the scaled GEMM.
 
-// Code planes `Planes<LOW, HIGH, WHOLE>` (`registry::code_planes`): a lane
-// chunk's codes as a LOW-bit and a HIGH-bit plane; WHOLE when rows hold whole
-// 256-code superblocks, so a superblock's four k-blocks always exist and its
-// high plane is fetched warp-coalesced. `W` is the decoder value (its base,
+// Code planes `Planes<LOW, HIGH, SUPERBLOCKS>` (`registry::code_planes`): a
+// lane chunk's codes as a LOW-bit and a HIGH-bit plane; SUPERBLOCKS when rows
+// hold whole 256-code superblocks (the coefficients' storage group is one),
+// so a superblock's four k-blocks always exist and its high plane is fetched
+// warp-coalesced. `W` is the decoder value (its base,
 // stride and planes).
 // LOW-bit codes of a 2- or 4-bit low plane, with a 1-bit high plane (bit LOW
 // of a code) or none. A lane chunk of a k-block is 4 LOW bytes of the low
@@ -276,7 +277,7 @@ template <> struct LowPlane<2> {
         return (x | (x << 2)) & 0x33333333u;
     }
 };
-template <int LOW, int HIGH, bool WHOLE> struct Planes {
+template <int LOW, int HIGH, bool SUPERBLOCKS> struct Planes {
     static_assert(LOW == 2 || LOW == 4, "a sub-byte low plane of 2 or 4 bits");
     static_assert(HIGH <= 1, "a 2-bit high plane needs rows of whole superblocks (Planes<4, 2, true>)");
     static constexpr int BITS = LOW + HIGH;
@@ -297,14 +298,14 @@ template <int LOW, int HIGH, bool WHOLE> struct Planes {
             raw.high = 0;
         return raw;
     }
-    // The lane chunks of one superblock (4 k-blocks). With WHOLE the warp's
-    // high bits of the superblock are 512 contiguous bytes, fetched as one
+    // The lane chunks of one superblock (4 k-blocks). With SUPERBLOCKS the
+    // warp's high bits of the superblock are 512 contiguous bytes, fetched as one
     // 16 B load per lane and redistributed by `raw` (warp-collective);
     // otherwise a row's last superblock may be partial and its missing
     // k-blocks are not fetched.
     struct Super {
         Raw raw[4];
-        typename Select<WHOLE && HIGH == 1, uint4, None>::type high;
+        typename Select<SUPERBLOCKS && HIGH == 1, uint4, None>::type high;
     };
     template <class W>
     __device__ static __forceinline__ Super fetch_superblock(const W &w, u64 tile, u64 superblock, u64 kblocks,
@@ -312,8 +313,8 @@ template <int LOW, int HIGH, bool WHOLE> struct Planes {
         Super super;
 #pragma unroll
         for (int q = 0; q < 4; ++q)
-            if (WHOLE || 4 * superblock + q < kblocks) {
-                if constexpr (WHOLE) {
+            if (SUPERBLOCKS || 4 * superblock + q < kblocks) {
+                if constexpr (SUPERBLOCKS) {
                     super.raw[q].low = L::load(
                         w.low.chunk(w.base, w.stride, tile, (4 * superblock + q) * KBLOCK_BYTES + lane * LANE_BYTES));
                     super.raw[q].high = 0;
@@ -321,13 +322,13 @@ template <int LOW, int HIGH, bool WHOLE> struct Planes {
                     super.raw[q] = fetch(w, tile, 4 * superblock + q, lane);
                 }
             }
-        if constexpr (WHOLE && HIGH == 1)
+        if constexpr (SUPERBLOCKS && HIGH == 1)
             super.high = seismic_ld_nc_na_v4(w.high.chunk(w.base, w.stride, tile, superblock * 512 + lane * 16));
         return super;
     }
     __device__ static __forceinline__ Raw raw(const Super &super, int q, u32 lane) {
         Raw raw = super.raw[q];
-        if constexpr (WHOLE && HIGH == 1) {
+        if constexpr (SUPERBLOCKS && HIGH == 1) {
             // Word 32q + lane of the superblock sits in lane 8q + lane/4, component lane % 4.
             const u32 source = 8 * (u32)q + lane / 4;
             const u32 x = seismic_shfl_idx_u32(super.high.x, source);
@@ -804,13 +805,13 @@ template <class C, bool BIAS> __device__ __forceinline__ float coded_value(u32 c
 
 // Direct coefficients: a scale S (with BIAS a bias after it) per GROUP
 // codes, rows holding whole storage groups of STORAGE codes; GROUPS a
-// 64-code k-block. WHOLE when rows hold whole 256-code superblocks.
-template <class S, int GROUP_, bool BIAS_, int STORAGE, int CODE_EXPONENT> struct Direct {
+// 64-code k-block.
+template <class S, int GROUP_, bool BIAS_, int STORAGE_, int CODE_EXPONENT> struct Direct {
     static constexpr int GROUP = GROUP_;
     static_assert(64 % GROUP == 0, "a k-block holds whole groups");
     static constexpr int GROUPS = 64 / GROUP;
     static constexpr bool BIAS = BIAS_;
-    static constexpr bool WHOLE = STORAGE % 256 == 0;
+    static constexpr int STORAGE = STORAGE_;
     // Bytes of a group's coefficients, and of a superblock's (256 codes),
     // loaded 8 B or 16 B at a time (`load`, and `staged_block`) and staged
     // 4 B a word (`super_word`).
@@ -851,8 +852,7 @@ template <class S, int GROUP_, bool BIAS_, int STORAGE, int CODE_EXPONENT> struc
     }
     // The coefficient words of one superblock of rows g, g+8, 16 B a load
     // (8 B for 8), past the first 16 B where the row's supers plane holds
-    // them (unless WHOLE, a row's last superblock may end inside its final
-    // 16 B).
+    // them (a row's last superblock may end inside its final 16 B).
     struct Block {
         u32 words[2][BLOCK_WORDS];
     };
@@ -868,7 +868,7 @@ template <class S, int GROUP_, bool BIAS_, int STORAGE, int CODE_EXPONENT> struc
 #pragma unroll
             for (int c = 0; c < BLOCK_BYTES / 16; ++c)
                 put(words, c,
-                    c == 0 || WHOLE || superblock * BLOCK_BYTES + 16 * c < supers_bytes
+                    c == 0 || superblock * BLOCK_BYTES + 16 * c < supers_bytes
                         ? seismic_ld_nc_v4(fields + 16 * c)
                         : make_uint4(0, 0, 0, 0));
         }
@@ -964,7 +964,8 @@ struct HierFactors {
     static constexpr int GROUP = GROUP_;
     static constexpr int GROUPS = 64 / GROUP;
     static constexpr bool BIAS = MIN;
-    static constexpr bool WHOLE = true;
+    // The storage group: a row holds whole superblocks.
+    static constexpr int STORAGE = 256;
     static constexpr bool GEMV_STAGED = false;
     // Bits of a group's codes.
     static constexpr u32 WIDTH = LOCAL_BITS * (MIN ? 2 : 1);
@@ -1013,7 +1014,10 @@ struct IsCarried<CarriedHier<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, 
 };
 
 // Hierarchical coefficients whose codes are in the scales plane: a
-// superblock's are WORDS whole words.
+// superblock's are SPAN bits after the previous superblock's, read as the
+// WORDS words from the word they start in. They start at a multiple of
+// SPAN's lowest set bit (at most 32) within that word, so they reach 32 less
+// that bit past SPAN; where SPAN fills whole words they are its words.
 template <class FS, int EXPONENT, int CODE_EXPONENT, u32 LOCAL_BITS, class L, int GROUP_, bool MIN, int BIAS_SIGN>
 struct Hier : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP_, MIN, BIAS_SIGN> {
     typedef HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP_, MIN, BIAS_SIGN> F;
@@ -1023,11 +1027,18 @@ struct Hier : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP_, MI
     using F::WIDTH;
     using F::factor_word;
     using F::factors;
-    static constexpr int WORDS = (int)(256 / GROUP * WIDTH / 32);
-    static_assert(256 / GROUP * WIDTH % 32 == 0, "a factor group's fields fill whole words");
+    static constexpr u32 SPAN = 256 / GROUP * WIDTH;
+    static constexpr u32 LEAD = (SPAN & (0u - SPAN)) < 32 ? (SPAN & (0u - SPAN)) : 32;
+    static constexpr int WORDS = (int)((SPAN + 32 - LEAD + 31) / 32);
+    // Byte offset of the word superblock sb's fields start in, and their
+    // first bit in it.
+    __host__ __device__ static constexpr u64 fields_offset(u64 sb) {
+        return SPAN % 32 == 0 ? sb * (4 * WORDS) : sb * SPAN / 32 * 4;
+    }
+    __host__ __device__ static constexpr u32 fields_shift(u64 sb) { return (u32)(sb * SPAN % 32); }
     // Group g (of a row's) of the scales plane at `scales` and the supers
-    // plane at `supers`. Superblocks' fields are whole words one after
-    // another, so group g's are at bit `WIDTH` g, addressed from g alone.
+    // plane at `supers`. Superblocks' fields follow one another, so group
+    // g's are at bit `WIDTH` g, addressed from g alone.
     __device__ static __forceinline__ void at(const u8 *scales, const u8 *supers, u64 g, float &scale, float &bias) {
         const u64 bit = g * WIDTH;
         const u32 shift = (u32)(bit % 8);
@@ -1072,14 +1083,22 @@ struct Hier : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP_, MI
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
             const u8 *line = w.base + (tile * 16 + lane / 4 + 8 * r) * w.stride;
-            const u8 *fields = line + w.scales + superblock * (4 * WORDS);
-            if constexpr (WORDS == 4) {
+            const u8 *fields = line + w.scales + fields_offset(superblock);
+            if constexpr (WORDS == 4 && SPAN % 32 == 0) {
                 const uint4 v = seismic_ld_nc_v4(fields);
                 block.fields[r][0] = v.x, block.fields[r][1] = v.y, block.fields[r][2] = v.z, block.fields[r][3] = v.w;
             } else {
 #pragma unroll
                 for (int i = 0; i < WORDS; ++i)
                     block.fields[r][i] = seismic_ld_nc_u32(fields + 4 * i);
+            }
+            if constexpr (SPAN % 32 != 0) {
+                // The superblock's fields from bit 0.
+                const u32 shift = fields_shift(superblock);
+#pragma unroll
+                for (int i = 0; i < WORDS; ++i)
+                    block.fields[r][i] =
+                        __funnelshift_r(block.fields[r][i], i + 1 < WORDS ? block.fields[r][i + 1] : 0u, shift);
             }
             block.factors[r] = hold(factor_word(line + w.supers, superblock));
         }
@@ -1095,16 +1114,18 @@ struct Hier : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP_, MI
                 F::template form<WORDS>(block.fields[r], q * GROUPS + group, factor, c.scale[r][group], c.bias[r][group]);
         }
     }
-    // GEMM staging: the superblock's code words and the aligned word holding
-    // its factors (the supers plane is padded to 16 B).
+    // GEMM staging: the words the superblock's codes lie in and the aligned
+    // word holding its factors (the supers plane is padded to 16 B). Where
+    // its codes do not fill whole words, a word's first k-block is taken as
+    // the superblock's first (a row holds whole superblocks).
     static constexpr int SUPER_WORDS = WORDS + 1;
     template <class W> __device__ static __forceinline__ const u8 *super_word(const W &w, u64 row, u64 superblock, int word) {
         const u8 *line = w.base + row * w.stride;
-        return word < WORDS ? line + w.scales + superblock * (4 * WORDS) + 4 * word
+        return word < WORDS ? line + w.scales + fields_offset(superblock) + 4 * word
                             : line + w.supers + (superblock * FACTOR_BYTES & ~3ull);
     }
     __host__ __device__ static constexpr int word_kblock(int word) {
-        return word < WORDS ? (int)((u32)(32 * word) / (GROUPS * WIDTH)) : 0;
+        return word < WORDS && SPAN % 32 == 0 ? (int)((u32)(32 * word) / (GROUPS * WIDTH)) : 0;
     }
     __device__ static __forceinline__ void staged_coefficient(const u32 *words, u64 kblock, int group, float &scale,
                                                               float &bias) {
@@ -1114,7 +1135,7 @@ struct Hier : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP_, MI
         // copy of them all would be indexed dynamically, through local
         // memory. The field's word, and the next only where a field can
         // cross into it (`bits_of`).
-        const u32 bit = (u32)((kblock % 4) * GROUPS + group) * WIDTH;
+        const u32 bit = fields_shift(sb) + (u32)((kblock % 4) * GROUPS + group) * WIDTH;
         const u32 *at = words + bit / 32;
         u32 two[2] = {at[0], 0u};
         if constexpr (32 % WIDTH != 0)
@@ -1943,10 +1964,9 @@ struct CoefficientsOf<SEISMIC_COEFF_HIER, SCALE, BIAS, BIAS_SIGN, GROUP, STORAGE
                             Hier<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, (int)GROUP, BIAS != 0, BIAS_SIGN>>::type type;
 };
 
-// Whether a form multiplies through the scaled GEMM: direct coefficients,
-// but neither 8-bit codes nor whole 256-code rows (iq4g32, whose dequantized
-// GEMM its Qwen results were qualified with). Today's forms' choice, which
-// tuning owns once both GEMMs are qualified for each.
+// Whether a form multiplies through the scaled GEMM: direct coefficients of
+// codes below 8 bits. Today's forms' choice, which tuning owns once both
+// GEMMs are qualified for each.
 template <class K> struct IsDirect {
     static constexpr bool value = false;
 };
@@ -1955,7 +1975,7 @@ struct IsDirect<Direct<S, GROUP, BIAS, STORAGE, CODE_EXPONENT>> {
     static constexpr bool value = true;
 };
 template <class K, u32 LOW> struct ScaledGemm {
-    static constexpr bool value = IsDirect<K>::value && LOW != 8 && !K::WHOLE;
+    static constexpr bool value = IsDirect<K>::value && LOW != 8;
 };
 
 // The decoder of code axes CODES .. LANES under coefficients K
@@ -1965,7 +1985,7 @@ template <u32 CODES, u32 LOW, u32 HIGH, int OFFSET, u32 TABLE, u32 GRID, u32 IND
           bool OPERANDS>
 struct Decoder {
     static_assert(!RECORDS, "only grid codes are held in records");
-    typedef Packed<Planes<(int)LOW, (int)HIGH, K::WHOLE>, typename CodesOf<CODES, OFFSET, TABLE>::type, K,
+    typedef Packed<Planes<(int)LOW, (int)HIGH, K::STORAGE % 256 == 0>, typename CodesOf<CODES, OFFSET, TABLE>::type, K,
                    ScaledGemm<K, LOW>::value, OPERANDS>
         type;
 };

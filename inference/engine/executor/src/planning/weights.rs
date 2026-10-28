@@ -280,7 +280,7 @@ fn packing_bound(resident: Element, logical: &[u64]) -> u64 {
 }
 
 /// Whether a weight's packed sums take residue bits beside their 16-bit
-/// fields: its codes are values of 8 bits (Q8_0 and iq4g32), whose sums 16
+/// fields: its codes are values of 8 bits (Q8_0 and the IQ4 codebook's), whose sums 16
 /// bits a token do not hold at a useful gain. Only such weights make the
 /// packed forms' second residue width (`RESIDUE` 2) apply.
 pub fn packing_residue(resident: Element) -> bool {
@@ -1627,15 +1627,14 @@ fn host_table(
             descriptor.name
         ));
     }
-    let [_, width] = stored.shape[..] else {
+    if stored.shape.len() != 2 {
         return Err(format!("host table {:?} is not a matrix", descriptor.name));
-    };
-    let source = source_element(stored.encoding, width)
+    }
+    let source = source_element(stored.encoding)
         .ok_or_else(|| format!("unsupported source encoding {:?}", stored.encoding))?;
     let resident = resident_element(
         stored.encoding,
         crate::import_transforms::scaled_activations(descriptor),
-        width,
         form.activation,
         form.layout,
     )
@@ -1904,8 +1903,7 @@ fn push_weight(
                 descriptor.name
             )
         })?;
-    let width = stored.shape.last().copied().unwrap_or(1);
-    let source = source_element(stored.encoding, width)
+    let source = source_element(stored.encoding)
         .ok_or_else(|| format!("unsupported source encoding {:?}", stored.encoding))?;
     // The logical shape the importer's exact transforms make of the stored
     // tensor (the stored shape when there are none).
@@ -1935,7 +1933,6 @@ fn push_weight(
             resident_element(
                 stored.encoding,
                 crate::import_transforms::scaled_activations(descriptor),
-                width,
                 dense_resident,
                 form.layout,
             )
@@ -2176,30 +2173,26 @@ pub fn resident_layout(path: ExecutionPath, backend: BackendName) -> Layout {
     }
 }
 
-/// The external storage of an artifact encoding whose rows hold `width`
-/// values (the stored last axis): its dense element, or the registry's
-/// source of such rows (`None` when the registry has none). IQ4_NL rows
-/// whose width is a multiple of 256 read eight-block packets (into iq4g32),
-/// others single blocks (into iq4g32s).
-pub fn source_element(encoding: Encoding, width: u64) -> Option<Element> {
+/// The external storage of an artifact encoding: its dense element, or the
+/// registry's source (`None` when the registry has none).
+pub fn source_element(encoding: Encoding) -> Option<Element> {
     match encoding {
         Encoding::F32 => Some(Element::dense(DType::F32)),
         Encoding::F16 => Some(Element::dense(DType::F16)),
         Encoding::BF16 => Some(Element::dense(DType::BF16)),
-        _ => Element::gguf_source(encoding, width),
+        _ => Element::gguf_source(encoding),
     }
 }
 
 /// The resident storage of an artifact encoding: that of its source
-/// (`source_element`, of rows of `width` values) by [`resident_storage`].
+/// (`source_element`) by [`resident_storage`].
 pub fn resident_element(
     encoding: Encoding,
     activations: ScaledActivations,
-    width: u64,
     dense: DType,
     layout: Layout,
 ) -> Option<Element> {
-    resident_storage(source_element(encoding, width)?, activations, dense, layout)
+    resident_storage(source_element(encoding)?, activations, dense, layout)
 }
 
 /// The packet storage holding the values alone of a matrix stored as
@@ -2239,18 +2232,15 @@ fn resident_storage(
 
 /// Every element a weight can be resident as in `layout`: the image of
 /// [`resident_element`] over every encoding, activations and dense dtype,
-/// and both IQ4_NL sources (rows whose width is a multiple of 256, and rows
-/// whose width is not), each once, in a fixed order.
+/// each once, in a fixed order.
 pub fn resident_elements(layout: Layout) -> Vec<Element> {
     let mut elements = Vec::new();
     for dense in [DType::BF16, DType::F16, DType::F32] {
         for encoding in Encoding::ALL {
             for activations in [ScaledActivations::Rounded, ScaledActivations::Nvfp4] {
-                for width in [256, 32] {
-                    match resident_element(encoding, activations, width, dense, layout) {
-                        Some(element) if !elements.contains(&element) => elements.push(element),
-                        _ => {}
-                    }
+                match resident_element(encoding, activations, dense, layout) {
+                    Some(element) if !elements.contains(&element) => elements.push(element),
+                    _ => {}
                 }
             }
         }
@@ -2335,74 +2325,35 @@ mod representation_byte_tests {
     /// element only where the conversion has one (sharing its storage).
     #[test]
     fn the_registry_owns_the_encoding_map() {
-        let widths = [256, 32];
         let reached: HashSet<Element> = Encoding::ALL
             .into_iter()
-            .flat_map(|encoding| widths.map(|width| source_element(encoding, width)))
-            .flatten()
+            .filter_map(source_element)
             .collect();
         for source in Element::external_sources() {
             assert!(reached.contains(&source), "{} is no encoding's source", source.name());
         }
         for encoding in Encoding::ALL {
-            for width in widths {
-                let Some(source) = source_element(encoding, width) else {
-                    continue;
-                };
-                for layout in Layout::ALL {
-                    let resident = |activations| {
-                        resident_element(encoding, activations, width, DType::BF16, layout)
-                    };
-                    let rounded = resident(ScaledActivations::Rounded).unwrap();
-                    let w4a4 = resident(ScaledActivations::Nvfp4);
-                    if source.dtype().is_some() {
-                        assert_eq!((rounded, w4a4), (Element::bf16(), None));
-                        continue;
-                    }
-                    assert_eq!(rounded.layout(), layout);
-                    assert_eq!(rounded.operand_recipe(), OperandRecipe::Rounded);
-                    if let Some(w4a4) = w4a4 {
-                        assert_eq!(w4a4.operand_recipe(), OperandRecipe::Nvfp4Rows);
-                        assert_eq!(
-                            (w4a4.representation(), w4a4.layout()),
-                            (rounded.representation(), layout)
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// IQ4_NL rows whose width is a multiple of 256 read eight-block packets
-    /// into iq4g32; other widths (a 640-wide expert down) read single blocks
-    /// into iq4g32s, whose bytes are the stored blocks'.
-    #[test]
-    fn iq4_nl_forms_follow_the_row_width() {
-        for (width, source, representation) in [
-            (2560, "gguf_iq4_nl", "iq4g32"),
-            (640, "gguf_iq4_nl_block", "iq4g32s"),
-            (160, "gguf_iq4_nl_block", "iq4g32s"),
-        ] {
-            let stored = source_element(Encoding::Iq4Nl, width).unwrap();
-            assert_eq!(stored.name(), source);
-            // 18 bytes per 32 stored values, whatever the packet.
-            assert_eq!(
-                stored.canonical_byte_len(&[2, width]).unwrap(),
-                2 * width / 32 * 18
-            );
+            let Some(source) = source_element(encoding) else {
+                continue;
+            };
             for layout in Layout::ALL {
-                let element = resident_element(
-                    Encoding::Iq4Nl,
-                    ScaledActivations::Rounded,
-                    width,
-                    DType::BF16,
-                    layout,
-                )
-                .unwrap();
-                assert_eq!(
-                    (element.representation(), element.layout()),
-                    (representation, layout)
-                );
+                let resident =
+                    |activations| resident_element(encoding, activations, DType::BF16, layout);
+                let rounded = resident(ScaledActivations::Rounded).unwrap();
+                let w4a4 = resident(ScaledActivations::Nvfp4);
+                if source.dtype().is_some() {
+                    assert_eq!((rounded, w4a4), (Element::bf16(), None));
+                    continue;
+                }
+                assert_eq!(rounded.layout(), layout);
+                assert_eq!(rounded.operand_recipe(), OperandRecipe::Rounded);
+                if let Some(w4a4) = w4a4 {
+                    assert_eq!(w4a4.operand_recipe(), OperandRecipe::Nvfp4Rows);
+                    assert_eq!(
+                        (w4a4.representation(), w4a4.layout()),
+                        (rounded.representation(), layout)
+                    );
+                }
             }
         }
     }

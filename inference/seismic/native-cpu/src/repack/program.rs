@@ -2440,7 +2440,7 @@ mod tests {
             let group = u64::from(layout.logical_group);
             let encoding = Encoding::ALL
                 .into_iter()
-                .find(|encoding| registry::gguf_source(*encoding, group) == Some(conversion.source))
+                .find(|encoding| registry::gguf_source(*encoding) == Some(conversion.source))
                 .expect("a conversion's source is a GGUF type's");
             let path = vectors.join(format!("{}.bin", encoding.ggml_name()));
             let file =

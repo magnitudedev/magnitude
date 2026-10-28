@@ -1568,66 +1568,55 @@ pub fn representation_conversion_info(
 pub fn representation_conversions() -> &'static [RepresentationConversion] {
     internals::representation_conversions()
 }
-/// A GGUF source the registry converts from: its ggml type, the type's
-/// blocks one source packet holds, its storage name, and the resident
-/// representation its conversion writes. Packet bytes and values are the
-/// type's block geometry (`magnitude_ggml`) times `blocks`.
+/// A GGUF source the registry converts from: its ggml type, its storage
+/// name, and the resident representation its conversion writes. A source
+/// packet is one block of the type (`magnitude_ggml`'s geometry).
 #[derive(Clone, Copy, Debug)]
 struct GgufSource {
     encoding: Encoding,
-    blocks: u64,
     name: &'static str,
     resident: &'static str,
 }
 
 const fn gguf_source_spec(
     encoding: Encoding,
-    blocks: u64,
     name: &'static str,
     resident: &'static str,
 ) -> GgufSource {
     GgufSource {
         encoding,
-        blocks,
         name,
         resident,
     }
 }
 
-const GGUF_SOURCES: [GgufSource; 19] = [
-    gguf_source_spec(Encoding::Q3K, 1, "gguf_q3_k", "q3k"),
-    gguf_source_spec(Encoding::Iq3S, 1, "gguf_iq3_s", "q6k"),
-    gguf_source_spec(Encoding::Q4K, 1, "gguf_q4_k", "q4k"),
-    gguf_source_spec(Encoding::Q5K, 1, "gguf_q5_k", "q5k"),
-    gguf_source_spec(Encoding::Q6K, 1, "gguf_q6_k", "q6k"),
-    gguf_source_spec(Encoding::Q8_0, 1, "gguf_q8_0", "q8g32s"),
-    gguf_source_spec(Encoding::Iq4Nl, 8, "gguf_iq4_nl", "iq4g32"),
-    gguf_source_spec(Encoding::Iq4Xs, 1, "gguf_iq4_xs", "iq4g32"),
-    gguf_source_spec(Encoding::Q4_0, 1, "gguf_q4_0", "q4g32s"),
-    gguf_source_spec(Encoding::Q4_1, 1, "gguf_q4_1", "q4g32"),
-    gguf_source_spec(Encoding::Iq4Nl, 1, "gguf_iq4_nl_block", "iq4g32s"),
-    gguf_source_spec(Encoding::Q5_0, 1, "gguf_q5_0", "q5g32s"),
-    gguf_source_spec(Encoding::Q5_1, 1, "gguf_q5_1", "q5g32"),
-    gguf_source_spec(Encoding::Mxfp4, 1, "gguf_mxfp4", "mxfp4g32"),
-    gguf_source_spec(Encoding::Nvfp4, 1, "gguf_nvfp4", "nvfp4g16"),
-    gguf_source_spec(Encoding::Iq2Xs, 1, "gguf_iq2_xs", "iq2xs"),
-    gguf_source_spec(Encoding::Iq3Xxs, 1, "gguf_iq3_xxs", "iq3xxs"),
-    gguf_source_spec(Encoding::Iq2Xxs, 1, "gguf_iq2_xxs", "iq2xxs"),
-    gguf_source_spec(Encoding::Q2K, 1, "gguf_q2_k", "q2k"),
+const GGUF_SOURCES: [GgufSource; 18] = [
+    gguf_source_spec(Encoding::Q3K, "gguf_q3_k", "q3k"),
+    gguf_source_spec(Encoding::Iq3S, "gguf_iq3_s", "q6k"),
+    gguf_source_spec(Encoding::Q4K, "gguf_q4_k", "q4k"),
+    gguf_source_spec(Encoding::Q5K, "gguf_q5_k", "q5k"),
+    gguf_source_spec(Encoding::Q6K, "gguf_q6_k", "q6k"),
+    gguf_source_spec(Encoding::Q8_0, "gguf_q8_0", "q8g32s"),
+    gguf_source_spec(Encoding::Iq4Xs, "gguf_iq4_xs", "iq4xs"),
+    gguf_source_spec(Encoding::Q4_0, "gguf_q4_0", "q4g32s"),
+    gguf_source_spec(Encoding::Q4_1, "gguf_q4_1", "q4g32"),
+    gguf_source_spec(Encoding::Iq4Nl, "gguf_iq4_nl", "iq4g32s"),
+    gguf_source_spec(Encoding::Q5_0, "gguf_q5_0", "q5g32s"),
+    gguf_source_spec(Encoding::Q5_1, "gguf_q5_1", "q5g32"),
+    gguf_source_spec(Encoding::Mxfp4, "gguf_mxfp4", "mxfp4g32"),
+    gguf_source_spec(Encoding::Nvfp4, "gguf_nvfp4", "nvfp4g16"),
+    gguf_source_spec(Encoding::Iq2Xs, "gguf_iq2_xs", "iq2xs"),
+    gguf_source_spec(Encoding::Iq3Xxs, "gguf_iq3_xxs", "iq3xxs"),
+    gguf_source_spec(Encoding::Iq2Xxs, "gguf_iq2_xxs", "iq2xxs"),
+    gguf_source_spec(Encoding::Q2K, "gguf_q2_k", "q2k"),
 ];
 
-/// The external storage rows of `width` stored values of `encoding` are
-/// read as: the registered source of the most blocks whose packet divides
-/// the row (a GGUF row is whole blocks); `None` when the registry converts
-/// from none.
-pub fn gguf_source(encoding: Encoding, width: u64) -> Option<RepresentationId> {
+/// The external storage `encoding` is read as: its registered source;
+/// `None` when the registry converts from none.
+pub fn gguf_source(encoding: Encoding) -> Option<RepresentationId> {
     GGUF_SOURCES
         .iter()
-        .filter(|source| {
-            source.encoding == encoding
-                && width.is_multiple_of(encoding.block_elements() * source.blocks)
-        })
-        .max_by_key(|source| source.blocks)
+        .find(|source| source.encoding == encoding)
         .and_then(|source| representation(source.name))
 }
 
@@ -1952,18 +1941,14 @@ pub(crate) mod internals {
         // representation holds exactly converts into it: IQ3_S's
         // `d * (1 + 2 s) * ±g` (four-bit `s` per 32 values, odd grid
         // magnitude `g` <= 15) is q6k's `d * s' * (c - 32)` with
-        // `s' = 1 + 2 s` and `c = 32 ± g`. An IQ4_NL packet is eight
-        // consecutive 32-value blocks (one iq4g32 storage group), each
-        // block's f16 scale widened exactly; an IQ4_NL block alone
-        // (`gguf_iq4_nl_block`, the rows of a table whose width is a
-        // multiple of 32 but not of 256, held as stored) is an iq4g32s
-        // packet. Q4_0, Q4_1, Q5_0, Q5_1, MXFP4, NVFP4, Q2_K and Q3_K move
-        // their codes and coefficient fields bit for bit into
+        // `s' = 1 + 2 s` and `c = 32 ± g`. Q4_0, Q4_1, IQ4_NL, IQ4_XS, Q5_0,
+        // Q5_1, MXFP4, NVFP4, Q2_K and Q3_K move their codes and
+        // coefficient fields bit for bit into
         // representations of their own.
         let external_specs = GGUF_SOURCES.map(|source| {
-            let packet_size = u32::try_from(source.encoding.block_bytes() * source.blocks)
+            let packet_size = u32::try_from(source.encoding.block_bytes())
                 .expect("a GGUF source packet fits u32 bytes");
-            let logical_group = u32::try_from(source.encoding.block_elements() * source.blocks)
+            let logical_group = u32::try_from(source.encoding.block_elements())
                 .expect("a GGUF source packet fits u32 values");
             (source.name, packet_size, logical_group, source.resident)
         });
@@ -2780,6 +2765,11 @@ pub(crate) mod internals {
                 ));
             }
             "gguf_iq4_xs" => {
+                // block_iq4_xs: d (f16) | scales_h (u16) | scales_l[4] |
+                // qs[128]. Value p of sub-block p / 32 is the low (p % 32 <
+                // 16) or high nibble of qs[16 (p / 32) + p % 16]; sub-block
+                // g's 6-bit scale code is nibble g % 2 of scales_l[g / 2]
+                // under bits 2g, 2g + 1 of scales_h; d moves bit for bit.
                 push(plane(
                     "words",
                     PlaneRepackRecipe::BitRoutes(
@@ -2792,36 +2782,24 @@ pub(crate) mod internals {
                             .collect(),
                     ),
                 ));
-                let base =
-                    RepackExpr::F16ToF32(Box::new(RepackExpr::SourceBits { bit: 0, width: 16 }));
                 push(plane(
-                    "scale",
-                    PlaneRepackRecipe::DenseValues(
-                        (0..8)
-                            .map(|group| {
-                                let combined = RepackExpr::OffsetI32 {
-                                    value: Box::new(RepackExpr::BitOr(
-                                        Box::new(RepackExpr::SourceBits {
-                                            bit: (4 + group / 2) * 8 + (group % 2) * 4,
-                                            width: 4,
-                                        }),
-                                        Box::new(RepackExpr::ShiftLeft {
-                                            value: Box::new(RepackExpr::SourceBits {
-                                                bit: 16 + 2 * group,
-                                                width: 2,
-                                            }),
-                                            bits: 4,
-                                        }),
-                                    )),
-                                    offset: -32,
-                                };
-                                RepackExpr::MultiplyF32(
-                                    Box::new(base.clone()),
-                                    Box::new(RepackExpr::I32ToF32(Box::new(combined))),
-                                )
+                    "coefficients",
+                    PlaneRepackRecipe::BitRoutes(
+                        (0..48)
+                            .map(|bit| {
+                                let (group, code_bit) = (bit / 6, bit % 6);
+                                if code_bit < 4 {
+                                    (4 + group / 2) * 8 + (group % 2) * 4 + code_bit
+                                } else {
+                                    16 + 2 * group + code_bit - 4
+                                }
                             })
                             .collect(),
                     ),
+                ));
+                push(plane(
+                    "scale_factor",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(0, 2)),
                 ));
             }
             "gguf_q3_k" => {
@@ -2948,41 +2926,10 @@ pub(crate) mod internals {
                     PlaneRepackRecipe::BitRoutes(direct_bits(0, 2)),
                 ));
             }
-            "gguf_iq4_nl" => {
-                // Eight block_iq4_nl: d (f16) | qs[16]; value w of a block is
-                // the low (w < 16) or high nibble of qs[w % 16].
-                push(plane(
-                    "words",
-                    PlaneRepackRecipe::BitRoutes(
-                        (0..1024)
-                            .map(|bit| {
-                                let position = bit / 4;
-                                let block = position / 32;
-                                let within = position % 32;
-                                (block * 18 + 2 + within % 16) * 8 + (within / 16) * 4 + bit % 4
-                            })
-                            .collect(),
-                    ),
-                ));
-                push(plane(
-                    "scale",
-                    PlaneRepackRecipe::DenseValues(
-                        (0..8)
-                            .map(|block| {
-                                RepackExpr::F16ToF32(Box::new(RepackExpr::SourceBits {
-                                    bit: block * 18 * 8,
-                                    width: 16,
-                                }))
-                            })
-                            .collect(),
-                    ),
-                ));
-            }
-            "gguf_q4_0" | "gguf_iq4_nl_block" | "gguf_q4_1" => {
-                // block_q4_0 and one block_iq4_nl: d (f16) | qs[16];
-                // block_q4_1: d | m (f16) | qs[16]. Value p is the low
-                // (p < 16) or high nibble of qs[p % 16]; d and m move bit
-                // for bit.
+            "gguf_q4_0" | "gguf_iq4_nl" | "gguf_q4_1" => {
+                // block_q4_0 and block_iq4_nl: d (f16) | qs[16]; block_q4_1:
+                // d | m (f16) | qs[16]. Value p is the low (p < 16) or high
+                // nibble of qs[p % 16]; d and m move bit for bit.
                 let minimum = source_name == "gguf_q4_1";
                 let header = if minimum { 4 } else { 2 };
                 push(plane(
@@ -3629,17 +3576,13 @@ mod tests {
     }
 
     /// A conversion's domain makes the scales it converts as numbers finite
-    /// and keeps every other source bit: IQ4_NL's eight block scales and
-    /// IQ4_XS's base, and nothing of Q4_0, whose scale moves bit for bit.
+    /// and keeps every other source bit: IQ2_XS's factor, and nothing of
+    /// Q4_0 or IQ4_XS, whose scales move bit for bit.
     #[test]
     fn a_conversion_admits_sources_with_finite_converted_scales() {
         for (source, destination, fields) in [
-            (
-                "gguf_iq4_nl",
-                "iq4g32@rows16",
-                (0..8).map(|block| block * 144).collect::<Vec<u32>>(),
-            ),
-            ("gguf_iq4_xs", "iq4g32@rows16", vec![0]),
+            ("gguf_iq2_xs", "iq2xs@rows16", vec![0u32]),
+            ("gguf_iq4_xs", "iq4xs@rows16", vec![]),
             ("gguf_q4_0", "q4g32s@rows16", vec![]),
         ] {
             let conversion = representation_conversion(
@@ -3777,8 +3720,8 @@ mod tests {
         );
         assert_eq!(plane_set("q8g32s@rows16"), [("codes", 32), ("supers", 2)]);
         assert_eq!(
-            plane_set("iq4g32@rows16"),
-            [("codes_lo", 128), ("supers", 32)]
+            plane_set("iq4xs@rows16"),
+            [("codes_lo", 128), ("scales", 6), ("supers", 2)]
         );
         // Qwen3.5 K = 2560: codes 1280 | scales 120 -> 128 | supers 40 -> 48.
         let q4k = row_layout("q4k@rows16");
@@ -3806,7 +3749,7 @@ mod tests {
         for (name, multiple) in [
             ("q4k@mma16", 1),
             ("q6k@mma16", 1),
-            ("iq4g32@mma16", 1),
+            ("iq4xs@mma16", 1),
             ("q8g32s@mma16", 2),
             ("q4g32s@mma16", 2),
             ("mxfp4g32@mma16", 2),

@@ -10,7 +10,7 @@ fn packed_reads(backend: registry::BackendName) {
         path: "packed-field-read.seismic".into(),
         text: "fn probe[N](x: &tensor[N] Q) -> tensor[N] f32:\n    let mut result = tensor[N] f32\n    parallel for i in 0..N:\n        result[i] = f32(x[i])\n    return result\n".into(),
     }])).unwrap();
-    for name in ["q4g64", "q4k", "q5k", "q6k", "iq4g32", "nvfp4_e2m1_block16"] {
+    for name in ["q4g64", "q4k", "q5k", "q6k", "iq4xs", "nvfp4_e2m1_block16"] {
         let representation = registry::representation(name).unwrap();
         let registry::RepresentationKind::Packed(layout) =
             &registry::representation_info(representation).kind

@@ -69,7 +69,7 @@ fn cuda_recurrent_project_matches_host_model() {
     );
 }
 
-/// IQ4_XS / IQ4_NL weights are resident as iq4g32.
+/// IQ4_XS weights are resident as iq4xs.
 #[test]
 fn cuda_recurrent_project_iq4_matches_host_model() {
     recurrent_project_cases(&[[Some(Format::Iq4); 4]], 43);
@@ -171,7 +171,7 @@ fn cuda_attention_project_matches_host_model() {
     );
 }
 
-/// IQ4_XS / IQ4_NL weights are resident as iq4g32.
+/// IQ4_XS weights are resident as iq4xs.
 #[test]
 fn cuda_attention_project_iq4_matches_host_model() {
     attention_project_cases(&[[Format::Iq4; 3]], 59);

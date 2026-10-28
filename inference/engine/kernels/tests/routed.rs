@@ -1509,7 +1509,7 @@ fn metal_q5_router_matches_dense_decoding() {
 
 #[test]
 fn metal_iq4_router_matches_dense_decoding() {
-    packed_router_matches_dense_decoding("iq4g32", seismic::BackendName::Metal);
+    packed_router_matches_dense_decoding("iq4xs", seismic::BackendName::Metal);
 }
 
 #[test]
@@ -1534,7 +1534,7 @@ fn cuda_q5_router_matches_dense_decoding() {
 
 #[test]
 fn cuda_iq4_router_matches_dense_decoding() {
-    packed_router_matches_dense_decoding("iq4g32", seismic::BackendName::Cuda);
+    packed_router_matches_dense_decoding("iq4xs", seismic::BackendName::Cuda);
 }
 
 #[test]
@@ -1559,7 +1559,7 @@ fn vulkan_q5_router_matches_dense_decoding() {
 
 #[test]
 fn vulkan_iq4_router_matches_dense_decoding() {
-    packed_router_matches_dense_decoding("iq4g32", seismic::BackendName::Vulkan);
+    packed_router_matches_dense_decoding("iq4xs", seismic::BackendName::Vulkan);
 }
 
 /// The planes of one packed weight: resident element, layout bytes and
@@ -1690,10 +1690,10 @@ fn bf16_weight(device: &seismic::Device, shape: &[u64], seed: u32) -> (seismic::
 enum Experts {
     /// The 35B-A3B mix: gate/up q4k, down q5k.
     Packed,
-    /// IQ4_XS / IQ4_NL weights resident as iq4g32.
+    /// IQ4_XS weights resident as iq4xs.
     Iq4,
-    /// IQ4_NL weights read as single blocks, resident as iq4g32s (rows whose
-    /// width is not a multiple of 256, as a 640-wide expert down).
+    /// IQ4_NL weights, resident as iq4g32s, in rows whose width is not a
+    /// multiple of 256 (a 640-wide expert down).
     Iq4Blocks,
     /// Dense bf16 (GGUF F32/F16/BF16 experts are resident bf16).
     Bf16,
@@ -1736,7 +1736,7 @@ impl PackedBlock {
     const SHARED: usize = 256;
 
     /// Expert features: Qwen3.8 Flash Next Q2's 640 (not a multiple of 256)
-    /// for IQ4_NL single-block experts, else 256.
+    /// for IQ4_NL experts, else 256.
     fn features(experts: Experts) -> usize {
         match experts {
             Experts::Iq4Blocks => 640,
@@ -1755,7 +1755,7 @@ impl PackedBlock {
         // The representations of gate, up and down.
         let representations = match experts {
             Experts::Packed => ["q4k", "q4k", "q5k"],
-            Experts::Iq4 => ["iq4g32"; 3],
+            Experts::Iq4 => ["iq4xs"; 3],
             Experts::Iq4Blocks => ["iq4g32s"; 3],
             Experts::Bf16 => ["bf16"; 3],
             Experts::Coded => ["q4g32s", "mxfp4g32", "q5g32"],
@@ -2539,7 +2539,7 @@ fn native_routed_experts_match_reference_with_nvfp4_experts() {
     }
 }
 
-/// IQ4_NL single-block experts (iq4g32s) in the decode expand and output
+/// IQ4_NL experts (iq4g32s) in the decode expand and output
 /// and the grouped (prefill) expert GEMMs.
 #[test]
 fn native_routed_experts_match_reference_with_iq4_block_experts() {

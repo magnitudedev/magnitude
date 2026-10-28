@@ -315,7 +315,7 @@ mod tests {
             4 => (Encoding::Q4_0, ProgressiveCodeDepth::Four),
             _ => (Encoding::Q8_0, ProgressiveCodeDepth::Eight),
         };
-        let source = crate::source_element(encoding, columns as u64).unwrap();
+        let source = crate::source_element(encoding).unwrap();
         let columns = NonZeroU32::new(u32::try_from(columns).unwrap()).unwrap();
         plane(part, &Placement::of(depth, source, columns).unwrap(), bytes)
     }
@@ -327,7 +327,7 @@ mod tests {
     #[test]
     fn placement_admits_only_rows_whose_positions_fit() {
         let of = |columns: u32| {
-            let source = crate::source_element(Encoding::Q8_0, u64::from(columns)).unwrap();
+            let source = crate::source_element(Encoding::Q8_0).unwrap();
             Placement::of(
                 ProgressiveCodeDepth::Eight,
                 source,
@@ -482,7 +482,7 @@ mod tests {
             } else {
                 Encoding::Q8_0
             };
-            let source = crate::source_element(encoding, columns as u64).unwrap();
+            let source = crate::source_element(encoding).unwrap();
             let depth = if bits == 4 {
                 ProgressiveCodeDepth::Four
             } else {

@@ -176,9 +176,7 @@ impl Stored {
     pub fn source_element(&self) -> Option<Element> {
         match self {
             Self::Dense(tensor) => Some(Element::dense(tensor.dtype)),
-            Self::GgmlBlocks {
-                encoding, shape, ..
-            } => source_element(*encoding, shape.last().copied().unwrap_or(1)),
+            Self::GgmlBlocks { encoding, .. } => source_element(*encoding),
         }
     }
 
@@ -858,14 +856,11 @@ impl ResidencyStore {
         let (upload, actual_resident) = match stored {
             Stored::Dense(_) => (actual_source, Element::dense(target)),
             Stored::GgmlBlocks { .. } if dequantized => (Element::f32(), Element::dense(target)),
-            Stored::GgmlBlocks {
-                encoding, shape, ..
-            } => (
+            Stored::GgmlBlocks { encoding, .. } => (
                 actual_source,
                 resident_element(
                     *encoding,
                     crate::import_transforms::scaled_activations(descriptor),
-                    shape.last().copied().unwrap_or(1),
                     target,
                     layout,
                 )
@@ -1498,7 +1493,7 @@ fn validate_request(
             if *nbytes != expected {
                 return Err(invalid("packed weight byte count mismatch"));
             }
-            if source_element(*encoding, shape.last().copied().unwrap_or(1)).is_none() {
+            if source_element(*encoding).is_none() {
                 return Err(invalid(format!(
                     "GGUF encoding {encoding:?} has no qualified native import"
                 )));

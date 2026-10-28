@@ -37,7 +37,7 @@ pub enum Format {
     Q5K,
     Q6K,
     Q8,
-    /// GGUF IQ4_XS, resident as iq4g32.
+    /// GGUF IQ4_XS, resident as iq4xs.
     Iq4,
     /// GGUF Q4_0, Q4_1, Q5_0, Q5_1, MXFP4, NVFP4 (representations of their
     /// own).
@@ -107,7 +107,7 @@ impl Format {
             Format::Q5K => "q5k",
             Format::Q6K => "q6k",
             Format::Q8 => "q8g32s",
-            Format::Iq4 => "iq4g32",
+            Format::Iq4 => "iq4xs",
             Format::Q4_0 => "q4g32s",
             Format::Q4_1 => "q4g32",
             Format::Q5_0 => "q5g32s",

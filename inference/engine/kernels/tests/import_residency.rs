@@ -59,7 +59,7 @@ fn every_gguf_source_imports_as_the_reference_dequantizes() {
         let width = source.logical_group().unwrap().max(128);
         let encoding = magnitude_ggml::Encoding::ALL
             .into_iter()
-            .find(|encoding| seismic::Element::gguf_source(*encoding, width) == Some(source))
+            .find(|encoding| seismic::Element::gguf_source(*encoding) == Some(source))
             .unwrap_or_else(|| panic!("{} is no encoding's source", source.name()));
         let (bytes, reference) = reference_vectors(encoding);
         let shape = [reference.len() as u64 / width, width];
@@ -72,6 +72,68 @@ fn every_gguf_source_imports_as_the_reference_dequantizes() {
                 reference.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
                 "{} -> {}",
                 source.name(),
+                element.name()
+            );
+        }
+    }
+}
+
+/// IQ4_XS and IQ4_NL rows of whole 256-value blocks, which `main` imported
+/// with one f32 scale per 32-value group (`d (ls - 32)`, or IQ4_NL's
+/// widened `d`) times the codebook value, decode in every layout of their
+/// resident forms (iq4xs, iq4g32s) to exactly those values.
+#[test]
+fn iq4_rows_decode_as_main_did() {
+    const CODEBOOK: [i8; 16] = [
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    ];
+    let f16 =
+        |bytes: &[u8]| seismic_lang::registry::f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]]));
+    for encoding in [
+        magnitude_ggml::Encoding::Iq4Xs,
+        magnitude_ggml::Encoding::Iq4Nl,
+    ] {
+        let (bytes, _) = reference_vectors(encoding);
+        let block = encoding.block_bytes() as usize;
+        // Per 32-value group: main's f32 scale and the group's 16 code bytes.
+        let groups = bytes
+            .chunks_exact(block)
+            .flat_map(|block| match encoding {
+                magnitude_ggml::Encoding::Iq4Xs => (0..8)
+                    .map(|g| {
+                        let low = (block[4 + g / 2] >> (4 * (g % 2))) & 0xf;
+                        let high = (u16::from_le_bytes([block[2], block[3]]) >> (2 * g)) & 3;
+                        let ls = i32::from(low) | (i32::from(high) << 4);
+                        (f16(block) * (ls - 32) as f32, &block[8 + 16 * g..][..16])
+                    })
+                    .collect::<Vec<_>>(),
+                _ => vec![(f16(block), &block[2..18])],
+            })
+            .collect::<Vec<_>>();
+        let main = groups
+            .iter()
+            .flat_map(|(scale, codes)| {
+                (0..32).map(move |i| {
+                    let code = (codes[i % 16] >> (4 * (i / 16))) & 0xf;
+                    scale * f32::from(CODEBOOK[usize::from(code)])
+                })
+            })
+            .collect::<Vec<_>>();
+        let source = seismic::Element::gguf_source(encoding).unwrap();
+        let shape = [main.len() as u64 / 256, 256];
+        for layout in seismic::Layout::ALL {
+            let element = source
+                .converted(layout, seismic::OperandRecipe::Rounded)
+                .unwrap();
+            let stored = element.repack_host(source, &shape, &bytes).unwrap();
+            let values = element.decode_host(&shape, &stored).unwrap();
+            assert_eq!(
+                values
+                    .iter()
+                    .map(|value| (*value as f32).to_bits())
+                    .collect::<Vec<_>>(),
+                main.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                "{}",
                 element.name()
             );
         }
@@ -100,7 +162,7 @@ fn real_gguf_tensors_import_as_the_reference_dequantizes() {
             .into_iter()
             .find(|encoding| encoding.ggml_name() == *type_name)
             .unwrap_or_else(|| panic!("type `{type_name}`"));
-        let source = seismic::Element::gguf_source(encoding, shape[1]).unwrap();
+        let source = seismic::Element::gguf_source(encoding).unwrap();
         for layout in seismic::Layout::ALL {
             let element = source
                 .converted(layout, seismic::OperandRecipe::Rounded)
@@ -169,7 +231,7 @@ fn q3_k_decodes_as_its_q6_k_reexpression() {
         });
         q6_k_block([block[108], block[109]], scales, codes)
     };
-    let source = seismic::Element::gguf_source(encoding, 256).unwrap();
+    let source = seismic::Element::gguf_source(encoding).unwrap();
     let (vectors, _) = reference_vectors(encoding);
     let bytes = [vectors, source_bytes(64 * encoding.block_bytes(), 7)].concat();
     let shape = [bytes.len() as u64 / encoding.block_bytes(), 256];

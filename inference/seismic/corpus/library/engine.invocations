@@ -55,9 +55,9 @@ repack_weight[E=gguf_q6_k,U=q6k@mma16]: gguf_q6_k[1,16,256]=rand(369)
 repack_weight[E=gguf_q8_0,U=q8g32s]: gguf_q8_0[1,2,128]=rand(370)
 repack_weight[E=gguf_q8_0,U=q8g32s@rows16]: gguf_q8_0[1,2,128]=rand(371)
 repack_weight[E=gguf_q8_0,U=q8g32s@mma16]: gguf_q8_0[1,16,64]=rand(372)
-repack_weight[E=gguf_iq4_xs,U=iq4g32]: gguf_iq4_xs[1,2,512]=rand(373)
-repack_weight[E=gguf_iq4_xs,U=iq4g32@rows16]: gguf_iq4_xs[1,2,512]=rand(374)
-repack_weight[E=gguf_iq4_xs,U=iq4g32@mma16]: gguf_iq4_xs[1,16,256]=rand(375)
+repack_weight[E=gguf_iq4_xs,U=iq4xs]: gguf_iq4_xs[1,2,512]=rand(373)
+repack_weight[E=gguf_iq4_xs,U=iq4xs@rows16]: gguf_iq4_xs[1,2,512]=rand(374)
+repack_weight[E=gguf_iq4_xs,U=iq4xs@mma16]: gguf_iq4_xs[1,16,256]=rand(375)
 
 # readout.seismic: M = 3, O = 2, V = 5, D = 4, Sv = 2.
 readout_head_rows[NW=f32,OW=f32,A=f32]: f32[3,4]=rand(158) ; f32[4]=rand(159) ; f32[5,4]=rand(160) ; i32[2]=2,0 ; f32:0.000001

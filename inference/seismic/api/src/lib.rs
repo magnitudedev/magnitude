@@ -481,10 +481,10 @@ impl Element {
     pub fn stored(storage: &str, layout: Layout) -> Option<Element> {
         seismic_lang::registry::storage(storage, layout).map(Element)
     }
-    /// The external storage rows of `width` stored values of `encoding`
-    /// are read as, when the registry converts from it.
-    pub fn gguf_source(encoding: magnitude_ggml::Encoding, width: u64) -> Option<Element> {
-        seismic_lang::registry::gguf_source(encoding, width).map(Element)
+    /// The external storage `encoding` is read as, when the registry
+    /// converts from it.
+    pub fn gguf_source(encoding: magnitude_ggml::Encoding) -> Option<Element> {
+        seismic_lang::registry::gguf_source(encoding).map(Element)
     }
     /// Every external (artifact-format) storage the registry converts from.
     pub fn external_sources() -> impl Iterator<Item = Element> {
