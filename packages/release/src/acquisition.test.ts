@@ -183,12 +183,16 @@ describe("unsigned release acquisition", () => {
     }
   })
 
-  it("publishes an extracted installation without scoped staging cleanup failure", async () => {
+  it("publishes an extracted installation and leaves no staging behind", async () => {
     const root = await mkdtemp(join(tmpdir(), "magnitude-release-test-"))
     const payload = join(root, "payload")
     const archivePath = join(root, "cli.tar.gz")
     const destination = join(root, "installations", "digest")
     await mkdir(join(payload, "bin"), { recursive: true })
+    await mkdir(join(root, "installations", ".download-killed", ".artifact-download-old"), { recursive: true })
+    await writeFile(join(root, "installations", ".download-killed", ".artifact-download-old", "part-0"), "stale")
+    await mkdir(join(root, "installations", ".release-killed"))
+    await mkdir(join(root, "installations", `.partial-${"0".repeat(64)}`))
     const executable = join(payload, "bin", "magnitude-cli")
     await writeFile(executable, "#!/bin/sh\nexit 0\n")
     await chmod(executable, 0o755)
@@ -276,10 +280,7 @@ describe("unsigned release acquisition", () => {
         expect(extracted.progress.completedBytes).toBe(archiveBytes.byteLength)
         expect(extracted.progress.totalBytes).toBe(archiveBytes.byteLength)
       }
-      expect(
-        (await readdir(join(root, "installations")))
-          .filter((entry) => entry.startsWith(".release-")),
-      ).toEqual([])
+      expect(await readdir(join(root, "installations"))).toEqual(["digest"])
     } finally {
       server.stop(true)
       await rm(root, { recursive: true, force: true })

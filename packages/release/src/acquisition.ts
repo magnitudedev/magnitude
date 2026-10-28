@@ -8,6 +8,7 @@ import { ArchiveExtractor } from "./archive"
 import {
   defaultArtifactDownloadPolicy,
   downloadArtifact as downloadReleaseArtifact,
+  partialDirectoryName,
 } from "./artifact-download"
 import type { ArtifactInstallationObserver } from "./installation-progress"
 import { ReleaseAcquisitionError } from "./errors"
@@ -283,6 +284,30 @@ export const releaseBundleSizes = (
     }
   })
 
+/**
+ * Staging beside installations is only ever this process's own, so anything there but the
+ * resumable parts of the artifact being installed was left by an interrupted or older install.
+ */
+const removeAbandonedStaging = (
+  directory: string,
+  sha256: string,
+): Effect.Effect<void, ReleaseAcquisitionError, FileSystem.FileSystem | Path.Path> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const path = yield* Path.Path
+    const entries = yield* fs.readDirectory(directory).pipe(
+      Effect.mapError(() => failure("install", "unable to read release directory"))
+    )
+    yield* Effect.forEach(
+      entries.filter((entry) => entry.startsWith(".") && entry !== partialDirectoryName(sha256)),
+      (entry) =>
+        fs.remove(path.join(directory, entry), { recursive: true, force: true }).pipe(
+          Effect.mapError(() => failure("install", `unable to remove abandoned download ${entry}`))
+        ),
+      { discard: true }
+    )
+  })
+
 export const installArtifact = (
   baseUrl: string,
   version: string,
@@ -310,17 +335,11 @@ export const installArtifact = (
             failure("install", "unable to create release directory")
           )
         )
-      const downloadDirectory = yield* fs
-        .makeTempDirectoryScoped({
-          directory: parent,
-          prefix: ".download-",
-        })
-        .pipe(
-          Effect.mapError(() =>
-            failure("install", "unable to create release download directory")
-          )
-        )
-      const archive = path.join(downloadDirectory, "artifact")
+      yield* removeAbandonedStaging(parent, artifact.sha256)
+      const archive = path.join(parent, `.archive-${artifact.sha256}`)
+      yield* Effect.addFinalizer(() =>
+        fs.remove(archive, { force: true }).pipe(Effect.catchAll(() => Effect.void))
+      )
       yield* downloadReleaseArtifact({
         url: releaseUrl(baseUrl, version, artifact.filename),
         destination: archive,

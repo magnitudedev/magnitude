@@ -5,12 +5,16 @@ import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
 import * as HttpClientResponse from "@effect/platform/HttpClientResponse"
 import * as Path from "@effect/platform/Path"
 import {
+  Cause,
+  Clock,
   Data,
   Duration,
   Effect,
+  Either,
+  Exit,
   Option,
+  Random,
   Ref,
-  Schedule,
   Sink,
   Stream,
 } from "effect"
@@ -32,17 +36,23 @@ export interface ArtifactDownloadProgress {
   readonly attempt: number
 }
 
+/**
+ * A transient failure is retried with jittered exponential backoff from `retryDelay` up to
+ * `retryMaxDelay`, until `retryWindow` passes without the transfer accepting a byte.
+ */
 export interface ArtifactDownloadPolicy {
-  readonly retryCount: number
   readonly retryDelay: Duration.DurationInput
+  readonly retryMaxDelay: Duration.DurationInput
+  readonly retryWindow: Duration.DurationInput
   readonly attemptTimeout: Duration.DurationInput
   readonly stallTimeout: Duration.DurationInput
   readonly totalTimeout: Duration.DurationInput
 }
 
 export const defaultArtifactDownloadPolicy: ArtifactDownloadPolicy = {
-  retryCount: 2,
-  retryDelay: "500 millis",
+  retryDelay: "1 second",
+  retryMaxDelay: "30 seconds",
+  retryWindow: "10 minutes",
   attemptTimeout: "10 minutes",
   stallTimeout: "60 seconds",
   totalTimeout: "31 minutes",
@@ -69,6 +79,12 @@ export interface ArtifactDownloadResult {
   readonly bytes: number
   readonly sha256: string
 }
+
+/**
+ * Parts of an unfinished download live beside its destination, named by the artifact's digest, so
+ * a later download of the same artifact resumes them. One process downloads an artifact at a time.
+ */
+export const partialDirectoryName = (sha256: string) => `.partial-${sha256}`
 
 export class ArtifactDownloadError extends Data.TaggedError("ArtifactDownloadError")<{
   readonly phase: "request" | "protocol" | "stream" | "filesystem" | "integrity"
@@ -123,14 +139,41 @@ const parseContentRange = (
     ))
 }
 
-const retrySchedule = (
-  retryCount: number,
-  retryDelay: Duration.DurationInput,
-) =>
-  Schedule.exponential(retryDelay).pipe(
-    Schedule.jittered,
-    Schedule.intersect(Schedule.recurs(retryCount)),
-  )
+/**
+ * An outage of a release host lasts seconds to minutes, so a part keeps retrying for the whole
+ * window, and any byte it accepts restarts the window and the backoff.
+ */
+const retryTransfer = <A, E, R>(
+  policy: ArtifactDownloadPolicy,
+  retriable: (error: E) => boolean,
+  accepted: Effect.Effect<number>,
+  transfer: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  Effect.gen(function* () {
+    const initialDelay = Duration.toMillis(policy.retryDelay)
+    const maximumDelay = Duration.toMillis(policy.retryMaxDelay)
+    const window = Duration.toMillis(policy.retryWindow)
+    let delay = initialDelay
+    let acceptedBytes = yield* accepted
+    let idleSince = yield* Clock.currentTimeMillis
+    for (;;) {
+      const result = yield* Effect.either(transfer)
+      if (Either.isRight(result)) return result.right
+      if (!retriable(result.left)) return yield* Effect.fail(result.left)
+      const now = yield* Clock.currentTimeMillis
+      const currentBytes = yield* accepted
+      if (currentBytes > acceptedBytes) {
+        acceptedBytes = currentBytes
+        idleSince = now
+        delay = initialDelay
+      }
+      if (now - idleSince >= window) return yield* Effect.fail(result.left)
+      yield* Effect.sleep(Duration.millis(delay * (0.8 + 0.4 * (yield* Random.next))))
+      delay = Math.min(delay * 2, maximumDelay)
+    }
+  })
+
+const isTransient = (error: ArtifactDownloadError) => error.transient
 
 const report = (
   input: ArtifactDownloadInput,
@@ -177,6 +220,7 @@ const streamResponse = (
   expectedBytes: number,
   attempt: number,
   onAccepted: (bytes: number) => Effect.Effect<number>,
+  flag: "w" | "a",
 ): Effect.Effect<void, ArtifactDownloadError, FileSystem.FileSystem> =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
@@ -204,7 +248,7 @@ const streamResponse = (
         )
       }),
       Stream.run(
-        fs.sink(destination, { flag: "w", mode: 0o600 }).pipe(
+        fs.sink(destination, { flag, mode: 0o600 }).pipe(
           Sink.mapError(() =>
             downloadError("filesystem", "unable to write downloaded artifact")
           ),
@@ -266,6 +310,7 @@ const sequentialAttempt = (
   input: ArtifactDownloadInput,
   staging: string,
   attempt: number,
+  received: Ref.Ref<number>,
 ): Effect.Effect<
   void,
   ArtifactDownloadError,
@@ -306,7 +351,11 @@ const sequentialAttempt = (
       staging,
       input.bytes,
       attempt,
-      (bytes) => Ref.updateAndGet(accepted, (current) => current + bytes),
+      (bytes) =>
+        Ref.update(received, (current) => current + bytes).pipe(
+          Effect.zipRight(Ref.updateAndGet(accepted, (current) => current + bytes)),
+        ),
+      "w",
     )
   }).pipe(
     Effect.timeoutFail({
@@ -326,17 +375,16 @@ const downloadSequential = (
 > =>
   Effect.gen(function* () {
     const attempt = yield* Ref.make(0)
-    yield* Ref.updateAndGet(attempt, (value) => value + 1).pipe(
-      Effect.flatMap((currentAttempt) =>
-        sequentialAttempt(input, staging, currentAttempt)
-      ),
-      Effect.retry({
-        while: (error) => error.transient,
-        schedule: retrySchedule(
-          input.policy.retryCount,
-          input.policy.retryDelay,
+    const received = yield* Ref.make(0)
+    yield* retryTransfer(
+      input.policy,
+      isTransient,
+      Ref.get(received),
+      Ref.updateAndGet(attempt, (value) => value + 1).pipe(
+        Effect.flatMap((currentAttempt) =>
+          sequentialAttempt(input, staging, currentAttempt, received)
         ),
-      }),
+      ),
     )
     yield* validateCompleteFile(input, staging)
   })
@@ -467,6 +515,25 @@ const updateSegmentedProgress = (
     ),
   )
 
+const partBytes = (
+  part: string,
+  rangeBytes: number,
+): Effect.Effect<number, ArtifactDownloadError, FileSystem.FileSystem> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const info = yield* fs.stat(part).pipe(Effect.option)
+    if (Option.isNone(info)) return 0
+    const bytes = Number(info.value.size)
+    if (bytes <= rangeBytes) return bytes
+    yield* fs.remove(part).pipe(
+      Effect.mapError(() =>
+        downloadError("filesystem", "unable to discard an oversized range part")
+      ),
+    )
+    return 0
+  })
+
+/** A part keeps the bytes it has, so a retry or a later download asks only for the rest of its range. */
 const downloadRange = (
   input: ArtifactDownloadInput,
   range: Range,
@@ -480,18 +547,22 @@ const downloadRange = (
 > =>
   Effect.gen(function* () {
     const attempt = yield* Ref.make(0)
+    const received = yield* Ref.make(0)
+    const rangeBytes = range.end - range.start + 1
     const once = Effect.gen(function* () {
       const currentAttempt = yield* Ref.updateAndGet(attempt, (value) => value + 1)
+      const kept = yield* partBytes(part, rangeBytes)
       yield* updateSegmentedProgress(
         input,
         progress,
         range.index,
-        () => 0,
+        () => kept,
         currentAttempt,
       )
+      if (kept === rangeBytes) return
       const response = yield* rangeRequest(
         input,
-        range,
+        { index: range.index, start: range.start + kept, end: range.end },
         representation.etag,
         false,
       ).pipe(
@@ -504,23 +575,22 @@ const downloadRange = (
         "Segmented",
         response,
         part,
-        range.end - range.start + 1,
+        rangeBytes - kept,
         currentAttempt,
         (bytes) =>
-          progress.reporting.withPermits(1)(
-            Ref.modify(progress.acceptedByPart, (parts) => {
-              const updated = [...parts]
-              updated[range.index] = updated[range.index]! + bytes
-              return [
-                updated.reduce((sum, value) => sum + value, 0),
-                updated,
-              ] as const
-            }).pipe(
-              Effect.tap((acceptedBytes) =>
-                report(input, "Segmented", acceptedBytes, currentAttempt)
-              ),
-            ),
+          Ref.update(received, (current) => current + bytes).pipe(
+            Effect.zipRight(progress.reporting.withPermits(1)(
+              Ref.modify(progress.acceptedByPart, (parts) => {
+                const updated = [...parts]
+                updated[range.index] = updated[range.index]! + bytes
+                return [
+                  updated.reduce((sum, value) => sum + value, 0),
+                  updated,
+                ] as const
+              }),
+            )),
           ),
+        "a",
       )
     }).pipe(
       Effect.timeoutFail({
@@ -529,15 +599,7 @@ const downloadRange = (
           downloadError("stream", `range ${range.index} timed out`, true),
       }),
     )
-    yield* once.pipe(
-      Effect.retry({
-        while: (error) => error.transient,
-        schedule: retrySchedule(
-          input.policy.retryCount,
-          input.policy.retryDelay,
-        ),
-      }),
-    )
+    yield* retryTransfer(input.policy, isTransient, Ref.get(received), once)
   })
 
 const assembleRanges = (
@@ -605,20 +667,22 @@ const downloadSegmented = (
       )
     }
     const path = yield* Path.Path
-    const representation = yield* probeRanges(input).pipe(
-      Effect.timeoutFail({
-        duration: input.policy.attemptTimeout,
-        onTimeout: () =>
-          downloadError("stream", "range probe timed out", true),
-      }),
-      Effect.retry({
-        while: (error) =>
-          error._tag === "ArtifactDownloadError" && (error.transient || error.phase === "protocol"),
-        schedule: retrySchedule(
-          input.policy.retryCount,
-          input.policy.retryDelay,
-        ),
-      }),
+    const probeAttempt = yield* Ref.make(0)
+    // Each attempt reports, so an owner watching for a stuck startup sees the download is still trying.
+    const representation = yield* retryTransfer(
+      input.policy,
+      (error) =>
+        error._tag === "ArtifactDownloadError" && (error.transient || error.phase === "protocol"),
+      Effect.succeed(0),
+      Ref.updateAndGet(probeAttempt, (value) => value + 1).pipe(
+        Effect.flatMap((attempt) => report(input, "Segmented", 0, attempt)),
+        Effect.zipRight(probeRanges(input)),
+        Effect.timeoutFail({
+          duration: input.policy.attemptTimeout,
+          onTimeout: () =>
+            downloadError("stream", "range probe timed out", true),
+        }),
+      ),
     )
     const ranges = Array.from(
       { length: Math.ceil(input.bytes / strategy.chunkBytes) },
@@ -658,15 +722,11 @@ export const downloadArtifact = (
       if (
         !Number.isSafeInteger(input.bytes) ||
         input.bytes <= 0 ||
-        !/^[a-f0-9]{64}$/.test(input.sha256) ||
-        (
-          !Number.isSafeInteger(input.policy.retryCount) ||
-          input.policy.retryCount < 0
-        )
+        !/^[a-f0-9]{64}$/.test(input.sha256)
       ) {
         return yield* downloadError(
           "protocol",
-          "artifact bytes, SHA-256, and retry count must be valid",
+          "artifact bytes and SHA-256 must be valid",
         )
       }
       const fs = yield* FileSystem.FileSystem
@@ -688,11 +748,10 @@ export const downloadArtifact = (
           "download destination already exists",
         )
       }
+      const partial = path.join(parent, partialDirectoryName(input.sha256))
       return yield* Effect.acquireUseRelease(
-        fs.makeTempDirectory({
-          directory: parent,
-          prefix: ".artifact-download-",
-        }).pipe(
+        fs.makeDirectory(partial, { recursive: true, mode: 0o700 }).pipe(
+          Effect.as(partial),
           Effect.mapError(() =>
             downloadError("filesystem", "unable to create download staging directory")
           ),
@@ -748,9 +807,18 @@ export const downloadArtifact = (
               }
             })
           }),
-        (directory) =>
-          fs.remove(directory, { recursive: true, force: true }).pipe(
-            Effect.catchAll(() => Effect.void),
-          ),
+        // An interrupted or transiently failed transfer keeps its parts for the next download to resume.
+        (directory, exit) =>
+          Exit.isFailure(exit) && Exit.match(exit, {
+            onSuccess: () => false,
+            onFailure: (cause) => Option.match(Cause.failureOption(cause), {
+              onNone: () => Cause.isInterruptedOnly(cause),
+              onSome: (error) => error.transient,
+            }),
+          })
+            ? Effect.void
+            : fs.remove(directory, { recursive: true, force: true }).pipe(
+              Effect.catchAll(() => Effect.void),
+            ),
       )
     })

@@ -5,7 +5,7 @@ import * as Path from "@effect/platform/Path"
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem"
 import * as NodePath from "@effect/platform-node/NodePath"
 import { createHash } from "node:crypto"
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Effect, Fiber, Layer, Option } from "effect"
@@ -13,6 +13,7 @@ import { describe, expect, it } from "vitest"
 import {
   defaultArtifactDownloadPolicy,
   downloadArtifact,
+  partialDirectoryName,
   type ArtifactDownloadPolicy,
 } from "./artifact-download"
 
@@ -219,9 +220,9 @@ describe("artifact downloader", () => {
   })
 
   it.each([
-    { invalidProbe: true, shiftedBounds: false, expectedRequests: 3 },
-    { invalidProbe: false, shiftedBounds: false, expectedRequests: 4 },
-    { invalidProbe: false, shiftedBounds: true, expectedRequests: 4 },
+    { invalidProbe: true, shiftedBounds: false, expectedRequests: 1 },
+    { invalidProbe: false, shiftedBounds: false, expectedRequests: 2 },
+    { invalidProbe: false, shiftedBounds: true, expectedRequests: 2 },
   ])("rejects inconsistent ranges without publishing ($invalidProbe, $shiftedBounds)", async ({ invalidProbe, shiftedBounds, expectedRequests }) => {
     const bytes = new TextEncoder().encode("inconsistent range")
     const root = await mkdtemp(join(tmpdir(), "artifact-download-test-"))
@@ -255,7 +256,7 @@ describe("artifact downloader", () => {
           chunkBytes: 8,
           fallbackToSequential: true,
         },
-        policy: policy({ retryDelay: "1 millis" }),
+        policy: policy({ retryDelay: "1 millis", retryWindow: "0 millis" }),
         onProgress: Option.none(),
         onVerificationProgress: Option.none(),
       }).pipe(Effect.flip))
@@ -316,20 +317,30 @@ describe("artifact downloader", () => {
     }
   })
 
-  it("removes all staging state when the download is interrupted", async () => {
-    const bytes = new TextEncoder().encode("interrupted artifact")
+  it("keeps the received parts when the download is interrupted", async () => {
+    const bytes = new TextEncoder().encode("0123456789abcdef")
     const root = await mkdtemp(join(tmpdir(), "artifact-download-test-"))
     let started!: () => void
-    const requestStarted = new Promise<void>((resolve) => {
+    const secondRangeStarted = new Promise<void>((resolve) => {
       started = resolve
     })
     const server = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,
-      fetch: async () => {
-        started()
-        await Bun.sleep(10_000)
-        return new Response(bytes)
+      fetch: async (request) => {
+        const { start, end } = parseRange(request.headers.get("range")!)
+        if (start === 8) {
+          started()
+          await Bun.sleep(10_000)
+        }
+        const part = bytes.slice(start, end + 1)
+        return new Response(part, {
+          status: 206,
+          headers: {
+            "content-range": `bytes ${start}-${end}/${bytes.byteLength}`,
+            "content-length": String(part.byteLength),
+          },
+        })
       },
     })
     try {
@@ -338,14 +349,160 @@ describe("artifact downloader", () => {
         destination: join(root, "artifact"),
         bytes: bytes.byteLength,
         sha256: sha256(bytes),
-        strategy: { _tag: "Sequential" },
+        strategy: { _tag: "Segmented", concurrency: 1, chunkBytes: 8, fallbackToSequential: false },
         policy: policy(),
         onProgress: Option.none(),
         onVerificationProgress: Option.none(),
       }).pipe(Effect.provide(DownloadLayer)))
-      await requestStarted
+      await secondRangeStarted
       await Effect.runPromise(Fiber.interrupt(fiber))
-      expect(await readdir(root)).toEqual([])
+      const partial = join(root, partialDirectoryName(sha256(bytes)))
+      expect(await readdir(root)).toEqual([partialDirectoryName(sha256(bytes))])
+      expect(new TextDecoder().decode(await readFile(join(partial, "part-0")))).toBe("01234567")
+    } finally {
+      server.stop(true)
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("resumes kept parts and dropped ranges from their received bytes", async () => {
+    const bytes = new TextEncoder().encode("0123456789abcdefghijklmnopqrstuv")
+    const root = await mkdtemp(join(tmpdir(), "artifact-download-test-"))
+    const partial = join(root, partialDirectoryName(sha256(bytes)))
+    await mkdir(partial)
+    await writeFile(join(partial, "part-0"), "01234567")
+    await writeFile(join(partial, "part-1"), "89ab")
+    const requested: string[] = []
+    let dropped = false
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: (request) => {
+        const header = request.headers.get("range")!
+        requested.push(header)
+        const { start, end } = parseRange(header)
+        const part = bytes.slice(start, end + 1)
+        const headers = {
+          "content-range": `bytes ${start}-${end}/${bytes.byteLength}`,
+          "content-length": String(part.byteLength),
+        }
+        if (start === 16 && !dropped) {
+          dropped = true
+          return new Response(new ReadableStream({
+            async start(controller) {
+              controller.enqueue(part.slice(0, 3))
+              await Bun.sleep(50)
+              controller.error(new Error("connection reset"))
+            },
+          }), { status: 206, headers })
+        }
+        return new Response(part, { status: 206, headers })
+      },
+    })
+    try {
+      const destination = join(root, "artifact")
+      await run(downloadArtifact({
+        url: `http://127.0.0.1:${server.port}/artifact`,
+        destination,
+        bytes: bytes.byteLength,
+        sha256: sha256(bytes),
+        strategy: { _tag: "Segmented", concurrency: 1, chunkBytes: 8, fallbackToSequential: false },
+        policy: policy({ retryDelay: "1 millis" }),
+        onProgress: Option.none(),
+        onVerificationProgress: Option.none(),
+      }))
+      expect(requested).toEqual([
+        "bytes=0-0",
+        "bytes=12-15",
+        "bytes=16-23",
+        "bytes=19-23",
+        "bytes=24-31",
+      ])
+      expect(new Uint8Array(await readFile(destination))).toEqual(bytes)
+      expect(await readdir(root)).toEqual(["artifact"])
+    } finally {
+      server.stop(true)
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("keeps retrying an unavailable range for its retry window", async () => {
+    const bytes = new TextEncoder().encode("0123456789abcdef")
+    const root = await mkdtemp(join(tmpdir(), "artifact-download-test-"))
+    const outageEnds = Date.now() + 300
+    let unavailable = 0
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: (request) => {
+        const { start, end } = parseRange(request.headers.get("range")!)
+        if (start === 8 && Date.now() < outageEnds) {
+          unavailable += 1
+          return new Response("unavailable", { status: 503 })
+        }
+        const part = bytes.slice(start, end + 1)
+        return new Response(part, {
+          status: 206,
+          headers: {
+            "content-range": `bytes ${start}-${end}/${bytes.byteLength}`,
+            "content-length": String(part.byteLength),
+          },
+        })
+      },
+    })
+    try {
+      const destination = join(root, "artifact")
+      await run(downloadArtifact({
+        url: `http://127.0.0.1:${server.port}/artifact`,
+        destination,
+        bytes: bytes.byteLength,
+        sha256: sha256(bytes),
+        strategy: { _tag: "Segmented", concurrency: 2, chunkBytes: 8, fallbackToSequential: false },
+        policy: policy({ retryDelay: "5 millis", retryMaxDelay: "40 millis", retryWindow: "5 seconds" }),
+        onProgress: Option.none(),
+        onVerificationProgress: Option.none(),
+      }))
+      expect(unavailable).toBeGreaterThan(3)
+      expect(new Uint8Array(await readFile(destination))).toEqual(bytes)
+    } finally {
+      server.stop(true)
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("gives up once the retry window passes without progress", async () => {
+    const bytes = new TextEncoder().encode("0123456789abcdef")
+    const root = await mkdtemp(join(tmpdir(), "artifact-download-test-"))
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: (request) => {
+        const { start, end } = parseRange(request.headers.get("range")!)
+        if (start === 8) return new Response("unavailable", { status: 503 })
+        const part = bytes.slice(start, end + 1)
+        return new Response(part, {
+          status: 206,
+          headers: {
+            "content-range": `bytes ${start}-${end}/${bytes.byteLength}`,
+            "content-length": String(part.byteLength),
+          },
+        })
+      },
+    })
+    try {
+      const error = await run(downloadArtifact({
+        url: `http://127.0.0.1:${server.port}/artifact`,
+        destination: join(root, "artifact"),
+        bytes: bytes.byteLength,
+        sha256: sha256(bytes),
+        strategy: { _tag: "Segmented", concurrency: 2, chunkBytes: 8, fallbackToSequential: false },
+        policy: policy({ retryDelay: "5 millis", retryMaxDelay: "10 millis", retryWindow: "100 millis" }),
+        onProgress: Option.none(),
+        onVerificationProgress: Option.none(),
+      }).pipe(Effect.flip))
+      expect(error.message).toBe("range 1 returned HTTP 503, expected 206")
+      expect(error.transient).toBe(true)
+      expect(await readdir(join(root, partialDirectoryName(sha256(bytes))))).toEqual(["part-0"])
     } finally {
       server.stop(true)
       await rm(root, { recursive: true, force: true })
@@ -380,7 +537,7 @@ describe("artifact downloader", () => {
       }).pipe(Effect.flip))
       expect(error.phase).toBe("stream")
       expect(error.message).toContain("total deadline")
-      expect(await readdir(root)).toEqual([])
+      expect(await readdir(root)).toEqual([partialDirectoryName(sha256(bytes))])
     } finally {
       server.stop(true)
       await rm(root, { recursive: true, force: true })
