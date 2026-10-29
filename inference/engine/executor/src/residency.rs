@@ -8,9 +8,10 @@ use crate::device_table::{
     DeviceTable, KeptRows, ResidentTable, StoredRows, TileRun, TileSource, TilesBrought,
 };
 use crate::domain::ClaimRefusal;
+use crate::planning::{ImportBacking, ImportPlan};
 use crate::programs::ProgramSubmission;
 use crate::programs::native_import::NativeImportProgram;
-use crate::resources::ImportWindow;
+use crate::resources::{ImportSource, ImportWindow};
 use crate::stored_table::StoredTable;
 use crate::{
     AllocationError, ExecutionPlan, ImportLaunchInputs, ImportProgram, InvariantError,
@@ -401,8 +402,59 @@ struct OrderedImport {
     plan: WeightPlan,
     source: Arc<FileSource>,
     offset: u64,
-    end: u64,
+    backing: ImportBacking,
     target: DType,
+}
+
+impl OrderedImport {
+    fn of(
+        artifact: &GgufArtifact,
+        weights: &[WeightPlan],
+        activation: DType,
+        device: &Device,
+    ) -> Result<Vec<Self>, WeightImportError> {
+        let mut seen = HashSet::<WeightStorageIdentity>::new();
+        let mut ordered = Vec::new();
+        // A host-placed weight takes no import entry (`import_progressive`).
+        // Nor is a streamed table imported: its rows reach the device as
+        // steps name them (`stream_table`).
+        for plan in weights
+            .iter()
+            .filter(|plan| !plan.placed_on_host() && plan.streamed.is_none())
+        {
+            if !seen.insert(plan.storage_identity()) {
+                continue;
+            }
+            let tensor = ImportArtifactTensor::from_gguf(artifact, &plan.descriptor)?;
+            let (source, offset, length) = tensor.stored().file_range();
+            let end = offset
+                .checked_add(length)
+                .ok_or_else(|| invalid("source range overflows"))?;
+            let backing = if ImportSource::reads_in_place(plan, tensor.stored(), device)
+                .map_err(WeightImportError::Allocation)?
+            {
+                ImportBacking::Mapped(offset..end)
+            } else {
+                ImportBacking::Staged(plan.source_bytes)
+            };
+            ordered.push(OrderedImport {
+                plan: plan.clone(),
+                source: source.clone(),
+                offset,
+                backing,
+                target: plan.resident.dtype().unwrap_or(activation),
+            });
+        }
+        // A split component's tensors live in several files: order each
+        // file's tensors contiguously so windows coalesce within a file.
+        ordered.sort_by(|left, right| {
+            left.source
+                .path()
+                .cmp(right.source.path())
+                .then(left.offset.cmp(&right.offset))
+        });
+        Ok(ordered)
+    }
 }
 
 /// Coarse host costs of the most recent mapped component import. The caller
@@ -1020,50 +1072,11 @@ impl ResidencyStore {
         if self.device.backend() != seismic::BackendName::Metal || weights.is_empty() {
             return Ok(());
         }
-        let mut seen = HashSet::<WeightStorageIdentity>::new();
-        let mut ordered = Vec::new();
-        // A host-placed weight takes no import entry (`import_progressive`).
-        // Nor is a streamed table imported: its rows reach the device as
-        // steps name them (`stream_table`).
-        for plan in weights
-            .iter()
-            .filter(|plan| !plan.placed_on_host() && plan.streamed.is_none())
-        {
-            if !seen.insert(plan.storage_identity()) {
-                continue;
-            }
-            let tensor = ImportArtifactTensor::from_gguf(artifact, &plan.descriptor)?;
-            let (source, offset, length) = tensor.stored().file_range();
-            let end = offset
-                .checked_add(length)
-                .ok_or_else(|| invalid("source range overflows"))?;
-            ordered.push(OrderedImport {
-                plan: plan.clone(),
-                source: source.clone(),
-                offset,
-                end,
-                target: plan.resident.dtype().unwrap_or(activation),
-            });
-        }
-        // A split component's tensors live in several files: order each
-        // file's tensors contiguously so windows coalesce within a file.
-        ordered.sort_by(|left, right| {
-            left.source
-                .path()
-                .cmp(right.source.path())
-                .then(left.offset.cmp(&right.offset))
-        });
-        // A window maps at most the component's largest stored tensor. A
-        // streamed table counts though it is not imported here, so the
-        // tensors around it are mapped in the windows a load that imports it
-        // maps them in.
-        let largest = weights
-            .iter()
-            .filter(|plan| !plan.placed_on_host())
-            .try_fold(0, |largest, plan| {
-                plan.stored_bytes().map(|bytes| bytes.max(largest))
-            })
-            .map_err(invalid)?;
+        let ordered = OrderedImport::of(artifact, weights, activation, &self.device)?;
+        // The same source bound drives admission and window construction.
+        // Whole streamed tables never enlarge this bound: only their slots
+        // (or no upload at all) are source storage.
+        let imports = ImportPlan::new(weights.iter());
         let mut report = MappedImportReport::default();
         // Measurement only: timed Metal encoders change the device path, so
         // these numbers attribute work but are not production load timings.
@@ -1073,18 +1086,19 @@ impl ResidencyStore {
         let mut first = 0;
         while first < ordered.len() {
             let source = ordered[first].source.clone();
-            let start = ordered[first].offset;
-            let mut end = ordered[first].end;
-            let mut last = first + 1;
-            while last < ordered.len()
-                && Arc::ptr_eq(&source, &ordered[last].source)
-                && ordered[last].end.saturating_sub(start) <= largest
-            {
-                end = end.max(ordered[last].end);
-                last += 1;
-            }
+            let batch_plan = imports
+                .batch(
+                    ordered[first..]
+                        .iter()
+                        .map(|item| (Arc::as_ptr(&item.source), item.backing.clone())),
+                )
+                .expect("the remaining import sources are nonempty");
+            let last = first + batch_plan.len;
             let mapping = Instant::now();
-            let window = ImportWindow::new(&self.execution, &self.device, source, start, end)
+            let window = batch_plan
+                .mapping
+                .map(|range| ImportWindow::map(&self.device, source, range.start, range.end))
+                .transpose()
                 .map_err(WeightImportError::Allocation)?;
             report.mapping += mapping.elapsed();
             report.windows += 1;
@@ -1097,7 +1111,7 @@ impl ResidencyStore {
                     artifact,
                     &item.plan.descriptor,
                     item.target,
-                    Some(&window),
+                    window.as_ref(),
                 )? {
                     ImportPreparation::Resident(_) => {}
                     ImportPreparation::Pending {
@@ -1539,6 +1553,105 @@ fn validate_dense(stored: &StoredTensor) -> Result<usize, WeightImportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Uses the real shard headers and the production source ordering, without
+    /// allocating resident weights or reading the sparse tensor payloads.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn catalog_flash_next_import_windows_fit_the_admitted_peak() {
+        use magnitude_artifacts::{Package, catalog_headers::ComponentRole};
+        use magnitude_family_common::headers;
+        use magnitude_family_contracts::ModelFamily;
+        use magnitude_family_qwen4exp::Qwen4ExpFamily;
+
+        let devices = seismic::Devices::discover(&[]).unwrap();
+        let device = devices.open_backend(seismic::BackendName::Metal).unwrap();
+        for model in [
+            "qwen3.8-flash-next:gguf:q4",
+            "qwen3.8-flash-next:gguf:nvfp4",
+        ] {
+            let component = headers::index()
+                .iter()
+                .find(|component| {
+                    component.model == model && component.role == ComponentRole::Target
+                })
+                .unwrap();
+            let package =
+                Package::open_without_projector(component.file(&headers::root())).unwrap();
+            let definition = Qwen4ExpFamily
+                .inspect(package.target().directory(), None, package.identity())
+                .unwrap();
+            let load = crate::ModelLoadPlan::derive(
+                &package.manifest(),
+                &definition,
+                crate::ComponentSelection {
+                    head: false,
+                    vision: false,
+                },
+                crate::resident_layout(crate::ExecutionPath::Native, seismic::BackendName::Metal),
+            )
+            .unwrap();
+            let imports = ImportPlan::new(load.target());
+            let peak = imports.peak_bytes().unwrap();
+            let ordered =
+                OrderedImport::of(package.target(), load.target(), DType::BF16, &device).unwrap();
+            // Demonstrate the actual regression's precondition: a streamed
+            // tensor's file extent exceeds the admitted import source peak.
+            assert!(
+                load.target()
+                    .iter()
+                    .filter(|weight| weight.streamed.is_some())
+                    .any(|weight| {
+                        weight
+                            .upload
+                            .canonical_byte_len(&weight.stored_shape())
+                            .unwrap()
+                            > peak
+                    })
+            );
+            let mut first = 0;
+            let mut windows = 0;
+            let mut largest = 0;
+            while first < ordered.len() {
+                let batch = imports
+                    .batch(
+                        ordered[first..]
+                            .iter()
+                            .map(|item| (Arc::as_ptr(&item.source), item.backing.clone())),
+                    )
+                    .unwrap();
+                let last = first + batch.len;
+                let staged = ordered[first..last]
+                    .iter()
+                    .map(|item| match item.backing {
+                        ImportBacking::Staged(bytes) => bytes,
+                        ImportBacking::Mapped(_) => 0,
+                    })
+                    .sum::<u64>();
+                let mapped = batch.mapping.map_or(0, |range| {
+                    let source = &ordered[first].source;
+                    let window = source
+                        .map_window(range.start, range.end - range.start)
+                        .unwrap();
+                    // Exercise Metal's mapping of precisely the scheduled
+                    // span too; no tensor payload is touched.
+                    ImportWindow::map(&device, source.clone(), range.start, range.end).unwrap();
+                    window.mapped_len() as u64
+                });
+                assert!(
+                    mapped + staged <= peak,
+                    "{model}: {mapped} mapped + {staged} staged > {peak}"
+                );
+                largest = largest.max(mapped + staged);
+                windows += 1;
+                first = last;
+            }
+            eprintln!(
+                "{model}: {} weights, {windows} batches, largest source backing {largest}, admitted {peak}",
+                ordered.len()
+            );
+        }
+    }
 
     #[test]
     fn checked_element_count_rejects_invalid_shapes() {
