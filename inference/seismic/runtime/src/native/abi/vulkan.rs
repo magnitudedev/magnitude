@@ -142,13 +142,15 @@ pub(super) fn header(features: VulkanFeatures) -> String {
     header
 }
 
-/// The argument block (buffer addresses, the scalar-result address, then
-/// the words: there is no words buffer), read-only flags, workgroup size and
-/// group-memory views of a source with `buffers` buffers.
+/// The push constants (the argument block's address and the device's
+/// tables buffer's, `<seismic/tables.glsl>`), the argument block (buffer
+/// addresses, the scalar-result address, then the words: there is no words
+/// buffer), read-only flags, workgroup size and group-memory views of a
+/// source with `buffers` buffers.
 pub(super) fn tail(buffers: usize, read_only: impl Iterator<Item = bool>) -> String {
     let mut tail = format!("#define SEISMIC_BUFFER_SCALAR_RESULTS {buffers}\n");
     tail.push_str(
-        "layout(push_constant, scalar) uniform seismic_push_t { uint64_t seismic_arguments; };\n\
+        "layout(push_constant, scalar) uniform seismic_push_t { uint64_t seismic_arguments; uint64_t seismic_tables; };\n\
          layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer seismic_argument_block_t { uint64_t w[]; };\n\
          #define SEISMIC_PTR(index) (seismic_argument_block_t(seismic_arguments).w[index])\n",
     );

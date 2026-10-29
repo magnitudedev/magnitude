@@ -69,6 +69,11 @@ pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
     ),
 ];
 
+/// The bytes of the Vulkan tables buffer, whose layout `<seismic/tables.glsl>`
+/// declares (`seismic_tables_t`): a Vulkan device holds them read-only at the
+/// push constant `seismic_tables`.
+pub const VULKAN_TABLES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tables.bin"));
+
 #[derive(Debug)]
 pub enum LoadError {
     Io(std::io::Error),

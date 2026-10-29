@@ -4357,6 +4357,7 @@ dependencies = [
  "ash",
  "glslang",
  "seismic-compiler",
+ "seismic-lang",
  "seismic-native-target",
  "spirv-tools",
 ]

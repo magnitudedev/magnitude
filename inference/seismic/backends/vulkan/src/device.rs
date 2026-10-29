@@ -111,6 +111,9 @@ pub(crate) struct Inner {
     pub(crate) device: ash::Device,
     pub(crate) facts: Facts,
     pub(crate) memory: Memory,
+    /// The tables buffer (`seismic_lang::source::VULKAN_TABLES`), every
+    /// launch's second push constant.
+    pub(crate) tables: Range,
     pub(crate) layout: vk::PipelineLayout,
     pub(crate) cache: vk::PipelineCache,
     pub(crate) timeline: vk::Semaphore,
@@ -268,6 +271,9 @@ impl Device {
         let device = Self {
             inner: Arc::new(Inner::create(instance, physical, facts)?),
         };
+        device
+            .write_tables()
+            .map_err(|error| OpenError::Creation(error.to_string()))?;
         registry.opened.push(device.clone());
         Ok(device)
     }
@@ -373,6 +379,54 @@ impl Device {
             )?;
             done += length;
         }
+        Ok(())
+    }
+
+    /// Fill the tables buffer, before the device is shared: by
+    /// `vkCmdUpdateBuffer`, which takes no staging (a staging block taken
+    /// before the device has its accounts would be charged to none).
+    fn write_tables(&self) -> Result<(), ExecutionError> {
+        /// What one `vkCmdUpdateBuffer` writes at most.
+        const UPDATE_BYTES: usize = 65536;
+        let tables = &self.inner.tables;
+        let device = &self.inner.device;
+        let command = {
+            let mut recording = self.recording();
+            self.command(&mut recording, vk::CommandBufferLevel::PRIMARY)?
+        };
+        unsafe {
+            call(
+                device.begin_command_buffer(
+                    command,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                ),
+                "vkBeginCommandBuffer",
+            )?;
+            for (index, chunk) in seismic_lang::source::VULKAN_TABLES
+                .chunks(UPDATE_BYTES)
+                .enumerate()
+            {
+                device.cmd_update_buffer(
+                    command,
+                    tables.raw(),
+                    tables.offset() + (index * UPDATE_BYTES) as u64,
+                    chunk,
+                );
+            }
+            barrier(
+                device,
+                command,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                vk::AccessFlags2::MEMORY_READ,
+            );
+            call(device.end_command_buffer(command), "vkEndCommandBuffer")?;
+        }
+        let value = self.submit(command)?;
+        self.wait(value)?;
+        self.recording().free_command(command);
         Ok(())
     }
 
@@ -886,10 +940,19 @@ impl Inner {
                 return Err(OpenError::Creation(reason.into()));
             }
         };
+        let tables =
+            match memory.resident(&device, seismic_lang::source::VULKAN_TABLES.len() as u64) {
+                Ok(tables) => tables,
+                Err(error) => {
+                    unsafe { device.destroy_device(None) };
+                    return Err(OpenError::Creation(error.to_string()));
+                }
+            };
         let mut inner = Self {
             device,
             facts,
             memory,
+            tables,
             layout: vk::PipelineLayout::null(),
             cache: vk::PipelineCache::null(),
             timeline: vk::Semaphore::null(),
@@ -916,7 +979,7 @@ impl Inner {
         let ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
-            .size(8)];
+            .size(16)];
         inner.layout = creation(
             unsafe {
                 device.create_pipeline_layout(
@@ -1031,6 +1094,7 @@ impl Drop for Inner {
             {
                 device.destroy_command_pool(staging.pool, None);
             }
+            self.memory.destroy_resident(device, &self.tables);
             self.memory.destroy(device);
             device.destroy_semaphore(self.timeline, None);
             device.destroy_pipeline_cache(self.cache, None);
