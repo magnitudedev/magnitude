@@ -6,7 +6,7 @@ It is expected that contributions involve AI-generated content. However, to faci
 
 Issues and PRs should be created to address a real, user-facing suggestion or concern - not arbitrary code quality or internal tooling problems, unless those actually affect you as a contributor and are pertinent to a contribution you are making.
 
-If a PR involves an implementation that is one-shot by an agent with no meaningful human steering or validation, it is preferrable to submit an Issue instead.
+If a PR involves an implementation that is one-shot by an agent with no meaningful human steering or validation, it is preferable to submit an Issue instead.
 
 Any PR should involve:
 - Clear justification for the change and the implemented approach
@@ -16,4 +16,4 @@ Any PR should involve:
 - Explanation of testing conducted - preferably "AI-manual" or even better "Human-manual" rather than strawman unit tests
 - Do not include unit tests that do not demonstrate a meaningful property of the system
 
-No particular domains of the codebase are necessarily on or off-limits for contributions, but targetted, clearly scoped changes that solve a specific bug are most likely to be accepted.
+No particular domains of the codebase are necessarily on or off-limits for contributions, but targeted, clearly scoped changes that solve a specific bug are most likely to be accepted.
