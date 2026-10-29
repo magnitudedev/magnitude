@@ -1,3 +1,4 @@
+import { FileSystem } from "@effect/platform"
 import { Effect, Option, Schema } from "effect"
 import { dirname, join } from "node:path"
 import { NativeHost } from "./index"
@@ -27,7 +28,11 @@ const lockingUnsupported = "Cannot acquire ownership lock"
  */
 export const holdContainerData = (dataDirectory: string) => Effect.gen(function* () {
   const native = yield* NativeHost
+  const fs = yield* FileSystem.FileSystem
   const path = join(dataDirectory, "container.lock")
+  // Kubernetes' fsGroup makes volume files group-writable at every mount; the lock must be private to
+  // its owner, so the owner makes it private again. Another user's lock can't be changed, and is refused.
+  yield* fs.chmod(path, 0o600).pipe(Effect.ignore)
   const lock = yield* native.acquireOwnership(path).pipe(Effect.catchTag("NativeHostUnavailable", error => error.message === lockingUnsupported
     ? Effect.logWarning(`The data volume can't be locked, so nothing stops a second container from using it: ${error.message}`).pipe(Effect.as(Option.some({})))
     : new ContainerDataLockUnsafe({ lock: path })))
