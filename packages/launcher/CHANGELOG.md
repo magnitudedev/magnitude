@@ -1,5 +1,19 @@
 # @magnitudedev/cli
 
+## 0.2.14
+
+### Patch Changes
+
+- [`5a61bfd`](https://github.com/magnitudedev/magnitude/commit/5a61bfde3f9443b83156b2e1917238d0867dca92) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Sort the model catalog by Fastest, using each model's estimated speed on your machine at 50K context, or by Most intelligent, using the catalog's intelligence score. Models without an estimate or score go last.
+
+- [`5a61bfd`](https://github.com/magnitudedev/magnitude/commit/5a61bfde3f9443b83156b2e1917238d0867dca92) Thanks [@anerli](https://github.com/anerli)! - Quantized GGUF models decode faster on CPU: each token takes about 13% less time for a Q4 Qwen3.5 4B on an M4 Pro.
+
+- [`5a61bfd`](https://github.com/magnitudedev/magnitude/commit/5a61bfde3f9443b83156b2e1917238d0867dca92) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Downloading the inference engine survives outages and slow connections. Each part retries until 10 minutes pass without data (it gave up after two quick retries before), partial downloads resume after a restart instead of starting over, and the service keeps retrying a failed download while `magnitude status` shows the error and when it tries again. Startup is no longer cancelled after five minutes while a download is still progressing.
+
+- [`5a61bfd`](https://github.com/magnitudedev/magnitude/commit/5a61bfde3f9443b83156b2e1917238d0867dca92) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Launching OpenCode 2 with a Magnitude model works again. OpenCode 2 dropped `--model` and shares one background server across launches, so Magnitude now detects the installed version and starts OpenCode 2 on its own server with the model set in its config. OpenCode 1 launches as before.
+
+- [`5a61bfd`](https://github.com/magnitudedev/magnitude/commit/5a61bfde3f9443b83156b2e1917238d0867dca92) Thanks [@anerli](https://github.com/anerli)! - Fix Qwen3.8 Flash Next failing to load on Apple silicon with "prepared 105 bytes but the ordered program plan charged 102" ([#227](https://github.com/magnitudedev/magnitude/issues/227)). Kernel memory is now derived instead of counted by hand, so the two counts can no longer disagree.
+
 ## 0.2.13
 
 ### Patch Changes
