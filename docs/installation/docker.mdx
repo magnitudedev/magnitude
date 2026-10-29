@@ -161,7 +161,7 @@ docker run -d --name magnitude --restart unless-stopped \
   magnitudedev/magnitude
 ```
 
-`/usr/share/ollama/.ollama/models` is where the Ollama Linux service keeps models; a user's own Ollama uses `~/.ollama/models`. For any other folder of GGUF files, mount it and add it:
+`/usr/share/ollama/.ollama/models` is where the Ollama Linux service keeps models; a user's own Ollama uses `~/.ollama/models`. For any other folder of GGUF files, mount it, for example with `-v /srv/gguf:/models/gguf:ro` in the `docker run` command, and add it:
 
 ```sh
 docker exec magnitude magnitude models folders add /models/gguf
