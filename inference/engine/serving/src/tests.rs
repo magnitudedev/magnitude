@@ -2229,16 +2229,17 @@ async fn anthropic_count_tokens_is_host_only() {
 }
 
 #[tokio::test]
-async fn anthropic_requires_the_supported_protocol_version() {
-    let reply = send(
-        app(Scripted::new(Script::text("hello"))),
-        "/anthropic/v1/messages",
-        &[("anthropic-version", "2024-01-01")],
-        json!({ "model": "test-model", "max_tokens": 32, "messages": [{ "role": "user", "content": "hi" }] }),
-    )
-    .await;
-    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-    assert!(reply.body.contains("unsupported anthropic-version"));
+async fn anthropic_accepts_any_protocol_version_or_none() {
+    for headers in [&[("anthropic-version", "2026-10-21")][..], &[]] {
+        let reply = send(
+            app(Scripted::new(Script::text("hello"))),
+            "/anthropic/v1/messages",
+            headers,
+            json!({ "model": "test-model", "max_tokens": 32, "messages": [{ "role": "user", "content": "hi" }] }),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+    }
 }
 
 #[tokio::test]
