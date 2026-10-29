@@ -1,8 +1,8 @@
 name: Docker image
 
 # Builds the image of a published release from its own .deb and engine, natively per
-# architecture, smoke-tests each, pushes each by digest, then publishes one multi-arch manifest
-# under the release's tags. Called by the release after publication; dispatch it to rebuild a
+# architecture, pushes each by digest (untagged), smoke-tests exactly that digest, then publishes
+# one multi-arch manifest under the release's tags. Called by the release after publication; dispatch it to rebuild a
 # published version or to push to another repository, such as magnitudedev/magnitude-qa.
 on:
   workflow_call:
@@ -22,6 +22,11 @@ on:
         required: false
         type: boolean
         default: true
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: true
+      DOCKERHUB_TOKEN:
+        required: true
   workflow_dispatch:
     inputs:
       version:
@@ -41,7 +46,7 @@ on:
         description: Also move latest, beta or alpha; leave off when rebuilding an older release
         required: false
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: read
@@ -63,12 +68,15 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
-      - name: Only main publishes the official repository
-        if: env.REPOSITORY == 'magnitudedev/magnitude'
-        run: test "$GITHUB_REF" = refs/heads/main
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+      - name: Only main publishes the official repository
+        if: env.REPOSITORY == 'magnitudedev/magnitude'
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          git merge-base --is-ancestor HEAD origin/main
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
@@ -84,34 +92,16 @@ jobs:
           --version "$VERSION" --arch "${{ matrix.arch }}" --output "$RUNNER_TEMP/context"
         env:
           VERSION: ${{ inputs.version }}
-      - name: Build
+      - name: Build and push by digest
         env:
           VERSION: ${{ inputs.version }}
         run: |
           revision=$(jq -r .sourceCommit "$RUNNER_TEMP/context/magnitude-release.json")
-          echo "REVISION=$revision" >> "$GITHUB_ENV"
           docker buildx build \
             --platform "linux/${{ matrix.arch }}" \
             --file packaging/docker/Dockerfile \
             --build-arg "VERSION=$VERSION" \
             --build-arg "REVISION=$revision" \
-            --tag "magnitude-smoke:${{ matrix.arch }}" \
-            --load \
-            "$RUNNER_TEMP/context"
-      - name: Smoke test
-        timeout-minutes: 45
-        env:
-          VERSION: ${{ inputs.version }}
-        run: bash packages/release/scripts/acceptance/test-docker.sh "magnitude-smoke:${{ matrix.arch }}" "$VERSION"
-      - name: Push by digest
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          docker buildx build \
-            --platform "linux/${{ matrix.arch }}" \
-            --file packaging/docker/Dockerfile \
-            --build-arg "VERSION=$VERSION" \
-            --build-arg "REVISION=$REVISION" \
             --output "type=image,name=docker.io/$REPOSITORY,push-by-digest=true,name-canonical=true,push=true" \
             --metadata-file "$RUNNER_TEMP/metadata.json" \
             "$RUNNER_TEMP/context"
@@ -119,7 +109,14 @@ jobs:
           [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
           mkdir -p "$RUNNER_TEMP/digests"
           touch "$RUNNER_TEMP/digests/${digest#sha256:}"
+          echo "IMAGE=docker.io/$REPOSITORY@$digest" >> "$GITHUB_ENV"
           echo "Pushed linux/${{ matrix.arch }} as docker.io/$REPOSITORY@$digest"
+      # The digest stays untagged, and so unpublished, unless this passes.
+      - name: Smoke test the pushed digest
+        timeout-minutes: 45
+        env:
+          VERSION: ${{ inputs.version }}
+        run: bash packages/release/scripts/acceptance/test-docker.sh "$IMAGE" "$VERSION"
       - uses: actions/upload-artifact@v4
         with:
           name: docker-digest-${{ matrix.arch }}

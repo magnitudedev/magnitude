@@ -147,7 +147,9 @@ sudo chown 1000:1000 /srv/magnitude
 docker run -d --name magnitude -p 10100:10100 -v /srv/magnitude:/data magnitudedev/magnitude
 ```
 
-Give each container its own volume. A second container started on a volume that another one is using stops at once and says so.
+Give each container its own volume. A second container started on a volume that another one is using stops at once and says so. On network filesystems that can't lock files, such as some NFS shares and `ReadWriteMany` volumes, nothing stops it, so make sure only one container uses each volume.
+
+Ubuntu's snap of Docker can only mount folders under your home directory; use a named volume, a folder in your home directory, or Docker from docker.com.
 
 ## Use models you already have
 
@@ -319,7 +321,7 @@ docker compose pull && docker compose up -d
 
 Tools that pull new images and recreate containers for you, such as Watchtower, work the same way as long as they keep the volume.
 
-Tags: `latest` is the newest stable release, `beta` and `alpha` the newest prereleases, and each release also has its own tag, such as `magnitudedev/magnitude:0.2.14`, for pinning.
+Tags: `latest` is the newest stable release, `beta` and `alpha` the newest prereleases, and each release also has its own tag, such as `magnitudedev/magnitude:0.2.14`, for pinning. A container on a prerelease is offered that channel's releases and told to pull `magnitudedev/magnitude:beta` or `:alpha`; a pinned container upgrades when you change its tag.
 
 ## Port 10100 is already in use
 

@@ -233,7 +233,10 @@ jobs:
     with:
       version: ${{ needs.preflight.outputs.version }}
       ref: ${{ needs.preflight.outputs.source_commit }}
-    secrets: inherit
+      channel_tag: true
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
   register-metadata:
     needs: preflight
     if: needs.preflight.outputs.action == 'register-metadata'

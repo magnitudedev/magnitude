@@ -327,6 +327,12 @@ describe("network access read at startup", () => {
       expect(config.unknownSetting).toBe(1)
       expect((await readIn(dataDir)).apiKey).toEqual(network.apiKey)
     }))
+  it("saves only the generated key in a container, not the host names from MAGNITUDE_ALLOWED_HOSTS", () =>
+    withDataDir({}, async dataDir => {
+      const network = await Effect.runPromise(readNetworkAccess(dataDir, Option.some({ networkKey: Option.none(), allowedHosts: ["nas.local"] })).pipe(Effect.provide(BunContext.layer)))
+      expect(network.allowedHosts).toEqual(["nas.local"])
+      expect((await saved(dataDir)).network).toEqual({ enabled: true, requireApiKey: true, allowedHosts: [], apiKey: Option.getOrThrow(network.apiKey) })
+    }))
   it("uses MAGNITUDE_NETWORK_KEY in a container without saving it, over a saved key", () =>
     withDataDir({ network: { enabled: true, apiKey: "mag-saved" } }, async dataDir => {
       expect((await readIn(dataDir, "a-key-from-the-environment")).apiKey).toEqual(Option.some("a-key-from-the-environment"))

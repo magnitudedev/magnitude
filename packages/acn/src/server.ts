@@ -119,7 +119,7 @@ import {
   makeHealthResponse,
 } from "./identity"
 import { AcnHost, ServerSettingsLive, type AcnHostApi } from "./server-settings"
-import { containerNetworkConfig, readContainerInstallation, type ContainerInstallation } from "./container"
+import { containerNetworkConfig, readContainerInstallation, savedNetworkForKey, type ContainerInstallation } from "./container"
 import { AcnHarnessConnectionsLive } from "./harness-connections"
 import { AcnOwner } from "./application-owner"
 import { resolveWebAppSource, serveWebApp } from "./web-app"
@@ -485,7 +485,7 @@ const ensureNetworkKey = (dataDir: string, network: NetworkAccess, container: Op
   return makeConfigStorage().pipe(
     Effect.provideService(GlobalStorage, storage), Effect.provide(BunPath.layer),
     Effect.flatMap(config => config.update(current => ({ ...current,
-      network: Option.map(containerNetworkConfig(container, current.network), saved => ({ ...saved, apiKey: saved.apiKey ?? apiKey })) }))),
+      network: Option.map(savedNetworkForKey(container, current.network), saved => ({ ...saved, apiKey: saved.apiKey ?? apiKey })) }))),
     Effect.as({ ...network, apiKey: Option.some(apiKey) }),
     // A container's output is its log, which only those who can already run commands in it read.
     Effect.tap(() => Option.isSome(container)

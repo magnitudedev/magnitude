@@ -1,5 +1,4 @@
-import { FileSystem } from "@effect/platform"
-import { LinuxInstallationKind } from "@magnitudedev/release/linux-package"
+import { isDockerInstallation } from "@magnitudedev/release/linux-package"
 import type { NetworkAccessConfig } from "@magnitudedev/storage"
 import { Effect, Option, Schema } from "effect"
 import { dirname, join } from "node:path"
@@ -20,14 +19,12 @@ const NetworkKey = Schema.String.pipe(Schema.pattern(/^[\x21-\x7E]{16,512}$/))
 
 const resourcesDirectory = () => dirname(process.env.MAGNITUDE_NATIVE_HOST ?? join(dirname(process.execPath), "desktop-host.node"))
 
-/** Whether the installed resources are a Docker image's; an unreadable marker means they aren't. */
-export const isContainerInstallation = (resources: string = resourcesDirectory()) => Effect.flatMap(FileSystem.FileSystem, fs =>
-  fs.readFileString(join(resources, "update-package.json")).pipe(
-    Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ format: LinuxInstallationKind })))),
-    Effect.map(marker => marker.format === "docker"), Effect.orElseSucceed(() => false)))
+/** Whether this service runs from a Docker image's installed resources. */
+export const isContainerInstallation = (resources: string = resourcesDirectory()) => isDockerInstallation(resources)
+
 
 export const readContainerInstallation = (environment: Readonly<Record<string, string | undefined>> = process.env, resources: string = resourcesDirectory()) => Effect.gen(function* () {
-  if (!(yield* isContainerInstallation(resources))) return Option.none<ContainerInstallation>()
+  if (!(yield* isDockerInstallation(resources))) return Option.none<ContainerInstallation>()
   const supplied = Option.fromNullable(environment.MAGNITUDE_NETWORK_KEY?.trim()).pipe(Option.filter(key => key.length > 0))
   const networkKey = Option.filter(supplied, Schema.is(NetworkKey))
   if (Option.isSome(supplied) && Option.isNone(networkKey)) {
@@ -36,6 +33,15 @@ export const readContainerInstallation = (environment: Readonly<Record<string, s
   const allowedHosts = (environment.MAGNITUDE_ALLOWED_HOSTS ?? "").split(",").map(host => host.trim().toLowerCase()).filter(host => host.length > 0)
   return Option.some<ContainerInstallation>({ networkKey, allowedHosts })
 })
+
+const containerNetworkDefault = (): NetworkAccessConfig => ({ enabled: true, requireApiKey: true, allowedHosts: [] })
+
+/**
+ * Where a generated key is saved: the person's own block, or else the container default. The
+ * environment's key and host names stay out of it, so changing those variables later still applies.
+ */
+export const savedNetworkForKey = (container: Option.Option<ContainerInstallation>, saved: Option.Option<NetworkAccessConfig>): Option.Option<NetworkAccessConfig> =>
+  Option.isSome(container) ? Option.orElse(saved, () => Option.some(containerNetworkDefault())) : saved
 
 /**
  * The network settings a container serves with. Published ports reach nothing on loopback, so without
@@ -47,7 +53,7 @@ export const containerNetworkConfig = (container: Option.Option<ContainerInstall
   Option.match(container, {
     onNone: () => saved,
     onSome: ({ networkKey, allowedHosts }) => {
-      const config = Option.getOrElse(saved, (): NetworkAccessConfig => ({ enabled: true, requireApiKey: true, allowedHosts: [] }))
+      const config = Option.getOrElse(saved, containerNetworkDefault)
       const hosts = { ...config, allowedHosts: [...new Set([...config.allowedHosts, ...allowedHosts])] }
       return Option.some(Option.match(networkKey, { onNone: () => hosts, onSome: apiKey => ({ ...hosts, apiKey }) }))
     },

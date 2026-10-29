@@ -7,7 +7,9 @@ import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
 import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
 import { applicationNativeHostPath, applicationStateDirectory, holdContainerData, nativeHostLayer, resolveApplicationProfile,
   resolveInstalledApplicationRuntime, runHeadlessApplication, type ApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
+import { containerImage } from "@magnitudedev/daemon-management/application-update"
 import { isDevelopmentBuild } from "../runtime/environment"
+import { CLI_VERSION } from "../version"
 import { idleInstallationSystem, initializeContainerUpdates, initializeServeUpdates, makeDownloadedNotice, makeIdleInstallation, makeImageNotice, prepareServeStartup } from "../server/serve-updates"
 import { isContainer, renderNodeHint, requireWritableDataDirectory, unopenableRenderNodes } from "../server/container"
 import { resolveServeOwner } from "../server/serve-owner"
@@ -54,7 +56,7 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
     const stop = yield* runHeadlessApplication({ runtime, profile, stateDirectory, home: homedir(), environment: process.env,
     prepareStartup: prepareServeStartup(runtime, profile, stateDirectory).pipe(
       Effect.provide(process.platform === "win32" ? bundledWindowsNative.host : nativeHostLayer(addon))),
-    initializeUpdates, container,
+    initializeUpdates, ...(container ? { container: { image: containerImage(CLI_VERSION) } } : {}),
     ...updateHooks,
     stopping: reason => Effect.sync(() => { process.stderr.write(reason === "DesktopTakeover"
       ? "The desktop app was opened and is taking over. Stopping the headless server.\n"

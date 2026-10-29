@@ -9,7 +9,7 @@ import { type ApplicationRuntime, type ApplicationProfile, PreparedUpdateStore, 
 import { ApplicationUpdateSource, makeInstalledUpdatePreparation, makeApplicationUpdate,
   reconcilePreparedUpdate, unavailableApplicationUpdate, completeLinuxForegroundUpdate, prepareMacForegroundStartup,
   startMacForegroundInstallation, recordStartupFailure, makeContainerApplicationUpdate, recordContainerUpgrade, containerImageVersions,
-  containerUpdateNotice, type ApplicationUpdate } from "@magnitudedev/daemon-management/application-update"
+  containerImage, containerUpdateNotice, type ApplicationUpdate } from "@magnitudedev/daemon-management/application-update"
 import { CLI_VERSION } from "../version"
 import { withLocalService } from "./server-reach"
 
@@ -56,11 +56,12 @@ export const initializeServeUpdates = (runtime: ApplicationRuntime, profile: App
 export const initializeContainerUpdates = (runtime: Extract<ApplicationRuntime, { _tag: "Installed" }>, profile: ApplicationProfile, addon: string, owner: UpdateOwner,
   notice: (version: string) => Effect.Effect<void>) => Effect.gen(function* () {
   const prepared = yield* preparation(runtime, profile, addon, owner)
-  yield* recordContainerUpgrade(profile.dataDirectory, CLI_VERSION).pipe(Effect.provideService(PreparedUpdateStore, prepared.store),
-    Effect.catchAll(error => Effect.logWarning(error.message)))
-  const updates = yield* makeContainerApplicationUpdate.pipe(Effect.provideService(ApplicationUpdateSource, yield* prepared.makeSource))
+  const updates = yield* makeContainerApplicationUpdate(containerImage(CLI_VERSION)).pipe(Effect.provideService(ApplicationUpdateSource, yield* prepared.makeSource))
   yield* containerImageVersions(updates.changes).pipe(Stream.runForEach(notice), Effect.forkScoped)
-  return updates
+  // The launch check runs only once the service is ready, so a version that never starts records no upgrade.
+  const recordUpgrade = recordContainerUpgrade(profile.dataDirectory, CLI_VERSION).pipe(Effect.provideService(PreparedUpdateStore, prepared.store),
+    Effect.provideService(FileSystem.FileSystem, yield* FileSystem.FileSystem), Effect.catchAll(error => Effect.logWarning(error.message)))
+  return { ...updates, check: reason => (reason === "launch" ? recordUpgrade : Effect.void).pipe(Effect.zipRight(updates.check(reason))) } satisfies ApplicationUpdate
 }).pipe(Effect.provide(unixPrivateFilePermissions.pipe(Layer.provideMerge(BunContext.layer))),
   Effect.catchAll(() => Effect.succeed(unavailableApplicationUpdate("Application update setup could not be read."))))
 
@@ -87,7 +88,8 @@ export const makeDownloadedNotice = (notify: (line: string) => Effect.Effect<voi
   makeVersionNotice(notify, version => `Magnitude ${version} is downloaded. Install it with \`magnitude update install\`.`)
 
 /** The one line a container prints for each newer release, which a newer image provides. */
-export const makeImageNotice = (notify: (line: string) => Effect.Effect<void>) => makeVersionNotice(notify, containerUpdateNotice)
+export const makeImageNotice = (notify: (line: string) => Effect.Effect<void>) =>
+  makeVersionNotice(notify, version => containerUpdateNotice(version, containerImage(CLI_VERSION)))
 
 /** The machine an idle installation acts on; replaced by fakes to exercise the decisions. */
 export interface IdleInstallationSystem {

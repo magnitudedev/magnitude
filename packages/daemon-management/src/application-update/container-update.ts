@@ -2,15 +2,20 @@ import { FileSystem } from "@effect/platform"
 import { Clock, Effect, ExecutionStrategy, Exit, Option, Schema, Scope, Stream, SubscriptionRef } from "effect"
 import { randomUUID } from "node:crypto"
 import { dirname, join } from "node:path"
-import { isNewerVersion } from "@magnitudedev/release"
+import { isNewerVersion, releaseChannelOf } from "@magnitudedev/release"
 import { Version, type UpdateCheckReason } from "@magnitudedev/release/hosted-update"
 import type { ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { PreparedUpdateStore } from "../desktop-native/prepared-update"
 import { ApplicationUpdate, ApplicationUpdateFailed, ApplicationUpdateSource } from "./application-update"
 
-export const CONTAINER_UPDATE_INSTRUCTION = "Pull the new image (docker pull magnitudedev/magnitude) and recreate the container."
-export const containerUpdateNotice = (version: string) => `Magnitude ${version} is available. ${CONTAINER_UPDATE_INSTRUCTION}`
-export const containerUpdateRefusal = `Magnitude in a container is updated by its image, not in place. ${CONTAINER_UPDATE_INSTRUCTION}`
+/** The image a container on this version pulls to upgrade: stable releases move `latest`, prereleases their channel's tag. */
+export const containerImage = (version: string) => {
+  const channel = releaseChannelOf(version)
+  return channel === "beta" || channel === "alpha" ? `magnitudedev/magnitude:${channel}` : "magnitudedev/magnitude"
+}
+const instruction = (image: string) => `Pull the new image (docker pull ${image}) and recreate the container.`
+export const containerUpdateNotice = (version: string, image: string) => `Magnitude ${version} is available. ${instruction(image)}`
+export const containerUpdateRefusal = (image: string) => `Magnitude in a container is updated by its image, not in place. ${instruction(image)}`
 
 const LastRun = Schema.parseJson(Schema.Struct({ version: Version }))
 
@@ -40,12 +45,12 @@ export const recordContainerUpgrade = (dataDirectory: string, version: string) =
  * outcomes, but a newer release is only announced: the image is the installation, so an update applied
  * inside the container would be lost when it is recreated.
  */
-export const makeContainerApplicationUpdate = Effect.gen(function* () {
+export const makeContainerApplicationUpdate = (image: string) => Effect.gen(function* () {
   const source = yield* ApplicationUpdateSource
   const workers = yield* Scope.fork(yield* Scope.Scope, ExecutionStrategy.sequential)
-  const refused = new ApplicationUpdateFailed({ message: containerUpdateRefusal })
+  const refused = new ApplicationUpdateFailed({ message: containerUpdateRefusal(image) })
   const state = yield* SubscriptionRef.make<ApplicationUpdateState>({ transfer: { _tag: "Idle" }, check: { _tag: "Idle" },
-    preference: { _tag: "Unavailable", message: containerUpdateRefusal } })
+    preference: { _tag: "Unavailable", message: containerUpdateRefusal(image) } })
   const gate = yield* Effect.makeSemaphore(1)
   const settle = (f: (current: ApplicationUpdateState) => ApplicationUpdateState) =>
     SubscriptionRef.update(state, current => current.transfer._tag === "Closed" ? current : f(current))
@@ -56,7 +61,7 @@ export const makeContainerApplicationUpdate = Effect.gen(function* () {
     yield* SubscriptionRef.set(state, { ...current, check: { _tag: "Checking" } })
     yield* source.check(reason).pipe(
       Effect.flatMap(candidate => Clock.currentTimeMillis.pipe(Effect.flatMap(at => settle(current => ({ ...current, check: { _tag: "Succeeded", at },
-        transfer: Option.match(candidate, { onNone: () => ({ _tag: "Idle" }) as const, onSome: release => ({ _tag: "ImageAvailable", version: release.version }) as const }) }))))),
+        transfer: Option.match(candidate, { onNone: () => ({ _tag: "Idle" }) as const, onSome: release => ({ _tag: "ImageAvailable", version: release.version, image }) as const }) }))))),
       Effect.catchAll(error => settle(current => ({ ...current, check: { _tag: "Failed", message: error.message } }))),
       Effect.catchAllDefect(() => settle(current => ({ ...current, check: { _tag: "Failed", message: "Could not check for updates." } }))),
       Effect.interruptible, Effect.forkIn(workers),

@@ -66,7 +66,7 @@ export const runHeadlessApplication = (options: {
    * Answering true stops with `InstallUpdate` instead of failing, to install a download that replaces it.
    */
   readonly startupFailed?: (report: Effect.Effect<void>, updates: ApplicationUpdate) => Effect.Effect<boolean>
-  readonly container?: boolean
+  readonly container?: { readonly image: string }
 }) => Effect.scoped(Effect.gen(function* () {
   const stop = yield* Deferred.make<HeadlessStop>()
   yield* options.stop.pipe(Effect.zipRight(Deferred.succeed(stop, "Requested")), Effect.forkScoped)
@@ -98,7 +98,7 @@ export const runHeadlessApplication = (options: {
   // Update checks start once the service is ready, so a new version reports `applied` only after it starts.
   const firstReady = yield* Deferred.make<void>()
   const report = (reason: UpdateCheckReason) => reportUpdateOutcome(updates, reason)
-  const update = yield* makeHeadlessUpdateControl(updates, Deferred.await(firstReady), options.container ? containerUpdateRefusal : undefined)
+  const update = yield* makeHeadlessUpdateControl(updates, Deferred.await(firstReady), options.container ? containerUpdateRefusal(options.container.image) : undefined)
   if (options.updateReady) {
     const notify = options.updateReady
     yield* updates.changes.pipe(Stream.map(state => state.transfer), Stream.changesWith((a, b) =>
@@ -106,7 +106,7 @@ export const runHeadlessApplication = (options: {
       Stream.runForEach(state => state._tag === "Ready" ? notify(state.version) : Effect.void), Effect.forkScoped)
   }
   const ownerAgent: OwnerAgent = {
-    state: updates.changes.pipe(Stream.map(state => ({ owner: "Headless" as const, capabilities: headlessCapabilities(options.container === true), updates: Option.some(state), loginStartup: Option.none() }))),
+    state: updates.changes.pipe(Stream.map(state => ({ owner: "Headless" as const, capabilities: headlessCapabilities(options.container !== undefined), updates: Option.some(state), loginStartup: Option.none() }))),
     handle: request => {
       switch (request._tag) {
         case "CheckUpdate": return ownerResult(update("check"))

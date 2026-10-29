@@ -20,7 +20,7 @@ const Transfer = Schema.Union(
   Schema.TaggedStruct("InstallationFailed", { version: Schema.String, message: Schema.String }),
   Schema.TaggedStruct("Failed", { message: Schema.String }),
   Schema.TaggedStruct("Unavailable", { message: Schema.String }),
-  Schema.TaggedStruct("ImageAvailable", { version: Schema.String }),
+  Schema.TaggedStruct("ImageAvailable", { version: Schema.String, image: Schema.String }),
   Schema.TaggedStruct("Closed", {}),
 )
 export const ApplicationUpdateState = Schema.Struct({

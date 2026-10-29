@@ -11,7 +11,7 @@ export { serveWindowsApplicationControl } from "./windows-control"
 export * from "./application-owner"
 export { runHeadlessApplication, HeadlessApplicationFailed } from "./headless-application"
 export { readLinuxInstallationKind, isDockerInstallation } from "./installation-kind"
-export { holdContainerData, ContainerDataInUse } from "./container-data-lock"
+export { holdContainerData, ContainerDataInUse, ContainerDataLockUnsafe } from "./container-data-lock"
 
 export * from "./application-client"
 export * from "./application-host"

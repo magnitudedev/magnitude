@@ -657,7 +657,7 @@ function AboutRow() {
       : current && !["Unavailable", "Closed"].includes(current._tag) ? <NoticeAction disabled={busy} onClick={() => check()}>Check for updates</NoticeAction> : null}
   </>
   return <>{disconnect.dialog}<SettingsRow label={version} hint={Result.isInitial(observation) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : message}
-    children={current?._tag === "ImageAvailable" && <div className="mt-2"><CopyCommand command="docker pull magnitudedev/magnitude" label="Copy pull command" /></div>}
+    children={current?._tag === "ImageAvailable" && <div className="mt-2"><CopyCommand command={`docker pull ${current.image}`} label="Copy pull command" /></div>}
     alert={hasFailure && !busy ? <ErrorNotice
       title={Result.isFailure(discarding) && !discarding.waiting ? "Couldn’t discard the update" : current?._tag === "InstallationFailed" ? "The update wasn’t completed" : checkFailed ? "Couldn’t check for updates" : "The update couldn’t finish"}
       description={installable ? "The prepared update is still available. Retry it, or discard its download."

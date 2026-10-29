@@ -30,7 +30,7 @@ export const renderApplicationUpdate = (state: ApplicationUpdateState, owner: "D
     case "Ready": return `Magnitude ${state.transfer.version} is ready to install.\n${owner === "Headless"
       ? server ? "The server installs it on its own once it is idle." : "Stop `magnitude serve`, then run: magnitude update install"
       : owner === "None" ? "Install: magnitude update install" : "Install and restart: magnitude update install"}\n`
-    case "ImageAvailable": return `${containerUpdateNotice(state.transfer.version)}\n`
+    case "ImageAvailable": return `${containerUpdateNotice(state.transfer.version, state.transfer.image)}\n`
     case "Cancelling": return "Cancelling the automatic update download.\nCheck progress: magnitude update status\n"
     case "Closed": return "Magnitude is quitting.\n"
     case "Idle": return state.check._tag === "Succeeded" ? "Magnitude is up to date.\n"
