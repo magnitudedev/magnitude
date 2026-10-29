@@ -68,6 +68,7 @@
           "installation/macos",
           "installation/windows",
           "installation/linux",
+          "installation/docker",
           "remote-server",
           "hardware",
           "models",
