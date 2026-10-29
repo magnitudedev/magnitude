@@ -142,7 +142,7 @@ Follow established Effect conventions in the project, while referring to the fol
 
 #### Effect DI
 
-Always use the effect DI system where appropraite. Break abstractions into services.
+Always use the effect DI system where appropriate. Break abstractions into services.
 Services should be a Context.Tag, with an interface of the same name as the tag.
 
 ### Effect Schemas
