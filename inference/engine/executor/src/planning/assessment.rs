@@ -12,7 +12,7 @@
 
 use super::resources::{NativeGraphCharge, history_row_bytes, recurrent_bank_bytes};
 use super::{
-    ComponentSelection, ModelLoadPlan, PlannedMethod, ResourceLimits, source_import_peak_bytes,
+    ComponentSelection, ModelLoadPlan, PlannedMethod, ResourceLimits,
     weight_bytes_by_component,
 };
 use crate::assessment::DomainFit;
@@ -625,12 +625,7 @@ impl AssessmentGraphResourceBounds {
 
 impl AssessmentHeaderBounds {
     pub fn derive(load: &ModelLoadPlan) -> Result<Self, String> {
-        let largest_source = load
-            .weights()
-            .map(|weight| weight.source_bytes)
-            .max()
-            .unwrap_or(0);
-        let import_peak = source_import_peak_bytes(largest_source)?;
+        let import_peak = load.imports().peak_bytes()?;
         let startup_additional_bytes =
             AttestedPrograms::qualification_peak_bytes(load)?.max(import_peak);
         let component_upload_bytes = load

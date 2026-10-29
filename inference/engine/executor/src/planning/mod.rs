@@ -7,6 +7,8 @@ mod assessment;
 mod capabilities;
 mod components;
 mod execution_plan;
+mod imports;
+pub(crate) use imports::{ImportBacking, ImportPlan};
 mod programs;
 mod resources;
 mod weights;
@@ -48,7 +50,7 @@ pub use weights::{
 
 pub(crate) use weights::{activation_dtype, elements, packing_residue, packing_run, value_packets};
 use weights::{
-    planned_element, planned_readout, planned_scalable, source_import_peak_bytes,
+    planned_element, planned_readout, planned_scalable,
     weight_bytes_by_component,
 };
 #[cfg(test)]
@@ -90,6 +92,52 @@ pub(crate) mod tests {
             bound: 0,
             streamed: None,
         }
+    }
+
+    #[test]
+    fn streamed_extents_do_not_enlarge_the_import_schedule() {
+        let role = WeightRole {
+            scope: WeightScope::Target,
+            kind: WeightKind::Embedding,
+        };
+        let mut table = weight(role, "streamed");
+        table.shape = vec![1, 1];
+        table.descriptor = WeightDescriptor::stored("streamed", [1_000_000, 1]);
+        table.streamed = Some(super::weights::StreamedRows {
+            table_rows: 1_000_000,
+            staging_rows: 1,
+            landing_rows: 0,
+            directory: DirectoryForm::Dense,
+            fill: super::weights::TableFill::Imported,
+        });
+        let ordinary = weight(
+            WeightRole {
+                scope: WeightScope::Target,
+                kind: WeightKind::OutputNorm,
+            },
+            "norm",
+        );
+        let imports = ImportPlan::new([&table, &ordinary]);
+        // The table's source is one row. Its million stored rows must not
+        // permit the two adjacent ordinary sources to share a larger window.
+        assert_eq!(
+            imports
+                .batch([
+                    (0, ImportBacking::Mapped(0..2)),
+                    (0, ImportBacking::Mapped(2..4))
+                ])
+                .unwrap()
+                .len,
+            1
+        );
+        assert_eq!(
+            imports.peak_bytes().unwrap(),
+            ImportPlan::new([&ordinary]).peak_bytes().unwrap()
+        );
+        // Stored tables upload nothing, regardless of their stored extent.
+        table.source_bytes = 0;
+        table.streamed.as_mut().unwrap().fill = super::weights::TableFill::Stored;
+        assert_eq!(ImportPlan::new([&table]).peak_bytes().unwrap(), 0);
     }
 
     #[test]
