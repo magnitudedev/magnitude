@@ -43,17 +43,22 @@ fi
 # ubuntu:24.04 ships an `ubuntu` account with uid 1000.
 if id -u ubuntu >/dev/null 2>&1; then userdel --remove ubuntu || true; fi
 if getent group ubuntu >/dev/null; then groupdel ubuntu; fi
+# The NVIDIA toolkit's Vulkan manifest names libGLX_nvidia, which can't create an instance without
+# an X server, so a container only sees llvmpipe. Its libEGL_nvidia works headless; elsewhere the
+# loader skips this manifest because the library isn't mounted.
+printf '%s\n' '{"file_format_version":"1.0.1","ICD":{"library_path":"libEGL_nvidia.so.0","api_version":"1.3"}}' \
+  > /usr/share/vulkan/icd.d/nvidia_egl_icd.json
 useradd --uid 1000 --user-group --home-dir /data --create-home --shell /bin/bash magnitude
-install -d -o 1000 -g 1000 -m 0700 /run/magnitude
 EOF
 
 COPY --chmod=755 inference/ /opt/magnitude/inference/
 
 # MAGNITUDE_DESKTOP_STATE_DIR keeps the control socket off /data, where a Docker Desktop bind
-# mount refuses its chmod. `graphics` lets the NVIDIA toolkit mount its Vulkan driver.
+# mount refuses its chmod; under /tmp, whichever uid runs the container (`--user`) creates it.
+# `graphics` lets the NVIDIA toolkit mount its Vulkan driver.
 ENV HOME=/data \
     MAGNITUDE_ICN_PATH=/opt/magnitude/inference/installation.json \
-    MAGNITUDE_DESKTOP_STATE_DIR=/run/magnitude \
+    MAGNITUDE_DESKTOP_STATE_DIR=/tmp/magnitude \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
 

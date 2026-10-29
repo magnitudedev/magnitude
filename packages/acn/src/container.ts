@@ -6,10 +6,13 @@ import { dirname, join } from "node:path"
 
 /**
  * A Docker installation, which its image marks in the installed resources like every Linux payload.
- * Its environment may set the network access key, which other containers and the host then use.
+ * Its environment may set the network access key, which other containers and the host then use, and
+ * the host names people open the browser app by (`MAGNITUDE_ALLOWED_HOSTS`, comma-separated), since
+ * the container's own Settings can't change network access.
  */
 export interface ContainerInstallation {
   readonly networkKey: Option.Option<string>
+  readonly allowedHosts: ReadonlyArray<string>
 }
 
 /** A key other devices send as a bearer token: printable, without spaces, and long enough not to guess. */
@@ -30,19 +33,22 @@ export const readContainerInstallation = (environment: Readonly<Record<string, s
   if (Option.isSome(supplied) && Option.isNone(networkKey)) {
     yield* Effect.logWarning("Ignoring MAGNITUDE_NETWORK_KEY: it must be 16 to 512 printable characters without spaces. Magnitude uses the saved or a generated key instead.")
   }
-  return Option.some<ContainerInstallation>({ networkKey })
+  const allowedHosts = (environment.MAGNITUDE_ALLOWED_HOSTS ?? "").split(",").map(host => host.trim().toLowerCase()).filter(host => host.length > 0)
+  return Option.some<ContainerInstallation>({ networkKey, allowedHosts })
 })
 
 /**
  * The network settings a container serves with. Published ports reach nothing on loopback, so without
  * a `network` block network access is on, on all interfaces, with the key required; a block the person
- * saved still decides. `MAGNITUDE_NETWORK_KEY`, when set, is the key either way.
+ * saved still decides. `MAGNITUDE_NETWORK_KEY`, when set, is the key either way, and
+ * `MAGNITUDE_ALLOWED_HOSTS` adds to the allowed host names.
  */
 export const containerNetworkConfig = (container: Option.Option<ContainerInstallation>, saved: Option.Option<NetworkAccessConfig>): Option.Option<NetworkAccessConfig> =>
   Option.match(container, {
     onNone: () => saved,
-    onSome: ({ networkKey }) => {
+    onSome: ({ networkKey, allowedHosts }) => {
       const config = Option.getOrElse(saved, (): NetworkAccessConfig => ({ enabled: true, requireApiKey: true, allowedHosts: [] }))
-      return Option.some(Option.match(networkKey, { onNone: () => config, onSome: apiKey => ({ ...config, apiKey }) }))
+      const hosts = { ...config, allowedHosts: [...new Set([...config.allowedHosts, ...allowedHosts])] }
+      return Option.some(Option.match(networkKey, { onNone: () => hosts, onSome: apiKey => ({ ...hosts, apiKey }) }))
     },
   })

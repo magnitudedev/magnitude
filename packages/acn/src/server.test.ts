@@ -316,7 +316,7 @@ describe("network access read at startup", () => {
       expect(config.unknownSetting).toBe(1)
       expect((await read(dataDir)).apiKey).toEqual(network.apiKey)
     }))
-  const container = (key?: string) => Option.some({ networkKey: Option.fromNullable(key) })
+  const container = (key?: string) => Option.some({ networkKey: Option.fromNullable(key), allowedHosts: [] })
   const readIn = (dataDir: string, key?: string) => Effect.runPromise(readNetworkAccess(dataDir, container(key)).pipe(Effect.provide(BunContext.layer)))
   it("turns network access on in a container without a network block, and saves the key it makes", () =>
     withDataDir({ unknownSetting: 1 }, async dataDir => {

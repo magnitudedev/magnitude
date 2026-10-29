@@ -84,6 +84,16 @@ curl -H "Authorization: Bearer KEY" http://localhost:10100/inference/v1/models
 
 See [Network access](/api/network-access) for clients and agents.
 
+The browser app opens by IP address, `localhost` or a Tailscale name. To open it by another host name, such as `http://nas.local:10100`, list the names in `MAGNITUDE_ALLOWED_HOSTS`, separated by commas:
+
+```sh
+docker run -d --name magnitude -p 10100:10100 -v magnitude:/data \
+  -e MAGNITUDE_ALLOWED_HOSTS=nas.local,magnitude.home.arpa \
+  magnitudedev/magnitude
+```
+
+Requests that send the key are accepted under any host name, so other containers can use names such as `http://magnitude:10100` without this.
+
 ## GPUs
 
 <Tabs>
@@ -137,7 +147,7 @@ sudo chown 1000:1000 /srv/magnitude
 docker run -d --name magnitude -p 10100:10100 -v /srv/magnitude:/data magnitudedev/magnitude
 ```
 
-Give each container its own volume; don't run two containers on one volume at the same time.
+Give each container its own volume. A second container started on a volume that another one is using stops at once and says so.
 
 ## Use models you already have
 

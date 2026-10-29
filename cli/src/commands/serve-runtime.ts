@@ -5,11 +5,11 @@ import { BunContext } from "@effect/platform-bun"
 import { Deferred, Effect, Option, Ref, Runtime, Schema } from "effect"
 import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
 import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
-import { applicationNativeHostPath, applicationStateDirectory, nativeHostLayer, resolveApplicationProfile,
+import { applicationNativeHostPath, applicationStateDirectory, holdContainerData, nativeHostLayer, resolveApplicationProfile,
   resolveInstalledApplicationRuntime, runHeadlessApplication, type ApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
 import { isDevelopmentBuild } from "../runtime/environment"
 import { idleInstallationSystem, initializeContainerUpdates, initializeServeUpdates, makeDownloadedNotice, makeIdleInstallation, makeImageNotice, prepareServeStartup } from "../server/serve-updates"
-import { isContainer, requireWritableDataDirectory } from "../server/container"
+import { isContainer, renderNodeHint, requireWritableDataDirectory, unopenableRenderNodes } from "../server/container"
 import { resolveServeOwner } from "../server/serve-owner"
 import { readServerReach, renderServeReady } from "../server/server-reach"
 import { serveStopSignals } from "./serve-signals"
@@ -34,8 +34,10 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
   if (container) yield* requireWritableDataDirectory(profile.dataDirectory)
   const stateDirectory = yield* applicationStateDirectory({ platform: process.platform, dataDirectory: profile.dataDirectory, override: Option.fromNullable(process.env.MAGNITUDE_DESKTOP_STATE_DIR) })
   const addon = applicationNativeHostPath(runtime, process.platform, process.arch)
+  if (container) yield* holdContainerData(profile.dataDirectory).pipe(Effect.provide(nativeHostLayer(addon)))
   const ready = yield* Ref.make(false)
   const notify = (line: string) => Effect.sync(() => { process.stderr.write(`${line}\n`) })
+  if (container) yield* Effect.forEach(yield* unopenableRenderNodes(), node => notify(renderNodeHint(node)))
   // macOS and Linux servers install downloaded updates at idle points when they can without a password; Windows serve only prepares them.
   // A container never installs one: its image is the installation.
   const idle = runtime._tag === "Installed" && process.platform !== "win32" && !container

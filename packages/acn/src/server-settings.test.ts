@@ -101,7 +101,7 @@ describe("network access", () => {
   })
 
   it("reports a container's network access as the container sets it, and refuses changes from Settings", async () => {
-    const container = Option.some({ networkKey: Option.some("a-key-from-the-environment") })
+    const container = Option.some({ networkKey: Option.some("a-key-from-the-environment"), allowedHosts: [] })
     const active = resolveNetworkAccess(Option.some({ enabled: true, apiKey: "a-key-from-the-environment", requireApiKey: true, allowedHosts: [] }))
     const [settings, change, regenerate] = await run(fresh(), Effect.gen(function* () {
       const service = yield* ServerSettings
