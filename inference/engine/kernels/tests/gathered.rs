@@ -218,7 +218,7 @@ fn stored_rows_decode_the_rows_their_directory_names() {
 }
 
 /// Rows 256 wide: of 256-value block encodings (Q2_K, Q3_K, IQ4_XS), and of
-/// IQ4_NL blocks at a width that is a multiple of 256.
+/// IQ4_NL's 32-value blocks, whose resident form is iq4g32s at every width.
 #[test]
 fn stored_rows_decode_k_quant_rows() {
     for (source, resident) in [

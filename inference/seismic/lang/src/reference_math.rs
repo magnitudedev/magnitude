@@ -25,7 +25,7 @@ use crate::types::DType;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 pub const VERSION: &str = "seismic-scalar-reference-bits-v5";
 
@@ -653,6 +653,38 @@ fn cached_recipe(key: RecipeKey, build: impl FnOnce() -> ReferenceRecipe) -> Arc
     cache.lock().unwrap().entry(key).or_insert(recipe).clone()
 }
 
+/// The widest code whose recipe's values `cached_code` tables; a wider
+/// code's recipe is evaluated per read.
+const TABLED_BITS: u32 = 16;
+
+/// The value at `raw` of the code recipe of `key` (`recipe`: total, of one
+/// `U32` input whose low `bits` bits it reads), for a code of at most
+/// `TABLED_BITS` bits read from the recipe's values at every code, evaluated
+/// once per process.
+fn cached_code(
+    key: RecipeKey,
+    bits: u32,
+    raw: u32,
+    recipe: impl FnOnce() -> Arc<ReferenceRecipe>,
+) -> ReferenceScalar {
+    let value = |recipe: &ReferenceRecipe, raw| {
+        evaluate(recipe, &[ReferenceScalar::U32(raw)]).expect("a code recipe is total")
+    };
+    if bits > TABLED_BITS {
+        return value(&recipe(), raw);
+    }
+    type Tables = HashMap<RecipeKey, Arc<[ReferenceScalar]>>;
+    static TABLES: OnceLock<RwLock<Tables>> = OnceLock::new();
+    let tables = TABLES.get_or_init(Default::default);
+    let known = tables.read().unwrap().get(&key).cloned();
+    let table = known.unwrap_or_else(|| {
+        let recipe = recipe();
+        let table: Arc<[ReferenceScalar]> = (0..1u32 << bits).map(|raw| value(&recipe, raw)).collect();
+        tables.write().unwrap().entry(key).or_insert(table).clone()
+    });
+    table[(raw & (u32::MAX >> (32 - bits))) as usize]
+}
+
 pub fn scalar_recipe(op: ScalarOp, operands: &[DType]) -> Arc<ReferenceRecipe> {
     cached_recipe(RecipeKey::Scalar(op, operands.to_vec()), || {
         let b = Recipe::default();
@@ -724,6 +756,24 @@ pub fn code_recipe(
     })
 }
 
+/// `code_recipe(interpretation, bits)` at `raw` (`cached_code`).
+pub fn code_value(
+    interpretation: &crate::registry::CodeInterpretation,
+    bits: u32,
+    raw: u32,
+) -> ReferenceScalar {
+    cached_code(RecipeKey::Code(interpretation.clone(), bits), bits, raw, || {
+        code_recipe(interpretation, bits)
+    })
+}
+
+/// `float_code_recipe(format)` at `raw` (`cached_code`).
+pub fn float_code_value(format: crate::registry::FloatCodeFormat, raw: u32) -> ReferenceScalar {
+    cached_code(RecipeKey::FloatCode(format), format.bits(), raw, || {
+        float_code_recipe(format)
+    })
+}
+
 /// The code of a vector-coded value (`GridCodes::code`) from its entry
 /// (operand 0) and its lane (operand 1, below `GRID_VALUES`): word operations
 /// around one lookup of the grid's lane values (`LookupTable::Grid`).
@@ -767,32 +817,38 @@ pub fn grid_code_recipe(grid: &'static crate::registry::GridCodes) -> ReferenceR
             b.word(WordOp::And, lane, b.u(grid.lanes() - 1)),
         ),
     );
-    // A magnitude signed by its lane's sign bit (eight sign bits, or seven
-    // and their even-parity eighth), or a signed value.
-    let value = match grid.signs {
-        GridSigns::None => value,
-        signs => {
-            let bits = signs.bits();
-            let explicit = b.word(
-                WordOp::And,
-                b.word(WordOp::Shr, entry, b.u(grid.sign_bit())),
-                b.u((1 << bits) - 1),
-            );
-            let signs = match signs {
-                GridSigns::ParityPlus7 => {
-                    let mut parity = explicit;
-                    for fold in [4, 2, 1] {
-                        parity =
-                            b.word(WordOp::Xor, parity, b.word(WordOp::Shr, parity, b.u(fold)));
-                    }
-                    b.word(
-                        WordOp::Or,
-                        explicit,
-                        b.word(WordOp::Shl, b.word(WordOp::And, parity, b.u(1)), b.u(bits)),
-                    )
-                }
-                _ => explicit,
-            };
+    // A magnitude signed by its lane's sign (`GridSigns::lanes`: eight sign
+    // bits, or seven and their even-parity eighth), or a signed value.
+    let explicit = || {
+        b.word(
+            WordOp::And,
+            b.word(WordOp::Shr, entry, b.u(grid.sign_bit())),
+            b.u((1 << grid.signs.bits()) - 1),
+        )
+    };
+    let lane_signs = match grid.signs {
+        GridSigns::None => None,
+        GridSigns::Explicit8 => Some(explicit()),
+        GridSigns::ParityPlus7 => {
+            let explicit = explicit();
+            let mut parity = explicit;
+            for fold in [4, 2, 1] {
+                parity = b.word(WordOp::Xor, parity, b.word(WordOp::Shr, parity, b.u(fold)));
+            }
+            Some(b.word(
+                WordOp::Or,
+                explicit,
+                b.word(
+                    WordOp::Shl,
+                    b.word(WordOp::And, parity, b.u(1)),
+                    b.u(grid.signs.bits()),
+                ),
+            ))
+        }
+    };
+    let value = match lane_signs {
+        None => value,
+        Some(signs) => {
             let negative = b.word(WordOp::And, b.word(WordOp::Shr, signs, lane), b.u(1));
             b.select(
                 b.word_cmp(CmpOp::Eq, negative, b.u(1)),

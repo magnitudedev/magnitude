@@ -986,7 +986,8 @@ template <class S, int GROUP_, bool BIAS_, int STORAGE_, int CODE_EXPONENT> stru
 };
 
 // Hierarchical coefficients: per GROUP codes a LOCAL_BITS-bit scale code
-// (and with MIN a minimum code after it), interpreted by L, under a factor FS
+// (and with a minimum a minimum code after it), interpreted by L, in a
+// WIDTH-bit field (`LocalBias::field_bits`), under a factor FS
 // (and a minimum factor) per 256-code superblock: scale = factor
 // 2^(EXPONENT + CODE_EXPONENT) L(scale code) and value = scale code - bias
 // with bias = -(BIAS_SIGN minimum factor 2^EXPONENT L(minimum code)). A
@@ -994,13 +995,17 @@ template <class S, int GROUP_, bool BIAS_, int STORAGE_, int CODE_EXPONENT> stru
 // it is the storage group (`Repr::storage_group`), so rows hold whole ones.
 // Where the codes are is the component: the scales plane (`Hier`) or
 // carried in grid entries (`CarriedHier`); `HierFactors` is what both share.
-// With SIGNED (and no minimum) a group's scale code is followed by a sign
-// bit: its bias is the scale times 2^SIGNED_EXPONENT, negated with the bit
-// set (`registry::LocalBias::Signed`).
-template <class FS, int EXPONENT, int CODE_EXPONENT, u32 LOCAL_BITS, class L, int GROUP_, bool MIN, int BIAS_SIGN,
-          bool SIGNED = false, int SIGNED_EXPONENT = 0>
+// The bias is of kind BIAS_KIND (`SEISMIC_BIAS_*`, 0 for none): a minimum
+// code (`SEISMIC_BIAS_MINIMUM`, its term of sign BIAS_SIGN), or a sign bit
+// after the scale code (`SEISMIC_BIAS_SIGNED`): its bias is the scale times
+// 2^SIGNED_EXPONENT, negated with the bit set (`registry::LocalBias`).
+template <class FS, int EXPONENT, int CODE_EXPONENT, u32 LOCAL_BITS, class L, int GROUP_, u32 BIAS_KIND, int BIAS_SIGN,
+          u32 WIDTH_, int SIGNED_EXPONENT>
 struct HierFactors {
-    static_assert(!(MIN && SIGNED), "a group's bias is a minimum or signed");
+    static_assert(BIAS_KIND == 0 || BIAS_KIND == SEISMIC_BIAS_MINIMUM || BIAS_KIND == SEISMIC_BIAS_SIGNED,
+                  "a group's bias is a minimum code or a sign bit");
+    static constexpr bool MIN = BIAS_KIND == SEISMIC_BIAS_MINIMUM;
+    static constexpr bool SIGNED = BIAS_KIND == SEISMIC_BIAS_SIGNED;
     typedef L local;
     static constexpr int GROUP = GROUP_;
     static constexpr int GROUPS = 64 / GROUP;
@@ -1009,7 +1014,7 @@ struct HierFactors {
     static constexpr int STORAGE = 256;
     static constexpr bool GEMV_STAGED = false;
     // Bits of a group's codes.
-    static constexpr u32 WIDTH = LOCAL_BITS * (MIN ? 2 : 1) + (SIGNED ? 1 : 0);
+    static constexpr u32 WIDTH = WIDTH_;
     // Bytes of a superblock's factors, and of the aligned word holding them.
     static constexpr int FACTOR_BYTES = FS::BYTES * (MIN ? 2 : 1);
     static_assert(FACTOR_BYTES == 2 || FACTOR_BYTES == 4, "a superblock's factors are a half word or a word");
@@ -1046,8 +1051,10 @@ struct HierFactors {
     }
 };
 
+template <int BYTES, int HIGH> struct Entries;
+
 // Hierarchical coefficients whose codes are carried in grid entries: bit j
-// of a group's field (its code, and with SIGNED its bias's sign bit) at entry
+// of a group's field (its code, and with a signed bias its sign bit) at entry
 // bit CARRIED of its entry j (no minimum). Entries are BYTES whole bytes and
 // HIGH bits more in the high plane; where they have a high part the carried
 // bit is in it, and a row's coefficients are read from the high plane where
@@ -1055,10 +1062,12 @@ struct HierFactors {
 // a row's k-block's eight entries' high bits are the HIGH bytes at virtual
 // byte `(kblock 16 + r) HIGH` of its tile. Without one, records hold them
 // (`Records`).
-template <class FS, int EXPONENT, int CODE_EXPONENT, u32 LOCAL_BITS, class L, int GROUP, u32 CARRIED_, int BYTES = 2,
-          int HIGH = 0, bool SIGNED = false, int SIGNED_EXPONENT = 0>
-struct CarriedHier : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, false, 1, SIGNED, SIGNED_EXPONENT> {
-    typedef HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, false, 1, SIGNED, SIGNED_EXPONENT> F;
+template <class FS, int EXPONENT, int CODE_EXPONENT, u32 LOCAL_BITS, class L, int GROUP, u32 CARRIED_, int BYTES,
+          int HIGH, u32 BIAS_KIND, u32 WIDTH_, int SIGNED_EXPONENT>
+struct CarriedHier
+    : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, BIAS_KIND, 1, WIDTH_, SIGNED_EXPONENT> {
+    typedef HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, BIAS_KIND, 1, WIDTH_, SIGNED_EXPONENT> F;
+    static_assert(!F::MIN, "grid entries carry no minimum code");
     using F::FACTOR_BYTES;
     using F::GROUPS;
     using F::WIDTH;
@@ -1067,6 +1076,8 @@ struct CarriedHier : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GRO
     static constexpr u32 CARRIED = CARRIED_;
     static_assert(HIGH == 0 || (CARRIED >= 8 * BYTES && CARRIED < 8 * BYTES + HIGH),
                   "entries with a high part carry their fields in it");
+    // The entries (`Entries`): where a row's k-block holds its high part.
+    typedef Entries<BYTES, HIGH> E;
     static constexpr int ENTRIES = GROUP / 8;
     static_assert(WIDTH <= (u32)ENTRIES, "a group's entries carry its field");
     // A superblock's high words (32 entries of HIGH bits).
@@ -1079,16 +1090,18 @@ struct CarriedHier : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GRO
             field |= ((high >> (((u32)(ENTRIES * group) + j) * HIGH + (CARRIED - 8 * BYTES))) & 1u) << j;
         return field;
     }
-    // The high bits of k-block `kblock` of row `row`.
+    // The high bits of k-block `kblock` of row `row`, and where they are.
     template <class W> __device__ static __forceinline__ const u8 *high_at(const W &w, u64 row, u64 kblock) {
-        static_assert(HIGH == 4, "a k-block's high part is one word");
-        return w.high.chunk(w.base, w.stride, row / 16, (kblock * 16 + row % 16) * HIGH);
+        return E::high_at(w, row / 16, kblock, (u32)(row % 16));
+    }
+    template <class W> __device__ static __forceinline__ u32 high(const W &w, u64 row, u64 kblock) {
+        return E::high_word_nc(high_at(w, row, kblock));
     }
     template <class W>
     __device__ static __forceinline__ void coefficient(const W &w, u64 row, u64 kblock, int group, float &scale,
                                                        float &bias) {
         const u8 *line = w.base + row * w.stride;
-        const u32 fields[1] = {field(seismic_ld_nc_u32(high_at(w, row, kblock)), group)};
+        const u32 fields[1] = {field(high(w, row, kblock), group)};
         F::template form<1>(fields, 0, factors(factor_word(line + w.supers, kblock / 4)), scale, bias);
     }
     // A superblock's high words and factors of rows g and g+8.
@@ -1097,14 +1110,13 @@ struct CarriedHier : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GRO
         float2 factors[2];
     };
     template <class W> __device__ static __forceinline__ Block block(const W &w, u64 tile, u64 superblock, u32 lane) {
-        static_assert(HIGH == 4, "a k-block's high part is one word");
         Block block;
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
             const u64 row = tile * 16 + lane / 4 + 8 * r;
 #pragma unroll
             for (int q = 0; q < 4; ++q)
-                block.high[r][q] = seismic_ld_nc_u32(high_at(w, row, 4 * superblock + q));
+                block.high[r][q] = high(w, row, 4 * superblock + q);
             block.factors[r] = factors(factor_word(w.base + row * w.stride + w.supers, superblock));
         }
         return block;
@@ -1120,7 +1132,7 @@ struct CarriedHier : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GRO
             }
     }
     // GEMM staging: a superblock's high words and the aligned word holding
-    // its factors.
+    // its factors, a k-block's high part staged as one word.
     static constexpr int SUPER_WORDS = HIGH_WORDS + 1;
     template <class W> __device__ static __forceinline__ const u8 *super_word(const W &w, u64 row, u64 superblock, int word) {
         const u8 *line = w.base + row * w.stride;
@@ -1130,7 +1142,7 @@ struct CarriedHier : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GRO
     __host__ __device__ static constexpr int word_kblock(int word) { return word < HIGH_WORDS ? word * 4 / HIGH_WORDS : 0; }
     __device__ static __forceinline__ void staged_coefficient(const u32 *words, u64 kblock, int group, float &scale,
                                                               float &bias) {
-        static_assert(HIGH == 4, "a k-block's high part is one word");
+        static_assert(HIGH == 4, "staging holds a k-block's high part as one word");
         const u64 sb = kblock / 4;
         const u32 factor = words[HIGH_WORDS] >> (8 * (sb * FACTOR_BYTES % 4));
         const u32 fields[1] = {field(words[kblock % 4], group)};
@@ -1141,8 +1153,8 @@ template <class K> struct IsCarried {
     static constexpr bool value = false;
 };
 template <class FS, int EXPONENT, int CODE_EXPONENT, u32 LOCAL_BITS, class L, int GROUP, u32 CARRIED, int BYTES,
-          int HIGH, bool SIGNED, int SIGNED_EXPONENT>
-struct IsCarried<CarriedHier<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, CARRIED, BYTES, HIGH, SIGNED,
+          int HIGH, u32 BIAS_KIND, u32 WIDTH, int SIGNED_EXPONENT>
+struct IsCarried<CarriedHier<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, CARRIED, BYTES, HIGH, BIAS_KIND, WIDTH,
                              SIGNED_EXPONENT>> {
     static constexpr bool value = true;
 };
@@ -1152,10 +1164,13 @@ struct IsCarried<CarriedHier<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, 
 // WORDS words from the word they start in. They start at a multiple of
 // SPAN's lowest set bit (at most 32) within that word, so they reach 32 less
 // that bit past SPAN; where SPAN fills whole words they are its words.
-template <class FS, int EXPONENT, int CODE_EXPONENT, u32 LOCAL_BITS, class L, int GROUP_, bool MIN, int BIAS_SIGN,
-          bool SIGNED = false, int SIGNED_EXPONENT = 0>
-struct Hier : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP_, MIN, BIAS_SIGN, SIGNED, SIGNED_EXPONENT> {
-    typedef HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP_, MIN, BIAS_SIGN, SIGNED, SIGNED_EXPONENT> F;
+template <class FS, int EXPONENT, int CODE_EXPONENT, u32 LOCAL_BITS, class L, int GROUP_, u32 BIAS_KIND, int BIAS_SIGN,
+          u32 WIDTH_, int SIGNED_EXPONENT>
+struct Hier
+    : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP_, BIAS_KIND, BIAS_SIGN, WIDTH_, SIGNED_EXPONENT> {
+    typedef HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP_, BIAS_KIND, BIAS_SIGN, WIDTH_, SIGNED_EXPONENT>
+        F;
+    using F::MIN;
     using F::FACTOR_BYTES;
     using F::GROUP;
     using F::GROUPS;
@@ -1167,9 +1182,7 @@ struct Hier : HierFactors<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP_, MI
     static constexpr int WORDS = (int)((SPAN + 32 - LEAD + 31) / 32);
     // Byte offset of the word superblock sb's fields start in, and their
     // first bit in it.
-    __host__ __device__ static constexpr u64 fields_offset(u64 sb) {
-        return SPAN % 32 == 0 ? sb * (4 * WORDS) : sb * SPAN / 32 * 4;
-    }
+    __host__ __device__ static constexpr u64 fields_offset(u64 sb) { return sb * SPAN / 32 * 4; }
     __host__ __device__ static constexpr u32 fields_shift(u64 sb) { return (u32)(sb * SPAN % 32); }
     // Group g (of a row's) of the scales plane at `scales` and the supers
     // plane at `supers`. Superblocks' fields follow one another, so group
@@ -1294,10 +1307,8 @@ template <class P, int GROUP> struct OrderOf<P, GROUP, decltype((void)sizeof(typ
 // `gemm_tile_half`), OPERANDS that products take NVFP4 operand rows (the
 // registry's operand recipe, `_OPERANDS_NVFP4`: an element of any form of
 // E2M1 codes in 16-value groups under UE4M3 scales).
-// The entry-order GEMV (`OrderOf`) takes no bias, so a biased decoder runs
-// in step order.
 template <class P, class C, class K, bool SCALED, bool OPERANDS = false>
-struct Packed : Rows, Select<K::BIAS, None, typename OrderOf<P, K::GROUP>::type>::type {
+struct Packed : Rows, OrderOf<P, K::GROUP>::type {
     static_assert(C::template READS<P::BITS>, "the interpretation reads codes of the planes' width (Linear: below "
                                               "8 bits, Twos: 8, Table: at most 4)");
     // The codes of a coefficient group within a k-block: the k-block's
@@ -1383,14 +1394,18 @@ template <class W> struct nvfp4_operands<W, decltype(void(W::NVFP4_OPERANDS))> {
 // 16-bit operands and s8 fragments. Their coefficients are hierarchical
 // (`Hier`). Rows hold whole 256-value groups.
 
-// The eight lane sign bits of an entry's SIGNS: eight, or seven and an
-// eighth that makes the count of set bits even.
-template <int SIGNS> __device__ __forceinline__ u32 grid_signs(u32 signs) {
-    static_assert(SIGNS == 7 || SIGNS == 8, "eight signs, or seven and their parity");
-    if constexpr (SIGNS == 7)
+// The eight lane signs of an entry's sign bits `signs` under sign mode
+// SIGNS (`GridSigns::lanes`): seven and an eighth that makes the count of
+// set bits even, eight, or none (signed points).
+template <u32 SIGNS> __device__ __forceinline__ u32 grid_signs(u32 signs) {
+    if constexpr (SIGNS == SEISMIC_GRID_SIGNS_PARITY_PLUS7)
         return (signs & 127u) | ((__popc(signs & 127u) & 1u) << 7);
-    else
+    else if constexpr (SIGNS == SEISMIC_GRID_SIGNS_EXPLICIT8)
         return signs & 255u;
+    else {
+        static_assert(SIGNS == SEISMIC_GRID_SIGNS_NONE, "a grid sign mode");
+        return 0u;
+    }
 }
 
 // Four sign bits as four 0x00 / 0xff bytes (bit i to byte i).
@@ -1462,9 +1477,9 @@ template <> struct Entries<1> {
 
 // Entries of BYTES whole bytes with HIGH bits more each: a row's k-block's
 // whole bytes (`Entries<BYTES>`), then the word of its eight entries' high
-// bits, entry e's at bit HIGH e (a k-block's HIGH bytes of the high plane).
+// bits, entry e's at bit HIGH e (a k-block's HIGH bytes of the high plane;
+// `registry::GRID_HIGH_BITS` keeps them within a word).
 template <int BYTES_, int HIGH_> struct Entries {
-    static_assert(HIGH_ > 0 && HIGH_ <= 4, "a k-block's eight high parts are one word");
     typedef Entries<BYTES_> E;
     static constexpr int BYTES = BYTES_;
     static constexpr int HIGH = HIGH_;
@@ -1481,18 +1496,34 @@ template <int BYTES_, int HIGH_> struct Entries {
     __device__ static __forceinline__ void load_shared(const u8 *shared, u32 (&w)[WORDS]) {
         E::load_shared(shared, reinterpret_cast<u32(&)[LOW_WORDS]>(w));
     }
-    // The k-block's high bits at `at` (global or shared): HIGH bytes, at a
-    // multiple of HIGH.
-    __device__ static __forceinline__ void load_high(const u8 *at, u32 (&w)[WORDS]) {
-        if constexpr (HIGH == 1)
-            w[LOW_WORDS] = *at;
-        else if constexpr (HIGH == 2)
-            w[LOW_WORDS] = *reinterpret_cast<const u16 *>(at);
-        else if constexpr (HIGH == 4)
-            w[LOW_WORDS] = *reinterpret_cast<const u32 *>(at);
-        else
-            w[LOW_WORDS] = (u32)at[0] | ((u32)at[1] << 8) | ((u32)at[2] << 16);
+    // Where row r (of tile `tile`'s 16) holds its k-block's high bits in the
+    // high plane: the HIGH bytes at virtual byte (kblock 16 + r) HIGH of the
+    // tile (`registry::PackedRowLayout::code_bit`).
+    __host__ __device__ static constexpr u64 high_byte(u64 kblock, u32 r) { return (kblock * 16 + r) * HIGH; }
+    template <class W> __device__ static __forceinline__ const u8 *high_at(const W &w, u64 tile, u64 kblock, u32 r) {
+        return w.high.chunk(w.base, w.stride, tile, high_byte(kblock, r));
     }
+    // The k-block's high bits at `at` (global or shared): HIGH bytes, at a
+    // multiple of HIGH, 2 or 4 (the registry's high parts are whole bytes per
+    // 32 columns and at most `GRID_HIGH_BITS`).
+    static_assert(HIGH == 2 || HIGH == 4, "a k-block's high part is a half word or a word");
+    __device__ static __forceinline__ u32 high_word(const u8 *at) {
+        if constexpr (HIGH == 2)
+            return *reinterpret_cast<const u16 *>(at);
+        else
+            return *reinterpret_cast<const u32 *>(at);
+    }
+    // The same of global memory through the read-only cache: a half word as
+    // the aligned word holding it (a plane starts 16-byte aligned).
+    __device__ static __forceinline__ u32 high_word_nc(const u8 *global) {
+        if constexpr (HIGH == 2) {
+            const u32 at = (u32)reinterpret_cast<u64>(global) & 3u;
+            return (seismic_ld_nc_u32(global - at) >> (8 * at)) & 0xffffu;
+        } else {
+            return seismic_ld_nc_u32(global);
+        }
+    }
+    __device__ static __forceinline__ void load_high(const u8 *at, u32 (&w)[WORDS]) { w[LOW_WORDS] = high_word(at); }
 };
 
 // An entry's grid points (`grids::table<GRID>`, LANES values a point, its
@@ -1534,27 +1565,21 @@ __device__ __forceinline__ u32 byte_signs(u32 bytes) {
     return ((bytes >> 7) & 1u) | ((bytes >> 14) & 2u) | ((bytes >> 21) & 4u) | ((bytes >> 28) & 8u);
 }
 
-// A grid code of entries E and points Pts: SIGNS sign bits past the indices
-// (eight, or seven completed by an eighth of even parity, over magnitudes; none for
-// signed points, two's complement bytes), and where DELTA_BIT is not 0 a
+// A grid code of entries E and points Pts: the sign bits of sign mode SIGNS
+// past the indices (`grid_signs`, over magnitudes; none for signed points,
+// two's complement bytes), and where DELTA_BIT is not 0 a
 // delta there: a value's code is then 2^DELTA times it, plus 1, or minus 1
 // with the delta set (s8 throughout: |code| < 128).
-template <class E, class Pts, int SIGNS, u32 DELTA_BIT = 0, u32 DELTA = 0> struct GridCodes {
-    static_assert(SIGNS == 8 || SIGNS == 7 || SIGNS == 0, "eight signs, seven and their parity, or signed points");
+template <class E, class Pts, u32 SIGNS, u32 DELTA_BIT = 0, u32 DELTA = 0> struct GridCodes {
     typedef E entries;
     typedef Pts points;
-    static constexpr bool SIGNED = SIGNS == 0;
+    static constexpr bool SIGNED = SIGNS == SEISMIC_GRID_SIGNS_NONE;
     static constexpr int WORDS = E::WORDS;       // words of a row's k-block entries
     __device__ static __forceinline__ void load(const u8 *global, u32 (&w)[WORDS]) { E::load(global, w); }
     __device__ static __forceinline__ void load_shared(const u8 *shared, u32 (&w)[WORDS]) {
         E::load_shared(shared, w);
     }
-    __device__ static __forceinline__ u32 signs(u32 entry) {
-        if constexpr (SIGNED)
-            return 0u;
-        else
-            return grid_signs<SIGNS>(entry >> Pts::SIGNS);
-    }
+    __device__ static __forceinline__ u32 signs(u32 entry) { return grid_signs<SIGNS>(entry >> Pts::SIGNS); }
     // Four signed point bytes of `entry` as its codes (the delta applied).
     __device__ static __forceinline__ u32 codes(u32 bytes, u32 entry) {
         if constexpr (DELTA_BIT == 0)
@@ -1592,11 +1617,11 @@ template <class E, class Pts, int SIGNS, u32 DELTA_BIT = 0, u32 DELTA = 0> struc
 
 // The grid code of a packed element's grid axes: entries of LOW / 8 bytes
 // and HIGH bits more, and points of INDEX_BITS-bit indices, LANES values
-// each, signed by SIGNS sign bits, with a delta at DELTA_BIT (0: none) of
+// each, signed by sign mode SIGNS, with a delta at DELTA_BIT (0: none) of
 // exponent DELTA.
 template <u32 LOW, u32 HIGH, u32 GRID, u32 INDEX_BITS, u32 LANES, u32 SIGNS, u32 DELTA_BIT, u32 DELTA>
 struct GridCodesOf {
-    typedef GridCodes<Entries<(int)LOW / 8, (int)HIGH>, Points<GRID, (int)INDEX_BITS, (int)LANES>, (int)SIGNS, DELTA_BIT,
+    typedef GridCodes<Entries<(int)LOW / 8, (int)HIGH>, Points<GRID, (int)INDEX_BITS, (int)LANES>, SIGNS, DELTA_BIT,
                       DELTA>
         type;
 };
@@ -1623,9 +1648,8 @@ template <class G> struct GridPlanes {
         G::load(w.low.chunk(w.base, w.stride, tile, row), raw.g);
         G::load(w.low.chunk(w.base, w.stride, tile, row + 8 * KBLOCK_BYTES), raw.g8);
         if constexpr (HIGH_BYTES != 0) {
-            const u64 high = (kblock * 16 + lane / 4) * HIGH_BYTES;
-            G::entries::load_high(w.high.chunk(w.base, w.stride, tile, high), raw.g);
-            G::entries::load_high(w.high.chunk(w.base, w.stride, tile, high + 8 * HIGH_BYTES), raw.g8);
+            G::entries::load_high(G::entries::high_at(w, tile, kblock, lane / 4), raw.g);
+            G::entries::load_high(G::entries::high_at(w, tile, kblock, lane / 4 + 8), raw.g8);
         }
         raw.t = lane % 4;
         return raw;
@@ -1670,7 +1694,8 @@ template <class G> struct GridPlanes {
     template <class W> __device__ static __forceinline__ const u8 *chunk_source(const W &w, u64 tile, u64 kblock, u32 chunk) {
         if constexpr (HIGH_BYTES != 0)
             if (chunk >= (u32)KBLOCK_BYTES)
-                return w.high.chunk(w.base, w.stride, tile, kblock * 16 * HIGH_BYTES + (chunk - KBLOCK_BYTES) * 16);
+                return w.high.chunk(w.base, w.stride, tile,
+                                    G::entries::high_byte(kblock, 0) + (chunk - KBLOCK_BYTES) * 16);
         return w.low.chunk(w.base, w.stride, tile, kblock * 16 * KBLOCK_BYTES + chunk * 16);
     }
     __device__ static __forceinline__ Raw from_shared(const u8 *staged, u32 lane) {
@@ -2201,35 +2226,37 @@ template <u32 BITS, int OFFSET> struct LocalOf<SEISMIC_CODES_OFFSET, BITS, OFFSE
 template <u32 BITS, int OFFSET> struct LocalOf<SEISMIC_CODES_ODD, BITS, OFFSET> { typedef OddCode type; };
 
 template <u32 COEFF, u32 SCALE, u32 BIAS, int BIAS_SIGN, u32 GROUP, u32 STORAGE, u32 FACTOR_GROUP, int EXPONENT,
-          int CODE_EXPONENT, u32 LOCAL_BITS, u32 LOCAL, int LOCAL_OFFSET, u32 CARRIED, u32 LOW, u32 HIGH, u32 SIGNED,
-          int SIGNED_EXPONENT>
+          int CODE_EXPONENT, u32 LOCAL_BITS, u32 FIELD_BITS, u32 LOCAL, int LOCAL_OFFSET, u32 CARRIED, u32 LOW,
+          u32 HIGH, int SIGNED_EXPONENT>
 struct CoefficientsOf;
 template <u32 SCALE, u32 BIAS, int BIAS_SIGN, u32 GROUP, u32 STORAGE, u32 FACTOR_GROUP, int EXPONENT,
-          int CODE_EXPONENT, u32 LOCAL_BITS, u32 LOCAL, int LOCAL_OFFSET, u32 CARRIED, u32 LOW, u32 HIGH, u32 SIGNED,
-          int SIGNED_EXPONENT>
+          int CODE_EXPONENT, u32 LOCAL_BITS, u32 FIELD_BITS, u32 LOCAL, int LOCAL_OFFSET, u32 CARRIED, u32 LOW,
+          u32 HIGH, int SIGNED_EXPONENT>
 struct CoefficientsOf<SEISMIC_COEFF_DIRECT, SCALE, BIAS, BIAS_SIGN, GROUP, STORAGE, FACTOR_GROUP, EXPONENT,
-                      CODE_EXPONENT, LOCAL_BITS, LOCAL, LOCAL_OFFSET, CARRIED, LOW, HIGH, SIGNED, SIGNED_EXPONENT> {
-    typedef Direct<typename ScaleOf<SCALE>::type, (int)GROUP, BIAS != 0, (int)STORAGE, CODE_EXPONENT> type;
+                      CODE_EXPONENT, LOCAL_BITS, FIELD_BITS, LOCAL, LOCAL_OFFSET, CARRIED, LOW, HIGH,
+                      SIGNED_EXPONENT> {
+    static_assert(BIAS == 0 || BIAS == SEISMIC_BIAS_STORED, "a direct coefficient's bias is stored");
+    typedef Direct<typename ScaleOf<SCALE>::type, (int)GROUP, BIAS == SEISMIC_BIAS_STORED, (int)STORAGE,
+                   CODE_EXPONENT>
+        type;
 };
 // Hierarchical coefficients' factors are per 256-code superblock; their
 // local codes are in the scales plane (`Hier`) or, where CARRIED is not 0,
 // at entry bit CARRIED of grid entries of LOW / 8 bytes and HIGH bits more
-// (`CarriedHier`); with SIGNED a sign bit follows a scale code (its bias,
-// for which BIAS is also set, `registry::LocalBias::Signed`).
+// (`CarriedHier`), FIELD_BITS a group's.
 template <u32 SCALE, u32 BIAS, int BIAS_SIGN, u32 GROUP, u32 STORAGE, u32 FACTOR_GROUP, int EXPONENT,
-          int CODE_EXPONENT, u32 LOCAL_BITS, u32 LOCAL, int LOCAL_OFFSET, u32 CARRIED, u32 LOW, u32 HIGH, u32 SIGNED,
-          int SIGNED_EXPONENT>
+          int CODE_EXPONENT, u32 LOCAL_BITS, u32 FIELD_BITS, u32 LOCAL, int LOCAL_OFFSET, u32 CARRIED, u32 LOW,
+          u32 HIGH, int SIGNED_EXPONENT>
 struct CoefficientsOf<SEISMIC_COEFF_HIER, SCALE, BIAS, BIAS_SIGN, GROUP, STORAGE, FACTOR_GROUP, EXPONENT,
-                      CODE_EXPONENT, LOCAL_BITS, LOCAL, LOCAL_OFFSET, CARRIED, LOW, HIGH, SIGNED, SIGNED_EXPONENT> {
+                      CODE_EXPONENT, LOCAL_BITS, FIELD_BITS, LOCAL, LOCAL_OFFSET, CARRIED, LOW, HIGH,
+                      SIGNED_EXPONENT> {
     static_assert(FACTOR_GROUP == 256, "hierarchical factors are per 256-code superblock");
-    static constexpr bool MIN = BIAS != 0 && SIGNED == 0;
-    static_assert(CARRIED == 0 || !MIN, "grid entries carry scale codes without a minimum");
     typedef typename ScaleOf<SCALE>::type FS;
     typedef typename LocalOf<LOCAL, LOCAL_BITS, LOCAL_OFFSET>::type L;
     typedef typename Select<CARRIED != 0,
                             CarriedHier<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, (int)GROUP, CARRIED, (int)LOW / 8,
-                                        (int)HIGH, SIGNED != 0, SIGNED_EXPONENT>,
-                            Hier<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, (int)GROUP, MIN, BIAS_SIGN, SIGNED != 0,
+                                        (int)HIGH, BIAS, FIELD_BITS, SIGNED_EXPONENT>,
+                            Hier<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, (int)GROUP, BIAS, BIAS_SIGN, FIELD_BITS,
                                  SIGNED_EXPONENT>>::type type;
 };
 
@@ -2301,10 +2328,10 @@ template <class W> __device__ __forceinline__ void row_values16(const W &w, u64 
                             ELEMENT_CAT(P, _COEFF_BIAS_SIGN), ELEMENT_CAT(P, _COEFF_GROUP),                    \
                             ELEMENT_CAT(P, _LOGICAL_GROUP), ELEMENT_CAT(P, _COEFF_FACTOR_GROUP),               \
                             ELEMENT_CAT(P, _COEFF_EXPONENT), ELEMENT_CAT(P, _CODES_EXPONENT),                  \
-                            ELEMENT_CAT(P, _COEFF_LOCAL_BITS), ELEMENT_CAT(P, _COEFF_LOCAL),                   \
-                            ELEMENT_CAT(P, _COEFF_LOCAL_OFFSET), ELEMENT_CAT(P, _COEFF_CARRIED),               \
-                            ELEMENT_CAT(P, _CODE_LOW_BITS), ELEMENT_CAT(P, _CODE_HIGH_BITS),                   \
-                            ELEMENT_CAT(P, _COEFF_SIGNED_BIAS), ELEMENT_CAT(P, _COEFF_SIGNED_EXPONENT)>::type
+                            ELEMENT_CAT(P, _COEFF_LOCAL_BITS), ELEMENT_CAT(P, _COEFF_FIELD_BITS),              \
+                            ELEMENT_CAT(P, _COEFF_LOCAL), ELEMENT_CAT(P, _COEFF_LOCAL_OFFSET),                 \
+                            ELEMENT_CAT(P, _COEFF_CARRIED), ELEMENT_CAT(P, _CODE_LOW_BITS),                    \
+                            ELEMENT_CAT(P, _CODE_HIGH_BITS), ELEMENT_CAT(P, _COEFF_SIGNED_EXPONENT)>::type
 
 // A packed element's decoder type, and its value at `pointer`.
 #define PACKETS_DECODER(P)                                                                               \

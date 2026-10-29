@@ -279,7 +279,7 @@ kernel void dense_output_pack(DENSE_OUTPUT_ARGUMENTS,
     typedef projection::packing_codes<packets::W0> coded;
     constexpr uint BOUNDS = SEISMIC_DIM_DB != 0 ? 1 : 0;
     const projection::packing_bounds<BOUNDS> bounds{{down_bound}};
-    projection::packing_operand<coded::centre, coded::folds, (coded::residue != 0 ? RESIDUE : 0), BOUNDS>(in,
+    projection::packing_operand<coded::magnitude, coded::folds, (coded::residue != 0 ? RESIDUE : 0), BOUNDS>(in,
         scratch, bounds, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), pairs, peaks, thread_index, sg, lane);
 }
 #endif

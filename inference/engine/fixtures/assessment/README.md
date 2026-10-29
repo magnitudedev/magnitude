@@ -89,7 +89,7 @@ header and then only the sampled values, with range requests. Sources
   (`mtp`, `dflash`, `dspark` or `dflash2`) or `{ "rejected": [reasons] }`. When it is omitted, the
   drafter is `"none"`.
 - Reasons use the serde form of the engine's `UnsupportedReason`, for example
-  `{ "WeightTypes": { "types": [{ "ggml_type": "Q2_K", "tensor_count": 147 }] } }`,
+  `{ "WeightTypes": { "types": [{ "ggml_type": "I32", "tensor_count": 3 }] } }`,
   `{ "Architecture": { "architecture": "deepseek4" } }` or `"Unreadable"`.
 - A `TargetMismatch` detail is developer text. The expected detail only has to occur in the actual
   one. Every other reason must be equal.

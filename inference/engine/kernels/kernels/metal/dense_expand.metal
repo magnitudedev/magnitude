@@ -290,7 +290,7 @@ kernel void dense_expand_pack(DENSE_EXPAND_ARGUMENTS,
     constexpr uint BOUNDS =
         projection::packing_bounded<3u, (SEISMIC_DIM_GB != 0 ? 1u : 0u) | (SEISMIC_DIM_UB != 0 ? 2u : 0u)>::value;
     const projection::packing_bounds<BOUNDS> bounds{{gate_bound, up_bound}};
-    projection::packing_operand<shared::centre, shared::folds, shared::residue, BOUNDS>(x, gate_scratch, bounds,
+    projection::packing_operand<shared::magnitude, shared::folds, shared::residue, BOUNDS>(x, gate_scratch, bounds,
         uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_H), pairs, peaks, thread_index, sg, lane);
 }
 #endif

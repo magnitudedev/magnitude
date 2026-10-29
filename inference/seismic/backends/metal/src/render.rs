@@ -792,7 +792,15 @@ impl<'a> Renderer<'a> {
                             bits,
                             interpretation,
                             ..
-                        } => interpret_code(&temps[recipe.ordinal(*raw)], *bits, interpretation),
+                        } => {
+                            let code = &temps[recipe.ordinal(*raw)];
+                            let code = if recipe.exceeds(*raw, *bits) {
+                                format!("(uint({code}) & {}u)", u32::MAX >> (32 - bits))
+                            } else {
+                                code.clone()
+                            };
+                            interpret_code(&code, *bits, interpretation)
+                        }
                         DecodeStep::ReadPlaneLane { plane, .. } => {
                             plane_lane(coords, layout.planes[*plane as usize].group)
                         }
@@ -1777,13 +1785,39 @@ fn repack_expression(expression: &RepackExpr, source: &str, lookups: &mut Lookup
                 lookups.name(LookupTable::Repack(*table))
             )
         }
-        // `seismic_lang::repack::base3_digit`.
         RepackExpr::Base3Digit { value, digit } => format!(
-            "int((((uint({}) * {}u) & 0xffu) * 3u) >> 8)",
-            repack_expression(value, source, lookups),
-            3u32.pow(u32::from(*digit))
+            "int({})",
+            word_immediates(
+                &format!("uint({})", repack_expression(value, source, lookups)),
+                &seismic_lang::repack::base3_digit_ops(u32::from(*digit)),
+                ""
+            )
         ),
     }
+}
+
+/// `ops` applied in turn to the unsigned word `value`, each result an
+/// expression to parenthesize, its shift counts suffixed by `shift_suffix`.
+fn word_immediates(
+    value: &str,
+    ops: &[seismic_lang::repack::WordImmediate],
+    shift_suffix: &str,
+) -> String {
+    use seismic_lang::repack::WordImmediate;
+    ops.iter()
+        .enumerate()
+        .fold(value.to_owned(), |value, (index, op)| {
+            let operand = if index == 0 {
+                value
+            } else {
+                format!("({value})")
+            };
+            match op {
+                WordImmediate::Multiply(factor) => format!("{operand} * {factor}u"),
+                WordImmediate::And(mask) => format!("{operand} & {mask:#x}u"),
+                WordImmediate::ShiftRight(bits) => format!("{operand} >> {bits}{shift_suffix}"),
+            }
+        })
 }
 
 fn strict_f32_publication(dtype: DType, expression: &str) -> String {
@@ -1859,27 +1893,28 @@ fn grid_code(raw: &str, lane: &str, grid: &GridCodes, table: &str) -> String {
         "int({table}[({index}) * {lanes}u + (({lane}) & {}u)])",
         lanes - 1
     );
-    let value = match grid.signs {
-        GridSigns::None => value,
-        signs => {
-            let bits = signs.bits();
-            let explicit = format!(
-                "((uint({raw}) >> {}u) & {}u)",
-                grid.sign_bit(),
-                (1u32 << bits) - 1
-            );
-            let signs = match signs {
-                GridSigns::ParityPlus7 => {
-                    format!("({explicit} | ((popcount({explicit}) & 1u) << {bits}u))")
-                }
-                _ => explicit,
-            };
-            format!("(((({signs}) >> ({lane})) & 1u) != 0u ? -{value} : {value})")
-        }
+    // The lane signs (`GridSigns::lanes`), none for signed points.
+    let explicit = format!(
+        "((uint({raw}) >> {}u) & {}u)",
+        grid.sign_bit(),
+        (1u32 << grid.signs.bits()) - 1
+    );
+    let lane_signs = match grid.signs {
+        GridSigns::None => None,
+        GridSigns::Explicit8 => Some(explicit),
+        GridSigns::ParityPlus7 => Some(format!(
+            "({explicit} | ((popcount({explicit}) & 1u) << {}u))",
+            grid.signs.bits()
+        )),
+    };
+    let value = match lane_signs {
+        None => value,
+        Some(signs) => format!("(((({signs}) >> ({lane})) & 1u) != 0u ? -{value} : {value})"),
     };
     match grid.delta {
         Some(exponent) => format!(
-            "((({value}) << {exponent}) + (((uint({raw}) >> {}u) & 1u) != 0u ? -1 : 1))",
+            "((({value}) * {}) + (((uint({raw}) >> {}u) & 1u) != 0u ? -1 : 1))",
+            1i32 << exponent,
             grid.delta_bit()
         ),
         None => value,

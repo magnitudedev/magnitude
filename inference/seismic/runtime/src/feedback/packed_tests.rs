@@ -34,73 +34,79 @@ fn packed_reads(backend: registry::BackendName) {
         let bindings = ElementBindings::new().bind("Q", representation);
         let entry_id = module.entry_named("probe").unwrap();
         let entry = module.entry(entry_id, &bindings).unwrap();
-        let mut bytes = vec![0; layout.packet_size as usize];
-        for (ordinal, plane) in layout.planes.iter().enumerate() {
-            let storage =
-                &mut bytes[plane.offset as usize..(plane.offset + plane.bytes_per_group) as usize];
-            match plane.encoding {
-                registry::PlaneEncoding::Dense(dtype) => {
-                    for (i, slot) in storage.chunks_exact_mut(dtype.bytes() as usize).enumerate() {
-                        let scalar = seismic_lang::reference_math::float_literal(
-                            dtype,
-                            if (i + ordinal) % 2 == 0 {
-                                1.0078125
-                            } else {
-                                -0.03125
-                            },
-                        );
-                        slot.copy_from_slice(
-                            &scalar.bits().to_le_bytes()[..dtype.bytes() as usize],
-                        );
+        // The fill and its complement: every bit of every packed field is
+        // read both clear and set (a signed bias's sign bit among them).
+        for flip in [0u8, 0xff] {
+            let mut bytes = vec![0; layout.packet_size as usize];
+            for (ordinal, plane) in layout.planes.iter().enumerate() {
+                let storage = &mut bytes
+                    [plane.offset as usize..(plane.offset + plane.bytes_per_group) as usize];
+                match plane.encoding {
+                    registry::PlaneEncoding::Dense(dtype) => {
+                        for (i, slot) in
+                            storage.chunks_exact_mut(dtype.bytes() as usize).enumerate()
+                        {
+                            let scalar = seismic_lang::reference_math::float_literal(
+                                dtype,
+                                if (i + ordinal) % 2 == 0 {
+                                    1.0078125
+                                } else {
+                                    -0.03125
+                                },
+                            );
+                            slot.copy_from_slice(
+                                &scalar.bits().to_le_bytes()[..dtype.bytes() as usize],
+                            );
+                        }
                     }
-                }
-                _ => {
-                    // Different adjacent bytes force five/six-bit fields to use
-                    // both sides of byte and word boundaries.
-                    for (i, byte) in storage.iter_mut().enumerate() {
-                        *byte = (i as u8).wrapping_mul(73).wrapping_add(0x95);
+                    _ => {
+                        // Different adjacent bytes force five/six-bit fields to use
+                        // both sides of byte and word boundaries.
+                        for (i, byte) in storage.iter_mut().enumerate() {
+                            *byte = (i as u8).wrapping_mul(73).wrapping_add(0x95) ^ flip;
+                        }
                     }
                 }
             }
+            let mut interpreter = Interpreter::new(&entry);
+            let tensor = interpreter.add_tensor(
+                TensorData::encoded(representation, vec![layout.group as usize], bytes.clone())
+                    .unwrap(),
+            );
+            let outcome = interpreter.run(&[Arg::Tensor(tensor)]).unwrap();
+            let reference = outcome.results().next().unwrap();
+            let seismic_lang::interp::OutcomeValue::Tensor(reference) = reference.value() else {
+                panic!()
+            };
+            let expected = reference.canonical_bytes().unwrap().unwrap();
+            let prepared = crate::api::kernel::prepare(
+                &module,
+                entry_id,
+                bindings.clone(),
+                &device,
+                PreparationOptions::feedback(
+                    PrecisionPolicy::Exact,
+                    FeedbackOptions {
+                        search_time: Duration::ZERO,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap();
+            let input = Arc::new(
+                TensorInner::from_host(&device, representation, &[u64::from(layout.group)], &bytes)
+                    .unwrap(),
+            );
+            let mut args = EncodedArgs::new();
+            args.push_tensor(input.clone());
+            let mut actual = crate::api::kernel::call(&Arc::new(prepared), args).unwrap();
+            assert_eq!(
+                actual.take_tensor().read_to_host().unwrap(),
+                expected,
+                "{backend:?}/{name} packed fields and arithmetic (fill {flip:#x})"
+            );
+            assert_eq!(input.read_to_host().unwrap(), bytes);
         }
-        let mut interpreter = Interpreter::new(&entry);
-        let tensor = interpreter.add_tensor(
-            TensorData::encoded(representation, vec![layout.group as usize], bytes.clone())
-                .unwrap(),
-        );
-        let outcome = interpreter.run(&[Arg::Tensor(tensor)]).unwrap();
-        let reference = outcome.results().next().unwrap();
-        let seismic_lang::interp::OutcomeValue::Tensor(reference) = reference.value() else {
-            panic!()
-        };
-        let expected = reference.canonical_bytes().unwrap().unwrap();
-        let prepared = crate::api::kernel::prepare(
-            &module,
-            entry_id,
-            bindings,
-            &device,
-            PreparationOptions::feedback(
-                PrecisionPolicy::Exact,
-                FeedbackOptions {
-                    search_time: Duration::ZERO,
-                    ..Default::default()
-                },
-            ),
-        )
-        .unwrap();
-        let input = Arc::new(
-            TensorInner::from_host(&device, representation, &[u64::from(layout.group)], &bytes)
-                .unwrap(),
-        );
-        let mut args = EncodedArgs::new();
-        args.push_tensor(input.clone());
-        let mut actual = crate::api::kernel::call(&Arc::new(prepared), args).unwrap();
-        assert_eq!(
-            actual.take_tensor().read_to_host().unwrap(),
-            expected,
-            "{backend:?}/{name} packed fields and arithmetic"
-        );
-        assert_eq!(input.read_to_host().unwrap(), bytes);
     }
 }
 

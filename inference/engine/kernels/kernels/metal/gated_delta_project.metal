@@ -232,7 +232,7 @@ kernel void gated_delta_project_tall(RECURRENT_PROJECT_ARGUMENTS,
     const projection::packing_scratch gate_scratch{packed, token_factors, token_scales, \
         weight_factors + ulong(qkv_rows) * (k / 32u) * 2u, weight_scales + qkv_rows}
 // The shared operand coded for WIDTH residue bits where it has them; its
-// layout (folds, centre, the weights it serves) is every width's.
+// layout (folds, magnitude, the weights it serves) is every width's.
 #define RECURRENT_PROJECT_PACKING_OF(WIDTH)                                             \
     projection::packing_shared<WIDTH, packets::W0, uint((2 * SEISMIC_DIM_NK + SEISMIC_DIM_NV) * SEISMIC_DIM_W), \
         packets::W1, uint(SEISMIC_DIM_NV * SEISMIC_DIM_W)>
@@ -260,7 +260,7 @@ kernel void gated_delta_project_pack(RECURRENT_PROJECT_ARGUMENTS,
     constexpr uint BOUNDED = (SEISMIC_DIM_QB != 0 ? 1u : 0u) | (SEISMIC_DIM_ZB != 0 ? 2u : 0u);
     constexpr uint BOUNDS = projection::packing_bounded<SERVED, BOUNDED>::value;
     const projection::packing_bounds<BOUNDS> bounds{{qkv_bound, gate_bound}};
-    projection::packing_operand<RECURRENT_PROJECT_PACKING::centre, RECURRENT_PROJECT_PACKING::folds,
+    projection::packing_operand<RECURRENT_PROJECT_PACKING::magnitude, RECURRENT_PROJECT_PACKING::folds,
         RECURRENT_PROJECT_PACKING_OF(RESIDUE)::residue, BOUNDS>(x, qkv_scratch, bounds, uint(SEISMIC_DIM_M), k,
         pairs, peaks,
         thread_index, sg, lane);

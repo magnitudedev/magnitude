@@ -334,15 +334,16 @@ pub enum GridSigns {
 }
 
 impl GridSigns {
-    /// The mode whose entries hold `bits` sign bits.
-    pub const fn of_bits(bits: u32) -> Self {
-        match bits {
-            0 => Self::None,
-            7 => Self::ParityPlus7,
-            8 => Self::Explicit8,
-            _ => panic!("eight signs, seven and their parity, or none"),
+    pub const ALL: [Self; 3] = [Self::ParityPlus7, Self::Explicit8, Self::None];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::ParityPlus7 => "PARITY_PLUS7",
+            Self::Explicit8 => "EXPLICIT8",
+            Self::None => "NONE",
         }
     }
+
     /// Sign bits an entry holds.
     pub const fn bits(self) -> u32 {
         match self {
@@ -636,7 +637,10 @@ pub enum DecodeStep {
     /// `plane` covers: a vector code's lane.
     ReadPlaneLane { into: DecodeTemp, plane: u32 },
     /// `into: i32 := interpretation.decode(raw, bits)` (unsigned, two's
-    /// complement, zero-point offset, or table).
+    /// complement, zero-point offset, or table) of the low `bits` bits of
+    /// `raw`; bits above them are not the code's (a signed bias's scale
+    /// code is the field below its sign bit). A lowering masks `raw` where
+    /// `DecodeRecipe::exceeds` says it may hold them.
     InterpretCode {
         into: DecodeTemp,
         raw: DecodeTemp,
@@ -965,6 +969,17 @@ impl DecodeRecipe {
 
     pub fn planes(&self) -> &[PlaneSchema] {
         &self.planes
+    }
+
+    /// Whether `temp` may hold bits at or above bit `bits`: a plane field
+    /// is exactly its entry wide, any other temporary a full word.
+    pub fn exceeds(&self, temp: DecodeTemp, bits: u32) -> bool {
+        match self.steps.iter().find(|step| step.defines() == temp) {
+            Some(DecodeStep::ReadPlaneField { plane, .. }) => {
+                self.planes[*plane as usize].entry_bits > bits
+            }
+            _ => bits < 32,
+        }
     }
 
     pub fn steps(&self) -> &[DecodeStep] {
@@ -1658,13 +1673,9 @@ pub(crate) fn lookup(name: &str) -> Option<&'static Repr> {
 
 impl CodeInterpretation {
     pub(crate) fn decode(&self, raw: u32, bits: u32) -> i32 {
-        let recipe = crate::reference_math::code_recipe(self, bits);
-        let value = crate::reference_math::evaluate(
-            &recipe,
-            &[crate::reference_math::ReferenceScalar::U32(raw)],
-        )
-        .expect("registry code interpretation is total");
-        let crate::reference_math::ReferenceScalar::I32(value) = value else {
+        let crate::reference_math::ReferenceScalar::I32(value) =
+            crate::reference_math::code_value(self, bits, raw)
+        else {
             unreachable!()
         };
         value
@@ -1735,6 +1746,76 @@ pub struct DecodeAxes {
     pub coefficients: CoefficientAxes,
 }
 
+/// How the token-packing projection forms (Metal's
+/// `projection/packing.h`) read a decoder's codes ([`DecodeAxes::packing`],
+/// emitted as `_PACKING_RUN`, `_PACKING_CENTRE`, `_PACKING_MAGNITUDE` and
+/// `_PACKING_RESIDUE`): a 32-column block is runs of `run` columns under one
+/// scale each, the codes enter centred at `centre` (their zero where they
+/// have a negative code, else half their range), and `magnitude` is the
+/// largest magnitude of a code minus the centre, which bounds every sum of a
+/// run's products.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Packing {
+    pub run: u32,
+    pub centre: u32,
+    pub magnitude: u32,
+}
+
+impl Packing {
+    /// The largest code magnitude whose sums the packed forms' 16-bit fields
+    /// hold at their full token codes: codes of 7-bit two's complement
+    /// values or narrower.
+    const FIELD_MAGNITUDE: u32 = 64;
+
+    /// Whether the codes' sums take residue bits beside their 16-bit
+    /// fields: codes of 8-bit values (beyond `FIELD_MAGNITUDE`), whose sums
+    /// 16 bits a token do not hold at a useful gain.
+    pub fn residue(&self) -> bool {
+        self.magnitude > Self::FIELD_MAGNITUDE
+    }
+}
+
+impl DecodeAxes {
+    /// The packed forms' reading of these codes, where they serve them:
+    /// integer codes (linear codes as stored, codebooks' values and grid
+    /// codes as 8-bit values, so only those whose every value is one), not
+    /// scaled by a power of two of their own, under one or two coefficient
+    /// groups a 32-value packet. A block of two runs has no term beside its
+    /// scaled codes (no stored, minimum or signed bias, and codes centred
+    /// at their zero: codes with a negative value) and no residue (an
+    /// operand with residue bits scales every 32 columns). `None` for any
+    /// other decoder.
+    pub fn packing(&self) -> Option<Packing> {
+        let codes = match &self.code {
+            CodeInterpretation::Unsigned
+            | CodeInterpretation::TwosComplement
+            | CodeInterpretation::Offset(_) => self.code.codes(self.low + self.high),
+            CodeInterpretation::Table(_) | CodeInterpretation::Grid(_) => {
+                let codes = self.code.codes(self.low + self.high);
+                codes
+                    .iter()
+                    .all(|code| i8::try_from(*code).is_ok())
+                    .then_some(codes)?
+            }
+            CodeInterpretation::Odd | CodeInterpretation::SignedOdd => return None,
+        };
+        if self.code_exponent != 0 {
+            return None;
+        }
+        let (CoefficientAxes::Direct { group, .. } | CoefficientAxes::Hierarchical { group, .. }) =
+            &self.coefficients;
+        let bias = self.coefficients.bias().is_some();
+        let (least, largest) = (codes[0], codes[codes.len() - 1]);
+        let centre = if least < 0 { 0 } else { (largest + 1) / 2 };
+        let packing = Packing {
+            run: (*group).min(32),
+            centre: u32::try_from(centre).ok()?,
+            magnitude: u32::try_from((centre - least).max(largest - centre)).ok()?,
+        };
+        (packing.run == 32 || !(bias || centre != 0 || packing.residue())).then_some(packing)
+    }
+}
+
 /// A decoder's coefficients: a stored scale (and bias) per `group` values,
 /// or per `group` local codes (`LocalCodes`) under a factor (and minimum
 /// factor) per `factor_group` scaled by `2^exponent`.
@@ -1793,6 +1874,62 @@ impl LocalBias {
             None => bits,
             Some(Self::Minimum(_)) => 2 * bits,
             Some(Self::Signed { .. }) => bits + 1,
+        }
+    }
+}
+
+/// A decoder's bias without its parameters: a stored bias per group
+/// (`CoefficientAxes::Direct`), or a hierarchical group's minimum code or
+/// sign bit (`LocalBias`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BiasKind {
+    Stored,
+    Minimum,
+    Signed,
+}
+
+impl BiasKind {
+    pub const ALL: [Self; 3] = [Self::Stored, Self::Minimum, Self::Signed];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Stored => "STORED",
+            Self::Minimum => "MINIMUM",
+            Self::Signed => "SIGNED",
+        }
+    }
+}
+
+impl LocalCodes {
+    pub const fn bits(&self) -> u32 {
+        match self {
+            Self::Plane { bits, .. } | Self::Carried { bits, .. } => *bits,
+        }
+    }
+
+    pub const fn bias(&self) -> Option<LocalBias> {
+        match self {
+            Self::Plane { bias, .. } | Self::Carried { bias, .. } => *bias,
+        }
+    }
+
+    /// Bits of a group's field (`LocalBias::field_bits`).
+    pub const fn field_bits(&self) -> u32 {
+        LocalBias::field_bits(self.bias(), self.bits())
+    }
+}
+
+impl CoefficientAxes {
+    /// The kind of the coefficients' bias, if they have one.
+    pub const fn bias(&self) -> Option<BiasKind> {
+        match self {
+            Self::Direct { bias: true, .. } => Some(BiasKind::Stored),
+            Self::Direct { bias: false, .. } => None,
+            Self::Hierarchical { locals, .. } => match locals.bias() {
+                Some(LocalBias::Minimum(_)) => Some(BiasKind::Minimum),
+                Some(LocalBias::Signed { .. }) => Some(BiasKind::Signed),
+                None => None,
+            },
         }
     }
 }
@@ -2676,20 +2813,23 @@ mod tests {
 
     #[test]
     fn compact_planes_match_payload() {
-        for (name, expected) in [
-            ("q2k", 84),
-            ("q3k", 110),
-            ("q4k", 144),
-            ("q5k", 176),
-            ("q6k", 210),
+        use magnitude_ggml::Encoding;
+        // The k-quants hold their GGUF blocks' bytes exactly.
+        for (encoding, name) in [
+            (Encoding::Q2K, "q2k"),
+            (Encoding::Q3K, "q3k"),
+            (Encoding::Q4K, "q4k"),
+            (Encoding::Q5K, "q5k"),
+            (Encoding::Q6K, "q6k"),
         ] {
             let r = lookup(name).unwrap();
             assert_eq!(
                 r.planes()
                     .iter()
-                    .map(|p| p.bytes(256).unwrap())
+                    .map(|p| p.bytes(encoding.block_elements()).unwrap())
                     .sum::<u64>(),
-                expected
+                encoding.block_bytes(),
+                "{name}"
             );
         }
     }

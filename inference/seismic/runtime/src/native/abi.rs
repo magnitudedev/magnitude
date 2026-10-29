@@ -733,7 +733,7 @@ fn render_symbolic_rows(
 /// record's words; for a row layout per group role (`RowPlaneRole::ALL`)
 /// `{prefix}_{ROLE}_WORD` and `_BYTES`, its share's first record word and
 /// bytes (0 and 0 without the role); per code role `{prefix}_{ROLE}_FIRST`
-/// and `_UNIT_WORDS` (`WordSpan`); the alignments a kernel stores the
+/// and `_UNIT_BYTES` (`WordSpan`); the alignments a kernel stores the
 /// record's bytes in (`render_record_alignments`); then the word form as
 /// code (`conversion::render_conversion_code`).
 fn render_conversion(
@@ -758,18 +758,18 @@ fn render_conversion(
         }
     }
     // Per code role its segment of the span: its first record word and a
-    // unit's words (0 and 0 without the role).
+    // unit's bytes (0 and 0 without the role).
     let span = words.span();
     for role in registry::RowPlaneRole::CODES {
-        let (first, unit_words) = span
+        let (first, unit_bytes) = span
             .segments
             .iter()
             .find(|segment| segment.role == role)
-            .map_or((0, 0), |segment| (segment.first, segment.unit_words));
+            .map_or((0, 0), |segment| (segment.first, segment.unit_bytes));
         let role = native_macro(role.name());
         out.push_str(&format!("#define {prefix}_{role}_FIRST {first}\n"));
         out.push_str(&format!(
-            "#define {prefix}_{role}_UNIT_WORDS {unit_words}\n"
+            "#define {prefix}_{role}_UNIT_BYTES {unit_bytes}\n"
         ));
     }
     render_record_alignments(out, prefix, words, conversion.destination_layout);
@@ -780,9 +780,9 @@ fn render_conversion(
 /// bytes a kernel stores together keeps: its start, its length and its
 /// destination's alignment allow. For a row layout, per role
 /// (`RowPlaneRole::ALL`, from a row plane's 16-byte-aligned start)
-/// `{prefix}_{ROLE}_ALIGNMENT`: a code role's unit's words, a group role's
+/// `{prefix}_{ROLE}_ALIGNMENT`: a code role's unit's bytes, a group role's
 /// share; and per code role `{prefix}_{ROLE}_REST_ALIGNMENT`: its share's
-/// bytes past its units' words (an mma16 record's factors). For the packet
+/// bytes past its units' (an mma16 record's factors). For the packet
 /// layout (from a packet's start): `{prefix}_CODES_ALIGNMENT`, a unit's
 /// codes; `{prefix}_LEADING_ALIGNMENT` and `{prefix}_TRAILING_ALIGNMENT`,
 /// the record's bytes before and after the codes (to the packet's end).
@@ -798,18 +798,18 @@ fn render_record_alignments(
         span.segments
             .iter()
             .find(|segment| segment.role == role)
-            .map_or((0, 0), |segment| (segment.first, segment.unit_words))
+            .map_or((0, 0), |segment| (segment.first, segment.unit_bytes))
     };
     match layout {
         registry::ConversionLayout::Packet(packet) => {
             let size = packet.packet_size;
-            let (first, unit_words) = segment(registry::RowPlaneRole::Codes);
-            let end = 4 * (first + span.units * unit_words);
+            let (first, unit_bytes) = segment(registry::RowPlaneRole::Codes);
+            let end = 4 * first + span.units * unit_bytes;
             let stored = (4 * words.words()).min(size);
             let base = alignment(size).min(alignment(4 * first));
             out.push_str(&format!(
                 "#define {prefix}_CODES_ALIGNMENT {}\n#define {prefix}_LEADING_ALIGNMENT {}\n#define {prefix}_TRAILING_ALIGNMENT {}\n",
-                base.min(alignment(4 * unit_words)),
+                base.min(alignment(unit_bytes)),
                 base,
                 alignment(size)
                     .min(alignment(end))
@@ -825,14 +825,14 @@ fn render_record_alignments(
                     .map_or(0, |(_, _, bytes)| *bytes);
                 let name = native_macro(role.name());
                 if registry::RowPlaneRole::CODES.contains(&role) {
-                    let (_, unit_words) = segment(role);
+                    let (_, unit_bytes) = segment(role);
                     out.push_str(&format!(
                         "#define {prefix}_{name}_ALIGNMENT {}\n#define {prefix}_{name}_REST_ALIGNMENT {}\n",
-                        alignment(4 * unit_words),
+                        alignment(unit_bytes),
                         alignment(
                             bytes
-                                .checked_sub(4 * span.units * unit_words)
-                                .expect("a code role's share holds its units' words")
+                                .checked_sub(span.units * unit_bytes)
+                                .expect("a code role's share holds its units")
                         ),
                     ));
                 } else {
@@ -860,6 +860,22 @@ fn render_representation(
         let coded = Coded::of(representation);
         for (axis, value) in CODING_AXES {
             out.push_str(&format!("#define {prefix}_{axis} {}\n", value(&coded)));
+        }
+        // How the token-packing projection forms read the codes
+        // (`DecodeAxes::packing`): a run's columns (0: they do not), the
+        // codes' centre and largest magnitude about it, and whether their
+        // sums take residue bits.
+        let packing = registry::decode_axes(representation)
+            .expect("packed storage has decode axes")
+            .packing();
+        let axis = |value: fn(&registry::Packing) -> u32| packing.as_ref().map_or(0, value);
+        for (name, value) in [
+            ("RUN", axis(|packing| packing.run)),
+            ("CENTRE", axis(|packing| packing.centre)),
+            ("MAGNITUDE", axis(|packing| packing.magnitude)),
+            ("RESIDUE", axis(|packing| u32::from(packing.residue()))),
+        ] {
+            out.push_str(&format!("#define {prefix}_PACKING_{name} {value}\n"));
         }
     }
     // GLSL's preprocessor pastes no tokens in `#if`: Vulkan libraries read a
@@ -933,10 +949,8 @@ fn render_representation(
                             ));
                         }
                     }
-                    registry::RowPlaneContent::GridHigh { bits, .. } => {
-                        out.push_str(&format!("#define {plane_prefix}_ENTRY_BITS {bits}\n"))
-                    }
-                    registry::RowPlaneContent::Groups { .. } => {}
+                    registry::RowPlaneContent::GridHigh { .. }
+                    | registry::RowPlaneContent::Groups { .. } => {}
                 }
             }
         }
@@ -1013,11 +1027,10 @@ impl Axis for registry::CodeKind {
 
 /// A code interpretation's axis values: the interpretation, its offset, its
 /// codebook (`SEISMIC_CODEBOOK_<NAME>`), and its grid (`SEISMIC_GRID_<NAME>`)
-/// with the grid's index bits, values a point, sign bits
-/// (`GridSigns::bits`: 8, 7 with their even-parity eighth, or 0 for signed
-/// points) and delta (`GridCodes::delta`: its entry bit, 0 for none, and
-/// exponent); 0 where it has none (and every value 0 for no
-/// interpretation).
+/// with the grid's index bits, values a point, sign mode
+/// (`SEISMIC_GRID_SIGNS_<MODE>`, `GridSigns`) and delta (`GridCodes::delta`:
+/// its entry bit, 0 for none, and exponent); 0 where it has none (and every
+/// value 0 for no interpretation).
 struct Interpretation {
     codes: Option<registry::CodeKind>,
     offset: i32,
@@ -1025,7 +1038,7 @@ struct Interpretation {
     grid: String,
     index_bits: u32,
     lanes: u32,
-    signs: u32,
+    signs: Option<registry::GridSigns>,
     delta_bit: u32,
     delta: u32,
 }
@@ -1039,7 +1052,7 @@ impl Interpretation {
             grid: "0".to_owned(),
             index_bits: 0,
             lanes: 0,
-            signs: 0,
+            signs: None,
             delta_bit: 0,
             delta: 0,
         }
@@ -1068,7 +1081,7 @@ impl Interpretation {
                 grid: id("GRID", grid.grid.name),
                 index_bits: grid.index_bits(),
                 lanes: grid.lanes(),
-                signs: grid.signs.bits(),
+                signs: Some(grid.signs),
                 delta_bit: grid.delta.map_or(0, |_| grid.delta_bit()),
                 delta: grid.delta.unwrap_or(0),
                 ..kind
@@ -1078,6 +1091,26 @@ impl Interpretation {
 
     fn codes(&self) -> String {
         self.codes.map_or_else(|| "0".to_owned(), Axis::constant)
+    }
+
+    fn signs(&self) -> String {
+        self.signs.map_or_else(|| "0".to_owned(), Axis::constant)
+    }
+}
+
+impl Axis for registry::GridSigns {
+    const AXIS: &'static str = "GRID_SIGNS";
+    const ALL: &'static [Self] = &registry::GridSigns::ALL;
+    fn name(self) -> &'static str {
+        registry::GridSigns::name(self)
+    }
+}
+
+impl Axis for registry::BiasKind {
+    const AXIS: &'static str = "BIAS";
+    const ALL: &'static [Self] = &registry::BiasKind::ALL;
+    fn name(self) -> &'static str {
+        registry::BiasKind::name(self)
     }
 }
 
@@ -1100,12 +1133,12 @@ impl Axis for registry::ScaleEncoding {
 /// A row-layout packed element's decode axes (`registry::decode_axes`) as
 /// the ABI's flat values, 0 where its coefficients have none: a direct
 /// coefficient's scale is `scale`; a hierarchical one's factor is `scale`,
-/// its local codes are `local_bits`-bit `local`, its minimum's sign is
-/// `bias_sign` (1 without one), a signed bias (`LocalBias::Signed`, a sign
-/// bit past the scale code) is `signed_bias` with its exponent
-/// `signed_exponent`, and carried local codes sit at entry bit
-/// `carried_bit`, which is past the entry's indices, signs and delta (0:
-/// none carried).
+/// its local codes are `local_bits`-bit `local` in `field_bits`-bit group
+/// fields (`LocalBias::field_bits`), and carried local codes sit at entry
+/// bit `carried_bit`, which is past the entry's indices, signs and delta (0:
+/// none carried). The bias is of kind `bias` (`SEISMIC_BIAS_<KIND>`): a
+/// minimum's sign is `bias_sign` (1 without one), a signed bias's exponent
+/// `signed_exponent`.
 struct Coded {
     low: u32,
     high: u32,
@@ -1113,14 +1146,14 @@ struct Coded {
     code_exponent: i32,
     coeff: registry::CoefficientKind,
     scale: registry::ScaleEncoding,
-    bias: bool,
+    bias: Option<registry::BiasKind>,
     bias_sign: i32,
-    signed_bias: bool,
     signed_exponent: i32,
     group: u32,
     factor_group: u32,
     exponent: i32,
     local_bits: u32,
+    field_bits: u32,
     local: Interpretation,
     carried_bit: u32,
 }
@@ -1128,27 +1161,27 @@ struct Coded {
 impl Coded {
     fn of(id: RepresentationId) -> Self {
         let axes = registry::decode_axes(id).expect("packed storage has decode axes");
-        let flat = |coeff, scale, bias, group| Self {
+        let flat = |coeff, scale, group| Self {
             low: axes.low,
             high: axes.high,
             code: Interpretation::of(&axes.code),
             code_exponent: axes.code_exponent,
             coeff,
             scale,
-            bias,
+            bias: axes.coefficients.bias(),
             bias_sign: 1,
-            signed_bias: false,
             signed_exponent: 0,
             group,
             factor_group: 0,
             exponent: 0,
             local_bits: 0,
+            field_bits: 0,
             local: Interpretation::none(),
             carried_bit: 0,
         };
         match &axes.coefficients {
-            registry::CoefficientAxes::Direct { scale, bias, group } => {
-                flat(axes.coefficients.kind(), *scale, *bias, *group)
+            registry::CoefficientAxes::Direct { scale, group, .. } => {
+                flat(axes.coefficients.kind(), *scale, *group)
             }
             registry::CoefficientAxes::Hierarchical {
                 factor,
@@ -1157,42 +1190,37 @@ impl Coded {
                 group,
                 locals,
             } => {
-                let hierarchical = Self {
-                    factor_group: *factor_group,
-                    exponent: *exponent,
-                    ..flat(axes.coefficients.kind(), *factor, false, *group)
-                };
-                let (bits, interpretation, bias, carried_bit) = match locals {
-                    registry::LocalCodes::Plane {
-                        bits,
-                        interpretation,
-                        bias,
-                    } => (bits, interpretation, bias, 0),
+                let (interpretation, carried_bit) = match locals {
+                    registry::LocalCodes::Plane { interpretation, .. } => (interpretation, 0),
                     registry::LocalCodes::Carried {
                         bit,
-                        bits,
                         interpretation,
-                        bias,
-                    } => (bits, interpretation, bias, *bit),
+                        ..
+                    } => (interpretation, *bit),
                 };
                 Self {
-                    bias: bias.is_some(),
-                    bias_sign: match bias {
+                    factor_group: *factor_group,
+                    exponent: *exponent,
+                    bias_sign: match locals.bias() {
                         Some(registry::LocalBias::Minimum(sign)) => sign.value(),
                         Some(registry::LocalBias::Signed { .. }) | None => 1,
                     },
-                    signed_bias: matches!(bias, Some(registry::LocalBias::Signed { .. })),
-                    signed_exponent: match bias {
-                        Some(registry::LocalBias::Signed { exponent }) => *exponent,
+                    signed_exponent: match locals.bias() {
+                        Some(registry::LocalBias::Signed { exponent }) => exponent,
                         Some(registry::LocalBias::Minimum(_)) | None => 0,
                     },
-                    local_bits: *bits,
+                    local_bits: locals.bits(),
+                    field_bits: locals.field_bits(),
                     local: Interpretation::of(interpretation),
                     carried_bit,
-                    ..hierarchical
+                    ..flat(axes.coefficients.kind(), *factor, *group)
                 }
             }
         }
+    }
+
+    fn bias(&self) -> String {
+        self.bias.map_or_else(|| "0".to_owned(), Axis::constant)
     }
 }
 
@@ -1208,22 +1236,20 @@ const CODING_AXES: [(&str, fn(&Coded) -> String); 25] = [
     ("CODES_GRID", |c| c.code.grid.clone()),
     ("CODES_GRID_INDEX_BITS", |c| c.code.index_bits.to_string()),
     ("CODES_GRID_LANES", |c| c.code.lanes.to_string()),
-    ("CODES_GRID_SIGNS", |c| c.code.signs.to_string()),
+    ("CODES_GRID_SIGNS", |c| c.code.signs()),
     ("CODES_GRID_DELTA_BIT", |c| c.code.delta_bit.to_string()),
     ("CODES_GRID_DELTA", |c| c.code.delta.to_string()),
     ("CODES_EXPONENT", |c| c.code_exponent.to_string()),
     ("COEFF", |c| c.coeff.constant()),
     ("COEFF_SCALE", |c| c.scale.constant()),
-    ("COEFF_BIAS", |c| u32::from(c.bias).to_string()),
+    ("COEFF_BIAS", |c| c.bias()),
     ("COEFF_BIAS_SIGN", |c| c.bias_sign.to_string()),
-    ("COEFF_SIGNED_BIAS", |c| {
-        u32::from(c.signed_bias).to_string()
-    }),
     ("COEFF_SIGNED_EXPONENT", |c| c.signed_exponent.to_string()),
     ("COEFF_GROUP", |c| c.group.to_string()),
     ("COEFF_FACTOR_GROUP", |c| c.factor_group.to_string()),
     ("COEFF_EXPONENT", |c| c.exponent.to_string()),
     ("COEFF_LOCAL_BITS", |c| c.local_bits.to_string()),
+    ("COEFF_FIELD_BITS", |c| c.field_bits.to_string()),
     ("COEFF_LOCAL", |c| c.local.codes()),
     ("COEFF_LOCAL_OFFSET", |c| c.local.offset.to_string()),
     ("COEFF_CARRIED", |c| c.carried_bit.to_string()),
@@ -1279,7 +1305,9 @@ const TUPLE_AXES: [&str; 4] = ["ID", "FORM", "DTYPE", "LOGICAL_GROUP"];
 /// (seismic/lang/build.rs).
 fn render_axis_constants(out: &mut String, dialect: Dialect) {
     render_axis_values::<registry::CodeKind>(out);
+    render_axis_values::<registry::GridSigns>(out);
     render_axis_values::<registry::CoefficientKind>(out);
+    render_axis_values::<registry::BiasKind>(out);
     render_axis_values::<registry::ScaleEncoding>(out);
     // The axes tuple's form and dtype values (`render_axes_tuple`).
     #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
@@ -1629,7 +1657,7 @@ mod tests {
                     ("CODES", "SEISMIC_CODES_UNSIGNED"),
                     ("COEFF", "SEISMIC_COEFF_HIER"),
                     ("COEFF_SCALE", "SEISMIC_SCALE_F16"),
-                    ("COEFF_BIAS", "1"),
+                    ("COEFF_BIAS", "SEISMIC_BIAS_MINIMUM"),
                     ("COEFF_BIAS_SIGN", "-1"),
                     ("COEFF_GROUP", "32"),
                     ("COEFF_FACTOR_GROUP", "256"),
@@ -1656,7 +1684,7 @@ mod tests {
                     ("CODES_GRID", "SEISMIC_GRID_IQ2XXS"),
                     ("CODES_GRID_INDEX_BITS", "8"),
                     ("CODES_GRID_LANES", "8"),
-                    ("CODES_GRID_SIGNS", "7"),
+                    ("CODES_GRID_SIGNS", "SEISMIC_GRID_SIGNS_PARITY_PLUS7"),
                     ("COEFF", "SEISMIC_COEFF_HIER"),
                     ("COEFF_LOCAL_BITS", "4"),
                     ("COEFF_LOCAL", "SEISMIC_CODES_ODD"),
@@ -1670,7 +1698,7 @@ mod tests {
                     ("CODE_HIGH_BITS", "2"),
                     ("CODES_GRID", "SEISMIC_GRID_IQ2S"),
                     ("CODES_GRID_INDEX_BITS", "10"),
-                    ("CODES_GRID_SIGNS", "8"),
+                    ("CODES_GRID_SIGNS", "SEISMIC_GRID_SIGNS_EXPLICIT8"),
                     ("COEFF_GROUP", "16"),
                     ("COEFF_EXPONENT", "-3"),
                     ("COEFF_CARRIED", "0"),
@@ -1683,10 +1711,10 @@ mod tests {
                     ("CODE_HIGH_BITS", "4"),
                     ("CODES_GRID", "SEISMIC_GRID_IQ1S"),
                     ("CODES_GRID_INDEX_BITS", "11"),
-                    ("CODES_GRID_SIGNS", "0"),
+                    ("CODES_GRID_SIGNS", "SEISMIC_GRID_SIGNS_NONE"),
                     ("CODES_GRID_DELTA_BIT", "0"),
-                    ("COEFF_BIAS", "1"),
-                    ("COEFF_SIGNED_BIAS", "1"),
+                    ("COEFF_BIAS", "SEISMIC_BIAS_SIGNED"),
+                    ("COEFF_FIELD_BITS", "4"),
                     ("COEFF_SIGNED_EXPONENT", "-3"),
                     ("COEFF_LOCAL_BITS", "3"),
                     ("COEFF_CARRIED", "11"),
@@ -1697,11 +1725,10 @@ mod tests {
                 &[
                     ("CODE_LOW_BITS", "8"),
                     ("CODE_HIGH_BITS", "4"),
-                    ("CODES_GRID_SIGNS", "0"),
+                    ("CODES_GRID_SIGNS", "SEISMIC_GRID_SIGNS_NONE"),
                     ("CODES_GRID_DELTA_BIT", "11"),
                     ("CODES_GRID_DELTA", "3"),
                     ("COEFF_BIAS", "0"),
-                    ("COEFF_SIGNED_BIAS", "0"),
                     ("COEFF_EXPONENT", "-3"),
                     ("COEFF_GROUP", "16"),
                     ("COEFF_CARRIED", "0"),

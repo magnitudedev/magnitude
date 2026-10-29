@@ -1801,16 +1801,20 @@ impl Emitter<'_, '_> {
                     .load(types::I32, MemFlags::trusted().with_readonly(), address, 0)
             }
             RepackExpr::Base3Digit { value, digit } => {
-                // `((value 3^digit mod 256) 3) >> 8`
-                // (`seismic_lang::repack::base3_digit`).
                 let value = self.repack_expression(source_packet, value);
-                let moved = self
-                    .builder
-                    .ins()
-                    .imul_imm(value, i64::from(3u32.pow(u32::from(*digit))));
-                let fraction = self.builder.ins().band_imm(moved, 0xff);
-                let tripled = self.builder.ins().imul_imm(fraction, 3);
-                self.builder.ins().ushr_imm(tripled, 8)
+                seismic_lang::repack::base3_digit_ops(u32::from(*digit))
+                    .into_iter()
+                    .fold(value, |value, op| match op {
+                        seismic_lang::repack::WordImmediate::Multiply(factor) => {
+                            self.builder.ins().imul_imm(value, i64::from(factor))
+                        }
+                        seismic_lang::repack::WordImmediate::And(mask) => {
+                            self.builder.ins().band_imm(value, i64::from(mask))
+                        }
+                        seismic_lang::repack::WordImmediate::ShiftRight(bits) => {
+                            self.builder.ins().ushr_imm(value, i64::from(bits))
+                        }
+                    })
             }
         }
     }

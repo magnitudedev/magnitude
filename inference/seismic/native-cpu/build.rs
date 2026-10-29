@@ -9,8 +9,8 @@
 //! in index order to a macro.
 
 use seismic_lang::registry::{
-    self, CodeInterpretation, CoefficientAxes, Layout, LocalBias, LocalCodes, RepresentationKind,
-    ScaleEncoding,
+    self, CodeInterpretation, CoefficientAxes, GridSigns, Layout, LocalBias, LocalCodes,
+    RepresentationKind, ScaleEncoding,
 };
 use seismic_lang::types::DType;
 use std::fmt::Write as _;
@@ -60,7 +60,10 @@ fn packed(id: seismic_lang::ids::RepresentationId, storage: u32) -> String {
             grid.index_bits(),
             axes.low / 8,
             axes.high,
-            grid.signs.bits(),
+            GridSigns::ALL
+                .iter()
+                .position(|known| *known == grid.signs)
+                .expect("a sign mode"),
             grid.delta.map_or(0, |_| grid.delta_bit()),
             grid.delta.unwrap_or(0)
         ),

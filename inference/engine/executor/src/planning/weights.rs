@@ -15,7 +15,7 @@ use magnitude_family_contracts::{
     WeightRole, WeightScope,
 };
 use magnitude_state::KvCodec;
-use seismic::{BackendName, DType, Element, Layout, OperandRecipe};
+use seismic::{BackendName, DType, Element, Layout, OperandRecipe, Packing};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -253,16 +253,20 @@ impl WeightPlan {
     }
 }
 
-/// The columns of one run of a resident weight's packing bound, the columns
-/// that share a scale: a weight whose resident codes are integers (the
-/// registry's), in the layout the token-packing projection forms read
-/// (Metal's `rows32`), and that those forms serve
-/// (`IntegerCodes::packing_run`); `None` for any other.
-pub fn packing_run(resident: Element) -> Option<u64> {
+/// How the token-packing projection forms read a resident weight
+/// (`Element::packing`), in the layout they read (Metal's `rows32`); `None`
+/// for any other weight.
+fn packing(resident: Element) -> Option<Packing> {
     (resident.layout() == Layout::Rows32)
-        .then(|| resident.integer_codes())
+        .then(|| resident.packing())
         .flatten()
-        .and_then(|codes| codes.packing_run())
+}
+
+/// The columns of one run of a resident weight's packing bound, the columns
+/// of a 32-column block that share a scale (`packing`); `None` for a weight
+/// the packed forms do not read.
+pub fn packing_run(resident: Element) -> Option<u64> {
+    packing(resident).map(|packing| u64::from(packing.run))
 }
 
 /// The extent of a weight's packing bound (the `packing_bound` entry), the
@@ -280,14 +284,11 @@ fn packing_bound(resident: Element, logical: &[u64]) -> u64 {
 }
 
 /// Whether a weight's packed sums take residue bits beside their 16-bit
-/// fields: its codes are values of 8 bits (Q8_0 and the IQ4 codebook's), whose sums 16
-/// bits a token do not hold at a useful gain. Only such weights make the
-/// packed forms' second residue width (`RESIDUE` 2) apply.
+/// fields (`Packing::residue`: codes of 8-bit values, whose sums 16 bits a
+/// token do not hold at a useful gain). Only such weights make the packed
+/// forms' second residue width (`RESIDUE` 2) apply.
 pub fn packing_residue(resident: Element) -> bool {
-    packing_run(resident).is_some()
-        && resident
-            .integer_codes()
-            .is_some_and(|codes| codes.max - codes.min > i32::from(i8::MAX))
+    packing(resident).is_some_and(|packing| packing.residue())
 }
 
 /// A packed weight's second-level scale (NVFP4's per-tensor or per-matrix
@@ -2181,6 +2182,24 @@ pub fn source_element(encoding: Encoding) -> Option<Element> {
         Encoding::F16 => Some(Element::dense(DType::F16)),
         Encoding::BF16 => Some(Element::dense(DType::BF16)),
         _ => Element::gguf_source(encoding),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn every_written_weight_type_has_a_source() {
+    // GGUF's support set: every type but those no producer writes and the
+    // integer tensors, which are model work.
+    for encoding in Encoding::ALL {
+        let integer = matches!(
+            encoding,
+            Encoding::I8 | Encoding::I16 | Encoding::I32 | Encoding::I64
+        );
+        assert_eq!(
+            source_element(encoding).is_some(),
+            encoding.produced() && !integer,
+            "{encoding:?}"
+        );
     }
 }
 

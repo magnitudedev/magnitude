@@ -826,10 +826,10 @@ impl<'a> Code<'a> {
     #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
     fn straight_block(&mut self, block: u32) {
         let words = self.words;
-        let record = words.block_words(block);
+        let record = words.block_bits(block);
         let count = record.len();
         let unit = self.moves.is_some();
-        let at = move |word: u32| if unit { word } else { record[word as usize] };
+        let at = move |word: u32| if unit { word } else { record[word as usize].0 / 32 };
         let mut terms: Vec<Vec<String>> = vec![Vec::new(); count];
         for group in words.groups(block) {
             let first = self.visited;
@@ -1165,11 +1165,36 @@ impl<'a> Code<'a> {
                     let (value, width) = stack.pop().expect("an operand");
                     (format!("({value} << {bits}u)"), 32.min(width + bits))
                 }
-                // Digit `digit` of the base-3 fraction in the low byte, in
-                // 0..=2 (`seismic_lang::repack::base3_digit`).
                 WordStep::Base3Digit(digit) => {
-                    let (value, _) = stack.pop().expect("an operand");
-                    (format!("(((({value} * {}u) & 0xffu) * 3u) >> 8u)", 3u32.pow(digit)), 2)
+                    let (value, width) = stack.pop().expect("an operand");
+                    let ops = seismic_lang::repack::base3_digit_ops(digit);
+                    let (value, width) = ops.iter().enumerate().fold(
+                        (value, width),
+                        |(value, width), (index, op)| {
+                            use seismic_lang::repack::WordImmediate;
+                            let operand = if index == 0 {
+                                value
+                            } else {
+                                format!("({value})")
+                            };
+                            (
+                                match op {
+                                    WordImmediate::Multiply(factor) => {
+                                        format!("{operand} * {factor}u")
+                                    }
+                                    WordImmediate::And(mask) => format!("{operand} & {mask:#x}u"),
+                                    WordImmediate::ShiftRight(bits) => {
+                                        format!("{operand} >> {bits}u")
+                                    }
+                                },
+                                op.width(width),
+                            )
+                        },
+                    );
+                    (format!("({value})"), width)
+                }
+                WordStep::F16ToF32 => {
+                    (spelling.f16_to_f32(&stack.pop().expect("an operand").0), 32)
                 }
                 WordStep::F16ToF32 => (spelling.f16_to_f32(&stack.pop().expect("an operand").0), 32),
                 // Times 2^exponent, a normal float built from its exponent
@@ -1212,10 +1237,10 @@ impl<'a> Code<'a> {
     /// (measured: cheaper to compile than runs of short loops).
     fn placed_block(&mut self, block: u32) {
         let words = self.words;
-        let record = words.block_words(block);
+        let record = words.block_bits(block);
         let count = record.len();
         let unit = self.moves.is_some();
-        let at = move |word: u32| if unit { word } else { record[word as usize] };
+        let at = move |word: u32| if unit { word } else { record[word as usize].0 / 32 };
         for word in 0..count as u32 {
             self.lines.push(format!("words[{}] = 0u;", at(word)));
         }

@@ -14,8 +14,8 @@
 //
 // Each workgroup (32 invocations) places one row tile: 16 rows x 32
 // columns. Every group is a multiple of 32, so a tile covers a whole packet
-// or part of a larger one, and a code plane's share of a tile row is whole
-// record words (a unit of the span); the tile at a group's first column also
+// or part of a larger one, and a code plane's share of a tile row is a unit
+// of the span (whole record words, or part of one); the tile at a group's first column also
 // places that group's other record words. Stored-but-unoccupied bytes (plane
 // alignment tails) are written as zero, so the result is fully defined.
 #include <seismic/element.glsl>
@@ -40,13 +40,12 @@
 
 // ---- rows16: the record is the row planes' shares -------------------------
 
-// A unit's words (32 columns of each code plane, `WordSpan`): the codes',
-// then the high codes'.
-#define CODES_WORDS SEISMIC_CONVERSION_E_U_CODES_UNIT_WORDS
-#define HIGH_WORDS SEISMIC_CONVERSION_E_U_HIGH_UNIT_WORDS
-// A high role outside the span (a grid entry's high part, below a byte a
-// column) is a share of its group, placed as the group roles' are.
-#define HIGH_GROUP_SHARE (HIGH_WORDS == 0 && SEISMIC_CONVERSION_E_U_HIGH_BYTES != 0)
+// A unit's bytes (32 columns of each code plane, `WordSpan`), the codes'
+// then the high codes', and the codes' record words (a unit is whole words
+// or part of one).
+#define CODES_UNIT_BYTES SEISMIC_CONVERSION_E_U_CODES_UNIT_BYTES
+#define HIGH_UNIT_BYTES SEISMIC_CONVERSION_E_U_HIGH_UNIT_BYTES
+#define CODES_WORDS ((CODES_UNIT_BYTES + 3u) / 4u)
 
 // `bytes` bytes of the record words `words` from word `first` at `place`,
 // aligned as `bytes` bytes from a 16-byte aligned plane are (a unit's share
@@ -111,17 +110,13 @@ void repack_weight() {
     const uint unit = column0 / TILE_COLUMNS;
     uint words[SEISMIC_CONVERSION_E_U_WORDS];
     SEISMIC_CONVERSION_E_U_UNIT(packet, within / TILE_COLUMNS, words);
-    store(row + SEISMIC_RESULT_0_ROW_CODES + uint64_t(unit) * (4u * CODES_WORDS), words, 0u, 4u * CODES_WORDS);
-    store(row + SEISMIC_RESULT_0_ROW_HIGH + uint64_t(unit) * (4u * HIGH_WORDS), words, CODES_WORDS, 4u * HIGH_WORDS);
+    store(row + SEISMIC_RESULT_0_ROW_CODES + uint64_t(unit) * CODES_UNIT_BYTES, words, 0u, CODES_UNIT_BYTES);
+    store(row + SEISMIC_RESULT_0_ROW_HIGH + uint64_t(unit) * HIGH_UNIT_BYTES, words, CODES_WORDS, HIGH_UNIT_BYTES);
 
     // Group planes, once per group (at its first tile): the fixed words
     // computed, then each role's share stored.
     if (within == 0u) {
         SEISMIC_CONVERSION_E_U_FIXED(packet, words);
-#if HIGH_GROUP_SHARE
-        store(row + SEISMIC_RESULT_0_ROW_HIGH + group * SEISMIC_CONVERSION_E_U_HIGH_BYTES, words,
-            SEISMIC_CONVERSION_E_U_HIGH_WORD, SEISMIC_CONVERSION_E_U_HIGH_BYTES);
-#endif
         store(row + SEISMIC_RESULT_0_ROW_SCALES + group * SEISMIC_CONVERSION_E_U_SCALES_BYTES, words,
             SEISMIC_CONVERSION_E_U_SCALES_WORD, SEISMIC_CONVERSION_E_U_SCALES_BYTES);
         store(row + SEISMIC_RESULT_0_ROW_SUPERS + group * SEISMIC_CONVERSION_E_U_SUPERS_BYTES, words,

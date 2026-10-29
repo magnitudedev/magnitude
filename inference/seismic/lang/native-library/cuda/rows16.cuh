@@ -89,12 +89,16 @@ template <class G, class K> struct Grid : Planes {
     typedef typename G::entries E;
     typedef typename G::points Pts;
     static constexpr bool CARRIED_LOCALS = packets::IsCarried<K>::value;
-    // Entry k of the row at `row`.
+    // Entry k of the row at `row`: its whole bytes, then its high bits
+    // (which span a second byte only where HIGH does not divide 8).
     __device__ __forceinline__ u32 entry_at(const u8 *row, u64 k) const {
         u32 entry = E::read(row + codes + E::BYTES * k);
         if constexpr (E::HIGH != 0) {
-            const u64 bit = k * E::HIGH;
-            entry |= ((u8_at(row + high + bit / 8) >> (u32)(bit % 8)) & ((1u << E::HIGH) - 1u)) << (8 * E::BYTES);
+            const u64 bit = E::HIGH * k;
+            u32 high = u8_at(row + this->high + (bit >> 3));
+            if constexpr (8 % E::HIGH != 0)
+                high |= u8_at(row + this->high + (bit >> 3) + 1) << 8;
+            entry |= ((high >> (bit & 7u)) & ((1u << E::HIGH) - 1u)) << (8 * E::BYTES);
         }
         return entry;
     }
@@ -135,14 +139,6 @@ template <class G, class K> struct Grid : Planes {
         } else {
             entry = entry_at(row, i >> 3);
             K::at(row + scales, row + supers, group, scale, bias);
-        }
-        if constexpr (E::HIGH != 0) {
-            // (Its bits span a second byte only where HIGH does not divide 8.)
-            const u64 bit = E::HIGH * (i >> 3);
-            u32 high = u8_at(row + this->high + (bit >> 3));
-            if constexpr (8 % E::HIGH != 0)
-                high |= u8_at(row + this->high + (bit >> 3) + 1) << 8;
-            entry |= ((high >> (bit & 7u)) & ((1u << E::HIGH) - 1u)) << (8 * E::BYTES);
         }
         const uint2 point = Pts::point(entry);
         const u32 word = lane < 4 ? point.x : point.y;

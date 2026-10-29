@@ -1567,9 +1567,8 @@ fn vulkan_iq4_router_matches_dense_decoding() {
 type Planes = (seismic::Element, Vec<u8>, Vec<f32>);
 
 /// The resident element, layout bytes and decoded values of a
-/// `representation` weight of `shape` with pseudo-random planes. Decoding
-/// through the reference recipe is slow in a test build, so every device and
-/// test of one resident layout shares one decoding.
+/// `representation` weight of `shape` with pseudo-random planes. Every
+/// device and test of one resident layout shares one decoding.
 fn packed_planes(
     device: &seismic::Device,
     representation: &str,
@@ -1655,7 +1654,9 @@ fn decode_packed_planes(
         .iter()
         .map(|extent| *extent as usize)
         .collect::<Vec<_>>();
-    let values = TensorData::encoded(rows_id, shape_usize, placed.clone())
+    // The values are the packet form's: placing moves its bits, and only
+    // them (`PackedRowLayout::place`).
+    let values = TensorData::encoded(packet_id, shape_usize, bytes)
         .unwrap()
         .values()
         .unwrap()

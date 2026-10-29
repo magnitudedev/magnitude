@@ -1037,6 +1037,7 @@ fn unsupported_weights<'a>(
     layout: Layout,
 ) -> Option<UnsupportedModel> {
     let mut counts = BTreeMap::<&'static str, u32>::new();
+    let mut unproduced = Vec::new();
     for (tensor, residency) in tensors {
         let imported = source_element(tensor.encoding).is_some()
             && match residency {
@@ -1052,6 +1053,9 @@ fn unsupported_weights<'a>(
             };
         if !imported {
             *counts.entry(tensor.encoding.ggml_name()).or_default() += 1;
+            if !tensor.encoding.produced() && !unproduced.contains(&tensor.encoding.ggml_name()) {
+                unproduced.push(tensor.encoding.ggml_name());
+            }
         }
     }
     if counts.is_empty() {
@@ -1066,9 +1070,16 @@ fn unsupported_weights<'a>(
             })
             .collect(),
     };
-    let detail = format!(
-        "{reason} have no import into the `{}` layout",
-        layout.as_str()
-    );
+    let detail = if unproduced.is_empty() {
+        format!(
+            "{reason} have no import into the `{}` layout",
+            layout.as_str()
+        )
+    } else {
+        format!(
+            "{reason} have no import: no producer writes {} weights",
+            unproduced.join(", ")
+        )
+    };
     Some(UnsupportedModel::reason(reason, detail))
 }

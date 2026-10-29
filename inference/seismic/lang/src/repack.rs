@@ -54,15 +54,56 @@ pub enum RepackOp {
 /// The base-3 digits a byte holds: `3^5 = 243 <= 256`.
 pub const BASE3_DIGITS: u8 = 5;
 
+/// A word operation with an immediate operand, of which a code generator
+/// renders sequences ([`base3_digit_ops`]) without knowing what they compute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WordImmediate {
+    /// Times the operand, modulo `2^32`.
+    Multiply(u32),
+    And(u32),
+    ShiftRight(u32),
+}
+
+impl WordImmediate {
+    pub fn apply(self, value: u32) -> u32 {
+        match self {
+            Self::Multiply(factor) => value.wrapping_mul(factor),
+            Self::And(mask) => value & mask,
+            Self::ShiftRight(bits) => value >> bits,
+        }
+    }
+
+    /// The bits of the result of a value of `width` bits.
+    pub fn width(self, width: u32) -> u32 {
+        match self {
+            Self::Multiply(factor) => 32.min(width + (32 - factor.leading_zeros())),
+            Self::And(mask) => width.min(32 - mask.leading_zeros()),
+            Self::ShiftRight(bits) => width.saturating_sub(bits),
+        }
+    }
+}
+
 /// Digit `digit` (the first 0) of the base-3 fraction whose eight bits are
-/// `value`'s low byte, as every executor computes
-/// [`RepackOp::Base3Digit`]: the byte times `3^digit` keeps the fraction
-/// past the digit's predecessors (mod 256), and times 3 its integer part is
-/// the digit, in 0..=2. ggml's `dequantize_row_tq1_0` unpacks ternary codes
-/// so; it is exact for every byte.
+/// a value's low byte ([`RepackOp::Base3Digit`]), as the word operations
+/// every executor applies: the byte times `3^digit` keeps the fraction past
+/// the digit's predecessors (mod 256), and times 3 its integer part is the
+/// digit, in 0..=2. ggml's `dequantize_row_tq1_0` unpacks ternary codes so;
+/// it is exact for every byte.
+pub fn base3_digit_ops(digit: u32) -> [WordImmediate; 4] {
+    [
+        WordImmediate::Multiply(3u32.pow(digit)),
+        WordImmediate::And(0xff),
+        WordImmediate::Multiply(3),
+        WordImmediate::ShiftRight(8),
+    ]
+}
+
+/// [`base3_digit_ops`] of `value`.
 #[inline]
 pub fn base3_digit(value: u32, digit: u32) -> u32 {
-    ((value.wrapping_mul(3u32.pow(digit)) & 0xff) * 3) >> 8
+    base3_digit_ops(digit)
+        .into_iter()
+        .fold(value, |value, op| op.apply(value))
 }
 
 /// A program shape: `ops[ops..ops + length]`, reading fields of `fields`
@@ -858,11 +899,12 @@ pub struct WordTable {
     lookups: Vec<(WordLookup, RepackTable)>,
 }
 
-/// The record words of the code planes (a row layout's code roles, or the
+/// The record bytes of the code planes (a row layout's code roles, or the
 /// packet form's plane 0) in units of 32 columns: unit `u` is, segment by
-/// segment, words `first + u * unit_words ..` of each code plane (32
-/// columns of `unit_words` bits a column), the words a layout writer places
-/// together, a block of the table (block `u`). Units whose blocks have one
+/// segment, bytes `4 first + u unit_bytes ..` of each code plane (its 32
+/// columns' `unit_bytes` bytes), the bytes a layout writer places together,
+/// a block of the table (block `u`): per segment its words
+/// ([`WordSegment::unit_bits`]), a unit's bytes from bit 0 of the first. Units whose blocks have one
 /// structure, the same groups but for where their representatives' runs
 /// start, reading values in the same pattern (a group reads the same value
 /// as an earlier group of its unit exactly where it does in the other
@@ -896,12 +938,36 @@ pub struct WordSpan {
     directory: u32,
 }
 
-/// A code plane's words in a [`WordSpan`]'s units.
+/// A code plane's bytes in a [`WordSpan`]'s units: from record word
+/// `first`, `unit_bytes` a unit. A unit is whole words or a part of one
+/// (`unit_bytes` 1 or 2: a grid entry's high part), so the units tile the
+/// segment's words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WordSegment {
     pub role: RowPlaneRole,
     pub first: u32,
-    pub unit_words: u32,
+    pub unit_bytes: u32,
+}
+
+impl WordSegment {
+    /// The unit bytes of a code plane whose 32 columns are `bits` bits, if
+    /// its units tile words.
+    fn unit_bytes(bits: u32) -> Option<u32> {
+        (bits.is_multiple_of(8) && (32 % bits == 0 || bits.is_multiple_of(32))).then_some(bits / 8)
+    }
+
+    /// The words of unit `unit` of the segment, in order: each its first
+    /// record bit and its bits.
+    pub fn unit_bits(self, unit: u32) -> impl Iterator<Item = (u32, u32)> {
+        let first = 8 * (4 * self.first + unit * self.unit_bytes);
+        let bits = 8 * self.unit_bytes;
+        (0..bits.div_ceil(32)).map(move |word| (first + 32 * word, (bits - 32 * word).min(32)))
+    }
+
+    /// The record words the segment's `units` units cover.
+    fn words(self, units: u32) -> std::ops::Range<u32> {
+        self.first..self.first + (units * self.unit_bytes).div_ceil(4)
+    }
 }
 
 impl WordTable {
@@ -927,18 +993,21 @@ impl WordTable {
                     codes.offset.is_multiple_of(4),
                     "a packet form's codes start at a word"
                 );
-                // Codes of whole bits a column are placed in units; others
-                // (grid entries with a part below a byte) are words of the
-                // packet like the rest.
-                let segments = if (codes.bytes_per_group * 8).is_multiple_of(packet.group) {
-                    vec![WordSegment {
+                // Codes whose units tile words are placed in units; others
+                // (grid entries of bytes and a part, units straddling words)
+                // are words of the packet like the rest.
+                let bits = codes.bytes_per_group * 8 * 32;
+                let segments = bits
+                    .is_multiple_of(packet.group)
+                    .then(|| WordSegment::unit_bytes(bits / packet.group))
+                    .flatten()
+                    .map(|unit_bytes| WordSegment {
                         role: RowPlaneRole::Codes,
                         first: codes.offset / 4,
-                        unit_words: codes.bytes_per_group * 8 / packet.group,
-                    }]
-                } else {
-                    Vec::new()
-                };
+                        unit_bytes,
+                    })
+                    .into_iter()
+                    .collect();
                 Self::compile(
                     recipe,
                     packet,
@@ -958,16 +1027,13 @@ impl WordTable {
                     if let Some(index) = rows.planes.iter().position(|plane| plane.role() == role) {
                         let bytes = rows.planes[index].bytes_per_group;
                         roles.push((role, words, bytes));
-                        // Column codes are placed in units; a grid
-                        // entry's high part is placed as a group's bytes.
-                        if !matches!(
-                            rows.planes[index].content,
-                            RowPlaneContent::Groups { .. } | RowPlaneContent::GridHigh { .. }
-                        ) {
+                        // Code planes are placed in units.
+                        if !matches!(rows.planes[index].content, RowPlaneContent::Groups { .. }) {
                             segments.push(WordSegment {
                                 role,
                                 first: words,
-                                unit_words: rows.column_bits(index),
+                                unit_bytes: WordSegment::unit_bytes(rows.code_bits(index, 32))
+                                    .expect("a code plane's units tile its words"),
                             });
                         }
                         first[index] = words;
@@ -1018,7 +1084,8 @@ impl WordTable {
                 inputs[at] = values.bit(plane, bit);
             }
         }
-        // Each word's runs (first input, shift, length).
+        // The runs (first input, shift, length) of the `length` record bits
+        // from `first`, a block's word.
         let next = |input: PacketBit, length: u32| match input {
             PacketBit::Source(bit) => PacketBit::Source(bit + length),
             PacketBit::Value { value, bit } => PacketBit::Value {
@@ -1026,24 +1093,21 @@ impl WordTable {
                 bit: bit + length,
             },
         };
-        let word_runs = inputs
-            .chunks_exact(32)
-            .map(|word| {
-                let mut runs: Vec<(PacketBit, u32, u32)> = Vec::new();
-                for (at, input) in word.iter().enumerate() {
-                    let Some(input) = *input else { continue };
-                    match runs.last_mut() {
-                        Some((first, shift, length))
-                            if *shift + *length == at as u32 && next(*first, *length) == input =>
-                        {
-                            *length += 1
-                        }
-                        _ => runs.push((input, at as u32, 1)),
+        let word_runs = |(first, length): (u32, u32)| {
+            let mut runs: Vec<(PacketBit, u32, u32)> = Vec::new();
+            for (at, input) in inputs[first as usize..][..length as usize].iter().enumerate() {
+                let Some(input) = *input else { continue };
+                match runs.last_mut() {
+                    Some((first, shift, length))
+                        if *shift + *length == at as u32 && next(*first, *length) == input =>
+                    {
+                        *length += 1
                     }
+                    _ => runs.push((input, at as u32, 1)),
                 }
-                runs
-            })
-            .collect::<Vec<_>>();
+            }
+            runs
+        };
         // A field's runs, each a piece (source bit, shift, length).
         let field_runs = |placed: &[(u32, u32)]| {
             let mut placed = placed.to_vec();
@@ -1095,37 +1159,38 @@ impl WordTable {
                 (key, parameters)
             }
         };
-        // The blocks ([`WordTable::blocks`]): each unit of the span, its
-        // words segment by segment, then the other words in ranges, each
-        // within one role's share.
+        // The blocks ([`WordTable::blocks`]), each its words' first record
+        // bits and bits: each unit of the span, its words segment by
+        // segment, then the other words in ranges, each within one role's
+        // share.
         assert!(
             packet.group.is_multiple_of(32),
             "a code plane's group is whole units of 32 columns"
         );
         let units = packet.group / 32;
-        let mut blocks: Vec<Vec<u32>> = (0..units)
+        let mut blocks: Vec<Vec<(u32, u32)>> = (0..units)
             .map(|unit| {
                 segments
                     .iter()
-                    .flat_map(|segment| {
-                        (0..segment.unit_words)
-                            .map(move |word| segment.first + unit * segment.unit_words + word)
-                    })
+                    .flat_map(|segment| segment.unit_bits(unit))
                     .collect()
             })
             .collect();
-        let spanned = blocks.concat();
+        let spanned = segments
+            .iter()
+            .flat_map(|segment| segment.words(units))
+            .collect::<Vec<_>>();
         for word in (0..words).filter(|word| !spanned.contains(word)) {
             let fixed = blocks.len() > units as usize;
             let continues = fixed
                 && blocks
                     .last()
-                    .is_some_and(|block| block[block.len() - 1] + 1 == word)
+                    .is_some_and(|block| block[block.len() - 1].0 / 32 + 1 == word)
                 && !roles.iter().any(|(_, first, _)| *first == word);
             if continues {
-                blocks.last_mut().unwrap().push(word);
+                blocks.last_mut().unwrap().push((32 * word, 32));
             } else {
-                blocks.push(vec![word]);
+                blocks.push(vec![(32 * word, 32)]);
             }
         }
         // Each block's pieces, in order: its words', each word's in order;
@@ -1137,9 +1202,9 @@ impl WordTable {
                     .iter()
                     .enumerate()
                     .flat_map(|(index, word)| {
-                        word_runs[*word as usize].iter().map(move |run| {
-                            let (key, parameters) = describe(index as u32, *run);
-                            (*run, key, parameters)
+                        word_runs(*word).into_iter().map(move |run| {
+                            let (key, parameters) = describe(index as u32, run);
+                            (run, key, parameters)
                         })
                     })
                     .collect::<Vec<_>>()
@@ -1291,7 +1356,7 @@ impl WordTable {
         for (index, (block, groups)) in blocks.iter().zip(&block_groups).enumerate() {
             table.push(encode_run(first, groups.len() as u32));
             if index >= units as usize {
-                table.push(encode_run(block[0], block.len() as u32));
+                table.push(encode_run(block[0].0 / 32, block.len() as u32));
             }
             first += 4 * groups.len() as u32;
         }
@@ -1598,21 +1663,22 @@ impl WordTable {
         }) as usize
     }
 
-    /// The record words of block `block`, in order: a unit's words segment
-    /// by segment, or a fixed block's range.
-    pub fn block_words(&self, block: u32) -> Vec<u32> {
+    /// The words of block `block`, in order, each its first record bit and
+    /// its bits: a unit's words segment by segment
+    /// ([`WordSegment::unit_bits`]), or a fixed block's range of record
+    /// words.
+    pub fn block_bits(&self, block: u32) -> Vec<(u32, u32)> {
         if block < self.span.units {
             self.span
                 .segments
                 .iter()
-                .flat_map(|segment| {
-                    (0..segment.unit_words)
-                        .map(move |word| segment.first + block * segment.unit_words + word)
-                })
+                .flat_map(|segment| segment.unit_bits(block))
                 .collect()
         } else {
             let run = self.table[self.header(block) + 1];
-            (run & 0xffff..(run & 0xffff) + (run >> 16)).collect()
+            (run & 0xffff..(run & 0xffff) + (run >> 16))
+                .map(|word| (32 * word, 32))
+                .collect()
         }
     }
 
@@ -1818,7 +1884,7 @@ mod tests {
             assert_eq!(stack.len(), 1);
             stack[0]
         };
-        let mut values = vec![0u32; words.block_words(block).len()];
+        let mut values = vec![0u32; words.block_bits(block).len()];
         for group in words.groups(block) {
             let piece = group.piece;
             for m in 0..group.count {
@@ -2013,23 +2079,30 @@ mod tests {
                     }
                 }
             }
+            // The record's `length` bits from bit `first` (a block's word).
+            let bits = |(first, length): (u32, u32)| {
+                (0..length)
+                    .filter(|bit| expected[((first + bit) / 32) as usize] >> ((first + bit) % 32) & 1 != 0)
+                    .fold(0u32, |word, bit| word | 1 << bit)
+            };
+            let mut covered = vec![0u32; expected.len()];
             for block in 0..words.blocks() {
                 let computed = block_words_at(words, packet_bytes, block, &mut |_, bit| bit);
-                for (word, computed) in words.block_words(block).into_iter().zip(computed) {
+                for (word, computed) in words.block_bits(block).into_iter().zip(computed) {
                     assert_eq!(
                         computed,
-                        expected[word as usize],
-                        "{} -> {}: packet {index} word {word}",
+                        bits(word),
+                        "{} -> {}: packet {index} record bits {word:?}",
                         registry::representation_info(conversion.source).name,
                         registry::representation_info(conversion.destination).name,
                     );
+                    for bit in word.0..word.0 + word.1 {
+                        covered[(bit / 32) as usize] |= 1 << (bit % 32);
+                    }
                 }
             }
-            assert_eq!(
-                (0..words.blocks())
-                    .map(|block| words.block_words(block).len())
-                    .sum::<usize>(),
-                expected.len(),
+            assert!(
+                covered.iter().zip(&expected).all(|(covered, expected)| expected & !covered == 0),
                 "the blocks cover the record",
             );
             // Each unit of a span is its class's representative unit
@@ -2047,11 +2120,11 @@ mod tests {
                         ((bit / 8) as i32 + bytes) as u32 * 8 + ((bit % 8) as i32 + bits) as u32
                     },
                 );
-                for (word, shared) in words.block_words(unit).into_iter().zip(shared) {
+                for (word, shared) in words.block_bits(unit).into_iter().zip(shared) {
                     assert_eq!(
                         shared,
-                        expected[word as usize],
-                        "{} -> {}: packet {index} unit {unit} word {word}",
+                        bits(word),
+                        "{} -> {}: packet {index} unit {unit} record bits {word:?}",
                         registry::representation_info(conversion.source).name,
                         registry::representation_info(conversion.destination).name,
                     );

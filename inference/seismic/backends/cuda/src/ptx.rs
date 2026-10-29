@@ -17,6 +17,7 @@ use seismic_lang::registry::{
     CodeInterpretation, DecodeStep, FloatCodeFormat, GridCodes, LookupTable, PlaneEncoding,
     PlaneInfo, PlaneRepackRecipe, RepackExpr, GridSigns,
 };
+use seismic_lang::repack::WordImmediate;
 use seismic_lang::types::DType;
 use seismic_native_target::{DeviceDescription, NativeCompilationError};
 use std::collections::{BTreeSet, HashMap};
@@ -1605,7 +1606,18 @@ impl<'a> Emitter<'a> {
                             bits,
                             interpretation,
                             ..
-                        } => self.interpret(&temps[recipe.ordinal(*raw)], *bits, interpretation),
+                        } => {
+                            let mut code = temps[recipe.ordinal(*raw)].clone();
+                            if recipe.exceeds(*raw, *bits) {
+                                let low = self.t32();
+                                self.line(format!(
+                                    "and.b32 {low}, {code}, {};",
+                                    u32::MAX >> (32 - bits)
+                                ));
+                                code = low;
+                            }
+                            self.interpret(&code, *bits, interpretation)
+                        }
                         DecodeStep::ReadPlaneLane { plane, .. } => {
                             self.plane_lane(&logical, layout.planes[*plane as usize].group)
                         }
@@ -1948,19 +1960,20 @@ impl<'a> Emitter<'a> {
                 else {
                     panic!("closed CUDA repack reads a base-3 digit of a floating value")
                 };
-                // `((value 3^digit mod 256) 3) >> 8`
-                // (`seismic_lang::repack::base3_digit`).
-                let moved = self.t32();
-                self.line(format!(
-                    "mul.lo.u32 {moved}, {value}, {};",
-                    3u32.pow(u32::from(*digit))
-                ));
-                let fraction = self.t32();
-                self.line(format!("and.b32 {fraction}, {moved}, 255;"));
-                let tripled = self.t32();
-                self.line(format!("mul.lo.u32 {tripled}, {fraction}, 3;"));
-                let output = self.t32();
-                self.line(format!("shr.u32 {output}, {tripled}, 8;"));
+                let mut output = value;
+                for op in seismic_lang::repack::base3_digit_ops(u32::from(*digit)) {
+                    let result = self.t32();
+                    self.line(match op {
+                        WordImmediate::Multiply(factor) => {
+                            format!("mul.lo.u32 {result}, {output}, {factor};")
+                        }
+                        WordImmediate::And(mask) => format!("and.b32 {result}, {output}, {mask};"),
+                        WordImmediate::ShiftRight(bits) => {
+                            format!("shr.u32 {result}, {output}, {bits};")
+                        }
+                    });
+                    output = result;
+                }
                 RepackValue::Integer(output)
             }
         }
@@ -2167,22 +2180,37 @@ impl<'a> Emitter<'a> {
         self.line(format!("mad.wide.u32 {address}, {slot}, 4, {base};"));
         let value = self.t32();
         self.line(format!("ld.const.s32 {value}, [{address}];"));
-        let value = match grid.signs {
-            GridSigns::None => value,
-            signs => {
-                let bits = signs.bits();
-                let signs_word = self.t32();
-                self.line(format!("shr.b32 {signs_word}, {raw}, {};", grid.sign_bit()));
-                self.line(format!("and.b32 {signs_word}, {signs_word}, {};", (1u32 << bits) - 1));
-                if signs == GridSigns::ParityPlus7 {
-                    let parity = self.t32();
-                    self.line(format!("popc.b32 {parity}, {signs_word};"));
-                    self.line(format!("and.b32 {parity}, {parity}, 1;"));
-                    self.line(format!("shl.b32 {parity}, {parity}, {bits};"));
-                    self.line(format!("or.b32 {signs_word}, {signs_word}, {parity};"));
-                }
+        // The lane signs (`GridSigns::lanes`), none for signed points.
+        let explicit = |this: &mut Self| {
+            let signs = this.t32();
+            this.line(format!("shr.b32 {signs}, {raw}, {};", grid.sign_bit()));
+            this.line(format!(
+                "and.b32 {signs}, {signs}, {};",
+                (1u32 << grid.signs.bits()) - 1
+            ));
+            signs
+        };
+        let lane_signs = match grid.signs {
+            GridSigns::None => None,
+            GridSigns::Explicit8 => Some(explicit(self)),
+            GridSigns::ParityPlus7 => {
+                let signs = explicit(self);
+                let parity = self.t32();
+                self.line(format!("popc.b32 {parity}, {signs};"));
+                self.line(format!("and.b32 {parity}, {parity}, 1;"));
+                self.line(format!(
+                    "shl.b32 {parity}, {parity}, {};",
+                    grid.signs.bits()
+                ));
+                self.line(format!("or.b32 {signs}, {signs}, {parity};"));
+                Some(signs)
+            }
+        };
+        let value = match lane_signs {
+            None => value,
+            Some(signs) => {
                 let bit = self.t32();
-                self.line(format!("shr.b32 {bit}, {signs_word}, {lane};"));
+                self.line(format!("shr.b32 {bit}, {signs}, {lane};"));
                 self.line(format!("and.b32 {bit}, {bit}, 1;"));
                 let negated = self.t32();
                 self.line(format!("neg.s32 {negated}, {value};"));

@@ -111,55 +111,11 @@ impl Gguf {
     /// quantized matrix (GGUF dims are [K, N]).
     fn rows(&self, name: &str, first: usize, rows: usize) -> (Format, usize, Vec<u8>) {
         let (kind, dims, offset) = &self.tensors[name];
-        let format = match kind {
-            12 => Format::Q4K,
-            13 => Format::Q5K,
-            14 => Format::Q6K,
-            8 => Format::Q8,
-            23 => Format::Iq4,
-            2 => Format::Q4_0,
-            3 => Format::Q4_1,
-            6 => Format::Q5_0,
-            7 => Format::Q5_1,
-            39 => Format::Mxfp4,
-            40 => Format::Nvfp4,
-            17 => Format::Iq2Xs,
-            18 => Format::Iq3Xxs,
-            16 => Format::Iq2Xxs,
-            10 => Format::Q2K,
-            11 => Format::Q3K,
-            22 => Format::Iq2S,
-            21 => Format::Iq3S,
-            19 => Format::Iq1S,
-            29 => Format::Iq1M,
-            41 => Format::Q1_0,
-            35 => Format::Tq2_0,
-            other => panic!("{name}: GGUF type {other}"),
-        };
+        let encoding = magnitude_ggml::Encoding::from_id(*kind)
+            .unwrap_or_else(|| panic!("{name}: GGUF type {kind}"));
+        let format = Format::of(encoding).unwrap_or_else(|| panic!("{name}: {encoding:?}"));
         let k = dims[0] as usize;
-        let block_bytes = match format {
-            Format::Q4K => 144,
-            Format::Q5K => 176,
-            Format::Q6K => 210,
-            Format::Q8 => 34,
-            Format::Iq4 => 136,
-            Format::Q4_0 => 18,
-            Format::Q4_1 => 20,
-            Format::Q5_0 => 22,
-            Format::Q5_1 => 24,
-            Format::Mxfp4 => 17,
-            Format::Nvfp4 | Format::Nvfp4A4 => 36,
-            Format::Iq2Xs => 74,
-            Format::Iq3Xxs => 98,
-            Format::Iq2Xxs => 66,
-            Format::Q2K => 84,
-            Format::Q3K | Format::Iq3S => 110,
-            Format::Iq2S => 82,
-            Format::Iq1S => 50,
-            Format::Iq1M => 56,
-            Format::Q1_0 => 18,
-            Format::Tq2_0 => 66,
-        };
+        let block_bytes = encoding.block_bytes() as usize;
         let row_bytes = k / format.block_values() * block_bytes;
         let start = self.data + offset + first * row_bytes;
         (

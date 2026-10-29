@@ -762,8 +762,10 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
 // rows g and g + 8 of the lane (`raw`, the k-block's entries of both), the
 // k-block's scales (`c`), the M <= 8 NB activation rows as the N columns of
 // NB column blocks. Each scale group's steps accumulate into a fresh MMA
-// sum, which then takes the group's scale once per row; every column is its
-// own activation row, so a row's bits do not depend on M.
+// sum, which then takes the group's scale once per row (and, biased, the
+// group's operand sum, one MMA against an all-ones operand per step, its
+// bias); every column is its own activation row, so a row's bits do not
+// depend on M.
 template <int NB, class Pro, class W>
 __device__ __forceinline__ void gemv_entries_kblock(float (&acc)[NB][4], const W &, const typename W::Raw &raw,
                                                     const Coefficients<W::GROUPS> &c, const Pro &pro, u32 M,
@@ -774,12 +776,12 @@ __device__ __forceinline__ void gemv_entries_kblock(float (&acc)[NB][4], const W
 #pragma unroll
     for (int group = 0; group < W::GROUPS; ++group) {
         const int entry = W::gemv_entry(group, t);
-        float d[NB][4];
+        float d[NB][4], sums[NB][4];
 #pragma unroll
         for (int nb = 0; nb < NB; ++nb)
 #pragma unroll
             for (int e = 0; e < 4; ++e)
-                d[nb][e] = 0.0f;
+                d[nb][e] = sums[nb][e] = 0.0f;
 #pragma unroll
         for (int step = 0; step < W::GROUP_STEPS; ++step) {
             const int h = W::gemv_half(step, t);
@@ -792,13 +794,20 @@ __device__ __forceinline__ void gemv_entries_kblock(float (&acc)[NB][4], const W
                 const u32 m = 8 * nb + g;
                 const u32 b[2] = {m < M ? pro.pair(factors, m, k) : 0u, m < M ? pro.pair(factors, m, k + 2) : 0u};
                 Op::mma(d[nb], a, b);
+                if constexpr (W::BIAS) {
+                    const u32 ones[4] = {Op::ONES, Op::ONES, Op::ONES, Op::ONES};
+                    Op::mma(sums[nb], ones, b);
+                }
             }
         }
 #pragma unroll
         for (int nb = 0; nb < NB; ++nb)
 #pragma unroll
-            for (int e = 0; e < 4; ++e)
+            for (int e = 0; e < 4; ++e) {
                 acc[nb][e] = seismic_fma_rn(c.scale[e / 2][group], d[nb][e], acc[nb][e]);
+                if constexpr (W::BIAS)
+                    acc[nb][e] = seismic_fma_rn(-c.bias[e / 2][group], sums[nb][e], acc[nb][e]);
+            }
     }
 }
 

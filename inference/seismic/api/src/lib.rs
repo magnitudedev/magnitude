@@ -169,7 +169,9 @@ pub mod native_cpu {
 pub use seismic_lang::expr::{BigInt, BigUint};
 pub use seismic_lang::ids::StableEntryId;
 pub use seismic_lang::reference_math::conversion::exact_f64;
-pub use seismic_lang::registry::{f16_bits, f16_to_f32, BackendName, Layout, OperandRecipe};
+pub use seismic_lang::registry::{
+    f16_bits, f16_to_f32, BackendName, Layout, OperandRecipe, Packing,
+};
 pub use seismic_lang::types::DType;
 /// The Seismic CPU library every CPU native kernel builds on.
 pub use seismic_native_cpu as cpu;
@@ -439,37 +441,13 @@ impl fmt::Debug for Device {
 pub struct Element(RepresentationId);
 
 /// The integer codes of a packed representation ([`Element::integer_codes`]):
-/// every code is a value in `min ..= max`, `group` consecutive values along
-/// the packing axis share one scale, and `bias` is whether the decode adds a
-/// term of its own to each scaled code (a stored bias or a minimum).
+/// every code is a value in `min ..= max`, and `group` consecutive values
+/// along the packing axis share one scale.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IntegerCodes {
     pub min: i32,
     pub max: i32,
     pub group: u64,
-    pub bias: bool,
-}
-
-impl IntegerCodes {
-    /// Whether a group's values are more than its scale times centred codes:
-    /// the decode adds a bias, or the codes are not centred on zero (codes
-    /// without a negative value are centred at half their range, as the
-    /// packing bound centres them). Metal's packed projection forms state the
-    /// same property as `packing_factors::biased`
-    /// (`engine/kernels/kernels/metal/lib/projection/packing.h`).
-    fn biased(&self) -> bool {
-        self.bias || self.min >= 0
-    }
-
-    /// The columns of one run of a packing bound over these codes, the
-    /// columns that share a scale, where the token-packing projection forms
-    /// serve them: a run is one coefficient group of a 32-column block
-    /// (groups of at most 32 columns), and a block of runs shorter than its
-    /// 32 columns has no term beside its scaled codes (Metal's
-    /// `packing_factors::available`).
-    pub fn packing_run(&self) -> Option<u64> {
-        (self.group <= 32 && (self.group == 32 || !self.biased())).then_some(self.group)
-    }
 }
 
 impl Element {
@@ -575,8 +553,13 @@ impl Element {
             min: constant(QuantizedComponent::CodeMin)?,
             max: constant(QuantizedComponent::CodeMax)?,
             group: u64::try_from(constant(QuantizedComponent::GroupSize)?).ok()?,
-            bias: constant(QuantizedComponent::BiasPresent)? != 0,
         })
+    }
+    /// How the token-packing projection forms read this storage's codes
+    /// (`registry::DecodeAxes::packing`); `None` for storage they do not
+    /// serve.
+    pub fn packing(&self) -> Option<Packing> {
+        seismic_lang::registry::decode_axes(self.0)?.packing()
     }
     /// Rows of one row tile of row-layout storage (`rows8`: 8); 1 for every
     /// other storage. A matrix view of tiled storage selects whole tiles, or

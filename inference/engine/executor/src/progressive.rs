@@ -70,7 +70,6 @@ impl Placement {
             min: -half,
             max: half - 1,
             group: GROUP as u64,
-            bias: false,
         };
         let rows = (packets.integer_codes()? == codes)
             .then(|| packets.scaled_code_rows(source, columns))??;

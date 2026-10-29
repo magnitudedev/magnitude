@@ -1449,7 +1449,8 @@ impl StreamProgram {
         let executions = source.len().div_ceil(execution);
         /// Source bytes each thread converts at least. Measured (whole
         /// tensors of 64 KiB to 16 MiB of `q8_0`, `q4_k`, `iq4_xs` and
-        /// `q3_k` packets into their packet forms, M4 Max): a quarter or
+        /// `q3_k` packets into their packet forms, `q3_k`'s then q6k's, M4
+        /// Max): a quarter or
         /// half of it speeds tensors of 1 MiB (`q3_k` 730 to 270 µs at a
         /// quarter) but slows the fastest of 4 MiB (`q8_0` 215 to 300 µs at
         /// a quarter, 245 µs at half); four times it slows every tensor of
@@ -2387,8 +2388,8 @@ mod tests {
             let path = vectors.join(format!("{}.bin", encoding.ggml_name()));
             let file =
                 std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-            let blocks = u64::from(u32::from_le_bytes(file[..4].try_into().unwrap()));
-            let packets = blocks * encoding.block_elements() / group;
+            // A source packet is one block of the type.
+            let packets = u64::from(u32::from_le_bytes(file[..4].try_into().unwrap()));
             let source = &file[4..][..(packets * u64::from(layout.packet_size)) as usize];
             assert_matches_the_interpreter(conversion, &[packets, group], source, "reference");
         }

@@ -18,8 +18,10 @@
 // two powers of two multiply the F32 result once, at the store.
 //
 // The gain is the largest one that bounds every block sum for any row of the
-// format. Codes minus their centre c (half their range: 8 for 4-bit codes,
-// 16 for 5-bit, 32 for 6-bit, 128 for 8-bit values) are at most c in magnitude, so a sum is at
+// format. Codes minus their centre (their zero code, or half their range
+// where they have no negative value) are at most c in magnitude (8 for
+// 4-bit codes, 16 for 5-bit, 32 for 6-bit, 128 for 8-bit values; 2 for
+// ternary codes offset by 1), so a sum is at
 // most c |q|_1 (Hoelder; the exact worst case over the format's rows, which
 // Cauchy-Schwarz and the l-infinity bound only exceed), and codes q rounded
 // from x under gain g to multiples of s have |q|_1 <= g |x|_1 + 32 s / 2:
@@ -118,26 +120,30 @@ inline float4 packing_scale(float4 value) {
 // width (the entries' PACK, 1 or 2; `packing_shared`): each bit holds the
 // top sum to one more bit beside a 16-bit low field, 17 or 18. One is the
 // faster; two halves the top token's step where one is not precise enough.
-// Codes that need residue bits declare `residue` 1.
+// The registry states which codes take residue bits (`Packing::residue`:
+// codes of 8-bit values).
 
 // The packed codes of weights W (`packing_codes<W>`), the one place its
 // packed forms and its packing bound (`packing_bound`) read them from: a
 // layout of its code planes and interpretation (`packing_layout`) and its
-// coefficients' factors (`packing_factors`). Codes enter as F16 subnormals
-// minus `centre`, half their range; a code's value is
-// scale (code - offset) + bias, so a block has the min term
-// (centre - offset) scale + bias where that is not zero (`biased`). A block
-// has `folds` runs of 32 / folds columns under one weight scale each (the
-// coefficient groups of a packet), a sum pair and a bound per run (`folds`
-// 0: no packed codes). A lane's `words` are the codes of its columns of one
-// weight row and block, loaded from the lane's place `at` in that row's
-// planes (the lane holds the two columns x, x + 1 of an 8-column step; lanes
-// 0, 2, 4 and 6 hold a block); `step` yields its two codes of step s, of run
-// s * folds / 4, as F16 subnormals.
+// coefficients' factors (`packing_factors`), for the runs a block, the
+// centre, the magnitude and the residue the registry gives the codes (the
+// decoder's `packets::Packing`, the registry's `DecodeAxes::packing`: which
+// codes the forms read is its rule, and a combination it gives that no
+// layout or factors serve does not compile). Codes enter as F16 subnormals
+// minus `centre`, the code of the registry's centre: a layout's `offset` is
+// the entering code of value zero, and the centre is that plus the centre's
+// value. A code's value is scale (code - offset) + bias, so a block has the
+// min term (centre - offset) scale + bias where that is not zero
+// (`biased`). A block has `folds` runs of 32 / folds columns under one
+// weight scale each (the coefficient groups of a packet), a sum pair and a
+// bound per run (`folds` 0: no packed codes). A lane's `words` are the codes
+// of its columns of one weight row and block, loaded from the lane's place
+// `at` in that row's planes (the lane holds the two columns x, x + 1 of an
+// 8-column step; lanes 0, 2, 4 and 6 hold a block); `step` yields its two
+// codes of step s, of run s * folds / 4, as F16 subnormals.
 //
-// Packed products serve integer codes (as the planner's packing runs do):
-// codes whose values are not scaled by a power of two of their own. A
-// weight's packed product is `available` on a device without tensor
+// A weight's packed product is `available` on a device without tensor
 // operations (their int8 products carry more than a packed matrix operand
 // does); `factors` gives a row's block factors of a 256-column block for
 // `packing_coefficients`: `reach` a bound on what the fold multiplies,
@@ -150,103 +156,101 @@ inline float4 packing_scale(float4 value) {
 // The packed product's forms, on a device without tensor operations.
 constant constexpr bool packing_forms = !SEISMIC_HAS_TENSOR_OPS;
 
-// The centre of codes in planes P: half their range.
-template <typename P>
-constexpr uint packing_centre() {
-    return (packets::CodeRange<P>::largest + 1u) / 2u;
-}
+// The layout of codes in planes P interpreted by C, for FOLDS runs a block
+// and with RESIDUE residue bits (`type`): `offset`, `at`, `load`, `step`
+// and, with RESIDUE, `planes`.
+template <typename P, typename C, uint FOLDS, bool RESIDUE>
+struct packing_layout;
 
-// A layout of codes in planes P interpreted by C, for FOLDS runs a block:
-// `centre`, `offset` (the entering code of value zero), `residue`, `at`,
-// `load`, `step` and, with residue bits, `planes`. None by default.
-template <typename P, typename C, uint FOLDS>
-struct packing_layout {
-    static constant constexpr bool available = false;
-};
-
-// 4-bit codes of a plane of low nibbles alone: step s multiplies the block's
-// columns 8 (c / 2) + s + 4 (c % 2) for c = 0 .. 7: a row's word c / 2 holds
-// them as nibble s of each half.
-template <int ZERO_CODE>
-struct packing_layout<packets::Planes<4, 0>, packets::Offset<ZERO_CODE>, 1> {
-    static constant constexpr bool available = true;
-    static constant constexpr uint centre = packing_centre<packets::Planes<4, 0>>(), offset = ZERO_CODE, residue = 0;
-    typedef uint place;
-    typedef uint words;
+// Linear codes of 1, 2 or 4 low bits and any high plane, one run a block: a
+// lane's codes as the matrix GEMV reads them (`lane_spread`), so step s
+// multiplies the block's columns 8 (c / 2) + s + 4 (c % 2) for c = 0 .. 7:
+// a row's field c / 2 holds them as code s of each half.
+template <uint LOW, uint HIGH, int ZERO, uint FOLDS>
+struct packing_linear;
+template <uint LOW, uint HIGH, int ZERO>
+struct packing_linear<LOW, HIGH, ZERO, 1> {
+    static constant constexpr uint offset = ZERO;
+    typedef typename lane_type<HIGH, uint, uint2>::type place;
+    typedef place words;
     template <typename W>
     static place at(thread const Weights<W> &w, uint n, uint x) {
-        return w.codes_at(n, 16u, 0u) + (x >> 1) * 4u;
+        const uint codes = w.codes_at(n, 4u * LOW, 0u) + (x >> 1) * LOW;
+        if constexpr (HIGH == 0u)
+            return codes;
+        else
+            return uint2(codes, w.high_at(n, 4u * HIGH, 0u) + (x >> 1) * HIGH);
     }
-    // A row tile's rows of one block are adjacent: 16 bytes a row.
+    // A row tile's rows of one block are adjacent: 4 LOW (and 4 HIGH) bytes
+    // a row.
     template <typename W>
     static words load(thread const Weights<W> &w, place at, uint g) {
-        return *reinterpret_cast<device const uint *>(w.base + at + g * 16u * w.layout.tile);
-    }
-    static half2 step(words codes, uint s) { return as_type<half2>((codes >> (4u * s)) & 0x000f000fu); }
-};
-
-// 5-bit codes of a plane of low nibbles and a plane of high bits: the
-// nibbles' columns; the lane's byte of the block's high bits beside its word
-// of low nibbles, a nibble of the byte under each half of the word, so that
-// bit s of each half is the high bit of step s's code there.
-template <int ZERO_CODE>
-struct packing_layout<packets::Planes<4, 1>, packets::Offset<ZERO_CODE>, 1> {
-    static constant constexpr bool available = true;
-    static constant constexpr uint centre = packing_centre<packets::Planes<4, 1>>(), offset = ZERO_CODE, residue = 0;
-    typedef uint2 place;
-    typedef uint2 words;
-    template <typename W>
-    static place at(thread const Weights<W> &w, uint n, uint x) {
-        return uint2(w.codes_at(n, 16u, 0u) + (x >> 1) * 4u, w.high_at(n, 4u, 0u) + (x >> 1));
-    }
-    template <typename W>
-    static words load(thread const Weights<W> &w, place at, uint g) {
-        const uint high = w.base[at.y + g * 4u * w.layout.tile];
-        return uint2(*reinterpret_cast<device const uint *>(w.base + at.x + g * 16u * w.layout.tile),
-            (high | (high << 12)) & 0x000f000fu);
+        if constexpr (HIGH == 0u) {
+            return lane_spread<LOW>(lane_field<LOW>(w.base + at + g * (4u * LOW) * w.layout.tile));
+        } else {
+            const uint high = lane_field<HIGH>(w.base + (at.y + g * (4u * HIGH) * w.layout.tile));
+            return uint2(lane_spread<LOW>(lane_field<LOW>(w.base + at.x + g * (4u * LOW) * w.layout.tile)),
+                lane_spread<HIGH>(high));
+        }
     }
     static half2 step(words codes, uint s) {
-        return as_type<half2>(((codes.x >> (4u * s)) & 0x000f000fu) | (((codes.y >> s) & 0x00010001u) << 4));
+        if constexpr (HIGH == 0u)
+            return as_type<half2>(lane_pair<LOW, 0u>(codes, 0u, s));
+        else
+            return as_type<half2>(lane_pair<LOW, HIGH>(codes.x, codes.y, s));
     }
 };
 
-// 6-bit codes of a plane of low nibbles and a plane of two high bits, two
-// runs a block: step 2 h + t multiplies the columns
-// 16 h + 8 (c / 4) + 2 ((c / 2) % 2) + t + 4 (c % 2) of run h: a row's word
-// 2 h + c / 4 holds them as nibble 2 ((c / 2) % 2) + t of each half, and a
-// 16-bit field of the high plane their two high bits alike. A lane holds its
-// word and field of each run, shifted to its first nibble.
-template <int ZERO_CODE>
-struct packing_layout<packets::Planes<4, 2>, packets::Offset<ZERO_CODE>, 2> {
-    static constant constexpr bool available = true;
-    static constant constexpr uint centre = packing_centre<packets::Planes<4, 2>>(), offset = ZERO_CODE, residue = 0;
-    typedef uint3 place;
-    typedef uint4 words;
+// Linear codes of 1, 2 or 4 low bits and any high plane, two runs a block:
+// step 2 h + t multiplies the columns
+// 16 h + 8 (c / 4) + 2 ((c / 2) % 2) + t + 4 (c % 2) of run h: a row's field
+// 2 h + c / 4 holds them as code 2 ((c / 2) % 2) + t of each half
+// (`lane_spread`). A lane holds its fields of each run, shifted to its
+// first code.
+template <uint LOW, uint HIGH, int ZERO>
+struct packing_linear<LOW, HIGH, ZERO, 2> {
+    static constant constexpr uint offset = ZERO;
+    typedef typename lane_type<HIGH, uint2, uint3>::type place;
+    typedef typename lane_type<HIGH, uint2, uint4>::type words;
     template <typename W>
     static place at(thread const Weights<W> &w, uint n, uint x) {
-        return uint3(w.codes_at(n, 16u, 0u) + (x >> 2) * 4u, w.high_at(n, 8u, 0u) + (x >> 2) * 2u, (x & 2u) * 4u);
+        const uint codes = w.codes_at(n, 4u * LOW, 0u) + (x >> 2) * LOW;
+        if constexpr (HIGH == 0u)
+            return uint2(codes, (x & 2u) * LOW);
+        else
+            return uint3(codes, w.high_at(n, 4u * HIGH, 0u) + (x >> 2) * HIGH, (x & 2u) * LOW);
     }
     template <typename W>
     static words load(thread const Weights<W> &w, place at, uint g) {
-        device const uchar *low = w.base + at.x + g * 16u * w.layout.tile;
-        device const uchar *high = w.base + at.y + g * 8u * w.layout.tile;
-        const uint2 nibbles = uint2(*reinterpret_cast<device const uint *>(low),
-            *reinterpret_cast<device const uint *>(low + 8));
-        const uint2 fields = uint2(*reinterpret_cast<device const ushort *>(high),
-            *reinterpret_cast<device const ushort *>(high + 4));
-        // A byte of each field (four columns' bits) under each half.
-        return uint4(nibbles >> at.z, ((fields | (fields << 8)) & 0x00ff00ffu) >> (at.z / 2u));
+        device const uchar *low = w.base + at.x + g * (4u * LOW) * w.layout.tile;
+        const uint2 codes = uint2(lane_field<LOW>(low), lane_field<LOW>(low + 2u * LOW));
+        if constexpr (HIGH == 0u) {
+            return lane_spread<LOW>(codes) >> at.y;
+        } else {
+            device const uchar *high = w.base + at.y + g * (4u * HIGH) * w.layout.tile;
+            const uint2 fields = uint2(lane_field<HIGH>(high), lane_field<HIGH>(high + 2u * HIGH));
+            return uint4(lane_spread<LOW>(codes) >> at.z, lane_spread<HIGH>(fields) >> (at.z / (LOW / HIGH)));
+        }
     }
     static half2 step(words codes, uint s) {
-        const uint nibbles = (s & 2u) ? codes.y : codes.x, fields = (s & 2u) ? codes.w : codes.z;
         const uint t = s & 1u;
-        return as_type<half2>(((nibbles >> (4u * t)) & 0x000f000fu) | (((fields >> (2u * t)) & 0x00030003u) << 4));
+        if constexpr (HIGH == 0u) {
+            return as_type<half2>(lane_pair<LOW, 0u>((s & 2u) ? codes.y : codes.x, 0u, t));
+        } else {
+            const uint low = (s & 2u) ? codes.y : codes.x, high = (s & 2u) ? codes.w : codes.z;
+            return as_type<half2>(lane_pair<LOW, HIGH>(low, high, t));
+        }
     }
+};
+
+template <uint LOW, uint HIGH, int ZERO, uint FOLDS>
+struct packing_layout<packets::Planes<LOW, HIGH>, packets::Linear<0u, ZERO>, FOLDS, false> {
+    typedef packing_linear<LOW, HIGH, ZERO, FOLDS> type;
 };
 
 // Codes of 8-bit values: the lane at fragment column x holds its row's eight
 // values 4 x .. 4 x + 7 of the block as two words of bytes (read as F16
-// subnormals, so the centre is 128). Step s multiplies the block's columns
+// subnormals). Step s multiplies the block's columns
 // 8 (c / 2) + 4 (s / 2) + s % 2 + 2 (c % 2) for c = 0 .. 7: bytes s % 2 and
 // s % 2 + 2 of word s / 2. `planes` are bit planes 0 and, with two residue
 // bits, 1 of the row's 32 values of the block (bit c: column c): a word's
@@ -274,10 +278,8 @@ inline uint2 packing_byte_planes(uint2 codes, uint x) {
 // 8-bit codes: a stored byte with MASK flipped is the code + 128 (two's
 // complement bytes) or the code.
 template <uint MASK, int ZERO>
-struct packing_layout<packets::Planes<8, 0>, packets::Linear<MASK, ZERO>, 1> {
-    static constant constexpr bool available = true;
-    static constant constexpr uint centre = packing_centre<packets::Planes<8, 0>>(), offset = uint(ZERO),
-        residue = 1;
+struct packing_bytes {
+    static constant constexpr uint offset = uint(ZERO);
     typedef uint place;
     typedef uint2 words;
     template <typename W>
@@ -293,48 +295,127 @@ struct packing_layout<packets::Planes<8, 0>, packets::Linear<MASK, ZERO>, 1> {
     template <uint RESIDUE>
     static uint2 planes(words codes, uint x) { return packing_byte_planes<RESIDUE>(codes, x); }
 };
+template <uint MASK, int ZERO>
+struct packing_layout<packets::Planes<8, 0>, packets::Linear<MASK, ZERO>, 1, true> {
+    typedef packing_bytes<MASK, ZERO> type;
+};
 
-// A codebook's 4-bit codes: the lane's four bytes of codes become its eight
-// values + 128 (`codebooks::pairs`, each code byte's two values), eight bits
-// each.
-template <uint ID>
-struct packing_layout<packets::Planes<4, 0>, packets::Table<ID>, 1> {
-    static constant constexpr bool available = true;
-    static constant constexpr uint centre = 128, offset = 128, residue = 1;
-    typedef uint place;
+// Codes that enter as their values + 128, eight bits each (a codebook's
+// values, grid codes), from a source V of a row's eight values a field (a
+// lane's columns 8 f .. 8 f + 7 of a block): V's `at` is its place in row n,
+// `bytes` field f of block g there, in column order. A layout holds them in
+// the order its steps read (`packing_byte_step`): with residue bits in column
+// order; one run a block, columns 0, 1, 4, 5 and 2, 3, 6, 7 of the lane's
+// field (step s: columns s and 4 + s); two runs, of the fields of each run
+// (c / 4 and 2 + c / 4), the half at the lane's first code
+// (2 ((c / 2) % 2)) of each: step 2 h + t its columns of run h.
+// Eight byte codes in column order as the words whose `packing_byte_step`
+// s is columns s and 4 + s: columns 0, 1, 4, 5 and 2, 3, 6, 7.
+inline uint2 packing_value_steps(uint2 bytes) {
+    return uint2((bytes.x & 0xffffu) | (bytes.y << 16), (bytes.x >> 16) | (bytes.y & 0xffff0000u));
+}
+template <typename V, uint FOLDS, bool RESIDUE>
+struct packing_value_layout {
+    static_assert(!RESIDUE || FOLDS == 1, "weights with residue bits scale every 32 columns");
+    static constant constexpr uint offset = 128;
+    struct place {
+        typename V::place row;
+        uint field;
+        uint side;
+    };
     typedef uint2 words;
     template <typename W>
     static place at(thread const Weights<W> &w, uint n, uint x) {
-        return w.codes_at(n, 16u, 0u) + (x >> 1) * 4u;
+        return place{V::at(w, n), FOLDS == 1 ? x >> 1 : x >> 2, (x >> 1) & 1u};
     }
-    // A row tile's rows of one block are adjacent: 16 bytes a row.
     template <typename W>
     static words load(thread const Weights<W> &w, place at, uint g) {
+        if constexpr (RESIDUE) {
+            return V::bytes(w, at.row, g, at.field);
+        } else if constexpr (FOLDS == 1) {
+            return packing_value_steps(V::bytes(w, at.row, g, at.field));
+        } else {
+            return uint2(packing_value_steps(V::bytes(w, at.row, g, at.field))[at.side],
+                packing_value_steps(V::bytes(w, at.row, g, at.field + 2u))[at.side]);
+        }
+    }
+    static half2 step(words codes, uint s) { return packing_byte_step(codes, s); }
+    template <uint RESIDUE_BITS>
+    static uint2 planes(words codes, uint x) { return packing_byte_planes<RESIDUE_BITS>(codes, x); }
+};
+
+// A codebook's codes of 1 or 4 bits: a field's eight codes as nibbles (a
+// field of 4-bit codes is its nibbles; one of 1-bit codes is spread to
+// them, `packets::spread_bits`) become its eight values + 128
+// (`codebooks::pairs`, each nibble pair's two values). A row tile's rows of
+// one block are adjacent: 4 LOW bytes a row.
+template <uint LOW>
+inline uint packing_nibbles(uint field) {
+    static_assert(LOW == 1u || LOW == 4u, "a codebook's codes are read as nibbles of 1 or 4 bits");
+    if constexpr (LOW == 4u)
+        return field;
+    else
+        return packets::spread_bits(field);
+}
+template <uint LOW, uint ID>
+struct packing_table_values {
+    typedef uint place;
+    template <typename W>
+    static place at(thread const Weights<W> &w, uint n) {
+        return w.codes_at(n, 4u * LOW, 0u);
+    }
+    template <typename W>
+    static uint2 bytes(thread const Weights<W> &w, place at, uint g, uint f) {
         constant ushort *pairs = codebooks::pairs<ID>::values();
-        const uint codes = *reinterpret_cast<device const uint *>(w.base + at + g * 16u * w.layout.tile);
+        const uint codes =
+            packing_nibbles<LOW>(lane_field<LOW>(w.base + at + g * (4u * LOW) * w.layout.tile + f * LOW));
         return uint2(uint(pairs[codes & 0xffu]) | (uint(pairs[(codes >> 8) & 0xffu]) << 16),
             uint(pairs[(codes >> 16) & 0xffu]) | (uint(pairs[codes >> 24]) << 16));
     }
-    static half2 step(words codes, uint s) { return packing_byte_step(codes, s); }
-    template <uint RESIDUE>
-    static uint2 planes(words codes, uint x) { return packing_byte_planes<RESIDUE>(codes, x); }
+};
+template <uint LOW, uint ID, uint FOLDS, bool RESIDUE>
+struct packing_layout<packets::Planes<LOW, 0>, packets::Table<ID>, FOLDS, RESIDUE> {
+    typedef packing_value_layout<packing_table_values<LOW, ID>, FOLDS, RESIDUE> type;
 };
 
-// The factors of coefficients K of codes centred at CENTRE whose value is
-// zero at OFFSET, a block's runs K's groups of a packet: a block's factors
-// are scale 32767 / 64 and its min term (CENTRE - OFFSET) scale + bias, or
-// with two runs the runs' scales 32767 / 64. The fold takes a sum of at most
-// 1 of the first and a code sum / 64 below 128 of the second, so 512 |scale|
-// + 128 |min term| bounds what it multiplies (`reach`). `available` where
-// the codes are integers, a run is one coefficient group (of at most 32
-// columns), a block of two runs has no min term and the run of a 256-column
-// block's factors is one factor group's or eight packets'.
-// The registry states the same rule as `IntegerCodes::packing_run`
-// (`seismic/api`), by which the planner plans a packing bound.
-template <typename K, uint CENTRE, uint OFFSET>
-struct packing_factors {
-    static constant constexpr bool available = false, biased = false;
+// Grid codes (`packets::Grid`): field f is entry f of the block's packet
+// (`packets::Entries`, read whole from its units of the codes and the high
+// plane), its codes + 128 (`Grid::offset_bytes`).
+template <uint BYTES, uint HIGH, typename C>
+struct packing_grid_values {
+    typedef packets::Entries<BYTES, HIGH> E;
+    typedef uint2 place;
+    template <typename W>
+    static place at(thread const Weights<W> &w, uint n) {
+        return uint2(w.codes_at(n, 4u * BYTES, 0u), w.high_at(n, packets::entries_high_bytes(HIGH), 0u));
+    }
+    template <typename W>
+    static uint2 bytes(thread const Weights<W> &w, place at, uint g, uint f) {
+        const typename E::words entries =
+            E::of(w.base + at.x + g * (4u * BYTES) * w.layout.tile,
+                w.base + at.y + g * packets::entries_high_bytes(HIGH) * w.layout.tile);
+        return C::offset_bytes(E::entry(entries, f));
+    }
 };
+template <uint BYTES, uint HIGH, uint GRID, uint INDEX_BITS, uint LANES, uint SIGNS, uint DELTA_BIT, uint DELTA,
+    uint FOLDS, bool RESIDUE>
+struct packing_layout<packets::Entries<BYTES, HIGH>, packets::Grid<GRID, INDEX_BITS, LANES, SIGNS, DELTA_BIT, DELTA>,
+    FOLDS, RESIDUE> {
+    typedef packing_value_layout<
+        packing_grid_values<BYTES, HIGH, packets::Grid<GRID, INDEX_BITS, LANES, SIGNS, DELTA_BIT, DELTA>>, FOLDS,
+        RESIDUE> type;
+};
+
+// The factors of coefficients K of codes in planes P centred at CENTRE whose
+// value is zero at OFFSET, a block's runs K's groups of a packet: a block's
+// factors are scale 32767 / 64 and its min term (CENTRE - OFFSET) scale +
+// bias, or with two runs the runs' scales 32767 / 64 (a block of two runs
+// has no min term: the registry's rule). The fold takes a sum of at most 1
+// of the first and a code sum / 64 below 128 of the second, so 512 |scale|
+// + 128 |min term| bounds what it multiplies (`reach`). The run of a
+// 256-column block's factors is one factor group's or eight packets'.
+template <typename P, typename K, uint CENTRE, uint OFFSET>
+struct packing_factors;
 
 // The difference CENTRE - OFFSET.
 template <uint CENTRE, uint OFFSET>
@@ -361,39 +442,49 @@ inline float2 packing_block_factors(thread const typename K::coefficients &k) {
     return float2(k.scale(0) * (32767.0f / 64.0f), packing_min_term<K, CENTRE, OFFSET>(k));
 }
 
-// Hierarchical coefficients in the scales plane: a block's factors from the
-// factor group's run (`packets::Hier::run`), bounded by the local codes'
-// largest magnitude under the group's factors.
-template <typename FS, int EXPONENT, uint LOCAL_BITS, typename L, uint GROUP, bool MIN, int BIAS_SIGN,
-    uint CENTRE, uint OFFSET>
-struct packing_factors<packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, 0u>, CENTRE,
-    OFFSET> {
-    typedef packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, 0u> K;
-    static constant constexpr bool biased = MIN || CENTRE != OFFSET;
-    static constant constexpr bool available = K::groups == 1 || !biased;
-    typedef typename K::run run;
+// Hierarchical coefficients: a block's factors from the factor group's run
+// (`packets::Hier::run`) and, where the entries carry the local codes, from
+// each packet's entries; bounded by the local codes' largest magnitude under
+// the group's factors (a signed bias is its scale's `signed_scale`).
+template <typename P, typename FS, int EXPONENT, uint LOCAL_BITS, uint WIDTH, typename L, uint GROUP, bool MIN,
+    int BIAS_SIGN, uint CARRIED_BIT, bool SIGNED, int SIGNED_EXPONENT, uint CENTRE, uint OFFSET>
+struct packing_factors<P,
+    packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, WIDTH, L, GROUP, MIN, BIAS_SIGN, CARRIED_BIT, SIGNED, SIGNED_EXPONENT>,
+    CENTRE, OFFSET> {
+    typedef packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, WIDTH, L, GROUP, MIN, BIAS_SIGN, CARRIED_BIT, SIGNED,
+        SIGNED_EXPONENT> K;
+    static constant constexpr bool biased = K::biased || CENTRE != OFFSET;
+    struct run {
+        typename K::run coefficients;
+        device const uchar *row;
+        Rows16 layout;
+        uint p;
+    };
     static run start(device const uchar *row, Rows16 layout, uint block) {
-        return K::start(row, layout, block * K::packets);
+        return run{K::start(row, layout, block * K::packets), row, layout, block * K::packets};
     }
     static float2 take(thread run &state) {
-        return packing_block_factors<K, CENTRE, OFFSET>(K::form(K::next(state), state.factor));
+        uint field;
+        if constexpr (K::carries)
+            field = K::template carried<P>(P::load(state.row, state.layout, state.p++));
+        else
+            field = K::next(state.coefficients);
+        return packing_block_factors<K, CENTRE, OFFSET>(K::form(field, state.coefficients.factor));
     }
     static float reach(device const uchar *row, Rows16 layout, uint block) {
         const typename K::group_factors factors = K::factors(row, layout, block);
-        const float scale = (512.0f + 128.0f * metal::abs(packing_shift<CENTRE, OFFSET>())) * metal::abs(factors.scale(0));
+        const float scale = (512.0f + 128.0f * (metal::abs(packing_shift<CENTRE, OFFSET>()) + K::signed_scale))
+            * metal::abs(factors.scale(0));
         return float(L::largest) * (MIN ? metal::fma(128.0f, metal::abs(factors.bias(0)), scale) : scale);
     }
 };
 
 // Direct coefficients: a block's factors from its eight packets' own,
 // bounded by the largest of them.
-template <typename S, uint GROUP, bool BIAS, uint STORAGE, uint CENTRE, uint OFFSET>
-struct packing_factors<packets::Direct<S, GROUP, BIAS, STORAGE, 0>, CENTRE, OFFSET> {
+template <typename P, typename S, uint GROUP, bool BIAS, uint STORAGE, uint CENTRE, uint OFFSET>
+struct packing_factors<P, packets::Direct<S, GROUP, BIAS, STORAGE, 0>, CENTRE, OFFSET> {
     typedef packets::Direct<S, GROUP, BIAS, STORAGE, 0> K;
     static constant constexpr bool biased = BIAS || CENTRE != OFFSET;
-    // Served where a run is one group of a 32-column block and a block of
-    // two runs has no min term.
-    static constant constexpr bool available = (K::groups == 1 || !biased) && GROUP <= 32u;
     // A 256-column block's share of the supers plane, from its first
     // group's scale: a packet's place in it is its index in the block.
     static device const uchar *block_supers(device const uchar *row, Rows16 layout, uint block) {
@@ -427,21 +518,22 @@ struct packing_factors<packets::Direct<S, GROUP, BIAS, STORAGE, 0>, CENTRE, OFFS
     }
 };
 
-// The packed codes of weights W whose code planes and interpretation have a
-// layout (`LAID`), its runs a block the coefficient groups of a packet. None
+// The packed codes of weights W that the forms read (`LAID`). None
 // otherwise.
 template <typename W, bool LAID>
 struct packing_codes_of {
     static constant constexpr bool available = false, biased = false;
-    static constant constexpr uint centre = 0, folds = 0, residue = 0;
+    static constant constexpr uint centre = 0, magnitude = 0, folds = 0, residue = 0;
 };
-template <typename P, typename C, typename K>
-struct packing_codes_of<packets::Packet<P, C, K>, true> {
-    typedef packets::Packet<P, C, K> W;
-    typedef packing_layout<P, C, K::groups> layout;
-    typedef packing_factors<K, layout::centre, layout::offset> factors;
-    static constant constexpr uint centre = layout::centre, folds = K::groups, residue = layout::residue;
-    static constant constexpr bool available = packing_forms && factors::available;
+template <typename P, typename C, typename K, typename G>
+struct packing_codes_of<packets::Packet<P, C, K, G>, true> {
+    typedef packets::Packet<P, C, K, G> W;
+    static constant constexpr uint folds = 32u / G::run;
+    typedef typename packing_layout<P, C, folds, G::residue>::type layout;
+    static constant constexpr uint centre = layout::offset + G::centre, magnitude = G::magnitude,
+        residue = G::residue ? 1u : 0u;
+    typedef packing_factors<P, K, centre, layout::offset> factors;
+    static constant constexpr bool available = packing_forms;
     static constant constexpr bool biased = factors::biased;
     typedef typename layout::place place;
     typedef typename layout::words words;
@@ -452,14 +544,14 @@ struct packing_codes_of<packets::Packet<P, C, K>, true> {
     static uint2 planes(words codes, uint x) { return layout::template planes<RESIDUE>(codes, x); }
 };
 
-// Whether weights W have a packing layout.
+// Whether the forms read weights W (their decoder's `packets::Packing`).
 template <typename W>
 struct packing_laid {
     static constant constexpr bool value = false;
 };
-template <typename P, typename C, typename K>
-struct packing_laid<packets::Packet<P, C, K>> {
-    static constant constexpr bool value = packing_layout<P, C, K::groups>::available;
+template <typename P, typename C, typename K, typename G>
+struct packing_laid<packets::Packet<P, C, K, G>> {
+    static constant constexpr bool value = G::run != 0u;
 };
 
 template <typename W>
@@ -511,9 +603,9 @@ struct packing_serves {
 // or one run with residue bits), and the shared one is laid out for the
 // layout that serves the most weight rows (`folds`; 0: no weight has a
 // packed path), a layout without residue bits before one with them where
-// they serve as many. It is coded for the largest centre among the weights it
-// serves, whose gain limits are the tightest, and with residue bits for
-// WIDTH of them (the form's PACK).
+// they serve as many. It is coded for the largest magnitude among the
+// weights it serves, whose gain limits are the tightest, and with residue
+// bits for WIDTH of them (the form's PACK).
 template <uint WIDTH, typename A, uint RA, typename B = A, uint RB = 0, typename C = A, uint RC = 0,
     typename D = A, uint RD = 0>
 struct packing_shared {
@@ -531,19 +623,19 @@ struct packing_shared {
         bytes = rows<1, 1>::value;
     static constant constexpr uint folds = one + two + bytes == 0 ? 0 : (two > one && two >= bytes) ? 2 : 1;
     static constant constexpr uint residue = folds == 1 && bytes > one ? WIDTH : 0;
-    static constant constexpr uint a = packing_serves<A, folds, residue>::value ? packing_codes<A>::centre : 0;
-    static constant constexpr uint b = packing_serves<B, folds, residue>::value ? packing_codes<B>::centre : 0;
-    static constant constexpr uint c = packing_serves<C, folds, residue>::value ? packing_codes<C>::centre : 0;
-    static constant constexpr uint d = packing_serves<D, folds, residue>::value ? packing_codes<D>::centre : 0;
+    static constant constexpr uint a = packing_serves<A, folds, residue>::value ? packing_codes<A>::magnitude : 0;
+    static constant constexpr uint b = packing_serves<B, folds, residue>::value ? packing_codes<B>::magnitude : 0;
+    static constant constexpr uint c = packing_serves<C, folds, residue>::value ? packing_codes<C>::magnitude : 0;
+    static constant constexpr uint d = packing_serves<D, folds, residue>::value ? packing_codes<D>::magnitude : 0;
     static constant constexpr uint ab = a > b ? a : b, cd = c > d ? c : d;
-    static constant constexpr uint centre = ab > cd ? ab : cd;
+    static constant constexpr uint magnitude = ab > cd ? ab : cd;
 };
 
 // The gain limits of a run of n = 32 / folds columns against codes minus
-// `centre` (each at most `centre` in magnitude): a run's sum is at most
-// centre |q|_1, and codes rounded to multiples of s have
+// their centre, each at most `magnitude` in magnitude: a run's sum is at
+// most magnitude |q|_1, and codes rounded to multiples of s have
 // |q|_1 <= g |x|_1 + n s / 2, so the largest gain under a sum limit is
-// (limit / centre - n s / 2) / |x|_1, with the limits of `packing_fields`
+// (limit / magnitude - n s / 2) / |x|_1, with the limits of `packing_fields`
 // (32767 for the top token and 32767 - 64 n for the low one where the sums
 // fit 16 bits each). Returned as what a run's scale (64 / gain) is per unit
 // of |x|_1, of the top token, of the low token and of the low token with even
@@ -551,8 +643,8 @@ struct packing_shared {
 // (at most 2^-19 of a sum of 32 magnitudes, in any order) and of the
 // products with it.
 template <uint RESIDUE>
-inline float3 packing_limits(uint centre, uint folds) {
-    const float n = 32.0f / float(folds), c = float(centre);
+inline float3 packing_limits(uint magnitude, uint folds) {
+    const float n = 32.0f / float(folds), c = float(magnitude);
     const float top = packing_fields<RESIDUE>::top_limit, low = packing_fields<RESIDUE>::low_limit(n);
     return (64.0f / 0.9990234375f) / float3(top / c - 0.5f * n, low / c - 0.5f * n, low / c - n);
 }
@@ -691,19 +783,20 @@ inline ushort2 packing_scales_over(ushort2 held, float2 scale) {
 // each column's two pairs together. Tokens at or past `m_rows` are zero.
 // The block scales are first stored as their bits; once the threadgroup has
 // the four tokens' largest (through `peaks`, one entry per simdgroup) their
-// token scales are stored and the block scales rewritten over them. CENTRE,
-// FOLDS and RESIDUE are the centre, the runs a block and the residue bits of
-// the weights the operand multiplies (`packing_shared`), whose steps' columns
+// token scales are stored and the block scales rewritten over them.
+// MAGNITUDE, FOLDS and RESIDUE are the largest code magnitude, the runs a
+// block and the residue bits of the weights the operand multiplies
+// (`packing_shared`), whose steps' columns
 // it is laid out in (`packing_codes`); `bounds` the packing bounds of the
 // weights it serves.
-template <uint CENTRE, uint FOLDS, uint RESIDUE, uint BOUNDS, typename In>
+template <uint MAGNITUDE, uint FOLDS, uint RESIDUE, uint BOUNDS, typename In>
 inline void packing_operand(thread const In &in, thread const packing_scratch &s,
     thread const packing_bounds<BOUNDS> &bounds, uint m_rows, uint columns, uint pairs, threadgroup float4 *peaks,
     uint thread_index, uint sg, uint lane) {
     static_assert(RESIDUE == 0 || FOLDS == 1, "weights with a residue bit scale every 32 columns");
     typedef packing_fields<RESIDUE> fields;
     const uint groups = columns / 32u, steps = columns / 8u;
-    const float3 limits = packing_limits<RESIDUE>(CENTRE, FOLDS);
+    const float3 limits = packing_limits<RESIDUE>(MAGNITUDE, FOLDS);
     const uint tile = pairs / 16u, within = (2u * pairs) & 31u;
     // A pair's entry of a block is 8 bytes, 16 with two residue bits.
     constexpr uint ENTRY = RESIDUE > 1 ? 16u : 8u;

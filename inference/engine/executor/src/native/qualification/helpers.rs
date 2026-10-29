@@ -560,7 +560,7 @@ pub(super) fn semantic_pattern(
     if element.dtype().is_some() {
         return semantic_ones(device, element, extents, entry, bindings);
     }
-    let (source, packet) = pattern_source(element.representation()).ok_or_else(|| {
+    let (source, packet) = pattern_source(element).ok_or_else(|| {
         qualification_dynamic(
             entry,
             bindings,
@@ -605,157 +605,119 @@ pub(super) fn semantic_pattern(
 /// packed layout's row group.
 const PATTERN_BLOCK_ROWS: u64 = 256;
 
-/// One GGUF source packet whose every value decodes to 1.0, for a packed
-/// representation. Repeated and converted by the registry's host reference
-/// into the element's (representation, layout), the fixture follows every
-/// layout's geometry.
-fn pattern_source(representation: &str) -> Option<(Element, Vec<u8>)> {
-    let (source, packet) = match representation {
-        "q8g32s" => (
-            "gguf_q8_0",
-            unit_packet(34, &[(0, &[0x00, 0x3c]), (2, &[1; 32])]),
-        ),
+/// A packed element's fixture: one packet of an external source the
+/// registry converts into the element, every value of which decodes to 1.0
+/// (`unit_source_packet`). Repeated and converted by the registry's host
+/// reference into the element's (representation, layout), the fixture
+/// follows every layout's geometry.
+fn pattern_source(element: Element) -> Option<(Element, Vec<u8>)> {
+    Element::external_sources()
+        .filter(|source| {
+            source.converted(element.layout(), element.operand_recipe()) == Some(element)
+        })
+        .find_map(|source| Some((source, unit_source_packet(source)?)))
+}
+
+/// One packet of external source `source` every value of which decodes to
+/// 1.0; `None` for a source without one.
+fn unit_source_packet(source: Element) -> Option<Vec<u8>> {
+    let runs: &[(usize, &[u8])] = match source.name() {
+        "gguf_q8_0" => &[(0, &[0x00, 0x3c]), (2, &[1; 32])],
         // Codes 17 (low nibble 1, high bit 1) at offset -16 and d = 1.
-        "q5g32s" => (
-            "gguf_q5_0",
-            unit_packet(22, &[(0, &[0x00, 0x3c]), (2, &[0xff; 4]), (6, &[0x11; 16])]),
-        ),
+        "gguf_q5_0" => &[(0, &[0x00, 0x3c]), (2, &[0xff; 4]), (6, &[0x11; 16])],
         // d = 1, dmin = 0, sub-block scales 1 and minima 0, codes 1.
-        "q4k" => (
-            "gguf_q4_k",
-            unit_packet(
-                144,
-                &[
-                    (0, &[0x00, 0x3c]),
-                    (4, &[1; 4]),
-                    (12, &[1; 4]),
-                    (16, &[0x11; 128]),
-                ],
-            ),
-        ),
-        "q5k" => (
-            "gguf_q5_k",
-            unit_packet(
-                176,
-                &[
-                    (0, &[0x00, 0x3c]),
-                    (4, &[1; 4]),
-                    (12, &[1; 4]),
-                    (48, &[0x11; 128]),
-                ],
-            ),
-        ),
+        "gguf_q4_k" => &[
+            (0, &[0x00, 0x3c]),
+            (4, &[1; 4]),
+            (12, &[1; 4]),
+            (16, &[0x11; 128]),
+        ],
+        "gguf_q5_k" => &[
+            (0, &[0x00, 0x3c]),
+            (4, &[1; 4]),
+            (12, &[1; 4]),
+            (48, &[0x11; 128]),
+        ],
         // Codes 33 (low nibble 1, high bits 2) at scale 1 and d = 1.
-        "q6k" => (
-            "gguf_q6_k",
-            unit_packet(
-                210,
-                &[
-                    (0, &[0x11; 128]),
-                    (128, &[0xaa; 64]),
-                    (192, &[1; 16]),
-                    (208, &[0x00, 0x3c]),
-                ],
-            ),
-        ),
+        "gguf_q6_k" => &[
+            (0, &[0x11; 128]),
+            (128, &[0xaa; 64]),
+            (192, &[1; 16]),
+            (208, &[0x00, 0x3c]),
+        ],
         // Codes 9 at offset -8 and d = 1.
-        "q4g32s" => (
-            "gguf_q4_0",
-            unit_packet(18, &[(0, &[0x00, 0x3c]), (2, &[0x99; 16])]),
-        ),
+        "gguf_q4_0" => &[(0, &[0x00, 0x3c]), (2, &[0x99; 16])],
         // Codes 1, d = 1 and minimum m = 0.
-        "q4g32" => (
-            "gguf_q4_1",
-            unit_packet(20, &[(0, &[0x00, 0x3c]), (4, &[0x11; 16])]),
-        ),
+        "gguf_q4_1" => &[(0, &[0x00, 0x3c]), (4, &[0x11; 16])],
         // Codes 1, d = 1 and minimum m = 0.
-        "q5g32" => (
-            "gguf_q5_1",
-            unit_packet(24, &[(0, &[0x00, 0x3c]), (8, &[0x11; 16])]),
-        ),
+        "gguf_q5_1" => &[(0, &[0x00, 0x3c]), (8, &[0x11; 16])],
         // E2M1 code 2 (value 1) and E8M0 scale 127 (2^0).
-        "mxfp4g32" => (
-            "gguf_mxfp4",
-            unit_packet(17, &[(0, &[127]), (1, &[0x22; 16])]),
-        ),
+        "gguf_mxfp4" => &[(0, &[127]), (1, &[0x22; 16])],
         // E2M1 code 2 (value 1) and four UE4M3 scales 0x38 (1.0).
-        "nvfp4g16" => (
-            "gguf_nvfp4",
-            unit_packet(36, &[(0, &[0x38; 4]), (4, &[0x22; 32])]),
-        ),
+        "gguf_nvfp4" => &[(0, &[0x38; 4]), (4, &[0x22; 32])],
         // Grid point 0 (every magnitude 8), no signs, scale codes 0 (odd
         // scale 1) and d = 1: d / 8 * 1 * 8.
-        "iq2xs" => ("gguf_iq2_xs", unit_packet(74, &[(0, &[0x00, 0x3c])])),
+        "gguf_iq2_xs" => &[(0, &[0x00, 0x3c])],
         // Grid points 0 (every magnitude 4), no signs, scale codes 0 and
         // d = 1: d / 4 * 1 * 4.
-        "iq3xxs" => ("gguf_iq3_xxs", unit_packet(98, &[(0, &[0x00, 0x3c])])),
+        "gguf_iq3_xxs" => &[(0, &[0x00, 0x3c])],
         // Grid point 0 (every magnitude 8), no signs, scale codes 0 and
         // d = 1: d / 8 * 1 * 8.
-        "iq2xxs" => ("gguf_iq2_xxs", unit_packet(66, &[(0, &[0x00, 0x3c])])),
+        "gguf_iq2_xxs" => &[(0, &[0x00, 0x3c])],
         // Grid point 0 (every magnitude 8), no signs, scale codes 0 and
         // d = 1: d / 8 * 1 * 8.
-        "iq2s" => ("gguf_iq2_s", unit_packet(82, &[(0, &[0x00, 0x3c])])),
+        "gguf_iq2_s" => &[(0, &[0x00, 0x3c])],
         // Grid points 0 (every magnitude 1), no signs, scale codes 0 (odd
         // scale 1) and d = 1.
-        "iq3s" => ("gguf_iq3_s", unit_packet(110, &[(0, &[0x00, 0x3c])])),
+        "gguf_iq3_s" => &[(0, &[0x00, 0x3c])],
         // Grid point 1029 (every value 0, its index's low byte 5 and high
         // bits 4) with the delta +1/8, scale codes 0 (odd scale 1) and
         // d = 8: 8 * 1 * (0 + 1/8).
-        "iq1s" => (
-            "gguf_iq1_s",
-            unit_packet(
-                50,
-                &[
-                    (0, &[0x00, 0x48]),
-                    (2, &[0x05; 32]),
-                    (34, &[0x24, 0x09, 0x24, 0x09, 0x24, 0x09, 0x24, 0x09]),
-                    (42, &[0x24, 0x09, 0x24, 0x09, 0x24, 0x09, 0x24, 0x09]),
-                ],
-            ),
-        ),
+        "gguf_iq1_s" => &[
+            (0, &[0x00, 0x48]),
+            (2, &[0x05; 32]),
+            (34, &[0x24, 0x09, 0x24, 0x09, 0x24, 0x09, 0x24, 0x09]),
+            (42, &[0x24, 0x09, 0x24, 0x09, 0x24, 0x09, 0x24, 0x09]),
+        ],
         // The same point and delta, scale codes 0 and d = 8, whose nibbles
         // are the scale words' top ones.
-        "iq1m" => (
-            "gguf_iq1_m",
-            unit_packet(
-                56,
-                &[(0, &[0x05; 32]), (32, &[0x44; 16]), (48, &[0, 0, 0, 0, 0, 0x80, 0, 0x40])],
-            ),
-        ),
+        "gguf_iq1_m" => &[
+            (0, &[0x05; 32]),
+            (32, &[0x44; 16]),
+            (48, &[0, 0, 0, 0, 0, 0x80, 0, 0x40]),
+        ],
         // Codes 1 at sub-block scales 1 and minima 0, d = 1 and dmin = 0.
-        "q2k" => (
-            "gguf_q2_k",
-            unit_packet(84, &[(0, &[0x01; 16]), (16, &[0x55; 64]), (80, &[0x00, 0x3c])]),
-        ),
+        "gguf_q2_k" => &[(0, &[0x01; 16]), (16, &[0x55; 64]), (80, &[0x00, 0x3c])],
         // Every code bit set (value +1) and d = 1.
-        "q1g128" => (
-            "gguf_q1_0",
-            unit_packet(18, &[(0, &[0x00, 0x3c]), (2, &[0xff; 16])]),
-        ),
+        "gguf_q1_0" => &[(0, &[0x00, 0x3c]), (2, &[0xff; 16])],
         // Codes 2 (value 2 - 1) and d = 1.
-        "q2g256" => (
-            "gguf_tq2_0",
-            unit_packet(66, &[(0, &[0xaa; 64]), (64, &[0x00, 0x3c])]),
-        ),
+        "gguf_tq2_0" => &[(0, &[0xaa; 64]), (64, &[0x00, 0x3c])],
         // Table code 8 (value 1) at sub-scale 33 - 32 = 1 and d = 1.
-        "iq4xs" => (
-            "gguf_iq4_xs",
-            unit_packet(
-                136,
-                &[
-                    (0, &[0x00, 0x3c]),
-                    (2, &[0xaa, 0xaa]),
-                    (4, &[0x11; 4]),
-                    (8, &[0x88; 128]),
-                ],
-            ),
-        ),
+        "gguf_iq4_xs" => &[
+            (0, &[0x00, 0x3c]),
+            (2, &[0xaa, 0xaa]),
+            (4, &[0x11; 4]),
+            (8, &[0x88; 128]),
+        ],
+        // Codes 5 (low bits 1, high bit 1) at offset -4, sub-block scale
+        // codes 33 (low nibbles 1, high crumbs 2) at offset -32 and d = 1.
+        "gguf_q3_k" => &[
+            (0, &[0xff; 32]),
+            (32, &[0x55; 64]),
+            (96, &[0x11; 8]),
+            (104, &[0xaa; 4]),
+            (108, &[0x00, 0x3c]),
+        ],
+        // Table code 8 (value 1) and d = 1.
+        "gguf_iq4_nl" => &[(0, &[0x00, 0x3c]), (2, &[0x88; 16])],
+        // Every base-3 digit 2 (value 2 - 1: byte 0xff) and d = 1.
+        "gguf_tq1_0" => &[(0, &[0xff; 52]), (52, &[0x00, 0x3c])],
         _ => return None,
     };
-    Some((
-        Element::named(source).expect("registered GGUF source representation"),
-        packet,
-    ))
+    let encoding = magnitude_artifacts::gguf::Encoding::ALL
+        .into_iter()
+        .find(|encoding| Element::gguf_source(*encoding) == Some(source))?;
+    Some(unit_packet(encoding.block_bytes() as usize, runs))
 }
 
 /// The host-converted fixture of `extents`: `packet` repeated over the
@@ -776,7 +738,8 @@ fn pattern_bytes(
     element.repack_host(source, extents, &source_bytes)
 }
 
-/// A source packet of `size` bytes: zero except the given byte runs.
+/// A source packet of `size` bytes (its encoding's block): zero except the
+/// given byte runs.
 fn unit_packet(size: usize, runs: &[(usize, &[u8])]) -> Vec<u8> {
     let mut packet = vec![0_u8; size];
     for (offset, bytes) in runs {
@@ -912,70 +875,56 @@ pub(super) fn read_dense_values(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seismic::Layout;
+    use seismic::{Layout, OperandRecipe};
 
     /// A large fixture is converted as one repeated row block; the block must
     /// reproduce the whole conversion byte for byte in every layout.
     #[test]
     fn repeated_pattern_block_matches_the_whole_conversion() {
-        let mut compared = Vec::new();
-        for representation in [
-            "q8g32s", "q5g32s", "q4k", "q5k", "q6k", "iq4xs", "q4g32s", "q4g32", "q5g32",
-            "mxfp4g32", "nvfp4g16", "iq2xs", "iq3xxs", "iq2xxs", "iq2s", "iq3s", "q2k", "q1g128",
-            "q2g256", "iq1s", "iq1m",
-        ] {
-            let (source, packet) = pattern_source(representation).unwrap();
-            for layout in [Layout::Packet, Layout::Rows16, Layout::Rows8, Layout::Mma16] {
-                let Some(element) = Element::stored(representation, layout) else {
-                    continue;
-                };
+        for source in Element::external_sources() {
+            let packet = unit_source_packet(source).unwrap();
+            for layout in Layout::ALL {
+                let element = source.converted(layout, OperandRecipe::Rounded).unwrap();
                 let columns = 512;
-                let Some(whole) =
+                let whole =
                     pattern_bytes(element, source, &packet, &[2 * PATTERN_BLOCK_ROWS, columns])
-                else {
-                    continue;
-                };
+                        .unwrap();
                 let block = pattern_bytes(element, source, &packet, &[PATTERN_BLOCK_ROWS, columns])
                     .unwrap();
-                assert_eq!(block.repeat(2), whole, "{representation} {layout:?}");
-                compared.push((representation, layout));
+                assert_eq!(block.repeat(2), whole, "{} {layout:?}", source.name());
             }
-        }
-        // Every production row layout of every fixture format was compared.
-        for representation in ["q8g32s", "q4k", "q5k", "q6k", "iq4xs"] {
-            assert!(
-                compared.contains(&(representation, Layout::Rows16)),
-                "{representation} rows16 was not compared: {compared:?}"
-            );
         }
     }
 
-    /// Every packed resident representation has a fixture, and it decodes to
-    /// 1.0 everywhere in every layout (at a K with a partial 256-value block).
+    /// Every external source has a fixture packet, so every packed element
+    /// the registry converts into has a fixture, and it decodes to 1.0
+    /// everywhere in every layout and for every operand recipe (at a K with
+    /// a partial 256-value block).
     #[test]
-    fn every_packed_representation_has_a_unit_fixture() {
-        let representations = [
-            "q8g32s", "q4k", "q5k", "q6k", "iq4xs", "q4g32s", "q4g32", "q5g32s", "q5g32",
-            "mxfp4g32", "nvfp4g16", "nvfp4g16a4", "iq2xs", "iq3xxs", "iq2xxs", "iq2s", "iq3s", "q2k",
-            "q1g128", "q2g256", "iq1s", "iq1m",
-        ];
-        for representation in representations {
-            let stored = Element::stored(representation, Layout::Packet).unwrap();
-            let (source, packet) = pattern_source(stored.representation())
-                .unwrap_or_else(|| panic!("{representation} has no fixture"));
+    fn every_external_source_has_a_unit_fixture() {
+        for source in Element::external_sources() {
+            let packet = unit_source_packet(source)
+                .unwrap_or_else(|| panic!("{} has no fixture", source.name()));
             // Whole source blocks: two 256-value ones, and one more of a
             // shorter source block (a partial 256-value block).
             let group = source.logical_group().unwrap();
             let columns = 512 + if group < 256 { group } else { 0 };
             for layout in Layout::ALL {
-                let element = Element::stored(representation, layout).unwrap();
-                let extents = [3, columns];
-                let bytes = pattern_bytes(element, source, &packet, &extents).unwrap();
-                let values = element.decode_host(&extents, &bytes).unwrap();
-                assert!(
-                    values.iter().all(|value| *value == 1.0),
-                    "{representation} {layout:?}"
-                );
+                for operands in OperandRecipe::ALL {
+                    let Some(element) = source.converted(layout, operands) else {
+                        continue;
+                    };
+                    assert!(pattern_source(element).is_some(), "{}", element.name());
+                    let extents = [3, columns];
+                    let bytes = pattern_bytes(element, source, &packet, &extents).unwrap();
+                    let values = element.decode_host(&extents, &bytes).unwrap();
+                    assert!(
+                        values.iter().all(|value| *value == 1.0),
+                        "{} {}",
+                        source.name(),
+                        element.name()
+                    );
+                }
             }
         }
     }
