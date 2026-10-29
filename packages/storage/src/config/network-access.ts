@@ -77,17 +77,27 @@ export const isAllowedHostHeader = (header: string | undefined, network: Network
   return network.allowedHosts.some(allowed => allowed.trim().toLowerCase() === host)
 }
 
-/** Whether a remote inference request carries the configured key, when one is required. */
-export const authorizesRemoteInference = (
-  headers: { readonly authorization?: string; readonly 'x-api-key'?: string },
-  network: NetworkAccess,
-): boolean => {
-  if (!network.requireApiKey) return true
+type KeyHeaders = { readonly authorization?: string; readonly 'x-api-key'?: string }
+
+/** Whether a request presents the configured key, as a bearer token or `x-api-key`. */
+export const presentsNetworkKey = (headers: KeyHeaders, network: NetworkAccess): boolean => {
   if (Option.isNone(network.apiKey)) return false
   const bearer = headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim()
   const presented = bearer ?? headers['x-api-key']?.trim()
   return presented !== undefined && constantTimeEqual(presented, network.apiKey.value)
 }
+
+/** Whether a remote inference request carries the configured key, when one is required. */
+export const authorizesRemoteInference = (headers: KeyHeaders, network: NetworkAccess): boolean =>
+  !network.requireApiKey || presentsNetworkKey(headers, network)
+
+/**
+ * The Host rule for a request. In a container, other containers reach the service by names nobody can
+ * list ahead of time, such as a compose service name. A DNS-rebinding page can't know the network
+ * access key, so in a container a request that presents it is admitted under any Host.
+ */
+export const admitsRequestHost = (headers: KeyHeaders & { readonly host?: string }, network: NetworkAccess, container: boolean): boolean =>
+  isAllowedHostHeader(headers.host, network) || (container && network.enabled && presentsNetworkKey(headers, network))
 
 const constantTimeEqual = (a: string, b: string): boolean => {
   const left = Buffer.from(a)

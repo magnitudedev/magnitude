@@ -8,7 +8,8 @@ import { type ApplicationRuntime, type ApplicationProfile, PreparedUpdateStore, 
   acquireApplicationMaintenance, nativeHostLayer, unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory, nodeTerminalCommand, linuxInstallationLockHeldByOthers } from "@magnitudedev/daemon-management/desktop-native"
 import { ApplicationUpdateSource, makeInstalledUpdatePreparation, makeApplicationUpdate,
   reconcilePreparedUpdate, unavailableApplicationUpdate, completeLinuxForegroundUpdate, prepareMacForegroundStartup,
-  startMacForegroundInstallation, recordStartupFailure, type ApplicationUpdate } from "@magnitudedev/daemon-management/application-update"
+  startMacForegroundInstallation, recordStartupFailure, makeContainerApplicationUpdate, recordContainerUpgrade, containerImageVersions,
+  containerUpdateNotice, type ApplicationUpdate } from "@magnitudedev/daemon-management/application-update"
 import { CLI_VERSION } from "../version"
 import { withLocalService } from "./server-reach"
 
@@ -48,6 +49,21 @@ export const initializeServeUpdates = (runtime: ApplicationRuntime, profile: App
   }).pipe(Effect.provide(privateFiles))
 }).pipe(Effect.provide(BunContext.layer), Effect.catchAll(() => Effect.succeed(unavailableApplicationUpdate("Application update setup could not be read."))))
 
+/**
+ * A container's updates: the same checks as any installation, which also report an upgrade to the
+ * image that is starting now, but a newer release is only announced, once per version, with `notice`.
+ */
+export const initializeContainerUpdates = (runtime: Extract<ApplicationRuntime, { _tag: "Installed" }>, profile: ApplicationProfile, addon: string, owner: UpdateOwner,
+  notice: (version: string) => Effect.Effect<void>) => Effect.gen(function* () {
+  const prepared = yield* preparation(runtime, profile, addon, owner)
+  yield* recordContainerUpgrade(profile.dataDirectory, CLI_VERSION).pipe(Effect.provideService(PreparedUpdateStore, prepared.store),
+    Effect.catchAll(error => Effect.logWarning(error.message)))
+  const updates = yield* makeContainerApplicationUpdate.pipe(Effect.provideService(ApplicationUpdateSource, yield* prepared.makeSource))
+  yield* containerImageVersions(updates.changes).pipe(Stream.runForEach(notice), Effect.forkScoped)
+  return updates
+}).pipe(Effect.provide(unixPrivateFilePermissions.pipe(Layer.provideMerge(BunContext.layer))),
+  Effect.catchAll(() => Effect.succeed(unavailableApplicationUpdate("Application update setup could not be read."))))
+
 /** Startup only completes an interrupted macOS transaction; downloaded updates install at an idle point. */
 export const prepareServeStartup = (runtime: ApplicationRuntime, profile: ApplicationProfile, stateDirectory: string) => Effect.gen(function* () {
   if (runtime._tag !== "Installed" || process.platform !== "darwin") return
@@ -59,12 +75,19 @@ export const prepareServeStartup = (runtime: ApplicationRuntime, profile: Applic
 const isIdle = (endpoint: string) => withLocalService(endpoint, client => client.application.getServiceActivity({})).pipe(
   Effect.map(activity => activity.inferenceRequests === 0), Effect.orElseSucceed(() => false))
 
-/** The one line a server that cannot install by itself prints for each downloaded version. */
-export const makeDownloadedNotice = (notify: (line: string) => Effect.Effect<void>) => Effect.gen(function* () {
+/** Prints `line(version)` the first time it is given each version. */
+const makeVersionNotice = (notify: (line: string) => Effect.Effect<void>, line: (version: string) => string) => Effect.gen(function* () {
   const noticed = yield* Ref.make(new Set<string>())
   return (version: string) => Ref.modify(noticed, seen => [!seen.has(version), new Set([...seen, version])] as const).pipe(
-    Effect.flatMap(first => first ? notify(`Magnitude ${version} is downloaded. Install it with \`magnitude update install\`.`) : Effect.void))
+    Effect.flatMap(first => first ? notify(line(version)) : Effect.void))
 })
+
+/** The one line a server that cannot install by itself prints for each downloaded version. */
+export const makeDownloadedNotice = (notify: (line: string) => Effect.Effect<void>) =>
+  makeVersionNotice(notify, version => `Magnitude ${version} is downloaded. Install it with \`magnitude update install\`.`)
+
+/** The one line a container prints for each newer release, which a newer image provides. */
+export const makeImageNotice = (notify: (line: string) => Effect.Effect<void>) => makeVersionNotice(notify, containerUpdateNotice)
 
 /** The machine an idle installation acts on; replaced by fakes to exercise the decisions. */
 export interface IdleInstallationSystem {

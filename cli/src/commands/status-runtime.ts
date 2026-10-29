@@ -1,4 +1,5 @@
-import { applicationDataDirectory, desktopApplication, desktopIsolatedProfile, desktopServiceOrigin, readDesktopLoginStartup } from "../server/application"
+import { applicationDataDirectory, desktopApplication, desktopIsolatedProfile, desktopServiceOrigin, readDesktopLoginStartup, updateDesktopApplication } from "../server/application"
+import { containerUpdateNotice } from "@magnitudedev/daemon-management/application-update"
 import { isServerSetUp } from "../server/serve-owner"
 import { serverLogs, serverNotRunning, serviceFailureLine } from "../server/server-setup"
 import { readServerReach, renderServerReach, type ServerReach } from "../server/server-reach"
@@ -32,6 +33,7 @@ interface ServiceStatusPresentation {
   readonly loaded: Option.Option<boolean>
   readonly elsewhere: Option.Option<Elsewhere>
   readonly retrying: Option.Option<StartupRetry>
+  readonly imageAvailable: Option.Option<string>
 }
 
 /** A startup step that failed and runs again on its own, as the service reported it when status was read. */
@@ -154,11 +156,15 @@ const ownStatus = desktopApplication.observe.pipe(
       : Effect.succeed(Option.none<ServerReach>())
     const failing = (server: boolean) => server && process.platform === "linux" && state?._tag !== "Ready" ? readServerFailing : Effect.succeed(Option.none<ServerFailing>())
     const loaded = (server: boolean) => server && process.platform === "darwin" && Option.isNone(snapshot) ? readMacServerLoaded : Effect.succeed(Option.none<boolean>())
-    return Effect.all({ model: activeModel, reach, now: Clock.currentTimeMillis, server: isServerSetUp.pipe(Effect.flatMap(server => Effect.all({ server: Effect.succeed(server), failing: failing(server), loaded: loaded(server) }))), login: Option.isSome(snapshot) && snapshot.value.owner._tag === "Desktop" ? readDesktopLoginStartup.pipe(Effect.map(state => state._tag === "Enabled" ? Option.some(true) : state._tag === "Disabled" ? Option.some(false) : Option.none<boolean>()), Effect.orElseSucceed(() => Option.none<boolean>())) : Effect.succeed(Option.none<boolean>()) }, { concurrency: "unbounded" }).pipe(Effect.map(({ model, login, reach, now, server: { server, failing, loaded } }): ServiceStatusPresentation => ({
+    // A container announces a newer image instead of installing it; nothing else reports it.
+    const imageAvailable = Option.isSome(snapshot) ? updateDesktopApplication("status").pipe(
+      Effect.map(state => state.transfer._tag === "ImageAvailable" ? Option.some(state.transfer.version) : Option.none<string>()),
+      Effect.timeout("2 seconds"), Effect.orElseSucceed(() => Option.none<string>())) : Effect.succeed(Option.none<string>())
+    return Effect.all({ model: activeModel, reach, imageAvailable, now: Clock.currentTimeMillis, server: isServerSetUp.pipe(Effect.flatMap(server => Effect.all({ server: Effect.succeed(server), failing: failing(server), loaded: loaded(server) }))), login: Option.isSome(snapshot) && snapshot.value.owner._tag === "Desktop" ? readDesktopLoginStartup.pipe(Effect.map(state => state._tag === "Enabled" ? Option.some(true) : state._tag === "Disabled" ? Option.some(false) : Option.none<boolean>()), Effect.orElseSucceed(() => Option.none<boolean>())) : Effect.succeed(Option.none<boolean>()) }, { concurrency: "unbounded" }).pipe(Effect.map(({ model, login, reach, imageAvailable, now, server: { server, failing, loaded } }): ServiceStatusPresentation => ({
       status: state?._tag ?? "Stopped", address: serviceAddress,
       version: state?._tag === "Ready" ? Option.some(String(state.health.version)) : Option.none(),
       startsAutomaticallyOnLogin: login, activeModel: model,
-      owner: Option.map(snapshot, value => value.owner), reach, server, failing, loaded, elsewhere: Option.none(),
+      owner: Option.map(snapshot, value => value.owner), reach, server, failing, loaded, elsewhere: Option.none(), imageAvailable,
       retrying: state?._tag === "Starting" ? Option.flatMap(state.health, health => startupRetry(health, now)) : Option.none(),
     })))
   }),
@@ -208,6 +214,7 @@ export const renderStatus =(status: ServiceStatusPresentation, platform: NodeJS.
       : `${model.displayName} - ${model.status}`,
   })}`] : []),
   ...Option.match(status.reach, { onNone: () => [], onSome: reach => ["", ...renderServerReach(reach).map(line => `  ${line}`)] }),
+  ...Option.match(status.imageAvailable, { onNone: () => [], onSome: version => ["", containerUpdateNotice(version)] }),
   ...Option.match(status.elsewhere, { onNone: () => [], onSome: other => other._tag === "OtherAccount" ? ["",
     `Magnitude is running on this computer for another account (${other.account}). This account can't see or control it;`,
     status.server ? "that account can stop it, or remove the server with `magnitude server remove`." : "that account can quit it."]

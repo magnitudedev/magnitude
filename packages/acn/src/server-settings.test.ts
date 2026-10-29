@@ -7,14 +7,15 @@ import { describe, expect, it } from "vitest"
 import { LOOPBACK_ONLY, resolveNetworkAccess } from "@magnitudedev/storage"
 import { AcnChanges, AcnChangesLive } from "./changes"
 import { AcnHost, ServerSettings, ServerSettingsLive } from "./server-settings"
+import type { ContainerInstallation } from "./container"
 
-const layerFor = (dataDir: string, activeNetwork = LOOPBACK_ONLY) => ServerSettingsLive.pipe(
+const layerFor = (dataDir: string, activeNetwork = LOOPBACK_ONLY, container: Option.Option<ContainerInstallation> = Option.none()) => ServerSettingsLive.pipe(
   Layer.provideMerge(AcnChangesLive),
-  Layer.provide(Layer.succeed(AcnHost, { dataDir, port: 10100, activeNetwork })),
+  Layer.provide(Layer.succeed(AcnHost, { dataDir, port: 10100, activeNetwork, container })),
   Layer.provide(BunContext.layer),
 )
-const run = <A, E>(dataDir: string, effect: Effect.Effect<A, E, ServerSettings | AcnChanges>, activeNetwork = LOOPBACK_ONLY) =>
-  Effect.runPromise(Effect.scoped(effect.pipe(Effect.provide(layerFor(dataDir, activeNetwork)))))
+const run = <A, E>(dataDir: string, effect: Effect.Effect<A, E, ServerSettings | AcnChanges>, activeNetwork = LOOPBACK_ONLY, container: Option.Option<ContainerInstallation> = Option.none()) =>
+  Effect.runPromise(Effect.scoped(effect.pipe(Effect.provide(layerFor(dataDir, activeNetwork, container)))))
 const fresh = () => mkdtempSync(join(tmpdir(), "magnitude-server-settings-"))
 
 describe("model storage", () => {
@@ -97,6 +98,19 @@ describe("network access", () => {
       enabled: Option.some(true), bind: Option.some({ _tag: "Address", address: "laptop.local" }), requireApiKey: Option.none(),
     })).pipe(Effect.either))
     expect(result._tag).toBe("Left")
+  })
+
+  it("reports a container's network access as the container sets it, and refuses changes from Settings", async () => {
+    const container = Option.some({ networkKey: Option.some("a-key-from-the-environment") })
+    const active = resolveNetworkAccess(Option.some({ enabled: true, apiKey: "a-key-from-the-environment", requireApiKey: true, allowedHosts: [] }))
+    const [settings, change, regenerate] = await run(fresh(), Effect.gen(function* () {
+      const service = yield* ServerSettings
+      return [yield* service.networkAccess,
+        yield* service.setNetworkAccess({ enabled: Option.some(false), bind: Option.none(), requireApiKey: Option.none() }).pipe(Effect.either),
+        yield* service.regenerateNetworkApiKey.pipe(Effect.either)] as const
+    }), active, container)
+    expect(settings).toMatchObject({ enabled: true, requireApiKey: true, apiKey: Option.some("a-key-from-the-environment"), pending: false, container: true })
+    expect([change._tag, regenerate._tag]).toEqual(["Left", "Left"])
   })
 
   it("replaces the key when regenerated", async () => {

@@ -278,6 +278,18 @@ describe("ACN network access", () => {
       expect((yield* get({ host: "localhost:1" })).status).toBe(503)
     })).pipe(Effect.provide(Layer.merge(FetchHttpClient.layer, BunContext.layer))))
   })
+  it.each([true, false])("admits any Host that sends the key only in a container (container=%s)", container => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const http = yield* HttpClient.HttpClient
+    const lifecycle = yield* makeAcnServiceLifecycle()
+    const publicRouter = yield* HttpLayerRouter.make
+    yield* installAcnHealthRoutes(publicRouter, lifecycle, yield* makeRemoteAccess(network), container)
+    const origin = loopbackOrigin(yield* listen(publicRouter, 0))
+    const get = (headers: Record<string, string>) => http.execute(HttpClientRequest.get(`${origin}/health`, { headers }))
+    expect((yield* get({ host: "magnitude:10100", authorization: "Bearer mag-test-key" })).status).toBe(container ? 503 : 421)
+    expect((yield* get({ host: "magnitude:10100", "x-api-key": "mag-test-key" })).status).toBe(container ? 503 : 421)
+    expect((yield* get({ host: "magnitude:10100", authorization: "Bearer mag-wrong" })).status).toBe(421)
+    expect((yield* get({ host: "magnitude:10100" })).status).toBe(421)
+  })).pipe(Effect.provide(Layer.merge(FetchHttpClient.layer, BunContext.layer)))))
 })
 
 describe("network access read at startup", () => {
@@ -303,6 +315,30 @@ describe("network access read at startup", () => {
       expect(config.network.enabled).toBe(true)
       expect(config.unknownSetting).toBe(1)
       expect((await read(dataDir)).apiKey).toEqual(network.apiKey)
+    }))
+  const container = (key?: string) => Option.some({ networkKey: Option.fromNullable(key) })
+  const readIn = (dataDir: string, key?: string) => Effect.runPromise(readNetworkAccess(dataDir, container(key)).pipe(Effect.provide(BunContext.layer)))
+  it("turns network access on in a container without a network block, and saves the key it makes", () =>
+    withDataDir({ unknownSetting: 1 }, async dataDir => {
+      const network = await readIn(dataDir)
+      expect([network.enabled, network.bind, network.requireApiKey]).toEqual([true, "0.0.0.0", true])
+      const config = await saved(dataDir)
+      expect(config.network).toEqual({ enabled: true, requireApiKey: true, allowedHosts: [], apiKey: Option.getOrThrow(network.apiKey) })
+      expect(config.unknownSetting).toBe(1)
+      expect((await readIn(dataDir)).apiKey).toEqual(network.apiKey)
+    }))
+  it("uses MAGNITUDE_NETWORK_KEY in a container without saving it, over a saved key", () =>
+    withDataDir({ network: { enabled: true, apiKey: "mag-saved" } }, async dataDir => {
+      expect((await readIn(dataDir, "a-key-from-the-environment")).apiKey).toEqual(Option.some("a-key-from-the-environment"))
+      expect((await saved(dataDir)).network.apiKey).toBe("mag-saved")
+    }))
+  it("keeps a container's saved network block, which may turn network access off", () =>
+    withDataDir({ network: { enabled: false } }, async dataDir => {
+      expect(await readIn(dataDir, "a-key-from-the-environment")).toEqual(LOOPBACK_ONLY)
+    }))
+  it("stays on loopback when config.json is invalid, in a container too", () =>
+    withDataDir("not an object", async dataDir => {
+      expect(await readIn(dataDir)).toEqual(LOOPBACK_ONLY)
     }))
   it("leaves loopback-only access without a key", () =>
     withDataDir({ network: { enabled: false } }, async dataDir => {

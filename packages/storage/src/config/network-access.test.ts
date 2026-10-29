@@ -1,6 +1,6 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
-import { authorizesRemoteInference, generateApiKey, isAllowedHostHeader, isLoopbackAddress, LOOPBACK_ONLY, resolveNetworkAccess, type NetworkAccess } from "./network-access"
+import { admitsRequestHost, authorizesRemoteInference, generateApiKey, isAllowedHostHeader, isLoopbackAddress, LOOPBACK_ONLY, resolveNetworkAccess, type NetworkAccess } from "./network-access"
 
 const enabled = (overrides: Partial<NetworkAccess> = {}): NetworkAccess => ({
   enabled: true, bind: "0.0.0.0", apiKey: Option.some("mag-secret"), requireApiKey: true, allowedHosts: [], warning: Option.none(), ...overrides,
@@ -44,6 +44,22 @@ describe("Host header allowlist", () => {
       expect(isAllowedHostHeader(host, network)).toBe(true)
     }
     for (const host of ["evil.com", "evil.com:10100", "ts.net", "attacker.ts.net.evil.com", "*"]) expect(isAllowedHostHeader(host, network)).toBe(false)
+  })
+})
+
+describe("container Host rule", () => {
+  it("admits any Host that presents the key in a container, and keeps the allowlist everywhere else", () => {
+    const network = enabled()
+    for (const headers of [{ host: "magnitude:10100", authorization: "Bearer mag-secret" }, { host: "inference.internal", "x-api-key": "mag-secret" }]) {
+      expect(admitsRequestHost(headers, network, true)).toBe(true)
+      expect(admitsRequestHost(headers, network, false)).toBe(false)
+    }
+    for (const headers of [{ host: "magnitude:10100" }, { host: "magnitude:10100", authorization: "Bearer wrong" }]) {
+      expect(admitsRequestHost(headers, network, true)).toBe(false)
+    }
+    expect(admitsRequestHost({ host: "magnitude", authorization: "Bearer mag-secret" }, enabled({ requireApiKey: false, apiKey: Option.none() }), true)).toBe(false)
+    expect(admitsRequestHost({ host: "magnitude", authorization: "Bearer mag-secret" }, { ...LOOPBACK_ONLY, apiKey: Option.some("mag-secret") }, true)).toBe(false)
+    expect(admitsRequestHost({ host: "localhost:10100" }, LOOPBACK_ONLY, true)).toBe(true)
   })
 })
 

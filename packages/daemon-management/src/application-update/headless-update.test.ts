@@ -33,6 +33,14 @@ describe("running headless update control", () => {
       expect(calls).toEqual(["check", "download", "discard"])
     })).pipe(Effect.provide(TestContext.TestContext)))
   })
+  it("explains how an installation that never installs in place is updated instead", async () => {
+    const { calls, updates } = fixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const control = yield* makeHeadlessUpdateControl(updates, Effect.void, "Pull the new image.")
+      expect((yield* control("install").pipe(Effect.flip)).message).toBe("Pull the new image.")
+      expect(calls).toEqual([])
+    })).pipe(Effect.provide(TestContext.TestContext)))
+  })
   it("runs no manual check before the service is first ready, so no outcome is reported early", async () => {
     const { calls, updates, state } = fixture()
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {

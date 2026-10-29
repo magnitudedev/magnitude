@@ -3,6 +3,6 @@ export { checkHostedUpdate, resolveHostedDownload, HostedUpdateCheckFailed, Upda
 export { signUpdateRequest, UpdateSigningFailed } from "./request-auth"
 export { downloadUpdateArtifact } from "./installer-download"
 export { UpdateManifest, PublishedUpdate, acceptsUpdateManifest, verifyUpdateManifest, decodePublisherPublicKey } from "./manifest"
-export { UpdateRelease, ReleaseTarget, acceptsUpdateRelease, verifyUpdateRelease, updateInstallerFilename } from "./release"
+export { UpdateRelease, ReleaseTarget, releaseTargetOf, acceptsUpdateRelease, verifyUpdateRelease, updateInstallerFilename } from "./release"
 export { InstallationOffer, InstallationChannel, InvalidInstallationOffer, verifyInstallationOffer, installationOfferFromPublication } from "./installation-offer"
 export { UpdateCheckReason, UpdateHardware, UpdateOutcome, UpdateOutcomeReason, UpdateFailureReason, UpdateOwner, Version } from "./request"

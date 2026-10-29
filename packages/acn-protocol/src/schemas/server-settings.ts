@@ -30,6 +30,7 @@ export const NetworkInterfaceAddress = Schema.Struct({
 })
 export type NetworkInterfaceAddress = typeof NetworkInterfaceAddress.Type
 
+/** `container`: a container runs the service, and its environment and config.json set network access, not Settings. */
 export const NetworkAccessSettings = Schema.Struct({
   enabled: Schema.Boolean,
   bind: optional(Schema.String),
@@ -39,6 +40,7 @@ export const NetworkAccessSettings = Schema.Struct({
   port: Schema.Int,
   pending: Schema.Boolean,
   warning: optional(Schema.String),
+  container: Schema.Boolean,
 })
 export type NetworkAccessSettings = typeof NetworkAccessSettings.Type
 

@@ -20,6 +20,11 @@ describe("headless application update output", () => {
     expect(renderApplicationUpdate(state({ _tag: "Downloading", version: "2.0.0", completed: 10, total: 100 }))).toContain("magnitude update status")
     expect(renderApplicationUpdate(state({ _tag: "Ready", version: "2.0.0" }))).toContain("magnitude update install")
   })
+  it("tells a container to pull the newer image instead of downloading", () => {
+    expect(renderApplicationUpdate(state({ _tag: "ImageAvailable", version: "2.0.0" }), "Headless"))
+      .toBe("Magnitude 2.0.0 is available. Pull the new image (docker pull magnitudedev/magnitude) and recreate the container.\n")
+    expect(renderApplicationUpdate(state({ _tag: "ImageAvailable", version: "2.0.0" }, { _tag: "Checking" }))).toBe("Checking for application updates.\n")
+  })
   it("never calls an unchecked or failed observation up to date", () => {
     expect(renderApplicationUpdate(state({ _tag: "Idle" }))).toBe("Magnitude is up to date.\n")
     expect(renderApplicationUpdate(state({ _tag: "Idle" }, { _tag: "Idle" }))).toContain("No update check has completed")

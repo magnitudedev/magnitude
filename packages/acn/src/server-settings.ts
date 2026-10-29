@@ -31,12 +31,14 @@ import {
 } from "@magnitudedev/storage"
 import { AcnChanges } from "./changes"
 import { readMachineIdentity } from "./machine-identity"
+import { containerNetworkConfig, type ContainerInstallation } from "./container"
 
-/** Facts about this ACN process fixed at startup: where it keeps data and what it serves. */
+/** Facts about this ACN process fixed at startup: where it keeps data, what it serves, and whether a container runs it. */
 export interface AcnHostApi {
   readonly dataDir: string
   readonly port: number
   readonly activeNetwork: NetworkAccess
+  readonly container: Option.Option<ContainerInstallation>
 }
 export class AcnHost extends Context.Tag("AcnHost")<AcnHost, AcnHostApi>() {}
 
@@ -103,6 +105,9 @@ export const ServerSettingsLive = Layer.effect(ServerSettings, Effect.gen(functi
     )
   const networkBase = (current: Option.Option<NetworkAccessConfig>): NetworkAccessConfig => Option.getOrElse(current, () => ({ enabled: false, requireApiKey: true, allowedHosts: [] }))
   const poke = (operation: string) => changes.publish({ operation })
+  const containerManaged = Option.isSome(host.container)
+    ? Effect.fail(new ServerSettingsFailed({ message: "The container sets network access. Set the key with MAGNITUDE_NETWORK_KEY, or other settings under network in config.json, then restart the container." }))
+    : Effect.void
 
   const machine = yield* Effect.cached(readMachineIdentity(() => createRequire(import.meta.url)(nativeHostPath())).pipe(
     Effect.map((identity): ServerMachine => ({ platform: process.platform, identity })),
@@ -150,8 +155,9 @@ export const ServerSettingsLive = Layer.effect(ServerSettings, Effect.gen(functi
     }),
     networkAccess: readNetwork.pipe(
       Effect.map((saved): NetworkAccessSettings => {
-        const resolved = Option.isNone(saved) ? LOOPBACK_ONLY : resolveNetworkAccess(saved)
-        const current = networkBase(saved)
+        const effective = containerNetworkConfig(host.container, saved)
+        const resolved = Option.isNone(effective) ? LOOPBACK_ONLY : resolveNetworkAccess(effective)
+        const current = networkBase(effective)
         return {
           enabled: current.enabled,
           bind: Option.fromNullable(current.bind),
@@ -161,11 +167,13 @@ export const ServerSettingsLive = Layer.effect(ServerSettings, Effect.gen(functi
           port: host.port,
           pending: !networkAccessEquals(resolved, host.activeNetwork),
           warning: resolved.warning,
+          container: Option.isSome(host.container),
         }
       }),
       Effect.mapError(() => new ServerSettingsFailed({ message: "The saved network access settings could not be read. Network access is off." })),
     ),
     setNetworkAccess: change => Effect.gen(function* () {
+      yield* containerManaged
       if (Option.isSome(change.bind) && change.bind.value._tag === "Address" && isIP(change.bind.value.address) === 0) {
         return yield* new ServerSettingsFailed({ message: "Choose an address from the list, or all interfaces." })
       }
@@ -186,9 +194,9 @@ export const ServerSettingsLive = Layer.effect(ServerSettings, Effect.gen(functi
       }))
       yield* poke(Configuration.getNetworkAccess._tag)
     }),
-    regenerateNetworkApiKey: writes.withPermits(1)(writeNetwork(current => ({ ...networkBase(current), apiKey: generateApiKey() }))).pipe(
+    regenerateNetworkApiKey: containerManaged.pipe(Effect.zipRight(writes.withPermits(1)(writeNetwork(current => ({ ...networkBase(current), apiKey: generateApiKey() }))).pipe(
       Effect.zipRight(poke(Configuration.getNetworkAccess._tag)),
-    ),
+    ))),
     machine,
   })
 }))

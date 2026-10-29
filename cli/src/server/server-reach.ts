@@ -15,7 +15,7 @@ export const withLocalService = <A, E>(origin: string, use: (client: MagnitudeCl
 
 export interface ServerReach {
   readonly endpoint: string
-  readonly network: Option.Option<Pick<NetworkAccessSettings, "enabled" | "bind" | "interfaces" | "port" | "pending">>
+  readonly network: Option.Option<Pick<NetworkAccessSettings, "enabled" | "bind" | "interfaces" | "port" | "pending" | "container">>
   readonly configPath: string
   /** Running as the system service: stopping it means removing the server, not Ctrl+C. */
   readonly service: boolean
@@ -35,8 +35,9 @@ const sshTunnel = (endpoint: string) => {
  * access key: service output goes to logs other accounts can read.
  */
 export const renderServerReach = (reach: ServerReach): readonly string[] => {
-  const lines = [`On this computer:   ${reach.endpoint}`]
   const network = Option.getOrUndefined(reach.network)
+  if (network?.container) return renderContainerReach(reach, network)
+  const lines = [`On this computer:   ${reach.endpoint}`]
   const addresses = network?.enabled ? network.interfaces.filter(entry => entry.kind !== "virtual") : []
   if (network?.enabled && addresses.length > 0) {
     lines.push("From other devices: open one of these in a browser; it asks for the network access key.")
@@ -55,6 +56,24 @@ export const renderServerReach = (reach: ServerReach): readonly string[] => {
   return lines
 }
 
+/**
+ * A container's own addresses (172.17.0.x) are reachable only from its Docker network, so reach is
+ * described from the host and the other containers, through the port each of them publishes or uses.
+ */
+const renderContainerReach = (reach: ServerReach, network: NonNullable<Option.Option.Value<ServerReach["network"]>>): readonly string[] => {
+  if (!network.enabled) return [
+    `Only this container can reach it: network access is off in ${reach.configPath}. Remove that setting or turn it on, and restart the container.`,
+    ...(network.pending ? ["A network access change applies when Magnitude restarts."] : []),
+  ]
+  return [
+    `On the host:        http://localhost:${network.port}, or the host port you published for the container's port ${network.port}`,
+    `Other containers:   http://<this container's name>:${network.port} on a shared Docker network`,
+    `Apps and agents:    the address above with /inference/v1, sending the network access key as a Bearer token`,
+    `The key is network.apiKey in ${reach.configPath}: docker exec <container> cat ${reach.configPath}`,
+    ...(network.pending ? ["A network access change applies when Magnitude restarts."] : []),
+  ]
+}
+
 /** Reads network access from the service itself; reach falls back to this computer only if it can't. */
 export const readServerReach = (options: { readonly endpoint: string; readonly dataDirectory: string; readonly service: boolean }) =>
   withLocalService(options.endpoint, client => client.configuration.getNetworkAccess({})).pipe(
@@ -69,6 +88,7 @@ const stopService = (platform: NodeJS.Platform) => platform === "linux"
 export const renderServeReady = (reach: ServerReach, platform: NodeJS.Platform = process.platform) => [
   "Magnitude is ready.",
   ...renderServerReach(reach),
-  reach.service ? stopService(platform) : "Press Ctrl+C to stop.",
+  Option.exists(reach.network, network => network.container) ? "Stop it with `docker stop <container>`."
+    : reach.service ? stopService(platform) : "Press Ctrl+C to stop.",
   "",
 ].join("\n")
