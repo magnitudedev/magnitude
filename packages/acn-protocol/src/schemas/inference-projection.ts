@@ -69,6 +69,7 @@ export const projectInferenceHardware = (
   hardware: InferenceSchema.HardwareSnapshot,
   instances: InferenceSchema.ModelInstancesSnapshot,
 ): Effect.Effect<LocalInferenceHardware, InferenceHardwareProjectionError> => Effect.gen(function* () {
+  // Host RAM counts only what this process may use: a container's memory limit, not the whole host's RAM.
   const host = hardware.host_ram
   const placements = yield* resolvePlacements(hardware)
   const active = yield* resolveActive(hardware, instances)
@@ -92,7 +93,7 @@ export const projectInferenceHardware = (
       // Host RAM is unified only when it is the active device's own memory: a GPU is integrated
       // exactly when its memory is the host's.
       kind: active.physical.kind === "integrated_gpu" ? "UnifiedMemory" as const : "System" as const,
-      totalBytes: host.store.total_capacity_bytes,
+      totalBytes: host.store.allocation_capacity_bytes,
       availableBytes: Option.some(host.current_free_bytes),
     },
     ...hardware.device_memory.map(memory => ({
@@ -121,7 +122,7 @@ export const projectInferenceHardware = (
     processor: Option.flatMap(hardware.cpu_model, Option.fromNullable),
     physicalCores: Option.filter(Option.flatMap(hardware.physical_cores, Option.fromNullable), count => count > 0),
     logicalCores: Math.max(1, hardware.logical_cores),
-    totalSystemMemoryBytes: host.store.total_capacity_bytes,
+    totalSystemMemoryBytes: host.store.allocation_capacity_bytes,
     accelerators,
     activeDeviceId: LocalInferenceDeviceIdSchema.make(active.executor.id),
     memoryDomains,

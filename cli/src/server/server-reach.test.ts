@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest"
 import { renderServeReady, type ServerReach } from "./server-reach"
 
 const reach = (overrides: Partial<ServerReach> = {}): ServerReach => ({
-  endpoint: "http://127.0.0.1:10100", configPath: "/home/ada/.magnitude/config.json", service: false,
+  endpoint: "http://127.0.0.1:10100", configPath: "/home/ada/.magnitude/config.json", service: false, kubernetes: false,
   network: Option.some({ enabled: true, bind: Option.none(), port: 10100, pending: false, container: false, interfaces: [
     { name: "eth0", address: "192.168.1.5", kind: "lan" },
     { name: "tailscale0", address: "100.64.0.3", kind: "tailscale" },
@@ -59,6 +59,16 @@ describe("serve ready output", () => {
     const off = renderServeReady(reach({ network: Option.some({ ...settings, enabled: false }), configPath: "/data/.magnitude/config.json" }))
     expect(off).toContain("Only this container can reach it")
     expect(off).not.toContain("ssh -N")
+  })
+  it("tells a Kubernetes pod how to reach, read and stop it with kubectl, never Docker", () => {
+    const settings = { enabled: true, bind: Option.none(), port: 10100, pending: false, container: true, interfaces: [] }
+    const output = renderServeReady(reach({ network: Option.some(settings), configPath: "/data/.magnitude/config.json", kubernetes: true }))
+    expect(output).toContain("http://<the Service's name>:10100")
+    expect(output).toContain("kubectl port-forward <pod> 10100")
+    expect(output).toContain("kubectl exec <pod> -- cat /data/.magnitude/config.json")
+    expect(output).toContain("kubectl scale deployment <name> --replicas=0")
+    expect(output).not.toContain("docker")
+    expect(output).not.toContain("Docker")
   })
   it("notes a network access change that waits for a restart", () => {
     expect(renderServeReady(reach({ network: Option.some({ enabled: false, bind: Option.none(), port: 10100, pending: true, container: false, interfaces: [] }) })))

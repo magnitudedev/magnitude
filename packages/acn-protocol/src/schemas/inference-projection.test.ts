@@ -45,6 +45,12 @@ it("preserves machine-wide physical core counts independently of process paralle
 it.each([undefined, null, 0])("keeps an unavailable physical core observation absent: %s", count => {
   expect(Effect.runSync(projectInferenceHardware(snapshot(count === undefined ? {} : { physical_cores: count }), none)).physicalCores).toEqual(Option.none())
 })
+it("counts host RAM within the process's memory limits, as a container's limit sets them", () => {
+  const limited = { ...host, store: { ...store("system"), allocation_capacity_bytes: 6 }, current_free_bytes: 5 }
+  const value = Effect.runSync(projectInferenceHardware(snapshot({ host_ram: limited }), none))
+  expect(value.totalSystemMemoryBytes).toBe(6)
+  expect(value.memoryDomains[0]?.totalBytes).toBe(6)
+})
 it("groups backend executors by reported physical identity", () => {
   const value = Effect.runSync(projectInferenceHardware(snapshot({ physical_devices: [cpu, gpu], access_paths: paths }), none))
   expect(value.accelerators).toHaveLength(1)

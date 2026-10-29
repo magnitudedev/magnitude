@@ -137,7 +137,7 @@ describe("Magnitude service definitions", () => {
       status: "Ready", address: "127.0.0.1:10100", version: Option.some("1.0.0"),
       startsAutomaticallyOnLogin: Option.none(), activeModel: { _tag: "Observed", model: Option.none() },
       owner: Option.some({ _tag: "Headless", service: false }),
-      reach: Option.some({ endpoint: "http://127.0.0.1:10100", configPath: "/var/lib/magnitude/config.json", service: true,
+      reach: Option.some({ endpoint: "http://127.0.0.1:10100", configPath: "/var/lib/magnitude/config.json", service: true, kubernetes: false,
         network: Option.some({ enabled: true, bind: Option.none(), port: 10100, pending: false, container: false, interfaces: [{ name: "eth0", address: "10.0.0.4", kind: "lan" }] }) }),
       server: true, failing: Option.none(), retrying: Option.none(), loaded: Option.none(), imageNotice: Option.none(), elsewhere: Option.none(),
     })
