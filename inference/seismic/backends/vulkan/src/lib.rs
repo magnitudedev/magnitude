@@ -41,8 +41,24 @@ pub fn discover() -> Result<Vec<Description>, LoaderError> {
 /// `uuid`, in heap order, read from the physical device without a logical
 /// one; `None` when no device has that UUID. The extension is in the floor,
 /// so every device meeting it reports budgets.
+///
+/// The instance lives for the whole process, so a physical device's handle
+/// does too: each UUID is enumerated once and its handle kept, because the
+/// enumeration costs milliseconds on some drivers and budgets are read on
+/// every step.
 pub fn heap_budgets(uuid: [u8; 16]) -> Result<Option<Vec<HeapBudget>>, LoaderError> {
+    static FOUND: std::sync::Mutex<Vec<([u8; 16], ash::vk::PhysicalDevice)>> =
+        std::sync::Mutex::new(Vec::new());
     let instance = instance::instance()?;
+    let known = FOUND
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .find(|(id, _)| *id == uuid)
+        .map(|&(_, physical)| physical);
+    if let Some(physical) = known {
+        return Ok(Some(device::heap_budgets(instance, physical)));
+    }
     for physical in instance.physical_devices()? {
         let mut id = ash::vk::PhysicalDeviceIDProperties::default();
         let mut properties = ash::vk::PhysicalDeviceProperties2::default().push_next(&mut id);
@@ -52,6 +68,10 @@ pub fn heap_budgets(uuid: [u8; 16]) -> Result<Option<Vec<HeapBudget>>, LoaderErr
                 .get_physical_device_properties2(physical, &mut properties)
         };
         if id.device_uuid == uuid {
+            FOUND
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((uuid, physical));
             return Ok(Some(device::heap_budgets(instance, physical)));
         }
     }
