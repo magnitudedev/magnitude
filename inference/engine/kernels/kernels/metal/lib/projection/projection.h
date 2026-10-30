@@ -2833,20 +2833,18 @@ inline void gemv_batch_paired_runtime(thread const In &in, thread const Out &out
 // Weights with a matrix GEMV whose products fold a block's local scale codes
 // into the left operand: unsigned codes of a plane of low nibbles (and a
 // plane of high bits) under hierarchical coefficients with a minimum, an
-// unsigned local scale code per 32 columns and factors per 256, where a code
-// times a scale code stays below 2048 (an exact F16 integer of the
-// operand's 2^-24). `at` is a lane's place in its row's planes (32-bit
-// offsets from the tensor), `load` its words of block g, `pair` its two codes
-// of step s in the halves of one word.
+// unsigned local scale code per 32 columns and factors per 256, which the
+// runtime admits where a code times a scale code stays below 2048 (an exact
+// F16 integer of the operand's 2^-24). `at` is a lane's place in its row's
+// planes (32-bit offsets from the tensor), `load` its words of block g,
+// `pair` its two codes of step s in the halves of one word.
 template <typename P>
 struct matrix_planes {
-    static constant constexpr bool available = false;
-    static constant constexpr uint largest = 0;
+    static constant constexpr bool implemented = false;
 };
 template <>
 struct matrix_planes<packets::Planes<4, 0>> {
-    static constant constexpr bool available = true;
-    static constant constexpr uint largest = packets::CodeRange<packets::Planes<4, 0>>::largest;
+    static constant constexpr bool implemented = true;
     typedef uint place;
     typedef uint words;
     template <typename W>
@@ -2865,8 +2863,7 @@ struct matrix_planes<packets::Planes<4, 0>> {
 // its word of nibbles, a nibble of the byte under each half of the word.
 template <>
 struct matrix_planes<packets::Planes<4, 1>> {
-    static constant constexpr bool available = true;
-    static constant constexpr uint largest = packets::CodeRange<packets::Planes<4, 1>>::largest;
+    static constant constexpr bool implemented = true;
     typedef uint2 place;
     typedef uint2 words;
     template <typename W>
@@ -2887,15 +2884,14 @@ struct matrix_planes<packets::Planes<4, 1>> {
 
 template <typename W>
 struct matrix_codes {
-    static constant constexpr bool available = false;
+    static constant constexpr bool implemented = false;
 };
-template <typename P, typename FS, int EXPONENT, uint LOCAL_BITS, int BIAS_SIGN>
+template <typename P, typename FS, int EXPONENT, uint LOCAL_BITS, int BIAS_SIGN, typename F>
 struct matrix_codes<packets::Packet<P, packets::Unsigned,
-    packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, packets::LocalUnsigned<LOCAL_BITS>, 32u, true, BIAS_SIGN, 0u>>> {
+    packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, packets::LocalUnsigned<LOCAL_BITS>, 32u, true, BIAS_SIGN, 0u>, F>> {
     typedef packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, packets::LocalUnsigned<LOCAL_BITS>, 32u, true, BIAS_SIGN, 0u> K;
     typedef matrix_planes<P> planes;
-    static constant constexpr bool available =
-        planes::available && planes::largest * packets::LocalUnsigned<LOCAL_BITS>::largest < 2048u;
+    static constant constexpr bool implemented = planes::implemented;
     typedef typename planes::place place;
     typedef typename planes::words words;
     template <typename W>
@@ -2913,14 +2909,14 @@ struct matrix_codes<packets::Packet<P, packets::Unsigned,
 // scale code per 16 columns and factors per 256 (`gemv_matrix_runs_body`).
 template <typename W>
 struct matrix_runs {
-    static constant constexpr bool available = false;
+    static constant constexpr bool implemented = false;
 };
-template <int ZERO_CODE, typename FS, int EXPONENT, uint LOCAL_BITS, typename L, int BIAS_SIGN>
+template <int ZERO_CODE, typename FS, int EXPONENT, uint LOCAL_BITS, typename L, int BIAS_SIGN, typename F>
 struct matrix_runs<packets::Packet<packets::Planes<4, 2>, packets::Offset<ZERO_CODE>,
-    packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, L, 16u, false, BIAS_SIGN, 0u>>> {
+    packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, L, 16u, false, BIAS_SIGN, 0u>, F>> {
     typedef packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, L, 16u, false, BIAS_SIGN, 0u> K;
     typedef L local;
-    static constant constexpr bool available = true;
+    static constant constexpr bool implemented = true;
     static constant constexpr int zero_code = ZERO_CODE;
 };
 
@@ -2929,13 +2925,13 @@ struct matrix_runs<packets::Packet<packets::Planes<4, 2>, packets::Offset<ZERO_C
 // (`gemv_matrix_symmetric_body`).
 template <typename W>
 struct matrix_symmetric {
-    static constant constexpr bool available = false;
+    static constant constexpr bool implemented = false;
 };
-template <int ZERO_CODE, typename S, uint STORAGE>
+template <int ZERO_CODE, typename S, uint STORAGE, typename F>
 struct matrix_symmetric<packets::Packet<packets::Planes<4, 0>, packets::Offset<ZERO_CODE>,
-    packets::Direct<S, 32u, false, STORAGE, 0>>> {
+    packets::Direct<S, 32u, false, STORAGE, 0>, F>> {
     typedef packets::Direct<S, 32u, false, STORAGE, 0> K;
-    static constant constexpr bool available = true;
+    static constant constexpr bool implemented = true;
     static constant constexpr int zero_code = ZERO_CODE;
 };
 
@@ -3447,22 +3443,35 @@ inline void gemv_matrix_body(thread const In &in, thread const Out &out, thread 
         m_rows, rows, k, group, shared, simdgroups, sg, lane);
 }
 
-// The matrix GEMV of weights W (`available`), chosen by its components: the
-// products folding a block's scale codes (`matrix_codes`), the runs of 16
-// columns (`matrix_runs`) or the symmetric 32 columns (`matrix_symmetric`).
-// `run` takes the body for the operand's strides and for whether the block
-// sums are staged, once per call. The forms' weights are disjoint: at most
-// one serves W.
-template <typename W, bool CODES = matrix_codes<W>::available, bool RUNS = matrix_runs<W>::available,
-    bool SYMMETRIC = matrix_symmetric<W>::available>
-struct matrix_form {
-    static_assert(!CODES && !RUNS && !SYMMETRIC, "at most one matrix GEMV form serves a weight");
+// The matrix GEMV products the runtime admits weights W to
+// (`packets::Forms`, `_FORM_MATRIX_*`, at most one): none by default.
+template <typename W>
+struct matrix_admitted {
+    static constant constexpr bool codes = false, runs = false, symmetric = false;
+};
+template <typename P, typename C, typename K, typename F>
+struct matrix_admitted<packets::Packet<P, C, K, F>> {
+    static constant constexpr bool codes = F::matrix_codes, runs = F::matrix_runs, symmetric = F::matrix_symmetric;
+};
+
+// The matrix GEMV of weights W (`available`), by the product the runtime
+// admits it to: the products folding a block's scale codes (`matrix_codes`),
+// the runs of 16 columns (`matrix_runs`) or the symmetric 32 columns
+// (`matrix_symmetric`), each asserted to serve W. `run` takes the body for
+// the operand's strides and for whether the block sums are staged, once per
+// call.
+template <typename W, bool CODES = matrix_admitted<W>::codes, bool RUNS = matrix_admitted<W>::runs,
+    bool SYMMETRIC = matrix_admitted<W>::symmetric>
+struct matrix_form;
+template <typename W>
+struct matrix_form<W, false, false, false> {
     static constant constexpr bool available = false;
     static constant constexpr bool symmetric32 = false;
     static constant constexpr bool stages_block_sums = false;
 };
 template <typename W>
 struct matrix_form<W, true, false, false> {
+    static_assert(matrix_codes<W>::implemented, "an admitted weight has the matrix GEMV folding its scale codes");
     static constant constexpr bool available = true;
     static constant constexpr bool symmetric32 = false;
     static constant constexpr bool stages_block_sums = true;
@@ -3488,6 +3497,7 @@ struct matrix_form<W, true, false, false> {
 };
 template <typename W>
 struct matrix_form<W, false, true, false> {
+    static_assert(matrix_runs<W>::implemented, "an admitted weight has the matrix GEMV over 16-column runs");
     static constant constexpr bool available = true;
     static constant constexpr bool symmetric32 = false;
     static constant constexpr bool stages_block_sums = false;
@@ -3503,6 +3513,7 @@ struct matrix_form<W, false, true, false> {
 };
 template <typename W>
 struct matrix_form<W, false, false, true> {
+    static_assert(matrix_symmetric<W>::implemented, "an admitted weight has the symmetric matrix GEMV");
     static constant constexpr bool available = true;
     static constant constexpr bool stages_block_sums = false;
     static constant constexpr bool symmetric32 = true;
@@ -3732,9 +3743,21 @@ struct int8_scratch {
 // product takes the stored codes themselves, so its codes are unsigned 4-bit
 // codes under hierarchical coefficients (the local codes integers under the
 // factor) or two's complement 8-bit codes under direct ones, a scale per
-// block; none otherwise.
+// block; none otherwise. The product is `available` for the weights the
+// runtime admits to it (`packets::Forms::int8`, `_FORM_INT8`) on a device
+// with tensor operations, where an admitted weight's codes have one.
+template <typename W>
+struct int8_admitted {
+    static constant constexpr bool value = false;
+};
+template <typename P, typename C, typename K, typename F>
+struct int8_admitted<packets::Packet<P, C, K, F>> {
+    static constant constexpr bool value = F::int8;
+};
 template <typename W>
 struct int8_codes {
+    static_assert(!SEISMIC_HAS_TENSOR_OPS || !int8_admitted<W>::value,
+        "an admitted weight's codes enter the int8 product");
     static constant constexpr bool available = false;
     static constant constexpr bool biased = false;
     static constant constexpr bool factored = false;
@@ -3745,12 +3768,13 @@ struct int8_codes {
 #if SEISMIC_HAS_TENSOR_OPS
 // Unsigned 4-bit codes: two bytes hold four codes, a nibble each; value =
 // factor * scale code * code + bias factor * minimum code.
-template <typename FS, int EXPONENT, uint LOCAL_BITS, bool MIN, int BIAS_SIGN>
+template <typename FS, int EXPONENT, uint LOCAL_BITS, bool MIN, int BIAS_SIGN, typename F>
 struct int8_codes<packets::Packet<packets::Planes<4, 0>, packets::Unsigned,
-    packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, packets::LocalUnsigned<LOCAL_BITS>, 32u, MIN, BIAS_SIGN, 0u>>> {
+    packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, packets::LocalUnsigned<LOCAL_BITS>, 32u, MIN, BIAS_SIGN, 0u>, F>> {
     typedef packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, packets::LocalUnsigned<LOCAL_BITS>, 32u, MIN, BIAS_SIGN, 0u> K;
-    // A factor of at most 16 bits times a byte code is exact in F32.
-    static constant constexpr bool available = LOCAL_BITS <= 8 && FS::bytes <= 2;
+    // Admitted where a factor of at most 16 bits times a byte code is exact
+    // in F32.
+    static constant constexpr bool available = F::int8;
     static constant constexpr bool biased = MIN;
     static constant constexpr uint block_bytes = 16;
     // A lane's eight codes of one row and block are one 4-byte word: byte x
@@ -3786,11 +3810,11 @@ struct int8_codes<packets::Packet<packets::Planes<4, 0>, packets::Unsigned,
     }
 };
 // Two's complement 8-bit codes, a scale per block.
-template <typename S, uint STORAGE>
+template <typename S, uint STORAGE, typename F>
 struct int8_codes<packets::Packet<packets::Planes<8, 0>, packets::Twos,
-    packets::Direct<S, 32u, false, STORAGE, 0>>> {
+    packets::Direct<S, 32u, false, STORAGE, 0>, F>> {
     typedef packets::Direct<S, 32u, false, STORAGE, 0> K;
-    static constant constexpr bool available = true;
+    static constant constexpr bool available = F::int8;
     static constant constexpr bool biased = false;
     static constant constexpr uint block_bytes = 32;
     // A lane's eight codes of one row and block are eight bytes, in column

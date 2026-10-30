@@ -231,11 +231,12 @@ impl Repr {
         self.element_in(resident_layout(device))
     }
     /// Whether this format's packed forms take two residue bits (codes of
-    /// 8-bit values, as the executor's `packing_residue` decides).
+    /// 8-bit values, as its token packing admits it, which the executor's
+    /// `packing_residue` reads).
     fn takes_residue(self, device: &Device) -> bool {
         self.resident(device)
-            .integer_codes()
-            .is_some_and(|codes| codes.max - codes.min > i32::from(i8::MAX))
+            .metal_packing()
+            .is_some_and(|packing| packing.residue)
     }
 }
 
@@ -338,17 +339,17 @@ impl Weight {
 
     /// The packing bound operand of this weight on `device` and its extent,
     /// as loading makes it: on Metal, `packing_bound` of a resident weight
-    /// with integer codes (one bound per run of the registry's code group);
-    /// an absent bound elsewhere.
+    /// with a token packing (one bound per run of its columns sharing a
+    /// scale); an absent bound elsewhere.
     fn bound(&self, device: &Device) -> (Tensor, usize) {
         let resident = self.repr.resident(device);
-        let Some(codes) = resident.integer_codes() else {
+        let Some(packing) = resident.metal_packing() else {
             return (absent_bound(device), 0);
         };
         if device.backend() != BackendName::Metal {
             return (absent_bound(device), 0);
         }
-        let runs = self.k / codes.group as usize;
+        let runs = self.k / packing.run() as usize;
         let mut bound = f32_tensor(device, &[runs], &vec![0.0; runs]);
         packing_bound::native_for_device_with(
             device,
@@ -3313,7 +3314,7 @@ fn packing_bound_matches_its_portable_body() {
             let (rows, k) = (40, 512);
             let w = weight(repr, rows, k, 17, 1.0);
             let resident = repr.resident(&device);
-            let runs = k / resident.integer_codes().unwrap().group as usize;
+            let runs = k / resident.metal_packing().unwrap().run() as usize;
             let outcome = interpret(
                 &module,
                 "packing_bound",

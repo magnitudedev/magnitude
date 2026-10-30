@@ -20,6 +20,7 @@ use seismic_lang::registry;
 use seismic_lang::repack::WordTable;
 
 mod conversion;
+pub(crate) mod forms;
 #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
 pub(crate) mod vulkan;
 
@@ -848,10 +849,14 @@ fn render_representation(
     out.push_str(&format!(
         "#define {prefix}_REPRESENTATION_{name} 1\n#define {prefix}_REPRESENTATION {name}\n"
     ));
-    if let registry::RepresentationKind::PackedRows(_) = info.kind {
+    if let registry::RepresentationKind::PackedRows(rows) = &info.kind {
         let coded = Coded::of(representation);
         for (axis, value) in CODING_AXES {
             out.push_str(&format!("#define {prefix}_{axis} {}\n", value(&coded)));
+        }
+        let axes = registry::decode_axes(representation).expect("packed storage has decode axes");
+        for (form, value) in forms::forms(dialect, &axes, rows) {
+            out.push_str(&format!("#define {prefix}_FORM_{form} {value}\n"));
         }
     }
     // GLSL's preprocessor pastes no tokens in `#if`: Vulkan libraries read a
@@ -1095,11 +1100,18 @@ struct Coded {
     local_bits: u32,
     local: Interpretation,
     carried_bit: u32,
+    /// The ends of the code and local coefficient code domains
+    /// (`DecodeAxes::codes`, `CoefficientAxes::local_codes`; 0 without one).
+    codes: (i32, i32),
+    locals: (i32, i32),
 }
 
 impl Coded {
     fn of(id: RepresentationId) -> Self {
         let axes = registry::decode_axes(id).expect("packed storage has decode axes");
+        let ends = |codes: Vec<i32>| (codes[0], codes[codes.len() - 1]);
+        let codes = ends(axes.codes());
+        let locals = axes.coefficients.local_codes().map_or((0, 0), ends);
         let flat = |coeff, scale, bias, group| Self {
             low: axes.low,
             high: axes.high,
@@ -1115,6 +1127,8 @@ impl Coded {
             local_bits: 0,
             local: Interpretation::none(),
             carried_bit: 0,
+            codes,
+            locals,
         };
         match &axes.coefficients {
             registry::CoefficientAxes::Direct { scale, bias, group } => {
@@ -1163,7 +1177,7 @@ impl Coded {
 /// The decode axes of a packed row-layout element, each defined as
 /// `<prefix>_<AXIS>` (`render_representation`), in the order of the axes
 /// tuple (`render_axes_tuple`).
-const CODING_AXES: [(&str, fn(&Coded) -> String); 20] = [
+const CODING_AXES: [(&str, fn(&Coded) -> String); 24] = [
     ("CODE_LOW_BITS", |c| c.low.to_string()),
     ("CODE_HIGH_BITS", |c| c.high.to_string()),
     ("CODES", |c| c.code.codes()),
@@ -1184,6 +1198,10 @@ const CODING_AXES: [(&str, fn(&Coded) -> String); 20] = [
     ("COEFF_LOCAL", |c| c.local.codes()),
     ("COEFF_LOCAL_OFFSET", |c| c.local.offset.to_string()),
     ("COEFF_CARRIED", |c| c.carried_bit.to_string()),
+    ("CODES_LEAST", |c| c.codes.0.to_string()),
+    ("CODES_GREATEST", |c| c.codes.1.to_string()),
+    ("COEFF_LOCAL_LEAST", |c| c.locals.0.to_string()),
+    ("COEFF_LOCAL_GREATEST", |c| c.locals.1.to_string()),
 ];
 
 /// The tensor's prefix as a function-like macro over its axes, emitted for
