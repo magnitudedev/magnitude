@@ -131,7 +131,8 @@ constexpr float power2() {
 // Decoders are composed from the registry's decode axes (`registry::decode_axes`,
 // emitted as each bound element's `_CODE*` and `_COEFF*` macros): the code
 // planes a packet's codes are stored in (`P`), the codes' interpretation
-// (`C`), and the coefficients that scale them (`K`). `Packet<P, C, K>` is a
+// (`C`), and the coefficients that scale them (`K`), with the consumer forms
+// it is admitted to (`F`, `_FORM_*`). `Packet<P, C, K, F>` is a
 // decoder of the uniform interface every reader takes: `load` a packet, and
 // its step's eight values (`values`, `even` lanes 0,2,4,6 and `odd` 1,3,5,7)
 // or two of them (`pair_values`), each with one F32 rounding.
@@ -144,15 +145,6 @@ constexpr float power2() {
 // codes), the indices a codebook reads.
 template <uint LOW, uint HIGH>
 struct Planes;
-
-// The largest code of planes P.
-template <typename P>
-struct CodeRange;
-template <uint LOW, uint HIGH>
-struct CodeRange<Planes<LOW, HIGH>> {
-    static constant constexpr uint largest = (1u << (LOW + HIGH)) - 1u;
-};
-
 
 template <>
 struct Planes<4, 0> {
@@ -826,8 +818,25 @@ struct Hier {
     }
 };
 
-// A decoder of codes in planes `P` interpreted by `C` under coefficients `K`.
-template <typename P, typename C, typename K>
+// The consumer forms the runtime admits a weight to (`<prefix>_FORM_<NAME>`,
+// its one form admission, `abi/forms.rs`), which projection libraries select
+// on: the token-packing GEMM (`PACK`, with its codes' entry: a code enters as
+// its value + PACK_OFFSET, centred at PACK_CENTRE, and its sums take
+// PACK_RESIDUE residue bits), the int8 GEMM (`INT8`) and the matrix GEMV
+// folding a block's scale codes, over 16-column runs or of symmetric 32
+// columns (`MATRIX_CODES`, `MATRIX_RUNS`, `MATRIX_SYMMETRIC`, at most one).
+template <bool PACK, uint PACK_CENTRE, uint PACK_OFFSET, uint PACK_RESIDUE, bool INT8, bool MATRIX_CODES,
+    bool MATRIX_RUNS, bool MATRIX_SYMMETRIC>
+struct Forms {
+    static constant constexpr bool pack = PACK, int8 = INT8;
+    static constant constexpr uint pack_centre = PACK_CENTRE, pack_offset = PACK_OFFSET, pack_residue = PACK_RESIDUE;
+    static constant constexpr bool matrix_codes = MATRIX_CODES, matrix_runs = MATRIX_RUNS,
+        matrix_symmetric = MATRIX_SYMMETRIC;
+};
+
+// A decoder of codes in planes `P` interpreted by `C` under coefficients `K`,
+// admitted to the consumer forms `F` (`Forms`).
+template <typename P, typename C, typename K, typename F>
 struct Packet {
     static constant constexpr uint groups = K::groups;
     struct packet {
@@ -964,11 +973,11 @@ struct Block {
 };
 
 template <typename P, typename C, typename FS, uint FACTOR_GROUP, int EXPONENT, int CODE_EXPONENT, uint LOCAL_BITS,
-    typename L, uint GROUP, bool MIN, int BIAS_SIGN, uint CARRIED_BIT>
+    typename L, uint GROUP, bool MIN, int BIAS_SIGN, uint CARRIED_BIT, typename F>
 struct Block<Packet<P, C,
-    Hier<FS, FACTOR_GROUP, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, CARRIED_BIT>>> {
+    Hier<FS, FACTOR_GROUP, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, CARRIED_BIT>, F>> {
     typedef Hier<FS, FACTOR_GROUP, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, CARRIED_BIT> K;
-    typedef Packet<P, C, K> W;
+    typedef Packet<P, C, K, F> W;
     static constant constexpr uint packets = K::packets;
     typedef typename K::run state;
     static state load(device const uchar *row, Rows16 layout, uint p) { return K::start(row, layout, p); }
@@ -1077,7 +1086,11 @@ struct CoefficientsOf<SEISMIC_COEFF_HIER, CODES, SCALE, BIAS, BIAS_SIGN, GROUP, 
             ELEMENT_CAT(P, _LOGICAL_GROUP),                                                                     \
             ELEMENT_CAT(P, _COEFF_FACTOR_GROUP), ELEMENT_CAT(P, _COEFF_EXPONENT), ELEMENT_CAT(P, _CODES_EXPONENT),     \
             ELEMENT_CAT(P, _COEFF_LOCAL_BITS), ELEMENT_CAT(P, _COEFF_LOCAL), ELEMENT_CAT(P, _COEFF_LOCAL_OFFSET),      \
-            ELEMENT_CAT(P, _COEFF_CARRIED)>::type>
+            ELEMENT_CAT(P, _COEFF_CARRIED)>::type,                                                              \
+        packets::Forms<ELEMENT_CAT(P, _FORM_PACK) != 0, ELEMENT_CAT(P, _FORM_PACK_CENTRE),                       \
+            ELEMENT_CAT(P, _FORM_PACK_OFFSET), ELEMENT_CAT(P, _FORM_PACK_RESIDUE), ELEMENT_CAT(P, _FORM_INT8) != 0,  \
+            ELEMENT_CAT(P, _FORM_MATRIX_CODES) != 0, ELEMENT_CAT(P, _FORM_MATRIX_RUNS) != 0,                     \
+            ELEMENT_CAT(P, _FORM_MATRIX_SYMMETRIC) != 0>>
 #define PACKETS_ROWS(P)                                                                                \
     packets::Rows16 { ELEMENT_CAT(P, _ROW_STRIDE_BYTES), ELEMENT_CAT(P, _ROW_CODES), ELEMENT_CAT(P, _ROW_HIGH), \
         ELEMENT_CAT(P, _ROW_SCALES), ELEMENT_CAT(P, _ROW_SUPERS), ELEMENT_CAT(P, _TILE_ROWS), 0,            \

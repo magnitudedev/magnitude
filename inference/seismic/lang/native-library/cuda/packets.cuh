@@ -1915,41 +1915,29 @@ struct CoefficientsOf<SEISMIC_COEFF_HIER, SCALE, BIAS, BIAS_SIGN, GROUP, STORAGE
                             Hier<FS, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, (int)GROUP, BIAS != 0, BIAS_SIGN>>::type type;
 };
 
-// Whether a form multiplies through the scaled GEMM: direct coefficients,
-// but neither 8-bit codes nor whole 256-code rows (iq4g32, whose dequantized
-// GEMM its Qwen results were qualified with). Today's forms' choice, which
-// tuning owns once both GEMMs are qualified for each.
-template <class K> struct IsDirect {
-    static constexpr bool value = false;
-};
-template <class S, int GROUP, bool BIAS, int STORAGE, int CODE_EXPONENT>
-struct IsDirect<Direct<S, GROUP, BIAS, STORAGE, CODE_EXPONENT>> {
-    static constexpr bool value = true;
-};
-template <class K, u32 LOW> struct ScaledGemm {
-    static constexpr bool value = IsDirect<K>::value && LOW != 8 && !K::WHOLE;
-};
-
 // The decoder of code axes CODES .. LANES under coefficients K
 // (`PACKETS_COEFFICIENTS`), RECORDS when the layout holds the codes in
-// records (`_PLANE_RECORDS`).
+// records (`_PLANE_RECORDS`), FOLD when the weight is admitted to the scaled
+// GEMM (`_FORM_GEMM_FOLD`, the runtime's form admission).
 template <u32 CODES, u32 LOW, u32 HIGH, int OFFSET, u32 TABLE, u32 GRID, u32 INDEX_BITS, u32 LANES, class K, bool RECORDS,
-          bool OPERANDS>
+          bool OPERANDS, bool FOLD>
 struct Decoder {
     static_assert(!RECORDS, "only grid codes are held in records");
-    typedef Packed<Planes<(int)LOW, (int)HIGH, K::WHOLE>, typename CodesOf<CODES, OFFSET, TABLE>::type, K,
-                   ScaledGemm<K, LOW>::value, OPERANDS>
+    typedef Packed<Planes<(int)LOW, (int)HIGH, K::WHOLE>, typename CodesOf<CODES, OFFSET, TABLE>::type, K, FOLD,
+                   OPERANDS>
         type;
 };
 // A grid code under its coefficients: with carried coefficient codes, the
-// `mma16` records, else the grids plane (multiplied through the scaled GEMM).
+// `mma16` records, else the grids plane, both multiplied through the scaled
+// GEMM.
 template <u32 LOW, u32 HIGH, int OFFSET, u32 TABLE, u32 GRID, u32 INDEX_BITS, u32 LANES, class K, bool RECORDS,
-          bool OPERANDS>
-struct Decoder<SEISMIC_CODES_GRID, LOW, HIGH, OFFSET, TABLE, GRID, INDEX_BITS, LANES, K, RECORDS, OPERANDS> {
+          bool OPERANDS, bool FOLD>
+struct Decoder<SEISMIC_CODES_GRID, LOW, HIGH, OFFSET, TABLE, GRID, INDEX_BITS, LANES, K, RECORDS, OPERANDS, FOLD> {
     static_assert(!OPERANDS, "grid codes have no NVFP4 operands");
+    static_assert(FOLD, "grid codes are admitted to the scaled GEMM only");
     static_assert(RECORDS == IsCarried<K>::value, "mma16 holds carried coefficient codes in records, and only those");
     typedef typename GridCodesOf<LOW, HIGH, GRID, INDEX_BITS, LANES>::type Codes;
-    typedef typename Select<RECORDS, Records<Codes, K>, Packed<GridPlanes<Codes>, Twos, K, true>>::type type;
+    typedef typename Select<RECORDS, Records<Codes, K>, Packed<GridPlanes<Codes>, Twos, K, FOLD>>::type type;
 };
 
 // One row's values at k = 64*kb + 16*s + {2t, 2t+1, 2t+8, 2t+9} (s = 0..3)
@@ -1991,7 +1979,7 @@ template <class W> __device__ __forceinline__ void row_values16(const W &w, u64 
                      ELEMENT_CAT(P, _CODES_OFFSET), ELEMENT_CAT(P, _CODES_TABLE), ELEMENT_CAT(P, _CODES_GRID),     \
                      ELEMENT_CAT(P, _CODES_GRID_INDEX_BITS), ELEMENT_CAT(P, _CODES_GRID_LANES),                  \
                      PACKETS_COEFFICIENTS(P), ELEMENT_HAS(P, _PLANE_RECORDS) != 0,                               \
-                     ELEMENT_HAS(P, _OPERANDS_NVFP4) != 0>::type
+                     ELEMENT_HAS(P, _OPERANDS_NVFP4) != 0, ELEMENT_CAT(P, _FORM_GEMM_FOLD) != 0>::type
 #define PACKETS_MAKE(TYPE, P, pointer)                                                                   \
     TYPE {                                                                                               \
         packets::Rows {                                                                                  \

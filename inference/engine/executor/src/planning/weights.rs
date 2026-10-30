@@ -15,7 +15,7 @@ use magnitude_family_contracts::{
     WeightRole, WeightScope,
 };
 use magnitude_state::KvCodec;
-use seismic::{BackendName, DType, Element, Layout, OperandRecipe};
+use seismic::{BackendName, DType, Element, Layout, MetalPacking, OperandRecipe};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -242,15 +242,20 @@ impl WeightPlan {
     }
 }
 
-/// The columns of one run of a resident weight's packing bound, the columns
-/// that share a scale: a weight whose resident codes are integers (the
-/// registry's), in the layout the token-packing projection forms read
-/// (Metal's `rows32`); `None` for any other.
-pub fn packing_run(resident: Element) -> Option<u64> {
+/// A resident weight's token packing: a weight in the layout the
+/// token-packing projection forms read (Metal's `rows32`) that the form
+/// admits (`Element::metal_packing`); `None` for any other.
+fn packing(resident: Element) -> Option<MetalPacking> {
     (resident.layout() == Layout::Rows32)
-        .then(|| resident.integer_codes())
+        .then(|| resident.metal_packing())
         .flatten()
-        .map(|codes| codes.group)
+}
+
+/// The columns of one run of a resident weight's packing bound, the columns
+/// that share a scale, for a weight with a token packing; `None` for any
+/// other.
+pub fn packing_run(resident: Element) -> Option<u64> {
+    packing(resident).map(|packing| u64::from(packing.run()))
 }
 
 /// The extent of a weight's packing bound (the `packing_bound` entry), the
@@ -268,14 +273,11 @@ fn packing_bound(resident: Element, logical: &[u64]) -> u64 {
 }
 
 /// Whether a weight's packed sums take residue bits beside their 16-bit
-/// fields: its codes are values of 8 bits (Q8_0 and iq4g32), whose sums 16
-/// bits a token do not hold at a useful gain. Only such weights make the
-/// packed forms' second residue width (`RESIDUE` 2) apply.
+/// fields (`MetalPacking::residue`: its codes are values of 8 bits, Q8_0
+/// and iq4g32). Only such weights make the packed forms' second residue
+/// width (`RESIDUE` 2) apply.
 pub fn packing_residue(resident: Element) -> bool {
-    packing_run(resident).is_some()
-        && resident
-            .integer_codes()
-            .is_some_and(|codes| codes.max - codes.min > i32::from(i8::MAX))
+    packing(resident).is_some_and(|packing| packing.residue)
 }
 
 /// A packed weight's second-level scale (NVFP4's per-tensor or per-matrix

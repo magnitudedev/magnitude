@@ -118,12 +118,15 @@ inline float4 packing_scale(float4 value) {
 // width (the entries' PACK, 1 or 2; `packing_shared`): each bit holds the
 // top sum to one more bit beside a 16-bit low field, 17 or 18. One is the
 // faster; two halves the top token's step where one is not precise enough.
-// Codes that need residue bits declare `residue` 1.
+// The runtime admits a weight's codes with residue bits (`_FORM_PACK_RESIDUE`
+// 1).
 
 // The packed codes of weights W (`packing_codes<W>`), the one place its
 // packed forms and its packing bound (`packing_bound`) read them from: a
 // layout of its code planes and interpretation (`packing_layout`) and its
-// coefficients' factors (`packing_factors`). Codes enter as F16 subnormals
+// coefficients' factors (`packing_factors`), for weights the runtime admits
+// to the form (`packets::Forms::pack`, `_FORM_PACK`, which also gives their
+// codes' `centre`, `offset` and `residue`). Codes enter as F16 subnormals
 // minus `centre`, half their range; a code's value is
 // scale (code - offset) + bias, so a block has the min term
 // (centre - offset) scale + bias where that is not zero (`biased`). A block
@@ -135,33 +138,25 @@ inline float4 packing_scale(float4 value) {
 // 0, 2, 4 and 6 hold a block); `step` yields its two codes of step s, of run
 // s * folds / 4, as F16 subnormals.
 //
-// Packed products serve integer codes (as the planner's packing runs do):
-// codes whose values are not scaled by a power of two of their own. A
-// weight's packed product is `available` on a device without tensor
-// operations (their int8 products carry more than a packed matrix operand
-// does); `factors` gives a row's block factors of a 256-column block for
-// `packing_coefficients`: `reach` a bound on what the fold multiplies,
-// `start` and `take` each block's two factors in turn. `residue` is the bits
-// of the top sum the code planes resolve (0: the sums fit 16 bits each);
-// weights with a residue bit give a row's low bit plane of a block from its
-// lanes' words (`planes`), and their steps' columns are bytes in column
-// order.
+// An admitted weight's packed product is `available` on a device without
+// tensor operations (their int8 products carry more than a packed matrix
+// operand does); `factors` gives a row's block factors of a 256-column
+// block for `packing_coefficients`: `reach` a bound on what the fold
+// multiplies, `start` and `take` each block's two factors in turn. `residue`
+// is the bits of the top sum the code planes resolve (0: the sums fit 16
+// bits each); weights with a residue bit give a row's low bit plane of a
+// block from its lanes' words (`planes`), and their steps' columns are bytes
+// in column order.
 
 // The packed product's forms, on a device without tensor operations.
 constant constexpr bool packing_forms = !SEISMIC_HAS_TENSOR_OPS;
 
-// The centre of codes in planes P: half their range.
-template <typename P>
-constexpr uint packing_centre() {
-    return (packets::CodeRange<P>::largest + 1u) / 2u;
-}
-
-// A layout of codes in planes P interpreted by C, for FOLDS runs a block:
-// `centre`, `offset` (the entering code of value zero), `residue`, `at`,
-// `load`, `step` and, with residue bits, `planes`. None by default.
+// A layout of codes in planes P interpreted by C, for FOLDS runs a block
+// (`implemented`): `at`, `load`, `step` and, where its steps' columns are
+// `bytes` (the codes with residue bits), `planes`. None by default.
 template <typename P, typename C, uint FOLDS>
 struct packing_layout {
-    static constant constexpr bool available = false;
+    static constant constexpr bool implemented = false, bytes = false;
 };
 
 // 4-bit codes of a plane of low nibbles alone: step s multiplies the block's
@@ -169,8 +164,7 @@ struct packing_layout {
 // them as nibble s of each half.
 template <int ZERO_CODE>
 struct packing_layout<packets::Planes<4, 0>, packets::Offset<ZERO_CODE>, 1> {
-    static constant constexpr bool available = true;
-    static constant constexpr uint centre = packing_centre<packets::Planes<4, 0>>(), offset = ZERO_CODE, residue = 0;
+    static constant constexpr bool implemented = true, bytes = false;
     typedef uint place;
     typedef uint words;
     template <typename W>
@@ -191,8 +185,7 @@ struct packing_layout<packets::Planes<4, 0>, packets::Offset<ZERO_CODE>, 1> {
 // bit s of each half is the high bit of step s's code there.
 template <int ZERO_CODE>
 struct packing_layout<packets::Planes<4, 1>, packets::Offset<ZERO_CODE>, 1> {
-    static constant constexpr bool available = true;
-    static constant constexpr uint centre = packing_centre<packets::Planes<4, 1>>(), offset = ZERO_CODE, residue = 0;
+    static constant constexpr bool implemented = true, bytes = false;
     typedef uint2 place;
     typedef uint2 words;
     template <typename W>
@@ -218,8 +211,7 @@ struct packing_layout<packets::Planes<4, 1>, packets::Offset<ZERO_CODE>, 1> {
 // word and field of each run, shifted to its first nibble.
 template <int ZERO_CODE>
 struct packing_layout<packets::Planes<4, 2>, packets::Offset<ZERO_CODE>, 2> {
-    static constant constexpr bool available = true;
-    static constant constexpr uint centre = packing_centre<packets::Planes<4, 2>>(), offset = ZERO_CODE, residue = 0;
+    static constant constexpr bool implemented = true, bytes = false;
     typedef uint3 place;
     typedef uint4 words;
     template <typename W>
@@ -275,9 +267,7 @@ inline uint2 packing_byte_planes(uint2 codes, uint x) {
 // complement bytes) or the code.
 template <uint MASK, int ZERO>
 struct packing_layout<packets::Planes<8, 0>, packets::Linear<MASK, ZERO>, 1> {
-    static constant constexpr bool available = true;
-    static constant constexpr uint centre = packing_centre<packets::Planes<8, 0>>(), offset = uint(ZERO),
-        residue = 1;
+    static constant constexpr bool implemented = true, bytes = true;
     typedef uint place;
     typedef uint2 words;
     template <typename W>
@@ -299,8 +289,7 @@ struct packing_layout<packets::Planes<8, 0>, packets::Linear<MASK, ZERO>, 1> {
 // each.
 template <uint ID>
 struct packing_layout<packets::Planes<4, 0>, packets::Table<ID>, 1> {
-    static constant constexpr bool available = true;
-    static constant constexpr uint centre = 128, offset = 128, residue = 1;
+    static constant constexpr bool implemented = true, bytes = true;
     typedef uint place;
     typedef uint2 words;
     template <typename W>
@@ -325,12 +314,13 @@ struct packing_layout<packets::Planes<4, 0>, packets::Table<ID>, 1> {
 // are scale 32767 / 64 and its min term (CENTRE - OFFSET) scale + bias, or
 // with two runs the runs' scales 32767 / 64. The fold takes a sum of at most
 // 1 of the first and a code sum / 64 below 128 of the second, so 512 |scale|
-// + 128 |min term| bounds what it multiplies (`reach`). `available` where
-// the codes are integers, a block of two runs has no min term and the run
-// of a 256-column block's factors is one factor group's or eight packets'.
+// + 128 |min term| bounds what it multiplies (`reach`). Implemented for
+// codes not scaled by a power of two of their own, a block of two runs
+// without a min term and the run of a 256-column block's factors one factor
+// group's or eight packets'.
 template <typename K, uint CENTRE, uint OFFSET>
 struct packing_factors {
-    static constant constexpr bool available = false, biased = false;
+    static constant constexpr bool implemented = false;
 };
 
 // The difference CENTRE - OFFSET.
@@ -367,7 +357,8 @@ struct packing_factors<packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, L, GROUP
     OFFSET> {
     typedef packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, 0u> K;
     static constant constexpr bool biased = MIN || CENTRE != OFFSET;
-    static constant constexpr bool available = K::groups == 1 || !biased;
+    static_assert(K::groups == 1 || !biased, "a block of two runs has no min term");
+    static constant constexpr bool implemented = true;
     typedef typename K::run run;
     static run start(device const uchar *row, Rows16 layout, uint block) {
         return K::start(row, layout, block * K::packets);
@@ -388,9 +379,9 @@ template <typename S, uint GROUP, bool BIAS, uint STORAGE, uint CENTRE, uint OFF
 struct packing_factors<packets::Direct<S, GROUP, BIAS, STORAGE, 0>, CENTRE, OFFSET> {
     typedef packets::Direct<S, GROUP, BIAS, STORAGE, 0> K;
     static constant constexpr bool biased = BIAS || CENTRE != OFFSET;
-    // Served where a block of two runs has no min term and a 256-column
-    // block holds whole groups.
-    static constant constexpr bool available = (K::groups == 1 || !biased) && 256u % GROUP == 0u;
+    static_assert(K::groups == 1 || !biased, "a block of two runs has no min term");
+    static_assert(256u % GROUP == 0u, "a 256-column block holds whole groups");
+    static constant constexpr bool implemented = true;
     // A 256-column block's share of the supers plane, from its first
     // group's scale: a packet's place in it is its index in the block.
     static device const uchar *block_supers(device const uchar *row, Rows16 layout, uint block) {
@@ -424,21 +415,24 @@ struct packing_factors<packets::Direct<S, GROUP, BIAS, STORAGE, 0>, CENTRE, OFFS
     }
 };
 
-// The packed codes of weights W whose code planes and interpretation have a
-// layout (`LAID`), its runs a block the coefficient groups of a packet. None
-// otherwise.
-template <typename W, bool LAID>
+// The packed codes of weights W the runtime admits to the form (`ADMITTED`),
+// its runs a block the coefficient groups of a packet, with the layout and
+// factors of an admitted weight's codes. None otherwise.
+template <typename W, bool ADMITTED>
 struct packing_codes_of {
     static constant constexpr bool available = false, biased = false;
     static constant constexpr uint centre = 0, folds = 0, residue = 0;
 };
-template <typename P, typename C, typename K>
-struct packing_codes_of<packets::Packet<P, C, K>, true> {
-    typedef packets::Packet<P, C, K> W;
+template <typename P, typename C, typename K, typename F>
+struct packing_codes_of<packets::Packet<P, C, K, F>, true> {
+    typedef packets::Packet<P, C, K, F> W;
     typedef packing_layout<P, C, K::groups> layout;
-    typedef packing_factors<K, layout::centre, layout::offset> factors;
-    static constant constexpr uint centre = layout::centre, folds = K::groups, residue = layout::residue;
-    static constant constexpr bool available = packing_forms && factors::available;
+    static_assert(layout::implemented, "an admitted weight's codes have a packing layout");
+    static constant constexpr uint centre = F::pack_centre, folds = K::groups, residue = F::pack_residue;
+    static_assert(layout::bytes == (residue != 0), "the codes with residue bits are the layouts of bytes");
+    typedef packing_factors<K, centre, F::pack_offset> factors;
+    static_assert(factors::implemented, "an admitted weight's coefficients have packing factors");
+    static constant constexpr bool available = packing_forms;
     static constant constexpr bool biased = factors::biased;
     typedef typename layout::place place;
     typedef typename layout::words words;
@@ -449,18 +443,18 @@ struct packing_codes_of<packets::Packet<P, C, K>, true> {
     static uint2 planes(words codes, uint x) { return layout::template planes<RESIDUE>(codes, x); }
 };
 
-// Whether weights W have a packing layout.
+// Whether the runtime admits weights W to the form.
 template <typename W>
-struct packing_laid {
+struct packing_admitted {
     static constant constexpr bool value = false;
 };
-template <typename P, typename C, typename K>
-struct packing_laid<packets::Packet<P, C, K>> {
-    static constant constexpr bool value = packing_layout<P, C, K::groups>::available;
+template <typename P, typename C, typename K, typename F>
+struct packing_admitted<packets::Packet<P, C, K, F>> {
+    static constant constexpr bool value = F::pack;
 };
 
 template <typename W>
-using packing_codes = packing_codes_of<W, packing_laid<W>::value>;
+using packing_codes = packing_codes_of<W, packing_admitted<W>::value>;
 
 // The fields of a packed element and of a run's accumulator for weights
 // with RESIDUE residue bits. An element is (2^top_shift top + low) x

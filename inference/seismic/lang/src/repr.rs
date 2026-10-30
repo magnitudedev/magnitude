@@ -1433,6 +1433,31 @@ pub struct DecodeAxes {
     pub coefficients: CoefficientAxes,
 }
 
+impl DecodeAxes {
+    /// Every value a code takes, ascending: the exact integers a value is
+    /// before `2^code_exponent` and its coefficients (a grid code's signed
+    /// magnitudes). Native libraries read the domain's ends from here
+    /// (`CODES_LEAST`, `CODES_GREATEST`) instead of deriving them.
+    pub fn codes(&self) -> Vec<i32> {
+        self.code.codes(self.low + self.high)
+    }
+}
+
+impl CoefficientAxes {
+    /// Every value a hierarchical coefficient's local code takes, ascending
+    /// (`COEFF_LOCAL_LEAST`, `COEFF_LOCAL_GREATEST`); direct coefficients
+    /// have none.
+    pub fn local_codes(&self) -> Option<Vec<i32>> {
+        match self {
+            Self::Direct { .. } => None,
+            Self::Hierarchical { locals, .. } => Some(match locals {
+                LocalCodes::Plane { bits, interpretation, .. }
+                | LocalCodes::Carried { bits, interpretation, .. } => interpretation.codes(*bits),
+            }),
+        }
+    }
+}
+
 /// A decoder's coefficients: a stored scale (and bias) per `group` values,
 /// or per `group` local codes (`LocalCodes`) under a factor (and minimum
 /// factor) per `factor_group` scaled by `2^exponent`.
