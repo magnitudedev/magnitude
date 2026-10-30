@@ -6,6 +6,13 @@ It is expected that contributions involve AI-generated content. However, to faci
 
 Issues and PRs should be created to address a real, user-facing suggestion or concern - not arbitrary code quality or internal tooling problems, unless those actually affect you as a contributor and are pertinent to a contribution you are making.
 
+Label every issue so it can be triaged:
+- A type: `type: bug` or `type: feature request`
+- The operating system it affects: `os: macos`, `os: windows`, or `os: linux`
+- The inference backend it affects, when relevant: `backend: metal`, `backend: cuda`, `backend: vulkan`, or `backend: cpu`
+
+Apply more than one `os:` or `backend:` label if the issue spans several, and leave them off if it is platform-independent.
+
 If a PR involves an implementation that is one-shot by an agent with no meaningful human steering or validation, it is preferrable to submit an Issue instead.
 
 Any PR should involve:
