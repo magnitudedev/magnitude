@@ -92,12 +92,33 @@ inline void split_high2(uint field, thread uint &even, thread uint &odd) {
     odd = (t & 0x0c0c0c0cu) << 2;
 }
 
+// The same for a 16-bit field of 2-bit codes, in bits 0..1.
+inline void split_crumbs(uint field, thread uint &even, thread uint &odd) {
+    split_high2(field, even, odd);
+    even >>= 4;
+    odd >>= 4;
+}
+
 // The same for an 8-bit field of 1-bit high codes, moved to bit 4.
 inline void split_high1(uint field, thread uint &even, thread uint &odd) {
     uint t = (field | (field << 12)) & 0x000f000fu;
     t = (t | (t << 6)) & 0x03030303u;
     even = (t & 0x01010101u) << 4;
     odd = (t & 0x02020202u) << 3;
+}
+
+// The same for an 8-bit field of 1-bit codes, in bit 0.
+inline void split_bits(uint field, thread uint &even, thread uint &odd) {
+    split_high1(field, even, odd);
+    even >>= 4;
+    odd >>= 4;
+}
+
+// An 8-bit field of 1-bit codes as eight nibbles: bit j moved to bit 4j.
+inline uint spread_bits(uint field) {
+    uint t = (field | (field << 12)) & 0x000f000fu;
+    t = (t | (t << 6)) & 0x03030303u;
+    return (t | (t << 3)) & 0x11111111u;
 }
 
 inline void split_nibbles(uint word, thread uint &even, thread uint &odd) {
@@ -131,7 +152,7 @@ constexpr float power2() {
 // Decoders are composed from the registry's decode axes (`registry::decode_axes`,
 // emitted as each bound element's `_CODE*` and `_COEFF*` macros): the code
 // planes a packet's codes are stored in (`P`), the codes' interpretation
-// (`C`), and the coefficients that scale them (`K`). `Packet<P, C, K>` is a
+// (`C`), and the coefficients that scale them (`K`). `Packet<P, C, K, G>` is a
 // decoder of the uniform interface every reader takes: `load` a packet, and
 // its step's eight values (`values`, `even` lanes 0,2,4,6 and `odd` 1,3,5,7)
 // or two of them (`pair_values`), each with one F32 rounding.
@@ -140,8 +161,8 @@ constexpr float power2() {
 // high plane of HIGH. `floats` yields a step's codes, their bytes with `mask`
 // flipped, as exact floats less `offset - 1024`; `pair` the step's codes 2j
 // and 2j + 1, the second in bits 16.., with `mask` flipped alike; `nibbles`
-// the step's eight 4-bit codes as one word and `nibble_pair` its byte j (two
-// codes), the indices a codebook reads.
+// the step's eight codes (of at most 4 bits), one nibble each, as one word
+// and `nibble_pair` its byte j (two codes), the indices a codebook reads.
 template <uint LOW, uint HIGH>
 struct Planes;
 
@@ -153,6 +174,92 @@ struct CodeRange<Planes<LOW, HIGH>> {
     static constant constexpr uint largest = (1u << (LOW + HIGH)) - 1u;
 };
 
+
+template <>
+struct Planes<1, 0> {
+    struct words {
+        uint low;
+    };
+    static words load(device const uchar *row, Rows16 layout, uint p) {
+        words w;
+        w.low = *reinterpret_cast<device const uint *>(layout.at(row, layout.codes, 4ul, p));
+        return w;
+    }
+    // Step `step`'s eight codes: byte `step` of the word.
+    static uint field(thread const words &w, uint step) { return (w.low >> (8u * step)) & 0xffu; }
+    template <uint MASK>
+    static void floats(thread const words &w, uint step, half offset, thread float4 &even, thread float4 &odd) {
+        uint e, o;
+        split_bits(field(w, step), e, o);
+        even = byte_floats(e ^ MASK, offset);
+        odd = byte_floats(o ^ MASK, offset);
+    }
+    template <uint MASK>
+    static uint pair(thread const words &w, uint step, uint j) {
+        uint b = (field(w, step) >> (2u * j)) & 3u;
+        return ((b & 1u) | ((b >> 1) << 16)) ^ (MASK & 0x00ff00ffu);
+    }
+    static uint nibbles(thread const words &w, uint step) { return spread_bits(field(w, step)); }
+    static uint nibble_pair(thread const words &w, uint step, uint j) {
+        uint b = (field(w, step) >> (2u * j)) & 3u;
+        return (b & 1u) | ((b >> 1) << 4);
+    }
+};
+
+template <>
+struct Planes<2, 0> {
+    struct words {
+        uint2 low;
+    };
+    static words load(device const uchar *row, Rows16 layout, uint p) {
+        words w;
+        w.low = *reinterpret_cast<device const uint2 *>(layout.at(row, layout.codes, 8ul, p));
+        return w;
+    }
+    // Step `step`'s eight codes: bits 16 (step % 2).. of word step / 2.
+    static uint field(thread const words &w, uint step) { return (w.low[step >> 1] >> (16u * (step & 1u))) & 0xffffu; }
+    template <uint MASK>
+    static void floats(thread const words &w, uint step, half offset, thread float4 &even, thread float4 &odd) {
+        uint e, o;
+        split_crumbs(field(w, step), e, o);
+        even = byte_floats(e ^ MASK, offset);
+        odd = byte_floats(o ^ MASK, offset);
+    }
+    template <uint MASK>
+    static uint pair(thread const words &w, uint step, uint j) {
+        uint b = (field(w, step) >> (4u * j)) & 0xfu;
+        return ((b & 3u) | ((b >> 2) << 16)) ^ (MASK & 0x00ff00ffu);
+    }
+};
+
+// 2-bit codes under a 1-bit high plane (bit 2 of a code).
+template <>
+struct Planes<2, 1> {
+    struct words {
+        uint2 low;
+        uint high;
+    };
+    static words load(device const uchar *row, Rows16 layout, uint p) {
+        words w;
+        w.low = *reinterpret_cast<device const uint2 *>(layout.at(row, layout.codes, 8ul, p));
+        w.high = *reinterpret_cast<device const uint *>(layout.at(row, layout.high, 4ul, p));
+        return w;
+    }
+    template <uint MASK>
+    static void floats(thread const words &w, uint step, half offset, thread float4 &even, thread float4 &odd) {
+        uint e, o, he, ho;
+        split_crumbs(Planes<2, 0>::field(Planes<2, 0>::words{w.low}, step), e, o);
+        split_high1((w.high >> (8u * step)) & 0xffu, he, ho);
+        even = byte_floats((e | (he >> 2)) ^ MASK, offset);
+        odd = byte_floats((o | (ho >> 2)) ^ MASK, offset);
+    }
+    template <uint MASK>
+    static uint pair(thread const words &w, uint step, uint j) {
+        uint b = (Planes<2, 0>::field(Planes<2, 0>::words{w.low}, step) >> (4u * j)) & 0xfu;
+        uint h = (w.high >> (8u * step + 2u * j)) & 3u;
+        return ((b & 3u) | ((h & 1u) << 2) | (((b >> 2) | ((h >> 1) << 2)) << 16)) ^ (MASK & 0x00ff00ffu);
+    }
+};
 
 template <>
 struct Planes<4, 0> {
@@ -306,28 +413,75 @@ inline uint plane_bits(device const uchar *plane, uint bit) {
     }
 }
 
-// Grid entries: a packet's four BYTES-byte entries, the code plane of a grid
-// code (`Grid`), entry `step` the step's.
-template <uint BYTES>
+// Grid entries: a packet's four entries of BYTES whole bytes in the codes
+// plane and HIGH bits more in the high plane, the code plane of a grid code
+// (`Grid`), entry `step` the step's.
+template <uint BYTES, uint HIGH>
 struct Entries;
 
+// A packet's entries are read from `codes`, its whole bytes in the codes
+// plane, and `high`, its unit of the high plane (`of`); `load` is the same at
+// packet p of a row (`entries_codes`, `entries_high`). Both planes place a
+// packet's unit as the codes are (`registry::RowPlaneContent::GridHigh`): a
+// unit of 4 HIGH bits, whole bytes (`entries_high_bytes`).
+constexpr uint entries_high_bytes(uint high) { return 4u * high / 8u; }
+inline device const uchar *entries_codes(device const uchar *row, Rows16 layout, uint bytes, uint p) {
+    return layout.at(row, layout.codes, 4ul * bytes, p);
+}
+inline device const uchar *entries_high(device const uchar *row, Rows16 layout, uint high, uint p) {
+    return layout.at(row, layout.high, entries_high_bytes(high), p);
+}
+
 template <>
-struct Entries<2> {
+struct Entries<2, 0> {
     typedef uint2 words;
-    static words load(device const uchar *row, Rows16 layout, uint p) {
-        return *reinterpret_cast<device const uint2 *>(layout.at(row, layout.codes, 8ul, p));
+    static words of(device const uchar *codes, device const uchar *) {
+        return *reinterpret_cast<device const uint2 *>(codes);
     }
+    static words load(device const uchar *row, Rows16 layout, uint p) { return of(entries_codes(row, layout, 2u, p), row); }
     static uint entry(words e, uint step) { return (e[step >> 1] >> (16u * (step & 1u))) & 0xffffu; }
 };
 
 template <>
-struct Entries<3> {
+struct Entries<3, 0> {
     typedef uint3 words;
-    static words load(device const uchar *row, Rows16 layout, uint p) {
-        return uint3(*reinterpret_cast<device const packed_uint3 *>(layout.at(row, layout.codes, 12ul, p)));
+    static words of(device const uchar *codes, device const uchar *) {
+        return uint3(*reinterpret_cast<device const packed_uint3 *>(codes));
     }
+    static words load(device const uchar *row, Rows16 layout, uint p) { return of(entries_codes(row, layout, 3u, p), row); }
     // Entry `step` at bit 24 * step of the packet's three words.
     static uint entry(words e, uint step) { return word_bits<24>(e, 24u * step); }
+};
+
+template <>
+struct Entries<1, 0> {
+    typedef uint words;
+    static words of(device const uchar *codes, device const uchar *) {
+        return *reinterpret_cast<device const uint *>(codes);
+    }
+    static words load(device const uchar *row, Rows16 layout, uint p) { return of(entries_codes(row, layout, 1u, p), row); }
+    static uint entry(words e, uint step) { return (e >> (8u * step)) & 0xffu; }
+};
+
+// Entries with HIGH bits each in the high plane: the packet's whole bytes
+// (`low`) and their high bits.
+template <uint BYTES, uint HIGH>
+struct Entries {
+    typedef Entries<BYTES, 0> E;
+    static_assert(4u * HIGH % 8u == 0u, "a unit's high bits are whole bytes");
+    struct words {
+        typename E::words low;
+        uint high;
+    };
+    static words of(device const uchar *codes, device const uchar *high) {
+        return words{E::of(codes, high), plane_bits<4u * HIGH>(high, 0u)};
+    }
+    static words load(device const uchar *row, Rows16 layout, uint p) {
+        return of(entries_codes(row, layout, BYTES, p), entries_high(row, layout, HIGH, p));
+    }
+    static uint entry(thread const words &e, uint step) {
+        return E::entry(e.low, step) | (((e.high >> (HIGH * step)) & ((1u << HIGH) - 1u)) << (8u * BYTES));
+    }
 };
 
 // Interpretations of codes: a step's codes (`codes`) and the exact values of
@@ -370,7 +524,8 @@ inline void table_codes(constant float *table, uint word, thread float4 &even, t
         table[word >> 28]);
 }
 
-// Codebook ID's 4-bit codes (`codebooks::table<ID>`, exact integers).
+// Codebook ID's codes of at most 4 bits, read as nibbles
+// (`codebooks::table<ID>`, exact integers).
 template <uint ID>
 struct Table {
     static constant constexpr int zero = 0;
@@ -386,8 +541,11 @@ struct Table {
 };
 
 // Grid codes (`registry::GridCodes`): an entry's LANES-value grid points
-// (`grids::table<GRID>`, its first INDEX_BITS-bit index lowest) and, past its
-// indices, seven sign bits completed by an eighth of even parity.
+// (`grids::table<GRID>`, its first INDEX_BITS-bit index lowest), past its
+// indices the sign bits of sign mode SIGNS (`grid_signs`, over magnitudes;
+// none for signed points, whose bytes are two's complement), and where
+// DELTA_BIT is not 0 a delta there: the code is then
+// 2^DELTA times the value, plus 1, or minus 1 with the delta set.
 template <uint GRID, uint INDEX_BITS, uint LANES>
 struct Points;
 
@@ -407,25 +565,77 @@ struct Points<GRID, INDEX_BITS, 4> {
     }
 };
 
-// The eight lane sign bits of an entry's seven: the eighth makes the count of
-// set bits even.
-inline uint grid_signs(uint signs) { return signs | ((popcount(signs) & 1u) << 7); }
+// The eight lane signs of an entry's sign bits `signs` under sign mode
+// SIGNS (`GridSigns::lanes`): seven and an eighth that makes the count of
+// set bits even, eight, or none (signed points).
+template <uint SIGNS>
+inline uint grid_signs(uint signs) {
+    if constexpr (SIGNS == SEISMIC_GRID_SIGNS_PARITY_PLUS7)
+        return (signs & 127u) | ((popcount(signs & 127u) & 1u) << 7);
+    else if constexpr (SIGNS == SEISMIC_GRID_SIGNS_EXPLICIT8)
+        return signs & 255u;
+    else {
+        static_assert(SIGNS == SEISMIC_GRID_SIGNS_NONE, "a grid sign mode");
+        return 0u;
+    }
+}
 
-template <uint GRID, uint INDEX_BITS, uint LANES>
+template <uint GRID, uint INDEX_BITS, uint LANES, uint SIGNS, uint DELTA_BIT, uint DELTA>
 struct Grid {
     static constant constexpr int zero = 0;
+    static constant constexpr bool signed_points = SIGNS == SEISMIC_GRID_SIGNS_NONE;
     typedef Points<GRID, INDEX_BITS, LANES> points;
-    static uint signs(uint entry) { return grid_signs((entry >> points::signs) & 127u); }
-    // The eight signed codes of `entry` (lanes 0..3 in x, 4..7 in y).
+    // The bytes of a point word as exact floats: magnitudes, or two's
+    // complement values (their sign bits flipped to offset binary).
+    static float4 lanes(uint word) {
+        return signed_points ? byte_floats(word ^ 0x80808080u, 1152.0h) : unsigned_bytes(word);
+    }
+    static uint signs(uint entry) { return grid_signs<SIGNS>(entry >> points::signs); }
+    // The delta of `entry` (+1, or -1 with the delta bit set).
+    static float delta(uint entry) { return ((entry >> DELTA_BIT) & 1u) != 0u ? -1.0f : 1.0f; }
+    // The eight codes of `entry` (lanes 0..3 in x, 4..7 in y).
     template <typename P>
     static void codes(thread const typename P::words &w, uint step, thread float4 &even, thread float4 &odd) {
         uint entry = P::entry(w, step), s = signs(entry);
         uint2 point = points::point(entry);
-        float4 low = unsigned_bytes(point.x), high = unsigned_bytes(point.y);
+        float4 low = lanes(point.x), high = lanes(point.y);
         even = as_type<float4>(as_type<uint4>(float4(low.x, low.z, high.x, high.z)) ^
                                ((uint4(s) << uint4(31, 29, 27, 25)) & 0x80000000u));
         odd = as_type<float4>(as_type<uint4>(float4(low.y, low.w, high.y, high.w)) ^
                               ((uint4(s) << uint4(30, 28, 26, 24)) & 0x80000000u));
+        if (DELTA_BIT != 0u) {
+            const float d = delta(entry);
+            even = metal::fma(even, float4(power2<int(DELTA)>()), float4(d));
+            odd = metal::fma(odd, float4(power2<int(DELTA)>()), float4(d));
+        }
+    }
+    // The eight codes of `entry` + 128 as bytes in lane order (lanes 0..3
+    // in x, 4..7 in y), for codes of 8-bit two's complement values (the
+    // packed forms', `registry::DecodeAxes::packing`): a magnitude m below
+    // 128 is 128 + m, or 128 - m with its sign set, neither carrying out of
+    // its byte; a signed point is its byte with the sign bit flipped. A
+    // delta's code 2^DELTA value + 1 or - 1 is formed in 16-bit lanes,
+    // where 2^DELTA (value + 128) and the code + 128 do not leave theirs.
+    static uint2 offset_bytes(uint entry) {
+        const uint2 point = points::point(entry);
+        uint2 bytes;
+        if constexpr (signed_points) {
+            bytes = point ^ 0x80808080u;
+        } else {
+            // Sign j as byte j (bit j to bit 8 j: no two bits meet), all set.
+            const uint s = signs(entry);
+            const uint2 negative =
+                ((uint2(s & 15u, s >> 4) * 0x00204081u) & 0x01010101u) * 0xffu;
+            bytes = (0x80808080u + (point & ~negative)) - (point & negative);
+        }
+        if constexpr (DELTA_BIT != 0u) {
+            constexpr uint scaled = 128u << DELTA;
+            const uint added = ((entry >> DELTA_BIT) & 1u) != 0u ? 127u : 129u;
+            const uint2 even = bytes & 0x00ff00ffu, odd = (bytes >> 8) & 0x00ff00ffu;
+            bytes = (((even << DELTA) + added * 0x00010001u) - scaled * 0x00010001u)
+                | ((((odd << DELTA) + added * 0x00010001u) - scaled * 0x00010001u) << 8);
+        }
+        return bytes;
     }
     // Lanes 2j and 2j + 1 of the same.
     template <typename P>
@@ -434,8 +644,12 @@ struct Grid {
         uint2 point = points::point(entry);
         uint word = (j < 2u ? point.x : point.y) >> (16u * (j & 1u));
         uint s = signs(entry) >> (2u * j);
-        float2 magnitudes = code_pair((word & 0xffu) | ((word & 0xff00u) << 8), 1024.0h);
-        return as_type<float2>(as_type<uint2>(magnitudes) ^ ((uint2(s, s >> 1) & 1u) << 31));
+        uint two = (word & 0xffu) | ((word & 0xff00u) << 8);
+        float2 values = signed_points ? code_pair(two ^ 0x00800080u, 1152.0h) : code_pair(two, 1024.0h);
+        values = as_type<float2>(as_type<uint2>(values) ^ ((uint2(s, s >> 1) & 1u) << 31));
+        if (DELTA_BIT != 0u)
+            values = metal::fma(values, float2(power2<int(DELTA)>()), float2(delta(entry)));
+        return values;
     }
 };
 
@@ -638,12 +852,15 @@ struct Direct {
     }
 };
 
-// WORDS consecutive little-endian words, shifted right as one value
-// (`shift`), with their lowest word (`low`) and their bits
-// [BITS index, BITS (index + 1)) (`field`, BITS < 32). No words (`Run<0>`)
-// are a run of nothing.
+// WORDS consecutive little-endian words, loaded from an aligned word
+// (`load`) or made of words (`of`), shifted right as one value by BITS
+// (`shift`) or by a runtime count below 32 (`shift_by`), with their lowest
+// word (`low`) and their bits [BITS index, BITS (index + 1)) (`field`,
+// BITS < 32). No words (`Run<0>`) are a run of nothing.
 template <uint WORDS>
 struct Run;
+// Word `low` shifted right by `s` < 32 with the low bits of `high` above it.
+inline uint funnel(uint low, uint high, uint s) { return (low >> s) | ((high << 1u) << (31u - s)); }
 template <>
 struct Run<0> {
     struct words {};
@@ -652,8 +869,10 @@ template <>
 struct Run<1> {
     typedef uint words;
     static words load(device const uchar *at) { return *reinterpret_cast<device const uint *>(at); }
+    static words of(thread const uint *w) { return w[0]; }
     template <uint BITS>
     static words shift(words w) { return w >> BITS; }
+    static words shift_by(words w, uint s) { return w >> s; }
     static uint low(words w) { return w; }
     template <uint BITS>
     static uint field(words w, uint index) { return (w >> (BITS * index)) & ((1u << BITS) - 1u); }
@@ -662,8 +881,10 @@ template <>
 struct Run<2> {
     typedef uint2 words;
     static words load(device const uchar *at) { return uint2(*reinterpret_cast<device const packed_uint2 *>(at)); }
+    static words of(thread const uint *w) { return uint2(w[0], w[1]); }
     template <uint BITS>
     static words shift(words w) { return uint2((w.x >> BITS) | (w.y << (32u - BITS)), w.y >> BITS); }
+    static words shift_by(words w, uint s) { return uint2(funnel(w.x, w.y, s), w.y >> s); }
     static uint low(words w) { return w.x; }
     template <uint BITS>
     static uint field(words w, uint index) {
@@ -674,10 +895,12 @@ template <>
 struct Run<3> {
     typedef uint3 words;
     static words load(device const uchar *at) { return uint3(*reinterpret_cast<device const packed_uint3 *>(at)); }
+    static words of(thread const uint *w) { return uint3(w[0], w[1], w[2]); }
     template <uint BITS>
     static words shift(words w) {
         return uint3((w.x >> BITS) | (w.y << (32u - BITS)), (w.y >> BITS) | (w.z << (32u - BITS)), w.z >> BITS);
     }
+    static words shift_by(words w, uint s) { return uint3(funnel(w.x, w.y, s), funnel(w.y, w.z, s), w.z >> s); }
     static uint low(words w) { return w.x; }
     template <uint BITS>
     static uint field(words w, uint index) {
@@ -688,10 +911,14 @@ template <>
 struct Run<4> {
     typedef uint4 words;
     static words load(device const uchar *at) { return uint4(*reinterpret_cast<device const packed_uint4 *>(at)); }
+    static words of(thread const uint *w) { return uint4(w[0], w[1], w[2], w[3]); }
     template <uint BITS>
     static words shift(words w) {
         return uint4((w.x >> BITS) | (w.y << (32u - BITS)), (w.y >> BITS) | (w.z << (32u - BITS)),
             (w.z >> BITS) | (w.w << (32u - BITS)), w.w >> BITS);
+    }
+    static words shift_by(words w, uint s) {
+        return uint4(funnel(w.x, w.y, s), funnel(w.y, w.z, s), funnel(w.z, w.w, s), w.w >> s);
     }
     static uint low(words w) { return w.x; }
     template <uint BITS>
@@ -701,31 +928,45 @@ struct Run<4> {
 };
 
 // Hierarchical coefficients: per GROUP values a LOCAL_BITS-bit scale code
-// (and with MIN a minimum code after it), interpreted by `L`, under a factor
-// `FS` (and a minimum factor) per FACTOR_GROUP values: scale = factor
-// 2^(EXPONENT + CODE_EXPONENT) L(scale code) and bias = BIAS_SIGN minimum
-// factor 2^EXPONENT L(minimum code). A packet's codes are one `field` of
-// `field_bits`, in the scales plane, where each factor group's fields fill
-// whole words, or, where CARRIED_BIT is not 0, bit j of a group's code at
-// bit CARRIED_BIT of its entry j.
-template <typename FS, uint FACTOR_GROUP, int EXPONENT, int CODE_EXPONENT, uint LOCAL_BITS, typename L,
-    uint GROUP, bool MIN, int BIAS_SIGN, uint CARRIED_BIT>
+// (and with MIN a minimum code after it, or with SIGNED a sign bit),
+// interpreted by `L`, under a factor `FS` (and a minimum factor) per
+// FACTOR_GROUP values: scale = factor 2^(EXPONENT + CODE_EXPONENT) L(scale
+// code) and bias = BIAS_SIGN minimum factor 2^EXPONENT L(minimum code), or
+// with SIGNED the scale times 2^SIGNED_EXPONENT, negated with the sign bit
+// set, a group's codes a WIDTH-bit field (`COEFF_FIELD_BITS`,
+// `LocalBias::field_bits`). A packet's codes are one `field` of `field_bits`, in the scales plane,
+// where factor groups' fields follow one another (a factor group's need not
+// fill whole words), or, where CARRIED_BIT is not 0, bit j of a group's field
+// at bit CARRIED_BIT of its entry j.
+template <typename FS, uint FACTOR_GROUP, int EXPONENT, int CODE_EXPONENT, uint LOCAL_BITS, uint WIDTH,
+    typename L, uint GROUP, bool MIN, int BIAS_SIGN, uint CARRIED_BIT, bool SIGNED = false, int SIGNED_EXPONENT = 0>
 struct Hier {
     static_assert(GROUP == 16u || GROUP == 32u, "a packet's hierarchical coefficients are two or one");
+    static_assert(!(MIN && SIGNED), "a group's bias is a minimum or signed");
     // Whether its entries carry its local codes (at bit CARRIED_BIT).
     static constant constexpr bool carries = CARRIED_BIT != 0u;
-    static_assert(!carries || (!MIN && LOCAL_BITS <= GROUP / 8u), "a group's entries carry its scale code");
     static constant constexpr uint groups = 32u / GROUP;
-    static constant constexpr bool biased = MIN;
+    static constant constexpr bool biased = MIN || SIGNED;
+    // A signed bias's magnitude over its group's scale (0 without one).
+    static constant constexpr float signed_scale = SIGNED ? power2<SIGNED_EXPONENT>() : 0.0f;
     typedef Coefficients<groups, biased> coefficients;
-    static constant constexpr uint width = LOCAL_BITS * (MIN ? 2u : 1u);
+    static constant constexpr uint width = WIDTH;
+    static_assert(!carries || (!MIN && width <= GROUP / 8u), "a group's entries carry its field");
     static constant constexpr uint field_bits = width * groups;
     static_assert(field_bits < 32u, "a packet's field is below a word: a run shifts by it");
-    // Packets a factor group, and the whole words of its fields in the
-    // scales plane (none when its entries carry them).
+    // Packets a factor group, the bits of its fields in the scales plane
+    // (`span`), and the words a factor group's fields are read in (none when
+    // its entries carry them). Where the span fills whole words a row's
+    // share of the plane is whole words, and so are a factor group's
+    // fields; otherwise they start at a multiple of the span's lowest set
+    // bit (at most 8) within a byte of a share that need not start a word,
+    // so they are read as the `bytes` they reach, 8 less that bit past the
+    // span.
     static constant constexpr uint packets = FACTOR_GROUP / 32u;
-    static constant constexpr uint words = carries ? 0u : packets * field_bits / 32u;
-    static_assert(carries || packets * field_bits % 32u == 0, "a factor group's fields fill whole words");
+    static constant constexpr uint span = packets * field_bits;
+    static constant constexpr uint lead = (span & (0u - span)) < 8u ? (span & (0u - span)) : 8u;
+    static constant constexpr uint bytes = (span + 8u - lead + 7u) / 8u;
+    static constant constexpr uint words = carries ? 0u : (bytes + 3u) / 4u;
     // A factor group's factors, as the coefficients of one group: the scale
     // factor 2^(EXPONENT + CODE_EXPONENT) (`scale(0)`) and, MIN, the BIAS_SIGN
     // minimum factor 2^EXPONENT (`bias(0)`).
@@ -744,6 +985,12 @@ struct Hier {
     }
     // Group g's scale code and minimum code in a packet's field.
     static uint scale_code(uint field, uint g) { return (field >> (g * width)) & ((1u << LOCAL_BITS) - 1u); }
+    // Group g's bias sign in a packet's field (SIGNED): its scale, negated
+    // with the sign bit set, times 2^SIGNED_EXPONENT.
+    static float signed_bias(uint field, uint g, float scale) {
+        const float bias = scale * power2<SIGNED_EXPONENT>();
+        return ((field >> (g * width + LOCAL_BITS)) & 1u) != 0u ? -bias : bias;
+    }
     static uint min_code(uint field, uint g) {
         return (field >> (g * width + LOCAL_BITS)) & ((1u << LOCAL_BITS) - 1u);
     }
@@ -758,6 +1005,11 @@ struct Hier {
                 scale[g] = factor.scale(0) * codes.x;
                 bias[g] = factor.bias(0) * codes.y;
             }
+        } else if (SIGNED) {
+            for (uint g = 0; g < groups; ++g) {
+                scale[g] = factor.scale(0) * L::value(scale_code(field, g));
+                bias[g] = signed_bias(field, g, scale[g]);
+            }
         } else if (groups == 2) {
             scale = factor.scale(0) * L::adjacent(field);
         } else {
@@ -770,13 +1022,13 @@ struct Hier {
     static uint carried(thread const typename P::words &w) {
         uint field = 0u;
         for (uint g = 0; g < groups; ++g)
-            for (uint j = 0; j < LOCAL_BITS; ++j)
+            for (uint j = 0; j < width; ++j)
                 field |= ((P::entry(w, g * (GROUP / 8u) + j) >> CARRIED_BIT) & 1u) << (g * width + j);
         return field;
     }
     // A packet's field: carried by its entries `w` (`P`) or in the scales
-    // plane, where factor groups' fields fill whole words one after
-    // another, so packet p's is at bit `field_bits` p of the row's share.
+    // plane, where factor groups' fields follow one another, so packet p's
+    // is at bit `field_bits` p of the row's share.
     template <typename P>
     static uint field(device const uchar *row, Rows16 layout, uint p, thread const typename P::words &w) {
         if constexpr (carries)
@@ -792,10 +1044,22 @@ struct Hier {
     // A run over a factor group's packets from packet p on: its fields from
     // packet p's lowest (no words when its entries carry them), and its factors. `next` takes
     // the next packet's field. `group_fields` are factor group f's fields
-    // whole, packet b's `field_of` them.
+    // whole (shifted to bit 0 where they do not start a word), packet b's
+    // `field_of` them.
     typedef Run<words> fields;
     static typename fields::words group_fields(device const uchar *row, Rows16 layout, uint f) {
-        return fields::load(layout.scale_at(row, ulong(f) * (4u * words)));
+        if constexpr (span % 32u == 0u) {
+            return fields::load(layout.scale_at(row, ulong(f) * (4u * words)));
+        } else {
+            const uint bit = f * span;
+            device const uchar *at = layout.scale_at(row, ulong(bit >> 3));
+            uint w[words];
+            for (uint i = 0; i < words; ++i)
+                w[i] = 0u;
+            for (uint i = 0; i < bytes; ++i)
+                w[i / 4u] |= uint(at[i]) << (8u * (i % 4u));
+            return fields::shift_by(fields::of(w), bit & 7u);
+        }
     }
     static uint field_of(typename fields::words w, uint b) { return fields::template field<field_bits>(w, b); }
     struct run {
@@ -826,8 +1090,22 @@ struct Hier {
     }
 };
 
-// A decoder of codes in planes `P` interpreted by `C` under coefficients `K`.
-template <typename P, typename C, typename K>
+// How the token-packing projection forms read a decoder's codes
+// (`registry::DecodeAxes::packing`, emitted as `_PACKING_RUN`,
+// `_PACKING_CENTRE`, `_PACKING_MAGNITUDE` and `_PACKING_RESIDUE`): a
+// 32-column block is runs of RUN columns under one scale each (RUN 0: the
+// forms do not read the codes), its codes centred at the value CENTRE and
+// at most MAGNITUDE from it, and with RESIDUE (codes of 8-bit values) their
+// sums take residue bits.
+template <uint RUN, uint CENTRE, uint MAGNITUDE, bool RESIDUE>
+struct Packing {
+    static constant constexpr uint run = RUN, centre = CENTRE, magnitude = MAGNITUDE;
+    static constant constexpr bool residue = RESIDUE;
+};
+
+// A decoder of codes in planes `P` interpreted by `C` under coefficients `K`,
+// which the packed forms read as `G` (a `Packing`).
+template <typename P, typename C, typename K, typename G>
 struct Packet {
     static constant constexpr uint groups = K::groups;
     struct packet {
@@ -964,11 +1242,14 @@ struct Block {
 };
 
 template <typename P, typename C, typename FS, uint FACTOR_GROUP, int EXPONENT, int CODE_EXPONENT, uint LOCAL_BITS,
-    typename L, uint GROUP, bool MIN, int BIAS_SIGN, uint CARRIED_BIT>
+    uint WIDTH, typename L, uint GROUP, bool MIN, int BIAS_SIGN, uint CARRIED_BIT, bool SIGNED, int SIGNED_EXPONENT,
+    typename G>
 struct Block<Packet<P, C,
-    Hier<FS, FACTOR_GROUP, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, CARRIED_BIT>>> {
-    typedef Hier<FS, FACTOR_GROUP, EXPONENT, CODE_EXPONENT, LOCAL_BITS, L, GROUP, MIN, BIAS_SIGN, CARRIED_BIT> K;
-    typedef Packet<P, C, K> W;
+    Hier<FS, FACTOR_GROUP, EXPONENT, CODE_EXPONENT, LOCAL_BITS, WIDTH, L, GROUP, MIN, BIAS_SIGN, CARRIED_BIT, SIGNED,
+        SIGNED_EXPONENT>, G>> {
+    typedef Hier<FS, FACTOR_GROUP, EXPONENT, CODE_EXPONENT, LOCAL_BITS, WIDTH, L, GROUP, MIN, BIAS_SIGN, CARRIED_BIT, SIGNED,
+        SIGNED_EXPONENT> K;
+    typedef Packet<P, C, K, G> W;
     static constant constexpr uint packets = K::packets;
     typedef typename K::run state;
     static state load(device const uchar *row, Rows16 layout, uint p) { return K::start(row, layout, p); }
@@ -996,34 +1277,33 @@ struct PlanesOf {
 };
 template <uint LOW, uint HIGH>
 struct PlanesOf<SEISMIC_CODES_GRID, LOW, HIGH> {
-    static_assert(HIGH == 0, "grid entries are one plane");
-    typedef Entries<LOW / 8u> type;
+    typedef Entries<LOW / 8u, HIGH> type;
 };
 
 // The interpretation of BITS-bit codes.
-template <uint CODES, uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES>
+template <uint CODES, uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES, uint SIGNS, uint DELTA_BIT, uint DELTA>
 struct InterpretationOf;
-template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES>
-struct InterpretationOf<SEISMIC_CODES_UNSIGNED, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES> {
+template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES, uint SIGNS, uint DELTA_BIT, uint DELTA>
+struct InterpretationOf<SEISMIC_CODES_UNSIGNED, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES, SIGNS, DELTA_BIT, DELTA> {
     typedef Unsigned type;
 };
-template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES>
-struct InterpretationOf<SEISMIC_CODES_OFFSET, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES> {
+template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES, uint SIGNS, uint DELTA_BIT, uint DELTA>
+struct InterpretationOf<SEISMIC_CODES_OFFSET, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES, SIGNS, DELTA_BIT, DELTA> {
     typedef Offset<OFFSET> type;
 };
-template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES>
-struct InterpretationOf<SEISMIC_CODES_TWOS, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES> {
+template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES, uint SIGNS, uint DELTA_BIT, uint DELTA>
+struct InterpretationOf<SEISMIC_CODES_TWOS, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES, SIGNS, DELTA_BIT, DELTA> {
     static_assert(BITS == 8, "two's complement codes are bytes");
     typedef Twos type;
 };
-template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES>
-struct InterpretationOf<SEISMIC_CODES_TABLE, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES> {
-    static_assert(BITS == 4, "codebook codes are nibbles");
+template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES, uint SIGNS, uint DELTA_BIT, uint DELTA>
+struct InterpretationOf<SEISMIC_CODES_TABLE, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES, SIGNS, DELTA_BIT, DELTA> {
+    static_assert(BITS <= 4, "codebook codes are at most nibbles");
     typedef Table<TABLE> type;
 };
-template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES>
-struct InterpretationOf<SEISMIC_CODES_GRID, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES> {
-    typedef Grid<GRID, INDEX_BITS, LANES> type;
+template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES, uint SIGNS, uint DELTA_BIT, uint DELTA>
+struct InterpretationOf<SEISMIC_CODES_GRID, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES, SIGNS, DELTA_BIT, DELTA> {
+    typedef Grid<GRID, INDEX_BITS, LANES, SIGNS, DELTA_BIT, DELTA> type;
 };
 
 template <uint SCALE>
@@ -1042,23 +1322,31 @@ template <uint BITS, int OFFSET> struct LocalOf<SEISMIC_CODES_OFFSET, BITS, OFFS
 template <uint BITS, int OFFSET> struct LocalOf<SEISMIC_CODES_ODD, BITS, OFFSET> { typedef LocalOdd<BITS> type; };
 
 // The coefficients of codes CODES (whose entries carry the local codes at
-// bit CARRIED_BIT, where it is not 0).
+// bit CARRIED_BIT, where it is not 0), whose bias is of kind BIAS
+// (`SEISMIC_BIAS_*`, 0 for none).
 template <uint COEFF, uint CODES, uint SCALE, uint BIAS, int BIAS_SIGN, uint GROUP, uint STORAGE, uint FACTOR_GROUP,
-    int EXPONENT, int CODE_EXPONENT, uint LOCAL_BITS, uint LOCAL, int LOCAL_OFFSET, uint CARRIED_BIT>
+    int EXPONENT, int CODE_EXPONENT, uint LOCAL_BITS, uint FIELD_BITS, uint LOCAL, int LOCAL_OFFSET, uint CARRIED_BIT,
+    int SIGNED_EXPONENT>
 struct CoefficientsOf;
 template <uint CODES, uint SCALE, uint BIAS, int BIAS_SIGN, uint GROUP, uint STORAGE, uint FACTOR_GROUP, int EXPONENT,
-    int CODE_EXPONENT, uint LOCAL_BITS, uint LOCAL, int LOCAL_OFFSET, uint CARRIED_BIT>
+    int CODE_EXPONENT, uint LOCAL_BITS, uint FIELD_BITS, uint LOCAL, int LOCAL_OFFSET, uint CARRIED_BIT,
+    int SIGNED_EXPONENT>
 struct CoefficientsOf<SEISMIC_COEFF_DIRECT, CODES, SCALE, BIAS, BIAS_SIGN, GROUP, STORAGE, FACTOR_GROUP, EXPONENT,
-    CODE_EXPONENT, LOCAL_BITS, LOCAL, LOCAL_OFFSET, CARRIED_BIT> {
-    typedef Direct<typename ScaleOf<SCALE>::type, GROUP, BIAS != 0, STORAGE, CODE_EXPONENT> type;
+    CODE_EXPONENT, LOCAL_BITS, FIELD_BITS, LOCAL, LOCAL_OFFSET, CARRIED_BIT, SIGNED_EXPONENT> {
+    static_assert(BIAS == 0 || BIAS == SEISMIC_BIAS_STORED, "a direct coefficient's bias is stored");
+    typedef Direct<typename ScaleOf<SCALE>::type, GROUP, BIAS == SEISMIC_BIAS_STORED, STORAGE, CODE_EXPONENT> type;
 };
 template <uint CODES, uint SCALE, uint BIAS, int BIAS_SIGN, uint GROUP, uint STORAGE, uint FACTOR_GROUP, int EXPONENT,
-    int CODE_EXPONENT, uint LOCAL_BITS, uint LOCAL, int LOCAL_OFFSET, uint CARRIED_BIT>
+    int CODE_EXPONENT, uint LOCAL_BITS, uint FIELD_BITS, uint LOCAL, int LOCAL_OFFSET, uint CARRIED_BIT,
+    int SIGNED_EXPONENT>
 struct CoefficientsOf<SEISMIC_COEFF_HIER, CODES, SCALE, BIAS, BIAS_SIGN, GROUP, STORAGE, FACTOR_GROUP, EXPONENT,
-    CODE_EXPONENT, LOCAL_BITS, LOCAL, LOCAL_OFFSET, CARRIED_BIT> {
+    CODE_EXPONENT, LOCAL_BITS, FIELD_BITS, LOCAL, LOCAL_OFFSET, CARRIED_BIT, SIGNED_EXPONENT> {
+    static_assert(BIAS == 0 || BIAS == SEISMIC_BIAS_MINIMUM || BIAS == SEISMIC_BIAS_SIGNED,
+        "a hierarchical group's bias is a minimum code or a sign bit");
     static_assert(CARRIED_BIT == 0 || CODES == SEISMIC_CODES_GRID, "grid entries carry scale codes");
-    typedef Hier<typename ScaleOf<SCALE>::type, FACTOR_GROUP, EXPONENT, CODE_EXPONENT, LOCAL_BITS,
-        typename LocalOf<LOCAL, LOCAL_BITS, LOCAL_OFFSET>::type, GROUP, BIAS != 0, BIAS_SIGN, CARRIED_BIT> type;
+    typedef Hier<typename ScaleOf<SCALE>::type, FACTOR_GROUP, EXPONENT, CODE_EXPONENT, LOCAL_BITS, FIELD_BITS,
+        typename LocalOf<LOCAL, LOCAL_BITS, LOCAL_OFFSET>::type, GROUP, BIAS == SEISMIC_BIAS_MINIMUM, BIAS_SIGN,
+        CARRIED_BIT, BIAS == SEISMIC_BIAS_SIGNED, SIGNED_EXPONENT> type;
 };
 
 } // namespace packets
@@ -1071,13 +1359,17 @@ struct CoefficientsOf<SEISMIC_COEFF_HIER, CODES, SCALE, BIAS, BIAS_SIGN, GROUP, 
     packets::Packet<                                                                                            \
         packets::PlanesOf<ELEMENT_CAT(P, _CODES), ELEMENT_CAT(P, _CODE_LOW_BITS), ELEMENT_CAT(P, _CODE_HIGH_BITS)>::type, \
         packets::InterpretationOf<ELEMENT_CAT(P, _CODES), ELEMENT_CAT(P, _CODE_LOW_BITS) + ELEMENT_CAT(P, _CODE_HIGH_BITS), \
-            ELEMENT_CAT(P, _CODES_OFFSET), ELEMENT_CAT(P, _CODES_TABLE), ELEMENT_CAT(P, _CODES_GRID), ELEMENT_CAT(P, _CODES_GRID_INDEX_BITS), ELEMENT_CAT(P, _CODES_GRID_LANES)>::type, \
+            ELEMENT_CAT(P, _CODES_OFFSET), ELEMENT_CAT(P, _CODES_TABLE), ELEMENT_CAT(P, _CODES_GRID), ELEMENT_CAT(P, _CODES_GRID_INDEX_BITS), ELEMENT_CAT(P, _CODES_GRID_LANES), \
+            ELEMENT_CAT(P, _CODES_GRID_SIGNS), ELEMENT_CAT(P, _CODES_GRID_DELTA_BIT), ELEMENT_CAT(P, _CODES_GRID_DELTA)>::type, \
         packets::CoefficientsOf<ELEMENT_CAT(P, _COEFF), ELEMENT_CAT(P, _CODES), ELEMENT_CAT(P, _COEFF_SCALE),         \
             ELEMENT_CAT(P, _COEFF_BIAS), ELEMENT_CAT(P, _COEFF_BIAS_SIGN), ELEMENT_CAT(P, _COEFF_GROUP),            \
             ELEMENT_CAT(P, _LOGICAL_GROUP),                                                                     \
             ELEMENT_CAT(P, _COEFF_FACTOR_GROUP), ELEMENT_CAT(P, _COEFF_EXPONENT), ELEMENT_CAT(P, _CODES_EXPONENT),     \
-            ELEMENT_CAT(P, _COEFF_LOCAL_BITS), ELEMENT_CAT(P, _COEFF_LOCAL), ELEMENT_CAT(P, _COEFF_LOCAL_OFFSET),      \
-            ELEMENT_CAT(P, _COEFF_CARRIED)>::type>
+            ELEMENT_CAT(P, _COEFF_LOCAL_BITS), ELEMENT_CAT(P, _COEFF_FIELD_BITS), ELEMENT_CAT(P, _COEFF_LOCAL),       \
+            ELEMENT_CAT(P, _COEFF_LOCAL_OFFSET),                                                                \
+            ELEMENT_CAT(P, _COEFF_CARRIED), ELEMENT_CAT(P, _COEFF_SIGNED_EXPONENT)>::type,                          \
+        packets::Packing<ELEMENT_CAT(P, _PACKING_RUN), ELEMENT_CAT(P, _PACKING_CENTRE),                       \
+            ELEMENT_CAT(P, _PACKING_MAGNITUDE), ELEMENT_CAT(P, _PACKING_RESIDUE) != 0>>
 #define PACKETS_ROWS(P)                                                                                \
     packets::Rows16 { ELEMENT_CAT(P, _ROW_STRIDE_BYTES), ELEMENT_CAT(P, _ROW_CODES), ELEMENT_CAT(P, _ROW_HIGH), \
         ELEMENT_CAT(P, _ROW_SCALES), ELEMENT_CAT(P, _ROW_SUPERS), ELEMENT_CAT(P, _TILE_ROWS), 0,            \

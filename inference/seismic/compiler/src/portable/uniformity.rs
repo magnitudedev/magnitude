@@ -31,7 +31,8 @@ fn scalar_failure_scope(recipe: &seismic_lang::reference_math::ReferenceRecipe, 
             N::Not { value }
             | N::Bits { value }
             | N::FromBits { value, .. }
-            | N::Resize { value, .. } => get(value),
+            | N::Resize { value, .. }
+            | N::Lookup { index: value, .. } => get(value),
             N::Select { condition, yes, no } => all([get(condition), get(yes), get(no)]),
         });
     }

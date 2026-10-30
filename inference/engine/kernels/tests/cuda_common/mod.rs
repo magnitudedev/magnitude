@@ -3,7 +3,8 @@
 //! RMS/projection host models, mappings and tolerance checks.
 #![allow(dead_code)]
 
-use seismic::{BackendName, Device, Element, Layout, Tensor};
+use magnitude_ggml::Encoding;
+use seismic::{BackendName, Device, Element, Layout, OperandRecipe, Tensor};
 use seismic_lang::registry::{bf16_round, f16_bits};
 
 pub fn cuda() -> Option<Device> {
@@ -37,10 +38,12 @@ pub enum Format {
     Q5K,
     Q6K,
     Q8,
-    /// GGUF IQ4_XS, resident as iq4g32.
+    /// GGUF IQ4_XS, resident as iq4xs.
     Iq4,
-    /// GGUF Q4_0, Q5_0, Q5_1, MXFP4, NVFP4 (representations of their own).
+    /// GGUF Q4_0, Q4_1, Q5_0, Q5_1, MXFP4, NVFP4 (representations of their
+    /// own).
     Q4_0,
+    Q4_1,
     Q5_0,
     Q5_1,
     Mxfp4,
@@ -53,16 +56,35 @@ pub enum Format {
     Iq2Xs,
     Iq3Xxs,
     Iq2Xxs,
+    /// GGUF Q2_K, resident as q2k.
+    Q2K,
+    /// GGUF Q3_K, resident as q3k.
+    Q3K,
+    /// GGUF IQ2_S, resident as iq2s (vector codes with a high part).
+    Iq2S,
+    /// GGUF IQ3_S, resident as iq3s (vector codes with a high part).
+    Iq3S,
+    /// GGUF IQ1_S and IQ1_M (vector codes of signed points, representations
+    /// of their own).
+    Iq1S,
+    Iq1M,
+    /// GGUF Q1_0, TQ2_0 and TQ1_0, resident as q1g128 and q2g256.
+    Q1_0,
+    Tq2_0,
+    Tq1_0,
+    /// GGUF IQ4_NL, resident as iq4g32s.
+    Iq4Nl,
 }
 
 impl Format {
-    pub const ALL: [Format; 14] = [
+    pub const ALL: [Format; 25] = [
         Format::Q4K,
         Format::Q5K,
         Format::Q6K,
         Format::Q8,
         Format::Iq4,
         Format::Q4_0,
+        Format::Q4_1,
         Format::Q5_0,
         Format::Q5_1,
         Format::Mxfp4,
@@ -71,41 +93,82 @@ impl Format {
         Format::Iq2Xs,
         Format::Iq3Xxs,
         Format::Iq2Xxs,
+        Format::Q2K,
+        Format::Q3K,
+        Format::Iq2S,
+        Format::Iq3S,
+        Format::Iq1S,
+        Format::Iq1M,
+        Format::Q1_0,
+        Format::Tq2_0,
+        Format::Tq1_0,
+        Format::Iq4Nl,
     ];
-    pub fn external(self) -> &'static str {
+    /// The GGUF encoding the format's blocks are.
+    pub fn encoding(self) -> Encoding {
         match self {
-            Format::Q4K => "gguf_q4_k",
-            Format::Q5K => "gguf_q5_k",
-            Format::Q6K => "gguf_q6_k",
-            Format::Q8 => "gguf_q8_0",
-            Format::Iq4 => "gguf_iq4_xs",
-            Format::Q4_0 => "gguf_q4_0",
-            Format::Q5_0 => "gguf_q5_0",
-            Format::Q5_1 => "gguf_q5_1",
-            Format::Mxfp4 => "gguf_mxfp4",
-            Format::Nvfp4 | Format::Nvfp4A4 => "gguf_nvfp4",
-            Format::Iq2Xs => "gguf_iq2_xs",
-            Format::Iq3Xxs => "gguf_iq3_xxs",
-            Format::Iq2Xxs => "gguf_iq2_xxs",
+            Format::Q4K => Encoding::Q4K,
+            Format::Q5K => Encoding::Q5K,
+            Format::Q6K => Encoding::Q6K,
+            Format::Q8 => Encoding::Q8_0,
+            Format::Iq4 => Encoding::Iq4Xs,
+            Format::Q4_0 => Encoding::Q4_0,
+            Format::Q4_1 => Encoding::Q4_1,
+            Format::Q5_0 => Encoding::Q5_0,
+            Format::Q5_1 => Encoding::Q5_1,
+            Format::Mxfp4 => Encoding::Mxfp4,
+            Format::Nvfp4 | Format::Nvfp4A4 => Encoding::Nvfp4,
+            Format::Iq2Xs => Encoding::Iq2Xs,
+            Format::Iq3Xxs => Encoding::Iq3Xxs,
+            Format::Iq2Xxs => Encoding::Iq2Xxs,
+            Format::Q2K => Encoding::Q2K,
+            Format::Q3K => Encoding::Q3K,
+            Format::Iq2S => Encoding::Iq2S,
+            Format::Iq3S => Encoding::Iq3S,
+            Format::Iq1S => Encoding::Iq1S,
+            Format::Iq1M => Encoding::Iq1M,
+            Format::Q1_0 => Encoding::Q1_0,
+            Format::Tq2_0 => Encoding::Tq2_0,
+            Format::Tq1_0 => Encoding::Tq1_0,
+            Format::Iq4Nl => Encoding::Iq4Nl,
         }
     }
-    pub fn representation(self) -> &'static str {
+    /// The format of every encoding the registry has a GGUF source of, in
+    /// `Encoding` order: every form GGUF weights load as.
+    pub fn imported() -> Vec<Format> {
+        Encoding::ALL
+            .into_iter()
+            .filter(|encoding| Element::gguf_source(*encoding).is_some())
+            .map(|encoding| {
+                Format::of(encoding).unwrap_or_else(|| panic!("no test format of {encoding:?}"))
+            })
+            .collect()
+    }
+    /// The format of `encoding`'s blocks for rounded activations.
+    pub fn of(encoding: Encoding) -> Option<Format> {
+        Format::ALL.into_iter().find(|format| {
+            format.encoding() == encoding && format.operands() == OperandRecipe::Rounded
+        })
+    }
+    /// The activation operands the format's products take.
+    pub fn operands(self) -> OperandRecipe {
         match self {
-            Format::Q4K => "q4k",
-            Format::Q5K => "q5k",
-            Format::Q6K => "q6k",
-            Format::Q8 => "q8g32s",
-            Format::Iq4 => "iq4g32",
-            Format::Q4_0 => "q4g32s",
-            Format::Q5_0 => "q5g32s",
-            Format::Q5_1 => "q5g32",
-            Format::Mxfp4 => "mxfp4g32",
-            Format::Nvfp4 => "nvfp4g16",
-            Format::Nvfp4A4 => "nvfp4g16a4",
-            Format::Iq2Xs => "iq2xs",
-            Format::Iq3Xxs => "iq3xxs",
-            Format::Iq2Xxs => "iq2xxs",
+            Format::Nvfp4A4 => OperandRecipe::Nvfp4Rows,
+            _ => OperandRecipe::Rounded,
         }
+    }
+    fn source(self) -> Element {
+        Element::gguf_source(self.encoding()).expect("a registered GGUF source")
+    }
+    pub fn external(self) -> &'static str {
+        self.source().name()
+    }
+    /// The packet-form storage the format's registered conversion writes.
+    pub fn representation(self) -> &'static str {
+        self.source()
+            .converted(Layout::Packet, self.operands())
+            .expect("a registered conversion")
+            .name()
     }
     /// Whether the CUDA GEMM keeps this format's codes exact and scales its
     /// F32 partial products (`SCALED_GEMM`): its weights are never rounded
@@ -114,6 +177,7 @@ impl Format {
         matches!(
             self,
             Format::Q4_0
+                | Format::Q4_1
                 | Format::Q5_0
                 | Format::Q5_1
                 | Format::Mxfp4
@@ -122,10 +186,18 @@ impl Format {
                 | Format::Iq2Xs
                 | Format::Iq3Xxs
                 | Format::Iq2Xxs
+                | Format::Iq2S
+                | Format::Iq3S
+                | Format::Iq1S
+                | Format::Iq1M
+                | Format::Q1_0
+                | Format::Iq4Nl
         )
     }
     pub fn resident(self) -> Element {
-        Element::stored(self.representation(), Layout::Mma16).unwrap()
+        self.source()
+            .converted(Layout::Mma16, self.operands())
+            .expect("a registered conversion")
     }
     /// One random GGUF block (with small positive super factors).
     pub fn block(self, rng: &mut Rng) -> Vec<u8> {
@@ -159,6 +231,11 @@ impl Format {
             }
             Format::Q4_0 => {
                 block.extend(f16(rng.uniform(0.0005, 0.003)));
+                block.extend((0..16).map(|_| rng.byte()));
+            }
+            Format::Q4_1 => {
+                block.extend(f16(rng.uniform(0.0005, 0.003)));
+                block.extend(f16(-rng.uniform(0.005, 0.02)));
                 block.extend((0..16).map(|_| rng.byte()));
             }
             Format::Q5_0 => {
@@ -198,15 +275,73 @@ impl Format {
                 block.extend(f16(rng.uniform(0.0002, 0.001)));
                 block.extend((0..64).map(|_| rng.byte()));
             }
+            Format::Q2K => {
+                // Scale and minimum nibbles, codes, then d and dmin.
+                block.extend((0..16 + 64).map(|_| rng.byte()));
+                block.extend(f16(rng.uniform(0.0005, 0.003)));
+                block.extend(f16(rng.uniform(0.0, 0.002)));
+            }
+            Format::Q3K => {
+                // High bits, low codes and scale bytes, then d (values
+                // reach d * 32 * 4).
+                block.extend((0..32 + 64 + 12).map(|_| rng.byte()));
+                block.extend(f16(rng.uniform(0.0001, 0.0005)));
+            }
+            Format::Iq2S => {
+                // d (values reach d * 31 * 43 / 8), 32 low index bytes, 32
+                // sign bytes, eight high index bytes, eight scale bytes.
+                block.extend(f16(rng.uniform(0.0002, 0.001)));
+                block.extend((0..64 + 8 + 8).map(|_| rng.byte()));
+            }
+            Format::Iq3S => {
+                // d (values reach d * 31 * 15), low grid indices, their high
+                // bits, signs and scale nibbles.
+                block.extend(f16(rng.uniform(0.00005, 0.0003)));
+                block.extend((0..64 + 8 + 32 + 4).map(|_| rng.byte()));
+            }
+            Format::Iq1S => {
+                // d (values reach d * 15 * 9 / 8), 32 low index bytes, eight
+                // high-index, scale and sign words.
+                block.extend(f16(rng.uniform(0.001, 0.005)));
+                block.extend((0..32 + 16).map(|_| rng.byte()));
+            }
+            Format::Iq1M => {
+                // 32 low index bytes, 16 high-index and delta bytes, then four
+                // scale words whose top nibbles are d (values reach
+                // d * 15 * 9 / 8).
+                block.extend((0..32 + 16 + 8).map(|_| rng.byte()));
+                let d = f16_bits(rng.uniform(0.001, 0.005));
+                for word in 0..4 {
+                    let at = 48 + 2 * word + 1;
+                    block[at] = (block[at] & 0x0f) | (((d >> (4 * word)) as u8 & 0x0f) << 4);
+                }
+            }
+            Format::Q1_0 => {
+                // d (values are ±d), then 128 code bits.
+                block.extend(f16(rng.uniform(0.0005, 0.003)));
+                block.extend((0..16).map(|_| rng.byte()));
+            }
+            Format::Tq2_0 => {
+                // 256 2-bit codes (values reach 2 d), then d.
+                block.extend((0..64).map(|_| rng.byte()));
+                block.extend(f16(rng.uniform(0.0005, 0.003)));
+            }
+            Format::Tq1_0 => {
+                // 256 base-3 digits, five a byte and four of the last four
+                // (values reach d), then d.
+                block.extend((0..48 + 4).map(|_| rng.byte()));
+                block.extend(f16(rng.uniform(0.0005, 0.003)));
+            }
+            Format::Iq4Nl => {
+                // d (values reach d * 127), then 32 table codes.
+                block.extend(f16(rng.uniform(0.00005, 0.0003)));
+                block.extend((0..16).map(|_| rng.byte()));
+            }
         }
         block
     }
     pub fn block_values(self) -> usize {
-        match self {
-            Format::Q8 | Format::Q4_0 | Format::Q5_0 | Format::Q5_1 | Format::Mxfp4 => 32,
-            Format::Nvfp4 | Format::Nvfp4A4 => 64,
-            _ => 256,
-        }
+        self.encoding().block_elements() as usize
     }
 }
 
@@ -463,6 +598,19 @@ pub fn mappings(m: usize) -> &'static [Mapping] {
     } else {
         &GEMM_MAPPINGS
     }
+}
+
+/// The mappings set `set` of `sets` runs at M: a native program is compiled
+/// per set and mapping, so the sets share the mappings (set i runs the
+/// mappings j = i mod the sets, to the mappings' count), and every set and
+/// every mapping is checked.
+pub fn shared_mappings(m: usize, set: usize, sets: usize) -> impl Iterator<Item = Mapping> {
+    let all = mappings(m);
+    let shared = sets.min(all.len());
+    all.iter()
+        .enumerate()
+        .filter(move |(j, _)| j % shared == set % shared)
+        .map(|(_, mapping)| *mapping)
 }
 
 /// q8_1 quantization of rows of `k` as the INT8 path forms them: per 32

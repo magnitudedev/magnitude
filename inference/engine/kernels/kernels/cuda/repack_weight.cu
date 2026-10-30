@@ -50,9 +50,13 @@ typedef unsigned long long u64;
 #define UNITS (GROUP / TILE_COLUMNS)
 static_assert(GROUP % TILE_COLUMNS == 0, "a tile lies in one group");
 
-// A unit's code words: the codes', then the high codes' (`WordSpan`).
-#define CODES_WORDS SEISMIC_CONVERSION_E_U_CODES_UNIT_WORDS
-#define HIGH_WORDS SEISMIC_CONVERSION_E_U_HIGH_UNIT_WORDS
+// A unit's code bytes, the codes' then the high codes' (`WordSpan`), and
+// their record words: a unit is whole words, or part of one (a grid entry's
+// high part).
+#define CODES_UNIT_BYTES SEISMIC_CONVERSION_E_U_CODES_UNIT_BYTES
+#define HIGH_UNIT_BYTES SEISMIC_CONVERSION_E_U_HIGH_UNIT_BYTES
+#define CODES_WORDS ((CODES_UNIT_BYTES + 3u) / 4u)
+#define HIGH_WORDS ((HIGH_UNIT_BYTES + 3u) / 4u)
 #define UNIT_WORDS (CODES_WORDS + HIGH_WORDS)
 #define WORDS SEISMIC_CONVERSION_E_U_WORDS
 
@@ -99,8 +103,8 @@ struct Stage {
     // access is conditional: NVRTC then predicates each access in place, and
     // a batch's loads stay in flight together (with the address under the
     // condition it branches around every access, issuing one load at a time
-    // between its stores: measured against A7, iq3_s 1.09x, q3_k packet
-    // 1.09x its time).
+    // between its stores: measured against A7, 1.09x the time of the
+    // iq3_s and q3_k packet conversions then, into q6k).
     __device__ __forceinline__ u32 load(u32 first, u32 length, u32 unit, int moved, u32 index) const {
         u32 r, k;
         locate(length, unit, index, r, k);
@@ -237,8 +241,8 @@ __device__ __forceinline__ u8 *destination_packet(u8 *destination, const seismic
 // source stage's memory, from staged word 0: its unit's codes, then (at a
 // group's first tile) its fixed words. Only those: a block's shared memory
 // bounds the blocks (one warp each) an SM keeps resident, and staging every
-// record word (iq3_s's 53: 4416 bytes a block) fits 22 blocks in an sm_120
-// SM's 100 KB, of the 32 it would otherwise run.
+// record word (iq3_s's 53 when it converted into q6k: 4416 bytes a block)
+// fits 22 blocks in an sm_120 SM's 100 KB, of the 32 it would otherwise run.
 #define RECORD_STRIDE odd_words(CODES_WORDS > FIXED_WORDS ? CODES_WORDS : FIXED_WORDS)
 
 // Row `lane`'s words [first, first + count) and [second, second + more),
@@ -456,6 +460,22 @@ __device__ __forceinline__ void place_fragments(const Tile &tile, u8 *destinatio
               value, 2 * bits, 2 * bits < 16 ? 2 * bits : 16);
     }
 }
+
+// A grids plane's unit (`unit_bytes` bytes, a constant, of `words`, at the
+// plane at row offset `offset`, `row_bytes` a row) of the lane's row: grid
+// entries and their high parts stay whole, an mma16 tile's sequence being
+// [k-block][row][the k-block's two units] (`PackedRowLayout::code_bit`), so
+// the row's 32 columns (steps `step0`, `step0 + 1`) are one of its k-block's
+// units. Stored in units of `alignment` bytes (its role's).
+__device__ __forceinline__ void place_entries(const Tile &tile, u8 *destination, u32 column0, const u32 *words,
+                                              u32 unit_bytes, u64 offset, u64 row_bytes, u32 alignment) {
+    const seismic_words_t &seismic_words_value = tile.seismic_words_value;
+    const u32 r = tile.lane % MMA_ROWS;
+    const u32 block = column0 / 64, step0 = (column0 % 64) / 16;
+    store(tile_plane_byte(destination, seismic_words_value, tile.b, tile.row0 + tile.lane - r,
+                          (u64(block) * MMA_ROWS + r) * (2 * unit_bytes) + step0 / 2 * unit_bytes, row_bytes, offset),
+          words, unit_bytes, alignment);
+}
 #endif
 
 extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
@@ -487,16 +507,12 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
     tile.fixed_load(loaded);
     tile.unit_record(words);
 #if defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16) && defined(SEISMIC_ELEMENT_U_PLANE_GRIDS)
-    // Grid entries stay whole: an mma16 tile's sequence is
-    // [k-block][row][k-block bytes]; row `r`'s 32 columns (steps `step0`,
-    // `step0 + 1`) are half of its k-block bytes.
+    // Grid entries and their high parts stay whole (`place_entries`).
     if (lane < rows) {
-        const u32 r = lane % MMA_ROWS;
-        const u32 block = column0 / 64, step0 = (column0 % 64) / 16;
-        store(tile_plane_byte(destination, seismic_words_value, b, row0 + lane - r,
-                              (u64(block) * MMA_ROWS + r) * 8 * CODES_WORDS + step0 / 2 * 4 * CODES_WORDS,
-                              SEISMIC_RESULT_0_ROW_CODES_BYTES, SEISMIC_RESULT_0_ROW_CODES),
-              words, 4 * CODES_WORDS, ROLE_ALIGNMENT(CODES));
+        place_entries(tile, destination, column0, words, CODES_UNIT_BYTES, SEISMIC_RESULT_0_ROW_CODES,
+                      SEISMIC_RESULT_0_ROW_CODES_BYTES, ROLE_ALIGNMENT(CODES));
+        place_entries(tile, destination, column0, words + CODES_WORDS, HIGH_UNIT_BYTES, SEISMIC_RESULT_0_ROW_HIGH,
+                      SEISMIC_RESULT_0_ROW_HIGH_BYTES, ROLE_ALIGNMENT(HIGH));
     }
 #elif defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16)
     // The code roles' words of the warp's rows staged, then placed.
@@ -510,10 +526,10 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
 #else
     // The tile's 32 columns of a row are one unit of each code plane.
     if (lane < rows) {
-        store(row + SEISMIC_RESULT_0_ROW_CODES + column0 / TILE_COLUMNS * 4 * CODES_WORDS, words, 4 * CODES_WORDS,
+        store(row + SEISMIC_RESULT_0_ROW_CODES + column0 / TILE_COLUMNS * CODES_UNIT_BYTES, words, CODES_UNIT_BYTES,
               ROLE_ALIGNMENT(CODES));
-        store(row + SEISMIC_RESULT_0_ROW_HIGH + column0 / TILE_COLUMNS * 4 * HIGH_WORDS, words + CODES_WORDS,
-              4 * HIGH_WORDS, ROLE_ALIGNMENT(HIGH));
+        store(row + SEISMIC_RESULT_0_ROW_HIGH + column0 / TILE_COLUMNS * HIGH_UNIT_BYTES, words + CODES_WORDS,
+              HIGH_UNIT_BYTES, ROLE_ALIGNMENT(HIGH));
     }
 #endif
 

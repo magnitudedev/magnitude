@@ -140,6 +140,14 @@ fn plane_value(encoding: &PlaneEncoding, raw: u32) -> f64 {
             }
             CodeInterpretation::Offset(offset) => f64::from(raw) - f64::from(*offset),
             CodeInterpretation::Odd => f64::from(2 * raw + 1),
+            CodeInterpretation::SignedOdd => {
+                let odd = f64::from(2 * (raw & ((1 << (bits - 1)) - 1)) + 1);
+                if raw >> (bits - 1) == 1 {
+                    -odd
+                } else {
+                    odd
+                }
+            }
             CodeInterpretation::Table(codebook) => f64::from(codebook.values[raw as usize]),
             // An entry of vector codes is no one value: it is its raw bits.
             CodeInterpretation::Grid(_) => f64::from(raw),
@@ -991,17 +999,26 @@ const DECODED_EXTENTS: [u64; 2] = [2, 270];
 fn assert_mixed_moves_are_adjacent(stored: &Stored, packets: &[u8], decoded: &[Vec<Vec<f64>>]) {
     let (tallies, observed) = perturb_and_examine(stored, packets, decoded, &dither(41, 0.3, 0.3));
     let name = stored.info.name;
-    let code = &observed[stepping_code_plane(stored.packet())];
+    let plane = stepping_code_plane(stored.packet());
+    let code = &observed[plane];
+    // An unmoved entry is interior only on a lattice of more than two
+    // levels (a 1-bit code's two levels are its top and bottom).
+    let Oracle::Table(levels) = Oracle::plane(&stored.packet().planes[plane].encoding) else {
+        unreachable!("a code plane's lattice is a table")
+    };
     assert!(
-        code.up > 0 && code.down > 0 && code.interior > 0,
+        code.up > 0 && code.down > 0 && (code.interior > 0 || levels.len() == 2),
         "`{name}`: {code:?}"
     );
-    for tally in tallies {
-        assert!(
-            tally.up + tally.down + tally.blocked + tally.off_lattice < tally.values,
-            "`{name}`: every entry drew a move"
-        );
-    }
+    // The dither leaves entries unmoved: over the representation's entries,
+    // since a plane of a few entries (a scale per 256 values) may draw a
+    // move for each.
+    let moved: u64 = tallies
+        .iter()
+        .map(|tally| tally.up + tally.down + tally.blocked + tally.off_lattice)
+        .sum();
+    let values: u64 = tallies.iter().map(|tally| tally.values).sum();
+    assert!(moved < values, "`{name}`: every entry drew a move");
 }
 
 #[test]

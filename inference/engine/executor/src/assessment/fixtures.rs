@@ -6,29 +6,9 @@ use crate::source_element;
 use magnitude_artifacts::gguf::Encoding;
 use magnitude_family_contracts::ScaledActivations;
 
-/// The encodings the synthetic costs measure: every one the fixtures and
-/// the catalog's models hold.
-const FORMATS: [Encoding; 16] = [
-    Encoding::Q8_0,
-    Encoding::Q5K,
-    Encoding::Q6K,
-    Encoding::Q4K,
-    Encoding::Mxfp4,
-    Encoding::Iq4Nl,
-    Encoding::Nvfp4,
-    Encoding::Q5_1,
-    Encoding::Iq2Xs,
-    Encoding::Q4_0,
-    Encoding::Q5_0,
-    Encoding::Iq2Xxs,
-    Encoding::Iq3Xxs,
-    Encoding::Q3K,
-    Encoding::Iq4Xs,
-    Encoding::Iq3S,
-];
-
 /// Synthetic executor costs, each from one sample: 300 GB/s weight
-/// streaming of every format, both storage kinds on device storage's
+/// streaming of every format (the resident element of every artifact
+/// encoding the registry stores), both storage kinds on device storage's
 /// route; 20 TFLOP/s over every format's representation on every backend
 /// (with the dense f32 and bf16); every history layout at 10 µs per call
 /// plus 200 GB/s; 5 µs launches; a 1.2 composition ratio; a 50 µs
@@ -47,14 +27,13 @@ pub(crate) fn costs() -> super::ExecutorCosts {
         .into_iter()
         .flat_map(|backend| {
             let layout = crate::resident_layout(crate::ExecutionPath::Native, backend);
-            FORMATS.iter().flat_map(move |encoding| {
+            Encoding::ALL.iter().flat_map(move |encoding| {
                 [ScaledActivations::Rounded, ScaledActivations::Nvfp4]
                     .into_iter()
                     .filter_map(move |activations| {
                         crate::resident_element(
                             *encoding,
                             activations,
-                            4096,
                             seismic::DType::BF16,
                             layout,
                         )
@@ -277,7 +256,7 @@ pub(crate) fn declared_model(
         } else {
             Encoding::F32
         };
-        let nbytes = source_element(encoding, *shape.last().unwrap())
+        let nbytes = source_element(encoding)
             .unwrap()
             .canonical_byte_len(&shape)
             .unwrap();

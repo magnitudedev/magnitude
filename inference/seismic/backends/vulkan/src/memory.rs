@@ -447,6 +447,39 @@ impl Memory {
         }
     }
 
+    /// Device storage of `bytes` the device holds for its life outside every
+    /// pool and account (its tables buffer): a block of its own, from the
+    /// first of the device kind's types that takes it, measured as driver
+    /// memory with the device's creation. [`Memory::destroy_resident`]
+    /// frees it.
+    pub(crate) fn resident(
+        &self,
+        device: &ash::Device,
+        bytes: u64,
+    ) -> Result<Range, ExecutionError> {
+        let pool = self.pool(StorageKind::Device);
+        let mut failure = None;
+        for candidate in pool.passable.iter().chain([&pool.last]) {
+            match create_block(device, *candidate, bytes, true, None) {
+                Ok(block) => {
+                    return Ok(Range {
+                        kind: StorageKind::Device,
+                        block,
+                        offset: 0,
+                        bytes,
+                    });
+                }
+                Err(error) => failure = Some(error),
+            }
+        }
+        Err(failure.expect("a pool has at least its last type"))
+    }
+
+    /// Free a range of [`Memory::resident`]. The device is idle.
+    pub(crate) fn destroy_resident(&self, device: &ash::Device, range: &Range) {
+        destroy_block(device, &range.block);
+    }
+
     /// Destroy every block. The device is idle and no allocation lives.
     pub(crate) fn destroy(&self, device: &ash::Device) {
         for pool in &self.pools {

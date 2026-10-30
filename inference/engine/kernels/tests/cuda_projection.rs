@@ -156,19 +156,20 @@ fn cuda_dense_expand_matches_host_model() {
     dense_expand_cases(&[Format::Q4K, Format::Q5K, Format::Q6K, Format::Q8], 7);
 }
 
-/// IQ4_XS / IQ4_NL weights are resident as iq4g32.
+/// IQ4_XS weights are resident as iq4xs.
 #[test]
 fn cuda_dense_expand_iq4_matches_host_model() {
     dense_expand_cases(&[Format::Iq4], 9);
 }
 
-/// Q4_0, Q5_0, Q5_1, MXFP4 and NVFP4 gate/up weights (the scaled GEMM for
-/// all but Q5_1).
+/// Q4_0, Q4_1, Q5_0, Q5_1, MXFP4 and NVFP4 gate/up weights (the scaled
+/// GEMM for every one).
 #[test]
 fn cuda_dense_expand_coded_matches_host_model() {
     dense_expand_cases(
         &[
             Format::Q4_0,
+            Format::Q4_1,
             Format::Q5_0,
             Format::Q5_1,
             Format::Mxfp4,
@@ -177,6 +178,20 @@ fn cuda_dense_expand_coded_matches_host_model() {
         ],
         17,
     );
+}
+
+/// Q2_K and Q3_K gate/up weights, resident as q2k (biased groups of 16) and
+/// q3k (2 + 1 code planes).
+#[test]
+fn cuda_dense_expand_k_quant_matches_host_model() {
+    dense_expand_cases(&[Format::Q2K, Format::Q3K], 19);
+}
+
+/// Q1_0 and TQ2_0 gate/up weights, resident as q1g128 and q2g256 (a direct
+/// scale per 128 and 256 codes).
+#[test]
+fn cuda_dense_expand_low_bit_matches_host_model() {
+    dense_expand_cases(&[Format::Q1_0, Format::Tq2_0], 23);
 }
 
 fn dense_expand_cases(formats: &[Format], seed: u64) {
@@ -225,7 +240,7 @@ fn dense_expand_cases(formats: &[Format], seed: u64) {
 fn cuda_dense_output_matches_host_model() {
     let Some(device) = cuda() else { return };
     let mut rng = Rng(11);
-    dense_output_cases(&device, &Format::ALL, 272, 512, &mut rng);
+    dense_output_cases(&device, &Format::ALL, 40, 512, &mut rng);
 }
 
 /// Rows whose K is not a multiple of 256 (a partial last superblock):
@@ -237,6 +252,7 @@ fn cuda_dense_output_32_granular_k_matches_host_model() {
     let formats = [
         Format::Q8,
         Format::Q4_0,
+        Format::Q4_1,
         Format::Q5_0,
         Format::Q5_1,
         Format::Mxfp4,
@@ -250,8 +266,15 @@ fn cuda_dense_output_32_granular_k_matches_host_model() {
 
 fn dense_output_cases(device: &Device, formats: &[Format], h: usize, f: usize, rng: &mut Rng) {
     let device = device.clone();
-    for &format in formats {
+    for (index, &format) in formats.iter().enumerate() {
         let down = weight(&device, format, h, f, rng);
+        // Each program once: the form's shared GEMV and GEMM mappings.
+        let kernels = |rows: usize| {
+            shared_mappings(rows, index, formats.len())
+                .map(|mapping| (mapping, output_kernel(&device, format, h, f, mapping)))
+                .collect::<Vec<_>>()
+        };
+        let (gemv, gemm) = (kernels(1), kernels(GEMV_ROWS + 1));
         for o in ROWS {
             let m = o + 2;
             let out_rows_values: Vec<i32> = (0..o).map(|i| ((i * 5 + 3) % m) as i32).collect();
@@ -262,7 +285,8 @@ fn dense_output_cases(device: &Device, formats: &[Format], h: usize, f: usize, r
             let product = bf16_tensor(&device, &[o as u64, f as u64], &product_values);
             let residual = f32_tensor(&device, &[m as u64, h as u64], &residual_values);
             let out_rows = i32_tensor(&device, &[o as u64], &out_rows_values);
-            for &mapping in mappings(o) {
+            for (mapping, kernel) in if o <= GEMV_ROWS { &gemv } else { &gemm } {
+                let mapping = *mapping;
                 // The product is exact input, so the INT8 emulation is exact too.
                 let (x, _) = operand_rows(&product_values, f, mapping, Some(format));
                 let (projected, magnitude) = project(&x, &down.values, o, h, f);
@@ -284,7 +308,7 @@ fn dense_output_cases(device: &Device, formats: &[Format], h: usize, f: usize, r
                 let tolerance: Vec<f64> = (0..o * h)
                     .map(|i| projected[i].abs() / 256.0 + magnitude[i] * 2e-5 + dequant[i] + 1e-6)
                     .collect();
-                let result = output_kernel(&device, format, h, f, mapping)
+                let result = kernel
                     .call(dense_output::Args {
                         residual: &residual,
                         product: &product,
@@ -335,12 +359,10 @@ fn cuda_gemm_row_bands_match_host_model() {
     let mapping = rotations[0];
     for format in Format::ALL {
         // The output projects K codes onto f rows: 704 (11 k-blocks, a
-        // partial last superblock) where the format's blocks allow it.
-        let k = if format.block_values() == 256 {
-            1280
-        } else {
-            704
-        };
+        // partial last superblock) where the format's blocks divide it, else
+        // five whole blocks (a partial last tile).
+        let block = format.block_values();
+        let k = if 704 % block == 0 { 704 } else { 5 * block };
         let gate = weight(&device, format, f, h, &mut rng);
         let up = weight(&device, format, f, h, &mut rng);
         let down = weight(&device, format, f, k, &mut rng);

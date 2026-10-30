@@ -327,7 +327,7 @@ kernel void attention_project_tall(ATTENTION_PROJECT_ARGUMENTS,
     projection::packing_scratch{packed, token_factors, token_scales,                    \
         weight_factors + ulong(first) * (k / 32u) * 2u, weight_scales + (first)}
 // The shared operand coded for WIDTH residue bits where it has them; its
-// layout (folds, centre, the weights it serves) is every width's.
+// layout (folds, magnitude, the weights it serves) is every width's.
 #define ATTENTION_PROJECT_PACKING_OF(WIDTH)                                             \
     projection::packing_shared<WIDTH, packets::W0, uint(SEISMIC_DIM_Q), packets::W1, uint(SEISMIC_DIM_GR), \
         packets::W2, uint(SEISMIC_DIM_K), packets::W3, uint(SEISMIC_DIM_V)>
@@ -358,7 +358,7 @@ kernel void attention_project_pack(ATTENTION_PROJECT_ARGUMENTS,
         | (SEISMIC_DIM_KB != 0 ? 4u : 0u) | (SEISMIC_DIM_VB != 0 ? 8u : 0u);
     constexpr uint BOUNDS = projection::packing_bounded<SERVED, BOUNDED>::value;
     const projection::packing_bounds<BOUNDS> bounds{{query_bound, gate_bound, key_bound, value_bound}};
-    projection::packing_operand<ATTENTION_PROJECT_PACKING::centre, ATTENTION_PROJECT_PACKING::folds,
+    projection::packing_operand<ATTENTION_PROJECT_PACKING::magnitude, ATTENTION_PROJECT_PACKING::folds,
         ATTENTION_PROJECT_PACKING_OF(RESIDUE)::residue, BOUNDS>(x, ATTENTION_PROJECT_PACKING_SCRATCH(0u), bounds,
         uint(SEISMIC_DIM_M), k, pairs, peaks, thread_index, sg, lane);
 }

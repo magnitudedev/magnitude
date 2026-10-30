@@ -153,7 +153,6 @@ fn chain_element(backend: seismic::BackendName) -> Option<Element> {
     resident_element(
         CHAIN_FORMAT,
         ScaledActivations::Rounded,
-        HIDDEN,
         DType::BF16,
         resident_layout(ExecutionPath::Native, backend),
     )
@@ -4323,12 +4322,10 @@ mod tests {
             for dense in [DType::BF16, DType::F16, DType::F32] {
                 for encoding in Encoding::ALL {
                     for activations in [ScaledActivations::Rounded, ScaledActivations::Nvfp4] {
-                        for width in [HIDDEN, HIDDEN + 32] {
-                            if let Some(element) =
-                                resident_element(encoding, activations, width, dense, layout)
-                            {
-                                assert!(formats.contains(&element), "{backend:?} {element:?}");
-                            }
+                        if let Some(element) =
+                            resident_element(encoding, activations, dense, layout)
+                        {
+                            assert!(formats.contains(&element), "{backend:?} {element:?}");
                         }
                     }
                 }

@@ -28,10 +28,10 @@
 # same LANES (and TILED);
 # BATCH_FROM..16 rows the batched launch on the matrix units (SIMDGROUPS x ROWS
 # blocks of 8 weight rows, F32 operands, a different summation order, so
-# BATCH_FROM is arithmetic too; the down projection over Q4_K, Q5_K or Q6_K
-# weights takes the matrix GEMV there instead, `gemv_matrix`: the weights' integer
-# codes as the left fragment, BATCH_PARTS simdgroups sharing a fragment's
-# eight weight rows); 17..64 rows the GEMM at the fixed small-row
+# BATCH_FROM is arithmetic too; weights with a matrix GEMV (`matrix_form`:
+# k-quant, symmetric 32-column and grid codes) take it there instead,
+# `gemv_matrix`: the weights' integer codes as the left fragment,
+# BATCH_PARTS simdgroups sharing a fragment's eight weight rows); 17..64 rows the GEMM at the fixed small-row
 # geometry (`_gemm_small`: 32 x 64 tiles, 4-way split-K on the down
 # projection); larger classes the GEMM over tuned TILE_M x TILE_N tiles
 # (activations staged as stored, weights decoded to half once per tile), with
@@ -66,8 +66,8 @@
 # result depends on it but a packed form's, whose error it lowers; B is
 # static on every backend. On Metal a bound offers the packed form's wider
 # residue (`RESIDUE` 2: one more bit of top sum, half the top token's step),
-# which applies only to weights whose values are 8 bits (Q8_0 and iq4g32): a
-# tuning unit of other weights fixes `RESIDUE` at 1.
+# which applies only to weights whose values are 8 bits (8-bit codes and
+# codebooks' values): a tuning unit of other weights fixes `RESIDUE` at 1.
 fn dense_expand[M, O, H, F, GS, US, GB, UB](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
     gate_weight: &tensor[F, H] GW, up_weight: &tensor[F, H] UW,
     out_rows: &tensor[O] i32, eps: f32, activation: i32,
@@ -238,10 +238,12 @@ fn dense_output[M, O, H, F, DS, DB](residual: &tensor[M, H] f32,
             result[row, col] = residual[out_rows[row], col] + f32(projected[row, col])
     return result
 
-# PACK selects the token-packing GEMM past 64 rows (`gemm_packed`, Q4_K,
-# Q5_K, Q6_K, q4g32s, Q8_0 or iq4g32 weights on a device without tensor operations, and in
-# `dense_expand` a gate and an up weight one operand serves: Q4_K, Q5_K and
-# q4g32s together, both Q6_K, or Q8_0 and iq4g32 together; other weights and devices run the staged tile, with
+# PACK selects the token-packing GEMM past 64 rows (`gemm_packed`, weights
+# whose codes the packed forms read, `DecodeAxes::packing`: integer, codebook
+# and grid codes, on a device without tensor operations, and in
+# `dense_expand` a gate and an up weight one operand serves, of one layout:
+# one run a block, two, or one with residue bits); other weights and devices
+# run the staged tile, with
 # its results, in the `unpacked` launch, and each launch of the other path
 # returns at once): the activations become integer codes per (row, 32 columns)
 # and two rows share one F32 matrix operand against the weights' stored codes,
@@ -256,7 +258,7 @@ fn dense_output[M, O, H, F, DS, DB](residual: &tensor[M, H] f32,
 # launched, so the form's configurations do not multiply another's. Its
 # scratch is transient, per call: the packed operand (`packed`, 2 bytes per
 # padded row and column, plus one step read ahead), the rows' scales and code
-# sums, or for Q8_0 and iq4g32 the rows' scales and the RESIDUE low bit
+# sums, or for codes of 8-bit values the rows' scales and the RESIDUE low bit
 # planes of their codes (`token_factors`, 4 bytes per padded row and 32
 # columns, 8 with two planes; RESIDUE 2 takes a packing bound) and the
 # weights' block scales and biases (`weight_factors`, 4 bytes per weight row

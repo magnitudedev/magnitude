@@ -13,7 +13,8 @@
 //
 // Each threadgroup (32 threads) places one row tile: 16 rows x 32 columns.
 // Every group is a multiple of 32, so a tile covers a whole packet or part of
-// a larger one, and a code plane's share of a tile row is whole record words;
+// a larger one, and a code plane's share of a tile row is a unit of the span
+// (whole record words, or part of one);
 // the tile at a group's first column also places that group's other record
 // words. Stored-but-unoccupied bytes (mma16 padding rows and groups, plane
 // alignment tails, packet gaps) are written as zero, so the result is fully
@@ -41,9 +42,13 @@
 #define TILE_COLUMNS 32u
 static_assert(GROUP % TILE_COLUMNS == 0, "a tile lies in one group");
 
-// A unit's code words: the codes', then the high codes' (`WordSpan`).
-#define CODES_WORDS SEISMIC_CONVERSION_E_U_CODES_UNIT_WORDS
-#define HIGH_WORDS SEISMIC_CONVERSION_E_U_HIGH_UNIT_WORDS
+// A unit's code bytes, the codes' then the high codes' (`WordSpan`), and
+// their record words: a unit is whole words, or part of one (a grid entry's
+// high part).
+#define CODES_UNIT_BYTES SEISMIC_CONVERSION_E_U_CODES_UNIT_BYTES
+#define HIGH_UNIT_BYTES SEISMIC_CONVERSION_E_U_HIGH_UNIT_BYTES
+#define CODES_WORDS ((CODES_UNIT_BYTES + 3u) / 4u)
+#define HIGH_WORDS ((HIGH_UNIT_BYTES + 3u) / 4u)
 #define UNIT_WORDS (CODES_WORDS + HIGH_WORDS)
 
 // Helpers are inlined before they are optimized: optimized alone, their
@@ -226,14 +231,29 @@ ALWAYS_INLINE void place_fragments(device uchar *destination, constant ulong *se
     store(out, value, 2 * bits, 2 * bits < 16 ? 2 * bits : 16);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
+
+// A grids plane's unit (`unit_bytes` bytes, a constant, of `words`, at the
+// plane at row offset `offset`, `row_bytes` a row) of row `lane` of the tile
+// at `row0`: grid entries and their high parts stay whole, the tile's
+// sequence being [k-block][row][the k-block's two units]
+// (`PackedRowLayout::code_bit`), so the row's 32 columns (steps `step0`,
+// `step0 + 1` of k-block `block`) are one of its k-block's units. Stored in
+// units of `alignment` bytes (its role's).
+ALWAYS_INLINE void place_entries(device uchar *destination, constant ulong *seismic_words, ulong b, ulong row0,
+                                 thread const uint *words, uint unit_bytes, ulong offset, ulong row_bytes, uint lane,
+                                 uint block, uint step0, uint alignment) {
+    const ulong position = (ulong(block) * TILE_ROWS + lane) * (2 * unit_bytes) + step0 / 2 * unit_bytes;
+    store(tile_plane_byte(destination, seismic_words, b, row0, position, row_bytes, offset), words, unit_bytes,
+          alignment);
+}
 #else
-// A code plane's `words` (`bits` a column, a constant) of the tile's 32
+// A code plane's `words` (`unit_bytes` bytes, a constant) of the tile's 32
 // columns of stored row `n`: one unit of its plane, stored in units of
 // `unit` bytes (its role's alignment).
 ALWAYS_INLINE void place_unit(device uchar *destination, constant ulong *seismic_words, ulong b, ulong n,
-                       thread const uint *words, uint bits, ulong offset, ulong stored_unit, uint unit) {
-    if (bits != 0)
-        store(plane_unit(destination, seismic_words, b, n, offset, 4ul * bits, stored_unit), words, 4 * bits, unit);
+                       thread const uint *words, uint unit_bytes, ulong offset, ulong stored_unit, uint unit) {
+    if (unit_bytes != 0)
+        store(plane_unit(destination, seismic_words, b, n, offset, unit_bytes, stored_unit), words, unit_bytes, unit);
 }
 #endif
 
@@ -292,10 +312,11 @@ kernel void repack_weight(
     // bytes]; row `lane`'s 32 columns (steps `step0`, `step0 + 1`) are half
     // of its k-block bytes.
     if (lane < TILE_ROWS) {
-        const ulong position = (ulong(block) * TILE_ROWS + lane) * 8 * CODES_WORDS + step0 / 2 * 4 * CODES_WORDS;
-        store(tile_plane_byte(destination, seismic_words, b, row0, position, SEISMIC_RESULT_0_ROW_CODES_BYTES,
-                              SEISMIC_RESULT_0_ROW_CODES),
-              words, 4 * CODES_WORDS, ROLE_ALIGNMENT(CODES));
+        place_entries(destination, seismic_words, b, row0, words, CODES_UNIT_BYTES, SEISMIC_RESULT_0_ROW_CODES,
+                      SEISMIC_RESULT_0_ROW_CODES_BYTES, lane, block, step0, ROLE_ALIGNMENT(CODES));
+        place_entries(destination, seismic_words, b, row0, words + CODES_WORDS, HIGH_UNIT_BYTES,
+                      SEISMIC_RESULT_0_ROW_HIGH, SEISMIC_RESULT_0_ROW_HIGH_BYTES, lane, block, step0,
+                      ROLE_ALIGNMENT(HIGH));
     }
 #else
     place_fragments(destination, seismic_words, b, row0, words, CODES_WORDS, SEISMIC_RESULT_0_ROW_CODES,
@@ -310,9 +331,9 @@ kernel void repack_weight(
         if (!real)
             for (uint word = 0; word < UNIT_WORDS; ++word) words[word] = 0;
         const ulong stored_unit = column0 / TILE_COLUMNS;
-        place_unit(destination, seismic_words, b, n, words, CODES_WORDS, SEISMIC_RESULT_0_ROW_CODES, stored_unit,
+        place_unit(destination, seismic_words, b, n, words, CODES_UNIT_BYTES, SEISMIC_RESULT_0_ROW_CODES, stored_unit,
                    ROLE_ALIGNMENT(CODES));
-        place_unit(destination, seismic_words, b, n, words + CODES_WORDS, HIGH_WORDS, SEISMIC_RESULT_0_ROW_HIGH,
+        place_unit(destination, seismic_words, b, n, words + CODES_WORDS, HIGH_UNIT_BYTES, SEISMIC_RESULT_0_ROW_HIGH,
                    stored_unit, ROLE_ALIGNMENT(HIGH));
     }
 #endif

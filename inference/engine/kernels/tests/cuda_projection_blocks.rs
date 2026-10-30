@@ -41,6 +41,15 @@ fn rounded_segment(
     (values, tolerance)
 }
 
+/// Every imported format (`Format::imported`) in turn, `S` a launch (the last
+/// launch completed from the first formats).
+fn imported_sets<const S: usize>() -> Vec<[Format; S]> {
+    let imported = Format::imported();
+    (0..imported.len().div_ceil(S))
+        .map(|set| std::array::from_fn(|i| imported[(S * set + i) % imported.len()]))
+        .collect()
+}
+
 /// Columns [offset, offset + n) of every row of a [m, width] expectation.
 fn place(target: &mut [f64], width: usize, offset: usize, source: &[f64], m: usize, n: usize) {
     for row in 0..m {
@@ -69,10 +78,14 @@ fn cuda_recurrent_project_matches_host_model() {
     );
 }
 
-/// IQ4_XS / IQ4_NL weights are resident as iq4g32.
+/// Every form GGUF weights load as, four a launch.
 #[test]
-fn cuda_recurrent_project_iq4_matches_host_model() {
-    recurrent_project_cases(&[[Some(Format::Iq4); 4]], 43);
+fn cuda_recurrent_project_imported_formats_match_host_model() {
+    let sets = imported_sets::<4>()
+        .into_iter()
+        .map(|set| set.map(Some))
+        .collect::<Vec<_>>();
+    recurrent_project_cases(&sets, 43);
 }
 
 fn recurrent_project_cases(mixes: &[[Option<Format>; 4]], seed: u64) {
@@ -81,7 +94,7 @@ fn recurrent_project_cases(mixes: &[[Option<Format>; 4]], seed: u64) {
     let (h, nk, nv, w) = (512usize, 2usize, 4usize, 64usize);
     let (qkv, z) = ((2 * nk + nv) * w, nv * w);
     let width = qkv + z + 2 * nv;
-    for &formats in mixes {
+    for (set, &formats) in mixes.iter().enumerate() {
         let make = |format: Option<Format>, rows: usize, rng: &mut Rng| match format {
             Some(format) => weight(&device, format, rows, h, rng),
             None => dense_weight(&device, rows, h, rng),
@@ -93,13 +106,43 @@ fn recurrent_project_cases(mixes: &[[Option<Format>; 4]], seed: u64) {
             make(formats[2], nv, &mut rng),
             make(formats[3], nv, &mut rng),
         ];
+        // Each program once: the set's shared GEMV and GEMM mappings.
+        let kernels = |rows: usize| {
+            shared_mappings(rows, set, mixes.len())
+                .map(|mapping| {
+                    let kernel = gated_delta_project::native_for_device_with(
+                        &device,
+                        gated_delta_project::Elements {
+                            NW: Element::f32(),
+                            QW: element(formats[0]),
+                            GW: element(formats[1]),
+                            AW: element(formats[2]),
+                            BW: element(formats[3]),
+                            A: Element::bf16(),
+                        },
+                        &mapping.projection_params(statics_specialization(&[
+                            ("H", h),
+                            ("PT", 1),
+                            ("NM", h),
+                            ("NK", nk),
+                            ("NV", nv),
+                            ("W", w),
+                        ])),
+                    )
+                    .unwrap();
+                    (mapping, kernel)
+                })
+                .collect::<Vec<_>>()
+        };
+        let (gemv, gemm) = (kernels(1), kernels(GEMV_ROWS + 1));
         for m in ROWS {
             let hidden_values: Vec<f32> = (0..m * h).map(|_| rng.uniform(-3.0, 3.0)).collect();
             let norm_values: Vec<f32> = (0..h).map(|_| rng.uniform(0.25, 1.25)).collect();
             let normed = normalized(&hidden_values, &norm_values, m, h);
             let hidden = f32_tensor(&device, &[m as u64, h as u64], &hidden_values);
             let norm = f32_tensor(&device, &[h as u64], &norm_values);
-            for &mapping in mappings(m) {
+            for (mapping, kernel) in if m <= GEMV_ROWS { &gemv } else { &gemm } {
+                let mapping = *mapping;
                 // INT8 has no effect when any weight is dense.
                 let path = if formats.contains(&None) {
                     Mapping { int8: 0, ..mapping }
@@ -118,39 +161,20 @@ fn recurrent_project_cases(mixes: &[[Option<Format>; 4]], seed: u64) {
                     place(&mut expected, width, offset, &values, m, n);
                     place(&mut tolerance, width, offset, &bound, m, n);
                 }
-                let projection = gated_delta_project::native_for_device_with(
-                    &device,
-                    gated_delta_project::Elements {
-                        NW: Element::f32(),
-                        QW: element(formats[0]),
-                        GW: element(formats[1]),
-                        AW: element(formats[2]),
-                        BW: element(formats[3]),
-                        A: Element::bf16(),
-                    },
-                    &mapping.projection_params(statics_specialization(&[
-                        ("H", h),
-                        ("PT", 1),
-                        ("NM", h),
-                        ("NK", nk),
-                        ("NV", nv),
-                        ("W", w),
-                    ])),
-                )
-                .unwrap()
-                .call(gated_delta_project::Args {
-                    hidden: &hidden,
-                    input_norm: &norm,
-                    qkv_weight: &weights[0].tensor,
-                    gate_weight: &weights[1].tensor,
-                    alpha_weight: &weights[2].tensor,
-                    beta_weight: &weights[3].tensor,
-                    epsilon: EPSILON,
-                    qkv_bound: &f32_tensor(&device, &[0], &[]),
-                    gate_bound: &f32_tensor(&device, &[0], &[]),
-                })
-                .unwrap()
-                .value;
+                let projection = kernel
+                    .call(gated_delta_project::Args {
+                        hidden: &hidden,
+                        input_norm: &norm,
+                        qkv_weight: &weights[0].tensor,
+                        gate_weight: &weights[1].tensor,
+                        alpha_weight: &weights[2].tensor,
+                        beta_weight: &weights[3].tensor,
+                        epsilon: EPSILON,
+                        qkv_bound: &f32_tensor(&device, &[0], &[]),
+                        gate_bound: &f32_tensor(&device, &[0], &[]),
+                    })
+                    .unwrap()
+                    .value;
                 check(
                     &format!("recurrent project {formats:?} M={m} {mapping:?}"),
                     &read_bf16(&projection),
@@ -171,10 +195,10 @@ fn cuda_attention_project_matches_host_model() {
     );
 }
 
-/// IQ4_XS / IQ4_NL weights are resident as iq4g32.
+/// Every form GGUF weights load as, three a launch.
 #[test]
-fn cuda_attention_project_iq4_matches_host_model() {
-    attention_project_cases(&[[Format::Iq4; 3]], 59);
+fn cuda_attention_project_imported_formats_match_host_model() {
+    attention_project_cases(&imported_sets::<3>(), 59);
 }
 
 fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
@@ -182,7 +206,7 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
     let mut rng = Rng(seed);
     let (d, kv, g, w) = (512usize, 2usize, 2usize, 64usize);
     let (query, keys) = (kv * g * 2 * w, kv * w);
-    for &formats in sets {
+    for (set, &formats) in sets.iter().enumerate() {
         let weights = [
             weight(&device, formats[0], query, d, &mut rng),
             weight(&device, formats[1], keys, d, &mut rng),
@@ -191,63 +215,74 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
         // Qwen's form: the gate is interleaved in the query segment, so the
         // gate segment is zero rows of the query weight.
         let gate = weights[0].tensor.slice_leading(0, 0).unwrap();
+        // Each program once: the set's shared GEMV and GEMM mappings.
+        let kernels = |rows: usize| {
+            shared_mappings(rows, set, sets.len())
+                .map(|mapping| {
+                    let kernel = attention_project::native_for_device_with(
+                        &device,
+                        attention_project::Elements {
+                            NW: Element::f32(),
+                            QW: formats[0].resident(),
+                            GW: formats[0].resident(),
+                            KW: formats[1].resident(),
+                            VW: formats[2].resident(),
+                            A: Element::bf16(),
+                        },
+                        &mapping.projection_params(statics_specialization(&[
+                            ("D", d),
+                            ("PT", 1),
+                            ("NM", d),
+                            ("Q", query),
+                            ("GR", 0),
+                            ("K", keys),
+                            ("V", keys),
+                            ("QS", 0),
+                            ("GS", 0),
+                            ("KS", 0),
+                            ("VS", 0),
+                        ])),
+                    )
+                    .unwrap();
+                    (mapping, kernel)
+                })
+                .collect::<Vec<_>>()
+        };
+        let (gemv, gemm) = (kernels(1), kernels(GEMV_ROWS + 1));
         for m in ROWS {
             let hidden_values: Vec<f32> = (0..m * d).map(|_| rng.uniform(-3.0, 3.0)).collect();
             let norm_values: Vec<f32> = (0..d).map(|_| rng.uniform(0.25, 1.25)).collect();
             let normed = normalized(&hidden_values, &norm_values, m, d);
             let hidden = f32_tensor(&device, &[m as u64, d as u64], &hidden_values);
             let norm = f32_tensor(&device, &[d as u64], &norm_values);
-            for &mapping in mappings(m) {
+            for (mapping, kernel) in if m <= GEMV_ROWS { &gemv } else { &gemm } {
+                let mapping = *mapping;
                 let (x, slack) = operand_rows(&normed, d, mapping, Some(formats[0]));
                 let expected: Vec<(Vec<f64>, Vec<f64>)> = weights
                     .iter()
                     .zip([query, keys, keys])
                     .map(|(weight, n)| rounded_segment(&x, &slack, weight, m, n, d, mapping))
                     .collect();
-                let results = attention_project::native_for_device_with(
-                    &device,
-                    attention_project::Elements {
-                        NW: Element::f32(),
-                        QW: formats[0].resident(),
-                        GW: formats[0].resident(),
-                        KW: formats[1].resident(),
-                        VW: formats[2].resident(),
-                        A: Element::bf16(),
-                    },
-                    &mapping.projection_params(statics_specialization(&[
-                        ("D", d),
-                        ("PT", 1),
-                        ("NM", d),
-                        ("Q", query),
-                        ("GR", 0),
-                        ("K", keys),
-                        ("V", keys),
-                        ("QS", 0),
-                        ("GS", 0),
-                        ("KS", 0),
-                        ("VS", 0),
-                    ])),
-                )
-                .unwrap()
-                .call(attention_project::Args {
-                    hidden: &hidden,
-                    input_norm: &norm,
-                    query_weight: &weights[0].tensor,
-                    gate_weight: &gate,
-                    key_weight: &weights[1].tensor,
-                    value_weight: &weights[2].tensor,
-                    epsilon: EPSILON,
-                    project_mode: 0,
-                    query_scale: &f32_tensor(&device, &[0], &[]),
-                    gate_scale: &f32_tensor(&device, &[0], &[]),
-                    key_scale: &f32_tensor(&device, &[0], &[]),
-                    value_scale: &f32_tensor(&device, &[0], &[]),
-                    query_bound: &f32_tensor(&device, &[0], &[]),
-                    gate_bound: &f32_tensor(&device, &[0], &[]),
-                    key_bound: &f32_tensor(&device, &[0], &[]),
-                    value_bound: &f32_tensor(&device, &[0], &[]),
-                })
-                .unwrap();
+                let results = kernel
+                    .call(attention_project::Args {
+                        hidden: &hidden,
+                        input_norm: &norm,
+                        query_weight: &weights[0].tensor,
+                        gate_weight: &gate,
+                        key_weight: &weights[1].tensor,
+                        value_weight: &weights[2].tensor,
+                        epsilon: EPSILON,
+                        project_mode: 0,
+                        query_scale: &f32_tensor(&device, &[0], &[]),
+                        gate_scale: &f32_tensor(&device, &[0], &[]),
+                        key_scale: &f32_tensor(&device, &[0], &[]),
+                        value_scale: &f32_tensor(&device, &[0], &[]),
+                        query_bound: &f32_tensor(&device, &[0], &[]),
+                        gate_bound: &f32_tensor(&device, &[0], &[]),
+                        key_bound: &f32_tensor(&device, &[0], &[]),
+                        value_bound: &f32_tensor(&device, &[0], &[]),
+                    })
+                    .unwrap();
                 for (name, tensor, (values, tolerance)) in [
                     ("query", &results.r0, &expected[0]),
                     ("key", &results.r2, &expected[1]),

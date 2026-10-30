@@ -169,7 +169,9 @@ pub mod native_cpu {
 pub use seismic_lang::expr::{BigInt, BigUint};
 pub use seismic_lang::ids::StableEntryId;
 pub use seismic_lang::reference_math::conversion::exact_f64;
-pub use seismic_lang::registry::{f16_bits, f16_to_f32, BackendName, Layout, OperandRecipe};
+pub use seismic_lang::registry::{
+    f16_bits, f16_to_f32, BackendName, Layout, OperandRecipe, Packing,
+};
 pub use seismic_lang::types::DType;
 /// The Seismic CPU library every CPU native kernel builds on.
 pub use seismic_native_cpu as cpu;
@@ -459,10 +461,10 @@ impl Element {
     pub fn stored(storage: &str, layout: Layout) -> Option<Element> {
         seismic_lang::registry::storage(storage, layout).map(Element)
     }
-    /// The external storage rows of `width` stored values of `encoding`
-    /// are read as, when the registry converts from it.
-    pub fn gguf_source(encoding: magnitude_ggml::Encoding, width: u64) -> Option<Element> {
-        seismic_lang::registry::gguf_source(encoding, width).map(Element)
+    /// The external storage `encoding` is read as, when the registry
+    /// converts from it.
+    pub fn gguf_source(encoding: magnitude_ggml::Encoding) -> Option<Element> {
+        seismic_lang::registry::gguf_source(encoding).map(Element)
     }
     /// Every external (artifact-format) storage the registry converts from.
     pub fn external_sources() -> impl Iterator<Item = Element> {
@@ -552,6 +554,12 @@ impl Element {
             max: constant(QuantizedComponent::CodeMax)?,
             group: u64::try_from(constant(QuantizedComponent::GroupSize)?).ok()?,
         })
+    }
+    /// How the token-packing projection forms read this storage's codes
+    /// (`registry::DecodeAxes::packing`); `None` for storage they do not
+    /// serve.
+    pub fn packing(&self) -> Option<Packing> {
+        seismic_lang::registry::decode_axes(self.0)?.packing()
     }
     /// Rows of one row tile of row-layout storage (`rows8`: 8); 1 for every
     /// other storage. A matrix view of tiled storage selects whole tiles, or

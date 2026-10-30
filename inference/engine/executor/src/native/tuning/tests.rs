@@ -3611,7 +3611,7 @@ fn cpu_projection_default_form_follows_the_tier_integer_dots() {
             .unwrap()
     };
     let vector = seismic::cpu::Tier::detected().unwrap().quantized_dots() > 0;
-    let packed = ["q4k@rows8", "q6k@rows8", "q8g32s@rows8", "iq4g32@rows8", "q4k@rows16"]
+    let packed = ["q4k@rows8", "q6k@rows8", "q8g32s@rows8", "iq4xs@rows8", "q4k@rows16"]
         .map(|name| case(Element::named(name).expect("a CPU weight storage")));
     for case in &packed {
         assert_eq!(int8(case), u64::from(vector), "{}", case.down.name());

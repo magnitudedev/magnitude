@@ -886,7 +886,7 @@ mod internals {
                 for role in registry::RowPlaneRole::CODES {
                     let role = native_macro(role.name());
                     symbols.insert(format!("{prefix}_{role}_FIRST"));
-                    symbols.insert(format!("{prefix}_{role}_UNIT_WORDS"));
+                    symbols.insert(format!("{prefix}_{role}_UNIT_BYTES"));
                     symbols.insert(format!("{prefix}_{role}_REST_ALIGNMENT"));
                 }
                 symbols.insert(prefix);

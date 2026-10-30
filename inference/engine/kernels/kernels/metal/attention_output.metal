@@ -228,7 +228,7 @@ kernel void attention_output_pack(ATTENTION_OUTPUT_ARGUMENTS,
     typedef projection::packing_codes<packets::W0> coded;
     constexpr uint BOUNDS = SEISMIC_DIM_OB != 0 ? 1 : 0;
     const projection::packing_bounds<BOUNDS> bounds{{output_bound}};
-    projection::packing_operand<coded::centre, coded::folds, (coded::residue != 0 ? RESIDUE : 0), BOUNDS>(in,
+    projection::packing_operand<coded::magnitude, coded::folds, (coded::residue != 0 ? RESIDUE : 0), BOUNDS>(in,
         scratch, bounds,
         uint(SEISMIC_DIM_M), k, pairs, peaks, thread_index, sg, lane);
 }

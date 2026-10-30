@@ -122,6 +122,16 @@ __device__ __forceinline__ uint4 seismic_ld_nc_v4(const void* global) {
         : "l"(global));
     return value;
 }
+__device__ __forceinline__ unsigned seismic_ld_nc_na_u32(const void* global) {
+    unsigned value;
+    asm("ld.global.nc.L1::no_allocate.u32 %0, [%1];" : "=r"(value) : "l"(global));
+    return value;
+}
+__device__ __forceinline__ uint2 seismic_ld_nc_na_v2(const void* global) {
+    uint2 value;
+    asm("ld.global.nc.L1::no_allocate.v2.u32 {%0, %1}, [%2];" : "=r"(value.x), "=r"(value.y) : "l"(global));
+    return value;
+}
 __device__ __forceinline__ uint4 seismic_ld_nc_na_v4(const void* global) {
     uint4 value;
     asm("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"

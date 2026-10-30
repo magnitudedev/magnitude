@@ -3,7 +3,8 @@
 //! `mma16`): the embedding table and the combine weight are GGUF packets
 //! repacked to that layout, and the result is checked against a host model of
 //! the entry's contract. The table takes every form a target embedding table
-//! a draft head reads is stored in (Q8_0, Q4_0, Q4_K, Q6_K, BF16).
+//! a draft head reads can be stored in: every GGUF encoding the registry
+//! converts, and BF16.
 
 use magnitude_kernels::{draft_rows, repack_weight};
 use seismic::{Device, Element, Layout, NativeSpecialization, Tensor};
@@ -48,48 +49,140 @@ fn resident_q8(device: &Device) -> Element {
 /// The form of an embedding table: a GGUF block format, or BF16.
 #[derive(Clone, Copy, Debug)]
 enum TableForm {
-    Q8_0,
-    Q4_0,
-    Q4K,
-    Q6K,
+    Gguf(magnitude_ggml::Encoding),
     Bf16,
 }
 
 /// A GGUF block format: its external element, the resident representation
-/// it loads as, its block bytes and values, and the offset of each f16 block
-/// scale with the largest code magnitude that scale multiplies.
+/// it loads as, its block bytes and values, and where each f16 block scale
+/// is with the largest code magnitude that scale multiplies.
 struct GgufBlocks {
-    external: &'static str,
+    external: Element,
     resident: &'static str,
     block_bytes: usize,
     block_values: usize,
-    scales: &'static [(usize, f32)],
+    scales: &'static [(Scale, f32)],
+}
+
+/// Where a block holds a scale: an f16 at a byte offset, or (IQ1_M) its
+/// nibbles the top ones of four little-endian words from an offset; or a
+/// floating scale code byte, `low` plus one of `count` (its magnitude fixed).
+#[derive(Clone, Copy, Debug)]
+enum Scale {
+    At(usize),
+    Nibbles(usize),
+    Code { offset: usize, low: u8, count: u32 },
 }
 
 impl TableForm {
-    const ALL: [TableForm; 5] = [Self::Q8_0, Self::Q4_0, Self::Q4K, Self::Q6K, Self::Bf16];
+    /// Every GGUF encoding the registry converts (a target embedding table
+    /// can be any), and BF16.
+    fn all() -> Vec<TableForm> {
+        magnitude_ggml::Encoding::ALL
+            .into_iter()
+            .filter(|encoding| Element::gguf_source(*encoding).is_some())
+            .map(TableForm::Gguf)
+            .chain([TableForm::Bf16])
+            .collect()
+    }
+
+    /// A seed distinguishing the form's fixtures.
+    fn seed(self) -> u64 {
+        match self {
+            TableForm::Gguf(encoding) => encoding as u64 + 1,
+            TableForm::Bf16 => 0,
+        }
+    }
 
     fn gguf(self) -> Option<GgufBlocks> {
-        let blocks = |external, resident, block_bytes, block_values, scales| GgufBlocks {
-            external,
-            resident,
-            block_bytes,
-            block_values,
-            scales,
+        use magnitude_ggml::Encoding;
+        let TableForm::Gguf(encoding) = self else {
+            return None;
         };
-        match self {
-            Self::Q8_0 => Some(blocks("gguf_q8_0", "q8g32s", 34, 32, &[(0, 127.0)])),
-            Self::Q4_0 => Some(blocks("gguf_q4_0", "q4g32s", 18, 32, &[(0, 8.0)])),
-            Self::Q4K => Some(blocks(
-                "gguf_q4_k",
-                "q4k",
-                144,
-                256,
-                &[(0, 63.0 * 15.0), (2, 63.0 * 63.0)],
-            )),
-            Self::Q6K => Some(blocks("gguf_q6_k", "q6k", 210, 256, &[(208, 127.0 * 32.0)])),
-            Self::Bf16 => None,
-        }
+        let scales: &'static [(Scale, f32)] = match encoding {
+            Encoding::Q8_0 => &[(Scale::At(0), 127.0)],
+            Encoding::Q4_0 | Encoding::Iq4Nl => &[(Scale::At(0), 127.0)],
+            Encoding::Q4_1 => &[(Scale::At(0), 15.0), (Scale::At(2), 1.0)],
+            Encoding::Q5_0 => &[(Scale::At(0), 16.0)],
+            Encoding::Q5_1 => &[(Scale::At(0), 31.0), (Scale::At(2), 1.0)],
+            Encoding::Q4K => &[(Scale::At(0), 63.0 * 15.0), (Scale::At(2), 63.0 * 63.0)],
+            Encoding::Q5K => &[(Scale::At(0), 63.0 * 31.0), (Scale::At(2), 63.0 * 63.0)],
+            Encoding::Q6K => &[(Scale::At(208), 127.0 * 32.0)],
+            Encoding::Q2K => &[(Scale::At(80), 15.0 * 3.0), (Scale::At(82), 15.0 * 15.0)],
+            Encoding::Q3K => &[(Scale::At(108), 32.0 * 4.0)],
+            Encoding::Iq4Xs => &[(Scale::At(0), 127.0 * 32.0)],
+            // d / 8 times an odd scale code to 31 and a magnitude to 43.
+            Encoding::Iq2S | Encoding::Iq2Xs | Encoding::Iq2Xxs => {
+                &[(Scale::At(0), 31.0 * 43.0 / 8.0)]
+            }
+            // d times an odd scale code to 31 and a magnitude to 15.
+            Encoding::Iq3S => &[(Scale::At(0), 31.0 * 15.0)],
+            // d / 4 times an odd scale code to 31 and a magnitude to 62.
+            Encoding::Iq3Xxs => &[(Scale::At(0), 31.0 * 62.0 / 4.0)],
+            // d: codes reach 15 (1 + 1/8).
+            Encoding::Iq1S => &[(Scale::At(0), 17.0)],
+            // d / 8 times an odd scale code to 15 and codes to 8 * 15 + 1.
+            Encoding::Iq1M => &[(Scale::Nibbles(48), 15.0 * 121.0 / 8.0)],
+            Encoding::Q1_0 => &[(Scale::At(0), 1.0)],
+            Encoding::Tq2_0 => &[(Scale::At(64), 2.0)],
+            Encoding::Tq1_0 => &[(Scale::At(52), 1.0)],
+            // E8M0 2^-10 .. 2^-8 (values to 6 of them).
+            Encoding::Mxfp4 => &[(
+                Scale::Code {
+                    offset: 0,
+                    low: 117,
+                    count: 3,
+                },
+                1.0,
+            )],
+            // Four UE4M3 subnormal and smallest-normal scales (<= 2^-5).
+            Encoding::Nvfp4 => &[
+                (
+                    Scale::Code {
+                        offset: 0,
+                        low: 0,
+                        count: 16,
+                    },
+                    1.0,
+                ),
+                (
+                    Scale::Code {
+                        offset: 1,
+                        low: 0,
+                        count: 16,
+                    },
+                    1.0,
+                ),
+                (
+                    Scale::Code {
+                        offset: 2,
+                        low: 0,
+                        count: 16,
+                    },
+                    1.0,
+                ),
+                (
+                    Scale::Code {
+                        offset: 3,
+                        low: 0,
+                        count: 16,
+                    },
+                    1.0,
+                ),
+            ],
+            other => panic!("no table fixture for {other:?}"),
+        };
+        let external = Element::gguf_source(encoding)?;
+        Some(GgufBlocks {
+            external,
+            resident: external
+                .converted(Layout::Packet, seismic::OperandRecipe::Rounded)
+                .expect("a registered conversion")
+                .name(),
+            block_bytes: encoding.block_bytes() as usize,
+            block_values: encoding.block_elements() as usize,
+            scales,
+        })
     }
 }
 
@@ -129,13 +222,25 @@ fn table_weight(
         let mut block = (0..block_bytes)
             .map(|_| random.next() as u8)
             .collect::<Vec<_>>();
-        for &(offset, codes) in scales {
-            let factor = scale / codes * (0.5 + 0.5 * (random.symmetric() + 1.0));
-            block[offset..offset + 2].copy_from_slice(&f16_bits(factor).to_le_bytes());
+        for &(at, codes) in scales {
+            let factor = f16_bits(scale / codes * (0.5 + 0.5 * (random.symmetric() + 1.0)));
+            match at {
+                Scale::At(offset) => {
+                    block[offset..offset + 2].copy_from_slice(&factor.to_le_bytes())
+                }
+                Scale::Nibbles(offset) => {
+                    for word in 0..4 {
+                        let byte = &mut block[offset + 2 * word + 1];
+                        *byte = (*byte & 0x0f) | (((factor >> (4 * word)) as u8 & 0x0f) << 4);
+                    }
+                }
+                Scale::Code { offset, low, count } => {
+                    block[offset] = low + (random.next() % count) as u8;
+                }
+            }
         }
         bytes.extend(block);
     }
-    let external = Element::named(external).unwrap();
     let shape = [rows as u64, columns as u64];
     let host = Element::stored(resident, Layout::Rows16).unwrap();
     let bytes = host.repack_source(external, bytes).unwrap();
@@ -654,7 +759,7 @@ fn draft_rows_match_the_host_model_over_every_table_form() {
         let mut layouts = vec![resident_layout(&device), Layout::Rows16];
         layouts.dedup();
         for layout in layouts {
-            for form in TableForm::ALL {
+            for form in TableForm::all() {
                 for width in [1024, 1536] {
                     for rows in [1, 3, 17] {
                         draft_rows_match_with_table(&device, form, layout, width, 37, rows);
@@ -686,7 +791,7 @@ fn draft_rows_match_with_table(
     if device.backend() == seismic::BackendName::Cpu {
         statics = statics.with_param("INT8", 0);
     }
-    let mut random = Random(width as u64 * 131 + rows as u64 * 7 + form as u64);
+    let mut random = Random(width as u64 * 131 + rows as u64 * 7 + form.seed());
     let (table, table_values) =
         table_weight(device, form, layout, vocabulary, width, 1.0, &mut random);
     let kernel = draft_rows::native_for_device_with(

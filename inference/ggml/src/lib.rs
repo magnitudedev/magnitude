@@ -140,6 +140,13 @@ impl Encoding {
         }
     }
 
+    /// Whether some producer writes weights of this type: ggml's Q8_1 and
+    /// Q8_K are its matrix products' activation-side blocks, and no
+    /// producer writes F64 weights.
+    pub const fn produced(self) -> bool {
+        !matches!(self, Self::Q8_1 | Self::Q8K | Self::F64)
+    }
+
     pub const fn block_elements(self) -> u64 {
         match self {
             Self::F32

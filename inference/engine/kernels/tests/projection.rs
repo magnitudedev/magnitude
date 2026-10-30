@@ -137,11 +137,12 @@ enum Repr {
     Q5k,
     Q6k,
     Q8,
-    Iq4,
     Bf16,
     // Built from GGUF blocks through the registry's conversion
     // (`gguf_weight`).
+    Iq4xs,
     Q4g32s,
+    Q4g32,
     Iq4g32s,
     Q5g32s,
     Q5g32,
@@ -152,14 +153,30 @@ enum Repr {
     Iq2xs,
     Iq3xxs,
     Iq2xxs,
+    Q2k,
+    Q3k,
+    Iq2s,
+    Iq3s,
+    Iq1s,
+    Iq1m,
+    Q1g128,
+    Q2g256,
 }
 
 /// The vector-coded formats (256-value GGUF blocks).
-const GRID_REPRS: [Repr; 3] = [Repr::Iq2xs, Repr::Iq3xxs, Repr::Iq2xxs];
+const GRID_REPRS: [Repr; 7] =
+    [Repr::Iq2xs, Repr::Iq3xxs, Repr::Iq2xxs, Repr::Iq2s, Repr::Iq3s, Repr::Iq1s, Repr::Iq1m];
+
+/// The k-quant formats imported from GGUF blocks of 256 values.
+const K_QUANT_REPRS: [Repr; 2] = [Repr::Q2k, Repr::Q3k];
+
+/// The 1- and 2-bit formats of one direct scale per block (Q1_0, TQ2_0).
+const LOW_BIT_REPRS: [Repr; 2] = [Repr::Q1g128, Repr::Q2g256];
 
 /// The formats with a representation of their own, imported from GGUF.
-const GGUF_REPRS: [Repr; 7] = [
+const GGUF_REPRS: [Repr; 8] = [
     Repr::Q4g32s,
+    Repr::Q4g32,
     Repr::Iq4g32s,
     Repr::Q5g32s,
     Repr::Q5g32,
@@ -168,21 +185,67 @@ const GGUF_REPRS: [Repr; 7] = [
     Repr::Nvfp4A4,
 ];
 
-/// The iq4g32 code table (the registry's `iq4g32` interpretation).
-const IQ4_TABLE: [i8; 16] = [
-    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
-];
-
 impl Repr {
+    const ALL: [Repr; 25] = [
+        Repr::Q4k,
+        Repr::Q5k,
+        Repr::Q6k,
+        Repr::Q8,
+        Repr::Bf16,
+        Repr::Iq4xs,
+        Repr::Q4g32s,
+        Repr::Q4g32,
+        Repr::Iq4g32s,
+        Repr::Q5g32s,
+        Repr::Q5g32,
+        Repr::Mxfp4,
+        Repr::Nvfp4,
+        Repr::Nvfp4A4,
+        Repr::Iq2xs,
+        Repr::Iq3xxs,
+        Repr::Iq2xxs,
+        Repr::Q2k,
+        Repr::Q3k,
+        Repr::Iq2s,
+        Repr::Iq3s,
+        Repr::Iq1s,
+        Repr::Iq1m,
+        Repr::Q1g128,
+        Repr::Q2g256,
+    ];
+    /// Every representation a GGUF file's weights load as: the destinations
+    /// of the registry's GGUF sources' conversions for rounded activations,
+    /// each once, in `Encoding` order.
+    fn imported() -> Vec<Repr> {
+        let mut imported = Vec::new();
+        for encoding in magnitude_ggml::Encoding::ALL {
+            let Some(source) = Element::gguf_source(encoding) else {
+                continue;
+            };
+            let name = source
+                .converted(registry::Layout::Packet, registry::OperandRecipe::Rounded)
+                .expect("a registered conversion")
+                .name();
+            let repr = Repr::ALL
+                .into_iter()
+                .find(|repr| repr.name() == name)
+                .unwrap_or_else(|| panic!("no test form of {name} ({encoding:?})"));
+            if !imported.contains(&repr) {
+                imported.push(repr);
+            }
+        }
+        imported
+    }
     fn name(self) -> &'static str {
         match self {
             Repr::Q4k => "q4k",
             Repr::Q5k => "q5k",
             Repr::Q6k => "q6k",
             Repr::Q8 => "q8g32s",
-            Repr::Iq4 => "iq4g32",
+            Repr::Iq4xs => "iq4xs",
             Repr::Bf16 => "bf16",
             Repr::Q4g32s => "q4g32s",
+            Repr::Q4g32 => "q4g32",
             Repr::Iq4g32s => "iq4g32s",
             Repr::Q5g32s => "q5g32s",
             Repr::Q5g32 => "q5g32",
@@ -192,23 +255,53 @@ impl Repr {
             Repr::Iq2xs => "iq2xs",
             Repr::Iq3xxs => "iq3xxs",
             Repr::Iq2xxs => "iq2xxs",
+            Repr::Q2k => "q2k",
+            Repr::Q3k => "q3k",
+            Repr::Iq2s => "iq2s",
+            Repr::Iq3s => "iq3s",
+            Repr::Iq1s => "iq1s",
+            Repr::Iq1m => "iq1m",
+            Repr::Q1g128 => "q1g128",
+            Repr::Q2g256 => "q2g256",
         }
     }
+    /// The GGUF encoding of a representation built from GGUF blocks.
+    fn encoding(self) -> Option<magnitude_ggml::Encoding> {
+        use magnitude_ggml::Encoding;
+        Some(match self {
+            Repr::Iq4xs => Encoding::Iq4Xs,
+            Repr::Q4g32s => Encoding::Q4_0,
+            Repr::Q4g32 => Encoding::Q4_1,
+            Repr::Iq4g32s => Encoding::Iq4Nl,
+            Repr::Q5g32s => Encoding::Q5_0,
+            Repr::Q5g32 => Encoding::Q5_1,
+            Repr::Mxfp4 => Encoding::Mxfp4,
+            Repr::Nvfp4 | Repr::Nvfp4A4 => Encoding::Nvfp4,
+            Repr::Iq2xs => Encoding::Iq2Xs,
+            Repr::Iq3xxs => Encoding::Iq3Xxs,
+            Repr::Iq2xxs => Encoding::Iq2Xxs,
+            Repr::Q2k => Encoding::Q2K,
+            Repr::Q3k => Encoding::Q3K,
+            Repr::Iq2s => Encoding::Iq2S,
+            Repr::Iq3s => Encoding::Iq3S,
+            Repr::Iq1s => Encoding::Iq1S,
+            Repr::Iq1m => Encoding::Iq1M,
+            Repr::Q1g128 => Encoding::Q1_0,
+            Repr::Q2g256 => Encoding::Tq2_0,
+            Repr::Q4k | Repr::Q5k | Repr::Q6k | Repr::Q8 | Repr::Bf16 => return None,
+        })
+    }
     /// The GGUF source of a representation built from GGUF blocks, with its
-    /// block bytes and values.
+    /// block bytes and values (`Encoding`'s geometry).
     fn gguf_source(self) -> Option<(&'static str, usize, usize)> {
-        match self {
-            Repr::Q4g32s => Some(("gguf_q4_0", 18, 32)),
-            Repr::Iq4g32s => Some(("gguf_iq4_nl_block", 18, 32)),
-            Repr::Q5g32s => Some(("gguf_q5_0", 22, 32)),
-            Repr::Q5g32 => Some(("gguf_q5_1", 24, 32)),
-            Repr::Mxfp4 => Some(("gguf_mxfp4", 17, 32)),
-            Repr::Nvfp4 | Repr::Nvfp4A4 => Some(("gguf_nvfp4", 36, 64)),
-            Repr::Iq2xs => Some(("gguf_iq2_xs", 74, 256)),
-            Repr::Iq3xxs => Some(("gguf_iq3_xxs", 98, 256)),
-            Repr::Iq2xxs => Some(("gguf_iq2_xxs", 66, 256)),
-            _ => None,
-        }
+        let encoding = self.encoding()?;
+        Some((
+            Element::gguf_source(encoding)
+                .expect("a registered GGUF source")
+                .name(),
+            encoding.block_bytes() as usize,
+            encoding.block_elements() as usize,
+        ))
     }
     fn storage(self) -> RepresentationId {
         match self {
@@ -234,8 +327,8 @@ impl Repr {
     /// 8-bit values, as the executor's `packing_residue` decides).
     fn takes_residue(self, device: &Device) -> bool {
         self.resident(device)
-            .integer_codes()
-            .is_some_and(|codes| codes.max - codes.min > i32::from(i8::MAX))
+            .packing()
+            .is_some_and(|packing| packing.residue())
     }
 }
 
@@ -285,12 +378,10 @@ fn planes(repr: Repr, k: usize) -> Planes {
             planes.codes = place(k);
             planes.supers = place(2 * (k / 32));
         }
-        Repr::Iq4 => {
-            planes.codes = place(k / 2);
-            planes.supers = place(4 * (k / 32));
-        }
         Repr::Bf16 => at = 2 * k,
-        Repr::Q4g32s
+        Repr::Iq4xs
+        | Repr::Q4g32s
+        | Repr::Q4g32
         | Repr::Iq4g32s
         | Repr::Q5g32s
         | Repr::Q5g32
@@ -299,7 +390,15 @@ fn planes(repr: Repr, k: usize) -> Planes {
         | Repr::Nvfp4A4
         | Repr::Iq2xs
         | Repr::Iq3xxs
-        | Repr::Iq2xxs => {
+        | Repr::Iq2xxs
+        | Repr::Q2k
+        | Repr::Q3k
+        | Repr::Iq2s
+        | Repr::Iq3s
+        | Repr::Iq1s
+        | Repr::Iq1m
+        | Repr::Q1g128
+        | Repr::Q2g256 => {
             unreachable!("{repr:?} takes the registry's geometry (`gguf_weight`)")
         }
     }
@@ -337,18 +436,18 @@ impl Weight {
     }
 
     /// The packing bound operand of this weight on `device` and its extent,
-    /// as loading makes it: on Metal, `packing_bound` of a resident weight
-    /// with integer codes (one bound per run of the registry's code group);
-    /// an absent bound elsewhere.
+    /// as loading makes it (the executor's `packing_run`): on Metal,
+    /// `packing_bound` of a resident weight the packed forms read, one bound
+    /// per run (`Element::packing`); an absent bound elsewhere.
     fn bound(&self, device: &Device) -> (Tensor, usize) {
         let resident = self.repr.resident(device);
-        let Some(codes) = resident.integer_codes() else {
+        let Some(run) = resident.packing().map(|packing| packing.run) else {
             return (absent_bound(device), 0);
         };
         if device.backend() != BackendName::Metal {
             return (absent_bound(device), 0);
         }
-        let runs = self.k / codes.group as usize;
+        let runs = self.k / run as usize;
         let mut bound = f32_tensor(device, &[runs], &vec![0.0; runs]);
         packing_bound::native_for_device_with(
             device,
@@ -366,29 +465,7 @@ impl Weight {
 
     /// This weight in `device`'s resident layout.
     fn tensor(&self, device: &Device) -> Tensor {
-        self.tensor_in(device, resident_layout(device))
-    }
-    /// The host-built `rows16` bytes placed in `layout` through the
-    /// registry's packet form.
-    fn tensor_in(&self, device: &Device, layout: registry::Layout) -> Tensor {
-        let shape = [self.rows as u64, self.k as u64];
-        if self.repr == Repr::Bf16 || layout == registry::Layout::Rows16 {
-            let element = self.repr.element();
-            return Tensor::from_host(device, element, &shape, &self.bytes).unwrap();
-        }
-        let registry::RepresentationKind::PackedRows(source) =
-            &registry::representation_info(self.repr.storage()).kind
-        else {
-            unreachable!()
-        };
-        let resident =
-            registry::representation_info(registry::storage(self.repr.name(), layout).unwrap());
-        let registry::RepresentationKind::PackedRows(destination) = &resident.kind else {
-            unreachable!()
-        };
-        let packets = source.packets(&shape, &self.bytes);
-        let bytes = destination.place(&shape, &packets);
-        Tensor::from_host(device, self.repr.element_in(layout), &shape, &bytes).unwrap()
+        resident_tensor(device, self.repr, [self.rows, self.k], &self.bytes)
     }
     fn oracle(&self) -> TensorData {
         match self.repr {
@@ -408,6 +485,28 @@ impl Weight {
     fn row(&self, n: usize) -> &[f32] {
         &self.values[n * self.k..(n + 1) * self.k]
     }
+}
+
+/// `repr`'s host-built `rows16` bytes of a `[rows, k]` matrix placed in
+/// `device`'s resident layout through the registry's packet form.
+fn resident_tensor(device: &Device, repr: Repr, [rows, k]: [usize; 2], bytes: &[u8]) -> Tensor {
+    let layout = resident_layout(device);
+    let shape = [rows as u64, k as u64];
+    if repr == Repr::Bf16 || layout == registry::Layout::Rows16 {
+        return Tensor::from_host(device, repr.element(), &shape, bytes).unwrap();
+    }
+    let registry::RepresentationKind::PackedRows(source) =
+        &registry::representation_info(repr.storage()).kind
+    else {
+        unreachable!()
+    };
+    let resident = registry::representation_info(registry::storage(repr.name(), layout).unwrap());
+    let registry::RepresentationKind::PackedRows(destination) = &resident.kind else {
+        unreachable!()
+    };
+    let packets = source.packets(&shape, bytes);
+    let bytes = destination.place(&shape, &packets);
+    Tensor::from_host(device, repr.element_in(layout), &shape, &bytes).unwrap()
 }
 
 fn put_bits(bytes: &mut [u8], bit: usize, width: usize, value: u32) {
@@ -496,19 +595,6 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
                     }
                 }
             }
-            Repr::Iq4 => {
-                for group in 0..k / 32 {
-                    let factor = scale / 64.0 * (0.5 + rng.uniform());
-                    row[p.supers + 4 * group..p.supers + 4 * group + 4]
-                        .copy_from_slice(&factor.to_le_bytes());
-                    for i in 0..32 {
-                        let column = 32 * group + i;
-                        let code = rng.below(16);
-                        put_bits(&mut row[p.codes..], 4 * column, 4, code);
-                        out[column] = factor * f32::from(IQ4_TABLE[code as usize]);
-                    }
-                }
-            }
             Repr::Bf16 => {
                 for column in 0..k {
                     let value = bf16_round(rng.symmetric() * scale);
@@ -517,7 +603,9 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
                     out[column] = value;
                 }
             }
-            Repr::Q4g32s
+            Repr::Iq4xs
+            | Repr::Q4g32s
+            | Repr::Q4g32
             | Repr::Iq4g32s
             | Repr::Q5g32s
             | Repr::Q5g32
@@ -526,7 +614,15 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
             | Repr::Nvfp4A4
             | Repr::Iq2xs
             | Repr::Iq3xxs
-            | Repr::Iq2xxs => {
+            | Repr::Iq2xxs
+            | Repr::Q2k
+            | Repr::Q3k
+            | Repr::Iq2s
+            | Repr::Iq3s
+            | Repr::Iq1s
+            | Repr::Iq1m
+            | Repr::Q1g128
+            | Repr::Q2g256 => {
                 unreachable!("built by `gguf_weight`")
             }
         }
@@ -545,6 +641,25 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
 /// through the registry's conversion, so the rows16 bytes are the ones the
 /// device repack produces.
 fn gguf_weight(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -> Weight {
+    let bytes = gguf_bytes(repr, rows, k, rng, scale);
+    let values = repr
+        .element()
+        .decode_host(&[rows as u64, k as u64], &bytes)
+        .unwrap()
+        .into_iter()
+        .map(|value| value as f32)
+        .collect();
+    Weight {
+        repr,
+        rows,
+        k,
+        bytes,
+        values,
+    }
+}
+
+/// The rows16 bytes of `gguf_weight`.
+fn gguf_bytes(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -> Vec<u8> {
     let (source, block_bytes, block_values) = repr.gguf_source().unwrap();
     assert_eq!(k % block_values, 0, "{repr:?} rows of whole GGUF blocks");
     let mut external = Vec::with_capacity(rows * k / block_values * block_bytes);
@@ -555,9 +670,15 @@ fn gguf_weight(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -> 
         let factor = scale * (0.5 + rng.uniform());
         match repr {
             Repr::Q4g32s => block[..2].copy_from_slice(&f16_bits(factor / 8.0).to_le_bytes()),
-            // d: the table's values reach 127 d.
+            // d: the table's values reach 127 d (32 d (ls - 32) under IQ4_XS's
+            // six-bit local scales).
+            Repr::Iq4xs => block[..2].copy_from_slice(&f16_bits(factor / 4096.0).to_le_bytes()),
             Repr::Iq4g32s => block[..2].copy_from_slice(&f16_bits(factor / 128.0).to_le_bytes()),
             Repr::Q5g32s => block[..2].copy_from_slice(&f16_bits(factor / 16.0).to_le_bytes()),
+            Repr::Q4g32 => {
+                block[..2].copy_from_slice(&f16_bits(factor / 8.0).to_le_bytes());
+                block[2..4].copy_from_slice(&f16_bits(-factor).to_le_bytes());
+            }
             Repr::Q5g32 => {
                 block[..2].copy_from_slice(&f16_bits(factor / 16.0).to_le_bytes());
                 block[2..4].copy_from_slice(&f16_bits(-factor).to_le_bytes());
@@ -572,32 +693,44 @@ fn gguf_weight(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -> 
                 }
             }
             // d: values reach d (2 s + 1) 43 / 8 and d (2 s + 1) 62 / 4.
-            Repr::Iq2xs | Repr::Iq2xxs => {
+            Repr::Iq2xs | Repr::Iq2xxs | Repr::Iq2s => {
                 block[..2].copy_from_slice(&f16_bits(factor / 40.0).to_le_bytes())
             }
             Repr::Iq3xxs => block[..2].copy_from_slice(&f16_bits(factor / 120.0).to_le_bytes()),
+            // d: values reach d 31 15.
+            Repr::Iq3s => block[..2].copy_from_slice(&f16_bits(factor / 465.0).to_le_bytes()),
+            // d: values reach d 32 4.
+            Repr::Q3k => block[108..110].copy_from_slice(&f16_bits(factor / 128.0).to_le_bytes()),
+            // d and dmin: values reach d 15 3 and dmin 15.
+            Repr::Q2k => {
+                block[80..82].copy_from_slice(&f16_bits(factor / 45.0).to_le_bytes());
+                block[82..84].copy_from_slice(&f16_bits(factor / 30.0).to_le_bytes());
+            }
+            // d: values reach d 15 (1 + 1/8).
+            Repr::Iq1s => block[..2].copy_from_slice(&f16_bits(factor / 17.0).to_le_bytes()),
+            // d's nibbles are the top nibbles of the four scale words.
+            Repr::Iq1m => {
+                let d = f16_bits(factor / 17.0);
+                for word in 0..4 {
+                    let at = 48 + 2 * word + 1;
+                    block[at] = (block[at] & 0x0f) | (((d >> (4 * word)) as u8 & 0x0f) << 4);
+                }
+            }
+            // d: values are ±d.
+            Repr::Q1g128 => block[..2].copy_from_slice(&f16_bits(factor).to_le_bytes()),
+            // d: values reach 2 d.
+            Repr::Q2g256 => block[64..66].copy_from_slice(&f16_bits(factor / 2.0).to_le_bytes()),
             _ => unreachable!("{repr:?} is not imported from GGUF"),
         }
         external.extend(block);
     }
-    let shape = [rows as u64, k as u64];
-    let element = repr.element();
-    let bytes = element
-        .repack_host(Element::named(source).unwrap(), &shape, &external)
-        .unwrap();
-    let values = element
-        .decode_host(&shape, &bytes)
+    repr.element()
+        .repack_host(
+            Element::named(source).unwrap(),
+            &[rows as u64, k as u64],
+            &external,
+        )
         .unwrap()
-        .into_iter()
-        .map(|value| value as f32)
-        .collect();
-    Weight {
-        repr,
-        rows,
-        k,
-        bytes,
-        values,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1595,7 +1728,7 @@ fn attention_project_statics(
 
 #[test]
 fn rows16_builder_matches_the_registry_layout_and_decode() {
-    for repr in [Repr::Q4k, Repr::Q5k, Repr::Q6k, Repr::Q8, Repr::Iq4] {
+    for repr in [Repr::Q4k, Repr::Q5k, Repr::Q6k, Repr::Q8] {
         let k = 512;
         let w = weight(repr, 3, k, 1, 1.0);
         let info = registry::representation_info(repr.storage());
@@ -1738,11 +1871,11 @@ fn dense_expand_matches_its_portable_body() {
     }
 }
 
-/// IQ4_XS / IQ4_NL weights are resident as iq4g32 (the table decode).
+/// IQ4_XS weights are resident as iq4xs (the table decode).
 #[test]
 fn dense_expand_iq4_matches_its_portable_body() {
     for device in devices() {
-        dense_expand_matches_its_portable_body_on(&device, &[(Repr::Iq4, Repr::Iq4)]);
+        dense_expand_matches_its_portable_body_on(&device, &[(Repr::Iq4xs, Repr::Iq4xs)]);
     }
 }
 
@@ -1818,7 +1951,7 @@ fn dense_expand_matches_the_host_reference_across_row_classes_on(device: &Device
         (Act::Bf16, Repr::Q4k, Repr::Q4k),
         (Act::Bf16, Repr::Q5k, Repr::Q6k),
         (Act::Bf16, Repr::Q8, Repr::Bf16),
-        (Act::Bf16, Repr::Iq4, Repr::Q4k),
+        (Act::Bf16, Repr::Iq4xs, Repr::Q4k),
         (Act::F16, Repr::Q4k, Repr::Q4k),
     ] {
         let gate = weight(gate_repr, f, h, 21, 1.0);
@@ -1906,6 +2039,7 @@ fn metal_dense_expand_matrix_pair_matches_host() {
                 (Repr::Q6k, Repr::Q5k),
                 (Repr::Q5k, Repr::Q6k),
                 (Repr::Q8, Repr::Q8),
+                (Repr::Q2g256, Repr::Q5g32s),
             ] {
                 let gate = weight(gate_repr, f, h, 61, 1.0);
                 let up = weight(up_repr, f, h, 62, 1.0);
@@ -2064,7 +2198,7 @@ fn metal_tall_gemm_is_bit_identical_to_the_staged_tiles() {
         Repr::Q5k,
         Repr::Q6k,
         Repr::Q8,
-        Repr::Iq4,
+        Repr::Iq4xs,
         Repr::Bf16,
     ] {
         let (h, f) = (256, 200);
@@ -2569,7 +2703,7 @@ fn project_rows_native(
 
 /// Metal's tall and PACK forms of the plain projection: the tall tile gives
 /// the staged tile's bits; the PACK form differs from them by the packed
-/// form's error over Q4_K, Q5_K, Q6_K, q4g32s, Q8_0 or iq4g32 weights.
+/// form's error over Q4_K, Q5_K, Q6_K, q4g32s, Q8_0 or IQ4 codebook weights.
 #[test]
 fn metal_tall_and_packed_project_rows_agree_with_the_staged_form() {
     let Some(device) = devices()
@@ -2586,7 +2720,7 @@ fn metal_tall_and_packed_project_rows_agree_with_the_staged_form() {
         Repr::Q6k,
         Repr::Q4g32s,
         Repr::Q8,
-        Repr::Iq4,
+        Repr::Iq4xs,
         Repr::Iq4g32s,
     ] {
         let (outputs, k) = (192, 1024);
@@ -2682,7 +2816,8 @@ fn dense_output_packed(
 
 /// Metal's PACK form of the down projection: integer activation codes per
 /// (row, 32 columns), two rows packed per operand element against the exact
-/// Q4_K, Q5_K, Q6_K, q4g32s, Q8_0 or iq4g32 codes. Its results differ from the staged
+/// Q4_K, Q5_K, Q6_K, q4g32s, Q8_0, IQ4 codebook, q3k, Q1_0 codebook,
+/// ternary or grid codes. Its results differ from the staged
 /// form's by the activation rounding, the packed accumulator's rounding and
 /// the F16 fold.
 #[test]
@@ -2701,9 +2836,15 @@ fn metal_packed_dense_output_agrees_with_the_staged_form() {
         Repr::Q6k,
         Repr::Q4g32s,
         Repr::Q8,
-        Repr::Iq4,
+        Repr::Iq4xs,
         Repr::Iq4g32s,
-    ] {
+        Repr::Q3k,
+        Repr::Q2g256,
+        Repr::Q1g128,
+    ]
+    .into_iter()
+    .chain(GRID_REPRS)
+    {
         let (outputs, k) = (192, 1024);
         let down = weight(repr, outputs, k, 91, 1.0);
         for rows in [128usize, 200, 512] {
@@ -2753,9 +2894,11 @@ fn metal_packed_dense_output_agrees_with_the_staged_form() {
                     "packed dense_output {repr:?} rows {rows} {pack:?}: relative RMS error {relative:.2e}, largest {worst:.2e}"
                 );
             }
-            // 8-bit values: two residue bits give the top sum one more bit,
-            // the top token half its step. With the pair's two errors alike
-            // the form's falls to sqrt((1/4 + 1) / 2) of it, 0.79.
+            // Codes of 8-bit values, the only ones with residue bits
+            // (`Packing::residue`), whose rows' l2 norms lie near the
+            // format's bound: two residue bits give the top sum one more
+            // bit, the top token half its step. With the pair's two errors
+            // alike the form's falls to sqrt((1/4 + 1) / 2) of it, 0.79.
             if repr.takes_residue(&device) {
                 let packed = dense_output_packed(
                     &device, act, &down, &residual, rows, &product, &out_rows, PACK_WIDE,
@@ -2777,7 +2920,7 @@ fn metal_packed_dense_output_agrees_with_the_staged_form() {
 /// Metal's PACK form of the paired gate/up projection, as for the down
 /// projection: the GLU outputs differ from the staged form's by the packed
 /// form's error with gate and up weights one packed operand serves (Q4_K,
-/// Q5_K and q4g32s together, both Q6_K, or Q8_0 and iq4g32 together), and are
+/// Q5_K and q4g32s together, both Q6_K, or Q8_0 and IQ4 codebook weights together), and are
 /// the staged tile's bit for bit otherwise.
 #[test]
 fn metal_packed_dense_expand_agrees_with_the_staged_form() {
@@ -2796,8 +2939,8 @@ fn metal_packed_dense_expand_agrees_with_the_staged_form() {
         (Repr::Q4g32s, Repr::Q4g32s, true),
         (Repr::Q4g32s, Repr::Q4k, true),
         (Repr::Q8, Repr::Q8, true),
-        (Repr::Iq4, Repr::Iq4, true),
-        (Repr::Iq4, Repr::Q8, true),
+        (Repr::Iq4xs, Repr::Iq4xs, true),
+        (Repr::Iq4xs, Repr::Q8, true),
         (Repr::Iq4g32s, Repr::Iq4g32s, true),
         (Repr::Q4k, Repr::Q6k, false),
         (Repr::Q8, Repr::Q4k, false),
@@ -2948,7 +3091,7 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
         .map(|i| weight(project_reprs[i], project_rows[i], d, 181 + i as u64, 1.0))
         .collect::<Vec<_>>();
     let (outputs, heads, width) = (128, 8, 64);
-    let out_weights = [Repr::Q5k, Repr::Q4k, Repr::Q6k, Repr::Q8, Repr::Iq4]
+    let out_weights = [Repr::Q5k, Repr::Q4k, Repr::Q6k, Repr::Q8, Repr::Iq4xs]
         .map(|repr| weight(repr, outputs, heads * width, 185, 1.0));
     let (nk, nv, head_width) = (1, 2, 32);
     let recurrent_reprs = [Repr::Q5k, Repr::Q4k, Repr::Q8, Repr::Bf16];
@@ -3289,9 +3432,10 @@ fn dense_output_reference(
     (expected, bound)
 }
 
-/// `packing_bound` on Metal equals its portable body over every format with
-/// integer codes, at a row count that leaves padding rows in a tile, with
-/// the runs the registry gives the format.
+/// `packing_bound` on Metal equals its portable body over every format the
+/// packed forms read (`Element::packing`: q2k, whose two runs a block have a
+/// minimum, is not), the grids among them, at a row count that leaves
+/// padding rows in a tile, with the runs the registry gives the format.
 #[test]
 fn packing_bound_matches_its_portable_body() {
     let module = module();
@@ -3299,21 +3443,29 @@ fn packing_bound_matches_its_portable_body() {
         if device.backend() != BackendName::Metal {
             continue;
         }
-        for repr in [
+        for repr in GRID_REPRS.into_iter().chain([
             Repr::Q4k,
             Repr::Q5k,
             Repr::Q6k,
             Repr::Q8,
-            Repr::Iq4,
+            Repr::Iq4xs,
             Repr::Q4g32s,
             Repr::Iq4g32s,
             Repr::Q5g32s,
             Repr::Q5g32,
-        ] {
+            Repr::Q4g32,
+            Repr::Q3k,
+            Repr::Q2k,
+            Repr::Q1g128,
+            Repr::Q2g256,
+        ]) {
+            let resident = repr.resident(&device);
+            let Some(packing) = resident.packing() else {
+                continue;
+            };
             let (rows, k) = (40, 512);
             let w = weight(repr, rows, k, 17, 1.0);
-            let resident = repr.resident(&device);
-            let runs = k / resident.integer_codes().unwrap().group as usize;
+            let runs = k / packing.run as usize;
             let outcome = interpret(
                 &module,
                 "packing_bound",
@@ -3360,12 +3512,12 @@ fn dense_output_matches_its_portable_body_and_the_host_reference() {
 #[test]
 fn dense_output_iq4_matches_its_portable_body_and_the_host_reference() {
     for device in devices() {
-        dense_output_matches_its_portable_body_and_the_host_reference_on(&device, &[Repr::Iq4]);
+        dense_output_matches_its_portable_body_and_the_host_reference_on(&device, &[Repr::Iq4xs]);
     }
 }
 
-/// Q4_0, Q5_0, Q5_1, MXFP4 and NVFP4 weights, imported into representations
-/// of their own.
+/// Q4_0, Q4_1, Q5_0, Q5_1, MXFP4 and NVFP4 weights, imported into
+/// representations of their own.
 #[test]
 fn dense_output_gguf_formats_match_their_portable_body_and_the_host_reference() {
     for device in devices() {
@@ -3373,12 +3525,48 @@ fn dense_output_gguf_formats_match_their_portable_body_and_the_host_reference() 
     }
 }
 
-/// IQ2_XS, IQ3_XXS and IQ2_XXS weights, imported into their vector-coded
-/// representations.
+/// IQ2_XS, IQ3_XXS, IQ2_XXS and IQ2_S weights, imported into their
+/// vector-coded representations.
 #[test]
 fn dense_output_grid_formats_match_their_portable_body_and_the_host_reference() {
     for device in devices() {
         dense_output_matches_its_portable_body_and_the_host_reference_on(&device, &GRID_REPRS);
+    }
+}
+
+/// Q2_K weights, imported into q2k.
+#[test]
+fn dense_output_k_quant_formats_match_their_portable_body_and_the_host_reference() {
+    for device in devices() {
+        dense_output_matches_its_portable_body_and_the_host_reference_on(&device, &K_QUANT_REPRS);
+    }
+}
+
+#[test]
+fn dense_expand_k_quant_formats_match_their_portable_body() {
+    for device in devices() {
+        dense_expand_matches_its_portable_body_on(
+            &device,
+            &[(Repr::Q2k, Repr::Q2k), (Repr::Q3k, Repr::Q3k)],
+        );
+    }
+}
+
+/// Q1_0 and TQ2_0 weights, imported into q1g128 and q2g256.
+#[test]
+fn dense_output_low_bit_formats_match_their_portable_body_and_the_host_reference() {
+    for device in devices() {
+        dense_output_matches_its_portable_body_and_the_host_reference_on(&device, &LOW_BIT_REPRS);
+    }
+}
+
+#[test]
+fn dense_expand_low_bit_formats_match_their_portable_body() {
+    for device in devices() {
+        dense_expand_matches_its_portable_body_on(
+            &device,
+            &[(Repr::Q1g128, Repr::Q2g256), (Repr::Q2g256, Repr::Q1g128)],
+        );
     }
 }
 
@@ -3387,7 +3575,7 @@ fn dense_expand_grid_formats_match_their_portable_body() {
     for device in devices() {
         dense_expand_matches_its_portable_body_on(
             &device,
-            &[(Repr::Iq2xs, Repr::Iq3xxs), (Repr::Iq2xxs, Repr::Iq2xxs)],
+            &[(Repr::Iq2xs, Repr::Iq3xxs), (Repr::Iq2xxs, Repr::Iq2xxs), (Repr::Iq2s, Repr::Iq2s), (Repr::Iq3s, Repr::Iq3s), (Repr::Iq1s, Repr::Iq1m)],
         );
     }
 }
@@ -3405,6 +3593,7 @@ fn dense_expand_gguf_formats_match_their_portable_body() {
                 (Repr::Nvfp4, Repr::Nvfp4),
                 (Repr::Nvfp4A4, Repr::Nvfp4A4),
                 (Repr::Q5g32s, Repr::Q5g32),
+                (Repr::Q4g32, Repr::Q4g32),
             ],
         );
     }
@@ -3631,9 +3820,11 @@ fn metal_dense_output_scoped_launches_match_the_host() {
     }
 }
 
-/// `dense_output`'s matrix GEMV (the batched launch over Q4_K, Q5_K and Q6_K
-/// weights), from two rows (BATCH_FROM 2) to sixteen, with every BATCH_PARTS
-/// and weight rows that do not fill a fragment, against the host reference.
+/// `dense_output`'s matrix GEMV (the batched launch over Q4_K, Q5_K, Q6_K,
+/// q3k, ternary and q5g32s weights: every form, with codes of 2 low bits and
+/// of a high plane), from two rows (BATCH_FROM 2) to sixteen, with every
+/// BATCH_PARTS and weight rows that do not fill a fragment, against the host
+/// reference.
 #[test]
 fn metal_dense_output_matrix_gemv_matches_the_host() {
     let Some(device) = devices()
@@ -3643,7 +3834,14 @@ fn metal_dense_output_matrix_gemv_matches_the_host() {
         return;
     };
     let act = Act::Bf16;
-    for repr in [Repr::Q4k, Repr::Q5k, Repr::Q6k] {
+    for repr in [
+        Repr::Q4k,
+        Repr::Q5k,
+        Repr::Q6k,
+        Repr::Q3k,
+        Repr::Q2g256,
+        Repr::Q5g32s,
+    ] {
         for (h, f) in [(40usize, 256usize), (67, 512)] {
             let down = weight(repr, h, f, 37, 1.0);
             for rows in [2usize, 3, 4, 8, 9, 16] {
@@ -3692,13 +3890,20 @@ fn dense_output_matches_its_portable_body_and_the_host_reference_on(
 ) {
     let module = module();
     let act = Act::Bf16;
-    for &repr in reprs {
-        // Portable body at small shapes.
-        let (h, f) = (40, 256);
+    // A native program is compiled per form, shape and mapping, so the forms
+    // share the mappings: form i runs mapping i (mod four) against the
+    // portable body and the mappings m = i (mod the forms, to four) against
+    // the host reference, so every form is checked at both and every mapping
+    // against the host reference.
+    let shared = reprs.len().min(MAPPINGS.len());
+    for (index, &repr) in reprs.iter().enumerate() {
+        // Portable body at small shapes: the GEMV (2 rows) and the batched
+        // GEMV (9, below every mapping's GEMM), over a partial row tile.
+        let (h, f) = (20, 256);
         let down = weight(repr, h, f, 31, 1.0);
         for (rows, out_rows) in [
             (3usize, vec![1, 2]),
-            (20, (0..16).map(|i| (i * 3 + 2) % 20).collect::<Vec<i32>>()),
+            (12, (0..9).map(|i| (i * 3 + 2) % 12).collect::<Vec<i32>>()),
         ] {
             let mut rng = Rng::new(rows as u64);
             let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
@@ -3720,7 +3925,7 @@ fn dense_output_matches_its_portable_body_and_the_host_reference_on(
                 ],
             );
             let oracle = result(&outcome, 0);
-            for mapping in MAPPINGS {
+            for mapping in [MAPPINGS[index % MAPPINGS.len()]] {
                 let (_, bound) = under(out_rows.len(), || {
                     dense_output_reference(act, &down, &residual, &product, &out_rows)
                 });
@@ -3747,7 +3952,12 @@ fn dense_output_matches_its_portable_body_and_the_host_reference_on(
             let product = (0..rows * f)
                 .map(|_| act.round(rng.symmetric()))
                 .collect::<Vec<_>>();
-            for mapping in MAPPINGS {
+            for mapping in MAPPINGS
+                .into_iter()
+                .enumerate()
+                .filter(|(m, _)| m % shared == index % shared)
+                .map(|(_, mapping)| mapping)
+            {
                 let (expected, bound) = under(out_rows.len(), || {
                     dense_output_reference(act, &down, &residual, &product, &out_rows)
                 });
@@ -3888,13 +4098,37 @@ fn dense_entries_at_4b_geometry_match_the_host_reference_and_single_rows_on(devi
 }
 
 /// Which cases a segmented projection check runs: the small and 4B
-/// geometries over every mapping, the scoped launches, or the IQ4_NL
-/// single-block weights.
+/// geometries over every mapping, the scoped launches, the IQ4_NL weights at
+/// a K that is not a multiple of 256, or every form GGUF weights load as
+/// (`Repr::imported`) at the small geometry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cases {
     Checked,
     Scoped,
     Iq4Blocks,
+    Imported,
+}
+
+/// The segments' representations of `Cases::Imported`: every imported form
+/// in turn, `S` a launch (the last launch completed from the first forms).
+/// A native program is compiled per launch and mapping, so launch i runs
+/// mapping i (mod four) alone; every form is checked in a segmented launch
+/// and every mapping over imported forms.
+fn imported_segments<const S: usize>() -> Vec<[Repr; S]> {
+    let imported = Repr::imported();
+    (0..imported.len().div_ceil(S))
+        .map(|launch| std::array::from_fn(|i| imported[(S * launch + i) % imported.len()]))
+        .collect()
+}
+
+/// The row classes and mappings segmented launch `launch` of `cases` checks
+/// at a geometry (`four_b`: the pinned 4B one).
+fn segmented_classes(cases: Cases, four_b: bool, launch: usize) -> (Vec<usize>, Vec<Mapping>) {
+    match cases {
+        Cases::Scoped => (vec![1, 8, 32, 128], vec![MAPPINGS[0], MAPPINGS[2]]),
+        Cases::Imported => (ROW_CLASSES.to_vec(), vec![MAPPINGS[launch % MAPPINGS.len()]]),
+        Cases::Checked | Cases::Iq4Blocks => checked_classes(four_b),
+    }
 }
 
 #[test]
@@ -3904,12 +4138,21 @@ fn recurrent_project_matches_its_portable_body_and_the_host_reference() {
     }
 }
 
-/// QKV and alpha weights in the IQ4_NL single-block form (iq4g32s) beside
+/// QKV and alpha weights in the IQ4_NL form (iq4g32s) beside
 /// weights of other kinds in one segmented launch.
 #[test]
 fn recurrent_project_over_iq4_blocks_matches_its_portable_body_and_the_host_reference() {
     for device in devices() {
         recurrent_project_cases_on(&device, Cases::Iq4Blocks);
+    }
+}
+
+/// QKV, gate, alpha and beta weights of every form GGUF weights load as,
+/// four forms a segmented launch.
+#[test]
+fn recurrent_project_over_imported_forms_matches_the_host_reference() {
+    for device in devices() {
+        recurrent_project_cases_on(&device, Cases::Imported);
     }
 }
 
@@ -3944,8 +4187,12 @@ fn recurrent_project_cases_on(device: &Device, cases: Cases) {
             (2560, 16, 32, 128, true, k_quants),
         ],
         Cases::Iq4Blocks => vec![(640, 2, 4, 32, false, iq4_blocks)],
+        Cases::Imported => imported_segments()
+            .into_iter()
+            .map(|reprs| (512, 2, 4, 32, false, reprs))
+            .collect(),
     };
-    for (h, nk, nv, w, four_b, reprs) in geometries {
+    for (launch, (h, nk, nv, w, four_b, reprs)) in geometries.into_iter().enumerate() {
         let rows_of = [(2 * nk + nv) * w, nv * w, nv, nv];
         let total: usize = rows_of.iter().sum();
         let weights = (0..4)
@@ -4005,12 +4252,12 @@ fn recurrent_project_cases_on(device: &Device, cases: Cases) {
                 .value;
             read_act(act, &out)
         };
-        let (row_classes, mappings) = if scoped {
-            (vec![1, 8, 32, 128], vec![MAPPINGS[0], MAPPINGS[2]])
+        let (row_classes, mappings) = segmented_classes(cases, four_b, launch);
+        let portable_rows: &[usize] = if four_b || scoped || cases == Cases::Imported {
+            &[]
         } else {
-            checked_classes(four_b)
+            &[3, 17]
         };
-        let portable_rows: &[usize] = if four_b || scoped { &[] } else { &[3, 17] };
         for &rows in portable_rows {
             let mut rng = Rng::new(rows as u64 + 3);
             let hidden = (0..rows * h)
@@ -4219,7 +4466,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference() {
     }
 }
 
-/// Query and value weights in the IQ4_NL single-block form (iq4g32s, rows
+/// Query and value weights in the IQ4_NL form (iq4g32s, rows
 /// whose width is not a multiple of 256) beside a key weight of another
 /// kind in one segmented launch, and an iq4g32s output projection.
 #[test]
@@ -4228,6 +4475,18 @@ fn attention_projections_over_iq4_blocks_match_their_portable_bodies_and_the_hos
         attention_projections_match_their_portable_bodies_and_the_host_reference_on(
             &device,
             Cases::Iq4Blocks,
+        );
+    }
+}
+
+/// Query, key and value weights of every form GGUF weights load as, three
+/// forms a segmented launch.
+#[test]
+fn attention_projections_over_imported_forms_match_the_host_reference() {
+    for device in devices() {
+        attention_projections_match_their_portable_bodies_and_the_host_reference_on(
+            &device,
+            Cases::Imported,
         );
     }
 }
@@ -4307,13 +4566,13 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
             (2560, 4, 4, 256, true, k_quants),
         ],
         Cases::Iq4Blocks => vec![(640, 2, 2, 64, false, iq4_blocks)],
+        Cases::Imported => imported_segments()
+            .into_iter()
+            .map(|reprs| (512, 2, 2, 64, false, reprs))
+            .collect(),
     };
-    for (d, kv, g, w, four_b, reprs) in geometries {
-        let (row_classes, mappings) = if scoped {
-            (vec![1, 8, 32, 128], vec![MAPPINGS[0], MAPPINGS[2]])
-        } else {
-            checked_classes(four_b)
-        };
+    for (launch, (d, kv, g, w, four_b, reprs)) in geometries.into_iter().enumerate() {
+        let (row_classes, mappings) = segmented_classes(cases, four_b, launch);
         let rows_of = [kv * g * 2 * w, kv * w, kv * w];
         let weights = (0..3)
             .map(|i| weight(reprs[i], rows_of[i], d, 60 + i as u64, 1.0))
@@ -4384,7 +4643,11 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
             }
             out
         };
-        let portable_rows: &[usize] = if four_b || scoped { &[] } else { &[2, 16] };
+        let portable_rows: &[usize] = if four_b || scoped || cases == Cases::Imported {
+            &[]
+        } else {
+            &[2, 16]
+        };
         for &rows in portable_rows {
             let mut rng = Rng::new(rows as u64 + 5);
             let hidden = (0..rows * d)
@@ -4474,12 +4737,12 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
         }
         // Output projection over Q = KV * G gated heads.
         let q = kv * g;
-        let reprs: &[Repr] = if four_b || scoped {
-            &[Repr::Q4k]
-        } else if cases == Cases::Iq4Blocks {
-            &[Repr::Iq4g32s]
-        } else {
-            &[Repr::Q4k, Repr::Q8, Repr::Bf16]
+        let reprs: &[Repr] = match cases {
+            // The segmented launches alone.
+            Cases::Imported => &[],
+            Cases::Iq4Blocks => &[Repr::Iq4g32s],
+            _ if four_b || scoped => &[Repr::Q4k],
+            _ => &[Repr::Q4k, Repr::Q8, Repr::Bf16],
         };
         for &repr in reprs {
             let (d_out, k) = (if four_b { d } else { 300usize }, q * w);
@@ -4878,11 +5141,14 @@ fn scaled_projections_on(device: &Device) {
 
 /// One readout check: vocabulary V and width D, head representations, output
 /// row classes, mappings, the softcap (0 = none), and whether the portable
-/// bodies are interpreted at 2 output rows (Q6K).
+/// bodies are interpreted at 2 output rows (Q6K). A native program is
+/// compiled per form and mapping, so the forms share the mappings: form i
+/// runs the mappings m = i (mod the forms, to the mappings' count), so every
+/// form and every mapping is checked.
 struct ReadoutCheck {
     v: usize,
     d: usize,
-    reprs: &'static [Repr],
+    reprs: Vec<Repr>,
     output_classes: &'static [usize],
     mappings: &'static [Mapping],
     softcap: f32,
@@ -4896,7 +5162,8 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference() {
     let check = ReadoutCheck {
         v: 1000,
         d: 512,
-        reprs: &[Repr::Q6k, Repr::Q4k, Repr::Q8],
+        // Every form a GGUF readout head loads as.
+        reprs: Repr::imported(),
         output_classes: &ROW_CLASSES,
         mappings: &MAPPINGS,
         softcap: 0.0,
@@ -4916,7 +5183,7 @@ fn readout_softcap_matches_the_portable_bodies_and_the_host_reference() {
     let check = ReadoutCheck {
         v: 256,
         d: 256,
-        reprs: &[Repr::Q6k],
+        reprs: vec![Repr::Q6k],
         output_classes: &[2, 12],
         mappings: &MAPPING,
         softcap: 30.0,
@@ -4939,7 +5206,7 @@ fn readout_weight_scale_matches_the_portable_bodies_and_the_host_reference() {
         let check = ReadoutCheck {
             v: 256,
             d: 256,
-            reprs: &[Repr::Q6k],
+            reprs: vec![Repr::Q6k],
             output_classes: &[1, 12, 40],
             mappings: &MAPPING,
             softcap,
@@ -4964,7 +5231,7 @@ fn metal_readout_scoped_launches_match_the_host() {
     let check = ReadoutCheck {
         v: 256,
         d: 256,
-        reprs: &[Repr::Q6k],
+        reprs: vec![Repr::Q6k],
         output_classes: &[1, 8, 32, 128],
         mappings: &SCOPED,
         softcap: 0.0,
@@ -5096,7 +5363,8 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
     let module = module();
     let act = Act::Bf16;
     let (v, d, cap) = (check.v, check.d, check.softcap);
-    for &repr in check.reprs {
+    let shared = check.reprs.len().min(check.mappings.len());
+    for (index, &repr) in check.reprs.iter().enumerate() {
         let head = weight(repr, v, d, 80, 1.0);
         let norm = norm_values(d, 8);
         let selected = (0..37)
@@ -5189,7 +5457,13 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                     })
                     .collect::<Vec<_>>()
             };
-            for &mapping in check.mappings {
+            for &mapping in check
+                .mappings
+                .iter()
+                .enumerate()
+                .filter(|(m, _)| m % shared == index % shared)
+                .map(|(_, mapping)| mapping)
+            {
                 let specialization = readout_head_specialization_on(
                     device,
                     &[("V", v), ("D", d), ("WS", scale_extent)],
@@ -5469,7 +5743,15 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
         Repr::Q4k,
         Repr::Q5k,
         Repr::Q8,
-        Repr::Iq4,
+        Repr::Iq4xs,
+        Repr::Q2k,
+        Repr::Q3k,
+        Repr::Iq2s,
+        Repr::Iq3s,
+        Repr::Iq1s,
+        Repr::Iq1m,
+        Repr::Q1g128,
+        Repr::Q2g256,
         Repr::Bf16,
     ] {
         let table = weight(repr, v, d, 90, 8.0);
@@ -6151,4 +6433,230 @@ fn metal_normalize_prepass_matches_small_row_tree() {
 /// The inject port of a single residual stream: no columns.
 fn no_inject(device: &seismic::Device, rows: u64) -> seismic::Tensor {
     seismic::Tensor::zeros(device, seismic::Element::f32(), &[rows, 0]).unwrap()
+}
+
+/// `dense_output`'s time per call on every device this host has, over the
+/// projection shapes of Gemma 4 E2B Q2_K_P (H x F: its gate/up 12288 x 1536
+/// and 6144 x 1536, query 2048 x 1536, key 256 x 1536, per-layer projection
+/// 1536 x 256), for q2k and q3k, the existing forms nearest them in bits
+/// (iq2xxs, iq2xs), q4k and q4g32s, and q6k (the form Q3_K was held in
+/// before q3k), at one row (the GEMV) and at 512 (the GEMM):
+/// per form the best over `MAPPINGS` of the best of eleven batches of 20
+/// calls.
+#[test]
+#[ignore = "timing"]
+fn dense_output_timing_at_model_shapes() {
+    let catalog = seismic::Devices::discover(&[]).unwrap();
+    let devices = [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan, BackendName::Cpu]
+        .into_iter()
+        .filter_map(|backend| catalog.open_backend(backend).ok())
+        .collect::<Vec<_>>();
+    let act = Act::Bf16;
+    for device in &devices {
+        for (h, f) in [(12288usize, 1536usize), (6144, 1536), (2048, 1536), (256, 1536), (1536, 256)] {
+            for rows in [1usize, 512] {
+                if is_cpu(device) && rows > 1 {
+                    continue;
+                }
+                let mut rng = Rng::new(7);
+                let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
+                let product = (0..rows * f).map(|_| act.round(rng.symmetric())).collect::<Vec<_>>();
+                let out_rows = (0..rows as i32).collect::<Vec<_>>();
+                let residual = f32_tensor(device, &[rows, h], &residual);
+                let product = act_tensor(device, act, &[rows, f], &product);
+                let out_rows = i32_tensor(device, &[rows], &out_rows);
+                let down_scale = f32_tensor(device, &[0], &[]);
+                let down_bound = absent_bound(device);
+                let mut line = format!("{:>7} {h:>5} x {f:>4} M {rows:>3}:", device.backend().as_str());
+                for repr in [Repr::Q2k, Repr::Q3k, Repr::Iq3s, Repr::Iq2s, Repr::Iq2xxs, Repr::Iq2xs, Repr::Q4k, Repr::Q4g32s, Repr::Q6k] {
+                    // Bytes alone: a time does not read the values.
+                    let weight = match repr.gguf_source() {
+                        Some(_) => resident_tensor(
+                            device,
+                            repr,
+                            [h, f],
+                            &gguf_bytes(repr, h, f, &mut Rng::new(11), 2.0 / (f as f32).sqrt()),
+                        ),
+                        None => weight(repr, h, f, 11, 1.0).tensor(device),
+                    };
+                    let best = MAPPINGS
+                        .iter()
+                        .map(|mapping| {
+                            let kernel = dense_output::native_for_device_with(
+                                device,
+                                dense_output::Elements {
+                                    A: act.element(),
+                                    DW: repr.resident(device),
+                                },
+                                &dense_output_specialization_on(device, &[("H", h), ("F", f)], *mapping),
+                            )
+                            .unwrap();
+                            let args = || dense_output::Args {
+                                residual: &residual,
+                                product: &product,
+                                down_weight: &weight,
+                                out_rows: &out_rows,
+                                down_scale: &down_scale,
+                                down_bound: &down_bound,
+                            };
+                            let mut value = kernel.call(args()).unwrap().value;
+                            const CALLS: u32 = 20;
+                            (0..12)
+                                .map(|_| {
+                                    let mut batch = seismic::NativeTensorBatch::new(device);
+                                    for _ in 0..CALLS {
+                                        batch
+                                            .push(&kernel, args(), dense_output::OutputArgs { value: &mut value })
+                                            .unwrap();
+                                    }
+                                    let started = std::time::Instant::now();
+                                    batch.submit().unwrap().wait().unwrap();
+                                    started.elapsed() / CALLS
+                                })
+                                .skip(1)
+                                .min()
+                                .unwrap()
+                        })
+                        .min()
+                        .unwrap();
+                    line += &format!(" {repr:?} {:>8.2} us", best.as_secs_f64() * 1e6);
+                }
+                println!("{line}");
+            }
+        }
+    }
+}
+
+/// The columns of a packing bound's run of resident `element` (the
+/// executor's `packing_run`), where the packed forms read it.
+fn packing_runs(element: Element) -> Option<usize> {
+    element.packing().map(|packing| packing.run as usize)
+}
+
+/// `dense_output`'s time per call on Metal over the forms GGUF Q3_K and
+/// IQ3_S weights import as (q3k, iq3s) and the one main held both in (q6k),
+/// at the shapes (H x F) of Qwen3.5 4B Q3_K_M's Q3_K gate/up and query
+/// (9216 x 2560, 8192 x 2560) and Qwen3.8 27B IQ3_XS's IQ3_S gate/up and down
+/// (17408 x 5120, 5120 x 17408), and over q5g32s (its matrix GEMV now the
+/// symmetric one) and q4g32s (unchanged) at the first: at one row (the
+/// GEMV), eight (the matrix GEMV) and 512 (the exact GEMMs, and PACK with the
+/// weight's packing bound where the packed forms read it), the best over
+/// `MAPPINGS` of the best of seven batches.
+#[test]
+#[ignore = "timing"]
+fn dense_output_timing_of_imported_forms() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let device = &device;
+    let act = Act::Bf16;
+    let cases: [(&str, usize, usize, &[Repr]); 4] = [
+        (
+            "qwen3.5-4b ffn_gate",
+            9216,
+            2560,
+            &[Repr::Q3k, Repr::Q6k, Repr::Q5g32s, Repr::Q4g32s],
+        ),
+        ("qwen3.5-4b attn_q", 8192, 2560, &[Repr::Q3k, Repr::Q6k]),
+        ("qwen3.8-27b ffn_gate", 17408, 5120, &[Repr::Iq3s, Repr::Q6k]),
+        ("qwen3.8-27b ffn_down", 5120, 17408, &[Repr::Iq3s, Repr::Q6k]),
+    ];
+    for (name, h, f, reprs) in cases {
+        for &repr in reprs {
+            let element = repr.resident(device);
+            // Bytes alone: a time does not read the values.
+            let weight = match repr.gguf_source() {
+                Some(_) => resident_tensor(
+                    device,
+                    repr,
+                    [h, f],
+                    &gguf_bytes(repr, h, f, &mut Rng::new(11), 2.0 / (f as f32).sqrt()),
+                ),
+                None => weight(repr, h, f, 11, 1.0).tensor(device),
+            };
+            let bound = packing_runs(element).map(|run| {
+                let runs = f / run;
+                let mut bound = f32_tensor(device, &[runs], &vec![0.0; runs]);
+                packing_bound::native_for_device_with(
+                    device,
+                    packing_bound::Elements { W: element },
+                    &NativeSpecialization::new(),
+                )
+                .unwrap()
+                .call(packing_bound::Args {
+                    weight: &weight,
+                    bound: &mut bound,
+                })
+                .unwrap();
+                (bound, runs)
+            });
+            let mut line = format!("{name} {h:>5} x {f:>5} {repr:?}:");
+            for rows in [1usize, 8, 512] {
+                let mut rng = Rng::new(7);
+                let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
+                let product = (0..rows * f).map(|_| act.round(rng.symmetric())).collect::<Vec<_>>();
+                let residual = f32_tensor(device, &[rows, h], &residual);
+                let product = act_tensor(device, act, &[rows, f], &product);
+                let out_rows = i32_tensor(device, &[rows], &(0..rows as i32).collect::<Vec<_>>());
+                let down_scale = f32_tensor(device, &[0], &[]);
+                let calls: u32 = if rows > 64 { 4 } else { 20 };
+                let time = |specialization: &NativeSpecialization, down_bound: &Tensor| {
+                    let kernel = dense_output::native_for_device_with(
+                        device,
+                        dense_output::Elements {
+                            A: act.element(),
+                            DW: element,
+                        },
+                        specialization,
+                    )
+                    .unwrap();
+                    let args = || dense_output::Args {
+                        residual: &residual,
+                        product: &product,
+                        down_weight: &weight,
+                        out_rows: &out_rows,
+                        down_scale: &down_scale,
+                        down_bound,
+                    };
+                    let mut value = kernel.call(args()).unwrap().value;
+                    (0..8)
+                        .map(|_| {
+                            let mut batch = seismic::NativeTensorBatch::new(device);
+                            for _ in 0..calls {
+                                batch
+                                    .push(&kernel, args(), dense_output::OutputArgs { value: &mut value })
+                                    .unwrap();
+                            }
+                            let started = std::time::Instant::now();
+                            batch.submit().unwrap().wait().unwrap();
+                            started.elapsed() / calls
+                        })
+                        .skip(1)
+                        .min()
+                        .unwrap()
+                };
+                let statics = [("H", h), ("F", f)];
+                let absent = absent_bound(device);
+                let exact = MAPPINGS
+                    .iter()
+                    .map(|mapping| time(&dense_output_specialization_on(device, &statics, *mapping), &absent))
+                    .min()
+                    .unwrap();
+                line += &format!(" M {rows} {:.2} us", exact.as_secs_f64() * 1e6);
+                if let (512, Some((bound, runs))) = (rows, &bound) {
+                    let specialization = with_pack(
+                        dense_output_specialization_on(device, &statics, pack_mapping()),
+                        DENSE_OUTPUT_PACKED_LAUNCH,
+                        PACK_DEFAULT,
+                    )
+                    .with_static("DB", *runs as u64);
+                    line += &format!(" PACK {:.2} us", time(&specialization, bound).as_secs_f64() * 1e6);
+                }
+            }
+            println!("{line}");
+        }
+    }
 }

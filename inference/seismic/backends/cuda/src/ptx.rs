@@ -15,8 +15,9 @@ use seismic_ir::storage::LaunchLocalKind;
 use seismic_lang::intrinsics::{AtomicOp, MathOp, ReduceOp};
 use seismic_lang::registry::{
     CodeInterpretation, DecodeStep, FloatCodeFormat, GridCodes, LookupTable, PlaneEncoding,
-    PlaneInfo, PlaneRepackRecipe, RepackExpr, GRID_SIGN_BITS,
+    PlaneInfo, PlaneRepackRecipe, RepackExpr, GridSigns,
 };
+use seismic_lang::repack::WordImmediate;
 use seismic_lang::types::DType;
 use seismic_native_target::{DeviceDescription, NativeCompilationError};
 use std::collections::{BTreeSet, HashMap};
@@ -73,16 +74,12 @@ fn repack_expression_nodes(expression: &RepackExpr) -> u64 {
     match expression {
         RepackExpr::SourceBits { .. } => 1,
         RepackExpr::ShiftLeft { value, .. }
-        | RepackExpr::OffsetI32 { value, .. }
         | RepackExpr::F16ToF32(value)
-        | RepackExpr::I32ToF32(value)
-        | RepackExpr::ScaleF32 { value, .. } => 1 + repack_expression_nodes(value),
-        RepackExpr::BitOr(left, right)
-        | RepackExpr::MultiplyF32(left, right)
-        | RepackExpr::NegateIf {
-            value: left,
-            sign: right,
-        } => 1 + repack_expression_nodes(left) + repack_expression_nodes(right),
+        | RepackExpr::ScaleF32 { value, .. }
+        | RepackExpr::Base3Digit { value, .. } => 1 + repack_expression_nodes(value),
+        RepackExpr::BitOr(left, right) => {
+            1 + repack_expression_nodes(left) + repack_expression_nodes(right)
+        }
         RepackExpr::Lookup { index, .. } => 1 + repack_expression_nodes(index),
     }
 }
@@ -92,16 +89,10 @@ fn repack_lookup_tables(expression: &RepackExpr, tables: &mut Vec<LookupTable>) 
     match expression {
         RepackExpr::SourceBits { .. } => {}
         RepackExpr::ShiftLeft { value, .. }
-        | RepackExpr::OffsetI32 { value, .. }
         | RepackExpr::F16ToF32(value)
-        | RepackExpr::I32ToF32(value)
-        | RepackExpr::ScaleF32 { value, .. } => repack_lookup_tables(value, tables),
-        RepackExpr::BitOr(left, right)
-        | RepackExpr::MultiplyF32(left, right)
-        | RepackExpr::NegateIf {
-            value: left,
-            sign: right,
-        } => {
+        | RepackExpr::ScaleF32 { value, .. }
+        | RepackExpr::Base3Digit { value, .. } => repack_lookup_tables(value, tables),
+        RepackExpr::BitOr(left, right) => {
             repack_lookup_tables(left, tables);
             repack_lookup_tables(right, tables);
         }
@@ -264,6 +255,11 @@ impl<'a> Emitter<'a> {
                         if !self.lookup_tables.contains(&table) {
                             self.lookup_tables.push(table);
                         }
+                    }
+                }
+                Op::Lookup { table, .. } => {
+                    if !self.lookup_tables.contains(table) {
+                        self.lookup_tables.push(*table);
                     }
                 }
                 Op::Branch {
@@ -552,6 +548,24 @@ impl<'a> Emitter<'a> {
                         self.v(a.value),
                         self.v(b.value)
                     ));
+                }
+                ClosedOpView::Lookup { out, table, index } => {
+                    let ordinal = self
+                        .lookup_tables
+                        .iter()
+                        .position(|known| *known == table)
+                        .expect("every lookup table is collected before emission");
+                    let entry = self.t32();
+                    self.line(format!(
+                        "and.b32 {entry}, {}, {};",
+                        self.v(index.value),
+                        table.index_mask()
+                    ));
+                    let base = self.t64();
+                    self.line(format!("mov.u64 {base}, seismic_lookup{ordinal};"));
+                    let address = self.t64();
+                    self.line(format!("mad.wide.u32 {address}, {entry}, 4, {base};"));
+                    self.line(format!("ld.const.u32 {}, [{address}];", self.v(out.value)));
                 }
                 ClosedOpView::Logic { op, out, a, b } => self.line(format!(
                     "{}.b32 {}, {}, {};",
@@ -1592,7 +1606,18 @@ impl<'a> Emitter<'a> {
                             bits,
                             interpretation,
                             ..
-                        } => self.interpret(&temps[recipe.ordinal(*raw)], *bits, interpretation),
+                        } => {
+                            let mut code = temps[recipe.ordinal(*raw)].clone();
+                            if recipe.exceeds(*raw, *bits) {
+                                let low = self.t32();
+                                self.line(format!(
+                                    "and.b32 {low}, {code}, {};",
+                                    u32::MAX >> (32 - bits)
+                                ));
+                                code = low;
+                            }
+                            self.interpret(&code, *bits, interpretation)
+                        }
                         DecodeStep::ReadPlaneLane { plane, .. } => {
                             self.plane_lane(&logical, layout.planes[*plane as usize].group)
                         }
@@ -1890,15 +1915,6 @@ impl<'a> Emitter<'a> {
                 self.line(format!("or.b32 {output}, {left}, {right};"));
                 RepackValue::Integer(output)
             }
-            RepackExpr::OffsetI32 { value, offset } => {
-                let RepackValue::Integer(value) = self.repack_expression(source_packet, value)
-                else {
-                    panic!("closed CUDA repack offsets a floating value")
-                };
-                let output = self.t32();
-                self.line(format!("add.s32 {output}, {value}, {offset};"));
-                RepackValue::Integer(output)
-            }
             RepackExpr::F16ToF32(value) => {
                 let RepackValue::Integer(value) = self.repack_expression(source_packet, value)
                 else {
@@ -1908,26 +1924,6 @@ impl<'a> Emitter<'a> {
                 self.line(format!("cvt.u16.u32 {half}, {value};"));
                 let output = self.f32();
                 self.line(format!("cvt.f32.f16 {output}, {half};"));
-                RepackValue::Float(output)
-            }
-            RepackExpr::I32ToF32(value) => {
-                let RepackValue::Integer(value) = self.repack_expression(source_packet, value)
-                else {
-                    panic!("closed CUDA repack converts an already-floating i32 value")
-                };
-                let output = self.f32();
-                self.line(format!("cvt.rn.f32.s32 {output}, {value};"));
-                RepackValue::Float(output)
-            }
-            RepackExpr::MultiplyF32(left, right) => {
-                let RepackValue::Float(left) = self.repack_expression(source_packet, left) else {
-                    panic!("closed CUDA repack multiply has a non-floating left operand")
-                };
-                let RepackValue::Float(right) = self.repack_expression(source_packet, right) else {
-                    panic!("closed CUDA repack multiply has a non-floating right operand")
-                };
-                let output = self.f32();
-                self.line(format!("mul.rn.f32 {output}, {left}, {right};"));
                 RepackValue::Float(output)
             }
             RepackExpr::ScaleF32 { value, exponent } => {
@@ -1959,21 +1955,25 @@ impl<'a> Emitter<'a> {
                 self.line(format!("ld.const.s32 {output}, [{address}];"));
                 RepackValue::Integer(output)
             }
-            RepackExpr::NegateIf { value, sign } => {
+            RepackExpr::Base3Digit { value, digit } => {
                 let RepackValue::Integer(value) = self.repack_expression(source_packet, value)
                 else {
-                    panic!("closed CUDA repack negates a floating value")
+                    panic!("closed CUDA repack reads a base-3 digit of a floating value")
                 };
-                let RepackValue::Integer(sign) = self.repack_expression(source_packet, sign) else {
-                    panic!("closed CUDA repack negates by a floating sign")
-                };
-                // `(value ^ -sign) + sign`: `-value` where `sign` is 1.
-                let mask = self.t32();
-                self.line(format!("neg.s32 {mask}, {sign};"));
-                let flipped = self.t32();
-                self.line(format!("xor.b32 {flipped}, {value}, {mask};"));
-                let output = self.t32();
-                self.line(format!("add.s32 {output}, {flipped}, {sign};"));
+                let mut output = value;
+                for op in seismic_lang::repack::base3_digit_ops(u32::from(*digit)) {
+                    let result = self.t32();
+                    self.line(match op {
+                        WordImmediate::Multiply(factor) => {
+                            format!("mul.lo.u32 {result}, {output}, {factor};")
+                        }
+                        WordImmediate::And(mask) => format!("and.b32 {result}, {output}, {mask};"),
+                        WordImmediate::ShiftRight(bits) => {
+                            format!("shr.u32 {result}, {output}, {bits};")
+                        }
+                    });
+                    output = result;
+                }
                 RepackValue::Integer(output)
             }
         }
@@ -2107,6 +2107,19 @@ impl<'a> Emitter<'a> {
                 self.line(format!("add.s32 {out}, {raw}, {};", -*offset))
             }
             CodeInterpretation::Odd => self.line(format!("mad.lo.u32 {out}, {raw}, 2, 1;")),
+            CodeInterpretation::SignedOdd => {
+                let low = self.t32();
+                self.line(format!("and.b32 {low}, {raw}, {};", (1u32 << (bits - 1)) - 1));
+                self.line(format!("mad.lo.u32 {low}, {low}, 2, 1;"));
+                let negated = self.t32();
+                self.line(format!("neg.s32 {negated}, {low};"));
+                let sign = self.t32();
+                self.line(format!("shr.b32 {sign}, {raw}, {};", bits - 1));
+                self.line(format!("and.b32 {sign}, {sign}, 1;"));
+                let negative = self.pred();
+                self.line(format!("setp.ne.u32 {negative}, {sign}, 0;"));
+                self.line(format!("selp.s32 {out}, {negated}, {low}, {negative};"));
+            }
             CodeInterpretation::Table(codebook) => {
                 let table = codebook.values;
                 self.line(format!("mov.s32 {out}, {};", table[0]));
@@ -2165,34 +2178,63 @@ impl<'a> Emitter<'a> {
         self.line(format!("mov.u64 {base}, seismic_lookup{ordinal};"));
         let address = self.t64();
         self.line(format!("mad.wide.u32 {address}, {slot}, 4, {base};"));
-        let magnitude = self.t32();
-        self.line(format!("ld.const.s32 {magnitude}, [{address}];"));
-        let signs = self.t32();
-        self.line(format!(
-            "shr.b32 {signs}, {raw}, {};",
-            grid.indices() * grid.index_bits()
-        ));
-        self.line(format!(
-            "and.b32 {signs}, {signs}, {};",
-            (1u32 << GRID_SIGN_BITS) - 1
-        ));
-        let parity = self.t32();
-        self.line(format!("popc.b32 {parity}, {signs};"));
-        self.line(format!("and.b32 {parity}, {parity}, 1;"));
-        self.line(format!("shl.b32 {parity}, {parity}, {GRID_SIGN_BITS};"));
-        self.line(format!("or.b32 {signs}, {signs}, {parity};"));
-        let bit = self.t32();
-        self.line(format!("shr.b32 {bit}, {signs}, {lane};"));
-        self.line(format!("and.b32 {bit}, {bit}, 1;"));
-        let negated = self.t32();
-        self.line(format!("neg.s32 {negated}, {magnitude};"));
-        let negative = self.pred();
-        self.line(format!("setp.ne.u32 {negative}, {bit}, 0;"));
-        let out = self.t32();
-        self.line(format!(
-            "selp.s32 {out}, {negated}, {magnitude}, {negative};"
-        ));
-        out
+        let value = self.t32();
+        self.line(format!("ld.const.s32 {value}, [{address}];"));
+        // The lane signs (`GridSigns::lanes`), none for signed points.
+        let explicit = |this: &mut Self| {
+            let signs = this.t32();
+            this.line(format!("shr.b32 {signs}, {raw}, {};", grid.sign_bit()));
+            this.line(format!(
+                "and.b32 {signs}, {signs}, {};",
+                (1u32 << grid.signs.bits()) - 1
+            ));
+            signs
+        };
+        let lane_signs = match grid.signs {
+            GridSigns::None => None,
+            GridSigns::Explicit8 => Some(explicit(self)),
+            GridSigns::ParityPlus7 => {
+                let signs = explicit(self);
+                let parity = self.t32();
+                self.line(format!("popc.b32 {parity}, {signs};"));
+                self.line(format!("and.b32 {parity}, {parity}, 1;"));
+                self.line(format!(
+                    "shl.b32 {parity}, {parity}, {};",
+                    grid.signs.bits()
+                ));
+                self.line(format!("or.b32 {signs}, {signs}, {parity};"));
+                Some(signs)
+            }
+        };
+        let value = match lane_signs {
+            None => value,
+            Some(signs) => {
+                let bit = self.t32();
+                self.line(format!("shr.b32 {bit}, {signs}, {lane};"));
+                self.line(format!("and.b32 {bit}, {bit}, 1;"));
+                let negated = self.t32();
+                self.line(format!("neg.s32 {negated}, {value};"));
+                let negative = self.pred();
+                self.line(format!("setp.ne.u32 {negative}, {bit}, 0;"));
+                let out = self.t32();
+                self.line(format!("selp.s32 {out}, {negated}, {value}, {negative};"));
+                out
+            }
+        };
+        match grid.delta {
+            Some(exponent) => {
+                let delta = self.t32();
+                self.line(format!("shr.b32 {delta}, {raw}, {};", grid.delta_bit()));
+                self.line(format!("and.b32 {delta}, {delta}, 1;"));
+                // +1, or -1 with the delta bit set: 1 - 2 bit.
+                self.line(format!("mad.lo.s32 {delta}, {delta}, -2, 1;"));
+                let out = self.t32();
+                self.line(format!("shl.b32 {out}, {value}, {exponent};"));
+                self.line(format!("add.s32 {out}, {out}, {delta};"));
+                out
+            }
+            None => value,
+        }
     }
     /// E8M0: the exponent byte is the F32 exponent field (2^(raw - 127));
     /// raw 0 is the F32 subnormal 2^-127 and raw 255 is NaN.
@@ -3808,7 +3850,8 @@ fn op_values<B: seismic_ir::physical_target::PhysicalDialect>(op: &Op<B>) -> Vec
         | Op::Bitcast { out, a, .. }
         | Op::ScalarBits { out, a }
         | Op::ScalarFromBits { out, a }
-        | Op::Not { out, a } => vec![*out, *a],
+        | Op::Not { out, a }
+        | Op::Lookup { out, index: a, .. } => vec![*out, *a],
         Op::Fma { out, a, b, c } => vec![*out, *a, *b, *c],
         Op::VectorFromLanes { out, lanes } => {
             let mut values = vec![*out];

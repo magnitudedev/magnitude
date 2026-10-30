@@ -3576,6 +3576,11 @@ mod internals {
                         digest.bytes(b"select");
                         values(digest, &[*out, *cond, *a, *b]);
                     }
+                    Op::Lookup { out, table, index } => {
+                        digest.bytes(b"lookup");
+                        digest.hashed(table.values());
+                        values(digest, &[*out, *index]);
+                    }
                     Op::Logic { op, out, a, b } => {
                         digest.bytes(b"logic");
                         digest.hashed(op);

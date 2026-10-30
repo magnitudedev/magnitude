@@ -5,7 +5,8 @@
 //!
 //! Every launch reads its arguments from an argument block in upload
 //! storage: its buffer addresses, the scalar-result address, then its words.
-//! The launch's only push constant is the block's address.
+//! The launch's push constants are the block's address and the device's
+//! tables buffer's.
 
 use crate::device::{
     barrier, call, Device, Recording, Retired, RetiredCommand, ARGUMENT_CHUNK_BYTES,
@@ -99,7 +100,7 @@ impl Arguments {
 }
 
 /// Record one launch: its barrier after the previous launch's writes, the
-/// pipeline, the argument block address, the dispatch.
+/// pipeline, the argument block and tables addresses, the dispatch.
 unsafe fn record_launch(
     device: &Device,
     command: vk::CommandBuffer,
@@ -122,7 +123,9 @@ unsafe fn record_launch(
         device.inner.layout,
         vk::ShaderStageFlags::COMPUTE,
         0,
-        &address.to_le_bytes(),
+        &[address, device.inner.tables.address()]
+            .map(u64::to_le_bytes)
+            .concat(),
     );
     raw.cmd_dispatch(command, groups[0], groups[1], groups[2]);
 }

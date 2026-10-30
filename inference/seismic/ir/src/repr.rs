@@ -313,7 +313,7 @@ representation!(Q4K, "q4k", F32, 3);
 representation!(Q5K, "q5k", F32, 4);
 representation!(Q6K, "q6k", F32, 3);
 representation!(Q8G32S, "q8g32s", F32, 2);
-representation!(IQ4G32, "iq4g32", F32, 2);
+representation!(IQ4XS, "iq4xs", F32, 3);
 representation!(Q8G32, "q8g32", F32, 2);
 representation!(Q4G32S, "q4g32s", F32, 2);
 representation!(IQ4G32S, "iq4g32s", F32, 2);
@@ -324,18 +324,21 @@ representation!(Q5G32, "q5g32", F32, 3);
 representation!(MXFP4G32, "mxfp4g32", F32, 2);
 representation!(NVFP4G16, "nvfp4g16", F32, 2);
 representation!(Q4G32SRows16, "q4g32s", Rows16, F32, 2);
+representation!(Q4G32Rows16, "q4g32", Rows16, F32, 2);
 representation!(IQ4G32SRows16, "iq4g32s", Rows16, F32, 2);
 representation!(Q5G32SRows16, "q5g32s", Rows16, F32, 3);
 representation!(Q5G32Rows16, "q5g32", Rows16, F32, 3);
 representation!(MXFP4G32Rows16, "mxfp4g32", Rows16, F32, 2);
 representation!(NVFP4G16Rows16, "nvfp4g16", Rows16, F32, 2);
 representation!(Q4G32SRows8, "q4g32s", Rows8, F32, 2);
+representation!(Q4G32Rows8, "q4g32", Rows8, F32, 2);
 representation!(IQ4G32SRows8, "iq4g32s", Rows8, F32, 2);
 representation!(Q5G32SRows8, "q5g32s", Rows8, F32, 3);
 representation!(Q5G32Rows8, "q5g32", Rows8, F32, 3);
 representation!(MXFP4G32Rows8, "mxfp4g32", Rows8, F32, 2);
 representation!(NVFP4G16Rows8, "nvfp4g16", Rows8, F32, 2);
 representation!(Q4G32SMma16, "q4g32s", Mma16, F32, 2);
+representation!(Q4G32Mma16, "q4g32", Mma16, F32, 2);
 representation!(IQ4G32SMma16, "iq4g32s", Mma16, F32, 2);
 representation!(Q5G32SMma16, "q5g32s", Mma16, F32, 3);
 representation!(Q5G32Mma16, "q5g32", Mma16, F32, 3);
@@ -345,13 +348,14 @@ representation!(Q4KRows16, "q4k", Rows16, F32, 3);
 representation!(Q5KRows16, "q5k", Rows16, F32, 4);
 representation!(Q6KRows16, "q6k", Rows16, F32, 4);
 representation!(Q8G32SRows16, "q8g32s", Rows16, F32, 2);
-representation!(IQ4G32Rows16, "iq4g32", Rows16, F32, 2);
+representation!(IQ4XSRows16, "iq4xs", Rows16, F32, 3);
 representation!(Q4KRows8, "q4k", Rows8, F32, 3);
 representation!(Q5KRows8, "q5k", Rows8, F32, 4);
 representation!(Q6KRows8, "q6k", Rows8, F32, 4);
 representation!(Q8G32SRows8, "q8g32s", Rows8, F32, 2);
-representation!(IQ4G32Rows8, "iq4g32", Rows8, F32, 2);
+representation!(IQ4XSRows8, "iq4xs", Rows8, F32, 3);
 representation!(Q4G32SRows32, "q4g32s", Rows32, F32, 2);
+representation!(Q4G32Rows32, "q4g32", Rows32, F32, 2);
 representation!(IQ4G32SRows32, "iq4g32s", Rows32, F32, 2);
 representation!(Q5G32SRows32, "q5g32s", Rows32, F32, 3);
 representation!(Q5G32Rows32, "q5g32", Rows32, F32, 3);
@@ -361,12 +365,32 @@ representation!(Q4KRows32, "q4k", Rows32, F32, 3);
 representation!(Q5KRows32, "q5k", Rows32, F32, 4);
 representation!(Q6KRows32, "q6k", Rows32, F32, 4);
 representation!(Q8G32SRows32, "q8g32s", Rows32, F32, 2);
-representation!(IQ4G32Rows32, "iq4g32", Rows32, F32, 2);
+representation!(IQ4XSRows32, "iq4xs", Rows32, F32, 3);
 representation!(Q4KMma16, "q4k", Mma16, F32, 3);
 representation!(Q5KMma16, "q5k", Mma16, F32, 4);
 representation!(Q6KMma16, "q6k", Mma16, F32, 4);
 representation!(Q8G32SMma16, "q8g32s", Mma16, F32, 2);
-representation!(IQ4G32Mma16, "iq4g32", Mma16, F32, 2);
+representation!(IQ4XSMma16, "iq4xs", Mma16, F32, 3);
+representation!(Q2K, "q2k", F32, 4);
+representation!(Q2KRows16, "q2k", Rows16, F32, 3);
+representation!(Q2KRows8, "q2k", Rows8, F32, 3);
+representation!(Q2KRows32, "q2k", Rows32, F32, 3);
+representation!(Q2KMma16, "q2k", Mma16, F32, 3);
+representation!(Q3K, "q3k", F32, 3);
+representation!(Q3KRows16, "q3k", Rows16, F32, 4);
+representation!(Q3KRows8, "q3k", Rows8, F32, 4);
+representation!(Q3KRows32, "q3k", Rows32, F32, 4);
+representation!(Q3KMma16, "q3k", Mma16, F32, 4);
+representation!(Q1G128, "q1g128", F32, 2);
+representation!(Q1G128Rows16, "q1g128", Rows16, F32, 2);
+representation!(Q1G128Rows8, "q1g128", Rows8, F32, 2);
+representation!(Q1G128Rows32, "q1g128", Rows32, F32, 2);
+representation!(Q1G128Mma16, "q1g128", Mma16, F32, 2);
+representation!(Q2G256, "q2g256", F32, 2);
+representation!(Q2G256Rows16, "q2g256", Rows16, F32, 2);
+representation!(Q2G256Rows8, "q2g256", Rows8, F32, 2);
+representation!(Q2G256Rows32, "q2g256", Rows32, F32, 2);
+representation!(Q2G256Mma16, "q2g256", Mma16, F32, 2);
 // Vector codes: row layouts keep whole entries in `grids`.
 representation!(IQ2XS, "iq2xs", F32, 3);
 representation!(IQ3XXS, "iq3xxs", F32, 3);
@@ -385,6 +409,30 @@ representation!(IQ2XXSRows16, "iq2xxs", Rows16, F32, 2);
 representation!(IQ2XXSRows8, "iq2xxs", Rows8, F32, 2);
 representation!(IQ2XXSRows32, "iq2xxs", Rows32, F32, 2);
 representation!(IQ2XXSMma16, "iq2xxs", Mma16, F32, 1);
+// iq3s and iq2s entries have a part below a byte: row layouts hold `grids`
+// and `grids_hi`.
+representation!(IQ3S, "iq3s", F32, 3);
+representation!(IQ3SRows16, "iq3s", Rows16, F32, 4);
+representation!(IQ3SRows8, "iq3s", Rows8, F32, 4);
+representation!(IQ3SRows32, "iq3s", Rows32, F32, 4);
+representation!(IQ3SMma16, "iq3s", Mma16, F32, 4);
+representation!(IQ2S, "iq2s", F32, 3);
+representation!(IQ2SRows16, "iq2s", Rows16, F32, 4);
+representation!(IQ2SRows8, "iq2s", Rows8, F32, 4);
+representation!(IQ2SRows32, "iq2s", Rows32, F32, 4);
+representation!(IQ2SMma16, "iq2s", Mma16, F32, 4);
+// iq1s carries its coefficient fields in its entries: row layouts hold
+// `grids`, `grids_hi` and `supers`.
+representation!(IQ1S, "iq1s", F32, 3);
+representation!(IQ1SRows16, "iq1s", Rows16, F32, 3);
+representation!(IQ1SRows8, "iq1s", Rows8, F32, 3);
+representation!(IQ1SRows32, "iq1s", Rows32, F32, 3);
+representation!(IQ1SMma16, "iq1s", Mma16, F32, 3);
+representation!(IQ1M, "iq1m", F32, 3);
+representation!(IQ1MRows16, "iq1m", Rows16, F32, 4);
+representation!(IQ1MRows8, "iq1m", Rows8, F32, 4);
+representation!(IQ1MRows32, "iq1m", Rows32, F32, 4);
+representation!(IQ1MMma16, "iq1m", Mma16, F32, 4);
 // NVFP4's W4A4 elements: nvfp4g16's storage, NVFP4 rows as operands.
 representation!(NVFP4G16A4, "nvfp4g16a4", F32, 2);
 representation!(NVFP4G16A4Rows16, "nvfp4g16a4", Rows16, F32, 2);
@@ -425,18 +473,19 @@ pub fn with_representation<V: RepresentationVisitor>(
         ("q5k", registry::Layout::Rows16) => return visitor.visit::<Q5KRows16>(),
         ("q6k", registry::Layout::Rows16) => return visitor.visit::<Q6KRows16>(),
         ("q8g32s", registry::Layout::Rows16) => return visitor.visit::<Q8G32SRows16>(),
-        ("iq4g32", registry::Layout::Rows16) => return visitor.visit::<IQ4G32Rows16>(),
+        ("iq4xs", registry::Layout::Rows16) => return visitor.visit::<IQ4XSRows16>(),
         ("q4k", registry::Layout::Rows8) => return visitor.visit::<Q4KRows8>(),
         ("q5k", registry::Layout::Rows8) => return visitor.visit::<Q5KRows8>(),
         ("q6k", registry::Layout::Rows8) => return visitor.visit::<Q6KRows8>(),
         ("q8g32s", registry::Layout::Rows8) => return visitor.visit::<Q8G32SRows8>(),
-        ("iq4g32", registry::Layout::Rows8) => return visitor.visit::<IQ4G32Rows8>(),
+        ("iq4xs", registry::Layout::Rows8) => return visitor.visit::<IQ4XSRows8>(),
         ("q4k", registry::Layout::Rows32) => return visitor.visit::<Q4KRows32>(),
         ("q5k", registry::Layout::Rows32) => return visitor.visit::<Q5KRows32>(),
         ("q6k", registry::Layout::Rows32) => return visitor.visit::<Q6KRows32>(),
         ("q8g32s", registry::Layout::Rows32) => return visitor.visit::<Q8G32SRows32>(),
-        ("iq4g32", registry::Layout::Rows32) => return visitor.visit::<IQ4G32Rows32>(),
+        ("iq4xs", registry::Layout::Rows32) => return visitor.visit::<IQ4XSRows32>(),
         ("q4g32s", registry::Layout::Rows32) => return visitor.visit::<Q4G32SRows32>(),
+        ("q4g32", registry::Layout::Rows32) => return visitor.visit::<Q4G32Rows32>(),
         ("iq4g32s", registry::Layout::Rows32) => return visitor.visit::<IQ4G32SRows32>(),
         ("q5g32s", registry::Layout::Rows32) => return visitor.visit::<Q5G32SRows32>(),
         ("q5g32", registry::Layout::Rows32) => return visitor.visit::<Q5G32Rows32>(),
@@ -446,20 +495,39 @@ pub fn with_representation<V: RepresentationVisitor>(
         ("q5k", registry::Layout::Mma16) => return visitor.visit::<Q5KMma16>(),
         ("q6k", registry::Layout::Mma16) => return visitor.visit::<Q6KMma16>(),
         ("q8g32s", registry::Layout::Mma16) => return visitor.visit::<Q8G32SMma16>(),
-        ("iq4g32", registry::Layout::Mma16) => return visitor.visit::<IQ4G32Mma16>(),
+        ("iq4xs", registry::Layout::Mma16) => return visitor.visit::<IQ4XSMma16>(),
+        ("q2k", registry::Layout::Rows16) => return visitor.visit::<Q2KRows16>(),
+        ("q2k", registry::Layout::Rows8) => return visitor.visit::<Q2KRows8>(),
+        ("q2k", registry::Layout::Rows32) => return visitor.visit::<Q2KRows32>(),
+        ("q2k", registry::Layout::Mma16) => return visitor.visit::<Q2KMma16>(),
+        ("q3k", registry::Layout::Rows16) => return visitor.visit::<Q3KRows16>(),
+        ("q3k", registry::Layout::Rows8) => return visitor.visit::<Q3KRows8>(),
+        ("q3k", registry::Layout::Rows32) => return visitor.visit::<Q3KRows32>(),
+        ("q3k", registry::Layout::Mma16) => return visitor.visit::<Q3KMma16>(),
+        ("q1g128", registry::Layout::Rows16) => return visitor.visit::<Q1G128Rows16>(),
+        ("q1g128", registry::Layout::Rows8) => return visitor.visit::<Q1G128Rows8>(),
+        ("q1g128", registry::Layout::Rows32) => return visitor.visit::<Q1G128Rows32>(),
+        ("q1g128", registry::Layout::Mma16) => return visitor.visit::<Q1G128Mma16>(),
+        ("q2g256", registry::Layout::Rows16) => return visitor.visit::<Q2G256Rows16>(),
+        ("q2g256", registry::Layout::Rows8) => return visitor.visit::<Q2G256Rows8>(),
+        ("q2g256", registry::Layout::Rows32) => return visitor.visit::<Q2G256Rows32>(),
+        ("q2g256", registry::Layout::Mma16) => return visitor.visit::<Q2G256Mma16>(),
         ("q4g32s", registry::Layout::Rows16) => return visitor.visit::<Q4G32SRows16>(),
+        ("q4g32", registry::Layout::Rows16) => return visitor.visit::<Q4G32Rows16>(),
         ("iq4g32s", registry::Layout::Rows16) => return visitor.visit::<IQ4G32SRows16>(),
         ("q5g32s", registry::Layout::Rows16) => return visitor.visit::<Q5G32SRows16>(),
         ("q5g32", registry::Layout::Rows16) => return visitor.visit::<Q5G32Rows16>(),
         ("mxfp4g32", registry::Layout::Rows16) => return visitor.visit::<MXFP4G32Rows16>(),
         ("nvfp4g16", registry::Layout::Rows16) => return visitor.visit::<NVFP4G16Rows16>(),
         ("q4g32s", registry::Layout::Rows8) => return visitor.visit::<Q4G32SRows8>(),
+        ("q4g32", registry::Layout::Rows8) => return visitor.visit::<Q4G32Rows8>(),
         ("iq4g32s", registry::Layout::Rows8) => return visitor.visit::<IQ4G32SRows8>(),
         ("q5g32s", registry::Layout::Rows8) => return visitor.visit::<Q5G32SRows8>(),
         ("q5g32", registry::Layout::Rows8) => return visitor.visit::<Q5G32Rows8>(),
         ("mxfp4g32", registry::Layout::Rows8) => return visitor.visit::<MXFP4G32Rows8>(),
         ("nvfp4g16", registry::Layout::Rows8) => return visitor.visit::<NVFP4G16Rows8>(),
         ("q4g32s", registry::Layout::Mma16) => return visitor.visit::<Q4G32SMma16>(),
+        ("q4g32", registry::Layout::Mma16) => return visitor.visit::<Q4G32Mma16>(),
         ("iq4g32s", registry::Layout::Mma16) => return visitor.visit::<IQ4G32SMma16>(),
         ("q5g32s", registry::Layout::Mma16) => return visitor.visit::<Q5G32SMma16>(),
         ("q5g32", registry::Layout::Mma16) => return visitor.visit::<Q5G32Mma16>(),
@@ -477,6 +545,22 @@ pub fn with_representation<V: RepresentationVisitor>(
         ("iq2xxs", registry::Layout::Rows8) => return visitor.visit::<IQ2XXSRows8>(),
         ("iq2xxs", registry::Layout::Rows32) => return visitor.visit::<IQ2XXSRows32>(),
         ("iq2xxs", registry::Layout::Mma16) => return visitor.visit::<IQ2XXSMma16>(),
+        ("iq3s", registry::Layout::Rows16) => return visitor.visit::<IQ3SRows16>(),
+        ("iq3s", registry::Layout::Rows8) => return visitor.visit::<IQ3SRows8>(),
+        ("iq3s", registry::Layout::Rows32) => return visitor.visit::<IQ3SRows32>(),
+        ("iq3s", registry::Layout::Mma16) => return visitor.visit::<IQ3SMma16>(),
+        ("iq2s", registry::Layout::Rows16) => return visitor.visit::<IQ2SRows16>(),
+        ("iq2s", registry::Layout::Rows8) => return visitor.visit::<IQ2SRows8>(),
+        ("iq2s", registry::Layout::Rows32) => return visitor.visit::<IQ2SRows32>(),
+        ("iq2s", registry::Layout::Mma16) => return visitor.visit::<IQ2SMma16>(),
+        ("iq1s", registry::Layout::Rows16) => return visitor.visit::<IQ1SRows16>(),
+        ("iq1s", registry::Layout::Rows8) => return visitor.visit::<IQ1SRows8>(),
+        ("iq1s", registry::Layout::Rows32) => return visitor.visit::<IQ1SRows32>(),
+        ("iq1s", registry::Layout::Mma16) => return visitor.visit::<IQ1SMma16>(),
+        ("iq1m", registry::Layout::Rows16) => return visitor.visit::<IQ1MRows16>(),
+        ("iq1m", registry::Layout::Rows8) => return visitor.visit::<IQ1MRows8>(),
+        ("iq1m", registry::Layout::Rows32) => return visitor.visit::<IQ1MRows32>(),
+        ("iq1m", registry::Layout::Mma16) => return visitor.visit::<IQ1MMma16>(),
         (_, registry::Layout::Packet) => {}
         (other, layout) => panic!(
             "registry storage `{other}` in layout `{}` has no type-level marker",
@@ -496,8 +580,12 @@ pub fn with_representation<V: RepresentationVisitor>(
         "q4k" => visitor.visit::<Q4K>(),
         "q5k" => visitor.visit::<Q5K>(),
         "q6k" => visitor.visit::<Q6K>(),
+        "q2k" => visitor.visit::<Q2K>(),
+        "q3k" => visitor.visit::<Q3K>(),
+        "q1g128" => visitor.visit::<Q1G128>(),
+        "q2g256" => visitor.visit::<Q2G256>(),
         "q8g32s" => visitor.visit::<Q8G32S>(),
-        "iq4g32" => visitor.visit::<IQ4G32>(),
+        "iq4xs" => visitor.visit::<IQ4XS>(),
         "q8g32" => visitor.visit::<Q8G32>(),
         "q4g32s" => visitor.visit::<Q4G32S>(),
         "iq4g32s" => visitor.visit::<IQ4G32S>(),
@@ -508,6 +596,10 @@ pub fn with_representation<V: RepresentationVisitor>(
         "iq2xs" => visitor.visit::<IQ2XS>(),
         "iq3xxs" => visitor.visit::<IQ3XXS>(),
         "iq2xxs" => visitor.visit::<IQ2XXS>(),
+        "iq3s" => visitor.visit::<IQ3S>(),
+        "iq2s" => visitor.visit::<IQ2S>(),
+        "iq1s" => visitor.visit::<IQ1S>(),
+        "iq1m" => visitor.visit::<IQ1M>(),
         other => panic!("registry representation `{other}` has no type-level marker"),
     }
 }

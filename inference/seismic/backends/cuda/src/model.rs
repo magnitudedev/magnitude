@@ -105,6 +105,7 @@ impl AnalyticalModelDefinition<Cuda> for CudaAnalyticalModel {
             | ClosedOpView::ScalarArg { .. }
             | ClosedOpView::Extent { .. }
             | ClosedOpView::ReadPlaneLane { .. }
+            | ClosedOpView::Lookup { .. }
             | ClosedOpView::Branch { .. }
             | ClosedOpView::Repeat { .. } => demand(
                 SERVICE_INSTRUCTION,

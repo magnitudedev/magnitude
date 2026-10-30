@@ -5,9 +5,11 @@
 //! and each codebook's values (on Metal and Vulkan, which read them), and
 //! their bindings by id: `grids::table<ID>::points()` and
 //! `codebooks::table<ID>::values()` (Vulkan `GRIDS_TABLE_<ID>`,
-//! `CODEBOOKS_TABLE_<ID>`). A `u32` grid point is one
+//! `CODEBOOKS_TABLE_<ID>`, arrays of the device's tables buffer: see
+//! `vulkan`). A `u32` grid point is one
 //! word and a `u64` point its (low, high) words; codebook values are exact
-//! floats. A 16-value codebook also has a dialect's own forms of its values:
+//! floats. A codebook also has a dialect's own forms of its values over its
+//! sixteen codes (fewer padded with zeros):
 //! on Metal each code byte's two values + 128 (`codebooks::pairs<ID>`: the
 //! low nibble's in the low byte), on CUDA its values as little-endian s8
 //! words (`codebooks::words<ID>`: `W0`..`W3`, values 4w..4w + 3 in word w)
@@ -54,6 +56,15 @@ enum Element {
     Float,
 }
 
+impl Element {
+    fn bytes(self) -> usize {
+        match self {
+            Self::Pair => 8,
+            Self::Word | Self::Float => 4,
+        }
+    }
+}
+
 struct Dialect {
     file: &'static str,
     begin: &'static str,
@@ -69,7 +80,7 @@ struct Dialect {
     /// The binding of table `id` of `space` to array `space::name` of type
     /// `ty`.
     bind: fn(space: Space, id: usize, name: &str, ty: &str) -> String,
-    /// A 16-value codebook's dialect forms.
+    /// A codebook's dialect forms, its values padded to sixteen.
     sixteen: fn(id: usize, name: &str, values: [i8; 16]) -> String,
     /// A grid's dialect forms.
     grid: fn(id: usize, points: GridPoints) -> String,
@@ -78,7 +89,7 @@ struct Dialect {
     values: bool,
 }
 
-const DIALECTS: [Dialect; 3] = [
+const DIALECTS: [Dialect; 2] = [
     Dialect {
         file: "tables.h",
         begin: "namespace grids { template <uint ID> struct table; }\nnamespace codebooks { template <uint ID> struct table; template <uint ID> struct pairs; }\n\n",
@@ -152,26 +163,6 @@ const DIALECTS: [Dialect; 3] = [
         },
         grid: magnitudes,
         values: false,
-    },
-    Dialect {
-        file: "tables.glsl",
-        begin: "#ifndef SEISMIC_TABLES_GLSL\n#define SEISMIC_TABLES_GLSL\n\n",
-        end: "#endif\n",
-        ty: |element| match element {
-            Element::Word => "uint",
-            Element::Pair => "uvec2",
-            Element::Float => "float",
-        },
-        open: |space, name, ty, len| format!("const {ty} {}_{name}[{len}] = {ty}[](\n", space.name()),
-        close: ");\n\n",
-        pair: |low, high| format!("uvec2(0x{low:08x}u, 0x{high:08x}u)"),
-        bind: |space, id, name, _| {
-            let space = space.name();
-            format!("#define {}_TABLE_{id} {space}_{name}\n", native_macro(space))
-        },
-        sixteen: |_, _, _| String::new(),
-        grid: |_, _| String::new(),
-        values: true,
     },
 ];
 
@@ -277,8 +268,68 @@ fn body(text: &mut String, words: &[String]) {
     writeln!(text, "    {}", lines.join(",\n    ")).unwrap();
 }
 
+/// The Vulkan tables: their bytes (`tables.bin`, `source::VULKAN_TABLES`),
+/// which a device holds in one read-only storage buffer at the push
+/// constant `seismic_tables` (seismic/runtime's Vulkan ABI), and
+/// `tables.glsl`, that buffer's block `seismic_tables_t` and the bindings of
+/// its arrays. A constant array would be no table: glslang copies a constant
+/// array indexed by a variable into the invocation's own storage, which the
+/// driver places in local memory, at every use. The arrays are std430,
+/// eight-byte points before four-byte words and values, so each starts
+/// aligned with no padding and the bytes are the arrays' elements in
+/// declaration order.
+fn vulkan(out: &std::path::Path) {
+    let mut members: Vec<(Space, usize, &str, Element, Vec<u8>)> = Vec::new();
+    for (index, grid) in GRIDS.iter().enumerate() {
+        let (element, bytes): (_, Vec<u8>) = match grid.points {
+            GridPoints::Lanes4(points) => (Element::Word, points.iter().flat_map(|point| point.to_le_bytes()).collect()),
+            GridPoints::Lanes8(points) => (Element::Pair, points.iter().flat_map(|point| point.to_le_bytes()).collect()),
+        };
+        members.push((Space::Grids, index + 1, grid.name, element, bytes));
+    }
+    for (index, codebook) in CODEBOOKS.iter().enumerate() {
+        let bytes = codebook.values.iter().flat_map(|value| f32::from(*value).to_le_bytes()).collect();
+        members.push((Space::Codebooks, index + 1, codebook.name, Element::Float, bytes));
+    }
+    members.sort_by_key(|(_, _, _, element, _)| std::cmp::Reverse(element.bytes()));
+    let mut text = String::from(
+        "// Seismic native library: ggml's grids and codebooks (`ggml-common.h`),\n\
+         // rendered from `magnitude_ggml::tables` by seismic/lang/build.rs: the\n\
+         // device's tables buffer (`seismic_tables`). Byte `j` of a grid point is\n\
+         // its lane `j`; an eight-lane point's lanes 0..3 are its first word, lanes\n\
+         // 4..7 its second.\n\n#ifndef SEISMIC_TABLES_GLSL\n#define SEISMIC_TABLES_GLSL\n\n",
+    );
+    for (index, grid) in GRIDS.iter().enumerate() {
+        writeln!(text, "#define SEISMIC_GRID_{} {}", native_macro(grid.name), index + 1).unwrap();
+    }
+    for (index, codebook) in CODEBOOKS.iter().enumerate() {
+        writeln!(text, "#define SEISMIC_CODEBOOK_{} {}", native_macro(codebook.name), index + 1).unwrap();
+    }
+    text += "\nlayout(buffer_reference, std430, buffer_reference_align = 16) readonly restrict buffer seismic_tables_t {\n";
+    let mut bytes = Vec::new();
+    for (space, _, name, element, values) in &members {
+        let ty = match element {
+            Element::Word => "uint",
+            Element::Pair => "uvec2",
+            Element::Float => "float",
+        };
+        assert_eq!(bytes.len() % element.bytes(), 0, "a table starts aligned to its element");
+        writeln!(text, "    {ty} {}_{name}[{}];", space.name(), values.len() / element.bytes()).unwrap();
+        bytes.extend_from_slice(values);
+    }
+    text += "};\n\n";
+    for (space, id, name, _, _) in &members {
+        let space = space.name();
+        writeln!(text, "#define {}_TABLE_{id} (seismic_tables_t(seismic_tables).{space}_{name})", native_macro(space)).unwrap();
+    }
+    text += "\n#endif\n";
+    std::fs::write(out.join("tables.glsl"), text).expect("tables header");
+    std::fs::write(out.join("tables.bin"), bytes).expect("tables bytes");
+}
+
 fn main() {
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    vulkan(&out);
     for dialect in DIALECTS {
         let mut text = format!(
             "// Seismic native library: ggml's grids and codebooks (`ggml-common.h`),\n\
@@ -324,9 +375,12 @@ fn main() {
                 text += dialect.close;
                 text += &(dialect.bind)(Space::Codebooks, index + 1, codebook.name, ty);
             }
-            if let Ok(values) = <[i8; 16]>::try_from(codebook.values) {
-                text += &(dialect.sixteen)(index + 1, codebook.name, values);
-            }
+            // Codes index only their codebook's values, so a codebook of
+            // fewer than 16 (Q1_0's two) takes the forms padded with zeros.
+            assert!(codebook.values.len() <= 16, "a codebook of at most 4-bit codes");
+            let mut values = [0i8; 16];
+            values[..codebook.values.len()].copy_from_slice(codebook.values);
+            text += &(dialect.sixteen)(index + 1, codebook.name, values);
             text += "\n";
         }
         text += dialect.end;

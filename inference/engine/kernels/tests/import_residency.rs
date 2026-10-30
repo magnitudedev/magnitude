@@ -59,7 +59,7 @@ fn every_gguf_source_imports_as_the_reference_dequantizes() {
         let width = source.logical_group().unwrap().max(128);
         let encoding = magnitude_ggml::Encoding::ALL
             .into_iter()
-            .find(|encoding| seismic::Element::gguf_source(*encoding, width) == Some(source))
+            .find(|encoding| seismic::Element::gguf_source(*encoding) == Some(source))
             .unwrap_or_else(|| panic!("{} is no encoding's source", source.name()));
         let (bytes, reference) = reference_vectors(encoding);
         let shape = [reference.len() as u64 / width, width];
@@ -100,7 +100,7 @@ fn real_gguf_tensors_import_as_the_reference_dequantizes() {
             .into_iter()
             .find(|encoding| encoding.ggml_name() == *type_name)
             .unwrap_or_else(|| panic!("type `{type_name}`"));
-        let source = seismic::Element::gguf_source(encoding, shape[1]).unwrap();
+        let source = seismic::Element::gguf_source(encoding).unwrap();
         for layout in seismic::Layout::ALL {
             let element = source
                 .converted(layout, seismic::OperandRecipe::Rounded)

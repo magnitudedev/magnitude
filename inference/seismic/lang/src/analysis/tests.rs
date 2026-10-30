@@ -175,7 +175,7 @@ fn dense_expand_weights_are_packed_planes_and_its_row_table_is_discrete() {
 fn attention_project_classifies_each_weight_by_its_own_representation() {
     let entry = kernel(
         "attention_project",
-        &[("NW", "f32"), ("QW", "q4k"), ("GW", "q8g32s"), ("KW", "iq4g32"), ("VW", "bf16"), ("A", "bf16")],
+        &[("NW", "f32"), ("QW", "q4k"), ("GW", "q8g32s"), ("KW", "iq4g32s"), ("VW", "bf16"), ("A", "bf16")],
     );
     let analysis = analyze(&entry);
     assert_eq!(
@@ -211,7 +211,7 @@ fn attention_project_classifies_each_weight_by_its_own_representation() {
         &Stored::Packed {
             planes: vec![
                 plane(PlaneField::Words, 1, 1, Lattice::Codes(levels.clone())),
-                plane(PlaneField::Scale, 32, 1, Lattice::Float(DType::F32)),
+                plane(PlaneField::Scale, 32, 1, Lattice::Float(DType::F16)),
             ]
         }
     );

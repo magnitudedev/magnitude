@@ -464,7 +464,7 @@ mod tests {
                 } else {
                     Encoding::F32
                 };
-                let nbytes = source_element(encoding, *shape.last().unwrap())
+                let nbytes = source_element(encoding)
                     .unwrap()
                     .canonical_byte_len(&shape)
                     .unwrap();

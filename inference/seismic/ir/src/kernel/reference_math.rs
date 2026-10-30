@@ -146,6 +146,9 @@ fn expand_recipe<B: PhysicalDialect>(
             reference::ReferenceNode::Resize { value, dtype } => {
                 builder.word_resize(get(value), dtype)
             }
+            reference::ReferenceNode::Lookup { table, index } => {
+                builder.lookup_terminal(table, get(index))
+            }
         };
         values.push(value);
     }

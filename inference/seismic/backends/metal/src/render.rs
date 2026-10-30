@@ -27,8 +27,8 @@ use seismic_ir::physical_target::KernelEmissionLayout;
 use seismic_ir::storage::LaunchLocalKind;
 use seismic_lang::intrinsics::{AtomicOp, MathOp, ReduceOp};
 use seismic_lang::registry::{
-    CodeInterpretation, DecodeStep, FloatCodeFormat, GridCodes, LookupTable, PlaneEncoding,
-    PlaneRepackRecipe, RepackExpr, RepresentationKind, GRID_SIGN_BITS,
+    CodeInterpretation, DecodeStep, FloatCodeFormat, GridCodes, GridSigns, LookupTable,
+    PlaneEncoding, PlaneRepackRecipe, RepackExpr, RepresentationKind,
 };
 use seismic_lang::types::DType;
 use std::collections::BTreeMap;
@@ -792,7 +792,15 @@ impl<'a> Renderer<'a> {
                             bits,
                             interpretation,
                             ..
-                        } => interpret_code(&temps[recipe.ordinal(*raw)], *bits, interpretation),
+                        } => {
+                            let code = &temps[recipe.ordinal(*raw)];
+                            let code = if recipe.exceeds(*raw, *bits) {
+                                format!("(uint({code}) & {}u)", u32::MAX >> (32 - bits))
+                            } else {
+                                code.clone()
+                            };
+                            interpret_code(&code, *bits, interpretation)
+                        }
                         DecodeStep::ReadPlaneLane { plane, .. } => {
                             plane_lane(coords, layout.planes[*plane as usize].group)
                         }
@@ -1101,6 +1109,15 @@ impl<'a> Renderer<'a> {
                     self.name(condition.value()),
                     self.name(raw(a)),
                     self.name(raw(b))
+                );
+                self.assign(raw(out), expression, lines);
+            }
+            ClosedOpView::Lookup { out, table, index } => {
+                let name = self.lookups.borrow_mut().name(table);
+                let expression = format!(
+                    "uint({name}[{} & {}u])",
+                    self.name(raw(index)),
+                    table.index_mask()
                 );
                 self.assign(raw(out), expression, lines);
             }
@@ -1752,21 +1769,9 @@ fn repack_expression(expression: &RepackExpr, source: &str, lookups: &mut Lookup
             repack_expression(left, source, lookups),
             repack_expression(right, source, lookups)
         ),
-        RepackExpr::OffsetI32 { value, offset } => format!(
-            "(int({}) + int({offset}))",
-            repack_expression(value, source, lookups)
-        ),
         RepackExpr::F16ToF32(value) => format!(
             "float(as_type<half>(ushort({})))",
             repack_expression(value, source, lookups)
-        ),
-        RepackExpr::I32ToF32(value) => {
-            format!("float(int({}))", repack_expression(value, source, lookups))
-        }
-        RepackExpr::MultiplyF32(left, right) => format!(
-            "f32_mul(float({}), float({}))",
-            repack_expression(left, source, lookups),
-            repack_expression(right, source, lookups)
         ),
         RepackExpr::ScaleF32 { value, exponent } => format!(
             "f32_mul(float({}), as_type<float>({:#010x}u))",
@@ -1780,15 +1785,39 @@ fn repack_expression(expression: &RepackExpr, source: &str, lookups: &mut Lookup
                 lookups.name(LookupTable::Repack(*table))
             )
         }
-        RepackExpr::NegateIf { value, sign } => {
-            // `(value ^ -sign) + sign`: `-value` where `sign` is 1.
-            let sign = repack_expression(sign, source, lookups);
-            format!(
-                "int((uint({}) ^ (0u - uint({sign}))) + uint({sign}))",
-                repack_expression(value, source, lookups)
+        RepackExpr::Base3Digit { value, digit } => format!(
+            "int({})",
+            word_immediates(
+                &format!("uint({})", repack_expression(value, source, lookups)),
+                &seismic_lang::repack::base3_digit_ops(u32::from(*digit)),
+                ""
             )
-        }
+        ),
     }
+}
+
+/// `ops` applied in turn to the unsigned word `value`, each result an
+/// expression to parenthesize, its shift counts suffixed by `shift_suffix`.
+fn word_immediates(
+    value: &str,
+    ops: &[seismic_lang::repack::WordImmediate],
+    shift_suffix: &str,
+) -> String {
+    use seismic_lang::repack::WordImmediate;
+    ops.iter()
+        .enumerate()
+        .fold(value.to_owned(), |value, (index, op)| {
+            let operand = if index == 0 {
+                value
+            } else {
+                format!("({value})")
+            };
+            match op {
+                WordImmediate::Multiply(factor) => format!("{operand} * {factor}u"),
+                WordImmediate::And(mask) => format!("{operand} & {mask:#x}u"),
+                WordImmediate::ShiftRight(bits) => format!("{operand} >> {bits}{shift_suffix}"),
+            }
+        })
 }
 
 fn strict_f32_publication(dtype: DType, expression: &str) -> String {
@@ -1824,6 +1853,10 @@ fn interpret_code(raw: &str, bits: u32, interpretation: &CodeInterpretation) -> 
         }
         CodeInterpretation::Offset(offset) => format!("(int({raw}) - {offset})"),
         CodeInterpretation::Odd => format!("int(2u * uint({raw}) + 1u)"),
+        CodeInterpretation::SignedOdd => {
+            let odd = format!("int(2u * (uint({raw}) & {}u) + 1u)", (1u32 << (bits - 1)) - 1);
+            format!("(((uint({raw}) >> {}u) & 1u) != 0u ? -{odd} : {odd})", bits - 1)
+        }
         CodeInterpretation::Table(codebook) => {
             let table = codebook.values;
             let mut expression = table[0].to_string();
@@ -1847,7 +1880,7 @@ fn plane_lane(coords: &[String], group: u32) -> String {
 }
 
 /// The code of the value at `lane` of vector-code entry `raw`
-/// (`GridCodes::code`), reading the grid's magnitudes from `table`.
+/// (`GridCodes::code`), reading the grid's lane values from `table`.
 fn grid_code(raw: &str, lane: &str, grid: &GridCodes, table: &str) -> String {
     let lanes = grid.lanes();
     let index = format!(
@@ -1856,17 +1889,36 @@ fn grid_code(raw: &str, lane: &str, grid: &GridCodes, table: &str) -> String {
         lanes.trailing_zeros(),
         (1u32 << grid.index_bits()) - 1
     );
-    let magnitude = format!(
-        "{table}[({index}) * {lanes}u + (({lane}) & {}u)]",
+    let value = format!(
+        "int({table}[({index}) * {lanes}u + (({lane}) & {}u)])",
         lanes - 1
     );
-    let signs = format!(
+    // The lane signs (`GridSigns::lanes`), none for signed points.
+    let explicit = format!(
         "((uint({raw}) >> {}u) & {}u)",
-        grid.indices() * grid.index_bits(),
-        (1u32 << GRID_SIGN_BITS) - 1
+        grid.sign_bit(),
+        (1u32 << grid.signs.bits()) - 1
     );
-    let signs = format!("({signs} | ((popcount({signs}) & 1u) << {GRID_SIGN_BITS}u))");
-    format!("(((({signs}) >> ({lane})) & 1u) != 0u ? -int({magnitude}) : int({magnitude}))")
+    let lane_signs = match grid.signs {
+        GridSigns::None => None,
+        GridSigns::Explicit8 => Some(explicit),
+        GridSigns::ParityPlus7 => Some(format!(
+            "({explicit} | ((popcount({explicit}) & 1u) << {}u))",
+            grid.signs.bits()
+        )),
+    };
+    let value = match lane_signs {
+        None => value,
+        Some(signs) => format!("(((({signs}) >> ({lane})) & 1u) != 0u ? -{value} : {value})"),
+    };
+    match grid.delta {
+        Some(exponent) => format!(
+            "((({value}) * {}) + (((uint({raw}) >> {}u) & 1u) != 0u ? -1 : 1))",
+            1i32 << exponent,
+            grid.delta_bit()
+        ),
+        None => value,
+    }
 }
 
 fn float_code_function(format: FloatCodeFormat) -> &'static str {

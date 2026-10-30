@@ -845,6 +845,23 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
         });
         PortableValue { raw: out, ty }
     }
+    pub(super) fn lookup_terminal(
+        &mut self,
+        table: seismic_lang::registry::LookupTable,
+        index: PortableValue,
+    ) -> PortableValue {
+        assert_eq!(
+            index.ty,
+            ValueType::Scalar(DType::U32),
+            "a lookup index is a U32 word"
+        );
+        let ty = ValueType::Scalar(DType::U32);
+        let uniformity = self.inner.uniformity_of(index.raw);
+        let index = self.used(index);
+        let out = self.inner.define_with(ty, None, uniformity);
+        self.inner.emit(Op::Lookup { out, table, index });
+        PortableValue { raw: out, ty }
+    }
     pub fn not(&mut self, a: PortableValue) -> PortableValue {
         assert_eq!(a.ty, ValueType::Bool);
         let uniformity = self.inner.uniformity_of(a.raw);
@@ -3006,6 +3023,7 @@ fn rebrand_op<B: PhysicalDialect>(
         | Op::VectorCast { out, a, .. }
         | Op::VectorLane { out, vector: a, .. }
         | Op::VectorReduceAdd { out, vector: a }
+        | Op::Lookup { out, index: a, .. }
         | Op::Not { out, a } => {
             *out = value(*out);
             *a = value(*a);

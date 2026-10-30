@@ -25,7 +25,9 @@ use crate::element::{bf16_to_f32, f16_to_f32, Dense};
 use crate::quant::{Q8Block, Q8_BLOCK};
 use crate::reduce::{combine, LANES};
 use magnitude_ggml::tables;
-use seismic_lang::registry::{Layout, RepresentationInfo, RepresentationKind, RowPlaneRole};
+use seismic_lang::registry::{
+    GridSigns, Layout, LocalBias, MinimumSign, RepresentationInfo, RepresentationKind, RowPlaneRole,
+};
 use std::marker::PhantomData;
 
 /// Values of one packet.
@@ -457,12 +459,19 @@ impl Interpretation for Odd {
 }
 
 impl<const ID: usize> Table<ID> {
+    /// The codebook's values (of codes of at most 4 bits).
+    const LEN: usize = {
+        let len = tables::CODEBOOKS[ID].values.len();
+        assert!(len <= 16, "a codebook of at most 4-bit codes");
+        len
+    };
+    /// The values padded with zeros to sixteen, a 16-byte lookup table
+    /// (codes index only the codebook's own).
     const VALUES: [i8; 16] = {
         let values = tables::CODEBOOKS[ID].values;
-        assert!(values.len() == 16, "a 4-bit codebook");
         let mut out = [0i8; 16];
         let mut i = 0;
-        while i < 16 {
+        while i < Self::LEN {
             out[i] = values[i];
             i += 1;
         }
@@ -471,7 +480,7 @@ impl<const ID: usize> Table<ID> {
     const LEAST: i8 = {
         let mut least = Self::VALUES[0];
         let mut i = 1;
-        while i < 16 {
+        while i < Self::LEN {
             if Self::VALUES[i] < least {
                 least = Self::VALUES[i];
             }
@@ -482,7 +491,7 @@ impl<const ID: usize> Table<ID> {
     const GREATEST: i8 = {
         let mut greatest = Self::VALUES[0];
         let mut i = 1;
-        while i < 16 {
+        while i < Self::LEN {
             if Self::VALUES[i] > greatest {
                 greatest = Self::VALUES[i];
             }
@@ -559,17 +568,20 @@ pub trait Codes: Copy + Send + Sync + 'static {
 
 /// Codes in a `LOW`-bit low plane and a `HIGH`-bit high plane
 /// (`registry::code_planes`), read through interpretation `I`: code `i` of
-/// a packet is nibble `i & 1` of byte `i / 2` of a 4-bit low plane (byte
-/// `i` of an 8-bit one) joined with bits `HIGH i ..` of the high plane
-/// shifted to bit `LOW`.
+/// a packet is bits `LOW i ..` of the low plane (the low nibble of byte
+/// `i / 2` first for 4-bit codes; byte `i` of an 8-bit plane) joined with
+/// bits `HIGH i ..` of the high plane shifted to bit `LOW`.
 #[derive(Clone, Copy, Debug)]
 pub struct Planes<const LOW: u32, const HIGH: u32, I>(PhantomData<I>);
 
-impl<const HIGH: u32, I> Planes<4, HIGH, I> {
-    /// The packet's 16 low-plane bytes.
+impl<const LOW: u32, const HIGH: u32, I> Planes<LOW, HIGH, I> {
+    /// The packet's `4 LOW` low-plane bytes.
     #[inline(always)]
     unsafe fn low_bytes(at: At) -> *const u8 {
-        unsafe { at.plane(RowPlaneRole::Codes).add(16 * at.packet) }
+        unsafe {
+            at.plane(RowPlaneRole::Codes)
+                .add(4 * LOW as usize * at.packet)
+        }
     }
 
     /// The packet's `4 HIGH` high-plane bytes.
@@ -584,12 +596,21 @@ impl<const HIGH: u32, I> Planes<4, HIGH, I> {
     /// The packet's raw codes.
     #[inline(always)]
     unsafe fn raw(at: At) -> [u8; PACKET] {
-        const { assert!(HIGH <= 2, "a high plane of at most 2 bits") };
-        let bytes: [u8; 16] = unsafe { read(Self::low_bytes(at)) };
+        const {
+            assert!(
+                matches!(LOW, 1 | 2 | 4) && HIGH <= 2,
+                "a 1-, 2- or 4-bit low plane and a high plane of at most 2 bits"
+            )
+        };
+        let per_byte = (8 / LOW) as usize;
+        let mask = (1u8 << LOW) - 1;
         let mut codes = [0u8; PACKET];
-        for (i, byte) in bytes.iter().enumerate() {
-            codes[2 * i] = byte & 15;
-            codes[2 * i + 1] = byte >> 4;
+        let low = unsafe { Self::low_bytes(at) };
+        for i in 0..PACKET / per_byte {
+            let byte = unsafe { *low.add(i) };
+            for j in 0..per_byte {
+                codes[per_byte * i + j] = (byte >> (LOW as usize * j)) & mask;
+            }
         }
         if HIGH > 0 {
             let high: u64 = match HIGH {
@@ -598,7 +619,7 @@ impl<const HIGH: u32, I> Planes<4, HIGH, I> {
             };
             let mask = (1u64 << HIGH) - 1;
             for (i, code) in codes.iter_mut().enumerate() {
-                *code |= (((high >> (HIGH as usize * i)) & mask) as u8) << 4;
+                *code |= (((high >> (HIGH as usize * i)) & mask) as u8) << LOW;
             }
         }
         codes
@@ -607,10 +628,11 @@ impl<const HIGH: u32, I> Planes<4, HIGH, I> {
     #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
     #[inline(always)]
     unsafe fn raw_neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
+        const { assert!(HIGH <= 1 || LOW == 4, "a 2-bit high plane joins a nibble low plane") };
         let low = unsafe { Self::low_bytes(at) };
         match HIGH {
-            0 => unsafe { packed_neon::nibbles(low, 0) },
-            1 => unsafe { packed_neon::nibbles(low, read(Self::high_bytes(at))) },
+            0 => unsafe { packed_neon::codes::<LOW>(low, 0) },
+            1 => unsafe { packed_neon::codes::<LOW>(low, read(Self::high_bytes(at))) },
             _ => unsafe { packed_neon::nibbles2(low, Self::high_bytes(at)) },
         }
     }
@@ -618,18 +640,19 @@ impl<const HIGH: u32, I> Planes<4, HIGH, I> {
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn raw_x86(at: At) -> std::arch::x86_64::__m256i {
+        const { assert!(HIGH <= 1 || LOW == 4, "a 2-bit high plane joins a nibble low plane") };
         let low = unsafe { Self::low_bytes(at) };
         match HIGH {
-            0 => unsafe { packed_x86::nibbles(low) },
-            1 => unsafe { packed_x86::nibbles1(low, read(Self::high_bytes(at))) },
+            0 => unsafe { packed_x86::codes::<LOW>(low) },
+            1 => unsafe { packed_x86::codes1::<LOW>(low, read(Self::high_bytes(at))) },
             _ => unsafe { packed_x86::nibbles2(low, Self::high_bytes(at)) },
         }
     }
 }
 
-impl<const HIGH: u32> Codes for Planes<4, HIGH, Unsigned> {
+impl<const LOW: u32, const HIGH: u32> Codes for Planes<LOW, HIGH, Unsigned> {
     const LEAST: i32 = 0;
-    const GREATEST: i32 = (16 << HIGH) - 1;
+    const GREATEST: i32 = (1 << (LOW + HIGH)) - 1;
 
     #[inline(always)]
     unsafe fn values(at: At) -> [i8; PACKET] {
@@ -660,12 +683,12 @@ impl<const HIGH: u32> Codes for Planes<4, HIGH, Unsigned> {
     }
 }
 
-impl<const HIGH: u32, const C: i32> Codes for Planes<4, HIGH, Offset<C>> {
+impl<const LOW: u32, const HIGH: u32, const C: i32> Codes for Planes<LOW, HIGH, Offset<C>> {
     const LEAST: i32 = {
         assert!(C >= 0 && C <= 128, "values fit a signed byte");
         -C
     };
-    const GREATEST: i32 = (16 << HIGH) - 1 - C;
+    const GREATEST: i32 = (1 << (LOW + HIGH)) - 1 - C;
 
     #[inline(always)]
     unsafe fn values(at: At) -> [i8; PACKET] {
@@ -700,8 +723,11 @@ impl<const HIGH: u32, const C: i32> Codes for Planes<4, HIGH, Offset<C>> {
     }
 }
 
-impl<const ID: usize> Codes for Planes<4, 0, Table<ID>> {
-    const LEAST: i32 = Table::<ID>::LEAST as i32;
+impl<const LOW: u32, const ID: usize> Codes for Planes<LOW, 0, Table<ID>> {
+    const LEAST: i32 = {
+        assert!(1 << LOW == Table::<ID>::LEN, "a code names each of its codebook's values");
+        Table::<ID>::LEAST as i32
+    };
     const GREATEST: i32 = Table::<ID>::GREATEST as i32;
 
     #[inline(always)]
@@ -709,7 +735,7 @@ impl<const ID: usize> Codes for Planes<4, 0, Table<ID>> {
         let raw = unsafe { Self::raw(at) };
         let mut values = [0i8; PACKET];
         for i in 0..PACKET {
-            values[i] = Table::<ID>::value::<4>(u32::from(raw[i])) as i8;
+            values[i] = Table::<ID>::value::<LOW>(u32::from(raw[i])) as i8;
         }
         values
     }
@@ -775,57 +801,130 @@ impl Planes<8, 0, Twos> {
     }
 }
 
-/// Grid codes (`registry::GridCodes`): `BYTES`-byte entries of grid `GRID`
-/// (its position in `tables::GRIDS`), one per eight values, each holding
-/// `8 / lanes` `INDEX_BITS`-bit point indices, first lowest, then seven sign
-/// bits completed by an eighth of even parity. The value at lane `j` of an
-/// entry is byte `j % lanes` of its point `j / lanes`, negated by sign `j`.
+/// Grid codes (`registry::GridCodes`): entries of grid `GRID` (its position
+/// in `tables::GRIDS`), one per eight values, `BYTES` whole bytes in the
+/// codes plane and `HIGH` bits more in the high plane, each holding
+/// `8 / lanes` `INDEX_BITS`-bit point indices, first lowest, then the sign
+/// bits of sign mode `GridSigns::ALL[SIGNS]` (over magnitudes; none for
+/// signed points), then, where `DELTA_BIT` is not 0, the
+/// delta bit there. The value at lane `j` of an entry is byte `j % lanes` of
+/// its point `j / lanes`, negated by sign `j`, then `2^DELTA` times it plus
+/// 1, or minus 1 with the delta bit set, with a delta.
 #[derive(Clone, Copy, Debug)]
-pub struct Grid<const GRID: usize, const INDEX_BITS: u32, const BYTES: usize>;
+pub struct Grid<
+    const GRID: usize,
+    const INDEX_BITS: u32,
+    const BYTES: usize,
+    const HIGH: u32,
+    const SIGNS: u32,
+    const DELTA_BIT: u32,
+    const DELTA: u32,
+>;
 
-impl<const GRID: usize, const INDEX_BITS: u32, const BYTES: usize> Grid<GRID, INDEX_BITS, BYTES> {
+impl<
+        const GRID: usize,
+        const INDEX_BITS: u32,
+        const BYTES: usize,
+        const HIGH: u32,
+        const SIGNS: u32,
+        const DELTA_BIT: u32,
+        const DELTA: u32,
+    > Grid<GRID, INDEX_BITS, BYTES, HIGH, SIGNS, DELTA_BIT, DELTA>
+{
     const POINTS: tables::GridPoints = tables::GRIDS[GRID].points;
-    /// The greatest magnitude of a point lane.
+    const SIGN_MODE: GridSigns = GridSigns::ALL[SIGNS as usize];
+    /// The greatest magnitude of a code.
     const MAGNITUDE: i32 = {
-        let mut greatest = 0u8;
+        let mut greatest = 0i32;
         let mut index = 0;
         while index < Self::POINTS.len() {
             let mut lane = 0;
             while lane < Self::POINTS.lanes() {
                 let byte = Self::POINTS.byte(index, lane);
-                if byte > greatest {
-                    greatest = byte;
+                let value = match Self::SIGN_MODE {
+                    GridSigns::None => byte as i8 as i32,
+                    GridSigns::ParityPlus7 | GridSigns::Explicit8 => byte as i32,
+                }
+                .abs();
+                if value > greatest {
+                    greatest = value;
                 }
                 lane += 1;
             }
             index += 1;
         }
-        assert!(
-            greatest <= i8::MAX as u8,
-            "grid magnitudes fit a signed byte"
-        );
-        greatest as i32
+        let greatest = if DELTA_BIT != 0 {
+            (greatest << DELTA) + 1
+        } else {
+            greatest
+        };
+        assert!(greatest <= i8::MAX as i32, "grid codes fit a signed byte");
+        greatest
     };
 
-    /// Entry `e` of the storage group of `at`.
     #[inline(always)]
     unsafe fn entry(at: At, e: usize) -> u32 {
-        let at = unsafe { at.plane(RowPlaneRole::Codes).add(BYTES * e) };
-        (0..BYTES).fold(0, |entry, byte| {
-            entry | (u32::from(unsafe { *at.add(byte) }) << (8 * byte))
-        })
+        unsafe { grid_entry::<BYTES, HIGH>(at, e) }
+    }
+
+    /// The eight values of `entry`.
+    #[inline(always)]
+    fn entry_values(entry: u32) -> [i8; 8] {
+        let mask = (1u32 << INDEX_BITS) - 1;
+        let point = match Self::POINTS {
+            tables::GridPoints::Lanes8(points) => points[(entry & mask) as usize],
+            tables::GridPoints::Lanes4(points) => {
+                u64::from(points[(entry & mask) as usize])
+                    | (u64::from(points[((entry >> INDEX_BITS) & mask) as usize]) << 32)
+            }
+        };
+        let values = match Self::SIGN_MODE {
+            GridSigns::None => point.to_le_bytes().map(|byte| byte as i8),
+            GridSigns::ParityPlus7 | GridSigns::Explicit8 => {
+                let signs = (entry >> (8 / Self::POINTS.lanes() * INDEX_BITS))
+                    & ((1 << Self::SIGN_MODE.bits()) - 1);
+                grid_values(point, Self::SIGN_MODE.lanes(signs))
+            }
+        };
+        if DELTA_BIT == 0 {
+            return values;
+        }
+        let delta = if (entry >> DELTA_BIT) & 1 == 0 { 1 } else { -1 };
+        values.map(|value| (value << DELTA) + delta)
     }
 }
 
+/// Entry `e` of the storage group of `at` of grid entries of `BYTES` whole
+/// bytes and `HIGH` high bits: its whole bytes, then its high bits.
+///
+/// # Safety
+/// `at` is a packet of a row of such entries.
+#[inline(always)]
+unsafe fn grid_entry<const BYTES: usize, const HIGH: u32>(at: At, e: usize) -> u32 {
+    let low = unsafe { at.plane(RowPlaneRole::Codes).add(BYTES * e) };
+    let low = (0..BYTES).fold(0, |entry, byte| {
+        entry | (u32::from(unsafe { *low.add(byte) }) << (8 * byte))
+    });
+    if HIGH == 0 {
+        return low;
+    }
+    let bit = HIGH as usize * e;
+    let high = unsafe { at.plane(RowPlaneRole::High).add(bit / 8) };
+    let mut bits = u32::from(unsafe { *high });
+    if bit % 8 + HIGH as usize > 8 {
+        bits |= u32::from(unsafe { *high.add(1) }) << 8;
+    }
+    low | (((bits >> (bit % 8)) & ((1 << HIGH) - 1)) << (8 * BYTES))
+}
+
 /// The eight values one grid entry gives: `point`'s magnitudes (byte `j` the
-/// lane-`j` magnitude), negated where the seven sign bits `signs` and their
-/// even-parity eighth are set. Bit `j` of the signs becomes byte `j` of a
-/// mask; a magnitude is below 128, so `(m ^ 0xff) + 1 = -m` bytewise without
-/// carries.
+/// lane-`j` magnitude), negated where the eight lane signs `signs` are set.
+/// Bit `j` of the signs becomes byte `j` of a mask; a magnitude is below
+/// 128, so `(m ^ 0xff) + 1 = -m` bytewise without carries.
 #[inline(always)]
 fn grid_values(point: u64, signs: u32) -> [i8; 8] {
     const ONES: u64 = 0x0101_0101_0101_0101;
-    let signs = u64::from(signs | ((signs.count_ones() & 1) << 7));
+    let signs = u64::from(signs);
     let spread = signs.wrapping_mul(ONES) & 0x8040_2010_0804_0201;
     let negative = (spread.wrapping_add(0x7f7f_7f7f_7f7f_7f7f) >> 7) & ONES;
     ((point ^ (negative * 0xff)).wrapping_add(negative))
@@ -833,29 +932,25 @@ fn grid_values(point: u64, signs: u32) -> [i8; 8] {
         .map(|byte| byte as i8)
 }
 
-impl<const GRID: usize, const INDEX_BITS: u32, const BYTES: usize> Codes
-    for Grid<GRID, INDEX_BITS, BYTES>
+impl<
+        const GRID: usize,
+        const INDEX_BITS: u32,
+        const BYTES: usize,
+        const HIGH: u32,
+        const SIGNS: u32,
+        const DELTA_BIT: u32,
+        const DELTA: u32,
+    > Codes for Grid<GRID, INDEX_BITS, BYTES, HIGH, SIGNS, DELTA_BIT, DELTA>
 {
     const LEAST: i32 = -Self::MAGNITUDE;
     const GREATEST: i32 = Self::MAGNITUDE;
 
     #[inline(always)]
     unsafe fn values(at: At) -> [i8; PACKET] {
-        let mask = (1u32 << INDEX_BITS) - 1;
         let mut values = [0i8; PACKET];
         for e in 0..PACKET / 8 {
             let entry = unsafe { Self::entry(at, 4 * at.packet + e) };
-            let (point, signs) = match Self::POINTS {
-                tables::GridPoints::Lanes8(points) => {
-                    (points[(entry & mask) as usize], entry >> INDEX_BITS)
-                }
-                tables::GridPoints::Lanes4(points) => (
-                    u64::from(points[(entry & mask) as usize])
-                        | (u64::from(points[((entry >> INDEX_BITS) & mask) as usize]) << 32),
-                    entry >> (2 * INDEX_BITS),
-                ),
-            };
-            values[8 * e..8 * e + 8].copy_from_slice(&grid_values(point, signs & 127));
+            values[8 * e..8 * e + 8].copy_from_slice(&Self::entry_values(entry));
         }
         values
     }
@@ -1507,11 +1602,12 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32> C
 }
 
 /// The local codes of hierarchical coefficients: per coefficient group a
-/// scale code (and with a minimum a minimum code).
+/// scale code (and with a bias its minimum code).
 pub trait Locals: Copy + Send + Sync + 'static {
-    /// The sign of the minimum's term in a value's bias: -1 or 1, or 0
-    /// without a minimum.
-    const MIN_SIGN: i32;
+    /// The groups' bias, entering a value as a minimum term: a minimum code
+    /// under the stored minimum factor, or the scale code signed by the
+    /// group's sign bit under the scale factor times `2^exponent`.
+    const BIAS: Option<LocalBias>;
 
     /// The (scale, minimum) codes' values of `GROUP`-value coefficient group
     /// `local` of the storage group of `at`; the minimum is 0 without one.
@@ -1541,20 +1637,17 @@ pub trait Locals: Copy + Send + Sync + 'static {
 /// Local codes in the scales plane: per coefficient group a `BITS`-bit
 /// scale code (then, with a minimum of sign `MIN_SIGN`, a minimum code) read
 /// through `L`, group `j`'s at bit `j BITS (1 + minimum)` of its storage
-/// group's bytes.
+/// group's bytes. (A sign bit of a signed bias is carried, `Carried`.)
 #[derive(Clone, Copy, Debug)]
 pub struct Scales<L, const BITS: u32, const MIN_SIGN: i32>(PhantomData<L>);
 
 impl<L: Interpretation, const BITS: u32, const MIN_SIGN: i32> Scales<L, BITS, MIN_SIGN> {
     /// Whether the groups have a minimum code.
-    const MIN: bool = {
-        assert!(MIN_SIGN.abs() <= 1, "a minimum's sign is -1, 0 or 1");
-        MIN_SIGN != 0
-    };
+    const MIN: bool = <Self as Locals>::BIAS.is_some();
 
     /// Bits of one group's codes; every group's lie within two bytes.
     const WIDTH: usize = {
-        let width = BITS as usize * (1 + Self::MIN as usize);
+        let width = LocalBias::field_bits(<Self as Locals>::BIAS, BITS) as usize;
         let mut group = 0;
         while group < 8 {
             assert!(
@@ -1588,7 +1681,13 @@ impl<L: Interpretation, const BITS: u32, const MIN_SIGN: i32> Scales<L, BITS, MI
 }
 
 impl<L: Interpretation, const BITS: u32, const MIN_SIGN: i32> Locals for Scales<L, BITS, MIN_SIGN> {
-    const MIN_SIGN: i32 = MIN_SIGN;
+    /// The groups' minimum code, if they have one (`MinimumSign::value`).
+    const BIAS: Option<LocalBias> = match MIN_SIGN {
+        0 => None,
+        1 => Some(LocalBias::Minimum(MinimumSign::Add)),
+        -1 => Some(LocalBias::Minimum(MinimumSign::Subtract)),
+        _ => panic!("a minimum's sign is -1, 0 or 1"),
+    };
 
     #[inline(always)]
     unsafe fn block<const GROUP: usize>(at: At) -> [[(i32, i32); 2]; 8] {
@@ -1633,28 +1732,52 @@ impl<L: Interpretation, const BITS: u32, const MIN_SIGN: i32> Locals for Scales<
     }
 }
 
-/// Local scale codes carried by grid entries of `ENTRY_BYTES` bytes: bit
-/// `j` of a group's `BITS`-bit code at bit `BIT` of the group's entry `j`,
-/// read through `L`.
+/// Local scale codes carried by grid entries of `ENTRY_BYTES` whole bytes
+/// and `HIGH` high bits (`Grid`): bit `j` of a group's `BITS`-bit code at
+/// bit `BIT` of the group's entry `j`, read through `L`, and with `SIGNED`
+/// the sign bit of its signed bias (`LocalBias::Signed`, of `EXPONENT`) past it.
 #[derive(Clone, Copy, Debug)]
-pub struct Carried<const BIT: u32, const ENTRY_BYTES: usize, L, const BITS: u32>(PhantomData<L>);
+pub struct Carried<
+    const BIT: u32,
+    const ENTRY_BYTES: usize,
+    const HIGH: u32,
+    L,
+    const BITS: u32,
+    const SIGNED: bool,
+    const EXPONENT: i32,
+>(PhantomData<L>);
 
-impl<const BIT: u32, const ENTRY_BYTES: usize, L: Interpretation, const BITS: u32> Locals
-    for Carried<BIT, ENTRY_BYTES, L, BITS>
+impl<
+        const BIT: u32,
+        const ENTRY_BYTES: usize,
+        const HIGH: u32,
+        L: Interpretation,
+        const BITS: u32,
+        const SIGNED: bool,
+        const EXPONENT: i32,
+    > Locals for Carried<BIT, ENTRY_BYTES, HIGH, L, BITS, SIGNED, EXPONENT>
 {
-    const MIN_SIGN: i32 = 0;
+    const BIAS: Option<LocalBias> = if SIGNED {
+        Some(LocalBias::Signed { exponent: EXPONENT })
+    } else {
+        None
+    };
 
     #[inline(always)]
     unsafe fn read<const GROUP: usize>(at: At, local: usize) -> (i32, i32) {
-        let entries = unsafe {
-            at.plane(RowPlaneRole::Codes)
-                .add(ENTRY_BYTES * (GROUP / 8) * local)
-        };
-        let (byte, bit) = (BIT as usize / 8, BIT % 8);
-        let code = (0..BITS as usize).fold(0u32, |code, j| {
-            code | (((u32::from(unsafe { *entries.add(ENTRY_BYTES * j + byte) }) >> bit) & 1) << j)
+        let width = LocalBias::field_bits(Self::BIAS, BITS);
+        let first = (GROUP / 8) * local;
+        let code = (0..width as usize).fold(0u32, |code, j| {
+            let entry = unsafe { grid_entry::<ENTRY_BYTES, HIGH>(at, first + j) };
+            code | (((entry >> BIT) & 1) << j)
         });
-        (L::value::<BITS>(code), 0)
+        let scale = L::value::<BITS>(code & ((1 << BITS) - 1));
+        let minimum = if SIGNED && (code >> BITS) & 1 != 0 {
+            -scale
+        } else {
+            scale
+        };
+        (scale, if SIGNED { minimum } else { 0 })
     }
 }
 
@@ -1662,7 +1785,7 @@ impl<const BIT: u32, const ENTRY_BYTES: usize, L: Interpretation, const BITS: u3
 /// group (the factor group) a factor of encoding `F` (then with a minimum a
 /// minimum factor) in the supers plane, scaled by `2^EXPONENT`; per `GROUP`
 /// values local codes `L`. A value's scale is `factor * 2^CODE_EXPONENT *
-/// scale code` and its bias `L::MIN_SIGN * minimum factor * minimum code`. A
+/// scale code` and its bias `±minimum factor * minimum code` (`L::BIAS`). A
 /// quantized dot sums `scale code * products` (and `minimum code *
 /// activation sums`) over the factor group exactly, then combines
 /// `factor * scaled ± minimum factor * minimums` once.
@@ -1674,16 +1797,21 @@ pub struct Hier<F, const EXPONENT: i32, const CODE_EXPONENT: i32, L, const GROUP
 impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const GROUP: usize>
     Hier<F, EXPONENT, CODE_EXPONENT, L, GROUP>
 {
-    /// Whether the coefficients have a minimum.
-    const MIN: bool = L::MIN_SIGN != 0;
+    /// Whether the coefficients have a minimum term.
+    const MIN: bool = L::BIAS.is_some();
+    /// Whether the supers plane stores a minimum factor.
+    const STORED_MIN: bool = matches!(L::BIAS, Some(LocalBias::Minimum(_)));
+    /// Whether the minimum term is subtracted.
+    const NEGATE: bool = matches!(L::BIAS, Some(LocalBias::Minimum(MinimumSign::Subtract)));
 
     /// The scale factor (`factor * 2^(EXPONENT + CODE_EXPONENT)`) and the
-    /// minimum factor (the stored minimum factor times `2^EXPONENT`) of the
-    /// storage group of `at`.
+    /// minimum factor (the stored minimum factor times `2^EXPONENT`, or the
+    /// scale factor times a signed bias's `2^exponent`) of the storage group
+    /// of `at`.
     #[inline(always)]
     unsafe fn factors(at: At) -> (f32, f32) {
         let supers = at.plane(RowPlaneRole::Supers);
-        let minimum = if Self::MIN {
+        let minimum = if Self::STORED_MIN {
             unsafe { F::read(supers.add(F::BYTES)) }
         } else {
             0.0
@@ -1691,15 +1819,17 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         Self::factors_of(unsafe { F::read(supers) }, minimum)
     }
 
-    /// [`Hier::factors`] of the stored factor and minimum factor.
+    /// [`Hier::factors`] of the stored factor and minimum factor (read
+    /// only with a stored minimum).
     #[inline(always)]
     fn factors_of(factor: f32, minimum: f32) -> (f32, f32) {
-        let minimum = if Self::MIN {
-            scaled::<EXPONENT>(minimum)
-        } else {
-            0.0
+        let factor = scaled::<CODE_EXPONENT>(scaled::<EXPONENT>(factor));
+        let minimum = match L::BIAS {
+            None => 0.0,
+            Some(LocalBias::Minimum(_)) => scaled::<EXPONENT>(minimum),
+            Some(LocalBias::Signed { exponent }) => factor * 2.0f32.powi(exponent),
         };
-        (scaled::<CODE_EXPONENT>(scaled::<EXPONENT>(factor)), minimum)
+        (factor, minimum)
     }
 
     /// [`Hier::factors`] of the eight lanes of the rows8 tile whose lane 0
@@ -1716,7 +1846,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
             row.groups[RowPlaneRole::Supers as usize],
         );
         let mut fields = [[0.0f32; 8]; 2];
-        for (field, values) in fields.iter_mut().enumerate().take(1 + Self::MIN as usize) {
+        for (field, values) in fields.iter_mut().enumerate().take(1 + Self::STORED_MIN as usize) {
             let first = unsafe { supers.add(F::BYTES * field) };
             #[cfg(target_arch = "aarch64")]
             unsafe {
@@ -2042,7 +2172,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
     fn coefficient(factors: (f32, f32), (scale, minimum): (i32, i32)) -> (f32, f32) {
         let bias = if Self::MIN {
             let bias = factors.1 * minimum as f32;
-            if L::MIN_SIGN < 0 {
+            if Self::NEGATE {
                 -bias
             } else {
                 bias
@@ -2053,14 +2183,14 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         (factors.0 * scale as f32, bias)
     }
 
-    /// `factor * scaled + L::MIN_SIGN * minimum * minimums`, the minimum
+    /// `factor * scaled ± minimum * minimums` (`L::BIAS`), the minimum
     /// term's product rounded on its own.
     #[inline(always)]
     fn combine(factors: (f32, f32), scaled: i32, minimums: i32) -> f32 {
         let scaled = factors.0 * scaled as f32;
         if !Self::MIN {
             scaled
-        } else if L::MIN_SIGN < 0 {
+        } else if Self::NEGATE {
             scaled - factors.1 * minimums as f32
         } else {
             scaled + factors.1 * minimums as f32
@@ -2255,35 +2385,58 @@ mod packed_neon {
         }
     }
 
-    /// Bit `i` of `mask` as the value 16 in byte `i`.
+    /// Bit `i` of `mask` as the value `2^LOW` in byte `i`.
     #[inline(always)]
-    fn high_bits(mask: u16) -> uint8x16_t {
+    fn high_bits<const LOW: u32>(mask: u16) -> uint8x16_t {
         const BITS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
         unsafe {
             let bytes = vcombine_u8(vdup_n_u8(mask as u8), vdup_n_u8((mask >> 8) as u8));
-            vandq_u8(vtstq_u8(bytes, vld1q_u8(BITS.as_ptr())), vdupq_n_u8(16))
+            vandq_u8(vtstq_u8(bytes, vld1q_u8(BITS.as_ptr())), vdupq_n_u8(1 << LOW))
         }
     }
 
-    /// A packet's codes in element order: codes 2i and 2i + 1 are the low
-    /// and high nibble of byte i, each joined with its bit of `high` (a
-    /// 1-bit high plane's packet word). Codes are at most 31, so they are
-    /// also signed bytes.
+    /// A packet's codes of a `LOW`-bit low plane (`4 LOW` bytes) in element
+    /// order: code `(8 / LOW) i + j` is bits `LOW j ..` of byte `i`, joined
+    /// with its bit of `high`, a 1-bit high plane's packet word (0 for none),
+    /// at bit `LOW`. Codes are at most 31, so they are also signed bytes.
     ///
     /// # Safety
-    /// `bytes` addresses the packet's 16 code bytes.
+    /// `bytes` addresses the packet's `4 LOW` code bytes.
     #[inline(always)]
-    pub(super) unsafe fn nibbles(bytes: *const u8, high: u32) -> [int8x16_t; 2] {
+    pub(super) unsafe fn codes<const LOW: u32>(bytes: *const u8, high: u32) -> [int8x16_t; 2] {
+        const { assert!(matches!(LOW, 1 | 2 | 4), "a 1-, 2- or 4-bit low plane") };
         unsafe {
-            let packed = vld1q_u8(bytes);
-            let low = vandq_u8(packed, vdupq_n_u8(15));
-            let upper = vshrq_n_u8(packed, 4);
-            let mut first = vzip1q_u8(low, upper);
-            let mut second = vzip2q_u8(low, upper);
-            if high != 0 {
-                first = vorrq_u8(first, high_bits(high as u16));
-                second = vorrq_u8(second, high_bits((high >> 16) as u16));
-            }
+            let (first, second) = if LOW == 1 {
+                // Code 8i + j is bit j of byte i.
+                let word: u32 = super::read(bytes);
+                (high_bits::<0>(word as u16), high_bits::<0>((word >> 16) as u16))
+            } else if LOW == 4 {
+                let packed = vld1q_u8(bytes);
+                let low = vandq_u8(packed, vdupq_n_u8(15));
+                let upper = vshrq_n_u8(packed, 4);
+                (vzip1q_u8(low, upper), vzip2q_u8(low, upper))
+            } else {
+                // Codes 4i..4i + 4 of byte i: its crumbs at bits 0, 2, 4, 6.
+                let packed = vld1_u8(bytes);
+                let three = vdup_n_u8(3);
+                let crumbs = [
+                    vand_u8(packed, three),
+                    vand_u8(vshr_n_u8(packed, 2), three),
+                    vand_u8(vshr_n_u8(packed, 4), three),
+                    vshr_n_u8(packed, 6),
+                ];
+                let even = vcombine_u8(vzip1_u8(crumbs[0], crumbs[2]), vzip2_u8(crumbs[0], crumbs[2]));
+                let odd = vcombine_u8(vzip1_u8(crumbs[1], crumbs[3]), vzip2_u8(crumbs[1], crumbs[3]));
+                (vzip1q_u8(even, odd), vzip2q_u8(even, odd))
+            };
+            let (first, second) = if high != 0 {
+                (
+                    vorrq_u8(first, high_bits::<LOW>(high as u16)),
+                    vorrq_u8(second, high_bits::<LOW>((high >> 16) as u16)),
+                )
+            } else {
+                (first, second)
+            };
             [vreinterpretq_s8_u8(first), vreinterpretq_s8_u8(second)]
         }
     }
@@ -2455,22 +2608,42 @@ mod packed_x86 {
         }
     }
 
-    /// 16 packed bytes as 32 nibble codes in element order: codes 2i and
-    /// 2i + 1 are the low and high nibble of byte i.
+    /// A packet's `4 LOW` bytes of `LOW`-bit codes as 32 codes in element
+    /// order: code `(8 / LOW) i + j` is bits `LOW j ..` of byte `i`.
     #[inline(always)]
-    pub(super) unsafe fn nibbles(bytes: *const u8) -> __m256i {
+    pub(super) unsafe fn codes<const LOW: u32>(bytes: *const u8) -> __m256i {
+        const { assert!(matches!(LOW, 1 | 2 | 4), "a 1-, 2- or 4-bit low plane") };
         unsafe {
-            let packed = _mm_loadu_si128(bytes.cast());
-            let mask = _mm_set1_epi8(15);
-            let low = _mm_and_si128(packed, mask);
-            let high = _mm_and_si128(_mm_srli_epi16::<4>(packed), mask);
-            _mm256_set_m128i(_mm_unpackhi_epi8(low, high), _mm_unpacklo_epi8(low, high))
+            if LOW == 1 {
+                // Code 8i + j is bit j of byte i: 1 in byte 8i + j.
+                high_bits::<0>(super::read(bytes))
+            } else if LOW == 4 {
+                let packed = _mm_loadu_si128(bytes.cast());
+                let mask = _mm_set1_epi8(15);
+                let low = _mm_and_si128(packed, mask);
+                let high = _mm_and_si128(_mm_srli_epi16::<4>(packed), mask);
+                _mm256_set_m128i(_mm_unpackhi_epi8(low, high), _mm_unpacklo_epi8(low, high))
+            } else {
+                // Codes 4i..4i + 4 of byte i: its crumbs at bits 0, 2, 4, 6.
+                let packed = _mm_loadl_epi64(bytes.cast());
+                let three = _mm_set1_epi8(3);
+                let crumb0 = _mm_and_si128(packed, three);
+                let crumb1 = _mm_and_si128(_mm_srli_epi16::<2>(packed), three);
+                let crumb2 = _mm_and_si128(_mm_srli_epi16::<4>(packed), three);
+                let crumb3 = _mm_and_si128(_mm_srli_epi16::<6>(packed), three);
+                let pairs01 = _mm_unpacklo_epi8(crumb0, crumb1);
+                let pairs23 = _mm_unpacklo_epi8(crumb2, crumb3);
+                _mm256_set_m128i(
+                    _mm_unpackhi_epi16(pairs01, pairs23),
+                    _mm_unpacklo_epi16(pairs01, pairs23),
+                )
+            }
         }
     }
 
-    /// Bit `i` of `mask` as the value 16 in byte `i`.
+    /// Bit `i` of `mask` as the value `2^LOW` in byte `i`.
     #[inline(always)]
-    unsafe fn high_bits(mask: u32) -> __m256i {
+    unsafe fn high_bits<const LOW: u32>(mask: u32) -> __m256i {
         unsafe {
             let spread = _mm256_shuffle_epi8(
                 _mm256_set1_epi32(mask as i32),
@@ -2481,15 +2654,15 @@ mod packed_x86 {
             );
             let bits = _mm256_set1_epi64x(0x8040_2010_0804_0201u64 as i64);
             let set = _mm256_cmpeq_epi8(_mm256_and_si256(spread, bits), bits);
-            _mm256_and_si256(set, _mm256_set1_epi8(16))
+            _mm256_and_si256(set, _mm256_set1_epi8(1 << LOW))
         }
     }
 
-    /// A packet's nibble codes, each joined with its bit of `high` (a 1-bit
-    /// high plane's packet word).
+    /// A packet's `LOW`-bit codes (`codes`), each joined with its bit of
+    /// `high` (a 1-bit high plane's packet word) at bit `LOW`.
     #[inline(always)]
-    pub(super) unsafe fn nibbles1(bytes: *const u8, high: u32) -> __m256i {
-        unsafe { _mm256_or_si256(nibbles(bytes), high_bits(high)) }
+    pub(super) unsafe fn codes1<const LOW: u32>(bytes: *const u8, high: u32) -> __m256i {
+        unsafe { _mm256_or_si256(codes::<LOW>(bytes), high_bits::<LOW>(high)) }
     }
 
     /// A packet's codes under a 2-bit high plane: codes 2i and 2i + 1 join

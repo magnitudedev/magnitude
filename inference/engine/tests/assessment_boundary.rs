@@ -356,19 +356,19 @@ fn an_unknown_architecture_is_named() {
 #[test]
 fn every_unsupported_weight_type_is_counted() {
     let mut gguf = llama();
-    gguf.encode("blk.0.ffn_up.weight", Encoding::Q2K);
-    gguf.encode("blk.1.ffn_up.weight", Encoding::Q2K);
-    gguf.encode("blk.1.ffn_gate.weight", Encoding::Iq1M);
+    gguf.encode("blk.0.ffn_up.weight", Encoding::Q8K);
+    gguf.encode("blk.1.ffn_up.weight", Encoding::Q8K);
+    gguf.encode("blk.1.ffn_gate.weight", Encoding::Q8_1);
     assert_eq!(
         refusal(&gguf, "weights").reasons,
         [UnsupportedReason::WeightTypes {
             types: vec![
                 WeightTypeCount {
-                    ggml_type: "IQ1_M".into(),
+                    ggml_type: "Q8_1".into(),
                     tensor_count: 1
                 },
                 WeightTypeCount {
-                    ggml_type: "Q2_K".into(),
+                    ggml_type: "Q8_K".into(),
                     tensor_count: 2
                 },
             ]
@@ -485,7 +485,7 @@ fn an_unreadable_chat_template_is_named() {
 #[test]
 fn independent_checks_report_every_reason_together() {
     let mut gguf = llama();
-    gguf.encode("blk.0.ffn_down.weight", Encoding::Q2K);
+    gguf.encode("blk.0.ffn_down.weight", Encoding::Q8K);
     gguf.tensor("rope_freqs.weight", &[WIDTH / 2], Encoding::F32);
     gguf.set("tokenizer.ggml.pre", Meta::Str("deepseek-v3".into()));
     gguf.remove("tokenizer.chat_template");
@@ -496,7 +496,7 @@ fn independent_checks_report_every_reason_together() {
         [
             UnsupportedReason::WeightTypes {
                 types: vec![WeightTypeCount {
-                    ggml_type: "Q2_K".into(),
+                    ggml_type: "Q8_K".into(),
                     tensor_count: 1
                 }]
             },
@@ -510,7 +510,7 @@ fn independent_checks_report_every_reason_together() {
             UnsupportedReason::ChatTemplate,
         ]
     );
-    assert!(refusal.detail.contains("Q2_K"), "{}", refusal.detail);
+    assert!(refusal.detail.contains("Q8_K"), "{}", refusal.detail);
 }
 
 /// A header's own refusal is admission's without the weight types: with the
@@ -525,7 +525,7 @@ fn a_header_refuses_what_admission_does_without_its_weight_types() {
         header_refusal(&directory(gguf), extent).map(|refusal| refusal.reasons)
     };
     let mut quantized = llama();
-    quantized.encode("blk.0.ffn_down.weight", Encoding::Q2K);
+    quantized.encode("blk.0.ffn_down.weight", Encoding::Q8K);
     assert_eq!(reasons(&quantized, HeaderExtent::Whole), None);
     let mut refused = quantized;
     refused.tensor("blk.0.attn_q.bias", &[HEADS * WIDTH], Encoding::F32);
@@ -712,14 +712,14 @@ fn prepared(package: &ModelPackagePaths) -> PreparedModelAssessment {
 fn an_unsupported_target_reports_its_fingerprint() {
     let scratch = Scratch::new("unsupported-fingerprint");
     let mut gguf = llama();
-    gguf.encode("blk.0.ffn_up.weight", Encoding::Q2K);
+    gguf.encode("blk.0.ffn_up.weight", Encoding::Q8K);
     let target = gguf.write(&scratch.file("target.gguf"));
     let PreparedModelAssessment::Unsupported {
         unsupported,
         fingerprint,
     } = prepared(&package(target.clone()))
     else {
-        panic!("Q2_K is not imported");
+        panic!("Q8_K is not imported");
     };
     assert!(matches!(
         unsupported.reasons.as_slice(),
@@ -771,7 +771,7 @@ fn a_drafter_with_unsupported_weights_names_them() {
     let scratch = Scratch::new("drafter-weights");
     let target = llama().write(&scratch.file("target.gguf"));
     let mut draft = dflash(HIDDEN);
-    draft.encode("blk.0.ffn_up.weight", Encoding::Iq2S);
+    draft.encode("blk.0.ffn_up.weight", Encoding::Q8K);
     let draft = draft.write(&scratch.file("draft.gguf"));
     let PreparedModelAssessment::Planned { facts, .. } = prepared(&ModelPackagePaths {
         draft: Some(draft),
@@ -781,13 +781,13 @@ fn a_drafter_with_unsupported_weights_names_them() {
         panic!("the target plans without the drafter");
     };
     let DrafterVerdict::Rejected(rejection) = facts.drafter else {
-        panic!("IQ2_S is not imported: {:?}", facts.drafter);
+        panic!("Q8_K is not imported: {:?}", facts.drafter);
     };
     assert_eq!(
         rejection.reasons,
         [UnsupportedReason::WeightTypes {
             types: vec![WeightTypeCount {
-                ggml_type: "IQ2_S".into(),
+                ggml_type: "Q8_K".into(),
                 tensor_count: 1
             }]
         }]
@@ -932,8 +932,9 @@ fn a_kernel_call_outside_its_domain_names_the_kernel_and_its_statics() {
     assert!(!statics.is_empty());
 }
 
-/// Memory is charged as stored after import: Q3_K weights are held widened
-/// as q6k, so a Q3_K file is charged as its Q6_K twin though it is smaller.
+/// Memory is charged as stored after import: TQ1_0 weights are held widened
+/// as q2g256, TQ2_0's form, so a TQ1_0 file is charged as its TQ2_0 twin
+/// though it is smaller.
 #[test]
 fn widened_weights_are_charged_as_resident() {
     let scratch = Scratch::new("widened");
@@ -967,11 +968,11 @@ fn widened_weights_are_charged_as_resident() {
             .collect::<Vec<_>>();
         (stored, required)
     };
-    let (q3k_stored, q3k_required) = charged(Encoding::Q3K, "q3k.gguf");
-    let (q6k_stored, q6k_required) = charged(Encoding::Q6K, "q6k.gguf");
-    assert!(q3k_stored < q6k_stored);
-    assert_eq!(q3k_required, q6k_required);
-    assert!(q3k_required.iter().all(|required| *required > q6k_stored));
+    let (tq1_stored, tq1_required) = charged(Encoding::Tq1_0, "tq1_0.gguf");
+    let (tq2_stored, tq2_required) = charged(Encoding::Tq2_0, "tq2_0.gguf");
+    assert!(tq1_stored < tq2_stored);
+    assert_eq!(tq1_required, tq2_required);
+    assert!(tq1_required.iter().all(|required| *required > tq2_stored));
 }
 
 /// A shared real-header fixture (`fixtures/assessment/headers`),

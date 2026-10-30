@@ -206,18 +206,59 @@ fn stored_rows_decode_the_rows_their_directory_names() {
     // in, each with its rows16 resident form; IQ4_NL and Q8_0 (`Some(q8)`)
     // were read as stored before.
     for (source, resident, as_stored) in [
-        ("gguf_iq4_nl_block", "iq4g32s@rows16", Some(false)),
+        ("gguf_iq4_nl", "iq4g32s@rows16", Some(false)),
         ("gguf_q8_0", "q8g32s@rows16", Some(true)),
         ("gguf_q4_0", "q4g32s@rows16", None),
         ("gguf_q5_0", "q5g32s@rows16", None),
         ("gguf_q5_1", "q5g32@rows16", None),
+        ("gguf_q4_1", "q4g32@rows16", None),
     ] {
-        stored_rows_match(source, resident, as_stored);
+        stored_rows_match(source, resident, as_stored, 160);
     }
 }
 
-fn stored_rows_match(source: &str, resident: &str, as_stored: Option<bool>) {
-    let (rows, slots, width, buckets) = (300usize, 24usize, 160usize, 64usize);
+/// Rows 256 wide: of 256-value block encodings (Q2_K, Q3_K, IQ4_XS), and of
+/// IQ4_NL's 32-value blocks, whose resident form is iq4g32s at every width.
+#[test]
+fn stored_rows_decode_k_quant_rows() {
+    for (source, resident) in [
+        ("gguf_q2_k", "q2k@rows16"),
+        ("gguf_q3_k", "q3k@rows16"),
+        ("gguf_iq4_xs", "iq4xs@rows16"),
+        ("gguf_iq4_nl", "iq4g32s@rows16"),
+    ] {
+        stored_rows_match(source, resident, None, 256);
+    }
+}
+
+/// Rows of vector codes with a high part (IQ2_S, IQ3_S, IQ1_S, IQ1_M), 256
+/// wide.
+#[test]
+fn stored_rows_decode_grid_rows() {
+    for (source, resident) in [
+        ("gguf_iq2_s", "iq2s@rows16"),
+        ("gguf_iq3_s", "iq3s@rows16"),
+        ("gguf_iq1_s", "iq1s@rows16"),
+        ("gguf_iq1_m", "iq1m@rows16"),
+    ] {
+        stored_rows_match(source, resident, None, 256);
+    }
+}
+
+/// Rows of the 1- and 2-bit encodings (Q1_0, TQ2_0, TQ1_0), 256 wide.
+#[test]
+fn stored_rows_decode_low_bit_rows() {
+    for (source, resident) in [
+        ("gguf_q1_0", "q1g128@rows16"),
+        ("gguf_tq2_0", "q2g256@rows16"),
+        ("gguf_tq1_0", "q2g256@rows16"),
+    ] {
+        stored_rows_match(source, resident, None, 256);
+    }
+}
+
+fn stored_rows_match(source: &str, resident: &str, as_stored: Option<bool>, width: usize) {
+    let (rows, slots, buckets) = (300usize, 24usize, 64usize);
     let mut random = Random(41);
     let (source_element, resident_element) =
         (Element::named(source).unwrap(), Element::named(resident).unwrap());

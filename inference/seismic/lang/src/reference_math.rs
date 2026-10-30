@@ -1,9 +1,10 @@
 //! Language-owned scalar semantics as total, typed-bit recipes.
 //!
 //! The terminal vocabulary contains only unsigned word arithmetic, comparisons,
-//! Boolean selection and bit-preserving transport. Both interpretation and kernel
-//! construction consume this same graph. `exp` and `log` preserve the ordered
-//! Sun/FreeBSD f32 recipes; their scalar steps expand through the same owner.
+//! Boolean selection, constant-table lookup and bit-preserving transport. Both
+//! interpretation and kernel construction consume this same graph. `exp` and
+//! `log` preserve the ordered Sun/FreeBSD f32 recipes; their scalar steps
+//! expand through the same owner.
 //! `sqrt` is correctly rounded, and `sin`/`cos` evaluate the FreeBSD kernels in
 //! 64-bit fixed point with one final rounding. Every math recipe returns the
 //! canonical NaN for a NaN operand. `exp`, `log`, `sin` and `cos` are within one
@@ -24,7 +25,7 @@ use crate::types::DType;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 pub const VERSION: &str = "seismic-scalar-reference-bits-v5";
 
@@ -185,6 +186,12 @@ pub enum ReferenceNode {
     /// A word of the other width: zero extension from U32 to U64, or the low
     /// word of a U64.
     Resize { value: V, dtype: DType },
+    /// The U32 word of entry `index` of a constant table, an `i32` in two's
+    /// complement (`LookupTable::entry`: the index modulo the table's length).
+    Lookup {
+        table: crate::registry::LookupTable,
+        index: V,
+    },
 }
 impl ReferenceNode {
     fn operands(&self) -> Vec<V> {
@@ -198,6 +205,7 @@ impl ReferenceNode {
             | Self::FromBits { value, .. }
             | Self::Resize { value, .. } => vec![value],
             Self::Select { condition, yes, no } => vec![condition, yes, no],
+            Self::Lookup { index, .. } => vec![index],
         }
     }
     fn ty(&self) -> DType {
@@ -210,6 +218,7 @@ impl ReferenceNode {
             Self::Bits { value } => word_type(value.ty),
             Self::Compare { .. } | Self::And { .. } | Self::Not { .. } => DType::Bool,
             Self::Select { yes, .. } => yes.ty,
+            Self::Lookup { .. } => DType::U32,
         }
     }
 }
@@ -295,6 +304,10 @@ impl ReferenceRecipe {
                 ReferenceNode::Resize { value, dtype } => ReferenceNode::Resize {
                     value: at(value),
                     dtype,
+                },
+                ReferenceNode::Lookup { table, index } => ReferenceNode::Lookup {
+                    table,
+                    index: at(index),
                 },
             };
             renumbered[ordinal] = Some(V {
@@ -395,6 +408,12 @@ fn terminal(node: &ReferenceNode, get: impl Fn(V) -> ReferenceScalar) -> Referen
         }
         ReferenceNode::FromBits { value, dtype } => ReferenceScalar::from_bits(dtype, word(value)),
         ReferenceNode::Resize { value, dtype } => ReferenceScalar::from_bits(dtype, word(value)),
+        ReferenceNode::Lookup { table, index } => {
+            let ReferenceScalar::U32(index) = get(index) else {
+                panic!("a lookup index is a U32 word")
+            };
+            ReferenceScalar::U32(table.entry(index) as u32)
+        }
     }
 }
 pub fn evaluate(
@@ -557,6 +576,10 @@ impl Recipe {
     fn not(&self, value: V) -> V {
         self.push(DType::Bool, ReferenceNode::Not { value })
     }
+    fn lookup(&self, table: crate::registry::LookupTable, index: V) -> V {
+        assert_eq!(index.ty, U32_TY);
+        self.push(U32_TY, ReferenceNode::Lookup { table, index })
+    }
     fn select(&self, condition: V, yes: V, no: V) -> V {
         assert_eq!(condition.ty, DType::Bool);
         assert_eq!(yes.ty, no.ty);
@@ -619,7 +642,6 @@ enum RecipeKey {
     Scalar(ScalarOp, Vec<DType>),
     Code(crate::registry::CodeInterpretation, u32),
     FloatCode(crate::registry::FloatCodeFormat),
-    GridCode(&'static crate::registry::GridCodes),
 }
 fn cached_recipe(key: RecipeKey, build: impl FnOnce() -> ReferenceRecipe) -> Arc<ReferenceRecipe> {
     static RECIPES: OnceLock<Mutex<HashMap<RecipeKey, Arc<ReferenceRecipe>>>> = OnceLock::new();
@@ -629,6 +651,38 @@ fn cached_recipe(key: RecipeKey, build: impl FnOnce() -> ReferenceRecipe) -> Arc
     }
     let recipe = Arc::new(build());
     cache.lock().unwrap().entry(key).or_insert(recipe).clone()
+}
+
+/// The widest code whose recipe's values `cached_code` tables; a wider
+/// code's recipe is evaluated per read.
+const TABLED_BITS: u32 = 16;
+
+/// The value at `raw` of the code recipe of `key` (`recipe`: total, of one
+/// `U32` input whose low `bits` bits it reads), for a code of at most
+/// `TABLED_BITS` bits read from the recipe's values at every code, evaluated
+/// once per process.
+fn cached_code(
+    key: RecipeKey,
+    bits: u32,
+    raw: u32,
+    recipe: impl FnOnce() -> Arc<ReferenceRecipe>,
+) -> ReferenceScalar {
+    let value = |recipe: &ReferenceRecipe, raw| {
+        evaluate(recipe, &[ReferenceScalar::U32(raw)]).expect("a code recipe is total")
+    };
+    if bits > TABLED_BITS {
+        return value(&recipe(), raw);
+    }
+    type Tables = HashMap<RecipeKey, Arc<[ReferenceScalar]>>;
+    static TABLES: OnceLock<RwLock<Tables>> = OnceLock::new();
+    let tables = TABLES.get_or_init(Default::default);
+    let known = tables.read().unwrap().get(&key).cloned();
+    let table = known.unwrap_or_else(|| {
+        let recipe = recipe();
+        let table: Arc<[ReferenceScalar]> = (0..1u32 << bits).map(|raw| value(&recipe, raw)).collect();
+        tables.write().unwrap().entry(key).or_insert(table).clone()
+    });
+    table[(raw & (u32::MAX >> (32 - bits))) as usize]
 }
 
 pub fn scalar_recipe(op: ScalarOp, operands: &[DType]) -> Arc<ReferenceRecipe> {
@@ -667,6 +721,15 @@ pub fn code_recipe(
             CodeInterpretation::Odd => {
                 b.word(WordOp::Add, b.word(WordOp::Shl, raw, b.u(1)), b.u(1))
             }
+            CodeInterpretation::SignedOdd => {
+                let low = b.word(WordOp::And, raw, b.u(mask >> 1));
+                let odd = b.word(WordOp::Add, b.word(WordOp::Shl, low, b.u(1)), b.u(1));
+                b.select(
+                    b.word_cmp(CmpOp::Eq, b.word(WordOp::Shr, raw, b.u(bits - 1)), b.u(0)),
+                    odd,
+                    b.word(WordOp::Sub, b.u(0), odd),
+                )
+            }
             CodeInterpretation::Table(codebook) => {
                 let table = codebook.values;
                 assert_eq!(
@@ -693,92 +756,126 @@ pub fn code_recipe(
     })
 }
 
-/// The code of a vector-coded value (`GridCodes::code`) from its entry
-/// (operand 0) and its lane (operand 1, below `GRID_VALUES`), in ordinary
-/// word operations: the grid is finite registry data, expanded into
-/// comparisons and selections before kernel closure like a code table.
-pub fn grid_code_recipe(grid: &'static crate::registry::GridCodes) -> Arc<ReferenceRecipe> {
-    use crate::registry::GRID_SIGN_BITS;
-    cached_recipe(RecipeKey::GridCode(grid), || {
-        let b = Recipe::default();
-        let entry = b.input(0, DType::U32);
-        let lane = b.input(1, DType::U32);
-        let lane_shift = grid.lanes().trailing_zeros();
-        assert_eq!(1 << lane_shift, grid.lanes(), "grid lanes are a power of two");
-        // The index this lane reads: index `lane / lanes` of the entry.
-        let mut shift = b.u(0);
-        for which in 1..grid.indices() {
-            shift = b.select(
-                b.word_cmp(
-                    CmpOp::Eq,
-                    b.word(WordOp::Shr, lane, b.u(lane_shift)),
-                    b.u(which),
-                ),
-                b.u(which * grid.index_bits()),
-                shift,
-            );
-        }
-        let index = b.word(
-            WordOp::And,
-            b.word(WordOp::Shr, entry, shift),
-            b.u((1 << grid.index_bits()) - 1),
-        );
-        // The point's magnitudes as two words of four lanes each.
-        let half = |high: bool| {
-            let word = |point: u64| (if high { point >> 32 } else { point }) as u32;
-            let mut value = b.u(word(grid.points().point(0)));
-            for i in 1..grid.points().len() {
-                value = b.select(
-                    b.word_cmp(CmpOp::Eq, index, b.u(i as u32)),
-                    b.u(word(grid.points().point(i))),
-                    value,
-                );
-            }
-            value
-        };
-        let sub = b.word(WordOp::And, lane, b.u(grid.lanes() - 1));
-        let point = if grid.lanes() > 4 {
-            b.select(b.word_cmp(CmpOp::Lt, sub, b.u(4)), half(false), half(true))
-        } else {
-            half(false)
-        };
-        let magnitude = b.word(
-            WordOp::And,
-            b.word(
-                WordOp::Shr,
-                point,
-                b.word(WordOp::Shl, b.word(WordOp::And, sub, b.u(3)), b.u(3)),
-            ),
-            b.u(0xff),
-        );
-        // Seven sign bits and their even-parity eighth.
-        let signs = b.word(
-            WordOp::And,
-            b.word(WordOp::Shr, entry, b.u(grid.indices() * grid.index_bits())),
-            b.u((1 << GRID_SIGN_BITS) - 1),
-        );
-        let mut parity = signs;
-        for fold in [4, 2, 1] {
-            parity = b.word(WordOp::Xor, parity, b.word(WordOp::Shr, parity, b.u(fold)));
-        }
-        let signs = b.word(
-            WordOp::Or,
-            signs,
-            b.word(
-                WordOp::Shl,
-                b.word(WordOp::And, parity, b.u(1)),
-                b.u(GRID_SIGN_BITS),
-            ),
-        );
-        let negative = b.word(WordOp::And, b.word(WordOp::Shr, signs, lane), b.u(1));
-        let code = b.select(
-            b.word_cmp(CmpOp::Eq, negative, b.u(1)),
-            b.word(WordOp::Sub, b.u(0), magnitude),
-            magnitude,
-        );
-        let out = b.typed(code, DType::I32);
-        b.finish(out)
+/// `code_recipe(interpretation, bits)` at `raw` (`cached_code`).
+pub fn code_value(
+    interpretation: &crate::registry::CodeInterpretation,
+    bits: u32,
+    raw: u32,
+) -> ReferenceScalar {
+    cached_code(RecipeKey::Code(interpretation.clone(), bits), bits, raw, || {
+        code_recipe(interpretation, bits)
     })
+}
+
+/// `float_code_recipe(format)` at `raw` (`cached_code`).
+pub fn float_code_value(format: crate::registry::FloatCodeFormat, raw: u32) -> ReferenceScalar {
+    cached_code(RecipeKey::FloatCode(format), format.bits(), raw, || {
+        float_code_recipe(format)
+    })
+}
+
+/// The code of a vector-coded value (`GridCodes::code`) from its entry
+/// (operand 0) and its lane (operand 1, below `GRID_VALUES`): word operations
+/// around one lookup of the grid's lane values (`LookupTable::Grid`).
+pub fn grid_code_recipe(grid: &'static crate::registry::GridCodes) -> ReferenceRecipe {
+    use crate::registry::{GridSigns, LookupTable};
+    let b = Recipe::default();
+    let entry = b.input(0, DType::U32);
+    let lane = b.input(1, DType::U32);
+    let lane_shift = grid.lanes().trailing_zeros();
+    assert_eq!(
+        1 << lane_shift,
+        grid.lanes(),
+        "grid lanes are a power of two"
+    );
+    // The index this lane reads: index `lane / lanes` of the entry.
+    let mut shift = b.u(0);
+    for which in 1..grid.indices() {
+        shift = b.select(
+            b.word_cmp(
+                CmpOp::Eq,
+                b.word(WordOp::Shr, lane, b.u(lane_shift)),
+                b.u(which),
+            ),
+            b.u(which * grid.index_bits()),
+            shift,
+        );
+    }
+    // Lane `lane % lanes` of that point, at `index * lanes + lane % lanes`
+    // of the table: the lookup keeps the index's own bits, the table holding
+    // `2^index_bits` points.
+    let point = b.word(
+        WordOp::Shl,
+        b.word(WordOp::Shr, entry, shift),
+        b.u(lane_shift),
+    );
+    let value = b.lookup(
+        LookupTable::Grid(grid),
+        b.word(
+            WordOp::Or,
+            point,
+            b.word(WordOp::And, lane, b.u(grid.lanes() - 1)),
+        ),
+    );
+    // A magnitude signed by its lane's sign (`GridSigns::lanes`: eight sign
+    // bits, or seven and their even-parity eighth), or a signed value.
+    let explicit = || {
+        b.word(
+            WordOp::And,
+            b.word(WordOp::Shr, entry, b.u(grid.sign_bit())),
+            b.u((1 << grid.signs.bits()) - 1),
+        )
+    };
+    let lane_signs = match grid.signs {
+        GridSigns::None => None,
+        GridSigns::Explicit8 => Some(explicit()),
+        GridSigns::ParityPlus7 => {
+            let explicit = explicit();
+            let mut parity = explicit;
+            for fold in [4, 2, 1] {
+                parity = b.word(WordOp::Xor, parity, b.word(WordOp::Shr, parity, b.u(fold)));
+            }
+            Some(b.word(
+                WordOp::Or,
+                explicit,
+                b.word(
+                    WordOp::Shl,
+                    b.word(WordOp::And, parity, b.u(1)),
+                    b.u(grid.signs.bits()),
+                ),
+            ))
+        }
+    };
+    let value = match lane_signs {
+        None => value,
+        Some(signs) => {
+            let negative = b.word(WordOp::And, b.word(WordOp::Shr, signs, lane), b.u(1));
+            b.select(
+                b.word_cmp(CmpOp::Eq, negative, b.u(1)),
+                b.word(WordOp::Sub, b.u(0), value),
+                value,
+            )
+        }
+    };
+    // A delta's code: `2^e value + 1`, `- 1` with the delta bit set.
+    let value = match grid.delta {
+        Some(exponent) => {
+            let scaled = b.word(WordOp::Shl, value, b.u(exponent));
+            let set = b.word(
+                WordOp::And,
+                b.word(WordOp::Shr, entry, b.u(grid.delta_bit())),
+                b.u(1),
+            );
+            b.select(
+                b.word_cmp(CmpOp::Eq, set, b.u(1)),
+                b.word(WordOp::Sub, scaled, b.u(1)),
+                b.word(WordOp::Add, scaled, b.u(1)),
+            )
+        }
+        None => value,
+    };
+    let out = b.typed(value, DType::I32);
+    b.finish(out)
 }
 
 /// Floating code formats are finite registry data. Expand their exact payload
@@ -1097,6 +1194,41 @@ mod tests {
             0x7fc0_0000
         } else {
             bits
+        }
+    }
+    #[test]
+    fn grid_code_recipe_is_the_grid_code_of_every_entry_index_and_lane() {
+        for repr in crate::repr::REPRS {
+            let crate::registry::CodeInterpretation::Grid(grid) = repr.code else {
+                continue;
+            };
+            let recipe = grid_code_recipe(grid);
+            // Every index at every index position, with sign, delta and
+            // carried bits drawn from a fixed sequence.
+            let mut state = 0x9e37_79b9u32;
+            for index in 0..grid.points().len() as u32 {
+                for position in 0..grid.indices() {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let mask = u32::MAX >> (32 - grid.entry_bits());
+                    let entry = (state
+                        & mask
+                        & !(((1 << grid.index_bits()) - 1) << (position * grid.index_bits())))
+                        | (index << (position * grid.index_bits()));
+                    for lane in 0..crate::registry::GRID_VALUES {
+                        let actual = evaluate(
+                            &recipe,
+                            &[ReferenceScalar::U32(entry), ReferenceScalar::U32(lane)],
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            actual,
+                            ReferenceScalar::I32(grid.code(entry, lane)),
+                            "`{}` entry {entry:#x} lane {lane}",
+                            repr.name
+                        );
+                    }
+                }
+            }
         }
     }
     #[test]
