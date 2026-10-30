@@ -1,5 +1,13 @@
 # @magnitudedev/cli
 
+## 0.2.15
+
+### Patch Changes
+
+- [`ae7875a`](https://github.com/magnitudedev/magnitude/commit/ae7875a7b347817abce5f8efbbe8aec40d39595f) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - The inference engine's Anthropic-compatible messages and token-counting endpoints now accept any `anthropic-version` header value, or no header, instead of rejecting clients that do not send `2023-06-01`.
+
+- [`ae7875a`](https://github.com/magnitudedev/magnitude/commit/ae7875a7b347817abce5f8efbbe8aec40d39595f) Thanks [@anerli](https://github.com/anerli)! - Fix model loading on Metal exceeding its reserved weight-import memory when streaming weight tables ([#231](https://github.com/magnitudedev/magnitude/issues/231)). Import batches now share the memory plan used to reserve their budget, accounting for mapped file spans and simultaneous staged uploads.
+
 ## 0.2.14
 
 ### Patch Changes
