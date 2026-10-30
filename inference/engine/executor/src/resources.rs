@@ -129,8 +129,6 @@ pub(crate) struct ImportWindow {
     start: u64,
     end: u64,
     data_offset: u64,
-    /// The bytes mapped: the range, rounded out to whole pages.
-    mapped_bytes: u64,
     region: ReadOnlyMappedRegion,
 }
 
@@ -155,25 +153,6 @@ fn stored_range(stored: &Stored) -> Result<(Arc<FileSource>, u64, u64), Allocati
 }
 
 impl ImportWindow {
-    /// A window of a load's import, held to the import transient its
-    /// execution plan admitted.
-    pub(crate) fn new(
-        execution: &ExecutionPlan,
-        device: &Device,
-        source: Arc<FileSource>,
-        start: u64,
-        end: u64,
-    ) -> Result<Self, AllocationError> {
-        let window = Self::map(device, source, start, end)?;
-        if window.mapped_bytes > execution.resources().qualification_peak_bytes() {
-            return Err(AllocationError::Plan(InvariantError {
-                context: "import window",
-                detail: "mapped source exceeds admitted import transient".into(),
-            }));
-        }
-        Ok(window)
-    }
-
     /// Whether `device` reads an artifact's mapped pages in place: where it
     /// does, a weight uploaded as stored whose bytes there keep its source's
     /// alignment is imported from a window and nowhere else; any other is
@@ -204,7 +183,6 @@ impl ImportWindow {
         let window = source
             .map_window(start, end - start)
             .map_err(|error| AllocationError::Mapping(error.to_string()))?;
-        let mapped_bytes = window.mapped_len() as u64;
         let pointer = std::ptr::NonNull::new(window.as_ref().as_ref().as_ptr() as *mut u8)
             .ok_or_else(|| invalid("mapped artifact window has no address"))?;
         // SAFETY: the window owns the immutable mapped range through every
@@ -216,7 +194,6 @@ impl ImportWindow {
             start,
             end,
             data_offset: window.data_offset() as u64,
-            mapped_bytes,
             region,
         })
     }
@@ -450,17 +427,12 @@ impl ResourceAllocator {
         }
         let count = crate::planning::elements(&weight.shape)
             .ok_or_else(|| invalid("weight element count overflows"))?;
-        if weight.source_bytes > execution.resources().qualification_peak_bytes() {
-            return Err(invalid(
-                "source upload exceeds admitted startup transient bytes",
-            ));
-        }
         // A weight imported alone and read in place has a window of its own
         // range; its source view keeps the mapping.
         let own = match window {
             None if ImportSource::reads_in_place(weight, stored, device)? => {
                 let (file, start, end) = stored_range(stored)?;
-                Some(ImportWindow::new(execution, device, file, start, end)?)
+                Some(ImportWindow::map(device, file, start, end)?)
             }
             _ => None,
         };

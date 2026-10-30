@@ -185,17 +185,6 @@ impl WeightPlan {
         shape
     }
 
-    /// The bytes of the stored tensor in the upload representation:
-    /// `source_bytes`, or a streamed table's whole rows, of which a load
-    /// uploads only its slots' (an imported table) or none (a stored one,
-    /// whose filler reads its rows).
-    pub fn stored_bytes(&self) -> Result<u64, String> {
-        match self.streamed {
-            Some(_) => representation_bytes(self.upload, &self.stored_shape()),
-            None => Ok(self.source_bytes),
-        }
-    }
-
     /// The shape `[R, F]` of a streamed table's device directory
     /// (`DirectoryForm`); `[0, 1]`, the empty directory, of a weight held
     /// whole.
@@ -850,40 +839,23 @@ impl ModelLoadPlan {
         })
     }
 
+    /// Admission for the same bounded source batches that residency imports.
+    pub(crate) fn imports(&self) -> super::ImportPlan {
+        super::ImportPlan::new(self.weights())
+    }
+
     /// Peak upload backing while the target component is imported.
     pub fn target_upload_peak_bytes(&self) -> Result<u64, String> {
-        let source = self
-            .target
-            .iter()
-            .map(|weight| weight.source_bytes)
-            .max()
-            .unwrap_or(0);
-        source_import_peak_bytes(source)
+        super::ImportPlan::new(self.target.iter()).peak_bytes()
     }
 
     /// Peak upload allocation while importing a lazy optional component.
     pub fn head_upload_peak_bytes(&self) -> Result<u64, String> {
-        let source = self
-            .head
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(|weight| weight.source_bytes)
-            .max()
-            .unwrap_or(0);
-        source_import_peak_bytes(source)
+        super::ImportPlan::new(self.head.iter().flatten()).peak_bytes()
     }
 
     pub fn vision_upload_peak_bytes(&self) -> Result<u64, String> {
-        let source = self
-            .vision
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(|weight| weight.source_bytes)
-            .max()
-            .unwrap_or(0);
-        source_import_peak_bytes(source)
+        super::ImportPlan::new(self.vision.iter().flatten()).peak_bytes()
     }
 }
 
@@ -892,27 +864,6 @@ pub(crate) fn elements(extents: &[u64]) -> Option<u64> {
     extents
         .iter()
         .try_fold(1u64, |count, extent| count.checked_mul(*extent))
-}
-
-pub(super) fn source_import_peak_bytes(source_bytes: u64) -> Result<u64, String> {
-    if source_bytes == 0 {
-        return Ok(0);
-    }
-    // The importer learns the source file offset at load. Bound a host-page
-    // aligned mapping with both a leading and a trailing partial page.
-    #[cfg(unix)]
-    {
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        let page =
-            u64::try_from(page).map_err(|_| "host page size is unavailable for import planning")?;
-        source_bytes
-            .checked_add(page.checked_mul(2).ok_or("import page bound overflow")?)
-            .ok_or_else(|| "import window bound overflow".into())
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(source_bytes)
-    }
 }
 
 pub(super) fn weight_bytes_by_component(load: &ModelLoadPlan) -> Result<[u64; 3], String> {
@@ -2478,7 +2429,14 @@ mod stored_table_tests {
                 let budget = NGRAM_TABLE_STORED_ROWS * stored_row;
                 assert!(table.resident_bytes <= budget && budget < table.resident_bytes + row);
                 assert_eq!(table.streamed.unwrap().fill, TableFill::Stored);
-                assert_eq!(table.stored_bytes().unwrap(), ROWS * stored_row);
+                assert_eq!(
+                    representation_bytes(table.upload, &table.stored_shape()).unwrap(),
+                    ROWS * stored_row,
+                );
+                assert_eq!(
+                    super::super::ImportPlan::new(out.iter()).peak_bytes().unwrap(),
+                    0,
+                );
             }
         }
     }

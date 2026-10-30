@@ -1107,19 +1107,6 @@ async fn project(mut stream: GenerationStream, mut projector: StreamProjector) {
     }
 }
 
-fn validate_anthropic_version(headers: &HeaderMap) -> Result<(), ApiError> {
-    let version = headers
-        .get("anthropic-version")
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| ApiError::invalid("anthropic-version header is required"))?;
-    if version != "2023-06-01" {
-        return Err(ApiError::invalid(format!(
-            "unsupported anthropic-version: {version}"
-        )));
-    }
-    Ok(())
-}
-
 fn with_anthropic_request_id(mut response: Response, request_id: &str) -> Response {
     if let Ok(value) = request_id.parse() {
         response.headers_mut().insert("request-id", value);
@@ -1177,12 +1164,10 @@ fn anthropic_error_response(request_id: String, error: ApiError) -> Response {
 )]
 pub async fn anthropic_count_tokens(
     State(state): State<Serving>,
-    headers: HeaderMap,
     payload: Result<Json<CountTokensRequest>, JsonRejection>,
 ) -> Response {
     let request_id = state.next_id("req_icn_");
     let result = async {
-        validate_anthropic_version(&headers)?;
         let Json(request) = payload.map_err(|error| ApiError::invalid(error.body_text()))?;
         let adapted = adapt_input(request)?;
         let host = state
@@ -1248,7 +1233,6 @@ async fn messages(
     request: MessagesRequest,
     request_id: String,
 ) -> Result<Response, ApiError> {
-    validate_anthropic_version(&headers)?;
     let adapted = adapt(request)?;
     let response_model = headers
         .get("Magnitude-Gateway-Model")

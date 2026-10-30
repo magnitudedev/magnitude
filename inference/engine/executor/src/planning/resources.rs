@@ -1,4 +1,4 @@
-use super::{assessment, source_import_peak_bytes, weight_bytes_by_component, ModelLoadPlan, PlannedMethod};
+use super::{assessment, weight_bytes_by_component, ModelLoadPlan, PlannedMethod};
 use crate::{
     PreparedDrafterGraphs, PreparedStateCopyGraphs, PreparedTargetGraphs,
     PreparedTargetReadoutGraphs, PreparedVisionGraphs,
@@ -765,9 +765,6 @@ pub struct ResourcePlan {
 }
 
 impl ResourcePlan {
-    pub(crate) fn qualification_peak_bytes(&self) -> u64 {
-        self.qualification_peak_bytes
-    }
     pub fn domain_capacity_bytes(&self) -> u64 {
         self.domain_capacity_bytes
     }
@@ -1169,15 +1166,7 @@ impl ResourcePlanner {
         let limits = state.limits;
         let capacity_bytes = state.capacity_bytes;
         let qualification_peak = crate::AttestedPrograms::qualification_peak_bytes(load)?;
-        let source_import_peak = load
-            .target
-            .iter()
-            .chain(load.head.iter().flatten())
-            .chain(load.vision.iter().flatten())
-            .map(|weight| weight.source_bytes)
-            .max()
-            .unwrap_or(0);
-        let source_import_peak = source_import_peak_bytes(source_import_peak)?;
+        let source_import_peak = load.imports().peak_bytes()?;
         let qualification_peak_bytes = qualification_peak.max(source_import_peak);
         let slots = limits.startup_slots();
         let target_graph = NativeGraphCharge::from_prepared(target_graphs, slots.target)?;
