@@ -664,6 +664,11 @@ fn pattern_source(representation: &str) -> Option<(Element, Vec<u8>)> {
             unit_packet(18, &[(0, &[0x00, 0x3c]), (2, &[0x99; 16])]),
         ),
         // Codes 1, d = 1 and minimum m = 0.
+        "q4g32" => (
+            "gguf_q4_1",
+            unit_packet(20, &[(0, &[0x00, 0x3c]), (4, &[0x11; 16])]),
+        ),
+        // Codes 1, d = 1 and minimum m = 0.
         "q5g32" => (
             "gguf_q5_1",
             unit_packet(24, &[(0, &[0x00, 0x3c]), (8, &[0x11; 16])]),

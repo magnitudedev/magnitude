@@ -39,8 +39,10 @@ pub enum Format {
     Q8,
     /// GGUF IQ4_XS, resident as iq4g32.
     Iq4,
-    /// GGUF Q4_0, Q5_0, Q5_1, MXFP4, NVFP4 (representations of their own).
+    /// GGUF Q4_0, Q4_1, Q5_0, Q5_1, MXFP4, NVFP4 (representations of their
+    /// own).
     Q4_0,
+    Q4_1,
     Q5_0,
     Q5_1,
     Mxfp4,
@@ -56,13 +58,14 @@ pub enum Format {
 }
 
 impl Format {
-    pub const ALL: [Format; 14] = [
+    pub const ALL: [Format; 15] = [
         Format::Q4K,
         Format::Q5K,
         Format::Q6K,
         Format::Q8,
         Format::Iq4,
         Format::Q4_0,
+        Format::Q4_1,
         Format::Q5_0,
         Format::Q5_1,
         Format::Mxfp4,
@@ -80,6 +83,7 @@ impl Format {
             Format::Q8 => "gguf_q8_0",
             Format::Iq4 => "gguf_iq4_xs",
             Format::Q4_0 => "gguf_q4_0",
+            Format::Q4_1 => "gguf_q4_1",
             Format::Q5_0 => "gguf_q5_0",
             Format::Q5_1 => "gguf_q5_1",
             Format::Mxfp4 => "gguf_mxfp4",
@@ -87,6 +91,26 @@ impl Format {
             Format::Iq2Xs => "gguf_iq2_xs",
             Format::Iq3Xxs => "gguf_iq3_xxs",
             Format::Iq2Xxs => "gguf_iq2_xxs",
+        }
+    }
+    /// The GGUF tensor type this format's weights are stored as.
+    pub fn encoding(self) -> magnitude_ggml::Encoding {
+        use magnitude_ggml::Encoding;
+        match self {
+            Format::Q4K => Encoding::Q4K,
+            Format::Q5K => Encoding::Q5K,
+            Format::Q6K => Encoding::Q6K,
+            Format::Q8 => Encoding::Q8_0,
+            Format::Iq4 => Encoding::Iq4Xs,
+            Format::Q4_0 => Encoding::Q4_0,
+            Format::Q4_1 => Encoding::Q4_1,
+            Format::Q5_0 => Encoding::Q5_0,
+            Format::Q5_1 => Encoding::Q5_1,
+            Format::Mxfp4 => Encoding::Mxfp4,
+            Format::Nvfp4 | Format::Nvfp4A4 => Encoding::Nvfp4,
+            Format::Iq2Xs => Encoding::Iq2Xs,
+            Format::Iq3Xxs => Encoding::Iq3Xxs,
+            Format::Iq2Xxs => Encoding::Iq2Xxs,
         }
     }
     pub fn representation(self) -> &'static str {
@@ -99,6 +123,7 @@ impl Format {
             Format::Q4_0 => "q4g32s",
             Format::Q5_0 => "q5g32s",
             Format::Q5_1 => "q5g32",
+            Format::Q4_1 => "q4g32",
             Format::Mxfp4 => "mxfp4g32",
             Format::Nvfp4 => "nvfp4g16",
             Format::Nvfp4A4 => "nvfp4g16a4",
@@ -114,6 +139,7 @@ impl Format {
         matches!(
             self,
             Format::Q4_0
+                | Format::Q4_1
                 | Format::Q5_0
                 | Format::Q5_1
                 | Format::Mxfp4
@@ -170,6 +196,11 @@ impl Format {
                 block.extend(f16(-rng.uniform(0.005, 0.02)));
                 block.extend((0..4 + 16).map(|_| rng.byte()));
             }
+            Format::Q4_1 => {
+                block.extend(f16(rng.uniform(0.0004, 0.003)));
+                block.extend(f16(-rng.uniform(0.005, 0.02)));
+                block.extend((0..16).map(|_| rng.byte()));
+            }
             Format::Mxfp4 => {
                 // E8M0 2^-10 .. 2^-8 (values up to 6 of them).
                 block.push(117 + (rng.next() % 3) as u8);
@@ -202,11 +233,7 @@ impl Format {
         block
     }
     pub fn block_values(self) -> usize {
-        match self {
-            Format::Q8 | Format::Q4_0 | Format::Q5_0 | Format::Q5_1 | Format::Mxfp4 => 32,
-            Format::Nvfp4 | Format::Nvfp4A4 => 64,
-            _ => 256,
-        }
+        self.encoding().block_elements() as usize
     }
 }
 

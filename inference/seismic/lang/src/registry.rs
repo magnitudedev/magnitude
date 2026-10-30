@@ -1594,7 +1594,7 @@ const fn gguf_source_spec(
     }
 }
 
-const GGUF_SOURCES: [GgufSource; 17] = [
+const GGUF_SOURCES: [GgufSource; 18] = [
     gguf_source_spec(Encoding::Q3K, 1, "gguf_q3_k", "q6k"),
     gguf_source_spec(Encoding::Iq3S, 1, "gguf_iq3_s", "q6k"),
     gguf_source_spec(Encoding::Q4K, 1, "gguf_q4_k", "q4k"),
@@ -1612,6 +1612,7 @@ const GGUF_SOURCES: [GgufSource; 17] = [
     gguf_source_spec(Encoding::Iq2Xs, 1, "gguf_iq2_xs", "iq2xs"),
     gguf_source_spec(Encoding::Iq3Xxs, 1, "gguf_iq3_xxs", "iq3xxs"),
     gguf_source_spec(Encoding::Iq2Xxs, 1, "gguf_iq2_xxs", "iq2xxs"),
+    gguf_source_spec(Encoding::Q4_1, 1, "gguf_q4_1", "q4g32"),
 ];
 
 /// The external storage rows of `width` stored values of `encoding` are
@@ -1956,9 +1957,9 @@ pub(crate) mod internals {
         // blocks (one iq4g32 storage group), each block's f16 scale widened
         // exactly; an IQ4_NL block alone (`gguf_iq4_nl_block`, the rows of a
         // table whose width is a multiple of 32 but not of 256, held as
-        // stored) is an iq4g32s packet. Q4_0, Q5_0, Q5_1, MXFP4 and NVFP4
-        // move their codes and scale fields bit for bit into representations
-        // of their own.
+        // stored) is an iq4g32s packet. Q4_0, Q4_1, Q5_0, Q5_1, MXFP4 and
+        // NVFP4 move their codes and scale fields bit for bit into
+        // representations of their own.
         let external_specs = GGUF_SOURCES.map(|source| {
             let packet_size = u32::try_from(source.encoding.block_bytes() * source.blocks)
                 .expect("a GGUF source packet fits u32 bytes");
@@ -2979,6 +2980,30 @@ pub(crate) mod internals {
                 push(plane(
                     "scale",
                     PlaneRepackRecipe::BitRoutes(direct_bits(0, 2)),
+                ));
+            }
+            "gguf_q4_1" => {
+                // block_q4_1: d (f16) | m (f16) | qs[16]: value p is
+                // d q + m of q the low (p < 16) or high nibble of qs[p % 16];
+                // d and m move bit for bit to the scale and the bias.
+                push(plane(
+                    "words",
+                    PlaneRepackRecipe::BitRoutes(
+                        (0..128)
+                            .map(|bit| {
+                                let position = bit / 4;
+                                (4 + position % 16) * 8 + (position / 16) * 4 + bit % 4
+                            })
+                            .collect(),
+                    ),
+                ));
+                push(plane(
+                    "scale",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(0, 2)),
+                ));
+                push(plane(
+                    "bias",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(2, 2)),
                 ));
             }
             "gguf_mxfp4" => {
