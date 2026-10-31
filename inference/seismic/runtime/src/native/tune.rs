@@ -5887,7 +5887,9 @@ impl LaunchPrograms {
     /// that launch that none has either. A compile call has a cost of its
     /// own besides what each variant it forms costs, so a call that must
     /// happen also forms what is measured next. None when every variant is
-    /// held.
+    /// held. A configuration runs only the launches it reaches
+    /// ([`NativeImplementation::reachable`]), as preparation forms it: a
+    /// launch it does not reach is formed for it in no variant.
     fn sources(
         &self,
         implementation: &NativeImplementation,
@@ -5899,6 +5901,9 @@ impl LaunchPrograms {
             for specialization in specializations {
                 let specialization = implementation.with_owned_defaults(specialization.clone());
                 for ordinal in 0..implementation.launches.len() {
+                    if !implementation.reachable(&specialization, ordinal) {
+                        continue;
+                    }
                     variants
                         .entry(ordinal)
                         .or_default()

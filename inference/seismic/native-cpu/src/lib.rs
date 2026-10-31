@@ -46,14 +46,17 @@ pub use isa::{X86V4Vnni, X86V2, X86V3, X86V4};
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+cpu-library-5");
 
 /// A weight buffer's element as a call reads it: its storage element, that
-/// element's resolved components, and whether products over it take their
+/// element's resolved components, whether products over it take their
 /// activation rows as NVFP4 operands (the registry's operand recipe,
-/// `operands(W)`).
+/// `operands(W)`), and whether they take quantized activation rows under a
+/// declaration's `INT8 = 1` (the quantized dot's admission,
+/// `form(W, INT8)`).
 #[derive(Clone, Copy, Debug)]
 pub struct WeightOperand {
     kernels: &'static WeightKernels,
     storage: &'static registry::RepresentationInfo,
     nvfp4_operands: bool,
+    quantized: bool,
 }
 
 impl WeightOperand {
@@ -66,6 +69,7 @@ impl WeightOperand {
             storage,
             nvfp4_operands: registry::representation_info(element).operands
                 == registry::OperandRecipe::Nvfp4Rows,
+            quantized: seismic_lang::forms::cpu_int8_of(element),
         })
     }
 
@@ -78,7 +82,7 @@ impl WeightOperand {
     }
 
     /// Whether the operand multiplies NVFP4 operand rows (the weight's W4A4
-    /// recipe), which never take quantized activations.
+    /// recipe).
     pub fn nvfp4_operands(&self) -> bool {
         self.nvfp4_operands
     }
@@ -94,6 +98,7 @@ pub struct Weights<'a> {
     geometry: RowGeometry,
     kernels: &'static WeightKernels,
     nvfp4_operands: bool,
+    quantized: bool,
     life: std::marker::PhantomData<&'a u8>,
 }
 
@@ -122,6 +127,7 @@ impl<'a> Weights<'a> {
                 .with_base(base, rows.max(1)),
             kernels: operand.kernels,
             nvfp4_operands: operand.nvfp4_operands,
+            quantized: operand.quantized,
             life: std::marker::PhantomData,
         }
     }
@@ -185,6 +191,12 @@ impl<'a> Weights<'a> {
     /// NVFP4 operands (`WeightOperand`).
     pub fn nvfp4_operands(&self) -> bool {
         self.nvfp4_operands
+    }
+
+    /// Whether a product over these weights takes quantized activation rows
+    /// under `INT8 = 1` (`WeightOperand`).
+    pub fn quantized(&self) -> bool {
+        self.quantized
     }
 
     /// The `k` values of row `row`.

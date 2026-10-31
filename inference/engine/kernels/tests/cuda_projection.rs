@@ -194,7 +194,7 @@ fn dense_expand_cases(formats: &[Format], seed: u64) {
             let residual = f32_tensor(&device, &[case.m as u64, h as u64], &case.residual);
             let norm = f32_tensor(&device, &[h as u64], &case.norm);
             let out_rows = i32_tensor(&device, &[o as u64], &case.out_rows);
-            for &mapping in mappings(o) {
+            for mapping in mappings(o, &[format.resident()]) {
                 let (expected, tolerance) = case.expand(&gate, &up, Some(format), mapping);
                 let product = expand_kernel(&device, format, &case, mapping)
                     .call(dense_expand::Args {
@@ -264,7 +264,7 @@ fn dense_output_cases(device: &Device, formats: &[Format], h: usize, f: usize, r
             let product = bf16_tensor(&device, &[o as u64, f as u64], &product_values);
             let residual = f32_tensor(&device, &[m as u64, h as u64], &residual_values);
             let out_rows = i32_tensor(&device, &[o as u64], &out_rows_values);
-            for &mapping in mappings(o) {
+            for mapping in mappings(o, &[format.resident()]) {
                 // The product is exact input, so the INT8 emulation is exact too.
                 let (x, _) = operand_rows(&product_values, f, mapping, Some(format));
                 let (projected, magnitude) = project(&x, &down.values, o, h, f);
@@ -626,13 +626,11 @@ fn cuda_dense_weights_match_host_model() {
         let residual = f32_tensor(&device, &[case.m as u64, h as u64], &case.residual);
         let norm = f32_tensor(&device, &[h as u64], &case.norm);
         let out_rows = i32_tensor(&device, &[o as u64], &case.out_rows);
-        for &mapping in mappings(o) {
+        for mapping in mappings(o, &[bf16]) {
             let statics = NativeSpecialization::new()
                 .with_static("H", h as u64)
                 .with_static("F", f as u64);
-            // INT8 has no effect with dense weights: every mapping runs the
-            // 16-bit path.
-            let (expected, tolerance) = case.expand(&gate, &up, None, Mapping { int8: 0, ..mapping });
+            let (expected, tolerance) = case.expand(&gate, &up, None, mapping);
             let product = dense_expand::native_for_device_with(
                 &device,
                 dense_expand::Elements {
@@ -729,7 +727,7 @@ fn cuda_gemv_rows_match_single_row_bits() {
         let product_values: Vec<f32> = (0..rows * f)
             .map(|_| bf16_round(rng.uniform(-1.0, 1.0)))
             .collect();
-        for &mapping in &GEMV_MAPPINGS {
+        for mapping in admitted(&GEMV_MAPPINGS, &[format.resident()]) {
             let expand = dense_expand::native_for_device_with(
                 &device,
                 dense_expand::Elements {
@@ -851,7 +849,7 @@ fn cuda_head_rows_match_host_model() {
             let hidden = f32_tensor(&device, &[case.m as u64, d as u64], &case.residual);
             let norm = f32_tensor(&device, &[d as u64], &case.norm);
             let out_rows = i32_tensor(&device, &[o as u64], &case.out_rows);
-            for &mapping in mappings(o) {
+            for mapping in mappings(o, &[format.resident()]) {
                 // The head's GEMMs are the 16-bit path.
                 let (expected, tolerance) =
                     head_expected(&case, &head, v, Some(format), Mapping { int8: 0, ..mapping });

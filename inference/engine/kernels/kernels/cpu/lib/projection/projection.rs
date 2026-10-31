@@ -42,9 +42,11 @@ pub fn project(weights: &Weights<'_>, first: usize, x: &[f32], out: &mut [f32]) 
     project_arithmetic(weights, first, x, None, out)
 }
 
-/// Project with either exact F32 activations or one previously quantized row.
-/// Weights that take NVFP4 operand rows multiply `x`, the rows their recipe
-/// forms: activation quantization never re-forms them.
+/// Project with either exact F32 activations or one previously quantized row,
+/// for weights that take it (`Weights::quantized`, the quantized dot's
+/// admission); others, which take NVFP4 operand rows, multiply `x`, the rows
+/// their recipe forms. A declaration admits `INT8 = 1` only where a weight
+/// it multiplies takes the quantized rows (`form(W, INT8)`).
 #[inline(always)]
 pub fn project_arithmetic(
     weights: &Weights<'_>,
@@ -53,7 +55,7 @@ pub fn project_arithmetic(
     q8: Option<&[Q8Block]>,
     out: &mut [f32],
 ) {
-    let q8 = q8.filter(|_| !weights.nvfp4_operands());
+    let q8 = q8.filter(|_| weights.quantized());
     let mut done = 0;
     while done < out.len() {
         let block = ROW_BLOCKS
@@ -102,7 +104,7 @@ pub fn project_staged(
 }
 
 /// Project staged rows, using their corresponding Q8 rows when present and
-/// the weights do not take NVFP4 operand rows (`project_arithmetic`).
+/// the weights take them (`project_arithmetic`).
 #[inline(always)]
 pub fn project_staged_arithmetic(
     weights: &Weights<'_>,
@@ -111,7 +113,7 @@ pub fn project_staged_arithmetic(
     quantized: Option<&[Q8Block]>,
     mut publish: impl FnMut(usize, &[f32]),
 ) {
-    let quantized = quantized.filter(|_| !weights.nvfp4_operands());
+    let quantized = quantized.filter(|_| weights.quantized());
     let mut completed = 0;
     if rows.len() == 8 {
         if let Some(q8) = quantized {
@@ -155,7 +157,7 @@ pub fn project_pair_staged_arithmetic(
 ) {
     assert_eq!(first.k(), second.k(), "paired projections share their input");
     // Paired weights share their rows, and so their operand recipe.
-    let quantized = quantized.filter(|_| !first.nvfp4_operands());
+    let quantized = quantized.filter(|_| first.quantized());
     let mut completed = 0;
     if rows.len() == 8 {
         if let Some(q8) = quantized {

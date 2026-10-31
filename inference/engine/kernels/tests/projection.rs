@@ -243,8 +243,7 @@ impl Repr {
         self.element_in(resident_layout(device))
     }
     /// Whether this format's packed forms take two residue bits (codes of
-    /// 8-bit values, as its token packing admits it, which the executor's
-    /// `packing_residue` reads).
+    /// 8-bit values, as its token packing admits it, `form(W, PACK_RESIDUE)`).
     fn takes_residue(self, device: &Device) -> bool {
         self.resident(device)
             .metal_packing()
@@ -2440,10 +2439,11 @@ fn cpu_int8_dense_output_agrees_with_exact_projection() {
 }
 
 /// Metal's INT8 form of the down projection: int8 activations per (row, 32
-/// columns) against the exact weights. On tensor operations with Q4_K weights
-/// its results differ from the tall form's by the activation quantization
-/// alone; other weights and devices without tensor operations run the staged
-/// 64 x 64 tile, bit for bit.
+/// columns) against the exact weights. On tensor operations with Q4_K or
+/// Q8_0 weights its results differ from the tall form's by the activation
+/// quantization alone; devices without tensor operations run the staged
+/// 64 x 64 tile, bit for bit. Weights not admitted to the int8 GEMM (Q6_K)
+/// have no INT8 configuration.
 #[test]
 fn metal_int8_dense_output_agrees_with_the_tall_form() {
     let Some(device) = devices()
@@ -2458,7 +2458,16 @@ fn metal_int8_dense_output_agrees_with_the_tall_form() {
         tall: Some(TALL_DEFAULT),
         ..staged
     };
-    for repr in [Repr::Q4k, Repr::Q6k, Repr::Q8] {
+    let refused = dense_output::native_for_device_with(
+        &device,
+        dense_output::Elements {
+            A: act.element(),
+            DW: Repr::Q6k.resident(&device),
+        },
+        &dense_output_specialization_on(&device, &[("H", 192), ("F", 1024)], tall).with_param("INT8", 1),
+    );
+    assert!(refused.is_err(), "Q6_K has no INT8 configuration");
+    for repr in [Repr::Q4k, Repr::Q8] {
         let (outputs, k) = (192, 1024);
         let down = weight(repr, outputs, k, 91, 1.0);
         for rows in [128usize, 200, 512] {
@@ -2808,7 +2817,8 @@ fn metal_packed_dense_output_agrees_with_the_staged_form() {
 /// projection: the GLU outputs differ from the staged form's by the packed
 /// form's error with gate and up weights one packed operand serves (Q4_K,
 /// Q5_K and q4g32s together, both Q6_K, or Q8_0 and iq4g32 together), and are
-/// the staged tile's bit for bit otherwise.
+/// the staged tile's bit for bit on a device without the packed path; other
+/// pairs have no PACK configuration.
 #[test]
 fn metal_packed_dense_expand_agrees_with_the_staged_form() {
     let Some(device) = devices()
@@ -2870,8 +2880,12 @@ fn metal_packed_dense_expand_agrees_with_the_staged_form() {
                         A: act.element(),
                     },
                     &specialization,
-                )
-                .unwrap();
+                );
+                if !served {
+                    assert!(kernel.is_err(), "{gate_repr:?} {up_repr:?} have no PACK configuration");
+                    continue;
+                }
+                let kernel = kernel.unwrap();
                 let packed = read_act(
                     act,
                     &kernel
@@ -2891,10 +2905,6 @@ fn metal_packed_dense_expand_agrees_with_the_staged_form() {
                         .unwrap()
                         .value,
                 );
-                if !served {
-                    assert_eq!(exact, packed, "{gate_repr:?} {up_repr:?} rows {rows}");
-                    continue;
-                }
                 let wide = |values: &[f32]| {
                     values
                         .iter()
@@ -3246,8 +3256,10 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
 
 /// Metal's INT8 form of the paired gate/up projection, as for the down
 /// projection: the GLU outputs differ from the tall form's by the activation
-/// quantization on tensor operations with Q4_K gate and up weights, and are
-/// the staged tile's bit for bit otherwise.
+/// quantization on tensor operations with Q4_K or Q8_0 gate and up weights,
+/// and are the staged tile's bit for bit on a device without them. A Q4_K
+/// and a Q8_0 weight, whose codes one quantized operand does not serve, have
+/// no INT8 configuration.
 #[test]
 fn metal_int8_dense_expand_agrees_with_the_tall_form() {
     let Some(device) = devices()
@@ -3262,6 +3274,17 @@ fn metal_int8_dense_expand_agrees_with_the_tall_form() {
         tall: Some(TALL_DEFAULT),
         ..staged
     };
+    let refused = dense_expand::native_for_device_with(
+        &device,
+        dense_expand::Elements {
+            NW: Element::bf16(),
+            GW: Repr::Q4k.resident(&device),
+            UW: Repr::Q8.resident(&device),
+            A: act.element(),
+        },
+        &dense_expand_specialization_on(&device, &[("H", 512), ("F", 192)], tall).with_param("INT8", 1),
+    );
+    assert!(refused.is_err(), "Q4_K and Q8_0 have no paired INT8 configuration");
     for repr in [Repr::Q4k, Repr::Q8] {
         let (h, f) = (512, 192);
         let gate = weight(repr, f, h, 93, 1.0);
@@ -4880,9 +4903,9 @@ fn scaled_projections_on(device: &Device) {
                     &output_bound,
                 );
             }
-            // The PACK form rounds its operand: within the packed error of the
-            // scaled projection.
-            if metal && rows > 64 {
+            // The PACK form, of weights admitted to it, rounds its operand:
+            // within the packed error of the scaled projection.
+            if metal && rows > 64 && repr.resident(device).metal_packing().is_some() {
                 let wide = |values: &[f32]| values.iter().map(|v| f64::from(*v)).collect::<Vec<_>>();
                 let packed = project(&hidden, rows, pack_mapping(), Some(PACK_DEFAULT));
                 for (segment, (expected, _)) in project_expected.iter().enumerate() {

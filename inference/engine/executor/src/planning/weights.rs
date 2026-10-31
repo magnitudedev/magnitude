@@ -272,14 +272,6 @@ fn packing_bound(resident: Element, logical: &[u64]) -> u64 {
     }
 }
 
-/// Whether a weight's packed sums take residue bits beside their 16-bit
-/// fields (`MetalPacking::residue`: its codes are values of 8 bits, Q8_0
-/// and iq4g32). Only such weights make the packed forms' second residue
-/// width (`RESIDUE` 2) apply.
-pub fn packing_residue(resident: Element) -> bool {
-    packing(resident).is_some_and(|packing| packing.residue)
-}
-
 /// A packed weight's second-level scale (NVFP4's per-tensor or per-matrix
 /// F32 `.scale`): a stored tensor of its own, `[1]` or `[stack]`, resident
 /// beside the weight's representation as one F32 value per matrix. Entries

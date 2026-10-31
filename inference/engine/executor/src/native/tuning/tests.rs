@@ -749,6 +749,18 @@ struct FakeCase {
     unqualified: bool,
 }
 
+/// `dense_output`'s implementation on `device` over dense BF16 rows: its
+/// CPU `where` reads the weight's form (`form(DW, INT8)`).
+fn dense_output_implementation(device: &seismic::Device) -> NativeImplementation {
+    seismic::generated::native_implementation_at::<dense_output::Entry>(
+        device.backend(),
+        &[("A", Element::bf16()), ("DW", Element::bf16())],
+    )
+    .unwrap()
+    .unwrap()
+    .clone()
+}
+
 impl FakeCase {
     /// A case choosing the defaults with `ROWS` 2 (admissible, not the
     /// default).
@@ -1260,9 +1272,7 @@ fn abandoning_the_tuner_after_the_mandatory_phase_leaves_a_cache_a_second_load_c
         max_projected_rows: 8,
         context_tokens: 256,
     };
-    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
-        .unwrap()
-        .unwrap();
+    let implementation = dense_output_implementation(&device);
     let statics = implementation
         .statics
         .iter()
@@ -1393,9 +1403,7 @@ fn profile_what_compiles_on_workers_add_to_the_process_footprint() {
     let Some(device) = metal() else {
         return;
     };
-    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
-        .unwrap()
-        .unwrap();
+    let implementation = dense_output_implementation(&device);
     let statics = implementation
         .statics
         .iter()
@@ -1525,9 +1533,7 @@ fn a_record_is_published_with_a_promotion_and_once_when_the_work_stops() {
         max_projected_rows: 8,
         context_tokens: 256,
     };
-    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
-        .unwrap()
-        .unwrap();
+    let implementation = dense_output_implementation(&device);
     let statics = implementation
         .statics
         .iter()
@@ -1822,9 +1828,7 @@ fn a_composed_recipe_finds_its_pinned_prerequisite_on_an_empty_cache() {
         packing_bound: HashMap::new(),
     };
     let recorder = Recorder::default();
-    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
-        .unwrap()
-        .unwrap();
+    let implementation = dense_output_implementation(&device);
     let statics = implementation
         .statics
         .iter()
@@ -1922,9 +1926,7 @@ fn ordinary_and_zero_demand_units_outlasting_the_budget_fail_nothing() {
         repack_weight: HashMap::new(),
         packing_bound: HashMap::new(),
     };
-    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
-        .unwrap()
-        .unwrap();
+    let implementation = dense_output_implementation(&device);
     let statics = implementation
         .statics
         .iter()
@@ -1990,9 +1992,7 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
         max_projected_rows: 8,
         context_tokens: 256,
     };
-    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
-        .unwrap()
-        .unwrap();
+    let implementation = dense_output_implementation(&device);
     let statics = implementation
         .statics
         .iter()
@@ -2172,9 +2172,7 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
     let root = std::env::temp_dir().join(format!("magnitude-tuning-cache-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let cache = KernelCache::open(root.clone(), crate::DEFAULT_KERNEL_CACHE_BYTES).unwrap();
-    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
-        .unwrap()
-        .unwrap();
+    let implementation = dense_output_implementation(&device);
     let statics = implementation
         .statics
         .iter()
@@ -2398,9 +2396,7 @@ fn a_stored_record_is_served_under_another_alpha_without_forming_or_measuring() 
     let root = std::env::temp_dir().join(format!("magnitude-tuning-alpha-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let cache = KernelCache::open(root.clone(), crate::DEFAULT_KERNEL_CACHE_BYTES).unwrap();
-    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
-        .unwrap()
-        .unwrap();
+    let implementation = dense_output_implementation(&device);
     let statics = implementation
         .statics
         .iter()
@@ -2552,9 +2548,7 @@ fn unqualified_terminal_choices_are_reused_with_their_disposition_and_without_se
     ));
     let _ = std::fs::remove_dir_all(&root);
     let cache = KernelCache::open(root.clone(), crate::DEFAULT_KERNEL_CACHE_BYTES).unwrap();
-    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
-        .unwrap()
-        .unwrap();
+    let implementation = dense_output_implementation(&device);
     let statics = implementation
         .statics
         .iter()
@@ -2647,9 +2641,7 @@ fn canonical_prerequisites_precede_every_census_and_a_spent_budget_starts_nothin
         packing_bound: HashMap::new(),
     };
     let recorder = Recorder::default();
-    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
-        .unwrap()
-        .unwrap();
+    let implementation = dense_output_implementation(&device);
     let statics = implementation
         .statics
         .iter()
@@ -2752,9 +2744,7 @@ fn the_count_forms_nothing_and_a_weight_without_its_import_entry_is_a_typed_fail
         packing_bound: HashMap::new(),
     };
     let recorder = Recorder::default();
-    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
-        .unwrap()
-        .unwrap();
+    let implementation = dense_output_implementation(&device);
     let statics = implementation
         .statics
         .iter()
@@ -3028,9 +3018,7 @@ fn units_measure_baselines_before_search() {
         packing_bound: HashMap::new(),
     };
     let recorder = Recorder::default();
-    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
-        .unwrap()
-        .unwrap();
+    let implementation = dense_output_implementation(&device);
     let statics = implementation
         .statics
         .iter()
@@ -3343,9 +3331,7 @@ fn a_load_reads_records_and_reports_or_serves_defaults_without_searching() {
     let root = std::env::temp_dir().join(format!("magnitude-tuning-serve-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let cache = KernelCache::open(root.clone(), crate::DEFAULT_KERNEL_CACHE_BYTES).unwrap();
-    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
-        .unwrap()
-        .unwrap();
+    let implementation = dense_output_implementation(&device);
     let statics = implementation
         .statics
         .iter()
@@ -3584,9 +3570,7 @@ fn cpu_projection_default_form_follows_the_tier_integer_dots() {
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();
-    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
-        .unwrap()
-        .unwrap();
+    let implementation = dense_output_implementation(&device);
     let statics = implementation
         .statics
         .iter()

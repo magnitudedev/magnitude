@@ -549,11 +549,13 @@ pub(crate) fn on_device(
 
 /// `implementation`'s declared defaults as `device` offers them at
 /// `bindings`. On a CPU whose tier forms quantized dots from vector integer
-/// products (AVX2, AVX-512 or VNNI), a projection with a packed weight
-/// operand defaults to its `INT8` form: it quantizes the staged rows to Q8
-/// blocks and runs the representation's integer dot, and the F32 form is
-/// the challenger. Elsewhere (x86-64-v2, NEON, dense weights, weights that
-/// multiply NVFP4 operand rows, GPUs) the declaration's defaults stand.
+/// products (AVX2, AVX-512 or VNNI, `Tier::quantized_dots`, a fact of the
+/// device), a projection over a packed weight the quantized dot takes
+/// (`form(W, INT8)`) prefers its `INT8` form: it quantizes the staged rows
+/// to Q8 blocks and runs the representation's integer dot, and the F32 form
+/// is the challenger. The default is the first configuration the
+/// declaration admits in that order. Elsewhere (x86-64-v2, NEON, dense
+/// weights, GPUs) the declaration's defaults stand.
 pub(crate) fn device_defaults(
     device: &DeviceInner,
     mut implementation: NativeImplementation,
@@ -563,14 +565,14 @@ pub(crate) fn device_defaults(
     let OpenedKind::Cpu(_) = &device.kind else {
         return implementation;
     };
-    let Some(tier) =
-        seismic_native_cpu::Tier::detected().filter(|tier| tier.quantized_dots() > 0)
-    else {
+    if !seismic_native_cpu::Tier::detected().is_some_and(|tier| tier.quantized_dots() > 0) {
         return implementation;
-    };
+    }
     let packed = bindings.iter().any(|(_, representation)| {
-        seismic_native_cpu::WeightOperand::of(tier, representation)
-            .is_some_and(|operand| operand.dense_bytes().is_none() && !operand.nvfp4_operands())
+        matches!(
+            seismic_lang::registry::representation_info(representation).kind,
+            seismic_lang::registry::RepresentationKind::PackedRows(_)
+        ) && seismic_lang::forms::cpu_int8_of(representation)
     });
     if !packed {
         return implementation;

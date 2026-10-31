@@ -1048,7 +1048,9 @@ impl<'m> Subject<'m> {
     }
 
     /// The code variants of each launch at `row`'s bindings and statics:
-    /// every template instance an admissible configuration names.
+    /// every template instance an admissible configuration reaching the
+    /// launch names ([`NativeImplementation::reachable`]); none for a launch
+    /// no admissible configuration reaches, which preparation never forms.
     fn variants(&self, row: &Row) -> Vec<Vec<LaunchVariant>> {
         self.admissible(self.implementation(&row.bindings), &statics_of(&row.specialization))
             .variants
@@ -1056,7 +1058,8 @@ impl<'m> Subject<'m> {
     }
 
     /// The programs preparation forms for `row`, every code variant of a
-    /// launch-scoped implementation among their entries.
+    /// launch-scoped implementation among their entries: none of a launch no
+    /// admissible configuration reaches.
     fn programs(&self, row: &Row) -> Vec<ProgramSource> {
         let logical = self
             .module
@@ -1088,7 +1091,10 @@ impl<'m> Subject<'m> {
                 &row.specialization,
                 self.asset,
                 &self.variants(row),
-            ),
+            )
+            .into_iter()
+            .filter(|program| !program.entries.is_empty())
+            .collect(),
         }
     }
 
@@ -1265,6 +1271,9 @@ impl<'m> Admissible<'m> {
                     first = Some(candidate.clone());
                 }
                 for (ordinal, variants) in admissible.variants.iter_mut().enumerate() {
+                    if !implementation.reachable(candidate, ordinal) {
+                        continue;
+                    }
                     let variant = variant_of(implementation, candidate, ordinal);
                     if !variants.contains(&variant) {
                         variants.push(variant);
@@ -1320,12 +1329,17 @@ impl<'m> Admissible<'m> {
 
     /// The code variants of launch `launch` in the order of their first
     /// configurations: each from the first configuration holding one
-    /// combination of the parameters a variant reads.
+    /// combination of the parameters a variant reads and the launch's
+    /// condition reads, of the combinations at which it reaches the launch.
     fn launch_variants(&self, launch: usize) -> Vec<LaunchVariant> {
         let declaration = &self.implementation.launches[launch];
         let mut extent = Vec::new();
         for expression in &declaration.group_extent {
             expression.parameters(&mut extent);
+        }
+        let mut reached = Vec::new();
+        if let Some(when) = &declaration.when {
+            when.parameters(&mut reached);
         }
         let reads = self
             .axes
@@ -1333,7 +1347,7 @@ impl<'m> Admissible<'m> {
             .enumerate()
             .filter(|(_, (scope, parameter))| {
                 scope.is_none_or(|scope| scope == launch)
-                    && (parameter.code || extent.contains(&parameter.name))
+                    && (parameter.code || extent.contains(&parameter.name) || reached.contains(&parameter.name))
             })
             .map(|(axis, _)| axis)
             .collect::<Vec<_>>();
@@ -1351,7 +1365,10 @@ impl<'m> Admissible<'m> {
                     },
                 )
                 .collect::<Vec<_>>();
-            if let Some(first) = self.first_within(&values) {
+            if let Some(first) = self
+                .first_within(&values)
+                .filter(|first| self.implementation.reachable(first, launch))
+            {
                 firsts.push((
                     self.codes_of(&first),
                     variant_of(self.implementation, &first, launch),

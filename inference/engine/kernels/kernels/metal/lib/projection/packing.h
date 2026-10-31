@@ -140,7 +140,10 @@ inline float4 packing_scale(float4 value) {
 //
 // An admitted weight's packed product is `available` on a device without
 // tensor operations (their int8 products carry more than a packed matrix
-// operand does); `factors` gives a row's block factors of a 256-column
+// operand does). A PACK = 1 configuration names the form only of weights
+// admitted to it (a declaration's `form(W, PACK)`); on a device with tensor
+// operations its `unpacked` launch runs the staged tiles of the default form
+// instead, with their results. `factors` gives a row's block factors of a 256-column
 // block for `packing_coefficients`: `reach` a bound on what the fold
 // multiplies, `start` and `take` each block's two factors in turn. `residue`
 // is the bits of the top sum the code planes resolve (0: the sums fit 16
@@ -455,6 +458,19 @@ struct packing_admitted<packets::Packet<P, C, K, F>> {
 
 template <typename W>
 using packing_codes = packing_codes_of<W, packing_admitted<W>::value>;
+
+// Whether a PACK launch over the weights W... runs the packed products: on a
+// device without tensor operations (`packing_forms`); elsewhere the form's
+// launches return and its `unpacked` launch takes the staged tiles of the
+// default form. PACK = 1 names the packed GEMM only of weights admitted to it
+// (`form(W, PACK)`), which the declaration's `where` requires; only a
+// configuration that runs a launch forms it.
+// A function, not a class's constant: a class's static data member is a
+// constant of the program, which moves what follows it.
+template <typename... W> constexpr bool packing_path() {
+    static_assert((packing_admitted<W>::value && ...), "PACK = 1 names the packed GEMM of weights admitted to it");
+    return packing_forms;
+}
 
 // The fields of a packed element and of a run's accumulator for weights
 // with RESIDUE residue bits. An element is (2^top_shift top + low) x

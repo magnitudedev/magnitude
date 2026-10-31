@@ -489,12 +489,19 @@ pub const GEMM_MAPPINGS: [Mapping; 4] = [
     },
 ];
 
-pub fn mappings(m: usize) -> &'static [Mapping] {
-    if m <= GEMV_ROWS {
-        &GEMV_MAPPINGS
-    } else {
-        &GEMM_MAPPINGS
-    }
+/// The mappings of `m` rows over `weights` ([`admitted`]).
+pub fn mappings(m: usize, weights: &[Element]) -> Vec<Mapping> {
+    admitted(if m <= GEMV_ROWS { &GEMV_MAPPINGS } else { &GEMM_MAPPINGS }, weights)
+}
+
+/// The `mappings` a product over `weights` admits: INT8 1 only where CUDA's
+/// int8 GEMM takes every weight (`Element::cuda_int8`, `form(W, INT8)`).
+pub fn admitted(mappings: &[Mapping], weights: &[Element]) -> Vec<Mapping> {
+    mappings
+        .iter()
+        .copied()
+        .filter(|mapping| mapping.int8 == 0 || weights.iter().all(Element::cuda_int8))
+        .collect()
 }
 
 /// q8_1 quantization of rows of `k` as the INT8 path forms them: per 32

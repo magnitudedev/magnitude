@@ -213,16 +213,15 @@ kernel void dense_expand_tall(DENSE_EXPAND_ARGUMENTS,
 #define DENSE_EXPAND_INT8_SCRATCH                                                        \
     const projection::int8_scratch gate_scratch{quantized, row_scales, block_sums, gate_coefficients, gate_biases}; \
     const projection::int8_scratch up_scratch{quantized, row_scales, block_sums, up_coefficients, up_biases}
-#define DENSE_EXPAND_INT8_AVAILABLE \
-    (projection::int8_codes<packets::W0>::available && projection::int8_codes<packets::W1>::available && \
-        projection::int8_codes<packets::W0>::interleaved == projection::int8_codes<packets::W1>::interleaved)
+// Whether the INT8 launches run the int8 products (`int8_path`).
+#define DENSE_EXPAND_INT8_PATH projection::int8_path<packets::W0, packets::W1>()
 
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_QUANTIZE
 kernel void dense_expand_quantize(DENSE_EXPAND_ARGUMENTS,
     uint row [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (!DENSE_EXPAND_INT8_AVAILABLE)
+    if constexpr (!DENSE_EXPAND_INT8_PATH)
         return;
     DENSE_EXPAND_INT8_SCRATCH;
     projection::Plain<activation, projection::AllRows> x{normalized, SEISMIC_DIM_H, 1, uint(SEISMIC_DIM_H), {}};
@@ -234,7 +233,7 @@ kernel void dense_expand_quantize(DENSE_EXPAND_ARGUMENTS,
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_COEFFICIENTS
 kernel void dense_expand_coefficients(DENSE_EXPAND_ARGUMENTS,
     uint item [[thread_position_in_grid]]) {
-    if constexpr (!DENSE_EXPAND_INT8_AVAILABLE)
+    if constexpr (!DENSE_EXPAND_INT8_PATH)
         return;
     DENSE_EXPAND_OPERANDS;
     DENSE_EXPAND_INT8_SCRATCH;
@@ -248,16 +247,16 @@ kernel void dense_expand_int8(DENSE_EXPAND_ARGUMENTS,
     uint2 tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float exchange[DENSE_EXPAND_INT8_AVAILABLE ? 2 * 32 * 32 : 1];
+    threadgroup float exchange[DENSE_EXPAND_INT8_PATH ? 2 * 32 * 32 : 1];
     // The default form's tile only where the launch takes that form:
     // threadgroup memory a kernel does not use still slows its products.
-    threadgroup float4 shared_words[DENSE_EXPAND_INT8_AVAILABLE ? 1 : projection::gemm_tile<64, 64>::bytes / 16];
+    threadgroup float4 shared_words[DENSE_EXPAND_INT8_PATH ? 1 : projection::gemm_tile<64, 64>::bytes / 16];
     threadgroup uchar *shared = reinterpret_cast<threadgroup uchar *>(shared_words);
     DENSE_EXPAND_OPERANDS;
     DENSE_EXPAND_INT8_SCRATCH;
     projection::Plain<activation, projection::AllRows> x{normalized, SEISMIC_DIM_H, 1, uint(SEISMIC_DIM_H), {}};
-    projection::gemm_int8_paired<packets::W0, packets::W1>(x, out, gate, up, gate_scratch, up_scratch,
-        uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile.y, tile.x, shared, exchange, sg, lane);
+    projection::gemm_int8_paired<packets::W0, packets::W1, DENSE_EXPAND_INT8_PATH>(x, out, gate, up, gate_scratch,
+        up_scratch, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile.y, tile.x, shared, exchange, sg, lane);
 }
 #endif
 
@@ -267,10 +266,16 @@ kernel void dense_expand_int8(DENSE_EXPAND_ARGUMENTS,
 #define DENSE_EXPAND_PACKING_SCRATCH                                                     \
     const projection::packing_scratch gate_scratch{packed, token_factors, token_scales, gate_factors, gate_scales}; \
     const projection::packing_scratch up_scratch{packed, token_factors, token_scales, up_factors, up_scales}
-#define DENSE_EXPAND_PACKING_AVAILABLE \
-    (projection::packing_codes<packets::W0>::available \
-        && projection::packing_serves<packets::W1, projection::packing_codes<packets::W0>::folds, \
-            projection::packing_codes<packets::W0>::residue>::value)
+// Whether the PACK launches run the paired packed products
+// (`packing_path`): PACK = 1 names them only for a gate and an up weight one
+// operand serves, of one layout (`PACK_FOLDS`, `PACK_RESIDUE`), which the
+// declaration's `where` requires.
+#define DENSE_EXPAND_PACKING_PATH projection::packing_path<packets::W0, packets::W1>()
+#define DENSE_EXPAND_PACKING_ADMITTED                                                    \
+    static_assert(projection::packing_codes<packets::W0>::folds == projection::packing_codes<packets::W1>::folds \
+            && (projection::packing_codes<packets::W0>::residue != 0)                    \
+                == (projection::packing_codes<packets::W1>::residue != 0),               \
+        "PACK = 1 names the packed GEMM of weights one operand serves")
 
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_PACK
 // RESIDUE: the operand's residue width for weights with residue bits.
@@ -280,7 +285,8 @@ kernel void dense_expand_pack(DENSE_EXPAND_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (!DENSE_EXPAND_PACKING_AVAILABLE)
+    DENSE_EXPAND_PACKING_ADMITTED;
+    if constexpr (!DENSE_EXPAND_PACKING_PATH)
         return;
     threadgroup float4 peaks[8];
     DENSE_EXPAND_PACKING_SCRATCH;
@@ -301,7 +307,8 @@ kernel void dense_expand_pack_coefficients(DENSE_EXPAND_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (!DENSE_EXPAND_PACKING_AVAILABLE)
+    DENSE_EXPAND_PACKING_ADMITTED;
+    if constexpr (!DENSE_EXPAND_PACKING_PATH)
         return;
     threadgroup float gate_peaks[8];
     threadgroup float up_peaks[8];
@@ -320,7 +327,8 @@ kernel void dense_expand_packed(DENSE_EXPAND_ARGUMENTS,
     uint tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (!DENSE_EXPAND_PACKING_AVAILABLE)
+    DENSE_EXPAND_PACKING_ADMITTED;
+    if constexpr (!DENSE_EXPAND_PACKING_PATH)
         return;
     threadgroup float4 exchange[projection::packing_simdgroups / 2 * projection::packing_exchange];
     DENSE_EXPAND_OPERANDS;
@@ -332,14 +340,15 @@ kernel void dense_expand_packed(DENSE_EXPAND_ARGUMENTS,
 }
 #endif
 
-// PACK with weights that have no packed path: the staged paired tiles of the
+// PACK on a device without the packed path: the staged paired tiles of the
 // default form, with its results.
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_UNPACKED
 kernel void dense_expand_unpacked(DENSE_EXPAND_ARGUMENTS,
     uint2 tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (DENSE_EXPAND_PACKING_AVAILABLE)
+    DENSE_EXPAND_PACKING_ADMITTED;
+    if constexpr (DENSE_EXPAND_PACKING_PATH)
         return;
     DENSE_EXPAND_GEMM(64, 64);
 }

@@ -335,6 +335,14 @@ kernel void attention_project_tall(ATTENTION_PROJECT_ARGUMENTS,
 #define ATTENTION_PROJECT_PACKED(SLOT)                                                  \
     projection::packing_serves<packets::SLOT, ATTENTION_PROJECT_PACKING::folds,         \
         ATTENTION_PROJECT_PACKING::residue>::value
+// PACK = 1 names the packed GEMM of a segment of weights admitted to it (the
+// declaration's `where`).
+#define ATTENTION_PROJECT_PACKING_ADMITTED                                              \
+    static_assert((projection::packing_admitted<packets::W0>::value && SEISMIC_DIM_Q > 0) \
+            || (projection::packing_admitted<packets::W1>::value && SEISMIC_DIM_GR > 0) \
+            || (projection::packing_admitted<packets::W2>::value && SEISMIC_DIM_K > 0)  \
+            || (projection::packing_admitted<packets::W3>::value && SEISMIC_DIM_V > 0), \
+        "PACK = 1 names the packed GEMM of a segment of weights admitted to it")
 
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_PACK
 // RESIDUE: the operand's residue width for weights with residue bits.
@@ -344,7 +352,8 @@ kernel void attention_project_pack(ATTENTION_PROJECT_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (ATTENTION_PROJECT_PACKING::folds == 0)
+    ATTENTION_PROJECT_PACKING_ADMITTED;
+    if constexpr (!projection::packing_forms)
         return;
     threadgroup float4 peaks[8];
     ATTENTION_PROJECT_OPERANDS;
@@ -368,6 +377,7 @@ kernel void attention_project_pack(ATTENTION_PROJECT_ARGUMENTS,
 kernel void attention_project_pack_coefficients(ATTENTION_PROJECT_ARGUMENTS,
     uint row [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
+    ATTENTION_PROJECT_PACKING_ADMITTED;
     ATTENTION_PROJECT_OPERANDS;
     const uint r1 = query_rows, r2 = r1 + gate_rows, r3 = r2 + key_rows;
     if (row < r1) {
@@ -396,6 +406,7 @@ kernel void attention_project_packed(ATTENTION_PROJECT_ARGUMENTS,
     uint tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
+    ATTENTION_PROJECT_PACKING_ADMITTED;
     ATTENTION_PROJECT_OPERANDS;
     const uint m = uint(SEISMIC_DIM_M), padded = (m + 127u) / 128u * 128u;
     const uint r1 = query_rows, r2 = r1 + gate_rows, r3 = r2 + key_rows;
@@ -426,6 +437,7 @@ kernel void attention_project_unpacked(ATTENTION_PROJECT_ARGUMENTS,
     uint2 tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
+    ATTENTION_PROJECT_PACKING_ADMITTED;
     ATTENTION_PROJECT_GEMM_SEGMENTS(64u, 64u, !ATTENTION_PROJECT_PACKED(W0), !ATTENTION_PROJECT_PACKED(W1),
         !ATTENTION_PROJECT_PACKED(W2), !ATTENTION_PROJECT_PACKED(W3));
 }

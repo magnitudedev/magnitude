@@ -369,6 +369,7 @@ native routed_expand for vulkan from "vulkan/routed_expand.comp":
 # every row.
 native routed_expand for cpu from "cpu/routed_expand.rs":
     params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
+    where (INT8 == 0 or form(EGW, INT8) == 1 or form(EUW, INT8) == 1 or form(SGW, INT8) == 1 or form(SUW, INT8) == 1)
     scratch quantized bytes (M * ceil_div(H, 256) * 292)
     scratch staged bytes (M * H * 4)
     scratch operands bytes (M * H * 4) when operands(EGW) + operands(SGW) > 0
@@ -481,6 +482,7 @@ native routed_output for vulkan from "vulkan/routed_output.comp":
 # channels of row m and carries their running sum across the choices.
 native routed_output for cpu from "cpu/routed_output.rs":
     params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
+    where (INT8 == 0 or form(EDW, INT8) == 1 or form(SDW, INT8) == 1)
     scratch expert_q8 bytes (M * K * ceil_div(F, 256) * 292)
     scratch shared_q8 bytes (M * ceil_div(S, 256) * 292)
     scratch expert bytes (M * K * F * 4)
@@ -693,6 +695,7 @@ native routed_experts for vulkan from "vulkan/routed_experts.comp":
 # the products as F32 in scratch.
 native routed_experts for cpu from "cpu/routed_experts.rs":
     params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
+    where (INT8 == 0 or form(EGW, INT8) == 1 or form(EUW, INT8) == 1 or form(EDW, INT8) == 1)
     scratch quantized bytes (M * ceil_div(H, 256) * 292)
     scratch product_q8 bytes (B * T * ceil_div(F, 256) * 292)
     scratch staged bytes (M * H * 4)
@@ -817,6 +820,7 @@ native routed_combine for vulkan from "vulkan/routed_combine.comp":
 # per work item: the shared down projection and the unpermuting combine.
 native routed_combine for cpu from "cpu/routed_combine.rs":
     params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
+    where (INT8 == 0 or form(SGW, INT8) == 1 or form(SUW, INT8) == 1 or form(SDW, INT8) == 1)
     scratch quantized bytes (M * ceil_div(H, 256) * 292)
     scratch shared_q8 bytes (M * ceil_div(S, 256) * 292)
     scratch staged bytes (M * H * 4)
@@ -1205,6 +1209,7 @@ native routed_gate_up for vulkan from "vulkan/routed_gate_up.comp":
 
 native routed_gate_up for cpu from "cpu/routed_gate_up.rs":
     params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
+    where (INT8 == 0 or form(EGW, INT8) == 1 or form(EUW, INT8) == 1)
     scratch quantized bytes (M * ceil_div(H, 256) * 292)
     scratch staged bytes (M * H * 4)
     launch routed_gate_up_stage:
@@ -1250,6 +1255,7 @@ native routed_up for vulkan from "vulkan/routed_up.comp":
 
 native routed_up for cpu from "cpu/routed_up.rs":
     params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
+    where (INT8 == 0 or form(EUW, INT8) == 1)
     scratch quantized bytes (M * ceil_div(H, 256) * 292)
     scratch staged bytes (M * H * 4)
     launch routed_up_stage:
@@ -1307,6 +1313,7 @@ native routed_down for vulkan from "vulkan/routed_down.comp":
 
 native routed_down for cpu from "cpu/routed_down.rs":
     params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
+    where (INT8 == 0 or form(EDW, INT8) == 1)
     scratch quantized bytes (M * K * ceil_div(F, 256) * 292)
     scratch staged bytes (M * K * F * 4)
     launch routed_down_stage:
@@ -1387,6 +1394,7 @@ native routed_experts_up for vulkan from "vulkan/routed_experts_up.comp":
 
 native routed_experts_up for cpu from "cpu/routed_experts_up.rs":
     params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
+    where (INT8 == 0 or form(EUW, INT8) == 1 or form(EDW, INT8) == 1)
     scratch quantized bytes (M * ceil_div(H, 256) * 292)
     scratch product_q8 bytes (B * T * ceil_div(F, 256) * 292)
     scratch staged bytes (M * H * 4)

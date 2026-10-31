@@ -106,13 +106,13 @@ fn attention_output[M, D, SN, IN, Q, W, OS, OB](hidden: &tensor[M, SN * D] f32, 
 # PACK selects `dense_output`'s token-packing form past 64 rows (see
 # `dense_rows.seismic`), with its launches, complete paired computation and transient
 # scratch, over the gated rows (the weights' factors a simdgroup per weight
-# row); weights or devices without the packed path run the staged tile, with
-# its results.
+# row), for weights admitted to it (`form(OW, PACK)`); devices without the
+# packed path run the staged tile, with its results.
 native attention_output for metal from "metal/attention_output.metal":
     static (D, SN, IN, Q, W, OS, OB)
     params (arithmetic BATCH_FROM in [5, 3, 9], arithmetic SPLIT in [1, 2, 4], form TALL in [1, 0],
         arithmetic form PACK in [0, 1], code arithmetic form RESIDUE in [1, 2])
-    where Q * W > 0 and (TALL == 0 or (SPLIT == 1 and Q * W % 128 == 0)) and (PACK == 0 or (TALL == 1 and Q * W % 256 == 0 and Q * W < 1048576 and D % 64 == 0)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and OB > 0))
+    where Q * W > 0 and (TALL == 0 or (SPLIT == 1 and Q * W % 128 == 0)) and (PACK == 0 or (TALL == 1 and Q * W % 256 == 0 and Q * W < 1048576 and D % 64 == 0 and form(OW, PACK) == 1)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and OB > 0 and form(OW, PACK_RESIDUE) == 1))
     scratch partials bytes (SPLIT * M * D * 4) when M > 64 and SPLIT > 1
     scratch small_partials bytes (4 * M * D * 4) when M > 16 and M <= 64
     scratch fragments bytes (ceil_div(M, 64) * 64 * Q * W * 2) when M > 64 and TALL == 1 and PACK == 0
@@ -271,7 +271,7 @@ native attention_output for vulkan from "vulkan/attention_output.comp":
 native attention_output for cpu from "cpu/attention_output.rs":
     static (Q, W, OS)
     params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
-    where Q * W > 0
+    where Q * W > 0 and (INT8 == 0 or form(OW, INT8) == 1)
     scratch quantized bytes (M * ceil_div(Q * W, 256) * 292)
     scratch staged bytes (M * Q * W * 4)
     launch attention_output_stage:
@@ -377,12 +377,14 @@ fn attention_project[M, D, PT, NM, Q, GR, K, V, QS, GS, KS, VS, QB, GB, KB, VB](
 # `gated_delta_project` (`recurrent.seismic`): one operand for every segment,
 # each weight's own factor tables in segment order, the packed tiles in
 # segment order, and the staged 64 x 64 tiles (`unpacked`) for a segment whose
-# weights the operand does not serve and for the zero tiles of mode 1.
+# weights the operand does not serve and for the zero tiles of mode 1. PACK
+# is admitted where a segment's weights are (`form(W, PACK)`), and RESIDUE 2
+# where a bounded segment's codes take the residue (`form(W, PACK_RESIDUE)`).
 native attention_project for metal from "metal/attention_project.metal":
     static (D, PT, NM, Q, GR, K, V, QS, GS, KS, VS, QB, GB, KB, VB)
     params (arithmetic BATCH_FROM in [5, 3, 9], form TALL in [1, 0], arithmetic form PACK in [0, 1],
         code arithmetic form RESIDUE in [1, 2])
-    where D > 0 and (TALL == 0 or D % 128 == 0) and (PACK == 0 or (TALL == 1 and D % 256 == 0 and D < 1048576 and Q % 32 == 0 and GR % 32 == 0 and K % 32 == 0 and V % 32 == 0)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and QB + GB + KB + VB > 0))
+    where D > 0 and (TALL == 0 or D % 128 == 0) and (PACK == 0 or (TALL == 1 and D % 256 == 0 and D < 1048576 and Q % 32 == 0 and GR % 32 == 0 and K % 32 == 0 and V % 32 == 0 and ((Q > 0 and form(QW, PACK) == 1) or (GR > 0 and form(GW, PACK) == 1) or (K > 0 and form(KW, PACK) == 1) or (V > 0 and form(VW, PACK) == 1)))) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and ((QB > 0 and form(QW, PACK_RESIDUE) == 1) or (GB > 0 and form(GW, PACK_RESIDUE) == 1) or (KB > 0 and form(KW, PACK_RESIDUE) == 1) or (VB > 0 and form(VW, PACK_RESIDUE) == 1))))
     scratch normalized bytes ((M + TALL * (ceil_div(M, 64) * 64 - M)) * D * 2) when M > 16
     scratch packed bytes (ceil_div(M, 128) * 128 * D * 2 + 1024) when M > 64 and PACK == 1
     scratch token_factors bytes (ceil_div(M, 128) * 128 * (D / 32) * 4 * RESIDUE) when M > 64 and PACK == 1
@@ -535,7 +537,7 @@ native attention_project for vulkan from "vulkan/attention_project.comp":
 native attention_project for cpu from "cpu/attention_project.rs":
     static (D, QS, GS, KS, VS)
     params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
-    where D > 0
+    where D > 0 and (INT8 == 0 or form(QW, INT8) == 1 or form(GW, INT8) == 1 or form(KW, INT8) == 1 or form(VW, INT8) == 1)
     scratch quantized bytes (M * ceil_div(D, 256) * 292)
     scratch normalized bytes (M * D * 4)
     launch attention_project_normalize:
