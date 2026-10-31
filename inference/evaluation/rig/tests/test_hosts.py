@@ -52,12 +52,12 @@ def test_manifest_excludes_native_submodule_and_build_outputs():
 
 
 def test_login_shell_command_quoting():
-    remote = Remote("h", False, False, "Linux", "aarch64", "python3", "/r", "/m", "/r/agent/x.py",
+    remote = Remote("h", False, False, "Linux", "aarch64", "python3", "/r", "/m", "/r/agent/x.zip",
                     {"T": "/home/u/t"}, ("cpu", "cuda"), True)
-    line = remote.command(["python3", "/r/agent/x.py", "session", "--who", "a b"], login=True)[-1]
+    line = remote.command(["python3", "/r/agent/x.zip", "session", "--who", "a b"], login=True)[-1]
     assert line.startswith('exec "$SHELL" -lc ')
     inner = shlex.split(line)[-1]
-    assert shlex.split(inner) == ["exec", "python3", "/r/agent/x.py", "session", "--who", "a b"]
+    assert shlex.split(inner) == ["exec", "python3", "/r/agent/x.zip", "session", "--who", "a b"]
 
 
 def test_host_env_from_the_hosts_file(tmp_path):

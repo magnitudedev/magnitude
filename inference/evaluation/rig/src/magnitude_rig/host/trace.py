@@ -54,12 +54,12 @@ def timed_read(probe: Optional[Probe], unavailable: Optional[str]):
     started = time.monotonic()
     at = datetime.now(timezone.utc).isoformat()
     if probe is None:
-        reading = Reading({}, {}, {}, None, {"probe": unavailable or "no probe"})
+        reading = Reading({}, {}, {}, {}, None, {"probe": unavailable or "no probe"})
     else:
         try:
             reading = probe.read()
         except Exception as error:
-            reading = Reading({}, {}, {}, None, {"probe": f"{type(error).__name__}: {error}"})
+            reading = Reading({}, {}, {}, {}, None, {"probe": f"{type(error).__name__}: {error}"})
     return reading, at, started, time.monotonic()
 
 

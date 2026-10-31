@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mrig hosts</title>
+<style>
+:root {
+  --bg: #f6f7f9; --card: #ffffff; --line: #e3e6ea; --text: #1c2026; --muted: #6b7380;
+  --track: #eceef1; --accent: #3b6fd8; --ok: #2f9e5b; --warn: #c98a14; --hot: #d0453b;
+  --held: #3b6fd8; --waiting: #8a6fd1;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111317; --card: #1a1d23; --line: #2a2e36; --text: #e6e8eb; --muted: #8b93a1;
+    --track: #262a32; --accent: #6b9bff; --ok: #4cc27d; --warn: #e3a83a; --hot: #f06a5f;
+    --held: #6b9bff; --waiting: #ab93ee;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+header {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px;
+  padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--card);
+  position: sticky; top: 0; z-index: 1;
+}
+header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+header .stat { color: var(--muted); }
+header .stat b { color: var(--text); font-weight: 600; }
+header .updated { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+main { padding: 16px; max-width: 1600px; margin: 0 auto; }
+h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+     margin: 18px 0 8px; font-weight: 600; }
+h2:first-child { margin-top: 0; }
+.grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; min-width: 0; }
+.card.down { opacity: .7; }
+.top { display: flex; align-items: center; gap: 8px; }
+.name { font-weight: 600; font-size: 14px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--muted); }
+.dot.live { background: var(--ok); } .dot.stale { background: var(--warn); } .dot.unreachable { background: var(--hot); }
+.tags { margin-left: auto; display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+.tag { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--track); color: var(--muted); }
+.tag.bad { background: color-mix(in srgb, var(--hot) 18%, transparent); color: var(--hot); }
+.tag.busy { background: color-mix(in srgb, var(--held) 18%, transparent); color: var(--held); }
+.sub { color: var(--muted); margin: 2px 0 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.error { color: var(--hot); font-size: 12px; word-break: break-word; }
+.rows { display: grid; grid-template-columns: 64px 1fr 74px 64px; gap: 5px 8px; align-items: center; }
+.label { color: var(--muted); }
+.bar { height: 8px; background: var(--track); border-radius: 4px; overflow: hidden; }
+.bar > span { display: block; height: 100%; background: var(--accent); border-radius: 4px; transition: width .4s; }
+.value { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+svg.spark { width: 64px; height: 18px; display: block; }
+svg.spark path { fill: none; stroke: var(--accent); stroke-width: 1.4; }
+.temps { display: flex; gap: 14px; margin-top: 10px; flex-wrap: wrap; }
+.temp { display: flex; align-items: baseline; gap: 5px; }
+.temp b { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.temp.warm b { color: var(--warn); } .temp.hot b { color: var(--hot); }
+.queue { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 8px; }
+.queue .empty { color: var(--muted); }
+.entry { display: grid; grid-template-columns: auto 1fr auto; gap: 2px 8px; margin: 6px 0; }
+.state { font-size: 11px; font-weight: 600; text-transform: uppercase; }
+.state.held { color: var(--held); } .state.waiting { color: var(--waiting); }
+.what { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.when { color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; }
+.entry .bar { grid-column: 1 / -1; height: 3px; }
+.entry .bar.over > span { background: var(--hot); }
+.who { grid-column: 1 / -1; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+td.purpose { white-space: normal; min-width: 240px; }
+td.over { color: var(--hot); }
+tr:last-child td { border-bottom: none; }
+.tablewrap { overflow-x: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>mrig hosts</h1>
+  <span class="stat" id="summary"></span>
+  <span class="updated" id="updated">connecting…</span>
+</header>
+<main id="main"></main>
+<script>
+const HISTORY = 60;            // readings kept per series for sparklines
+const series = new Map();      // "alias/series" -> [values]
+let lastAt = new Map();        // alias -> sample.at already recorded
+
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+// Memory in binary units, as it is sold (a 48 GB machine); disk in decimal, as drives are.
+const memory = b => (b / 2 ** 30).toFixed(b >= 100 * 2 ** 30 ? 0 : 1);
+const disk = b => (b / 1e9).toFixed(b >= 100e9 ? 0 : 1);
+function duration(s) {
+  s = Math.max(0, Math.round(s));
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m" + (s % 60 ? String(s % 60).padStart(2, "0") + "s" : "");
+  return Math.floor(s / 3600) + "h" + String(Math.floor(s % 3600 / 60)).padStart(2, "0") + "m";
+}
+
+function record(alias, at, values) {
+  if (lastAt.get(alias) === at) return;
+  lastAt.set(alias, at);
+  for (const [key, value] of Object.entries(values)) {
+    const id = alias + "/" + key;
+    const kept = series.get(id) || [];
+    kept.push(value);
+    if (kept.length > HISTORY) kept.shift();
+    series.set(id, kept);
+  }
+}
+
+function spark(alias, key, max) {
+  const values = series.get(alias + "/" + key) || [];
+  if (values.length < 2) return '<svg class="spark"></svg>';
+  const top = max ?? Math.max(...values.filter(v => v != null), 1);
+  const step = 64 / (HISTORY - 1), offset = 64 - (values.length - 1) * step;
+  let d = "", pen = false;
+  values.forEach((v, i) => {
+    if (v == null) { pen = false; return; }
+    d += (pen ? "L" : "M") + (offset + i * step).toFixed(1) + "," + (17 - 16 * Math.min(v / top, 1)).toFixed(1);
+    pen = true;
+  });
+  return `<svg class="spark" viewBox="0 0 64 18" preserveAspectRatio="none"><path d="${d}"/></svg>`;
+}
+
+function row(alias, label, key, fraction, text, max) {
+  const pct = fraction == null ? 0 : Math.max(0, Math.min(1, fraction)) * 100;
+  return `<span class="label">${esc(label)}</span><div class="bar"><span style="width:${pct}%"></span></div>` +
+         `<span class="value">${text}</span>${spark(alias, key, max)}`;
+}
+
+function temp(label, value) {
+  if (value == null) return "";
+  const cls = value >= 90 ? "hot" : value >= 75 ? "warm" : "";
+  return `<span class="temp ${cls}"><span class="label">${label}</span><b>${value.toFixed(0)}°</b></span>`;
+}
+
+function describe(facts) {
+  if (!facts) return "";
+  const gpus = (facts.gpus || []).map(g => g.name + (g.cores ? ` (${g.cores} cores)` : ""));
+  const parts = [facts.chip, ...new Set(gpus)];
+  if (facts.memory_bytes) parts.push(memory(facts.memory_bytes) + " GB");
+  return parts.filter(Boolean).join(" · ");
+}
+
+function entries(sample) {
+  const list = sample.status.entries;
+  const at = Date.parse(sample.at) / 1000;
+  const lock = sample.status.device_lock_held_elsewhere;
+  let html = "";
+  if (lock) html += `<div class="entry"><span class="state held">held</span><span class="what">device lock outside mrig</span>` +
+                    `<span class="when"></span><span class="who">${esc(lock.who || "unknown holder")}${lock.run ? " · run " + esc(lock.run) : ""}</span></div>`;
+  for (const e of list) {
+    const elapsed = at - e.started, over = e.remaining <= 0;
+    const fraction = e.estimate > 0 ? Math.min(1, elapsed / e.estimate) : 1;
+    html += `<div class="entry" title="${esc(e.purpose)}">` +
+      `<span class="state ${esc(e.state)}">${esc(e.state)}</span>` +
+      `<span class="what"><b>${esc(e.kind)}</b> ${esc(e.purpose)}</span>` +
+      `<span class="when">${over ? "over by " + duration(elapsed - e.estimate) : duration(e.remaining) + " left"}</span>` +
+      `<div class="bar${over ? " over" : ""}"><span style="width:${fraction * 100}%"></span></div>` +
+      `<span class="who">${esc(e.run)} · ${esc(e.who)}</span></div>`;
+  }
+  if (!html) html = '<div class="empty">idle: nothing held or waiting</div>';
+  const wait = sample.status.waits.device;
+  const head = wait > 0 ? `<div class="label">device free in ~${duration(wait)} by the holders' estimates</div>` : "";
+  return `<div class="queue">${head}${html}</div>`;
+}
+
+function card(host, now) {
+  const sample = host.sample;
+  const stale = host.state === "live" && now - host.received > 3 * host.interval + 5;
+  const state = stale ? "stale" : host.state;
+  const tags = [];
+  if (host.backends) tags.push(...host.backends.filter(b => b !== "cpu").map(b => `<span class="tag">${esc(b)}</span>`));
+  if (host.ready === false) tags.push('<span class="tag bad">not set up</span>');
+  if (sample) {
+    const held = sample.status.entries.filter(e => e.state === "held").length;
+    const waiting = sample.status.entries.length - held;
+    if (held) tags.push(`<span class="tag busy">${held} held</span>`);
+    if (waiting) tags.push(`<span class="tag busy">${waiting} waiting</span>`);
+  }
+  let body = "";
+  if (host.error && state !== "live") body += `<div class="error">${esc(host.error)}</div>`;
+  if (sample) {
+    const r = sample.reading, a = host.alias, rows = [];
+    const util = r.utilization_pct;
+    const gpus = Object.keys(util).filter(k => k.startsWith("gpu")).sort();
+    const values = {cpu: util.cpu};
+    if (util.cpu != null) rows.push(row(a, "CPU", "cpu", util.cpu / 100, util.cpu.toFixed(0) + "%", 100));
+    for (const g of gpus) {
+      values[g] = util[g];
+      rows.push(row(a, gpus.length > 1 ? g.toUpperCase() : "GPU", g, util[g] / 100, util[g].toFixed(0) + "%", 100));
+    }
+    for (const [key, m] of Object.entries(r.memory_bytes).sort()) {
+      values["mem:" + key] = m.used / m.total * 100;
+      const label = key === "system" ? "Memory" : gpus.length > 1 ? "VRAM " + key.slice(3) : "VRAM";
+      rows.push(row(a, label, "mem:" + key, m.used / m.total,
+                    `${memory(m.used)}/${memory(m.total)} GB`, 100));
+    }
+    record(a, sample.at, values);
+    const pressure = r.thermal_pressure && r.thermal_pressure !== "nominal"
+      ? `<span class="temp hot"><span class="label">pressure</span><b>${esc(r.thermal_pressure)}</b></span>` : "";
+    body += `<div class="rows">${rows.join("")}</div>` +
+      `<div class="temps">${temp("CPU max", sample.groups_c.cpu_max)}${temp("GPU max", sample.groups_c.gpu_max)}` +
+      `${pressure}<span class="temp"><span class="label">disk free</span><b>${disk(sample.status.free_bytes)}</b> GB</span></div>` +
+      entries(sample);
+  } else if (state === "connecting") {
+    body += '<div class="label">connecting…</div>';
+  }
+  return `<div class="card ${state === "live" ? "" : "down"}"><div class="top"><span class="dot ${state}"></span>` +
+    `<span class="name">${esc(host.alias)}</span><div class="tags">${tags.join("")}</div></div>` +
+    `<div class="sub" title="${esc(describe(host.facts))}">${esc(describe(host.facts)) || "&nbsp;"}</div>${body}</div>`;
+}
+
+// Every run any reachable host reports, whichever machine launched it: a run registers on its
+// host (one entry per hold it takes or waits for) from the moment it queues there.
+function runs(hosts) {
+  const found = new Map();
+  for (const host of hosts) {
+    if (host.state !== "live") continue;
+    const at = Date.parse(host.sample.at) / 1000;
+    for (const e of host.sample.status.entries) {
+      const id = host.alias + "/" + e.run;
+      const run = found.get(id) || {host: host.alias, at, held: [], waiting: [], ...e};
+      (e.state === "held" ? run.held : run.waiting).push(e.kind.split(":")[0]);
+      found.set(id, run);
+    }
+  }
+  if (!found.size) return "";
+  const rows = [...found.values()].sort((a, b) => a.started - b.started).map(r => {
+    const elapsed = r.at - r.started, over = elapsed > r.estimate;
+    return `<tr><td>${esc(r.run)}</td><td>${esc(r.host)}</td><td>${esc(r.held.join(", ")) || "–"}</td>` +
+      `<td>${esc(r.waiting.join(", ")) || "–"}</td>` +
+      `<td class="${over ? "over" : ""}">${duration(elapsed)} of ${duration(r.estimate)}</td>` +
+      `<td>${esc(r.who)}</td><td class="purpose">${esc(r.purpose)}</td></tr>`;
+  }).join("");
+  return `<h2>Runs on all hosts</h2><div class="tablewrap"><table><thead><tr><th>Run</th><th>Host</th>` +
+    `<th>Holding</th><th>Waiting for</th><th>Time</th><th>Started by</th><th>Purpose</th></tr></thead>` +
+    `<tbody>${rows}</tbody></table></div>`;
+}
+
+function render(snapshot) {
+  const byAlias = new Map(snapshot.hosts.map(h => [h.alias, h]));
+  const placed = new Set(), groups = [];
+  for (const [pool, members] of Object.entries(snapshot.pools)) {
+    const hosts = members.map(m => byAlias.get(m)).filter(Boolean);
+    hosts.forEach(h => placed.add(h.alias));
+    if (hosts.length) groups.push([pool, hosts]);
+  }
+  const rest = snapshot.hosts.filter(h => !placed.has(h.alias));
+  if (rest.length) groups.push([groups.length ? "other hosts" : "hosts", rest]);
+  document.getElementById("main").innerHTML =
+    groups.map(([name, hosts]) => `<h2>${esc(name)}</h2><div class="grid">${hosts.map(h => card(h, snapshot.now)).join("")}</div>`).join("") +
+    runs(snapshot.hosts);
+  const live = snapshot.hosts.filter(h => h.state === "live");
+  const running = new Set(live.flatMap(h => h.sample.status.entries.map(e => h.alias + "/" + e.run))).size;
+  document.getElementById("summary").innerHTML =
+    `<b>${live.length}</b>/${snapshot.hosts.length} hosts live · <b>${running}</b> runs`;
+  document.getElementById("updated").textContent = "updated " + new Date(snapshot.now * 1000).toLocaleTimeString();
+}
+
+async function poll() {
+  try {
+    const response = await fetch("/api/snapshot", {cache: "no-store"});
+    render(await response.json());
+  } catch (error) {
+    document.getElementById("updated").textContent = "dashboard server unreachable";
+  }
+  setTimeout(poll, 2000);
+}
+poll();
+</script>
+</body>
+</html>

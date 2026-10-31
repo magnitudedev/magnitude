@@ -19,7 +19,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import ab, engine, selectors, sources, state
+from . import ab, dashboard, engine, selectors, sources, state
 from .connection import HostUnavailable, connect, host_status, read, setup
 from .hosts import Hosts
 from .instruments import KINDS, REGISTRY, Instrument
@@ -35,6 +35,7 @@ def _epilog() -> str:
                 "(mrig ab INSTRUMENT --base A --candidate B ...)")
     tools = [
         "  inspect    Who holds and waits on each host; or run a read-only command on one (no hold)",
+        "  dashboard  A live local web page of every host: holds, queue, utilization, memory, thermals",
         "  runs       This machine's runs in flight: phase, host, time against estimate",
         "  logs RUN   Where a run's logs are, and the end of its current phase's",
         "  wait RUN   Follow a run past its estimate, with a new --estimate and its --justification",
@@ -209,6 +210,7 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--host")
     command.add_argument("command", nargs=argparse.REMAINDER)
     command.set_defaults(handler=_inspect)
+    dashboard.configure(commands.add_parser("dashboard", help="live web page of hosts and their queues"))
     commands.add_parser("runs", help="this machine's runs in flight").set_defaults(handler=_runs)
     command = commands.add_parser("logs", help="a run's logs")
     command.add_argument("run")

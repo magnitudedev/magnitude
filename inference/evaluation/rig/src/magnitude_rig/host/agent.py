@@ -1,7 +1,8 @@
 """The rig's host agent: one session per run, taking and releasing typed holds on the host.
 
-Copied verbatim to `<root>/agent/<sha256 prefix>.py` and run with the host's system Python,
-so it is a single standard-library file (Python 3.9+) importing nothing from this package.
+Deployed with the rest of the host package (`connection.connect`) and run with the host's
+system Python, so it is a single standard-library file (Python 3.9+) importing nothing from
+this package: it also runs alone.
 
     agent.py session --root R --who W --run ID --purpose P --estimate S [--heartbeat-timeout S]
     agent.py status  --root R [--checkout KEY]
@@ -536,9 +537,14 @@ def session(arguments) -> int:
 
 
 def status(arguments) -> int:
+    print(json.dumps(report(arguments.root, arguments.checkout)))
+    return 0
+
+
+def report(root: str, checkout: "str | None") -> dict:
     """The host's live entries, the queue a new device or timed request would wait behind (by
     the entries' own estimates), and whether a checkout is present on the host."""
-    rig = Rig(arguments.root)
+    rig = Rig(root)
     entries = rig.guarded(rig.live)
     now = time.time()
     waits = {}
@@ -547,29 +553,28 @@ def status(arguments) -> int:
             remaining(e, now) for e in entries if e.get("protocol") != PROTOCOL or conflicts(e["kind"], kind)
         )
     legacy = None
-    device = FileLock(os.path.join(arguments.root, "lock"))
+    device = FileLock(os.path.join(root, "lock"))
     if not any(e["kind"] in DEVICE_KINDS and e["state"] == "held" for e in entries):
         if not device.try_acquire():
             try:
-                with open(os.path.join(arguments.root, "holder.json")) as stream:
+                with open(os.path.join(root, "holder.json")) as stream:
                     legacy = json.load(stream)
             except (OSError, ValueError):
                 legacy = {}
     device.close()
-    report = {
+    found = {
         "entries": [dict(_public(e), remaining=remaining(e, now)) for e in entries],
         "waits": waits,
         "device_lock_held_elsewhere": legacy,
-        "free_bytes": shutil.disk_usage(arguments.root).free,
+        "free_bytes": shutil.disk_usage(root).free,
     }
-    if arguments.checkout:
-        directory = rig.checkout(arguments.checkout)
-        report["checkout"] = {
+    if checkout:
+        directory = rig.checkout(checkout)
+        found["checkout"] = {
             "present": os.path.isdir(os.path.join(directory, "target")),
             "size": _size(directory),
         }
-    print(json.dumps(report))
-    return 0
+    return found
 
 
 def prune(arguments) -> int:

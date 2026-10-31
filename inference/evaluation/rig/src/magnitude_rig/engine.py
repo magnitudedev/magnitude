@@ -48,7 +48,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from . import state, sync
-from .connection import AgentSession, HostUnavailable, Remote, _ssh, connect, host_status
+from .connection import AGENT, AgentSession, HostUnavailable, Remote, _ssh, connect, host_status
 from .host.gate import GateSettings
 from .hosts import Hosts
 from .sources import Source
@@ -477,7 +477,7 @@ def _prepare(run: Run, side: Side) -> None:
     sync.push(remote, list(side.source.paths), side.source.directory, f"{checkout}/src")
     run.step(
         side,
-        [remote.python, remote.agent, "prune", "--dir", f"{checkout}/src"],
+        remote.host(AGENT, "prune", "--dir", f"{checkout}/src"),
         {},
         input="\n".join(side.source.paths) + "\n",
     )

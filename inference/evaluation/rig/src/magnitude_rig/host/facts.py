@@ -6,7 +6,6 @@ the executing machine; the ssh alias, when there is one, is recorded beside it.
 
 from __future__ import annotations
 
-import ctypes as c
 import os
 import platform
 import re
@@ -16,7 +15,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, TypeVar
 
-from .probes import number
+from .probes import number, windows_memory_status
 
 T = TypeVar("T")
 
@@ -94,25 +93,8 @@ def _linux_memory() -> int:
     raise OSError("/proc/meminfo has no MemTotal")
 
 
-class _MemoryStatus(c.Structure):
-    _fields_ = [
-        ("length", c.c_uint32),
-        ("load", c.c_uint32),
-        ("total_physical", c.c_uint64),
-        ("available_physical", c.c_uint64),
-        ("total_page_file", c.c_uint64),
-        ("available_page_file", c.c_uint64),
-        ("total_virtual", c.c_uint64),
-        ("available_virtual", c.c_uint64),
-        ("available_extended_virtual", c.c_uint64),
-    ]
-
-
 def _windows_memory() -> int:
-    status = _MemoryStatus(length=c.sizeof(_MemoryStatus))
-    if not c.windll.kernel32.GlobalMemoryStatusEx(c.byref(status)):
-        raise OSError("GlobalMemoryStatusEx failed")
-    return status.total_physical
+    return windows_memory_status().total_physical
 
 
 def _mac_gpus() -> List[Gpu]:

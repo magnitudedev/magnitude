@@ -1,18 +1,40 @@
-"""Connecting to a host: OS probe, agent deployment, and the agent session holding a run's holds."""
+"""Connecting to a host: OS probe, host package deployment, and the agent session holding a
+run's holds."""
 
 import base64
+import io
 import json
 import queue
 import shlex
 import subprocess
 import threading
+import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from .hosts import HostConfig
 
-AGENT_SOURCE = (Path(__file__).parent / "host" / "agent.py").read_bytes()
+
+
+def _host_package() -> bytes:
+    """The host package (`magnitude_rig.host`, the agent among it) as a zip any Python 3.9+
+    runs as `python ZIP MODULE ARGS...`. Its bytes depend only on the sources, so their hash
+    names it on the host."""
+    package = Path(__file__).parent
+    files = {"__main__.py": b"import runpy, sys\n"
+             b"runpy.run_module(sys.argv.pop(1), run_name='__main__', alter_sys=True)\n"}
+    for path in (package / "__init__.py", *sorted((package / "host").glob("*.py"))):
+        files[path.relative_to(package.parent).as_posix()] = path.read_bytes()
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as stream:
+        for name, data in files.items():
+            stream.writestr(zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0)), data, zipfile.ZIP_DEFLATED)
+    return archive.getvalue()
+
+
+HOST_PACKAGE = _host_package()
+AGENT = "magnitude_rig.host.agent"
 HEARTBEAT_SECONDS = 10.0
 # An unreachable host must not hold up placement among the reachable ones: a reachable host
 # connects in well under a second, so a few seconds bounds the cost of one that does not.
@@ -24,17 +46,17 @@ root = os.path.abspath(os.path.expanduser(sys.argv[1]))
 models = os.path.abspath(os.path.expanduser(sys.argv[2]))
 env = {{name: os.path.expanduser(value) for name, value in json.loads(sys.argv[3]).items()}}
 source = base64.b64decode({source!r})
-agent = os.path.join(root, "agent", hashlib.sha256(source).hexdigest()[:16] + ".py")
-for directory in (os.path.dirname(agent), os.path.join(root, "src"), models):  # src: steps' cwd
+package = os.path.join(root, "agent", hashlib.sha256(source).hexdigest()[:16] + ".zip")
+for directory in (os.path.dirname(package), os.path.join(root, "src"), models):  # src: steps' cwd
     try:
         os.makedirs(directory, exist_ok=True)
     except PermissionError:
         sys.exit("cannot create %s; run `mrig setup <host>` once" % directory)
-if not os.path.exists(agent):
-    temporary = "%s.%d.tmp" % (agent, os.getpid())
+if not os.path.exists(package):
+    temporary = "%s.%d.tmp" % (package, os.getpid())
     with open(temporary, "wb") as stream:
         stream.write(source)
-    os.replace(temporary, agent)
+    os.replace(temporary, package)
 import glob, platform, shutil
 backends = ["cpu"]
 if platform.system() == "Darwin" and platform.machine() == "arm64":
@@ -46,7 +68,7 @@ icds += glob.glob("/usr/share/vulkan/icd.d/*.json") + glob.glob("/etc/vulkan/icd
 if any(os.path.exists(p) for p in icds):
     backends.append("vulkan")
 ready = os.path.exists(os.path.join(root, "rig", "ready.json"))
-print(json.dumps({{"root": root, "models": models, "agent": agent, "env": env,
+print(json.dumps({{"root": root, "models": models, "package": package, "env": env,
                   "backends": backends, "ready": ready}}))
 """
 
@@ -86,7 +108,7 @@ class Remote:
     python: str
     root: str
     models: str
-    agent: str
+    package: str  # the deployed host package (`host`)
     env: dict[str, str]  # the host's own step environment, `~` expanded on the host
     backends: tuple[str, ...]  # what the host can run, probed on connect
     ready: bool  # `mrig setup` verified the host
@@ -101,6 +123,10 @@ class Remote:
         if login:
             line = f'exec "$SHELL" -lc {shlex.quote("exec " + line)}'
         return shell(self.alias, self.local, line)
+
+    def host(self, module: str, *arguments: str) -> list[str]:
+        """The argv running a module of the deployed host package, e.g. `magnitude_rig.host.agent`."""
+        return [self.python, self.package, module, *arguments]
 
     def place(self, path: str) -> str:
         """`path` on the host as rsync names it."""
@@ -142,14 +168,14 @@ def _ssh(host, line: str, *, stdin: bytes | None = None, timeout: float = 60) ->
 
 
 def connect(config: HostConfig) -> Remote:
-    """Probe the host's OS (`uname`; failure means Windows) and deploy the agent."""
+    """Probe the host's OS (`uname`; failure means Windows) and deploy the host package."""
     probe = _attempt(config, "uname -sm", None, 30)
     if probe.returncode == 0:
         system, machine = probe.stdout.decode().split()
         windows, python = False, "python3"
     else:
         system, machine, windows, python = "Windows", "unknown", True, "python"
-    bootstrap = _BOOTSTRAP.format(source=base64.b64encode(AGENT_SOURCE).decode())
+    bootstrap = _BOOTSTRAP.format(source=base64.b64encode(HOST_PACKAGE).decode())
     argv = [python, "-", config.root, config.models, json.dumps(dict(config.env))]
     line = windows_command(argv) if windows else shlex.join(argv)
     probed = json.loads(_ssh(config, line, stdin=bootstrap.encode()).strip().splitlines()[-1])
@@ -193,7 +219,7 @@ def setup(config: HostConfig) -> str:
 def host_status(remote: Remote, checkout: str | None = None) -> dict:
     """The host agent's `status`: live holds and requests, queue estimates, free disk, and
     whether `checkout` is present."""
-    argv = [remote.python, remote.agent, "status", "--root", remote.root]
+    argv = remote.host(AGENT, "status", "--root", remote.root)
     if checkout:
         argv += ["--checkout", checkout]
     return json.loads(_ssh(remote, remote.command(argv)[-1]).strip().splitlines()[-1])
@@ -204,10 +230,10 @@ class AgentSession:
 
     def __init__(self, remote: Remote, *, who: str, run: str, purpose: str, estimate: float):
         self.remote = remote
-        argv = [
-            remote.python, remote.agent, "session", "--root", remote.root, "--who", who,
+        argv = remote.host(
+            AGENT, "session", "--root", remote.root, "--who", who,
             "--run", run, "--purpose", purpose, "--estimate", str(estimate),
-        ]
+        )
         self._process = subprocess.Popen(
             remote.command(argv, login=True),
             stdin=subprocess.PIPE,

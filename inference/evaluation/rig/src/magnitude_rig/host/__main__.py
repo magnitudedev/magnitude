@@ -2,6 +2,7 @@
 
     python3 -m magnitude_rig.host facts [--alias A]
     python3 -m magnitude_rig.host probe
+    python3 -m magnitude_rig.host watch --root ROOT [--alias A] [--interval S]
     python3 -m magnitude_rig.host gate --log PATH [settings]
     python3 -m magnitude_rig.host record --run-dir DIR [--alias A] -- ARGV...
     python3 -m magnitude_rig.host compiler --root ROOT
@@ -11,6 +12,9 @@
 
 `record` writes `host.json`, records `thermal.jsonl` around the job, and completes the
 job's `result.json` (when it wrote one) with the host facts and the thermal trace path.
+`watch` streams JSON Lines until stdin closes: the host facts once (`{"facts": ...}`), then
+every interval the agent's status of the rig at ROOT with a probe reading and its group
+aggregates (`{"at", "status", "reading", "groups_c"}`).
 `compiler` installs the recording rustc wrapper and prints its path; `provenance` writes the
 build provenance of the cargo-built executables the job's texts name and exits 1 unless
 each is verified (see `provenance.py`).
@@ -24,11 +28,12 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import asdict, fields
 from pathlib import Path
 
-from . import facts, gate, provenance, trace
+from . import agent, facts, gate, provenance, trace
 from .probes import open_probe
 
 GATE_TIMEOUT_EXIT = 3
@@ -115,6 +120,31 @@ def _probe(arguments) -> int:
     return 0
 
 
+def _watch(arguments) -> int:
+    closed = threading.Event()
+    threading.Thread(target=lambda: (sys.stdin.read(), closed.set()), daemon=True).start()
+    print(json.dumps({"facts": facts.capture(arguments.alias).to_json()}), flush=True)
+    probe, unavailable = None, None
+    try:
+        probe = open_probe()
+    except Exception as error:
+        unavailable = f"{type(error).__name__}: {error}"
+    try:
+        while not closed.wait(arguments.interval):
+            reading, at, _, _ = trace.timed_read(probe, unavailable)
+            sample = {
+                "at": at,
+                "status": agent.report(arguments.root, None),
+                "reading": reading.to_json(),
+                "groups_c": trace.group_aggregates(reading),
+            }
+            print(json.dumps(sample), flush=True)
+    finally:
+        if probe is not None:
+            probe.close()
+    return 0
+
+
 def _gate(arguments) -> int:
     settings = gate.GateSettings(
         **{f.name: getattr(arguments, f.name) for f in fields(gate.GateSettings)}
@@ -176,6 +206,11 @@ def main(argv=None) -> int:
     command.add_argument("--alias")
     command.set_defaults(handler=_facts)
     commands.add_parser("probe").set_defaults(handler=_probe)
+    command = commands.add_parser("watch")
+    command.add_argument("--root", required=True)
+    command.add_argument("--alias")
+    command.add_argument("--interval", type=float, default=2.0)
+    command.set_defaults(handler=_watch)
     command = commands.add_parser("gate")
     command.add_argument("--log", required=True)
     for field in fields(gate.GateSettings):

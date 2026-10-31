@@ -1,10 +1,15 @@
 """Per-OS thermal and load probes: one reading per call, failures kept as explicit errors.
 
-- macOS: AppleSMC temperatures, thermal pressure level, CPU ticks, IOAccelerator utilization.
-- Linux: /sys/class/thermal zones, hwmon temperatures, nvidia-smi, /proc/stat.
-- Windows: nvidia-smi and system CPU times; other temperatures are reported unsupported.
+- macOS: AppleSMC temperatures, thermal pressure level, CPU ticks, IOAccelerator utilization,
+  VM statistics.
+- Linux: /sys/class/thermal zones, hwmon temperatures, nvidia-smi, /proc/stat, /proc/meminfo.
+- Windows: nvidia-smi, system CPU times and memory status; other temperatures are reported
+  unsupported.
 
 Utilization is measured since the previous reading (the first since the probe opened).
+Memory is used and total bytes: `system` (what processes hold: total less what is available
+without swapping on Linux and Windows, Activity Monitor's "Memory Used" on macOS) and each
+NVIDIA GPU's own memory (`gpuN`).
 Sensor groups describe CPU/GPU associations, not documented core identities.
 """
 
@@ -26,6 +31,7 @@ class Reading:
     sensors_c: Dict[str, float]
     sensor_groups: Dict[str, str]
     utilization_pct: Dict[str, float]
+    memory_bytes: Dict[str, Dict[str, int]]  # {"used": N, "total": N} per memory
     thermal_pressure: Optional[str]
     errors: Dict[str, str] = field(default_factory=dict)
 
@@ -40,6 +46,7 @@ class Reading:
             "sensors_c": self.sensors_c,
             "sensor_groups": self.sensor_groups,
             "utilization_pct": self.utilization_pct,
+            "memory_bytes": self.memory_bytes,
             "thermal_pressure": self.thermal_pressure,
             "errors": self.errors,
         }
@@ -58,13 +65,14 @@ def _failure(error: BaseException) -> str:
     return f"{type(error).__name__}: {error}"
 
 
-def nvidia_smi() -> Optional[List[Tuple[str, Optional[float], Optional[float]]]]:
-    """(index, temperature, utilization) per GPU, or None when nvidia-smi is not installed."""
+def nvidia_smi() -> Optional[List[Tuple[str, ...]]]:
+    """(index, temperature, utilization, memory used MiB, memory total MiB) per GPU, each value
+    None when not reported, or None when nvidia-smi is not installed."""
     try:
         result = subprocess.run(
             [
                 "nvidia-smi",
-                "--query-gpu=index,temperature.gpu,utilization.gpu",
+                "--query-gpu=index,temperature.gpu,utilization.gpu,memory.used,memory.total",
                 "--format=csv,noheader,nounits",
             ],
             capture_output=True,
@@ -77,8 +85,8 @@ def nvidia_smi() -> Optional[List[Tuple[str, Optional[float], Optional[float]]]]
         raise OSError(f"nvidia-smi exited {result.returncode}: {result.stderr.strip()}")
     rows = []
     for line in result.stdout.strip().splitlines():
-        index, temperature, utilization = (part.strip() for part in line.split(","))
-        rows.append((index, number(temperature), number(utilization)))
+        index, *values = (part.strip() for part in line.split(","))
+        rows.append((index, *(number(value) for value in values)))
     return rows
 
 
@@ -90,13 +98,17 @@ def number(text: str) -> Optional[float]:
         return None
 
 
-def _add_nvidia(sensors, groups, utilization, errors) -> None:
+def _memory(used: float, total: float) -> Dict[str, int]:
+    return {"used": int(used), "total": int(total)}
+
+
+def _add_nvidia(sensors, groups, utilization, memory, errors) -> None:
     try:
         rows = nvidia_smi()
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         errors["nvidia-smi"] = _failure(error)
         return
-    for index, temperature, busy in rows or ():
+    for index, temperature, busy, used, total in rows or ():
         key = f"nvidia:{index}"
         if temperature is None:
             errors[key] = "temperature not reported"
@@ -106,6 +118,10 @@ def _add_nvidia(sensors, groups, utilization, errors) -> None:
             errors[f"utilization:gpu{index}"] = "utilization not reported"
         else:
             utilization[f"gpu{index}"] = busy
+        if used is None or total is None:
+            errors[f"memory:gpu{index}"] = "memory not reported"
+        else:
+            memory[f"gpu{index}"] = _memory(used * 2**20, total * 2**20)
 
 
 class _Ticks:
@@ -124,8 +140,25 @@ class _Ticks:
         return 100.0 * (busy - previous_busy) / (total - previous_total)
 
 
+class _VmStatistics64(c.Structure):
+    """`struct vm_statistics64` (mach/vm_statistics.h)."""
+
+    _fields_ = [
+        *((name, c.c_uint32) for name in ("free", "active", "inactive", "wire")),
+        *((name, c.c_uint64) for name in (
+            "zero_fill", "reactivations", "pageins", "pageouts", "faults", "cow_faults",
+            "lookups", "hits", "purges",
+        )),
+        ("purgeable", c.c_uint32),
+        ("speculative", c.c_uint32),
+        *((name, c.c_uint64) for name in ("decompressions", "compressions", "swapins", "swapouts")),
+        *((name, c.c_uint32) for name in ("compressor", "throttled", "external", "internal")),
+        ("uncompressed_in_compressor", c.c_uint64),
+    ]
+
+
 class MacProbe:
-    source = "macOS: AppleSMC, thermal pressure, host CPU ticks, IOAccelerator"
+    source = "macOS: AppleSMC, thermal pressure, host CPU ticks, IOAccelerator, VM statistics"
     grouping = "SMC prefixes: CPU-associated Tp/Te/Ts; GPU-associated Tg"
     _PRESSURE = {0: "nominal", 1: "moderate", 2: "heavy", 3: "trapping", 4: "sleeping"}
 
@@ -139,6 +172,17 @@ class MacProbe:
             c.c_uint32, c.c_int, c.POINTER(c.c_uint32 * 4), c.POINTER(c.c_uint32)
         ]
         self._host = self._system.mach_host_self()
+        self._system.host_statistics64.argtypes = [
+            c.c_uint32, c.c_int, c.POINTER(_VmStatistics64), c.POINTER(c.c_uint32)
+        ]
+        page, total = c.c_size_t(), c.c_uint64()
+        code = self._system.host_page_size(self._host, c.byref(page))
+        if code:
+            raise OSError(f"host_page_size failed: {code}")
+        size = c.c_size_t(c.sizeof(total))
+        if self._system.sysctlbyname(b"hw.memsize", c.byref(total), c.byref(size), None, 0):
+            raise OSError("sysctlbyname(hw.memsize) failed")
+        self._page, self._total = page.value, total.value
         self._pressure_token = c.c_int()
         code = self._system.notify_register_check(
             b"com.apple.system.thermalpressurelevel", c.byref(self._pressure_token)
@@ -161,8 +205,19 @@ class MacProbe:
         user, system, idle, nice = ticks
         return user + system + nice, user + system + idle + nice
 
+    def _system_memory(self) -> Dict[str, int]:
+        """Activity Monitor's "Memory Used": app memory (internal less purgeable), wired and
+        compressed pages."""
+        stats = _VmStatistics64()
+        count = c.c_uint32(c.sizeof(stats) // 4)  # HOST_VM_INFO64_COUNT
+        code = self._system.host_statistics64(self._host, 4, c.byref(stats), c.byref(count))
+        if code:
+            raise OSError(f"host_statistics64(HOST_VM_INFO64) failed: {code}")
+        pages = stats.internal - stats.purgeable + stats.wire + stats.compressor
+        return _memory(pages * self._page, self._total)
+
     def read(self) -> Reading:
-        sensors, groups, utilization, errors = {}, {}, {}, {}
+        sensors, groups, utilization, memory, errors = {}, {}, {}, {}, {}
         if self._smc is None:
             errors["smc"] = self._smc_error
         else:
@@ -185,7 +240,11 @@ class MacProbe:
             utilization.update(self._gpu_utilization())
         except (OSError, ValueError, subprocess.TimeoutExpired) as error:
             errors["utilization:gpu"] = _failure(error)
-        return Reading(sensors, groups, utilization, pressure, errors)
+        try:
+            memory["system"] = self._system_memory()
+        except OSError as error:
+            errors["memory:system"] = _failure(error)
+        return Reading(sensors, groups, utilization, memory, pressure, errors)
 
     @staticmethod
     def _gpu_utilization() -> Dict[str, float]:
@@ -229,24 +288,35 @@ def _proc_stat_ticks() -> Tuple[int, int]:
     return sum(values) - idle, sum(values)
 
 
+def _proc_meminfo(path: Path) -> Dict[str, int]:
+    """Total less MemAvailable, the kernel's estimate of what is available without swapping."""
+    kibibytes = {}
+    for line in path.read_text().splitlines():
+        name, value = line.split(":", 1)
+        kibibytes[name] = int(value.split()[0])
+    total = kibibytes["MemTotal"]
+    return _memory((total - kibibytes["MemAvailable"]) * 1024, total * 1024)
+
+
 def _millidegrees(path: Path) -> float:
     return int(path.read_text().strip()) / 1000.0
 
 
 class LinuxProbe:
-    source = "Linux: /sys/class/thermal, hwmon, nvidia-smi, /proc/stat"
+    source = "Linux: /sys/class/thermal, hwmon, nvidia-smi, /proc/stat, /proc/meminfo"
     grouping = (
         "Names containing cpu/coretemp/k10temp/zenpower/x86_pkg/soc/package are CPU; "
         "gpu/amdgpu/nouveau/radeon and nvidia-smi are GPU; everything else is other. "
         "hwmon chips duplicating a thermal zone type are skipped."
     )
 
-    def __init__(self, sysfs: Path = Path("/sys/class")):
+    def __init__(self, sysfs: Path = Path("/sys/class"), meminfo: Path = Path("/proc/meminfo")):
         self._sysfs = sysfs
+        self._meminfo = meminfo
         self._cpu = _Ticks(_proc_stat_ticks)
 
     def read(self) -> Reading:
-        sensors, groups, utilization, errors = {}, {}, {}, {}
+        sensors, groups, utilization, memory, errors = {}, {}, {}, {}, {}
         zone_types = set()
         for zone in sorted((self._sysfs / "thermal").glob("thermal_zone*")):
             try:
@@ -274,12 +344,16 @@ class LinuxProbe:
                     groups[key] = linux_group(f"{name} {label}")
                 except (OSError, ValueError) as error:
                     errors[f"hwmon:{chip.name}:{channel}"] = _failure(error)
-        _add_nvidia(sensors, groups, utilization, errors)
+        _add_nvidia(sensors, groups, utilization, memory, errors)
         try:
             utilization["cpu"] = self._cpu.percent()
         except (OSError, ValueError) as error:
             errors["utilization:cpu"] = _failure(error)
-        return Reading(sensors, groups, utilization, None, errors)
+        try:
+            memory["system"] = _proc_meminfo(self._meminfo)
+        except (OSError, ValueError, KeyError) as error:
+            errors["memory:system"] = _failure(error)
+        return Reading(sensors, groups, utilization, memory, None, errors)
 
     def close(self) -> None:
         pass
@@ -293,6 +367,29 @@ class _FileTime(c.Structure):
         return (self.high << 32) | self.low
 
 
+class MemoryStatus(c.Structure):
+    """`MEMORYSTATUSEX`, filled by `GlobalMemoryStatusEx`."""
+
+    _fields_ = [
+        ("length", c.c_uint32),
+        ("load", c.c_uint32),
+        ("total_physical", c.c_uint64),
+        ("available_physical", c.c_uint64),
+        ("total_page_file", c.c_uint64),
+        ("available_page_file", c.c_uint64),
+        ("total_virtual", c.c_uint64),
+        ("available_virtual", c.c_uint64),
+        ("available_extended_virtual", c.c_uint64),
+    ]
+
+
+def windows_memory_status() -> MemoryStatus:
+    status = MemoryStatus(length=c.sizeof(MemoryStatus))
+    if not c.windll.kernel32.GlobalMemoryStatusEx(c.byref(status)):
+        raise OSError("GlobalMemoryStatusEx failed")
+    return status
+
+
 def _windows_ticks() -> Tuple[int, int]:
     idle, kernel, user = _FileTime(), _FileTime(), _FileTime()
     if not c.windll.kernel32.GetSystemTimes(c.byref(idle), c.byref(kernel), c.byref(user)):
@@ -302,21 +399,28 @@ def _windows_ticks() -> Tuple[int, int]:
 
 
 class WindowsProbe:
-    source = "Windows: nvidia-smi, GetSystemTimes"
+    source = "Windows: nvidia-smi, GetSystemTimes, GlobalMemoryStatusEx"
     grouping = "nvidia-smi GPUs are GPU; other temperatures are unsupported on Windows"
 
     def __init__(self):
         self._cpu = _Ticks(_windows_ticks)
 
     def read(self) -> Reading:
-        sensors, groups, utilization = {}, {}, {}
+        sensors, groups, utilization, memory = {}, {}, {}, {}
         errors = {"temperature:cpu": "CPU temperatures are unsupported on Windows"}
-        _add_nvidia(sensors, groups, utilization, errors)
+        _add_nvidia(sensors, groups, utilization, memory, errors)
         try:
             utilization["cpu"] = self._cpu.percent()
         except OSError as error:
             errors["utilization:cpu"] = _failure(error)
-        return Reading(sensors, groups, utilization, None, errors)
+        try:
+            status = windows_memory_status()
+            memory["system"] = _memory(
+                status.total_physical - status.available_physical, status.total_physical
+            )
+        except OSError as error:
+            errors["memory:system"] = _failure(error)
+        return Reading(sensors, groups, utilization, memory, None, errors)
 
     def close(self) -> None:
         pass

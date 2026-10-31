@@ -13,7 +13,7 @@ class Probe:
 
     def read(self):
         return Reading(
-            {"Tp01": 65.0, "Tg01": 45.0}, {"Tp01": "cpu", "Tg01": "gpu"}, {"cpu": 1.0}, "nominal"
+            {"Tp01": 65.0, "Tg01": 45.0}, {"Tp01": "cpu", "Tg01": "gpu"}, {"cpu": 1.0}, {}, "nominal"
         )
 
     def close(self):
@@ -65,10 +65,12 @@ def test_linux_probe_reads_zones_hwmon_and_skips_duplicates(tmp_path, monkeypatc
         (path / "temp1_input").write_text(value)
         if label:
             (path / "temp1_label").write_text(label)
-    monkeypatch.setattr("magnitude_rig.host.probes.nvidia_smi", lambda: [("0", 40.0, 3.0)])
+    monkeypatch.setattr("magnitude_rig.host.probes.nvidia_smi", lambda: [("0", 40.0, 3.0, 1024.0, 24576.0)])
     ticks = iter([(100, 1000), (130, 1100)])
     monkeypatch.setattr("magnitude_rig.host.probes._proc_stat_ticks", lambda: next(ticks))
-    reading = LinuxProbe(tmp_path).read()
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemTotal:       16384 kB\nMemFree:  1024 kB\nMemAvailable:   4096 kB\n")
+    reading = LinuxProbe(tmp_path, meminfo).read()
     assert reading.sensors_c == {
         "zone:thermal_zone0:x86_pkg_temp": 51.0,
         "hwmon:hwmon1:nvme:Composite": 38.5,
@@ -83,6 +85,10 @@ def test_linux_probe_reads_zones_hwmon_and_skips_duplicates(tmp_path, monkeypatc
     }
     assert reading.utilization_pct["gpu0"] == 3.0
     assert reading.utilization_pct["cpu"] == 30.0
+    assert reading.memory_bytes == {
+        "gpu0": {"used": 1024 * 2**20, "total": 24576 * 2**20},
+        "system": {"used": 12288 * 1024, "total": 16384 * 1024},
+    }
     assert reading.errors == {}
 
 

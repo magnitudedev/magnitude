@@ -14,7 +14,7 @@ class RemoteCommandTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "POSIX shell working directory")
     def test_posix_working_directory_is_literal(self):
         remote = Remote("local", True, False, "Linux", "x86_64", sys.executable,
-                        "/tmp", "/tmp", "/tmp/agent.py", {}, ("cpu",), True)
+                        "/tmp", "/tmp", "/tmp/agent/package.zip", {}, ("cpu",), True)
         command = remote.command([sys.executable, "-c", "import os; print(os.getcwd())"],
                                  cwd=os.getcwd())
         result = subprocess.run(command, capture_output=True, text=True, check=True)

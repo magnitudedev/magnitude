@@ -20,7 +20,7 @@ def reading(cpu=50.0, gpu=45.0, cpu_busy=2.0, gpu_busy=0.0, pressure="nominal", 
     utilization = {"cpu": cpu_busy}
     if gpu_busy is not None:
         utilization["gpu0"] = gpu_busy
-    return Reading(sensors, groups, utilization, pressure, errors or {})
+    return Reading(sensors, groups, utilization, {}, pressure, errors or {})
 
 
 def series(make, seconds=70, step=2):
