@@ -92,6 +92,7 @@ jobs:
           --version "$VERSION" --arch "${{ matrix.arch }}" --output "$RUNNER_TEMP/context"
         env:
           VERSION: ${{ inputs.version }}
+      # Docker media types without attestations: Podman reads HEALTHCHECK only from a Docker image config.
       - name: Build and push by digest
         env:
           VERSION: ${{ inputs.version }}
@@ -102,7 +103,8 @@ jobs:
             --file packaging/docker/Dockerfile \
             --build-arg "VERSION=$VERSION" \
             --build-arg "REVISION=$revision" \
-            --output "type=image,name=docker.io/$REPOSITORY,push-by-digest=true,name-canonical=true,push=true" \
+            --provenance=false --sbom=false \
+            --output "type=image,name=docker.io/$REPOSITORY,push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=false" \
             --metadata-file "$RUNNER_TEMP/metadata.json" \
             "$RUNNER_TEMP/context"
           digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/metadata.json")
@@ -160,3 +162,4 @@ jobs:
           for tag in "${tags[@]}"; do arguments+=(--tag "$tag"); done
           docker buildx imagetools create "${arguments[@]}" "${sources[@]}"
           docker buildx imagetools inspect "${tags[0]}"
+          test "$(docker buildx imagetools inspect --raw "${tags[0]}" | jq -r .mediaType)" = application/vnd.docker.distribution.manifest.list.v2+json

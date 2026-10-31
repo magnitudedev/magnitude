@@ -49,6 +49,9 @@ if getent group ubuntu >/dev/null; then groupdel ubuntu; fi
 printf '%s\n' '{"file_format_version":"1.0.1","ICD":{"library_path":"libEGL_nvidia.so.0","api_version":"1.3"}}' \
   > /usr/share/vulkan/icd.d/nvidia_egl_icd.json
 useradd --uid 1000 --user-group --home-dir /data --create-home --shell /bin/bash magnitude
+# The service never raises privileges, so no binary may: the package's dependencies bring setuid
+# root helpers (pkexec, polkit's agent helper, Electron's chrome-sandbox) a server has no use for.
+find / -xdev -perm /6000 -type f -exec chmod a-s {} +
 EOF
 
 COPY --chmod=755 inference/ /opt/magnitude/inference/

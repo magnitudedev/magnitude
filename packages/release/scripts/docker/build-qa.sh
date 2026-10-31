@@ -46,8 +46,10 @@ build=(docker buildx build
   --build-arg "VERSION=${version:-qa}"
   --build-arg "REVISION=$(git -C "$repository" rev-parse HEAD)"
   --tag "$tag"
-  --metadata-file "$work/metadata.json")
-if test "$push" = 1; then build+=(--push); else build+=(--load); fi
+  --metadata-file "$work/metadata.json"
+  --provenance=false --sbom=false)
+# Docker media types, as the release publishes: Podman reads HEALTHCHECK only from a Docker image config.
+if test "$push" = 1; then build+=(--output "type=image,name=$tag,push=true,oci-mediatypes=false"); else build+=(--load); fi
 "${build[@]}" "$work/context"
 
 digest=$(sed -n 's/.*"containerimage.digest": *"\(sha256:[0-9a-f]*\)".*/\1/p' "$work/metadata.json" | head -n 1)
