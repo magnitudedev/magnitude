@@ -2807,9 +2807,10 @@ mod tests {
 
     const GIB: u64 = 1 << 30;
 
-    /// Status of an unopened machine whose host RAM `by` reports: assessment
-    /// plans on stable fit, which no headroom changes.
-    fn unopened(by: seismic::ReportedBy) -> Status {
+    /// Status of an unopened machine whose host RAM `by` reports, sampled
+    /// for every executor of `topology`: assessment plans on stable fit,
+    /// which no headroom changes.
+    fn unopened(topology: &DeviceTopology, by: seismic::ReportedBy) -> Status {
         Status {
             sample: seismic::Sample {
                 taken: std::time::SystemTime::now(),
@@ -2821,6 +2822,11 @@ mod tests {
                     kernel_pressure: None,
                 }),
                 volumes: Vec::new(),
+                executors: topology
+                    .executors()
+                    .iter()
+                    .map(|executor| executor.id())
+                    .collect(),
                 grants: Vec::new(),
             },
             runtime: Default::default(),
@@ -2863,7 +2869,7 @@ mod tests {
     fn fit_is_decided_per_domain_against_capacity_less_reserve() {
         let reserves = crate::platform::MemoryReserves::standard();
         let m4_pro = recorded::m4_pro();
-        let status = unopened(seismic::ReportedBy::MachMovablePages);
+        let status = unopened(&m4_pro, seismic::ReportedBy::MachMovablePages);
         let cpu = executor(&m4_pro, BackendName::Cpu);
         let host_ram = m4_pro.host_ram().id();
         let host = Fit::new(&m4_pro, &status, &reserves)
@@ -2908,7 +2914,7 @@ mod tests {
         assert_eq!(short.domains[0].remaining_bytes, -1);
 
         let rtx3090 = recorded::rtx3090();
-        let status = unopened(seismic::ReportedBy::LinuxMemAvailable);
+        let status = unopened(&rtx3090, seismic::ReportedBy::LinuxMemAvailable);
         let cuda = executor(&rtx3090, BackendName::Cuda);
         let (gpu, host_ram) = (device_memory(&rtx3090), rtx3090.host_ram().id());
         let fit = Fit::new(&rtx3090, &status, &reserves);
@@ -2993,7 +2999,7 @@ mod tests {
         );
 
         let rtx3090 = recorded::rtx3090();
-        let status = unopened(seismic::ReportedBy::LinuxMemAvailable);
+        let status = unopened(&rtx3090, seismic::ReportedBy::LinuxMemAvailable);
         let cuda = executor(&rtx3090, BackendName::Cuda);
         let (gpu, host_ram) = (device_memory(&rtx3090), rtx3090.host_ram().id());
         let fit = worker
@@ -3135,7 +3141,7 @@ mod tests {
                 WindowsPhysicalAndCommit,
             ),
         ] {
-            let status = unopened(by);
+            let status = unopened(&topology, by);
             let executor = executor(&topology, backend);
             let host_ram = topology.host_ram().id();
             let staging = assess(&topology, executor, &status, staged);
@@ -3150,7 +3156,7 @@ mod tests {
         }
 
         let rtx3090 = recorded::rtx3090();
-        let status = unopened(seismic::ReportedBy::LinuxMemAvailable);
+        let status = unopened(&rtx3090, seismic::ReportedBy::LinuxMemAvailable);
         let cuda = executor(&rtx3090, BackendName::Cuda);
         let (gpu, host_ram) = (device_memory(&rtx3090), rtx3090.host_ram().id());
         let staging = assess(&rtx3090, cuda, &status, staged);
@@ -3166,7 +3172,7 @@ mod tests {
     fn host_demand_sits_beside_the_metal_working_set() {
         let reserves = crate::platform::MemoryReserves::standard();
         let m4_pro = recorded::m4_pro();
-        let status = unopened(seismic::ReportedBy::MachMovablePages);
+        let status = unopened(&m4_pro, seismic::ReportedBy::MachMovablePages);
         let metal = executor(&m4_pro, BackendName::Metal);
         let host_ram = m4_pro.host_ram().id();
         let fit = Fit::new(&m4_pro, &status, &reserves);
@@ -3212,7 +3218,7 @@ mod tests {
     fn stored_tables_are_charged_in_the_domain_of_shared_storage() {
         let reserves = crate::platform::MemoryReserves::standard();
         let topology = recorded::rtx3090();
-        let status = unopened(seismic::ReportedBy::LinuxMemAvailable);
+        let status = unopened(&topology, seismic::ReportedBy::LinuxMemAvailable);
         let (gpu, host_ram) = (device_memory(&topology), topology.host_ram().id());
         let fit = Fit::new(&topology, &status, &reserves);
         let (own, host) = (fit.store(gpu).unwrap(), fit.store(host_ram).unwrap());

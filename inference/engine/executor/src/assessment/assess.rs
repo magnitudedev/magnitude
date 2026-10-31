@@ -314,8 +314,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         Environment {
+            status: catalog.status(&catalog.topology(), selected.info.id()),
             topology: catalog.topology(),
-            status: catalog.status(),
             draft,
             definition,
         }

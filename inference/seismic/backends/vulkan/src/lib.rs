@@ -15,7 +15,7 @@ mod memory;
 pub mod seal;
 pub mod toolchain;
 
-pub use device::{Device, HeapBudget, MemoryBudget, OpenError};
+pub use device::{Device, DeviceHandle, HeapBudget, MemoryBudget, OpenError};
 pub use facts::{
     Allocation, Calibration, Description, DeviceType, Facts, FormationFacts, Limits, MemoryHeap,
     MemoryLayout, MemoryType, SubgroupWidth, SUBGROUP_WIDTH,
@@ -35,27 +35,6 @@ pub fn discover() -> Result<Vec<Description>, LoaderError> {
         .collect::<Vec<_>>();
     descriptions.sort_by_key(|description| !description.facts.is_gpu());
     Ok(descriptions)
-}
-
-/// Every heap's `VK_EXT_memory_budget` budget and usage of the device of
-/// `uuid`, in heap order, read from the physical device without a logical
-/// one; `None` when no device has that UUID. The extension is in the floor,
-/// so every device meeting it reports budgets.
-pub fn heap_budgets(uuid: [u8; 16]) -> Result<Option<Vec<HeapBudget>>, LoaderError> {
-    let instance = instance::instance()?;
-    for physical in instance.physical_devices()? {
-        let mut id = ash::vk::PhysicalDeviceIDProperties::default();
-        let mut properties = ash::vk::PhysicalDeviceProperties2::default().push_next(&mut id);
-        unsafe {
-            instance
-                .raw()
-                .get_physical_device_properties2(physical, &mut properties)
-        };
-        if id.device_uuid == uuid {
-            return Ok(Some(device::heap_budgets(instance, physical)));
-        }
-    }
-    Ok(None)
 }
 
 #[cfg(test)]

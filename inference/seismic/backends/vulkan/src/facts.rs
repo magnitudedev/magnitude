@@ -5,6 +5,7 @@
 //! facts select prefix macros, the numerical environment and the formation and
 //! tuning identities.
 
+use crate::device::DeviceHandle;
 use crate::instance::Instance;
 use ash::vk;
 use std::ffi::CStr;
@@ -535,10 +536,11 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// One enumerated physical device: its facts, and whether it meets the
-/// floor (`Err` names the first missing item).
+/// One enumerated physical device: its handle, its facts, and whether it
+/// meets the floor (`Err` names the first missing item).
 #[derive(Clone, Debug)]
 pub struct Description {
+    pub handle: DeviceHandle,
     pub facts: Facts,
     pub floor: Result<(), String>,
 }
@@ -557,7 +559,7 @@ fn text(raw: &[std::ffi::c_char]) -> String {
 }
 
 /// Describe one physical device.
-pub(crate) fn describe(instance: &Instance, physical: vk::PhysicalDevice) -> Description {
+pub(crate) fn describe(instance: &'static Instance, physical: vk::PhysicalDevice) -> Description {
     let raw = instance.raw();
     let extensions = unsafe { raw.enumerate_device_extension_properties(physical) }
         .unwrap_or_default()
@@ -756,7 +758,11 @@ pub(crate) fn describe(instance: &Instance, physical: vk::PhysicalDevice) -> Des
         Some((missing, _)) => Err(format!("missing {missing}")),
         None => Ok(()),
     };
-    Description { facts, floor }
+    Description {
+        handle: DeviceHandle { instance, physical },
+        facts,
+        floor,
+    }
 }
 
 /// The heaps and types of `properties`, in the driver's order.

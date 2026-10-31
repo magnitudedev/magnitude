@@ -257,16 +257,20 @@ impl Device {
             return Ok(device.clone());
         }
         let instance = crate::instance::instance().map_err(OpenError::Loader)?;
-        let (physical, Description { facts, floor, .. }) = instance
+        let Description {
+            handle,
+            facts,
+            floor,
+        } = instance
             .physical_devices()
             .map_err(OpenError::Loader)?
             .into_iter()
-            .map(|physical| (physical, facts::describe(instance, physical)))
-            .find(|(_, description)| description.facts.uuid == uuid)
+            .map(|physical| facts::describe(instance, physical))
+            .find(|description| description.facts.uuid == uuid)
             .ok_or(OpenError::Missing)?;
         floor.map_err(OpenError::Floor)?;
         let device = Self {
-            inner: Arc::new(Inner::create(instance, physical, facts)?),
+            inner: Arc::new(Inner::create(instance, handle.physical, facts)?),
         };
         registry.opened.push(device.clone());
         Ok(device)
@@ -744,6 +748,29 @@ pub struct HeapBudget {
     pub budget: u64,
     /// `heapUsage`: what this process uses of the heap.
     pub usage: u64,
+}
+
+/// An unopened physical device. Its instance is the process's, which is
+/// never destroyed, so the handle is valid for the whole process.
+#[derive(Clone, Copy)]
+pub struct DeviceHandle {
+    pub(crate) instance: &'static Instance,
+    pub(crate) physical: vk::PhysicalDevice,
+}
+
+impl DeviceHandle {
+    /// Every heap's `VK_EXT_memory_budget` budget and usage, in heap order,
+    /// read without a logical device. The extension is in the floor, so
+    /// every device meeting it reports budgets.
+    pub fn heap_budgets(&self) -> Vec<HeapBudget> {
+        heap_budgets(self.instance, self.physical)
+    }
+}
+
+impl std::fmt::Debug for DeviceHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("DeviceHandle").field(&self.physical).finish()
+    }
 }
 
 /// Every heap's budget of `physical`, a device meeting the floor (which

@@ -116,8 +116,13 @@ impl HardwareInventory {
         resident: Option<&MemoryObservation>,
     ) -> Result<HardwareSnapshot, InventoryError> {
         let topology = inventory.topology();
+        let every = topology
+            .executors()
+            .iter()
+            .map(|executor| executor.id())
+            .collect::<Vec<_>>();
         let status = Status {
-            sample: inventory.sample(&topology),
+            sample: inventory.sample(&topology, &every),
             runtime: RuntimeStatus::default(),
         };
         let mut snapshot = snapshot(&topology, &status, reserves, serving, machine)?;
@@ -338,7 +343,7 @@ fn snapshot(
         .iter()
         .map(|path| {
             let remaining = status
-                .grant_left(path.id())
+                .grant_left(path)
                 .transpose()
                 .map_err(observation_error)?;
             Ok(HardwareAccessPath {

@@ -84,15 +84,16 @@ impl Inventory {
         host::status(&mut self.state().displacement)
     }
 
-    /// One reading of the status of `topology`'s stores and grants.
-    pub fn sample(&self, topology: &DeviceTopology) -> Sample {
+    /// One reading of the status of `topology`'s stores and of the grants
+    /// of `executors`.
+    pub fn sample(&self, topology: &DeviceTopology, executors: &[ExecutorId]) -> Sample {
         let mut state = self.state();
         let State {
             natives,
             displacement,
             ..
         } = &mut *state;
-        status::sample(topology, natives, displacement)
+        status::sample(topology, executors, natives, displacement)
     }
 
     /// The persistent identity of an executor of the current revision, what

@@ -8,7 +8,8 @@
 use crate::discovery::Natives;
 use crate::host::{self, DisplacementHistory, HostStatus, ObservationError};
 use crate::model::{
-    AccessPathId, DeviceTopology, GrantSource, Reported, ReportedBy, Store, StoreId, StoreKind,
+    AccessPath, AccessPathId, DeviceTopology, ExecutorId, GrantSource, Reported, ReportedBy, Store,
+    StoreId, StoreKind,
 };
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -23,8 +24,11 @@ pub struct Sample {
     pub host_ram: Result<HostStatus, ObservationError>,
     /// Each volume's space available to this process.
     pub volumes: Vec<(StoreId, Result<Reported<u64>, ObservationError>)>,
-    /// What is left of each grant readable without an opened executor:
-    /// Vulkan heap budgets less usage, Metal's working set less allocated.
+    /// The executors whose grants the sample read.
+    pub executors: Vec<ExecutorId>,
+    /// What is left of each grant of `executors` readable without an opened
+    /// executor: Vulkan heap budgets less usage, Metal's working set less
+    /// allocated.
     pub grants: Vec<(AccessPathId, Result<Reported<u64>, ObservationError>)>,
 }
 
@@ -94,24 +98,33 @@ impl Status {
 
     /// What is left of `path`'s grant: the runtime's reading where an
     /// opened executor gave one, else the sample's. `None` when neither
-    /// source read it.
+    /// source has one to read. The sample must be of `path`'s executor.
     pub fn grant_left(
         &self,
-        path: AccessPathId,
+        path: &AccessPath,
     ) -> Option<Result<Reported<u64>, &ObservationError>> {
-        if let Some((_, left)) = self.runtime.grants.iter().find(|(of, _)| *of == path) {
+        assert!(
+            self.sample.executors.contains(&path.executor()),
+            "the status is not of the path's executor"
+        );
+        let id = path.id();
+        if let Some((_, left)) = self.runtime.grants.iter().find(|(of, _)| *of == id) {
             return Some(left.as_ref().copied());
         }
         self.sample
             .grants
             .iter()
-            .find(|(of, _)| *of == path)
+            .find(|(of, _)| *of == id)
             .map(|(_, left)| left.as_ref().copied())
     }
 }
 
+/// A sample of `topology` reading the grants of `executors` alone: a grant
+/// is read only for a reader that asks of its executor, since a reading can
+/// cost a driver call.
 pub(crate) fn sample(
     topology: &DeviceTopology,
+    executors: &[ExecutorId],
     natives: &Natives,
     history: &mut DisplacementHistory,
 ) -> Sample {
@@ -132,12 +145,14 @@ pub(crate) fn sample(
     let mut budgets = HashMap::new();
     let grants = topology
         .grant_sources()
-        .map(|(path, grant, source)| (path, grant_left(source, grant, natives, &mut budgets)))
+        .filter(|(path, _, _)| executors.contains(&path.executor()))
+        .map(|(path, grant, source)| (path.id(), grant_left(source, grant, natives, &mut budgets)))
         .collect();
     Sample {
         taken,
         host_ram,
         volumes,
+        executors: executors.to_vec(),
         grants,
     }
 }
@@ -162,7 +177,7 @@ fn grant_left(
         } => {
             let device = budgets
                 .entry(*uuid)
-                .or_insert_with(|| vulkan_budgets(*uuid))
+                .or_insert_with(|| vulkan_budgets(*uuid, natives))
                 .as_ref()
                 .map_err(Clone::clone)?;
             if heaps.iter().any(|&heap| heap >= device.len()) {
@@ -196,23 +211,30 @@ fn attributed(device: &[(u64, u64)], heaps: &[usize], before: u64, grant: u64) -
     budget.min(before + grant).saturating_sub(usage.max(before))
 }
 
+/// The heap budgets of the Vulkan device `uuid`, read from the handle
+/// discovery found it by.
 #[cfg(not(target_os = "macos"))]
-fn vulkan_budgets(uuid: [u8; 16]) -> Result<Vec<(u64, u64)>, ObservationError> {
-    match seismic_vulkan::heap_budgets(uuid) {
-        Ok(Some(budgets)) => Ok(budgets
-            .into_iter()
-            .map(|heap| (heap.budget, heap.usage))
-            .collect()),
-        Ok(None) => Err(ObservationError::Failed(
-            "the Vulkan device is gone; refresh the inventory".into(),
-        )),
-        Err(error) => Err(ObservationError::Failed(error.to_string())),
-    }
+fn vulkan_budgets(uuid: [u8; 16], natives: &Natives) -> Result<Vec<(u64, u64)>, ObservationError> {
+    let (_, handle) = natives
+        .vulkan
+        .iter()
+        .find(|(of, _)| *of == uuid)
+        .ok_or_else(|| {
+            ObservationError::Failed("the Vulkan device is gone; refresh the inventory".into())
+        })?;
+    Ok(handle
+        .heap_budgets()
+        .into_iter()
+        .map(|heap| (heap.budget, heap.usage))
+        .collect())
 }
 
 /// Vulkan is not built on macOS, so no topology there holds a Vulkan grant.
 #[cfg(target_os = "macos")]
-fn vulkan_budgets(_uuid: [u8; 16]) -> Result<Vec<(u64, u64)>, ObservationError> {
+fn vulkan_budgets(
+    _uuid: [u8; 16],
+    _natives: &Natives,
+) -> Result<Vec<(u64, u64)>, ObservationError> {
     Err(ObservationError::Unsupported(
         "this build has no Vulkan runtime".into(),
     ))

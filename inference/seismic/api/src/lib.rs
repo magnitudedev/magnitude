@@ -272,10 +272,11 @@ impl Devices {
             .map(|inner| Device { inner })
     }
 
-    /// A status sample of the current topology with what this process's
-    /// opened executors hold.
-    pub fn status(&self) -> Status {
-        self.inner.status()
+    /// The status of `executor` of `topology`: a sample of the stores and
+    /// of the executor's grants, with what this process's opened executors
+    /// hold.
+    pub fn status(&self, topology: &DeviceTopology, executor: ExecutorId) -> Status {
+        self.inner.status(topology, executor)
     }
 }
 

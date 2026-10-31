@@ -751,6 +751,9 @@ pub(crate) struct Gathered {
 pub(crate) struct Natives {
     #[cfg(target_os = "macos")]
     pub(crate) metal: Vec<seismic_metal::DeviceHandle>,
+    /// Each Vulkan device's handle, by UUID.
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) vulkan: Vec<([u8; 16], seismic_vulkan::DeviceHandle)>,
 }
 
 /// The diagnostic of a backend whose enumeration succeeded with no device:
@@ -786,6 +789,8 @@ pub(crate) fn gather(paths: &[PathBuf]) -> Result<Gathered, DiscoveryError> {
     let natives = Natives {
         metal: seismic_metal::DeviceHandle::discover(),
     };
+    #[cfg(not(target_os = "macos"))]
+    let mut natives = Natives::default();
     #[cfg(target_os = "macos")]
     if natives.metal.is_empty() {
         diagnostics.push(no_device(BackendName::Metal));
@@ -811,7 +816,7 @@ pub(crate) fn gather(paths: &[PathBuf]) -> Result<Gathered, DiscoveryError> {
         })
         .collect();
     #[cfg(not(target_os = "macos"))]
-    let (natives, metal) = (Natives::default(), Vec::new());
+    let metal = Vec::new();
 
     let cuda = cuda_reports(&mut diagnostics);
 
@@ -828,6 +833,10 @@ pub(crate) fn gather(paths: &[PathBuf]) -> Result<Gathered, DiscoveryError> {
             if descriptions.is_empty() {
                 diagnostics.push(no_device(BackendName::Vulkan));
             }
+            natives.vulkan = descriptions
+                .iter()
+                .map(|description| (description.facts.uuid, description.handle))
+                .collect();
             descriptions.iter().map(vulkan_report).collect()
         }
     };

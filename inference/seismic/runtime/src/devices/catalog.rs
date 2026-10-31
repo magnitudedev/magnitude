@@ -112,19 +112,19 @@ impl Devices {
         self.open(executor.id())
     }
 
-    /// A status sample of the current topology with what this process's
-    /// opened executors hold.
-    pub fn status(&self) -> Status {
-        let topology = self.topology();
+    /// The status of `executor` of `topology`: a sample of the stores and
+    /// of the executor's grants, with what this process's opened executors
+    /// hold.
+    pub fn status(&self, topology: &DeviceTopology, executor: ExecutorId) -> Status {
         Status {
-            sample: self.inventory.sample(&topology),
-            runtime: self.runtime_status(&topology),
+            sample: self.inventory.sample(topology, &[executor]),
+            runtime: self.runtime_status(topology, executor),
         }
     }
 
     /// What only opened executors know: each store's ledger, and what is
-    /// left of each grant an opened CUDA executor reads.
-    fn runtime_status(&self, topology: &DeviceTopology) -> RuntimeStatus {
+    /// left of each grant of `of` when it is an opened CUDA executor.
+    fn runtime_status(&self, topology: &DeviceTopology, of: ExecutorId) -> RuntimeStatus {
         let charges = topology
             .stores()
             .iter()
@@ -137,23 +137,22 @@ impl Devices {
             .values()
             .filter_map(Weak::upgrade)
             .collect::<Vec<_>>();
-        let mut cuda = HashMap::new();
-        for device in devices {
-            let Some(executor) = topology.resolve(device.info().selector()) else {
-                continue;
-            };
-            if let Some(free) = device.kind.cuda_free() {
-                let prior = cuda.entry(executor.id()).or_insert_with(|| free.clone());
-                *prior = match (prior.clone(), free) {
-                    (Ok(a), Ok(b)) => Ok(a.min(b)),
-                    (Err(error), _) | (_, Err(error)) => Err(error),
-                };
-            }
-        }
+        let free = devices
+            .iter()
+            .filter(|device| {
+                topology
+                    .resolve(device.info().selector())
+                    .is_some_and(|executor| executor.id() == of)
+            })
+            .filter_map(|device| device.kind.cuda_free())
+            .reduce(|a, b| match (a, b) {
+                (Ok(a), Ok(b)) => Ok(a.min(b)),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            });
         let mut grants = Vec::new();
-        for (id, free) in cuda {
+        if let Some(free) = free {
             let executor = topology
-                .executor(id)
+                .executor(of)
                 .expect("opened executor belongs to topology");
             let memory = topology
                 .physical_device(executor.physical())
@@ -162,7 +161,7 @@ impl Devices {
             for path in topology
                 .access_paths()
                 .iter()
-                .filter(|path| path.executor() == id)
+                .filter(|path| path.executor() == of)
             {
                 let Some(grant) = path.grant() else {
                     continue;

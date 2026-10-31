@@ -687,10 +687,10 @@ impl DeviceTopology {
 
     /// Each grant whose status is read without an opened executor: its
     /// path, its size and where it is read.
-    pub(crate) fn grant_sources(&self) -> impl Iterator<Item = (AccessPathId, u64, &GrantSource)> {
+    pub(crate) fn grant_sources(&self) -> impl Iterator<Item = (&AccessPath, u64, &GrantSource)> {
         self.access.iter().filter_map(|path| {
             let (grant, source) = path.grant_source()?;
-            Some((path.id, grant, source))
+            Some((path, grant, source))
         })
     }
 }

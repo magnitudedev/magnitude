@@ -90,9 +90,10 @@ impl AssessmentStructure {
     ) -> Result<Self, ModelAssessmentError> {
         let selected = platform::select_device(catalog, ExecutionPath::Native, device, &reserves)
             .map_err(ModelAssessmentError::Platform)?;
+        let topology = catalog.topology();
         Ok(Self {
-            topology: catalog.topology(),
-            status: catalog.status(),
+            status: catalog.status(&topology, selected.info.id()),
+            topology,
             device,
             selected,
             reserves,

@@ -137,7 +137,7 @@ impl DeviceHeap {
         reserves: MemoryReserves,
         device: Rc<Device>,
     ) -> Result<Self, MemoryPolicyError> {
-        let status = catalog.status();
+        let status = catalog.status(device.topology(), device.info().id());
         let capacity_bytes = Fit::new(device.topology(), &status, &reserves)
             .storage_beside(device.info(), &StorageKind::ALL, &[])?
             .stable_bytes;
@@ -157,6 +157,12 @@ impl DeviceHeap {
         &self.device
     }
 
+    /// A fresh status of the device's executor.
+    fn status(&self) -> seismic::Status {
+        self.catalog
+            .status(self.device.topology(), self.device.info().id())
+    }
+
     pub fn heap(&self) -> &MemoryHeap {
         &self.heap
     }
@@ -171,7 +177,7 @@ impl DeviceHeap {
     /// ceiling from the readings, and refresh the heap's view from them.
     /// A failed observation revokes unspent grants and leaves the heap Blind.
     pub fn refresh(&mut self) -> Result<Vec<DomainReading>, MemoryPolicyError> {
-        let status = self.catalog.status();
+        let status = self.status();
         self.observe(&status)
     }
 
@@ -225,7 +231,7 @@ impl DeviceHeap {
     /// sample. Fit decides where the claims' staged bytes are charged
     /// ([`Fit::host_staging`]).
     fn check_storage(&mut self, claim: ClaimDemand, table: u64) -> Result<(), ClaimRefusal> {
-        let status = self.catalog.status();
+        let status = self.status();
         let readings = self.observe(&status).map_err(ClaimRefusal::Blind)?;
         if let Some(refusal) = reclaiming(&readings) {
             return Err(refusal);
@@ -359,6 +365,7 @@ mod tests {
                     kernel_pressure: None,
                 }),
                 volumes: Vec::new(),
+                executors: vec![cuda.id()],
                 grants: Vec::new(),
             },
             runtime: seismic::RuntimeStatus::default(),
@@ -390,7 +397,7 @@ mod tests {
     /// tables, from a fresh status sample.
     fn live_ceiling(heap: &DeviceHeap) -> u64 {
         let topology = heap.device.topology();
-        Fit::new(topology, &heap.catalog.status(), &heap.reserves)
+        Fit::new(topology, &heap.status(), &heap.reserves)
             .storage_beside(
                 heap.device.info(),
                 &StorageKind::ALL,

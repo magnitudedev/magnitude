@@ -101,7 +101,7 @@ pub fn select_device(
     enforce_phase_one(path)?;
     let topology = catalog.topology();
     let info = select(&topology, path, request).map_err(PlatformError::Selection)?;
-    let status = catalog.status();
+    let status = catalog.status(&topology, info.id());
     let assessment_capacity_bytes = Fit::new(&topology, &status, reserves)
         .placement(&info, StorageKind::Device)
         .map_err(PlatformError::Memory)?
@@ -131,7 +131,7 @@ pub fn open_selected(
             },
         )
         .map_err(PlatformError::Open)?;
-    let status = catalog.status();
+    let status = catalog.status(device.topology(), device.info().id());
     refresh_device_ceiling(&device, &status, &config.reserves).map_err(PlatformError::Memory)?;
     let topology = device.topology();
     let host_ram = topology.host_ram().id();

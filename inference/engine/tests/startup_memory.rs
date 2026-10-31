@@ -178,7 +178,7 @@ fn probe_model_load() {
     let catalog = Devices::discover(&[]).unwrap();
     eprintln!(
         "before load: {:?}",
-        catalog.status().sample.host_ram.unwrap()
+        catalog.inventory().host_status().unwrap()
     );
     match build_native_domain(&resolved.manifest, resolved.host.shared_package()) {
         Ok(_) => eprintln!("probe: model loaded and warmed up"),

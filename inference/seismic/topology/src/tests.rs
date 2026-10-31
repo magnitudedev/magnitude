@@ -948,6 +948,38 @@ fn a_driver_update_changes_only_its_executor_identity() {
     assert_eq!(vulkan.physical, gpu);
 }
 
+/// A sample reads the grants of the executors it is for alone: the RTX
+/// 3090's CUDA executor reads no Vulkan heap budget, though its Vulkan
+/// executor on the same device has grants a heap budget reads.
+#[test]
+fn a_sample_reads_the_grants_of_its_executors_alone() {
+    let inventory = Inventory::from_gathered(Vec::new(), gathered(rtx3090()));
+    let topology = inventory.topology();
+    let gpu = PhysicalIdentity::Uuid(rtx3090_uuid());
+    let cuda = executor(&topology, BackendName::Cuda, &gpu).id();
+    let vulkan = executor(&topology, BackendName::Vulkan, &gpu).id();
+    let sourced = |of| {
+        topology
+            .grant_sources()
+            .filter(|(path, _, _)| path.executor() == of)
+            .map(|(path, _, _)| path.id())
+            .collect::<Vec<_>>()
+    };
+    assert!(sourced(cuda).is_empty());
+    assert!(!sourced(vulkan).is_empty());
+    let read = |executors: &[_]| {
+        inventory
+            .sample(&topology, executors)
+            .grants
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>()
+    };
+    assert!(read(&[cuda]).is_empty());
+    assert_eq!(read(&[vulkan]), sourced(vulkan));
+    assert_eq!(read(&[cuda, vulkan]), sourced(vulkan));
+}
+
 /// The rtx3090 machine with Vulkan driver `driver`.
 fn rtx3090_topology(driver: &str) -> Arc<DeviceTopology> {
     let mut reports = rtx3090();
@@ -974,12 +1006,18 @@ fn the_machine_is_discovered_and_sampled() {
         );
     }
     let served = volume(&topology, &directory).unwrap();
-    let sample = inventory.sample(&topology);
+    let every = topology
+        .executors()
+        .iter()
+        .map(|executor| executor.id())
+        .collect::<Vec<_>>();
+    let sample = inventory.sample(&topology, &every);
     assert!(sample.host_ram.as_ref().unwrap().headroom.value > 0);
     assert_eq!(sample.volumes.len(), 1);
     assert_eq!(sample.volumes[0].0, served);
     assert!(sample.volumes[0].1.as_ref().unwrap().value > 0);
-    // Every grant whose status needs no opened executor is read.
+    // Every grant whose status needs no opened executor is read, from the
+    // handles discovery found.
     assert_eq!(sample.grants.len(), topology.grant_sources().count());
     assert!(sample.grants.iter().all(|(_, left)| left.is_ok()));
     eprintln!("{sample:#?}");

@@ -588,7 +588,7 @@ impl<'a> Fit<'a> {
         };
         let left = match mode {
             FitMode::Stable => grant.value,
-            FitMode::Live => match self.status.grant_left(id) {
+            FitMode::Live => match self.status.grant_left(path) {
                 Some(Ok(left)) => grant.value.min(left.value),
                 Some(Err(error)) => return Err(MemoryPolicyError::Observation(error.clone())),
                 // An unopened executor has only its reported stable grant.
@@ -782,7 +782,7 @@ pub fn observe_domains(
     device: &seismic::Device,
     reserves: &MemoryReserves,
 ) -> Result<Vec<DomainReading>, MemoryPolicyError> {
-    let status = devices.status();
+    let status = devices.status(device.topology(), device.info().id());
     domain_readings(device, &status, reserves)
 }
 
@@ -933,10 +933,23 @@ mod tests {
                 taken: SystemTime::now(),
                 host_ram: Ok(host),
                 volumes: Vec::new(),
+                executors: Vec::new(),
                 grants: Vec::new(),
             },
             runtime: RuntimeStatus::default(),
         }
+    }
+
+    /// Status of an unopened machine sampled for every executor of
+    /// `topology`: `host` alone, no grant read and no charge.
+    fn sampled(topology: &DeviceTopology, host: HostStatus) -> Status {
+        let mut status = status(host);
+        status.sample.executors = topology
+            .executors()
+            .iter()
+            .map(|executor| executor.id())
+            .collect();
+        status
     }
 
     /// The first executor of `backend`.
@@ -1387,7 +1400,7 @@ mod tests {
         let reserves = MemoryReserves::standard();
         let metal = executor(&topology, BackendName::Metal);
         let working_set = grant_room(&topology, metal, StorageKind::Device, 0);
-        let unlimited = status(host(MACOS, 16 * GIB));
+        let unlimited = sampled(&topology, host(MACOS, 16 * GIB));
         let fit = Fit::new(&topology, &unlimited, &reserves);
         let host_fit = fit.store(topology.host_ram().id()).unwrap().stable_bytes;
         assert!(working_set < host_fit);
@@ -1413,7 +1426,7 @@ mod tests {
             used_bytes: 0,
             reclaimable_bytes: 0,
         }];
-        let limited = status(limited);
+        let limited = sampled(&topology, limited);
         let fit = Fit::new(&topology, &limited, &reserves);
         let host_fit = fit.store(topology.host_ram().id()).unwrap().stable_bytes;
         assert!(host_fit < working_set);
@@ -1436,7 +1449,7 @@ mod tests {
         let metal = executor(&topology, BackendName::Metal);
         let path = metal.placement(StorageKind::Device)[0];
         let host_ram = topology.host_ram().id();
-        let mut sampled = status(host(MACOS, 20 * GIB));
+        let mut sampled = sampled(&topology, host(MACOS, 20 * GIB));
         let with_left = |sampled: &mut Status, left| {
             sampled.sample.grants = vec![(
                 path,
@@ -1509,13 +1522,13 @@ mod tests {
     #[test]
     fn an_integrated_gpu_is_bounded_by_the_smaller_of_its_grant_and_host_ram() {
         let reserves = MemoryReserves::standard();
-        let unopened = status(host(LINUX, 8 * GIB));
         for (topology, backend) in [
             (recorded::gb10(), BackendName::Cuda),
             (recorded::gb10(), BackendName::Vulkan),
             (recorded::strix_halo_linux(), BackendName::Vulkan),
             (recorded::lunar_lake(), BackendName::Vulkan),
         ] {
+            let unopened = sampled(&topology, host(LINUX, 8 * GIB));
             let fit = Fit::new(&topology, &unopened, &reserves);
             let host_fit = fit.store(topology.host_ram().id()).unwrap().stable_bytes;
             let executor = executor(&topology, backend);
@@ -1584,7 +1597,7 @@ mod tests {
         let cuda = executor(&topology, BackendName::Cuda);
         let path = cuda.placement(StorageKind::Device)[0];
         let total = topology.access_path(path).unwrap().grant().unwrap().value;
-        let mut opened = status(host(LINUX, 40 * GIB));
+        let mut opened = sampled(&topology, host(LINUX, 40 * GIB));
         let holding = |opened: &mut Status, held| {
             opened.runtime.grants = vec![(
                 path,
@@ -1628,7 +1641,7 @@ mod tests {
         let reserves = MemoryReserves::standard();
         let gpu = device_memory(&topology);
         let capacity = topology.store(gpu).unwrap().capacity().value;
-        let mut sampled = status(host(LINUX, 16 * GIB));
+        let mut sampled = sampled(&topology, host(LINUX, 16 * GIB));
         let fit = Fit::new(&topology, &sampled, &reserves);
         let own = fit.store(gpu).unwrap();
         assert_eq!(own.constraint, MemoryConstraint::DeviceLocal);
@@ -1687,7 +1700,7 @@ mod tests {
         let reserves = MemoryReserves::standard();
         let slice = device_memory(&topology);
         let capacity = topology.store(slice).unwrap().capacity().value;
-        let mut sampled = status(host(LINUX, 16 * GIB));
+        let mut sampled = sampled(&topology, host(LINUX, 16 * GIB));
         let fit = Fit::new(&topology, &sampled, &reserves);
         let own = fit.store(slice).unwrap();
         assert_eq!(own.thresholds.planning_bytes, 512 * MIB);
@@ -1734,7 +1747,7 @@ mod tests {
         let vulkan = executor(&topology, BackendName::Vulkan);
         let path = vulkan.placement(StorageKind::Device)[0];
         assert_eq!(vulkan.placement(StorageKind::Upload), [path]);
-        let mut sampled = status(host(LINUX, 16 * GIB));
+        let mut sampled = sampled(&topology, host(LINUX, 16 * GIB));
         let gpu = device_memory(&topology);
         let reserve = Fit::new(&topology, &sampled, &reserves)
             .store(gpu)
@@ -1780,7 +1793,7 @@ mod tests {
     fn a_placement_over_two_paths_continues_onto_host_ram() {
         let topology = recorded::strix_halo_windows();
         let reserves = MemoryReserves::standard();
-        let unopened = status(host(WINDOWS, 16 * GIB));
+        let unopened = sampled(&topology, host(WINDOWS, 16 * GIB));
         let fit = Fit::new(&topology, &unopened, &reserves);
         let (radeon, host_ram) = (device_memory(&topology), topology.host_ram().id());
         let own_fit = fit.store(radeon).unwrap().stable_bytes;
