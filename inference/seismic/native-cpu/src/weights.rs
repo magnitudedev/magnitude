@@ -468,39 +468,6 @@ impl<const ID: usize> Table<ID> {
         }
         out
     };
-    const LEAST: i8 = {
-        let mut least = Self::VALUES[0];
-        let mut i = 1;
-        while i < 16 {
-            if Self::VALUES[i] < least {
-                least = Self::VALUES[i];
-            }
-            i += 1;
-        }
-        least
-    };
-    const GREATEST: i8 = {
-        let mut greatest = Self::VALUES[0];
-        let mut i = 1;
-        while i < 16 {
-            if Self::VALUES[i] > greatest {
-                greatest = Self::VALUES[i];
-            }
-            i += 1;
-        }
-        greatest
-    };
-    /// The codebook shifted to start at zero, as unsigned bytes.
-    #[cfg(target_arch = "x86_64")]
-    const SHIFTED: [i8; 16] = {
-        let mut shifted = [0i8; 16];
-        let mut i = 0;
-        while i < 16 {
-            shifted[i] = (Self::VALUES[i] as i32 - Self::LEAST as i32) as u8 as i8;
-            i += 1;
-        }
-        shifted
-    };
 }
 
 impl<const ID: usize> Interpretation for Table<ID> {
@@ -512,7 +479,8 @@ impl<const ID: usize> Interpretation for Table<ID> {
 
 /// A packet's 32 exact integer values: a code component.
 pub trait Codes: Copy + Send + Sync + 'static {
-    /// The least and the greatest value.
+    /// The least and the greatest value: the registry's code domain
+    /// (`DecodeAxes::codes`), a component's const parameters.
     const LEAST: i32;
     const GREATEST: i32;
 
@@ -558,18 +526,35 @@ pub trait Codes: Copy + Send + Sync + 'static {
 }
 
 /// Codes in a `LOW`-bit low plane and a `HIGH`-bit high plane
-/// (`registry::code_planes`), read through interpretation `I`: code `i` of
-/// a packet is nibble `i & 1` of byte `i / 2` of a 4-bit low plane (byte
-/// `i` of an 8-bit one) joined with bits `HIGH i ..` of the high plane
-/// shifted to bit `LOW`.
+/// (`registry::code_planes`), read through interpretation `I`, whose values
+/// are the registry's code domain `LEAST..=GREATEST` (`DecodeAxes::codes`):
+/// code `i` of a packet is bits `LOW i ..` of the low plane (the low nibble
+/// of byte `i / 2` first for 4-bit codes; byte `i` of an 8-bit plane) joined
+/// with bits `HIGH i ..` of the high plane shifted to bit `LOW`.
 #[derive(Clone, Copy, Debug)]
-pub struct Planes<const LOW: u32, const HIGH: u32, I>(PhantomData<I>);
+pub struct Planes<const LOW: u32, const HIGH: u32, I, const LEAST: i32, const GREATEST: i32>(
+    PhantomData<I>,
+);
 
-impl<const HIGH: u32, I> Planes<4, HIGH, I> {
-    /// The packet's 16 low-plane bytes.
+impl<const LOW: u32, const HIGH: u32, I, const LEAST: i32, const GREATEST: i32>
+    Planes<LOW, HIGH, I, LEAST, GREATEST>
+{
+    /// The code domain, whose values fit a signed byte.
+    const DOMAIN: (i32, i32) = {
+        assert!(
+            i8::MIN as i32 <= LEAST && LEAST <= GREATEST && GREATEST <= i8::MAX as i32,
+            "values fit a signed byte"
+        );
+        (LEAST, GREATEST)
+    };
+
+    /// The packet's `4 LOW` low-plane bytes.
     #[inline(always)]
     unsafe fn low_bytes(at: At) -> *const u8 {
-        unsafe { at.plane(RowPlaneRole::Codes).add(16 * at.packet) }
+        unsafe {
+            at.plane(RowPlaneRole::Codes)
+                .add(4 * LOW as usize * at.packet)
+        }
     }
 
     /// The packet's `4 HIGH` high-plane bytes.
@@ -584,12 +569,29 @@ impl<const HIGH: u32, I> Planes<4, HIGH, I> {
     /// The packet's raw codes.
     #[inline(always)]
     unsafe fn raw(at: At) -> [u8; PACKET] {
-        const { assert!(HIGH <= 2, "a high plane of at most 2 bits") };
-        let bytes: [u8; 16] = unsafe { read(Self::low_bytes(at)) };
+        const {
+            assert!(
+                matches!(LOW, 2 | 4) && HIGH <= 2,
+                "a 2- or 4-bit low plane and a high plane of at most 2 bits"
+            )
+        };
+        let mut bytes = [0u8; 16];
+        unsafe {
+            std::ptr::copy_nonoverlapping(Self::low_bytes(at), bytes.as_mut_ptr(), 4 * LOW as usize)
+        };
         let mut codes = [0u8; PACKET];
-        for (i, byte) in bytes.iter().enumerate() {
-            codes[2 * i] = byte & 15;
-            codes[2 * i + 1] = byte >> 4;
+        // Code `(8 / LOW) i + j` is bits `LOW j ..` of byte `i`.
+        if LOW == 4 {
+            for (i, byte) in bytes.iter().enumerate() {
+                codes[2 * i] = byte & 15;
+                codes[2 * i + 1] = byte >> 4;
+            }
+        } else {
+            for (i, byte) in bytes[..8].iter().enumerate() {
+                for j in 0..4 {
+                    codes[4 * i + j] = (byte >> (2 * j)) & 3;
+                }
+            }
         }
         if HIGH > 0 {
             let high: u64 = match HIGH {
@@ -598,7 +600,7 @@ impl<const HIGH: u32, I> Planes<4, HIGH, I> {
             };
             let mask = (1u64 << HIGH) - 1;
             for (i, code) in codes.iter_mut().enumerate() {
-                *code |= (((high >> (HIGH as usize * i)) & mask) as u8) << 4;
+                *code |= (((high >> (HIGH as usize * i)) & mask) as u8) << LOW;
             }
         }
         codes
@@ -607,10 +609,16 @@ impl<const HIGH: u32, I> Planes<4, HIGH, I> {
     #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
     #[inline(always)]
     unsafe fn raw_neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
+        const {
+            assert!(
+                HIGH <= 1 || LOW == 4,
+                "a 2-bit high plane joins a nibble low plane"
+            )
+        };
         let low = unsafe { Self::low_bytes(at) };
         match HIGH {
-            0 => unsafe { packed_neon::nibbles(low, 0) },
-            1 => unsafe { packed_neon::nibbles(low, read(Self::high_bytes(at))) },
+            0 => unsafe { packed_neon::codes::<LOW>(low, 0) },
+            1 => unsafe { packed_neon::codes::<LOW>(low, read(Self::high_bytes(at))) },
             _ => unsafe { packed_neon::nibbles2(low, Self::high_bytes(at)) },
         }
     }
@@ -618,18 +626,26 @@ impl<const HIGH: u32, I> Planes<4, HIGH, I> {
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn raw_x86(at: At) -> std::arch::x86_64::__m256i {
+        const {
+            assert!(
+                HIGH <= 1 || LOW == 4,
+                "a 2-bit high plane joins a nibble low plane"
+            )
+        };
         let low = unsafe { Self::low_bytes(at) };
         match HIGH {
-            0 => unsafe { packed_x86::nibbles(low) },
-            1 => unsafe { packed_x86::nibbles1(low, read(Self::high_bytes(at))) },
+            0 => unsafe { packed_x86::codes::<LOW>(low) },
+            1 => unsafe { packed_x86::codes1::<LOW>(low, read(Self::high_bytes(at))) },
             _ => unsafe { packed_x86::nibbles2(low, Self::high_bytes(at)) },
         }
     }
 }
 
-impl<const HIGH: u32> Codes for Planes<4, HIGH, Unsigned> {
-    const LEAST: i32 = 0;
-    const GREATEST: i32 = (16 << HIGH) - 1;
+impl<const LOW: u32, const HIGH: u32, const LEAST: i32, const GREATEST: i32> Codes
+    for Planes<LOW, HIGH, Unsigned, LEAST, GREATEST>
+{
+    const LEAST: i32 = Self::DOMAIN.0;
+    const GREATEST: i32 = Self::DOMAIN.1;
 
     #[inline(always)]
     unsafe fn values(at: At) -> [i8; PACKET] {
@@ -660,19 +676,18 @@ impl<const HIGH: u32> Codes for Planes<4, HIGH, Unsigned> {
     }
 }
 
-impl<const HIGH: u32, const C: i32> Codes for Planes<4, HIGH, Offset<C>> {
-    const LEAST: i32 = {
-        assert!(C >= 0 && C <= 128, "values fit a signed byte");
-        -C
-    };
-    const GREATEST: i32 = (16 << HIGH) - 1 - C;
+impl<const LOW: u32, const HIGH: u32, const C: i32, const LEAST: i32, const GREATEST: i32> Codes
+    for Planes<LOW, HIGH, Offset<C>, LEAST, GREATEST>
+{
+    const LEAST: i32 = Self::DOMAIN.0;
+    const GREATEST: i32 = Self::DOMAIN.1;
 
     #[inline(always)]
     unsafe fn values(at: At) -> [i8; PACKET] {
         let raw = unsafe { Self::raw(at) };
         let mut values = [0i8; PACKET];
         for i in 0..PACKET {
-            values[i] = (i32::from(raw[i]) + Self::LEAST) as i8;
+            values[i] = (i32::from(raw[i]) - C) as i8;
         }
         values
     }
@@ -681,7 +696,7 @@ impl<const HIGH: u32, const C: i32> Codes for Planes<4, HIGH, Offset<C>> {
     #[inline(always)]
     unsafe fn neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
         use std::arch::aarch64::*;
-        let offset = unsafe { vdupq_n_s8(-Self::LEAST as i8) };
+        let offset = unsafe { vdupq_n_s8(C as i8) };
         unsafe { Self::raw_neon(at) }.map(|codes| unsafe { vsubq_s8(codes, offset) })
     }
 
@@ -689,7 +704,7 @@ impl<const HIGH: u32, const C: i32> Codes for Planes<4, HIGH, Offset<C>> {
     #[inline(always)]
     unsafe fn x86(at: At) -> std::arch::x86_64::__m256i {
         use std::arch::x86_64::*;
-        let offset = _mm256_set1_epi8(-Self::LEAST as i8);
+        let offset = _mm256_set1_epi8(C as i8);
         unsafe { _mm256_sub_epi8(Self::raw_x86(at), offset) }
     }
 
@@ -700,9 +715,27 @@ impl<const HIGH: u32, const C: i32> Codes for Planes<4, HIGH, Offset<C>> {
     }
 }
 
-impl<const ID: usize> Codes for Planes<4, 0, Table<ID>> {
-    const LEAST: i32 = Table::<ID>::LEAST as i32;
-    const GREATEST: i32 = Table::<ID>::GREATEST as i32;
+impl<const ID: usize, const LEAST: i32, const GREATEST: i32>
+    Planes<4, 0, Table<ID>, LEAST, GREATEST>
+{
+    /// The codebook shifted to start at zero, as unsigned bytes.
+    #[cfg(target_arch = "x86_64")]
+    const SHIFTED: [i8; 16] = {
+        let mut shifted = [0i8; 16];
+        let mut i = 0;
+        while i < 16 {
+            shifted[i] = (Table::<ID>::VALUES[i] as i32 - LEAST) as u8 as i8;
+            i += 1;
+        }
+        shifted
+    };
+}
+
+impl<const ID: usize, const LEAST: i32, const GREATEST: i32> Codes
+    for Planes<4, 0, Table<ID>, LEAST, GREATEST>
+{
+    const LEAST: i32 = Self::DOMAIN.0;
+    const GREATEST: i32 = Self::DOMAIN.1;
 
     #[inline(always)]
     unsafe fn values(at: At) -> [i8; PACKET] {
@@ -732,31 +765,31 @@ impl<const ID: usize> Codes for Planes<4, 0, Table<ID>> {
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn x86_shifted(at: At) -> std::arch::x86_64::__m256i {
-        unsafe { packed_x86::lookup(packed_x86::table(&Table::<ID>::SHIFTED), Self::raw_x86(at)) }
+        unsafe { packed_x86::lookup(packed_x86::table(&Self::SHIFTED), Self::raw_x86(at)) }
     }
 }
 
-impl Codes for Planes<8, 0, Twos> {
-    const LEAST: i32 = i8::MIN as i32;
-    const GREATEST: i32 = i8::MAX as i32;
+impl<const LEAST: i32, const GREATEST: i32> Codes for Planes<8, 0, Twos, LEAST, GREATEST> {
+    const LEAST: i32 = Self::DOMAIN.0;
+    const GREATEST: i32 = Self::DOMAIN.1;
 
     #[inline(always)]
     unsafe fn values(at: At) -> [i8; PACKET] {
-        unsafe { read(Self::bytes(at)) }
+        unsafe { read(Self::low_bytes(at)) }
     }
 
     #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
     #[inline(always)]
     unsafe fn neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
         use std::arch::aarch64::*;
-        let bytes = unsafe { Self::bytes(at) }.cast::<i8>();
+        let bytes = unsafe { Self::low_bytes(at) }.cast::<i8>();
         unsafe { [vld1q_s8(bytes), vld1q_s8(bytes.add(16))] }
     }
 
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn x86(at: At) -> std::arch::x86_64::__m256i {
-        unsafe { packed_x86::load(Self::bytes(at).cast()) }
+        unsafe { packed_x86::load(Self::low_bytes(at).cast()) }
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -767,44 +800,38 @@ impl Codes for Planes<8, 0, Twos> {
     }
 }
 
-impl Planes<8, 0, Twos> {
-    /// The packet's 32 code bytes.
-    #[inline(always)]
-    unsafe fn bytes(at: At) -> *const u8 {
-        unsafe { at.plane(RowPlaneRole::Codes).add(PACKET * at.packet) }
-    }
-}
-
 /// Grid codes (`registry::GridCodes`): `BYTES`-byte entries of grid `GRID`
 /// (its position in `tables::GRIDS`), one per eight values, each holding
 /// `8 / lanes` `INDEX_BITS`-bit point indices, first lowest, then seven sign
 /// bits completed by an eighth of even parity. The value at lane `j` of an
-/// entry is byte `j % lanes` of its point `j / lanes`, negated by sign `j`.
+/// entry is byte `j % lanes` of its point `j / lanes`, negated by sign `j`;
+/// the values are the registry's code domain `LEAST..=GREATEST`
+/// (`DecodeAxes::codes`).
 #[derive(Clone, Copy, Debug)]
-pub struct Grid<const GRID: usize, const INDEX_BITS: u32, const BYTES: usize>;
+pub struct Grid<
+    const GRID: usize,
+    const INDEX_BITS: u32,
+    const BYTES: usize,
+    const LEAST: i32,
+    const GREATEST: i32,
+>;
 
-impl<const GRID: usize, const INDEX_BITS: u32, const BYTES: usize> Grid<GRID, INDEX_BITS, BYTES> {
+impl<
+        const GRID: usize,
+        const INDEX_BITS: u32,
+        const BYTES: usize,
+        const LEAST: i32,
+        const GREATEST: i32,
+    > Grid<GRID, INDEX_BITS, BYTES, LEAST, GREATEST>
+{
     const POINTS: tables::GridPoints = tables::GRIDS[GRID].points;
-    /// The greatest magnitude of a point lane.
-    const MAGNITUDE: i32 = {
-        let mut greatest = 0u8;
-        let mut index = 0;
-        while index < Self::POINTS.len() {
-            let mut lane = 0;
-            while lane < Self::POINTS.lanes() {
-                let byte = Self::POINTS.byte(index, lane);
-                if byte > greatest {
-                    greatest = byte;
-                }
-                lane += 1;
-            }
-            index += 1;
-        }
+    /// The code domain: signed magnitudes below 128 (`grid_values`).
+    const DOMAIN: (i32, i32) = {
         assert!(
-            greatest <= i8::MAX as u8,
+            -LEAST <= i8::MAX as i32 && GREATEST <= i8::MAX as i32,
             "grid magnitudes fit a signed byte"
         );
-        greatest as i32
+        (LEAST, GREATEST)
     };
 
     /// Entry `e` of the storage group of `at`.
@@ -833,11 +860,16 @@ fn grid_values(point: u64, signs: u32) -> [i8; 8] {
         .map(|byte| byte as i8)
 }
 
-impl<const GRID: usize, const INDEX_BITS: u32, const BYTES: usize> Codes
-    for Grid<GRID, INDEX_BITS, BYTES>
+impl<
+        const GRID: usize,
+        const INDEX_BITS: u32,
+        const BYTES: usize,
+        const LEAST: i32,
+        const GREATEST: i32,
+    > Codes for Grid<GRID, INDEX_BITS, BYTES, LEAST, GREATEST>
 {
-    const LEAST: i32 = -Self::MAGNITUDE;
-    const GREATEST: i32 = Self::MAGNITUDE;
+    const LEAST: i32 = Self::DOMAIN.0;
+    const GREATEST: i32 = Self::DOMAIN.1;
 
     #[inline(always)]
     unsafe fn values(at: At) -> [i8; PACKET] {
@@ -2255,25 +2287,39 @@ mod packed_neon {
         }
     }
 
-    /// Bit `i` of `mask` as the value 16 in byte `i`.
+    /// Bit `i` of `mask` as the value `2^LOW` in byte `i`.
     #[inline(always)]
-    fn high_bits(mask: u16) -> uint8x16_t {
+    fn high_bits<const LOW: u32>(mask: u16) -> uint8x16_t {
         const BITS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
         unsafe {
             let bytes = vcombine_u8(vdup_n_u8(mask as u8), vdup_n_u8((mask >> 8) as u8));
-            vandq_u8(vtstq_u8(bytes, vld1q_u8(BITS.as_ptr())), vdupq_n_u8(16))
+            vandq_u8(vtstq_u8(bytes, vld1q_u8(BITS.as_ptr())), vdupq_n_u8(1 << LOW))
         }
     }
 
-    /// A packet's codes in element order: codes 2i and 2i + 1 are the low
-    /// and high nibble of byte i, each joined with its bit of `high` (a
-    /// 1-bit high plane's packet word). Codes are at most 31, so they are
-    /// also signed bytes.
+    /// A packet's codes of a `LOW`-bit low plane (`4 LOW` bytes) in element
+    /// order: code `(8 / LOW) i + j` is bits `LOW j ..` of byte `i`, joined
+    /// with its bit of `high` (a 1-bit high plane's packet word) at bit
+    /// `LOW`. Codes are at most 31, so they are also signed bytes.
     ///
     /// # Safety
-    /// `bytes` addresses the packet's 16 code bytes.
+    /// `bytes` addresses the packet's `4 LOW` code bytes.
     #[inline(always)]
-    pub(super) unsafe fn nibbles(bytes: *const u8, high: u32) -> [int8x16_t; 2] {
+    pub(super) unsafe fn codes<const LOW: u32>(bytes: *const u8, high: u32) -> [int8x16_t; 2] {
+        const { assert!(matches!(LOW, 2 | 4), "a 2- or 4-bit low plane") };
+        unsafe {
+            if LOW == 4 {
+                nibbles(bytes, high)
+            } else {
+                crumbs(bytes, high)
+            }
+        }
+    }
+
+    /// [`codes`] of a 4-bit low plane: codes 2i and 2i + 1 are the low and
+    /// high nibble of byte i.
+    #[inline(always)]
+    unsafe fn nibbles(bytes: *const u8, high: u32) -> [int8x16_t; 2] {
         unsafe {
             let packed = vld1q_u8(bytes);
             let low = vandq_u8(packed, vdupq_n_u8(15));
@@ -2281,8 +2327,34 @@ mod packed_neon {
             let mut first = vzip1q_u8(low, upper);
             let mut second = vzip2q_u8(low, upper);
             if high != 0 {
-                first = vorrq_u8(first, high_bits(high as u16));
-                second = vorrq_u8(second, high_bits((high >> 16) as u16));
+                first = vorrq_u8(first, high_bits::<4>(high as u16));
+                second = vorrq_u8(second, high_bits::<4>((high >> 16) as u16));
+            }
+            [vreinterpretq_s8_u8(first), vreinterpretq_s8_u8(second)]
+        }
+    }
+
+    /// [`codes`] of a 2-bit low plane: codes 4i .. 4i + 4 are bits 0, 2, 4
+    /// and 6 of byte i, each byte spread to its four codes' lanes and
+    /// shifted right by the code's bit.
+    #[inline(always)]
+    unsafe fn crumbs(bytes: *const u8, high: u32) -> [int8x16_t; 2] {
+        const SPREAD: [[u8; 16]; 2] = [
+            [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3],
+            [4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7],
+        ];
+        const SHIFTS: [i8; 16] = [0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6];
+        unsafe {
+            let packed = vreinterpretq_u8_u64(vld1q_dup_u64(bytes.cast()));
+            let shifts = vld1q_s8(SHIFTS.as_ptr());
+            let three = vdupq_n_u8(3);
+            let [mut first, mut second] = SPREAD.map(|spread| {
+                let spread = vqtbl1q_u8(packed, vld1q_u8(spread.as_ptr()));
+                vandq_u8(vshlq_u8(spread, shifts), three)
+            });
+            if high != 0 {
+                first = vorrq_u8(first, high_bits::<2>(high as u16));
+                second = vorrq_u8(second, high_bits::<2>((high >> 16) as u16));
             }
             [vreinterpretq_s8_u8(first), vreinterpretq_s8_u8(second)]
         }
@@ -2455,22 +2527,44 @@ mod packed_x86 {
         }
     }
 
-    /// 16 packed bytes as 32 nibble codes in element order: codes 2i and
-    /// 2i + 1 are the low and high nibble of byte i.
+    /// A packet's `4 LOW` bytes of `LOW`-bit codes as 32 codes in element
+    /// order: code `(8 / LOW) i + j` is bits `LOW j ..` of byte `i`.
     #[inline(always)]
-    pub(super) unsafe fn nibbles(bytes: *const u8) -> __m256i {
+    pub(super) unsafe fn codes<const LOW: u32>(bytes: *const u8) -> __m256i {
+        const { assert!(matches!(LOW, 2 | 4), "a 2- or 4-bit low plane") };
         unsafe {
-            let packed = _mm_loadu_si128(bytes.cast());
-            let mask = _mm_set1_epi8(15);
-            let low = _mm_and_si128(packed, mask);
-            let high = _mm_and_si128(_mm_srli_epi16::<4>(packed), mask);
-            _mm256_set_m128i(_mm_unpackhi_epi8(low, high), _mm_unpacklo_epi8(low, high))
+            if LOW == 4 {
+                let packed = _mm_loadu_si128(bytes.cast());
+                let mask = _mm_set1_epi8(15);
+                let low = _mm_and_si128(packed, mask);
+                let high = _mm_and_si128(_mm_srli_epi16::<4>(packed), mask);
+                _mm256_set_m128i(_mm_unpackhi_epi8(low, high), _mm_unpacklo_epi8(low, high))
+            } else {
+                // Codes 4i..4i + 4 of byte i: its pairs of bits at 0, 2, 4
+                // and 6, interleaved byte by byte, then pair by pair.
+                let packed = _mm_loadl_epi64(bytes.cast());
+                let three = _mm_set1_epi8(3);
+                let pairs = [
+                    _mm_and_si128(packed, three),
+                    _mm_and_si128(_mm_srli_epi16::<2>(packed), three),
+                    _mm_and_si128(_mm_srli_epi16::<4>(packed), three),
+                    _mm_and_si128(_mm_srli_epi16::<6>(packed), three),
+                ];
+                let (first, second) = (
+                    _mm_unpacklo_epi8(pairs[0], pairs[1]),
+                    _mm_unpacklo_epi8(pairs[2], pairs[3]),
+                );
+                _mm256_set_m128i(
+                    _mm_unpackhi_epi16(first, second),
+                    _mm_unpacklo_epi16(first, second),
+                )
+            }
         }
     }
 
-    /// Bit `i` of `mask` as the value 16 in byte `i`.
+    /// Bit `i` of `mask` as the value `2^LOW` in byte `i`.
     #[inline(always)]
-    unsafe fn high_bits(mask: u32) -> __m256i {
+    unsafe fn high_bits<const LOW: u32>(mask: u32) -> __m256i {
         unsafe {
             let spread = _mm256_shuffle_epi8(
                 _mm256_set1_epi32(mask as i32),
@@ -2481,15 +2575,15 @@ mod packed_x86 {
             );
             let bits = _mm256_set1_epi64x(0x8040_2010_0804_0201u64 as i64);
             let set = _mm256_cmpeq_epi8(_mm256_and_si256(spread, bits), bits);
-            _mm256_and_si256(set, _mm256_set1_epi8(16))
+            _mm256_and_si256(set, _mm256_set1_epi8(1 << LOW))
         }
     }
 
-    /// A packet's nibble codes, each joined with its bit of `high` (a 1-bit
-    /// high plane's packet word).
+    /// A packet's `LOW`-bit codes ([`codes`]), each joined with its bit of
+    /// `high` (a 1-bit high plane's packet word) at bit `LOW`.
     #[inline(always)]
-    pub(super) unsafe fn nibbles1(bytes: *const u8, high: u32) -> __m256i {
-        unsafe { _mm256_or_si256(nibbles(bytes), high_bits(high)) }
+    pub(super) unsafe fn codes1<const LOW: u32>(bytes: *const u8, high: u32) -> __m256i {
+        unsafe { _mm256_or_si256(codes::<LOW>(bytes), high_bits::<LOW>(high)) }
     }
 
     /// A packet's codes under a 2-bit high plane: codes 2i and 2i + 1 join

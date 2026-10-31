@@ -55,10 +55,13 @@ pub enum Format {
     Iq2Xs,
     Iq3Xxs,
     Iq2Xxs,
+    /// GGUF Q2_K and TQ2_0 (2-bit codes, representations of their own).
+    Q2K,
+    Tq2_0,
 }
 
 impl Format {
-    pub const ALL: [Format; 15] = [
+    pub const ALL: [Format; 17] = [
         Format::Q4K,
         Format::Q5K,
         Format::Q6K,
@@ -74,6 +77,8 @@ impl Format {
         Format::Iq2Xs,
         Format::Iq3Xxs,
         Format::Iq2Xxs,
+        Format::Q2K,
+        Format::Tq2_0,
     ];
     pub fn external(self) -> &'static str {
         match self {
@@ -91,6 +96,8 @@ impl Format {
             Format::Iq2Xs => "gguf_iq2_xs",
             Format::Iq3Xxs => "gguf_iq3_xxs",
             Format::Iq2Xxs => "gguf_iq2_xxs",
+            Format::Q2K => "gguf_q2_k",
+            Format::Tq2_0 => "gguf_tq2_0",
         }
     }
     /// The GGUF tensor type this format's weights are stored as.
@@ -111,6 +118,8 @@ impl Format {
             Format::Iq2Xs => Encoding::Iq2Xs,
             Format::Iq3Xxs => Encoding::Iq3Xxs,
             Format::Iq2Xxs => Encoding::Iq2Xxs,
+            Format::Q2K => Encoding::Q2K,
+            Format::Tq2_0 => Encoding::Tq2_0,
         }
     }
     pub fn representation(self) -> &'static str {
@@ -130,6 +139,8 @@ impl Format {
             Format::Iq2Xs => "iq2xs",
             Format::Iq3Xxs => "iq3xxs",
             Format::Iq2Xxs => "iq2xxs",
+            Format::Q2K => "q2k",
+            Format::Tq2_0 => "q2g256",
         }
     }
     /// Whether the CUDA GEMM keeps this format's codes exact and scales its
@@ -228,6 +239,18 @@ impl Format {
                 // grid indices and a sign-and-scale word.
                 block.extend(f16(rng.uniform(0.0002, 0.001)));
                 block.extend((0..64).map(|_| rng.byte()));
+            }
+            Format::Q2K => {
+                // Sixteen scale-and-minimum bytes, 64 code bytes, then d
+                // (values reach d * 15 * 3) and dmin.
+                block.extend((0..16 + 64).map(|_| rng.byte()));
+                block.extend(f16(rng.uniform(0.0002, 0.001)));
+                block.extend(f16(rng.uniform(0.0002, 0.001)));
+            }
+            Format::Tq2_0 => {
+                // 64 code bytes, then d (values reach 2 d).
+                block.extend((0..64).map(|_| rng.byte()));
+                block.extend(f16(rng.uniform(0.005, 0.02)));
             }
         }
         block

@@ -7,9 +7,9 @@
 // high plane, or its four grid entries; its local coefficient codes and its
 // factors). A packet is consumed in four 8-element sub-steps. Each sub-step
 // decodes its codes as exact small integers in two vec4s, `even` (elements
-// 0,2,4,6) and `odd` (1,3,5,7), by splitting code bytes on nibble
-// boundaries: every decoded code is an exact integer, so the decode has no
-// rounding or subnormal case.
+// 0,2,4,6) and `odd` (1,3,5,7), by splitting code bytes on nibble (or
+// 2-bit) boundaries: every decoded code is an exact integer, so the decode
+// has no rounding or subnormal case.
 //
 // A packet's logical value is `scale(g) * (code - offset)`, plus a stored
 // bias(g), for its coefficient group g, with one F32 rounding
@@ -188,7 +188,7 @@ struct packets_rows16 {
 // staged GEMM to 32 bytes of local memory instead of 16 and slowed it 3%
 // (NVIDIA GB10, driver 580.159.03).
 struct packets_packet {
-    uvec4 low;       // the low plane's codes (8-bit: the first 16) or the grid entries
+    uvec4 low;       // the low plane's codes (8-bit: the first 16; 2-bit: .xy) or the grid entries
     uvec4 second;    // 8-bit codes: the last 16
     uvec2 high;      // the high plane's codes: one bit in .x, two in .xy
     float scale0;    // the scales of the packet's (one or two) coefficient groups
@@ -233,14 +233,15 @@ void packets_set_group(inout packets_packet packet, uint g, float scale, const b
 // high plane of HIGH, a code's bits one byte of four (`packets_codes`), or a
 // grid code's entries: four of LOW bits a packet.
 
-// The code planes this file reads: 4-bit low planes with up to two high
-// bits, 8-bit low planes, and 16- or 24-bit grid entries.
+// The code planes this file reads: 2- and 8-bit low planes, 4-bit low
+// planes with up to two high bits, and 16- or 24-bit grid entries.
 #define PACKETS_READS_PLANES(AXES) (AXES(SEISMIC_AXIS_FORM) != SEISMIC_FORM_ROWS \
     || (AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) == 0 \
         && (AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 16 || AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 24)) \
     || (AXES(SEISMIC_AXIS_CODES) != SEISMIC_CODES_GRID \
         && ((AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 4 && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) <= 2) \
-            || (AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 8 && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) == 0))))
+            || ((AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 2 || AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 8) \
+                && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) == 0))))
 #if !PACKETS_ALL(PACKETS_READS_PLANES)
 #error "packets: a weight slot's code planes are of a width this file does not read"
 #endif
@@ -261,6 +262,15 @@ void packets_split_high1(uint field, out uint even, out uint odd) {
     even = (t & 0x01010101u) << 4;
     odd = (t & 0x02020202u) << 3;
 }
+
+#if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 2)
+// The same for a 16-bit field of 2-bit low codes, in bits 0..1.
+void packets_split_low2(uint field, out uint even, out uint odd) {
+    packets_split_high2(field, even, odd);
+    even >>= 4;
+    odd >>= 4;
+}
+#endif
 
 vec4 packets_unsigned_bytes(uint word) { return vec4(unpack8(word)); }
 
@@ -678,6 +688,10 @@ packets_packet packets_load(const int kind, uint64_t row, packets_rows16 geometr
     // The packet's codes: 32 codes or 4 grid entries of `low` bits.
     const bool grid = PACKETS_AXIS(kind, SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID;
     const uint64_t codes = row + geometry.codes + uint64_t((grid ? 4u : 32u) * low / 8u) * p;
+#if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 2)
+    if (low == 2u)
+        packet.low.xy = element_uvec2_at(codes);
+#endif
 #if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 16)
     if (low == 16u)
         packet.low = uvec4(element_uvec2_at(codes), 0u, 0u);
@@ -747,6 +761,16 @@ void packets_decode(const int kind, packets_packet packet, uint step, const bool
         const vec4 b = packets_interpret(kind, words[base + 1u], centred);
         even = vec4(a.x, a.z, b.x, b.z);
         odd = vec4(a.y, a.w, b.y, b.w);
+        return;
+    }
+#endif
+#if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 2)
+    if (PACKETS_AXIS(kind, SEISMIC_AXIS_CODE_LOW_BITS) == 2) {
+        // A sub-step's codes are the 16 bits at bit 16 step of the packet's.
+        uint e, o;
+        packets_split_low2((packet.low[step >> 1] >> (16u * (step & 1u))) & 0xffffu, e, o);
+        even = packets_interpret(kind, e, centred);
+        odd = packets_interpret(kind, o, centred);
         return;
     }
 #endif

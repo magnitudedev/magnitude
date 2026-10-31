@@ -277,8 +277,9 @@ mod tests {
     use super::*;
 
     /// Metal's admissions of every representation it imports, as main's
-    /// libraries matched their decoders' shapes: PACK (folds, centre,
-    /// offset, residue), INT8 and the matrix GEMV product.
+    /// libraries matched their decoders' shapes (and, for q4g32, q2k and
+    /// q2g256, as the same rules admit them): PACK (folds, centre, offset,
+    /// residue), INT8 and the matrix GEMV product.
     #[test]
     fn metal_admissions_are_mains() {
         let pack = |folds, centre, offset, residue| {
@@ -305,6 +306,9 @@ mod tests {
             ("iq2xs", None, false, None),
             ("iq3xxs", None, false, None),
             ("iq2xxs", None, false, None),
+            ("q4g32", pack(1, 8, 0, false), false, None),
+            ("q2k", None, false, None),
+            ("q2g256", None, false, None),
         ];
         for (storage, packing, int8, matrix) in expected {
             let id = registry::storage(storage, registry::Layout::Rows32).unwrap();

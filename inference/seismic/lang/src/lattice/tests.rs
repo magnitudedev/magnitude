@@ -996,12 +996,15 @@ fn assert_mixed_moves_are_adjacent(stored: &Stored, packets: &[u8], decoded: &[V
         code.up > 0 && code.down > 0 && code.interior > 0,
         "`{name}`: {code:?}"
     );
-    for tally in tallies {
-        assert!(
-            tally.up + tally.down + tally.blocked + tally.off_lattice < tally.values,
-            "`{name}`: every entry drew a move"
-        );
-    }
+    // The dither leaves entries unmoved: over the representation's entries,
+    // since a plane of a few entries (a scale per 256 values) may draw a
+    // move for each.
+    let moved: u64 = tallies
+        .iter()
+        .map(|tally| tally.up + tally.down + tally.blocked + tally.off_lattice)
+        .sum();
+    let values: u64 = tallies.iter().map(|tally| tally.values).sum();
+    assert!(moved < values, "`{name}`: every entry drew a move");
 }
 
 #[test]
