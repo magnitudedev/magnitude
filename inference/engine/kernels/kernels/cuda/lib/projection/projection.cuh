@@ -2165,11 +2165,16 @@ __device__ __forceinline__ void gemm_segment_s8(u8 *shared, const QuantizedRows 
 // Act; either matrix tile band can consume exact semantic operands, explicitly
 // admitted S8 activations, or a separately admitted materialized F16 operand
 // view. The common producer owns the selected representation and its group
-// metadata. S8 multiplies packed codes, so dense weights retain the semantic
-// path rather than silently quantizing their activations, and weights that
-// take NVFP4 operand rows keep the rows their recipe defines.
-template <class... W>
-constexpr bool quantizable = ((!W::DENSE && !packets::nvfp4_operands<W>::value) && ...);
+// metadata. S8 multiplies packed codes as int8: a configuration selects it
+// (INT8 = 1) only where every weight it multiplies is admitted to the int8
+// GEMM (`ADMITTED`, the slots' `form(W, INT8)`), which its declaration's
+// `where` requires.
+// A function, not a class's constant: a static data member takes a slot of
+// the module's global constant bank, which moves every table after it.
+template <unsigned INT8, bool... ADMITTED> __host__ __device__ constexpr bool int8_path() {
+    static_assert(INT8 == 0 || (ADMITTED && ...), "INT8 = 1 names the int8 GEMM of weights admitted to it");
+    return INT8 == 1;
+}
 
 // A selected materialized operand view owns its storage even when its type
 // equals semantic Act. Its producer must write every row; in-place eligibility

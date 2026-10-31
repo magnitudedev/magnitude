@@ -16,26 +16,121 @@
 //! A form's arithmetic requirements change only with the form, and its
 //! producer's reach only with the library's producers.
 //!
-//! Native declarations read the same admission (`form(W, NAME)`), so a
-//! configuration names only forms its weights take.
+//! Native declarations read the same admission (`form(W, NAME)`, a
+//! [`Form`]), so a configuration names only forms its weights take.
 
 use crate::ids::RepresentationId;
-use crate::registry::{self, BackendName};
+use crate::registry::{self, BackendName, OperandRecipe};
 use crate::registry::profile::{Bias, LocalScale, Profile, ValueMap};
+
+/// CUDA's forms, in emission order: the folded GEMM recipe (`GEMM_FOLD`)
+/// and the int8 GEMM (`INT8`). [`cuda_forms`] values them in this order.
+const CUDA_FORMS: [&str; 2] = ["GEMM_FOLD", "INT8"];
+
+/// Metal's forms, in emission order (`packets::Forms`). [`metal_forms`]
+/// values them in this order.
+const METAL_FORMS: [&str; 8] = [
+    "PACK",
+    "PACK_CENTRE",
+    "PACK_OFFSET",
+    "PACK_RESIDUE",
+    "INT8",
+    "MATRIX_CODES",
+    "MATRIX_RUNS",
+    "MATRIX_SYMMETRIC",
+];
+
+/// The names of `backend`'s forms, in emission order.
+pub fn names(backend: BackendName) -> &'static [&'static str] {
+    match backend {
+        BackendName::Cuda => &CUDA_FORMS,
+        BackendName::Metal => &METAL_FORMS,
+        BackendName::Cpu | BackendName::Vulkan => &[],
+    }
+}
+
+/// The values of `backend`'s forms for representation `id`, in the order of
+/// [`names`]; `None` for storage other than packed rows, which has none.
+fn values(backend: BackendName, id: RepresentationId) -> Option<Vec<u32>> {
+    let info = registry::representation_info(id);
+    let (registry::RepresentationKind::PackedRows(rows), Some(axes)) = (&info.kind, registry::decode_axes(id))
+    else {
+        return None;
+    };
+    Some(match backend {
+        BackendName::Cuda => cuda_forms(&axes, rows, info.operands).to_vec(),
+        BackendName::Metal => metal_forms(&axes).to_vec(),
+        BackendName::Cpu | BackendName::Vulkan => Vec::new(),
+    })
+}
 
 /// The forms admitted for representation `id` on `backend`, in emission
 /// order, with their values; none for storage other than packed rows.
 pub fn forms(backend: BackendName, id: RepresentationId) -> Vec<(&'static str, u32)> {
-    let (registry::RepresentationKind::PackedRows(rows), Some(axes)) =
-        (&registry::representation_info(id).kind, registry::decode_axes(id))
-    else {
-        return Vec::new();
-    };
-    match backend {
-        BackendName::Cuda => vec![("GEMM_FOLD", u32::from(cuda_gemm_fold(&axes, rows)))],
-        BackendName::Metal => metal_forms(&axes),
-        BackendName::Cpu | BackendName::Vulkan => Vec::new(),
+    values(backend, id).map_or_else(Vec::new, |values| names(backend).iter().copied().zip(values).collect())
+}
+
+/// One of a backend's forms, as a native declaration of that backend names
+/// it (`form(W, NAME)`): only a name of [`names`] is represented, so its
+/// value is defined for every representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "(BackendName, String)", into = "(BackendName, String)")]
+pub struct Form {
+    backend: BackendName,
+    /// Its position in `names(backend)`.
+    index: usize,
+}
+
+impl Form {
+    /// Form `name` of `backend`, or `None` when the backend has no form of
+    /// that name.
+    pub fn named(backend: BackendName, name: &str) -> Option<Self> {
+        let index = names(backend).iter().position(|candidate| *candidate == name)?;
+        Some(Self { backend, index })
     }
+
+    pub fn name(self) -> &'static str {
+        names(self.backend)[self.index]
+    }
+
+    /// The form's admitted value for representation `id` (`forms`): 0 for
+    /// storage other than packed rows, which has no forms.
+    pub fn of(self, id: RepresentationId) -> u32 {
+        values(self.backend, id).map_or(0, |values| values[self.index])
+    }
+
+    /// Every value the form takes over the registry's representations, in
+    /// increasing order.
+    pub fn values(self) -> Vec<u32> {
+        let values = registry::representations()
+            .iter()
+            .map(|info| self.of(info.id))
+            .collect::<std::collections::BTreeSet<_>>();
+        values.into_iter().collect()
+    }
+}
+
+impl TryFrom<(BackendName, String)> for Form {
+    type Error = String;
+
+    fn try_from((backend, name): (BackendName, String)) -> Result<Self, Self::Error> {
+        Self::named(backend, &name).ok_or_else(|| format!("`{}` has no form `{name}`", backend.as_str()))
+    }
+}
+
+impl From<Form> for (BackendName, String) {
+    fn from(form: Form) -> Self {
+        (form.backend, form.name().to_owned())
+    }
+}
+
+/// CUDA's forms of a packed-rows weight, in the order of [`CUDA_FORMS`].
+fn cuda_forms(
+    axes: &registry::DecodeAxes,
+    rows: &registry::PackedRowLayout,
+    operands: OperandRecipe,
+) -> [u32; CUDA_FORMS.len()] {
+    [u32::from(cuda_gemm_fold(axes, rows)), u32::from(cuda_int8(axes, operands))]
 }
 
 /// Whether CUDA's GEMM multiplies the weight's exact codes and applies each
@@ -70,24 +165,43 @@ pub fn cuda_gemm_fold_of(id: RepresentationId) -> bool {
     }
 }
 
-/// Metal's forms (`packets::Forms`): the token-packing GEMM with its codes'
+/// Whether CUDA's int8 GEMM (`gemm_tile_s8`, a declaration's `INT8 = 1`)
+/// takes the weight: it multiplies the weight's codes as s8 against the
+/// activations it quantizes per 32 codes, one m16n8k32 MMA per 32 codes
+/// into an exact int32 product, and folds each product under its group's
+/// coefficients.
+///
+/// Its arithmetic requires integer codes of `i8`; groups of 16 codes (half
+/// an MMA each) or of 32 and more (whole MMAs); and activations it
+/// quantizes itself, so not a weight whose products take NVFP4 operand
+/// rows, which its recipe defines (`OperandRecipe`).
+///
+/// Its producer delivers every packed-rows weight's codes as s8
+/// (`packets::Packed::s8`, `packets::Records::s8`).
+fn cuda_int8(axes: &registry::DecodeAxes, operands: OperandRecipe) -> bool {
+    let profile = axes.profile();
+    let group = profile.local.group;
+    profile.codes.fits_i8() && (group == 16 || group >= 32) && operands != OperandRecipe::Nvfp4Rows
+}
+
+/// Metal's forms (`packets::Forms`), in the order of [`METAL_FORMS`]: the token-packing GEMM with its codes'
 /// entry (`PACK`, `PACK_CENTRE`, `PACK_OFFSET`, `PACK_RESIDUE`; 0 where not
 /// admitted), the int8 GEMM (`INT8`) and the matrix GEMV, by one of its
 /// three products or none (`MATRIX_CODES`, `MATRIX_RUNS`,
 /// `MATRIX_SYMMETRIC`). Each admits the weight on any device; whether a
 /// device runs the form (tensor operations) is the library's condition.
-fn metal_forms(axes: &registry::DecodeAxes) -> Vec<(&'static str, u32)> {
+fn metal_forms(axes: &registry::DecodeAxes) -> [u32; METAL_FORMS.len()] {
     let packing = metal_packing(axes);
     let matrix = metal_matrix(axes);
-    vec![
-        ("PACK", u32::from(packing.is_some())),
-        ("PACK_CENTRE", packing.map_or(0, |packing| packing.centre)),
-        ("PACK_OFFSET", packing.map_or(0, |packing| packing.offset)),
-        ("PACK_RESIDUE", packing.map_or(0, |packing| u32::from(packing.residue))),
-        ("INT8", u32::from(metal_int8(axes))),
-        ("MATRIX_CODES", u32::from(matrix == Some(MetalMatrix::Codes))),
-        ("MATRIX_RUNS", u32::from(matrix == Some(MetalMatrix::Runs))),
-        ("MATRIX_SYMMETRIC", u32::from(matrix == Some(MetalMatrix::Symmetric))),
+    [
+        u32::from(packing.is_some()),
+        packing.map_or(0, |packing| packing.centre),
+        packing.map_or(0, |packing| packing.offset),
+        packing.map_or(0, |packing| u32::from(packing.residue)),
+        u32::from(metal_int8(axes)),
+        u32::from(matrix == Some(MetalMatrix::Codes)),
+        u32::from(matrix == Some(MetalMatrix::Runs)),
+        u32::from(matrix == Some(MetalMatrix::Symmetric)),
     ]
 }
 
@@ -296,6 +410,49 @@ mod tests {
         for (storage, fold) in expected {
             let id = registry::storage(storage, registry::Layout::Mma16).unwrap();
             assert_eq!(cuda_gemm_fold_of(id), fold, "{storage}");
+        }
+    }
+
+    /// CUDA's int8 GEMM admission of every representation it imports: main's
+    /// library took the INT8 path for every packed weight whose products do
+    /// not take NVFP4 operand rows (`projection::quantizable`), and so does
+    /// the admission, of every packed-rows representation of the registry.
+    #[test]
+    fn cuda_int8_is_mains() {
+        let admitted = [
+            "q4k", "q5k", "q6k", "q8g32s", "iq4g32", "q4g32s", "iq4g32s", "q5g32s", "q5g32", "mxfp4g32", "nvfp4g16",
+            "iq2xs", "iq3xxs", "iq2xxs", "q4g32", "q2k", "q2g256",
+        ];
+        let excluded = ["nvfp4g16a4"];
+        let int8 = Form::named(BackendName::Cuda, "INT8").unwrap();
+        let expected = admitted.map(|storage| (storage, 1)).into_iter().chain(excluded.map(|storage| (storage, 0)));
+        for (storage, value) in expected {
+            let id = registry::storage(storage, registry::Layout::Mma16).unwrap();
+            assert_eq!(int8.of(id), value, "{storage}");
+        }
+        for info in registry::representations() {
+            let main = match info.kind {
+                registry::RepresentationKind::PackedRows(_) => u32::from(info.operands != OperandRecipe::Nvfp4Rows),
+                _ => 0,
+            };
+            assert_eq!(int8.of(info.id), main, "{}", info.name);
+        }
+    }
+
+    /// Every backend's forms are its names, valued for packed rows only.
+    #[test]
+    fn forms_are_named_by_their_backend() {
+        for backend in BackendName::ALL {
+            for info in registry::representations() {
+                let forms = forms(backend, info.id);
+                let packed = matches!(info.kind, registry::RepresentationKind::PackedRows(_));
+                let named = forms.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+                assert_eq!(named, if packed { names(backend).to_vec() } else { Vec::new() }, "{}", info.name);
+                for (name, value) in forms {
+                    assert_eq!(Form::named(backend, name).unwrap().of(info.id), value, "{} {name}", info.name);
+                }
+            }
+            assert_eq!(Form::named(backend, "INT9"), None);
         }
     }
 

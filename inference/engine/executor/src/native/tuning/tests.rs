@@ -382,7 +382,7 @@ fn stored_cpu_choice_accepts_device_owned_parameters() {
         .with_param("cpu.workers.1", 0);
     assert!(implementation.validate(&choice).is_err());
     assert!(
-        seismic::generated::native_specialization_valid::<shape_rows::Entry>(&device, &choice)
+        seismic::generated::native_specialization_valid::<shape_rows::Entry>(&device, &choice, &[])
             .unwrap()
     );
 }

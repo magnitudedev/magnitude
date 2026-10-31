@@ -114,7 +114,7 @@ __device__ __forceinline__ void project_gemm(const projection::u8 *staged, const
 template <unsigned INT8, unsigned OPERAND>
 __global__ void gated_delta_project_stage(SEISMIC_KERNEL_PARAMS) {
     seismic_dependency_start();
-    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1, packets::W2, packets::W3>;
+    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0), PACKETS_FORM_INT8(KERNEL_W1), PACKETS_FORM_INT8(KERNEL_W2), PACKETS_FORM_INT8(KERNEL_W3)>();
     using Operands = projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1, packets::W2, packets::W3>;
     projection::stage_projection_row<S8, Operands>(PROLOGUE, blockIdx.x, SEISMIC_DIM_M, SEISMIC_DIM_H, STAGING, GROUPS);
 }
@@ -144,7 +144,7 @@ __global__ void gated_delta_project_gemv16(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMM_SMALL
 template <unsigned INT8, unsigned OPERAND>
 __global__ void gated_delta_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1, packets::W2, packets::W3>;
+    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0), PACKETS_FORM_INT8(KERNEL_W1), PACKETS_FORM_INT8(KERNEL_W2), PACKETS_FORM_INT8(KERNEL_W3)>();
     const unsigned long long rows[4] = SEGMENT_ROWS;
     const Out out[4] = SEGMENT_OUT;
     project_gemm<projection::SmallGemm, S8, projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1, packets::W2, packets::W3>>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows, WEIGHTS,
@@ -155,7 +155,7 @@ __global__ void gated_delta_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMM
 template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
 __global__ void gated_delta_project_gemm(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1, packets::W2, packets::W3>;
+    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0), PACKETS_FORM_INT8(KERNEL_W1), PACKETS_FORM_INT8(KERNEL_W2), PACKETS_FORM_INT8(KERNEL_W3)>();
     const unsigned long long rows[4] = SEGMENT_ROWS;
     const Out out[4] = SEGMENT_OUT;
     project_gemm<projection::LargeGemm<ROTATE>, S8, projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1, packets::W2, packets::W3>>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows,

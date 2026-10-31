@@ -170,19 +170,17 @@ __device__ __forceinline__ void project_gemm(const projection::u8 *staged, const
     }
 }
 
-// The INT8 path needs every non-empty segment packed (an empty segment's
-// binding is irrelevant).
-#define QUANTIZABLE                                                                                       \
-    ((SEISMIC_DIM_Q == 0 || projection::quantizable<packets::W0>) &&                                      \
-     (SEISMIC_DIM_GR == 0 || projection::quantizable<packets::W1>) &&                                     \
-     (SEISMIC_DIM_K == 0 || projection::quantizable<packets::W2>) &&                                      \
-     (SEISMIC_DIM_V == 0 || projection::quantizable<packets::W3>))
+// The INT8 path multiplies every non-empty segment's weight (an empty
+// segment's binding is irrelevant).
+#define INT8_PATH(INT8)                                                                                   \
+    projection::int8_path<INT8, SEISMIC_DIM_Q == 0 || PACKETS_FORM_INT8(KERNEL_W0), SEISMIC_DIM_GR == 0 || PACKETS_FORM_INT8(KERNEL_W1), \
+                     SEISMIC_DIM_K == 0 || PACKETS_FORM_INT8(KERNEL_W2), SEISMIC_DIM_V == 0 || PACKETS_FORM_INT8(KERNEL_W3)>()
 
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_STAGE
 template <unsigned INT8, unsigned OPERAND>
 __global__ void attention_project_stage(SEISMIC_KERNEL_PARAMS) {
     seismic_dependency_start();
-    constexpr bool S8 = INT8 == 1 && QUANTIZABLE;
+    constexpr bool S8 = INT8_PATH(INT8);
     using Operands = projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1, packets::W2, packets::W3>;
     projection::stage_projection_row<S8, Operands>(PROLOGUE, blockIdx.x, SEISMIC_DIM_M, SEISMIC_DIM_D, STAGING, GROUPS);
 }
@@ -210,7 +208,7 @@ __global__ void attention_project_gemv16(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMM_SMALL
 template <unsigned INT8, unsigned OPERAND>
 __global__ void attention_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = INT8 == 1 && QUANTIZABLE;
+    constexpr bool S8 = INT8_PATH(INT8);
     project_gemm<projection::SmallGemm, S8, projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1, packets::W2, packets::W3>>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D,
                                              SEGMENTS, (unsigned)SEISMIC_PARAM_PROJECT_MODE);
 }
@@ -219,7 +217,7 @@ __global__ void attention_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMM
 template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
 __global__ void attention_project_gemm(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = INT8 == 1 && QUANTIZABLE;
+    constexpr bool S8 = INT8_PATH(INT8);
     project_gemm<projection::LargeGemm<ROTATE>, S8, projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1, packets::W2, packets::W3>>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D,
                                                        SEGMENTS, (unsigned)SEISMIC_PARAM_PROJECT_MODE);
 }

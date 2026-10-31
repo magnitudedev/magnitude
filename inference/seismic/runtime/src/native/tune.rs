@@ -3630,23 +3630,13 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         } = request;
         let backend = super::backend_name(&device.kind);
         let entry_name = super::entry_name(module, entry);
-        let mut implementation = super::device_defaults(
-            device,
-            super::on_device(
-                device,
-                module
-                    .native_implementation(entry, backend)
-                    .cloned()
-                    .ok_or_else(|| {
-                        TuneError::Declaration(format!(
-                            "`{entry_name}` has no native implementation for `{}`",
-                            backend.as_str()
-                        ))
-                    })?,
-            ),
-            &bindings,
-        );
-        implementation = implementation.at_elements(&bindings);
+        let mut implementation =
+            super::offered(device, module, entry, &bindings).ok_or_else(|| {
+                TuneError::Declaration(format!(
+                    "`{entry_name}` has no native implementation for `{}`",
+                    backend.as_str()
+                ))
+            })?;
         fix(&mut implementation, statics.params())?;
         widen(&mut implementation, domains)?;
         // Every configuration formed is this one entry at these bindings.
@@ -7191,21 +7181,14 @@ pub fn implementation_digest(
 ) -> Result<String, TuneError> {
     let backend = super::backend_name(&device.kind);
     let entry_name = super::entry_name(module, entry);
-    // The declaration as the device offers its defaults: a stored result is
-    // qualified against them.
-    let implementation = super::device_defaults(
-        device,
-        module
-            .native_implementation(entry, backend)
-            .cloned()
-            .ok_or_else(|| {
-                TuneError::Declaration(format!(
-                    "`{entry_name}` has no native implementation for `{}`",
-                    backend.as_str()
-                ))
-            })?,
-        bindings,
-    );
+    // The declaration at the bindings as the device offers its defaults: a
+    // stored result is qualified against them.
+    let implementation = super::offered(device, module, entry, bindings).ok_or_else(|| {
+        TuneError::Declaration(format!(
+            "`{entry_name}` has no native implementation for `{}`",
+            backend.as_str()
+        ))
+    })?;
     let implementation = &implementation;
     let default = implementation
         .default_specialization(statics)
@@ -7284,7 +7267,7 @@ pub fn kernel_digest(
         )
     };
     let implementation = module
-        .native_implementation(entry, backend)
+        .native_implementation_at(entry, backend, bindings)
         .ok_or_else(|| {
             declaration(format!(
                 "`{entry_name}` has no native implementation for `{}`",

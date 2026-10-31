@@ -165,7 +165,7 @@ native gated_delta_project for metal from "metal/gated_delta_project.metal":
 native gated_delta_project for cuda from "cuda/gated_delta_project.cu":
     static (H, PT, NM, NK, NV, W)
     params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1])
-    where H % 64 == 0 and (OPERAND == 0 or INT8 == 0)
+    where H % 64 == 0 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or (form(QW, INT8) == 1 and form(GW, INT8) == 1 and form(AW, INT8) == 1 and form(BW, INT8) == 1))
     scratch staged bytes (M * H * 2) when M > 1
     scratch groups bytes (M * H / 4) when INT8 == 1 and M > 16
     launch gated_delta_project_stage when M > 1:
