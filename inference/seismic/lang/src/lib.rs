@@ -15,6 +15,7 @@ pub mod checked;
 pub mod entry;
 pub mod expr;
 pub mod failure;
+pub mod forms;
 pub mod ids;
 pub mod registry;
 pub mod repack;

@@ -278,7 +278,7 @@ fn dense_output_cases(device: &Device, formats: &[Format], h: usize, f: usize, r
                 // GEMM's weight dequantization.
                 // A scaled-GEMM format's weights enter exactly: no
                 // dequantization slack.
-                let dequant = if format.scaled_gemm() {
+                let dequant = if format.resident().cuda_gemm_fold() {
                     vec![0.0; o * h]
                 } else {
                     dequant_bound(&x, &down.values, o, h, f, mapping)
@@ -389,7 +389,7 @@ fn cuda_gemm_row_bands_match_host_model() {
             let base: Vec<f32> = (0..m * f).map(|_| rng.uniform(-2.0, 2.0)).collect();
             let (x, _) = operand_rows(&values, k, mapping, Some(format));
             let (projected, magnitude) = project(&x, &down.values, o, f, k);
-            let dequant = if format.scaled_gemm() {
+            let dequant = if format.resident().cuda_gemm_fold() {
                 vec![0.0; o * f]
             } else {
                 dequant_bound(&x, &down.values, o, f, k, mapping)
