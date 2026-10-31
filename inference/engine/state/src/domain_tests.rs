@@ -476,6 +476,56 @@ fn relocation_moves_one_domain() {
     assert_eq!(state.history_ranges(WINDOW).len(), 1);
     drop(filler);
 }
+
+/// Two live forks of one checkpoint end at the same row of a partial page,
+/// whose next rows either could take first: each is blocked while the other
+/// ends there, the checkpoint blocks neither, and once one relocates the
+/// other grows in place. (Regression #237.)
+#[test]
+fn sibling_forks_ending_together_relocate_all_but_one() {
+    let Some(device) = cpu_device() else { return };
+    let mut store = windowed_store(device, 1024, 64, 1, 1024, 1);
+    store
+        .provision(
+            &[
+                RowDemand {
+                    domain: TOKEN,
+                    rows: 1024,
+                },
+                RowDemand {
+                    domain: WINDOW,
+                    rows: 1024,
+                },
+            ],
+            0,
+        )
+        .unwrap();
+    let checkpoint = commit(store.create().unwrap(), 10).checkpoint();
+    let only = checkpoint.fork();
+    assert!(only.blocked_tails().is_empty());
+    let sibling = checkpoint.fork();
+    assert_eq!(only.blocked_tails(), [TOKEN, WINDOW]);
+    assert_eq!(sibling.blocked_tails(), [TOKEN, WINDOW]);
+    assert!(OwnedStateAdvance::begin(sibling, 1).is_err());
+    let mut sibling = checkpoint.fork();
+    for domain in [TOKEN, WINDOW] {
+        sibling = OwnedTailRelocation::prepare(sibling, domain)
+            .ok()
+            .unwrap()
+            .commit();
+    }
+    assert!(sibling.blocked_tails().is_empty());
+    assert!(only.blocked_tails().is_empty());
+    let end = rows_of(&only.history_ranges(TOKEN))[9] + 1;
+    let only = commit(only, 1);
+    assert_eq!(
+        rows_of(&only.history_ranges(TOKEN))[10],
+        end,
+        "the last sibling grows in place"
+    );
+    let sibling = commit(sibling, 1);
+    drop((only, sibling, checkpoint));
+}
 #[test]
 fn shrink_and_census_cover_every_domain() {
     let Some(device) = cpu_device() else { return };

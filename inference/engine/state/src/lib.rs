@@ -170,7 +170,8 @@ pub struct PlaneBuffer {
 /// (see [`history_geometry`]). The rows after a history's end in its last
 /// page are never given to another history: its page holds a referenced
 /// row. A history whose last page is partial but whose next row another
-/// history took (a sibling fork) relocates that page's rows before it grows
+/// history took, or where another live history ends at the same row and may
+/// take it first (sibling forks), relocates that page's rows before it grows
 /// ([`OwnedTailRelocation`]). A history takes the free page that begins at
 /// its end when there is one; otherwise, as a fresh history does, the middle
 /// page of the largest run of free pages, leaving the pages before it for
@@ -270,15 +271,29 @@ impl Arena {
             .map_or(0, |&(start, count)| count.min(self.page_end(start) - start))
     }
 
-    /// Whether a history ending at `end` must relocate its last page before
-    /// it grows: the page has rows after its end, but another history took
-    /// the next one.
-    fn tail_blocked(&self, end: Option<usize>) -> bool {
+    /// Whether a history ending at `end` has a partial last page whose next
+    /// row another history took.
+    fn tail_taken(&self, end: Option<usize>) -> bool {
         end.is_some_and(|end| {
             end % self.page_rows != 0
                 && end < self.page_end(end - 1)
                 && self.in_place(Some(end)) == 0
         })
+    }
+
+    /// Whether history `id` must relocate its last page before it grows: the
+    /// page has rows after its end, but another history took the next one, or
+    /// another live history ends at the same row and may take it first
+    /// (sibling forks of one state, which a launch can grow together).
+    fn tail_blocked(&self, id: u64) -> bool {
+        let end = self.entries[&id].end();
+        self.tail_taken(end)
+            || end.is_some_and(|end| {
+                end % self.page_rows != 0
+                    && self.entries.iter().any(|(&other, entry)| {
+                        other != id && entry.live && entry.end() == Some(end)
+                    })
+            })
     }
 
     /// Rows a history ending at `end` can take (see [`Arena::claim`]).
@@ -468,7 +483,7 @@ impl Arena {
     /// pages. The caller has checked that its tail is not blocked and that
     /// `count <= self.claimable(after)`.
     fn claim(&mut self, after: Option<usize>, count: usize) -> Vec<(usize, usize)> {
-        debug_assert!(!self.tail_blocked(after));
+        debug_assert!(!self.tail_taken(after));
         let mut claimed = Vec::new();
         let mut remaining = count;
         let mut end = after;
@@ -2710,14 +2725,14 @@ impl StateStore {
         let ends = (0..self.domains.len())
             .map(|index| histories.and_then(|histories| histories[index].end()))
             .collect::<Vec<_>>();
-        if self
-            .domains
-            .iter()
-            .zip(&ends)
-            .any(|(domain, &end)| domain.arena.borrow().tail_blocked(end))
-        {
+        if histories.is_some_and(|histories| {
+            self.domains
+                .iter()
+                .zip(histories)
+                .any(|(domain, claims)| domain.arena.borrow().tail_blocked(claims.id))
+        }) {
             return Err(Error::Request(
-                "a history whose last page another history continued must relocate it before it grows"
+                "a history whose last page another history continued, or may continue first, must relocate it before it grows"
                     .into(),
             ));
         }
@@ -2933,7 +2948,9 @@ impl SequenceState {
 
     /// The domains whose partial last page this history must relocate
     /// before it grows, because another history (a sibling fork) continued
-    /// that page ([`OwnedTailRelocation`]).
+    /// that page or, live, ends there too and may continue it first
+    /// ([`OwnedTailRelocation`]). Siblings relocate one at a time, so the
+    /// last one left keeps growing in place.
     pub fn blocked_tails(&self) -> Vec<HistoryDomainId> {
         self.store
             .history_domains()
@@ -2941,7 +2958,7 @@ impl SequenceState {
                 self.store.domains[domain.0]
                     .arena
                     .borrow()
-                    .tail_blocked(self.claims[domain.0].end())
+                    .tail_blocked(self.claims[domain.0].id)
             })
             .collect()
     }
@@ -3776,9 +3793,9 @@ mod tests {
         assert_eq!(arena.available(), 0);
         assert_eq!(arena.claimable(Some(95)), 5);
         // A history whose next row another took must relocate its last page.
-        assert!(arena.tail_blocked(Some(12)));
-        assert!(!arena.tail_blocked(Some(15)));
-        assert!(!arena.tail_blocked(Some(20)));
+        assert!(arena.tail_taken(Some(12)));
+        assert!(!arena.tail_taken(Some(15)));
+        assert!(!arena.tail_taken(Some(20)));
     }
 
     #[test]
@@ -4364,12 +4381,15 @@ mod tests {
         assert!(
             !readable(&[&left, &right, &fork], &[&root, &branch]).contains(&parent.bank_index())
         );
+        // A live sibling ending where the fork does would contend for the
+        // rows it grows into; `branch` keeps `left`'s bank readable.
+        drop(left);
         let advance = OwnedStateAdvance::begin(fork, 1).ok().unwrap();
         let following = advance.bindings().following_bank;
         assert_ne!(following, ZERO_SEED_BANK);
-        assert!(!readable(&[&left, &right, &parent], &[&root, &branch]).contains(&following));
+        assert!(!readable(&[&right, &parent], &[&root, &branch]).contains(&following));
         drop(advance);
-        drop((left, right, parent, root, branch));
+        drop((right, parent, root, branch));
         assert_eq!(store.available_banks(), committed_extent(&store).1 - 1);
     }
 
@@ -4804,7 +4824,7 @@ mod tests {
                             if rows == 0 {
                                 continue;
                             }
-                            if arena.borrow().tail_blocked(history.end()) {
+                            if arena.borrow().tail_taken(history.end()) {
                                 // Relocate the last page (the copy itself is
                                 // the executor's): its rows move to a fresh
                                 // page's start.

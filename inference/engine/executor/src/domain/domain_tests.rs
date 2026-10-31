@@ -863,6 +863,53 @@ fn reservation_recomputes_row_demand_after_shared_tail_relocation() {
     );
 }
 
+/// Two requests continuing one checkpoint share its partial last page, whose
+/// free rows either could grow into. One launch advancing both relocates one
+/// tail first and grows the other in place. (Regression #237: neither tail
+/// read as blocked, the first advance took the rows, and the second failed
+/// with "target state capacity changed after availability check".)
+#[test]
+fn one_launch_advances_two_continuations_of_a_shared_tail() {
+    let Some((mut domain, mut bindings)) = fixture(None) else {
+        return;
+    };
+    let source = RequestId(81);
+    open(&mut domain, &mut bindings, source);
+    let flight = submit_reserved_target(&mut domain, bindings, vec![forward(source, 0)]);
+    let (pending, mut bindings) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    let checkpoint = domain.resume_state(source).unwrap();
+    let copies = [RequestId(82), RequestId(83)];
+    for copy in copies {
+        domain
+            .install_input(copy, PreparedModelInput::continuation_only())
+            .unwrap();
+        domain
+            .open_state(&mut bindings, copy, Some(&checkpoint))
+            .unwrap();
+    }
+    for copy in copies {
+        assert!(!domain.target[&copy].blocked_tails().is_empty());
+    }
+    let flight = submit_reserved_target(
+        &mut domain,
+        bindings,
+        copies.iter().map(|&copy| forward(copy, 1)).collect(),
+    );
+    let (pending, _bindings) = domain.finish_target(flight).unwrap();
+    assert_eq!(pending.len(), 2);
+    for outcome in pending {
+        domain
+            .reconcile(outcome, PhysicalDecision { accepted_rows: 1 })
+            .unwrap();
+    }
+    for copy in copies {
+        assert_eq!(domain.resume_state(copy).unwrap().target.position(), 2);
+    }
+}
+
 /// A cancelled completed request aborts and the bindings return; a device
 /// failure is returned as an error that consumes them.
 #[test]
