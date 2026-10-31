@@ -240,7 +240,10 @@ struct Mapping {
     int8: bool,
 }
 
-fn mappings(device: &seismic::Device, launches: Launches) -> Vec<Mapping> {
+/// The mappings `device` admits over `weights`: the INT8 candidate only where
+/// the weights take it (`Element::cuda_int8`, every weight a CUDA product
+/// multiplies; `Element::cpu_int8`, some weight of a CPU one).
+fn mappings(device: &seismic::Device, launches: Launches, weights: &[seismic::Element]) -> Vec<Mapping> {
     let split = |value| launches.split.then_some(entry("SPLIT", value));
     match device.backend() {
         seismic::BackendName::Metal => [
@@ -279,6 +282,7 @@ fn mappings(device: &seismic::Device, launches: Launches) -> Vec<Mapping> {
         .collect(),
         seismic::BackendName::Cuda => [(0, 4, 2), (1, 2, 1), (0, 4, 4)]
             .into_iter()
+            .filter(|(int8, _, _)| *int8 == 0 || weights.iter().all(seismic::Element::cuda_int8))
             .map(|(int8, ksplit, rotate)| Mapping {
                 params: [entry("INT8", int8), scoped("ROTATE", launches.cuda_gemm, rotate)]
                     .into_iter()
@@ -317,6 +321,7 @@ fn mappings(device: &seismic::Device, launches: Launches) -> Vec<Mapping> {
         .collect(),
         seismic::BackendName::Cpu => [(8, 0), (1, 1)]
             .into_iter()
+            .filter(|(_, int8)| *int8 == 0 || weights.iter().any(seismic::Element::cpu_int8))
             .map(|(rows, int8)| Mapping {
                 params: vec![entry("ROWS", rows), entry("INT8", int8)],
                 int8: int8 == 1,
@@ -842,7 +847,7 @@ fn native_project_rows_matches_host_reference() {
                         &[extent],
                         &scale.into_iter().collect::<Vec<_>>(),
                     );
-                    for mapping in mappings(device, launches) {
+                    for mapping in mappings(device, launches, &[seismic::Element::bf16()]) {
                         let label = format!(
                             "{:?} {} rows {rows} scale {scale:?} {:?}",
                             device.backend(),
@@ -920,7 +925,7 @@ fn native_dense_up_matches_host_reference() {
                     &[outputs],
                     &rows.iter().map(|r| *r as i32).collect::<Vec<_>>(),
                 );
-                for mapping in mappings(device, launches) {
+                for mapping in mappings(device, launches, &[seismic::Element::bf16()]) {
                     let label = format!(
                         "{:?} {name} rows {outputs} scale {scale} {:?}",
                         device.backend(),
@@ -993,7 +998,7 @@ fn native_short_conv_project_matches_host_reference() {
                     tensor(device, DType::F32, &[rows, h], &x),
                     tensor(device, DType::F32, &[h], &norm),
                 );
-                for mapping in mappings(device, launches) {
+                for mapping in mappings(device, launches, &[seismic::Element::bf16()]) {
                     let label = format!(
                         "{:?} {name} rows {rows} {:?}",
                         device.backend(),
@@ -1071,7 +1076,7 @@ fn native_per_layer_gate_matches_host_reference() {
                     tensor(device, DType::BF16, &[p, d], &gate),
                     tensor(device, DType::F32, &[rows, l, p], &inputs),
                 );
-                for mapping in mappings(device, launches) {
+                for mapping in mappings(device, launches, &[seismic::Element::bf16()]) {
                     let label = format!(
                         "{:?} {name} rows {rows} {:?}",
                         device.backend(),

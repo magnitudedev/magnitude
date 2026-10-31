@@ -74,15 +74,13 @@ pub(crate) fn scale_statics(
 
 /// The packing statics of a projection entry's weights: each named bound's
 /// port extent `scopes` share (`WeightPlan::bound`; 0 for a weight the
-/// entry does not read, `None`), and the `RESIDUE` parameter fixed at 1
-/// unless a bounded weight's codes take the residue.
+/// entry does not read, `None`).
 pub(crate) fn packing_statics(
     inputs: &ModelInputs<'_>,
     scopes: &[WeightScope],
     bounds: &[(&'static str, Option<WeightKind>)],
 ) -> Result<Vec<(&'static str, u64)>, String> {
-    let mut residue = false;
-    let mut statics = Vec::with_capacity(bounds.len() + 1);
+    let mut statics = Vec::with_capacity(bounds.len());
     for &(name, kind) in bounds {
         let Some(kind) = kind else {
             statics.push((name, 0));
@@ -93,7 +91,7 @@ pub(crate) fn packing_statics(
             .map(|&scope| inputs.packing(scope, kind))
             .collect::<Result<Vec<_>, _>>()?;
         packings.dedup();
-        let [(extent, takes_residue)] = packings[..] else {
+        let [extent] = packings[..] else {
             return Err(match packings.is_empty() {
                 true => "a tuning case needs at least one layer".into(),
                 false => format!(
@@ -101,11 +99,7 @@ pub(crate) fn packing_statics(
                 ),
             });
         };
-        residue |= takes_residue;
         statics.push((name, extent));
-    }
-    if !residue {
-        statics.push(("RESIDUE", 1));
     }
     Ok(statics)
 }

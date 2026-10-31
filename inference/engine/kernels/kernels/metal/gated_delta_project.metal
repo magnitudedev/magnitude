@@ -240,6 +240,12 @@ kernel void gated_delta_project_tall(RECURRENT_PROJECT_ARGUMENTS,
 #define RECURRENT_PROJECT_PACKED(SLOT)                                                  \
     projection::packing_serves<packets::SLOT, RECURRENT_PROJECT_PACKING::folds,         \
         RECURRENT_PROJECT_PACKING::residue>::value
+// PACK = 1 names the packed GEMM of the qkv or z weights, admitted to it (the
+// declaration's `where`).
+#define RECURRENT_PROJECT_PACKING_ADMITTED                                              \
+    static_assert(projection::packing_admitted<packets::W0>::value          \
+            || projection::packing_admitted<packets::W1>::value,                       \
+        "PACK = 1 names the packed GEMM of a segment of weights admitted to it")
 
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_PACK
 // RESIDUE: the operand's residue width for weights with residue bits.
@@ -249,7 +255,8 @@ kernel void gated_delta_project_pack(RECURRENT_PROJECT_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (RECURRENT_PROJECT_PACKING::folds == 0)
+    RECURRENT_PROJECT_PACKING_ADMITTED;
+    if constexpr (!projection::packing_forms)
         return;
     threadgroup float4 peaks[8];
     RECURRENT_PROJECT_OPERANDS;
@@ -271,6 +278,7 @@ kernel void gated_delta_project_pack(RECURRENT_PROJECT_ARGUMENTS,
 kernel void gated_delta_project_pack_coefficients(RECURRENT_PROJECT_ARGUMENTS,
     uint row [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
+    RECURRENT_PROJECT_PACKING_ADMITTED;
     RECURRENT_PROJECT_OPERANDS;
     RECURRENT_PROJECT_PACKING_SCRATCH;
     if (row < qkv_rows) {
@@ -289,6 +297,7 @@ kernel void gated_delta_project_packed(RECURRENT_PROJECT_ARGUMENTS,
     uint tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
+    RECURRENT_PROJECT_PACKING_ADMITTED;
     RECURRENT_PROJECT_OPERANDS;
     RECURRENT_PROJECT_PACKING_SCRATCH;
     const uint m = uint(SEISMIC_DIM_M), padded = (m + 127u) / 128u * 128u;
@@ -307,6 +316,7 @@ kernel void gated_delta_project_unpacked(RECURRENT_PROJECT_ARGUMENTS,
     uint2 tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
+    RECURRENT_PROJECT_PACKING_ADMITTED;
     RECURRENT_PROJECT_GEMM_SEGMENTS(64, 64, !RECURRENT_PROJECT_PACKED(W0), !RECURRENT_PROJECT_PACKED(W1));
 }
 #endif

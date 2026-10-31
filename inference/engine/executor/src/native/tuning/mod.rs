@@ -2215,15 +2215,10 @@ impl ModelInputs<'_> {
         Ok(weights::weight_plan(self.load, scope, kind)?.scale_extent())
     }
 
-    /// The planned packing of one weight role: its bound port's extent (0
-    /// without a bound) and whether a bounded weight's codes take the residue
-    /// (`planning::packing_residue`).
-    pub fn packing(&self, scope: WeightScope, kind: WeightKind) -> Result<(u64, bool), String> {
-        let plan = weights::weight_plan(self.load, scope, kind)?;
-        Ok((
-            plan.bound,
-            plan.bound > 0 && crate::planning::packing_residue(plan.resident),
-        ))
+    /// The planned packing bound of one weight role: its port's extent (0
+    /// without a bound).
+    pub fn packing(&self, scope: WeightScope, kind: WeightKind) -> Result<u64, String> {
+        Ok(weights::weight_plan(self.load, scope, kind)?.bound)
     }
 }
 

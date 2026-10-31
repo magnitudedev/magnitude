@@ -220,7 +220,7 @@ kernel void attention_output_pack(ATTENTION_OUTPUT_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (!projection::packing_codes<packets::W0>::available)
+    if constexpr (!projection::packing_path<packets::W0>())
         return;
     threadgroup float4 peaks[8];
     ATTENTION_OUTPUT_OPERANDS;
@@ -238,7 +238,7 @@ kernel void attention_output_pack(ATTENTION_OUTPUT_ARGUMENTS,
 kernel void attention_output_pack_coefficients(ATTENTION_OUTPUT_ARGUMENTS,
     uint row [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (!projection::packing_codes<packets::W0>::available)
+    if constexpr (!projection::packing_path<packets::W0>())
         return;
     ATTENTION_OUTPUT_OPERANDS;
     ATTENTION_OUTPUT_PACKING_SCRATCH;
@@ -252,7 +252,7 @@ kernel void attention_output_packed(ATTENTION_OUTPUT_ARGUMENTS,
     uint tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (!projection::packing_codes<packets::W0>::available)
+    if constexpr (!projection::packing_path<packets::W0>())
         return;
     ATTENTION_OUTPUT_OPERANDS;
     ATTENTION_OUTPUT_PACKING_SCRATCH;
@@ -262,14 +262,14 @@ kernel void attention_output_packed(ATTENTION_OUTPUT_ARGUMENTS,
 }
 #endif
 
-// PACK with weights that have no packed path: the staged tiles of the
-// default form, with its results.
+// PACK on a device without the packed path: the staged tiles of the default
+// form, with its results.
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_UNPACKED
 kernel void attention_output_unpacked(ATTENTION_OUTPUT_ARGUMENTS,
     uint3 tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (projection::packing_codes<packets::W0>::available)
+    if constexpr (projection::packing_path<packets::W0>())
         return;
     ATTENTION_OUTPUT_GEMM(64, 64, 1, partials);
 }

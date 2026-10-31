@@ -219,7 +219,7 @@ kernel void dense_output_quantize(DENSE_OUTPUT_ARGUMENTS,
     uint row [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (!projection::int8_codes<packets::W0>::available)
+    if constexpr (!projection::int8_path<packets::W0>())
         return;
     DENSE_OUTPUT_OPERANDS;
     DENSE_OUTPUT_INT8_SCRATCH;
@@ -231,7 +231,7 @@ kernel void dense_output_quantize(DENSE_OUTPUT_ARGUMENTS,
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_COEFFICIENTS
 kernel void dense_output_coefficients(DENSE_OUTPUT_ARGUMENTS,
     uint item [[thread_position_in_grid]]) {
-    if constexpr (!projection::int8_codes<packets::W0>::available)
+    if constexpr (!projection::int8_path<packets::W0>())
         return;
     DENSE_OUTPUT_OPERANDS;
     DENSE_OUTPUT_INT8_SCRATCH;
@@ -245,14 +245,14 @@ kernel void dense_output_int8(DENSE_OUTPUT_ARGUMENTS,
     uint3 tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
+    constexpr bool PATH = projection::int8_path<packets::W0>();
     // The default form's tile only where the launch takes that form:
     // threadgroup memory a kernel does not use still slows its products.
-    threadgroup float4 shared_words[projection::int8_codes<packets::W0>::available
-        ? 1 : projection::gemm_tile<64, 64>::bytes / 16];
+    threadgroup float4 shared_words[PATH ? 1 : projection::gemm_tile<64, 64>::bytes / 16];
     threadgroup uchar *shared = reinterpret_cast<threadgroup uchar *>(shared_words);
     DENSE_OUTPUT_OPERANDS;
     DENSE_OUTPUT_INT8_SCRATCH;
-    projection::gemm_int8<packets::W0, INT8_TILE>(in, out, w, scratch, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_H),
+    projection::gemm_int8<packets::W0, INT8_TILE, PATH>(in, out, w, scratch, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_H),
         uint(SEISMIC_DIM_F), tile.x, tile.y, shared, sg, lane);
 }
 #endif
@@ -271,7 +271,7 @@ kernel void dense_output_pack(DENSE_OUTPUT_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (!projection::packing_codes<packets::W0>::available)
+    if constexpr (!projection::packing_path<packets::W0>())
         return;
     threadgroup float4 peaks[8];
     DENSE_OUTPUT_OPERANDS;
@@ -290,7 +290,7 @@ kernel void dense_output_pack_coefficients(DENSE_OUTPUT_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (!projection::packing_codes<packets::W0>::available)
+    if constexpr (!projection::packing_path<packets::W0>())
         return;
     threadgroup float peaks[8];
     DENSE_OUTPUT_OPERANDS;
@@ -305,7 +305,7 @@ kernel void dense_output_packed(DENSE_OUTPUT_ARGUMENTS,
     uint tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (!projection::packing_codes<packets::W0>::available)
+    if constexpr (!projection::packing_path<packets::W0>())
         return;
     DENSE_OUTPUT_OPERANDS;
     DENSE_OUTPUT_PACKING_SCRATCH;
@@ -316,14 +316,14 @@ kernel void dense_output_packed(DENSE_OUTPUT_ARGUMENTS,
 }
 #endif
 
-// PACK with weights that have no packed path: the staged tiles of the
-// default form, with its results.
+// PACK on a device without the packed path: the staged tiles of the default
+// form, with its results.
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_UNPACKED
 kernel void dense_output_unpacked(DENSE_OUTPUT_ARGUMENTS,
     uint3 tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (projection::packing_codes<packets::W0>::available)
+    if constexpr (projection::packing_path<packets::W0>())
         return;
     DENSE_OUTPUT_GEMM(64, 64, 1, partials);
 }

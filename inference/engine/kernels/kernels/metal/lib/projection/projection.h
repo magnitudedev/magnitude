@@ -3743,9 +3743,10 @@ struct int8_scratch {
 // product takes the stored codes themselves, so its codes are unsigned 4-bit
 // codes under hierarchical coefficients (the local codes integers under the
 // factor) or two's complement 8-bit codes under direct ones, a scale per
-// block; none otherwise. The product is `available` for the weights the
-// runtime admits to it (`packets::Forms::int8`, `_FORM_INT8`) on a device
-// with tensor operations, where an admitted weight's codes have one.
+// block; none otherwise. An INT8 = 1 configuration names the product only
+// of weights the runtime admits to it (`packets::Forms::int8`, `_FORM_INT8`,
+// a declaration's `form(W, INT8)`), whose codes have one on a device with
+// tensor operations (`int8_path`).
 template <typename W>
 struct int8_admitted {
     static constant constexpr bool value = false;
@@ -3758,7 +3759,6 @@ template <typename W>
 struct int8_codes {
     static_assert(!SEISMIC_HAS_TENSOR_OPS || !int8_admitted<W>::value,
         "an admitted weight's codes enter the int8 product");
-    static constant constexpr bool available = false;
     static constant constexpr bool biased = false;
     static constant constexpr bool factored = false;
     static constant constexpr bool interleaved = false;
@@ -3774,7 +3774,6 @@ struct int8_codes<packets::Packet<packets::Planes<4, 0>, packets::Unsigned,
     typedef packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, packets::LocalUnsigned<LOCAL_BITS>, 32u, MIN, BIAS_SIGN, 0u> K;
     // Admitted where a factor of at most 16 bits times a byte code is exact
     // in F32.
-    static constant constexpr bool available = F::int8;
     static constant constexpr bool biased = MIN;
     static constant constexpr uint block_bytes = 16;
     // A lane's eight codes of one row and block are one 4-byte word: byte x
@@ -3814,7 +3813,6 @@ template <typename S, uint STORAGE, typename F>
 struct int8_codes<packets::Packet<packets::Planes<8, 0>, packets::Twos,
     packets::Direct<S, 32u, false, STORAGE, 0>, F>> {
     typedef packets::Direct<S, 32u, false, STORAGE, 0> K;
-    static constant constexpr bool available = F::int8;
     static constant constexpr bool biased = false;
     static constant constexpr uint block_bytes = 32;
     // A lane's eight codes of one row and block are eight bytes, in column
@@ -3840,6 +3838,22 @@ struct int8_codes<packets::Packet<packets::Planes<8, 0>, packets::Twos,
     }
 };
 #endif
+
+// Whether an INT8 launch over the weights W, V... runs the int8 products:
+// on a device with tensor operations; elsewhere it takes the staged 64 x 64
+// tiles of the default form, with their results. INT8 = 1 names the int8
+// GEMM only of weights admitted to it whose codes one quantized operand
+// serves (`form(W, INT8)`, `INT8_INTERLEAVED`), which the declaration's
+// `where` requires; only a configuration that runs a launch forms it.
+// A function, not a class's constant: a class's static data member is a
+// constant of the program, which moves what follows it.
+template <typename W, typename... V> constexpr bool int8_path() {
+    static_assert(int8_admitted<W>::value && (int8_admitted<V>::value && ...),
+        "INT8 = 1 names the int8 GEMM of weights admitted to it");
+    static_assert(((int8_codes<V>::interleaved == int8_codes<W>::interleaved) && ...),
+        "INT8 = 1 names the int8 GEMM of weights one quantized operand serves");
+    return SEISMIC_HAS_TENSOR_OPS;
+}
 
 // The min-term product takes 32 blocks a run (the widest the operation
 // forms; a run's cost is nearly independent of its width): its operands are
@@ -4152,18 +4166,17 @@ inline uint int8_operand_row(int8_lane at, uint e) { return at.c + (e & 3u) + 16
 // `gemm_int8_products`, in one of two tile shapes (the grid's physical shape
 // decides the rate, so the shape is the launch's). TILE 128, grid
 // (ceil(M / 128), rows / 32): 128 rows by 32 weight rows. TILE 64, grid
-// (rows / 64, ceil(M / 64)): 64 x 64, a simdgroup a quarter each. Weights
-// without an int8 path, and devices without tensor
-// operations, run the staged 64 x 64 tiles of the default form instead, with
-// its results (the TILE 128 grid's threadgroups in order take them in order;
-// rows is a multiple of 64).
-template <typename W, uint TILE, typename In, typename Out>
+// (rows / 64, ceil(M / 64)): 64 x 64, a simdgroup a quarter each, where the
+// launch runs the int8 products (PATH, `int8_path`); otherwise the staged
+// 64 x 64 tiles of the default form, with its results (the TILE 128 grid's
+// threadgroups in order take them in order; rows is a multiple of 64).
+template <typename W, uint TILE, bool PATH, typename In, typename Out>
 inline void gemm_int8(thread const In &in, thread const Out &out, thread const Weights<W> &w,
     thread const int8_scratch &s, uint m_rows, uint rows, uint k, uint gx, uint gy, threadgroup uchar *shared,
     uint sg, uint lane) {
     static_assert(TILE == 128 || TILE == 64, "an int8 tile is 128 x 32 or 64 x 64");
 #if SEISMIC_HAS_TENSOR_OPS
-    if constexpr (int8_codes<W>::available) {
+    if constexpr (PATH) {
         const uint m0 = TILE == 128 ? gx * 128u + sg * 32u : gx * 64u + (sg / 2u) * 32u;
         const uint n0 = TILE == 128 ? gy * 32u : gy * 64u + (sg % 2u) * 32u;
         const int8_lane at(lane);
@@ -4204,16 +4217,17 @@ inline void gemm_int8(thread const In &in, thread const Out &out, thread const W
 // for the tile's two 32-row halves, 1 and 3 the up weights', and each up
 // simdgroup stores the pair with its gate simdgroup's sums, exchanged through
 // `exchange` (2 x 32 x 32 floats). `gate_scratch` and `up_scratch` share the
-// operand and differ in the weights' coefficients and biases. Either weight
-// without an int8 path, and devices without tensor operations, run the staged
-// paired 64 x 64 tile of the default form, with its results.
-template <typename G, typename U, typename In, typename Out>
+// operand, quantized in the order both weights' codes take (`interleaved`),
+// and differ in the weights' coefficients and biases. Where the launch does
+// not run the int8 products (PATH, `int8_path`), the staged paired 64 x 64
+// tile of the default form runs, with its results.
+template <typename G, typename U, bool PATH, typename In, typename Out>
 inline void gemm_int8_paired(thread const In &in, thread const Out &out, thread const Weights<G> &gate,
     thread const Weights<U> &up, thread const int8_scratch &gate_scratch, thread const int8_scratch &up_scratch,
     uint m_rows, uint rows, uint k, uint tm, uint tn, threadgroup uchar *shared, threadgroup float *exchange,
     uint sg, uint lane) {
 #if SEISMIC_HAS_TENSOR_OPS
-    if constexpr (int8_codes<G>::available && int8_codes<U>::available) {
+    if constexpr (PATH) {
         const uint half_tile = sg / 2u, m0 = tm * 64u + half_tile * 32u, n0 = tn * 32u;
         const int8_lane at(lane);
         const bool second = (sg % 2u) != 0;

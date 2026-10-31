@@ -176,7 +176,7 @@ kernel void project_rows_pack(PROJECT_ROWS_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (!projection::packing_codes<packets::W0>::available)
+    if constexpr (!projection::packing_path<packets::W0>())
         return;
     threadgroup float4 peaks[8];
     PROJECT_ROWS_OPERANDS;
@@ -195,7 +195,7 @@ kernel void project_rows_pack_coefficients(PROJECT_ROWS_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (!projection::packing_codes<packets::W0>::available)
+    if constexpr (!projection::packing_path<packets::W0>())
         return;
     threadgroup float peaks[8];
     PROJECT_ROWS_OPERANDS;
@@ -210,7 +210,7 @@ kernel void project_rows_packed(PROJECT_ROWS_ARGUMENTS,
     uint tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (!projection::packing_codes<packets::W0>::available)
+    if constexpr (!projection::packing_path<packets::W0>())
         return;
     PROJECT_ROWS_OPERANDS;
     PROJECT_ROWS_PACKING_SCRATCH;
@@ -220,14 +220,14 @@ kernel void project_rows_packed(PROJECT_ROWS_ARGUMENTS,
 }
 #endif
 
-// PACK with weights that have no packed path: the staged tiles of the
-// default form, with its results.
+// PACK on a device without the packed path: the staged tiles of the default
+// form, with its results.
 #ifdef SEISMIC_FORMING_PROJECT_ROWS_UNPACKED
 kernel void project_rows_unpacked(PROJECT_ROWS_ARGUMENTS,
     uint3 tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (projection::packing_codes<packets::W0>::available)
+    if constexpr (projection::packing_path<packets::W0>())
         return;
     PROJECT_ROWS_GEMM(64, 64, 1, partials);
 }

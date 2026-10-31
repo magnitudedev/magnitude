@@ -281,7 +281,7 @@ fn real_4b_projections_match_their_operand_emulation() {
                 let (u_exact, _) = project(&exact, &up.values, o, f, h);
                 let reference: Vec<f64> =
                     (0..o * f).map(|i| silu(g_exact[i]) * u_exact[i]).collect();
-                for &mapping in mappings(o) {
+                for mapping in mappings(o, &[gate_format.resident(), up_format.resident()]) {
                     let (x, _) = operand_rows(&exact, h, mapping, Some(gate_format));
                     let (g, _) = project(&x, &gate.values, o, f, h);
                     let (u, _) = project(&x, &up.values, o, f, h);

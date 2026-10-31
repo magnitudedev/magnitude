@@ -1533,6 +1533,23 @@ impl NativeCondition {
         }
     }
 
+    /// Whether the condition can hold at some values of the names within the
+    /// inclusive bounds `dimension` and `parameter` supply. Unlike
+    /// [`Self::bounded`], an operand that cannot be bounded does not hide one
+    /// that is false throughout: `and` cannot hold with either operand false
+    /// throughout, `or` only with both.
+    pub fn may_hold(
+        &self,
+        dimension: &impl Fn(&str) -> Option<(u64, u64)>,
+        parameter: &impl Fn(&str) -> Option<(u64, u64)>,
+    ) -> bool {
+        match self {
+            Self::Compare { .. } => self.bounded(dimension, parameter) != NativeBounded::Always(false),
+            Self::And(left, right) => left.may_hold(dimension, parameter) && right.may_hold(dimension, parameter),
+            Self::Or(left, right) => left.may_hold(dimension, parameter) || right.may_hold(dimension, parameter),
+        }
+    }
+
     /// What the condition is when every name ranges over the inclusive
     /// bounds `dimension` and `parameter` supply, evaluated as
     /// [`Self::holds`] evaluates it: `and` and `or` read their right side
@@ -2066,7 +2083,7 @@ impl NativeImplementation {
                 .or_else(|| specialization.param(name))
                 .map(|value| (value, value))
         };
-        when.bounded(&dimension, &parameter) != NativeBounded::Always(false)
+        when.may_hold(&dimension, &parameter)
     }
 
     /// The group size of launch `launch` under `specialization`, when every

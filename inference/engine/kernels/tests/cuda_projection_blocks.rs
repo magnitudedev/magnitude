@@ -99,14 +99,8 @@ fn recurrent_project_cases(mixes: &[[Option<Format>; 4]], seed: u64) {
             let normed = normalized(&hidden_values, &norm_values, m, h);
             let hidden = f32_tensor(&device, &[m as u64, h as u64], &hidden_values);
             let norm = f32_tensor(&device, &[h as u64], &norm_values);
-            for &mapping in mappings(m) {
-                // INT8 has no effect when any weight is dense.
-                let path = if formats.contains(&None) {
-                    Mapping { int8: 0, ..mapping }
-                } else {
-                    mapping
-                };
-                let (x, slack) = operand_rows(&normed, h, path, formats[0]);
+            for mapping in mappings(m, &formats.map(element)) {
+                let (x, slack) = operand_rows(&normed, h, mapping, formats[0]);
                 let mut expected = vec![0.0; m * width];
                 let mut tolerance = vec![0.0; m * width];
                 for (weight, (offset, n)) in
@@ -114,7 +108,7 @@ fn recurrent_project_cases(mixes: &[[Option<Format>; 4]], seed: u64) {
                         .iter()
                         .zip([(0, qkv), (qkv, z), (qkv + z, nv), (qkv + z + nv, nv)])
                 {
-                    let (values, bound) = rounded_segment(&x, &slack, weight, m, n, h, path);
+                    let (values, bound) = rounded_segment(&x, &slack, weight, m, n, h, mapping);
                     place(&mut expected, width, offset, &values, m, n);
                     place(&mut tolerance, width, offset, &bound, m, n);
                 }
@@ -197,7 +191,7 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
             let normed = normalized(&hidden_values, &norm_values, m, d);
             let hidden = f32_tensor(&device, &[m as u64, d as u64], &hidden_values);
             let norm = f32_tensor(&device, &[d as u64], &norm_values);
-            for &mapping in mappings(m) {
+            for mapping in mappings(m, &formats.map(Format::resident)) {
                 let (x, slack) = operand_rows(&normed, d, mapping, Some(formats[0]));
                 let expected: Vec<(Vec<f64>, Vec<f64>)> = weights
                     .iter()
@@ -279,7 +273,7 @@ fn cuda_attention_output_matches_host_model() {
             let hidden_values: Vec<f32> = (0..m * d).map(|_| rng.uniform(-2.0, 2.0)).collect();
             let gated_tensor = bf16_tensor(&device, &[m as u64, q as u64, w as u64], &gated_values);
             let hidden = f32_tensor(&device, &[m as u64, d as u64], &hidden_values);
-            for &mapping in mappings(m) {
+            for mapping in mappings(m, &[format.resident()]) {
                 // The heads are exact input, so the INT8 emulation is exact too.
                 let (x, _) = operand_rows(&gated_values, q * w, mapping, Some(format));
                 let (projected, magnitude) = project(&x, &output.values, m, d, q * w);
@@ -360,7 +354,7 @@ fn cuda_scaled_projections_match_host_model() {
             let hidden = f32_tensor(&device, &[m as u64, d as u64], &hidden_values);
             let norm = f32_tensor(&device, &[d as u64], &norm_values);
             let gated = bf16_tensor(&device, &[m as u64, heads as u64, width as u64], &gated_values);
-            for &mapping in mappings(m) {
+            for mapping in mappings(m, &[format.resident()]) {
                 let (x, slack) = operand_rows(&normed, d, mapping, Some(format));
                 let projected = attention_project::native_for_device_with(
                     &device,
