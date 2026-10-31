@@ -28,6 +28,7 @@ coverage = ["dep:seismic-vulkan"]
 
 [dev-dependencies]
 seismic-std.workspace = true
+seismic-topology = { workspace = true, features = ["fixtures"] }
 # The Vulkan prefix's formation tests run on every host.
 seismic-vulkan.workspace = true
 serde_json = "1"
