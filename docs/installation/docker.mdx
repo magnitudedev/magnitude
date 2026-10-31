@@ -130,10 +130,14 @@ No flags are needed. Magnitude runs models on the CPU when it finds no usable GP
 
 Docker Desktop runs Linux containers in a virtual machine, so the container sees that machine's memory and processors, not your computer's.
 
-- **macOS:** containers can't use the GPU; Metal isn't available inside the virtual machine. The image runs on CPU only. To use your Mac's GPU, install the [macOS app](/installation/macos) instead.
+- **macOS:** containers can't use the GPU; Metal isn't available inside the virtual machine. The image runs on CPU only. To use your Mac's GPU, install the [macOS app](/installation/macos) instead. Colima and Podman's machine run the image the same way.
 - **Windows:** with the WSL 2 backend and a current NVIDIA driver on Windows, `--gpus all` gives the container the NVIDIA GPU. AMD and Intel GPUs aren't available to containers; use the [Windows app](/installation/windows) for them.
 
 Raise the virtual machine's memory limit in Docker Desktop's **Settings → Resources** if models you expect to fit are reported as too large.
+
+## Memory limits
+
+With a memory limit, such as `-m 8g` or a Kubernetes `resources.limits.memory`, Magnitude counts the limit as the container's memory and fits models to it. It keeps 2 GB or a tenth of the limit in reserve, whichever is larger, so even the smallest catalog models need a limit of about 5 GB. `docker exec magnitude magnitude hardware` shows the memory Magnitude sees.
 
 ## Data and permissions
 
