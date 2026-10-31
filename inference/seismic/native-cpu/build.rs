@@ -48,9 +48,12 @@ fn scale(scale: ScaleEncoding) -> &'static str {
 /// The component type of packed storage `id` of `STORAGE`-value groups.
 fn packed(id: seismic_lang::ids::RepresentationId, storage: u32) -> String {
     let axes = registry::decode_axes(id).expect("packed storage has decode axes");
+    // The code domain's ends, which every code component takes from here.
+    let domain = axes.codes();
+    let (least, greatest) = (domain[0], domain[domain.len() - 1]);
     let codes = match &axes.code {
         CodeInterpretation::Grid(grid) => format!(
-            "Grid<{}, {}, {}>",
+            "Grid<{}, {}, {}, {least}, {greatest}>",
             magnitude_ggml::tables::GRIDS
                 .iter()
                 .position(|known| *known == grid.grid)
@@ -59,7 +62,7 @@ fn packed(id: seismic_lang::ids::RepresentationId, storage: u32) -> String {
             axes.low / 8
         ),
         code => format!(
-            "Planes<{}, {}, {}>",
+            "Planes<{}, {}, {}, {least}, {greatest}>",
             axes.low,
             axes.high,
             interpretation(code)

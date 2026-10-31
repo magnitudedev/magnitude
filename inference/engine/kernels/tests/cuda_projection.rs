@@ -162,8 +162,8 @@ fn cuda_dense_expand_iq4_matches_host_model() {
     dense_expand_cases(&[Format::Iq4], 9);
 }
 
-/// Q4_0, Q5_0, Q5_1, MXFP4 and NVFP4 gate/up weights (the scaled GEMM for
-/// all but Q5_1).
+/// Q4_0, Q5_0, Q5_1, MXFP4, NVFP4, Q2_K and TQ2_0 gate/up weights (the
+/// scaled GEMM for all but Q5_1, Q2_K and TQ2_0).
 #[test]
 fn cuda_dense_expand_coded_matches_host_model() {
     dense_expand_cases(
@@ -174,6 +174,8 @@ fn cuda_dense_expand_coded_matches_host_model() {
             Format::Mxfp4,
             Format::Nvfp4,
             Format::Nvfp4A4,
+            Format::Q2K,
+            Format::Tq2_0,
         ],
         17,
     );

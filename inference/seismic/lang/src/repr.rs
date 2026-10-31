@@ -1335,6 +1335,43 @@ pub(crate) const REPRS: &[Repr] = &[
             carried: true,
         },
     },
+    // GGUF Q2_K: unsigned 2-bit codes, a 4-bit scale and a 4-bit minimum
+    // per 16 values under one f16 factor `d` and one f16 minimum factor
+    // `dmin` per 256: ggml's `d s q - dmin m` exactly, 84 bytes per 256
+    // values as in GGUF.
+    Repr {
+        name: "q2k",
+        packing_axis: PackingAxisRule::Last,
+        group: 16,
+        bits: 2,
+        code: CodeInterpretation::Unsigned,
+        float_code: None,
+        coefficients: Coefficients::Hierarchical {
+            factor_group: 256,
+            factor_dtype: DType::F16,
+            factor_exponent: 0,
+            bits: 4,
+            interpretation: CodeInterpretation::Unsigned,
+            minimum: Some(MinimumSign::Subtract),
+            carried: false,
+        },
+    },
+    // GGUF TQ2_0: ternary codes stored as 2-bit codes offset by 1, one f16
+    // scale per 256: ggml's `(q - 1) d` exactly, 66 bytes per 256 values as
+    // in GGUF.
+    Repr {
+        name: "q2g256",
+        packing_axis: PackingAxisRule::Last,
+        group: 256,
+        bits: 2,
+        code: CodeInterpretation::Offset(1),
+        float_code: None,
+        coefficients: Coefficients::Direct {
+            dtype: DType::F16,
+            bias: false,
+            packet_group: 256,
+        },
+    },
 ];
 
 pub(crate) static IQ2XS_CODES: GridCodes = GridCodes {

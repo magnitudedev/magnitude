@@ -440,16 +440,53 @@ struct NoWeight {
 // ---------------------------------------------------------------------------
 // GEMV (M <= GEMV_ROWS).
 
-// Operand sums of x over each 32-code half of a k-block, for the lane's
-// C-fragment columns 2t and 2t+1 of each 8-row column block.
-template <int NB> struct GroupSums {
-    float half[NB][2][2];
+// Operand sums of x over each GROUP-code group of a k-block, for the lane's
+// C-fragment columns 2t and 2t+1 of each 8-row column block: the sums a
+// biased weight of GROUP-code groups folds its biases with (`gemv_sums`),
+// none for GROUP 0 (no bias).
+template <int NB, int GROUP_> struct GroupSums {
+    static constexpr int GROUP = GROUP_;
+    float group[NB][64 / GROUP][2];
 };
+template <int NB> struct GroupSums<NB, 0> {
+    static constexpr int GROUP = 0;
+};
+// The group a weight's biases take operand sums over: its own, or 0.
+template <class W> constexpr int bias_group = W::BIAS ? W::GROUP : 0;
 
-template <int NB, class W>
+// The sums of the B operands `b` of one k-block over GROUP-code groups,
+// from the same B operands through an all-ones A fragment, a group's steps
+// accumulating in one MMA sum (explicit calls: a step loop, even unrolled,
+// compiles to other code).
+template <int NB, int GROUP>
+__device__ __forceinline__ void gemv_sums(const u32 (&b)[NB][4][2], GroupSums<NB, GROUP> &sums) {
+    if constexpr (GROUP != 0) {
+        constexpr int STEPS = GROUP / 16;
+        static_assert(STEPS == 1 || STEPS == 2 || STEPS == 4, "groups of 16, 32 or 64 codes");
+        const u32 ones[4] = {Op::ONES, Op::ONES, Op::ONES, Op::ONES};
+#pragma unroll
+        for (int nb = 0; nb < NB; ++nb)
+#pragma unroll
+            for (int h = 0; h < 64 / GROUP; ++h) {
+                float x[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                Op::mma(x, ones, b[nb][STEPS * h]);
+                if constexpr (STEPS >= 2)
+                    Op::mma(x, ones, b[nb][STEPS * h + 1]);
+                if constexpr (STEPS == 4) {
+                    Op::mma(x, ones, b[nb][STEPS * h + 2]);
+                    Op::mma(x, ones, b[nb][STEPS * h + 3]);
+                }
+                sums.group[nb][h][0] = x[0];
+                sums.group[nb][h][1] = x[1];
+            }
+    }
+}
+
+template <int NB, class W, class Sums>
 __device__ __forceinline__ void gemv_accumulate(float (&acc)[NB][4], const typename W::Raw &raw, const W &w,
                                                 const typename W::Block &block, int q, const u32 (&b)[NB][4][2],
-                                                const GroupSums<NB> &sums) {
+                                                const Sums &sums) {
+    static_assert(Sums::GROUP == bias_group<W> || !W::BIAS, "a biased weight folds its groups' operand sums");
     Coefficients<W::GROUPS> c;
     w.coefficients(block, q, c);
     constexpr int STEPS = W::GROUP / 16;
@@ -476,10 +513,9 @@ __device__ __forceinline__ void gemv_accumulate(float (&acc)[NB][4], const typen
             for (int e = 0; e < 4; ++e)
                 acc[nb][e] = seismic_fma_rn(c.scale[e / 2][group], p[nb][e], acc[nb][e]);
             if constexpr (W::BIAS) {
-                static_assert(W::GROUP == 32, "biased groups span half a k-block");
 #pragma unroll
                 for (int e = 0; e < 4; ++e)
-                    acc[nb][e] = seismic_fma_rn(-c.bias[e / 2][group], sums.half[nb][group][e % 2], acc[nb][e]);
+                    acc[nb][e] = seismic_fma_rn(-c.bias[e / 2][group], sums.group[nb][group][e % 2], acc[nb][e]);
             }
         }
     }
@@ -601,7 +637,10 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
     constexpr bool STAGED = STAGING && !PAIR && GemvStaged<WA>::value;
     // Both weights read permuted, or neither: the activations follow one order.
     constexpr bool PERMUTED = GemvPermuted<WA>::value && (!PAIR || GemvPermuted<WB>::value);
-    constexpr bool BIAS = WA::BIAS || WB::BIAS;
+    // The operand sums each stream's biases take, formed once where both
+    // take the same.
+    constexpr int SUMS_A = bias_group<WA>, SUMS_B = bias_group<WB>;
+    constexpr bool OWN_B = SUMS_B != 0 && SUMS_B != SUMS_A;
     const u32 lane = threadIdx.x % 32;
     const u32 g = lane / 4;
     const u32 t = lane % 4;
@@ -688,20 +727,10 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
                     b[nb][s][1] = feeds ? pro.pair(factors, m, k0 + high) : 0u;
                 }
             }
-            GroupSums<NB> sums;
-            if constexpr (BIAS) {
-                const u32 ones[4] = {Op::ONES, Op::ONES, Op::ONES, Op::ONES};
-#pragma unroll
-                for (int nb = 0; nb < NB; ++nb)
-#pragma unroll
-                    for (int h = 0; h < 2; ++h) {
-                        float x[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                        Op::mma(x, ones, b[nb][2 * h]);
-                        Op::mma(x, ones, b[nb][2 * h + 1]);
-                        sums.half[nb][h][0] = x[0];
-                        sums.half[nb][h][1] = x[1];
-                    }
-            }
+            GroupSums<NB, SUMS_A != 0 ? SUMS_A : SUMS_B> sums;
+            gemv_sums(b, sums);
+            GroupSums<NB, OWN_B ? SUMS_B : 0> sums_b;
+            gemv_sums(b, sums_b);
 #pragma unroll
             for (int i = 0; i < TPW; ++i)
                 if (tile0 + i < tiles) {
@@ -711,7 +740,9 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
                                             sums);
                     else
                         gemv_accumulate<NB>(acc[0][i], wa.raw(stage.ra[i], q, lane), wa, stage.ba[i], q, b, sums);
-                    if constexpr (PAIR)
+                    if constexpr (PAIR && OWN_B)
+                        gemv_accumulate<NB>(acc[1][i], wb.raw(stage.rb[i], q, lane), wb, stage.bb[i], q, b, sums_b);
+                    else if constexpr (PAIR)
                         gemv_accumulate<NB>(acc[1][i], wb.raw(stage.rb[i], q, lane), wb, stage.bb[i], q, b, sums);
                 }
         }
@@ -1113,8 +1144,8 @@ template <class Pro> __device__ __forceinline__ auto after_dependency(const Pro 
 // representation's SUPER_WORDS words, 16 B aligned) are staged once per
 // superblock into one of two record buffers, with the stage of the
 // superblock's first k-block (or of the share's first). Each warp decodes its
-// own rows' coefficients of every k-block into its area (16 B per row per
-// stream).
+// own rows' coefficients of every k-block into its area (per row per stream
+// its k-block's coefficients padded to 16 B: `COEF_AREA`).
 // Bytes of one staged code chunk of W: 16, or `W::CHUNK_BYTES` (a
 // representation whose k-block's bytes are 8-byte pieces of its storage).
 template <class W, class = void> struct ChunkBytes {
@@ -1153,14 +1184,20 @@ struct GemmShape {
     template <bool S8> static constexpr int A_ROW = S8 ? 96 : 144;
     template <class W> static constexpr int TILE = W::CHUNKS * ChunkBytes<W>::value;
     template <class W> static constexpr int RECORD = (W::SUPER_WORDS * 4 + 15) / 16 * 16;
+    // A warp's coefficient area per stream: its NJ * 16 rows' k-block
+    // coefficients (`gemm_decode_coefficients`), each row's padded to whole
+    // 16 B, the larger of WA's and WB's. COEF_WARP is 16 B a row.
     static constexpr int COEF_WARP = NJ * 16 * 16;
+    template <class W> static constexpr int COEF_ROW = (W::GROUPS * (W::BIAS ? 8 : 4) + 15) / 16 * 16;
+    template <class WA, class WB>
+    static constexpr int COEF_AREA = NJ * 16 * (COEF_ROW<WA> > COEF_ROW<WB> ? COEF_ROW<WA> : COEF_ROW<WB>);
     template <class WA, class WB, bool S8>
     static constexpr int STAGE_BYTES = BM * A_ROW<S8> + 8 * (TILE<WA> + TILE<WB>);
     // One record buffer: both streams' 128 rows.
     template <class WA, class WB> static constexpr int RECORDS = 128 * (RECORD<WA> + RECORD<WB>);
     template <class WA, class WB, bool S8>
     static constexpr int LAYOUT_BYTES = STAGES * STAGE_BYTES<WA, WB, S8> + 2 * RECORDS<WA, WB> +
-                                        (Same<WB, NoWeight>::value ? 1 : 2) * WARPS * COEF_WARP;
+                                        (Same<WB, NoWeight>::value ? 1 : 2) * WARPS * COEF_AREA<WA, WB>;
     // Shared bytes (the declared `shared_bytes` of a GEMM launch), a bound on
     // every representation's layout:
     //   STAGES * (BM * 144 + STREAMS * 10240) + STREAMS * WARPS * NJ * 256
@@ -1168,7 +1205,8 @@ struct GemmShape {
     // effect with dense weights, so a configuration's GEMM may run either).
     // Per stream the largest codes (q8: 1024 B per tile, 16 B records) and
     // records (q6k, 32 B per row, 768 B per tile) take STAGES * 8192 + 4096
-    // and STAGES * 6144 + 8192 of its STAGES * 10240 bytes.
+    // and STAGES * 6144 + 8192 of its STAGES * 10240 bytes; coefficients of
+    // more than 16 B a row (`COEF_AREA`) come with codes that leave room.
     template <int STREAMS>
     static constexpr int SHARED_BYTES = STAGES * (BM * 144 + STREAMS * 10240) + STREAMS * WARPS * COEF_WARP;
 };
@@ -1452,6 +1490,7 @@ __device__ __forceinline__ void gemm_tile_half(float acc[Shape::MI][2][4], const
             w.template decode<Operand>(raw, 2 * half + local, r[local]);
         // One partial product per coefficient group: both steps of the half
         // for 32-code groups, each step for 16-code groups.
+        static_assert(STEPS <= 2, "the scaled GEMM folds groups within a 32-code half");
         constexpr int FOLDS = 2 / STEPS;
 #pragma unroll
         for (int fold = 0; fold < FOLDS; ++fold) {
@@ -1543,7 +1582,8 @@ template <class Shape, class WA, class WB, bool S8> struct GemmWeights {
     static constexpr int BUFFER = Shape::template RECORDS<WA, WB>;
     static constexpr int RECORDS = Shape::STAGES * STAGE;
     static constexpr int AREAS = RECORDS + 2 * BUFFER;
-    static_assert(Shape::template LAYOUT_BYTES<WA, WB, S8> == AREAS + STREAMS * Shape::WARPS * Shape::COEF_WARP,
+    static_assert(Shape::template LAYOUT_BYTES<WA, WB, S8> ==
+                      AREAS + STREAMS * Shape::WARPS * Shape::template COEF_AREA<WA, WB>,
                   "the layout of GemmShape");
     static_assert(Shape::template LAYOUT_BYTES<WA, WB, S8> <= Shape::template SHARED_BYTES<STREAMS>,
                   "the declared shared bytes bound every representation's layout");
@@ -1561,7 +1601,8 @@ template <class Shape, class WA, class WB, bool S8> struct GemmWeights {
         return shared + RECORDS + (kb / 4) % 2 * BUFFER + (stream == 0 ? 0 : 128 * RECORD_A);
     }
     __device__ __forceinline__ float *area(u32 warp, int stream) const {
-        return reinterpret_cast<float *>(shared + AREAS + (warp * STREAMS + stream) * Shape::COEF_WARP);
+        return reinterpret_cast<float *>(shared + AREAS +
+                                         (warp * STREAMS + stream) * Shape::template COEF_AREA<WA, WB>);
     }
     template <int STRIDE> __device__ __forceinline__ void load(int s, u64 index, u32 first) const {
         const u64 kb = kbegin + index;
@@ -1929,8 +1970,9 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
 // The INT8 candidate's GEMM: the same block tiling and pipeline over s8
 // activations staged by `stage_row_s8` (BM rows x 64 bytes per k-block, pitch
 // 80, plus each row's two (d, d * sum q) groups) and s8 weight fragments
-// (packets.cuh virtual order). Per 32-code group one m16n8k32 s8 MMA into an
-// exact int32 product (two, half-masked, for 16-code groups), folded as
+// (packets.cuh virtual order). Per 32 codes one m16n8k32 s8 MMA into an
+// exact int32 product (two, half-masked, for 16-code groups), folded with the
+// coefficients of its group (of 32 codes or more) as
 // acc += scale * (d_x * P) - bias * (d_x * sum q_x).
 // An s8 MMA product as F32, exactly: |p| <= 32 * 127 * 128 < 2^22, so
 // p + 1.5 * 2^23 is an integer-valued float whose low mantissa bits are p. One
@@ -1948,7 +1990,11 @@ __device__ __forceinline__ void gemm_tile_s8(float acc[Shape::MI][2][4], const W
     const u32 lane = threadIdx.x % 32;
     const u32 t = lane % 4;
     const typename W::Raw raw = w.from_shared(staged_tile, lane);
-    auto fold = [&](const int (&p)[Shape::MI][2][4], int group, int h) {
+    // A biased 16-code group's sum q_x (rows g, g + 8 of each m16 tile) is
+    // the exact s8 product of its half of the 32 codes with all-ones weights;
+    // a group of 32 codes or more takes the staged d_x sum q_x of each half.
+    constexpr bool SUMS = W::BIAS && W::GROUP < 32;
+    auto fold = [&](const int (&p)[Shape::MI][2][4], const int (&sum)[Shape::MI][4], int group, int h) {
 #pragma unroll
         for (int half = 0; half < 2; ++half)
 #pragma unroll
@@ -1960,7 +2006,9 @@ __device__ __forceinline__ void gemm_tile_s8(float acc[Shape::MI][2][4], const W
                     for (int r = 0; r < 2; ++r) {
                         float &value = acc[mi][half][2 * r + c];
                         value = seismic_fma_rn(k.x, x[h][mi][r].x * gemm_s8_product(p[mi][half][2 * r + c]), value);
-                        if constexpr (W::BIAS)
+                        if constexpr (SUMS)
+                            value = seismic_fma_rn(k.y, x[h][mi][r].x * gemm_s8_product(sum[mi][2 * r]), value);
+                        else if constexpr (W::BIAS)
                             value = seismic_fma_rn(k.y, x[h][mi][r].y, value);
                     }
             }
@@ -1969,7 +2017,9 @@ __device__ __forceinline__ void gemm_tile_s8(float acc[Shape::MI][2][4], const W
     for (int h = 0; h < 2; ++h) {
         const S8Pair first = w.s8(raw, 2 * h);
         const S8Pair second = w.s8(raw, 2 * h + 1);
-        if constexpr (W::GROUP == 32) {
+        const int none[Shape::MI][4] = {};
+        if constexpr (W::GROUP >= 32) {
+            // Half h's 32 codes, of group 32 h / GROUP.
             const u32 b0[2] = {first.row_g, second.row_g};
             const u32 b1[2] = {first.row_g8, second.row_g8};
             int p[Shape::MI][2][4];
@@ -1981,24 +2031,29 @@ __device__ __forceinline__ void gemm_tile_s8(float acc[Shape::MI][2][4], const W
                 seismic_mma_m16n8k32_s8(p[mi][0], a[h][mi], b0);
                 seismic_mma_m16n8k32_s8(p[mi][1], a[h][mi], b1);
             }
-            fold(p, h, h);
+            fold(p, none, 32 * h / W::GROUP, h);
         } else {
-            static_assert(W::GROUP == 16, "groups of 16 or 32 codes");
+            static_assert(W::GROUP == 16, "groups of 16 codes, or of 32 or more");
 #pragma unroll
             for (int part = 0; part < 2; ++part) {
                 const S8Pair &step = part == 0 ? first : second;
                 const u32 b0[2] = {part == 0 ? step.row_g : 0u, part == 1 ? step.row_g : 0u};
                 const u32 b1[2] = {part == 0 ? step.row_g8 : 0u, part == 1 ? step.row_g8 : 0u};
                 int p[Shape::MI][2][4];
+                int sum[Shape::MI][4];
 #pragma unroll
                 for (int mi = 0; mi < Shape::MI; ++mi) {
 #pragma unroll
                     for (int e = 0; e < 4; ++e)
-                        p[mi][0][e] = p[mi][1][e] = 0;
+                        p[mi][0][e] = p[mi][1][e] = sum[mi][e] = 0;
                     seismic_mma_m16n8k32_s8(p[mi][0], a[h][mi], b0);
                     seismic_mma_m16n8k32_s8(p[mi][1], a[h][mi], b1);
+                    if constexpr (SUMS) {
+                        const u32 ones[2] = {part == 0 ? 0x01010101u : 0u, part == 1 ? 0x01010101u : 0u};
+                        seismic_mma_m16n8k32_s8(sum[mi], a[h][mi], ones);
+                    }
                 }
-                fold(p, 2 * h + part, h);
+                fold(p, sum, 2 * h + part, h);
             }
         }
     }

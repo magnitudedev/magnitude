@@ -153,13 +153,15 @@ enum Repr {
     Iq2xs,
     Iq3xxs,
     Iq2xxs,
+    Q2k,
+    Q2g256,
 }
 
 /// The vector-coded formats (256-value GGUF blocks).
 const GRID_REPRS: [Repr; 3] = [Repr::Iq2xs, Repr::Iq3xxs, Repr::Iq2xxs];
 
 /// The formats with a representation of their own, imported from GGUF.
-const GGUF_REPRS: [Repr; 8] = [
+const GGUF_REPRS: [Repr; 10] = [
     Repr::Q4g32s,
     Repr::Q4g32,
     Repr::Iq4g32s,
@@ -168,6 +170,8 @@ const GGUF_REPRS: [Repr; 8] = [
     Repr::Mxfp4,
     Repr::Nvfp4,
     Repr::Nvfp4A4,
+    Repr::Q2k,
+    Repr::Q2g256,
 ];
 
 /// The iq4g32 code table (the registry's `iq4g32` interpretation).
@@ -195,6 +199,8 @@ impl Repr {
             Repr::Iq2xs => "iq2xs",
             Repr::Iq3xxs => "iq3xxs",
             Repr::Iq2xxs => "iq2xxs",
+            Repr::Q2k => "q2k",
+            Repr::Q2g256 => "q2g256",
         }
     }
     /// The GGUF source of a representation built from GGUF blocks, with its
@@ -211,6 +217,8 @@ impl Repr {
             Repr::Iq2xs => Some(("gguf_iq2_xs", 74, 256)),
             Repr::Iq3xxs => Some(("gguf_iq3_xxs", 98, 256)),
             Repr::Iq2xxs => Some(("gguf_iq2_xxs", 66, 256)),
+            Repr::Q2k => Some(("gguf_q2_k", 84, 256)),
+            Repr::Q2g256 => Some(("gguf_tq2_0", 66, 256)),
             _ => None,
         }
     }
@@ -305,7 +313,9 @@ fn planes(repr: Repr, k: usize) -> Planes {
         | Repr::Nvfp4A4
         | Repr::Iq2xs
         | Repr::Iq3xxs
-        | Repr::Iq2xxs => {
+        | Repr::Iq2xxs
+        | Repr::Q2k
+        | Repr::Q2g256 => {
             unreachable!("{repr:?} takes the registry's geometry (`gguf_weight`)")
         }
     }
@@ -533,7 +543,9 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
             | Repr::Nvfp4A4
             | Repr::Iq2xs
             | Repr::Iq3xxs
-            | Repr::Iq2xxs => {
+            | Repr::Iq2xxs
+            | Repr::Q2k
+            | Repr::Q2g256 => {
                 unreachable!("built by `gguf_weight`")
             }
         }
@@ -587,6 +599,13 @@ fn gguf_weight(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -> 
                 block[..2].copy_from_slice(&f16_bits(factor / 40.0).to_le_bytes())
             }
             Repr::Iq3xxs => block[..2].copy_from_slice(&f16_bits(factor / 120.0).to_le_bytes()),
+            // d and dmin: values reach d 15 3 and dmin 15.
+            Repr::Q2k => {
+                block[80..82].copy_from_slice(&f16_bits(factor / 45.0).to_le_bytes());
+                block[82..84].copy_from_slice(&f16_bits(factor / 30.0).to_le_bytes());
+            }
+            // d: codes - 1 reach 2.
+            Repr::Q2g256 => block[64..66].copy_from_slice(&f16_bits(factor / 2.0).to_le_bytes()),
             _ => unreachable!("{repr:?} is not imported from GGUF"),
         }
         external.extend(block);
@@ -3533,7 +3552,8 @@ fn dense_output_gguf_formats_at_32_granular_k() {
 fn dense_output_gguf_formats_at_32_granular_k_on(device: &Device) {
     let module = module();
     let act = Act::Bf16;
-    for repr in GGUF_REPRS {
+    // Only formats of blocks below 256 values have such rows.
+    for repr in GGUF_REPRS.into_iter().filter(|repr| repr.gguf_source().unwrap().2 < 256) {
         let (h, f) = (16, 704);
         let down = weight(repr, h, f, 41, 1.0);
         let (rows, out_rows) = (3usize, vec![2, 0]);
@@ -5476,6 +5496,11 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
     let module = module();
     let act = Act::Bf16;
     let (v, d) = (300usize, 2560usize);
+    // Every format's table, the GGUF formats' of 256-value blocks included;
+    // a gather takes no activation operands, so each storage once.
+    let gguf = GGUF_REPRS
+        .into_iter()
+        .filter(|repr| repr.element().operand_recipe() == registry::OperandRecipe::Rounded);
     for repr in [
         Repr::Q6k,
         Repr::Q4k,
@@ -5483,7 +5508,10 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
         Repr::Q8,
         Repr::Iq4,
         Repr::Bf16,
-    ] {
+    ]
+    .into_iter()
+    .chain(gguf)
+    {
         let table = weight(repr, v, d, 90, 8.0);
         for rows in [1usize, 3, 8, 64] {
             let tokens = (0..rows)

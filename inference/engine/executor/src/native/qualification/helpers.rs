@@ -692,6 +692,16 @@ fn pattern_source(representation: &str) -> Option<(Element, Vec<u8>)> {
         // Grid point 0 (every magnitude 8), no signs, scale codes 0 and
         // d = 1: d / 8 * 1 * 8.
         "iq2xxs" => ("gguf_iq2_xxs", unit_packet(66, &[(0, &[0x00, 0x3c])])),
+        // Sub-block scales 1 and minima 0, codes 1, d = 1 and dmin = 0.
+        "q2k" => (
+            "gguf_q2_k",
+            unit_packet(84, &[(0, &[0x01; 16]), (16, &[0x55; 64]), (80, &[0x00, 0x3c])]),
+        ),
+        // Codes 2 (value 2 - 1) and d = 1.
+        "q2g256" => (
+            "gguf_tq2_0",
+            unit_packet(66, &[(0, &[0xaa; 64]), (64, &[0x00, 0x3c])]),
+        ),
         // Table code 8 (value 1) at sub-scale 33 - 32 = 1 and d = 1.
         "iq4g32" => (
             "gguf_iq4_xs",

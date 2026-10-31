@@ -1594,7 +1594,7 @@ const fn gguf_source_spec(
     }
 }
 
-const GGUF_SOURCES: [GgufSource; 18] = [
+const GGUF_SOURCES: [GgufSource; 20] = [
     gguf_source_spec(Encoding::Q3K, 1, "gguf_q3_k", "q6k"),
     gguf_source_spec(Encoding::Iq3S, 1, "gguf_iq3_s", "q6k"),
     gguf_source_spec(Encoding::Q4K, 1, "gguf_q4_k", "q4k"),
@@ -1613,6 +1613,8 @@ const GGUF_SOURCES: [GgufSource; 18] = [
     gguf_source_spec(Encoding::Iq3Xxs, 1, "gguf_iq3_xxs", "iq3xxs"),
     gguf_source_spec(Encoding::Iq2Xxs, 1, "gguf_iq2_xxs", "iq2xxs"),
     gguf_source_spec(Encoding::Q4_1, 1, "gguf_q4_1", "q4g32"),
+    gguf_source_spec(Encoding::Q2K, 1, "gguf_q2_k", "q2k"),
+    gguf_source_spec(Encoding::Tq2_0, 1, "gguf_tq2_0", "q2g256"),
 ];
 
 /// The external storage rows of `width` stored values of `encoding` are
@@ -2499,6 +2501,18 @@ pub(crate) mod internals {
         (0..bytes * 8).map(|bit| byte * 8 + bit).collect()
     }
 
+    /// The bit routes of ggml's 2-bit codes of 256 values from byte `byte`:
+    /// value p's code is at bit 2 ((p % 128) / 32) of byte 32 (p / 128) +
+    /// p % 32 of them (Q2_K's and TQ2_0's `qs`).
+    fn quarter_bits(byte: u32) -> Vec<u32> {
+        (0..512)
+            .map(|bit| {
+                let position = bit / 2;
+                (byte + (position / 128) * 32 + position % 32) * 8 + (position % 128 / 32) * 2 + bit % 2
+            })
+            .collect()
+    }
+
     fn hierarchical_coefficients() -> Vec<u32> {
         (0..96)
             .map(|destination_bit| {
@@ -2980,6 +2994,31 @@ pub(crate) mod internals {
                 push(plane(
                     "scale",
                     PlaneRepackRecipe::BitRoutes(direct_bits(0, 2)),
+                ));
+            }
+            "gguf_q2_k" => {
+                // block_q2_K: scales[16] (a 4-bit scale, then a 4-bit
+                // minimum, per 16 values) | qs[64] | d (f16) | dmin (f16).
+                push(plane("words", PlaneRepackRecipe::BitRoutes(quarter_bits(16))));
+                push(plane(
+                    "coefficients",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(0, 16)),
+                ));
+                push(plane(
+                    "scale_factor",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(80, 2)),
+                ));
+                push(plane(
+                    "bias_factor",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(82, 2)),
+                ));
+            }
+            "gguf_tq2_0" => {
+                // block_tq2_0: qs[64] | d (f16).
+                push(plane("words", PlaneRepackRecipe::BitRoutes(quarter_bits(0))));
+                push(plane(
+                    "scale",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(64, 2)),
                 ));
             }
             "gguf_q4_1" => {

@@ -83,21 +83,21 @@ struct Rows16 {
     }
 };
 
-// Bytes 0,2,4,6 / 1,3,5,7 of a 16-bit field of 2-bit high codes, moved to
-// bits 4..5 of four bytes.
-inline void split_high2(uint field, thread uint &even, thread uint &odd) {
-    uint t = (field | (field << 8)) & 0x00ff00ffu;
-    t = (t | (t << 4)) & 0x0f0f0f0fu;
-    even = (t & 0x03030303u) << 4;
-    odd = (t & 0x0c0c0c0cu) << 2;
-}
-
-// The same for an 8-bit field of 1-bit high codes, moved to bit 4.
-inline void split_high1(uint field, thread uint &even, thread uint &odd) {
-    uint t = (field | (field << 12)) & 0x000f000fu;
-    t = (t | (t << 6)) & 0x03030303u;
-    even = (t & 0x01010101u) << 4;
-    odd = (t & 0x02020202u) << 3;
+// The eight WIDTH-bit codes (WIDTH 1 or 2) of an 8 WIDTH-bit field, codes
+// 0,2,4,6 in bytes 0..3 of `even` and 1,3,5,7 in those of `odd`, at bit AT
+// of each byte: the field's halves move to bits 0 and 16, each half's two
+// quarters to two bytes, and a byte's two codes apart.
+template <uint WIDTH, uint AT>
+inline void split_fields(uint field, thread uint &even, thread uint &odd) {
+    static_assert(WIDTH == 1u || WIDTH == 2u, "a byte holds two codes of a quarter field");
+    constexpr uint code = (1u << WIDTH) - 1u;
+    uint t = (field | (field << (16u - 4u * WIDTH))) & (((1u << (4u * WIDTH)) - 1u) * 0x00010001u);
+    t = (t | (t << (8u - 2u * WIDTH))) & (((1u << (2u * WIDTH)) - 1u) * 0x01010101u);
+    even = (t & (code * 0x01010101u)) << AT;
+    if constexpr (AT >= WIDTH)
+        odd = (t & ((code << WIDTH) * 0x01010101u)) << (AT - WIDTH);
+    else
+        odd = (t & ((code << WIDTH) * 0x01010101u)) >> (WIDTH - AT);
 }
 
 inline void split_nibbles(uint word, thread uint &even, thread uint &odd) {
@@ -137,14 +137,67 @@ constexpr float power2() {
 // its step's eight values (`values`, `even` lanes 0,2,4,6 and `odd` 1,3,5,7)
 // or two of them (`pair_values`), each with one F32 rounding.
 
+// A plane of WIDTH-bit codes (WIDTH 1 or 2): a packet's codes fill WIDTH words
+// (`words`, `load`ed from unit p of the code plane at row offset `plane`),
+// step s's eight are their bits [8 WIDTH s, 8 WIDTH (s + 1)) (`step`), and
+// its codes 2j and 2j + 1 the 2 WIDTH bits from bit 2 WIDTH j of those
+// (`pair`).
+template <uint WIDTH>
+struct Fields {
+    static_assert(WIDTH == 1u || WIDTH == 2u, "a packet's codes fill one or two words");
+    typedef metal::conditional_t<WIDTH == 1u, uint, uint2> words;
+    static words load(device const uchar *row, Rows16 layout, ulong plane, uint p) {
+        return *reinterpret_cast<device const words *>(layout.at(row, plane, 4ul * WIDTH, p));
+    }
+    static uint step(words w, uint s) {
+        if constexpr (WIDTH == 1u)
+            return (w >> (8u * s)) & 0xffu;
+        else
+            return (w[s >> 1] >> (16u * (s & 1u))) & 0xffffu;
+    }
+    // Always inlined: as a call, the batched GEMV of 4 + 1-bit codes
+    // compiles to other code (M4 Pro, q5g32s `dense_output_batch`, +160 B).
+    __attribute__((always_inline)) static uint pair(words w, uint s, uint j) {
+        if constexpr (WIDTH == 1u)
+            return (w >> (8u * s + 2u * j)) & 3u;
+        else
+            return (w[s >> 1] >> (16u * (s & 1u) + 4u * j)) & 0xfu;
+    }
+};
+
 // Code planes (`registry::code_planes`): a low plane of LOW bits a code and a
 // high plane of HIGH. `floats` yields a step's codes, their bytes with `mask`
 // flipped, as exact floats less `offset - 1024`; `pair` the step's codes 2j
 // and 2j + 1, the second in bits 16.., with `mask` flipped alike; `nibbles`
 // the step's eight 4-bit codes as one word and `nibble_pair` its byte j (two
 // codes), the indices a codebook reads.
+
+// Codes below a nibble: one plane of LOW-bit codes (`Fields<LOW>`).
 template <uint LOW, uint HIGH>
-struct Planes;
+struct Planes {
+    static_assert(LOW < 4u && HIGH == 0u, "codes below a nibble are one plane");
+    typedef Fields<LOW> low_plane;
+    struct words {
+        typename low_plane::words low;
+    };
+    static words load(device const uchar *row, Rows16 layout, uint p) {
+        words w;
+        w.low = low_plane::load(row, layout, layout.codes, p);
+        return w;
+    }
+    template <uint MASK>
+    static void floats(thread const words &w, uint step, half offset, thread float4 &even, thread float4 &odd) {
+        uint e, o;
+        split_fields<LOW, 0>(low_plane::step(w.low, step), e, o);
+        even = byte_floats(e ^ MASK, offset);
+        odd = byte_floats(o ^ MASK, offset);
+    }
+    template <uint MASK>
+    static uint pair(thread const words &w, uint step, uint j) {
+        uint b = low_plane::pair(w.low, step, j);
+        return ((b & ((1u << LOW) - 1u)) | ((b >> LOW) << 16)) ^ (MASK & 0x00ff00ffu);
+    }
+};
 
 template <>
 struct Planes<4, 0> {
@@ -172,59 +225,35 @@ struct Planes<4, 0> {
     static uint nibble_pair(thread const words &w, uint step, uint j) { return (w.low[step] >> (8u * j)) & 0xffu; }
 };
 
-template <>
-struct Planes<4, 1> {
+// Nibbles under a plane of their HIGH high bits (`Fields<HIGH>`), at bit 4
+// of a code.
+template <uint HIGH>
+struct Planes<4, HIGH> {
+    typedef Fields<HIGH> high_plane;
     struct words {
         uint4 low;
-        uint high;
+        typename high_plane::words high;
     };
     static words load(device const uchar *row, Rows16 layout, uint p) {
         words w;
         w.low = *reinterpret_cast<device const uint4 *>(layout.at(row, layout.codes, 16ul, p));
-        w.high = *reinterpret_cast<device const uint *>(layout.at(row, layout.high, 4ul, p));
+        w.high = high_plane::load(row, layout, layout.high, p);
         return w;
     }
     template <uint MASK>
     static void floats(thread const words &w, uint step, half offset, thread float4 &even, thread float4 &odd) {
         uint e, o, he, ho;
         split_nibbles(w.low[step], e, o);
-        split_high1((w.high >> (8u * step)) & 0xffu, he, ho);
+        split_fields<HIGH, 4>(high_plane::step(w.high, step), he, ho);
         even = byte_floats((e | he) ^ MASK, offset);
         odd = byte_floats((o | ho) ^ MASK, offset);
     }
     template <uint MASK>
     static uint pair(thread const words &w, uint step, uint j) {
         uint b = (w.low[step] >> (8u * j)) & 0xffu;
-        uint h = (w.high >> (8u * step + 2u * j)) & 3u;
-        return ((b & 15u) | ((h & 1u) << 4) | (((b >> 4) | ((h >> 1) << 4)) << 16)) ^ (MASK & 0x00ff00ffu);
-    }
-};
-
-template <>
-struct Planes<4, 2> {
-    struct words {
-        uint4 low;
-        uint2 high;
-    };
-    static words load(device const uchar *row, Rows16 layout, uint p) {
-        words w;
-        w.low = *reinterpret_cast<device const uint4 *>(layout.at(row, layout.codes, 16ul, p));
-        w.high = *reinterpret_cast<device const uint2 *>(layout.at(row, layout.high, 8ul, p));
-        return w;
-    }
-    template <uint MASK>
-    static void floats(thread const words &w, uint step, half offset, thread float4 &even, thread float4 &odd) {
-        uint e, o, he, ho;
-        split_nibbles(w.low[step], e, o);
-        split_high2((w.high[step >> 1] >> (16u * (step & 1u))) & 0xffffu, he, ho);
-        even = byte_floats((e | he) ^ MASK, offset);
-        odd = byte_floats((o | ho) ^ MASK, offset);
-    }
-    template <uint MASK>
-    static uint pair(thread const words &w, uint step, uint j) {
-        uint b = (w.low[step] >> (8u * j)) & 0xffu;
-        uint h = (w.high[step >> 1] >> (16u * (step & 1u) + 4u * j)) & 0xfu;
-        return ((b & 15u) | ((h & 3u) << 4) | (((b >> 4) | ((h >> 2) << 4)) << 16)) ^ (MASK & 0x00ff00ffu);
+        uint h = high_plane::pair(w.high, step, j);
+        return ((b & 15u) | ((h & ((1u << HIGH) - 1u)) << 4) | (((b >> 4) | ((h >> HIGH) << 4)) << 16))
+            ^ (MASK & 0x00ff00ffu);
     }
 };
 
