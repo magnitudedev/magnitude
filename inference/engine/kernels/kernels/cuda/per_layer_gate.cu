@@ -36,7 +36,7 @@ __device__ __forceinline__ void gate_gemv(const Pro &rounded, unsigned M, unsign
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_STAGE
 template <unsigned INT8, unsigned OPERAND>
 __global__ void per_layer_gate_stage(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
+    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0)>();
     using Operands = projection::GemmOperandsOf<OPERAND, packets::W0>;
     // Formed as the gate weight's operand rows.
     using Raw = projection::Strided<element::F32, projection::AllRows>;
@@ -63,7 +63,7 @@ __global__ void per_layer_gate_gemv16(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMM_SMALL
 template <unsigned INT8, unsigned OPERAND>
 __global__ void per_layer_gate_gemm_small(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
+    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0)>();
     extern __shared__ uint4 dynamic_shared[];
     const unsigned long long column = projection::gemm_column<projection::SmallGemm>();
     if (column < projection::gemm_columns(SEISMIC_DIM_P))
@@ -77,7 +77,7 @@ __global__ void per_layer_gate_gemm_small(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMM
 template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
 __global__ void per_layer_gate_gemm(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
+    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0)>();
     using Shape = projection::LargeGemm<ROTATE>;
     extern __shared__ uint4 dynamic_shared[];
     const unsigned long long column = projection::gemm_column<Shape>();

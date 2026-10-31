@@ -586,32 +586,42 @@ pub(crate) fn device_defaults(
     implementation
 }
 
+/// `entry`'s implementation at `bindings` ([`CheckedModule::native_implementation_at`])
+/// as `device` offers it ([`on_device`], [`device_defaults`]): the
+/// declaration whose configurations preparation forms at these bindings.
+/// `None` when the backend has no implementation.
+pub(crate) fn offered(
+    device: &DeviceInner,
+    module: &CheckedModule,
+    entry: EntryId,
+    bindings: &ElementBindings,
+) -> Option<NativeImplementation> {
+    module
+        .native_implementation_at(entry, backend_name(&device.kind), bindings)
+        .cloned()
+        .map(|implementation| device_defaults(device, on_device(device, implementation), bindings))
+}
+
 /// Check a cached choice against the implementation as it exists on this
-/// device. CPU worker and ISA parameters are Seismic-owned additions to the
-/// checked declaration, so validating the bare declaration rejects a valid
-/// CPU tuning result.
+/// device at `bindings` ([`offered`]). CPU worker and ISA parameters are
+/// Seismic-owned additions to the checked declaration, so validating the
+/// bare declaration rejects a valid CPU tuning result.
 pub fn specialization_valid(
     device: &Arc<DeviceInner>,
     module: &CheckedModule,
     entry: EntryId,
+    bindings: &ElementBindings,
     specialization: &NativeSpecialization,
 ) -> bool {
-    module
-        .native_implementation(entry, backend_name(&device.kind))
-        .cloned()
-        .is_some_and(|implementation| {
-            on_device(device, implementation)
-                .validate(specialization)
-                .is_ok()
-        })
+    offered(device, module, entry, bindings)
+        .is_some_and(|implementation| implementation.validate(specialization).is_ok())
 }
 
 /// The default specialization of `entry` at `bindings` and `statics` as
-/// `device` offers the implementation ([`on_device`], [`device_defaults`]):
-/// on a CPU device it also values the Seismic-owned worker counts and tier,
-/// which a stored choice carries and the bare declaration's default lacks.
-/// `None` when the backend has no implementation or nothing is admissible at
-/// `statics`.
+/// `device` offers the implementation ([`offered`]): on a CPU device it
+/// also values the Seismic-owned worker counts and tier, which a stored
+/// choice carries and the bare declaration's default lacks. `None` when the
+/// backend has no implementation or nothing is admissible at `statics`.
 pub fn default_specialization(
     device: &Arc<DeviceInner>,
     module: &CheckedModule,
@@ -619,14 +629,8 @@ pub fn default_specialization(
     bindings: &ElementBindings,
     statics: &NativeSpecialization,
 ) -> Option<NativeSpecialization> {
-    module
-        .native_implementation(entry, backend_name(&device.kind))
-        .cloned()
-        .and_then(|implementation| {
-            device_defaults(device, on_device(device, implementation), bindings)
-                .default_specialization(statics)
-                .ok()
-        })
+    offered(device, module, entry, bindings)
+        .and_then(|implementation| implementation.default_specialization(statics).ok())
 }
 
 /// The CPU route of `implementation` (as [`on_device`] offers it) for a

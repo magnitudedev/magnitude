@@ -163,14 +163,16 @@ impl<'a> Tuning<'a> {
         };
         let entry = <T::Entry as Entry>::NAME;
         let bindings = case.bindings();
-        let implementation =
-            seismic::generated::native_implementation_for_backend::<T::Entry>(device.backend())
-                .map_err(|error| failure(entry, &bindings, error.to_string()))?
-                .ok_or_else(|| failure(entry, &bindings, "native implementation absent".into()))?;
+        let implementation = seismic::generated::native_implementation_at::<T::Entry>(
+            device.backend(),
+            case.entry().elements(),
+        )
+        .map_err(|error| failure(entry, &bindings, error.to_string()))?
+        .ok_or_else(|| failure(entry, &bindings, "native implementation absent".into()))?;
         let values = case
             .statics(&self.model())
             .map_err(|error| failure(entry, &bindings, error))?;
-        let fixed = domain_statics(&implementation, entry, &bindings, &values)?;
+        let fixed = domain_statics(implementation, entry, &bindings, &values)?;
         Ok(Some((entry, bindings, fixed.statics().clone())))
     }
 
@@ -412,12 +414,15 @@ impl<'a> Specializer<'a> {
         }
     }
 
+    /// `entry`'s implementation at its element bindings, whose
+    /// configurations its preparation forms.
     fn implementation<E: Entry>(
         &self,
+        entry: &BoundEntry<E>,
         bindings: &str,
-    ) -> Result<NativeImplementation, CatalogFailure> {
+    ) -> Result<&'static NativeImplementation, CatalogFailure> {
         let implementation =
-            seismic::generated::native_implementation_for_backend::<E>(self.backend)
+            seismic::generated::native_implementation_at::<E>(self.backend, entry.elements())
                 .map_err(|error| failure(E::NAME, bindings, error.to_string()))?;
         Ok(implementation.unwrap_or_else(|| {
             panic!(
@@ -455,7 +460,7 @@ impl<'a> Specializer<'a> {
         values: &[(&str, u64)],
         entry: BoundEntry<E>,
     ) -> Result<Option<NativeKernel<E>>, CatalogFailure> {
-        let implementation = self.implementation::<E>(bindings)?;
+        let implementation = self.implementation(&entry, bindings)?;
         if implementation.has_tuning_parameters() {
             return Err(failure(
                 E::NAME,
@@ -463,7 +468,7 @@ impl<'a> Specializer<'a> {
                 "the implementation declares tuning parameters, but its call site registers no tuning case".into(),
             ));
         }
-        let specialization = domain_statics(&implementation, E::NAME, bindings, values)?;
+        let specialization = domain_statics(implementation, E::NAME, bindings, values)?;
         if let Mode::CountUntuned(device, untuned) = &mut self.mode {
             untuned.add(*device, entry, bindings, specialization);
             return Ok(None);
@@ -482,15 +487,16 @@ impl<'a> Specializer<'a> {
     ) -> Result<Option<NativeKernel<T::Entry>>, CatalogFailure> {
         let entry = <T::Entry as Entry>::NAME;
         let bindings = case.bindings();
-        let implementation = self.implementation::<T::Entry>(&bindings)?;
+        let bound = case.entry();
+        let implementation = self.implementation(&bound, &bindings)?;
         let values = case
             .statics(&tuning.model())
             .map_err(|outcome| failure(entry, &bindings, outcome))?;
-        let fixed = domain_statics(&implementation, entry, &bindings, &values)?;
+        let fixed = domain_statics(implementation, entry, &bindings, &values)?;
         let tuning_model = tuning.model();
         let specialization = match tuning {
             Tuning::Tuner(tuner) if implementation.has_tuning_parameters() => {
-                tuner.tune(case, &implementation, &fixed)?
+                tuner.tune(case, implementation, &fixed)?
             }
             Tuning::Demand {
                 invocations,
@@ -517,7 +523,7 @@ impl<'a> Specializer<'a> {
             }
             Tuning::Tuner(_) | Tuning::Listing(_) => fixed,
         };
-        self.form(case.entry(), &bindings, &specialization)
+        self.form(bound, &bindings, &specialization)
     }
 }
 

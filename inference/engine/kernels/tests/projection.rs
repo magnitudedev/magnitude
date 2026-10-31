@@ -3493,7 +3493,14 @@ fn dense_up_gguf_formats_match_their_portable_body() {
                 }
             }
             for device in devices() {
-                let implementation = dense_up::native_implementation(&device).unwrap().unwrap();
+                // The declaration at the weight's binding, whose `where`
+                // reads its forms.
+                let implementation = seismic::generated::native_implementation_at::<dense_up::Entry>(
+                    device.backend(),
+                    &[("NW", Element::bf16()), ("UW", repr.resident(&device)), ("A", act.element())],
+                )
+                .unwrap()
+                .unwrap();
                 let statics = implementation.statics.iter().fold(
                     NativeSpecialization::new(),
                     |statics, name| {

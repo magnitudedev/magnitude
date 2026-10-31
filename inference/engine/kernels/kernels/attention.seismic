@@ -189,7 +189,7 @@ native attention_output for metal from "metal/attention_output.metal":
 native attention_output for cuda from "cuda/attention_output.cu":
     static (D, SN, IN, Q, W, OS)
     params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1])
-    where Q * W > 0 and Q * W % 64 == 0 and (OPERAND == 0 or INT8 == 0)
+    where Q * W > 0 and Q * W % 64 == 0 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or form(OW, INT8) == 1)
     scratch staged bytes (M * Q * W * max(1 + OPERAND, 2 * operands(OW))) when (M > 1 and operands(OW) == 1) or (M > 16 and (INT8 == 1 or OPERAND == 1))
     scratch groups bytes (M * Q * W / 4) when INT8 == 1 and M > 16
     scratch partials bytes (2 * M * D * 4) when M > 16 and M <= 128
@@ -467,7 +467,7 @@ native attention_project for metal from "metal/attention_project.metal":
 native attention_project for cuda from "cuda/attention_project.cu":
     static (D, PT, NM, Q, GR, K, V, QS, GS, KS, VS)
     params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1])
-    where D > 0 and D % 64 == 0 and (OPERAND == 0 or INT8 == 0)
+    where D > 0 and D % 64 == 0 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or ((Q == 0 or form(QW, INT8) == 1) and (GR == 0 or form(GW, INT8) == 1) and (K == 0 or form(KW, INT8) == 1) and (V == 0 or form(VW, INT8) == 1)))
     scratch staged bytes (M * D * 2) when M > 1
     scratch groups bytes (M * D / 4) when INT8 == 1 and M > 16
     launch attention_project_stage when M > 1:

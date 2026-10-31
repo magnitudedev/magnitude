@@ -11,7 +11,8 @@
 # (`gemm_small`, 17 to 64 rows: 64-row block tiles, 3 cp.async stages) has
 # two operand paths: the 16-bit path (weights
 # dequantized to A) and the INT8 candidate (arithmetic INT8 = 1: activations
-# quantized per 32 codes as q8_1 does, s8 MMAs); the tuner keeps INT8 only
+# quantized per 32 codes as q8_1 does, s8 MMAs), which `where` admits only
+# for weights the int8 GEMM takes (`form(W, INT8)`); the tuner keeps INT8 only
 # where it is faster within tolerance. The large-band GEMM (`gemm`, beyond 64
 # rows: 128-row block tiles, 2 stages) is the 16-bit path; each stage's copies
 # are issued by one of ROTATE rotating warp sets (the launch parameter ROTATE,
@@ -33,7 +34,7 @@
 native dense_expand for cuda from "cuda/dense_expand.cu":
     static (H, F, GS, US)
     params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1])
-    where H % 64 == 0 and GS <= 1 and US <= 1 and (OPERAND == 0 or INT8 == 0)
+    where H % 64 == 0 and GS <= 1 and US <= 1 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or (form(GW, INT8) == 1 and form(UW, INT8) == 1))
     scratch staged bytes (O * H * 2) when O > 1
     scratch groups bytes (O * H / 4) when INT8 == 1 and O > 16
     launch dense_expand_stage when O > 1:
@@ -65,7 +66,7 @@ native dense_expand for cuda from "cuda/dense_expand.cu":
 native dense_up for cuda from "cuda/dense_up.cu":
     static (H, F, US)
     params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1], code arithmetic KSPLIT in [4, 2, 8])
-    where H % 64 == 0 and US <= 1 and (OPERAND == 0 or INT8 == 0)
+    where H % 64 == 0 and US <= 1 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or form(UW, INT8) == 1)
     scratch staged bytes (O * H * 2) when O > 1
     scratch groups bytes (O * H / 4) when INT8 == 1 and O > 16
     launch dense_up_stage when O > 1:
@@ -98,7 +99,7 @@ native dense_up for cuda from "cuda/dense_up.cu":
 native short_conv_project for cuda from "cuda/short_conv_project.cu":
     static (H, CH, BS, CS, XS)
     params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1])
-    where H > 0 and H % 64 == 0 and BS <= 1 and CS <= 1 and XS <= 1 and (OPERAND == 0 or INT8 == 0)
+    where H > 0 and H % 64 == 0 and BS <= 1 and CS <= 1 and XS <= 1 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or (form(BW, INT8) == 1 and form(XW, INT8) == 1 and form(CW, INT8) == 1))
     scratch staged bytes (M * H * 2) when M > 1
     scratch groups bytes (M * H / 4) when INT8 == 1 and M > 16
     launch short_conv_project_stage when M > 1:
@@ -131,7 +132,7 @@ native short_conv_project for cuda from "cuda/short_conv_project.cu":
 native per_layer_gate for cuda from "cuda/per_layer_gate.cu":
     static (D, L, P, GS)
     params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1])
-    where D % 64 == 0 and GS <= 1 and (OPERAND == 0 or INT8 == 0)
+    where D % 64 == 0 and GS <= 1 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or form(GW, INT8) == 1)
     scratch staged bytes (M * D * 2)
     scratch groups bytes (M * D / 4) when INT8 == 1 and M > 16
     launch per_layer_gate_stage:
@@ -164,7 +165,7 @@ native per_layer_gate for cuda from "cuda/per_layer_gate.cu":
 native project_rows for cuda from "cuda/project_rows.cu":
     static (K, N, WS)
     params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1])
-    where K % 64 == 0 and WS <= 1 and (OPERAND == 0 or INT8 == 0)
+    where K % 64 == 0 and WS <= 1 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or form(W, INT8) == 1)
     scratch staged bytes (M * K * max(1 + OPERAND, 2 * operands(W))) when (M > 1 and operands(W) == 1) or (M > 16 and (INT8 == 1 or OPERAND == 1))
     scratch groups bytes (M * K / 4) when INT8 == 1 and M > 16
     scratch partials bytes (2 * M * N * 4) when M > 16 and M <= 128
@@ -199,7 +200,7 @@ native project_rows for cuda from "cuda/project_rows.cu":
 native dense_output for cuda from "cuda/dense_output.cu":
     static (H, F, DS)
     params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1], code arithmetic KSPLIT in [4, 2, 8])
-    where F % 64 == 0 and DS <= 1 and (OPERAND == 0 or INT8 == 0)
+    where F % 64 == 0 and DS <= 1 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or form(DW, INT8) == 1)
     scratch staged bytes (O * F * max(1 + OPERAND, 2 * operands(DW))) when (O > 1 and operands(DW) == 1) or (O > 16 and (INT8 == 1 or OPERAND == 1))
     scratch groups bytes (O * F / 4) when INT8 == 1 and O > 16
     scratch partials bytes (2 * O * H * 4) when O > 16 and O <= 128

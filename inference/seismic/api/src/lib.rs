@@ -2507,7 +2507,7 @@ impl<E: Entry> BoundEntry<E> {
         device: &Device,
         specialization: &NativeSpecialization,
     ) -> Result<bool, CheckedBundleError> {
-        generated::native_specialization_valid::<E>(device, specialization)
+        generated::native_specialization_valid::<E>(device, specialization, &self.elements)
     }
 
     pub fn prepare(
@@ -3981,9 +3981,10 @@ pub mod generated {
 
     /// The checked native implementation of an entry for a backend, without
     /// opening a device: its declaration-level facts (statics, parameters,
-    /// constraint, whether one is declared). Its launches and scratch read
-    /// the bound elements' operand recipes (`operands(W)`), so evaluating
-    /// them takes [`native_implementation_at`].
+    /// constraint, whether one is declared). Its expressions may read the
+    /// bound elements (`operands(W)`, `form(W, NAME)`), so evaluating them,
+    /// and enumerating or validating configurations where `where` reads
+    /// them, takes [`native_implementation_at`].
     pub fn native_implementation_for_backend<E: Entry>(
         backend: BackendName,
     ) -> Result<Option<NativeImplementation>, CheckedBundleError> {
@@ -3996,7 +3997,7 @@ pub mod generated {
     }
 
     /// The checked native implementation of an entry for a backend at
-    /// element bindings `elements`, every `operands(W)` substituted: the
+    /// element bindings `elements`, every element read substituted: the
     /// declaration a request of these bindings prepares, evaluable without a
     /// device. Metadata-only assessment inspects the same declaration that
     /// execution later prepares.
@@ -4029,8 +4030,8 @@ pub mod generated {
     #[derive(Clone)]
     pub struct NativeGraphCheckedEntry {
         shapes: Arc<seismic_lang::entry::CompiledEntryShapes>,
-        /// The module's declaration at these element bindings (its
-        /// `operands(W)` substituted, `native_implementation_at`): bound for
+        /// The module's declaration at these element bindings (its element
+        /// reads substituted, `native_implementation_at`): bound for
         /// every node and port a graph makes, so it is borrowed, never
         /// copied.
         implementation: &'static NativeImplementation,
@@ -4389,10 +4390,12 @@ pub mod generated {
     }
 
     /// Validate a stored native choice against the opened device's complete
-    /// parameter domain, including Seismic-owned CPU workers and ISA tier.
+    /// parameter domain at element bindings `elements`, including
+    /// Seismic-owned CPU workers and ISA tier.
     pub fn native_specialization_valid<E: Entry>(
         device: &Device,
         specialization: &NativeSpecialization,
+        elements: &[(&str, Element)],
     ) -> Result<bool, CheckedBundleError> {
         let module = E::module()?;
         let entry = E::resolve(module)?;
@@ -4400,6 +4403,7 @@ pub mod generated {
             device.inner(),
             module.checked(),
             entry.id(),
+            &element_bindings(elements),
             specialization,
         ))
     }

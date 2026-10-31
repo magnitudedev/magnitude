@@ -42,7 +42,7 @@ __device__ __forceinline__ void project_gemv(const Pro &source, projection::u8 *
 #ifdef SEISMIC_FORMING_PROJECT_ROWS_STAGE
 template <unsigned INT8, unsigned OPERAND>
 __global__ void project_rows_stage(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
+    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0)>();
     using Operands = projection::GemmOperandsOf<OPERAND, packets::W0>;
     projection::stage_projection_row<S8, Operands>(SOURCE_ROWS, blockIdx.x, SEISMIC_DIM_M, SEISMIC_DIM_K, STAGING, GROUPS);
 }
@@ -69,7 +69,7 @@ __global__ void project_rows_gemv16(SEISMIC_KERNEL_PARAMS) {
 template <unsigned INT8, unsigned OPERAND>
 __global__ void project_rows_gemm_small(SEISMIC_KERNEL_PARAMS) {
     using Operands = projection::GemmOperandsOf<OPERAND, packets::W0>;
-    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
+    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0)>();
     extern __shared__ uint4 dynamic_shared[];
     const unsigned long long column = projection::gemm_column<projection::SmallGemm>();
     constexpr bool STAGED = S8 || Operands::MATERIALIZE || Pro::STAGED;
@@ -84,7 +84,7 @@ __global__ void project_rows_gemm_small(SEISMIC_KERNEL_PARAMS) {
 template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
 __global__ void project_rows_gemm(SEISMIC_KERNEL_PARAMS) {
     using Operands = projection::GemmOperandsOf<OPERAND, packets::W0>;
-    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
+    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0)>();
     using Shape = projection::LargeGemm<ROTATE>;
     extern __shared__ uint4 dynamic_shared[];
     const unsigned long long column = projection::gemm_column<Shape>();

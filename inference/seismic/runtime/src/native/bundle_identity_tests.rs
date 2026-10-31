@@ -172,6 +172,13 @@ fn decoded_kernel_bundle_forms_identical_native_sources() {
                     .native_implementation(decoded_entry, *backend)
                     .expect("the decoded module has the native implementation");
                 assert_eq!(native.launches, decoded_native.launches);
+                // The implementations at the binding, which preparation forms.
+                let native = checked
+                    .native_implementation_at(info.id, *backend, bound)
+                    .expect("the module has the native implementation");
+                let decoded_native = decoded
+                    .native_implementation_at(decoded_entry, *backend, bound)
+                    .expect("the decoded module has the native implementation");
                 let specialization = specialization(native);
                 let asset = |module: &CheckedModule, entry| {
                     module

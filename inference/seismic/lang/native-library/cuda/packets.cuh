@@ -2095,6 +2095,11 @@ template <class W> __device__ __forceinline__ void row_values16(const W &w, u64 
 // Slot bindings. Each bound slot must name a dense tensor or a tensor in the
 // mma16 layout. `KERNEL_Wn_MATRIX(pointer, index)` is the decoder value of
 // matrix `index` of a stacked [B, N, K] tensor bound to slot n.
+// A slot's admission to the int8 GEMM (`form(W, INT8)`, `_FORM_INT8`; 0 for
+// dense weights, which have no forms), as a constant expression of the slot
+// `KERNEL_Wn`.
+#define PACKETS_FORM_INT8(slot) ELEMENT_HAS(slot, _FORM_INT8)
+
 #if defined(KERNEL_W0)
 #if ELEMENT_HAS(KERNEL_W0, _KIND_DENSE)
 namespace packets { typedef Dense<ELEMENT_OF(KERNEL_W0)> W0; }

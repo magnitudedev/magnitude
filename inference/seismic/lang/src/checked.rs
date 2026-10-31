@@ -335,18 +335,20 @@ pub struct CheckedModule {
     inner: Arc<internals::Module>,
     pub(crate) assets: std::collections::BTreeMap<(EntryId, BackendName), String>,
     /// Each native implementation's declarations at element bindings, one
-    /// per combination of the operand recipes it reads, formed when first
-    /// asked for (`native_implementation_at`).
+    /// per combination of the values of the element reads it makes, formed
+    /// when first asked for (`native_implementation_at`).
     bound: Arc<[std::sync::OnceLock<BoundImplementation>]>,
 }
 
 /// A native implementation's declarations at element bindings: one per
-/// combination of the operand recipes of the elements it reads with
-/// `operands(W)` (digit i of a slot's index in base
-/// `OperandRecipe::ALL.len()`, the code of `reads[i]`).
+/// combination of the values of its element reads (`operands(W)`,
+/// `form(W, NAME)`). Digit i of a slot's index, in base
+/// `values[i].len()`, is the position of `reads[i]`'s value in `values[i]`,
+/// every value it takes over the registry's representations.
 #[derive(Debug)]
 struct BoundImplementation {
-    reads: Vec<String>,
+    reads: Vec<(String, ElementQuery)>,
+    values: Vec<Vec<u64>>,
     slots: Vec<std::sync::OnceLock<NativeImplementation>>,
 }
 
@@ -383,9 +385,9 @@ impl CheckedModule {
     }
 
     /// The native implementation of an entry for a backend at element
-    /// bindings `bindings`, every `operands(W)` substituted: formed once per
-    /// combination of the operand recipes it reads, and shared by every
-    /// caller after.
+    /// bindings `bindings`, every element read substituted: formed once per
+    /// combination of the values it reads, and shared by every caller
+    /// after.
     pub fn native_implementation_at(
         &self,
         entry: EntryId,
@@ -399,27 +401,35 @@ impl CheckedModule {
             .position(|native| native.entry == entry && native.backend == backend)?;
         let native = &self.inner.native_implementations[index];
         let bound = self.bound[index].get_or_init(|| {
-            let reads = std::cell::RefCell::new(std::collections::BTreeSet::new());
-            native.at_codes(&|element: &str| {
-                reads.borrow_mut().insert(element.to_owned());
-                0
-            });
-            let reads = reads.into_inner().into_iter().collect::<Vec<_>>();
-            let slots = (0..RECIPES.pow(reads.len() as u32))
+            let reads = native.element_reads();
+            let values = reads
+                .iter()
+                .map(|(_, query)| query.values())
+                .collect::<Vec<_>>();
+            let slots = (0..values.iter().map(Vec::len).product::<usize>())
                 .map(|_| std::sync::OnceLock::new())
                 .collect();
-            BoundImplementation { reads, slots }
+            BoundImplementation {
+                reads,
+                values,
+                slots,
+            }
         });
         if bound.reads.is_empty() {
             return Some(native);
         }
-        const RECIPES: usize = registry::OperandRecipe::ALL.len();
-        let slot = bound.reads.iter().fold(0usize, |slot, element| {
-            let representation = bindings
-                .get(element)
-                .unwrap_or_else(|| panic!("element parameter `{element}` is bound"));
-            slot * RECIPES + registry::representation_info(representation).operands.code() as usize
-        });
+        let slot = bound.reads.iter().zip(&bound.values).fold(
+            0usize,
+            |slot, ((element, query), values)| {
+                let representation = bindings
+                    .get(element)
+                    .unwrap_or_else(|| panic!("element parameter `{element}` is bound"));
+                let digit = values
+                    .binary_search(&query.of(representation))
+                    .expect("a query's values hold its value at every representation");
+                slot * values.len() + digit
+            },
+        );
         Some(bound.slots[slot].get_or_init(|| native.at_elements(bindings)))
     }
 
@@ -841,7 +851,10 @@ pub struct NativeImplementation {
     /// parameters that do not take the default (`f32`, `bf16`, `f16`).
     pub elements: Vec<NativeElementCoverage>,
     /// The `where` condition restricting admissible parameter
-    /// configurations. It reads only static dimensions and parameters.
+    /// configurations. It reads only static dimensions, parameters and the
+    /// elements (`operands(W)`, `form(W, NAME)`), whose reads make the
+    /// configurations the implementation's at its bindings
+    /// ([`Self::at_elements`]).
     pub constraint: Option<NativeCondition>,
     /// Call-private scratch buffers, in ABI order.
     pub scratch: Vec<NativeScratch>,
@@ -865,21 +878,45 @@ pub struct NativeRepeat {
 }
 
 impl NativeImplementation {
-    /// The implementation as formed at `bindings`: every `operands(W)` is
-    /// the operand recipe code of the representation `W` is bound to. The
-    /// checker admits `operands` only over the entry's element parameters,
-    /// and a formation binds every one of them.
+    /// The implementation as formed at `bindings`: every element read
+    /// (`operands(W)`, `form(W, NAME)`) is its value for the representation
+    /// `W` is bound to. The checker admits element reads only over the
+    /// entry's element parameters, and a formation binds every one of them.
     pub fn at_elements(&self, bindings: &ElementBindings) -> Self {
-        self.at_codes(&|element: &str| {
+        self.at_codes(&|element: &str, query: ElementQuery| {
             let representation = bindings
                 .get(element)
                 .unwrap_or_else(|| panic!("element parameter `{element}` is bound"));
-            registry::representation_info(representation).operands.code()
+            query.of(representation)
         })
     }
 
-    /// The implementation with every `operands(W)` replaced by `code(W)`.
-    fn at_codes(&self, code: &impl Fn(&str) -> u64) -> Self {
+    /// The element reads of every expression of the implementation, each
+    /// once, in order.
+    fn element_reads(&self) -> Vec<(String, ElementQuery)> {
+        let reads = std::cell::RefCell::new(std::collections::BTreeSet::new());
+        self.at_codes(&|element: &str, query: ElementQuery| {
+            reads.borrow_mut().insert((element.to_owned(), query));
+            0
+        });
+        reads.into_inner().into_iter().collect()
+    }
+
+    /// Whether the configurations of the implementation are those of every
+    /// formation of it: its `where` reads no element, as it does once
+    /// instantiated at its bindings ([`Self::at_elements`]). Otherwise which
+    /// configurations are admissible depends on the bindings, and
+    /// enumerating or validating them is `Unbound`.
+    fn enumerable(&self) -> Result<(), NativeSpecializationError> {
+        match self.constraint.as_ref().and_then(NativeCondition::element_read) {
+            None => Ok(()),
+            Some((element, query)) => Err(NativeSpecializationError::Unbound(query.spelled(element))),
+        }
+    }
+
+    /// The implementation with every element read replaced by
+    /// `code(W, query)`.
+    fn at_codes(&self, code: &impl Fn(&str, ElementQuery) -> u64) -> Self {
         let expression = |expression: &NativeNatExpr| expression.at_elements(&code);
         let condition = |condition: &NativeCondition| condition.at_elements(&code);
         Self {
@@ -1093,12 +1130,11 @@ pub enum NativeNatExpr {
     Constant(u64),
     Dimension(String),
     Parameter(String),
-    /// `operands(W)`: the operand recipe code
-    /// ([`crate::registry::OperandRecipe::code`]) of the representation
-    /// element parameter `W` is bound to. It has a value only in an
+    /// `query` of the representation element parameter `W` is bound to
+    /// (`operands(W)`, `form(W, NAME)`). It has a value only in an
     /// implementation instantiated at its bindings
     /// ([`NativeImplementation::at_elements`]).
-    Operands(String),
+    Element(String, ElementQuery),
     Add(Box<Self>, Box<Self>),
     Sub(Box<Self>, Box<Self>),
     Mul(Box<Self>, Box<Self>),
@@ -1107,6 +1143,45 @@ pub enum NativeNatExpr {
     CeilDiv(Box<Self>, Box<Self>),
     Min(Box<Self>, Box<Self>),
     Max(Box<Self>, Box<Self>),
+}
+
+/// What a native expression reads of the representation an element
+/// parameter is bound to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ElementQuery {
+    /// `operands(W)`: the operand recipe code
+    /// ([`crate::registry::OperandRecipe::code`]).
+    Operands,
+    /// `form(W, NAME)`: the admitted value of the implementation backend's
+    /// form NAME ([`crate::forms::Form::of`]).
+    Form(crate::forms::Form),
+}
+
+impl ElementQuery {
+    /// The query's value for `representation`.
+    pub fn of(self, representation: RepresentationId) -> u64 {
+        match self {
+            Self::Operands => registry::representation_info(representation).operands.code(),
+            Self::Form(form) => u64::from(form.of(representation)),
+        }
+    }
+
+    /// Every value the query takes over the registry's representations, in
+    /// increasing order.
+    fn values(self) -> Vec<u64> {
+        match self {
+            Self::Operands => registry::OperandRecipe::ALL.map(registry::OperandRecipe::code).to_vec(),
+            Self::Form(form) => form.values().into_iter().map(u64::from).collect(),
+        }
+    }
+
+    /// The query as a declaration spells it over element parameter `element`.
+    fn spelled(self, element: &str) -> String {
+        match self {
+            Self::Operands => format!("operands({element})"),
+            Self::Form(form) => format!("form({element}, {})", form.name()),
+        }
+    }
 }
 
 /// What a native condition is over ranges of the names it reads.
@@ -1141,13 +1216,13 @@ impl std::fmt::Display for NativeEvalError {
 }
 
 impl NativeNatExpr {
-    /// The expression with every `operands(W)` replaced by `code(W)`.
-    fn at_elements(&self, code: &impl Fn(&str) -> u64) -> Self {
+    /// The expression with every element read replaced by `code(W, query)`.
+    fn at_elements(&self, code: &impl Fn(&str, ElementQuery) -> u64) -> Self {
         let binary = |left: &Self, right: &Self, make: fn(Box<Self>, Box<Self>) -> Self| {
             make(Box::new(left.at_elements(code)), Box::new(right.at_elements(code)))
         };
         match self {
-            Self::Operands(element) => Self::Constant(code(element)),
+            Self::Element(element, query) => Self::Constant(code(element, *query)),
             Self::Constant(_) | Self::Dimension(_) | Self::Parameter(_) => self.clone(),
             Self::Add(left, right) => binary(left, right, Self::Add),
             Self::Sub(left, right) => binary(left, right, Self::Sub),
@@ -1179,7 +1254,7 @@ impl NativeNatExpr {
             Self::Parameter(name) => {
                 parameter(name).ok_or_else(|| NativeEvalError::Unbound(name.clone()))
             }
-            Self::Operands(element) => Err(NativeEvalError::Unbound(format!("operands({element})"))),
+            Self::Element(element, query) => Err(NativeEvalError::Unbound(query.spelled(element))),
             Self::Add(left, right) => binary(left, right, u64::checked_add),
             Self::Sub(left, right) => binary(left, right, u64::checked_sub),
             Self::Mul(left, right) => binary(left, right, u64::checked_mul),
@@ -1216,7 +1291,7 @@ impl NativeNatExpr {
             Self::Constant(value) => Some((*value, *value)),
             Self::Dimension(name) => dimension(name),
             Self::Parameter(name) => parameter(name),
-            Self::Operands(_) => None,
+            Self::Element(..) => None,
             Self::Add(left, right) => {
                 let ((a, b), (c, d)) = operands(left, right)?;
                 Some((a + c, b.checked_add(d)?))
@@ -1255,7 +1330,7 @@ impl NativeNatExpr {
     /// Every dimension name the expression reads.
     pub fn dimensions(&self, out: &mut Vec<String>) {
         match self {
-            Self::Constant(_) | Self::Parameter(_) | Self::Operands(_) => {}
+            Self::Constant(_) | Self::Parameter(_) | Self::Element(..) => {}
             Self::Dimension(name) => {
                 if !out.contains(name) {
                     out.push(name.clone());
@@ -1278,7 +1353,7 @@ impl NativeNatExpr {
     /// Every tuning parameter name the expression reads.
     pub fn parameters(&self, out: &mut Vec<String>) {
         match self {
-            Self::Constant(_) | Self::Dimension(_) | Self::Operands(_) => {}
+            Self::Constant(_) | Self::Dimension(_) | Self::Element(..) => {}
             Self::Parameter(name) => {
                 if !out.contains(name) {
                     out.push(name.clone());
@@ -1298,13 +1373,29 @@ impl NativeNatExpr {
         }
     }
 
+    /// The first element read of the expression, if it makes one.
+    fn element_read(&self) -> Option<(&str, ElementQuery)> {
+        match self {
+            Self::Element(element, query) => Some((element, *query)),
+            Self::Constant(_) | Self::Dimension(_) | Self::Parameter(_) => None,
+            Self::Add(left, right)
+            | Self::Sub(left, right)
+            | Self::Mul(left, right)
+            | Self::Div(left, right)
+            | Self::Rem(left, right)
+            | Self::CeilDiv(left, right)
+            | Self::Min(left, right)
+            | Self::Max(left, right) => left.element_read().or_else(|| right.element_read()),
+        }
+    }
+
     /// Every integer literal the expression contains.
     pub fn constants(&self, out: &mut std::collections::BTreeSet<u64>) {
         match self {
             Self::Constant(value) => {
                 out.insert(*value);
             }
-            Self::Dimension(_) | Self::Parameter(_) | Self::Operands(_) => {}
+            Self::Dimension(_) | Self::Parameter(_) | Self::Element(..) => {}
             Self::Add(left, right)
             | Self::Sub(left, right)
             | Self::Mul(left, right)
@@ -1321,8 +1412,8 @@ impl NativeNatExpr {
 }
 
 impl NativeCondition {
-    /// The condition with every `operands(W)` replaced by `code(W)`.
-    fn at_elements(&self, code: &impl Fn(&str) -> u64) -> Self {
+    /// The condition with every element read replaced by `code(W, query)`.
+    fn at_elements(&self, code: &impl Fn(&str, ElementQuery) -> u64) -> Self {
         match self {
             Self::Compare {
                 comparison,
@@ -1341,6 +1432,16 @@ impl NativeCondition {
                 Box::new(left.at_elements(code)),
                 Box::new(right.at_elements(code)),
             ),
+        }
+    }
+
+    /// The first element read of the condition, if it makes one.
+    fn element_read(&self) -> Option<(&str, ElementQuery)> {
+        match self {
+            Self::Compare { left, right, .. } => left.element_read().or_else(|| right.element_read()),
+            Self::And(left, right) | Self::Or(left, right) => {
+                left.element_read().or_else(|| right.element_read())
+            }
         }
     }
 
@@ -1768,6 +1869,10 @@ pub enum NativeSpecializationError {
         low: u64,
         high: u64,
     },
+    /// The `where` condition reads an element (this read), so the
+    /// configurations are those of the implementation at its bindings
+    /// ([`NativeImplementation::at_elements`]), not of the declaration.
+    Unbound(String),
 }
 
 impl std::fmt::Display for NativeSpecializationError {
@@ -1806,6 +1911,10 @@ impl std::fmt::Display for NativeSpecializationError {
             Self::EmptyRange { name, low, high } => {
                 write!(f, "the range {low}..={high} of `{name}` admits no value")
             }
+            Self::Unbound(read) => write!(
+                f,
+                "native `where` reads `{read}`: its configurations are the implementation's at element bindings"
+            ),
         }
     }
 }
@@ -1815,6 +1924,15 @@ impl std::error::Error for NativeSpecializationError {}
 impl NativeImplementation {
     /// Check a complete specialization against the declaration.
     pub fn validate(
+        &self,
+        specialization: &NativeSpecialization,
+    ) -> Result<(), NativeSpecializationError> {
+        self.enumerable()?;
+        self.validate_enumerable(specialization)
+    }
+
+    /// [`Self::validate`] of an implementation that is enumerable.
+    fn validate_enumerable(
         &self,
         specialization: &NativeSpecialization,
     ) -> Result<(), NativeSpecializationError> {
@@ -2034,9 +2152,14 @@ impl NativeImplementation {
     /// depth-first search over the statics in declaration order: every
     /// top-level conjunct of `where` that the assigned and fixed statics
     /// decide as false prunes a partial assignment. `None` when no
-    /// assignment over the candidates is admitted.
-    pub fn search_statics(&self, fixed: &[(&str, u64)]) -> Option<NativeSpecialization> {
-        self.search(fixed, &|_| None, &|statics| {
+    /// assignment over the candidates is admitted; `Unbound` where the
+    /// admitted assignments depend on the element bindings.
+    pub fn search_statics(
+        &self,
+        fixed: &[(&str, u64)],
+    ) -> Result<Option<NativeSpecialization>, NativeSpecializationError> {
+        self.enumerable()?;
+        Ok(self.search(fixed, &|_| None, &|statics| {
             // A walk that cannot fail succeeds once it admits one.
             let infallible = self.infallible(statics);
             let mut admitted = false;
@@ -2046,7 +2169,7 @@ impl NativeImplementation {
             })
             .ok()?;
             admitted.then(|| statics.clone())
-        })
+        }))
     }
 
     /// The first admissible configuration that holds the tuning parameter
@@ -2054,13 +2177,16 @@ impl NativeImplementation {
     /// assignments [`Self::search_statics`] walks, in its order: the
     /// configuration of a form that only some statics admit (a head width,
     /// say). The value of an entry parameter joins the assigned statics in
-    /// pruning. `None` when no assignment over the candidates admits it.
+    /// pruning. `None` when no assignment over the candidates admits it;
+    /// `Unbound` where the admitted configurations depend on the element
+    /// bindings.
     pub fn search_form(
         &self,
         launch: Option<usize>,
         name: &str,
         value: u64,
-    ) -> Option<NativeSpecialization> {
+    ) -> Result<Option<NativeSpecialization>, NativeSpecializationError> {
+        self.enumerable()?;
         let held = |configuration: &NativeSpecialization| match launch {
             None => configuration.param(name),
             Some(launch) => configuration.launch_param(launch, name),
@@ -2079,7 +2205,7 @@ impl NativeImplementation {
             .iter()
             .any(|parameter| parameter.name == name && parameter.values.contains(&value))
         {
-            return None;
+            return Ok(None);
         }
         for parameter in parameters
             .iter_mut()
@@ -2094,8 +2220,10 @@ impl NativeImplementation {
         // `D % 256 == 0`). Every assignment those domains refute admits no
         // such configuration, so the first assignment found is the same,
         // and none is searched for a value no configuration holds.
-        let narrowed = holding.narrowed(&NativeSpecialization::new())?;
-        narrowed.search(&[], &parameter, &|statics| {
+        let Some(narrowed) = holding.narrowed(&NativeSpecialization::new()) else {
+            return Ok(None);
+        };
+        Ok(narrowed.search(&[], &parameter, &|statics| {
             let mut found = None;
             if self.infallible(statics) {
                 holding
@@ -2116,7 +2244,7 @@ impl NativeImplementation {
                 .ok()?;
             }
             found
-        })
+        }))
     }
 
     /// The bounds of every tuning parameter a specialization walk resolves
@@ -2390,6 +2518,7 @@ impl NativeImplementation {
         mut keep_going: impl FnMut() -> bool,
         mut visit: impl FnMut(&NativeSpecialization) -> bool,
     ) -> Result<(), NativeSpecializationError> {
+        self.enumerable()?;
         let mut base = NativeSpecialization::new();
         for name in &self.statics {
             let value = statics
@@ -2532,7 +2661,7 @@ impl NativeImplementation {
                 let admitted = if decided && !failed {
                     Ok(())
                 } else {
-                    self.validate(&configuration)
+                    self.validate_enumerable(&configuration)
                 };
                 match admitted {
                     Ok(()) => {
@@ -3159,24 +3288,24 @@ mod native_tests {
         let native = module
             .native_implementation(module.entries()[0].id, BackendName::Metal)
             .unwrap();
-        let first = native.search_statics(&[]).unwrap();
+        let first = native.search_statics(&[]).unwrap().unwrap();
         assert_eq!(first.static_value("N"), Some(2));
-        let narrow = native.search_form(None, "WIDE", 0).unwrap();
+        let narrow = native.search_form(None, "WIDE", 0).unwrap().unwrap();
         assert_eq!(
             (narrow.static_value("N"), narrow.param("ROWS")),
             (Some(2), Some(8))
         );
-        let wide = native.search_form(None, "WIDE", 1).unwrap();
+        let wide = native.search_form(None, "WIDE", 1).unwrap().unwrap();
         assert_eq!(wide.static_value("N"), Some(96));
         assert_eq!((wide.param("WIDE"), wide.param("ROWS")), (Some(1), Some(4)));
         assert!(native.validate(&wide).is_ok());
-        assert!(native.search_form(None, "WIDE", 2).is_none());
+        assert!(native.search_form(None, "WIDE", 2).unwrap().is_none());
 
         let module = check_source(source(&declaration("(WIDE == 0 or N < 1)"))).unwrap();
         let native = module
             .native_implementation(module.entries()[0].id, BackendName::Metal)
             .unwrap();
-        assert!(native.search_form(None, "WIDE", 1).is_none());
+        assert!(native.search_form(None, "WIDE", 1).unwrap().is_none());
     }
 
     /// A form value that constrains the statics only through another
@@ -3194,7 +3323,7 @@ mod native_tests {
         let native = module
             .native_implementation(module.entries()[0].id, BackendName::Metal)
             .unwrap();
-        let packed = native.search_form(None, "RESIDUE", 2).unwrap();
+        let packed = native.search_form(None, "RESIDUE", 2).unwrap().unwrap();
         assert_eq!(packed.static_value("N"), Some(256));
         assert_eq!(
             (packed.param("PACK"), packed.param("ROWS")),
@@ -3204,7 +3333,7 @@ mod native_tests {
         let native = module
             .native_implementation(module.entries()[0].id, BackendName::Metal)
             .unwrap();
-        assert!(native.search_form(None, "RESIDUE", 2).is_none());
+        assert!(native.search_form(None, "RESIDUE", 2).unwrap().is_none());
     }
 
     /// Over ranges of the names it reads, a condition is decided only where
@@ -3259,7 +3388,7 @@ mod native_tests {
             .native_implementation(module.entries()[0].id, BackendName::Metal)
             .unwrap();
         let found = |fixed: &[(&str, u64)]| {
-            native.search_statics(fixed).map(|statics| {
+            native.search_statics(fixed).unwrap().map(|statics| {
                 (
                     statics.static_value("A"),
                     statics.static_value("B"),
@@ -3524,6 +3653,72 @@ mod native_tests {
                 .to_string()
                 .contains("already has a native implementation")
         );
+    }
+
+    /// `form(W, NAME)` is the backend's admission of form NAME for the
+    /// representation `W` is bound to, and `where` may read it: the
+    /// configurations are the implementation's at its bindings, and the
+    /// declaration's own are `Unbound`. A name the backend has no form of is
+    /// a declaration error.
+    #[test]
+    fn where_reads_the_forms_of_the_bound_elements() {
+        let check = |native: &str| {
+            let mut sources = SourceSet::default();
+            sources.push(SourceFile {
+                path: "ops.seismic".to_owned(),
+                text: format!(
+                    "fn copy[N](src: &tensor[N] A, dst: &mut tensor[N] A, w: &tensor[N] W):\n    dst[0:N] = src[0:N]\n\n{native}"
+                ),
+            });
+            check_source(sources)
+        };
+        let declaration = |form: &str| {
+            format!(
+                "native copy for cuda from \"copy.cu\":\n    params (code INT8 in [0, 1])\n    where INT8 == 0 or form(W, {form}) == 1\n    launch copy:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
+            )
+        };
+        let module = check(&declaration("INT8")).expect("`where` reads a CUDA form");
+        let entry = module.entry_named("copy").unwrap();
+        let native = module.native_implementation(entry, BackendName::Cuda).unwrap();
+        let statics = NativeSpecialization::new();
+        assert_eq!(
+            native.default_specialization(&statics),
+            Err(NativeSpecializationError::Unbound("form(W, INT8)".to_owned()))
+        );
+        assert!(matches!(
+            native.search_statics(&[]),
+            Err(NativeSpecializationError::Unbound(_))
+        ));
+        let int8 = |weight: RepresentationId| {
+            let storage = registry::representation_info(weight).name;
+            let bindings = ElementBindings::new()
+                .bind("A", registry::dense(DType::F32))
+                .bind("W", weight);
+            let bound = module
+                .native_implementation_at(entry, BackendName::Cuda, &bindings)
+                .unwrap();
+            assert_eq!(bound, &native.at_elements(&bindings), "{storage}");
+            bound
+                .admissible(&statics)
+                .unwrap()
+                .iter()
+                .map(|configuration| configuration.param("INT8").unwrap())
+                .collect::<Vec<_>>()
+        };
+        let mma16 = |storage| registry::storage(storage, registry::Layout::Mma16).unwrap();
+        assert_eq!(int8(mma16("q4k")), [0, 1]);
+        assert_eq!(int8(mma16("nvfp4g16a4")), [0]);
+        assert_eq!(int8(registry::dense(DType::BF16)), [0]);
+        for (form, message) in [
+            ("INT9", "`INT9` is not a form of `cuda`; its forms are GEMM_FOLD, INT8"),
+            ("PACK", "`PACK` is not a form of `cuda`"),
+        ] {
+            let error = check(&declaration(form)).expect_err("a misspelled form fails checking");
+            assert!(error.to_string().contains(message), "{error}");
+        }
+        let error = check(&declaration("INT8").replace("form(W,", "form(N,"))
+            .expect_err("a form reads an element parameter");
+        assert!(error.to_string().contains("`form` reads one of the entry's element parameters"), "{error}");
     }
 
     /// `elements` lists the dense types a CPU form compiles a stored element

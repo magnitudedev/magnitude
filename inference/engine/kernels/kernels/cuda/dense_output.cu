@@ -57,7 +57,7 @@ __device__ __forceinline__ void output_gemv(const Pro &product, projection::u8 *
 template <unsigned INT8, unsigned OPERAND>
 __global__ void dense_output_stage(SEISMIC_KERNEL_PARAMS) {
     seismic_dependency_start();
-    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
+    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0)>();
     using Operands = projection::GemmOperandsOf<OPERAND, packets::W0>;
     projection::stage_projection_row<S8, Operands>(PRODUCT, blockIdx.x, SEISMIC_DIM_O, SEISMIC_DIM_F, STAGING, GROUPS);
 }
@@ -84,7 +84,7 @@ __global__ void dense_output_gemv16(SEISMIC_KERNEL_PARAMS) {
 template <unsigned INT8, unsigned OPERAND>
 __global__ void dense_output_gemm_small(SEISMIC_KERNEL_PARAMS) {
     using Operands = projection::GemmOperandsOf<OPERAND, packets::W0>;
-    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
+    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0)>();
     extern __shared__ uint4 dynamic_shared[];
     seismic_dependency_start();
     const unsigned long long column = projection::gemm_column<projection::SmallGemm>();
@@ -100,7 +100,7 @@ __global__ void dense_output_gemm_small(SEISMIC_KERNEL_PARAMS) {
 template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
 __global__ void dense_output_gemm(SEISMIC_KERNEL_PARAMS) {
     using Operands = projection::GemmOperandsOf<OPERAND, packets::W0>;
-    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
+    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0)>();
     using Shape = projection::LargeGemm<ROTATE>;
     extern __shared__ uint4 dynamic_shared[];
     seismic_dependency_start();

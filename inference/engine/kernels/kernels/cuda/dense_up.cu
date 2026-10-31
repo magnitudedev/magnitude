@@ -69,7 +69,7 @@ __device__ __forceinline__ void up_gemm(const projection::u8 *staged, const void
 template <unsigned INT8, unsigned OPERAND>
 __global__ void dense_up_stage(SEISMIC_KERNEL_PARAMS) {
     seismic_dependency_start();
-    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
+    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0)>();
     using Operands = projection::GemmOperandsOf<OPERAND, packets::W0>;
     projection::stage_projection_row<S8, Operands>(PROLOGUE, blockIdx.x, SEISMIC_DIM_O, SEISMIC_DIM_H, STAGING, GROUPS);
 }
@@ -96,7 +96,7 @@ __global__ void dense_up_gemv16(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_DENSE_UP_GEMM_SMALL
 template <unsigned INT8, unsigned OPERAND>
 __global__ void dense_up_gemm_small(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
+    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0)>();
     up_gemm<projection::SmallGemm, S8, projection::GemmOperandsOf<OPERAND, packets::W0>>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F, UP,
                                        EPILOGUE);
 }
@@ -105,7 +105,7 @@ __global__ void dense_up_gemm_small(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_DENSE_UP_GEMM
 template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
 __global__ void dense_up_gemm(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
+    constexpr bool S8 = projection::int8_path<INT8, PACKETS_FORM_INT8(KERNEL_W0)>();
     up_gemm<projection::LargeGemm<ROTATE>, S8, projection::GemmOperandsOf<OPERAND, packets::W0>>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H,
                                                   SEISMIC_DIM_F, UP, EPILOGUE);
 }

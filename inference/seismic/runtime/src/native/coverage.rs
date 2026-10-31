@@ -27,6 +27,11 @@
 //! representation it is not implemented at is reported as untaken. Every
 //! change of a binding the search makes carries those tied slots with it.
 //!
+//! The configurations a row may hold are its implementation's at its
+//! bindings, whose `where` may read them (`form(W, NAME)`). A change of a
+//! binding keeps the row's configuration where the new bindings admit it,
+//! and otherwise takes their first at its statics.
+//!
 //! A `form` tuning parameter selects a structurally different algorithm,
 //! which a kernel may take without a preprocessor group (a template chosen
 //! by a constant, say) and which its declaration may admit only at some
@@ -827,23 +832,29 @@ fn representations() -> Vec<RepresentationId> {
 }
 
 /// The checked inputs of one entry's implementation on one backend.
+///
+/// Which configurations are admissible is the implementation's at a row's
+/// bindings ([`Subject::implementation`]), whose `where` may read them; the
+/// declaration holds what every binding shares (its source, statics,
+/// parameters and launches).
 struct Subject<'m> {
     module: &'m CheckedModule,
     info: &'m EntryInfo,
-    implementation: &'m NativeImplementation,
+    backend: BackendName,
+    declaration: &'m NativeImplementation,
     asset: &'m str,
     label: String,
     /// Each element parameter's candidate representations.
     candidates: Vec<(String, Vec<RepresentationId>)>,
     /// Whether the entry monomorphizes at a binding, by binding.
     admitted: std::sync::Mutex<std::collections::HashMap<String, bool>>,
-    /// Searched statics, by the statics fixed.
+    /// Searched statics, by implementation ([`Bound`]) and the statics fixed.
     searched: std::sync::Mutex<
-        std::collections::HashMap<Vec<(String, u64)>, Option<NativeSpecialization>>,
+        std::collections::HashMap<(Bound, Vec<(String, u64)>), Option<NativeSpecialization>>,
     >,
-    /// Admissible specializations, by statics.
+    /// Admissible specializations, by implementation and statics.
     specializations: std::sync::Mutex<
-        std::collections::HashMap<NativeSpecialization, std::sync::Arc<Admissible<'m>>>,
+        std::collections::HashMap<(Bound, NativeSpecialization), std::sync::Arc<Admissible<'m>>>,
     >,
     /// Whether programs are formed per code variant (CUDA and Metal).
     variant_programs: bool,
@@ -856,11 +867,11 @@ impl<'m> Subject<'m> {
         backend: BackendName,
         candidates: Vec<(String, Vec<RepresentationId>)>,
     ) -> Option<Self> {
-        let implementation = module.native_implementation(info.id, backend)?;
+        let declaration = module.native_implementation(info.id, backend)?;
         let asset = module
             .native_asset(info.id, backend)
             .expect("a checked module captures every native asset");
-        let label = std::path::Path::new(&implementation.source_path)
+        let label = std::path::Path::new(&declaration.source_path)
             .file_name()
             .expect("a native asset path names a file")
             .to_string_lossy()
@@ -868,7 +879,8 @@ impl<'m> Subject<'m> {
         Some(Self {
             module,
             info,
-            implementation,
+            backend,
+            declaration,
             asset,
             label,
             candidates,
@@ -879,8 +891,22 @@ impl<'m> Subject<'m> {
         })
     }
 
-    /// [`NativeImplementation::search_statics`], once per `fixed`.
-    fn statics(&self, fixed: &[(&str, u64)]) -> Option<NativeSpecialization> {
+    /// The implementation at `bindings`, every element read substituted
+    /// ([`CheckedModule::native_implementation_at`]): the one value of the
+    /// module's that every binding of the same reads shares.
+    fn implementation(&self, bindings: &ElementBindings) -> &'m NativeImplementation {
+        self.module
+            .native_implementation_at(self.info.id, self.backend, bindings)
+            .expect("a subject's entry has a native implementation")
+    }
+
+    /// [`NativeImplementation::search_statics`] of `implementation`, once per
+    /// `fixed`.
+    fn statics(
+        &self,
+        implementation: &'m NativeImplementation,
+        fixed: &[(&str, u64)],
+    ) -> Option<NativeSpecialization> {
         let key = fixed
             .iter()
             .map(|(name, value)| ((*name).to_owned(), *value))
@@ -890,27 +916,75 @@ impl<'m> Subject<'m> {
             .lock()
             .expect("no thread panics holding the cache");
         searched
-            .entry(key)
-            .or_insert_with(|| self.implementation.search_statics(fixed))
+            .entry((Bound::of(implementation), key))
+            .or_insert_with(|| {
+                implementation
+                    .search_statics(fixed)
+                    .expect("an implementation at bindings reads no element")
+            })
             .clone()
     }
 
-    /// The admissible specializations at `statics`, walked once.
-    fn admissible(&self, statics: &NativeSpecialization) -> std::sync::Arc<Admissible<'m>> {
+    /// The admissible specializations of `implementation` at `statics`,
+    /// walked once.
+    fn admissible(
+        &self,
+        implementation: &'m NativeImplementation,
+        statics: &NativeSpecialization,
+    ) -> std::sync::Arc<Admissible<'m>> {
         let mut walked = self
             .specializations
             .lock()
             .expect("no thread panics holding the cache");
         walked
-            .entry(statics.clone())
+            .entry((Bound::of(implementation), statics.clone()))
             .or_insert_with(|| {
                 std::sync::Arc::new(Admissible::walk(
-                    self.implementation,
+                    implementation,
                     statics,
                     self.variant_programs,
                 ))
             })
             .clone()
+    }
+
+    /// The row at `bindings` (searched statics' defaults), when the
+    /// implementation there admits some statics.
+    fn based(&self, bindings: ElementBindings, configuration: Configuration) -> Option<Row> {
+        let implementation = self.implementation(&bindings);
+        let statics = self.statics(implementation, &[])?;
+        Some(Row {
+            specialization: implementation
+                .default_specialization(&statics)
+                .expect("searched statics admit a configuration"),
+            bindings,
+            configuration,
+        })
+    }
+
+    /// `row` at `bindings`: its specialization where the implementation at
+    /// them admits it, else theirs first at its statics; `None` when those
+    /// bindings admit no configuration at its statics.
+    fn rebound(&self, row: &Row, bindings: ElementBindings) -> Option<Row> {
+        let implementation = self.implementation(&bindings);
+        let specialization = match implementation.validate(&row.specialization) {
+            Ok(()) => row.specialization.clone(),
+            Err(seismic_lang::checked::NativeSpecializationError::Inadmissible) => {
+                match implementation.default_specialization(&statics_of(&row.specialization)) {
+                    Ok(specialization) => specialization,
+                    Err(seismic_lang::checked::NativeSpecializationError::Inadmissible) => {
+                        return None;
+                    }
+                    Err(error) => panic!("a row's statics are the declaration's: {error}"),
+                }
+            }
+            Err(error) => panic!("a row's specialization is the declaration's: {error}"),
+        };
+        Some(Row {
+            bindings,
+            specialization,
+            configuration: row.configuration,
+        })
     }
 
     /// `bindings` with `parameter` bound to `representation`, and every
@@ -973,10 +1047,12 @@ impl<'m> Subject<'m> {
         admitted
     }
 
-    /// The code variants of each launch at `specialization`'s statics: every
-    /// template instance an admissible configuration names.
-    fn variants(&self, specialization: &NativeSpecialization) -> Vec<Vec<LaunchVariant>> {
-        self.admissible(&statics_of(specialization)).variants.clone()
+    /// The code variants of each launch at `row`'s bindings and statics:
+    /// every template instance an admissible configuration names.
+    fn variants(&self, row: &Row) -> Vec<Vec<LaunchVariant>> {
+        self.admissible(self.implementation(&row.bindings), &statics_of(&row.specialization))
+            .variants
+            .clone()
     }
 
     /// The programs preparation forms for `row`, every code variant of a
@@ -987,18 +1063,18 @@ impl<'m> Subject<'m> {
             .entry(self.info.id, &row.bindings)
             .expect("a row's bindings are admitted");
         let dialect = row.configuration.dialect();
+        let implementation = self.implementation(&row.bindings);
         match dialect {
             Dialect::Vulkan(_) => vec![ProgramSource {
                 text: render_source(
                     dialect,
                     &logical,
                     &row.bindings,
-                    self.implementation,
+                    implementation,
                     &row.specialization,
                     self.asset,
                 ),
-                entries: self
-                    .implementation
+                entries: implementation
                     .launches
                     .iter()
                     .map(|launch| ProgramEntry::named(launch.kernel.as_str()))
@@ -1008,10 +1084,10 @@ impl<'m> Subject<'m> {
                 dialect,
                 &logical,
                 &row.bindings,
-                self.implementation,
+                implementation,
                 &row.specialization,
                 self.asset,
-                &self.variants(&row.specialization),
+                &self.variants(row),
             ),
         }
     }
@@ -1019,8 +1095,8 @@ impl<'m> Subject<'m> {
     /// How many programs [`Self::programs`] renders for a row: one per
     /// launch for a launch-scoped CUDA or Metal implementation, else one.
     fn programs_per_row(&self) -> usize {
-        if self.variant_programs && self.implementation.launch_scoped() {
-            self.implementation.launches.len().max(1)
+        if self.variant_programs && self.declaration.launch_scoped() {
+            self.declaration.launches.len().max(1)
         } else {
             1
         }
@@ -1044,7 +1120,7 @@ impl<'m> Subject<'m> {
     }
 
     fn kernels(&self) -> Vec<&str> {
-        self.implementation
+        self.declaration
             .launches
             .iter()
             .map(|launch| launch.kernel.as_str())
@@ -1069,6 +1145,19 @@ impl<'m> Subject<'m> {
             configuration: row.configuration,
             error,
         }
+    }
+}
+
+/// An implementation at bindings by identity: each is one value of the
+/// module's ([`CheckedModule::native_implementation_at`]), shared by every
+/// binding of the same element reads, so its address names it while the
+/// module lives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Bound(usize);
+
+impl Bound {
+    fn of(implementation: &NativeImplementation) -> Self {
+        Self(std::ptr::from_ref(implementation) as usize)
     }
 }
 
@@ -1461,17 +1550,22 @@ fn variant_of(
 /// row order. The nearest configurations of rows sharing statics come from
 /// one set of walks.
 fn variations(subject: &Subject<'_>, former: &Former, rows: &[Row]) -> Vec<Row> {
-    let mut groups: Vec<(NativeSpecialization, Vec<usize>)> = Vec::new();
+    let mut groups: Vec<((Bound, NativeSpecialization), Vec<usize>)> = Vec::new();
+    let mut implementations = Vec::new();
     for (index, row) in rows.iter().enumerate() {
-        let statics = statics_of(&row.specialization);
-        match groups.iter_mut().find(|(held, _)| *held == statics) {
+        let implementation = subject.implementation(&row.bindings);
+        let key = (Bound::of(implementation), statics_of(&row.specialization));
+        match groups.iter_mut().find(|(held, _)| *held == key) {
             Some((_, indices)) => indices.push(index),
-            None => groups.push((statics, vec![index])),
+            None => {
+                groups.push((key, vec![index]));
+                implementations.push(implementation);
+            }
         }
     }
     let mut nearest = vec![Vec::new(); rows.len()];
-    for (statics, indices) in groups {
-        let admissible = subject.admissible(&statics);
+    for (((_, statics), indices), implementation) in groups.into_iter().zip(implementations) {
+        let admissible = subject.admissible(implementation, &statics);
         let helds = indices
             .iter()
             .map(|index| admissible.codes_of(&rows[*index].specialization))
@@ -1503,23 +1597,20 @@ fn row_variations(
             }
             let bindings = subject.rebind(&row.bindings, parameter, *representation);
             if subject.admits(&bindings) {
-                rows.push(Row {
-                    bindings,
-                    ..row.clone()
-                });
+                rows.extend(subject.rebound(row, bindings));
             }
         }
     }
-    let implementation = subject.implementation;
+    let implementation = subject.implementation(&row.bindings);
     let statics = statics_of(&row.specialization);
     for name in &implementation.statics {
         for value in [0, 1] {
             if statics.static_value(name) == Some(value) {
                 continue;
             }
-            if let Some(found) = subject.statics(&[(name.as_str(), value)]) {
+            if let Some(found) = subject.statics(implementation, &[(name.as_str(), value)]) {
                 rows.push(Row {
-                    specialization: subject.admissible(&found).first.clone(),
+                    specialization: subject.admissible(implementation, &found).first.clone(),
                     ..row.clone()
                 });
             }
@@ -1729,23 +1820,12 @@ impl Search {
 }
 
 fn search(subject: &Subject<'_>, forms: Forms<'_>) -> Result<Option<Search>, CoverageError> {
-    let implementation = subject.implementation;
-    let Some(statics) = subject.statics(&[]) else {
-        return Ok(None);
-    };
-    let specialization = implementation
-        .default_specialization(&statics)
-        .expect("searched statics admit a configuration");
     let mut search = Search::default();
     // The base: the first binding in candidate order that is admitted,
     // implemented and not rejected by the toolchain.
     let base = base_row(
         subject,
-        Row {
-            bindings: ElementBindings::new(),
-            specialization,
-            configuration: forms.former.base(),
-        },
+        forms.former.base(),
         |row, mut evaluated| {
             search
                 .universe
@@ -1795,11 +1875,13 @@ fn search(subject: &Subject<'_>, forms: Forms<'_>) -> Result<Option<Search>, Cov
     Ok(Some(search))
 }
 
-/// The first binding in candidate order that is admitted and that `accept`
-/// takes, given its evaluation, as a row like `template`.
+/// The first binding in candidate order that is admitted, whose
+/// implementation admits some statics, and that `accept` takes, given its
+/// evaluation, as a row of `configuration` at the searched statics' defaults
+/// ([`Subject::based`]).
 fn base_row(
     subject: &Subject<'_>,
-    template: Row,
+    configuration: Configuration,
     mut accept: impl FnMut(&Row, Evaluation) -> bool,
 ) -> Result<Option<Row>, CoverageError> {
     if subject
@@ -1817,11 +1899,11 @@ fn base_row(
                 bindings.bind(parameter, candidates[*index])
             },
         );
-        if subject.admits(&bindings) {
-            let row = Row {
-                bindings,
-                ..template.clone()
-            };
+        if let Some(row) = subject
+            .admits(&bindings)
+            .then(|| subject.based(bindings, configuration))
+            .flatten()
+        {
             let evaluated = evaluate(subject, std::slice::from_ref(&row))?;
             if accept(&row, evaluated) {
                 return Ok(Some(row));
@@ -1864,11 +1946,9 @@ fn untaken_at(
             .filter(|representation| {
                 registry::representation_info(**representation).layout == layout
             })
-            .map(|representation| Row {
-                bindings: subject.rebind(&base.bindings, parameter, *representation),
-                ..base.clone()
-            })
-            .filter(|row| subject.admits(&row.bindings))
+            .map(|representation| subject.rebind(&base.bindings, parameter, *representation))
+            .filter(|bindings| subject.admits(bindings))
+            .filter_map(|bindings| subject.rebound(base, bindings))
             .collect::<Vec<_>>();
         let reached = evaluate(subject, &rows)?.reached;
         if reached.iter().all(Option::is_none) {
@@ -1914,20 +1994,9 @@ pub fn untaken(
     let former = &toolchain.former;
     let subjects = subjects(module, former.backend());
     let found = in_parallel(&subjects, |subject| {
-        let Some(statics) = subject.statics(&[]) else {
-            return Ok(Vec::new());
-        };
-        let specialization = subject
-            .implementation
-            .default_specialization(&statics)
-            .expect("searched statics admit a configuration");
         let base = base_row(
             subject,
-            Row {
-                bindings: ElementBindings::new(),
-                specialization,
-                configuration: former.base(),
-            },
+            former.base(),
             |_, mut evaluated| {
                 evaluated
                     .reached
@@ -1971,7 +2040,7 @@ fn form_values(
     base: &Row,
     search: &mut Search,
 ) -> Result<(), CoverageError> {
-    let implementation = subject.implementation;
+    let implementation = subject.implementation(&base.bindings);
     let values: Vec<Form<'_>> = implementation
         .params
         .iter()
@@ -2009,9 +2078,15 @@ fn form_values(
             .iter()
             .chain(rows.iter().map(|(_, row)| row))
             .map(|row| &row.specialization)
-            .find(|specialization| holds(specialization, *form))
+            .find(|specialization| {
+                holds(specialization, *form) && implementation.validate(specialization).is_ok()
+            })
             .cloned()
-            .or_else(|| implementation.search_form(form.0, form.1, form.2));
+            .or_else(|| {
+                implementation
+                    .search_form(form.0, form.1, form.2)
+                    .expect("an implementation at bindings reads no element")
+            });
         let Some(specialization) = specialization else {
             continue;
         };
@@ -2139,16 +2214,18 @@ fn binding_pairs(subject: &Subject<'_>, row: &Row, seen: &mut BTreeSet<String>) 
                     if row.bindings.get(other) == Some(*other_representation) {
                         continue;
                     }
-                    let candidate = Row {
-                        bindings: subject.rebind(
-                            &subject.rebind(&row.bindings, parameter, *representation),
-                            other,
-                            *other_representation,
-                        ),
-                        ..row.clone()
-                    };
-                    if seen.insert(candidate.key()) && subject.admits(&candidate.bindings) {
-                        rows.push(candidate);
+                    let bindings = subject.rebind(
+                        &subject.rebind(&row.bindings, parameter, *representation),
+                        other,
+                        *other_representation,
+                    );
+                    if !subject.admits(&bindings) {
+                        continue;
+                    }
+                    if let Some(candidate) = subject.rebound(row, bindings) {
+                        if seen.insert(candidate.key()) {
+                            rows.push(candidate);
+                        }
                     }
                 }
             }
@@ -2354,7 +2431,7 @@ fn form_request(
     let subject = Subject::new(module, info, forms.former.backend(), Vec::new())
         .expect("a request names an entry with a native implementation");
     let specialization = subject
-        .implementation
+        .implementation(&request.bindings)
         .default_specialization(&request.statics)
         .map_err(|error| RequestFailure::Inadmissible(error.to_string()))?;
     let row = Row {

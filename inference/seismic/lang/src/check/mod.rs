@@ -1005,6 +1005,10 @@ fn check_native(
 ) -> Result<crate::checked::NativeImplementation, Vec<(Span, String)>> {
     use crate::checked::{NativeLaunch, NativeNatExpr, NativeParameter, NativeScratch};
     let mut errors = Vec::new();
+    let element_reads = NativeElements {
+        parameters: &entry.element_parameters,
+        backend,
+    };
 
     let mut statics: Vec<String> = Vec::new();
     for name in &native.statics {
@@ -1099,12 +1103,7 @@ fn check_native(
             continue;
         }
         let value = native_term_expansion(&term.value, &terms);
-        match native_nat_expr(
-            &value,
-            &entry.dimensions,
-            &parameter_names,
-            &entry.element_parameters,
-        ) {
+        match native_nat_expr(&value, &entry.dimensions, &parameter_names, element_reads) {
             Ok(_) => terms.push((name.clone(), value)),
             Err(message) => errors.push((term.value.span, message)),
         }
@@ -1211,14 +1210,9 @@ fn check_native(
     }
 
     let expression = |expr: &crate::syntax::ast::Expr, errors: &mut Vec<(Span, String)>| {
-        native_nat_expr(
-            expr,
-            &entry.dimensions,
-            &parameter_names,
-            &entry.element_parameters,
-        )
-        .map_err(|message| errors.push((expr.span, message)))
-        .ok()
+        native_nat_expr(expr, &entry.dimensions, &parameter_names, element_reads)
+            .map_err(|message| errors.push((expr.span, message)))
+            .ok()
     };
 
     // `None` inside the result means the clause is absent; an outer `None`
@@ -1227,16 +1221,12 @@ fn check_native(
                      expr: &Option<crate::syntax::ast::Expr>,
                      errors: &mut Vec<(Span, String)>| match expr {
         None => Some(None),
-        Some(expr) => native_condition(
-            clause,
-            expr,
-            &entry.dimensions,
-            &parameter_names,
-            &entry.element_parameters,
-        )
-        .map_err(|error| errors.push(error))
-        .ok()
-        .map(Some),
+        Some(expr) => {
+            native_condition(clause, expr, &entry.dimensions, &parameter_names, element_reads)
+                .map_err(|error| errors.push(error))
+                .ok()
+                .map(Some)
+        }
     };
 
     let launch_names = native
@@ -1249,10 +1239,10 @@ fn check_native(
         .cloned()
         .chain(launch_names.iter().cloned())
         .collect::<Vec<_>>();
+    // `where` may read the elements: admissible configurations are those of
+    // the implementation at its bindings (`NativeImplementation::at_elements`).
     let constraint = native.constraint.as_ref().and_then(|expr| {
-        // Admissible configurations are enumerated before any formation
-        // binds the elements, so `where` reads no `operands`.
-        native_condition("where", expr, &entry.dimensions, &where_names, &[])
+        native_condition("where", expr, &entry.dimensions, &where_names, element_reads)
             .map_err(|error| errors.push(error))
             .ok()
     });
@@ -1410,27 +1400,18 @@ fn check_native(
             .collect::<Vec<_>>();
         let launch_expression = |expr: &crate::syntax::ast::Expr,
                                  errors: &mut Vec<(Span, String)>| {
-            native_nat_expr(
-                expr,
-                &entry.dimensions,
-                &launch_names,
-                &entry.element_parameters,
-            )
-            .map_err(|message| errors.push((expr.span, message)))
-            .ok()
+            native_nat_expr(expr, &entry.dimensions, &launch_names, element_reads)
+                .map_err(|message| errors.push((expr.span, message)))
+                .ok()
         };
         let when = match &launch.when {
             None => Some(None),
-            Some(expr) => native_condition(
-                "when",
-                expr,
-                &entry.dimensions,
-                &launch_names,
-                &entry.element_parameters,
-            )
-            .map_err(|error| errors.push(error))
-            .ok()
-            .map(Some),
+            Some(expr) => {
+                native_condition("when", expr, &entry.dimensions, &launch_names, element_reads)
+                    .map_err(|error| errors.push(error))
+                    .ok()
+                    .map(Some)
+            }
         };
         let groups = launch
             .threadgroups
@@ -1581,7 +1562,7 @@ fn native_condition(
     expression: &crate::syntax::ast::Expr,
     dimensions: &[String],
     parameters: &[String],
-    elements: &[String],
+    elements: NativeElements<'_>,
 ) -> Result<crate::checked::NativeCondition, (Span, String)> {
     use crate::checked::{NativeComparison, NativeCondition};
     use crate::syntax::ast::{BinaryOp, ExprKind};
@@ -1624,13 +1605,38 @@ fn native_condition(
     })
 }
 
+/// The element parameters a native expression may read, and the backend
+/// whose forms `form(W, NAME)` names.
+#[derive(Clone, Copy)]
+struct NativeElements<'a> {
+    parameters: &'a [String],
+    backend: crate::registry::BackendName,
+}
+
+impl NativeElements<'_> {
+    /// Element parameter `argument` of a read, as `call` names it.
+    fn parameter(self, call: &str, argument: &crate::syntax::ast::Arg) -> Result<String, String> {
+        match &argument.value.kind {
+            crate::syntax::ast::ExprKind::Name(element)
+                if argument.name.is_none() && self.parameters.contains(&element.name) =>
+            {
+                Ok(element.name.clone())
+            }
+            _ => Err(format!(
+                "`{call}` reads one of the entry's element parameters ({})",
+                self.parameters.join(", ")
+            )),
+        }
+    }
+}
+
 fn native_nat_expr(
     expression: &crate::syntax::ast::Expr,
     dimensions: &[String],
     parameters: &[String],
-    elements: &[String],
+    elements: NativeElements<'_>,
 ) -> Result<crate::checked::NativeNatExpr, String> {
-    use crate::checked::NativeNatExpr as N;
+    use crate::checked::{ElementQuery, NativeNatExpr as N};
     use crate::syntax::ast::{BinaryOp, ExprKind};
     let binary = |left: &crate::syntax::ast::Expr,
                   right: &crate::syntax::ast::Expr,
@@ -1666,20 +1672,38 @@ fn native_nat_expr(
             args,
         } if matches!(&callee.kind, ExprKind::Name(name) if name.name == "operands") => {
             match (bindings.is_empty(), args.as_slice()) {
-                (true, [arg]) if arg.name.is_none() => match &arg.value.kind {
-                    ExprKind::Name(element) if elements.contains(&element.name) => {
-                        Ok(N::Operands(element.name.clone()))
-                    }
-                    _ if elements.is_empty() => Err(
-                        "`operands` is not read here: it has a value only once a formation binds the elements"
-                            .to_owned(),
-                    ),
-                    _ => Err(format!(
-                        "`operands` takes one of the entry's element parameters ({})",
-                        elements.join(", ")
-                    )),
-                },
+                (true, [arg]) => Ok(N::Element(
+                    elements.parameter("operands", arg)?,
+                    ElementQuery::Operands,
+                )),
                 _ => Err("`operands` takes one element parameter".to_owned()),
+            }
+        }
+        ExprKind::Call {
+            callee,
+            bindings,
+            args,
+        } if matches!(&callee.kind, ExprKind::Name(name) if name.name == "form") => {
+            let names = crate::forms::names(elements.backend);
+            let form = |arg: &crate::syntax::ast::Arg| match &arg.value.kind {
+                ExprKind::Name(name) if arg.name.is_none() => {
+                    crate::forms::Form::named(elements.backend, &name.name).ok_or_else(|| {
+                        format!(
+                            "`{}` is not a form of `{}`; its forms are {}",
+                            name.name,
+                            elements.backend.as_str(),
+                            if names.is_empty() { "none".to_owned() } else { names.join(", ") }
+                        )
+                    })
+                }
+                _ => Err("`form` names a form of the backend".to_owned()),
+            };
+            match (bindings.is_empty(), args.as_slice()) {
+                (true, [element, name]) => Ok(N::Element(
+                    elements.parameter("form", element)?,
+                    ElementQuery::Form(form(name)?),
+                )),
+                _ => Err("`form` takes an element parameter and a form name".to_owned()),
             }
         }
         ExprKind::Call {
@@ -1696,7 +1720,7 @@ fn native_nat_expr(
                 ExprKind::Name(name) if name.name == "max" => N::Max,
                 _ => {
                     return Err(
-                        "native expressions call only `ceil_div`, `min`, `max` and `operands`"
+                        "native expressions call only `ceil_div`, `min`, `max`, `operands` and `form`"
                             .to_owned()
                     );
                 }
