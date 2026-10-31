@@ -64,7 +64,6 @@ use crate::driver::{
 };
 pub(crate) use crate::formation::FormationClass;
 use crate::formation::{Compile, Keyed, ProgramFormer};
-pub use abi::forms::{metal_packing_of, MetalPacking};
 pub use budget::{Footprint, Linear, Observed, Quote};
 pub use point::{GraphPending, GraphPoint, GraphTiming, KernelPoint, Point, PointPending};
 use seismic_compiler::errors::{ExecutionError, InvocationError, PreparationError};

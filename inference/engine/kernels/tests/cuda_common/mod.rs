@@ -143,24 +143,6 @@ impl Format {
             Format::Tq2_0 => "q2g256",
         }
     }
-    /// Whether the CUDA GEMM keeps this format's codes exact and scales its
-    /// F32 partial products (`SCALED_GEMM`): its weights are never rounded
-    /// to the activation type.
-    pub fn scaled_gemm(self) -> bool {
-        matches!(
-            self,
-            Format::Q4_0
-                | Format::Q4_1
-                | Format::Q5_0
-                | Format::Q5_1
-                | Format::Mxfp4
-                | Format::Nvfp4
-                | Format::Nvfp4A4
-                | Format::Iq2Xs
-                | Format::Iq3Xxs
-                | Format::Iq2Xxs
-        )
-    }
     pub fn resident(self) -> Element {
         Element::stored(self.representation(), Layout::Mma16).unwrap()
     }

@@ -20,7 +20,6 @@ use seismic_lang::registry;
 use seismic_lang::repack::WordTable;
 
 mod conversion;
-pub(crate) mod forms;
 #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
 pub(crate) mod vulkan;
 
@@ -36,6 +35,18 @@ pub(crate) enum Dialect {
     /// Vulkan is not built on macOS; its prefix still renders in tests there.
     #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
     Vulkan(vulkan::VulkanFeatures),
+}
+
+impl Dialect {
+    /// The backend the dialect's sources run on.
+    pub(crate) fn backend(self) -> registry::BackendName {
+        match self {
+            Self::Metal(_) => registry::BackendName::Metal,
+            Self::Cuda(_) => registry::BackendName::Cuda,
+            #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+            Self::Vulkan(_) => registry::BackendName::Vulkan,
+        }
+    }
 }
 
 /// The Metal device features a native source tests as `SEISMIC_HAS_<NAME>`,
@@ -849,13 +860,12 @@ fn render_representation(
     out.push_str(&format!(
         "#define {prefix}_REPRESENTATION_{name} 1\n#define {prefix}_REPRESENTATION {name}\n"
     ));
-    if let registry::RepresentationKind::PackedRows(rows) = &info.kind {
+    if let registry::RepresentationKind::PackedRows(_) = &info.kind {
         let coded = Coded::of(representation);
         for (axis, value) in CODING_AXES {
             out.push_str(&format!("#define {prefix}_{axis} {}\n", value(&coded)));
         }
-        let axes = registry::decode_axes(representation).expect("packed storage has decode axes");
-        for (form, value) in forms::forms(dialect, &axes, rows) {
+        for (form, value) in seismic_lang::forms::forms(dialect.backend(), representation) {
             out.push_str(&format!("#define {prefix}_FORM_{form} {value}\n"));
         }
     }
@@ -1100,18 +1110,21 @@ struct Coded {
     local_bits: u32,
     local: Interpretation,
     carried_bit: u32,
-    /// The ends of the code and local coefficient code domains
-    /// (`DecodeAxes::codes`, `CoefficientAxes::local_codes`; 0 without one).
-    codes: (i32, i32),
-    locals: (i32, i32),
+    /// The code domain and the local coefficient code domain, where its
+    /// local scales are codes (`registry::profile::Profile`).
+    codes: registry::profile::Domain,
+    locals: Option<registry::profile::Domain>,
 }
 
 impl Coded {
     fn of(id: RepresentationId) -> Self {
         let axes = registry::decode_axes(id).expect("packed storage has decode axes");
-        let ends = |codes: Vec<i32>| (codes[0], codes[codes.len() - 1]);
-        let codes = ends(axes.codes());
-        let locals = axes.coefficients.local_codes().map_or((0, 0), ends);
+        let profile = axes.profile();
+        let codes = profile.codes;
+        let locals = match profile.local.scale {
+            registry::profile::LocalScale::Code(locals) => Some(locals),
+            registry::profile::LocalScale::Stored(_) => None,
+        };
         let flat = |coeff, scale, bias, group| Self {
             low: axes.low,
             high: axes.high,
@@ -1198,10 +1211,10 @@ const CODING_AXES: [(&str, fn(&Coded) -> String); 24] = [
     ("COEFF_LOCAL", |c| c.local.codes()),
     ("COEFF_LOCAL_OFFSET", |c| c.local.offset.to_string()),
     ("COEFF_CARRIED", |c| c.carried_bit.to_string()),
-    ("CODES_LEAST", |c| c.codes.0.to_string()),
-    ("CODES_GREATEST", |c| c.codes.1.to_string()),
-    ("COEFF_LOCAL_LEAST", |c| c.locals.0.to_string()),
-    ("COEFF_LOCAL_GREATEST", |c| c.locals.1.to_string()),
+    ("CODES_LEAST", |c| c.codes.least.to_string()),
+    ("CODES_GREATEST", |c| c.codes.greatest.to_string()),
+    ("COEFF_LOCAL_LEAST", |c| c.locals.map_or(0, |locals| locals.least).to_string()),
+    ("COEFF_LOCAL_GREATEST", |c| c.locals.map_or(0, |locals| locals.greatest).to_string()),
 ];
 
 /// The tensor's prefix as a function-like macro over its axes, emitted for

@@ -1473,28 +1473,139 @@ pub struct DecodeAxes {
 }
 
 impl DecodeAxes {
-    /// Every value a code takes, ascending: the exact integers a value is
-    /// before `2^code_exponent` and its coefficients (a grid code's signed
-    /// magnitudes). Native libraries read the domain's ends from here
-    /// (`CODES_LEAST`, `CODES_GREATEST`) instead of deriving them.
-    pub fn codes(&self) -> Vec<i32> {
-        self.code.codes(self.low + self.high)
+    /// The weight's arithmetic (`Profile`): what its values are as integers
+    /// and the levels that scale them, without how they are stored.
+    pub fn profile(&self) -> Profile {
+        let local = match &self.coefficients {
+            CoefficientAxes::Direct { scale, bias, group } => Local {
+                group: *group,
+                scale: LocalScale::Stored(*scale),
+                bias: if *bias { Bias::Stored } else { Bias::None },
+            },
+            CoefficientAxes::Hierarchical { group, locals, .. } => {
+                let (bits, interpretation, minimum) = match locals {
+                    LocalCodes::Plane { bits, interpretation, minimum } => (bits, interpretation, *minimum),
+                    LocalCodes::Carried { bits, interpretation, .. } => (bits, interpretation, None),
+                };
+                let codes = Domain::of(&interpretation.codes(*bits));
+                Local {
+                    group: *group,
+                    scale: LocalScale::Code(codes),
+                    bias: minimum.map_or(Bias::None, |sign| Bias::Minimum { codes, sign }),
+                }
+            }
+        };
+        let upper = match &self.coefficients {
+            CoefficientAxes::Direct { .. } => None,
+            CoefficientAxes::Hierarchical { factor, factor_group, exponent, .. } => Some(Upper {
+                group: *factor_group,
+                factor: *factor,
+                exponent: *exponent,
+            }),
+        };
+        Profile {
+            codes: Domain::of(&self.code.codes(self.low + self.high)),
+            code_exponent: self.code_exponent,
+            map: match self.code {
+                CodeInterpretation::Unsigned
+                | CodeInterpretation::TwosComplement
+                | CodeInterpretation::Offset(_)
+                | CodeInterpretation::Odd => ValueMap::Linear,
+                CodeInterpretation::Table(_) => ValueMap::Table,
+                CodeInterpretation::Grid(_) => ValueMap::Grid,
+            },
+            local,
+            upper,
+        }
     }
 }
 
-impl CoefficientAxes {
-    /// Every value a hierarchical coefficient's local code takes, ascending
-    /// (`COEFF_LOCAL_LEAST`, `COEFF_LOCAL_GREATEST`); direct coefficients
-    /// have none.
-    pub fn local_codes(&self) -> Option<Vec<i32>> {
-        match self {
-            Self::Direct { .. } => None,
-            Self::Hierarchical { locals, .. } => Some(match locals {
-                LocalCodes::Plane { bits, interpretation, .. }
-                | LocalCodes::Carried { bits, interpretation, .. } => interpretation.codes(*bits),
-            }),
-        }
+/// A weight's arithmetic, derived from its decode axes alone
+/// (`DecodeAxes::profile`): value `2^code_exponent q` times its local
+/// level's coefficients, under its upper level's factor where it has one,
+/// for an integer code value `q` in `codes`. Consumer forms state what they
+/// need over it; how the codes and coefficients are stored stays in the
+/// decode axes, which only producers read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Profile {
+    pub codes: Domain,
+    pub code_exponent: i32,
+    pub map: ValueMap,
+    pub local: Local,
+    pub upper: Option<Upper>,
+}
+
+impl Profile {
+    /// Whether a group's `Σ q ℓ x` is an exact integer for integer `x` up
+    /// to the upper level: its local scales are integer codes, and its
+    /// codes not scaled by a power of two of their own.
+    pub fn integer_through_upper(&self) -> bool {
+        matches!(self.local.scale, LocalScale::Code(_)) && self.code_exponent == 0
     }
+}
+
+/// The least and greatest of a set of integers (`Profile::codes`, a local
+/// code's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Domain {
+    pub least: i32,
+    pub greatest: i32,
+}
+
+impl Domain {
+    fn of(values: &[i32]) -> Self {
+        let least = *values.iter().min().expect("a code takes some value");
+        let greatest = *values.iter().max().expect("a code takes some value");
+        Self { least, greatest }
+    }
+    /// Whether every value is an `i8`.
+    pub fn fits_i8(self) -> bool {
+        i32::from(i8::MIN) <= self.least && self.greatest <= i32::from(i8::MAX)
+    }
+}
+
+/// How a code becomes its integer `q`: read linearly (unsigned, two's
+/// complement, offset or odd), as an entry of a codebook, or as a lane of a
+/// vector grid's entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValueMap {
+    Linear,
+    Table,
+    Grid,
+}
+
+/// A weight's local level: a scale per `group` values, stored, or an
+/// integer code under the upper level's factor, and its bias.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Local {
+    pub group: u32,
+    pub scale: LocalScale,
+    pub bias: Bias,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalScale {
+    Stored(ScaleEncoding),
+    Code(Domain),
+}
+
+/// A local level's bias: none, a stored float per group, or a minimum
+/// code (of `codes`) under the upper level's minimum factor, added or
+/// subtracted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bias {
+    None,
+    Stored,
+    Minimum { codes: Domain, sign: MinimumSign },
+}
+
+/// A weight's upper level: a factor (and minimum factor) per `group`
+/// values, scaled by `2^exponent`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Upper {
+    pub group: u32,
+    pub factor: ScaleEncoding,
+    pub exponent: i32,
 }
 
 /// A decoder's coefficients: a stored scale (and bias) per `group` values,

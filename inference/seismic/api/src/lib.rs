@@ -186,9 +186,10 @@ mod slab;
 /// sustained clock, the statistics and the records of measured points. The
 /// runtime's measurable work is [`KernelPoint`] and [`GraphPoint`].
 pub use seismic_measure as measure;
+pub use seismic_lang::forms::MetalPacking;
 pub use seismic_runtime::devices::{LimitError, MemoryUsage, OpenError, ResolveError};
 pub use seismic_runtime::native::{
-    GraphPending, GraphPoint, GraphTiming, KernelPoint, MetalPacking, Point, PointPending,
+    GraphPending, GraphPoint, GraphTiming, KernelPoint, Point, PointPending,
 };
 pub use seismic_topology::{
     volume_available, AccessPath, AccessPathId, AccessRoute, Availability, DeviceMemory,
@@ -531,11 +532,18 @@ impl Element {
         *codes.write().unwrap().entry(self.0).or_insert(derived)
     }
 
+    /// Whether CUDA's GEMM folds this element's exact codes, scaling each
+    /// group's F32 partial (`_FORM_GEMM_FOLD`), rather than rounding its
+    /// values to the operand type.
+    pub fn cuda_gemm_fold(&self) -> bool {
+        seismic_lang::forms::cuda_gemm_fold_of(self.0)
+    }
+
     /// This element's admission to Metal's token-packing GEMM, as Metal's
     /// native libraries read it (`_FORM_PACK`); `None` where the form does
     /// not serve it.
     pub fn metal_packing(&self) -> Option<MetalPacking> {
-        seismic_runtime::native::metal_packing_of(self.0)
+        seismic_lang::forms::metal_packing_of(self.0)
     }
 
     fn derive_integer_codes(&self) -> Option<IntegerCodes> {

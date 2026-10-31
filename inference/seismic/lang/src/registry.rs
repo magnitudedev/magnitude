@@ -19,6 +19,12 @@ pub use crate::repr::{
     QuantizedComponent, ScaleEncoding, ScaledCodes, GRID_SIGN_BITS, GRID_VALUES,
 };
 
+/// A weight's arithmetic (`DecodeAxes::profile`), what consumer forms state
+/// their requirements over.
+pub mod profile {
+    pub use crate::repr::{Bias, Domain, Local, LocalScale, Profile, Upper, ValueMap};
+}
+
 /// Backends are a closed set.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
