@@ -802,6 +802,12 @@ export const installAcnPublicRoutes = (
   )
 })
 
+/** All interfaces, IPv6 as well as IPv4, unless the host can't listen on IPv6 (a kernel booted without it). */
+const allInterfacesListenAddress = Effect.try(() => Bun.serve({ hostname: "::", port: 0, fetch: () => new Response() }).stop(true)).pipe(
+  Effect.as("::"),
+  Effect.orElseSucceed(() => ALL_INTERFACES_BIND),
+)
+
 export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerControl) =>
   Effect.scoped(Effect.gen(function* () {
     const dataDir = options.dataDir ?? defaultDataDir()
@@ -830,7 +836,7 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
     const container = yield* readContainerInstallation().pipe(Effect.provide(BunFileSystem.layer))
     const network = yield* readNetworkAccess(dataDir, container).pipe(Effect.provide(BunFileSystem.layer))
     // Loopback always listens; all-interfaces subsumes it, any other address is added beside it.
-    const primaryBind = network.bind === ALL_INTERFACES_BIND ? ALL_INTERFACES_BIND : "127.0.0.1"
+    const primaryBind = network.bind === ALL_INTERFACES_BIND ? yield* allInterfacesListenAddress : "127.0.0.1"
     const infrastructure = yield* Layer.buildWithScope(
       makeAcnInfrastructure(options, lifecycle, primaryBind),
       applicationScope,
@@ -841,7 +847,7 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
     const remote = yield* makeRemoteAccess(network, sessions)
     yield* installAcnHealthRoutes(router, lifecycle, remote, Option.isSome(container)).pipe(Effect.provideService(FileSystem.FileSystem, Context.get(infrastructure, FileSystem.FileSystem)))
     yield* server.serve(router.asHttpEffect()).pipe(Effect.provide(infrastructure))
-    if (network.enabled && network.bind !== primaryBind) {
+    if (network.enabled && network.bind !== ALL_INTERFACES_BIND && network.bind !== primaryBind) {
       const additional = yield* Layer.buildWithScope(BunHttpServer.layer({
         port: options.port ?? ACN_PUBLIC_PORT,
         hostname: network.bind,

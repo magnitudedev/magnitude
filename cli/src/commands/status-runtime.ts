@@ -189,7 +189,7 @@ const listeningAddress = (status: ServiceStatusPresentation) => {
   const network = Option.getOrUndefined(Option.flatMap(status.reach, reach => reach.network))
   if (!network?.enabled || network.pending) return status.address
   const configured = Option.getOrUndefined(network.bind)?.trim()
-  if (configured === undefined || isIP(configured) === 0 || configured === "0.0.0.0") return `0.0.0.0:${network.port} (all interfaces)`
+  if (configured === undefined || isIP(configured) === 0 || configured === "0.0.0.0" || configured === "::") return `*:${network.port} (all interfaces)`
   return `${status.address}, ${isIP(configured) === 6 ? `[${configured}]` : configured}:${network.port}`
 }
 

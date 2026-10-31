@@ -14,6 +14,7 @@ describe("network access resolution", () => {
   it("binds all interfaces unless a specific address is configured", () => {
     expect(resolveNetworkAccess(Option.some({ enabled: true, requireApiKey: true, allowedHosts: [] })).bind).toBe("0.0.0.0")
     expect(resolveNetworkAccess(Option.some({ enabled: true, bind: "100.64.1.5", requireApiKey: true, allowedHosts: [] })).bind).toBe("100.64.1.5")
+    expect(resolveNetworkAccess(Option.some({ enabled: true, bind: "::", requireApiKey: true, allowedHosts: [] })).bind).toBe("0.0.0.0")
     const bad = resolveNetworkAccess(Option.some({ enabled: true, bind: "my-mac", requireApiKey: true, allowedHosts: [] }))
     expect(bad.bind).toBe("0.0.0.0")
     expect(Option.isSome(bad.warning)).toBe(true)
@@ -28,8 +29,8 @@ describe("network access resolution", () => {
 
 describe("loopback detection", () => {
   it("recognises IPv4, IPv6, and mapped loopback addresses", () => {
-    for (const address of ["127.0.0.1", "127.0.0.53", "::1", "::ffff:127.0.0.1", "[::1]"]) expect(isLoopbackAddress(address)).toBe(true)
-    for (const address of ["192.168.1.67", "100.124.15.114", "::ffff:192.168.1.2", "10.0.0.1"]) expect(isLoopbackAddress(address)).toBe(false)
+    for (const address of ["127.0.0.1", "127.0.0.53", "::1", "::ffff:127.0.0.1", "::FFFF:127.0.0.9", "[::1]"]) expect(isLoopbackAddress(address)).toBe(true)
+    for (const address of ["192.168.1.67", "100.124.15.114", "::ffff:192.168.1.2", "::ffff:10.0.0.1", "fd00::127", "10.0.0.1"]) expect(isLoopbackAddress(address)).toBe(false)
   })
 })
 

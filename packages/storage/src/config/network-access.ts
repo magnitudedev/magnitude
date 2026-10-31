@@ -32,7 +32,7 @@ export const resolveNetworkAccess = (config: Option.Option<NetworkAccessConfig>)
   const bindIsAddress = bind !== undefined && isIP(bind) !== 0
   return {
     enabled: true,
-    bind: bindIsAddress ? bind : ALL_INTERFACES_BIND,
+    bind: bindIsAddress && bind !== '::' ? bind : ALL_INTERFACES_BIND,
     apiKey: Option.fromNullable(value.apiKey),
     requireApiKey: value.requireApiKey,
     allowedHosts: value.allowedHosts,
@@ -44,12 +44,10 @@ export const resolveNetworkAccess = (config: Option.Option<NetworkAccessConfig>)
 
 export const generateApiKey = (): string => `mag-${randomBytes(24).toString('base64url')}`
 
-const LOOPBACK_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
-
-/** Whether a socket peer address is this machine's loopback. */
+/** Whether a socket peer address is this machine's loopback, as IPv6 or as IPv4 (mapped or not). */
 export const isLoopbackAddress = (address: string): boolean => {
-  const bare = address.replace(/^\[|\]$/g, '')
-  return LOOPBACK_ADDRESSES.has(bare) || bare.startsWith('127.')
+  const bare = address.replace(/^\[|\]$/g, '').toLowerCase().replace(/^::ffff:(?=\d+\.)/, '')
+  return bare === '::1' || bare.startsWith('127.')
 }
 
 const LOCAL_HOST_NAMES = new Set(['localhost', '127.0.0.1', '[::1]'])

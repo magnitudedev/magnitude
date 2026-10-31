@@ -141,7 +141,7 @@ describe("Magnitude service definitions", () => {
         network: Option.some({ enabled: true, bind: Option.none(), port: 10100, pending: false, container: false, interfaces: [{ name: "eth0", address: "10.0.0.4", kind: "lan" }] }) }),
       server: true, failing: Option.none(), retrying: Option.none(), loaded: Option.none(), imageNotice: Option.none(), elsewhere: Option.none(),
     })
-    expect(output).toContain("Address         0.0.0.0:10100 (all interfaces)")
+    expect(output).toContain("Address         *:10100 (all interfaces)")
     expect(output).toContain("Owner           Server")
     expect(output).toContain("On this computer:   http://127.0.0.1:10100")
     expect(output).toContain("http://10.0.0.4:10100")
