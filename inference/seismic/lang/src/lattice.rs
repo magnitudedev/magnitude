@@ -304,9 +304,8 @@ impl Steps {
     fn of(encoding: &PlaneEncoding) -> Option<Steps> {
         match encoding {
             PlaneEncoding::Dense(dtype) => Steps::float(*dtype),
-            // A vector code's entry, or a byte of digits, codes several values
-            // at once.
-            PlaneEncoding::Grid(_) | PlaneEncoding::Digits { .. } => Some(Steps::Fixed),
+            // A vector code's entry codes several values at once.
+            PlaneEncoding::Grid(_) => Some(Steps::Fixed),
             PlaneEncoding::Packed {
                 bits,
                 interpretation,
@@ -658,7 +657,6 @@ impl Lattice {
                                     }
                                     RowPlaneContent::Grids { .. }
                                     | RowPlaneContent::GridHigh { .. }
-                                    | RowPlaneContent::Digits { .. }
                                     | RowPlaneContent::Groups { .. }
                                     | RowPlaneContent::Records { .. } => None,
                                 })

@@ -90,9 +90,6 @@ impl Oracle {
             PlaneEncoding::Grid(grid) => {
                 Oracle::table((0..1u32 << grid.entry_bits()).map(|raw| plane_value(encoding, raw)))
             }
-            PlaneEncoding::Digits { .. } => {
-                Oracle::table((0..1u32 << 8).map(|raw| plane_value(encoding, raw)))
-            }
             PlaneEncoding::FloatCode { format } => {
                 Oracle::table((0..1u32 << format.bits()).map(|raw| plane_value(encoding, raw)))
             }
@@ -169,18 +166,13 @@ fn plane_value(encoding: &PlaneEncoding, raw: u32) -> f64 {
                 -value
             }
         }
-        // A byte of digits is no one value either.
-        PlaneEncoding::Digits { .. } => f64::from(raw),
         PlaneEncoding::FloatCode { format } => f64::from(format.decode(raw)),
     }
 }
 
 /// Whether a plane holds vector codes, whose entries never move.
 fn vector_codes(encoding: &PlaneEncoding) -> bool {
-    matches!(
-        encoding,
-        PlaneEncoding::Grid(_) | PlaneEncoding::Digits { .. }
-    )
+    matches!(encoding, PlaneEncoding::Grid(_))
 }
 
 /// The first plane whose entries step by decoded value: the code plane, or
@@ -1040,8 +1032,7 @@ fn assert_mixed_moves_are_adjacent(stored: &Stored, packets: &[u8], decoded: &[V
         }
         PlaneEncoding::Dense(_)
         | PlaneEncoding::FloatCode { .. }
-        | PlaneEncoding::Grid(_)
-        | PlaneEncoding::Digits { .. } => true,
+        | PlaneEncoding::Grid(_) => true,
     };
     assert!(
         code.up > 0 && code.down > 0 && (code.interior > 0 || !interior),
@@ -1104,7 +1095,7 @@ fn every_packed_representation_steps_each_plane_to_its_adjacent_decoded_level() 
         }
         // Mixed moves are drawn over at least `MIXED_ENTRIES` entries of the
         // stepping plane, more rows where its entries are few (a scale per
-        // 256 values over vector or digit codes).
+        // 256 values over vector codes).
         let packet = stored.packet();
         let schema = &packet.planes[stepping_code_plane(packet)];
         let per_row =

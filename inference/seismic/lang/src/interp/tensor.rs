@@ -430,18 +430,6 @@ fn decode(
             DecodeStep::ReadPlaneLane { plane, .. } => {
                 ReferenceScalar::U32(recipe.planes()[*plane as usize].lane(local))
             }
-            DecodeStep::InterpretDigitCode {
-                raw,
-                digit,
-                interpretation,
-                ..
-            } => ReferenceScalar::I32(interpretation.decode(
-                registry::DigitCodes::digit(
-                    temporaries[recipe.ordinal(*raw)].bits() as u32,
-                    temporaries[recipe.ordinal(*digit)].bits() as u32,
-                ),
-                registry::DIGIT_BITS,
-            )),
             DecodeStep::InterpretGridCode {
                 raw, lane, grid, ..
             } => ReferenceScalar::I32(grid.code(
@@ -540,7 +528,6 @@ impl PlaneStorage<'_> {
             PlaneEncoding::Packed { .. }
             | PlaneEncoding::Grid(_)
             | PlaneEncoding::SignedLocal { .. }
-            | PlaneEncoding::Digits { .. }
             | PlaneEncoding::FloatCode { .. } => {
                 (entry as u32 * schema.entry_bits, schema.entry_bits)
             }
@@ -572,7 +559,6 @@ impl PlaneStorage<'_> {
             PlaneEncoding::Packed { .. }
             | PlaneEncoding::Grid(_)
             | PlaneEncoding::SignedLocal { .. }
-            | PlaneEncoding::Digits { .. }
             | PlaneEncoding::FloatCode { .. } => ReferenceScalar::U32(raw),
             PlaneEncoding::Dense(dtype) => {
                 read_dense(*dtype, &raw.to_le_bytes()[..dtype.bytes() as usize])

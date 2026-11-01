@@ -1061,7 +1061,6 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
             registry::PlaneEncoding::Packed { .. }
             | registry::PlaneEncoding::Grid(_)
             | registry::PlaneEncoding::SignedLocal { .. }
-            | registry::PlaneEncoding::Digits { .. }
             | registry::PlaneEncoding::FloatCode { .. } => DType::U32,
         };
         let indices = self.read_indices(entry, index);

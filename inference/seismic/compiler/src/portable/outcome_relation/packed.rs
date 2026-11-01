@@ -66,19 +66,6 @@ impl Analysis<'_> {
                 } => {
                     self.total_recipe(&reference::grid_code_recipe(grid), &[get(*raw), get(*lane)])?
                 }
-                DecodeStep::InterpretDigitCode {
-                    raw,
-                    digit,
-                    interpretation,
-                    ..
-                } => {
-                    let digit =
-                        self.total_recipe(&reference::digit_recipe(), &[get(*raw), get(*digit)])?;
-                    self.total_recipe(
-                        &reference::code_recipe(interpretation, registry::DIGIT_BITS),
-                        &[digit],
-                    )?
-                }
                 DecodeStep::DecodeFloatCode { raw, format, .. } => {
                     self.total_recipe(&reference::float_code_recipe(*format), &[get(*raw)])?
                 }

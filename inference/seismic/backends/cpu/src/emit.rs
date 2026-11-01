@@ -22,7 +22,7 @@ use seismic_ir::physical_target::{
 };
 use seismic_ir::storage::LaunchLocalKind;
 use seismic_lang::intrinsics::MathOp;
-use seismic_lang::registry::{DigitCodes, PlaneEncoding, PlaneInfo, PlaneRepackRecipe, RepackExpr};
+use seismic_lang::registry::{PlaneEncoding, PlaneInfo, PlaneRepackRecipe, RepackExpr};
 use seismic_lang::types::DType;
 use seismic_native_target::NativeCompilationError;
 use std::collections::{BTreeSet, HashMap};
@@ -686,15 +686,10 @@ impl Emitter<'_, '_> {
                             .expect("a packed place has a packing axis")
                             .value(),
                     );
-                    let within = self
+                    let lane = self
                         .builder
                         .ins()
                         .urem_imm(logical, i64::from(plane_info.group));
-                    // A digit's lane is its digit of its byte.
-                    let lane = match &plane_info.encoding {
-                        PlaneEncoding::Digits { digits, .. } => self.digit_place(within, digits).1,
-                        _ => within,
-                    };
                     let lane = self.builder.ins().ireduce(types::I32, lane);
                     self.define(out.value, lane);
                 }
@@ -1562,24 +1557,6 @@ impl Emitter<'_, '_> {
                 let width = self.builder.ins().iconst(types::I32, i64::from(bits));
                 self.call(HostImport::PackedBits, &[base, bit, width])
             }
-            // A digits plane's entry is the byte its runs place the value
-            // in (`PlaneSchema::entry`), of one field.
-            PlaneEncoding::Digits { digits, .. } => {
-                assert_eq!(field, 0, "a digits plane has one field");
-                let within = self.builder.ins().urem_imm(local, i64::from(plane.group));
-                let (byte, _) = self.digit_place(within, digits);
-                let entry = self.builder.ins().imul_imm(group, i64::from(plane.fields));
-                let entry = self.builder.ins().iadd(entry, byte);
-                let bit = self
-                    .builder
-                    .ins()
-                    .imul_imm(entry, i64::from(plane.entry_bits));
-                let width = self
-                    .builder
-                    .ins()
-                    .iconst(types::I32, i64::from(plane.entry_bits));
-                self.call(HostImport::PackedBits, &[base, bit, width])
-            }
             PlaneEncoding::FloatCode { format } => {
                 let bits = format.bits();
                 let bit = self.builder.ins().imul_imm(entry, i64::from(bits));
@@ -1587,37 +1564,6 @@ impl Emitter<'_, '_> {
                 self.call(HostImport::PackedBits, &[base, bit, width])
             }
         }
-    }
-
-    /// The byte and the digit of value `within` (an `I64` below the runs'
-    /// values) of a digits group (`DigitCodes::place`): its run's, the first
-    /// run that holds it selected.
-    fn digit_place(&mut self, within: Value, digits: &DigitCodes) -> (Value, Value) {
-        let mut candidates = Vec::with_capacity(digits.runs.len());
-        let (mut first, mut byte) = (0u32, 0u32);
-        for run in digits.runs {
-            let offset = self.builder.ins().iadd_imm(within, -i64::from(first));
-            let within_run = self.builder.ins().urem_imm(offset, i64::from(run.bytes()));
-            let place = (
-                self.builder.ins().iadd_imm(within_run, i64::from(byte)),
-                self.builder.ins().udiv_imm(offset, i64::from(run.bytes())),
-            );
-            first += run.bytes() * run.digits();
-            byte += run.bytes();
-            candidates.push((first, place));
-        }
-        let (_, mut place) = candidates.pop().expect("digit codes have runs");
-        while let Some((end, candidate)) = candidates.pop() {
-            let inside =
-                self.builder
-                    .ins()
-                    .icmp_imm(IntCC::UnsignedLessThan, within, i64::from(end));
-            place = (
-                self.builder.ins().select(inside, candidate.0, place.0),
-                self.builder.ins().select(inside, candidate.1, place.1),
-            );
-        }
-        place
     }
 
     fn to_f32(&mut self, value: Value, dtype: DType) -> Value {

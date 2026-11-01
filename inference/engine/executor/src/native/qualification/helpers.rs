@@ -705,8 +705,6 @@ fn pattern_source(representation: &str) -> Option<(Element, Vec<u8>)> {
                 (52, &[0x00, 0x80, 0x00, 0x40]),
             ],
         ),
-        // Every digit 2 (byte 0xff: value 2 - 1) and d = 1.
-        "b3g256" => unit_packet(size, &[(0, &[0xff; 52]), (52, &[0x00, 0x3c])]),
         // Table code 8 (value 1) at sub-scale 33 - 32 = 1 and d = 1.
         "iq4xs" => unit_packet(
             size,

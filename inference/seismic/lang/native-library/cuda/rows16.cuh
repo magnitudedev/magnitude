@@ -77,22 +77,6 @@ template <u32 LOW, u32 HIGH, class C, class K> struct Packed : Planes {
     }
 };
 
-// A gather of digit codes D (`packets::DigitPlanes`: a row's groups,
-// each `D::group_bytes()` bytes in the codes plane) read through
-// interpretation C (`packets::CodesOf`, as `Packed` reads codes) under
-// coefficients K.
-template <class D, class C, class K> struct Digits : Planes {
-    __device__ __forceinline__ float value(u64 index, u64 i) const {
-        const u8 *row = base + index * stride;
-        u32 byte, digit;
-        D::place((u32)(i % D::group_values()), byte, digit);
-        const u32 b = u8_at(row + codes + i / D::group_values() * D::group_bytes() + byte);
-        float scale, bias;
-        K::at(row + scales, row + supers, i / K::GROUP, scale, bias);
-        return packets::coded_value<C, K::BIAS>(D::digit(b, digit), scale, bias);
-    }
-};
-
 // A gather of grid codes G (`packets::GridCodes`: one entry per eight
 // elements) under hierarchical coefficients K whose local codes are in the
 // scales plane (`packets::Hier`) or carried (`packets::CarriedHier`: bit j
@@ -151,20 +135,14 @@ template <class G, class K> struct Grid : Planes {
 
 // The gather decoder of a packed element's emitted decode axes.
 template <u32 CODES, u32 LOW, u32 HIGH, int OFFSET, u32 TABLE, u32 GRID, u32 INDEX_BITS, u32 LANES, u32 SIGNS,
-          u32 DELTA, u32 DELTA_EXPONENT, u32 SIGN_BIT, u32 SIGN_BITS, u32 DELTA_BIT, u32 DIGIT_RUNS, u32 RUN_BYTES,
-          u32 RUN_DIGITS, u32 DIGIT_BITS, class K>
+          u32 DELTA, u32 DELTA_EXPONENT, u32 SIGN_BIT, u32 SIGN_BITS, u32 DELTA_BIT, class K>
 struct Decoder {
-    typedef typename packets::Select<
-        DIGIT_RUNS != 0,
-        Digits<packets::DigitPlanes<DIGIT_RUNS, RUN_BYTES, RUN_DIGITS, DIGIT_BITS>,
-               typename packets::CodesOf<CODES, OFFSET, TABLE>::type, K>,
-        Packed<LOW, HIGH, typename packets::CodesOf<CODES, OFFSET, TABLE>::type, K>>::type type;
+    typedef Packed<LOW, HIGH, typename packets::CodesOf<CODES, OFFSET, TABLE>::type, K> type;
 };
 template <u32 LOW, u32 HIGH, int OFFSET, u32 TABLE, u32 GRID, u32 INDEX_BITS, u32 LANES, u32 SIGNS, u32 DELTA,
-          u32 DELTA_EXPONENT, u32 SIGN_BIT, u32 SIGN_BITS, u32 DELTA_BIT, u32 DIGIT_RUNS, u32 RUN_BYTES,
-          u32 RUN_DIGITS, u32 DIGIT_BITS, class K>
+          u32 DELTA_EXPONENT, u32 SIGN_BIT, u32 SIGN_BITS, u32 DELTA_BIT, class K>
 struct Decoder<SEISMIC_CODES_GRID, LOW, HIGH, OFFSET, TABLE, GRID, INDEX_BITS, LANES, SIGNS, DELTA, DELTA_EXPONENT,
-               SIGN_BIT, SIGN_BITS, DELTA_BIT, DIGIT_RUNS, RUN_BYTES, RUN_DIGITS, DIGIT_BITS, K> {
+               SIGN_BIT, SIGN_BITS, DELTA_BIT, K> {
     typedef Grid<typename packets::GridCodesOf<LOW, HIGH, GRID, INDEX_BITS, LANES, SIGNS, DELTA, DELTA_EXPONENT,
                                                SIGN_BIT, SIGN_BITS, DELTA_BIT>::type,
                  K>
@@ -185,9 +163,6 @@ typedef Decoder<ELEMENT_CAT(ROWS16_T, _CODES), ELEMENT_CAT(ROWS16_T, _CODE_LOW_B
                 ELEMENT_CAT(ROWS16_T, _CODES_GRID_SIGNS), ELEMENT_CAT(ROWS16_T, _CODES_GRID_DELTA),
                 ELEMENT_CAT(ROWS16_T, _CODES_GRID_DELTA_EXPONENT), ELEMENT_CAT(ROWS16_T, _CODES_GRID_SIGN_BIT),
                 ELEMENT_CAT(ROWS16_T, _CODES_GRID_SIGN_BITS), ELEMENT_CAT(ROWS16_T, _CODES_GRID_DELTA_BIT),
-                ELEMENT_CAT(ROWS16_T, _CODES_DIGIT_RUNS),
-                ELEMENT_CAT(ROWS16_T, _CODES_DIGIT_RUN_BYTES), ELEMENT_CAT(ROWS16_T, _CODES_DIGIT_RUN_DIGITS),
-                ELEMENT_CAT(ROWS16_T, _CODES_DIGIT_BITS),
                 PACKETS_COEFFICIENTS(ROWS16_T)>::type T;
 } // namespace rows16
 #define ROWS16_T_AT(pointer)                                                                                   \

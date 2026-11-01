@@ -69,9 +69,6 @@ impl Analysis<'_> {
             .planes
             .get(plane as usize)
             .ok_or("lane read has no registered plane")?;
-        if matches!(schema.encoding, registry::PlaneEncoding::Digits { .. }) {
-            return Err("a digit's position in its byte is not affine in its value");
-        }
         let logical = self.logical_position(view, indices, state)?;
         let lane = self.terms.natural_div_rem(true, logical, schema.group);
         Ok(self.terms.node(Node::WordFromNatural(lane, DType::U32)))
@@ -131,9 +128,6 @@ impl Analysis<'_> {
                 let displacement = self.terms.natural_binary(true, entry, width);
                 let byte = self.terms.natural_binary(false, base, displacement);
                 self.read(state, Place { root, byte, dtype })
-            }
-            registry::PlaneEncoding::Digits { .. } => {
-                Err("a digits plane's entry is not affine in its value")
             }
             registry::PlaneEncoding::Packed { .. }
             | registry::PlaneEncoding::Grid(_)

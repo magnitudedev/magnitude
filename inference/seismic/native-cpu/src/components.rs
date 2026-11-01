@@ -13,8 +13,8 @@
 use crate::isa::Tier;
 use crate::quant::Q8Block;
 use crate::weights::{
-    self, codes, scales, Carried, Delta, DenseRows, Digits, Direct, Format, Grid, Hier, Minimum,
-    NoDelta, PackedRows, Planes, RowGeometry, Scales, SignedBias, Unbiased,
+    self, codes, scales, Carried, Delta, DenseRows, Direct, Format, Grid, Hier, Minimum, NoDelta,
+    PackedRows, Planes, RowGeometry, Scales, SignedBias, Unbiased,
 };
 use seismic_lang::ids::RepresentationId;
 #[cfg(test)]

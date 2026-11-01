@@ -338,10 +338,8 @@ fn metal_packet_groups(profile: &Profile) -> u32 {
 enum MetalLanes {
     /// Linear codes of code planes, of every split `registry::code_planes`
     /// makes up to 8 bits (two's complement bytes with their sign bits
-    /// flipped), or of base-3 digits (`registry::DigitCodes`, a chunk's
-    /// eight digits decoded as it loads), entering as their stored codes,
-    /// whose value zero is `zero`, or, but as `bytes` (codes of a plane of
-    /// bytes), at any zero above.
+    /// flipped), entering as their stored codes, whose value zero is `zero`,
+    /// or, but as `bytes` (codes of a plane of bytes), at any zero above.
     Stored { zero: u32, bytes: bool },
     /// A codebook's 4-bit codes of values of `i8`, entering as those values
     /// + 128 (`codebooks::pairs`), as bytes.
@@ -366,19 +364,17 @@ impl MetalLanes {
 
 fn metal_lanes(axes: &registry::DecodeAxes) -> Option<MetalLanes> {
     use registry::CodeInterpretation as Code;
-    // Every split `code_planes` makes of up to 8 bits, a plane of bytes the
-    // one without a high plane at 8; and digits, each a code of its own.
-    let (code, planes, bytes) = match axes.coding.codes() {
-        registry::ValueCodes::Fields(code) => {
-            let width = axes.low + axes.high;
-            let planes = width <= 8 && registry::code_planes(width) == Some((axes.low, axes.high));
-            (code, planes, (axes.low, axes.high) == (8, 0))
-        }
+    let code = match axes.coding.codes() {
+        registry::ValueCodes::Fields(code) => code,
         registry::ValueCodes::Grid(_) => {
             return axes.profile().codes.fits_i8().then_some(MetalLanes::Grid);
         }
-        registry::ValueCodes::Digits { interpretation, .. } => (interpretation, true, false),
     };
+    // Every split `code_planes` makes of up to 8 bits; a plane of bytes is
+    // the one without a high plane at 8.
+    let width = axes.low + axes.high;
+    let planes = width <= 8 && registry::code_planes(width) == Some((axes.low, axes.high));
+    let bytes = (axes.low, axes.high) == (8, 0);
     match code {
         Code::Unsigned => planes.then_some(MetalLanes::Stored { zero: 0, bytes }),
         Code::Offset(zero) => planes.then_some(MetalLanes::Stored {
@@ -641,7 +637,7 @@ mod tests {
 
     /// CUDA's GEMM recipe of every representation it imports, as main's
     /// library derived it (`ScaledGemm`), and for q4g32, q2k, q2g256,
-    /// q1g128, iq2s, iq1s, iq1m, b3g256, q3k, iq4xs and iq3s as the same
+    /// q1g128, iq2s, iq1s, iq1m, q3k, iq4xs and iq3s as the same
     /// choice takes them.
     #[test]
     fn cuda_folds_are_mains() {
@@ -663,7 +659,7 @@ mod tests {
             "iq3s",
         ];
         let rounded = [
-            "q4k", "q5k", "q6k", "q8g32s", "q2k", "q2g256", "q1g128", "b3g256", "q3k", "iq4xs",
+            "q4k", "q5k", "q6k", "q8g32s", "q2k", "q2g256", "q1g128", "q3k", "iq4xs",
         ];
         let expected = folded
             .map(|storage| (storage, true))
@@ -684,7 +680,7 @@ mod tests {
         let admitted = [
             "q4k", "q5k", "q6k", "q8g32s", "q4g32s", "iq4g32s", "q5g32s", "q5g32", "mxfp4g32",
             "nvfp4g16", "iq2xs", "iq3xxs", "iq2xxs", "q4g32", "q2k", "q2g256", "q1g128", "iq2s",
-            "iq1s", "iq1m", "b3g256", "q3k", "iq4xs", "iq3s",
+            "iq1s", "iq1m", "q3k", "iq4xs", "iq3s",
         ];
         let excluded = ["nvfp4g16a4"];
         let int8 = Form::named(BackendName::Cuda, "INT8").unwrap();
@@ -748,7 +744,6 @@ mod tests {
             "iq2s@rows16",
             "iq1s@rows16",
             "iq1m@rows16",
-            "b3g256@rows16",
             "q3k@rows16",
             "iq4xs@rows16",
             "iq3s@rows16",
@@ -822,7 +817,7 @@ mod tests {
     /// centre, offset, residue), INT8 and the matrix GEMV product, as
     /// `metal_packing`, `metal_int8` and `metal_matrix` admit each over the
     /// lane codes `metal_lanes` delivers (every code-plane split up to 8
-    /// bits, base-3 digits, codebook and grid of `i8` values; no odd codes).
+    /// bits, codebook and grid of `i8` values; no odd codes).
     #[test]
     fn metal_admissions_are_pinned() {
         let pack = |folds, centre, offset, residue| {
@@ -904,12 +899,6 @@ mod tests {
                 pack(2, 16, 16, false),
                 None,
                 Some(MetalMatrix::Runs { halves: true }),
-            ),
-            (
-                "b3g256",
-                pack(1, 2, 2, false),
-                None,
-                Some(MetalMatrix::Symmetric),
             ),
             (
                 "q3k",

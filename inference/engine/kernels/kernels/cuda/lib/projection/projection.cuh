@@ -1090,7 +1090,7 @@ template <class Shape> __host__ __device__ constexpr u64 gemv_grid(u64 rows) {
 // another's: an RTX 3090's 82 SMs draw 890 GB/s, and one 8-warp block per SM
 // does not. Measured on it (dense_output, H = F = 8192, M = 1, tuned KSPLIT):
 // q4k 62.7 -> 59.6 us, q6k 80.5 -> 78.1 us, iq2xs 82.7 -> 75.8 us, q2g256
-// 35.0 -> 32.3 us, q8g32s 94.1 -> 91.2 us, q4g32s and b3g256 level.
+// 35.0 -> 32.3 us, q8g32s 94.1 -> 91.2 us, q4g32s level.
 //
 // A records weight's warp (`GemvRecords`) keeps one 1 KiB record per tile in
 // flight, so its launch needs its blocks resident together, up to four per
@@ -1171,11 +1171,6 @@ template <class Pro> __device__ __forceinline__ auto after_dependency(const Pro 
 // superblock's first k-block (or of the share's first). Each warp decodes its
 // own rows' coefficients of every k-block into its area (per row per stream
 // its k-block's coefficients padded to 16 B: `COEF_AREA`).
-// A representation may instead stage its codes once per superblock with its
-// records (`packets::super_chunks`: 16 B chunks per tile, after
-// the records of both streams in the record buffer), which every k-block of
-// the superblock reads (base-3 digits, whose bytes hold codes of several
-// k-blocks).
 // Bytes of one staged code chunk of W: 16, or `W::CHUNK_BYTES` (a
 // representation whose k-block's bytes are 8-byte pieces of its storage), or
 // its code planes' `chunk_bytes()` (planes whose rows are not whole 16 B).
@@ -1230,11 +1225,6 @@ struct GemmShape {
     template <bool S8> static constexpr int A_ROW = S8 ? 96 : 144;
     template <class W> static constexpr int TILE = W::CHUNKS * ChunkBytes<W>::value;
     template <class W> static constexpr int RECORD = (W::SUPER_WORDS * 4 + 15) / 16 * 16;
-    // A tile's codes staged once per superblock (`packets::super_chunks`). A
-    // function, not a class's constant: an odr-used static data member takes
-    // a slot of the module's global constant bank, which moves every table
-    // after it.
-    template <class W> __host__ __device__ static constexpr int super_tile() { return packets::super_chunks<W>() * 16; }
     // A warp's coefficient area per stream: its NJ * 16 rows' k-block
     // coefficients (`coefficient_words` a group), each row's padded to whole
     // 16 B, the larger of WA's and WB's. COEF_WARP is 16 B a row.
@@ -1246,10 +1236,8 @@ struct GemmShape {
         NJ * 16 * (COEF_ROW<WA, S8> > COEF_ROW<WB, S8> ? COEF_ROW<WA, S8> : COEF_ROW<WB, S8>);
     template <class WA, class WB, bool S8>
     static constexpr int STAGE_BYTES = BM * A_ROW<S8> + 8 * (TILE<WA> + TILE<WB>);
-    // One record buffer: both streams' 128 rows, then both streams' 8 tiles'
-    // superblock codes.
-    template <class WA, class WB>
-    static constexpr int RECORDS = 128 * (RECORD<WA> + RECORD<WB>) + 8 * (super_tile<WA>() + super_tile<WB>());
+    // One record buffer: both streams' 128 rows.
+    template <class WA, class WB> static constexpr int RECORDS = 128 * (RECORD<WA> + RECORD<WB>);
     template <class WA, class WB, bool S8>
     static constexpr int LAYOUT_BYTES = STAGES * STAGE_BYTES<WA, WB, S8> + 2 * RECORDS<WA, WB> +
                                         (Same<WB, NoWeight>::value ? 1 : 2) * WARPS * COEF_AREA<WA, WB, S8>;
@@ -1260,8 +1248,7 @@ struct GemmShape {
     // effect with dense weights, so a configuration's GEMM may run either).
     // Per stream the largest codes (q8: 1024 B per tile, 16 B records) and
     // records (q6k, 32 B per row, 768 B per tile) take STAGES * 8192 + 4096
-    // and STAGES * 6144 + 8192 of its STAGES * 10240 bytes, and superblock
-    // codes (b3g256: 832 B per tile, 16 B records) 17408; coefficients of
+    // and STAGES * 6144 + 8192 of its STAGES * 10240 bytes; coefficients of
     // more than 16 B a row (`COEF_AREA`) come with codes that leave room.
     template <int STREAMS>
     static constexpr int SHARED_BYTES = STAGES * (BM * 144 + STREAMS * 10240) + STREAMS * WARPS * COEF_WARP;
@@ -1327,7 +1314,7 @@ __device__ __forceinline__ typename W::Raw gemm_raw(const W &w, const u8 *staged
     if constexpr (W::DENSE)
         return w.fetch(tile, kblock, lane);
     else
-        return staged_raw(w, staged_tile, lane, kblock, 0);
+        return w.from_shared(staged_tile, lane);
 }
 
 __device__ __forceinline__ void cp_async_4_zfill(void *shared, const void *global, u32 source_bytes) {
@@ -1354,15 +1341,12 @@ template <int CHUNK> __device__ __forceinline__ void cp_async_chunk(u8 *shared, 
 template <class W, int STRIDE, int TILE>
 __device__ __forceinline__ void gemm_load_codes(const W &w, u64 tile0, u64 tiles, u64 kblock, u8 *codes, u32 first) {
     constexpr int CHUNK = ChunkBytes<W>::value;
-    // (Codes staged per superblock have no k-block chunks.)
-    if constexpr (W::CHUNKS != 0) {
-        for (int c = first; c < 8 * W::CHUNKS; c += STRIDE) {
-            const u64 j = c / W::CHUNKS;
-            const u32 q = c % W::CHUNKS;
-            const bool valid = tile0 + j < tiles;
-            cp_async_chunk<CHUNK>(codes + j * TILE + q * CHUNK, w.chunk_source(valid ? tile0 + j : tile0, kblock, q),
-                                  valid);
-        }
+    for (int c = first; c < 8 * W::CHUNKS; c += STRIDE) {
+        const u64 j = c / W::CHUNKS;
+        const u32 q = c % W::CHUNKS;
+        const bool valid = tile0 + j < tiles;
+        cp_async_chunk<CHUNK>(codes + j * TILE + q * CHUNK, w.chunk_source(valid ? tile0 + j : tile0, kblock, q),
+                              valid);
     }
 }
 
@@ -1376,18 +1360,16 @@ __device__ __forceinline__ void gemm_load_codes(const W &w, u64 tile0, u64 tiles
 template <class W, int STRIDE, int TILE, int SPAN, int STAGE>
 __device__ __forceinline__ void gemm_load_codes_span(const W &w, u64 tile0, u64 tiles, u64 kblock, u64 count,
                                                      u8 *codes, u32 first) {
-    if constexpr (W::CHUNKS != 0) {
-        for (int c = first; c < SPAN * 8 * W::CHUNKS; c += STRIDE) {
-            const u64 d = c % SPAN;
-            if (d >= count)
-                continue;
-            const int position = c / SPAN;
-            const u64 j = position / W::CHUNKS;
-            const u32 q = position % W::CHUNKS;
-            const bool valid = tile0 + j < tiles;
-            cp_async_chunk<ChunkBytes<W>::value>(codes + d * STAGE + j * TILE + q * ChunkBytes<W>::value,
-                                                 w.chunk_source(valid ? tile0 + j : tile0, kblock + d, q), valid);
-        }
+    for (int c = first; c < SPAN * 8 * W::CHUNKS; c += STRIDE) {
+        const u64 d = c % SPAN;
+        if (d >= count)
+            continue;
+        const int position = c / SPAN;
+        const u64 j = position / W::CHUNKS;
+        const u32 q = position % W::CHUNKS;
+        const bool valid = tile0 + j < tiles;
+        cp_async_chunk<ChunkBytes<W>::value>(codes + d * STAGE + j * TILE + q * ChunkBytes<W>::value,
+                                             w.chunk_source(valid ? tile0 + j : tile0, kblock + d, q), valid);
     }
 }
 
@@ -1405,22 +1387,6 @@ __device__ __forceinline__ void gemm_load_records(const W &w, u64 tile0, u64 til
         cp_async_4_zfill(records + row * RECORD + word * 4,
                          w.super_word(tile0 * 16 + (valid ? row : 0), valid ? superblock : 0, valid ? word : 0),
                          valid ? 4u : 0u);
-    }
-}
-
-// One stream's superblock codes (`packets::super_chunks`) of superblock
-// `superblock` of tiles [tile0, tile0 + 8) into `codes` (SUPER_TILE bytes per
-// tile, zero past `tiles`), by threads `first`, `first + STRIDE`, ...
-template <class W, int STRIDE, int SUPER_TILE>
-__device__ __forceinline__ void gemm_load_super_codes(const W &w, u64 tile0, u64 tiles, u64 superblock, u8 *codes,
-                                                      u32 first) {
-    constexpr int CHUNKS = packets::super_chunks<W>();
-    for (int c = first; c < 8 * CHUNKS; c += STRIDE) {
-        const u64 j = c / CHUNKS;
-        const u32 q = c % CHUNKS;
-        const bool valid = tile0 + j < tiles;
-        seismic_cp_async_16_zfill(codes + j * SUPER_TILE + q * 16,
-                                  w.super_chunk(valid ? tile0 + j : tile0, superblock, q), valid ? 16u : 0u);
     }
 }
 
@@ -1663,12 +1629,11 @@ struct ActivationRows {
 
 // The weight side of a GEMM block's shared memory: STAGES stages (BM
 // activation rows of A_ROW<S8> bytes, then each stream's codes), the two
-// record buffers (each stream's records, then each stream's superblock
-// codes) and the warps' coefficient areas (each stream's). `load` stages
-// k-block `index` of the share (with its superblock's records and codes when
-// it starts one or the share) by threads `first`, `first + STRIDE`, ...;
-// `decode` forms the warp's coefficients of the share's k-block `index` from
-// its record buffer; `staged` is a tile's staged codes of it.
+// record buffers (each stream's records) and the warps' coefficient areas
+// (each stream's). `load` stages k-block `index` of the share (with its
+// superblock's records when it starts one or the share) by threads `first`,
+// `first + STRIDE`, ...; `decode` forms the warp's coefficients of the share's
+// k-block `index` from its record buffer.
 template <class Shape, class WA, class WB, bool S8> struct GemmWeights {
     static constexpr bool PAIR = !Same<WB, NoWeight>::value;
     static constexpr int STREAMS = PAIR ? 2 : 1;
@@ -1699,49 +1664,25 @@ template <class Shape, class WA, class WB, bool S8> struct GemmWeights {
     __device__ __forceinline__ const u8 *records(u64 kb, int stream) const {
         return shared + RECORDS + (kb / 4) % 2 * BUFFER + (stream == 0 ? 0 : 128 * RECORD_A);
     }
-    // A stream's tile of superblock codes (`GemmShape::super_tile`).
-    __host__ __device__ static constexpr int super_tile(int stream) {
-        return stream == 0 ? Shape::template super_tile<WA>() : Shape::template super_tile<WB>();
+    __device__ __forceinline__ float *area(u32 warp, int stream) const {
+        return reinterpret_cast<float *>(shared + AREAS +
+                                         (warp * STREAMS + stream) * Shape::template COEF_AREA<WA, WB, S8>);
     }
-    // Stream `stream`'s superblock codes in record buffer `buffer`.
-    __device__ __forceinline__ u8 *super_codes(u8 *buffer, int stream) const {
-        return buffer + 128 * (RECORD_A + RECORD_B) + (stream == 0 ? 0 : 8 * super_tile(0));
-    }
-    // The staged codes of k-block `index` of the share in stage `s` of tile
-    // `tile` of stream STREAM: the stage's, or the superblock's
-    // (`super_tile`).
-    template <int STREAM> __device__ __forceinline__ const u8 *staged(int s, u64 index, int tile) const {
-        if constexpr (super_tile(STREAM) == 0)
-            return codes(s, STREAM, tile);
-        else
-            return super_codes(shared + RECORDS + (kbegin + index) / 4 % 2 * BUFFER, STREAM) +
-                   tile * super_tile(STREAM);
-    }
-    // The records and superblock codes of superblock `superblock` into
-    // record buffer `buffer`.
+    // Superblock `superblock`'s records of both weights into `buffer`.
     template <int STRIDE> __device__ __forceinline__ void load_records(u8 *buffer, u64 superblock, u32 first) const {
         gemm_load_records<WA, STRIDE, RECORD_A>(wa, tile0, tiles, superblock, ktotal, buffer, first);
         if constexpr (PAIR)
             gemm_load_records<WB, STRIDE, RECORD_B>(wb, tile0, tiles, superblock, ktotal, buffer + 128 * RECORD_A,
                                                     first);
-        if constexpr (super_tile(0) != 0)
-            gemm_load_super_codes<WA, STRIDE, super_tile(0)>(wa, tile0, tiles, superblock, super_codes(buffer, 0),
-                                                             first);
-        if constexpr (PAIR && super_tile(1) != 0)
-            gemm_load_super_codes<WB, STRIDE, super_tile(1)>(wb, tile0, tiles, superblock, super_codes(buffer, 1),
-                                                             first);
-    }
-    __device__ __forceinline__ float *area(u32 warp, int stream) const {
-        return reinterpret_cast<float *>(shared + AREAS +
-                                         (warp * STREAMS + stream) * Shape::template COEF_AREA<WA, WB, S8>);
     }
     template <int STRIDE> __device__ __forceinline__ void load(int s, u64 index, u32 first) const {
         const u64 kb = kbegin + index;
         gemm_load_codes<WA, STRIDE, TILE_A>(wa, tile0, tiles, kb, stage(s) + ROWS, first);
         if constexpr (PAIR)
             gemm_load_codes<WB, STRIDE, TILE_B>(wb, tile0, tiles, kb, stage(s) + ROWS + 8 * TILE_A, first);
-        if (index == 0 || kb % 4 == 0)
+        if (index == 0 || kb % 4 == 0) {
             load_records<STRIDE>(shared + RECORDS + (kb / 4) % 2 * BUFFER, kb / 4, first);
+        }
     }
     // The weights of the share's k-blocks [index, index + count) into stages
     // s, s + 1, ... (`gemm_load_codes_span`), and the records of each
@@ -1791,9 +1732,9 @@ __device__ __forceinline__ void gemm_multiply(float (&acc)[2][Shape::NJ][Shape::
 #pragma unroll
     for (int j = 0; j < NJ; ++j) {
         const u64 tile = weights.tile0 + wn * NJ + j;
-        raw_a[j] = gemm_raw(weights.wa, weights.template staged<0>(stage, index, wn * NJ + j), tile, kb, lane);
+        raw_a[j] = gemm_raw(weights.wa, weights.codes(stage, 0, wn * NJ + j), tile, kb, lane);
         if constexpr (Weights::PAIR)
-            raw_b[j] = gemm_raw(weights.wb, weights.template staged<1>(stage, index, wn * NJ + j), tile, kb, lane);
+            raw_b[j] = gemm_raw(weights.wb, weights.codes(stage, 1, wn * NJ + j), tile, kb, lane);
     }
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
@@ -2109,13 +2050,13 @@ __device__ __forceinline__ float gemm_s8_product(int p) {
 
 template <class Shape, class W>
 __device__ __forceinline__ void gemm_tile_s8(float acc[Shape::MI][2][4], const W &w, const u8 *staged_tile,
-                                             u64 kblock, const float *coefficients, int j_tile,
-                                             const u32 a[2][Shape::MI][4], const float2 x[2][Shape::MI][2]) {
+                                             const float *coefficients, int j_tile, const u32 a[2][Shape::MI][4],
+                                             const float2 x[2][Shape::MI][2]) {
     static_assert(!W::DENSE, "the INT8 GEMM needs packed weights");
     constexpr bool LOCAL = staged_multiplier<W, true>();
     const u32 lane = threadIdx.x % 32;
     const u32 t = lane % 4;
-    const typename W::Raw raw = staged_raw(w, staged_tile, lane, kblock, 0);
+    const typename W::Raw raw = w.from_shared(staged_tile, lane);
     // A biased 16-code group's sum q_x (rows g, g + 8 of each m16 tile) is
     // the exact s8 product of its half of the 32 codes with all-ones weights;
     // a group of 32 codes or more takes the staged d_x sum q_x of each half.
@@ -2286,11 +2227,9 @@ __device__ __forceinline__ void gemm_segment_s8(u8 *shared, const QuantizedRows 
 #pragma unroll
         for (int j = 0; j < NJ; ++j) {
             const int tile_local = wn * NJ + j;
-            gemm_tile_s8<Shape>(acc[0][j], wa, weights.template staged<0>(stage, kb, tile_local), kbegin + kb,
-                                coefficients_a, j, a, groups);
+            gemm_tile_s8<Shape>(acc[0][j], wa, weights.codes(stage, 0, tile_local), coefficients_a, j, a, groups);
             if constexpr (PAIR)
-                gemm_tile_s8<Shape>(acc[1][j], wb, weights.template staged<1>(stage, kb, tile_local), kbegin + kb,
-                                    coefficients_b, j, a, groups);
+                gemm_tile_s8<Shape>(acc[1][j], wb, weights.codes(stage, 1, tile_local), coefficients_b, j, a, groups);
         }
     }
     seismic_cp_async_wait<0>();

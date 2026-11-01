@@ -54,12 +54,6 @@ pub(crate) enum CodeStorage {
     Float(FloatCodeFormat),
     /// Grid entries, each coding eight values (`GRID_VALUES`).
     Grid(&'static GridCodes),
-    /// Bytes of digits (`DIGIT_BITS` a digit's value), each digit read
-    /// through `interpretation`.
-    Digits {
-        digits: &'static DigitCodes,
-        interpretation: CodeInterpretation,
-    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,12 +176,6 @@ pub enum PlaneEncoding {
         scale_bits: u32,
         interpretation: CodeInterpretation,
     },
-    /// Bytes of base-3 digits (`DigitCodes`), each digit read through
-    /// `interpretation`.
-    Digits {
-        digits: &'static DigitCodes,
-        interpretation: CodeInterpretation,
-    },
     /// A closed floating code format packed bytewise, never a scalar dtype.
     FloatCode {
         format: FloatCodeFormat,
@@ -303,7 +291,6 @@ impl PlaneEncoding {
             PlaneEncoding::Packed { bits, .. } => bits,
             PlaneEncoding::SignedLocal { scale_bits, .. } => scale_bits + 1,
             PlaneEncoding::Grid(grid) => grid.entry_bits(),
-            PlaneEncoding::Digits { .. } => DIGIT_BYTE_BITS,
             PlaneEncoding::FloatCode { format } => format.bits(),
         }
     }
@@ -314,8 +301,7 @@ impl Plane {
             PlaneEncoding::Dense(dtype) => dtype,
             PlaneEncoding::Packed { .. }
             | PlaneEncoding::Grid(_)
-            | PlaneEncoding::SignedLocal { .. }
-            | PlaneEncoding::Digits { .. } => DType::U32,
+            | PlaneEncoding::SignedLocal { .. } => DType::U32,
             PlaneEncoding::FloatCode { .. } => DType::U32,
         }
     }
@@ -333,8 +319,7 @@ impl Plane {
             PlaneEncoding::Dense(dtype) => entries.checked_mul(u64::from(dtype.bytes())),
             PlaneEncoding::Packed { .. }
             | PlaneEncoding::Grid(_)
-            | PlaneEncoding::SignedLocal { .. }
-            | PlaneEncoding::Digits { .. } => entries
+            | PlaneEncoding::SignedLocal { .. } => entries
                 .checked_mul(u64::from(self.entry_bits()))
                 .map(|n| n.div_ceil(32) * u64::from(DType::U32.bytes())),
             PlaneEncoding::FloatCode { format } => entries
@@ -610,135 +595,10 @@ impl GridCodes {
     }
 }
 
-/// The radix of digit codes (`DigitCodes`).
-pub const DIGIT_RADIX: u32 = 3;
-/// Bits holding one digit's value.
-pub const DIGIT_BITS: u32 = u32::BITS - (DIGIT_RADIX - 1).leading_zeros();
-
-/// Base-3 digit codes (ggml's TQ1_0): bytes each holding a few values'
-/// digits as a base-3 fraction of the byte, digit `n` of byte `b` being
-/// `(((b 3^n) mod 256) 3) >> 8` (ggml's `dequantize_row_tq1_0`, exact for
-/// every byte), in `runs` that cover a storage group's values in order: a
-/// run of `bytes` bytes of `digits` digits holds the next `bytes digits`
-/// values, its value `o` being digit `o / bytes` of its byte `o % bytes`.
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub struct DigitCodes {
-    pub runs: &'static [DigitRun],
-}
-
-/// A run of `bytes` bytes of `digits` digits each, at most
-/// `DIGITS_PER_BYTE` (`DigitRun::new`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct DigitRun {
-    bytes: u32,
-    digits: u32,
-}
-
-impl DigitRun {
-    pub const fn new(bytes: u32, digits: u32) -> Self {
-        assert!(
-            digits <= DIGITS_PER_BYTE,
-            "a run's byte holds at most `DIGITS_PER_BYTE` digits"
-        );
-        Self { bytes, digits }
-    }
-
-    pub const fn bytes(&self) -> u32 {
-        self.bytes
-    }
-
-    pub const fn digits(&self) -> u32 {
-        self.digits
-    }
-}
-
-/// Bits of a byte of digits: an entry of a digits plane.
-pub const DIGIT_BYTE_BITS: u32 = u8::BITS;
-/// Digits one byte holds at most: the most `n` with `DIGIT_RADIX^n` below
-/// `2^DIGIT_BYTE_BITS` (`3^5 = 243`).
-pub const DIGITS_PER_BYTE: u32 = {
-    let mut digits = 0;
-    while DIGIT_RADIX.pow(digits + 1) <= 1 << DIGIT_BYTE_BITS {
-        digits += 1;
-    }
-    digits
-};
-
-impl DigitCodes {
-    /// Values the runs hold.
-    pub const fn values(&self) -> u32 {
-        let mut values = 0;
-        let mut run = 0;
-        while run < self.runs.len() {
-            values += self.runs[run].bytes * self.runs[run].digits;
-            run += 1;
-        }
-        values
-    }
-
-    /// Bytes the runs hold.
-    pub const fn bytes(&self) -> u32 {
-        let mut bytes = 0;
-        let mut run = 0;
-        while run < self.runs.len() {
-            bytes += self.runs[run].bytes;
-            run += 1;
-        }
-        bytes
-    }
-
-    /// The byte and the digit of value `value` (< `values`).
-    pub const fn place(&self, value: u32) -> (u32, u32) {
-        let (mut first, mut byte) = (0, 0);
-        let mut run = 0;
-        while run < self.runs.len() {
-            let DigitRun { bytes, digits } = self.runs[run];
-            if value < first + bytes * digits {
-                let offset = value - first;
-                return (byte + offset % bytes, offset / bytes);
-            }
-            first += bytes * digits;
-            byte += bytes;
-            run += 1;
-        }
-        panic!("a value lies past the digit runs")
-    }
-
-    /// Digit `digit` (< `DIGITS_PER_BYTE`) of byte `byte`
-    /// (`reference_math::digit_recipe`).
-    pub fn digit(byte: u32, digit: u32) -> u32 {
-        use crate::reference_math::ReferenceScalar;
-        let value = crate::reference_math::evaluate(
-            &crate::reference_math::digit_recipe(),
-            &[ReferenceScalar::U32(byte), ReferenceScalar::U32(digit)],
-        )
-        .expect("a digit is total");
-        let ReferenceScalar::U32(value) = value else {
-            unreachable!("a digit is a word")
-        };
-        value
-    }
-}
-
-/// TQ1_0's digits: 32 and 16 bytes of five digits, then 4 of four.
-pub(crate) static TQ1_DIGITS: DigitCodes = DigitCodes {
-    runs: &[
-        DigitRun::new(32, 5),
-        DigitRun::new(16, 5),
-        DigitRun::new(4, 4),
-    ],
-};
-
 impl CodeInterpretation {
     /// Every code the interpretation gives a `bits`-wide entry, ascending.
     pub fn codes(&self, bits: u32) -> Vec<i32> {
-        self.codes_below(1 << bits, bits)
-    }
-
-    /// Every code the interpretation gives the `bits`-wide raw codes below
-    /// `raw`, ascending (a digit's: below `DIGIT_RADIX`).
-    pub fn codes_below(&self, raw: u32, bits: u32) -> Vec<i32> {
-        let mut codes = (0..raw)
+        let mut codes = (0..1u32 << bits)
             .map(|raw| self.decode(raw, bits))
             .collect::<Vec<_>>();
         codes.sort_unstable();
@@ -748,14 +608,13 @@ impl CodeInterpretation {
 }
 #[cfg(test)]
 impl Repr {
-    /// A field's or a digit's code from its raw bits.
+    /// A field's code from its raw bits.
     pub(crate) fn decode_code(&self, raw: u32) -> i32 {
         match &self.coding.codes() {
             CodeStorage::Fields {
                 bits,
                 interpretation,
             } => interpretation.decode(raw, *bits),
-            CodeStorage::Digits { interpretation, .. } => interpretation.decode(raw, DIGIT_BITS),
             CodeStorage::Float(_) | CodeStorage::Grid(_) => {
                 panic!("`{}` stores no integer fields", self.name)
             }
@@ -772,9 +631,7 @@ impl Repr {
 /// axis shares group `v / group`, whose `fields` entries are consecutive;
 /// entry `(v / group) * fields + field` starts at bit
 /// `entry * entry_bits` of the plane row, little-endian within
-/// `storage_dtype` words (see `entry` and `bit_offset`). A digits plane's
-/// group is its runs' values and its entries their bytes: value `v` is in
-/// the group's byte its runs place it in (`DigitCodes::place`).
+/// `storage_dtype` words (see `entry` and `bit_offset`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlaneSchema {
     pub field: PlaneField,
@@ -795,24 +652,13 @@ pub struct PlaneSchema {
 impl PlaneSchema {
     /// The entry holding field `field` of the group of logical value `value`.
     pub fn entry(&self, value: u64, field: u32) -> u64 {
-        let within = match &self.encoding {
-            PlaneEncoding::Digits { digits, .. } => {
-                assert_eq!(field, 0, "a digits plane has one field");
-                digits.place((value % u64::from(self.group)) as u32).0
-            }
-            _ => field,
-        };
-        value / u64::from(self.group) * u64::from(self.fields) + u64::from(within)
+        value / u64::from(self.group) * u64::from(self.fields) + u64::from(field)
     }
 
     /// The position of logical value `value` among the values its entry
-    /// covers: a vector code's lane, or a digit of its byte.
+    /// covers: a vector code's lane.
     pub fn lane(&self, value: u64) -> u32 {
-        let within = (value % u64::from(self.group)) as u32;
-        match &self.encoding {
-            PlaneEncoding::Digits { digits, .. } => digits.place(within).1,
-            _ => within,
-        }
+        (value % u64::from(self.group)) as u32
     }
 
     /// The first bit of `entry` within the plane row, little-endian within
@@ -870,17 +716,8 @@ pub enum DecodeStep {
     },
     /// `into: u32 :=` the position of the logical value being decoded among
     /// the values its entry of the plane at ordinal `plane` covers
-    /// (`PlaneSchema::lane`): a vector code's lane, or its digit's position
-    /// in its byte.
+    /// (`PlaneSchema::lane`): a vector code's lane.
     ReadPlaneLane { into: DecodeTemp, plane: u32 },
-    /// `into: i32 := interpretation.decode(DigitCodes::digit(raw, digit),
-    /// DIGIT_BITS)`: the code of a base-3 digit of a byte.
-    InterpretDigitCode {
-        into: DecodeTemp,
-        raw: DecodeTemp,
-        digit: DecodeTemp,
-        interpretation: CodeInterpretation,
-    },
     /// `into: i32 := interpretation.decode(raw, bits)` (unsigned, two's
     /// complement, zero-point offset, or table) of the low `bits` bits of
     /// `raw` (`DecodeRecipe::read_bits`: all of a read but a signed local
@@ -957,7 +794,6 @@ impl DecodeStep {
             | DecodeStep::InterpretCode { into, .. }
             | DecodeStep::SignedCode { into, .. }
             | DecodeStep::InterpretGridCode { into, .. }
-            | DecodeStep::InterpretDigitCode { into, .. }
             | DecodeStep::DecodeFloatCode { into, .. }
             | DecodeStep::ConvertToF32 { into, .. }
             | DecodeStep::Constant { into, .. }
@@ -977,7 +813,6 @@ impl DecodeStep {
             DecodeStep::InterpretCode { raw, .. } => vec![*raw],
             DecodeStep::SignedCode { code, raw, .. } => vec![*code, *raw],
             DecodeStep::InterpretGridCode { raw, lane, .. } => vec![*raw, *lane],
-            DecodeStep::InterpretDigitCode { raw, digit, .. } => vec![*raw, *digit],
             DecodeStep::DecodeFloatCode { raw, .. } => vec![*raw],
             DecodeStep::ConvertToF32 { from, .. }
             | DecodeStep::Negate { from, .. }
@@ -1145,13 +980,6 @@ impl DecodeRecipe {
                             interpretation,
                             ..
                         } if *into == code => Some(interpretation.codes(*bits)),
-                        DecodeStep::InterpretDigitCode {
-                            into,
-                            interpretation,
-                            ..
-                        } if *into == code => {
-                            Some(interpretation.codes_below(DIGIT_RADIX, DIGIT_BITS))
-                        }
                         DecodeStep::InterpretGridCode { into, grid, .. } if *into == code => {
                             Some(grid.codes())
                         }
@@ -1354,23 +1182,6 @@ impl RecipeBuilder<'_> {
             raw,
             lane,
             grid,
-        });
-        into
-    }
-
-    /// The code of the base-3 digit of the value being decoded in its byte
-    /// `raw` of the words plane.
-    fn digit_code(&mut self, raw: DecodeTemp, interpretation: CodeInterpretation) -> DecodeTemp {
-        let plane = self.ordinal(PlaneField::Words);
-        let digit = self.temp(DType::U32);
-        self.steps
-            .push(DecodeStep::ReadPlaneLane { into: digit, plane });
-        let into = self.temp(DType::I32);
-        self.steps.push(DecodeStep::InterpretDigitCode {
-            into,
-            raw,
-            digit,
-            interpretation,
         });
         into
     }
@@ -1889,25 +1700,6 @@ pub(crate) const REPRS: &[Repr] = &[
             },
         },
     },
-    // GGUF TQ1_0: ternary codes as base-3 digits offset by 1, five or four
-    // a byte (`TQ1_DIGITS`), one f16 scale per 256: ggml's `(q - 1) d`
-    // exactly, 54 bytes per 256 values as in GGUF.
-    Repr {
-        name: "b3g256",
-        packing_axis: PackingAxisRule::Last,
-        group: 256,
-        coding: Coding::Direct {
-            codes: CodeStorage::Digits {
-                digits: &TQ1_DIGITS,
-                interpretation: CodeInterpretation::Offset(1),
-            },
-            scales: Scales::Stored {
-                dtype: DType::F16,
-                bias: false,
-                packet_group: 256,
-            },
-        },
-    },
     // GGUF Q3_K: 3-bit codes offset by 4 (a 2-bit low part and a 1-bit high
     // part), a 6-bit scale code offset by 32 per 16 values and one f16
     // factor `d` per 256: ggml's `d (s - 32) q` exactly, 110 bytes per 256
@@ -2098,7 +1890,7 @@ impl OperandRecipe {
 /// How a decoder reads a packed representation's values, the axes native
 /// libraries compose their decoders from: code planes of `low` and `high`
 /// bits (a grid code's entry is its whole bytes, `low`, and the rest,
-/// `high`; digits have no code planes), their values scaled by
+/// `high`), their values scaled by
 /// `2^code_exponent` (a floating value code is its codebook,
 /// `FloatCodeFormat::codebook`), and the `coding`: the codes with the
 /// coefficients that scale them.
@@ -2111,30 +1903,16 @@ pub struct DecodeAxes {
 }
 
 /// What a decoder's code planes hold: fields read through an
-/// interpretation, grid entries each coding `GRID_VALUES` values, or bytes
-/// of digits each read through an interpretation.
+/// interpretation, or grid entries each coding `GRID_VALUES` values.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueCodes {
     Fields(CodeInterpretation),
     Grid(&'static GridCodes),
-    Digits {
-        digits: &'static DigitCodes,
-        interpretation: CodeInterpretation,
-    },
 }
 
 impl From<&'static GridCodes> for ValueCodes {
     fn from(grid: &'static GridCodes) -> Self {
         Self::Grid(grid)
-    }
-}
-
-impl ValueCodes {
-    pub const fn digits(&self) -> Option<&'static DigitCodes> {
-        match self {
-            Self::Digits { digits, .. } => Some(digits),
-            Self::Fields(_) | Self::Grid(_) => None,
-        }
     }
 }
 
@@ -2185,21 +1963,14 @@ impl DecodeAxes {
         let codes = match &values {
             ValueCodes::Fields(interpretation) => interpretation.codes(self.low + self.high),
             ValueCodes::Grid(grid) => grid.codes(),
-            ValueCodes::Digits { interpretation, .. } => {
-                interpretation.codes_below(DIGIT_RADIX, DIGIT_BITS)
-            }
         };
         Profile {
             codes: Domain::of(&codes),
             code_exponent: self.code_exponent,
             map: match &values {
                 ValueCodes::Grid(_) => ValueMap::Grid,
-                ValueCodes::Fields(CodeInterpretation::Table(_))
-                | ValueCodes::Digits {
-                    interpretation: CodeInterpretation::Table(_),
-                    ..
-                } => ValueMap::Table,
-                ValueCodes::Fields(_) | ValueCodes::Digits { .. } => ValueMap::Linear,
+                ValueCodes::Fields(CodeInterpretation::Table(_)) => ValueMap::Table,
+                ValueCodes::Fields(_) => ValueMap::Linear,
             },
             local,
             upper,
@@ -2501,17 +2272,6 @@ impl Repr {
                 let bits = grid.entry_bits();
                 (ValueCodes::Grid(grid), 0, (bits / 8 * 8, bits % 8))
             }
-            CodeStorage::Digits {
-                digits,
-                interpretation,
-            } => (
-                ValueCodes::Digits {
-                    digits,
-                    interpretation: interpretation.clone(),
-                },
-                0,
-                (0, 0),
-            ),
         };
         let (values, code_exponent, (low, high)) = codes(&self.coding.codes());
         let coding = match &self.coding {
@@ -2599,26 +2359,14 @@ impl Repr {
             PlaneField::Words,
             Plane {
                 name: "words",
-                // A vector code's entry is shared by its eight values; a
-                // digits plane's bytes by its runs' values.
+                // A vector code's entry is shared by its eight values.
                 group: match &codes {
-                    CodeStorage::Digits { digits, .. } => digits.values(),
                     CodeStorage::Grid(_) => GRID_VALUES,
                     CodeStorage::Fields { .. } | CodeStorage::Float(_) => 1,
                 },
-                fields: match &codes {
-                    CodeStorage::Digits { digits, .. } => digits.bytes(),
-                    CodeStorage::Fields { .. } | CodeStorage::Float(_) | CodeStorage::Grid(_) => 1,
-                },
+                fields: 1,
                 encoding: match codes {
                     CodeStorage::Float(format) => PlaneEncoding::FloatCode { format },
-                    CodeStorage::Digits {
-                        digits,
-                        interpretation,
-                    } => PlaneEncoding::Digits {
-                        digits,
-                        interpretation,
-                    },
                     CodeStorage::Fields {
                         bits,
                         interpretation,
@@ -2765,10 +2513,6 @@ impl Repr {
         let raw = recipe.read(PlaneField::Words, 0);
         let (code_value, integer_code) = match self.coding.codes() {
             CodeStorage::Float(format) => (recipe.float_code(raw, format), None),
-            CodeStorage::Digits { interpretation, .. } => {
-                let code = recipe.digit_code(raw, interpretation);
-                (recipe.to_f32(code), Some(code))
-            }
             CodeStorage::Fields {
                 bits,
                 interpretation,
@@ -3038,18 +2782,6 @@ mod tests {
                 DecodeStep::ReadPlaneLane { plane, .. } => {
                     f64::from(recipe.planes()[*plane as usize].lane(value))
                 }
-                DecodeStep::InterpretDigitCode {
-                    raw,
-                    digit,
-                    interpretation,
-                    ..
-                } => f64::from(interpretation.decode(
-                    DigitCodes::digit(
-                        get(&temporaries, *raw) as u32,
-                        get(&temporaries, *digit) as u32,
-                    ),
-                    DIGIT_BITS,
-                )),
                 DecodeStep::InterpretGridCode {
                     raw, lane, grid, ..
                 } => f64::from(grid.code(
@@ -3104,8 +2836,7 @@ mod tests {
             match plane.encoding {
                 PlaneEncoding::Packed { .. }
                 | PlaneEncoding::Grid(_)
-                | PlaneEncoding::SignedLocal { .. }
-                | PlaneEncoding::Digits { .. } => f64::from(
+                | PlaneEncoding::SignedLocal { .. } => f64::from(
                     (entry as u32)
                         .wrapping_mul(2_654_435_761)
                         .wrapping_add(ordinal.wrapping_mul(97))
@@ -3163,8 +2894,8 @@ mod tests {
                             code
                         }
                     }
-                    PlaneEncoding::Grid(_) | PlaneEncoding::Digits { .. } => {
-                        unreachable!("grid entries and digits are codes, not coefficients")
+                    PlaneEncoding::Grid(_) => {
+                        unreachable!("grid entries are codes, not coefficients")
                     }
                     PlaneEncoding::FloatCode { format } => format.decode(raw as u32),
                     PlaneEncoding::Dense(_) => raw as f32,
@@ -3212,9 +2943,6 @@ mod tests {
                 let decoded_code = match &repr.coding.codes() {
                     CodeStorage::Float(format) => format.decode(code),
                     CodeStorage::Grid(grid) => grid.code(code, flat as u32 % GRID_VALUES) as f32,
-                    CodeStorage::Digits { .. } => {
-                        repr.decode_code(DigitCodes::digit(code, words.lane(flat as u64))) as f32
-                    }
                     CodeStorage::Fields { .. } => repr.decode_code(code) as f32,
                 };
                 let expected = (coefficient(false) as f64 * f64::from(decoded_code)
@@ -3279,13 +3007,6 @@ mod tests {
                         } => {
                             assert_eq!(recipe.dtype(*raw), DType::U32);
                             assert_eq!(recipe.dtype(*lane), DType::U32);
-                            assert_eq!(recipe.dtype(*into), DType::I32);
-                        }
-                        DecodeStep::InterpretDigitCode {
-                            into, raw, digit, ..
-                        } => {
-                            assert_eq!(recipe.dtype(*raw), DType::U32);
-                            assert_eq!(recipe.dtype(*digit), DType::U32);
                             assert_eq!(recipe.dtype(*into), DType::I32);
                         }
                         DecodeStep::DecodeFloatCode {
@@ -3393,7 +3114,6 @@ mod tests {
             ("q6k", 210),
             ("q1g128", 18 * 2),
             ("iq2s", 82),
-            ("b3g256", 54),
         ] {
             let r = lookup(name).unwrap();
             assert_eq!(

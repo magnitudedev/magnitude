@@ -977,8 +977,7 @@ fn render_representation(
                     registry::RowPlaneContent::GridHigh { bits, .. } => {
                         out.push_str(&format!("#define {plane_prefix}_ENTRY_BITS {bits}\n"))
                     }
-                    registry::RowPlaneContent::Digits { .. }
-                    | registry::RowPlaneContent::Groups { .. } => {}
+                    registry::RowPlaneContent::Groups { .. } => {}
                 }
             }
         }
@@ -1101,11 +1100,7 @@ impl Interpretation {
     /// or a grid's.
     fn of_values(codes: &registry::ValueCodes) -> Self {
         match codes {
-            registry::ValueCodes::Fields(code)
-            | registry::ValueCodes::Digits {
-                interpretation: code,
-                ..
-            } => Self::of(code),
+            registry::ValueCodes::Fields(code) => Self::of(code),
             registry::ValueCodes::Grid(grid) => Self {
                 codes: Some(registry::CodeKind::Grid),
                 grid: Some(grid),
@@ -1168,12 +1163,10 @@ impl Axis for registry::ScaleEncoding {
 /// `bias` (`SEISMIC_BIAS_KIND_*`), a minimum's sign `bias_sign` (1 without
 /// one) and a signed bias's exponent `signed_exponent`, and carried local
 /// codes sit at entry bit `carried_bit`, which is past the entry's indices,
-/// signs and delta (0: none carried). Base-3 digit codes are `digits`'
-/// runs.
+/// signs and delta (0: none carried).
 struct Coded {
     low: u32,
     high: u32,
-    digits: Option<&'static registry::DigitCodes>,
     code: Interpretation,
     code_exponent: i32,
     coeff: registry::CoefficientKind,
@@ -1209,7 +1202,6 @@ impl Coded {
         let flat = |coeff, scale, bias, group| Self {
             low: axes.low,
             high: axes.high,
-            digits: values.digits(),
             code: Interpretation::of_values(&values),
             code_exponent: axes.code_exponent,
             coeff,
@@ -1273,7 +1265,7 @@ impl Coded {
 /// The decode axes of a packed row-layout element, each defined as
 /// `<prefix>_<AXIS>` (`render_representation`), in the order of the axes
 /// tuple (`render_axes_tuple`).
-const CODING_AXES: [(&str, fn(&Coded) -> String); 36] = [
+const CODING_AXES: [(&str, fn(&Coded) -> String); 32] = [
     ("CODE_LOW_BITS", |c| c.low.to_string()),
     ("CODE_HIGH_BITS", |c| c.high.to_string()),
     ("CODES", |c| c.code.codes()),
@@ -1337,53 +1329,10 @@ const CODING_AXES: [(&str, fn(&Coded) -> String); 36] = [
             }
         })
     }),
-    // Digit runs: their count, and each run's bytes and digits a byte, eight
-    // bits a run from bit 0 (`registry::DigitCodes`), and a digit's bits
-    // (`registry::DIGIT_BITS`).
-    ("CODES_DIGIT_RUNS", |c| {
-        c.digits.map_or(0, |digits| digits.runs.len()).to_string()
-    }),
-    ("CODES_DIGIT_RUN_BYTES", |c| {
-        digit_runs(c, |run| run.bytes())
-    }),
-    ("CODES_DIGIT_RUN_DIGITS", |c| {
-        digit_runs(c, |run| run.digits())
-    }),
-    ("CODES_DIGIT_BITS", |c| {
-        c.digits.map_or(0, |_| registry::DIGIT_BITS).to_string()
-    }),
     ("COEFF_SIGNED_BIAS_EXPONENT", |c| {
         c.signed_exponent.to_string()
     }),
 ];
-
-/// A run value of every base-3 digit run of `c`, eight bits a run, as a
-/// plain hex literal: a GLSL library reads it in `#if`, where glslang takes
-/// no `u` suffix.
-fn digit_runs(c: &Coded, value: fn(&registry::DigitRun) -> u32) -> String {
-    let runs = c.digits.map_or(&[][..], |digits| digits.runs);
-    assert!(runs.len() <= 4, "a word holds four digit runs");
-    let packed = runs.iter().enumerate().fold(0u32, |packed, (index, run)| {
-        assert!(value(run) < 256, "a digit run's value fits a byte");
-        packed | value(run) << (8 * index)
-    });
-    format!("0x{packed:08x}")
-}
-
-/// The powers `DIGIT_RADIX^n` of the digits a byte holds past its first
-/// (`n` = 1 .. `DIGITS_PER_BYTE` - 1, each below `2^DIGIT_BYTE_BITS`), eight
-/// bits a power from bit 0, as a plain hex literal (`digit_runs`). Its low
-/// byte is the radix.
-fn digit_powers() -> String {
-    assert!(
-        registry::DIGITS_PER_BYTE <= 5,
-        "a word holds the powers of a byte's digits past its first"
-    );
-    let powers = (1..registry::DIGITS_PER_BYTE).fold(0u32, |packed, n| {
-        packed | registry::DIGIT_RADIX.pow(n) << (8 * (n - 1))
-    });
-    format!("0x{powers:08x}")
-}
 
 /// The tensor's prefix as a function-like macro over its axes, emitted for
 /// Vulkan sources (`render_representation`): `<prefix>(F)` =
@@ -1439,18 +1388,6 @@ fn render_axis_constants(out: &mut String, dialect: Dialect) {
     render_axis_values::<registry::BiasKind>(out);
     render_axis_values::<registry::ScaleEncoding>(out);
     render_axis_values::<registry::GridSigns>(out);
-    // The digit radix's powers (`digit_powers`), the same for every digits
-    // representation.
-    out.push_str(&format!("#define SEISMIC_DIGIT_POWERS {}\n", digit_powers()));
-    // The bytes of an `mma16` digits chunk and of a segment across a tile,
-    // which CUDA's digits reader places its lanes' sources by.
-    if matches!(dialect, Dialect::Cuda(_)) {
-        out.push_str(&format!(
-            "#define SEISMIC_MMA_DIGIT_CHUNK {}\n#define SEISMIC_MMA_DIGIT_SEGMENT {}\n",
-            registry::MMA_DIGIT_CHUNK,
-            registry::MMA_DIGIT_SEGMENT
-        ));
-    }
     // The axes tuple's form and dtype values (`render_axes_tuple`).
     #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
     if matches!(dialect, Dialect::Vulkan(_)) {

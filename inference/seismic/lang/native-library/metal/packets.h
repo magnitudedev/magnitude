@@ -22,8 +22,8 @@
 // Weight tensors are bound to slots before this file is included:
 //     #define KERNEL_W0 SEISMIC_GATE_WEIGHT
 // which defines `packets::W0` (the decoder of the bound representation) and
-// `KERNEL_W0_LAYOUT(k)` (its geometry, `GeometryOf<W0>`, for rows of `k`
-// logical values). Slots W0..W3 exist. A bound weight is dense (f32, bf16, f16) or
+// `KERNEL_W0_LAYOUT(k)` (its `Rows16` geometry for rows of `k` logical
+// values). Slots W0..W3 exist. A bound weight is dense (f32, bf16, f16) or
 // packed in the rows16 or rows32 layout.
 
 #include <seismic/element.h>
@@ -39,97 +39,48 @@ namespace packets {
 // `rows32`, whose code planes are interleaved across the tile (unit `u` of
 // the tile's row `r` follows unit `u` of row `r - 1`) and whose coefficient
 // planes hold the tile's rows one after another, each row's bytes contiguous
-// (`scales_row`, `supers_row` bytes a row), as does a code plane of base-3
-// digits, which keeps a storage group's bytes whole: its geometry is
-// `DigitRows16`, `Rows16` and its bytes a row (`codes_row`). A row is then
-// addressed by its tile's base and `r`, which the geometry of that row
-// carries (`of`): a code plane address is `at(row, plane, unit bytes, unit)`,
-// a coefficient address `scale_at(row, offset)` or `super_at(row, offset)`,
-// a digits address `DigitRows16::codes_at(row, offset)`.
-
-// The members of a row geometry (`Rows16`, and `DigitRows16`, which Metal's
-// lack of derived structs makes a second struct of the same members):
-// `codes` the low code plane, the grid entries or the values (dense);
-// `high` the high code plane; `scales` the local coefficient codes;
-// `supers` the direct coefficients or the factors. `base_of(base, n)` is row
-// `n`'s base (its tile's first row) from the tensor's `base`; `of(n)` this
-// geometry for row `n`. `at(row, plane, bytes, unit)` is unit `unit` (of
-// `bytes` bytes) of the code plane at row offset `plane`: a tile's planes
-// are below 4 GB, so the offset inside one is 32-bit arithmetic, and the
-// row's share (everything but the unit's step) is one loop-invariant
-// address: 64-bit index arithmetic on every load costs a decode lane
-// several instructions a packet. `scale_at(row, offset)` and
-// `super_at(row, offset)` are byte `offset` of this row's share of the
-// scales and of the supers plane.
-#define PACKETS_ROWS16_MEMBERS                                                                              \
-    ulong stride;                                                                                           \
-    ulong codes;                                                                                            \
-    ulong high;                                                                                             \
-    ulong scales;                                                                                           \
-    ulong supers;                                                                                           \
-    uint tile;                                                                                              \
-    uint r;                                                                                                 \
-    ulong scales_row;                                                                                       \
-    ulong supers_row;                                                                                       \
-    device const uchar *base_of(device const uchar *base, ulong n) const {                                  \
-        return base + (n - n % tile) * stride;                                                              \
-    }                                                                                                       \
-    auto of(ulong n) const {                                                                                \
-        auto row = *this;                                                                                   \
-        row.r = uint(n % tile);                                                                             \
-        return row;                                                                                         \
-    }                                                                                                       \
-    device const uchar *at(device const uchar *row, ulong plane, ulong bytes, ulong unit) const {           \
-        return (row + plane * tile + ulong(r * uint(bytes))) + ulong(uint(unit) * (tile * uint(bytes)));    \
-    }                                                                                                       \
-    device const uchar *scale_at(device const uchar *row, ulong offset) const {                             \
-        return (row + scales * tile + ulong(r * uint(scales_row))) + ulong(uint(offset));                   \
-    }                                                                                                       \
-    device const uchar *super_at(device const uchar *row, ulong offset) const {                             \
-        return (row + supers * tile + ulong(r * uint(supers_row))) + ulong(uint(offset));                   \
-    }
+// (`scales_row`, `supers_row` bytes a row). A row is then addressed by its
+// tile's base and `r`, which the geometry of that row carries (`of`): a code
+// plane address is `at(row, plane, unit bytes, unit)`, a coefficient address
+// `scale_at(row, offset)` or `super_at(row, offset)`.
 
 struct Rows16 {
-    PACKETS_ROWS16_MEMBERS
-    // This geometry of a bound weight's rows from the members' values
-    // (`codes_row` a digits plane's bytes a row, which it has none of).
-    static Rows16 of_rows(ulong stride, ulong codes, ulong high, ulong scales, ulong supers, uint tile, uint r,
-        ulong scales_row, ulong supers_row, ulong) {
-        return Rows16{stride, codes, high, scales, supers, tile, r, scales_row, supers_row};
-    }
-};
+    ulong stride;
+    ulong codes;    // the low code plane, the grid entries or the values (dense)
+    ulong high;     // the high code plane
+    ulong scales;   // the local coefficient codes
+    ulong supers;   // the direct coefficients or the factors
+    uint tile;
+    uint r;
+    ulong scales_row;
+    ulong supers_row;
 
-// The geometry of rows whose codes are a digits plane (`Digits`): a
-// `Rows16`'s members and the digits plane's bytes a row, `codes_row`; the
-// coefficient decoders take it as its `Rows16`.
-struct DigitRows16 {
-    PACKETS_ROWS16_MEMBERS
-    ulong codes_row;
-    operator Rows16() const { return Rows16{stride, codes, high, scales, supers, tile, r, scales_row, supers_row}; }
-    static DigitRows16 of_rows(ulong stride, ulong codes, ulong high, ulong scales, ulong supers, uint tile, uint r,
-        ulong scales_row, ulong supers_row, ulong codes_row) {
-        return DigitRows16{stride, codes, high, scales, supers, tile, r, scales_row, supers_row, codes_row};
+    // Row `n`'s base (its tile's first row) from the tensor's `base`.
+    device const uchar *base_of(device const uchar *base, ulong n) const {
+        return base + (n - n % tile) * stride;
     }
-    // Byte `offset` of this row's share of the digits plane.
-    device const uchar *codes_at(device const uchar *row, ulong offset) const {
-        return (row + codes * tile + ulong(r * uint(codes_row))) + ulong(uint(offset));
+    // This geometry for row `n`.
+    Rows16 of(ulong n) const {
+        Rows16 row = *this;
+        row.r = uint(n % tile);
+        return row;
     }
-};
-#undef PACKETS_ROWS16_MEMBERS
-
-// The row geometry a decoder W reads (`W::geometry`): `Rows16` unless it
-// names its own.
-template <typename>
-struct always_void {
-    typedef void type;
-};
-template <typename W, typename = void>
-struct GeometryOf {
-    typedef Rows16 type;
-};
-template <typename W>
-struct GeometryOf<W, typename always_void<typename W::geometry>::type> {
-    typedef typename W::geometry type;
+    // Unit `unit` (of `bytes` bytes) of the code plane at row offset `plane`.
+    // A tile's planes are below 4 GB, so the offset inside one is 32-bit
+    // arithmetic, and the row's share (everything but the unit's step) is
+    // one loop-invariant address: 64-bit index arithmetic on every load
+    // costs a decode lane several instructions a packet.
+    device const uchar *at(device const uchar *row, ulong plane, ulong bytes, ulong unit) const {
+        return (row + plane * tile + ulong(r * uint(bytes))) + ulong(uint(unit) * (tile * uint(bytes)));
+    }
+    // Byte `offset` of this row's share of the scales and of the supers
+    // plane.
+    device const uchar *scale_at(device const uchar *row, ulong offset) const {
+        return (row + scales * tile + ulong(r * uint(scales_row))) + ulong(uint(offset));
+    }
+    device const uchar *super_at(device const uchar *row, ulong offset) const {
+        return (row + supers * tile + ulong(r * uint(supers_row))) + ulong(uint(offset));
+    }
 };
 
 // The eight WIDTH-bit codes (WIDTH 1 or 2) of an 8 WIDTH-bit field, codes
@@ -364,379 +315,6 @@ struct Planes<8, 0> {
     }
 };
 
-// Digit codes (`registry::DigitCodes`): a storage group's bytes,
-// whole in the digits plane (`DigitRows16::codes_at`), are RUNS runs, run r of
-// `run_bytes(r)` bytes of `run_digits(r)` digits each (bits 8r.. of
-// RUN_BYTES and RUN_DIGITS), holding the group's values in order: run value
-// o is digit o / bytes of the run's byte o % bytes, and digit n of byte b is
-// (((b R^n) mod 256) R) >> 8 (`registry::DigitCodes::digit`) for the radix
-// R, whose powers R^n (n >= 1) are the bytes of `SEISMIC_DIGIT_POWERS` (R
-// its low byte). A step's
-// eight values lie in one run: eight bytes of one digit (a run of whole
-// 8-byte steps) or four bytes of two. A step reads the 8 bytes of the group
-// from `place<value, 0>`: its values 0..3 are word 0 or 1 of them, and so
-// are 4..7 (both the word of a step's four bytes, read with the word before
-// it or, at the group's start, after it). `place<value, 1>` and `place<value,
-// 2>` are R^n of the digits of values 0..3 and 4..7 (below 128), bit 7 set
-// where they are word 1.
-template <uint RUNS, uint RUN_BYTES, uint RUN_DIGITS>
-struct DigitRuns {
-    static constexpr uint radix() { return SEISMIC_DIGIT_POWERS & 0xffu; }
-    // R^n, n < 5 (the powers' byte n - 1 past R^0).
-    static constexpr uint power(uint n) { return n == 0u ? 1u : (SEISMIC_DIGIT_POWERS >> (8u * (n - 1u))) & 0xffu; }
-    static constexpr uint run_bytes(uint r) { return (RUN_BYTES >> (8u * r)) & 0xffu; }
-    static constexpr uint run_digits(uint r) { return (RUN_DIGITS >> (8u * r)) & 0xffu; }
-    static constexpr uint bytes() {
-        uint total = 0u;
-        for (uint r = 0; r < RUNS; ++r)
-            total += run_bytes(r);
-        return total;
-    }
-    static constexpr uint values() {
-        uint total = 0u;
-        for (uint r = 0; r < RUNS; ++r)
-            total += run_bytes(r) * run_digits(r);
-        return total;
-    }
-    // Whether every run's steps are eight bytes of a digit (whole words) or
-    // four bytes of two, every run starts at a word, and a step's powers are
-    // below 128 (bit 7 flags their word).
-    static constexpr bool steps_fit() {
-        for (uint r = 0; r < RUNS; ++r)
-            if ((run_bytes(r) % 8u != 0u && run_bytes(r) != 4u) || power(run_digits(r) - 1u) >= 128u)
-                return false;
-        return true;
-    }
-    static_assert(steps_fit() && values() % 32u == 0u && values() <= 256u,
-        "a group's runs are whole steps of words, a step's powers below 128, a group at most 256 values");
-    static constexpr uint packets() { return values() / 32u; }
-    // The first value and byte of run r, and the run holding value `value`
-    // (< values()).
-    static constexpr uint first_value(uint r) {
-        uint total = 0u;
-        for (uint i = 0; i < r; ++i)
-            total += run_bytes(i) * run_digits(i);
-        return total;
-    }
-    static constexpr uint first_byte(uint r) {
-        uint total = 0u;
-        for (uint i = 0; i < r; ++i)
-            total += run_bytes(i);
-        return total;
-    }
-    static constexpr uint run_of(uint value) {
-        uint run = 0u;
-        for (uint r = 1; r < RUNS; ++r)
-            run = value >= first_value(r) ? r : run;
-        return run;
-    }
-    // The step at value `value` (< values()): whether its run is of whole
-    // 8-byte units (its values 4..7 the unit's second word, else the four
-    // bytes' digit after that of 0..3), its first byte in the share, and the
-    // digit of its values 0..3.
-    static constexpr bool step_wide(uint value) { return run_bytes(run_of(value)) % 8u == 0u; }
-    static constexpr uint step_byte(uint value) {
-        return first_byte(run_of(value)) + (value - first_value(run_of(value))) % run_bytes(run_of(value));
-    }
-    static constexpr uint step_digit(uint value) {
-        return (value - first_value(run_of(value))) / run_bytes(run_of(value));
-    }
-    // The word of half h of the step at value `value` (its values 0..3, h =
-    // 0, or 4..7): its first byte in the share, and the power of its digit.
-    static constexpr uint half_byte(uint value, uint h) {
-        return step_byte(value) + (step_wide(value) ? 4u * h : 0u);
-    }
-    static constexpr uint half_power(uint value, uint h) {
-        return power(step_digit(value) + (step_wide(value) ? 0u : h));
-    }
-    // Field FIELD of the step at value VALUE, a value of the group's runs.
-    template <uint VALUE, uint FIELD>
-    static constexpr uint place() {
-        static_assert(VALUE < values(), "a step's value lies in the group's runs");
-        constexpr uint at = step_byte(VALUE) - (!step_wide(VALUE) && step_byte(VALUE) >= 4u ? 4u : 0u);
-        return FIELD == 0u ? at : half_power(VALUE, FIELD - 1u) | (half_byte(VALUE, FIELD - 1u) > at ? 0x80u : 0u);
-    }
-    // A lane that takes step s of every packet of a group (`Digits::
-    // load_lane`, `Digits::lane_step`) reads word h of packet k's step, slot
-    // c = 2 k + h, at `half_byte(32 k + 8 s, h)`. A slot's first is the
-    // first slot that reads the same word at every s (`slot_first`); the
-    // lane loads each first slot once (`Digits::lane_words`), `lane_slot`
-    // its index among them and `lane_words` their count.
-    static constexpr bool same_word(uint c, uint d) {
-        for (uint s = 0; s < 4u; ++s)
-            if (half_byte(32u * (c / 2u) + 8u * s, c % 2u) != half_byte(32u * (d / 2u) + 8u * s, d % 2u))
-                return false;
-        return true;
-    }
-    static constexpr uint slot_first(uint c) {
-        uint d = 0u;
-        while (!same_word(c, d))
-            ++d;
-        return d;
-    }
-    static constexpr uint lane_slot(uint c) {
-        uint index = 0u;
-        for (uint d = 0; d < slot_first(c); ++d)
-            index += slot_first(d) == d ? 1u : 0u;
-        return index;
-    }
-    static constexpr uint lane_words() {
-        uint count = 0u;
-        for (uint c = 0; c < 2u * packets(); ++c)
-            count += slot_first(c) == c ? 1u : 0u;
-        return count;
-    }
-    // Packet K's table entries: its steps' offsets, and their low and high
-    // powers a byte a step; zero past the group's packets.
-    template <uint K>
-    static constexpr uint4 offsets() {
-        if constexpr (K < packets())
-            return uint4(place<32u * K, 0u>(), place<32u * K + 8u, 0u>(), place<32u * K + 16u, 0u>(),
-                place<32u * K + 24u, 0u>());
-        else
-            return uint4(0u);
-    }
-    template <uint K, uint FIELD>
-    static constexpr uint powers() {
-        return place<32u * K, FIELD>() | place<32u * K + 8u, FIELD>() << 8u | place<32u * K + 16u, FIELD>() << 16u |
-            place<32u * K + 24u, FIELD>() << 24u;
-    }
-    template <uint K>
-    static constexpr uint4 power_entry() {
-        if constexpr (K < packets())
-            return uint4(powers<K, 1u>(), powers<K, 2u>(), 0u, 0u);
-        else
-            return uint4(0u);
-    }
-};
-
-// Every packet's places (`DigitRuns`): packet k's step offsets at entry 2k,
-// its low and high powers in entry 2k + 1.
-#define SEISMIC_DIGIT_PACKET(k) D::template offsets<k>(), D::template power_entry<k>()
-template <uint RUNS, uint RUN_BYTES, uint RUN_DIGITS,
-    typename D = DigitRuns<RUNS, RUN_BYTES, RUN_DIGITS>>
-constant uint4 digit_places[16] = {SEISMIC_DIGIT_PACKET(0u), SEISMIC_DIGIT_PACKET(1u), SEISMIC_DIGIT_PACKET(2u),
-    SEISMIC_DIGIT_PACKET(3u), SEISMIC_DIGIT_PACKET(4u), SEISMIC_DIGIT_PACKET(5u), SEISMIC_DIGIT_PACKET(6u),
-    SEISMIC_DIGIT_PACKET(7u)};
-#undef SEISMIC_DIGIT_PACKET
-
-// The digits as a packet's codes: its steps' words of values 0..3 and 4..7
-// and their powers, a byte a step (`DigitRuns::place`).
-template <uint RUNS, uint RUN_BYTES, uint RUN_DIGITS>
-struct Digits {
-    typedef DigitRuns<RUNS, RUN_BYTES, RUN_DIGITS> runs;
-    typedef DigitRows16 geometry;
-    struct words {
-        uint low[4];
-        uint high[4];
-        uint low_powers;
-        uint high_powers;
-    };
-    // Group g of the row share `share`.
-    static device const uchar *group_at(device const uchar *share, uint g) { return share + g * runs::bytes(); }
-    // Packet p's places in the row share `share` (`digit_places`): its
-    // group, its steps' offsets (`entries[0]`) and the bytes of their low and
-    // high words' powers (`entries[1].xy`, a byte a step; step s's
-    // `step_bytes`). A step's words of values 0..3 and 4..7 (`words`) are the
-    // first or, where bit 7 of the power's byte is set, the second word at
-    // its offset; their powers (`powers`, of a step's bytes or every step's)
-    // the bytes' low 7 bits.
-    struct packet_places {
-        device const uchar *group;
-        constant uint4 *entries;
-        static packet_places of(device const uchar *share, uint p) {
-            return packet_places{group_at(share, p / runs::packets()),
-                digit_places<RUNS, RUN_BYTES, RUN_DIGITS> + 2u * (p % runs::packets())};
-        }
-        template <class T> static T step_bytes(T bytes, uint s) { return (bytes >> (8u * s)) & 0xffu; }
-        uint2 words(uint offset, uint2 step) const {
-            const uint2 v = uint2(*reinterpret_cast<device const packed_uint2 *>(group + ulong(offset)));
-            return uint2((step.x & 0x80u) ? v.y : v.x, (step.y & 0x80u) ? v.y : v.x);
-        }
-        static uint2 powers(uint2 bytes) { return bytes & 0x7f7f7f7fu; }
-    };
-    static words load(device const uchar *row, DigitRows16 layout, uint p) {
-        const packet_places at = packet_places::of(layout.codes_at(row, 0ul), p);
-        const uint4 offsets = at.entries[0];
-        const uint2 bytes = at.entries[1].xy;
-        words w;
-        _Pragma("clang loop unroll(full)")
-        for (uint s = 0; s < 4u; ++s) {
-            const uint2 v = at.words(offsets[s], packet_places::step_bytes(bytes, s));
-            w.low[s] = v.x;
-            w.high[s] = v.y;
-        }
-        const uint2 powers = packet_places::powers(bytes);
-        w.low_powers = powers.x;
-        w.high_powers = powers.y;
-        return w;
-    }
-    // Digit n of the bytes b in the 16-bit lanes of `lanes` (no product
-    // reaches the next lane), radix R, is (r R) >> 8 of the remainder r =
-    // (b R^n) mod 256, one product by R^n (`remainders`), as `digit_pair`'s
-    // integer or a half: 1024 + r, times R/256 plus 1025.5 - 4R, rounded
-    // once: 1026 + the digit, the floor of R/256 of it (whose only integer
-    // value, at 0, rounds to even from 1025.5; `digit_halves`), less
-    // `digit_base`. A span's integer pairs take r by a chain of n
-    // products by R (`chain`) instead, measured faster there (M4 Pro, b3g256
-    // at eight rows: 304.9 against 309.1 µs).
-    static uint remainders(uint lanes, uint power) { return (lanes * power) & 0x00ff00ffu; }
-    template <uint N>
-    static uint chain(uint lanes) {
-        _Pragma("clang loop unroll(full)")
-        for (uint i = 0; i < N; ++i)
-            lanes = (lanes * runs::radix()) & 0x00ff00ffu;
-        return lanes;
-    }
-    static uint digit_pair(uint remainder) { return ((remainder * runs::radix()) >> 8) & 0x00ff00ffu; }
-    static half2 digit_halves(uint remainder) {
-        const half2 h = as_type<half2>(remainder | 0x64006400u);
-        return metal::fma(h, half2(half(runs::radix()) / 256.0h), half2(half(1025.5f - 4.0f * float(runs::radix()))));
-    }
-    // The half `digit_halves` less leaves the digits less the codes' zero:
-    // 1026 + that zero, from `offset`, 1024 + it (`Linear::codes`).
-    static half2 digit_base(half offset) { return half2(offset + 2.0h); }
-    // A step's values from its words and powers (`step_remainder`), less
-    // the codes' zero (`digit_base`): values 0, 2 (`even`) and 1, 3 of its
-    // first word, and the same of its second.
-    static void remainder_floats(uint low, uint high, uint low_power, uint high_power, half offset,
-        thread float4 &even, thread float4 &odd) {
-        const half2 base = digit_base(offset);
-        const half2 le = digit_halves(step_remainder<0u>(low, high, low_power, high_power)) - base;
-        const half2 lo = digit_halves(step_remainder<1u>(low, high, low_power, high_power)) - base;
-        const half2 he = digit_halves(step_remainder<2u>(low, high, low_power, high_power)) - base;
-        const half2 ho = digit_halves(step_remainder<3u>(low, high, low_power, high_power)) - base;
-        even = float4(le.x, le.y, he.x, he.y);
-        odd = float4(lo.x, lo.y, ho.x, ho.y);
-    }
-    // A lane's decode of its row's whole group, the `span()` packets of the
-    // group decoded together (`projection::gemv_body`, `gemv_batch_body`):
-    // every byte's digits in one lane, each step's powers compile-time
-    // constants.
-    static constexpr uint span() { return runs::packets(); }
-    struct span_words {
-        uint w[(runs::bytes() + 3u) / 4u];
-    };
-    static span_words load_span(device const uchar *row, DigitRows16 layout, uint p) {
-        constexpr uint WORDS = (runs::bytes() + 3u) / 4u;
-        device const uchar *share = group_at(layout.codes_at(row, 0ul), p / runs::packets());
-        span_words k;
-        _Pragma("clang loop unroll(full)")
-        for (uint i = 0; i + 4u <= WORDS; i += 4u) {
-            const uint4 v = uint4(*reinterpret_cast<device const packed_uint4 *>(share + 4u * i));
-            k.w[i] = v.x, k.w[i + 1u] = v.y, k.w[i + 2u] = v.z, k.w[i + 3u] = v.w;
-        }
-        _Pragma("clang loop unroll(full)")
-        for (uint i = WORDS / 4u * 4u; i < WORDS; ++i)
-            k.w[i] = *reinterpret_cast<device const uint *>(share + 4u * i);
-        return k;
-    }
-    // Step STEP's values (`remainder_floats`): its second word the same
-    // word, the next digit, in a run of 4.
-    template <uint MASK, uint STEP>
-    static void span_floats(thread const span_words &k, half offset, thread float4 &even, thread float4 &odd) {
-        static_assert(MASK == 0u, "digits are unsigned codes");
-        constexpr bool wide = runs::step_wide(8u * STEP);
-        constexpr uint first = runs::step_byte(8u * STEP) / 4u, n = runs::step_digit(8u * STEP);
-        constexpr uint pl = runs::power(n), ph = runs::power(wide ? n : n + 1u);
-        remainder_floats(k.w[first], k.w[wide ? first + 1u : first], pl, ph, offset, even, odd);
-    }
-    // Step STEP's values 2j and 2j + 1 as integers in bits 0.. and 16..
-    template <uint MASK, uint STEP>
-    static uint span_pair(thread const span_words &k, uint j) {
-        static_assert(MASK == 0u, "digits are unsigned codes");
-        constexpr bool wide = runs::step_wide(8u * STEP);
-        constexpr uint first = runs::step_byte(8u * STEP) / 4u, n = runs::step_digit(8u * STEP);
-        // Bytes 2j, 2j + 1 of the step's 8 (or twice its 4).
-        uint word;
-        if constexpr (wide)
-            word = (j >= 2u ? k.w[first + 1u] : k.w[first]) >> (16u * (j % 2u));
-        else
-            word = k.w[first] >> (16u * (j % 2u));
-        const uint lanes = chain<n>((word & 0xffu) | ((word & 0xff00u) << 8));
-        return digit_pair(!wide && j >= 2u ? chain<1u>(lanes) : lanes);
-    }
-    // The remainders of step `step` of packet p of the row share `share`
-    // (`projection::lane_codes`): its place's word or words
-    // (`packet_places`), each byte's by its digit's power.
-    static uint4 step_remainders(device const uchar *share, uint p, uint step) {
-        const packet_places at = packet_places::of(share, p);
-        const uint2 bytes = packet_places::step_bytes(at.entries[1].xy, step);
-        const uint2 v = at.words(at.entries[0][step], bytes), powers = packet_places::powers(bytes);
-        return step_remainders(v.x, v.y, powers.x, powers.y);
-    }
-    // A step's remainders from its words of values 0..3 and 4..7 and their
-    // digits' powers, a value a 16-bit lane: values 0, 2 in x, 1, 3 in y,
-    // 4, 6 in z and 5, 7 in w; remainder V of them (`step_remainder`).
-    template <uint V>
-    static uint step_remainder(uint low, uint high, uint low_power, uint high_power) {
-        const uint word = V < 2u ? low : high;
-        return remainders((V % 2u != 0u ? word >> 8 : word) & 0x00ff00ffu, V < 2u ? low_power : high_power);
-    }
-    static uint4 step_remainders(uint low, uint high, uint low_power, uint high_power) {
-        return uint4(step_remainder<0u>(low, high, low_power, high_power),
-            step_remainder<1u>(low, high, low_power, high_power), step_remainder<2u>(low, high, low_power, high_power),
-            step_remainder<3u>(low, high, low_power, high_power));
-    }
-    // A lane's step s of every packet of a group (`projection::lane_codes`):
-    // the words that step reads (`DigitRuns::lane_slot`), loaded once a
-    // group, each packet's places constants of the packet and the step.
-    struct lane_words {
-        uint w[runs::lane_words()];
-    };
-    // Slot C's byte and power at step s.
-    template <uint C>
-    static uint lane_byte(uint s) {
-        constexpr uint value = 32u * (C / 2u), h = C % 2u;
-        constexpr uint b0 = runs::half_byte(value, h), b1 = runs::half_byte(value + 8u, h),
-            b2 = runs::half_byte(value + 16u, h), b3 = runs::half_byte(value + 24u, h);
-        return s == 0u ? b0 : s == 1u ? b1 : s == 2u ? b2 : b3;
-    }
-    template <uint C>
-    static uint lane_power(uint s) {
-        constexpr uint value = 32u * (C / 2u), h = C % 2u;
-        constexpr uint p0 = runs::half_power(value, h), p1 = runs::half_power(value + 8u, h),
-            p2 = runs::half_power(value + 16u, h), p3 = runs::half_power(value + 24u, h);
-        return s == 0u ? p0 : s == 1u ? p1 : s == 2u ? p2 : p3;
-    }
-    template <uint C = 0u>
-    static void load_slots(thread lane_words &l, device const uchar *at, uint s) {
-        if constexpr (C < 2u * runs::packets()) {
-            if constexpr (runs::slot_first(C) == C) {
-                constexpr uint slot = runs::lane_slot(C);
-                l.w[slot] = *reinterpret_cast<device const uint *>(at + lane_byte<C>(s));
-            }
-            load_slots<C + 1u>(l, at, s);
-        }
-    }
-    static lane_words load_lane(device const uchar *share, uint group, uint s) {
-        lane_words l;
-        load_slots(l, group_at(share, group), s);
-        return l;
-    }
-    // Packet K's step s of the lane's words, as `step_remainders` gives it.
-    template <uint K>
-    static uint4 lane_step(thread const lane_words &l, uint s) {
-        constexpr uint low = runs::lane_slot(2u * K), high = runs::lane_slot(2u * K + 1u);
-        return step_remainders(l.w[low], l.w[high], lane_power<2u * K>(s), lane_power<2u * K + 1u>(s));
-    }
-    // Step `step`'s values (`remainder_floats`).
-    template <uint MASK>
-    static void floats(thread const words &w, uint step, half offset, thread float4 &even, thread float4 &odd) {
-        static_assert(MASK == 0u, "digits are unsigned codes");
-        remainder_floats(w.low[step], w.high[step], packet_places::step_bytes(w.low_powers, step),
-            packet_places::step_bytes(w.high_powers, step), offset, even, odd);
-    }
-    // The step's values 2j and 2j + 1 as integers in bits 0.. and 16..
-    template <uint MASK>
-    static uint pair(thread const words &w, uint step, uint j) {
-        static_assert(MASK == 0u, "digits are unsigned codes");
-        const uint word = (j < 2u ? w.low[step] : w.high[step]) >> ((j & 1u) * 16u);
-        const uint p = packet_places::step_bytes(j < 2u ? w.low_powers : w.high_powers, step);
-        return digit_pair(remainders((word & 0xffu) | ((word & 0xff00u) << 8), p));
-    }
-};
-
 // The bits `[bit, bit + WIDTH)` (WIDTH < 32, `bit` a multiple of WIDTH)
 // of consecutive little-endian words `w` held in registers: one word where
 // WIDTH divides 32, so that no field spans two, else the two words it may
@@ -892,16 +470,6 @@ struct Linear {
     template <typename P>
     static void codes(thread const typename P::words &w, uint step, thread float4 &even, thread float4 &odd) {
         P::template floats<MASK>(w, step, 1024.0h, even, odd);
-    }
-    // A span's codes less their zero, the zero taken off in the half
-    // subtraction.
-    template <typename P, uint STEP>
-    static void span_codes(thread const typename P::span_words &w, thread float4 &even, thread float4 &odd) {
-        P::template span_floats<MASK, STEP>(w, half(1024 + ZERO), even, odd);
-    }
-    template <typename P, uint STEP>
-    static float2 span_pair(thread const typename P::span_words &w, uint j) {
-        return code_pair(P::template span_pair<MASK, STEP>(w, j), half(1024 + ZERO));
     }
     template <typename P>
     static float2 pair(thread const typename P::words &w, uint step, uint j) {
@@ -1531,12 +1099,11 @@ struct Forms {
 template <typename P, typename C, typename K, typename F>
 struct Packet {
     static constant constexpr uint groups = K::groups;
-    typedef typename GeometryOf<P>::type geometry;
     struct packet {
         typename P::words codes;
         typename K::coefficients coefficients;
     };
-    static packet load(device const uchar *row, geometry layout, uint p) {
+    static packet load(device const uchar *row, Rows16 layout, uint p) {
         packet k;
         k.codes = P::load(row, layout, p);
         k.coefficients = K::template load<P>(row, layout, p, k.codes);
@@ -1559,41 +1126,6 @@ struct Packet {
         const float b = C::zero != 0 ? -(float(C::zero) * s) : K::biased ? k.coefficients.bias(group(step)) : 0.0f;
         even = metal::fma(float4(s), even, float4(b));
         odd = metal::fma(float4(s), odd, float4(b));
-    }
-    // A lane's decode of `span()` packets together, where the planes have
-    // one (`P::span`, base-3 digits): the planes' words of the span, and its
-    // coefficients, one direct coefficient group's (`K::at`). Step STEP (<
-    // 4 span()) of it as `values` forms a packet's, and its values 2j and
-    // 2j + 1 as `pair_values` does.
-    template <typename Q = P>
-    static constexpr auto span() -> decltype(Q::span()) {
-        return Q::span();
-    }
-    struct span_packet {
-        typename P::span_words codes;
-        typename K::coefficients coefficients;
-    };
-    static span_packet load_span(device const uchar *row, geometry layout, uint p) {
-        static_assert(K::groups == 1u, "a span's packets take one direct coefficient group");
-        span_packet k;
-        k.codes = P::load_span(row, layout, p);
-        k.coefficients = K::at(layout.super_at(row, 0ul), p);
-        return k;
-    }
-    // A span's values are its codes less their zero (`span_codes`, step
-    // STEP's) times its one scale (`span_scale`): a product over the span
-    // takes the codes, and the scale once.
-    template <uint STEP>
-    static void span_codes(thread const span_packet &k, thread float4 &even, thread float4 &odd) {
-        static_assert(!K::biased, "a span's values are its codes under one scale");
-        C::template span_codes<P, STEP>(k.codes, even, odd);
-    }
-    static float span_scale(thread const span_packet &k) { return k.coefficients.scale(0u); }
-    template <uint STEP>
-    static float2 span_pair_values(thread const span_packet &k, uint j) {
-        const float2 codes = C::template span_pair<P, STEP>(k.codes, j);
-        const float s = k.coefficients.scale(0u);
-        return K::biased ? metal::fma(float2(s), codes, float2(k.coefficients.bias(0u))) : s * codes;
     }
     // Step `step`'s eight logical values exactly, as a gather publishes
     // them: scale * (code - zero code), the difference exact, plus a stored
@@ -1669,7 +1201,7 @@ struct Dense {
 // Uniform packet loading: quantized packets ignore the row length.
 template <typename W>
 struct Loader {
-    static typename W::packet load(device const uchar *row, typename GeometryOf<W>::type layout, uint p, uint) {
+    static typename W::packet load(device const uchar *row, Rows16 layout, uint p, uint) {
         return W::load(row, layout, p);
     }
 };
@@ -1694,8 +1226,8 @@ template <typename W>
 struct Block {
     static constant constexpr uint packets = 1;
     struct state {};
-    static state load(device const uchar *, typename GeometryOf<W>::type, uint) { return state{}; }
-    static typename W::packet packet(device const uchar *row, typename GeometryOf<W>::type layout, uint p, uint k,
+    static state load(device const uchar *, Rows16, uint) { return state{}; }
+    static typename W::packet packet(device const uchar *row, Rows16 layout, uint p, uint k,
         thread state &) {
         return Loader<W>::load(row, layout, p, k);
     }
@@ -1710,8 +1242,8 @@ struct Block<Packet<P, C,
     typedef Packet<P, C, K, F> W;
     static constant constexpr uint packets = K::packets;
     typedef typename K::run state;
-    static state load(device const uchar *row, typename W::geometry layout, uint p) { return K::start(row, layout, p); }
-    static typename W::packet packet(device const uchar *row, typename W::geometry layout, uint p, uint,
+    static state load(device const uchar *row, Rows16 layout, uint p) { return K::start(row, layout, p); }
+    static typename W::packet packet(device const uchar *row, Rows16 layout, uint p, uint,
         thread state &run) {
         typename W::packet k;
         k.codes = P::load(row, layout, p);
@@ -1730,19 +1262,13 @@ inline float value_at(thread const typename W::packet &k, uint i) {
 // The decoder of a packed element's emitted decode axes (`_CODE*`,
 // `_COEFF*`): each axis value's component, chosen in one place.
 
-// The producer of codes CODES in planes of LOW and HIGH bits, or in RUNS
-// runs of digits.
-template <uint CODES, uint LOW, uint HIGH, uint RUNS, uint RUN_BYTES, uint RUN_DIGITS>
+// The producer of codes CODES in planes of LOW and HIGH bits.
+template <uint CODES, uint LOW, uint HIGH>
 struct PlanesOf {
-    static_assert(LOW == 0u && HIGH == 0u, "digits are no code planes");
-    typedef Digits<RUNS, RUN_BYTES, RUN_DIGITS> type;
-};
-template <uint CODES, uint LOW, uint HIGH, uint RUN_BYTES, uint RUN_DIGITS>
-struct PlanesOf<CODES, LOW, HIGH, 0u, RUN_BYTES, RUN_DIGITS> {
     typedef Planes<LOW, HIGH> type;
 };
-template <uint LOW, uint HIGH, uint RUN_BYTES, uint RUN_DIGITS>
-struct PlanesOf<SEISMIC_CODES_GRID, LOW, HIGH, 0u, RUN_BYTES, RUN_DIGITS> {
+template <uint LOW, uint HIGH>
+struct PlanesOf<SEISMIC_CODES_GRID, LOW, HIGH> {
     typedef Entries<LOW / 8u, HIGH> type;
 };
 
@@ -1842,9 +1368,7 @@ struct CoefficientsOf<SEISMIC_COEFF_HIER, CODES, SCALE, BIAS, BIAS_SIGN, GROUP, 
 
 #define PACKETS_DECODER(P)                                                                                      \
     packets::Packet<                                                                                            \
-        packets::PlanesOf<ELEMENT_CAT(P, _CODES), ELEMENT_CAT(P, _CODE_LOW_BITS), ELEMENT_CAT(P, _CODE_HIGH_BITS),   \
-            ELEMENT_CAT(P, _CODES_DIGIT_RUNS), ELEMENT_CAT(P, _CODES_DIGIT_RUN_BYTES),                          \
-            ELEMENT_CAT(P, _CODES_DIGIT_RUN_DIGITS)>::type,                                                     \
+        packets::PlanesOf<ELEMENT_CAT(P, _CODES), ELEMENT_CAT(P, _CODE_LOW_BITS), ELEMENT_CAT(P, _CODE_HIGH_BITS)>::type, \
         packets::InterpretationOf<ELEMENT_CAT(P, _CODES), ELEMENT_CAT(P, _CODE_LOW_BITS) + ELEMENT_CAT(P, _CODE_HIGH_BITS), \
             ELEMENT_CAT(P, _CODES_OFFSET), ELEMENT_CAT(P, _CODES_TABLE), ELEMENT_CAT(P, _CODES_GRID), ELEMENT_CAT(P, _CODES_GRID_INDEX_BITS), ELEMENT_CAT(P, _CODES_GRID_LANES), \
             ELEMENT_CAT(P, _CODES_GRID_SIGNS), ELEMENT_CAT(P, _CODES_GRID_DELTA) != 0,                          \
@@ -1861,14 +1385,10 @@ struct CoefficientsOf<SEISMIC_COEFF_HIER, CODES, SCALE, BIAS, BIAS_SIGN, GROUP, 
             ELEMENT_CAT(P, _FORM_PACK_OFFSET), ELEMENT_CAT(P, _FORM_PACK_RESIDUE), ELEMENT_CAT(P, _FORM_INT8) != 0,  \
             ELEMENT_CAT(P, _FORM_MATRIX_CODES) != 0, ELEMENT_CAT(P, _FORM_MATRIX_RUNS),                          \
             ELEMENT_CAT(P, _FORM_MATRIX_SYMMETRIC) != 0>>
-#define PACKETS_ROWS16_VALUES(P)                                                                       \
-    ELEMENT_CAT(P, _ROW_STRIDE_BYTES), ELEMENT_CAT(P, _ROW_CODES), ELEMENT_CAT(P, _ROW_HIGH),            \
+#define PACKETS_ROWS(P)                                                                                \
+    packets::Rows16 { ELEMENT_CAT(P, _ROW_STRIDE_BYTES), ELEMENT_CAT(P, _ROW_CODES), ELEMENT_CAT(P, _ROW_HIGH), \
         ELEMENT_CAT(P, _ROW_SCALES), ELEMENT_CAT(P, _ROW_SUPERS), ELEMENT_CAT(P, _TILE_ROWS), 0,            \
-        ELEMENT_CAT(P, _ROW_SCALES_BYTES), ELEMENT_CAT(P, _ROW_SUPERS_BYTES)
-// The rows of the packed weight bound to slot SLOT (prefix P), in the
-// geometry its decoder reads (`GeometryOf`).
-#define PACKETS_ROWS(P, SLOT)                                                                          \
-    packets::GeometryOf<packets::SLOT>::type::of_rows(PACKETS_ROWS16_VALUES(P), ELEMENT_CAT(P, _ROW_CODES_BYTES))
+        ELEMENT_CAT(P, _ROW_SCALES_BYTES), ELEMENT_CAT(P, _ROW_SUPERS_BYTES) }
 #define PACKETS_DENSE(P) packets::Dense<element::Of<ELEMENT_KIND(P)>::type>
 #define PACKETS_ROWS16_DENSE(E, k) packets::Rows16 { ulong(k) * E::bytes, 0, 0, 0, 0, 1, 0 }
 
@@ -1883,7 +1403,7 @@ PACKETS_BIND(W0, PACKETS_DENSE(KERNEL_W0))
 #error "KERNEL_W0 must be dense or in the rows16 or rows32 layout"
 #else
 PACKETS_BIND(W0, PACKETS_DECODER(KERNEL_W0))
-#define KERNEL_W0_LAYOUT(k) PACKETS_ROWS(KERNEL_W0, W0)
+#define KERNEL_W0_LAYOUT(k) PACKETS_ROWS(KERNEL_W0)
 #endif
 // The slot's operand recipe (`operands(W)`): whether products over it take
 // NVFP4 operand rows.
@@ -1898,7 +1418,7 @@ PACKETS_BIND(W1, PACKETS_DENSE(KERNEL_W1))
 #error "KERNEL_W1 must be dense or in the rows16 or rows32 layout"
 #else
 PACKETS_BIND(W1, PACKETS_DECODER(KERNEL_W1))
-#define KERNEL_W1_LAYOUT(k) PACKETS_ROWS(KERNEL_W1, W1)
+#define KERNEL_W1_LAYOUT(k) PACKETS_ROWS(KERNEL_W1)
 #endif
 namespace packets { constant constexpr bool W1_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W1, _OPERANDS_NVFP4); }
 #endif
@@ -1911,7 +1431,7 @@ PACKETS_BIND(W2, PACKETS_DENSE(KERNEL_W2))
 #error "KERNEL_W2 must be dense or in the rows16 or rows32 layout"
 #else
 PACKETS_BIND(W2, PACKETS_DECODER(KERNEL_W2))
-#define KERNEL_W2_LAYOUT(k) PACKETS_ROWS(KERNEL_W2, W2)
+#define KERNEL_W2_LAYOUT(k) PACKETS_ROWS(KERNEL_W2)
 #endif
 namespace packets { constant constexpr bool W2_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W2, _OPERANDS_NVFP4); }
 #endif
@@ -1924,7 +1444,7 @@ PACKETS_BIND(W3, PACKETS_DENSE(KERNEL_W3))
 #error "KERNEL_W3 must be dense or in the rows16 or rows32 layout"
 #else
 PACKETS_BIND(W3, PACKETS_DECODER(KERNEL_W3))
-#define KERNEL_W3_LAYOUT(k) PACKETS_ROWS(KERNEL_W3, W3)
+#define KERNEL_W3_LAYOUT(k) PACKETS_ROWS(KERNEL_W3)
 #endif
 namespace packets { constant constexpr bool W3_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W3, _OPERANDS_NVFP4); }
 #endif
