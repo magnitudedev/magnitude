@@ -4,7 +4,10 @@
 //! class and mapping) against the host reference at the catalog's real
 //! widths (Gemma 4 E2B/E4B/26B, LFM2, Nemotron-H Lightning and Super).
 
+mod mapped;
+
 use magnitude_kernels::{dense_up, per_layer_gate, project_rows, short_conv_project};
+use mapped::Mapped;
 use seismic_lang::{
     checked::{check_source, CheckedModule, SourceFile},
     entry::ElementBindings,
@@ -240,12 +243,14 @@ struct Mapping {
     int8: bool,
 }
 
-/// The mappings `device` admits over `weights`: the INT8 candidate only where
-/// the weights take it (`Element::cuda_int8`, every weight a CUDA product
-/// multiplies; `Element::cpu_int8`, some weight of a CPU one).
-fn mappings(device: &seismic::Device, launches: Launches, weights: &[seismic::Element]) -> Vec<Mapping> {
+/// The mappings on `device` that `admits` holds for ([`Mapped::admits`]).
+fn mappings(
+    device: &seismic::Device,
+    launches: Launches,
+    admits: impl Fn(&Mapping) -> bool,
+) -> Vec<Mapping> {
     let split = |value| launches.split.then_some(entry("SPLIT", value));
-    match device.backend() {
+    let mappings: Vec<Mapping> = match device.backend() {
         seismic::BackendName::Metal => [
             (5, 4, 2, 32, 8, 2, 64, 64, 2),
             (9, 16, 1, 16, 4, 4, 32, 128, 1),
@@ -280,19 +285,25 @@ fn mappings(device: &seismic::Device, launches: Launches, weights: &[seismic::El
             },
         )
         .collect(),
-        seismic::BackendName::Cuda => [(0, 4, 2), (1, 2, 1), (0, 4, 4)]
+        seismic::BackendName::Cuda => [(0, 4, 2, 1), (1, 2, 1, 2), (0, 4, 4, 1)]
             .into_iter()
-            .filter(|(int8, _, _)| *int8 == 0 || weights.iter().all(seismic::Element::cuda_int8))
-            .map(|(int8, ksplit, rotate)| Mapping {
-                params: [entry("INT8", int8), scoped("ROTATE", launches.cuda_gemm, rotate)]
-                    .into_iter()
-                    .chain(match launches.cuda_gemv {
-                        Some([first, second]) => {
-                            vec![scoped("KSPLIT", first, ksplit), scoped("KSPLIT", second, ksplit)]
-                        }
-                        None => vec![entry("KSPLIT", ksplit)],
-                    })
-                    .collect(),
+            .map(|(int8, ksplit, rotate, residency)| Mapping {
+                params: [
+                    entry("INT8", int8),
+                    scoped("ROTATE", launches.cuda_gemm, rotate),
+                ]
+                .into_iter()
+                .chain(match launches.cuda_gemv {
+                    Some([first, second]) => {
+                        vec![
+                            scoped("KSPLIT", first, ksplit),
+                            scoped("KSPLIT", second, ksplit),
+                        ]
+                    }
+                    // The dense pair: its 1..8-row GEMV is launch 1.
+                    None => vec![entry("KSPLIT", ksplit), scoped("RESIDENCY", 1, residency)],
+                })
+                .collect(),
                 int8: int8 == 1,
             })
             .collect(),
@@ -321,13 +332,16 @@ fn mappings(device: &seismic::Device, launches: Launches, weights: &[seismic::El
         .collect(),
         seismic::BackendName::Cpu => [(8, 0), (1, 1)]
             .into_iter()
-            .filter(|(_, int8)| *int8 == 0 || weights.iter().any(seismic::Element::cpu_int8))
             .map(|(rows, int8)| Mapping {
                 params: vec![entry("ROWS", rows), entry("INT8", int8)],
                 int8: int8 == 1,
             })
             .collect(),
-    }
+    };
+    mappings
+        .into_iter()
+        .filter(|mapping| admits(mapping))
+        .collect()
 }
 
 /// The statics the device's implementation declares: backends fix different
@@ -388,6 +402,8 @@ fn project_rows_specialization(
         .with_param("PACK", 0)
         .with_param("RESIDUE", 1)
         .with_launch_param(2, "BATCH_PARTS", 2)
+        // Dense weights have no matrix GEMV.
+        .with_launch_param(2, "MATRIX", 0)
         .with_launch_param(8, "TALL_M", 128)
         .with_launch_param(8, "TALL_K", 64)
         .with_launch_param(8, "STAGERS", 2)
@@ -836,6 +852,21 @@ fn native_project_rows_matches_host_reference() {
                     .map(|value| value * factor)
                     .collect::<Vec<_>>();
                 let extent = usize::from(scale.is_some());
+                let projection = Mapped::new(
+                    project_rows::native_entry_with(project_rows::Elements {
+                        A: seismic::Element::bf16(),
+                        W: seismic::Element::bf16(),
+                        Y: if shape.published == DType::F32 {
+                            seismic::Element::f32()
+                        } else {
+                            seismic::Element::bf16()
+                        },
+                    }),
+                    |device: &seismic::Device, mapping: &Mapping| {
+                        project_rows_specialization(device, &[("K", k), ("N", n)], mapping)
+                            .with_static("WS", extent as u64)
+                    },
+                );
                 for device in &devices {
                     let (source, weight) = (
                         tensor(device, DType::BF16, &[rows, k], &x),
@@ -847,36 +878,25 @@ fn native_project_rows_matches_host_reference() {
                         &[extent],
                         &scale.into_iter().collect::<Vec<_>>(),
                     );
-                    for mapping in mappings(device, launches, &[seismic::Element::bf16()]) {
+                    for mapping in mappings(device, launches, |mapping| {
+                        projection.admits(device, mapping)
+                    }) {
                         let label = format!(
                             "{:?} {} rows {rows} scale {scale:?} {:?}",
                             device.backend(),
                             shape.name,
                             mapping.params
                         );
-                        let result = project_rows::native_for_device_with(
-                            device,
-                            project_rows::Elements {
-                                A: seismic::Element::bf16(),
-                                W: seismic::Element::bf16(),
-                                Y: if shape.published == DType::F32 {
-                                    seismic::Element::f32()
-                                } else {
-                                    seismic::Element::bf16()
-                                },
-                            },
-                            &project_rows_specialization(device, &[("K", k), ("N", n)], &mapping)
-                                .with_static("WS", extent as u64),
-                        )
-                        .unwrap()
-                        .call(project_rows::Args {
-                            source: &source,
-                            weight: &weight,
-                            weight_scale: &weight_scale,
-                            weight_bound: &tensor(device, DType::F32, &[0], &[]),
-                        })
-                        .unwrap()
-                        .value;
+                        let result = projection
+                            .kernel(device, &mapping)
+                            .call(project_rows::Args {
+                                source: &source,
+                                weight: &weight,
+                                weight_scale: &weight_scale,
+                                weight_bound: &tensor(device, DType::F32, &[0], &[]),
+                            })
+                            .unwrap()
+                            .value;
                         let actual = read(&result, shape.published);
                         if quantized(device, &mapping, rows) {
                             let expected = expected.iter().map(|v| *v as f32).collect::<Vec<_>>();
@@ -904,6 +924,22 @@ fn native_dense_up_matches_host_reference() {
     let devices = devices();
     for (name, h, f) in UP_SHAPES {
         let (norm, up) = (norm(h), weights(f, h, 3));
+        let expansion = Mapped::new(
+            dense_up::native_entry_with(dense_up::Elements {
+                NW: seismic::Element::f32(),
+                UW: seismic::Element::bf16(),
+                A: seismic::Element::bf16(),
+            }),
+            |device: &seismic::Device, mapping: &Mapping| {
+                specialization(
+                    device,
+                    &declared(dense_up::native_implementation(device)),
+                    &[("H", h), ("F", f)],
+                    mapping,
+                )
+                .with_static("US", 1)
+            },
+        );
         // Unscaled (dense weights), and an NVFP4 weight's second-level scales.
         for (outputs, scale) in ROW_CLASSES
             .iter()
@@ -925,39 +961,27 @@ fn native_dense_up_matches_host_reference() {
                     &[outputs],
                     &rows.iter().map(|r| *r as i32).collect::<Vec<_>>(),
                 );
-                for mapping in mappings(device, launches, &[seismic::Element::bf16()]) {
+                for mapping in mappings(device, launches, |mapping| {
+                    expansion.admits(device, mapping)
+                }) {
                     let label = format!(
                         "{:?} {name} rows {outputs} scale {scale} {:?}",
                         device.backend(),
                         mapping.params
                     );
-                    let result = dense_up::native_for_device_with(
-                        device,
-                        dense_up::Elements {
-                            NW: seismic::Element::f32(),
-                            UW: seismic::Element::bf16(),
-                            A: seismic::Element::bf16(),
-                        },
-                        &specialization(
-                            device,
-                            &declared(dense_up::native_implementation(device)),
-                            &[("H", h), ("F", f)],
-                            &mapping,
-                        )
-                        .with_static("US", 1),
-                    )
-                    .unwrap()
-                    .call(dense_up::Args {
-                        residual: &residual,
-                        norm: &norm_tensor,
-                        up_weight: &up_tensor,
-                        out_rows: &out_rows,
-                        eps: EPSILON,
-                        activation: 2,
-                        up_scale: &tensor(device, DType::F32, &[1], &[scale]),
-                    })
-                    .unwrap()
-                    .value;
+                    let result = expansion
+                        .kernel(device, &mapping)
+                        .call(dense_up::Args {
+                            residual: &residual,
+                            norm: &norm_tensor,
+                            up_weight: &up_tensor,
+                            out_rows: &out_rows,
+                            eps: EPSILON,
+                            activation: 2,
+                            up_scale: &tensor(device, DType::F32, &[1], &[scale]),
+                        })
+                        .unwrap()
+                        .value;
                     let actual = read(&result, DType::BF16);
                     if quantized(device, &mapping, outputs) {
                         assert_norm(&label, &actual, &expected);
@@ -988,6 +1012,26 @@ fn native_short_conv_project_matches_host_reference() {
             weights(ch, h, 5),
             weights(ch, h, 7),
         );
+        let projection = Mapped::new(
+            short_conv_project::native_entry_with(short_conv_project::Elements {
+                NW: seismic::Element::f32(),
+                BW: seismic::Element::bf16(),
+                CW: seismic::Element::bf16(),
+                XW: seismic::Element::bf16(),
+                A: seismic::Element::bf16(),
+            }),
+            |device: &seismic::Device, mapping: &Mapping| {
+                specialization(
+                    device,
+                    &declared(short_conv_project::native_implementation(device)),
+                    &[("H", h), ("CH", ch)],
+                    mapping,
+                )
+                .with_static("BS", 0)
+                .with_static("CS", 0)
+                .with_static("XS", 0)
+            },
+        );
         for rows in ROW_CLASSES {
             let x = residual(rows, h, 11 + rows as u32);
             let (expected, magnitudes) = short_conv_reference(&x, &norm, [&b, &c, &xw], ch);
@@ -998,45 +1042,29 @@ fn native_short_conv_project_matches_host_reference() {
                     tensor(device, DType::F32, &[rows, h], &x),
                     tensor(device, DType::F32, &[h], &norm),
                 );
-                for mapping in mappings(device, launches, &[seismic::Element::bf16()]) {
+                for mapping in mappings(device, launches, |mapping| {
+                    projection.admits(device, mapping)
+                }) {
                     let label = format!(
                         "{:?} {name} rows {rows} {:?}",
                         device.backend(),
                         mapping.params
                     );
-                    let result = short_conv_project::native_for_device_with(
-                        device,
-                        short_conv_project::Elements {
-                            NW: seismic::Element::f32(),
-                            BW: seismic::Element::bf16(),
-                            CW: seismic::Element::bf16(),
-                            XW: seismic::Element::bf16(),
-                            A: seismic::Element::bf16(),
-                        },
-                        &specialization(
-                            device,
-                            &declared(short_conv_project::native_implementation(device)),
-                            &[("H", h), ("CH", ch)],
-                            &mapping,
-                        )
-                        .with_static("BS", 0)
-                        .with_static("CS", 0)
-                        .with_static("XS", 0),
-                    )
-                    .unwrap()
-                    .call(short_conv_project::Args {
-                        residual: &residual,
-                        norm: &norm_tensor,
-                        b_weight: &b_tensor,
-                        c_weight: &c_tensor,
-                        x_weight: &x_tensor,
-                        eps: EPSILON,
-                        b_scale: &tensor(device, DType::F32, &[0], &[]),
-                        c_scale: &tensor(device, DType::F32, &[0], &[]),
-                        x_scale: &tensor(device, DType::F32, &[0], &[]),
-                    })
-                    .unwrap()
-                    .value;
+                    let result = projection
+                        .kernel(device, &mapping)
+                        .call(short_conv_project::Args {
+                            residual: &residual,
+                            norm: &norm_tensor,
+                            b_weight: &b_tensor,
+                            c_weight: &c_tensor,
+                            x_weight: &x_tensor,
+                            eps: EPSILON,
+                            b_scale: &tensor(device, DType::F32, &[0], &[]),
+                            c_scale: &tensor(device, DType::F32, &[0], &[]),
+                            x_scale: &tensor(device, DType::F32, &[0], &[]),
+                        })
+                        .unwrap()
+                        .value;
                     let actual = read(&result, DType::F32);
                     if quantized(device, &mapping, rows) {
                         let expected = expected.iter().map(|v| *v as f32).collect::<Vec<_>>();
@@ -1064,6 +1092,21 @@ fn native_per_layer_gate_matches_host_reference() {
     for (name, d, l, p) in GATE_SHAPES {
         let gate = weights(p, d, 3);
         let layer = l - 2;
+        let gating = Mapped::new(
+            per_layer_gate::native_entry_with(per_layer_gate::Elements {
+                GW: seismic::Element::bf16(),
+                A: seismic::Element::bf16(),
+            }),
+            |device: &seismic::Device, mapping: &Mapping| {
+                specialization(
+                    device,
+                    &declared(per_layer_gate::native_implementation(device)),
+                    &[("D", d), ("L", l), ("P", p)],
+                    mapping,
+                )
+                .with_static("GS", 0)
+            },
+        );
         for rows in ROW_CLASSES {
             let (hidden, inputs) = (
                 residual(rows, d, 13 + rows as u32),
@@ -1076,37 +1119,25 @@ fn native_per_layer_gate_matches_host_reference() {
                     tensor(device, DType::BF16, &[p, d], &gate),
                     tensor(device, DType::F32, &[rows, l, p], &inputs),
                 );
-                for mapping in mappings(device, launches, &[seismic::Element::bf16()]) {
+                for mapping in mappings(device, launches, |mapping| gating.admits(device, mapping))
+                {
                     let label = format!(
                         "{:?} {name} rows {rows} {:?}",
                         device.backend(),
                         mapping.params
                     );
-                    let result = per_layer_gate::native_for_device_with(
-                        device,
-                        per_layer_gate::Elements {
-                            GW: seismic::Element::bf16(),
-                            A: seismic::Element::bf16(),
-                        },
-                        &specialization(
-                            device,
-                            &declared(per_layer_gate::native_implementation(device)),
-                            &[("D", d), ("L", l), ("P", p)],
-                            &mapping,
-                        )
-                        .with_static("GS", 0),
-                    )
-                    .unwrap()
-                    .call(per_layer_gate::Args {
-                        hidden: &hidden_tensor,
-                        gate_weight: &gate_tensor,
-                        inputs: &inputs_tensor,
-                        layer: layer as i32,
-                        activation: 1,
-                        gate_scale: &tensor(device, DType::F32, &[0], &[]),
-                    })
-                    .unwrap()
-                    .value;
+                    let result = gating
+                        .kernel(device, &mapping)
+                        .call(per_layer_gate::Args {
+                            hidden: &hidden_tensor,
+                            gate_weight: &gate_tensor,
+                            inputs: &inputs_tensor,
+                            layer: layer as i32,
+                            activation: 1,
+                            gate_scale: &tensor(device, DType::F32, &[0], &[]),
+                        })
+                        .unwrap()
+                        .value;
                     let actual = read(&result, DType::BF16);
                     if quantized(device, &mapping, rows) {
                         assert_norm(&label, &actual, &expected);

@@ -1,0 +1,213 @@
+//! The GGUF formats the registry imports, and the test modules the build
+//! script generates for them (`gguf_format_tests!`, one module a format, so
+//! a run selects formats by name, `gguf::iq1s::`, and libtest runs the
+//! formats in parallel). A suite that generates no tests a format uses
+//! neither the macro nor its export.
+#![allow(dead_code, unused_macros)]
+
+use magnitude_ggml::Encoding;
+use seismic::{Element, Layout, OperandRecipe};
+use seismic_lang::registry::f16_bits;
+
+include!("widths.rs");
+include!(concat!(env!("OUT_DIR"), "/gguf_format_tests.rs"));
+#[allow(unused_imports)]
+pub(crate) use gguf_format_tests;
+
+/// The tests' pseudo-random source: a 64-bit LCG yielding its high 31 bits.
+pub struct Rng(pub u64);
+
+impl Rng {
+    pub fn next(&mut self) -> u32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (self.0 >> 33) as u32
+    }
+    pub fn byte(&mut self) -> u8 {
+        self.next() as u8
+    }
+    /// Uniform in [0, 1).
+    pub fn fraction(&mut self) -> f32 {
+        (self.next() >> 8) as f32 / (1u32 << 24) as f32
+    }
+}
+
+/// A GGUF-imported element: weights stored as `encoding`, converted by the
+/// registry into the element whose products take `operands`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Format {
+    pub encoding: Encoding,
+    pub operands: OperandRecipe,
+}
+
+impl std::fmt::Debug for Format {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name())
+    }
+}
+
+impl Format {
+    pub const Q4K: Format = Format::rounded(Encoding::Q4K);
+    pub const Q5K: Format = Format::rounded(Encoding::Q5K);
+    pub const Q6K: Format = Format::rounded(Encoding::Q6K);
+    pub const Q8: Format = Format::rounded(Encoding::Q8_0);
+    pub const IQ4_XS: Format = Format::rounded(Encoding::Iq4Xs);
+    pub const NVFP4: Format = Format::rounded(Encoding::Nvfp4);
+    /// GGUF NVFP4 calibrated for FP4 activations (W4A4): nvfp4g16's storage,
+    /// NVFP4 operands.
+    pub const NVFP4_A4: Format = Format {
+        encoding: Encoding::Nvfp4,
+        operands: OperandRecipe::Nvfp4Rows,
+    };
+
+    /// The element of `encoding` products take rounded activations into.
+    pub const fn rounded(encoding: Encoding) -> Self {
+        Self {
+            encoding,
+            operands: OperandRecipe::Rounded,
+        }
+    }
+    /// Every format the registry converts into `layout`, in ggml id order.
+    pub fn all(layout: Layout) -> Vec<Format> {
+        Self::pairs()
+            .filter(|format| format.converted(layout).is_some())
+            .collect()
+    }
+    /// The registry's source of this format's GGUF blocks.
+    pub fn source(self) -> Element {
+        Element::gguf_source(self.encoding, self.encoding.block_elements())
+            .unwrap_or_else(|| panic!("{:?}: no registered GGUF source", self.encoding))
+    }
+    /// This format's element in `layout`.
+    pub fn element(self, layout: Layout) -> Element {
+        self.converted(layout)
+            .unwrap_or_else(|| panic!("{self:?}: no conversion into {layout:?}"))
+    }
+    /// The storage name: the representation, then the operand recipe's
+    /// suffix.
+    pub fn name(self) -> String {
+        let element = self.stored().unwrap_or_else(|| {
+            panic!(
+                "{:?} {:?}: no registered conversion",
+                self.encoding, self.operands
+            )
+        });
+        format!("{}{}", element.representation(), self.operands.suffix())
+    }
+    /// The `PARTIAL_BLOCK_WIDTHS` whole blocks of this format fill.
+    pub fn partial_block_widths(self) -> Vec<usize> {
+        partial_block_widths(self.block_values()).collect()
+    }
+    pub fn block_values(self) -> usize {
+        self.encoding.block_elements() as usize
+    }
+    pub fn block_bytes(self) -> usize {
+        self.encoding.block_bytes() as usize
+    }
+    /// One random GGUF block whose values reach about `scale`: random codes
+    /// and sub-scales, with the scale fields set so the values reach a
+    /// random 0.5 to 1.5 times `scale`.
+    pub fn block(self, rng: &mut Rng, scale: f32) -> Vec<u8> {
+        let mut block = (0..self.block_bytes())
+            .map(|_| rng.byte())
+            .collect::<Vec<_>>();
+        let factor = scale * (0.5 + rng.fraction());
+        let mut f16 = |at: usize, value: f32| {
+            block[at..at + 2].copy_from_slice(&f16_bits(value).to_le_bytes())
+        };
+        match self.encoding {
+            // d: codes - 8 reach 8.
+            Encoding::Q4_0 => f16(0, factor / 8.0),
+            // d and the minimum m: values d code + m span [-factor, factor).
+            Encoding::Q4_1 => {
+                f16(0, factor / 8.0);
+                f16(2, -factor);
+            }
+            // d: codes - 16 reach 16.
+            Encoding::Q5_0 => f16(0, factor / 16.0),
+            Encoding::Q5_1 => {
+                f16(0, factor / 16.0);
+                f16(2, -factor);
+            }
+            // d: values reach d 127.
+            Encoding::Q8_0 => f16(0, factor / 127.0),
+            // d: the table's values reach 127 d.
+            Encoding::Iq4Nl => f16(0, factor / 128.0),
+            // d: values reach d 32 127.
+            Encoding::Iq4Xs => f16(0, factor / 4096.0),
+            // d and dmin: values reach d 63 15 and dmin 63.
+            Encoding::Q4K => {
+                f16(0, factor / 945.0);
+                f16(2, factor / 63.0);
+            }
+            // d and dmin: values reach d 63 31 and dmin 63.
+            Encoding::Q5K => {
+                f16(0, factor / 1953.0);
+                f16(2, factor / 63.0);
+            }
+            // d: values reach d 128 32.
+            Encoding::Q6K => f16(208, factor / 4096.0),
+            // d: values reach d (2 s + 1) 43 / 8.
+            Encoding::Iq2Xs | Encoding::Iq2Xxs | Encoding::Iq2S => f16(0, factor / 40.0),
+            // d: values reach d (2 s + 1) 62 / 4.
+            Encoding::Iq3Xxs => f16(0, factor / 120.0),
+            // d: values reach d (2 s + 1) 15.
+            Encoding::Iq3S => f16(0, factor / 480.0),
+            // d and dmin: values reach d 15 3 and dmin 15.
+            Encoding::Q2K => {
+                f16(80, factor / 45.0);
+                f16(82, factor / 30.0);
+            }
+            // d: values reach d 32 4.
+            Encoding::Q3K => f16(108, factor / 128.0),
+            // d: codes - 1 reach 2.
+            Encoding::Tq2_0 => f16(64, factor / 2.0),
+            // d: digits - 1 reach 1.
+            Encoding::Tq1_0 => f16(52, factor),
+            // d: values are ±d.
+            Encoding::Q1_0 => f16(0, factor),
+            // d: values reach d (2 s + 1) 9 / 8.
+            Encoding::Iq1S => f16(0, factor / 16.0),
+            // d, as the top nibbles of the four scale words: values reach
+            // d (2 s + 1) 9 / 8.
+            Encoding::Iq1M => {
+                let d = f16_bits(factor / 16.0);
+                for nibble in 0..4 {
+                    let byte = &mut block[49 + 2 * nibble];
+                    *byte = (*byte & 0x0f) | (((d >> (4 * nibble)) as u8 & 0x0f) << 4);
+                }
+            }
+            // E8M0: the power of two nearest factor / 6 (the E2M1 range).
+            Encoding::Mxfp4 => block[0] = (127.0 + (factor / 6.0).log2().round()) as u8,
+            // UE4M3 exponent of factor / 6 (normal), random mantissas.
+            Encoding::Nvfp4 => {
+                for field in &mut block[..4] {
+                    let exponent = ((factor / 6.0).log2().floor() as i32 + 7).clamp(1, 14) as u8;
+                    *field = (exponent << 3) | (rng.next() % 8) as u8;
+                }
+            }
+            other => panic!("{other:?}: no GGUF block fixture"),
+        }
+        block
+    }
+    /// Every encoding under every operand recipe, in ggml id order.
+    fn pairs() -> impl Iterator<Item = Format> {
+        Encoding::ALL.into_iter().flat_map(|encoding| {
+            OperandRecipe::ALL
+                .into_iter()
+                .map(move |operands| Format { encoding, operands })
+        })
+    }
+    fn converted(self, layout: Layout) -> Option<Element> {
+        Element::gguf_source(self.encoding, self.encoding.block_elements())?
+            .converted(layout, self.operands)
+    }
+    /// This format's element in a layout the registry converts it into.
+    fn stored(self) -> Option<Element> {
+        Layout::ALL
+            .into_iter()
+            .find_map(|layout| self.converted(layout))
+    }
+}

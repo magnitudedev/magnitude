@@ -662,7 +662,7 @@ mod tests {
     const SLOT_BYTES: usize = 96;
 
     fn stored() -> Element {
-        Element::named("gguf_iq4_nl_block").unwrap()
+        Element::named("gguf_iq4_nl").unwrap()
     }
 
     fn resident() -> Element {

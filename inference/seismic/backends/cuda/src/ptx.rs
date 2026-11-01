@@ -14,8 +14,9 @@ use seismic_ir::physical_target::{
 use seismic_ir::storage::LaunchLocalKind;
 use seismic_lang::intrinsics::{AtomicOp, MathOp, ReduceOp};
 use seismic_lang::registry::{
-    CodeInterpretation, DecodeStep, FloatCodeFormat, GridCodes, LookupTable, PlaneEncoding,
-    PlaneInfo, PlaneRepackRecipe, RepackExpr, GRID_SIGN_BITS,
+    CodeInterpretation, DecodeStep, DigitCodes, FloatCodeFormat, GridCodes, GridSigns, LookupTable,
+    PlaneEncoding, PlaneInfo, PlaneRepackRecipe, RepackExpr, DIGITS_PER_BYTE, DIGIT_BITS,
+    DIGIT_BYTE_BITS, DIGIT_RADIX,
 };
 use seismic_lang::types::DType;
 use seismic_native_target::{DeviceDescription, NativeCompilationError};
@@ -72,17 +73,9 @@ impl AddressGeometry for ReadableRepresentationGeometry {
 fn repack_expression_nodes(expression: &RepackExpr) -> u64 {
     match expression {
         RepackExpr::SourceBits { .. } => 1,
-        RepackExpr::ShiftLeft { value, .. }
-        | RepackExpr::OffsetI32 { value, .. }
-        | RepackExpr::F16ToF32(value)
-        | RepackExpr::I32ToF32(value)
-        | RepackExpr::ScaleF32 { value, .. } => 1 + repack_expression_nodes(value),
-        RepackExpr::BitOr(left, right)
-        | RepackExpr::MultiplyF32(left, right)
-        | RepackExpr::NegateIf {
-            value: left,
-            sign: right,
-        } => 1 + repack_expression_nodes(left) + repack_expression_nodes(right),
+        RepackExpr::F16ToF32(value) | RepackExpr::ScaleF32 { value, .. } => {
+            1 + repack_expression_nodes(value)
+        }
         RepackExpr::Lookup { index, .. } => 1 + repack_expression_nodes(index),
     }
 }
@@ -91,19 +84,8 @@ fn repack_expression_nodes(expression: &RepackExpr) -> u64 {
 fn repack_lookup_tables(expression: &RepackExpr, tables: &mut Vec<LookupTable>) {
     match expression {
         RepackExpr::SourceBits { .. } => {}
-        RepackExpr::ShiftLeft { value, .. }
-        | RepackExpr::OffsetI32 { value, .. }
-        | RepackExpr::F16ToF32(value)
-        | RepackExpr::I32ToF32(value)
-        | RepackExpr::ScaleF32 { value, .. } => repack_lookup_tables(value, tables),
-        RepackExpr::BitOr(left, right)
-        | RepackExpr::MultiplyF32(left, right)
-        | RepackExpr::NegateIf {
-            value: left,
-            sign: right,
-        } => {
-            repack_lookup_tables(left, tables);
-            repack_lookup_tables(right, tables);
+        RepackExpr::F16ToF32(value) | RepackExpr::ScaleF32 { value, .. } => {
+            repack_lookup_tables(value, tables)
         }
         RepackExpr::Lookup { index, table } => {
             repack_lookup_tables(index, tables);
@@ -639,7 +621,7 @@ impl<'a> Emitter<'a> {
                 } => {
                     let index = indices.iter().map(|v| v.value()).collect::<Vec<_>>();
                     let (_, _, logical) = self.address(&place, &index);
-                    let lane = self.plane_lane(&logical, plane_info.group);
+                    let lane = self.plane_lane(&logical, &plane_info);
                     self.line(format!("mov.u32 {}, {lane};", self.v(out.value)));
                 }
                 ClosedOpView::ReadPlane {
@@ -1592,9 +1574,39 @@ impl<'a> Emitter<'a> {
                             bits,
                             interpretation,
                             ..
-                        } => self.interpret(&temps[recipe.ordinal(*raw)], *bits, interpretation),
+                        } => {
+                            // The low `bits` bits of a wider read.
+                            let read = &temps[recipe.ordinal(*raw)];
+                            let low = if *bits < recipe.read_bits(*raw) {
+                                let low = self.t32();
+                                self.line(format!(
+                                    "and.b32 {low}, {read}, {};",
+                                    u32::MAX >> (32 - bits)
+                                ));
+                                low
+                            } else {
+                                read.clone()
+                            };
+                            self.interpret(&low, *bits, interpretation)
+                        }
+                        DecodeStep::SignedCode { code, raw, bit, .. } => {
+                            let code = &temps[recipe.ordinal(*code)];
+                            let sign = self.t32();
+                            self.line(format!(
+                                "shr.b32 {sign}, {}, {bit};",
+                                temps[recipe.ordinal(*raw)]
+                            ));
+                            self.line(format!("and.b32 {sign}, {sign}, 1;"));
+                            let negated = self.t32();
+                            self.line(format!("neg.s32 {negated}, {code};"));
+                            let negative = self.pred();
+                            self.line(format!("setp.ne.u32 {negative}, {sign}, 0;"));
+                            let value = self.t32();
+                            self.line(format!("selp.s32 {value}, {negated}, {code}, {negative};"));
+                            value
+                        }
                         DecodeStep::ReadPlaneLane { plane, .. } => {
-                            self.plane_lane(&logical, layout.planes[*plane as usize].group)
+                            self.plane_lane(&logical, &layout.planes[*plane as usize])
                         }
                         DecodeStep::InterpretGridCode {
                             raw, lane, grid, ..
@@ -1602,6 +1614,16 @@ impl<'a> Emitter<'a> {
                             &temps[recipe.ordinal(*raw)],
                             &temps[recipe.ordinal(*lane)],
                             grid,
+                        ),
+                        DecodeStep::InterpretDigitCode {
+                            raw,
+                            digit,
+                            interpretation,
+                            ..
+                        } => self.digit_code(
+                            &temps[recipe.ordinal(*raw)],
+                            &temps[recipe.ordinal(*digit)],
+                            interpretation,
                         ),
                         DecodeStep::DecodeFloatCode { raw, format, .. } => {
                             self.decode_float_code(&temps[recipe.ordinal(*raw)], *format)
@@ -1775,7 +1797,12 @@ impl<'a> Emitter<'a> {
                     for (destination_byte, byte_routes) in routes.chunks_exact(8).enumerate() {
                         let byte = self.t32();
                         self.line(format!("mov.u32 {byte}, 0;"));
-                        for (destination_bit, source_bit) in byte_routes.iter().copied().enumerate()
+                        for (destination_bit, source_bit) in byte_routes
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(destination_bit, source_bit)| {
+                                source_bit.map(|source_bit| (destination_bit, source_bit))
+                            })
                         {
                             let bit = self.source_bits(&source_packet, source_bit, 1);
                             let shifted = self.t32();
@@ -1869,36 +1896,6 @@ impl<'a> Emitter<'a> {
             RepackExpr::SourceBits { bit, width } => {
                 RepackValue::Integer(self.source_bits(source_packet, *bit, *width))
             }
-            RepackExpr::ShiftLeft { value, bits } => {
-                let RepackValue::Integer(value) = self.repack_expression(source_packet, value)
-                else {
-                    panic!("closed CUDA repack shifts a floating value")
-                };
-                let output = self.t32();
-                self.line(format!("shl.b32 {output}, {value}, {bits};"));
-                RepackValue::Integer(output)
-            }
-            RepackExpr::BitOr(left, right) => {
-                let RepackValue::Integer(left) = self.repack_expression(source_packet, left) else {
-                    panic!("closed CUDA repack OR has a floating left operand")
-                };
-                let RepackValue::Integer(right) = self.repack_expression(source_packet, right)
-                else {
-                    panic!("closed CUDA repack OR has a floating right operand")
-                };
-                let output = self.t32();
-                self.line(format!("or.b32 {output}, {left}, {right};"));
-                RepackValue::Integer(output)
-            }
-            RepackExpr::OffsetI32 { value, offset } => {
-                let RepackValue::Integer(value) = self.repack_expression(source_packet, value)
-                else {
-                    panic!("closed CUDA repack offsets a floating value")
-                };
-                let output = self.t32();
-                self.line(format!("add.s32 {output}, {value}, {offset};"));
-                RepackValue::Integer(output)
-            }
             RepackExpr::F16ToF32(value) => {
                 let RepackValue::Integer(value) = self.repack_expression(source_packet, value)
                 else {
@@ -1908,26 +1905,6 @@ impl<'a> Emitter<'a> {
                 self.line(format!("cvt.u16.u32 {half}, {value};"));
                 let output = self.f32();
                 self.line(format!("cvt.f32.f16 {output}, {half};"));
-                RepackValue::Float(output)
-            }
-            RepackExpr::I32ToF32(value) => {
-                let RepackValue::Integer(value) = self.repack_expression(source_packet, value)
-                else {
-                    panic!("closed CUDA repack converts an already-floating i32 value")
-                };
-                let output = self.f32();
-                self.line(format!("cvt.rn.f32.s32 {output}, {value};"));
-                RepackValue::Float(output)
-            }
-            RepackExpr::MultiplyF32(left, right) => {
-                let RepackValue::Float(left) = self.repack_expression(source_packet, left) else {
-                    panic!("closed CUDA repack multiply has a non-floating left operand")
-                };
-                let RepackValue::Float(right) = self.repack_expression(source_packet, right) else {
-                    panic!("closed CUDA repack multiply has a non-floating right operand")
-                };
-                let output = self.f32();
-                self.line(format!("mul.rn.f32 {output}, {left}, {right};"));
                 RepackValue::Float(output)
             }
             RepackExpr::ScaleF32 { value, exponent } => {
@@ -1957,23 +1934,6 @@ impl<'a> Emitter<'a> {
                 self.line(format!("mad.wide.u32 {address}, {index}, 4, {base};"));
                 let output = self.t32();
                 self.line(format!("ld.const.s32 {output}, [{address}];"));
-                RepackValue::Integer(output)
-            }
-            RepackExpr::NegateIf { value, sign } => {
-                let RepackValue::Integer(value) = self.repack_expression(source_packet, value)
-                else {
-                    panic!("closed CUDA repack negates a floating value")
-                };
-                let RepackValue::Integer(sign) = self.repack_expression(source_packet, sign) else {
-                    panic!("closed CUDA repack negates by a floating sign")
-                };
-                // `(value ^ -sign) + sign`: `-value` where `sign` is 1.
-                let mask = self.t32();
-                self.line(format!("neg.s32 {mask}, {sign};"));
-                let flipped = self.t32();
-                self.line(format!("xor.b32 {flipped}, {value}, {mask};"));
-                let output = self.t32();
-                self.line(format!("add.s32 {output}, {flipped}, {sign};"));
                 RepackValue::Integer(output)
             }
         }
@@ -2055,7 +2015,26 @@ impl<'a> Emitter<'a> {
                     self.load_temp(&address, *storage)
                 }
             }
-            PlaneEncoding::Packed { bits, .. } => self.packed_field(&base, &entry, *bits),
+            PlaneEncoding::Packed { .. }
+            | PlaneEncoding::Grid(_)
+            | PlaneEncoding::SignedLocal { .. } => {
+                self.packed_field(&base, &entry, plane.entry_bits)
+            }
+            // The byte holding the value's digit (`DigitCodes::place`).
+            PlaneEncoding::Digits { digits, .. } => {
+                let within = self.t32();
+                self.line(format!("cvt.u32.u64 {within}, {local};"));
+                self.line(format!("rem.u32 {within}, {within}, {};", plane.group));
+                let (byte, _) = self.digit_place(&within, digits);
+                let wide = self.t64();
+                self.line(format!("cvt.u64.u32 {wide}, {byte};"));
+                let entry = self.t64();
+                self.line(format!(
+                    "mad.lo.u64 {entry}, {group}, {}, {wide};",
+                    plane.fields
+                ));
+                self.packed_field(&base, &entry, plane.entry_bits)
+            }
             PlaneEncoding::FloatCode { format } => self.packed_field(&base, &entry, format.bits()),
         }
     }
@@ -2106,7 +2085,10 @@ impl<'a> Emitter<'a> {
             CodeInterpretation::Offset(offset) => {
                 self.line(format!("add.s32 {out}, {raw}, {};", -*offset))
             }
-            CodeInterpretation::Odd => self.line(format!("mad.lo.u32 {out}, {raw}, 2, 1;")),
+            CodeInterpretation::Odd(offset) => self.line(format!(
+                "mad.lo.u32 {out}, {raw}, 2, {};",
+                (1 - 2 * *offset) as u32
+            )),
             CodeInterpretation::Table(codebook) => {
                 let table = codebook.values;
                 self.line(format!("mov.s32 {out}, {};", table[0]));
@@ -2115,9 +2097,6 @@ impl<'a> Emitter<'a> {
                     self.line(format!("setp.eq.u32 {p}, {raw}, {index};"));
                     self.line(format!("selp.s32 {out}, {value}, {out}, {p};"));
                 }
-            }
-            CodeInterpretation::Grid(_) => {
-                unreachable!("a vector code is a grid code step, which reads its lane")
             }
         }
         out
@@ -2128,12 +2107,73 @@ impl<'a> Emitter<'a> {
     /// The U32 lane of the element at packing position `logical` among the
     /// `group` elements one plane entry covers (a plane group divides the
     /// packet group).
-    fn plane_lane(&mut self, logical: &str, group: u32) -> String {
+    /// The value's position among its entry's values: its lane, or a digit
+    /// plane's digit of its byte (`PlaneInfo::lane`).
+    fn plane_lane(&mut self, logical: &str, plane: &PlaneInfo) -> String {
         let wide = self.t64();
-        self.line(format!("rem.u64 {wide}, {logical}, {group};"));
+        self.line(format!("rem.u64 {wide}, {logical}, {};", plane.group));
         let lane = self.t32();
         self.line(format!("cvt.u32.u64 {lane}, {wide};"));
-        lane
+        match &plane.encoding {
+            PlaneEncoding::Digits { digits, .. } => self.digit_place(&lane, digits).1,
+            _ => lane,
+        }
+    }
+
+    /// The byte and the digit of value `within` of a group of base-3 digits
+    /// (`DigitCodes::place`): each run from its first value on overrides the
+    /// one before.
+    fn digit_place(&mut self, within: &str, digits: &DigitCodes) -> (String, String) {
+        let (byte, digit) = (self.t32(), self.t32());
+        let (mut first, mut first_byte) = (0u32, 0u32);
+        for run in digits.runs {
+            let offset = self.t32();
+            self.line(format!("sub.u32 {offset}, {within}, {first};"));
+            let (run_byte, run_digit) = (self.t32(), self.t32());
+            self.line(format!("rem.u32 {run_byte}, {offset}, {};", run.bytes()));
+            self.line(format!("add.u32 {run_byte}, {run_byte}, {first_byte};"));
+            self.line(format!("div.u32 {run_digit}, {offset}, {};", run.bytes()));
+            if first == 0 {
+                self.line(format!("mov.u32 {byte}, {run_byte};"));
+                self.line(format!("mov.u32 {digit}, {run_digit};"));
+            } else {
+                let past = self.pred();
+                self.line(format!("setp.ge.u32 {past}, {within}, {first};"));
+                self.line(format!("selp.b32 {byte}, {run_byte}, {byte}, {past};"));
+                self.line(format!("selp.b32 {digit}, {run_digit}, {digit}, {past};"));
+            }
+            first += run.bytes() * run.digits();
+            first_byte += run.bytes();
+        }
+        (byte, digit)
+    }
+
+    /// Digit `digit` of byte `raw` (`DigitCodes::digit`: the byte times
+    /// 3^digit modulo 256, times 3, over 256), read through `interpretation`.
+    fn digit_code(
+        &mut self,
+        raw: &str,
+        digit: &str,
+        interpretation: &CodeInterpretation,
+    ) -> String {
+        let power = self.t32();
+        self.line(format!("mov.u32 {power}, 1;"));
+        for n in 1..DIGITS_PER_BYTE {
+            let at = self.pred();
+            self.line(format!("setp.eq.u32 {at}, {digit}, {n};"));
+            self.line(format!(
+                "selp.b32 {power}, {}, {power}, {at};",
+                DIGIT_RADIX.pow(n)
+            ));
+        }
+        let mask = (1u32 << DIGIT_BYTE_BITS) - 1;
+        let value = self.t32();
+        self.line(format!("and.b32 {value}, {raw}, {mask};"));
+        self.line(format!("mul.lo.u32 {value}, {value}, {power};"));
+        self.line(format!("and.b32 {value}, {value}, {mask};"));
+        self.line(format!("mul.lo.u32 {value}, {value}, {DIGIT_RADIX};"));
+        self.line(format!("shr.b32 {value}, {value}, {DIGIT_BYTE_BITS};"));
+        self.interpret(&value, DIGIT_BITS, interpretation)
     }
 
     fn grid_code(&mut self, raw: &str, lane: &str, grid: &'static GridCodes) -> String {
@@ -2167,31 +2207,50 @@ impl<'a> Emitter<'a> {
         self.line(format!("mad.wide.u32 {address}, {slot}, 4, {base};"));
         let magnitude = self.t32();
         self.line(format!("ld.const.s32 {magnitude}, [{address}];"));
-        let signs = self.t32();
-        self.line(format!(
-            "shr.b32 {signs}, {raw}, {};",
-            grid.indices() * grid.index_bits()
-        ));
-        self.line(format!(
-            "and.b32 {signs}, {signs}, {};",
-            (1u32 << GRID_SIGN_BITS) - 1
-        ));
-        let parity = self.t32();
-        self.line(format!("popc.b32 {parity}, {signs};"));
-        self.line(format!("and.b32 {parity}, {parity}, 1;"));
-        self.line(format!("shl.b32 {parity}, {parity}, {GRID_SIGN_BITS};"));
-        self.line(format!("or.b32 {signs}, {signs}, {parity};"));
-        let bit = self.t32();
-        self.line(format!("shr.b32 {bit}, {signs}, {lane};"));
-        self.line(format!("and.b32 {bit}, {bit}, 1;"));
-        let negated = self.t32();
-        self.line(format!("neg.s32 {negated}, {magnitude};"));
-        let negative = self.pred();
-        self.line(format!("setp.ne.u32 {negative}, {bit}, 0;"));
+        // The table holds the points' signed values where entries have no
+        // signs.
+        let value = match grid.signs {
+            GridSigns::None => magnitude,
+            GridSigns::ParityPlus7 | GridSigns::Explicit8 => {
+                let bits = grid.signs.bits();
+                let signs = self.t32();
+                self.line(format!("shr.b32 {signs}, {raw}, {};", grid.sign_bit()));
+                self.line(format!("and.b32 {signs}, {signs}, {};", (1u32 << bits) - 1));
+                if grid.signs == GridSigns::ParityPlus7 {
+                    let parity = self.t32();
+                    self.line(format!("popc.b32 {parity}, {signs};"));
+                    self.line(format!("and.b32 {parity}, {parity}, 1;"));
+                    self.line(format!("shl.b32 {parity}, {parity}, {bits};"));
+                    self.line(format!("or.b32 {signs}, {signs}, {parity};"));
+                }
+                let bit = self.t32();
+                self.line(format!("shr.b32 {bit}, {signs}, {lane};"));
+                self.line(format!("and.b32 {bit}, {bit}, 1;"));
+                let negated = self.t32();
+                self.line(format!("neg.s32 {negated}, {magnitude};"));
+                let negative = self.pred();
+                self.line(format!("setp.ne.u32 {negative}, {bit}, 0;"));
+                let out = self.t32();
+                self.line(format!(
+                    "selp.s32 {out}, {negated}, {magnitude}, {negative};"
+                ));
+                out
+            }
+        };
+        // `2^e v ± 1`: minus where the delta bit is set.
+        let Some(exponent) = grid.delta else {
+            return value;
+        };
+        let delta = self.t32();
+        self.line(format!("shr.b32 {delta}, {raw}, {};", grid.delta_bit()));
+        self.line(format!("and.b32 {delta}, {delta}, 1;"));
+        let minus = self.pred();
+        self.line(format!("setp.ne.u32 {minus}, {delta}, 0;"));
+        let step = self.t32();
+        self.line(format!("selp.s32 {step}, -1, 1, {minus};"));
         let out = self.t32();
-        self.line(format!(
-            "selp.s32 {out}, {negated}, {magnitude}, {negative};"
-        ));
+        self.line(format!("shl.b32 {out}, {value}, {exponent};"));
+        self.line(format!("add.s32 {out}, {out}, {step};"));
         out
     }
     /// E8M0: the exponent byte is the F32 exponent field (2^(raw - 127));

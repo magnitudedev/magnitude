@@ -267,9 +267,19 @@ pub struct Scratch<'a> {
 unsafe impl Send for Scratch<'_> {}
 unsafe impl Sync for Scratch<'_> {}
 
+/// The alignment of every buffer a launch passes (tensors and scratch): the
+/// runtime places every native buffer at it, and the bodies' vector
+/// accesses rely on it.
+pub const BUFFER_ALIGNMENT: usize = 256;
+
+const _: () = assert!(
+    BUFFER_ALIGNMENT.is_multiple_of(std::mem::align_of::<crate::quant::Q8Block>()),
+    "a buffer's base carries the INT8 activation blocks' alignment"
+);
+
 impl<'a> Scratch<'a> {
     /// # Safety
-    /// `base` is valid for `'a` and aligned to 256 bytes.
+    /// `base` is valid for `'a` and aligned to [`BUFFER_ALIGNMENT`].
     pub unsafe fn from_raw(base: *mut u8) -> Self {
         Self {
             base,

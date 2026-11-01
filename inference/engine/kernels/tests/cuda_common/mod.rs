@@ -3,8 +3,9 @@
 //! RMS/projection host models, mappings and tolerance checks.
 #![allow(dead_code)]
 
-use seismic::{BackendName, Device, Element, Layout, Tensor};
-use seismic_lang::registry::{bf16_round, f16_bits};
+use magnitude_kernels::dense_expand;
+use seismic::{BackendName, Device, Element, Layout, NativeSpecialization, OperandRecipe, Tensor};
+use seismic_lang::registry::bf16_round;
 
 pub fn cuda() -> Option<Device> {
     seismic::Devices::discover(&[])
@@ -13,232 +14,29 @@ pub fn cuda() -> Option<Device> {
         .ok()
 }
 
-pub struct Rng(pub u64);
+#[path = "../gguf_formats/mod.rs"]
+mod gguf_formats;
+#[path = "../mapped/mod.rs"]
+mod mapped;
+pub use gguf_formats::{Format, Rng};
+pub use mapped::Mapped;
+// The suites with a module of tests a format generate them.
+#[allow(unused_imports)]
+pub(crate) use gguf_formats::gguf_format_tests;
 
 impl Rng {
-    pub fn next(&mut self) -> u32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        (self.0 >> 33) as u32
-    }
-    pub fn byte(&mut self) -> u8 {
-        self.next() as u8
-    }
     pub fn uniform(&mut self, low: f32, high: f32) -> f32 {
         low + (high - low) * (self.next() as f32 / (1u64 << 31) as f32)
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Format {
-    Q4K,
-    Q5K,
-    Q6K,
-    Q8,
-    /// GGUF IQ4_XS, resident as iq4g32.
-    Iq4,
-    /// GGUF Q4_0, Q4_1, Q5_0, Q5_1, MXFP4, NVFP4 (representations of their
-    /// own).
-    Q4_0,
-    Q4_1,
-    Q5_0,
-    Q5_1,
-    Mxfp4,
-    Nvfp4,
-    /// GGUF NVFP4 calibrated for FP4 activations (W4A4): nvfp4g16's storage,
-    /// NVFP4 operands.
-    Nvfp4A4,
-    /// GGUF IQ2_XS, IQ3_XXS and IQ2_XXS (vector codes, representations of
-    /// their own).
-    Iq2Xs,
-    Iq3Xxs,
-    Iq2Xxs,
-    /// GGUF Q2_K and TQ2_0 (2-bit codes, representations of their own).
-    Q2K,
-    Tq2_0,
-}
+/// The magnitude of the weights' values, packed and dense.
+pub const WEIGHT_SCALE: f32 = 0.05;
 
 impl Format {
-    pub const ALL: [Format; 17] = [
-        Format::Q4K,
-        Format::Q5K,
-        Format::Q6K,
-        Format::Q8,
-        Format::Iq4,
-        Format::Q4_0,
-        Format::Q4_1,
-        Format::Q5_0,
-        Format::Q5_1,
-        Format::Mxfp4,
-        Format::Nvfp4,
-        Format::Nvfp4A4,
-        Format::Iq2Xs,
-        Format::Iq3Xxs,
-        Format::Iq2Xxs,
-        Format::Q2K,
-        Format::Tq2_0,
-    ];
-    pub fn external(self) -> &'static str {
-        match self {
-            Format::Q4K => "gguf_q4_k",
-            Format::Q5K => "gguf_q5_k",
-            Format::Q6K => "gguf_q6_k",
-            Format::Q8 => "gguf_q8_0",
-            Format::Iq4 => "gguf_iq4_xs",
-            Format::Q4_0 => "gguf_q4_0",
-            Format::Q4_1 => "gguf_q4_1",
-            Format::Q5_0 => "gguf_q5_0",
-            Format::Q5_1 => "gguf_q5_1",
-            Format::Mxfp4 => "gguf_mxfp4",
-            Format::Nvfp4 | Format::Nvfp4A4 => "gguf_nvfp4",
-            Format::Iq2Xs => "gguf_iq2_xs",
-            Format::Iq3Xxs => "gguf_iq3_xxs",
-            Format::Iq2Xxs => "gguf_iq2_xxs",
-            Format::Q2K => "gguf_q2_k",
-            Format::Tq2_0 => "gguf_tq2_0",
-        }
-    }
-    /// The GGUF tensor type this format's weights are stored as.
-    pub fn encoding(self) -> magnitude_ggml::Encoding {
-        use magnitude_ggml::Encoding;
-        match self {
-            Format::Q4K => Encoding::Q4K,
-            Format::Q5K => Encoding::Q5K,
-            Format::Q6K => Encoding::Q6K,
-            Format::Q8 => Encoding::Q8_0,
-            Format::Iq4 => Encoding::Iq4Xs,
-            Format::Q4_0 => Encoding::Q4_0,
-            Format::Q4_1 => Encoding::Q4_1,
-            Format::Q5_0 => Encoding::Q5_0,
-            Format::Q5_1 => Encoding::Q5_1,
-            Format::Mxfp4 => Encoding::Mxfp4,
-            Format::Nvfp4 | Format::Nvfp4A4 => Encoding::Nvfp4,
-            Format::Iq2Xs => Encoding::Iq2Xs,
-            Format::Iq3Xxs => Encoding::Iq3Xxs,
-            Format::Iq2Xxs => Encoding::Iq2Xxs,
-            Format::Q2K => Encoding::Q2K,
-            Format::Tq2_0 => Encoding::Tq2_0,
-        }
-    }
-    pub fn representation(self) -> &'static str {
-        match self {
-            Format::Q4K => "q4k",
-            Format::Q5K => "q5k",
-            Format::Q6K => "q6k",
-            Format::Q8 => "q8g32s",
-            Format::Iq4 => "iq4g32",
-            Format::Q4_0 => "q4g32s",
-            Format::Q5_0 => "q5g32s",
-            Format::Q5_1 => "q5g32",
-            Format::Q4_1 => "q4g32",
-            Format::Mxfp4 => "mxfp4g32",
-            Format::Nvfp4 => "nvfp4g16",
-            Format::Nvfp4A4 => "nvfp4g16a4",
-            Format::Iq2Xs => "iq2xs",
-            Format::Iq3Xxs => "iq3xxs",
-            Format::Iq2Xxs => "iq2xxs",
-            Format::Q2K => "q2k",
-            Format::Tq2_0 => "q2g256",
-        }
-    }
+    /// The mma16 element CUDA's kernels read.
     pub fn resident(self) -> Element {
-        Element::stored(self.representation(), Layout::Mma16).unwrap()
-    }
-    /// One random GGUF block (with small positive super factors).
-    pub fn block(self, rng: &mut Rng) -> Vec<u8> {
-        let f16 = |value: f32| f16_bits(value).to_le_bytes();
-        let mut block = Vec::new();
-        match self {
-            Format::Q4K | Format::Q5K => {
-                block.extend(f16(rng.uniform(0.0005, 0.003)));
-                block.extend(f16(rng.uniform(0.0, 0.002)));
-                let bytes = if matches!(self, Format::Q4K) {
-                    12 + 128
-                } else {
-                    12 + 32 + 128
-                };
-                block.extend((0..bytes).map(|_| rng.byte()));
-            }
-            Format::Q6K => {
-                block.extend((0..128 + 64).map(|_| rng.byte()));
-                block.extend((0..16).map(|_| (rng.next() % 128) as u8 ^ 0xC0));
-                block.extend(f16(rng.uniform(0.0002, 0.001)));
-            }
-            Format::Q8 => {
-                block.extend(f16(rng.uniform(0.001, 0.005)));
-                block.extend((0..32).map(|_| rng.byte()));
-            }
-            Format::Iq4 => {
-                // d, the eight six-bit sub-block scales (each less 32) as
-                // 2 high-bit + 4 low-nibble bytes, and 128 bytes of table codes.
-                block.extend(f16(rng.uniform(0.00005, 0.0003)));
-                block.extend((0..2 + 4 + 128).map(|_| rng.byte()));
-            }
-            Format::Q4_0 => {
-                block.extend(f16(rng.uniform(0.0005, 0.003)));
-                block.extend((0..16).map(|_| rng.byte()));
-            }
-            Format::Q5_0 => {
-                block.extend(f16(rng.uniform(0.0002, 0.0015)));
-                block.extend((0..4 + 16).map(|_| rng.byte()));
-            }
-            Format::Q5_1 => {
-                block.extend(f16(rng.uniform(0.0002, 0.0015)));
-                block.extend(f16(-rng.uniform(0.005, 0.02)));
-                block.extend((0..4 + 16).map(|_| rng.byte()));
-            }
-            Format::Q4_1 => {
-                block.extend(f16(rng.uniform(0.0004, 0.003)));
-                block.extend(f16(-rng.uniform(0.005, 0.02)));
-                block.extend((0..16).map(|_| rng.byte()));
-            }
-            Format::Mxfp4 => {
-                // E8M0 2^-10 .. 2^-8 (values up to 6 of them).
-                block.push(117 + (rng.next() % 3) as u8);
-                block.extend((0..16).map(|_| rng.byte()));
-            }
-            Format::Nvfp4 | Format::Nvfp4A4 => {
-                // UE4M3 subnormal and smallest-normal scales (<= 2^-5).
-                block.extend((0..4).map(|_| (rng.next() % 16) as u8));
-                block.extend((0..32).map(|_| rng.byte()));
-            }
-            Format::Iq2Xs => {
-                // d (values reach d * 31 * 43 / 8), 32 grid entries, eight
-                // scale bytes.
-                block.extend(f16(rng.uniform(0.0002, 0.001)));
-                block.extend((0..64 + 8).map(|_| rng.byte()));
-            }
-            Format::Iq3Xxs => {
-                // d (values reach d * 31 * 62 / 4), 64 grid indices, eight
-                // sign-and-scale words.
-                block.extend(f16(rng.uniform(0.00005, 0.0003)));
-                block.extend((0..64 + 32).map(|_| rng.byte()));
-            }
-            Format::Iq2Xxs => {
-                // d (values reach d * 31 * 43 / 8), then eight pairs of four
-                // grid indices and a sign-and-scale word.
-                block.extend(f16(rng.uniform(0.0002, 0.001)));
-                block.extend((0..64).map(|_| rng.byte()));
-            }
-            Format::Q2K => {
-                // Sixteen scale-and-minimum bytes, 64 code bytes, then d
-                // (values reach d * 15 * 3) and dmin.
-                block.extend((0..16 + 64).map(|_| rng.byte()));
-                block.extend(f16(rng.uniform(0.0002, 0.001)));
-                block.extend(f16(rng.uniform(0.0002, 0.001)));
-            }
-            Format::Tq2_0 => {
-                // 64 code bytes, then d (values reach 2 d).
-                block.extend((0..64).map(|_| rng.byte()));
-                block.extend(f16(rng.uniform(0.005, 0.02)));
-            }
-        }
-        block
-    }
-    pub fn block_values(self) -> usize {
-        self.encoding().block_elements() as usize
+        self.element(Layout::Mma16)
     }
 }
 
@@ -252,16 +50,12 @@ pub struct Weight {
 pub fn weight(device: &Device, format: Format, rows: usize, k: usize, rng: &mut Rng) -> Weight {
     let mut external = Vec::new();
     for _ in 0..rows * k / format.block_values() {
-        external.extend(format.block(rng));
+        external.extend(format.block(rng, WEIGHT_SCALE));
     }
     let shape = [rows as u64, k as u64];
     let resident = format.resident();
     let bytes = resident
-        .repack_host(
-            Element::named(format.external()).unwrap(),
-            &shape,
-            &external,
-        )
+        .repack_host(format.source(), &shape, &external)
         .expect("registered GGUF -> mma16 conversion");
     let values = resident.decode_host(&shape, &bytes).unwrap();
     let tensor = Tensor::from_host(device, resident, &shape, &bytes).unwrap();
@@ -276,7 +70,7 @@ pub fn weight(device: &Device, format: Format, rows: usize, k: usize, rng: &mut 
 /// resident) and its values.
 pub fn dense_weight(device: &Device, rows: usize, k: usize, rng: &mut Rng) -> Weight {
     let values: Vec<f32> = (0..rows * k)
-        .map(|_| bf16_round(rng.uniform(-0.05, 0.05)))
+        .map(|_| bf16_round(rng.uniform(-WEIGHT_SCALE, WEIGHT_SCALE)))
         .collect();
     let tensor = bf16_tensor(device, &[rows as u64, k as u64], &values);
     let bytes = tensor.read_to_host().unwrap();
@@ -389,13 +183,15 @@ pub const GEMV_ROWS: usize = 16;
 pub const SMALL_GEMM_ROWS: usize = 64;
 
 /// A native mapping: the GEMV K split, the small-band GEMM's INT8 operand
-/// path (the large-band GEMM is the 16-bit path) and the large-band GEMM's
-/// loader rotation.
+/// path (the large-band GEMM is the 16-bit path), the large-band GEMM's
+/// loader rotation and the dense pair's GEMV residency (blocks of streaming
+/// weights per SM).
 #[derive(Clone, Copy, Debug)]
 pub struct Mapping {
     pub ksplit: u64,
     pub int8: u64,
     pub rotate: u64,
+    pub residency: u64,
 }
 
 impl Mapping {
@@ -425,6 +221,7 @@ impl Mapping {
         spec.with_param("INT8", self.int8)
             .with_param("OPERAND", 0)
             .with_param("KSPLIT", self.ksplit)
+            .with_launch_param(1, "RESIDENCY", self.residency)
             .with_launch_param(4, "ROTATE", self.rotate)
     }
     /// Readout head GEMVs own KSPLIT on launches 1 and 2, its GEMM ROTATE.
@@ -446,21 +243,25 @@ pub const GEMV_MAPPINGS: [Mapping; 4] = [
         ksplit: 4,
         int8: 0,
         rotate: 2,
+        residency: 1,
     },
     Mapping {
         ksplit: 2,
         int8: 0,
         rotate: 2,
+        residency: 2,
     },
     Mapping {
         ksplit: 8,
         int8: 1,
         rotate: 2,
+        residency: 2,
     },
     Mapping {
         ksplit: 4,
         int8: 1,
         rotate: 2,
+        residency: 1,
     },
 ];
 /// GEMM mappings: both operand paths (the large band ignores INT8) and every
@@ -471,36 +272,74 @@ pub const GEMM_MAPPINGS: [Mapping; 4] = [
         ksplit: 4,
         int8: 0,
         rotate: 2,
+        residency: 1,
     },
     Mapping {
         ksplit: 4,
         int8: 1,
         rotate: 2,
+        residency: 1,
     },
     Mapping {
         ksplit: 4,
         int8: 0,
         rotate: 1,
+        residency: 1,
     },
     Mapping {
         ksplit: 4,
         int8: 0,
         rotate: 4,
+        residency: 1,
     },
 ];
 
-/// The mappings of `m` rows over `weights` ([`admitted`]).
-pub fn mappings(m: usize, weights: &[Element]) -> Vec<Mapping> {
-    admitted(if m <= GEMV_ROWS { &GEMV_MAPPINGS } else { &GEMM_MAPPINGS }, weights)
+/// `dense_expand` of [h]-wide rows through `gate` and `up` weights of `f`
+/// rows.
+pub fn expansion(
+    gate: Element,
+    up: Element,
+    h: usize,
+    f: usize,
+) -> Mapped<dense_expand::Entry, impl Fn(&Device, Mapping) -> NativeSpecialization> {
+    Mapped::new(
+        dense_expand::native_entry_with(dense_expand::Elements {
+            NW: Element::f32(),
+            GW: gate,
+            UW: up,
+            A: Element::bf16(),
+        }),
+        move |_: &Device, mapping: Mapping| {
+            mapping.projection_params(
+                NativeSpecialization::new()
+                    .with_static("H", h as u64)
+                    .with_static("F", f as u64)
+                    .with_static("GS", 0)
+                    .with_static("US", 0),
+            )
+        },
+    )
 }
 
-/// The `mappings` a product over `weights` admits: INT8 1 only where CUDA's
-/// int8 GEMM takes every weight (`Element::cuda_int8`, `form(W, INT8)`).
-pub fn admitted(mappings: &[Mapping], weights: &[Element]) -> Vec<Mapping> {
+/// The mappings of `m` rows that `admits` holds for ([`admitted`]).
+pub fn mappings(m: usize, admits: impl Fn(Mapping) -> bool) -> Vec<Mapping> {
+    admitted(
+        if m <= GEMV_ROWS {
+            &GEMV_MAPPINGS
+        } else {
+            &GEMM_MAPPINGS
+        },
+        admits,
+    )
+}
+
+/// The `mappings` that `admits` holds for: those every entry a test
+/// prepares under each admits ([`Mapped::admits`]).
+pub fn admitted(mappings: &[Mapping], admits: impl Fn(Mapping) -> bool) -> Vec<Mapping> {
     mappings
         .iter()
         .copied()
-        .filter(|mapping| mapping.int8 == 0 || weights.iter().all(Element::cuda_int8))
+        .filter(|mapping| admits(*mapping))
         .collect()
 }
 
@@ -589,7 +428,7 @@ pub fn operand_rows(
     mapping: Mapping,
     format: Option<Format>,
 ) -> (Vec<f32>, Vec<f32>) {
-    if format == Some(Format::Nvfp4A4) {
+    if format.is_some_and(|format| format.operands == OperandRecipe::Nvfp4Rows) {
         (nvfp4_rows(x, k), vec![0.0; x.len()])
     } else if mapping.quantizes(x.len() / k) {
         quantize(x, k)

@@ -9,6 +9,9 @@ seismic.workspace = true
 
 [build-dependencies]
 seismic-build.workspace = true
+# The GGUF formats the registry imports (`gguf_format_tests`).
+magnitude-ggml.workspace = true
+seismic-lang.workspace = true
 
 [dev-dependencies]
 magnitude-ggml.workspace = true

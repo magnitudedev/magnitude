@@ -23,10 +23,6 @@ use seismic::cpu::{Dense, Weights};
 /// The largest weight-row block of one work item.
 pub const MAX_ROWS: usize = 8;
 
-/// Scratch bytes per quantized activation block. Keep the Seismic scratch
-/// declarations in sync with this representation.
-pub const Q8_BYTES: usize = std::mem::size_of::<Q8Block>();
-
 /// The weight rows of work item `item` when every item owns `rows` of
 /// `total` rows (the last item owns the remainder).
 #[inline(always)]

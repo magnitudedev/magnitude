@@ -539,18 +539,6 @@ impl Element {
         seismic_lang::forms::cuda_gemm_fold_of(self.0)
     }
 
-    /// Whether CUDA's int8 GEMM takes this element (`form(W, INT8)`,
-    /// `_FORM_INT8`): the weights a CUDA `INT8 = 1` configuration admits.
-    pub fn cuda_int8(&self) -> bool {
-        seismic_lang::forms::cuda_int8_of(self.0)
-    }
-
-    /// Whether the CPU's quantized dot takes this element (`form(W, INT8)`):
-    /// the weights a CPU `INT8 = 1` configuration quantizes activations for.
-    pub fn cpu_int8(&self) -> bool {
-        seismic_lang::forms::cpu_int8_of(self.0)
-    }
-
     /// This element's admission to Metal's token-packing GEMM, as Metal's
     /// native libraries read it (`_FORM_PACK`); `None` where the form does
     /// not serve it.
@@ -4401,9 +4389,10 @@ pub mod generated {
         ))
     }
 
-    /// Validate a stored native choice against the opened device's complete
-    /// parameter domain at element bindings `elements`, including
-    /// Seismic-owned CPU workers and ISA tier.
+    /// Validate a native choice against the opened device's complete
+    /// parameter domain at element bindings `elements`, as preparation takes
+    /// it: Seismic-owned CPU workers and ISA tier as the choice gives them,
+    /// at their defaults where it leaves them unset.
     pub fn native_specialization_valid<E: Entry>(
         device: &Device,
         specialization: &NativeSpecialization,

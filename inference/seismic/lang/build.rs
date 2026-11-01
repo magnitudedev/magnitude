@@ -5,15 +5,17 @@
 //! and each codebook's values (on Metal and Vulkan, which read them), and
 //! their bindings by id: `grids::table<ID>::points()` and
 //! `codebooks::table<ID>::values()` (Vulkan `GRIDS_TABLE_<ID>`,
-//! `CODEBOOKS_TABLE_<ID>`). A `u32` grid point is one
-//! word and a `u64` point its (low, high) words; codebook values are exact
-//! floats. A 16-value codebook also has a dialect's own forms of its values:
+//! `CODEBOOKS_TABLE_<ID>`). A
+//! `u32` grid point is one word and a `u64` point its (low, high) words;
+//! codebook values are exact floats. A 16-value codebook also has a dialect's own forms of its values:
 //! on Metal each code byte's two values + 128 (`codebooks::pairs<ID>`: the
 //! low nibble's in the low byte), on CUDA its values as little-endian s8
 //! words (`codebooks::words<ID>`: `W0`..`W3`, values 4w..4w + 3 in word w)
 //! and whether they are E2M1 doubled (`codebooks::e2m1<ID>`). On CUDA a grid
 //! whose lane magnitudes are few also has the operands of its magnitudes
-//! (`grids::magnitudes<ID>`, see `magnitudes`).
+//! (`grids::magnitudes<ID>`, see `magnitudes`). A dialect declares some
+//! tables only where its includer reads them (`Dialect::guarded`), each
+//! under `SEISMIC_TABLES_READ_<TABLE>(ID)`, which the includer defines.
 
 use magnitude_ggml::tables::{CODEBOOKS, GRIDS, GridPoints};
 use std::fmt::Write as _;
@@ -42,6 +44,28 @@ impl Space {
             Self::Grids => "points",
             Self::Codebooks => "values",
         }
+    }
+}
+
+/// A kind of table: a grid's points, a codebook's values, a grid's
+/// magnitude operands.
+#[derive(Clone, Copy, PartialEq)]
+enum Table {
+    Grid,
+    Codebook,
+    Magnitudes,
+}
+
+impl Table {
+    /// The condition its table `id` is declared under where a dialect
+    /// declares it only where read (`Dialect::guarded`).
+    fn read(self, id: usize) -> String {
+        let table = match self {
+            Self::Grid => "GRID",
+            Self::Codebook => "CODEBOOK",
+            Self::Magnitudes => "MAGNITUDES",
+        };
+        format!("SEISMIC_TABLES_READ_{table}({id})")
     }
 }
 
@@ -76,6 +100,21 @@ struct Dialect {
     /// Whether the dialect reads codebooks' values themselves (CUDA reads
     /// only their dialect forms).
     values: bool,
+    /// The tables the dialect declares only where its includer reads them
+    /// (`Table::read`).
+    guarded: &'static [Table],
+}
+
+impl Dialect {
+    /// Table `id` of kind `table`, declared by `declaration`: under its read
+    /// condition where the dialect guards it.
+    fn declare(&self, table: Table, id: usize, declaration: String) -> String {
+        if declaration.is_empty() || !self.guarded.contains(&table) {
+            declaration
+        } else {
+            format!("#if {}\n{declaration}#endif\n", table.read(id))
+        }
+    }
 }
 
 const DIALECTS: [Dialect; 3] = [
@@ -102,6 +141,7 @@ const DIALECTS: [Dialect; 3] = [
         },
         grid: |_, _| String::new(),
         values: true,
+        guarded: &[],
         sixteen: |id, name, values| {
             let pairs: Vec<String> = (0..256)
                 .map(|byte| {
@@ -152,6 +192,8 @@ const DIALECTS: [Dialect; 3] = [
         },
         grid: magnitudes,
         values: false,
+        // A grid's magnitude operands' only reader is the records GEMV.
+        guarded: &[Table::Magnitudes],
     },
     Dialect {
         file: "tables.glsl",
@@ -172,6 +214,9 @@ const DIALECTS: [Dialect; 3] = [
         sixteen: |_, _, _| String::new(),
         grid: |_, _| String::new(),
         values: true,
+        // glslang emits every declared constant array, read or not: a
+        // module holds only the tables its includer reads.
+        guarded: &[Table::Grid, Table::Codebook],
     },
 ];
 
@@ -196,6 +241,8 @@ fn e2m1_doubled(values: [i8; 16]) -> bool {
 /// selector is the positive's plus 0x40. f16: the low bytes, then the high
 /// bytes; a negative value flips its sign bit. Grids of more magnitudes have
 /// none.
+///
+/// Their only reader is the records GEMV (`packets::Records`).
 fn magnitudes(id: usize, points: GridPoints) -> String {
     let mut distinct: Vec<u32> = (0..points.len())
         .flat_map(|index| (0..points.lanes()).map(move |lane| u32::from(points.byte(index, lane))))
@@ -308,21 +355,23 @@ fn main() {
                 ),
             };
             let ty = (dialect.ty)(element);
-            text += &(dialect.open)(Space::Grids, grid.name, ty, words.len());
-            body(&mut text, &words);
-            text += dialect.close;
-            text += &(dialect.bind)(Space::Grids, index + 1, grid.name, ty);
-            text += &(dialect.grid)(index + 1, grid.points);
+            let mut points = (dialect.open)(Space::Grids, grid.name, ty, words.len());
+            body(&mut points, &words);
+            points += dialect.close;
+            points += &(dialect.bind)(Space::Grids, index + 1, grid.name, ty);
+            text += &dialect.declare(Table::Grid, index + 1, points);
+            text += &dialect.declare(Table::Magnitudes, index + 1, (dialect.grid)(index + 1, grid.points));
             text += "\n";
         }
         for (index, codebook) in CODEBOOKS.iter().enumerate() {
             if dialect.values {
                 let words: Vec<String> = codebook.values.iter().map(|value| format!("{value}.0f")).collect();
                 let ty = (dialect.ty)(Element::Float);
-                text += &(dialect.open)(Space::Codebooks, codebook.name, ty, words.len());
-                body(&mut text, &words);
-                text += dialect.close;
-                text += &(dialect.bind)(Space::Codebooks, index + 1, codebook.name, ty);
+                let mut values = (dialect.open)(Space::Codebooks, codebook.name, ty, words.len());
+                body(&mut values, &words);
+                values += dialect.close;
+                values += &(dialect.bind)(Space::Codebooks, index + 1, codebook.name, ty);
+                text += &dialect.declare(Table::Codebook, index + 1, values);
             }
             if let Ok(values) = <[i8; 16]>::try_from(codebook.values) {
                 text += &(dialect.sixteen)(index + 1, codebook.name, values);

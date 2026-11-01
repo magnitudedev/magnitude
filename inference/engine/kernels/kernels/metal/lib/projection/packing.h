@@ -18,8 +18,8 @@
 // two powers of two multiply the F32 result once, at the store.
 //
 // The gain is the largest one that bounds every block sum for any row of the
-// format. Codes minus their centre c (half their range: 8 for 4-bit codes,
-// 16 for 5-bit, 32 for 6-bit, 128 for 8-bit values) are at most c in magnitude, so a sum is at
+// format. Codes minus their centre c (half their entries' range: 8 for 4-bit
+// entries, 4 for 3-bit, 128 for 8-bit values) are at most c in magnitude, so a sum is at
 // most c |q|_1 (Hoelder; the exact worst case over the format's rows, which
 // Cauchy-Schwarz and the l-infinity bound only exceed), and codes q rounded
 // from x under gain g to multiples of s have |q|_1 <= g |x|_1 + 32 s / 2:
@@ -68,8 +68,9 @@
 // Two pre-passes write the form's scratch in the order the lanes read it:
 // `packing_operand` the packed operand and the tokens' scales and code sums,
 // `packing_coefficients` the weights' block scales and biases. Weight codes
-// are read from the resident rows, one 4-byte word per weight row and run
-// (and the lane's share of the plane of high bits, where the format has one).
+// are read from the resident rows, a lane's chunk of eight codes per weight
+// row and run (`lane_codes`: its share of each code plane, its codebook
+// codes or its grid entry).
 //
 // The weights are the left operand (inference/docs/kernels/lane-order.md): a
 // lane at fragment coordinate (x, y) holds weight row y of a weight fragment
@@ -123,7 +124,8 @@ inline float4 packing_scale(float4 value) {
 
 // The packed codes of weights W (`packing_codes<W>`), the one place its
 // packed forms and its packing bound (`packing_bound`) read them from: a
-// layout of its code planes and interpretation (`packing_layout`) and its
+// layout of its lane codes (`lane_codes`, entering at the admitted `offset`;
+// `packing_layout`) and its
 // coefficients' factors (`packing_factors`), for weights the runtime admits
 // to the form (`packets::Forms::pack`, `_FORM_PACK`, which also gives their
 // codes' `centre`, `offset` and `residue`). Codes enter as F16 subnormals
@@ -154,88 +156,55 @@ inline float4 packing_scale(float4 value) {
 // The packed product's forms, on a device without tensor operations.
 constant constexpr bool packing_forms = !SEISMIC_HAS_TENSOR_OPS;
 
-// A layout of codes in planes P interpreted by C, for FOLDS runs a block
-// (`implemented`): `at`, `load`, `step` and, where its steps' columns are
-// `bytes` (the codes with residue bits), `planes`. None by default.
-template <typename P, typename C, uint FOLDS>
+// The layout of a weight's lane codes L (`lane_codes`) for FOLDS runs a
+// block, in bytes of column order where BYTES (entries of 8 bits, the codes
+// with residue bits; `planes`): `at`, `load` and `step`. None by default.
+template <typename L, uint FOLDS, bool BYTES>
 struct packing_layout {
-    static constant constexpr bool implemented = false, bytes = false;
+    static constexpr bool implemented() { return false; }
 };
 
-// 4-bit codes of a plane of low nibbles alone: step s multiplies the block's
-// columns 8 (c / 2) + s + 4 (c % 2) for c = 0 .. 7: a row's word c / 2 holds
-// them as nibble s of each half.
-template <int ZERO_CODE>
-struct packing_layout<packets::Planes<4, 0>, packets::Offset<ZERO_CODE>, 1> {
-    static constant constexpr bool implemented = true, bytes = false;
-    typedef uint place;
-    typedef uint words;
+// One run a block: step s multiplies the block's columns
+// 8 (c / 2) + s + 4 (c % 2) for c = 0 .. 7: a lane's chunk x / 2, its pair s.
+template <typename L>
+struct packing_layout<L, 1, false> {
+    static constexpr bool implemented() { return L::implemented(); }
+    typedef typename L::place place;
+    typedef typename L::words words;
     template <typename W>
     static place at(thread const Weights<W> &w, uint n, uint x) {
-        return w.codes_at(n, 16u, 0u) + (x >> 1) * 4u;
+        return L::at(w, w.locate(n), x >> 1);
     }
-    // A row tile's rows of one block are adjacent: 16 bytes a row.
     template <typename W>
-    static words load(thread const Weights<W> &w, place at, uint g) {
-        return *reinterpret_cast<device const uint *>(w.base + at + g * 16u * w.layout.tile);
-    }
-    static half2 step(words codes, uint s) { return as_type<half2>((codes >> (4u * s)) & 0x000f000fu); }
+    static words load(thread const Weights<W> &w, place at, uint g) { return L::template load<false>(w, at, g); }
+    static half2 step(thread const words &codes, uint s) { return as_type<half2>(L::pair(codes, s)); }
 };
 
-// 5-bit codes of a plane of low nibbles and a plane of high bits: the
-// nibbles' columns; the lane's byte of the block's high bits beside its word
-// of low nibbles, a nibble of the byte under each half of the word, so that
-// bit s of each half is the high bit of step s's code there.
-template <int ZERO_CODE>
-struct packing_layout<packets::Planes<4, 1>, packets::Offset<ZERO_CODE>, 1> {
-    static constant constexpr bool implemented = true, bytes = false;
-    typedef uint2 place;
-    typedef uint2 words;
+// Two runs a block: step 2 h + t multiplies the columns
+// 16 h + 8 (c / 4) + 2 ((c / 2) % 2) + t + 4 (c % 2) of run h: a lane's
+// chunks x / 4 and x / 4 + 2, its pairs x % 4 + t (x even). A lane holds its
+// chunk of each run, shifted to its first pair.
+template <typename L>
+struct packing_layout<L, 2, false> {
+    static constexpr bool implemented() { return L::implemented(); }
+    struct place {
+        typename L::place first;
+        uint shift;
+    };
+    struct words {
+        typename L::words first, second;
+    };
     template <typename W>
     static place at(thread const Weights<W> &w, uint n, uint x) {
-        return uint2(w.codes_at(n, 16u, 0u) + (x >> 1) * 4u, w.high_at(n, 4u, 0u) + (x >> 1));
-    }
-    template <typename W>
-    static words load(thread const Weights<W> &w, place at, uint g) {
-        const uint high = w.base[at.y + g * 4u * w.layout.tile];
-        return uint2(*reinterpret_cast<device const uint *>(w.base + at.x + g * 16u * w.layout.tile),
-            (high | (high << 12)) & 0x000f000fu);
-    }
-    static half2 step(words codes, uint s) {
-        return as_type<half2>(((codes.x >> (4u * s)) & 0x000f000fu) | (((codes.y >> s) & 0x00010001u) << 4));
-    }
-};
-
-// 6-bit codes of a plane of low nibbles and a plane of two high bits, two
-// runs a block: step 2 h + t multiplies the columns
-// 16 h + 8 (c / 4) + 2 ((c / 2) % 2) + t + 4 (c % 2) of run h: a row's word
-// 2 h + c / 4 holds them as nibble 2 ((c / 2) % 2) + t of each half, and a
-// 16-bit field of the high plane their two high bits alike. A lane holds its
-// word and field of each run, shifted to its first nibble.
-template <int ZERO_CODE>
-struct packing_layout<packets::Planes<4, 2>, packets::Offset<ZERO_CODE>, 2> {
-    static constant constexpr bool implemented = true, bytes = false;
-    typedef uint3 place;
-    typedef uint4 words;
-    template <typename W>
-    static place at(thread const Weights<W> &w, uint n, uint x) {
-        return uint3(w.codes_at(n, 16u, 0u) + (x >> 2) * 4u, w.high_at(n, 8u, 0u) + (x >> 2) * 2u, (x & 2u) * 4u);
+        return place{L::at(w, w.locate(n), x >> 2), x & 2u};
     }
     template <typename W>
     static words load(thread const Weights<W> &w, place at, uint g) {
-        device const uchar *low = w.base + at.x + g * 16u * w.layout.tile;
-        device const uchar *high = w.base + at.y + g * 8u * w.layout.tile;
-        const uint2 nibbles = uint2(*reinterpret_cast<device const uint *>(low),
-            *reinterpret_cast<device const uint *>(low + 8));
-        const uint2 fields = uint2(*reinterpret_cast<device const ushort *>(high),
-            *reinterpret_cast<device const ushort *>(high + 4));
-        // A byte of each field (four columns' bits) under each half.
-        return uint4(nibbles >> at.z, ((fields | (fields << 8)) & 0x00ff00ffu) >> (at.z / 2u));
+        return words{L::shift(L::template load<false>(w, at.first, g), at.shift),
+            L::shift(L::template load<false>(w, at.first, g, 2u), at.shift)};
     }
-    static half2 step(words codes, uint s) {
-        const uint nibbles = (s & 2u) ? codes.y : codes.x, fields = (s & 2u) ? codes.w : codes.z;
-        const uint t = s & 1u;
-        return as_type<half2>(((nibbles >> (4u * t)) & 0x000f000fu) | (((fields >> (2u * t)) & 0x00030003u) << 4));
+    static half2 step(thread const words &codes, uint s) {
+        return as_type<half2>(L::pair((s & 2u) ? codes.second : codes.first, s & 1u));
     }
 };
 
@@ -266,47 +235,19 @@ inline uint2 packing_byte_planes(uint2 codes, uint x) {
     return row;
 }
 
-// 8-bit codes: a stored byte with MASK flipped is the code + 128 (two's
-// complement bytes) or the code.
-template <uint MASK, int ZERO>
-struct packing_layout<packets::Planes<8, 0>, packets::Linear<MASK, ZERO>, 1> {
-    static constant constexpr bool implemented = true, bytes = true;
-    typedef uint place;
-    typedef uint2 words;
+// Values of 8 bits, one run a block: the lane's chunk x / 2 as bytes
+// (`lane_codes::bytes`).
+template <typename L>
+struct packing_layout<L, 1, true> {
+    static constexpr bool implemented() { return L::implemented() && L::bytes(); }
+    typedef typename L::place place;
+    typedef typename L::words words;
     template <typename W>
     static place at(thread const Weights<W> &w, uint n, uint x) {
-        return w.codes_at(n, 32u, 0u) + (x >> 1) * 8u;
+        return L::at(w, w.locate(n), x >> 1);
     }
-    // A row tile's rows of one block are adjacent: 32 bytes a row.
     template <typename W>
-    static words load(thread const Weights<W> &w, place at, uint g) {
-        return *reinterpret_cast<device const uint2 *>(w.base + at + g * 32u * w.layout.tile) ^ MASK;
-    }
-    static half2 step(words codes, uint s) { return packing_byte_step(codes, s); }
-    template <uint RESIDUE>
-    static uint2 planes(words codes, uint x) { return packing_byte_planes<RESIDUE>(codes, x); }
-};
-
-// A codebook's 4-bit codes: the lane's four bytes of codes become its eight
-// values + 128 (`codebooks::pairs`, each code byte's two values), eight bits
-// each.
-template <uint ID>
-struct packing_layout<packets::Planes<4, 0>, packets::Table<ID>, 1> {
-    static constant constexpr bool implemented = true, bytes = true;
-    typedef uint place;
-    typedef uint2 words;
-    template <typename W>
-    static place at(thread const Weights<W> &w, uint n, uint x) {
-        return w.codes_at(n, 16u, 0u) + (x >> 1) * 4u;
-    }
-    // A row tile's rows of one block are adjacent: 16 bytes a row.
-    template <typename W>
-    static words load(thread const Weights<W> &w, place at, uint g) {
-        constant ushort *pairs = codebooks::pairs<ID>::values();
-        const uint codes = *reinterpret_cast<device const uint *>(w.base + at + g * 16u * w.layout.tile);
-        return uint2(uint(pairs[codes & 0xffu]) | (uint(pairs[(codes >> 8) & 0xffu]) << 16),
-            uint(pairs[(codes >> 16) & 0xffu]) | (uint(pairs[codes >> 24]) << 16));
-    }
+    static words load(thread const Weights<W> &w, place at, uint g) { return L::template load<false>(w, at, g); }
     static half2 step(words codes, uint s) { return packing_byte_step(codes, s); }
     template <uint RESIDUE>
     static uint2 planes(words codes, uint x) { return packing_byte_planes<RESIDUE>(codes, x); }
@@ -429,10 +370,11 @@ struct packing_codes_of {
 template <typename P, typename C, typename K, typename F>
 struct packing_codes_of<packets::Packet<P, C, K, F>, true> {
     typedef packets::Packet<P, C, K, F> W;
-    typedef packing_layout<P, C, K::groups> layout;
-    static_assert(layout::implemented, "an admitted weight's codes have a packing layout");
     static constant constexpr uint centre = F::pack_centre, folds = K::groups, residue = F::pack_residue;
-    static_assert(layout::bytes == (residue != 0), "the codes with residue bits are the layouts of bytes");
+    typedef lane_codes<P, C, int(F::pack_offset)> lanes;
+    static_assert(lanes::zero() == int(F::pack_offset), "an admitted weight's codes enter at their offset");
+    typedef packing_layout<lanes, K::groups, (F::pack_residue != 0)> layout;
+    static_assert(layout::implemented(), "an admitted weight's codes have a packing layout");
     typedef packing_factors<K, centre, F::pack_offset> factors;
     static_assert(factors::implemented, "an admitted weight's coefficients have packing factors");
     static constant constexpr bool available = packing_forms;

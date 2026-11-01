@@ -1464,7 +1464,9 @@ pub(crate) fn packet_forms(conversion: &RepresentationConversion, source_bytes: 
             match recipe {
                 PlaneRepackRecipe::BitRoutes(routes) => {
                     for (destination_bit, source_bit) in routes.iter().enumerate() {
-                        let bit = read_bits(source_packet, *source_bit as usize, 1);
+                        let bit = source_bit.map_or(0, |source_bit| {
+                            read_bits(source_packet, source_bit as usize, 1)
+                        });
                         write_bits(plane_bytes, destination_bit, 1, bit);
                     }
                 }
@@ -1497,42 +1499,10 @@ fn eval_repack(expression: &RepackExpr, source: &[u8]) -> ReferenceScalar {
         RepackExpr::SourceBits { bit, width } => {
             ReferenceScalar::U32(read_bits(source, *bit as usize, u32::from(*width)))
         }
-        RepackExpr::ShiftLeft { value, bits } => scalar::binary(
-            BinaryOp::Shl,
-            eval_repack(value, source),
-            ReferenceScalar::U32(u32::from(*bits)),
-            None,
-        )
-        .unwrap(),
-        RepackExpr::BitOr(left, right) => scalar::binary(
-            BinaryOp::BitOr,
-            eval_repack(left, source),
-            eval_repack(right, source),
-            None,
-        )
-        .unwrap(),
-        RepackExpr::OffsetI32 { value, offset } => scalar::binary(
-            BinaryOp::Add,
-            scalar::cast(DType::I32, eval_repack(value, source)),
-            ReferenceScalar::I32(*offset),
-            None,
-        )
-        .unwrap(),
         RepackExpr::F16ToF32(value) => scalar::cast(
             DType::F32,
             ReferenceScalar::F16(eval_repack(value, source).bits() as u16),
         ),
-        RepackExpr::I32ToF32(value) => scalar::cast(
-            DType::F32,
-            scalar::cast(DType::I32, eval_repack(value, source)),
-        ),
-        RepackExpr::MultiplyF32(left, right) => scalar::binary(
-            BinaryOp::Mul,
-            eval_repack(left, source),
-            eval_repack(right, source),
-            Some(DType::F32),
-        )
-        .unwrap(),
         RepackExpr::ScaleF32 { value, exponent } => scalar::binary(
             BinaryOp::Mul,
             eval_repack(value, source),
@@ -1543,12 +1513,6 @@ fn eval_repack(expression: &RepackExpr, source: &[u8]) -> ReferenceScalar {
         RepackExpr::Lookup { index, table } => {
             let index = scalar::cast(DType::I32, eval_repack(index, source)).bits();
             ReferenceScalar::I32(table.values()[index as usize])
-        }
-        RepackExpr::NegateIf { value, sign } => {
-            // An I32's bits are its low 32.
-            let value = scalar::cast(DType::I32, eval_repack(value, source)).bits() as u32;
-            let sign = scalar::cast(DType::I32, eval_repack(sign, source)).bits() as u32;
-            ReferenceScalar::I32(crate::repack::negate_if(value, sign) as i32)
         }
     }
 }

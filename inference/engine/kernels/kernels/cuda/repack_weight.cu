@@ -13,13 +13,15 @@
 // words' loaded apart, by SEISMIC_CONVERSION_E_U_FIXED_LOAD); the rest of
 // this kernel places records in U's layout.
 //
-// Each block, one warp, places one row tile: 16 rows x 32 columns, a lane
-// per row (the other 16 lanes help stage and store), so the warp runs one
-// stream of record words (only their data differ). Every group is a
-// multiple of 32 columns, so a tile is one unit of the code planes
-// (`WordSpan`): its words are its class's representative's, their runs moved
-// by the unit's displacements. The tile at a group's first column also
-// places the group's other record words. Stored-but-unoccupied bytes (mma16
+// Each block, one warp, places one row tile: 16 rows x one unit of the code
+// planes' columns (`WordSpan`, SEISMIC_CONVERSION_E_U_UNIT_COLUMNS: 32, or a
+// multiple where the code planes' words need more), a lane per row (the
+// other 16 lanes help stage and store), so the warp runs one stream of
+// record words (only their data differ). Every group is a multiple of the
+// unit's columns: a tile's words are its class's representative's, their
+// runs moved by the unit's displacements. The grid covers the stored columns'
+// tiles (`unit_columns(U)` a tile); blocks past them return. The tile at a
+// group's first column also places the group's other record words. Stored-but-unoccupied bytes (mma16
 // padding rows and groups, plane alignment tails, packet gaps) are written
 // as zero, so the result is fully defined.
 
@@ -46,7 +48,7 @@ typedef unsigned long long u64;
 // staged units to them (`SEISMIC_CONVERSION_E_U_TILE_ROWS`, `_LANES`).
 #define TILE_ROWS ((u32)SEISMIC_CONVERSION_E_U_TILE_ROWS)
 #define LANES ((u32)SEISMIC_CONVERSION_E_U_LANES)
-#define TILE_COLUMNS 32u
+#define TILE_COLUMNS ((u32)SEISMIC_CONVERSION_E_U_UNIT_COLUMNS)
 #define UNITS (GROUP / TILE_COLUMNS)
 static_assert(GROUP % TILE_COLUMNS == 0, "a tile lies in one group");
 
@@ -411,8 +413,59 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
 
 // ---- rows16 / mma16 planes --------------------------------------------------
 
+// mma16 code planes in fragment order: neither grid entries nor base-3
+// digits (placed by fragment lane, `packets::DigitPlanes`).
+#if defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16) && !defined(SEISMIC_ELEMENT_U_PLANE_GRIDS) && \
+    !defined(SEISMIC_ELEMENT_U_PLANE_DIGITS)
+#define FRAGMENTS 1
+#endif
+
+#if defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16) && defined(SEISMIC_ELEMENT_U_PLANE_DIGITS)
+#include <seismic/packets.cuh>
+// An mma16 tile's base-3 digits (`PackedRowLayout::digit_byte`): the reader's
+// planes, whose sources of a lane the repack composes from the tile's staged
+// rows and stores where the reader loads them.
+typedef packets::DigitPlanes<ELEMENT_CAT(SEISMIC_ELEMENT_U, _CODES_DIGIT_RUNS),
+                             ELEMENT_CAT(SEISMIC_ELEMENT_U, _CODES_DIGIT_RUN_BYTES),
+                             ELEMENT_CAT(SEISMIC_ELEMENT_U, _CODES_DIGIT_RUN_DIGITS),
+                             ELEMENT_CAT(SEISMIC_ELEMENT_U, _CODES_DIGIT_BITS)>
+    Digits;
+static_assert(TILE_COLUMNS == GROUP && HIGH_WORDS == 0 && 4 * CODES_WORDS == Digits::group_bytes(),
+              "a digits unit is its group's share, one plane");
+// The plane's geometry as the reader takes it (`packets::Rows`).
+struct DigitRows {
+    const u8 *base;
+    u64 stride;
+    packets::CodePlane low;
+};
+
+// Lane `lane`'s sources S.. of rows g, g + 8 (g = lane / 4) of the mma16
+// tile whose rows' shares are staged at `staged` (UNIT_WORDS words a row)
+// into the block of group `group`.
+template <u32 S>
+__device__ __forceinline__ void place_digit_sources(const DigitRows &rows, u64 tile, u64 group, const u32 *staged,
+                                                    u32 lane) {
+    if constexpr (S < Digits::sources()) {
+        u32 word[2];
+#pragma unroll
+        for (u32 r = 0; r < 2; ++r) {
+            const u32 *row = staged + (lane / 4 + 8 * r) * UNIT_WORDS;
+            word[r] = Digits::source_word<S>([row](u32 byte) { return (row[byte / 4] >> (8 * (byte % 4))) & 0xFFFFu; },
+                                             lane % 4);
+        }
+        u8 *at = const_cast<u8 *>(Digits::block_byte(rows, tile, group, Digits::lane_byte<S>(lane)));
+        if constexpr (Digits::segmented(Digits::source_run(S)))
+            *reinterpret_cast<uint2 *>(at) = make_uint2(word[0], word[1]);
+        else
+            *reinterpret_cast<u32 *>(at) = word[0] | (word[1] << 16);
+        place_digit_sources<S + 1>(rows, tile, group, staged, lane);
+    }
+}
+#endif
+
 #if defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16)
-#if !defined(SEISMIC_ELEMENT_U_PLANE_GRIDS)
+#if defined(FRAGMENTS)
+static_assert(TILE_COLUMNS == 32, "fragment units of 32 columns");
 static_assert(32 % CODES_WORDS == 0 && (HIGH_WORDS == 0 || 32 % HIGH_WORDS == 0), "a code lies in one staged word");
 #endif
 
@@ -463,8 +516,8 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
     u8 *destination = reinterpret_cast<u8 *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
     __shared__ u32 stage[TILE_ROWS * STAGE_WORDS];
     const u32 lane = threadIdx.x;
-#if defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16) && !defined(SEISMIC_ELEMENT_U_PLANE_GRIDS)
-    // The code roles' words of the warp's rows (mma16 fragments).
+#if defined(FRAGMENTS) || (defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16) && defined(SEISMIC_ELEMENT_U_PLANE_DIGITS))
+    // The code roles' words of the warp's rows (mma16 fragments, digits).
     __shared__ u32 staged[TILE_ROWS * UNIT_WORDS];
 #endif
     const u64 b = blockIdx.z;
@@ -490,6 +543,7 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
     // Grid entries stay whole: an mma16 tile's sequence is
     // [k-block][row][k-block bytes]; row `r`'s 32 columns (steps `step0`,
     // `step0 + 1`) are half of its k-block bytes.
+#if SEISMIC_CONVERSION_E_U_UNIT_COLUMNS == 32
     if (lane < rows) {
         const u32 r = lane % MMA_ROWS;
         const u32 block = column0 / 64, step0 = (column0 % 64) / 16;
@@ -498,7 +552,46 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
                               SEISMIC_RESULT_0_ROW_CODES_BYTES, SEISMIC_RESULT_0_ROW_CODES),
               words, 4 * CODES_WORDS, ROLE_ALIGNMENT(CODES));
     }
-#elif defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16)
+#else
+    // A unit of whole k-blocks: per k-block the row's entry bytes, and its
+    // entries' high bits ([k-block][row][the row's high bytes], placed as
+    // the entries are) from the unit's high words, entry e at bit
+    // ENTRY_BITS e.
+    static_assert(TILE_COLUMNS % 64 == 0, "a unit of whole k-blocks");
+    if (lane < rows) {
+        constexpr u32 SPANS = TILE_COLUMNS / 64;
+        constexpr u32 KBLOCK = 4 * CODES_WORDS / SPANS;
+        const u32 r = lane % MMA_ROWS;
+#pragma unroll
+        for (u32 span = 0; span < SPANS; ++span) {
+            const u64 block = column0 / 64 + span;
+            store(tile_plane_byte(destination, seismic_words_value, b, row0 + lane - r,
+                                  (block * MMA_ROWS + r) * KBLOCK, SEISMIC_RESULT_0_ROW_CODES_BYTES,
+                                  SEISMIC_RESULT_0_ROW_CODES),
+                  words + span * KBLOCK / 4, KBLOCK, KBLOCK < 16 ? KBLOCK : 16);
+#if defined(SEISMIC_ELEMENT_U_PLANE_GRID_HIGH)
+            constexpr u32 HIGH = SEISMIC_ELEMENT_U_PLANE_GRID_HIGH_ENTRY_BITS; // bytes a row's k-block
+            static_assert(4 * HIGH_WORDS == SPANS * HIGH && (HIGH == 2 || HIGH == 4), "a k-block's high bits");
+            const u32 high = words[CODES_WORDS + span * HIGH / 4] >> (8 * (span * HIGH % 4));
+            store(tile_plane_byte(destination, seismic_words_value, b, row0 + lane - r, (block * MMA_ROWS + r) * HIGH,
+                                  SEISMIC_RESULT_0_ROW_HIGH_BYTES, SEISMIC_RESULT_0_ROW_HIGH),
+                  &high, HIGH, HIGH);
+#endif
+        }
+    }
+#endif
+#elif defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16) && defined(SEISMIC_ELEMENT_U_PLANE_DIGITS)
+    // The rows' shares staged, then each mma16 tile's lanes' sources placed.
+    if (lane < rows)
+        for (u32 word = 0; word < UNIT_WORDS; ++word) staged[lane * UNIT_WORDS + word] = words[word];
+    __syncwarp();
+    const DigitRows digit_rows{row_base(destination, seismic_words_value, b, 0),
+                               u64(SEISMIC_RESULT_0_STRIDE_1) * SEISMIC_RESULT_0_ROW_STRIDE_BYTES,
+                               {SEISMIC_RESULT_0_ROW_CODES, SEISMIC_RESULT_0_ROW_CODES_BYTES}};
+    for (u32 tile_row = 0; tile_row < rows; tile_row += MMA_ROWS)
+        place_digit_sources<0>(digit_rows, (row0 + tile_row) / MMA_ROWS, tile.packet,
+                               staged + tile_row * UNIT_WORDS, lane);
+#elif defined(FRAGMENTS)
     // The code roles' words of the warp's rows staged, then placed.
     if (lane < rows)
         for (u32 word = 0; word < UNIT_WORDS; ++word) staged[lane * UNIT_WORDS + word] = words[word];
@@ -508,7 +601,8 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
     place_fragments(tile, destination, rows, column0, staged, HIGH_WORDS, CODES_WORDS, SEISMIC_RESULT_0_ROW_HIGH,
                     SEISMIC_RESULT_0_ROW_HIGH_BYTES);
 #else
-    // The tile's 32 columns of a row are one unit of each code plane.
+    // The tile's columns of a row are one unit of each code plane (rows16,
+    // and an mma16 digits plane, whose groups' bytes are row-major).
     if (lane < rows) {
         store(row + SEISMIC_RESULT_0_ROW_CODES + column0 / TILE_COLUMNS * 4 * CODES_WORDS, words, 4 * CODES_WORDS,
               ROLE_ALIGNMENT(CODES));
@@ -530,9 +624,17 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
     }
 
     // Alignment tails of every plane, from its end to the next plane's start
-    // (or the row's end), at the row's last stored tile.
+    // (or the row's end), at the row's last stored tile. An mma16 digits
+    // plane's slots hold its tile's chunks (`Digits::slot_used`), the rest of
+    // each slot zero.
     if (column0 + TILE_COLUMNS == stored_columns && lane < rows) {
+#if defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16) && defined(SEISMIC_ELEMENT_U_PLANE_DIGITS)
+        const u64 used = Digits::slot_used(MMA_ROWS * SEISMIC_RESULT_0_ROW_CODES_BYTES / Digits::chunk(), lane % MMA_ROWS);
+        zero_bytes(row + SEISMIC_RESULT_0_ROW_CODES + used,
+                   SEISMIC_RESULT_0_ROW_CODES_BYTES + SEISMIC_RESULT_0_ROW_CODES_TAIL - used);
+#else
         zero_bytes(row + SEISMIC_RESULT_0_ROW_CODES + SEISMIC_RESULT_0_ROW_CODES_BYTES, SEISMIC_RESULT_0_ROW_CODES_TAIL);
+#endif
         zero_bytes(row + SEISMIC_RESULT_0_ROW_HIGH + SEISMIC_RESULT_0_ROW_HIGH_BYTES, SEISMIC_RESULT_0_ROW_HIGH_TAIL);
         zero_bytes(row + SEISMIC_RESULT_0_ROW_SCALES + SEISMIC_RESULT_0_ROW_SCALES_BYTES,
                    SEISMIC_RESULT_0_ROW_SCALES_TAIL);

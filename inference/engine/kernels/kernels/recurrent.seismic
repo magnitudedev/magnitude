@@ -249,7 +249,7 @@ native gated_delta_project for vulkan from "vulkan/gated_delta_project.comp":
 native gated_delta_project for cpu from "cpu/gated_delta_project.rs":
     params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     where (INT8 == 0 or form(QW, INT8) == 1 or form(GW, INT8) == 1)
-    scratch quantized bytes (M * ceil_div(H, 256) * 292)
+    scratch quantized bytes (M * ceil_div(H, Q8_VALUES) * Q8_BYTES)
     scratch normalized bytes (M * H * 4)
     launch gated_delta_project_normalize:
         threadgroups (M, 1, 1)
@@ -584,6 +584,7 @@ fn gated_delta_project_convolved[M, B, S, H, PT, NM, NK, NV, W, C, T](hidden: &t
 native gated_delta_project_convolved for metal from "metal/gated_delta_project_convolved.metal":
     static (H, PT, NM, NK, NV, W, C)
     params (arithmetic BATCH_FROM in [5, 3, 9])
+    where MATRIX == 0 or (H % 256 == 0 and (form(QW, MATRIX) == 1 or form(GW, MATRIX) == 1 or form(AW, MATRIX) == 1 or form(BW, MATRIX) == 1))
     scratch normalized bytes (M * H * 2) when M >= BATCH_FROM and M <= 16
     launch gated_delta_project_convolved_normalize when M >= BATCH_FROM and M <= 16:
         threadgroups (M, 1, 1)
@@ -596,7 +597,7 @@ native gated_delta_project_convolved for metal from "metal/gated_delta_project_c
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
     launch gated_delta_project_convolved_batch when M >= BATCH_FROM and M <= 16:
-        params (BATCH_SIMDGROUPS in [8, 4, 16, 32], code BATCH_ROWS in [2, 1, 4], code arithmetic BATCH_PARTS in [2, 4, 1])
+        params (BATCH_SIMDGROUPS in [8, 4, 16, 32], code BATCH_ROWS in [2, 1, 4], code arithmetic BATCH_PARTS in [2, 4, 1], code arithmetic form MATRIX in [1, 0])
         threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 8) * BATCH_PARTS, BATCH_SIMDGROUPS)
             + ceil_div(ceil_div(NV * W, 8) * BATCH_PARTS, BATCH_SIMDGROUPS) + 2 * ceil_div(ceil_div(NV, 8) * BATCH_PARTS, BATCH_SIMDGROUPS), 1, 1)
         threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)

@@ -419,9 +419,29 @@ fn decode(
             } => ReferenceScalar::I32(
                 interpretation.decode(temporaries[recipe.ordinal(*raw)].bits() as u32, *bits),
             ),
-            DecodeStep::ReadPlaneLane { plane, .. } => ReferenceScalar::U32(
-                (local % u64::from(recipe.planes()[*plane as usize].group)) as u32,
-            ),
+            DecodeStep::SignedCode { code, raw, bit, .. } => crate::reference_math::evaluate(
+                &crate::reference_math::signed_code_recipe(*bit),
+                &[
+                    temporaries[recipe.ordinal(*code)],
+                    temporaries[recipe.ordinal(*raw)],
+                ],
+            )
+            .expect("a signed code is total"),
+            DecodeStep::ReadPlaneLane { plane, .. } => {
+                ReferenceScalar::U32(recipe.planes()[*plane as usize].lane(local))
+            }
+            DecodeStep::InterpretDigitCode {
+                raw,
+                digit,
+                interpretation,
+                ..
+            } => ReferenceScalar::I32(interpretation.decode(
+                registry::DigitCodes::digit(
+                    temporaries[recipe.ordinal(*raw)].bits() as u32,
+                    temporaries[recipe.ordinal(*digit)].bits() as u32,
+                ),
+                registry::DIGIT_BITS,
+            )),
             DecodeStep::InterpretGridCode {
                 raw, lane, grid, ..
             } => ReferenceScalar::I32(grid.code(
@@ -517,7 +537,11 @@ impl PlaneStorage<'_> {
     ) -> ReferenceScalar {
         let schema = &self.packet().planes[plane];
         let (first, width) = match &schema.encoding {
-            PlaneEncoding::Packed { .. } | PlaneEncoding::FloatCode { .. } => {
+            PlaneEncoding::Packed { .. }
+            | PlaneEncoding::Grid(_)
+            | PlaneEncoding::SignedLocal { .. }
+            | PlaneEncoding::Digits { .. }
+            | PlaneEncoding::FloatCode { .. } => {
                 (entry as u32 * schema.entry_bits, schema.entry_bits)
             }
             PlaneEncoding::Dense(dtype) => (entry as u32 * dtype.bytes() * 8, dtype.bytes() * 8),
@@ -545,9 +569,11 @@ impl PlaneStorage<'_> {
             }
         };
         match &schema.encoding {
-            PlaneEncoding::Packed { .. } | PlaneEncoding::FloatCode { .. } => {
-                ReferenceScalar::U32(raw)
-            }
+            PlaneEncoding::Packed { .. }
+            | PlaneEncoding::Grid(_)
+            | PlaneEncoding::SignedLocal { .. }
+            | PlaneEncoding::Digits { .. }
+            | PlaneEncoding::FloatCode { .. } => ReferenceScalar::U32(raw),
             PlaneEncoding::Dense(dtype) => {
                 read_dense(*dtype, &raw.to_le_bytes()[..dtype.bytes() as usize])
             }

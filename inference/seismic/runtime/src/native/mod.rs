@@ -141,10 +141,11 @@ pub(crate) struct CallLaunches {
 
 /// Alignment of the base of every buffer the route places: standalone
 /// scratch, and every graph result, local, host-written input, export and
-/// scratch buffer. Device allocations are at least this aligned, so kernels
-/// may rely on it for vector access to any placed buffer, as they do for a
-/// standalone call's.
-pub(crate) const BUFFER_ALIGNMENT: u64 = 256;
+/// scratch buffer, on every device the launch contract's
+/// (`seismic_native_cpu::tensor::BUFFER_ALIGNMENT`). Device allocations are
+/// at least this aligned, so kernels may rely on it for vector access to any
+/// placed buffer, as they do for a standalone call's.
+pub(crate) const BUFFER_ALIGNMENT: u64 = seismic_native_cpu::tensor::BUFFER_ALIGNMENT as u64;
 
 /// Per-device state of native submission.
 #[derive(Default)]
@@ -604,10 +605,11 @@ pub(crate) fn offered(
         .map(|implementation| device_defaults(device, on_device(device, implementation), bindings))
 }
 
-/// Check a cached choice against the implementation as it exists on this
-/// device at `bindings` ([`offered`]). CPU worker and ISA parameters are
-/// Seismic-owned additions to the checked declaration, so validating the
-/// bare declaration rejects a valid CPU tuning result.
+/// Check a choice against the implementation as it exists on this device
+/// at `bindings` ([`offered`]), as preparation takes it
+/// ([`NativeImplementation::prepared`]): CPU worker and ISA parameters are
+/// Seismic-owned additions to the checked declaration, which a cached
+/// choice carries and a caller's may leave at their defaults.
 pub fn specialization_valid(
     device: &Arc<DeviceInner>,
     module: &CheckedModule,
@@ -616,7 +618,7 @@ pub fn specialization_valid(
     specialization: &NativeSpecialization,
 ) -> bool {
     offered(device, module, entry, bindings)
-        .is_some_and(|implementation| implementation.validate(specialization).is_ok())
+        .is_some_and(|implementation| implementation.prepared(specialization.clone()).is_ok())
 }
 
 /// The default specialization of `entry` at `bindings` and `statics` as
@@ -1406,9 +1408,8 @@ impl NativePrepared {
                 backend.as_str()
             )));
         }
-        let specialization = implementation.with_owned_defaults(specialization);
-        implementation
-            .validate(&specialization)
+        let specialization = implementation
+            .prepared(specialization)
             .map_err(|error| preparation(format!("`{name}`: {error}")))?;
         // A range holds a call-time dimension of the entry; the declaration
         // alone does not know them.

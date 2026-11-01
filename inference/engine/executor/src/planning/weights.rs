@@ -2122,9 +2122,7 @@ pub fn resident_layout(path: ExecutionPath, backend: BackendName) -> Layout {
 
 /// The external storage of an artifact encoding whose rows hold `width`
 /// values (the stored last axis): its dense element, or the registry's
-/// source of such rows (`None` when the registry has none). IQ4_NL rows
-/// whose width is a multiple of 256 read eight-block packets (into iq4g32),
-/// others single blocks (into iq4g32s).
+/// source of such rows (`None` when the registry has none).
 pub fn source_element(encoding: Encoding, width: u64) -> Option<Element> {
     match encoding {
         Encoding::F32 => Some(Element::dense(DType::F32)),
@@ -2317,15 +2315,15 @@ mod representation_byte_tests {
         }
     }
 
-    /// IQ4_NL rows whose width is a multiple of 256 read eight-block packets
-    /// into iq4g32; other widths (a 640-wide expert down) read single blocks
-    /// into iq4g32s, whose bytes are the stored blocks'.
+    /// IQ4_NL rows of every width (a 2560-wide projection, a 640-wide
+    /// expert down, a 160-wide table) read single blocks into iq4g32s, whose
+    /// bytes are the stored blocks'.
     #[test]
-    fn iq4_nl_forms_follow_the_row_width() {
+    fn iq4_nl_reads_iq4g32s_at_every_row_width() {
         for (width, source, representation) in [
-            (2560, "gguf_iq4_nl", "iq4g32"),
-            (640, "gguf_iq4_nl_block", "iq4g32s"),
-            (160, "gguf_iq4_nl_block", "iq4g32s"),
+            (2560, "gguf_iq4_nl", "iq4g32s"),
+            (640, "gguf_iq4_nl", "iq4g32s"),
+            (160, "gguf_iq4_nl", "iq4g32s"),
         ] {
             let stored = source_element(Encoding::Iq4Nl, width).unwrap();
             assert_eq!(stored.name(), source);

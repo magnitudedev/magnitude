@@ -27,8 +27,9 @@ use seismic_ir::physical_target::KernelEmissionLayout;
 use seismic_ir::storage::LaunchLocalKind;
 use seismic_lang::intrinsics::{AtomicOp, MathOp, ReduceOp};
 use seismic_lang::registry::{
-    CodeInterpretation, DecodeStep, FloatCodeFormat, GridCodes, LookupTable, PlaneEncoding,
-    PlaneRepackRecipe, RepackExpr, RepresentationKind, GRID_SIGN_BITS,
+    CodeInterpretation, DecodeStep, DigitCodes, FloatCodeFormat, GridCodes, GridSigns, LookupTable,
+    PlaneEncoding, PlaneRepackRecipe, RepackExpr, RepresentationKind, DIGITS_PER_BYTE, DIGIT_BITS,
+    DIGIT_RADIX,
 };
 use seismic_lang::types::DType;
 use std::collections::BTreeMap;
@@ -792,10 +793,45 @@ impl<'a> Renderer<'a> {
                             bits,
                             interpretation,
                             ..
-                        } => interpret_code(&temps[recipe.ordinal(*raw)], *bits, interpretation),
-                        DecodeStep::ReadPlaneLane { plane, .. } => {
-                            plane_lane(coords, layout.planes[*plane as usize].group)
+                        } => {
+                            // The low `bits` bits of a wider read.
+                            let read = &temps[recipe.ordinal(*raw)];
+                            let low = if *bits < recipe.read_bits(*raw) {
+                                format!("(uint({read}) & {}u)", u32::MAX >> (32 - bits))
+                            } else {
+                                read.clone()
+                            };
+                            interpret_code(&low, *bits, interpretation)
                         }
+                        DecodeStep::SignedCode { code, raw, bit, .. } => {
+                            let code = &temps[recipe.ordinal(*code)];
+                            format!(
+                                "(((uint({}) >> {bit}u) & 1u) != 0u ? -int({code}) : int({code}))",
+                                temps[recipe.ordinal(*raw)]
+                            )
+                        }
+                        DecodeStep::ReadPlaneLane { plane, .. } => {
+                            let schema = &layout.planes[*plane as usize];
+                            match &schema.encoding {
+                                PlaneEncoding::Digits { digits, .. } => {
+                                    digit_place(&plane_lane(coords, schema.group), digits).1
+                                }
+                                _ => plane_lane(coords, schema.group),
+                            }
+                        }
+                        DecodeStep::InterpretDigitCode {
+                            raw,
+                            digit,
+                            interpretation,
+                            ..
+                        } => interpret_code(
+                            &digit_code(
+                                &temps[recipe.ordinal(*raw)],
+                                &temps[recipe.ordinal(*digit)],
+                            ),
+                            DIGIT_BITS,
+                            interpretation,
+                        ),
                         DecodeStep::InterpretGridCode {
                             raw, lane, grid, ..
                         } => {
@@ -885,9 +921,21 @@ impl<'a> Renderer<'a> {
         let (pointer, packet) = self.closed_address(place, coords);
         let schema = &layout.planes[plane];
         let logical = coords.last().map(String::as_str).unwrap_or("0");
+        // A digits plane's group is one entry a byte, its value's byte the
+        // one its runs place it in (`PlaneSchema::entry`).
+        let within = match &schema.encoding {
+            PlaneEncoding::Digits { digits, .. } => {
+                assert_eq!(field, 0, "a digits plane has one field");
+                format!(
+                    "ulong({})",
+                    digit_place(&plane_lane(coords, schema.group), digits).0
+                )
+            }
+            _ => format!("{field}ul"),
+        };
         let entry = format!(
-            "((ulong({logical}) % {}ul) / {}ul * {}ul + {}ul)",
-            layout.group, schema.group, schema.fields, field
+            "((ulong({logical}) % {}ul) / {}ul * {}ul + {within})",
+            layout.group, schema.group, schema.fields
         );
         let base = format!("({pointer} + ({packet}) + {}ul)", schema.offset);
         match &schema.encoding {
@@ -896,9 +944,12 @@ impl<'a> Renderer<'a> {
                 dtype_name(*dtype),
                 dtype.bytes()
             ),
-            PlaneEncoding::Packed { bits, .. } => packed_field_expression(&base, &entry, *bits),
-            PlaneEncoding::FloatCode { format } => {
-                packed_field_expression(&base, &entry, format.bits())
+            PlaneEncoding::Packed { .. }
+            | PlaneEncoding::Grid(_)
+            | PlaneEncoding::SignedLocal { .. }
+            | PlaneEncoding::Digits { .. }
+            | PlaneEncoding::FloatCode { .. } => {
+                packed_field_expression(&base, &entry, schema.entry_bits)
             }
         }
     }
@@ -1418,6 +1469,9 @@ impl<'a> Renderer<'a> {
                         let terms = bits
                             .iter()
                             .enumerate()
+                            .filter_map(|(destination_bit, source_bit)| {
+                                source_bit.map(|source_bit| (destination_bit, source_bit))
+                            })
                             .map(|(destination_bit, source_bit)| {
                                 format!(
                                     "((uint({source_base}[{}ul]) >> {}u) & 1u) << {}u",
@@ -1742,31 +1796,9 @@ fn repack_expression(expression: &RepackExpr, source: &str, lookups: &mut Lookup
                 terms.join(" | ")
             }
         }
-        RepackExpr::ShiftLeft { value, bits } => format!(
-            "(uint({}) << {}u)",
-            repack_expression(value, source, lookups),
-            bits
-        ),
-        RepackExpr::BitOr(left, right) => format!(
-            "(uint({}) | uint({}))",
-            repack_expression(left, source, lookups),
-            repack_expression(right, source, lookups)
-        ),
-        RepackExpr::OffsetI32 { value, offset } => format!(
-            "(int({}) + int({offset}))",
-            repack_expression(value, source, lookups)
-        ),
         RepackExpr::F16ToF32(value) => format!(
             "float(as_type<half>(ushort({})))",
             repack_expression(value, source, lookups)
-        ),
-        RepackExpr::I32ToF32(value) => {
-            format!("float(int({}))", repack_expression(value, source, lookups))
-        }
-        RepackExpr::MultiplyF32(left, right) => format!(
-            "f32_mul(float({}), float({}))",
-            repack_expression(left, source, lookups),
-            repack_expression(right, source, lookups)
         ),
         RepackExpr::ScaleF32 { value, exponent } => format!(
             "f32_mul(float({}), as_type<float>({:#010x}u))",
@@ -1778,14 +1810,6 @@ fn repack_expression(expression: &RepackExpr, source: &str, lookups: &mut Lookup
             format!(
                 "{}[uint({index})]",
                 lookups.name(LookupTable::Repack(*table))
-            )
-        }
-        RepackExpr::NegateIf { value, sign } => {
-            // `(value ^ -sign) + sign`: `-value` where `sign` is 1.
-            let sign = repack_expression(sign, source, lookups);
-            format!(
-                "int((uint({}) ^ (0u - uint({sign}))) + uint({sign}))",
-                repack_expression(value, source, lookups)
             )
         }
     }
@@ -1823,7 +1847,9 @@ fn interpret_code(raw: &str, bits: u32, interpretation: &CodeInterpretation) -> 
             format!("(int(uint({raw}) << {shift}u) >> {shift}u)")
         }
         CodeInterpretation::Offset(offset) => format!("(int({raw}) - {offset})"),
-        CodeInterpretation::Odd => format!("int(2u * uint({raw}) + 1u)"),
+        CodeInterpretation::Odd(offset) => {
+            format!("int(2u * uint({raw}) + {}u)", (1 - 2 * *offset) as u32)
+        }
         CodeInterpretation::Table(codebook) => {
             let table = codebook.values;
             let mut expression = table[0].to_string();
@@ -1831,9 +1857,6 @@ fn interpret_code(raw: &str, bits: u32, interpretation: &CodeInterpretation) -> 
                 expression = format!("(uint({raw}) == {index}u ? {value} : {expression})");
             }
             expression
-        }
-        CodeInterpretation::Grid(_) => {
-            unreachable!("a vector code is a grid code step, which reads its lane")
         }
     }
 }
@@ -1846,8 +1869,41 @@ fn plane_lane(coords: &[String], group: u32) -> String {
     format!("uint(ulong({column}) % {group}ul)")
 }
 
+/// The byte and the digit of the value at `within` (< its values) of a
+/// group of base-3 digit runs `digits` (`DigitCodes::place`), as U32
+/// expressions.
+fn digit_place(within: &str, digits: &DigitCodes) -> (String, String) {
+    let (mut byte, mut digit) = ("0u".to_owned(), "0u".to_owned());
+    let (mut first, mut start) = (digits.values(), digits.bytes());
+    for run in digits.runs.iter().rev() {
+        first -= run.bytes() * run.digits();
+        start -= run.bytes();
+        let offset = format!("(({within}) - {first}u)");
+        byte = format!(
+            "(({within}) >= {first}u ? {start}u + {offset} % {}u : {byte})",
+            run.bytes()
+        );
+        digit = format!(
+            "(({within}) >= {first}u ? {offset} / {}u : {digit})",
+            run.bytes()
+        );
+    }
+    (byte, digit)
+}
+
+/// Digit `digit` of byte `raw` (`DigitCodes::digit`): `(((raw 3^digit) mod
+/// 256) 3) >> 8`, `3^digit` from the powers below 256 as bytes of one word.
+fn digit_code(raw: &str, digit: &str) -> String {
+    let powers = (0..DIGITS_PER_BYTE).fold(0u64, |powers, n| {
+        powers | u64::from(DIGIT_RADIX.pow(n)) << (8 * n)
+    });
+    format!(
+        "(((((uint({raw}) & 0xffu) * (uint({powers:#x}ul >> (8u * uint({digit}))) & 0xffu)) & 0xffu) * {DIGIT_RADIX}u) >> 8)"
+    )
+}
+
 /// The code of the value at `lane` of vector-code entry `raw`
-/// (`GridCodes::code`), reading the grid's magnitudes from `table`.
+/// (`GridCodes::code`), reading the grid's point values from `table`.
 fn grid_code(raw: &str, lane: &str, grid: &GridCodes, table: &str) -> String {
     let lanes = grid.lanes();
     let index = format!(
@@ -1860,13 +1916,33 @@ fn grid_code(raw: &str, lane: &str, grid: &GridCodes, table: &str) -> String {
         "{table}[({index}) * {lanes}u + (({lane}) & {}u)]",
         lanes - 1
     );
-    let signs = format!(
-        "((uint({raw}) >> {}u) & {}u)",
-        grid.indices() * grid.index_bits(),
-        (1u32 << GRID_SIGN_BITS) - 1
-    );
-    let signs = format!("({signs} | ((popcount({signs}) & 1u) << {GRID_SIGN_BITS}u))");
-    format!("(((({signs}) >> ({lane})) & 1u) != 0u ? -int({magnitude}) : int({magnitude}))")
+    let value = match grid.signs {
+        GridSigns::None => format!("int({magnitude})"),
+        signs @ (GridSigns::ParityPlus7 | GridSigns::Explicit8) => {
+            let bits = signs.bits();
+            let explicit = format!(
+                "((uint({raw}) >> {}u) & {}u)",
+                grid.sign_bit(),
+                (1u32 << bits) - 1
+            );
+            // Seven completed by an eighth of even parity, or eight.
+            let signs = if signs == GridSigns::ParityPlus7 {
+                format!("({explicit} | ((popcount({explicit}) & 1u) << {bits}u))")
+            } else {
+                explicit
+            };
+            format!("(((({signs}) >> ({lane})) & 1u) != 0u ? -int({magnitude}) : int({magnitude}))")
+        }
+    };
+    match grid.delta {
+        Some(exponent) => format!(
+            "((((uint({raw}) >> {}u) & 1u) != 0u) ? {value} * {} - 1 : {value} * {} + 1)",
+            grid.delta_bit(),
+            1 << exponent,
+            1 << exponent
+        ),
+        None => value,
+    }
 }
 
 fn float_code_function(format: FloatCodeFormat) -> &'static str {

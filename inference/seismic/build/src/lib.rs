@@ -868,7 +868,14 @@ mod internals {
                     native_macro(from),
                     native_macro(to)
                 );
-                for suffix in ["WORDS", "UNIT", "FIXED", "LEADING_ALIGNMENT", "TRAILING_ALIGNMENT"] {
+                for suffix in [
+                    "WORDS",
+                    "UNIT",
+                    "UNIT_COLUMNS",
+                    "FIXED",
+                    "LEADING_ALIGNMENT",
+                    "TRAILING_ALIGNMENT",
+                ] {
                     symbols.insert(format!("{prefix}_{suffix}"));
                 }
                 if dialect == SourceDialect::Cuda {
@@ -1053,6 +1060,7 @@ mod internals {
                             "CARRIED_BIT",
                             "ENTRY_BYTES",
                             "FACTORS_OFFSET",
+                            "ENTRY_BITS",
                         ] {
                             symbols.insert(format!("{plane_prefix}_{suffix}"));
                         }

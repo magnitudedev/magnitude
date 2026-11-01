@@ -954,10 +954,9 @@ pub(crate) fn capability_rows() -> Vec<CapabilityRow> {
         // into dense tiles, so every resident f32-decoded integer-code format
         // has the same semantic operation; block-float NVFP4 remains its
         // explicitly scaled CUDA family below.
-        for representation in crate::repr::REPRS
-            .iter()
-            .filter(|representation| representation.float_code.is_none())
-        {
+        for representation in crate::repr::REPRS.iter().filter(|representation| {
+            !matches!(representation.coding.codes(), crate::repr::CodeStorage::Float(_))
+        }) {
             out.push(CapabilityRow {
                 backend,
                 capability: "matrix",

@@ -620,6 +620,8 @@ enum RecipeKey {
     Code(crate::registry::CodeInterpretation, u32),
     FloatCode(crate::registry::FloatCodeFormat),
     GridCode(&'static crate::registry::GridCodes),
+    SignedCode(u32),
+    Digit,
 }
 fn cached_recipe(key: RecipeKey, build: impl FnOnce() -> ReferenceRecipe) -> Arc<ReferenceRecipe> {
     static RECIPES: OnceLock<Mutex<HashMap<RecipeKey, Arc<ReferenceRecipe>>>> = OnceLock::new();
@@ -650,45 +652,111 @@ pub fn code_recipe(
     interpretation: &crate::registry::CodeInterpretation,
     bits: u32,
 ) -> Arc<ReferenceRecipe> {
-    use crate::registry::CodeInterpretation;
     assert!((1..=32).contains(&bits), "code width is invalid");
     cached_recipe(RecipeKey::Code(interpretation.clone(), bits), || {
         let b = Recipe::default();
         let input = b.input(0, DType::U32);
-        let mask = u32::MAX >> (32 - bits);
-        let raw = b.word(WordOp::And, input, b.u(mask));
-        let word = match interpretation {
-            CodeInterpretation::Unsigned => raw,
-            CodeInterpretation::TwosComplement => {
-                let sign = b.u(1 << (bits - 1));
-                b.word(WordOp::Sub, b.word(WordOp::Xor, raw, sign), sign)
-            }
-            CodeInterpretation::Offset(offset) => b.word(WordOp::Sub, raw, b.u(*offset as u32)),
-            CodeInterpretation::Odd => {
-                b.word(WordOp::Add, b.word(WordOp::Shl, raw, b.u(1)), b.u(1))
-            }
-            CodeInterpretation::Table(codebook) => {
-                let table = codebook.values;
-                assert_eq!(
-                    table.len() as u64,
-                    1u64 << bits,
-                    "code table must cover its codes"
-                );
-                let mut value = b.u(i32::from(table[0]) as u32);
-                for (i, &entry) in table.iter().enumerate().skip(1) {
-                    value = b.select(
-                        b.word_cmp(CmpOp::Eq, raw, b.u(i as u32)),
-                        b.u(i32::from(entry) as u32),
-                        value,
-                    );
-                }
-                value
-            }
-            CodeInterpretation::Grid(_) => unreachable!(
-                "a vector code depends on its value's lane: `DecodeStep::InterpretGridCode`"
-            ),
-        };
+        let word = code_word(&b, interpretation, input, bits);
         let out = b.typed(word, DType::I32);
+        b.finish(out)
+    })
+}
+
+/// A signed bias's code (`DecodeStep::SignedCode`): code `code` (operand 0),
+/// negated where bit `bit` of `raw` (operand 1) is set.
+pub fn signed_code_recipe(bit: u32) -> Arc<ReferenceRecipe> {
+    assert!(bit < 32, "a sign bit of a word");
+    cached_recipe(RecipeKey::SignedCode(bit), || {
+        let b = Recipe::default();
+        let code = b.bits(b.input(0, DType::I32));
+        let raw = b.input(1, DType::U32);
+        let sign = b.word(WordOp::And, b.word(WordOp::Shr, raw, b.u(bit)), b.u(1));
+        let word = b.select(
+            b.word_cmp(CmpOp::Eq, sign, b.u(1)),
+            b.word(WordOp::Sub, b.u(0), code),
+            code,
+        );
+        let out = b.typed(word, DType::I32);
+        b.finish(out)
+    })
+}
+
+/// The word of `interpretation`'s value of the low `bits` bits of `input`.
+fn code_word(
+    b: &Recipe,
+    interpretation: &crate::registry::CodeInterpretation,
+    input: V,
+    bits: u32,
+) -> V {
+    use crate::registry::CodeInterpretation;
+    let mask = u32::MAX >> (32 - bits);
+    let raw = b.word(WordOp::And, input, b.u(mask));
+    match interpretation {
+        CodeInterpretation::Unsigned => raw,
+        CodeInterpretation::TwosComplement => {
+            let sign = b.u(1 << (bits - 1));
+            b.word(WordOp::Sub, b.word(WordOp::Xor, raw, sign), sign)
+        }
+        CodeInterpretation::Offset(offset) => b.word(WordOp::Sub, raw, b.u(*offset as u32)),
+        CodeInterpretation::Odd(offset) => b.word(
+            WordOp::Add,
+            b.word(WordOp::Shl, raw, b.u(1)),
+            b.u((1 - 2 * *offset) as u32),
+        ),
+        CodeInterpretation::Table(codebook) => {
+            let table = codebook.values;
+            assert_eq!(
+                table.len() as u64,
+                1u64 << bits,
+                "code table must cover its codes"
+            );
+            let mut value = b.u(i32::from(table[0]) as u32);
+            for (i, &entry) in table.iter().enumerate().skip(1) {
+                value = b.select(
+                    b.word_cmp(CmpOp::Eq, raw, b.u(i as u32)),
+                    b.u(i32::from(entry) as u32),
+                    value,
+                );
+            }
+            value
+        }
+    }
+}
+
+/// Digit `digit` (operand 1, below `DIGITS_PER_BYTE`) of byte `byte`
+/// (operand 0) of a digit code (`DigitCodes::digit`), in ordinary word
+/// operations: the byte's fraction times `DIGIT_RADIX^digit` modulo 256,
+/// times the radix, past its low byte.
+pub fn digit_recipe() -> Arc<ReferenceRecipe> {
+    use crate::registry::{DIGITS_PER_BYTE, DIGIT_BYTE_BITS, DIGIT_RADIX};
+    cached_recipe(RecipeKey::Digit, || {
+        let b = Recipe::default();
+        let byte = b.input(0, DType::U32);
+        let digit = b.input(1, DType::U32);
+        let mask = (1 << DIGIT_BYTE_BITS) - 1;
+        // `x DIGIT_RADIX` as the sum of `x` shifted to each set bit of the
+        // radix, highest first.
+        let times_radix = |x: V| {
+            (0..u32::BITS - DIGIT_RADIX.leading_zeros())
+                .rev()
+                .filter(|bit| DIGIT_RADIX >> bit & 1 == 1)
+                .map(|bit| {
+                    if bit == 0 {
+                        x
+                    } else {
+                        b.word(WordOp::Shl, x, b.u(bit))
+                    }
+                })
+                .reduce(|sum, term| b.word(WordOp::Add, sum, term))
+                .expect("the radix is positive")
+        };
+        let mut power = b.word(WordOp::And, byte, b.u(mask));
+        let mut fraction = power;
+        for n in 1..DIGITS_PER_BYTE {
+            power = b.word(WordOp::And, times_radix(power), b.u(mask));
+            fraction = b.select(b.word_cmp(CmpOp::Eq, digit, b.u(n)), power, fraction);
+        }
+        let out = b.word(WordOp::Shr, times_radix(fraction), b.u(DIGIT_BYTE_BITS));
         b.finish(out)
     })
 }
@@ -698,7 +766,7 @@ pub fn code_recipe(
 /// word operations: the grid is finite registry data, expanded into
 /// comparisons and selections before kernel closure like a code table.
 pub fn grid_code_recipe(grid: &'static crate::registry::GridCodes) -> Arc<ReferenceRecipe> {
-    use crate::registry::GRID_SIGN_BITS;
+    use crate::registry::GridSigns;
     cached_recipe(RecipeKey::GridCode(grid), || {
         let b = Recipe::default();
         let entry = b.input(0, DType::U32);
@@ -751,31 +819,64 @@ pub fn grid_code_recipe(grid: &'static crate::registry::GridCodes) -> Arc<Refere
             ),
             b.u(0xff),
         );
-        // Seven sign bits and their even-parity eighth.
+        let sign_bits = grid.signs.bits();
         let signs = b.word(
             WordOp::And,
-            b.word(WordOp::Shr, entry, b.u(grid.indices() * grid.index_bits())),
-            b.u((1 << GRID_SIGN_BITS) - 1),
+            b.word(WordOp::Shr, entry, b.u(grid.sign_bit())),
+            b.u((1 << sign_bits) - 1),
         );
-        let mut parity = signs;
-        for fold in [4, 2, 1] {
-            parity = b.word(WordOp::Xor, parity, b.word(WordOp::Shr, parity, b.u(fold)));
-        }
-        let signs = b.word(
-            WordOp::Or,
-            signs,
-            b.word(
-                WordOp::Shl,
-                b.word(WordOp::And, parity, b.u(1)),
-                b.u(GRID_SIGN_BITS),
+        let code = match grid.signs {
+            // Point bytes of two's complement values.
+            GridSigns::None => b.word(
+                WordOp::Sub,
+                b.word(WordOp::Xor, magnitude, b.u(0x80)),
+                b.u(0x80),
             ),
-        );
-        let negative = b.word(WordOp::And, b.word(WordOp::Shr, signs, lane), b.u(1));
-        let code = b.select(
-            b.word_cmp(CmpOp::Eq, negative, b.u(1)),
-            b.word(WordOp::Sub, b.u(0), magnitude),
-            magnitude,
-        );
+            GridSigns::ParityPlus7 | GridSigns::Explicit8 => {
+                // Seven sign bits and their even-parity eighth, or eight.
+                let signs = if grid.signs == GridSigns::ParityPlus7 {
+                    let mut parity = signs;
+                    for fold in [4, 2, 1] {
+                        parity =
+                            b.word(WordOp::Xor, parity, b.word(WordOp::Shr, parity, b.u(fold)));
+                    }
+                    b.word(
+                        WordOp::Or,
+                        signs,
+                        b.word(
+                            WordOp::Shl,
+                            b.word(WordOp::And, parity, b.u(1)),
+                            b.u(sign_bits),
+                        ),
+                    )
+                } else {
+                    signs
+                };
+                let negative = b.word(WordOp::And, b.word(WordOp::Shr, signs, lane), b.u(1));
+                b.select(
+                    b.word_cmp(CmpOp::Eq, negative, b.u(1)),
+                    b.word(WordOp::Sub, b.u(0), magnitude),
+                    magnitude,
+                )
+            }
+        };
+        // `2^e v ± 1`: minus where the delta bit is set.
+        let code = match grid.delta {
+            Some(exponent) => {
+                let delta = b.word(
+                    WordOp::And,
+                    b.word(WordOp::Shr, entry, b.u(grid.delta_bit())),
+                    b.u(1),
+                );
+                let scaled = b.word(WordOp::Shl, code, b.u(exponent));
+                b.select(
+                    b.word_cmp(CmpOp::Eq, delta, b.u(1)),
+                    b.word(WordOp::Sub, scaled, b.u(1)),
+                    b.word(WordOp::Add, scaled, b.u(1)),
+                )
+            }
+            None => code,
+        };
         let out = b.typed(code, DType::I32);
         b.finish(out)
     })

@@ -22,14 +22,89 @@
 //! free to differ by tier.
 
 use crate::element::{bf16_to_f32, f16_to_f32, Dense};
+use crate::isa::Isa;
 use crate::quant::{Q8Block, Q8_BLOCK};
 use crate::reduce::{combine, LANES};
 use magnitude_ggml::tables;
-use seismic_lang::registry::{Layout, RepresentationInfo, RepresentationKind, RowPlaneRole};
+use seismic_lang::registry::{
+    DigitCodes, GridSigns, Layout, LocalBias, MinimumSign, RepresentationInfo, RepresentationKind,
+    RowPlaneRole, DIGIT_BITS, DIGIT_BYTE_BITS, DIGIT_RADIX,
+};
 use std::marker::PhantomData;
 
 /// Values of one packet.
 pub const PACKET: usize = 32;
+
+/// The stack alignment every frame has (the x86-64 and AArch64 ABIs').
+const STACK_ALIGNMENT: usize = 16;
+
+/// A packet buffer the vector bodies store and reload whole, starting on a
+/// `VECTOR`-byte boundary (their tier's widest vector, `Tier::vector_bytes`):
+/// wherever a caller's frame puts it, no vector access straddles a cache
+/// line, which stalls store-to-load forwarding. Its `LENGTH` values
+/// (`VECTOR`'s room, a parameter of its own because stable array lengths
+/// take no expression of one) keep only the ABI's stack alignment, with
+/// room to start at the next vector boundary, so no frame is realigned
+/// (which would cost the body its frame-pointer register).
+#[derive(Clone, Copy)]
+#[repr(C, align(16))]
+pub struct PacketBuffer<const VECTOR: usize, const LENGTH: usize>([f32; LENGTH]);
+
+impl<const VECTOR: usize, const LENGTH: usize> PacketBuffer<VECTOR, LENGTH> {
+    const ZERO: Self = {
+        assert!(
+            std::mem::align_of::<Self>() == STACK_ALIGNMENT
+                && LENGTH == PACKET + (VECTOR - STACK_ALIGNMENT) / 4,
+            "a packet buffer holds a packet from its first vector boundary"
+        );
+        Self([0.0; LENGTH])
+    };
+
+    /// The packet, from the first vector boundary of the storage.
+    #[inline(always)]
+    fn packet(&mut self) -> &mut [f32; PACKET] {
+        let skip = if VECTOR == STACK_ALIGNMENT {
+            0
+        } else {
+            self.0.as_ptr().align_offset(VECTOR)
+        };
+        (&mut self.0[skip..skip + PACKET])
+            .try_into()
+            .expect("a packet")
+    }
+}
+
+/// A tier as the bodies take it: its token type (`isa::Isa`), whose
+/// quantized-dot mode and packet buffer they compile for.
+pub trait Vectors: Isa {
+    /// The tier's packet buffer.
+    type Buffer: Copy;
+    const ZERO: Self::Buffer;
+    /// The packet of `buffer`.
+    fn packet(buffer: &mut Self::Buffer) -> &mut [f32; PACKET];
+}
+
+macro_rules! vectors {
+    ($($token:ident),*) => {$(
+        impl Vectors for crate::isa::$token {
+            type Buffer = PacketBuffer<
+                { <crate::isa::$token as Isa>::TIER.vector_bytes() },
+                { PACKET + (<crate::isa::$token as Isa>::TIER.vector_bytes() - STACK_ALIGNMENT) / 4 },
+            >;
+            const ZERO: Self::Buffer = PacketBuffer::ZERO;
+
+            #[inline(always)]
+            fn packet(buffer: &mut Self::Buffer) -> &mut [f32; PACKET] {
+                buffer.packet()
+            }
+        }
+    )*};
+}
+
+#[cfg(target_arch = "x86_64")]
+vectors!(X86V2, X86V3, X86V4, X86V4Vnni);
+#[cfg(target_arch = "aarch64")]
+vectors!(Neon);
 
 /// Byte geometry of the rows of one weight operand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,12 +249,31 @@ impl Row {
 
 /// One weight element's component bodies.
 pub trait Format: Copy + Send + Sync + 'static {
-    /// The 32 values of packet `p` of `row`, on a tier of quantized-dot mode
-    /// `MODE`.
+    /// The 32 values of packet `p` of `row`, on tier `V`.
     ///
     /// # Safety
     /// `row` is a row of at least `32 * p + 1` values.
-    unsafe fn decode<const MODE: u8>(row: &Row, p: usize, k: usize, out: &mut [f32; PACKET]);
+    unsafe fn decode<V: Vectors>(row: &Row, p: usize, k: usize, out: &mut [f32; PACKET]);
+
+    /// `lanes` plus the products of whole packet `p` of `row` and `x`, value
+    /// `i` fused into lane `i % LANES` in index order ([`accumulate`]):
+    /// its decode into `packet`, then the products; an element whose values
+    /// widen in the tier's vectors feeds them to the products directly.
+    ///
+    /// # Safety
+    /// `row` is a row of at least `32 (p + 1)` values.
+    #[inline(always)]
+    unsafe fn dot_packet<V: Vectors>(
+        row: &Row,
+        p: usize,
+        k: usize,
+        lanes: &mut [f32; LANES],
+        x: &[f32; PACKET],
+        packet: &mut [f32; PACKET],
+    ) {
+        unsafe { Self::decode::<V>(row, p, k, packet) };
+        unsafe { accumulate::<V>(lanes, packet, x) };
+    }
 
     /// Values `256 b .. 256 b + 256` (below `k`) of each of the `R` rows
     /// `rows` dotted with each of the `M` quantized activation blocks `x`: per row and activation block, the
@@ -188,7 +282,7 @@ pub trait Format: Copy + Send + Sync + 'static {
     ///
     /// # Safety
     /// Each row is a row of `k` values, and `256 b < k`.
-    unsafe fn dot_q8<const R: usize, const M: usize, const MODE: u8>(
+    unsafe fn dot_q8<const R: usize, const M: usize, V: Vectors>(
         rows: &[Row; R],
         b: usize,
         k: usize,
@@ -215,14 +309,14 @@ pub struct DenseRows<E: Dense>(E);
 
 impl<E: Dense> Format for DenseRows<E> {
     #[inline(always)]
-    unsafe fn decode<const MODE: u8>(row: &Row, p: usize, k: usize, out: &mut [f32; PACKET]) {
+    unsafe fn decode<V: Vectors>(row: &Row, p: usize, k: usize, out: &mut [f32; PACKET]) {
         let first = p * PACKET;
         // A whole packet widens in the tier's vectors; a row's tail and a
         // tier without them widen value by value.
         if k - first >= PACKET {
             let values = unsafe { row.start.cast::<E::Storage>().add(first) };
             #[cfg(target_arch = "x86_64")]
-            if MODE >= 1 {
+            if V::QUANTIZED_DOTS >= 1 {
                 for chunk in 0..PACKET / 8 {
                     unsafe {
                         let widened = E::widen_x86(values.add(8 * chunk));
@@ -258,8 +352,61 @@ impl<E: Dense> Format for DenseRows<E> {
         }
     }
 
+    /// The packet's values widen in the tier's vectors straight into the
+    /// products, eight values a multiply-add as [`accumulate`] adds them,
+    /// never stored; only a tier without them decodes into `packet`.
     #[inline(always)]
-    unsafe fn dot_q8<const R: usize, const M: usize, const MODE: u8>(
+    #[cfg_attr(target_arch = "aarch64", allow(unused_variables))]
+    unsafe fn dot_packet<V: Vectors>(
+        row: &Row,
+        p: usize,
+        k: usize,
+        lanes: &mut [f32; LANES],
+        x: &[f32; PACKET],
+        packet: &mut [f32; PACKET],
+    ) {
+        const { assert!(LANES == 8 && PACKET % LANES == 0, "a lane vector of eight") };
+        let values = unsafe { row.start.cast::<E::Storage>().add(p * PACKET) };
+        #[cfg(target_arch = "x86_64")]
+        if V::QUANTIZED_DOTS >= 1 {
+            use std::arch::x86_64::*;
+            unsafe {
+                let mut sum = _mm256_loadu_ps(lanes.as_ptr());
+                for chunk in 0..PACKET / LANES {
+                    let at = LANES * chunk;
+                    sum = _mm256_fmadd_ps(
+                        E::widen_x86(values.add(at)),
+                        _mm256_loadu_ps(x.as_ptr().add(at)),
+                        sum,
+                    );
+                }
+                _mm256_storeu_ps(lanes.as_mut_ptr(), sum);
+            }
+            return;
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            use std::arch::aarch64::*;
+            let (mut low, mut high) = (vld1q_f32(lanes.as_ptr()), vld1q_f32(lanes.as_ptr().add(4)));
+            for chunk in 0..PACKET / LANES {
+                let at = LANES * chunk;
+                let [first, second] = E::widen_neon(values.add(at));
+                low = vfmaq_f32(low, first, vld1q_f32(x.as_ptr().add(at)));
+                high = vfmaq_f32(high, second, vld1q_f32(x.as_ptr().add(at + 4)));
+            }
+            vst1q_f32(lanes.as_mut_ptr(), low);
+            vst1q_f32(lanes.as_mut_ptr().add(4), high);
+            return;
+        }
+        #[allow(unreachable_code)]
+        {
+            unsafe { Self::decode::<V>(row, p, k, packet) };
+            unsafe { accumulate::<V>(lanes, packet, x) };
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn dot_q8<const R: usize, const M: usize, V: Vectors>(
         rows: &[Row; R],
         b: usize,
         k: usize,
@@ -275,14 +422,16 @@ impl<E: Dense> Format for DenseRows<E> {
             for (row, out) in rows.iter().zip(&mut out) {
                 let mut lanes = [[0.0f32; LANES]; M];
                 for local in 0..Q8_BLOCK / PACKET {
-                    let mut values = [0.0f32; PACKET];
-                    unsafe { Self::decode::<MODE>(row, b * (Q8_BLOCK / PACKET) + local, k, &mut values) };
+                    let mut values = V::ZERO;
+                    let values = V::packet(&mut values);
+                    unsafe { Self::decode::<V>(row, b * (Q8_BLOCK / PACKET) + local, k, values) };
                     for (lanes, x) in lanes.iter_mut().zip(x.iter()) {
-                        let mut codes = [0.0f32; PACKET];
+                        let mut codes = V::ZERO;
+                        let codes = V::packet(&mut codes);
                         for (code, x) in codes.iter_mut().zip(&x.codes[PACKET * local..]) {
                             *code = f32::from(*x);
                         }
-                        unsafe { accumulate::<MODE>(lanes, &values, &codes) };
+                        unsafe { accumulate::<V>(lanes, values, codes) };
                     }
                 }
                 for ((out, lanes), x) in out.iter_mut().zip(lanes).zip(x.iter()) {
@@ -414,9 +563,9 @@ pub mod codes {
     /// The code minus `C`.
     #[derive(Clone, Copy, Debug)]
     pub struct Offset<const C: i32>;
-    /// The odd value `2 c + 1`.
+    /// The odd value `2 (c - K) + 1`.
     #[derive(Clone, Copy, Debug)]
-    pub struct Odd;
+    pub struct Odd<const K: i32>;
     /// Value `c` of codebook `ID` (its position in `tables::CODEBOOKS`).
     #[derive(Clone, Copy, Debug)]
     pub struct Table<const ID: usize>;
@@ -449,10 +598,10 @@ impl<const C: i32> Interpretation for Offset<C> {
     }
 }
 
-impl Interpretation for Odd {
+impl<const K: i32> Interpretation for Odd<K> {
     #[inline(always)]
     fn value<const BITS: u32>(raw: u32) -> i32 {
-        2 * raw as i32 + 1
+        2 * (raw as i32 - K) + 1
     }
 }
 
@@ -489,6 +638,18 @@ pub trait Codes: Copy + Send + Sync + 'static {
     /// # Safety
     /// `at` is a packet of a row.
     unsafe fn values(at: At) -> [i8; PACKET];
+
+    /// [`Codes::values`] as tier `V` reads them for a float decode: codes
+    /// whose scalar reading leaves the vectorizer a choice read through the
+    /// tier's vectors instead, so every body inlining the decode compiles it
+    /// alike.
+    ///
+    /// # Safety
+    /// As [`Codes::values`].
+    #[inline(always)]
+    unsafe fn decoded<V: Vectors>(at: At) -> [i8; PACKET] {
+        unsafe { Self::values(at) }
+    }
 
     /// The values in registers, values `0..16` then `16..32`.
     ///
@@ -571,8 +732,8 @@ impl<const LOW: u32, const HIGH: u32, I, const LEAST: i32, const GREATEST: i32>
     unsafe fn raw(at: At) -> [u8; PACKET] {
         const {
             assert!(
-                matches!(LOW, 2 | 4) && HIGH <= 2,
-                "a 2- or 4-bit low plane and a high plane of at most 2 bits"
+                matches!(LOW, 1 | 2 | 4) && HIGH <= 2,
+                "a 1-, 2- or 4-bit low plane and a high plane of at most 2 bits"
             )
         };
         let mut bytes = [0u8; 16];
@@ -586,10 +747,16 @@ impl<const LOW: u32, const HIGH: u32, I, const LEAST: i32, const GREATEST: i32>
                 codes[2 * i] = byte & 15;
                 codes[2 * i + 1] = byte >> 4;
             }
-        } else {
+        } else if LOW == 2 {
             for (i, byte) in bytes[..8].iter().enumerate() {
                 for j in 0..4 {
                     codes[4 * i + j] = (byte >> (2 * j)) & 3;
+                }
+            }
+        } else {
+            for (i, byte) in bytes[..4].iter().enumerate() {
+                for j in 0..8 {
+                    codes[8 * i + j] = (byte >> j) & 1;
                 }
             }
         }
@@ -715,6 +882,55 @@ impl<const LOW: u32, const HIGH: u32, const C: i32, const LEAST: i32, const GREA
     }
 }
 
+impl<const LOW: u32, const HIGH: u32, const K: i32, const LEAST: i32, const GREATEST: i32> Codes
+    for Planes<LOW, HIGH, Odd<K>, LEAST, GREATEST>
+{
+    const LEAST: i32 = Self::DOMAIN.0;
+    const GREATEST: i32 = Self::DOMAIN.1;
+
+    #[inline(always)]
+    unsafe fn values(at: At) -> [i8; PACKET] {
+        let raw = unsafe { Self::raw(at) };
+        let mut values = [0i8; PACKET];
+        for i in 0..PACKET {
+            values[i] = Odd::<K>::value::<0>(u32::from(raw[i])) as i8;
+        }
+        values
+    }
+
+    // `2 (c - K) + 1` is the doubled code plus `1 - 2 K`.
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[inline(always)]
+    unsafe fn neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
+        use std::arch::aarch64::*;
+        let offset = unsafe { vdupq_n_s8((1 - 2 * K) as i8) };
+        unsafe { Self::raw_neon(at) }
+            .map(|codes| unsafe { vaddq_s8(vaddq_s8(codes, codes), offset) })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86(at: At) -> std::arch::x86_64::__m256i {
+        use std::arch::x86_64::*;
+        let codes = unsafe { Self::raw_x86(at) };
+        unsafe {
+            _mm256_add_epi8(
+                _mm256_add_epi8(codes, codes),
+                _mm256_set1_epi8((1 - 2 * K) as i8),
+            )
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86_shifted(at: At) -> std::arch::x86_64::__m256i {
+        use std::arch::x86_64::*;
+        let codes = unsafe { Self::raw_x86(at) };
+        let offset = _mm256_set1_epi8((1 - 2 * K - LEAST) as i8);
+        unsafe { _mm256_add_epi8(_mm256_add_epi8(codes, codes), offset) }
+    }
+}
+
 impl<const ID: usize, const LEAST: i32, const GREATEST: i32>
     Planes<4, 0, Table<ID>, LEAST, GREATEST>
 {
@@ -800,32 +1016,84 @@ impl<const LEAST: i32, const GREATEST: i32> Codes for Planes<8, 0, Twos, LEAST, 
     }
 }
 
-/// Grid codes (`registry::GridCodes`): `BYTES`-byte entries of grid `GRID`
-/// (its position in `tables::GRIDS`), one per eight values, each holding
-/// `8 / lanes` `INDEX_BITS`-bit point indices, first lowest, then seven sign
-/// bits completed by an eighth of even parity. The value at lane `j` of an
-/// entry is byte `j % lanes` of its point `j / lanes`, negated by sign `j`;
-/// the values are the registry's code domain `LEAST..=GREATEST`
-/// (`DecodeAxes::codes`).
+/// Grid codes (`registry::GridCodes`): entries of grid `GRID` (its position
+/// in `tables::GRIDS`), one per eight values, their `BYTES` whole bytes in
+/// the codes plane and their `HIGH` further bits in the high plane (entry
+/// `e`'s at bit `HIGH e` of its storage group's). An entry holds `8 / lanes`
+/// `INDEX_BITS`-bit point indices, first lowest, then the sign bits of
+/// `registry::GridSigns::ALL[SIGNS]`, then delta `D`'s bit. The value at
+/// lane `j` of an entry is byte `j % lanes` of its point `j / lanes`,
+/// negated by lane sign `j` (a two's complement value where the entry has no
+/// signs), then delta `D`'s; the values are the registry's code domain
+/// `LEAST..=GREATEST` (`DecodeAxes::codes`).
 #[derive(Clone, Copy, Debug)]
 pub struct Grid<
     const GRID: usize,
     const INDEX_BITS: u32,
     const BYTES: usize,
+    const HIGH: u32,
+    const SIGNS: usize,
+    D,
     const LEAST: i32,
     const GREATEST: i32,
->;
+>(PhantomData<D>);
+
+/// A grid entry's delta (`registry::GridCodes::delta`): its bits and the
+/// values it makes of the signed values of an entry.
+pub trait GridDelta: Copy + Send + Sync + 'static {
+    const BITS: u32;
+
+    /// The values of an entry of signed values `values` and delta bits
+    /// `delta`.
+    fn apply(values: [i8; 8], delta: u32) -> [i8; 8];
+}
+
+/// No delta: the signed values themselves.
+#[derive(Clone, Copy, Debug)]
+pub struct NoDelta;
+
+impl GridDelta for NoDelta {
+    const BITS: u32 = 0;
+
+    #[inline(always)]
+    fn apply(values: [i8; 8], _: u32) -> [i8; 8] {
+        values
+    }
+}
+
+/// A delta bit: values `2^EXPONENT v + 1`, or `2^EXPONENT v - 1` where the
+/// bit is set.
+#[derive(Clone, Copy, Debug)]
+pub struct Delta<const EXPONENT: u32>;
+
+impl<const EXPONENT: u32> GridDelta for Delta<EXPONENT> {
+    const BITS: u32 = 1;
+
+    #[inline(always)]
+    fn apply(values: [i8; 8], delta: u32) -> [i8; 8] {
+        let offset = 1 - 2 * (delta & 1) as i8;
+        values.map(|value| (value << EXPONENT) + offset)
+    }
+}
 
 impl<
         const GRID: usize,
         const INDEX_BITS: u32,
         const BYTES: usize,
+        const HIGH: u32,
+        const SIGNS: usize,
+        D: GridDelta,
         const LEAST: i32,
         const GREATEST: i32,
-    > Grid<GRID, INDEX_BITS, BYTES, LEAST, GREATEST>
+    > Grid<GRID, INDEX_BITS, BYTES, HIGH, SIGNS, D, LEAST, GREATEST>
 {
     const POINTS: tables::GridPoints = tables::GRIDS[GRID].points;
-    /// The code domain: signed magnitudes below 128 (`grid_values`).
+    const SIGNED: GridSigns = GridSigns::ALL[SIGNS];
+    /// Sign bits an entry holds.
+    const SIGN_BITS: u32 = Self::SIGNED.bits();
+    const SIGN_MASK: u32 = (1 << Self::SIGN_BITS) - 1;
+    /// The code domain: signed values below 128 in magnitude
+    /// (`grid_values`).
     const DOMAIN: (i32, i32) = {
         assert!(
             -LEAST <= i8::MAX as i32 && GREATEST <= i8::MAX as i32,
@@ -837,22 +1105,38 @@ impl<
     /// Entry `e` of the storage group of `at`.
     #[inline(always)]
     unsafe fn entry(at: At, e: usize) -> u32 {
-        let at = unsafe { at.plane(RowPlaneRole::Codes).add(BYTES * e) };
+        let at_entry = unsafe { at.plane(RowPlaneRole::Codes).add(BYTES * e) };
         (0..BYTES).fold(0, |entry, byte| {
-            entry | (u32::from(unsafe { *at.add(byte) }) << (8 * byte))
-        })
+            entry | (u32::from(unsafe { *at_entry.add(byte) }) << (8 * byte))
+        }) | unsafe { Self::high(at, e) }
+    }
+
+    /// The high bits of entry `e` of the storage group of `at`, at the
+    /// entry's bit `8 BYTES`.
+    #[inline(always)]
+    unsafe fn high(at: At, e: usize) -> u32 {
+        const { assert!(HIGH <= 8, "an entry's high bits lie within two bytes") };
+        if HIGH == 0 {
+            return 0;
+        }
+        let bit = HIGH as usize * e;
+        let high = unsafe { at.plane(RowPlaneRole::High).add(bit / 8) };
+        let mut bits = u32::from(unsafe { *high });
+        if bit % 8 + HIGH as usize > 8 {
+            bits |= u32::from(unsafe { *high.add(1) }) << 8;
+        }
+        ((bits >> (bit % 8)) & ((1 << HIGH) - 1)) << (8 * BYTES)
     }
 }
 
-/// The eight values one grid entry gives: `point`'s magnitudes (byte `j` the
-/// lane-`j` magnitude), negated where the seven sign bits `signs` and their
-/// even-parity eighth are set. Bit `j` of the signs becomes byte `j` of a
-/// mask; a magnitude is below 128, so `(m ^ 0xff) + 1 = -m` bytewise without
-/// carries.
+/// The eight values one grid entry gives: `point`'s bytes (byte `j` lane
+/// `j`'s), negated where the lane signs `lanes` are set. Bit `j` of the
+/// signs becomes byte `j` of a mask; a magnitude is below 128, so `(m ^
+/// 0xff) + 1 = -m` bytewise without carries.
 #[inline(always)]
-fn grid_values(point: u64, signs: u32) -> [i8; 8] {
+fn grid_values(point: u64, lanes: u32) -> [i8; 8] {
     const ONES: u64 = 0x0101_0101_0101_0101;
-    let signs = u64::from(signs | ((signs.count_ones() & 1) << 7));
+    let signs = u64::from(lanes);
     let spread = signs.wrapping_mul(ONES) & 0x8040_2010_0804_0201;
     let negative = (spread.wrapping_add(0x7f7f_7f7f_7f7f_7f7f) >> 7) & ONES;
     ((point ^ (negative * 0xff)).wrapping_add(negative))
@@ -864,9 +1148,12 @@ impl<
         const GRID: usize,
         const INDEX_BITS: u32,
         const BYTES: usize,
+        const HIGH: u32,
+        const SIGNS: usize,
+        D: GridDelta,
         const LEAST: i32,
         const GREATEST: i32,
-    > Codes for Grid<GRID, INDEX_BITS, BYTES, LEAST, GREATEST>
+    > Codes for Grid<GRID, INDEX_BITS, BYTES, HIGH, SIGNS, D, LEAST, GREATEST>
 {
     const LEAST: i32 = Self::DOMAIN.0;
     const GREATEST: i32 = Self::DOMAIN.1;
@@ -877,7 +1164,8 @@ impl<
         let mut values = [0i8; PACKET];
         for e in 0..PACKET / 8 {
             let entry = unsafe { Self::entry(at, 4 * at.packet + e) };
-            let (point, signs) = match Self::POINTS {
+            // The point and the entry's bits past its indices.
+            let (point, rest) = match Self::POINTS {
                 tables::GridPoints::Lanes8(points) => {
                     (points[(entry & mask) as usize], entry >> INDEX_BITS)
                 }
@@ -887,9 +1175,219 @@ impl<
                     entry >> (2 * INDEX_BITS),
                 ),
             };
-            values[8 * e..8 * e + 8].copy_from_slice(&grid_values(point, signs & 127));
+            // One expression: named temporaries here change the code
+            // LLVM schedules.
+            values[8 * e..8 * e + 8].copy_from_slice(&D::apply(
+                grid_values(point, Self::SIGNED.lanes(rest & Self::SIGN_MASK)),
+                rest >> Self::SIGN_BITS,
+            ));
         }
         values
+    }
+}
+
+/// The runs of base-3 digit codes (`registry::DigitCodes`), a digits
+/// component's parameter (build.rs generates one type per runs).
+pub trait DigitRuns: Copy + Send + Sync + 'static {
+    const CODES: DigitCodes;
+}
+
+/// Base-3 digit codes (`registry::DigitCodes`) of runs `R`, a storage
+/// group's bytes whole in the codes plane: value `o` of a run of `bytes`
+/// bytes is digit `o / bytes` of its byte `o % bytes`, digit `n` of byte `b`
+/// being `(((b 3^n) mod 256) 3) >> 8`, read through interpretation `I`, whose
+/// values are the registry's code domain `LEAST..=GREATEST`
+/// (`DecodeAxes::codes`).
+#[derive(Clone, Copy, Debug)]
+pub struct Digits<R, I, const LEAST: i32, const GREATEST: i32>(PhantomData<(R, I)>);
+
+/// Packets of a digits storage group, at most a block's.
+const DIGIT_PACKETS: usize = Q8_BLOCK / PACKET;
+
+/// Where packet `p` of a digits storage group of `bytes` bytes (at least
+/// 16) reads: two 16-byte windows of the group, `windows[p]`, and per value
+/// its byte's position in the two windows' 32 bytes and its power `3^n`.
+struct DigitPlaces {
+    windows: [(usize, usize); DIGIT_PACKETS],
+    positions: [[u8; PACKET]; DIGIT_PACKETS],
+    powers: [[u8; PACKET]; DIGIT_PACKETS],
+}
+
+impl DigitPlaces {
+    const fn of(codes: &DigitCodes) -> Self {
+        let (bytes, values) = (codes.bytes() as usize, codes.values() as usize);
+        assert!(bytes >= 16, "a digits group holds two 16-byte windows");
+        assert!(values <= Q8_BLOCK, "a digits group holds at most a block");
+        assert!(values % PACKET == 0, "a digits group holds whole packets");
+        let mut places = Self {
+            windows: [(0, 0); DIGIT_PACKETS],
+            positions: [[0; PACKET]; DIGIT_PACKETS],
+            powers: [[0; PACKET]; DIGIT_PACKETS],
+        };
+        // Each value's byte and digit (`DigitCodes::place`).
+        let mut byte_of = [0usize; Q8_BLOCK];
+        let mut value = 0;
+        while value < values {
+            let (byte, digit) = codes.place(value as u32);
+            byte_of[value] = byte as usize;
+            places.powers[value / PACKET][value % PACKET] = DIGIT_RADIX.pow(digit) as u8;
+            value += 1;
+        }
+        let mut p = 0;
+        while p < value / PACKET {
+            let (mut least, mut end) = (usize::MAX, 0);
+            let mut i = 0;
+            while i < PACKET {
+                let byte = byte_of[PACKET * p + i];
+                if byte < least {
+                    least = byte;
+                }
+                if byte + 1 > end {
+                    end = byte + 1;
+                }
+                i += 1;
+            }
+            let last = bytes - 16;
+            let first = if least < last { least } else { last };
+            let second = if end < 16 {
+                0
+            } else if end - 16 < last {
+                end - 16
+            } else {
+                last
+            };
+            places.windows[p] = (first, second);
+            let mut i = 0;
+            while i < PACKET {
+                let byte = byte_of[PACKET * p + i];
+                places.positions[p][i] = if first <= byte && byte < first + 16 {
+                    (byte - first) as u8
+                } else {
+                    assert!(
+                        second <= byte && byte < second + 16,
+                        "a packet's digit bytes lie within two 16-byte windows"
+                    );
+                    (16 + byte - second) as u8
+                };
+                i += 1;
+            }
+            p += 1;
+        }
+        places
+    }
+}
+
+impl<R: DigitRuns, I: Interpretation, const LEAST: i32, const GREATEST: i32>
+    Digits<R, I, LEAST, GREATEST>
+{
+    const PLACES: DigitPlaces = DigitPlaces::of(&R::CODES);
+    /// The code domain, whose values fit a signed byte.
+    const DOMAIN: (i32, i32) = {
+        assert!(
+            i8::MIN as i32 <= LEAST && LEAST <= GREATEST && GREATEST <= i8::MAX as i32,
+            "values fit a signed byte"
+        );
+        (LEAST, GREATEST)
+    };
+    /// The value of each digit minus `least` (as an unsigned byte), then
+    /// zeros: a 16-entry table, constant once inlined.
+    #[inline(always)]
+    fn table(least: i32) -> [i8; 16] {
+        let mut table = [0i8; 16];
+        for digit in 0..DIGIT_RADIX {
+            table[digit as usize] = (I::value::<DIGIT_BITS>(digit) - least) as u8 as i8;
+        }
+        table
+    }
+
+    /// The group's two 16-byte windows of packet `at`.
+    #[inline(always)]
+    unsafe fn windows(at: At) -> (*const u8, *const u8) {
+        let (first, second) = Self::PLACES.windows[at.packet];
+        let digits = at.plane(RowPlaneRole::Codes);
+        unsafe { (digits.add(first), digits.add(second)) }
+    }
+}
+
+impl<R: DigitRuns, I: Interpretation, const LEAST: i32, const GREATEST: i32> Codes
+    for Digits<R, I, LEAST, GREATEST>
+{
+    const LEAST: i32 = Self::DOMAIN.0;
+    const GREATEST: i32 = Self::DOMAIN.1;
+
+    #[inline(always)]
+    unsafe fn values(at: At) -> [i8; PACKET] {
+        let (first, second) = unsafe { Self::windows(at) };
+        let mut bytes = [0u8; PACKET];
+        unsafe {
+            std::ptr::copy_nonoverlapping(first, bytes.as_mut_ptr(), 16);
+            std::ptr::copy_nonoverlapping(second, bytes.as_mut_ptr().add(16), 16);
+        }
+        let (positions, powers) = (
+            &Self::PLACES.positions[at.packet],
+            &Self::PLACES.powers[at.packet],
+        );
+        let mut values = [0i8; PACKET];
+        for i in 0..PACKET {
+            let byte = bytes[positions[i] as usize].wrapping_mul(powers[i]);
+            values[i] =
+                Self::table(0)[((u32::from(byte) * DIGIT_RADIX) >> DIGIT_BYTE_BITS) as usize];
+        }
+        values
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[inline(always)]
+    unsafe fn neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
+        use std::arch::aarch64::*;
+        unsafe {
+            let (first, second) = Self::windows(at);
+            let windows = uint8x16x2_t(vld1q_u8(first), vld1q_u8(second));
+            let (positions, powers) = (
+                Self::PLACES.positions[at.packet].as_ptr(),
+                Self::PLACES.powers[at.packet].as_ptr(),
+            );
+            let table = vld1q_s8(Self::table(0).as_ptr());
+            [0, 16].map(|half| {
+                let bytes = vqtbl2q_u8(windows, vld1q_u8(positions.add(half)));
+                let digits = packed_neon::digits(vmulq_u8(bytes, vld1q_u8(powers.add(half))));
+                vqtbl1q_s8(table, digits)
+            })
+        }
+    }
+
+    /// On a tier of 256-bit integer vectors, the digits of [`Codes::x86`]:
+    /// the scalar reading's per-value byte gather and digit extraction is
+    /// otherwise vectorized differently in each body that inlines it.
+    #[inline(always)]
+    unsafe fn decoded<V: Vectors>(at: At) -> [i8; PACKET] {
+        #[cfg(target_arch = "x86_64")]
+        if const { V::TIER.vector_bytes() >= 32 } {
+            let mut values = [0i8; PACKET];
+            unsafe {
+                std::arch::x86_64::_mm256_storeu_si256(values.as_mut_ptr().cast(), Self::x86(at))
+            };
+            return values;
+        }
+        unsafe { Self::values(at) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86(at: At) -> std::arch::x86_64::__m256i {
+        unsafe {
+            let digits = packed_x86::digits(Self::windows(at), &Self::PLACES, at.packet);
+            packed_x86::lookup(packed_x86::table(&Self::table(0)), digits)
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86_shifted(at: At) -> std::arch::x86_64::__m256i {
+        unsafe {
+            let digits = packed_x86::digits(Self::windows(at), &Self::PLACES, at.packet);
+            packed_x86::lookup(packed_x86::table(&Self::table(LEAST)), digits)
+        }
     }
 }
 
@@ -1091,13 +1589,7 @@ pub trait Coefficients: Copy + Send + Sync + 'static {
     ///
     /// # Safety
     /// As [`Format::dot_q8`], with `packets` the block's packets below `k`.
-    unsafe fn dot_q8<
-        C: Codes,
-        const STORAGE: usize,
-        const R: usize,
-        const M: usize,
-        const MODE: u8,
-    >(
+    unsafe fn dot_q8<C: Codes, const STORAGE: usize, const R: usize, const M: usize, V: Vectors>(
         rows: &[Row; R],
         b: usize,
         packets: usize,
@@ -1159,7 +1651,7 @@ unsafe fn packet_dots<
     const STORAGE: usize,
     const M: usize,
     const GROUP: usize,
-    const MODE: u8,
+    V: Vectors,
 >(
     block: &Block,
     packets: usize,
@@ -1220,17 +1712,17 @@ unsafe fn packet_dots<
         return exact;
     }
     #[cfg(target_arch = "x86_64")]
-    if MODE >= 1 {
+    if V::QUANTIZED_DOTS >= 1 {
         unsafe {
             use std::arch::x86_64::*;
-            let unsigned = unsigned::<C>(if MODE == 2 { 255 } else { 128 });
+            let unsigned = unsigned::<C>(if V::QUANTIZED_DOTS == 2 { 255 } else { 128 });
             // Per activation block, a block's eight packets reduce together:
             // the sums of their low and high halves (values 0..16, 16..32).
             for m in 0..M {
                 let mut products = [_mm256_setzero_si256(); 8];
                 for local in packets_of(packets) {
                     let weights = C::x86(block.at::<STORAGE>(local));
-                    products[local] = packed_x86::product::<MODE>(weights, x[m], local, unsigned);
+                    products[local] = packed_x86::product::<V>(weights, x[m], local, unsigned);
                 }
                 let (first, second) = packed_x86::halves8(products);
                 if halves == 1 {
@@ -1248,7 +1740,7 @@ unsafe fn packet_dots<
     {
         for local in packets_of(packets) {
             let values = unsafe { C::values(block.at::<STORAGE>(local)) };
-            let dots = scalar_dots::<M, GROUP, MODE>(&values, x, local);
+            let dots = scalar_dots::<M, GROUP, V>(&values, x, local);
             for m in 0..M {
                 for h in 0..halves {
                     exact[m][h][local] = dots[m][h] as f32;
@@ -1263,7 +1755,7 @@ unsafe fn packet_dots<
 /// each activation block of `x`, per `GROUP`-value coefficient group (the
 /// whole packet in `[0]` when a group covers it), by [`dot_i8_i8`].
 #[inline(always)]
-fn scalar_dots<const M: usize, const GROUP: usize, const MODE: u8>(
+fn scalar_dots<const M: usize, const GROUP: usize, V: Vectors>(
     values: &[i8; PACKET],
     x: [&Q8Block; M],
     local: usize,
@@ -1276,19 +1768,19 @@ fn scalar_dots<const M: usize, const GROUP: usize, const MODE: u8>(
             .expect("a packet of codes");
         for (h, exact) in exact.iter_mut().enumerate().take(halves) {
             *exact = if halves == 1 {
-                dot_i8_i8::<MODE>(values, activations)
+                dot_i8_i8::<V>(values, activations)
             } else {
                 // Each sixteen-value group alone: the other half is zero.
                 let mut half = [0i8; PACKET];
                 half[16 * h..16 * h + 16].copy_from_slice(&values[16 * h..16 * h + 16]);
-                dot_i8_i8::<MODE>(&half, activations)
+                dot_i8_i8::<V>(&half, activations)
             };
         }
     }
     exact
 }
 
-/// Direct coefficients (`CoefficientAxes::Direct`): per `GROUP` values a
+/// Direct coefficients (`CodingAxes::Direct`): per `GROUP` values a
 /// stored scale of encoding `S` (and with `BIAS` a bias), the scales of a
 /// storage group then its biases in the supers plane; values are scaled by
 /// `2^CODE_EXPONENT`, folded into each scale exactly. A quantized dot sums
@@ -1314,7 +1806,7 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32>
         const STORAGE: usize,
         const R: usize,
         const M: usize,
-        const MODE: u8,
+        V: Vectors,
     >(
         rows: &[Row; R],
         b: usize,
@@ -1324,7 +1816,7 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32>
         use std::arch::x86_64::*;
         let halves = const { groups_per_packet(GROUP) };
         let x = x[0];
-        let shift = shifted::<C>(if MODE == 2 { 255 } else { 128 });
+        let shift = shifted::<C>(if V::QUANTIZED_DOTS == 2 { 255 } else { 128 });
         let block = Block::of::<STORAGE>(&rows[0], b);
         let mut sums = unsafe { _mm256_setzero_ps() };
         for local in packets_of(packets) {
@@ -1335,9 +1827,9 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32>
                 let at = at.lane(r, &rows[0]);
                 *products = unsafe {
                     if shift {
-                        packed_x86::dot::<MODE>(*products, C::x86_shifted(at), activations)
+                        packed_x86::dot::<V>(*products, C::x86_shifted(at), activations)
                     } else {
-                        packed_x86::dot_signed::<MODE>(*products, C::x86(at), activations)
+                        packed_x86::dot_signed::<V>(*products, C::x86(at), activations)
                     }
                 };
             }
@@ -1398,7 +1890,7 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32>
         const STORAGE: usize,
         const R: usize,
         const M: usize,
-        const MODE: u8,
+        V: Vectors,
     >(
         rows: &[Row; R],
         b: usize,
@@ -1407,7 +1899,7 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32>
     ) -> [[f32; M]; R] {
         use std::arch::x86_64::*;
         let halves = const { groups_per_packet(GROUP) };
-        let unsigned = unsigned::<C>(if MODE == 2 { 255 } else { 128 });
+        let unsigned = unsigned::<C>(if V::QUANTIZED_DOTS == 2 { 255 } else { 128 });
         let mut out = [[0.0f32; M]; R];
         for (out, row) in out.iter_mut().zip(rows) {
             let block = Block::of::<STORAGE>(row, b);
@@ -1417,7 +1909,7 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32>
                 let weights = unsafe { C::x86(at) };
                 let mut products = [unsafe { _mm256_setzero_si256() }; 4];
                 for (products, x) in products.iter_mut().zip(x.iter()) {
-                    *products = unsafe { packed_x86::product::<MODE>(weights, x, local, unsigned) };
+                    *products = unsafe { packed_x86::product::<V>(weights, x, local, unsigned) };
                 }
                 // Low and high halves of the four blocks' sums.
                 let halves4 = unsafe { packed_x86::halves4(products) };
@@ -1491,13 +1983,7 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32> C
     }
 
     #[inline(always)]
-    unsafe fn dot_q8<
-        C: Codes,
-        const STORAGE: usize,
-        const R: usize,
-        const M: usize,
-        const MODE: u8,
-    >(
+    unsafe fn dot_q8<C: Codes, const STORAGE: usize, const R: usize, const M: usize, V: Vectors>(
         rows: &[Row; R],
         b: usize,
         packets: usize,
@@ -1505,17 +1991,17 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32> C
     ) -> [[f32; M]; R] {
         let halves = const { groups_per_packet(GROUP) };
         #[cfg(target_arch = "x86_64")]
-        if M == 1 && MODE >= 1 && Row::same_tile(rows) {
-            return unsafe { Self::dot_q8_eight::<C, STORAGE, R, M, MODE>(rows, b, packets, x) };
+        if M == 1 && V::QUANTIZED_DOTS >= 1 && Row::same_tile(rows) {
+            return unsafe { Self::dot_q8_eight::<C, STORAGE, R, M, V>(rows, b, packets, x) };
         }
         #[cfg(target_arch = "x86_64")]
-        if M == 4 && MODE >= 1 {
-            return unsafe { Self::dot_q8_four::<C, STORAGE, R, M, MODE>(rows, b, packets, x) };
+        if M == 4 && V::QUANTIZED_DOTS >= 1 {
+            return unsafe { Self::dot_q8_four::<C, STORAGE, R, M, V>(rows, b, packets, x) };
         }
         let mut out = [[0.0f32; M]; R];
         for (out, row) in out.iter_mut().zip(rows) {
             let block = Block::of::<STORAGE>(row, b);
-            let exact = unsafe { packet_dots::<C, STORAGE, M, GROUP, MODE>(&block, packets, x) };
+            let exact = unsafe { packet_dots::<C, STORAGE, M, GROUP, V>(&block, packets, x) };
             let mut sums = [0.0f32; M];
             for local in packets_of(packets) {
                 let coefficients = unsafe { Self::decode::<STORAGE>(block.at::<STORAGE>(local)) };
@@ -1539,14 +2025,14 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32> C
 }
 
 /// The local codes of hierarchical coefficients: per coefficient group a
-/// scale code (and with a minimum a minimum code).
+/// scale code (and with a bias its bias code).
 pub trait Locals: Copy + Send + Sync + 'static {
-    /// The sign of the minimum's term in a value's bias: -1 or 1, or 0
-    /// without a minimum.
-    const MIN_SIGN: i32;
+    /// The groups' bias term, if any.
+    const BIAS: Option<LocalBias>;
 
-    /// The (scale, minimum) codes' values of `GROUP`-value coefficient group
-    /// `local` of the storage group of `at`; the minimum is 0 without one.
+    /// The (scale, bias) codes' values of `GROUP`-value coefficient group
+    /// `local` of the storage group of `at`; the bias code is 0 without a
+    /// bias.
     ///
     /// # Safety
     /// `at` is a packet of a row.
@@ -1571,22 +2057,38 @@ pub trait Locals: Copy + Send + Sync + 'static {
 }
 
 /// Local codes in the scales plane: per coefficient group a `BITS`-bit
-/// scale code (then, with a minimum of sign `MIN_SIGN`, a minimum code) read
-/// through `L`, group `j`'s at bit `j BITS (1 + minimum)` of its storage
-/// group's bytes.
+/// scale code (then, with bias `B`'s minimum, a minimum code) read through
+/// `L`, group `j`'s at bit `j BITS (1 + minimum)` of its storage group's
+/// bytes.
 #[derive(Clone, Copy, Debug)]
-pub struct Scales<L, const BITS: u32, const MIN_SIGN: i32>(PhantomData<L>);
+pub struct Scales<L, const BITS: u32, B>(PhantomData<(L, B)>);
 
-impl<L: Interpretation, const BITS: u32, const MIN_SIGN: i32> Scales<L, BITS, MIN_SIGN> {
+/// The bias of local codes in the scales plane (`registry::LocalBias`):
+/// none, or a minimum code.
+pub trait PlaneBias: Copy + Send + Sync + 'static {
+    const BIAS: Option<LocalBias>;
+}
+
+/// A minimum code (`LocalBias::Minimum`), its term subtracted when
+/// `SUBTRACT`, else added.
+#[derive(Clone, Copy, Debug)]
+pub struct Minimum<const SUBTRACT: bool>;
+
+impl<const SUBTRACT: bool> PlaneBias for Minimum<SUBTRACT> {
+    const BIAS: Option<LocalBias> = Some(LocalBias::Minimum(if SUBTRACT {
+        MinimumSign::Subtract
+    } else {
+        MinimumSign::Add
+    }));
+}
+
+impl<L: Interpretation, const BITS: u32, B: PlaneBias> Scales<L, BITS, B> {
     /// Whether the groups have a minimum code.
-    const MIN: bool = {
-        assert!(MIN_SIGN.abs() <= 1, "a minimum's sign is -1, 0 or 1");
-        MIN_SIGN != 0
-    };
+    const MINIMUM: bool = B::BIAS.is_some();
 
     /// Bits of one group's codes; every group's lie within two bytes.
     const WIDTH: usize = {
-        let width = BITS as usize * (1 + Self::MIN as usize);
+        let width = BITS as usize * (1 + Self::MINIMUM as usize);
         let mut group = 0;
         while group < 8 {
             assert!(
@@ -1610,7 +2112,7 @@ impl<L: Interpretation, const BITS: u32, const MIN_SIGN: i32> Scales<L, BITS, MI
     #[inline(always)]
     fn split(field: u32) -> (i32, i32) {
         let mask = (1u32 << BITS) - 1;
-        let minimum = if Self::MIN {
+        let minimum = if Self::MINIMUM {
             L::value::<BITS>((field >> BITS) & mask)
         } else {
             0
@@ -1619,8 +2121,8 @@ impl<L: Interpretation, const BITS: u32, const MIN_SIGN: i32> Scales<L, BITS, MI
     }
 }
 
-impl<L: Interpretation, const BITS: u32, const MIN_SIGN: i32> Locals for Scales<L, BITS, MIN_SIGN> {
-    const MIN_SIGN: i32 = MIN_SIGN;
+impl<L: Interpretation, const BITS: u32, B: PlaneBias> Locals for Scales<L, BITS, B> {
+    const BIAS: Option<LocalBias> = B::BIAS;
 
     #[inline(always)]
     unsafe fn block<const GROUP: usize>(at: At) -> [[(i32, i32); 2]; 8] {
@@ -1665,39 +2167,98 @@ impl<L: Interpretation, const BITS: u32, const MIN_SIGN: i32> Locals for Scales<
     }
 }
 
-/// Local scale codes carried by grid entries of `ENTRY_BYTES` bytes: bit
-/// `j` of a group's `BITS`-bit code at bit `BIT` of the group's entry `j`,
-/// read through `L`.
+/// Local codes carried by grid entries of `ENTRY_BYTES` whole bytes and
+/// `HIGH` high-plane bits (`Grid`): bit `j` of a group's code at entry bit
+/// `BIT` of the group's entry `j`, a `BITS`-bit scale code read through `L`
+/// and then bias `B`'s sign bits.
 #[derive(Clone, Copy, Debug)]
-pub struct Carried<const BIT: u32, const ENTRY_BYTES: usize, L, const BITS: u32>(PhantomData<L>);
+pub struct Carried<const BIT: u32, const ENTRY_BYTES: usize, const HIGH: u32, L, const BITS: u32, B>(
+    PhantomData<(L, B)>,
+);
 
-impl<const BIT: u32, const ENTRY_BYTES: usize, L: Interpretation, const BITS: u32> Locals
-    for Carried<BIT, ENTRY_BYTES, L, BITS>
+/// The bias of carried local codes (`registry::LocalBias`): none, or a
+/// signed bias.
+pub trait CarriedBias: Copy + Send + Sync + 'static {
+    const BIAS: Option<LocalBias>;
+    /// Sign bits past the scale code: the signed bias's sign.
+    const SIGN_BITS: u32 = Self::BIAS.is_some() as u32;
+}
+
+/// No bias.
+#[derive(Clone, Copy, Debug)]
+pub struct Unbiased;
+
+impl PlaneBias for Unbiased {
+    const BIAS: Option<LocalBias> = None;
+}
+
+impl CarriedBias for Unbiased {
+    const BIAS: Option<LocalBias> = None;
+}
+
+/// A signed bias (`LocalBias::Signed`): the scale code, negated where the
+/// sign bit past it is set, under the factor scaled by `2^EXPONENT`.
+#[derive(Clone, Copy, Debug)]
+pub struct SignedBias<const EXPONENT: i32>;
+
+impl<const EXPONENT: i32> CarriedBias for SignedBias<EXPONENT> {
+    const BIAS: Option<LocalBias> = Some(LocalBias::Signed { exponent: EXPONENT });
+}
+
+impl<
+        const BIT: u32,
+        const ENTRY_BYTES: usize,
+        const HIGH: u32,
+        L: Interpretation,
+        const BITS: u32,
+        B: CarriedBias,
+    > Locals for Carried<BIT, ENTRY_BYTES, HIGH, L, BITS, B>
 {
-    const MIN_SIGN: i32 = 0;
+    const BIAS: Option<LocalBias> = B::BIAS;
 
     #[inline(always)]
     unsafe fn read<const GROUP: usize>(at: At, local: usize) -> (i32, i32) {
-        let entries = unsafe {
-            at.plane(RowPlaneRole::Codes)
-                .add(ENTRY_BYTES * (GROUP / 8) * local)
+        let width = (BITS + B::SIGN_BITS) as usize;
+        let code = if (BIT as usize) < 8 * ENTRY_BYTES {
+            let entries = unsafe {
+                at.plane(RowPlaneRole::Codes)
+                    .add(ENTRY_BYTES * (GROUP / 8) * local)
+            };
+            let (byte, bit) = (BIT as usize / 8, BIT % 8);
+            (0..width).fold(0u32, |code, j| {
+                code | (((u32::from(unsafe { *entries.add(ENTRY_BYTES * j + byte) }) >> bit) & 1)
+                    << j)
+            })
+        } else {
+            // Entry `e`'s bit is high-plane bit `HIGH e + BIT - 8 ENTRY_BYTES`.
+            let high = at.plane(RowPlaneRole::High);
+            let first = HIGH as usize * (GROUP / 8) * local + BIT as usize - 8 * ENTRY_BYTES;
+            (0..width).fold(0u32, |code, j| {
+                let bit = first + HIGH as usize * j;
+                code | (((u32::from(unsafe { *high.add(bit / 8) }) >> (bit % 8)) & 1) << j)
+            })
         };
-        let (byte, bit) = (BIT as usize / 8, BIT % 8);
-        let code = (0..BITS as usize).fold(0u32, |code, j| {
-            code | (((u32::from(unsafe { *entries.add(ENTRY_BYTES * j + byte) }) >> bit) & 1) << j)
-        });
-        (L::value::<BITS>(code), 0)
+        let scale = L::value::<BITS>(code & ((1 << BITS) - 1));
+        let bias = if B::SIGN_BITS == 0 {
+            0
+        } else if (code >> BITS) & 1 == 1 {
+            -scale
+        } else {
+            scale
+        };
+        (scale, bias)
     }
 }
 
-/// Hierarchical coefficients (`CoefficientAxes::Hierarchical`): per storage
+/// Hierarchical coefficients (`CodingAxes::Hierarchical`): per storage
 /// group (the factor group) a factor of encoding `F` (then with a minimum a
 /// minimum factor) in the supers plane, scaled by `2^EXPONENT`; per `GROUP`
 /// values local codes `L`. A value's scale is `factor * 2^CODE_EXPONENT *
-/// scale code` and its bias `L::MIN_SIGN * minimum factor * minimum code`. A
-/// quantized dot sums `scale code * products` (and `minimum code *
-/// activation sums`) over the factor group exactly, then combines
-/// `factor * scaled ± minimum factor * minimums` once.
+/// scale code` and its bias the bias factor times the bias code (`L::BIAS`):
+/// `± minimum factor * minimum code`, or `factor * 2^(EXPONENT + exponent) *
+/// signed code`. A quantized dot sums `scale code * products` (and `bias
+/// code * activation sums`) over the factor group exactly, then combines
+/// `factor * scaled ± bias factor * biases` once.
 #[derive(Clone, Copy, Debug)]
 pub struct Hier<F, const EXPONENT: i32, const CODE_EXPONENT: i32, L, const GROUP: usize>(
     PhantomData<(F, L)>,
@@ -1706,16 +2267,19 @@ pub struct Hier<F, const EXPONENT: i32, const CODE_EXPONENT: i32, L, const GROUP
 impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const GROUP: usize>
     Hier<F, EXPONENT, CODE_EXPONENT, L, GROUP>
 {
-    /// Whether the coefficients have a minimum.
-    const MIN: bool = L::MIN_SIGN != 0;
+    /// Whether the bias factor is a stored minimum factor.
+    const MINIMUM: bool = matches!(L::BIAS, Some(LocalBias::Minimum(_)));
+    /// Whether the bias term is subtracted.
+    const SUBTRACT: bool = matches!(L::BIAS, Some(LocalBias::Minimum(MinimumSign::Subtract)));
 
     /// The scale factor (`factor * 2^(EXPONENT + CODE_EXPONENT)`) and the
-    /// minimum factor (the stored minimum factor times `2^EXPONENT`) of the
+    /// bias factor (the stored minimum factor times `2^EXPONENT`, or the
+    /// factor times `2^(EXPONENT + exponent)` of a signed bias) of the
     /// storage group of `at`.
     #[inline(always)]
     unsafe fn factors(at: At) -> (f32, f32) {
         let supers = at.plane(RowPlaneRole::Supers);
-        let minimum = if Self::MIN {
+        let minimum = if Self::MINIMUM {
             unsafe { F::read(supers.add(F::BYTES)) }
         } else {
             0.0
@@ -1726,12 +2290,12 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
     /// [`Hier::factors`] of the stored factor and minimum factor.
     #[inline(always)]
     fn factors_of(factor: f32, minimum: f32) -> (f32, f32) {
-        let minimum = if Self::MIN {
-            scaled::<EXPONENT>(minimum)
-        } else {
-            0.0
+        let bias = match L::BIAS {
+            Some(LocalBias::Minimum(_)) => scaled::<EXPONENT>(minimum),
+            Some(LocalBias::Signed { exponent }) => factor * power2(EXPONENT + exponent),
+            None => 0.0,
         };
-        (scaled::<CODE_EXPONENT>(scaled::<EXPONENT>(factor)), minimum)
+        (scaled::<CODE_EXPONENT>(scaled::<EXPONENT>(factor)), bias)
     }
 
     /// [`Hier::factors`] of the eight lanes of the rows8 tile whose lane 0
@@ -1748,7 +2312,11 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
             row.groups[RowPlaneRole::Supers as usize],
         );
         let mut fields = [[0.0f32; 8]; 2];
-        for (field, values) in fields.iter_mut().enumerate().take(1 + Self::MIN as usize) {
+        for (field, values) in fields
+            .iter_mut()
+            .enumerate()
+            .take(1 + Self::MINIMUM as usize)
+        {
             let first = unsafe { supers.add(F::BYTES * field) };
             #[cfg(target_arch = "aarch64")]
             unsafe {
@@ -1788,7 +2356,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
     /// One row's [`Coefficients::dot_q8`] over the block's first
     /// `packets` packets, with the activation blocks' code sums `sums`.
     #[inline(always)]
-    unsafe fn dot_row<C: Codes, const M: usize, const MODE: u8>(
+    unsafe fn dot_row<C: Codes, const M: usize, V: Vectors>(
         row: &Row,
         b: usize,
         packets: usize,
@@ -1805,7 +2373,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         let codes = unsafe { L::block::<GROUP>(group) };
         let mut scaled = [0i32; M];
         let mut minimums = [0i32; M];
-        if Self::MIN {
+        if Self::BIASED {
             for m in 0..M {
                 for local in packets_of(packets) {
                     for h in 0..halves {
@@ -1854,7 +2422,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
             }
         }
         #[cfg(target_arch = "x86_64")]
-        if MODE >= 1 {
+        if V::QUANTIZED_DOTS >= 1 {
             unsafe {
                 use std::arch::x86_64::*;
                 // The pair products take one 16-bit scale code per half.
@@ -1892,10 +2460,10 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
             }
         }
         #[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
-        if !(cfg!(target_arch = "x86_64") && MODE >= 1) {
+        if !(cfg!(target_arch = "x86_64") && V::QUANTIZED_DOTS >= 1) {
             for local in packets_of(packets) {
                 let values = unsafe { C::values(group.packet(local)) };
-                let exact = scalar_dots::<M, GROUP, MODE>(&values, x, local);
+                let exact = scalar_dots::<M, GROUP, V>(&values, x, local);
                 for m in 0..M {
                     for h in 0..halves {
                         scaled[m] += codes[local][h].0 * exact[m][h];
@@ -1921,7 +2489,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         target_arch = "x86_64"
     ))]
     #[inline(always)]
-    unsafe fn dot_tile<C: Codes, const MODE: u8>(
+    unsafe fn dot_tile<C: Codes, V: Vectors>(
         row: &Row,
         b: usize,
         packets: usize,
@@ -1933,7 +2501,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         let group = At::group(row, b);
         // Each row's minimum term; its scale codes are read where used.
         let mut minimums = [0i32; 8];
-        if Self::MIN {
+        if Self::BIASED {
             for r in 0..8 {
                 let codes = unsafe { L::block::<GROUP>(group.lane(r, row)) };
                 for local in packets_of(packets) {
@@ -2031,7 +2599,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
 
     /// [`Coefficients::dot_q8`] over the block's first `packets` packets.
     #[inline(always)]
-    unsafe fn dot_block<C: Codes, const R: usize, const M: usize, const MODE: u8>(
+    unsafe fn dot_block<C: Codes, const R: usize, const M: usize, V: Vectors>(
         rows: &[Row; R],
         b: usize,
         packets: usize,
@@ -2052,8 +2620,11 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
             all(target_arch = "aarch64", target_feature = "dotprod"),
             target_arch = "x86_64"
         ))]
-        if M == 1 && (cfg!(target_arch = "aarch64") || MODE >= 1) && Row::same_tile(rows) {
-            let tile = unsafe { Self::dot_tile::<C, MODE>(&rows[0], b, packets, x[0], &sums[0]) };
+        if M == 1
+            && (cfg!(target_arch = "aarch64") || V::QUANTIZED_DOTS >= 1)
+            && Row::same_tile(rows)
+        {
+            let tile = unsafe { Self::dot_tile::<C, V>(&rows[0], b, packets, x[0], &sums[0]) };
             let mut out = [[0.0f32; M]; R];
             for r in 0..R {
                 out[r][0] = tile[r];
@@ -2063,7 +2634,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         // Row by row, each whole.
         let mut out = [[0.0f32; M]; R];
         for (out, row) in out.iter_mut().zip(rows) {
-            *out = unsafe { Self::dot_row::<C, M, MODE>(row, b, packets, x, &sums) };
+            *out = unsafe { Self::dot_row::<C, M, V>(row, b, packets, x, &sums) };
         }
         out
     }
@@ -2072,9 +2643,9 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
     /// `factors`.
     #[inline(always)]
     fn coefficient(factors: (f32, f32), (scale, minimum): (i32, i32)) -> (f32, f32) {
-        let bias = if Self::MIN {
+        let bias = if Self::BIASED {
             let bias = factors.1 * minimum as f32;
-            if L::MIN_SIGN < 0 {
+            if Self::SUBTRACT {
                 -bias
             } else {
                 bias
@@ -2085,14 +2656,14 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         (factors.0 * scale as f32, bias)
     }
 
-    /// `factor * scaled + L::MIN_SIGN * minimum * minimums`, the minimum
-    /// term's product rounded on its own.
+    /// `factor * scaled ± bias factor * biases`, the bias term's product
+    /// rounded on its own.
     #[inline(always)]
     fn combine(factors: (f32, f32), scaled: i32, minimums: i32) -> f32 {
         let scaled = factors.0 * scaled as f32;
-        if !Self::MIN {
+        if !Self::BIASED {
             scaled
-        } else if L::MIN_SIGN < 0 {
+        } else if Self::SUBTRACT {
             scaled - factors.1 * minimums as f32
         } else {
             scaled + factors.1 * minimums as f32
@@ -2103,7 +2674,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
 impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const GROUP: usize>
     Coefficients for Hier<F, EXPONENT, CODE_EXPONENT, L, GROUP>
 {
-    const BIASED: bool = Self::MIN;
+    const BIASED: bool = L::BIAS.is_some();
 
     #[inline(always)]
     unsafe fn decode<const STORAGE: usize>(at: At) -> [(f32, f32); 2] {
@@ -2119,13 +2690,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
     }
 
     #[inline(always)]
-    unsafe fn dot_q8<
-        C: Codes,
-        const STORAGE: usize,
-        const R: usize,
-        const M: usize,
-        const MODE: u8,
-    >(
+    unsafe fn dot_q8<C: Codes, const STORAGE: usize, const R: usize, const M: usize, V: Vectors>(
         rows: &[Row; R],
         b: usize,
         packets: usize,
@@ -2142,9 +2707,9 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         // a constant, which unrolls the block into registers.
         let full = Q8_BLOCK / PACKET;
         if packets == full {
-            unsafe { Self::dot_block::<C, R, M, MODE>(rows, b, full, x) }
+            unsafe { Self::dot_block::<C, R, M, V>(rows, b, full, x) }
         } else {
-            unsafe { Self::dot_block::<C, R, M, MODE>(rows, b, packets, x) }
+            unsafe { Self::dot_block::<C, R, M, V>(rows, b, packets, x) }
         }
     }
 }
@@ -2156,7 +2721,7 @@ pub struct PackedRows<C, K, const STORAGE: usize>(PhantomData<(C, K)>);
 
 impl<C: Codes, K: Coefficients, const STORAGE: usize> Format for PackedRows<C, K, STORAGE> {
     #[inline(always)]
-    unsafe fn decode<const MODE: u8>(row: &Row, p: usize, _k: usize, out: &mut [f32; PACKET]) {
+    unsafe fn decode<V: Vectors>(row: &Row, p: usize, _k: usize, out: &mut [f32; PACKET]) {
         const { assert!(STORAGE % PACKET == 0, "storage groups of whole packets") };
         let at = At::of::<STORAGE>(row, p);
         let coefficients = unsafe { K::decode::<STORAGE>(at) };
@@ -2175,7 +2740,7 @@ impl<C: Codes, K: Coefficients, const STORAGE: usize> Format for PackedRows<C, K
         }
         #[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
         {
-            let values = unsafe { C::values(at) };
+            let values = unsafe { C::decoded::<V>(at) };
             for half in 0..2 {
                 let (scale, bias) = coefficients[half];
                 for i in 16 * half..16 * half + 16 {
@@ -2190,14 +2755,14 @@ impl<C: Codes, K: Coefficients, const STORAGE: usize> Format for PackedRows<C, K
     }
 
     #[inline(always)]
-    unsafe fn dot_q8<const R: usize, const M: usize, const MODE: u8>(
+    unsafe fn dot_q8<const R: usize, const M: usize, V: Vectors>(
         rows: &[Row; R],
         b: usize,
         k: usize,
         x: [&Q8Block; M],
     ) -> [[f32; M]; R] {
         let packets = block_packets(b, k).len();
-        unsafe { K::dot_q8::<C, STORAGE, R, M, MODE>(rows, b, packets, x) }
+        unsafe { K::dot_q8::<C, STORAGE, R, M, V>(rows, b, packets, x) }
     }
 }
 
@@ -2206,6 +2771,7 @@ impl<C: Codes, K: Coefficients, const STORAGE: usize> Format for PackedRows<C, K
 /// are formed in two vectors in element order and never leave registers.
 #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
 mod packed_neon {
+    use super::DIGIT_RADIX;
     use std::arch::aarch64::*;
 
     /// `acc` plus the four-way signed byte dot products of `a` and `b`.
@@ -2306,13 +2872,31 @@ mod packed_neon {
     /// `bytes` addresses the packet's `4 LOW` code bytes.
     #[inline(always)]
     pub(super) unsafe fn codes<const LOW: u32>(bytes: *const u8, high: u32) -> [int8x16_t; 2] {
-        const { assert!(matches!(LOW, 2 | 4), "a 2- or 4-bit low plane") };
+        const { assert!(matches!(LOW, 1 | 2 | 4), "a 1-, 2- or 4-bit low plane") };
         unsafe {
             if LOW == 4 {
                 nibbles(bytes, high)
-            } else {
+            } else if LOW == 2 {
                 crumbs(bytes, high)
+            } else {
+                bits(bytes, high)
             }
+        }
+    }
+
+    /// [`codes`] of a 1-bit low plane: code `i` is bit `i` of the packet's
+    /// word.
+    #[inline(always)]
+    unsafe fn bits(bytes: *const u8, high: u32) -> [int8x16_t; 2] {
+        unsafe {
+            let word = super::read::<u32>(bytes);
+            let mut first = high_bits::<0>(word as u16);
+            let mut second = high_bits::<0>((word >> 16) as u16);
+            if high != 0 {
+                first = vorrq_u8(first, high_bits::<1>(high as u16));
+                second = vorrq_u8(second, high_bits::<1>((high >> 16) as u16));
+            }
+            [vreinterpretq_s8_u8(first), vreinterpretq_s8_u8(second)]
         }
     }
 
@@ -2360,6 +2944,18 @@ mod packed_neon {
         }
     }
 
+    /// The digits `(DIGIT_RADIX x) >> 8` of the bytes `x`
+    /// (`registry::DigitCodes`): the high bytes of the widened products.
+    #[inline(always)]
+    pub(super) fn digits(x: uint8x16_t) -> uint8x16_t {
+        unsafe {
+            let radix = vdupq_n_u8(DIGIT_RADIX as u8);
+            let low = vmull_u8(vget_low_u8(x), vget_low_u8(radix));
+            let high = vmull_high_u8(x, radix);
+            vuzp2q_u8(vreinterpretq_u8_u16(low), vreinterpretq_u8_u16(high))
+        }
+    }
+
     /// A packet's codes in element order under a 2-bit high plane: codes 2i
     /// and 2i + 1 join the low and high nibble of byte i with bits 0-1 and
     /// 2-3 of the high plane's nibble i. Codes are at most 63.
@@ -2402,6 +2998,7 @@ mod packed_neon {
 /// sums of 16-bit products never saturate (`2 * 128 * 127 < 2^15`).
 #[cfg(target_arch = "x86_64")]
 mod packed_x86 {
+    use super::{Vectors, DIGIT_RADIX};
     use std::arch::x86_64::*;
 
     /// 32 bytes at `bytes`.
@@ -2413,13 +3010,13 @@ mod packed_x86 {
     /// `acc` plus, per 32-bit lane, the four products of unsigned weight
     /// bytes `weights` and signed activation bytes `activations`.
     #[inline(always)]
-    pub(super) unsafe fn dot<const MODE: u8>(
+    pub(super) unsafe fn dot<V: Vectors>(
         acc: __m256i,
         weights: __m256i,
         activations: __m256i,
     ) -> __m256i {
         unsafe {
-            if MODE == 2 {
+            if V::QUANTIZED_DOTS == 2 {
                 _mm256_dpbusd_epi32(acc, weights, activations)
             } else {
                 let pairs = _mm256_maddubs_epi16(weights, activations);
@@ -2431,13 +3028,13 @@ mod packed_x86 {
     /// `acc` plus the four-way products of signed weights and activations:
     /// `|w| * (a * sign(w))` is `w * a` exactly, with `|w|` at most 128.
     #[inline(always)]
-    pub(super) unsafe fn dot_signed<const MODE: u8>(
+    pub(super) unsafe fn dot_signed<V: Vectors>(
         acc: __m256i,
         weights: __m256i,
         activations: __m256i,
     ) -> __m256i {
         unsafe {
-            dot::<MODE>(
+            dot::<V>(
                 acc,
                 _mm256_abs_epi8(weights),
                 _mm256_sign_epi8(activations, weights),
@@ -2449,7 +3046,7 @@ mod packed_x86 {
     /// `unsigned`, else signed) with packet `local` of the activation block
     /// `x`.
     #[inline(always)]
-    pub(super) unsafe fn product<const MODE: u8>(
+    pub(super) unsafe fn product<V: Vectors>(
         weights: __m256i,
         x: &crate::quant::Q8Block,
         local: usize,
@@ -2458,9 +3055,9 @@ mod packed_x86 {
         unsafe {
             let activations = load(x.codes.as_ptr().add(super::PACKET * local));
             if unsigned {
-                dot::<MODE>(_mm256_setzero_si256(), weights, activations)
+                dot::<V>(_mm256_setzero_si256(), weights, activations)
             } else {
-                dot_signed::<MODE>(_mm256_setzero_si256(), weights, activations)
+                dot_signed::<V>(_mm256_setzero_si256(), weights, activations)
             }
         }
     }
@@ -2531,9 +3128,12 @@ mod packed_x86 {
     /// order: code `(8 / LOW) i + j` is bits `LOW j ..` of byte `i`.
     #[inline(always)]
     pub(super) unsafe fn codes<const LOW: u32>(bytes: *const u8) -> __m256i {
-        const { assert!(matches!(LOW, 2 | 4), "a 2- or 4-bit low plane") };
+        const { assert!(matches!(LOW, 1 | 2 | 4), "a 1-, 2- or 4-bit low plane") };
         unsafe {
-            if LOW == 4 {
+            if LOW == 1 {
+                // Code i is bit i of the packet's word.
+                high_bits::<0>(super::read(bytes))
+            } else if LOW == 4 {
                 let packed = _mm_loadu_si128(bytes.cast());
                 let mask = _mm_set1_epi8(15);
                 let low = _mm_and_si128(packed, mask);
@@ -2612,6 +3212,58 @@ mod packed_x86 {
         }
     }
 
+    /// The base-3 digits of packet `packet` of a digits storage group
+    /// (`super::Digits`) whose two 16-byte windows are at `windows`: each
+    /// value's byte times its power `3^n` modulo 256 and then `(3 x) >> 8`,
+    /// both in 16-bit lanes with the byte in their high half, even bytes and
+    /// odd bytes apart.
+    #[inline(always)]
+    pub(super) unsafe fn digits(
+        windows: (*const u8, *const u8),
+        places: &super::DigitPlaces,
+        packet: usize,
+    ) -> __m256i {
+        unsafe {
+            let (first, second) = (
+                _mm256_broadcastsi128_si256(_mm_loadu_si128(windows.0.cast())),
+                _mm256_broadcastsi128_si256(_mm_loadu_si128(windows.1.cast())),
+            );
+            // A position below 16 selects from the first window, the rest
+            // from the second; a set top bit selects zero.
+            let positions = load(places.positions[packet].as_ptr().cast());
+            let in_second = _mm256_cmpgt_epi8(positions, _mm256_set1_epi8(15));
+            let bytes = _mm256_or_si256(
+                _mm256_shuffle_epi8(first, _mm256_or_si256(positions, in_second)),
+                _mm256_shuffle_epi8(
+                    second,
+                    _mm256_or_si256(
+                        _mm256_sub_epi8(positions, _mm256_set1_epi8(16)),
+                        _mm256_andnot_si256(in_second, _mm256_set1_epi8(i8::MIN)),
+                    ),
+                ),
+            );
+            let powers = load(places.powers[packet].as_ptr().cast());
+            let radix = _mm256_set1_epi16(DIGIT_RADIX as i16);
+            // (x << 8) p mod 2^16 = ((x p) mod 256) << 8, whose high product
+            // by the radix is (DIGIT_RADIX ((x p) mod 256)) >> 8.
+            let even = _mm256_mulhi_epu16(
+                _mm256_mullo_epi16(
+                    _mm256_slli_epi16::<8>(bytes),
+                    _mm256_and_si256(powers, _mm256_set1_epi16(0xff)),
+                ),
+                radix,
+            );
+            let odd = _mm256_mulhi_epu16(
+                _mm256_mullo_epi16(
+                    _mm256_and_si256(bytes, _mm256_set1_epi16(0xff00u16 as i16)),
+                    _mm256_srli_epi16::<8>(powers),
+                ),
+                radix,
+            );
+            _mm256_or_si256(even, _mm256_slli_epi16::<8>(odd))
+        }
+    }
+
     /// The 32 values of a 16-entry table `table` (broadcast to both halves)
     /// at the nibble codes `codes`.
     #[inline(always)]
@@ -2628,15 +3280,15 @@ mod packed_x86 {
 
 /// Integer dot of 32 signed weight values and signed activation codes.
 #[inline(always)]
-fn dot_i8_i8<const MODE: u8>(weights: &[i8; 32], activations: &[i8; 32]) -> i32 {
+fn dot_i8_i8<V: Vectors>(weights: &[i8; 32], activations: &[i8; 32]) -> i32 {
     #[cfg(target_arch = "x86_64")]
-    if MODE >= 1 {
+    if V::QUANTIZED_DOTS >= 1 {
         return unsafe {
             let (w, a) = (
                 packed_x86::load(weights.as_ptr()),
                 packed_x86::load(activations.as_ptr()),
             );
-            packed_x86::sum(packed_x86::dot_signed::<MODE>(
+            packed_x86::sum(packed_x86::dot_signed::<V>(
                 std::arch::x86_64::_mm256_setzero_si256(),
                 w,
                 a,
@@ -2694,7 +3346,7 @@ unsafe fn read<T: Copy>(pointer: *const u8) -> T {
 /// `row` addresses a row of `W` with `geometry` and `k` values; `out` holds
 /// at least `k` values.
 #[inline(always)]
-pub unsafe fn decode_row<W: Format, const MODE: u8>(
+pub unsafe fn decode_row<W: Format, V: Vectors>(
     row: *const u8,
     geometry: &RowGeometry,
     k: usize,
@@ -2702,9 +3354,10 @@ pub unsafe fn decode_row<W: Format, const MODE: u8>(
 ) {
     let out = &mut out[..k];
     let row = geometry.row(row);
-    let mut packet = [0.0f32; PACKET];
+    let mut storage = V::ZERO;
+    let packet = V::packet(&mut storage);
     for (p, chunk) in out.chunks_mut(PACKET).enumerate() {
-        unsafe { W::decode::<MODE>(&row, p, k, &mut packet) };
+        unsafe { W::decode::<V>(&row, p, k, packet) };
         chunk.copy_from_slice(&packet[..chunk.len()]);
     }
 }
@@ -2714,14 +3367,14 @@ pub unsafe fn decode_row<W: Format, const MODE: u8>(
 /// multiply-adds where it has them, so the accumulation is the same
 /// instructions in every component.
 #[inline(always)]
-unsafe fn accumulate<const MODE: u8>(
+unsafe fn accumulate<V: Vectors>(
     lanes: &mut [f32; LANES],
     values: &[f32; PACKET],
     x: &[f32; PACKET],
 ) {
     const { assert!(LANES == 8 && PACKET % LANES == 0, "a lane vector of eight") };
     #[cfg(target_arch = "x86_64")]
-    if MODE >= 1 {
+    if V::QUANTIZED_DOTS >= 1 {
         use std::arch::x86_64::*;
         unsafe {
             let mut sum = _mm256_loadu_ps(lanes.as_ptr());
@@ -2772,7 +3425,7 @@ unsafe fn accumulate<const MODE: u8>(
 /// # Safety
 /// `rows` addresses `R` rows of `W` with `geometry` and `k` values.
 #[inline(always)]
-pub unsafe fn dot_rows<W: Format, const R: usize, const MODE: u8>(
+pub unsafe fn dot_rows<W: Format, const R: usize, V: Vectors>(
     rows: *const u8,
     geometry: &RowGeometry,
     x: &[f32],
@@ -2783,7 +3436,8 @@ pub unsafe fn dot_rows<W: Format, const R: usize, const MODE: u8>(
     // One packet buffer, consumed by its row before the next row decodes:
     // with every row's packet live at once, x86 vectorizers transpose the
     // accumulation across rows into a gather per multiply-add.
-    let mut packet = [0.0f32; PACKET];
+    let mut storage = V::ZERO;
+    let packet = V::packet(&mut storage);
     let rows =
         std::array::from_fn::<_, R, _>(|r| geometry.row(rows.wrapping_add(r * geometry.stride)));
     let full = k / PACKET;
@@ -2792,15 +3446,14 @@ pub unsafe fn dot_rows<W: Format, const R: usize, const MODE: u8>(
             .try_into()
             .expect("a whole packet");
         for (r, lanes) in lanes.iter_mut().enumerate() {
-            unsafe { W::decode::<MODE>(&rows[r], p, k, &mut packet) };
-            unsafe { accumulate::<MODE>(lanes, &packet, xs) };
+            unsafe { W::dot_packet::<V>(&rows[r], p, k, lanes, xs, packet) };
         }
     }
     let tail = k - full * PACKET;
     if tail > 0 {
         let xs = &x[full * PACKET..];
         for (r, lanes) in lanes.iter_mut().enumerate() {
-            unsafe { W::decode::<MODE>(&rows[r], full, k, &mut packet) };
+            unsafe { W::decode::<V>(&rows[r], full, k, packet) };
             for (i, value) in xs.iter().enumerate() {
                 lanes[i % LANES] = packet[i].mul_add(*value, lanes[i % LANES]);
             }
@@ -2817,7 +3470,7 @@ pub unsafe fn dot_rows<W: Format, const R: usize, const MODE: u8>(
 /// `rows` addresses `R` rows of `W` with `geometry` and `k` values, and `x`
 /// holds `quant::blocks(k)` blocks.
 #[inline(always)]
-pub unsafe fn dot_q8_rows<W: Format, const R: usize, const MODE: u8>(
+pub unsafe fn dot_q8_rows<W: Format, const R: usize, V: Vectors>(
     rows: *const u8,
     geometry: &RowGeometry,
     x: &[Q8Block],
@@ -2828,7 +3481,7 @@ pub unsafe fn dot_q8_rows<W: Format, const R: usize, const MODE: u8>(
         std::array::from_fn::<_, R, _>(|r| geometry.row(rows.wrapping_add(r * geometry.stride)));
     let mut sums = [0.0f32; R];
     for (b, block) in x.iter().enumerate() {
-        let values = unsafe { W::dot_q8::<R, 1, MODE>(&rows, b, k, [block]) };
+        let values = unsafe { W::dot_q8::<R, 1, V>(&rows, b, k, [block]) };
         for (sum, value) in sums.iter_mut().zip(values) {
             *sum += value[0];
         }
@@ -2845,7 +3498,7 @@ pub unsafe fn dot_q8_rows<W: Format, const R: usize, const MODE: u8>(
 /// `rows` addresses eight rows of `W` with `geometry` and `k` values, and
 /// `x` holds `4 quant::blocks(k)` blocks.
 #[inline(always)]
-pub unsafe fn gemm_q8_rows<W: Format, const MODE: u8>(
+pub unsafe fn gemm_q8_rows<W: Format, V: Vectors>(
     rows: *const u8,
     geometry: &RowGeometry,
     x: &[Q8Block],
@@ -2858,7 +3511,7 @@ pub unsafe fn gemm_q8_rows<W: Format, const MODE: u8>(
     for b in 0..blocks {
         let activations = std::array::from_fn(|m| &x[m * blocks + b]);
         for r in 0..8 {
-            let [products] = unsafe { W::dot_q8::<1, 4, MODE>(&[rows[r]], b, k, activations) };
+            let [products] = unsafe { W::dot_q8::<1, 4, V>(&[rows[r]], b, k, activations) };
             for m in 0..4 {
                 accumulators[m][r] += products[m];
             }
@@ -2872,7 +3525,7 @@ mod tests {
     use crate::components::{elements, resolve};
     use crate::isa::Tier;
     use seismic_lang::registry::{
-        self, CoefficientAxes, Layout, RepresentationKind, RowPlaneRole,
+        self, CodingAxes, Layout, RepresentationKind, RowPlaneRole,
     };
 
     /// Every packed weight element decodes rows of random codes to exactly
@@ -2892,9 +3545,9 @@ mod tests {
             }
             let kernels = resolve(tier, id).unwrap();
             let axes = registry::decode_axes(id).unwrap();
-            let encoding = match axes.coefficients {
-                CoefficientAxes::Direct { scale, .. } => scale,
-                CoefficientAxes::Hierarchical { factor, .. } => factor,
+            let encoding = match axes.coding {
+                CodingAxes::Direct { scale, .. } => scale,
+                CodingAxes::Hierarchical { factor, .. } => factor,
             };
             let group = layout.group() as usize;
             // Also the Gemma K = 704 and the Nemotron K = 2688 where whole

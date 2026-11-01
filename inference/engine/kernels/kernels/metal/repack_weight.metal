@@ -11,11 +11,14 @@
 // planes' words, and SEISMIC_CONVERSION_E_U_FIXED, the other words; this
 // kernel loads, and places records in U's layout.
 //
-// Each threadgroup (32 threads) places one row tile: 16 rows x 32 columns.
-// Every group is a multiple of 32, so a tile covers a whole packet or part of
-// a larger one, and a code plane's share of a tile row is whole record words;
-// the tile at a group's first column also places that group's other record
-// words. Stored-but-unoccupied bytes (mma16 padding rows and groups, plane
+// Each threadgroup (32 threads) places one row tile: 16 rows x one unit of
+// the code planes' words (TILE_COLUMNS, SEISMIC_CONVERSION_E_U_UNIT_COLUMNS:
+// 32, or more where 32 columns are no whole words of a plane), each plane's
+// share of the unit's 32-column chunks where the layout puts them. A unit
+// divides its group, so a tile covers a whole packet or part of a larger
+// one; the tile at a group's first column also places that group's other
+// record words. The grid holds a threadgroup per unit. A base-3 digits plane keeps a
+// group's bytes whole, placed as a group plane is (its unit the group). Stored-but-unoccupied bytes (mma16 padding rows and groups, plane
 // alignment tails, packet gaps) are written as zero, so the result is fully
 // defined.
 
@@ -38,8 +41,12 @@
 
 #define GROUP ((uint)SEISMIC_ELEMENT_E_LOGICAL_GROUP)
 #define TILE_ROWS 16u
-#define TILE_COLUMNS 32u
-static_assert(GROUP % TILE_COLUMNS == 0, "a tile lies in one group");
+#define TILE_COLUMNS ((uint)SEISMIC_CONVERSION_E_U_UNIT_COLUMNS)
+// The 32-column chunks a unit spans, which row layouts place as units of a
+// plane (`PackedRowLayout::code_bit`).
+#define CHUNK_COLUMNS 32u
+static_assert(TILE_COLUMNS % CHUNK_COLUMNS == 0 && GROUP % TILE_COLUMNS == 0, "a unit is whole chunks of a group");
+#define CHUNKS (TILE_COLUMNS / CHUNK_COLUMNS)
 
 // A unit's code words: the codes', then the high codes' (`WordSpan`).
 #define CODES_WORDS SEISMIC_CONVERSION_E_U_CODES_UNIT_WORDS
@@ -83,7 +90,7 @@ ALWAYS_INLINE void store(device uchar *out, thread const uint *words, uint bytes
 
 // ---- packet: the record is the packet form ---------------------------------
 
-// The codes' (packet plane 0's) first record word and words per 32 columns.
+// The codes' (packet plane 0's) first record word.
 #define CODES_WORD SEISMIC_CONVERSION_E_U_CODES_FIRST
 static_assert((CODES_WORD + GROUP / TILE_COLUMNS * CODES_WORDS) * 4 <= SEISMIC_ELEMENT_U_PACKET_SIZE,
               "the codes are whole words of a packet");
@@ -186,6 +193,10 @@ ALWAYS_INLINE void zero_tail(device uchar *destination, constant ulong *seismic_
 }
 
 #if defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16)
+#if defined(SEISMIC_ELEMENT_U_PLANE_DIGITS)
+#error "repack_weight writes no mma16 base-3 digits"
+#endif
+static_assert(TILE_COLUMNS == CHUNK_COLUMNS, "an mma16 tile's code planes are 32-column units");
 #if !defined(SEISMIC_ELEMENT_U_PLANE_GRIDS)
 static_assert(32 % CODES_WORDS == 0 && (HIGH_WORDS == 0 || 32 % HIGH_WORDS == 0), "a code lies in one staged word");
 #endif
@@ -227,13 +238,26 @@ ALWAYS_INLINE void place_fragments(device uchar *destination, constant ulong *se
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 #else
-// A code plane's `words` (`bits` a column, a constant) of the tile's 32
-// columns of stored row `n`: one unit of its plane, stored in units of
-// `unit` bytes (its role's alignment).
+// A code plane's `words` (`bits` of them, a constant) of a unit of stored
+// row `n`: its CHUNKS chunks of 32 columns, chunk `c` its bytes [c chunk,
+// (c + 1) chunk), placed as units of the plane, the first at `stored_unit`,
+// each stored in units of the widest power of two to `unit` (its role's
+// alignment) its bytes keep.
 ALWAYS_INLINE void place_unit(device uchar *destination, constant ulong *seismic_words, ulong b, ulong n,
                        thread const uint *words, uint bits, ulong offset, ulong stored_unit, uint unit) {
-    if (bits != 0)
-        store(plane_unit(destination, seismic_words, b, n, offset, 4ul * bits, stored_unit), words, 4 * bits, unit);
+    if (bits == 0) return;
+    const uint chunk = 4 * bits / CHUNKS;
+    const uint aligned = chunk & (0u - chunk);
+    const uint stores = aligned < unit ? aligned : unit;
+    for (uint c = 0; c < CHUNKS; ++c) {
+        device uchar *out = plane_unit(destination, seismic_words, b, n, offset, ulong(chunk), stored_unit + c);
+        if (chunk % 4 == 0) {
+            store(out, words + c * chunk / 4, chunk, stores);
+        } else {
+            const uint part = words[c * chunk / 4] >> (c * chunk % 4 * 8);
+            store(out, &part, chunk, stores);
+        }
+    }
 }
 #endif
 
@@ -304,16 +328,24 @@ kernel void repack_weight(
                     SEISMIC_RESULT_0_ROW_HIGH_BYTES, lane, block, step0, staged);
 #endif
 #else
-    // The tile's 32 columns of one row are one unit of each code plane.
+    // A unit of each code plane of one row.
     if (lane < rows) {
         SEISMIC_CONVERSION_E_U_UNIT(in, unit, words);
         if (!real)
             for (uint word = 0; word < UNIT_WORDS; ++word) words[word] = 0;
-        const ulong stored_unit = column0 / TILE_COLUMNS;
+#if defined(SEISMIC_ELEMENT_U_PLANE_DIGITS)
+        // A digits plane's unit is its group's share, whole.
+        static_assert(TILE_COLUMNS == GROUP && HIGH_WORDS == 0, "a digits group is one unit of one plane");
+        store(plane_group(destination, seismic_words, b, n, SEISMIC_RESULT_0_ROW_CODES,
+                          SEISMIC_RESULT_0_ROW_CODES_BYTES, ROLE_BYTES(CODES), group),
+              words, ROLE_BYTES(CODES), ROLE_ALIGNMENT(CODES));
+#else
+        const ulong stored_unit = column0 / CHUNK_COLUMNS;
         place_unit(destination, seismic_words, b, n, words, CODES_WORDS, SEISMIC_RESULT_0_ROW_CODES, stored_unit,
                    ROLE_ALIGNMENT(CODES));
         place_unit(destination, seismic_words, b, n, words + CODES_WORDS, HIGH_WORDS, SEISMIC_RESULT_0_ROW_HIGH,
                    stored_unit, ROLE_ALIGNMENT(HIGH));
+#endif
     }
 #endif
 

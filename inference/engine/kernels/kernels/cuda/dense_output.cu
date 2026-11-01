@@ -37,21 +37,24 @@ template <int NB, int KSPLIT> using OutputShape = projection::GemvShape<8, 1, KS
 // rows included: once the warps' first weight loads are in flight it waits
 // for the previous launch, and at M = 1 a block of NVFP4 operands forms its
 // row (block-collective).
-template <int NB, int KSPLIT, unsigned long long GRID>
+template <int NB, int KSPLIT, unsigned long long GRID, int RESIDENCY>
 __device__ __forceinline__ void output_gemv(const Pro &product, projection::u8 *row, const projection::u8 *staged,
                                             unsigned M, unsigned long long H, unsigned long long F,
                                             const packets::W0 &down, const Epi &epi) {
     using Shape = OutputShape<NB, KSPLIT>;
     __shared__ projection::GemvShared<Shape, Source::type> shared;
-    projection::gemv_segment_ready<Shape, GRID>(shared, projection::source_after_dependency(product, row, M, F, staged),
-                                                M, F / 64, Shape::tile_group(), H, down, projection::NoWeight{}, epi);
+    projection::gemv_segment_ready<Shape, GRID, RESIDENCY>(
+        shared, projection::source_after_dependency(product, row, M, F, staged), M, F / 64, Shape::tile_group(), H,
+        down, projection::NoWeight{}, epi);
 }
 
 // The 1..8-row GEMV states its grid, so its blocks share their SMs as one
-// wave of them needs, and its launch bounds admit that residency.
+// wave of them needs (streaming weights: up to its tuned RESIDENCY), and its
+// launch bounds admit that residency.
 #define OUTPUT_GRID(KSPLIT) projection::gemv_grid<OutputShape<1, KSPLIT>>(SEISMIC_DIM_H)
-#define OUTPUT_MIN_BLOCKS(KSPLIT) \
-    projection::gemv_min_blocks<OutputShape<1, KSPLIT>, packets::W0, projection::NoWeight, OUTPUT_GRID(KSPLIT)>()
+#define OUTPUT_MIN_BLOCKS(KSPLIT, RESIDENCY)                                                                \
+    projection::gemv_min_blocks<OutputShape<1, KSPLIT>, packets::W0, projection::NoWeight, OUTPUT_GRID(KSPLIT), \
+                                RESIDENCY>()
 
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_STAGE
 template <unsigned INT8, unsigned OPERAND>
@@ -64,19 +67,20 @@ __global__ void dense_output_stage(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMV
-template <unsigned KSPLIT>
-__launch_bounds__(256, OUTPUT_MIN_BLOCKS(KSPLIT)) __global__ void dense_output_gemv(SEISMIC_KERNEL_PARAMS) {
+template <unsigned KSPLIT, unsigned RESIDENCY>
+__launch_bounds__(256, OUTPUT_MIN_BLOCKS(KSPLIT, RESIDENCY)) __global__ void dense_output_gemv(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ uint4 dynamic_shared[];
-    output_gemv<1, KSPLIT, OUTPUT_GRID(KSPLIT)>(PRODUCT, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING,
-                                                (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F, DOWN, EPILOGUE);
+    output_gemv<1, KSPLIT, OUTPUT_GRID(KSPLIT), RESIDENCY>(PRODUCT, reinterpret_cast<projection::u8 *>(dynamic_shared),
+                                                           STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H,
+                                                           SEISMIC_DIM_F, DOWN, EPILOGUE);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMV16
 template <unsigned KSPLIT>
 __global__ void dense_output_gemv16(SEISMIC_KERNEL_PARAMS) {
-    output_gemv<2, KSPLIT, 0>(PRODUCT, nullptr, STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F, DOWN,
-                              EPILOGUE);
+    output_gemv<2, KSPLIT, 0, 1>(PRODUCT, nullptr, STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F,
+                                 DOWN, EPILOGUE);
 }
 #endif
 

@@ -36,21 +36,25 @@ template <int NB, int KSPLIT> using UpShape = projection::GemvShape<8, 1, KSPLIT
 // rows included: once the warps' first weight loads are in flight it waits
 // for the previous launch, and at M = 1 the block forms its row
 // (block-collective).
-template <int NB, int KSPLIT, unsigned long long GRID>
+template <int NB, int KSPLIT, unsigned long long GRID, int RESIDENCY>
 __device__ __forceinline__ void up_gemv(const Pro &pro, projection::u8 *row, const projection::u8 *staged, unsigned M,
                                         unsigned long long H, unsigned long long F, const packets::W0 &up,
                                         const Epi &epi) {
     using Shape = UpShape<NB, KSPLIT>;
     __shared__ projection::GemvShared<Shape, Source::type> shared;
-    projection::gemv_segment_ready<Shape, GRID>(shared, projection::source_after_dependency(pro, row, M, H, staged),
-                                                M, H / 64, Shape::tile_group(), F, up, projection::NoWeight{}, epi);
+    projection::gemv_segment_ready<Shape, GRID, RESIDENCY>(shared,
+                                                           projection::source_after_dependency(pro, row, M, H, staged),
+                                                           M, H / 64, Shape::tile_group(), F, up,
+                                                           projection::NoWeight{}, epi);
 }
 
 // The 1..8-row GEMV states its grid, so its blocks share their SMs as one
-// wave of them needs, and its launch bounds admit that residency.
+// wave of them needs (streaming weights: up to its tuned RESIDENCY), and its
+// launch bounds admit that residency.
 #define UP_GRID(KSPLIT) projection::gemv_grid<UpShape<1, KSPLIT>>(SEISMIC_DIM_F)
-#define UP_MIN_BLOCKS(KSPLIT) \
-    projection::gemv_min_blocks<UpShape<1, KSPLIT>, packets::W0, projection::NoWeight, UP_GRID(KSPLIT)>()
+#define UP_MIN_BLOCKS(KSPLIT, RESIDENCY)                                                             \
+    projection::gemv_min_blocks<UpShape<1, KSPLIT>, packets::W0, projection::NoWeight, UP_GRID(KSPLIT), \
+                                RESIDENCY>()
 
 // The GEMM of one row band over the staged rows (A rows, or q8_1 rows with Q).
 template <class Shape, bool Q, class Operands = projection::SemanticGemmOperands>
@@ -77,19 +81,20 @@ __global__ void dense_up_stage(SEISMIC_KERNEL_PARAMS) {
 
 
 #ifdef SEISMIC_FORMING_DENSE_UP_GEMV
-template <unsigned KSPLIT>
-__launch_bounds__(256, UP_MIN_BLOCKS(KSPLIT)) __global__ void dense_up_gemv(SEISMIC_KERNEL_PARAMS) {
+template <unsigned KSPLIT, unsigned RESIDENCY>
+__launch_bounds__(256, UP_MIN_BLOCKS(KSPLIT, RESIDENCY)) __global__ void dense_up_gemv(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ uint4 dynamic_shared[];
-    up_gemv<1, KSPLIT, UP_GRID(KSPLIT)>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING,
-                                        (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F, UP, EPILOGUE);
+    up_gemv<1, KSPLIT, UP_GRID(KSPLIT), RESIDENCY>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared),
+                                                   STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F, UP,
+                                                   EPILOGUE);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_DENSE_UP_GEMV16
 template <unsigned KSPLIT>
 __global__ void dense_up_gemv16(SEISMIC_KERNEL_PARAMS) {
-    up_gemv<2, KSPLIT, 0>(PROLOGUE, nullptr, STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F, UP,
-                          EPILOGUE);
+    up_gemv<2, KSPLIT, 0, 1>(PROLOGUE, nullptr, STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F, UP,
+                             EPILOGUE);
 }
 #endif
 

@@ -2027,6 +2027,8 @@ fn convolved_form(
         .with_launch_param(2, "BATCH_SIMDGROUPS", mapping.batch_simdgroups)
         .with_launch_param(2, "BATCH_ROWS", mapping.batch_rows)
         .with_launch_param(2, "BATCH_PARTS", 2)
+        // Dense weights have no matrix GEMV.
+        .with_launch_param(2, "MATRIX", 0)
         .with_launch_param(3, "SIMDGROUPS", mapping.simdgroups)
         .with_launch_param(3, "ROWS", mapping.rows)
         .with_launch_param(3, "LANES", mapping.lanes)

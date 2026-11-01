@@ -25,7 +25,10 @@ fn short_conv_project_normalize<L: Isa, E: Elements>(
         // SAFETY: this work item owns the corresponding quantized row.
         let q8 = unsafe {
             cx.scratch_quantized()
-                .slice_mut::<seismic::cpu::quant::Q8Block>(row * blocks * projection::Q8_BYTES, blocks)
+                .slice_mut::<seismic::cpu::quant::Q8Block>(
+                    row * blocks * seismic::cpu::quant::Q8_BYTES,
+                    blocks,
+                )
         };
         projection::quantize(normalized, q8);
     }

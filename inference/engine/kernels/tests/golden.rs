@@ -25,6 +25,7 @@
 //! import, state, vision, plus `library` (every entry built on the projection
 //! library) and `all`.
 
+use magnitude_ggml::Encoding;
 use seismic::dynamic::{Function, Module, Scalar, SignatureType, Tensor, TensorAccess, Value};
 use seismic::{BackendName, Device, Element, Layout, NativeSpecialization};
 use seismic_lang::checked::{CheckedModule, NativeImplementation};
@@ -35,22 +36,17 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+mod gguf_formats;
+
+use gguf_formats::{Format, Rng};
+
 // ---------------------------------------------------------------------------
 // Values
 // ---------------------------------------------------------------------------
 
-struct Rng(u64);
-
 impl Rng {
     fn new(seed: u64) -> Self {
         Self(seed ^ 0x9e37_79b9_7f4a_7c15)
-    }
-    fn next(&mut self) -> u32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        (self.0 >> 33) as u32
     }
     fn below(&mut self, bound: usize) -> usize {
         self.next() as usize % bound
@@ -58,9 +54,6 @@ impl Rng {
     /// Uniform in [-1, 1).
     fn unit(&mut self) -> f32 {
         (self.next() as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
-    }
-    fn byte(&mut self) -> u8 {
-        self.next() as u8
     }
 }
 
@@ -138,92 +131,22 @@ fn hash(bytes: &[u8]) -> String {
 // Weights
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Format {
-    Q4K,
-    Q5K,
-    Q6K,
-    Q8,
-    Iq4,
-}
+/// The magnitude of synthetic weights' values, packed and dense.
+const WEIGHT_SCALE: f32 = 0.04;
+
+/// The formats `repack_weight` covers.
+const REPACKED: [Format; 5] = [
+    Format::Q4K,
+    Format::Q5K,
+    Format::Q6K,
+    Format::Q8,
+    Format::IQ4_XS,
+];
 
 impl Format {
+    /// The format of GGUF tensor type `kind`.
     fn from_gguf(kind: u32) -> Self {
-        match kind {
-            12 => Self::Q4K,
-            13 => Self::Q5K,
-            14 => Self::Q6K,
-            8 => Self::Q8,
-            23 => Self::Iq4,
-            other => panic!("GGUF type {other}"),
-        }
-    }
-    fn external(self) -> Element {
-        Element::named(match self {
-            Self::Q4K => "gguf_q4_k",
-            Self::Q5K => "gguf_q5_k",
-            Self::Q6K => "gguf_q6_k",
-            Self::Q8 => "gguf_q8_0",
-            Self::Iq4 => "gguf_iq4_xs",
-        })
-        .unwrap()
-    }
-    fn representation(self) -> &'static str {
-        match self {
-            Self::Q4K => "q4k",
-            Self::Q5K => "q5k",
-            Self::Q6K => "q6k",
-            Self::Q8 => "q8g32s",
-            Self::Iq4 => "iq4g32",
-        }
-    }
-    fn block_values(self) -> usize {
-        match self {
-            Self::Q8 => 32,
-            _ => 256,
-        }
-    }
-    fn block_bytes(self) -> usize {
-        match self {
-            Self::Q4K => 144,
-            Self::Q5K => 176,
-            Self::Q6K => 210,
-            Self::Q8 => 34,
-            Self::Iq4 => 136,
-        }
-    }
-    /// One pseudo-random GGUF block with GGUF-like (small positive) factors.
-    fn block(self, rng: &mut Rng) -> Vec<u8> {
-        let f16 = |value: f32| f16_bits(value).to_le_bytes();
-        let mut block = Vec::new();
-        let factor =
-            |rng: &mut Rng, low: f32, high: f32| low + (high - low) * (rng.unit() + 1.0) * 0.5;
-        match self {
-            Self::Q4K | Self::Q5K => {
-                block.extend(f16(factor(rng, 0.0005, 0.003)));
-                block.extend(f16(factor(rng, 0.0, 0.002)));
-                let bytes = if self == Self::Q4K {
-                    12 + 128
-                } else {
-                    12 + 32 + 128
-                };
-                block.extend((0..bytes).map(|_| rng.byte()));
-            }
-            Self::Q6K => {
-                block.extend((0..128 + 64).map(|_| rng.byte()));
-                block.extend((0..16).map(|_| (rng.next() % 128) as u8 ^ 0xC0));
-                block.extend(f16(factor(rng, 0.0002, 0.001)));
-            }
-            Self::Q8 => {
-                block.extend(f16(factor(rng, 0.001, 0.005)));
-                block.extend((0..32).map(|_| rng.byte()));
-            }
-            Self::Iq4 => {
-                block.extend(f16(factor(rng, 0.0005, 0.003)));
-                block.extend((0..2 + 4 + 128).map(|_| rng.byte()));
-            }
-        }
-        block
+        Format::rounded(Encoding::from_id(kind).unwrap_or_else(|| panic!("GGUF type {kind}")))
     }
 }
 
@@ -430,13 +353,13 @@ impl Ctx {
         Arg::Shared(self.tensor(Element::i32(), shape, &i32_bytes(values)))
     }
     fn resident(&self, format: Format) -> Element {
-        Element::stored(format.representation(), self.layout()).unwrap()
+        format.element(self.layout())
     }
     /// A resident packed weight of `shape` from external GGUF bytes.
     fn packed(&self, format: Format, shape: &[u64], external: &[u8]) -> Tensor {
         let resident = self.resident(format);
         let bytes = resident
-            .repack_host(format.external(), shape, external)
+            .repack_host(format.source(), shape, external)
             .unwrap_or_else(|| panic!("{format:?} {shape:?} repack"));
         self.tensor(resident, shape, &bytes)
     }
@@ -448,8 +371,8 @@ impl Ctx {
         let values = uniform(
             &mut rng,
             shape.iter().product::<u64>() as usize,
-            -0.04,
-            0.04,
+            -WEIGHT_SCALE,
+            WEIGHT_SCALE,
         );
         self.tensor(element, shape, &dense_bytes(element, &values))
     }
@@ -495,7 +418,7 @@ impl Ctx {
         let mut rng = Rng::new(seed);
         let values = shape.iter().product::<u64>() as usize;
         let external = (0..values / format.block_values())
-            .flat_map(|_| format.block(&mut rng))
+            .flat_map(|_| format.block(&mut rng, WEIGHT_SCALE))
             .collect::<Vec<_>>();
         self.packed(format, shape, &external)
     }
@@ -1487,12 +1410,12 @@ fn routed_weights(ctx: &Ctx, formats: [Format; 6], dense: Option<Element>) -> Ro
 }
 
 fn routed_weight_variants() -> Vec<(&'static str, Element, [Format; 6], Option<Element>, bool)> {
-    use Format::*;
+    let (q4k, q5k, q6k, q8) = (Format::Q4K, Format::Q5K, Format::Q6K, Format::Q8);
     vec![
-        ("35b-mix", bf16(), [Q4K, Q4K, Q5K, Q8, Q8, Q8], None, true),
-        ("k-mix", bf16(), [Q5K, Q6K, Q4K, Q4K, Q6K, Q5K], None, false),
-        ("f16", f16(), [Q4K, Q4K, Q5K, Q8, Q8, Q8], None, false),
-        ("dense-bf16", bf16(), [Q4K; 6], Some(bf16()), false),
+        ("35b-mix", bf16(), [q4k, q4k, q5k, q8, q8, q8], None, true),
+        ("k-mix", bf16(), [q5k, q6k, q4k, q4k, q6k, q5k], None, false),
+        ("f16", f16(), [q4k, q4k, q5k, q8, q8, q8], None, false),
+        ("dense-bf16", bf16(), [q4k; 6], Some(bf16()), false),
     ]
 }
 
@@ -1939,8 +1862,7 @@ fn import_dense(ctx: &Ctx) -> Vec<Variant> {
 }
 
 fn repack_weight(ctx: &Ctx) -> Vec<Variant> {
-    use Format::*;
-    [Q4K, Q5K, Q6K, Q8, Iq4]
+    REPACKED
         .into_iter()
         .map(|format| {
             let mut rng = Rng::new(21);
@@ -1949,21 +1871,17 @@ fn repack_weight(ctx: &Ctx) -> Vec<Variant> {
                 .map(|shape| {
                     let n = shape.iter().product::<u64>() as usize;
                     let external = (0..n / format.block_values())
-                        .flat_map(|_| format.block(&mut rng))
+                        .flat_map(|_| format.block(&mut rng, WEIGHT_SCALE))
                         .collect::<Vec<_>>();
                     Case {
                         label: format!("{shape:?}"),
-                        args: vec![Arg::Shared(ctx.tensor(
-                            format.external(),
-                            &shape,
-                            &external,
-                        ))],
+                        args: vec![Arg::Shared(ctx.tensor(format.source(), &shape, &external))],
                     }
                 })
                 .collect();
             Variant {
-                label: format.representation().into(),
-                elements: vec![("E", format.external()), ("U", ctx.resident(format))],
+                label: format.name(),
+                elements: vec![("E", format.source()), ("U", ctx.resident(format))],
                 statics: vec![],
                 every_configuration: true,
                 cases,

@@ -81,8 +81,9 @@ struct SelectedRows {
 // optionally gathered through a row table (the selected vocabulary rows).
 template <typename W>
 struct Weights {
+    typedef typename packets::GeometryOf<W>::type geometry_type;
     device const uchar *base;
-    Rows16 layout;
+    geometry_type layout;
     uint k;
     device const int *table;
     // The tensor row of this view's row 0 (a view over a row range).
@@ -95,7 +96,7 @@ struct Weights {
     // Row n as the packet decoders address it: its base (its row tile's
     // first row) and its geometry (`Rows16::of`).
     device const uchar *row(uint n) const { return layout.base_of(base, stored(n)); }
-    Rows16 geometry(uint n) const { return layout.of(stored(n)); }
+    geometry_type geometry(uint n) const { return layout.of(stored(n)); }
     typename W::packet packet(uint n, uint p) const {
         return packets::Loader<W>::load(row(n), geometry(n), p, k);
     }
@@ -116,7 +117,7 @@ struct Weights {
     // `dense_expand` over Q8_0 at four rows: 118.5 against 114.9 µs).
     struct located {
         device const uchar *row;
-        Rows16 geometry;
+        geometry_type geometry;
     };
     located locate(uint n) const { return located{row(n), geometry(n)}; }
     // Whether rows g * R .. g * R + R - 1 of a view of `rows` rows lie in
@@ -137,6 +138,15 @@ struct Weights {
     }
     typename W::packet packet(thread const located &at, uint p) const {
         return packets::Loader<W>::load(at.row, at.geometry, p, k);
+    }
+    // Packets p .. p + W::span() - 1 decoded together (`packets::Packet::span`).
+    template <typename V = W>
+    typename V::span_packet span(uint n, uint p) const {
+        return V::load_span(row(n), geometry(n), p);
+    }
+    template <typename V = W>
+    typename V::span_packet span(thread const located &at, uint p) const {
+        return V::load_span(at.row, at.geometry, p);
     }
     typename packets::Block<W>::state run(thread const located &at, uint p) const {
         return packets::Block<W>::load(at.row, at.geometry, p);
@@ -846,13 +856,27 @@ private:
 constant constexpr uint gemv_stage_packet_rows = 448;
 constant constexpr uint gemv_packet_row_bytes = 4 * 16;
 
+// The staged word of step s of chunk-local packet p of a chunk of `count`
+// packets, for lanes that decode SPAN packets at a time: p * 4 + s for whole
+// packets; in spans (SPAN > 1), packet i of span a at ((4 i + s) spans + a),
+// so the lanes of a group, each at the same step of its own span, read
+// consecutive words (in packet order they would be a span's words apart, in
+// one bank).
+template <uint SPAN>
+inline uint gemv_staged(uint p, uint s, uint count) {
+    if constexpr (SPAN == 1u)
+        return p * 4u + s;
+    else
+        return (p % SPAN * 4u + s) * (count / SPAN) + p / SPAN;
+}
+
 // Stage packets first .. first + count of MAXM activation rows (rows at or
 // past m_rows are zero); all threads of the threadgroup (whole simdgroups)
 // take part, one thread per eight columns. The eight activation values of
 // chunk-local packet p, step s (columns 32p + 8s ..) and row m are one uint4
-// in A storage at words[(p * 4 + s) * MAXM + m], so a lane reads the rows of
-// its step consecutively.
-template <uint MAXM, typename In>
+// in A storage at words[gemv_staged<SPAN>(p, s, count) * MAXM + m], so a lane
+// reads the rows of its step consecutively.
+template <uint MAXM, uint SPAN = 1u, typename In>
 inline void gemv_stage(thread const In &in, uint m_rows, uint first, uint count, threadgroup uint4 *words,
     uint thread_index, uint threads) {
     typedef typename In::activation A;
@@ -862,7 +886,7 @@ inline void gemv_stage(thread const In &in, uint m_rows, uint first, uint count,
         float4 even = float4(0.0f), odd = float4(0.0f);
         if (m < m_rows)
             in.load8(m, 32u * (first + local) + 8u * step, 0.0f, even, odd);
-        words[(local * 4u + step) * MAXM + m] = A::pack8(even, odd);
+        words[gemv_staged<SPAN>(local, step, count) * MAXM + m] = A::pack8(even, odd);
     }
 }
 
@@ -901,25 +925,61 @@ struct gemv_rows {
     }
 };
 
-// One packet of R weight rows (and, paired, of R rows of the second tensor).
-template <typename W, typename U, bool PAIRED, uint R>
+// The packets a GEMV lane decodes together (`gemv_body`,
+// `gemv_batch_body`): its decoders' span (`span()`), the same for both where
+// paired, or one; in the row GEMV where its staging holds LANES spans
+// (`gemv_stage_packet_rows / MAXM` packets).
+template <typename W>
+constexpr auto decoder_span(int) -> decltype(W::span()) { return W::span(); }
+template <typename W>
+constexpr uint decoder_span(long) { return 1u; }
+template <typename W, typename U, bool PAIRED>
+constexpr uint paired_span() {
+    return !PAIRED || decoder_span<W>(0) == decoder_span<U>(0) ? decoder_span<W>(0) : 1u;
+}
+template <typename W, typename U, bool PAIRED, uint MAXM, uint LANES>
+constexpr uint gemv_span() {
+    return gemv_stage_packet_rows / MAXM >= LANES * paired_span<W, U, PAIRED>() ? paired_span<W, U, PAIRED>() : 1u;
+}
+
+// The packets one lane decodes at a time of a decoder: one, or a span.
+template <typename W, uint SPAN>
+struct gemv_packet {
+    typedef typename W::span_packet type;
+};
+template <typename W>
+struct gemv_packet<W, 1u> {
+    typedef typename W::packet type;
+};
+// Those at packet p of the row `at` names (its index or its located row).
+template <uint SPAN, typename V, typename At>
+inline typename gemv_packet<V, SPAN>::type gemv_lane_load(thread const Weights<V> &w, thread const At &at, uint p) {
+    if constexpr (SPAN == 1u)
+        return w.packet(at, p);
+    else
+        return w.span(at, p);
+}
+
+// One packet (or, SPAN > 1, one span) of R weight rows (and, paired, of R
+// rows of the second tensor).
+template <typename W, typename U, bool PAIRED, uint R, uint SPAN = 1u>
 struct gemv_packets {
-    typename W::packet a[R];
-    typename U::packet b[R];
+    typename gemv_packet<W, SPAN>::type a[R];
+    typename gemv_packet<U, SPAN>::type b[R];
     template <bool DERIVED>
     void load(thread const Weights<W> &w, thread const Weights<U> &u,
         thread const gemv_rows<W, U, PAIRED, R, DERIVED> &at, uint p) {
         if (DERIVED) {
-            a[0] = w.packet(at.only, p);
+            a[0] = gemv_lane_load<SPAN>(w, at.only, p);
             if (PAIRED)
-                b[0] = u.packet(at.only, p);
+                b[0] = gemv_lane_load<SPAN>(u, at.only, p);
             return;
         }
         PROJECTION_UNROLL
         for (uint r = 0; r < R; ++r) {
-            a[r] = w.packet(at.a[r], p);
+            a[r] = gemv_lane_load<SPAN>(w, at.a[r], p);
             if (PAIRED)
-                b[r] = u.packet(at.b[r], p);
+                b[r] = gemv_lane_load<SPAN>(u, at.b[r], p);
         }
     }
 };
@@ -1041,6 +1101,36 @@ struct gemv_emit<true> {
     }
 };
 
+// Accumulate steps STEP.. of a loaded span into the accumulators of all
+// MAXM staged rows, its step s at `words + s spans MAXM` (`gemv_staged`),
+// each step's places compile-time constants.
+template <typename W, typename U, bool PAIRED, uint R, uint MAXM, typename A, uint SPAN, uint STEP = 0u>
+inline void gemv_span_steps(thread float (&acc)[R][MAXM], thread float (&acc2)[R][MAXM],
+    thread const gemv_packets<W, U, PAIRED, R, SPAN> &packets, threadgroup const uint4 *words, uint spans) {
+    if constexpr (STEP < 4u * SPAN) {
+        float4 ae[R], ao[R], be[R], bo[R];
+        PROJECTION_UNROLL
+        for (uint r = 0; r < R; ++r) {
+            W::template span_values<STEP>(packets.a[r], ae[r], ao[r]);
+            if (PAIRED)
+                U::template span_values<STEP>(packets.b[r], be[r], bo[r]);
+        }
+        threadgroup const uint4 *x = words + STEP * spans * MAXM;
+        PROJECTION_UNROLL
+        for (uint m = 0; m < MAXM; ++m) {
+            float4 xe, xo;
+            A::split8(x[m], xe, xo);
+            PROJECTION_UNROLL
+            for (uint r = 0; r < R; ++r) {
+                acc[r][m] = gemv_step_dot(acc[r][m], ae[r], ao[r], xe, xo);
+                if (PAIRED)
+                    acc2[r][m] = gemv_step_dot(acc2[r][m], be[r], bo[r], xe, xo);
+            }
+        }
+        gemv_span_steps<W, U, PAIRED, R, MAXM, A, SPAN, STEP + 1u>(acc, acc2, packets, words, spans);
+    }
+}
+
 // One GEMV threadgroup of SG simdgroups. A simdgroup is 32 / LANES lane
 // groups; lane group g of simdgroup sg owns the R weight rows from
 // ((tile * SG + sg) * (32 / LANES) + g) * R, and its lanes own the packets
@@ -1049,28 +1139,32 @@ struct gemv_emit<true> {
 // (a multiple of LANES). Weight packets are double-buffered in registers: a
 // lane loads its next packet before accumulating the current one, and its
 // first packet before the staging, so the weight stream never waits on it.
+// Decoders with a span (`gemv_span`) take it: a lane owns the spans sub,
+// sub + LANES, ... of its rows (a row's packets rounded up to whole spans,
+// the activations past K staged as zero), each byte of a span decoded once.
 template <typename W, typename U, bool PAIRED, uint R, uint MAXM, uint LANES, bool COLUMNS = false, typename In,
     typename Out>
 inline void gemv_body(thread const In &in, thread const Out &out, thread const Weights<W> &w,
     thread const Weights<U> &u, uint m_rows, uint rows, uint k, uint tile,
     threadgroup uchar *shared, uint simdgroups, uint sg, uint lane) {
     static_assert(LANES == 32 || LANES == 16 || LANES == 8, "a GEMV lane group is 8, 16 or 32 lanes");
+    constexpr uint SPAN = gemv_span<W, U, PAIRED, MAXM, LANES>();
     typedef typename In::activation A;
     uint group = lane / LANES, sub = lane % LANES;
     uint first_row = ((tile * simdgroups + sg) * (32u / LANES) + group) * R;
     bool active = first_row < rows;
-    uint packets = (k + 31u) / 32u;
+    uint packets = ((k + 31u) / 32u + (SPAN - 1u)) / SPAN * SPAN;
     // A lane group of one row derives it at each load: across four activation
     // rows' accumulators the located row costs more than the arithmetic
     // (`Weights::locate`).
     gemv_rows<W, U, PAIRED, R, (R == 1u)> at;
-    gemv_packets<W, U, PAIRED, R> current, next;
+    gemv_packets<W, U, PAIRED, R, SPAN> current, next;
     if (active) {
         at.locate(w, u, first_row, rows);
-        if (sub < packets)
-            current.load(w, u, at, sub);
+        if (sub * SPAN < packets)
+            current.load(w, u, at, sub * SPAN);
     }
-    uint chunk = min(packets, (gemv_stage_packet_rows / MAXM) / LANES * LANES);
+    uint chunk = min(packets, (gemv_stage_packet_rows / MAXM) / (LANES * SPAN) * (LANES * SPAN));
     threadgroup uint4 *words = reinterpret_cast<threadgroup uint4 *>(shared);
     float acc[R][MAXM], acc2[R][MAXM];
     for (uint r = 0; r < R; ++r)
@@ -1082,13 +1176,17 @@ inline void gemv_body(thread const In &in, thread const Out &out, thread const W
         // call's reads of the threadgroup memory finish before this one
         // writes it.
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        gemv_stage<MAXM>(in, m_rows, first, count, words, sg * 32u + lane, simdgroups * 32u);
+        gemv_stage<MAXM, SPAN>(in, m_rows, first, count, words, sg * 32u + lane, simdgroups * 32u);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (active) {
-            for (uint local = sub; local < count; local += LANES) {
-                if (first + local + LANES < packets)
-                    next.load(w, u, at, first + local + LANES);
-                gemv_accumulate<W, U, PAIRED, R, MAXM, A>(acc, acc2, current, local, words);
+            for (uint local = sub * SPAN; local < count; local += LANES * SPAN) {
+                if (first + local + LANES * SPAN < packets)
+                    next.load(w, u, at, first + local + LANES * SPAN);
+                if constexpr (SPAN == 1u)
+                    gemv_accumulate<W, U, PAIRED, R, MAXM, A>(acc, acc2, current, local, words);
+                else
+                    gemv_span_steps<W, U, PAIRED, R, MAXM, A, SPAN>(acc, acc2, current,
+                        words + local / SPAN * MAXM, count / SPAN);
                 current = next;
             }
         }
@@ -2578,13 +2676,18 @@ struct gemv_batch_rows {
 // Packet p of the weight row at `at` for a lane that walks the row in packet
 // order: formed through the row's coefficient run (`packets::Block`), which
 // is loaded at each run's first packet. A lane then reads the coefficient
-// planes once per run instead of once per packet.
-template <typename W>
-inline typename W::packet gemv_batch_load(thread const Weights<W> &w,
+// planes once per run instead of once per packet. With a span
+// (`paired_span`) packets p .. p + SPAN - 1 together.
+template <typename W, uint SPAN = 1u>
+inline typename gemv_packet<W, SPAN>::type gemv_batch_load(thread const Weights<W> &w,
     thread const typename Weights<W>::located &at, uint p, thread typename packets::Block<W>::state &run) {
-    if (p % packets::Block<W>::packets == 0u)
-        run = w.run(at, p);
-    return w.packet(at, p, run);
+    if constexpr (SPAN == 1u) {
+        if (p % packets::Block<W>::packets == 0u)
+            run = w.run(at, p);
+        return w.packet(at, p, run);
+    } else {
+        return w.span(at, p);
+    }
 }
 
 // Accumulate one packet of this lane's weight row into `acc`: the decoded
@@ -2597,6 +2700,41 @@ inline void gemv_batch_packet(thread simdgroup_float8x8 (&acc)[NB], thread const
         reinterpret_cast<thread float2 &>(weights.thread_elements()) = W::pair_values(a, step, pair_index);
         for (uint b = 0; b < NB; ++b)
             simdgroup_multiply_accumulate(acc[b], weights, x[step][b], acc[b]);
+    }
+}
+// The same of the steps FIRST + STEP.. of a span (`paired_span`), its
+// steps' places compile-time constants.
+template <typename W, uint NB, uint FIRST, uint STEP = 0u>
+inline void gemv_batch_span_packet(thread simdgroup_float8x8 (&acc)[NB], thread const typename W::span_packet &a,
+    thread const simdgroup_float8x8 (&x)[4][NB], uint pair_index) {
+    if constexpr (STEP < 4u) {
+        simdgroup_float8x8 weights;
+        reinterpret_cast<thread float2 &>(weights.thread_elements()) =
+            W::template span_pair_values<FIRST + STEP>(a, pair_index);
+        for (uint b = 0; b < NB; ++b)
+            simdgroup_multiply_accumulate(acc[b], weights, x[STEP][b], acc[b]);
+        gemv_batch_span_packet<W, NB, FIRST, STEP + 1u>(acc, a, x, pair_index);
+    }
+}
+// Packets I.. of a span of R weight rows (and, paired, of the second
+// tensor) whose first is chunk-local packet `local`, their staged steps at
+// `staged` (`gemv_batch_body`).
+template <typename W, typename U, bool PAIRED, uint R, uint NB, uint SPAN, uint PITCH, uint I = 0u>
+inline void gemv_batch_span(thread simdgroup_float8x8 (&acc)[R][NB], thread simdgroup_float8x8 (&acc2)[R][NB],
+    thread const typename W::span_packet (&a)[R], thread const typename U::span_packet (&b)[R],
+    threadgroup const float *staged, uint local, uint pair_index) {
+    if constexpr (I < SPAN) {
+        simdgroup_float8x8 x[4][NB];
+        for (uint step = 0; step < 4; ++step)
+            for (uint bb = 0; bb < NB; ++bb)
+                simdgroup_load(x[step][bb], staged + 8u * bb * PITCH + 32u * (local + I) + 8u * step, PITCH,
+                    ulong2(0, 0), true);
+        for (uint r = 0; r < R; ++r) {
+            gemv_batch_span_packet<W, NB, 4u * I>(acc[r], a[r], x, pair_index);
+            if (PAIRED)
+                gemv_batch_span_packet<U, NB, 4u * I>(acc2[r], b[r], x, pair_index);
+        }
+        gemv_batch_span<W, U, PAIRED, R, NB, SPAN, PITCH, I + 1u>(acc, acc2, a, b, staged, local, pair_index);
     }
 }
 
@@ -2664,6 +2802,9 @@ inline void gemv_batch_body(thread const In &in, thread const Out &out, thread c
     uint simdgroups, uint sg, uint lane) {
     constexpr uint chunk = gemv_batch_chunk<NB, BYTES>();
     constexpr uint pitch = chunk + 4u;
+    // A lane walks its row's packets in spans where its decoders have them
+    // (`paired_span`) and a chunk holds whole spans.
+    constexpr uint SPAN = chunk % (32u * paired_span<W, U, PAIRED>()) == 0u ? paired_span<W, U, PAIRED>() : 1u;
     threadgroup float *staged = reinterpret_cast<threadgroup float *>(shared);
     ushort2 at = fragment_coordinate(lane);
     uint pair_index = at.x / 2u;
@@ -2688,20 +2829,20 @@ inline void gemv_batch_body(thread const In &in, thread const Out &out, thread c
             acc2[r][b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
         }
     }
-    typename W::packet a[R], a_next[R];
-    typename U::packet b[R], b_next[R];
+    typename gemv_packet<W, SPAN>::type a[R], a_next[R];
+    typename gemv_packet<U, SPAN>::type b[R], b_next[R];
     typename packets::Block<W>::state a_run[R];
     typename packets::Block<U>::state b_run[R];
     for (uint c0 = 0; c0 < k; c0 += chunk) {
-        uint packets = (min(chunk, k - c0) + 31u) / 32u;
+        uint packets = ((min(chunk, k - c0) + 31u) / 32u + (SPAN - 1u)) / SPAN * SPAN;
         // The chunk's first packets load while the threadgroup stages it; a
         // threadgroup may run several batched GEMVs in turn, and the previous
         // chunk or call finishes reading the staging first.
         if (active) {
             for (uint r = 0; r < R; ++r) {
-                a[r] = gemv_batch_load(w, a_at[r], c0 / 32u, a_run[r]);
+                a[r] = gemv_batch_load<W, SPAN>(w, a_at[r], c0 / 32u, a_run[r]);
                 if (PAIRED)
-                    b[r] = gemv_batch_load(u, b_at[r], c0 / 32u, b_run[r]);
+                    b[r] = gemv_batch_load<U, SPAN>(u, b_at[r], c0 / 32u, b_run[r]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2717,23 +2858,27 @@ inline void gemv_batch_body(thread const In &in, thread const Out &out, thread c
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (!active)
             continue;
-        for (uint local = 0; local < packets; ++local) {
-            if (local + 1u < packets) {
+        for (uint local = 0; local < packets; local += SPAN) {
+            if (local + SPAN < packets) {
                 for (uint r = 0; r < R; ++r) {
-                    a_next[r] = gemv_batch_load(w, a_at[r], c0 / 32u + local + 1u, a_run[r]);
+                    a_next[r] = gemv_batch_load<W, SPAN>(w, a_at[r], c0 / 32u + local + SPAN, a_run[r]);
                     if (PAIRED)
-                        b_next[r] = gemv_batch_load(u, b_at[r], c0 / 32u + local + 1u, b_run[r]);
+                        b_next[r] = gemv_batch_load<U, SPAN>(u, b_at[r], c0 / 32u + local + SPAN, b_run[r]);
                 }
             }
-            simdgroup_float8x8 x[4][NB];
-            for (uint step = 0; step < 4; ++step)
-                for (uint bb = 0; bb < NB; ++bb)
-                    simdgroup_load(x[step][bb], staged + 8u * bb * pitch + 32u * local + 8u * step, pitch,
-                        ulong2(0, 0), true);
-            for (uint r = 0; r < R; ++r) {
-                gemv_batch_packet<W, NB>(acc[r], a[r], x, pair_index);
-                if (PAIRED)
-                    gemv_batch_packet<U, NB>(acc2[r], b[r], x, pair_index);
+            if constexpr (SPAN == 1u) {
+                simdgroup_float8x8 x[4][NB];
+                for (uint step = 0; step < 4; ++step)
+                    for (uint bb = 0; bb < NB; ++bb)
+                        simdgroup_load(x[step][bb], staged + 8u * bb * pitch + 32u * local + 8u * step, pitch,
+                            ulong2(0, 0), true);
+                for (uint r = 0; r < R; ++r) {
+                    gemv_batch_packet<W, NB>(acc[r], a[r], x, pair_index);
+                    if (PAIRED)
+                        gemv_batch_packet<U, NB>(acc2[r], b[r], x, pair_index);
+                }
+            } else {
+                gemv_batch_span<W, U, PAIRED, R, NB, SPAN, pitch>(acc, acc2, a, b, staged, local, pair_index);
             }
             for (uint r = 0; r < R; ++r) {
                 a[r] = a_next[r];
@@ -2830,109 +2975,373 @@ inline void gemv_batch_paired_runtime(thread const In &in, thread const Out &out
 // `shared` holds PARTS-independent 16 bytes per thread and activation
 // fragment.
 
-// Weights with a matrix GEMV whose products fold a block's local scale codes
-// into the left operand: unsigned codes of a plane of low nibbles (and a
-// plane of high bits) under hierarchical coefficients with a minimum, an
-// unsigned local scale code per 32 columns and factors per 256, which the
-// runtime admits where a code times a scale code stays below 2048 (an exact
-// F16 integer of the operand's 2^-24). `at` is a lane's place in its row's
-// planes (32-bit offsets from the tensor), `load` its words of block g,
-// `pair` its two codes of step s in the halves of one word.
-template <typename P>
-struct matrix_planes {
-    static constant constexpr bool implemented = false;
+// Lane codes: the operand the matrix GEMV and the token-packing GEMM
+// (`packing.h`) take from a weight's producer. Chunk k of a packet is its
+// columns 8 k .. 8 k + 7; a lane that holds a chunk takes its codes two at a
+// time, p and p + 4 (`pair`, position p < 4), as unsigned integers in the
+// two halves of a word whose values are the codes less `zero()`, each below
+// 1024 (a half of the same bits is the code times 2^-24, exactly). `at` is
+// a lane's place of chunk k in a row's planes (32-bit offsets from the
+// tensor), `load<INDEXED>` its words of packet g (or of the chunk `chunks`
+// chunks on, by the same base), and `shift` words moved on by `positions`
+// positions (pair p of the result is pair p + positions of the words). One
+// reader per code source:
+// linear codes of code planes of every split the registry makes
+// (`registry::code_planes`), entering as their stored codes or above them; a
+// codebook's values, entering at 128 (`codebooks::pairs`); and grid entries'
+// values, entering at any ZERO. Where `bytes()`, a chunk's words are its
+// eight codes as bytes in column order, as `packing_byte_step` reads them.
+
+// The codes of one plane of B-bit codes (B 1, 2 or 4) in a chunk: B bytes at
+// byte B k of the packet's unit of 4 B bytes, code i at bit B i
+// (`packets::Fields`, `packets::Planes`); `load` spreads them, codes 0..3
+// and 4..7 in the two halves of a word.
+template <uint B>
+struct chunk_plane {
+    static_assert(B == 1u || B == 2u || B == 4u, "a plane's chunk is one, two or four bytes");
+    typedef metal::conditional_t<B == 1u, uchar, metal::conditional_t<B == 2u, ushort, uint>> unit;
+    template <typename W>
+    static uint at(thread const Weights<W> &w, thread const typename Weights<W>::located &row, ulong plane, uint k) {
+        return uint(row.geometry.at(row.row, plane, 4ul * B, 0ul) - w.base) + k * B;
+    }
+    // A load INDEXED from the lane's place (a base and a 32-bit index of its
+    // units), as the matrix GEMV's block loop takes it, or from the sum of
+    // the place and a 32-bit offset, as PACK's does: indexed, PACK over
+    // q5g32s is 1.7% slower (M4 Pro, `dense_output` at M = 512, 5448 against
+    // 5353 µs) and over iq4xs 1%.
+    template <bool INDEXED, typename W>
+    static uint load(thread const Weights<W> &w, uint at, uint g, uint chunks) {
+        uint field;
+        if constexpr (INDEXED)
+            field = uint(reinterpret_cast<device const unit *>(w.base + at)[g * 4u * w.layout.tile + chunks]);
+        else
+            field = uint(*reinterpret_cast<device const unit *>(w.base + at + (g * 4u * w.layout.tile + chunks) * B));
+        if constexpr (B == 4u)
+            return field;
+        else
+            return (field | (field << (16u - 4u * B))) & (((1u << (4u * B)) - 1u) * 0x00010001u);
+    }
+    static uint pair(uint spread, uint p) { return (spread >> (B * p)) & (((1u << B) - 1u) * 0x00010001u); }
 };
-template <>
-struct matrix_planes<packets::Planes<4, 0>> {
-    static constant constexpr bool implemented = true;
-    typedef uint place;
-    typedef uint words;
-    template <typename W>
-    static place at(thread const Weights<W> &w, thread const typename Weights<W>::located &row, uint x) {
-        return uint(row.geometry.at(row.row, w.layout.codes, 16ul, 0ul) - w.base) + (x / 2u) * 4u;
-    }
-    // An indexed load from the lane's place: the load takes a base and a
-    // 32-bit index, where the address of each word would be a 64-bit sum.
-    template <typename W>
-    static words load(thread const Weights<W> &w, place at, uint g) {
-        return reinterpret_cast<device const uint *>(w.base + at)[g * 4u * w.layout.tile];
-    }
-    static uint pair(words codes, uint s) { return (codes >> (4u * s)) & 0x000f000fu; }
+
+// A chunk's eight codes as bytes (columns 0..3 in x, 4..7 in y): pair p is
+// byte p of each word.
+inline uint chunk_byte_pair(uint2 codes, uint p) {
+    return ((codes.x >> (8u * p)) & 0xffu) | (((codes.y >> (8u * p)) & 0xffu) << 16);
+}
+
+// The zero code a producer's codes enter at by themselves: a linear code's
+// stored zero, else 128 (a codebook's pairs, and grid values as bytes).
+template <typename P, typename C>
+struct lane_zero {
+    static constexpr int value() { return 128; }
 };
-// With a plane of high bits: the lane's byte of the block's high bits beside
-// its word of nibbles, a nibble of the byte under each half of the word.
-template <>
-struct matrix_planes<packets::Planes<4, 1>> {
-    static constant constexpr bool implemented = true;
-    typedef uint2 place;
-    typedef uint2 words;
+template <typename P, uint MASK, int Z>
+struct lane_zero<P, packets::Linear<MASK, Z>> {
+    static constexpr int value() { return Z; }
+};
+
+// The lane codes of decoders of codes in planes P interpreted by C, entering
+// at ZERO (`implemented()`); none by default.
+template <typename P, typename C, int ZERO = lane_zero<P, C>::value()>
+struct lane_codes {
+    static constexpr bool implemented() { return false; }
+};
+
+// Linear codes of code planes, whose value zero is code Z: a low plane of
+// LOW bits (1, 2 or 4) and, HIGH, a high plane of HIGH bits above them,
+// entering at any ZERO from Z on (one add moves both of a pair).
+template <uint LOW, uint HIGH, uint MASK, int Z, int ZERO>
+struct lane_codes<packets::Planes<LOW, HIGH>, packets::Linear<MASK, Z>, ZERO> {
+    typedef chunk_plane<LOW> low_plane;
+    typedef metal::conditional_t<HIGH == 0u, uint, uint2> place;
+    typedef place words;
+    static constexpr bool implemented() { return MASK == 0u && LOW <= 4u && HIGH <= 2u && ZERO >= Z; }
+    static constexpr int zero() { return ZERO; }
+    static constexpr bool bytes() { return false; }
+    static constexpr bool byte_words() { return false; }
     template <typename W>
-    static place at(thread const Weights<W> &w, thread const typename Weights<W>::located &row, uint x) {
-        return uint2(uint(row.geometry.at(row.row, w.layout.codes, 16ul, 0ul) - w.base) + (x / 2u) * 4u,
-            uint(row.geometry.at(row.row, w.layout.high, 4ul, 0ul) - w.base) + x / 2u);
+    static place at(thread const Weights<W> &w, thread const typename Weights<W>::located &row, uint k) {
+        const uint low = low_plane::at(w, row, w.layout.codes, k);
+        if constexpr (HIGH == 0u)
+            return low;
+        else
+            return uint2(low, chunk_plane<HIGH>::at(w, row, w.layout.high, k));
     }
-    template <typename W>
-    static words load(thread const Weights<W> &w, place at, uint g) {
-        const uint high = w.base[at.y + g * 4u * w.layout.tile];
-        return uint2(reinterpret_cast<device const uint *>(w.base + at.x)[g * 4u * w.layout.tile],
-            (high | (high << 12)) & 0x000f000fu);
+    template <bool INDEXED, typename W>
+    static words load(thread const Weights<W> &w, place at, uint g, uint chunks = 0u) {
+        if constexpr (HIGH == 0u)
+            return low_plane::template load<INDEXED>(w, at, g, chunks);
+        else
+            return uint2(low_plane::template load<INDEXED>(w, at.x, g, chunks),
+                chunk_plane<HIGH>::template load<INDEXED>(w, at.y, g, chunks));
     }
-    static uint pair(words codes, uint s) {
-        return ((codes.x >> (4u * s)) & 0x000f000fu) | (((codes.y >> s) & 0x00010001u) << 4);
+    static uint pair(words codes, uint p) {
+        uint stored;
+        if constexpr (HIGH == 0u)
+            stored = low_plane::pair(codes, p);
+        else
+            stored = low_plane::pair(codes.x, p) | (chunk_plane<HIGH>::pair(codes.y, p) << LOW);
+        if constexpr (ZERO != Z)
+            return stored + uint(ZERO - Z) * 0x00010001u;
+        else
+            return stored;
+    }
+    static words shift(words codes, uint positions) {
+        if constexpr (HIGH == 0u)
+            return codes >> (LOW * positions);
+        else
+            return uint2(codes.x >> (LOW * positions), codes.y >> (HIGH * positions));
     }
 };
 
+// Linear codes of a plane of bytes, MASK flipped (two's complement bytes
+// become offset binary), entering at their zero.
+template <uint MASK, int Z, int ZERO>
+struct lane_codes<packets::Planes<8, 0>, packets::Linear<MASK, Z>, ZERO> {
+    typedef uint place;
+    typedef uint2 words;
+    static constexpr bool implemented() { return ZERO == Z; }
+    static constexpr int zero() { return Z; }
+    static constexpr bool bytes() { return true; }
+    static constexpr bool byte_words() { return true; }
+    static uint2 byte_codes(words codes) { return codes; }
+    template <typename W>
+    static place at(thread const Weights<W> &w, thread const typename Weights<W>::located &row, uint k) {
+        return uint(row.geometry.at(row.row, w.layout.codes, 32ul, 0ul) - w.base) + k * 8u;
+    }
+    // A row tile's rows of one block are adjacent: 32 bytes a row.
+    template <bool INDEXED, typename W>
+    static words load(thread const Weights<W> &w, place at, uint g, uint chunks = 0u) {
+        if constexpr (INDEXED)
+            return reinterpret_cast<device const uint2 *>(w.base + at)[g * 4u * w.layout.tile + chunks] ^ MASK;
+        else
+            return *reinterpret_cast<device const uint2 *>(w.base + at + (g * 4u * w.layout.tile + chunks) * 8u) ^ MASK;
+    }
+    static uint pair(words codes, uint p) { return chunk_byte_pair(codes, p); }
+    static words shift(words codes, uint positions) { return codes >> (8u * positions); }
+};
+
+// A codebook's 4-bit codes: the lane's four bytes of codes become its eight
+// values + 128 (`codebooks::pairs`, each code byte's two values), a byte
+// each.
+template <uint ID, int ZERO>
+struct lane_codes<packets::Planes<4, 0>, packets::Table<ID>, ZERO> {
+    typedef uint place;
+    typedef uint2 words;
+    static constexpr bool implemented() { return ZERO == 128; }
+    static constexpr int zero() { return 128; }
+    static constexpr bool bytes() { return true; }
+    static constexpr bool byte_words() { return true; }
+    static uint2 byte_codes(words codes) { return codes; }
+    template <typename W>
+    static place at(thread const Weights<W> &w, thread const typename Weights<W>::located &row, uint k) {
+        return chunk_plane<4>::at(w, row, w.layout.codes, k);
+    }
+    template <bool INDEXED, typename W>
+    static words load(thread const Weights<W> &w, place at, uint g, uint chunks = 0u) {
+        constant ushort *pairs = codebooks::pairs<ID>::values();
+        const uint codes = chunk_plane<4>::template load<INDEXED>(w, at, g, chunks);
+        return uint2(uint(pairs[codes & 0xffu]) | (uint(pairs[(codes >> 8) & 0xffu]) << 16),
+            uint(pairs[(codes >> 16) & 0xffu]) | (uint(pairs[codes >> 24]) << 16));
+    }
+    static uint pair(words codes, uint p) { return chunk_byte_pair(codes, p); }
+    static words shift(words codes, uint positions) { return codes >> (8u * positions); }
+};
+
+// Grid codes: a chunk is one entry (`packets::Entries::chunk_entry`), whose
+// eight values (`packets::Grid`: its points, signed by its sign bits, then
+// moved by its delta) enter at ZERO. A lane's place is its entry's in the
+// packet units of the grids plane and of the grid high plane, its shifts
+// there (`packets::EntryChunk`) and the entry. Without a delta an entry's
+// values + 128 are its words' bytes, formed four at a time when it loads: a
+// two's complement point's bytes with their sign bits flipped, or its
+// magnitudes signed as bytes (`packets::signed_bytes`). With a delta a pair
+// is formed at each step, 2^DELTA_EXPONENT (value + 128) moved by the
+// delta, in halves that stay below 2^16.
+template <uint BYTES, uint HIGH, uint GRID, uint INDEX_BITS, uint LANES, uint SIGNS, bool DELTA,
+    uint DELTA_EXPONENT, uint SIGN_BIT, uint SIGN_BITS, uint DELTA_BIT, int ZERO>
+struct lane_codes<packets::Entries<BYTES, HIGH>,
+    packets::Grid<GRID, INDEX_BITS, LANES, SIGNS, DELTA, DELTA_EXPONENT, SIGN_BIT, SIGN_BITS, DELTA_BIT>, ZERO> {
+    typedef packets::Entries<BYTES, HIGH> E;
+    typedef packets::Grid<GRID, INDEX_BITS, LANES, SIGNS, DELTA, DELTA_EXPONENT, SIGN_BIT, SIGN_BITS, DELTA_BIT> G;
+    typedef uint4 place;
+    // The entry's bytes (its values + 128 without a delta; its points with
+    // one), its sign bits with a delta (columns 0..3 at bits 0.., 4..7 at
+    // bits 16..), and what moves a pair to the values + ZERO, in both halves
+    // of a word.
+    struct words {
+        uint2 points;
+        uint signs;
+        uint offset;
+    };
+    static constexpr bool implemented() { return true; }
+    static constexpr int zero() { return ZERO; }
+    static constexpr bool bytes() { return false; }
+    // Its values + 128 as bytes, without a delta.
+    static constexpr bool byte_words() { return !DELTA && ZERO == 128; }
+    static uint2 byte_codes(thread const words &codes) { return codes.points; }
+    template <typename W>
+    static place at(thread const Weights<W> &w, thread const typename Weights<W>::located &row, uint k) {
+        const packets::EntryChunk chunk = E::chunk_of(k);
+        return uint4(uint(row.geometry.at(row.row, w.layout.codes, ulong(E::unit_bytes()), 0ul) - w.base) + chunk.offset,
+            uint(row.geometry.at(row.row, w.layout.high, ulong(E::high_bytes()), 0ul) - w.base),
+            chunk.shift | (chunk.high_shift << 8), k);
+    }
+    // Addressed by sums either way (INDEXED: the consumer's choice for
+    // planes).
+    template <bool INDEXED, typename W>
+    static words load(thread const Weights<W> &w, place at, uint g, uint chunks = 0u) {
+        // The entry `chunks` on: its offset from this one's, and its shifts.
+        const packets::EntryChunk later = E::chunk_of(at.w + chunks);
+        const uint offset = later.offset - E::chunk_of(at.w).offset;
+        const uint shifts = chunks == 0u ? at.z : later.shift | (later.high_shift << 8);
+        const uint entry = E::chunk_entry(w.base + at.x + offset + g * E::unit_bytes() * w.layout.tile,
+            w.base + at.y + g * E::high_bytes() * w.layout.tile, packets::EntryChunk{0u, shifts & 0xffu, shifts >> 8});
+        words codes;
+        const uint2 points = G::points::point(entry);
+        codes.signs = 0u;
+        if constexpr (DELTA) {
+            codes.points = points;
+            if constexpr (!G::signed_points()) {
+                const uint signs = G::signs(entry);
+                codes.signs = (signs & 15u) | ((signs & 0xf0u) << 12);
+            }
+            const int delta = ((entry >> DELTA_BIT) & 1u) != 0u ? -1 : 1;
+            codes.offset = uint(ZERO + delta - (128 << DELTA_EXPONENT)) * 0x00010001u;
+        } else {
+            if constexpr (G::signed_points()) {
+                codes.points = points ^ 0x80808080u;
+            } else {
+                const uint signs = G::signs(entry);
+                codes.points = uint2(packets::signed_bytes(points.x, signs & 15u),
+                    packets::signed_bytes(points.y, signs >> 4));
+            }
+            codes.offset = uint(ZERO - 128) * 0x00010001u;
+        }
+        return codes;
+    }
+    static uint pair(thread const words &codes, uint p) {
+        const uint pair = chunk_byte_pair(codes.points, p);
+        if constexpr (DELTA) {
+            uint shifted;
+            if constexpr (G::signed_points())
+                shifted = pair ^ 0x00800080u;
+            else {
+                const uint negative = (codes.signs >> p) & 0x00010001u;
+                shifted = pair + 0x00800080u - ((pair << 1) & ((negative << 16) - negative));
+            }
+            return (shifted << DELTA_EXPONENT) + codes.offset;
+        } else if constexpr (ZERO != 128) {
+            return pair + codes.offset;
+        } else {
+            return pair;
+        }
+    }
+    static words shift(words codes, uint positions) {
+        codes.points >>= 8u * positions;
+        codes.signs >>= positions;
+        return codes;
+    }
+};
+
+// A lane's pairs of chunk codes (`lane_codes`) less their zero as exact
+// halves, the operands of the matrix GEMV (`pair(p)`: codes p and p + 4).
+// Codes of bytes (`byte_words()`) are taken when they load, a word at a
+// time, four codes by two half subtractions (`packets::byte_floats`); others
+// a pair at each step (`packets::code_pair`), the same arithmetic over fewer
+// registers. An integer conversion costs several times a half subtraction,
+// and the matrix GEMV at M = 8 is bound by its lanes' arithmetic.
+template <typename L, bool BYTES = L::byte_words()>
+struct lane_operands {
+    typename L::words codes;
+    static lane_operands of(thread const typename L::words &codes) { return lane_operands{codes}; }
+    half2 pair(uint p) const { return as_type<half2>(L::pair(codes, p) | 0x64006400u) - half2(half(1024 + L::zero())); }
+};
+template <typename L>
+struct lane_operands<L, true> {
+    half2 pairs[4];
+    static lane_operands of(thread const typename L::words &codes) {
+        const half2 zero = half2(half(1024 + L::zero()));
+        const uint2 bytes = L::byte_codes(codes);
+        const half2 low_even = as_type<half2>((bytes.x & 0x00ff00ffu) | 0x64006400u) - zero;
+        const half2 low_odd = as_type<half2>(((bytes.x >> 8) & 0x00ff00ffu) | 0x64006400u) - zero;
+        const half2 high_even = as_type<half2>((bytes.y & 0x00ff00ffu) | 0x64006400u) - zero;
+        const half2 high_odd = as_type<half2>(((bytes.y >> 8) & 0x00ff00ffu) | 0x64006400u) - zero;
+        lane_operands operands;
+        operands.pairs[0] = half2(low_even.x, high_even.x);
+        operands.pairs[1] = half2(low_odd.x, high_odd.x);
+        operands.pairs[2] = half2(low_even.y, high_even.y);
+        operands.pairs[3] = half2(low_odd.y, high_odd.y);
+        return operands;
+    }
+    half2 pair(uint p) const { return pairs[p]; }
+};
+
+// Weights with a matrix GEMV whose products fold a block's local scale codes
+// into the left operand: unsigned codes (`lane_codes`) under hierarchical
+// coefficients with a minimum, an unsigned local scale code per 32 columns
+// and factors per 256, which the runtime admits where a code times a scale
+// code stays below 2048 (an exact F16 integer of the operand's 2^-24). `at`
+// is a lane's place in its row's planes (fragment column x holds chunk
+// x / 2), `load` its words of block g, `pair` its two codes of step s in the
+// halves of one word.
 template <typename W>
 struct matrix_codes {
-    static constant constexpr bool implemented = false;
+    static constexpr bool implemented() { return false; }
 };
 template <typename P, typename FS, int EXPONENT, uint LOCAL_BITS, int BIAS_SIGN, typename F>
 struct matrix_codes<packets::Packet<P, packets::Unsigned,
     packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, packets::LocalUnsigned<LOCAL_BITS>, 32u, true, BIAS_SIGN, 0u>, F>> {
     typedef packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, packets::LocalUnsigned<LOCAL_BITS>, 32u, true, BIAS_SIGN, 0u> K;
-    typedef matrix_planes<P> planes;
-    static constant constexpr bool implemented = planes::implemented;
-    typedef typename planes::place place;
-    typedef typename planes::words words;
+    typedef lane_codes<P, packets::Unsigned> lanes;
+    static constexpr bool implemented() { return lanes::implemented(); }
+    typedef typename lanes::place place;
+    typedef typename lanes::words words;
     template <typename W>
     static place at(thread const Weights<W> &w, thread const typename Weights<W>::located &row, uint x) {
-        return planes::at(w, row, x);
+        return lanes::at(w, row, x / 2u);
     }
     template <typename W>
-    static words load(thread const Weights<W> &w, place at, uint g) { return planes::load(w, at, g); }
-    static uint pair(words codes, uint s) { return planes::pair(codes, s); }
+    static words load(thread const Weights<W> &w, place at, uint g) { return lanes::template load<true>(w, at, g); }
+    static uint pair(words codes, uint s) { return lanes::pair(codes, s); }
 };
 
-// The weights the matrix GEMV over a block's 16-column runs serves: codes of
-// a plane of low nibbles and a plane of two high bits, of value zero at
-// ZERO_CODE, under hierarchical coefficients without a minimum, a local
-// scale code per 16 columns and factors per 256 (`gemv_matrix_runs_body`).
+// The weights the matrix GEMV over a block's runs serves: integer codes
+// (`lane_codes`) under hierarchical coefficients without a bias, a local
+// scale code per GROUP (16 or 32) columns and factors per 256
+// (`gemv_matrix_runs_body`): a lane's chunk lies in one group.
 template <typename W>
 struct matrix_runs {
-    static constant constexpr bool implemented = false;
+    static constexpr bool implemented() { return false; }
 };
-template <int ZERO_CODE, typename FS, int EXPONENT, uint LOCAL_BITS, typename L, int BIAS_SIGN, typename F>
-struct matrix_runs<packets::Packet<packets::Planes<4, 2>, packets::Offset<ZERO_CODE>,
-    packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, L, 16u, false, BIAS_SIGN, 0u>, F>> {
-    typedef packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, L, 16u, false, BIAS_SIGN, 0u> K;
+template <typename P, typename C, typename FS, int EXPONENT, uint LOCAL_BITS, typename L, uint GROUP, int BIAS_SIGN,
+    typename F>
+struct matrix_runs<packets::Packet<P, C, packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, L, GROUP, false, BIAS_SIGN, 0u>,
+    F>> {
+    typedef packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, L, GROUP, false, BIAS_SIGN, 0u> K;
     typedef L local;
-    static constant constexpr bool implemented = true;
-    static constant constexpr int zero_code = ZERO_CODE;
+    typedef lane_codes<P, C> lanes;
+    static constexpr bool implemented() { return lanes::implemented(); }
+    // The group of a packet's chunk k.
+    static uint group_of(uint k) { return k / (GROUP / 8u); }
+    // Whether a code times its scale code is an exact F16 operand.
+    static constexpr bool halves() { return F::matrix_runs_halves(); }
 };
 
-// The weights the symmetric matrix GEMV serves: codes of a plane of low
-// nibbles of value zero at ZERO_CODE under a direct scale per 32 columns
+// The weights the symmetric matrix GEMV serves: integer codes
+// (`lane_codes`) under a direct scale per 32 columns or per a multiple of
+// them, which every 32-column block of a group repeats
 // (`gemv_matrix_symmetric_body`).
 template <typename W>
 struct matrix_symmetric {
-    static constant constexpr bool implemented = false;
+    static constexpr bool implemented() { return false; }
 };
-template <int ZERO_CODE, typename S, uint STORAGE, typename F>
-struct matrix_symmetric<packets::Packet<packets::Planes<4, 0>, packets::Offset<ZERO_CODE>,
-    packets::Direct<S, 32u, false, STORAGE, 0>, F>> {
-    typedef packets::Direct<S, 32u, false, STORAGE, 0> K;
-    static constant constexpr bool implemented = true;
-    static constant constexpr int zero_code = ZERO_CODE;
+template <typename P, typename C, typename S, uint GROUP, uint STORAGE, typename F>
+struct matrix_symmetric<packets::Packet<P, C, packets::Direct<S, GROUP, false, STORAGE, 0>, F>> {
+    typedef packets::Direct<S, GROUP, false, STORAGE, 0> K;
+    typedef lane_codes<P, C> lanes;
+    static constexpr bool implemented() { return lanes::implemented() && GROUP % 32u == 0u; }
 };
 
 // Whether an operand's rows are read with whole-word loads. The matrix GEMV
@@ -3064,9 +3473,11 @@ constexpr uint matrix_run() {
     return 8u / NB;
 }
 
-// The matrix GEMV over 16-column runs (`matrix_runs`): a lane's two matrix
+// The matrix GEMV over a block's runs (`matrix_runs`): a lane's two matrix
 // columns of a step lie in one run of its row, so its left elements are
-// (code - zero_code) times the run's local scale code as F32 integers; the
+// (code - zero) times the run's local scale code as integers, F16 where the
+// runtime admits them exact in it (`matrix_runs::halves`) and F32 otherwise,
+// the differences exact halves (`lane_operands`); the
 // accumulator runs over a 256-column block and folds once with the block's
 // factor. No min term and nothing staged. UNIT is `matrix_unit` of the
 // operand.
@@ -3076,16 +3487,18 @@ inline void gemv_matrix_runs_body(thread const In &in, thread const Out &out,
     uint simdgroups, uint sg, uint lane) {
     typedef typename matrix_runs<W>::K K;
     typedef typename matrix_runs<W>::local L;
+    typedef typename matrix_runs<W>::lanes lanes;
     typedef typename In::activation A;
+    constexpr bool halves = matrix_runs<W>::halves();
+    typedef metal::conditional_t<halves, half2, float2> operand;
     constexpr uint RUN = matrix_run<NB>();
     threadgroup float2 *parts = reinterpret_cast<threadgroup float2 *>(shared);
     const ushort2 at = fragment_coordinate(lane);
     const uint index = group * simdgroups + sg, piece = index / PARTS, part = index % PARTS;
     const uint n = piece * 8u + at.y;
     const typename Weights<W>::located row = w.locate(min(n, rows - 1u));
-    const uint codes = uint(row.geometry.at(row.row, w.layout.codes, 16ul, 0ul) - w.base) + (at.x / 2u) * 4u;
-    const uint high = uint(row.geometry.at(row.row, w.layout.high, 8ul, 0ul) - w.base) + (at.x / 2u) * 2u;
-    const uint code_step = 16u * w.layout.tile, high_step = 8u * w.layout.tile;
+    const typename lanes::place codes = lanes::at(w, row, at.x / 2u);
+    const uint run_of = matrix_runs<W>::group_of(at.x / 2u);
     const uint blocks = k / 256u;
     device const typename A::storage *stored_rows[NB][2];
     float2 y[NB];
@@ -3100,7 +3513,7 @@ inline void gemv_matrix_runs_body(thread const In &in, thread const Out &out,
     }
     for (uint block = part * blocks / PARTS; block < (part + 1u) * blocks / PARTS; ++block) {
         // The row's local scale codes of the block (the lane's run of packet
-        // b is its group x / 4) and its factor.
+        // b is its chunk's group) and its factor.
         const typename K::fields::words scales = K::group_fields(row.row, row.geometry, block);
         const float d = K::factors(row.row, row.geometry, block).scale(0);
         _Pragma("clang loop unroll(disable)")
@@ -3109,10 +3522,9 @@ inline void gemv_matrix_runs_body(thread const In &in, thread const Out &out,
             for (uint i = 0; i < RUN; ++i) {
                 const uint b = run + i;
                 const uint g = block * 8u + b;
-                const float scale = L::value(K::scale_code(K::field_of(scales, b), at.x / 4u));
-                const uint word = *reinterpret_cast<device const uint *>(w.base + codes + g * code_step);
-                const uint field = uint(*reinterpret_cast<device const ushort *>(w.base + high + g * high_step));
-                const uint spread = (field | (field << 8)) & 0x00ff00ffu;
+                const float scale = L::value(K::scale_code(K::field_of(scales, b), run_of));
+                const typename lanes::words words = lanes::template load<true>(w, codes, g);
+                const lane_operands<lanes> pairs = lane_operands<lanes>::of(words);
                 uint2 stored[NB][2];
                 PROJECTION_UNROLL
                 for (uint f = 0; f < NB; ++f) {
@@ -3123,11 +3535,8 @@ inline void gemv_matrix_runs_body(thread const In &in, thread const Out &out,
                 }
                 PROJECTION_UNROLL
                 for (uint s = 0; s < 4; ++s) {
-                    const uint pair = ((word >> (4u * s)) & 0x000f000fu)
-                        | (((spread >> (2u * s)) & 0x00030003u) << 4);
-                    simdgroup_float8x8 left;
-                    reinterpret_cast<thread float2 &>(left.thread_elements()) =
-                        float2(int2(int(pair & 0xffffu), int(pair >> 16)) - matrix_runs<W>::zero_code) * scale;
+                    metal::conditional_t<halves, simdgroup_half8x8, simdgroup_float8x8> left;
+                    reinterpret_cast<thread operand &>(left.thread_elements()) = operand(pairs.pair(s)) * operand(scale);
                     PROJECTION_UNROLL
                     for (uint f = 0; f < NB; ++f) {
                         simdgroup_float8x8 right;
@@ -3157,8 +3566,8 @@ inline void gemv_matrix_runs_body(thread const In &in, thread const Out &out,
 }
 
 // The symmetric 32-column matrix GEMV (`matrix_symmetric`): decode each code
-// once into an exact integer matrix operand, share it across the activation
-// rows, then fold the block scale into the F32 sums. No rounded weight
+// once into an exact integer matrix operand (`lane_operands`), share it
+// across the activation rows, then fold the block scale into the F32 sums. No rounded weight
 // operand or token packing.
 template <bool PAIRED, uint NB, uint PARTS, bool UNIT, typename W, typename U, typename In, typename Out>
 inline void gemv_matrix_symmetric_body(thread const In &in, thread const Out &out,
@@ -3170,10 +3579,12 @@ inline void gemv_matrix_symmetric_body(thread const In &in, thread const Out &ou
     const ushort2 at = fragment_coordinate(lane);
     const uint index = group * simdgroups + sg, piece = index / PARTS, part = index % PARTS;
     const uint n = piece * 8u + at.y;
+    typedef typename matrix_symmetric<W>::lanes lanes;
+    typedef typename matrix_symmetric<U>::lanes up_lanes;
     const auto row = w.locate(min(n, rows - 1u));
-    const uint codes = uint(row.geometry.at(row.row, w.layout.codes, 16ul, 0ul) - w.base) + (at.x / 2u) * 4u;
+    const typename lanes::place codes = lanes::at(w, row, at.x / 2u);
     const auto up_row = u.locate(min(n, rows - 1u));
-    const uint up_codes = uint(up_row.geometry.at(up_row.row, u.layout.codes, 16ul, 0ul) - u.base) + (at.x / 2u) * 4u;
+    const typename up_lanes::place up_codes = up_lanes::at(u, up_row, at.x / 2u);
     device const uchar *supers = row.geometry.super_at(row.row, 0ul);
     device const uchar *up_supers = up_row.geometry.super_at(up_row.row, 0ul);
     const uint blocks = k / 32u;
@@ -3187,12 +3598,15 @@ inline void gemv_matrix_symmetric_body(thread const In &in, thread const Out &ou
                 + ulong(in.rows.at(min(8u * f + at.x + j, m_rows - 1u))) * in.stride0;
     }
     for (uint g = part * blocks / PARTS; g < (part + 1u) * blocks / PARTS; ++g) {
-        const uint word = *reinterpret_cast<device const uint *>(w.base + codes + g * 16u * w.layout.tile);
+        const typename lanes::words word = lanes::template load<true>(w, codes, g);
+        const lane_operands<lanes> pairs = lane_operands<lanes>::of(word);
+        lane_operands<up_lanes> up_pairs;
         const float d = matrix_symmetric<W>::K::at(supers, g).scale(0);
-        uint up_word;
+        typename up_lanes::words up_word;
         float up_d;
         if constexpr (PAIRED) {
-            up_word = *reinterpret_cast<device const uint *>(u.base + up_codes + g * 16u * u.layout.tile);
+            up_word = up_lanes::template load<true>(u, up_codes, g);
+            up_pairs = lane_operands<up_lanes>::of(up_word);
             up_d = matrix_symmetric<U>::K::at(up_supers, g).scale(0);
         }
         uint2 stored[NB][2];
@@ -3203,14 +3617,10 @@ inline void gemv_matrix_symmetric_body(thread const In &in, thread const Out &ou
                     8u * (at.y / 2u) + 4u * (at.y & 1u));
         }
         PROJECTION_UNROLL for (uint s = 0; s < 4; ++s) {
-            const uint pair = (word >> (4u * s)) & 0x000f000fu;
             simdgroup_half8x8 left, up_left;
-            reinterpret_cast<thread half2 &>(left.thread_elements()) =
-                half2(int2(int(pair & 0xffffu), int(pair >> 16)) - matrix_symmetric<W>::zero_code);
+            reinterpret_cast<thread half2 &>(left.thread_elements()) = pairs.pair(s);
             if constexpr (PAIRED) {
-                const uint up_pair = (up_word >> (4u * s)) & 0x000f000fu;
-                reinterpret_cast<thread half2 &>(up_left.thread_elements()) =
-                    half2(int2(int(up_pair & 0xffffu), int(up_pair >> 16)) - matrix_symmetric<U>::zero_code);
+                reinterpret_cast<thread half2 &>(up_left.thread_elements()) = up_pairs.pair(s);
             }
             PROJECTION_UNROLL for (uint f = 0; f < NB; ++f) {
                 simdgroup_float8x8 right;
@@ -3456,7 +3866,7 @@ struct matrix_admitted<packets::Packet<P, C, K, F>> {
 
 // The matrix GEMV of weights W (`available`), by the product the runtime
 // admits it to: the products folding a block's scale codes (`matrix_codes`),
-// the runs of 16 columns (`matrix_runs`) or the symmetric 32 columns
+// the runs of a block (`matrix_runs`) or the symmetric 32 columns
 // (`matrix_symmetric`), each asserted to serve W. `run` takes the body for
 // the operand's strides and for whether the block sums are staged, once per
 // call.
@@ -3471,7 +3881,7 @@ struct matrix_form<W, false, false, false> {
 };
 template <typename W>
 struct matrix_form<W, true, false, false> {
-    static_assert(matrix_codes<W>::implemented, "an admitted weight has the matrix GEMV folding its scale codes");
+    static_assert(matrix_codes<W>::implemented(), "an admitted weight has the matrix GEMV folding its scale codes");
     static constant constexpr bool available = true;
     static constant constexpr bool symmetric32 = false;
     static constant constexpr bool stages_block_sums = true;
@@ -3497,7 +3907,7 @@ struct matrix_form<W, true, false, false> {
 };
 template <typename W>
 struct matrix_form<W, false, true, false> {
-    static_assert(matrix_runs<W>::implemented, "an admitted weight has the matrix GEMV over 16-column runs");
+    static_assert(matrix_runs<W>::implemented(), "an admitted weight has the matrix GEMV over its runs");
     static constant constexpr bool available = true;
     static constant constexpr bool symmetric32 = false;
     static constant constexpr bool stages_block_sums = false;
@@ -3513,7 +3923,7 @@ struct matrix_form<W, false, true, false> {
 };
 template <typename W>
 struct matrix_form<W, false, false, true> {
-    static_assert(matrix_symmetric<W>::implemented, "an admitted weight has the symmetric matrix GEMV");
+    static_assert(matrix_symmetric<W>::implemented(), "an admitted weight has the symmetric matrix GEMV");
     static constant constexpr bool available = true;
     static constant constexpr bool stages_block_sums = false;
     static constant constexpr bool symmetric32 = true;

@@ -1058,9 +1058,11 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
         assert!(field < schema.fields, "field is outside its plane group");
         let dtype = match schema.encoding {
             registry::PlaneEncoding::Dense(dtype) => dtype,
-            registry::PlaneEncoding::Packed { .. } | registry::PlaneEncoding::FloatCode { .. } => {
-                DType::U32
-            }
+            registry::PlaneEncoding::Packed { .. }
+            | registry::PlaneEncoding::Grid(_)
+            | registry::PlaneEncoding::SignedLocal { .. }
+            | registry::PlaneEncoding::Digits { .. }
+            | registry::PlaneEncoding::FloatCode { .. } => DType::U32,
         };
         let indices = self.read_indices(entry, index);
         let ty = dtype_value_type(dtype);

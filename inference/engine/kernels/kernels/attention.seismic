@@ -112,7 +112,7 @@ native attention_output for metal from "metal/attention_output.metal":
     static (D, SN, IN, Q, W, OS, OB)
     params (arithmetic BATCH_FROM in [5, 3, 9], arithmetic SPLIT in [1, 2, 4], form TALL in [1, 0],
         arithmetic form PACK in [0, 1], code arithmetic form RESIDUE in [1, 2])
-    where Q * W > 0 and (TALL == 0 or (SPLIT == 1 and Q * W % 128 == 0)) and (PACK == 0 or (TALL == 1 and Q * W % 256 == 0 and Q * W < 1048576 and D % 64 == 0 and form(OW, PACK) == 1)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and OB > 0 and form(OW, PACK_RESIDUE) == 1))
+    where Q * W > 0 and (TALL == 0 or (SPLIT == 1 and Q * W % 128 == 0)) and (PACK == 0 or (TALL == 1 and Q * W % 256 == 0 and Q * W < 1048576 and D % 64 == 0 and form(OW, PACK) == 1)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and OB > 0 and form(OW, PACK_RESIDUE) == 1)) and (MATRIX == 0 or (Q * W % 256 == 0 and form(OW, MATRIX) == 1))
     scratch partials bytes (SPLIT * M * D * 4) when M > 64 and SPLIT > 1
     scratch small_partials bytes (4 * M * D * 4) when M > 16 and M <= 64
     scratch fragments bytes (ceil_div(M, 64) * 64 * Q * W * 2) when M > 64 and TALL == 1 and PACK == 0
@@ -131,7 +131,7 @@ native attention_output for metal from "metal/attention_output.metal":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch attention_output_batch when M >= BATCH_FROM and M <= 16:
-        params (BATCH_SIMDGROUPS in [8, 4, 16, 32], code BATCH_ROWS in [2, 1, 4], code arithmetic BATCH_PARTS in [2, 4, 1])
+        params (BATCH_SIMDGROUPS in [8, 4, 16, 32], code BATCH_ROWS in [2, 1, 4], code arithmetic BATCH_PARTS in [2, 4, 1], code arithmetic form MATRIX in [1, 0])
         threadgroups (ceil_div(ceil_div(D, 8) * BATCH_PARTS, BATCH_SIMDGROUPS), 1, 1)
         threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
         shared_bytes (max(16640, min((BATCH_SIMDGROUPS * 256 + ceil_div(Q * W, 32) * 32) * ceil_div(M, 8), 28672)))
@@ -272,7 +272,7 @@ native attention_output for cpu from "cpu/attention_output.rs":
     static (Q, W, OS)
     params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     where Q * W > 0 and (INT8 == 0 or form(OW, INT8) == 1)
-    scratch quantized bytes (M * ceil_div(Q * W, 256) * 292)
+    scratch quantized bytes (M * ceil_div(Q * W, Q8_VALUES) * Q8_BYTES)
     scratch staged bytes (M * Q * W * 4)
     launch attention_output_stage:
         threadgroups (M, 1, 1)
@@ -538,7 +538,7 @@ native attention_project for cpu from "cpu/attention_project.rs":
     static (D, QS, GS, KS, VS)
     params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     where D > 0 and (INT8 == 0 or form(QW, INT8) == 1 or form(GW, INT8) == 1 or form(KW, INT8) == 1 or form(VW, INT8) == 1)
-    scratch quantized bytes (M * ceil_div(D, 256) * 292)
+    scratch quantized bytes (M * ceil_div(D, Q8_VALUES) * Q8_BYTES)
     scratch normalized bytes (M * D * 4)
     launch attention_project_normalize:
         threadgroups (M, 1, 1)

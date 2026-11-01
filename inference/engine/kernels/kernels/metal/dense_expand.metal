@@ -117,7 +117,7 @@ kernel void dense_expand_gemv_pair(DENSE_EXPAND_ARGUMENTS,
 #endif
 
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_BATCH
-template <uint BATCH_ROWS, uint BATCH_PARTS>
+template <uint BATCH_ROWS, uint BATCH_PARTS, uint MATRIX>
 kernel void dense_expand_batch(DENSE_EXPAND_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
@@ -127,8 +127,7 @@ kernel void dense_expand_batch(DENSE_EXPAND_ARGUMENTS,
     DENSE_EXPAND_OPERANDS;
     projection::Plain<activation, projection::AllRows> x{normalized,
         SEISMIC_DIM_H, 1, uint(SEISMIC_DIM_H), {}};
-    if constexpr (projection::matrix_form<packets::W0>::available
-        && projection::matrix_form<packets::W1>::available && SEISMIC_DIM_H % 256 == 0) {
+    if constexpr (MATRIX == 1) {
         projection::gemv_matrix_paired<packets::W0, packets::W1, BATCH_PARTS>(x, out,
             gate, up, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H),
             tile, shared, simdgroups, sg, lane);
