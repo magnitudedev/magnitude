@@ -3765,7 +3765,7 @@ mod native_tests {
         assert_eq!(int8(mma16("nvfp4g16a4")), [0]);
         assert_eq!(int8(registry::dense(DType::BF16)), [0]);
         for (form, message) in [
-            ("INT9", "`INT9` is not a form of `cuda`; its forms are GEMM_FOLD, INT8, GEMV_RECORDS"),
+            ("INT9", "`INT9` is not a form of `cuda`; its forms are GEMM_FOLD, INT8, GEMV_RECORDS, INT8_LOCAL, INT8_LOCAL_NEGATED"),
             ("PACK", "`PACK` is not a form of `cuda`"),
         ] {
             let error = check(&declaration(form)).expect_err("a misspelled form fails checking");

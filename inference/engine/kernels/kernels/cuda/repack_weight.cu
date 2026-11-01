@@ -629,7 +629,7 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
     // each slot zero.
     if (column0 + TILE_COLUMNS == stored_columns && lane < rows) {
 #if defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16) && defined(SEISMIC_ELEMENT_U_PLANE_DIGITS)
-        const u64 used = Digits::slot_used(MMA_ROWS * SEISMIC_RESULT_0_ROW_CODES_BYTES / Digits::chunk(), lane % MMA_ROWS);
+        const u64 used = Digits::slot_used(SEISMIC_RESULT_0_ROW_CODES_BYTES, lane % MMA_ROWS);
         zero_bytes(row + SEISMIC_RESULT_0_ROW_CODES + used,
                    SEISMIC_RESULT_0_ROW_CODES_BYTES + SEISMIC_RESULT_0_ROW_CODES_TAIL - used);
 #else

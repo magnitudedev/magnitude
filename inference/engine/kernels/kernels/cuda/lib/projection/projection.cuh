@@ -68,6 +68,7 @@ using element::u64;
 using packets::Coefficients;
 using packets::S8Pair;
 using packets::Same;
+using packets::s8_times;
 typedef element::Act Act;
 
 static_assert(Act::bytes == 2, "the CUDA projection family requires a bf16 or f16 activation element");
@@ -1188,6 +1189,18 @@ template <class W> struct ChunkBytes<W, decltype((void)W::planes::chunk_bytes())
     static constexpr int value = W::planes::chunk_bytes();
 };
 
+// Whether a warp's decoded coefficients (`gemm_decode_coefficients`) hold
+// each group's local multiplier: in the int8 GEMM (S8) of weights whose
+// local codes multiply their codes (`packets::int8_local`).
+template <class W, bool S8> __host__ __device__ constexpr bool staged_multiplier() {
+    return S8 && packets::int8_local<W>() != 0;
+}
+// Words of each group's decoded coefficients: a scale, and its bias or its
+// local multiplier.
+template <class W, bool S8> __host__ __device__ constexpr int coefficient_words() {
+    return W::BIAS || staged_multiplier<W, S8>() ? 2 : 1;
+}
+
 template <int BM_, int WM_, int WN_, int STAGES_, bool ORDERED_ = false, int ROTATE_ = 1, int SPAN_ = 1>
 struct GemmShape {
     static constexpr int BM = BM_;
@@ -1223,12 +1236,14 @@ struct GemmShape {
     // after it.
     template <class W> __host__ __device__ static constexpr int super_tile() { return packets::super_chunks<W>() * 16; }
     // A warp's coefficient area per stream: its NJ * 16 rows' k-block
-    // coefficients (`gemm_decode_coefficients`), each row's padded to whole
+    // coefficients (`coefficient_words` a group), each row's padded to whole
     // 16 B, the larger of WA's and WB's. COEF_WARP is 16 B a row.
     static constexpr int COEF_WARP = NJ * 16 * 16;
-    template <class W> static constexpr int COEF_ROW = (W::GROUPS * (W::BIAS ? 8 : 4) + 15) / 16 * 16;
-    template <class WA, class WB>
-    static constexpr int COEF_AREA = NJ * 16 * (COEF_ROW<WA> > COEF_ROW<WB> ? COEF_ROW<WA> : COEF_ROW<WB>);
+    template <class W, bool S8>
+    static constexpr int COEF_ROW = (W::GROUPS * coefficient_words<W, S8>() * 4 + 15) / 16 * 16;
+    template <class WA, class WB, bool S8>
+    static constexpr int COEF_AREA =
+        NJ * 16 * (COEF_ROW<WA, S8> > COEF_ROW<WB, S8> ? COEF_ROW<WA, S8> : COEF_ROW<WB, S8>);
     template <class WA, class WB, bool S8>
     static constexpr int STAGE_BYTES = BM * A_ROW<S8> + 8 * (TILE<WA> + TILE<WB>);
     // One record buffer: both streams' 128 rows, then both streams' 8 tiles'
@@ -1237,7 +1252,7 @@ struct GemmShape {
     static constexpr int RECORDS = 128 * (RECORD<WA> + RECORD<WB>) + 8 * (super_tile<WA>() + super_tile<WB>());
     template <class WA, class WB, bool S8>
     static constexpr int LAYOUT_BYTES = STAGES * STAGE_BYTES<WA, WB, S8> + 2 * RECORDS<WA, WB> +
-                                        (Same<WB, NoWeight>::value ? 1 : 2) * WARPS * COEF_AREA<WA, WB>;
+                                        (Same<WB, NoWeight>::value ? 1 : 2) * WARPS * COEF_AREA<WA, WB, S8>;
     // Shared bytes (the declared `shared_bytes` of a GEMM launch), a bound on
     // every representation's layout:
     //   STAGES * (BM * 144 + STREAMS * 10240) + STREAMS * WARPS * NJ * 256
@@ -1412,33 +1427,53 @@ __device__ __forceinline__ void gemm_load_super_codes(const W &w, u64 tile0, u64
 // The warp's decoded coefficients of k-block `kblock`: its NJ tiles' rows
 // (block-tile rows first..first + NJ * 16) from their records (the record
 // buffer of the k-block's superblock), area[row * GROUPS + group] as F32
-// (scale, -bias), the bias absent when the representation has none.
-template <class W, int NJ, int RECORD, int TILE>
+// (scale, -bias), the bias absent when the representation has none; for the
+// int8 GEMM (S8) of weights whose local codes multiply their codes
+// (`packets::int8_local`), (factor, local multiplier) instead.
+template <class W, int NJ, int RECORD, int TILE, bool S8>
 __device__ __forceinline__ void gemm_decode_coefficients(const W &w, const u8 *records, const u8 *codes, u32 first,
                                                          u64 kblock, float *area) {
     if constexpr (W::DENSE)
         return;
+    constexpr bool LOCAL = staged_multiplier<W, S8>();
     constexpr int ITEMS = NJ * 16 * W::GROUPS;
-    constexpr int WORDS = W::BIAS ? 2 : 1;
+    constexpr int WORDS = coefficient_words<W, S8>();
     for (int item = threadIdx.x % 32; item < ITEMS; item += 32) {
         const u32 row = item / W::GROUPS;
-        float scale, bias;
-        w.staged_coefficient(reinterpret_cast<const u32 *>(records + (first + row) * RECORD),
-                             codes + (first + row) / 16 * TILE, (first + row) % 16, kblock, item % W::GROUPS, scale,
-                             bias);
-        area[item * WORDS] = scale;
-        if constexpr (W::BIAS)
-            area[item * WORDS + 1] = -bias;
+        const u32 *words = reinterpret_cast<const u32 *>(records + (first + row) * RECORD);
+        if constexpr (LOCAL) {
+            float factor;
+            u32 multiplier;
+            W::staged_local(words, kblock, item % W::GROUPS, factor, multiplier);
+            area[item * WORDS] = factor;
+            area[item * WORDS + 1] = __uint_as_float(multiplier);
+        } else {
+            float scale, bias;
+            w.staged_coefficient(words, codes + (first + row) / 16 * TILE, (first + row) % 16, kblock,
+                                 item % W::GROUPS, scale, bias);
+            area[item * WORDS] = scale;
+            if constexpr (W::BIAS)
+                area[item * WORDS + 1] = -bias;
+        }
     }
     __syncwarp();
 }
 
-// (scale, -bias) of (row, group) in a warp's decoded area.
-template <class W> __device__ __forceinline__ float2 gemm_coefficient(const float *area, u32 row, int group) {
+// (scale, -bias) of (row, group) in a warp's decoded area; in the int8
+// GEMM's (S8) of weights whose local codes multiply their codes, (factor, 0).
+template <class W, bool S8 = false>
+__device__ __forceinline__ float2 gemm_coefficient(const float *area, u32 row, int group) {
     if constexpr (W::BIAS)
         return reinterpret_cast<const float2 *>(area)[row * W::GROUPS + group];
+    else if constexpr (staged_multiplier<W, S8>())
+        return make_float2(reinterpret_cast<const float2 *>(area)[row * W::GROUPS + group].x, 0.0f);
     else
         return make_float2(area[row * W::GROUPS + group], 0.0f);
+}
+// The local multiplier of (row, group) in the int8 GEMM's decoded area of
+// weights whose local codes multiply their codes (`packets::s8_times`).
+template <class W> __device__ __forceinline__ u32 gemm_multiplier(const float *area, u32 row, int group) {
+    return __float_as_uint(reinterpret_cast<const float2 *>(area)[row * W::GROUPS + group].y);
 }
 
 // The A pair of two codes (an exact A pair, as `decode` forms it) of one row:
@@ -1647,7 +1682,7 @@ template <class Shape, class WA, class WB, bool S8> struct GemmWeights {
     static constexpr int RECORDS = Shape::STAGES * STAGE;
     static constexpr int AREAS = RECORDS + 2 * BUFFER;
     static_assert(Shape::template LAYOUT_BYTES<WA, WB, S8> ==
-                      AREAS + STREAMS * Shape::WARPS * Shape::template COEF_AREA<WA, WB>,
+                      AREAS + STREAMS * Shape::WARPS * Shape::template COEF_AREA<WA, WB, S8>,
                   "the layout of GemmShape");
     static_assert(Shape::template LAYOUT_BYTES<WA, WB, S8> <= Shape::template SHARED_BYTES<STREAMS>,
                   "the declared shared bytes bound every representation's layout");
@@ -1698,7 +1733,7 @@ template <class Shape, class WA, class WB, bool S8> struct GemmWeights {
     }
     __device__ __forceinline__ float *area(u32 warp, int stream) const {
         return reinterpret_cast<float *>(shared + AREAS +
-                                         (warp * STREAMS + stream) * Shape::template COEF_AREA<WA, WB>);
+                                         (warp * STREAMS + stream) * Shape::template COEF_AREA<WA, WB, S8>);
     }
     template <int STRIDE> __device__ __forceinline__ void load(int s, u64 index, u32 first) const {
         const u64 kb = kbegin + index;
@@ -1726,11 +1761,11 @@ template <class Shape, class WA, class WB, bool S8> struct GemmWeights {
     }
     __device__ __forceinline__ void decode(int s, u64 index, u32 warp, u32 first) const {
         const u64 kb = kbegin + index;
-        gemm_decode_coefficients<WA, Shape::NJ, RECORD_A, TILE_A>(wa, records(kb, 0), codes(s, 0, 0), first, kb,
-                                                                  area(warp, 0));
+        gemm_decode_coefficients<WA, Shape::NJ, RECORD_A, TILE_A, S8>(wa, records(kb, 0), codes(s, 0, 0), first, kb,
+                                                                      area(warp, 0));
         if constexpr (PAIR)
-            gemm_decode_coefficients<WB, Shape::NJ, RECORD_B, TILE_B>(wb, records(kb, 1), codes(s, 1, 0), first, kb,
-                                                                      area(warp, 1));
+            gemm_decode_coefficients<WB, Shape::NJ, RECORD_B, TILE_B, S8>(wb, records(kb, 1), codes(s, 1, 0), first,
+                                                                          kb, area(warp, 1));
     }
 };
 
@@ -2060,7 +2095,10 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
 // (packets.cuh virtual order). Per 32 codes one m16n8k32 s8 MMA into an
 // exact int32 product (two, half-masked, for 16-code groups), folded with the
 // coefficients of its group (of 32 codes or more) as
-// acc += scale * (d_x * P) - bias * (d_x * sum q_x).
+// acc += scale * (d_x * P) - bias * (d_x * sum q_x). Weights whose local codes
+// multiply their codes (`packets::int8_local`) take the s8 products of each
+// step's codes and its group's local code, so each 32 codes are one MMA under
+// the row's factor whatever their groups.
 // An s8 MMA product as F32, exactly: |p| <= 32 * 127 * 128 < 2^22, so
 // p + 1.5 * 2^23 is an integer-valued float whose low mantissa bits are p. One
 // integer add and one F32 add replace the quarter-rate integer-to-float
@@ -2074,6 +2112,7 @@ __device__ __forceinline__ void gemm_tile_s8(float acc[Shape::MI][2][4], const W
                                              u64 kblock, const float *coefficients, int j_tile,
                                              const u32 a[2][Shape::MI][4], const float2 x[2][Shape::MI][2]) {
     static_assert(!W::DENSE, "the INT8 GEMM needs packed weights");
+    constexpr bool LOCAL = staged_multiplier<W, true>();
     const u32 lane = threadIdx.x % 32;
     const u32 t = lane % 4;
     const typename W::Raw raw = staged_raw(w, staged_tile, lane, kblock, 0);
@@ -2086,7 +2125,7 @@ __device__ __forceinline__ void gemm_tile_s8(float acc[Shape::MI][2][4], const W
         for (int half = 0; half < 2; ++half)
 #pragma unroll
             for (int c = 0; c < 2; ++c) {
-                const float2 k = gemm_coefficient<W>(coefficients, j_tile * 16 + half * 8 + 2 * t + c, group);
+                const float2 k = gemm_coefficient<W, true>(coefficients, j_tile * 16 + half * 8 + 2 * t + c, group);
 #pragma unroll
                 for (int mi = 0; mi < Shape::MI; ++mi)
 #pragma unroll
@@ -2102,11 +2141,21 @@ __device__ __forceinline__ void gemm_tile_s8(float acc[Shape::MI][2][4], const W
     };
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
-        const S8Pair first = w.s8(raw, 2 * h);
-        const S8Pair second = w.s8(raw, 2 * h + 1);
+        S8Pair first = w.s8(raw, 2 * h);
+        S8Pair second = w.s8(raw, 2 * h + 1);
+        if constexpr (LOCAL) {
+            // Rows g and g + 8 of each step times their group's local code.
+            const u32 row = j_tile * 16 + lane / 4;
+            const int groups[2] = {2 * h * 16 / W::GROUP, (2 * h + 1) * 16 / W::GROUP};
+            first = S8Pair{s8_times(first.row_g, gemm_multiplier<W>(coefficients, row, groups[0])),
+                           s8_times(first.row_g8, gemm_multiplier<W>(coefficients, row + 8, groups[0]))};
+            second = S8Pair{s8_times(second.row_g, gemm_multiplier<W>(coefficients, row, groups[1])),
+                            s8_times(second.row_g8, gemm_multiplier<W>(coefficients, row + 8, groups[1]))};
+        }
         const int none[Shape::MI][4] = {};
-        if constexpr (W::GROUP >= 32) {
-            // Half h's 32 codes, of group 32 h / GROUP.
+        if constexpr (W::GROUP >= 32 || LOCAL) {
+            // Half h's 32 codes, of group 32 h / GROUP (of any group, under
+            // the row's factor, where LOCAL).
             const u32 b0[2] = {first.row_g, second.row_g};
             const u32 b1[2] = {first.row_g8, second.row_g8};
             int p[Shape::MI][2][4];
