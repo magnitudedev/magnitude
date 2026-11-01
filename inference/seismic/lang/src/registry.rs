@@ -1201,16 +1201,16 @@ impl PackedRowLayout {
     /// (`share_byte`), a lane's whole group one contiguous run of its row.
     ///
     /// `mma16`: the tile's 16 rows' plane slots (payload and alignment tail,
-    /// `ROW_ALIGNMENT` whole) are one sequence `V` of 16-byte chunks dealt
-    /// to the rows in turn: chunk `c` is chunk `c / 16` of the slot of row
-    /// `c % 16` (no chunk straddles a row, every chunk address is shifts and
-    /// masks, and the tile's groups fill the slots exactly). Group `p`'s 16
-    /// shares are `V` bytes `[16 B p, 16 B (p + 1))` (`B` a share's bytes),
-    /// its runs one after another in m16n8k16 fragment-lane order
+    /// `ROW_ALIGNMENT` whole) are one sequence `V` of 16-byte chunks, the
+    /// slots in row order as a code plane's `V` (`code_bit`): chunk `c` is
+    /// chunk `c mod S` of the slot of row `c / S`, `S` a slot's chunks (no
+    /// chunk straddles a row, and the tile's groups fit the slots). Group
+    /// `p`'s 16 shares are `V` bytes `[16 B p, 16 B (p + 1))` (`B` a share's
+    /// bytes), its runs one after another in m16n8k16 fragment-lane order
     /// (`mma16_digit`): lane `l = 4g + t` of the k16 steps reads, of rows
     /// `g` and `g + 8`, the bytes holding k `2t, 2t + 1, 2t + 8, 2t + 9` of
     /// every step (its sources), two segment sources one 16-byte unit of the
-    /// lane, so a warp's load is two whole chunks of each of the 16 rows.
+    /// lane, so a warp's load is one contiguous run of `V`.
     pub fn digit_byte(
         &self,
         geometry: &RowGeometry,
@@ -1230,9 +1230,10 @@ impl PackedRowLayout {
         let (tile, r) = (row / MMA_TILE_ROWS, row % MMA_TILE_ROWS);
         let at = MMA_TILE_ROWS * group_bytes * packet + mma16_digit(digits, r, byte);
         let chunk = at / MMA_DIGIT_CHUNK;
-        (tile * MMA_TILE_ROWS + chunk % MMA_TILE_ROWS) * geometry.stride
+        let slot = geometry.bytes_per_row[plane].div_ceil(MMA_DIGIT_CHUNK);
+        (tile * MMA_TILE_ROWS + chunk / slot) * geometry.stride
             + geometry.offsets[plane]
-            + chunk / MMA_TILE_ROWS * MMA_DIGIT_CHUNK
+            + chunk % slot * MMA_DIGIT_CHUNK
             + at % MMA_DIGIT_CHUNK
     }
 

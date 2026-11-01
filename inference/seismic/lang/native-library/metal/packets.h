@@ -441,16 +441,50 @@ struct DigitRuns {
     static constexpr uint step_digit(uint value) {
         return (value - first_value(run_of(value))) / run_bytes(run_of(value));
     }
+    // The word of half h of the step at value `value` (its values 0..3, h =
+    // 0, or 4..7): its first byte in the share, and the power of its digit.
+    static constexpr uint half_byte(uint value, uint h) {
+        return step_byte(value) + (step_wide(value) ? 4u * h : 0u);
+    }
+    static constexpr uint half_power(uint value, uint h) {
+        return power(step_digit(value) + (step_wide(value) ? 0u : h));
+    }
     // Field FIELD of the step at value VALUE, a value of the group's runs.
     template <uint VALUE, uint FIELD>
     static constexpr uint place() {
         static_assert(VALUE < values(), "a step's value lies in the group's runs");
-        constexpr bool wide = step_wide(VALUE);
-        constexpr uint at = step_byte(VALUE), digit = step_digit(VALUE);
-        constexpr bool after = !wide && at >= 4u;
-        return FIELD == 0u ? (after ? at - 4u : at)
-            : FIELD == 1u  ? power(digit) | (after ? 0x80u : 0u)
-                           : power(wide ? digit : digit + 1u) | (wide || after ? 0x80u : 0u);
+        constexpr uint at = step_byte(VALUE) - (!step_wide(VALUE) && step_byte(VALUE) >= 4u ? 4u : 0u);
+        return FIELD == 0u ? at : half_power(VALUE, FIELD - 1u) | (half_byte(VALUE, FIELD - 1u) > at ? 0x80u : 0u);
+    }
+    // A lane that takes step s of every packet of a group (`Digits::
+    // load_lane`, `Digits::lane_step`) reads word h of packet k's step, slot
+    // c = 2 k + h, at `half_byte(32 k + 8 s, h)`. A slot's first is the
+    // first slot that reads the same word at every s (`slot_first`); the
+    // lane loads each first slot once (`Digits::lane_words`), `lane_slot`
+    // its index among them and `lane_words` their count.
+    static constexpr bool same_word(uint c, uint d) {
+        for (uint s = 0; s < 4u; ++s)
+            if (half_byte(32u * (c / 2u) + 8u * s, c % 2u) != half_byte(32u * (d / 2u) + 8u * s, d % 2u))
+                return false;
+        return true;
+    }
+    static constexpr uint slot_first(uint c) {
+        uint d = 0u;
+        while (!same_word(c, d))
+            ++d;
+        return d;
+    }
+    static constexpr uint lane_slot(uint c) {
+        uint index = 0u;
+        for (uint d = 0; d < slot_first(c); ++d)
+            index += slot_first(d) == d ? 1u : 0u;
+        return index;
+    }
+    static constexpr uint lane_words() {
+        uint count = 0u;
+        for (uint c = 0; c < 2u * packets(); ++c)
+            count += slot_first(c) == c ? 1u : 0u;
+        return count;
     }
     // Packet K's table entries: its steps' offsets, and their low and high
     // powers a byte a step; zero past the group's packets.
@@ -498,31 +532,54 @@ struct Digits {
         uint low_powers;
         uint high_powers;
     };
+    // Group g of the row share `share`.
+    static device const uchar *group_at(device const uchar *share, uint g) { return share + g * runs::bytes(); }
+    // Packet p's places in the row share `share` (`digit_places`): its
+    // group, its steps' offsets (`entries[0]`) and the bytes of their low and
+    // high words' powers (`entries[1].xy`, a byte a step; step s's
+    // `step_bytes`). A step's words of values 0..3 and 4..7 (`words`) are the
+    // first or, where bit 7 of the power's byte is set, the second word at
+    // its offset; their powers (`powers`, of a step's bytes or every step's)
+    // the bytes' low 7 bits.
+    struct packet_places {
+        device const uchar *group;
+        constant uint4 *entries;
+        static packet_places of(device const uchar *share, uint p) {
+            return packet_places{group_at(share, p / runs::packets()),
+                digit_places<RUNS, RUN_BYTES, RUN_DIGITS> + 2u * (p % runs::packets())};
+        }
+        template <class T> static T step_bytes(T bytes, uint s) { return (bytes >> (8u * s)) & 0xffu; }
+        uint2 words(uint offset, uint2 step) const {
+            const uint2 v = uint2(*reinterpret_cast<device const packed_uint2 *>(group + ulong(offset)));
+            return uint2((step.x & 0x80u) ? v.y : v.x, (step.y & 0x80u) ? v.y : v.x);
+        }
+        static uint2 powers(uint2 bytes) { return bytes & 0x7f7f7f7fu; }
+    };
     static words load(device const uchar *row, DigitRows16 layout, uint p) {
-        device const uchar *group = layout.codes_at(row, ulong(p / runs::packets()) * runs::bytes());
-        constant uint4 *places = digit_places<RUNS, RUN_BYTES, RUN_DIGITS> + 2u * (p % runs::packets());
-        const uint4 offsets = places[0];
-        const uint2 powers = places[1].xy;
+        const packet_places at = packet_places::of(layout.codes_at(row, 0ul), p);
+        const uint4 offsets = at.entries[0];
+        const uint2 bytes = at.entries[1].xy;
         words w;
         _Pragma("clang loop unroll(full)")
         for (uint s = 0; s < 4u; ++s) {
-            const uint2 v = uint2(*reinterpret_cast<device const packed_uint2 *>(group + ulong(offsets[s])));
-            w.low[s] = (powers.x >> (8u * s + 7u)) & 1u ? v.y : v.x;
-            w.high[s] = (powers.y >> (8u * s + 7u)) & 1u ? v.y : v.x;
+            const uint2 v = at.words(offsets[s], packet_places::step_bytes(bytes, s));
+            w.low[s] = v.x;
+            w.high[s] = v.y;
         }
-        w.low_powers = powers.x & 0x7f7f7f7fu;
-        w.high_powers = powers.y & 0x7f7f7f7fu;
+        const uint2 powers = packet_places::powers(bytes);
+        w.low_powers = powers.x;
+        w.high_powers = powers.y;
         return w;
     }
     // Digit n of the bytes b in the 16-bit lanes of `lanes` (no product
     // reaches the next lane), radix R, is (r R) >> 8 of the remainder r =
     // (b R^n) mod 256, one product by R^n (`remainders`), as `digit_pair`'s
-    // integer or `digit_halves`' half: 1024 + r, times R/256 plus 1025.5 -
-    // 4R, rounded once: 1026 + the digit, the floor of R/256 of it (whose
-    // only integer value, at 0, rounds to even from 1025.5). A span's
-    // integer pairs take r by a chain of n products by R (`chain`) instead,
-    // measured faster there (M4 Pro, b3g256 at eight rows: 304.9 against
-    // 309.1 µs).
+    // integer or a half: 1024 + r, times R/256 plus 1025.5 - 4R, rounded
+    // once: 1026 + the digit, the floor of R/256 of it (whose only integer
+    // value, at 0, rounds to even from 1025.5; `digit_halves`), less
+    // `digit_base`. A span's integer pairs take r by a chain of n
+    // products by R (`chain`) instead, measured faster there (M4 Pro, b3g256
+    // at eight rows: 304.9 against 309.1 µs).
     static uint remainders(uint lanes, uint power) { return (lanes * power) & 0x00ff00ffu; }
     template <uint N>
     static uint chain(uint lanes) {
@@ -536,6 +593,22 @@ struct Digits {
         const half2 h = as_type<half2>(remainder | 0x64006400u);
         return metal::fma(h, half2(half(runs::radix()) / 256.0h), half2(half(1025.5f - 4.0f * float(runs::radix()))));
     }
+    // The half `digit_halves` less leaves the digits less the codes' zero:
+    // 1026 + that zero, from `offset`, 1024 + it (`Linear::codes`).
+    static half2 digit_base(half offset) { return half2(offset + 2.0h); }
+    // A step's values from its words and powers (`step_remainder`), less
+    // the codes' zero (`digit_base`): values 0, 2 (`even`) and 1, 3 of its
+    // first word, and the same of its second.
+    static void remainder_floats(uint low, uint high, uint low_power, uint high_power, half offset,
+        thread float4 &even, thread float4 &odd) {
+        const half2 base = digit_base(offset);
+        const half2 le = digit_halves(step_remainder<0u>(low, high, low_power, high_power)) - base;
+        const half2 lo = digit_halves(step_remainder<1u>(low, high, low_power, high_power)) - base;
+        const half2 he = digit_halves(step_remainder<2u>(low, high, low_power, high_power)) - base;
+        const half2 ho = digit_halves(step_remainder<3u>(low, high, low_power, high_power)) - base;
+        even = float4(le.x, le.y, he.x, he.y);
+        odd = float4(lo.x, lo.y, ho.x, ho.y);
+    }
     // A lane's decode of its row's whole group, the `span()` packets of the
     // group decoded together (`projection::gemv_body`, `gemv_batch_body`):
     // every byte's digits in one lane, each step's powers compile-time
@@ -546,7 +619,7 @@ struct Digits {
     };
     static span_words load_span(device const uchar *row, DigitRows16 layout, uint p) {
         constexpr uint WORDS = (runs::bytes() + 3u) / 4u;
-        device const uchar *share = layout.codes_at(row, ulong(p / runs::packets()) * runs::bytes());
+        device const uchar *share = group_at(layout.codes_at(row, 0ul), p / runs::packets());
         span_words k;
         _Pragma("clang loop unroll(full)")
         for (uint i = 0; i + 4u <= WORDS; i += 4u) {
@@ -558,23 +631,15 @@ struct Digits {
             k.w[i] = *reinterpret_cast<device const uint *>(share + 4u * i);
         return k;
     }
-    // Step STEP's values 0, 2 (`le`) and 1, 3 of its first word, and the
-    // same of its second (the same word, the next digit, in a run of 4), as
-    // 1026 + digit, less 1026.
+    // Step STEP's values (`remainder_floats`): its second word the same
+    // word, the next digit, in a run of 4.
     template <uint MASK, uint STEP>
     static void span_floats(thread const span_words &k, half offset, thread float4 &even, thread float4 &odd) {
         static_assert(MASK == 0u, "digits are unsigned codes");
         constexpr bool wide = runs::step_wide(8u * STEP);
         constexpr uint first = runs::step_byte(8u * STEP) / 4u, n = runs::step_digit(8u * STEP);
         constexpr uint pl = runs::power(n), ph = runs::power(wide ? n : n + 1u);
-        const uint low = k.w[first], high = k.w[wide ? first + 1u : first];
-        const half2 base = half2(offset + 2.0h);
-        const half2 le = digit_halves(remainders(low & 0x00ff00ffu, pl)) - base;
-        const half2 lo = digit_halves(remainders((low >> 8) & 0x00ff00ffu, pl)) - base;
-        const half2 he = digit_halves(remainders(high & 0x00ff00ffu, ph)) - base;
-        const half2 ho = digit_halves(remainders((high >> 8) & 0x00ff00ffu, ph)) - base;
-        even = float4(le.x, le.y, he.x, he.y);
-        odd = float4(lo.x, lo.y, ho.x, ho.y);
+        remainder_floats(k.w[first], k.w[wide ? first + 1u : first], pl, ph, offset, even, odd);
     }
     // Step STEP's values 2j and 2j + 1 as integers in bits 0.. and 16..
     template <uint MASK, uint STEP>
@@ -591,28 +656,83 @@ struct Digits {
         const uint lanes = chain<n>((word & 0xffu) | ((word & 0xff00u) << 8));
         return digit_pair(!wide && j >= 2u ? chain<1u>(lanes) : lanes);
     }
-    static uint power(uint powers, uint step) { return (powers >> (8u * step)) & 0xffu; }
-    // Step `step`'s values 0, 2 (`le`) and 1, 3 of its low word, and the
-    // same of its high word, as 1026 + digit, less 1026.
+    // The remainders of step `step` of packet p of the row share `share`
+    // (`projection::lane_codes`): its place's word or words
+    // (`packet_places`), each byte's by its digit's power.
+    static uint4 step_remainders(device const uchar *share, uint p, uint step) {
+        const packet_places at = packet_places::of(share, p);
+        const uint2 bytes = packet_places::step_bytes(at.entries[1].xy, step);
+        const uint2 v = at.words(at.entries[0][step], bytes), powers = packet_places::powers(bytes);
+        return step_remainders(v.x, v.y, powers.x, powers.y);
+    }
+    // A step's remainders from its words of values 0..3 and 4..7 and their
+    // digits' powers, a value a 16-bit lane: values 0, 2 in x, 1, 3 in y,
+    // 4, 6 in z and 5, 7 in w; remainder V of them (`step_remainder`).
+    template <uint V>
+    static uint step_remainder(uint low, uint high, uint low_power, uint high_power) {
+        const uint word = V < 2u ? low : high;
+        return remainders((V % 2u != 0u ? word >> 8 : word) & 0x00ff00ffu, V < 2u ? low_power : high_power);
+    }
+    static uint4 step_remainders(uint low, uint high, uint low_power, uint high_power) {
+        return uint4(step_remainder<0u>(low, high, low_power, high_power),
+            step_remainder<1u>(low, high, low_power, high_power), step_remainder<2u>(low, high, low_power, high_power),
+            step_remainder<3u>(low, high, low_power, high_power));
+    }
+    // A lane's step s of every packet of a group (`projection::lane_codes`):
+    // the words that step reads (`DigitRuns::lane_slot`), loaded once a
+    // group, each packet's places constants of the packet and the step.
+    struct lane_words {
+        uint w[runs::lane_words()];
+    };
+    // Slot C's byte and power at step s.
+    template <uint C>
+    static uint lane_byte(uint s) {
+        constexpr uint value = 32u * (C / 2u), h = C % 2u;
+        constexpr uint b0 = runs::half_byte(value, h), b1 = runs::half_byte(value + 8u, h),
+            b2 = runs::half_byte(value + 16u, h), b3 = runs::half_byte(value + 24u, h);
+        return s == 0u ? b0 : s == 1u ? b1 : s == 2u ? b2 : b3;
+    }
+    template <uint C>
+    static uint lane_power(uint s) {
+        constexpr uint value = 32u * (C / 2u), h = C % 2u;
+        constexpr uint p0 = runs::half_power(value, h), p1 = runs::half_power(value + 8u, h),
+            p2 = runs::half_power(value + 16u, h), p3 = runs::half_power(value + 24u, h);
+        return s == 0u ? p0 : s == 1u ? p1 : s == 2u ? p2 : p3;
+    }
+    template <uint C = 0u>
+    static void load_slots(thread lane_words &l, device const uchar *at, uint s) {
+        if constexpr (C < 2u * runs::packets()) {
+            if constexpr (runs::slot_first(C) == C) {
+                constexpr uint slot = runs::lane_slot(C);
+                l.w[slot] = *reinterpret_cast<device const uint *>(at + lane_byte<C>(s));
+            }
+            load_slots<C + 1u>(l, at, s);
+        }
+    }
+    static lane_words load_lane(device const uchar *share, uint group, uint s) {
+        lane_words l;
+        load_slots(l, group_at(share, group), s);
+        return l;
+    }
+    // Packet K's step s of the lane's words, as `step_remainders` gives it.
+    template <uint K>
+    static uint4 lane_step(thread const lane_words &l, uint s) {
+        constexpr uint low = runs::lane_slot(2u * K), high = runs::lane_slot(2u * K + 1u);
+        return step_remainders(l.w[low], l.w[high], lane_power<2u * K>(s), lane_power<2u * K + 1u>(s));
+    }
+    // Step `step`'s values (`remainder_floats`).
     template <uint MASK>
     static void floats(thread const words &w, uint step, half offset, thread float4 &even, thread float4 &odd) {
         static_assert(MASK == 0u, "digits are unsigned codes");
-        const uint low = w.low[step], high = w.high[step];
-        const uint pl = power(w.low_powers, step), ph = power(w.high_powers, step);
-        const half2 base = half2(offset + 2.0h);
-        const half2 le = digit_halves(remainders(low & 0x00ff00ffu, pl)) - base;
-        const half2 lo = digit_halves(remainders((low >> 8) & 0x00ff00ffu, pl)) - base;
-        const half2 he = digit_halves(remainders(high & 0x00ff00ffu, ph)) - base;
-        const half2 ho = digit_halves(remainders((high >> 8) & 0x00ff00ffu, ph)) - base;
-        even = float4(le.x, le.y, he.x, he.y);
-        odd = float4(lo.x, lo.y, ho.x, ho.y);
+        remainder_floats(w.low[step], w.high[step], packet_places::step_bytes(w.low_powers, step),
+            packet_places::step_bytes(w.high_powers, step), offset, even, odd);
     }
     // The step's values 2j and 2j + 1 as integers in bits 0.. and 16..
     template <uint MASK>
     static uint pair(thread const words &w, uint step, uint j) {
         static_assert(MASK == 0u, "digits are unsigned codes");
         const uint word = (j < 2u ? w.low[step] : w.high[step]) >> ((j & 1u) * 16u);
-        const uint p = power(j < 2u ? w.low_powers : w.high_powers, step);
+        const uint p = packet_places::step_bytes(j < 2u ? w.low_powers : w.high_powers, step);
         return digit_pair(remainders((word & 0xffu) | ((word & 0xff00u) << 8), p));
     }
 };
@@ -773,9 +893,11 @@ struct Linear {
     static void codes(thread const typename P::words &w, uint step, thread float4 &even, thread float4 &odd) {
         P::template floats<MASK>(w, step, 1024.0h, even, odd);
     }
+    // A span's codes less their zero, the zero taken off in the half
+    // subtraction.
     template <typename P, uint STEP>
     static void span_codes(thread const typename P::span_words &w, thread float4 &even, thread float4 &odd) {
-        P::template span_floats<MASK, STEP>(w, 1024.0h, even, odd);
+        P::template span_floats<MASK, STEP>(w, half(1024 + ZERO), even, odd);
     }
     template <typename P, uint STEP>
     static float2 span_pair(thread const typename P::span_words &w, uint j) {
@@ -1458,15 +1580,15 @@ struct Packet {
         k.coefficients = K::at(layout.super_at(row, 0ul), p);
         return k;
     }
+    // A span's values are its codes less their zero (`span_codes`, step
+    // STEP's) times its one scale (`span_scale`): a product over the span
+    // takes the codes, and the scale once.
     template <uint STEP>
-    static void span_values(thread const span_packet &k, thread float4 &even, thread float4 &odd) {
-        static_assert(C::zero == 0 || !K::biased, "a stored bias and a zero code are not one exact bias");
+    static void span_codes(thread const span_packet &k, thread float4 &even, thread float4 &odd) {
+        static_assert(!K::biased, "a span's values are its codes under one scale");
         C::template span_codes<P, STEP>(k.codes, even, odd);
-        const float s = k.coefficients.scale(0u);
-        const float b = C::zero != 0 ? -(float(C::zero) * s) : K::biased ? k.coefficients.bias(0u) : 0.0f;
-        even = metal::fma(float4(s), even, float4(b));
-        odd = metal::fma(float4(s), odd, float4(b));
     }
+    static float span_scale(thread const span_packet &k) { return k.coefficients.scale(0u); }
     template <uint STEP>
     static float2 span_pair_values(thread const span_packet &k, uint j) {
         const float2 codes = C::template span_pair<P, STEP>(k.codes, j);
