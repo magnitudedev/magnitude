@@ -52,6 +52,28 @@ impl Tier {
         }
     }
 
+    /// Bytes of the tier's widest vector, which its bodies load and store
+    /// whole: SSE's 128 bits, AVX2's 256, AVX-512's 512, NEON's 128.
+    pub const fn vector_bytes(self) -> usize {
+        match self {
+            Tier::X86V2 | Tier::Neon => 16,
+            Tier::X86V3 => 32,
+            Tier::X86V4 | Tier::X86V4Vnni => 64,
+        }
+    }
+
+    /// The widest vector of any of `tiers`.
+    pub const fn widest_vector(tiers: &[Tier]) -> usize {
+        let (mut widest, mut tier) = (0, 0);
+        while tier < tiers.len() {
+            if tiers[tier].vector_bytes() > widest {
+                widest = tiers[tier].vector_bytes();
+            }
+            tier += 1;
+        }
+        widest
+    }
+
     /// Every tier of the architecture this crate is compiled for, lowest
     /// first.
     pub const fn all() -> &'static [Tier] {
@@ -152,6 +174,8 @@ pub const NEON_FEATURES: &str = "neon";
 pub unsafe trait Isa: Copy + Send + Sync + 'static {
     const TIER: Tier;
     const FEATURES: &'static str;
+    /// The tier's quantized-dot mode ([`Tier::quantized_dots`]).
+    const QUANTIZED_DOTS: u8 = Self::TIER.quantized_dots();
 
     /// The token, when the host has the tier's features.
     fn detect() -> Option<Self>;

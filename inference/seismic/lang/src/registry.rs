@@ -13,10 +13,11 @@ use crate::types::DType;
 use magnitude_ggml::Encoding;
 
 pub use crate::repr::{
-    CodeInterpretation, CodeKind, CoefficientAxes, CoefficientKind, DecodeAxes, DecodeComponent,
-    DecodeRecipe, DecodeStep, DecodeTemp, FloatCodeFormat, GridCodes, LocalCodes, LookupTable,
-    MinimumSign, OperandRecipe, PlaneEncoding, PlaneField, PlaneRead, PlaneSchema,
-    QuantizedComponent, ScaleEncoding, ScaledCodes, GRID_SIGN_BITS, GRID_VALUES,
+    BiasKind, CodeInterpretation, CodeKind, CodingAxes, CoefficientKind, DecodeAxes, DecodeComponent,
+    DecodeRecipe, DecodeStep, DecodeTemp, DigitCodes, DigitRun, FloatCodeFormat, GridCodes,
+    GridSigns, LocalBias, LocalCodes, LookupTable, MinimumSign, OperandRecipe,
+    PlaneEncoding, PlaneField, PlaneRead, PlaneSchema, QuantizedComponent, ScaleEncoding,
+    ScaledCodes, ValueCodes, DIGITS_PER_BYTE, DIGIT_BITS, DIGIT_BYTE_BITS, DIGIT_RADIX, GRID_VALUES,
 };
 
 /// A weight's arithmetic (`DecodeAxes::profile`), what consumer forms state
@@ -467,6 +468,15 @@ pub enum ConversionLayout {
 }
 
 impl ConversionLayout {
+    /// The layout of packed representation kind `kind`; `None` for another.
+    pub fn of(kind: &'static RepresentationKind) -> Option<Self> {
+        match kind {
+            RepresentationKind::Packed(packet) => Some(Self::Packet(packet)),
+            RepresentationKind::PackedRows(rows) => Some(Self::Rows(rows)),
+            RepresentationKind::Dense(_) | RepresentationKind::External(_) => None,
+        }
+    }
+
     /// The destination's packet form.
     pub fn packet(self) -> &'static PackedPacketLayout {
         match self {
@@ -530,20 +540,8 @@ impl PacketRepackRecipe {
                     RepackExpr::SourceBits { bit, .. } => fields.push(*bit),
                     _ => unreachable!("a validated recipe widens a source field"),
                 },
-                RepackExpr::ShiftLeft { value, .. }
-                | RepackExpr::OffsetI32 { value, .. }
-                | RepackExpr::I32ToF32(value)
-                | RepackExpr::ScaleF32 { value, .. } => collect(value, fields),
+                RepackExpr::ScaleF32 { value, .. } => collect(value, fields),
                 RepackExpr::Lookup { index, .. } => collect(index, fields),
-                RepackExpr::BitOr(left, right)
-                | RepackExpr::MultiplyF32(left, right)
-                | RepackExpr::NegateIf {
-                    value: left,
-                    sign: right,
-                } => {
-                    collect(left, fields);
-                    collect(right, fields);
-                }
             }
         }
         let mut fields = Vec::new();
@@ -566,8 +564,9 @@ impl PacketRepackRecipe {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlaneRepackRecipe {
-    /// One source packet bit ordinal for every destination plane bit.
-    BitRoutes(Vec<u32>),
+    /// For every destination plane bit, the source packet bit ordinal it
+    /// moves, or none: a zero bit.
+    BitRoutes(Vec<Option<u32>>),
     /// One typed expression for every dense destination plane element.
     DenseValues(Vec<RepackExpr>),
     /// One integer expression for every entry of a packed destination plane,
@@ -583,18 +582,7 @@ pub enum RepackExpr {
         bit: u32,
         width: u8,
     },
-    ShiftLeft {
-        value: Box<RepackExpr>,
-        bits: u8,
-    },
-    BitOr(Box<RepackExpr>, Box<RepackExpr>),
-    OffsetI32 {
-        value: Box<RepackExpr>,
-        offset: i32,
-    },
     F16ToF32(Box<RepackExpr>),
-    I32ToF32(Box<RepackExpr>),
-    MultiplyF32(Box<RepackExpr>, Box<RepackExpr>),
     /// `value * 2^exponent`: exact for a widened binary16 `value`, whose
     /// every multiple by a small power of two is a normal `f32`.
     ScaleF32 {
@@ -606,13 +594,6 @@ pub enum RepackExpr {
     Lookup {
         index: Box<RepackExpr>,
         table: RepackTable,
-    },
-    /// The integer `value`, negated (two's complement) where the one-bit
-    /// integer `sign` is 1: a sign kept apart from a magnitude, so a table
-    /// holds magnitudes only.
-    NegateIf {
-        value: Box<RepackExpr>,
-        sign: Box<RepackExpr>,
     },
 }
 
@@ -658,7 +639,10 @@ impl PlaneInfo {
     pub fn storage_element_bytes(&self) -> u32 {
         match self.encoding {
             PlaneEncoding::Dense(dtype) => dtype.bytes(),
-            PlaneEncoding::Packed { .. } => 4,
+            PlaneEncoding::Packed { .. }
+            | PlaneEncoding::Grid(_)
+            | PlaneEncoding::SignedLocal { .. }
+            | PlaneEncoding::Digits { .. } => 4,
             PlaneEncoding::FloatCode { .. } => 1,
         }
     }
@@ -813,8 +797,9 @@ pub const MMA_LANES: u64 = 32;
 ///
 /// `mma16` additionally pads the row axis `N` of every `[N, K]` matrix to a
 /// multiple of 16 rows (padding rows are zero) and permutes each code plane
-/// within each 16-row tile (`code_bit`). Scale and super planes, the row
-/// stride and every plane offset are exactly those of `rows16`.
+/// and a digits plane within each 16-row tile (`code_bit`, `digit_byte`).
+/// Scale and super planes, the row stride and every plane offset are exactly
+/// those of `rows16`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackedRowLayout {
     /// `Rows16`, `Rows8` or `Mma16`.
@@ -866,22 +851,41 @@ pub enum RowPlaneContent {
     /// `c * bits` of the row's plane (little-endian within bytes: code `2i`
     /// in the low nibble of byte `i` for 4-bit codes).
     Codes { shift: u32, bits: u32 },
-    /// The whole vector-code entries of the packet `words` plane (one per
-    /// `GRID_VALUES` columns), placed as a code plane of `bits` bits a column
-    /// (`code_bit`): an entry is the codes of its columns. With `carried`,
-    /// the entries also carry that packet plane, the representation's
-    /// coefficient codes: bit `j` of a group's code at the grid's
-    /// `carried_bit` of the group's entry `j`.
-    Grids { bits: u32, carried: Option<u32> },
+    /// The whole bytes of the vector-code entries of the packet `words`
+    /// plane (one per `GRID_VALUES` columns), placed as a code plane of
+    /// `bits` bits a column (`code_bit`): an entry is the codes of its
+    /// columns. With `carried`, the entries also carry that packet plane, the
+    /// representation's coefficient codes: bit `j` of a group's code at the
+    /// grid's `carried_bit` of the group's entry `j` (in the grid high plane
+    /// where that bit is past the entry's whole bytes). `grid` is the
+    /// entries' grid.
+    Grids {
+        bits: u32,
+        grid: &'static GridCodes,
+        carried: Option<u32>,
+    },
+    /// Bits `[shift, shift + bits)` of every vector-code entry of the packet
+    /// `words` plane, the part of an entry past its whole bytes (`grids`
+    /// holds those), `bits` an entry in entry order: placed as a code plane
+    /// of one unit an entry (`code_bit`).
+    GridHigh { shift: u32, bits: u32 },
+    /// The packet `words` plane of base-3 digits (`PlaneEncoding::Digits`):
+    /// its codes are no column's bits, so a storage group's share is its
+    /// bytes, placed whole as a group plane's are (`share_byte`) but in
+    /// `mma16`, which interleaves them across the tile (`digit_byte`).
+    /// `digits` is the plane's digit coding.
+    Digits { digits: &'static DigitCodes },
     /// The bytes of the listed packet planes of one packet, concatenated in
     /// list order, per storage group: the local or the super coefficients.
     Groups { level: CoefficientLevel, planes: Vec<u32> },
     /// `mma16` of a carried grid representation: the tile's whole storage
     /// groups as records of its 16 rows (`record_byte`), every group's
     /// carried entries in GEMV lane order, then every group's `factors`
-    /// packet planes. The only plane of its layout.
+    /// packet planes. The only plane of its layout. `grid` is the entries'
+    /// grid.
     Records {
         bits: u32,
+        grid: &'static GridCodes,
         carried: u32,
         factors: Vec<u32>,
     },
@@ -938,8 +942,9 @@ impl RowPlaneInfo {
         match self.content {
             RowPlaneContent::Codes { shift: 0, .. }
             | RowPlaneContent::Grids { .. }
+            | RowPlaneContent::Digits { .. }
             | RowPlaneContent::Records { .. } => RowPlaneRole::Codes,
-            RowPlaneContent::Codes { .. } => RowPlaneRole::High,
+            RowPlaneContent::Codes { .. } | RowPlaneContent::GridHigh { .. } => RowPlaneRole::High,
             RowPlaneContent::Groups { level: CoefficientLevel::Local, .. } => RowPlaneRole::Scales,
             RowPlaneContent::Groups { level: CoefficientLevel::Super, .. } => RowPlaneRole::Supers,
         }
@@ -1001,13 +1006,17 @@ impl PackedRowLayout {
         })
     }
 
-    /// Bytes between the starts of adjacent rows.
+    /// Bytes between the starts of adjacent rows; `None` on overflow or
+    /// where a tile's rows would hold 2^32 bytes or more, since the native
+    /// libraries address within a tile in 32 bits (CUDA's
+    /// `packets::CodePlane`).
     pub fn row_stride_bytes(&self, logical_extent: u64) -> Option<u64> {
         let last = self.planes.len().checked_sub(1)?;
-        align(
+        let stride = align(
             self.plane_row_offset(last, logical_extent)?
                 .checked_add(self.plane_bytes_per_row(last, logical_extent)?)?,
-        )
+        )?;
+        (stride.checked_mul(self.tile_rows())? <= u64::from(u32::MAX)).then_some(stride)
     }
 
     /// Storage units of a tensor with `extents`: the leading extents (the
@@ -1071,11 +1080,16 @@ impl PackedRowLayout {
     /// cannot be split across lanes: its `V` is `[k-block kb][row r][64 *
     /// bits / 8 bytes]`, the k-block's columns of each of the tile's rows
     /// adjacent, row by row. A `records` plane's entries are placed by
-    /// `record_byte`.
+    /// `record_byte`. A `grid_high` plane is placed as a grids plane of one
+    /// unit an entry (`GRID_VALUES` columns, `column` its first), `bits` a
+    /// unit.
     pub fn code_bit(&self, geometry: &RowGeometry, plane: usize, row: u64, column: u64) -> u64 {
-        let (bits, grids) = match self.planes[plane].content {
-            RowPlaneContent::Codes { bits, .. } => (bits, false),
-            RowPlaneContent::Grids { bits, .. } => (bits, true),
+        // Bits of a placed unit, whether it is placed as entries are, and the
+        // columns of a unit.
+        let (bits, grids, unit) = match self.planes[plane].content {
+            RowPlaneContent::Codes { bits, .. } => (bits, false, 1),
+            RowPlaneContent::Grids { bits, .. } => (bits, true, 1),
+            RowPlaneContent::GridHigh { bits, .. } => (bits, true, u64::from(GRID_VALUES)),
             RowPlaneContent::Records { bits, .. } => {
                 let entry = column % u64::from(self.packet.group) / u64::from(GRID_VALUES);
                 let packet = column / u64::from(self.packet.group);
@@ -1085,8 +1099,11 @@ impl PackedRowLayout {
                 });
                 return byte * 8 + column % u64::from(GRID_VALUES) * u64::from(bits);
             }
-            RowPlaneContent::Groups { .. } => {
-                panic!("row plane `{}` holds no codes", self.planes[plane].name)
+            RowPlaneContent::Groups { .. } | RowPlaneContent::Digits { .. } => {
+                panic!(
+                    "row plane `{}` holds no column's codes",
+                    self.planes[plane].name
+                )
             }
         };
         let bits = u64::from(bits);
@@ -1098,15 +1115,15 @@ impl PackedRowLayout {
                 let byte = self
                     .share_byte(geometry, row, column / group, plane)
                     .expect("a rows16 or rows8 share is its bytes");
-                byte * 8 + column % group * bits
+                byte * 8 + column % group / unit * bits
             }
             Layout::Rows32 => interleaved(
                 ROWS32_TILE_ROWS,
-                ROWS32_CHUNK,
+                ROWS32_CHUNK / unit,
                 stride,
                 offset,
                 row,
-                column,
+                column / unit,
                 bits,
             ),
             Layout::Mma16 => {
@@ -1114,7 +1131,7 @@ impl PackedRowLayout {
                 let (tile, r) = (row / MMA_TILE_ROWS, row % MMA_TILE_ROWS);
                 let (block, c) = (column / MMA_KBLOCK, column % MMA_KBLOCK);
                 let bit = if grids {
-                    ((block * MMA_TILE_ROWS + r) * MMA_KBLOCK + c) * bits
+                    ((block * MMA_TILE_ROWS + r) * (MMA_KBLOCK / unit) + c / unit) * bits
                 } else {
                     let (step, k) = (c / 16, c % 16);
                     let lane = 4 * (r % 8) + (k % 8) / 2;
@@ -1134,8 +1151,9 @@ impl PackedRowLayout {
     /// another), in the layouts that keep a share's bytes together: every
     /// plane of `rows16` and `rows8` (whose tile holds a group's shares of
     /// its rows one after another), and the group planes of `rows32` and
-    /// `mma16`. `None` for a code plane of `rows32` or `mma16`
-    /// (`code_bit`).
+    /// `mma16`, and the digits plane of `rows32`. `None` for a code plane of
+    /// `rows32` or `mma16`, or the digits plane of `mma16` (`code_bit`,
+    /// `digit_byte`).
     pub fn share_byte(
         &self,
         geometry: &RowGeometry,
@@ -1145,7 +1163,10 @@ impl PackedRowLayout {
     ) -> Option<u64> {
         let group_bytes = u64::from(self.planes[plane].bytes_per_group);
         let (stride, offset, tile) = (geometry.stride, geometry.offsets[plane], self.tile_rows());
-        let groups = matches!(self.planes[plane].content, RowPlaneContent::Groups { .. });
+        let groups = matches!(
+            self.planes[plane].content,
+            RowPlaneContent::Groups { .. } | RowPlaneContent::Digits { .. }
+        );
         Some(match self.layout {
             Layout::Rows16 | Layout::Rows8 => {
                 row / tile * stride * tile
@@ -1162,10 +1183,57 @@ impl PackedRowLayout {
                     + row % tile * geometry.bytes_per_row[plane]
                     + packet * group_bytes
             }
-            Layout::Mma16 if groups => row * stride + offset + packet * group_bytes,
+            Layout::Mma16
+                if groups
+                    && !matches!(self.planes[plane].content, RowPlaneContent::Digits { .. }) =>
+            {
+                row * stride + offset + packet * group_bytes
+            }
             Layout::Rows32 | Layout::Mma16 => return None,
             Layout::Packet => unreachable!("a row layout is never `packet`"),
         })
+    }
+
+    /// The byte holding byte `byte` of storage group `packet`'s share of the
+    /// digits plane `plane` of stored row `row` (`RowPlaneContent::Digits`):
+    ///
+    /// `rows16`, `rows8`, `rows32`: the share's bytes in order
+    /// (`share_byte`), a lane's whole group one contiguous run of its row.
+    ///
+    /// `mma16`: the tile's 16 rows' plane slots (payload and alignment tail,
+    /// `ROW_ALIGNMENT` whole) are one sequence `V` of 16-byte chunks dealt
+    /// to the rows in turn: chunk `c` is chunk `c / 16` of the slot of row
+    /// `c % 16` (no chunk straddles a row, every chunk address is shifts and
+    /// masks, and the tile's groups fill the slots exactly). Group `p`'s 16
+    /// shares are `V` bytes `[16 B p, 16 B (p + 1))` (`B` a share's bytes),
+    /// its runs one after another in m16n8k16 fragment-lane order
+    /// (`mma16_digit`): lane `l = 4g + t` of the k16 steps reads, of rows
+    /// `g` and `g + 8`, the bytes holding k `2t, 2t + 1, 2t + 8, 2t + 9` of
+    /// every step (its sources), two segment sources one 16-byte unit of the
+    /// lane, so a warp's load is two whole chunks of each of the 16 rows.
+    pub fn digit_byte(
+        &self,
+        geometry: &RowGeometry,
+        row: u64,
+        packet: u64,
+        plane: usize,
+        digits: &DigitCodes,
+        byte: u32,
+    ) -> u64 {
+        if self.layout != Layout::Mma16 {
+            return self
+                .share_byte(geometry, row, packet, plane)
+                .expect("a digits share is its bytes outside mma16")
+                + u64::from(byte);
+        }
+        let group_bytes = u64::from(self.planes[plane].bytes_per_group);
+        let (tile, r) = (row / MMA_TILE_ROWS, row % MMA_TILE_ROWS);
+        let at = MMA_TILE_ROWS * group_bytes * packet + mma16_digit(digits, r, byte);
+        let chunk = at / MMA_DIGIT_CHUNK;
+        (tile * MMA_TILE_ROWS + chunk % MMA_TILE_ROWS) * geometry.stride
+            + geometry.offsets[plane]
+            + chunk / MMA_TILE_ROWS * MMA_DIGIT_CHUNK
+            + at % MMA_DIGIT_CHUNK
     }
 
     /// Bytes of one storage group's entries in a `records` tile: its 16 rows'
@@ -1219,7 +1287,9 @@ impl PackedRowLayout {
     /// `f` at the carried bit of entry `j` of the field's group. A groups
     /// plane's share is its listed packet planes' bytes in list order; a
     /// records plane's share is its entries, then its factors' bytes in list
-    /// order.
+    /// order. A vector-code entry's bits past its whole bytes are in the grid
+    /// high plane, an entry's in entry order; a digits plane's share is the
+    /// packet plane's bytes.
     pub fn group_bit(&self, plane: usize, bit: u32) -> (usize, u32) {
         let entries = self.planes.iter().position(|candidate| {
             matches!(
@@ -1228,13 +1298,17 @@ impl PackedRowLayout {
             )
         });
         if plane == 0 {
+            if let Some(index) = self
+                .planes
+                .iter()
+                .position(|candidate| matches!(candidate.content, RowPlaneContent::Digits { .. }))
+            {
+                return (index, bit);
+            }
             let code_bits = self.packet.planes[0].entry_bits;
             let (code, code_bit) = (bit / code_bits, bit % code_bits);
             if let Some(index) = entries {
-                return (
-                    index,
-                    code * GRID_VALUES * self.column_bits(index) + code_bit,
-                );
+                return self.entry_bit(index, code, code_bit);
             }
             return self
                 .planes
@@ -1261,11 +1335,14 @@ impl PackedRowLayout {
             )
         };
         if let Some(index) = entries {
-            let (carried, factors) = match &self.planes[index].content {
-                RowPlaneContent::Grids { carried, .. } => (*carried, None),
+            let (grid, carried, factors) = match &self.planes[index].content {
+                RowPlaneContent::Grids { grid, carried, .. } => (*grid, *carried, None),
                 RowPlaneContent::Records {
-                    carried, factors, ..
-                } => (Some(*carried), Some(factors)),
+                    grid,
+                    carried,
+                    factors,
+                    ..
+                } => (*grid, Some(*carried), Some(factors)),
                 _ => unreachable!(),
             };
             let bits = self.column_bits(index);
@@ -1273,10 +1350,7 @@ impl PackedRowLayout {
                 let codes = &self.packet.planes[plane];
                 let (field, j) = (bit / codes.entry_bits, bit % codes.entry_bits);
                 let entry = field * (codes.group / GRID_VALUES) + j;
-                return (
-                    index,
-                    entry * GRID_VALUES * bits + self.grid().carried_bit(),
-                );
+                return self.entry_bit(index, entry, grid.carried_bit());
             }
             if let Some(factors) = factors {
                 let prefix = prefix(factors)
@@ -1291,9 +1365,49 @@ impl PackedRowLayout {
                 RowPlaneContent::Groups { planes, .. } => Some((index, prefix(planes)? * 8 + bit)),
                 RowPlaneContent::Codes { .. }
                 | RowPlaneContent::Grids { .. }
+                | RowPlaneContent::GridHigh { .. }
+                | RowPlaneContent::Digits { .. }
                 | RowPlaneContent::Records { .. } => None,
             })
             .expect("every packet plane has one row plane")
+    }
+
+    /// The row plane and share bit of bit `bit` of vector-code entry `entry`
+    /// of a storage group, whose whole bytes are in entries plane `entries`
+    /// (`group_bit`) and the rest in the grid high plane.
+    fn entry_bit(&self, entries: usize, entry: u32, bit: u32) -> (usize, u32) {
+        let low = GRID_VALUES * self.column_bits(entries);
+        if bit < low {
+            return (entries, entry * low + bit);
+        }
+        self.planes
+            .iter()
+            .enumerate()
+            .find_map(|(index, candidate)| match candidate.content {
+                RowPlaneContent::GridHigh { shift, bits }
+                    if (shift..shift + bits).contains(&bit) =>
+                {
+                    Some((index, entry * bits + bit - shift))
+                }
+                _ => None,
+            })
+            .expect("every entry bit has one row plane")
+    }
+
+    /// Bits of a storage group's codes code plane `plane` holds: its
+    /// columns' bits, a grid high plane's entries', or a digits plane's
+    /// bytes (a records plane's factors are not codes).
+    pub fn code_bits(&self, plane: usize) -> u32 {
+        match self.planes[plane].content {
+            RowPlaneContent::Codes { .. }
+            | RowPlaneContent::Grids { .. }
+            | RowPlaneContent::Records { .. } => self.column_bits(plane) * self.packet.group,
+            RowPlaneContent::GridHigh { bits, .. } => bits * self.packet.group / GRID_VALUES,
+            RowPlaneContent::Digits { .. } => self.planes[plane].bytes_per_group * 8,
+            RowPlaneContent::Groups { .. } => {
+                panic!("row plane `{}` holds no codes", self.planes[plane].name)
+            }
+        }
     }
 
     /// Bits a column of code plane `plane` holds.
@@ -1302,8 +1416,13 @@ impl PackedRowLayout {
             RowPlaneContent::Codes { bits, .. }
             | RowPlaneContent::Grids { bits, .. }
             | RowPlaneContent::Records { bits, .. } => bits,
-            RowPlaneContent::Groups { .. } => {
-                panic!("row plane `{}` holds no codes", self.planes[plane].name)
+            RowPlaneContent::GridHigh { .. }
+            | RowPlaneContent::Digits { .. }
+            | RowPlaneContent::Groups { .. } => {
+                panic!(
+                    "row plane `{}` holds no column's codes",
+                    self.planes[plane].name
+                )
             }
         }
     }
@@ -1329,6 +1448,12 @@ impl PackedRowLayout {
             RowPlaneContent::Codes { bits, .. } | RowPlaneContent::Grids { bits, .. } => {
                 code(*bits)
             }
+            // The share bit's entry, placed at its first column.
+            RowPlaneContent::GridHigh { bits, .. } => {
+                let column =
+                    packet * u64::from(self.packet.group) + u64::from(share / bits * GRID_VALUES);
+                self.code_bit(geometry, index, row, column) + u64::from(share % bits)
+            }
             RowPlaneContent::Records { bits, .. } if share < self.packet.group * bits => {
                 code(*bits)
             }
@@ -1349,6 +1474,10 @@ impl PackedRowLayout {
                     .expect("a group plane's share is its bytes");
                 byte * 8 + u64::from(share)
             }
+            RowPlaneContent::Digits { digits } => {
+                self.digit_byte(geometry, row, packet, index, digits, share / 8) * 8
+                    + u64::from(share % 8)
+            }
         }
     }
 
@@ -1363,30 +1492,28 @@ impl PackedRowLayout {
                 .is_some_and(|(_, carried_bit)| bit % self.packet.planes[0].entry_bits >= carried_bit))
     }
 
+    /// Whether the layout stores its tiles as records (its only plane a
+    /// `RowPlaneContent::Records`).
+    pub fn records(&self) -> bool {
+        self.planes.iter().any(|plane| matches!(plane.content, RowPlaneContent::Records { .. }))
+    }
+
     /// The packet plane a carried grid layout's entries carry, and the entry
     /// bit carrying it (`GridCodes::carried_bit`).
     pub fn carried(&self) -> Option<(u32, u32)> {
         self.planes.iter().find_map(|candidate| match candidate.content {
             RowPlaneContent::Grids {
+                grid,
                 carried: Some(plane),
                 ..
             }
             | RowPlaneContent::Records {
-                carried: plane, ..
-            } => Some((plane, self.grid().carried_bit())),
+                grid,
+                carried: plane,
+                ..
+            } => Some((plane, grid.carried_bit())),
             _ => None,
         })
-    }
-
-    /// The vector codes of a grid representation's `words` plane.
-    fn grid(&self) -> &'static GridCodes {
-        match &self.packet.planes[0].encoding {
-            PlaneEncoding::Packed {
-                interpretation: CodeInterpretation::Grid(grid),
-                ..
-            } => grid,
-            _ => panic!("a carried coefficient plane needs grid codes"),
-        }
     }
 
     /// `width` bits of packet-form plane `plane` starting at bit `first`, of
@@ -1510,6 +1637,80 @@ fn interleaved(
     byte * 8 + column % chunk * bits
 }
 
+/// Bytes of an `mma16` digits chunk (`PackedRowLayout::digit_byte`): the
+/// widest load and copy, 16-byte aligned in every row slot.
+pub const MMA_DIGIT_CHUNK: u64 = 16;
+/// Bytes of one `mma16` digits segment source across a tile: a chunk of
+/// each of its rows (`mma16_digit`; `SEISMIC_MMA_DIGIT_SEGMENT`,
+/// `packets::DigitPlanes::lane_byte`).
+pub const MMA_DIGIT_SEGMENT: u64 = MMA_TILE_ROWS * MMA_DIGIT_CHUNK;
+
+/// Whether `digits` code a 256-value group in `mma16` fragment order
+/// (`mma16_digit`): every run starts on a k16 step, the values of a chunk's
+/// bytes (`MMA_DIGIT_CHUNK`), and its bytes are whole chunks (a step is one
+/// digit of one segment) or an even divisor of a chunk (a step is digits of
+/// all its bytes).
+fn mma16_digits(digits: &DigitCodes) -> bool {
+    const CHUNK: u32 = MMA_DIGIT_CHUNK as u32;
+    let mut first = 0;
+    digits.runs.iter().all(|run| {
+        let whole = first % CHUNK == 0
+            && (run.bytes() % CHUNK == 0 || (run.bytes() % 2 == 0 && CHUNK % run.bytes() == 0));
+        first += run.bytes() * run.digits();
+        whole
+    }) && digits.values() == 4 * MMA_KBLOCK as u32
+}
+
+/// Where byte `byte` of row `r` (of 16) of an `mma16` tile's storage group
+/// lies within the group's 16 shares (`PackedRowLayout::digit_byte`), in
+/// fragment-lane order. A run of whole 16-byte segments holds a source per
+/// segment, lane `l = 4g + t`'s 4 bytes of each row its segment bytes `2t,
+/// 2t + 1, 2t + 8, 2t + 9` (k `2t, 2t + 1, 2t + 8, 2t + 9` of each step); a
+/// run of `b < 16` bytes one source, lane `t`'s 2 bytes of each row its pair
+/// `t mod b / 2` (k `2t, 2t + 1`, and `2t + 8, 2t + 9` at the digit `8 / b`
+/// on). The segment sources come first, in order, two to a 16-byte unit of
+/// each lane, `[pair][lane][source][row g, row g + 8][4 bytes]`, an odd last
+/// one `[lane][row g, row g + 8][4 bytes]`; then the shorter runs, each
+/// `[g][pair j < b / 2][row g, row g + 8][bytes 2j, 2j + 1]`.
+fn mma16_digit(digits: &DigitCodes, r: u64, byte: u32) -> u64 {
+    // A segment is a chunk of each row; a lane's unit is a chunk, two
+    // segment sources a half each, its rows `g` and `g + 8`.
+    let (chunk, unit) = (MMA_DIGIT_CHUNK, MMA_DIGIT_CHUNK / 2);
+    let (g, half) = (r % (MMA_TILE_ROWS / 2), r / (MMA_TILE_ROWS / 2));
+    let segments = digits
+        .runs
+        .iter()
+        .filter(|run| u64::from(run.bytes()) % chunk == 0)
+        .map(|run| u64::from(run.bytes()) / chunk)
+        .sum::<u64>();
+    let pairs = segments / 2;
+    let (mut first, mut segment, mut short) = (0, 0u64, MMA_DIGIT_SEGMENT * segments);
+    for run in digits.runs {
+        let b = u64::from(run.bytes());
+        if byte < first + run.bytes() {
+            let j = u64::from(byte - first);
+            if b % chunk != 0 {
+                return short + (g * (b / 2) + j / 2) * 4 + 2 * half + j % 2;
+            }
+            let (source, k) = (segment + j / chunk, j % chunk);
+            let lane = 4 * g + k % unit / 2;
+            let within = 4 * half + 2 * (k / unit) + k % 2;
+            return if source < 2 * pairs {
+                2 * MMA_DIGIT_SEGMENT * (source / 2) + chunk * lane + unit * (source % 2) + within
+            } else {
+                2 * MMA_DIGIT_SEGMENT * pairs + unit * lane + within
+            };
+        }
+        first += run.bytes();
+        if b % chunk == 0 {
+            segment += b / chunk;
+        } else {
+            short += MMA_TILE_ROWS * b;
+        }
+    }
+    panic!("byte {byte} lies past the digit runs")
+}
+
 pub fn capability(backend: BackendName, name: &str) -> Option<CapabilityId> {
     internals::capability(backend, name)
 }
@@ -1574,67 +1775,65 @@ pub fn representation_conversion_info(
 pub fn representation_conversions() -> &'static [RepresentationConversion] {
     internals::representation_conversions()
 }
-/// A GGUF source the registry converts from: its ggml type, the type's
-/// blocks one source packet holds, its storage name, and the resident
-/// representation its conversion writes. Packet bytes and values are the
-/// type's block geometry (`magnitude_ggml`) times `blocks`.
+/// A GGUF source the registry converts from: its ggml type, its storage
+/// name, and the resident representation its conversion writes. A source
+/// packet is one block of the type (`magnitude_ggml` geometry).
 #[derive(Clone, Copy, Debug)]
 struct GgufSource {
     encoding: Encoding,
-    blocks: u64,
     name: &'static str,
     resident: &'static str,
 }
 
 const fn gguf_source_spec(
     encoding: Encoding,
-    blocks: u64,
     name: &'static str,
     resident: &'static str,
 ) -> GgufSource {
     GgufSource {
         encoding,
-        blocks,
         name,
         resident,
     }
 }
 
-const GGUF_SOURCES: [GgufSource; 20] = [
-    gguf_source_spec(Encoding::Q3K, 1, "gguf_q3_k", "q6k"),
-    gguf_source_spec(Encoding::Iq3S, 1, "gguf_iq3_s", "q6k"),
-    gguf_source_spec(Encoding::Q4K, 1, "gguf_q4_k", "q4k"),
-    gguf_source_spec(Encoding::Q5K, 1, "gguf_q5_k", "q5k"),
-    gguf_source_spec(Encoding::Q6K, 1, "gguf_q6_k", "q6k"),
-    gguf_source_spec(Encoding::Q8_0, 1, "gguf_q8_0", "q8g32s"),
-    gguf_source_spec(Encoding::Iq4Nl, 8, "gguf_iq4_nl", "iq4g32"),
-    gguf_source_spec(Encoding::Iq4Xs, 1, "gguf_iq4_xs", "iq4g32"),
-    gguf_source_spec(Encoding::Q4_0, 1, "gguf_q4_0", "q4g32s"),
-    gguf_source_spec(Encoding::Iq4Nl, 1, "gguf_iq4_nl_block", "iq4g32s"),
-    gguf_source_spec(Encoding::Q5_0, 1, "gguf_q5_0", "q5g32s"),
-    gguf_source_spec(Encoding::Q5_1, 1, "gguf_q5_1", "q5g32"),
-    gguf_source_spec(Encoding::Mxfp4, 1, "gguf_mxfp4", "mxfp4g32"),
-    gguf_source_spec(Encoding::Nvfp4, 1, "gguf_nvfp4", "nvfp4g16"),
-    gguf_source_spec(Encoding::Iq2Xs, 1, "gguf_iq2_xs", "iq2xs"),
-    gguf_source_spec(Encoding::Iq3Xxs, 1, "gguf_iq3_xxs", "iq3xxs"),
-    gguf_source_spec(Encoding::Iq2Xxs, 1, "gguf_iq2_xxs", "iq2xxs"),
-    gguf_source_spec(Encoding::Q4_1, 1, "gguf_q4_1", "q4g32"),
-    gguf_source_spec(Encoding::Q2K, 1, "gguf_q2_k", "q2k"),
-    gguf_source_spec(Encoding::Tq2_0, 1, "gguf_tq2_0", "q2g256"),
+const GGUF_SOURCES: [GgufSource; 24] = [
+    gguf_source_spec(Encoding::Q3K, "gguf_q3_k", "q3k"),
+    gguf_source_spec(Encoding::Iq3S, "gguf_iq3_s", "iq3s"),
+    gguf_source_spec(Encoding::Q4K, "gguf_q4_k", "q4k"),
+    gguf_source_spec(Encoding::Q5K, "gguf_q5_k", "q5k"),
+    gguf_source_spec(Encoding::Q6K, "gguf_q6_k", "q6k"),
+    gguf_source_spec(Encoding::Q8_0, "gguf_q8_0", "q8g32s"),
+    gguf_source_spec(Encoding::Iq4Nl, "gguf_iq4_nl", "iq4g32s"),
+    gguf_source_spec(Encoding::Iq4Xs, "gguf_iq4_xs", "iq4xs"),
+    gguf_source_spec(Encoding::Q4_0, "gguf_q4_0", "q4g32s"),
+    gguf_source_spec(Encoding::Q5_0, "gguf_q5_0", "q5g32s"),
+    gguf_source_spec(Encoding::Q5_1, "gguf_q5_1", "q5g32"),
+    gguf_source_spec(Encoding::Mxfp4, "gguf_mxfp4", "mxfp4g32"),
+    gguf_source_spec(Encoding::Nvfp4, "gguf_nvfp4", "nvfp4g16"),
+    gguf_source_spec(Encoding::Iq2Xs, "gguf_iq2_xs", "iq2xs"),
+    gguf_source_spec(Encoding::Iq3Xxs, "gguf_iq3_xxs", "iq3xxs"),
+    gguf_source_spec(Encoding::Iq2Xxs, "gguf_iq2_xxs", "iq2xxs"),
+    gguf_source_spec(Encoding::Q4_1, "gguf_q4_1", "q4g32"),
+    gguf_source_spec(Encoding::Q2K, "gguf_q2_k", "q2k"),
+    gguf_source_spec(Encoding::Tq2_0, "gguf_tq2_0", "q2g256"),
+    gguf_source_spec(Encoding::Q1_0, "gguf_q1_0", "q1g128"),
+    gguf_source_spec(Encoding::Iq2S, "gguf_iq2_s", "iq2s"),
+    gguf_source_spec(Encoding::Iq1S, "gguf_iq1_s", "iq1s"),
+    gguf_source_spec(Encoding::Iq1M, "gguf_iq1_m", "iq1m"),
+    gguf_source_spec(Encoding::Tq1_0, "gguf_tq1_0", "b3g256"),
 ];
 
 /// The external storage rows of `width` stored values of `encoding` are
-/// read as: the registered source of the most blocks whose packet divides
-/// the row (a GGUF row is whole blocks); `None` when the registry converts
-/// from none.
+/// read as: the registered source of the encoding, whose block divides the
+/// row (a GGUF row is whole blocks); `None` when the registry converts from
+/// none.
 pub fn gguf_source(encoding: Encoding, width: u64) -> Option<RepresentationId> {
     GGUF_SOURCES
         .iter()
-        .filter(|source| {
-            source.encoding == encoding
-                && width.is_multiple_of(encoding.block_elements() * source.blocks)
+        .find(|source| {
+            source.encoding == encoding && width.is_multiple_of(encoding.block_elements())
         })
-        .max_by_key(|source| source.blocks)
         .and_then(|source| representation(source.name))
 }
 
@@ -1904,8 +2103,8 @@ pub(crate) mod internals {
     //! capability so backend/capability slices are direct sub-slices.
 
     use super::*;
-    use crate::intrinsics::{RowOperand, RowResult, capability_rows};
-    use crate::repr::{Coefficients, PlaneEncoding, REPRS, Repr};
+    use crate::intrinsics::{capability_rows, RowOperand, RowResult};
+    use crate::repr::{Coding, PlaneEncoding, Repr, REPRS};
     use std::sync::OnceLock;
 
     pub(crate) struct Tables {
@@ -1955,23 +2154,13 @@ pub(crate) mod internals {
             }
         }
         // (external source, packet bytes, packet values, resident
-        // representation). A source whose every value the resident
-        // representation holds exactly converts into it: Q3_K's
-        // `d * (s - 32) * q` (six-bit `s`, `q` in [-4, 3], sixteen-value
-        // sub-blocks) is q6k's `d * s' * (c - 32)` with `s' = s - 32` and
-        // `c = q + 32`; IQ3_S's `d * (1 + 2 s) * ±g` (four-bit `s` per 32
-        // values, odd grid magnitude `g` <= 15) is q6k's with `s' = 1 + 2 s`
-        // and `c = 32 ± g`. An IQ4_NL packet is eight consecutive 32-value
-        // blocks (one iq4g32 storage group), each block's f16 scale widened
-        // exactly; an IQ4_NL block alone (`gguf_iq4_nl_block`, the rows of a
-        // table whose width is a multiple of 32 but not of 256, held as
-        // stored) is an iq4g32s packet. Q4_0, Q4_1, Q5_0, Q5_1, MXFP4 and
-        // NVFP4 move their codes and scale fields bit for bit into
-        // representations of their own.
+        // representation). Every source converts into a representation of
+        // its own block, moving its codes and coefficient fields bit for bit
+        // (IQ2_XS's and IQ3_XXS's factors widened exactly).
         let external_specs = GGUF_SOURCES.map(|source| {
-            let packet_size = u32::try_from(source.encoding.block_bytes() * source.blocks)
+            let packet_size = u32::try_from(source.encoding.block_bytes())
                 .expect("a GGUF source packet fits u32 bytes");
-            let logical_group = u32::try_from(source.encoding.block_elements() * source.blocks)
+            let logical_group = u32::try_from(source.encoding.block_elements())
                 .expect("a GGUF source packet fits u32 values");
             (source.name, packet_size, logical_group, source.resident)
         });
@@ -2184,13 +2373,8 @@ pub(crate) mod internals {
                 .iter()
                 .filter(|representation| representation.representation == gguf.resident)
             {
-                let destination_layout = match &destination.kind {
-                    RepresentationKind::Packed(packet) => ConversionLayout::Packet(packet),
-                    RepresentationKind::PackedRows(rows) => ConversionLayout::Rows(rows),
-                    RepresentationKind::Dense(_) | RepresentationKind::External(_) => {
-                        panic!("external conversion destination is not packed")
-                    }
-                };
+                let destination_layout = ConversionLayout::of(&destination.kind)
+                    .expect("external conversion destination is packed");
                 let packet = destination_layout.packet();
                 let recipe = external_repack_recipe(gguf.name, packet);
                 validate_repack_recipe(source_layout, packet, &recipe);
@@ -2233,7 +2417,10 @@ pub(crate) mod internals {
                 .unwrap_or_else(|| panic!("packed representation plane size overflow"));
             let alignment = match plane.encoding {
                 PlaneEncoding::Dense(dtype) => dtype.bytes(),
-                PlaneEncoding::Packed { .. } => 4,
+                PlaneEncoding::Packed { .. }
+                | PlaneEncoding::Grid(_)
+                | PlaneEncoding::SignedLocal { .. }
+                | PlaneEncoding::Digits { .. } => 4,
                 PlaneEncoding::FloatCode { .. } => 1,
             };
             let alignment64 = u64::from(alignment);
@@ -2280,16 +2467,18 @@ pub(crate) mod internals {
     ///    plane of the largest power of two of bits that fits (`codes_lo`, or
     ///    `codes` when it holds the whole 8-bit code) and a high plane of the
     ///    rest, at most 2 bits (`codes_hi`); vector-code entries -> `grids`,
-    ///    whole, carrying the `coefficients` plane when the representation's
-    ///    coefficients are carried;
+    ///    their whole bytes, and `grid_high`, the rest of each entry, carrying
+    ///    the `coefficients` plane when the representation's coefficients are
+    ///    carried; base-3 digit bytes -> `digits`, whole;
     /// 2. `scales`: the hierarchical local coefficients exactly as the packet
     ///    `coefficients` plane packs them (never widened), unless carried;
     /// 3. `supers`: every remaining coefficient plane of one packet
     ///    concatenated per group (k-quant super factors `d, dmin`; a direct
     ///    per-group scale).
     ///
-    /// `mma16` of a carried representation is one `records` plane holding
-    /// the entries, their carried codes and the supers.
+    /// `mma16` of a carried representation of whole-byte entries is one
+    /// `records` plane holding the entries, their carried codes and the
+    /// supers.
     fn row_layout(repr: &Repr, layout: Layout) -> PackedRowLayout {
         let packet = packed_layout(repr);
         let words = &packet.planes[0];
@@ -2323,18 +2512,17 @@ pub(crate) mod internals {
             "`{}` has no super coefficients",
             repr.name
         );
-        let carried = match repr.coefficients {
-            Coefficients::Hierarchical { carried: true, .. } => {
-                let CodeInterpretation::Grid(grid) = &repr.code else {
-                    panic!("`{}` carries coefficients outside grid entries", repr.name)
-                };
+        let carried = match &repr.coding {
+            Coding::Hierarchical {
+                locals: LocalCodes::Carried { grid, .. },
+                ..
+            } => {
                 let [plane] = scales[..] else {
                     panic!("`{}` carries one coefficient plane", repr.name)
                 };
                 let codes = &packet.planes[plane as usize];
                 assert!(
-                    codes.fields == 1
-                        && codes.entry_bits == codes.group / GRID_VALUES
+                    codes.entry_bits == codes.group / GRID_VALUES
                         && grid.carried_bit() < grid.entry_bits(),
                     "`{}` carries one coefficient bit an entry, a group's code in its entries",
                     repr.name
@@ -2349,8 +2537,11 @@ pub(crate) mod internals {
             content: RowPlaneContent::Codes { shift, bits },
         };
         let mut planes = match (&words.encoding, words.entry_bits) {
-            // A carried grid representation's `mma16` tile is records.
-            (_, bits) if layout == Layout::Mma16 && carried.is_some() => {
+            // A carried grid representation's `mma16` tile of whole-byte
+            // entries is records.
+            (PlaneEncoding::Grid(grid), bits)
+                if layout == Layout::Mma16 && carried.is_some() && bits % 8 == 0 =>
+            {
                 assert!(
                     bits == 16 && group == 256 && repr.group == 32,
                     "`{}` records hold 256 values of 16-bit entries, groups of 32",
@@ -2361,26 +2552,57 @@ pub(crate) mod internals {
                     bytes_per_group: words.bytes_per_group + group_bytes(&supers),
                     content: RowPlaneContent::Records {
                         bits: bits / GRID_VALUES,
+                        grid,
                         carried: carried.unwrap(),
                         factors: supers.clone(),
                     },
                 }]
             }
-            // Vector codes stay whole: one entry is several values' codes.
-            (
-                PlaneEncoding::Packed {
-                    interpretation: CodeInterpretation::Grid(_),
-                    ..
-                },
-                bits,
-            ) => vec![RowPlaneInfo {
-                name: "grids",
-                bytes_per_group: words.bytes_per_group,
-                content: RowPlaneContent::Grids {
-                    bits: bits / GRID_VALUES,
-                    carried,
-                },
-            }],
+            // Vector codes stay whole entries, one entry several values'
+            // codes: their whole bytes, then the rest.
+            (PlaneEncoding::Grid(grid), bits) => {
+                let (low, high) = (bits / 8 * 8, bits % 8);
+                let entries = group / GRID_VALUES;
+                assert!(
+                    low > 0 && (entries * high).is_multiple_of(8),
+                    "`{}` grid entries hold whole bytes, and their rest whole bytes a group",
+                    repr.name
+                );
+                let mut planes = vec![RowPlaneInfo {
+                    name: "grids",
+                    bytes_per_group: entries * low / 8,
+                    content: RowPlaneContent::Grids {
+                        bits: low / GRID_VALUES,
+                        grid,
+                        carried,
+                    },
+                }];
+                if high > 0 {
+                    planes.push(RowPlaneInfo {
+                        name: "grid_high",
+                        bytes_per_group: entries * high / 8,
+                        content: RowPlaneContent::GridHigh {
+                            shift: low,
+                            bits: high,
+                        },
+                    });
+                }
+                planes
+            }
+            // Base-3 digits stay whole bytes, placed by run
+            // (`PackedRowLayout::digit_byte`).
+            (PlaneEncoding::Digits { digits, .. }, _) => {
+                assert!(
+                    layout != Layout::Mma16 || mma16_digits(digits),
+                    "`{}` digit runs are no mma16 fragment runs",
+                    repr.name
+                );
+                vec![RowPlaneInfo {
+                    name: "digits",
+                    bytes_per_group: words.bytes_per_group,
+                    content: RowPlaneContent::Digits { digits },
+                }]
+            }
             // A low plane of whole bytes is `codes`.
             (_, bits) => {
                 let (low, high) = code_planes(bits)
@@ -2420,9 +2642,10 @@ pub(crate) mod internals {
             .iter()
             .flat_map(|plane| match &plane.content {
                 RowPlaneContent::Groups { planes, .. } => planes.clone(),
-                RowPlaneContent::Codes { .. } | RowPlaneContent::Grids { carried: None, .. } => {
-                    Vec::new()
-                }
+                RowPlaneContent::Codes { .. }
+                | RowPlaneContent::Grids { carried: None, .. }
+                | RowPlaneContent::GridHigh { .. }
+                | RowPlaneContent::Digits { .. } => Vec::new(),
                 RowPlaneContent::Grids {
                     carried: Some(carried),
                     ..
@@ -2437,6 +2660,7 @@ pub(crate) mod internals {
                 plane.content,
                 RowPlaneContent::Codes { .. }
                     | RowPlaneContent::Grids { .. }
+                    | RowPlaneContent::Digits { .. }
                     | RowPlaneContent::Records { .. }
             )
         }) {
@@ -2488,6 +2712,8 @@ pub(crate) mod internals {
                             // rows' k-block bytes, whole chunks; records
                             // run over the tile's rows whole.
                             RowPlaneContent::Grids { .. }
+                            | RowPlaneContent::GridHigh { .. }
+                            | RowPlaneContent::Digits { .. }
                             | RowPlaneContent::Groups { .. }
                             | RowPlaneContent::Records { .. } => multiple,
                         }
@@ -2503,23 +2729,40 @@ pub(crate) mod internals {
         }
     }
 
-    fn direct_bits(byte: u32, bytes: u32) -> Vec<u32> {
-        (0..bytes * 8).map(|bit| byte * 8 + bit).collect()
+    fn direct_bits(byte: u32, bytes: u32) -> Vec<Option<u32>> {
+        (0..bytes * 8).map(|bit| Some(byte * 8 + bit)).collect()
     }
 
     /// The bit routes of ggml's 2-bit codes of 256 values from byte `byte`:
     /// value p's code is at bit 2 ((p % 128) / 32) of byte 32 (p / 128) +
     /// p % 32 of them (Q2_K's and TQ2_0's `qs`).
-    fn quarter_bits(byte: u32) -> Vec<u32> {
+    fn quarter_bits(byte: u32) -> Vec<Option<u32>> {
         (0..512)
             .map(|bit| {
                 let position = bit / 2;
-                (byte + (position / 128) * 32 + position % 32) * 8 + (position % 128 / 32) * 2 + bit % 2
+                Some(
+                    (byte + (position / 128) * 32 + position % 32) * 8
+                        + (position % 128 / 32) * 2
+                        + bit % 2,
+                )
             })
             .collect()
     }
 
-    fn hierarchical_coefficients() -> Vec<u32> {
+    /// The bit routes of `entries` packed entries of `bits` bits each, bit
+    /// `b` of entry `e` from source bit `route(e, b)` (zero where it is
+    /// none).
+    fn entry_bits<R: Into<Option<u32>>>(
+        entries: u32,
+        bits: u32,
+        route: impl Fn(u32, u32) -> R,
+    ) -> Vec<Option<u32>> {
+        (0..entries * bits)
+            .map(|bit| route(bit / bits, bit % bits).into())
+            .collect()
+    }
+
+    fn hierarchical_coefficients() -> Vec<Option<u32>> {
         (0..96)
             .map(|destination_bit| {
                 let field = destination_bit / 6;
@@ -2533,6 +2776,7 @@ pub(crate) mod internals {
                     high_byte * 8 + (field % 2) * 4 + local_bit
                 }
             })
+            .map(Some)
             .collect()
     }
 
@@ -2570,6 +2814,7 @@ pub(crate) mod internals {
                                 let source_byte = 16 + (position / 64) * 32 + position % 32;
                                 source_byte * 8 + (position % 64 / 32) * 4 + bit % 4
                             })
+                            .map(Some)
                             .collect(),
                     ),
                 ));
@@ -2602,6 +2847,7 @@ pub(crate) mod internals {
                                     source_byte * 8 + position / 32
                                 }
                             })
+                            .map(Some)
                             .collect(),
                     ),
                 ));
@@ -2634,6 +2880,7 @@ pub(crate) mod internals {
                                     source_byte * 8 + (position % 128 / 32) * 2 + code_bit - 4
                                 }
                             })
+                            .map(Some)
                             .collect(),
                     ),
                 ));
@@ -2676,32 +2923,25 @@ pub(crate) mod internals {
                 // `qs[8 (e / 4) + 2 (e % 4) .. +2] | signs (e % 4) << 16`.
                 push(plane(
                     "words",
-                    PlaneRepackRecipe::PackedEntries(
-                        (0..32)
-                            .map(|entry| {
-                                let (block, group) = (entry / 4, entry % 4);
-                                RepackExpr::BitOr(
-                                    Box::new(RepackExpr::SourceBits {
-                                        bit: (2 + 8 * block + 2 * group) * 8,
-                                        width: 16,
-                                    }),
-                                    Box::new(RepackExpr::ShiftLeft {
-                                        value: Box::new(RepackExpr::SourceBits {
-                                            bit: (66 + 4 * block) * 8 + 7 * group,
-                                            width: 7,
-                                        }),
-                                        bits: 16,
-                                    }),
-                                )
-                            })
-                            .collect(),
-                    ),
+                    PlaneRepackRecipe::BitRoutes(entry_bits(
+                        32,
+                        crate::repr::IQ3XXS_CODES.entry_bits(),
+                        |entry, bit| {
+                            let (block, group) = (entry / 4, entry % 4);
+                            match bit {
+                                0..16 => Some((2 + 8 * block + 2 * group) * 8 + bit),
+                                16..23 => Some((66 + 4 * block) * 8 + 7 * group + bit - 16),
+                                _ => None,
+                            }
+                        },
+                    )),
                 ));
                 push(plane(
                     "coefficients",
                     PlaneRepackRecipe::BitRoutes(
                         (0..32)
                             .map(|bit| (66 + 4 * (bit / 4)) * 8 + 28 + bit % 4)
+                            .map(Some)
                             .collect(),
                     ),
                 ));
@@ -2724,32 +2964,25 @@ pub(crate) mod internals {
                 // `qs[8 (e / 4) + e % 4] | signs (e % 4) << 8`.
                 push(plane(
                     "words",
-                    PlaneRepackRecipe::PackedEntries(
-                        (0..32)
-                            .map(|entry| {
-                                let (block, group) = (entry / 4, entry % 4);
-                                RepackExpr::BitOr(
-                                    Box::new(RepackExpr::SourceBits {
-                                        bit: (2 + 8 * block + group) * 8,
-                                        width: 8,
-                                    }),
-                                    Box::new(RepackExpr::ShiftLeft {
-                                        value: Box::new(RepackExpr::SourceBits {
-                                            bit: (6 + 8 * block) * 8 + 7 * group,
-                                            width: 7,
-                                        }),
-                                        bits: 8,
-                                    }),
-                                )
-                            })
-                            .collect(),
-                    ),
+                    PlaneRepackRecipe::BitRoutes(entry_bits(
+                        32,
+                        crate::repr::IQ2XXS_CODES.entry_bits(),
+                        |entry, bit| {
+                            let (block, group) = (entry / 4, entry % 4);
+                            match bit {
+                                0..8 => Some((2 + 8 * block + group) * 8 + bit),
+                                8..15 => Some((6 + 8 * block) * 8 + 7 * group + bit - 8),
+                                _ => None,
+                            }
+                        },
+                    )),
                 ));
                 push(plane(
                     "coefficients",
                     PlaneRepackRecipe::BitRoutes(
                         (0..32)
                             .map(|bit| (6 + 8 * (bit / 4)) * 8 + 28 + bit % 4)
+                            .map(Some)
                             .collect(),
                     ),
                 ));
@@ -2770,6 +3003,11 @@ pub(crate) mod internals {
                 ));
             }
             "gguf_iq4_xs" => {
+                // block_iq4_xs: d (f16) | scales_h (u16) | scales_l[4] |
+                // qs[128]. Value w of 32-value block b is the low (w < 16)
+                // or high nibble of qs[16 b + w % 16]; block b's six-bit
+                // scale code is nibble b % 2 of scales_l[b / 2] under bits
+                // 2b, 2b + 1 of scales_h.
                 push(plane(
                     "words",
                     PlaneRepackRecipe::BitRoutes(
@@ -2779,95 +3017,42 @@ pub(crate) mod internals {
                                 let source_byte = 8 + (position / 32) * 16 + position % 16;
                                 source_byte * 8 + (position % 32 / 16) * 4 + bit % 4
                             })
+                            .map(Some)
                             .collect(),
                     ),
                 ));
-                let base =
-                    RepackExpr::F16ToF32(Box::new(RepackExpr::SourceBits { bit: 0, width: 16 }));
                 push(plane(
-                    "scale",
-                    PlaneRepackRecipe::DenseValues(
-                        (0..8)
-                            .map(|group| {
-                                let combined = RepackExpr::OffsetI32 {
-                                    value: Box::new(RepackExpr::BitOr(
-                                        Box::new(RepackExpr::SourceBits {
-                                            bit: (4 + group / 2) * 8 + (group % 2) * 4,
-                                            width: 4,
-                                        }),
-                                        Box::new(RepackExpr::ShiftLeft {
-                                            value: Box::new(RepackExpr::SourceBits {
-                                                bit: 16 + 2 * group,
-                                                width: 2,
-                                            }),
-                                            bits: 4,
-                                        }),
-                                    )),
-                                    offset: -32,
-                                };
-                                RepackExpr::MultiplyF32(
-                                    Box::new(base.clone()),
-                                    Box::new(RepackExpr::I32ToF32(Box::new(combined))),
-                                )
-                            })
-                            .collect(),
-                    ),
+                    "coefficients",
+                    PlaneRepackRecipe::BitRoutes(entry_bits(8, 6, |block, bit| match bit {
+                        0..4 => (4 + block / 2) * 8 + 4 * (block % 2) + bit,
+                        _ => 16 + 2 * block + bit - 4,
+                    })),
+                ));
+                push(plane(
+                    "scale_factor",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(0, 2)),
                 ));
             }
             "gguf_q3_k" => {
                 // block_q3_K: hmask[32] | qs[64] | scales[12] | d (f16).
                 // Value p: low bits `(qs[32 (p / 128) + p % 32] >> 2 (p % 128 / 32)) & 3`,
-                // high bit `(hmask[p % 32] >> (p / 32)) & 1`, q = low + 4 high - 4;
-                // the q6k code is q + 32.
+                // high bit `(hmask[p % 32] >> (p / 32)) & 1`, its code
+                // `low + 4 high` (q = code - 4). Sub-block j's six-bit scale
+                // code: low four bits `scales[j % 8] >> 4 (j / 8)`, high two
+                // bits `scales[8 + j % 4] >> 2 (j / 4)`.
                 push(plane(
                     "words",
-                    PlaneRepackRecipe::PackedEntries(
-                        (0..256)
-                            .map(|p| RepackExpr::OffsetI32 {
-                                value: Box::new(RepackExpr::BitOr(
-                                    Box::new(RepackExpr::SourceBits {
-                                        bit: (32 + (p / 128) * 32 + p % 32) * 8
-                                            + (p % 128 / 32) * 2,
-                                        width: 2,
-                                    }),
-                                    Box::new(RepackExpr::ShiftLeft {
-                                        value: Box::new(RepackExpr::SourceBits {
-                                            bit: (p % 32) * 8 + p / 32,
-                                            width: 1,
-                                        }),
-                                        bits: 2,
-                                    }),
-                                )),
-                                offset: 28,
-                            })
-                            .collect(),
-                    ),
+                    PlaneRepackRecipe::BitRoutes(entry_bits(256, 3, |p, bit| match bit {
+                        0..2 => (32 + (p / 128) * 32 + p % 32) * 8 + (p % 128 / 32) * 2 + bit,
+                        _ => (p % 32) * 8 + p / 32,
+                    })),
                 ));
-                // Six-bit scale s of sub-block j: low four bits
-                // `scales[j % 8] >> 4 (j / 8)`, high two bits
-                // `scales[8 + j % 4] >> 2 (j / 4)`; the q6k coefficient is s - 32.
                 push(plane(
                     "coefficients",
-                    PlaneRepackRecipe::PackedEntries(
-                        (0..16)
-                            .map(|j| RepackExpr::OffsetI32 {
-                                value: Box::new(RepackExpr::BitOr(
-                                    Box::new(RepackExpr::SourceBits {
-                                        bit: (96 + j % 8) * 8 + 4 * (j / 8),
-                                        width: 4,
-                                    }),
-                                    Box::new(RepackExpr::ShiftLeft {
-                                        value: Box::new(RepackExpr::SourceBits {
-                                            bit: (104 + j % 4) * 8 + 2 * (j / 4),
-                                            width: 2,
-                                        }),
-                                        bits: 4,
-                                    }),
-                                )),
-                                offset: -32,
-                            })
-                            .collect(),
-                    ),
+                    PlaneRepackRecipe::BitRoutes(entry_bits(16, 6, |j, bit| match bit {
+                        0..4 => (96 + j % 8) * 8 + 4 * (j / 8) + bit,
+                        _ => (104 + j % 4) * 8 + 2 * (j / 4) + bit - 4,
+                    })),
                 ));
                 push(plane(
                     "scale_factor",
@@ -2876,114 +3061,43 @@ pub(crate) mod internals {
             }
             "gguf_iq3_s" => {
                 // block_iq3_s: d (f16) | qs[64] | qh[8] | signs[32] | scales[4].
-                // Value p of 32-value sub-block b = p / 32, w = p % 32, in
-                // eight-value group l = w / 8 at t = w % 8: grid point
-                // `qs[8 b + 2 l + t / 4] | ((qh[b] >> (2 l + t / 4)) & 1) << 8`,
-                // magnitude byte `t % 4` of that point, negated when bit t of
-                // `signs[4 b + l]` is set; the q6k code is that value + 32.
+                // Entry `e` (values 8e..8e+8, group l = e % 4 of 32-value
+                // sub-block b = e / 4) is its two 9-bit indices
+                // `qs[8 b + 2 l + i] | ((qh[b] >> (2 l + i)) & 1) << 8`
+                // (i = 0, 1), then the sign byte `signs[e]`; scales[b / 2]
+                // holds sub-block b's 4-bit scale in nibble b % 2.
                 push(plane(
                     "words",
-                    PlaneRepackRecipe::PackedEntries(
-                        (0..256)
-                            .map(|p| {
-                                let (block, within) = (p / 32, p % 32);
-                                let (group, slot) = (within / 8, within % 8);
-                                let point = RepackExpr::BitOr(
-                                    Box::new(RepackExpr::SourceBits {
-                                        bit: (2 + 8 * block + 2 * group + slot / 4) * 8,
-                                        width: 8,
-                                    }),
-                                    Box::new(RepackExpr::ShiftLeft {
-                                        value: Box::new(RepackExpr::SourceBits {
-                                            bit: (66 + block) * 8 + 2 * group + slot / 4,
-                                            width: 1,
-                                        }),
-                                        bits: 8,
-                                    }),
-                                );
-                                let magnitude = RepackExpr::Lookup {
-                                    index: Box::new(RepackExpr::OffsetI32 {
-                                        value: Box::new(RepackExpr::ShiftLeft {
-                                            value: Box::new(point),
-                                            bits: 2,
-                                        }),
-                                        offset: (slot % 4) as i32,
-                                    }),
-                                    table: RepackTable::Iq3sMagnitudes,
-                                };
-                                RepackExpr::OffsetI32 {
-                                    value: Box::new(RepackExpr::NegateIf {
-                                        value: Box::new(magnitude),
-                                        sign: Box::new(RepackExpr::SourceBits {
-                                            bit: (74 + 4 * block + group) * 8 + slot,
-                                            width: 1,
-                                        }),
-                                    }),
-                                    offset: 32,
+                    PlaneRepackRecipe::BitRoutes(entry_bits(
+                        32,
+                        crate::repr::IQ3S_CODES.entry_bits(),
+                        |entry, bit| {
+                            let (block, group) = (entry / 4, entry % 4);
+                            match bit {
+                                0..18 => {
+                                    let (index, bit) = (bit / 9, bit % 9);
+                                    if bit < 8 {
+                                        (2 + 8 * block + 2 * group + index) * 8 + bit
+                                    } else {
+                                        (66 + block) * 8 + 2 * group + index
+                                    }
                                 }
-                            })
-                            .collect(),
-                    ),
+                                _ => (74 + entry) * 8 + bit - 18,
+                            }
+                        },
+                    )),
                 ));
-                // Both sixteen-value halves of 32-value sub-block b take
-                // `1 + 2 s`, s the four bits `scales[b / 2] >> 4 (b % 2)`.
                 push(plane(
                     "coefficients",
-                    PlaneRepackRecipe::PackedEntries(
-                        (0..16)
-                            .map(|half| {
-                                let block = half / 2;
-                                RepackExpr::OffsetI32 {
-                                    value: Box::new(RepackExpr::ShiftLeft {
-                                        value: Box::new(RepackExpr::SourceBits {
-                                            bit: (106 + block / 2) * 8 + 4 * (block % 2),
-                                            width: 4,
-                                        }),
-                                        bits: 1,
-                                    }),
-                                    offset: 1,
-                                }
-                            })
-                            .collect(),
-                    ),
+                    PlaneRepackRecipe::BitRoutes(direct_bits(106, 4)),
                 ));
                 push(plane(
                     "scale_factor",
                     PlaneRepackRecipe::BitRoutes(direct_bits(0, 2)),
                 ));
             }
-            "gguf_iq4_nl" => {
-                // Eight block_iq4_nl: d (f16) | qs[16]; value w of a block is
-                // the low (w < 16) or high nibble of qs[w % 16].
-                push(plane(
-                    "words",
-                    PlaneRepackRecipe::BitRoutes(
-                        (0..1024)
-                            .map(|bit| {
-                                let position = bit / 4;
-                                let block = position / 32;
-                                let within = position % 32;
-                                (block * 18 + 2 + within % 16) * 8 + (within / 16) * 4 + bit % 4
-                            })
-                            .collect(),
-                    ),
-                ));
-                push(plane(
-                    "scale",
-                    PlaneRepackRecipe::DenseValues(
-                        (0..8)
-                            .map(|block| {
-                                RepackExpr::F16ToF32(Box::new(RepackExpr::SourceBits {
-                                    bit: block * 18 * 8,
-                                    width: 16,
-                                }))
-                            })
-                            .collect(),
-                    ),
-                ));
-            }
-            "gguf_q4_0" | "gguf_iq4_nl_block" => {
-                // block_q4_0 and one block_iq4_nl: d (f16) | qs[16]. Value p
+            "gguf_q4_0" | "gguf_iq4_nl" => {
+                // block_q4_0 and block_iq4_nl: d (f16) | qs[16]. Value p
                 // is the low (p < 16) or high nibble of qs[p % 16]; d moves
                 // bit for bit.
                 push(plane(
@@ -2994,6 +3108,7 @@ pub(crate) mod internals {
                                 let position = bit / 4;
                                 (2 + position % 16) * 8 + (position / 16) * 4 + bit % 4
                             })
+                            .map(Some)
                             .collect(),
                     ),
                 ));
@@ -3039,6 +3154,7 @@ pub(crate) mod internals {
                                 let position = bit / 4;
                                 (4 + position % 16) * 8 + (position / 16) * 4 + bit % 4
                             })
+                            .map(Some)
                             .collect(),
                     ),
                 ));
@@ -3086,6 +3202,7 @@ pub(crate) mod internals {
                                     high * 8 + position
                                 }
                             })
+                            .map(Some)
                             .collect(),
                     ),
                 ));
@@ -3121,6 +3238,122 @@ pub(crate) mod internals {
                 push(plane(
                     "block_scale",
                     PlaneRepackRecipe::BitRoutes(direct_bits(0, 4)),
+                ));
+            }
+            "gguf_q1_0" => {
+                // block_q1_0: d (f16) | qs[16]: value p is bit p % 8 of
+                // qs[p / 8], ggml's `±d`.
+                push(plane(
+                    "words",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(2, 16)),
+                ));
+                push(plane(
+                    "scale",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(0, 2)),
+                ));
+            }
+            "gguf_iq2_s" => {
+                // block_iq2_s: d (f16) | qs[32] | signs[32] | qh[8] |
+                // scales[8]. Entry `e` (values 8e..8e+8) is its 10-bit index
+                // `qs[e] | (qh[e / 4] >> 2 (e % 4) & 3) << 8`, then the sign
+                // byte `signs[e]`; scales[i] holds the 4-bit scales of values
+                // 32i..32i+16 (low nibble) and 32i+16..32i+32.
+                push(plane(
+                    "words",
+                    PlaneRepackRecipe::BitRoutes(entry_bits(
+                        32,
+                        crate::repr::IQ2S_CODES.entry_bits(),
+                        |entry, bit| match bit {
+                            0..8 => (2 + entry) * 8 + bit,
+                            8..10 => (66 + entry / 4) * 8 + 2 * (entry % 4) + bit - 8,
+                            _ => (34 + entry) * 8 + bit - 10,
+                        },
+                    )),
+                ));
+                push(plane(
+                    "coefficients",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(74, 8)),
+                ));
+                // d moves bit for bit; the representation scales it by 2^-3.
+                push(plane(
+                    "scale_factor",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(0, 2)),
+                ));
+            }
+            "gguf_iq1_s" => {
+                // block_iq1_s: d (f16) | qs[32] | qh[8] (u16). Entry `e` is
+                // its 11-bit index `qs[e] | (qh[e / 4] >> 3 (e % 4) & 7) << 8`
+                // and its carried bit, zero; qh[i]'s bits 12..15 are the
+                // scale and the bias sign of values 32i..32i+32, its 4-bit
+                // local code.
+                push(plane(
+                    "words",
+                    PlaneRepackRecipe::BitRoutes(entry_bits(
+                        32,
+                        crate::repr::IQ1S_CODES.entry_bits(),
+                        |entry, bit| match bit {
+                            0..8 => Some((2 + entry) * 8 + bit),
+                            8..11 => Some((34 + 2 * (entry / 4)) * 8 + 3 * (entry % 4) + bit - 8),
+                            _ => None,
+                        },
+                    )),
+                ));
+                push(plane(
+                    "coefficients",
+                    PlaneRepackRecipe::BitRoutes(entry_bits(8, 4, |group, bit| {
+                        (34 + 2 * group) * 8 + 12 + bit
+                    })),
+                ));
+                push(plane(
+                    "scale_factor",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(0, 2)),
+                ));
+            }
+            "gguf_iq1_m" => {
+                // block_iq1_m: qs[32] | qh[16] | scales[8] (u16 sc[4]). Entry
+                // `e` is its 11-bit index `qs[e]` and the low three bits of
+                // nibble `e % 2` of qh[e / 2], then that nibble's top bit, its
+                // delta. The 3-bit scale of values 16f..16f+16 is bits
+                // 3 (f % 4).. of sc[f / 4]; d's nibble `n` is sc[n]'s top
+                // nibble (ggml's `iq1m_scale_t`).
+                push(plane(
+                    "words",
+                    PlaneRepackRecipe::BitRoutes(entry_bits(
+                        32,
+                        crate::repr::IQ1M_CODES.entry_bits(),
+                        |entry, bit| match bit {
+                            0..8 => entry * 8 + bit,
+                            _ => (32 + entry / 2) * 8 + 4 * (entry % 2) + bit - 8,
+                        },
+                    )),
+                ));
+                push(plane(
+                    "coefficients",
+                    PlaneRepackRecipe::BitRoutes(entry_bits(16, 3, |field, bit| {
+                        48 * 8 + 16 * (field / 4) + 3 * (field % 4) + bit
+                    })),
+                ));
+                // d moves bit for bit; the representation scales it by 2^-3.
+                push(plane(
+                    "scale_factor",
+                    PlaneRepackRecipe::BitRoutes(
+                        (0..16)
+                            .map(|bit| 48 * 8 + 16 * (bit / 4) + 12 + bit % 4)
+                            .map(Some)
+                            .collect(),
+                    ),
+                ));
+            }
+            "gguf_tq1_0" => {
+                // block_tq1_0: qs[48] | qh[4] | d (f16): the digit bytes move
+                // whole, in `TQ1_DIGITS`'s runs.
+                push(plane(
+                    "words",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(0, 52)),
+                ));
+                push(plane(
+                    "scale",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(52, 2)),
                 ));
             }
             _ => panic!("unknown external representation `{source_name}`"),
@@ -3175,9 +3408,6 @@ pub(crate) mod internals {
                     );
                     validate_expr(value, source_bits);
                 }
-                RepackExpr::ShiftLeft { value, .. }
-                | RepackExpr::OffsetI32 { value, .. }
-                | RepackExpr::I32ToF32(value) => validate_expr(value, source_bits),
                 RepackExpr::ScaleF32 { value, exponent } => {
                     // Every widened binary16 times 2^±8 is a normal f32.
                     assert!(
@@ -3192,19 +3422,6 @@ pub(crate) mod internals {
                     assert!(
                         min >= 0 && max < table.values().len() as i64,
                         "representation conversion indexes outside its lookup table"
-                    );
-                }
-                RepackExpr::BitOr(left, right) | RepackExpr::MultiplyF32(left, right) => {
-                    validate_expr(left, source_bits);
-                    validate_expr(right, source_bits);
-                }
-                RepackExpr::NegateIf { value, sign } => {
-                    validate_expr(value, source_bits);
-                    validate_expr(sign, source_bits);
-                    let (min, max) = integer_range(sign);
-                    assert!(
-                        min >= 0 && max <= 1,
-                        "representation conversion negates by something other than one bit"
                     );
                 }
             }
@@ -3222,7 +3439,7 @@ pub(crate) mod internals {
                         "bit-route conversion does not initialize its entire plane"
                     );
                     assert!(
-                        routes.iter().all(|source| *source < source_bits),
+                        routes.iter().flatten().all(|source| *source < source_bits),
                         "bit-route conversion reads beyond its source packet"
                     );
                 }
@@ -3254,7 +3471,16 @@ pub(crate) mod internals {
                             bits,
                             interpretation: CodeInterpretation::TwosComplement,
                         } => (*bits, -(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1),
-                        PlaneEncoding::Packed { bits, .. } => (*bits, 0, (1i64 << bits) - 1),
+                        PlaneEncoding::Packed { .. } | PlaneEncoding::SignedLocal { .. } => {
+                            let bits = plane.encoding.entry_bits();
+                            (bits, 0, (1i64 << bits) - 1)
+                        }
+                        PlaneEncoding::Grid(grid) => {
+                            (grid.entry_bits(), 0, (1i64 << grid.entry_bits()) - 1)
+                        }
+                        PlaneEncoding::Digits { .. } => {
+                            (DIGIT_BYTE_BITS, 0, (1i64 << DIGIT_BYTE_BITS) - 1)
+                        }
                         PlaneEncoding::FloatCode { format } => {
                             (format.bits(), 0, (1i64 << format.bits()) - 1)
                         }
@@ -3279,23 +3505,6 @@ pub(crate) mod internals {
     fn integer_range(expression: &RepackExpr) -> (i64, i64) {
         match expression {
             RepackExpr::SourceBits { width, .. } => (0, (1i64 << width) - 1),
-            RepackExpr::ShiftLeft { value, bits } => {
-                let (min, max) = integer_range(value);
-                (min << bits, max << bits)
-            }
-            RepackExpr::BitOr(left, right) => {
-                let (left_min, left_max) = integer_range(left);
-                let (right_min, right_max) = integer_range(right);
-                assert!(
-                    left_min >= 0 && right_min >= 0,
-                    "a packed-entry OR combines non-negative bit fields"
-                );
-                (left_min.max(right_min), left_max + right_max)
-            }
-            RepackExpr::OffsetI32 { value, offset } => {
-                let (min, max) = integer_range(value);
-                (min + i64::from(*offset), max + i64::from(*offset))
-            }
             RepackExpr::Lookup { table, .. } => (
                 i64::from(
                     *table
@@ -3312,14 +3521,7 @@ pub(crate) mod internals {
                         .expect("a lookup table has entries"),
                 ),
             ),
-            RepackExpr::NegateIf { value, .. } => {
-                let (min, max) = integer_range(value);
-                (min.min(-max), max.max(-min))
-            }
-            RepackExpr::F16ToF32(_)
-            | RepackExpr::I32ToF32(_)
-            | RepackExpr::MultiplyF32(..)
-            | RepackExpr::ScaleF32 { .. } => {
+            RepackExpr::F16ToF32(_) | RepackExpr::ScaleF32 { .. } => {
                 panic!("a packed-entry conversion value is floating")
             }
         }
@@ -3673,17 +3875,13 @@ mod tests {
     }
 
     /// A conversion's domain makes the scales it converts as numbers finite
-    /// and keeps every other source bit: IQ4_NL's eight block scales and
-    /// IQ4_XS's base, and nothing of Q4_0, whose scale moves bit for bit.
+    /// and keeps every other source bit: IQ2_XS's and IQ3_XXS's factors, and
+    /// nothing of Q4_0, whose scale moves bit for bit.
     #[test]
     fn a_conversion_admits_sources_with_finite_converted_scales() {
         for (source, destination, fields) in [
-            (
-                "gguf_iq4_nl",
-                "iq4g32@rows16",
-                (0..8).map(|block| block * 144).collect::<Vec<u32>>(),
-            ),
-            ("gguf_iq4_xs", "iq4g32@rows16", vec![0]),
+            ("gguf_iq2_xs", "iq2xs@rows16", vec![0]),
+            ("gguf_iq3_xxs", "iq3xxs@rows16", vec![0]),
             ("gguf_q4_0", "q4g32s@rows16", vec![]),
         ] {
             let conversion = representation_conversion(
@@ -3821,8 +4019,26 @@ mod tests {
         );
         assert_eq!(plane_set("q8g32s@rows16"), [("codes", 32), ("supers", 2)]);
         assert_eq!(
-            plane_set("iq4g32@rows16"),
-            [("codes_lo", 128), ("supers", 32)]
+            plane_set("q3k@rows16"),
+            [
+                ("codes_lo", 64),
+                ("codes_hi", 32),
+                ("scales", 12),
+                ("supers", 2)
+            ]
+        );
+        assert_eq!(
+            plane_set("iq4xs@rows16"),
+            [("codes_lo", 128), ("scales", 6), ("supers", 2)]
+        );
+        assert_eq!(
+            plane_set("iq3s@rows16"),
+            [
+                ("grids", 96),
+                ("grid_high", 8),
+                ("scales", 4),
+                ("supers", 2)
+            ]
         );
         // Qwen3.5 K = 2560: codes 1280 | scales 120 -> 128 | supers 40 -> 48.
         let q4k = row_layout("q4k@rows16");
@@ -3850,7 +4066,6 @@ mod tests {
         for (name, multiple) in [
             ("q4k@mma16", 1),
             ("q6k@mma16", 1),
-            ("iq4g32@mma16", 1),
             ("q8g32s@mma16", 2),
             ("q4g32s@mma16", 2),
             ("mxfp4g32@mma16", 2),

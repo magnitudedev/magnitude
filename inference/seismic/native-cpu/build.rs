@@ -2,15 +2,16 @@
 //! components, from the registry: every floating dense element, and every
 //! packed element of a CPU row layout (`rows16`, `rows8`) that is its own
 //! storage, decoded by the components its decode axes name
-//! (`registry::decode_axes`). Elements of one decode share one component,
-//! whatever their layout. Writes `$OUT_DIR/elements.rs`: `COMPONENT_OF`,
+//! (`registry::decode_axes`, `packed`). Elements
+//! of one decode share one component, whatever their layout. Writes
+//! `$OUT_DIR/elements.rs`: `COMPONENT_OF`,
 //! per registered element (in `registry::representations()` order) the index
 //! of its component, and `with_components!`, which passes the component types
 //! in index order to a macro.
 
 use seismic_lang::registry::{
-    self, CodeInterpretation, CoefficientAxes, Layout, LocalCodes, MinimumSign, RepresentationKind,
-    ScaleEncoding,
+    self, CodeInterpretation, CodingAxes, DigitCodes, GridSigns, Layout, LocalCodes, MinimumSign,
+    RepresentationKind, ScaleEncoding, ValueCodes,
 };
 use seismic_lang::types::DType;
 use std::fmt::Write as _;
@@ -21,9 +22,8 @@ fn interpretation(interpretation: &CodeInterpretation) -> String {
         CodeInterpretation::Unsigned => "codes::Unsigned".to_owned(),
         CodeInterpretation::TwosComplement => "codes::Twos".to_owned(),
         CodeInterpretation::Offset(offset) => format!("codes::Offset<{offset}>"),
-        CodeInterpretation::Odd => "codes::Odd".to_owned(),
+        CodeInterpretation::Odd(offset) => format!("codes::Odd<{offset}>"),
         CodeInterpretation::Table(codebook) => format!("codes::Table<{}>", codebook_id(codebook)),
-        CodeInterpretation::Grid(_) => panic!("a grid is a code component, not an interpretation"),
     }
 }
 
@@ -45,44 +45,94 @@ fn scale(scale: ScaleEncoding) -> &'static str {
     }
 }
 
-/// The component type of packed storage `id` of `STORAGE`-value groups.
-fn packed(id: seismic_lang::ids::RepresentationId, storage: u32) -> String {
+/// The digit-runs type (`weights::DigitRuns`) of `digits`, its definition
+/// joining `definitions` once.
+fn digit_runs(digits: &DigitCodes, definitions: &mut Vec<String>) -> String {
+    let name = digits
+        .runs
+        .iter()
+        .map(|run| format!("{}x{}", run.bytes(), run.digits()))
+        .collect::<Vec<_>>()
+        .join("_");
+    let name = format!("Runs{name}");
+    let runs = digits
+        .runs
+        .iter()
+        .map(|run| format!("DigitRun::new({}, {})", run.bytes(), run.digits()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let definition = format!(
+        "    #[derive(Clone, Copy, Debug)]\n    pub(crate) struct {name};\n    impl crate::weights::DigitRuns for {name} {{\n        const CODES: DigitCodes = DigitCodes {{ runs: &[{runs}] }};\n    }}\n"
+    );
+    if !definitions.contains(&definition) {
+        definitions.push(definition);
+    }
+    format!("digit_runs::{name}")
+}
+
+/// The component type of packed storage `id` of `STORAGE`-value groups,
+/// its digit runs' definition joining `digit_runs`.
+fn packed(
+    id: seismic_lang::ids::RepresentationId,
+    storage: u32,
+    digit_runs: &mut Vec<String>,
+) -> String {
     let axes = registry::decode_axes(id).expect("packed storage has decode axes");
     // The code domain's ends, which every code component takes from here.
     let registry::profile::Domain { least, greatest } = axes.profile().codes;
-    let codes = match &axes.code {
-        CodeInterpretation::Grid(grid) => format!(
-            "Grid<{}, {}, {}, {least}, {greatest}>",
+    let codes = match &axes.coding.codes() {
+        ValueCodes::Grid(grid) => format!(
+            "Grid<{}, {}, {}, {}, {}, {}, {least}, {greatest}>",
             magnitude_ggml::tables::GRIDS
                 .iter()
                 .position(|known| *known == grid.grid)
                 .expect("a ggml grid"),
             grid.index_bits(),
-            axes.low / 8
+            axes.low / 8,
+            axes.high,
+            GridSigns::ALL
+                .iter()
+                .position(|known| *known == grid.signs)
+                .expect("a grid's signs"),
+            match grid.delta {
+                None => "NoDelta".to_owned(),
+                Some(exponent) => format!("Delta<{exponent}>"),
+            }
         ),
-        code => format!(
+        ValueCodes::Digits {
+            digits,
+            interpretation: code,
+        } => format!(
+            "Digits<{}, {}, {least}, {greatest}>",
+            self::digit_runs(digits, digit_runs),
+            interpretation(code)
+        ),
+        ValueCodes::Fields(code) => format!(
             "Planes<{}, {}, {}, {least}, {greatest}>",
             axes.low,
             axes.high,
             interpretation(code)
         ),
     };
-    let coefficients = match &axes.coefficients {
-        CoefficientAxes::Direct {
+    let coefficients = match &axes.coding {
+        CodingAxes::Direct {
             scale: encoding,
             bias,
             group,
+            ..
         } => format!(
             "Direct<{}, {group}, {bias}, {}>",
             scale(*encoding),
             axes.code_exponent
         ),
         // The factor group is the storage group, which `PackedRows` carries.
-        CoefficientAxes::Hierarchical {
+        CodingAxes::Hierarchical {
             factor,
             factor_group,
             exponent,
             group,
+            bits,
+            interpretation: local,
             locals,
         } => {
             assert_eq!(
@@ -90,24 +140,27 @@ fn packed(id: seismic_lang::ids::RepresentationId, storage: u32) -> String {
                 "a factor group is one storage group"
             );
             let locals = match locals {
-                LocalCodes::Carried {
-                    bit,
-                    bits,
-                    interpretation: local,
-                } => format!(
-                    "Carried<{bit}, {}, {}, {bits}>",
+                // The scale code (`LocalCodes::scale_bits`), then a signed
+                // bias's sign bit.
+                LocalCodes::Carried { grid, signed_bias } => format!(
+                    "Carried<{}, {}, {}, {}, {}, {}>",
+                    grid.carried_bit(),
                     axes.low / 8,
-                    self::interpretation(local)
-                ),
-                LocalCodes::Plane {
-                    bits,
-                    interpretation: local,
-                    minimum,
-                } => format!(
-                    "Scales<{}, {bits}, {}>",
+                    axes.high,
                     self::interpretation(local),
-                    minimum.map_or(0, MinimumSign::value)
+                    locals.scale_bits(*bits),
+                    match signed_bias {
+                        None => "Unbiased".to_owned(),
+                        Some(exponent) => format!("SignedBias<{exponent}>"),
+                    }
                 ),
+                LocalCodes::Plane { minimum, .. } => {
+                    let bias = match minimum {
+                        None => "Unbiased".to_owned(),
+                        Some(sign) => format!("Minimum<{}>", *sign == MinimumSign::Subtract),
+                    };
+                    format!("Scales<{}, {bits}, {bias}>", self::interpretation(local))
+                }
             };
             format!(
                 "Hier<{}, {exponent}, {}, {locals}, {group}>",
@@ -121,6 +174,7 @@ fn packed(id: seismic_lang::ids::RepresentationId, storage: u32) -> String {
 
 fn main() {
     let mut components: Vec<String> = Vec::new();
+    let mut digit_runs: Vec<String> = Vec::new();
     let mut component_of: Vec<Option<usize>> = Vec::new();
     for info in registry::representations() {
         let component = match &info.kind {
@@ -131,7 +185,7 @@ fn main() {
                 if matches!(info.layout, Layout::Rows16 | Layout::Rows8)
                     && registry::storage_of(info.id) == info.id =>
             {
-                packed(info.id, rows.group())
+                packed(info.id, rows.group(), &mut digit_runs)
             }
             _ => {
                 component_of.push(None);
@@ -165,7 +219,9 @@ fn main() {
     for index in &component_of {
         writeln!(text, "    {index:?},").unwrap();
     }
-    text += "];\n\n/// `$m![component types]`, in component index order.\nmacro_rules! with_components {\n    ($m:ident) => {\n        $m![\n";
+    text += "];\n\n/// The digit runs of the digits components (`weights::DigitRuns`).\npub(crate) mod digit_runs {\n    use seismic_lang::registry::{DigitCodes, DigitRun};\n\n";
+    text += &digit_runs.join("\n");
+    text += "}\n\n/// `$m![component types]`, in component index order.\nmacro_rules! with_components {\n    ($m:ident) => {\n        $m![\n";
     for component in &components {
         writeln!(text, "            {component},").unwrap();
     }

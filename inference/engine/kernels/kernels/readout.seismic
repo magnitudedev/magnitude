@@ -85,7 +85,7 @@ fn readout_head_rows[M, O, V, D, PT, NM, WS](hidden: &tensor[M, PT * D] f32,
 native readout_head_rows for metal from "metal/readout_head_rows.metal":
     static (V, D, PT, NM, WS)
     params (arithmetic BATCH_FROM in [5, 3, 9])
-    where WS <= 1
+    where WS <= 1 and (MATRIX == 0 or form(OW, MATRIX) == 1)
     scratch normalized bytes (O * D * 2) when O >= BATCH_FROM
     launch readout_head_rows_stage when O >= BATCH_FROM:
         threadgroups (O, 1, 1)
@@ -97,7 +97,7 @@ native readout_head_rows for metal from "metal/readout_head_rows.metal":
         shared_bytes (min(ceil_div(D, 32) * (min(O, 2) + 2 * min(O / 3, 1) + 4 * min(O / 5, 1)), 448) * 64)
     launch readout_head_rows_batch when O >= BATCH_FROM and O <= 16:
         params (BATCH_SIMDGROUPS in [8, 4, 16, 32], code BATCH_ROWS in [2, 1, 4],
-            code arithmetic BATCH_PARTS in [2, 4, 1])
+            code arithmetic BATCH_PARTS in [2, 4, 1], code arithmetic form MATRIX in [1, 0])
         threadgroups (ceil_div(ceil_div(V, 8) * BATCH_PARTS, BATCH_SIMDGROUPS), 1, 1)
         threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
         shared_bytes (max(16640, min((BATCH_SIMDGROUPS * 256 + ceil_div(D, 32) * 32) * ceil_div(O, 8), 28672)))
@@ -202,7 +202,7 @@ native readout_head_rows for cpu from "cpu/readout_head_rows.rs":
     static (WS)
     params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     where WS <= 1 and (INT8 == 0 or form(OW, INT8) == 1)
-    scratch quantized bytes (O * ceil_div(D, 256) * 292)
+    scratch quantized bytes (O * ceil_div(D, Q8_VALUES) * Q8_BYTES)
     scratch normalized bytes (O * D * 4)
     launch readout_head_rows_normalize:
         threadgroups (O, 1, 1)
@@ -321,7 +321,7 @@ native readout_selected_rows for vulkan from "vulkan/readout_selected_rows.comp"
 native readout_selected_rows for cpu from "cpu/readout_selected_rows.rs":
     params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     where (INT8 == 0 or form(OW, INT8) == 1)
-    scratch quantized bytes (O * ceil_div(D, 256) * 292)
+    scratch quantized bytes (O * ceil_div(D, Q8_VALUES) * Q8_BYTES)
     scratch normalized bytes (O * D * 4)
     launch readout_selected_rows_normalize:
         threadgroups (O, 1, 1)

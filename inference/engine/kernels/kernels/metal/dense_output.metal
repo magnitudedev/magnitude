@@ -116,7 +116,7 @@ kernel void dense_output_stage(DENSE_OUTPUT_ARGUMENTS,
 #endif
 
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_BATCH
-template <uint BATCH_ROWS, uint BATCH_PARTS>
+template <uint BATCH_ROWS, uint BATCH_PARTS, uint MATRIX>
 kernel void dense_output_batch(DENSE_OUTPUT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
@@ -124,9 +124,10 @@ kernel void dense_output_batch(DENSE_OUTPUT_ARGUMENTS,
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     DENSE_OUTPUT_OPERANDS;
-    // Weights with a matrix GEMV take it; the others the batched rows, in
-    // the first threadgroups of the launch.
-    if constexpr (projection::matrix_form<packets::W0>::available) {
+    // The matrix GEMV (MATRIX, which the declaration admits only where it
+    // serves the weight), else the batched rows, in the first threadgroups of
+    // the launch.
+    if constexpr (MATRIX == 1) {
         projection::gemv_matrix<packets::W0, BATCH_PARTS>(in, out, w, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_H),
             uint(SEISMIC_DIM_F), tile, shared, simdgroups, sg, lane);
         return;

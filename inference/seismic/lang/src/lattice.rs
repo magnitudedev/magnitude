@@ -87,7 +87,7 @@
 use crate::ids::RepresentationId;
 use crate::reference_math::{self, ReferenceScalar, conversion};
 use crate::registry::{
-    self, CodeInterpretation, PackedPacketLayout, PackedRowLayout, PlaneEncoding,
+    self, PackedPacketLayout, PackedRowLayout, PlaneEncoding,
     RepresentationKind, RowGeometry, RowPlaneContent,
 };
 use crate::types::DType;
@@ -304,10 +304,9 @@ impl Steps {
     fn of(encoding: &PlaneEncoding) -> Option<Steps> {
         match encoding {
             PlaneEncoding::Dense(dtype) => Steps::float(*dtype),
-            PlaneEncoding::Packed {
-                interpretation: CodeInterpretation::Grid(_),
-                ..
-            } => Some(Steps::Fixed),
+            // A vector code's entry, or a byte of digits, codes several values
+            // at once.
+            PlaneEncoding::Grid(_) | PlaneEncoding::Digits { .. } => Some(Steps::Fixed),
             PlaneEncoding::Packed {
                 bits,
                 interpretation,
@@ -316,6 +315,21 @@ impl Steps {
                 Steps::levels(*bits, |raw| {
                     reference_math::evaluate(&recipe, &[ReferenceScalar::U32(raw)])
                         .expect("registry code interpretation is total")
+                        .to_f64()
+                })
+            }),
+            // Its scale code, negated where its top bit is set.
+            PlaneEncoding::SignedLocal {
+                scale_bits,
+                interpretation,
+            } => (encoding.entry_bits() <= ENUMERABLE_CODE_BITS).then(|| {
+                let scale = reference_math::code_recipe(interpretation, *scale_bits);
+                let signed = reference_math::signed_code_recipe(*scale_bits);
+                Steps::levels(encoding.entry_bits(), |raw| {
+                    let code = reference_math::evaluate(&scale, &[ReferenceScalar::U32(raw)])
+                        .expect("registry code interpretation is total");
+                    reference_math::evaluate(&signed, &[code, ReferenceScalar::U32(raw)])
+                        .expect("a signed code is total")
                         .to_f64()
                 })
             }),
@@ -643,6 +657,8 @@ impl Lattice {
                                         Some(Run { first: shift, bits })
                                     }
                                     RowPlaneContent::Grids { .. }
+                                    | RowPlaneContent::GridHigh { .. }
+                                    | RowPlaneContent::Digits { .. }
                                     | RowPlaneContent::Groups { .. }
                                     | RowPlaneContent::Records { .. } => None,
                                 })

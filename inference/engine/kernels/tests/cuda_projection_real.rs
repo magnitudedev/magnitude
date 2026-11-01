@@ -11,7 +11,7 @@ mod cuda_common;
 
 use cuda_common::*;
 use magnitude_kernels::{dense_expand, project_rows};
-use seismic::{Element, NativeSpecialization, Tensor};
+use seismic::{Element, Layout, NativeSpecialization, Tensor};
 use seismic_lang::registry::bf16_round;
 use std::collections::HashMap;
 use std::fs;
@@ -113,10 +113,7 @@ impl Gguf {
         let (kind, dims, offset) = &self.tensors[name];
         let encoding = magnitude_ggml::Encoding::from_id(*kind)
             .unwrap_or_else(|| panic!("{name}: GGUF type {kind}"));
-        let format = Format::ALL
-            .into_iter()
-            .find(|format| format.encoding() == encoding)
-            .unwrap_or_else(|| panic!("{name}: GGUF type {kind}"));
+        let format = Format::rounded(encoding);
         let k = dims[0] as usize;
         let block_bytes = encoding.block_bytes() as usize;
         let row_bytes = k / format.block_values() * block_bytes;
@@ -151,7 +148,7 @@ fn real_weight(
     let shape = [rows as u64, k as u64];
     let resident = format.resident();
     let bytes = resident
-        .repack_host(Element::named(format.external()).unwrap(), &shape, external)
+        .repack_host(format.source(), &shape, external)
         .unwrap();
     let values = resident.decode_host(&shape, &bytes).unwrap();
     let tensor = Tensor::from_host(device, resident, &shape, &bytes).unwrap();
@@ -166,13 +163,9 @@ fn real_weight(
 /// way massive activations are.
 fn residual(gguf: &Gguf, m: usize, outliers: bool) -> Vec<f32> {
     let (format, k, external) = gguf.rows("token_embd.weight", 1000, m);
-    let packet = Element::named(format.representation()).unwrap();
+    let packet = format.element(Layout::Packet);
     let bytes = packet
-        .repack_host(
-            Element::named(format.external()).unwrap(),
-            &[m as u64, k as u64],
-            &external,
-        )
+        .repack_host(format.source(), &[m as u64, k as u64], &external)
         .unwrap();
     let mut values: Vec<f32> = packet
         .decode_host(&[m as u64, k as u64], &bytes)
@@ -270,6 +263,7 @@ fn real_4b_projections_match_their_operand_emulation() {
         assert_eq!(k, h);
         let gate = real_weight(&device, gate_format, f, k, &gate_bytes);
         let up = real_weight(&device, up_format, f, k, &up_bytes);
+        let expand = expansion(gate_format.resident(), up_format.resident(), h, f);
         for outliers in [false, true] {
             for o in [1usize, 3, 12, 64, 128] {
                 let values = residual(&gguf, o, outliers);
@@ -281,7 +275,7 @@ fn real_4b_projections_match_their_operand_emulation() {
                 let (u_exact, _) = project(&exact, &up.values, o, f, h);
                 let reference: Vec<f64> =
                     (0..o * f).map(|i| silu(g_exact[i]) * u_exact[i]).collect();
-                for mapping in mappings(o, &[gate_format.resident(), up_format.resident()]) {
+                for mapping in mappings(o, |mapping| expand.admits(&device, mapping)) {
                     let (x, _) = operand_rows(&exact, h, mapping, Some(gate_format));
                     let (g, _) = project(&x, &gate.values, o, f, h);
                     let (u, _) = project(&x, &up.values, o, f, h);
@@ -290,23 +284,7 @@ fn real_4b_projections_match_their_operand_emulation() {
                     let emulated: Vec<f64> = (0..o * f)
                         .map(|i| round(round(silu(round(g[i]))) * round(u[i])))
                         .collect();
-                    let kernel = dense_expand::native_for_device_with(
-                        &device,
-                        dense_expand::Elements {
-                            NW: Element::f32(),
-                            GW: gate_format.resident(),
-                            UW: up_format.resident(),
-                            A: Element::bf16(),
-                        },
-                        &mapping.projection_params(
-                            NativeSpecialization::new()
-                                .with_static("H", h as u64)
-                                .with_static("F", f as u64)
-                                .with_static("GS", 0)
-                                .with_static("US", 0),
-                        ),
-                    )
-                    .unwrap();
+                    let kernel = expand.kernel(&device, mapping);
                     let actual: Vec<f64> = read_bf16(
                         &kernel
                             .call(dense_expand::Args {
@@ -388,7 +366,7 @@ fn real_12b_physical_f16_projection_operands() {
         let resident = format.resident();
         let shape = [intermediate as u64, hidden as u64];
         let packed = resident
-            .repack_host(Element::named(format.external()).unwrap(), &shape, &bytes)
+            .repack_host(format.source(), &shape, &bytes)
             .unwrap();
         Tensor::from_host(&device, resident, &shape, &packed).unwrap()
     };
@@ -420,6 +398,7 @@ fn real_12b_physical_f16_projection_operands() {
                 int8: 0,
                 ksplit: 4,
                 rotate: 1,
+                residency: 1,
             }
             .projection_params(
                 NativeSpecialization::new()
@@ -449,12 +428,10 @@ fn real_12b_physical_f16_projection_operands() {
     let physical = kernel(1);
     let reference = read_bf16(&baseline.call(args()).unwrap().value);
     let actual = read_bf16(&physical.call(args()).unwrap().value);
-    assert!(
-        reference
-            .iter()
-            .chain(&actual)
-            .all(|value| value.is_finite())
-    );
+    assert!(reference
+        .iter()
+        .chain(&actual)
+        .all(|value| value.is_finite()));
     let scale = (reference
         .iter()
         .map(|&value| (value as f64).powi(2))
@@ -502,7 +479,7 @@ fn real_12b_physical_f16_projection_operands() {
     let resident = format.resident();
     let shape = [hidden as u64, intermediate as u64];
     let packed = resident
-        .repack_host(Element::named(format.external()).unwrap(), &shape, &bytes)
+        .repack_host(format.source(), &shape, &bytes)
         .unwrap();
     let down = Tensor::from_host(&device, resident, &shape, &packed).unwrap();
     let product = baseline.call(args()).unwrap().value;
@@ -643,11 +620,7 @@ fn real_26b_grouped_physical_f16_operands() {
         let shape = [e as u64, rows as u64, columns as u64];
         let resident = format.resident();
         let bytes = resident
-            .repack_host(
-                Element::named(format.external()).unwrap(),
-                &shape,
-                &external,
-            )
+            .repack_host(format.source(), &shape, &external)
             .unwrap();
         Tensor::from_host(&device, resident, &shape, &bytes).unwrap()
     };

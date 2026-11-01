@@ -25,7 +25,10 @@ fn routed_experts_up_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, grou
         // SAFETY: this work item owns the corresponding quantized row.
         let q8 = unsafe {
             cx.scratch_quantized()
-                .slice_mut::<seismic::cpu::quant::Q8Block>(row * blocks * projection::Q8_BYTES, blocks)
+                .slice_mut::<seismic::cpu::quant::Q8Block>(
+                    row * blocks * seismic::cpu::quant::Q8_BYTES,
+                    blocks,
+                )
         };
         projection::quantize(staged, q8);
     }
@@ -77,7 +80,10 @@ fn routed_experts_up_quantize<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, g
         let blocks = seismic::cpu::quant::blocks(f);
         let q8 = unsafe {
             cx.scratch_product_q8()
-                .slice_mut::<seismic::cpu::quant::Q8Block>(row * blocks * projection::Q8_BYTES, blocks)
+                .slice_mut::<seismic::cpu::quant::Q8Block>(
+                    row * blocks * seismic::cpu::quant::Q8_BYTES,
+                    blocks,
+                )
         };
         projection::quantize(product, q8);
     }

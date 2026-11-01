@@ -21,7 +21,11 @@ use seismic_lang::{
     types::DType,
 };
 
+mod gguf_formats;
 mod operands;
+
+use gguf_formats::{Format, Rng, gguf_format_tests};
+use magnitude_ggml::Encoding;
 
 // ---------------------------------------------------------------------------
 // Host values.
@@ -101,8 +105,6 @@ impl Act {
     }
 }
 
-struct Rng(u64);
-
 impl Rng {
     fn new(seed: u64) -> Self {
         Self(
@@ -110,122 +112,59 @@ impl Rng {
                 .wrapping_add(1_442_695_040_888_963_407),
         )
     }
-    fn next(&mut self) -> u32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        (self.0 >> 33) as u32
-    }
     fn below(&mut self, n: u32) -> u32 {
         self.next() % n
     }
-    fn uniform(&mut self) -> f32 {
-        (self.next() >> 8) as f32 / (1u32 << 24) as f32
-    }
     fn symmetric(&mut self) -> f32 {
-        self.uniform() * 2.0 - 1.0
+        self.fraction() * 2.0 - 1.0
     }
 }
 
 // ---------------------------------------------------------------------------
 // rows16 weights.
 
+/// A rows16 weight's representation: built host-side in rows16 directly
+/// (`rows16_weight`), or a GGUF format imported through the registry's
+/// conversion (`gguf_weight`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Repr {
     Q4k,
     Q5k,
     Q6k,
     Q8,
-    Iq4,
     Bf16,
-    // Built from GGUF blocks through the registry's conversion
-    // (`gguf_weight`).
-    Q4g32s,
-    Q4g32,
-    Iq4g32s,
-    Q5g32s,
-    Q5g32,
-    Mxfp4,
-    Nvfp4,
-    /// NVFP4's W4A4 element: nvfp4g16's storage, NVFP4 operands.
-    Nvfp4A4,
-    Iq2xs,
-    Iq3xxs,
-    Iq2xxs,
-    Q2k,
-    Q2g256,
+    Gguf(Format),
 }
 
-/// The vector-coded formats (256-value GGUF blocks).
-const GRID_REPRS: [Repr; 3] = [Repr::Iq2xs, Repr::Iq3xxs, Repr::Iq2xxs];
-
-/// The formats with a representation of their own, imported from GGUF.
-const GGUF_REPRS: [Repr; 10] = [
-    Repr::Q4g32s,
-    Repr::Q4g32,
-    Repr::Iq4g32s,
-    Repr::Q5g32s,
-    Repr::Q5g32,
-    Repr::Mxfp4,
-    Repr::Nvfp4,
-    Repr::Nvfp4A4,
-    Repr::Q2k,
-    Repr::Q2g256,
-];
-
-/// The iq4g32 code table (the registry's `iq4g32` interpretation).
-const IQ4_TABLE: [i8; 16] = [
-    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
-];
-
 impl Repr {
-    fn name(self) -> &'static str {
-        match self {
-            Repr::Q4k => "q4k",
-            Repr::Q5k => "q5k",
-            Repr::Q6k => "q6k",
-            Repr::Q8 => "q8g32s",
-            Repr::Iq4 => "iq4g32",
-            Repr::Bf16 => "bf16",
-            Repr::Q4g32s => "q4g32s",
-            Repr::Q4g32 => "q4g32",
-            Repr::Iq4g32s => "iq4g32s",
-            Repr::Q5g32s => "q5g32s",
-            Repr::Q5g32 => "q5g32",
-            Repr::Mxfp4 => "mxfp4g32",
-            Repr::Nvfp4 => "nvfp4g16",
-            Repr::Nvfp4A4 => "nvfp4g16a4",
-            Repr::Iq2xs => "iq2xs",
-            Repr::Iq3xxs => "iq3xxs",
-            Repr::Iq2xxs => "iq2xxs",
-            Repr::Q2k => "q2k",
-            Repr::Q2g256 => "q2g256",
-        }
+    const HOST: [Repr; 5] = [Repr::Q4k, Repr::Q5k, Repr::Q6k, Repr::Q8, Repr::Bf16];
+    /// `encoding` imported for rounded activations.
+    const fn gguf(encoding: Encoding) -> Repr {
+        Repr::Gguf(Format::rounded(encoding))
     }
-    /// The GGUF source of a representation built from GGUF blocks, with its
-    /// block bytes and values.
-    fn gguf_source(self) -> Option<(&'static str, usize, usize)> {
+    /// The weight of `format`: host-built where a host builder writes its
+    /// storage, else imported.
+    fn of(format: Format) -> Repr {
+        let name = format.name();
+        Repr::HOST
+            .into_iter()
+            .find(|repr| repr.name() == name)
+            .unwrap_or(Repr::Gguf(format))
+    }
+    fn name(self) -> String {
         match self {
-            Repr::Q4g32s => Some(("gguf_q4_0", 18, 32)),
-            Repr::Q4g32 => Some(("gguf_q4_1", 20, 32)),
-            Repr::Iq4g32s => Some(("gguf_iq4_nl_block", 18, 32)),
-            Repr::Q5g32s => Some(("gguf_q5_0", 22, 32)),
-            Repr::Q5g32 => Some(("gguf_q5_1", 24, 32)),
-            Repr::Mxfp4 => Some(("gguf_mxfp4", 17, 32)),
-            Repr::Nvfp4 | Repr::Nvfp4A4 => Some(("gguf_nvfp4", 36, 64)),
-            Repr::Iq2xs => Some(("gguf_iq2_xs", 74, 256)),
-            Repr::Iq3xxs => Some(("gguf_iq3_xxs", 98, 256)),
-            Repr::Iq2xxs => Some(("gguf_iq2_xxs", 66, 256)),
-            Repr::Q2k => Some(("gguf_q2_k", 84, 256)),
-            Repr::Q2g256 => Some(("gguf_tq2_0", 66, 256)),
-            _ => None,
+            Repr::Q4k => "q4k".into(),
+            Repr::Q5k => "q5k".into(),
+            Repr::Q6k => "q6k".into(),
+            Repr::Q8 => "q8g32s".into(),
+            Repr::Bf16 => "bf16".into(),
+            Repr::Gguf(format) => format.name(),
         }
     }
     fn storage(self) -> RepresentationId {
         match self {
             Repr::Bf16 => registry::dense(DType::BF16),
-            _ => registry::storage(self.name(), registry::Layout::Rows16).expect("rows16 storage"),
+            _ => registry::storage(&self.name(), registry::Layout::Rows16).expect("rows16 storage"),
         }
     }
     /// The element of the host-built bytes (`rows16`).
@@ -235,7 +174,7 @@ impl Repr {
     fn element_in(self, layout: registry::Layout) -> Element {
         match self {
             Repr::Bf16 => Element::bf16(),
-            _ => Element::stored(self.name(), layout).expect("row layout element"),
+            _ => Element::stored(&self.name(), layout).expect("row layout element"),
         }
     }
     /// The element `device`'s native kernels read this weight as.
@@ -297,26 +236,8 @@ fn planes(repr: Repr, k: usize) -> Planes {
             planes.codes = place(k);
             planes.supers = place(2 * (k / 32));
         }
-        Repr::Iq4 => {
-            planes.codes = place(k / 2);
-            planes.supers = place(4 * (k / 32));
-        }
         Repr::Bf16 => at = 2 * k,
-        Repr::Q4g32s
-        | Repr::Q4g32
-        | Repr::Iq4g32s
-        | Repr::Q5g32s
-        | Repr::Q5g32
-        | Repr::Mxfp4
-        | Repr::Nvfp4
-        | Repr::Nvfp4A4
-        | Repr::Iq2xs
-        | Repr::Iq3xxs
-        | Repr::Iq2xxs
-        | Repr::Q2k
-        | Repr::Q2g256 => {
-            unreachable!("{repr:?} takes the registry's geometry (`gguf_weight`)")
-        }
+        Repr::Gguf(_) => unreachable!("{repr:?} takes the registry's geometry (`gguf_weight`)"),
     }
     planes.stride = at;
     planes
@@ -345,7 +266,7 @@ impl Weight {
     /// Rows `x` of `k` as products over this weight take them: as NVFP4
     /// operands where the registry's recipe of its representation says so.
     fn operand_rows(&self, x: &[f32]) -> Vec<f32> {
-        let representation = registry::representation(self.repr.name()).unwrap();
+        let representation = registry::representation(&self.repr.name()).unwrap();
         let nvfp4 = registry::representation_info(representation).operands
             == registry::OperandRecipe::Nvfp4Rows;
         operands::operand_rows(x, self.k, nvfp4)
@@ -397,7 +318,7 @@ impl Weight {
             unreachable!()
         };
         let resident =
-            registry::representation_info(registry::storage(self.repr.name(), layout).unwrap());
+            registry::representation_info(registry::storage(&self.repr.name(), layout).unwrap());
         let registry::RepresentationKind::PackedRows(destination) = &resident.kind else {
             unreachable!()
         };
@@ -438,9 +359,15 @@ fn put_bits(bytes: &mut [u8], bit: usize, width: usize, value: u32) {
 fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
     let scale = scale * 2.0 / (k as f32).sqrt();
     let mut rng = Rng::new(seed);
-    if repr.gguf_source().is_some() {
-        return gguf_weight(repr, rows, k, &mut rng, scale);
+    match repr {
+        Repr::Gguf(format) => gguf_weight(format, rows, k, &mut rng, scale),
+        _ => rows16_weight(repr, rows, k, &mut rng, scale),
     }
+}
+
+/// A random weight built in rows16 directly, in the frozen plane order
+/// (`planes`).
+fn rows16_weight(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -> Weight {
     let p = planes(repr, k);
     let mut bytes = vec![0u8; p.stride * rows];
     let mut values = vec![0f32; rows * k];
@@ -452,9 +379,9 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
                 let bits = if repr == Repr::Q4k { 4 } else { 5 };
                 let center = if bits == 5 { 15.5 } else { 7.5 };
                 for block in 0..k / 256 {
-                    let d_value = scale / (center * 32.0) * (0.5 + rng.uniform());
+                    let d_value = scale / (center * 32.0) * (0.5 + rng.fraction());
                     let d = f16_bits(d_value);
-                    let dmin = f16_bits(d_value * center * (0.75 + 0.5 * rng.uniform()));
+                    let dmin = f16_bits(d_value * center * (0.75 + 0.5 * rng.fraction()));
                     row[p.supers + 4 * block..p.supers + 4 * block + 2]
                         .copy_from_slice(&d.to_le_bytes());
                     row[p.supers + 4 * block + 2..p.supers + 4 * block + 4]
@@ -481,7 +408,7 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
             }
             Repr::Q6k => {
                 for block in 0..k / 256 {
-                    let d = f16_bits(scale / 32.0 / 48.0 * (0.5 + rng.uniform()));
+                    let d = f16_bits(scale / 32.0 / 48.0 * (0.5 + rng.fraction()));
                     row[p.supers + 2 * block..p.supers + 2 * block + 2]
                         .copy_from_slice(&d.to_le_bytes());
                     for group in 0..16 {
@@ -500,7 +427,7 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
             }
             Repr::Q8 => {
                 for group in 0..k / 32 {
-                    let factor = f16_bits(scale / 96.0 * (0.5 + rng.uniform()));
+                    let factor = f16_bits(scale / 96.0 * (0.5 + rng.fraction()));
                     row[p.supers + 2 * group..p.supers + 2 * group + 2]
                         .copy_from_slice(&factor.to_le_bytes());
                     for i in 0..32 {
@@ -508,19 +435,6 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
                         let code = (rng.below(255) as i32 - 127) as i8;
                         row[p.codes + column] = code as u8;
                         out[column] = f16_to_f32(factor) * f32::from(code);
-                    }
-                }
-            }
-            Repr::Iq4 => {
-                for group in 0..k / 32 {
-                    let factor = scale / 64.0 * (0.5 + rng.uniform());
-                    row[p.supers + 4 * group..p.supers + 4 * group + 4]
-                        .copy_from_slice(&factor.to_le_bytes());
-                    for i in 0..32 {
-                        let column = 32 * group + i;
-                        let code = rng.below(16);
-                        put_bits(&mut row[p.codes..], 4 * column, 4, code);
-                        out[column] = factor * f32::from(IQ4_TABLE[code as usize]);
                     }
                 }
             }
@@ -532,21 +446,7 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
                     out[column] = value;
                 }
             }
-            Repr::Q4g32s
-            | Repr::Q4g32
-            | Repr::Iq4g32s
-            | Repr::Q5g32s
-            | Repr::Q5g32
-            | Repr::Mxfp4
-            | Repr::Nvfp4
-            | Repr::Nvfp4A4
-            | Repr::Iq2xs
-            | Repr::Iq3xxs
-            | Repr::Iq2xxs
-            | Repr::Q2k
-            | Repr::Q2g256 => {
-                unreachable!("built by `gguf_weight`")
-            }
+            Repr::Gguf(_) => unreachable!("{repr:?} is built by `gguf_weight`"),
         }
     }
     Weight {
@@ -558,61 +458,23 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
     }
 }
 
-/// A random weight of a representation imported from GGUF: random blocks of
-/// its source format (with scale fields of magnitude about `scale / 8`)
-/// through the registry's conversion, so the rows16 bytes are the ones the
-/// device repack produces.
-fn gguf_weight(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -> Weight {
-    let (source, block_bytes, block_values) = repr.gguf_source().unwrap();
-    assert_eq!(k % block_values, 0, "{repr:?} rows of whole GGUF blocks");
-    let mut external = Vec::with_capacity(rows * k / block_values * block_bytes);
-    for _ in 0..rows * k / block_values {
-        let mut block = (0..block_bytes)
-            .map(|_| rng.next() as u8)
-            .collect::<Vec<_>>();
-        let factor = scale * (0.5 + rng.uniform());
-        match repr {
-            Repr::Q4g32s => block[..2].copy_from_slice(&f16_bits(factor / 8.0).to_le_bytes()),
-            Repr::Q4g32 => {
-                block[..2].copy_from_slice(&f16_bits(factor / 8.0).to_le_bytes());
-                block[2..4].copy_from_slice(&f16_bits(-factor).to_le_bytes());
-            }
-            // d: the table's values reach 127 d.
-            Repr::Iq4g32s => block[..2].copy_from_slice(&f16_bits(factor / 128.0).to_le_bytes()),
-            Repr::Q5g32s => block[..2].copy_from_slice(&f16_bits(factor / 16.0).to_le_bytes()),
-            Repr::Q5g32 => {
-                block[..2].copy_from_slice(&f16_bits(factor / 16.0).to_le_bytes());
-                block[2..4].copy_from_slice(&f16_bits(-factor).to_le_bytes());
-            }
-            // E8M0: the power of two nearest factor / 6 (the E2M1 range).
-            Repr::Mxfp4 => block[0] = (127.0 + (factor / 6.0).log2().round()) as u8,
-            // UE4M3 exponent of factor / 6 (normal), random mantissas.
-            Repr::Nvfp4 | Repr::Nvfp4A4 => {
-                for field in &mut block[..4] {
-                    let exponent = ((factor / 6.0).log2().floor() as i32 + 7).clamp(1, 14) as u8;
-                    *field = (exponent << 3) | rng.below(8) as u8;
-                }
-            }
-            // d: values reach d (2 s + 1) 43 / 8 and d (2 s + 1) 62 / 4.
-            Repr::Iq2xs | Repr::Iq2xxs => {
-                block[..2].copy_from_slice(&f16_bits(factor / 40.0).to_le_bytes())
-            }
-            Repr::Iq3xxs => block[..2].copy_from_slice(&f16_bits(factor / 120.0).to_le_bytes()),
-            // d and dmin: values reach d 15 3 and dmin 15.
-            Repr::Q2k => {
-                block[80..82].copy_from_slice(&f16_bits(factor / 45.0).to_le_bytes());
-                block[82..84].copy_from_slice(&f16_bits(factor / 30.0).to_le_bytes());
-            }
-            // d: codes - 1 reach 2.
-            Repr::Q2g256 => block[64..66].copy_from_slice(&f16_bits(factor / 2.0).to_le_bytes()),
-            _ => unreachable!("{repr:?} is not imported from GGUF"),
-        }
-        external.extend(block);
-    }
+/// A random weight of a GGUF format: random blocks of it (`Format::block`,
+/// values reaching about `scale`) through the registry's conversion, so the
+/// rows16 bytes are the ones the device repack produces.
+fn gguf_weight(format: Format, rows: usize, k: usize, rng: &mut Rng, scale: f32) -> Weight {
+    let repr = Repr::Gguf(format);
+    assert_eq!(
+        k % format.block_values(),
+        0,
+        "{repr:?} rows of whole GGUF blocks"
+    );
+    let external = (0..rows * k / format.block_values())
+        .flat_map(|_| format.block(rng, scale))
+        .collect::<Vec<_>>();
     let shape = [rows as u64, k as u64];
     let element = repr.element();
     let bytes = element
-        .repack_host(Element::named(source).unwrap(), &shape, &external)
+        .repack_host(format.source(), &shape, &external)
         .unwrap();
     let values = element
         .decode_host(&shape, &bytes)
@@ -1423,6 +1285,25 @@ fn readout_projection_specialization_on(
 
 /// The specialization of `readout_head_rows` on `device`: the readout
 /// projection's, with the GEMV launch for two rows up to BATCH_FROM.
+/// `specialization` with Metal's batched launch (2) taking the matrix GEMV
+/// (`MATRIX`) where the declaration admits it for `elements`, as the declared
+/// default does; other backends have no such choice.
+fn with_matrix<E: seismic::Entry>(
+    device: &Device,
+    specialization: NativeSpecialization,
+    elements: &[(&str, Element)],
+) -> NativeSpecialization {
+    if device.backend() != BackendName::Metal {
+        return specialization;
+    }
+    let matrix = specialization.clone().with_launch_param(2, "MATRIX", 1);
+    if seismic::generated::native_specialization_valid::<E>(device, &matrix, elements).unwrap() {
+        matrix
+    } else {
+        specialization.with_launch_param(2, "MATRIX", 0)
+    }
+}
+
 fn readout_head_specialization_on(
     device: &Device,
     statics: &[(&str, usize)],
@@ -1595,7 +1476,7 @@ fn result(outcome: &OracleOutcome, index: usize) -> Vec<f32> {
 
 fn norm_values(n: usize, seed: u64) -> Vec<f32> {
     let mut rng = Rng::new(seed);
-    (0..n).map(|_| bf16_round(0.5 + rng.uniform())).collect()
+    (0..n).map(|_| bf16_round(0.5 + rng.fraction())).collect()
 }
 
 fn bf16_norm(device: &Device, values: &[f32]) -> Tensor {
@@ -1624,7 +1505,7 @@ fn attention_project_statics(
 
 #[test]
 fn rows16_builder_matches_the_registry_layout_and_decode() {
-    for repr in [Repr::Q4k, Repr::Q5k, Repr::Q6k, Repr::Q8, Repr::Iq4] {
+    for repr in [Repr::Q4k, Repr::Q5k, Repr::Q6k, Repr::Q8] {
         let k = 512;
         let w = weight(repr, 3, k, 1, 1.0);
         let info = registry::representation_info(repr.storage());
@@ -1692,6 +1573,16 @@ fn dense_expand_native_arithmetic(
     if device.backend() == BackendName::Metal {
         specialization = specialization.with_param("INT8", u64::from(int8));
     }
+    let specialization = with_matrix::<dense_expand::Entry>(
+        device,
+        specialization,
+        &[
+            ("NW", Element::bf16()),
+            ("GW", gate.repr.resident(&device)),
+            ("UW", up.repr.resident(&device)),
+            ("A", act.element()),
+        ],
+    );
     let kernel = dense_expand::native_for_device_with(
         device,
         dense_expand::Elements {
@@ -1767,11 +1658,14 @@ fn dense_expand_matches_its_portable_body() {
     }
 }
 
-/// IQ4_XS / IQ4_NL weights are resident as iq4g32 (the table decode).
+/// IQ4_XS weights (iq4xs, the table decode).
 #[test]
 fn dense_expand_iq4_matches_its_portable_body() {
     for device in devices() {
-        dense_expand_matches_its_portable_body_on(&device, &[(Repr::Iq4, Repr::Iq4)]);
+        dense_expand_matches_its_portable_body_on(
+            &device,
+            &[(Repr::gguf(Encoding::Iq4Xs), Repr::gguf(Encoding::Iq4Xs))],
+        );
     }
 }
 
@@ -1847,7 +1741,7 @@ fn dense_expand_matches_the_host_reference_across_row_classes_on(device: &Device
         (Act::Bf16, Repr::Q4k, Repr::Q4k),
         (Act::Bf16, Repr::Q5k, Repr::Q6k),
         (Act::Bf16, Repr::Q8, Repr::Bf16),
-        (Act::Bf16, Repr::Iq4, Repr::Q4k),
+        (Act::Bf16, Repr::gguf(Encoding::Iq4Xs), Repr::Q4k),
         (Act::F16, Repr::Q4k, Repr::Q4k),
     ] {
         let gate = weight(gate_repr, f, h, 21, 1.0);
@@ -1928,8 +1822,8 @@ fn metal_dense_expand_matrix_pair_matches_host() {
         for (h, f) in [(256usize, 131usize), (2560, 67)] {
             let norm = norm_values(h, 63);
             for (gate_repr, up_repr) in [
-                (Repr::Q4g32s, Repr::Q4g32s),
-                (Repr::Q4g32s, Repr::Q4k),
+                (Repr::gguf(Encoding::Q4_0), Repr::gguf(Encoding::Q4_0)),
+                (Repr::gguf(Encoding::Q4_0), Repr::Q4k),
                 (Repr::Q4k, Repr::Q4k),
                 (Repr::Q5k, Repr::Q4k),
                 (Repr::Q6k, Repr::Q5k),
@@ -2093,7 +1987,7 @@ fn metal_tall_gemm_is_bit_identical_to_the_staged_tiles() {
         Repr::Q5k,
         Repr::Q6k,
         Repr::Q8,
-        Repr::Iq4,
+        Repr::gguf(Encoding::Iq4Xs),
         Repr::Bf16,
     ] {
         let (h, f) = (256, 200);
@@ -2248,10 +2142,14 @@ fn metal_tall_segmented_projections_are_bit_identical_to_the_staged_tiles() {
                     OW: out_weight.repr.resident(&device),
                     A: act.element(),
                 },
-                &attention_output_specialization_on(
+                &with_matrix::<attention_output::Entry>(
                     &device,
-                    &[("D", outputs), ("Q", heads), ("W", width)],
-                    mapping,
+                    attention_output_specialization_on(
+                        &device,
+                        &[("D", outputs), ("Q", heads), ("W", width)],
+                        mapping,
+                    ),
+                    &[("OW", out_weight.repr.resident(&device)), ("A", act.element())],
                 ),
             )
             .unwrap()
@@ -2361,6 +2259,11 @@ fn dense_output_native_arithmetic(
     if is_cpu(device) || device.backend() == BackendName::Metal {
         specialization = specialization.with_param("INT8", u64::from(int8));
     }
+    let specialization = with_matrix::<dense_output::Entry>(
+        device,
+        specialization,
+        &[("A", act.element()), ("DW", down.repr.resident(&device))],
+    );
     let kernel = dense_output::native_for_device_with(
         device,
         dense_output::Elements {
@@ -2464,7 +2367,11 @@ fn metal_int8_dense_output_agrees_with_the_tall_form() {
             A: act.element(),
             DW: Repr::Q6k.resident(&device),
         },
-        &dense_output_specialization_on(&device, &[("H", 192), ("F", 1024)], tall).with_param("INT8", 1),
+        &with_matrix::<dense_output::Entry>(
+            &device,
+            dense_output_specialization_on(&device, &[("H", 192), ("F", 1024)], tall).with_param("INT8", 1),
+            &[("A", act.element()), ("DW", Repr::Q6k.resident(&device))],
+        ),
     );
     assert!(refused.is_err(), "Q6_K has no INT8 configuration");
     for repr in [Repr::Q4k, Repr::Q8] {
@@ -2584,6 +2491,11 @@ fn project_rows_native(
     )
     .with_param("PACK", u64::from(pack.is_some()))
     .with_launch_param(2, "BATCH_PARTS", mapping.batch_parts);
+    let specialization = with_matrix::<project_rows::Entry>(
+        device,
+        specialization,
+        &[("A", act.element()), ("W", weight.repr.resident(device)), ("Y", Element::f32())],
+    );
     let kernel = project_rows::native_for_device_with(
         device,
         project_rows::Elements {
@@ -2606,11 +2518,11 @@ fn project_rows_native(
     read_f32(&out)
 }
 
-/// Metal's tall and PACK forms of the plain projection: the tall tile gives
-/// the staged tile's bits; the PACK form differs from them by the packed
-/// form's error over Q4_K, Q5_K, Q6_K, q4g32s, Q8_0 or iq4g32 weights.
-#[test]
-fn metal_tall_and_packed_project_rows_agree_with_the_staged_form() {
+/// Metal's tall and PACK forms of the plain projection over a format the
+/// PACK form admits (`Element::metal_packing`; a generated test a format):
+/// the tall tile gives the staged tile's bits; the PACK form differs from
+/// them by the packed form's error.
+fn metal_tall_and_packed_project_rows_agree_with_the_staged_form(format: Format) {
     let Some(device) = devices()
         .into_iter()
         .find(|device| device.backend() == BackendName::Metal)
@@ -2619,15 +2531,11 @@ fn metal_tall_and_packed_project_rows_agree_with_the_staged_form() {
     };
     let act = Act::Bf16;
     let staged = gemm_mapping(64, 64, 1);
-    for repr in [
-        Repr::Q4k,
-        Repr::Q5k,
-        Repr::Q6k,
-        Repr::Q4g32s,
-        Repr::Q8,
-        Repr::Iq4,
-        Repr::Iq4g32s,
-    ] {
+    let repr = Repr::of(format);
+    if repr.resident(&device).metal_packing().is_none() {
+        return;
+    }
+    {
         let (outputs, k) = (192, 1024);
         let weight = weight(repr, outputs, k, 97, 1.0);
         for rows in [128usize, 200, 512] {
@@ -2696,6 +2604,11 @@ fn dense_output_packed(
         pack,
     )
     .with_static("DB", bound_extent as u64);
+    let specialization = with_matrix::<dense_output::Entry>(
+        device,
+        specialization,
+        &[("A", act.element()), ("DW", down.repr.resident(device))],
+    );
     let kernel = dense_output::native_for_device_with(
         device,
         dense_output::Elements {
@@ -2721,11 +2634,10 @@ fn dense_output_packed(
 
 /// Metal's PACK form of the down projection: integer activation codes per
 /// (row, 32 columns), two rows packed per operand element against the exact
-/// Q4_K, Q5_K, Q6_K, q4g32s, Q8_0 or iq4g32 codes. Its results differ from the staged
-/// form's by the activation rounding, the packed accumulator's rounding and
-/// the F16 fold.
-#[test]
-fn metal_packed_dense_output_agrees_with_the_staged_form() {
+/// codes of a format the form admits (a generated test a format). Its
+/// results differ from the staged form's by the activation rounding, the
+/// packed accumulator's rounding and the F16 fold.
+fn metal_packed_dense_output_agrees_with_the_staged_form(format: Format) {
     let Some(device) = devices()
         .into_iter()
         .find(|device| device.backend() == BackendName::Metal)
@@ -2734,15 +2646,11 @@ fn metal_packed_dense_output_agrees_with_the_staged_form() {
     };
     let act = Act::Bf16;
     let staged = gemm_mapping(64, 64, 1);
-    for repr in [
-        Repr::Q4k,
-        Repr::Q5k,
-        Repr::Q6k,
-        Repr::Q4g32s,
-        Repr::Q8,
-        Repr::Iq4,
-        Repr::Iq4g32s,
-    ] {
+    let repr = Repr::of(format);
+    if repr.resident(&device).metal_packing().is_none() {
+        return;
+    }
+    {
         let (outputs, k) = (192, 1024);
         let down = weight(repr, outputs, k, 91, 1.0);
         for rows in [128usize, 200, 512] {
@@ -2816,7 +2724,7 @@ fn metal_packed_dense_output_agrees_with_the_staged_form() {
 /// Metal's PACK form of the paired gate/up projection, as for the down
 /// projection: the GLU outputs differ from the staged form's by the packed
 /// form's error with gate and up weights one packed operand serves (Q4_K,
-/// Q5_K and q4g32s together, both Q6_K, or Q8_0 and iq4g32 together), and are
+/// Q5_K and q4g32s together, both Q6_K, or Q8_0 and iq4xs together), and are
 /// the staged tile's bit for bit on a device without the packed path; other
 /// pairs have no PACK configuration.
 #[test]
@@ -2833,12 +2741,20 @@ fn metal_packed_dense_expand_agrees_with_the_staged_form() {
         (Repr::Q4k, Repr::Q4k, true),
         (Repr::Q5k, Repr::Q4k, true),
         (Repr::Q6k, Repr::Q6k, true),
-        (Repr::Q4g32s, Repr::Q4g32s, true),
-        (Repr::Q4g32s, Repr::Q4k, true),
+        (Repr::gguf(Encoding::Q4_0), Repr::gguf(Encoding::Q4_0), true),
+        (Repr::gguf(Encoding::Q4_0), Repr::Q4k, true),
         (Repr::Q8, Repr::Q8, true),
-        (Repr::Iq4, Repr::Iq4, true),
-        (Repr::Iq4, Repr::Q8, true),
-        (Repr::Iq4g32s, Repr::Iq4g32s, true),
+        (
+            Repr::gguf(Encoding::Iq4Xs),
+            Repr::gguf(Encoding::Iq4Xs),
+            true,
+        ),
+        (Repr::gguf(Encoding::Iq4Xs), Repr::Q8, true),
+        (
+            Repr::gguf(Encoding::Iq4Nl),
+            Repr::gguf(Encoding::Iq4Nl),
+            true,
+        ),
         (Repr::Q4k, Repr::Q6k, false),
         (Repr::Q8, Repr::Q4k, false),
     ] {
@@ -2871,6 +2787,16 @@ fn metal_packed_dense_expand_agrees_with_the_staged_form() {
                 )
                 .with_static("GB", gate_bound_extent as u64)
                 .with_static("UB", up_bound_extent as u64);
+                let specialization = with_matrix::<dense_expand::Entry>(
+                    &device,
+                    specialization,
+                    &[
+                        ("NW", Element::bf16()),
+                        ("GW", gate.repr.resident(&device)),
+                        ("UW", up.repr.resident(&device)),
+                        ("A", act.element()),
+                    ],
+                );
                 let kernel = dense_expand::native_for_device_with(
                     &device,
                     dense_expand::Elements {
@@ -2988,8 +2914,14 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
         .map(|i| weight(project_reprs[i], project_rows[i], d, 181 + i as u64, 1.0))
         .collect::<Vec<_>>();
     let (outputs, heads, width) = (128, 8, 64);
-    let out_weights = [Repr::Q5k, Repr::Q4k, Repr::Q6k, Repr::Q8, Repr::Iq4]
-        .map(|repr| weight(repr, outputs, heads * width, 185, 1.0));
+    let out_weights = [
+        Repr::Q5k,
+        Repr::Q4k,
+        Repr::Q6k,
+        Repr::Q8,
+        Repr::gguf(Encoding::Iq4Xs),
+    ]
+    .map(|repr| weight(repr, outputs, heads * width, 185, 1.0));
     let (nk, nv, head_width) = (1, 2, 32);
     let recurrent_reprs = [Repr::Q5k, Repr::Q4k, Repr::Q8, Repr::Bf16];
     let recurrent_rows = [(2 * nk + nv) * head_width, nv * head_width, nv, nv];
@@ -3104,6 +3036,11 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
                 },
             )
             .with_static("OB", bound_extent as u64);
+            let specialization = with_matrix::<attention_output::Entry>(
+                &device,
+                specialization,
+                &[("OW", weight.repr.resident(&device)), ("A", act.element())],
+            );
             let out = attention_output::native_for_device_with(
                 &device,
                 attention_output::Elements {
@@ -3282,7 +3219,16 @@ fn metal_int8_dense_expand_agrees_with_the_tall_form() {
             UW: Repr::Q8.resident(&device),
             A: act.element(),
         },
-        &dense_expand_specialization_on(&device, &[("H", 512), ("F", 192)], tall).with_param("INT8", 1),
+        &with_matrix::<dense_expand::Entry>(
+            &device,
+            dense_expand_specialization_on(&device, &[("H", 512), ("F", 192)], tall).with_param("INT8", 1),
+            &[
+                ("NW", Element::bf16()),
+                ("GW", Repr::Q4k.resident(&device)),
+                ("UW", Repr::Q8.resident(&device)),
+                ("A", act.element()),
+            ],
+        ),
     );
     assert!(refused.is_err(), "Q4_K and Q8_0 have no paired INT8 configuration");
     for repr in [Repr::Q4k, Repr::Q8] {
@@ -3342,28 +3288,20 @@ fn dense_output_reference(
     (expected, bound)
 }
 
-/// `packing_bound` on Metal equals its portable body over every format with
-/// integer codes, at a row count that leaves padding rows in a tile, with
+/// `packing_bound` on Metal equals its portable body over a format the PACK
+/// form admits (a generated test a format), at a row count that leaves padding rows in a tile, with
 /// the runs the registry gives the format.
-#[test]
-fn packing_bound_matches_its_portable_body() {
+fn packing_bound_matches_its_portable_body(format: Format) {
     let module = module();
     for device in devices() {
         if device.backend() != BackendName::Metal {
             continue;
         }
-        for repr in [
-            Repr::Q4k,
-            Repr::Q5k,
-            Repr::Q6k,
-            Repr::Q8,
-            Repr::Iq4,
-            Repr::Q4g32s,
-            Repr::Q4g32,
-            Repr::Iq4g32s,
-            Repr::Q5g32s,
-            Repr::Q5g32,
-        ] {
+        let repr = Repr::of(format);
+        if repr.resident(&device).metal_packing().is_none() {
+            continue;
+        }
+        {
             let (rows, k) = (40, 512);
             let w = weight(repr, rows, k, 17, 1.0);
             let resident = repr.resident(&device);
@@ -3401,38 +3339,11 @@ fn packing_bound_matches_its_portable_body() {
     }
 }
 
+/// Dense bf16 weights (the GGUF formats: `gguf::<format>::`).
 #[test]
-fn dense_output_matches_its_portable_body_and_the_host_reference() {
+fn bf16_dense_output_matches_its_portable_body_and_the_host_reference() {
     for device in devices() {
-        dense_output_matches_its_portable_body_and_the_host_reference_on(
-            &device,
-            &[Repr::Q4k, Repr::Q5k, Repr::Q6k, Repr::Q8, Repr::Bf16],
-        );
-    }
-}
-
-#[test]
-fn dense_output_iq4_matches_its_portable_body_and_the_host_reference() {
-    for device in devices() {
-        dense_output_matches_its_portable_body_and_the_host_reference_on(&device, &[Repr::Iq4]);
-    }
-}
-
-/// Q4_0, Q5_0, Q5_1, MXFP4 and NVFP4 weights, imported into representations
-/// of their own.
-#[test]
-fn dense_output_gguf_formats_match_their_portable_body_and_the_host_reference() {
-    for device in devices() {
-        dense_output_matches_its_portable_body_and_the_host_reference_on(&device, &GGUF_REPRS);
-    }
-}
-
-/// IQ2_XS, IQ3_XXS and IQ2_XXS weights, imported into their vector-coded
-/// representations.
-#[test]
-fn dense_output_grid_formats_match_their_portable_body_and_the_host_reference() {
-    for device in devices() {
-        dense_output_matches_its_portable_body_and_the_host_reference_on(&device, &GRID_REPRS);
+        dense_output_matches_its_portable_body_and_the_host_reference_on(&device, Repr::Bf16);
     }
 }
 
@@ -3441,7 +3352,10 @@ fn dense_expand_grid_formats_match_their_portable_body() {
     for device in devices() {
         dense_expand_matches_its_portable_body_on(
             &device,
-            &[(Repr::Iq2xs, Repr::Iq3xxs), (Repr::Iq2xxs, Repr::Iq2xxs)],
+            &[
+                (Repr::gguf(Encoding::Iq2Xs), Repr::gguf(Encoding::Iq3Xxs)),
+                (Repr::gguf(Encoding::Iq2Xxs), Repr::gguf(Encoding::Iq2Xxs)),
+            ],
         );
     }
 }
@@ -3452,13 +3366,16 @@ fn dense_expand_gguf_formats_match_their_portable_body() {
         dense_expand_matches_its_portable_body_on(
             &device,
             &[
-                (Repr::Q4g32s, Repr::Q4g32s),
-                (Repr::Iq4g32s, Repr::Q4g32s),
-                (Repr::Mxfp4, Repr::Q4g32s),
+                (Repr::gguf(Encoding::Q4_0), Repr::gguf(Encoding::Q4_0)),
+                (Repr::gguf(Encoding::Iq4Nl), Repr::gguf(Encoding::Q4_0)),
+                (Repr::gguf(Encoding::Mxfp4), Repr::gguf(Encoding::Q4_0)),
                 // Weights that share their rows share an operand recipe.
-                (Repr::Nvfp4, Repr::Nvfp4),
-                (Repr::Nvfp4A4, Repr::Nvfp4A4),
-                (Repr::Q5g32s, Repr::Q5g32),
+                (Repr::Gguf(Format::NVFP4), Repr::Gguf(Format::NVFP4)),
+                (Repr::Gguf(Format::NVFP4_A4), Repr::Gguf(Format::NVFP4_A4)),
+                (Repr::gguf(Encoding::Q5_0), Repr::gguf(Encoding::Q5_1)),
+                (Repr::gguf(Encoding::Q1_0), Repr::gguf(Encoding::Tq1_0)),
+                (Repr::gguf(Encoding::Iq2S), Repr::gguf(Encoding::Iq1M)),
+                (Repr::gguf(Encoding::Iq1S), Repr::gguf(Encoding::Iq1S)),
             ],
         );
     }
@@ -3472,7 +3389,11 @@ fn dense_up_gguf_formats_match_their_portable_body() {
     let module = module();
     let act = Act::Bf16;
     let (h, f) = (256, 40);
-    for repr in [Repr::Nvfp4, Repr::Nvfp4A4, Repr::Q4g32s] {
+    for repr in [
+        Repr::Gguf(Format::NVFP4),
+        Repr::Gguf(Format::NVFP4_A4),
+        Repr::gguf(Encoding::Q4_0),
+    ] {
         let up = weight(repr, f, h, 21, 1.0);
         let norm = norm_values(h, 5);
         for outputs in [1usize, 2, 3, 6, 12, 18, 70] {
@@ -3568,23 +3489,20 @@ fn dense_up_gguf_formats_match_their_portable_body() {
     }
 }
 
-/// Rows whose K is not a multiple of 256 (a partial last 256-value block):
-/// Gemma's 704 (expert down) and 2112 (dense down) and Nemotron's 2688, on
-/// the portable body at K = 704 and on the host reference over the row
-/// classes.
-#[test]
-fn dense_output_gguf_formats_at_32_granular_k() {
-    for device in devices() {
-        dense_output_gguf_formats_at_32_granular_k_on(&device);
-    }
-}
-
-fn dense_output_gguf_formats_at_32_granular_k_on(device: &Device) {
+/// Rows of `format` whose K is not a multiple of 256 (a partial last
+/// 256-value block), at each model width whole blocks of it fill
+/// (`Format::partial_block_widths`): on the portable body at the first and
+/// on the host reference over the row classes at each.
+fn dense_output_at_partial_block_widths_on(device: &Device, format: Format) {
     let module = module();
     let act = Act::Bf16;
-    // Only formats of blocks below 256 values have such rows.
-    for repr in GGUF_REPRS.into_iter().filter(|repr| repr.gguf_source().unwrap().2 < 256) {
-        let (h, f) = (16, 704);
+    let repr = Repr::of(format);
+    let widths = format.partial_block_widths();
+    {
+        // The portable body at the first width (the generated tests exist
+        // only for formats with one).
+        let f = widths[0];
+        let h = 16;
         let down = weight(repr, h, f, 41, 1.0);
         let (rows, out_rows) = (3usize, vec![2, 0]);
         let mut rng = Rng::new(43);
@@ -3619,32 +3537,32 @@ fn dense_output_gguf_formats_at_32_granular_k_on(device: &Device) {
                 &bound,
             );
         }
-        for f in [704usize, 2112, 2688] {
-            let h = 72;
-            let down = weight(repr, h, f, 42 + f as u64, 1.0);
-            for rows in ROW_CLASSES {
-                let mut rng = Rng::new(rows as u64 + f as u64);
-                let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
-                let out_rows = (0..rows)
-                    .map(|i| ((i * 5 + 1) % rows) as i32)
-                    .collect::<Vec<_>>();
-                let product = (0..rows * f)
-                    .map(|_| act.round(rng.symmetric()))
-                    .collect::<Vec<_>>();
-                let (expected, bound) = under(out_rows.len(), || {
-                    dense_output_reference(act, &down, &residual, &product, &out_rows)
-                });
-                for mapping in MAPPINGS {
-                    let native = dense_output_native(
-                        &device, act, &down, &residual, rows, &product, &out_rows, mapping,
-                    );
-                    assert_within(
-                        &format!("dense_output {repr:?} K {f} M {rows} {mapping:?}"),
-                        &native,
-                        &expected,
-                        &bound,
-                    );
-                }
+    }
+    for f in widths {
+        let h = 72;
+        let down = weight(repr, h, f, 42 + f as u64, 1.0);
+        for rows in ROW_CLASSES {
+            let mut rng = Rng::new(rows as u64 + f as u64);
+            let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
+            let out_rows = (0..rows)
+                .map(|i| ((i * 5 + 1) % rows) as i32)
+                .collect::<Vec<_>>();
+            let product = (0..rows * f)
+                .map(|_| act.round(rng.symmetric()))
+                .collect::<Vec<_>>();
+            let (expected, bound) = under(out_rows.len(), || {
+                dense_output_reference(act, &down, &residual, &product, &out_rows)
+            });
+            for mapping in MAPPINGS {
+                let native = dense_output_native(
+                    &device, act, &down, &residual, rows, &product, &out_rows, mapping,
+                );
+                assert_within(
+                    &format!("dense_output {repr:?} K {f} M {rows} {mapping:?}"),
+                    &native,
+                    &expected,
+                    &bound,
+                );
             }
         }
     }
@@ -3748,81 +3666,76 @@ fn metal_dense_output_matrix_gemv_matches_the_host() {
     }
 }
 
-fn dense_output_matches_its_portable_body_and_the_host_reference_on(
-    device: &Device,
-    reprs: &[Repr],
-) {
+fn dense_output_matches_its_portable_body_and_the_host_reference_on(device: &Device, repr: Repr) {
     let module = module();
     let act = Act::Bf16;
-    for &repr in reprs {
-        // Portable body at small shapes.
-        let (h, f) = (40, 256);
-        let down = weight(repr, h, f, 31, 1.0);
-        for (rows, out_rows) in [
-            (3usize, vec![1, 2]),
-            (20, (0..16).map(|i| (i * 3 + 2) % 20).collect::<Vec<i32>>()),
-        ] {
-            let mut rng = Rng::new(rows as u64);
-            let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
-            let product = (0..out_rows.len() * f)
-                .map(|_| act.round(rng.symmetric()))
-                .collect::<Vec<_>>();
-            let outcome = interpret(
-                &module,
-                "dense_output",
-                &[("A", registry::dense(DType::BF16)), ("DW", repr.storage())],
-                vec![
-                    floats(&[rows, h], &residual),
-                    activations(act, &[out_rows.len(), f], &product),
-                    Input::Data(down.oracle()),
-                    ints(&[out_rows.len()], &out_rows),
-                    floats(&[0], &[]),
-                    // No packing bound.
-                    floats(&[0], &[]),
-                ],
+    // Portable body at small shapes.
+    let (h, f) = (40, 256);
+    let down = weight(repr, h, f, 31, 1.0);
+    for (rows, out_rows) in [
+        (3usize, vec![1, 2]),
+        (20, (0..16).map(|i| (i * 3 + 2) % 20).collect::<Vec<i32>>()),
+    ] {
+        let mut rng = Rng::new(rows as u64);
+        let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
+        let product = (0..out_rows.len() * f)
+            .map(|_| act.round(rng.symmetric()))
+            .collect::<Vec<_>>();
+        let outcome = interpret(
+            &module,
+            "dense_output",
+            &[("A", registry::dense(DType::BF16)), ("DW", repr.storage())],
+            vec![
+                floats(&[rows, h], &residual),
+                activations(act, &[out_rows.len(), f], &product),
+                Input::Data(down.oracle()),
+                ints(&[out_rows.len()], &out_rows),
+                floats(&[0], &[]),
+                // No packing bound.
+                floats(&[0], &[]),
+            ],
+        );
+        let oracle = result(&outcome, 0);
+        for mapping in MAPPINGS {
+            let (_, bound) = under(out_rows.len(), || {
+                dense_output_reference(act, &down, &residual, &product, &out_rows)
+            });
+            let native = dense_output_native(
+                &device, act, &down, &residual, rows, &product, &out_rows, mapping,
             );
-            let oracle = result(&outcome, 0);
-            for mapping in MAPPINGS {
-                let (_, bound) = under(out_rows.len(), || {
-                    dense_output_reference(act, &down, &residual, &product, &out_rows)
-                });
-                let native = dense_output_native(
-                    &device, act, &down, &residual, rows, &product, &out_rows, mapping,
-                );
-                assert_within(
-                    &format!("dense_output portable {repr:?} rows {rows} {mapping:?}"),
-                    &native,
-                    &oracle,
-                    &bound,
-                );
-            }
+            assert_within(
+                &format!("dense_output portable {repr:?} rows {rows} {mapping:?}"),
+                &native,
+                &oracle,
+                &bound,
+            );
         }
-        // Host reference over the row classes, with a row tail (H = 300).
-        let (h, f) = (300, 1024);
-        let down = weight(repr, h, f, 32, 1.0);
-        for rows in ROW_CLASSES {
-            let mut rng = Rng::new(rows as u64 + 100);
-            let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
-            let out_rows = (0..rows)
-                .map(|i| ((i * 5 + 1) % rows) as i32)
-                .collect::<Vec<_>>();
-            let product = (0..rows * f)
-                .map(|_| act.round(rng.symmetric()))
-                .collect::<Vec<_>>();
-            for mapping in MAPPINGS {
-                let (expected, bound) = under(out_rows.len(), || {
-                    dense_output_reference(act, &down, &residual, &product, &out_rows)
-                });
-                let native = dense_output_native(
-                    &device, act, &down, &residual, rows, &product, &out_rows, mapping,
-                );
-                assert_within(
-                    &format!("dense_output {repr:?} M {rows} {mapping:?}"),
-                    &native,
-                    &expected,
-                    &bound,
-                );
-            }
+    }
+    // Host reference over the row classes, with a row tail (H = 300).
+    let (h, f) = (300, 1024);
+    let down = weight(repr, h, f, 32, 1.0);
+    for rows in ROW_CLASSES {
+        let mut rng = Rng::new(rows as u64 + 100);
+        let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
+        let out_rows = (0..rows)
+            .map(|i| ((i * 5 + 1) % rows) as i32)
+            .collect::<Vec<_>>();
+        let product = (0..rows * f)
+            .map(|_| act.round(rng.symmetric()))
+            .collect::<Vec<_>>();
+        for mapping in MAPPINGS {
+            let (expected, bound) = under(out_rows.len(), || {
+                dense_output_reference(act, &down, &residual, &product, &out_rows)
+            });
+            let native = dense_output_native(
+                &device, act, &down, &residual, rows, &product, &out_rows, mapping,
+            );
+            assert_within(
+                &format!("dense_output {repr:?} M {rows} {mapping:?}"),
+                &native,
+                &expected,
+                &bound,
+            );
         }
     }
 }
@@ -3998,7 +3911,12 @@ fn recurrent_project_cases_on(device: &Device, cases: Cases) {
     // the decode and verify rows with the decode mapping; each with its qkv,
     // gate, alpha and beta representations.
     let k_quants = [Repr::Q5k, Repr::Q4k, Repr::Q8, Repr::Q8];
-    let iq4_blocks = [Repr::Iq4g32s, Repr::Q4g32s, Repr::Iq4g32s, Repr::Q8];
+    let iq4_blocks = [
+        Repr::gguf(Encoding::Iq4Nl),
+        Repr::gguf(Encoding::Q4_0),
+        Repr::gguf(Encoding::Iq4Nl),
+        Repr::Q8,
+    ];
     let geometries = match cases {
         Cases::Scoped => vec![(256usize, 1usize, 1usize, 64usize, false, k_quants)],
         Cases::Checked => vec![
@@ -4207,10 +4125,10 @@ fn recurrent_output_cases_on(device: &Device, scoped: bool) {
                         OW: repr.resident(&device),
                         A: act.element(),
                     },
-                    &attention_output_specialization_on(
+                    &with_matrix::<attention_output::Entry>(
                         device,
-                        &[("D", h), ("Q", nv), ("W", w)],
-                        mapping,
+                        attention_output_specialization_on(device, &[("D", h), ("Q", nv), ("W", w)], mapping),
+                        &[("OW", repr.resident(&device)), ("A", act.element())],
                     ),
                 )
                 .unwrap();
@@ -4361,7 +4279,11 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
     // the decode and verify rows with the decode mapping; each with its
     // query, key and value representations.
     let k_quants = [Repr::Q4k, Repr::Q4k, Repr::Q6k];
-    let iq4_blocks = [Repr::Iq4g32s, Repr::Q8, Repr::Iq4g32s];
+    let iq4_blocks = [
+        Repr::gguf(Encoding::Iq4Nl),
+        Repr::Q8,
+        Repr::gguf(Encoding::Iq4Nl),
+    ];
     let geometries = match cases {
         Cases::Scoped => vec![(256usize, 1usize, 4usize, 64usize, false, k_quants)],
         Cases::Checked => vec![
@@ -4539,7 +4461,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
         let reprs: &[Repr] = if four_b || scoped {
             &[Repr::Q4k]
         } else if cases == Cases::Iq4Blocks {
-            &[Repr::Iq4g32s]
+            &[Repr::gguf(Encoding::Iq4Nl)]
         } else {
             &[Repr::Q4k, Repr::Q8, Repr::Bf16]
         };
@@ -4553,10 +4475,10 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                         A: act.element(),
                         OW: repr.resident(&device),
                     },
-                    &attention_output_specialization_on(
+                    &with_matrix::<attention_output::Entry>(
                         device,
-                        &[("D", d_out), ("Q", q), ("W", w)],
-                        mapping,
+                        attention_output_specialization_on(device, &[("D", d_out), ("Q", q), ("W", w)], mapping),
+                        &[("A", act.element()), ("OW", repr.resident(&device))],
                     ),
                 )
                 .unwrap();
@@ -4680,7 +4602,11 @@ fn scaled_projections_on(device: &Device) {
     let rows_classes = [1usize, 2, 8, 17, 64, 128];
     let mappings = [MAPPINGS[0], MAPPINGS[2]];
     let metal = device.backend() == BackendName::Metal;
-    for repr in [Repr::Nvfp4, Repr::Nvfp4A4, Repr::Q4k] {
+    for repr in [
+        Repr::Gguf(Format::NVFP4),
+        Repr::Gguf(Format::NVFP4_A4),
+        Repr::Q4k,
+    ] {
         let projections = [301, 311, 312, 313]
             .into_iter()
             .zip(segments)
@@ -4751,6 +4677,11 @@ fn scaled_projections_on(device: &Device) {
                     device,
                     &[("D", d), ("Q", heads), ("W", width), ("OS", 1)],
                     mapping,
+                );
+                let specialization = with_matrix::<attention_output::Entry>(
+                    device,
+                    specialization,
+                    &[("OW", repr.resident(device)), ("A", act.element())],
                 );
                 let out = attention_output::native_for_device_with(
                     device,
@@ -5062,7 +4993,13 @@ fn metal_head_logits_scoped_launches_match_the_host() {
 #[test]
 fn draft_head_logits_match_the_host_at_head_widths() {
     for device in devices() {
-        for repr in [Repr::Q4g32s, Repr::Q4k, Repr::Q6k, Repr::Q8, Repr::Bf16] {
+        for repr in [
+            Repr::gguf(Encoding::Q4_0),
+            Repr::Q4k,
+            Repr::Q6k,
+            Repr::Q8,
+            Repr::Bf16,
+        ] {
             for d in [1024, 1536, 9472] {
                 head_logits_match_the_host(&device, repr, (40, d), &[1, 3], &MAPPINGS[..2]);
             }
@@ -5263,6 +5200,11 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                 } else {
                     specialization
                 };
+                let specialization = with_matrix::<readout_head_rows::Entry>(
+                    &device,
+                    specialization,
+                    &[("NW", Element::bf16()), ("OW", repr.resident(&device)), ("A", act.element())],
+                );
                 let head_native = readout_head_rows::native_for_device_with(
                     &device,
                     readout_head_rows::Elements {
@@ -5515,44 +5457,55 @@ fn embedding_rows_read_the_slots_their_directory_names() {
     }
 }
 
+/// Dense bf16 tables (the GGUF formats: `gguf::<format>::`).
 #[test]
-fn embedding_rows_decode_exactly_as_the_portable_body() {
+fn bf16_embedding_rows_decode_exactly_as_the_portable_body() {
     for device in devices() {
-        embedding_rows_decode_exactly_as_the_portable_body_on(&device);
+        embedding_rows_decode_exactly_as_the_portable_body_on(&device, Repr::Bf16);
     }
 }
 
-fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
+/// A gather of `repr` rows decodes them exactly as the portable body.
+fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device, repr: Repr) {
     let module = module();
     let act = Act::Bf16;
     let (v, d) = (300usize, 2560usize);
-    // Every format's table, the GGUF formats' of 256-value blocks included;
-    // a gather takes no activation operands, so each storage once.
-    let gguf = GGUF_REPRS
-        .into_iter()
-        .filter(|repr| repr.element().operand_recipe() == registry::OperandRecipe::Rounded);
-    for repr in [
-        Repr::Q6k,
-        Repr::Q4k,
-        Repr::Q5k,
-        Repr::Q8,
-        Repr::Iq4,
-        Repr::Bf16,
-    ]
-    .into_iter()
-    .chain(gguf)
-    {
-        let table = weight(repr, v, d, 90, 8.0);
-        for rows in [1usize, 3, 8, 64] {
-            let tokens = (0..rows)
-                .map(|i| ((i * 97 + 5) % v) as i32)
-                .collect::<Vec<_>>();
-            // (token, status) rows, the `sample_rows` result layout.
-            let pairs = tokens
-                .iter()
-                .flat_map(|token| [*token, 0])
-                .collect::<Vec<_>>();
-            let out = embedding_rows::native_for_device_with(
+    let table = weight(repr, v, d, 90, 8.0);
+    for rows in [1usize, 3, 8, 64] {
+        let tokens = (0..rows)
+            .map(|i| ((i * 97 + 5) % v) as i32)
+            .collect::<Vec<_>>();
+        // (token, status) rows, the `sample_rows` result layout.
+        let pairs = tokens
+            .iter()
+            .flat_map(|token| [*token, 0])
+            .collect::<Vec<_>>();
+        let out = embedding_rows::native_for_device_with(
+            &device,
+            embedding_rows::Elements {
+                EW: repr.resident(&device),
+                A: act.element(),
+            },
+            &statics_on(device, &[("D", d)]),
+        )
+        .unwrap()
+        .call(embedding_rows::Args {
+            table: &table.tensor(&device),
+            tokens: &i32_tensor(&device, &[rows, 2], &pairs),
+            directory: &i32_tensor(&device, &[0, 1], &[]),
+            scale: 1.0,
+            normalize: 0,
+            epsilon: 0.0,
+        })
+        .unwrap();
+        let expected = tokens
+            .iter()
+            .flat_map(|t| table.row(*t as usize).iter().map(|value| act.round(*value)))
+            .collect::<Vec<_>>();
+        // The scaled (Gemma, √D) and normalized (Muse, weightless RMS)
+        // forms: the square sum reassociates, so within an A rounding.
+        for (scale, normalize) in [(39.191835f32, 0), (1.0, 1)] {
+            let transformed = embedding_rows::native_for_device_with(
                 &device,
                 embedding_rows::Elements {
                     EW: repr.resident(&device),
@@ -5565,101 +5518,109 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
                 table: &table.tensor(&device),
                 tokens: &i32_tensor(&device, &[rows, 2], &pairs),
                 directory: &i32_tensor(&device, &[0, 1], &[]),
-                scale: 1.0,
-                normalize: 0,
-                epsilon: 0.0,
+                scale,
+                normalize,
+                epsilon: 1e-5,
             })
             .unwrap();
-            let expected = tokens
+            let (values, bound): (Vec<f32>, Vec<f32>) = tokens
                 .iter()
-                .flat_map(|t| table.row(*t as usize).iter().map(|value| act.round(*value)))
-                .collect::<Vec<_>>();
-            // The scaled (Gemma, √D) and normalized (Muse, weightless RMS)
-            // forms: the square sum reassociates, so within an A rounding.
-            for (scale, normalize) in [(39.191835f32, 0), (1.0, 1)] {
-                let transformed = embedding_rows::native_for_device_with(
-                    &device,
-                    embedding_rows::Elements {
-                        EW: repr.resident(&device),
-                        A: act.element(),
-                    },
-                    &statics_on(device, &[("D", d)]),
-                )
-                .unwrap()
-                .call(embedding_rows::Args {
-                    table: &table.tensor(&device),
-                    tokens: &i32_tensor(&device, &[rows, 2], &pairs),
-                    directory: &i32_tensor(&device, &[0, 1], &[]),
-                    scale,
-                    normalize,
-                    epsilon: 1e-5,
-                })
-                .unwrap();
-                let (values, bound): (Vec<f32>, Vec<f32>) = tokens
-                    .iter()
-                    .flat_map(|t| {
-                        let row = table
-                            .row(*t as usize)
+                .flat_map(|t| {
+                    let row = table
+                        .row(*t as usize)
+                        .iter()
+                        .map(|v| v * scale)
+                        .collect::<Vec<_>>();
+                    let inverse = if normalize != 0 {
+                        let squares = row
                             .iter()
-                            .map(|v| v * scale)
-                            .collect::<Vec<_>>();
-                        let inverse = if normalize != 0 {
-                            let squares = row
-                                .iter()
-                                .map(|v| f64::from(*v) * f64::from(*v))
-                                .sum::<f64>();
-                            (1.0 / (squares / d as f64 + 1e-5).sqrt()) as f32
-                        } else {
-                            1.0
-                        };
-                        row.into_iter()
-                            .map(move |v| (act.round(v * inverse), (v * inverse).abs() / 128.0))
-                            .collect::<Vec<_>>()
-                    })
-                    .unzip();
-                assert_within(
-                    &format!("embedding {repr:?} rows {rows} scale {scale} normalize {normalize}"),
-                    &read_act(act, &transformed.r0),
-                    &values,
-                    &bound,
-                );
-            }
-            let exact = vec![0.0; expected.len()];
+                            .map(|v| f64::from(*v) * f64::from(*v))
+                            .sum::<f64>();
+                        (1.0 / (squares / d as f64 + 1e-5).sqrt()) as f32
+                    } else {
+                        1.0
+                    };
+                    row.into_iter()
+                        .map(move |v| (act.round(v * inverse), (v * inverse).abs() / 128.0))
+                        .collect::<Vec<_>>()
+                })
+                .unzip();
             assert_within(
-                &format!("embedding {repr:?} rows {rows} (A)"),
-                &read_act(act, &out.r0),
+                &format!("embedding {repr:?} rows {rows} scale {scale} normalize {normalize}"),
+                &read_act(act, &transformed.r0),
+                &values,
+                &bound,
+            );
+        }
+        let exact = vec![0.0; expected.len()];
+        assert_within(
+            &format!("embedding {repr:?} rows {rows} (A)"),
+            &read_act(act, &out.r0),
+            &expected,
+            &exact,
+        );
+        assert_within(
+            &format!("embedding {repr:?} rows {rows} (F32)"),
+            &read_f32(&out.r1),
+            &expected,
+            &exact,
+        );
+        if rows == 3 {
+            let outcome = interpret(
+                &module,
+                "embedding_rows",
+                &[("EW", repr.storage()), ("A", registry::dense(DType::BF16))],
+                vec![
+                    Input::Data(table.oracle()),
+                    ints(&[rows, 2], &pairs),
+                    ints(&[0, 1], &[]),
+                    Input::F32(1.0),
+                    Input::I32(0),
+                    Input::F32(0.0),
+                ],
+            );
+            assert_within(
+                &format!("embedding {repr:?} portable"),
+                &result(&outcome, 1),
                 &expected,
                 &exact,
             );
-            assert_within(
-                &format!("embedding {repr:?} rows {rows} (F32)"),
-                &read_f32(&out.r1),
-                &expected,
-                &exact,
-            );
-            if rows == 3 {
-                let outcome = interpret(
-                    &module,
-                    "embedding_rows",
-                    &[("EW", repr.storage()), ("A", registry::dense(DType::BF16))],
-                    vec![
-                        Input::Data(table.oracle()),
-                        ints(&[rows, 2], &pairs),
-                        ints(&[0, 1], &[]),
-                        Input::F32(1.0),
-                        Input::I32(0),
-                        Input::F32(0.0),
-                    ],
-                );
-                assert_within(
-                    &format!("embedding {repr:?} portable"),
-                    &result(&outcome, 1),
-                    &expected,
-                    &exact,
-                );
-            }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// GGUF formats: a module of tests a format (`gguf::<format>::`), generated
+// from the registry.
+
+fn dense_output_matches_its_portable_body_and_the_host_reference(format: Format) {
+    for device in devices() {
+        dense_output_matches_its_portable_body_and_the_host_reference_on(&device, Repr::of(format));
+    }
+}
+
+fn dense_output_at_partial_block_widths(format: Format) {
+    for device in devices() {
+        dense_output_at_partial_block_widths_on(&device, format);
+    }
+}
+
+fn embedding_rows_decode_exactly_as_the_portable_body(format: Format) {
+    for device in devices() {
+        embedding_rows_decode_exactly_as_the_portable_body_on(&device, Repr::of(format));
+    }
+}
+
+gguf_format_tests! {
+    rows16;
+    every: [dense_output_matches_its_portable_body_and_the_host_reference];
+    partial_block: [dense_output_at_partial_block_widths];
+    own_storage: [
+        embedding_rows_decode_exactly_as_the_portable_body
+        metal_tall_and_packed_project_rows_agree_with_the_staged_form
+        metal_packed_dense_output_agrees_with_the_staged_form
+        packing_bound_matches_its_portable_body
+    ];
 }
 
 /// Matrix column gathering preserves the rounded projection, convolution,
@@ -5779,6 +5740,18 @@ fn metal_convolved_matrix_columns_match_host() {
                         .with_launch_param(launch, "ROWS", 2)
                         .with_launch_param(launch, "LANES", 16);
                 }
+                let spec = with_matrix::<gated_delta_project_convolved::Entry>(
+                    &device,
+                    spec,
+                    &[
+                        ("NW", act.element()),
+                        ("QW", reprs[0].resident(&device)),
+                        ("GW", reprs[1].resident(&device)),
+                        ("AW", reprs[2].resident(&device)),
+                        ("BW", reprs[3].resident(&device)),
+                        ("A", act.element()),
+                    ],
+                );
                 let output = gated_delta_project_convolved::native_for_device_with(
                     &device,
                     gated_delta_project_convolved::Elements {
@@ -5989,10 +5962,10 @@ fn metal_attention_output_matrix_matches_host() {
                             A: act.element(),
                             OW: repr.resident(&device),
                         },
-                        &attention_output_specialization_on(
+                        &with_matrix::<attention_output::Entry>(
                             &device,
-                            &[("D", d), ("Q", q), ("W", w)],
-                            mapping,
+                            attention_output_specialization_on(&device, &[("D", d), ("Q", q), ("W", w)], mapping),
+                            &[("A", act.element()), ("OW", repr.resident(&device))],
                         ),
                     )
                     .unwrap();
@@ -6031,8 +6004,8 @@ fn metal_q4_verify_rows_match_host() {
     };
     let act = Act::Bf16;
     let (h, f) = (2560, 131);
-    let gate = weight(Repr::Q4g32s, f, h, 61, 1.0);
-    let up = weight(Repr::Q4g32s, f, h, 62, 1.0);
+    let gate = weight(Repr::gguf(Encoding::Q4_0), f, h, 61, 1.0);
+    let up = weight(Repr::gguf(Encoding::Q4_0), f, h, 62, 1.0);
     let norm = norm_values(h, 63);
     for rows in [2usize, 4, 8, 16] {
         let source = uniform_values(rows * h, rows as u64, 1.0)
@@ -6150,13 +6123,17 @@ fn metal_normalize_prepass_matches_small_row_tree() {
                 OW: Element::bf16(),
                 A: Element::bf16(),
             },
-            &readout_head_specialization_on(
+            &with_matrix::<readout_head_rows::Entry>(
                 &device,
-                &[("D", h), ("V", h), ("WS", 0)],
-                Mapping {
-                    batch_from: 5,
-                    ..gemm_mapping(64, 64, 1)
-                },
+                readout_head_specialization_on(
+                    &device,
+                    &[("D", h), ("V", h), ("WS", 0)],
+                    Mapping {
+                        batch_from: 5,
+                        ..gemm_mapping(64, 64, 1)
+                    },
+                ),
+                &[("NW", Element::bf16()), ("OW", Element::bf16()), ("A", Element::bf16())],
             ),
         )
         .unwrap()

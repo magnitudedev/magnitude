@@ -60,19 +60,21 @@ native packing_bound for metal from "metal/packing_bound.metal":
 fn repack_weight[B, N, K](source: &tensor[B, N, K] E) -> tensor[B, N, K] U:
     return repack[U = U](source)
 
-# Metal: each threadgroup (32 threads) converts one 16-row by 32-column tile;
-# the grid covers whole 32-row tiles, which `rows32` stores in full.
+# Metal: each threadgroup (32 threads) converts one 16-row tile of a
+# conversion unit's columns (`unit_columns(U)`, 32 or more, dividing every
+# group and so 256); the grid covers whole 32-row tiles, which `rows32` stores
+# in full.
 native repack_weight for metal from "metal/repack_weight.metal":
     launch repack_weight:
-        threadgroups (ceil_div(K, 256) * 8, ceil_div(N, 32) * 2, B)
+        threadgroups (ceil_div(K, 256) * (256 / unit_columns(U)), ceil_div(N, 32) * 2, B)
         threads_per_threadgroup (32, 1, 1)
 
-# CUDA: each threadgroup, one warp, converts one 16-row by 32-column tile, a
-# lane per row (the other 16 lanes help stage and store), so it runs one
-# stream of compile-time record words.
+# CUDA: each threadgroup, one warp, converts one 16-row tile of a conversion
+# unit's columns (`unit_columns(U)`), a lane per row (the other 16 lanes help
+# stage and store), so it runs one stream of compile-time record words.
 native repack_weight for cuda from "cuda/repack_weight.cu":
     launch repack_weight:
-        threadgroups (ceil_div(K, 256) * 8, ceil_div(N, 16), B)
+        threadgroups (ceil_div(K, 256) * (256 / unit_columns(U)), ceil_div(N, 16), B)
         threads_per_threadgroup (32, 1, 1)
 
 # CPU: each work item converts one eight-row tile within one [N, K]
@@ -97,10 +99,11 @@ native import_dense for cpu from "cpu/import_dense.rs":
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (K * 4)
 
-# Vulkan: one workgroup converts one 16-row by 32-column tile into rows16 (the
-# Vulkan resident layout). N / 16 stays below 65535 for every model weight
-# (the largest, the 248320-row head, gives 15520).
+# Vulkan: one workgroup converts one 16-row tile of a conversion unit's
+# columns (`unit_columns(U)`) into rows16 (the Vulkan resident layout).
+# N / 16 stays below 65535 for every model weight (the largest, the
+# 248320-row head, gives 15520).
 native repack_weight for vulkan from "vulkan/repack_weight.comp":
     launch repack_weight:
-        threadgroups (ceil_div(K, 256) * 8, ceil_div(N, 16), B)
+        threadgroups (ceil_div(K, 256) * (256 / unit_columns(U)), ceil_div(N, 16), B)
         threads_per_threadgroup (32, 1, 1)

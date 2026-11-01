@@ -48,6 +48,14 @@ pub(super) fn read_component<B: PhysicalDialect>(
                 let scalar = reference_math::code_recipe(interpretation, *bits);
                 super::reference_math::expand_total_recipe(builder, &scalar, &[get(*raw)])
             }
+            DecodeStep::SignedCode { code, raw, bit, .. } => {
+                let scalar = reference_math::signed_code_recipe(*bit);
+                super::reference_math::expand_total_recipe(
+                    builder,
+                    &scalar,
+                    &[get(*code), get(*raw)],
+                )
+            }
             DecodeStep::ReadPlaneLane { plane, .. } => {
                 builder.read_plane_lane(place, indices, *plane)
             }
@@ -60,6 +68,22 @@ pub(super) fn read_component<B: PhysicalDialect>(
                     &scalar,
                     &[get(*raw), get(*lane)],
                 )
+            }
+            DecodeStep::InterpretDigitCode {
+                raw,
+                digit,
+                interpretation,
+                ..
+            } => {
+                let scalar = reference_math::digit_recipe();
+                let digit = super::reference_math::expand_total_recipe(
+                    builder,
+                    &scalar,
+                    &[get(*raw), get(*digit)],
+                );
+                let scalar =
+                    reference_math::code_recipe(interpretation, seismic_lang::registry::DIGIT_BITS);
+                super::reference_math::expand_total_recipe(builder, &scalar, &[digit])
             }
             DecodeStep::DecodeFloatCode { raw, format, .. } => {
                 let scalar = reference_math::float_code_recipe(*format);

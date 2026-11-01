@@ -64,6 +64,26 @@ them a row at a time (decode per packet or per run of packets; the int8 and pack
 row and 256-column block in a pre-pass that writes its own table), so inside the tile each row's
 coefficients are contiguous, the rows one after another, as in row order.
 
+Base-3 digit planes (`b3g256`, GGUF TQ1_0) are codes but no column's bits: a byte holds five
+values' digits, in runs that put a byte's digits 32 or 16 columns apart. A lane can only read such
+a byte once if it decodes every value the byte holds, so the unit of a digits layout is the
+storage group (256 values), not a column unit:
+
+- **CUDA (`mma16`).** A tile's digits are in fragment-lane order: the 16 rows' plane slots are one
+  sequence of 16-byte chunks dealt to the rows in turn, and each group's 16 shares hold, per lane,
+  the bytes of its fragment k of rows g and g + 8, two 16-byte segments to one 16-byte unit. A
+  lane's superblock is one 16-, one 8- and one 4-byte load (against 14 two-byte loads over eight
+  rows in row order), and the GEMM stages a tile's group once per superblock with its records.
+- **Metal (`rows32`).** Each row keeps its groups' bytes whole and in order, so a lane that owns a
+  whole group (a span of 8 packets) reads one contiguous run of its row and decodes every byte
+  once. Digit n of a byte is read from its remainder `(b R^n) mod 256`, one product by `R^n`
+  (`remainders`); a span's integer pairs take that remainder by a chain of n products by R
+  (`chain`) instead, measured 1.4% faster there (M4 Pro, b3g256 at eight rows). The GEMV and the
+  batched GEMV give their lanes spans; the GEMV stages the activations span-interleaved, so the
+  lanes of a group, each at the same step of its own span, read consecutive words. A lane that
+  owns single packets would read each byte once per digit: a packet's 32 values are one digit of
+  32 bytes.
+
 | Backend primitive | Weights side | A lane's load |
 | --- | --- | --- |
 | Metal tensor operations (M6), 16 × 32 fragments | left | 8 bytes of one row, two rows per fragment |

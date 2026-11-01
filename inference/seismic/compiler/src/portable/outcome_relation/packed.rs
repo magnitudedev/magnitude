@@ -54,6 +54,10 @@ impl Analysis<'_> {
                 } => {
                     self.total_recipe(&reference::code_recipe(interpretation, *bits), &[get(*raw)])?
                 }
+                DecodeStep::SignedCode { code, raw, bit, .. } => self.total_recipe(
+                    &reference::signed_code_recipe(*bit),
+                    &[get(*code), get(*raw)],
+                )?,
                 DecodeStep::ReadPlaneLane { plane, .. } => {
                     self.plane_lane(view, indices, *plane, state)?
                 }
@@ -61,6 +65,19 @@ impl Analysis<'_> {
                     raw, lane, grid, ..
                 } => {
                     self.total_recipe(&reference::grid_code_recipe(grid), &[get(*raw), get(*lane)])?
+                }
+                DecodeStep::InterpretDigitCode {
+                    raw,
+                    digit,
+                    interpretation,
+                    ..
+                } => {
+                    let digit =
+                        self.total_recipe(&reference::digit_recipe(), &[get(*raw), get(*digit)])?;
+                    self.total_recipe(
+                        &reference::code_recipe(interpretation, registry::DIGIT_BITS),
+                        &[digit],
+                    )?
                 }
                 DecodeStep::DecodeFloatCode { raw, format, .. } => {
                     self.total_recipe(&reference::float_code_recipe(*format), &[get(*raw)])?

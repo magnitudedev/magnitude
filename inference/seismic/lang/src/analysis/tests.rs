@@ -175,7 +175,14 @@ fn dense_expand_weights_are_packed_planes_and_its_row_table_is_discrete() {
 fn attention_project_classifies_each_weight_by_its_own_representation() {
     let entry = kernel(
         "attention_project",
-        &[("NW", "f32"), ("QW", "q4k"), ("GW", "q8g32s"), ("KW", "iq4g32"), ("VW", "bf16"), ("A", "bf16")],
+        &[
+            ("NW", "f32"),
+            ("QW", "q4k"),
+            ("GW", "q8g32s"),
+            ("KW", "iq4g32s"),
+            ("VW", "bf16"),
+            ("A", "bf16"),
+        ],
     );
     let analysis = analyze(&entry);
     assert_eq!(
@@ -211,7 +218,7 @@ fn attention_project_classifies_each_weight_by_its_own_representation() {
         &Stored::Packed {
             planes: vec![
                 plane(PlaneField::Words, 1, 1, Lattice::Codes(levels.clone())),
-                plane(PlaneField::Scale, 32, 1, Lattice::Float(DType::F32)),
+                plane(PlaneField::Scale, 32, 1, Lattice::Float(DType::F16)),
             ]
         }
     );
@@ -440,9 +447,16 @@ fn every_packed_representation_has_one_grid_per_code_it_stores() {
         }
         let (planes, grids) = packed(info.id, "w", Vec::new());
         assert!(matches!(planes[0].lattice, Lattice::Codes(_)), "{}", info.name);
+        let recipe = registry::decode_recipe(info.id, info.decoded).unwrap();
         for plane in &planes {
             let codes = grids.iter().filter(|grid| grid.plane.is_some_and(|(field, _)| field == plane.field));
+            // A value reads one byte of a digits plane's group.
+            let digits = recipe.planes().iter().any(|schema| {
+                schema.field == plane.field
+                    && matches!(schema.encoding, registry::PlaneEncoding::Digits { .. })
+            });
             let expected = match plane.lattice {
+                Lattice::Codes(_) if digits => 1,
                 Lattice::Codes(_) => plane.fields as usize,
                 Lattice::Float(_) => 0,
             };

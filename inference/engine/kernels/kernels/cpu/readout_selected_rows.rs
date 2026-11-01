@@ -34,7 +34,7 @@ fn readout_selected_rows_normalize<L: Isa, E: Elements>(
         let q8 = unsafe {
             cx.scratch_quantized()
                 .slice_mut::<seismic::cpu::quant::Q8Block>(
-                    row * blocks * projection::Q8_BYTES,
+                    row * blocks * seismic::cpu::quant::Q8_BYTES,
                     blocks,
                 )
         };

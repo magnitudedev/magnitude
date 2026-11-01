@@ -13,8 +13,8 @@
 use crate::isa::Tier;
 use crate::quant::Q8Block;
 use crate::weights::{
-    self, codes, scales, Carried, DenseRows, Direct, Format, Grid, Hier, PackedRows, Planes,
-    RowGeometry, Scales,
+    self, codes, scales, Carried, Delta, DenseRows, Digits, Direct, Format, Grid, Hier, Minimum,
+    NoDelta, PackedRows, Planes, RowGeometry, Scales, SignedBias, Unbiased,
 };
 use seismic_lang::ids::RepresentationId;
 #[cfg(test)]
@@ -160,11 +160,7 @@ macro_rules! tier_components {
                 out: *mut f32,
             ) {
                 let out = unsafe { std::slice::from_raw_parts_mut(out, k) };
-                unsafe {
-                    weights::decode_row::<W, { Tier::$tier.quantized_dots() }>(
-                        row, geometry, k, out,
-                    )
-                }
+                unsafe { weights::decode_row::<W, crate::isa::$tier>(row, geometry, k, out) }
             }
 
             /// Every block of `R` rows of `rows` rows dotted with `x`, the
@@ -181,7 +177,7 @@ macro_rules! tier_components {
             ) {
                 for first in (0..rows).step_by(R) {
                     let result = unsafe {
-                        weights::dot_rows::<W, R, { Tier::$tier.quantized_dots() }>(
+                        weights::dot_rows::<W, R, crate::isa::$tier>(
                             data.add(first * geometry.stride),
                             geometry,
                             x,
@@ -206,11 +202,8 @@ macro_rules! tier_components {
                 out: *mut f32,
             ) {
                 let x = unsafe { std::slice::from_raw_parts(x, k) };
-                let result = unsafe {
-                    weights::dot_rows::<W, R, { Tier::$tier.quantized_dots() }>(
-                        rows, geometry, x, k,
-                    )
-                };
+                let result =
+                    unsafe { weights::dot_rows::<W, R, crate::isa::$tier>(rows, geometry, x, k) };
                 unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, R) };
             }
 
@@ -224,9 +217,7 @@ macro_rules! tier_components {
             ) {
                 let x = unsafe { std::slice::from_raw_parts(x, crate::quant::blocks(k)) };
                 let result = unsafe {
-                    weights::dot_q8_rows::<W, R, { Tier::$tier.quantized_dots() }>(
-                        rows, geometry, x, k,
-                    )
+                    weights::dot_q8_rows::<W, R, crate::isa::$tier>(rows, geometry, x, k)
                 };
                 unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, R) };
             }
@@ -242,11 +233,8 @@ macro_rules! tier_components {
                 out: *mut f32,
             ) {
                 let x = unsafe { std::slice::from_raw_parts(x, 4 * crate::quant::blocks(k)) };
-                let accumulators = unsafe {
-                    weights::gemm_q8_rows::<W, { Tier::$tier.quantized_dots() }>(
-                        rows, geometry, x, k,
-                    )
-                };
+                let accumulators =
+                    unsafe { weights::gemm_q8_rows::<W, crate::isa::$tier>(rows, geometry, x, k) };
                 unsafe {
                     std::ptr::copy_nonoverlapping(accumulators.as_ptr().cast::<f32>(), out, 32)
                 };
@@ -332,32 +320,37 @@ pub(crate) fn resolve(tier: Tier, element: RepresentationId) -> Option<&'static 
         .find(|kernels| kernels.tier == tier)
 }
 
-/// Compiled component instances in this build: decode, dot and quantized dot
-/// instances of every component on every tier of the architecture.
-pub fn instances() -> usize {
-    TABLES.len() * COMPONENTS * (2 + 2 * ROW_BLOCKS.len())
-}
-
-/// The recorded ceiling on compiled component instances. Raising it is a
-/// reviewed change with a stated reason (see the CPU authoring design).
-pub const INSTANCE_CEILING: usize = 1_000;
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::element::{f32_to_bf16, f32_to_f16};
     use seismic_lang::registry::{
-        self, CoefficientAxes, Layout, RepresentationKind, RowPlaneRole,
+        self, CodingAxes, Layout, RepresentationKind, RowPlaneRole,
     };
     use seismic_lang::types::DType;
 
+    /// A cross-check of build.rs's deduplication: the components it emits
+    /// are as many as the distinct decodes (a dense element's dtype, a
+    /// packed storage's decode axes and storage group) of the elements that
+    /// have one, each compiled once per tier, row block and body.
     #[test]
-    fn instance_count_stays_under_the_ceiling() {
-        assert!(
-            instances() <= INSTANCE_CEILING,
-            "{} component instances",
-            instances()
-        );
+    fn components_are_the_distinct_decodes_of_the_elements() {
+        let mut decodes: Vec<(Option<DType>, Option<(registry::DecodeAxes, u32)>)> = Vec::new();
+        for name in elements() {
+            let info = registry::representation_info(registry::representation(name).unwrap());
+            let decode = match &info.kind {
+                RepresentationKind::Dense(dtype) => (Some(*dtype), None),
+                RepresentationKind::PackedRows(rows) => (
+                    None,
+                    Some((registry::decode_axes(info.id).unwrap(), rows.group())),
+                ),
+                _ => unreachable!("`{name}` is a dense or packed rows element"),
+            };
+            if !decodes.contains(&decode) {
+                decodes.push(decode);
+            }
+        }
+        assert_eq!(decodes.len(), COMPONENTS);
     }
 
     #[test]
@@ -391,6 +384,62 @@ mod tests {
             .collect()
     }
 
+    /// One line of a [`Placed`] buffer.
+    #[derive(Clone, Copy)]
+    #[repr(C, align(256))]
+    struct Line([u8; crate::tensor::BUFFER_ALIGNMENT]);
+
+    const _: () = assert!(std::mem::align_of::<Line>() == crate::tensor::BUFFER_ALIGNMENT);
+
+    /// Values placed as a launch's buffers are (`tensor::BUFFER_ALIGNMENT`),
+    /// so a measurement's vector accesses line up as they do in a launch,
+    /// wherever the allocator puts the storage.
+    pub(crate) struct Placed<T> {
+        lines: Vec<Line>,
+        len: usize,
+        values: std::marker::PhantomData<T>,
+    }
+
+    impl<T: Copy> Placed<T> {
+        /// `len` zero values.
+        fn zeroed(len: usize) -> Self {
+            let lines = (len * std::mem::size_of::<T>()).div_ceil(crate::tensor::BUFFER_ALIGNMENT);
+            Self {
+                lines: vec![Line([0; crate::tensor::BUFFER_ALIGNMENT]); lines],
+                len,
+                values: std::marker::PhantomData,
+            }
+        }
+
+        /// A copy of `values`.
+        fn of(values: &[T]) -> Self {
+            let mut placed = Self::zeroed(values.len());
+            placed.copy_from_slice(values);
+            placed
+        }
+    }
+
+    impl<'a, T: Copy> IntoIterator for &'a Placed<T> {
+        type Item = &'a T;
+        type IntoIter = std::slice::Iter<'a, T>;
+        fn into_iter(self) -> Self::IntoIter {
+            self.iter()
+        }
+    }
+
+    impl<T: Copy> std::ops::Deref for Placed<T> {
+        type Target = [T];
+        fn deref(&self) -> &[T] {
+            unsafe { std::slice::from_raw_parts(self.lines.as_ptr().cast(), self.len) }
+        }
+    }
+
+    impl<T: Copy> std::ops::DerefMut for Placed<T> {
+        fn deref_mut(&mut self) -> &mut [T] {
+            unsafe { std::slice::from_raw_parts_mut(self.lines.as_mut_ptr().cast(), self.len) }
+        }
+    }
+
     /// The components of the element named `name` on `tier`.
     fn kernels_of(tier: Tier, name: &str) -> &'static WeightKernels {
         resolve(tier, registry::representation(name).unwrap()).unwrap()
@@ -401,7 +450,7 @@ mod tests {
 
     /// Rows of `representation` whose scales and factors are finite and
     /// small.
-    fn rows(representation: &str, rows: usize, k: usize, seed: u64) -> (Vec<u8>, RowGeometry) {
+    fn rows(representation: &str, rows: usize, k: usize, seed: u64) -> (Placed<u8>, RowGeometry) {
         let id = registry::representation(representation).unwrap();
         let info = registry::representation_info(id);
         if info.layout == Layout::Rows8 {
@@ -410,7 +459,7 @@ mod tests {
             let (source, source_geometry) =
                 self::rows(registry::representation_info(row_major).name, rows, k, seed);
             let mut geometry = RowGeometry::of(info, k, 0);
-            let mut data = vec![0u8; rows.div_ceil(8) * 8 * geometry.stride];
+            let mut data = Placed::<u8>::zeroed(rows.div_ceil(8) * 8 * geometry.stride);
             let RepresentationKind::PackedRows(layout) = &info.kind else {
                 unreachable!("a rows8 element is packed rows")
             };
@@ -462,9 +511,9 @@ mod tests {
                 RepresentationKind::PackedRows(layout) => {
                     // The supers plane: the direct scales (and biases) or the
                     // factors, each a small finite value of its encoding.
-                    let encoding = match registry::decode_axes(id).unwrap().coefficients {
-                        CoefficientAxes::Direct { scale, .. } => scale,
-                        CoefficientAxes::Hierarchical { factor, .. } => factor,
+                    let encoding = match registry::decode_axes(id).unwrap().coding {
+                        CodingAxes::Direct { scale, .. } => scale,
+                        CodingAxes::Hierarchical { factor, .. } => factor,
                     };
                     let supers = RowPlaneRole::Supers as usize;
                     let start = base + geometry.offsets[supers];
@@ -476,16 +525,18 @@ mod tests {
                 _ => unreachable!("a weight element is dense or packed rows"),
             }
         }
-        (data, geometry)
+        (Placed::of(&data), geometry)
     }
 
     #[test]
     fn every_row_block_and_tier_gives_the_single_row_result() {
         let k = 2 * 256 + 32 * 3;
-        let x = bytes(7, k)
-            .iter()
-            .map(|byte| (*byte as f32 - 128.0) / 100.0)
-            .collect::<Vec<_>>();
+        let x = Placed::of(
+            &bytes(7, k)
+                .iter()
+                .map(|byte| (*byte as f32 - 128.0) / 100.0)
+                .collect::<Vec<_>>(),
+        );
         for representation in elements() {
             let (data, geometry) = rows(representation, 8, k, 11);
             let reference = kernels_of(Tier::detected().unwrap(), representation);
@@ -538,8 +589,7 @@ mod tests {
         let kernels = kernels_of(tier, representation);
         let (first, first_geometry) = rows(representation, 5, k, 41);
         let (second, second_geometry) = rows(representation, 5, k, 43);
-        let mut bytes = first.clone();
-        bytes.extend_from_slice(&second);
+        let bytes = Placed::of(&[&first[..], &second[..]].concat());
         let view = unsafe {
             crate::Weights::from_tensor(
                 bytes.as_ptr(),
@@ -695,10 +745,12 @@ mod tests {
         }
         let tier = Tier::detected().unwrap();
         let (rows, k) = (64usize, 2048usize);
-        let x = bytes(5, k)
-            .iter()
-            .map(|byte| (*byte as f32 - 128.0) / 100.0)
-            .collect::<Vec<_>>();
+        let x = Placed::of(
+            &bytes(5, k)
+                .iter()
+                .map(|byte| (*byte as f32 - 128.0) / 100.0)
+                .collect::<Vec<_>>(),
+        );
         for representation in elements() {
             let (data, geometry) = self::rows(representation, rows, k, 9);
             let kernels = kernels_of(tier, representation);
@@ -862,10 +914,12 @@ mod tests {
             rows.parse::<usize>().expect("CPU_DOT_ROWS is a row count")
         });
         let k = 4096usize;
-        let x = bytes(5, k)
-            .iter()
-            .map(|byte| (*byte as f32 - 128.0) / 100.0)
-            .collect::<Vec<_>>();
+        let x = Placed::of(
+            &bytes(5, k)
+                .iter()
+                .map(|byte| (*byte as f32 - 128.0) / 100.0)
+                .collect::<Vec<_>>(),
+        );
         let selected = std::env::var("CPU_DOT_REPRESENTATIONS").ok();
         let selected_blocks = std::env::var("CPU_DOT_BLOCKS").ok();
         for representation in elements() {
@@ -966,10 +1020,12 @@ mod tests {
     fn quantized_dots_are_tier_invariant_and_within_the_activation_rounding() {
         use crate::quant::{blocks, quantize, Q8Block, Q8_BLOCK};
         let k = 2 * 256 + 32 * 3;
-        let x = bytes(7, k)
-            .iter()
-            .map(|byte| (*byte as f32 - 128.0) / 100.0)
-            .collect::<Vec<_>>();
+        let x = Placed::of(
+            &bytes(7, k)
+                .iter()
+                .map(|byte| (*byte as f32 - 128.0) / 100.0)
+                .collect::<Vec<_>>(),
+        );
         let mut xq = vec![Q8Block::ZERO; blocks(k)];
         quantize(&x, &mut xq);
         let detected = Tier::detected().unwrap();

@@ -852,7 +852,7 @@ pub struct NativeImplementation {
     pub elements: Vec<NativeElementCoverage>,
     /// The `where` condition restricting admissible parameter
     /// configurations. It reads only static dimensions, parameters and the
-    /// elements (`operands(W)`, `form(W, NAME)`), whose reads make the
+    /// elements (`operands(W)`, `form(W, NAME)`, `unit_columns(W)`), whose reads make the
     /// configurations the implementation's at its bindings
     /// ([`Self::at_elements`]).
     pub constraint: Option<NativeCondition>,
@@ -879,7 +879,7 @@ pub struct NativeRepeat {
 
 impl NativeImplementation {
     /// The implementation as formed at `bindings`: every element read
-    /// (`operands(W)`, `form(W, NAME)`) is its value for the representation
+    /// (`operands(W)`, `form(W, NAME)`, `unit_columns(W)`) is its value for the representation
     /// `W` is bound to. The checker admits element reads only over the
     /// entry's element parameters, and a formation binds every one of them.
     pub fn at_elements(&self, bindings: &ElementBindings) -> Self {
@@ -1131,7 +1131,7 @@ pub enum NativeNatExpr {
     Dimension(String),
     Parameter(String),
     /// `query` of the representation element parameter `W` is bound to
-    /// (`operands(W)`, `form(W, NAME)`). It has a value only in an
+    /// (`operands(W)`, `form(W, NAME)`, `unit_columns(W)`). It has a value only in an
     /// implementation instantiated at its bindings
     /// ([`NativeImplementation::at_elements`]).
     Element(String, ElementQuery),
@@ -1155,6 +1155,12 @@ pub enum ElementQuery {
     /// `form(W, NAME)`: the admitted value of the implementation backend's
     /// form NAME ([`crate::forms::Form::of`]).
     Form(crate::forms::Form),
+    /// `unit_columns(W)`: the columns of a unit of the code planes' words of
+    /// a conversion into packed `W`, which a converter places together
+    /// ([`crate::repack::conversion_unit_columns`]). The checker admits it
+    /// only over an entry's conversion destination (`repack[U = W]`), which
+    /// its bindings bind to a registered conversion's packed destination.
+    UnitColumns,
 }
 
 impl ElementQuery {
@@ -1163,6 +1169,12 @@ impl ElementQuery {
         match self {
             Self::Operands => registry::representation_info(representation).operands.code(),
             Self::Form(form) => u64::from(form.of(representation)),
+            Self::UnitColumns => u64::from(crate::repack::conversion_unit_columns(
+                registry::ConversionLayout::of(&registry::representation_info(representation).kind)
+                    .expect(
+                        "`unit_columns` reads a conversion destination, a packed representation",
+                    ),
+            )),
         }
     }
 
@@ -1172,6 +1184,19 @@ impl ElementQuery {
         match self {
             Self::Operands => registry::OperandRecipe::ALL.map(registry::OperandRecipe::code).to_vec(),
             Self::Form(form) => form.values().into_iter().map(u64::from).collect(),
+            Self::UnitColumns => {
+                let mut columns: Vec<u64> = registry::representation_conversions()
+                    .iter()
+                    .map(|conversion| {
+                        u64::from(crate::repack::conversion_unit_columns(
+                            conversion.destination_layout,
+                        ))
+                    })
+                    .collect();
+                columns.sort_unstable();
+                columns.dedup();
+                columns
+            }
         }
     }
 
@@ -1180,6 +1205,7 @@ impl ElementQuery {
         match self {
             Self::Operands => format!("operands({element})"),
             Self::Form(form) => format!("form({element}, {})", form.name()),
+            Self::UnitColumns => format!("unit_columns({element})"),
         }
     }
 }
@@ -1729,6 +1755,18 @@ impl NativeImplementation {
                     specialization.with_param(parameter.name.clone(), parameter.values[0])
                 }
             })
+    }
+
+    /// `specialization` as preparation takes it: its unset Seismic-owned
+    /// parameters at their defaults ([`Self::with_owned_defaults`]),
+    /// checked against the declaration ([`Self::validate`]).
+    pub fn prepared(
+        &self,
+        specialization: NativeSpecialization,
+    ) -> Result<NativeSpecialization, NativeSpecializationError> {
+        let specialization = self.with_owned_defaults(specialization);
+        self.validate(&specialization)?;
+        Ok(specialization)
     }
 
     /// The parameters of the `params` clause, in declaration order.
@@ -3727,7 +3765,7 @@ mod native_tests {
         assert_eq!(int8(mma16("nvfp4g16a4")), [0]);
         assert_eq!(int8(registry::dense(DType::BF16)), [0]);
         for (form, message) in [
-            ("INT9", "`INT9` is not a form of `cuda`; its forms are GEMM_FOLD, INT8"),
+            ("INT9", "`INT9` is not a form of `cuda`; its forms are GEMM_FOLD, INT8, GEMV_RECORDS"),
             ("PACK", "`PACK` is not a form of `cuda`"),
         ] {
             let error = check(&declaration(form)).expect_err("a misspelled form fails checking");
@@ -3827,7 +3865,7 @@ mod native_tests {
             ),
             (
                 "native scale for metal from \"scale.metal\":\n    launch scale:\n        threadgroups (ceil_div(M, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n".to_owned(),
-                "references `M`, which is neither a dimension nor a native parameter",
+                "references `M`, which is neither a dimension, a native parameter nor a constant",
             ),
             (
                 format!("native scale for tpu from \"scale.c\":\n{launch}"),
@@ -3871,7 +3909,7 @@ mod native_tests {
             ),
             (
                 "native scale for metal from \"scale.metal\":\n    launch scale when M > 1:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".to_owned(),
-                "references `M`, which is neither a dimension nor a native parameter",
+                "references `M`, which is neither a dimension, a native parameter nor a constant",
             ),
             (
                 format!("native scale for metal from \"scale.metal\":\n    scratch partials bytes (N * 4) when N\n{launch}"),
@@ -3879,7 +3917,7 @@ mod native_tests {
             ),
             (
                 format!("native scale for metal from \"scale.metal\":\n    scratch partials bytes (N * 4) when Q >= 2\n{launch}"),
-                "references `Q`, which is neither a dimension nor a native parameter",
+                "references `Q`, which is neither a dimension, a native parameter nor a constant",
             ),
             (
                 "native scale for metal from \"scale.metal\":\n    static (N)\n".to_owned(),

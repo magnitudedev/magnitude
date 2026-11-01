@@ -12,11 +12,14 @@
 // SEISMIC_CONVERSION_E_U_FIXED, the other words: the group roles' shares);
 // this kernel places records in rows16.
 //
-// Each workgroup (32 invocations) places one row tile: 16 rows x 32
-// columns. Every group is a multiple of 32, so a tile covers a whole packet
-// or part of a larger one, and a code plane's share of a tile row is whole
-// record words (a unit of the span); the tile at a group's first column also
-// places that group's other record words. Stored-but-unoccupied bytes (plane
+// Each workgroup (32 invocations) places one row tile: 16 rows x one unit of
+// the span's columns (SEISMIC_CONVERSION_E_U_UNIT_COLUMNS: 32, or more where
+// 32 columns of a code plane are no whole words). A unit divides its group,
+// so a tile covers a whole packet or part of a larger one, and a code
+// plane's share of a tile row is whole record words (a unit of the span);
+// the tile at a group's first column also places that group's other record
+// words. The grid holds a workgroup per unit; those past the row's units
+// place nothing. Stored-but-unoccupied bytes (plane
 // alignment tails) are written as zero, so the result is fully defined.
 #include <seismic/element.glsl>
 
@@ -36,11 +39,11 @@
 
 #define GROUP uint(SEISMIC_ELEMENT_E_LOGICAL_GROUP)
 #define TILE_ROWS 16u
-#define TILE_COLUMNS 32u
+#define TILE_COLUMNS uint(SEISMIC_CONVERSION_E_U_UNIT_COLUMNS)
 
 // ---- rows16: the record is the row planes' shares -------------------------
 
-// A unit's words (32 columns of each code plane, `WordSpan`): the codes',
+// A unit's words (a tile's columns of each code plane, `WordSpan`): the codes',
 // then the high codes'.
 #define CODES_WORDS SEISMIC_CONVERSION_E_U_CODES_UNIT_WORDS
 #define HIGH_WORDS SEISMIC_CONVERSION_E_U_HIGH_UNIT_WORDS
@@ -102,9 +105,9 @@ void repack_weight() {
     const uint64_t packet = source_packet(source, b, n, group);
     const uint64_t row = row_base(destination, b, n);
 
-    // Code planes: the tile's 32 columns of the row are one unit of each,
-    // the unit `within / 32` of the group, its words all computed before any
-    // is stored.
+    // Code planes: the tile's columns of the row are one unit of each,
+    // the unit `within / TILE_COLUMNS` of the group, its words all computed
+    // before any is stored.
     const uint unit = column0 / TILE_COLUMNS;
     uint words[SEISMIC_CONVERSION_E_U_WORDS];
     SEISMIC_CONVERSION_E_U_UNIT(packet, within / TILE_COLUMNS, words);

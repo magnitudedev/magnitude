@@ -114,7 +114,7 @@ kernel void attention_output_stage(ATTENTION_OUTPUT_ARGUMENTS,
 #endif
 
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_BATCH
-template <uint BATCH_ROWS, uint BATCH_PARTS>
+template <uint BATCH_ROWS, uint BATCH_PARTS, uint MATRIX>
 kernel void attention_output_batch(ATTENTION_OUTPUT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
@@ -122,7 +122,7 @@ kernel void attention_output_batch(ATTENTION_OUTPUT_ARGUMENTS,
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     ATTENTION_OUTPUT_OPERANDS;
-    if constexpr (projection::matrix_form<packets::W0>::available && SEISMIC_DIM_Q * SEISMIC_DIM_W % 256 == 0) {
+    if constexpr (MATRIX == 1) {
         projection::gemv_matrix<packets::W0, BATCH_PARTS>(in, out, w,
             uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_D), k, tile, shared, simdgroups, sg, lane);
         return;

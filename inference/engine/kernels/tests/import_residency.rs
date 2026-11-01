@@ -394,10 +394,9 @@ fn dense_import_matches_host_for_all_nine_pairs(device: &seismic::Device) {
 
 /// Whether `element`'s storage holds whole `records` (CUDA's iq2xxs mma16).
 fn has_records(element: seismic::Element) -> bool {
-    use seismic_lang::registry::{self, RepresentationKind, RowPlaneContent};
+    use seismic_lang::registry::{self, RepresentationKind};
     let info = registry::representation_info(registry::representation(element.name()).unwrap());
-    matches!(&info.kind, RepresentationKind::PackedRows(rows)
-        if rows.planes.iter().any(|plane| matches!(plane.content, RowPlaneContent::Records { .. })))
+    matches!(&info.kind, RepresentationKind::PackedRows(rows) if rows.records())
 }
 
 /// K8: the native repack of every (format, layout) conversion equals the

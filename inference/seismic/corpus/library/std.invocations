@@ -1,7 +1,7 @@
 # Standard-library entries through the public API (design A10 §2.8; lines owned by A10).
 # Every exported std entry has at least one line. Shapes are small but non-degenerate:
 # every free dimension is at least 2, and every packed operand holds at least one packet
-# (q4g64: 64 values; q4g32, q8g32, q8g32s: 32; q4k, q5k, q6k, iq4g32: 256; nvfp4: 16) along
+# (q4g64: 64 values; q4g32, q8g32, q8g32s: 32; q4k, q5k, q6k, iq4xs: 256; nvfp4: 16) along
 # its packed last axis. Arguments follow parameter order; dimensions are inferred from shapes.
 
 # argmax.seismic: V = 8; the second line ties at 1 and 2 (the smaller index wins).
@@ -83,7 +83,7 @@ linear[T=bf16,U=q5k,V=f32]: bf16[2,256]=rand(172) ; q5k[3,256]=rand(173) ; f32[2
 linear[T=bf16,U=q6k,V=f32]: bf16[2,256]=rand(174) ; q6k[3,256]=rand(175) ; f32[2,3]=zero
 linear[T=f32,U=q8g32s,V=f32]: f32[2,64]=rand(176) ; q8g32s[3,64]=rand(177) ; f32[2,3]=zero
 linear[T=f32,U=q8g32,V=f32]: f32[2,64]=rand(178) ; q8g32[3,64]=rand(179) ; f32[2,3]=zero
-linear[T=f32,U=iq4g32,V=f32]: f32[2,256]=rand(180) ; iq4g32[3,256]=rand(181) ; f32[2,3]=zero
+linear[T=f32,U=iq4xs,V=f32]: f32[2,256]=rand(180) ; iq4xs[3,256]=rand(181) ; f32[2,3]=zero
 linear[T=f32,U=nvfp4_e2m1_block16,V=f32]: f32[2,64]=rand(182) ; nvfp4_e2m1_block16[3,64]=rand(183) ; f32[2,3]=zero
 
 # linear_bias.seismic: M = 2, N = 3.

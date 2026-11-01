@@ -31,7 +31,7 @@ fn routed_experts_stage<L: Isa, E: Elements>(
         let q8 = unsafe {
             cx.scratch_quantized()
                 .slice_mut::<seismic::cpu::quant::Q8Block>(
-                    row * blocks * projection::Q8_BYTES,
+                    row * blocks * seismic::cpu::quant::Q8_BYTES,
                     blocks,
                 )
         };
@@ -115,7 +115,10 @@ fn routed_experts_quantize<L: Isa, E: Elements>(
         let blocks = seismic::cpu::quant::blocks(f);
         let q8 = unsafe {
             cx.scratch_product_q8()
-                .slice_mut::<seismic::cpu::quant::Q8Block>(row * blocks * projection::Q8_BYTES, blocks)
+                .slice_mut::<seismic::cpu::quant::Q8Block>(
+                    row * blocks * seismic::cpu::quant::Q8_BYTES,
+                    blocks,
+                )
         };
         projection::quantize(product, q8);
     }

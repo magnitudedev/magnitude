@@ -206,7 +206,7 @@ fn stored_rows_decode_the_rows_their_directory_names() {
     // in, each with its rows16 resident form; IQ4_NL and Q8_0 (`Some(q8)`)
     // were read as stored before.
     for (source, resident, as_stored) in [
-        ("gguf_iq4_nl_block", "iq4g32s@rows16", Some(false)),
+        ("gguf_iq4_nl", "iq4g32s@rows16", Some(false)),
         ("gguf_q8_0", "q8g32s@rows16", Some(true)),
         ("gguf_q4_0", "q4g32s@rows16", None),
         ("gguf_q5_0", "q5g32s@rows16", None),

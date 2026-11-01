@@ -609,6 +609,9 @@ fn packed_input(
                         }
                     }
                     registry::PlaneEncoding::Packed { .. }
+                    | registry::PlaneEncoding::Grid(_)
+                    | registry::PlaneEncoding::SignedLocal { .. }
+                    | registry::PlaneEncoding::Digits { .. }
                     | registry::PlaneEncoding::FloatCode { .. } => {
                         for byte in storage {
                             *byte = random_bits(random) as u8;

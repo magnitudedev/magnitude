@@ -84,8 +84,14 @@ impl Oracle {
     fn plane(encoding: &PlaneEncoding) -> Oracle {
         match encoding {
             PlaneEncoding::Dense(dtype) => Oracle::dense(*dtype),
-            PlaneEncoding::Packed { bits, .. } => {
-                Oracle::table((0..1u32 << bits).map(|raw| plane_value(encoding, raw)))
+            PlaneEncoding::Packed { .. } | PlaneEncoding::SignedLocal { .. } => {
+                Oracle::table((0..1u32 << encoding.entry_bits()).map(|raw| plane_value(encoding, raw)))
+            }
+            PlaneEncoding::Grid(grid) => {
+                Oracle::table((0..1u32 << grid.entry_bits()).map(|raw| plane_value(encoding, raw)))
+            }
+            PlaneEncoding::Digits { .. } => {
+                Oracle::table((0..1u32 << 8).map(|raw| plane_value(encoding, raw)))
             }
             PlaneEncoding::FloatCode { format } => {
                 Oracle::table((0..1u32 << format.bits()).map(|raw| plane_value(encoding, raw)))
@@ -139,11 +145,32 @@ fn plane_value(encoding: &PlaneEncoding, raw: u32) -> f64 {
                     }
             }
             CodeInterpretation::Offset(offset) => f64::from(raw) - f64::from(*offset),
-            CodeInterpretation::Odd => f64::from(2 * raw + 1),
+            CodeInterpretation::Odd(offset) => f64::from(2 * raw + 1) - f64::from(2 * *offset),
             CodeInterpretation::Table(codebook) => f64::from(codebook.values[raw as usize]),
-            // An entry of vector codes is no one value: it is its raw bits.
-            CodeInterpretation::Grid(_) => f64::from(raw),
         },
+        // An entry of vector codes is no one value: it is its raw bits.
+        PlaneEncoding::Grid(_) => f64::from(raw),
+        // Its scale code, negated where its top bit is set.
+        PlaneEncoding::SignedLocal {
+            scale_bits,
+            interpretation,
+        } => {
+            let top = 1 << *scale_bits;
+            let value = plane_value(
+                &PlaneEncoding::Packed {
+                    bits: *scale_bits,
+                    interpretation: interpretation.clone(),
+                },
+                raw & (top - 1),
+            );
+            if raw & top == 0 {
+                value
+            } else {
+                -value
+            }
+        }
+        // A byte of digits is no one value either.
+        PlaneEncoding::Digits { .. } => f64::from(raw),
         PlaneEncoding::FloatCode { format } => f64::from(format.decode(raw)),
     }
 }
@@ -152,10 +179,7 @@ fn plane_value(encoding: &PlaneEncoding, raw: u32) -> f64 {
 fn vector_codes(encoding: &PlaneEncoding) -> bool {
     matches!(
         encoding,
-        PlaneEncoding::Packed {
-            interpretation: CodeInterpretation::Grid(_),
-            ..
-        }
+        PlaneEncoding::Grid(_) | PlaneEncoding::Digits { .. }
     )
 }
 
@@ -799,13 +823,19 @@ impl Stored {
 }
 
 /// The semantic role holding the decoded value of each (plane, field): the
-/// temporary the recipe computes directly from the plane read.
+/// temporary the recipe computes directly from the plane read; none for a
+/// plane of vector codes, whose entries never move.
 fn entry_roles(recipe: &DecodeRecipe) -> Vec<Vec<QuantizedComponent>> {
     recipe
         .planes()
         .iter()
         .map(|schema| {
-            (0..schema.fields)
+            let fields = if vector_codes(&schema.encoding) {
+                0
+            } else {
+                schema.fields
+            };
+            (0..fields)
                 .map(|wanted| {
                     let read = recipe
                         .steps()
@@ -819,12 +849,14 @@ fn entry_roles(recipe: &DecodeRecipe) -> Vec<Vec<QuantizedComponent>> {
                             _ => None,
                         })
                         .expect("the recipe reads every plane field");
-                    // The step whose first operand is the read (a vector
-                    // code's also takes its lane).
+                    // The last step that reads the read: its decode (a
+                    // vector code's also takes its lane; a signed local
+                    // code's sign follows its scale code).
                     let decoded = recipe
                         .steps()
                         .iter()
-                        .find(|step| step.uses().first() == Some(&read))
+                        .rev()
+                        .find(|step| step.uses().contains(&read))
                         .expect("the recipe decodes every plane read")
                         .defines();
                     QuantizedComponent::ALL
@@ -911,14 +943,9 @@ fn perturb_and_examine(
     for (plane, cell, entry) in stored.entries() {
         let schema = &packet.planes[plane];
         let bit = stored.entry_bit(plane, cell, entry);
-        let (flat, field) = stored.reader(plane, cell, entry);
         let (raw_before, raw_after) = (
             read_bits(packets, bit, schema.entry_bits),
             read_bits(&after_packets, bit, schema.entry_bits),
-        );
-        let (value_before, value_after) = (
-            decoded_before[plane][field][flat],
-            decoded_after[plane][field][flat],
         );
         let context = format!("`{name}` plane `{}` cell {cell} entry {entry}", schema.name);
         if vector_codes(&schema.encoding) {
@@ -928,6 +955,11 @@ fn perturb_and_examine(
             observed[plane].fixed += 1;
             continue;
         }
+        let (flat, field) = stored.reader(plane, cell, entry);
+        let (value_before, value_after) = (
+            decoded_before[plane][field][flat],
+            decoded_after[plane][field][flat],
+        );
         // The entry addressed here is the one the reference decoder reads.
         let direct = plane_value(&schema.encoding, raw_before);
         assert!(
@@ -986,14 +1018,33 @@ const EXTENTS: [u64; 3] = [2, 3, 300];
 /// partial last packet.
 const DECODED_EXTENTS: [u64; 2] = [2, 270];
 
+/// The least entries of a stepping plane mixed moves are drawn over.
+const MIXED_ENTRIES: u64 = 32;
+
 /// Mixed moves through the reference decoder: both directions and unmoved
 /// entries in the code plane, every plane checked entry by entry.
 fn assert_mixed_moves_are_adjacent(stored: &Stored, packets: &[u8], decoded: &[Vec<Vec<f64>>]) {
     let (tallies, observed) = perturb_and_examine(stored, packets, decoded, &dither(41, 0.3, 0.3));
     let name = stored.info.name;
-    let code = &observed[stepping_code_plane(stored.packet())];
+    let stepping = stepping_code_plane(stored.packet());
+    let code = &observed[stepping];
+    // A plane of two levels (one-bit codes) has no interior one.
+    let interior = match &stored.packet().planes[stepping].encoding {
+        encoding @ (PlaneEncoding::Packed { .. } | PlaneEncoding::SignedLocal { .. }) => {
+            let mut levels = (0..1u32 << encoding.entry_bits())
+                .map(|raw| plane_value(encoding, raw))
+                .collect::<Vec<_>>();
+            levels.sort_by(f64::total_cmp);
+            levels.dedup();
+            levels.len() > 2
+        }
+        PlaneEncoding::Dense(_)
+        | PlaneEncoding::FloatCode { .. }
+        | PlaneEncoding::Grid(_)
+        | PlaneEncoding::Digits { .. } => true,
+    };
     assert!(
-        code.up > 0 && code.down > 0 && code.interior > 0,
+        code.up > 0 && code.down > 0 && (code.interior > 0 || !interior),
         "`{name}`: {code:?}"
     );
     // The dither leaves entries unmoved: over the representation's entries,
@@ -1051,7 +1102,25 @@ fn every_packed_representation_steps_each_plane_to_its_adjacent_decoded_level() 
                 );
             }
         }
-        assert_mixed_moves_are_adjacent(&stored, &packets, &decoded);
+        // Mixed moves are drawn over at least `MIXED_ENTRIES` entries of the
+        // stepping plane, more rows where its entries are few (a scale per
+        // 256 values over vector or digit codes).
+        let packet = stored.packet();
+        let schema = &packet.planes[stepping_code_plane(packet)];
+        let per_row =
+            stored.packets_per_row() * u64::from(packet.group / schema.group * schema.fields);
+        let rows = MIXED_ENTRIES.div_ceil(per_row);
+        if rows > DECODED_EXTENTS[0] {
+            let stored = Stored {
+                info,
+                extents: vec![rows, DECODED_EXTENTS[1]],
+            };
+            let packets = stored.random_packets(&mut samples);
+            let decoded = observe(&stored, &stored.place(&packets));
+            assert_mixed_moves_are_adjacent(&stored, &packets, &decoded);
+        } else {
+            assert_mixed_moves_are_adjacent(&stored, &packets, &decoded);
+        }
     }
     assert_eq!(
         representations,

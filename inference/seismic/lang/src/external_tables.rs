@@ -7,14 +7,12 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RepackTable {
     E2m1PositiveZero,
-    Iq3sMagnitudes,
 }
 
 impl RepackTable {
     pub fn values(self) -> &'static [i32] {
         match self {
             Self::E2m1PositiveZero => &E2M1_POSITIVE_ZERO,
-            Self::Iq3sMagnitudes => &IQ3S_MAGNITUDES,
         }
     }
 
@@ -45,18 +43,4 @@ static E2M1_POSITIVE_ZERO: [i32; 16] = {
         code += 1;
     }
     codes
-};
-
-/// The IQ3_S magnitude at index `point << 2 | j`: byte `j` of ggml's grid
-/// point `point` (its sign is a recipe's `NegateIf`).
-static IQ3S_MAGNITUDES: [i32; 2048] = {
-    let mut values = [0i32; 2048];
-    let mut index = 0;
-    while index < 2048 {
-        values[index] = magnitude_ggml::tables::IQ3S
-            .points
-            .byte(index >> 2, (index & 3) as u32) as i32;
-        index += 1;
-    }
-    values
 };

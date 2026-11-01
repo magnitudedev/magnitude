@@ -69,6 +69,9 @@ impl Analysis<'_> {
             .planes
             .get(plane as usize)
             .ok_or("lane read has no registered plane")?;
+        if matches!(schema.encoding, registry::PlaneEncoding::Digits { .. }) {
+            return Err("a digit's position in its byte is not affine in its value");
+        }
         let logical = self.logical_position(view, indices, state)?;
         let lane = self.terms.natural_div_rem(true, logical, schema.group);
         Ok(self.terms.node(Node::WordFromNatural(lane, DType::U32)))
@@ -129,7 +132,13 @@ impl Analysis<'_> {
                 let byte = self.terms.natural_binary(false, base, displacement);
                 self.read(state, Place { root, byte, dtype })
             }
-            registry::PlaneEncoding::Packed { .. } | registry::PlaneEncoding::FloatCode { .. } => {
+            registry::PlaneEncoding::Digits { .. } => {
+                Err("a digits plane's entry is not affine in its value")
+            }
+            registry::PlaneEncoding::Packed { .. }
+            | registry::PlaneEncoding::Grid(_)
+            | registry::PlaneEncoding::SignedLocal { .. }
+            | registry::PlaneEncoding::FloatCode { .. } => {
                 if state.writes.iter().any(|write| match (write.root(), root) {
                     (ViewBase::Allocation(a), ViewBase::Allocation(b)) => {
                         self.storage.allocations_may_overlap(a, b)

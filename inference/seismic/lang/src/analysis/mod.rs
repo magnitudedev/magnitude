@@ -392,6 +392,27 @@ fn lattice(encoding: &PlaneEncoding) -> Lattice {
         } => Lattice::Codes(CodeLevels::of(
             interpretation.codes(*bits).into_iter().map(f64::from),
         )),
+        PlaneEncoding::Grid(grid) => {
+            Lattice::Codes(CodeLevels::of(grid.codes().into_iter().map(f64::from)))
+        }
+        // A signed local code's value is its scale code, either sign.
+        PlaneEncoding::SignedLocal {
+            scale_bits,
+            interpretation,
+        } => Lattice::Codes(CodeLevels::of(
+            interpretation
+                .codes(*scale_bits)
+                .into_iter()
+                .flat_map(|code| [code, -code])
+                .map(f64::from),
+        )),
+        // A byte's digits take the codes of a digit.
+        PlaneEncoding::Digits { interpretation, .. } => Lattice::Codes(CodeLevels::of(
+            interpretation
+                .codes_below(crate::registry::DIGIT_RADIX, crate::registry::DIGIT_BITS)
+                .into_iter()
+                .map(f64::from),
+        )),
         PlaneEncoding::FloatCode { format } => Lattice::Codes(CodeLevels::of(
             (0..1u32 << format.bits())
                 .map(|raw| f64::from(format.decode(raw)))
@@ -458,8 +479,12 @@ fn packed(
             DecodeStep::ReadPlaneLane { .. } => {
                 Term::opaque(index.last().map(Term::variables).unwrap_or_default())
             }
+            // A signed code is its plane read's value, the read's sign its
+            // own (`PlaneEncoding::SignedLocal`).
             DecodeStep::InterpretCode { raw: from, .. }
+            | DecodeStep::SignedCode { code: from, .. }
             | DecodeStep::InterpretGridCode { raw: from, .. }
+            | DecodeStep::InterpretDigitCode { raw: from, .. }
             | DecodeStep::DecodeFloatCode { raw: from, .. }
             | DecodeStep::ConvertToF32 { from, .. } => get(*from),
             DecodeStep::Constant { value, .. } => Term::constant(value.to_f64()),

@@ -34,7 +34,7 @@ kernel void per_layer_inputs(
         * projected_scale;
     const float total = reduce::group_sum<chunk / 32>(p * p, partials, sg, lane);
     const float inverse = metal::rsqrt(total / float(chunk) + epsilon);
-    const packets::Rows16 layout = KERNEL_W0_LAYOUT(width);
+    const packets::GeometryOf<packets::W0>::type layout = KERNEL_W0_LAYOUT(width);
     const typename packets::W0::packet packet =
         packets::Loader<packets::W0>::load(layout.base_of(gathered, row), layout.of(row), column / 32u, width);
     const float token = packets::value_at<packets::W0>(packet, column % 32u);

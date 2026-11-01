@@ -23,7 +23,10 @@ fn routed_down_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u6
             // SAFETY: this work item owns the corresponding choice row.
             let q8 = unsafe {
                 cx.scratch_quantized()
-                    .slice_mut::<seismic::cpu::quant::Q8Block>(choice * blocks * projection::Q8_BYTES, blocks)
+                    .slice_mut::<seismic::cpu::quant::Q8Block>(
+                        choice * blocks * seismic::cpu::quant::Q8_BYTES,
+                        blocks,
+                    )
             };
             projection::quantize(staged, q8);
         }

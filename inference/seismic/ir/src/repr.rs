@@ -313,7 +313,6 @@ representation!(Q4K, "q4k", F32, 3);
 representation!(Q5K, "q5k", F32, 4);
 representation!(Q6K, "q6k", F32, 3);
 representation!(Q8G32S, "q8g32s", F32, 2);
-representation!(IQ4G32, "iq4g32", F32, 2);
 representation!(Q8G32, "q8g32", F32, 2);
 representation!(Q4G32S, "q4g32s", F32, 2);
 representation!(IQ4G32S, "iq4g32s", F32, 2);
@@ -345,12 +344,10 @@ representation!(Q4KRows16, "q4k", Rows16, F32, 3);
 representation!(Q5KRows16, "q5k", Rows16, F32, 4);
 representation!(Q6KRows16, "q6k", Rows16, F32, 4);
 representation!(Q8G32SRows16, "q8g32s", Rows16, F32, 2);
-representation!(IQ4G32Rows16, "iq4g32", Rows16, F32, 2);
 representation!(Q4KRows8, "q4k", Rows8, F32, 3);
 representation!(Q5KRows8, "q5k", Rows8, F32, 4);
 representation!(Q6KRows8, "q6k", Rows8, F32, 4);
 representation!(Q8G32SRows8, "q8g32s", Rows8, F32, 2);
-representation!(IQ4G32Rows8, "iq4g32", Rows8, F32, 2);
 representation!(Q4G32SRows32, "q4g32s", Rows32, F32, 2);
 representation!(IQ4G32SRows32, "iq4g32s", Rows32, F32, 2);
 representation!(Q5G32SRows32, "q5g32s", Rows32, F32, 3);
@@ -361,12 +358,10 @@ representation!(Q4KRows32, "q4k", Rows32, F32, 3);
 representation!(Q5KRows32, "q5k", Rows32, F32, 4);
 representation!(Q6KRows32, "q6k", Rows32, F32, 4);
 representation!(Q8G32SRows32, "q8g32s", Rows32, F32, 2);
-representation!(IQ4G32Rows32, "iq4g32", Rows32, F32, 2);
 representation!(Q4KMma16, "q4k", Mma16, F32, 3);
 representation!(Q5KMma16, "q5k", Mma16, F32, 4);
 representation!(Q6KMma16, "q6k", Mma16, F32, 4);
 representation!(Q8G32SMma16, "q8g32s", Mma16, F32, 2);
-representation!(IQ4G32Mma16, "iq4g32", Mma16, F32, 2);
 // Vector codes: row layouts keep whole entries in `grids`.
 representation!(IQ2XS, "iq2xs", F32, 3);
 representation!(IQ3XXS, "iq3xxs", F32, 3);
@@ -425,17 +420,14 @@ pub fn with_representation<V: RepresentationVisitor>(
         ("q5k", registry::Layout::Rows16) => return visitor.visit::<Q5KRows16>(),
         ("q6k", registry::Layout::Rows16) => return visitor.visit::<Q6KRows16>(),
         ("q8g32s", registry::Layout::Rows16) => return visitor.visit::<Q8G32SRows16>(),
-        ("iq4g32", registry::Layout::Rows16) => return visitor.visit::<IQ4G32Rows16>(),
         ("q4k", registry::Layout::Rows8) => return visitor.visit::<Q4KRows8>(),
         ("q5k", registry::Layout::Rows8) => return visitor.visit::<Q5KRows8>(),
         ("q6k", registry::Layout::Rows8) => return visitor.visit::<Q6KRows8>(),
         ("q8g32s", registry::Layout::Rows8) => return visitor.visit::<Q8G32SRows8>(),
-        ("iq4g32", registry::Layout::Rows8) => return visitor.visit::<IQ4G32Rows8>(),
         ("q4k", registry::Layout::Rows32) => return visitor.visit::<Q4KRows32>(),
         ("q5k", registry::Layout::Rows32) => return visitor.visit::<Q5KRows32>(),
         ("q6k", registry::Layout::Rows32) => return visitor.visit::<Q6KRows32>(),
         ("q8g32s", registry::Layout::Rows32) => return visitor.visit::<Q8G32SRows32>(),
-        ("iq4g32", registry::Layout::Rows32) => return visitor.visit::<IQ4G32Rows32>(),
         ("q4g32s", registry::Layout::Rows32) => return visitor.visit::<Q4G32SRows32>(),
         ("iq4g32s", registry::Layout::Rows32) => return visitor.visit::<IQ4G32SRows32>(),
         ("q5g32s", registry::Layout::Rows32) => return visitor.visit::<Q5G32SRows32>(),
@@ -446,7 +438,6 @@ pub fn with_representation<V: RepresentationVisitor>(
         ("q5k", registry::Layout::Mma16) => return visitor.visit::<Q5KMma16>(),
         ("q6k", registry::Layout::Mma16) => return visitor.visit::<Q6KMma16>(),
         ("q8g32s", registry::Layout::Mma16) => return visitor.visit::<Q8G32SMma16>(),
-        ("iq4g32", registry::Layout::Mma16) => return visitor.visit::<IQ4G32Mma16>(),
         ("q4g32s", registry::Layout::Rows16) => return visitor.visit::<Q4G32SRows16>(),
         ("iq4g32s", registry::Layout::Rows16) => return visitor.visit::<IQ4G32SRows16>(),
         ("q5g32s", registry::Layout::Rows16) => return visitor.visit::<Q5G32SRows16>(),
@@ -497,7 +488,6 @@ pub fn with_representation<V: RepresentationVisitor>(
         "q5k" => visitor.visit::<Q5K>(),
         "q6k" => visitor.visit::<Q6K>(),
         "q8g32s" => visitor.visit::<Q8G32S>(),
-        "iq4g32" => visitor.visit::<IQ4G32>(),
         "q8g32" => visitor.visit::<Q8G32>(),
         "q4g32s" => visitor.visit::<Q4G32S>(),
         "iq4g32s" => visitor.visit::<IQ4G32S>(),

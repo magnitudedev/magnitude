@@ -10,24 +10,44 @@
 //! Quantizing activations changes a projection's arithmetic: an entry offers
 //! it as an `arithmetic` tuning parameter, validated like any other.
 
-/// Values per quantized activation block (the k-quant super block).
-pub const Q8_BLOCK: usize = 256;
+use seismic_lang::forms::{CPU_Q8_ALIGNMENT, CPU_Q8_BYTES, CPU_Q8_VALUES};
 
-/// One block of quantized activations.
-#[repr(C)]
+/// Values per quantized activation block (the k-quant super block).
+pub const Q8_BLOCK: usize = CPU_Q8_VALUES as usize;
+
+/// Bytes of one quantized activation block, which declarations size their
+/// scratch by as `Q8_BYTES`.
+pub const Q8_BYTES: usize = CPU_Q8_BYTES as usize;
+
+/// One block of quantized activations, the CPU INT8 form's
+/// (`forms::CPU_Q8_BYTES`): its codes first and the block aligned to
+/// `forms::CPU_Q8_ALIGNMENT`, so every packet's codes are whole vectors on
+/// one cache line wherever the block lies.
+#[repr(C, align(64))]
 #[derive(Clone, Copy, Debug)]
 pub struct Q8Block {
-    pub d: f32,
     pub codes: [i8; Q8_BLOCK],
     /// Sums of codes `16 j .. 16 j + 16`.
     pub sums: [i16; Q8_BLOCK / 16],
+    pub d: f32,
 }
+
+const _: () = assert!(
+    std::mem::align_of::<Q8Block>() as u64 == CPU_Q8_ALIGNMENT
+        && std::mem::size_of::<Q8Block>() as u64 == CPU_Q8_BYTES,
+    "a Q8 block is the CPU INT8 form's"
+);
+
+const _: () = assert!(
+    CPU_Q8_ALIGNMENT as usize == crate::isa::Tier::widest_vector(&crate::isa::Tier::EVERY),
+    "the CPU INT8 form aligns its blocks to the widest vector of any tier"
+);
 
 impl Q8Block {
     pub const ZERO: Q8Block = Q8Block {
-        d: 0.0,
         codes: [0; Q8_BLOCK],
         sums: [0; Q8_BLOCK / 16],
+        d: 0.0,
     };
 }
 
@@ -146,7 +166,6 @@ mod tests {
 
     #[test]
     fn codes_reconstruct_within_half_a_step() {
-        assert_eq!(std::mem::size_of::<Q8Block>(), 292);
         let x = (0..600)
             .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.013)
             .collect::<Vec<_>>();

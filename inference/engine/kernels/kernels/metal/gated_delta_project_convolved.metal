@@ -249,11 +249,13 @@ kernel void gated_delta_project_convolved_normalize(RECURRENT_PROJECT_ARGUMENTS,
 }
 #endif
 
-template <typename W, uint BATCH_ROWS, uint PARTS, bool COLUMNS, typename In, typename Out>
+// A weight's segment: the matrix GEMV where MATRIX takes it and it serves
+// the weight, else the batched rows.
+template <typename W, uint BATCH_ROWS, uint PARTS, uint MATRIX, bool COLUMNS, typename In, typename Out>
 inline void convolved_project_segment(thread const In &in, thread const Out &out,
     thread const projection::Weights<W> &w, uint m_rows, uint rows, uint k, uint tile,
     threadgroup uchar *shared, uint simdgroups, uint sg, uint lane) {
-    if constexpr (projection::matrix_form<W>::available && SEISMIC_DIM_H % 256 == 0) {
+    if constexpr (MATRIX == 1 && projection::matrix_form<W>::available) {
         if constexpr (COLUMNS)
             projection::gemv_matrix_columns<W, PARTS>(in, out, w, m_rows, rows, k,
                 tile, shared, simdgroups, sg, lane);
@@ -273,7 +275,7 @@ inline void convolved_project_segment(thread const In &in, thread const Out &out
 }
 
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_BATCH
-template <uint BATCH_ROWS, uint BATCH_PARTS>
+template <uint BATCH_ROWS, uint BATCH_PARTS, uint MATRIX>
 kernel void gated_delta_project_convolved_batch(RECURRENT_PROJECT_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
@@ -292,16 +294,16 @@ kernel void gated_delta_project_convolved_batch(RECURRENT_PROJECT_ARGUMENTS,
             convolved_rows({segments, stop, previous_bank, previous_tape, following_bank}, window,
                 slot_rows, lane, seismic_words);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        convolved_project_segment<packets::W0, BATCH_ROWS, BATCH_PARTS, true>(x, qkv_out, qkv,
+        convolved_project_segment<packets::W0, BATCH_ROWS, BATCH_PARTS, MATRIX, true>(x, qkv_out, qkv,
             rows, qkv_rows, k, tile, shared, simdgroups, sg, lane);
     } else if (tile < t0 + t1) {
-        convolved_project_segment<packets::W1, BATCH_ROWS, BATCH_PARTS, false>(x, gate_out, gate,
+        convolved_project_segment<packets::W1, BATCH_ROWS, BATCH_PARTS, MATRIX, false>(x, gate_out, gate,
             rows, gate_rows, k, tile - t0, shared, simdgroups, sg, lane);
     } else if (tile < t0 + t1 + t2) {
-        convolved_project_segment<packets::W2, BATCH_ROWS, BATCH_PARTS, false>(x, alpha_out, alpha,
+        convolved_project_segment<packets::W2, BATCH_ROWS, BATCH_PARTS, MATRIX, false>(x, alpha_out, alpha,
             rows, head_rows, k, tile - t0 - t1, shared, simdgroups, sg, lane);
     } else if (tile < t0 + t1 + 2u * t2) {
-        convolved_project_segment<packets::W3, BATCH_ROWS, BATCH_PARTS, false>(x, beta_out, beta,
+        convolved_project_segment<packets::W3, BATCH_ROWS, BATCH_PARTS, MATRIX, false>(x, beta_out, beta,
             rows, head_rows, k, tile - t0 - t1 - t2, shared, simdgroups, sg, lane);
     }
 }

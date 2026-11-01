@@ -1005,8 +1005,18 @@ fn check_native(
 ) -> Result<crate::checked::NativeImplementation, Vec<(Span, String)>> {
     use crate::checked::{NativeLaunch, NativeNatExpr, NativeParameter, NativeScratch};
     let mut errors = Vec::new();
+    let destinations: Vec<String> = entry
+        .element_domain
+        .conversions()
+        .iter()
+        .filter_map(|conversion| match &conversion.target {
+            crate::checked::ElementTarget::Parameter(parameter) => Some(parameter.clone()),
+            crate::checked::ElementTarget::Concrete(_) => None,
+        })
+        .collect();
     let element_reads = NativeElements {
         parameters: &entry.element_parameters,
+        destinations: &destinations,
         backend,
     };
 
@@ -1605,11 +1615,13 @@ fn native_condition(
     })
 }
 
-/// The element parameters a native expression may read, and the backend
-/// whose forms `form(W, NAME)` names.
+/// The element parameters a native expression may read, those the entry
+/// converts into (`repack[U = W]`: bound only to a registered conversion's
+/// packed destination), and the backend whose forms `form(W, NAME)` names.
 #[derive(Clone, Copy)]
 struct NativeElements<'a> {
     parameters: &'a [String],
+    destinations: &'a [String],
     backend: crate::registry::BackendName,
 }
 
@@ -1654,10 +1666,17 @@ fn native_nat_expr(
         ExprKind::Name(name) if parameters.contains(&name.name) => {
             Ok(N::Parameter(name.name.clone()))
         }
-        ExprKind::Name(name) => Err(format!(
-            "native expression references `{}`, which is neither a dimension nor a native parameter",
-            name.name
-        )),
+        ExprKind::Name(name) => crate::forms::constants(elements.backend)
+            .iter()
+            .find(|(constant, _)| *constant == name.name)
+            .map(|(_, value)| N::Constant(*value))
+            .ok_or_else(|| {
+                format!(
+                    "native expression references `{}`, which is neither a dimension, a native parameter nor a constant of `{}`",
+                    name.name,
+                    elements.backend.as_str()
+                )
+            }),
         ExprKind::Binary { op, lhs, rhs } => match op {
             BinaryOp::Add => binary(lhs, rhs, N::Add),
             BinaryOp::Sub => binary(lhs, rhs, N::Sub),
@@ -1677,6 +1696,24 @@ fn native_nat_expr(
                     ElementQuery::Operands,
                 )),
                 _ => Err("`operands` takes one element parameter".to_owned()),
+            }
+        }
+        ExprKind::Call {
+            callee,
+            bindings,
+            args,
+        } if matches!(&callee.kind, ExprKind::Name(name) if name.name == "unit_columns") => {
+            match (bindings.is_empty(), args.as_slice()) {
+                (true, [arg]) => {
+                    let element = elements.parameter("unit_columns", arg)?;
+                    if !elements.destinations.contains(&element) {
+                        return Err(format!(
+                            "`unit_columns` reads a conversion's destination; `{element}` is not one (`repack[U = {element}]`)"
+                        ));
+                    }
+                    Ok(N::Element(element, ElementQuery::UnitColumns))
+                }
+                _ => Err("`unit_columns` takes one element parameter".to_owned()),
             }
         }
         ExprKind::Call {
@@ -1720,7 +1757,7 @@ fn native_nat_expr(
                 ExprKind::Name(name) if name.name == "max" => N::Max,
                 _ => {
                     return Err(
-                        "native expressions call only `ceil_div`, `min`, `max`, `operands` and `form`"
+                        "native expressions call only `ceil_div`, `min`, `max`, `operands`, `form` and `unit_columns`"
                             .to_owned()
                     );
                 }

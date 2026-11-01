@@ -28,13 +28,14 @@ use crate::registry::{self, BackendName, OperandRecipe, RepresentationInfo};
 use crate::registry::profile::{Bias, LocalScale, Profile, ValueMap};
 use crate::types::DType;
 
-/// CUDA's forms, in emission order: the folded GEMM recipe (`GEMM_FOLD`)
-/// and the int8 GEMM (`INT8`). [`cuda_forms`] values them in this order.
-const CUDA_FORMS: [&str; 2] = ["GEMM_FOLD", "INT8"];
+/// CUDA's forms, in emission order: the folded GEMM recipe (`GEMM_FOLD`),
+/// the int8 GEMM (`INT8`) and the records GEMV (`GEMV_RECORDS`).
+/// [`cuda_forms`] values them in this order.
+const CUDA_FORMS: [&str; 3] = ["GEMM_FOLD", "INT8", "GEMV_RECORDS"];
 
 /// Metal's forms, in emission order (`packets::Forms` reads those its
 /// library selects on). [`metal_forms`] values them in this order.
-const METAL_FORMS: [&str; 10] = [
+const METAL_FORMS: [&str; 11] = [
     "PACK",
     "PACK_CENTRE",
     "PACK_OFFSET",
@@ -45,10 +46,34 @@ const METAL_FORMS: [&str; 10] = [
     "MATRIX_CODES",
     "MATRIX_RUNS",
     "MATRIX_SYMMETRIC",
+    "MATRIX",
 ];
 
 /// The CPU's forms: the quantized dot (`INT8`). [`cpu_int8`] values it.
 const CPU_FORMS: [&str; 1] = ["INT8"];
+
+/// Values of one CPU INT8 activation block (`quant::Q8Block`, the k-quant
+/// super block): its `i8` codes, then the `i16` sums of each 16, then its
+/// `f32` scale.
+pub const CPU_Q8_VALUES: u64 = 256;
+/// The alignment of a CPU INT8 activation block: the widest vector of any
+/// CPU tier (`isa::Tier::vector_bytes`, the X86V4 tiers' 512-bit), so no
+/// vector load of its codes straddles a cache line, wherever a block lies.
+pub const CPU_Q8_ALIGNMENT: u64 = 64;
+/// Bytes of one CPU INT8 activation block, its fields padded to its
+/// alignment.
+pub const CPU_Q8_BYTES: u64 =
+    (CPU_Q8_VALUES + CPU_Q8_VALUES / 16 * 2 + 4).next_multiple_of(CPU_Q8_ALIGNMENT);
+
+/// The named constants `backend`'s native declarations may use in their
+/// expressions (`scratch quantized bytes (M * ceil_div(H, Q8_VALUES) *
+/// Q8_BYTES)`), the facts of its forms they size buffers by.
+pub fn constants(backend: BackendName) -> &'static [(&'static str, u64)] {
+    match backend {
+        BackendName::Cpu => &[("Q8_VALUES", CPU_Q8_VALUES), ("Q8_BYTES", CPU_Q8_BYTES)],
+        BackendName::Cuda | BackendName::Metal | BackendName::Vulkan => &[],
+    }
+}
 
 /// The names of `backend`'s forms, in emission order.
 pub fn names(backend: BackendName) -> &'static [&'static str] {
@@ -68,12 +93,13 @@ fn values(backend: BackendName, id: RepresentationId) -> Option<Vec<u32>> {
     if backend == BackendName::Cpu {
         return Some(vec![u32::from(cpu_int8(info))]);
     }
-    let (registry::RepresentationKind::PackedRows(rows), Some(axes)) = (&info.kind, registry::decode_axes(id))
+    let (registry::RepresentationKind::PackedRows(rows), Some(axes)) =
+        (&info.kind, registry::decode_axes(id))
     else {
         return None;
     };
     Some(match backend {
-        BackendName::Cuda => cuda_forms(&axes, rows, info.operands).to_vec(),
+        BackendName::Cuda => cuda_forms(rows, &axes, info.operands).to_vec(),
         BackendName::Metal => metal_forms(&axes).to_vec(),
         BackendName::Cpu | BackendName::Vulkan => Vec::new(),
     })
@@ -142,11 +168,19 @@ impl From<Form> for (BackendName, String) {
 
 /// CUDA's forms of a packed-rows weight, in the order of [`CUDA_FORMS`].
 fn cuda_forms(
-    axes: &registry::DecodeAxes,
     rows: &registry::PackedRowLayout,
+    axes: &registry::DecodeAxes,
     operands: OperandRecipe,
 ) -> [u32; CUDA_FORMS.len()] {
-    [u32::from(cuda_gemm_fold(axes, rows)), u32::from(cuda_int8(axes, operands))]
+    [
+        u32::from(cuda_gemm_fold(axes)),
+        u32::from(cuda_int8(axes, operands)),
+        // The GEMV reads a records layout as records (`gemv_records_group`,
+        // `packets::Records`). Its launch keeps the blocks per SM that hold
+        // its grid in one wave (`projection::GemvResidency`), so it takes no
+        // tuned residency.
+        u32::from(rows.records()),
+    ]
 }
 
 /// Whether CUDA's GEMM multiplies the weight's exact codes and applies each
@@ -157,16 +191,14 @@ fn cuda_forms(
 /// codes) and codes its producer reads as exact operand integers (`q` of at
 /// most 8 bits, which BF16 and F16 hold). Of the weights it admits, the fold
 /// is chosen for grid codes and for linear codes below 8 bits under direct
-/// coefficients, except whole 256-code rows (iq4g32, whose rounded GEMM its
-/// Qwen results were qualified with): today's choice, which tuning owns once
-/// both recipes are qualified for each weight.
-fn cuda_gemm_fold(axes: &registry::DecodeAxes, rows: &registry::PackedRowLayout) -> bool {
+/// coefficients.
+fn cuda_gemm_fold(axes: &registry::DecodeAxes) -> bool {
     let profile = axes.profile();
     let admitted = matches!(profile.local.group, 16 | 32) && profile.codes.fits_i8();
     let chosen = match profile.map {
         ValueMap::Grid => true,
         ValueMap::Linear | ValueMap::Table => {
-            matches!(profile.local.scale, LocalScale::Stored(_)) && axes.low != 8 && rows.group() % 256 != 0
+            matches!(profile.local.scale, LocalScale::Stored(_)) && axes.low != 8
         }
     };
     admitted && chosen
@@ -176,17 +208,7 @@ fn cuda_gemm_fold(axes: &registry::DecodeAxes, rows: &registry::PackedRowLayout)
 /// (`cuda_gemm_fold`); false for storage other than packed rows.
 pub fn cuda_gemm_fold_of(id: RepresentationId) -> bool {
     match (&registry::representation_info(id).kind, registry::decode_axes(id)) {
-        (registry::RepresentationKind::PackedRows(rows), Some(axes)) => cuda_gemm_fold(&axes, rows),
-        _ => false,
-    }
-}
-
-/// Whether CUDA's int8 GEMM takes representation `id` (`cuda_int8`, the
-/// `INT8` form); false for storage other than packed rows.
-pub fn cuda_int8_of(id: RepresentationId) -> bool {
-    let info = registry::representation_info(id);
-    match (&info.kind, registry::decode_axes(id)) {
-        (registry::RepresentationKind::PackedRows(_), Some(axes)) => cuda_int8(&axes, info.operands),
+        (registry::RepresentationKind::PackedRows(_), Some(axes)) => cuda_gemm_fold(&axes),
         _ => false,
     }
 }
@@ -215,9 +237,11 @@ fn cuda_int8(axes: &registry::DecodeAxes, operands: OperandRecipe) -> bool {
 /// `PACK_OFFSET`, `PACK_RESIDUE`, `PACK_FOLDS`; 0 where not admitted), the
 /// int8 GEMM with its operand's order (`INT8`, `INT8_INTERLEAVED`) and the
 /// matrix GEMV, by one of its three products or none (`MATRIX_CODES`,
-/// `MATRIX_RUNS`, `MATRIX_SYMMETRIC`). Each admits the weight on any device;
-/// whether a device runs the form (tensor operations) is the library's
-/// condition. One operand serves several weights of a declaration only
+/// `MATRIX_RUNS` with its operands' type, `MATRIX_SYMMETRIC`; `MATRIX`
+/// whether one serves it, which a declaration offers its batched rows as the
+/// alternative to). Each admits
+/// the weight on any device; whether a device runs the form (tensor
+/// operations) is the library's condition. One operand serves several weights of a declaration only
 /// where their operand layout (`PACK_FOLDS`, `PACK_RESIDUE`) or order
 /// (`INT8_INTERLEAVED`) agree.
 fn metal_forms(axes: &registry::DecodeAxes) -> [u32; METAL_FORMS.len()] {
@@ -233,8 +257,12 @@ fn metal_forms(axes: &registry::DecodeAxes) -> [u32; METAL_FORMS.len()] {
         u32::from(int8.is_some()),
         u32::from(int8 == Some(MetalInt8::Nibbles)),
         u32::from(matrix == Some(MetalMatrix::Codes)),
-        u32::from(matrix == Some(MetalMatrix::Runs)),
+        match matrix {
+            Some(MetalMatrix::Runs { halves }) => 1 + u32::from(halves),
+            _ => 0,
+        },
         u32::from(matrix == Some(MetalMatrix::Symmetric)),
+        u32::from(matrix.is_some()),
     ]
 }
 
@@ -248,23 +276,74 @@ fn metal_packet_groups(profile: &Profile) -> u32 {
     if group < METAL_PACKET { METAL_PACKET / group } else { 1 }
 }
 
-/// Whether Metal's code planes read a weight's codes as
-/// `packets::Offset<ZERO>` (`Unsigned` is `Offset<0>`): linear codes of a
-/// plane of low nibbles and, with `high`, a plane of that many high bits.
-fn metal_offset_planes(axes: &registry::DecodeAxes, high: &[u32]) -> bool {
-    matches!(axes.code, registry::CodeInterpretation::Unsigned | registry::CodeInterpretation::Offset(_))
-        && axes.low == 4
-        && high.contains(&axes.high)
+/// How Metal's lane producers (`projection::lane_codes`) deliver a weight's
+/// integer codes to its matrix GEMV and token-packing GEMM: a packet's
+/// chunks of eight codes, which a lane takes two at a time as unsigned
+/// integers entering at a zero code. `None` for any other codes (odd codes,
+/// base-3 digits).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetalLanes {
+    /// Linear codes of code planes, of every split `registry::code_planes`
+    /// makes up to 8 bits (two's complement bytes with their sign bits
+    /// flipped), entering as their stored codes, whose value zero is `zero`,
+    /// or, but as `bytes` (codes of a plane of bytes), at any zero above.
+    Stored { zero: u32, bytes: bool },
+    /// A codebook's 4-bit codes of values of `i8`, entering as those values
+    /// + 128 (`codebooks::pairs`), as bytes.
+    Table,
+    /// A grid's entries of values of `i8`, entering as those values (signed,
+    /// moved by their delta) + any zero.
+    Grid,
+}
+
+impl MetalLanes {
+    /// Whether the codes enter as their values + `offset`, in a layout of
+    /// bytes (`bytes`) or of pairs.
+    fn enter_at(self, offset: u32, bytes: bool) -> bool {
+        match self {
+            MetalLanes::Stored { zero, bytes: true } => offset == zero,
+            MetalLanes::Stored { zero, bytes: false } => !bytes && offset >= zero,
+            MetalLanes::Table => offset == 128,
+            MetalLanes::Grid => !bytes,
+        }
+    }
+}
+
+fn metal_lanes(axes: &registry::DecodeAxes) -> Option<MetalLanes> {
+    use registry::CodeInterpretation as Code;
+    let code = match axes.coding.codes() {
+        registry::ValueCodes::Fields(code) => code,
+        registry::ValueCodes::Grid(_) => {
+            return axes.profile().codes.fits_i8().then_some(MetalLanes::Grid);
+        }
+        registry::ValueCodes::Digits { .. } => return None,
+    };
+    // Every split `code_planes` makes of up to 8 bits; a plane of bytes is
+    // the one without a high plane at 8.
+    let width = axes.low + axes.high;
+    let planes = width <= 8 && registry::code_planes(width) == Some((axes.low, axes.high));
+    let bytes = (axes.low, axes.high) == (8, 0);
+    match code {
+        Code::Unsigned => planes.then_some(MetalLanes::Stored { zero: 0, bytes }),
+        Code::Offset(zero) => planes.then_some(MetalLanes::Stored {
+            zero: u32::try_from(zero).ok()?,
+            bytes,
+        }),
+        Code::TwosComplement => bytes.then_some(MetalLanes::Stored { zero: 128, bytes }),
+        Code::Table(_) => ((axes.low, axes.high) == (4, 0) && axes.profile().codes.fits_i8())
+            .then_some(MetalLanes::Table),
+        Code::Odd(_) => None,
+    }
 }
 
 /// Whether a Metal producer reads the weight's local codes from its scales
 /// plane, of plain unsigned codes (`packets::LocalUnsigned`), rather than
 /// from its grid entries.
 fn metal_plane_locals(axes: &registry::DecodeAxes, unsigned: bool) -> bool {
-    match &axes.coefficients {
-        registry::CoefficientAxes::Direct { .. } => true,
-        registry::CoefficientAxes::Hierarchical { locals, .. } => match locals {
-            registry::LocalCodes::Plane { interpretation, .. } => {
+    match &axes.coding {
+        registry::CodingAxes::Direct { .. } => true,
+        registry::CodingAxes::Hierarchical { interpretation, locals, .. } => match locals {
+            registry::LocalCodes::Plane { .. } => {
                 !unsigned || *interpretation == registry::CodeInterpretation::Unsigned
             }
             registry::LocalCodes::Carried { .. } => false,
@@ -313,21 +392,31 @@ pub fn metal_packing_of(id: RepresentationId) -> Option<MetalPacking> {
 /// columns; and a block of two runs only without a bias term,
 /// (centre - offset) scale + bias.
 ///
-/// Its producer packs entries of 4, 5 or 8 bits in runs of 32 columns or of
-/// 6 bits in runs of 16: linear codes enter as themselves, a codebook's
-/// 4-bit codes as its values of 8 bits + 128 (`codebooks::pairs`), and local
-/// codes come from the scales plane.
+/// Its producer packs a weight's lane codes (`metal_lanes`) as entries,
+/// the values + `offset`, of the fewest bits that hold them centred as the
+/// packing bound centres them (`packing_bound`): unsigned codes as
+/// themselves, centred at half their range, and signed values at the
+/// centre, a power of two holding their magnitudes. Entries below 8 bits pack
+/// in runs of 32 or 16 columns (`packing_layout`), entries of 8 bits only as
+/// bytes in runs of 32 (the residue bits' layout); local codes come from the
+/// scales plane.
 fn metal_packing(axes: &registry::DecodeAxes) -> Option<MetalPacking> {
     let profile = axes.profile();
-    let (bits, offset) = match profile.map {
-        ValueMap::Linear if axes.code != registry::CodeInterpretation::Odd => {
-            (axes.low + axes.high, u32::try_from(-profile.codes.least).ok()?)
-        }
-        ValueMap::Table if (axes.low, axes.high) == (4, 0) && profile.codes.fits_i8() => (8, 128),
-        ValueMap::Linear | ValueMap::Table | ValueMap::Grid => return None,
+    let lanes = metal_lanes(axes)?;
+    let (bits, offset) = if profile.codes.least >= 0 {
+        (
+            u32::BITS - u32::try_from(profile.codes.greatest).ok()?.leading_zeros(),
+            0,
+        )
+    } else {
+        let reach = u32::try_from((-profile.codes.least).max(profile.codes.greatest + 1)).ok()?;
+        let centre = reach.next_power_of_two();
+        (centre.trailing_zeros() + 1, centre)
     };
     let folds = metal_packet_groups(&profile);
-    let entries = matches!((bits, folds), (4 | 5 | 8, 1) | (6, 2)) && metal_plane_locals(axes, false);
+    let entries = (bits < 8 || folds == 1)
+        && lanes.enter_at(offset, bits == 8)
+        && metal_plane_locals(axes, false);
     let centre = 1u32 << (bits - 1);
     let biased = profile.local.bias != Bias::None || centre != offset;
     let factors = match profile.upper {
@@ -379,11 +468,12 @@ fn metal_int8(axes: &registry::DecodeAxes) -> Option<MetalInt8> {
         _ => false,
     };
     let produced = match profile.upper {
-        Some(_) => (axes.code == registry::CodeInterpretation::Unsigned
+        Some(_) => (axes.coding.codes() == registry::ValueCodes::Fields(registry::CodeInterpretation::Unsigned)
             && (axes.low, axes.high) == (4, 0)
             && metal_plane_locals(axes, true))
         .then_some(MetalInt8::Nibbles),
-        None => (axes.code == registry::CodeInterpretation::TwosComplement && (axes.low, axes.high) == (8, 0))
+        None => (axes.coding.codes() == registry::ValueCodes::Fields(registry::CodeInterpretation::TwosComplement)
+            && (axes.low, axes.high) == (8, 0))
             .then_some(MetalInt8::Bytes),
     };
     produced.filter(|_| codes && coefficients)
@@ -438,23 +528,26 @@ enum MetalMatrix {
     /// the operand's 2^-24 (`matrix_codes`).
     Codes,
     /// Codes under hierarchical coefficients without a minimum, a local
-    /// scale code per 16 columns and factors per 256 (`matrix_runs`).
-    Runs,
-    /// Codes under a direct scale per 32 columns without a bias
-    /// (`matrix_symmetric`).
+    /// scale code per 16 or 32 columns and factors per 256, a code times a
+    /// scale code an exact F32 integer, or, `halves`, below 2048, an exact
+    /// F16 integer (`matrix_runs`, `MATRIX_RUNS` 2).
+    Runs { halves: bool },
+    /// Codes of `i8` under a direct scale per 32 columns or a multiple of
+    /// them without a bias, exact F16 integers (`matrix_symmetric`).
     Symmetric,
 }
 
 /// The matrix GEMV product serving a weight.
 ///
 /// Each product's arithmetic requires integer codes not scaled by a power
-/// of two of their own, under its levels (`MetalMatrix`). Its producer reads
-/// them as `packets::Offset` codes of a plane of low nibbles: with a plane
-/// of at most one high bit and plain unsigned local codes of the scales
-/// plane (`Codes`), with a plane of two high bits and local codes of the
-/// scales plane (`Runs`), or alone (`Symmetric`).
+/// of two of their own, under its levels (`MetalMatrix`). Its producer takes
+/// the weight's lane codes (`metal_lanes`): codes entering as themselves
+/// with plain unsigned local codes of the scales plane (`Codes`), any lane
+/// codes with local codes of the scales plane (`Runs`), or any lane codes
+/// (`Symmetric`).
 fn metal_matrix(axes: &registry::DecodeAxes) -> Option<MetalMatrix> {
     let profile = axes.profile();
+    let lanes = metal_lanes(axes)?;
     if profile.code_exponent != 0 {
         return None;
     }
@@ -462,18 +555,26 @@ fn metal_matrix(axes: &registry::DecodeAxes) -> Option<MetalMatrix> {
     match (profile.local.group, profile.local.scale, profile.local.bias) {
         (32, LocalScale::Code(locals), Bias::Minimum { .. })
             if factors
-                && profile.codes.least == 0
-                && metal_offset_planes(axes, &[0, 1])
+                && matches!(lanes, MetalLanes::Stored { zero: 0, .. })
                 && metal_plane_locals(axes, true) =>
         {
             (profile.codes.greatest * locals.greatest < 2048).then_some(MetalMatrix::Codes)
         }
-        (16, LocalScale::Code(_), Bias::None)
-            if factors && metal_offset_planes(axes, &[2]) && metal_plane_locals(axes, false) =>
+        (16 | 32, LocalScale::Code(locals), Bias::None)
+            if factors && metal_plane_locals(axes, false) =>
         {
-            Some(MetalMatrix::Runs)
+            let magnitude = |least: i32, greatest: i32| least.abs().max(greatest.abs());
+            let product = magnitude(profile.codes.least, profile.codes.greatest)
+                * magnitude(locals.least, locals.greatest);
+            Some(MetalMatrix::Runs {
+                halves: product < 2048,
+            })
         }
-        (32, LocalScale::Stored(_), Bias::None) if metal_offset_planes(axes, &[0]) => Some(MetalMatrix::Symmetric),
+        (group, LocalScale::Stored(_), Bias::None)
+            if group % 32 == 0 && profile.codes.fits_i8() =>
+        {
+            Some(MetalMatrix::Symmetric)
+        }
         _ => None,
     }
 }
@@ -483,16 +584,35 @@ mod tests {
     use super::*;
 
     /// CUDA's GEMM recipe of every representation it imports, as main's
-    /// library derived it (`ScaledGemm`), and for q4g32, q2k and q2g256 as
-    /// the same choice takes them.
+    /// library derived it (`ScaledGemm`), and for q4g32, q2k, q2g256,
+    /// q1g128, iq2s, iq1s, iq1m, b3g256, q3k, iq4xs and iq3s as the same
+    /// choice takes them.
     #[test]
     fn cuda_folds_are_mains() {
         let folded = [
-            "q4g32s", "iq4g32s", "q5g32s", "q5g32", "mxfp4g32", "nvfp4g16", "nvfp4g16a4", "iq2xs", "iq3xxs", "iq2xxs",
+            "q4g32s",
+            "iq4g32s",
+            "q5g32s",
+            "q5g32",
+            "mxfp4g32",
+            "nvfp4g16",
+            "nvfp4g16a4",
+            "iq2xs",
+            "iq3xxs",
+            "iq2xxs",
             "q4g32",
+            "iq2s",
+            "iq1s",
+            "iq1m",
+            "iq3s",
         ];
-        let rounded = ["q4k", "q5k", "q6k", "q8g32s", "iq4g32", "q2k", "q2g256"];
-        let expected = folded.map(|storage| (storage, true)).into_iter().chain(rounded.map(|storage| (storage, false)));
+        let rounded = [
+            "q4k", "q5k", "q6k", "q8g32s", "q2k", "q2g256", "q1g128", "b3g256", "q3k", "iq4xs",
+        ];
+        let expected = folded
+            .map(|storage| (storage, true))
+            .into_iter()
+            .chain(rounded.map(|storage| (storage, false)));
         for (storage, fold) in expected {
             let id = registry::storage(storage, registry::Layout::Mma16).unwrap();
             assert_eq!(cuda_gemm_fold_of(id), fold, "{storage}");
@@ -506,8 +626,9 @@ mod tests {
     #[test]
     fn cuda_int8_is_mains() {
         let admitted = [
-            "q4k", "q5k", "q6k", "q8g32s", "iq4g32", "q4g32s", "iq4g32s", "q5g32s", "q5g32", "mxfp4g32", "nvfp4g16",
-            "iq2xs", "iq3xxs", "iq2xxs", "q4g32", "q2k", "q2g256",
+            "q4k", "q5k", "q6k", "q8g32s", "q4g32s", "iq4g32s", "q5g32s", "q5g32", "mxfp4g32",
+            "nvfp4g16", "iq2xs", "iq3xxs", "iq2xxs", "q4g32", "q2k", "q2g256", "q1g128", "iq2s",
+            "iq1s", "iq1m", "b3g256", "q3k", "iq4xs", "iq3s",
         ];
         let excluded = ["nvfp4g16a4"];
         let int8 = Form::named(BackendName::Cuda, "INT8").unwrap();
@@ -533,10 +654,34 @@ mod tests {
     #[test]
     fn cpu_int8_is_mains() {
         let admitted = [
-            "f32", "bf16", "f16", "q4k@rows16", "q5k@rows16", "q6k@rows16", "q8g32s@rows16", "iq4g32@rows16",
-            "q4g32s@rows16", "iq4g32s@rows16", "q5g32s@rows16", "q5g32@rows16", "mxfp4g32@rows16",
-            "nvfp4g16@rows16", "iq2xs@rows16", "iq3xxs@rows16", "iq2xxs@rows16", "q4g32@rows16", "q2k@rows16",
-            "q2g256@rows16", "q4k@rows8",
+            "f32",
+            "bf16",
+            "f16",
+            "q4k@rows16",
+            "q5k@rows16",
+            "q6k@rows16",
+            "q8g32s@rows16",
+            "q4g32s@rows16",
+            "iq4g32s@rows16",
+            "q5g32s@rows16",
+            "q5g32@rows16",
+            "mxfp4g32@rows16",
+            "nvfp4g16@rows16",
+            "iq2xs@rows16",
+            "iq3xxs@rows16",
+            "iq2xxs@rows16",
+            "q4g32@rows16",
+            "q2k@rows16",
+            "q2g256@rows16",
+            "q1g128@rows16",
+            "iq2s@rows16",
+            "iq1s@rows16",
+            "iq1m@rows16",
+            "b3g256@rows16",
+            "q3k@rows16",
+            "iq4xs@rows16",
+            "iq3s@rows16",
+            "q4k@rows8",
         ];
         let excluded = ["nvfp4g16a4@rows16"];
         let int8 = Form::named(BackendName::Cpu, "INT8").unwrap();
@@ -588,7 +733,10 @@ mod tests {
         for info in registry::representations() {
             let groups = registry::decode_axes(info.id).map_or(0, |axes| metal_packet_groups(&axes.profile()));
             let nibbles = registry::decode_axes(info.id)
-                .is_some_and(|axes| axes.code == registry::CodeInterpretation::Unsigned && (axes.low, axes.high) == (4, 0));
+                .is_some_and(|axes| {
+                    axes.coding.codes() == registry::ValueCodes::Fields(registry::CodeInterpretation::Unsigned)
+                        && (axes.low, axes.high) == (4, 0)
+                });
             assert_eq!(folds.of(info.id), pack.of(info.id) * groups, "{}", info.name);
             assert_eq!(interleaved.of(info.id), int8.of(info.id) * u32::from(nibbles), "{}", info.name);
         }
@@ -599,12 +747,13 @@ mod tests {
         }
     }
 
-    /// Metal's admissions of every representation it imports, as main's
-    /// libraries matched their decoders' shapes (and, for q4g32, q2k and
-    /// q2g256, as the same rules admit them): PACK (folds, centre, offset,
-    /// residue), INT8 and the matrix GEMV product.
+    /// Metal's admissions of every representation it imports: PACK (folds,
+    /// centre, offset, residue), INT8 and the matrix GEMV product, as
+    /// `metal_packing`, `metal_int8` and `metal_matrix` admit each over the
+    /// lane codes `metal_lanes` delivers (every code-plane split up to 8
+    /// bits, codebook and grid of `i8` values; no odd codes or digits).
     #[test]
-    fn metal_admissions_are_mains() {
+    fn metal_admissions_are_pinned() {
         let pack = |folds, centre, offset, residue| {
             Some(MetalPacking {
                 folds,
@@ -616,22 +765,94 @@ mod tests {
         let expected = [
             ("q4k", pack(1, 8, 0, false), Some(MetalInt8::Nibbles), Some(MetalMatrix::Codes)),
             ("q5k", pack(1, 16, 0, false), None, Some(MetalMatrix::Codes)),
-            ("q6k", pack(2, 32, 32, false), None, Some(MetalMatrix::Runs)),
-            ("q8g32s", pack(1, 128, 128, true), Some(MetalInt8::Bytes), None),
-            ("iq4g32", pack(1, 128, 128, true), None, None),
-            ("q4g32s", pack(1, 8, 8, false), None, Some(MetalMatrix::Symmetric)),
-            ("iq4g32s", pack(1, 128, 128, true), None, None),
-            ("q5g32s", pack(1, 16, 16, false), None, None),
+            (
+                "q6k",
+                pack(2, 32, 32, false),
+                None,
+                Some(MetalMatrix::Runs { halves: false }),
+            ),
+            (
+                "q8g32s",
+                pack(1, 128, 128, true),
+                Some(MetalInt8::Bytes),
+                Some(MetalMatrix::Symmetric),
+            ),
+            (
+                "q4g32s",
+                pack(1, 8, 8, false),
+                None,
+                Some(MetalMatrix::Symmetric),
+            ),
+            (
+                "iq4g32s",
+                pack(1, 128, 128, true),
+                None,
+                Some(MetalMatrix::Symmetric),
+            ),
+            (
+                "q5g32s",
+                pack(1, 16, 16, false),
+                None,
+                Some(MetalMatrix::Symmetric),
+            ),
             ("q5g32", pack(1, 16, 0, false), None, None),
             ("mxfp4g32", None, None, None),
             ("nvfp4g16", None, None, None),
             ("nvfp4g16a4", None, None, None),
-            ("iq2xs", None, None, None),
-            ("iq3xxs", None, None, None),
+            (
+                "iq2xs",
+                pack(2, 64, 64, false),
+                None,
+                Some(MetalMatrix::Runs { halves: true }),
+            ),
+            (
+                "iq3xxs",
+                pack(1, 64, 64, false),
+                None,
+                Some(MetalMatrix::Runs { halves: true }),
+            ),
             ("iq2xxs", None, None, None),
             ("q4g32", pack(1, 8, 0, false), None, None),
             ("q2k", None, None, None),
-            ("q2g256", None, None, None),
+            (
+                "q2g256",
+                pack(1, 4, 4, false),
+                None,
+                Some(MetalMatrix::Symmetric),
+            ),
+            ("q1g128", None, None, None),
+            (
+                "iq2s",
+                pack(2, 64, 64, false),
+                None,
+                Some(MetalMatrix::Runs { halves: true }),
+            ),
+            ("iq1s", None, None, None),
+            (
+                "iq1m",
+                pack(2, 16, 16, false),
+                None,
+                Some(MetalMatrix::Runs { halves: true }),
+            ),
+            ("b3g256", None, None, None),
+            (
+                "q3k",
+                pack(2, 4, 4, false),
+                None,
+                Some(MetalMatrix::Runs { halves: true }),
+            ),
+            (
+                "iq4xs",
+                pack(1, 128, 128, true),
+                None,
+                Some(MetalMatrix::Runs { halves: false }),
+            ),
+            (
+                "iq3s",
+                pack(1, 16, 16, false),
+                None,
+                Some(MetalMatrix::Runs { halves: true }),
+            ),
         ];
         for (storage, packing, int8, matrix) in expected {
             let id = registry::storage(storage, registry::Layout::Rows32).unwrap();
