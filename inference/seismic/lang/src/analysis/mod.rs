@@ -406,13 +406,6 @@ fn lattice(encoding: &PlaneEncoding) -> Lattice {
                 .flat_map(|code| [code, -code])
                 .map(f64::from),
         )),
-        // A byte's digits take the codes of a digit.
-        PlaneEncoding::Digits { interpretation, .. } => Lattice::Codes(CodeLevels::of(
-            interpretation
-                .codes_below(crate::registry::DIGIT_RADIX, crate::registry::DIGIT_BITS)
-                .into_iter()
-                .map(f64::from),
-        )),
         PlaneEncoding::FloatCode { format } => Lattice::Codes(CodeLevels::of(
             (0..1u32 << format.bits())
                 .map(|raw| f64::from(format.decode(raw)))
@@ -484,7 +477,6 @@ fn packed(
             DecodeStep::InterpretCode { raw: from, .. }
             | DecodeStep::SignedCode { code: from, .. }
             | DecodeStep::InterpretGridCode { raw: from, .. }
-            | DecodeStep::InterpretDigitCode { raw: from, .. }
             | DecodeStep::DecodeFloatCode { raw: from, .. }
             | DecodeStep::ConvertToF32 { from, .. } => get(*from),
             DecodeStep::Constant { value, .. } => Term::constant(value.to_f64()),

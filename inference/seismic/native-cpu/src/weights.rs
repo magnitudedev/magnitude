@@ -27,8 +27,8 @@ use crate::quant::{Q8Block, Q8_BLOCK};
 use crate::reduce::{combine, LANES};
 use magnitude_ggml::tables;
 use seismic_lang::registry::{
-    DigitCodes, GridSigns, Layout, LocalBias, MinimumSign, RepresentationInfo, RepresentationKind,
-    RowPlaneRole, DIGIT_BITS, DIGIT_BYTE_BITS, DIGIT_RADIX,
+    GridSigns, Layout, LocalBias, MinimumSign, RepresentationInfo, RepresentationKind,
+    RowPlaneRole,
 };
 use std::marker::PhantomData;
 
@@ -639,18 +639,6 @@ pub trait Codes: Copy + Send + Sync + 'static {
     /// `at` is a packet of a row.
     unsafe fn values(at: At) -> [i8; PACKET];
 
-    /// [`Codes::values`] as tier `V` reads them for a float decode: codes
-    /// whose scalar reading leaves the vectorizer a choice read through the
-    /// tier's vectors instead, so every body inlining the decode compiles it
-    /// alike.
-    ///
-    /// # Safety
-    /// As [`Codes::values`].
-    #[inline(always)]
-    unsafe fn decoded<V: Vectors>(at: At) -> [i8; PACKET] {
-        unsafe { Self::values(at) }
-    }
-
     /// The values in registers, values `0..16` then `16..32`.
     ///
     /// # Safety
@@ -1183,211 +1171,6 @@ impl<
             ));
         }
         values
-    }
-}
-
-/// The runs of base-3 digit codes (`registry::DigitCodes`), a digits
-/// component's parameter (build.rs generates one type per runs).
-pub trait DigitRuns: Copy + Send + Sync + 'static {
-    const CODES: DigitCodes;
-}
-
-/// Base-3 digit codes (`registry::DigitCodes`) of runs `R`, a storage
-/// group's bytes whole in the codes plane: value `o` of a run of `bytes`
-/// bytes is digit `o / bytes` of its byte `o % bytes`, digit `n` of byte `b`
-/// being `(((b 3^n) mod 256) 3) >> 8`, read through interpretation `I`, whose
-/// values are the registry's code domain `LEAST..=GREATEST`
-/// (`DecodeAxes::codes`).
-#[derive(Clone, Copy, Debug)]
-pub struct Digits<R, I, const LEAST: i32, const GREATEST: i32>(PhantomData<(R, I)>);
-
-/// Packets of a digits storage group, at most a block's.
-const DIGIT_PACKETS: usize = Q8_BLOCK / PACKET;
-
-/// Where packet `p` of a digits storage group of `bytes` bytes (at least
-/// 16) reads: two 16-byte windows of the group, `windows[p]`, and per value
-/// its byte's position in the two windows' 32 bytes and its power `3^n`.
-struct DigitPlaces {
-    windows: [(usize, usize); DIGIT_PACKETS],
-    positions: [[u8; PACKET]; DIGIT_PACKETS],
-    powers: [[u8; PACKET]; DIGIT_PACKETS],
-}
-
-impl DigitPlaces {
-    const fn of(codes: &DigitCodes) -> Self {
-        let (bytes, values) = (codes.bytes() as usize, codes.values() as usize);
-        assert!(bytes >= 16, "a digits group holds two 16-byte windows");
-        assert!(values <= Q8_BLOCK, "a digits group holds at most a block");
-        assert!(values % PACKET == 0, "a digits group holds whole packets");
-        let mut places = Self {
-            windows: [(0, 0); DIGIT_PACKETS],
-            positions: [[0; PACKET]; DIGIT_PACKETS],
-            powers: [[0; PACKET]; DIGIT_PACKETS],
-        };
-        // Each value's byte and digit (`DigitCodes::place`).
-        let mut byte_of = [0usize; Q8_BLOCK];
-        let mut value = 0;
-        while value < values {
-            let (byte, digit) = codes.place(value as u32);
-            byte_of[value] = byte as usize;
-            places.powers[value / PACKET][value % PACKET] = DIGIT_RADIX.pow(digit) as u8;
-            value += 1;
-        }
-        let mut p = 0;
-        while p < value / PACKET {
-            let (mut least, mut end) = (usize::MAX, 0);
-            let mut i = 0;
-            while i < PACKET {
-                let byte = byte_of[PACKET * p + i];
-                if byte < least {
-                    least = byte;
-                }
-                if byte + 1 > end {
-                    end = byte + 1;
-                }
-                i += 1;
-            }
-            let last = bytes - 16;
-            let first = if least < last { least } else { last };
-            let second = if end < 16 {
-                0
-            } else if end - 16 < last {
-                end - 16
-            } else {
-                last
-            };
-            places.windows[p] = (first, second);
-            let mut i = 0;
-            while i < PACKET {
-                let byte = byte_of[PACKET * p + i];
-                places.positions[p][i] = if first <= byte && byte < first + 16 {
-                    (byte - first) as u8
-                } else {
-                    assert!(
-                        second <= byte && byte < second + 16,
-                        "a packet's digit bytes lie within two 16-byte windows"
-                    );
-                    (16 + byte - second) as u8
-                };
-                i += 1;
-            }
-            p += 1;
-        }
-        places
-    }
-}
-
-impl<R: DigitRuns, I: Interpretation, const LEAST: i32, const GREATEST: i32>
-    Digits<R, I, LEAST, GREATEST>
-{
-    const PLACES: DigitPlaces = DigitPlaces::of(&R::CODES);
-    /// The code domain, whose values fit a signed byte.
-    const DOMAIN: (i32, i32) = {
-        assert!(
-            i8::MIN as i32 <= LEAST && LEAST <= GREATEST && GREATEST <= i8::MAX as i32,
-            "values fit a signed byte"
-        );
-        (LEAST, GREATEST)
-    };
-    /// The value of each digit minus `least` (as an unsigned byte), then
-    /// zeros: a 16-entry table, constant once inlined.
-    #[inline(always)]
-    fn table(least: i32) -> [i8; 16] {
-        let mut table = [0i8; 16];
-        for digit in 0..DIGIT_RADIX {
-            table[digit as usize] = (I::value::<DIGIT_BITS>(digit) - least) as u8 as i8;
-        }
-        table
-    }
-
-    /// The group's two 16-byte windows of packet `at`.
-    #[inline(always)]
-    unsafe fn windows(at: At) -> (*const u8, *const u8) {
-        let (first, second) = Self::PLACES.windows[at.packet];
-        let digits = at.plane(RowPlaneRole::Codes);
-        unsafe { (digits.add(first), digits.add(second)) }
-    }
-}
-
-impl<R: DigitRuns, I: Interpretation, const LEAST: i32, const GREATEST: i32> Codes
-    for Digits<R, I, LEAST, GREATEST>
-{
-    const LEAST: i32 = Self::DOMAIN.0;
-    const GREATEST: i32 = Self::DOMAIN.1;
-
-    #[inline(always)]
-    unsafe fn values(at: At) -> [i8; PACKET] {
-        let (first, second) = unsafe { Self::windows(at) };
-        let mut bytes = [0u8; PACKET];
-        unsafe {
-            std::ptr::copy_nonoverlapping(first, bytes.as_mut_ptr(), 16);
-            std::ptr::copy_nonoverlapping(second, bytes.as_mut_ptr().add(16), 16);
-        }
-        let (positions, powers) = (
-            &Self::PLACES.positions[at.packet],
-            &Self::PLACES.powers[at.packet],
-        );
-        let mut values = [0i8; PACKET];
-        for i in 0..PACKET {
-            let byte = bytes[positions[i] as usize].wrapping_mul(powers[i]);
-            values[i] =
-                Self::table(0)[((u32::from(byte) * DIGIT_RADIX) >> DIGIT_BYTE_BITS) as usize];
-        }
-        values
-    }
-
-    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
-    #[inline(always)]
-    unsafe fn neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
-        use std::arch::aarch64::*;
-        unsafe {
-            let (first, second) = Self::windows(at);
-            let windows = uint8x16x2_t(vld1q_u8(first), vld1q_u8(second));
-            let (positions, powers) = (
-                Self::PLACES.positions[at.packet].as_ptr(),
-                Self::PLACES.powers[at.packet].as_ptr(),
-            );
-            let table = vld1q_s8(Self::table(0).as_ptr());
-            [0, 16].map(|half| {
-                let bytes = vqtbl2q_u8(windows, vld1q_u8(positions.add(half)));
-                let digits = packed_neon::digits(vmulq_u8(bytes, vld1q_u8(powers.add(half))));
-                vqtbl1q_s8(table, digits)
-            })
-        }
-    }
-
-    /// On a tier of 256-bit integer vectors, the digits of [`Codes::x86`]:
-    /// the scalar reading's per-value byte gather and digit extraction is
-    /// otherwise vectorized differently in each body that inlines it.
-    #[inline(always)]
-    unsafe fn decoded<V: Vectors>(at: At) -> [i8; PACKET] {
-        #[cfg(target_arch = "x86_64")]
-        if const { V::TIER.vector_bytes() >= 32 } {
-            let mut values = [0i8; PACKET];
-            unsafe {
-                std::arch::x86_64::_mm256_storeu_si256(values.as_mut_ptr().cast(), Self::x86(at))
-            };
-            return values;
-        }
-        unsafe { Self::values(at) }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
-    unsafe fn x86(at: At) -> std::arch::x86_64::__m256i {
-        unsafe {
-            let digits = packed_x86::digits(Self::windows(at), &Self::PLACES, at.packet);
-            packed_x86::lookup(packed_x86::table(&Self::table(0)), digits)
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
-    unsafe fn x86_shifted(at: At) -> std::arch::x86_64::__m256i {
-        unsafe {
-            let digits = packed_x86::digits(Self::windows(at), &Self::PLACES, at.packet);
-            packed_x86::lookup(packed_x86::table(&Self::table(LEAST)), digits)
-        }
     }
 }
 
@@ -2740,7 +2523,7 @@ impl<C: Codes, K: Coefficients, const STORAGE: usize> Format for PackedRows<C, K
         }
         #[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
         {
-            let values = unsafe { C::decoded::<V>(at) };
+            let values = unsafe { C::values(at) };
             for half in 0..2 {
                 let (scale, bias) = coefficients[half];
                 for i in 16 * half..16 * half + 16 {
@@ -2771,7 +2554,6 @@ impl<C: Codes, K: Coefficients, const STORAGE: usize> Format for PackedRows<C, K
 /// are formed in two vectors in element order and never leave registers.
 #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
 mod packed_neon {
-    use super::DIGIT_RADIX;
     use std::arch::aarch64::*;
 
     /// `acc` plus the four-way signed byte dot products of `a` and `b`.
@@ -2944,18 +2726,6 @@ mod packed_neon {
         }
     }
 
-    /// The digits `(DIGIT_RADIX x) >> 8` of the bytes `x`
-    /// (`registry::DigitCodes`): the high bytes of the widened products.
-    #[inline(always)]
-    pub(super) fn digits(x: uint8x16_t) -> uint8x16_t {
-        unsafe {
-            let radix = vdupq_n_u8(DIGIT_RADIX as u8);
-            let low = vmull_u8(vget_low_u8(x), vget_low_u8(radix));
-            let high = vmull_high_u8(x, radix);
-            vuzp2q_u8(vreinterpretq_u8_u16(low), vreinterpretq_u8_u16(high))
-        }
-    }
-
     /// A packet's codes in element order under a 2-bit high plane: codes 2i
     /// and 2i + 1 join the low and high nibble of byte i with bits 0-1 and
     /// 2-3 of the high plane's nibble i. Codes are at most 63.
@@ -2998,7 +2768,7 @@ mod packed_neon {
 /// sums of 16-bit products never saturate (`2 * 128 * 127 < 2^15`).
 #[cfg(target_arch = "x86_64")]
 mod packed_x86 {
-    use super::{Vectors, DIGIT_RADIX};
+    use super::Vectors;
     use std::arch::x86_64::*;
 
     /// 32 bytes at `bytes`.
@@ -3209,58 +2979,6 @@ mod packed_x86 {
                 _mm_slli_epi16::<4>(_mm_and_si128(_mm_srli_epi16::<2>(nibbles), three)),
             );
             _mm256_set_m128i(_mm_unpackhi_epi8(even, odd), _mm_unpacklo_epi8(even, odd))
-        }
-    }
-
-    /// The base-3 digits of packet `packet` of a digits storage group
-    /// (`super::Digits`) whose two 16-byte windows are at `windows`: each
-    /// value's byte times its power `3^n` modulo 256 and then `(3 x) >> 8`,
-    /// both in 16-bit lanes with the byte in their high half, even bytes and
-    /// odd bytes apart.
-    #[inline(always)]
-    pub(super) unsafe fn digits(
-        windows: (*const u8, *const u8),
-        places: &super::DigitPlaces,
-        packet: usize,
-    ) -> __m256i {
-        unsafe {
-            let (first, second) = (
-                _mm256_broadcastsi128_si256(_mm_loadu_si128(windows.0.cast())),
-                _mm256_broadcastsi128_si256(_mm_loadu_si128(windows.1.cast())),
-            );
-            // A position below 16 selects from the first window, the rest
-            // from the second; a set top bit selects zero.
-            let positions = load(places.positions[packet].as_ptr().cast());
-            let in_second = _mm256_cmpgt_epi8(positions, _mm256_set1_epi8(15));
-            let bytes = _mm256_or_si256(
-                _mm256_shuffle_epi8(first, _mm256_or_si256(positions, in_second)),
-                _mm256_shuffle_epi8(
-                    second,
-                    _mm256_or_si256(
-                        _mm256_sub_epi8(positions, _mm256_set1_epi8(16)),
-                        _mm256_andnot_si256(in_second, _mm256_set1_epi8(i8::MIN)),
-                    ),
-                ),
-            );
-            let powers = load(places.powers[packet].as_ptr().cast());
-            let radix = _mm256_set1_epi16(DIGIT_RADIX as i16);
-            // (x << 8) p mod 2^16 = ((x p) mod 256) << 8, whose high product
-            // by the radix is (DIGIT_RADIX ((x p) mod 256)) >> 8.
-            let even = _mm256_mulhi_epu16(
-                _mm256_mullo_epi16(
-                    _mm256_slli_epi16::<8>(bytes),
-                    _mm256_and_si256(powers, _mm256_set1_epi16(0xff)),
-                ),
-                radix,
-            );
-            let odd = _mm256_mulhi_epu16(
-                _mm256_mullo_epi16(
-                    _mm256_and_si256(bytes, _mm256_set1_epi16(0xff00u16 as i16)),
-                    _mm256_srli_epi16::<8>(powers),
-                ),
-                radix,
-            );
-            _mm256_or_si256(even, _mm256_slli_epi16::<8>(odd))
         }
     }
 

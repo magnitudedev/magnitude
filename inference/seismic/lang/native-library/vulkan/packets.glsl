@@ -193,8 +193,8 @@ struct packets_rows16 {
 // staged GEMM to 32 bytes of local memory instead of 16 and slowed it 3%
 // (NVIDIA GB10, driver 580.159.03).
 struct packets_packet {
-    uvec4 low;       // the low plane's codes (8-bit: the first 16; 2-bit: .xy; 1-bit: .x), base-3 digit
-                     // codes as 4-bit codes, or the grid entries' whole bytes
+    uvec4 low;       // the low plane's codes (8-bit: the first 16; 2-bit: .xy; 1-bit: .x), or the
+                     // grid entries' whole bytes
     uvec4 second;    // 8-bit codes: the last 16
     uvec2 high;      // the high plane's codes: one bit in .x, two in .xy; the grid entries' rest in .x
     float scale0;    // the scales of the packet's (one or two) coefficient groups
@@ -238,34 +238,18 @@ void packets_set_group(inout packets_packet packet, uint g, float scale, const b
 // Code planes (`registry::code_planes`): a low plane of LOW bits a code and a
 // high plane of HIGH, a code's bits one byte of four (`packets_codes`); a
 // grid code's entries: four a packet, their whole bytes (LOW bits) in the
-// grids plane and the rest (HIGH bits) in the grid high plane; or base-3
-// digit bytes, a storage group's whole (`packets_digits`).
-
-// Whether slot axes `AXES` are base-3 digit codes.
-#define PACKETS_DIGITS(AXES) (AXES(SEISMIC_AXIS_FORM) == SEISMIC_FORM_ROWS && AXES(SEISMIC_AXIS_CODES_DIGIT_RUNS) != 0)
-
-// Run `r`'s value of a packed digit run axis (`CODES_DIGIT_RUN_*`, eight
-// bits a run).
-#define PACKETS_DIGIT_RUN(V, r) (((V) >> (8 * (r))) & 255)
-#define PACKETS_DIGIT_VALUES(AXES, r) (PACKETS_DIGIT_RUN(AXES(SEISMIC_AXIS_CODES_DIGIT_RUN_BYTES), r) \
-    * PACKETS_DIGIT_RUN(AXES(SEISMIC_AXIS_CODES_DIGIT_RUN_DIGITS), r))
+// grids plane and the rest (HIGH bits) in the grid high plane.
 
 // The code planes this file reads: 1-, 2- and 4-bit low planes with up to
 // two high bits, 8-bit low planes; grid entries of 8, 16 or 24 whole bits
-// with none, two or four more; and base-3 digits in runs of whole words of
-// bytes covering a storage group of whole packets.
+// with none, two or four more.
 #define PACKETS_READS_PLANES(AXES) (AXES(SEISMIC_AXIS_FORM) != SEISMIC_FORM_ROWS \
     || (AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID \
         && (AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 8 || AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 16 \
             || AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 24) \
         && (AXES(SEISMIC_AXIS_CODE_HIGH_BITS) == 0 || AXES(SEISMIC_AXIS_CODE_HIGH_BITS) == 2 \
             || AXES(SEISMIC_AXIS_CODE_HIGH_BITS) == 4)) \
-    || (PACKETS_DIGITS(AXES) \
-        && (AXES(SEISMIC_AXIS_CODES_DIGIT_RUN_BYTES) & 0x03030303) == 0 \
-        && AXES(SEISMIC_AXIS_LOGICAL_GROUP) % 32 == 0 \
-        && PACKETS_DIGIT_VALUES(AXES, 0) + PACKETS_DIGIT_VALUES(AXES, 1) + PACKETS_DIGIT_VALUES(AXES, 2) \
-            + PACKETS_DIGIT_VALUES(AXES, 3) == AXES(SEISMIC_AXIS_LOGICAL_GROUP)) \
-    || (AXES(SEISMIC_AXIS_CODES) != SEISMIC_CODES_GRID && !PACKETS_DIGITS(AXES) \
+    || (AXES(SEISMIC_AXIS_CODES) != SEISMIC_CODES_GRID \
         && (((AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 1 || AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 2 \
                     || AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 4) \
                 && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) <= 2) \
@@ -527,68 +511,6 @@ void packets_grid_codes(uvec2 point, uint signs,
                            (((uvec4(signs) >> uvec4(0u, 2u, 4u, 6u)) & 1u) << 31));
     odd = uintBitsToFloat(floatBitsToUint(vec4(low.y, low.w, high.y, high.w)) ^
                           (((uvec4(signs) >> uvec4(1u, 3u, 5u, 7u)) & 1u) << 31));
-}
-#endif
-
-#if PACKETS_SOME(PACKETS_DIGITS)
-// ---------------------------------------------------------------------------
-// Digit codes (`registry::DigitCodes`): a storage group's share of the
-// codes plane is its runs' bytes in order, a run of B bytes of D digits
-// holding the next B D values, its value o digit o / B of its byte o % B,
-// digit n of byte b being ((b R^n mod 256) R) >> 8 for the radix R, whose
-// powers R^n (n >= 1) are the bytes of `SEISMIC_DIGIT_POWERS` (R its low
-// byte). Every run's bytes are whole words, so four consecutive values from
-// a multiple of four are one digit of one aligned word's bytes. Digits are
-// placed as 4-bit codes, so R is at most 16.
-#define PACKETS_DIGIT_POWERS uint(SEISMIC_DIGIT_POWERS)
-#define PACKETS_DIGIT_RADIX (PACKETS_DIGIT_POWERS & 0xffu)
-#if (SEISMIC_DIGIT_POWERS & 0xff) > 16
-#error "digits are placed as 4-bit codes"
-#endif
-
-// R^n: a word holds R^0 .. R^3, and R^4 is the top byte of the powers.
-uint packets_digit_power(const uint n) {
-    return n == 4u ? PACKETS_DIGIT_POWERS >> 24u : (((PACKETS_DIGIT_POWERS << 8u) | 1u) >> (8u * n)) & 0xffu;
-}
-
-// The digits of bytes 0 and 2 of `word` (bits 0 and 16), `power` R^n of
-// their digit: in those 16-bit lanes, where no product reaches the next
-// lane, a lane's digit its low 4 bits.
-uint packets_digit_lanes(const uint word, const uint power) {
-    return (((((word & 0x00ff00ffu) * power) & 0x00ff00ffu) * PACKETS_DIGIT_RADIX) >> 8u) & 0x000f000fu;
-}
-
-// Packet p's 32 codes into `packet.low`, placed as 4-bit codes are (code 2i
-// in the low nibble of byte i), which `packets_decode` reads.
-void packets_digits(const int kind, uint64_t plane, uint p, inout packets_packet packet) {
-    const uint runs = uint(PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_DIGIT_RUNS));
-    const uint run_bytes = uint(PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_DIGIT_RUN_BYTES));
-    const uint run_digits = uint(PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_DIGIT_RUN_DIGITS));
-    const uint per = uint(PACKETS_AXIS(kind, SEISMIC_AXIS_LOGICAL_GROUP)) / 32u; // packets a storage group
-    // The four runs a packed run axis holds, eight bits a run of a word.
-    uint share = 0u;
-    [[unroll]] for (uint r = 0u; r < 4u; ++r)
-        share += PACKETS_DIGIT_RUN(run_bytes, r);
-    const uint64_t at = plane + uint64_t(p / per) * uint64_t(share);
-    [[unroll]] for (uint quad = 0u; quad < 8u; ++quad) {
-        // The run of values v.., its byte and R^digit.
-        const uint v = 32u * (p % per) + 4u * quad;
-        uint byte = 0u, power = 1u, first = 0u, offset = 0u;
-        [[unroll]] for (uint r = 0u; r < 4u; ++r) {
-            const uint bytes = PACKETS_DIGIT_RUN(run_bytes, r), values = bytes * PACKETS_DIGIT_RUN(run_digits, r);
-            if (r < runs && v >= first && v < first + values) {
-                byte = offset + (v - first) % bytes;
-                power = packets_digit_power((v - first) / bytes);
-            }
-            first += values;
-            offset += bytes;
-        }
-        const uint word = element_u32_at(at + uint64_t(byte));
-        // Digits of bytes 0, 2 at bits 0, 16 and of bytes 1, 3 at bits 4, 20,
-        // then bytes 2, 3's moved to bits 8, 12.
-        const uint codes = packets_digit_lanes(word, power) | (packets_digit_lanes(word >> 8u, power) << 4u);
-        packet.low[quad >> 1] |= ((codes & 0xffu) | ((codes >> 8u) & 0xff00u)) << (16u * (quad & 1u));
-    }
 }
 #endif
 
@@ -875,10 +797,6 @@ packets_packet packets_load(const int kind, uint64_t row, packets_rows16 geometr
     // The packet's codes: 32 codes or 4 grid entries of `low` bits.
     const bool grid = PACKETS_AXIS(kind, SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID;
     const uint64_t codes = row + geometry.codes + uint64_t((grid ? 4u : 32u) * low / 8u) * p;
-#if PACKETS_SOME(PACKETS_DIGITS)
-    if (PACKETS_OF(kind, PACKETS_DIGITS))
-        packets_digits(kind, row + geometry.codes, p, packet);
-#endif
 #if PACKETS_ANY(SEISMIC_AXIS_CODE_LOW_BITS, 1)
     if (low == 1u)
         packet.low.x = element_u32_at(codes);
@@ -1040,7 +958,7 @@ void packets_decode(const int kind, packets_packet packet, uint step, const bool
         return;
     }
 #endif
-    // 4-bit codes (base-3 digit codes placed so) and their high bits.
+    // 4-bit codes and their high bits.
     const uint word = packet.low[step];
     uint he = 0u, ho = 0u;
 #if PACKETS_ANY(SEISMIC_AXIS_CODE_HIGH_BITS, 1)

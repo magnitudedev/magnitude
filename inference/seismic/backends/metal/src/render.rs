@@ -27,9 +27,8 @@ use seismic_ir::physical_target::KernelEmissionLayout;
 use seismic_ir::storage::LaunchLocalKind;
 use seismic_lang::intrinsics::{AtomicOp, MathOp, ReduceOp};
 use seismic_lang::registry::{
-    CodeInterpretation, DecodeStep, DigitCodes, FloatCodeFormat, GridCodes, GridSigns, LookupTable,
-    PlaneEncoding, PlaneRepackRecipe, RepackExpr, RepresentationKind, DIGITS_PER_BYTE, DIGIT_BITS,
-    DIGIT_RADIX,
+    CodeInterpretation, DecodeStep, FloatCodeFormat, GridCodes, GridSigns, LookupTable,
+    PlaneEncoding, PlaneRepackRecipe, RepackExpr, RepresentationKind,
 };
 use seismic_lang::types::DType;
 use std::collections::BTreeMap;
@@ -811,27 +810,8 @@ impl<'a> Renderer<'a> {
                             )
                         }
                         DecodeStep::ReadPlaneLane { plane, .. } => {
-                            let schema = &layout.planes[*plane as usize];
-                            match &schema.encoding {
-                                PlaneEncoding::Digits { digits, .. } => {
-                                    digit_place(&plane_lane(coords, schema.group), digits).1
-                                }
-                                _ => plane_lane(coords, schema.group),
-                            }
+                            plane_lane(coords, layout.planes[*plane as usize].group)
                         }
-                        DecodeStep::InterpretDigitCode {
-                            raw,
-                            digit,
-                            interpretation,
-                            ..
-                        } => interpret_code(
-                            &digit_code(
-                                &temps[recipe.ordinal(*raw)],
-                                &temps[recipe.ordinal(*digit)],
-                            ),
-                            DIGIT_BITS,
-                            interpretation,
-                        ),
                         DecodeStep::InterpretGridCode {
                             raw, lane, grid, ..
                         } => {
@@ -921,20 +901,8 @@ impl<'a> Renderer<'a> {
         let (pointer, packet) = self.closed_address(place, coords);
         let schema = &layout.planes[plane];
         let logical = coords.last().map(String::as_str).unwrap_or("0");
-        // A digits plane's group is one entry a byte, its value's byte the
-        // one its runs place it in (`PlaneSchema::entry`).
-        let within = match &schema.encoding {
-            PlaneEncoding::Digits { digits, .. } => {
-                assert_eq!(field, 0, "a digits plane has one field");
-                format!(
-                    "ulong({})",
-                    digit_place(&plane_lane(coords, schema.group), digits).0
-                )
-            }
-            _ => format!("{field}ul"),
-        };
         let entry = format!(
-            "((ulong({logical}) % {}ul) / {}ul * {}ul + {within})",
+            "((ulong({logical}) % {}ul) / {}ul * {}ul + {field}ul)",
             layout.group, schema.group, schema.fields
         );
         let base = format!("({pointer} + ({packet}) + {}ul)", schema.offset);
@@ -947,7 +915,6 @@ impl<'a> Renderer<'a> {
             PlaneEncoding::Packed { .. }
             | PlaneEncoding::Grid(_)
             | PlaneEncoding::SignedLocal { .. }
-            | PlaneEncoding::Digits { .. }
             | PlaneEncoding::FloatCode { .. } => {
                 packed_field_expression(&base, &entry, schema.entry_bits)
             }
@@ -1867,39 +1834,6 @@ fn interpret_code(raw: &str, bits: u32, interpretation: &CodeInterpretation) -> 
 fn plane_lane(coords: &[String], group: u32) -> String {
     let column = coords.last().map(String::as_str).unwrap_or("0");
     format!("uint(ulong({column}) % {group}ul)")
-}
-
-/// The byte and the digit of the value at `within` (< its values) of a
-/// group of base-3 digit runs `digits` (`DigitCodes::place`), as U32
-/// expressions.
-fn digit_place(within: &str, digits: &DigitCodes) -> (String, String) {
-    let (mut byte, mut digit) = ("0u".to_owned(), "0u".to_owned());
-    let (mut first, mut start) = (digits.values(), digits.bytes());
-    for run in digits.runs.iter().rev() {
-        first -= run.bytes() * run.digits();
-        start -= run.bytes();
-        let offset = format!("(({within}) - {first}u)");
-        byte = format!(
-            "(({within}) >= {first}u ? {start}u + {offset} % {}u : {byte})",
-            run.bytes()
-        );
-        digit = format!(
-            "(({within}) >= {first}u ? {offset} / {}u : {digit})",
-            run.bytes()
-        );
-    }
-    (byte, digit)
-}
-
-/// Digit `digit` of byte `raw` (`DigitCodes::digit`): `(((raw 3^digit) mod
-/// 256) 3) >> 8`, `3^digit` from the powers below 256 as bytes of one word.
-fn digit_code(raw: &str, digit: &str) -> String {
-    let powers = (0..DIGITS_PER_BYTE).fold(0u64, |powers, n| {
-        powers | u64::from(DIGIT_RADIX.pow(n)) << (8 * n)
-    });
-    format!(
-        "(((((uint({raw}) & 0xffu) * (uint({powers:#x}ul >> (8u * uint({digit}))) & 0xffu)) & 0xffu) * {DIGIT_RADIX}u) >> 8)"
-    )
 }
 
 /// The code of the value at `lane` of vector-code entry `raw`

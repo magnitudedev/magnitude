@@ -17,10 +17,9 @@
 // share of the unit's 32-column chunks where the layout puts them. A unit
 // divides its group, so a tile covers a whole packet or part of a larger
 // one; the tile at a group's first column also places that group's other
-// record words. The grid holds a threadgroup per unit. A base-3 digits plane keeps a
-// group's bytes whole, placed as a group plane is (its unit the group). Stored-but-unoccupied bytes (mma16 padding rows and groups, plane
-// alignment tails, packet gaps) are written as zero, so the result is fully
-// defined.
+// record words. The grid holds a threadgroup per unit. Stored-but-unoccupied
+// bytes (mma16 padding rows and groups, plane alignment tails, packet gaps)
+// are written as zero, so the result is fully defined.
 
 #if !defined(SEISMIC_ELEMENT_E_KIND_EXTERNAL) || !defined(SEISMIC_ELEMENT_U_KIND_PACKED)
 #error "repack_weight converts an external GGUF source into packed resident storage"
@@ -193,9 +192,6 @@ ALWAYS_INLINE void zero_tail(device uchar *destination, constant ulong *seismic_
 }
 
 #if defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16)
-#if defined(SEISMIC_ELEMENT_U_PLANE_DIGITS)
-#error "repack_weight writes no mma16 base-3 digits"
-#endif
 static_assert(TILE_COLUMNS == CHUNK_COLUMNS, "an mma16 tile's code planes are 32-column units");
 #if !defined(SEISMIC_ELEMENT_U_PLANE_GRIDS)
 static_assert(32 % CODES_WORDS == 0 && (HIGH_WORDS == 0 || 32 % HIGH_WORDS == 0), "a code lies in one staged word");
@@ -333,19 +329,11 @@ kernel void repack_weight(
         SEISMIC_CONVERSION_E_U_UNIT(in, unit, words);
         if (!real)
             for (uint word = 0; word < UNIT_WORDS; ++word) words[word] = 0;
-#if defined(SEISMIC_ELEMENT_U_PLANE_DIGITS)
-        // A digits plane's unit is its group's share, whole.
-        static_assert(TILE_COLUMNS == GROUP && HIGH_WORDS == 0, "a digits group is one unit of one plane");
-        store(plane_group(destination, seismic_words, b, n, SEISMIC_RESULT_0_ROW_CODES,
-                          SEISMIC_RESULT_0_ROW_CODES_BYTES, ROLE_BYTES(CODES), group),
-              words, ROLE_BYTES(CODES), ROLE_ALIGNMENT(CODES));
-#else
         const ulong stored_unit = column0 / CHUNK_COLUMNS;
         place_unit(destination, seismic_words, b, n, words, CODES_WORDS, SEISMIC_RESULT_0_ROW_CODES, stored_unit,
                    ROLE_ALIGNMENT(CODES));
         place_unit(destination, seismic_words, b, n, words + CODES_WORDS, HIGH_WORDS, SEISMIC_RESULT_0_ROW_HIGH,
                    stored_unit, ROLE_ALIGNMENT(HIGH));
-#endif
     }
 #endif
 

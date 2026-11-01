@@ -14,9 +14,8 @@ use seismic_ir::physical_target::{
 use seismic_ir::storage::LaunchLocalKind;
 use seismic_lang::intrinsics::{AtomicOp, MathOp, ReduceOp};
 use seismic_lang::registry::{
-    CodeInterpretation, DecodeStep, DigitCodes, FloatCodeFormat, GridCodes, GridSigns, LookupTable,
-    PlaneEncoding, PlaneInfo, PlaneRepackRecipe, RepackExpr, DIGITS_PER_BYTE, DIGIT_BITS,
-    DIGIT_BYTE_BITS, DIGIT_RADIX,
+    CodeInterpretation, DecodeStep, FloatCodeFormat, GridCodes, GridSigns, LookupTable,
+    PlaneEncoding, PlaneInfo, PlaneRepackRecipe, RepackExpr,
 };
 use seismic_lang::types::DType;
 use seismic_native_target::{DeviceDescription, NativeCompilationError};
@@ -621,7 +620,7 @@ impl<'a> Emitter<'a> {
                 } => {
                     let index = indices.iter().map(|v| v.value()).collect::<Vec<_>>();
                     let (_, _, logical) = self.address(&place, &index);
-                    let lane = self.plane_lane(&logical, &plane_info);
+                    let lane = self.plane_lane(&logical, plane_info.group);
                     self.line(format!("mov.u32 {}, {lane};", self.v(out.value)));
                 }
                 ClosedOpView::ReadPlane {
@@ -1606,7 +1605,7 @@ impl<'a> Emitter<'a> {
                             value
                         }
                         DecodeStep::ReadPlaneLane { plane, .. } => {
-                            self.plane_lane(&logical, &layout.planes[*plane as usize])
+                            self.plane_lane(&logical, layout.planes[*plane as usize].group)
                         }
                         DecodeStep::InterpretGridCode {
                             raw, lane, grid, ..
@@ -1614,16 +1613,6 @@ impl<'a> Emitter<'a> {
                             &temps[recipe.ordinal(*raw)],
                             &temps[recipe.ordinal(*lane)],
                             grid,
-                        ),
-                        DecodeStep::InterpretDigitCode {
-                            raw,
-                            digit,
-                            interpretation,
-                            ..
-                        } => self.digit_code(
-                            &temps[recipe.ordinal(*raw)],
-                            &temps[recipe.ordinal(*digit)],
-                            interpretation,
                         ),
                         DecodeStep::DecodeFloatCode { raw, format, .. } => {
                             self.decode_float_code(&temps[recipe.ordinal(*raw)], *format)
@@ -2020,21 +2009,6 @@ impl<'a> Emitter<'a> {
             | PlaneEncoding::SignedLocal { .. } => {
                 self.packed_field(&base, &entry, plane.entry_bits)
             }
-            // The byte holding the value's digit (`DigitCodes::place`).
-            PlaneEncoding::Digits { digits, .. } => {
-                let within = self.t32();
-                self.line(format!("cvt.u32.u64 {within}, {local};"));
-                self.line(format!("rem.u32 {within}, {within}, {};", plane.group));
-                let (byte, _) = self.digit_place(&within, digits);
-                let wide = self.t64();
-                self.line(format!("cvt.u64.u32 {wide}, {byte};"));
-                let entry = self.t64();
-                self.line(format!(
-                    "mad.lo.u64 {entry}, {group}, {}, {wide};",
-                    plane.fields
-                ));
-                self.packed_field(&base, &entry, plane.entry_bits)
-            }
             PlaneEncoding::FloatCode { format } => self.packed_field(&base, &entry, format.bits()),
         }
     }
@@ -2107,73 +2081,12 @@ impl<'a> Emitter<'a> {
     /// The U32 lane of the element at packing position `logical` among the
     /// `group` elements one plane entry covers (a plane group divides the
     /// packet group).
-    /// The value's position among its entry's values: its lane, or a digit
-    /// plane's digit of its byte (`PlaneInfo::lane`).
-    fn plane_lane(&mut self, logical: &str, plane: &PlaneInfo) -> String {
+    fn plane_lane(&mut self, logical: &str, group: u32) -> String {
         let wide = self.t64();
-        self.line(format!("rem.u64 {wide}, {logical}, {};", plane.group));
+        self.line(format!("rem.u64 {wide}, {logical}, {group};"));
         let lane = self.t32();
         self.line(format!("cvt.u32.u64 {lane}, {wide};"));
-        match &plane.encoding {
-            PlaneEncoding::Digits { digits, .. } => self.digit_place(&lane, digits).1,
-            _ => lane,
-        }
-    }
-
-    /// The byte and the digit of value `within` of a group of base-3 digits
-    /// (`DigitCodes::place`): each run from its first value on overrides the
-    /// one before.
-    fn digit_place(&mut self, within: &str, digits: &DigitCodes) -> (String, String) {
-        let (byte, digit) = (self.t32(), self.t32());
-        let (mut first, mut first_byte) = (0u32, 0u32);
-        for run in digits.runs {
-            let offset = self.t32();
-            self.line(format!("sub.u32 {offset}, {within}, {first};"));
-            let (run_byte, run_digit) = (self.t32(), self.t32());
-            self.line(format!("rem.u32 {run_byte}, {offset}, {};", run.bytes()));
-            self.line(format!("add.u32 {run_byte}, {run_byte}, {first_byte};"));
-            self.line(format!("div.u32 {run_digit}, {offset}, {};", run.bytes()));
-            if first == 0 {
-                self.line(format!("mov.u32 {byte}, {run_byte};"));
-                self.line(format!("mov.u32 {digit}, {run_digit};"));
-            } else {
-                let past = self.pred();
-                self.line(format!("setp.ge.u32 {past}, {within}, {first};"));
-                self.line(format!("selp.b32 {byte}, {run_byte}, {byte}, {past};"));
-                self.line(format!("selp.b32 {digit}, {run_digit}, {digit}, {past};"));
-            }
-            first += run.bytes() * run.digits();
-            first_byte += run.bytes();
-        }
-        (byte, digit)
-    }
-
-    /// Digit `digit` of byte `raw` (`DigitCodes::digit`: the byte times
-    /// 3^digit modulo 256, times 3, over 256), read through `interpretation`.
-    fn digit_code(
-        &mut self,
-        raw: &str,
-        digit: &str,
-        interpretation: &CodeInterpretation,
-    ) -> String {
-        let power = self.t32();
-        self.line(format!("mov.u32 {power}, 1;"));
-        for n in 1..DIGITS_PER_BYTE {
-            let at = self.pred();
-            self.line(format!("setp.eq.u32 {at}, {digit}, {n};"));
-            self.line(format!(
-                "selp.b32 {power}, {}, {power}, {at};",
-                DIGIT_RADIX.pow(n)
-            ));
-        }
-        let mask = (1u32 << DIGIT_BYTE_BITS) - 1;
-        let value = self.t32();
-        self.line(format!("and.b32 {value}, {raw}, {mask};"));
-        self.line(format!("mul.lo.u32 {value}, {value}, {power};"));
-        self.line(format!("and.b32 {value}, {value}, {mask};"));
-        self.line(format!("mul.lo.u32 {value}, {value}, {DIGIT_RADIX};"));
-        self.line(format!("shr.b32 {value}, {value}, {DIGIT_BYTE_BITS};"));
-        self.interpret(&value, DIGIT_BITS, interpretation)
+        lane
     }
 
     fn grid_code(&mut self, raw: &str, lane: &str, grid: &'static GridCodes) -> String {

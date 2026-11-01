@@ -191,21 +191,23 @@ fn main() {
 
 /// Writes `gguf_format_tests.rs`: the macro `gguf_format_tests!`, whose arm
 /// for a layout (`rows16; every: [..]; partial_block: [..]; own_storage:
-/// [..]`) expands to `mod gguf` with one module for each GGUF format the
-/// registry converts into that layout, in ggml id order. A format's module
-/// has a test for each of the `every` functions, for each `partial_block`
-/// function when whole blocks of it fill a `PARTIAL_BLOCK_WIDTHS` width
-/// (`partial_block_widths`),
-/// and for each `own_storage` function when no other format has its
-/// storage (its rounded element; an element of another operand recipe
-/// shares it). Each test calls `crate::<function>(format)` with the
+/// [..]`) expands to `mod gguf` with one module for each storage the
+/// registry converts GGUF formats into in that layout, holding one module
+/// for each such format, in ggml id order (`gguf::q2g256::tq2_0`). A
+/// format's module has a test for each of the `every` functions, and for
+/// each `partial_block` function when whole blocks of it fill a
+/// `PARTIAL_BLOCK_WIDTHS` width (`partial_block_widths`). A storage's
+/// module has a test for each `own_storage` function, of its first format,
+/// when it is a rounded element (an element of another operand recipe
+/// shares its storage). Each test calls `crate::<function>(format)` with the
 /// format's `crate::Format`.
 fn gguf_format_tests(out: &Path) {
     use magnitude_ggml::Encoding;
     use seismic_lang::registry::{self, Layout, OperandRecipe};
     let mut arms = String::new();
     for layout in Layout::ALL {
-        let mut modules = String::new();
+        // Each storage's modules, in the order its first format comes.
+        let mut storages: Vec<(String, String)> = Vec::new();
         for encoding in Encoding::ALL {
             let block = encoding.block_elements();
             let Some(source) = registry::gguf_source(encoding, block) else {
@@ -221,18 +223,34 @@ fn gguf_format_tests(out: &Path) {
                     registry::representation_info(element).representation,
                     operands.suffix()
                 );
+                let index = storages
+                    .iter()
+                    .position(|(known, _)| *known == name)
+                    .unwrap_or_else(|| {
+                        let own = if operands == OperandRecipe::Rounded {
+                            format!(
+                                " crate::gguf_format_tests!(@tests {encoding:?} {operands:?}: $($own)*);"
+                            )
+                        } else {
+                            String::new()
+                        };
+                        storages.push((name, own));
+                        storages.len() - 1
+                    });
                 let mut tests = String::from("$($every)*");
                 if partial_block_widths(block as usize).next().is_some() {
                     tests.push_str(" $($partial)*");
                 }
-                if operands == OperandRecipe::Rounded {
-                    tests.push_str(" $($own)*");
-                }
-                modules.push_str(&format!(
-                    "            pub mod {name} {{ crate::gguf_format_tests!(@tests {encoding:?} {operands:?}: {tests}); }}\n"
+                storages[index].1.push_str(&format!(
+                    " pub mod {} {{ crate::gguf_format_tests!(@tests {encoding:?} {operands:?}: {tests}); }}",
+                    encoding.ggml_name().to_ascii_lowercase()
                 ));
             }
         }
+        let modules: String = storages
+            .iter()
+            .map(|(name, body)| format!("            pub mod {name} {{{body} }}\n"))
+            .collect();
         arms.push_str(&format!(
             "    ({}; every: [$($every:ident)*]; partial_block: [$($partial:ident)*]; own_storage: [$($own:ident)*] $(;)?) => {{\n        mod gguf {{\n{modules}        }}\n    }};\n",
             layout.as_str()

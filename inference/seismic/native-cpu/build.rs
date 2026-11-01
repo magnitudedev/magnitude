@@ -10,7 +10,7 @@
 //! in index order to a macro.
 
 use seismic_lang::registry::{
-    self, CodeInterpretation, CodingAxes, DigitCodes, GridSigns, Layout, LocalCodes, MinimumSign,
+    self, CodeInterpretation, CodingAxes, GridSigns, Layout, LocalCodes, MinimumSign,
     RepresentationKind, ScaleEncoding, ValueCodes,
 };
 use seismic_lang::types::DType;
@@ -45,38 +45,8 @@ fn scale(scale: ScaleEncoding) -> &'static str {
     }
 }
 
-/// The digit-runs type (`weights::DigitRuns`) of `digits`, its definition
-/// joining `definitions` once.
-fn digit_runs(digits: &DigitCodes, definitions: &mut Vec<String>) -> String {
-    let name = digits
-        .runs
-        .iter()
-        .map(|run| format!("{}x{}", run.bytes(), run.digits()))
-        .collect::<Vec<_>>()
-        .join("_");
-    let name = format!("Runs{name}");
-    let runs = digits
-        .runs
-        .iter()
-        .map(|run| format!("DigitRun::new({}, {})", run.bytes(), run.digits()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let definition = format!(
-        "    #[derive(Clone, Copy, Debug)]\n    pub(crate) struct {name};\n    impl crate::weights::DigitRuns for {name} {{\n        const CODES: DigitCodes = DigitCodes {{ runs: &[{runs}] }};\n    }}\n"
-    );
-    if !definitions.contains(&definition) {
-        definitions.push(definition);
-    }
-    format!("digit_runs::{name}")
-}
-
-/// The component type of packed storage `id` of `STORAGE`-value groups,
-/// its digit runs' definition joining `digit_runs`.
-fn packed(
-    id: seismic_lang::ids::RepresentationId,
-    storage: u32,
-    digit_runs: &mut Vec<String>,
-) -> String {
+/// The component type of packed storage `id` of `STORAGE`-value groups.
+fn packed(id: seismic_lang::ids::RepresentationId, storage: u32) -> String {
     let axes = registry::decode_axes(id).expect("packed storage has decode axes");
     // The code domain's ends, which every code component takes from here.
     let registry::profile::Domain { least, greatest } = axes.profile().codes;
@@ -98,14 +68,6 @@ fn packed(
                 None => "NoDelta".to_owned(),
                 Some(exponent) => format!("Delta<{exponent}>"),
             }
-        ),
-        ValueCodes::Digits {
-            digits,
-            interpretation: code,
-        } => format!(
-            "Digits<{}, {}, {least}, {greatest}>",
-            self::digit_runs(digits, digit_runs),
-            interpretation(code)
         ),
         ValueCodes::Fields(code) => format!(
             "Planes<{}, {}, {}, {least}, {greatest}>",
@@ -174,7 +136,6 @@ fn packed(
 
 fn main() {
     let mut components: Vec<String> = Vec::new();
-    let mut digit_runs: Vec<String> = Vec::new();
     let mut component_of: Vec<Option<usize>> = Vec::new();
     for info in registry::representations() {
         let component = match &info.kind {
@@ -185,7 +146,7 @@ fn main() {
                 if matches!(info.layout, Layout::Rows16 | Layout::Rows8)
                     && registry::storage_of(info.id) == info.id =>
             {
-                packed(info.id, rows.group(), &mut digit_runs)
+                packed(info.id, rows.group())
             }
             _ => {
                 component_of.push(None);
@@ -219,9 +180,7 @@ fn main() {
     for index in &component_of {
         writeln!(text, "    {index:?},").unwrap();
     }
-    text += "];\n\n/// The digit runs of the digits components (`weights::DigitRuns`).\npub(crate) mod digit_runs {\n    use seismic_lang::registry::{DigitCodes, DigitRun};\n\n";
-    text += &digit_runs.join("\n");
-    text += "}\n\n/// `$m![component types]`, in component index order.\nmacro_rules! with_components {\n    ($m:ident) => {\n        $m![\n";
+    text += "];\n\n/// `$m![component types]`, in component index order.\nmacro_rules! with_components {\n    ($m:ident) => {\n        $m![\n";
     for component in &components {
         writeln!(text, "            {component},").unwrap();
     }

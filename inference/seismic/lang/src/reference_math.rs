@@ -621,7 +621,6 @@ enum RecipeKey {
     FloatCode(crate::registry::FloatCodeFormat),
     GridCode(&'static crate::registry::GridCodes),
     SignedCode(u32),
-    Digit,
 }
 fn cached_recipe(key: RecipeKey, build: impl FnOnce() -> ReferenceRecipe) -> Arc<ReferenceRecipe> {
     static RECIPES: OnceLock<Mutex<HashMap<RecipeKey, Arc<ReferenceRecipe>>>> = OnceLock::new();
@@ -721,44 +720,6 @@ fn code_word(
             value
         }
     }
-}
-
-/// Digit `digit` (operand 1, below `DIGITS_PER_BYTE`) of byte `byte`
-/// (operand 0) of a digit code (`DigitCodes::digit`), in ordinary word
-/// operations: the byte's fraction times `DIGIT_RADIX^digit` modulo 256,
-/// times the radix, past its low byte.
-pub fn digit_recipe() -> Arc<ReferenceRecipe> {
-    use crate::registry::{DIGITS_PER_BYTE, DIGIT_BYTE_BITS, DIGIT_RADIX};
-    cached_recipe(RecipeKey::Digit, || {
-        let b = Recipe::default();
-        let byte = b.input(0, DType::U32);
-        let digit = b.input(1, DType::U32);
-        let mask = (1 << DIGIT_BYTE_BITS) - 1;
-        // `x DIGIT_RADIX` as the sum of `x` shifted to each set bit of the
-        // radix, highest first.
-        let times_radix = |x: V| {
-            (0..u32::BITS - DIGIT_RADIX.leading_zeros())
-                .rev()
-                .filter(|bit| DIGIT_RADIX >> bit & 1 == 1)
-                .map(|bit| {
-                    if bit == 0 {
-                        x
-                    } else {
-                        b.word(WordOp::Shl, x, b.u(bit))
-                    }
-                })
-                .reduce(|sum, term| b.word(WordOp::Add, sum, term))
-                .expect("the radix is positive")
-        };
-        let mut power = b.word(WordOp::And, byte, b.u(mask));
-        let mut fraction = power;
-        for n in 1..DIGITS_PER_BYTE {
-            power = b.word(WordOp::And, times_radix(power), b.u(mask));
-            fraction = b.select(b.word_cmp(CmpOp::Eq, digit, b.u(n)), power, fraction);
-        }
-        let out = b.word(WordOp::Shr, times_radix(fraction), b.u(DIGIT_BYTE_BITS));
-        b.finish(out)
-    })
 }
 
 /// The code of a vector-coded value (`GridCodes::code`) from its entry

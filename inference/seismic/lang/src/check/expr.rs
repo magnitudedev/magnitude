@@ -1852,8 +1852,7 @@ impl<'a> Checker<'a> {
                     crate::registry::PlaneEncoding::Dense(_) => entries,
                     crate::registry::PlaneEncoding::Packed { .. }
                     | crate::registry::PlaneEncoding::Grid(_)
-                    | crate::registry::PlaneEncoding::SignedLocal { .. }
-                    | crate::registry::PlaneEncoding::Digits { .. } => {
+                    | crate::registry::PlaneEncoding::SignedLocal { .. } => {
                         let bits = self.arena.int(i64::from(plane.entry_bits));
                         let total_bits = self.arena.int_mul(entries, bits);
                         let thirty_one = self.arena.int(31);

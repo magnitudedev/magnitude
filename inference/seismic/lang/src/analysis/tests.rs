@@ -447,16 +447,9 @@ fn every_packed_representation_has_one_grid_per_code_it_stores() {
         }
         let (planes, grids) = packed(info.id, "w", Vec::new());
         assert!(matches!(planes[0].lattice, Lattice::Codes(_)), "{}", info.name);
-        let recipe = registry::decode_recipe(info.id, info.decoded).unwrap();
         for plane in &planes {
             let codes = grids.iter().filter(|grid| grid.plane.is_some_and(|(field, _)| field == plane.field));
-            // A value reads one byte of a digits plane's group.
-            let digits = recipe.planes().iter().any(|schema| {
-                schema.field == plane.field
-                    && matches!(schema.encoding, registry::PlaneEncoding::Digits { .. })
-            });
             let expected = match plane.lattice {
-                Lattice::Codes(_) if digits => 1,
                 Lattice::Codes(_) => plane.fields as usize,
                 Lattice::Float(_) => 0,
             };
