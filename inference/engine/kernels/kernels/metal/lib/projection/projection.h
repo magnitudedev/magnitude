@@ -2839,8 +2839,10 @@ inline void gemv_batch_paired_runtime(thread const In &in, thread const Out &out
 // a lane's place of chunk k in a row's planes (32-bit offsets from the
 // tensor), `load<INDEXED>` its words of packet g (or of the chunk `chunks`
 // chunks on, by the same base), and `shift` words moved on by `positions`
-// positions (pair p of the result is pair p + positions of the words). One
-// reader per code source:
+// positions (pair p of the result is pair p + positions of the words);
+// code planes split a load into its loads alone (`fetch<INDEXED>`, its
+// `fields`) and their words (`spread`, or `moved` on by positions), which
+// PACK carries ahead apart (`packing_fetch`). One reader per code source:
 // linear codes of code planes of every split the registry makes
 // (`registry::code_planes`), entering as their stored codes or above them; a
 // codebook's values, entering at 128 (`codebooks::pairs`); and grid entries'
@@ -2849,8 +2851,15 @@ inline void gemv_batch_paired_runtime(thread const In &in, thread const Out &out
 
 // The codes of one plane of B-bit codes (B 1, 2 or 4) in a chunk: B bytes at
 // byte B k of the packet's unit of 4 B bytes, code i at bit B i
-// (`packets::Fields`, `packets::Planes`); `load` spreads them, codes 0..3
-// and 4..7 in the two halves of a word.
+// (`packets::Fields`, `packets::Planes`); `fetch` reads them, `spread`
+// spreads them, codes 0..3 and 4..7 in the two halves of a word (`load`
+// both), and `moved` spreads them moved on by a lane's `positions`
+// positions. A spread's bits past a half's four codes are no pair's (even
+// moved on by three positions) and every reader masks its pair, so a moved
+// spread, past whose variable shift the compiler cannot drop a mask, takes
+// none; a byte's field and its copy 12 bits above it do not overlap, so
+// one multiply spreads them (exact; a 2-bit plane's 16-bit field and its
+// copy overlap, and the carry of their sum would reach code 4).
 template <uint B>
 struct chunk_plane {
     static_assert(B == 1u || B == 2u || B == 4u, "a plane's chunk is one, two or four bytes");
@@ -2861,20 +2870,36 @@ struct chunk_plane {
     }
     // A load INDEXED from the lane's place (a base and a 32-bit index of its
     // units), as the matrix GEMV's block loop takes it, or from the sum of
-    // the place and a 32-bit offset, as PACK's does: indexed, PACK over
-    // q5g32s is 1.7% slower (M4 Pro, `dense_output` at M = 512, 5448 against
-    // 5353 µs) and over iq4xs 1%.
+    // the place, the packet's 32-bit offset and the chunks' offset, as PACK's
+    // does: indexed, PACK over q5g32s is 1.7% slower (M4 Pro, `dense_output`
+    // at M = 512, 5448 against 5353 µs) and over iq4xs 1%. The chunks'
+    // offset is a constant beside the 32-bit sum, so a load of a later chunk
+    // takes it as the load's own (inside the sum, which may wrap, it is one
+    // more add a load).
     template <bool INDEXED, typename W>
-    static uint load(thread const Weights<W> &w, uint at, uint g, uint chunks) {
-        uint field;
+    static uint fetch(thread const Weights<W> &w, uint at, uint g, uint chunks) {
         if constexpr (INDEXED)
-            field = uint(reinterpret_cast<device const unit *>(w.base + at)[g * 4u * w.layout.tile + chunks]);
+            return uint(reinterpret_cast<device const unit *>(w.base + at)[g * 4u * w.layout.tile + chunks]);
         else
-            field = uint(*reinterpret_cast<device const unit *>(w.base + at + (g * 4u * w.layout.tile + chunks) * B));
+            return uint(*reinterpret_cast<device const unit *>(w.base + at + g * 4u * B * w.layout.tile + chunks * B));
+    }
+    static uint spread(uint field) {
         if constexpr (B == 4u)
             return field;
         else
             return (field | (field << (16u - 4u * B))) & (((1u << (4u * B)) - 1u) * 0x00010001u);
+    }
+    template <bool INDEXED, typename W>
+    static uint load(thread const Weights<W> &w, uint at, uint g, uint chunks) {
+        return spread(fetch<INDEXED>(w, at, g, chunks));
+    }
+    static uint moved(uint field, uint positions) {
+        if constexpr (B == 4u)
+            return field >> (4u * positions);
+        else if constexpr (B == 2u)
+            return (field | (field << 8)) >> (2u * positions);
+        else
+            return (field * 0x1001u) >> positions;
     }
     static uint pair(uint spread, uint p) { return (spread >> (B * p)) & (((1u << B) - 1u) * 0x00010001u); }
 };
@@ -2911,6 +2936,7 @@ struct lane_codes<packets::Planes<LOW, HIGH>, packets::Linear<MASK, Z>, ZERO> {
     typedef chunk_plane<LOW> low_plane;
     typedef metal::conditional_t<HIGH == 0u, uint, uint2> place;
     typedef place words;
+    typedef place fields;
     static constexpr bool implemented() { return MASK == 0u && LOW <= 4u && HIGH <= 2u && ZERO >= Z; }
     static constexpr int zero() { return ZERO; }
     static constexpr bool bytes() { return false; }
@@ -2924,12 +2950,22 @@ struct lane_codes<packets::Planes<LOW, HIGH>, packets::Linear<MASK, Z>, ZERO> {
             return uint2(low, chunk_plane<HIGH>::at(w, row, w.layout.high, k));
     }
     template <bool INDEXED, typename W>
-    static words load(thread const Weights<W> &w, place at, uint g, uint chunks = 0u) {
+    static fields fetch(thread const Weights<W> &w, place at, uint g, uint chunks = 0u) {
         if constexpr (HIGH == 0u)
-            return low_plane::template load<INDEXED>(w, at, g, chunks);
+            return low_plane::template fetch<INDEXED>(w, at, g, chunks);
         else
-            return uint2(low_plane::template load<INDEXED>(w, at.x, g, chunks),
-                chunk_plane<HIGH>::template load<INDEXED>(w, at.y, g, chunks));
+            return uint2(low_plane::template fetch<INDEXED>(w, at.x, g, chunks),
+                chunk_plane<HIGH>::template fetch<INDEXED>(w, at.y, g, chunks));
+    }
+    static words spread(fields codes) {
+        if constexpr (HIGH == 0u)
+            return low_plane::spread(codes);
+        else
+            return uint2(low_plane::spread(codes.x), chunk_plane<HIGH>::spread(codes.y));
+    }
+    template <bool INDEXED, typename W>
+    static words load(thread const Weights<W> &w, place at, uint g, uint chunks = 0u) {
+        return spread(fetch<INDEXED>(w, at, g, chunks));
     }
     static uint pair(words codes, uint p) {
         uint stored;
@@ -2942,11 +2978,12 @@ struct lane_codes<packets::Planes<LOW, HIGH>, packets::Linear<MASK, Z>, ZERO> {
         else
             return stored;
     }
-    static words shift(words codes, uint positions) {
+    // Its fetched fields spread moved on by `positions` positions.
+    static words moved(fields codes, uint positions) {
         if constexpr (HIGH == 0u)
-            return codes >> (LOW * positions);
+            return low_plane::moved(codes, positions);
         else
-            return uint2(codes.x >> (LOW * positions), codes.y >> (HIGH * positions));
+            return uint2(low_plane::moved(codes.x, positions), chunk_plane<HIGH>::moved(codes.y, positions));
     }
 };
 
@@ -2971,7 +3008,7 @@ struct lane_codes<packets::Planes<8, 0>, packets::Linear<MASK, Z>, ZERO> {
         if constexpr (INDEXED)
             return reinterpret_cast<device const uint2 *>(w.base + at)[g * 4u * w.layout.tile + chunks] ^ MASK;
         else
-            return *reinterpret_cast<device const uint2 *>(w.base + at + (g * 4u * w.layout.tile + chunks) * 8u) ^ MASK;
+            return *reinterpret_cast<device const uint2 *>(w.base + at + g * 32u * w.layout.tile + chunks * 8u) ^ MASK;
     }
     static uint pair(words codes, uint p) { return chunk_byte_pair(codes, p); }
     static words shift(words codes, uint positions) { return codes >> (8u * positions); }
