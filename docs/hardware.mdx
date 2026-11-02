@@ -14,7 +14,7 @@ Magnitude assesses your machine and recommends models that fit. Start with those
 | Windows x64 | CPU, supported NVIDIA CUDA GPUs, or supported Vulkan GPUs |
 | Linux x64 or ARM64 | CPU, supported NVIDIA CUDA GPUs, or supported Vulkan GPUs |
 
-See [macOS](/installation/macos), [Windows](/installation/windows), and [Linux](/installation/linux) for OS requirements and installers. In [Docker](/installation/docker), containers reach NVIDIA GPUs through the NVIDIA Container Toolkit and AMD and Intel GPUs through Vulkan; Docker Desktop on a Mac runs on CPU only.
+See [macOS](/installation/macos), [Windows](/installation/windows), and [Linux](/installation/linux) for OS requirements and installers. In [Docker](/installation/docker), containers reach NVIDIA GPUs through the NVIDIA Container Toolkit and AMD and Intel GPUs through Vulkan. On any Mac, Docker runs containers in a Linux virtual machine that can't reach the Apple GPU, so the container runs models on the CPU cores; use the [macOS app](/installation/macos) for GPU speed.
 
 ## Apple Silicon
 

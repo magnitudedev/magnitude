@@ -45,9 +45,7 @@ Or download the installer:
 - **Linux x64:** [.deb](https://magnitude.dev/api/installer?os=linux&arch=x64&package=deb) · [.rpm](https://magnitude.dev/api/installer?os=linux&arch=x64&package=rpm) · [.pkg.tar.zst](https://magnitude.dev/api/installer?os=linux&arch=x64&package=pacman)
 - **Linux ARM64:** [.deb](https://magnitude.dev/api/installer?os=linux&arch=arm64&package=deb) · [.rpm](https://magnitude.dev/api/installer?os=linux&arch=arm64&package=rpm)
 
-### Run it on a server
-
-On Linux and macOS, `magnitude server setup` runs Magnitude as a service that starts at boot, keeps running after logout, updates itself, and serves browsers and agents on other computers. See [Remote server](https://docs.magnitude.dev/remote-server).
+To run Magnitude as a service other computers can use, see [Remote server](https://docs.magnitude.dev/remote-server). To run it in a container, see [Docker](https://docs.magnitude.dev/installation/docker).
 
 ## Why Magnitude?
 
