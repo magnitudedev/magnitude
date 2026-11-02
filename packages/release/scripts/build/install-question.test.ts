@@ -109,7 +109,7 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
     expect(events()).not.toContain("magnitude server setup")
     expect(events()).toContain("install")
   })
-  it.each([{ DISPLAY: ":0" }, { WAYLAND_DISPLAY: "wayland-0" }])("opens the desktop after declining server setup in %j", display => {
+  it.each<Record<string, string>>([{ DISPLAY: ":0" }, { WAYLAND_DISPLAY: "wayland-0" }])("opens the desktop after declining server setup in %j", display => {
     const result = answer("n", display)
     expect(result.status, result.output).toBe(0)
     expect(events().at(-1)).toBe("magnitude app open")
