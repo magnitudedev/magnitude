@@ -178,3 +178,20 @@ export class ChatStorageFailed extends Schema.TaggedError<ChatStorageFailed>()("
     return storageFailures[this.reason]
   }
 }
+
+export const ChatModelDefaultsFailure = Schema.Literal("unreadable", "unwritable")
+export type ChatModelDefaultsFailure = typeof ChatModelDefaultsFailure.Type
+
+const modelDefaultsFailures: { readonly [Failure in ChatModelDefaultsFailure]: string } = {
+  unreadable: "Saved model defaults could not be read. Check access to the Magnitude configuration.",
+  unwritable: "Model defaults could not be saved. Check access to the Magnitude configuration and try again.",
+}
+
+/** Saved model defaults could not be read or written. */
+export class ChatModelDefaultsFailed extends Schema.TaggedError<ChatModelDefaultsFailed>()("ChatModelDefaultsFailed", {
+  reason: ChatModelDefaultsFailure,
+}) {
+  get message() {
+    return modelDefaultsFailures[this.reason]
+  }
+}

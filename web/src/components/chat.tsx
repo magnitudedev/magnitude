@@ -14,7 +14,6 @@ import {
   generateSessionId,
   liveResponse,
   type MessageId,
-  ReasoningEffortSchema,
   RequestedResponseSettings,
   ServingModelId,
   type SessionId,
@@ -27,10 +26,14 @@ import {
   chatRequestSettings,
   chatRetry,
   chatSend,
+  changedChatDefaults,
+  chatDefaultsStatus,
+  chatModelDefaults,
+  chatStartingSettings,
   completeChatSubmission,
-  defaultResponseSettings,
   reasoningEffortFor,
   selectedChat,
+  type ChatDefaultsKey,
   type ChatRequestSettings,
   localModelProviderModelId,
   localModelServingProfile,
@@ -60,6 +63,7 @@ import { NamedLogo, labForName } from "./model-logo"
 import { ErrorNotice } from "./error-notice"
 import { useNarrowViewport } from "../lib/viewport"
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog"
+import { ActionTooltip } from "./ui/tooltip"
 import {
   IconButton,
   errorText,
@@ -69,7 +73,7 @@ import {
 } from "./chat/shared"
 import { ChatResponse } from "./chat/response"
 import { ChatRequestStatus } from "./chat/activity"
-import { ChatSettingsPanel } from "./chat/settings"
+import { ChatSettingsPanel, type ChatDefaultsState } from "./chat/settings"
 import { ChatHistoryPanel } from "./chat/history"
 import { ChatThinkingSelect } from "./chat/thinking"
 
@@ -91,11 +95,15 @@ function ChatView({
   const clearSend = useAtomSet(client.Chat.SendChatMessage)
   const clearRetry = useAtomSet(client.Chat.RetryChatResponse)
   const clearStop = useAtomSet(client.Chat.StopChatResponse)
+  const clearSaveDefaults = useAtomSet(client.Chat.SaveChatModelDefaults)
+  const clearClearDefaults = useAtomSet(client.Chat.ClearChatModelDefaults)
   const clearError = () => {
     clearStart(Atom.Reset)
     clearSend(Atom.Reset)
     clearRetry(Atom.Reset)
     clearStop(Atom.Reset)
+    clearSaveDefaults(Atom.Reset)
+    clearClearDefaults(Atom.Reset)
   }
   const [panel, setPanel] = useState<"settings" | "history" | null>(null)
   const draftAtom = chatDraft(id)
@@ -127,10 +135,22 @@ function ChatView({
           m.architecture.output_modalities.includes("text")
       )
     : []
+  const savedResult = useAtomValue(client.Chat.ListChatModelDefaults({})).result
+  const saved = Result.isSuccess(savedResult) ? savedResult.value : {}
+  const transcript = chatRequestSettings(chat?.messages ?? [])
+  const modelId =
+    value(draft.settings.model ?? transcript.model) ?? models[0]?.id
+  const model = models.find((m) => m.id === modelId)
+  // A chat with no response yet starts from its model's defaults; one with responses continues from its latest.
   const settings: ChatRequestSettings = {
-    ...chatRequestSettings(chat?.messages ?? []),
+    ...(Option.isNone(transcript.model) && model
+      ? chatStartingSettings(model, saved)
+      : transcript),
     ...draft.settings,
   }
+  const changed: ReadonlySet<ChatDefaultsKey> = model
+    ? changedChatDefaults(settings, model, saved)
+    : new Set()
   const local = useLocalModels()
   const localFor = (id: string) =>
     Result.isSuccess(local)
@@ -147,9 +167,6 @@ function ChatView({
         )
       : m.context_length
   }
-  const modelId = value(settings.model) ?? models[0]?.id
-  const model = models.find((m) => m.id === modelId)
-  const reasoning = model ? Option.getOrNull(model.reasoning) : null
   const effort = reasoningEffortFor(model, settings.reasoningEffort)
   const effectiveSettings: ChatRequestSettings = {
     ...settings,
@@ -164,8 +181,31 @@ function ChatView({
   const settingsValid = Schema.is(Schema.typeSchema(RequestedResponseSettings))(
     effectiveSettings
   )
+  // Editing a setting commits the chat to the model it shows, so a model list that changes meanwhile can't move it.
   const patch = (change: Partial<ChatRequestSettings>) =>
-    setDraft({ ...draft, settings: { ...draft.settings, ...change } })
+    setDraft({
+      ...draft,
+      settings: { ...draft.settings, model: effectiveSettings.model, ...change },
+    })
+  const saveDefaults = useAtomSet(client.Chat.SaveChatModelDefaults)
+  const clearDefaults = useAtomSet(client.Chat.ClearChatModelDefaults)
+  const saveDefaultsState = useAtomValue(client.Chat.SaveChatModelDefaults)
+  const clearDefaultsState = useAtomValue(client.Chat.ClearChatModelDefaults)
+  const defaults: ChatDefaultsState | undefined =
+    model && Result.isSuccess(savedResult)
+      ? {
+          status: chatDefaultsStatus(model, saved, changed),
+          changed,
+          canSave: settingsValid && !saveDefaultsState.waiting,
+          save: () =>
+            saveDefaults({
+              model: ServingModelId.make(model.id),
+              defaults: chatModelDefaults(settings, model),
+            }),
+          revert: () => patch(chatStartingSettings(model, saved)),
+          reset: () => clearDefaults({ model: ServingModelId.make(model.id) }),
+        }
+      : undefined
   const start = useAtomSet(client.Chat.StartChat, { mode: "promise" })
   const send = useAtomSet(client.Chat.SendChatMessage, { mode: "promise" })
   const retry = useAtomSet(client.Chat.RetryChatResponse, {
@@ -276,14 +316,17 @@ function ChatView({
     : errorText(startState) ??
       errorText(sendState) ??
       errorText(retryState) ??
-      errorText(stopState)
+      errorText(stopState) ??
+      errorText(saveDefaultsState) ??
+      errorText(clearDefaultsState) ??
+      errorText(savedResult)
   const narrow = useNarrowViewport()
   const PanelTitle = narrow ? DialogTitle : "h2"
   const body = (
     <>
       <div className="flex items-center justify-between">
-        <PanelTitle className="font-sans text-sm font-semibold">
-          {panel === "settings" ? "Chat settings" : "History"}
+        <PanelTitle className="min-w-0 truncate font-sans text-sm font-semibold">
+          {panel === "settings" ? model?.name ?? "Chat settings" : "History"}
         </PanelTitle>
         <IconButton label="Close panel" onClick={() => setPanel(null)}>
           <XIcon />
@@ -294,15 +337,7 @@ function ChatView({
           settings={effectiveSettings}
           patch={patch}
           context={model ? contextFor(model) : undefined}
-          reset={() =>
-            patch({
-              ...defaultResponseSettings,
-              model: effectiveSettings.model,
-              reasoningEffort: reasoning
-                ? Option.some(ReasoningEffortSchema.make(reasoning.default_effort))
-                : none(),
-            })
-          }
+          defaults={defaults}
         />
       ) : (
         <ChatHistoryPanel
@@ -328,9 +363,10 @@ function ChatView({
             onClick={() => {
               clearError()
               select(null)
+              // The new chat keeps this model and starts from its defaults.
               setNewDraft({
                 text: "",
-                settings: effectiveSettings,
+                settings: { model: effectiveSettings.model },
                 submitted: null,
               })
               input.current?.focus()
@@ -494,10 +530,12 @@ function ChatView({
                     onValueChange={(next) => {
                       if (next) {
                         const m = models.find((m) => m.id === next)
-                        patch({
-                          model: Option.some(ServingModelId.make(next)),
-                          reasoningEffort: reasoningEffortFor(m, effort),
-                        })
+                        // Another model brings its own defaults.
+                        patch(
+                          m
+                            ? chatStartingSettings(m, saved)
+                            : { model: Option.some(ServingModelId.make(next)) }
+                        )
                       }
                     }}
                   >
@@ -537,6 +575,20 @@ function ChatView({
                                 className="size-3"
                               />
                               {m.name}
+                              {m.id in saved && (
+                                <ActionTooltip
+                                  label="New chats start with your defaults"
+                                  trigger={
+                                    <span
+                                      role="img"
+                                      aria-label="New chats start with your defaults"
+                                      className="inline-flex size-4 items-center justify-center text-blue-600 dark:text-blue-400"
+                                    >
+                                      <SlidersHorizontalIcon className="size-3" />
+                                    </span>
+                                  }
+                                />
+                              )}
                             </span>
                             <span className="pl-[18px] text-xs font-normal text-slate-500">
                               {[
@@ -561,6 +613,7 @@ function ChatView({
                   <ChatThinkingSelect
                     model={model}
                     selected={settings.reasoningEffort}
+                    changed={changed.has("reasoningEffort")}
                     onChange={(next) =>
                       patch({ reasoningEffort: Option.some(next) })
                     }

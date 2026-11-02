@@ -1,4 +1,5 @@
 import { ChatService } from "../chat/service";
+import { ChatModelDefaultsStore } from "../chat/model-defaults";
 import { ChatInference } from "../chat/inference";
 import { ServingUsage } from "../serving-usage";
 import {
@@ -36,6 +37,7 @@ import { HuggingFaceAccount } from "../hugging-face-account";
 export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
     const lifecycle = yield* AcnServiceLifecycle;
     const chats = yield* ChatService;
+    const modelDefaults = yield* ChatModelDefaultsStore;
     const inference = yield* ChatInference;
     const projectStore = yield* ProjectStore;
     const projectManager = yield* ProjectManager;
@@ -100,6 +102,11 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       StopChatResponse: (payload) => observeRpcDefects("StopChatResponse", chats.stop(payload)),
       RemoveChat: ({ chatId }) => observeRpcDefects("RemoveChat", chats.remove(chatId)),
       WatchChat: ({ chatId }) => observeRpcStreamDefects("WatchChat", chats.watch(chatId)),
+      ListChatModelDefaults: () => observeRpcDefects("ListChatModelDefaults", modelDefaults.list),
+      SaveChatModelDefaults: ({ model, defaults }) =>
+        observeRpcDefects("SaveChatModelDefaults", modelDefaults.save(model, defaults)),
+      ClearChatModelDefaults: ({ model }) =>
+        observeRpcDefects("ClearChatModelDefaults", modelDefaults.clear(model)),
       // Connection
       Health: () => lifecycle.state.pipe(
         Effect.map((state) => makeHealthResponse(ACN_VERSION, state)),

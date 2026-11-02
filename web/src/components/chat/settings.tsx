@@ -1,28 +1,111 @@
 import { formatStopSequences, parseStopSequences } from "./stop-sequences"
 import { useState, type ReactNode } from "react"
 import { Option } from "effect"
-import type { ChatRequestSettings } from "@magnitudedev/client-common"
-import {
-  ArrowCounterClockwiseIcon,
-  CaretDownIcon,
-  CaretRightIcon,
-} from "@phosphor-icons/react"
-import { Button } from "../ui/button"
+import type {
+  ChatDefaultsKey,
+  ChatDefaultsStatus,
+  ChatRequestSettings,
+} from "@magnitudedev/client-common"
+import { CaretDownIcon, CaretRightIcon, CheckIcon } from "@phosphor-icons/react"
 import { Input } from "../ui/input"
 import { none, number, value } from "./shared"
+
+/** Where this chat's settings stand against its model's defaults, and what can be done about it. */
+export interface ChatDefaultsState {
+  readonly status: ChatDefaultsStatus
+  readonly changed: ReadonlySet<ChatDefaultsKey>
+  readonly canSave: boolean
+  readonly save: () => void
+  readonly revert: () => void
+  readonly reset: () => void
+}
+
+export function ChangedDot() {
+  return (
+    <span
+      role="img"
+      aria-label="Changed"
+      className="inline-block size-1.5 shrink-0 rounded-full bg-blue-600 dark:bg-blue-400"
+    />
+  )
+}
+
+const statusText: { readonly [Status in ChatDefaultsStatus]: string } = {
+  standard: "Standard settings",
+  changedFromStandard: "Changed from standard",
+  yours: "Your defaults",
+  changedFromYours: "Changed from your defaults",
+}
+
+const link =
+  "rounded text-xs font-medium transition-colors outline-none focus-visible:ring-2 focus-visible:ring-blue-500/30 disabled:pointer-events-none disabled:opacity-40"
+const quietLink = `${link} text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100`
+
+/** Two lines under the model name: where the settings stand, then what can be done, always in the same place. */
+function DefaultsStatus({ d }: { d: ChatDefaultsState }) {
+  const changed = d.status === "changedFromStandard" || d.status === "changedFromYours"
+  return (
+    <div className="mt-1 text-xs">
+      <div className="flex h-5 items-center gap-1.5 text-slate-600 dark:text-slate-300">
+        <span className="flex w-1.5 shrink-0 justify-center">
+          {changed ? (
+            <ChangedDot />
+          ) : d.status === "yours" ? (
+            <CheckIcon weight="bold" className="size-3 text-green-600 dark:text-green-400" />
+          ) : (
+            <span className="size-1.5 rounded-full border border-slate-400 dark:border-slate-500" />
+          )}
+        </span>
+        <span className="truncate">{statusText[d.status]}</span>
+      </div>
+      <div className="flex h-5 items-center gap-3 pl-3">
+        {changed ? (
+          <>
+            <button
+              type="button"
+              disabled={!d.canSave}
+              onClick={d.save}
+              title="Start new chats with this model from these settings"
+              className={`${link} text-blue-700 hover:text-blue-900 dark:text-blue-400 dark:hover:text-blue-300`}
+            >
+              {d.status === "changedFromYours" ? "Update default" : "Save as default"}
+            </button>
+            <button type="button" onClick={d.revert} className={quietLink}>
+              Revert
+            </button>
+          </>
+        ) : d.status === "yours" ? (
+          <button type="button" onClick={d.reset} className={quietLink}>
+            Reset to standard
+          </button>
+        ) : (
+          <span className="truncate text-slate-400 dark:text-slate-500">
+            Edit anything to save it as default
+          </span>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function Setting({
   title,
   children,
   value: numberValue,
+  changed,
 }: {
   title: string
   children: ReactNode
   value?: ReactNode
+  changed?: boolean
 }) {
   return (
     <div className="mt-5">
       <div className="mb-3 flex items-center justify-between gap-3">
-        <span className="text-[13px] font-medium">{title}</span>
+        <span className="inline-flex items-center gap-1.5 text-[13px] font-medium">
+          {title}
+          {changed && <ChangedDot />}
+        </span>
         {numberValue !== undefined && (
           <span className="text-xs tabular-nums text-slate-500 dark:text-slate-400">
             {numberValue}
@@ -33,19 +116,37 @@ function Setting({
     </div>
   )
 }
+
+const advancedKeys: ReadonlyArray<ChatDefaultsKey> = [
+  "topP",
+  "topK",
+  "minP",
+  "repetitionPenalty",
+  "presencePenalty",
+  "frequencyPenalty",
+  "seed",
+  "stop",
+]
+
 export function ChatSettingsPanel({
   settings: s,
   patch,
   context,
-  reset,
+  defaults: d,
 }: {
   settings: ChatRequestSettings
   patch: (change: Partial<ChatRequestSettings>) => void
   context?: number
-  reset: () => void
+  defaults?: ChatDefaultsState
 }) {
   const [advanced, setAdvanced] = useState(false)
   const [stopText, setStopText] = useState(() => formatStopSequences(s.stop))
+  // Typed text stays as typed while it means these stops; a revert or another model's defaults replace it.
+  const shownStopText =
+    JSON.stringify(parseStopSequences(stopText)) === JSON.stringify(s.stop)
+      ? stopText
+      : formatStopSequences(s.stop)
+  const changed = (key: ChatDefaultsKey) => d?.changed.has(key) ?? false
   // Unset temperature uses the inference service's sampling default.
   const temperature = value(s.temperature) ?? 1
   const defaults = {
@@ -71,7 +172,7 @@ export function ChatSettingsPanel({
     max: number,
     step = 1
   ) => (
-    <Setting title={label}>
+    <Setting title={label} changed={changed(key)}>
       <Input
         aria-label={label}
         type="number"
@@ -94,7 +195,8 @@ export function ChatSettingsPanel({
   )
   return (
     <>
-      <Setting title="System prompt">
+      {d && <DefaultsStatus d={d} />}
+      <Setting title="System prompt" changed={changed("systemPrompt")}>
         <textarea
           aria-label="System prompt"
           rows={4}
@@ -107,6 +209,7 @@ export function ChatSettingsPanel({
       <Setting
         title="Temperature"
         value={temperature}
+        changed={changed("temperature")}
       >
         <input
           aria-label="Temperature"
@@ -133,11 +236,15 @@ export function ChatSettingsPanel({
           aria-expanded={advanced}
           className="flex w-full items-center justify-between text-[13px] font-medium"
         >
-          Advanced{advanced ? <CaretDownIcon /> : <CaretRightIcon />}
+          <span className="inline-flex items-center gap-1.5">
+            Advanced
+            {!advanced && advancedKeys.some(changed) && <ChangedDot />}
+          </span>
+          {advanced ? <CaretDownIcon /> : <CaretRightIcon />}
         </button>
         {advanced && (
           <>
-            <Setting title="Top P" value={value(s.topP) ?? 0.95}>
+            <Setting title="Top P" value={value(s.topP) ?? 0.95} changed={changed("topP")}>
               <input
                 aria-label="Top P"
                 type="range"
@@ -163,12 +270,12 @@ export function ChatSettingsPanel({
             {numeric("Presence penalty", "presencePenalty", -2, 2, 0.1)}
             {numeric("Frequency penalty", "frequencyPenalty", -2, 2, 0.1)}
             {numeric("Seed", "seed", 0, 0xffffffff)}
-            <Setting title="Stop sequences">
+            <Setting title="Stop sequences" changed={changed("stop")}>
               <textarea
                 aria-label="Stop sequences"
                 placeholder="One sequence per line"
                 rows={3}
-                value={stopText}
+                value={shownStopText}
                 onChange={(e) => {
                   setStopText(e.target.value)
                   patch({ stop: parseStopSequences(e.target.value) })
@@ -193,18 +300,6 @@ export function ChatSettingsPanel({
           Configured when the model is loaded.
         </p>
       </div>
-      <Button
-        variant="outline"
-        size="sm"
-        className="mt-6"
-        onClick={() => {
-          reset()
-          setStopText("")
-        }}
-      >
-        <ArrowCounterClockwiseIcon />
-        Reset to defaults
-      </Button>
     </>
   )
 }

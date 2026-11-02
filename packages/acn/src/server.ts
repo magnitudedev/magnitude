@@ -1,6 +1,7 @@
 import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
 import { ChatInferenceLive } from "./chat/inference"
 import { ChatServiceLive } from "./chat/service"
+import { ChatModelDefaultsStoreLive } from "./chat/model-defaults"
 import {
   BunHttpServer,
   BunFileSystem,
@@ -468,7 +469,7 @@ const AcnDebugServicesLayer = (dataDir: string) => {
  */
 /** Services that answer for the machine running this ACN: its settings and its harness configuration. */
 const withServerOwnedServices = <A, E, R>(base: Layer.Layer<A, E, R>, host: AcnHostApi, owner: AcnOwnerControl) =>
-  Layer.mergeAll(ServerSettingsLive, AcnHarnessConnectionsLive, Layer.succeed(AcnOwner, owner)).pipe(
+  Layer.mergeAll(ServerSettingsLive, ChatModelDefaultsStoreLive, AcnHarnessConnectionsLive, Layer.succeed(AcnOwner, owner)).pipe(
     Layer.provideMerge(base),
     Layer.provide(Layer.succeed(AcnHost, host)),
   )

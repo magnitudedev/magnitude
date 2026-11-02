@@ -1,5 +1,5 @@
 import { applyChatUpdate, Chat as Rpcs } from "@magnitudedev/sdk"
-import { Group } from "@magnitudedev/effect-query"
+import { Group, QueryClient } from "@magnitudedev/effect-query"
 import { mutation, query, streamQuery } from "./bind"
 
 const ListChats = query(Rpcs.list, (client) => client.chat.list)
@@ -13,6 +13,13 @@ const RetryChatResponse = mutation(Rpcs.retry, (client) => client.chat.retry)
 const StopChatResponse = mutation(Rpcs.stop, (client) => client.chat.stop)
 const RenameChat = mutation(Rpcs.rename, (client) => client.chat.rename)
 const RemoveChat = mutation(Rpcs.remove, (client) => client.chat.remove)
+const ListChatModelDefaults = query(Rpcs.listModelDefaults, (client) => client.chat.listModelDefaults)
+const SaveChatModelDefaults = mutation(Rpcs.saveModelDefaults, (client) => client.chat.saveModelDefaults, {
+  synchronize: () => QueryClient.invalidate(ListChatModelDefaults.match({})),
+})
+const ClearChatModelDefaults = mutation(Rpcs.clearModelDefaults, (client) => client.chat.clearModelDefaults, {
+  synchronize: () => QueryClient.invalidate(ListChatModelDefaults.match({})),
+})
 
 export const Chat = Group.make({
   ListChats,
@@ -23,4 +30,7 @@ export const Chat = Group.make({
   StopChatResponse,
   RenameChat,
   RemoveChat,
+  ListChatModelDefaults,
+  SaveChatModelDefaults,
+  ClearChatModelDefaults,
 })

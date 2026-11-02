@@ -12,15 +12,18 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../ui/select"
+import { ChangedDot } from "./settings"
 import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip"
 
 export function ChatThinkingSelect({
   model,
   selected,
+  changed,
   onChange,
 }: {
   model: InferenceModel | undefined
   selected: Option.Option<ResponseReasoningEffort>
+  changed?: boolean
   onChange: (effort: ReasoningEffort) => void
 }) {
   const levels = reasoningLevels(model)
@@ -63,6 +66,7 @@ export function ChatThinkingSelect({
                 <SelectValue>
                   <ChartBarIcon aria-hidden="true" className="size-3" />
                   {label}
+                  {changed && <ChangedDot />}
                 </SelectValue>
               </SelectTrigger>
               <SelectContent

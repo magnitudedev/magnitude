@@ -4,7 +4,15 @@ import { replaySafe } from "../transport/recovery"
 import { ServableModelsUnavailable } from "../errors"
 import { optional } from "../schemas/codec"
 import { MessageId, SessionId } from "../schemas/identifier"
-import { ChatBusy, ChatNotFound, ChatPage, ChatStorageFailed, ChatUpdate, InvalidChatRequest } from "../schemas/chat"
+import {
+  ChatBusy,
+  ChatModelDefaultsFailed,
+  ChatNotFound,
+  ChatPage,
+  ChatStorageFailed,
+  ChatUpdate,
+  InvalidChatRequest,
+} from "../schemas/chat"
 import { ResponseReasoningEffort } from "../schemas/session-event"
 import { ServingModelId } from "../schemas/serving-usage"
 
@@ -37,13 +45,30 @@ export type RequestedResponseSettings = typeof RequestedResponseSettings.Type
 const chatId = SessionId.pipe(Schema.maxLength(128))
 const messageId = MessageId.pipe(Schema.maxLength(128))
 
+const model = ServingModelId.pipe(Schema.maxLength(1024))
+const reasoningEffort = optional(ResponseReasoningEffort.pipe(Schema.maxLength(32)))
+
 /** A response wanted from a model, as the client's draft configures it. */
 const response = {
   responseId: messageId,
-  model: ServingModelId.pipe(Schema.maxLength(1024)),
-  reasoningEffort: optional(ResponseReasoningEffort.pipe(Schema.maxLength(32))),
+  model,
+  reasoningEffort,
   settings: RequestedResponseSettings,
 }
+
+/** The reasoning level and settings a model's new chats start from, as saved for it. */
+export const ChatModelDefaults = Schema.Struct({
+  reasoningEffort,
+  settings: RequestedResponseSettings,
+})
+export type ChatModelDefaults = typeof ChatModelDefaults.Type
+
+/** Each model's saved defaults. A model with none starts from the standard settings. */
+export const SavedChatModelDefaults = Schema.Record({ key: model, value: ChatModelDefaults })
+export type SavedChatModelDefaults = typeof SavedChatModelDefaults.Type
+
+export const ChatModelDefaultsSave = Schema.Struct({ model, defaults: ChatModelDefaults })
+export type ChatModelDefaultsSave = typeof ChatModelDefaultsSave.Type
 
 /** A payload's IDs each name a different message: one ID never names two. */
 const distinct = (ids: ReadonlyArray<MessageId>) => new Set(ids).size === ids.length || "A request's IDs must differ."
@@ -132,6 +157,23 @@ export const Chat = {
     payload: chat,
     success: Schema.Void,
     error: ChatStorageFailed,
+  }).pipe(replaySafe),
+  listModelDefaults: Rpc.make("ListChatModelDefaults", {
+    payload: Schema.Struct({}),
+    success: SavedChatModelDefaults,
+    error: ChatModelDefaultsFailed,
+  }).pipe(replaySafe),
+  /** Saving replaces the model's saved defaults with these. */
+  saveModelDefaults: Rpc.make("SaveChatModelDefaults", {
+    payload: ChatModelDefaultsSave,
+    success: Schema.Void,
+    error: ChatModelDefaultsFailed,
+  }).pipe(replaySafe),
+  /** Clearing a model with no saved defaults does nothing. */
+  clearModelDefaults: Rpc.make("ClearChatModelDefaults", {
+    payload: Schema.Struct({ model }),
+    success: Schema.Void,
+    error: ChatModelDefaultsFailed,
   }).pipe(replaySafe),
   /** The chat as it is, then each settlement's changes to it and its running response, until it is removed. */
   watch: Rpc.make("WatchChat", {
