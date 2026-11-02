@@ -1,6 +1,6 @@
 #!/bin/bash
-# Rebuild the checked-in ICNS from the brand tile (assets/brand/icon-tile.svg, the same
-# rounded blue tile the website ships), inset on Apple's icon grid so it matches other
+# Rebuild the checked-in ICNS from the brand tile (assets/brand/icon-tile.svg, the
+# slate squircle the website ships), inset on Apple's icon grid so it matches other
 # Dock icons. Asset-authoring only; release CI consumes the committed resource.
 set -euo pipefail
 cd "$(dirname "$0")/../../../.."
