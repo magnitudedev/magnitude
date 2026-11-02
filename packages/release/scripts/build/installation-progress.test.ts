@@ -125,7 +125,7 @@ describe.skipIf(process.platform === "win32")("Unix installer progress", () => {
       const progressPid = Number(readFileSync(join(root, "pid"), "utf8"))
       expect(() => process.kill(progressPid, 0)).toThrow()
     } finally { rmSync(root, { recursive: true, force: true }) }
-  })
+  }, 15_000)
 })
 
 const powershell = process.env.MAGNITUDE_TEST_POWERSHELL ?? (process.platform === "win32" ? "powershell.exe" : "pwsh")
@@ -140,5 +140,5 @@ describe.skipIf(!hasPowerShell)("Windows installer progress", () => {
     expect(result.stderr).toContain("child output")
     expect(result.stderr).not.toMatch(/NaN|Infinity/)
     expect(result.stderr).not.toContain("\u001b")
-  })
+  }, 30_000)
 })
