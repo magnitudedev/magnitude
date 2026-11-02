@@ -86,10 +86,36 @@ pub fn names(backend: BackendName) -> &'static [&'static str] {
     }
 }
 
+/// The values of `backend`'s forms for representation `id` ([`admitted`]),
+/// decided once per backend over the registry's representations: every
+/// native node a graph binds reads them.
+fn values(backend: BackendName, id: RepresentationId) -> Option<&'static [u32]> {
+    type Table = std::sync::OnceLock<Vec<Option<Vec<u32>>>>;
+    static CUDA: Table = Table::new();
+    static METAL: Table = Table::new();
+    static CPU: Table = Table::new();
+    static VULKAN: Table = Table::new();
+    let table = match backend {
+        BackendName::Cuda => &CUDA,
+        BackendName::Metal => &METAL,
+        BackendName::Cpu => &CPU,
+        BackendName::Vulkan => &VULKAN,
+    };
+    table.get_or_init(|| {
+        let representations = registry::representations();
+        let mut values = vec![None; representations.len()];
+        for info in representations {
+            values[info.id.index()] = admitted(backend, info.id);
+        }
+        values
+    })[id.index()]
+    .as_deref()
+}
+
 /// The values of `backend`'s forms for representation `id`, in the order of
 /// [`names`]; `None` where the backend chooses no form of it: on a GPU,
 /// storage other than packed rows.
-fn values(backend: BackendName, id: RepresentationId) -> Option<Vec<u32>> {
+fn admitted(backend: BackendName, id: RepresentationId) -> Option<Vec<u32>> {
     let info = registry::representation_info(id);
     if backend == BackendName::Cpu {
         return Some(vec![u32::from(cpu_int8(info))]);
@@ -110,7 +136,7 @@ fn values(backend: BackendName, id: RepresentationId) -> Option<Vec<u32>> {
 /// order, with their values; none where the backend chooses no form of it
 /// (`values`).
 pub fn forms(backend: BackendName, id: RepresentationId) -> Vec<(&'static str, u32)> {
-    values(backend, id).map_or_else(Vec::new, |values| names(backend).iter().copied().zip(values).collect())
+    values(backend, id).map_or_else(Vec::new, |values| names(backend).iter().copied().zip(values.iter().copied()).collect())
 }
 
 /// One of a backend's forms, as a native declaration of that backend names
