@@ -1,6 +1,6 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
-import { authorizesRemoteInference, generateApiKey, isAllowedHostHeader, isLoopbackAddress, LOOPBACK_ONLY, resolveNetworkAccess, type NetworkAccess } from "./network-access"
+import { admitsRequestHost, authorizesRemoteInference, generateApiKey, isAllowedHostHeader, isLoopbackAddress, LOOPBACK_ONLY, resolveNetworkAccess, type NetworkAccess } from "./network-access"
 
 const enabled = (overrides: Partial<NetworkAccess> = {}): NetworkAccess => ({
   enabled: true, bind: "0.0.0.0", apiKey: Option.some("mag-secret"), requireApiKey: true, allowedHosts: [], warning: Option.none(), ...overrides,
@@ -14,6 +14,7 @@ describe("network access resolution", () => {
   it("binds all interfaces unless a specific address is configured", () => {
     expect(resolveNetworkAccess(Option.some({ enabled: true, requireApiKey: true, allowedHosts: [] })).bind).toBe("0.0.0.0")
     expect(resolveNetworkAccess(Option.some({ enabled: true, bind: "100.64.1.5", requireApiKey: true, allowedHosts: [] })).bind).toBe("100.64.1.5")
+    expect(resolveNetworkAccess(Option.some({ enabled: true, bind: "::", requireApiKey: true, allowedHosts: [] })).bind).toBe("0.0.0.0")
     const bad = resolveNetworkAccess(Option.some({ enabled: true, bind: "my-mac", requireApiKey: true, allowedHosts: [] }))
     expect(bad.bind).toBe("0.0.0.0")
     expect(Option.isSome(bad.warning)).toBe(true)
@@ -28,8 +29,8 @@ describe("network access resolution", () => {
 
 describe("loopback detection", () => {
   it("recognises IPv4, IPv6, and mapped loopback addresses", () => {
-    for (const address of ["127.0.0.1", "127.0.0.53", "::1", "::ffff:127.0.0.1", "[::1]"]) expect(isLoopbackAddress(address)).toBe(true)
-    for (const address of ["192.168.1.67", "100.124.15.114", "::ffff:192.168.1.2", "10.0.0.1"]) expect(isLoopbackAddress(address)).toBe(false)
+    for (const address of ["127.0.0.1", "127.0.0.53", "::1", "::ffff:127.0.0.1", "::FFFF:127.0.0.9", "[::1]"]) expect(isLoopbackAddress(address)).toBe(true)
+    for (const address of ["192.168.1.67", "100.124.15.114", "::ffff:192.168.1.2", "::ffff:10.0.0.1", "fd00::127", "10.0.0.1"]) expect(isLoopbackAddress(address)).toBe(false)
   })
 })
 
@@ -44,6 +45,22 @@ describe("Host header allowlist", () => {
       expect(isAllowedHostHeader(host, network)).toBe(true)
     }
     for (const host of ["evil.com", "evil.com:10100", "ts.net", "attacker.ts.net.evil.com", "*"]) expect(isAllowedHostHeader(host, network)).toBe(false)
+  })
+})
+
+describe("container Host rule", () => {
+  it("admits any Host that presents the key in a container, and keeps the allowlist everywhere else", () => {
+    const network = enabled()
+    for (const headers of [{ host: "magnitude:10100", authorization: "Bearer mag-secret" }, { host: "inference.internal", "x-api-key": "mag-secret" }]) {
+      expect(admitsRequestHost(headers, network, true)).toBe(true)
+      expect(admitsRequestHost(headers, network, false)).toBe(false)
+    }
+    for (const headers of [{ host: "magnitude:10100" }, { host: "magnitude:10100", authorization: "Bearer wrong" }]) {
+      expect(admitsRequestHost(headers, network, true)).toBe(false)
+    }
+    expect(admitsRequestHost({ host: "magnitude", authorization: "Bearer mag-secret" }, enabled({ requireApiKey: false, apiKey: Option.none() }), true)).toBe(false)
+    expect(admitsRequestHost({ host: "magnitude", authorization: "Bearer mag-secret" }, { ...LOOPBACK_ONLY, apiKey: Option.some("mag-secret") }, true)).toBe(false)
+    expect(admitsRequestHost({ host: "localhost:10100" }, LOOPBACK_ONLY, true)).toBe(true)
   })
 })
 

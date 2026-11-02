@@ -1,13 +1,13 @@
 import { FileSystem } from "@effect/platform"
 import { UpdateClientMetadata, type UpdateOwner } from "@magnitudedev/release/hosted-update"
-import { LinuxPackageFormat } from "@magnitudedev/release/linux-package"
+import { LinuxInstallationKind } from "@magnitudedev/release/linux-package"
 import { Effect, Schema } from "effect"
 import { join } from "node:path"
 
 export const readLinuxUpdateMetadata = (resources: string, version: string, osVersion: string, owner: UpdateOwner) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const format = yield* fs.readFileString(join(resources, "update-package.json")).pipe(
-    Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ format: LinuxPackageFormat })))),
+    Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ format: LinuxInstallationKind })))),
   )
   const distro: Record<string, string> = {}
   for (const line of (yield* fs.readFileString("/etc/os-release")).split("\n")) {

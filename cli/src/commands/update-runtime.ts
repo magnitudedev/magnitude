@@ -4,13 +4,14 @@ import { formatStorageSize } from "@magnitudedev/client-common"
 import { updateApplication } from "../server/application"
 import { isServerSetUp } from "../server/serve-owner"
 import { runCommand } from "./output"
+import { containerUpdateNotice } from "@magnitudedev/daemon-management/application-update"
 
 const failedPhrase = { verify: "could not be verified", install: "failed to install", authorization: "was not authorized to install", startup: "failed to start" } as const
 
 /** `server` is a Headless owner running as the system service, which installs on its own when idle. */
 export const renderApplicationUpdate = (state: ApplicationUpdateState, owner: "Desktop" | "Headless" | "None" = "Desktop", server = false): string => {
   // A running check supersedes the previous check's offer or failure; only transfers in progress stay visible.
-  if (state.check._tag === "Checking" && (state.transfer._tag === "Idle" || state.transfer._tag === "Failed" || state.transfer._tag === "Available")) {
+  if (state.check._tag === "Checking" && (state.transfer._tag === "Idle" || state.transfer._tag === "Failed" || state.transfer._tag === "Available" || state.transfer._tag === "ImageAvailable")) {
     return "Checking for application updates.\n"
   }
   switch (state.transfer._tag) {
@@ -29,6 +30,7 @@ export const renderApplicationUpdate = (state: ApplicationUpdateState, owner: "D
     case "Ready": return `Magnitude ${state.transfer.version} is ready to install.\n${owner === "Headless"
       ? server ? "The server installs it on its own once it is idle." : "Stop `magnitude serve`, then run: magnitude update install"
       : owner === "None" ? "Install: magnitude update install" : "Install and restart: magnitude update install"}\n`
+    case "ImageAvailable": return `${containerUpdateNotice(state.transfer.version, state.transfer.image)}\n`
     case "Cancelling": return "Cancelling the automatic update download.\nCheck progress: magnitude update status\n"
     case "Closed": return "Magnitude is quitting.\n"
     case "Idle": return state.check._tag === "Succeeded" ? "Magnitude is up to date.\n"

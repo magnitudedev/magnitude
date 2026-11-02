@@ -221,6 +221,21 @@ jobs:
           DISTRIBUTION_PUBLISHER_DATABASE_URL: ${{ secrets.DISTRIBUTION_PUBLISHER_DATABASE_URL }}
           DISTRIBUTION_DATABASE_CA: ${{ secrets.DISTRIBUTION_DATABASE_CA }}
           GH_TOKEN: ${{ github.token }}
+  # The image is built from the published release, so it runs only after publication. A failure
+  # here fails this job alone: the release stays published and no image tag moves. Rebuild it by
+  # dispatching docker-image.yml for the version.
+  docker:
+    permissions:
+      contents: read
+    needs: [preflight, publish]
+    if: needs.preflight.outputs.action == 'release'
+    uses: ./.github/workflows/docker-image.yml
+    with:
+      version: ${{ needs.preflight.outputs.version }}
+      ref: ${{ needs.preflight.outputs.source_commit }}
+      channel_tag: true
+    secrets:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
   register-metadata:
     needs: preflight
     if: needs.preflight.outputs.action == 'register-metadata'

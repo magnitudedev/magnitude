@@ -1,0 +1,338 @@
+---
+title: "Docker"
+description: "Run Magnitude as a container with the official image."
+---
+
+The official image, `magnitudedev/magnitude`, runs Magnitude as a server: the OpenAI and Anthropic compatible API at `:10100/inference/v1` and `:10100/inference/anthropic`, the browser app at `:10100`, and the `magnitude` CLI through `docker exec`. It is the same product as a [remote server](/remote-server), packaged for people who run everything in containers.
+
+The image is for Linux on x64 and ARM64; Docker picks the right one. One image serves CPU, NVIDIA CUDA and Vulkan GPUs.
+
+## Run it
+
+```sh
+docker run -d --name magnitude --restart unless-stopped \
+  -p 10100:10100 \
+  -v magnitude:/data \
+  magnitudedev/magnitude
+```
+
+Add the flag for your GPU from [GPUs](#gpus). The container reports `healthy` in `docker ps` once Magnitude is ready. On its first start Magnitude makes a network key, the API key for everything outside the container, and prints it:
+
+```sh
+docker logs magnitude
+```
+
+Then download a model:
+
+```sh
+docker exec magnitude magnitude catalog recommendations --preference balanced --limit 5
+docker exec magnitude magnitude catalog pull "MODEL_ID"
+docker exec magnitude magnitude models status "MODEL_ID"
+```
+
+Use it at `http://localhost:10100/inference/v1` with the network key as the API key, or open `http://localhost:10100` in a browser and sign in with the key. From another computer, use the Docker host's address instead of `localhost`.
+
+Always keep `/data` on a volume. It holds models, settings, the network key and the installation's identity; without a volume, all of it is lost when the container is removed.
+
+## Docker Compose
+
+```yaml compose.yaml
+services:
+  magnitude:
+    image: magnitudedev/magnitude
+    restart: unless-stopped
+    ports:
+      - "10100:10100"
+    volumes:
+      - magnitude:/data
+    environment:
+      MAGNITUDE_NETWORK_KEY: ${MAGNITUDE_NETWORK_KEY}
+    # NVIDIA GPUs; remove for CPU or Vulkan
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  magnitude:
+```
+
+Put `MAGNITUDE_NETWORK_KEY=` and a long random value in a `.env` file beside it, then run `docker compose up -d`. Run CLI commands with `docker compose exec magnitude magnitude …`.
+
+## The network key
+
+In a container, network access is on by default: Magnitude listens on all of the container's interfaces and requires a key from every caller outside the container. Requests through a published port count as coming from another device.
+
+- **Let Magnitude make one:** as in [Run it](#run-it), the first start generates a key, saves it in the volume, and prints it once in `docker logs magnitude`. Recreating the container on the same volume keeps it. Read it again with:
+
+```sh
+docker exec magnitude cat /data/.magnitude/config.json
+```
+
+It is `network.apiKey` there.
+
+- **Or set your own:** pass `-e MAGNITUDE_NETWORK_KEY=KEY`, as the Compose and Kubernetes examples do. It must be 16 to 512 printable characters without spaces; use a long random value, such as the output of `openssl rand -hex 32`. Magnitude uses it at every start the variable is set, in place of the saved key, so pass it every time you recreate the container.
+
+Send the key as `Authorization: Bearer KEY` or `x-api-key: KEY`. Check it from the host:
+
+```sh
+curl -H "Authorization: Bearer KEY" http://localhost:10100/inference/v1/models
+```
+
+See [Network access](/api/network-access) for clients and agents.
+
+The browser app opens by IP address, `localhost` or a Tailscale name. To open it by another host name, such as `http://nas.local:10100`, list the names in `MAGNITUDE_ALLOWED_HOSTS`, separated by commas:
+
+```sh
+docker run -d --name magnitude -p 10100:10100 -v magnitude:/data \
+  -e MAGNITUDE_ALLOWED_HOSTS=nas.local,magnitude.home.arpa \
+  magnitudedev/magnitude
+```
+
+Requests that send the key are accepted under any host name, so other containers can use names such as `http://magnitude:10100` without this.
+
+## GPUs
+
+<Tabs>
+<Tab title="NVIDIA">
+Install the NVIDIA driver and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) on the host, then add `--gpus all`:
+
+```sh
+docker run -d --name magnitude --restart unless-stopped --gpus all \
+  -p 10100:10100 -v magnitude:/data \
+  magnitudedev/magnitude
+```
+
+CUDA needs an Ampere or newer GPU. The image asks the toolkit for its Vulkan driver too, so older cards such as Turing run on Vulkan instead. Check what Magnitude sees with `docker exec magnitude magnitude hardware`.
+</Tab>
+<Tab title="AMD and Intel (Vulkan)">
+The image includes Mesa's Vulkan drivers. Pass the host's GPU devices and the group that owns them, since Magnitude runs as uid 1000 in the container:
+
+```sh
+docker run -d --name magnitude --restart unless-stopped \
+  --device /dev/dri \
+  --group-add "$(stat -c %g /dev/dri/renderD128)" \
+  -p 10100:10100 -v magnitude:/data \
+  magnitudedev/magnitude
+```
+
+`renderD128` is the first GPU; `ls -l /dev/dri` lists them. In Compose, use `devices: ["/dev/dri:/dev/dri"]` and `group_add: ["GID"]` with the number that `stat -c %g /dev/dri/renderD128` prints. Without the group, the container can't open the GPU and Magnitude runs on CPU.
+</Tab>
+<Tab title="CPU">
+No flags are needed. Magnitude runs models on the CPU when it finds no usable GPU.
+</Tab>
+</Tabs>
+
+## Docker Desktop on macOS and Windows
+
+Docker Desktop runs Linux containers in a virtual machine, so the container sees that machine's memory and processors, not your computer's.
+
+- **macOS:** containers can't use the GPU; Metal isn't available inside the virtual machine. The image runs on CPU only. To use your Mac's GPU, install the [macOS app](/installation/macos) instead. Colima and Podman's machine run the image the same way.
+- **Windows:** with the WSL 2 backend and a current NVIDIA driver on Windows, `--gpus all` gives the container the NVIDIA GPU. AMD and Intel GPUs aren't available to containers; use the [Windows app](/installation/windows) for them.
+
+Raise the virtual machine's memory limit in Docker Desktop's **Settings → Resources** if models you expect to fit are reported as too large.
+
+## Memory limits
+
+With a memory limit, such as `-m 8g` or a Kubernetes `resources.limits.memory`, Magnitude counts the limit as the container's memory and fits models to it. It keeps 2 GB or a tenth of the limit in reserve, whichever is larger, so even the smallest catalog models need a limit of about 5 GB. `docker exec magnitude magnitude hardware` shows the memory Magnitude sees.
+
+## Data and permissions
+
+Magnitude runs as uid 1000 with its home at `/data`. Everything it keeps is in `/data/.magnitude`: models in `models/`, settings in `config.json`, logs in `logs/`.
+
+A named volume, as in the examples, is created with the right owner. To use a host directory instead, make it writable by uid 1000 first:
+
+```sh
+mkdir -p /srv/magnitude
+sudo chown 1000:1000 /srv/magnitude
+docker run -d --name magnitude -p 10100:10100 -v /srv/magnitude:/data magnitudedev/magnitude
+```
+
+Give each container its own volume. A second container started on a volume that another one is using stops at once and says so. On network filesystems that can't lock files, such as some NFS shares and `ReadWriteMany` volumes, nothing stops it, so make sure only one container uses each volume.
+
+Ubuntu's snap of Docker can only mount folders under your home directory; use a named volume, a folder in your home directory, or Docker from docker.com.
+
+## Use models you already have
+
+Mount existing model folders read-only. Magnitude finds Ollama models and the Hugging Face cache automatically when the container's environment points at them:
+
+```sh
+docker run -d --name magnitude --restart unless-stopped \
+  -p 10100:10100 -v magnitude:/data \
+  -v /usr/share/ollama/.ollama/models:/models/ollama:ro -e OLLAMA_MODELS=/models/ollama \
+  -v "$HOME/.cache/huggingface/hub":/models/huggingface:ro -e HF_HUB_CACHE=/models/huggingface \
+  magnitudedev/magnitude
+```
+
+`/usr/share/ollama/.ollama/models` is where the Ollama Linux service keeps models; a user's own Ollama uses `~/.ollama/models`. For any other folder of GGUF files, mount it, for example with `-v /srv/gguf:/models/gguf:ro` in the `docker run` command, and add it:
+
+```sh
+docker exec magnitude magnitude models folders add /models/gguf
+docker exec magnitude magnitude models folders list
+```
+
+The files must be readable by uid 1000. Magnitude only reads these folders.
+
+## Hugging Face sign-in
+
+For gated models, private repositories or higher download limits, sign in with a code you enter on any device:
+
+```sh
+docker exec -it magnitude magnitude hf login
+```
+
+The sign-in is saved in `/data` and survives upgrades. Magnitude doesn't read `HF_TOKEN`.
+
+## Use it from other containers
+
+Put your app and Magnitude on the same Docker network, such as one Compose project, and use the service name:
+
+| Setting | Value |
+| --- | --- |
+| OpenAI-compatible base URL | `http://magnitude:10100/inference/v1` |
+| Anthropic-compatible base URL | `http://magnitude:10100/inference/anthropic` |
+| API key | The network key |
+
+Requests that carry the key are accepted under any host name, so the service name works as it is.
+
+## Kubernetes
+
+One replica with a persistent volume, the key from a Secret, and one NVIDIA GPU. It assumes the [NVIDIA device plugin](https://github.com/NVIDIA/k8s-device-plugin); for CPU, remove the `nvidia.com/gpu` limit.
+
+```yaml magnitude.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: magnitude
+stringData:
+  network-key: REPLACE_WITH_A_LONG_RANDOM_KEY
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: magnitude-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: magnitude
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: magnitude
+  template:
+    metadata:
+      labels:
+        app: magnitude
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: magnitude
+          image: magnitudedev/magnitude:VERSION
+          ports:
+            - containerPort: 10100
+          env:
+            - name: MAGNITUDE_NETWORK_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: magnitude
+                  key: network-key
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 10100
+            periodSeconds: 10
+            failureThreshold: 30
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: magnitude-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: magnitude
+spec:
+  selector:
+    app: magnitude
+  ports:
+    - port: 10100
+      targetPort: 10100
+```
+
+Replace `VERSION` with a release, such as `0.2.14`, so the cluster upgrades only when you change it. `Recreate` stops the old pod before the new one starts, since only one may use the volume. On clusters that select the NVIDIA runtime by class, such as k3s, add `runtimeClassName: nvidia` to the pod spec. Other pods reach it at `http://magnitude:10100/inference/v1` with the key; run CLI commands with `kubectl exec deploy/magnitude -- magnitude …`.
+
+## Podman
+
+Rootless Podman 4.3 or later maps your account to uid 1000 in the container with `--userns=keep-id`. NVIDIA GPUs use CDI after `sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`:
+
+```sh
+mkdir -p ~/magnitude
+podman run -d --name magnitude \
+  --userns=keep-id:uid=1000,gid=1000 \
+  --device nvidia.com/gpu=all \
+  -p 10100:10100 \
+  -v ~/magnitude:/data:Z \
+  docker.io/magnitudedev/magnitude
+```
+
+`:Z` relabels the directory for SELinux, as on Fedora and RHEL. Leave out `--device nvidia.com/gpu=all` for CPU, or use `--device /dev/dri --group-add keep-groups` for Vulkan. Run CLI commands with `podman exec magnitude magnitude …`.
+
+## Logs and status
+
+```sh
+docker logs magnitude
+docker exec magnitude magnitude status
+```
+
+The inference engine also writes `/data/.magnitude/logs/inference.log`.
+
+## Upgrade
+
+The container never updates itself: an update installed inside it would be lost when the container is recreated. It checks for new releases and says when one is available, in the logs, in `magnitude status` and in Settings. To upgrade, pull the image and recreate the container on the same volume:
+
+```sh
+docker pull magnitudedev/magnitude
+docker rm -f magnitude
+docker run -d --name magnitude ...   # the same command as before
+```
+
+With Compose:
+
+```sh
+docker compose pull && docker compose up -d
+```
+
+Tools that pull new images and recreate containers for you, such as Watchtower, work the same way as long as they keep the volume.
+
+Tags: `latest` is the newest stable release, `beta` and `alpha` the newest prereleases, and each release also has its own tag, such as `magnitudedev/magnitude:0.2.14`, for pinning. A container on a prerelease is offered that channel's releases and told to pull `magnitudedev/magnitude:beta` or `:alpha`; a pinned container upgrades when you change its tag.
+
+## Port 10100 is already in use
+
+If Magnitude also runs on the host, it already uses port 10100. Publish the container on another host port and use that port in URLs:
+
+```sh
+docker run -d --name magnitude -p 10101:10100 -v magnitude:/data magnitudedev/magnitude
+```
+
+The API is then at `http://localhost:10101/inference/v1`.

@@ -23,7 +23,7 @@ use magnitude_engine::host::HostArtifacts;
 use magnitude_engine::preview::LoadPreview;
 use magnitude_engine::worker::{EngineClient, Preparation, load_prepared};
 use magnitude_engine::worker::protocol::{LoadProgress, MemoryObservation};
-use magnitude_executor::platform::MemoryReserves;
+use magnitude_executor::platform::{Fit, MemoryReserves};
 use magnitude_service_contracts::models::{
     CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover,
     InstalledModelPackages as _, MemoryShortage, ModelAssessment, ModelAssessmentDomainSnapshot,
@@ -116,12 +116,18 @@ impl ModelInstances {
     pub fn start(environment: ResidencyEnvironment) -> Self {
         let environment = Arc::new(environment);
         let (client, inbox) = ResidencyClient::channel();
-        let host_capacity = environment.catalog.topology().host_ram().capacity().value;
+        // The reserves of what this process may use, as fit reads them: within a container's memory
+        // limit, not the whole host's RAM. Without a reading, the whole host's, the larger.
+        let topology = environment.catalog.topology();
+        let thresholds = match environment.catalog.inventory().host_status() {
+            Ok(host) => Fit::host_ram(&topology, &host, &environment.reserves).thresholds,
+            Err(_) => environment
+                .reserves
+                .for_domain(&seismic::StoreKind::HostRam, topology.host_ram().capacity().value),
+        };
         let supervisor = MemorySupervisor::start(
             Arc::clone(&environment.host_memory),
-            environment
-                .reserves
-                .for_domain(&seismic::StoreKind::HostRam, host_capacity),
+            thresholds,
             client.notifier(),
         );
         let driver = EngineResidency {

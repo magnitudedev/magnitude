@@ -1,9 +1,11 @@
 import { Deferred, Effect, Exit, Option, Ref, Schema, Stream, type Scope } from "effect"
 import { dirname } from "node:path"
 import { LoginStartupFailed, type OwnedServiceState } from "@magnitudedev/sdk/desktop-host"
+import type { OwnerCapability } from "@magnitudedev/acn-protocol"
 import type { UpdateCheckReason } from "@magnitudedev/release/hosted-update"
 import { unavailableApplicationUpdate, type ApplicationUpdate } from "../application-update/application-update"
 import { makeHeadlessUpdateControl, reportUpdateOutcome } from "../application-update/headless-update"
+import { containerUpdateRefusal } from "../application-update/container-update"
 import { UpdateHardwareSource, updateHardwareFromService } from "../application-update/update-hardware"
 import { WindowsPipeName, nativeWindowsPrivatePipesLayer } from "@magnitudedev/utils/windows-native"
 import { NativeHost } from "./index"
@@ -25,6 +27,13 @@ export class HeadlessApplicationFailed extends Schema.TaggedError<HeadlessApplic
 const windowsUncontainedServe = "On Windows, start `magnitude serve` with the Magnitude command, "
   + "%LOCALAPPDATA%\\Programs\\Magnitude CLI\\magnitude.exe, not the app's resources\\magnitude.exe. "
   + "Service wrappers such as NSSM and scheduled tasks must start that command too."
+
+/**
+ * In a Docker installation the image is the installation and the container's lifecycle is the
+ * application's, so the owner offers neither updates nor quitting, only restarting the service.
+ */
+export const headlessCapabilities = (container: boolean): ReadonlyArray<OwnerCapability> =>
+  container ? ["RestartService"] : ["Updates", "RestartService", "Quit"]
 
 /**
  * Why a Headless owner ended. `Restart` asks the caller to admit a new owner with the same invocation;
@@ -57,6 +66,7 @@ export const runHeadlessApplication = (options: {
    * Answering true stops with `InstallUpdate` instead of failing, to install a download that replaces it.
    */
   readonly startupFailed?: (report: Effect.Effect<void>, updates: ApplicationUpdate) => Effect.Effect<boolean>
+  readonly container?: { readonly image: string }
 }) => Effect.scoped(Effect.gen(function* () {
   const stop = yield* Deferred.make<HeadlessStop>()
   yield* options.stop.pipe(Effect.zipRight(Deferred.succeed(stop, "Requested")), Effect.forkScoped)
@@ -88,7 +98,7 @@ export const runHeadlessApplication = (options: {
   // Update checks start once the service is ready, so a new version reports `applied` only after it starts.
   const firstReady = yield* Deferred.make<void>()
   const report = (reason: UpdateCheckReason) => reportUpdateOutcome(updates, reason)
-  const update = yield* makeHeadlessUpdateControl(updates, Deferred.await(firstReady))
+  const update = yield* makeHeadlessUpdateControl(updates, Deferred.await(firstReady), options.container ? containerUpdateRefusal(options.container.image) : undefined)
   if (options.updateReady) {
     const notify = options.updateReady
     yield* updates.changes.pipe(Stream.map(state => state.transfer), Stream.changesWith((a, b) =>
@@ -96,7 +106,7 @@ export const runHeadlessApplication = (options: {
       Stream.runForEach(state => state._tag === "Ready" ? notify(state.version) : Effect.void), Effect.forkScoped)
   }
   const ownerAgent: OwnerAgent = {
-    state: updates.changes.pipe(Stream.map(state => ({ owner: "Headless" as const, capabilities: ["Updates" as const, "RestartService" as const, "Quit" as const], updates: Option.some(state), loginStartup: Option.none() }))),
+    state: updates.changes.pipe(Stream.map(state => ({ owner: "Headless" as const, capabilities: headlessCapabilities(options.container !== undefined), updates: Option.some(state), loginStartup: Option.none() }))),
     handle: request => {
       switch (request._tag) {
         case "CheckUpdate": return ownerResult(update("check"))
@@ -104,7 +114,7 @@ export const runHeadlessApplication = (options: {
         case "DiscardUpdate": return ownerResult(update("discard"))
         case "InstallUpdate": return ownerResult(update("install"))
         case "SetAutoDownload": return ownerResult(updates.setAutoDownload(request.enabled))
-        case "Quit": return Effect.succeed(ownerDone(Deferred.succeed(stop, "Requested").pipe(Effect.asVoid)))
+        case "Quit": return options.container ? ownerUnsupported : Effect.succeed(ownerDone(Deferred.succeed(stop, "Requested").pipe(Effect.asVoid)))
         // Restarting re-admits the owner, so settings that apply at service start take effect.
         case "RestartService": return Effect.succeed(ownerDone(Deferred.succeed(stop, "Restart").pipe(Effect.asVoid)))
         case "SetLoginStartup": return ownerUnsupported

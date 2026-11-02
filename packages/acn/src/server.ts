@@ -14,6 +14,7 @@ import * as HttpServer from "@effect/platform/HttpServer"
 import * as HttpServerRequest from "@effect/platform/HttpServerRequest"
 import { RpcSerialization, RpcServer } from "@effect/rpc"
 import {
+  Console,
   Context,
   Cause,
   Data,
@@ -44,7 +45,7 @@ import {
   resolveNetworkAccess,
   generateApiKey,
   makeConfigStorage,
-  isAllowedHostHeader,
+  admitsRequestHost,
   authorizesRemoteInference,
   LOOPBACK_ONLY,
   ALL_INTERFACES_BIND,
@@ -118,6 +119,7 @@ import {
   makeHealthResponse,
 } from "./identity"
 import { AcnHost, ServerSettingsLive, type AcnHostApi } from "./server-settings"
+import { containerNetworkConfig, readContainerInstallation, savedNetworkForKey, type ContainerInstallation } from "./container"
 import { AcnHarnessConnectionsLive } from "./harness-connections"
 import { AcnOwner } from "./application-owner"
 import { resolveWebAppSource, serveWebApp } from "./web-app"
@@ -473,18 +475,25 @@ const withServerOwnedServices = <A, E, R>(base: Layer.Layer<A, E, R>, host: AcnH
 
 /**
  * Network access turned on in config.json by hand has no key, and without one every remote request is
- * refused. The service makes the key then, as Settings does, and says where it is without printing it.
+ * refused. The service makes the key then, as Settings does, and says where it is without printing it,
+ * except in a container, whose network access is on by default and whose output is where people look.
  */
-const ensureNetworkKey = (dataDir: string, network: NetworkAccess) => {
+const ensureNetworkKey = (dataDir: string, network: NetworkAccess, container: Option.Option<ContainerInstallation>) => {
   if (!network.enabled || !network.requireApiKey || Option.isSome(network.apiKey)) return Effect.succeed(network)
   const storage = makeGlobalStorage({ root: dataDir })
   const apiKey = generateApiKey()
   return makeConfigStorage().pipe(
     Effect.provideService(GlobalStorage, storage), Effect.provide(BunPath.layer),
     Effect.flatMap(config => config.update(current => ({ ...current,
-      network: Option.map(current.network, saved => ({ ...saved, apiKey: saved.apiKey ?? apiKey })) }))),
+      network: Option.map(savedNetworkForKey(container, current.network), saved => ({ ...saved, apiKey: saved.apiKey ?? apiKey })) }))),
     Effect.as({ ...network, apiKey: Option.some(apiKey) }),
-    Effect.tap(() => Effect.logWarning(`Network access was on without a key, so Magnitude made one and saved it as network.apiKey in ${storage.paths.configFile}. `
+    // A container's output is its log, which only those who can already run commands in it read.
+    Effect.tap(() => Option.isSome(container)
+      ? Console.error([`Network access is on, with this key: ${apiKey}`,
+        "Send it as a bearer token from other containers and devices, or sign in with it in the browser app.",
+        `It is saved as network.apiKey in ${storage.paths.configFile}; read it again with \`docker exec <container> cat ${storage.paths.configFile}\`,`,
+        "or set your own with the MAGNITUDE_NETWORK_KEY environment variable."].join("\n"))
+      : Effect.logWarning(`Network access was on without a key, so Magnitude made one and saved it as network.apiKey in ${storage.paths.configFile}. `
       + "Other computers need it: find it in Settings → Network access in the app on this computer, or run `magnitude server setup` again on a server.")),
     Effect.catchAll(error => Effect.logWarning("Network access is on without a key, and a key could not be saved, so other computers can't connect. "
       + "Turn network access on in Settings → Network access, or add a network.apiKey to config.json.").pipe(
@@ -492,14 +501,15 @@ const ensureNetworkKey = (dataDir: string, network: NetworkAccess) => {
   )
 }
 
-export const readNetworkAccess = (dataDir: string) =>
+export const readNetworkAccess = (dataDir: string, container: Option.Option<ContainerInstallation> = Option.none()) =>
   readStructuredFile(makeGlobalStorage({ root: dataDir }).paths.configFile, MagnitudeConfigSchema.pick("network")).pipe(
-    Effect.map((result) => result._tag === "Invalid" || result._tag === "Missing" ? LOOPBACK_ONLY : resolveNetworkAccess(result.value.network)),
+    Effect.map((result) => result._tag === "Invalid" ? LOOPBACK_ONLY
+      : resolveNetworkAccess(containerNetworkConfig(container, result._tag === "Missing" ? Option.none() : result.value.network))),
     Effect.tapError((error) => Effect.logWarning("Could not read network access from config.json; listening on loopback only").pipe(
       Effect.annotateLogs({ cause: error.message }),
     )),
     Effect.orElseSucceed(() => LOOPBACK_ONLY),
-    Effect.flatMap((network) => ensureNetworkKey(dataDir, network)),
+    Effect.flatMap((network) => ensureNetworkKey(dataDir, network, container)),
     Effect.tap((network) => Option.isSome(network.warning) ? Effect.logWarning(network.warning.value) : Effect.void),
     Effect.tap((network) => Effect.logInfo("Network access resolved").pipe(
       Effect.annotateLogs({ bind: network.bind, requireApiKey: network.requireApiKey }),
@@ -714,20 +724,22 @@ const ROOT_BODY = [
   "",
 ].join("\n")
 
-const invalidHostMessage = (network: NetworkAccess) => network.enabled
-  ? "Invalid Host header. Magnitude accepts local names, IP addresses, host.docker.internal, *.ts.net, and names listed under network.allowedHosts in config.json."
+const invalidHostMessage = (network: NetworkAccess, container: boolean) => network.enabled
+  ? `Invalid Host header. Magnitude accepts local names, IP addresses, host.docker.internal, *.ts.net, and names listed under network.allowedHosts in config.json${container ? ", and any name from a request that sends the network access key" : ""}.`
   : "Invalid Host header. Network access is off; turn it on in Magnitude Settings to reach this service from other devices."
 
 export const installAcnHealthRoutes = (
   router: HttpLayerRouter.HttpRouter,
   lifecycle: AcnServiceLifecycleApi,
   remote: RemoteAccessApi,
+  container = false,
 ) => Effect.gen(function* () {
   const network = remote.network
   yield* router.addGlobalMiddleware((responseEffect) => Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest
-    if (!isAllowedHostHeader(request.headers.host, network)) {
-      return HttpServerResponse.text(invalidHostMessage(network), { status: 421 })
+    if (!admitsRequestHost({ host: request.headers.host, authorization: request.headers.authorization,
+      "x-api-key": request.headers["x-api-key"] }, network, container)) {
+      return HttpServerResponse.text(invalidHostMessage(network, container), { status: 421 })
     }
     return withCors(yield* responseEffect, request)
   }))
@@ -790,6 +802,12 @@ export const installAcnPublicRoutes = (
   )
 })
 
+/** All interfaces, IPv6 as well as IPv4, unless the host can't listen on IPv6 (a kernel booted without it). */
+const allInterfacesListenAddress = Effect.try(() => Bun.serve({ hostname: "::", port: 0, fetch: () => new Response() }).stop(true)).pipe(
+  Effect.as("::"),
+  Effect.orElseSucceed(() => ALL_INTERFACES_BIND),
+)
+
 export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerControl) =>
   Effect.scoped(Effect.gen(function* () {
     const dataDir = options.dataDir ?? defaultDataDir()
@@ -815,9 +833,10 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
       Effect.ensuring(closeApplication(applicationScope)),
     ))
     yield* Effect.addFinalizer(() => closeApplicationScope)
-    const network = yield* readNetworkAccess(dataDir).pipe(Effect.provide(BunFileSystem.layer))
+    const container = yield* readContainerInstallation().pipe(Effect.provide(BunFileSystem.layer))
+    const network = yield* readNetworkAccess(dataDir, container).pipe(Effect.provide(BunFileSystem.layer))
     // Loopback always listens; all-interfaces subsumes it, any other address is added beside it.
-    const primaryBind = network.bind === ALL_INTERFACES_BIND ? ALL_INTERFACES_BIND : "127.0.0.1"
+    const primaryBind = network.bind === ALL_INTERFACES_BIND ? yield* allInterfacesListenAddress : "127.0.0.1"
     const infrastructure = yield* Layer.buildWithScope(
       makeAcnInfrastructure(options, lifecycle, primaryBind),
       applicationScope,
@@ -826,9 +845,9 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
     const server = Context.get(infrastructure, HttpServer.HttpServer)
     const sessions = yield* fileSessionStore(join(dataDir, REMOTE_SESSIONS_FILE), network).pipe(Effect.provideService(FileSystem.FileSystem, Context.get(infrastructure, FileSystem.FileSystem)))
     const remote = yield* makeRemoteAccess(network, sessions)
-    yield* installAcnHealthRoutes(router, lifecycle, remote).pipe(Effect.provideService(FileSystem.FileSystem, Context.get(infrastructure, FileSystem.FileSystem)))
+    yield* installAcnHealthRoutes(router, lifecycle, remote, Option.isSome(container)).pipe(Effect.provideService(FileSystem.FileSystem, Context.get(infrastructure, FileSystem.FileSystem)))
     yield* server.serve(router.asHttpEffect()).pipe(Effect.provide(infrastructure))
-    if (network.enabled && network.bind !== primaryBind) {
+    if (network.enabled && network.bind !== ALL_INTERFACES_BIND && network.bind !== primaryBind) {
       const additional = yield* Layer.buildWithScope(BunHttpServer.layer({
         port: options.port ?? ACN_PUBLIC_PORT,
         hostname: network.bind,
@@ -850,14 +869,14 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
     yield* lifecycle.reportStarting("Resolving", Option.none())
     const application = Effect.gen(function* () {
       const builtServices = yield* debug
-        ? Layer.buildWithScope(withServerOwnedServices(AcnDebugServicesLayer(dataDir), { dataDir, port: options.port ?? ACN_PUBLIC_PORT, activeNetwork: network }, owner), applicationScope).pipe(
+        ? Layer.buildWithScope(withServerOwnedServices(AcnDebugServicesLayer(dataDir), { dataDir, port: options.port ?? ACN_PUBLIC_PORT, activeNetwork: network, container }, owner), applicationScope).pipe(
             Effect.provide(infrastructure),
             Effect.map((context) => ({
               context,
               introspector: Option.some(Context.get(context, AcnIntrospector)),
             })),
           )
-        : Layer.buildWithScope(withServerOwnedServices(AcnBaseServicesLayer(dataDir), { dataDir, port: options.port ?? ACN_PUBLIC_PORT, activeNetwork: network }, owner), applicationScope).pipe(
+        : Layer.buildWithScope(withServerOwnedServices(AcnBaseServicesLayer(dataDir), { dataDir, port: options.port ?? ACN_PUBLIC_PORT, activeNetwork: network, container }, owner), applicationScope).pipe(
             Effect.provide(infrastructure),
             Effect.map((context) => ({
               context,

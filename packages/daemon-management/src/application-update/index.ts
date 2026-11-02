@@ -12,6 +12,7 @@ export * from "./finite-update"
 export * from "./update-configuration"
 export * from "./installed-preparation"
 export * from "./headless-update"
+export * from "./container-update"
 export * from "./linux-foreground-update"
 export * from "./windows-foreground-update"
 

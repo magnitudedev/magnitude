@@ -1,5 +1,5 @@
 import { Effect, Option, Schema } from "effect"
-import { ReleaseTarget, UpdateClientMetadata, type UpdateOwner } from "@magnitudedev/release/hosted-update"
+import { releaseTargetOf, UpdateClientMetadata, type UpdateOwner } from "@magnitudedev/release/hosted-update"
 import { makePreparedUpdateStore, PreparedUpdateStore } from "../desktop-native/prepared-update"
 import { makeUpdatePreferences } from "../desktop-native/update-preferences"
 import { nativeWindowsInstallerVerifier, WindowsInstallerVerifier } from "../desktop-native/windows-update-signature"
@@ -28,7 +28,7 @@ export const makeInstalledUpdatePreparation = (options: {
     : yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: options.version, os_version: options.osVersion, owner: options.owner,
       os: options.platform === "win32" ? "windows" : "darwin", arch: options.architecture,
       package: options.platform === "win32" ? "windows-exe" : "mac-zip" })
-  const target = yield* Schema.decodeUnknown(ReleaseTarget)({ os: metadata.os, arch: metadata.arch, package: metadata.package })
+  const target = yield* releaseTargetOf(metadata)
   const store = yield* makePreparedUpdateStore({ dataDirectory: options.dataDirectory, target, trustedPublishers: configuration.trustedPublishers })
   const preferences = yield* makeUpdatePreferences(options.dataDirectory)
   const makeSource = Effect.gen(function* () {

@@ -87,6 +87,24 @@ describe("hosted update client", () => {
     }
     expect(Either.isLeft(await Effect.runPromise(Effect.either(check(async () => Response.json({ ...envelope.release, signature: "bad" })))))).toBe(true)
   })
+  it("sends a Docker check as package=docker and accepts the DEB release its image is built from", async () => {
+    const docker = Schema.decodeUnknownSync(UpdateClientMetadata)({ version: "1.0.0", os: "linux", os_version: "6.10.14", arch: "x64", package: "docker", distro: "ubuntu", distro_version: "24.04" })
+    const offer = (target: typeof manifest.artifact.target) => Effect.runPromise(signUpdateManifest({ ...manifest, artifact: { ...manifest.artifact, target, filename: "magnitude.deb" } }, publisher.privateKey))
+    const seen: URL[] = []
+    const checkDocker = (release: unknown) => checkHostedUpdate({ origin: "https://magnitude.dev", metadata: docker,
+      sign: url => signUpdateRequest(installation.privateKey, url), trustedPublishers: new Map([[keyId, publisher.publicKey]]), userAgent: "Magnitude/1.0.0",
+    }, { reason: "scheduled", outcome: Option.none(), hardware: Option.none() }).pipe(Effect.provide(FetchHttpClient.layer),
+      Effect.provideService(FetchHttpClient.Fetch, Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
+        seen.push(new URL(new Request(input, init).url))
+        return Response.json(release)
+      }, { preconnect: () => {} })), Effect.either)
+    const deb = await offer({ os: "linux", arch: "x64", package: "deb" })
+    expect(Either.getOrThrow(await Effect.runPromise(checkDocker(deb.release)))).toEqual(Option.some(deb.release))
+    const decoded = await Effect.runPromise(decodeUpdateRequest(seen[0]!, Math.floor(Date.now() / 1000)))
+    expect([decoded.os, decoded.package, decoded.distro]).toEqual(["linux", "docker", Option.some("ubuntu")])
+    const rpm = await offer({ os: "linux", arch: "x64", package: "rpm" })
+    expect(Either.isLeft(await Effect.runPromise(checkDocker(rpm.release)))).toBe(true)
+  })
   it.each([301, 302, 401, 409, 429, 500, 503])("does not turn HTTP %s into current or retry it", async status => {
     let calls = 0
     const result = await Effect.runPromise(Effect.either(check(async () => { calls++; return new Response(null, { status, headers: { location: "https://other.invalid" } }) })))

@@ -70,6 +70,8 @@ Keep the tunnel running while using inference. You must be able to reach the ser
 
 From a container on this computer, use `http://host.docker.internal:10100/inference/v1` with the API key. Network access must be on, because the container connects from its own address.
 
+To run Magnitude itself in a container, see [Docker](/installation/docker).
+
 ## Windows with WSL
 
 See [Windows and WSL](/api/windows-wsl) for mirrored and NAT networking.
@@ -89,7 +91,7 @@ Use the server URL as the base URL and its API key as the key. For an app that i
 - [Oh My Pi](/integrations/oh-my-pi#configuration)
 - [Cline](/integrations/cline#configuration)
 
-Codex and Claude Code route hosted models through Magnitude's gateway. From another device, only local models are available to them.
+Codex and Claude Code route hosted models through Magnitude's local gateway, the Magnitude running on their own computer. Connected to a server from another device, only the server's local models are available to them.
 
 ## Check the connection
 

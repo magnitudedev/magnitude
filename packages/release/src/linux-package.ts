@@ -1,4 +1,6 @@
-import { Schema } from "effect"
+import { FileSystem } from "@effect/platform"
+import { Effect, Option, Schema } from "effect"
+import { join } from "node:path"
 
 /**
  * Newest glibc and libstdc++ symbol versions any shipped Linux binary may require, so RHEL 9
@@ -9,6 +11,29 @@ export const LINUX_GLIBCXX_MAXIMUM = "3.4.29"
 
 export const LinuxPackageFormat = Schema.Literal("deb", "rpm", "pacman")
 export type LinuxPackageFormat = typeof LinuxPackageFormat.Type
+/**
+ * How an installed Linux payload was delivered: one of the packages, or the Docker image that installs
+ * the DEB. Only the packages take part in the release matrices; a Docker installation's update checks
+ * are answered with the DEB's signed release, which its image is built from.
+ */
+export const LinuxInstallationKind = Schema.Literal(...LinuxPackageFormat.literals, "docker")
+export type LinuxInstallationKind = typeof LinuxInstallationKind.Type
+
+/**
+ * The installed payload's delivery, from the marker in its resources. Callers take container behaviour
+ * only when this is positively `docker`; an unreadable marker reads as none and keeps package behaviour.
+ */
+export const readLinuxInstallationKind = (resources: string) => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  return yield* fs.readFileString(join(resources, "update-package.json")).pipe(
+    Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ format: LinuxInstallationKind })))),
+    Effect.map(marker => Option.some(marker.format)),
+    Effect.orElseSucceed(() => Option.none<LinuxInstallationKind>()),
+  )
+})
+
+export const isDockerInstallation = (resources: string) =>
+  readLinuxInstallationKind(resources).pipe(Effect.map(kind => Option.contains(kind, "docker")))
 export type LinuxPackageArch = "arm64" | "x64"
 
 /** Arch Linux and its derivatives publish x86_64 only, so pacman packages exist only for that host. */

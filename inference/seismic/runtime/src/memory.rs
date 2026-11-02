@@ -17,7 +17,7 @@ use seismic_topology::{
     AccessPath, AccessPathId, AccessRoute, DeviceTopology, Executor, ExecutorSelector, StorageKind,
     StoreId, StoreIdentity,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 /// Seismic-owned charges and enforced limits. This is not global driver or
@@ -384,12 +384,12 @@ impl ExecutorMemory {
 }
 
 /// The bytes `charges` along `topology`'s access paths hold on each store,
-/// each store once.
+/// each store once, in store order so that equal charges compare equal.
 pub(crate) fn store_charges(
     topology: &DeviceTopology,
     charges: impl IntoIterator<Item = (AccessPathId, u64)>,
-) -> HashMap<StoreId, u64> {
-    let mut stores = HashMap::new();
+) -> BTreeMap<StoreId, u64> {
+    let mut stores = BTreeMap::new();
     for (path, bytes) in charges {
         let store = topology
             .access_path(path)
@@ -841,6 +841,28 @@ mod tests {
             grant: Some(grant),
             account: Account::new(),
         })
+    }
+
+    /// A device on host RAM and its own memory reports its stores in one
+    /// order however its charges arrive, so equal censuses compare equal.
+    #[test]
+    fn store_charges_come_in_store_order() {
+        let topology = seismic_topology::fixtures::recorded::rtx3090();
+        let charges: Vec<_> = topology
+            .access_paths()
+            .iter()
+            .rev()
+            .map(|path| (path.id(), 1))
+            .collect();
+        let mut stores: Vec<_> = topology.stores().iter().map(|store| store.id()).collect();
+        stores.sort();
+        assert!(stores.len() > 1);
+        for _ in 0..16 {
+            let reported: Vec<_> = store_charges(&topology, charges.clone())
+                .into_keys()
+                .collect();
+            assert_eq!(reported, stores);
+        }
     }
 
     #[test]

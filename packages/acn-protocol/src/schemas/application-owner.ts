@@ -3,7 +3,8 @@ import { Schema } from "effect"
 /**
  * Application updates belong to the owning application, independently of ACN readiness. An offer
  * whose version already failed here (to verify, install, be authorized or start) carries why; it is
- * held back from unattended download until a person downloads it explicitly.
+ * held back from unattended download until a person downloads it explicitly. A container never
+ * installs updates; a newer release becomes `ImageAvailable`, which a newer image provides.
  */
 const Transfer = Schema.Union(
   Schema.TaggedStruct("Idle", {}),
@@ -19,6 +20,7 @@ const Transfer = Schema.Union(
   Schema.TaggedStruct("InstallationFailed", { version: Schema.String, message: Schema.String }),
   Schema.TaggedStruct("Failed", { message: Schema.String }),
   Schema.TaggedStruct("Unavailable", { message: Schema.String }),
+  Schema.TaggedStruct("ImageAvailable", { version: Schema.String, image: Schema.String }),
   Schema.TaggedStruct("Closed", {}),
 )
 export const ApplicationUpdateState = Schema.Struct({

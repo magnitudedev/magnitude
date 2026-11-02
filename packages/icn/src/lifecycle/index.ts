@@ -119,6 +119,7 @@ export class IcnLifecycleConfig extends Schema.Class<IcnLifecycleConfig>(
   ),
   outputLimitBytes: PositiveInt,
   logFile: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  echoOutput: Schema.Boolean,
 }) {}
 
 export interface ResolvedIcnBinary {
@@ -453,8 +454,12 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
       onNone: () => Effect.succeed(Option.none<LogFile>()),
       onSome: (file) => openLogFile(file, 10 * 1024 * 1024).pipe(Effect.map(Option.some)),
     });
+    // Echoed output reaches whatever collects this process's standard error, such as `docker logs`.
+    const echo = (text: string) => config.echoOutput
+      ? Effect.sync(() => { globalThis.process.stderr.write(text) })
+      : Effect.void;
     const logged = (text: string) =>
-      Option.match(log, { onNone: () => Effect.void, onSome: (file) => file.append(text) });
+      Option.match(log, { onNone: () => Effect.void, onSome: (file) => file.append(text) }).pipe(Effect.zipRight(echo(text)));
     const record = (note: string) => logged(`[${new Date().toISOString()}] ${note}\n`);
     yield* record(`magnitude-inference started (pid ${process.pid})`);
     const startupRecord = yield* Deferred.make<

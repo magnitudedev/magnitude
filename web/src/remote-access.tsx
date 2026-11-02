@@ -67,7 +67,7 @@ export function SignIn({ origin, keyConfigured, onSignedIn }: { origin: string; 
       <form className="rounded-lg border border-slate-300 bg-white p-6 dark:border-slate-750 dark:bg-slate-850" onSubmit={event => { event.preventDefault(); if (key.trim()) submit(key.trim()) }}>
         <h1 className="font-heading text-xl font-semibold tracking-tight">Sign in</h1>
         {keyConfigured ? <>
-          <p className="mt-2 text-sm text-slate-500">Enter the Network access key from Settings on the computer running Magnitude.</p>
+          <p className="mt-2 text-sm text-slate-500">Enter the Network access key from Settings on the computer running Magnitude. For a Docker container, it’s in <code className="font-mono">docker logs</code> or the <code className="font-mono">MAGNITUDE_NETWORK_KEY</code> you set.</p>
           <label className="mt-5 block text-sm font-medium" htmlFor="network-access-key">Network access key</label>
           <Input id="network-access-key" type="password" autoComplete="current-password" autoFocus spellCheck={false} value={key} onChange={event => setKey(event.target.value)} className="mt-1.5 font-mono" />
           {error && <ErrorNotice className="mt-4" title={error.title} description={error.description} />}

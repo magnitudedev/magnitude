@@ -40,6 +40,7 @@ import { hostDiscoveryEnvironment, resolveAutomaticLocations } from "./discovery
 import { localModelsConfiguration } from "../custom-models";
 import { HuggingFaceCredentialDeliveryLive } from "../hugging-face-credential-delivery";
 import { AcnServiceLifecycle } from "../service-lifecycle";
+import { isContainerInstallation } from "../container";
 
 const artifactProgress = (
   event: Extract<ArtifactInstallationEvent, { readonly _tag: "Downloading" }>,
@@ -157,7 +158,7 @@ const resolveLocalModelsSnapshot = Effect.gen(function* () {
   return localModelsConfiguration(config, locations);
 });
 
-const makeProcess = (dataDir: string, modelStore: string, localModels: LocalModelsConfiguration) =>
+const makeProcess = (dataDir: string, modelStore: string, localModels: LocalModelsConfiguration, container: boolean) =>
   makeIcnProcess(
     new IcnLifecycleConfig({
       binary: new IcnBinaryResolutionConfig({
@@ -188,6 +189,7 @@ const makeProcess = (dataDir: string, modelStore: string, localModels: LocalMode
       forceShutdownTimeout: Duration.millis(500),
       outputLimitBytes: 256 * 1024,
       logFile: Option.some(join(dataDir, "logs", "inference.log")),
+      echoOutput: container,
     })
   ).pipe(Layer.provide(process.platform === "win32"
     ? WindowsIcnChildSpawner.pipe(Layer.provide(Layer.merge(
@@ -299,9 +301,9 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
     })
   );
   const process = Layer.unwrapEffect(
-    Effect.all([resolveModelStore(dataDir), resolveLocalModelsSnapshot]).pipe(
-      Effect.map(([modelStore, localModels]) =>
-        makeProcess(dataDir, modelStore, localModels).pipe(Layer.provide(preparation)))
+    Effect.all([resolveModelStore(dataDir), resolveLocalModelsSnapshot, isContainerInstallation()]).pipe(
+      Effect.map(([modelStore, localModels, container]) =>
+        makeProcess(dataDir, modelStore, localModels, container).pipe(Layer.provide(preparation)))
     )
   );
   const supervisedProcess = Layer.provideMerge(makeSupervision(), process);

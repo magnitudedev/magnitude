@@ -166,7 +166,9 @@ fn host_ram_fit(store: &Store, host: &HostStatus, reserves: &MemoryReserves) -> 
 
 /// `store`'s fit from its capacity within process limits, its headroom and
 /// its host's distress: each less its planning reserve, in the Reclaim band
-/// at or below the reserve or while the host is in distress.
+/// at or below the reserve or while the host is in distress. The reserves are
+/// fractions of the capacity within limits, not of the whole store: a
+/// container limited to a few GiB of a large host keeps a reserve of those.
 fn store_fit(
     store: &Store,
     reserves: &MemoryReserves,
@@ -175,7 +177,7 @@ fn store_fit(
     distress: Option<HostDistress>,
     constraint: MemoryConstraint,
 ) -> StoreFit {
-    let thresholds = reserves.for_domain(store.kind(), store.capacity().value);
+    let thresholds = reserves.for_domain(store.kind(), capacity_bytes);
     StoreFit {
         store: store.id(),
         capacity_bytes,
@@ -595,14 +597,7 @@ impl<'a> Fit<'a> {
                 None => grant.value,
             },
         };
-        let store = self
-            .topology
-            .store(path.store())
-            .expect("a path's store belongs to its topology");
-        let reserve = self
-            .reserves
-            .for_domain(store.kind(), store.capacity().value)
-            .planning_bytes;
+        let reserve = self.store(path.store())?.thresholds.planning_bytes;
         Ok(left.saturating_sub(reserve))
     }
 
@@ -1860,6 +1855,35 @@ mod tests {
 
     /// Process limits are grants on host RAM that every path into it
     /// shares: a cgroup limit bounds host RAM's stable fit by its limit and
+    /// A container limited to a few GiB of a large host keeps reserves of
+    /// what it may use: a fraction of the whole host's RAM would exceed the
+    /// limit and leave nothing to fit.
+    #[test]
+    fn host_reserves_are_fractions_of_the_capacity_within_limits() {
+        let topology = recorded::rtx3090();
+        let reserves = MemoryReserves::standard();
+        let host_ram = topology.host_ram();
+        assert!(host_ram.capacity().value / 10 > 4 * GIB);
+        let mut limited = host(LINUX, 3 * GIB);
+        limited.limits = vec![ProcessMemoryLimit {
+            kind: ProcessLimitKind::CgroupV2 {
+                cgroup: "/container".into(),
+            },
+            limit_bytes: 4 * GIB,
+            used_bytes: GIB,
+            reclaimable_bytes: 0,
+        }];
+        let limited = status(limited);
+        let reading = Fit::new(&topology, &limited, &reserves).store(host_ram.id()).unwrap();
+        assert_eq!(reading.capacity_bytes, 4 * GIB);
+        assert_eq!(reading.thresholds, reserves.for_domain(host_ram.kind(), 4 * GIB));
+        assert_eq!(reading.stable_bytes, 2 * GIB);
+        assert_eq!(
+            Fit::host_ram(&topology, &limited.sample.host_ram.clone().unwrap(), &reserves).thresholds,
+            reading.thresholds
+        );
+    }
+
     /// its headroom by what the limit leaves, for the CPU and for CUDA's
     /// pinned upload alike, though the cgroup's ancestors are hidden.
     #[test]

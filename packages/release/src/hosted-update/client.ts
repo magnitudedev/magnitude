@@ -4,7 +4,7 @@ import { Clock, Effect, Option, Schema, Stream } from "effect"
 import type { KeyObject } from "node:crypto"
 import { newUpdateNonce, updateQuery, type UpdateSigningFailed } from "./request-auth"
 import { UpdateRequest, UpdateRequestFields, type UpdateCheckReason, type UpdateHardware, type UpdateOutcome } from "./request"
-import { acceptsUpdateRelease, verifyUpdateRelease, UpdateRelease, ReleaseTarget } from "./release"
+import { acceptsUpdateRelease, verifyUpdateRelease, UpdateRelease, releaseTargetOf } from "./release"
 import { releaseChannelOf } from "../client-update/release-channels"
 
 export const UpdateClientMetadata = UpdateRequestFields.pipe(Schema.omit("protocol", "product", "channel", "ts", "nonce", "reason", "outcome", "outcome_version", "outcome_reason", "outcome_from",
@@ -76,7 +76,7 @@ export const checkHostedUpdate = (options: HostedUpdateConnection & {
   }), Effect.mapError(() => new HostedUpdateCheckFailed({ reason: "response" })))
   const json = yield* Effect.try({ try: () => new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(bytes.chunks)), catch: () => new HostedUpdateCheckFailed({ reason: "response" }) })
   const offer = yield* Schema.decodeUnknown(Schema.parseJson(UpdateRelease))(json, { onExcessProperty: "error" }).pipe(Effect.mapError(() => new HostedUpdateCheckFailed({ reason: "response" })))
-  const target = yield* Schema.decodeUnknown(ReleaseTarget)({ os: fields.os, arch: fields.arch, package: fields.package }).pipe(Effect.mapError(() => new HostedUpdateCheckFailed({ reason: "request" })))
+  const target = yield* releaseTargetOf(fields).pipe(Effect.mapError(() => new HostedUpdateCheckFailed({ reason: "request" })))
   const release = yield* verifyUpdateRelease(offer, target, options.trustedPublishers).pipe(Effect.mapError(() => new HostedUpdateCheckFailed({ reason: "publisher" })))
   if (!acceptsUpdateRelease(release, fields.version)) return yield* new HostedUpdateCheckFailed({ reason: "response" })
   return Option.some(release)
