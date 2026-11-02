@@ -235,7 +235,6 @@ jobs:
       ref: ${{ needs.preflight.outputs.source_commit }}
       channel_tag: true
     secrets:
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
   register-metadata:
     needs: preflight
