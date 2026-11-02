@@ -3,14 +3,17 @@ and which wait, its utilization, memory and temperatures, and every run on any h
 machine launched it.
 
 Each host keeps one `watch` stream (`python -m magnitude_rig.host watch`) open over ssh,
-feeding the latest view kept here; the page polls that view. A host that cannot be reached,
-or whose stream ends, is shown so and reconnected after RETRY_SECONDS. Nothing is held on any
+feeding the latest view kept here and the last HISTORY_SECONDS of its load, stamped with this
+machine's clock as they arrive (so every host's history shares the page's time axis); the page
+polls the view and takes the history once, when it opens. A host that cannot be reached, or
+whose stream ends, is shown so and reconnected after RETRY_SECONDS. Nothing is held on any
 host and nothing is written there but the host package `connect` deploys.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 import threading
@@ -19,12 +22,14 @@ import webbrowser
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .connection import HostUnavailable, connect
 from .hosts import HostConfig, Hosts
 
 PAGE = (Path(__file__).parent / "dashboard.html").read_bytes()
 RETRY_SECONDS = 15.0
+HISTORY_SECONDS = 300.0
 STDERR_LINES = 20
 
 
@@ -37,16 +42,23 @@ class Watch:
         self._stopping = stopping
         self._lock = threading.Lock()
         self._process: subprocess.Popen | None = None
-        self._view: dict = {"alias": config.alias, "state": "connecting"}
+        self._view: dict = {"alias": config.alias, "state": "connecting", "since": time.time()}
+        self._history: deque[dict] = deque(maxlen=math.ceil(HISTORY_SECONDS / interval) + 1)
         self._thread = threading.Thread(target=self._run, name=f"watch-{config.alias}", daemon=True)
         self._thread.start()
 
-    def view(self) -> dict:
+    def view(self, history: bool) -> dict:
+        """The latest view, with the recent load (`history`) when asked."""
         with self._lock:
-            return dict(self._view)
+            view = dict(self._view)
+            if history:
+                view["history"] = list(self._history)
+            return view
 
     def _set(self, **fields) -> None:
         with self._lock:
+            if fields.get("state", self._view["state"]) != self._view["state"]:
+                fields["since"] = time.time()
             self._view.update(fields)
 
     def _run(self) -> None:
@@ -87,7 +99,12 @@ class Watch:
             if "facts" in event:
                 self._set(facts=event["facts"])
             else:
-                self._set(state="live", sample=event, received=time.time())
+                received = time.time()
+                point = {"received": received, "utilization_pct": event["reading"]["utilization_pct"],
+                         "memory_bytes": event["reading"]["memory_bytes"], "groups_c": event["groups_c"]}
+                with self._lock:
+                    self._history.append(point)
+                self._set(state="live", sample=event, received=received)
         code = process.wait()
         drain.join()
         raise HostUnavailable(f"watch exited {code}: {''.join(stderr).strip()}")
@@ -115,10 +132,12 @@ class Watch:
 def _handler(snapshot):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            if self.path == "/":
+            url = urlsplit(self.path)
+            if url.path == "/":
                 self._send("text/html; charset=utf-8", PAGE)
-            elif self.path == "/api/snapshot":
-                self._send("application/json", json.dumps(snapshot()).encode())
+            elif url.path == "/api/snapshot":
+                body = json.dumps(snapshot(history=url.query == "history"))
+                self._send("application/json", body.encode())
             else:
                 self.send_error(404)
 
@@ -146,11 +165,12 @@ def serve(arguments) -> int:
     if not configs:
         raise SystemExit("no hosts: list them in ~/.magnitude/evaluation/hosts.json or pass --host")
 
-    def snapshot() -> dict:
+    def snapshot(history: bool) -> dict:
         return {
             "now": time.time(),
+            "window": HISTORY_SECONDS,
             "pools": hosts.pools,
-            "hosts": [watch.view() for watch in watches],
+            "hosts": [watch.view(history) for watch in watches],
         }
 
     try:
