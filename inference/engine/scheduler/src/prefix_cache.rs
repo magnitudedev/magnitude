@@ -295,6 +295,18 @@ impl<S> PrefixCache<S> {
             .map_or(0, |index| self.entries[index].position())
     }
 
+    /// The entries a live request holds the rows of: the one it resumed
+    /// from (`source`) and the deepest one within the `resident` rows of
+    /// `path` it holds, which is the entry it retained last once its prefill
+    /// passes one. Each costs the cache only a bank while the request lives.
+    /// The resumed entry is the prefix the next request sharing it resumes
+    /// from, and the deepest is where the request's own continuation (a
+    /// conversation's next turn) resumes.
+    pub fn held(&self, source: Option<u64>, path: PrefixPath, resident: usize) -> impl Iterator<Item = u64> {
+        let deepest = self.best(path, resident + 1).map(|index| self.entries[index].id);
+        source.into_iter().chain(deepest)
+    }
+
     fn best(&self, path: PrefixPath, bound: usize) -> Option<usize> {
         let mut best: Option<(usize, usize, u64)> = None;
         for (index, entry) in self.entries.iter().enumerate() {
@@ -428,13 +440,13 @@ impl<S> PrefixCache<S> {
     }
 
     /// Capacity-ladder rung zero: drop the least-recently-used entry without
-    /// submitted uses, preferring one no live request resumed from
-    /// (`resumed`): such an entry's rows are the resumers' own, so dropping
-    /// it releases only its bank and loses the prefix they share. Returns
-    /// whether an entry was eligible; the heap observes what the drop
-    /// released.
-    pub fn evict_one(&mut self, resumed: &BTreeSet<u64>) -> bool {
-        let unused = self.victim(|entry| !resumed.contains(&entry.id));
+    /// submitted uses, preferring one no live request holds (`held`, see
+    /// [`Self::held`]): such an entry's rows are the holders' own, so
+    /// dropping it releases only its bank and loses the prefix they resume
+    /// from. Returns whether an entry was eligible; the heap observes what
+    /// the drop released.
+    pub fn evict_one(&mut self, held: &BTreeSet<u64>) -> bool {
+        let unused = self.victim(|entry| !held.contains(&entry.id));
         match unused.or_else(|| self.victim(|_| true)) {
             Some(index) => {
                 self.entries.remove(index);
@@ -452,40 +464,41 @@ impl<S> PrefixCache<S> {
     /// many entries were dropped.
     pub fn release_beyond_workload<E>(
         &mut self,
-        resumed: &BTreeSet<u64>,
+        held: &BTreeSet<u64>,
         mut occupied: impl FnMut(&Self) -> Result<u64, E>,
     ) -> Result<usize, E> {
         let mut released = 0;
-        while occupied(self)? > self.capacity.workload_state_bytes && self.release_unspared(resumed) {
+        while occupied(self)? > self.capacity.workload_state_bytes && self.release_unspared(held) {
             released += 1;
         }
         Ok(released)
     }
 
     /// Whether an entry beyond the latest conversation's checkpoints, in no
-    /// submitted use and resumed from by no live request, could be released.
-    pub fn holds_unspared(&self, resumed: &BTreeSet<u64>) -> bool {
-        self.unspared(resumed).is_some()
+    /// submitted use and held by no live request, could be released.
+    pub fn holds_unspared(&self, held: &BTreeSet<u64>) -> bool {
+        self.unspared(held).is_some()
     }
 
     /// Drop the least-recently-used entry beyond the latest conversation's
     /// checkpoints and in no submitted use: what retained state gives back
     /// before it would make the stores grow past the workload the plan
-    /// charges. An entry a live request resumed from (`resumed`) is spared
-    /// too: its rows are that request's own, so dropping it gives back only
-    /// a bank while losing the prefix the request shares with the next one.
-    /// Returns whether one was dropped.
-    pub fn release_unspared(&mut self, resumed: &BTreeSet<u64>) -> bool {
-        let Some(index) = self.unspared(resumed) else {
+    /// charges. An entry a live request holds (`held`, see [`Self::held`])
+    /// is spared too: its rows are that request's own, so dropping it gives
+    /// back only a bank while losing where the request's continuation, or
+    /// the next request sharing its prefix, resumes. Returns whether one was
+    /// dropped.
+    pub fn release_unspared(&mut self, held: &BTreeSet<u64>) -> bool {
+        let Some(index) = self.unspared(held) else {
             return false;
         };
         self.entries.remove(index);
         true
     }
 
-    fn unspared(&self, resumed: &BTreeSet<u64>) -> Option<usize> {
+    fn unspared(&self, held: &BTreeSet<u64>) -> Option<usize> {
         let spared = self.conversation_checkpoints();
-        self.victim(|entry| !spared.contains(&entry.id) && !resumed.contains(&entry.id))
+        self.victim(|entry| !spared.contains(&entry.id) && !held.contains(&entry.id))
     }
 
     /// The least-recently-used entry without submitted uses that `eligible`
@@ -700,8 +713,8 @@ mod tests {
     /// shared system prompt, then each retains its own deeper points. The
     /// shared branch is now the least recently used and on no latest
     /// checkpoint, but live requests resumed from it: state growth releases
-    /// the requests' own points instead, and the next request sharing the
-    /// system prompt still resumes there.
+    /// the deeper points no live request holds instead, and the next request
+    /// sharing the system prompt still resumes there.
     #[test]
     fn growth_spares_an_entry_live_requests_resumed_from() {
         let mut cache = PrefixCache::new(capacity(16));
@@ -728,6 +741,42 @@ mod tests {
         assert!(cache.holds(chat(100, 9, 130).path(), 100));
         assert!(cache.evict_one(&resumed));
         assert_eq!(cache.len(), 0);
+    }
+
+    /// win-cuda run C: a conversation's live turn resumed from its previous
+    /// turn's entry and retained its own deeper one, while another
+    /// conversation retained last. Sparing only the entry the turn resumed
+    /// from releases the deeper one, so the next turn resumes a turn back
+    /// again and recomputes it, turn after turn. The turn holds both: growth
+    /// releases the other conversation's older entry, and the next turn
+    /// resumes from the deepest.
+    #[test]
+    fn growth_spares_the_deepest_entry_a_live_turn_holds() {
+        let build = || {
+            let mut cache = PrefixCache::new(capacity(16));
+            assert!(retain(&mut cache, &text(100, "x"), 99, rows(0..99)));
+            let turn = text(130, "x");
+            let resumed = lookup_any(&mut cache, &turn).unwrap();
+            assert_eq!(resumed.position(), 99);
+            assert!(retain(&mut cache, &turn, 129, rows(0..129)));
+            assert!(retain(&mut cache, &text(100, "y"), 99, rows(500..599)));
+            assert!(retain(&mut cache, &text(120, "y"), 119, rows(600..719)));
+            (cache, turn, resumed.id())
+        };
+        let next_turn = text(160, "x");
+        let (mut cache, turn, source) = build();
+        let held = cache.held(Some(source), turn.path(), 129).collect::<BTreeSet<_>>();
+        assert_eq!(held.len(), 2);
+        while cache.release_unspared(&held) {}
+        assert_eq!(cache.deepest(next_turn.path(), usize::MAX), 129);
+        assert!(!referenced(598) && referenced(700), "the other conversation's older entry went");
+        // Before the turn retains its own entry, it holds only its source.
+        let (cache, turn, source) = build();
+        assert_eq!(cache.held(Some(source), turn.path(), 120).collect::<BTreeSet<_>>(), BTreeSet::from([source]));
+        // Sparing only the source drops the turn's own entry.
+        let (mut cache, ..) = build();
+        while cache.release_unspared(&BTreeSet::from([source])) {}
+        assert_eq!(cache.deepest(next_turn.path(), usize::MAX), 99);
     }
 
     #[test]
