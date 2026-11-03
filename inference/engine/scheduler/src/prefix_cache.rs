@@ -21,6 +21,7 @@ use magnitude_executor::{CONVERSATION_CHECKPOINTS, ResourcePlan};
 use magnitude_family_contracts::{InputLayout, TokenId};
 use magnitude_generation::{Generation, MethodCheckpoint, MethodChoice};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 pub const MIN_PREFIX_HIT: usize = 64;
 
@@ -384,7 +385,7 @@ impl<S> PrefixCache<S> {
             submitted: 0,
         });
         while self.entries.len() > self.capacity.max_entries {
-            if !self.evict_one_except(Some(id)) {
+            if !self.evict_one_except(id) {
                 self.entries.retain(|entry| entry.id != id);
                 return Ok(false);
             }
@@ -427,10 +428,20 @@ impl<S> PrefixCache<S> {
     }
 
     /// Capacity-ladder rung zero: drop the least-recently-used entry without
-    /// submitted uses. Returns whether an entry was eligible; the heap
-    /// observes what the drop released.
-    pub fn evict_one(&mut self) -> bool {
-        self.evict_one_except(None)
+    /// submitted uses, preferring one no live request resumed from
+    /// (`resumed`): such an entry's rows are the resumers' own, so dropping
+    /// it releases only its bank and loses the prefix they share. Returns
+    /// whether an entry was eligible; the heap observes what the drop
+    /// released.
+    pub fn evict_one(&mut self, resumed: &BTreeSet<u64>) -> bool {
+        let unused = self.victim(|entry| !resumed.contains(&entry.id));
+        match unused.or_else(|| self.victim(|_| true)) {
+            Some(index) => {
+                self.entries.remove(index);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Hold cached prefixes within the state the memory plan charges: while
@@ -441,39 +452,49 @@ impl<S> PrefixCache<S> {
     /// many entries were dropped.
     pub fn release_beyond_workload<E>(
         &mut self,
+        resumed: &BTreeSet<u64>,
         mut occupied: impl FnMut(&Self) -> Result<u64, E>,
     ) -> Result<usize, E> {
         let mut released = 0;
-        while occupied(self)? > self.capacity.workload_state_bytes && self.release_unspared() {
+        while occupied(self)? > self.capacity.workload_state_bytes && self.release_unspared(resumed) {
             released += 1;
         }
         Ok(released)
     }
 
-    /// Whether an entry beyond the latest conversation's checkpoints, and in
-    /// no submitted use, could be released.
-    pub fn holds_unspared(&self) -> bool {
-        self.unspared().is_some()
+    /// Whether an entry beyond the latest conversation's checkpoints, in no
+    /// submitted use and resumed from by no live request, could be released.
+    pub fn holds_unspared(&self, resumed: &BTreeSet<u64>) -> bool {
+        self.unspared(resumed).is_some()
     }
 
     /// Drop the least-recently-used entry beyond the latest conversation's
     /// checkpoints and in no submitted use: what retained state gives back
     /// before it would make the stores grow past the workload the plan
-    /// charges. Returns whether one was dropped.
-    pub fn release_unspared(&mut self) -> bool {
-        let Some(index) = self.unspared() else {
+    /// charges. An entry a live request resumed from (`resumed`) is spared
+    /// too: its rows are that request's own, so dropping it gives back only
+    /// a bank while losing the prefix the request shares with the next one.
+    /// Returns whether one was dropped.
+    pub fn release_unspared(&mut self, resumed: &BTreeSet<u64>) -> bool {
+        let Some(index) = self.unspared(resumed) else {
             return false;
         };
         self.entries.remove(index);
         true
     }
 
-    fn unspared(&self) -> Option<usize> {
+    fn unspared(&self, resumed: &BTreeSet<u64>) -> Option<usize> {
         let spared = self.conversation_checkpoints();
+        self.victim(|entry| !spared.contains(&entry.id) && !resumed.contains(&entry.id))
+    }
+
+    /// The least-recently-used entry without submitted uses that `eligible`
+    /// admits.
+    fn victim(&self, eligible: impl Fn(&CachedPrefix<S>) -> bool) -> Option<usize> {
         self.entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| entry.submitted == 0 && !spared.contains(&entry.id))
+            .filter(|(_, entry)| entry.submitted == 0 && eligible(entry))
             .min_by_key(|(_, entry)| entry.last_use)
             .map(|(index, _)| index)
     }
@@ -516,15 +537,8 @@ impl<S> PrefixCache<S> {
         self.entries.retain(|entry| entry.submitted != 0);
     }
 
-    fn evict_one_except(&mut self, keep: Option<u64>) -> bool {
-        let candidate = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.submitted == 0 && Some(entry.id) != keep)
-            .min_by_key(|(_, entry)| entry.last_use)
-            .map(|(index, _)| index);
-        let Some(index) = candidate else {
+    fn evict_one_except(&mut self, keep: u64) -> bool {
+        let Some(index) = self.victim(|entry| entry.id != keep) else {
             return false;
         };
         self.entries.remove(index);
@@ -672,14 +686,48 @@ mod tests {
             }
         };
         conversation(&mut cache, "a", 0);
-        assert!(!cache.holds_unspared(), "the only conversation is the latest");
+        assert!(!cache.holds_unspared(&BTreeSet::new()), "the only conversation is the latest");
         conversation(&mut cache, "b", 1000);
         conversation(&mut cache, "c", 2000);
-        assert!(cache.holds_unspared());
-        while cache.release_unspared() {}
+        assert!(cache.holds_unspared(&BTreeSet::new()));
+        while cache.release_unspared(&BTreeSet::new()) {}
         assert_eq!(cache.len(), 2);
         assert!(!referenced(0) && !referenced(1000), "the older conversations were released");
         assert!(referenced(2000), "the latest conversation's checkpoints remain");
+    }
+
+    /// cc237 round 1: requests resume from the branch at the end of their
+    /// shared system prompt, then each retains its own deeper points. The
+    /// shared branch is now the least recently used and on no latest
+    /// checkpoint, but live requests resumed from it: state growth releases
+    /// the requests' own points instead, and the next request sharing the
+    /// system prompt still resumes there.
+    #[test]
+    fn growth_spares_an_entry_live_requests_resumed_from() {
+        let mut cache = PrefixCache::new(capacity(16));
+        let first = chat(100, 1, 130);
+        assert!(retain(&mut cache, &first, 100, rows(0..100)));
+        let shared = lookup_any(&mut cache, &chat(100, 2, 130)).unwrap();
+        assert_eq!(shared.position(), 100);
+        for question in 2..6 {
+            assert!(retain(&mut cache, &chat(100, question, 130), 120, rows(0..120)));
+        }
+        let resumed = BTreeSet::from([shared.id()]);
+        while cache.release_unspared(&resumed) {}
+        assert!(cache.holds(chat(100, 9, 130).path(), 100));
+        // With no request resuming from it, it is the first released.
+        assert!(cache.release_unspared(&BTreeSet::new()));
+        assert!(!cache.holds(chat(100, 9, 130).path(), 100));
+        // A capacity deficit prefers any other entry, and takes it last.
+        let mut cache = PrefixCache::new(capacity(16));
+        assert!(retain(&mut cache, &first, 100, rows(0..100)));
+        let shared = lookup_any(&mut cache, &chat(100, 2, 130)).unwrap();
+        assert!(retain(&mut cache, &chat(100, 2, 130), 120, rows(0..120)));
+        let resumed = BTreeSet::from([shared.id()]);
+        assert!(cache.evict_one(&resumed));
+        assert!(cache.holds(chat(100, 9, 130).path(), 100));
+        assert!(cache.evict_one(&resumed));
+        assert_eq!(cache.len(), 0);
     }
 
     #[test]
@@ -908,7 +956,7 @@ mod tests {
             ));
         }
         assert_eq!(cache.len(), 3);
-        assert!(cache.evict_one());
+        assert!(cache.evict_one(&BTreeSet::new()));
         assert_eq!(cache.len(), 2);
         assert!(!referenced(1064));
         assert!(referenced(1080) && referenced(1100));
@@ -918,7 +966,7 @@ mod tests {
         cache.evict_all();
         assert_eq!(cache.len(), 1);
         assert!(!referenced(1080) && referenced(1100));
-        assert!(!cache.evict_one());
+        assert!(!cache.evict_one(&BTreeSet::new()));
     }
 
     #[test]
@@ -982,7 +1030,7 @@ mod tests {
             assert!(cache
                 .retain(owned.path(), position, point, state, MethodCheckpoint::Plain)
                 .unwrap());
-            cache.release_beyond_workload(occupied).unwrap();
+            cache.release_beyond_workload(&BTreeSet::new(), occupied).unwrap();
         };
         // Each request's prompt, what it resumed at, and its reply.
         let request = |cache: &mut PrefixCache<Rows>, prompt: &[u32], declared: Option<usize>| {

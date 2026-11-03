@@ -93,20 +93,14 @@ fn peer_stop(branches: &BTreeSet<usize>, shared: usize) -> Option<usize> {
 }
 
 /// The prefix a new request waits for: `in_flight`, the deepest stop a peer
-/// is still prefilling toward, when it is beyond what the cache shares, worth
-/// resuming from, and within [`MIN_BRANCH_GAIN`] rows of the deepest prefix
-/// the request shares (`deepest`); otherwise the request plans its own
-/// branch.
-fn awaited_prefix(
-    in_flight: usize,
-    deepest: usize,
-    cached: usize,
-    resumed: usize,
-    prompt: usize,
-) -> Option<usize> {
-    (in_flight > cached
-        && worthwhile(in_flight, resumed, prompt)
-        && in_flight + MIN_BRANCH_GAIN > deepest)
+/// is still prefilling toward, when it is worth resuming from over the
+/// deepest cached entry (`resumed`) and within [`MIN_BRANCH_GAIN`] rows of
+/// the deepest prefix the request shares with a cached path or a peer
+/// (`deepest`); otherwise the request plans its own branch. Only an entry is
+/// a resume point: a cached path sharing the prefix without an entry ending
+/// in it saves the request nothing, so it never stands in for the peer.
+fn awaited_prefix(in_flight: usize, deepest: usize, resumed: usize, prompt: usize) -> Option<usize> {
+    (worthwhile(in_flight, resumed, prompt) && in_flight + MIN_BRANCH_GAIN > deepest)
         .then_some(in_flight)
 }
 
@@ -175,6 +169,21 @@ fn prefilling_toward(generation: &Generation, position: usize) -> bool {
     generation.is_resident()
         && generation.finish_reason().is_none()
         && generation.resident_position() < position
+}
+
+/// Whether a request outside the pipeline will compute its prompt up to
+/// `position`: it prefills toward it now, or it is admitted and unfinished
+/// but not yet resident, so its first round prefills from where the cache
+/// resumes it. A request admitted while an earlier one has not yet started
+/// otherwise prefills the shared prefix beside it. A request awaiting a
+/// prefix computes nothing until a peer caches it, so waiters never wait on
+/// each other.
+fn computes_toward(state: &State, position: usize) -> bool {
+    match state {
+        State::Between(generation, Stage::NonResident(_)) => generation.finish_reason().is_none(),
+        State::Between(_, Stage::AwaitingPrefix { .. }) => false,
+        _ => prefilling_toward(state.generation(), position),
+    }
 }
 
 /// Whether a finished request still owes the prefix cache its reconciliation
@@ -1053,23 +1062,24 @@ impl<F: ProgramFamily> Service<F> {
                 plan_declared(&mut branches, point, resumed, path.len());
             }
         }
-        let cached = self.prefix_cache.shared_boundary(path);
-        let mut deepest = cached;
+        let mut deepest = self.prefix_cache.shared_boundary(path);
         // The deepest shared prefix a live peer is still prefilling toward
         // and will cache at its branch point.
         let mut in_flight = 0;
         let live = self
             .requests
             .values_mut()
-            .map(|request| (&mut request.record, request.state.generation()))
+            .map(|request| {
+                (&mut request.record, request.state.generation(), Some(&request.state))
+            })
             .chain(
                 members
                     .into_iter()
                     .flat_map(|members| members.values_mut())
-                    .map(|member| (&mut member.record, member.state.generation())),
+                    .map(|member| (&mut member.record, member.state.generation(), None)),
             )
-            .filter(|(record, _)| record.prefix_cache);
-        for (record, generation) in live {
+            .filter(|(record, ..)| record.prefix_cache);
+        for (record, generation, outside) in live {
             let shared = path.shared_with_prompt_of(PrefixPath::of(generation));
             deepest = deepest.max(shared);
             plan_branch(
@@ -1079,7 +1089,13 @@ impl<F: ProgramFamily> Service<F> {
                 generation.prompt().len(),
             );
             if let Some(stop) = peer_stop(&record.branches, shared) {
-                if prefilling_toward(generation, stop) {
+                // A round member is resident; a request outside the
+                // pipeline may not be yet.
+                let computes = match outside {
+                    Some(state) => computes_toward(state, stop),
+                    None => prefilling_toward(generation, stop),
+                };
+                if computes {
                     in_flight = in_flight.max(stop);
                 }
             }
@@ -1090,7 +1106,7 @@ impl<F: ProgramFamily> Service<F> {
                 awaited: None,
             };
         }
-        if let Some(through) = awaited_prefix(in_flight, deepest, cached, resumed, path.len()) {
+        if let Some(through) = awaited_prefix(in_flight, deepest, resumed, path.len()) {
             // A peer computes this prefix now: wait for it to be cached.
             return BranchPlan {
                 branches,
@@ -1104,6 +1120,25 @@ impl<F: ProgramFamily> Service<F> {
         }
     }
 
+    /// The cached entries live requests resumed from, among the service's
+    /// requests and the in-flight round's `members`. Each such request holds
+    /// the entry's rows itself, so the entry costs one bank and is the prefix
+    /// the next request sharing it resumes from: the cache releases it last.
+    fn resumed_entries(&self, members: Option<&BTreeMap<RequestId, Member>>) -> BTreeSet<u64> {
+        self.requests
+            .values()
+            .map(|request| (&request.record, request.state.generation()))
+            .chain(
+                members
+                    .into_iter()
+                    .flat_map(BTreeMap::values)
+                    .map(|member| (&member.record, member.state.generation())),
+            )
+            .filter(|(_, generation)| generation.is_resident() && generation.finish_reason().is_none())
+            .filter_map(|(record, _)| record.prefix_source)
+            .collect()
+    }
+
     /// Whether a live request other than `except` is still prefilling toward
     /// a planned branch point at `position`.
     fn prefix_pending(&self, position: usize, except: RequestId) -> bool {
@@ -1111,7 +1146,7 @@ impl<F: ProgramFamily> Service<F> {
             id != except
                 && request.record.prefix_cache
                 && request.record.branches.contains(&position)
-                && prefilling_toward(request.state.generation(), position)
+                && computes_toward(&request.state, position)
         })
     }
 
@@ -1490,7 +1525,8 @@ impl<F: ProgramFamily> Service<F> {
     fn release_for_reclaim(&mut self, bindings: &mut StateBindings<F>) -> Result<bool, RequestError> {
         let mut released = self.release_surplus(bindings)?;
         while self.reclaim_needed()? {
-            if !self.prefix_cache.evict_one() {
+            let resumed = self.resumed_entries(None);
+            if !self.prefix_cache.evict_one(&resumed) {
                 break;
             }
             // Eviction drops claims, but committed rows and banks remain
@@ -2096,7 +2132,8 @@ impl<F: ProgramFamily> Service<F> {
             current = self.open_capacity(bindings, requirements);
         }
         while matches!(current, Err(DomainError::Capacity(_))) {
-            if !self.prefix_cache.evict_one() {
+            let resumed = self.resumed_entries(None);
+            if !self.prefix_cache.evict_one(&resumed) {
                 break;
             }
             self.domain.shrink_state(bindings, ShrinkPolicy::Reclaim)?;
@@ -2316,38 +2353,39 @@ impl<F: ProgramFamily> Service<F> {
     ) -> Result<Provisioned, RequestError> {
         let short = |current: &Result<(), DomainError>| matches!(current, Err(DomainError::Capacity(_)));
         let mut group_ = group_;
-        let mut current = self.fits(bindings, &group_);
+        let mut current = self.fits(bindings, round, &group_);
         // Retained prefixes never make the stores grow past the workload
         // state the plan charges: the group takes the rows and banks of the
         // least recently used ones instead. Once none is left to release,
         // `fits` sets no ceiling.
+        let resumed = self.resumed_entries(Some(&round.members));
         while matches!(current, Err(DomainError::StateCeiling { .. })) {
-            self.prefix_cache.release_unspared();
-            current = self.fits(bindings, &group_);
+            self.prefix_cache.release_unspared(&resumed);
+            current = self.fits(bindings, round, &group_);
         }
         if short(&current) {
             self.domain
                 .shrink_state(bindings, ShrinkPolicy::Reclaim)
                 .map_err(classify_domain_error)?;
-            current = self.fits(bindings, &group_);
+            current = self.fits(bindings, round, &group_);
         }
         if short(&current) {
             self.domain
                 .reclaim_idle(bindings)
                 .map_err(invariant("idle state release"))?;
-            current = self.fits(bindings, &group_);
+            current = self.fits(bindings, round, &group_);
         }
-        while short(&current) && self.prefix_cache.evict_one() {
+        while short(&current) && self.prefix_cache.evict_one(&resumed) {
             self.domain
                 .shrink_state(bindings, ShrinkPolicy::Reclaim)
                 .map_err(classify_domain_error)?;
-            current = self.fits(bindings, &group_);
+            current = self.fits(bindings, round, &group_);
         }
         if short(&current) {
             self.domain
                 .release_idle_optional_components(bindings)
                 .map_err(invariant("optional component release"))?;
-            current = self.fits(bindings, &group_);
+            current = self.fits(bindings, round, &group_);
         }
         if short(&current) {
             group_ = match group_.split_last() {
@@ -2359,7 +2397,7 @@ impl<F: ProgramFamily> Service<F> {
                 self.domain
                     .shrink_state(bindings, ShrinkPolicy::Reclaim)
                     .map_err(classify_domain_error)?;
-                current = self.fits(bindings, &group_);
+                current = self.fits(bindings, round, &group_);
             }
         }
         match current {
@@ -2380,10 +2418,16 @@ impl<F: ProgramFamily> Service<F> {
     /// its requirement, derived from the layout it was just provisioned
     /// into, would take. While a retained prefix could be released instead,
     /// state growth stops at the workload state the plan charges.
-    fn fits(&mut self, bindings: &mut StateBindings<F>, group_: &OperationGroup) -> Result<(), DomainError> {
+    fn fits(
+        &mut self,
+        bindings: &mut StateBindings<F>,
+        round: &Round,
+        group_: &OperationGroup,
+    ) -> Result<(), DomainError> {
+        let resumed = self.resumed_entries(Some(&round.members));
         let ceiling = self
             .prefix_cache
-            .holds_unspared()
+            .holds_unspared(&resumed)
             .then(|| self.prefix_cache.workload_state_bytes());
         self.domain.provision(bindings, group_.operations(), ceiling)?;
         let requirement = requirements(&self.domain, bindings, group_)?;
@@ -2845,9 +2889,10 @@ impl<F: ProgramFamily> Service<F> {
             .retain(PrefixPath::of(generation), position, point, state, method)
             .map_err(invariant("prefix retention"))?;
         if retained {
+            let resumed = self.resumed_entries(None);
             let domain = &self.domain;
             self.prefix_cache
-                .release_beyond_workload(|cache| occupied_state(domain, cache))
+                .release_beyond_workload(&resumed, |cache| occupied_state(domain, cache))
                 .map_err(invariant("prefix retention"))?;
         }
         Ok(())
@@ -3155,16 +3200,32 @@ mod branch_plan_tests {
         plan_branch(&mut peer, shared, 0, prompt);
         assert!(!peer.contains(&shared));
         assert_eq!(peer_stop(&peer, shared), Some(declared));
-        assert_eq!(awaited_prefix(declared, shared, 0, 0, prompt), Some(declared));
+        assert_eq!(awaited_prefix(declared, shared, 0, prompt), Some(declared));
         // The divergence itself, when planned, is awaited as before.
-        assert_eq!(awaited_prefix(shared, shared, 0, 0, prompt), Some(shared));
-        // Not a stop the cache already shares, one too far below the
-        // divergence, one not worth resuming from, or none at all.
-        assert_eq!(awaited_prefix(declared, shared, declared, 0, prompt), None);
-        assert_eq!(awaited_prefix(shared - MIN_BRANCH_GAIN, shared, 0, 0, prompt), None);
-        assert_eq!(awaited_prefix(declared, shared, 0, declared - 1, prompt), None);
-        assert_eq!(awaited_prefix(0, shared, 0, 0, prompt), None);
+        assert_eq!(awaited_prefix(shared, shared, 0, prompt), Some(shared));
+        // Not a stop too far below the divergence, one not worth resuming
+        // from (an entry already ends at or near it), or none at all.
+        assert_eq!(awaited_prefix(shared - MIN_BRANCH_GAIN, shared, 0, prompt), None);
+        assert_eq!(awaited_prefix(declared, shared, declared, prompt), None);
+        assert_eq!(awaited_prefix(declared, shared, declared - 1, prompt), None);
+        assert_eq!(awaited_prefix(0, shared, 0, prompt), None);
         assert_eq!(peer_stop(&BTreeSet::from([prompt - 6]), shared), None);
+    }
+
+    /// cc237 round 2: a conversation that shares the system prompt and the
+    /// opening of the user message is cached, but its entry at the system
+    /// prompt's end is gone, so nothing on the new requests' path ends below
+    /// their divergence (they resume at 0). The cached path still shares
+    /// rows up to just past the peer's stop. Those rows are no resume point,
+    /// so the new request waits for the peer instead of prefilling the whole
+    /// prompt beside it, as all eight requests did.
+    #[test]
+    fn a_cached_path_without_an_entry_in_the_prefix_never_replaces_the_peer() {
+        let (declared, shared, prompt) = (14869, 14894, 14917);
+        let cached_path = shared;
+        let resumed = 0;
+        let deepest = cached_path.max(shared);
+        assert_eq!(awaited_prefix(declared, deepest, resumed, prompt), Some(declared));
     }
 
     /// A short turn of a conversation: it resumes where the previous turn
@@ -3377,6 +3438,23 @@ mod timing_tests {
             &request(Stage::Ready),
             Status::Terminal(FinishReason::Length)
         ));
+    }
+
+    /// An admitted peer that has not yet become resident still computes the
+    /// shared prefix in its first round, so a request admitted right after it
+    /// waits for it instead of prefilling the prefix beside it. A peer
+    /// awaiting a prefix itself never counts, so two waiters cannot hold each
+    /// other.
+    #[test]
+    fn an_admitted_peer_not_yet_resident_computes_its_prefix() {
+        let generation = super::termination_tests::generation;
+        assert!(computes_toward(&State::Between(generation(), Stage::NonResident(None)), 1));
+        assert!(!computes_toward(
+            &State::Between(generation(), Stage::AwaitingPrefix { through: 1 }),
+            1
+        ));
+        let cancelled = terminated(generation(), true);
+        assert!(!computes_toward(&State::Between(cancelled, Stage::NonResident(None)), 1));
     }
 
     #[test]
