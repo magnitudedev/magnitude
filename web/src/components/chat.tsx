@@ -172,10 +172,6 @@ function ChatView({
     ...settings,
     model: modelId ? Option.some(ServingModelId.make(modelId)) : none(),
     reasoningEffort: effort,
-    // With no explicit output limit, generation may use the remaining context.
-    maxOutputTokens: Option.orElse(settings.maxOutputTokens, () =>
-      model ? Option.some(contextFor(model)) : none()
-    ),
   }
   const request = chatRequest(effectiveSettings)
   const settingsValid = Schema.is(Schema.typeSchema(RequestedResponseSettings))(
@@ -203,7 +199,10 @@ function ChatView({
               defaults: chatModelDefaults(settings, model),
             }),
           revert: () => patch(chatStartingSettings(model, saved)),
-          reset: () => clearDefaults({ model: ServingModelId.make(model.id) }),
+          reset: () => {
+            clearDefaults({ model: ServingModelId.make(model.id) })
+            patch(chatStartingSettings(model, {}))
+          },
         }
       : undefined
   const start = useAtomSet(client.Chat.StartChat, { mode: "promise" })
