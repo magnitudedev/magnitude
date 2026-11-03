@@ -576,7 +576,9 @@ function ChatView({
                                 lab={labForName(m.name)}
                                 className="size-3"
                               />
-                              {m.name}
+                              {localFor(m.id)
+                                ? formatLocalModelDisplayName(localFor(m.id)!)
+                                : m.name}
                               {m.id in saved && (
                                 <ActionTooltip
                                   label="New chats start with your defaults"
@@ -594,7 +596,6 @@ function ChatView({
                             </span>
                             <span className="pl-[18px] text-xs font-normal text-slate-500">
                               {[
-                                localFor(m.id)?.presentation.variantLabel,
                                 `${number(contextFor(m))} context`,
                                 localFor(m.id) &&
                                 Option.exists(
