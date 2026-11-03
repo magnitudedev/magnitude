@@ -5,6 +5,7 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use magnitude_chat::{ChatError, output::JournalError};
+use magnitude_decision::DecisionError;
 use magnitude_engine::error::{LoadError, RequestError, UnloadCause};
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,6 +49,8 @@ pub enum ServingError {
     InvalidRequest(String),
     /// The request cannot be prepared for the model.
     Chat(ChatError),
+    /// The decision request is not one the model's description serves.
+    Decision(DecisionError),
     /// The engine refused or ended the request.
     Request(RequestError),
     /// Loading the model for this request failed.
@@ -64,6 +67,7 @@ impl std::fmt::Display for ServingError {
         match self {
             Self::InvalidRequest(message) | Self::Internal(message) => formatter.write_str(message),
             Self::Chat(error) => error.fmt(formatter),
+            Self::Decision(error) => error.fmt(formatter),
             Self::Request(error) => error.fmt(formatter),
             Self::Load(error) => error.fmt(formatter),
             Self::Model(error) => match error {
@@ -229,6 +233,7 @@ impl From<ServingError> for ApiError {
             ServingError::Chat(ChatError::InvalidRequest(_) | ChatError::Reasoning(_)) => {
                 (StatusCode::BAD_REQUEST, INVALID, "invalid_request", false)
             }
+            ServingError::Decision(_) => (StatusCode::BAD_REQUEST, INVALID, "invalid_request", false),
             ServingError::Request(error) => request_class(error),
             ServingError::Load(error) => load_class(error),
             ServingError::Model(error) => model_class(error),

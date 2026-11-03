@@ -1171,7 +1171,7 @@ pub async fn anthropic_count_tokens(
         let Json(request) = payload.map_err(|error| ApiError::invalid(error.body_text()))?;
         let adapted = adapt_input(request)?;
         let host = state
-            .models
+            
             .host(&adapted.model)
             .await
             .map_err(ApiError::from)?;
@@ -1241,7 +1241,7 @@ async fn messages(
         .map(str::to_owned)
         .unwrap_or_else(|| adapted.model.clone());
     let invocation = state
-        .models
+        
         .invoke(&adapted.model, None)
         .await
         .map_err(ApiError::from)?;

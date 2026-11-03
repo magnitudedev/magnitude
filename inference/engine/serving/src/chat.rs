@@ -1547,7 +1547,7 @@ pub async fn chat_completions(
         };
         tokio::spawn(async move {
             let invocation = tokio::select! {
-                result = state.models.invoke(&adapted.model, Some(progress)) => result,
+                result = state.invoke(&adapted.model, Some(progress)) => result,
                 _ = sender.closed() => return,
             };
             match invocation {
@@ -1564,7 +1564,7 @@ pub async fn chat_completions(
         return Ok(with_request_id(response, &id));
     }
     let invocation = state
-        .models
+        
         .invoke(&adapted.model, None)
         .await
         .map_err(|error| ApiError::from(error).with_param("model"))?;
@@ -1735,7 +1735,7 @@ pub async fn count_chat_tokens(
     let Json(request) = payload.map_err(|error| ApiError::invalid(error.body_text()))?;
     let adapted = adapt_request(request)?;
     let host = state
-        .models
+        
         .host(&adapted.model)
         .await
         .map_err(ApiError::from)?;
@@ -1776,7 +1776,7 @@ pub async fn apply_template(
         .ok_or_else(|| ApiError::invalid("model is required"))?;
     tracing::Span::current().record("model.id", model.as_str());
     let input = validate_apply_template_request(request)?;
-    let host = state.models.host(&model).await.map_err(ApiError::from)?;
+    let host = state.host(&model).await.map_err(ApiError::from)?;
     let applied = tokio::task::spawn_blocking(move || host.apply_template(&input))
         .await
         .map_err(|error| ApiError::server(format!("template task failed: {error}")))?

@@ -17,6 +17,8 @@ use magnitude_chat::request::{
     Entry, OutputFormat, PromptCache, SamplingControls, ToolCall, UserPart,
 };
 use magnitude_chat::{ChatError, ChatInput, EndOfGeneration, GenerationRequest, ReasoningIntent, ToolChoice};
+use magnitude_artifacts::Serves;
+use magnitude_decision::{DecisionAnswers, DecisionRequest};
 use magnitude_engine::chat::{AppliedTemplate, ModelProperties};
 use magnitude_engine::error::RequestError;
 use serde_json::{Value, json};
@@ -26,8 +28,9 @@ use tower::ServiceExt;
 use crate::chat::{ChatCompletionRequest, adapt_request, validate_request};
 use crate::error::{ModelUnavailable, ServingError};
 use crate::source::{
-    GenerationEvent, GenerationStream, HostChat, LoadProgress, ModelInvocation, ModelLoadProgress,
-    ModelLoadStage, ServedModels,
+    ChatInvocation, ChatTarget, DecisionInvocation, DecisionTarget, GenerationEvent,
+    GenerationStream, HostChat, LoadProgress, ModelLoadProgress, ModelLoadStage, ResolvedModel,
+    ServedModels, ServedTarget,
 };
 use crate::{Serving, anthropic, responses, router};
 
@@ -48,6 +51,10 @@ struct Script {
     cached_input_tokens: u64,
     /// `None` derives the termination from the output.
     termination: Option<Termination>,
+    /// What the model serves.
+    serves: Serves,
+    /// A decision model's answers.
+    answers: Option<DecisionAnswers>,
 }
 
 impl Script {
@@ -68,6 +75,8 @@ impl Script {
             hang: false,
             cached_input_tokens: 0,
             termination: None,
+            serves: Serves::Chat,
+            answers: None,
         }
     }
 
@@ -111,6 +120,8 @@ fn completion(script: &Script) -> Completion {
 #[derive(Default)]
 struct Observed {
     invocations: AtomicUsize,
+    /// Every decision request a decision model received.
+    decided: Mutex<Vec<DecisionRequest>>,
     requests: Mutex<Vec<(String, GenerationRequest)>>,
     counted: Mutex<Vec<ChatInput>>,
     /// Set when a consumer dropped a live generation.
@@ -147,7 +158,20 @@ struct ScriptedInvocation {
     observed: Arc<Observed>,
 }
 
-impl ModelInvocation for ScriptedInvocation {
+impl DecisionInvocation for ScriptedInvocation {
+    fn decide(
+        self: Box<Self>,
+        request: DecisionRequest,
+    ) -> BoxFuture<'static, Result<DecisionAnswers, ServingError>> {
+        self.observed.decided.lock().unwrap().push(request);
+        let answers = self.script.answers.clone();
+        Box::pin(async move {
+            answers.ok_or_else(|| ServingError::Internal("the script answers no decisions".into()))
+        })
+    }
+}
+
+impl ChatInvocation for ScriptedInvocation {
     fn generate(self: Box<Self>, request: GenerationRequest) -> GenerationStream {
         self.observed
             .requests
@@ -217,52 +241,70 @@ impl Drop for DropFlag {
 }
 
 impl ServedModels for Scripted {
-    fn invoke(
-        &self,
-        model: &str,
-        progress: Option<LoadProgress>,
-    ) -> BoxFuture<'_, Result<Box<dyn ModelInvocation>, ServingError>> {
-        let model = model.to_owned();
-        Box::pin(async move {
-            self.observed.invocations.fetch_add(1, Ordering::Relaxed);
-            if model != self.model {
-                return Err(ServingError::Model(ModelUnavailable::NotFound(format!(
-                    "model `{model}` is not served"
-                ))));
-            }
-            if let Some(progress) = progress {
-                progress(ModelLoadProgress {
-                    stage: ModelLoadStage::LoadingWeights,
-                    fraction: 0.5,
-                    details: None,
-                });
-            }
-            if self.pending {
-                let _flag = DropFlag(self.observed.clone());
-                std::future::pending::<()>().await;
-            }
-            if let Some(error) = &self.binding_failure {
-                return Err(error.clone());
-            }
-            Ok(Box::new(ScriptedInvocation {
-                script: self.script.clone(),
-                model,
-                observed: self.observed.clone(),
-            }) as Box<dyn ModelInvocation>)
-        })
-    }
-
-    fn host(&self, model: &str) -> BoxFuture<'_, Result<Arc<dyn HostChat>, ServingError>> {
+    fn resolve(&self, model: &str) -> BoxFuture<'_, Result<ResolvedModel<'_>, ServingError>> {
         let result = if model == self.model {
-            Ok(Arc::new(ScriptedHost {
-                observed: self.observed.clone(),
-            }) as Arc<dyn HostChat>)
+            let target = ScriptedTarget { source: self };
+            Ok(ResolvedModel {
+                host: Arc::new(ScriptedHost {
+                    observed: self.observed.clone(),
+                }),
+                target: match self.script.serves {
+                    Serves::Chat => ServedTarget::Chat(Box::new(target)),
+                    Serves::Decisions => ServedTarget::Decisions(Box::new(target)),
+                },
+            })
         } else {
             Err(ServingError::Model(ModelUnavailable::NotFound(format!(
-                "model `{model}` is not installed"
+                "model `{model}` is not served"
             ))))
         };
         Box::pin(std::future::ready(result))
+    }
+}
+
+/// The scripted model, resolved.
+struct ScriptedTarget<'a> {
+    source: &'a Scripted,
+}
+
+impl ScriptedTarget<'_> {
+    async fn bind(self, progress: Option<LoadProgress>) -> Result<ScriptedInvocation, ServingError> {
+        let source = self.source;
+        source.observed.invocations.fetch_add(1, Ordering::Relaxed);
+        if let Some(progress) = progress {
+            progress(ModelLoadProgress {
+                stage: ModelLoadStage::LoadingWeights,
+                fraction: 0.5,
+                details: None,
+            });
+        }
+        if source.pending {
+            let _flag = DropFlag(source.observed.clone());
+            std::future::pending::<()>().await;
+        }
+        if let Some(error) = &source.binding_failure {
+            return Err(error.clone());
+        }
+        Ok(ScriptedInvocation {
+            script: source.script.clone(),
+            model: source.model.to_owned(),
+            observed: source.observed.clone(),
+        })
+    }
+}
+
+impl<'a> ChatTarget<'a> for ScriptedTarget<'a> {
+    fn invoke(
+        self: Box<Self>,
+        progress: Option<LoadProgress>,
+    ) -> BoxFuture<'a, Result<Box<dyn ChatInvocation>, ServingError>> {
+        Box::pin(async move { Ok(Box::new(self.bind(progress).await?) as Box<dyn ChatInvocation>) })
+    }
+}
+
+impl<'a> DecisionTarget<'a> for ScriptedTarget<'a> {
+    fn invoke(self: Box<Self>) -> BoxFuture<'a, Result<Box<dyn DecisionInvocation>, ServingError>> {
+        Box::pin(async move { Ok(Box::new(self.bind(None).await?) as Box<dyn DecisionInvocation>) })
     }
 }
 
@@ -360,10 +402,11 @@ async fn send(app: axum::Router, path: &str, headers: &[(&str, &str)], body: Val
     for (name, value) in headers {
         request = request.header(*name, *value);
     }
-    let response = app
-        .oneshot(request.body(Body::from(body.to_string())).unwrap())
-        .await
-        .unwrap();
+    reply(app, request.body(Body::from(body.to_string())).unwrap()).await
+}
+
+async fn reply(app: axum::Router, request: Request<Body>) -> Reply {
+    let response = app.oneshot(request).await.unwrap();
     let status = response.status();
     let headers = response.headers().clone();
     let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -2630,5 +2673,489 @@ async fn responses_end_a_call_cut_off_by_the_output_limit_incomplete_in_both_mod
     assert_eq!(
         Value::Array(stream.concluded.await.unwrap()),
         terminal["output"]
+    );
+}
+
+fn decision_model() -> Scripted {
+    use magnitude_decision::Answer;
+    deciding(vec![
+        Answer::Predicate { probability: 0.75 },
+        Answer::Score {
+            probabilities: vec![0.25, 0.75],
+            score: 1.0,
+            confidence: 0.75,
+        },
+    ])
+}
+
+#[tokio::test]
+async fn decision_routes_answer_decision_models_in_each_format() {
+    let systemone = send(
+        app(decision_model()),
+        "/v1/systemone",
+        &[],
+        json!({"model": "test-model", "state": "charged twice",
+               "questions": {"refund": {"type": "noul"},
+                             "urgency": {"type": "score", "criteria": ["later", "now"]}}}),
+    )
+    .await;
+    assert_eq!(systemone.status, StatusCode::OK, "{}", systemone.body);
+    assert!(systemone.headers.contains_key("x-typesafe-request-id"));
+    assert_eq!(
+        systemone.body,
+        r#"{"model":"test-model","answers":{"refund":{"type":"noul","noul":0.75},"urgency":{"type":"score","score":1.0,"confidence":0.75,"legend":{"0":"later","1":"now"},"probabilities":{"0":0.25,"1":0.75}}},"usage":{"input_tokens":42,"output_tokens":0}}"#
+    );
+    let openai = send(
+        app(decision_model()),
+        "/v1/decisions",
+        &[],
+        json!({"model": "test-model", "input": "charged twice",
+               "questions": [{"type": "predicate", "name": "refund"},
+                             {"type": "score", "levels": [{"label": "later"}, {"label": "now"}]}]}),
+    )
+    .await;
+    assert_eq!(openai.status, StatusCode::OK, "{}", openai.body);
+    let body: Value = serde_json::from_str(&openai.body).unwrap();
+    assert_eq!(body["answers"][0], json!({"type": "predicate", "name": "refund", "probability": 0.75}));
+    assert_eq!(body["answers"][1]["name"], Value::Null);
+    assert_eq!(body["answers"][1]["probabilities"][1], json!({"value": 1, "label": "now", "probability": 0.75}));
+    assert_eq!(body["usage"]["total_tokens"], json!(42));
+}
+
+/// Each route refuses the other kind of model from what its source knows
+/// before binding: the model is never bound (so never loaded).
+#[tokio::test]
+async fn chat_and_decision_routes_refuse_the_other_kind_of_model() {
+    let decisions = decision_model();
+    let observed = decisions.observed.clone();
+    let (status, body) = post_chat(decisions, minimal_request()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["error"]["code"], json!("operation_unsupported"));
+    assert_eq!(observed.invocations.load(Ordering::Relaxed), 0);
+    let chat = Scripted::new(Script::text("hello"));
+    let observed = chat.observed.clone();
+    let refused = send(
+        app(chat),
+        "/v1/systemone",
+        &[],
+        json!({"model": "test-model", "state": "s", "questions": {"q": {"type": "noul"}}}),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.body);
+    assert!(refused.body.contains("serves chat, not decisions"));
+    assert_eq!(observed.invocations.load(Ordering::Relaxed), 0);
+    let invalid = send(
+        app(decision_model()),
+        "/v1/systemone",
+        &[],
+        json!({"model": "test-model", "questions": {"q": {"type": "noul"}}}),
+    )
+    .await;
+    assert_eq!(invalid.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        serde_json::from_str::<Value>(&invalid.body).unwrap(),
+        json!({"detail": [{"loc": ["body", "state"], "msg": "Field required", "type": "missing"}]})
+    );
+}
+
+/// A decision model whose script answers `answers`.
+fn deciding(answers: Vec<magnitude_decision::Answer>) -> Scripted {
+    use magnitude_decision::DecisionUsage;
+    Scripted::new(Script {
+        serves: Serves::Decisions,
+        answers: Some(DecisionAnswers {
+            answers,
+            usage: DecisionUsage {
+                input_tokens: 42,
+                cached_tokens: 0,
+            },
+        }),
+        ..Script::text("unused")
+    })
+}
+
+async fn send_raw(app: axum::Router, path: &str, content_type: &str, body: Vec<u8>) -> Reply {
+    let request = Request::post(path).header("content-type", content_type);
+    reply(app, request.body(Body::from(body)).unwrap()).await
+}
+
+/// A `multipart/form-data` body of `(name, content type, bytes)` parts.
+fn multipart(parts: &[(&str, Option<&str>, &[u8])]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (name, content_type, bytes) in parts {
+        body.extend(
+            format!(
+                "--X\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{name}\"\r\n"
+            )
+            .bytes(),
+        );
+        if let Some(content_type) = content_type {
+            body.extend(format!("Content-Type: {content_type}\r\n").bytes());
+        }
+        body.extend(b"\r\n");
+        body.extend(*bytes);
+        body.extend(b"\r\n");
+    }
+    body.extend(b"--X--\r\n");
+    body
+}
+
+const MULTIPART: &str = "multipart/form-data; boundary=X";
+const JPEG: &[u8] = &[0xff, 0xd8, 0xff, 0xe0, 1, 2, 3];
+
+#[tokio::test]
+async fn systemone_reads_multipart_requests_with_their_file_parts() {
+    use magnitude_decision::Answer;
+    let source = deciding(vec![Answer::Predicate { probability: 0.5 }]);
+    let observed = source.observed.clone();
+    let request = json!({"model": "test-model", "state": {"door": "a3f1-door"},
+        "assets": {"a3f1-door": {"type": "image", "part": "door-photo"}},
+        "questions": {"person": {"type": "noul", "instructions": "Is someone at `door`?"}}})
+    .to_string();
+    let reply = send_raw(
+        app(source),
+        "/v1/systemone",
+        MULTIPART,
+        multipart(&[
+            ("request", Some("application/json"), request.as_bytes()),
+            ("door-photo", None, JPEG),
+        ]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let decided = observed.decided.lock().unwrap();
+    let request = &decided[0];
+    assert_eq!(request.images.len(), 1);
+    assert_eq!(request.images[0].media_type, "image/jpeg");
+    assert_eq!(&*request.images[0].bytes, JPEG);
+    assert_eq!(request.state.get("door").unwrap().images(), vec![0]);
+}
+
+#[tokio::test]
+async fn systemone_refuses_multipart_requests_that_break_its_rules() {
+    let request = |part: &str| {
+        json!({"model": "test-model", "state": "a3f1-door",
+            "assets": {"a3f1-door": {"type": "image", "part": part}},
+            "questions": {"person": {"type": "noul"}}})
+        .to_string()
+    };
+    let named = request("door-photo");
+    for (parts, refusal) in [
+        (
+            vec![
+                ("door-photo", None, JPEG),
+                ("request", None, named.as_bytes()),
+            ],
+            "the first part is named `request`",
+        ),
+        (
+            vec![("request", None, named.as_bytes())],
+            "no file part is named `door-photo`",
+        ),
+        (
+            vec![
+                ("request", None, named.as_bytes()),
+                ("door-photo", None, JPEG),
+                ("spare", None, JPEG),
+            ],
+            "file part `spare` is not named by any asset",
+        ),
+        (
+            vec![
+                ("request", None, named.as_bytes()),
+                ("door-photo", Some("image/gif"), JPEG),
+            ],
+            "content type `image/gif`",
+        ),
+        (
+            vec![
+                ("request", None, named.as_bytes()),
+                ("door-photo", None, JPEG),
+                ("door-photo", None, JPEG),
+            ],
+            "part names are unique",
+        ),
+    ] {
+        let reply = send_raw(
+            app(deciding(Vec::new())),
+            "/v1/systemone",
+            MULTIPART,
+            multipart(&parts),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+        assert!(reply.body.contains(refusal), "{refusal}: {}", reply.body);
+    }
+}
+
+#[tokio::test]
+async fn systemone_takes_images_out_of_a_chat_message_state() {
+    use magnitude_decision::Answer;
+    let source = deciding(vec![Answer::Predicate { probability: 0.5 }]);
+    let observed = source.observed.clone();
+    let png = "data:image/png;base64,iVBORw==";
+    let reply = send(
+        app(source),
+        "/v1/systemone",
+        &[],
+        json!({"model": "test-model", "images": [png],
+            "state": {"messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Is it broken?"},
+                                             {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/4A=="}}]},
+                {"role": "assistant", "content": "Let me look."}]},
+            "questions": {"broken": {"type": "noul", "instructions": "Is it broken?"}}}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let decided = observed.decided.lock().unwrap();
+    let request = &decided[0];
+    assert_eq!(request.front, vec![0, 1]);
+    assert_eq!(request.images[1].media_type, "image/jpeg");
+    let expected: magnitude_decision::json::Value = serde_json::from_value(json!({"messages": [
+        {"role": "user", "content": [{"type": "text", "text": "Is it broken?"}]},
+        {"role": "assistant", "content": "Let me look."}]}))
+    .unwrap();
+    assert_eq!(request.state, expected);
+    let audio = send(
+        app(deciding(Vec::new())),
+        "/v1/systemone",
+        &[],
+        json!({"model": "test-model",
+            "state": [{"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": "AAAA"}}]}],
+            "questions": {"q": {"type": "noul"}}}),
+    )
+    .await;
+    assert_eq!(
+        audio.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        audio.body
+    );
+    let both = send(
+        app(deciding(Vec::new())),
+        "/v1/systemone",
+        &[],
+        json!({"model": "test-model", "images": [png], "files": [png],
+            "state": "Is it broken?",
+            "questions": {"q": {"type": "noul"}}}),
+    )
+    .await;
+    assert_eq!(both.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", both.body);
+    assert!(both.body.contains(r#""loc":["body","files"]"#), "{}", both.body);
+}
+
+#[tokio::test]
+async fn systemone_maps_d1_extended_kinds() {
+    use magnitude_decision::request::{QuestionKind, ReadValue};
+    // One answer per question; only the request is checked.
+    let source = deciding(vec![
+        magnitude_decision::Answer::Predicate { probability: 0.5 };
+        9
+    ]);
+    let observed = source.observed.clone();
+    send(
+        app(source),
+        "/v1/systemone",
+        &[],
+        json!({"model": "test-model", "state": "s", "questions": {
+            "flags": {"type": "choice", "multiple": true, "instructions": "Which?", "criteria": {"a": null, "b": "B"}},
+            "cups": {"type": "boxes", "instructions": "cups", "max": 3},
+            "all": {"type": "boxes", "instructions": "cups"},
+            "mug": {"type": "box", "instructions": "mug"},
+            "name": {"type": "text", "instructions": "Name?"},
+            "total": {"type": "number", "instructions": "Total?", "unit": "EUR"},
+            "stars": {"type": "number", "instructions": "Stars?", "range": [0, 10], "step": 0.5, "unit": "stars"},
+            "share": {"type": "number", "instructions": "Share?", "range": [0.0, 1]},
+            "due": {"type": "date", "instructions": "Due?"}}}),
+    )
+    .await;
+    let decided = observed.decided.lock().unwrap();
+    let kinds: Vec<&QuestionKind> = decided[0]
+        .questions
+        .iter()
+        .map(|question| &question.kind)
+        .collect();
+    assert!(
+        matches!(kinds[0], QuestionKind::Choice { multiple: true, options } if options.len() == 2)
+    );
+    assert_eq!(kinds[1], &QuestionKind::Boxes { max: Some(3) });
+    assert_eq!(kinds[2], &QuestionKind::Boxes { max: None });
+    assert_eq!(kinds[3], &QuestionKind::Box);
+    assert_eq!(
+        kinds[4],
+        &QuestionKind::Read {
+            value: ReadValue::Text
+        }
+    );
+    assert_eq!(
+        kinds[5],
+        &QuestionKind::Read {
+            value: ReadValue::Number {
+                unit: Some("EUR".into())
+            }
+        }
+    );
+    assert_eq!(
+        kinds[6],
+        &QuestionKind::Estimate {
+            low: 0.0,
+            high: 10.0,
+            step: Some(0.5),
+            unit: Some("stars".into())
+        }
+    );
+    assert_eq!(
+        kinds[7],
+        &QuestionKind::Estimate {
+            low: 0.0,
+            high: 1.0,
+            step: None,
+            unit: None
+        }
+    );
+    assert_eq!(
+        kinds[8],
+        &QuestionKind::Read {
+            value: ReadValue::Date
+        }
+    );
+}
+
+#[tokio::test]
+async fn systemone_refuses_extended_fields_outside_their_kind() {
+    for (question, field) in [
+        (json!({"type": "noul", "max": 3}), "max"),
+        (json!({"type": "text", "range": [0, 1]}), "range"),
+        (json!({"type": "number", "step": 1}), "step"),
+        (json!({"type": "number", "range": [0]}), "range"),
+        (json!({"type": "boxes", "max": 0}), "max"),
+        (
+            json!({"type": "score", "multiple": true, "criteria": ["a", "b"]}),
+            "multiple",
+        ),
+    ] {
+        let reply = send(
+            app(deciding(Vec::new())),
+            "/v1/systemone",
+            &[],
+            json!({"model": "test-model", "state": "s", "questions": {"q": question}}),
+        )
+        .await;
+        assert_eq!(
+            reply.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{}",
+            reply.body
+        );
+        let body: Value = serde_json::from_str(&reply.body).unwrap();
+        assert_eq!(
+            body["detail"][0]["loc"],
+            json!(["body", "questions", "q", field]),
+            "{}",
+            reply.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn systemone_answers_d1_extended_kinds_in_d1_shapes() {
+    use magnitude_decision::Answer;
+    use magnitude_decision::answers::{FoundBox, ReadSpan, ReadValue, Rect, WrittenNumber};
+    let rect = Rect {
+        top: 0.25,
+        bottom: 0.75,
+        left: 0.125,
+        right: 0.5,
+    };
+    let span = |text: &str, path: Option<&str>| ReadSpan {
+        text: text.into(),
+        span: [3, 3 + text.len()],
+        path: path.map(str::to_owned),
+    };
+    let source = deciding(vec![
+        Answer::Multiple {
+            probabilities: vec![0.75, 0.25],
+        },
+        Answer::Box {
+            found: Some(0.875),
+            rect: Some(rect),
+            confidence: 0.5,
+        },
+        Answer::Box {
+            found: Some(0.25),
+            rect: None,
+            confidence: 0.0,
+        },
+        Answer::Boxes {
+            boxes: vec![FoundBox {
+                rect,
+                found: 0.75,
+                confidence: 0.5,
+            }],
+            at_least: false,
+            presence: vec![0.75, 0.25],
+        },
+        Answer::Read {
+            found: 0.875,
+            read: Some(span("Acme", Some("/from"))),
+            value: ReadValue::Text,
+        },
+        Answer::Read {
+            found: 0.875,
+            read: Some(span("1e40", None)),
+            value: ReadValue::Number {
+                number: Some(WrittenNumber::Integer(format!("1{}", "0".repeat(40)))),
+                unit: Some("%".into()),
+            },
+        },
+        Answer::Read {
+            found: 0.25,
+            read: None,
+            value: ReadValue::Date { date: None },
+        },
+        Answer::Estimate {
+            median: 3.5,
+            p10: 2.0,
+            p90: 4.5,
+        },
+    ]);
+    let reply = send(
+        app(source),
+        "/v1/systemone",
+        &[],
+        json!({"model": "test-model", "state": "s", "questions": {
+            "flags": {"type": "choice", "multiple": true, "instructions": "Which?", "criteria": {"a": null, "b": "B"}},
+            "mug": {"type": "box", "instructions": "mug"},
+            "cat": {"type": "box", "instructions": "cat"},
+            "cups": {"type": "boxes", "instructions": "cups", "max": 2},
+            "from": {"type": "text", "instructions": "From?"},
+            "total": {"type": "number", "instructions": "Total?"},
+            "due": {"type": "date", "instructions": "Due?"},
+            "stars": {"type": "number", "instructions": "Stars?", "range": [0, 5], "unit": "stars"}}}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let edges = r#"{"top":0.25,"bottom":0.75,"left":0.125,"right":0.5}"#;
+    assert_eq!(
+        reply.body,
+        [
+            r#"{"model":"test-model","answers":{"#,
+            r#""flags":{"type":"choice","choices":["a"],"probabilities":{"a":0.75,"b":0.25}},"#,
+            &format!(r#""mug":{{"type":"box","box":{edges},"found":0.875,"confidence":0.5}},"#),
+            r#""cat":{"type":"box","box":null,"found":0.25,"confidence":0.0},"#,
+            &format!(
+                r#""cups":{{"type":"boxes","boxes":[{{"box":{edges},"found":0.75,"confidence":0.5}}],"count":1,"at_least":false,"presence":[0.75,0.25]}},"#
+            ),
+            r#""from":{"type":"text","text":"Acme","span":[3,7],"found":0.875,"path":"/from"},"#,
+            &format!(
+                r#""total":{{"type":"number","number":1{},"span":[3,7],"found":0.875,"text":"1e40","unit":"%"}},"#,
+                "0".repeat(40)
+            ),
+            r#""due":{"type":"date","date":null,"span":null,"found":0.25,"text":null},"#,
+            r#""stars":{"type":"number","number":3.5,"interval":[2.0,4.5],"unit":"stars"}},"#,
+            r#""usage":{"input_tokens":42,"output_tokens":0}}"#,
+        ]
+        .concat()
     );
 }

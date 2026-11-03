@@ -5,16 +5,19 @@ edition = "2024"
 license.workspace = true
 
 # The one implementation of the inference protocols (Chat Completions,
-# Responses, Anthropic Messages). Engine core only: no Seismic, no service
-# types. The service and the standalone engine mount its router.
+# Responses, Anthropic Messages, System One, OpenAI Decisions). Engine core
+# only: no Seismic, no service types. The service and the standalone engine
+# mount its router.
 [dependencies]
-axum = { version = "0.8.9", features = ["ws"] }
+axum = { version = "0.8.9", features = ["multipart", "ws"] }
 base64.workspace = true
 futures-util.workspace = true
+magnitude-artifacts = { path = "../artifacts" }
 magnitude-chat = { path = "../chat" }
+magnitude-decision = { path = "../decision" }
 magnitude-engine = { path = ".." }
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
 tokio-stream = "0.1.18"

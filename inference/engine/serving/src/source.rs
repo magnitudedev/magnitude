@@ -1,7 +1,8 @@
 //! What protocol handlers need from the models they serve (integration spec
 //! §8.2). Handlers are router-independent: they name a model and receive
-//! either a generation binding (which may load the model and holds its
-//! release guard) or its host chat semantics (which never lease or load).
+//! its resolution, whose host chat semantics never lease or load and whose
+//! binding, of the kind the model serves, may load the model and holds its
+//! release guard.
 //! The CLI serves one in-process engine; the service resolves canonical models,
 //! ensures instances and leases them. Tests serve scripted models.
 use crate::error::ServingError;
@@ -10,6 +11,7 @@ use magnitude_chat::{
     output::{Completion, OutputEvent, Progress, TimingSnapshot},
     ChatInput, GenerationRequest,
 };
+use magnitude_decision::{DecisionAnswers, DecisionRequest};
 use magnitude_engine::chat::{AppliedTemplate, ModelProperties};
 use serde::Serialize;
 use std::sync::Arc;
@@ -80,25 +82,58 @@ pub type LoadProgress = Arc<dyn Fn(ModelLoadProgress) + Send + Sync>;
 
 /// The models a router serves.
 pub trait ServedModels: Send + Sync + 'static {
-    /// Bind a generation to the model `model` names, loading it if the source
-    /// manages residency. The binding is to one exact model generation and
-    /// releases its guard when the returned invocation (and every generation
-    /// it started) ends.
-    fn invoke(
-        &self,
-        model: &str,
-        progress: Option<LoadProgress>,
-    ) -> BoxFuture<'_, Result<Box<dyn ModelInvocation>, ServingError>>;
-
-    /// The model's host chat semantics for operations that never lease or
-    /// load: counting, template application.
-    fn host(&self, model: &str) -> BoxFuture<'_, Result<Arc<dyn HostChat>, ServingError>>;
+    /// Resolve the model `model` names once, without leasing or loading it:
+    /// its host chat semantics and, by what it serves, the binding of
+    /// exactly that resolution. A route of the other kind refuses it from
+    /// the resolution, so a wrong-kind request never loads the model.
+    fn resolve(&self, model: &str) -> BoxFuture<'_, Result<ResolvedModel<'_>, ServingError>>;
 }
 
-/// One bound model generation.
-pub trait ModelInvocation: Send {
+/// One resolution of a served model.
+pub struct ResolvedModel<'a> {
+    /// Operations that never lease or load: counting, template application,
+    /// properties.
+    pub host: Arc<dyn HostChat>,
+    pub target: ServedTarget<'a>,
+}
+
+/// A resolved model's binding, by what it serves.
+pub enum ServedTarget<'a> {
+    Chat(Box<dyn ChatTarget<'a> + 'a>),
+    Decisions(Box<dyn DecisionTarget<'a> + 'a>),
+}
+
+/// A resolved chat model.
+pub trait ChatTarget<'a>: Send {
+    /// Bind a generation to the resolved model, loading it if the source
+    /// manages residency. The binding releases its guard when the returned
+    /// invocation (and the generation it started) ends.
+    fn invoke(
+        self: Box<Self>,
+        progress: Option<LoadProgress>,
+    ) -> BoxFuture<'a, Result<Box<dyn ChatInvocation>, ServingError>>;
+}
+
+/// A resolved decision model.
+pub trait DecisionTarget<'a>: Send {
+    /// Bind a decision to the resolved model, loading it if the source
+    /// manages residency.
+    fn invoke(self: Box<Self>) -> BoxFuture<'a, Result<Box<dyn DecisionInvocation>, ServingError>>;
+}
+
+/// One bound chat model generation.
+pub trait ChatInvocation: Send {
     /// Start generating. Dropping the returned stream cancels the request.
     fn generate(self: Box<Self>, request: GenerationRequest) -> GenerationStream;
+}
+
+/// One bound decision model generation.
+pub trait DecisionInvocation: Send {
+    /// Answer a decision request. Dropping the future cancels it.
+    fn decide(
+        self: Box<Self>,
+        request: DecisionRequest,
+    ) -> BoxFuture<'static, Result<DecisionAnswers, ServingError>>;
 }
 
 /// Chat semantics that run on the host alone, with the same rendering and

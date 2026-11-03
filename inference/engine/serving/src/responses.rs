@@ -1533,7 +1533,7 @@ pub async fn responses(
     let id = state.next_id("resp_icn_");
     let created_at = unix_timestamp();
     let invocation = state
-        .models
+        
         .invoke(&adapted.model, None)
         .await
         .map_err(|error| ApiError::from(error).with_param("model"))?;
@@ -1600,7 +1600,7 @@ pub(crate) async fn start_response_stream(
                 return;
             }
             let invocation = tokio::select! {
-                result = state.models.invoke(&adapted.model, Some(progress)) => result,
+                result = state.invoke(&adapted.model, Some(progress)) => result,
                 _ = projector.sender.closed() => return,
             };
             match invocation {
@@ -1614,7 +1614,7 @@ pub(crate) async fn start_response_stream(
         return Ok(response);
     }
     let invocation = state
-        .models
+        
         .invoke(&adapted.model, None)
         .await
         .map_err(|error| ApiError::from(error).with_param("model"))?;
