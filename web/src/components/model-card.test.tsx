@@ -47,5 +47,20 @@ describe("unified catalog rows", () => {
     expect(dash).toBeDefined()
     expect(dash).not.toContain("title=")
   })
+  it.each([
+    [{ code: "worker_exited", message: "PRIVATE", retryable: true }, true],
+    [{ code: "model_load_failed", message: "PRIVATE", retryable: false }, false],
+    [{ code: "unsupported_model", message: "PRIVATE", retryable: false }, false],
+    [{ _tag: "MemoryShortage" as const, code: "memory_shortage" as const, message: "PRIVATE", retryable: true, shortage: { _tag: "UnderPressure" as const } }, true],
+  ])("offers a retry after a failed load exactly when its notice advises one (%o)", (failure, retry) => {
+    const installed = catalogModel()
+    if (installed.acquisitionState._tag !== "Installed") throw new Error("Expected an installed fixture")
+    const html = render({ ...installed, acquisitionState: { ...installed.acquisitionState, residencyState: { _tag: "Failed", failure } } }, "models")
+    const advises = /try loading it again|try again/i.test(html)
+    const offers = html.includes(">Load again<") || />Load<\/button>/.test(html)
+    expect(advises).toBe(retry)
+    expect(offers).toBe(retry)
+    expect(html).not.toContain("PRIVATE")
+  })
 
 })

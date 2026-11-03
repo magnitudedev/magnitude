@@ -8,7 +8,9 @@ import type { ReactNode } from "react"
 
 export const modelLoadNotice = (failure: ModelInstanceFailure): NoticeContent => {
   if ("_tag" in failure) return { title: memoryShortageTitle(failure.shortage), description: describeMemoryShortage(failure.shortage) }
-  return { title: "This model couldn’t start", description: "Try loading it again. If it still won’t start, choose another model." }
+  return failure.retryable
+    ? { title: "This model couldn’t start", description: "Try loading it again. If it still won’t start, choose another model." }
+    : { title: "This model couldn’t start", description: "It can’t run on this computer with this version of Magnitude. Choose another model." }
 }
 
 export function ModelLoadNotice({ failure, actions }: { failure: ModelInstanceFailure; actions?: ReactNode }) {
