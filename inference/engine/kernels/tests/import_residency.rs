@@ -326,6 +326,56 @@ fn cuda_repack_matches_the_registered_conversion_for_every_format_and_layout() {
     }
 }
 
+/// The CUDA repack into mma16 of the GGUF sources that keep their own size
+/// there, at a real tensor's shape (Qwen3.5-2B's `attn_output`, 2048 x
+/// 2048), equals the registry's host conversion byte for byte. IQ3_S comes
+/// last: its rows' 24-byte k-blocks of grid entries are the only ones not a
+/// power of two, which the mma16 grid placement once stored as 16-byte
+/// units (a misaligned address on the device).
+#[test]
+fn cuda_repack_into_mma16_matches_the_host_at_a_real_shape() {
+    let Some(device) = device(seismic::BackendName::Cuda) else {
+        return;
+    };
+    use magnitude_ggml::Encoding;
+    let shape = [1, 2048, 2048];
+    for encoding in [
+        Encoding::Iq2S,
+        Encoding::Iq1S,
+        Encoding::Iq1M,
+        Encoding::Q3K,
+        Encoding::Iq4Xs,
+        Encoding::Q1_0,
+        Encoding::Iq3S,
+    ] {
+        let source_element = seismic::Element::gguf_source(encoding, shape[2]).unwrap();
+        let destination = source_element
+            .converted(seismic::Layout::Mma16, seismic::OperandRecipe::Rounded)
+            .unwrap();
+        let length = source_element.canonical_byte_len(&shape).unwrap();
+        let bytes = source_bytes(length, 11);
+        let source = seismic::Tensor::from_host(&device, source_element, &shape, &bytes).unwrap();
+        let label = format!("{} -> {} over {shape:?}", source_element.name(), destination.name());
+        let native = repack_weight::native_for_device_with(
+            &device,
+            repack_weight::Elements {
+                E: source_element,
+                U: destination,
+            },
+            &seismic::NativeSpecialization::new(),
+        )
+        .unwrap()
+        .call(repack_weight::Args { source: &source })
+        .unwrap_or_else(|error| panic!("{label}: {error:?}"))
+        .value;
+        assert!(
+            native.read_to_host().unwrap() == destination.repack_host(source_element, &shape, &bytes).unwrap(),
+            "{label}"
+        );
+        println!("{label}: exact");
+    }
+}
+
 #[test]
 fn vulkan_dense_import_matches_host_for_all_nine_pairs() {
     if let Some(device) = device(seismic::BackendName::Vulkan) {

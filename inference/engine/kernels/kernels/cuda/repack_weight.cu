@@ -62,6 +62,12 @@ static_assert(GROUP % TILE_COLUMNS == 0, "a tile lies in one group");
 // rows starts in its own bank).
 __host__ __device__ constexpr u32 odd_words(u32 words) { return words % 2 == 0 ? words + 1 : words; }
 
+// The widest store unit, to 16 bytes, that `bytes` bytes keep: its largest
+// power-of-two divisor (`seismic_lang::repack::alignment`).
+__host__ __device__ constexpr u32 alignment(u32 bytes) {
+    return (bytes & (0u - bytes)) < 16u ? (bytes & (0u - bytes)) : 16u;
+}
+
 // A staged row's words (`SEISMIC_CONVERSION_E_U_STAGE_WORDS`), padded.
 #define STAGE_WORDS odd_words((u32)SEISMIC_CONVERSION_E_U_STAGE_WORDS)
 
@@ -511,7 +517,9 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
     // A unit of whole k-blocks: per k-block the row's entry bytes, and its
     // entries' high bits ([k-block][row][the row's high bytes], placed as
     // the entries are) from the unit's high words, entry e at bit
-    // ENTRY_BITS e.
+    // ENTRY_BITS e. A row's k-block bytes sit at a multiple of KBLOCK from a
+    // 16-byte-aligned plane, and KBLOCK need not be a power of two (iq3s's
+    // eight 3-byte entries: 24), so they are stored in units KBLOCK keeps.
     static_assert(TILE_COLUMNS % 64 == 0, "a unit of whole k-blocks");
     if (lane < rows) {
         constexpr u32 SPANS = TILE_COLUMNS / 64;
@@ -523,7 +531,7 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
             store(tile_plane_byte(destination, seismic_words_value, b, row0 + lane - r,
                                   (block * MMA_ROWS + r) * KBLOCK, SEISMIC_RESULT_0_ROW_CODES_BYTES,
                                   SEISMIC_RESULT_0_ROW_CODES),
-                  words + span * KBLOCK / 4, KBLOCK, KBLOCK < 16 ? KBLOCK : 16);
+                  words + span * KBLOCK / 4, KBLOCK, alignment(KBLOCK));
 #if defined(SEISMIC_ELEMENT_U_PLANE_GRID_HIGH)
             constexpr u32 HIGH = SEISMIC_ELEMENT_U_PLANE_GRID_HIGH_ENTRY_BITS; // bytes a row's k-block
             static_assert(4 * HIGH_WORDS == SPANS * HIGH && (HIGH == 2 || HIGH == 4), "a k-block's high bits");
