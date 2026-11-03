@@ -106,9 +106,14 @@ const memoryFitLabel = (assessment: ModelAssessment): string => {
 /** How to read an estimated speed: arithmetic over this machine's measurements, not a benchmark. */
 export const localModelSpeedNote = "Rough estimate. Does not account for speculative decoding."
 
+/** The context depths an estimated speed's range is shown at, capped at the model's context length. */
+export const localModelSpeedRangeContexts = [25_000, 75_000] as const
+
+const thousands = (tokens: number): string => `${tokens / 1_000}K`
+
 /** The explanation behind an estimated speed's info icon. */
 export const localModelSpeedTooltip =
-  "Estimated from measurements of your machine running Magnitude's own kernels. Actual performance will differ. Does not include speculative decoding."
+  `Decode speed with ${localModelSpeedRangeContexts.map(thousands).join("–")} tokens of context; short conversations decode faster. Estimated from measurements of your machine running Magnitude's own kernels. Actual performance will differ. Does not include speculative decoding.`
 
 /** The estimate whose context depth is nearest `contextTokens`. */
 const nearestSample = (
@@ -135,10 +140,9 @@ export const performanceRangeSpeedLabel = (
     case "Pending": return measurementLabel(performance.measurement)
     case "Unavailable": return performance.failure.message
     case "Estimated": {
-      const speeds = [
-        nearestSample(performance.samples, Math.min(25_000, contextLength)),
-        nearestSample(performance.samples, Math.min(75_000, contextLength)),
-      ].map(({ estimatedTokensPerSecond }) => Math.round(estimatedTokensPerSecond))
+      const speeds = localModelSpeedRangeContexts
+        .map((contextTokens) => nearestSample(performance.samples, Math.min(contextTokens, contextLength)))
+        .map(({ estimatedTokensPerSecond }) => Math.round(estimatedTokensPerSecond))
       const lower = Math.min(...speeds)
       const upper = Math.max(...speeds)
       return lower === upper ? `~${lower} tok/s` : `~${lower}–${upper} tok/s`

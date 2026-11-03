@@ -2,7 +2,7 @@ import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import { ModelVariantLabelSchema, type CustomLocalModel } from "@magnitudedev/sdk"
 import { makeFoundModel, makeSetupModel } from "../application/fixtures/model"
-import { localModelRadarAxes, normalizeLocalModelRadarSpeed } from "./local-model-radar"
+import { localModelRadarAxes, localModelSpeedTooltip, normalizeLocalModelRadarSpeed } from "./local-model-radar"
 
 const axis = (model: Parameters<typeof localModelRadarAxes>[0], label: string) =>
   Option.getOrThrow(localModelRadarAxes(model)).find((candidate) => candidate.label === label)!
@@ -17,6 +17,10 @@ const withQuantization = (quantization: string, quantizationName: string, varian
 }
 
 describe("local model radar", () => {
+  it("says which context depths the speed range is estimated at", () => {
+    expect(localModelSpeedTooltip).toContain("25K–75K tokens of context")
+  })
+
   it("never rates a custom model's intelligence", () => {
     const intelligence = axis(makeFoundModel(), "INTELLIGENCE")
     expect(intelligence.value).toEqual(Option.none())
