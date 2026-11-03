@@ -751,12 +751,9 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             let _ = waiter.reply.send(Err(Self::inventory_failure(failure)));
             return;
         }
-        if self.package_removal_active || !self.package_removals.is_empty() {
-            self.enqueue(waiter);
-            return;
-        }
+        // A package removal excludes only new loads: demand for the current instance joins it.
+        let removing = self.package_removal_active || !self.package_removals.is_empty();
         match &mut self.state {
-            ResidencyState::Vacant => self.start_loading(waiter),
             ResidencyState::Loading(loading)
                 if loading.instance.model_id == waiter.target.model_id
                     && loading.configuration_key == waiter.target.configuration_key =>
@@ -770,6 +767,8 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             {
                 self.grant_ready(waiter);
             }
+            _ if removing => self.enqueue(waiter),
+            ResidencyState::Vacant => self.start_loading(waiter),
             ResidencyState::Loading(_) | ResidencyState::Releasing(_) => {
                 self.enqueue(waiter);
             }
@@ -2126,6 +2125,59 @@ mod tests {
         assert_eq!(model_id, "model-a:gguf:test");
         client.stop(instance_id).await.expect("load stopped");
         assert_explicit_stop(request.await.expect("request waiter"));
+        actor.abort();
+    }
+
+    /// Overnight soak: removing another installed model while a resident one served requests
+    /// released the resident with reason Replacement once the removal ended, because a request
+    /// for the resident arriving during the removal was queued as a load.
+    #[tokio::test]
+    async fn a_package_removal_neither_delays_nor_replaces_requests_for_the_resident_model() {
+        let (client, mut loads, workers, actor) = test_residency(true);
+        let serving = client
+            .acquire(
+                test_target("model-a"),
+                ResidencyAcquisition::Inference { progress: None },
+            )
+            .await
+            .expect("first acquisition");
+        let _ = loads.recv().await.expect("resident load");
+        let permit = client
+            .acquire_package_removal(vec![ModelPackageId("removed-package".to_owned())])
+            .await
+            .expect("removal of another model's package admitted");
+        let during = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.acquire(
+                test_target("model-a"),
+                ResidencyAcquisition::Inference { progress: None },
+            ),
+        )
+        .await
+        .expect("a request for the resident model is not queued behind the removal")
+        .expect("a request for the resident model is granted during the removal");
+        assert!(matches!(during, ResidencyGrant::Lease(_)));
+        drop(permit);
+        drop(during);
+        drop(serving);
+        let after = client
+            .acquire(test_target("model-a"), ResidencyAcquisition::Warm)
+            .await
+            .expect("the resident model is still granted");
+        assert!(matches!(after, ResidencyGrant::Ready(_)));
+        assert!(loads.try_recv().is_err(), "nothing was loaded again");
+        assert_eq!(
+            workers.lock().expect("test worker lock")[0]
+                .shutdown
+                .load(Ordering::Acquire),
+            0,
+            "the resident model was not released"
+        );
+        let snapshot = client.snapshot().await.unwrap();
+        assert!(matches!(
+            snapshot.instances.last().map(|instance| &instance.lifecycle),
+            Some(ModelInstanceLifecycle::Ready { .. })
+        ));
         actor.abort();
     }
 
