@@ -956,6 +956,84 @@
           "url": "https://artificialanalysis.ai/models/glm-5-2"
         }
       }
+    },
+    {
+      "id": "d3-ultra",
+      "displayName": "vLLM-SR d3-ultra 27B",
+      "description": "Large vLLM Semantic Router decision model built on Qwen3.8 27B: calibrated answers to typed questions about text and images, without generating text.",
+      "releaseDate": "2026-10-26",
+      "parameterization": { "architecture": "dense", "totalParameters": 26085330160 },
+      "support": { "level": "supported" },
+      "sources": [
+        {
+          "repository": "magnitudedev/d3-ultra-GGUF",
+          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "projector": { "path": "mmproj-d3-ultra-BF16.gguf" },
+          "license": "apache-2.0"
+        }
+      ]
+    },
+    {
+      "id": "mammoth-1",
+      "displayName": "Base Labs mammoth-1 27B",
+      "description": "Large Base Labs decision model built on Qwen3.5 27B: calibrated answers to many typed questions about text from one shared prefill, without generating text.",
+      "releaseDate": "2026-10-21",
+      "parameterization": { "architecture": "dense", "totalParameters": 27356728560 },
+      "support": { "level": "supported" },
+      "sources": [
+        {
+          "repository": "magnitudedev/mammoth-1-GGUF",
+          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "license": "mit"
+        }
+      ]
+    },
+    {
+      "id": "elephant-1",
+      "displayName": "Base Labs elephant-1 9B",
+      "description": "Small Base Labs decision model built on Qwen3.5 9B: calibrated answers to many typed questions about text from one shared prefill, without generating text.",
+      "releaseDate": "2026-10-21",
+      "parameterization": { "architecture": "dense", "totalParameters": 9409813744 },
+      "support": { "level": "supported" },
+      "sources": [
+        {
+          "repository": "magnitudedev/elephant-1-GGUF",
+          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "license": "mit"
+        }
+      ]
+    },
+    {
+      "id": "pplx-decider-flash-v1.2",
+      "displayName": "Perplexity Decider Flash v1.2 4B",
+      "description": "Compact Perplexity decision model built on Qwen3.5 4B: calibrated answers to typed questions about text and images, without generating text.",
+      "releaseDate": "2026-10-16",
+      "parameterization": { "architecture": "dense", "totalParameters": 4539265536 },
+      "support": { "level": "supported" },
+      "sources": [
+        {
+          "repository": "magnitudedev/pplx-decider-flash-v1.2-GGUF",
+          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "projector": { "path": "mmproj-pplx-decider-flash-v1.2-BF16.gguf" },
+          "license": "apache-2.0"
+        }
+      ]
+    },
+    {
+      "id": "d1-2b",
+      "displayName": "Liquid d1 2B",
+      "description": "Compact Liquid decision model built on LFM3-VL 2B: calibrated answers to typed questions about text and images, without generating text.",
+      "releaseDate": "2026-10-27",
+      "parameterization": { "architecture": "dense", "totalParameters": 1918181888 },
+      "support": { "level": "supported" },
+      "sources": [
+        {
+          "repository": "magnitudedev/d1-2B-GGUF",
+          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+          "projector": { "path": "mmproj-d1-2B-BF16.gguf" },
+          "license": "lfm1.0"
+        }
+      ]
     }
   ]
 }

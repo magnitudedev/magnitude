@@ -13,3 +13,4 @@ seismic/hardware/results/
 solver/lab/results/
 solver/lab/evidence/
 solver/lab/**/__pycache__/
+catalog/conversions/__pycache__/

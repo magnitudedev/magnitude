@@ -1,0 +1,153 @@
+{#- Liquid d1-2B, as its repository 97c5704 renders a set of questions (prompt.py: `prefix_text`, `suffix_layout`,
+    `question_block`, `marked_suffix`; attention.py `pack_set`) under the checkpoint's prompt 1, codes scheme 2 and
+    no system turn, in LFM3's frame with its empty thought. The state block is the sequence start, the user turn's
+    images and the state with `QUESTION:`; each further question of the set repeats that header. A noul, choice,
+    score and estimate are read at their last token, every other kind at the colon of each named marker after the
+    answer header. The state's text is placed by its read anchor, as reads index it. A boxes question reading fewer
+    blocks than prompt 1's most ends on the newline a next block would follow, as the reference writes it where its
+    tokenizer takes the colon and the newline as one token, which LFM3 does after every marker. The context and
+    anchors are the decision crate's (engine/decision/KEYS.md). -#}
+{%- macro show(parts) -%}
+    {#- Request text only: the description places images before the state alone. -#}
+    {%- for part in parts -%}
+        {{- part -}}
+    {%- endfor -%}
+{%- endmacro -%}
+{%- macro text(value, what) -%}
+    {#- A value d1 reads as text: a string as written. -#}
+    {%- if value.kind != "string" -%}
+        {{- raise_exception("d1 reads " ~ what ~ " as text") -}}
+    {%- endif -%}
+    {{- show(value.text) -}}
+{%- endmacro -%}
+{%- macro legend(question) -%}
+    {%- set codes = question.codes -%}
+    {%- if question.grid.numbers -%}
+        {{- "Each edge is a number from " ~ codes[0] ~ " to " ~ codes[codes | length - 1] ~ ", in thousandths of the picture: top and bottom from its top edge, left and right from its left edge." -}}
+    {%- else -%}
+        {{- "Each edge is a code on a " ~ question.grid.size ~ "-value scale: " ~ codes[0] ~ " is 0 (top or left), " ~ codes[codes | length - 1] ~ " is 1 (bottom or right). Values are equally spaced." -}}
+    {%- endif -%}
+{%- endmacro -%}
+{%- macro slot(index) -%}
+    {{- "﷐slot:" ~ index ~ "﷑" -}}
+{%- endmacro -%}
+{%- set box = namespace(any=false) -%}
+{%- for question in request_questions -%}
+    {%- if question.kind == "box" or question.kind == "boxes" -%}{%- set box.any = true -%}{%- endif -%}
+{%- endfor -%}
+{%- if box.any and images | length != 1 -%}
+    {{- raise_exception("a box or boxes question reads exactly one picture; this request has " ~ images | length) -}}
+{%- endif -%}
+{#- The state block. -#}
+{{- "<|startoftext|><|im_start|>user\n" -}}
+{%- for image in images -%}
+    {{- "﷐image:" ~ image ~ "﷑" -}}
+{%- endfor -%}
+{%- if state.kind != "none" -%}
+    {%- if state.kind == "string" -%}
+        {{- "﷐read:text﷑" -}}
+    {%- else -%}
+        {{- "﷐read:indented﷑" -}}
+    {%- endif -%}
+    {{- "\n\n\nQUESTION:\n" -}}
+{%- endif -%}
+{{- "﷐state﷑" -}}
+{#- The questions. -#}
+{%- for question in questions -%}
+    {%- set index = loop.index0 -%}
+    {%- if index > 0 -%}
+        {{- "﷐question:" ~ index ~ "﷑" -}}
+        {%- if state.kind != "none" -%}{{- "QUESTION:\n" -}}{%- endif -%}
+    {%- endif -%}
+    {%- if question.instructions.kind != "string" or question.instructions.stripped | length == 0 -%}
+        {{- raise_exception("d1 needs the question's instructions") -}}
+    {%- endif -%}
+    {{- show(question.instructions.text) -}}
+    {%- set codes = question.codes -%}
+    {%- set markers = namespace(names=[]) -%}
+    {%- if question.kind == "noul" -%}
+        {%- if question.truthy.kind != "none" or question.falsy.kind != "none" -%}
+            {%- for label, value in [("\nYes: ", question.truthy), ("\nNo: ", question.falsy)] -%}
+                {{- label -}}
+                {%- if value.kind == "none" -%}{{- "None" -}}{%- else -%}{{- text(value, "a noul's criteria") -}}{%- endif -%}
+            {%- endfor -%}
+        {%- endif -%}
+        {{- "\n\nReply with yes or no only." -}}
+    {%- elif question.kind == "choice" -%}
+        {{- "\n\nOptions:\n" -}}
+        {%- for option in question.options -%}
+            {%- if not loop.first -%}{{- "\n" -}}{%- endif -%}
+            {{- codes[loop.index0] ~ " " -}}
+            {%- if option.description.kind == "none" or not option.description.truthy -%}
+                {%- if option.description.kind not in ["none", "string"] -%}
+                    {{- raise_exception("d1 reads a choice's descriptions as text") -}}
+                {%- endif -%}
+                {{- option.key | replace("_", " ") -}}
+            {%- else -%}
+                {{- text(option.description, "a choice's descriptions") -}}
+            {%- endif -%}
+        {%- endfor -%}
+        {{- "\n\nReply with the option code only." -}}
+    {%- elif question.kind == "multiple" -%}
+        {{- "\n\nOptions:\n" -}}
+        {%- for option in question.options -%}
+            {%- if not loop.first -%}{{- "\n" -}}{%- endif -%}
+            {{- show(option.label.line) ~ ": " -}}
+            {%- if option.description.kind == "none" or not option.description.truthy -%}
+                {%- if option.description.kind not in ["none", "string"] -%}
+                    {{- raise_exception("d1 reads a choice's descriptions as text") -}}
+                {%- endif -%}
+                {{- option.key -}}
+            {%- else -%}
+                {{- text(option.description, "a choice's descriptions") -}}
+            {%- endif -%}
+        {%- endfor -%}
+        {{- "\n\nReply with yes or no for each option." -}}
+    {%- elif question.kind == "score" -%}
+        {{- "\n\n" -}}
+        {%- for level in question.levels -%}
+            {%- if not loop.first -%}{{- "\n" -}}{%- endif -%}
+            {{- loop.index0 ~ " " -}}{{- text(level, "a score's levels") -}}
+        {%- endfor -%}
+        {{- "\n\nReply with a single digit 0-" ~ (question.levels | length - 1) ~ " only." -}}
+    {%- elif question.kind == "read" -%}
+        {{- "\n\nRead the " ~ question.value -}}
+        {%- if question.value == "number" and question.unit.truthy -%}
+            {{- " (unit: " -}}{{- show(question.unit.text) -}}{{- ")" -}}
+        {%- endif -%}
+        {{- " from the state, or nothing if it is absent." -}}
+        {%- set markers.names = ["start", "end"] -%}
+    {%- elif question.kind == "estimate" -%}
+        {%- set grid = question.grid -%}
+        {{- "\n\nEstimate from " ~ grid.low ~ " to " ~ grid.high -}}
+        {%- if question.unit.kind != "none" -%}{{- " " -}}{{- show(question.unit.text) -}}{%- endif -%}
+        {%- if grid.numbers -%}
+            {{- ", in steps of " ~ grid.step ~ ". Reply with the number only." -}}
+        {%- else -%}
+            {{- " on " ~ grid.size ~ " equally spaced values, step " ~ grid.step ~ ": " ~ codes[0] ~ " is " ~ grid.low ~ ", " ~ codes[codes | length - 1] ~ " is " ~ grid.high ~ ". Reply with the code only." -}}
+        {%- endif -%}
+    {%- elif question.kind == "box" -%}
+        {{- "\n\nPresence is yes or no. " ~ legend(question) ~ " Reply with yes or no at present, then " ~ ("one number" if question.grid.numbers else "one code") ~ " at top, bottom, left and right." -}}
+        {%- set markers.names = ["present", "top", "bottom", "left", "right"] -%}
+    {%- else -%}
+        {{- "\n\nEvery one of them, " ~ question.most ~ " at most, in reading order (left edge, then top). Present k is yes when there are at least k. " ~ legend(question) ~ " Reply with yes or no at each present, then its top, bottom, left and right." -}}
+        {%- for block in range(1, question.max + 1) -%}
+            {%- for name in ["present", "top", "bottom", "left", "right"] -%}
+                {%- set markers.names = markers.names + [name ~ " " ~ block] -%}
+            {%- endfor -%}
+        {%- endfor -%}
+    {%- endif -%}
+    {{- "<|im_end|>\n<|im_start|>assistant\n<think></think>" -}}
+    {%- if question.kind == "multiple" -%}
+        {#- Each option's marker is its name as JSON writes it, request text. -#}
+        {%- for option in question.options -%}
+            {%- if not loop.first -%}{{- "\n" -}}{%- endif -%}
+            {{- show(option.label.line) -}}{{- ":" ~ slot(index) -}}
+        {%- endfor -%}
+    {%- endif -%}
+    {%- for name in markers.names -%}
+        {%- if not loop.first -%}{{- "\n" -}}{%- endif -%}
+        {{- name ~ ":" ~ slot(index) -}}
+    {%- endfor -%}
+    {%- if question.kind == "boxes" and question.max < question.most -%}{{- "\n" -}}{%- endif -%}
+{%- endfor -%}

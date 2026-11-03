@@ -1,0 +1,78 @@
+{#- Base Labs mammoth-1 and elephant-1, as OneJev `qev` 81ce62f with Base Labs' serve.patch renders
+    them (prompt `qev-labels-v2`, qev/prompt.py): the system line, a user turn of the `<state>` block
+    then the question, and Qwen3.5's assistant header with thinking off. One question per rendering,
+    read at its last token; the state ends after its block. The context and anchors are the decision
+    crate's (engine/decision/src/prompt.rs). -#}
+{%- macro entry(value) -%}
+    {#- render_entry: a string stripped, JSON indented by two, nothing for null. -#}
+    {%- if value.kind == "string" -%}
+        {{- value.stripped | join -}}
+    {%- elif value.kind == "json" -%}
+        {{- value.indented | join -}}
+    {%- endif -%}
+{%- endmacro -%}
+{%- macro blank(value) -%}
+    {{- "" if value.kind == "json" or (value.kind == "string" and value.stripped | length > 0) else "blank" -}}
+{%- endmacro -%}
+{%- macro line(code, name, value) -%}
+    {#- _options_lines: `X. name: text`, or `X. name` without text. -#}
+    {{- code ~ ". " ~ name -}}
+    {%- if not blank(value) -%}
+        {{- ": " ~ entry(value) -}}
+    {%- endif -%}
+{%- endmacro -%}
+{{- "<|im_start|>system\nApply the question to the state. Choose exactly one of the listed options. Respond with only its uppercase letter, with no explanation or reasoning.<|im_end|>\n<|im_start|>user\n<state>\n" -}}
+{#- render_state: a string as written, JSON indented by two, nothing for null. -#}
+{%- if state.kind == "string" -%}
+    {{- state.text | join -}}
+{%- elif state.kind == "json" -%}
+    {{- state.indented | join -}}
+{%- endif -%}
+{{- "\n</state>\n\n﷐state﷑" -}}
+{%- for question in questions -%}
+    {%- if question.kind == "score" -%}
+        {%- set header = "Rate the state:" -%}
+        {%- set default = "Which level describes the state?" -%}
+    {%- elif question.kind == "choice" -%}
+        {%- set header = "Question:" -%}
+        {%- set default = "Which option applies to the state?" -%}
+    {%- else -%}
+        {%- set header = "Question:" -%}
+        {%- set default = "Is the statement true, or is the answer to the question yes?" -%}
+    {%- endif -%}
+    {{- header ~ " " -}}
+    {%- if blank(question.instructions) -%}
+        {{- default -}}
+    {%- else -%}
+        {{- entry(question.instructions) -}}
+    {%- endif -%}
+    {{- "\n\nOptions:\n" -}}
+    {%- set codes = question.codes -%}
+    {%- if question.kind == "noul" -%}
+        {#- yes (true) then no; a description left out takes the default. -#}
+        {%- if question.truthy.kind == "none" -%}
+            {{- codes[0] ~ ". yes: the statement is true / the answer is yes" -}}
+        {%- else -%}
+            {{- line(codes[0], "yes", question.truthy) -}}
+        {%- endif -%}
+        {{- "\n" -}}
+        {%- if question.falsy.kind == "none" -%}
+            {{- codes[1] ~ ". no: the statement is false / the answer is no" -}}
+        {%- else -%}
+            {{- line(codes[1], "no", question.falsy) -}}
+        {%- endif -%}
+    {%- elif question.kind == "choice" -%}
+        {%- for option in question.options -%}
+            {%- if not loop.first -%}{{- "\n" -}}{%- endif -%}
+            {{- line(codes[loop.index0], option.key, option.description) -}}
+        {%- endfor -%}
+    {%- else -%}
+        {%- for level in question.levels -%}
+            {%- if not loop.first -%}{{- "\n" -}}{%- endif -%}
+            {{- line(codes[loop.index0], "level " ~ loop.index0, level) -}}
+        {%- endfor -%}
+    {%- endif -%}
+    {{- "\n\nAnswer with one letter: " if codes | length <= 26 else "\n\nAnswer with one label: " -}}
+    {{- codes | join(", ") ~ "." -}}
+{%- endfor -%}
+{{- "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n" -}}

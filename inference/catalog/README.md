@@ -18,6 +18,16 @@ exact `path` instead.
 A catalog entry declares no context length. Its serving profile is the target's supported maximum
 context from its GGUF metadata, which is the context the engine resolves, serves and assesses.
 
+Nor does an entry declare what its model serves. A target whose GGUF header carries a decision
+description (its decision template `tokenizer.chat_template.decision`) serves decisions only and
+every other target serves chat, read
+from the locked target header when the bundle is generated and carried in its planner input, so the
+catalog knows it before download.
+
+A chat model's entry declares its `artificialAnalysis` score; a decision model's declares none, since
+the Intelligence Index measures generated text. Generation joins the score to what the header serves
+(`serves: chat` with its intelligence, or `decisions`) and refuses either declared the other way.
+
 ```sh
 cargo run --release -p magnitude-service-catalog-tool -- update-lock ...   # advance the commit map
 cargo run --release -p magnitude-service-catalog-tool -- build-bundle ...  # build the header bundle
@@ -33,6 +43,56 @@ cargo run --release -p magnitude-service-catalog-tool -- slice --output FILE hub
 large to run whole, with a provenance record beside it. `header`, `weight-sample` and `slice` read
 a `local PATH` or a `hub --repository REPO --revision REV --path PATH --model-store DIR` file; a
 Hub file is read by range requests only, through the model store's Hub client.
+
+`conversions/decision.py` writes a `magnitudedev` decision GGUF from a decision model's
+safetensors checkpoint: the base architecture through llama.cpp's converter at its pinned revision,
+plus the decision description it writes for the checkpoint it recognizes (the decision template
+from `conversions/decision-templates/`, the `decision.*` keys of
+`engine/decision/KEYS.md`, `<arch>.attention.causal = false`) and, for a description read through
+a readout head, the head as `decision.readout.weight` in its reference dtype. It takes a llama.cpp
+checkout at the pinned revision and a local snapshot of the checkpoint's repository (weights,
+configuration, tokenizer), from `inference/`:
+
+```sh
+uv run --script catalog/conversions/decision.py convert --llama-cpp LLAMA_CPP --checkpoint CHECKPOINT \
+    --output OUT --name NAME
+python3 catalog/conversions/decision.py describe --checkpoint CHECKPOINT --output FILE  # the description alone
+```
+
+| Checkpoint | `--name` | Template | Writes (`OUT/`) | Readout |
+|---|---|---|---|---|
+| `vllm-sr/d3-ultra` | `d3-ultra` | `d3-header-v1` | `d3-ultra-BF16.gguf`, `mmproj-d3-ultra-BF16.gguf` | F32 readout head |
+| `baselabs/mammoth-1` | `mammoth-1` | `qev-labels-v2` | `mammoth-1-BF16.gguf` | slot labels from the LM head |
+| `baselabs/elephant-1` | `elephant-1` | `qev-labels-v2` | `elephant-1-BF16.gguf` | slot labels from the LM head |
+| `perplexity-ai/pplx-decider-flash-v1.2` | `pplx-decider-flash-v1.2` | `joint-question-inline-readout-v1` | `pplx-decider-flash-v1.2-BF16.gguf`, `mmproj-pplx-decider-flash-v1.2-BF16.gguf` | BF16 readout head |
+| `LiquidAI/d1-2B` | `d1-2B` | `d1-prompt-v1` | `d1-2B-BF16.gguf`, `mmproj-d1-2B-BF16.gguf` | option codes' spellings from the LM head |
+
+Base Labs' reference applies its block layout to text only, so their conversions serve no images
+and write no projector; d3-ultra's and pplx-decider's projectors are llama.cpp's own conversion of
+their vision towers, and d1-2B's is llama.cpp's LFM3-VL projector, its text model llama.cpp's LFM3
+conversion of the same weights (without llama.cpp's own d1 type and template, which the description
+replaces).
+
+Each model's variants are the catalog's `gguf:q4` (`Q4_K_M`), `gguf:q5` (`Q5_K_M`), `gguf:q6`
+(`Q6_K`) and `gguf:q8` (`Q8_0`), published as `magnitudedev/<NAME>-GGUF` (`NAME` the conversion's
+`--name`) and quantized from the BF16 conversion with llama.cpp's `llama-quantize` at the same
+revision. A description read through a readout head keeps the head in its reference dtype, which
+the engine requires (F32 or BF16), so its quantization names that dtype:
+
+```sh
+llama-quantize --tensor-type decision.readout=f32  d3-ultra-BF16.gguf d3-ultra-Q4_K_M.gguf Q4_K_M
+llama-quantize --tensor-type decision.readout=bf16 pplx-decider-flash-v1.2-BF16.gguf pplx-decider-flash-v1.2-Q8_0.gguf Q8_0
+llama-quantize mammoth-1-BF16.gguf mammoth-1-Q4_K_M.gguf Q4_K_M   # no readout head: no override
+```
+
+A GGUF converted while the description's keys were under `<arch>.decision.` is rewritten with each
+under `decision.` in its place, every other key and every tensor byte unchanged, so a published
+quantization moves without being quantized again:
+
+```sh
+uv run --script catalog/conversions/decision.py rename-namespace --llama-cpp LLAMA_CPP \
+    --input d3-ultra-Q4_K_M.gguf --output OUT/d3-ultra-Q4_K_M.gguf
+```
 
 `acquire` resolves one catalog model at its locked revisions, downloads into a managed model store
 only the target, drafter and projector files that are missing, verifies them through the service's
