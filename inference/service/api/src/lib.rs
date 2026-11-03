@@ -1758,62 +1758,53 @@ fn offered_capabilities(
         })
         .flatten()
         .filter_map(|entry| match &entry.state {
-            ModelAssessmentEntryState::Assessed {
-                capabilities,
-                profiles,
-                ..
-            } if matches!(profiles.first(), Some(ModelAssessment::Fits { .. })) => {
-                Some((entry.subject.clone(), capabilities.clone()))
-            }
-            ModelAssessmentEntryState::Assessed { .. }
-            | ModelAssessmentEntryState::Assessing
-            | ModelAssessmentEntryState::Dropped => None,
+            ModelAssessmentEntryState::Assessed { profiles, .. } => match profiles.first() {
+                Some(ModelAssessment::Fits { capabilities, .. }) => {
+                    Some((entry.subject.clone(), capabilities.clone()))
+                }
+                Some(ModelAssessment::DoesNotFit { .. } | ModelAssessment::Unsupported { .. })
+                | None => None,
+            },
+            ModelAssessmentEntryState::Assessing | ModelAssessmentEntryState::Dropped => None,
         })
         .collect()
 }
 
-/// An offered model's OpenAI listing entry. A model that supports reasoning but has no default
-/// effort is an incomplete assessment: it is left out of the listing rather than taking down every
-/// other model's entry.
+/// An offered model's OpenAI listing entry. A chat model lists the chat parameters it takes; a
+/// decision model outputs decisions and takes none. A chat model that supports reasoning but has no
+/// default effort is an incomplete assessment: it is left out of the listing rather than taking down
+/// every other model's entry.
 fn open_ai_model(
     id: String,
     owned_by: &'static str,
     name: String,
     description: String,
     context_length: u32,
-    capabilities: magnitude_service_contracts::models::ModelCapabilities,
+    capabilities: ModelCapabilities,
 ) -> Option<OpenAiModel> {
-    let mut supported_parameters = vec!["max_tokens"];
-    if capabilities.tools {
-        supported_parameters.extend(["tools", "tool_choice"]);
-    }
-    if capabilities.structured_output {
-        supported_parameters.extend(["structured_outputs", "response_format"]);
-    }
-    let reasoning = match (
-        capabilities.reasoning.supported,
-        capabilities.reasoning.default_effort,
-    ) {
-        (false, _) => None,
-        (true, Some(default_effort)) => {
-            supported_parameters.push("reasoning");
-            Some(OpenAiModelReasoning {
-                default_enabled: default_effort != "none",
-                mandatory: !capabilities
-                    .reasoning
-                    .efforts
-                    .iter()
-                    .any(|effort| effort == "none"),
-                supported_efforts: capabilities.reasoning.efforts,
-                default_effort,
-            })
-        }
-        (true, None) => return None,
-    };
     let mut input_modalities = vec!["text"];
-    if capabilities.vision {
+    if capabilities.vision() {
         input_modalities.push("image");
     }
+    let (output_modalities, supported_parameters, reasoning, max_completion_tokens) =
+        match capabilities {
+            ModelCapabilities::Chat {
+                tools,
+                structured_output,
+                reasoning,
+                ..
+            } => {
+                let (supported_parameters, reasoning) =
+                    chat_parameters(tools, structured_output, reasoning)?;
+                (
+                    vec!["text"],
+                    supported_parameters,
+                    reasoning,
+                    context_length.min(CONNECTOR_MAX_OUTPUT_TOKENS),
+                )
+            }
+            ModelCapabilities::Decisions { .. } => (vec!["decisions"], Vec::new(), None, 0),
+        };
     Some(OpenAiModel {
         id,
         object: "model",
@@ -1824,15 +1815,45 @@ fn open_ai_model(
         context_length,
         architecture: OpenAiModelArchitecture {
             input_modalities,
-            output_modalities: vec!["text"],
+            output_modalities,
         },
         supported_parameters,
         reasoning,
         top_provider: OpenAiTopProvider {
             context_length,
-            max_completion_tokens: context_length.min(CONNECTOR_MAX_OUTPUT_TOKENS),
+            max_completion_tokens,
         },
     })
+}
+
+/// A chat model's supported parameters and reasoning, or none when it supports reasoning without a
+/// default effort.
+fn chat_parameters(
+    tools: bool,
+    structured_output: bool,
+    reasoning: magnitude_service_contracts::models::ModelReasoningCapabilities,
+) -> Option<(Vec<&'static str>, Option<OpenAiModelReasoning>)> {
+    let mut supported_parameters = vec!["max_tokens"];
+    if tools {
+        supported_parameters.extend(["tools", "tool_choice"]);
+    }
+    if structured_output {
+        supported_parameters.extend(["structured_outputs", "response_format"]);
+    }
+    let reasoning = match (reasoning.supported, reasoning.default_effort) {
+        (false, _) => None,
+        (true, Some(default_effort)) => {
+            supported_parameters.push("reasoning");
+            Some(OpenAiModelReasoning {
+                default_enabled: default_effort != "none",
+                mandatory: !reasoning.efforts.iter().any(|effort| effort == "none"),
+                supported_efforts: reasoning.efforts,
+                default_effort,
+            })
+        }
+        (true, None) => return None,
+    };
+    Some((supported_parameters, reasoning))
 }
 
 #[derive(OpenApi)]
@@ -2288,10 +2309,7 @@ mod tests {
     use magnitude_service_contracts::models::{
         ModelAssessmentsInvalidation, ModelInstanceAllocation, ModelInstanceLifecycle,
     };
-    use magnitude_serving::{
-        HostChat, LoadProgress, ModelInvocation, ModelUnavailable, ServedModels, Serving,
-        ServingError,
-    };
+    use magnitude_serving::{ModelUnavailable, ResolvedModel, ServedModels, Serving, ServingError};
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
@@ -2299,16 +2317,7 @@ mod tests {
     struct NoModels;
 
     impl ServedModels for NoModels {
-        fn invoke(
-            &self,
-            model: &str,
-            _progress: Option<LoadProgress>,
-        ) -> BoxFuture<'_, Result<Box<dyn ModelInvocation>, ServingError>> {
-            let model = model.to_owned();
-            Box::pin(async move { Err(ServingError::Model(ModelUnavailable::NotFound(model))) })
-        }
-
-        fn host(&self, model: &str) -> BoxFuture<'_, Result<Arc<dyn HostChat>, ServingError>> {
+        fn resolve(&self, model: &str) -> BoxFuture<'_, Result<ResolvedModel<'_>, ServingError>> {
             let model = model.to_owned();
             Box::pin(async move { Err(ServingError::Model(ModelUnavailable::NotFound(model))) })
         }
@@ -2326,7 +2335,7 @@ mod tests {
             "Local Model".to_owned(),
             "Local fixture.".to_owned(),
             65_536,
-            magnitude_service_contracts::models::ModelCapabilities {
+            ModelCapabilities::Chat {
                 vision: true,
                 tools: true,
                 structured_output: true,
@@ -2358,6 +2367,30 @@ mod tests {
                 .expect("parameters")
                 .contains(&json!("reasoning"))
         );
+        assert_eq!(value["architecture"]["output_modalities"], json!(["text"]));
+    }
+
+    /// A decision model outputs decisions and takes no chat parameters.
+    #[test]
+    fn openai_model_discovery_lists_a_decision_model_by_its_output() {
+        let model = open_ai_model(
+            "local/decider".to_owned(),
+            "magnitude",
+            "Decider".to_owned(),
+            "Decision fixture.".to_owned(),
+            65_536,
+            ModelCapabilities::Decisions { vision: true },
+        )
+        .expect("listed model");
+
+        let value = serde_json::to_value(model).expect("serializable model");
+        assert_eq!(
+            value["architecture"],
+            json!({ "input_modalities": ["text", "image"], "output_modalities": ["decisions"] })
+        );
+        assert_eq!(value["supported_parameters"], json!([]));
+        assert!(value.get("reasoning").is_none());
+        assert_eq!(value["top_provider"]["max_completion_tokens"], 0);
     }
 
     #[tokio::test]
@@ -3083,6 +3116,16 @@ mod tests {
 
     fn fits_assessment() -> ModelAssessment {
         ModelAssessment::Fits {
+            capabilities: ModelCapabilities::Chat {
+                vision: false,
+                tools: true,
+                structured_output: false,
+                reasoning: magnitude_service_contracts::models::ModelReasoningCapabilities {
+                    supported: false,
+                    efforts: Vec::new(),
+                    default_effort: None,
+                },
+            },
             profile: ServingProfile {
                 context_length: 8192,
             },
@@ -3776,6 +3819,16 @@ mod tests {
 
     fn does_not_fit_assessment() -> ModelAssessment {
         ModelAssessment::DoesNotFit {
+            capabilities: ModelCapabilities::Chat {
+                vision: false,
+                tools: true,
+                structured_output: false,
+                reasoning: magnitude_service_contracts::models::ModelReasoningCapabilities {
+                    supported: false,
+                    efforts: Vec::new(),
+                    default_effort: None,
+                },
+            },
             profile: ServingProfile {
                 context_length: 8192,
             },
@@ -3795,6 +3848,7 @@ mod tests {
             profile: Some(ServingProfile {
                 context_length: 8192,
             }),
+            serves: Some(magnitude_service_contracts::models::ModelServes::Chat),
             reasons: Vec::new(),
             detail: "unknown GGUF tensor type 31".to_owned(),
         }
@@ -3807,16 +3861,6 @@ mod tests {
         magnitude_service_contracts::models::ModelAssessmentEntry {
             subject,
             state: ModelAssessmentEntryState::Assessed {
-                capabilities: ModelCapabilities {
-                    vision: false,
-                    tools: true,
-                    structured_output: false,
-                    reasoning: magnitude_service_contracts::models::ModelReasoningCapabilities {
-                        supported: false,
-                        efforts: Vec::new(),
-                        default_effort: None,
-                    },
-                },
                 template_fingerprint: "template".to_owned(),
                 fingerprint: None,
                 profiles: vec![assessment],
@@ -3881,10 +3925,17 @@ mod tests {
             },
             fits_assessment(),
         );
-        let ModelAssessmentEntryState::Assessed { capabilities, .. } = &mut entry.state else {
+        let ModelAssessmentEntryState::Assessed { profiles, .. } = &mut entry.state else {
             unreachable!("assessed entry");
         };
-        capabilities.reasoning = magnitude_service_contracts::models::ModelReasoningCapabilities {
+        let [ModelAssessment::Fits {
+            capabilities: ModelCapabilities::Chat { reasoning, .. },
+            ..
+        }] = profiles.as_mut_slice()
+        else {
+            unreachable!("a fitting chat model");
+        };
+        *reasoning = magnitude_service_contracts::models::ModelReasoningCapabilities {
             supported: true,
             efforts: vec!["none".to_owned(), "high".to_owned()],
             default_effort: None,

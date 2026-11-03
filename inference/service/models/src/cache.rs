@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use getrandom::fill;
-use magnitude_service_contracts::models::{ModelAssessment, ModelCapabilities, ModelId, ParsedModelId};
+use magnitude_service_contracts::models::{ModelAssessment, ModelId, ParsedModelId};
 use magnitude_service_utils::file_cache::{
     read_json, read_object, write_json_atomic,
 };
@@ -19,7 +19,6 @@ use crate::header_cache::{HEADER_CAPACITY_BYTES, HEADER_EVICTION_GRACE, HeaderCa
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CachedModelAssessment {
-    pub capabilities: ModelCapabilities,
     pub template_fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<magnitude_service_contracts::models::ModelFingerprint>,
@@ -389,7 +388,18 @@ mod tests {
     #[test]
     fn fitting_target_with_non_fitting_sibling_profiles_survives_cache_reopen() {
         let directory = tempfile::tempdir().unwrap();
+        let capabilities = ModelCapabilities::Chat {
+            vision: false,
+            tools: true,
+            structured_output: true,
+            reasoning: ModelReasoningCapabilities {
+                supported: false,
+                efforts: Vec::new(),
+                default_effort: None,
+            },
+        };
         let fits = ModelAssessment::Fits {
+            capabilities: capabilities.clone(),
             profile: profile(50_000),
             assessment_id: ModelAssessmentId("fits-assessment".to_owned()),
             memory: vec![MemoryAssessment {
@@ -409,6 +419,7 @@ mod tests {
             drafter: magnitude_service_contracts::models::DrafterVerdict::None,
         };
         let does_not_fit = ModelAssessment::DoesNotFit {
+            capabilities,
             profile: profile(100_000),
             assessment_id: ModelAssessmentId("non-fit-assessment".to_owned()),
             memory: vec![MemoryAssessment {
@@ -425,24 +436,12 @@ mod tests {
         };
 
         let initial = ModelCache::new(directory.path());
-        let capabilities = ModelCapabilities {
-            vision: false,
-            tools: true,
-            structured_output: true,
-            reasoning: ModelReasoningCapabilities {
-                supported: false,
-                efforts: Vec::new(),
-                default_effort: None,
-            },
-        };
         let fits = CachedModelAssessment {
-            capabilities: capabilities.clone(),
             template_fingerprint: "template".to_owned(),
             fingerprint: None,
             profile: fits,
         };
         let does_not_fit = CachedModelAssessment {
-            capabilities,
             template_fingerprint: fits.template_fingerprint.clone(),
             fingerprint: None,
             profile: does_not_fit,

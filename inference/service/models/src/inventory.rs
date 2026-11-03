@@ -2895,6 +2895,7 @@ mod tests {
 
     fn catalog_model(package: ModelPackage) -> RecommendableModel {
         RecommendableModel {
+            serves: magnitude_service_contracts::models::CatalogServes::Chat { intelligence: 0 },
             model_id: CatalogBaseId::new("catalog").expect("catalog base ID"),
             variant_id: CatalogVariantId::new("gguf:q4").expect("catalog variant ID"),
             configuration: ModelServingConfiguration {
@@ -2911,7 +2912,6 @@ mod tests {
             parameterization: magnitude_service_contracts::models::ModelParameterization::Dense {
                 total_parameters: 8_000_000_000,
             },
-            intelligence: 0,
             support: magnitude_service_contracts::models::CatalogSupport::Supported,
             fidelity_rank: 0,
             quantization_aware: false,

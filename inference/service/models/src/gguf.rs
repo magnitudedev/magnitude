@@ -6,7 +6,10 @@
 
 use crate::candidate_files::RecognizedArchitectures;
 use magnitude_artifacts::gguf::{Directory, Element, Encoding, PROJECTOR_ARCHITECTURE, Scalar, Value};
-use magnitude_service_contracts::models::{LocalModelHash, LocalModelLabel, ModelId, ModelIdError};
+use magnitude_artifacts::{DecisionError, DecisionMetadata, Serves};
+use magnitude_service_contracts::models::{
+    LocalModelHash, LocalModelLabel, ModelId, ModelIdError, ModelServes,
+};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, Read};
@@ -126,6 +129,20 @@ impl GgufTensors {
                 embedded_mtp: nextn_tensors > 0,
             }
         }
+    }
+}
+
+/// What a target GGUF serves, from its header: decisions when it carries a decision description,
+/// which must read as the engine reads it.
+pub fn serves(directory: &Directory) -> Result<ModelServes, DecisionError> {
+    Ok(model_serves(Serves::of_description(DecisionMetadata::of(directory)?.as_ref())))
+}
+
+/// The service contract's spelling of what a model serves.
+pub fn model_serves(serves: Serves) -> ModelServes {
+    match serves {
+        Serves::Chat => ModelServes::Chat,
+        Serves::Decisions => ModelServes::Decisions,
     }
 }
 

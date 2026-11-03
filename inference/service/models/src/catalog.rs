@@ -11,12 +11,12 @@ use magnitude_artifacts::catalog_headers::{
 };
 use magnitude_service_contracts::ComponentRole;
 use magnitude_service_contracts::models::{
-    CatalogBaseId, CatalogDiagnostic, CatalogSupport, CatalogVariantId, ModelFailure,
+    CatalogBaseId, CatalogDiagnostic, CatalogServes, CatalogSupport, CatalogVariantId, ModelFailure,
     ModelFileRole, ModelId, ModelPackage, ModelPackageSource, ModelParameterization,
     ModelReleaseDate, ModelServingConfiguration, PackageValidation, ParsedModelId,
     RecommendableModel, RecommendableModelCatalog, RecommendableModelCatalogProvider,
-    ResolvedServableModelBundle, ServableModelBundle, ServingProfile, SpeculativeDraftSource,
-    SpeculativeMethod,
+    ModelServes, ResolvedServableModelBundle, ServableModelBundle, ServingProfile,
+    SpeculativeDraftSource, SpeculativeMethod,
 };
 use magnitude_service_contracts::{
     ContentId, HuggingFaceRepositoryFile, HuggingFaceRepositoryRequest,
@@ -117,7 +117,9 @@ struct CatalogModel {
     sources: Vec<CatalogModelSource>,
     #[serde(default)]
     speculative_decoding: Option<CatalogSpeculativeDecoding>,
-    artificial_analysis: ArtificialAnalysisScore,
+    /// A chat model's score; a decision model, which generates no text, has none.
+    #[serde(default)]
+    artificial_analysis: Option<ArtificialAnalysisScore>,
     support: CatalogSupport,
 }
 
@@ -236,6 +238,8 @@ struct ReleasePlannerManifest {
 struct ReleasePlannerInput {
     model_id: CatalogBaseId,
     variant_id: CatalogVariantId,
+    /// What the target serves, derived from its header when the bundle is built.
+    serves: ModelServes,
     target: ReleasePlannerPackage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     draft: Option<ReleasePlannerPackage>,
@@ -398,10 +402,15 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
                         }
                     }
                 })
-            || !valid_artificial_analysis(
-                &model.artificial_analysis,
-                &source.artificial_analysis_frontier,
-            )
+            || model
+                .artificial_analysis
+                .as_ref()
+                .is_some_and(|artificial_analysis| {
+                    !valid_artificial_analysis(
+                        artificial_analysis,
+                        &source.artificial_analysis_frontier,
+                    )
+                })
             || !ids.insert(model.id.as_str())
             || model.variants().any(|(_, variant)| {
                 !presentations.insert((model.display_name.as_str(), variant.variant_label.as_str()))
@@ -1533,6 +1542,7 @@ fn recommendable_model(
     target: ModelPackage,
     draft: Option<ModelPackage>,
     properties: &InventoryProperties,
+    serves: ModelServes,
 ) -> Result<RecommendableModel, InventoryError> {
     // The served context is the target's supported maximum, which is the context the engine
     // resolves and assesses; a separate draft never bounds it.
@@ -1596,17 +1606,42 @@ fn recommendable_model(
         variant_id: CatalogVariantId::new(variant.variant_id.clone())
             .map_err(|error| InventoryError::Integrity(error.to_string()))?,
         configuration: ModelServingConfiguration { bundle, profile },
+        serves: catalog_serves(declaration, frontier, serves)?,
         display_name: declaration.display_name.clone(),
         variant_label: variant.variant_label.clone(),
         description: declaration.description.clone(),
         release_date: declaration.release_date.clone(),
         license: source.license.clone(),
         parameterization: declaration.parameterization.clone(),
-        intelligence: frontier.intelligence(&declaration.artificial_analysis),
         support: declaration.support.clone(),
         fidelity_rank: variant.fidelity_rank,
         quantization_aware: variant.quantization_aware,
     })
+}
+
+/// What a catalog model serves, from what its target's header serves and what its entry declares:
+/// a chat model with the intelligence of its Artificial Analysis score, or a decision model, which
+/// the index (it measures generated text) does not rate. The header, not the entry, owns what the
+/// model serves, so this is where an entry's score meets it.
+fn catalog_serves(
+    declaration: &CatalogModel,
+    frontier: &ArtificialAnalysisFrontier,
+    serves: ModelServes,
+) -> Result<CatalogServes, InventoryError> {
+    match (serves, &declaration.artificial_analysis) {
+        (ModelServes::Chat, Some(artificial_analysis)) => Ok(CatalogServes::Chat {
+            intelligence: frontier.intelligence(artificial_analysis),
+        }),
+        (ModelServes::Decisions, None) => Ok(CatalogServes::Decisions {}),
+        (ModelServes::Chat, None) => Err(InventoryError::Integrity(format!(
+            "chat model {} declares no Artificial Analysis score",
+            declaration.id
+        ))),
+        (ModelServes::Decisions, Some(_)) => Err(InventoryError::Integrity(format!(
+            "decision model {} declares an Artificial Analysis score, which measures chat",
+            declaration.id
+        ))),
+    }
 }
 
 fn catalog_from_planner_inputs(
@@ -1645,6 +1680,7 @@ fn catalog_from_planner_inputs(
                 input.target.package.clone(),
                 input.draft.as_ref().map(|draft| draft.package.clone()),
                 &input.target.properties,
+                input.serves,
             )?;
             if !inputs.contains_key(&recommendable_model_bundle_key(&model)) {
                 return Err(InventoryError::Integrity(format!(
@@ -1779,6 +1815,7 @@ impl ResolvingRecommendableCatalog {
             }
             None => None,
         };
+        let serves = target_serves(&target, &headers)?;
         let model = recommendable_model(
             declaration,
             frontier,
@@ -1787,10 +1824,12 @@ impl ResolvingRecommendableCatalog {
             target.package.clone(),
             draft.as_ref().map(|draft| draft.package.clone()),
             &target.properties,
+            serves,
         )?;
         let planner = ReleasePlannerInput {
             model_id: model.model_id.clone(),
             variant_id: model.variant_id.clone(),
+            serves,
             target,
             draft,
         };
@@ -1869,6 +1908,37 @@ impl ResolvingRecommendableCatalog {
         };
         Ok((planner, headers))
     }
+}
+
+/// What a planner package's target serves, from its primary GGUF's header.
+fn target_serves(
+    target: &ReleasePlannerPackage,
+    headers: &BTreeMap<String, Vec<u8>>,
+) -> Result<ModelServes, InventoryError> {
+    let header = target
+        .components
+        .iter()
+        .find(|component| component.component.path == target.primary_gguf)
+        .and_then(|component| headers.get(&component.header_digest))
+        .ok_or_else(|| {
+            InventoryError::Integrity(format!(
+                "catalog primary {} has no planner header",
+                target.primary_gguf.display()
+            ))
+        })?;
+    let directory = crate::gguf::known_tensors(magnitude_artifacts::gguf::read_header(header))
+        .map_err(|error| {
+            InventoryError::Integrity(format!(
+                "catalog primary {} has an unreadable header: {error}",
+                target.primary_gguf.display()
+            ))
+        })?;
+    crate::gguf::serves(&directory).map_err(|error| {
+        InventoryError::Integrity(format!(
+            "catalog primary {} has invalid decision metadata: {error}",
+            target.primary_gguf.display()
+        ))
+    })
 }
 
 /// The variant's primary GGUF: the one non-projector, non-imatrix file (or first shard) whose
@@ -2451,14 +2521,47 @@ mod tests {
     }
 
     #[test]
+    fn only_chat_models_serve_with_an_artificial_analysis_intelligence() {
+        let source = catalog_source().expect("catalog source should be valid");
+        let frontier = &source.artificial_analysis_frontier;
+        let model = |id: &str| {
+            source
+                .models
+                .iter()
+                .find(|model| model.id == id)
+                .expect("catalog model")
+        };
+        let (chat, decisions) = (model("qwen3.5-4b"), model("d1-2b"));
+        assert_eq!(
+            catalog_serves(chat, frontier, ModelServes::Chat).unwrap(),
+            CatalogServes::Chat {
+                intelligence: frontier.intelligence(chat.artificial_analysis.as_ref().unwrap())
+            }
+        );
+        assert_eq!(
+            catalog_serves(decisions, frontier, ModelServes::Decisions).unwrap(),
+            CatalogServes::Decisions {}
+        );
+        assert!(catalog_serves(decisions, frontier, ModelServes::Chat).is_err());
+        assert!(catalog_serves(chat, frontier, ModelServes::Decisions).is_err());
+    }
+
+    #[test]
     fn artificial_analysis_scores_share_the_frontier_version_and_never_exceed_it() {
         let source = catalog_source().expect("catalog source should be valid");
         let frontier = &source.artificial_analysis_frontier;
         assert!(valid_artificial_analysis_frontier(frontier));
-        for model in &source.models {
-            assert!(valid_artificial_analysis(&model.artificial_analysis, frontier));
+        for artificial_analysis in source
+            .models
+            .iter()
+            .filter_map(|model| model.artificial_analysis.as_ref())
+        {
+            assert!(valid_artificial_analysis(artificial_analysis, frontier));
         }
-        let model = source.models[0].artificial_analysis.clone();
+        let model = source.models[0]
+            .artificial_analysis
+            .clone()
+            .expect("the first catalog model is a scored chat model");
         let above = ArtificialAnalysisScore {
             score: frontier.score + 0.1,
             ..model.clone()

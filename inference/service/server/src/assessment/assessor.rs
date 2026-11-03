@@ -27,7 +27,8 @@ use magnitude_service_contracts::models::{
     AssessmentEnvironmentId, DrafterVerdict, InstalledModelPackages as _, KernelStatic,
     KnownUnsupportedReason, MemoryAssessment, ModelAssessment, ModelAssessmentId,
     ModelAssessmentProfile, ModelBundleInput, ModelCapabilities, ModelFailure, ModelFingerprint,
-    ModelPackageOperand, ModelPerformance, ModelReasoningCapabilities, ModelServingConfiguration,
+    ModelPackageOperand, ModelPerformance, ModelReasoningCapabilities, ModelServes,
+    ModelServingConfiguration,
     PerformanceEvidence, ProjectorVerdict, ResolvedServableModelBundle, ServableModelBundle,
     SpeculativeDraftSource, SpeculativeDraftSourceInput, SpeculativeMethod, UnsupportedReason,
     WeightTypeCount,
@@ -467,11 +468,13 @@ pub(crate) fn model_assessment(
         EngineAssessment::Unsupported {
             unsupported,
             fingerprint,
+            serves,
         } => {
             return Ok(unsupported_model(
                 requested,
                 unsupported,
                 fingerprint.map(model_fingerprint),
+                serves,
             ));
         }
         EngineAssessment::Assessed { facts, execution } => (facts, execution),
@@ -493,11 +496,13 @@ pub(crate) fn model_assessment(
         profile,
         performance_context_tokens,
     } = requested;
+    let capabilities = capabilities(facts.capabilities);
     let assessment = match execution {
         ModelExecution::Fits {
             fit: ExecutionFit { domains, .. },
             performance,
         } => ModelAssessment::Fits {
+            capabilities,
             profile,
             assessment_id,
             memory: memory_assessments(&domains, environment),
@@ -511,6 +516,7 @@ pub(crate) fn model_assessment(
             deficit_bytes,
             ..
         }) => ModelAssessment::DoesNotFit {
+            capabilities,
             profile,
             assessment_id,
             memory: memory_assessments(&domains, environment),
@@ -521,7 +527,6 @@ pub(crate) fn model_assessment(
         },
     };
     Ok(CachedModelAssessment {
-        capabilities: capabilities(facts.capabilities),
         template_fingerprint: facts.template_fingerprint,
         fingerprint: facts.fingerprint.map(model_fingerprint),
         profile: assessment,
@@ -666,46 +671,48 @@ fn unsupported_model(
     requested: ModelAssessmentProfile,
     unsupported: UnsupportedModel,
     fingerprint: Option<ModelFingerprint>,
+    serves: Option<magnitude_artifacts::Serves>,
 ) -> CachedModelAssessment {
     let (reasons, detail) = unsupported_reasons(unsupported);
     // A file the engine refused before establishing a context (and with no training context in its
     // header) has no serving profile, never a zero-token one.
     let profile = Some(requested.profile).filter(|profile| profile.context_length > 0);
-    unsupported_assessment(profile, reasons, detail, fingerprint)
+    unsupported_assessment(
+        profile,
+        reasons,
+        detail,
+        fingerprint,
+        serves.map(magnitude_service_models::gguf::model_serves),
+    )
 }
 
 /// A file whose header or bytes cannot be read: refused before the engine sees it, without a
-/// serving profile.
+/// serving profile, and saying nothing of what it serves.
 pub(crate) fn unreadable_assessment(detail: String) -> CachedModelAssessment {
     unsupported_assessment(
         None,
         vec![UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)],
         detail,
         None,
+        None,
     )
 }
 
+/// A refused model's verdict: what its header names it serves (a broken decision model serves
+/// decisions), and no capability, which only a model the engine runs has.
 fn unsupported_assessment(
     profile: Option<magnitude_service_contracts::models::ServingProfile>,
     reasons: Vec<UnsupportedReason>,
     detail: String,
     fingerprint: Option<ModelFingerprint>,
+    serves: Option<ModelServes>,
 ) -> CachedModelAssessment {
     CachedModelAssessment {
-        capabilities: ModelCapabilities {
-            vision: false,
-            tools: false,
-            structured_output: false,
-            reasoning: ModelReasoningCapabilities {
-                supported: false,
-                efforts: Vec::new(),
-                default_effort: None,
-            },
-        },
         template_fingerprint: String::new(),
         fingerprint,
         profile: ModelAssessment::Unsupported {
             profile,
+            serves,
             reasons,
             detail,
         },
@@ -713,15 +720,23 @@ fn unsupported_assessment(
 }
 
 fn capabilities(capabilities: EngineCapabilities) -> ModelCapabilities {
-    ModelCapabilities {
-        vision: capabilities.vision,
-        tools: capabilities.tools,
-        structured_output: capabilities.structured_output,
-        reasoning: ModelReasoningCapabilities {
-            supported: capabilities.reasoning.supported(),
-            efforts: capabilities.reasoning.efforts,
-            default_effort: capabilities.reasoning.default_effort,
+    match capabilities {
+        EngineCapabilities::Chat {
+            vision,
+            tools,
+            structured_output,
+            reasoning,
+        } => ModelCapabilities::Chat {
+            vision,
+            tools,
+            structured_output,
+            reasoning: ModelReasoningCapabilities {
+                supported: reasoning.supported(),
+                efforts: reasoning.efforts,
+                default_effort: reasoning.default_effort,
+            },
         },
+        EngineCapabilities::Decisions { vision } => ModelCapabilities::Decisions { vision },
     }
 }
 
@@ -882,6 +897,30 @@ pub fn inventory_model_failure(error: InventoryError) -> ModelFailure {
 mod tests {
     use super::*;
 
+    /// A refused decision model (its decision description unreadable, say) serves decisions, as
+    /// its header carries; it is never reported as a chat model. A file whose header does not read says
+    /// nothing of what it serves.
+    #[test]
+    fn an_unsupported_model_serves_what_its_header_names() {
+        let serves_of = |assessment: CachedModelAssessment| match assessment.profile {
+            ModelAssessment::Unsupported { serves, .. } => serves,
+            other => panic!("not unsupported: {other:?}"),
+        };
+        let refused = unsupported_model(
+            ModelAssessmentProfile {
+                profile: magnitude_service_contracts::models::ServingProfile {
+                    context_length: 4096,
+                },
+                performance_context_tokens: Vec::new(),
+            },
+            UnsupportedModel::unreadable("decision metadata `set_size` is missing".to_owned()),
+            None,
+            Some(magnitude_artifacts::Serves::Decisions),
+        );
+        assert_eq!(serves_of(refused), Some(ModelServes::Decisions));
+        assert_eq!(serves_of(unreadable_assessment("truncated".to_owned())), None);
+    }
+
     /// An unsupported file whose context is unknown has no serving profile, never a zero-token one;
     /// one with a context keeps it.
     #[test]
@@ -903,11 +942,21 @@ mod tests {
             other => panic!("not unsupported: {other:?}"),
         };
         assert_eq!(
-            profile_of(unsupported_model(profile(0), unsupported(), None)),
+            profile_of(unsupported_model(
+                profile(0),
+                unsupported(),
+                None,
+                Some(magnitude_artifacts::Serves::Chat)
+            )),
             None
         );
         assert_eq!(
-            profile_of(unsupported_model(profile(4096), unsupported(), None)),
+            profile_of(unsupported_model(
+                profile(4096),
+                unsupported(),
+                None,
+                Some(magnitude_artifacts::Serves::Chat)
+            )),
             Some(magnitude_service_contracts::models::ServingProfile {
                 context_length: 4096
             })

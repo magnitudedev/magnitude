@@ -446,7 +446,6 @@ impl AssessmentPoolCurrent {
                     };
                     entry.state = match (&outcome.result, &dropped) {
                         (Ok(assessment), None) => ModelAssessmentEntryState::Assessed {
-                            capabilities: assessment.capabilities.clone(),
                             template_fingerprint: assessment.template_fingerprint.clone(),
                             fingerprint: assessment.fingerprint.clone(),
                             profiles: vec![assessment.profile.clone()],
@@ -1214,19 +1213,19 @@ mod tests {
     ) -> CachedModelAssessment {
         let profile = test_configuration(subject.model_id().as_str()).profile;
         CachedModelAssessment {
-            capabilities: magnitude_service_contracts::models::ModelCapabilities {
-                vision: false,
-                tools: false,
-                structured_output: false,
-                reasoning: magnitude_service_contracts::models::ModelReasoningCapabilities {
-                    supported: false,
-                    efforts: Vec::new(),
-                    default_effort: None,
-                },
-            },
             template_fingerprint: String::new(),
             fingerprint: None,
             profile: ModelAssessment::Fits {
+                capabilities: magnitude_service_contracts::models::ModelCapabilities::Chat {
+                    vision: false,
+                    tools: false,
+                    structured_output: false,
+                    reasoning: magnitude_service_contracts::models::ModelReasoningCapabilities {
+                        supported: false,
+                        efforts: Vec::new(),
+                        default_effort: None,
+                    },
+                },
                 profile,
                 assessment_id: magnitude_service_contracts::models::ModelAssessmentId(
                     "assessment".to_owned(),
@@ -1615,20 +1614,11 @@ mod tests {
         let applied = current.apply_outcome(&AssessmentOutcome {
             key: AssessmentWorkKey("unsupported".to_owned()),
             result: Ok(CachedModelAssessment {
-                capabilities: magnitude_service_contracts::models::ModelCapabilities {
-                    vision: false,
-                    tools: false,
-                    structured_output: false,
-                    reasoning: magnitude_service_contracts::models::ModelReasoningCapabilities {
-                        supported: false,
-                        efforts: Vec::new(),
-                        default_effort: None,
-                    },
-                },
                 template_fingerprint: String::new(),
                 fingerprint: None,
                 profile: ModelAssessment::Unsupported {
                     profile: Some(test_configuration(catalog.model_id().as_str()).profile),
+                    serves: Some(magnitude_service_contracts::models::ModelServes::Chat),
                     reasons: Vec::new(),
                     detail: failure.message.clone(),
                 },

@@ -748,6 +748,7 @@ fn catalog_model(
     CatalogModel {
         id: catalog_id(definition),
         desired: ready_model(&desired.bundle, desired.profile),
+        serves: definition.serves,
         drafter_withheld: fit.withheld,
         display_name: definition.display_name.clone(),
         variant_label: definition.variant_label.clone(),
@@ -765,7 +766,6 @@ fn catalog_model(
             .into_iter()
             .collect(),
         parameterization: definition.parameterization.clone(),
-        intelligence: definition.intelligence.clone(),
         support: definition.support.clone(),
         fidelity_rank: definition.fidelity_rank,
         quantization_aware: definition.quantization_aware,
@@ -1429,6 +1429,7 @@ mod tests {
 
     fn definition(bundle: ServableModelBundle) -> RecommendableModel {
         RecommendableModel {
+            serves: magnitude_service_contracts::models::CatalogServes::Chat { intelligence: 1 },
             model_id: CatalogBaseId::new("catalog").expect("catalog base"),
             variant_id: CatalogVariantId::new("gguf:q4").expect("catalog variant"),
             configuration: ModelServingConfiguration {
@@ -1445,7 +1446,6 @@ mod tests {
             parameterization: ModelParameterization::Dense {
                 total_parameters: 1_000_000,
             },
-            intelligence: 1,
             support: CatalogSupport::Supported,
             fidelity_rank: 1,
             quantization_aware: false,

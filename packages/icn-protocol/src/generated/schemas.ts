@@ -483,7 +483,6 @@ export const CatalogModel = S.Struct({
   drafterWithheld: S.Boolean,
   fidelityRank: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   id: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
-  intelligence: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   license: S.String,
   localState: S.suspend((): S.Schema<CatalogModelState, CatalogModelStateEncoded> => CatalogModelState),
   parameterization: S.suspend(
@@ -491,6 +490,7 @@ export const CatalogModel = S.Struct({
   ),
   quantizationAware: S.Boolean,
   releaseDate: S.suspend((): S.Schema<ModelReleaseDate, ModelReleaseDateEncoded> => ModelReleaseDate),
+  serves: S.suspend((): S.Schema<CatalogServes, CatalogServesEncoded> => CatalogServes),
   sourceUrls: S.Array(S.String),
   support: S.suspend((): S.Schema<CatalogSupport, CatalogSupportEncoded> => CatalogSupport),
   variantLabel: S.String,
@@ -556,6 +556,24 @@ export type CatalogOptimizationProgressEncoded = S.Schema.Encoded<typeof Catalog
 export const CatalogOptimizationStage = S.Union(S.Literal("waiting"), S.Literal("preparing"), S.Literal("tuning"))
 export type CatalogOptimizationStage = S.Schema.Type<typeof CatalogOptimizationStage>
 export type CatalogOptimizationStageEncoded = S.Schema.Encoded<typeof CatalogOptimizationStage>
+
+export const CatalogServes = S.Union(
+  S.extend(
+    S.Struct({
+      intelligence: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      kind: S.Literal("chat"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      kind: S.Literal("decisions"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type CatalogServes = S.Schema.Type<typeof CatalogServes>
+export type CatalogServesEncoded = S.Schema.Encoded<typeof CatalogServes>
 
 export const CatalogSupport = S.Union(
   S.extend(
@@ -2169,6 +2187,7 @@ export const ModelAssessment = S.Union(
   S.extend(
     S.TaggedStruct("Fits", {
       assessmentId: S.suspend((): S.Schema<ModelAssessmentId, ModelAssessmentIdEncoded> => ModelAssessmentId),
+      capabilities: S.suspend((): S.Schema<ModelCapabilities, ModelCapabilitiesEncoded> => ModelCapabilities),
       drafter: S.suspend((): S.Schema<DrafterVerdict, DrafterVerdictEncoded> => DrafterVerdict),
       memory: S.Array(S.suspend((): S.Schema<MemoryAssessment, MemoryAssessmentEncoded> => MemoryAssessment)),
       performance: S.suspend((): S.Schema<ModelPerformance, ModelPerformanceEncoded> => ModelPerformance),
@@ -2180,6 +2199,7 @@ export const ModelAssessment = S.Union(
   S.extend(
     S.TaggedStruct("DoesNotFit", {
       assessmentId: S.suspend((): S.Schema<ModelAssessmentId, ModelAssessmentIdEncoded> => ModelAssessmentId),
+      capabilities: S.suspend((): S.Schema<ModelCapabilities, ModelCapabilitiesEncoded> => ModelCapabilities),
       deficitBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       drafter: S.suspend((): S.Schema<DrafterVerdict, DrafterVerdictEncoded> => DrafterVerdict),
       limitingResource: S.String,
@@ -2197,6 +2217,10 @@ export const ModelAssessment = S.Union(
         { exact: true, as: "Option" },
       ),
       reasons: S.Array(S.suspend((): S.Schema<UnsupportedReason, UnsupportedReasonEncoded> => UnsupportedReason)),
+      serves: S.optionalWith(
+        S.suspend((): S.Schema<ModelServes, ModelServesEncoded> => ModelServes),
+        { exact: true, as: "Option" },
+      ),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
@@ -2237,7 +2261,6 @@ export const ModelAssessmentEntryState = S.Union(
   S.extend(S.TaggedStruct("Assessing", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(
     S.TaggedStruct("Assessed", {
-      capabilities: S.suspend((): S.Schema<ModelCapabilities, ModelCapabilitiesEncoded> => ModelCapabilities),
       fingerprint: S.optionalWith(
         S.suspend((): S.Schema<ModelFingerprint, ModelFingerprintEncoded> => ModelFingerprint),
         { exact: true, as: "Option" },
@@ -2305,14 +2328,27 @@ export const ModelCandidate = S.Struct({
 export type ModelCandidate = S.Schema.Type<typeof ModelCandidate>
 export type ModelCandidateEncoded = S.Schema.Encoded<typeof ModelCandidate>
 
-export const ModelCapabilities = S.Struct({
-  reasoning: S.suspend(
-    (): S.Schema<ModelReasoningCapabilities, ModelReasoningCapabilitiesEncoded> => ModelReasoningCapabilities,
+export const ModelCapabilities = S.Union(
+  S.extend(
+    S.Struct({
+      reasoning: S.suspend(
+        (): S.Schema<ModelReasoningCapabilities, ModelReasoningCapabilitiesEncoded> => ModelReasoningCapabilities,
+      ),
+      serves: S.Literal("chat"),
+      structuredOutput: S.Boolean,
+      tools: S.Boolean,
+      vision: S.Boolean,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
   ),
-  structuredOutput: S.Boolean,
-  tools: S.Boolean,
-  vision: S.Boolean,
-})
+  S.extend(
+    S.Struct({
+      serves: S.Literal("decisions"),
+      vision: S.Boolean,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
 export type ModelCapabilities = S.Schema.Type<typeof ModelCapabilities>
 export type ModelCapabilitiesEncoded = S.Schema.Encoded<typeof ModelCapabilities>
 
@@ -2800,6 +2836,10 @@ export const ModelRootKind = S.Union(
 )
 export type ModelRootKind = S.Schema.Type<typeof ModelRootKind>
 export type ModelRootKindEncoded = S.Schema.Encoded<typeof ModelRootKind>
+
+export const ModelServes = S.Union(S.Literal("chat"), S.Literal("decisions"))
+export type ModelServes = S.Schema.Type<typeof ModelServes>
+export type ModelServesEncoded = S.Schema.Encoded<typeof ModelServes>
 
 export const ModelStoppingAllocation = S.Union(
   S.extend(

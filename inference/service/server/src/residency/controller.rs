@@ -72,6 +72,13 @@ pub struct ResidentEngine {
     _configuration: Arc<ResolvedConfiguration>,
 }
 
+/// A model resolved for inference: the residency target a request acquires, and the host
+/// artifacts of exactly that target's configuration.
+pub struct InferenceTarget {
+    pub target: ResolvedResidencyTarget,
+    pub host: Arc<HostArtifacts>,
+}
+
 /// Everything a model load needs besides the model.
 pub struct ResidencyEnvironment {
     pub models: Arc<ManagedModelStore>,
@@ -211,13 +218,30 @@ impl ModelInstances {
         }
     }
 
-    /// Lease `model_id` for inference, loading it if needed.
-    pub async fn acquire_for_inference(
+    /// Resolve `model_id` for inference once, without leasing or loading it: the residency target
+    /// a request acquires and its host semantics, which say what it serves (§8.5).
+    pub async fn resolve_for_inference(
         &self,
         model_id: &str,
+    ) -> Result<InferenceTarget, InventoryError> {
+        let target = self.target(model_id)?;
+        let host = Arc::clone(
+            &self
+                .environment
+                .configurations
+                .resolve(&target.configuration)
+                .await?
+                .host,
+        );
+        Ok(InferenceTarget { target, host })
+    }
+
+    /// Lease exactly the resolved `target` for inference, loading it if needed.
+    pub async fn acquire_for_inference(
+        &self,
+        target: ResolvedResidencyTarget,
         progress: Option<LoadingObserver>,
     ) -> Result<ResidencyLease<ResidentEngine>, InventoryError> {
-        let target = self.target(model_id)?;
         self.admit(&target).await?;
         let _request = self.requested(&target);
         match self
@@ -253,19 +277,6 @@ impl ModelInstances {
 
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<ModelInstancesInvalidation> {
         self.residency.subscribe()
-    }
-
-    /// The model's host chat semantics, for operations that never lease or load (§8.5).
-    pub async fn host(&self, model_id: &str) -> Result<Arc<HostArtifacts>, InventoryError> {
-        let target = self.target(model_id)?;
-        Ok(Arc::clone(
-            &self
-                .environment
-                .configurations
-                .resolve(&target.configuration)
-                .await?
-                .host,
-        ))
     }
 
     fn target(&self, model_id: &str) -> Result<ResolvedResidencyTarget, InventoryError> {
@@ -966,10 +977,6 @@ mod tests {
                     "subject": { "_tag": "Catalog", "modelId": model, "selection": "Effective" },
                     "state": {
                         "_tag": "Assessed",
-                        "capabilities": {
-                            "vision": false, "tools": true, "structuredOutput": true,
-                            "reasoning": { "supported": false, "efforts": [] },
-                        },
                         "templateFingerprint": "template",
                         "profiles": [assessment],
                     },
@@ -984,6 +991,10 @@ mod tests {
     fn does_not_fit(context_length: u32, deficit_bytes: u64) -> serde_json::Value {
         serde_json::json!({
             "_tag": "DoesNotFit",
+            "capabilities": {
+                "serves": "chat", "vision": false, "tools": true, "structuredOutput": true,
+                "reasoning": { "supported": false, "efforts": [] },
+            },
             "profile": { "contextLength": context_length },
             "assessmentId": "assessment",
             "memory": [],
@@ -1019,6 +1030,10 @@ mod tests {
     fn fitting_unassessed_or_other_profile_loads_are_admitted() {
         let fits = serde_json::json!({
             "_tag": "Fits",
+            "capabilities": {
+                "serves": "chat", "vision": false, "tools": true, "structuredOutput": true,
+                "reasoning": { "supported": false, "efforts": [] },
+            },
             "profile": { "contextLength": 262_144 },
             "assessmentId": "assessment",
             "memory": [],

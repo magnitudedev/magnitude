@@ -3506,6 +3506,7 @@
         "required": [
           "id",
           "desired",
+          "serves",
           "drafterWithheld",
           "displayName",
           "variantLabel",
@@ -3514,7 +3515,6 @@
           "license",
           "sourceUrls",
           "parameterization",
-          "intelligence",
           "support",
           "fidelityRank",
           "quantizationAware",
@@ -3526,6 +3526,9 @@
           },
           "desired": {
             "$ref": "#/components/schemas/ReadyModel"
+          },
+          "serves": {
+            "$ref": "#/components/schemas/CatalogServes"
           },
           "drafterWithheld": {
             "type": "boolean"
@@ -3553,11 +3556,6 @@
           },
           "parameterization": {
             "$ref": "#/components/schemas/ModelParameterization"
-          },
-          "intelligence": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
           },
           "support": {
             "$ref": "#/components/schemas/CatalogSupport"
@@ -3753,6 +3751,45 @@
           "preparing",
           "tuning"
         ]
+      },
+      "CatalogServes": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "intelligence",
+              "kind"
+            ],
+            "properties": {
+              "intelligence": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "chat"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "decisions"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "What a catalog model serves, with what only that kind has: a chat model's intelligence, its\nArtificial Analysis Intelligence Index score as a whole percentage of the top score. A decision\nmodel generates no text, so the index does not rate it."
       },
       "CatalogSupport": {
         "oneOf": [
@@ -7754,6 +7791,7 @@
             "type": "object",
             "description": "A fitting model, with its decode-speed estimates.",
             "required": [
+              "capabilities",
               "profile",
               "assessmentId",
               "memory",
@@ -7763,6 +7801,9 @@
               "_tag"
             ],
             "properties": {
+              "capabilities": {
+                "$ref": "#/components/schemas/ModelCapabilities"
+              },
               "profile": {
                 "$ref": "#/components/schemas/ServingProfile"
               },
@@ -7795,6 +7836,7 @@
           {
             "type": "object",
             "required": [
+              "capabilities",
               "profile",
               "assessmentId",
               "memory",
@@ -7805,6 +7847,9 @@
               "_tag"
             ],
             "properties": {
+              "capabilities": {
+                "$ref": "#/components/schemas/ModelCapabilities"
+              },
               "profile": {
                 "$ref": "#/components/schemas/ServingProfile"
               },
@@ -7841,7 +7886,7 @@
           },
           {
             "type": "object",
-            "description": "The engine cannot execute a custom model, with every reason it found. A catalog model is\nnever unsupported: the pool drops a catalog target the engine cannot execute as a release\ndefect. An unreadable file has no serving profile.",
+            "description": "The engine cannot execute a custom model, with every reason it found, and what its header\nsays it serves. A catalog model is never unsupported: the pool drops a catalog target the\nengine cannot execute as a release defect. An unreadable file has no serving profile, and\nsays nothing of what it serves.",
             "required": [
               "reasons",
               "detail",
@@ -7850,6 +7895,9 @@
             "properties": {
               "profile": {
                 "$ref": "#/components/schemas/ServingProfile"
+              },
+              "serves": {
+                "$ref": "#/components/schemas/ModelServes"
               },
               "reasons": {
                 "type": "array",
@@ -7957,15 +8005,11 @@
           {
             "type": "object",
             "required": [
-              "capabilities",
               "templateFingerprint",
               "profiles",
               "_tag"
             ],
             "properties": {
-              "capabilities": {
-                "$ref": "#/components/schemas/ModelCapabilities"
-              },
               "templateFingerprint": {
                 "type": "string"
               },
@@ -8108,28 +8152,57 @@
         "additionalProperties": false
       },
       "ModelCapabilities": {
-        "type": "object",
-        "required": [
-          "vision",
-          "tools",
-          "structuredOutput",
-          "reasoning"
-        ],
-        "properties": {
-          "vision": {
-            "type": "boolean"
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "vision",
+              "tools",
+              "structuredOutput",
+              "reasoning",
+              "serves"
+            ],
+            "properties": {
+              "vision": {
+                "type": "boolean"
+              },
+              "tools": {
+                "type": "boolean"
+              },
+              "structuredOutput": {
+                "type": "boolean"
+              },
+              "reasoning": {
+                "$ref": "#/components/schemas/ModelReasoningCapabilities"
+              },
+              "serves": {
+                "type": "string",
+                "enum": [
+                  "chat"
+                ]
+              }
+            }
           },
-          "tools": {
-            "type": "boolean"
-          },
-          "structuredOutput": {
-            "type": "boolean"
-          },
-          "reasoning": {
-            "$ref": "#/components/schemas/ModelReasoningCapabilities"
+          {
+            "type": "object",
+            "required": [
+              "vision",
+              "serves"
+            ],
+            "properties": {
+              "vision": {
+                "type": "boolean"
+              },
+              "serves": {
+                "type": "string",
+                "enum": [
+                  "decisions"
+                ]
+              }
+            }
           }
-        },
-        "additionalProperties": false
+        ],
+        "description": "What a model the engine runs serves, with what it takes there: chat, with what its chat\ntemplates take, or decisions, which generate nothing and so take no chat parameter."
       },
       "ModelDownload": {
         "type": "object",
@@ -9371,6 +9444,14 @@
           "LlamaCpp",
           "Ollama",
           "Folder"
+        ]
+      },
+      "ModelServes": {
+        "type": "string",
+        "description": "What a model serves: decisions only when its GGUF carries a decision description, chat otherwise.",
+        "enum": [
+          "chat",
+          "decisions"
         ]
       },
       "ModelStoppingAllocation": {

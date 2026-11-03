@@ -3823,6 +3823,7 @@ mod tests {
         };
         RecommendableModelCatalog {
             models: vec![RecommendableModel {
+                serves: magnitude_service_contracts::models::CatalogServes::Chat { intelligence: 1 },
                 model_id: CatalogBaseId::new("llama-test").unwrap(),
                 variant_id: CatalogVariantId::new("gguf:q8").unwrap(),
                 configuration: ModelServingConfiguration {
@@ -3839,7 +3840,6 @@ mod tests {
                 parameterization: ModelParameterization::Dense {
                     total_parameters: 1,
                 },
-                intelligence: 1,
                 support: CatalogSupport::Supported,
                 fidelity_rank: 1,
                 quantization_aware: false,

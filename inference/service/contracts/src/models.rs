@@ -1142,14 +1142,50 @@ pub struct ModelReasoningCapabilities {
     pub default_effort: Option<String>,
 }
 
+/// What a model serves: decisions only when its GGUF carries a decision description, chat otherwise.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelServes {
+    Chat,
+    Decisions,
+}
+
+/// What a catalog model serves, with what only that kind has: a chat model's intelligence, its
+/// Artificial Analysis Intelligence Index score as a whole percentage of the top score. A decision
+/// model generates no text, so the index does not rate it.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CatalogServes {
+    Chat { intelligence: u32 },
+    Decisions {},
+}
+
+/// What a model the engine runs serves, with what it takes there: chat, with what its chat
+/// templates take, or decisions, which generate nothing and so take no chat parameter.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelCapabilities {
-    pub vision: bool,
-    pub tools: bool,
-    pub structured_output: bool,
-    pub reasoning: ModelReasoningCapabilities,
+#[serde(tag = "serves", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelCapabilities {
+    #[serde(rename_all = "camelCase")]
+    Chat {
+        vision: bool,
+        tools: bool,
+        structured_output: bool,
+        reasoning: ModelReasoningCapabilities,
+    },
+    Decisions { vision: bool },
+}
+
+impl ModelCapabilities {
+    /// Whether it takes image input.
+    #[must_use]
+    pub fn vision(&self) -> bool {
+        match self {
+            Self::Chat { vision, .. } | Self::Decisions { vision } => *vision,
+        }
+    }
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -1280,13 +1316,14 @@ pub struct RecommendableModel {
     pub model_id: CatalogBaseId,
     pub variant_id: CatalogVariantId,
     pub configuration: ModelServingConfiguration,
+    /// What the target serves, from its GGUF header.
+    pub serves: CatalogServes,
     pub display_name: String,
     pub variant_label: String,
     pub description: String,
     pub release_date: ModelReleaseDate,
     pub license: String,
     pub parameterization: ModelParameterization,
-    pub intelligence: u32,
     pub support: CatalogSupport,
     pub fidelity_rank: u32,
     pub quantization_aware: bool,
@@ -1372,6 +1409,7 @@ pub enum CatalogModelState {
 pub struct CatalogModel {
     pub id: ModelId,
     pub desired: ReadyModel,
+    pub serves: CatalogServes,
     pub drafter_withheld: bool,
     pub display_name: String,
     pub variant_label: String,
@@ -1380,7 +1418,6 @@ pub struct CatalogModel {
     pub license: String,
     pub source_urls: Vec<String>,
     pub parameterization: ModelParameterization,
-    pub intelligence: u32,
     pub support: CatalogSupport,
     pub fidelity_rank: u32,
     pub quantization_aware: bool,
@@ -2396,6 +2433,7 @@ pub enum ModelAssessment {
     /// A fitting model, with its decode-speed estimates.
     #[serde(rename_all = "camelCase")]
     Fits {
+        capabilities: ModelCapabilities,
         profile: ServingProfile,
         assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
@@ -2405,6 +2443,7 @@ pub enum ModelAssessment {
     },
     #[serde(rename_all = "camelCase")]
     DoesNotFit {
+        capabilities: ModelCapabilities,
         profile: ServingProfile,
         assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
@@ -2413,13 +2452,17 @@ pub enum ModelAssessment {
         projector: ProjectorVerdict,
         drafter: DrafterVerdict,
     },
-    /// The engine cannot execute a custom model, with every reason it found. A catalog model is
-    /// never unsupported: the pool drops a catalog target the engine cannot execute as a release
-    /// defect. An unreadable file has no serving profile.
+    /// The engine cannot execute a custom model, with every reason it found, and what its header
+    /// says it serves. A catalog model is never unsupported: the pool drops a catalog target the
+    /// engine cannot execute as a release defect. An unreadable file has no serving profile, and
+    /// says nothing of what it serves.
     Unsupported {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "openapi", schema(nullable = false))]
         profile: Option<ServingProfile>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        serves: Option<ModelServes>,
         reasons: Vec<UnsupportedReason>,
         detail: String,
     },
@@ -2432,7 +2475,6 @@ pub enum ModelAssessmentEntryState {
     Assessing,
     #[serde(rename_all = "camelCase")]
     Assessed {
-        capabilities: ModelCapabilities,
         template_fingerprint: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "openapi", schema(nullable = false))]
@@ -2889,11 +2931,31 @@ mod custom_model_wire_tests {
     }
 
     #[test]
+    fn only_a_chat_catalog_model_carries_intelligence() {
+        assert_eq!(
+            serde_json::from_value::<CatalogServes>(json!({ "kind": "chat", "intelligence": 33 }))
+                .expect("deserialize"),
+            CatalogServes::Chat { intelligence: 33 }
+        );
+        assert_eq!(
+            serde_json::to_value(CatalogServes::Decisions {}).expect("serialize"),
+            json!({ "kind": "decisions" })
+        );
+        for refused in [
+            json!({ "kind": "chat" }),
+            json!({ "kind": "decisions", "intelligence": 33 }),
+        ] {
+            assert!(serde_json::from_value::<CatalogServes>(refused).is_err());
+        }
+    }
+
+    #[test]
     fn unsupported_assessment_carries_reasons_and_detail() {
         let assessment = ModelAssessment::Unsupported {
             profile: Some(ServingProfile {
                 context_length: 4096,
             }),
+            serves: Some(ModelServes::Decisions),
             reasons: vec![UnsupportedReason::Known(
                 KnownUnsupportedReason::UnrecognizedTensor {
                     name: "rope_freqs.weight".to_owned(),
@@ -2906,6 +2968,7 @@ mod custom_model_wire_tests {
             json!({
                 "_tag": "Unsupported",
                 "profile": { "contextLength": 4096 },
+                "serves": "decisions",
                 "reasons": [{ "_tag": "UnrecognizedTensor", "name": "rope_freqs.weight" }],
                 "detail": "unrecognized tensor"
             })
@@ -2913,9 +2976,10 @@ mod custom_model_wire_tests {
     }
 
     #[test]
-    fn unreadable_assessment_serializes_without_a_profile() {
+    fn unreadable_assessment_serializes_without_a_profile_or_what_it_serves() {
         let assessment = ModelAssessment::Unsupported {
             profile: None,
+            serves: None,
             reasons: vec![UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)],
             detail: "truncated".to_owned(),
         };
@@ -2931,6 +2995,39 @@ mod custom_model_wire_tests {
         assert_eq!(
             serde_json::from_value::<ModelAssessment>(encoded).expect("deserialize"),
             assessment
+        );
+    }
+
+    #[test]
+    fn only_chat_capabilities_carry_chat_parameters() {
+        let decisions = json!({ "serves": "decisions", "vision": true });
+        assert_eq!(
+            serde_json::from_value::<ModelCapabilities>(decisions.clone()).expect("deserialize"),
+            ModelCapabilities::Decisions { vision: true }
+        );
+        assert!(serde_json::from_value::<ModelCapabilities>(json!({
+            "serves": "decisions", "vision": true, "tools": false
+        }))
+        .is_err());
+        let chat = ModelCapabilities::Chat {
+            vision: false,
+            tools: true,
+            structured_output: false,
+            reasoning: ModelReasoningCapabilities {
+                supported: false,
+                efforts: Vec::new(),
+                default_effort: None,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&chat).expect("serialize"),
+            json!({
+                "serves": "chat",
+                "vision": false,
+                "tools": true,
+                "structuredOutput": false,
+                "reasoning": { "supported": false, "efforts": [] }
+            })
         );
     }
 
