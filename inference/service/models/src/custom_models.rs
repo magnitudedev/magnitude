@@ -8735,4 +8735,50 @@ mod tests {
             ])
         );
     }
+
+    /// Listing the catalog never takes the installed-package lock again while it holds it: the
+    /// standard library's lock queues a reader behind a waiting writer, so a second read while a
+    /// reconciliation waits to publish would block every reader and that writer for good.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn listing_the_catalog_while_the_inventory_publishes_does_not_deadlock() {
+        let fixture = Fixture::new().await;
+        let cache = fixture.root.join("hf");
+        publish_hf_cache(
+            &cache,
+            "owner/Model-GGUF",
+            &"a".repeat(40),
+            &[("Model-Q4_K_M.gguf", model_bytes("model"))],
+        );
+        fixture
+            .apply(roots(vec![root(ModelRootKind::HuggingFaceCache, &cache)]))
+            .await;
+        let (done, finished) = std::sync::mpsc::channel();
+        let lister = {
+            let resolver = Arc::clone(&fixture.resolver);
+            let done = done.clone();
+            std::thread::spawn(move || {
+                for _ in 0..20_000 {
+                    resolver.catalog_snapshot().unwrap();
+                }
+                let _ = done.send(());
+            })
+        };
+        let publisher = {
+            let resolver = Arc::clone(&fixture.resolver);
+            std::thread::spawn(move || {
+                let snapshot = resolver.inventory.installed_packages.read().unwrap().clone();
+                for _ in 0..20_000 {
+                    *resolver.inventory.installed_packages.write().unwrap() = snapshot.clone();
+                }
+                let _ = done.send(());
+            })
+        };
+        for _ in 0..2 {
+            finished
+                .recv_timeout(Duration::from_secs(20))
+                .expect("listing the catalog and publishing the inventory deadlocked");
+        }
+        lister.join().unwrap();
+        publisher.join().unwrap();
+    }
 }

@@ -324,8 +324,11 @@ impl ModelDomainResolver {
                 .or_default()
                 .include(weights.installed.origin);
         }
+        // The installed-package lock is released before anything else runs and never taken
+        // again under it: a reader waiting behind a queued writer while holding it deadlocks.
+        drop(records);
         Ok(CatalogModelsResponse {
-            revision: self.revision()?,
+            revision: installed.revision + self.catalog_changes.generation.load(Ordering::Acquire),
             reconciliation_complete: installed.reconciliation_complete,
             models: self
                 .catalog
