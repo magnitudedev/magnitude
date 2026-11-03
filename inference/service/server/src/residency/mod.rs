@@ -669,6 +669,11 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                     // The start notification may already be queued when cancellation is admitted.
                     worker.terminate("model_instance_stopped", "model instance was stopped");
                     *retained = Some(worker);
+                } else {
+                    // The load ended before its sequence announced this worker: a stopped load's
+                    // sequence outlives its task and may have started its next worker (the Load
+                    // after its Prepare) just before it saw the stop. Nothing owns it but here.
+                    worker.terminate("model_instance_stopped", "model instance was stopped");
                 }
             }
             ResidencyNotification::LoadProgress {
@@ -987,11 +992,13 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 &ModelReleaseReason::UserStop,
             )));
         }
+        // The load's sequence learns of the stop before its worker ends: it reacts to that end by
+        // starting its next worker unless it sees the load abandoned.
+        loading.operation.abort();
         let worker = loading.worker.take();
         if let Some(worker) = &worker {
             worker.terminate("model_instance_stopped", "model instance was stopped");
         }
-        loading.operation.abort();
         let notifier = self.controller.client().notifier();
         let instance_id = loading.instance.id.clone();
         let operation = loading.operation;
@@ -2324,6 +2331,53 @@ mod tests {
                 actor.abort();
             }
         }).await.expect("cancellation lost worker ownership or a reply");
+    }
+
+    /// QA retest2 30-stop: a stop during a load's Prepare ends the load. Its sequence, which
+    /// outlives the load's task, saw its Prepare worker end and announced the next (the Load)
+    /// only after the residency went vacant. That worker is ended at once, no other load starts,
+    /// and the optimization job waiting for the device takes it as the sequence lets it go.
+    #[tokio::test]
+    async fn a_stop_during_a_loads_prepare_starts_no_further_load_and_frees_the_device() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let device = crate::device_lock::DeviceLock::default();
+            let (client, mut loads, _, actor) = test_residency(false);
+            let loading = tokio::spawn({ let client = client.clone(); async move {
+                client.acquire(test_target("model-a"), ResidencyAcquisition::Warm).await
+            }});
+            let (instance_id, _) = loads.recv().await.unwrap();
+            let share = device.try_share().expect("the load shares the device");
+            let job = tokio::spawn({ let device = device.clone(); async move { device.job().await } });
+            let prepare = Arc::new(TestResidencyWorker::default());
+            let load = Arc::new(TestResidencyWorker::default());
+            let (announce, announced) = tokio::sync::oneshot::channel::<()>();
+            let sequence = tokio::spawn({
+                let notifier = client.notifier();
+                let instance_id = instance_id.clone();
+                let (prepare, load) = (Arc::clone(&prepare), Arc::clone(&load));
+                async move {
+                    notifier.send(ResidencyNotification::LoadWorkerStarted { instance_id: instance_id.clone(), worker: prepare });
+                    announced.await.unwrap();
+                    notifier.send(ResidencyNotification::LoadWorkerStarted { instance_id, worker: load.clone() });
+                    while load.try_wait().unwrap().is_none() {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    drop(share);
+                }
+            });
+            client.snapshot().await.unwrap();
+            client.stop(instance_id.clone()).await.expect("stop during the Prepare");
+            assert_explicit_stop(loading.await.unwrap());
+            assert!(prepare.interrupted.load(Ordering::Acquire) > 0, "the Prepare worker is ended");
+            announce.send(()).unwrap();
+            job.await.expect("the waiting job takes the device");
+            sequence.await.unwrap();
+            assert!(load.interrupted.load(Ordering::Acquire) > 0, "the stopped load's next worker is ended");
+            assert!(loads.try_recv().is_err(), "no further load starts");
+            let snapshot = client.snapshot().await.unwrap();
+            assert!(snapshot.instances.iter().all(|instance| !matches!(instance.lifecycle, ModelInstanceLifecycle::Loading { .. })));
+            actor.abort();
+        }).await.expect("a stopped load's worker outlived the stop or held the device");
     }
 
     #[tokio::test]
