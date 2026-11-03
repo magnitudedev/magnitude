@@ -288,7 +288,7 @@ fn presentation_evidence(model_id: &ModelId, commit: &str) -> String {
     let catalog = CATALOG.get_or_init(|| {
         format!("{}:{}", crate::catalog::catalog_source_digest(), crate::catalog::catalog_lock_digest())
     });
-    format!("candidate-presentation-v1:{catalog}:{model_id}@{commit}")
+    format!("candidate-presentation-v2:{catalog}:{model_id}@{commit}")
 }
 
 fn evidence_digest(evidence: &str) -> String {

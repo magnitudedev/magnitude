@@ -2029,7 +2029,7 @@ fn classification_evidence(
     architectures: &crate::candidate_files::RecognizedArchitectures,
 ) -> String {
     format!(
-        "candidate-classification-v6:{digest}:{}",
+        "candidate-classification-v7:{digest}:{}",
         architectures.key()
     )
 }

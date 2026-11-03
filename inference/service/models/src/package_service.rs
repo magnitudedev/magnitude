@@ -1067,7 +1067,7 @@ impl ManagedModelStore {
 
     fn gguf_inspection_cache_key(path: &Path, content: &ContentIdentity) -> Option<String> {
         let evidence =
-            serde_json::to_vec(&("gguf-inspection-v8", content, path.metadata().ok()?.len()))
+            serde_json::to_vec(&("gguf-inspection-v9", content, path.metadata().ok()?.len()))
                 .ok()?;
         Some(format!("gguf_inspection_{:x}", Sha256::digest(evidence)))
     }

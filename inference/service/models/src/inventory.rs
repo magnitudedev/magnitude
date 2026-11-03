@@ -2384,7 +2384,7 @@ pub(crate) fn local_gguf_cached(
     read: impl FnOnce(&[u8]),
 ) -> Result<gguf::LocalGguf, InventoryError> {
     let metadata = path.metadata().map_err(io_error)?;
-    let evidence = format!("gguf-file-v8\0{}", file_identity(path, &metadata));
+    let evidence = format!("gguf-file-v9\0{}", file_identity(path, &metadata));
     if let Some(gguf) = cache.read_index(ModelIndexKind::GgufInspection, &evidence) {
         return Ok(gguf);
     }
