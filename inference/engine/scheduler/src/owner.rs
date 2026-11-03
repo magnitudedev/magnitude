@@ -84,6 +84,41 @@ fn plan_declared(branches: &mut BTreeSet<usize>, point: usize, from: usize, prom
     }
 }
 
+/// Where a peer's prefill stops within the prefix it shares with a new
+/// request, up to `shared` rows: its deepest planned point there. That is
+/// `shared` itself, or a point fewer than [`MIN_BRANCH_GAIN`] rows below it
+/// (such as a declared cache point) that kept `shared` from being planned.
+fn peer_stop(branches: &BTreeSet<usize>, shared: usize) -> Option<usize> {
+    branches.range(..=shared).next_back().copied()
+}
+
+/// The prefix a new request waits for: `in_flight`, the deepest stop a peer
+/// is still prefilling toward, when it is beyond what the cache shares, worth
+/// resuming from, and within [`MIN_BRANCH_GAIN`] rows of the deepest prefix
+/// the request shares (`deepest`); otherwise the request plans its own
+/// branch.
+fn awaited_prefix(
+    in_flight: usize,
+    deepest: usize,
+    cached: usize,
+    resumed: usize,
+    prompt: usize,
+) -> Option<usize> {
+    (in_flight > cached
+        && worthwhile(in_flight, resumed, prompt)
+        && in_flight + MIN_BRANCH_GAIN > deepest)
+        .then_some(in_flight)
+}
+
+/// Whether a request outside a round may take the device before a member's
+/// queued successor chunk, which would then be discarded: it is unfinished
+/// (or still owes its reconciliation) and is not waiting on a prefix that a
+/// member computes.
+fn competes(request: &Request, status: Status) -> bool {
+    !matches!(status, Status::Terminal(_))
+        && !matches!(request.state, State::Between(_, Stage::AwaitingPrefix { .. }))
+}
+
 /// Where a request's prompt is retained: one row before the prompt end, the
 /// deepest point a request with the same prompt can resume from (it must
 /// compute the row it samples from). None when that is not an exact input
@@ -1043,8 +1078,10 @@ impl<F: ProgramFamily> Service<F> {
                 generation.resident_position(),
                 generation.prompt().len(),
             );
-            if record.branches.contains(&shared) && prefilling_toward(generation, shared) {
-                in_flight = in_flight.max(shared);
+            if let Some(stop) = peer_stop(&record.branches, shared) {
+                if prefilling_toward(generation, stop) {
+                    in_flight = in_flight.max(stop);
+                }
             }
         }
         if !worthwhile(deepest, resumed, path.len()) {
@@ -1053,11 +1090,11 @@ impl<F: ProgramFamily> Service<F> {
                 awaited: None,
             };
         }
-        if in_flight == deepest && deepest > cached {
+        if let Some(through) = awaited_prefix(in_flight, deepest, cached, resumed, path.len()) {
             // A peer computes this prefix now: wait for it to be cached.
             return BranchPlan {
                 branches,
-                awaited: Some(deepest),
+                awaited: Some(through),
             };
         }
         plan_branch(&mut branches, deepest, resumed, path.len());
@@ -2216,6 +2253,12 @@ impl<F: ProgramFamily> Service<F> {
     /// is known now, so the domain queues it behind this group. A chunk
     /// ending at a planned branch or retention point is followed by that
     /// retention, not planned past.
+    ///
+    /// Only a request the device serves alone plans one: the queued chunk is
+    /// claimed only when the next group submitted is that chunk. Any other
+    /// group first waits for the queued chunk and discards it, so a lone
+    /// group (a primed chunk launches alone) among other requests' work would
+    /// compute a full chunk it throws away in every round.
     fn planned_prefill(&self, round: &Round, operations: &[Operation]) -> Result<Vec<Operation>, RequestError> {
         let [Operation::Forward {
             request,
@@ -2227,6 +2270,14 @@ impl<F: ProgramFamily> Service<F> {
         else {
             return Ok(Vec::new());
         };
+        if round.members.len() != 1
+            || self
+                .requests
+                .values()
+                .any(|other| competes(other, self.status(other)))
+        {
+            return Ok(Vec::new());
+        }
         let Some(Member {
             record,
             state: Membership::Started(started),
@@ -3087,8 +3138,34 @@ fn memory_observation(result: Result<(), DomainError>) -> Result<MemoryObservati
 
 #[cfg(test)]
 mod branch_plan_tests {
-    use super::{MIN_BRANCH_GAIN, MIN_PREFIX_HIT, plan_branch, plan_declared};
+    use super::{
+        MIN_BRANCH_GAIN, MIN_PREFIX_HIT, awaited_prefix, peer_stop, plan_branch, plan_declared,
+    };
     use std::collections::BTreeSet;
+
+    /// Chat requests sharing a system prompt diverge a few rows into the
+    /// last user message, fewer than the gain past the peer's declared cache
+    /// point at the system prompt's end, so the divergence is never planned
+    /// on the peer. The new request still waits for the peer's declared
+    /// point instead of prefilling the whole prompt alongside it.
+    #[test]
+    fn a_request_waits_for_a_peer_stop_just_below_their_divergence() {
+        let (declared, shared, prompt) = (14864, 14891, 14908);
+        let mut peer = BTreeSet::from([declared, prompt - 6]);
+        plan_branch(&mut peer, shared, 0, prompt);
+        assert!(!peer.contains(&shared));
+        assert_eq!(peer_stop(&peer, shared), Some(declared));
+        assert_eq!(awaited_prefix(declared, shared, 0, 0, prompt), Some(declared));
+        // The divergence itself, when planned, is awaited as before.
+        assert_eq!(awaited_prefix(shared, shared, 0, 0, prompt), Some(shared));
+        // Not a stop the cache already shares, one too far below the
+        // divergence, one not worth resuming from, or none at all.
+        assert_eq!(awaited_prefix(declared, shared, declared, 0, prompt), None);
+        assert_eq!(awaited_prefix(shared - MIN_BRANCH_GAIN, shared, 0, 0, prompt), None);
+        assert_eq!(awaited_prefix(declared, shared, 0, declared - 1, prompt), None);
+        assert_eq!(awaited_prefix(0, shared, 0, 0, prompt), None);
+        assert_eq!(peer_stop(&BTreeSet::from([prompt - 6]), shared), None);
+    }
 
     /// A short turn of a conversation: it resumes where the previous turn
     /// declared the next one leaves the prompt, and declares the opening of
@@ -3271,6 +3348,35 @@ mod timing_tests {
         fn read(&mut self, _: &FeatureSpan) -> Result<FeatureRows, String> {
             panic!("plain prompt needs no features")
         }
+    }
+
+    /// A lone prefill group queues its next chunk only when nothing outside
+    /// the round competes for the device: another live request's work would
+    /// orphan the queued chunk, discarding a whole chunk of device work.
+    #[test]
+    fn only_live_work_outside_the_round_competes_with_a_queued_chunk() {
+        let record = || Record {
+            waiting_since: 0, service_ns: 0, physical_timings: PhysicalTimings::default(),
+            timing_phase: TimingPhase::Prompt, error: None, preemption_debt: 0,
+            protected_until: None, prefix_cache: true, prefix_source: None,
+            prefill_retained: false, terminal_retained: false, branches: BTreeSet::new(),
+            publication: None, publication_batch_limit: 4, pending_publication: None,
+            publication_permits: VecDeque::new(),
+        };
+        let request = |stage| Request {
+            record: record(),
+            state: State::Between(super::termination_tests::generation(), stage),
+        };
+        assert!(competes(&request(Stage::NonResident(None)), Status::Runnable));
+        assert!(competes(&request(Stage::Ready), Status::Runnable));
+        assert!(!competes(
+            &request(Stage::AwaitingPrefix { through: 1 }),
+            Status::Runnable
+        ));
+        assert!(!competes(
+            &request(Stage::Ready),
+            Status::Terminal(FinishReason::Length)
+        ));
     }
 
     #[test]
