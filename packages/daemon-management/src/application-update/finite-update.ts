@@ -1,4 +1,5 @@
 import { Clock, Effect, Option, Schema } from "effect"
+import { isNewerVersion } from "@magnitudedev/release"
 import { UpdateRelease } from "@magnitudedev/release/hosted-update"
 import type { ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { PreparedUpdateStore, type PreparedUpdate } from "../desktop-native/prepared-update"
@@ -42,12 +43,12 @@ export const runFiniteUpdatePreparation = (action: "check" | "download" | "disca
   const store = yield* PreparedUpdateStore
   if (action === "discard") return yield* discardPreparedUpdate
   const initial = yield* readPreparedUpdateState
-  if (action === "download" && initial.transfer._tag !== "Idle") return initial
   const source = yield* ApplicationUpdateSource
   const candidate = yield* source.check("manual")
   const check = { _tag: "Succeeded", at: yield* Clock.currentTimeMillis } as const
-  if (initial.transfer._tag !== "Idle") return { ...initial, check }
-  if (Option.isNone(candidate)) return { ...initial, check }
+  // Only a release newer than a prepared update supersedes it.
+  const prepared = initial.transfer._tag === "Ready" || initial.transfer._tag === "InstallationFailed" ? Option.some(initial.transfer.version) : Option.none()
+  if (Option.isNone(candidate) || Option.exists(prepared, version => !isNewerVersion(candidate.value.version, version))) return { ...initial, check }
   if (action === "check") return { ...initial, check,
     transfer: { _tag: "Available", version: candidate.value.version, bytes: candidate.value.bytes, failed: yield* heldUpdateFailure(store, candidate.value.version) } } satisfies ApplicationUpdateState
   yield* store.removeAbandonedTransfers

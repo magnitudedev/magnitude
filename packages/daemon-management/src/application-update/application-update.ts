@@ -1,4 +1,5 @@
 import { Clock, Context, Effect, ExecutionStrategy, Exit, Fiber, Option, Schema, Scope, Stream, SubscriptionRef } from "effect"
+import { isNewerVersion } from "@magnitudedev/release"
 import { UpdateFailureReason, UpdateRelease, type UpdateCheckReason } from "@magnitudedev/release/hosted-update"
 import type { ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { UpdatePreferences } from "../desktop-native/update-preferences"
@@ -55,6 +56,13 @@ export const heldUpdateFailure = (store: PreparedUpdateStore, version: string) =
   Effect.map(Option.filter(hold => Option.exists(hold.version, held => held === version))),
   Effect.map(Option.map(hold => Option.getOrElse(hold.reason, () => "install" as const))), Effect.orElseSucceed(() => Option.none()))
 
+const preparedTransfer = (pending: Option.Option<PreparedUpdate>): Transfer => Option.match(pending, {
+  onNone: () => ({ _tag: "Idle" }),
+  onSome: ({ release, installation }) => installation._tag === "Unattempted"
+    ? { _tag: "Ready", version: release.version }
+    : { _tag: "InstallationFailed", version: release.version, message: installation._tag === "Failed" ? installation.reason : "The update did not complete." },
+})
+
 /** Checks and transfers have independent admission; workers belong to the application owner. */
 export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = Option.none()) => Effect.gen(function* () {
   const source = yield* ApplicationUpdateSource
@@ -65,11 +73,7 @@ export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = O
     onFailure: error => ({ _tag: "Unavailable", message: error.message }) as const,
   }))
   const owner = yield* Scope.fork(yield* Scope.Scope, ExecutionStrategy.sequential)
-  const state = yield* SubscriptionRef.make<State>({ preference, check: { _tag: "Idle" },
-    transfer: Option.isSome(pending) ? pending.value.installation._tag === "Unattempted"
-      ? { _tag: "Ready", version: pending.value.release.version }
-      : { _tag: "InstallationFailed", version: pending.value.release.version, message: pending.value.installation._tag === "Failed" ? pending.value.installation.reason : "The update did not complete." }
-      : { _tag: "Idle" } })
+  const state = yield* SubscriptionRef.make<State>({ preference, check: { _tag: "Idle" }, transfer: preparedTransfer(pending) })
   const gate = yield* Effect.makeSemaphore(1)
   let transferWorker: Option.Option<Fiber.RuntimeFiber<void, never>> = Option.none()
   const closed = new ApplicationUpdateFailed({ message: "Magnitude is quitting." })
@@ -128,12 +132,18 @@ export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = O
       Effect.flatMap(candidate => gate.withPermits(1)(Effect.gen(function* () {
         const current = yield* SubscriptionRef.get(state)
         if (current.transfer._tag === "Closed") return
-        const replaceable = ["Idle", "Available", "Failed"].includes(current.transfer._tag)
-        const failed = Option.isSome(candidate) ? yield* heldUpdateFailure(store, candidate.value.version) : Option.none()
+        const settled = ["Idle", "Available", "Failed", "Ready", "InstallationFailed"].includes(current.transfer._tag)
+        // The newest release is always the one offered: a newer candidate supersedes a prepared update,
+        // which stays installable on disk until the candidate's own preparation replaces it, so a state
+        // that no longer shows it reads it back.
+        const prepared: Transfer = current.transfer._tag === "Ready" || current.transfer._tag === "InstallationFailed" ? current.transfer
+          : settled ? yield* store.read.pipe(Effect.map(preparedTransfer), Effect.orElseSucceed((): Transfer => ({ _tag: "Idle" }))) : { _tag: "Idle" }
+        const offered = Option.filter(candidate, release => prepared._tag !== "Ready" && prepared._tag !== "InstallationFailed" || isNewerVersion(release.version, prepared.version))
+        const failed = Option.isSome(offered) ? yield* heldUpdateFailure(store, offered.value.version) : Option.none()
         const next: State = { ...current, check: { _tag: "Succeeded", at: yield* Clock.currentTimeMillis },
-          transfer: replaceable ? Option.isSome(candidate) ? { _tag: "Available", candidate: candidate.value, failed } : { _tag: "Idle" } : current.transfer }
+          transfer: settled ? Option.isSome(offered) ? { _tag: "Available", candidate: offered.value, failed } : prepared : current.transfer }
         yield* SubscriptionRef.set(state, next)
-        if (replaceable && Option.isSome(candidate) && autoEnabled(next) && Option.isNone(failed)) yield* startDownload(candidate.value, true)
+        if (settled && Option.isSome(offered) && autoEnabled(next) && Option.isNone(failed)) yield* startDownload(offered.value, true)
       }))),
       Effect.catchAll(error => gate.withPermits(1)(SubscriptionRef.update(state, (current): State => current.transfer._tag === "Closed" ? current
         : { ...current, check: { _tag: "Failed", message: error.message } }))),

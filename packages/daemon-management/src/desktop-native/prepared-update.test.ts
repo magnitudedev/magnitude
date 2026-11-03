@@ -134,6 +134,35 @@ describe("one durable prepared update", () => {
       expect((yield* store.prepare(archive, release, "1.0.0").pipe(Effect.either))._tag).toBe("Left")
     }))
   })
+  it("replaces an older preparation with a newer release and refuses the same or an older one", async () => {
+    const newerBytes = Buffer.from("a newer complete verified installer")
+    const newer = await Effect.runPromise(signUpdateRelease({ version: "2.1.0", bytes: newerBytes.length, sha256: createHash("sha256").update(newerBytes).digest("hex") }, target, key.privateKey))
+    const newerArchive = join(root, "newer-download")
+    await writeFile(newerArchive, newerBytes)
+    await run(Effect.gen(function* () {
+      const store = yield* make
+      yield* store.prepare(archive, release, "1.0.0")
+      yield* store.prepare(newerArchive, newer, "1.0.0")
+      expect(Option.getOrThrow(yield* store.read)).toEqual({ release: newer, from: Option.some("1.0.0"), installation: { _tag: "Unattempted" } })
+      yield* store.verify(newer)
+      expect((yield* store.prepare(newerArchive, newer, "1.0.0").pipe(Effect.either))._tag).toBe("Left")
+      expect((yield* store.prepare(archive, release, "1.0.0").pipe(Effect.either))._tag).toBe("Left")
+      expect(Option.getOrThrow(yield* store.read).release).toEqual(newer)
+    }))
+    expect(await readFile(join(root, "updates/magnitude.deb"))).toEqual(newerBytes)
+    expect((await readdir(join(root, "updates"))).sort()).toEqual(["magnitude.deb", "update.json"])
+  })
+  it("keeps the older preparation when a newer download fails verification", async () => {
+    const newer = await Effect.runPromise(signUpdateRelease({ version: "2.1.0", bytes: bytes.length, sha256: "b".repeat(64) }, target, key.privateKey))
+    await run(Effect.gen(function* () {
+      const store = yield* make
+      yield* store.prepare(archive, release, "1.0.0")
+      expect((yield* store.prepare(archive, newer, "1.0.0").pipe(Effect.either))._tag).toBe("Left")
+      expect(Option.getOrThrow(yield* store.read).release).toEqual(release)
+      yield* store.verify(release)
+    }))
+    expect((await readdir(join(root, "updates"))).sort()).toEqual(["magnitude.deb", "update.json"])
+  })
   it("cleans an abandoned transfer and orphan installer without touching identity or config", async () => {
     await writeFile(join(root, "identity.pem"), "private identity")
     await writeFile(join(root, "config.json"), "{}")

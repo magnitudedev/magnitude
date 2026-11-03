@@ -75,7 +75,20 @@ describe("finite application update preparation", () => {
     const { pending, events, provide } = yield* fixture
     yield* Ref.set(pending, Option.some({ release, from: Option.none(), installation: tag === "Failed" ? { _tag: tag, kind: "install", reason: "Install failed" } : { _tag: tag } }))
     expect((yield* provide(runFiniteUpdatePreparation("download"))).transfer._tag).toBe(tag === "Unattempted" ? "Ready" : "InstallationFailed")
-    expect(events).toEqual(["read"])
+    expect(events).toEqual(["read", "check"])
+  })))
+  it.each(["check", "download"] as const)("%s offers a newer release over an older prepared update", action => run(Effect.gen(function* () {
+    const { pending, events, provide } = yield* fixture
+    const older = yield* signUpdateRelease({ version: "0.1.5", bytes: 1, sha256: createHash("sha256").update("x").digest("hex") }, { os: "darwin", arch: "arm64", package: "mac-zip" }, key.privateKey)
+    yield* Ref.set(pending, Option.some({ release: older, from: Option.none(), installation: { _tag: "Unattempted" } }))
+    const state = yield* provide(runFiniteUpdatePreparation(action))
+    if (action === "check") {
+      expect(state.transfer).toEqual({ _tag: "Available", version: release.version, bytes: release.bytes, failed: Option.none() })
+      expect(Option.getOrThrow(yield* Ref.get(pending)).release.version).toBe(older.version)
+    } else {
+      expect(state.transfer).toEqual({ _tag: "Ready", version: release.version })
+      expect(events).toContain("publish")
+    }
   })))
   it("keeps retained state when discard fails", () => run(Effect.gen(function* () {
     const { pending, provide, store } = yield* fixture

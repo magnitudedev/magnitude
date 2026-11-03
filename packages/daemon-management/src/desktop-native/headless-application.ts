@@ -137,11 +137,14 @@ export const runHeadlessApplication = (options: {
     Effect.zipRight(options.observe(state)))), Effect.forkScoped)
   if (options.installWhenIdle) {
     const decide = options.installWhenIdle
-    // A newer download interrupts waiting for the previous one.
-    yield* updates.changes.pipe(Stream.map(state => state.transfer), Stream.filter(transfer => transfer._tag === "Ready"),
-      Stream.map(transfer => transfer.version), Stream.changes,
-      Stream.flatMap(version => Stream.fromEffect(Deferred.await(firstReady).pipe(
-        Effect.zipRight(decide(version, report("scheduled"))))), { switch: true }),
+    // Installing waits for the launch check, so a newer release found there supersedes a download
+    // made before this start; one still unanswered after a while no longer holds the install back.
+    const launchChecked = updates.changes.pipe(Stream.filter(state => state.check._tag === "Succeeded" || state.check._tag === "Failed"),
+      Stream.take(1), Stream.runDrain, Effect.timeout("30 seconds"), Effect.ignore)
+    // Any change away from a ready download, such as a newer one starting, interrupts waiting for it.
+    yield* updates.changes.pipe(Stream.map(state => state.transfer._tag === "Ready" ? Option.some(state.transfer.version) : Option.none()), Stream.changes,
+      Stream.flatMap(version => Option.match(version, { onNone: () => Stream.empty, onSome: version => Stream.fromEffect(Deferred.await(firstReady).pipe(
+        Effect.zipRight(launchChecked), Effect.zipRight(decide(version, report("scheduled"))))) }), { switch: true }),
       Stream.filter(install => install), Stream.take(1),
       Stream.runForEach(() => Deferred.succeed(stop, "InstallUpdate")), Effect.forkScoped)
   }

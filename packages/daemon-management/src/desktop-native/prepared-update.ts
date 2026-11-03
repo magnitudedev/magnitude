@@ -2,6 +2,7 @@ import { FileSystem } from "@effect/platform"
 import { Context, Effect, Option, Schema, Stream } from "effect"
 import { createHash, randomUUID, type KeyObject } from "node:crypto"
 import { join, dirname, basename } from "node:path"
+import { isNewerVersion } from "@magnitudedev/release"
 import { UpdateFailureReason, UpdateOutcome, UpdateRelease, Version, verifyUpdateRelease, updateInstallerFilename, type ReleaseTarget } from "@magnitudedev/release/hosted-update"
 import { PrivateFilePermissions } from "./private-files"
 
@@ -183,7 +184,8 @@ export const makePreparedUpdateStore = (options: {
       Effect.zipRight(discard)),
     prepare: (archive, release, from) => Effect.gen(function* () {
       yield* verifyUpdateRelease(release, options.target, options.trustedPublishers)
-      if (Option.isSome(yield* read)) return yield* failed("An update is already prepared.")
+      const current = yield* read
+      if (Option.isSome(current) && !isNewerVersion(release.version, current.value.release.version)) return yield* failed("An update is already prepared.")
       yield* permissions.prepareDirectory(directory)
       const temporary = join(directory, `installer-${randomUUID()}.tmp`)
       yield* Effect.acquireUseRelease(permissions.createFile(temporary), () => Effect.gen(function* () {
@@ -191,6 +193,12 @@ export const makePreparedUpdateStore = (options: {
         yield* verifyFile(temporary, release)
         yield* Effect.scoped(fs.open(temporary, { flag: "r+" }).pipe(Effect.flatMap(file => file.sync)))
         yield* Effect.gen(function* () {
+          // A newer release replaces an older preparation. Its metadata goes first: an interruption then
+          // leaves no preparation, and cleanup removes the orphan installer, never a mismatched pair.
+          if (Option.isSome(current)) {
+            yield* fs.remove(metadata, { force: true })
+            yield* syncDirectory
+          }
           yield* fs.rename(temporary, installer)
           yield* syncDirectory
           yield* write({ release, from: Option.some(from), installation: { _tag: "Unattempted" } })

@@ -1,7 +1,7 @@
 import { generateKeyPairSync } from 'node:crypto'
 import { Deferred, Effect, Option, Ref, Schema, Scope, Stream } from "effect"
 import { UpdateManifest, PublisherKeyId, signUpdateManifest } from "../../../release/src/hosted-update/manifest"
-import { PreparedUpdateStore, PreparedUpdateFailed, UpdatePreferences, UpdatePreferencesFailed, type UnattendedHold } from "@magnitudedev/daemon-management/desktop-native"
+import { PreparedUpdateStore, PreparedUpdateFailed, UpdatePreferences, UpdatePreferencesFailed, type PreparedUpdate, type UnattendedHold } from "@magnitudedev/daemon-management/desktop-native"
 import { describe, expect, it } from "vitest"
 import { ApplicationUpdateFailed, ApplicationUpdateSource, makeApplicationUpdate, type ApplicationUpdate } from "./application-update"
 
@@ -213,6 +213,73 @@ describe("application-owned updates", () => {
     expect((yield* owner.requireReady.pipe(Effect.either))._tag).toBe("Left")
   })))
 
+  describe("a newer release than the prepared update", () => {
+    const newer = { ...candidate, version: "2.1.0" }
+    const owner = (options: { readonly auto: boolean, readonly installation?: PreparedUpdate["installation"], readonly offers: Ref.Ref<Option.Option<typeof candidate>>,
+      readonly download?: Effect.Effect<string, ApplicationUpdateFailed> }) => Effect.gen(function* () {
+      const store = yield* PreparedUpdateStore
+      const saved = yield* Ref.make(Option.some<PreparedUpdate>({ release: candidate, from: Option.some("1.0.0"), installation: options.installation ?? { _tag: "Unattempted" } }))
+      const downloads = yield* Ref.make<string[]>([])
+      const update = yield* makeApplicationUpdate(yield* Ref.get(saved)).pipe(
+        Effect.provideService(PreparedUpdateStore, { ...store, read: Ref.get(saved) }),
+        Effect.provideService(UpdatePreferences, { read: Effect.succeed(options.auto), write: () => Effect.void }),
+        Effect.provideService(ApplicationUpdateSource, {
+          check: () => Ref.get(options.offers),
+          download: release => Ref.update(downloads, all => [...all, release.version]).pipe(Effect.zipRight(options.download ?? Effect.succeed("archive"))),
+          stage: (_, release) => Ref.set(saved, Option.some({ release, from: Option.some("1.0.0"), installation: { _tag: "Unattempted" } })),
+        }))
+      return { update, saved, downloads }
+    })
+    const checked = (update: ApplicationUpdate) => update.changes.pipe(Stream.filter(state => state.check._tag === "Succeeded"), Stream.take(1), Stream.runDrain)
+
+    it("downloads it automatically and replaces the prepared update", () => run(Effect.gen(function* () {
+      const { update, saved, downloads } = yield* owner({ auto: true, offers: yield* Ref.make(Option.some(newer)) })
+      expect((yield* update.state).transfer).toEqual({ _tag: "Ready", version: candidate.version })
+      yield* update.check("scheduled")
+      yield* update.changes.pipe(Stream.filter(state => state.transfer._tag === "Ready" && state.transfer.version === newer.version), Stream.take(1), Stream.runDrain)
+      expect(yield* Ref.get(downloads)).toEqual([newer.version])
+      expect(Option.getOrThrow(yield* Ref.get(saved)).release.version).toBe(newer.version)
+      yield* update.requireReady
+    })))
+    it("offers it for download when automatic downloads are off", () => run(Effect.gen(function* () {
+      const { update, downloads } = yield* owner({ auto: false, offers: yield* Ref.make(Option.some(newer)) })
+      yield* update.check("scheduled")
+      yield* checked(update)
+      expect((yield* update.state).transfer).toEqual({ _tag: "Available", version: newer.version, bytes: newer.bytes, failed: Option.none() })
+      expect(yield* Ref.get(downloads)).toEqual([])
+      yield* update.download
+      yield* update.changes.pipe(Stream.filter(state => state.transfer._tag === "Ready" && state.transfer.version === newer.version), Stream.take(1), Stream.runDrain)
+      expect(yield* Ref.get(downloads)).toEqual([newer.version])
+    })))
+    it("supersedes a prepared update that failed to install", () => run(Effect.gen(function* () {
+      const { update, downloads } = yield* owner({ auto: true, installation: { _tag: "Failed", kind: "install", reason: "The installer failed" }, offers: yield* Ref.make(Option.some(newer)) })
+      expect((yield* update.state).transfer._tag).toBe("InstallationFailed")
+      yield* update.check("scheduled")
+      yield* update.changes.pipe(Stream.filter(state => state.transfer._tag === "Ready" && state.transfer.version === newer.version), Stream.take(1), Stream.runDrain)
+      expect(yield* Ref.get(downloads)).toEqual([newer.version])
+    })))
+    it("keeps the prepared update installable when the newer download fails, and offers it again once the release is gone", () => run(Effect.gen(function* () {
+      const offers = yield* Ref.make(Option.some(newer))
+      const { update, saved } = yield* owner({ auto: true, offers, download: new ApplicationUpdateFailed({ message: "Network down" }) })
+      yield* update.check("scheduled")
+      yield* waitFor(update, "Failed")
+      expect(Option.getOrThrow(yield* Ref.get(saved)).release.version).toBe(candidate.version)
+      yield* Ref.set(offers, Option.none())
+      yield* update.check("scheduled")
+      yield* checked(update)
+      expect((yield* update.state).transfer).toEqual({ _tag: "Ready", version: candidate.version })
+      yield* update.requireReady
+    })))
+    it("does not download a newer version held after its own failure", () => run(Effect.gen(function* () {
+      const store = yield* PreparedUpdateStore
+      const { update, downloads } = yield* owner({ auto: true, offers: yield* Ref.make(Option.some(newer)) }).pipe(Effect.provideService(PreparedUpdateStore, {
+        ...store, hold: Effect.succeed(Option.some({ version: Option.some(newer.version), reason: Option.some("install" as const), until: 0 })) }))
+      yield* update.check("scheduled")
+      yield* checked(update)
+      expect((yield* update.state).transfer).toEqual({ _tag: "Available", version: newer.version, bytes: newer.bytes, failed: Option.some("install") })
+      expect(yield* Ref.get(downloads)).toEqual([])
+    })))
+  })
   describe("after an unattended installation failed", () => {
     const owner = (hold: Ref.Ref<Option.Option<UnattendedHold>>, offer: typeof candidate, downloads: Ref.Ref<string[]>) => Effect.gen(function* () {
       const store = yield* PreparedUpdateStore
