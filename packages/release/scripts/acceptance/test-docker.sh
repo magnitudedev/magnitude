@@ -34,8 +34,10 @@ cleanup() {
 trap cleanup EXIT
 
 # The published port arrives from the bridge, not loopback, so the service treats it as another device.
+# The smoke test never contacts magnitude.dev.
 # shellcheck disable=SC2086
 docker run --detach --name "$name" \
+  --add-host magnitude.dev:127.0.0.1 \
   --mount "type=volume,source=$volume,target=/data" \
   --env "MAGNITUDE_NETWORK_KEY=$key" \
   --publish 127.0.0.1::10100 \
