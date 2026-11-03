@@ -568,14 +568,14 @@ function NetworkAccessRows() {
   const regenerate = useAtomSet(client.Configuration.RegenerateNetworkApiKey)
   const regenerating = useAtomValue(client.Configuration.RegenerateNetworkApiKey)
   const current = Result.isSuccess(settings) ? settings.value : null
-  // A container's environment and config.json set network access; Settings only shows it.
+  // A container always serves on every interface with a key, set by its environment; Settings only shows it.
   const managed = current?.container === true
   const busy = updating.waiting || regenerating.waiting || managed
   const failure = firstFailure([updating, regenerating])
   const reachable = current?.enabled ? Option.getOrElse(current.bind, () => current.interfaces[0]?.address) : undefined
   return <>
     {disconnect.dialog}
-    <SettingsRow label="Network access" hint={current ? <>{managed ? "Set by the container: MAGNITUDE_NETWORK_KEY sets the key, MAGNITUDE_ALLOWED_HOSTS adds host names, and a network block in config.json overrides the default. " : "Let other devices on your network use Magnitude for inference. "}<a href={managed ? "https://docs.magnitude.dev/installation/docker" : "https://docs.magnitude.dev/remote-server"} target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 font-medium text-slate-700 hover:underline dark:text-slate-300">{managed ? "Docker guide" : "Remote server guide"}<ArrowUpRightIcon aria-hidden="true" className="size-3" /></a></> : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="240px" /> : undefined}
+    <SettingsRow label="Network access" hint={current ? <>{managed ? "Set by the container: it accepts connections on every interface with an API key. MAGNITUDE_NETWORK_KEY sets the key and MAGNITUDE_ALLOWED_HOSTS adds host names. " : "Let other devices on your network use Magnitude for inference. "}<a href={managed ? "https://docs.magnitude.dev/installation/docker" : "https://docs.magnitude.dev/remote-server"} target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 font-medium text-slate-700 hover:underline dark:text-slate-300">{managed ? "Docker guide" : "Remote server guide"}<ArrowUpRightIcon aria-hidden="true" className="size-3" /></a></> : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="240px" /> : undefined}
       alert={!busy && failure ? <ErrorNotice title="Network settings weren’t saved" description="Your previous saved settings are still in use." /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read network settings" description="The running service’s network settings have not been changed." /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title="The saved network address is invalid" description="All interfaces are selected. Choose an address below to save a valid setting." /> : undefined}
       control={current && <Switch aria-label="Network access" checked={current.enabled} disabled={busy} onCheckedChange={checked => checked ? update({ enabled: Option.some(true) }) : disconnect.warn("TurnOffNetworkAccess", () => update({ enabled: Option.some(false) }))} />} />
     {current?.enabled && <>
