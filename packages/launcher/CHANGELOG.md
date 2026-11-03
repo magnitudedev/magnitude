@@ -1,5 +1,51 @@
 # @magnitudedev/cli
 
+## 0.2.16
+
+### Patch Changes
+
+- [`b4eb689`](https://github.com/magnitudedev/magnitude/commit/b4eb689ee384cfdc16fd628de0727f3044eddc7f) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Fix concurrent chats with a shared prompt prefix unloading the model with "target state capacity changed after availability check" ([#237](https://github.com/magnitudedev/magnitude/issues/237), reported by @Wenjix). Requests that continue the same cached prefix now grow together instead of failing every request in flight.
+
+  Concurrent requests that share a long prompt, such as an agent's parallel subagents, are also much faster:
+
+  - A request now waits for another request that is already computing their shared prefix and reuses it, instead of computing it again. With a draft model, 8 concurrent requests sharing a 15K-token prompt went from 226 s each to 3.5 s on an NVIDIA A10G.
+  - A shared prefix stays cached after a batch finishes, so repeating it is fast: 4 concurrent requests on a 13.6K-token prompt went from 12 s to 0.7 s, and 8 from 24 s to 1.2 s.
+  - Long conversations running side by side recompute their history from scratch less often.
+
+- [`b4eb689`](https://github.com/magnitudedev/magnitude/commit/b4eb689ee384cfdc16fd628de0727f3044eddc7f) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Run Magnitude in Docker with the official image, `magnitudedev/magnitude`, for x64 and ARM64 Linux. See [Docker](https://docs.magnitude.dev/installation/docker).
+
+  - NVIDIA GPUs work through the NVIDIA Container Toolkit, and AMD and Intel GPUs through Vulkan. On a Mac, a container can't use the GPU through Metal, so install the macOS app for full speed.
+  - Models, settings and the network key live on the `/data` volume and survive upgrades. On first start the container creates a network key and prints it to `docker logs`.
+  - A container's memory limit sets which models fit, so models aren't loaded into memory the container can't use.
+  - Update notices tell you which `docker pull` to run, since the container doesn't update itself.
+  - Docker Compose, Kubernetes and Podman, including rootless Podman, are supported, and a native installation's data can be mounted to keep its models.
+
+- [`b764553`](https://github.com/magnitudedev/magnitude/commit/b7645534de59b20de335800e241eac58f8f67399) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Removing a downloaded model no longer unloads and reloads the model in use, which paused its requests and dropped its cached prompts.
+
+  - Stopping a model while it is still preparing no longer starts another load.
+  - Fix the service sometimes stopping responding when the model list was read while a download or removal was being recorded.
+  - On Linux, a software Vulkan device such as llvmpipe is no longer counted as a GPU.
+  - After a model fails to load, the message suggests trying again only when trying again can help.
+
+- [`b4eb689`](https://github.com/magnitudedev/magnitude/commit/b4eb689ee384cfdc16fd628de0727f3044eddc7f) Thanks [@anerli](https://github.com/anerli)! - Run more GGUF quantizations, and run several existing ones smaller and faster, on CUDA, Metal, Vulkan and CPU.
+
+  - Q1_0, IQ1_S, IQ1_M, IQ2_S and TQ1_0 models now load and run.
+  - Q2_K, Q3_K, Q4_1, IQ3_S, IQ4_XS, IQ4_NL and TQ2_0 stay at their own size instead of being expanded when loaded. For example, Q3_K goes from 6.56 to 3.44 bits per weight, so larger models fit.
+  - Decoding is faster for many formats: on CUDA, 13–23% for Q4_1, Q5_0, Q5_1, Q2_K, Q4_K and Q5_K, and 2.5× for IQ3_XXS. On Metal, small batches of Q8_0, Q5_0 and several IQ formats are 29–35% faster. Q3_K prefill on CUDA is 29% faster.
+
+- [`b4eb689`](https://github.com/magnitudedev/magnitude/commit/b4eb689ee384cfdc16fd628de0727f3044eddc7f) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - With network access on all interfaces, Magnitude now accepts IPv6 connections as well as IPv4.
+
+  - A model loaded on a GPU and sitting idle no longer writes a log line every second.
+
+- [`b764553`](https://github.com/magnitudedev/magnitude/commit/b7645534de59b20de335800e241eac58f8f67399) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Fix a model staying slower than it should when it was used while its one-time optimization was running after download. Loading it, chatting with it in the app, or sending it a request from the API or an agent stopped the optimization part way, and the model kept the untuned settings. The optimization now finishes, either during that load or later when the device is free.
+
+  - Discover and My Models show "Optimizing" while the optimization runs, and "Optimization pending" while it waits to run when no model is loaded.
+  - After this update, each downloaded model optimizes once more, so its next optimization or first load takes about a minute longer.
+
+- [`8972965`](https://github.com/magnitudedev/magnitude/commit/8972965f49543f86734ff1b4ffb9acbe1587d52e) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Save chat settings as defaults for each model ([#234](https://github.com/magnitudedev/magnitude/issues/234)). Chat settings now show whether a chat uses the standard settings, your defaults for its model, or has changed from them, with Save as default, Revert and Reset to standard. New chats and model switches start from that model's defaults, including the thinking level, system prompt, sampling settings, seed and stop sequences, and the defaults are kept across restarts and updates.
+
+- [`3b0cabd`](https://github.com/magnitudedev/magnitude/commit/3b0cabd99addac637de414b16eba1b474890b08c) Thanks [@anerli](https://github.com/anerli)! - Fix slow decoding on Linux with NVIDIA GPUs ([#235](https://github.com/magnitudedev/magnitude/issues/235), reported by @puhuk). Every memory check during decoding read the memory budget of every GPU through every backend, re-enumerating Vulkan devices each time, even when the model ran on CUDA. Memory checks now read only the device in use, and Vulkan budgets are read from the device handle found at discovery. On two A100s with the reported driver (580.178.04), a Qwen3.5 4B decode step went from 13.0 to 6.7 ms, and prefill is 32% faster.
+
 ## 0.2.15
 
 ### Patch Changes
