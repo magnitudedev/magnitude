@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
-import type { LocalInferenceHardware, ModelLoadDevice, ModelOptimizationProgress } from "@magnitudedev/sdk"
+import type { LocalInferenceHardware, ModelLoadDevice, ModelOptimizationProgress, ModelResidency } from "@magnitudedev/sdk"
 import {
+  modelOptimizationPendingIdle,
   MEMORY_PRESSURE_TITLE,
   describeMemoryShortage,
   describeModelLoadFailure,
@@ -28,6 +29,21 @@ describe("model optimization wording", () => {
     expect(formatModelOptimization(preparing)).toBe("Optimizing")
     expect(formatModelOptimization(tuning)).toBe("Optimizing 42%")
     expect(formatModelOptimization({ ...tuning, completed: 232, total: 400 })).toBe("Optimizing 58%")
+  })
+
+  it("reads a pending optimization as pending only while nothing of the model runs", () => {
+    const installation = { _tag: "Resolved", installedBytes: 1, primaryPath: "/m.gguf", ownership: "Magnitude" } as never
+    const pending = (residencyState: ModelResidency) => ({ _tag: "OptimizationPending" as const, installation, residencyState })
+
+    expect(modelOptimizationPendingIdle(pending({ _tag: "Unloaded" }))).toBe(true)
+    expect(modelOptimizationPendingIdle(pending({ _tag: "Stopped", reason: "user_stop" }))).toBe(true)
+    expect(modelOptimizationPendingIdle(pending({ _tag: "Ready" } as never))).toBe(false)
+    expect(modelOptimizationPendingIdle(pending({ _tag: "Requested" }))).toBe(false)
+    expect(modelOptimizationPendingIdle({ _tag: "Installed", installation, residencyState: { _tag: "Unloaded" } })).toBe(false)
+    expect(modelOptimizationPendingIdle({
+      _tag: "Optimizing", installation, residencyState: { _tag: "Unloaded" },
+      progress: { stage: "tuning", completed: 1, total: 2, device: Option.none() },
+    })).toBe(false)
   })
 })
 

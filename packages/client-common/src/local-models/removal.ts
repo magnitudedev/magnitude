@@ -11,7 +11,8 @@ export type RemovalKind = "delete" | "hide" | "parts"
 export const acquiringCatalogParts = (model: LocalModel): boolean =>
   model._tag === "Catalog"
   && installedAcquisition(model.acquisitionState)?.installation.ownership === "External"
-  && (model.acquisitionState._tag === "Updating" || model.acquisitionState._tag === "Optimizing")
+  && (model.acquisitionState._tag === "Updating" || model.acquisitionState._tag === "Optimizing"
+    || model.acquisitionState._tag === "OptimizationPending")
 
 export const removalKind = (model: LocalModel): RemovalKind => {
   if (model._tag === "Catalog") {

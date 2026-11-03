@@ -8,6 +8,8 @@ import {
   formatLocalModelDisplayName,
   formatModelLoadPercentage,
   formatModelOptimization,
+  MODEL_OPTIMIZATION_PENDING,
+  MODEL_OPTIMIZATION_PENDING_DETAIL,
   modelOptimizationFraction,
   formatStorageSize,
   localModelIsInstalled,
@@ -193,6 +195,10 @@ const modelStatus = (model: LocalModel): string => {
     case "InstallFailed": return `Failed - ${downloadFailureText(acquisition.failure, modelRepository(model.modelId))}`
     case "UpdateFailed": return `Failed - ${downloadFailureText(acquisition.failure, modelRepository(model.modelId))}`
     case "Optimizing": return formatModelOptimization(acquisition.progress)
+    case "OptimizationPending": {
+      const status = readyStatus(model)
+      return status === UNLOADED ? MODEL_OPTIMIZATION_PENDING : `${status} - ${MODEL_OPTIMIZATION_PENDING}`
+    }
     case "RemoveFailed": return `Failed - ${acquisition.failure.message}`
     case "NotInstalled": return "Not installed"
     case "Unavailable": return `Unavailable - ${acquisition.failure.message}`
@@ -319,6 +325,10 @@ const installationFields = (model: LocalModel): readonly (readonly [string, stri
       onNone: () => [],
       onSome: (fraction) => [["Progress", formatModelLoadPercentage(fraction)]] as const,
     }),
+  ]
+  if (state._tag === "OptimizationPending") return [
+    ["Installation", "Installed"],
+    ["Optimization", `Pending - ${MODEL_OPTIMIZATION_PENDING_DETAIL}`],
   ]
   if (state._tag === "InstallFailed" || state._tag === "UpdateFailed") return [
     ["Installation", "Failed"],

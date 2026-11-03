@@ -464,6 +464,26 @@ describe("catalog acquisition projection", () => {
     })
   })
 
+  it("projects an optimization waiting for the device as pending, neither tuning nor done", () => {
+    const installation = { _tag: "Resolved", installedBytes: 1, primaryPath: "/model.gguf", ownership: "Magnitude" }
+    const model = {
+      desired: { metadata: { storageBytes: 7 } },
+      localState: { _tag: "Installed", installation, updateState: { _tag: "Current" } },
+    } as unknown as CatalogModel
+    const operation = {
+      state: {
+        _tag: "Optimizing",
+        progress: { stage: "waiting", completed: 0, total: 0, device: Option.some({ id: "metal:0", backend: "metal" }) },
+      },
+    } as unknown as CatalogInstallationOperation
+
+    expect(catalogAcquisition(model, operation, { _tag: "Ready" } as never)).toEqual({
+      _tag: "OptimizationPending",
+      installation,
+      residencyState: { _tag: "Ready" },
+    })
+  })
+
   it("keeps an optimizing download finishing until the catalog observes its installation", () => {
     const model = {
       desired: { metadata: { storageBytes: 7 } },

@@ -615,6 +615,8 @@ export const LocalModelAcquisitionStateSchema = Schema.Union(
     ...InstalledModelFields,
     progress: ModelOptimizationProgressSchema,
   }),
+  /** That tuning has not finished and waits for the device, which a loaded model holds; the model is installed and loads meanwhile. */
+  Schema.TaggedStruct("OptimizationPending", InstalledModelFields),
   Schema.TaggedStruct("Removing", InstalledModelFields),
   Schema.TaggedStruct("RemoveFailed", {
     ...InstalledModelFields,
@@ -636,6 +638,7 @@ export const installedAcquisition = (
   || state._tag === "Updating"
   || state._tag === "UpdateFailed"
   || state._tag === "Optimizing"
+  || state._tag === "OptimizationPending"
   || state._tag === "Removing"
   || state._tag === "RemoveFailed"
   ? state

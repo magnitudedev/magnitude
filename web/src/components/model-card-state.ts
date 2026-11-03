@@ -1,7 +1,7 @@
 import { Option } from "effect"
 import {
   catalogDrafterState, catalogVariantOfName, customModelDrafterOffer, describeModelLoadStage, formatModelParameters, formatModelReleaseAge,
-  localModelSpeculativeMethodLabel,
+  localModelSpeculativeMethodLabel, MODEL_OPTIMIZATION_PENDING, modelOptimizationPendingIdle,
 } from "@magnitudedev/client-common"
 import type { LocalInferenceHardware, LocalModel, ModelTransferProgress } from "@magnitudedev/sdk"
 import { modelLab } from "./model-logo"
@@ -92,6 +92,7 @@ export const modelCardStatus = (model: LocalModel, hardware: Option.Option<Local
     case "InstallFailed": return { label: "Not downloaded", tone: "problem" }
     case "UpdateFailed": return { label: "Update incomplete", tone: "problem" }
   }
+  if (modelOptimizationPendingIdle(acquisition)) return { label: MODEL_OPTIMIZATION_PENDING, tone: "stored" }
   if (!("residencyState" in acquisition)) return { label: "Not downloaded", tone: "absent" }
   const residency = acquisition.residencyState
   switch (residency._tag) {

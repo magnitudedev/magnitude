@@ -553,7 +553,7 @@ export const CatalogOptimizationProgress = S.Struct({
 export type CatalogOptimizationProgress = S.Schema.Type<typeof CatalogOptimizationProgress>
 export type CatalogOptimizationProgressEncoded = S.Schema.Encoded<typeof CatalogOptimizationProgress>
 
-export const CatalogOptimizationStage = S.Union(S.Literal("preparing"), S.Literal("tuning"))
+export const CatalogOptimizationStage = S.Union(S.Literal("waiting"), S.Literal("preparing"), S.Literal("tuning"))
 export type CatalogOptimizationStage = S.Schema.Type<typeof CatalogOptimizationStage>
 export type CatalogOptimizationStageEncoded = S.Schema.Encoded<typeof CatalogOptimizationStage>
 

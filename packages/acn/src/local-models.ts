@@ -271,11 +271,13 @@ export const catalogAcquisition = (
       ? { _tag: "Installing", progress: {
           stage: "publishing", completedBytes: storageBytes, totalBytes: storageBytes, bytesPerSecond: Option.none(),
         } }
-      : {
-          _tag: "Optimizing",
-          ...installed,
-          progress: { stage, completed, total, device: Option.map(device, projectInferenceLoadDevice) },
-        }
+      : stage === "waiting"
+        ? { _tag: "OptimizationPending", ...installed }
+        : {
+            _tag: "Optimizing",
+            ...installed,
+            progress: { stage, completed, total, device: Option.map(device, projectInferenceLoadDevice) },
+          }
   }
   if (operation?.state._tag === "Failed" && !operation.state.acknowledged
     && !(model.localState._tag === "Installed" && model.localState.updateState._tag === "Current")) {

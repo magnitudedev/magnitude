@@ -96,6 +96,7 @@ struct EngineResidency {
     environment: Arc<ResidencyEnvironment>,
     client: ResidencyClient<ResidentEngine>,
     supervisor: MemorySupervisor,
+    preparations: PreparationJobs,
     next_instance_id: Arc<AtomicU64>,
 }
 
@@ -130,10 +131,12 @@ impl ModelInstances {
             thresholds,
             client.notifier(),
         );
+        let preparations = PreparationJobs::default();
         let driver = EngineResidency {
             environment: Arc::clone(&environment),
             client: client.clone(),
             supervisor: supervisor.clone(),
+            preparations: preparations.clone(),
             next_instance_id: Arc::new(AtomicU64::new(1)),
         };
         tokio::spawn(ModelResidency::new(driver).run(inbox));
@@ -141,7 +144,7 @@ impl ModelInstances {
             environment,
             residency: client,
             supervisor,
-            preparations: PreparationJobs::default(),
+            preparations,
             assessments: Arc::default(),
         }
     }
@@ -166,11 +169,12 @@ impl ModelInstances {
     }
 
     /// The residency loads `target` unless it is resident, and the load's Prepare searches what
-    /// its bundle's catalog optimization would: one waiting for the device ends without running.
-    /// Marked before the residency releases another model, whose release frees the device.
-    fn requested(&self, target: &ResolvedResidencyTarget) {
+    /// its bundle's catalog optimization would: the optimization leaves the device to it while
+    /// the request lasts. Taken before the residency releases another model, whose release frees
+    /// the device.
+    fn requested(&self, target: &ResolvedResidencyTarget) -> optimization::LoadRequest {
         self.preparations
-            .loading(&servable_model_bundle_key_for_bundle(&target.configuration.bundle));
+            .request(servable_model_bundle_key_for_bundle(&target.configuration.bundle))
     }
 
     /// A fresh memory observation from the resident worker, when one is resident.
@@ -196,7 +200,7 @@ impl ModelInstances {
     pub async fn ensure_resident(&self, model_id: &str) -> Result<ModelInstance, InventoryError> {
         let target = self.target(model_id)?;
         self.admit(&target).await?;
-        self.requested(&target);
+        let _request = self.requested(&target);
         match self
             .residency
             .acquire(target, ResidencyAcquisition::Warm)
@@ -215,7 +219,7 @@ impl ModelInstances {
     ) -> Result<ResidencyLease<ResidentEngine>, InventoryError> {
         let target = self.target(model_id)?;
         self.admit(&target).await?;
-        self.requested(&target);
+        let _request = self.requested(&target);
         match self
             .residency
             .acquire(
@@ -320,7 +324,7 @@ impl CatalogModelOptimizer for ModelInstances {
     fn optimize_catalog_model(
         &self,
         model_id: ModelId,
-        progress: Box<dyn Fn(Option<CatalogOptimizationProgress>) + Send + Sync>,
+        progress: Box<dyn Fn(CatalogOptimizationProgress) + Send + Sync>,
     ) -> BoxFuture<'static, ()> {
         let environment = Arc::clone(&self.environment);
         let preparations = self.preparations.clone();
@@ -698,6 +702,12 @@ impl EngineResidency {
         let driver = self.clone();
         let load_instance = instance_id.clone();
         let load_plan = plan.clone();
+        // The bundle's catalog optimization, if one waits, shows this Prepare and ends once it
+        // has prepared the bundle.
+        let preparation = self.preparations.load(
+            servable_model_bundle_key_for_bundle(&configuration.bundle),
+            plan.device.clone(),
+        );
         let loaded = crate::spawn_blocking_traced(move || {
             // One progression across the workers: a Prepare fills `optimizing`, the Load the
             // rest.
@@ -734,6 +744,7 @@ impl EngineResidency {
                     }
                 }
             };
+            let preparation = RefCell::new(preparation);
             let loaded = load_prepared(
                 &manifest,
                 |unprepared| {
@@ -742,18 +753,24 @@ impl EngineResidency {
                         .map_err(|(_, error)| error)
                 },
                 || spawn().map(SpawnedWorker::into_process),
-                &report,
+                |progress: LoadProgress| {
+                    preparation.borrow_mut().report(progress.clone());
+                    report(progress);
+                },
             );
             match loaded {
-                Ok((loaded, preparation)) => {
-                    if let Preparation::Incomplete(error) = preparation {
+                Ok((loaded, prepared)) => {
+                    match prepared {
                         // The load is not failed by its preparation: units without a record
                         // serve their canonical defaults, and a later load prepares them.
-                        tracing::warn!(
+                        Preparation::Incomplete(error) => tracing::warn!(
                             %error,
                             "kernel preparation did not finish; the load serves canonical defaults \
                              for the units without a tuning record"
-                        );
+                        ),
+                        Preparation::Unneeded | Preparation::Prepared | Preparation::Unshared => {
+                            preparation.into_inner().prepared();
+                        }
                     }
                     Ok(loaded)
                 }

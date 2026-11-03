@@ -3844,7 +3844,7 @@ impl magnitude_service_contracts::models::CatalogModelOptimizer for NoCatalogEff
         &self,
         _model_id: ModelId,
         _progress: Box<
-            dyn Fn(Option<magnitude_service_contracts::models::CatalogOptimizationProgress>)
+            dyn Fn(magnitude_service_contracts::models::CatalogOptimizationProgress)
                 + Send
                 + Sync,
         >,

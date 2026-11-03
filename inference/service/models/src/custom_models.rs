@@ -4189,7 +4189,7 @@ mod tests {
         fn optimize_catalog_model(
             &self,
             _model_id: ModelId,
-            _progress: Box<dyn Fn(Option<magnitude_service_contracts::models::CatalogOptimizationProgress>) + Send + Sync>,
+            _progress: Box<dyn Fn(magnitude_service_contracts::models::CatalogOptimizationProgress) + Send + Sync>,
         ) -> futures_util::future::BoxFuture<'static, ()> {
             Box::pin(async {})
         }
@@ -5615,13 +5615,13 @@ mod tests {
         fn optimize_catalog_model(
             &self,
             _model_id: ModelId,
-            progress: Box<dyn Fn(Option<magnitude_service_contracts::models::CatalogOptimizationProgress>) + Send + Sync>,
+            progress: Box<dyn Fn(magnitude_service_contracts::models::CatalogOptimizationProgress) + Send + Sync>,
         ) -> futures_util::future::BoxFuture<'static, ()> {
             let waiting = Arc::clone(&self.waiting);
             let stopped = SetOnDrop(Arc::clone(&self.stopped));
             Box::pin(async move {
                 let _stopped = stopped;
-                progress(None);
+                progress(magnitude_service_contracts::models::CatalogOptimizationProgress::waiting(None));
                 waiting.store(true, Ordering::SeqCst);
                 std::future::pending::<()>().await;
             })
@@ -5629,13 +5629,14 @@ mod tests {
     }
 
     /// QA optimization-memory: an optimization deferred while another model is resident waits
-    /// for the device without gating the model. Meanwhile the installation reads as completed
-    /// (the model is installed and loadable), never as an optimization stuck preparing, and
-    /// removing the model stops the waiting job.
+    /// for the device without gating the model. Meanwhile the installation reads as an
+    /// optimization waiting for the device, neither completed (its tuning has not run) nor stuck
+    /// preparing, and removing the model stops the waiting job.
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_optimization_waiting_for_the_device_reads_completed_and_ends_with_removal() {
+    async fn an_optimization_waiting_for_the_device_reads_waiting_and_ends_with_removal() {
         use magnitude_service_contracts::models::{
             CatalogInstallationAdmission, CatalogInstallationOperationState,
+            CatalogOptimizationProgress,
             CatalogInstallations as _, InstalledModelPackages as _,
         };
 
@@ -5708,8 +5709,10 @@ mod tests {
             .operations;
         assert!(
             matches!(operations.as_slice(), [operation]
-                if operation.state == CatalogInstallationOperationState::Completed),
-            "nothing optimizes while the job waits for the device: {operations:?}"
+                if operation.state == CatalogInstallationOperationState::Optimizing {
+                    progress: CatalogOptimizationProgress::waiting(None),
+                }),
+            "the optimization waits for the device: {operations:?}"
         );
         assert!(!stopped.load(Ordering::SeqCst));
 

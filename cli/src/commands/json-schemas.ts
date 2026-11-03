@@ -93,6 +93,7 @@ const [
   updating,
   updateFailed,
   optimizing,
+  optimizationPending,
   removing,
   removeFailed,
 ] = LocalModelAcquisitionStateSchema.members
@@ -105,13 +106,14 @@ const managedAcquisitionJsonMembers = [
   Schema.Struct({ ...updating.fields, ...InstalledJsonFields }),
   Schema.Struct({ ...updateFailed.fields, ...InstalledJsonFields }),
   Schema.Struct({ ...optimizing.fields, ...InstalledJsonFields, progress: OptimizationProgressJsonSchema }),
+  Schema.Struct({ ...optimizationPending.fields, ...InstalledJsonFields }),
   Schema.Struct({ ...removing.fields, ...InstalledJsonFields }),
   Schema.Struct({ ...removeFailed.fields, ...InstalledJsonFields }),
 ] as const
 const AcquisitionStateJsonSchema = Schema.Union(...managedAcquisitionJsonMembers)
 
-const external = CustomModelAcquisitionStateSchema.members[10]
-const unavailable = CustomModelAcquisitionStateSchema.members[11]
+const external = CustomModelAcquisitionStateSchema.members[11]
+const unavailable = CustomModelAcquisitionStateSchema.members[12]
 const CustomAcquisitionStateJsonSchema = Schema.Union(
   ...managedAcquisitionJsonMembers,
   Schema.Struct({ ...external.fields, ...InstalledJsonFields }),

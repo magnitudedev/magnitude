@@ -3720,7 +3720,7 @@
       },
       "CatalogOptimizationProgress": {
         "type": "object",
-        "description": "Kernel tuning after a verified download, in tuning work units. `Preparing` opens the device\nand counts the units (0 of 0); `device` is the device a load would select, once previewed.",
+        "description": "Kernel tuning after a verified download, in tuning work units. `Waiting` has not finished and\nwaits for the device, which a resident or loading model holds (0 of 0); `Preparing` opens the\ndevice and counts the units (0 of 0); `device` is the device a load would select, once\npreviewed. A load of the model whose own Prepare tunes reports that Prepare's progress.",
         "required": [
           "stage",
           "completed",
@@ -3749,6 +3749,7 @@
       "CatalogOptimizationStage": {
         "type": "string",
         "enum": [
+          "waiting",
           "preparing",
           "tuning"
         ]

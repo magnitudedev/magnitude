@@ -2149,12 +2149,15 @@ pub struct CatalogInstallationProgress {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CatalogOptimizationStage {
+    Waiting,
     Preparing,
     Tuning,
 }
 
-/// Kernel tuning after a verified download, in tuning work units. `Preparing` opens the device
-/// and counts the units (0 of 0); `device` is the device a load would select, once previewed.
+/// Kernel tuning after a verified download, in tuning work units. `Waiting` has not finished and
+/// waits for the device, which a resident or loading model holds (0 of 0); `Preparing` opens the
+/// device and counts the units (0 of 0); `device` is the device a load would select, once
+/// previewed. A load of the model whose own Prepare tunes reports that Prepare's progress.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -2168,6 +2171,16 @@ pub struct CatalogOptimizationProgress {
 }
 
 impl CatalogOptimizationProgress {
+    #[must_use]
+    pub const fn waiting(device: Option<ModelLoadDevice>) -> Self {
+        Self {
+            stage: CatalogOptimizationStage::Waiting,
+            completed: 0,
+            total: 0,
+            device,
+        }
+    }
+
     #[must_use]
     pub const fn preparing(device: Option<ModelLoadDevice>) -> Self {
         Self {
@@ -2736,14 +2749,15 @@ pub struct CatalogInstallationsInvalidation {
 }
 
 /// Tunes a freshly installed catalog model's kernels for the device a load would select, so its
-/// first load does not. Reports progress until it finishes, and `None` while the job waits for
-/// the device, when nothing optimizes; dropping the future stops the job. A failure is the
-/// optimizer's to log: the model is installed either way.
+/// first load does not. Reports progress until it finishes, `Waiting` while the job waits for the
+/// device; the future ends once the model is tuned, or tuning is unneeded or cannot finish, and
+/// dropping it stops the job. A failure is the optimizer's to log: the model is installed either
+/// way.
 pub trait CatalogModelOptimizer: Send + Sync + 'static {
     fn optimize_catalog_model(
         &self,
         model_id: ModelId,
-        progress: Box<dyn Fn(Option<CatalogOptimizationProgress>) + Send + Sync>,
+        progress: Box<dyn Fn(CatalogOptimizationProgress) + Send + Sync>,
     ) -> BoxFuture<'static, ()>;
 }
 

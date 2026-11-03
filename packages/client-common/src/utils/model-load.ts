@@ -1,5 +1,6 @@
 import type {
   LocalInferenceHardware,
+  CustomModelAcquisitionState,
   MemoryShortage,
   ModelInstanceAllocation,
   ModelInstanceFailure,
@@ -98,6 +99,19 @@ export const describeModelOptimization = (
 ): string => progress.stage === "preparing"
   ? "Preparing to optimize…"
   : describeOptimizing(progress.device, hardware)
+
+/** Post-download optimization that has not finished and waits for the device a loaded model holds. */
+export const MODEL_OPTIMIZATION_PENDING = "Optimization pending"
+
+export const MODEL_OPTIMIZATION_PENDING_DETAIL = "One-time setup for this device runs when no model is loaded."
+
+/** Whether a model's optimization is pending while nothing of the model itself runs: a running model shows its own state. */
+export const modelOptimizationPendingIdle = (acquisition: CustomModelAcquisitionState): boolean =>
+  acquisition._tag === "OptimizationPending" && !modelResidencyActive(acquisition.residencyState)
+
+/** Whether a model is requested, loading, ready or stopping. */
+export const modelResidencyActive = (residency: ModelResidency): boolean =>
+  residency._tag === "Requested" || residency._tag === "Loading" || residency._tag === "Ready" || residency._tag === "Stopping"
 
 /** Post-download optimization where space is short (the CLI). */
 export const formatModelOptimization = (progress: ModelOptimizationProgress): string => Option.match(

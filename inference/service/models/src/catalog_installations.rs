@@ -31,8 +31,8 @@ struct OperationBinding {
 
 /// Catalog installations: a download, then kernel tuning for the installed model. Each admitted
 /// installation has one job that follows its download and, once the download is verified and
-/// published, runs the optimizer. The operation is `Optimizing` while that runs, and `Completed`
-/// while the optimizer waits for the device.
+/// published, runs the optimizer. The operation is `Optimizing` until the optimizer ends, its
+/// progress `Waiting` while the job waits for the device, and `Completed` once it has ended.
 pub struct ManagedCatalogInstallations {
     this: Weak<Self>,
     resolver: Arc<ModelDomainResolver>,
@@ -133,7 +133,7 @@ impl ManagedCatalogInstallations {
                 binding.model_id,
                 Box::new(move |progress| {
                     if let Some(installations) = this.upgrade() {
-                        installations.set_optimization(&progress_id, progress);
+                        installations.set_optimization(&progress_id, Some(progress));
                     }
                 }),
             )
@@ -141,8 +141,7 @@ impl ManagedCatalogInstallations {
     }
 
     /// Stop the operation's optimization, if it is optimizing or waiting for the device to, and
-    /// wait until it has stopped. Returns whether it was. A job waiting for the device reads
-    /// `Completed`: the model is installed, and nothing optimizes until the device is free.
+    /// wait until it has stopped. Returns whether it was.
     async fn stop_optimization(&self, id: &CatalogInstallationOperationId) -> Result<bool, InventoryError> {
         let optimizing = match self.operation(id).await?.state {
             CatalogInstallationOperationState::Optimizing { .. } => true,

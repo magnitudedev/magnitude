@@ -49,7 +49,7 @@ import {
   activeLocalModel, useAgentClient, type ApplicationPage,
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, useLocalInferenceHardware, formatLocalModelDisplayName,
   describeModelOptimization,
-  formatStorageSize, formatTransferRate, localModelIsInstalled, localModelProviderModelId, localModelConnectionOptions, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes, MODEL_STOPPED_FOR_MEMORY_MESSAGE, modelStoppedForMemory,
+  formatStorageSize, formatTransferRate, localModelIsInstalled, localModelProviderModelId, localModelConnectionOptions, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes, MODEL_STOPPED_FOR_MEMORY_MESSAGE, modelStoppedForMemory, MODEL_OPTIMIZATION_PENDING, MODEL_OPTIMIZATION_PENDING_DETAIL, modelOptimizationPendingIdle,
   useCustomModels, useHiddenLocalModels, useUnsupportedLocalModels,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
 } from "@magnitudedev/client-common"
@@ -211,6 +211,7 @@ function ModelControls({ model, replacing, children, onConnectAgent, inlineLoadF
       </>}
 
     </div>
+    {modelOptimizationPendingIdle(acquisition) && <ErrorNotice severity="info" title={MODEL_OPTIMIZATION_PENDING} description={MODEL_OPTIMIZATION_PENDING_DETAIL} className="col-span-full mt-3" />}
     {transferring && <div className="col-span-full mt-1"><DownloadProgress layout="row" modelName={formatLocalModelDisplayName(model)} acquisition={acquisition} pending={command.pending} onCancel={() => cancel(model.modelId)} /></div>}
     {fit !== null && (doesNotFit || !loadFailure) && !downloadFailure && <ErrorNotice severity="info" title={fit} className="col-span-full mt-3" />}
     {stoppedForMemory && !command.pendingOperations.includes("load") && <ErrorNotice severity="warning" title={MODEL_STOPPED_FOR_MEMORY_MESSAGE} description="It was stopped to keep your other apps running. Quit apps you aren’t using before loading it again." className="col-span-full mt-3" />}

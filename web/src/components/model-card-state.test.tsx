@@ -62,6 +62,21 @@ describe("model card status", () => {
     const running = customModel(added, { acquisitionState: { _tag: "Installed", installation: { _tag: "Resolved", installedBytes: 1, primaryPath: "/m.gguf", ownership: "Magnitude" }, residencyState: { _tag: "Ready" } } as never })
     expect(modelCardStatus(running, Option.none())).toEqual({ label: "Running", tone: "ready" })
   })
+
+  it("tells a pending optimization from one tuning and from one done", () => {
+    const installation = { _tag: "Resolved", installedBytes: 1, primaryPath: "/m.gguf", ownership: "Magnitude" }
+    const state = (acquisitionState: unknown) => ({ ...catalogModel(), acquisitionState } as never)
+    expect(modelCardStatus(state({ _tag: "OptimizationPending", installation, residencyState: { _tag: "Unloaded" } }), Option.none()))
+      .toEqual({ label: "Optimization pending", tone: "stored" })
+    expect(modelCardStatus(state({ _tag: "OptimizationPending", installation, residencyState: { _tag: "Ready" } }), Option.none()))
+      .toEqual({ label: "Running", tone: "ready" })
+    expect(modelCardStatus(state({
+      _tag: "Optimizing", installation, residencyState: { _tag: "Unloaded" },
+      progress: { stage: "tuning", completed: 3, total: 10, device: Option.none() },
+    }), Option.none())).toEqual({ label: "Optimizing", tone: "busy" })
+    expect(modelCardStatus(state({ _tag: "Installed", installation, residencyState: { _tag: "Unloaded" } }), Option.none()))
+      .toEqual({ label: "Downloaded", tone: "stored" })
+  })
 })
 
 describe("model card download", () => {
