@@ -318,29 +318,43 @@ describe("network access read at startup", () => {
     }))
   const container = (key?: string) => Option.some({ networkKey: Option.fromNullable(key), allowedHosts: [] })
   const readIn = (dataDir: string, key?: string) => Effect.runPromise(readNetworkAccess(dataDir, container(key)).pipe(Effect.provide(BunContext.layer)))
-  it("turns network access on in a container without a network block, and saves the key it makes", () =>
+  it("turns network access on in a container without a network block, and saves only the key it makes", () =>
     withDataDir({ unknownSetting: 1 }, async dataDir => {
       const network = await readIn(dataDir)
       expect([network.enabled, network.bind, network.requireApiKey]).toEqual([true, "0.0.0.0", true])
       const config = await saved(dataDir)
-      expect(config.network).toEqual({ enabled: true, requireApiKey: true, allowedHosts: [], apiKey: Option.getOrThrow(network.apiKey) })
+      expect(config.network).toEqual({ enabled: false, requireApiKey: true, allowedHosts: [], apiKey: Option.getOrThrow(network.apiKey) })
       expect(config.unknownSetting).toBe(1)
       expect((await readIn(dataDir)).apiKey).toEqual(network.apiKey)
+      expect(await read(dataDir)).toEqual(LOOPBACK_ONLY)
+    }))
+  it("leaves a native installation's network settings as they were when its data directory is a container's volume", () =>
+    withDataDir({ network: { enabled: false, bind: "192.168.1.5", requireApiKey: false, allowedHosts: ["a.local"] } }, async dataDir => {
+      const network = await readIn(dataDir)
+      expect([network.enabled, network.bind, network.requireApiKey, network.allowedHosts]).toEqual([true, "0.0.0.0", true, ["a.local"]])
+      expect((await saved(dataDir)).network).toEqual({ enabled: false, bind: "192.168.1.5", requireApiKey: false, allowedHosts: ["a.local"], apiKey: Option.getOrThrow(network.apiKey) })
+      expect(await read(dataDir)).toEqual(LOOPBACK_ONLY)
+    }))
+  it("keeps the key a container saved before, on a volume from an earlier release", () =>
+    withDataDir({ network: { enabled: true, requireApiKey: true, allowedHosts: [], apiKey: "mag-saved-by-the-container" } }, async dataDir => {
+      expect((await readIn(dataDir)).apiKey).toEqual(Option.some("mag-saved-by-the-container"))
+      expect((await saved(dataDir)).network.apiKey).toBe("mag-saved-by-the-container")
     }))
   it("saves only the generated key in a container, not the host names from MAGNITUDE_ALLOWED_HOSTS", () =>
     withDataDir({}, async dataDir => {
       const network = await Effect.runPromise(readNetworkAccess(dataDir, Option.some({ networkKey: Option.none(), allowedHosts: ["nas.local"] })).pipe(Effect.provide(BunContext.layer)))
       expect(network.allowedHosts).toEqual(["nas.local"])
-      expect((await saved(dataDir)).network).toEqual({ enabled: true, requireApiKey: true, allowedHosts: [], apiKey: Option.getOrThrow(network.apiKey) })
+      expect((await saved(dataDir)).network).toEqual({ enabled: false, requireApiKey: true, allowedHosts: [], apiKey: Option.getOrThrow(network.apiKey) })
     }))
   it("uses MAGNITUDE_NETWORK_KEY in a container without saving it, over a saved key", () =>
     withDataDir({ network: { enabled: true, apiKey: "mag-saved" } }, async dataDir => {
       expect((await readIn(dataDir, "a-key-from-the-environment")).apiKey).toEqual(Option.some("a-key-from-the-environment"))
       expect((await saved(dataDir)).network.apiKey).toBe("mag-saved")
     }))
-  it("keeps a container's saved network block, which may turn network access off", () =>
-    withDataDir({ network: { enabled: false } }, async dataDir => {
-      expect(await readIn(dataDir, "a-key-from-the-environment")).toEqual(LOOPBACK_ONLY)
+  it("saves nothing in a container given MAGNITUDE_NETWORK_KEY", () =>
+    withDataDir({ unknownSetting: 1 }, async dataDir => {
+      expect((await readIn(dataDir, "a-key-from-the-environment")).enabled).toBe(true)
+      expect(await saved(dataDir)).toEqual({ unknownSetting: 1 })
     }))
   it("stays on loopback when config.json is invalid, in a container too", () =>
     withDataDir("not an object", async dataDir => {

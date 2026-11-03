@@ -106,7 +106,7 @@ export const ServerSettingsLive = Layer.effect(ServerSettings, Effect.gen(functi
   const networkBase = (current: Option.Option<NetworkAccessConfig>): NetworkAccessConfig => Option.getOrElse(current, () => ({ enabled: false, requireApiKey: true, allowedHosts: [] }))
   const poke = (operation: string) => changes.publish({ operation })
   const containerManaged = Option.isSome(host.container)
-    ? Effect.fail(new ServerSettingsFailed({ message: "The container sets network access. Set the key with MAGNITUDE_NETWORK_KEY, or other settings under network in config.json, then restart the container." }))
+    ? Effect.fail(new ServerSettingsFailed({ message: "A container keeps network access on with a key. Set the key with MAGNITUDE_NETWORK_KEY and host names with MAGNITUDE_ALLOWED_HOSTS, then recreate the container." }))
     : Effect.void
 
   const machine = yield* Effect.cached(readMachineIdentity(() => createRequire(import.meta.url)(nativeHostPath())).pipe(

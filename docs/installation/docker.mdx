@@ -176,6 +176,8 @@ docker exec magnitude magnitude models folders list
 
 The files must be readable by uid 1000. Magnitude only reads these folders.
 
+To keep everything a Linux installation on the same machine has, its downloaded models included, mount its data directory at `/data/.magnitude`, with `-v ~/.magnitude:/data/.magnitude` in place of `-v magnitude:/data`, and add `--user "$(id -u):$(id -g)"` if your user isn't uid 1000. Quit the installed app and stop its service first, and don't run both at once: nothing stops them from using the directory together. The container's network access applies only while the container runs; the directory's own network settings stay as they were, and the container saves its key there as `network.apiKey`.
+
 ## Hugging Face sign-in
 
 For gated models, private repositories or higher download limits, sign in with a code you enter on any device:

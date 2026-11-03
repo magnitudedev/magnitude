@@ -34,27 +34,21 @@ export const readContainerInstallation = (environment: Readonly<Record<string, s
   return Option.some<ContainerInstallation>({ networkKey, allowedHosts })
 })
 
-const containerNetworkDefault = (): NetworkAccessConfig => ({ enabled: true, requireApiKey: true, allowedHosts: [] })
-
 /**
- * Where a generated key is saved: the person's own block, or else the container default. The
- * environment's key and host names stay out of it, so changing those variables later still applies.
- */
-export const savedNetworkForKey = (container: Option.Option<ContainerInstallation>, saved: Option.Option<NetworkAccessConfig>): Option.Option<NetworkAccessConfig> =>
-  Option.isSome(container) ? Option.orElse(saved, () => Option.some(containerNetworkDefault())) : saved
-
-/**
- * The network settings a container serves with. Published ports reach nothing on loopback, so without
- * a `network` block network access is on, on all interfaces, with the key required; a block the person
- * saved still decides. `MAGNITUDE_NETWORK_KEY`, when set, is the key either way, and
+ * The network settings a container serves with. Published ports reach nothing on loopback, so network
+ * access is on, on all interfaces, with the key required, whatever the saved `network` block says: these
+ * are facts of running in a container, applied here and never saved, so a native installation's data
+ * directory mounted as the volume keeps its own network settings. From the saved block the container
+ * takes only its key and allowed host names. `MAGNITUDE_NETWORK_KEY`, when set, is the key, and
  * `MAGNITUDE_ALLOWED_HOSTS` adds to the allowed host names.
  */
 export const containerNetworkConfig = (container: Option.Option<ContainerInstallation>, saved: Option.Option<NetworkAccessConfig>): Option.Option<NetworkAccessConfig> =>
   Option.match(container, {
     onNone: () => saved,
     onSome: ({ networkKey, allowedHosts }) => {
-      const config = Option.getOrElse(saved, containerNetworkDefault)
-      const hosts = { ...config, allowedHosts: [...new Set([...config.allowedHosts, ...allowedHosts])] }
-      return Option.some(Option.match(networkKey, { onNone: () => hosts, onSome: apiKey => ({ ...hosts, apiKey }) }))
+      const savedHosts = Option.match(saved, { onNone: () => [], onSome: block => block.allowedHosts })
+      const apiKey = Option.orElse(networkKey, () => Option.flatMap(saved, block => Option.fromNullable(block.apiKey)))
+      const config: NetworkAccessConfig = { enabled: true, requireApiKey: true, allowedHosts: [...new Set([...savedHosts, ...allowedHosts])] }
+      return Option.some(Option.match(apiKey, { onNone: () => config, onSome: apiKey => ({ ...config, apiKey }) }))
     },
   })

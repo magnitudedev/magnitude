@@ -23,18 +23,20 @@ describe("container installation", () => {
       }
     } finally { await rm(resources, { recursive: true, force: true }) }
   })
-  it("defaults network access on only in a container, where a saved block still decides and the environment's key wins", () => {
-    const block = { enabled: false, requireApiKey: false, allowedHosts: ["a.local"], apiKey: "mag-saved" }
+  it("turns network access on with the key required in a container, taking only the key and host names from a saved block", () => {
+    const block = { enabled: false, bind: "192.168.1.5", requireApiKey: false, allowedHosts: ["a.local"], apiKey: "mag-saved" }
     const saved = Option.some(block)
+    const container = (key?: string, allowedHosts: ReadonlyArray<string> = []) => Option.some({ networkKey: Option.fromNullable(key), allowedHosts })
+    const on = { enabled: true, requireApiKey: true }
     expect(containerNetworkConfig(Option.none(), Option.none())).toEqual(Option.none())
     expect(containerNetworkConfig(Option.none(), saved)).toEqual(saved)
-    expect(containerNetworkConfig(Option.some({ networkKey: Option.none(), allowedHosts: [] }), Option.none()))
-      .toEqual(Option.some({ enabled: true, requireApiKey: true, allowedHosts: [] }))
-    expect(containerNetworkConfig(Option.some({ networkKey: Option.some("from-the-environment"), allowedHosts: [] }), Option.none()))
-      .toEqual(Option.some({ enabled: true, requireApiKey: true, allowedHosts: [], apiKey: "from-the-environment" }))
-    expect(containerNetworkConfig(Option.some({ networkKey: Option.some("from-the-environment"), allowedHosts: [] }), saved))
-      .toEqual(Option.some({ ...block, apiKey: "from-the-environment" }))
-    expect(containerNetworkConfig(Option.some({ networkKey: Option.none(), allowedHosts: ["nas.local", "a.local"] }), saved))
-      .toEqual(Option.some({ ...block, allowedHosts: ["a.local", "nas.local"] }))
+    expect(containerNetworkConfig(container(), Option.none())).toEqual(Option.some({ ...on, allowedHosts: [] }))
+    expect(containerNetworkConfig(container("from-the-environment"), Option.none()))
+      .toEqual(Option.some({ ...on, allowedHosts: [], apiKey: "from-the-environment" }))
+    expect(containerNetworkConfig(container(), saved)).toEqual(Option.some({ ...on, allowedHosts: ["a.local"], apiKey: "mag-saved" }))
+    expect(containerNetworkConfig(container("from-the-environment"), saved))
+      .toEqual(Option.some({ ...on, allowedHosts: ["a.local"], apiKey: "from-the-environment" }))
+    expect(containerNetworkConfig(container(undefined, ["nas.local", "a.local"]), saved))
+      .toEqual(Option.some({ ...on, allowedHosts: ["a.local", "nas.local"], apiKey: "mag-saved" }))
   })
 })

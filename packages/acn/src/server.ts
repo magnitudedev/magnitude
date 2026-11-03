@@ -51,6 +51,7 @@ import {
   LOOPBACK_ONLY,
   ALL_INTERFACES_BIND,
   type NetworkAccess,
+  type NetworkAccessConfig,
 } from "@magnitudedev/storage"
 import type { JsonLineChannelFailed } from "@magnitudedev/utils/json-line-channel"
 import {
@@ -120,7 +121,7 @@ import {
   makeHealthResponse,
 } from "./identity"
 import { AcnHost, ServerSettingsLive, type AcnHostApi } from "./server-settings"
-import { containerNetworkConfig, readContainerInstallation, savedNetworkForKey, type ContainerInstallation } from "./container"
+import { containerNetworkConfig, readContainerInstallation, type ContainerInstallation } from "./container"
 import { AcnHarnessConnectionsLive } from "./harness-connections"
 import { AcnOwner } from "./application-owner"
 import { resolveWebAppSource, serveWebApp } from "./web-app"
@@ -475,9 +476,16 @@ const withServerOwnedServices = <A, E, R>(base: Layer.Layer<A, E, R>, host: AcnH
   )
 
 /**
+ * A container needs a key without a `network` block of its own, since it turns network access on at
+ * runtime. Its key is saved in a block that leaves network access off, so the directory, which may be a
+ * native installation's, never turns network access on outside the container.
+ */
+const keyOnlyNetwork = (): NetworkAccessConfig => ({ enabled: false, requireApiKey: true, allowedHosts: [] })
+
+/**
  * Network access turned on in config.json by hand has no key, and without one every remote request is
  * refused. The service makes the key then, as Settings does, and says where it is without printing it,
- * except in a container, whose network access is on by default and whose output is where people look.
+ * except in a container, whose network access is always on and whose output is where people look.
  */
 const ensureNetworkKey = (dataDir: string, network: NetworkAccess, container: Option.Option<ContainerInstallation>) => {
   if (!network.enabled || !network.requireApiKey || Option.isSome(network.apiKey)) return Effect.succeed(network)
@@ -486,7 +494,7 @@ const ensureNetworkKey = (dataDir: string, network: NetworkAccess, container: Op
   return makeConfigStorage().pipe(
     Effect.provideService(GlobalStorage, storage), Effect.provide(BunPath.layer),
     Effect.flatMap(config => config.update(current => ({ ...current,
-      network: Option.map(savedNetworkForKey(container, current.network), saved => ({ ...saved, apiKey: saved.apiKey ?? apiKey })) }))),
+      network: Option.some({ ...Option.getOrElse(current.network, keyOnlyNetwork), apiKey }) }))),
     Effect.as({ ...network, apiKey: Option.some(apiKey) }),
     // A container's output is its log, which only those who can already run commands in it read.
     Effect.tap(() => Option.isSome(container)
