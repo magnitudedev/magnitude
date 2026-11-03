@@ -339,12 +339,16 @@ impl KernelCache {
 
     /// Completed composed-recipe choice; false is a permanent canonical
     /// fallback for this first-load identity, including unmeasured scope.
+    /// A choice stored before its search's work ended is not settled: it is
+    /// no choice.
     pub(crate) fn readout_choice(&self, key: &TuningCacheKey) -> Option<bool> {
         let bytes = self.read(&self.entry(READOUT, key.as_str(), "json"))?;
-        serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()?
-            .get("selected")?
-            .as_bool()
+        let choice = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+        choice
+            .get("settled")?
+            .as_bool()?
+            .then(|| choice.get("selected")?.as_bool())
+            .flatten()
     }
 
     /// The exact finalized canonical specialization against which a selected

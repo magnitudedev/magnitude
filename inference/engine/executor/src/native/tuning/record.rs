@@ -24,7 +24,10 @@ use std::sync::Arc;
 /// What a load needs of a unit's record: the choice, what it was chosen
 /// under, how its search stood, and what the evidence holds of the choice
 /// itself. Derived from the result when the record is published
-/// ([`StoredChoice::of`]) and stored beside it.
+/// ([`StoredChoice::of`]) and stored beside it. A record is settled once the
+/// optional work of the search that published it stopped; one published
+/// before then ([`StoredChoice::provisional`]) is what a search that did not
+/// end left behind, and no reader takes it for the unit's choice.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct StoredChoice {
     /// The chosen configuration, for the load to prepare.
@@ -44,6 +47,7 @@ pub(crate) struct StoredChoice {
     /// The first rejection's configuration and reason.
     pub first_rejection: Option<String>,
     pub chosen: ChosenEvidence,
+    pub settled: bool,
 }
 
 /// What a unit's evidence holds of its chosen configuration: what a load
@@ -170,6 +174,16 @@ impl StoredChoice {
             rejections: result.rejections().count(),
             first_rejection,
             chosen: ChosenEvidence::of(result),
+            settled: true,
+        }
+    }
+
+    /// The choice as a search publishes it before its optional work stops:
+    /// a later search of the unit searches it again.
+    pub(crate) fn provisional(self) -> Self {
+        Self {
+            settled: false,
+            ..self
         }
     }
 

@@ -1243,12 +1243,15 @@ impl EntrySearch<dense_output::Entry> for FakeSearch {
     }
 }
 
-/// The mandatory phase comes first and leaves every unit legal: abandoning
-/// the tuner at any instant after it leaves a cache that a second load
-/// consumes with zero searches. A deterministic search and real typed point
-/// factories; no model inference or claimed numerical qualification.
+/// A Prepare abandoned at any instant after its mandatory phase (a load
+/// preempting a post-install optimization, a killed process) leaves only
+/// provisional records: the next Prepare, the preempting load's, searches
+/// the unit again to its end and settles it, and a load after that consumes
+/// the settled record with nothing searched. A deterministic search and
+/// real typed point factories; no model inference or claimed numerical
+/// qualification.
 #[test]
-fn abandoning_the_tuner_after_the_mandatory_phase_leaves_a_cache_a_second_load_consumes() {
+fn a_prepare_abandoned_mid_search_is_searched_again_by_the_next_prepare() {
     let Some(device) = metal() else {
         return;
     };
@@ -1290,8 +1293,8 @@ fn abandoning_the_tuner_after_the_mandatory_phase_leaves_a_cache_a_second_load_c
         });
     // The first load is abandoned after `performed` pieces of its optional
     // work: none at all, some of its discovery, its measurement, its
-    // promotion. Whenever that is, the cache holds the unit's legal record
-    // as it then stood.
+    // promotion. Whenever that is, the cache holds the unit's record only
+    // provisional.
     struct Abandoning {
         after: usize,
         stages: Cell<usize>,
@@ -1345,46 +1348,45 @@ fn abandoning_the_tuner_after_the_mandatory_phase_leaves_a_cache_a_second_load_c
             assert!(abandoned.is_err(), "the load was abandoned mid-search");
         }
         assert_eq!(case.stages.borrow().len(), performed);
-        // A second load consumes that record: nothing is formed, built,
-        // measured or searched, and the choice served is the one that
-        // stood: the challenger only once it was promoted.
+        // The next Prepare finds no settled record: it forms the canonical
+        // artifact again and searches the unit to its end, the challenger
+        // promoted.
+        let prepare = |case: &FakeCase| {
+            let mut tuner = Tuner::count(
+                &device,
+                TuningContext {
+                    cache: Some(&cache),
+                    ..context
+                },
+                limits,
+                TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+                fixture_invocations(case, &statics, limits),
+            );
+            tuner.tune(case, &implementation, &statics).unwrap();
+            let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
+            tuner.tune(case, &implementation, &statics).unwrap();
+            let mut tuner = tuner.search().unwrap();
+            let chosen = tuner.tune(case, &implementation, &statics).unwrap();
+            (chosen, tuner.conclude())
+        };
+        let resumed = FakeCase::new(&implementation, &statics, "abandoned");
+        let (chosen, tuned) = prepare(&resumed);
+        assert_eq!(resumed.formations.get(), 1, "after {performed} pieces");
+        assert_eq!(resumed.stages.borrow().len(), points + 2);
+        assert_eq!(chosen.launch_param(0, "ROWS"), Some(2));
+        assert_eq!(tuned.len(), 1);
+        assert_eq!(tuned[0].origin, TuningOrigin::Searched);
+        assert!(tuned[0].qualified);
+        // A load after it consumes the settled record: nothing is formed,
+        // built, measured or searched.
         let again = FakeCase::new(&implementation, &statics, "abandoned");
-        let mut tuner = Tuner::count(
-            &device,
-            TuningContext {
-                cache: Some(&cache),
-                ..context
-            },
-            limits,
-            TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
-            fixture_invocations(&again, &statics, limits),
-        );
-        tuner.tune(&again, &implementation, &statics).unwrap();
-        let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
-        tuner.tune(&again, &implementation, &statics).unwrap();
-        let mut tuner = tuner.search().unwrap();
-        let chosen = tuner.tune(&again, &implementation, &statics).unwrap();
+        let (chosen, tuned) = prepare(&again);
         assert_eq!(again.formations.get(), 0);
         assert!(again.seen.borrow().is_empty() && again.stages.borrow().is_empty());
-        let promoted = performed == points + 2;
-        if promoted {
-            assert_eq!(chosen.launch_param(0, "ROWS"), Some(2));
-        } else {
-            assert_eq!(
-                chosen,
-                implementation.default_specialization(&statics).unwrap(),
-                "after {performed} pieces"
-            );
-        }
-        let tuned = tuner.conclude();
-        assert_eq!(tuned.len(), 1);
+        assert_eq!(chosen.launch_param(0, "ROWS"), Some(2));
         assert_eq!(tuned[0].origin, TuningOrigin::Stored);
-        assert_eq!(tuned[0].qualified, promoted);
-        // The record is the one last published: the canonical default's
-        // from the mandatory phase, which measured nothing, or the
-        // promotion's, with everything measured until then. What a piece
-        // measured without promoting was the abandoned load's alone.
-        assert_eq!(tuned[0].measured, if promoted { 2 } else { 0 });
+        assert!(tuned[0].qualified);
+        assert_eq!(tuned[0].measured, 2);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
@@ -1512,11 +1514,10 @@ fn profile_what_compiles_on_workers_add_to_the_process_footprint() {
     );
 }
 
-/// A unit's record is stored when its served choice changes, with that
-/// choice's serving artifact formed, and once when the optional work stops
-/// if a piece changed it since, not with every piece: the record a later
-/// load reads is the mandatory phase's until a promotion, and a unit that
-/// measured without promoting publishes its measurements once, at the stop.
+/// A unit's record is stored provisional when its served choice changes,
+/// with that choice's serving artifact formed, and settled once when the
+/// optional work stops, not with every piece: a unit that measured without
+/// promoting publishes its measurements once, at the stop.
 #[test]
 fn a_record_is_published_with_a_promotion_and_once_when_the_work_stops() {
     let Some(device) = metal() else {
@@ -1626,9 +1627,10 @@ fn a_record_is_published_with_a_promotion_and_once_when_the_work_stops() {
             expected.push(("published", 2));
         } else {
             // The promotion forms the promoted choice's serving artifact
-            // and publishes the record with everything measured. Nothing
-            // changed it after, so nothing is owed when the work stops.
+            // and publishes the record with everything measured,
+            // provisional; the record is settled when the work stops.
             expected.push(("promoted", 2));
+            expected.push(("published", 2));
         }
         assert_eq!(*stored.seen.borrow(), expected);
         // Only a promoted choice has an artifact to publish: the canonical
@@ -1644,7 +1646,7 @@ fn a_record_is_published_with_a_promotion_and_once_when_the_work_stops() {
 #[test]
 fn no_demand_composed_choices_are_published_in_the_mandatory_phase_and_time_fails_nothing() {
     struct Recipe {
-        published: Rc<RefCell<Vec<bool>>>,
+        published: Rc<RefCell<Vec<(bool, bool)>>>,
         delay: Duration,
     }
     impl<'a> ComposedContender<'a> for Recipe {
@@ -1679,9 +1681,9 @@ fn no_demand_composed_choices_are_published_in_the_mandatory_phase_and_time_fail
         ) -> Result<bool, CatalogFailure> {
             panic!("an unused recipe must not qualify");
         }
-        fn conclude(&mut self, selected: bool) -> Result<(), CatalogFailure> {
+        fn conclude(&mut self, selected: bool, settled: bool) -> Result<(), CatalogFailure> {
             std::thread::sleep(self.delay);
-            self.published.borrow_mut().push(selected);
+            self.published.borrow_mut().push((selected, settled));
             Ok(())
         }
     }
@@ -1736,17 +1738,20 @@ fn no_demand_composed_choices_are_published_in_the_mandatory_phase_and_time_fail
             "counting cannot publish a choice"
         );
         // The recipe's mandatory work publishes the canonical choice it
-        // serves until it is qualified: nothing is owed at the end.
+        // serves until it is qualified, unsettled: a search abandoned here
+        // leaves no choice a later walk takes.
         let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
         assert_eq!(tuner.register_composed(recipe()).unwrap(), None);
-        assert_eq!(*published.borrow(), [false]);
-        // A publication that outlasts the whole budget fails nothing.
+        assert_eq!(*published.borrow(), [(false, false)]);
+        // The search's end settles it, and a publication that outlasts the
+        // whole budget fails nothing.
         let mut tuner = tuner.search().unwrap();
+        assert_eq!(*published.borrow(), [(false, false), (false, true)]);
         assert_eq!(tuner.register_composed(recipe()).unwrap(), Some(false));
         assert_eq!(
-            *published.borrow(),
-            [false],
-            "an unused recipe's choice is not republished"
+            published.borrow().len(),
+            2,
+            "a settled recipe's choice is not republished"
         );
     }
 }
@@ -1814,7 +1819,7 @@ fn a_composed_recipe_finds_its_pinned_prerequisite_on_an_empty_cache() {
             self.qualified.set(true);
             Ok(false)
         }
-        fn conclude(&mut self, _: bool) -> Result<(), CatalogFailure> {
+        fn conclude(&mut self, _: bool, _: bool) -> Result<(), CatalogFailure> {
             Ok(())
         }
     }

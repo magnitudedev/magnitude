@@ -98,6 +98,7 @@ struct ReadoutChoiceReceipt {
     canonical_specification: Option<String>,
     // Every pair is the complete submitted recipe, including dependent levels.
     pairs: Vec<(f64, f64)>,
+    settled: bool,
 }
 
 fn fail(outcome: impl ToString) -> CatalogFailure {
@@ -1002,8 +1003,9 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
         );
         Ok(true)
     }
-    fn conclude(&mut self, selected: bool) -> Result<(), CatalogFailure> {
+    fn conclude(&mut self, selected: bool, settled: bool) -> Result<(), CatalogFailure> {
         self.receipt.selected = selected;
+        self.receipt.settled = settled;
         self.state.borrow_mut().selected = selected;
         if !selected {
             *self.state.borrow_mut() = QualifiedRecipe::default();

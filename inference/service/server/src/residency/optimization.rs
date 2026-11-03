@@ -5,8 +5,9 @@
 //! ([`crate::device_lock`]): a search beside a resident or loading model would take the memory
 //! that model's verdict promised its requests. While residency or another job holds the device
 //! it waits, reported as no optimization, and runs once the device is free. Any load preempts
-//! it, and it waits again; the records it published stand. A load of its own model ends it: that
-//! load's Prepare searched every unit the job would have.
+//! it, and it waits again; the units it settled stand, and those it left mid-search have only
+//! provisional records, which no Prepare takes for a choice. A load of its own model ends it: that
+//! load finds no finished Prepare, so its Prepare searches every unit the job had not settled.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

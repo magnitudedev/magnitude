@@ -18,11 +18,13 @@
 //! confirmed and covered. Time past the budget is reported, never a failure.
 //! A unit builds each point's inputs only when its work reaches the point,
 //! and forms only what it is about to measure. With a [`KernelCache`], every
-//! unit's record is stored from its mandatory phase on, replaced when its
-//! served choice changes and once more, with everything it measured, when
-//! the optional work stops, including explicit unmeasured scope. A load
-//! abandoned between two of those keeps the choice last stored.
-//! Later loads only reuse that record, under a key over what its
+//! unit's record is stored provisional from its mandatory phase on, replaced
+//! when its served choice changes, and settled once, with everything it
+//! measured, when the optional work stops, including explicit unmeasured
+//! scope. A search abandoned before then (a Prepare preempted by a load,
+//! a killed process) leaves no settled record: the next search of the unit
+//! searches it again, and a load meets it as a unit without a record.
+//! Later loads only reuse a settled record, under a key over what its
 //! measurements are valid for (tuning version, tuning budget,
 //! device and toolchain identity, unit, implementation digest, the
 //! comparison its measurements come from and served shapes), choosing from
@@ -329,7 +331,12 @@ pub const STREAMING_ROWS: u64 = 8;
 /// result of 38 recorded it as expired, as if the budget had ended it).
 /// 40: optional runtime work observes the original load cutoff between
 /// submissions; interrupted witnesses and rounds never become rejections.
-pub const SEARCH_VERSION: u32 = 40;
+/// 41: a record is settled only when its search's optional work stopped,
+/// and one published before then is stored provisional and searched again
+/// (a result of 40 stored the mandatory phase's canonical default as the
+/// unit's final choice, so a Prepare preempted mid-search left its units
+/// untuned for good).
+pub const SEARCH_VERSION: u32 = 41;
 /// The tuning budget of a served load: the time one first-load preparation
 /// spends tuning, on any device.
 pub const STANDARD_TUNING_BUDGET: Duration = Duration::from_secs(60);
@@ -2618,8 +2625,10 @@ pub(super) trait ComposedContender<'a> {
         before: Instant,
     ) -> Result<bool, CatalogFailure>;
     /// Retain the choice as it stands: the canonical recipe from the
-    /// mandatory phase on, the composed one once it is qualified.
-    fn conclude(&mut self, selected: bool) -> Result<(), CatalogFailure>;
+    /// mandatory phase on, the composed one once it is qualified. A choice
+    /// retained before the recipe's work ended is stored unsettled: no
+    /// later walk takes it for the recipe's choice.
+    fn conclude(&mut self, selected: bool, settled: bool) -> Result<(), CatalogFailure>;
 }
 
 /// Actual census evidence prices a composed contender; no guessed grace period.
@@ -2759,7 +2768,7 @@ impl<'a> SearchedUnit<'a> for ComposedUnit<'a> {
         let qualified = began.elapsed();
         self.qualified = Some(selected);
         let publishing = Instant::now();
-        self.contender.conclude(selected)?;
+        self.contender.conclude(selected, true)?;
         tuner.composed_choices.insert(self.key.1.clone(), selected);
         let published = publishing.elapsed();
         tuner
@@ -2787,13 +2796,11 @@ impl<'a> SearchedUnit<'a> for ComposedUnit<'a> {
         Ok(qualified.max(published))
     }
 
-    /// A recipe never qualified keeps the canonical choice it published;
-    /// one that was censused releases what its census formed.
+    /// A recipe never qualified settles the canonical choice it served,
+    /// and releases what its census formed.
     fn finish(&mut self, tuner: &mut Tuner<'a>) -> Result<(), CatalogFailure> {
         if self.qualified.is_none() {
-            if self.census.is_some() {
-                self.contender.conclude(false)?;
-            }
+            self.contender.conclude(false, true)?;
             tuner.composed_choices.insert(self.key.1.clone(), false);
         }
         Ok(())
@@ -3223,8 +3230,8 @@ struct CaseUnit<'a, T: EntryTuning> {
     publishing: Rc<Cell<seismic::Observed>>,
     /// What publishing a serving artifact has taken in this load.
     artifacts: Rc<Cell<ArtifactPrice>>,
-    /// The unit's record changed since it was published: a piece measured
-    /// or judged something and promoted nothing.
+    /// The unit's settled record is still owed: everything it published
+    /// before the optional work stopped is provisional.
     unpublished: bool,
     /// The record as it was published when the optional work stopped.
     settled: Option<TuningResult>,
@@ -3352,8 +3359,8 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
         Some(work)
     }
 
-    /// A unit whose record changed since it was published owes its
-    /// publication when the optional work stops. Its served choice's
+    /// A unit owes its settled record when the optional work stops, until
+    /// it has published it. Its served choice's
     /// serving artifact it never owes: a conversion forms it as it
     /// promotes.
     fn owed(&self, worked: bool) -> seismic::Quote {
@@ -3374,7 +3381,7 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
         let began_seconds = tuner.started.elapsed().as_secs_f64();
         let owed = self.owed(false);
         let result = tuner
-            .publish(&self.key, || self.search.terminal())
+            .publish(&self.key, true, || self.search.terminal())
             .map_err(|error| unit_failure(&self.key, error))?;
         self.unpublished = false;
         self.settled = Some(result);
@@ -3472,16 +3479,16 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
         // published with the unit's record as it stands, served from that
         // instant ([`CaseUnit::form_artifact`]). What a piece measures or
         // judges besides is the unit's in memory and published once, when
-        // the optional work stops ([`SearchedUnit::settle`]): a load
-        // abandoned before then keeps the choice last published.
+        // the optional work stops ([`SearchedUnit::settle`]): a search
+        // abandoned before then leaves only provisional records, and the
+        // next search of the unit searches it again.
         let publishing = Instant::now();
         if performed.promoted {
             self.form_artifact(tuner)?;
             tuner
-                .publish(&self.key, || self.search.terminal())
+                .publish(&self.key, false, || self.search.terminal())
                 .map_err(|error| unit_failure(&self.key, error))?;
         }
-        self.unpublished = !performed.promoted;
         let published = publishing.elapsed();
         self.spent += began.elapsed();
         self.stages += 1;
@@ -3546,11 +3553,10 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
     }
 
     /// What stopped the unit's search is the memory room: the tuner is
-    /// told, and the unit owes its record once more, so that the record
-    /// published when the optional work stops says so.
+    /// told, so that the record settled when the optional work stops says
+    /// so.
     fn refused_for_bytes(&mut self, tuner: &mut Tuner<'a>) {
         tuner.without_room.insert(self.key.clone());
-        self.unpublished = true;
     }
 
     fn largest_footprint(&self) -> u64 {
@@ -4109,10 +4115,14 @@ impl<'a> Tuner<'a> {
 
     /// Publish a unit's record as it stands: derive it (`record`), store it
     /// where a later load reads it, and serve its choice. The whole is one
-    /// observation of the publication class. Returns the record.
+    /// observation of the publication class. Returns the record. A record
+    /// published before the unit's optional work stopped is stored
+    /// provisional: a search abandoned then leaves nothing a later search
+    /// takes for the unit's choice, so that search searches the unit again.
     fn publish(
         &mut self,
         key: &TuningKey,
+        settled: bool,
         record: impl FnOnce() -> Result<TuningResult, TuneError>,
     ) -> Result<TuningResult, TuneError> {
         let began = Instant::now();
@@ -4124,6 +4134,7 @@ impl<'a> Tuner<'a> {
             } else {
                 choice
             };
+            let choice = if settled { choice } else { choice.provisional() };
             cache.store_tuning(slot, &choice, &result);
         }
         self.chosen
@@ -4299,7 +4310,7 @@ impl<'a> Tuner<'a> {
             let forming = formed + forming.elapsed();
             self.longest = self.longest.max(longest);
             let publishing = Instant::now();
-            self.publish(key, || unit.record())
+            self.publish(key, false, || unit.record())
                 .map_err(|error| unit_failure(key, error))?;
             let publishing = publishing.elapsed();
             self.prepared.insert(key.clone(), unit);
@@ -4587,7 +4598,7 @@ impl<'a> Tuner<'a> {
                 let label = contender.label();
                 // The recipe's mandatory work: publish the canonical choice
                 // it serves until it is qualified.
-                contender.conclude(false)?;
+                contender.conclude(false, false)?;
                 let Phase::Census { units, .. } = &mut self.phase else {
                     unreachable!()
                 };
@@ -4876,14 +4887,15 @@ impl<'a> Tuner<'a> {
             forming_quote: Cell::new(None),
             publishing: self.publishing.clone(),
             artifacts: self.artifacts.clone(),
-            unpublished: false,
+            unpublished: true,
             settled: None,
             marker: std::marker::PhantomData,
         };
         if unit.shapes.iter().all(|shape| shape.weight == 0.) {
             // A unit without serving demand has no optional work: nothing
-            // could be ranked. Its published canonical default is its
-            // record.
+            // could be ranked. Its canonical default is its record, settled
+            // now.
+            unit.settle(self)?;
             unit.finish(self)?;
             let Phase::Census { launches, .. } = &mut self.phase else {
                 unreachable!("the phase is the census");
@@ -5092,7 +5104,10 @@ impl<'a> Tuner<'a> {
             true => None,
             false => cache.tuning::<StoredChoice>(&key),
         };
-        let hit = match stored {
+        // A provisional record is what a search abandoned before its optional
+        // work stopped left: the unit has no choice yet, and is searched
+        // again as if nothing were stored.
+        let hit = match stored.filter(|(choice, _)| choice.settled) {
             None => None,
             Some((choice, evidence)) if choice.requirement == requirement => {
                 Some((choice, Receipt::Stored(evidence)))
@@ -5104,6 +5119,7 @@ impl<'a> Tuner<'a> {
                 // to say: the evidence knows only whether it was complete.
                 let choice = StoredChoice {
                     stop: stored.stop,
+                    settled: stored.settled,
                     ..StoredChoice::of(&result)
                 };
                 Some((choice, Receipt::Held(Arc::new(result))))
