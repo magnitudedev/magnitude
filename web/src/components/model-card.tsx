@@ -50,6 +50,8 @@ interface Transfer {
   readonly onCancel: () => void
 }
 
+const badge = "inline-flex shrink-0 items-center gap-1 rounded border border-slate-200 px-1 text-[11px] leading-4 font-normal text-slate-500 dark:border-slate-700 dark:text-slate-400"
+
 const transferStages = { queued: "Queued", resolving: "Preparing", checking_space: "Checking space", downloading: "Downloading", verifying: "Verifying", publishing: "Finishing" }
 
 export interface ModelCardProps {
@@ -64,7 +66,8 @@ export interface ModelCardProps {
 /**
  * A Catalog or My Models card, complete without expanding. The header holds the model, its quant and (for an added
  * or found model) a source badge, its main action (a download fills that button) and a "⋮" menu for the rest; the
- * strip below states status, memory, drafter, estimated speed and intelligence, each acting where it is shown.
+ * strip below states status, memory, drafter, estimated speed and intelligence, each acting where it is shown. A
+ * decision model generates nothing, so its strip has no drafter, decode speed or chat intelligence.
  */
 export function ModelCard({ model, models, page, replacing, hardware, onFindOtherVersions }: ModelCardProps) {
   const { install, load, stop, cancel, remove, hide, dismissFailure, downloadComponent, setDrafter } = useLocalModelMutations()
@@ -137,8 +140,8 @@ export function ModelCard({ model, models, page, replacing, hardware, onFindOthe
   const status = modelCardStatus(model, hardware)
   const showStatus = page === "models" || status.tone !== "absent"
 
-  const drafterState = modelCardDrafter(model)
-  const drafter: ReactNode = (() => {
+  const drafterCell = (): ReactNode => {
+    const drafterState = modelCardDrafter(model)
     switch (drafterState._tag) {
       case "Add": return <AddDrafterButton disabled={pending} onAdd={() => {
         if (catalogDrafterOnlyUpdate(model)) install(model.modelId)
@@ -167,11 +170,10 @@ export function ModelCard({ model, models, page, replacing, hardware, onFindOthe
         </span>
       }
     }
-  })()
+  }
 
   const sourceBadge = model._tag === "Catalog" ? null : (() => {
     const { label, href } = customModelSource(model)
-    const badge = "inline-flex shrink-0 items-center gap-1 rounded border border-slate-200 px-1 text-[11px] leading-4 font-normal text-slate-500 dark:border-slate-700 dark:text-slate-400"
     return Option.match(href, {
       onNone: () => <span className={badge} title={label}>{customModelSourceLabel(model.origin)}</span>,
       onSome: url => <a href={url} target="_blank" rel="noreferrer" title={label} className={`${badge} hover:border-slate-300 hover:text-slate-700 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:border-slate-600 dark:hover:text-slate-200`}>
@@ -208,6 +210,9 @@ export function ModelCard({ model, models, page, replacing, hardware, onFindOthe
   </>
 
   const facts = localModelFacts(model)
+  const columns = facts._tag === "Decisions"
+    ? showStatus ? "grid-cols-2" : "grid-cols-1"
+    : showStatus ? "grid-cols-3 lg:grid-cols-5" : "grid-cols-2 lg:grid-cols-4"
   return <TooltipProvider><article className="min-w-0 overflow-hidden rounded-2xl border border-slate-200 bg-white dark:border-slate-750 dark:bg-slate-850">
     <div className="flex items-center gap-4 px-5 py-4">
       <ModelLogo model={model} className="size-10" />
@@ -216,21 +221,24 @@ export function ModelCard({ model, models, page, replacing, hardware, onFindOthe
           <span className="min-w-0 truncate">{model.presentation.displayName}</span>
           <span className="inline-flex shrink-0 items-center gap-1.5 text-xs font-normal text-slate-500 dark:text-slate-400">{model.presentation.variantLabel}<QuantizationAwareInfo model={model} /></span>
           {sourceBadge}
+          {facts._tag === "Decisions" && <span className={badge} title="Answers typed decisions, not chat">Decisions</span>}
         </h2>
         <p className="truncate text-xs text-slate-500">{modelSubtitle(model, models, page)}</p>
       </div>
       <CardActions name={name} primary={primary} transfer={transfer} menu={menu} />
     </div>
-    <dl className={`grid gap-px border-t border-slate-200 bg-slate-200 dark:border-slate-750 dark:bg-slate-750 ${showStatus ? "grid-cols-3 lg:grid-cols-5" : "grid-cols-2 lg:grid-cols-4"}`}>
+    <dl className={`grid gap-px border-t border-slate-200 bg-slate-200 dark:border-slate-750 dark:bg-slate-750 ${columns}`}>
       {showStatus && <StripCell label="Status"><StatusLabel {...status} /></StripCell>}
       <StripCell label="Memory">{memory}</StripCell>
-      <StripCell label="Drafter">{drafter}</StripCell>
-      <StripCell label="Estimated speed">
-        {Option.match(facts.speed, { onNone: () => <span className="text-slate-500">—</span>, onSome: speed => <span className="flex min-w-0 items-center gap-1"><span className="truncate tabular-nums" title={speed}>{speed}</span><SpeedInfo /></span> })}
-      </StripCell>
-      <StripCell label="Intelligence">
-        {Option.match(facts.intelligence, { onNone: () => <span className="truncate text-slate-500">Intelligence not rated</span>, onSome: score => <span className="truncate"><span className="tabular-nums">{score}%</span> <span className="text-slate-500">intelligence</span></span> })}
-      </StripCell>
+      {facts._tag === "Chat" && <>
+        <StripCell label="Drafter">{drafterCell()}</StripCell>
+        <StripCell label="Estimated speed">
+          {Option.match(facts.speed, { onNone: () => <span className="text-slate-500">—</span>, onSome: speed => <span className="flex min-w-0 items-center gap-1"><span className="truncate tabular-nums" title={speed}>{speed}</span><SpeedInfo /></span> })}
+        </StripCell>
+        <StripCell label="Intelligence">
+          {Option.match(facts.intelligence, { onNone: () => <span className="truncate text-slate-500">Intelligence not rated</span>, onSome: score => <span className="truncate"><span className="tabular-nums">{score}%</span> <span className="text-slate-500">intelligence</span></span> })}
+        </StripCell>
+      </>}
     </dl>
     <div className="px-5 pb-4 empty:hidden">{notices}</div>
     {replacing && <ConfirmDialog open={confirmingLoad} onOpenChange={setConfirmingLoad} title={`Load ${name}?`}

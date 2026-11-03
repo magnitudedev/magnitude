@@ -10,9 +10,11 @@ import {
   type LocalModelAcquisitionState,
   type LocalModelAssessment,
   type LocalModelsState,
+  type LocalModelCapabilities,
   type ModelCapabilities,
   type ModelInstallation,
   type ModelResidency,
+  type ModelServes,
   type LocalModelServingState,
   type ServingProfile,
   type SpeculativeMethod,
@@ -46,14 +48,40 @@ export const localModelServingProfile = (
   ? localModelAssessmentProfile(model.servingState.assessment)
   : Option.none()
 
+/** What an assessed model Magnitude runs takes; one it can't run, or not assessed yet, has no capabilities. */
 export const localModelCapabilities = (
   model: LocalModel,
-): Option.Option<ModelCapabilities> => Option.flatMap(localModelServingState(model), (serving) =>
-  serving._tag === "Assessed"
+): Option.Option<LocalModelCapabilities> => Option.flatMap(localModelServingState(model), (serving) =>
+  serving._tag === "Assessed" && "capabilities" in serving
     ? Option.some(serving.capabilities)
     : Option.none())
 
+/** The chat capabilities of a chat model Magnitude runs; a decision model has none. */
+export const localModelChatCapabilities = (model: LocalModel): Option.Option<ModelCapabilities> =>
+  Option.flatMap(localModelCapabilities(model), (capabilities) => {
+    if (capabilities.serves === "decisions") return Option.none()
+    const { serves: _, ...chat } = capabilities
+    return Option.some(chat)
+  })
+
 export type CatalogDeprecation = Extract<CatalogSupport, { readonly _tag: "Deprecated" }>
+
+/**
+ * What a model serves. A catalog model's is its catalog data, a fact of its pinned artifact known before any
+ * assessment and never replaced by one. A custom model's is known once its assessment reads its files: a
+ * supported model's capabilities name it, an unsupported one's header does, and a file whose header does not
+ * read says nothing.
+ */
+export const localModelServes = (model: LocalModel): Option.Option<ModelServes> => {
+  if (model._tag === "Catalog") return Option.some(model.catalogData.serves)
+  const serving = model.servingState
+  if (serving._tag !== "Assessed") return Option.none()
+  return "capabilities" in serving ? Option.some(serving.capabilities.serves) : serving.serves
+}
+
+/** A model is listed under the kind it serves, and under every kind while what it serves isn't known. */
+export const localModelListedAs = (model: LocalModel, serves: ModelServes): boolean =>
+  Option.match(localModelServes(model), { onNone: () => true, onSome: (kind) => kind === serves })
 
 export const localModelIsAvailable = (model: LocalModel): boolean => model._tag !== "Catalog"
   || model.catalogData.support._tag === "Supported"

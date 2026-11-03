@@ -9,11 +9,12 @@ import {
   MODEL_STOPPED_FOR_MEMORY_MESSAGE,
   describeModelLoadFailure,
   modelStoppedForMemory,
+  localModelCapabilities,
   localModelResidency,
   localModelServingProfile,
   localModelServingState,
 } from "@magnitudedev/client-common"
-import { findLocalModelById, type CatalogLocalModel, type LocalModel, type ModelCatalogState, type ModelId } from "@magnitudedev/sdk"
+import { findLocalModelById, ModelServesSchema, type CatalogLocalModel, type LocalModel, type ModelCatalogState, type ModelId, type ModelServes } from "@magnitudedev/sdk"
 import { Effect, Option, Schema } from "effect"
 import { addressableModels } from "./inference-client"
 import { formatContext } from "./inference-format"
@@ -24,6 +25,14 @@ export const optional = <A, I>(schema: Schema.Schema<A, I, never>) =>
 
 export const plural = (count: number, singular: string, pluralForm = `${singular}s`) =>
   `${count} ${count === 1 ? singular : pluralForm}`
+
+/** `--serves`: the kind of model a catalog command lists. */
+export const parseServes = (input: string): Effect.Effect<ModelServes, ModelCommandError> =>
+  Schema.decodeUnknown(ModelServesSchema)(input).pipe(
+    Effect.mapError(() => new ModelCommandError({ message: "Serves must be one of: chat, decisions" })))
+
+/** What a kind of model is called in headings: chat models are plain models. */
+export const servesNoun = (serves: ModelServes): string => serves === "chat" ? "model" : "decision model"
 
 /** The models a command can address by ID, hidden ones included. */
 export const requireLocalModels = (catalog: ModelCatalogState): Effect.Effect<readonly LocalModel[], ModelCommandError> =>
@@ -88,17 +97,18 @@ export const accelerationLabel = (model: LocalModel): string => {
     : "None"
 }
 
-export const capabilityLabels = (model: LocalModel): string[] => {
-  const serving = Option.getOrUndefined(localModelServingState(model))
-  if (serving?._tag !== "Assessed") return []
-  const capabilities = serving.capabilities
-  return [
+/** What a model Magnitude runs takes; a decision model takes no chat parameter. */
+export const capabilityLabels = (model: LocalModel): string[] => Option.match(localModelCapabilities(model), {
+  onNone: () => [],
+  onSome: (capabilities) => [
     ...(capabilities.vision ? ["Vision"] : []),
-    ...(capabilities.tools ? ["tools"] : []),
-    ...(capabilities.structuredOutput ? ["structured output"] : []),
-    ...(capabilities.reasoning.supported ? ["reasoning"] : []),
-  ]
-}
+    ...(capabilities.serves === "chat" ? [
+      ...(capabilities.tools ? ["tools"] : []),
+      ...(capabilities.structuredOutput ? ["structured output"] : []),
+      ...(capabilities.reasoning.supported ? ["reasoning"] : []),
+    ] : []),
+  ],
+})
 
 export const UNLOADED = "Unloaded"
 

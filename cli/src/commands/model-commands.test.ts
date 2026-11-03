@@ -572,7 +572,7 @@ const leakyModels = () => {
   } as CatalogLocalModel
   const found = withEvidence(makeFoundModel())
   const loadingFound = { ...found, acquisitionState: { ...found.acquisitionState, residencyState: residencies[0] } } as CustomLocalModel
-  const assessed = makeAddedModel().servingState as Extract<CustomLocalModel["servingState"], { _tag: "Assessed" }>
+  const assessed = makeAddedModel().servingState as Extract<CustomLocalModel["servingState"], { _tag: "Assessed"; capabilities: unknown }>
   const tooLarge = makeFolderModel({
     modelId: CustomFormModelIdSchema.make("local:too-large-q8_0:ffffffffffff"),
     servingState: { ...assessed, assessment: { _tag: "DoesNotFit", assessmentId: ModelAssessmentIdSchema.make("assessment_large"), environmentId: AssessmentEnvironmentIdSchema.make("environment_test"), profile: { contextLength: 4096 }, memoryDomains: [memoryEvidence], totalRequiredBytes: 10, deficitBytes: 4, limitingResource: "cuda0" } },
@@ -588,9 +588,9 @@ describe("--json never leaks internals", () => {
     for (const model of all) expect(JSON.stringify(model), model.modelId).toMatch(internalKey)
 
     const documents: Record<string, unknown>[] = [
-      encode(catalogListJson, state),
+      encode(catalogListJson, { catalog: state, serves: "chat" }),
       encode(catalogDetailJson, { model: catalog, models: all }),
-      encode(recommendationsJson, { catalog: state, models: [catalog], hardware: makeHardware(), preference: { label: "Balanced" }, ranked: [catalog, ...catalogs] }),
+      encode(recommendationsJson, { catalog: state, serves: "chat", models: [catalog], hardware: makeHardware(), preference: { label: "Balanced" }, ranked: [catalog, ...catalogs] }),
       encode(modelsStatusJson, statusView({ models: all, hidden: [withEvidence(makeFoundModel({ modelId: CustomFormModelIdSchema.make("hf:a/b/c.gguf") }))] })),
       ...all.map((model) => encode(modelDetailJson, { model, models: all, drafters: { _tag: "Listed", candidates: makeDrafterCandidates() }, hidden: false })),
       encode(hardwareJson, { hardware: makeHardware(), models: [loadingFound] }),
@@ -609,9 +609,9 @@ describe("--json never leaks internals", () => {
     const { catalog, catalogs } = leakyModels()
     const state = catalogState([catalog, ...catalogs])
     const documents = [
-      encode(catalogListJson, state),
+      encode(catalogListJson, { catalog: state, serves: "chat" }),
       encode(catalogDetailJson, { model: catalog, models: [catalog] }),
-      encode(recommendationsJson, { catalog: state, models: [catalog], hardware: makeHardware(), preference: { label: "Balanced" }, ranked: [catalog] }),
+      encode(recommendationsJson, { catalog: state, serves: "chat", models: [catalog], hardware: makeHardware(), preference: { label: "Balanced" }, ranked: [catalog] }),
     ]
     for (const document of documents) expect(JSON.stringify(document)).not.toMatch(/"(acquisitionState|residencyState|installation)"/)
   })

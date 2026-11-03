@@ -1,7 +1,7 @@
 import { Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import { CatalogFormModelIdSchema, CatalogSupportSchema, CustomFormModelIdSchema, HuggingFaceRepositoryIdSchema } from "@magnitudedev/sdk"
-import type { CatalogLocalModel, CatalogSupport, LocalInferenceHardware, LocalModel, ProviderModelId } from "@magnitudedev/sdk"
+import type { CatalogLocalModel, CatalogSupport, LocalInferenceHardware, LocalModel, ModelServes, ProviderModelId } from "@magnitudedev/sdk"
 import {
   localModelConnectionOptions,
   localModelRankingUtility,
@@ -10,7 +10,7 @@ import {
   targetPhysicalMemoryBytes,
   type LocalModelOption,
 } from "./options"
-import { makeFoundModel, makeSetupModel } from "../application/fixtures/model"
+import { decisionCatalogData, makeFoundModel, makeSetupModel } from "../application/fixtures/model"
 
 describe("connection model choices", () => {
   it("includes all five available catalog, Hugging Face and found models without ranking custom models", () => {
@@ -33,19 +33,20 @@ describe("connection model choices", () => {
     expect(choices[0]).toEqual({ id: added.modelId, label: "Added finetune (Q4_K_P)" })
     expect(models[0]).toBe(found)
     expect(rankedLocalModelOptions(models.map(model => ({ id: model.modelId, kind: "stored", model })), {
-      fastToSmart: 0.5, memoryBudgetBytes: 100,
+      serves: "chat", fastToSmart: 0.5, memoryBudgetBytes: 100,
     })).toHaveLength(3)
   })
 
   it("leaves out models that are unavailable, still assessing, unsupported or too large", () => {
     const found = makeFoundModel()
     const serving = found.servingState
-    if (serving._tag !== "Assessed") throw new Error("expected assessed fixture")
+    if (serving._tag !== "Assessed" || !("capabilities" in serving)) throw new Error("expected assessed fixture")
     const assessment = serving.assessment
     if (assessment._tag !== "Fits") throw new Error("expected fitting fixture")
     const unavailable = makeFoundModel({ acquisitionState: { _tag: "NotInstalled" } })
     const assessing = makeFoundModel({ servingState: { _tag: "Assessing", profile: { contextLength: 32_768 } } })
-    const unsupported = makeFoundModel({ servingState: { ...serving, assessment: {
+    const { capabilities: _, ...unassessed } = serving
+    const unsupported = makeFoundModel({ servingState: { ...unassessed, serves: Option.none(), assessment: {
       _tag: "Unsupported", environmentId: assessment.environmentId, profile: Option.none(),
       reasons: [{ _tag: "Unreadable" }], detail: "Unsupported model",
     } } })
@@ -57,28 +58,38 @@ describe("connection model choices", () => {
     expect(localModelConnectionOptions([makeSetupModel(false), unavailable, assessing, unsupported, tooLarge])).toEqual([])
     expect(localModelConnectionOptions([found])).toEqual([{ id: found.modelId, label: "Setup Model Uncensored (Q4_K_P)" }])
   })
+
+  it("leaves out decision models, which no agent can chat with", () => {
+    const decisions = makeSetupModel(true)
+    expect(localModelConnectionOptions([{ ...decisions, catalogData: decisionCatalogData(decisions.catalogData) }])).toEqual([])
+  })
 })
 
 const option = (
   modelId: string,
   totalRequiredBytes: number,
-  scores: { intelligence: number; speed: number | null; fidelity: number },
+  scores: { intelligence: number | null; speed: number | null; fidelity: number },
   kind: LocalModelOption["kind"] = "downloadable",
   support: CatalogSupport = { _tag: "Supported" },
+  serves: ModelServes = "chat",
 ): LocalModelOption => ({
   id: `${kind}:${modelId}`,
   kind,
   model: {
     _tag: "Catalog",
     modelId: modelId as ProviderModelId,
-    catalogData: { support },
+    catalogData: { support, serves },
     servingState: {
       _tag: "Assessed",
       assessment: {
         _tag: "Fits",
         memory: { totalRequiredBytes },
       },
-      rankingScores: { ...scores, speed: Option.fromNullable(scores.speed) },
+      rankingScores: {
+        ...scores,
+        intelligence: Option.fromNullable(scores.intelligence),
+        speed: Option.fromNullable(scores.speed),
+      },
     },
   } as unknown as LocalModel,
 })
@@ -102,11 +113,13 @@ describe("local model ranking", () => {
   })
 
   it("moves utility from speed toward intelligence while fidelity always contributes", () => {
-    const scores = { intelligence: 0.8, speed: Option.some(0.4), fidelity: 0.5 }
+    const scores = { intelligence: Option.some(0.8), speed: Option.some(0.4), fidelity: 0.5 }
     expect(localModelRankingUtility(scores, 0)).toBeCloseTo(0.4 ** 0.9 * 0.5 ** 0.1)
     expect(localModelRankingUtility(scores, 1)).toBeCloseTo(0.8 ** 0.9 * 0.5 ** 0.1)
     const pending = { ...scores, speed: Option.none() }
     expect(localModelRankingUtility(pending, 0.5)).toBeCloseTo(0.8 ** 0.45 * 0.5 ** 0.1)
+    const unrated = { ...scores, intelligence: Option.none() }
+    expect(localModelRankingUtility(unrated, 0.5)).toBeCloseTo(0.4 ** 0.45 * 0.5 ** 0.1)
   })
 
   it("filters by the exact memory budget before sorting and truncating", () => {
@@ -115,7 +128,7 @@ describe("local model ranking", () => {
     const overBudget = option("over", 9, { intelligence: 1, speed: 1, fidelity: 1 })
     expect(rankedLocalModelOptions(
       [smart, overBudget, fast],
-      { fastToSmart: 0, memoryBudgetBytes: 8 },
+      { serves: "chat", fastToSmart: 0, memoryBudgetBytes: 8 },
       1,
     )).toEqual([fast])
   })
@@ -126,7 +139,7 @@ describe("local model ranking", () => {
     const first = option("a", 1, scores)
     expect(rankedLocalModelOptions(
       [second, first],
-      { fastToSmart: 0.5, memoryBudgetBytes: 1 },
+      { serves: "chat", fastToSmart: 0.5, memoryBudgetBytes: 1 },
     )).toEqual([first, second])
   })
 
@@ -135,7 +148,7 @@ describe("local model ranking", () => {
     const pending = option("a-pending", 1, { intelligence: 1, speed: null, fidelity: 1 })
     expect(rankedLocalModelOptions(
       [pending, estimated],
-      { fastToSmart: 0.5, memoryBudgetBytes: 1 },
+      { serves: "chat", fastToSmart: 0.5, memoryBudgetBytes: 1 },
     )).toEqual([estimated, pending])
   })
 
@@ -145,7 +158,7 @@ describe("local model ranking", () => {
     const weaker = option("a-weaker", 1, { intelligence: 0.5, speed: null, fidelity: 0.5 })
     expect(rankedLocalModelOptions(
       [weaker, faithful, smarter],
-      { fastToSmart: 0.5, memoryBudgetBytes: 1 },
+      { serves: "chat", fastToSmart: 0.5, memoryBudgetBytes: 1 },
     )).toEqual([smarter, faithful, weaker])
   })
 
@@ -155,7 +168,7 @@ describe("local model ranking", () => {
 
     expect(rankedLocalModelOptions(
       [downloadable, stored],
-      { fastToSmart: 0.5, memoryBudgetBytes: 1 },
+      { serves: "chat", fastToSmart: 0.5, memoryBudgetBytes: 1 },
     )).toEqual([stored, downloadable])
   })
 
@@ -171,8 +184,16 @@ describe("local model ranking", () => {
     }))
     expect(rankedLocalModelOptions(
       [deprecated, disabled],
-      { fastToSmart: 0.5, memoryBudgetBytes: 1 },
+      { serves: "chat", fastToSmart: 0.5, memoryBudgetBytes: 1 },
     )).toEqual([])
+  })
+
+  it("ranks only models of the kind asked for", () => {
+    const chat = option("chat", 1, { intelligence: 1, speed: 1, fidelity: 1 })
+    const decisions = option("decisions", 1, { intelligence: null, speed: 1, fidelity: 1 }, "downloadable",
+      { _tag: "Supported" }, "decisions")
+    expect(rankedLocalModelOptions([chat, decisions], { serves: "chat", fastToSmart: 0.5, memoryBudgetBytes: 1 })).toEqual([chat])
+    expect(rankedLocalModelOptions([chat, decisions], { serves: "decisions", fastToSmart: 0.5, memoryBudgetBytes: 1 })).toEqual([decisions])
   })
 
   it("sums distinct normalized physical memory domains without adding system memory twice", () => {

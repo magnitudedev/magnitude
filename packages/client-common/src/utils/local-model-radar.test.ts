@@ -1,7 +1,7 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import { ModelVariantLabelSchema, type CustomLocalModel } from "@magnitudedev/sdk"
-import { makeFoundModel, makeSetupModel } from "../application/fixtures/model"
+import { decisionCatalogData, makeFoundModel, makeSetupModel } from "../application/fixtures/model"
 import { localModelRadarAxes, localModelSpeedTooltip, normalizeLocalModelRadarSpeed } from "./local-model-radar"
 
 const axis = (model: Parameters<typeof localModelRadarAxes>[0], label: string) =>
@@ -48,5 +48,11 @@ describe("local model radar", () => {
   it("keeps a catalog model's intelligence and catalog fidelity rank", () => {
     expect(axis(makeSetupModel(true), "INTELLIGENCE").detail).toBe("1%")
     expect(axis(makeSetupModel(true), "FIDELITY").detail).toBe("Reduced (Q4)")
+  })
+
+  it("never rates a decision model's intelligence", () => {
+    const model = makeSetupModel(true)
+    const decisions = { ...model, catalogData: decisionCatalogData(model.catalogData) }
+    expect(axis(decisions, "INTELLIGENCE")).toEqual({ label: "INTELLIGENCE", value: Option.none(), detail: "Not rated" })
   })
 })

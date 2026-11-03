@@ -10,7 +10,7 @@ const LINEAR_SPEED_SCORE_LIMIT = 40
 const SPEED_SCORE_CEILING = 100
 
 export interface LocalModelRankingCandidate {
-  readonly intelligenceScore: number
+  readonly intelligenceScore: Option.Option<number>
   readonly fidelityRank: number
   readonly profile: ServingProfile
   readonly performance: LocalModelPerformance
@@ -27,7 +27,8 @@ export const normalizedModelSpeedScore = (tokensPerSecond: number): number => {
   return rawScore / maximumScore
 }
 
-/** The speed term is the estimate at the comparison depth; none while speed is not estimated. */
+/** The speed term is the estimate at the comparison depth; none while speed is not estimated. A model without an
+ * intelligence score has no intelligence term. */
 export const modelRankingScores = (
   candidate: LocalModelRankingCandidate,
 ): LocalModelRankingScores => {
@@ -43,7 +44,7 @@ export const modelRankingScores = (
       )
     : Option.none()
   return {
-    intelligence: clamp01(candidate.intelligenceScore / 100),
+    intelligence: Option.map(candidate.intelligenceScore, (score) => clamp01(score / 100)),
     speed,
     fidelity: clamp01(candidate.fidelityRank / 100),
   }

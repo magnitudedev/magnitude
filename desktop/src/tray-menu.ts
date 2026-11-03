@@ -22,6 +22,7 @@ export const buildTrayMenu = (state: {
   { type: "separator" as const },
   { label: "Open Magnitude", click: () => actions.open() },
   { label: "Discover Models", click: () => actions.open("discover") },
+  { label: "Decisions", click: () => actions.open("decisions") },
   { label: "Settings", click: () => actions.open("settings") },
   ...(state.service === "Ready" && state.model.canStop ? [{ label: "Stop Model", click: actions.stopModel }] : []),
   { type: "separator" as const },

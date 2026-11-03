@@ -732,6 +732,7 @@ describe("adding models", () => {
         recommended: false,
         assessment: {
           _tag: "DoesNotFit",
+          capabilities: { serves: "chat", vision: false, tools: false, structuredOutput: false, reasoning: { supported: false, efforts: [] } },
           assessmentId: "assessment",
           profile: { contextLength: 4096 },
           memory: [{ memoryDomainId: "system", capacityBytes: 8, compatibilityReserveBytes: 0, remainingBytes: -4, requiredBytes: 12 }],

@@ -379,6 +379,16 @@ export const ModelCapabilitiesSchema = Schema.Struct({
 })
 export type ModelCapabilities = typeof ModelCapabilitiesSchema.Type
 
+/**
+ * What a local model Magnitude runs serves, with what it takes there: a chat model's chat capabilities, or a
+ * decision model's input only, since it generates nothing and so takes no chat parameter.
+ */
+export const LocalModelCapabilitiesSchema = Schema.Union(
+  Schema.Struct({ serves: Schema.Literal("chat"), ...ModelCapabilitiesSchema.fields }),
+  Schema.Struct({ serves: Schema.Literal("decisions"), vision: Schema.Boolean }),
+)
+export type LocalModelCapabilities = typeof LocalModelCapabilitiesSchema.Type
+
 export const ServingProfileSchema = Schema.Struct({
   contextLength: PositiveSafeInteger,
 })
@@ -425,7 +435,7 @@ export const HttpsUrlSchema = Schema.String.pipe(
   Schema.brand("HttpsUrl"),
 )
 
-/** A model's intelligence as a whole percentage of the top Artificial Analysis Intelligence Index score. */
+/** A chat model's intelligence as a whole percentage of the top Artificial Analysis Intelligence Index score. */
 export const IntelligenceScoreSchema = Schema.Int.pipe(Schema.between(0, 100))
 
 export const MemoryAssessmentSchema = Schema.Struct({
@@ -713,20 +723,29 @@ export const CatalogSupportSchema = Schema.Union(
 )
 export type CatalogSupport = typeof CatalogSupportSchema.Type
 
-/**
- * A catalog model's catalog facts. `aliases` are the IDs its files would have as found models (the
- * catalog's exact target found in another app's location); a request naming one means this model. A
- * hidden external copy keeps its own ID and is not an alias here.
- */
-export const LocalModelCatalogDataSchema = Schema.Struct({
+/** What a model answers: chat generation, or typed decisions read from one forward pass. */
+export const ModelServesSchema = Schema.Literal("chat", "decisions")
+export type ModelServes = typeof ModelServesSchema.Type
+
+const catalogFacts = {
   releaseDate: ModelReleaseDateSchema,
   parameterization: ModelParameterizationSchema,
-  intelligence: IntelligenceScoreSchema,
   support: CatalogSupportSchema,
   fidelityRank: NonNegativeSafeInteger,
   quantizationAware: Schema.Boolean,
   aliases: Schema.Array(CustomFormModelIdSchema),
-})
+}
+
+/**
+ * A catalog model's catalog facts, by what it serves: a chat model has its intelligence, and a decision model, which
+ * generates no text, has none (the Artificial Analysis index does not rate it). `aliases` are the IDs its files would
+ * have as found models (the catalog's exact target found in another app's location); a request naming one means this
+ * model. A hidden external copy keeps its own ID and is not an alias here.
+ */
+export const LocalModelCatalogDataSchema = Schema.Union(
+  Schema.Struct({ ...catalogFacts, serves: Schema.Literal("chat"), intelligence: IntelligenceScoreSchema }),
+  Schema.Struct({ ...catalogFacts, serves: Schema.Literal("decisions") }),
+)
 export type LocalModelCatalogData = typeof LocalModelCatalogDataSchema.Type
 
 const NormalizedRankingScoreSchema = Schema.Number.pipe(
@@ -734,9 +753,12 @@ const NormalizedRankingScoreSchema = Schema.Number.pipe(
   Schema.between(0, 1),
 )
 
-/** A fitting catalog model's normalized ranking terms; speed is absent until it is estimated. */
+/**
+ * A fitting catalog model's normalized ranking terms; speed is absent until it is estimated, and intelligence for a
+ * decision model, which the intelligence index does not rate.
+ */
 export const LocalModelRankingScoresSchema = Schema.Struct({
-  intelligence: NormalizedRankingScoreSchema,
+  intelligence: Schema.optionalWith(NormalizedRankingScoreSchema, { as: "Option", exact: true }),
   speed: Schema.optionalWith(NormalizedRankingScoreSchema, { as: "Option", exact: true }),
   fidelity: NormalizedRankingScoreSchema,
 })
@@ -900,21 +922,35 @@ const CustomModelFailedServingStateSchema = Schema.TaggedStruct("Failed", {
 })
 const LocalModelAssessedFields = {
   metadata: ModelMetadataSchema,
-  capabilities: ModelCapabilitiesSchema,
   speculativeMethod: Schema.optionalWith(SpeculativeMethodSchema, { as: "Option", exact: true }),
 } as const
-const CatalogModelAssessedFitsServingStateSchema = Schema.TaggedStruct("Assessed", {
+/** A model Magnitude runs has its capabilities; one it can't run has none. */
+const LocalModelSupportedFields = {
   ...LocalModelAssessedFields,
+  capabilities: LocalModelCapabilitiesSchema,
+} as const
+const CatalogModelAssessedFitsServingStateSchema = Schema.TaggedStruct("Assessed", {
+  ...LocalModelSupportedFields,
   assessment: LocalModelFitsAssessmentSchema,
   rankingScores: LocalModelRankingScoresSchema,
 })
 const CatalogModelAssessedDoesNotFitServingStateSchema = Schema.TaggedStruct("Assessed", {
-  ...LocalModelAssessedFields,
+  ...LocalModelSupportedFields,
   assessment: LocalModelDoesNotFitAssessmentSchema,
 })
-const CustomModelAssessedServingStateSchema = Schema.TaggedStruct("Assessed", {
+/**
+ * What a custom model serves is known only from its assessment, which reads its files: a supported model's
+ * capabilities name it, and an unsupported one's header does, unless it does not read. A catalog model's
+ * comes from its catalog data instead.
+ */
+const CustomModelAssessedSupportedServingStateSchema = Schema.TaggedStruct("Assessed", {
+  ...LocalModelSupportedFields,
+  assessment: Schema.Union(LocalModelFitsAssessmentSchema, LocalModelDoesNotFitAssessmentSchema),
+})
+const CustomModelAssessedUnsupportedServingStateSchema = Schema.TaggedStruct("Assessed", {
   ...LocalModelAssessedFields,
-  assessment: LocalModelAssessmentSchema,
+  assessment: LocalModelUnsupportedAssessmentSchema,
+  serves: Schema.optionalWith(ModelServesSchema, { as: "Option", exact: true }),
 })
 export const CatalogLocalModelServingStateSchema = Schema.Union(
   LocalModelAssessingServingStateSchema,
@@ -928,7 +964,8 @@ export type CatalogLocalModelServingState = typeof CatalogLocalModelServingState
 export const CustomLocalModelServingStateSchema = Schema.Union(
   LocalModelAssessingServingStateSchema,
   CustomModelFailedServingStateSchema,
-  CustomModelAssessedServingStateSchema,
+  CustomModelAssessedSupportedServingStateSchema,
+  CustomModelAssessedUnsupportedServingStateSchema,
 )
 export type CustomLocalModelServingState = typeof CustomLocalModelServingStateSchema.Type
 

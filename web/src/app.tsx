@@ -35,12 +35,13 @@ import {
   BuildingsIcon,
   ArrowRightIcon,
   BookOpenIcon,
+  ListChecksIcon,
 } from "@phosphor-icons/react"
 import { CopyCommand } from "./components/copy-command"
 import { Fragment, useMemo, useRef, useState, type ReactNode } from "react"
 import { Atom, Result, useAtomValue, useAtomSet, useAtomMount } from "@effect-atom/atom-react"
 import { Cause, Effect, Option } from "effect"
-import { type ProviderModelId, type CatalogLocalModel, type CustomModelAcquisitionState, type LocalModel, type ModelOptimizationProgress } from "@magnitudedev/sdk"
+import { type ProviderModelId, type ModelServes, type CatalogLocalModel, type CustomModelAcquisitionState, type LocalModel, type ModelOptimizationProgress } from "@magnitudedev/sdk"
 import type { AppearancePreference } from "@magnitudedev/sdk/desktop-host"
 import { ServerSettingsFailed, type ApplicationUpdateState, type NetworkAccessChange, type NetworkBind, type OwnerCapability } from "@magnitudedev/sdk"
 import { FolderPicker, choosePath, useNativeOpenPath } from "./components/folder-picker"
@@ -49,7 +50,7 @@ import {
   activeLocalModel, useAgentClient, type ApplicationPage,
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, useLocalInferenceHardware, formatLocalModelDisplayName,
   describeModelOptimization,
-  formatStorageSize, formatTransferRate, localModelIsInstalled, localModelProviderModelId, localModelConnectionOptions, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes, MODEL_STOPPED_FOR_MEMORY_MESSAGE, modelStoppedForMemory, MODEL_OPTIMIZATION_PENDING, MODEL_OPTIMIZATION_PENDING_DETAIL, modelOptimizationPendingIdle,
+  formatStorageSize, formatTransferRate, localModelIsInstalled, localModelProviderModelId, localModelListedAs, localModelConnectionOptions, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes, MODEL_STOPPED_FOR_MEMORY_MESSAGE, modelStoppedForMemory, MODEL_OPTIMIZATION_PENDING, MODEL_OPTIMIZATION_PENDING_DETAIL, modelOptimizationPendingIdle,
   useCustomModels, useHiddenLocalModels, useUnsupportedLocalModels,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
 } from "@magnitudedev/client-common"
@@ -76,6 +77,8 @@ import { ModelLocationsRow } from "./components/model-locations"
 import { HuggingFaceRow } from "./components/hugging-face"
 import { HostNotices } from "./components/host-notices"
 import { ModelCard } from "./components/model-card"
+import { DecisionsPage } from "./components/decisions-page"
+import { ServesControl } from "./components/serves-control"
 
 const ALL_INTERFACES = "all"
 const inferenceUrl = (address: string, port: number) => `http://${address}:${port}/inference/v1`
@@ -83,8 +86,8 @@ const inferenceUrl = (address: string, port: number) => `http://${address}:${por
 const moveModelsCommand = (platform: string, from: string, to: string) => platform === "win32"
   ? `robocopy "${from}" "${to}" /E /MOVE`
   : `mv "${from}/"* "${to}/"`
-const pageNames: Record<ApplicationPage, string> = { discover: "Discover", catalog: "Discover", chat: "Chat", models: "My Models", connections: "Connections", usage: "Usage", settings: "Settings" }
-const pageIcons = { discover: StackIcon, catalog: StackIcon, models: CubeIcon, chat: ChatCircleIcon, connections: PlugIcon, usage: ChartBarIcon, settings: SlidersIcon }
+const pageNames: Record<ApplicationPage, string> = { discover: "Discover", catalog: "Discover", chat: "Chat", models: "My Models", decisions: "Decisions", connections: "Connections", usage: "Usage", settings: "Settings" }
+const pageIcons = { discover: StackIcon, catalog: StackIcon, models: CubeIcon, decisions: ListChecksIcon, chat: ChatCircleIcon, connections: PlugIcon, usage: ChartBarIcon, settings: SlidersIcon }
 
 const minutesRemaining = (seconds: number) => seconds < 60 ? "Less than 1 min" : `About ${Math.ceil(seconds / 60)} min`
 /** Tuning's time remaining from its observed rate; units are measured configurations, so they track time. */
@@ -295,6 +298,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const hardware = useLocalInferenceHardware()
   const navigate = useNavigate()
   const [mySearch, setMySearch] = useState("")
+  const [myServes, setMyServes] = useState<ModelServes>("chat")
   const filterOptions = installedOnly
     ? [{ value: "all", label: "All models" }, { value: "downloaded", label: "Downloaded" }, { value: "downloading", label: "Downloading" }, { value: "hidden", label: "Hidden" }]
     : [{ value: "all", label: "All models" }, { value: "fits", label: "Fits my machine" }]
@@ -312,6 +316,8 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const noticeDismissal = useAtomValue(session.dismissFoundModelsNotice)
   const updateDiscovery = useAtomSet(useMemo(() => Atom.fn((update: Parameters<typeof session.updateDiscover>[0]) => session.updateDiscover(update)), [session]))
   const search = installedOnly ? mySearch : discovery.search
+  const serves = installedOnly ? myServes : discovery.serves
+  const setServes = (serves: ModelServes) => installedOnly ? setMyServes(serves) : updateDiscovery({ serves, selectedModel: Option.none() })
   const filter = installedOnly ? myFilter : discovery.filter
   const lab = installedOnly ? myLab : modelLabs.find(lab => Option.contains(discovery.lab, lab.name)) ?? null
   const sort = installedOnly ? mySort : discovery.sort
@@ -342,7 +348,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const custom = Result.isSuccess(customModels) ? customModels.value : []
   const allModels: readonly LocalModel[] = [...models, ...custom]
   const hidden = Result.isSuccess(hiddenModels) ? hiddenModels.value : []
-  const ranked = !installedOnly && Result.isSuccess(hardware) ? rankedLocalModelOptions(models.map(model => ({ id: model.modelId, kind: localModelIsInstalled(model) ? "stored" as const : "downloadable" as const, model })), { fastToSmart: LOCAL_MODEL_RANKING_SCALE_VALUES[preference]!, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, models.length).flatMap(option => option.model._tag === "Catalog" ? [option.model] : []) : []
+  const ranked = !installedOnly && Result.isSuccess(hardware) ? rankedLocalModelOptions(models.map(model => ({ id: model.modelId, kind: localModelIsInstalled(model) ? "stored" as const : "downloadable" as const, model })), { serves, fastToSmart: LOCAL_MODEL_RANKING_SCALE_VALUES[preference]!, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, models.length).flatMap(option => option.model._tag === "Catalog" ? [option.model] : []) : []
   const assessment = Result.isSuccess(catalog) ? catalog.value.preparation.assessment : undefined
   const recommendationsPending = !Result.isFailure(hardware) && (Result.isInitial(hardware) || !assessment?.complete)
   const rankedIds = new Set(ranked.map(model => model.modelId))
@@ -351,7 +357,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const library = ordered.filter(model => model._tag === "Custom" || model.acquisitionState._tag !== "NotInstalled"
     || !installedOnly && model.catalogData.support._tag === "Supported")
   const labOptions = modelLabs.filter(entry => library.some(model => modelLab(model) === entry))
-  const { selected, visible } = selectModels({ library, hidden, filter, lab, search, sort })
+  const { selected, visible } = selectModels({ library, hidden, serves, filter, lab, search, sort })
   const openAddFromHuggingFace = () => openDialog({ _tag: "Search", query: "" })
   const stopFailure = Option.isSome(stopResult.failure) && <ErrorNotice title="Couldn’t stop the model" description={stopResult.failure.value} className="mt-5" />
   const recommendationState: DiscoverRecommendationState = recommendationsPending ? "pending" : ranked.length > 0 ? "ranked" : models.some(model => model.servingState._tag === "Failed") ? "failed" : Result.isSuccess(hardware) ? "none" : "unavailable"
@@ -374,11 +380,13 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
     card={model => <ModelCard key={model.modelId} model={model} models={allModels} hardware={Result.value(hardware)} page={installedOnly ? "models" : "catalog"}
       {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})}
       {...Option.match(otherVersionsRequest(installedOnly ? "models" : "discover", model), { onNone: () => ({}), onSome: request => ({ onFindOtherVersions: () => openDialog(request) }) })} />}
-    empty={<p className="py-8 text-slate-500">{search.trim() || filter !== "all" || lab !== null ? "No models match your search or filter." : installedOnly ? "No models downloaded yet. Find one in Discover." : "No models match this filter."}</p>}
+    empty={<p className="py-8 text-slate-500">{search.trim() || filter !== "all" || lab !== null ? "No models match your search or filter."
+      : installedOnly ? serves === "decisions" ? "No decision models downloaded yet. Find one in Discover." : "No models downloaded yet. Find one in Discover."
+      : "No models match this filter."}</p>}
     footer={installedOnly && <UnsupportedModels models={Result.isSuccess(unsupportedModels) ? unsupportedModels.value : []} />} />
   if (discover) return <div ref={scrollRef} className="contents">
     <DiscoverHeader view={view} count={Result.isSuccess(catalog) ? visible.length : null} search={search} onView={setView} onSearch={setSearch}
-      action={<Button variant="outline" onClick={openAddFromHuggingFace}><HuggingFaceLogo />Add from Hugging Face</Button>}
+      action={<div className="flex flex-wrap items-center gap-3"><ServesControl value={serves} onChange={setServes} /><Button variant="outline" onClick={openAddFromHuggingFace}><HuggingFaceLogo />Add from Hugging Face</Button></div>}
       hardware={<HardwareOverview />}
       notice={!foundModelsNoticeDismissed && <>
         <FoundModelsBanner models={custom} onView={() => navigate("models")} onDismiss={() => dismissFoundModelsNotice()} dismissing={noticeDismissal.waiting} />
@@ -389,7 +397,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
       <DiscoverSections preference={<RecommendationPreference value={preference} onChange={setPreference} />}
         recommendations={recommendationsPending ? <RecommendationsSkeleton assessment={assessment} waitingForHardware={Result.isInitial(hardware)} /> : <Recommendations models={featuredCatalogModels(ranked, 5)} active={Option.fromNullable(active)} />}
         state={recommendationState} onAdd={openAddFromHuggingFace} onExplore={() => setView("all")} />
-      {recommendationState === "ranked" && <div className="mt-4 flex flex-wrap items-center justify-between gap-3 text-sm text-slate-500"><span>Want to compare more models?</span><Button variant="ghost" onClick={() => setView("all")}>Browse all {models.filter(model => model.catalogData.support._tag === "Supported").length} models<ArrowRightIcon /></Button></div>}
+      {recommendationState === "ranked" && <div className="mt-4 flex flex-wrap items-center justify-between gap-3 text-sm text-slate-500"><span>Want to compare more models?</span><Button variant="ghost" onClick={() => setView("all")}>Browse all {models.filter(model => model.catalogData.support._tag === "Supported" && localModelListedAs(model, serves)).length} models<ArrowRightIcon /></Button></div>}
     </section> : <section aria-label="All models">
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-2">{filterControls}
@@ -405,12 +413,26 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   return <>
     <ModelsHeader title={pageNames[page]} selectedCount={selected.length} matchingCount={visible.length} search={search} onSearch={setSearch}
       action={installedOnly ? null : <Button variant="outline" onClick={openAddFromHuggingFace}><HuggingFaceLogo />Add from Hugging Face</Button>}
-      controls={<>{filterControls}{sortControl}</>} />
+      controls={<><ServesControl value={serves} onChange={setServes} />{filterControls}{sortControl}</>} />
     {stopFailure}
     {assessment && !assessment.complete && <p className="mb-4 text-sm text-slate-500">{assessment.totalModels > 0 ? `Assessing models · ${assessment.settledModels} of ${assessment.totalModels}` : "Preparing models for assessment…"}</p>}
     {listing}
     {dialog}
   </>
+}
+/** A desktop window serves its own loopback endpoint; a browser reaches the service at its own origin. */
+function useApiOrigin(): Option.Option<string> {
+  const session = useSession()
+  const state = useAtomValue(session.application)
+  return Option.isSome(session.clientWindow)
+    ? (Result.isSuccess(state) ? Option.some(`http://127.0.0.1:${new URL(state.value.endpoint).port}`) : Option.none())
+    : Option.some(window.location.origin)
+}
+function Decisions() {
+  const navigate = useNavigate()
+  const platform = useServerPlatform()
+  const { remote } = useRemoteAccess()
+  return <DecisionsPage origin={useApiOrigin()} platform={remote ? viewerPlatform() : platform} remote={remote} onOpenSettings={() => navigate("settings")} />
 }
 function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; selectedModel: Option.Option<ProviderModelId> }) {
   const service = useSession()
@@ -418,14 +440,10 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
   const commandModels = Result.isSuccess(models) ? localModelConnectionOptions(models.value.models) : []
   const canConnect = serviceReady && commandModels.length > 0
   const navigate = useNavigate()
-  const state = useAtomValue(service.application)
   // The desktop app, its service, and the agents always share one computer and user, so it
   // configures agents in place. A browser can't know where its viewer's agents run.
   const desktop = Option.isSome(service.clientWindow)
-  // A desktop window serves its own loopback endpoint; a browser reaches the service at its own origin.
-  const apiOrigin = desktop
-    ? (Result.isSuccess(state) ? Option.some(`http://127.0.0.1:${new URL(state.value.endpoint).port}`) : Option.none<string>())
-    : Option.some(window.location.origin)
+  const apiOrigin = useApiOrigin()
   const platform = useServerPlatform()
   const { remote } = useRemoteAccess()
   const client = useAgentClient()
@@ -710,6 +728,7 @@ export function App() {
       : page === "chat" ? <ChatPage />
       : page === "usage" ? <ServingUsage />
       : page === "connections" ? <Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} />
+      : page === "decisions" ? <Decisions />
       : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(observation.service) ? <>{page !== "discover" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<ErrorNotice title="Magnitude needs your attention" description="The inference service is unavailable." className="mt-8" actions={<NoticeAction onClick={() => navigate("settings")}>Open Settings</NoticeAction>} /></> : <ModelsSkeleton page={page} startingService />)
       : page === "discover" || page === "catalog" || page === "models" ? <Models page={page} />
       : null}
@@ -768,7 +787,7 @@ export function AppShell({ page, navigate, platform, children }: { page: Applica
 }
 function Navigation({ page, navigate, onNavigate }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; onNavigate?: () => void }) {
   return <nav id="desktop-navigation" className="flex min-h-0 flex-1 flex-col gap-2 px-4">
-    {(["discover", "chat", "models", "connections", "usage", "settings"] as const).map(key => {
+    {(["discover", "chat", "models", "decisions", "connections", "usage", "settings"] as const).map(key => {
       const Icon = pageIcons[key]
       return <Fragment key={key}>
         {key === "settings" && <a href="https://docs.magnitude.dev" target="_blank" rel="noreferrer" onClick={onNavigate} className={`${buttonVariants({ variant: "ghost" })} mt-auto h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start hover:bg-slate-100 dark:hover:bg-slate-800`}>

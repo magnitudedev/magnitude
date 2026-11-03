@@ -4,6 +4,7 @@ import recommendationsMarkdown from "./topics/recommendations.md" with { type: "
 import speculativeMethodsMarkdown from "./topics/speculative-methods.md" with { type: "text" }
 import remoteAccessMarkdown from "./topics/remote-access.md" with { type: "text" }
 import customModelsMarkdown from "./topics/custom-models.md" with { type: "text" }
+import decisionsMarkdown from "./topics/decisions.md" with { type: "text" }
 
 export interface DocumentationTopic {
   readonly id: string
@@ -36,6 +37,11 @@ export const documentationTopics: readonly DocumentationTopic[] = [
     id: "custom-endpoints",
     description: "Configure an OpenAI-compatible Chat Completions endpoint",
     markdown: customEndpointsMarkdown,
+  },
+  {
+    id: "decisions",
+    description: "Get typed, calibrated answers from decision models through System One or OpenAI Decisions",
+    markdown: decisionsMarkdown,
   },
   {
     id: "remote-access",

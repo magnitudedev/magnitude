@@ -12,7 +12,7 @@ export const repository = HuggingFaceRepositoryIdSchema.make("HauhauCS/Qwen3.6-3
 const environmentId = AssessmentEnvironmentIdSchema.make("environment")
 const assessmentId = ModelAssessmentIdSchema.make("assessment")
 
-const capabilities = { vision: false, tools: true, structuredOutput: true, reasoning: { supported: false, efforts: [], defaultEffort: Option.none() } }
+const capabilities = { serves: "chat", vision: false, tools: true, structuredOutput: true, reasoning: { supported: false, efforts: [], defaultEffort: Option.none() } } as const
 const metadata = { format: "gguf" as const, quantization: "Q4_K", quantizationName: "Q4_K_P", architecture: "qwen35moe", maximumContextLength: Option.some(32_768), storageBytes: 23 * GB }
 
 export const fits: Extract<LocalModelAssessment, { readonly _tag: "Fits" }> = {
@@ -36,9 +36,9 @@ export const catalogModel = (): CatalogLocalModel => ({
   modelId: catalogId,
   storageBytes: 24 * GB,
   presentation: { displayName: "Qwen3.6 35B-A3B", variantLabel: ModelVariantLabelSchema.make("Q4"), description: "", license: Option.some("apache-2.0"), sourceUrls: [] },
-  catalogData: { releaseDate: ModelReleaseDateSchema.make("2026-01-01"), parameterization: { architecture: "dense", totalParameters: 1 }, intelligence: 1, support: { _tag: "Supported" }, fidelityRank: 1, quantizationAware: false, aliases: [] },
+  catalogData: { releaseDate: ModelReleaseDateSchema.make("2026-01-01"), parameterization: { architecture: "dense", totalParameters: 1 }, intelligence: 1, support: { _tag: "Supported" }, fidelityRank: 1, quantizationAware: false, serves: "chat", aliases: [] },
   acquisitionState: { _tag: "Installed", installation: { _tag: "Resolved", installedBytes: 24 * GB, primaryPath: "/models/qwen.gguf", ownership: "Magnitude" }, residencyState: { _tag: "Unloaded" } },
-  servingState: { _tag: "Assessed", capabilities, speculativeMethod: Option.none(), metadata, assessment: fits, rankingScores: { speed: Option.some(1), intelligence: 1, fidelity: 1 } },
+  servingState: { _tag: "Assessed", capabilities, speculativeMethod: Option.none(), metadata, assessment: fits, rankingScores: { speed: Option.some(1), intelligence: Option.some(1), fidelity: 1 } },
   missingComponents: [],
   storedComponents: [],
   drafterWithheld: false,

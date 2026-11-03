@@ -1,6 +1,14 @@
 import { Option, Schema } from "effect"
-import { AssessmentEnvironmentIdSchema, CatalogFormModelIdSchema, CustomFormModelIdSchema, ModelAssessmentIdSchema, ModelReleaseDateSchema, ModelVariantLabelSchema, type CustomLocalModel, type LocalModel } from "@magnitudedev/sdk"
+import { AssessmentEnvironmentIdSchema, CatalogFormModelIdSchema, CustomFormModelIdSchema, ModelAssessmentIdSchema, ModelReleaseDateSchema, ModelVariantLabelSchema, type CustomLocalModel, type LocalModel, type LocalModelCatalogData } from "@magnitudedev/sdk"
 export const providerModelId = CatalogFormModelIdSchema.make("setup-model:gguf:q4")
+
+/** The same catalog facts for a decision model, which has no intelligence. */
+export const decisionCatalogData = (data: LocalModelCatalogData): LocalModelCatalogData => {
+  if (data.serves === "decisions") return data
+  const { intelligence: _intelligence, ...facts } = data
+  return { ...facts, serves: "decisions" }
+}
+
 export const makeSetupModel = (installed: boolean): Extract<LocalModel, { readonly _tag: "Catalog" }> => {
   return {
     _tag: "Catalog",
@@ -20,6 +28,7 @@ export const makeSetupModel = (installed: boolean): Extract<LocalModel, { readon
         support: { _tag: "Supported" },
         fidelityRank: 1,
         quantizationAware: false,
+        serves: "chat",
         aliases: [],
     },
     acquisitionState: installed
@@ -40,6 +49,7 @@ export const makeSetupModel = (installed: boolean): Extract<LocalModel, { readon
     servingState: {
       _tag: "Assessed",
       capabilities: {
+        serves: "chat",
         vision: false,
         tools: true,
         structuredOutput: true,
@@ -70,7 +80,7 @@ export const makeSetupModel = (installed: boolean): Extract<LocalModel, { readon
         },
       },
       rankingScores: {
-        intelligence: 0.7,
+        intelligence: Option.some(0.7),
         speed: installed ? Option.none() : Option.some(0.8),
         fidelity: 0.9,
       },
@@ -110,6 +120,7 @@ export const makeFoundModel = (
   servingState: {
     _tag: "Assessed",
     capabilities: {
+      serves: "chat",
       vision: false,
       tools: true,
       structuredOutput: true,

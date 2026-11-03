@@ -8,13 +8,15 @@ All paths are relative to `http://127.0.0.1:10100`. From another device, use the
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | Returns `200` when the service is ready. |
-| `GET` | `/inference/v1/models` | List models available for inference. |
+| `GET` | `/inference/v1/models` | List models available for inference. Decision models report `["decisions"]` as their output modalities. |
 | `POST` | `/inference/v1/chat/completions` | OpenAI Chat Completions, JSON or streaming. |
 | `POST` | `/inference/v1/responses` | OpenAI Responses, JSON or streaming. |
+| `POST` | `/inference/v1/systemone` | TypeSafe System One decisions. See [Decisions](/api/decisions). |
+| `POST` | `/inference/v1/decisions` | OpenAI Decisions. See [Decisions](/api/decisions). |
 | `POST` | `/inference/anthropic/v1/messages` | Anthropic Messages. `max_tokens` is required. |
 | `POST` | `/inference/anthropic/v1/messages/count_tokens` | Count input tokens for an Anthropic-format request. |
 
-Supported inputs and features depend on the model. Your application keeps the conversation history and executes any tools the model requests.
+Supported inputs and features depend on the model. Chat routes serve chat models and decision routes serve decision models; a request to the other kind is refused. Your application keeps the conversation history and executes any tools the model requests.
 
 ## Chat completion
 

@@ -95,6 +95,7 @@
         "pages": [
           "api/overview",
           "api/endpoints",
+          "api/decisions",
           "api/network-access",
           "api/windows-wsl"
         ]

@@ -11,6 +11,7 @@ import { GaugeIcon, TimerIcon, ArrowDownIcon, ArrowUpIcon, StackIcon, InfoIcon, 
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select"
 
 import { ActionTooltip } from "./ui/tooltip"
+import { SegmentedControl } from "./ui/segmented-control"
 
 const number = (value: number) => value.toLocaleString()
 const decimal = (value: number) => value.toLocaleString(undefined, { maximumFractionDigits: 1 })
@@ -36,9 +37,7 @@ export function ServingUsage() {
       </Select>
       <div className="flex items-center gap-3">
         <span className="text-xs text-slate-500">Totals</span>
-        <div className="flex rounded-lg bg-slate-100 p-1 dark:bg-slate-900" aria-label="Usage period">
-          {(["Today", "AllTime"] as const).map(value => <button key={value} aria-pressed={period === value} onClick={() => setPeriod(value)} className={`rounded-md px-3 py-1.5 text-sm ${period === value ? "bg-white text-blue-700 shadow-sm dark:bg-slate-750 dark:text-blue-300" : "text-slate-500"}`}>{value === "Today" ? "Today" : "All time"}</button>)}
-        </div>
+        <SegmentedControl label="Usage period" options={[{ value: "Today", label: "Today" }, { value: "AllTime", label: "All time" }]} value={period} onChange={setPeriod} />
       </div>
     </div>
     {snapshot?._tag === "Available" ? <UsageActivity days={snapshot.dailyActivity} /> : Result.isInitial(result) ? <UsageActivity days={null} /> : null}

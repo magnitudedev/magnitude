@@ -7,6 +7,7 @@ import { DiscoverSections, HiddenModelUnhide, ModelsListing, afterModelAdded, ot
 import { ModelsHeader } from "./models-header"
 import { modelLabs } from "./model-logo"
 import { added, catalogModel, customModel, doesNotFit, foundIn } from "../../test/models/fixtures"
+import { decisionCatalogData } from "../../../packages/client-common/src/application/fixtures/model"
 
 const commands = vi.hoisted(() => ({ pending: new Set<string>(), unhide: vi.fn() }))
 
@@ -24,7 +25,7 @@ const header = (count: number) => renderToStaticMarkup(<ModelsHeader title="Cata
 
 describe("catalog search placeholder", () => {
   const select = (overrides: Partial<Parameters<typeof selectModels>[0]>) =>
-    selectModels({ library: [qwen, gemma, tooLarge], hidden: [], filter: "all", lab: null, search: "", sort: "name", ...overrides })
+    selectModels({ library: [qwen, gemma, tooLarge], hidden: [], serves: "chat", filter: "all", lab: null, search: "", sort: "name", ...overrides })
   it("counts what the filter and lab leave, not the typed search", () => {
     const typed = select({ search: "gemma" })
     expect(typed.selected).toHaveLength(3)
@@ -34,6 +35,17 @@ describe("catalog search placeholder", () => {
     expect(header(select({ filter: "fits", search: "nothing matches" }).selected.length)).toContain('placeholder="Search 2 models…"')
     expect(select({ lab: qwenLab }).selected.map(model => model.modelId)).toEqual([qwen.modelId, tooLarge.modelId])
     expect(header(select({ filter: "fits", lab: qwenLab, search: "gemma" }).selected.length)).toContain('placeholder="Search 1 model…"')
+  })
+  it("lists only models of the chosen kind", () => {
+    const elephant = { ...qwen, catalogData: decisionCatalogData(qwen.catalogData) }
+    expect(select({ library: [qwen, elephant, gemma] }).selected).toEqual([qwen, gemma])
+    expect(select({ library: [qwen, elephant, gemma], serves: "decisions" }).selected).toEqual([elephant])
+  })
+  it("lists a custom model under the kind its assessment reads, and under both while it is assessing", () => {
+    const decider = customModel(added, { servingState: { ...customModel(added).servingState, capabilities: { serves: "decisions", vision: false } } as ReturnType<typeof customModel>["servingState"] })
+    const assessing = customModel(added, { servingState: { _tag: "Assessing", profile: { contextLength: 4096 } } })
+    expect(select({ library: [gemma, decider, assessing] }).selected).toEqual([gemma, assessing])
+    expect(select({ library: [gemma, decider, assessing], serves: "decisions" }).selected).toEqual([decider, assessing])
   })
   it("lists hidden models under the Hidden filter", () => {
     const hidden = select({ filter: "hidden", hidden: [gemma] })

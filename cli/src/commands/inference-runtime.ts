@@ -7,8 +7,10 @@ import {
   formatStorageSize,
   LOCAL_MODEL_RANKING_SCALE_LABELS,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
+  localModelFacts,
   localModelIsInstalled,
   localModelRadarAxes,
+  localModelServes,
   rankedLocalModelOptions,
   targetPhysicalMemoryBytes,
 } from "@magnitudedev/client-common"
@@ -19,6 +21,7 @@ import {
   type LocalInferenceHardware,
   type LocalModel,
   type ModelCatalogState,
+  type ModelServes,
 } from "@magnitudedev/sdk"
 import { Effect, Option, Schema } from "effect"
 import {
@@ -52,6 +55,8 @@ import {
   capabilityLabels,
   residencyLabel,
   requireLocalModels,
+  parseServes,
+  servesNoun,
 } from "./model-format"
 export * from "./hugging-face-runtime"
 
@@ -64,6 +69,15 @@ export * from "./models-status-runtime"
 
 const catalogModels = (catalog: ModelCatalogState): readonly CatalogLocalModel[] =>
   catalogProducts(catalog).flatMap((model) => model._tag === "Catalog" ? [model] : [])
+
+/** The catalog models of one kind, which the list and recommendations show. */
+const servedCatalogModels = (catalog: ModelCatalogState, serves: ModelServes): readonly CatalogLocalModel[] =>
+  catalogModels(catalog).filter((model) => Option.contains(localModelServes(model), serves))
+
+export interface CatalogView {
+  readonly catalog: ModelCatalogState
+  readonly serves: ModelServes
+}
 
 export const renderCatalogStatus = (catalog: ModelCatalogState): string => {
   if (catalog._tag === "Initializing") return ensureTrailingNewline([
@@ -140,15 +154,16 @@ const labeledModelName = (model: CatalogLocalModel): string => Option.match(
     onSome: (label) => `${formatLocalModelDisplayName(model)} [${label}]`,
   })
 
-export const renderCatalog = (catalog: ModelCatalogState): string => {
+export const renderCatalog = ({ catalog, serves }: CatalogView): string => {
   if (catalog._tag === "Initializing") return "The local model catalog is initializing.\n"
-  const models = catalogModels(catalog)
+  const models = servedCatalogModels(catalog, serves)
+  const noun = servesNoun(serves)
   const compatible = fittingCatalogModels(models)
   const notice = [...assessmentNotice(models, "list"), ...catalogWarnings(catalog)]
   if (compatible.length === 0) {
     const lead = notice.length > 0
-      ? "No compatible catalog models are available yet."
-      : "No catalog models are compatible with this computer."
+      ? `No compatible catalog ${noun}s are available yet.`
+      : `No catalog ${noun}s are compatible with this computer.`
     return ensureTrailingNewline([lead, ...notice].join("\n"))
   }
   const table = renderTable(compatible, [
@@ -160,7 +175,7 @@ export const renderCatalog = (catalog: ModelCatalogState): string => {
     { heading: "MODEL ID", value: ({ modelId }) => modelId },
   ])
   return ensureTrailingNewline([
-    `Local model catalog - ${plural(compatible.length, "compatible model")}`,
+    `Local ${noun} catalog - ${plural(compatible.length, `compatible ${noun}`)}`,
     "",
     table.trimEnd(),
     ...(notice.length > 0 ? ["", ...notice] : []),
@@ -175,8 +190,8 @@ export const CatalogListJsonSchema = Schema.Struct({
   warnings: Schema.Array(Schema.String),
 })
 
-export const catalogListJson = jsonDocument(CatalogListJsonSchema, (catalog: ModelCatalogState) => {
-  const models = catalogModels(catalog)
+export const catalogListJson = jsonDocument(CatalogListJsonSchema, ({ catalog, serves }: CatalogView) => {
+  const models = servedCatalogModels(catalog, serves)
   return {
     initializing: catalog._tag === "Initializing",
     models: fittingCatalogModels(models),
@@ -185,8 +200,9 @@ export const catalogListJson = jsonDocument(CatalogListJsonSchema, (catalog: Mod
   }
 })
 
-export const showModelCatalog = (options: JsonOption = {}) => commandEffect({
-  effect: withClient(readCatalog),
+export const showModelCatalog = (servesInput: string, options: JsonOption = {}) => commandEffect({
+  effect: parseServes(servesInput).pipe(
+    Effect.flatMap((serves) => withClient(readCatalog).pipe(Effect.map((catalog) => ({ catalog, serves }))))),
   render: renderCatalog,
   json: asJson(options, catalogListJson),
 })
@@ -216,13 +232,18 @@ export const parseLimit = (input: string, maximum = Number.MAX_SAFE_INTEGER) => 
       }))
 }
 
+/** Whether speed, intelligence and acceleration apply: they describe chat models alone (`localModelFacts`). */
+const statesChatFacts = (model: CatalogLocalModel) => localModelFacts(model)._tag === "Chat"
+
 const renderRecommendation = (model: CatalogLocalModel, index: number): string => {
   const capabilities = capabilityLabels(model)
+  const chat = statesChatFacts(model)
+  const fidelity = `Fidelity ${radarDetail(model, "FIDELITY")}`
   return [
     `${index + 1}. ${labeledModelName(model)}`,
     `   ID: ${model.modelId}`,
-    `   ${speedLabel(model)} - ${modelMemory(model)} memory - ${modelContext(model)} context`,
-    `   Intelligence ${model.catalogData.intelligence}% - Fidelity ${radarDetail(model, "FIDELITY")} - Acceleration ${accelerationLabel(model)}`,
+    `   ${[...(chat ? [speedLabel(model)] : []), `${modelMemory(model)} memory`, `${modelContext(model)} context`].join(" - ")}`,
+    `   ${chat ? `Intelligence ${radarDetail(model, "INTELLIGENCE")} - ${fidelity} - Acceleration ${accelerationLabel(model)}` : fidelity}`,
     ...(capabilities.length > 0 ? [`   ${capabilities.join(", ")}`] : []),
   ].join("\n")
 }
@@ -232,6 +253,7 @@ export const HUGGING_FACE_HINT =
 
 export interface RecommendationsView {
   readonly catalog: ModelCatalogState
+  readonly serves: ModelServes
   readonly models: readonly CatalogLocalModel[]
   readonly hardware: LocalInferenceHardware
   readonly preference: { readonly label: string }
@@ -250,20 +272,21 @@ export const recommendationsJson = jsonDocument(RecommendationsJsonSchema, (view
   models: view.ranked,
 }))
 
-export const showRecommendations = (preferenceInput: string, limitInput: string, options: JsonOption = {}) => commandEffect({
-  effect: Effect.all([parsePreference(preferenceInput), parseLimit(limitInput)]).pipe(
-    Effect.flatMap(([preference, limit]) => withClient((client) => Effect.gen(function* () {
+export const showRecommendations = (preferenceInput: string, limitInput: string, servesInput: string, options: JsonOption = {}) => commandEffect({
+  effect: Effect.all([parsePreference(preferenceInput), parseLimit(limitInput), parseServes(servesInput)]).pipe(
+    Effect.flatMap(([preference, limit, serves]) => withClient((client) => Effect.gen(function* () {
       const [catalog, hardware] = yield* Effect.all([readCatalog(client), readHardware(client)])
-      const models = catalogModels(catalog)
-      const ranked = rankedLocalModelOptions(models.map((model) => ({
+      const models = servedCatalogModels(catalog, serves)
+      const ranked = rankedLocalModelOptions(catalogModels(catalog).map((model) => ({
         id: String(model.modelId),
         kind: localModelIsInstalled(model) ? "stored" as const : "downloadable" as const,
         model,
       })), {
+        serves,
         fastToSmart: preference.value,
         memoryBudgetBytes: targetPhysicalMemoryBytes(hardware),
       }, limit).flatMap(({ model }) => model._tag === "Catalog" ? [model] : [])
-      return { catalog, models, hardware, preference, ranked }
+      return { catalog, serves, models, hardware, preference, ranked }
     }))),
   ),
   render: renderRecommendations,
@@ -272,6 +295,7 @@ export const showRecommendations = (preferenceInput: string, limitInput: string,
 
 export function renderRecommendations({
   catalog,
+  serves,
   models,
   hardware,
   preference,
@@ -281,13 +305,13 @@ export function renderRecommendations({
   const system = describeLocalHardware(hardware).system.name
   const notice = [...assessmentNotice(models, "recommendations"), ...catalogWarnings(catalog)]
   if (ranked.length === 0) return ensureTrailingNewline([
-    `No compatible recommendations are available for ${preference.label}.`,
+    `No compatible ${servesNoun(serves)} recommendations are available for ${preference.label}.`,
     ...notice,
     "",
     HUGGING_FACE_HINT,
   ].join("\n"))
   return ensureTrailingNewline([
-    `Local model recommendations - ${preference.label}`,
+    `Local ${servesNoun(serves)} recommendations - ${preference.label}`,
     `${system} - ${formatMemorySize(hardware.totalSystemMemoryBytes)}`,
     "",
     ranked.map(renderRecommendation).join("\n\n"),
@@ -345,12 +369,13 @@ export const renderCatalogDetail = ({ model, models }: CatalogDetailView): strin
       ["Memory required", formatMemorySize(serving.assessment.totalRequiredBytes)],
       ["Additional memory", formatMemorySize(serving.assessment.deficitBytes)],
     ])]
+    const chat = statesChatFacts(model)
     return ["Performance on this machine", renderFields([
-      ["Speed", speedLabel(model)],
+      ...(chat ? [["Speed", speedLabel(model)]] as const : []),
       ["Fit", radarDetail(model, "FIT")],
-      ["Intelligence", `${model.catalogData.intelligence}%`],
+      ...(chat ? [["Intelligence", radarDetail(model, "INTELLIGENCE")]] as const : []),
       ["Fidelity", radarDetail(model, "FIDELITY")],
-      ["Acceleration", accelerationLabel(model)],
+      ...(chat ? [["Acceleration", accelerationLabel(model)]] as const : []),
     ])]
   })()
   return ensureTrailingNewline([

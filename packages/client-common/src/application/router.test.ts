@@ -10,6 +10,7 @@ describe("application routes", () => {
   it("treats the root and trailing slashes as the same route", () => {
     expect(pageFromPath("/")).toEqual(Option.some("discover"))
     expect(pageFromPath("/catalog/")).toEqual(Option.some("catalog"))
+    expect(pageFromPath("/decisions")).toEqual(Option.some("decisions"))
   })
   it("rejects paths that are not pages", () => {
     expect(pageFromPath("/inference/v1")).toEqual(Option.none())

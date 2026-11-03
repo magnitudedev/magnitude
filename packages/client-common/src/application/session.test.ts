@@ -127,6 +127,14 @@ describe("host actions", () => {
     expect(registry.get(session.discover)).toMatchObject({ filter: "fits", allScroll: 740 })
   })))
 
+  it("lists chat models in Discover until decision models are browsed", () => withSession([], (session, registry) => Effect.gen(function* () {
+    expect(registry.get(session.discover)).toMatchObject({ view: "recommended", serves: "chat" })
+    yield* session.navigate("decisions")
+    yield* session.browseDecisionModels
+    expect(registry.get(session.page)).toBe("discover")
+    expect(registry.get(session.discover)).toMatchObject({ view: "all", serves: "decisions" })
+  })))
+
   it("decodes the wire form with and without a file and rejects unsafe values", () => {
     const decode = Schema.decodeUnknownEither(HostAction)
     expect(decode({ _tag: "OpenHuggingFaceModel", repository: "owner/repo" })).toEqual(Either.right({ _tag: "OpenHuggingFaceModel", repository: "owner/repo", file: Option.none() }))

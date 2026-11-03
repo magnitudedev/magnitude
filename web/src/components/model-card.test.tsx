@@ -4,6 +4,7 @@ import type { CatalogLocalModel } from "@magnitudedev/sdk"
 import { Option } from "effect"
 import { ModelCard } from "./model-card"
 import { catalogModel, doesNotFit } from "../../test/models/fixtures"
+import { decisionCatalogData } from "../../../packages/client-common/src/application/fixtures/model"
 
 vi.mock("@magnitudedev/client-common", async importOriginal => ({
   ...await importOriginal<typeof import("@magnitudedev/client-common")>(),
@@ -25,6 +26,21 @@ describe("unified catalog rows", () => {
     expect(html).toContain("Estimated speed")
     expect(html).toContain("Intelligence")
     expect(html).not.toContain("font-mono")
+  })
+  it("marks decision models, and only them", () => {
+    expect(render()).not.toContain(">Decisions</span>")
+    expect(render({ ...model, catalogData: decisionCatalogData(model.catalogData) })).toContain(">Decisions</span>")
+  })
+  it("offers a decision model no drafter, decode speed or chat intelligence", () => {
+    const decisions = { ...model, catalogData: decisionCatalogData(model.catalogData) }
+    for (const [page, cells] of [["catalog", 1], ["models", 2]] as const) {
+      const html = render(decisions, page)
+      expect(html.match(/<dt /g)).toHaveLength(cells)
+      expect(html).toContain("Memory")
+      expect(html).not.toContain("Drafter")
+      expect(html).not.toContain("Estimated speed")
+      expect(html).not.toContain("Intelligence")
+    }
   })
   it("retains operational status in My Models", () => {
     const html = render(model, "models")

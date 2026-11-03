@@ -1,5 +1,6 @@
 import { Option } from "effect"
 import {
+  localModelServes,
   localModelServingState,
   type GenerationPerformanceEvidence,
   type GenerationPerformanceSamples,
@@ -174,15 +175,14 @@ export const localModelRadarAxes = (
     onNone: () => customFidelityRank(model),
     onSome: ({ fidelityRank }) => Option.some(fidelityRank),
   })
+  const intelligence = localModelIntelligence(model)
   const axes: LocalModelRadarAxes = [
     {
-      value: Option.map(catalog, ({ intelligence }) =>
-        clamp01(intelligence / 100)
-      ),
+      value: Option.map(intelligence, (score) => clamp01(score / 100)),
       label: "INTELLIGENCE",
-      detail: Option.match(catalog, {
+      detail: Option.match(intelligence, {
         onNone: () => "Not rated",
-        onSome: ({ intelligence }) => `${intelligence}%`,
+        onSome: (score) => `${score}%`,
       }),
     },
     {
@@ -224,17 +224,26 @@ export const localModelMemoryUse = (model: LocalModel): Option.Option<number> =>
   return serving?._tag === "Assessed" && serving.assessment._tag === "Fits" ? Option.some(memoryUseRatio(serving.assessment)) : Option.none()
 }
 
-/** What a model card states beyond its fit: catalog intelligence and the estimated speed range. */
-export interface LocalModelFacts {
-  readonly intelligence: Option.Option<number>
-  readonly speed: Option.Option<string>
-}
+/** A catalog chat model's intelligence; a custom model's is never rated, and a decision model has none. */
+export const localModelIntelligence = (model: LocalModel): Option.Option<number> =>
+  model._tag === "Catalog" && model.catalogData.serves === "chat" ? Option.some(model.catalogData.intelligence) : Option.none()
+
+/**
+ * What a model card states beyond its fit, for the kind of model it is. Intelligence, the estimated decode speed
+ * and drafter acceleration apply to chat models alone, so a decision model states none of them; a model whose kind
+ * isn't known yet is described as a chat model.
+ */
+export type LocalModelFacts =
+  | { readonly _tag: "Chat"; readonly intelligence: Option.Option<number>; readonly speed: Option.Option<string> }
+  | { readonly _tag: "Decisions" }
 
 export const localModelFacts = (model: LocalModel): LocalModelFacts => {
+  if (Option.contains(localModelServes(model), "decisions")) return { _tag: "Decisions" }
   const serving = Option.getOrUndefined(localModelServingState(model))
   const fits = serving?._tag === "Assessed" && serving.assessment._tag === "Fits" ? serving.assessment : undefined
   return {
-    intelligence: model._tag === "Catalog" ? Option.some(model.catalogData.intelligence) : Option.none(),
+    _tag: "Chat",
+    intelligence: localModelIntelligence(model),
     speed: fits === undefined ? Option.none() : Option.some(performanceRangeSpeedLabel(fits.performance, fits.profile.contextLength)),
   }
 }

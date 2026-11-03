@@ -13,9 +13,10 @@ import {
   catalogModelServingState,
   catalogRemovalAcquisition,
   coordinatedAssessment,
+  customModelServingState,
   projectLocalModelPreparation,
 } from "./local-models"
-import type { LocalModelSourcesState } from "./local-model-sources"
+import type { CustomModelSource, LocalModelSourcesState } from "./local-model-sources"
 
 describe("local model serving projection", () => {
   it("uses capabilities from the unified assessment result", () => {
@@ -39,6 +40,7 @@ describe("local model serving projection", () => {
         performance: { _tag: "Pending", measurement: { _tag: "Measuring" } },
       },
       capabilities: {
+        serves: "chat",
         vision: false,
         tools: true,
         structuredOutput: true,
@@ -50,14 +52,14 @@ describe("local model serving projection", () => {
       },
     } as unknown as Parameters<typeof catalogModelServingState>[1]
 
-    const state = catalogModelServingState(ready, assessment, { intelligenceScore: 80, fidelityRank: 60 })
+    const state = catalogModelServingState(ready, assessment, { intelligenceScore: Option.some(80), fidelityRank: 60 })
 
     expect(state._tag).toBe("Assessed")
-    if (state._tag !== "Assessed") return
+    if (state._tag !== "Assessed" || state.capabilities.serves !== "chat") throw new Error("expected an assessed chat model")
     expect(state.capabilities.reasoning.defaultEffort).toEqual(Option.some("high"))
     // A pending speed still ranks by the catalog's terms.
     expect("rankingScores" in state && state.rankingScores).toEqual({
-      intelligence: 0.8,
+      intelligence: Option.some(0.8),
       speed: Option.none(),
       fidelity: 0.6,
     })
@@ -75,16 +77,17 @@ describe("local model serving projection", () => {
           subject: { _tag: "Catalog", modelId, selection: "Desired" },
           state: {
             _tag: "Assessed",
-            capabilities: {
-              vision: false,
-              tools: true,
-              structuredOutput: true,
-              reasoning: { supported: false, efforts: ["none"], defaultEffort: Option.some("none") },
-            },
             templateFingerprint: "template",
             fingerprint: Option.none(),
             profiles: [{
               _tag: "Fits",
+              capabilities: {
+                serves: "chat",
+                vision: false,
+                tools: true,
+                structuredOutput: true,
+                reasoning: { supported: false, efforts: ["none"], defaultEffort: Option.some("none") },
+              },
               assessmentId: "assessment",
               profile: { contextLength: 4096 },
               memory: [],
@@ -108,13 +111,71 @@ describe("local model serving projection", () => {
     const assessment = coordinatedAssessment(snapshot, "catalog", modelId)
     expect(assessment?._tag).toBe("Assessed")
     if (assessment?._tag !== "Assessed") return
-    const state = catalogModelServingState(ready, assessment, { intelligenceScore: 50, fidelityRank: 40 })
+    const state = catalogModelServingState(ready, assessment, { intelligenceScore: Option.some(50), fidelityRank: 40 })
 
     expect(state._tag).toBe("Assessed")
-    if (state._tag !== "Assessed") return
+    if (state._tag !== "Assessed" || state.capabilities.serves !== "chat") throw new Error("expected an assessed chat model")
     expect(state.capabilities.reasoning).toEqual({
       supported: false, efforts: ["none"], defaultEffort: Option.some("none"),
     })
+  })
+
+  it("gives a custom model what its assessment says it serves, and an unreadable one nothing", () => {
+    const modelId = ModelIdSchema.make("local:decider-q8_0:aaaaaaaaaaaa")
+    const metadata = {
+      format: "gguf", architecture: "qwen35", quantization: "q8_0", quantizationName: "Q8_0",
+      storageBytes: 1, maximumContextLength: Option.some(4096),
+    }
+    const snapshot = (profile: unknown) => ({
+      revision: 1,
+      environmentId: "environment",
+      catalog: { _tag: "Pending", sourceRevision: 1 },
+      custom: {
+        _tag: "Available",
+        sourceRevision: 1,
+        entries: [{
+          subject: { _tag: "Custom", modelId },
+          state: {
+            _tag: "Assessed",
+            templateFingerprint: "template",
+            fingerprint: Option.none(),
+            profiles: [profile],
+          },
+        }],
+      },
+    }) as unknown as ModelAssessmentsSnapshot
+    const source = {
+      profile: { contextLength: 4096 },
+      state: { _tag: "Ready", model: { profile: { contextLength: 4096 }, metadata, speculativeMethod: Option.none() } },
+    } as unknown as CustomModelSource["source"]
+    const serving = (profile: unknown) => {
+      const assessment = coordinatedAssessment(snapshot(profile), "custom", modelId)
+      if (assessment === undefined || assessment._tag === "Dropped" || assessment._tag === "Assessing") {
+        throw new Error("expected an assessment")
+      }
+      return customModelServingState(source, assessment)
+    }
+    const unsupported = (serves: Option.Option<string>) => ({
+      _tag: "Unsupported",
+      profile: Option.none(),
+      serves,
+      reasons: [{ _tag: "Unreadable" }],
+      detail: "unreadable",
+    })
+
+    expect(serving({
+      _tag: "Fits",
+      capabilities: { serves: "decisions", vision: false },
+      assessmentId: "assessment",
+      profile: { contextLength: 4096 },
+      memory: [],
+      performance: { _tag: "Estimated", samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }] },
+      drafter: { _tag: "None" },
+    })).toMatchObject({ _tag: "Assessed", assessment: { _tag: "Fits" }, capabilities: { serves: "decisions", vision: false } })
+    const refused = serving(unsupported(Option.some("decisions")))
+    expect(refused).toMatchObject({ _tag: "Assessed", assessment: { _tag: "Unsupported" }, serves: Option.some("decisions") })
+    expect(refused).not.toHaveProperty("capabilities")
+    expect(serving(unsupported(Option.none()))).toMatchObject({ serves: Option.none() })
   })
 
   it("preserves ICN's native unavailability failure", () => {
@@ -126,7 +187,7 @@ describe("local model serving projection", () => {
     expect(catalogModelServingState(
       undefined,
       undefined,
-      { intelligenceScore: 80, fidelityRank: 60 },
+      { intelligenceScore: Option.some(80), fidelityRank: 60 },
       nativeFailure,
     )).toEqual({
       _tag: "Failed",
@@ -175,11 +236,11 @@ describe("automatic assessment projection", () => {
       subject: { _tag: "Catalog", modelId: id, selection: "Desired" },
       state: {
         _tag: "Assessed",
-        capabilities: { vision: false, tools: true, structuredOutput: true, reasoning },
         templateFingerprint: "template",
         fingerprint: Option.none(),
         profiles: [{
           _tag: "Fits",
+          capabilities: { serves: "chat", vision: false, tools: true, structuredOutput: true, reasoning },
           assessmentId: "assessment",
           profile: { contextLength: 4096 },
           memory: [],
@@ -219,14 +280,15 @@ describe("automatic assessment projection", () => {
           subject: { _tag: "Catalog", modelId, selection: "Desired" },
           state: {
             _tag: "Assessed",
-            capabilities: {
-              vision: false,
-              tools: true,
-              structuredOutput: true,
-              reasoning: { supported: true, efforts: ["none", "high"], defaultEffort: Option.some("high") },
-            },
             profiles: [{
               _tag: "Fits",
+              capabilities: {
+                serves: "chat",
+                vision: false,
+                tools: true,
+                structuredOutput: true,
+                reasoning: { supported: true, efforts: ["none", "high"], defaultEffort: Option.some("high") },
+              },
               profile: { contextLength: 32_768 },
               assessmentId: "assessment",
               memory: [],

@@ -18,6 +18,7 @@ import {
 } from "./custom-models.test-support"
 
 const capabilities = {
+  serves: "chat",
   vision: false,
   tools: true,
   structuredOutput: true,
@@ -40,13 +41,17 @@ const fits = assessed({
   performance: { _tag: "Estimated", samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 30 }] },
 })
 
-const unsupported = assessed({
-  _tag: "Unsupported",
-  environmentId: "environment",
-  profile: Option.some({ contextLength: 32_768 }),
-  reasons: [{ _tag: "Architecture", architecture: "deepseek4" }],
-  detail: "",
-})
+const unsupported = {
+  _tag: "Unsupported" as const,
+  assessment: {
+    _tag: "Unsupported",
+    environmentId: "environment",
+    profile: Option.some({ contextLength: 32_768 }),
+    reasons: [{ _tag: "Architecture", architecture: "deepseek4" }],
+    detail: "",
+  } as never,
+  serves: Option.some("chat" as const),
+}
 
 const inputs = (entry = customSource(nativeCustomModel()), overrides: Partial<Parameters<typeof customModel>[0]> = {}) => ({
   entry,
@@ -109,6 +114,8 @@ describe("custom model rows", () => {
     }))
     const row = Option.getOrThrow(customModel(inputs(added, { assessment: unsupported })))
     expect(row.servingState._tag === "Assessed" && row.servingState.assessment._tag).toBe("Unsupported")
+    expect(row.servingState).toMatchObject({ serves: Option.some("chat") })
+    expect(row.servingState).not.toHaveProperty("capabilities")
   })
 
   it("projects an added model's download as installation progress, then its failure", () => {
@@ -349,11 +356,11 @@ describe("local models state", () => {
         subject: { _tag: "Custom", modelId },
         state: {
           _tag: "Assessed",
-          capabilities,
           fingerprint: Option.none(),
           templateFingerprint: "t",
           profiles: [{
             _tag: "Fits",
+            capabilities,
             assessmentId: `a-${modelId}`,
             drafter: { _tag: "None" },
             memory: [],
@@ -400,8 +407,8 @@ describe("local models state", () => {
       source: { ...sources([]), catalogModels: [{
         id: modelId,
         source: {
-          aliases: Option.none(), description: "", desired, displayName: "Gemma 4 E2B", fidelityRank: 1, intelligence: 1,
-          license: "apache-2.0", parameterization: { architecture: "dense", totalParameters: 1 }, quantizationAware: true,
+          aliases: Option.none(), description: "", desired, displayName: "Gemma 4 E2B", fidelityRank: 1,
+          license: "apache-2.0", parameterization: { architecture: "dense", totalParameters: 1 }, quantizationAware: true, serves: { kind: "chat", intelligence: 1 },
           releaseDate: "2026-04-02", sourceUrls: [], support: { level: "supported" }, variantLabel: "Q4 QAT",
           localState: {
             _tag: "Installed",
@@ -440,10 +447,10 @@ describe("local models state", () => {
       source: { ...sources([]), catalogModels: [{
         id: "minicpm5-2b:gguf:q8",
         source: {
-          aliases: Option.none(), description: "", displayName: "MiniCPM5 2B", fidelityRank: 1, intelligence: 1,
+          aliases: Option.none(), description: "", displayName: "MiniCPM5 2B", fidelityRank: 1,
           desired: { metadata: { storageBytes: 2_679_710_688 }, profile: { contextLength: 131_072 }, speculativeMethod: Option.none() },
           drafterWithheld: true,
-          license: "apache-2.0", parameterization: { architecture: "dense", totalParameters: 1 }, quantizationAware: false,
+          license: "apache-2.0", parameterization: { architecture: "dense", totalParameters: 1 }, quantizationAware: false, serves: { kind: "chat", intelligence: 1 },
           releaseDate: "2026-09-01", sourceUrls: [], support: { level: "supported" }, variantLabel: "Q8",
           localState,
         },
@@ -473,7 +480,6 @@ describe("local models state", () => {
         desired,
         displayName: "Catalog Model",
         fidelityRank: 1,
-        intelligence: 1,
         license: "apache-2.0",
         localState: {
           _tag: "Installed",
@@ -486,6 +492,7 @@ describe("local models state", () => {
         drafterWithheld: false,
         parameterization: { architecture: "dense", totalParameters: 1 },
         quantizationAware: false,
+        serves: { kind: "chat", intelligence: 1 },
         releaseDate: "2026-08-29",
         sourceUrls: [],
         support: { level: "supported" },

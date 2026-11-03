@@ -2,8 +2,10 @@ import { Context, Effect, Layer, Option, Stream } from "effect"
 import {
   localModelAssessmentProfile,
   localModelDeprecation,
+  localModelChatCapabilities,
   localModelIsAvailable,
   localModelProviderModelId,
+  localModelListedAs,
   localModelServingState,
   LocalModelMutationFailed,
   PRIMARY_SLOT_ID,
@@ -13,6 +15,7 @@ import {
   type LocalModelServingState,
   type LocalModelsState,
   type LocalProviderOffering,
+  type ModelCapabilities,
   type ProviderModelCatalogEntry,
 } from "@magnitudedev/acn-protocol"
 import type { ProviderModelId } from "@magnitudedev/providers/client"
@@ -61,25 +64,41 @@ const providerAvailability = (
 export const localProviderOfferingsReady = (state: LocalModelsState): boolean =>
   state.preparation.discovery.complete && state.preparation.assessment.complete
 
+/** A model Magnitude can't run takes nothing: it is listed, disabled, with no capability. */
+const UNSUPPORTED_CAPABILITIES: ModelCapabilities = {
+  vision: false,
+  tools: false,
+  structuredOutput: false,
+  reasoning: { supported: false, efforts: [], defaultEffort: Option.none() },
+}
+
+/**
+ * The agent's local provider offers chat models only; a decision model answers no chat request. A model it
+ * can't run, whose kind may not be known, is still listed with the reason; only a fitting model, whose chat
+ * capabilities are known, is offered.
+ */
 export const projectLocalProviderOfferings = (models: readonly LocalModel[]) => {
-  const assessedModels = models.flatMap((model) => Option.match(localModelServingState(model), {
+  const assessedModels = models.filter((model) => localModelListedAs(model, "chat")).flatMap((model) => Option.match(localModelServingState(model), {
     onNone: () => [],
     onSome: (serving) => serving._tag === "Assessed"
-      ? Option.match(localModelAssessmentProfile(serving.assessment), {
+      ? Option.match(Option.all({
+        profile: localModelAssessmentProfile(serving.assessment),
+        capabilities: "capabilities" in serving ? localModelChatCapabilities(model) : Option.some(UNSUPPORTED_CAPABILITIES),
+      }), {
         onNone: () => [],
-        onSome: (profile) => [{ model, serving, profile }],
+        onSome: ({ profile, capabilities }) => [{ model, serving, profile, capabilities }],
       })
       : [],
   }))
   const selected = assessedModels.filter(({ model, serving }) =>
     serving.assessment._tag === "Fits" && Option.isSome(localModelProviderModelId(model)))
   return {
-    offerings: selected.map(({ model, serving, profile }): LocalProviderOffering => ({
+    offerings: selected.map(({ model, profile, capabilities }): LocalProviderOffering => ({
       providerModelId: model.modelId,
       profile,
-      capabilities: serving.capabilities,
+      capabilities,
     })),
-    entries: assessedModels.map(({ model, serving, profile }): ProviderModelCatalogEntry => {
+    entries: assessedModels.map(({ model, serving, profile, capabilities }): ProviderModelCatalogEntry => {
       return {
         providerId: LOCAL_PROVIDER_ID,
         providerModelId: model.modelId,
@@ -92,7 +111,7 @@ export const projectLocalProviderOfferings = (models: readonly LocalModel[]) => 
         memory: serving.assessment._tag === "Fits" ? Option.some(serving.assessment.memory.domains)
           : serving.assessment._tag === "DoesNotFit" ? Option.some(serving.assessment.memoryDomains)
             : Option.none(),
-        capabilities: serving.capabilities,
+        capabilities,
         availability: providerAvailability(model, serving),
         pricing: Option.none(),
       }

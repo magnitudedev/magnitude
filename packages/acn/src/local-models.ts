@@ -1,8 +1,9 @@
 import { Array, Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import { dataEquivalence } from "@magnitudedev/utils/data-equivalence"
 import {
-  LocalModelAssessmentSchema,
   LocalModelDoesNotFitAssessmentSchema,
+  LocalModelFitsAssessmentSchema,
+  LocalModelUnsupportedAssessmentSchema,
   CatalogLocalModelSchema,
   CatalogFormModelIdSchema,
   CustomLocalModelSchema,
@@ -11,13 +12,14 @@ import {
   DrafterVerdictSchema,
   ModelReleaseDateSchema,
   ModelVariantLabelSchema,
-  ModelCapabilitiesSchema,
+  LocalModelCapabilitiesSchema,
   UnsupportedLocalModelSchema,
   customModelSourceLabel,
   parseModelId,
   sameModelId,
   type AttachedDrafter,
   type CatalogLocalModel,
+  LocalModelCatalogDataSchema,
   type CustomLocalModel,
   type CustomLocalModelServingState,
   type CustomModelAcquisitionState,
@@ -28,14 +30,18 @@ import {
   type LocalModelAcquisitionState,
   type CatalogLocalModelServingState,
   type LocalModelAssessment,
+  type LocalModelDoesNotFitAssessment,
+  type LocalModelFitsAssessment,
+  type LocalModelUnsupportedAssessment,
   type MachineMeasurement,
   type LocalModel,
   type LocalModelsState,
   type LocalModelPreparation,
-  type ModelCapabilities,
+  type LocalModelCapabilities,
   type ModelId,
   type ModelFailure,
   type ModelResidency,
+  type ModelServes,
   type ResolvedModelInstallation,
   type UnsupportedLocalModel,
 } from "@magnitudedev/acn-protocol"
@@ -85,10 +91,11 @@ import { LocalModelRemovals, type LocalModelRemovalState } from "./local-model-r
 
 // Compiled once: `Schema.validateSync(schema)` rebuilds its parser on every call, which costs
 // seconds of event-loop time when the whole list is projected on each inference change.
-const decodeLocalModelAssessment = Schema.decodeUnknownSync(LocalModelAssessmentSchema)
+const decodeFitsAssessment = Schema.decodeUnknownSync(LocalModelFitsAssessmentSchema)
+const decodeDoesNotFitAssessment = Schema.decodeUnknownSync(LocalModelDoesNotFitAssessmentSchema)
+const decodeUnsupportedAssessment = Schema.decodeUnknownSync(LocalModelUnsupportedAssessmentSchema)
 const decodeDrafterVerdict = Schema.decodeUnknownOption(DrafterVerdictSchema)
-const validateModelCapabilities = Schema.validateOption(ModelCapabilitiesSchema)
-const validateDoesNotFitAssessment = Schema.validateSync(LocalModelDoesNotFitAssessmentSchema)
+const validateLocalModelCapabilities = Schema.validateOption(LocalModelCapabilitiesSchema)
 const validateCatalogLocalModel = Schema.validateSync(CatalogLocalModelSchema)
 const validateCustomLocalModel = Schema.validateSync(CustomLocalModelSchema)
 const validateUnsupportedLocalModel = Schema.validateOption(UnsupportedLocalModelSchema)
@@ -138,13 +145,19 @@ export const projectLocalModelPreparation = (
   }
 }
 
+/** A model the engine runs is assessed with its capabilities; one it can't run has only what its header serves. */
 type CoordinatedLocalModelAssessment =
   | { readonly _tag: "Assessing" }
   | {
       readonly _tag: "Assessed"
-      readonly assessment: LocalModelAssessment
-      readonly capabilities: ModelCapabilities
+      readonly assessment: LocalModelFitsAssessment | LocalModelDoesNotFitAssessment
+      readonly capabilities: LocalModelCapabilities
       readonly drafter: DrafterVerdict | undefined
+    }
+  | {
+      readonly _tag: "Unsupported"
+      readonly assessment: LocalModelUnsupportedAssessment
+      readonly serves: Option.Option<ModelServes>
     }
   | { readonly _tag: "Dropped" }
 
@@ -165,16 +178,19 @@ const projectPerformance = (performance: ModelPerformance, measurement: Measurem
     ? { _tag: "Pending" as const, measurement: projectMeasurement(measurement) }
     : performance
 
-export const projectAssessment = (
+type SupportedModelAssessment = Exclude<ModelAssessment, { readonly _tag: "Unsupported" }>
+type UnsupportedModelAssessment = Extract<ModelAssessment, { readonly _tag: "Unsupported" }>
+
+const projectSupportedAssessment = (
   snapshot: ModelAssessmentsSnapshot,
-  assessment: ModelAssessment,
-): LocalModelAssessment => {
+  assessment: SupportedModelAssessment,
+): LocalModelFitsAssessment | LocalModelDoesNotFitAssessment => {
   const environmentId = snapshot.environmentId
   if (assessment._tag === "Fits") {
     const totalRequiredBytes = assessment.memory.reduce((total, item) => total + item.requiredBytes, 0)
     const requiredSystemMemoryBytes = assessment.memory.filter((item) => item.memoryDomainId === "system")
       .reduce((total, item) => total + item.requiredBytes, 0)
-    return decodeLocalModelAssessment({
+    return decodeFitsAssessment({
       _tag: "Fits", assessmentId: assessment.assessmentId, environmentId,
       profile: assessment.profile,
       memory: {
@@ -183,21 +199,30 @@ export const projectAssessment = (
       performance: projectPerformance(assessment.performance, snapshot.measurement),
     })
   }
-  if (assessment._tag === "DoesNotFit") {
-    return decodeLocalModelAssessment({
-      _tag: "DoesNotFit", assessmentId: assessment.assessmentId, environmentId,
-      profile: assessment.profile,
-      memoryDomains: assessment.memory,
-      totalRequiredBytes: assessment.memory.reduce((total, item) => total + item.requiredBytes, 0),
-      deficitBytes: assessment.deficitBytes, limitingResource: assessment.limitingResource,
-    })
-  }
-  return decodeLocalModelAssessment({
-    _tag: "Unsupported", environmentId,
-    ...Option.match(assessment.profile, { onNone: () => ({}), onSome: (profile) => ({ profile }) }),
-    reasons: productUnsupportedReasons(assessment.reasons, assessment.detail), detail: assessment.detail,
+  return decodeDoesNotFitAssessment({
+    _tag: "DoesNotFit", assessmentId: assessment.assessmentId, environmentId,
+    profile: assessment.profile,
+    memoryDomains: assessment.memory,
+    totalRequiredBytes: assessment.memory.reduce((total, item) => total + item.requiredBytes, 0),
+    deficitBytes: assessment.deficitBytes, limitingResource: assessment.limitingResource,
   })
 }
+
+const projectUnsupportedAssessment = (
+  snapshot: ModelAssessmentsSnapshot,
+  assessment: UnsupportedModelAssessment,
+): LocalModelUnsupportedAssessment => decodeUnsupportedAssessment({
+  _tag: "Unsupported", environmentId: snapshot.environmentId,
+  ...Option.match(assessment.profile, { onNone: () => ({}), onSome: (profile) => ({ profile }) }),
+  reasons: productUnsupportedReasons(assessment.reasons, assessment.detail), detail: assessment.detail,
+})
+
+export const projectAssessment = (
+  snapshot: ModelAssessmentsSnapshot,
+  assessment: ModelAssessment,
+): LocalModelAssessment => assessment._tag === "Unsupported"
+  ? projectUnsupportedAssessment(snapshot, assessment)
+  : projectSupportedAssessment(snapshot, assessment)
 
 export const coordinatedAssessment = (
   snapshot: ModelAssessmentsSnapshot,
@@ -210,15 +235,19 @@ export const coordinatedAssessment = (
   if (entry === undefined || entry.state._tag === "Assessing") return undefined
   if (entry.state._tag === "Dropped") return { _tag: "Dropped" }
   const assessment = entry.state.profiles[0]
+  if (assessment === undefined) return { _tag: "Dropped" }
+  if (assessment._tag === "Unsupported") {
+    return { _tag: "Unsupported", assessment: projectUnsupportedAssessment(snapshot, assessment), serves: assessment.serves }
+  }
   // Capabilities that violate the product contract fail this one assessment, never the whole list.
-  const capabilities = validateModelCapabilities(entry.state.capabilities)
-  return assessment === undefined || Option.isNone(capabilities)
+  const capabilities = validateLocalModelCapabilities(assessment.capabilities)
+  return Option.isNone(capabilities)
     ? { _tag: "Dropped" }
     : {
         _tag: "Assessed",
-        assessment: projectAssessment(snapshot, assessment),
+        assessment: projectSupportedAssessment(snapshot, assessment),
         capabilities: capabilities.value,
-        drafter: assessment._tag === "Unsupported" ? undefined : productDrafterVerdict(assessment.drafter),
+        drafter: productDrafterVerdict(assessment.drafter),
       }
 }
 
@@ -306,6 +335,8 @@ export const catalogModelServingState = (
   if (assessment === undefined || assessment._tag === "Assessing") return {
     _tag: "Assessing", profile: ready.profile,
   }
+  // The service never reports a catalog model as Unsupported: it drops one as a release defect.
+  if (assessment._tag === "Unsupported") throw new Error("the service reported a catalog model as unsupported")
   const assessed = {
     metadata: ready.metadata,
     capabilities: assessment.capabilities,
@@ -320,9 +351,7 @@ export const catalogModelServingState = (
           performance: assessment.assessment.performance,
         }),
       }
-    // The service never reports a catalog model as Unsupported; validation rejects that contract violation.
-    : { _tag: "Assessed", ...assessed,
-        assessment: validateDoesNotFitAssessment(assessment.assessment) }
+    : { _tag: "Assessed", ...assessed, assessment: assessment.assessment }
 }
 
 const catalogSupport = (support: CatalogModel["support"]) => {
@@ -373,7 +402,23 @@ const catalogModel = (
     && source.localState.effective._tag === "Unavailable"
     ? source.localState.effective.failure
     : undefined
-  const catalogScores = { intelligenceScore: source.intelligence, fidelityRank: source.fidelityRank }
+  const facts = {
+    releaseDate: decodeReleaseDate(source.releaseDate),
+    parameterization: source.parameterization,
+    support: catalogSupport(source.support),
+    fidelityRank: source.fidelityRank,
+    quantizationAware: source.quantizationAware,
+    aliases: Option.getOrElse(source.aliases, () => [])
+      .filter((alias) => !hidden.some((hiddenId) => sameModelId(hiddenId, alias))).flatMap((alias) =>
+      Option.toArray(decodeCustomFormModelId(alias))),
+  }
+  const catalogData: typeof LocalModelCatalogDataSchema.Encoded = source.serves.kind === "chat"
+    ? { ...facts, serves: "chat", intelligence: source.serves.intelligence }
+    : { ...facts, serves: "decisions" }
+  const catalogScores = {
+    intelligenceScore: catalogData.serves === "chat" ? Option.some(catalogData.intelligence) : Option.none(),
+    fidelityRank: source.fidelityRank,
+  }
   return validateCatalogLocalModel({
     _tag: "Catalog",
     modelId: entry.id,
@@ -385,17 +430,7 @@ const catalogModel = (
       license: Option.some(source.license),
       sourceUrls: source.sourceUrls,
     },
-    catalogData: {
-      releaseDate: decodeReleaseDate(source.releaseDate),
-      parameterization: source.parameterization,
-      intelligence: source.intelligence,
-      support: catalogSupport(source.support),
-      fidelityRank: source.fidelityRank,
-      quantizationAware: source.quantizationAware,
-      aliases: Option.getOrElse(source.aliases, () => [])
-        .filter((alias) => !hidden.some((hiddenId) => sameModelId(hiddenId, alias))).flatMap((alias) =>
-        Option.toArray(decodeCustomFormModelId(alias))),
-    },
+    catalogData,
     acquisitionState,
     servingState: catalogModelServingState(ready, assessment, catalogScores, unavailableFailure),
     missingComponents: source.localState._tag === "Installed" ? source.localState.missingComponents : [],
@@ -419,13 +454,14 @@ export const customModelServingState = (
   if (state._tag === "NotInstalled" || assessment === undefined || assessment._tag === "Assessing") {
     return { _tag: "Assessing", profile: state._tag === "Ready" ? state.model.profile : source.profile }
   }
-  return {
+  const assessed = {
     _tag: "Assessed",
     metadata: state.model.metadata,
-    capabilities: assessment.capabilities,
     speculativeMethod: state.model.speculativeMethod,
-    assessment: assessment.assessment,
-  }
+  } as const
+  return assessment._tag === "Unsupported"
+    ? { ...assessed, assessment: assessment.assessment, serves: assessment.serves }
+    : { ...assessed, assessment: assessment.assessment, capabilities: assessment.capabilities }
 }
 
 const sourceUrls = (modelId: ModelId): readonly string[] => {
@@ -547,7 +583,7 @@ export const customAcquisition = (
 /** The engine's verdict that an external model cannot run; added models keep their row so they stay removable. */
 const externalUnsupportedAssessment = (inputs: CustomModelInputs, origin: CustomModelOrigin) => {
   const { assessment } = inputs
-  return origin._tag !== "Added" && assessment?._tag === "Assessed" && assessment.assessment._tag === "Unsupported"
+  return origin._tag !== "Added" && assessment?._tag === "Unsupported"
     ? Option.some(assessment.assessment)
     : Option.none()
 }

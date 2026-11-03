@@ -3,6 +3,7 @@ import type { Command } from "@commander-js/extra-typings"
 const loadRuntime = () => import("./inference-runtime")
 
 const JSON_HELP = "Print one machine-readable JSON document"
+const SERVES_HELP = "chat (models for chat and agents) or decisions (decision models)"
 const DRAFTER_HELP = "auto (the preselected drafter), none, built-in, a model ID, a Hugging Face reference, or a GGUF path"
 
 export const registerInferenceCommands = (program: Command): void => {
@@ -18,8 +19,9 @@ export const registerInferenceCommands = (program: Command): void => {
     .action((options) => loadRuntime().then(({ execute, showCatalogStatus }) => execute(showCatalogStatus(options))))
   catalog.command("list")
     .description("List catalog models compatible with this computer")
+    .option("--serves <kind>", SERVES_HELP, "chat")
     .option("--json", JSON_HELP)
-    .action((options) => loadRuntime().then(({ execute, showModelCatalog }) => execute(showModelCatalog(options))))
+    .action((options) => loadRuntime().then(({ execute, showModelCatalog }) => execute(showModelCatalog(options.serves, options))))
   catalog.command("show")
     .description("Show details for one catalog model")
     .argument("<model-id>", "Canonical model ID from `magnitude catalog list`")
@@ -29,9 +31,10 @@ export const registerInferenceCommands = (program: Command): void => {
     .description("Rank compatible models for a speed-to-intelligence preference")
     .option("--preference <value>", "Fastest, Faster, Balanced, Smarter, or Smartest", "balanced")
     .option("--limit <count>", "Maximum recommendations to show", "10")
+    .option("--serves <kind>", SERVES_HELP, "chat")
     .option("--json", JSON_HELP)
     .action((options) => loadRuntime().then(({ execute, showRecommendations }) =>
-      execute(showRecommendations(options.preference, options.limit, options))))
+      execute(showRecommendations(options.preference, options.limit, options.serves, options))))
   catalog.command("search")
     .description("Search Hugging Face for GGUF models that run in Magnitude")
     .argument("<query>", "Model name or words to search for")

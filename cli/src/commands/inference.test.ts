@@ -42,6 +42,7 @@ import { parseDrafterArgument, parsePullReference } from "./model-references"
 import { asJson, jsonDocument, renderCommandError, runCommand } from "./output"
 import { findModel } from "./model-format"
 import { describeLocalHardware } from "./inference-format"
+import { decisionCatalogData } from "../../../packages/client-common/src/application/fixtures/model"
 import {
   addModelFolder,
   cancelDownload,
@@ -134,8 +135,9 @@ const program = () => {
 
 describe("inference argument validation", () => {
   it.each([
-    [() => showRecommendations("unknown", "10"), "Preference must be one of: fastest, faster, balanced, smarter, smartest"],
-    [() => showRecommendations("balanced", "0"), "Limit must be a positive integer"],
+    [() => showRecommendations("unknown", "10", "chat"), "Preference must be one of: fastest, faster, balanced, smarter, smartest"],
+    [() => showRecommendations("balanced", "0", "chat"), "Limit must be a positive integer"],
+    [() => showRecommendations("balanced", "10", "images"), "Serves must be one of: chat, decisions"],
     [() => showCatalogModel(""), "Invalid catalog model ID: "],
     [() => showCatalogModel("hf:test/model/model.gguf"), "Invalid catalog model ID: hf:test/model/model.gguf"],
     [() => pullModel(""), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: "],
@@ -200,9 +202,9 @@ describe("inference command surface", () => {
     expect(shape).toEqual({
       "magnitude hardware": { arguments: [], options: [] },
       "catalog status": { arguments: [], options: [] },
-      "catalog list": { arguments: [], options: [] },
+      "catalog list": { arguments: [], options: ["--serves"] },
       "catalog show": { arguments: ["<model-id>"], options: [] },
-      "catalog recommendations": { arguments: [], options: ["--preference", "--limit"] },
+      "catalog recommendations": { arguments: [], options: ["--preference", "--limit", "--serves"] },
       "catalog search": { arguments: ["<query>"], options: ["--limit"] },
       "catalog inspect": { arguments: ["<reference>"], options: [] },
       "catalog pull": { arguments: ["<model>"], options: ["--drafter", "--force", "--only"] },
@@ -269,7 +271,7 @@ describe("catalog renderers", () => {
 
   it("renders only fitting catalog evidence and exact model IDs", () => {
     const model = makeCatalogModel()
-    const output = renderCatalog(catalogState([model, makeFoundModel()]))
+    const output = renderCatalog({ catalog: catalogState([model, makeFoundModel()]), serves: "chat" })
     expect(output).toContain("Local model catalog - 1 compatible model")
     expect(output).toContain(model.modelId)
     expect(output).not.toContain(FOUND_MODEL_ID)
@@ -281,13 +283,27 @@ describe("catalog renderers", () => {
       modelId: CatalogFormModelIdSchema.make("assessing:gguf:q4"),
       servingState: { _tag: "Assessing", profile: { contextLength: 32_768 } },
     })
-    expect(renderCatalog(catalogState([makeCatalogModel(), assessing]))).toContain("Assessing 1 additional catalog model; this list may grow.")
-    expect(renderCatalog(catalogState())).toBe("No catalog models are compatible with this computer.\n")
+    expect(renderCatalog({ catalog: catalogState([makeCatalogModel(), assessing]), serves: "chat" })).toContain("Assessing 1 additional catalog model; this list may grow.")
+    expect(renderCatalog({ catalog: catalogState(), serves: "chat" })).toBe("No catalog models are compatible with this computer.\n")
+  })
+
+  it("lists the kind of model asked for", () => {
+    const chat = makeCatalogModel()
+    const decisions = makeCatalogModel({
+      modelId: CatalogFormModelIdSchema.make("elephant-1:gguf:q4"),
+      catalogData: decisionCatalogData(chat.catalogData),
+    })
+    const catalog = catalogState([chat, decisions])
+    expect(renderCatalog({ catalog, serves: "chat" })).not.toContain(decisions.modelId)
+    const output = renderCatalog({ catalog, serves: "decisions" })
+    expect(output).toContain("Local decision model catalog - 1 compatible decision model")
+    expect(output).toContain(decisions.modelId)
+    expect(output).not.toContain(chat.modelId)
   })
 
   it("ends recommendations with the methodology and Hugging Face hints", () => {
     const model = makeCatalogModel()
-    const view = { catalog: catalogState([model]), models: [model], hardware: makeHardware(), preference: { label: "Balanced" } }
+    const view = { catalog: catalogState([model]), serves: "chat" as const, models: [model], hardware: makeHardware(), preference: { label: "Balanced" } }
     const lines = renderRecommendations({ ...view, ranked: [model] }).trimEnd().split("\n")
     expect(lines.at(-2)).toBe("Learn more: magnitude docs recommendations")
     expect(lines.at(-1)).toBe("Looking for a specific version, finetune, or uncensored model? magnitude catalog search \"<model name>\"")
@@ -302,7 +318,7 @@ describe("catalog renderers", () => {
     const hardware = { ...base, accelerators: [igpu, ...base.accelerators],
       memoryDomains: [{ memoryDomainId: system, kind: "System" as const, totalBytes: base.totalSystemMemoryBytes, availableBytes: Option.none() }, ...base.memoryDomains] }
     const model = makeCatalogModel()
-    const lines = renderRecommendations({ catalog: catalogState([model]), models: [model], hardware, preference: { label: "Balanced" }, ranked: [model] }).split("\n")
+    const lines = renderRecommendations({ catalog: catalogState([model]), serves: "chat", models: [model], hardware, preference: { label: "Balanced" }, ranked: [model] }).split("\n")
     expect(lines[1]).toBe("Workstation · Test CPU - 68.7 GB")
     expect(describeLocalHardware(hardware).accelerators).toEqual([
       { name: "Test GPU", details: "25.8 GB VRAM · CUDA acceleration · in use" },
@@ -782,8 +798,8 @@ describe("model status", () => {
       servingState: {
         _tag: "Assessed",
         metadata: (makeAddedModel().servingState as Extract<CustomLocalModel["servingState"], { _tag: "Assessed" }>).metadata,
-        capabilities: (makeAddedModel().servingState as Extract<CustomLocalModel["servingState"], { _tag: "Assessed" }>).capabilities,
         speculativeMethod: Option.none(),
+        serves: Option.some("chat"),
         assessment: unsupportedAssessment("IQ1_M"),
       },
     })
@@ -1088,13 +1104,13 @@ describe("--json internal identities", () => {
     : model
 
   it("never includes internal identities, managed paths, ownership, or ranking inputs", () => {
-    const assessed = makeAddedModel().servingState as Extract<CustomLocalModel["servingState"], { _tag: "Assessed" }>
-    const unrunnable = makeFolderModel({ servingState: { ...assessed, assessment: unsupportedAssessment("IQ1_M") } })
+    const { capabilities: _, ...assessed } = makeAddedModel().servingState as Extract<CustomLocalModel["servingState"], { _tag: "Assessed"; capabilities: unknown }>
+    const unrunnable = makeFolderModel({ servingState: { ...assessed, serves: Option.none(), assessment: unsupportedAssessment("IQ1_M") } })
     const catalog = catalogState([makeCatalogModel(), makeFoundModel(), makeAddedModel()], [makeUnsupportedLocalModel()], [unrunnable])
     const documents = [
-      encode(catalogListJson, catalog),
+      encode(catalogListJson, { catalog, serves: "chat" }),
       encode(catalogDetailJson, { model: makeCatalogModel(), models: [] }),
-      encode(recommendationsJson, { catalog, models: [makeCatalogModel()], hardware: makeHardware(), preference: { label: "Balanced" }, ranked: [makeCatalogModel()] }),
+      encode(recommendationsJson, { catalog, serves: "chat", models: [makeCatalogModel()], hardware: makeHardware(), preference: { label: "Balanced" }, ranked: [makeCatalogModel()] }),
       encode(modelsStatusJson, statusView({ models: [makeCatalogModel(), makeFoundModel(), makeAddedModel(), unrunnable], hidden: [makeFoundModel({ modelId: CustomFormModelIdSchema.make("hf:a/b/c.gguf") })] })),
       encode(modelDetailJson, { model: makeAddedModel(), models: [], drafters: { _tag: "Listed", candidates: makeDrafterCandidates() }, hidden: false }),
       encode(modelDetailJson, { model: makeInstalledCatalogModel(), models: [], drafters: { _tag: "NotApplicable" }, hidden: false }),

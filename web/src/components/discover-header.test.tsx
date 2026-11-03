@@ -19,7 +19,7 @@ describe("Discover filter counts", () => {
     { filter: "fits", search: "gemma", lab: null, count: 1 },
     { filter: "fits", search: "no such model", lab: null, count: 0 },
   ])("uses the same result count in the tab and search for $filter / $search", ({ filter, search, lab, count }) => {
-    const { visible } = selectModels({ library: [fit, large, custom], hidden: [], filter, lab, search, sort: "recommended" })
+    const { visible } = selectModels({ library: [fit, large, custom], hidden: [], serves: "chat", filter, lab, search, sort: "recommended" })
     expect(visible).toHaveLength(count)
     const html = renderToStaticMarkup(<DiscoverHeader view="all" count={visible.length} search={search} onSearch={() => {}} onView={() => {}} hardware={null} action={<button>Add from Hugging Face</button>} />)
     expect(html).toContain(`placeholder="Search ${count} models…"`)

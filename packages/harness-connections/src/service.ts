@@ -170,7 +170,8 @@ const toHarnessModel = (model: InferenceModel): HarnessModel => {
 const discoverMagnitudeModels = (baseUrl?: string) => Effect.gen(function* () {
   const client = yield* makeInferenceClient(baseUrl === undefined ? undefined : { baseUrl })
   const response = yield* client.listModels()
-  return response.data.map(toHarnessModel)
+  // Decision models report decisions, not text, as their output; an agent chats only with text models.
+  return response.data.filter((model) => model.architecture.output_modalities.includes("text")).map(toHarnessModel)
 })
 
 const uniqueModels = (models: ReadonlyArray<HarnessModel>): ReadonlyArray<HarnessModel> => models.filter(

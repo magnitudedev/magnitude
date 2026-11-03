@@ -67,6 +67,7 @@ export const makeHardware = (
 })
 
 const capabilities = {
+  serves: "chat" as const,
   vision: false,
   tools: true,
   structuredOutput: true,
@@ -101,7 +102,7 @@ export const fitsAssessment = (): Extract<LocalModelAssessment, { readonly _tag:
   performance: performance(CONTEXT_LENGTH),
 })
 
-export const doesNotFitAssessment = (): LocalModelAssessment => ({
+export const doesNotFitAssessment = (): Extract<LocalModelAssessment, { readonly _tag: "DoesNotFit" }> => ({
   _tag: "DoesNotFit",
   profile: { contextLength: CONTEXT_LENGTH },
   assessmentId: ModelAssessmentIdSchema.make("assessment_large"),
@@ -112,7 +113,7 @@ export const doesNotFitAssessment = (): LocalModelAssessment => ({
   limitingResource: "memory",
 })
 
-export const unsupportedAssessment = (ggmlType: string): LocalModelAssessment => ({
+export const unsupportedAssessment = (ggmlType: string): Extract<LocalModelAssessment, { readonly _tag: "Unsupported" }> => ({
   _tag: "Unsupported",
   profile: Option.some({ contextLength: CONTEXT_LENGTH }),
   environmentId: ENVIRONMENT_ID,
@@ -120,7 +121,7 @@ export const unsupportedAssessment = (ggmlType: string): LocalModelAssessment =>
   detail: `source_element has no ${ggmlType} case`,
 })
 
-export const unreadableAssessment = (): LocalModelAssessment => ({
+export const unreadableAssessment = (): Extract<LocalModelAssessment, { readonly _tag: "Unsupported" }> => ({
   _tag: "Unsupported",
   profile: Option.none(),
   environmentId: ENVIRONMENT_ID,
@@ -151,6 +152,7 @@ const makeCatalogOnlyModel = (
     support: { _tag: "Supported" },
     fidelityRank: 75,
     quantizationAware: false,
+    serves: "chat",
     aliases: [],
   },
   acquisitionState: { _tag: "NotInstalled" },
@@ -163,7 +165,7 @@ const makeCatalogOnlyModel = (
     capabilities,
     speculativeMethod: Option.some({ _tag: "DFlash" }),
     assessment: fitsAssessment(),
-    rankingScores: { intelligence: 0.75, speed: Option.some(0.65), fidelity: 0.75 },
+    rankingScores: { intelligence: Option.some(0.75), speed: Option.some(0.65), fidelity: 0.75 },
   },
   ...overrides,
 })
@@ -250,12 +252,12 @@ const customPresentation = (sourceLabel: string) => ({
   sourceUrls: [],
 })
 
-const customServing = (assessment: LocalModelAssessment = fitsAssessment()): CustomLocalModel["servingState"] => ({
+const customServing = (): CustomLocalModel["servingState"] => ({
   _tag: "Assessed",
   metadata,
   capabilities,
   speculativeMethod: Option.none(),
-  assessment,
+  assessment: fitsAssessment(),
 })
 
 export const makeFoundModel = (overrides: Partial<CustomLocalModel> = {}): CustomLocalModel => ({

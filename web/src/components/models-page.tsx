@@ -1,7 +1,7 @@
 import type { ReactNode } from "react"
 import { Option } from "effect"
-import { formatLocalModelDisplayName, localModelEstimatedTokensPerSecond, localModelFacts, localModelIsInstalled, useLocalModelCommandStatus, useLocalModelMutations, type ApplicationPage } from "@magnitudedev/client-common"
-import type { CustomLocalModel, CustomModelAcquisitionState, LocalModel } from "@magnitudedev/sdk"
+import { formatLocalModelDisplayName, localModelEstimatedTokensPerSecond, localModelIntelligence, localModelIsInstalled, localModelListedAs, useLocalModelCommandStatus, useLocalModelMutations, type ApplicationPage } from "@magnitudedev/client-common"
+import type { CustomLocalModel, CustomModelAcquisitionState, LocalModel, ModelServes } from "@magnitudedev/sdk"
 import { HiddenModels, UnhideButton } from "./local-model-lists"
 import { ErrorNotice, NoticeAction } from "./error-notice"
 import { NoRecommendations } from "./discover-custom"
@@ -17,24 +17,25 @@ const descendingKnown = (a: Option.Option<number>, b: Option.Option<number>): nu
   Option.isSome(a) && Option.isSome(b) ? b.value - a.value : Number(Option.isNone(a)) - Number(Option.isNone(b))
 
 /**
- * Catalog and My Models' list: `selected` is what the filter and lab selects leave, which the search
- * placeholder counts; `visible` also follows the typed search, in the chosen order.
+ * Catalog and My Models' list: `selected` is what the kind, filter and lab selects leave, which the
+ * search placeholder counts; `visible` also follows the typed search, in the chosen order.
  */
-export const selectModels = ({ library, hidden, filter, lab, search, sort }: {
+export const selectModels = ({ library, hidden, serves, filter, lab, search, sort }: {
   library: readonly LocalModel[]
   hidden: readonly LocalModel[]
+  serves: ModelServes
   filter: string
   lab: ModelLab | null
   search: string
   sort: string
 }): { readonly selected: readonly LocalModel[]; readonly visible: readonly LocalModel[] } => {
-  const matchesLab = (model: LocalModel) => lab === null || modelLab(model) === lab
-  const selected: readonly LocalModel[] = filter === "hidden" ? hidden.filter(matchesLab) : library.filter(model => {
+  const matchesSelects = (model: LocalModel) => localModelListedAs(model, serves) && (lab === null || modelLab(model) === lab)
+  const selected: readonly LocalModel[] = filter === "hidden" ? hidden.filter(matchesSelects) : library.filter(model => {
     const matchesFilter = filter === "all"
       || filter === "fits" && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits"
       || filter === "downloaded" && localModelIsInstalled(model)
       || filter === "downloading" && acquiring(model.acquisitionState)
-    return matchesFilter && matchesLab(model)
+    return matchesFilter && matchesSelects(model)
   })
   const query = search.trim().toLowerCase()
   const visible = selected.filter(model => `${formatLocalModelDisplayName(model)} ${modelLab(model)?.name ?? ""} ${model._tag === "Catalog" ? model.presentation.description : model.presentation.sourceLabel}`.toLowerCase().includes(query))
@@ -42,7 +43,7 @@ export const selectModels = ({ library, hidden, filter, lab, search, sort }: {
     const byName = formatLocalModelDisplayName(a).localeCompare(formatLocalModelDisplayName(b), undefined, { numeric: true }) || a.modelId.localeCompare(b.modelId)
     switch (sort) {
       case "fastest": return descendingKnown(localModelEstimatedTokensPerSecond(a), localModelEstimatedTokensPerSecond(b)) || byName
-      case "smartest": return descendingKnown(localModelFacts(a).intelligence, localModelFacts(b).intelligence) || byName
+      case "smartest": return descendingKnown(localModelIntelligence(a), localModelIntelligence(b)) || byName
       case "smallest": return a.storageBytes - b.storageBytes || byName
       case "largest": return b.storageBytes - a.storageBytes || byName
       default: return byName

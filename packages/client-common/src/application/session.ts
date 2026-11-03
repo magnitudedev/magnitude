@@ -1,6 +1,6 @@
 import { Atom, Registry, Result } from "@effect-atom/atom-react"
 import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
-import { CatalogFormModelIdSchema, localModelResidency, ModelLoadStageSchema, type LocalModelsState, type ModelResidency } from "@magnitudedev/sdk"
+import { CatalogFormModelIdSchema, localModelResidency, ModelLoadStageSchema, ModelServesSchema, type LocalModelsState, type ModelResidency } from "@magnitudedev/sdk"
 import type { AppearancePreference } from "@magnitudedev/sdk/desktop-host"
 import { LocalModels } from "../local-models/service"
 import { LOCAL_MODEL_RANKING_SCALE_VALUES } from "../local-models/options"
@@ -70,6 +70,7 @@ export const DiscoverState = Schema.Struct({
   view: Schema.Literal("recommended", "all"),
   search: Schema.String,
   filter: Schema.Literal("all", "fits"),
+  serves: ModelServesSchema,
   lab: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
   sort: Schema.Literal("recommended", "name", "fastest", "smartest", "smallest", "largest"),
   machineExpanded: Schema.Boolean,
@@ -92,7 +93,7 @@ const makeApplicationSession = Effect.gen(function* () {
     Effect.tap(() => Effect.sync(() => registry.set(foundModelsNoticeDismissed, true))),
   ))
   const discover = Atom.keepAlive(Atom.make<DiscoverState>({
-    view: registry.get(router.page) === "catalog" ? "all" : "recommended", search: "", filter: "all", lab: Option.none(), sort: "recommended",
+    view: registry.get(router.page) === "catalog" ? "all" : "recommended", search: "", filter: "all", serves: "chat", lab: Option.none(), sort: "recommended",
     machineExpanded: false, selectedModel: Option.none(), recommendedScroll: 0, allScroll: 0,
   }))
   const updateDiscover = (changes: Partial<DiscoverState>) => Effect.sync(() => registry.set(discover, { ...registry.get(discover), ...changes }))
@@ -100,6 +101,8 @@ const makeApplicationSession = Effect.gen(function* () {
   const navigate = (page: ApplicationPage) => page === "catalog"
     ? updateDiscover({ view: "all" }).pipe(Effect.zipRight(router.navigate("discover")))
     : router.navigate(page)
+  // The Decisions page opens every decision model in the catalog.
+  const browseDecisionModels = updateDiscover({ serves: "decisions", view: "all" }).pipe(Effect.zipRight(router.navigate("discover")))
   const rankingPreference = Atom.keepAlive(Atom.make(2))
   const setRankingPreference = (index: number) => Effect.sync(() => {
     if (Number.isInteger(index) && index >= 0 && index < LOCAL_MODEL_RANKING_SCALE_VALUES.length) registry.set(rankingPreference, index)
@@ -147,6 +150,7 @@ const makeApplicationSession = Effect.gen(function* () {
     navigate,
     discover: discover as Atom.Atom<DiscoverState>,
     updateDiscover,
+    browseDecisionModels,
     foundModelsNoticeDismissed: foundModelsNoticeDismissed as Atom.Atom<boolean>,
     dismissFoundModelsNotice,
     rankingPreference: rankingPreference as Atom.Atom<number>,

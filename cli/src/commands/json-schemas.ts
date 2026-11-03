@@ -128,14 +128,19 @@ const CatalogServingStateJsonSchema = Schema.Union(
   Schema.Struct({ ...catalogAssessedDoesNotFit.fields, assessment: DoesNotFitJsonSchema }),
 )
 
-const [customAssessing, customFailed, customAssessed] = CustomLocalModelServingStateSchema.members
+const [customAssessing, customFailed, customAssessedSupported, customAssessedUnsupported] = CustomLocalModelServingStateSchema.members
 const CustomServingStateJsonSchema = Schema.Union(
   customAssessing,
   customFailed,
-  Schema.Struct({ ...customAssessed.fields, assessment: LocalModelAssessmentJsonSchema }),
+  Schema.Struct({ ...customAssessedSupported.fields, assessment: Schema.Union(FitsJsonSchema, DoesNotFitJsonSchema) }),
+  Schema.Struct({ ...customAssessedUnsupported.fields, assessment: UnsupportedJsonSchema }),
 )
 
-const CatalogDataJsonSchema = Schema.Struct(Struct.omit(LocalModelCatalogDataSchema.fields, "fidelityRank"))
+const [chatCatalogData, decisionsCatalogData] = LocalModelCatalogDataSchema.members
+const CatalogDataJsonSchema = Schema.Union(
+  Schema.Struct(Struct.omit(chatCatalogData.fields, "fidelityRank")),
+  Schema.Struct(Struct.omit(decisionsCatalogData.fields, "fidelityRank")),
+)
 
 /** A catalog model as catalog commands show it: curated and machine-specific evidence, nothing on disk. */
 export const CatalogModelJsonSchema = Schema.Struct({

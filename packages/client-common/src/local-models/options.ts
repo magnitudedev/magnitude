@@ -1,10 +1,11 @@
 import { Option } from "effect"
-import { localModelIsAvailable, parseModelId, type CatalogLocalModel } from "@magnitudedev/sdk"
+import { localModelIsAvailable, localModelServes, parseModelId, type CatalogLocalModel } from "@magnitudedev/sdk"
 import type {
   LocalInferenceHardware,
   LocalModel,
   LocalModelRankingScores,
   LocalModelsState,
+  ModelServes,
   ModelSlotsState,
   ProviderModelId,
 } from "@magnitudedev/sdk"
@@ -17,7 +18,9 @@ export interface LocalModelOption {
   readonly model: LocalModel
 }
 
+/** A ranking compares models of one kind: `serves` is the kind ranked, and every other model is left out. */
 export interface LocalModelRankingPreference {
+  readonly serves: ModelServes
   readonly fastToSmart: number
   readonly memoryBudgetBytes: number
 }
@@ -50,13 +53,19 @@ const kindOrder: Record<LocalModelOption["kind"], number> = {
   downloadable: 2,
 }
 
-/** Utility over the scores present; without a speed estimate it is intelligence and fidelity alone. */
+/**
+ * Utility over the scores present: a term without a score (speed before its estimate, a decision model's intelligence)
+ * contributes nothing.
+ */
 export const localModelRankingUtility = (
   scores: LocalModelRankingScores,
   fastToSmart: number,
 ): number => {
   const preference = clamp01(fastToSmart)
-  return scores.intelligence ** (0.9 * preference)
+  return Option.match(scores.intelligence, {
+      onNone: () => 1,
+      onSome: (intelligence) => intelligence ** (0.9 * preference),
+    })
     * Option.match(scores.speed, {
       onNone: () => 1,
       onSome: (speed) => speed ** (0.9 * (1 - preference)),
@@ -67,10 +76,11 @@ export const localModelRankingUtility = (
 export const targetPhysicalMemoryBytes = (hardware: LocalInferenceHardware): number =>
   hardware.memoryDomains.reduce((total, domain) => total + domain.totalBytes, 0)
 
-/** Every installed, fitting model an agent can use, including custom models without ranking scores. */
+/** Every installed, fitting chat model an agent can use, including custom models without ranking scores. */
 export const localModelConnectionOptions = (
   models: readonly LocalModel[],
 ): readonly { readonly id: ProviderModelId; readonly label: string }[] => models
+  .filter(model => Option.contains(localModelServes(model), "chat"))
   .flatMap(model => Option.toArray(Option.map(localModelProviderModelId(model), id => ({
     id,
     label: formatLocalModelDisplayName(model),
@@ -87,7 +97,9 @@ export const rankedLocalModelOptions = (
     readonly speedEstimated: boolean
     readonly utility: number
   }[] => {
-    if (option.model._tag !== "Catalog" || !localModelIsAvailable(option.model)) return []
+    if (option.model._tag !== "Catalog"
+      || !localModelIsAvailable(option.model)
+      || !Option.contains(localModelServes(option.model), preference.serves)) return []
     const serving = option.model.servingState
     if (serving._tag !== "Assessed"
       || serving.assessment._tag !== "Fits"

@@ -7,7 +7,7 @@ import {
 } from "./local-model-ranking-policy"
 
 const candidate = (input: {
-  readonly intelligence?: number
+  readonly intelligence?: Option.Option<number>
   readonly fidelity?: number
   readonly context?: number
   readonly speed?: number
@@ -16,7 +16,7 @@ const candidate = (input: {
   const contextLength = input.context ?? 100_000
   const comparisonContext = Math.min(50_000, contextLength)
   return {
-    intelligenceScore: input.intelligence ?? 80,
+    intelligenceScore: input.intelligence ?? Option.some(80),
     fidelityRank: input.fidelity ?? 60,
     profile: { contextLength },
     performance: input.includeComparisonSample === false
@@ -44,12 +44,12 @@ describe("normalizedModelSpeedScore", () => {
 describe("modelRankingScores", () => {
   it("normalizes intelligence, target speed, and quantization fidelity independently", () => {
     const scores = modelRankingScores(candidate({
-      intelligence: 75,
+      intelligence: Option.some(75),
       fidelity: 50,
       speed: 40,
     }))
     expect(scores).toEqual({
-      intelligence: 0.75,
+      intelligence: Option.some(0.75),
       speed: Option.some(normalizedModelSpeedScore(40)),
       fidelity: 0.5,
     })
@@ -57,20 +57,25 @@ describe("modelRankingScores", () => {
 
   it("clamps catalog scores to the normalized range", () => {
     const scores = modelRankingScores(candidate({
-      intelligence: 150,
+      intelligence: Option.some(150),
       fidelity: -10,
     }))
-    expect(scores.intelligence).toBe(1)
+    expect(scores.intelligence).toEqual(Option.some(1))
     expect(scores.fidelity).toBe(0)
   })
 
   it("keeps the catalog terms and omits only speed while speed is pending", () => {
     const scores = modelRankingScores(candidate({
-      intelligence: 75,
+      intelligence: Option.some(75),
       fidelity: 50,
       includeComparisonSample: false,
     }))
-    expect(scores).toEqual({ intelligence: 0.75, speed: Option.none(), fidelity: 0.5 })
+    expect(scores).toEqual({ intelligence: Option.some(0.75), speed: Option.none(), fidelity: 0.5 })
+  })
+
+  it("has no intelligence term for a model without an intelligence score", () => {
+    const scores = modelRankingScores(candidate({ intelligence: Option.none(), fidelity: 50, speed: 40 }))
+    expect(scores).toEqual({ intelligence: Option.none(), speed: Option.some(normalizedModelSpeedScore(40)), fidelity: 0.5 })
   })
 
   it("uses the configured context as the comparison point below 50K", () => {

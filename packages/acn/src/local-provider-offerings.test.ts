@@ -15,6 +15,7 @@ import {
 import { localProviderOfferingsReady, projectLocalProviderOfferings } from "./local-provider-offerings"
 
 const capabilities = {
+  serves: "chat",
   vision: false,
   tools: true,
   structuredOutput: true,
@@ -97,12 +98,13 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
       support: { _tag: "Supported" },
       fidelityRank: 1,
       quantizationAware: false,
+      serves: "chat",
       aliases: [],
     },
     acquisitionState: { _tag: "Installed", installation, residencyState: { _tag: "Unloaded" } },
     servingState: {
       ...servingState,
-      rankingScores: { intelligence: 0.01, speed: Option.none(), fidelity: 0.01 },
+      rankingScores: { intelligence: Option.some(0.01), speed: Option.none(), fidelity: 0.01 },
     },
     missingComponents: [],
     storedComponents: [],
@@ -130,6 +132,19 @@ describe("local provider offerings", () => {
     expect(projection.offerings.every(({ capabilities }) => capabilities.tools)).toBe(true)
   })
 
+  it("offers no decision model to the agent", () => {
+    const model = catalogAssessed("elephant-1:gguf:q4")
+    if (model._tag !== "Catalog" || model.catalogData.serves !== "chat") throw new Error("expected a catalog chat model")
+    const { intelligence: _intelligence, ...facts } = model.catalogData
+    const custom = assessed("hf:owner/decider/model-q8.gguf", "Discovered")
+    if (custom._tag !== "Custom" || custom.servingState._tag !== "Assessed") throw new Error("expected an assessed custom model")
+    const projection = projectLocalProviderOfferings([
+      { ...model, catalogData: { ...facts, serves: "decisions" as const } },
+      { ...custom, servingState: { ...custom.servingState, capabilities: { serves: "decisions", vision: false } } as typeof custom.servingState },
+    ])
+    expect(projection).toEqual({ offerings: [], entries: [] })
+  })
+
   it("does not fabricate offerings or provider metadata before assessment", () => {
     const model = catalogAssessed("qwen3.5-4b:gguf:q4")
     const projection = projectLocalProviderOfferings([{
@@ -142,11 +157,12 @@ describe("local provider offerings", () => {
   it("lists an unsupported model with a profile but not an unreadable one, which has none", () => {
     const model = assessed("hf:owner/repository/model-q5.gguf", "Discovered")
     if (model._tag !== "Custom" || model.servingState._tag !== "Assessed") throw new Error("expected an assessed custom model")
-    const serving = model.servingState
+    const { capabilities: _, ...serving } = model.servingState as Extract<typeof model.servingState, { readonly capabilities: unknown }>
     const unsupported = (profile: Option.Option<ServingProfile>): LocalModel => ({
       ...model,
       servingState: {
         ...serving,
+        serves: Option.none(),
         assessment: {
           _tag: "Unsupported",
           environmentId: AssessmentEnvironmentIdSchema.make("environment"),
@@ -160,6 +176,8 @@ describe("local provider offerings", () => {
     const listed = projectLocalProviderOfferings([unsupported(Option.some({ contextLength: 8_192 }))])
     expect(listed.offerings).toEqual([])
     expect(listed.entries.map(({ contextWindow }) => contextWindow)).toEqual([8_192])
+    // A model Magnitude can't run takes nothing.
+    expect(listed.entries.map(({ capabilities }) => capabilities.tools || capabilities.vision || capabilities.reasoning.supported)).toEqual([false])
   })
 
   it("preserves resource and compatibility reasons in provider catalog entries", () => {

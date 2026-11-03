@@ -40,9 +40,9 @@ magnitude server setup|remove
 magnitude status
 magnitude hardware
 magnitude catalog status
-magnitude catalog list
+magnitude catalog list [--serves chat|decisions]
 magnitude catalog show|cancel|remove <model-id>
-magnitude catalog recommendations [--preference <value>] [--limit <count>]
+magnitude catalog recommendations [--preference <value>] [--limit <count>] [--serves chat|decisions]
 magnitude catalog search <query> [--limit <count>]
 magnitude catalog inspect <huggingface-url | owner/repo | owner/repo:QUANT>
 magnitude catalog pull <model-id | owner/repo[:QUANT] | huggingface-url> [--drafter auto|none|<drafter>] [--force]

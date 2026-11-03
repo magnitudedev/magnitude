@@ -1,0 +1,145 @@
+---
+title: "Decisions"
+description: "Typed, calibrated answers from decision models, in the TypeSafe System One and OpenAI Decisions formats."
+---
+
+A decision model answers typed questions about a state you send. Each answer is a probability distribution over a fixed set of answers, read from one pass over the input with no generated text. Answers come back quickly, cost no output tokens, and carry calibrated confidence, which suits routing, moderation, extraction, judging, and visual checks.
+
+Decision models are separate from chat models. They don't appear in chat or agent model pickers, and chat routes refuse them. The **Decisions** page in the app lists the decision models on this computer, with the model ID to send and copyable examples. To get one, see [Decision models](#decision-models).
+
+## Two formats
+
+Both routes accept the same questions and give identical probabilities for the same request.
+
+| Format | Route | Questions |
+| --- | --- | --- |
+| TypeSafe System One | `POST /inference/v1/systemone` | A map of ID to question |
+| OpenAI Decisions | `POST /inference/v1/decisions` | An ordered list, each with an optional `name` |
+
+All paths are relative to `http://127.0.0.1:10100`. From another device, send the Network access key; see [Network access](/api/network-access). Neither route streams; each returns one JSON body.
+
+### System One
+
+```sh
+curl http://127.0.0.1:10100/inference/v1/systemone \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "MODEL_ID",
+    "state": "I was charged twice for my order last week. Please refund one of the payments.",
+    "questions": {
+      "billing": {"type": "noul", "instructions": "Is this message about billing?"},
+      "route": {"type": "choice", "instructions": "Which team should handle this message?",
+        "criteria": {"billing": "Payments, charges and refunds", "shipping": "Delivery and tracking", "technical": "Bugs and errors"}},
+      "urgency": {"type": "score", "instructions": "How urgent is this message?",
+        "criteria": ["Not urgent", "Somewhat urgent", "Urgent"]}
+    }
+  }'
+```
+
+`state` is a string, a JSON object, or an array. The response holds `model`, `answers` keyed by question ID, and `usage` with `input_tokens` and `output_tokens: 0`. Every response carries an `x-typesafe-request-id` header.
+
+TypeSafe's SDKs work unchanged. Their base URL is the API root without `/v1`:
+
+```python
+from typesafe_sdk import TypeSafeClient
+
+client = TypeSafeClient(api_key="local", base_url="http://127.0.0.1:10100/inference")
+result = client.system_one(model="MODEL_ID", state="I was charged twice.", questions={
+    "billing": {"type": "noul", "instructions": "Is this message about billing?"},
+})
+print(result.nouls["billing"].noul)
+```
+
+Locally, any API key works. TypeSafe's `models.list()` doesn't; use `/inference/v1/models`.
+
+### OpenAI Decisions
+
+```sh
+curl http://127.0.0.1:10100/inference/v1/decisions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "MODEL_ID",
+    "input": "I was charged twice for my order last week. Please refund one of the payments.",
+    "questions": [
+      {"type": "predicate", "name": "billing", "instructions": "Is this message about billing?"},
+      {"type": "choice", "name": "route", "instructions": "Which team should handle this message?",
+        "choices": [{"value": "billing", "description": "Payments, charges and refunds"}, {"value": "shipping"}, {"value": "technical"}]},
+      {"type": "score", "name": "urgency", "instructions": "How urgent is this message?",
+        "levels": [{"label": "Not urgent"}, {"label": "Somewhat urgent"}, {"label": "Urgent"}]}
+    ]
+  }'
+```
+
+`input` is a string or a list of items: `user` messages with `input_text`, `input_image` and `input_json` parts, `developer`, `system` and `assistant` messages, and tool calls and outputs. Answers come back in question order with `name` echoed (null when absent). Errors use OpenAI's standard error envelope.
+
+With the OpenAI Python SDK:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(api_key="local", base_url="http://127.0.0.1:10100/inference/v1")
+response = client.decisions.create(model="MODEL_ID", input="I was charged twice.", questions=[
+    {"type": "predicate", "name": "billing", "instructions": "Is this message about billing?"},
+])
+print(response.answers[0].probability)
+```
+
+`prompt_cache_key` is accepted. Caching is automatic: a state shared across requests is computed once, and `usage.input_tokens_details.cached_tokens` reports the tokens served from cache.
+
+## Question kinds
+
+| System One | OpenAI | Answer |
+| --- | --- | --- |
+| `noul` | `predicate` | The probability that the statement is true |
+| `choice` | `choice` | The most likely option, every option's probability, and confidence |
+| `score` | `score` | The distribution over ordered levels, the score, and confidence |
+| `choice` with `multiple` | — | Each option's own probability of applying |
+| `box` | — | A bounding box as fractions of the image (`top`, `bottom`, `left`, `right`) and confidence |
+| `boxes` | — | Up to `max` boxes and their count |
+| `text`, `number`, `date` | — | A value read from the state, where it was found, and the probability it was found; `number` takes an optional `unit` |
+| `number` with `range` and `step` | — | An estimate: the median and the p10–p90 interval |
+
+OpenAI Decisions serves the first three kinds only. A model refuses a kind it doesn't serve with a validation error naming the question.
+
+## Decision models
+
+A GGUF is a decision model when it carries a decision description: a decision template (`tokenizer.chat_template.decision`) and the `decision.*` keys that select how the engine renders, lays out and reads each request. Magnitude's own conversions write it. The engine serves these models:
+
+| Models | Kinds beyond noul, choice and score | Images |
+| --- | --- | --- |
+| vLLM Semantic Router d3-ultra | `box` | In the state, and in question instructions and options |
+| Base Labs mammoth-1 and elephant-1 | None | No |
+| Perplexity pplx-decider Flash v1.2 | None | Before the state |
+| Liquid d1-2B | `multiple`, `box`, `boxes`, `text`, `number`, `date` and estimates | Before the state; a `box` or `boxes` question reads exactly one image |
+
+Each model renders requests and computes answers exactly as its publisher's reference does.
+
+The catalog carries Magnitude's conversion of each, from the `magnitudedev` repositories on Hugging Face (for example `magnitudedev/d1-2B-GGUF`), in Q4, Q5, Q6 and Q8. In **Discover**, set **Model kind** to **Decisions**, or run `magnitude catalog list --serves decisions` and `magnitude catalog recommendations --serves decisions`; the **Decisions** page's **Browse decision models** opens the same view. Download and load one like any catalog model.
+
+Any other decision GGUF is added as a custom model, the same way as any other GGUF:
+
+- **From Hugging Face:** **Add from Hugging Face** in **Discover**, or `magnitude catalog pull <owner>/<repo>[:QUANT]`.
+- **From a file on this computer:** put it in a folder Magnitude scans (`magnitude models folders add <path>`), or in the Hugging Face cache, LM Studio, the llama.cpp cache or Ollama, which Magnitude scans already.
+
+Magnitude reads what a GGUF serves from its metadata. A GGUF without a decision description is a chat model. One whose description the engine doesn't implement, or that doesn't read, is listed as unsupported with the reason: the published `LiquidAI/d1-2B-GGUF` names llama.cpp's decision type and carries no description, for example.
+
+## Confidence
+
+The probabilities are always the model's own, and so are a choice's and a score's `confidence` and a score's `score`, as each model's reference computes them: mammoth-1, elephant-1 and pplx-decider give the expected level and TypeSafe's published confidence formulas, d3-ultra the expected level and one minus the normalized entropy, d1-2B the median level and the likeliest option's probability. OpenAI's fields follow OpenAI's definitions. Where a format defines nothing, such as read and estimate fields, the model's reference value is returned.
+
+## Images
+
+Send images as base64 data URLs. Hosted image URLs are refused; the service never fetches from the network.
+
+- **System One:** reference images through `assets`, a map of reference string to `{type, format, data_base64}`, or send a `multipart/form-data` body with a `request` part. Top-level `images` (or `files`) as data URLs or raw base64 also work, as do `image_url` parts when `state` is a list of chat messages.
+- **OpenAI:** use `input_image` parts. Images in question instructions are accepted only by models that place images there.
+
+Video and audio input aren't supported.
+
+## Limits
+
+- System One: up to 255 options per choice, 1 to 10 score levels, 64 levels of JSON nesting, and a 32 MiB body. A model may narrow these; for example, d3-ultra, pplx-decider and d1-2B scores need 2 or more levels. The `TypeSafe-Danger-Zone-Images` and `TypeSafe-Danger-Zone-Long-Context` headers are accepted but not required.
+- OpenAI: 1 to 400 questions per request.
+- The context limit is the model's. `/inference/v1/models` marks decision models with `architecture.output_modalities: ["decisions"]`; a request beyond a model's limits is refused with the errors below.
+
+System One reports a request over the context limit as `400` with `max_tokens_exceeded`, validation errors as `422`, and overload as `529`.

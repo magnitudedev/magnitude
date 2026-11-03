@@ -8,6 +8,7 @@ import {
   CandidateInspectionSchema,
   CustomLocalModelServingStateSchema,
   LocalModelsStateSchema,
+  LocalModelCatalogDataSchema,
   UnsupportedReasonSchema,
   IntelligenceScoreSchema,
   LocalModelMemorySchema,
@@ -38,6 +39,7 @@ const catalogModel = {
     support: { _tag: "Supported" },
     fidelityRank: 1,
     quantizationAware: false,
+    serves: "chat",
     aliases: [],
   },
   acquisitionState: { _tag: "NotInstalled" },
@@ -174,6 +176,15 @@ describe("LocalModelSchema invariants", () => {
     })
   })
 
+  it("carries intelligence for a chat model only", () => {
+    const decode = Schema.decodeUnknownSync(LocalModelCatalogDataSchema)
+    const { intelligence, ...unrated } = catalogModel.catalogData
+    expect(decode(catalogModel.catalogData)).toMatchObject({ serves: "chat", intelligence })
+    expect(() => decode(unrated)).toThrow()
+    expect(decode({ ...unrated, serves: "decisions" })).not.toHaveProperty("intelligence")
+    expect(decode({ ...catalogModel.catalogData, serves: "decisions" })).not.toHaveProperty("intelligence")
+  })
+
   it("allows a catalog failure before a serving profile can be resolved", () => {
     expect(() => Schema.decodeUnknownSync(LocalModelSchema)({
       ...catalogModel,
@@ -256,7 +267,7 @@ describe("LocalModelSchema invariants", () => {
         storageBytes: 1,
       },
       capabilities: {
-        vision: false, tools: false, structuredOutput: false,
+        serves: "chat", vision: false, tools: false, structuredOutput: false,
         reasoning: { supported: false, efforts: [] },
       },
       assessment: {
@@ -284,7 +295,7 @@ describe("LocalModelSchema invariants", () => {
         storageBytes: 1,
       },
       capabilities: {
-        vision: false, tools: false, structuredOutput: false,
+        serves: "chat", vision: false, tools: false, structuredOutput: false,
         reasoning: { supported: false, efforts: [] },
       },
     } as const
@@ -327,8 +338,10 @@ describe("LocalModelSchema invariants", () => {
         },
       },
     }
+    const { capabilities: _capabilities, ...unassessed } = assessed
     const unsupported = {
-      ...assessed,
+      ...unassessed,
+      serves: "chat",
       assessment: {
         _tag: "Unsupported",
         environmentId: "environment",
@@ -342,12 +355,13 @@ describe("LocalModelSchema invariants", () => {
     expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(pending)).not.toThrow()
     expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(unavailable)).not.toThrow()
     expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(unsupported)).toThrow()
-    expect(() => Schema.decodeUnknownSync(CustomLocalModelServingStateSchema)(unsupported)).not.toThrow()
+    expect(Schema.decodeUnknownSync(CustomLocalModelServingStateSchema)(unsupported)).toMatchObject({ serves: Option.some("chat") })
     const { profile: _profile, ...unreadable } = unsupported.assessment
+    const { serves: _serves, ...unread } = unsupported
     expect(Schema.decodeUnknownSync(CustomLocalModelServingStateSchema)({
-      ...unsupported,
+      ...unread,
       assessment: { ...unreadable, reasons: [{ _tag: "Unreadable" }] },
-    })).toMatchObject({ assessment: { _tag: "Unsupported", profile: Option.none() } })
+    })).toMatchObject({ assessment: { _tag: "Unsupported", profile: Option.none() }, serves: Option.none() })
     expect(() => Schema.decodeUnknownSync(CustomLocalModelServingStateSchema)({
       ...unsupported,
       assessment: { ...unsupported.assessment, reasons: [] },
