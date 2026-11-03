@@ -291,6 +291,7 @@ mod tests {
             }],
             demand: Demand::NONE,
             select,
+            readouts: Vec::new(),
         }
     }
 

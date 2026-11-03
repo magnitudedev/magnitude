@@ -252,6 +252,7 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
             mean,
             std,
             channels: 3,
+            pixel_cap: None,
             patch,
             merge,
         },

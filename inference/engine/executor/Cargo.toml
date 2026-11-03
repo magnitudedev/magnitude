@@ -10,6 +10,7 @@ magnitude-artifacts = { path = "../artifacts" }
 magnitude-batching = { path = "../batching" }
 magnitude-family-contracts = { path = "../families/contracts" }
 magnitude-kernels = { path = "../kernels" }
+magnitude-readout = { path = "../readout" }
 magnitude-state = { path = "../state" }
 seismic.workspace = true
 serde.workspace = true

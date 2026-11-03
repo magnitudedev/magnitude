@@ -1,4 +1,5 @@
-//! The Qwen metadata reader and geometry name what they refuse.
+//! The shared metadata reader, as the Qwen families read it, and the Qwen
+//! geometry name what they refuse.
 
 use magnitude_artifacts::{
     UnsupportedReason,
@@ -63,7 +64,7 @@ fn every_unknown_key_of_the_family_is_named() {
         panic!("unknown keys are refused");
     };
     assert_eq!(
-        error.reasons,
+        error.reasons(),
         [
             UnsupportedReason::UnrecognizedMetadata {
                 key: "qwen35.attention.sliding_window".into()
@@ -83,13 +84,13 @@ fn missing_and_malformed_keys_are_named() {
     )]);
     let m = Metadata::new(&header, "qwen35", GEOMETRY_KEYS).unwrap();
     assert_eq!(
-        m.integer("attention.head_count").unwrap_err().reasons,
+        m.integer("attention.head_count").unwrap_err().reasons(),
         [UnsupportedReason::MissingMetadata {
             key: "qwen35.attention.head_count".into()
         }]
     );
     assert_eq!(
-        m.integer("embedding_length").unwrap_err().reasons,
+        m.integer("embedding_length").unwrap_err().reasons(),
         [UnsupportedReason::UnrecognizedMetadata {
             key: "qwen35.embedding_length".into()
         }]

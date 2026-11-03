@@ -24,6 +24,8 @@ pub struct AdmitRequest {
 
 pub enum WorkerCommand {
     Admit(AdmitRequest),
+    /// Admit a prompt-only readout plan; its one publication is its values.
+    Read(magnitude_readout::ReadoutPlan),
     Stop { request: RequestId },
     Status { request: RequestId },
     /// The memory heap's classified holdings and standing.

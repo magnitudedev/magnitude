@@ -220,6 +220,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.input.remove(&request);
         self.target.remove(&request);
         self.poisoned.remove(&request);
+        self.retained.remove(&request);
         Ok(())
     }
 

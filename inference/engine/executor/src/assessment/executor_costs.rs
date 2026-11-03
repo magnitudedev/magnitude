@@ -2328,6 +2328,7 @@ impl AttendCase {
                 }],
                 demand: Demand::NONE,
                 select: None,
+                readouts: Vec::new(),
             }],
             bank: 1,
             previous_tape: 0,

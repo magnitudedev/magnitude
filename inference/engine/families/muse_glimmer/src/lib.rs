@@ -255,6 +255,7 @@ pub fn inspect_components(
     tensors.finish()?;
 
     let definition = ModelDefinition {
+        decision: None,
         family: FamilyId(ARCHITECTURE.into()),
         artifact_identity: identity,
         inputs: InputSemantics {

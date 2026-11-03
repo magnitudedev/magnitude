@@ -16,13 +16,16 @@ use std::rc::Rc;
 /// planes of every stored domain ([`StateStore::history_planes`]);
 /// `destinations[domain]` holds the advance's fresh rows in that domain, one
 /// per advance row (for Block, one per block the advance completes, in
-/// order).
+/// order). An advance computed in several chunks holds `interim_bank` too,
+/// which its chunks' recurrent states alternate with `following_bank`: a
+/// bank is never written while it is read.
 #[derive(Clone, Copy)]
 pub struct OwnedAdvanceBindings<'a> {
     pub recurrent: &'a [Tensor],
     pub previous_bank: usize,
     pub previous_tape: usize,
     pub following_bank: usize,
+    pub interim_bank: Option<usize>,
     pub stop: usize,
     pub history: &'a [PlaneBuffer],
     pub destinations: &'a [Vec<usize>],
@@ -54,6 +57,9 @@ pub struct OwnedStateAdvance {
     /// The advance's tentative rows, per stored domain.
     claims: Vec<Claims>,
     following: BankHandle,
+    /// For an advance computed in several chunks, the bank its chunks'
+    /// recurrent states alternate with `following`.
+    interim: Option<BankHandle>,
     history: Vec<PlaneBuffer>,
     recurrent: Rc<[Tensor]>,
     destinations: Vec<Vec<usize>>,
@@ -62,7 +68,8 @@ pub struct OwnedStateAdvance {
 
 /// Tentative copy of one domain's partial last page into a free page, for a
 /// history that cannot grow in place because another history (a sibling
-/// fork) continued that page. Its source rows remain accepted until the
+/// fork) continued that page, or that would grow into the same rows as one
+/// ([`SequenceState::shared_tails`]). Its source rows remain accepted until the
 /// copy ([`OwnedTailRelocation::copy`], run like any store copy) completes
 /// and the relocation commits.
 pub struct OwnedTailRelocation {
@@ -414,8 +421,9 @@ fn conversion_steps(
 }
 
 impl OwnedTailRelocation {
-    /// Reserve a free page for a blocked last page of `domain` (see
-    /// [`SequenceState::blocked_tails`]) and plan the copy of that page's
+    /// Reserve a free page for the partial last page of `domain` (blocked,
+    /// [`SequenceState::blocked_tails`], or shared,
+    /// [`SequenceState::shared_tails`]) and plan the copy of that page's
     /// rows of this history to its start. The caller has provisioned one
     /// free page (see [`SequenceState::relocation_demands`]); without one
     /// this is a capacity error and the state is unchanged.
@@ -423,16 +431,18 @@ impl OwnedTailRelocation {
         state: SequenceState,
         domain: HistoryDomainId,
     ) -> Result<Self, (SequenceState, Error)> {
-        if !state.blocked_tails().contains(&domain) {
+        let page_rows = state.store.history_page_rows(domain);
+        let ranges = state.history_ranges(domain);
+        let Some(&(last, count)) = ranges
+            .last()
+            .filter(|&&(last, count)| (last + count) % page_rows != 0)
+        else {
             return Err((
                 state,
-                Error::Request("only a blocked last page is relocated".into()),
+                Error::Request("only a partial last page is relocated".into()),
             ));
-        }
-        let ranges = state.history_ranges(domain);
-        let &(last, count) = ranges.last().expect("a blocked history has rows");
+        };
         let end = last + count;
-        let page_rows = state.store.history_page_rows(domain);
         // A page is filled in place from its first row, so the history's
         // rows of its last page are one run.
         let first = last.max((end - 1) / page_rows * page_rows);
@@ -518,6 +528,22 @@ impl OwnedStateAdvance {
         count: usize,
         committed: usize,
     ) -> Result<Self, (SequenceState, Error)> {
+        Self::reserve(state, count, committed, false)
+    }
+
+    /// An advance whose rows all commit, computed in several chunks: it
+    /// holds an interim bank beside its successor
+    /// ([`OwnedAdvanceBindings::interim_bank`]).
+    pub fn begin_chunked(state: SequenceState, count: usize) -> Result<Self, (SequenceState, Error)> {
+        Self::reserve(state, count, count, true)
+    }
+
+    fn reserve(
+        state: SequenceState,
+        count: usize,
+        committed: usize,
+        chunked: bool,
+    ) -> Result<Self, (SequenceState, Error)> {
         if count == 0 || count > state.store.context_capacity.saturating_sub(state.position) {
             return Err((state, Error::from("advance exceeds context capacity")));
         }
@@ -535,6 +561,10 @@ impl OwnedStateAdvance {
             Ok(following) => following,
             Err(error) => return Err((state, error)),
         };
+        let interim = match chunked.then(|| state.store.successor_bank()).transpose() {
+            Ok(interim) => interim,
+            Err(error) => return Err((state, error)),
+        };
         let history = match state.store.history_planes() {
             Ok(history) => history,
             Err(error) => return Err((state, error)),
@@ -544,12 +574,16 @@ impl OwnedStateAdvance {
         let mut transaction = state.store.begin_transaction();
         transaction.track(&state.claims, &state.bank);
         transaction.track(&claims, &following);
+        if let Some(interim) = &interim {
+            transaction.track_bank(interim);
+        }
         Ok(Self {
             state,
             count,
             committed,
             claims,
             following,
+            interim,
             history,
             recurrent,
             destinations,
@@ -596,6 +630,7 @@ impl OwnedStateAdvance {
             previous_bank: self.state.bank.index(),
             previous_tape: self.state.tape,
             following_bank: self.following.index(),
+            interim_bank: self.interim.as_ref().map(BankHandle::index),
             stop: self.committed,
             history: &self.history,
             destinations: &self.destinations,
@@ -862,6 +897,7 @@ impl OwnedSuccessorAdvance {
             previous_bank: self.previous_bank,
             previous_tape: self.previous_tape,
             following_bank: self.following.index(),
+            interim_bank: None,
             stop: self.count,
             history: &self.history,
             destinations: &self.destinations,
@@ -901,6 +937,7 @@ impl OwnedSuccessorAdvance {
             committed: count,
             claims,
             following,
+            interim: None,
             history,
             recurrent,
             destinations,

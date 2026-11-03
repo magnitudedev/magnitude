@@ -69,13 +69,11 @@ impl Selection {
     pub fn contended(&self) -> bool {
         self.contended
     }
-    /// Capacity preparation may drop trailing members without changing phase.
-    pub fn truncate(&mut self, count: usize) -> Result<(), String> {
-        if count == 0 || count > self.requests.len() {
-            return Err("invalid prepared batch size".into());
-        }
-        self.requests.truncate(count);
-        Ok(())
+    /// Keep only the members that joined the round, in selection order,
+    /// without changing phase: the round's cost is charged to them alone,
+    /// and the rest keep their waiting age.
+    pub fn retain(&mut self, joined: impl Fn(&RequestId) -> bool) {
+        self.requests.retain(joined);
     }
 }
 pub struct Scheduler {

@@ -10,6 +10,7 @@ pub mod policy;
 pub mod prefix_cache;
 pub mod protocol;
 pub mod publication;
+pub mod readout;
 pub mod round_driver;
 pub mod worker;
 

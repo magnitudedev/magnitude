@@ -1,13 +1,17 @@
 //! Image requests through the composition root on the pinned Qwen3.5 4B and
-//! its projector: the chat wire renders each image part as the Qwen
-//! placeholder, and input preparation expands it to the image's merged patch
-//! rows between the vision delimiters, one conditioned span per image, with
-//! the 2D rotary coordinates of the image and the text after it.
+//! its projector: chat preparation renders each image part as the Qwen
+//! placeholder, which the template authors, and input preparation expands it
+//! to the image's merged patch rows between the vision delimiters, one
+//! conditioned span per image, with the 2D rotary coordinates of the image
+//! and the text after it.
 //!
 //! `cargo test --release -p magnitude-engine --test image_input -- --ignored`
 //! (`VISION_IMAGE` overrides the image, default llama.cpp's `test-1.jpeg`).
 
-use magnitude_chat::request::ImageInput;
+use magnitude_chat::{
+    request::{Conversation, Entry, ImageInput, OutputFormat, Tools, UserPart},
+    ChatInput, PreparedChat, ReasoningIntent, TemplateSelection,
+};
 use magnitude_engine::{
     host::HostArtifacts,
     options::{PackageOptions, ProjectorSelection},
@@ -48,17 +52,30 @@ fn image() -> ImageInput {
     }
 }
 
-/// A rendered prompt with one family media placeholder per image, as the
-/// chat template renders image parts.
+/// A chat request with `images` image parts between two text parts, rendered
+/// and encoded as the engine prepares chat: each image is the family's media
+/// placeholder, which the template authors, so it encodes as its marker tokens.
 fn prepare(artifacts: &HostArtifacts, images: usize) -> magnitude_family_contracts::PreparedModelInput {
-    let placeholder = artifacts.media_placeholder().expect("a vision model");
-    let prompt = format!("Compare:{}Describe it.", placeholder.repeat(images));
-    let tokens = artifacts
-        .tokenizer()
-        .encode(&prompt, magnitude_engine::inputs::SpecialTokens::Recognize)
-        .unwrap();
+    let mut parts = vec![UserPart::Text("Compare:".into())];
+    parts.extend(std::iter::repeat_n(UserPart::Image(image()), images));
+    parts.push(UserPart::Text("Describe it.".into()));
+    let input = ChatInput {
+        conversation: Conversation::new(None, vec![Entry::User(parts)]).unwrap(),
+        tools: Tools::none(),
+        reasoning: ReasoningIntent::ModelDefault,
+        output: OutputFormat::Text,
+        template_arguments: Default::default(),
+    };
+    let rendered = input.render(0, artifacts.media_placeholder()).unwrap();
+    let prepared = PreparedChat::prepare(
+        artifacts.templates(),
+        artifacts.tokenizer(),
+        &rendered.request,
+        &TemplateSelection::default(),
+    )
+    .unwrap();
     artifacts
-        .prepare_input(tokens, &vec![image(); images])
+        .prepare_input(prepared.input().tokens.clone(), &rendered.images)
         .unwrap()
 }
 

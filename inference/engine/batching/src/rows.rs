@@ -105,6 +105,28 @@ pub struct Select {
     pub history: Vec<i32>,
 }
 
+/// Values a row carrying `Demand::READOUT` returns to the host, computed
+/// from the row's final normalized hidden state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RowReadout {
+    /// The output projection's logits of these vocabulary rows, in order.
+    Logits(Arc<[i32]>),
+    /// The model's readout head: one value per head output.
+    Head,
+    /// Keep the row's final normalized hidden state at row `index` of store
+    /// `store` of the row's sequence (its stores: those of the sequences it
+    /// was forked from, then its own).
+    Retain { store: u32, index: u32 },
+    /// The scaled dot products of the final normalized hidden state at
+    /// `query` (a store and its row) with those at `keys`, in order: runs of
+    /// rows of one store each. The row is the last of them its sequence
+    /// computes, so every one is stored by its step.
+    Scores {
+        query: (u32, u32),
+        keys: Vec<(u32, std::ops::Range<u32>)>,
+    },
+}
+
 /// A logical model row. Rows remain in the order supplied inside their slot.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
@@ -115,6 +137,9 @@ pub struct Row {
     pub histories: Vec<RowHistory>,
     pub demand: Demand,
     pub select: Option<Select>,
+    /// What the row reads, in order; nonempty exactly when `demand` carries
+    /// `Demand::READOUT`.
+    pub readouts: Vec<RowReadout>,
 }
 
 /// A row's history in one history domain.
@@ -127,9 +152,10 @@ pub struct RowHistory {
     /// The first row of its slot, by offset in the slot, whose fresh history
     /// this row reads: 0 unless the domain's window starts inside the slot.
     pub fresh_start: i32,
-    /// For a media row attending its whole span bidirectionally, the offset
-    /// in its slot after the span's last row: it reads the fresh rows up to
-    /// there. A causal row reads the fresh rows through itself.
+    /// For a row reading fresh rows after itself (a media row attending its
+    /// span bidirectionally, a row of an attention block), the offset in its
+    /// slot after the last of them: it reads the fresh rows up to there. A
+    /// causal row reads the fresh rows through itself.
     pub bidirectional_end: Option<i32>,
     /// The domain row this row's history is written to, or -1.
     pub destination: i32,
@@ -183,6 +209,11 @@ pub struct PackedRowTables {
     pub plane_base: Vec<i32>,
     pub out_rows: Vec<i32>,
     pub select_rows: Vec<i32>,
+    /// Per readout of the rows carrying `Demand::READOUT`, in row order and
+    /// each row's readouts in order: its row's index in `out_rows`, and the
+    /// readout.
+    pub readout_rows: Vec<i32>,
+    pub readouts: Vec<RowReadout>,
     pub draws: Vec<[u32; 6]>,
     /// Per selected row, its index in `masks`, or -1 when unconstrained.
     pub mask_rows: Vec<i32>,
@@ -244,6 +275,12 @@ pub enum PackError {
         row: usize,
     },
     SelectMismatch {
+        row: usize,
+    },
+    /// Readouts without `Demand::READOUT`, the demand without any, a logits
+    /// readout of no vocabulary row or one outside the vocabulary, or a
+    /// scores readout of no keys.
+    InvalidReadout {
         row: usize,
     },
     InvalidDrawDomain {
@@ -327,6 +364,10 @@ impl fmt::Display for PackError {
                 f,
                 "row {row} selection controls do not match its SELECT demand"
             ),
+            Self::InvalidReadout { row } => write!(
+                f,
+                "row {row} readout does not match its READOUT demand or the vocabulary"
+            ),
             Self::InvalidDrawDomain { row, domain } => {
                 write!(f, "row {row} has invalid draw domain {domain}")
             }
@@ -369,16 +410,17 @@ impl PackedRowTables {
         vocabulary_size: usize,
         limits: ClassLimits,
     ) -> Result<Self, PackError> {
-        Self::pack_covering(slots, vocabulary_size, limits, 1)
+        Self::pack_covering(slots, vocabulary_size, limits, 1, 1)
     }
 
-    /// Pack into a launch class covering at least `segments` history ranges
-    /// per row: the class a reservation sized from a bound on its rows'
-    /// ranges.
+    /// Pack into a launch class covering at least `rows` rows and
+    /// `segments` history ranges per row: the class a reservation sized
+    /// from a bound on its rows' ranges, and on the rows its kernels need.
     pub fn pack_covering(
         slots: &[Slot],
         vocabulary_size: usize,
         limits: ClassLimits,
+        rows: usize,
         segments: usize,
     ) -> Result<Self, PackError> {
         if vocabulary_size == 0 {
@@ -483,11 +525,31 @@ impl PackedRowTables {
                 if has_select != row.demand.contains(Demand::SELECT) {
                     return Err(PackError::SelectMismatch { row: index });
                 }
+                let readout_valid = row.readouts.is_empty()
+                    != row.demand.contains(Demand::READOUT)
+                    && row.readouts.iter().all(|readout| match readout {
+                        RowReadout::Logits(tokens) => {
+                            !tokens.is_empty()
+                                && tokens.iter().all(|token| {
+                                    usize::try_from(*token)
+                                        .is_ok_and(|token| token < vocabulary_size)
+                                })
+                        }
+                        RowReadout::Head | RowReadout::Retain { .. } => true,
+                        RowReadout::Scores { keys, .. } => {
+                            !keys.is_empty() && keys.iter().all(|(_, rows)| !rows.is_empty())
+                        }
+                    });
+                if !readout_valid {
+                    return Err(PackError::InvalidReadout { row: index });
+                }
                 union |= row.demand;
                 index += 1;
             }
         }
-        let class = LaunchClass::covering(actual_rows, max_segments, union, limits)?;
+        // An empty launch covers no rows.
+        let covered = if actual_rows == 0 { 0 } else { actual_rows.max(rows) };
+        let class = LaunchClass::covering(covered, max_segments, union, limits)?;
         let m = class.rows();
         let r = class.segments();
         let m_i32 = i32::try_from(m).map_err(|_| PackError::IntegerOverflow("class rows"))?;
@@ -521,6 +583,8 @@ impl PackedRowTables {
             plane_base: vec![0; padded_slots + 1],
             out_rows: Vec::new(),
             select_rows: Vec::new(),
+            readout_rows: Vec::new(),
+            readouts: Vec::new(),
             draws: Vec::new(),
             mask_rows: Vec::new(),
             masks: Vec::new(),
@@ -554,15 +618,20 @@ impl PackedRowTables {
                 packed.row_slots[row_index] = as_i32(slot_index, "row slot")?;
                 packed.demand[row_index] = row.demand.bits();
 
-                if row
-                    .demand
-                    .intersects(Demand::LOGITS | Demand::FEATURES | Demand::SELECT)
-                {
+                // A readout row is an output row: the blocks past the
+                // stateless tail compute its final hidden state.
+                if row.demand.intersects(
+                    Demand::LOGITS | Demand::FEATURES | Demand::SELECT | Demand::READOUT,
+                ) {
                     let out_index = packed.out_rows.len();
                     packed.out_rows.push(as_i32(row_index, "output row")?);
                     if let Some(select) = &row.select {
                         packed.select_rows.push(as_i32(out_index, "select row")?);
                         append_select(&mut packed, row_index, select)?;
+                    }
+                    for readout in &row.readouts {
+                        packed.readout_rows.push(as_i32(out_index, "readout row")?);
+                        packed.readouts.push(readout.clone());
                     }
                 }
                 row_index += 1;
@@ -701,6 +770,7 @@ mod tests {
             }],
             demand,
             select: None,
+            readouts: Vec::new(),
         }
     }
 

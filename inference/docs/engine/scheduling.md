@@ -64,6 +64,40 @@ through cancellation until completion; cancelled results are never published.
 Capacity negotiation may reduce preparation batch membership, but changing a
 decoder token allowance cannot change an encoder preparation unit.
 
+## Readout plans
+
+A readout plan is prompt-only: sequences sharing their first rows, each with
+attention blocks and readouts at chosen rows, answered once with every
+readout's values. Admission validates the plan against the load once (readout
+kinds it computes, media spans, units it can compute) and records its runs:
+
+- **Trunk and continuations.** When several sequences share rows, or the plan
+  retains them, the shared rows are one run, the trunk, computed once. Each
+  sequence reading past them continues in a run of its own, opened from a fork
+  of the trunk's state once the trunk has computed its rows. Otherwise each
+  sequence is one run, from fresh or retained state.
+- **Units.** A run computes rows only through its last row read or retained,
+  then to the next boundary of its sequence's visibility. Its chunks end at
+  boundaries, so a unit (the rows between two boundaries) is one advance. A unit
+  wider than any launch takes a launch alone, which the executor computes
+  layer-major; it joins a round only when it is selected first.
+- **Rounds.** Runs are prefill work beside generation and share its token
+  allowance; sibling continuations batch into shared launches. Only work that
+  joins a round is charged for it: a run that cannot start keeps its waiting
+  age, so a wide unit rises until it takes a round of its own.
+- **Memory.** A launch's readout values are part of its reservation: the
+  heap claims their bytes from reservation until submission allocates them,
+  so a launch that cannot fit them negotiates capacity like any other. Logits
+  readouts are projected in groups within the logits memory the load plans for
+  one launch.
+- **Retention.** A plan asking to retain its shared rows caches the trunk's
+  end as an explicit cache point, a hit at any depth for a later plan whose
+  sequence has the same rows read alike. A run reading scores retains its rows'
+  final states on the device for the plan's lifetime.
+
+Runs retire once settled and no unopened continuation forks them; the plan is
+answered when its last run retires, or failed at its first failure.
+
 ## Capacity negotiation
 
 Apply these steps in order when preparation cannot fit:

@@ -51,6 +51,11 @@ includes snapshots when pricing eviction. Releasing one can wake capacity waits.
 
 - A checkpoint retains existing claims; a fork copies ownership descriptions rather
   than the history tensor bytes.
+- Sibling forks ending on a partial page would grow into the same rows. A
+  launch relocates the shared partial last page of every sibling but its first
+  into a page of its own (less than one page copied), so siblings share one
+  launch; a fork whose page another history already continued relocates the
+  same way before it grows.
 - Appends use an exclusive tail or a new extent. They cannot extend or overwrite
   a checkpoint's visible history.
 - Recurrent successors have independent handles and compatible component schemas.
@@ -61,6 +66,16 @@ includes snapshots when pricing eviction. Releasing one can wake capacity waits.
   requests' storage do not become visible; logical rotary positions remain
   independent of physical row destinations.
 - Trimming one sequence does not change retained checkpoint history.
+
+## Readout state
+
+A readout plan's trunk is one sequence; its continuations are forks of the
+trunk's reconciled state, each with its own recurrent bank, so recurrent and
+convolution state never crosses between sequences. A trunk retained for later
+plans is a prefix-cache checkpoint keyed by its tokens and visibility. Final
+hidden states that scores readouts read are kept in per-sequence feature
+stores; a continuation reads its trunk's store, which lives while the
+continuation does.
 
 ## Reclamation and recovery
 

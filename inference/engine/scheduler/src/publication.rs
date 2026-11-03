@@ -96,6 +96,8 @@ pub enum Publication {
         timings: PhysicalTimings,
     },
     Failed(RequestError),
+    /// A readout plan's values: its sole publication.
+    Read(magnitude_readout::ReadoutValues),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -344,6 +346,10 @@ impl PublicationSender {
 
     pub fn fail(mut self, error: RequestError) {
         self.record_terminal(Publication::Failed(error));
+    }
+
+    pub fn read(mut self, values: magnitude_readout::ReadoutValues) {
+        self.record_terminal(Publication::Read(values));
     }
 
     fn record_terminal(&mut self, publication: Publication) {

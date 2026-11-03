@@ -177,7 +177,7 @@ pub(crate) fn prediction_head(
     )?);
     // Published packages retain the indexer weights even though the prediction
     // block declares compression ratio zero and uses ordinary causal attention.
-    let ratios = m.integers("attention.compress_ratios")?;
+    let ratios = m.counts("attention.compress_ratios")?;
     if ratios.len() != decoder.blocks.len() + 1 || ratios.last() != Some(&0) {
         return Err(refuse("prediction head must declare unselected attention"));
     }

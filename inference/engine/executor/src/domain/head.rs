@@ -524,6 +524,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             histories: histories.clone(),
             demand: crate::batching::Demand::NONE,
             select: None,
+            readouts: Vec::new(),
         };
         let anchor = tokens.first().ok_or("a head transaction has no anchor")?;
         let last = proposals.last();
@@ -631,6 +632,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 }],
                 demand: crate::batching::Demand::NONE,
                 select: None,
+                readouts: Vec::new(),
             })
         };
         let entry = tokens

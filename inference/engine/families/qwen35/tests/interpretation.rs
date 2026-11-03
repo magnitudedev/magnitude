@@ -1,5 +1,5 @@
 use magnitude_artifacts::{
-    ArtifactIdentity, PackageIdentity,
+    ArtifactIdentity, DECISION_NAMESPACE, DECISION_TEMPLATE, PackageIdentity,
     gguf::{Array, ByteOrder, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
 };
 use magnitude_artifacts::{
@@ -11,6 +11,7 @@ use magnitude_family_contracts::{
     ModelInputAdapter, Operator, OutputForm, PositionSampling, RecurrentHeadMapping, RowRange,
     TokenPlan, VisionOperator, VisionResize,
 };
+use magnitude_family_common::readout_head;
 use magnitude_family_qwen::describe_projector;
 use magnitude_family_qwen::inputs::{QwenImageTokens, QwenInputAdapter};
 use magnitude_family_qwen35::{Architecture, FAMILY_IDS, inspect_components, recognize};
@@ -418,6 +419,87 @@ fn binds_dense_and_routed_geometry_to_semantic_roles() {
             );
         }
     }
+}
+
+/// A decision conversion's causal flag belongs to its decision description,
+/// which package inspection reads: the family leaves it and its
+/// `decision.*` keys, which are no architecture's, and its definition
+/// carries none. Without a decision template the flag is the family's, and
+/// refused.
+#[test]
+fn decision_keys_are_left_to_their_decision_description() {
+    let identity = PackageIdentity {
+        target: ArtifactIdentity([0; 32]),
+        projector: None,
+    };
+    let mut decision = directory(false);
+    decision.metadata.extend([
+        Metadata {
+            name: "qwen35.attention.causal".into(),
+            value: Value::Scalar(Scalar::Bool(false)),
+        },
+        Metadata {
+            name: format!("{DECISION_NAMESPACE}temperature.choice"),
+            value: Value::Scalar(Scalar::Float(1.5)),
+        },
+    ]);
+    let undescribed = inspect_components(&decision, None, identity.clone()).unwrap_err();
+    assert!(undescribed.to_string().contains("qwen35.attention.causal"));
+    decision.metadata.push(Metadata {
+        name: DECISION_TEMPLATE.into(),
+        value: Value::Scalar(Scalar::String("{{ state }}".into())),
+    });
+    let definition = inspect_components(&decision, None, identity).unwrap();
+    assert!(definition.decision.is_none());
+}
+
+/// A decision conversion's `decision.readout.weight` is its description's
+/// readout head, which package inspection binds (`readout_head`) at the
+/// model's width, `[outputs, hidden]` as stored: the family leaves it, and a
+/// head of another width is refused. Without a decision template it is an
+/// unbound weight of the family's.
+#[test]
+fn a_stored_readout_head_is_left_to_its_decision_description() {
+    let identity = PackageIdentity {
+        target: ArtifactIdentity([0; 32]),
+        projector: None,
+    };
+    let with_head = |shape: &[u64], described: bool| {
+        let mut directory = directory(false);
+        if described {
+            directory.metadata.extend([
+                Metadata {
+                    name: "qwen35.attention.causal".into(),
+                    value: Value::Scalar(Scalar::Bool(false)),
+                },
+                Metadata {
+                    name: DECISION_TEMPLATE.into(),
+                    value: Value::Scalar(Scalar::String("{{ state }}".into())),
+                },
+            ]);
+        }
+        directory.tensors.push(TensorDescriptor {
+            name: "decision.readout.weight".into(),
+            shape: shape.into(),
+            encoding: Encoding::BF16,
+            offset: 0,
+            nbytes: shape.iter().product::<u64>() * 2,
+        });
+        directory
+    };
+    let described = with_head(&[5, 8], true);
+    let definition = inspect_components(&described, None, identity.clone()).unwrap();
+    assert!(definition.decision.is_none());
+    let head = readout_head(&described, definition.decoder.hidden)
+        .unwrap()
+        .expect("the stored head is bound");
+    assert_eq!(
+        (head.name.as_str(), head.shape.as_slice()),
+        ("decision.readout.weight", &[5_u64, 8][..])
+    );
+    assert!(readout_head(&with_head(&[5, 7], true), 8).is_err());
+    assert_eq!(readout_head(&directory(false), 8), Ok(None));
+    assert!(inspect_components(&with_head(&[5, 8], false), None, identity).is_err());
 }
 
 #[test]

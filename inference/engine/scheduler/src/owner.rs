@@ -25,11 +25,12 @@ use super::{
         PublicationReceiver, PublicationSender, PublicationWake, PublicationWakeKind, PublishError,
         RequestError, ServiceCapacityError,
     },
+    readout::{self, PlanValues, Run, RunRole},
     round_driver::{RoundError, lower_round, reconcile_forward},
     worker::Wakes,
 };
 use magnitude_executor::{
-    DomainError, InvariantError, MemoryChargeReconciliation,
+    DomainError, InvariantError, MemoryChargeReconciliation, answer_row,
     NativeFamily,
     OpenRequirements, Operation, Outcome, PendingOperationOutcome, PhysicalDecision,
     ProgramFamily, RequestId, ResourceKind, ResourcePlan, StateBindings, SubmitError,
@@ -37,8 +38,10 @@ use magnitude_executor::{
 };
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{
-    FinishReason, Generation, OutputToken, RoundStart, StartedRound, TimedLaunch,
+    FinishReason, Generation, MethodCheckpoint, MethodChoice, OutputToken, RoundStart,
+    StartedRound, TimedLaunch,
 };
+use magnitude_readout::ReadoutPlan;
 use magnitude_state::ShrinkPolicy;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -666,6 +669,8 @@ struct Round {
     started: u64,
     /// The requests whose work is in this round, moved out of the map.
     members: BTreeMap<RequestId, Member>,
+    /// The readout runs whose chunk is in this round.
+    runs: BTreeMap<RequestId, RunRecord>,
     /// Groups not yet submitted, in order; reconciliation appends follow-ups.
     groups: VecDeque<OperationGroup>,
 }
@@ -700,6 +705,10 @@ struct Service<F: ProgramFamily> {
     scheduler: Scheduler,
     /// Requests outside the pipeline.
     requests: BTreeMap<RequestId, Request>,
+    /// Admitted readout plans, by the identity of their host stream.
+    plans: BTreeMap<RequestId, ReadoutPlanRecord>,
+    /// Readout runs outside the pipeline.
+    runs: BTreeMap<RequestId, RunEntry>,
     epoch: AvailabilityEpoch,
     next_id: u64,
     now: u64,
@@ -748,6 +757,8 @@ impl<F: ProgramFamily> Owner<F> {
                 domain,
                 scheduler: Scheduler::new(limits)?,
                 requests: BTreeMap::new(),
+                plans: BTreeMap::new(),
+                runs: BTreeMap::new(),
                 epoch: AvailabilityEpoch::default(),
                 next_id: 1,
                 now: 0,
@@ -809,6 +820,11 @@ impl<F: ProgramFamily> Owner<F> {
     }
 
     fn terminate_request(&mut self, id: RequestId, release: bool) {
+        if self.service.plans.contains_key(&id) {
+            // A plan has no ordered stop: either ends it unanswered.
+            self.service.cancel_plan(id);
+            return;
+        }
         if let Pipeline::InFlight(round, _) = &mut self.pipeline {
             if let Some(Member { mut record, state }) = round.members.remove(&id) {
                 // Work in flight reconciles as aborted; queued work is dropped.
@@ -899,10 +915,16 @@ impl<F: ProgramFamily> Owner<F> {
                 self.service.output_credit(request, wake, &mut self.pipeline);
                 false
             }
-            PublicationWakeKind::Cancelled => self
-                .service
-                .publication_sender(request, &mut self.pipeline)
-                .is_some_and(|sender| sender.process_cancelled(wake)),
+            PublicationWakeKind::Cancelled => match self.service.plans.get(&request) {
+                Some(plan) => plan
+                    .publication
+                    .as_ref()
+                    .is_some_and(|sender| sender.process_cancelled(wake)),
+                None => self
+                    .service
+                    .publication_sender(request, &mut self.pipeline)
+                    .is_some_and(|sender| sender.process_cancelled(wake)),
+            },
         };
         if cancelled {
             self.cancel(request);
@@ -1240,6 +1262,7 @@ impl<F: ProgramFamily> Service<F> {
         error: RequestError,
         members: Option<&mut BTreeMap<RequestId, Member>>,
     ) {
+        self.fail_plans(&error);
         let terminate = |record: &mut Record, generation: &mut Generation| {
             if generation.finish_reason().is_none() {
                 generation.fail();
@@ -1604,8 +1627,37 @@ impl<F: ProgramFamily> Service<F> {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        if waiting.is_empty() {
+        let plans = self
+            .runs
+            .values()
+            .filter_map(|entry| match entry.stage {
+                RunStage::NonResident(Some(Wait::Capacity {
+                    resource,
+                    required,
+                    available,
+                    ..
+                }))
+                | RunStage::Ready(Some(Wait::Capacity {
+                    resource,
+                    required,
+                    available,
+                    ..
+                })) => Some((entry.record.plan, resource, required, available)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if waiting.is_empty() && plans.is_empty() {
             return false;
+        }
+        for (plan, resource, required, available) in plans {
+            self.fail_plan(
+                plan,
+                RequestError::Capacity(ServiceCapacityError {
+                    resource: CapacityResource::Execution(resource),
+                    required,
+                    available,
+                }),
+            );
         }
         for (id, resource, required, available) in waiting {
             let Request { mut record, state } = self.requests.remove(&id).expect("waiting request");
@@ -1701,7 +1753,7 @@ impl<F: ProgramFamily> Service<F> {
 
     fn select(&mut self, bindings: &mut StateBindings<F>) -> Result<Selected, Fatal> {
         let mut candidates = self.candidates();
-        let operations = candidates
+        let mut operations = candidates
             .iter()
             .map(|(&id, (record, candidate))| {
                 let generation = candidate.generation();
@@ -1720,6 +1772,7 @@ impl<F: ProgramFamily> Service<F> {
                 }
             })
             .collect::<Vec<_>>();
+        self.run_candidates(&mut operations);
         let selection = self
             .scheduler
             .select(&operations, self.now)
@@ -1752,6 +1805,7 @@ impl<F: ProgramFamily> Service<F> {
         let mut remaining_selections = self.scheduler.limits().selection_bound();
         let mut attempted = 0;
         let mut members = BTreeMap::new();
+        let mut runs = BTreeMap::new();
         let mut operations = Vec::new();
         // Requests whose drafted blocks await verification share the launch
         // that verifies them: its rows go to the proposals most often right,
@@ -1759,7 +1813,7 @@ impl<F: ProgramFamily> Service<F> {
         let drafted = selection
             .requests()
             .iter()
-            .filter_map(|id| Some((*id, candidates[id].1.generation().draft_outlook()?)))
+            .filter_map(|id| Some((*id, candidates.get(id)?.1.generation().draft_outlook()?)))
             .collect::<Vec<_>>();
         let outlooks = drafted
             .iter()
@@ -1790,6 +1844,17 @@ impl<F: ProgramFamily> Service<F> {
                 .unwrap_or_else(|| remaining_rows.div_ceil(selection.requests().len() - attempted))
                 .min(remaining_rows);
             attempted += 1;
+            if self.runs.contains_key(&id) {
+                if let Some((record, work)) =
+                    self.start_run(id, allowance, remaining_rows, bindings)?
+                {
+                    remaining_rows = remaining_rows
+                        .saturating_sub(work.iter().map(Operation::row_count).sum());
+                    operations.extend(work);
+                    runs.insert(id, record);
+                }
+                continue;
+            }
             let (record, candidate) = candidates.remove(&id).expect("selected candidate");
             // Work composed before this round joins as it is, or waits.
             if candidate
@@ -1841,9 +1906,11 @@ impl<F: ProgramFamily> Service<F> {
             }
         }
         self.return_candidates(candidates);
-        selection
-            .truncate(attempted)
-            .map_err(|error| (None, invariant("scheduler")(error)))?;
+        // Only work that joined the round is charged for it: a request or
+        // run that could not start keeps its waiting age, so a unit waiting
+        // for a launch of its own rises until it is selected first, when it
+        // takes the round alone (`Run::lower`).
+        selection.retain(|id| members.contains_key(id) || runs.contains_key(id));
         if operations.is_empty() {
             self.scheduler.completed(selection, 0);
             return Ok(Selected::Retry);
@@ -1852,6 +1919,7 @@ impl<F: ProgramFamily> Service<F> {
             selection,
             started: self.now,
             members,
+            runs,
             groups: group(&self.domain, operations).into_iter().collect(),
         }))
     }
@@ -2182,22 +2250,12 @@ impl<F: ProgramFamily> Service<F> {
             let live = group_
                 .operations()
                 .iter()
-                .all(|operation| {
-                    round
-                        .members
-                        .get(&operation.request())
-                        .is_some_and(|member| !ended(member.state.generation()))
-                });
+                .all(|operation| self.round_live(&round, operation.request()));
             if !live {
                 let live = group_
                     .into_operations()
                     .into_iter()
-                    .filter(|operation| {
-                        round
-                            .members
-                            .get(&operation.request())
-                            .is_some_and(|member| !ended(member.state.generation()))
-                    })
+                    .filter(|operation| self.round_live(&round, operation.request()))
                     .collect::<Vec<_>>();
                 for group_ in group(&self.domain, live).into_iter().rev() {
                     round.groups.push_front(group_);
@@ -2234,7 +2292,8 @@ impl<F: ProgramFamily> Service<F> {
                         let source = round
                             .members
                             .get(&request)
-                            .and_then(|member| member.record.prefix_source);
+                            .and_then(|member| member.record.prefix_source)
+                            .or_else(|| round.runs.get(&request).and_then(|run| run.prefix_source));
                         if let Some(source) = source {
                             match self.prefix_cache.begin_submitted_if_cached(source) {
                                 Ok(true) => prefix_uses.push(source),
@@ -2268,11 +2327,17 @@ impl<F: ProgramFamily> Service<F> {
                                 .map(Operation::request)
                                 .collect::<BTreeSet<_>>();
                             for request in requests {
-                                Self::fail_member(
-                                    &mut round,
-                                    request,
-                                    RequestError::Input(error.clone()),
-                                );
+                                match round.runs.get(&request) {
+                                    Some(run) => {
+                                        let plan = run.plan;
+                                        self.fail_plan(plan, RequestError::Input(error.clone()));
+                                    }
+                                    None => Self::fail_member(
+                                        &mut round,
+                                        request,
+                                        RequestError::Input(error.clone()),
+                                    ),
+                                }
                             }
                             self.epoch.advance();
                         }
@@ -2283,6 +2348,16 @@ impl<F: ProgramFamily> Service<F> {
                     return Err((Some(round.members), classify_domain_error(error)));
                 }
             }
+        }
+    }
+
+    /// Whether `request`'s work in `round` is still wanted: a member that has
+    /// not ended, or a run of a plan that has not failed.
+    fn round_live(&self, round: &Round, request: RequestId) -> bool {
+        match (round.members.get(&request), round.runs.get(&request)) {
+            (Some(member), _) => !ended(member.state.generation()),
+            (None, Some(run)) => self.plans.get(&run.plan).is_some_and(|plan| !plan.failed),
+            (None, None) => false,
         }
     }
 
@@ -2431,9 +2506,7 @@ impl<F: ProgramFamily> Service<F> {
             .then(|| self.prefix_cache.workload_state_bytes());
         self.domain.provision(bindings, group_.operations(), ceiling)?;
         let requirement = requirements(&self.domain, bindings, group_)?;
-        self.domain
-            .can_reserve(&requirement)
-            .map_err(DomainError::from)
+        self.domain.can_reserve(&requirement)
     }
 
     /// Move a group that cannot proceed out of the round: each of its
@@ -2457,6 +2530,17 @@ impl<F: ProgramFamily> Service<F> {
         }
         round.groups = group(&self.domain, kept).into_iter().collect();
         for request in requests {
+            // A parked run's chunk is lowered anew when it is selected again.
+            if let Some(record) = round.runs.remove(&request) {
+                self.runs.insert(
+                    request,
+                    RunEntry {
+                        record,
+                        stage: RunStage::Ready(Some(wait)),
+                    },
+                );
+                continue;
+            }
             let Some(Member { record, state }) = round.members.remove(&request) else {
                 continue;
             };
@@ -2560,6 +2644,11 @@ impl<F: ProgramFamily> Service<F> {
                 return Err(invariant("service target flight")(
                     "target flight contains a non-forward operation".into(),
                 ));
+            }
+            if let Some(mut run) = round.runs.remove(&request) {
+                self.reconcile_run(&mut run, item, expected[&request])?;
+                round.runs.insert(request, run);
+                continue;
             }
             let Some(Member { mut record, state }) = round.members.remove(&request) else {
                 self.domain.abort(item).map_err(classify_domain_error)?;
@@ -2717,6 +2806,24 @@ impl<F: ProgramFamily> Service<F> {
                 "vision outcome differs from submitted request".into(),
             ));
         }
+        if let Some(run) = round.runs.get_mut(&request) {
+            // A run's encode completes one of the encodes it waits on.
+            if self.plans.get(&run.plan).is_none_or(|plan| plan.failed) {
+                return self.domain.abort(item).map_err(classify_domain_error);
+            }
+            return match self.domain.reconcile(item, PhysicalDecision { accepted_rows: 0 }) {
+                Ok(()) => {
+                    run.encodes.retain(|encode| encode != &operations[0]);
+                    Ok(())
+                }
+                Err(error) if is_fatal(&error) => Err(classify_domain_error(error)),
+                Err(error) => {
+                    let plan = run.plan;
+                    self.fail_plan(plan, classify_domain_error(error));
+                    Ok(())
+                }
+            };
+        }
         let Some(member) = round.members.get_mut(&request) else {
             return self.domain.abort(item).map_err(classify_domain_error);
         };
@@ -2757,6 +2864,7 @@ impl<F: ProgramFamily> Service<F> {
             selection,
             started,
             members,
+            runs,
             ..
         } = round;
         let elapsed = self.now.saturating_sub(started);
@@ -2764,8 +2872,17 @@ impl<F: ProgramFamily> Service<F> {
         let base = elapsed / count;
         let remainder = elapsed % count;
         let mut members = members;
+        let mut runs = runs;
         for (index, request) in selection.requests().iter().enumerate() {
             let share = base + u64::from((index as u64) < remainder);
+            let run = runs
+                .get_mut(request)
+                .or_else(|| self.runs.get_mut(request).map(|entry| &mut entry.record));
+            if let Some(run) = run {
+                run.service_ns = run.service_ns.saturating_add(share);
+                run.waiting_since = self.now;
+                continue;
+            }
             let (record, generation) = match members.get_mut(request) {
                 Some(member) => (&mut member.record, member.state.generation()),
                 None => match self.requests.get_mut(request) {
@@ -2783,6 +2900,14 @@ impl<F: ProgramFamily> Service<F> {
             }
         }
         self.scheduler.completed(selection, elapsed);
+        for (id, record) in runs {
+            let stage = if record.done() {
+                RunStage::Done
+            } else {
+                RunStage::Ready(None)
+            };
+            self.runs.insert(id, RunEntry { record, stage });
+        }
         let ids = members.keys().copied().collect::<Vec<_>>();
         for (id, Member { mut record, state }) in members {
             let generation = match state {
@@ -3024,6 +3149,7 @@ impl<F: ProgramFamily> Service<F> {
     /// Publish every request outside the pipeline, and retire the ones with
     /// nothing left for their host.
     fn publish_ready(&mut self) -> Result<(), RequestError> {
+        self.settle_readouts()?;
         let ids = self.requests.keys().copied().collect::<Vec<_>>();
         for id in ids {
             let request = self.requests.get_mut(&id).expect("listed request");
@@ -3628,5 +3754,605 @@ mod pending_retention_tests {
         let State::Between(generation, _) = state else { unreachable!() };
         let state = State::Between(generation, Stage::AwaitingPrefix { through: 1 });
         assert!(state.settled().is_some());
+    }
+}
+
+// --- readout plans -----------------------------------------------------------
+
+/// A readout plan's host stream and progress. It is answered once: with its
+/// values when its last run retires, or with its failure when one happens
+/// (its runs then retire as they settle).
+struct ReadoutPlanRecord {
+    values: PlanValues,
+    /// The host's stream; `None` once answered or released.
+    publication: Option<PublicationSender>,
+    /// Its runs not yet retired.
+    runs: BTreeSet<RequestId>,
+    failed: bool,
+    retain_shared: bool,
+}
+
+/// What stays with a run of a readout plan wherever it is.
+struct RunRecord {
+    plan: RequestId,
+    run: Run,
+    input: PreparedModelInput,
+    /// The trunk a continuation forks.
+    trunk: Option<RequestId>,
+    /// The resident position, once open.
+    position: Option<usize>,
+    waiting_since: u64,
+    service_ns: u64,
+    /// The cached prefix the run opened from, protected while work derived
+    /// from it is submitted.
+    prefix_source: Option<u64>,
+    /// The image encodes residency asked for that have not completed: the
+    /// run's next work, before its next chunk.
+    encodes: Vec<Operation>,
+}
+
+impl RunRecord {
+    fn done(&self) -> bool {
+        self.position.is_some_and(|position| position >= self.run.end())
+    }
+}
+
+/// Where a run outside the pipeline is.
+enum RunStage {
+    /// A continuation whose trunk has not computed its rows yet.
+    AwaitingTrunk,
+    /// Not resident; selection opens it.
+    NonResident(Option<Wait>),
+    /// Resident with rows left; selection lowers its next chunk.
+    Ready(Option<Wait>),
+    /// Resident with every row computed: it retires once nothing forks it.
+    Done,
+}
+
+struct RunEntry {
+    record: RunRecord,
+    stage: RunStage,
+}
+
+impl<F: ProgramFamily> Owner<F> {
+    /// Logical admission of a readout plan: record its runs and hand the
+    /// host its stream, whose one publication is the plan's values.
+    pub fn read(
+        &mut self,
+        plan: ReadoutPlan,
+        now: u64,
+    ) -> Result<(RequestId, PublicationReceiver), AdmissionError> {
+        self.service.read(plan, now)
+    }
+}
+
+impl<F: ProgramFamily> Service<F> {
+    fn read(
+        &mut self,
+        plan: ReadoutPlan,
+        now: u64,
+    ) -> Result<(RequestId, PublicationReceiver), AdmissionError> {
+        self.time(now).map_err(AdmissionError::Refused)?;
+        if matches!(self.memory_condition, MemoryCondition::Reclaim { .. }) {
+            return Err(AdmissionError::MemoryReclaim);
+        }
+        let refused = |reason: &str| AdmissionError::Refused(RequestError::Input(reason.into()));
+        let support = self.domain.readouts();
+        for sequence in plan.sequences() {
+            // A chunk ends only where both its layout and its visibility
+            // allow (`Run::lower`): no visibility boundary inside an
+            // indivisible media span.
+            let (layout, visibility) = (sequence.input().layout(), sequence.visibility());
+            if !visibility.is_causal() {
+                self.domain
+                    .reads_blocks()
+                    .map_err(|reason| refused(&format!("a blocked sequence {reason}")))?;
+            }
+            if sequence.blocks().iter().any(|block| {
+                visibility.boundary(block.rows().end) && !layout.boundary(block.rows().end)
+            }) {
+                return Err(refused(
+                    "an attention block boundary lies inside an indivisible media span",
+                ));
+            }
+            if let Some(refusal) = sequence
+                .readouts()
+                .iter()
+                .find_map(|readout| support.refusal(&readout.kind))
+            {
+                return Err(refused(refusal));
+            }
+        }
+        let runs = readout::runs(&plan);
+        let layout = |run: &Run| plan.sequences()[run.sequence()].input().layout();
+        if runs
+            .iter()
+            .any(|run| run.role() == RunRole::Trunk && !layout(run).boundary(run.end()))
+        {
+            return Err(refused("the shared rows end inside an indivisible media span"));
+        }
+        // A unit or an indivisible span is computed in one advance, however
+        // wide (`Run::lower`), of a load that computes one so wide.
+        for run in &runs {
+            for unit in run.units().into_iter().chain(run.indivisible(layout(run))) {
+                self.domain
+                    .computes_advance(unit.len())
+                    .map_err(|reason| refused(&format!("a unit wider than one launch {reason}")))?;
+            }
+        }
+        self.domain.probe_memory().map_err(AdmissionError::from)?;
+        let mut identity = || {
+            let id = RequestId(self.next_id);
+            self.next_id = self.next_id.checked_add(1).ok_or_else(|| {
+                AdmissionError::invariant("service identity")("identity exhausted".into())
+            })?;
+            Ok::<_, AdmissionError>(id)
+        };
+        let id = identity()?;
+        let runs = runs
+            .into_iter()
+            .map(|run| Ok((identity()?, run)))
+            .collect::<Result<Vec<_>, AdmissionError>>()?;
+        let wakes = self.wakes.clone();
+        let (sender, receiver) = PublicationQueue::bounded(1, move |wake| {
+            wakes.publication(id, wake);
+        })
+        .map_err(|error| AdmissionError::invariant("publication")(error.to_owned()))?;
+        // A plan with nothing to compute is answered at once.
+        if runs.is_empty() {
+            let values = PlanValues::new(&plan).finished().ok_or_else(|| {
+                AdmissionError::invariant("readout plan")("a readout has no run to answer it".into())
+            })?;
+            sender.read(values);
+            return Ok((id, receiver));
+        }
+        let trunk = runs
+            .iter()
+            .find(|(_, run)| run.role() == RunRole::Trunk)
+            .map(|(id, _)| *id);
+        // Installation is all or nothing: a refused input closes those
+        // installed before it.
+        for (index, (run_id, run)) in runs.iter().enumerate() {
+            let input = plan.sequences()[run.sequence()].input().clone();
+            if let Err(error) =
+                self.domain
+                    .install_visible_input(*run_id, input, run.visibility().clone())
+            {
+                for (installed, _) in &runs[..index] {
+                    self.domain
+                        .close(*installed)
+                        .map_err(AdmissionError::invariant("readout admission"))?;
+                }
+                return Err(AdmissionError::Refused(RequestError::Input(error)));
+            }
+        }
+        self.plans.insert(
+            id,
+            ReadoutPlanRecord {
+                values: PlanValues::new(&plan),
+                publication: Some(sender),
+                runs: runs.iter().map(|(run_id, _)| *run_id).collect(),
+                failed: false,
+                retain_shared: readout::retains(&plan),
+            },
+        );
+        for (run_id, run) in runs {
+            let continuation = run.role() == RunRole::Continuation;
+            self.runs.insert(
+                run_id,
+                RunEntry {
+                    record: RunRecord {
+                        plan: id,
+                        input: plan.sequences()[run.sequence()].input().clone(),
+                        run,
+                        trunk: trunk.filter(|_| continuation),
+                        position: None,
+                        waiting_since: now,
+                        service_ns: 0,
+                        prefix_source: None,
+                        encodes: Vec::new(),
+                    },
+                    stage: if continuation {
+                        RunStage::AwaitingTrunk
+                    } else {
+                        RunStage::NonResident(None)
+                    },
+                },
+            );
+        }
+        Ok((id, receiver))
+    }
+
+    /// The runs selection can take now, as scheduled operations.
+    fn run_candidates(&self, operations: &mut Vec<ScheduledOperation>) {
+        let memory_normal = self.memory_condition == MemoryCondition::Normal;
+        let ended = |wait: &Option<Wait>| match wait {
+            Some(Wait::Capacity { at, .. }) => self.epoch.changed_since(*at),
+            Some(Wait::Memory) => memory_normal,
+            None => true,
+        };
+        for (&id, entry) in &self.runs {
+            let selectable = match &entry.stage {
+                RunStage::NonResident(wait) => memory_normal && ended(wait),
+                RunStage::Ready(wait) => ended(wait),
+                RunStage::AwaitingTrunk | RunStage::Done => false,
+            };
+            if selectable {
+                operations.push(ScheduledOperation {
+                    identity: id,
+                    phase: Phase::Prefill,
+                    active: entry.record.service_ns > 0,
+                    resident: entry.record.position.is_some(),
+                    waiting_since_ns: entry.record.waiting_since,
+                    service_ns: entry.record.service_ns,
+                    preemption_debt: 0,
+                });
+            }
+        }
+    }
+
+    /// Start a selected run: open it when it is not resident, then submit
+    /// the image encodes its residency asked for, or else lower its next
+    /// chunk of about `allowance` rows and at most the `limit` rows its
+    /// launch has left; that work joins the round. A run whose next unit
+    /// does not fit waits for another round.
+    fn start_run(
+        &mut self,
+        id: RequestId,
+        allowance: usize,
+        limit: usize,
+        bindings: &mut StateBindings<F>,
+    ) -> Result<Option<(RunRecord, Vec<Operation>)>, Fatal> {
+        let fatal = |error: RequestError| (None, error);
+        let RunEntry { mut record, stage } = self.runs.remove(&id).expect("selected run");
+        // A plan that failed during this selection starts no more work.
+        if self.plans.get(&record.plan).is_none_or(|plan| plan.failed) {
+            self.runs.insert(id, RunEntry { record, stage });
+            return Ok(None);
+        }
+        if matches!(stage, RunStage::NonResident(_)) {
+            match self.open_run(id, &mut record, bindings)? {
+                Ok(()) => {}
+                Err(stage) => {
+                    self.runs.insert(id, RunEntry { record, stage });
+                    return Ok(None);
+                }
+            }
+        }
+        if !record.encodes.is_empty() {
+            let encodes = record.encodes.clone();
+            return Ok(Some((record, encodes)));
+        }
+        if record.done() {
+            self.runs.insert(id, RunEntry { record, stage: RunStage::Done });
+            return Ok(None);
+        }
+        let position = record.position.expect("an open run has a position");
+        match record.run.lower(
+            id,
+            &record.input,
+            position,
+            allowance,
+            limit,
+            self.scheduler.limits().prefill_tokens,
+        ) {
+            Ok(Some(operation)) => Ok(Some((record, vec![operation]))),
+            Ok(None) => {
+                self.runs.insert(id, RunEntry { record, stage: RunStage::Ready(None) });
+                Ok(None)
+            }
+            Err(error) => {
+                let plan = record.plan;
+                self.runs.insert(id, RunEntry { record, stage: RunStage::Ready(None) });
+                self.fail_plan(plan, invariant("readout chunk")(error));
+                self.settle_readouts().map_err(fatal)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Make a run resident: a continuation from a fork of its trunk's
+    /// state, any other run from the deepest retained prefix of its input
+    /// below its resume bound, or from fresh state. `Err` is the stage it
+    /// waits in.
+    fn open_run(
+        &mut self,
+        id: RequestId,
+        record: &mut RunRecord,
+        bindings: &mut StateBindings<F>,
+    ) -> Result<Result<(), RunStage>, Fatal> {
+        let fatal = |error: RequestError| (None, error);
+        let (opened, position, source) = match record.trunk {
+            Some(trunk) => {
+                let state = self
+                    .domain
+                    .resume_state(trunk)
+                    .map_err(|error| fatal(invariant("readout fork")(error)))?;
+                let position = state.position();
+                (self.domain.open_state(bindings, id, Some(&state)), position, None)
+            }
+            None => {
+                let path = PrefixPath::new(
+                    record.input.tokens(),
+                    &[],
+                    record.input.layout(),
+                    record.run.visibility(),
+                    MethodChoice::Plain,
+                );
+                let hit = self
+                    .prefix_cache
+                    .lookup(path, record.run.resume_bound())
+                    .map_err(|error| fatal(invariant("prefix cache")(error)))?;
+                match hit {
+                    Some(hit) => {
+                        let cached = self
+                            .prefix_cache
+                            .entry(hit)
+                            .map_err(|error| fatal(invariant("prefix cache")(error)))?;
+                        (
+                            self.domain.open_state(bindings, id, Some(cached.state())),
+                            hit.position(),
+                            Some(hit.id()),
+                        )
+                    }
+                    None => (
+                        self.ensure_open_capacity(bindings)
+                            .and_then(|()| self.domain.open_state(bindings, id, None)),
+                        0,
+                        None,
+                    ),
+                }
+            }
+        };
+        match opened {
+            Ok(encodes) => record.encodes = encodes,
+            Err(DomainError::Capacity(error)) => {
+                let wait = self.capacity_wait(error.resource, error.required, error.available);
+                return Ok(Err(RunStage::NonResident(Some(wait))));
+            }
+            Err(DomainError::Reclaim | DomainError::Blind(_)) => {
+                return Ok(Err(RunStage::NonResident(Some(Wait::Memory))));
+            }
+            Err(error) if is_fatal(&error) => return Err(fatal(classify_domain_error(error))),
+            Err(error) => {
+                self.fail_plan(record.plan, classify_domain_error(error));
+                return Ok(Err(RunStage::NonResident(None)));
+            }
+        }
+        record.position = Some(position);
+        record.prefix_source = source;
+        if record.trunk.is_none() {
+            if let Some(plan) = self.plans.get_mut(&record.plan) {
+                plan.values.cached(position);
+            }
+        }
+        // The run retains the states its plan's scores readouts read; a
+        // continuation also reads those its trunk retains.
+        if !record.run.retained().is_empty() {
+            let from = record.trunk.filter(|trunk| {
+                self.runs
+                    .get(trunk)
+                    .is_some_and(|trunk| !trunk.record.run.retained().is_empty())
+            });
+            match self
+                .domain
+                .retain_features(id, record.run.retained().to_vec(), from)
+            {
+                Ok(()) => {}
+                Err(error) if is_fatal(&error) => return Err(fatal(classify_domain_error(error))),
+                Err(error) => self.fail_plan(record.plan, classify_domain_error(error)),
+            }
+        }
+        self.epoch.advance();
+        Ok(Ok(()))
+    }
+
+    /// Reconcile a run's completed chunk: answer its readout rows and
+    /// commit its rows.
+    fn reconcile_run(
+        &mut self,
+        record: &mut RunRecord,
+        item: PendingOperationOutcome,
+        operation: &Operation,
+    ) -> Result<(), RequestError> {
+        let failed = self.plans.get(&record.plan).is_none_or(|plan| plan.failed);
+        let Operation::Forward {
+            position,
+            tokens,
+            readouts,
+            ..
+        } = operation
+        else {
+            return Err(invariant("readout flight")("a run submitted a non-forward".into()));
+        };
+        if failed {
+            return self.domain.abort(item).map_err(classify_domain_error);
+        }
+        let answered = match item.outcome() {
+            Outcome::Forward { rows } if rows.len() == tokens.len() => {
+                let plan = self.plans.get_mut(&record.plan).expect("live plan");
+                readouts
+                    .iter()
+                    .map(answer_row)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .try_for_each(|row| {
+                        record
+                            .run
+                            .answer(row, &rows[row - position].readouts, &mut plan.values)
+                    })
+            }
+            Outcome::TableReadFailed(error) => Err(error.detail.clone()),
+            _ => Err("a readout chunk returned another outcome".into()),
+        };
+        if let Err(error) = answered {
+            self.domain.abort(item).map_err(classify_domain_error)?;
+            self.fail_plan(record.plan, invariant("readout values")(error));
+            return Ok(());
+        }
+        match self.domain.reconcile(
+            item,
+            PhysicalDecision {
+                accepted_rows: tokens.len(),
+            },
+        ) {
+            Ok(()) => {
+                record.position = Some(position + tokens.len());
+                if let Some(plan) = self.plans.get_mut(&record.plan) {
+                    plan.values.computed(tokens.len());
+                }
+                Ok(())
+            }
+            Err(error) if is_fatal(&error) => Err(classify_domain_error(error)),
+            Err(error) => {
+                self.fail_plan(record.plan, classify_domain_error(error));
+                Ok(())
+            }
+        }
+    }
+
+    /// Fail a plan with `error`, answering its host now. Its runs retire as
+    /// they settle.
+    fn fail_plan(&mut self, plan: RequestId, error: RequestError) {
+        let Some(record) = self.plans.get_mut(&plan) else {
+            return;
+        };
+        record.failed = true;
+        if let Some(sender) = record.publication.take() {
+            sender.fail(error);
+        }
+        self.epoch.advance();
+    }
+
+    /// Release a plan its host abandoned: nothing more reaches it.
+    fn cancel_plan(&mut self, plan: RequestId) {
+        let Some(record) = self.plans.get_mut(&plan) else {
+            return;
+        };
+        record.failed = true;
+        // Dropping an unanswered sender records the worker closing it,
+        // which no receiver observes.
+        record.publication.take();
+        self.epoch.advance();
+    }
+
+    /// Settle every run outside the pipeline: a finished trunk is retained
+    /// when its plan asks and frees its continuations; runs nothing forks
+    /// any more retire, and a plan whose runs all retired is answered.
+    fn settle_readouts(&mut self) -> Result<(), RequestError> {
+        let finished_trunks = self
+            .runs
+            .iter()
+            .filter(|(_, entry)| {
+                matches!(entry.stage, RunStage::Done) && entry.record.run.role() == RunRole::Trunk
+            })
+            .map(|(&id, _)| id)
+            .collect::<Vec<_>>();
+        for trunk in finished_trunks {
+            let plan = self.runs[&trunk].record.plan;
+            let failed = self.plans.get(&plan).is_none_or(|plan| plan.failed);
+            for entry in self.runs.values_mut() {
+                if entry.record.trunk == Some(trunk) && matches!(entry.stage, RunStage::AwaitingTrunk)
+                {
+                    entry.stage = RunStage::NonResident(None);
+                }
+            }
+            let retain = self
+                .plans
+                .get_mut(&plan)
+                .is_some_and(|record| std::mem::take(&mut record.retain_shared));
+            if retain && !failed {
+                self.retain_trunk(trunk)?;
+            }
+        }
+        // Retire every run that is settled and that no unopened
+        // continuation still forks.
+        let retiring = self
+            .runs
+            .iter()
+            .filter(|(&id, entry)| {
+                let failed = self.plans.get(&entry.record.plan).is_none_or(|plan| plan.failed);
+                let settled = match entry.stage {
+                    RunStage::Done => true,
+                    RunStage::AwaitingTrunk | RunStage::NonResident(_) | RunStage::Ready(_) => {
+                        failed
+                    }
+                };
+                let forked = self.runs.values().any(|other| {
+                    other.record.trunk == Some(id) && other.record.position.is_none()
+                });
+                settled && (failed || !forked)
+            })
+            .map(|(&id, _)| id)
+            .collect::<Vec<_>>();
+        for id in retiring {
+            let entry = self.runs.remove(&id).expect("retiring run");
+            self.domain.close(id).map_err(invariant("readout retirement"))?;
+            if let Some(plan) = self.plans.get_mut(&entry.record.plan) {
+                plan.runs.remove(&id);
+            }
+            self.epoch.advance();
+        }
+        let answered = self
+            .plans
+            .iter()
+            .filter(|(_, plan)| plan.runs.is_empty())
+            .map(|(&id, _)| id)
+            .collect::<Vec<_>>();
+        for id in answered {
+            let mut plan = self.plans.remove(&id).expect("answered plan");
+            if let Some(sender) = plan.publication.take() {
+                match plan.values.finished() {
+                    Some(values) => sender.read(values),
+                    None => sender.fail(invariant("readout plan")(
+                        "a plan's runs retired with readouts unanswered".into(),
+                    )),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Retain a finished trunk's state at its end for later plans with the
+    /// same shared rows.
+    fn retain_trunk(&mut self, trunk: RequestId) -> Result<(), RequestError> {
+        let state = self
+            .domain
+            .resume_state(trunk)
+            .map_err(invariant("readout retention"))?;
+        let record = &self.runs[&trunk].record;
+        let path = PrefixPath::new(
+            record.input.tokens(),
+            &[],
+            record.input.layout(),
+            record.run.visibility(),
+            MethodChoice::Plain,
+        );
+        let retained = self
+            .prefix_cache
+            .retain(
+                path,
+                record.run.end(),
+                CachePoint::Trunk,
+                state,
+                MethodCheckpoint::Plain,
+            )
+            .map_err(invariant("readout retention"))?;
+        if retained {
+            let resumed = self.resumed_entries(None);
+            let domain = &self.domain;
+            self.prefix_cache
+                .release_beyond_workload(&resumed, |cache| occupied_state(domain, cache))
+                .map_err(invariant("readout retention"))?;
+        }
+        Ok(())
+    }
+
+    /// Fail every plan with `error`.
+    fn fail_plans(&mut self, error: &RequestError) {
+        let plans = self.plans.keys().copied().collect::<Vec<_>>();
+        for plan in plans {
+            self.fail_plan(plan, error.clone());
+        }
     }
 }

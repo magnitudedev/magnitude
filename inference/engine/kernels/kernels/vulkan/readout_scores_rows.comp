@@ -1,0 +1,26 @@
+// readout_scores_rows: scores[row, key] = scale * sum_d query[row, d] * keys[key, d],
+// the products of A operands summed in F32. One subgroup per key row, over a
+// grid-stride loop of key rows (the grid is capped below the 65535-group
+// floor): each lane sums its strided columns in order, then the subgroup sums
+// its lanes. The Vulkan form of `metal/readout_scores_rows.metal`.
+#include "lib/core/activation.glsl"
+
+void readout_scores_rows() {
+    const uint64_t query = SEISMIC_PTR(SEISMIC_BUFFER_QUERY);
+    const uint64_t keys = SEISMIC_PTR(SEISMIC_BUFFER_KEYS);
+    const uint64_t scores = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const uint64_t row = gl_WorkGroupID.y;
+    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * 8ul;
+    // The key is uniform across a subgroup: it leaves whole.
+    for (uint64_t key = uint64_t(gl_WorkGroupID.x) * 8ul + uint64_t(SEISMIC_SUBGROUP); key < SEISMIC_DIM_N;
+         key += step) {
+        float sum = 0.0;
+        for (uint64_t column = SEISMIC_LANE; column < SEISMIC_DIM_D; column += 32ul)
+            sum = seismic_fma_rn(element_at(ELEMENT_ACT, query, row * SEISMIC_QUERY_STRIDE_0 + column * SEISMIC_QUERY_STRIDE_1),
+                element_at(ELEMENT_ACT, keys, key * SEISMIC_KEYS_STRIDE_0 + column * SEISMIC_KEYS_STRIDE_1), sum);
+        sum = seismic_subgroup_sum_f32(sum);
+        if (SEISMIC_LANE == 0u)
+            element_f32_put(scores + (row * SEISMIC_RESULT_0_STRIDE_0 + key * SEISMIC_RESULT_0_STRIDE_1) * 4ul,
+                sum * element_word_f32(SEISMIC_PARAM_SCALE));
+    }
+}

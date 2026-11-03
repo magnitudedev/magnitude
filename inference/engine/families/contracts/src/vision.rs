@@ -152,6 +152,10 @@ pub struct VisionPreprocessing {
     /// by cell in raster order of the cells, each cell's patches in raster
     /// order.
     pub merge: u64,
+    /// The most pixels a picture is read at: a larger one is downscaled to
+    /// at most this many before its resize (`ImageProcessorConfig::pixel_cap`),
+    /// as a decision description's `image_max_pixels` states.
+    pub pixel_cap: Option<u64>,
 }
 
 /// How a patch row finds its rows of a learned position table.
@@ -680,6 +684,13 @@ impl VisionDescription {
         self.validate()
     }
 
+    /// Read every picture of more than `pixels` pixels downscaled to at most
+    /// that many first.
+    pub fn cap_pixels(&mut self, pixels: u64) -> Result<(), DefinitionError> {
+        self.preprocessing.pixel_cap = Some(pixels);
+        self.validate()
+    }
+
     pub fn image_processor_config(&self) -> Result<ImageProcessorConfig, DefinitionError> {
         self.validate()?;
         let p = &self.preprocessing;
@@ -727,6 +738,10 @@ impl VisionDescription {
             frames: size(self.stem.frames(), "frame count")?,
             mean: p.mean.map(|value| value as f32),
             std: p.std.map(|value| value as f32),
+            pixel_cap: p
+                .pixel_cap
+                .map(|pixels| size(pixels, "pixel cap"))
+                .transpose()?,
         };
         config.validate().map_err(DefinitionError::new)?;
         Ok(config)
@@ -739,6 +754,7 @@ impl VisionDescription {
             || p.channels != 3
             || p.patch == 0
             || p.merge == 0
+            || p.pixel_cap == Some(0)
             || p.mean.iter().any(|value| !value.is_finite())
             || p.std
                 .iter()

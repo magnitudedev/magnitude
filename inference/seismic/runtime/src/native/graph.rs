@@ -2362,18 +2362,31 @@ impl NativeGraphFamilySlot {
         Ok(NativeGraphFamilyActive { slot, _owner: self })
     }
 
+    /// Whether an activation finds an upload region no submission still
+    /// reads: a caller queueing more runs than the slot has regions waits
+    /// for earlier runs until one is.
+    pub fn upload_idle(&self) -> bool {
+        self.family.upload_bytes == 0 || self.idle_index().is_some()
+    }
+
     /// The first idle region in rotation order from `next_upload`.
-    fn idle_upload(&mut self) -> Result<Option<Arc<Allocation>>, WorkflowError> {
-        if self.family.upload_bytes == 0 {
-            return Ok(None);
-        }
+    fn idle_index(&self) -> Option<usize> {
         let regions = self.uploads.len();
-        let index = (0..regions)
+        (0..regions)
             .map(|step| (self.next_upload + step) % regions)
             .find(|index| {
                 let upload = &self.uploads[*index];
                 Arc::strong_count(upload) == 1 && upload.device_idle()
             })
+    }
+
+    fn idle_upload(&mut self) -> Result<Option<Arc<Allocation>>, WorkflowError> {
+        if self.family.upload_bytes == 0 {
+            return Ok(None);
+        }
+        let regions = self.uploads.len();
+        let index = self
+            .idle_index()
             .ok_or(WorkflowError::UploadRegionsExhausted { regions })?;
         self.next_upload = (index + 1) % regions;
         Ok(Some(self.uploads[index].clone()))

@@ -74,9 +74,11 @@ fn primes(operation: &Operation) -> bool {
 }
 
 /// Preserve input order while coalescing adjacent compatible operations. A
-/// request may occupy only one slot in a group; another operation starts a new
-/// group so dependencies never leap across an intervening lane. The domain
-/// validates every operation when a group is reserved.
+/// request may occupy only one slot in a group; another operation starts a
+/// new group so dependencies never leap across an intervening lane. Sibling
+/// forks share a group: provisioning relocates the tails they share
+/// (`ExecutorDomain::provision`). The domain validates every operation when
+/// a group is reserved.
 pub fn group<F: ProgramFamily>(
     domain: &ExecutorDomain<F>,
     operations: Vec<Operation>,
@@ -264,6 +266,7 @@ mod tests {
             select: Vec::new(),
             committed: 1,
             prime: None,
+            readouts: Vec::new(),
         };
         let group = OperationGroup {
             lane: DomainLane::Target,

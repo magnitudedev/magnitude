@@ -21,16 +21,17 @@ impl ValidatedTargetBatch {
         })
     }
 
-    /// Validate into a launch class covering at least `segments` history
-    /// ranges per row (`PackedRowTables::pack_covering`).
+    /// Validate into a launch class covering at least `rows` rows and
+    /// `segments` history ranges per row (`PackedRowTables::pack_covering`).
     pub fn covering(
         slots: &[Slot],
         vocabulary_size: usize,
         limits: ClassLimits,
+        rows: usize,
         segments: usize,
     ) -> Result<Self, PackError> {
         Ok(Self {
-            packed: PackedRowTables::pack_covering(slots, vocabulary_size, limits, segments)?,
+            packed: PackedRowTables::pack_covering(slots, vocabulary_size, limits, rows, segments)?,
         })
     }
 
@@ -73,6 +74,8 @@ impl ValidatedTargetBatch {
             plane_base: &packed.plane_base,
             out_rows: &packed.out_rows,
             select_rows: &packed.select_rows,
+            readout_rows: &packed.readout_rows,
+            readouts: &packed.readouts,
             draws: &packed.draws,
             mask_rows: &packed.mask_rows,
             masks: &packed.masks,
@@ -125,6 +128,10 @@ pub struct TargetBatchUpload<'a> {
     pub plane_base: &'a [i32],
     pub out_rows: &'a [i32],
     pub select_rows: &'a [i32],
+    /// Per readout, in row order: its row's index in `out_rows`, and the
+    /// readout (`PackedRowTables::readout_rows`).
+    pub readout_rows: &'a [i32],
+    pub readouts: &'a [crate::RowReadout],
     pub draws: &'a [[u32; 6]],
     pub mask_rows: &'a [i32],
     pub masks: &'a [Arc<[u32]>],
@@ -158,6 +165,11 @@ impl<'a> TargetBatchSlot<'a> {
 
     pub fn rows(&self) -> usize {
         self.end - self.start
+    }
+
+    /// The batch row of the slot's first row.
+    pub fn start(&self) -> usize {
+        self.start
     }
 
     /// History domains of the slot's store.
@@ -200,6 +212,7 @@ mod tests {
                     }],
                     demand: Demand::NONE,
                     select: None,
+                    readouts: Vec::new(),
                 }],
             }],
             16,

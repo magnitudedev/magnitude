@@ -19,6 +19,7 @@ use magnitude_chat::ConstraintPlan;
 use magnitude_executor::UnpreparedUnits;
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{DetailedUsage, FinishReason, Options, OutputToken};
+use magnitude_readout::{ReadoutPlan, ReadoutValues};
 use magnitude_scheduler::prefix_cache::PrefixRetention;
 use seismic::measure::Record;
 use seismic::{PointKey, StoreIdentity};
@@ -94,6 +95,12 @@ pub enum HostMessage {
         request: MeasureRequest,
     },
     Admit(Admission),
+    /// Evaluate a prompt-only readout plan. Its only outcome is `Read` or
+    /// `Failed`, after `Admitted`; `Cancel` abandons it.
+    Read {
+        request_id: HostRequestId,
+        plan: ReadoutPlan,
+    },
     /// The host's consumer drained `batches` output batches.
     Credit {
         request_id: HostRequestId,
@@ -255,6 +262,11 @@ pub enum WorkerMessage {
         timings: ExecutionTimings,
     },
     Failed { request_id: HostRequestId, error: RequestError },
+    /// A readout plan's values: its terminal outcome.
+    Read {
+        request_id: HostRequestId,
+        values: ReadoutValues,
+    },
     /// `None` when the request is not live in the worker.
     Status {
         request_id: HostRequestId,
@@ -277,6 +289,30 @@ mod tests {
 
     fn round_trip<T: Serialize + serde::de::DeserializeOwned>(value: &T) -> T {
         postcard::from_bytes(&postcard::to_allocvec(value).unwrap()).unwrap()
+    }
+
+    /// A picture's preprocessing survives the process encoding with and
+    /// without a pixel cap: the encoding is positional, so no field of a
+    /// message is ever left out.
+    #[test]
+    fn vision_preprocessing_round_trips_through_the_worker_encoding() {
+        use magnitude_family_contracts::{VisionPreprocessing, VisionResampling, VisionResize};
+        for pixel_cap in [None, Some(1_638_400)] {
+            let preprocessing = VisionPreprocessing {
+                resize: VisionResize::PixelBounds {
+                    min_pixels: 65_536,
+                    max_pixels: 16_777_216,
+                },
+                resampling: VisionResampling::Bicubic,
+                mean: [0.5; 3],
+                std: [0.5; 3],
+                channels: 3,
+                patch: 16,
+                merge: 2,
+                pixel_cap,
+            };
+            assert_eq!(round_trip(&preprocessing), preprocessing);
+        }
     }
 
     /// Memory observations, their failure and a store-qualified load

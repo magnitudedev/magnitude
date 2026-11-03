@@ -51,7 +51,7 @@ fn plain_owner(limits: ServiceLimits) -> (Host, usize, std::sync::Arc<ByteBpeTok
             draft_policy: None,
             method: ModelMethod::Plain,
             mtp_proposals: None,
-            kv_codec: KvCodec::AffineK8V4,
+            kv_codec: Some(KvCodec::AffineK8V4),
             lookahead: false,
             exported_logits_rows: 0,
             numerical_profile: None,
@@ -208,7 +208,7 @@ fn plain_domain(bound: usize, exported: usize) -> (ExecutorDomain, StateBindings
             draft_policy: None,
             method: ModelMethod::Plain,
             mtp_proposals: None,
-            kv_codec: KvCodec::AffineK8V4,
+            kv_codec: Some(KvCodec::AffineK8V4),
             lookahead: false,
             exported_logits_rows: exported,
             numerical_profile: None,
@@ -275,6 +275,7 @@ fn finishing(
         }],
         committed: tokens.len(),
         prime: None,
+        readouts: Vec::new(),
     }
 }
 

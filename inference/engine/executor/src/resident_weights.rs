@@ -155,6 +155,8 @@ pub struct ResidentTarget {
     pub fusion: Option<ResidentFusion>,
     /// The per-layer entry, when the model has per-layer inputs.
     pub per_layer: Option<ResidentPerLayer>,
+    /// The model's readout head, in the dense element it is stored in.
+    pub readout_head: Option<ResidentWeight>,
 }
 
 /// The target's vocabulary projection, as its plan places it.
@@ -226,6 +228,7 @@ impl ResidentTarget {
             visit(&per_layer.projection);
             visit(&per_layer.norm);
         }
+        self.readout_head.iter().for_each(&mut visit);
     }
 
     pub(crate) fn storage_bytes(&self) -> Result<u64, &'static str> {
@@ -318,6 +321,10 @@ pub(crate) fn import_target(
             })
         })
         .transpose()?;
+    let readout_head = definition
+        .readout_head()
+        .map(|head| residency.import_gguf_planned(target, head))
+        .transpose()?;
     Ok(ResidentTarget {
         embedding,
         blocks: decoder.blocks.len(),
@@ -326,6 +333,7 @@ pub(crate) fn import_target(
         output,
         fusion,
         per_layer,
+        readout_head,
     })
 }
 

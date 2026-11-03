@@ -36,6 +36,7 @@ mod input;
 mod lookahead;
 mod ownership;
 mod reconcile;
+mod retention;
 mod state;
 mod target;
 mod vision;
@@ -53,7 +54,8 @@ pub use ownership::OpenRequirements;
 pub use state::{MemoryChargeReconciliation, StoreAllocation};
 pub use target::TargetHostTiming;
 pub(crate) use target::{
-    AppendedRuns, accepted_history, cached_causal_domain, indexer_domain, indexer_history,
+    AppendedRuns, BlockedRow, accepted_history, blocked_reads, cached_causal_domain, chunk_version,
+    fresh_span, global_read, indexer_domain, indexer_history,
 };
 
 use std::{
@@ -359,6 +361,10 @@ pub struct DomainRequirements {
     priming_banks: usize,
     /// The operations claim the queued lookahead step: nothing is reserved.
     claim: bool,
+    /// Device bytes the launch's readout values allocate beside its leases
+    /// (`ProgramFamily::readout_values_bytes`), claimed from the heap by the
+    /// reservation.
+    readout_bytes: u64,
 }
 
 impl DomainRequirements {
@@ -426,11 +432,16 @@ pub enum TargetGraphReservation {
 pub struct TargetLaunchReservation {
     boundary: Option<FeatureRef>,
     advances: Vec<OwnedStateAdvance>,
+    /// A layer-major launch's barriers (`LayerMajor::barriers`).
+    barriers: Option<crate::Barriers>,
     graph_workspace: NativeGraphWorkspaceLease,
     graph_outputs: [NativeGraphOutputLease; 2],
     readout_workspace: NativeGraphWorkspaceLease,
     readout_output: NativeGraphOutputLease,
     priming: Option<PrimingReservation>,
+    /// The heap's claim on the readout values the launch allocates, released
+    /// when the launch is submitted or the reservation dropped.
+    readout_claim: Option<state::HeldClaim>,
 }
 
 /// A lone prompt chunk's drafter entry: its head advance and draft launch
@@ -460,6 +471,8 @@ struct InputImage {
 /// that lifetime; encoded features are released with it and re-encoded.
 struct RequestInput {
     input: PreparedModelInput,
+    /// What its rows read on global attention layers.
+    visibility: magnitude_readout::Visibility,
     images: BTreeMap<String, InputImage>,
     resident: bool,
     boundary: Option<FeatureRef>,
@@ -494,7 +507,7 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     resources: AllocatedResources,
     domain: ResourceDomain,
     /// The device's heap, carried over from the startup claims.
-    memory: RefCell<DeviceHeap>,
+    memory: Rc<RefCell<DeviceHeap>>,
     static_holding: Option<HoldingId>,
     optional_holding: Option<HoldingId>,
     target_store: Rc<StateStore>,
@@ -525,6 +538,10 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// later outcome of theirs fails (`Outcome::TableReadFailed`) until they
     /// close.
     poisoned: BTreeMap<RequestId, crate::TableReadError>,
+    /// The stores of the rows each sequence retains for scores readouts
+    /// (`retain_features`): those of the sequence it was forked from, then
+    /// its own.
+    retained: BTreeMap<RequestId, Vec<Rc<retention::FeatureStore>>>,
 }
 
 impl ExecutorDomain<NativeFamily> {
@@ -875,6 +892,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 priming_demand: Vec::new(),
                 priming_banks: 0,
                 claim: true,
+                readout_bytes: 0,
             });
         }
         let first = operations
@@ -965,6 +983,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 let mut segments = 1usize;
                 let mut demand = Demand::NONE;
                 let mut seen = BTreeSet::new();
+                let mut group = Vec::new();
                 for operation in operations {
                     operation.validate().map_err(|error| error.to_string())?;
                     if let Operation::Head {
@@ -993,7 +1012,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     rows = rows
                         .checked_add(operation.row_count())
                         .ok_or_else(|| DomainError::invariant("reservation row count overflow"))?;
-                    demand |= operation.demand();
+                    demand |= self.launch_demand(operation);
                     let state = match lane {
                         ReservationLane::Target => self.target.get(&operation.request()),
                         ReservationLane::Head if reads_target => {
@@ -1067,33 +1086,35 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         }
                         _ => {}
                     }
-                    segments = segments.max(if lane == ReservationLane::Target {
-                        target::reserved_segments(
-                            &self.target_store,
-                            state.span_count(),
-                            operation.row_count(),
-                        )
-                    } else {
-                        state.span_count()
-                    });
+                    segments = segments.max(state.span_count());
+                    if lane == ReservationLane::Target {
+                        group.push((operation, state));
+                    }
                 }
                 self.admit_selection(lane, operations)?;
-                let class_limits = if lane == ReservationLane::Target {
-                    self.target_class_limits()
+                let (pool, banks) = if lane == ReservationLane::Target {
+                    let group = group
+                        .iter()
+                        .map(|(operation, state)| (*operation, *state as &dyn target::AcceptedHistory))
+                        .collect::<Vec<_>>();
+                    let class = self.target_class(&group).map_err(DomainError::Input)?;
+                    // An advance computed in chunks also holds an interim
+                    // bank (`OwnedStateAdvance::begin_chunked`).
+                    let chunked = operations
+                        .iter()
+                        .any(|operation| self.target_chunks(operation.row_count()).len() > 1);
+                    (PoolClass::Target(class), operations.len() + usize::from(chunked))
                 } else {
-                    self.head_class_limits()?
-                };
-                let class = crate::LaunchClass::covering(rows, segments, demand, class_limits)
+                    let class = crate::LaunchClass::covering(
+                        rows,
+                        segments,
+                        demand,
+                        self.head_class_limits()?,
+                    )
                     .map_err(|error| error.to_string())?;
-                (
-                    if lane == ReservationLane::Target {
-                        PoolClass::Target(class)
-                    } else {
-                        PoolClass::Head(class)
-                    },
-                    state_demand,
-                    if reads_target { 0 } else { operations.len() },
-                )
+                    (PoolClass::Head(class), operations.len())
+                };
+                (pool, state_demand, if reads_target { 0 } else { banks })
             }
             ReservationLane::Vision => {
                 let [Operation::Encode { image, .. }] = operations else {
@@ -1125,6 +1146,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 )
             }
         };
+        let readout_bytes = match lane {
+            ReservationLane::Target => self.readout_values_bytes(operations)?,
+            ReservationLane::Head | ReservationLane::Vision => 0,
+        };
         Ok(DomainRequirements {
             lane,
             pool,
@@ -1133,10 +1158,45 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             priming_demand,
             priming_banks,
             claim: false,
+            readout_bytes,
         })
     }
 
-    pub fn can_reserve(&self, requirements: &DomainRequirements) -> Result<(), CapacityError> {
+    /// The device bytes the readout values of a target launch of
+    /// `operations` allocate beside its leases, from the row readouts its
+    /// batch packs.
+    pub(super) fn readout_values_bytes(&self, operations: &[Operation]) -> Result<u64, DomainError> {
+        let slots = operations
+            .iter()
+            .filter(|operation| self.launch_demand(operation).contains(Demand::READOUT))
+            .map(|operation| {
+                let retained = self.retained_rows(operation.request());
+                (0..operation.row_count())
+                    .map(|row| retention::row_readouts(operation, row, &retained))
+                    .collect::<Result<Vec<_>, String>>()
+                    .map(|rows| rows.into_iter().flatten().collect())
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(DomainError::invariant)?;
+        if slots.is_empty() {
+            return Ok(0);
+        }
+        self.family
+            .readout_values_bytes(&slots)
+            .map_err(DomainError::invariant)
+    }
+
+    /// Whether a reservation of `requirements` fits now: its pools, and the
+    /// heap for its readout values.
+    pub fn can_reserve(&self, requirements: &DomainRequirements) -> Result<(), DomainError> {
+        self.pools_fit(requirements).map_err(DomainError::Capacity)?;
+        if requirements.readout_bytes != 0 {
+            self.memory.borrow_mut().check(requirements.readout_bytes, 0)?;
+        }
+        Ok(())
+    }
+
+    fn pools_fit(&self, requirements: &DomainRequirements) -> Result<(), CapacityError> {
         if requirements.claim {
             return Ok(());
         }
@@ -1328,14 +1388,33 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 Ok(())
             }
         });
-        if let Some(claim) = claim {
-            self.release_claim(claim);
-        }
+        drop(claim);
         bound?;
         self.refresh_memory()?;
         self.sync_optional_holding().map_err(DomainError::Input)?;
-        self.can_reserve(&requirements)
-            .map_err(DomainError::Capacity)?;
+        self.pools_fit(&requirements).map_err(DomainError::Capacity)?;
+        // The readout values a target launch allocates at submission are the
+        // heap's from here until Seismic charges them (`launch_target`).
+        let readout_claim = (requirements.readout_bytes != 0)
+            .then(|| self.claim_device_growth(requirements.readout_bytes, 0, HoldingClass::Live))
+            .transpose()?;
+        let mut resources = self.reserve_resources(operations, &requirements)?;
+        if let ReservedResources::Target(TargetGraphReservation::Launch(launch)) = &mut resources {
+            launch.readout_claim = readout_claim;
+        }
+        Ok(DomainReservation {
+            requirements,
+            resources,
+        })
+    }
+
+    /// The resources of a reservation of `requirements` its pools fit: the
+    /// launch leases, and the numerical state moved into its advances.
+    fn reserve_resources(
+        &mut self,
+        operations: &[Operation],
+        requirements: &DomainRequirements,
+    ) -> Result<ReservedResources, DomainError> {
         let reads_target = requirements.lane == ReservationLane::Head && self.head_reads_target();
         let invariant = |detail: &str, error: CapacityError| {
             DomainError::invariant(format!(
@@ -1384,6 +1463,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     readout_output,
                     priming: None,
                     boundary,
+                    barriers: None,
+                    readout_claim: None,
                 }))
             }
             ReservationLane::Head => {
@@ -1419,9 +1500,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         match &mut resources {
             ReservedResources::Target(TargetGraphReservation::Launch(
                 TargetLaunchReservation {
-                    advances, priming, ..
+                    advances,
+                    priming,
+                    barriers,
+                    ..
                 },
             )) => {
+                *barriers = self.allocate_barriers(operations, requirements.pool)?;
                 if let [
                     Operation::Forward {
                         request,
@@ -1466,11 +1551,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         .target
                         .remove(&request)
                         .expect("reservation preflight established target ownership");
-                    match OwnedStateAdvance::begin_speculative(
-                        state,
-                        operation.row_count(),
-                        operation.committed_rows(),
-                    ) {
+                    let begun = if self.target_chunks(operation.row_count()).len() > 1 {
+                        OwnedStateAdvance::begin_chunked(state, operation.row_count())
+                    } else {
+                        OwnedStateAdvance::begin_speculative(
+                            state,
+                            operation.row_count(),
+                            operation.committed_rows(),
+                        )
+                    };
+                    match begun {
                         Ok(advance) => advances.push(advance),
                         Err((state, error)) => {
                             self.target.insert(request, state);
@@ -1523,11 +1613,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             _ => {}
         }
-        Ok(DomainReservation {
-            requirements,
-            resources,
-        })
+        Ok(resources)
     }
+
     /// The domain over `family`, and the one [`StateBindings`] of its stores.
     pub fn with_family(
         execution: Rc<ExecutionPlan>,
@@ -1550,7 +1638,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             definition,
             resources,
             domain: ResourceDomain::new(id, memory.device().clone()),
-            memory: RefCell::new(memory),
+            memory: Rc::new(RefCell::new(memory)),
             static_holding: None,
             optional_holding: None,
             target_store: Rc::clone(&target_state),
@@ -1570,6 +1658,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             host_turn: None,
             trace_lookahead: std::env::var_os("MAGNITUDE_TRACE_LOOKAHEAD").is_some(),
             poisoned: BTreeMap::new(),
+            retained: BTreeMap::new(),
         };
         let bindings = StateBindings {
             target: target_state,
@@ -1577,6 +1666,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             lookahead: None,
         };
         (domain, bindings)
+    }
+
+    /// The readouts target forwards compute at chosen rows
+    /// (`ProgramFamily::readouts`).
+    pub fn readouts(&self) -> crate::ReadoutSupport {
+        self.family.readouts()
+    }
+
+    /// The least row class a chunk of a layer-major advance launches in
+    /// (`ProgramFamily::layer_major_rows`).
+    pub fn layer_major_rows(&self) -> usize {
+        self.family.layer_major_rows()
     }
 
     pub fn resource_identity(&self) -> &ResourceDomainId {

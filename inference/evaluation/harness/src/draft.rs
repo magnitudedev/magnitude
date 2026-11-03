@@ -311,6 +311,7 @@ fn draft_at(
         demand: Demand::SELECT,
         committed: 1,
         prime: None,
+        readouts: Vec::new(),
     }];
     let verify_start = host_seconds();
     let mut bindings = engine.bindings();

@@ -6,12 +6,12 @@
 //! plans a package without a device. Drafter verdicts and memory need a
 //! selected device; they run on the CPU backend, which every build has.
 
-use magnitude_artifacts::gguf::Encoding;
+use magnitude_artifacts::{gguf::Encoding, Serves, DECISION_NAMESPACE};
 use magnitude_engine::{
     assessment::{
-        assess_model, header_refusal, kernel_inventory, prepare_model_assessment,
-        AssessmentSetup, AssessmentStructure, DrafterVerdict, HeaderExtent, KernelInventory,
-        Measurements, ModelAssessment, ModelExecution, ModelFacts, ModelPackagePaths,
+        assess_model, header_refusal, kernel_inventory, prepare_model_assessment, AssessmentSetup,
+        AssessmentStructure, DrafterVerdict, HeaderExtent, KernelInventory, Measurements,
+        ModelAssessment, ModelCapabilities, ModelExecution, ModelFacts, ModelPackagePaths,
         PreparedModelAssessment, ProjectorVerdict, SpeculativeMethod,
     },
     error::{UnsupportedModel, UnsupportedReason, WeightTypeCount},
@@ -589,6 +589,12 @@ fn truncated_and_invalid_files_are_unreadable_and_missing_files_are_operational(
             [UnsupportedReason::Unreadable],
             "{path:?}"
         );
+        // A header that does not open says nothing of what the file serves.
+        let PreparedModelAssessment::Unsupported { serves, .. } = prepared(&package(path.clone()))
+        else {
+            panic!("{} is assessed", path.display());
+        };
+        assert_eq!(serves, None, "{path:?}");
     }
     assert!(kernel_inventory(
         &package(scratch.file("absent.gguf")),
@@ -703,6 +709,13 @@ fn cpu_setup() -> AssessmentSetup {
     }
 }
 
+/// Whether an assessed model takes image input, whatever it serves.
+fn takes_images(facts: &ModelFacts) -> bool {
+    match facts.capabilities {
+        ModelCapabilities::Chat { vision, .. } | ModelCapabilities::Decisions { vision } => vision,
+    }
+}
+
 fn prepared(package: &ModelPackagePaths) -> PreparedModelAssessment {
     prepare_model_assessment(package, &cpu_structure())
         .unwrap_or_else(|error| panic!("operational failure: {error}"))
@@ -717,6 +730,7 @@ fn an_unsupported_target_reports_its_fingerprint() {
     let PreparedModelAssessment::Unsupported {
         unsupported,
         fingerprint,
+        serves,
     } = prepared(&package(target.clone()))
     else {
         panic!("Q2_K is not imported");
@@ -726,6 +740,90 @@ fn an_unsupported_target_reports_its_fingerprint() {
         [UnsupportedReason::WeightTypes { .. }]
     ));
     assert_eq!(fingerprint, ModelFingerprint::from_path(&target).ok());
+    assert_eq!(serves, Some(Serves::Chat));
+}
+
+/// `llama` converted to answer decisions: its decision description (a
+/// noul-only one read through a three-row readout head) and the head, which
+/// the family itself never reads.
+fn decision_llama() -> Gguf {
+    let mut gguf = llama();
+    gguf.set("llama.attention.causal", Meta::Bool(false));
+    gguf.set("tokenizer.chat_template.decision", Meta::Str("{{ state }}".into()));
+    for (key, value) in [
+        ("escape.method", "none"),
+        ("segments", "whole"),
+        ("state_attends", "state"),
+        ("question_attends", "question"),
+        ("codes.sequence", "letters"),
+        ("noul.codes", "sequence"),
+        ("noul.slots", "last"),
+    ] {
+        gguf.set(&format!("{DECISION_NAMESPACE}{key}"), Meta::Str(value.into()));
+    }
+    gguf.set(&format!("{DECISION_NAMESPACE}set_size"), Meta::U32(1));
+    gguf.set(&format!("{DECISION_NAMESPACE}kinds"), Meta::Strings(vec!["noul".into()]));
+    gguf.set(&format!("{DECISION_NAMESPACE}noul.true_option"), Meta::U32(0));
+    gguf.set(&format!("{DECISION_NAMESPACE}codes.probe"), Meta::Bool(false));
+    gguf.set(&format!("{DECISION_NAMESPACE}temperature.noul"), Meta::F32(1.0));
+    gguf.tensor("decision.readout.weight", &[3, HIDDEN], Encoding::F32);
+    gguf
+}
+
+/// Package inspection reads a target's decision metadata and readout head
+/// for every family: a family that never names them admits the target and
+/// it serves decisions, with no chat capability its templates name.
+#[test]
+fn every_family_admits_its_decision_keys_and_readout_head() {
+    let scratch = Scratch::new("decision-llama");
+    let target = decision_llama().write(&scratch.file("target.gguf"));
+    let PreparedModelAssessment::Planned { facts, .. } = prepared(&package(target)) else {
+        panic!("a decision llama is admitted");
+    };
+    assert_eq!(
+        facts.capabilities,
+        ModelCapabilities::Decisions { vision: false }
+    );
+}
+
+/// A decision model generates nothing to draft: a drafter that binds a
+/// chat target is rejected beside it, and the target plans alone.
+#[test]
+fn a_decision_target_binds_no_drafter() {
+    let scratch = Scratch::new("decision-drafter");
+    let target = decision_llama().write(&scratch.file("target.gguf"));
+    let draft = dflash(HIDDEN).write(&scratch.file("draft.gguf"));
+    let PreparedModelAssessment::Planned { facts, .. } = prepared(&ModelPackagePaths {
+        draft: Some(draft),
+        method: ModelMethod::Auto,
+        ..package(target)
+    }) else {
+        panic!("the decision target plans without the drafter");
+    };
+    let DrafterVerdict::Rejected(rejection) = facts.drafter else {
+        panic!(
+            "a decision target's drafter is rejected: {:?}",
+            facts.drafter
+        );
+    };
+    assert!(matches!(
+        rejection.reasons.as_slice(),
+        [UnsupportedReason::TargetMismatch { .. }]
+    ));
+}
+
+/// A refused decision model still serves decisions: its verdict reports
+/// what its header names, never chat.
+#[test]
+fn an_unsupported_decision_target_serves_decisions() {
+    let scratch = Scratch::new("unsupported-decision");
+    let mut gguf = decision_llama();
+    gguf.encode("blk.0.ffn_up.weight", Encoding::Q2K);
+    let target = gguf.write(&scratch.file("target.gguf"));
+    let PreparedModelAssessment::Unsupported { serves, .. } = prepared(&package(target)) else {
+        panic!("Q2_K is not imported");
+    };
+    assert_eq!(serves, Some(Serves::Decisions));
 }
 
 #[test]
@@ -890,7 +988,7 @@ fn a_form_the_backend_does_not_execute_names_the_backend() {
     let scratch = Scratch::new("backend");
     let target = llama().write(&scratch.file("target.gguf"));
     let rotated = ModelPolicy {
-        kv_codec: magnitude_state::KvCodec::RotatedK4V4,
+        kv_codec: Some(magnitude_state::KvCodec::RotatedK4V4),
         ..ModelPolicy::default()
     };
     assert_eq!(
@@ -1009,7 +1107,7 @@ fn embedded_mtp_heads_stay_bound_beside_a_projector() {
     };
     for (projector, vision) in [(None, false), (Some(projector), true)] {
         let facts = assessed(projector);
-        assert_eq!(facts.capabilities.vision, vision);
+        assert_eq!(takes_images(&facts), vision);
         assert!(
             matches!(
                 facts.drafter,
@@ -1044,12 +1142,12 @@ fn a_projector_binds_by_its_width_not_the_base_model_names() {
     let PreparedModelAssessment::Planned { facts, .. } = prepared(&with(own)) else {
         panic!("the finetune plans beside its base model's projector");
     };
-    assert!(facts.capabilities.vision);
+    assert!(takes_images(&facts));
     assert_eq!(facts.projector, ProjectorVerdict::Bound);
     let PreparedModelAssessment::Planned { facts, .. } = prepared(&with(narrow)) else {
         panic!("a projector of another width leaves the target planning text only");
     };
-    assert!(!facts.capabilities.vision);
+    assert!(!takes_images(&facts));
     let ProjectorVerdict::Rejected(rejection) = &facts.projector else {
         panic!("a projector of another width can't feed this decoder: {:?}", facts.projector);
     };
@@ -1082,7 +1180,7 @@ fn a_text_only_family_is_assessed_without_a_projector_it_cannot_bind() {
     }) else {
         panic!("a projector the family cannot bind never refuses the target");
     };
-    assert!(!facts.capabilities.vision);
+    assert!(!takes_images(&facts));
     let ProjectorVerdict::Rejected(rejection) = &facts.projector else {
         panic!("Nemotron-H has no vision projector: {:?}", facts.projector);
     };

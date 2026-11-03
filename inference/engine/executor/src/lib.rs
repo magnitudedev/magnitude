@@ -59,11 +59,12 @@ pub use kernel_cache::{
 };
 pub use lanes::ConditioningSlice;
 pub use lanes::{
-    HeadConditioning, HeadLaunchCore, HeadLaunchInputs, ImportLaunchCore, ImportLaunchInputs,
-    ResidentWeightSlot, StateLaunchCore, StateLaunchInputs, StateWork, TargetHistoryRead,
-    TargetLaunchCore, TargetLaunchInputs, TargetLaunchWorkspace, TargetReads, TargetTokens,
-    ValidatedHeadLaunch, ValidatedImportLaunch, ValidatedStateLaunch, ValidatedTargetLaunch,
-    ValidatedVisionLaunch, VisionLaunchCore, VisionLaunchInputs,
+    Barriers, HeadConditioning, HeadLaunchCore, HeadLaunchInputs, ImportLaunchCore,
+    ImportLaunchInputs, LaunchChunk, LaunchRows, LayerMajor, ResidentWeightSlot,
+    StateLaunchCore, StateLaunchInputs, StateWork, TargetHistoryRead, TargetLaunchCore,
+    TargetLaunchInputs, TargetLaunchWorkspace, TargetReads, TargetTokens, ValidatedHeadLaunch,
+    ValidatedImportLaunch, ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch,
+    VisionLaunchCore, VisionLaunchInputs,
 };
 pub use magnitude_batching::{self as batching, Demand, LaunchClass};
 /// Development-only tuning pin for bit-exact measurement runs
@@ -85,7 +86,7 @@ pub use native::{
 };
 pub use operation::{
     CommittedClass, DraftForm, ExecutableKind, FeatureReader, FeatureRows, FeatureSpan, GroupKey,
-    HeadPhase, Operation, OperationError, Outcome, Priming, ProgramIdentity, RequestId,
+    HeadPhase, Operation, OperationError, Outcome, ReadoutSupport, Priming, answer_row, ProgramIdentity, RequestId,
     ResourceDomainId, RowResult, Sampling, SelectSpec, Selected, Shaping, TokenId, WorkKind,
 };
 pub use operators::routed::{

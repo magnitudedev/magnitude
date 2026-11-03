@@ -221,6 +221,7 @@ pub fn describe_projector(
             mean: triple(directory, "clip.vision.image_mean")?,
             std: triple(directory, "clip.vision.image_std")?,
             channels: 3,
+            pixel_cap: None,
             patch,
             merge,
         },

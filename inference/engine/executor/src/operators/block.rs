@@ -105,6 +105,12 @@ pub(crate) enum BlockControlPorts {
         /// A selected read's indexer tables.
         indexer: Option<IndexerControlPorts>,
     },
+    /// An attention block's class that only appends its rows' keys and
+    /// values at their destinations, attending nothing.
+    Append {
+        coordinates: NativePort,
+        destinations: NativePort,
+    },
     Recurrent(RecurrentControlPorts),
 }
 
@@ -281,6 +287,9 @@ pub(crate) struct BlockSublayers<'a> {
     /// Whether a selected attention read's class scores (some row of its
     /// launch is past the selection threshold).
     pub scored: bool,
+    /// Whether an attention block's class computes only the keys and
+    /// values its rows append to their history (`BlockControlPorts::Append`).
+    pub keys_values: bool,
     pub output_scales: OutputScales,
 }
 
@@ -382,6 +391,7 @@ impl BlockSublayers<'_> {
             slots,
             listed,
             scored,
+            keys_values,
             output_scales,
             ..
         } = *self;
@@ -401,14 +411,21 @@ impl BlockSublayers<'_> {
                     .map_err(|error| error.to_string())?;
                 let post_norm_epsilon = post_norm_epsilon(paired.mixer_output);
                 let operands = AttentionOperands::planned(
-                    graph, load, scope, operator, &shape, true, weights, constants,
+                    graph,
+                    load,
+                    scope,
+                    operator,
+                    &shape,
+                    !keys_values,
+                    weights,
+                    constants,
                 )?;
                 let attention_weights = attention_weights(
                     &shape,
                     operator,
                     form,
-                    true,
-                    post_norm_epsilon.is_some(),
+                    !keys_values,
+                    !keys_values && post_norm_epsilon.is_some(),
                     operands,
                     |kind| weight(graph, load, scope, kind, weights),
                 )?;
@@ -446,7 +463,7 @@ impl BlockSublayers<'_> {
                         post_norm_epsilon: post_norm_epsilon.unwrap_or_default() as f32,
                         post_norm_scale: output_scales.mixer,
                         activation: activation(geometry),
-                        inject_only: false,
+                        inject_only: keys_values,
                         // A head's rows read target history and append
                         // nowhere.
                         causal_cache: self.lane == BlockLane::Target,
@@ -473,10 +490,12 @@ impl BlockSublayers<'_> {
                         .transpose()?,
                     },
                 )?;
-                (
-                    mixed,
-                    BlockStatePorts::Attention(ports.planes, ports.indexer),
-                    BlockControlPorts::Attention {
+                let controls = match keys_values {
+                    true => BlockControlPorts::Append {
+                        coordinates: controls.coordinates,
+                        destinations: controls.destinations,
+                    },
+                    false => BlockControlPorts::Attention {
                         coordinates: controls.coordinates,
                         visible: controls.visible.ok_or("attention visibility is absent")?,
                         fresh: controls.fresh.ok_or("attention fresh rows are absent")?,
@@ -484,6 +503,11 @@ impl BlockSublayers<'_> {
                         history_tiles: controls.history_tiles,
                         indexer: controls.indexer,
                     },
+                };
+                (
+                    mixed,
+                    BlockStatePorts::Attention(ports.planes, ports.indexer),
+                    controls,
                 )
             }
             (Mixer::GatedDelta(shape), MixerEntries::Recurrent(entries)) => {

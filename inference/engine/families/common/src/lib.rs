@@ -14,4 +14,4 @@ mod tensors;
 pub use error::HeaderError;
 pub use inputs::TextInput;
 pub use metadata::{Metadata, architecture_keys};
-pub use tensors::Tensors;
+pub use tensors::{readout_head, Tensors};

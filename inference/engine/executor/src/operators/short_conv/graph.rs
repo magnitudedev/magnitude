@@ -444,6 +444,7 @@ mod tests {
             projector: None,
         };
         let definition = ModelDefinition {
+            decision: None,
             family: FamilyId("lfm2-shaped".into()),
             artifact_identity: identity,
             inputs: InputSemantics { coordinate_axes: 1 },

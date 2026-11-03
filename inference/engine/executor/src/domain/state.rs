@@ -2,9 +2,23 @@
 
 use super::*;
 use crate::memory::{ClaimId, HoldingClass};
+use std::cell::RefCell;
 use magnitude_state::{
     GrowthChoice, Holder, RowDemand, ShrinkPolicy, StateHoldingCensus, StoreCopy,
 };
+
+/// A heap claim ([`ExecutorDomain::claim_device_growth`]), held until it is
+/// dropped: whatever path its holder takes, dropping releases it once.
+pub(crate) struct HeldClaim {
+    heap: Rc<RefCell<DeviceHeap>>,
+    id: ClaimId,
+}
+
+impl Drop for HeldClaim {
+    fn drop(&mut self) {
+        self.heap.borrow_mut().release(self.id);
+    }
+}
 
 /// A comparison with Seismic's logical allocation charge. `unattributed`
 /// remains explicit for storage without a classified owner. `stores` also
@@ -172,6 +186,35 @@ impl StoreCensus {
 }
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
+    /// The barriers of a target group's layer-major launch
+    /// (`LayerMajor::barriers`) in `pool`'s class, their held rows claimed
+    /// from the heap like any growth; none for a group computed in one
+    /// launch or whose rows read no later chunk's.
+    pub(super) fn allocate_barriers(
+        &mut self,
+        operations: &[Operation],
+        pool: crate::PoolClass,
+    ) -> Result<Option<crate::Barriers>, DomainError> {
+        let ([operation], crate::PoolClass::Target(class)) = (operations, pool) else {
+            return Ok(None);
+        };
+        let chunks = self.target_chunks(operation.row_count()).len();
+        let blocks = self
+            .layer_barriers(operation.request())
+            .map_err(DomainError::Input)?;
+        if chunks == 1 || blocks.is_empty() {
+            return Ok(None);
+        }
+        let elements = self
+            .held_elements(&blocks, chunks, class)
+            .map_err(DomainError::invariant)?;
+        let claim = self.claim_device_growth(elements * 4, 0, HoldingClass::Live)?;
+        let held = Tensor::zeros(self.domain.device(), seismic::Element::f32(), &[elements]);
+        drop(claim);
+        let held = held.map_err(|error| DomainError::Input(error.to_string()))?;
+        Ok(Some(crate::Barriers { blocks, held }))
+    }
+
     pub(super) fn allocate_boundary(&mut self) -> Result<FeatureRef, DomainError> {
         let head = self.definition.head.as_ref();
         let decoder = &self.definition.decoder;
@@ -184,7 +227,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let bytes = self.head_conditioning_bytes() as u64;
         let claim = self.claim_device_growth(bytes, 0, HoldingClass::Live)?;
         let tensor = Tensor::zeros(self.domain.device(), element, &[1, width]);
-        self.release_claim(claim);
+        drop(claim);
         let tensor = tensor.map_err(|error| DomainError::Input(error.to_string()))?;
         self.domain
             .publish_features(tensor)
@@ -459,12 +502,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Ok(());
         }
         self.orphan_lookahead(bindings)?;
-        for operation in operations {
-            if let Operation::Forward { request, .. } | Operation::Head { request, .. } = operation
-            {
-                self.relocate_tails(bindings, *request)?;
-            }
-        }
+        self.relocate_tails(bindings, operations)?;
         let mut target = Vec::new();
         let mut head = Vec::new();
         // A continuable step also queues its lookahead, which follows it by
@@ -494,7 +532,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     if let Some(state) = self.target.get(request) {
                         let ahead = next.as_ref().map_or(0, Operation::row_count);
                         target.extend(state.demands(rows + ahead));
-                        target_banks += 1 + usize::from(ahead != 0);
+                        // An advance computed in chunks holds an interim bank.
+                        let chunked = self.target_chunks(rows).len() > 1;
+                        target_banks += 1 + usize::from(ahead != 0) + usize::from(chunked);
                     }
                 }
                 Operation::Head { request, .. } => {
@@ -604,7 +644,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .vision_graph_mut()
                 .expect("the vision graph was found above"),
         );
-        self.release_claim(claim);
+        drop(claim);
         grown.map_err(|growth| match growth {
             crate::resources::VisionGrowth::Class(error) => {
                 DomainError::invariant(format!("vision class was not prepared: {error}"))
@@ -636,7 +676,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .retained_outputs_mut(lane)
             .expect("the pool was found above")
             .grow_output();
-        self.release_claim(claim);
+        drop(claim);
         grown.map_err(|error| growth_failure(error, bytes, "graph output growth"))?;
         self.refresh_memory()?;
         self.sync_static_holding().map_err(DomainError::Input)
@@ -681,9 +721,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 }
             };
             let provisioned = store.provision_with_growth(demands, banks, choice);
-            if let Some(claim) = claim {
-                self.release_claim(claim);
-            }
+            drop(claim);
             match provisioned {
                 Ok(()) => {
                     self.refresh_memory()?;
@@ -717,19 +755,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// Claim the peak new charge of one physical operation from the heap:
     /// `required` device bytes, of which a dedicated device stages `staged`
-    /// through host RAM. The caller releases the claim once Seismic has
-    /// measured the operation's result.
+    /// through host RAM. The caller drops the claim, releasing it, once
+    /// Seismic has measured the operation's result.
     pub(super) fn claim_device_growth(
         &mut self,
         required: u64,
         staged: u64,
         class: HoldingClass,
-    ) -> Result<ClaimId, DomainError> {
-        Ok(self.memory.borrow_mut().claim(required, staged, class)?)
-    }
-
-    pub(super) fn release_claim(&mut self, claim: ClaimId) {
-        self.memory.borrow_mut().release(claim);
+    ) -> Result<HeldClaim, DomainError> {
+        let id = self.memory.borrow_mut().claim(required, staged, class)?;
+        Ok(HeldClaim {
+            heap: Rc::clone(&self.memory),
+            id,
+        })
     }
 
     /// Whether the heap would grant a peak of `required` device bytes, of
@@ -743,30 +781,41 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(self.memory.borrow_mut().check(required, staged)?)
     }
 
-    /// Before a request's next launch reserves rows, relocate the partial
-    /// last page of each of its target and head histories that a sibling
-    /// fork continued (`magnitude_state::OwnedTailRelocation`), so every
-    /// history keeps growing within its span limit. A relocation copies
-    /// less than one page into one free page; without memory for that page
-    /// the request fails with a capacity error before any launch.
-    /// Moving rows changes bindings: a queued lookahead is orphaned before
-    /// the first relocation.
+    /// Before a launch reserves rows, relocate the partial last page of each
+    /// of its requests' target and head histories that cannot grow in place
+    /// (`magnitude_state::OwnedTailRelocation`): one another history
+    /// continued, or a live sibling fork ends at too. Siblings relocate in
+    /// launch order and the last keeps growing in place, so sibling forks of
+    /// one state share a launch and every history keeps growing within its
+    /// span limit. A relocation copies less than one page into one free
+    /// page; without memory for that page the launch fails with a capacity
+    /// error before it is submitted. Moving rows changes bindings: a queued
+    /// lookahead is orphaned before the first relocation.
     pub(super) fn relocate_tails(
         &mut self,
         bindings: &mut StateBindings<F>,
-        request: RequestId,
+        operations: &[Operation],
     ) -> Result<(), DomainError> {
         if !self.family.state_is_bound() {
             return Ok(());
         }
-        self.relocate_store_tails(bindings, request, false)?;
-        self.relocate_store_tails(bindings, request, true)
+        let requests = operations
+            .iter()
+            .filter_map(|operation| match operation {
+                Operation::Forward { request, .. } | Operation::Head { request, .. } => {
+                    Some(*request)
+                }
+                Operation::Encode { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        self.relocate_store_tails(bindings, &requests, false)?;
+        self.relocate_store_tails(bindings, &requests, true)
     }
 
     fn relocate_store_tails(
         &mut self,
         bindings: &mut StateBindings<F>,
-        request: RequestId,
+        requests: &[RequestId],
         head: bool,
     ) -> Result<(), DomainError> {
         let store = if head {
@@ -777,32 +826,34 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         } else {
             self.target_store.clone()
         };
-        // `provision` resolved the lookahead: only another history can block.
-        let Some(state) = self.lane_states(head).get(&request) else {
-            return Ok(());
-        };
-        let demands = state.relocation_demands();
-        if demands.is_empty() {
-            return Ok(());
-        }
-        self.grant_state_growth(bindings, head, &demands, 0)?;
-        for demand in demands {
-            let state = self
-                .lane_states(head)
-                .remove(&request)
-                .expect("state checked above");
-            let relocation = match OwnedTailRelocation::prepare(state, demand.domain) {
-                Ok(relocation) => relocation,
-                Err((state, error)) => {
-                    self.lane_states(head).insert(request, state);
-                    return Err(error.into());
-                }
+        for &request in requests {
+            // `provision` resolved the lookahead: only another history can block.
+            let Some(state) = self.lane_states(head).get(&request) else {
+                continue;
             };
-            if let Err(error) = self.submit_store_copy(&store, relocation.copy()) {
-                self.lane_states(head).insert(request, relocation.abort());
-                return Err(error);
+            let demands = state.relocation_demands();
+            if demands.is_empty() {
+                continue;
             }
-            self.lane_states(head).insert(request, relocation.commit());
+            self.grant_state_growth(bindings, head, &demands, 0)?;
+            for demand in demands {
+                let state = self
+                    .lane_states(head)
+                    .remove(&request)
+                    .expect("state checked above");
+                let relocation = match OwnedTailRelocation::prepare(state, demand.domain) {
+                    Ok(relocation) => relocation,
+                    Err((state, error)) => {
+                        self.lane_states(head).insert(request, state);
+                        return Err(error.into());
+                    }
+                };
+                if let Err(error) = self.submit_store_copy(&store, relocation.copy()) {
+                    self.lane_states(head).insert(request, relocation.abort());
+                    return Err(error);
+                }
+                self.lane_states(head).insert(request, relocation.commit());
+            }
         }
         Ok(())
     }

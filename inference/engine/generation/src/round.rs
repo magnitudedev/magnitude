@@ -34,6 +34,7 @@ impl RoundForward {
             select: self.selects,
             committed: self.committed,
             prime: self.prime,
+            readouts: Vec::new(),
         };
         operation.validate().map_err(|error| error.to_string())?;
         Ok(operation)

@@ -7,12 +7,15 @@ license.workspace = true
 [dependencies]
 magnitude-artifacts = { path = "artifacts" }
 magnitude-chat = { path = "chat" }
+magnitude-decision = { path = "decision" }
 magnitude-generation = { path = "generation" }
+magnitude-readout = { path = "readout" }
 magnitude-grammar = { path = "grammar" }
 magnitude-scheduler = { path = "scheduler" }
 magnitude-templates = { path = "templates" }
 magnitude-batching = { path = "batching" }
 magnitude-family-contracts = { path = "families/contracts" }
+magnitude-family-common = { path = "families/common" }
 magnitude-executor = { path = "executor" }
 magnitude-family-qwen35 = { path = "families/qwen35" }
 magnitude-family-qwen4exp = { path = "families/qwen4exp" }

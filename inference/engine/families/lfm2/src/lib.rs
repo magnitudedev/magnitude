@@ -496,6 +496,7 @@ pub fn inspect_components(
     }
     tensors.finish()?;
     let definition = ModelDefinition {
+        decision: None,
         family: FamilyId(family_id.into()),
         artifact_identity: identity,
         inputs: InputSemantics { coordinate_axes: 1 },

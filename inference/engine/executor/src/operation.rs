@@ -1,7 +1,44 @@
 use crate::batching::Demand;
 use crate::{ConditioningRef, FeatureRef, ImageRef, LogitsRef};
 pub use magnitude_artifacts::TokenId;
+use magnitude_readout::{Readout, ReadoutKind};
 use std::{fmt, sync::Arc};
+
+/// The readout kinds a load computes at chosen rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadoutSupport {
+    /// Logits of chosen tokens, through the attested selected-row projection
+    /// of the packed output projection the plan binds for a model whose
+    /// readouts read them (`ReadoutBinding::logits`).
+    pub logits: bool,
+    /// The model's readout head.
+    pub head: bool,
+    /// Scores of retained rows.
+    pub scores: bool,
+}
+
+impl ReadoutSupport {
+    /// Why the load cannot compute readouts of `kind`, or `None` when it can.
+    pub fn refusal(&self, kind: &ReadoutKind) -> Option<&'static str> {
+        match kind {
+            ReadoutKind::Logits { .. } if !self.logits => {
+                Some("this load reads no logits at chosen rows")
+            }
+            ReadoutKind::Head if !self.head => Some("this load reads no readout head"),
+            ReadoutKind::Scores { .. } if !self.scores => Some("this load reads no scores"),
+            ReadoutKind::Logits { .. } | ReadoutKind::Head | ReadoutKind::Scores { .. } => None,
+        }
+    }
+}
+
+/// The row whose step answers `readout`: its own, or for scores the last
+/// row they read, whose step holds every state they read.
+pub fn answer_row(readout: &Readout) -> usize {
+    match &readout.kind {
+        ReadoutKind::Scores { rows } => readout.row.max(rows.end - 1),
+        ReadoutKind::Logits { .. } | ReadoutKind::Head => readout.row,
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProgramIdentity(Arc<str>);
@@ -240,6 +277,10 @@ pub enum Operation {
         /// A prompt chunk's entry into a separate drafter, drafted on the
         /// device right behind the chunk from the chunk's own features.
         prime: Option<Priming>,
+        /// Values read at rows of a prompt-only chunk, in the order of the
+        /// rows that answer them (`answer_row`). Present exactly when
+        /// `demand` carries `Demand::READOUT`.
+        readouts: Vec<Readout>,
     },
     /// One drafter transaction. The entry rows pair each accepted token with
     /// the target's feature of the preceding row (`conditioning`, in row
@@ -425,10 +466,12 @@ impl Operation {
             Self::Forward {
                 kind,
                 tokens,
+                position,
                 demand,
                 select,
                 committed,
                 prime,
+                readouts,
                 ..
             } => {
                 if *committed == 0 || *committed > tokens.len() {
@@ -438,6 +481,7 @@ impl Operation {
                     });
                 }
                 validate_forward_select(*kind, tokens.len(), *demand, select)?;
+                validate_readouts(*kind, *position, tokens.len(), *committed, *demand, select, readouts)?;
                 if let Some(prime) = prime {
                     let closed_prefix = !prime.boundary
                         || (prime.tokens == *tokens
@@ -509,6 +553,42 @@ fn validate_forward_select(
     Ok(())
 }
 
+/// A readout chunk is a committed prompt chunk that selects nothing; its
+/// readouts are answered at rows inside it (`answer_row`), in row order.
+/// What each reads was validated with its plan (`ReadoutSequence::new`).
+fn validate_readouts(
+    kind: WorkKind,
+    position: usize,
+    rows: usize,
+    committed: usize,
+    demand: Demand,
+    select: &[SelectSpec],
+    readouts: &[Readout],
+) -> Result<(), OperationError> {
+    if demand.contains(Demand::READOUT) == readouts.is_empty() {
+        return Err(OperationError::Readout);
+    }
+    if readouts.is_empty() {
+        return Ok(());
+    }
+    let inside = readouts
+        .iter()
+        .map(answer_row)
+        .all(|row| row >= position && row - position < rows);
+    let ordered = readouts
+        .windows(2)
+        .all(|pair| answer_row(&pair[0]) <= answer_row(&pair[1]));
+    if kind != WorkKind::Prefill
+        || committed != rows
+        || !select.is_empty()
+        || !inside
+        || !ordered
+    {
+        return Err(OperationError::Readout);
+    }
+    Ok(())
+}
+
 fn validate_select(select: &SelectSpec) -> Result<(), OperationError> {
     select
         .shaping
@@ -561,6 +641,7 @@ pub enum OperationError {
         bytes: usize,
         rows: usize,
     },
+    Readout,
 }
 
 impl fmt::Display for OperationError {
@@ -609,6 +690,10 @@ impl fmt::Display for OperationError {
                 formatter,
                 "head conditioning has {count} rows for {rows} token rows",
             ),
+            Self::Readout => formatter.write_str(
+                "readouts are answered at ordered rows of a committed, unselecting prompt chunk \
+                 and carry the readout demand",
+            ),
             Self::FeatureRows { bytes, rows } => write!(
                 formatter,
                 "{bytes} bytes are not {rows} nonempty equal feature rows, or the rows differ in width",
@@ -625,14 +710,17 @@ pub struct Selected {
     pub status: u8,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct RowResult {
     pub selected: Option<Selected>,
     pub features: Option<FeatureRef>,
     pub logits: Option<LogitsRef>,
+    /// A readout row's values on the host: per readout of the row, in the
+    /// operation's order, its values in that readout's order.
+    pub readouts: Vec<Vec<f32>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Outcome {
     Forward {
         rows: Vec<RowResult>,

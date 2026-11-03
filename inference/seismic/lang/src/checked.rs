@@ -1731,7 +1731,100 @@ impl NativeScratch {
     }
 }
 
+/// Every choice of one index per list of `lengths` items, in a fixed order
+/// (the first list's index varying fastest): one empty choice for no lists,
+/// none when a list is empty.
+pub fn index_combinations(lengths: &[usize]) -> impl Iterator<Item = Vec<usize>> + '_ {
+    (0..lengths.iter().product::<usize>()).map(move |mut ordinal| {
+        lengths
+            .iter()
+            .map(|&length| {
+                let index = ordinal % length;
+                ordinal /= length;
+                index
+            })
+            .collect()
+    })
+}
+
 impl NativeImplementation {
+    /// Every dimension name a launch condition reads.
+    pub fn launch_dimensions(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for condition in self.launches.iter().filter_map(|launch| launch.when.as_ref()) {
+            condition.dimensions(&mut names);
+        }
+        names
+    }
+
+    /// The launches a call at `dimension` dispatches under every tuning
+    /// choice the launch conditions read: per choice (the product of those
+    /// parameters' declared values, a launch's own parameter where it
+    /// scopes the name, in one fixed order), whether each launch is active.
+    /// A specialization fixes one choice for every call, so two calls fire
+    /// the same launches under every specialization exactly when their
+    /// activities are equal.
+    pub fn launch_activity(
+        &self,
+        dimension: &impl Fn(&str) -> Option<u64>,
+    ) -> Result<Vec<bool>, NativeEvalError> {
+        // The parameter a launch's condition reads by `name`: in the
+        // launch's own scope, or the entry's.
+        let scope = |ordinal: usize, name: &str| {
+            self.launches[ordinal]
+                .params
+                .iter()
+                .any(|parameter| parameter.name == name)
+                .then_some(ordinal)
+        };
+        let mut read: Vec<(Option<usize>, &NativeParameter)> = Vec::new();
+        for (ordinal, launch) in self.launches.iter().enumerate() {
+            let mut names = Vec::new();
+            if let Some(condition) = &launch.when {
+                condition.parameters(&mut names);
+            }
+            for name in names {
+                let scoped = scope(ordinal, &name);
+                let declared = match scoped {
+                    Some(_) => &launch.params,
+                    None => &self.params,
+                };
+                let parameter = declared
+                    .iter()
+                    .find(|parameter| parameter.name == name && !parameter.values.is_empty())
+                    .ok_or_else(|| NativeEvalError::Unbound(name.clone()))?;
+                if !read
+                    .iter()
+                    .any(|(owner, known)| *owner == scoped && known.name == name)
+                {
+                    read.push((scoped, parameter));
+                }
+            }
+        }
+        let lengths = read
+            .iter()
+            .map(|(_, parameter)| parameter.values.len())
+            .collect::<Vec<_>>();
+        let mut activity = Vec::new();
+        for digits in index_combinations(&lengths) {
+            for (ordinal, launch) in self.launches.iter().enumerate() {
+                activity.push(match &launch.when {
+                    None => true,
+                    Some(condition) => condition.holds(dimension, &|name| {
+                        let scoped = scope(ordinal, name);
+                        read.iter()
+                            .zip(&digits)
+                            .find(|((owner, parameter), _)| {
+                                *owner == scoped && parameter.name == name
+                            })
+                            .map(|((_, parameter), &digit)| parameter.values[digit])
+                    })?,
+                });
+            }
+        }
+        Ok(activity)
+    }
+
     /// Whether preparation must choose any declared tuning parameter, either
     /// for the entry as a whole or for an individual launch.
     pub fn has_tuning_parameters(&self) -> bool {
@@ -2936,6 +3029,30 @@ mod native_tests {
             refused.contains("`repeat` is not implemented for cuda"),
             "{refused}"
         );
+    }
+
+    /// A call's launch activity holds, per tuning choice the conditions
+    /// read, which launches it dispatches: equal at two dimension values
+    /// exactly when every choice dispatches the same launches at both.
+    #[test]
+    fn launch_activity_compares_launches_under_every_tuning_choice() {
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "scale.seismic".into(),
+            text: "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (TALL in [0, 1])\n    launch small when N <= 64:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch wide when N > 64 and TALL == 0:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch tall when N > 64 and TALL == 1:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n".into(),
+        }]))
+        .unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let at = |rows: u64| {
+            native
+                .launch_activity(&|name| (name == "N").then_some(rows))
+                .unwrap()
+        };
+        assert_eq!(native.launch_dimensions(), ["N"]);
+        assert_eq!(at(128), [false, true, false, false, false, true]);
+        assert_eq!(at(128), at(512));
+        assert_ne!(at(64), at(128));
     }
 
     /// Terms are names for expressions: a declaration that names them checks

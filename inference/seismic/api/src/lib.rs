@@ -2341,7 +2341,87 @@ impl NativeGraphResourceTemplate {
             })
             .map_err(NativeGraphMetadataError::Workflow)
     }
+
+    /// The launches every node fires at each class of `slice`
+    /// (`NativeImplementation::launch_activity`): per node, its activity at
+    /// every combination of the class dimensions its launch conditions
+    /// read, in the slice's order. Two slices of one regime whose value
+    /// lists correspond fire the same launches at every node under every
+    /// specialization exactly when their launches are equal.
+    pub fn launches(
+        &self,
+        slice: &NativeGraphClassSlice,
+    ) -> Result<NativeGraphLaunches, NativeGraphMetadataError> {
+        let unsupported = NativeGraphMetadataError::Unsupported;
+        let mut known = std::collections::HashMap::<
+            (usize, Option<&'static str>, &[(String, u64)]),
+            Vec<bool>,
+        >::new();
+        let mut nodes = Vec::with_capacity(self.recorder.nodes.len());
+        for source in &self.recorder.nodes {
+            let key = (
+                source.checked.identity(),
+                source.class_scope,
+                source.dimensions.as_slice(),
+            );
+            if let Some(activity) = known.get(&key) {
+                nodes.push(activity.clone());
+                continue;
+            }
+            let implementation = source.checked.implementation();
+            let reads = implementation.launch_dimensions();
+            let varying = source
+                .dimensions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (name, _))| {
+                    reads
+                        .contains(name)
+                        .then(|| slice.values(source.entry_name, source.class_scope, name))
+                        .flatten()
+                        .map(|values| (index, name, values))
+                })
+                .collect::<Vec<_>>();
+            if let Some((_, name, _)) = varying.iter().find(|(_, _, values)| values.is_empty()) {
+                return Err(unsupported(format!(
+                    "`{}`: the class slice lists no value of dimension `{name}`, which its launches read",
+                    source.entry_name
+                )));
+            }
+            let lengths = varying
+                .iter()
+                .map(|(_, _, values)| values.len())
+                .collect::<Vec<_>>();
+            let mut point = source.dimensions.clone();
+            let mut activity = Vec::new();
+            for digits in seismic_lang::checked::index_combinations(&lengths) {
+                for (&(index, _, values), &digit) in varying.iter().zip(&digits) {
+                    point[index].1 = values[digit];
+                }
+                activity.extend(
+                    implementation
+                        .launch_activity(&|name| {
+                            point
+                                .iter()
+                                .find(|(candidate, _)| candidate == name)
+                                .map(|(_, value)| *value)
+                        })
+                        .map_err(|error| {
+                            unsupported(format!("`{}` launches: {error}", source.entry_name))
+                        })?,
+                );
+            }
+            known.insert(key, activity.clone());
+            nodes.push(activity);
+        }
+        Ok(NativeGraphLaunches(nodes))
+    }
 }
+
+/// The launches a graph regime's nodes fire over one class slice
+/// (`NativeGraphResourceTemplate::launches`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeGraphLaunches(Vec<Vec<bool>>);
 
 fn checked_native_scratch_bound(
     scratch_buffers: &[NativeScratch],
@@ -3182,6 +3262,12 @@ impl NativeGraphFamilySlot {
         self.inner
             .activate(&plan.inner)
             .map(|inner| NativeGraphFamilyActive { inner })
+    }
+
+    /// Whether an activation finds an upload region no submission still
+    /// reads.
+    pub fn upload_idle(&self) -> bool {
+        self.inner.upload_idle()
     }
 }
 

@@ -604,7 +604,7 @@ impl<'a> QualificationView<'a> {
             };
             match (readout, binding.head) {
                 (
-                    ReadoutHeadKernels::Packed { head, selected },
+                    ReadoutHeadKernels::Packed { head },
                     ReadoutHead::Packed {
                         weight: element,
                         weight_scale,
@@ -640,22 +640,6 @@ impl<'a> QualificationView<'a> {
                         .map_err(|error| qualification_dynamic("readout_head_rows", &label, error))?
                         .value;
                     require_zero_result(&logits, "readout_head_rows", &label)?;
-                    let rows = semantic_i32(device, &[1], &[0], "readout_selected_rows", &label)?;
-                    let selected_result = selected
-                        .call(readout_selected_rows::Args {
-                            hidden: &exit_rows,
-                            norm: &norm,
-                            weight: &weight,
-                            out_rows: &out_rows,
-                            selected: &rows,
-                            epsilon: 1.0e-5,
-                            softcap: 0.0,
-                        })
-                        .map_err(|error| {
-                            qualification_dynamic("readout_selected_rows", &label, error)
-                        })?
-                        .value;
-                    require_zero_result(&selected_result, "readout_selected_rows", &label)?;
                 }
                 _ => {
                     return Err(qualification_dynamic(
@@ -664,6 +648,31 @@ impl<'a> QualificationView<'a> {
                         "the prepared head differs from the planned head",
                     ));
                 }
+            }
+            if let (Some(element), Some(selected)) =
+                (binding.logits, &self.programs.target.readout.logits)
+            {
+                let weight = semantic_zeros(
+                    device,
+                    element,
+                    &[vocabulary, hidden],
+                    "target_readout",
+                    &label,
+                )?;
+                let rows = semantic_i32(device, &[1], &[0], "readout_selected_rows", &label)?;
+                let selected_result = selected
+                    .call(readout_selected_rows::Args {
+                        hidden: &exit_rows,
+                        norm: &norm,
+                        weight: &weight,
+                        out_rows: &out_rows,
+                        selected: &rows,
+                        epsilon: 1.0e-5,
+                        softcap: 0.0,
+                    })
+                    .map_err(|error| qualification_dynamic("readout_selected_rows", &label, error))?
+                    .value;
+                require_zero_result(&selected_result, "readout_selected_rows", &label)?;
             }
         }
 

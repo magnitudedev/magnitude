@@ -1,4 +1,4 @@
-//! What the Qwen families share: the metadata reader, the decoder geometry of
+//! What the Qwen families share: the decoder geometry of
 //! the Qwen 3.5 lineage and the builders of its sublayers (attention with an
 //! interleaved gate, gated delta, dense and routed feed-forward), the Qwen3-VL
 //! projector description and the input adapter. A family names its own
@@ -11,10 +11,10 @@ mod projector;
 pub use projector::describe_projector;
 
 use magnitude_artifacts::{
-    gguf::{Directory, Element, Scalar, Value},
+    gguf::{Directory, Element, Value},
     UnsupportedReason,
 };
-use magnitude_family_common::architecture_keys;
+pub use magnitude_family_common::Metadata;
 use magnitude_family_contracts::{
     ActivationFunction, Attention, AttentionGate, DenseFfn, ExpertSelection, FeedForwardUp,
     GateFunction, GatedDelta, HeadNorm, HistoryDomain, HistoryReads, KeyValue, MediaRowAttention,
@@ -33,91 +33,6 @@ pub fn product(dimensions: &[u64]) -> Result<u64, Error> {
 
 /// Binds a block's weight by its name within the block.
 pub type Weight<'a> = dyn FnMut(&str, &[u64]) -> Result<WeightDescriptor, Error> + 'a;
-
-/// Metadata of one family, read under its `{family}.` prefix.
-pub struct Metadata<'a> {
-    pub directory: &'a Directory,
-    pub prefix: String,
-}
-
-impl<'a> Metadata<'a> {
-    /// Reads `family.*` keys, refusing every one outside `keys` as
-    /// unrecognized metadata.
-    pub fn new(directory: &'a Directory, family: &str, keys: &[&str]) -> Result<Self, Error> {
-        let unknown = architecture_keys(directory, family)
-            .filter(|(key, _)| !keys.contains(key))
-            .map(|(_, entry)| entry.name.clone())
-            .collect::<Vec<_>>();
-        if !unknown.is_empty() {
-            let detail = format!("unknown Qwen metadata {unknown:?}");
-            return Err(Error::unsupported(
-                unknown
-                    .into_iter()
-                    .map(|key| UnsupportedReason::UnrecognizedMetadata { key })
-                    .collect(),
-                detail,
-            ));
-        }
-        Ok(Metadata {
-            directory,
-            prefix: format!("{family}."),
-        })
-    }
-    /// The full metadata name of `key`.
-    pub fn key(&self, key: &str) -> String {
-        format!("{}{key}", self.prefix)
-    }
-
-    /// A required key: a header without it does not describe a model of
-    /// the family.
-    pub fn value(&self, key: &str) -> Result<&Value, Error> {
-        let key = self.key(key);
-        self.directory
-            .value(&key)
-            .ok_or_else(|| {
-                let detail = format!("missing Qwen metadata {key}");
-                Error::missing_metadata(key, detail)
-            })
-    }
-    pub fn optional(&self, key: &str) -> Option<&Value> {
-        self.directory.value(&self.key(key))
-    }
-    /// A key present with a value outside what its reader admits.
-    pub fn malformed(&self, key: &str, expected: &str) -> Error {
-        let key = self.key(key);
-        let detail = format!("{key} must be {expected}");
-        Error::metadata(key, detail)
-    }
-    pub fn integer(&self, key: &str) -> Result<u64, Error> {
-        self.value(key)?
-            .unsigned()
-            .filter(|n| *n > 0)
-            .ok_or_else(|| self.malformed(key, "a positive integer"))
-    }
-    pub fn number(&self, key: &str) -> Result<f64, Error> {
-        match self.value(key)? {
-            Value::Scalar(Scalar::Float(n)) => Ok(*n),
-            Value::Scalar(Scalar::Unsigned(n)) => Ok(*n as f64),
-            Value::Scalar(Scalar::Signed(n)) => Ok(*n as f64),
-            _ => Err(self.malformed(key, "numeric")),
-        }
-    }
-    /// An array of nonnegative integers.
-    pub fn integers(&self, key: &str) -> Result<Vec<u64>, Error> {
-        let Value::Array(values) = self.value(key)? else {
-            return Err(self.malformed(key, "an integer array"));
-        };
-        values
-            .iter()
-            .map(|value| match value {
-                Element::Unsigned(n) => Some(n),
-                Element::Signed(n) => u64::try_from(n).ok(),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| self.malformed(key, "an array of nonnegative integers"))
-    }
-}
 
 /// The keys [`Geometry::read`] interprets in every Qwen 3.5 lineage
 /// artifact. `rope.scaling.type` is read to refuse scaled rotary.
@@ -160,12 +75,15 @@ pub const MIXER_KEYS: &[&str] = &["attention.recurrent_layers", "full_attention_
 /// `block_count` stored blocks. More than one is not admitted until its GGUF
 /// roles and execution semantics are qualified.
 pub fn prediction_blocks(m: &Metadata, block_count: u64) -> Result<u64, Error> {
-    match m.optional("nextn_predict_layers") {
+    match m.value("nextn_predict_layers") {
         None => Ok(0),
         Some(value) => value
             .unsigned()
             .filter(|layers| *layers <= 1 && *layers < block_count)
-            .ok_or_else(|| m.malformed("nextn_predict_layers", "at most one prediction layer")),
+            .ok_or_else(|| {
+                m.malformed("nextn_predict_layers", "at most one prediction layer")
+                    .into()
+            }),
     }
 }
 
@@ -213,7 +131,7 @@ pub fn mixer_kinds(
             })
             .collect()
     };
-    let Some(flags) = m.optional(FLAGS) else {
+    let Some(flags) = m.value(FLAGS) else {
         return Ok(by_interval(m.integer("full_attention_interval")?));
     };
     let flags = match flags {
@@ -229,11 +147,16 @@ pub fn mixer_kinds(
     .ok_or_else(|| m.malformed(FLAGS, "an array of booleans"))?;
     let blocks = layer_count + predictions;
     if flags.len() as u64 != blocks {
-        return Err(m.malformed(FLAGS, &format!("one flag for each of the {blocks} blocks")));
+        return Err(Error::metadata(
+            m.key(FLAGS),
+            format!("{} must be one flag for each of the {blocks} blocks", m.key(FLAGS)),
+        ));
     }
     let (decoder, prediction) = flags.split_at(layer_count as usize);
     if prediction.iter().any(|recurrent| *recurrent) {
-        return Err(m.malformed(FLAGS, "false for the attention-only prediction blocks"));
+        return Err(m
+            .malformed(FLAGS, "false for the attention-only prediction blocks")
+            .into());
     }
     let kinds = decoder
         .iter()
@@ -245,12 +168,15 @@ pub fn mixer_kinds(
             }
         })
         .collect::<Vec<_>>();
-    if m.optional("full_attention_interval").is_some() {
+    if m.value("full_attention_interval").is_some() {
         let interval = m.integer("full_attention_interval")?;
         if kinds != by_interval(interval) {
-            return Err(m.malformed(
-                FLAGS,
-                &format!("the layer order full_attention_interval {interval} places"),
+            return Err(Error::metadata(
+                m.key(FLAGS),
+                format!(
+                    "{} must be the layer order full_attention_interval {interval} places",
+                    m.key(FLAGS)
+                ),
             ));
         }
     }
@@ -289,7 +215,7 @@ pub struct Geometry {
 impl Geometry {
     pub fn read(m: &Metadata, routed: bool) -> Result<Self, Error> {
         if let Some(scaling) = m
-            .optional("rope.scaling.type")
+            .value("rope.scaling.type")
             .filter(|v| v.string() != Some("none"))
         {
             let kind = scaling.string().unwrap_or("unspecified").to_owned();
@@ -298,20 +224,8 @@ impl Geometry {
                 "scaled Qwen rotary definitions are not yet qualified",
             ));
         }
-        let Value::Array(sections) = m.value("rope.dimension_sections")? else {
-            return Err(Error::invalid(
-                "Qwen rotary sections must contain four integers",
-            ));
-        };
-        let sections = sections
-            .iter()
-            .map(|v| match v {
-                Element::Unsigned(n) => Some(n),
-                Element::Signed(n) => u64::try_from(n).ok(),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()
-            .and_then(|v| <[u64; 4]>::try_from(v).ok())
+        let sections = <[u64; 4]>::try_from(m.counts("rope.dimension_sections")?)
+            .ok()
             .ok_or_else(|| {
                 Error::invalid("Qwen rotary sections must contain four nonnegative integers")
             })?;

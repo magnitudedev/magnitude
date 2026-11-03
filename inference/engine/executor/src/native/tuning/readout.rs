@@ -170,6 +170,9 @@ fn vocabulary_shape(inputs: &ModelInputs<'_>) -> Result<(u64, u64), String> {
 #[derive(Clone)]
 pub(crate) struct HeadRowsTuning {
     pub projection_scope: WeightScope,
+    /// The projection's role: the vocabulary projection (`Output`) or the
+    /// model's readout head (`ReadoutHead`).
+    pub kind: WeightKind,
     pub norm_scope: WeightScope,
     pub norm: Element,
     pub weight: Element,
@@ -217,7 +220,7 @@ impl EntryTuning for HeadRowsTuning {
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (vocabulary, hidden) =
-            projection_shape(inputs, &[self.projection_scope], WeightKind::Output)?;
+            projection_shape(inputs, &[self.projection_scope], self.kind)?;
         let (parts, norm) = inputs.readout_form(self.norm_scope, hidden)?;
         Ok(vec![
             (
@@ -229,7 +232,7 @@ impl EntryTuning for HeadRowsTuning {
             ("NM", norm),
             (
                 "WS",
-                inputs.scale_extent(self.projection_scope, WeightKind::Output)?,
+                inputs.scale_extent(self.projection_scope, self.kind)?,
             ),
         ])
     }
@@ -243,9 +246,9 @@ impl EntryTuning for HeadRowsTuning {
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
     ) -> Result<Vec<Self::Case>, BuildError> {
-        let weight = inputs.weight(self.projection_scope, WeightKind::Output)?;
+        let weight = inputs.weight(self.projection_scope, self.kind)?;
         let [vocabulary, hidden] = weight.extents()[..] else {
-            return Err("the output weight is not a matrix".into());
+            return Err("the projection weight is not a matrix".into());
         };
         let weight = weight
             .slice_leading(0, self.rows.map_or(vocabulary, |rows| rows.min(vocabulary)))
@@ -257,7 +260,7 @@ impl EntryTuning for HeadRowsTuning {
             out_rows: inputs.every_row(point.rows)?,
             weight,
             weight_scale: inputs
-                .unit_scale(inputs.scale_extent(self.projection_scope, WeightKind::Output)?)?,
+                .unit_scale(inputs.scale_extent(self.projection_scope, self.kind)?)?,
             epsilon: self.epsilon,
         }])
     }
@@ -341,6 +344,7 @@ impl EntryTuning for SelectedRowsTuning {
     ) -> Result<Vec<Self::Case>, BuildError> {
         let head = HeadRowsTuning {
             projection_scope: WeightScope::Target,
+            kind: WeightKind::Output,
             norm_scope: WeightScope::Target,
             norm: self.norm,
             weight: self.weight,

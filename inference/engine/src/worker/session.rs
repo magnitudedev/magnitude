@@ -231,6 +231,7 @@ impl Session {
                 )))
             }
             HostMessage::Admit(admission) => self.admit(admission)?,
+            HostMessage::Read { request_id, plan } => self.read(request_id, plan)?,
             HostMessage::Credit {
                 request_id,
                 batches,
@@ -318,6 +319,57 @@ impl Session {
             })?,
         }
         Ok(())
+    }
+
+    /// Admit a readout plan: its one publication arrives on a stream like a
+    /// generation's, with credit for it alone.
+    fn read(
+        &mut self,
+        id: HostRequestId,
+        plan: magnitude_readout::ReadoutPlan,
+    ) -> Result<(), TransportError> {
+        let dispatched = self
+            .bind_plan(plan)
+            .and_then(|plan| self.dispatch(WorkerCommand::Read(plan)).map_err(undispatched));
+        match dispatched {
+            Ok(call) => self.admissions.push(PendingAdmission {
+                id,
+                call,
+                output_capacity: 1,
+                stop: false,
+                cancelled: false,
+            }),
+            Err(error) => self.send(WorkerMessage::AdmissionRefused {
+                request_id: id,
+                error,
+            })?,
+        }
+        Ok(())
+    }
+
+    /// Validate the decoded plan against the loaded definition
+    /// (`ReadoutPlan::validated`).
+    fn bind_plan(
+        &self,
+        plan: magnitude_readout::ReadoutPlan,
+    ) -> Result<magnitude_readout::ReadoutPlan, RequestError> {
+        use magnitude_readout::PlanValidationError;
+        if let Some(cause) = &self.unloading {
+            return Err(RequestError::ModelUnloaded {
+                cause: cause.clone(),
+            });
+        }
+        plan.validated(&self.loaded.definition)
+            .map_err(|error| match error {
+                PlanValidationError::Context { required, limit } => {
+                    RequestError::ContextLengthExceeded { required, limit }
+                }
+                error @ (PlanValidationError::Input(_) | PlanValidationError::Vocabulary) => {
+                    RequestError::InvalidRequest {
+                        reason: error.to_string(),
+                    }
+                }
+            })
     }
 
     /// Validate the decoded input against the loaded definition, instantiate
@@ -557,6 +609,14 @@ impl Session {
                                 prompt_ns: timings.prompt_ns,
                                 predicted_ns: timings.predicted_ns,
                             },
+                        });
+                        finished.insert(id);
+                        break;
+                    }
+                    Poll::Ready(Some(Publication::Read(values))) => {
+                        messages.push(WorkerMessage::Read {
+                            request_id: id,
+                            values,
                         });
                         finished.insert(id);
                         break;

@@ -1,7 +1,8 @@
 //! The official LFM3 1.7B and LFM3-VL 2B GGUF inventories at the catalog's
-//! pinned revision: the hybrid decoder of both and the LFM3-VL tower.
+//! pinned revision: the hybrid decoder of both and the LFM3-VL tower; and
+//! Liquid's published d1-2B on LFM3-VL 2B at its pinned revision, refused.
 
-use magnitude_artifacts::{ArtifactIdentity, PackageIdentity};
+use magnitude_artifacts::{ArtifactIdentity, DecisionError, DecisionMetadata, PackageIdentity};
 use magnitude_family_common::headers;
 use magnitude_family_contracts::{
     AttentionGate, CellReduction, GateFunction, GateGranularity, HistoryDomain, KeyValue,
@@ -162,4 +163,27 @@ fn lfm2_refuses_a_projector() {
     let target = headers::target("lfm2.5-2.6b:gguf:q4");
     let projector = headers::projector("lfm3-vl-2b:gguf:q4-qat");
     assert!(inspect_components(&target, Some(&projector), identity(true)).is_err());
+}
+
+/// `LiquidAI/d1-2B-GGUF`, LFM3-VL 2B converted to answer decisions, as
+/// published (a pinned artifact, not a catalog model), names its decision
+/// type with llama.cpp's keys and carries no decision description: those
+/// keys are its architecture's, which the family refuses, and as a
+/// description it is a non-causal model without a template, refused too.
+#[test]
+fn released_d1_without_a_decision_description_is_refused() {
+    let projector = headers::artifact("d1-2b-mmproj-bf16");
+    for variant in ["d1-2b-q4_k_m", "d1-2b-q8_0"] {
+        let target = headers::artifact(variant);
+        assert!(inspect_components(&target, Some(&projector), identity(true)).is_err());
+        assert_eq!(
+            DecisionMetadata::of(&target),
+            Err(DecisionError::Malformed {
+                key: "lfm3.attention.causal".into(),
+                expected: "true unless the model carries a decision template",
+            })
+        );
+    }
+    let chat = headers::target("lfm3-vl-2b:gguf:q8");
+    assert_eq!(DecisionMetadata::of(&chat), Ok(None));
 }

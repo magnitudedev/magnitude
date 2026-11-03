@@ -91,6 +91,27 @@ results to the host. An empty selection performs state advancement without outpu
 projection; out-of-vocabulary selections fail before tentative state reservation.
 Sampling remains a separate device-side readout and does not consume host logits.
 
+A model may store a readout head, `decision.readout.weight` (`[K, hidden]`,
+F32 or BF16), which every family binds as `DecisionBinding::readout_head` and
+which stays resident in its stored element. A head readout normalizes the row's
+final hidden state as the vocabulary projection does (BF16 activations), takes
+its F32 products with the head on the device, and publishes them in the head's
+element: an F32 head its F32 products, a BF16 head (a BF16 linear layer) its
+products rounded to BF16. Only the `K` values per row reach the host.
+
+A scores readout returns `h · h_j / √d` of a row's final normalized hidden
+state (BF16, as the vocabulary projection reads it) with those of a range of
+rows of its sequence, summed in F32 on the device. A sequence declares the rows
+it will retain before computing them; each step normalizes and copies its
+retained rows into the sequence's store on the device, and the step computing
+the last row a scores readout reads computes the scores from the stores. A
+sequence forked from another reads the source's store too, so shared rows are
+retained once. Only scores reach the host. Only a load of a model whose readouts
+read scores (`DecisionBinding::reads_scores`, which package inspection binds from
+whether its decision description's plans read them) prepares the scores kernel, and it
+seals each scores graph class on first use; every other load prepares and
+reserves nothing for scores and refuses a plan reading them at admission.
+
 ## Packed execution
 
 ```text

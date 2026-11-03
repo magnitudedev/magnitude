@@ -476,18 +476,22 @@ impl<'a> Renderer<'a> {
     /// that consults it: that choice reaches only the output parser and
     /// grammar, never the template's input.
     fn prepare(&self, request: &ChatRequest) -> Result<Prompt, String> {
-        let prompt = self
+        let (native, _) = self
             .host
             .templates()
             .prepare(request, &TemplateSelection::default())
-            .map(|(native, _)| native.description().prompt.clone())
             .map_err(|error| error.to_string())?;
-        let tokens = self.host.tokenizer().encode_sequence(&prompt)?.tokens;
+        let description = native.description();
+        let tokens = self
+            .host
+            .tokenizer()
+            .encode_sequence_controlled(&description.prompt, &description.controls)?
+            .tokens;
         if tokens.is_empty() {
             return Err("the chat template produced no input tokens".into());
         }
         Ok(Prompt {
-            text: prompt,
+            text: description.prompt.clone(),
             tokens,
         })
     }

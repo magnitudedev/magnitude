@@ -10,6 +10,7 @@ mod execution_plan;
 mod imports;
 pub(crate) use imports::{ImportBacking, ImportPlan};
 mod programs;
+pub(crate) use programs::computes_layer_major;
 mod resources;
 mod weights;
 
@@ -64,11 +65,11 @@ pub(crate) mod tests {
         gguf::{Encoding, TensorDescriptor},
     };
     use magnitude_family_contracts::{
-        ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
-        EmbeddingScale, EntryForm, ExitForm, ExitNorm, FeedForwardUp, GateFunction, HeadNorm,
-        HistoryDomain, HistoryReads, InputNorm, InputSemantics, KeyValue, MediaRowAttention,
-        ModelDefinition, Operator, OutputForm, ResidualForm, RmsNorm, Rotary, Sublayer,
-        SublayerIndex, ValueNorm, ValueSource, WeightDescriptor, WeightKind, WeightRole,
+        ActivationDType, ActivationFunction, Attention, AttentionGate, Block, DecisionBinding,
+        Decoder, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, FeedForwardUp,
+        GateFunction, HeadNorm, HistoryDomain, HistoryReads, InputNorm, InputSemantics, KeyValue,
+        MediaRowAttention, ModelDefinition, Operator, OutputForm, ResidualForm, RmsNorm, Rotary,
+        Sublayer, SublayerIndex, ValueNorm, ValueSource, WeightDescriptor, WeightKind, WeightRole,
         WeightScope,
     };
     use magnitude_state::KvCodec;
@@ -186,6 +187,21 @@ pub(crate) mod tests {
         WeightDescriptor::stored(name, shape)
     }
 
+    /// A decision binding, causal or not, with no readout head, reading
+    /// neither logits nor scores.
+    fn decision_binding(causal: bool) -> DecisionBinding {
+        DecisionBinding {
+            metadata: magnitude_artifacts::DecisionMetadata::new(
+                "{{ state }}".into(),
+                causal,
+                Default::default(),
+            ),
+            readout_head: None,
+            reads_logits: false,
+            reads_scores: false,
+        }
+    }
+
     /// The smallest geometry every native kernel admits: hidden and
     /// feed-forward widths a multiple of 64 (CUDA K1 k-blocks), an attention
     /// head width a multiple of 32 (attention lanes), and two query heads
@@ -238,6 +254,7 @@ pub(crate) mod tests {
             down: descriptor("down", &[HIDDEN, FEATURES]),
         };
         ModelDefinition {
+            decision: None,
             family: magnitude_family_contracts::FamilyId("resource-fixture".into()),
             artifact_identity: PackageIdentity {
                 target: ArtifactIdentity([7; 32]),
@@ -351,6 +368,204 @@ pub(crate) mod tests {
             ModelLoadPlan::derive(&manifest, &definition, selection, seismic::Layout::Rows32)
                 .unwrap();
         assert_eq!(fallback, plain);
+    }
+
+    /// Only a model whose attention was trained non-causal computes layer-
+    /// major, so only its global-history attention block carries the
+    /// key-and-value projection whose kernel and graph class a load
+    /// prepares; a chat model and a causal decision model carry none. A load
+    /// reads scores exactly when its model's readouts read them, whatever
+    /// its attention.
+    #[test]
+    fn only_non_causal_models_plan_a_key_and_value_projection() {
+        let planned = |decision: Option<bool>, reads_scores: bool| {
+            let mut definition = fixture_definition();
+            definition.decision = decision.map(|causal| DecisionBinding {
+                reads_scores,
+                ..decision_binding(causal)
+            });
+            let manifest = fixture_manifest(&definition);
+            let selection = ComponentSelection {
+                head: false,
+                vision: false,
+            };
+            let load =
+                ModelLoadPlan::derive(&manifest, &definition, selection, seismic::Layout::Rows32)
+                    .unwrap();
+            let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
+            let blocks = plan.target().blocks();
+            (
+                blocks
+                    .iter()
+                    .filter(|block| block.keys_values().is_some())
+                    .count(),
+                plan.target().readout().scores,
+                computes_layer_major(&definition),
+            )
+        };
+        let causal = Err("needs a model whose attention was trained non-causal");
+        assert_eq!(planned(None, false), (0, false, causal));
+        assert_eq!(planned(Some(true), false), (0, false, causal));
+        assert_eq!(planned(Some(false), false), (1, false, Ok(())));
+        assert_eq!(planned(Some(false), true), (1, true, Ok(())));
+    }
+
+    /// A Q8_0 output projection is offered as progressive views, which a
+    /// load may store in place of its packed form, only when every reader
+    /// of it reads them: a model whose readouts read logits of chosen tokens
+    /// reads them through the selected-row projection of the packed form,
+    /// so its projection is never offered as views and a class choice
+    /// storing it as them is refused, while a chat model's is offered as
+    /// before.
+    #[test]
+    fn a_model_reading_chosen_logits_keeps_its_output_projection_packed() {
+        let stored = |reads_logits: bool| {
+            let mut definition = fixture_definition();
+            definition.decision = reads_logits.then(|| DecisionBinding {
+                reads_logits,
+                ..decision_binding(true)
+            });
+            let mut manifest = fixture_manifest(&definition);
+            let output = manifest
+                .target
+                .tensors
+                .iter_mut()
+                .find(|tensor| tensor.name == definition.decoder.exit.output.name)
+                .unwrap();
+            output.encoding = Encoding::Q8_0;
+            output.nbytes = output.shape.iter().product::<u64>() / 32 * 34;
+            let load = ModelLoadPlan::derive(
+                &manifest,
+                &definition,
+                ComponentSelection {
+                    head: false,
+                    vision: false,
+                },
+                resident_layout(crate::ExecutionPath::Native, seismic::BackendName::Metal),
+            )
+            .unwrap()
+            .with_readout_candidates(&definition)
+            .unwrap();
+            let offered = !load.readout_candidates().is_empty();
+            let views = load
+                .finalize_readout(&[crate::ReadoutClassChoice {
+                    scope: WeightScope::Target,
+                    norm_scope: WeightScope::Target,
+                    prepared: false,
+                    rows: vec![1],
+                }])
+                .map(|load| {
+                    matches!(
+                        load.program_plan(&definition, KvCodec::Dense)
+                            .unwrap()
+                            .target()
+                            .readout()
+                            .head,
+                        crate::ReadoutHead::Qualified { .. }
+                    )
+                });
+            (offered, views.ok())
+        };
+        assert_eq!(stored(false), (true, Some(true)));
+        assert_eq!(stored(true), (false, None));
+    }
+
+    /// Logits of chosen tokens are read through `readout_selected_rows`,
+    /// which binds the output projection without an accumulator-scale port:
+    /// a model reading them binds its packed projection for them, and one
+    /// whose projection is stored with a second-level scale is refused when
+    /// its load is planned, while a chat model's load of the same projection
+    /// plans as before, binding no chosen logits.
+    #[test]
+    fn a_model_reading_chosen_logits_refuses_a_scaled_output_projection() {
+        let planned = |reads_logits: bool, scaled: bool| {
+            let mut definition = fixture_definition();
+            definition.decision = reads_logits.then(|| DecisionBinding {
+                reads_logits,
+                ..decision_binding(true)
+            });
+            if scaled {
+                definition.decoder.exit.output.transforms.push(
+                    magnitude_family_contracts::ImportTransform::ScaleByTensor {
+                        tensor: "output.scale".into(),
+                        activations: magnitude_family_contracts::ScaledActivations::Rounded,
+                    },
+                );
+            }
+            let mut manifest = fixture_manifest(&definition);
+            if scaled {
+                let offset = manifest.target.files[0].size;
+                manifest.target.tensors.push(TensorDescriptor {
+                    name: "output.scale".into(),
+                    shape: vec![1],
+                    encoding: Encoding::F32,
+                    offset,
+                    nbytes: 4,
+                });
+                manifest.target.files[0].size += 4;
+            }
+            let selection = ComponentSelection {
+                head: false,
+                vision: false,
+            };
+            ModelLoadPlan::derive(&manifest, &definition, selection, seismic::Layout::Rows32)
+                .unwrap()
+                .program_plan(&definition, KvCodec::Dense)
+                .map(|plan| plan.target().readout().logits)
+        };
+        assert!(matches!(planned(false, false), Ok(None)));
+        assert!(matches!(planned(true, false), Ok(Some(_))));
+        assert!(matches!(planned(false, true), Ok(None)));
+        assert!(matches!(
+            planned(true, true),
+            Err(crate::PlanError::UnportedScale(WeightRole {
+                scope: WeightScope::Target,
+                kind: WeightKind::Output,
+            }))
+        ));
+    }
+
+    /// A load prepares `readout_selected_rows` exactly when it reads chosen
+    /// logits: a chat load of the same model lists no such kernel.
+    #[test]
+    fn a_load_prepares_the_selected_rows_kernel_only_when_it_reads_chosen_logits() {
+        let listed = |reads_logits: bool| {
+            let mut definition = fixture_definition();
+            definition.decision = reads_logits.then(|| DecisionBinding {
+                reads_logits,
+                ..decision_binding(true)
+            });
+            let manifest = fixture_manifest(&definition);
+            let plan = ExecutionPlanner::backend_plan(
+                seismic::BackendName::Metal,
+                &manifest,
+                &definition,
+                ComponentSelection {
+                    head: false,
+                    vision: false,
+                },
+                crate::ExecutionPath::Native,
+                PlannedMethod::Plain,
+                KvCodec::Dense,
+                ResourceLimits {
+                    max_launch_rows: 2,
+                    max_launch_slots: 2,
+                    max_selected_rows: 2,
+                    max_drafting_slots: 2,
+                    exported_logits_rows: 0,
+                    max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
+                    max_image_cells: 0,
+                    lookahead: false,
+                },
+            )
+            .unwrap();
+            crate::kernel_inventory(&definition, &plan)
+                .unwrap()
+                .into_iter()
+                .any(|request| request.to_string().contains("readout_selected_rows"))
+        };
+        assert!(!listed(false));
+        assert!(listed(true));
     }
 
     /// The kernel inventory, derived without a device, names exactly the

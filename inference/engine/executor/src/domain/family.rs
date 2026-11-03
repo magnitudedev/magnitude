@@ -39,6 +39,21 @@ pub trait ProgramFamily: 'static {
     /// Graphs the device has recorded for submissions so far
     /// (`seismic::Device::recorded_graphs`).
     fn recorded_graphs(&self) -> u64;
+    /// The readouts target forwards compute at chosen rows
+    /// (`Demand::READOUT`).
+    fn readouts(&self) -> crate::ReadoutSupport;
+    /// The least row class a chunk of a layer-major advance launches in
+    /// (`PreparedTargetGraphs::layer_major_rows`).
+    fn layer_major_rows(&self) -> usize;
+    /// The device bytes the readout values of a target launch allocate
+    /// beside its graph leases, each slot's row readouts in batch order.
+    /// Test families compute no readout values.
+    fn readout_values_bytes(
+        &self,
+        _slots: &[Vec<crate::batching::RowReadout>],
+    ) -> Result<u64, String> {
+        Ok(0)
+    }
 
     /// Physical target tensors held by the bound family. Test families with
     /// no resident model have no target charge.
@@ -173,6 +188,20 @@ impl ProgramFamily for NativeFamily {
     }
     fn recorded_graphs(&self) -> u64 {
         self.programs.recorded_graphs()
+    }
+    fn readouts(&self) -> crate::ReadoutSupport {
+        self.target.readouts()
+    }
+    fn layer_major_rows(&self) -> usize {
+        self.target.layer_major_rows()
+    }
+    fn readout_values_bytes(
+        &self,
+        slots: &[Vec<crate::batching::RowReadout>],
+    ) -> Result<u64, String> {
+        self.target
+            .readout_values_bytes(slots)
+            .map_err(|error| error.to_string())
     }
     fn vision_is_bound(&self) -> bool {
         self.vision.is_some()

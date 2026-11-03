@@ -665,3 +665,50 @@ native readout_planes_rows for cuda from "cuda/readout_planes_rows.cu":
         params (WARPS in [8, 4, 2], code ROWS in [2, 1, 4])
         threadgroups (ceil_div(V, WARPS * ROWS), ceil_div(O, 8), 1)
         threads_per_threadgroup (WARPS * 32, 1, 1)
+
+
+# Scores readouts (`ReadoutKind::Scores`): the dot products of query
+# feature rows with key feature rows, final normalized hidden states in A
+# (`readout_features_rows`), each summed in F32 and scaled once.
+fn readout_scores_rows[Q, N, D](query: &tensor[Q, D] A, keys: &tensor[N, D] A,
+    scale: f32) -> tensor[Q, N] f32:
+    let mut scores = tensor[Q, N] f32
+    parallel for row in 0..Q:
+        parallel for key in 0..N:
+            let acc = matmul(
+                f32(query[row : row + 1]),
+                f32(keys[key : key + 1]),
+                zeros_like(scores[row : row + 1, key : key + 1], dtype=f32),
+            )
+            scores[row, key] = acc[0, 0] * scale
+    return scores
+
+# Metal: one simdgroup per key row, eight to a threadgroup; each lane sums
+# its strided columns in order, then the simdgroup sums its lanes.
+native readout_scores_rows for metal from "metal/readout_scores_rows.metal":
+    static (D)
+    launch readout_scores_rows:
+        threadgroups (ceil_div(N, 8), Q, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CUDA: as Metal, one warp per key row.
+native readout_scores_rows for cuda from "cuda/readout_scores_rows.cu":
+    static (D)
+    launch readout_scores_rows:
+        threadgroups (ceil_div(N, 8), Q, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# Vulkan: as Metal, one subgroup per key row; the x grid is capped at the
+# 65535-group floor (Vulkan spec §5.3), the subgroups striding over the rest.
+native readout_scores_rows for vulkan from "vulkan/readout_scores_rows.comp":
+    static (D)
+    launch readout_scores_rows:
+        threadgroups (min(ceil_div(N, 8), 65535), Q, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CPU: one work item per (key, query) pair, summing in column order.
+native readout_scores_rows for cpu from "cpu/readout_scores_rows.rs":
+    launch readout_scores_rows:
+        threadgroups (N, Q, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (D * 8)

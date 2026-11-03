@@ -38,9 +38,11 @@ fn domain() -> (ExecutorDomain, StateBindings, usize, usize, usize) {
             draft_policy: None,
             method: ModelMethod::Plain,
             mtp_proposals: None,
-            kv_codec: std::env::var("MAGNITUDE_TEST_KV_CODEC")
-                .map(|codec| codec.parse::<KvCodec>().unwrap())
-                .unwrap_or(KvCodec::AffineK8V4),
+            kv_codec: Some(
+                std::env::var("MAGNITUDE_TEST_KV_CODEC")
+                    .map(|codec| codec.parse::<KvCodec>().unwrap())
+                    .unwrap_or(KvCodec::AffineK8V4),
+            ),
             lookahead: false,
             exported_logits_rows: 64,
             numerical_profile: None,
@@ -103,6 +105,7 @@ fn forward(
         select: Vec::new(),
         committed: count,
         prime: None,
+        readouts: Vec::new(),
     };
     let operations = [operation];
     let ReservedResources::Target(reservation) = domain

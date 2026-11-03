@@ -177,12 +177,20 @@ impl ReasoningCapabilities {
     }
 }
 
+/// What a model serves, with what it takes there: chat, with what its chat
+/// templates take, or decisions only for a model that names its decision
+/// type, which generates nothing and so takes no chat parameter.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ModelCapabilities {
-    pub vision: bool,
-    pub tools: bool,
-    pub structured_output: bool,
-    pub reasoning: ReasoningCapabilities,
+pub enum ModelCapabilities {
+    Chat {
+        vision: bool,
+        tools: bool,
+        structured_output: bool,
+        reasoning: ReasoningCapabilities,
+    },
+    Decisions {
+        vision: bool,
+    },
 }
 
 /// The speculative method a bound drafter runs.
@@ -250,6 +258,9 @@ pub enum ModelAssessment {
     Unsupported {
         unsupported: UnsupportedModel,
         fingerprint: Option<ModelFingerprint>,
+        /// What its header says it serves ([`magnitude_artifacts::Serves::of`]),
+        /// or nothing known when its header does not open.
+        serves: Option<magnitude_artifacts::Serves>,
     },
 }
 
@@ -313,6 +324,7 @@ pub enum PreparedModelAssessment {
     Unsupported {
         unsupported: UnsupportedModel,
         fingerprint: Option<ModelFingerprint>,
+        serves: Option<magnitude_artifacts::Serves>,
     },
     Planned {
         facts: ModelFacts,
@@ -334,10 +346,12 @@ pub fn finish_model_assessment(
         PreparedModelAssessment::Unsupported {
             unsupported,
             fingerprint,
+            serves,
         } => {
             return Ok(ModelAssessment::Unsupported {
                 unsupported: unsupported.clone(),
                 fingerprint: fingerprint.clone(),
+                serves: *serves,
             });
         }
         PreparedModelAssessment::Planned {
@@ -424,10 +438,12 @@ pub fn prepare_model_assessment_from(
         Admission::Unsupported {
             unsupported,
             fingerprint,
+            serves,
         } => {
             return Ok(PreparedModelAssessment::Unsupported {
                 unsupported,
                 fingerprint,
+                serves,
             });
         }
         Admission::Admitted(admitted) => *admitted,
@@ -447,6 +463,7 @@ pub fn prepare_model_assessment_from(
             Err(Refusal::Unsupported(unsupported)) => {
                 return Ok(PreparedModelAssessment::Unsupported {
                     unsupported,
+                    serves: Some(admitted.serves()),
                     fingerprint: admitted.fingerprint,
                 });
             }
@@ -707,6 +724,7 @@ enum Admission {
     Unsupported {
         unsupported: UnsupportedModel,
         fingerprint: Option<ModelFingerprint>,
+        serves: Option<magnitude_artifacts::Serves>,
     },
     Admitted(Box<AdmittedPackage>),
 }
@@ -724,22 +742,32 @@ struct AdmittedPackage {
 }
 
 impl AdmittedPackage {
+    fn serves(&self) -> magnitude_artifacts::Serves {
+        magnitude_artifacts::Serves::of_description(
+            self.definition.decision.as_ref().map(|decision| &decision.metadata),
+        )
+    }
+
     fn facts(self, drafter: DrafterVerdict) -> ModelFacts {
+        let vision = self.definition.vision.is_some();
         ModelFacts {
-            capabilities: ModelCapabilities {
-                vision: self.definition.vision.is_some(),
-                tools: self.chat.tools,
-                structured_output: self.chat.structured_output,
-                reasoning: ReasoningCapabilities {
-                    efforts: self
-                        .chat
-                        .reasoning
-                        .mappings
-                        .iter()
-                        .map(|mapping| mapping.effort.clone())
-                        .collect(),
-                    default_effort: self.chat.reasoning.default_effort.clone(),
+            capabilities: match self.serves() {
+                magnitude_artifacts::Serves::Chat => ModelCapabilities::Chat {
+                    vision,
+                    tools: self.chat.tools,
+                    structured_output: self.chat.structured_output,
+                    reasoning: ReasoningCapabilities {
+                        efforts: self
+                            .chat
+                            .reasoning
+                            .mappings
+                            .iter()
+                            .map(|mapping| mapping.effort.clone())
+                            .collect(),
+                        default_effort: self.chat.reasoning.default_effort.clone(),
+                    },
                 },
+                magnitude_artifacts::Serves::Decisions => ModelCapabilities::Decisions { vision },
             },
             template_fingerprint: self.chat.fingerprint,
             context_limit: self.context_limit,
@@ -794,9 +822,11 @@ fn admit(
         Ok(headers) => headers,
         Err(error) => match artifact_refusal(&error) {
             Some(unsupported) => {
+                // A header that does not open says nothing of what it serves.
                 return Ok(Admission::Unsupported {
                     unsupported,
                     fingerprint: None,
+                    serves: None,
                 });
             }
             None => return Err(ModelAssessmentError::Artifact(error)),
@@ -845,6 +875,7 @@ fn admit(
                 unsupported: UnsupportedModel::union(refusals)
                     .expect("a refused admission has a refusal"),
                 fingerprint,
+                serves: Some(magnitude_artifacts::Serves::of(headers.target())),
             });
         }
     };

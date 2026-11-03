@@ -20,6 +20,8 @@
 use magnitude_executor::{CONVERSATION_CHECKPOINTS, ResourcePlan};
 use magnitude_family_contracts::{InputLayout, TokenId};
 use magnitude_generation::{Generation, MethodCheckpoint, MethodChoice};
+use magnitude_readout::Visibility;
+use std::sync::LazyLock;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -80,20 +82,26 @@ pub struct PrefixPath<'a> {
     prompt: &'a [TokenId],
     generated: &'a [TokenId],
     layout: &'a InputLayout,
+    visibility: &'a Visibility,
     method: MethodChoice,
 }
+
+/// What a generation's rows read: each attends causally.
+static CAUSAL: LazyLock<Visibility> = LazyLock::new(Visibility::causal);
 
 impl<'a> PrefixPath<'a> {
     pub fn new(
         prompt: &'a [TokenId],
         generated: &'a [TokenId],
         layout: &'a InputLayout,
+        visibility: &'a Visibility,
         method: MethodChoice,
     ) -> Self {
         Self {
             prompt,
             generated,
             layout,
+            visibility,
             method,
         }
     }
@@ -103,6 +111,7 @@ impl<'a> PrefixPath<'a> {
             generation.prompt(),
             generation.generated(),
             generation.layout(),
+            &CAUSAL,
             generation.method_choice(),
         )
     }
@@ -115,10 +124,13 @@ impl<'a> PrefixPath<'a> {
         self.prompt.iter().chain(self.generated)
     }
 
-    /// Whether `position` is a legal resume point: at most the path length
-    /// and not inside an indivisible media span.
+    /// Whether `position` is a legal resume point: at most the path length,
+    /// not inside an indivisible media span, and no row before it reading a
+    /// row after it (`Visibility::boundary`).
     pub fn exact_boundary(&self, position: usize) -> bool {
-        position <= self.len() && self.layout.boundary(position)
+        position <= self.len()
+            && self.layout.boundary(position)
+            && self.visibility.boundary(position)
     }
 
     /// The media identities conditioned before an exact boundary.
@@ -131,11 +143,22 @@ impl<'a> PrefixPath<'a> {
     }
 
     /// The deepest exact boundary of this path up to which a held path (its
-    /// tokens and the media identities conditioned on them) is the same
-    /// input. Image content is part of the identity: equal placeholder tokens
-    /// with different media diverge at the image.
-    pub fn shared_boundary(&self, tokens: &[TokenId], conditioning: &[String]) -> usize {
-        self.shared(tokens.iter(), conditioning.iter().map(String::as_str))
+    /// tokens, the media identities conditioned on them and what its rows
+    /// read) is the same input. Image content is part of the identity:
+    /// equal placeholder tokens with different media diverge at the image;
+    /// so is attention: a prefix of a bidirectional block is no state of the
+    /// block's rows.
+    pub fn shared_boundary(
+        &self,
+        tokens: &[TokenId],
+        conditioning: &[String],
+        visibility: &Visibility,
+    ) -> usize {
+        self.shared(
+            tokens.iter(),
+            conditioning.iter().map(String::as_str),
+            visibility,
+        )
     }
 
     /// [`Self::shared_boundary`] with a live request's prompt, the part of
@@ -144,6 +167,7 @@ impl<'a> PrefixPath<'a> {
         self.shared(
             live.prompt.iter(),
             live.layout.spans().iter().map(|span| span.identity.as_str()),
+            live.visibility,
         )
     }
 
@@ -151,6 +175,7 @@ impl<'a> PrefixPath<'a> {
         &self,
         tokens: impl Iterator<Item = &'b TokenId>,
         conditioning: impl Iterator<Item = &'b str> + Clone,
+        visibility: &Visibility,
     ) -> usize {
         let common = self
             .tokens()
@@ -160,11 +185,14 @@ impl<'a> PrefixPath<'a> {
         (0..=common)
             .rev()
             .find(|&position| {
-                self.exact_boundary(position) && {
-                    let mut held = conditioning.clone();
-                    self.conditioning_at(position)
-                        .all(|own| held.next().is_some_and(|held| held == own))
-                }
+                self.exact_boundary(position)
+                    && visibility.boundary(position)
+                    && self.visibility.alike_before(visibility, position)
+                    && {
+                        let mut held = conditioning.clone();
+                        self.conditioning_at(position)
+                            .all(|own| held.next().is_some_and(|held| held == own))
+                    }
             })
             .unwrap_or(0)
     }
@@ -179,6 +207,9 @@ pub enum CachePoint {
     PromptBoundary,
     /// A finished request's whole path.
     Terminal,
+    /// A readout plan's shared rows, retained because the plan asks: an
+    /// explicit cache point, a hit at any depth.
+    Trunk,
 }
 
 /// A match produced by [`PrefixCache::lookup`]: the entry's path is a prefix
@@ -206,6 +237,8 @@ pub struct CachedPrefix<S> {
     method: MethodCheckpoint,
     tokens: Vec<TokenId>,
     conditioning: Vec<String>,
+    /// What the entry's rows read.
+    visibility: Visibility,
     last_use: u64,
     submitted: usize,
 }
@@ -299,10 +332,10 @@ impl<S> PrefixCache<S> {
         let mut best: Option<(usize, usize, u64)> = None;
         for (index, entry) in self.entries.iter().enumerate() {
             let position = entry.position();
-            if position < MIN_PREFIX_HIT
+            if (position < MIN_PREFIX_HIT && entry.point != CachePoint::Trunk)
                 || position >= bound
                 || !entry.method.resumes(path.method)
-                || path.shared_boundary(&entry.tokens, &entry.conditioning) != position
+                || path.shared_boundary(&entry.tokens, &entry.conditioning, &entry.visibility) != position
             {
                 continue;
             }
@@ -327,7 +360,7 @@ impl<S> PrefixCache<S> {
     pub fn shared_boundary(&self, path: PrefixPath) -> usize {
         self.entries
             .iter()
-            .map(|entry| path.shared_boundary(&entry.tokens, &entry.conditioning))
+            .map(|entry| path.shared_boundary(&entry.tokens, &entry.conditioning, &entry.visibility))
             .max()
             .unwrap_or(0)
     }
@@ -355,12 +388,14 @@ impl<S> PrefixCache<S> {
             .conditioning_at(position)
             .map(str::to_owned)
             .collect::<Vec<_>>();
+        let visibility = path.visibility.prefix(position);
         if let Some(existing) = self
             .entries
             .iter()
             .position(|entry| {
                 entry.tokens == tokens
                     && entry.conditioning == conditioning
+                    && entry.visibility == visibility
                     && std::mem::discriminant(&entry.method) == std::mem::discriminant(&method)
             })
         {
@@ -381,6 +416,7 @@ impl<S> PrefixCache<S> {
             method,
             tokens,
             conditioning,
+            visibility,
             last_use,
             submitted: 0,
         });
@@ -519,7 +555,7 @@ impl<S> PrefixCache<S> {
             self.entries
                 .iter()
                 .filter(|entry| {
-                    entry.point == CachePoint::Branch
+                    matches!(entry.point, CachePoint::Branch | CachePoint::Trunk)
                         && path.tokens.starts_with(&entry.tokens)
                         && path.conditioning.starts_with(&entry.conditioning)
                 })
@@ -628,7 +664,7 @@ mod tests {
         }
 
         fn under(&self, method: MethodChoice) -> PrefixPath<'_> {
-            PrefixPath::new(&self.prompt, &self.generated, &self.layout, method)
+            PrefixPath::new(&self.prompt, &self.generated, &self.layout, &CAUSAL, method)
         }
     }
 
@@ -1094,5 +1130,77 @@ mod tests {
         assert!(!retain(&mut cache, &second, 64, rows(1..2)));
         assert_eq!(cache.len(), 1);
         assert!(lookup_any(&mut cache, &second).is_none());
+    }
+
+    /// A blocked path's prefix is a state only at a boundary of what its
+    /// rows read and only for a path whose rows read alike: a bidirectional
+    /// trunk serves the identical trunk, never a causal request over the
+    /// same tokens, a path continuing a prefix of the trunk, or a trunk read
+    /// otherwise; a causal entry never serves a blocked path.
+    #[test]
+    fn blocked_prefixes_serve_only_paths_reading_alike() {
+        use magnitude_family_contracts::{PreparedModelInput, TokenPlan};
+        use magnitude_readout::{Block, ReadoutSequence};
+        let owned = text(200, "t");
+        let visibility = |blocks: Vec<Block>| {
+            let input = PreparedModelInput::from_text_coordinates(
+                TokenPlan::new(owned.prompt.clone(), owned.layout.clone()).unwrap(),
+                (0..200).map(|row| [row as i32; 3]).collect(),
+            )
+            .unwrap();
+            ReadoutSequence::new(input, blocks, Vec::new())
+                .unwrap()
+                .visibility()
+        };
+        let trunk = visibility(vec![Block::new(0..100, vec![0]), Block::new(100..200, vec![0, 1])]);
+        let other = visibility(vec![Block::new(0..100, vec![0]), Block::new(100..200, vec![1])]);
+        let longer = visibility(vec![Block::new(0..150, vec![0]), Block::new(150..200, vec![0, 1])]);
+        let path = |visibility| {
+            PrefixPath::new(&owned.prompt, &[], &owned.layout, visibility, MethodChoice::Plain)
+        };
+        let mut cache = PrefixCache::new(capacity(4));
+        assert!(cache
+            .retain(path(&trunk), 100, CachePoint::Branch, rows(0..100), MethodCheckpoint::Plain)
+            .unwrap());
+        assert!(
+            cache
+                .retain(path(&trunk), 50, CachePoint::Branch, rows(0..50), MethodCheckpoint::Plain)
+                .is_err(),
+            "the middle of a block is no boundary"
+        );
+        let hit = |cache: &mut PrefixCache<Rows>, visibility| {
+            cache
+                .lookup(path(visibility), usize::MAX)
+                .unwrap()
+                .map(PrefixHit::position)
+        };
+        assert_eq!(hit(&mut cache, &trunk), Some(100));
+        assert_eq!(hit(&mut cache, &other), Some(100), "its trunk reads alike");
+        assert_eq!(hit(&mut cache, &longer), None);
+        assert_eq!(hit(&mut cache, &CAUSAL), None);
+        assert!(retain(&mut cache, &owned, 120, rows(0..120)));
+        assert_eq!(hit(&mut cache, &longer), None, "a causal state serves no blocked path");
+        assert_eq!(hit(&mut cache, &CAUSAL), Some(120));
+    }
+
+    /// A trunk is an explicit cache point: it serves a later path at any
+    /// depth, while an implicit point shallower than a hit serves none.
+    #[test]
+    fn a_trunk_is_a_hit_at_any_depth() {
+        let owned = text(200, "t");
+        let mut cache = PrefixCache::new(capacity(4));
+        let shallow = MIN_PREFIX_HIT - 1;
+        let path = || PrefixPath::new(&owned.prompt, &[], &owned.layout, &CAUSAL, MethodChoice::Plain);
+        assert!(cache
+            .retain(path(), shallow, CachePoint::Branch, rows(0..shallow as u32), MethodCheckpoint::Plain)
+            .unwrap());
+        assert_eq!(cache.lookup(path(), usize::MAX).unwrap(), None);
+        assert!(cache
+            .retain(path(), 3, CachePoint::Trunk, rows(0..3), MethodCheckpoint::Plain)
+            .unwrap());
+        assert_eq!(
+            cache.lookup(path(), usize::MAX).unwrap().map(PrefixHit::position),
+            Some(3)
+        );
     }
 }

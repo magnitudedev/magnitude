@@ -2300,6 +2300,7 @@ mod tests {
                 mean: [0.5; 3],
                 std: [0.5; 3],
                 channels: 3,
+                pixel_cap: None,
                 patch: 2,
                 merge: 2,
             },

@@ -1,9 +1,12 @@
 //! The architecture's metadata keys, read strictly: every `<architecture>.*`
 //! key must be one the family interprets, and every value must have the type
-//! its reader admits.
+//! its reader admits. The causality flag of a described decision header is
+//! the one exception ([`DecisionMetadata::owns_key`]): package
+//! inspection reads it for every family.
 
 use crate::HeaderError;
 use magnitude_artifacts::gguf::{self, Directory, Element, Scalar, Value};
+use magnitude_artifacts::DecisionMetadata;
 
 /// Every metadata entry in `architecture`'s own namespace, with its name
 /// within that namespace.
@@ -31,14 +34,17 @@ pub struct Metadata<'a> {
 }
 
 impl<'a> Metadata<'a> {
-    /// Reads `architecture.*` keys, rejecting every one outside `keys`.
+    /// Reads `architecture.*` keys, rejecting every one outside `keys` that
+    /// the header's decision description does not own.
     pub fn new(
         directory: &'a Directory,
         architecture: &str,
         keys: &[&str],
     ) -> Result<Self, HeaderError> {
         let unknown = architecture_keys(directory, architecture)
-            .filter(|(key, _)| !keys.contains(key))
+            .filter(|(key, _)| {
+                !keys.contains(key) && !DecisionMetadata::owns_key(directory, key)
+            })
             .map(|(_, entry)| entry.name.clone())
             .collect::<Vec<_>>();
         if !unknown.is_empty() {
@@ -63,7 +69,8 @@ impl<'a> Metadata<'a> {
         value.ok_or_else(|| HeaderError::MissingMetadata(self.key(key)))
     }
 
-    fn malformed(&self, key: &str, expected: &'static str) -> HeaderError {
+    /// `key` present with a value outside what its reader admits.
+    pub fn malformed(&self, key: &str, expected: &'static str) -> HeaderError {
         HeaderError::MetadataType {
             key: self.key(key),
             expected,

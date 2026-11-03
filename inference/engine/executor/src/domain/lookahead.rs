@@ -55,6 +55,7 @@ pub(super) fn continuation_of(operation: &Operation) -> Option<Operation> {
         select,
         committed: 1,
         prime: None,
+        readouts: _,
     } = operation
     else {
         return None;
@@ -82,6 +83,7 @@ pub(super) fn continuation_of(operation: &Operation) -> Option<Operation> {
         select: vec![next],
         committed: 1,
         prime: None,
+        readouts: Vec::new(),
     })
 }
 
@@ -197,7 +199,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     ) -> Option<crate::LaunchClass> {
         self.claim_slots(bindings, operations)?;
         let lookahead = bindings.lookahead.as_ref()?;
-        Some(lookahead.flight.submission.launch().batch().class())
+        match lookahead.flight.submission.launch().rows() {
+            crate::LaunchRows::Batch(batch) => Some(batch.class()),
+            crate::LaunchRows::LayerMajor(_) => None,
+        }
     }
 
     /// Hand the queued step to the owner as the flight of `operations`. Each
@@ -343,21 +348,21 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         }
         let mut slots = Vec::with_capacity(predicted.len());
-        let mut segments = 1usize;
         for (operation, advance) in predicted.iter().zip(&advances) {
             let (slot, slices) = self
-                .target_slot(operation, advance)
+                .target_slot(operation, advance, 0..operation.row_count(), (0, 1))
                 .map_err(DomainError::Input)?;
             if !slices.is_empty() {
                 return Ok(());
             }
-            segments = segments.max(super::target::reserved_segments(
-                &self.target_store,
-                advance.span_count(),
-                operation.row_count(),
-            ));
             slots.push(slot);
         }
+        let group = predicted
+            .iter()
+            .zip(&advances)
+            .map(|(operation, advance)| (operation, advance as &dyn super::target::AcceptedHistory))
+            .collect::<Vec<_>>();
+        let class = self.target_class(&group).map_err(DomainError::Input)?;
         // The continuation follows the tokens fed so far.
         let Ok(preceding) = self.target_preceding(&predicted) else {
             return Ok(());
@@ -367,7 +372,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let batch = if selected_tokens {
             ValidatedTargetBatch::from_slots(&slots, vocabulary, class_limits)
         } else {
-            ValidatedTargetBatch::covering(&slots, vocabulary, class_limits, segments)
+            ValidatedTargetBatch::covering(
+                &slots,
+                vocabulary,
+                class_limits,
+                class.rows(),
+                class.segments().min(class_limits.segments),
+            )
         }
         .map_err(|error| DomainError::Input(error.to_string()))?;
         let tokens = match selected {
@@ -432,8 +443,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             None
         };
         let count = operations.len();
+        let visibility = self
+            .launch_visibility(&operations)
+            .map_err(DomainError::Input)?;
         let inputs = TargetLaunchInputs::new(
-            batch,
+            crate::LaunchRows::Batch(batch),
             tokens,
             advances,
             vec![None; count],
@@ -444,7 +458,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             readout_output,
         )
         .with_boundary(boundary)
-        .with_preceding(preceding);
+        .with_preceding(preceding)
+        .with_visibility(visibility);
         let launch = match ValidatedTargetLaunch::new(
             inputs,
             &self.target_store,
@@ -614,6 +629,7 @@ mod tests {
             tokens,
             committed: 1,
             prime: None,
+            readouts: Vec::new(),
         }
     }
 

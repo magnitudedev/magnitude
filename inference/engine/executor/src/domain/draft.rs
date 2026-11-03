@@ -98,6 +98,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 histories,
                 demand: crate::batching::Demand::NONE,
                 select: None,
+                readouts: Vec::new(),
             });
         }
         let mut block = Vec::new();
@@ -168,6 +169,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     histories,
                     demand: crate::batching::Demand::NONE,
                     select,
+                    readouts: Vec::new(),
                 });
             }
         }

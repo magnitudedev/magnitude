@@ -17,8 +17,8 @@
 use magnitude_engine::{
     assessment::{
         finish_model_assessment, prepare_model_assessment, AssessmentSetup, AssessmentStructure,
-        DrafterVerdict, Measurements, ModelAssessment, ModelExecution, ModelPackagePaths,
-        Performance, PreparedModelAssessment,
+        DrafterVerdict, Measurements, ModelAssessment, ModelCapabilities, ModelExecution,
+        ModelPackagePaths, Performance, PreparedModelAssessment,
     },
     error::UnsupportedModel,
     options::{standard_service_limits, ModelMethod, ModelPolicy, PROFILE_SEQUENCES},
@@ -521,6 +521,7 @@ fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
         ModelAssessment::Unsupported {
             unsupported,
             fingerprint,
+            ..
         } => {
             let mut object = unsupported_json(unsupported);
             object["_tag"] = json!("Unsupported");
@@ -576,17 +577,28 @@ fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
             "deficitBytes": deficit_bytes,
         }),
     };
-    let reasoning = &facts.capabilities.reasoning;
-    object["capabilities"] = json!({
-        "vision": facts.capabilities.vision,
-        "tools": facts.capabilities.tools,
-        "structuredOutput": facts.capabilities.structured_output,
-        "reasoning": {
-            "supported": reasoning.supported(),
-            "efforts": reasoning.efforts,
-            "defaultEffort": reasoning.default_effort,
-        },
-    });
+    object["capabilities"] = match &facts.capabilities {
+        ModelCapabilities::Chat {
+            vision,
+            tools,
+            structured_output,
+            reasoning,
+        } => json!({
+            "serves": "chat",
+            "vision": vision,
+            "tools": tools,
+            "structuredOutput": structured_output,
+            "reasoning": {
+                "supported": reasoning.supported(),
+                "efforts": reasoning.efforts,
+                "defaultEffort": reasoning.default_effort,
+            },
+        }),
+        ModelCapabilities::Decisions { vision } => json!({
+            "serves": "decisions",
+            "vision": vision,
+        }),
+    };
     object["templateFingerprint"] = json!(facts.template_fingerprint);
     object["contextLimit"] = json!(facts.context_limit);
     object["fingerprint"] = json!(facts.fingerprint);

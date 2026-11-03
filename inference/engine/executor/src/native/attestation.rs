@@ -59,6 +59,9 @@ pub(crate) struct AttestedTarget {
 #[derive(Clone)]
 pub(crate) struct AttestedTargetBlock {
     pub mixer: AttestedMixer,
+    /// The key-and-value projection of an attention block a layer-major
+    /// advance publishes (`TargetBlockProgramSlot::keys_values`).
+    pub keys_values: Option<NativeKernel<attention_project::Entry>>,
     /// Absent for a lone mixer block.
     pub feed_forward: Option<AttestedFeedForward>,
     /// The post-norm output scales of the block's sublayers.
@@ -918,8 +921,20 @@ impl AttestedPrograms {
                             .ok_or_else(|| missing("ngram_inject", binding))
                     })
                     .transpose()?;
+                let keys_values = block
+                    .keys_values()
+                    .map(|binding| {
+                        prepared
+                            .target
+                            .keys_values
+                            .get(&binding)
+                            .cloned()
+                            .ok_or_else(|| missing("attention_project", binding))
+                    })
+                    .transpose()?;
                 blocks.push(AttestedTargetBlock {
                     mixer,
+                    keys_values,
                     feed_forward,
                     output_scales,
                     per_layer,
@@ -1421,12 +1436,19 @@ impl AttestedPrograms {
                     bindings: "resident readout weights".into(),
                     outcome: error,
                 })?;
+            let readout_values = readout_value_weights(&self.target.readout, &model)
+                .map_err(|error| CatalogFailure::Preparation {
+                    entry: "readout_values",
+                    bindings: "resident readout weights".into(),
+                    outcome: error,
+                })?;
             crate::programs::native_target::NativeTargetProgram::new(
                 model.embedding.tensor().device(),
                 self.state.clone(),
                 geometry,
                 graphs,
                 readout_graphs,
+                readout_values,
             )
             .map_err(|error| CatalogFailure::Preparation {
                 entry: "target_graph_controls",
@@ -1633,4 +1655,65 @@ impl AttestedPrograms {
     pub fn unprepared(&self) -> usize {
         self.unprepared
     }
+}
+
+/// What a load reads its readouts through: chosen logits through the
+/// attested `readout_selected_rows` over the packed output projection,
+/// which a load prepares only when its plan binds them
+/// (`ReadoutBinding::logits`, a packed projection without a second-level
+/// scale), the model's readout head through its attested
+/// `readout_head_rows`, and retained rows' features and scores through the
+/// readout's `readout_features_rows` and `readout_scores_rows`.
+fn readout_value_weights(
+    readout: &super::ReadoutKernels,
+    model: &crate::ResidentTarget,
+) -> Result<crate::programs::native_target::ReadoutValueWeights, String> {
+    use crate::programs::native_target::{
+        HeadValueWeights, ReadoutValueWeights, SelectedLogitsWeights,
+    };
+    let device = model.embedding.tensor().device();
+    let empty = || {
+        seismic::Tensor::from_host(&device, seismic::Element::f32(), &[0], &[])
+            .map_err(|error| error.to_string())
+    };
+    let logits = match (&readout.logits, &model.output) {
+        // A load whose plan binds no chosen logits, or whose device did not
+        // prepare their kernel, reads none.
+        (None, _) => None,
+        (Some(selected), crate::ResidentOutput::Packed(output)) if output.scale().is_none() => {
+            Some(SelectedLogitsWeights {
+                selected: selected.clone(),
+                weight: output.tensor().clone(),
+            })
+        }
+        (Some(_), _) => {
+            return Err(
+                "a chosen-logits kernel was prepared for an output projection that is not packed without a second-level scale"
+                    .into(),
+            );
+        }
+    };
+    let head = match (&readout.readout_head, &model.readout_head) {
+        (Some(kernel), Some(weight)) => Some(HeadValueWeights {
+            kernel: kernel.clone(),
+            weight: weight.tensor().clone(),
+            element: crate::programs::native_target::HeadElement::of(weight.tensor())?,
+            unscaled: empty()?,
+        }),
+        // A head whose kernel the device did not prepare reads no values.
+        (None, _) => None,
+        (Some(_), None) => {
+            return Err("a readout head kernel was prepared for a model without its weight".into());
+        }
+    };
+    Ok(ReadoutValueWeights {
+        norm: match &model.output_norm {
+            Some(norm) => norm.tensor().clone(),
+            None => empty()?,
+        },
+        logits,
+        head,
+        features: readout.features.clone(),
+        scores: readout.scores.clone(),
+    })
 }

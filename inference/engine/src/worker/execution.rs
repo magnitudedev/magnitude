@@ -82,6 +82,15 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                     Ok(WorkerReply::AdmissionRefused(unloaded(cause)))
                 }
             },
+            WorkerCommand::Read(plan) => Ok(match &mut self.execution {
+                Execution::Serving(owner) => match owner.read(plan, now) {
+                    Ok((request, receiver)) => WorkerReply::Admitted { request, receiver },
+                    Err(error) => WorkerReply::AdmissionRefused(error),
+                },
+                Execution::Draining(_, cause) | Execution::Stopped(cause) => {
+                    WorkerReply::AdmissionRefused(unloaded(cause))
+                }
+            }),
             WorkerCommand::Stop { request } => {
                 if let Execution::Serving(owner) | Execution::Draining(owner, _) =
                     &mut self.execution

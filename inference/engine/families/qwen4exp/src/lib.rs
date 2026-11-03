@@ -112,7 +112,7 @@ impl Extensions {
     /// `predictions` blocks follow the decoder's layers; their ratios are
     /// the prediction head's to check.
     fn read(m: &Metadata, layers: &[MixerKind], predictions: u64) -> Result<Self, Error> {
-        let blocks = m.integers("attention.compress_ratios")?;
+        let blocks = m.counts("attention.compress_ratios")?;
         if blocks.len() as u64 != layers.len() as u64 + predictions
             || layers
                 .iter()
@@ -123,7 +123,7 @@ impl Extensions {
                 "qwen4exp compress ratios must name exactly the attention layers",
             ));
         }
-        let ngram_layers = m.integers("ple.layers")?;
+        let ngram_layers = m.counts("ple.layers")?;
         let [layer] = ngram_layers[..] else {
             return Err(invalid("qwen4exp must name exactly one n-gram layer"));
         };
@@ -137,20 +137,17 @@ impl Extensions {
         let hash = NGramHash {
             context: ngram_size - 1,
             heads_per_order: m.integer("ple.heads_per_ngram")?,
-            multipliers: m.integers("ple.layer_multipliers")?,
-            sizes: m.integers("ple.head_vocab_sizes")?,
-            offsets: m.integers("ple.head_offsets")?,
-            reset: m
-                .value("ple.eos_token_id")?
-                .unsigned()
-                .ok_or_else(|| m.malformed("ple.eos_token_id", "an integer"))?,
+            multipliers: m.counts("ple.layer_multipliers")?,
+            sizes: m.counts("ple.head_vocab_sizes")?,
+            offsets: m.counts("ple.head_offsets")?,
+            reset: m.count("ple.eos_token_id")?,
         };
         // Media rows hash the token that stands in their place, which this
         // key names.
-        if m.optional("ple.image_token_id")
+        if m.value("ple.image_token_id")
             .is_some_and(|token| token.unsigned().is_none())
         {
-            return Err(m.malformed("ple.image_token_id", "an integer"));
+            return Err(m.malformed("ple.image_token_id", "an integer").into());
         }
         Ok(Self {
             streams: m.integer("hyper_connection.count")?,
@@ -361,6 +358,7 @@ pub fn inspect_components(
     }
     let vision = projector.map(describe_projector).transpose()?;
     let mut definition = ModelDefinition {
+        decision: None,
         family: FamilyId(FAMILY_ID.into()),
         artifact_identity: identity,
         inputs: InputSemantics { coordinate_axes: 3 },

@@ -23,10 +23,8 @@ use magnitude_engine::worker::transport::stdio_worker_transport;
 use magnitude_engine::worker::{EngineClient, WorkerExit, serve_worker};
 use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
 use magnitude_executor::{ExecutionPath, TuningSettings};
-use magnitude_serving::engine::{EngineHost, EngineInvocation};
-use magnitude_serving::{
-    HostChat, LoadProgress, ModelInvocation, ServedModels, Serving, ServingError,
-};
+use magnitude_serving::engine::{Acquire, resolved};
+use magnitude_serving::{ResolvedModel, ServedModels, Serving, ServingError};
 use magnitude_state::KvCodec;
 use serde_json::json;
 use std::path::PathBuf;
@@ -46,7 +44,7 @@ struct Options {
     method: ModelMethod,
     mtp_proposals: Option<u8>,
     draft_policy: Option<DraftPolicy>,
-    kv_codec: KvCodec,
+    kv_codec: Option<KvCodec>,
     numerical_profile: Option<magnitude_executor::NumericalProfile>,
     lookahead: bool,
     telemetry_endpoint: String,
@@ -150,7 +148,7 @@ fn parse() -> Result<Options, String> {
                     )
                 });
             }
-            "--kv-codec" => kv_codec = value(&flag, &mut args)?.parse()?,
+            "--kv-codec" => kv_codec = Some(value(&flag, &mut args)?.parse()?),
             "--numerical-profile" => {
                 let path = value(&flag, &mut args)?;
                 let bytes = std::fs::read(&path)
@@ -226,24 +224,14 @@ struct Standalone {
 }
 
 impl ServedModels for Standalone {
-    fn invoke(
-        &self,
-        model: &str,
-        _progress: Option<LoadProgress>,
-    ) -> BoxFuture<'_, Result<Box<dyn ModelInvocation>, ServingError>> {
+    fn resolve(&self, model: &str) -> BoxFuture<'_, Result<ResolvedModel<'_>, ServingError>> {
         let model = model.to_owned();
         Box::pin(async move {
             let invocation = self.engine.resolve(&model).await?;
-            Ok(Box::new(EngineInvocation::new(invocation, self.limits))
-                as Box<dyn ModelInvocation>)
-        })
-    }
-
-    fn host(&self, model: &str) -> BoxFuture<'_, Result<Arc<dyn HostChat>, ServingError>> {
-        let model = model.to_owned();
-        Box::pin(async move {
-            let invocation = self.engine.resolve(&model).await?;
-            Ok(Arc::new(EngineHost::new(invocation.host)) as Arc<dyn HostChat>)
+            let host = Arc::clone(&invocation.host);
+            let acquire: Acquire<'_> =
+                Box::new(move |_progress| Box::pin(std::future::ready(Ok(invocation))));
+            Ok(resolved(host, self.limits, acquire))
         })
     }
 }

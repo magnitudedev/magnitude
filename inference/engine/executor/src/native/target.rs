@@ -9,7 +9,8 @@ use magnitude_kernels::{
     dense_output, embedding_rows, gated_delta_chunk, gated_delta_project,
     gated_delta_project_convolved, gated_delta_step, gated_delta_step_convolved, indexer_select,
     post_norm_residual, project_rows, readout_exact_rows, readout_features_rows, readout_head_rows,
-    readout_planes_rows, readout_refine_rows, readout_selected_rows, readout_top_rows,
+    readout_planes_rows, readout_refine_rows, readout_scores_rows, readout_selected_rows,
+    readout_top_rows,
     routed_combine, routed_expand, routed_experts, routed_group, routed_output, routed_route,
     routed_route_shared,
 };
@@ -27,6 +28,9 @@ pub struct TargetKernels {
     pub(super) residual_features: Option<NativeKernel<feature_rows::Entry>>,
     pub(super) embedding: HashMap<EmbeddingBinding, NativeKernel<embedding_rows::Entry>>,
     pub(super) attention: HashMap<AttentionBinding, AttentionKernels>,
+    /// The key-and-value projections of the blocks a layer-major advance
+    /// publishes (`TargetBlockProgramSlot::keys_values`), by their bindings.
+    pub(super) keys_values: HashMap<AttentionBinding, NativeKernel<attention_project::Entry>>,
     pub(super) recurrent: HashMap<RecurrentBinding, RecurrentKernels>,
     pub(super) state_space: HashMap<StateSpaceBinding, StateSpaceKernels>,
     pub(super) short_conv: HashMap<ShortConvBinding, ShortConvKernels>,
@@ -164,15 +168,25 @@ pub struct TapKernels {
 pub struct ReadoutKernels {
     pub features: NativeKernel<readout_features_rows::Entry>,
     pub head: ReadoutHeadKernels,
+    /// The model's readout head over the final rows (`readout_head_rows`
+    /// over `ResidentTarget::readout_head`), when it has one and the device
+    /// prepares it.
+    pub readout_head: Option<NativeKernel<readout_head_rows::Entry>>,
+    /// The projection of chosen vocabulary rows (`readout_selected_rows`)
+    /// over the packed output projection, when the plan binds chosen logits
+    /// (`ReadoutBinding::logits`).
+    pub logits: Option<NativeKernel<readout_selected_rows::Entry>>,
+    /// Scores readouts over retained rows (`readout_scores_rows`), when the
+    /// plan binds them (`ReadoutBinding::scores`).
+    pub scores: Option<NativeKernel<readout_scores_rows::Entry>>,
 }
 
 /// The vocabulary projection's entries (`ReadoutHead`).
 #[derive(Clone, Debug)]
 pub enum ReadoutHeadKernels {
-    /// The head GEMV, and its projection of selected vocabulary rows.
+    /// The head GEMV.
     Packed {
         head: NativeKernel<readout_head_rows::Entry>,
-        selected: NativeKernel<readout_selected_rows::Entry>,
     },
     Qualified {
         packed: Box<ReadoutHeadKernels>,

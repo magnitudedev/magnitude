@@ -479,6 +479,7 @@ pub(crate) fn declared_model(
         projector: None,
     };
     let definition = ModelDefinition {
+        decision: None,
         family: magnitude_family_contracts::FamilyId("declared-qwen35".into()),
         artifact_identity: identity,
         inputs: InputSemantics { coordinate_axes: 1 },

@@ -146,9 +146,9 @@ pub fn inspect_components(
         family_id,
         &[QWEN35_KEYS, GEOMETRY_KEYS, MIXER_KEYS, width_keys].concat(),
     )?;
-    if let Some(order) = m.optional("rope.section_order") {
+    if let Some(order) = m.value("rope.section_order") {
         if order.string() != Some(SECTION_ORDER) {
-            return Err(m.malformed("rope.section_order", "\"zyxt\""));
+            return Err(m.malformed("rope.section_order", "\"zyxt\"").into());
         }
     }
     let block_count = m.integer("block_count")?;
@@ -249,6 +249,7 @@ pub fn inspect_components(
         })
         .transpose()?;
     let definition = ModelDefinition {
+        decision: None,
         family: FamilyId(family_id.into()),
         artifact_identity: identity,
         inputs: InputSemantics { coordinate_axes: 3 },

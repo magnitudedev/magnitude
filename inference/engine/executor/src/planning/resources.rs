@@ -1034,7 +1034,9 @@ impl ResourcePlanner {
         // bank and history row is committed on demand under a heap claim. A
         // live request holds its accepted bank and, in flight, a successor
         // (two with lookahead); a branch checkpoint or retention entry holds
-        // one more. Retention is bounded by what the domain could back.
+        // one more. An advance computed in chunks, alone in its launch, holds
+        // one interim bank more. Retention is bounded by what the domain
+        // could back.
         let retention_entries = if retained_entry_bytes == 0 {
             0
         } else {
@@ -1059,6 +1061,7 @@ impl ResourcePlanner {
             active: possible_requests,
             in_flight: possible_requests
                 .checked_mul(limits.target_launches())
+                .and_then(|banks| banks.checked_add(1))
                 .ok_or("in-flight bank count overflow")?,
             retained: possible_requests
                 .checked_add(retention_entries)

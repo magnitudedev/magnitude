@@ -9,9 +9,12 @@ use crate::error::{ArtifactError, RequestError, ResolveError, UnsupportedModel, 
 use crate::families;
 use crate::options::InputModalities;
 use magnitude_artifacts::{
-    ImageProcessor, InputLayout, Package, PackageIdentity, TokenId, TokenizerPayload,
+    DecisionMetadata, ImageProcessor, InputLayout, Package, PackageIdentity, TokenId,
+    TokenizerPayload,
     gguf::{Directory, Value},
 };
+use magnitude_family_common::{readout_head, HeaderError};
+use magnitude_decision::Decider;
 use magnitude_chat::{
     ByteBpeTokenizer, SpecialTokens, TemplateBundle, TemplateInspection,
     artifacts::{gguf_byte_bpe, gguf_templates},
@@ -19,29 +22,37 @@ use magnitude_chat::{
 };
 use magnitude_executor::{image_cell_limit, MAX_IMAGE_CELLS};
 use magnitude_family_contracts::{
-    FamilyError, MarkerTokens, ModelDefinition, ModelFamily, ModelInputAdapter,
-    PreparedModelInput, TokenPlan,
+    DecisionBinding, FamilyError, MarkerTokens, ModelDefinition, ModelFamily, ModelInputAdapter,
+    PreparedModelInput, TokenPlan, WeightDescriptor,
 };
 use std::{fmt, sync::Arc};
 
-/// The package's chat and input semantics: tokenizer, templates, media
-/// processor and the recognized family's input adapter.
+/// The package's chat and input semantics: tokenizer, templates, the
+/// recognized family's input adapter and each definition's media processor
+/// ([`media_processor`]), so the media a request prepares is the media its
+/// input adapter reads under the same definition.
 #[derive(Clone)]
 pub struct HostArtifacts {
     package: Arc<Package>,
     family: &'static dyn ModelFamily,
     /// The definition at the served context bound.
     definition: ModelDefinition,
+    /// `definition`'s media processor.
+    media: Option<ImageProcessor>,
     draft_unavailable: Option<DraftUnavailable>,
     /// The same definition at the artifact's declared capability, for
     /// host-only sizing (counting).
     declared: ModelDefinition,
+    /// `declared`'s media processor.
+    declared_media: Option<ImageProcessor>,
     tokenizer: Arc<ByteBpeTokenizer>,
     templates: Arc<TemplateBundle>,
     /// The templates' header-only chat facts, established once.
     inspection: TemplateInspection,
-    media: Option<ImageProcessor>,
     input_adapter: Arc<dyn ModelInputAdapter + Send + Sync>,
+    /// The decision description the GGUF carries, bound to the tokenizer:
+    /// present exactly when the model serves decisions.
+    decider: Option<Arc<Decider>>,
 }
 
 struct TokenizerMarkers<'a>(&'a ByteBpeTokenizer);
@@ -110,31 +121,75 @@ pub struct InterpretedTarget {
 /// whatever its projector, so a projector's refusal never becomes the
 /// target's verdict and never hides the target's. A payload-backed load and a
 /// header-only assessment interpret the same way.
+///
+/// The target's decision description, readout head and whether its
+/// description's plans read chosen logits and scores are read here, the
+/// same way for every family: the family's definition leaves them, and its
+/// strict reading leaves the keys and tensor a decision description owns. A decision model
+/// generates nothing, so nothing drafts for it: its definition keeps no
+/// draft head, and [`bind_draft`] binds it no separate draft.
 pub fn interpret_target(
     family: &dyn ModelFamily,
     target: &Directory,
     projector: Option<&Directory>,
     identity: PackageIdentity,
 ) -> Result<InterpretedTarget, UnsupportedModel> {
+    let decision = DecisionMetadata::of(target)
+        .map_err(|error| FamilyError::from(HeaderError::from(error)))?;
     let bound = projector.map(|projector| family.inspect(target, Some(projector), identity));
-    let refusal = match bound {
-        Some(Ok(definition)) => {
-            return Ok(InterpretedTarget {
-                definition,
-                projector_unavailable: None,
-            });
-        }
-        Some(Err(error)) => Some(UnsupportedModel::new(
-            error.reasons,
-            format!("projector: {}", error.detail),
-        )),
-        None => None,
+    let (definition, projector_unavailable) = match bound {
+        Some(Ok(definition)) => (definition, None),
+        Some(Err(error)) => (
+            family.inspect(target, None, identity)?,
+            Some(UnsupportedModel::new(
+                error.reasons,
+                format!("projector: {}", error.detail),
+            )),
+        ),
+        None => (family.inspect(target, None, identity)?, None),
     };
-    let definition = family.inspect(target, None, identity)?;
+    let readout_head =
+        readout_head(target, definition.decoder.hidden).map_err(FamilyError::from)?;
+    let decision = decision
+        .map(|metadata| {
+            let facts =
+                magnitude_decision::load_facts(&metadata, head_rows(readout_head.as_ref()))?;
+            let binding = DecisionBinding {
+                metadata,
+                readout_head,
+                reads_logits: facts.reads_logits,
+                reads_scores: facts.reads_scores,
+            };
+            Ok::<_, String>((binding, facts.image_pixels))
+        })
+        .transpose()
+        .map_err(UnsupportedModel::unreadable)?;
+    // A decision description's picture cap is the model's: every picture
+    // it reads, through any processor of its definition, is read within it.
+    let mut vision = definition.vision;
+    if let (Some(vision), Some(pixels)) = (
+        vision.as_mut(),
+        decision.as_ref().and_then(|(_, pixels)| *pixels),
+    ) {
+        vision
+            .cap_pixels(pixels as u64)
+            .map_err(|error| UnsupportedModel::unreadable(error.to_string()))?;
+    }
+    let decision = decision.map(|(binding, _)| binding);
     Ok(InterpretedTarget {
-        definition,
-        projector_unavailable: refusal,
+        definition: ModelDefinition {
+            head: definition.head.filter(|_| decision.is_none()),
+            decision,
+            vision,
+            ..definition
+        },
+        projector_unavailable,
     })
+}
+
+/// The rows of a bound readout head, one per code it reads.
+fn head_rows(head: Option<&WeightDescriptor>) -> Option<usize> {
+    head.map(|head| head.shape[0] as usize)
 }
 
 /// Why a package's separate draft is not bound: the drafter family its
@@ -152,6 +207,8 @@ pub enum DraftUnavailable {
     /// model architecture whose prediction heads the engine binds only
     /// built into their target, if at all (a separate Nemotron-H MTP file).
     Architecture(Option<String>),
+    /// A target that serves decisions, which generates nothing to draft.
+    Decisions,
 }
 
 impl DraftUnavailable {
@@ -164,6 +221,9 @@ impl DraftUnavailable {
                 architecture: architecture.clone(),
             }],
             Self::Architecture(None) => vec![UnsupportedReason::Unreadable],
+            Self::Decisions => vec![UnsupportedReason::TargetMismatch {
+                detail: self.to_string(),
+            }],
         };
         UnsupportedModel::new(reasons, self.to_string())
     }
@@ -180,6 +240,9 @@ impl fmt::Display for DraftUnavailable {
                 "draft GGUF architecture {architecture:?} names no drafter family"
             ),
             Self::Architecture(None) => formatter.write_str("draft has no GGUF architecture"),
+            Self::Decisions => {
+                formatter.write_str("a decision model generates nothing for a drafter to draft")
+            }
         }
     }
 }
@@ -219,6 +282,7 @@ pub fn package_definition(
 /// it: a block drafter's tapped layers the target family maps onto its
 /// sublayers; a Gemma assistant is a draft head reading its target's history.
 /// A payload-backed load and a header-only assessment bind the same draft.
+/// A decision target binds none: it generates nothing to draft.
 pub fn bind_draft(
     family: &dyn ModelFamily,
     declared: ModelDefinition,
@@ -227,6 +291,9 @@ pub fn bind_draft(
     let Some(draft) = draft else {
         return AdmittedDefinition::bound(declared);
     };
+    if declared.decision.is_some() {
+        return AdmittedDefinition::without(declared, DraftUnavailable::Decisions);
+    }
     match draft.value("general.architecture").and_then(Value::string) {
         Some(magnitude_family_qwen4exp::FAMILY_ID) => {
             match magnitude_family_qwen4exp::inspect_head(draft, &declared) {
@@ -315,7 +382,25 @@ impl HostArtifacts {
         let inspection = templates
             .inspect()
             .map_err(|detail| ResolveError::Unsupported(UnsupportedModel::chat_template(detail)))?;
+        let decider = definition
+            .decision
+            .as_ref()
+            .map(|decision| {
+                Decider::new(
+                    &decision.metadata,
+                    head_rows(decision.readout_head.as_ref()),
+                    tokenizer.clone(),
+                    definition
+                        .vision
+                        .as_ref()
+                        .and_then(|_| family.media_placeholder(&definition)),
+                )
+                .map(Arc::new)
+                .map_err(|detail| ResolveError::Unsupported(UnsupportedModel::unreadable(detail)))
+            })
+            .transpose()?;
         let media = media_processor(&definition).map_err(unsupported)?;
+        let declared_media = media_processor(&declared).map_err(unsupported)?;
         let input_adapter = family
             .input_adapter(&definition, &TokenizerMarkers(&tokenizer))
             .map_err(|error| ResolveError::Unsupported(error.into()))?
@@ -324,13 +409,15 @@ impl HostArtifacts {
             package: Arc::new(package),
             family,
             definition,
+            media,
             draft_unavailable,
             declared,
+            declared_media,
             tokenizer,
             templates: Arc::new(templates),
             inspection,
-            media,
             input_adapter,
+            decider,
         })
     }
 
@@ -406,9 +493,15 @@ impl HostArtifacts {
     /// The text one image renders as in the chat template, when the model
     /// accepts images.
     pub fn media_placeholder(&self) -> Option<&'static str> {
-        self.media
+        self.definition
+            .vision
             .as_ref()
             .and_then(|_| self.family.media_placeholder(&self.definition))
+    }
+
+    /// The model's decider: present exactly when it serves decisions.
+    pub fn decider(&self) -> Option<&Arc<Decider>> {
+        self.decider.as_ref()
     }
 
     /// The inputs the model accepts besides text.
@@ -424,7 +517,7 @@ impl HostArtifacts {
         tokens: Vec<TokenId>,
         images: &[ImageInput],
     ) -> Result<PreparedModelInput, RequestError> {
-        self.prepare_with(&self.definition, tokens, images)
+        self.prepare_with(&self.definition, self.media.as_ref(), tokens, images)
     }
 
     /// The same preparation bounded by the artifact's declared capability,
@@ -434,36 +527,46 @@ impl HostArtifacts {
         tokens: Vec<TokenId>,
         images: &[ImageInput],
     ) -> Result<PreparedModelInput, RequestError> {
-        self.prepare_with(&self.declared, tokens, images)
+        self.prepare_with(&self.declared, self.declared_media.as_ref(), tokens, images)
     }
 
     fn prepare_with(
         &self,
         definition: &ModelDefinition,
+        media: Option<&ImageProcessor>,
         tokens: Vec<TokenId>,
         images: &[ImageInput],
     ) -> Result<PreparedModelInput, RequestError> {
-        let invalid = |reason: String| RequestError::InvalidRequest { reason };
-        let layout = InputLayout::new(tokens.len(), Vec::new()).map_err(invalid)?;
-        let token_plan =
-            TokenPlan::new(tokens, layout).map_err(|error| invalid(error.to_string()))?;
-        let media = if images.is_empty() {
-            Vec::new()
-        } else {
-            let processor = self
-                .media
-                .as_ref()
-                .ok_or_else(|| invalid("the loaded model has no image processor".into()))?;
-            let encoded = images
-                .iter()
-                .map(|image| image.bytes.to_vec())
-                .collect::<Vec<_>>();
-            vec![processor.prepare(&encoded).map_err(invalid)?]
-        };
-        self.input_adapter
-            .prepare(definition, token_plan, &media)
-            .map_err(|error| invalid(error.to_string()))
+        prepare_model_input(definition, media, self.input_adapter.as_ref(), tokens, images)
     }
+}
+
+/// `tokens` and their `images` as `adapter` reads them under `definition`,
+/// the images prepared by `processor`, `definition`'s own media processor.
+fn prepare_model_input(
+    definition: &ModelDefinition,
+    processor: Option<&ImageProcessor>,
+    adapter: &dyn ModelInputAdapter,
+    tokens: Vec<TokenId>,
+    images: &[ImageInput],
+) -> Result<PreparedModelInput, RequestError> {
+    let invalid = |reason: String| RequestError::InvalidRequest { reason };
+    let layout = InputLayout::new(tokens.len(), Vec::new()).map_err(invalid)?;
+    let token_plan = TokenPlan::new(tokens, layout).map_err(|error| invalid(error.to_string()))?;
+    let media = if images.is_empty() {
+        Vec::new()
+    } else {
+        let processor =
+            processor.ok_or_else(|| invalid("the loaded model has no image processor".into()))?;
+        let encoded = images
+            .iter()
+            .map(|image| image.bytes.to_vec())
+            .collect::<Vec<_>>();
+        vec![processor.prepare(&encoded).map_err(invalid)?]
+    };
+    adapter
+        .prepare(definition, token_plan, &media)
+        .map_err(|error| invalid(error.to_string()))
 }
 
 /// Bound `definition`'s image resize to at most `cells` cells per image.
@@ -476,7 +579,8 @@ fn bound_images(definition: &mut ModelDefinition, cells: usize) -> Result<(), St
     }
 }
 
-/// The media processor of `definition`'s image resize, when it reads images.
+/// The media processor of `definition`'s image preprocessing, when it reads
+/// images: the processor its input adapter checks prepared media against.
 fn media_processor(definition: &ModelDefinition) -> Result<Option<ImageProcessor>, String> {
     definition
         .vision
@@ -533,6 +637,198 @@ fn resolve_served_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A noul-only decision description (`decision.*` keys without their
+    /// namespace), read at the last token through the LM head.
+    fn noul_description() -> [(&'static str, magnitude_artifacts::gguf::Value); 13] {
+        use magnitude_artifacts::gguf::{Array, Scalar, Strings, Value};
+        let string = |value: &str| Value::Scalar(Scalar::String(value.into()));
+        [
+            ("escape.method", string("none")),
+            ("segments", string("whole")),
+            ("set_size", Value::Scalar(Scalar::Unsigned(1))),
+            ("state_attends", string("state")),
+            ("question_attends", string("question")),
+            ("codes.sequence", string("letters")),
+            ("codes.probe", Value::Scalar(Scalar::Bool(false))),
+            ("codes.count", Value::Scalar(Scalar::Unsigned(2))),
+            (
+                "kinds",
+                Value::Array(Array::from(["noul"].into_iter().collect::<Strings>())),
+            ),
+            ("noul.codes", string("sequence")),
+            ("noul.true_option", Value::Scalar(Scalar::Unsigned(0))),
+            ("noul.slots", string("last")),
+            ("temperature.noul", Value::Scalar(Scalar::Float(1.0))),
+        ]
+    }
+
+    /// A target reads logits of chosen tokens and scores exactly when its
+    /// description's plans do; a description the decision crate does not
+    /// implement leaves it unreadable.
+    #[test]
+    fn a_target_reads_what_its_decision_description_plans() {
+        use magnitude_artifacts::{
+            ArtifactIdentity, DECISION_NAMESPACE, DECISION_TEMPLATE, PackageIdentity,
+            gguf::{Scalar, Value},
+        };
+        use magnitude_family_common::headers;
+        let family = magnitude_family_qwen35::Qwen35Family;
+        let string = |value: &str| Value::Scalar(Scalar::String(value.into()));
+        let described = noul_description();
+        let interpreted = |keys: &[(&str, Value)]| {
+            let mut target = headers::target("qwen3.6-35b-a3b:gguf:q4");
+            let architecture = target
+                .value("general.architecture")
+                .and_then(Value::string)
+                .unwrap()
+                .to_owned();
+            if !keys.is_empty() {
+                headers::set(&mut target, DECISION_TEMPLATE, string("{{ state }}"));
+                headers::set(
+                    &mut target,
+                    &format!("{architecture}.attention.causal"),
+                    Value::Scalar(Scalar::Bool(false)),
+                );
+            }
+            for (key, value) in keys {
+                headers::set(
+                    &mut target,
+                    &format!("{DECISION_NAMESPACE}{key}"),
+                    value.clone(),
+                );
+            }
+            interpret_target(
+                &family,
+                &target,
+                None,
+                PackageIdentity {
+                    target: ArtifactIdentity([7; 32]),
+                    projector: None,
+                },
+            )
+            .map(|interpreted| {
+                interpreted
+                    .definition
+                    .decision
+                    .map(|decision| (decision.reads_logits, decision.reads_scores))
+            })
+        };
+        assert_eq!(interpreted(&[]).unwrap(), None);
+        assert_eq!(interpreted(&described).unwrap(), Some((true, false)));
+        let unimplemented = [described.as_slice(), &[("boxes.max", Value::Scalar(Scalar::Unsigned(1)))]].concat();
+        assert_eq!(
+            interpreted(&unimplemented).unwrap_err().reasons,
+            vec![UnsupportedReason::Unreadable]
+        );
+    }
+
+    /// A decision description's picture cap is its definition's: a decision
+    /// request with a picture prepares through the processor the input
+    /// adapter checks its media against, at the served and the declared
+    /// bound alike (an LFM3-VL target and projector, described as reading
+    /// pictures before the state within d1-2B's cap).
+    #[test]
+    fn a_decision_request_with_a_picture_prepares_within_its_described_cap() {
+        use magnitude_artifacts::{
+            ArtifactIdentity, DECISION_NAMESPACE, DECISION_TEMPLATE, PackageIdentity,
+            gguf::{Array, Scalar, Strings, Value},
+        };
+        use magnitude_decision::{
+            DecisionRequest, Question, QuestionKind,
+            json::{Segment, Text, Value as Content},
+        };
+        use magnitude_family_common::headers;
+        const CAP: u64 = 1_638_400;
+        let family = magnitude_family_lfm2::Lfm2Family;
+        let string = |value: &str| Value::Scalar(Scalar::String(value.into()));
+        let mut target = headers::target("lfm3-vl-2b:gguf:q8");
+        let projector = headers::projector("lfm3-vl-2b:gguf:q8");
+        headers::set(
+            &mut target,
+            DECISION_TEMPLATE,
+            string(concat!(
+                "<|im_start|>user\n{% for image in images %}\u{FDD0}image:{{ image }}\u{FDD1}{% endfor %}",
+                "\u{FDD0}read:text\u{FDD1}\n\u{FDD0}state\u{FDD1}",
+                "{% for question in questions %}{{ question.instructions.stripped }}{% endfor %}"
+            )),
+        );
+        headers::set(&mut target, "lfm3.attention.causal", Value::Scalar(Scalar::Bool(false)));
+        for (key, value) in noul_description().into_iter().chain([
+            (
+                "image_placements",
+                Value::Array(Array::from(["front"].into_iter().collect::<Strings>())),
+            ),
+            ("image_max_pixels", Value::Scalar(Scalar::Unsigned(CAP))),
+        ]) {
+            headers::set(&mut target, &format!("{DECISION_NAMESPACE}{key}"), value);
+        }
+        let interpreted = interpret_target(
+            &family,
+            &target,
+            Some(&projector),
+            PackageIdentity {
+                target: ArtifactIdentity([7; 32]),
+                projector: Some(ArtifactIdentity([8; 32])),
+            },
+        )
+        .unwrap();
+        assert!(interpreted.projector_unavailable.is_none());
+        let declared = interpreted.definition;
+        assert_eq!(
+            declared.vision.as_ref().unwrap().preprocessing.pixel_cap,
+            Some(CAP)
+        );
+        let tokenizer = Arc::new(
+            gguf_byte_bpe(
+                &magnitude_artifacts::TokenizerPayload::from_directory(&target),
+                "lfm3-vl-2b".into(),
+            )
+            .and_then(ByteBpeTokenizer::new)
+            .unwrap(),
+        );
+        let decider = Decider::new(
+            &declared.decision.as_ref().unwrap().metadata,
+            None,
+            tokenizer.clone(),
+            family.media_placeholder(&declared),
+        )
+        .unwrap();
+        let mut served = declared.clone();
+        let cells = image_cell_limit(&served, 512, MAX_IMAGE_CELLS).unwrap();
+        bound_images(&mut served, cells).unwrap();
+        let literal = |text: &str| Content::String(Text::new([Segment::Literal(text.into())]));
+        let request = DecisionRequest {
+            state: literal("A picture."),
+            images: vec![ImageInput {
+                media_type: "image/png".into(),
+                bytes: Arc::from(
+                    &include_bytes!("../artifacts/tests/fixtures/cap-source.png")[..],
+                ),
+            }],
+            front: vec![0],
+            questions: vec![Question {
+                instructions: literal("Is it a picture?"),
+                kind: QuestionKind::Predicate {
+                    truthy: Content::Null,
+                    falsy: Content::Null,
+                },
+            }],
+        };
+        let prepared = decider.prepare(&request).unwrap();
+        for definition in [&served, &declared] {
+            let adapter = family
+                .input_adapter(definition, &TokenizerMarkers(&tokenizer))
+                .unwrap();
+            let plan = prepared
+                .readout_plan(&request, |tokens, images| {
+                    let media = media_processor(definition).unwrap();
+                    prepare_model_input(definition, media.as_ref(), adapter.as_ref(), tokens, images)
+                })
+                .unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(plan.sequences().len(), 1);
+        }
+    }
 
     #[test]
     fn draft_admission_retains_target_and_distinguishes_missing_from_invalid() {

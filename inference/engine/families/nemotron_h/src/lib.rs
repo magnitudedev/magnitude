@@ -685,6 +685,7 @@ pub fn inspect_components(
     binder.finish()?;
     let vision = projector.map(projector::describe_projector).transpose()?;
     let definition = ModelDefinition {
+        decision: None,
         family: FamilyId(ARCHITECTURE.into()),
         artifact_identity: identity,
         inputs,

@@ -556,6 +556,7 @@ mod tests {
                 projector: None,
             };
             let definition = ModelDefinition {
+                decision: None,
                 family: FamilyId("selected-attention".into()),
                 artifact_identity: identity,
                 inputs: InputSemantics { coordinate_axes: 1 },

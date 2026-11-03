@@ -78,6 +78,14 @@ impl Stream {
         }
     }
 
+    /// The values of an answered readout plan; panics on any other outcome.
+    pub fn values(&self) -> &magnitude_readout::ReadoutValues {
+        match &self.terminal {
+            Some(Publication::Read(values)) => values,
+            other => panic!("readout {:?} was not answered: {other:?}", self.id),
+        }
+    }
+
     pub fn failure(&self) -> Option<&RequestError> {
         match &self.terminal {
             Some(Publication::Failed(error)) => Some(error),
@@ -138,6 +146,35 @@ impl Host {
             output: Vec::new(),
             terminal: None,
         })
+    }
+
+    /// Logical admission of a readout plan at the host's current time.
+    pub fn read(&mut self, plan: magnitude_readout::ReadoutPlan) -> Result<Stream, AdmissionError> {
+        let now = self.now;
+        let (id, receiver) = self
+            .owner
+            .as_mut()
+            .expect("the owner is between runs")
+            .read(plan, now)?;
+        Ok(Stream {
+            id,
+            receiver,
+            output: Vec::new(),
+            terminal: None,
+        })
+    }
+
+    /// Step until every stream received its terminal publication.
+    pub fn answer(&mut self, streams: &mut [&mut Stream], timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while !streams.iter().all(|stream| stream.finished()) {
+            assert!(
+                Instant::now() < deadline,
+                "readouts were not answered: {:?}",
+                self.progress(streams)
+            );
+            self.step(streams);
+        }
     }
 
     /// Feed the recorded publication wakes, then run every transition

@@ -989,6 +989,7 @@ fn warm_up(
             position: 0,
             draft_from: 1,
         }),
+        readouts: Vec::new(),
     }];
     let resources = domain
         .reserve(&mut bindings, &operations)

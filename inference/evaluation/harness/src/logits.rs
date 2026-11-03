@@ -275,5 +275,6 @@ fn scored(sequence: &Sequence, forced: Vec<TokenId>) -> Operation {
         committed: forced.len(),
         tokens: forced,
         prime: None,
+        readouts: Vec::new(),
     }
 }

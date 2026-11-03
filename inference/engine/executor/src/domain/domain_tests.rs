@@ -226,7 +226,11 @@ fn fixture_of(
         head,
         None,
         None,
-        TestFamily { control, programs },
+        TestFamily {
+            control,
+            programs,
+            layer_major_rows: target_graphs.layer_major_rows() as usize,
+        },
     ))
 }
 
@@ -241,6 +245,7 @@ fn forward(request: RequestId, position: usize) -> Operation {
         select: Vec::new(),
         committed: 1,
         prime: None,
+        readouts: Vec::new(),
     }
 }
 
@@ -440,6 +445,8 @@ impl<L, W, O> ProgramSubmission for TestSubmission<L, W, O> {
 struct TestFamily {
     control: Option<PendingControl>,
     programs: AttestedPrograms,
+    /// The prepared target graphs' `layer_major_rows`.
+    layer_major_rows: usize,
 }
 impl TestFamily {
     fn submit<L, W, O>(&self, core: L, workspace: W, output: O) -> TestSubmission<L, W, O> {
@@ -472,6 +479,12 @@ impl ProgramFamily for TestFamily {
     fn recorded_graphs(&self) -> u64 {
         0
     }
+    fn readouts(&self) -> crate::ReadoutSupport {
+        crate::ReadoutSupport::default()
+    }
+    fn layer_major_rows(&self) -> usize {
+        self.layer_major_rows
+    }
     fn vision_is_bound(&self) -> bool {
         false
     }
@@ -479,6 +492,14 @@ impl ProgramFamily for TestFamily {
         true
     }
     fn unbind_optional(&mut self) {}
+
+    /// Each row readout allocates `READOUT_VALUE_BYTES`.
+    fn readout_values_bytes(
+        &self,
+        slots: &[Vec<crate::batching::RowReadout>],
+    ) -> Result<u64, String> {
+        Ok(slots.iter().map(|slot| slot.len() as u64).sum::<u64>() * READOUT_VALUE_BYTES)
+    }
 
     fn prepared_program_bytes(&self) -> u64 {
         self.programs.device_storage_bytes()
@@ -501,6 +522,7 @@ impl ProgramFamily for TestFamily {
                 },
                 landed_reads: Vec::new(),
                 stored_reads: STORED_READS.with(|reads| std::mem::take(&mut *reads.borrow_mut())),
+                readout_values: Default::default(),
             },
         ))
     }
@@ -565,6 +587,7 @@ fn prefill(request: RequestId, position: usize) -> Operation {
         select: Vec::new(),
         committed: 1,
         prime: None,
+        readouts: Vec::new(),
     }
 }
 
@@ -1133,6 +1156,7 @@ fn vision_definition() -> ModelDefinition {
             mean: [0.5; 3],
             std: [0.5; 3],
             channels: 3,
+            pixel_cap: None,
             patch: 2,
             merge: 2,
         },
@@ -1423,6 +1447,7 @@ fn an_image_repeated_across_turns_resumes_and_encodes_its_remaining_placement() 
         demand: crate::batching::Demand::NONE,
         select: Vec::new(),
         prime: None,
+        readouts: Vec::new(),
     };
     for (position, tokens) in [(0, vec![TEXT, MEDIA]), (2, vec![TEXT])] {
         let rows = tokens.len();
@@ -1801,6 +1826,7 @@ fn feed(request: RequestId, position: usize, values: &[u32]) -> Operation {
         select: Vec::new(),
         committed: values.len(),
         prime: None,
+        readouts: Vec::new(),
     }
 }
 
@@ -2249,4 +2275,235 @@ fn selected_histories_follow_blocks_across_rollback() {
         bindings = returned;
     }
     assert_eq!(blocks(&domain, source), 4);
+}
+
+/// What each row readout of a test launch allocates beside its leases.
+const READOUT_VALUE_BYTES: u64 = 4096;
+
+/// `definition` with global attention trained non-causal.
+fn non_causal(mut definition: ModelDefinition) -> ModelDefinition {
+    definition.decision = Some(magnitude_family_contracts::DecisionBinding {
+        metadata: magnitude_artifacts::DecisionMetadata::new(
+            "{{ state }}".into(),
+            false,
+            Default::default(),
+        ),
+        readout_head: None,
+        reads_logits: false,
+        reads_scores: false,
+    });
+    definition
+}
+
+/// A launch's readout values are the heap's from its reservation, so a
+/// second reservation decides beside them, until its submission, when
+/// Seismic charges them, or until the reservation is dropped unsubmitted.
+#[test]
+fn a_launch_claims_its_readout_values_while_its_reservation_lives() {
+    let Some((mut domain, mut bindings)) = fixture(None) else {
+        return;
+    };
+    let request = RequestId(90);
+    open(&mut domain, &mut bindings, request);
+    let claimed = |domain: &ExecutorDomain<TestFamily>| {
+        domain.memory.borrow().heap().claimed().device
+    };
+    let before = claimed(&domain);
+    let operations = vec![Operation::Forward {
+        request,
+        kind: WorkKind::Prefill,
+        tokens: vec![crate::TokenId(1)],
+        position: 0,
+        conditioning: None,
+        demand: crate::batching::Demand::READOUT,
+        select: Vec::new(),
+        committed: 1,
+        prime: None,
+        readouts: vec![magnitude_readout::Readout {
+            row: 0,
+            kind: magnitude_readout::ReadoutKind::Logits {
+                tokens: vec![crate::TokenId(1), crate::TokenId(2)].into(),
+            },
+        }],
+    }];
+    let ReservedResources::Target(reservation) = domain
+        .reserve(&mut bindings, &operations)
+        .unwrap()
+        .into_resources()
+    else {
+        panic!("a forward reserves the target lane")
+    };
+    assert_eq!(claimed(&domain), before + READOUT_VALUE_BYTES);
+    let flight = domain
+        .submit_target(bindings, &operations, reservation)
+        .unwrap_or_else(|failure| panic!("target submission failed: {}", failure.error()));
+    assert_eq!(claimed(&domain), before);
+    let (pending, mut bindings) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    // A reservation dropped unsubmitted releases its claim too.
+    let mut next = operations;
+    let Operation::Forward {
+        position, readouts, ..
+    } = &mut next[0]
+    else {
+        unreachable!()
+    };
+    *position = 1;
+    readouts[0].row = 1;
+    let reservation = domain.reserve(&mut bindings, &next).unwrap();
+    assert_eq!(claimed(&domain), before + READOUT_VALUE_BYTES);
+    drop(reservation);
+    assert_eq!(claimed(&domain), before);
+}
+
+/// A blocked input reads only in a model that computes layer-major: one
+/// whose attention was trained non-causal.
+#[test]
+fn only_a_model_computing_layer_major_reads_blocked_input() {
+    let blocked = || {
+        let input = vision_input(&[], 4);
+        let visibility = magnitude_readout::ReadoutSequence::new(
+            input.clone(),
+            vec![magnitude_readout::Block::new(0..4, vec![0])],
+            Vec::new(),
+        )
+        .unwrap()
+        .visibility();
+        (input, visibility)
+    };
+    let platform = platform::DeviceRequest::Automatic;
+    let Some((mut causal, _)) = fixture_of(tiny_definition(), 2, None, false, false, platform)
+    else {
+        return;
+    };
+    let (input, visibility) = blocked();
+    assert_eq!(
+        causal.install_visible_input(RequestId(91), input, visibility),
+        Err("a blocked input needs a model whose attention was trained non-causal".into())
+    );
+    let (mut trained, _) =
+        fixture_of(non_causal(tiny_definition()), 2, None, false, false, platform).unwrap();
+    let (input, visibility) = blocked();
+    trained
+        .install_visible_input(RequestId(92), input, visibility)
+        .unwrap();
+}
+
+/// A prompt of `TEXT`, one image of four media rows, and `TEXT`.
+fn wide_image_input() -> PreparedModelInput {
+    use magnitude_artifacts::{
+        BoundaryRule, InputLayout, InputSpan,
+        media::{DType, PreparedTensor},
+    };
+    use magnitude_family_contracts::{
+        PreparedVisionInput, TokenPlan, VisionPositionBlend, VisionSpatialControls,
+    };
+    let definition = vision_definition();
+    let patches = 16;
+    let pixels = PreparedTensor::new(
+        "pixel_values".into(),
+        DType::F32,
+        vec![patches, 24],
+        vec![0; patches as usize * 24 * 4],
+    )
+    .unwrap();
+    let spatial = VisionSpatialControls::new(
+        (0..patches as usize).collect(),
+        vec![[0, 0]; patches as usize],
+        Some(VisionPositionBlend {
+            indices: std::array::from_fn(|_| vec![0; patches as usize]),
+            coefficients: std::array::from_fn(|_| vec![0.25; patches as usize]),
+        }),
+        Vec::new(),
+    )
+    .unwrap();
+    let image = PreparedVisionInput::new(&definition, [1, 4, 4], pixels, spatial).unwrap();
+    let tokens = vec![TEXT, MEDIA, MEDIA, MEDIA, MEDIA, TEXT];
+    let span = InputSpan {
+        start: 1,
+        end: 5,
+        identity: "wide".into(),
+        boundaries: BoundaryRule::Indivisible,
+        language_history: false,
+    };
+    PreparedModelInput::new(
+        &definition,
+        TokenPlan::new(tokens, InputLayout::new(6, vec![span]).unwrap()).unwrap(),
+        (0..6).map(|position| [position; 3]).collect(),
+        6,
+        [("wide".to_owned(), image)].into_iter().collect(),
+    )
+    .unwrap()
+}
+
+/// An advance wider than one launch whose rows hold an image computes
+/// layer-major: the image encoded once, each chunk reading its own rows'
+/// part of the image's features.
+#[test]
+fn a_conditioned_advance_wider_than_one_launch_reads_each_chunks_part_of_its_media() {
+    use crate::programs::SubmittedTarget;
+    let Some((mut domain, mut bindings)) = fixture_of(
+        non_causal(tiny_definition()),
+        2,
+        None,
+        false,
+        false,
+        platform::DeviceRequest::Automatic,
+    ) else {
+        return;
+    };
+    let request = RequestId(93);
+    domain.install_input(request, wide_image_input()).unwrap();
+    let [encode] = encoded_images(&domain.open_state(&mut bindings, request, None).unwrap())
+        .try_into()
+        .unwrap_or_else(|_| panic!("one image forms one encode"));
+    let features = reconcile_encode(&mut domain, request, encode);
+    assert_eq!(domain.computes_advance(6), Ok(()));
+    let tokens = domain.input[&request].input.tokens().to_vec();
+    let operation = Operation::Forward {
+        request,
+        kind: WorkKind::Prefill,
+        committed: tokens.len(),
+        tokens,
+        position: 0,
+        conditioning: None,
+        demand: crate::batching::Demand::NONE,
+        select: Vec::new(),
+        prime: None,
+        readouts: Vec::new(),
+    };
+    let flight = submit_reserved_target(&mut domain, bindings, vec![operation]);
+    let launch = flight.work.submission.launch();
+    let crate::LaunchRows::LayerMajor(layered) = launch.rows() else {
+        panic!("an advance wider than one launch computes layer-major")
+    };
+    let parts = layered
+        .chunks
+        .iter()
+        .map(|chunk| {
+            let slices = crate::ConditioningSlice::within(&launch.conditioning_slices()[0], &chunk.rows);
+            assert!(slices.iter().all(|slice| slice.source.features == features));
+            (
+                chunk.rows.clone(),
+                slices
+                    .iter()
+                    .map(|slice| (slice.destination, slice.source.start, slice.source.count))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        parts,
+        vec![
+            (0..2, vec![(1, 0, 1)]),
+            (2..4, vec![(0, 1, 2)]),
+            (4..6, vec![(0, 3, 1)]),
+        ]
+    );
+    let (pending, _bindings) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 6 })
+        .unwrap();
 }

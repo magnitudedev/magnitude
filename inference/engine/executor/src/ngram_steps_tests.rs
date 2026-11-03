@@ -109,6 +109,7 @@ fn forward(request: RequestId, kind: WorkKind, tokens: &[u32], position: usize, 
             .collect(),
         committed: tokens.len(),
         prime: None,
+        readouts: Vec::new(),
     }
 }
 

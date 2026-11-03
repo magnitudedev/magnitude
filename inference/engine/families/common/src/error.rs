@@ -1,7 +1,7 @@
 //! Why a header could not be read. Families convert it into their own error
 //! type; the wording here is the default a family may keep.
 
-use magnitude_artifacts::{gguf::Encoding, UnsupportedReason};
+use magnitude_artifacts::{gguf::Encoding, DecisionError, UnsupportedReason};
 use magnitude_family_contracts::{DefinitionError, FamilyError};
 use std::{error, fmt};
 
@@ -136,6 +136,15 @@ const OUTPUT_HEAD: &str = "output.weight";
 impl From<HeaderError> for FamilyError {
     fn from(error: HeaderError) -> Self {
         FamilyError::unsupported(error.reasons(), error.to_string())
+    }
+}
+
+impl From<DecisionError> for HeaderError {
+    fn from(error: DecisionError) -> Self {
+        match error {
+            DecisionError::Missing { key } => Self::MissingMetadata(key),
+            DecisionError::Malformed { key, expected } => Self::MetadataType { key, expected },
+        }
     }
 }
 

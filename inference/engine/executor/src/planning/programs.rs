@@ -20,9 +20,10 @@ use crate::operators::{
     self, CausalHeadBlock, attention_slot, dense_slot, feed_forward_slot, mixer_slot, paired_block,
 };
 use magnitude_family_contracts::{
-    AffinePart, CandidateCorrector, CorrectorSite, CorrectorWeight, DraftDefinition,
-    DraftEmbedding, DraftMethod, ExitNorm, HistoryReads, ModelDefinition, Operator,
-    ProposalReadoutPolicy, SublayerIndex, TapPoint, TokenId, WeightKind, WeightRole, WeightScope,
+    AffinePart, Attention, CandidateCorrector, CorrectorSite, CorrectorWeight, DraftDefinition,
+    DraftEmbedding, DraftMethod, ExitNorm, HistoryDomain, HistoryReads, KeyValue, ModelDefinition,
+    Operator, ProposalReadoutPolicy, SublayerIndex, TapPoint, TokenId, WeightKind, WeightRole,
+    WeightScope,
 };
 use magnitude_state::KvCodec;
 use seismic::{DType, Element};
@@ -76,6 +77,9 @@ pub struct TargetBlockProgramSlot {
     streams: Option<StreamsBinding>,
     /// The n-gram input after the feed-forward.
     ngram: Option<NGramBinding>,
+    /// The projection of an attention block whose keys and values a
+    /// layer-major advance publishes alone (`publishes_keys_values`).
+    keys_values: Option<AttentionBinding>,
 }
 
 impl TargetBlockProgramSlot {
@@ -86,7 +90,19 @@ impl TargetBlockProgramSlot {
             per_layer: None,
             streams: None,
             ngram: None,
+            keys_values: None,
         }
+    }
+
+    pub fn with_keys_values(self, keys_values: Option<AttentionBinding>) -> Self {
+        Self {
+            keys_values,
+            ..self
+        }
+    }
+
+    pub fn keys_values(&self) -> Option<AttentionBinding> {
+        self.keys_values
     }
 
     pub fn with_per_layer(self, per_layer: Option<PerLayerBinding>) -> Self {
@@ -626,17 +642,27 @@ pub(super) fn derive_program_plan(
             .map_err(|_| PlanError::Arithmetic("target block index exceeds u32"))?;
         let paired = paired_block(block)?;
         let [mixer, feed_forward] = paired_scopes(index, WeightScope::TargetSublayer);
+        let mixer_program = mixer_slot(
+            &paired,
+            decoder.hidden,
+            decoder.context_limit,
+            |kind| lookup(target, mixer, kind),
+            |kind| planned_scalable(target, mixer, kind),
+            active_element,
+            history,
+        )?;
+        let keys_values = match mixer_program {
+            MixerProgramSlot::Attention(binding) if publishes_keys_values(definition, &paired) => {
+                Some(AttentionBinding {
+                    key_value_only: true,
+                    ..binding
+                })
+            }
+            _ => None,
+        };
         blocks.push(
             TargetBlockProgramSlot::new(
-                mixer_slot(
-                    &paired,
-                    decoder.hidden,
-                    decoder.context_limit,
-                    |kind| lookup(target, mixer, kind),
-                    |kind| planned_scalable(target, mixer, kind),
-                    active_element,
-                    history,
-                )?,
+                mixer_program,
                 paired
                     .feed_forward
                     .map(|sublayer| {
@@ -723,7 +749,8 @@ pub(super) fn derive_program_plan(
                         )
                     })
                     .transpose()?,
-            ),
+            )
+            .with_keys_values(keys_values),
         );
     }
     let per_layer_entry = decoder
@@ -760,6 +787,7 @@ pub(super) fn derive_program_plan(
         })
         .transpose()?;
     let readout_head = planned_readout_recipe(target, WeightScope::Target, readout_choices)?;
+    let decision = definition.decision.as_ref();
     let readout = ReadoutBinding {
         // A hyper-connection exit's partials bind an empty F32 norm.
         norm: match &decoder.exit.norm {
@@ -768,6 +796,19 @@ pub(super) fn derive_program_plan(
         },
         head: readout_head,
         activation: active_element,
+        readout_head: definition
+            .readout_head()
+            .map(|_| planned_element(target, WeightScope::Target, WeightKind::ReadoutHead))
+            .transpose()?,
+        // `readout_selected_rows` binds the packed output projection without
+        // an accumulator-scale port, so a model reading chosen logits is
+        // refused a projection stored with a second-level scale. (It is never
+        // stored as views, `ModelLoadPlan::with_readout_candidates`.)
+        logits: decision
+            .is_some_and(|decision| decision.reads_logits)
+            .then(|| planned_element(target, WeightScope::Target, WeightKind::Output))
+            .transpose()?,
+        scores: decision.is_some_and(|decision| decision.reads_scores),
     };
     // A selected separate draft is the drafter; a draft head otherwise.
     let separate = head.and(definition.draft.as_ref());
@@ -1224,4 +1265,57 @@ fn corrector_binding(
 /// The weight scopes of a paired block's mixer and feed-forward sublayers.
 fn paired_scopes(block: u32, scope: fn(SublayerIndex) -> WeightScope) -> [WeightScope; 2] {
     [0, 1].map(|sublayer| scope(SublayerIndex { block, sublayer }))
+}
+
+/// Whether `definition` reads attention blocks and computes an advance
+/// wider than one launch layer-major (`ExecutorDomain::reads_blocks`,
+/// `ExecutorDomain::computes_advance`), else what it lacks: its global
+/// attention was trained non-causal (`ModelDefinition::causal_attention`),
+/// the only models whose rows read later rows; no global attention selects
+/// among its history, whose indexer orders keys causally; no attention
+/// reads media rows bidirectionally, since a chunk may split a media span;
+/// and no block reads a per-layer or n-gram input, which a chunk would read
+/// per launch.
+pub(crate) fn computes_layer_major(definition: &ModelDefinition) -> Result<(), &'static str> {
+    if definition.causal_attention() {
+        return Err("needs a model whose attention was trained non-causal");
+    }
+    for (_, sublayer) in definition.decoder.sublayers() {
+        match &sublayer.op {
+            Operator::Attention(attention)
+                if matches!(attention.reads, HistoryReads::Selected { .. }) =>
+            {
+                return Err("needs a model whose global attention reads all of its history");
+            }
+            Operator::Attention(attention)
+                if attention.media_rows != magnitude_family_contracts::MediaRowAttention::Causal =>
+            {
+                return Err("needs a model whose attention reads media rows causally");
+            }
+            Operator::PerLayerInput(_) | Operator::NGramInput(_) => {
+                return Err("needs a model whose blocks read no per-layer or n-gram input");
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Whether a layer-major advance publishes `block`'s keys and values alone
+/// before its chunks attend there: an attention block storing its own rows
+/// in a history of every token (the global history a blocked input's rows
+/// read their blocks in, `ExecutorDomain::layer_barriers`), of a model
+/// computing layer-major.
+fn publishes_keys_values(definition: &ModelDefinition, block: &operators::PairedBlock<'_>) -> bool {
+    computes_layer_major(definition).is_ok()
+        && matches!(
+            block.mixer,
+            operators::Mixer::Attention(Attention {
+                key_value: KeyValue::Owned {
+                    domain: HistoryDomain::Token,
+                    ..
+                },
+                ..
+            })
+        )
 }

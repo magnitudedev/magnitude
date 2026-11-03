@@ -326,6 +326,7 @@ fn draft_readout_tuning_preserves_the_complete_artifact_vocabulary() {
     };
     let separate = readout::HeadRowsTuning {
         projection_scope: magnitude_family_contracts::WeightScope::Target,
+        kind: magnitude_family_contracts::WeightKind::Output,
         norm_scope: magnitude_family_contracts::WeightScope::Target,
         norm: Element::f16(),
         weight: Element::f16(),

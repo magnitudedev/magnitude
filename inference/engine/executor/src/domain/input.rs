@@ -44,13 +44,31 @@ impl TokenHistory {
 }
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
-    /// Install a request's prepared input for its lifetime. It is not
-    /// resident until [`Self::open_state`]; its images are encoded then.
+    /// Install a request's prepared input for its lifetime, its rows
+    /// attending causally. It is not resident until [`Self::open_state`];
+    /// its images are encoded then.
     pub fn install_input(
         &mut self,
         request: RequestId,
         input: PreparedModelInput,
     ) -> Result<(), String> {
+        self.install_visible_input(request, input, magnitude_readout::Visibility::causal())
+    }
+
+    /// [`Self::install_input`] whose rows read what `visibility` says on
+    /// the model's global attention layers. A blocked input reads in a
+    /// model that reads blocks ([`Self::reads_blocks`]) and is fed only
+    /// within its rows.
+    pub fn install_visible_input(
+        &mut self,
+        request: RequestId,
+        input: PreparedModelInput,
+        visibility: magnitude_readout::Visibility,
+    ) -> Result<(), String> {
+        if !visibility.is_causal() {
+            self.reads_blocks()
+                .map_err(|reason| format!("a blocked input {reason}"))?;
+        }
         if self.input.contains_key(&request)
             || self.target.contains_key(&request)
             || self.head.contains_key(&request)
@@ -85,6 +103,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             RequestInput {
                 boundary: None,
                 input,
+                visibility,
                 images,
                 resident: false,
                 tokens: TokenHistory::default(),
@@ -128,7 +147,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(())
     }
 
-    fn installed_input(&self, request: RequestId) -> Result<&RequestInput, String> {
+    pub(super) fn installed_input(&self, request: RequestId) -> Result<&RequestInput, String> {
         self.input
             .get(&request)
             .ok_or_else(|| format!("request {} lowers rows without installed input", request.0))
@@ -163,9 +182,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let end = position
             .checked_add(tokens.len())
             .ok_or("input end overflows")?;
+        let blocked = !state.visibility.is_causal();
         if !state.input.layout().boundary(position)
             || !state.input.layout().boundary(end)
-            || (position < state.input.tokens().len() && end > state.input.tokens().len())
+            || !state.visibility.boundary(position)
+            || !state.visibility.boundary(end)
+            || ((blocked || position < state.input.tokens().len())
+                && end > state.input.tokens().len())
             || tokens.iter().enumerate().any(|(index, token)| {
                 state
                     .input

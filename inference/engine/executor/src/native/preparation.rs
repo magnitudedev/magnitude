@@ -55,7 +55,8 @@ use magnitude_kernels::{
     draft_convolve_input,
     draft_convolve_residual, draft_gated_rows, draft_path_step, draft_top_k, feature_copy,
     feature_rows, import_dense, moe_tail, ngram_gate, ngram_inject, ngram_rows, packing_bound,
-    per_layer_inputs, place_logits_rows, post_norm_residual, repack_weight, repeat_rows,
+    per_layer_inputs, place_logits_rows, post_norm_residual, readout_scores_rows, repack_weight,
+    repeat_rows,
     selection_notice, stored_rows, tap_rows, widen_rows,
 };
 use seismic::KernelRequest;
@@ -661,6 +662,7 @@ impl<'a> Preparation<'a> {
         } else {
             self.tuning.dependency(&HeadRowsTuning {
                 projection_scope: scope,
+                kind: WeightKind::Output,
                 norm_scope,
                 norm,
                 weight,
@@ -1087,6 +1089,15 @@ impl<'a> Preparation<'a> {
                     _ => None,
                 }),
         );
+        let keys_values_layers = BindingLayers::of(
+            target
+                .blocks()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, block)| {
+                    Some((block.keys_values()?, sublayer_scope(index, 0)))
+                }),
+        );
         let recurrent_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
             |(index, block)| match block.mixer() {
                 MixerProgramSlot::Recurrent(binding) => Some((binding, sublayer_scope(index, 0))),
@@ -1201,6 +1212,24 @@ impl<'a> Preparation<'a> {
                 )
                 | None => {}
             }
+            // A layer-major advance's publishing passes project keys and
+            // values alone.
+            if let Some(binding) = block
+                .keys_values()
+                .filter(|binding| !self.target.keys_values.contains_key(binding))
+            {
+                let project = self.spec.tuned(
+                    &mut self.tuning,
+                    &AttentionProjectTuning {
+                        binding,
+                        scopes: keys_values_layers.scopes(binding),
+                        epsilon: self.epsilon,
+                    },
+                )?;
+                if let Some(project) = project {
+                    self.target.keys_values.insert(binding, project);
+                }
+            }
             if let Some(calls) = block.feed_forward().and_then(|feed| feed_demand.get(&feed)) {
                 self.tuning.set_invocations(calls.clone(), false);
             }
@@ -1298,33 +1327,22 @@ impl<'a> Preparation<'a> {
         let bindings = format!("{b:?}");
         let features = self.target_features(&bindings, b.norm, b.activation)?;
         let weight = b.head.packed();
-        let head = match b.head {
-            ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => {
-                let head = self.spec.tuned(
-                    &mut self.tuning,
-                    &HeadRowsTuning {
-                        projection_scope: WeightScope::Target,
-                        norm_scope: WeightScope::Target,
-                        norm: b.norm,
-                        weight,
-                        activation: b.activation,
-                        epsilon: self.epsilon,
-                        rows: None,
-                    },
-                )?;
-                let selected = self.spec.tuned(
-                    &mut self.tuning,
-                    &SelectedRowsTuning {
-                        norm: b.norm,
-                        weight,
-                        activation: b.activation,
-                        epsilon: self.epsilon,
-                    },
-                )?;
-                head.zip(selected)
-                    .map(|(head, selected)| ReadoutHeadKernels::Packed { head, selected })
-            }
-        };
+        let head = self
+            .spec
+            .tuned(
+                &mut self.tuning,
+                &HeadRowsTuning {
+                    projection_scope: WeightScope::Target,
+                    kind: WeightKind::Output,
+                    norm_scope: WeightScope::Target,
+                    norm: b.norm,
+                    weight: weight.element,
+                    activation: b.activation,
+                    epsilon: self.epsilon,
+                    rows: None,
+                },
+            )?
+            .map(|head| ReadoutHeadKernels::Packed { head });
         let qualified = self.qualified_readout(
             ReadoutReader::Target(b),
             WeightScope::Target,
@@ -1337,7 +1355,7 @@ impl<'a> Preparation<'a> {
             self.selection_limits
                 .map_or(0, |limits| limits.max_selected_rows),
             head.as_ref().map(|head| match head {
-                ReadoutHeadKernels::Packed { head, .. } => {
+                ReadoutHeadKernels::Packed { head } => {
                     ProjectionKernels::RawPacked(head.clone())
                 }
                 _ => unreachable!("ordinary target readout is canonical packed"),
@@ -1345,18 +1363,69 @@ impl<'a> Preparation<'a> {
         )?;
         let head = match (head, qualified) {
             (
-                Some(ReadoutHeadKernels::Packed { head, selected }),
+                Some(ReadoutHeadKernels::Packed { head }),
                 Some(ProjectionKernels::Qualified { progressive, .. }),
             ) => Some(ReadoutHeadKernels::Qualified {
-                packed: Box::new(ReadoutHeadKernels::Packed { head, selected }),
+                packed: Box::new(ReadoutHeadKernels::Packed { head }),
                 progressive,
             }),
             (head, _) => head,
         };
+        // A model with a readout head reads it through its own projection,
+        // one reading chosen logits (`ReadoutBinding::logits`) through the
+        // selected-row projection, and one reading scores
+        // (`ReadoutBinding::scores`) through the scores readout. Each is
+        // optional: a load whose device prepares none still reads its rows'
+        // logits and features.
+        let readout_head = match b.readout_head {
+            None => None,
+            Some(weight) => self.spec.tuned(
+                &mut self.tuning,
+                &HeadRowsTuning {
+                    projection_scope: WeightScope::Target,
+                    kind: WeightKind::ReadoutHead,
+                    norm_scope: WeightScope::Target,
+                    norm: b.norm,
+                    weight,
+                    activation: b.activation,
+                    epsilon: self.epsilon,
+                    rows: None,
+                },
+            )?,
+        };
+        let logits = match b.logits {
+            None => None,
+            Some(weight) => self.spec.tuned(
+                &mut self.tuning,
+                &SelectedRowsTuning {
+                    norm: b.norm,
+                    weight,
+                    activation: b.activation,
+                    epsilon: self.epsilon,
+                },
+            )?,
+        };
+        let scores = match b.scores {
+            false => None,
+            true => self.spec.fixed(
+                &bindings,
+                &[("D", self.hidden)],
+                readout_scores_rows::native_entry_with(readout_scores_rows::Elements {
+                    A: b.activation,
+                }),
+            )?,
+        };
         if let (Some(features), Some(head)) = (features, head) {
-            self.target
-                .readout
-                .insert(b, ReadoutKernels { features, head });
+            self.target.readout.insert(
+                b,
+                ReadoutKernels {
+                    features,
+                    head,
+                    readout_head,
+                    logits,
+                    scores,
+                },
+            );
         }
         if let Some(b) = target.features() {
             if let Some(kernel) = self.target_features(&format!("{b:?}"), b.norm, b.activation)? {
@@ -3071,6 +3140,7 @@ impl<'a> Preparation<'a> {
                     &mut self.tuning,
                     &HeadRowsTuning {
                         projection_scope: draft_plan.projection_scope(),
+                        kind: WeightKind::Output,
                         norm_scope: WeightScope::Draft,
                         norm: draft_plan.output_norm(),
                         weight,

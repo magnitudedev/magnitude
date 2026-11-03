@@ -17,7 +17,7 @@ pub use family::LlamaFamily;
 
 use magnitude_artifacts::{
     gguf::{Directory, Value},
-    PackageIdentity, UnsupportedReason,
+    DecisionMetadata, PackageIdentity, UnsupportedReason,
 };
 use magnitude_family_common::{architecture_keys, rotary, HeaderError, Metadata, Tensors};
 use magnitude_family_contracts::{
@@ -274,6 +274,8 @@ pub fn admit(directory: &Directory) -> Result<(), Error> {
     for (key, metadata) in architecture_keys(directory, FAMILY_ID) {
         if key.starts_with("rope.scaling.") {
             scaled = true;
+        } else if DecisionMetadata::owns_key(directory, key) {
+            // Its decision description's, read by package inspection.
         } else if !ADMITTED_KEYS.contains(&key) {
             features.push(Feature::UnknownMetadata(metadata.name.clone()));
         } else if matches!(metadata.value, Value::Array(_)) {
@@ -291,7 +293,10 @@ pub fn admit(directory: &Directory) -> Result<(), Error> {
         directory
             .tensors
             .iter()
-            .filter(|tensor| !admitted_role(&tensor.name))
+            .filter(|tensor| {
+                !admitted_role(&tensor.name)
+                    && !DecisionMetadata::owns_tensor(directory, &tensor.name)
+            })
             .map(|tensor| Feature::Tensor(tensor.name.clone())),
     );
     if directory.tensor("output.weight").is_none() {
@@ -429,6 +434,7 @@ pub fn inspect_components(
     tensors.finish()?;
 
     let definition = ModelDefinition {
+        decision: None,
         family: FamilyId(FAMILY_ID.into()),
         artifact_identity: identity,
         inputs: InputSemantics {

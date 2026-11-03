@@ -107,7 +107,10 @@ pub struct ModelPolicy {
     /// and sampled requests. When absent, the width is the widest the drafter
     /// has: all a separate draft's block holds, or all a head chains.
     pub mtp_proposals: Option<u8>,
-    pub kv_codec: KvCodec,
+    /// The KV history codec; when absent, the model's own: dense for a
+    /// decision model, whose answers are distributions calibrated on
+    /// uncompressed history, and affine K8/V4 otherwise.
+    pub kv_codec: Option<KvCodec>,
     /// Queue each plain decode step's successor on the device before the
     /// step completes (cross-step pipelining).
     pub lookahead: bool,
@@ -125,7 +128,7 @@ impl Default for ModelPolicy {
             method: ModelMethod::Auto,
             draft_policy: None,
             mtp_proposals: None,
-            kv_codec: KvCodec::AffineK8V4,
+            kv_codec: None,
             lookahead: true,
             exported_logits_rows: 0,
             numerical_profile: None,
@@ -298,13 +301,26 @@ impl ModelPolicy {
                 self.draft_policy
             },
             method,
-            kv_codec: self.kv_codec,
+            kv_codec: match self.kv_codec {
+                Some(codec) => codec,
+                None => default_kv_codec(definition),
+            },
             // A per-layer entry gathers host-table rows by host tokens, so
             // its steps cannot chain on device-selected tokens.
             lookahead: self.lookahead && definition.decoder.entry.per_layer.is_none(),
             exported_logits_rows: self.exported_logits_rows,
             numerical_profile: self.numerical_profile.clone(),
         })
+    }
+}
+
+/// The codec a model's attention history is stored in unless the host names
+/// one: dense for a decision model, which every reference reads at the
+/// precision it computed, else the affine K8/V4 codec.
+fn default_kv_codec(definition: &ModelDefinition) -> KvCodec {
+    match definition.decision {
+        Some(_) => KvCodec::Dense,
+        None => KvCodec::AffineK8V4,
     }
 }
 
@@ -656,6 +672,7 @@ pub(crate) mod tests {
             component: HeadComponent::Target,
         });
         ModelDefinition {
+            decision: None,
             family: magnitude_family_contracts::FamilyId("fixture".into()),
             artifact_identity: PackageIdentity {
                 target: magnitude_artifacts::ArtifactIdentity([1; 32]),
@@ -850,6 +867,24 @@ pub(crate) mod tests {
         let plain = ModelPolicy::default().resolve(&definition(false)).unwrap();
         assert_eq!(plain.method, ResolvedMethod::Plain);
         assert_eq!(plain.kv_codec, KvCodec::AffineK8V4);
+        let mut decision = definition(false);
+        decision.decision = Some(magnitude_family_contracts::DecisionBinding {
+            metadata: magnitude_artifacts::DecisionMetadata::new(
+                "{{ state }}".into(),
+                false,
+                Default::default(),
+            ),
+            readout_head: None,
+            reads_logits: false,
+            reads_scores: false,
+        });
+        let decides = ModelPolicy::default().resolve(&decision).unwrap();
+        assert_eq!(decides.kv_codec, KvCodec::Dense);
+        let explicit = ModelPolicy {
+            kv_codec: Some(KvCodec::AffineK8V4),
+            ..ModelPolicy::default()
+        };
+        assert_eq!(explicit.resolve(&decision).unwrap().kv_codec, KvCodec::AffineK8V4);
 
         let mtp = ModelPolicy::default().resolve(&definition(true)).unwrap();
         assert_eq!(

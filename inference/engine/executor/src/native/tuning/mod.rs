@@ -2539,6 +2539,7 @@ impl TuningInputs<'_, '_> {
                                 }],
                                 demand: Demand::NONE,
                                 select: None,
+                                readouts: Vec::new(),
                             }
                         })
                         .collect(),

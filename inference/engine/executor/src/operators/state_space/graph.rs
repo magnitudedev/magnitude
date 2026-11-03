@@ -452,6 +452,7 @@ mod tests {
             projector: None,
         };
         let definition = ModelDefinition {
+            decision: None,
             family: FamilyId("hybrid-state-space".into()),
             artifact_identity: identity,
             inputs: InputSemantics { coordinate_axes: 1 },

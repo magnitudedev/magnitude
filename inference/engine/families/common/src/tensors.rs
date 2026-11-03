@@ -4,10 +4,27 @@
 
 use crate::HeaderError;
 use magnitude_artifacts::gguf::{Directory, Encoding, TensorDescriptor};
+use magnitude_artifacts::{DecisionMetadata, READOUT_HEAD};
 use magnitude_family_contracts::{
     checked_product, ImportTransform, ScaledActivations, WeightDescriptor,
 };
 use std::collections::HashSet;
+
+/// The readout head of a described decision header, when it stores
+/// one: a `[outputs, hidden]` matrix in the element it is stored in
+/// (`DecisionBinding::readout_head`). Package inspection binds it for every
+/// family; a family's binder leaves it ([`DecisionMetadata::owns_tensor`]).
+pub fn readout_head(
+    directory: &Directory,
+    hidden: u64,
+) -> Result<Option<WeightDescriptor>, HeaderError> {
+    let mut tensors = Tensors::new(directory);
+    if !DecisionMetadata::described(directory) || !tensors.contains(READOUT_HEAD) {
+        return Ok(None);
+    }
+    let outputs = tensors.rows(READOUT_HEAD)?;
+    tensors.bind(READOUT_HEAD, &[outputs, hidden]).map(Some)
+}
 
 pub struct Tensors<'a> {
     directory: &'a Directory,
@@ -151,13 +168,16 @@ impl<'a> Tensors<'a> {
         }))
     }
 
-    /// The stored tensors bound by no role, in directory order.
+    /// The stored tensors bound by no role, in directory order, besides the
+    /// readout head the header's decision description owns.
     pub fn unbound(&self) -> impl Iterator<Item = &'a str> + '_ {
         self.directory
             .tensors
             .iter()
             .map(|tensor| tensor.name.as_str())
-            .filter(|name| !self.bound.contains(name))
+            .filter(|name| {
+                !self.bound.contains(name) && !DecisionMetadata::owns_tensor(self.directory, name)
+            })
     }
 
     /// Proves every stored tensor was bound, naming every one that was not.

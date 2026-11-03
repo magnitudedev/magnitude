@@ -98,7 +98,7 @@ pub fn configuration(
                 ModelMethod::Plain
             },
             mtp_proposals: load.proposals,
-            kv_codec: options.kv_codec,
+            kv_codec: Some(options.kv_codec),
             lookahead: load.lookahead,
             exported_logits_rows: load.exported_logits_rows,
             numerical_profile: options.numerical_profile.clone(),
@@ -291,6 +291,7 @@ impl Engine {
             select,
             committed,
             prime: None,
+            readouts: Vec::new(),
         }
     }
 

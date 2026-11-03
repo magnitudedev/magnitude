@@ -75,6 +75,7 @@ fn operation_validation_checks_the_complete_selection_row_contract() {
         select: vec![select],
         committed: 1,
         prime: None,
+        readouts: Vec::new(),
     };
 
     assert!(selected(selection(Shaping::default(), None))
@@ -109,6 +110,7 @@ fn operation_validation_checks_the_complete_selection_row_contract() {
         select: per_row.clone(),
         committed: 1,
         prime: None,
+        readouts: Vec::new(),
     };
     assert!(verify.validate().is_ok());
     assert_eq!(verify.selection_for_row(2), per_row.get(2));
@@ -137,6 +139,7 @@ fn operation_validation_checks_the_complete_selection_row_contract() {
         select: vec![selection(Shaping::default(), None)],
         committed: 3,
         prime: None,
+        readouts: Vec::new(),
     };
     assert!(finishing_prefill.validate().is_ok());
     assert!(finishing_prefill.selection_for_row(0).is_none());
@@ -153,6 +156,7 @@ fn operation_validation_checks_the_complete_selection_row_contract() {
         select: vec![selection(Shaping::default(), None)],
         committed: 1,
         prime: None,
+        readouts: Vec::new(),
     };
     assert!(matches!(
         invalid.validate(),

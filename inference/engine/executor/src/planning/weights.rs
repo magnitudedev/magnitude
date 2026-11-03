@@ -620,6 +620,20 @@ pub struct ReadoutBinding {
     pub norm: Element,
     pub head: ReadoutHead,
     pub activation: Element,
+    /// The resident element of the model's readout head, when it has one.
+    pub readout_head: Option<Element>,
+    /// The resident element of the packed output projection, without a
+    /// second-level scale, that the load reads logits of chosen tokens
+    /// through (`readout_selected_rows`): a model whose readouts read them
+    /// (`DecisionBinding::reads_logits`). Any other load prepares and
+    /// reserves nothing for them, and refuses a plan reading them at
+    /// admission.
+    pub logits: Option<Element>,
+    /// Whether the load reads scores of retained rows: a model whose
+    /// readouts read them (`DecisionBinding::reads_scores`). Any other load
+    /// prepares and reserves nothing for them, and refuses a plan reading
+    /// them at admission.
+    pub scores: bool,
 }
 
 /// How the plan places the vocabulary projection.
@@ -1067,6 +1081,12 @@ impl ModelLoadPlan {
                 .chain(operators::decoder_weights(decoder))
                 .chain(operators::exit_weights(decoder))
                 .chain([(target_role(WeightKind::Output), &decoder.exit.output)])
+                .chain(
+                    definition
+                        .readout_head()
+                        .into_iter()
+                        .map(|head| (target_role(WeightKind::ReadoutHead), head)),
+                )
                 .collect(),
             target_form,
         )?;
@@ -1190,9 +1210,11 @@ impl ModelLoadPlan {
     /// Offer lossless bounded-selection views of the target's output
     /// projection where every reader of it can read them at no loss: a Q8_0
     /// projection without a soft cap. Indexed policies require the
-    /// canonical table, and a separate drafter that projects through the
-    /// target's projection has no kernel for the views, so there the
-    /// projection keeps its packed form, as does a head's own projection. A
+    /// canonical table, and neither a separate drafter that projects through
+    /// the target's projection nor the selected-row projection of a model
+    /// whose readouts read logits of chosen tokens
+    /// (`DecisionBinding::reads_logits`) has a kernel for the views, so there
+    /// the projection keeps its packed form, as does a head's own projection. A
     /// view becomes resident, in place of the packed projection, only after
     /// whole-recipe class-cost qualification.
     pub fn with_readout_candidates(mut self, definition: &ModelDefinition) -> Result<Self, String> {
@@ -1283,7 +1305,9 @@ impl ModelLoadPlan {
                 .target
                 .iter()
                 .any(|weight| weight.role.scope == WeightScope::Draft);
-        self.readout_candidates = if drafter_reads_target {
+        self.readout_candidates = if drafter_reads_target
+            || definition.decision.as_ref().is_some_and(|decision| decision.reads_logits)
+        {
             Vec::new()
         } else {
             select(&self.target)?
@@ -1857,12 +1881,24 @@ fn push_weight(
     let role = WeightRole { scope, kind };
     // Projector weights keep their stored dense element: the vision kernels
     // read f32, f16 and bf16 matrices and vectors directly, and converting
-    // f16 matrices or f32 biases to the activation dtype only loses bits.
+    // f16 matrices or f32 biases to the activation dtype only loses bits. The
+    // readout head is read in the element it is stored in
+    // (`DecisionBinding::readout_head`).
     let stored_dense = source.dtype();
     let dense_resident = match (role.kind, stored_dense) {
-        (WeightKind::Vision(_), Some(dtype)) => dtype,
+        (WeightKind::Vision(_) | WeightKind::ReadoutHead, Some(dtype)) => dtype,
         _ => resident_dtype(role, form.activation),
     };
+    // A readout head publishes its values in its stored element: an F32
+    // product, or a BF16 linear layer's.
+    if kind == WeightKind::ReadoutHead
+        && !matches!(stored_dense, Some(DType::F32 | DType::BF16))
+    {
+        return Err(format!(
+            "the readout head {:?} is stored as {:?}; a readout head is stored F32 or BF16",
+            descriptor.name, stored.encoding
+        ));
+    }
     if operators::is_fixed_dense_role(kind) && stored_dense.is_none() {
         return Err(format!(
             "fixed-f32 weight {scope:?}/{kind:?} cannot use packed source encoding {:?}",

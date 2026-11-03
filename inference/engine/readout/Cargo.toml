@@ -1,0 +1,13 @@
+[package]
+name = "magnitude-readout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+magnitude-artifacts = { path = "../artifacts" }
+magnitude-family-contracts = { path = "../families/contracts" }
+serde = { workspace = true, features = ["rc"] }
+
+[dev-dependencies]
+postcard.workspace = true

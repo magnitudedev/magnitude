@@ -477,10 +477,11 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                 rows: slots,
                 segments: geometry.segments,
                 slots,
-                // The head's classes list no history row tiles and score
-                // no selected read.
+                // The head's classes list no history row tiles, score no
+                // selected read and attend.
                 listed: 0,
                 scored: false,
+                keys_values: false,
                 output_scales: (entries.scales)(index)?,
             };
             let (mixed, state, controls) = sublayers.mixer(

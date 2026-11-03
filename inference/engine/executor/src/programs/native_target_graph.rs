@@ -49,15 +49,21 @@ use std::time::Instant;
 /// A block graph's class: (rows, history segments, request slots, the
 /// history row tiles of its launch's rows it lists, 0 for a class that lists
 /// none; whether a selected read scores, 1, or every row of the launch reads
-/// its whole history, 0 and every other block's).
-type BlockClass = (u64, u64, u64, u64, u64);
+/// its whole history, 0 and every other block's; whether it computes only
+/// the attention block's keys and values, appending them at its rows'
+/// destinations, 1 (`TargetBlockProgramSlot::keys_values`), or the whole
+/// block, 0).
+type BlockClass = (u64, u64, u64, u64, u64, u64);
 
 /// The topology a block class's graph certifies in: its row form, whether
-/// it lists history row tiles and whether it scores.
-fn class_topology(class: BlockClass) -> (RowForm, bool, bool) {
-    let (rows, _, _, listed, scored) = class;
-    (RowForm::of(rows), listed > 0, scored > 0)
+/// it lists history row tiles, whether it scores and whether it computes
+/// keys and values alone.
+fn class_topology(class: BlockClass) -> BlockTopology {
+    let (rows, _, _, listed, scored, keys_values) = class;
+    (RowForm::of(rows), listed > 0, scored > 0, keys_values > 0)
 }
+
+type BlockTopology = (RowForm, bool, bool, bool);
 
 /// The shape of `slot`'s selected read, when its block reads one
 /// (`AttentionBinding::selection`).
@@ -157,7 +163,9 @@ fn block_listings(
 /// binds exact per-slot bank tables (every slot count a launch of `rows`
 /// rows can serve, up to the launch slot bound) and is independent of
 /// segments. Everything else is per row. A block that `scores` a selected
-/// read has, per segment count, a class that scores (and lists none).
+/// read has, per segment count, a class that scores (and lists none); one
+/// computing its `keys_values` alone has one class that reads no history.
+/// Ascending.
 fn block_classes(
     mixer: MixerKind,
     rows: u64,
@@ -165,6 +173,7 @@ fn block_classes(
     max_segments: u64,
     listings: &BlockListings,
     scores: bool,
+    keys_values: bool,
 ) -> Vec<BlockClass> {
     match mixer {
         MixerKind::Attention => std::iter::successors(Some(1u64), |segments| {
@@ -180,19 +189,24 @@ fn block_classes(
                 .filter(move |_| listings.segments(segments, max_segments) == segments);
             std::iter::once(0)
                 .chain(listed)
-                .map(move |listed| (rows, segments, 1, listed, 0))
-                .chain(scores.then_some((rows, segments, 1, 0, 1)))
+                .map(move |listed| (rows, segments, 1, listed, 0, 0))
+                .chain(scores.then_some((rows, segments, 1, 0, 1, 0)))
         })
+        .chain(keys_values.then_some(block_class(mixer, rows, 1, 1, 0, false, true)))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .collect(),
         MixerKind::Recurrent => (1..=rows.min(max_slots))
-            .map(|slots| (rows, 1, slots, 0, 0))
+            .map(|slots| (rows, 1, slots, 0, 0, 0))
             .collect(),
     }
 }
 
 /// The class of a block's graph serving a launch of `rows` rows over
 /// `segments` history segments and `slots` requests, listing `listed` of the
-/// launch's history row tiles, scoring a selected read when `scored`.
+/// launch's history row tiles, scoring a selected read when `scored`;
+/// computing an attention block's keys and values alone when `keys_values`,
+/// which reads no history.
 fn block_class(
     mixer: MixerKind,
     rows: u64,
@@ -200,17 +214,20 @@ fn block_class(
     slots: u64,
     listed: u64,
     scored: bool,
+    keys_values: bool,
 ) -> BlockClass {
     match mixer {
-        MixerKind::Attention => (rows, segments, 1, listed, u64::from(scored)),
-        MixerKind::Recurrent => (rows, 1, slots, 0, 0),
+        MixerKind::Attention if keys_values => (rows, 1, 1, 0, 0, 1),
+        MixerKind::Attention => (rows, segments, 1, listed, u64::from(scored), 0),
+        MixerKind::Recurrent => (rows, 1, slots, 0, 0, 0),
     }
 }
 
 /// The admitted classes of one block for a `rows`-row launch, as one slice:
 /// the row count, and every history segment count (attention) or request
 /// slot count (recurrent) that launch can serve. A routed feed-forward's
-/// grouped entries size their tile table from the row count alone.
+/// grouped entries size their tile table from the row count alone. A class
+/// computing keys and values alone serves its row count.
 fn block_class_slice(
     block: &PairedBlock,
     rows: u64,
@@ -218,7 +235,12 @@ fn block_class_slice(
     max_segments: u64,
     listed: &[u64],
     scored: bool,
+    keys_values: bool,
 ) -> Result<NativeGraphClassSlice, String> {
+    // Keys and values alone are a projection and an append per row.
+    if keys_values {
+        return Ok(NativeGraphClassSlice::new().dimension("M", [rows]));
+    }
     let mixer = block.mixer.kind();
     // The segment and slot counts are those of every listing class.
     let classes = block_classes(
@@ -227,6 +249,7 @@ fn block_class_slice(
         max_slots,
         max_segments,
         &BlockListings::default(),
+        false,
         false,
     );
     let slice = NativeGraphClassSlice::new()
@@ -309,7 +332,8 @@ struct BlockGraphEnumeration {
     exact: bool,
 }
 
-/// Enumerate the block graphs of `plan` over `row_classes`: the one
+/// Enumerate the block graphs of `plan` over `row_classes`, computing keys
+/// and values alone at the row classes from `layer_major_rows`: the one
 /// enumeration of the sealer (`PreparedTargetGraphs::prepare`, with the
 /// scales it read) and of the planner (`certify_target_family`, with the
 /// planned ones), so the planned sealed graphs are the sealed ones.
@@ -322,6 +346,7 @@ fn enumerate_block_graphs(
     shapes: &[BlockGraphShape],
     scales: BlockOutputScales<'_>,
     row_classes: &[u64],
+    layer_major_rows: u64,
     max_slots: u64,
     max_segments: u64,
 ) -> Result<BlockGraphEnumeration, String> {
@@ -371,6 +396,7 @@ fn enumerate_block_graphs(
                 max_segments,
                 &listings,
                 slot_scores(slot),
+                shapes[index].keys_values && rows >= layer_major_rows,
             ) {
                 enumeration.launch_classes.insert(class);
                 match shared[index] {
@@ -669,6 +695,8 @@ pub struct PreparedTargetGraphs {
     /// The `[rows, 2]` I32 extents of the token rows a model whose blocks
     /// read them keeps, over the largest row class (`keeps_token_rows`).
     token_rows: Option<[u64; 2]>,
+    /// `layer_major_rows`, as certified.
+    layer_major_rows: u64,
     seal: SealReport,
 }
 
@@ -738,6 +766,11 @@ struct BlockGraphShape {
     mixes_exit: bool,
     /// Where a separate draft taps the block.
     tapped: TapPositions,
+    /// Whether its graphs include, per row class a layer-major chunk takes
+    /// (`PreparedTargetGraphs::layer_major_rows`), a class computing its
+    /// keys and values alone (`TargetBlockProgramSlot::keys_values`): a
+    /// layer-major advance's chunks publish in their own classes.
+    keys_values: bool,
 }
 
 /// A block's draft tap indices (column blocks of the draft input rows): at
@@ -862,6 +895,7 @@ fn block_graph_shapes(
     load: &ModelLoadPlan,
     geometry: &Decoder,
     state: &StateResourcePlan,
+    plan: &TargetProgramPlan,
     tapped: &[BlockTaps],
 ) -> Result<Vec<BlockGraphShape>, String> {
     let components = &state.target_state().recurrent_components;
@@ -928,6 +962,7 @@ fn block_graph_shapes(
                 mixes_exit: index + 1 == geometry.blocks.len()
                     && matches!(geometry.exit.norm, ExitNorm::HyperConnectionHead(_)),
                 tapped: tapped[index].positions(),
+                keys_values: plan.blocks()[index].keys_values().is_some(),
             })
         })
         .collect()
@@ -1017,7 +1052,7 @@ impl PreparedTargetGraphs {
         // its own resident weights to it.
         let (tap_width, tapped) = block_taps(plan, geometry)?;
         let stateless_tail = stateless_tail(state, &mixers, &tapped);
-        let shapes = block_graph_shapes(load, geometry, state, &tapped)?;
+        let shapes = block_graph_shapes(load, geometry, state, plan, &tapped)?;
         // Output scales are values of the sealed graph.
         let scales = handles
             .blocks
@@ -1044,6 +1079,7 @@ impl PreparedTargetGraphs {
             &shapes,
             BlockOutputScales::Read(&scales),
             &row_classes,
+            certificate.layer_major_rows,
             max_slots,
             max_segments,
         )?;
@@ -1107,10 +1143,16 @@ impl PreparedTargetGraphs {
         // it.
         let constants = FamilyConstants::default();
         let seal_block = |&(index, class): &(usize, BlockClass)| {
-            let (rows, segments, slots, listed, scored) = class;
+            let (rows, segments, slots, listed, scored, keys_values) = class;
             let began = Instant::now();
+            // A draft taps a block's rows, which keys and values alone
+            // leave unread.
             let positions = tapped[index].positions();
-            let tap = match (positions.any(), tap_width, &handles.taps) {
+            let tap = match (
+                keys_values == 0 && positions.any(),
+                tap_width,
+                &handles.taps,
+            ) {
                 (false, ..) => None,
                 (true, Some(width), Some(taps)) => Some(TapEntry {
                     entry: &taps.tap,
@@ -1134,12 +1176,13 @@ impl PreparedTargetGraphs {
                 slots,
                 listed,
                 scored > 0,
+                keys_values > 0,
                 &certificate.blocks[index][&class_topology(class)].layout,
                 &constants,
             )
             .map_err(|error| {
                 format!(
-                    "target graph row class {rows}, history segments {segments}, request slots {slots}, listed {listed}, scored {scored}, block {index}: {error}"
+                    "target graph row class {rows}, history segments {segments}, request slots {slots}, listed {listed}, scored {scored}, keys and values {keys_values}, block {index}: {error}"
                 )
             })?;
             if trace {
@@ -1282,8 +1325,17 @@ impl PreparedTargetGraphs {
             per_layer_entries,
             per_layer_rows: per_layer_rows(plan, largest_rows),
             token_rows: token_rows_extents(load, largest_rows),
+            layer_major_rows: certificate.layer_major_rows,
             seal,
         })
+    }
+
+    /// The least row class a chunk of a layer-major advance launches in:
+    /// from it to the largest, every row class fires the launches of the
+    /// largest in every graph, so each chunk rounds its rows as the first
+    /// chunk does and a block reading every chunk's rows reads them alike.
+    pub(crate) fn layer_major_rows(&self) -> u64 {
+        self.layer_major_rows
     }
 
     /// The tile counts of block `index`'s listing classes for a launch of
@@ -1870,6 +1922,7 @@ impl BoundTargetGraphs {
         slots: u64,
         listed: u64,
         scored: bool,
+        keys_values: bool,
         index: usize,
     ) -> Result<(&PreparedTargetBlockGraph, &BoundNativeGraphPlan), String> {
         let mixer = *self
@@ -1877,7 +1930,7 @@ impl BoundTargetGraphs {
             .mixers
             .get(index)
             .ok_or_else(|| format!("target block {index} does not exist"))?;
-        let key = block_class(mixer, rows, segments, slots, listed, scored);
+        let key = block_class(mixer, rows, segments, slots, listed, scored, keys_values);
         let graphs = &self.prepared.blocks_by_class[index];
         let graph = graphs
             .binary_search_by(|(class, _)| class.cmp(&key))
@@ -2231,7 +2284,8 @@ pub(crate) struct PreparedTargetBlockGraph {
     pub per_layer: Option<NativePort>,
     /// What each step binds of a block with an n-gram input.
     pub ngram: Option<NGramStepPorts>,
-    pub output: WorkflowTensor,
+    /// Absent for a class computing keys and values alone (`BlockClass`).
+    pub output: Option<WorkflowTensor>,
 }
 
 /// What a graph's weight port binds of the resident weight of `role`.
@@ -3084,6 +3138,7 @@ impl PreparedTargetBlockGraph {
         slots: u64,
         listed: u64,
         scored: bool,
+        keys_values: bool,
         layout: &NativeGraphLayout,
         family: &FamilyConstants,
     ) -> Result<Self, String> {
@@ -3096,7 +3151,17 @@ impl PreparedTargetBlockGraph {
                 &[rows, block_input_width(geometry, block_index)?],
             )
             .map_err(|error| error.to_string())?;
-        let mixer = (&handle.mixer).into();
+        // Keys and values alone are projected by the block's own entry.
+        let mixer = match (keys_values, &handle.keys_values, (&handle.mixer).into()) {
+            (false, _, mixer) => mixer,
+            (true, Some(project), MixerEntries::Attention(entries)) => {
+                MixerEntries::Attention(crate::operators::attention::graph::AttentionGraphEntries {
+                    project,
+                    ..entries
+                })
+            }
+            _ => return Err("a block computing its keys and values has no such projection".into()),
+        };
         let feed_forward = handle.feed_forward.as_ref().map(Into::into);
         let streams = handle.streams.as_ref().map(Into::into);
         let per_layer = match (&handle.per_layer, per_layer) {
@@ -3128,17 +3193,15 @@ impl PreparedTargetBlockGraph {
                 slots,
                 listed,
                 scored,
+                keys_values,
                 output_scales: handle.output_scales,
             },
             &mut weights,
             &mut constants,
         )
         .map_err(|error| error.to_string())?;
-        graph
-            .export(&parts.output)
-            .map_err(|error| error.to_string())?;
-        if let Some(residual) = &parts.residual {
-            graph.export(residual).map_err(|error| error.to_string())?;
+        for exported in parts.output.iter().chain(&parts.residual) {
+            graph.export(exported).map_err(|error| error.to_string())?;
         }
         let plan = graph.seal().map_err(|error| error.to_string())?;
         // The graph's constants are the family's values, and its vectors
@@ -3189,12 +3252,17 @@ struct BlockGraphInputs<'a> {
     slots: u64,
     listed: u64,
     scored: bool,
+    /// Whether the class computes only the block's keys and values
+    /// (`BlockClass`).
+    keys_values: bool,
     output_scales: OutputScales,
 }
 
 struct BlockGraphParts {
     residual: Option<WorkflowTensor>,
-    output: WorkflowTensor,
+    /// The block's output rows; absent for a class computing keys and
+    /// values alone, whose rows are appended to history.
+    output: Option<WorkflowTensor>,
     state: BlockStatePorts,
     controls: BlockControlPorts,
     taps: Option<TapPorts>,
@@ -3207,7 +3275,7 @@ struct BlockGraphParts {
 /// The width of block `block_index`'s input rows: the embedded rows into
 /// block 0, the streams (`S * H`) into every later block of a decoder with
 /// residual streams.
-fn block_input_width(geometry: &Decoder, block_index: usize) -> Result<u64, String> {
+pub(crate) fn block_input_width(geometry: &Decoder, block_index: usize) -> Result<u64, String> {
     Ok(
         match StreamsGeometry::of(geometry).map_err(|error| error.to_string())? {
             Some(streams) if block_index > 0 => streams.width(),
@@ -3243,6 +3311,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         slots,
         listed,
         scored,
+        keys_values,
         output_scales,
     } = inputs;
     let block = geometry
@@ -3262,6 +3331,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         slots,
         listed,
         scored,
+        keys_values,
         output_scales,
     };
     let streams = StreamsGeometry::of(geometry).map_err(|error| error.to_string())?;
@@ -3292,6 +3362,18 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         weights,
         constants,
     )?;
+    // Keys and values alone: the rows are appended, and nothing is output.
+    if keys_values {
+        return Ok(BlockGraphParts {
+            residual: None,
+            output: None,
+            state: state_ports,
+            controls,
+            taps: None,
+            per_layer: None,
+            ngram: None,
+        });
+    }
     if let Some(taps) = taps.as_mut().filter(|taps| taps.positions.middle) {
         if paired.feed_forward.is_none() {
             return Err("a draft taps the feed-forward of a lone mixer block".into());
@@ -3352,7 +3434,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     }
     Ok(BlockGraphParts {
         residual,
-        output,
+        output: Some(output),
         state: state_ports,
         controls,
         taps: taps.map(|taps| taps.ports),
@@ -3379,6 +3461,7 @@ fn checked_block_graph_draft(
     slots: u64,
     listed: u64,
     scored: bool,
+    keys_values: bool,
 ) -> Result<(NativeGraphMetadata, Vec<GraphConstant>, HostHeap), GraphError> {
     let mut weights = Vec::new();
     let mut constants = Vec::new();
@@ -3439,6 +3522,7 @@ fn checked_block_graph_draft(
             slots,
             listed,
             scored,
+            keys_values,
             // Scalar arguments leave the checked shapes and storage alone.
             output_scales: OutputScales {
                 mixer: 1.0,
@@ -3449,9 +3533,8 @@ fn checked_block_graph_draft(
         &mut weights,
         &mut constants,
     )?;
-    GraphDraft::export(&mut graph, &parts.output)?;
-    if let Some(residual) = &parts.residual {
-        GraphDraft::export(&mut graph, residual)?;
+    for exported in parts.output.iter().chain(&parts.residual) {
+        GraphDraft::export(&mut graph, exported)?;
     }
     let owned = owned_vectors_heap(weights.len(), constants.len(), parts.state.ports().len());
     Ok((graph, constants, owned))
@@ -3485,6 +3568,7 @@ pub(crate) fn checked_block_graph_resources(
         slots,
         listed,
         scored,
+        false,
     )?;
     Ok((GraphDraft::seal(graph)?, constants))
 }
@@ -3530,7 +3614,29 @@ struct TargetFamilyCertificate {
     /// Per block, what each row regime's classes seal into, those that
     /// list their launch's history row tiles apart.
     /// Per block, its certified graphs by topology (`class_topology`).
-    blocks: Vec<BTreeMap<(RowForm, bool, bool), CertifiedBlockGraph>>,
+    blocks: Vec<BTreeMap<BlockTopology, CertifiedBlockGraph>>,
+    /// The least row class a layer-major chunk launches in
+    /// (`PreparedTargetGraphs::layer_major_rows`).
+    layer_major_rows: u64,
+}
+
+/// Keep in `alike` the row classes at which a graph regime fires the
+/// launches it fires at `largest`: `launches` gives its launches at a row
+/// class, `None` at one it has no class of.
+fn retain_alike(
+    alike: &mut std::collections::BTreeSet<u64>,
+    largest: u64,
+    launches: impl Fn(u64) -> Result<Option<seismic::NativeGraphLaunches>, seismic::NativeGraphMetadataError>,
+) -> Result<(), seismic::NativeGraphMetadataError> {
+    let at_largest = launches(largest)?;
+    let mut kept = std::collections::BTreeSet::new();
+    for &rows in alike.iter() {
+        if launches(rows)? == at_largest {
+            kept.insert(rows);
+        }
+    }
+    *alike = kept;
+    Ok(())
 }
 
 /// What every class of one block's row regime prepares to: one topology.
@@ -3567,7 +3673,7 @@ fn certify_target_family(
     )
     .map_err(|_| "target segment class exceeds u64")?;
     let (tap_width, tapped) = block_taps(plan, geometry)?;
-    let shapes = block_graph_shapes(load, geometry, state, &tapped)?;
+    let shapes = block_graph_shapes(load, geometry, state, plan, &tapped)?;
     let distinct_blocks = (0..shapes.len())
         .filter(|&index| !(0..index).any(|earlier| shapes[earlier] == shapes[index]))
         .collect::<Vec<_>>();
@@ -3581,6 +3687,14 @@ fn certify_target_family(
     let mut family = CheckedGraphFamilyResources::new();
     let mut entries = BTreeMap::new();
     let largest_rows = *row_classes.last().expect("row classes are nonempty");
+    // The row classes at which every graph fires the launches it fires at
+    // the largest: of the largest's regime, kept while each graph agrees.
+    let largest_form = RowForm::of(largest_rows);
+    let mut alike = row_classes
+        .iter()
+        .copied()
+        .filter(|&rows| RowForm::of(rows) == largest_form)
+        .collect::<std::collections::BTreeSet<_>>();
     let landing = CheckedLandingEntries::of(load, TARGET_TABLE)?;
     for source in [EntryTokens::Uploaded, EntryTokens::Selected] {
         let weight = embedding_weight(load)?;
@@ -3597,13 +3711,17 @@ fn certify_target_family(
             source,
         )?
         .graph;
-        let layout = graph
+        let template = graph
             .seal_template()
-            .and_then(|template| {
-                template.certify(&[
-                    NativeGraphClassSlice::new().dimension("M", row_classes.iter().copied())
-                ])
-            })
+            .map_err(|error| format!("target entry graph: {error}"))?;
+        retain_alike(&mut alike, largest_rows, |rows| {
+            template
+                .launches(&NativeGraphClassSlice::new().dimension("M", [rows]))
+                .map(Some)
+        })
+        .map_err(|error| format!("target entry graph: {error}"))?;
+        let layout = template
+            .certify(&[NativeGraphClassSlice::new().dimension("M", row_classes.iter().copied())])
             .map_err(|error| format!("target entry graph: {error}"))?;
         family.include(layout.storage_bytes(), []);
         entries.insert(source, layout);
@@ -3622,11 +3740,17 @@ fn certify_target_family(
                 entry,
                 largest_rows,
             )?;
-            let layout = graph
+            let template = graph
                 .seal_template()
-                .and_then(|template| {
-                    template.certify(&[per_layer_entry_class_slice(row_classes.iter().copied())])
-                })
+                .map_err(|error| format!("per-layer entry graph: {error}"))?;
+            retain_alike(&mut alike, largest_rows, |rows| {
+                template
+                    .launches(&per_layer_entry_class_slice([rows]))
+                    .map(Some)
+            })
+            .map_err(|error| format!("per-layer entry graph: {error}"))?;
+            let layout = template
+                .certify(&[per_layer_entry_class_slice(row_classes.iter().copied())])
                 .map_err(|error| format!("per-layer entry graph: {error}"))?;
             family.include(layout.storage_bytes(), []);
             Some(layout)
@@ -3634,6 +3758,9 @@ fn certify_target_family(
         _ => return Err("the per-layer entry's binding and geometry disagree".into()),
     };
     let mut blocks = vec![BTreeMap::new(); geometry.blocks.len()];
+    // The regimes computing keys and values alone, certified once the
+    // classes a layer-major chunk takes are known.
+    let mut keys_values_regimes = Vec::new();
     for &index in &distinct_blocks {
         let slot = plan.blocks()[index];
         let paired = paired_block(&geometry.blocks[index]).map_err(|error| error.to_string())?;
@@ -3646,11 +3773,17 @@ fn certify_target_family(
             // A regime's listing classes are their own topology (another
             // kernel of the entry, and the list's input), over every listed
             // tile count; so are a selected read's classes that score (the
-            // indexer's selection and the selected attention forms).
-            let topologies = [(false, false), (true, false)]
+            // indexer's selection and the selected attention forms), and
+            // the classes computing keys and values alone, which only a
+            // layer-major chunk computes, in the largest's regime.
+            let topologies = [(false, false, false), (true, false, false)]
                 .into_iter()
-                .chain(slot_scores(slot).then_some((false, true)));
-            for (listed, scored) in topologies {
+                .chain(slot_scores(slot).then_some((false, true, false)))
+                .chain(
+                    (shapes[index].keys_values && form == largest_form)
+                        .then_some((false, false, true)),
+                );
+            for (listed, scored, keys_values) in topologies {
                 let listings = match listed {
                     false => Vec::new(),
                     true => block_listings(state, backend, slot, index, largest)?.tiles,
@@ -3677,26 +3810,54 @@ fn certify_target_family(
                     slot,
                     tap_width
                         .map(|width| (width, tapped[index].positions()))
-                        .filter(|(_, positions)| positions.any()),
+                        .filter(|(_, positions)| !keys_values && positions.any()),
                     index,
                     largest,
                     1,
                     1,
                     listings.last().copied().unwrap_or(0),
                     scored,
+                    keys_values,
                 )?;
                 let slices = rows
                     .iter()
                     .map(|&rows| {
-                        block_class_slice(&paired, rows, max_slots, max_segments, &listings, scored)
+                        block_class_slice(
+                            &paired,
+                            rows,
+                            max_slots,
+                            max_segments,
+                            &listings,
+                            scored,
+                            keys_values,
+                        )
+                        .map(|slice| (rows, slice))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let layout = graph
+                let template = graph
                     .seal_template()
-                    .and_then(|template| template.certify(&slices))
+                    .map_err(|error| format!("target block {index}: {error}"))?;
+                if form == largest_form {
+                    retain_alike(&mut alike, largest_rows, |rows| {
+                        slices
+                            .iter()
+                            .find(|(class, _)| *class == rows)
+                            .map(|(_, slice)| template.launches(slice))
+                            .transpose()
+                    })
+                    .map_err(|error| format!("target block {index}: {error}"))?;
+                }
+                let topology = (form, listed, scored, keys_values);
+                if keys_values {
+                    keys_values_regimes.push((index, topology, template, slices, constants, owned));
+                    continue;
+                }
+                let slices = slices.into_iter().map(|(_, slice)| slice).collect::<Vec<_>>();
+                let layout = template
+                    .certify(&slices)
                     .map_err(|error| format!("target block {index}: {error}"))?;
                 family.include(layout.storage_bytes(), constants);
-                blocks[index].insert((form, listed, scored), CertifiedBlockGraph { layout, owned });
+                blocks[index].insert(topology, CertifiedBlockGraph { layout, owned });
             }
         }
         // Row-class constants (`block::class_constants_of`).
@@ -3724,6 +3885,29 @@ fn certify_target_family(
             );
         }
     }
+    // A layer-major chunk launches in a class of at least these rows: the
+    // least from which every class up to the largest fires the largest's
+    // launches, so every chunk of an advance rounds as its first does.
+    let layer_major_rows = row_classes
+        .iter()
+        .rev()
+        .skip(1)
+        .take_while(|rows| alike.contains(rows))
+        .last()
+        .copied()
+        .unwrap_or(largest_rows);
+    for (index, topology, template, slices, constants, owned) in keys_values_regimes {
+        let slices = slices
+            .into_iter()
+            .filter(|&(rows, _)| rows >= layer_major_rows)
+            .map(|(_, slice)| slice)
+            .collect::<Vec<_>>();
+        let layout = template
+            .certify(&slices)
+            .map_err(|error| format!("target block {index}: {error}"))?;
+        family.include(layout.storage_bytes(), constants);
+        blocks[index].insert(topology, CertifiedBlockGraph { layout, owned });
+    }
     for index in 0..blocks.len() {
         if let Some(first) = (0..index).find(|&first| shapes[first] == shapes[index]) {
             blocks[index] = blocks[first].clone();
@@ -3743,6 +3927,7 @@ fn certify_target_family(
             &shapes,
             BlockOutputScales::Planned(unread),
             &row_classes,
+            layer_major_rows,
             max_slots,
             max_segments,
         )
@@ -3841,6 +4026,7 @@ fn certify_target_family(
         entries,
         per_layer,
         blocks,
+        layer_major_rows,
     })
 }
 
@@ -3929,7 +4115,7 @@ mod resource_template_tests {
         let geometry = &definition.decoder;
         let plan = load.program_plan(&definition, codec).unwrap();
         let (_, tapped) = block_taps(plan.target(), geometry).unwrap();
-        let shapes = block_graph_shapes(&load, geometry, &state, &tapped).unwrap();
+        let shapes = block_graph_shapes(&load, geometry, &state, plan.target(), &tapped).unwrap();
         assert_ne!(shapes[0], shapes[1], "stream widening cannot be shared");
         assert_eq!(shapes[1], shapes[2], "interior graphs still share");
         assert_ne!(shapes[2], shapes[3], "the exit mix cannot be omitted");
@@ -3941,6 +4127,7 @@ mod resource_template_tests {
             &shapes,
             BlockOutputScales::Planned(UnreadScales::Equal),
             &[1, 64],
+            64,
             limits.max_launch_slots as u64,
             state.target_state().span_limit().next_power_of_two() as u64,
         )
@@ -4059,9 +4246,16 @@ mod resource_template_tests {
             listings.tiles.is_empty(),
             !(tensor_operations || matches!(head_width, 128 | 256 | 512))
         );
-        for class in block_classes(MixerKind::Attention, 512, 512, max_segments, &listings, false)
-        {
-            let (rows, segments, slots, listed, _) = class;
+        for class in block_classes(
+            MixerKind::Attention,
+            512,
+            512,
+            max_segments,
+            &listings,
+            false,
+            false,
+        ) {
+            let (rows, segments, slots, listed, ..) = class;
             let (graph, _, _) = checked_block_graph_draft(
                 NativeGraphMetadata::new(backend),
                 &load,
@@ -4074,6 +4268,7 @@ mod resource_template_tests {
                 segments,
                 slots,
                 listed,
+                false,
                 false,
             )
             .unwrap();
@@ -4246,7 +4441,8 @@ mod resource_template_tests {
                 // each exact class's own topology: blocks of one shape seal
                 // one plan per class (no block here reads a layer scale).
                 let (_, tapped) = block_taps(plan.target(), geometry).unwrap();
-                let shapes = block_graph_shapes(&load, geometry, &state, &tapped).unwrap();
+                let shapes =
+                    block_graph_shapes(&load, geometry, &state, plan.target(), &tapped).unwrap();
                 let sealed = std::cell::Cell::new((0usize, HostHeap::default()));
                 let seals = |heap: HostHeap| {
                     let (graphs, held) = sealed.get();
@@ -4314,8 +4510,9 @@ mod resource_template_tests {
                             )
                             .unwrap(),
                             slot_scores(plan.target().blocks()[index]),
+                            shapes[index].keys_values && rows >= certificate.layer_major_rows,
                         ) {
-                            let (rows, segments, slots, listed, scored) = class;
+                            let (rows, segments, slots, listed, scored, keys_values) = class;
                             let (graph, mut block_constants, block_owned) =
                                 checked_block_graph_draft(
                                     NativeGraphMetadata::new(backend),
@@ -4330,6 +4527,7 @@ mod resource_template_tests {
                                     slots,
                                     listed,
                                     scored > 0,
+                                    keys_values > 0,
                                 )
                                 .unwrap();
                             let certified = &certificate.blocks[index][&class_topology(class)];

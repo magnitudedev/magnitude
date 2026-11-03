@@ -15,7 +15,12 @@ impl Demand {
     pub const SELECT: Self = Self(1 << 2);
     /// Reserved for future layer-boundary feature readout.
     pub const TAPS: Self = Self(1 << 3);
-    pub const ALL: Self = Self(Self::LOGITS.0 | Self::FEATURES.0 | Self::SELECT.0 | Self::TAPS.0);
+    /// Prompt-only values read at the row (`RowReadout`), returned to the
+    /// host as F32.
+    pub const READOUT: Self = Self(1 << 4);
+    pub const ALL: Self = Self(
+        Self::LOGITS.0 | Self::FEATURES.0 | Self::SELECT.0 | Self::TAPS.0 | Self::READOUT.0,
+    );
 
     pub const fn from_bits(bits: u32) -> Option<Self> {
         if bits & !Self::ALL.0 == 0 {
@@ -89,6 +94,6 @@ mod tests {
     #[test]
     fn unknown_bits_are_rejected() {
         assert_eq!(Demand::from_bits(Demand::ALL.bits()), Some(Demand::ALL));
-        assert_eq!(Demand::from_bits(1 << 4), None);
+        assert_eq!(Demand::from_bits(1 << 5), None);
     }
 }

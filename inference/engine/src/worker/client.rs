@@ -17,6 +17,7 @@ use crate::options::{ExecutionManifest, ReadyInfo};
 use magnitude_chat::ConstraintPlan;
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{DetailedUsage, FinishReason, Options, OutputToken};
+use magnitude_readout::{ReadoutPlan, ReadoutValues};
 use magnitude_scheduler::prefix_cache::PrefixRetention;
 use std::{
     collections::{HashMap, VecDeque},
@@ -61,6 +62,8 @@ struct RequestSlot {
     /// `None` while admission is pending.
     admission: Option<Result<(), RequestError>>,
     events: VecDeque<RequestEvent>,
+    /// A readout's values, its successful terminal.
+    values: Option<ReadoutValues>,
     terminal_received: bool,
     /// `Some` once the pending status query was answered.
     status: Option<Option<RequestProgress>>,
@@ -156,6 +159,16 @@ impl State {
             )?,
             WorkerMessage::Failed { request_id, error } => {
                 self.event(request_id, RequestEvent::Failed(error))?
+            }
+            WorkerMessage::Read { request_id, values } => {
+                if let Some(slot) = self.requests.get_mut(&request_id) {
+                    if slot.terminal_received {
+                        return Err(format!("readout {request_id} received values after its terminal"));
+                    }
+                    slot.terminal_received = true;
+                    slot.values = Some(values);
+                    slot.wake();
+                }
             }
             WorkerMessage::Status {
                 request_id,
@@ -396,6 +409,57 @@ impl EngineClient {
                 reason: "request output capacity must be positive".into(),
             });
         }
+        let output_capacity = request.output_capacity;
+        self.open(output_capacity, |request_id| {
+            HostMessage::Admit(Admission {
+                request_id,
+                input: request.input,
+                options: request.options,
+                constraint: request.constraint,
+                retention: request.retention,
+                output_capacity,
+            })
+        })
+        .await
+    }
+
+    /// Evaluate a prompt-only readout plan: its values, in plan order.
+    /// Dropping the future cancels the plan.
+    pub async fn readout(&self, plan: ReadoutPlan) -> Result<ReadoutValues, RequestError> {
+        let mut request = self
+            .open(1, |request_id| HostMessage::Read { request_id, plan })
+            .await?;
+        let id = request.id;
+        let outcome = poll_fn(|cx| {
+            let mut state = self.connection.state.lock().unwrap();
+            let slot = state.requests.get_mut(&id).expect("live request slot");
+            if let Some(values) = slot.values.take() {
+                return Poll::Ready(Ok(values));
+            }
+            match slot.events.pop_front() {
+                Some(RequestEvent::Failed(error)) => Poll::Ready(Err(error)),
+                Some(_) => Poll::Ready(Err(RequestError::internal(
+                    "a readout received generation events",
+                ))),
+                None => {
+                    slot.waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+        })
+        .await;
+        request.finished = true;
+        self.connection.state.lock().unwrap().requests.remove(&id);
+        outcome
+    }
+
+    /// Register a request slot, send `message` for it, and wait for its
+    /// admission. From registration, dropping the handle cancels it.
+    async fn open(
+        &self,
+        output_capacity: usize,
+        message: impl FnOnce(HostRequestId) -> HostMessage,
+    ) -> Result<EngineRequest, RequestError> {
         let id = {
             let mut state = self.connection.state.lock().unwrap();
             if let Some(error) = &state.closed {
@@ -410,17 +474,10 @@ impl EngineClient {
         let mut handle = EngineRequest {
             connection: self.connection.clone(),
             id,
-            output_capacity: request.output_capacity,
+            output_capacity,
             finished: false,
         };
-        self.connection.send(HostMessage::Admit(Admission {
-            request_id: id,
-            input: request.input,
-            options: request.options,
-            constraint: request.constraint,
-            retention: request.retention,
-            output_capacity: request.output_capacity,
-        }))?;
+        self.connection.send(message(id))?;
         let admission = poll_fn(|cx| {
             let mut state = self.connection.state.lock().unwrap();
             let slot = state.requests.get_mut(&id).expect("live request slot");

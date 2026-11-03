@@ -469,6 +469,8 @@ pub enum WeightKind {
     /// A plane of the output projection's progressive placement
     /// (`ImportTransform::Progressive`), which then replaces `Output`.
     OutputPlane(ProgressivePlane),
+    /// The model's readout head (`DecisionBinding::readout_head`).
+    ReadoutHead,
     HeadEmbeddingNorm,
     HeadHiddenNorm,
     HeadCombine,
@@ -838,9 +840,50 @@ pub struct ModelDefinition {
     pub vision: Option<VisionDescription>,
     /// The package's separate draft component.
     pub draft: Option<DraftDefinition>,
+    /// The decision description of a model converted to answer decisions,
+    /// with what a load binds from it. Package inspection binds it for
+    /// every family; a family's own definition leaves it `None`.
+    pub decision: Option<DecisionBinding>,
+}
+
+/// A decision model's description and what a load binds from it: its
+/// readout head and the readout kinds its description's plans read.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DecisionBinding {
+    /// The artifact's decision description (its decision template and
+    /// `decision.*`).
+    pub metadata: magnitude_artifacts::DecisionMetadata,
+    /// The readout head, when it stores one: a `[K, hidden]` matrix applied
+    /// to a row's final normalized hidden state, one value per output (a
+    /// readout's `ReadoutKind::Head`), read in the element it is stored in.
+    pub readout_head: Option<WeightDescriptor>,
+    /// Whether its plans read logits of chosen tokens through the output
+    /// projection (`ReadoutKind::Logits`). A load stores such a model's
+    /// output projection only in the form those logits are read from.
+    pub reads_logits: bool,
+    /// Whether its plans read scores of retained rows
+    /// (`ReadoutKind::Scores`). A load prepares scores only for such a
+    /// model.
+    pub reads_scores: bool,
 }
 
 impl ModelDefinition {
+    /// Whether the model's global attention, as trained, is causal
+    /// (`<arch>.attention.causal`, which its decision metadata carries);
+    /// every model without that metadata is causal.
+    pub fn causal_attention(&self) -> bool {
+        self.decision
+            .as_ref()
+            .is_none_or(|decision| decision.metadata.causal())
+    }
+
+    /// The decision model's readout head, when it stores one.
+    pub fn readout_head(&self) -> Option<&WeightDescriptor> {
+        self.decision
+            .as_ref()
+            .and_then(|decision| decision.readout_head.as_ref())
+    }
+
     pub fn validate(&self) -> Result<(), DefinitionError> {
         if self.family.0.is_empty() {
             return Err(DefinitionError::new("model family identity is empty"));
@@ -860,6 +903,13 @@ impl ModelDefinition {
         }
         if let Some(draft) = &self.draft {
             draft.validate(&self.decoder, self.inputs.coordinate_axes)?;
+        }
+        if let Some(head) = self.readout_head() {
+            let outputs = head.shape.first().copied().unwrap_or(0);
+            if outputs == 0 {
+                return Err(DefinitionError::new("the readout head has no outputs"));
+            }
+            expect_shape(head, &[outputs, self.decoder.hidden], "readout head")?;
         }
         Ok(())
     }
@@ -991,6 +1041,7 @@ mod tests {
 
     fn definition(sublayers: Vec<Sublayer>) -> ModelDefinition {
         ModelDefinition {
+            decision: None,
             family: FamilyId("fixture".into()),
             artifact_identity: PackageIdentity {
                 target: ArtifactIdentity([0; 32]),
