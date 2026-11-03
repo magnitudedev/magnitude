@@ -198,6 +198,7 @@ dependencies = [
  "matchit",
  "memchr",
  "mime",
+ "multer",
  "percent-encoding",
  "pin-project-lite",
  "serde_core",
@@ -401,6 +402,15 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+
+[[package]]
+name = "caseless"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b6fd507454086c8edfd769ca6ada439193cdb209c7681712ef6275cccbfe5d8"
+dependencies = [
+ "unicode-normalization",
+]
 
 [[package]]
 name = "castaway"
@@ -2257,6 +2267,7 @@ dependencies = [
 name = "magnitude-chat"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "getrandom 0.4.3",
  "jsonschema",
  "magnitude-artifacts",
@@ -2270,6 +2281,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnitude-decision"
+version = "0.1.0"
+dependencies = [
+ "caseless",
+ "fancy-regex",
+ "magnitude-artifacts",
+ "magnitude-chat",
+ "magnitude-family-contracts",
+ "magnitude-readout",
+ "magnitude-templates",
+ "serde",
+ "serde_json",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "magnitude-engine"
 version = "0.1.0"
 dependencies = [
@@ -2278,6 +2305,7 @@ dependencies = [
  "magnitude-artifacts",
  "magnitude-batching",
  "magnitude-chat",
+ "magnitude-decision",
  "magnitude-executor",
  "magnitude-family-common",
  "magnitude-family-contracts",
@@ -2291,6 +2319,7 @@ dependencies = [
  "magnitude-family-qwen4exp",
  "magnitude-generation",
  "magnitude-grammar",
+ "magnitude-readout",
  "magnitude-scheduler",
  "magnitude-state",
  "magnitude-templates",
@@ -2339,6 +2368,7 @@ dependencies = [
  "magnitude-family-qwen35",
  "magnitude-family-qwen4exp",
  "magnitude-kernels",
+ "magnitude-readout",
  "magnitude-state",
  "seismic",
  "serde",
@@ -2535,12 +2565,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnitude-readout"
+version = "0.1.0"
+dependencies = [
+ "magnitude-artifacts",
+ "magnitude-family-contracts",
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "magnitude-scheduler"
 version = "0.1.0"
 dependencies = [
  "magnitude-executor",
  "magnitude-family-contracts",
  "magnitude-generation",
+ "magnitude-readout",
  "magnitude-state",
  "serde",
  "tracing",
@@ -2688,7 +2729,9 @@ dependencies = [
  "base64 0.22.1",
  "futures-util",
  "http-body-util",
+ "magnitude-artifacts",
  "magnitude-chat",
+ "magnitude-decision",
  "magnitude-engine",
  "serde",
  "serde_json",
@@ -2861,6 +2904,23 @@ checksum = "ac9557c559cd6fc9867e122e20d2cbefc9ca29d80d027a8e39310920ed2f0a97"
 dependencies = [
  "num-traits",
  "pxfm",
+]
+
+[[package]]
+name = "multer"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83e87776546dc87511aa5ee218730c92b666d7264ab6ed41f9d215af9cd5224b"
+dependencies = [
+ "bytes",
+ "encoding_rs",
+ "futures-util",
+ "http",
+ "httparse",
+ "memchr",
+ "mime",
+ "spin",
+ "version_check",
 ]
 
 [[package]]
@@ -4574,6 +4634,12 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "spin"
+version = "0.9.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 
 [[package]]
 name = "spirv-tools"

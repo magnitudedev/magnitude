@@ -1,0 +1,505 @@
+{
+  "template": "{#- Liquid d1-2B, as its repository 97c5704 renders a set of questions (prompt.py: `prefix_text`, `suffix_layout`,\n    `question_block`, `marked_suffix`; attention.py `pack_set`) under the checkpoint's prompt 1, codes scheme 2 and\n    no system turn, in LFM3's frame with its empty thought. The state block is the sequence start, the user turn's\n    images and the state with `QUESTION:`; each further question of the set repeats that header. A noul, choice,\n    score and estimate are read at their last token, every other kind at the colon of each named marker after the\n    answer header. The state's text is placed by its read anchor, as reads index it. A boxes question reading fewer\n    blocks than prompt 1's most ends on the newline a next block would follow, as the reference writes it where its\n    tokenizer takes the colon and the newline as one token, which LFM3 does after every marker. The context and\n    anchors are the decision crate's (engine/decision/KEYS.md). -#}\n{%- macro show(parts) -%}\n    {#- Request text only: the description places images before the state alone. -#}\n    {%- for part in parts -%}\n        {{- part -}}\n    {%- endfor -%}\n{%- endmacro -%}\n{%- macro text(value, what) -%}\n    {#- A value d1 reads as text: a string as written. -#}\n    {%- if value.kind != \"string\" -%}\n        {{- raise_exception(\"d1 reads \" ~ what ~ \" as text\") -}}\n    {%- endif -%}\n    {{- show(value.text) -}}\n{%- endmacro -%}\n{%- macro legend(question) -%}\n    {%- set codes = question.codes -%}\n    {%- if question.grid.numbers -%}\n        {{- \"Each edge is a number from \" ~ codes[0] ~ \" to \" ~ codes[codes | length - 1] ~ \", in thousandths of the picture: top and bottom from its top edge, left and right from its left edge.\" -}}\n    {%- else -%}\n        {{- \"Each edge is a code on a \" ~ question.grid.size ~ \"-value scale: \" ~ codes[0] ~ \" is 0 (top or left), \" ~ codes[codes | length - 1] ~ \" is 1 (bottom or right). Values are equally spaced.\" -}}\n    {%- endif -%}\n{%- endmacro -%}\n{%- macro slot(index) -%}\n    {{- \"﷐slot:\" ~ index ~ \"﷑\" -}}\n{%- endmacro -%}\n{%- set box = namespace(any=false) -%}\n{%- for question in request_questions -%}\n    {%- if question.kind == \"box\" or question.kind == \"boxes\" -%}{%- set box.any = true -%}{%- endif -%}\n{%- endfor -%}\n{%- if box.any and images | length != 1 -%}\n    {{- raise_exception(\"a box or boxes question reads exactly one picture; this request has \" ~ images | length) -}}\n{%- endif -%}\n{#- The state block. -#}\n{{- \"<|startoftext|><|im_start|>user\\n\" -}}\n{%- for image in images -%}\n    {{- \"﷐image:\" ~ image ~ \"﷑\" -}}\n{%- endfor -%}\n{%- if state.kind != \"none\" -%}\n    {%- if state.kind == \"string\" -%}\n        {{- \"﷐read:text﷑\" -}}\n    {%- else -%}\n        {{- \"﷐read:indented﷑\" -}}\n    {%- endif -%}\n    {{- \"\\n\\n\\nQUESTION:\\n\" -}}\n{%- endif -%}\n{{- \"﷐state﷑\" -}}\n{#- The questions. -#}\n{%- for question in questions -%}\n    {%- set index = loop.index0 -%}\n    {%- if index > 0 -%}\n        {{- \"﷐question:\" ~ index ~ \"﷑\" -}}\n        {%- if state.kind != \"none\" -%}{{- \"QUESTION:\\n\" -}}{%- endif -%}\n    {%- endif -%}\n    {%- if question.instructions.kind != \"string\" or question.instructions.stripped | length == 0 -%}\n        {{- raise_exception(\"d1 needs the question's instructions\") -}}\n    {%- endif -%}\n    {{- show(question.instructions.text) -}}\n    {%- set codes = question.codes -%}\n    {%- set markers = namespace(names=[]) -%}\n    {%- if question.kind == \"noul\" -%}\n        {%- if question.truthy.kind != \"none\" or question.falsy.kind != \"none\" -%}\n            {%- for label, value in [(\"\\nYes: \", question.truthy), (\"\\nNo: \", question.falsy)] -%}\n                {{- label -}}\n                {%- if value.kind == \"none\" -%}{{- \"None\" -}}{%- else -%}{{- text(value, \"a noul's criteria\") -}}{%- endif -%}\n            {%- endfor -%}\n        {%- endif -%}\n        {{- \"\\n\\nReply with yes or no only.\" -}}\n    {%- elif question.kind == \"choice\" -%}\n        {{- \"\\n\\nOptions:\\n\" -}}\n        {%- for option in question.options -%}\n            {%- if not loop.first -%}{{- \"\\n\" -}}{%- endif -%}\n            {{- codes[loop.index0] ~ \" \" -}}\n            {%- if option.description.kind == \"none\" or not option.description.truthy -%}\n                {%- if option.description.kind not in [\"none\", \"string\"] -%}\n                    {{- raise_exception(\"d1 reads a choice's descriptions as text\") -}}\n                {%- endif -%}\n                {{- option.key | replace(\"_\", \" \") -}}\n            {%- else -%}\n                {{- text(option.description, \"a choice's descriptions\") -}}\n            {%- endif -%}\n        {%- endfor -%}\n        {{- \"\\n\\nReply with the option code only.\" -}}\n    {%- elif question.kind == \"multiple\" -%}\n        {{- \"\\n\\nOptions:\\n\" -}}\n        {%- for option in question.options -%}\n            {%- if not loop.first -%}{{- \"\\n\" -}}{%- endif -%}\n            {{- show(option.label.line) ~ \": \" -}}\n            {%- if option.description.kind == \"none\" or not option.description.truthy -%}\n                {%- if option.description.kind not in [\"none\", \"string\"] -%}\n                    {{- raise_exception(\"d1 reads a choice's descriptions as text\") -}}\n                {%- endif -%}\n                {{- option.key -}}\n            {%- else -%}\n                {{- text(option.description, \"a choice's descriptions\") -}}\n            {%- endif -%}\n        {%- endfor -%}\n        {{- \"\\n\\nReply with yes or no for each option.\" -}}\n    {%- elif question.kind == \"score\" -%}\n        {{- \"\\n\\n\" -}}\n        {%- for level in question.levels -%}\n            {%- if not loop.first -%}{{- \"\\n\" -}}{%- endif -%}\n            {{- loop.index0 ~ \" \" -}}{{- text(level, \"a score's levels\") -}}\n        {%- endfor -%}\n        {{- \"\\n\\nReply with a single digit 0-\" ~ (question.levels | length - 1) ~ \" only.\" -}}\n    {%- elif question.kind == \"read\" -%}\n        {{- \"\\n\\nRead the \" ~ question.value -}}\n        {%- if question.value == \"number\" and question.unit.truthy -%}\n            {{- \" (unit: \" -}}{{- show(question.unit.text) -}}{{- \")\" -}}\n        {%- endif -%}\n        {{- \" from the state, or nothing if it is absent.\" -}}\n        {%- set markers.names = [\"start\", \"end\"] -%}\n    {%- elif question.kind == \"estimate\" -%}\n        {%- set grid = question.grid -%}\n        {{- \"\\n\\nEstimate from \" ~ grid.low ~ \" to \" ~ grid.high -}}\n        {%- if question.unit.kind != \"none\" -%}{{- \" \" -}}{{- show(question.unit.text) -}}{%- endif -%}\n        {%- if grid.numbers -%}\n            {{- \", in steps of \" ~ grid.step ~ \". Reply with the number only.\" -}}\n        {%- else -%}\n            {{- \" on \" ~ grid.size ~ \" equally spaced values, step \" ~ grid.step ~ \": \" ~ codes[0] ~ \" is \" ~ grid.low ~ \", \" ~ codes[codes | length - 1] ~ \" is \" ~ grid.high ~ \". Reply with the code only.\" -}}\n        {%- endif -%}\n    {%- elif question.kind == \"box\" -%}\n        {{- \"\\n\\nPresence is yes or no. \" ~ legend(question) ~ \" Reply with yes or no at present, then \" ~ (\"one number\" if question.grid.numbers else \"one code\") ~ \" at top, bottom, left and right.\" -}}\n        {%- set markers.names = [\"present\", \"top\", \"bottom\", \"left\", \"right\"] -%}\n    {%- else -%}\n        {{- \"\\n\\nEvery one of them, \" ~ question.most ~ \" at most, in reading order (left edge, then top). Present k is yes when there are at least k. \" ~ legend(question) ~ \" Reply with yes or no at each present, then its top, bottom, left and right.\" -}}\n        {%- for block in range(1, question.max + 1) -%}\n            {%- for name in [\"present\", \"top\", \"bottom\", \"left\", \"right\"] -%}\n                {%- set markers.names = markers.names + [name ~ \" \" ~ block] -%}\n            {%- endfor -%}\n        {%- endfor -%}\n    {%- endif -%}\n    {{- \"<|im_end|>\\n<|im_start|>assistant\\n<think></think>\" -}}\n    {%- if question.kind == \"multiple\" -%}\n        {#- Each option's marker is its name as JSON writes it, request text. -#}\n        {%- for option in question.options -%}\n            {%- if not loop.first -%}{{- \"\\n\" -}}{%- endif -%}\n            {{- show(option.label.line) -}}{{- \":\" ~ slot(index) -}}\n        {%- endfor -%}\n    {%- endif -%}\n    {%- for name in markers.names -%}\n        {%- if not loop.first -%}{{- \"\\n\" -}}{%- endif -%}\n        {{- name ~ \":\" ~ slot(index) -}}\n    {%- endfor -%}\n    {%- if question.kind == \"boxes\" and question.max < question.most -%}{{- \"\\n\" -}}{%- endif -%}\n{%- endfor -%}\n",
+  "keys": {
+    "escape.method": {
+      "type": "str",
+      "value": "zero_width"
+    },
+    "escape.min_length": {
+      "type": "i32",
+      "value": 2
+    },
+    "segments": {
+      "type": "str",
+      "value": "per_question"
+    },
+    "set_size": {
+      "type": "i32",
+      "value": 16
+    },
+    "state_attends": {
+      "type": "str",
+      "value": "set"
+    },
+    "question_attends": {
+      "type": "str",
+      "value": "question"
+    },
+    "codes.sequence": {
+      "type": "str",
+      "value": "aliases"
+    },
+    "codes.keys_if_letters": {
+      "type": "bool",
+      "value": true
+    },
+    "noul.codes": {
+      "type": "str",
+      "value": "yes_no"
+    },
+    "noul.true_option": {
+      "type": "i32",
+      "value": 0
+    },
+    "choice.max_options": {
+      "type": "i32",
+      "value": 255
+    },
+    "score.codes": {
+      "type": "str",
+      "value": "digits"
+    },
+    "score.min_levels": {
+      "type": "i32",
+      "value": 2
+    },
+    "score.max_levels": {
+      "type": "i32",
+      "value": 10
+    },
+    "estimate.slots": {
+      "type": "str",
+      "value": "last"
+    },
+    "estimate.max_values": {
+      "type": "i32",
+      "value": 128
+    },
+    "estimate.grid": {
+      "type": "str",
+      "value": "levels"
+    },
+    "estimate.numbers": {
+      "type": "bool",
+      "value": true
+    },
+    "box.presence": {
+      "type": "bool",
+      "value": true
+    },
+    "box.grid": {
+      "type": "str",
+      "value": "levels"
+    },
+    "box.numbers": {
+      "type": "bool",
+      "value": true
+    },
+    "box.bins": {
+      "type": "i32",
+      "value": 1000
+    },
+    "box.positions": {
+      "type": "str",
+      "value": "starts"
+    },
+    "box.edge": {
+      "type": "str",
+      "value": "median"
+    },
+    "box.points": {
+      "type": "str",
+      "value": "halton"
+    },
+    "box.draws": {
+      "type": "i32",
+      "value": 512
+    },
+    "box.iou": {
+      "type": "f64",
+      "value": 0.5
+    },
+    "box.crossed": {
+      "type": "str",
+      "value": "shift"
+    },
+    "box.drawn": {
+      "type": "str",
+      "value": "ordered"
+    },
+    "boxes.max": {
+      "type": "i32",
+      "value": 16
+    },
+    "image_placements": {
+      "type": "[str]",
+      "value": [
+        "front"
+      ]
+    },
+    "image_max_pixels": {
+      "type": "i32",
+      "value": 1638400
+    },
+    "noul.slots": {
+      "type": "str",
+      "value": "last"
+    },
+    "temperature.noul": {
+      "type": "f32",
+      "value": 1.337398453966105
+    },
+    "choice.slots": {
+      "type": "str",
+      "value": "last"
+    },
+    "temperature.choice": {
+      "type": "f32",
+      "value": 1.337398453966105
+    },
+    "score.slots": {
+      "type": "str",
+      "value": "last"
+    },
+    "temperature.score": {
+      "type": "f32",
+      "value": 1.337398453966105
+    },
+    "temperature.multiple": {
+      "type": "f32",
+      "value": 1.0
+    },
+    "temperature.estimate": {
+      "type": "f32",
+      "value": 1.0
+    },
+    "temperature.box": {
+      "type": "f32",
+      "value": 1.0
+    },
+    "temperature.boxes": {
+      "type": "f32",
+      "value": 1.0
+    },
+    "read.text.max_tokens": {
+      "type": "i32",
+      "value": 512
+    },
+    "read.number.max_tokens": {
+      "type": "i32",
+      "value": 32
+    },
+    "read.date.max_tokens": {
+      "type": "i32",
+      "value": 32
+    },
+    "calibration.multiple.raw": {
+      "type": "[f64]",
+      "value": [
+        0.0016627926872626571,
+        0.008286236297705318,
+        0.013284336191710702,
+        0.017877624036637375,
+        0.023793328700436385,
+        0.03199311782995977,
+        0.04889508202323689,
+        0.07631002315865278,
+        0.10610537429711313,
+        0.1516745984883731,
+        0.2304679394076778,
+        0.374861408323991,
+        0.6689872755703948,
+        0.976994335126831
+      ]
+    },
+    "calibration.multiple.calibrated": {
+      "type": "[f64]",
+      "value": [
+        0.0,
+        0.0024813895781637717,
+        0.0049504950495049506,
+        0.015,
+        0.018518518518518517,
+        0.03398058252427184,
+        0.05459057071960298,
+        0.07407407407407407,
+        0.1262135922330097,
+        0.15865384615384615,
+        0.21393034825870647,
+        0.3417085427135678,
+        0.7,
+        0.9690721649484536
+      ]
+    },
+    "calibration.multiple.inverted": {
+      "type": "bool",
+      "value": false
+    },
+    "calibration.found_text.raw": {
+      "type": "[f64]",
+      "value": [
+        0.005682162615729877,
+        0.020574209407310595,
+        0.05274184431288053,
+        0.12593568082560191,
+        0.2609023091129281,
+        0.45711776140061294,
+        0.6460263153368776,
+        0.7728411636569283,
+        0.852111120115627,
+        0.9055508368394591,
+        0.9416752389886163,
+        0.9675597308034246,
+        0.9927885918454691,
+        0.9997205003886156
+      ]
+    },
+    "calibration.found_text.calibrated": {
+      "type": "[f64]",
+      "value": [
+        0.0,
+        0.011363636363636364,
+        0.022727272727272728,
+        0.11363636363636363,
+        0.25,
+        0.42045454545454547,
+        0.5568181818181818,
+        0.7727272727272727,
+        0.8522727272727273,
+        0.9204545454545454,
+        0.9318181818181818,
+        0.9772727272727273,
+        0.9924242424242424,
+        1.0
+      ]
+    },
+    "calibration.found_text.inverted": {
+      "type": "bool",
+      "value": false
+    },
+    "calibration.found_number.raw": {
+      "type": "[f64]",
+      "value": [
+        0.01582507598356401,
+        0.1465578345315797,
+        0.29448616611106054,
+        0.6300800165959767,
+        0.9313231366021293,
+        0.9951998972501911
+      ]
+    },
+    "calibration.found_number.calibrated": {
+      "type": "[f64]",
+      "value": [
+        0.0,
+        0.2857142857142857,
+        0.5,
+        0.7142857142857143,
+        0.9285714285714286,
+        1.0
+      ]
+    },
+    "calibration.found_number.inverted": {
+      "type": "bool",
+      "value": false
+    },
+    "calibration.found_date.raw": {
+      "type": "[f64]",
+      "value": [
+        0.008417200646363199,
+        0.5494083234419426,
+        0.9654906044403712,
+        0.9966836659113566
+      ]
+    },
+    "calibration.found_date.calibrated": {
+      "type": "[f64]",
+      "value": [
+        0.0,
+        0.5,
+        0.9166666666666666,
+        1.0
+      ]
+    },
+    "calibration.found_date.inverted": {
+      "type": "bool",
+      "value": false
+    },
+    "calibration.found_box.raw": {
+      "type": "[f64]",
+      "value": [
+        0.0010319100776659475,
+        0.0162678323005357,
+        0.1641463061831407,
+        0.6041711138630492,
+        0.8735690557675277,
+        0.9579824398960495,
+        0.9952215192477699
+      ]
+    },
+    "calibration.found_box.calibrated": {
+      "type": "[f64]",
+      "value": [
+        0.0027472527472527475,
+        0.11235955056179775,
+        0.4157303370786517,
+        0.8541666666666666,
+        0.978021978021978,
+        0.9887640449438202,
+        1.0
+      ]
+    },
+    "calibration.found_box.inverted": {
+      "type": "bool",
+      "value": false
+    },
+    "calibration.box.raw": {
+      "type": "[f64]",
+      "value": [
+        0.08177083333333333,
+        0.35257161458333336,
+        0.5962035123966942,
+        0.7902631915983607,
+        0.8755763319672131,
+        0.9086263020833333,
+        0.9435433650362319,
+        0.9652183219178082,
+        0.9831365659916201,
+        0.9948308270676691
+      ]
+    },
+    "calibration.box.calibrated": {
+      "type": "[f64]",
+      "value": [
+        0.18333333333333332,
+        0.4,
+        0.6694214876033058,
+        0.7786885245901639,
+        0.8688524590163934,
+        0.9,
+        0.9492753623188406,
+        0.9726027397260274,
+        0.9888268156424581,
+        1.0
+      ]
+    },
+    "calibration.box.inverted": {
+      "type": "bool",
+      "value": false
+    },
+    "calibration.found_boxes.raw": {
+      "type": "[f64]",
+      "value": [
+        0.0022886859880368398,
+        0.11311487904813239,
+        0.39857997008840157,
+        0.8182158553298949,
+        0.980104905128495,
+        0.9981022046260327
+      ]
+    },
+    "calibration.found_boxes.calibrated": {
+      "type": "[f64]",
+      "value": [
+        0.0,
+        0.0891089108910891,
+        0.3786407766990291,
+        0.8514851485148515,
+        0.9702970297029703,
+        1.0
+      ]
+    },
+    "calibration.found_boxes.inverted": {
+      "type": "bool",
+      "value": false
+    },
+    "calibration.boxes.raw": {
+      "type": "[f64]",
+      "value": [
+        0.00048828125,
+        0.008246527777777778,
+        0.0777587890625,
+        0.20135498046875,
+        0.3692626953125,
+        0.50830078125,
+        0.5980224609375,
+        0.6732177734375,
+        0.8321126302083334,
+        0.9644757699275363,
+        0.9945746527777778
+      ]
+    },
+    "calibration.boxes.calibrated": {
+      "type": "[f64]",
+      "value": [
+        0.0,
+        0.05555555555555555,
+        0.3125,
+        0.46875,
+        0.5625,
+        0.625,
+        0.6875,
+        0.8125,
+        0.9375,
+        0.9710144927536232,
+        1.0
+      ]
+    },
+    "calibration.boxes.inverted": {
+      "type": "bool",
+      "value": false
+    },
+    "calibration.estimate.raw": {
+      "type": "[f64]",
+      "value": [
+        0.030000000000000002,
+        0.09,
+        0.15000000000000002,
+        0.21000000000000002,
+        0.27,
+        0.32999999999999996,
+        0.39,
+        0.44999999999999996,
+        0.51,
+        0.57,
+        0.63,
+        0.69,
+        0.75,
+        0.81,
+        0.87,
+        0.93,
+        0.9799999999999999
+      ]
+    },
+    "calibration.estimate.calibrated": {
+      "type": "[f64]",
+      "value": [
+        0.22420634920634921,
+        0.28869047619047616,
+        0.3551587301587302,
+        0.4007936507936508,
+        0.4603174603174603,
+        0.5238095238095238,
+        0.5922619047619048,
+        0.6448412698412699,
+        0.7033730158730159,
+        0.7579365079365079,
+        0.7986111111111112,
+        0.8452380952380952,
+        0.8869047619047619,
+        0.9246031746031746,
+        0.9523809523809523,
+        0.9751984126984127,
+        0.9940476190476191
+      ]
+    },
+    "calibration.estimate.inverted": {
+      "type": "bool",
+      "value": true
+    },
+    "kinds": {
+      "type": "[str]",
+      "value": [
+        "noul",
+        "choice",
+        "multiple",
+        "score",
+        "read",
+        "estimate",
+        "box",
+        "boxes"
+      ]
+    }
+  },
+  "head": null
+}

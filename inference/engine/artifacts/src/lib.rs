@@ -5,6 +5,7 @@
 //! families assign numerical meaning to those facts elsewhere.
 
 pub mod catalog_headers;
+mod decision;
 mod error;
 pub mod gguf;
 mod identity;
@@ -17,6 +18,10 @@ mod source;
 pub mod support;
 mod uncached;
 
+pub use decision::{
+    DecisionError, DecisionMetadata, DecisionValue, Serves, DECISION_NAMESPACE, DECISION_TEMPLATE,
+    READOUT_HEAD,
+};
 pub use error::Error;
 pub use identity::{ArtifactIdentity, PackageIdentity};
 pub use layout::{BoundaryRule, InputLayout, InputSpan};

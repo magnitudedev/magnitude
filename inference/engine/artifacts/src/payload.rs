@@ -4,8 +4,8 @@
 //! tokenizer implementation or template/parser family.
 
 use crate::{
-    gguf::{Directory, Metadata, Value},
-    Error,
+    gguf::{Array, Directory, Metadata, Value},
+    Error, DECISION_TEMPLATE,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -22,6 +22,7 @@ impl TokenizerPayload {
                 .filter(|entry| {
                     entry.name.starts_with("tokenizer.")
                         && entry.name != "tokenizer.chat_template"
+                        && entry.name != TEMPLATE_INDEX
                         && !entry.name.starts_with("tokenizer.chat_template.")
                 })
                 .cloned()
@@ -36,6 +37,12 @@ impl TokenizerPayload {
             .map(|entry| &entry.value)
     }
 }
+
+/// llama.cpp's index of a GGUF's named chat templates: the names of its
+/// `tokenizer.chat_template.<name>` variants. The decision template is the
+/// decision description's, not a chat variant, and is neither indexed nor
+/// carried here.
+const TEMPLATE_INDEX: &str = "tokenizer.chat_templates";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TemplateSource {
@@ -54,7 +61,11 @@ impl TemplatePayload {
     pub fn from_directory(directory: &Directory, provenance: &str) -> Result<Self, Error> {
         let has_unsuffixed_default = directory.value("tokenizer.chat_template").is_some();
         let mut sources = Vec::new();
-        for entry in &directory.metadata {
+        for entry in directory
+            .metadata
+            .iter()
+            .filter(|entry| entry.name != DECISION_TEMPLATE)
+        {
             let name = if entry.name == "tokenizer.chat_template" {
                 "default"
             } else if let Some(name) = entry.name.strip_prefix("tokenizer.chat_template.") {
@@ -84,6 +95,23 @@ impl TemplatePayload {
             });
         }
         sources.sort_by(|left, right| left.name.cmp(&right.name));
+        if let Some(index) = directory.value(TEMPLATE_INDEX) {
+            let Value::Array(Array::String(names)) = index else {
+                return Err(Error::Invalid(format!("{TEMPLATE_INDEX} must list names")));
+            };
+            let mut listed = names.iter().collect::<Vec<&str>>();
+            listed.sort_unstable();
+            let named = sources
+                .iter()
+                .map(|source| source.name.as_str())
+                .filter(|name| *name != "default")
+                .collect::<Vec<_>>();
+            if listed != named {
+                return Err(Error::Invalid(format!(
+                    "{TEMPLATE_INDEX} must list exactly the named chat templates"
+                )));
+            }
+        }
         Ok(Self { sources })
     }
 }

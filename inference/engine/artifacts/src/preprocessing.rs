@@ -62,6 +62,12 @@ pub struct ImageProcessorConfig {
     pub frames: usize,
     pub mean: [f32; 3],
     pub std: [f32; 3],
+    /// The most pixels a picture is read at: one of more pixels is
+    /// downscaled to at most this many first, as d1-2B's `media.cap_pixels`
+    /// does before its processor: each side scaled by `√(pixels / area)` and
+    /// truncated (at least 1), resized as Pillow resizes an RGB image
+    /// bicubically (`resize_rgb8`).
+    pub pixel_cap: Option<usize>,
 }
 
 impl ImageProcessorConfig {
@@ -72,6 +78,7 @@ impl ImageProcessorConfig {
             .ok_or("image processor factor overflows")?;
         if factor == 0
             || self.frames == 0
+            || self.pixel_cap == Some(0)
             || match self.resize {
                 ImageResize::Slices {
                     resolution,
@@ -99,6 +106,7 @@ impl ImageProcessorConfig {
         Ok(())
     }
 
+    /// The digest of this configuration.
     fn identity(&self) -> String {
         let mut digest = Sha256::new();
         let (resize, bounds): (&[u8], [usize; 2]) = match self.resize {
@@ -143,6 +151,13 @@ impl ImageProcessorConfig {
                 digest.update(value.to_bits().to_le_bytes());
             }
         }
+        if let Some(pixels) = self.pixel_cap {
+            let cap: &[u8] = b"pixel-cap:floor-sides:pil-bicubic-rgb8";
+            for field in [cap, &pixels.to_le_bytes()] {
+                digest.update((field.len() as u64).to_le_bytes());
+                digest.update(field);
+            }
+        }
         digest
             .finalize()
             .iter()
@@ -162,6 +177,25 @@ impl ImageProcessor {
         config.validate()?;
         let identity = config.identity();
         Ok(Self { config, identity })
+    }
+
+    /// `image` as RGB within the pixel cap (`ImageProcessorConfig::pixel_cap`).
+    fn within_cap(&self, image: &image::DynamicImage) -> Result<image::Rgb32FImage, String> {
+        let (width, height) = (image.width() as usize, image.height() as usize);
+        match self.config.pixel_cap {
+            Some(pixels) if width * height > pixels => {
+                let scale = (pixels as f64 / (width * height) as f64).sqrt();
+                let side = |extent: usize| ((extent as f64 * scale) as usize).max(1);
+                let capped = resize_rgb8(
+                    &image.to_rgb8(),
+                    side(width),
+                    side(height),
+                    Resampling::Bicubic,
+                )?;
+                Ok(image::DynamicImage::ImageRgb8(capped).to_rgb32f())
+            }
+            _ => Ok(image.to_rgb32f()),
+        }
     }
 
     pub fn identity(&self) -> &str {
@@ -242,7 +276,7 @@ impl ImageProcessor {
             let mut image = image::DynamicImage::from_decoder(decoder)
                 .map_err(|error| format!("image decode failed: {error}"))?;
             image.apply_orientation(orientation);
-            let source = image.to_rgb32f();
+            let source = self.within_cap(&image)?;
             let crops = match self.config.resize {
                 ImageResize::Slices {
                     resolution,
@@ -256,7 +290,7 @@ impl ImageProcessor {
                 }
                 _ => {
                     let (h, w) =
-                        self.resized_size(image.height() as usize, image.width() as usize)?;
+                        self.resized_size(source.height() as usize, source.width() as usize)?;
                     self.prepared_rows(rows, h, w)?;
                     vec![resize(&source, w, h, self.config.resampling)?]
                 }
@@ -593,7 +627,8 @@ fn python_set_order(pairs: impl Iterator<Item = (u64, u64)>) -> Vec<(u64, u64)> 
 #[derive(Clone, Debug)]
 struct FilterSpan {
     first: usize,
-    weights: Vec<f32>,
+    /// Normalized to sum to 1.
+    weights: Vec<f64>,
 }
 
 /// PIL's cubic kernel (a = −0.5).
@@ -672,13 +707,81 @@ fn filter_spans(
         if !sum.is_finite() || sum == 0.0 {
             return Err("resize produced invalid filter weights".into());
         }
-        let weights = weights
-            .drain(..)
-            .map(|weight| (weight / sum) as f32)
-            .collect();
+        let weights = weights.drain(..).map(|weight| weight / sum).collect();
         spans.push(FilterSpan { first, weights });
     }
     Ok(spans)
+}
+
+/// The fixed-point fraction bits of PIL's 8-bit resampling
+/// (`PRECISION_BITS`).
+const PRECISION_BITS: u32 = 32 - 8 - 2;
+
+/// PIL's resize of an 8-bit RGB image (`ImagingResample`, 8 bits per
+/// channel): the spans' weights fixed to `PRECISION_BITS` fraction bits
+/// (rounded half away from zero), then a horizontal and a vertical pass,
+/// each skipped where its side is unchanged, each summing its taps from a
+/// half and clipping to 8 bits.
+fn resize_rgb8(
+    source: &image::RgbImage,
+    output_width: usize,
+    output_height: usize,
+    resampling: Resampling,
+) -> Result<image::RgbImage, String> {
+    let fixed = |input: usize, output: usize| {
+        filter_spans(input, output, resampling).map(|spans| {
+            spans
+                .into_iter()
+                .map(|span| {
+                    let weights = span
+                        .weights
+                        .iter()
+                        .map(|weight| (weight * f64::from(1u32 << PRECISION_BITS)).round() as i32)
+                        .collect::<Vec<_>>();
+                    (span.first, weights)
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    let clip = |sum: i32| (sum >> PRECISION_BITS).clamp(0, 255) as u8;
+    // One pass over `image` along one side to `output` samples.
+    let pass = |image: &image::RgbImage, output: usize, horizontal: bool| {
+        let (width, height) = (image.width() as usize, image.height() as usize);
+        let spans = fixed(if horizontal { width } else { height }, output)?;
+        let (out_width, out_height) = if horizontal {
+            (output, height)
+        } else {
+            (width, output)
+        };
+        let mut out = image::RgbImage::new(out_width as u32, out_height as u32);
+        for y in 0..out_height {
+            for x in 0..out_width {
+                let (first, weights) = &spans[if horizontal { x } else { y }];
+                let mut sums = [1i32 << (PRECISION_BITS - 1); 3];
+                for (offset, weight) in weights.iter().enumerate() {
+                    let (sx, sy) = if horizontal {
+                        (first + offset, y)
+                    } else {
+                        (x, first + offset)
+                    };
+                    let pixel = image.get_pixel(sx as u32, sy as u32);
+                    for channel in 0..3 {
+                        sums[channel] += i32::from(pixel[channel]) * weight;
+                    }
+                }
+                out.put_pixel(x as u32, y as u32, image::Rgb(sums.map(clip)));
+            }
+        }
+        Ok::<_, String>(out)
+    };
+    let horizontal = match source.width() as usize == output_width {
+        true => source.clone(),
+        false => pass(source, output_width, true)?,
+    };
+    match source.height() as usize == output_height {
+        true => Ok(horizontal),
+        false => pass(&horizontal, output_height, false),
+    }
 }
 
 fn resize(
@@ -705,7 +808,7 @@ fn resize(
                 let pixel = source.get_pixel((span.first + offset) as u32, source_y as u32);
                 let base = (source_y * output_width + destination_x) * 3;
                 for channel in 0..3 {
-                    intermediate[base + channel] += pixel[channel] * weight;
+                    intermediate[base + channel] += pixel[channel] * *weight as f32;
                 }
             }
         }
@@ -717,7 +820,7 @@ fn resize(
             for (offset, weight) in span.weights.iter().enumerate() {
                 let base = ((span.first + offset) * output_width + destination_x) * 3;
                 for channel in 0..3 {
-                    value[channel] += intermediate[base + channel] * weight;
+                    value[channel] += intermediate[base + channel] * *weight as f32;
                 }
             }
             // PIL keeps an RGB image after resize: overshoot is clipped and

@@ -68,6 +68,19 @@ impl InputLayout {
                     && position < span.end
             })
     }
+    /// The first position at or after `position` a chunk may end at: the
+    /// end of the indivisible span holding it inside, or itself.
+    pub fn next_boundary(&self, position: usize) -> usize {
+        self.spans
+            .iter()
+            .find(|span| {
+                span.boundaries == BoundaryRule::Indivisible
+                    && span.start < position
+                    && position < span.end
+            })
+            .map_or(position, |span| span.end)
+    }
+
     /// The service allowance is soft. A physical capacity check still applies to
     /// the returned unit, including when the first indivisible span exceeds it.
     pub fn chunk_end(
@@ -107,5 +120,36 @@ impl InputLayout {
             .iter()
             .filter(|s| s.start <= position && position < s.end)
             .all(|s| s.language_history))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A chunk ends past an indivisible span; a causal span splits anywhere.
+    #[test]
+    fn indivisible_spans_bound_chunk_ends() {
+        let span = |start, end, boundaries| InputSpan {
+            start,
+            end,
+            identity: format!("{start}"),
+            boundaries,
+            language_history: false,
+        };
+        let layout = InputLayout::new(
+            12,
+            vec![
+                span(2, 6, BoundaryRule::Indivisible),
+                span(8, 10, BoundaryRule::Causal),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            (0..=12)
+                .map(|position| layout.next_boundary(position))
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 6, 6, 6, 6, 7, 8, 9, 10, 11, 12]
+        );
     }
 }

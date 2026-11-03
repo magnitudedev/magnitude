@@ -1,0 +1,20 @@
+[package]
+name = "magnitude-decision"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Typed decisions: request, decision description, answers. Builds the
+# readout plans the engine runs, without depending on it; below the protocol
+# adapters in serving.
+[dependencies]
+caseless = "0.2.2"
+fancy-regex = "0.19.2"
+magnitude-artifacts = { path = "../artifacts" }
+magnitude-chat = { path = "../chat" }
+magnitude-family-contracts = { path = "../families/contracts" }
+magnitude-readout = { path = "../readout" }
+magnitude-templates = { path = "../templates" }
+serde.workspace = true
+serde_json = "=1.0.151"
+unicode-normalization.workspace = true

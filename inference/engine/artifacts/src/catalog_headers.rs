@@ -90,7 +90,9 @@ impl ArtifactHeader {
 /// 27B and Nemotron 3.5 Bolt and Super VL DSpark drafts, the Qwen3.6 27B
 /// target the Qwen3.6 27B DFlash draft's publication binds to and
 /// bartowski's Gemma 4 E2B Q4_K_M (which keeps the sharing layers'
-/// projections the catalog's file omits).
+/// projections the catalog's file omits), and Liquid's published d1-2B
+/// GGUFs and projector (a decision model the catalog does not serve until
+/// its conversion carries every key its type reads).
 pub fn artifacts() -> Vec<ArtifactHeader> {
     [
         (
@@ -122,6 +124,24 @@ pub fn artifacts() -> Vec<ArtifactHeader> {
             "bartowski/google_gemma-4-E2B-it-GGUF",
             "81012ba3538e061d5ee003f11f25335b17f82e2d",
             "google_gemma-4-E2B-it-Q4_K_M.gguf",
+        ),
+        (
+            "d1-2b-q4_k_m",
+            "LiquidAI/d1-2B-GGUF",
+            "63be75e6586882defeb706ed4bda812d90256a6d",
+            "d1-2B-Q4_K_M.gguf",
+        ),
+        (
+            "d1-2b-q8_0",
+            "LiquidAI/d1-2B-GGUF",
+            "63be75e6586882defeb706ed4bda812d90256a6d",
+            "d1-2B-Q8_0.gguf",
+        ),
+        (
+            "d1-2b-mmproj-bf16",
+            "LiquidAI/d1-2B-GGUF",
+            "63be75e6586882defeb706ed4bda812d90256a6d",
+            "mmproj-d1-2B-BF16.gguf",
         ),
     ]
     .into_iter()

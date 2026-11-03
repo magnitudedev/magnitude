@@ -10,6 +10,8 @@ members = [
   "engine/generation",
   "engine/grammar",
   "engine/scheduler",
+  "engine/readout",
+  "engine/decision",
   "engine/batching",
   "engine/families/contracts",
   "engine/families/common",

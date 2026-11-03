@@ -11,6 +11,7 @@ fn configured(patch: usize, merge: usize, resize: ImageResize) -> ImageProcessor
         frames: 2,
         mean: [0.0; 3],
         std: [1.0; 3],
+        pixel_cap: None,
     })
     .unwrap()
 }
@@ -227,4 +228,69 @@ fn oversized_preparation_is_refused_before_resizing_or_slicing() {
             .unwrap_err();
         assert!(error.contains("prepared image pixels exceed capacity"), "{error}");
     }
+}
+
+/// A picture above a processor's pixel cap is read as d1-2B's
+/// `media.cap_pixels` reads it before its processor (`97c5704`): a 97x61
+/// picture (`cap-source.png`, pixel `(x, y)` holding `((37x + 11y) % 256,
+/// (x² + 3y) % 256, (5(x ^ y)) % 256)`) capped at 2000 pixels is 56x35,
+/// against Pillow 13.0's `Image.resize(..., BICUBIC)` of it
+/// (`cap-pil.png`). The processor here keeps the capped picture's size, so
+/// its pixel rows are the capped picture's; one below the cap is read as
+/// it is.
+#[test]
+fn a_picture_above_the_pixel_cap_is_downscaled_as_d1_2b_reads_it() {
+    let fixture = |name: &str| {
+        std::fs::read(format!(
+            "{}/tests/fixtures/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    };
+    let capped = |pixel_cap: Option<usize>| {
+        ImageProcessor::new(ImageProcessorConfig {
+            resize: ImageResize::PixelBounds {
+                min_pixels: 1,
+                max_pixels: 1 << 20,
+            },
+            resampling: Resampling::Bicubic,
+            patch: 1,
+            merge: 1,
+            frames: 1,
+            mean: [0.0; 3],
+            std: [1.0; 3],
+            pixel_cap,
+        })
+        .unwrap()
+    };
+    let unchanged = || capped(None);
+    let rows = |processor: &ImageProcessor, image: &[u8]| {
+        let prepared = processor.prepare(&[image.to_vec()]).unwrap();
+        let tensor = |name: &str| {
+            prepared
+                .tensors()
+                .iter()
+                .find(|tensor| tensor.name() == name)
+                .unwrap()
+                .data()
+                .chunks_exact(if name == "pixel_values" { 4 } else { 8 })
+                .map(|bytes| match bytes.len() {
+                    4 => f32::from_le_bytes(bytes.try_into().unwrap()) as f64,
+                    _ => i64::from_le_bytes(bytes.try_into().unwrap()) as f64,
+                })
+                .collect::<Vec<_>>()
+        };
+        (tensor("image_grid_thw"), tensor("pixel_values"))
+    };
+    let source = fixture("cap-source.png");
+    let below = capped(Some(2000));
+    assert_ne!(below.identity(), unchanged().identity());
+    let (grid, pixels) = rows(&below, &source);
+    assert_eq!(grid, [1.0, 35.0, 56.0]);
+    let (_, expected) = rows(&unchanged(), &fixture("cap-pil.png"));
+    assert_eq!(pixels, expected, "the capped picture is not Pillow's");
+    // At or below the cap, the picture is read as it is.
+    let (grid, pixels) = rows(&capped(Some(97 * 61)), &source);
+    assert_eq!(grid, [1.0, 61.0, 97.0]);
+    assert_eq!(pixels, rows(&unchanged(), &source).1);
 }
