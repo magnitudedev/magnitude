@@ -9,7 +9,7 @@
   color-scheme: light;
   --page: #f4f4f2; --panel: #ffffff; --ink: #161615; --ink-2: #4d4b46; --muted: #7c7a73; --faint: #c9c7bf;
   --line: rgba(22, 22, 21, .1); --track: rgba(22, 22, 21, .08); --prep: #9a978e;
-  --accent: #2a78d6; --accent-fill: rgba(42, 120, 214, .16); --red: #cf3a3a; --red-fill: rgba(207, 58, 58, .14);
+  --accent: #2a78d6; --accent-fill: rgba(42, 120, 214, .16); --red: #cf3a3a; --red-fill: rgba(207, 58, 58, .14); --amber: #c98a06; --amber-fill: rgba(201, 138, 6, .18); --glow: rgba(22, 22, 21, .35);
   --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
 }
@@ -18,20 +18,21 @@
     color-scheme: dark;
     --page: #0e0e0d; --panel: #171716; --ink: #ecebe6; --ink-2: #b4b2aa; --muted: #85837b; --faint: #4a4844;
     --line: rgba(255, 255, 255, .08); --track: rgba(255, 255, 255, .08); --prep: #77756e;
-    --accent: #3987e5; --accent-fill: rgba(57, 135, 229, .22); --red: #ec5c54; --red-fill: rgba(236, 92, 84, .18);
+    --accent: #3987e5; --accent-fill: rgba(57, 135, 229, .22); --red: #ec5c54; --red-fill: rgba(236, 92, 84, .18); --amber: #e8b030; --amber-fill: rgba(232, 176, 48, .2); --glow: rgba(255, 255, 255, .55);
   }
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
   --page: #0e0e0d; --panel: #171716; --ink: #ecebe6; --ink-2: #b4b2aa; --muted: #85837b; --faint: #4a4844;
   --line: rgba(255, 255, 255, .08); --track: rgba(255, 255, 255, .08); --prep: #77756e;
-  --accent: #3987e5; --accent-fill: rgba(57, 135, 229, .22); --red: #ec5c54; --red-fill: rgba(236, 92, 84, .18);
+  --accent: #3987e5; --accent-fill: rgba(57, 135, 229, .22); --red: #ec5c54; --red-fill: rgba(236, 92, 84, .18); --amber: #e8b030; --amber-fill: rgba(232, 176, 48, .2); --glow: rgba(255, 255, 255, .55);
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; background: var(--page); color: var(--ink); }
 body { font: 13px/1.45 var(--sans); -webkit-font-smoothing: antialiased; container-type: inline-size; }
 .num, .v, .when, .t { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 .bad { color: var(--red) !important; }
+.late { color: var(--amber) !important; }
 h2 { margin: 0; font: 600 11px var(--sans); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
 h2 b { font: 500 11px var(--mono); color: var(--ink-2); margin-left: 6px; letter-spacing: 0; }
 
@@ -47,10 +48,11 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 32px; pa
 .stat .l { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); white-space: nowrap; }
 .stat.zero .n { color: var(--faint); }
 .stat.bad:not(.zero) .n, .stat.bad:not(.zero) .l { color: var(--red); }
+.stat.late:not(.zero) .n, .stat.late:not(.zero) .l { color: var(--amber); }
 .sw { width: 9px; height: 9px; border-radius: 2px; flex: none; }
 .sw.busy { background: var(--accent); } .sw.prep { background: var(--prep); }
 .sw.queued { border: 1.5px dashed var(--muted); } .sw.idle { border: 1.5px solid var(--faint); }
-.sw.over { background: var(--red); } .sw.down { background: var(--red); border-radius: 50%; }
+.sw.over { background: var(--amber); } .sw.down { background: var(--red); border-radius: 50%; }
 #fleet { margin-left: auto; display: flex; flex-wrap: wrap; gap: 8px 18px; }
 .fg { display: flex; flex-direction: column; gap: 5px; }
 .fg span { font-size: 11px; color: var(--muted); white-space: nowrap; }
@@ -60,7 +62,7 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 32px; pa
 .tile.prep { background: var(--prep); border-color: var(--prep); }
 .tile.down { background: var(--red); border-color: var(--red); }
 .tile.unready, .tile.connecting { border-style: dashed; }
-.tile.over { box-shadow: 0 0 0 2px var(--page), 0 0 0 3.5px var(--red); }
+.tile.over { box-shadow: 0 0 0 2px var(--page), 0 0 0 3.5px var(--amber); }
 
 /* ---- machines on the left, jobs and activity on the right */
 .layout { display: grid; grid-template-columns: minmax(0, 1fr) 440px; gap: 16px; padding: 0 20px 20px; align-items: start; }
@@ -72,7 +74,7 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 32px; pa
 .activity { flex: 0 0 30%; min-height: 150px; display: flex; flex-direction: column; padding: 12px 14px 8px; }
 
 /* ---- a machine: fixed height, every slot always present, so nothing moves as work comes and goes */
-.card { padding: 11px 13px 12px; display: flex; flex-direction: column; gap: 8px; cursor: default; transition: opacity .15s; }
+.card { position: relative; padding: 11px 13px 12px; display: flex; flex-direction: column; gap: 8px; cursor: default; }
 .ch { display: flex; align-items: center; gap: 8px; height: 18px; }
 .dot { flex: none; width: 8px; height: 8px; border-radius: 50%; border: 1.5px solid var(--faint); }
 .dot.busy { background: var(--accent); border-color: var(--accent); }
@@ -100,23 +102,39 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 32px; pa
 .bar i { display: block; width: 0; height: 100%; border-radius: 2px; background: var(--ink-2); transition: width 1s linear; }
 .m.gpu .bar i { background: var(--accent); }
 .bar.bad i { background: var(--red); }
+.bar.late i { background: var(--amber); }
 .card.off .chart canvas, .card.off .metrics, .card.off .temp { opacity: .4; }
 .slots { display: flex; align-items: center; gap: 10px; height: 18px; border-top: 1px solid var(--line); padding-top: 9px; box-sizing: content-box; }
 .chips { flex: 1; min-width: 0; display: flex; align-items: center; gap: 4px; overflow: hidden; }
-.chip { flex: 0 0 26px; height: 12px; border-radius: 3px; background: var(--track); overflow: hidden; cursor: pointer; transition: opacity .15s; }
+.chip { flex: 0 0 26px; height: 12px; border-radius: 3px; background: var(--track); overflow: hidden; cursor: pointer; }
 .chip i { display: block; height: 100%; }
 .chip.device { flex-basis: 64px; background: var(--accent-fill); } .chip.device i { background: var(--accent); }
 .chip.prep i { background: var(--prep); }
 .chip.queued { background: none; border: 1.5px dashed var(--muted); }
-.chip.over { background: var(--red-fill); } .chip.over i { background: var(--red); }
+.chip.over { background: var(--amber-fill); } .chip.over i { background: var(--amber); }
 .chips .more { font: 11px var(--mono); color: var(--muted); }
 .sum { flex: none; font: 12px var(--mono); color: var(--ink-2); white-space: nowrap; }
 .sum.quiet { color: var(--muted); }
 
+/* ---- a machine's state around its edge: a gray light circling it while it prepares, a blue
+   border breathing while it holds the device, amber once a run overruns its estimate */
+@property --spin { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
+.card::before { content: ""; position: absolute; inset: -1px; border-radius: 9px; padding: 1.5px; pointer-events: none;
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor; mask-composite: exclude; }
+.card[data-state="prep"]::before { background: conic-gradient(from var(--spin), transparent 0 55%, var(--glow) 80%, transparent 100%);
+  animation: spin 3.2s linear infinite; }
+.card[data-state="prep"].over::before { --glow: var(--amber); }
+.card[data-state="busy"] { border-color: var(--accent); animation: breathe 2.4s ease-in-out infinite; --ring: var(--accent-fill); }
+.card[data-state="busy"].over { border-color: var(--amber); --ring: var(--amber-fill); }
+.card[data-state="down"] { border-color: var(--red-fill); }
+@keyframes spin { to { --spin: 360deg; } }
+@keyframes breathe { 0%, 100% { box-shadow: 0 0 0 0 transparent; } 50% { box-shadow: 0 0 0 3px var(--ring), 0 0 14px 0 var(--ring); } }
+@media (prefers-reduced-motion: reduce) { .card::before, .card { animation: none !important; } }
+
 /* ---- jobs: one row per run, the same height whatever its state */
 .sec + .sec { margin-top: 16px; }
 .sec .list:empty::after { content: "none"; display: block; padding: 6px 0 2px; color: var(--faint); font-size: 12px; }
-.job { padding: 9px 0 10px; border-bottom: 1px solid var(--line); cursor: pointer; transition: opacity .15s; }
+.job { padding: 9px 0 10px; border-bottom: 1px solid var(--line); cursor: pointer; }
 .job:last-child { border-bottom: 0; }
 .job .what { height: 2.9em; line-height: 1.45; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; color: var(--ink); }
 .job .meta { display: flex; align-items: baseline; gap: 8px; margin-top: 4px; font-size: 12px; min-width: 0; }
@@ -132,17 +150,20 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 32px; pa
 
 /* ---- activity: what changed, newest first */
 #log { flex: 1; min-height: 0; overflow: auto; margin-top: 2px; }
-.ev { display: flex; gap: 10px; align-items: baseline; padding: 3px 0; font-size: 12px; white-space: nowrap; min-width: 0; transition: opacity .15s; }
+.ev { display: flex; gap: 10px; align-items: baseline; padding: 3px 0; font-size: 12px; white-space: nowrap; min-width: 0; }
 .ev .t { flex: none; color: var(--muted); font-size: 11px; }
 .ev .h { flex: none; font: 500 11.5px var(--mono); color: var(--ink-2); min-width: 70px; }
 .ev .x { flex: none; color: var(--ink); }
 .ev .p { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
 .ev.bad .x { color: var(--red); }
+.ev.late .x { color: var(--amber); }
 
 /* ---- hovering any job, chip, machine, tile or event lights up everything it belongs to */
-body.hovering .card:not(.hl), body.hovering .job:not(.hl), body.hovering .chip:not(.hl),
-body.hovering .ev:not(.hl), body.hovering .tile:not(.hl) { opacity: .3; }
-.card.hl.focus, .job.hl.focus { outline: 1.5px solid var(--accent); outline-offset: -1px; border-radius: 8px; }
+.card.hl { background: color-mix(in srgb, var(--panel), var(--accent) 7%); }
+.job.hl, .ev.hl { background: var(--accent-fill); box-shadow: -14px 0 0 var(--accent-fill), 14px 0 0 var(--accent-fill); }
+.tile.hl { outline: 1.5px solid var(--ink); outline-offset: 1.5px; }
+.chip.hl { outline: 1.5px solid var(--ink); outline-offset: -1.5px; }  /* inside: the chip row clips its edges */
+.card.hl.focus { outline: 1.5px solid var(--accent); outline-offset: -1px; }
 
 @container (max-width: 1120px) {
   .layout { grid-template-columns: minmax(0, 1fr); }
@@ -305,10 +326,10 @@ function render() {
   // header
   const n = {device: runs.filter(r => r.phase === "device").length, prep: runs.filter(r => r.phase === "prep").length,
              queued: runs.filter(r => r.phase === "queued").length, over: runs.filter(overdue).length};
-  const stat = (k, value, label, bad) => `<div class="stat${value ? "" : " zero"}${bad ? " bad" : ""}"><span class="n">${value}</span><span class="l"><i class="sw ${k}"></i>${label}</span></div>`;
+  const stat = (k, value, label, tone) => `<div class="stat${value ? "" : " zero"}${tone ? " " + tone : ""}"><span class="n">${value}</span><span class="l"><i class="sw ${k}"></i>${label}</span></div>`;
   setHTML(document.getElementById("stats"), [
     stat("busy", n.device, "running"), stat("prep", n.prep, "preparing"), stat("queued", n.queued, "queued"),
-    stat("idle", count("idle"), "idle hosts"), stat("over", n.over, "overdue", true), stat("down", count("down"), "down", true),
+    stat("idle", count("idle"), "idle hosts"), stat("over", n.over, "overdue", "late"), stat("down", count("down"), "down", "bad"),
   ].join(""));
   const c = document.getElementById("clock");
   c.className = lost ? "lost" : ""; c.textContent = lost ? "server unreachable" : clock(t, true);
@@ -378,6 +399,8 @@ function card(v, t) {
   }
   const off = v.state === "down";
   r.el.classList.toggle("off", off);
+  r.el.classList.toggle("over", v.over);
+  r.el.dataset.state = v.state;
   r.dot.className = "dot " + v.state;
   const spec = [v.hw.title, ...v.hw.parts].join(" · ");
   setText(r.spec, h.facts ? spec : "");
@@ -417,9 +440,9 @@ function card(v, t) {
     if (p.runs.length > CHIPS) chips.push(`<span class="more">+${p.runs.length - CHIPS}</span>`);
     setHTML(r.chips, chips.join(""));
   } else setHTML(r.chips, "");
-  const [text, quiet, bad] = summary(v, t);
+  const [text, tone] = summary(v, t);
   setText(r.sum, text);
-  r.sum.className = "sum" + (quiet ? " quiet" : "") + (bad ? " bad" : "");
+  r.sum.className = "sum" + (tone ? " " + tone : "");
   return r.el;
 }
 
@@ -429,15 +452,15 @@ function meter(value, bar, pct) {
 }
 
 function summary({h, st, p, state}, t) {
-  if (st === "down") return [`down ${dur(t - h.since)}`, false, true];
-  if (st === "stale") return [`no reading ${dur(t - h.received)}`, false, true];
-  if (st === "connecting") return ["connecting", true];
+  if (st === "down") return [`down ${dur(t - h.since)}`, "bad"];
+  if (st === "stale") return [`no reading ${dur(t - h.received)}`, "bad"];
+  if (st === "connecting") return ["connecting", "quiet"];
   const queued = p.queue.length ? ` · ${p.queue.length} queued` : "";
   const r = p.device[0];
-  if (r) return r.over > 0 ? [`${dur(r.over)} over${queued}`, false, true] : [`${dur(t - r.start)} / ${dur(r.estimate)}${queued}`];
+  if (r) return r.over > 0 ? [`${dur(r.over)} over${queued}`, "late"] : [`${dur(t - r.start)} / ${dur(r.estimate)}${queued}`];
   if (p.lock) return ["held outside mrig" + queued];
   if (p.other.length) return [p.other[0].what + queued];
-  return [state === "unready" ? "not set up" : "idle", true];
+  return [state === "unready" ? "not set up" : "idle", "quiet"];
 }
 
 const jobEls = new Map();
@@ -460,8 +483,8 @@ function job(r, t) {
   const elapsed = t - r.start, over = overdue(r);
   setText(e.when, r.phase === "queued" ? `${dur(r.estimate)} · ${r.at <= t + 1 ? "next" : "in " + dur(r.at - t)}`
     : (over ? `${dur(r.over)} over · ` : "") + `${dur(elapsed)} / ${dur(r.estimate)}`);
-  e.when.classList.toggle("bad", over);
-  e.bar.classList.toggle("bad", over);
+  e.when.classList.toggle("late", over);
+  e.bar.classList.toggle("late", over);
   e.bar.firstChild.style.width = Math.min(100, elapsed / r.estimate * 100).toFixed(1) + "%";
   return e.el;
 }
@@ -529,11 +552,11 @@ function record(t, views) {
     for (const [a, s] of hosts) {
       const was = seen.hosts.get(a);
       if (s.st !== was.st) {
-        if (s.st === "down") note(t, a, null, "unreachable", reason(s.h), true);
-        else if (s.st === "stale") note(t, a, null, "stopped reporting", "", true);
+        if (s.st === "down") note(t, a, null, "unreachable", reason(s.h), "bad");
+        else if (s.st === "stale") note(t, a, null, "stopped reporting", "", "bad");
         else if (s.st === "live" && (was.st === "down" || was.st === "stale")) note(t, a, null, "back", "");
       }
-      if (s.pressure !== was.pressure && s.st === "live") note(t, a, null, "thermal pressure " + s.pressure, "", s.pressure !== "nominal");
+      if (s.pressure !== was.pressure && s.st === "live") note(t, a, null, "thermal pressure " + s.pressure, "", s.pressure !== "nominal" && "bad");
     }
     for (const [k, r] of runs) {
       const was = seen.runs.get(k);
@@ -542,7 +565,7 @@ function record(t, views) {
         else if (r.phase === "queued") note(t, r.host, k, "queued", r.purpose);
         else if (!was) note(t, r.host, k, r.what, r.purpose);
       }
-      if (r.over && !was?.over) note(t, r.host, k, `over its ${dur(r.estimate)} estimate`, r.purpose, true);
+      if (r.over && !was?.over) note(t, r.host, k, `over its ${dur(r.estimate)} estimate`, r.purpose, "late");
     }
     for (const [k, r] of seen.runs) if (!runs.has(k)) note(t, r.host, k, `ended after ${dur(t - r.start)}`, r.purpose);
     if (events.length > LOG_KEPT) events.splice(0, events.length - LOG_KEPT);
@@ -553,10 +576,10 @@ function record(t, views) {
   }
   seen = {hosts, runs};
 }
-function note(t, host, run, text, purpose, bad) { events.push({t, host, run, text, purpose, bad}); }
+function note(t, host, run, text, purpose, tone) { events.push({t, host, run, text, purpose, tone}); }
 function drawLog() {
   setHTML(document.getElementById("log"), events.slice().reverse().map(e =>
-    `<div class="ev${e.bad ? " bad" : ""}"${e.host ? ` data-host="${esc(e.host)}"` : ""}${e.run ? ` data-run="${esc(e.run)}"` : ""} title="${esc(e.purpose)}">` +
+    `<div class="ev${e.tone ? " " + e.tone : ""}"${e.host ? ` data-host="${esc(e.host)}"` : ""}${e.run ? ` data-run="${esc(e.run)}"` : ""} title="${esc(e.purpose)}">` +
     `<span class="t">${clock(e.t, true)}</span><span class="h">${esc(e.host || "")}</span><span class="x">${esc(e.text)}</span><span class="p">${esc(e.purpose)}</span></div>`).join(""));
 }
 
@@ -570,7 +593,6 @@ function target(el) {
 }
 function highlight() {
   for (const el of document.querySelectorAll(".hl")) el.classList.remove("hl", "focus");
-  document.body.classList.toggle("hovering", !!hover);
   if (!hover) return;
   const host = CSS.escape(hover.host), sel = hover.run
     ? `[data-run="${CSS.escape(hover.run)}"], .card[data-host="${host}"], .tile[data-host="${host}"]`
@@ -585,6 +607,8 @@ document.addEventListener("mouseover", e => {
   if (next?.run === hover?.run && next?.host === hover?.host) return;
   hover = next; highlight();
 });
+// the pointer leaving the page lands on nothing, so nothing stays lit
+document.documentElement.addEventListener("mouseleave", () => { if (hover) { hover = null; highlight(); } });
 document.addEventListener("click", e => {
   const at = target(e.target); if (!at) return;
   const other = at.run && !at.el.classList.contains("job") ? jobEls.get(at.run)?.el : cardEls.get(at.host)?.el;
