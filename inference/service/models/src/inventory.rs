@@ -2256,7 +2256,7 @@ fn model_metadata_evidence(
     content_id: &magnitude_service_contracts::ContentId,
     primary_name: &str,
 ) -> Result<String, InventoryError> {
-    serde_json::to_string(&(&content_id.0, primary_name))
+    serde_json::to_string(&(gguf::RULES, &content_id.0, primary_name))
         .map_err(|error| InventoryError::Internal(error.to_string()))
 }
 
@@ -2384,7 +2384,11 @@ pub(crate) fn local_gguf_cached(
     read: impl FnOnce(&[u8]),
 ) -> Result<gguf::LocalGguf, InventoryError> {
     let metadata = path.metadata().map_err(io_error)?;
-    let evidence = format!("gguf-file-v9\0{}", file_identity(path, &metadata));
+    let evidence = format!(
+        "gguf-file-v9\0{}\0{}",
+        gguf::RULES,
+        file_identity(path, &metadata)
+    );
     if let Some(gguf) = cache.read_index(ModelIndexKind::GgufInspection, &evidence) {
         return Ok(gguf);
     }
@@ -3987,6 +3991,67 @@ mod tests {
         reopened.ensure_model_inventory().await.unwrap();
         let changed = reopened.list().await.unwrap();
         assert_eq!(changed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_inspection_persisted_under_earlier_rules_is_derived_again() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("store");
+        let cache_root = temporary.path().join("cache");
+        let (hf_cache, source) = create_hf_snapshot(temporary.path());
+        write_minimal_gguf(&source.join("model.gguf"));
+        let mut config = InventoryConfig::with_roots(store, cache_root.clone()).unwrap();
+        config.add_hugging_face_caches([hf_cache]);
+        ManagedModelStore::open_unbounded(config.clone())
+            .await
+            .unwrap()
+            .ensure_installed_model_inventory()
+            .await
+            .unwrap();
+
+        // Rewrite what an install under earlier rules left: the inventory entry, its evidence and
+        // the inspection index, all keyed without the rules and labelled by them.
+        let index_path = cache_root.join("indexes/inventory.json");
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+        let (id, model) = index["models"]
+            .as_object_mut()
+            .unwrap()
+            .iter_mut()
+            .next()
+            .unwrap();
+        let id = id.clone();
+        model["properties"]["quantization"] = serde_json::json!("IQ2_XS");
+        let stale: InventoryModel = serde_json::from_value(model.clone()).unwrap();
+        let earlier_key =
+            serde_json::to_string(&(&stale.content_id.0, "model.gguf")).unwrap();
+        index["evidence"][&id]["metadata_key"] = serde_json::json!(earlier_key);
+        fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+        ModelCache::new(&cache_root).write_index(
+            ModelIndexKind::InventoryMetadata,
+            &earlier_key,
+            &CachedModelMetadata {
+                name: stale.name.clone(),
+                properties: stale.properties.clone(),
+                supported_parameters: Vec::new(),
+            },
+        );
+
+        let reopened = ManagedModelStore::open_unbounded(config).await.unwrap();
+        reopened.ensure_installed_model_inventory().await.unwrap();
+        let current = gguf::inspect_complete(&source.join("model.gguf"))
+            .unwrap()
+            .quantization;
+        let models = reopened.list().await.unwrap();
+        assert!(matches!(
+            &models[0].properties,
+            InventoryProperties::Inspected { quantization, .. } if *quantization == current
+        ));
+        let packages = reopened.installed_packages_response().unwrap().packages;
+        assert_eq!(
+            packages[0].package.properties.quantization,
+            current.unwrap_or_else(|| "unknown".to_owned())
+        );
     }
 
     #[cfg(unix)]

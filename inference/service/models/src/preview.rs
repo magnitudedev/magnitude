@@ -2029,7 +2029,8 @@ fn classification_evidence(
     architectures: &crate::candidate_files::RecognizedArchitectures,
 ) -> String {
     format!(
-        "candidate-classification-v7:{digest}:{}",
+        "candidate-classification-v7:{}:{digest}:{}",
+        crate::gguf::RULES,
         architectures.key()
     )
 }

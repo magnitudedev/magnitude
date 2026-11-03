@@ -15,6 +15,11 @@ use std::path::Path;
 const MAGIC: [u8; 4] = *b"GGUF";
 const SUPPORTED_VERSIONS: std::ops::RangeInclusive<u32> = 2..=3;
 
+/// The version of the rules that derive an inspection's facts and labels from a header. Every
+/// cache of something they derive carries it in its key, so changing it re-derives all of them;
+/// bump it with any change to what an inspection reports.
+pub const RULES: &str = "gguf-rules-v1";
+
 /// Header facts of one GGUF file. `header_digest` is the lowercase hex SHA-256 of the first
 /// `header_bytes` bytes, which identifies the file's content without reading tensor data.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
