@@ -803,9 +803,16 @@ impl Quantization {
         {
             return Some(Self::Declared(file_type));
         }
-        // Weights are matrices; norms and biases are vectors kept in full precision.
+        // Weights are matrices; norms and biases are vectors kept in full precision. The token
+        // embedding and output head are stored apart from the body, often at a higher precision,
+        // and with a large vocabulary can outweigh it.
+        let body = |name: &str| !matches!(name, "token_embd.weight" | "output.weight");
         let mut bytes = std::collections::BTreeMap::<u32, (Encoding, u64)>::new();
-        for tensor in directory.tensors.iter().filter(|tensor| tensor.shape.len() > 1) {
+        for tensor in directory
+            .tensors
+            .iter()
+            .filter(|tensor| tensor.shape.len() > 1 && body(&tensor.name))
+        {
             let entry = bytes
                 .entry(tensor.encoding as u32)
                 .or_insert((tensor.encoding, 0));
@@ -998,7 +1005,9 @@ impl FileTypeKind {
             Self::MostlyIq1Small => 19,
             Self::MostlyIq4Nl => 20,
             Self::MostlyIq3Xs | Self::MostlyIq3Small | Self::MostlyIq3Medium => 21,
-            Self::MostlyIq2Small | Self::MostlyIq2Medium => 22,
+            // IQ2_S is a mix whose body is IQ2_XS; IQ2_M's body is IQ2_S.
+            Self::MostlyIq2Small => 17,
+            Self::MostlyIq2Medium => 22,
             Self::MostlyIq4Xs => 23,
             Self::MostlyIq1Medium => 29,
             Self::MostlyBf16 => 30,
@@ -1552,6 +1561,41 @@ mod tests {
         assert_eq!(
             quantization_of(15, true, &[("output.weight", &[256, 256], 14, 256 * 210)]),
             pair("Q4_K - Medium", "4-bit")
+        );
+    }
+
+    #[test]
+    fn an_iq2_s_file_stores_its_body_in_iq2_xs() {
+        // mradermacher's Qwen3.5-0.8B i1-IQ2_S: llama.cpp's IQ2_S recipe stores the body in
+        // IQ2_XS and bumps a few tensors to IQ3_S and Q4_K; no tensor is IQ2_S. The Q5_K
+        // embedding holds the most bytes.
+        let iq2_s = quantization_of(
+            28,
+            false,
+            &[
+                ("blk.0.ffn_up.weight", &[1024, 3584], 17, 1024 * 3584 / 256 * 74),
+                ("blk.0.attn_v.weight", &[1024, 512], 21, 1024 * 512 / 256 * 110),
+                ("token_embd.weight", &[1024, 248_320], 13, 1024 * 248_320 / 256 * 176),
+            ],
+        );
+        assert_eq!(iq2_s, (Some("IQ2_S - 2.5 bpw".to_owned()), Some("2-bit".to_owned())));
+        assert_eq!(quantization_label(iq2_s.0.as_deref().unwrap()), Some("IQ2_S"));
+    }
+
+    #[test]
+    fn the_weights_type_of_a_contradicted_file_type_leaves_out_the_embedding_and_output() {
+        // An MXFP4 body declared as Q2_0, with a Q8_0 embedding and output larger than the body.
+        assert_eq!(
+            quantization_of(
+                41,
+                false,
+                &[
+                    ("blk.0.ffn_up.weight", &[256, 64], 39, 256 * 64 / 32 * 17),
+                    ("token_embd.weight", &[256, 4096], 8, 256 * 4096 / 32 * 34),
+                    ("output.weight", &[256, 4096], 8, 256 * 4096 / 32 * 34),
+                ],
+            ),
+            (Some("MXFP4".to_owned()), Some("4-bit".to_owned()))
         );
     }
 }

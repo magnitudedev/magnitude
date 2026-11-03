@@ -556,6 +556,11 @@ function ChatView({
                           {model?.name ??
                             (modelId ? "Model unavailable" : "Select model")}
                         </span>
+                        {model && localFor(model.id) && (
+                          <span className="shrink-0 text-slate-400 dark:text-slate-500">
+                            {localFor(model.id)!.presentation.variantLabel}
+                          </span>
+                        )}
                       </SelectValue>
                     </SelectTrigger>
                     <SelectContent
