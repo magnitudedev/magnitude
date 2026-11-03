@@ -15,13 +15,25 @@ Choose a Magnitude model in OpenCode’s model selector. If you use JSONC or an 
 
 ## Run OpenCode
 
-After connecting in Magnitude, start OpenCode with:
+After connecting in Magnitude, start OpenCode v2 with:
+
+```sh
+OPENCODE_CONFIG_CONTENT='{"model":"magnitude/MODEL_ID"}' opencode --standalone
+```
+
+In PowerShell:
+
+```powershell
+$env:OPENCODE_CONFIG_CONTENT='{"model":"magnitude/MODEL_ID"}'; opencode --standalone
+```
+
+On OpenCode v1, use:
 
 ```sh
 opencode --model magnitude/MODEL_ID
 ```
 
-Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e2b-it-qat:gguf:q4`, rather than its display name. The command shown in **Connections** already includes the correct ID for your selected model, so you can copy it without editing. Keep Magnitude running; it loads the model when the agent requests it.
+Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e2b-it-qat:gguf:q4`, rather than its display name. The command shown in **Connections** matches your installed OpenCode version and already includes the correct ID for your selected model, so you can copy it without editing. Keep Magnitude running; it loads the model when the agent requests it.
 
 ## Configuration
 

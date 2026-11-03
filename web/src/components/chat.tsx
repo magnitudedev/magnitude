@@ -616,7 +616,6 @@ function ChatView({
                   <ChatThinkingSelect
                     model={model}
                     selected={settings.reasoningEffort}
-                    changed={changed.has("reasoningEffort")}
                     onChange={(next) =>
                       patch({ reasoningEffort: Option.some(next) })
                     }
