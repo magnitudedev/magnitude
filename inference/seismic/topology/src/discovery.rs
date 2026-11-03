@@ -291,7 +291,8 @@ pub(crate) fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
 
     // Physical devices, by the identity their drivers share (a GPU's device
     // UUID, which its CUDA and Vulkan views report alike), each with whose
-    // memory it is.
+    // memory it is. A software Vulkan device (lavapipe) is no device of its
+    // own: it runs on the host's CPU, and is an executor of the host.
     for metal in &reports.metal {
         let memory = if metal.unified {
             DeviceMemory::Host
@@ -304,7 +305,13 @@ pub(crate) fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
         .cuda
         .iter()
         .map(|cuda| cuda.uuid)
-        .chain(reports.vulkan.iter().map(|vulkan| vulkan.uuid))
+        .chain(
+            reports
+                .vulkan
+                .iter()
+                .filter(|vulkan| vulkan.kind != ExecutorKind::Cpu)
+                .map(|vulkan| vulkan.uuid),
+        )
     {
         builder.physical(
             PhysicalIdentity::Uuid(uuid),
@@ -515,7 +522,11 @@ pub(crate) fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
 
     for vulkan in &reports.vulkan {
         let memory = device_memory(reports, vulkan.uuid);
-        let physical = builder.device(&PhysicalIdentity::Uuid(vulkan.uuid));
+        let physical = if vulkan.kind == ExecutorKind::Cpu {
+            host
+        } else {
+            builder.device(&PhysicalIdentity::Uuid(vulkan.uuid))
+        };
         let own = own_memory(&builder, physical);
         let heaps = &vulkan.memory;
         let placement = vulkan.floor.clone().and_then(|()| match memory {

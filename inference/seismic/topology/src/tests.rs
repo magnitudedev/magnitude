@@ -745,6 +745,54 @@ fn views_sharing_a_device_uuid_are_one_physical_device() {
     }
 }
 
+/// A software Vulkan device (lavapipe) beside a GPU's CUDA and Vulkan views
+/// is an executor of the host, not a second physical device: the machine
+/// has one GPU, and the software device owns no memory of its own.
+#[test]
+fn a_software_vulkan_device_is_an_executor_of_the_host() {
+    let mut reports = rtx3090();
+    let software = uuid("6d65736132342e302e340000000000ff");
+    let mut lavapipe = crate::fixtures::vulkan(
+        software,
+        "llvmpipe (LLVM 17.0.6, 256 bits)",
+        "vulkan driver MESA_LLVMPIPE version 24.0.9",
+        true,
+        crate::fixtures::layout(&[(RTX3090_HOST, true, &["DL|HV|HC|C"])]),
+        1 << 31,
+        None,
+    );
+    lavapipe.kind = crate::model::ExecutorKind::Cpu;
+    lavapipe.floor = Err("missing VK_KHR_workgroup_memory_explicit_layout".into());
+    reports.vulkan.push(lavapipe);
+    let topology = topology(&reports);
+
+    let gpus = topology
+        .physical_devices()
+        .iter()
+        .filter(|physical| !matches!(physical.identity(), PhysicalIdentity::Host { .. }))
+        .count();
+    assert_eq!(gpus, 1);
+    let software = topology
+        .resolve(ExecutorSelector::Vulkan { uuid: software })
+        .unwrap();
+    assert!(matches!(
+        topology
+            .physical_device(software.physical())
+            .unwrap()
+            .identity(),
+        PhysicalIdentity::Host { .. }
+    ));
+    assert_eq!(
+        topology
+            .stores()
+            .iter()
+            .filter(|store| matches!(store.kind(), StoreKind::DeviceMemory(_)))
+            .count(),
+        1
+    );
+    assert_consistent(&topology);
+}
+
 /// Whose memory a device's is, discovery decides once from every view's
 /// report: views that disagree leave it undecided and make every executor
 /// of the device unavailable, with the reason.
