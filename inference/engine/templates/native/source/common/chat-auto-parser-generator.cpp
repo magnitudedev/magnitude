@@ -47,19 +47,22 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
         // Build up generation prompt manually
         const auto & msg = inputs.continue_msg;
 
+        common_chat_prompt continuation;
         if (!autoparser.reasoning.start.empty()) {
-            data.generation_prompt = data.generation_prompt.substr(0, data.generation_prompt.find(autoparser.reasoning.start));
-            data.generation_prompt += autoparser.reasoning.start + msg.reasoning_content;
+            continuation.append(data.generation_prompt.substr(0, data.generation_prompt.find(autoparser.reasoning.start)) + autoparser.reasoning.start);
+            continuation.append(msg.reasoning_content, true);
             if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
-                data.generation_prompt += autoparser.reasoning.end;
+                continuation.append(autoparser.reasoning.end);
             }
+        } else {
+            continuation.append(data.generation_prompt);
         }
 
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
-            data.generation_prompt += msg.render_content();
+            continuation.append(msg.render_content(), true);
         }
 
-        data.prompt += data.generation_prompt;
+        data.append_continuation(continuation);
     }
 
     auto parser = autoparser.build_parser(inputs, parser_generation_prompt);

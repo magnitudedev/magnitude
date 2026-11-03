@@ -5,7 +5,7 @@ mod native;
 pub use native::{build_info, OutputStream, PreparedRequest, Template};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, ops::Range};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error {
@@ -49,6 +49,16 @@ pub struct BuildInfo {
     pub extraction: u32,
     pub upstream: String,
     pub build: String,
+}
+
+/// A template's rendering. `controls` are the byte ranges of `prompt` the
+/// template authored, ascending and disjoint: special tokens are recognized
+/// there only. Every other byte renders request input, which is literal text
+/// whatever it spells.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderedPrompt {
+    pub prompt: String,
+    pub controls: Vec<Range<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -105,6 +115,9 @@ pub struct GrammarTrigger {
 pub struct PreparedDescription {
     pub version: u32,
     pub prompt: String,
+    /// The byte ranges of `prompt` the template authored, as in
+    /// [`RenderedPrompt`]: special tokens are recognized only inside them.
+    pub controls: Vec<Range<usize>>,
     pub generation_prefix: String,
     pub parser: String,
     pub format: String,

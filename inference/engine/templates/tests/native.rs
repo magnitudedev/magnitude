@@ -65,7 +65,8 @@ fn rendering_preserves_absent_controls_special_tokens_and_explicit_time() {
     )
     .unwrap();
     let rendered = template.render(&Default::default(), 0).unwrap();
-    assert_eq!(rendered, "<s>False 1970-01-01");
+    assert_eq!(rendered.prompt, "<s>False 1970-01-01");
+    assert_eq!(rendered.controls, [0..rendered.prompt.len()]);
     assert!(template
         .render(json!({"bos_token":"other"}).as_object().unwrap(), 0)
         .is_err());

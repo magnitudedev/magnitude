@@ -42,12 +42,15 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
 
-        data.generation_prompt = "<|im_start|>assistant\n<think>\n" + msg.reasoning_content;
+        common_chat_prompt continuation;
+        continuation.append("<|im_start|>assistant\n<think>\n");
+        continuation.append(msg.reasoning_content, true);
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
-            data.generation_prompt += "\n</think>\n\n" + msg.render_content();
+            continuation.append("\n</think>\n\n");
+            continuation.append(msg.render_content(), true);
         }
 
-        data.prompt += data.generation_prompt;
+        data.append_continuation(continuation);
     }
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {

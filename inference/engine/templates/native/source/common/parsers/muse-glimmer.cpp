@@ -53,16 +53,19 @@ common_chat_params common_chat_params_init_muse_glimmer(const common_chat_templa
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
 
-        data.generation_prompt = "<|start|>assistant to=self<|message|>" + msg.reasoning_content;
+        common_chat_prompt continuation;
+        continuation.append("<|start|>assistant to=self<|message|>");
+        continuation.append(msg.reasoning_content, true);
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
-            data.generation_prompt += "<|eom|><|start|>assistant to=user<|message|>" + msg.render_content();
+            continuation.append("<|eom|><|start|>assistant to=user<|message|>");
+            continuation.append(msg.render_content(), true);
         }
 
-        data.prompt += data.generation_prompt;
+        data.append_continuation(continuation);
     } else if (reasoning_disabled && !include_grammar) {
         const std::string recipient = " to=user<|message|>";
         data.generation_prompt += recipient;
-        data.prompt            += recipient;
+        data.prompt.append(recipient);
     }
 
     auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;

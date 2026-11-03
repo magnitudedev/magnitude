@@ -121,19 +121,21 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
 
+        common_chat_prompt continuation;
         if (is_v4 && msg.reasoning_content.empty()) {
-            data.generation_prompt = GEN_PROMPT + THINK_END;
-            if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
-                data.generation_prompt += msg.render_content();
-            }
+            continuation.append(GEN_PROMPT + THINK_END);
         } else {
-            data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
+            continuation.append(GEN_PROMPT + THINK_START);
+            continuation.append(msg.reasoning_content, true);
             if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
-                data.generation_prompt += THINK_END + msg.render_content();
+                continuation.append(THINK_END);
             }
         }
+        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+            continuation.append(msg.render_content(), true);
+        }
 
-        data.prompt += data.generation_prompt;
+        data.append_continuation(continuation);
     }
 
     bool require_tools   = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;

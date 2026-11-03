@@ -70,12 +70,15 @@ common_chat_params common_chat_params_init_cohere2moe(const common_chat_template
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
 
-        data.generation_prompt = GEN_PREFIX + THINK_START + msg.reasoning_content;
+        common_chat_prompt continuation;
+        continuation.append(GEN_PREFIX + THINK_START);
+        continuation.append(msg.reasoning_content, true);
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
-            data.generation_prompt += THINK_END + TEXT_START + msg.render_content();
+            continuation.append(THINK_END + TEXT_START);
+            continuation.append(msg.render_content(), true);
         }
 
-        data.prompt += data.generation_prompt;
+        data.append_continuation(continuation);
     }
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {

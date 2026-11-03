@@ -42,6 +42,24 @@ struct subject_relaxation {
         return std::tie(tool, relaxation) < std::tie(other.tool, other.relaxation);
     }
 };
+// The prompt's bytes its template authored, as ascending, disjoint, maximal
+// [start, end) ranges: the complement of the request input it renders.
+json prompt_controls(const common_chat_prompt & prompt) {
+    json controls = json::array();
+    size_t offset = 0;
+    for (const auto & part : prompt.parts) {
+        const size_t end = offset + part.text.size();
+        if (!part.is_input && end > offset) {
+            if (!controls.empty() && controls.back().at("end").get<size_t>() == offset) {
+                controls.back()["end"] = end;
+            } else {
+                controls.push_back(json({{"start", offset}, {"end", end}}));
+            }
+        }
+        offset = end;
+    }
+    return controls;
+}
 struct prepared_state {
     common_chat_params parameters;
     common_chat_parser_params parser;
@@ -207,20 +225,21 @@ int32_t templates_template_render(uint64_t handle, const uint8_t * input, uint64
         require_output(output);
         auto & state = get_template(handle);
         auto data = payload(input, size);
-        auto context = data.at("context");
+        const auto & context = data.at("context");
         if (!context.is_object()) { throw std::invalid_argument("Render context must be an object"); }
         for (const auto & [key, value] : state.special_tokens.items()) {
             if (context.contains(key)) { throw std::invalid_argument("Context overrides an artifact special token"); }
-            context[key] = value;
         }
         auto now = data.at("now").get<int64_t>();
         const auto & compiled = common_chat_templates_get_default(state.compiled.get());
         jinja::context ctx(compiled.source());
         ctx.current_time = static_cast<time_t>(now);
-        jinja::global_from_json(ctx, context, false);
+        // The context is request input; the special tokens are the artifact's.
+        jinja::global_from_json(ctx, context, true);
+        jinja::global_from_json(ctx, state.special_tokens, false);
         jinja::runtime runtime(ctx);
-        auto rendered = runtime.execute(compiled.prog);
-        *output = owned(jinja::runtime::gather_string_parts(rendered)->as_string().str());
+        const common_chat_prompt prompt(std::move(jinja::runtime::gather_string_parts(runtime.execute(compiled.prog))->val_str));
+        *output = owned(json({{"version", 1}, {"prompt", prompt.str()}, {"controls", prompt_controls(prompt)}}).dump());
     });
 }
 
@@ -326,7 +345,7 @@ int32_t templates_request_describe(uint64_t handle, templates_buffer * output, t
             relaxations.push_back(json({{"subject", subject}, {"path", relaxation.path}, {"keyword", relaxation.keyword},
                 {"reason", common_chat_schema_relaxation::reason_name(relaxation.reason)}}));
         }
-        *output = owned(json({{"version", 1}, {"prompt", params.prompt},
+        *output = owned(json({{"version", 1}, {"prompt", params.prompt.str()}, {"controls", prompt_controls(params.prompt)},
             {"generation_prefix", params.generation_prompt}, {"parser", params.parser},
             {"format", common_chat_format_name(params.format)},
             {"grammar", params.grammar}, {"grammar_dialect", "gbnf"},

@@ -1,0 +1,909 @@
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -59,7 +59,7 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &
+             data.generation_prompt += msg.render_content();
+         }
+ 
+-        data.prompt += data.generation_prompt;
++        data.prompt.append(data.generation_prompt);
+     }
+ 
+     auto parser = autoparser.build_parser(inputs, parser_generation_prompt);
+--- a/common/chat-auto-parser-helpers.cpp
++++ b/common/chat-auto-parser-helpers.cpp
+@@ -323,7 +323,7 @@ std::string apply_template(const common_chat_template & tmpl, const template_par
+     tmpl_params.extra_context["enable_thinking"] = params.enable_thinking;
+ 
+     try {
+-        return common_chat_template_direct_apply(tmpl, tmpl_params);
++        return common_chat_template_direct_apply(tmpl, tmpl_params).str();
+     } catch (const std::exception & e) {
+         LOG_DBG("Template application failed: %s\n", e.what());
+         return ERR_TMPL;
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -634,7 +634,7 @@ std::string common_chat_format_single(const struct common_chat_templates * tmpls
+     if (!past_msg.empty()) {
+         inputs.messages              = past_msg;
+         inputs.add_generation_prompt = false;
+-        fmt_past_msg                 = common_chat_templates_apply(tmpls, inputs).prompt;
++        fmt_past_msg                 = common_chat_templates_apply(tmpls, inputs).prompt.str();
+     }
+     std::ostringstream ss;
+     // if the past_msg ends with a newline, we must preserve it in the formatted version
+@@ -644,7 +644,7 @@ std::string common_chat_format_single(const struct common_chat_templates * tmpls
+     // format chat with new_msg
+     inputs.messages.push_back(new_msg);
+     inputs.add_generation_prompt = add_ass;
+-    auto fmt_new_msg             = common_chat_templates_apply(tmpls, inputs).prompt;
++    auto fmt_new_msg             = common_chat_templates_apply(tmpls, inputs).prompt.str();
+     // get the diff part
+     ss << fmt_new_msg.substr(fmt_past_msg.size(), fmt_new_msg.size() - fmt_past_msg.size());
+     return ss.str();
+@@ -668,7 +668,7 @@ std::string common_chat_format_example(const struct common_chat_templates *
+     add_simple_msg("user", "Hello");
+     add_simple_msg("assistant", "Hi there");
+     add_simple_msg("user", "How are you?");
+-    return common_chat_templates_apply(tmpls, inputs).prompt;
++    return common_chat_templates_apply(tmpls, inputs).prompt.str();
+ }
+ 
+ #define CHATML_TEMPLATE_SRC                                                               \
+@@ -775,7 +775,7 @@ common_reasoning_format common_reasoning_format_from_name(const std::string & fo
+     throw std::runtime_error("Unknown reasoning format: " + format);
+ }
+ 
+-std::string common_chat_template_direct_apply_impl(
++common_chat_prompt common_chat_template_direct_apply_impl(
+     const common_chat_template & tmpl,
+     const autoparser::generation_params & inputs,
+     const std::optional<json> & messages_override,
+@@ -824,25 +824,38 @@ std::string common_chat_template_direct_apply_impl(
+ 
+     jinja::global_from_json(ctx, inp, inputs.mark_input);
+ 
++    // bos/eos come from the model, not from the user
++    ctx.set_val("bos_token", jinja::mk_val<jinja::value_string>(tmpl.bos_token()));
++    ctx.set_val("eos_token", jinja::mk_val<jinja::value_string>(tmpl.eos_token()));
++
+     // render
+     ++templates_native::renders;
+     jinja::runtime runtime(ctx);
+     const jinja::value results = runtime.execute(tmpl.prog);
+     auto parts = jinja::runtime::gather_string_parts(results);
+ 
+-    std::string result = parts->as_string().str();
++    common_chat_prompt result;
++    for (auto & part : parts->val_str.parts) {
++        result.parts.push_back({std::move(part.val), part.is_input});
++    }
+ 
+     // TODO: improve this later
+-    if (inputs.add_bos && string_starts_with(result, tmpl.bos_token())) {
+-        result = result.substr(tmpl.bos_token().size());
++    if (inputs.add_bos && !result.parts.empty()) {
++        auto & first = result.parts.front();
++        if (!first.is_input && string_starts_with(first.text, tmpl.bos_token())) {
++            first.text.erase(0, tmpl.bos_token().size());
++        }
+     }
+-    if (inputs.add_eos && string_ends_with(result, tmpl.eos_token())) {
+-        result = result.substr(0, result.size() - tmpl.eos_token().size());
++    if (inputs.add_eos && !result.parts.empty()) {
++        auto & last = result.parts.back();
++        if (!last.is_input && string_ends_with(last.text, tmpl.eos_token())) {
++            last.text.resize(last.text.size() - tmpl.eos_token().size());
++        }
+     }
+     return result;
+ }
+ 
+-std::string common_chat_template_direct_apply(
++common_chat_prompt common_chat_template_direct_apply(
+     const common_chat_template & tmpl,
+     const autoparser::generation_params & inputs) {
+     return common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt);
+@@ -855,16 +868,17 @@ common_chat_rendered_prompt common_chat_template_render_prompt(
+     const std::optional<json> & tools_override,
+     const std::optional<json> & additional_context) {
+ 
+-    std::string prompt = common_chat_template_direct_apply_impl(tmpl, inputs, messages_override, tools_override, additional_context);
++    common_chat_prompt prompt = common_chat_template_direct_apply_impl(tmpl, inputs, messages_override, tools_override, additional_context);
+     // These parameters differ from `inputs` only in add_generation_prompt and
+     // the continuation, which rendering does not read, so the prompt is the
+     // comparison's render on its own side and only the other side renders.
+     autoparser::generation_params params = inputs;
+     params.add_generation_prompt = !inputs.add_generation_prompt;
+     params.continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
+-    std::string other = common_chat_template_direct_apply_impl(tmpl, params, messages_override, tools_override, additional_context);
+-    const std::string & no_gen_prompt = inputs.add_generation_prompt ? other : prompt;
+-    const std::string & gen_prompt    = inputs.add_generation_prompt ? prompt : other;
++    const std::string text  = prompt.str();
++    const std::string other = common_chat_template_direct_apply_impl(tmpl, params, messages_override, tools_override, additional_context).str();
++    const std::string & no_gen_prompt = inputs.add_generation_prompt ? other : text;
++    const std::string & gen_prompt    = inputs.add_generation_prompt ? text : other;
+ 
+     size_t prefix_len = 0;
+     size_t min_size = std::min(no_gen_prompt.size(), gen_prompt.size());
+@@ -1243,6 +1257,46 @@ common_chat_params common_chat_templates_apply(const struct common_chat_template
+     return common_chat_templates_apply_jinja(tmpls, inputs);
+ }
+ 
++std::string common_chat_prompt::str() const {
++    if (parts.size() == 1) {
++        return parts[0].text;
++    }
++    size_t len = 0;
++    for (const auto & part : parts) {
++        len += part.text.size();
++    }
++    std::string out;
++    out.reserve(len);
++    for (const auto & part : parts) {
++        out += part.text;
++    }
++    return out;
++}
++
++void common_chat_prompt::append(const std::string & text, bool is_input) {
++    if (text.empty()) {
++        return;
++    }
++    if (!parts.empty() && parts.back().is_input == is_input) {
++        parts.back().text += text;
++    } else {
++        parts.push_back({text, is_input});
++    }
++}
++
++void common_chat_prompt::replace_last(const std::string & from, const std::string & to) {
++    for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
++        if (it->is_input) {
++            continue;
++        }
++        size_t pos = it->text.rfind(from);
++        if (pos != std::string::npos) {
++            it->text.replace(pos, from.size(), to);
++            return;
++        }
++    }
++}
++
+ common_chat_msg common_chat_parse(const std::string &               input,
+                                   bool                              is_partial,
+                                   const common_chat_parser_params & params) {
+--- a/common/chat.h
++++ b/common/chat.h
+@@ -263,9 +263,26 @@ struct common_chat_templates_inputs {
+     bool                                  force_pure_content = false;
+ };
+ 
++struct common_chat_prompt_part {
++    std::string text;
++    bool        is_input = false; // from user input, special tokens inside must not be parsed
++};
++
++// rendered chat template, split into template parts and user input parts
++struct common_chat_prompt {
++    std::vector<common_chat_prompt_part> parts;
++
++    std::string str() const;
++
++    void append(const std::string & text, bool is_input = false);
++
++    // replace the last occurrence of `from`, user input parts are skipped
++    void replace_last(const std::string & from, const std::string & to);
++};
++
+ struct common_chat_params {
+     common_chat_format                  format = COMMON_CHAT_FORMAT_CONTENT_ONLY;
+-    std::string                         prompt;
++    common_chat_prompt                  prompt;
+     std::string                         grammar;
+     bool                                grammar_lazy         = false;
+     std::string                         generation_prompt;
+@@ -362,7 +379,7 @@ common_json common_chat_tool_parameters(const common_json & function);
+ // get template caps, useful for reporting to server /props endpoint
+ std::map<std::string, bool> common_chat_templates_get_caps(const common_chat_templates * chat_templates);
+ 
+-std::string common_chat_template_direct_apply(
++common_chat_prompt common_chat_template_direct_apply(
+     const common_chat_template & tmpl,
+     const autoparser::generation_params & inputs);
+ 
+--- a/common/jinja/caps.cpp
++++ b/common/jinja/caps.cpp
+@@ -27,7 +27,8 @@ void caps_apply_preserve_reasoning(jinja::context & ctx, bool enabled) {
+ }
+ 
+ void caps_apply_reasoning_effort(jinja::context & ctx, const std::string & effort) {
+-    value var = mk_val<value_string>(effort); // bind to the same value for stats
++    // the effort is request input; bind to the same value for stats
++    value var = mk_val<value_string>(string(effort, true));
+     ctx.set_val("reasoning_effort",   var);
+     ctx.set_val("reasoning_strength", var);
+ }
+--- a/common/jinja/runtime.cpp
++++ b/common/jinja/runtime.cpp
+@@ -903,9 +903,9 @@ value member_expression::execute_impl(context & ctx) {
+                     val = arr[index];
+                 }
+             } else { // value_string
+-                auto str = object->as_string().str();
+-                if (index >= 0 && index < static_cast<int64_t>(str.size())) {
+-                    val = mk_val<value_string>(std::string(1, str[index]));
++                const auto str = object->as_string();
++                if (index >= 0 && index < static_cast<int64_t>(str.length())) {
++                    val = mk_val<value_string>(str.substr(static_cast<size_t>(index), 1));
+                 }
+             }
+ 
+--- a/common/jinja/string.cpp
++++ b/common/jinja/string.cpp
+@@ -93,13 +93,13 @@ void string::hash_update(hasher & hash) const noexcept {
+     }
+ }
+ 
+-bool string::all_parts_are_input() const {
++bool string::any_part_is_input() const {
+     for (const auto & part : parts) {
+-        if (!part.is_input) {
+-            return false;
++        if (part.is_input) {
++            return true;
+         }
+     }
+-    return true;
++    return false;
+ }
+ 
+ bool string::is_uppercase() const {
+@@ -120,15 +120,6 @@ bool string::is_lowercase() const {
+     return true;
+ }
+ 
+-// mark this string as input if other has ALL parts as input
+-void string::mark_input_based_on(const string & other) {
+-    if (other.all_parts_are_input()) {
+-        for (auto & part : parts) {
+-            part.is_input = true;
+-        }
+-    }
+-}
+-
+ string & string::append(const string & other) {
+     for (const auto & part : other.parts) {
+         parts.push_back(part);
+@@ -136,6 +127,25 @@ string & string::append(const string & other) {
+     return *this;
+ }
+ 
++string string::substr(size_t pos, size_t len) const {
++    string result;
++    size_t offset = 0;
++    for (const auto & part : parts) {
++        if (len == 0) {
++            break;
++        }
++        const size_t size = part.val.size();
++        if (pos < offset + size) {
++            const size_t count = std::min(offset + size - pos, len);
++            result.parts.push_back({part.is_input, part.val.substr(pos - offset, count)});
++            pos += count;
++            len -= count;
++        }
++        offset += size;
++    }
++    return result;
++}
++
+ // in-place transformation
+ 
+ using transform_fn = std::function<std::string(const std::string&)>;
+--- a/common/jinja/string.h
++++ b/common/jinja/string.h
+@@ -9,10 +9,11 @@
+ namespace jinja {
+ 
+ // allow differentiate between user input strings and template strings
+-// transformations should handle this information as follows:
+-// - one-to-one (e.g., uppercase, lowercase): preserve is_input flag
+-// - one-to-many (e.g., strip): if input string is marked as is_input, all resulting parts should be marked as is_input
+-// - many-to-one (e.g., concat): if ALL input parts are marked as is_input, resulting part should be marked as is_input
++// every byte keeps the marking of the byte it came from:
++// - transformations that keep bytes (case, strip, slicing, splitting, replacement, indentation,
++//   formatting, joining, concatenation) keep each byte's part
++// - text that cannot be traced to particular bytes (a JSON or repr serialization) is input if any
++//   of its sources is
+ struct string_part {
+     bool is_input = false; // may skip parsing special tokens if true
+     std::string val;
+@@ -42,15 +43,15 @@ struct string {
+     // whether both concatenate to the same text, without materializing either
+     bool equals(const string & other) const noexcept;
+     void hash_update(hasher & hash) const noexcept;
+-    bool all_parts_are_input() const;
++    bool any_part_is_input() const;
+     bool is_uppercase() const;
+     bool is_lowercase() const;
+ 
+-    // mark this string as input if other has ALL parts as input
+-    void mark_input_based_on(const string & other);
+-
+     string & append(const string & other);
+ 
++    // the bytes [pos, pos + len), each in a part marked as the byte's own part
++    string substr(size_t pos, size_t len) const;
++
+     // in-place transformations
+ 
+     string uppercase();
+--- a/common/jinja/value.cpp
++++ b/common/jinja/value.cpp
+@@ -12,6 +12,7 @@
+ #include <vector>
+ #include <optional>
+ #include <algorithm>
++#include <numeric>
+ 
+ #define FILENAME "jinja-value"
+ 
+@@ -259,7 +260,7 @@ static value tojson(const func_args & args) {
+     if (ensure_ascii) {
+         json_str = json_ensure_ascii_preserving_format(json_str);
+     }
+-    return mk_val<value_string>(json_str);
++    return mk_val<value_string>(jinja::string(json_str, value_contains_input(args.get_pos(0))));
+ }
+ 
+ template<bool is_reject>
+@@ -673,7 +674,8 @@ const func_builtins & value_string_t::get_builtins() const {
+             if (!is_val<value_string>(val_input)) {
+                 throw raised_exception("split() first argument must be a string");
+             }
+-            std::string str = val_input->as_string().str();
++            const jinja::string input = val_input->as_string();
++            const std::string str = input.str();
+             // FIXME: Support non-specified delimiter (split on consecutive (no leading or trailing) whitespace)
+             std::string delim = (args.count() > 1) ? args.get_pos(1)->as_string().str() : " ";
+             if (delim.empty()) {
+@@ -681,17 +683,14 @@ const func_builtins & value_string_t::get_builtins() const {
+             }
+             int64_t maxsplit = (args.count() > 2) ? args.get_pos(2)->as_int() : -1;
+             auto result = mk_val<value_array>();
++            size_t start = 0;
+             size_t pos = 0;
+-            std::string token;
+-            while ((pos = str.find(delim)) != std::string::npos && maxsplit != 0) {
+-                token = str.substr(0, pos);
+-                result->push_back(mk_val<value_string>(token));
+-                str.erase(0, pos + delim.length());
++            while ((pos = str.find(delim, start)) != std::string::npos && maxsplit != 0) {
++                result->push_back(mk_val<value_string>(input.substr(start, pos - start)));
++                start = pos + delim.length();
+                 --maxsplit;
+             }
+-            auto res = mk_val<value_string>(str);
+-            res->val_str.mark_input_based_on(args.get_pos(0)->val_str);
+-            result->push_back(std::move(res));
++            result->push_back(mk_val<value_string>(input.substr(start, str.size() - start)));
+             return result;
+         }},
+         {"rsplit", [](const func_args & args) -> value {
+@@ -700,7 +699,8 @@ const func_builtins & value_string_t::get_builtins() const {
+             if (!is_val<value_string>(val_input)) {
+                 throw raised_exception("rsplit() first argument must be a string");
+             }
+-            std::string str = val_input->as_string().str();
++            const jinja::string input = val_input->as_string();
++            const std::string str = input.str();
+             // FIXME: Support non-specified delimiter (split on consecutive (no leading or trailing) whitespace)
+             std::string delim = (args.count() > 1) ? args.get_pos(1)->as_string().str() : " ";
+             if (delim.empty()) {
+@@ -708,84 +708,75 @@ const func_builtins & value_string_t::get_builtins() const {
+             }
+             int64_t maxsplit = (args.count() > 2) ? args.get_pos(2)->as_int() : -1;
+             auto result = mk_val<value_array>();
++            size_t end = str.size();
+             size_t pos = 0;
+-            std::string token;
+-            while ((pos = str.rfind(delim)) != std::string::npos && maxsplit != 0) {
+-                token = str.substr(pos + delim.length());
+-                result->push_back(mk_val<value_string>(token));
+-                str.erase(pos);
++            while (end >= delim.length() && (pos = str.rfind(delim, end - delim.length())) != std::string::npos && maxsplit != 0) {
++                const size_t token = pos + delim.length();
++                result->push_back(mk_val<value_string>(input.substr(token, end - token)));
++                end = pos;
+                 --maxsplit;
+             }
+-            auto res = mk_val<value_string>(str);
+-            res->val_str.mark_input_based_on(args.get_pos(0)->val_str);
+-            result->push_back(std::move(res));
++            result->push_back(mk_val<value_string>(input.substr(0, end)));
+             result->reverse();
+             return result;
+         }},
+         {"replace", [](const func_args & args) -> value {
+             args.ensure_vals<value_string, value_string, value_string, value_int>(true, true, true, false);
+-            std::string str = args.get_pos(0)->as_string().str();
++            const jinja::string input = args.get_pos(0)->as_string();
++            const jinja::string replacement = args.get_pos(2)->as_string();
++            const std::string str = input.str();
+             std::string old_str = args.get_pos(1)->as_string().str();
+-            std::string new_str = args.get_pos(2)->as_string().str();
++            std::string new_str = replacement.str();
+             int64_t count = args.count() > 3 ? args.get_pos(3)->as_int() : -1;
+             if (count > 0) {
+                 throw not_implemented_exception("String replace with count argument not implemented");
+             }
+-            if (old_str != new_str) {
++            if (old_str == new_str) {
++                return mk_val<value_string>(input);
++            }
++            jinja::string result;
++            if (old_str.empty()) {
++                result.append(replacement);
++                for (size_t i = 0; i < str.size(); ++i) {
++                    result.append(input.substr(i, 1));
++                    result.append(replacement);
++                }
++            } else {
++                size_t start = 0;
+                 size_t pos = 0;
+-                if (old_str.empty()) {
+-                    std::string new_res;
+-                    new_res.reserve(str.length() + new_str.length() * (str.length() + 1));
+-                    new_res += new_str;
+-                    for (const char c : str) {
+-                        new_res.push_back(c);
+-                        new_res += new_str;
+-                    }
+-                    str = new_res;
+-                } else {
+-                    while ((pos = str.find(old_str, pos)) != std::string::npos) {
+-                        str.replace(pos, old_str.length(), new_str);
+-                        pos += new_str.length();
+-                    }
++                while ((pos = str.find(old_str, start)) != std::string::npos) {
++                    result.append(input.substr(start, pos - start));
++                    result.append(replacement);
++                    start = pos + old_str.length();
+                 }
++                result.append(input.substr(start, str.size() - start));
+             }
+-            auto res = mk_val<value_string>(str);
+-            res->val_str.mark_input_based_on(args.get_pos(0)->val_str);
+-            return res;
++            return mk_val<value_string>(result);
+         }},
+         {"format", [](const func_args & args) -> value {
+             value val_input = args.get_pos(0);
+             if (!is_val<value_string>(val_input)) {
+                 throw raised_exception("format() first argument must be a string");
+             }
+-            const jinja::string & fmt = val_input->as_string();
+-            const bool fmt_is_input = fmt.all_parts_are_input();
+-
++            const jinja::string fmt = val_input->as_string();
+             const std::string str = fmt.str();
+             jinja::string result;
+-            std::string literal;
+-            auto flush_literal = [&]() {
+-                if (!literal.empty()) {
+-                    result.parts.push_back({fmt_is_input, literal});
+-                    literal.clear();
+-                }
+-            };
++            size_t literal = 0;
+ 
+             size_t arg_idx = 1; // positional args follow the format string
+             for (size_t i = 0; i < str.size(); ++i) {
+                 if (str[i] != '{') {
+-                    literal += str[i];
+                     continue;
+                 }
+                 if (i + 1 >= str.size() || str[i + 1] != '}') {
+                     throw not_implemented_exception("format() only supports simple '{}' placeholders");
+                 }
++                result.append(fmt.substr(literal, i - literal));
+                 ++i;
+-                flush_literal();
+-                const jinja::string arg_str = args.get_pos(arg_idx++)->as_string();
+-                result.parts.insert(result.parts.end(), arg_str.parts.begin(), arg_str.parts.end());
++                literal = i + 1;
++                result.append(args.get_pos(arg_idx++)->as_string());
+             }
+-            flush_literal();
++            result.append(fmt.substr(literal, str.size() - literal));
+             return mk_val<value_string>(result);
+         }},
+         {"int", [](const func_args & args) -> value {
+@@ -863,11 +854,21 @@ const func_builtins & value_string_t::get_builtins() const {
+             if (step == 0) {
+                 throw raised_exception("slice step cannot be zero");
+             }
+-            auto input = args.get_pos(0);
+-            auto sliced = slice(input->as_string().str(), start, stop, step);
+-            auto res = mk_val<value_string>(sliced);
+-            res->val_str.mark_input_based_on(input->as_string());
+-            return res;
++            const jinja::string input = args.get_pos(0)->as_string();
++            std::vector<size_t> positions(input.length());
++            std::iota(positions.begin(), positions.end(), size_t(0));
++            const auto sliced = slice(positions, start, stop, step);
++            // consecutive positions are taken as one run of their parts
++            jinja::string result;
++            for (size_t i = 0; i < sliced.size();) {
++                size_t run = 1;
++                while (i + run < sliced.size() && sliced[i + run] == sliced[i] + run) {
++                    ++run;
++                }
++                result.append(input.substr(sliced[i], run));
++                i += run;
++            }
++            return mk_val<value_string>(result);
+         }},
+         {"safe", [](const func_args & args) -> value {
+             // no-op for now
+@@ -884,37 +885,38 @@ const func_builtins & value_string_t::get_builtins() const {
+             if (!is_val<value_string>(val_input)) {
+                 throw raised_exception("indent() first argument must be a string");
+             }
+-            std::string indent;
++            jinja::string indent;
+             if (is_val<value_int>(val_width)) {
+-                indent.assign(val_width->as_int(), ' ');
++                indent = std::string(val_width->as_int(), ' ');
+             } else if (is_val<value_string>(val_width)) {
+-                indent = val_width->as_string().str();
++                indent = val_width->as_string();
+             } else {
+-                indent = "    ";
+-            }
+-            std::string indented;
+-            std::string input = val_input->as_string().str();
+-            std::istringstream iss = std::istringstream(input);
+-            std::string line;
+-            while (std::getline(iss, line)) {
+-                if (!indented.empty()) {
+-                    indented.push_back('\n');
++                indent = std::string("    ");
++            }
++            // every line and newline is the input's own bytes
++            const jinja::string input = val_input->as_string();
++            const std::string str = input.str();
++            jinja::string indented;
++            size_t start = 0;
++            while (start < str.size()) {
++                const size_t newline = str.find('\n', start);
++                const size_t end = newline == std::string::npos ? str.size() : newline;
++                if (indented.length() > 0) {
++                    indented.append(input.substr(start - 1, 1));
+                 }
+-                if ((indented.empty() ? first : (!line.empty() || blank))) {
+-                    indented += indent;
++                if ((indented.length() == 0 ? first : (end > start || blank))) {
++                    indented.append(indent);
+                 }
+-                indented += line;
++                indented.append(input.substr(start, end - start));
++                start = newline == std::string::npos ? end : end + 1;
+             }
+-            if (!input.empty() && input.back() == '\n') {
+-                indented.push_back('\n');
++            if (!str.empty() && str.back() == '\n') {
++                indented.append(input.substr(str.size() - 1, 1));
+                 if (blank) {
+-                    indented += indent;
++                    indented.append(indent);
+                 }
+             }
+-
+-            auto res = mk_val<value_string>(indented);
+-            res->val_str.mark_input_based_on(val_input->as_string());
+-            return res;
++            return mk_val<value_string>(indented);
+         }},
+         {"join", string_join_not_implemented},
+     };
+@@ -1030,8 +1032,8 @@ const func_builtins & value_array_t::get_builtins() const {
+                 throw raised_exception("join() attribute must be string or integer");
+             }
+             const int64_t attr_int = attr_is_int ? attribute->as_int() : 0;
+-            const std::string delim = val_delim->is_undefined() ? "" : val_delim->as_string().str();
+-            std::string result;
++            const jinja::string delim = val_delim->is_undefined() ? jinja::string() : val_delim->as_string();
++            jinja::string result;
+             for (size_t i = 0; i < arr.size(); ++i) {
+                 value val_arr = arr[i];
+                 if (!attribute->is_undefined()) {
+@@ -1044,9 +1046,9 @@ const func_builtins & value_array_t::get_builtins() const {
+                 if (!is_val<value_string>(val_arr) && !is_val<value_int>(val_arr) && !is_val<value_float>(val_arr)) {
+                     throw raised_exception("join() can only join arrays of strings or numerics");
+                 }
+-                result += val_arr->as_string().str();
++                result.append(val_arr->as_string());
+                 if (i < arr.size() - 1) {
+-                    result += delim;
++                    result.append(delim);
+                 }
+             }
+             return mk_val<value_string>(result);
+@@ -1382,7 +1384,7 @@ static value from_json(const common_json & j, bool mark_input) {
+     } else if (j.is_object()) {
+         auto obj = mk_val<value_object>();
+         for (auto it = j.begin(); it != j.end(); ++it) {
+-            obj->insert(it.key(), from_json(it.value(), mark_input));
++            obj->insert(mk_val<value_string>(jinja::string(it.key(), mark_input)), from_json(it.value(), mark_input));
+         }
+         return obj;
+     } else {
+@@ -1554,6 +1556,23 @@ std::string value_to_json(const value & val, int indent, const std::string_view
+     return oss.str();
+ }
+ 
++bool value_contains_input(const value & val) {
++    if (is_val<value_string>(val)) {
++        return val->val_str.any_part_is_input();
++    }
++    if (is_val<value_array>(val)) {
++        const auto & arr = val->as_array();
++        return std::any_of(arr.begin(), arr.end(), value_contains_input);
++    }
++    if (is_val<value_object>(val)) {
++        const auto & obj = val->as_ordered_object();
++        return std::any_of(obj.begin(), obj.end(), [](const auto & pair) {
++            return value_contains_input(pair.first) || value_contains_input(pair.second);
++        });
++    }
++    return false;
++}
++
+ // TODO: avoid circular references
+ std::string value_to_string_repr(const value & val) {
+     if (is_val<value_string>(val)) {
+--- a/common/jinja/value.h
++++ b/common/jinja/value.h
+@@ -179,6 +179,9 @@ const func_builtins & global_builtins();
+ 
+ std::string value_to_json(const value & val, int indent = -1, const std::string_view item_sep = ", ", const std::string_view key_sep = ": ");
+ 
++// whether any string in the value (an object's keys included) has an input part
++bool value_contains_input(const value & val);
++
+ // Note: only used for debugging purposes
+ std::string value_to_string_repr(const value & val);
+ 
+@@ -410,7 +413,7 @@ struct value_array_t : public value_t {
+             ss << ",";
+         }
+         ss << (immutable ? ")" : "]");
+-        return ss.str();
++        return string(ss.str(), std::any_of(val_arr.begin(), val_arr.end(), value_contains_input));
+     }
+     virtual bool as_bool() const override {
+         return !val_arr.empty();
+@@ -515,7 +518,9 @@ struct value_object_t : public value_t {
+             ss << value_to_string_repr(key) << ": " << value_to_string_repr(val);
+         }
+         ss << "}";
+-        return ss.str();
++        return string(ss.str(), std::any_of(val_obj.begin(), val_obj.end(), [](const auto & pair) {
++            return value_contains_input(pair.first) || value_contains_input(pair.second);
++        }));
+     }
+     virtual bool as_bool() const override {
+         return !unordered.empty();
+--- a/common/parsers/cohere2moe.cpp
++++ b/common/parsers/cohere2moe.cpp
+@@ -75,7 +75,7 @@ common_chat_params common_chat_params_init_cohere2moe(const common_chat_template
+             data.generation_prompt += THINK_END + TEXT_START + msg.render_content();
+         }
+ 
+-        data.prompt += data.generation_prompt;
++        data.prompt.append(data.generation_prompt);
+     }
+ 
+     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+--- a/common/parsers/deepseek.cpp
++++ b/common/parsers/deepseek.cpp
+@@ -133,7 +133,7 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
+             }
+         }
+ 
+-        data.prompt += data.generation_prompt;
++        data.prompt.append(data.generation_prompt);
+     }
+ 
+     bool require_tools   = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+--- a/common/parsers/functionary-v3-2.cpp
++++ b/common/parsers/functionary-v3-2.cpp
+@@ -19,7 +19,7 @@ common_chat_params common_chat_params_init_functionary_v3_2(const common_chat_te
+     if (inputs.has_continuation()) {
+         const auto & msg = inputs.continue_msg;
+         data.generation_prompt = "<|start_header_id|>assistant<|end_header_id|>\n\n>>>all\n" + msg.render_content();
+-        data.prompt += data.generation_prompt;
++        data.prompt.append(data.generation_prompt);
+     }
+ 
+     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+--- a/common/parsers/gemma4.cpp
++++ b/common/parsers/gemma4.cpp
+@@ -381,12 +381,12 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &
+     data.prompt            = std::move(rendered.prompt);
+     data.generation_prompt = std::move(rendered.generation_prompt);
+ 
+-    if (inputs.add_generation_prompt && string_ends_with(data.prompt, "<turn|>\n")) {
++    if (inputs.add_generation_prompt && string_ends_with(data.prompt.str(), "<turn|>\n")) {
+         // This may happen if the model generates content + tool_call, the
+         // template does not add the model's next turn and confuses the model
+         // from emitting its proper reasoning token sequence.
+         data.generation_prompt = "<|turn>model\n";
+-        data.prompt += data.generation_prompt;
++        data.prompt.append(data.generation_prompt);
+     }
+ 
+     data.message_delimiters = {
+@@ -410,13 +410,13 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &
+     if (inputs.has_continuation()) {
+         const auto & msg = inputs.continue_msg;
+ 
+-        data.generation_prompt = string_ends_with(data.prompt, "<turn|>\n") ? "<|turn>model\n" : "";
++        data.generation_prompt = string_ends_with(data.prompt.str(), "<turn|>\n") ? "<|turn>model\n" : "";
+         data.generation_prompt += "<|channel>thought\n" + msg.reasoning_content;
+         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+             data.generation_prompt += "<channel|>" + msg.render_content();
+         }
+ 
+-        data.prompt += data.generation_prompt;
++        data.prompt.append(data.generation_prompt);
+     }
+ 
+     auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+--- a/common/parsers/gigachat-v3.cpp
++++ b/common/parsers/gigachat-v3.cpp
+@@ -19,7 +19,7 @@ common_chat_params common_chat_params_init_gigachat_v3(
+     if (inputs.has_continuation()) {
+         const auto & msg = inputs.continue_msg;
+         data.generation_prompt = "assistant<|role_sep|>\n" + msg.render_content();
+-        data.prompt += data.generation_prompt;
++        data.prompt.append(data.generation_prompt);
+     }
+ 
+     auto has_tools         = inputs.tools.is_array() && !inputs.tools.empty();
+--- a/common/parsers/gpt-oss.cpp
++++ b/common/parsers/gpt-oss.cpp
+@@ -25,9 +25,7 @@ common_chat_params common_chat_params_init_gpt_oss(const common_chat_template &
+     if (inputs.is_inference && !inputs.add_generation_prompt) {
+         static constexpr std::string_view return_token = "<|return|>";
+         static constexpr std::string_view end_token    = "<|end|>";
+-        if (size_t pos = prompt.rfind(return_token); pos != std::string::npos) {
+-            prompt.replace(pos, return_token.length(), end_token);
+-        }
++        prompt.replace_last(std::string(return_token), std::string(end_token));
+     }
+ 
+     data.prompt            = std::move(prompt);
+@@ -61,7 +59,7 @@ common_chat_params common_chat_params_init_gpt_oss(const common_chat_template &
+             data.generation_prompt += "<|end|><|start|>assistant<|channel|>final<|message|>" + msg.render_content();
+         }
+ 
+-        data.prompt += data.generation_prompt;
++        data.prompt.append(data.generation_prompt);
+     }
+ 
+     auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+--- a/common/parsers/kimi-k2.cpp
++++ b/common/parsers/kimi-k2.cpp
+@@ -46,7 +46,7 @@ common_chat_params common_chat_params_init_kimi_k2(const common_chat_template &
+             data.generation_prompt += THINK_END + msg.render_content();
+         }
+ 
+-        data.prompt += data.generation_prompt;
++        data.prompt.append(data.generation_prompt);
+     }
+ 
+     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+--- a/common/parsers/kimi-k3.cpp
++++ b/common/parsers/kimi-k3.cpp
+@@ -64,7 +64,7 @@ common_chat_params common_chat_params_init_kimi_k3(const common_chat_template &
+             data.generation_prompt += THINK_END + RESP_START + msg.render_content();
+         }
+ 
+-        data.prompt += data.generation_prompt;
++        data.prompt.append(data.generation_prompt);
+     }
+ 
+     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+--- a/common/parsers/lfm2.cpp
++++ b/common/parsers/lfm2.cpp
+@@ -76,7 +76,7 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &
+             data.generation_prompt += msg.render_content();
+         }
+ 
+-        data.prompt += data.generation_prompt;
++        data.prompt.append(data.generation_prompt);
+     }
+ 
+     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+--- a/common/parsers/minicpm5.cpp
++++ b/common/parsers/minicpm5.cpp
+@@ -47,7 +47,7 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
+             data.generation_prompt += "\n</think>\n\n" + msg.render_content();
+         }
+ 
+-        data.prompt += data.generation_prompt;
++        data.prompt.append(data.generation_prompt);
+     }
+ 
+     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+--- a/common/parsers/minimax-m3.cpp
++++ b/common/parsers/minimax-m3.cpp
+@@ -54,7 +54,7 @@ common_chat_params common_chat_params_init_minimax_m3(const common_chat_template
+             data.generation_prompt += THINK_END + msg.render_content();
+         }
+ 
+-        data.prompt += data.generation_prompt;
++        data.prompt.append(data.generation_prompt);
+     }
+ 
+     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+--- a/common/parsers/ministral3.cpp
++++ b/common/parsers/ministral3.cpp
+@@ -70,7 +70,7 @@ common_chat_params common_chat_params_init_ministral_3(const common_chat_templat
+             data.generation_prompt += "[/THINK]" + msg.render_content();
+         }
+ 
+-        data.prompt += data.generation_prompt;
++        data.prompt.append(data.generation_prompt);
+     }
+ 
+     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+--- a/common/parsers/muse-glimmer.cpp
++++ b/common/parsers/muse-glimmer.cpp
+@@ -58,11 +58,11 @@ common_chat_params common_chat_params_init_muse_glimmer(const common_chat_templa
+             data.generation_prompt += "<|eom|><|start|>assistant to=user<|message|>" + msg.render_content();
+         }
+ 
+-        data.prompt += data.generation_prompt;
++        data.prompt.append(data.generation_prompt);
+     } else if (reasoning_disabled && !include_grammar) {
+         const std::string recipient = " to=user<|message|>";
+         data.generation_prompt += recipient;
+-        data.prompt            += recipient;
++        data.prompt.append(recipient);
+     }
+ 
+     auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+--- a/common/parsers/parsers.h
++++ b/common/parsers/parsers.h
+@@ -24,7 +24,7 @@ void foreach_function(const json & tools, const std::function<void(const json &)
+ void foreach_parameter(const json & function, const std::function<void(const common_chat_schema_property &, const common_chat_schema_document_ptr &)> & fn);
+ 
+ // render a template; the override arguments let a parser feed in messages, tools or context it has rewritten
+-std::string common_chat_template_direct_apply_impl(
++common_chat_prompt common_chat_template_direct_apply_impl(
+     const common_chat_template & tmpl,
+     const autoparser::generation_params & inputs,
+     const std::optional<json> & messages_override = std::nullopt,
+@@ -34,7 +34,7 @@ std::string common_chat_template_direct_apply_impl(
+ // the prompt a template renders, and its generation prompt: the suffix the template appends when
+ // add_generation_prompt is set. The prompt is one of the generation prompt's two renders, rendered once.
+ struct common_chat_rendered_prompt {
+-    std::string prompt;
++    common_chat_prompt prompt;
+     std::string generation_prompt;
+ };
+ common_chat_rendered_prompt common_chat_template_render_prompt(
+--- a/common/parsers/qwen3-coder.cpp
++++ b/common/parsers/qwen3-coder.cpp
+@@ -56,7 +56,7 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
+             data.generation_prompt += msg.render_content();
+         }
+ 
+-        data.prompt += data.generation_prompt;
++        data.prompt.append(data.generation_prompt);
+     }
+ 
+     std::vector<std::string> tool_call_starts = { "<tool_call>" };

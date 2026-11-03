@@ -12,6 +12,7 @@
 #include <vector>
 #include <optional>
 #include <algorithm>
+#include <numeric>
 
 #define FILENAME "jinja-value"
 
@@ -259,7 +260,7 @@ static value tojson(const func_args & args) {
     if (ensure_ascii) {
         json_str = json_ensure_ascii_preserving_format(json_str);
     }
-    return mk_val<value_string>(json_str);
+    return mk_val<value_string>(jinja::string(json_str, value_contains_input(args.get_pos(0))));
 }
 
 template<bool is_reject>
@@ -673,7 +674,8 @@ const func_builtins & value_string_t::get_builtins() const {
             if (!is_val<value_string>(val_input)) {
                 throw raised_exception("split() first argument must be a string");
             }
-            std::string str = val_input->as_string().str();
+            const jinja::string input = val_input->as_string();
+            const std::string str = input.str();
             // FIXME: Support non-specified delimiter (split on consecutive (no leading or trailing) whitespace)
             std::string delim = (args.count() > 1) ? args.get_pos(1)->as_string().str() : " ";
             if (delim.empty()) {
@@ -681,17 +683,14 @@ const func_builtins & value_string_t::get_builtins() const {
             }
             int64_t maxsplit = (args.count() > 2) ? args.get_pos(2)->as_int() : -1;
             auto result = mk_val<value_array>();
+            size_t start = 0;
             size_t pos = 0;
-            std::string token;
-            while ((pos = str.find(delim)) != std::string::npos && maxsplit != 0) {
-                token = str.substr(0, pos);
-                result->push_back(mk_val<value_string>(token));
-                str.erase(0, pos + delim.length());
+            while ((pos = str.find(delim, start)) != std::string::npos && maxsplit != 0) {
+                result->push_back(mk_val<value_string>(input.substr(start, pos - start)));
+                start = pos + delim.length();
                 --maxsplit;
             }
-            auto res = mk_val<value_string>(str);
-            res->val_str.mark_input_based_on(args.get_pos(0)->val_str);
-            result->push_back(std::move(res));
+            result->push_back(mk_val<value_string>(input.substr(start, str.size() - start)));
             return result;
         }},
         {"rsplit", [](const func_args & args) -> value {
@@ -700,7 +699,8 @@ const func_builtins & value_string_t::get_builtins() const {
             if (!is_val<value_string>(val_input)) {
                 throw raised_exception("rsplit() first argument must be a string");
             }
-            std::string str = val_input->as_string().str();
+            const jinja::string input = val_input->as_string();
+            const std::string str = input.str();
             // FIXME: Support non-specified delimiter (split on consecutive (no leading or trailing) whitespace)
             std::string delim = (args.count() > 1) ? args.get_pos(1)->as_string().str() : " ";
             if (delim.empty()) {
@@ -708,84 +708,75 @@ const func_builtins & value_string_t::get_builtins() const {
             }
             int64_t maxsplit = (args.count() > 2) ? args.get_pos(2)->as_int() : -1;
             auto result = mk_val<value_array>();
+            size_t end = str.size();
             size_t pos = 0;
-            std::string token;
-            while ((pos = str.rfind(delim)) != std::string::npos && maxsplit != 0) {
-                token = str.substr(pos + delim.length());
-                result->push_back(mk_val<value_string>(token));
-                str.erase(pos);
+            while (end >= delim.length() && (pos = str.rfind(delim, end - delim.length())) != std::string::npos && maxsplit != 0) {
+                const size_t token = pos + delim.length();
+                result->push_back(mk_val<value_string>(input.substr(token, end - token)));
+                end = pos;
                 --maxsplit;
             }
-            auto res = mk_val<value_string>(str);
-            res->val_str.mark_input_based_on(args.get_pos(0)->val_str);
-            result->push_back(std::move(res));
+            result->push_back(mk_val<value_string>(input.substr(0, end)));
             result->reverse();
             return result;
         }},
         {"replace", [](const func_args & args) -> value {
             args.ensure_vals<value_string, value_string, value_string, value_int>(true, true, true, false);
-            std::string str = args.get_pos(0)->as_string().str();
+            const jinja::string input = args.get_pos(0)->as_string();
+            const jinja::string replacement = args.get_pos(2)->as_string();
+            const std::string str = input.str();
             std::string old_str = args.get_pos(1)->as_string().str();
-            std::string new_str = args.get_pos(2)->as_string().str();
+            std::string new_str = replacement.str();
             int64_t count = args.count() > 3 ? args.get_pos(3)->as_int() : -1;
             if (count > 0) {
                 throw not_implemented_exception("String replace with count argument not implemented");
             }
-            if (old_str != new_str) {
-                size_t pos = 0;
-                if (old_str.empty()) {
-                    std::string new_res;
-                    new_res.reserve(str.length() + new_str.length() * (str.length() + 1));
-                    new_res += new_str;
-                    for (const char c : str) {
-                        new_res.push_back(c);
-                        new_res += new_str;
-                    }
-                    str = new_res;
-                } else {
-                    while ((pos = str.find(old_str, pos)) != std::string::npos) {
-                        str.replace(pos, old_str.length(), new_str);
-                        pos += new_str.length();
-                    }
-                }
+            if (old_str == new_str) {
+                return mk_val<value_string>(input);
             }
-            auto res = mk_val<value_string>(str);
-            res->val_str.mark_input_based_on(args.get_pos(0)->val_str);
-            return res;
+            jinja::string result;
+            if (old_str.empty()) {
+                result.append(replacement);
+                for (size_t i = 0; i < str.size(); ++i) {
+                    result.append(input.substr(i, 1));
+                    result.append(replacement);
+                }
+            } else {
+                size_t start = 0;
+                size_t pos = 0;
+                while ((pos = str.find(old_str, start)) != std::string::npos) {
+                    result.append(input.substr(start, pos - start));
+                    result.append(replacement);
+                    start = pos + old_str.length();
+                }
+                result.append(input.substr(start, str.size() - start));
+            }
+            return mk_val<value_string>(result);
         }},
         {"format", [](const func_args & args) -> value {
             value val_input = args.get_pos(0);
             if (!is_val<value_string>(val_input)) {
                 throw raised_exception("format() first argument must be a string");
             }
-            const jinja::string & fmt = val_input->as_string();
-            const bool fmt_is_input = fmt.all_parts_are_input();
-
+            const jinja::string fmt = val_input->as_string();
             const std::string str = fmt.str();
             jinja::string result;
-            std::string literal;
-            auto flush_literal = [&]() {
-                if (!literal.empty()) {
-                    result.parts.push_back({fmt_is_input, literal});
-                    literal.clear();
-                }
-            };
+            size_t literal = 0;
 
             size_t arg_idx = 1; // positional args follow the format string
             for (size_t i = 0; i < str.size(); ++i) {
                 if (str[i] != '{') {
-                    literal += str[i];
                     continue;
                 }
                 if (i + 1 >= str.size() || str[i + 1] != '}') {
                     throw not_implemented_exception("format() only supports simple '{}' placeholders");
                 }
+                result.append(fmt.substr(literal, i - literal));
                 ++i;
-                flush_literal();
-                const jinja::string arg_str = args.get_pos(arg_idx++)->as_string();
-                result.parts.insert(result.parts.end(), arg_str.parts.begin(), arg_str.parts.end());
+                literal = i + 1;
+                result.append(args.get_pos(arg_idx++)->as_string());
             }
-            flush_literal();
+            result.append(fmt.substr(literal, str.size() - literal));
             return mk_val<value_string>(result);
         }},
         {"int", [](const func_args & args) -> value {
@@ -863,11 +854,21 @@ const func_builtins & value_string_t::get_builtins() const {
             if (step == 0) {
                 throw raised_exception("slice step cannot be zero");
             }
-            auto input = args.get_pos(0);
-            auto sliced = slice(input->as_string().str(), start, stop, step);
-            auto res = mk_val<value_string>(sliced);
-            res->val_str.mark_input_based_on(input->as_string());
-            return res;
+            const jinja::string input = args.get_pos(0)->as_string();
+            std::vector<size_t> positions(input.length());
+            std::iota(positions.begin(), positions.end(), size_t(0));
+            const auto sliced = slice(positions, start, stop, step);
+            // consecutive positions are taken as one run of their parts
+            jinja::string result;
+            for (size_t i = 0; i < sliced.size();) {
+                size_t run = 1;
+                while (i + run < sliced.size() && sliced[i + run] == sliced[i] + run) {
+                    ++run;
+                }
+                result.append(input.substr(sliced[i], run));
+                i += run;
+            }
+            return mk_val<value_string>(result);
         }},
         {"safe", [](const func_args & args) -> value {
             // no-op for now
@@ -884,37 +885,38 @@ const func_builtins & value_string_t::get_builtins() const {
             if (!is_val<value_string>(val_input)) {
                 throw raised_exception("indent() first argument must be a string");
             }
-            std::string indent;
+            jinja::string indent;
             if (is_val<value_int>(val_width)) {
-                indent.assign(val_width->as_int(), ' ');
+                indent = std::string(val_width->as_int(), ' ');
             } else if (is_val<value_string>(val_width)) {
-                indent = val_width->as_string().str();
+                indent = val_width->as_string();
             } else {
-                indent = "    ";
+                indent = std::string("    ");
             }
-            std::string indented;
-            std::string input = val_input->as_string().str();
-            std::istringstream iss = std::istringstream(input);
-            std::string line;
-            while (std::getline(iss, line)) {
-                if (!indented.empty()) {
-                    indented.push_back('\n');
+            // every line and newline is the input's own bytes
+            const jinja::string input = val_input->as_string();
+            const std::string str = input.str();
+            jinja::string indented;
+            size_t start = 0;
+            while (start < str.size()) {
+                const size_t newline = str.find('\n', start);
+                const size_t end = newline == std::string::npos ? str.size() : newline;
+                if (indented.length() > 0) {
+                    indented.append(input.substr(start - 1, 1));
                 }
-                if ((indented.empty() ? first : (!line.empty() || blank))) {
-                    indented += indent;
+                if ((indented.length() == 0 ? first : (end > start || blank))) {
+                    indented.append(indent);
                 }
-                indented += line;
+                indented.append(input.substr(start, end - start));
+                start = newline == std::string::npos ? end : end + 1;
             }
-            if (!input.empty() && input.back() == '\n') {
-                indented.push_back('\n');
+            if (!str.empty() && str.back() == '\n') {
+                indented.append(input.substr(str.size() - 1, 1));
                 if (blank) {
-                    indented += indent;
+                    indented.append(indent);
                 }
             }
-
-            auto res = mk_val<value_string>(indented);
-            res->val_str.mark_input_based_on(val_input->as_string());
-            return res;
+            return mk_val<value_string>(indented);
         }},
         {"join", string_join_not_implemented},
     };
@@ -1030,8 +1032,8 @@ const func_builtins & value_array_t::get_builtins() const {
                 throw raised_exception("join() attribute must be string or integer");
             }
             const int64_t attr_int = attr_is_int ? attribute->as_int() : 0;
-            const std::string delim = val_delim->is_undefined() ? "" : val_delim->as_string().str();
-            std::string result;
+            const jinja::string delim = val_delim->is_undefined() ? jinja::string() : val_delim->as_string();
+            jinja::string result;
             for (size_t i = 0; i < arr.size(); ++i) {
                 value val_arr = arr[i];
                 if (!attribute->is_undefined()) {
@@ -1044,9 +1046,9 @@ const func_builtins & value_array_t::get_builtins() const {
                 if (!is_val<value_string>(val_arr) && !is_val<value_int>(val_arr) && !is_val<value_float>(val_arr)) {
                     throw raised_exception("join() can only join arrays of strings or numerics");
                 }
-                result += val_arr->as_string().str();
+                result.append(val_arr->as_string());
                 if (i < arr.size() - 1) {
-                    result += delim;
+                    result.append(delim);
                 }
             }
             return mk_val<value_string>(result);
@@ -1368,11 +1370,7 @@ static value from_json(const common_json & j, bool mark_input) {
     } else if (j.is_number_float()) {
         return mk_val<value_float>(j.get<double>());
     } else if (j.is_string()) {
-        auto str = mk_val<value_string>(j.get<std::string>());
-        if (mark_input) {
-            str->mark_input();
-        }
-        return str;
+        return mk_val<value_string>(json_text(j.get<std::string>(), mark_input));
     } else if (j.is_array()) {
         auto arr = mk_val<value_array>();
         for (const auto & item : j) {
@@ -1382,7 +1380,7 @@ static value from_json(const common_json & j, bool mark_input) {
     } else if (j.is_object()) {
         auto obj = mk_val<value_object>();
         for (auto it = j.begin(); it != j.end(); ++it) {
-            obj->insert(it.key(), from_json(it.value(), mark_input));
+            obj->insert(mk_val<value_string>(jinja::string(it.key(), mark_input)), from_json(it.value(), mark_input));
         }
         return obj;
     } else {
@@ -1552,6 +1550,23 @@ std::string value_to_json(const value & val, int indent, const std::string_view 
     value_to_json_internal(oss, val, 0, indent, item_sep, key_sep);
     JJ_DEBUG("value_to_json: result=%s", oss.str().c_str());
     return oss.str();
+}
+
+bool value_contains_input(const value & val) {
+    if (is_val<value_string>(val)) {
+        return val->val_str.any_part_is_input();
+    }
+    if (is_val<value_array>(val)) {
+        const auto & arr = val->as_array();
+        return std::any_of(arr.begin(), arr.end(), value_contains_input);
+    }
+    if (is_val<value_object>(val)) {
+        const auto & obj = val->as_ordered_object();
+        return std::any_of(obj.begin(), obj.end(), [](const auto & pair) {
+            return value_contains_input(pair.first) || value_contains_input(pair.second);
+        });
+    }
+    return false;
 }
 
 // TODO: avoid circular references

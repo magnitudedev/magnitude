@@ -103,7 +103,9 @@ impl PreparedChat {
             tokens,
             added_token_ends,
         } = tokenizer
-            .encode_sequence(&description.prompt)
+            // Special tokens are recognized only inside the bytes the
+            // template authored, so request input is always literal text.
+            .encode_sequence_controlled(&description.prompt, &description.controls)
             .map_err(internal)?;
         if tokens.is_empty() {
             return Err(ChatError::InvalidRequest(

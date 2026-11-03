@@ -79,6 +79,32 @@ itself. Every family takes both from `common_chat_template_render_prompt`, which
 side alone. Prompts and generation prompts are unchanged. A preparation describes how many renders
 it made.
 
+Patch 0030 keeps request input literal. A rendered prompt is a sequence of template text and
+request input (upstream's later `common_chat_prompt`, which also renders the bos and eos tokens as
+the model's), and a description reports the template text as control ranges: special tokens are
+recognized there only, so a message that spells `<|im_end|>` stays text. Upstream marks request
+strings but loses the marking wherever a builtin builds a new string: split items, joins,
+replacements, slices, indexing, indentation and formats kept a byte's marking only when their whole
+source was input, and serializations (`tojson`, a container's string form) and object keys never
+marked it, so tool definitions, JSON tool arguments and argument names rendered as template text.
+Every builtin now keeps each byte's own marking; a serialization, whose bytes no source byte maps
+onto, is input when any string it serializes is. A request's reasoning effort is input, and gpt-oss
+replaces `<|return|>` in template text only. Numbers and booleans carry no marking; their text is
+digits, signs and words. Continuations, which the ABI never requests, append their generation
+prompt as template text, as upstream does.
+
+Patch 0031 gives the text the host joins into request input its own provenance. A media marker is
+the host's text for an image, which the model's input preparation expands, so it is template text
+in every template's prompt: joining a message's content parts brackets each marker with the bytes
+0xFE and 0xFF, which UTF-8 and therefore request JSON never contain, and reading a JSON string into
+the template context marks the bracketed bytes as template text. The marker survives every
+handler's message adjustment as part of its content string, and the template sees exactly the
+upstream joined text. A continuation's generation prompt marks the continued message's reasoning
+and content as input, superseding patch 0030's template-text continuation. A rendered prompt keeps
+no empty part and merges neighbouring parts of one kind, so its first and last parts hold its first
+and last bytes, and removing the template's BOS or EOS that the tokenizer adds looks past an empty
+input string.
+
 To refresh the extraction, use the provenance record and patch series in a maintainer workflow,
 then check in the resulting patched sources. Source preparation is deliberately not part of a
 consumer build.

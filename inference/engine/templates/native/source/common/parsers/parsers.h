@@ -24,7 +24,7 @@ void foreach_function(const json & tools, const std::function<void(const json &)
 void foreach_parameter(const json & function, const std::function<void(const common_chat_schema_property &, const common_chat_schema_document_ptr &)> & fn);
 
 // render a template; the override arguments let a parser feed in messages, tools or context it has rewritten
-std::string common_chat_template_direct_apply_impl(
+common_chat_prompt common_chat_template_direct_apply_impl(
     const common_chat_template & tmpl,
     const autoparser::generation_params & inputs,
     const std::optional<json> & messages_override = std::nullopt,
@@ -34,7 +34,7 @@ std::string common_chat_template_direct_apply_impl(
 // the prompt a template renders, and its generation prompt: the suffix the template appends when
 // add_generation_prompt is set. The prompt is one of the generation prompt's two renders, rendered once.
 struct common_chat_rendered_prompt {
-    std::string prompt;
+    common_chat_prompt prompt;
     std::string generation_prompt;
 };
 common_chat_rendered_prompt common_chat_template_render_prompt(

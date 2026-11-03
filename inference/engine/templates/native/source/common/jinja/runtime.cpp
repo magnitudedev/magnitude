@@ -903,9 +903,9 @@ value member_expression::execute_impl(context & ctx) {
                     val = arr[index];
                 }
             } else { // value_string
-                auto str = object->as_string().str();
-                if (index >= 0 && index < static_cast<int64_t>(str.size())) {
-                    val = mk_val<value_string>(std::string(1, str[index]));
+                const auto str = object->as_string();
+                if (index >= 0 && index < static_cast<int64_t>(str.length())) {
+                    val = mk_val<value_string>(str.substr(static_cast<size_t>(index), 1));
                 }
             }
 

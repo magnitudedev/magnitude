@@ -263,9 +263,32 @@ struct common_chat_templates_inputs {
     bool                                  force_pure_content = false;
 };
 
+struct common_chat_prompt_part {
+    std::string text;
+    bool        is_input = false; // from user input, special tokens inside must not be parsed
+};
+
+// rendered chat template, split into template parts and user input parts
+struct common_chat_prompt {
+    std::vector<common_chat_prompt_part> parts;
+
+    common_chat_prompt() = default;
+    // a template's rendered output; like `append`, it keeps no empty part and merges neighbours
+    // of one kind, so the first and last parts hold the prompt's first and last bytes
+    explicit common_chat_prompt(jinja::string rendered);
+
+    std::string str() const;
+
+    void append(std::string text, bool is_input = false);
+    void append(const common_chat_prompt & other);
+
+    // replace the last occurrence of `from`, user input parts are skipped
+    void replace_last(const std::string & from, const std::string & to);
+};
+
 struct common_chat_params {
     common_chat_format                  format = COMMON_CHAT_FORMAT_CONTENT_ONLY;
-    std::string                         prompt;
+    common_chat_prompt                  prompt;
     std::string                         grammar;
     bool                                grammar_lazy         = false;
     std::string                         generation_prompt;
@@ -277,6 +300,9 @@ struct common_chat_params {
     std::vector<std::string>            additional_stops;
     std::string                         parser;
     common_chat_msg_delimiters          message_delimiters;
+
+    // continue the final message: `continuation` is the generation prompt, and the prompt ends with it
+    void append_continuation(const common_chat_prompt & continuation);
 };
 
 // per-message parsing syntax
@@ -362,7 +388,7 @@ common_json common_chat_tool_parameters(const common_json & function);
 // get template caps, useful for reporting to server /props endpoint
 std::map<std::string, bool> common_chat_templates_get_caps(const common_chat_templates * chat_templates);
 
-std::string common_chat_template_direct_apply(
+common_chat_prompt common_chat_template_direct_apply(
     const common_chat_template & tmpl,
     const autoparser::generation_params & inputs);
 

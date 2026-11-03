@@ -200,6 +200,10 @@ const INTERPRETED_KEYS: &[&str] = &[
     "tokenizer.ggml.add_sep_token",
     "tokenizer.ggml.add_space_prefix",
     "tokenizer.ggml.suppress_tokens",
+    // Whether encoding composes NFC first; the profile fixes it.
+    "tokenizer.ggml.normalizer.nfc",
+    // Whether decoding removes spaces before punctuation; it never does.
+    "tokenizer.ggml.clean_spaces",
 ];
 
 /// Pieces that end a turn by the GGUF convention (llama.cpp 18443257a30c,
@@ -311,6 +315,18 @@ fn tokenizer_header(payload: &TokenizerPayload) -> Result<(Profile, usize), Toke
     ] {
         if flag(payload, key)? == Some(true) {
             unsupported.push(UnsupportedReason::UnrecognizedMetadata { key: key.into() });
+        }
+    }
+    if flag(payload, "tokenizer.ggml.clean_spaces")? == Some(true) {
+        unsupported.push(UnsupportedReason::UnrecognizedMetadata {
+            key: "tokenizer.ggml.clean_spaces".into(),
+        });
+    }
+    if let (Ok(profile), Some(nfc)) = (&profile, flag(payload, "tokenizer.ggml.normalizer.nfc")?) {
+        if nfc != (profile.normalization == Normalization::Nfc) {
+            unsupported.push(UnsupportedReason::UnrecognizedMetadata {
+                key: "tokenizer.ggml.normalizer.nfc".into(),
+            });
         }
     }
     let profile = match profile {

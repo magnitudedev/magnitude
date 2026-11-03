@@ -250,12 +250,25 @@ impl Template {
         }
         Ok(result.capabilities)
     }
-    pub fn render(&self, context: &Map<String, Value>, now: i64) -> Result<String, Error> {
+    pub fn render(&self, context: &Map<String, Value>, now: i64) -> Result<RenderedPrompt, Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Rendered {
+            version: u32,
+            prompt: String,
+            controls: Vec<std::ops::Range<usize>>,
+        }
         let payload = encode(&serde_json::json!({"version":1,"context":context,"now":now}))?;
-        let bytes = output(|o, e| unsafe {
+        let rendered: Rendered = decode(&output(|o, e| unsafe {
             templates_template_render(self.handle.id, payload.as_ptr(), payload.len() as u64, o, e)
-        })?;
-        String::from_utf8(bytes).map_err(|_| Error::incompatible("native prompt is not UTF-8"))
+        })?)?;
+        if rendered.version != 1 {
+            return Err(Error::incompatible("rendering payload version"));
+        }
+        Ok(RenderedPrompt {
+            prompt: rendered.prompt,
+            controls: rendered.controls,
+        })
     }
     pub fn prepare(&self, request: &Request) -> Result<PreparedRequest, Error> {
         #[derive(Serialize)]

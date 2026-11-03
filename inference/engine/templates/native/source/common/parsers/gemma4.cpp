@@ -381,12 +381,12 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
     data.prompt            = std::move(rendered.prompt);
     data.generation_prompt = std::move(rendered.generation_prompt);
 
-    if (inputs.add_generation_prompt && string_ends_with(data.prompt, "<turn|>\n")) {
+    if (inputs.add_generation_prompt && string_ends_with(data.prompt.str(), "<turn|>\n")) {
         // This may happen if the model generates content + tool_call, the
         // template does not add the model's next turn and confuses the model
         // from emitting its proper reasoning token sequence.
         data.generation_prompt = "<|turn>model\n";
-        data.prompt += data.generation_prompt;
+        data.prompt.append(data.generation_prompt);
     }
 
     data.message_delimiters = {
@@ -410,13 +410,15 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
 
-        data.generation_prompt = string_ends_with(data.prompt, "<turn|>\n") ? "<|turn>model\n" : "";
-        data.generation_prompt += "<|channel>thought\n" + msg.reasoning_content;
+        common_chat_prompt continuation;
+        continuation.append(std::string(string_ends_with(data.prompt.str(), "<turn|>\n") ? "<|turn>model\n" : "") + "<|channel>thought\n");
+        continuation.append(msg.reasoning_content, true);
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
-            data.generation_prompt += "<channel|>" + msg.render_content();
+            continuation.append("<channel|>");
+            continuation.append(msg.render_content(), true);
         }
 
-        data.prompt += data.generation_prompt;
+        data.append_continuation(continuation);
     }
 
     auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();

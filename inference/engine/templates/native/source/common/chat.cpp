@@ -146,6 +146,30 @@ common_chat_msg_delimiters common_chat_msg_delimiters_parse(const json & delimit
     return result;
 }
 
+// The content string a template reads for typed parts: the parts joined with newlines, none
+// before or after a media marker. A media marker is the host's text, not the request's, so it
+// renders as template text and the text parts stay request input.
+static std::string concat_content_parts(const json & parts) {
+    std::string text;
+    bool last_was_media_marker = false;
+    for (const auto & part : parts) {
+        std::string type = part.value("type", "");
+        if (type == "text") {
+            if (!last_was_media_marker && !text.empty()) {
+                text += '\n';
+            }
+            text += part.value("text", "");
+            last_was_media_marker = false;
+        } else if (type == "media_marker") {
+            text += jinja::template_text(part.value("text", ""));
+            last_was_media_marker = true;
+        } else {
+            LOG_WRN("Ignoring content part type: %s\n", type.c_str());
+        }
+    }
+    return text;
+}
+
 json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
     if (!content.empty() && !content_parts.empty()) {
         throw std::runtime_error("Cannot specify both content and content_parts");
@@ -156,38 +180,17 @@ json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
     if (!content.empty()) {
         jmsg["content"] = content;
     } else if (!content_parts.empty()) {
+        auto parts = json::array();
+        for (const auto & part : content_parts) {
+            parts.push_back({
+                {"type", part.type},
+                {"text", part.text},
+            });
+        }
         if (concat_typed_text || contains_media()) {
-            std::string text;
-            bool last_was_media_marker = false;
-            // join parts with newline, do not add newline before or after media markers
-            for (const auto & part : content_parts) {
-                bool add_new_line = true;
-                if (part.type == "text") {
-                    add_new_line = !last_was_media_marker && !text.empty();
-                    last_was_media_marker = false;
-                } else if (part.type == "media_marker") {
-                    add_new_line = false;
-                    last_was_media_marker = true;
-                } else {
-                    LOG_WRN("Ignoring content part type: %s\n", part.type.c_str());
-                    continue;
-                }
-
-                if (add_new_line) {
-                    text += '\n';
-                }
-
-                text += part.text;
-            }
-            jmsg["content"] = text;
+            jmsg["content"] = concat_content_parts(parts);
         } else {
-            auto & parts = jmsg["content"] = json::array();
-            for (const auto & part : content_parts) {
-                parts.push_back({
-                    {"type", part.type},
-                    {"text", part.text},
-                });
-            }
+            jmsg["content"] = std::move(parts);
         }
     } else {
         jmsg["content"] = "";
@@ -468,33 +471,6 @@ struct messages_inp_normalizer {
         }
         return normalized;
     }
-
-    // join parts with newline, do not add newline before or after media markers
-    static std::string concat_content_parts(const json & parts) {
-        std::string text;
-        bool last_was_media_marker = false;
-        for (const auto & part : parts) {
-            std::string type = part.value("type", "");
-            bool add_new_line = true;
-            if (type == "text") {
-                add_new_line = !last_was_media_marker && !text.empty();
-                last_was_media_marker = false;
-            } else if (type == "media_marker") {
-                add_new_line = false;
-                last_was_media_marker = true;
-            } else {
-                LOG_WRN("Ignoring content part type: %s\n", type.c_str());
-                continue;
-            }
-
-            if (add_new_line) {
-                text += '\n';
-            }
-
-            text += part.value("text", "");
-        }
-        return text;
-    }
 };
 
 static json render_message_to_json(const std::vector<common_chat_msg> & msgs, const jinja::caps & c) {
@@ -634,7 +610,7 @@ std::string common_chat_format_single(const struct common_chat_templates * tmpls
     if (!past_msg.empty()) {
         inputs.messages              = past_msg;
         inputs.add_generation_prompt = false;
-        fmt_past_msg                 = common_chat_templates_apply(tmpls, inputs).prompt;
+        fmt_past_msg                 = common_chat_templates_apply(tmpls, inputs).prompt.str();
     }
     std::ostringstream ss;
     // if the past_msg ends with a newline, we must preserve it in the formatted version
@@ -644,7 +620,7 @@ std::string common_chat_format_single(const struct common_chat_templates * tmpls
     // format chat with new_msg
     inputs.messages.push_back(new_msg);
     inputs.add_generation_prompt = add_ass;
-    auto fmt_new_msg             = common_chat_templates_apply(tmpls, inputs).prompt;
+    auto fmt_new_msg             = common_chat_templates_apply(tmpls, inputs).prompt.str();
     // get the diff part
     ss << fmt_new_msg.substr(fmt_past_msg.size(), fmt_new_msg.size() - fmt_past_msg.size());
     return ss.str();
@@ -668,7 +644,7 @@ std::string common_chat_format_example(const struct common_chat_templates *     
     add_simple_msg("user", "Hello");
     add_simple_msg("assistant", "Hi there");
     add_simple_msg("user", "How are you?");
-    return common_chat_templates_apply(tmpls, inputs).prompt;
+    return common_chat_templates_apply(tmpls, inputs).prompt.str();
 }
 
 #define CHATML_TEMPLATE_SRC                                                               \
@@ -775,7 +751,7 @@ common_reasoning_format common_reasoning_format_from_name(const std::string & fo
     throw std::runtime_error("Unknown reasoning format: " + format);
 }
 
-std::string common_chat_template_direct_apply_impl(
+common_chat_prompt common_chat_template_direct_apply_impl(
     const common_chat_template & tmpl,
     const autoparser::generation_params & inputs,
     const std::optional<json> & messages_override,
@@ -824,25 +800,33 @@ std::string common_chat_template_direct_apply_impl(
 
     jinja::global_from_json(ctx, inp, inputs.mark_input);
 
+    // bos/eos come from the model, not from the user
+    ctx.set_val("bos_token", jinja::mk_val<jinja::value_string>(tmpl.bos_token()));
+    ctx.set_val("eos_token", jinja::mk_val<jinja::value_string>(tmpl.eos_token()));
+
     // render
     ++templates_native::renders;
     jinja::runtime runtime(ctx);
     const jinja::value results = runtime.execute(tmpl.prog);
-    auto parts = jinja::runtime::gather_string_parts(results);
-
-    std::string result = parts->as_string().str();
+    common_chat_prompt result(std::move(jinja::runtime::gather_string_parts(results)->val_str));
 
     // TODO: improve this later
-    if (inputs.add_bos && string_starts_with(result, tmpl.bos_token())) {
-        result = result.substr(tmpl.bos_token().size());
+    if (inputs.add_bos && !result.parts.empty()) {
+        auto & first = result.parts.front();
+        if (!first.is_input && string_starts_with(first.text, tmpl.bos_token())) {
+            first.text.erase(0, tmpl.bos_token().size());
+        }
     }
-    if (inputs.add_eos && string_ends_with(result, tmpl.eos_token())) {
-        result = result.substr(0, result.size() - tmpl.eos_token().size());
+    if (inputs.add_eos && !result.parts.empty()) {
+        auto & last = result.parts.back();
+        if (!last.is_input && string_ends_with(last.text, tmpl.eos_token())) {
+            last.text.resize(last.text.size() - tmpl.eos_token().size());
+        }
     }
     return result;
 }
 
-std::string common_chat_template_direct_apply(
+common_chat_prompt common_chat_template_direct_apply(
     const common_chat_template & tmpl,
     const autoparser::generation_params & inputs) {
     return common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt);
@@ -855,16 +839,17 @@ common_chat_rendered_prompt common_chat_template_render_prompt(
     const std::optional<json> & tools_override,
     const std::optional<json> & additional_context) {
 
-    std::string prompt = common_chat_template_direct_apply_impl(tmpl, inputs, messages_override, tools_override, additional_context);
+    common_chat_prompt prompt = common_chat_template_direct_apply_impl(tmpl, inputs, messages_override, tools_override, additional_context);
     // These parameters differ from `inputs` only in add_generation_prompt and
     // the continuation, which rendering does not read, so the prompt is the
     // comparison's render on its own side and only the other side renders.
     autoparser::generation_params params = inputs;
     params.add_generation_prompt = !inputs.add_generation_prompt;
     params.continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
-    std::string other = common_chat_template_direct_apply_impl(tmpl, params, messages_override, tools_override, additional_context);
-    const std::string & no_gen_prompt = inputs.add_generation_prompt ? other : prompt;
-    const std::string & gen_prompt    = inputs.add_generation_prompt ? prompt : other;
+    const std::string text  = prompt.str();
+    const std::string other = common_chat_template_direct_apply_impl(tmpl, params, messages_override, tools_override, additional_context).str();
+    const std::string & no_gen_prompt = inputs.add_generation_prompt ? other : text;
+    const std::string & gen_prompt    = inputs.add_generation_prompt ? text : other;
 
     size_t prefix_len = 0;
     size_t min_size = std::min(no_gen_prompt.size(), gen_prompt.size());
@@ -1241,6 +1226,63 @@ common_chat_params common_chat_templates_apply(const struct common_chat_template
     TEMPLATES_ASSERT(tmpls != nullptr);
     if (!inputs.use_jinja) { throw std::invalid_argument("Only Jinja templates are supported"); }
     return common_chat_templates_apply_jinja(tmpls, inputs);
+}
+
+std::string common_chat_prompt::str() const {
+    if (parts.size() == 1) {
+        return parts[0].text;
+    }
+    size_t len = 0;
+    for (const auto & part : parts) {
+        len += part.text.size();
+    }
+    std::string out;
+    out.reserve(len);
+    for (const auto & part : parts) {
+        out += part.text;
+    }
+    return out;
+}
+
+void common_chat_params::append_continuation(const common_chat_prompt & continuation) {
+    generation_prompt = continuation.str();
+    prompt.append(continuation);
+}
+
+common_chat_prompt::common_chat_prompt(jinja::string rendered) {
+    for (auto & part : rendered.parts) {
+        append(std::move(part.val), part.is_input);
+    }
+}
+
+void common_chat_prompt::append(const common_chat_prompt & other) {
+    for (const auto & part : other.parts) {
+        append(part.text, part.is_input);
+    }
+}
+
+void common_chat_prompt::append(std::string text, bool is_input) {
+    if (text.empty()) {
+        return;
+    }
+    if (!parts.empty() && parts.back().is_input == is_input) {
+        parts.back().text += text;
+    } else {
+        parts.push_back({std::move(text), is_input});
+    }
+}
+
+void common_chat_prompt::replace_last(const std::string & from, const std::string & to) {
+    for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
+        if (it->is_input) {
+            continue;
+        }
+        size_t pos = it->text.rfind(from);
+        if (pos != std::string::npos) {
+            it->text.replace(pos, from.size(), to);
+            return;
+        }
+    }
 }
 
 common_chat_msg common_chat_parse(const std::string &               input,

@@ -45,18 +45,20 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
 
-        data.generation_prompt = GEN_PREFIX;
+        common_chat_prompt continuation;
+        continuation.append(GEN_PREFIX);
         if (supports_reasoning) {
-            data.generation_prompt += "<think>\n" + msg.reasoning_content;
+            continuation.append("<think>\n");
+            continuation.append(msg.reasoning_content, true);
             if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
-                data.generation_prompt += "\n</think>\n\n";
+                continuation.append("\n</think>\n\n");
             }
         }
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
-            data.generation_prompt += msg.render_content();
+            continuation.append(msg.render_content(), true);
         }
 
-        data.prompt += data.generation_prompt;
+        data.append_continuation(continuation);
     }
 
     std::vector<std::string> tool_call_starts = { "<tool_call>" };

@@ -5,6 +5,7 @@
 #include <functional>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -93,13 +94,13 @@ void string::hash_update(hasher & hash) const noexcept {
     }
 }
 
-bool string::all_parts_are_input() const {
+bool string::any_part_is_input() const {
     for (const auto & part : parts) {
-        if (!part.is_input) {
-            return false;
+        if (part.is_input) {
+            return true;
         }
     }
-    return true;
+    return false;
 }
 
 bool string::is_uppercase() const {
@@ -120,20 +121,30 @@ bool string::is_lowercase() const {
     return true;
 }
 
-// mark this string as input if other has ALL parts as input
-void string::mark_input_based_on(const string & other) {
-    if (other.all_parts_are_input()) {
-        for (auto & part : parts) {
-            part.is_input = true;
-        }
-    }
-}
-
 string & string::append(const string & other) {
     for (const auto & part : other.parts) {
         parts.push_back(part);
     }
     return *this;
+}
+
+string string::substr(size_t pos, size_t len) const {
+    string result;
+    size_t offset = 0;
+    for (const auto & part : parts) {
+        if (len == 0) {
+            break;
+        }
+        const size_t size = part.val.size();
+        if (pos < offset + size) {
+            const size_t count = std::min(offset + size - pos, len);
+            result.parts.push_back({part.is_input, part.val.substr(pos - offset, count)});
+            pos += count;
+            len -= count;
+        }
+        offset += size;
+    }
+    return result;
 }
 
 // in-place transformation
@@ -234,6 +245,46 @@ string string::strip(bool left, bool right, std::optional<const std::string_view
         }
     }
     return *this;
+}
+
+//
+// template text in request strings
+//
+
+static constexpr char template_text_open  = '\xFE';
+static constexpr char template_text_close = '\xFF';
+
+std::string template_text(const std::string & text) {
+    return template_text_open + text + template_text_close;
+}
+
+string json_text(const std::string & text, bool input) {
+    const char brackets[] = {template_text_open, template_text_close, '\0'};
+    if (text.find_first_of(brackets) == std::string::npos) {
+        return string(text, input);
+    }
+    string result;
+    auto push = [&](size_t start, size_t end, bool is_input) {
+        if (end > start) {
+            result.parts.push_back({is_input, text.substr(start, end - start)});
+        }
+    };
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const size_t open = text.find_first_of(brackets, pos);
+        if (open == std::string::npos) {
+            push(pos, text.size(), input);
+            break;
+        }
+        const size_t close = text.find_first_of(brackets, open + 1);
+        if (text[open] != template_text_open || close == std::string::npos || text[close] != template_text_close) {
+            throw std::logic_error("Unbalanced template text in a request string");
+        }
+        push(pos, open, input);
+        push(open + 1, close, false);
+        pos = close + 1;
+    }
+    return result;
 }
 
 } // namespace jinja

@@ -1,0 +1,616 @@
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -47,19 +47,22 @@ common_chat_params peg_generator::generate_parser(cons
+         // Build up generation prompt manually
+         const auto & msg = inputs.continue_msg;
+ 
++        common_chat_prompt continuation;
+         if (!autoparser.reasoning.start.empty()) {
+-            data.generation_prompt = data.generation_prompt.substr(0, data.generation_prompt.find(autoparser.reasoning.start));
+-            data.generation_prompt += autoparser.reasoning.start + msg.reasoning_content;
++            continuation.append(data.generation_prompt.substr(0, data.generation_prompt.find(autoparser.reasoning.start)) + autoparser.reasoning.start);
++            continuation.append(msg.reasoning_content, true);
+             if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-                data.generation_prompt += autoparser.reasoning.end;
++                continuation.append(autoparser.reasoning.end);
+             }
++        } else {
++            continuation.append(data.generation_prompt);
+         }
+ 
+         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += msg.render_content();
++            continuation.append(msg.render_content(), true);
+         }
+ 
+-        data.prompt.append(data.generation_prompt);
++        data.append_continuation(continuation);
+     }
+ 
+     auto parser = autoparser.build_parser(inputs, parser_generation_prompt);
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -146,6 +146,30 @@ common_chat_msg_delimiters common_chat_msg_delimiters_
+     return result;
+ }
+ 
++// The content string a template reads for typed parts: the parts joined with newlines, none
++// before or after a media marker. A media marker is the host's text, not the request's, so it
++// renders as template text and the text parts stay request input.
++static std::string concat_content_parts(const json & parts) {
++    std::string text;
++    bool last_was_media_marker = false;
++    for (const auto & part : parts) {
++        std::string type = part.value("type", "");
++        if (type == "text") {
++            if (!last_was_media_marker && !text.empty()) {
++                text += '\n';
++            }
++            text += part.value("text", "");
++            last_was_media_marker = false;
++        } else if (type == "media_marker") {
++            text += jinja::template_text(part.value("text", ""));
++            last_was_media_marker = true;
++        } else {
++            LOG_WRN("Ignoring content part type: %s\n", type.c_str());
++        }
++    }
++    return text;
++}
++
+ json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
+     if (!content.empty() && !content_parts.empty()) {
+         throw std::runtime_error("Cannot specify both content and content_parts");
+@@ -156,38 +180,17 @@ json common_chat_msg::to_json_oaicompat(bool concat_ty
+     if (!content.empty()) {
+         jmsg["content"] = content;
+     } else if (!content_parts.empty()) {
++        auto parts = json::array();
++        for (const auto & part : content_parts) {
++            parts.push_back({
++                {"type", part.type},
++                {"text", part.text},
++            });
++        }
+         if (concat_typed_text || contains_media()) {
+-            std::string text;
+-            bool last_was_media_marker = false;
+-            // join parts with newline, do not add newline before or after media markers
+-            for (const auto & part : content_parts) {
+-                bool add_new_line = true;
+-                if (part.type == "text") {
+-                    add_new_line = !last_was_media_marker && !text.empty();
+-                    last_was_media_marker = false;
+-                } else if (part.type == "media_marker") {
+-                    add_new_line = false;
+-                    last_was_media_marker = true;
+-                } else {
+-                    LOG_WRN("Ignoring content part type: %s\n", part.type.c_str());
+-                    continue;
+-                }
+-
+-                if (add_new_line) {
+-                    text += '\n';
+-                }
+-
+-                text += part.text;
+-            }
+-            jmsg["content"] = text;
++            jmsg["content"] = concat_content_parts(parts);
+         } else {
+-            auto & parts = jmsg["content"] = json::array();
+-            for (const auto & part : content_parts) {
+-                parts.push_back({
+-                    {"type", part.type},
+-                    {"text", part.text},
+-                });
+-            }
++            jmsg["content"] = std::move(parts);
+         }
+     } else {
+         jmsg["content"] = "";
+@@ -467,33 +470,6 @@ struct messages_inp_normalizer {
+             normalized.push_back(std::move(copy));
+         }
+         return normalized;
+-    }
+-
+-    // join parts with newline, do not add newline before or after media markers
+-    static std::string concat_content_parts(const json & parts) {
+-        std::string text;
+-        bool last_was_media_marker = false;
+-        for (const auto & part : parts) {
+-            std::string type = part.value("type", "");
+-            bool add_new_line = true;
+-            if (type == "text") {
+-                add_new_line = !last_was_media_marker && !text.empty();
+-                last_was_media_marker = false;
+-            } else if (type == "media_marker") {
+-                add_new_line = false;
+-                last_was_media_marker = true;
+-            } else {
+-                LOG_WRN("Ignoring content part type: %s\n", type.c_str());
+-                continue;
+-            }
+-
+-            if (add_new_line) {
+-                text += '\n';
+-            }
+-
+-            text += part.value("text", "");
+-        }
+-        return text;
+     }
+ };
+ 
+@@ -832,12 +808,7 @@ common_chat_prompt common_chat_template_direct_apply_i
+     ++templates_native::renders;
+     jinja::runtime runtime(ctx);
+     const jinja::value results = runtime.execute(tmpl.prog);
+-    auto parts = jinja::runtime::gather_string_parts(results);
+-
+-    common_chat_prompt result;
+-    for (auto & part : parts->val_str.parts) {
+-        result.parts.push_back({std::move(part.val), part.is_input});
+-    }
++    common_chat_prompt result(std::move(jinja::runtime::gather_string_parts(results)->val_str));
+ 
+     // TODO: improve this later
+     if (inputs.add_bos && !result.parts.empty()) {
+@@ -1273,14 +1244,31 @@ std::string common_chat_prompt::str() const {
+     return out;
+ }
+ 
+-void common_chat_prompt::append(const std::string & text, bool is_input) {
++void common_chat_params::append_continuation(const common_chat_prompt & continuation) {
++    generation_prompt = continuation.str();
++    prompt.append(continuation);
++}
++
++common_chat_prompt::common_chat_prompt(jinja::string rendered) {
++    for (auto & part : rendered.parts) {
++        append(std::move(part.val), part.is_input);
++    }
++}
++
++void common_chat_prompt::append(const common_chat_prompt & other) {
++    for (const auto & part : other.parts) {
++        append(part.text, part.is_input);
++    }
++}
++
++void common_chat_prompt::append(std::string text, bool is_input) {
+     if (text.empty()) {
+         return;
+     }
+     if (!parts.empty() && parts.back().is_input == is_input) {
+         parts.back().text += text;
+     } else {
+-        parts.push_back({text, is_input});
++        parts.push_back({std::move(text), is_input});
+     }
+ }
+ 
+--- a/common/chat.h
++++ b/common/chat.h
+@@ -272,9 +272,15 @@ struct common_chat_prompt {
+ struct common_chat_prompt {
+     std::vector<common_chat_prompt_part> parts;
+ 
++    common_chat_prompt() = default;
++    // a template's rendered output; like `append`, it keeps no empty part and merges neighbours
++    // of one kind, so the first and last parts hold the prompt's first and last bytes
++    explicit common_chat_prompt(jinja::string rendered);
++
+     std::string str() const;
+ 
+-    void append(const std::string & text, bool is_input = false);
++    void append(std::string text, bool is_input = false);
++    void append(const common_chat_prompt & other);
+ 
+     // replace the last occurrence of `from`, user input parts are skipped
+     void replace_last(const std::string & from, const std::string & to);
+@@ -294,6 +300,9 @@ struct common_chat_params {
+     std::vector<std::string>            additional_stops;
+     std::string                         parser;
+     common_chat_msg_delimiters          message_delimiters;
++
++    // continue the final message: `continuation` is the generation prompt, and the prompt ends with it
++    void append_continuation(const common_chat_prompt & continuation);
+ };
+ 
+ // per-message parsing syntax
+--- a/common/jinja/string.cpp
++++ b/common/jinja/string.cpp
+@@ -5,6 +5,7 @@
+ #include <functional>
+ #include <optional>
+ #include <sstream>
++#include <stdexcept>
+ #include <string>
+ #include <vector>
+ 
+@@ -244,6 +245,46 @@ string string::strip(bool left, bool right, std::optio
+         }
+     }
+     return *this;
++}
++
++//
++// template text in request strings
++//
++
++static constexpr char template_text_open  = '\xFE';
++static constexpr char template_text_close = '\xFF';
++
++std::string template_text(const std::string & text) {
++    return template_text_open + text + template_text_close;
+ }
+ 
++string json_text(const std::string & text, bool input) {
++    const char brackets[] = {template_text_open, template_text_close, '\0'};
++    if (text.find_first_of(brackets) == std::string::npos) {
++        return string(text, input);
++    }
++    string result;
++    auto push = [&](size_t start, size_t end, bool is_input) {
++        if (end > start) {
++            result.parts.push_back({is_input, text.substr(start, end - start)});
++        }
++    };
++    size_t pos = 0;
++    while (pos < text.size()) {
++        const size_t open = text.find_first_of(brackets, pos);
++        if (open == std::string::npos) {
++            push(pos, text.size(), input);
++            break;
++        }
++        const size_t close = text.find_first_of(brackets, open + 1);
++        if (text[open] != template_text_open || close == std::string::npos || text[close] != template_text_close) {
++            throw std::logic_error("Unbalanced template text in a request string");
++        }
++        push(pos, open, input);
++        push(open + 1, close, false);
++        pos = close + 1;
++    }
++    return result;
++}
++
+ } // namespace jinja
+--- a/common/jinja/string.h
++++ b/common/jinja/string.h
+@@ -61,4 +61,11 @@ struct string {
+     string strip(bool left, bool right, std::optional<const std::string_view> chars = std::nullopt);
+ };
+ 
++// Template text a host joins into a request string. Request JSON is valid UTF-8, which never uses
++// the bytes 0xFE and 0xFF, so text a host brackets with them can never be the request's own:
++// `template_text` brackets text (itself UTF-8) as template text, and `json_text` reads a JSON
++// string back, its bracketed bytes template text and the rest marked `input`.
++std::string template_text(const std::string & text);
++string json_text(const std::string & text, bool input);
++
+ } // namespace jinja
+--- a/common/jinja/value.cpp
++++ b/common/jinja/value.cpp
+@@ -1370,11 +1370,7 @@ static value from_json(const common_json & j, bool mar
+     } else if (j.is_number_float()) {
+         return mk_val<value_float>(j.get<double>());
+     } else if (j.is_string()) {
+-        auto str = mk_val<value_string>(j.get<std::string>());
+-        if (mark_input) {
+-            str->mark_input();
+-        }
+-        return str;
++        return mk_val<value_string>(json_text(j.get<std::string>(), mark_input));
+     } else if (j.is_array()) {
+         auto arr = mk_val<value_array>();
+         for (const auto & item : j) {
+--- a/common/parsers/cohere2moe.cpp
++++ b/common/parsers/cohere2moe.cpp
+@@ -70,12 +70,15 @@ common_chat_params common_chat_params_init_cohere2moe(
+     if (inputs.has_continuation()) {
+         const auto & msg = inputs.continue_msg;
+ 
+-        data.generation_prompt = GEN_PREFIX + THINK_START + msg.reasoning_content;
++        common_chat_prompt continuation;
++        continuation.append(GEN_PREFIX + THINK_START);
++        continuation.append(msg.reasoning_content, true);
+         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += THINK_END + TEXT_START + msg.render_content();
++            continuation.append(THINK_END + TEXT_START);
++            continuation.append(msg.render_content(), true);
+         }
+ 
+-        data.prompt.append(data.generation_prompt);
++        data.append_continuation(continuation);
+     }
+ 
+     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+--- a/common/parsers/deepseek.cpp
++++ b/common/parsers/deepseek.cpp
+@@ -121,19 +121,21 @@ common_chat_params common_chat_params_init_deepseek_v3
+     if (inputs.has_continuation()) {
+         const auto & msg = inputs.continue_msg;
+ 
++        common_chat_prompt continuation;
+         if (is_v4 && msg.reasoning_content.empty()) {
+-            data.generation_prompt = GEN_PROMPT + THINK_END;
+-            if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-                data.generation_prompt += msg.render_content();
+-            }
++            continuation.append(GEN_PROMPT + THINK_END);
+         } else {
+-            data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
+-            if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-                data.generation_prompt += THINK_END + msg.render_content();
++            continuation.append(GEN_PROMPT + THINK_START);
++            continuation.append(msg.reasoning_content, true);
++            if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
++                continuation.append(THINK_END);
+             }
+         }
++        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
++            continuation.append(msg.render_content(), true);
++        }
+ 
+-        data.prompt.append(data.generation_prompt);
++        data.append_continuation(continuation);
+     }
+ 
+     bool require_tools   = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+--- a/common/parsers/functionary-v3-2.cpp
++++ b/common/parsers/functionary-v3-2.cpp
+@@ -18,8 +18,10 @@ common_chat_params common_chat_params_init_functionary
+ 
+     if (inputs.has_continuation()) {
+         const auto & msg = inputs.continue_msg;
+-        data.generation_prompt = "<|start_header_id|>assistant<|end_header_id|>\n\n>>>all\n" + msg.render_content();
+-        data.prompt.append(data.generation_prompt);
++        common_chat_prompt continuation;
++        continuation.append("<|start_header_id|>assistant<|end_header_id|>\n\n>>>all\n");
++        continuation.append(msg.render_content(), true);
++        data.append_continuation(continuation);
+     }
+ 
+     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+--- a/common/parsers/gemma4.cpp
++++ b/common/parsers/gemma4.cpp
+@@ -410,13 +410,15 @@ common_chat_params common_chat_params_init_gemma4(cons
+     if (inputs.has_continuation()) {
+         const auto & msg = inputs.continue_msg;
+ 
+-        data.generation_prompt = string_ends_with(data.prompt.str(), "<turn|>\n") ? "<|turn>model\n" : "";
+-        data.generation_prompt += "<|channel>thought\n" + msg.reasoning_content;
++        common_chat_prompt continuation;
++        continuation.append(std::string(string_ends_with(data.prompt.str(), "<turn|>\n") ? "<|turn>model\n" : "") + "<|channel>thought\n");
++        continuation.append(msg.reasoning_content, true);
+         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += "<channel|>" + msg.render_content();
++            continuation.append("<channel|>");
++            continuation.append(msg.render_content(), true);
+         }
+ 
+-        data.prompt.append(data.generation_prompt);
++        data.append_continuation(continuation);
+     }
+ 
+     auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+--- a/common/parsers/gigachat-v3.cpp
++++ b/common/parsers/gigachat-v3.cpp
+@@ -18,8 +18,10 @@ common_chat_params common_chat_params_init_gigachat_v3
+ 
+     if (inputs.has_continuation()) {
+         const auto & msg = inputs.continue_msg;
+-        data.generation_prompt = "assistant<|role_sep|>\n" + msg.render_content();
+-        data.prompt.append(data.generation_prompt);
++        common_chat_prompt continuation;
++        continuation.append("assistant<|role_sep|>\n");
++        continuation.append(msg.render_content(), true);
++        data.append_continuation(continuation);
+     }
+ 
+     auto has_tools         = inputs.tools.is_array() && !inputs.tools.empty();
+--- a/common/parsers/gpt-oss.cpp
++++ b/common/parsers/gpt-oss.cpp
+@@ -54,12 +54,15 @@ common_chat_params common_chat_params_init_gpt_oss(con
+     if (inputs.has_continuation()) {
+         const auto & msg = inputs.continue_msg;
+ 
+-        data.generation_prompt = "<|start|>assistant<|channel|>analysis<|message|>" + msg.reasoning_content;
++        common_chat_prompt continuation;
++        continuation.append("<|start|>assistant<|channel|>analysis<|message|>");
++        continuation.append(msg.reasoning_content, true);
+         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += "<|end|><|start|>assistant<|channel|>final<|message|>" + msg.render_content();
++            continuation.append("<|end|><|start|>assistant<|channel|>final<|message|>");
++            continuation.append(msg.render_content(), true);
+         }
+ 
+-        data.prompt.append(data.generation_prompt);
++        data.append_continuation(continuation);
+     }
+ 
+     auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+--- a/common/parsers/kimi-k2.cpp
++++ b/common/parsers/kimi-k2.cpp
+@@ -41,12 +41,15 @@ common_chat_params common_chat_params_init_kimi_k2(con
+     if (inputs.has_continuation()) {
+         const auto & msg = inputs.continue_msg;
+ 
+-        data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
++        common_chat_prompt continuation;
++        continuation.append(GEN_PROMPT + THINK_START);
++        continuation.append(msg.reasoning_content, true);
+         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += THINK_END + msg.render_content();
++            continuation.append(THINK_END);
++            continuation.append(msg.render_content(), true);
+         }
+ 
+-        data.prompt.append(data.generation_prompt);
++        data.append_continuation(continuation);
+     }
+ 
+     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+--- a/common/parsers/kimi-k3.cpp
++++ b/common/parsers/kimi-k3.cpp
+@@ -59,12 +59,15 @@ common_chat_params common_chat_params_init_kimi_k3(con
+     if (inputs.has_continuation()) {
+         const auto & msg = inputs.continue_msg;
+ 
+-        data.generation_prompt = MSG_START + THINK_START + msg.reasoning_content;
++        common_chat_prompt continuation;
++        continuation.append(MSG_START + THINK_START);
++        continuation.append(msg.reasoning_content, true);
+         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += THINK_END + RESP_START + msg.render_content();
++            continuation.append(THINK_END + RESP_START);
++            continuation.append(msg.render_content(), true);
+         }
+ 
+-        data.prompt.append(data.generation_prompt);
++        data.append_continuation(continuation);
+     }
+ 
+     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+--- a/common/parsers/lfm2.cpp
++++ b/common/parsers/lfm2.cpp
+@@ -65,18 +65,20 @@ common_chat_params common_chat_params_init_lfm2(const 
+     if (inputs.has_continuation()) {
+         const auto & msg = inputs.continue_msg;
+ 
+-        data.generation_prompt = GEN_PROMPT;
++        common_chat_prompt continuation;
++        continuation.append(GEN_PROMPT);
+         if (supports_reasoning) {
+-            data.generation_prompt += THINK_START + msg.reasoning_content;
++            continuation.append(THINK_START);
++            continuation.append(msg.reasoning_content, true);
+             if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-                data.generation_prompt += THINK_END;
++                continuation.append(THINK_END);
+             }
+         }
+         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += msg.render_content();
++            continuation.append(msg.render_content(), true);
+         }
+ 
+-        data.prompt.append(data.generation_prompt);
++        data.append_continuation(continuation);
+     }
+ 
+     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+--- a/common/parsers/minicpm5.cpp
++++ b/common/parsers/minicpm5.cpp
+@@ -42,12 +42,15 @@ common_chat_params common_chat_params_init_minicpm5(co
+     if (inputs.has_continuation()) {
+         const auto & msg = inputs.continue_msg;
+ 
+-        data.generation_prompt = "<|im_start|>assistant\n<think>\n" + msg.reasoning_content;
++        common_chat_prompt continuation;
++        continuation.append("<|im_start|>assistant\n<think>\n");
++        continuation.append(msg.reasoning_content, true);
+         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += "\n</think>\n\n" + msg.render_content();
++            continuation.append("\n</think>\n\n");
++            continuation.append(msg.render_content(), true);
+         }
+ 
+-        data.prompt.append(data.generation_prompt);
++        data.append_continuation(continuation);
+     }
+ 
+     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+--- a/common/parsers/minimax-m3.cpp
++++ b/common/parsers/minimax-m3.cpp
+@@ -49,12 +49,15 @@ common_chat_params common_chat_params_init_minimax_m3(
+     if (inputs.has_continuation()) {
+         const auto & msg = inputs.continue_msg;
+ 
+-        data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
++        common_chat_prompt continuation;
++        continuation.append(GEN_PROMPT + THINK_START);
++        continuation.append(msg.reasoning_content, true);
+         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += THINK_END + msg.render_content();
++            continuation.append(THINK_END);
++            continuation.append(msg.render_content(), true);
+         }
+ 
+-        data.prompt.append(data.generation_prompt);
++        data.append_continuation(continuation);
+     }
+ 
+     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+--- a/common/parsers/ministral3.cpp
++++ b/common/parsers/ministral3.cpp
+@@ -65,12 +65,15 @@ common_chat_params common_chat_params_init_ministral_3
+     if (inputs.has_continuation()) {
+         const auto & msg = inputs.continue_msg;
+ 
+-        data.generation_prompt = "[THINK]" + msg.reasoning_content;
++        common_chat_prompt continuation;
++        continuation.append("[THINK]");
++        continuation.append(msg.reasoning_content, true);
+         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += "[/THINK]" + msg.render_content();
++            continuation.append("[/THINK]");
++            continuation.append(msg.render_content(), true);
+         }
+ 
+-        data.prompt.append(data.generation_prompt);
++        data.append_continuation(continuation);
+     }
+ 
+     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+--- a/common/parsers/muse-glimmer.cpp
++++ b/common/parsers/muse-glimmer.cpp
+@@ -53,12 +53,15 @@ common_chat_params common_chat_params_init_muse_glimme
+     if (inputs.has_continuation()) {
+         const auto & msg = inputs.continue_msg;
+ 
+-        data.generation_prompt = "<|start|>assistant to=self<|message|>" + msg.reasoning_content;
++        common_chat_prompt continuation;
++        continuation.append("<|start|>assistant to=self<|message|>");
++        continuation.append(msg.reasoning_content, true);
+         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += "<|eom|><|start|>assistant to=user<|message|>" + msg.render_content();
++            continuation.append("<|eom|><|start|>assistant to=user<|message|>");
++            continuation.append(msg.render_content(), true);
+         }
+ 
+-        data.prompt.append(data.generation_prompt);
++        data.append_continuation(continuation);
+     } else if (reasoning_disabled && !include_grammar) {
+         const std::string recipient = " to=user<|message|>";
+         data.generation_prompt += recipient;
+--- a/common/parsers/qwen3-coder.cpp
++++ b/common/parsers/qwen3-coder.cpp
+@@ -45,18 +45,20 @@ common_chat_params common_chat_params_init_qwen3_coder
+     if (inputs.has_continuation()) {
+         const auto & msg = inputs.continue_msg;
+ 
+-        data.generation_prompt = GEN_PREFIX;
++        common_chat_prompt continuation;
++        continuation.append(GEN_PREFIX);
+         if (supports_reasoning) {
+-            data.generation_prompt += "<think>\n" + msg.reasoning_content;
++            continuation.append("<think>\n");
++            continuation.append(msg.reasoning_content, true);
+             if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-                data.generation_prompt += "\n</think>\n\n";
++                continuation.append("\n</think>\n\n");
+             }
+         }
+         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+-            data.generation_prompt += msg.render_content();
++            continuation.append(msg.render_content(), true);
+         }
+ 
+-        data.prompt.append(data.generation_prompt);
++        data.append_continuation(continuation);
+     }
+ 
+     std::vector<std::string> tool_call_starts = { "<tool_call>" };

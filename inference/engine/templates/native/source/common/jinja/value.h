@@ -179,6 +179,9 @@ const func_builtins & global_builtins();
 
 std::string value_to_json(const value & val, int indent = -1, const std::string_view item_sep = ", ", const std::string_view key_sep = ": ");
 
+// whether any string in the value (an object's keys included) has an input part
+bool value_contains_input(const value & val);
+
 // Note: only used for debugging purposes
 std::string value_to_string_repr(const value & val);
 
@@ -410,7 +413,7 @@ struct value_array_t : public value_t {
             ss << ",";
         }
         ss << (immutable ? ")" : "]");
-        return ss.str();
+        return string(ss.str(), std::any_of(val_arr.begin(), val_arr.end(), value_contains_input));
     }
     virtual bool as_bool() const override {
         return !val_arr.empty();
@@ -515,7 +518,9 @@ struct value_object_t : public value_t {
             ss << value_to_string_repr(key) << ": " << value_to_string_repr(val);
         }
         ss << "}";
-        return ss.str();
+        return string(ss.str(), std::any_of(val_obj.begin(), val_obj.end(), [](const auto & pair) {
+            return value_contains_input(pair.first) || value_contains_input(pair.second);
+        }));
     }
     virtual bool as_bool() const override {
         return !unordered.empty();

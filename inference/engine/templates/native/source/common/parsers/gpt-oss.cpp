@@ -25,9 +25,7 @@ common_chat_params common_chat_params_init_gpt_oss(const common_chat_template & 
     if (inputs.is_inference && !inputs.add_generation_prompt) {
         static constexpr std::string_view return_token = "<|return|>";
         static constexpr std::string_view end_token    = "<|end|>";
-        if (size_t pos = prompt.rfind(return_token); pos != std::string::npos) {
-            prompt.replace(pos, return_token.length(), end_token);
-        }
+        prompt.replace_last(std::string(return_token), std::string(end_token));
     }
 
     data.prompt            = std::move(prompt);
@@ -56,12 +54,15 @@ common_chat_params common_chat_params_init_gpt_oss(const common_chat_template & 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
 
-        data.generation_prompt = "<|start|>assistant<|channel|>analysis<|message|>" + msg.reasoning_content;
+        common_chat_prompt continuation;
+        continuation.append("<|start|>assistant<|channel|>analysis<|message|>");
+        continuation.append(msg.reasoning_content, true);
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
-            data.generation_prompt += "<|end|><|start|>assistant<|channel|>final<|message|>" + msg.render_content();
+            continuation.append("<|end|><|start|>assistant<|channel|>final<|message|>");
+            continuation.append(msg.render_content(), true);
         }
 
-        data.prompt += data.generation_prompt;
+        data.append_continuation(continuation);
     }
 
     auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();

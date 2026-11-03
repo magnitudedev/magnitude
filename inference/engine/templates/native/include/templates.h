@@ -45,14 +45,18 @@ TEMPLATES_API int32_t templates_template_inspect(templates_handle handle,
     templates_buffer * output, templates_buffer * error);
 /* Raw authored rendering: no server message normalization or injected reasoning
  * controls. Payload: {version, context:{messages,...}, now:UTC_epoch_seconds}.
- * Context may not replace artifact special tokens. Output is UTF-8 prompt bytes. */
+ * Context may not replace artifact special tokens. Output is {version, prompt,
+ * controls}: controls are the ascending, disjoint [start, end) byte ranges of
+ * prompt its template authored; every other byte renders the context. */
 TEMPLATES_API int32_t templates_template_render(templates_handle handle,
     const uint8_t * json, uint64_t size, templates_buffer * output, templates_buffer * error);
 /* Prepared requests retain all parser/grammar data independently of the template.
  * Request payload includes messages, tools, tool_choice, parallel_tool_calls,
  * template_arguments, optional json_schema, and explicit now. enable_thinking is
  * true unless template_arguments sets it, and so is preserve_thinking for a
- * template whose source names that variable. */
+ * template whose source names that variable. A description's prompt carries
+ * controls as a raw rendering's does: every byte outside them renders request
+ * input. */
 TEMPLATES_API int32_t templates_request_create(templates_handle template_handle,
     const uint8_t * json, uint64_t size, templates_handle * output, templates_buffer * error);
 TEMPLATES_API int32_t templates_request_describe(templates_handle handle,

@@ -1,8 +1,10 @@
+use aho_corasick::{AhoCorasick, MatchKind};
 use magnitude_artifacts::UnsupportedReason;
 use magnitude_generation::TokenId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ops::Range;
 use tokenizers::{
     models::bpe::BPE,
     normalizers::{replace::Replace, unicode::NFC, NormalizerWrapper},
@@ -156,6 +158,10 @@ pub struct BpeConfig {
 
 pub struct ByteBpeTokenizer {
     encoders: [Tokenizer; 2],
+    /// The control pieces' spellings, matched leftmost-longest as the
+    /// recognizing encoder splits them, and their tokens.
+    controls: AhoCorasick,
+    control_tokens: Vec<TokenId>,
     pieces: Vec<Vec<u8>>,
     kinds: Vec<PieceKind>,
     implicit_bos: Option<TokenId>,
@@ -244,6 +250,18 @@ impl ByteBpeTokenizer {
             Ok(encoder)
         };
         let encoders = [make(true)?, make(false)?];
+        let (control_pieces, control_tokens): (Vec<&str>, Vec<TokenId>) = config
+            .pieces
+            .iter()
+            .zip(&config.kinds)
+            .enumerate()
+            .filter(|(_, (_, kind))| **kind == PieceKind::Control)
+            .map(|(id, (piece, _))| (piece.as_str(), TokenId(id as u32)))
+            .unzip();
+        let controls = AhoCorasick::builder()
+            .match_kind(MatchKind::LeftmostLongest)
+            .build(&control_pieces)
+            .map_err(|e| TokenizerError::Invalid(e.to_string()))?;
         let identity = Sha256::digest(
             serde_json::to_vec(&config).map_err(|e| TokenizerError::Invalid(e.to_string()))?,
         )
@@ -252,6 +270,8 @@ impl ByteBpeTokenizer {
         .collect();
         Ok(Self {
             encoders,
+            controls,
+            control_tokens,
             pieces,
             kinds: config.kinds,
             implicit_bos: config.implicit_bos,
@@ -409,51 +429,99 @@ impl ByteBpeTokenizer {
             .collect())
     }
 
+    /// Encode a text fragment whose template-authored byte ranges are
+    /// `controls` (ascending, disjoint, on character boundaries), with each
+    /// token's byte range of `text`: a control token is recognized only
+    /// wholly inside one of them, and every other byte is literal text. The text is split at the recognized control
+    /// tokens and nothing else, exactly as the recognizing encoder splits it,
+    /// so the tokens equal [`Self::encode`] with
+    /// [`SpecialTokens::Recognize`] whenever no control token's spelling
+    /// occurs outside `controls` (nor straddles one's edge). User-defined
+    /// pieces are recognized everywhere, as in both modes. No sequence-start
+    /// token is inserted.
+    pub fn encode_controlled_offsets(
+        &self,
+        text: &str,
+        controls: &[Range<usize>],
+    ) -> Result<Vec<(TokenId, Range<usize>)>, String> {
+        let mut end = 0;
+        for range in controls {
+            if range.start < end
+                || range.start > range.end
+                || !text.is_char_boundary(range.start)
+                || !text.is_char_boundary(range.end)
+            {
+                return Err("control ranges must be ascending, disjoint character ranges of the text".into());
+            }
+            end = range.end;
+        }
+        let mut tokens = Vec::new();
+        let mut literal = 0;
+        let push_literal = |tokens: &mut Vec<_>, range: Range<usize>| -> Result<(), String> {
+            let encoding = self.encoding(&text[range.clone()], SpecialTokens::Literal)?;
+            tokens.extend(encoding.get_ids().iter().zip(encoding.get_offsets()).map(
+                |(&id, &(start, end))| (TokenId(id), range.start + start..range.start + end),
+            ));
+            Ok(())
+        };
+        for range in controls {
+            for found in self.controls.find_iter(&text[range.clone()]) {
+                let start = range.start + found.start();
+                push_literal(&mut tokens, literal..start)?;
+                literal = range.start + found.end();
+                tokens.push((self.control_tokens[found.pattern().as_usize()], start..literal));
+            }
+        }
+        push_literal(&mut tokens, literal..text.len())?;
+        Ok(tokens)
+    }
+
     fn encoding(&self, text: &str, special: SpecialTokens) -> Result<Encoding, String> {
         let index = usize::from(special == SpecialTokens::Literal);
         self.encoders[index]
             .encode(text, false)
             .map_err(|e| e.to_string())
     }
-    /// Encode the complete text of a model input sequence, recognizing special
-    /// tokens. The implicit BOS is part of the sequence exactly once: a
-    /// sequence whose text already begins with it (a chat template that
-    /// renders the BOS text) is not given a second one.
-    pub fn encode_sequence(&self, text: &str) -> Result<EncodedSequence, String> {
-        let encoding = self.encoding(text, SpecialTokens::Recognize)?;
-        let mut tokens = encoding
-            .get_ids()
+    /// Encode the complete text of a model input sequence whose
+    /// template-authored byte ranges are `controls`, as
+    /// [`Self::encode_controlled_offsets`] encodes them. The implicit BOS is
+    /// part of the sequence exactly once: a sequence whose text already
+    /// begins with it (a chat template that renders the BOS text) is not
+    /// given a second one.
+    /// Every added token's end is reported.
+    pub fn encode_sequence_controlled(
+        &self,
+        text: &str,
+        controls: &[Range<usize>],
+    ) -> Result<EncodedSequence, String> {
+        let encoded = self.encode_controlled_offsets(text, controls)?;
+        let bos = self
+            .implicit_bos
+            .filter(|bos| encoded.first().map(|(token, _)| token) != Some(bos));
+        let inserted = usize::from(bos.is_some());
+        let added_token_ends = encoded
             .iter()
-            .map(|&id| TokenId(id))
-            .collect::<Vec<_>>();
-        let inserted = match self.implicit_bos {
-            Some(bos) if tokens.first() != Some(&bos) => {
-                tokens.insert(0, bos);
-                1
-            }
-            _ => 0,
-        };
-        let added_token_ends = encoding
-            .get_ids()
-            .iter()
-            .zip(encoding.get_offsets())
             .enumerate()
-            .filter(|(_, (&id, _))| {
+            .filter(|(_, (token, _))| {
                 matches!(
-                    self.kinds[id as usize],
+                    self.kinds[token.0 as usize],
                     PieceKind::Control | PieceKind::UserDefined
                 )
             })
-            .map(|(index, (_, &(_, end)))| AddedTokenEnd {
-                offset: end,
+            .map(|(index, (_, range))| AddedTokenEnd {
+                offset: range.end,
                 position: inserted + index + 1,
             })
             .collect();
         Ok(EncodedSequence {
-            tokens,
+            tokens: bos
+                .into_iter()
+                .chain(encoded.into_iter().map(|(token, _)| token))
+                .collect(),
             added_token_ends,
         })
     }
+
     pub fn piece(&self, token: TokenId, skip_control: bool) -> Result<&[u8], String> {
         let id = token.0 as usize;
         let piece = self

@@ -18,8 +18,10 @@ common_chat_params common_chat_params_init_gigachat_v3(
 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
-        data.generation_prompt = "assistant<|role_sep|>\n" + msg.render_content();
-        data.prompt += data.generation_prompt;
+        common_chat_prompt continuation;
+        continuation.append("assistant<|role_sep|>\n");
+        continuation.append(msg.render_content(), true);
+        data.append_continuation(continuation);
     }
 
     auto has_tools         = inputs.tools.is_array() && !inputs.tools.empty();

@@ -27,7 +27,8 @@ void caps_apply_preserve_reasoning(jinja::context & ctx, bool enabled) {
 }
 
 void caps_apply_reasoning_effort(jinja::context & ctx, const std::string & effort) {
-    value var = mk_val<value_string>(effort); // bind to the same value for stats
+    // the effort is request input; bind to the same value for stats
+    value var = mk_val<value_string>(string(effort, true));
     ctx.set_val("reasoning_effort",   var);
     ctx.set_val("reasoning_strength", var);
 }
