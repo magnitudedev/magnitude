@@ -96,44 +96,130 @@ fn sample_timestamps(device: &MetalDevice) -> TimestampPair {
     TimestampPair { gpu, host }
 }
 
-/// The GPU timestamp samples shared by the timed batches of one measurement:
-/// one sample index space over pages of [`PAGE_SAMPLES`] samples, each a
-/// Metal sample buffer of its largest size, added as reservations reach
-/// them and kept for later ones. Metal bounds how many sample buffers may
-/// exist, so timed batches take ranges of these pages instead of allocating
-/// their own. A launch's start and end samples are a pair at an even index,
-/// so a pair never straddles two pages.
+type Page = Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>;
+
+/// The process's GPU timestamp pages, shared by every timed batch: Metal
+/// sample buffers of [`PAGE_SAMPLES`] samples each. Metal bounds how many a
+/// process may hold (32 on an M4 Pro, macOS 15.7.9, whatever their size,
+/// another process's not counting: `tests/sample_buffers.rs`), and only this
+/// pool forms them, so it forms a page when a lease finds none free, until
+/// Metal first refuses one: the pages formed then are the process's
+/// allowance, and the pool's size. Each command buffer of a timed batch
+/// leases one page for its launches' start and end samples; when the
+/// command buffer completes, its completion handler resolves the page's
+/// ticks into host memory and frees the page. Timed work of any length
+/// therefore holds at most the pool.
 pub struct LaunchTimestamps {
-    device: MetalDevice,
-    pages: std::sync::Mutex<Vec<Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>>>,
-    /// First unreserved sample.
-    next: std::sync::Mutex<usize>,
+    /// The device whose command buffers sample the pages.
+    registry_id: u64,
+    /// The device's timestamp counter set, which every page samples.
+    counters: Retained<ProtocolObject<dyn MTLCounterSet>>,
+    pool: std::sync::Mutex<Pool>,
+    /// Signalled when a page is freed or a part's ticks are resolved.
+    changed: std::sync::Condvar,
 }
 
 /// Samples of one page: Metal's largest sample buffer, 32 KiB of 8-byte
-/// timestamps (even, so launch pairs never straddle a page).
+/// timestamps (even: a launch's pair lies in one page).
 const PAGE_SAMPLES: usize = 4_096;
+
+/// The pool, formed by the first timed work and kept for the process: its
+/// pages are the process's whole allowance.
+static PROCESS_POOL: std::sync::Mutex<Option<&'static LaunchTimestamps>> =
+    std::sync::Mutex::new(None);
+
+struct Pool {
+    free: Vec<Page>,
+    /// The pages formed: once `full`, the pool's size.
+    formed: usize,
+    /// Whether Metal refused a page: no more are formed.
+    full: bool,
+}
+
+/// A committed part's resolved ticks, set by its command buffer's
+/// completion handler: `None` when Metal did not resolve them.
+type PartTicks = std::sync::Arc<std::sync::OnceLock<Option<Vec<u64>>>>;
+
+/// The page leased by a timed batch's open command buffer and the samples
+/// its launches took. Dropped uncommitted (the batch failed or was
+/// abandoned), the page returns to the pool: nothing will run on it.
+struct Lease {
+    timestamps: &'static LaunchTimestamps,
+    /// Taken only when the command buffer commits.
+    page: Option<Page>,
+    samples: usize,
+}
+
+impl Lease {
+    fn full(&self) -> bool {
+        self.samples == PAGE_SAMPLES
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        if let Some(page) = self.page.take() {
+            self.timestamps.lock().free.push(page);
+            self.timestamps.changed.notify_all();
+        }
+    }
+}
 
 // The sample buffers are written by the device and resolved after completion.
 unsafe impl Send for LaunchTimestamps {}
 unsafe impl Sync for LaunchTimestamps {}
 
 impl LaunchTimestamps {
-    /// Timestamp samples for timed launches (two per launch), with their
-    /// first page formed: a device that cannot sample them fails here.
-    pub fn new(device: &MetalDevice) -> Result<Self, ExecutionError> {
-        let first = crate::pooled(|| Self::page(device))?;
-        Ok(Self {
-            device: device.clone(),
-            pages: std::sync::Mutex::new(vec![first]),
-            next: std::sync::Mutex::new(0),
-        })
+    /// The process's pool, formed on first use with its first page: a
+    /// device that cannot sample timestamps fails here, as does one whose
+    /// first page Metal refuses, and so does a second Metal device, since
+    /// the pages sample the first one's command buffers.
+    pub fn shared(device: &MetalDevice) -> Result<&'static Self, ExecutionError> {
+        let registry_id = device.handle().registry_id();
+        let mut shared = PROCESS_POOL
+            .lock()
+            .expect("process timestamp pool lock is never poisoned");
+        let pool = match *shared {
+            Some(pool) => pool,
+            None => {
+                let counters = crate::pooled(|| Self::counters(device))?;
+                let first = crate::pooled(|| Self::form(device, &counters)).map_err(|refusal| {
+                    ExecutionError::SubmissionFailed(format!(
+                        "Metal refused the process's first {PAGE_SAMPLES}-sample timestamp buffer: {refusal}"
+                    ))
+                })?;
+                let pool: &'static Self = Box::leak(Box::new(Self {
+                    registry_id,
+                    counters,
+                    pool: std::sync::Mutex::new(Pool {
+                        free: vec![first],
+                        formed: 1,
+                        full: false,
+                    }),
+                    changed: std::sync::Condvar::new(),
+                }));
+                *shared = Some(pool);
+                pool
+            }
+        };
+        if pool.registry_id != registry_id {
+            return Err(ExecutionError::SubmissionFailed(
+                "the process's Metal timestamp pages sample another device's work".into(),
+            ));
+        }
+        Ok(pool)
     }
 
-    fn page(
+    fn lock(&self) -> std::sync::MutexGuard<'_, Pool> {
+        self.pool
+            .lock()
+            .expect("timestamp pool lock is never poisoned")
+    }
+
+    /// The device's timestamp counter set, sampled at stage boundaries.
+    fn counters(
         device: &MetalDevice,
-    ) -> Result<Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>, ExecutionError> {
-        let samples = PAGE_SAMPLES;
+    ) -> Result<Retained<ProtocolObject<dyn MTLCounterSet>>, ExecutionError> {
         let failed = |detail: &str| ExecutionError::SubmissionFailed(detail.into());
         let raw = device.handle().raw();
         if !raw.supportsCounterSampling(MTLCounterSamplingPoint::AtStageBoundary) {
@@ -141,80 +227,137 @@ impl LaunchTimestamps {
                 "Metal device does not sample counters at stage boundaries",
             ));
         }
-        let timestamp_set = raw
-            .counterSets()
+        raw.counterSets()
             .and_then(|sets| {
                 // SAFETY: a static Metal string constant.
                 let wanted = unsafe { MTLCommonCounterSetTimestamp };
                 sets.iter().find(|set| &*set.name() == wanted)
             })
-            .ok_or_else(|| failed("Metal device has no timestamp counter set"))?;
+            .ok_or_else(|| failed("Metal device has no timestamp counter set"))
+    }
+
+    /// A new page, or Metal's refusal.
+    fn form(
+        device: &MetalDevice,
+        counters: &ProtocolObject<dyn MTLCounterSet>,
+    ) -> Result<Page, String> {
         let descriptor = MTLCounterSampleBufferDescriptor::new();
-        descriptor.setCounterSet(Some(&timestamp_set));
+        descriptor.setCounterSet(Some(counters));
         descriptor.setStorageMode(MTLStorageMode::Shared);
         // SAFETY: Metal validates the count when forming the buffer.
-        unsafe { descriptor.setSampleCount(samples) };
-        raw.newCounterSampleBufferWithDescriptor_error(&descriptor)
-            .map_err(|error| {
-                ExecutionError::SubmissionFailed(format!(
-                    "Metal refused a {samples}-sample timestamp buffer: {}",
-                    error.localizedDescription()
-                ))
-            })
+        unsafe { descriptor.setSampleCount(PAGE_SAMPLES) };
+        device
+            .handle()
+            .raw()
+            .newCounterSampleBufferWithDescriptor_error(&descriptor)
+            .map_err(|error| error.localizedDescription().to_string())
     }
 
-    /// Reserve `samples` consecutive samples, adding the pages they reach.
-    fn reserve(&self, samples: usize) -> Result<usize, ExecutionError> {
-        let mut next = self
-            .next
-            .lock()
-            .expect("timestamp cursor lock is never poisoned");
-        let first = *next;
-        let mut pages = self.pages.lock().expect("timestamp page lock is never poisoned");
-        while pages.len() * PAGE_SAMPLES < first + samples {
-            pages.push(crate::pooled(|| Self::page(&self.device))?);
+    /// A free page, or a new one until Metal refuses one. With neither,
+    /// the wait ends when a committed part's command buffer completes (its
+    /// completion handler frees its page) or a command buffer still being
+    /// encoded commits or drops its lease. The leasing batch holds no page
+    /// of its own uncommitted: a command buffer leases once, at its first
+    /// launch, so its batch's earlier pages are all committed and can
+    /// complete. When `blocked`, the count of the leasing batch's committed
+    /// parts waiting behind a host gate of its own not yet opened, is every
+    /// page formed, no page frees until a gate opens, which the encoding
+    /// thread waiting here never could ([`DirectBatch::wait_event`]): the
+    /// lease is refused.
+    fn lease(
+        &'static self,
+        device: &MetalDevice,
+        blocked: impl Fn() -> usize,
+    ) -> Result<Lease, ExecutionError> {
+        let mut pool = self.lock();
+        let page = loop {
+            if let Some(page) = pool.free.pop() {
+                break page;
+            }
+            if !pool.full {
+                match crate::pooled(|| Self::form(device, &self.counters)) {
+                    Ok(page) => {
+                        pool.formed += 1;
+                        break page;
+                    }
+                    // The refusal is the process's bound: the pages formed
+                    // so far are the pool.
+                    Err(_) => pool.full = true,
+                }
+                continue;
+            }
+            if blocked() == pool.formed {
+                return Err(ExecutionError::SubmissionFailed(format!(
+                    "timestamp pool exhausted: all {} pages are in flight behind a host gate \
+                     of this batch that is not yet open",
+                    pool.formed
+                )));
+            }
+            pool = self
+                .changed
+                .wait(pool)
+                .expect("timestamp pool lock is never poisoned");
+        };
+        Ok(Lease {
+            timestamps: self,
+            page: Some(page),
+            samples: 0,
+        })
+    }
+
+    /// `lease`'s command buffer is about to be committed: its completion
+    /// handler resolves the page's samples and frees the page. The ticks it
+    /// will resolve.
+    fn commit(
+        &'static self,
+        mut lease: Lease,
+        command: &ProtocolObject<dyn MTLCommandBuffer>,
+    ) -> PartTicks {
+        let ticks = PartTicks::default();
+        let page = lease.page.take().expect("a lease holds its page until committed");
+        let samples = lease.samples;
+        let resolved = ticks.clone();
+        let handler = block2::RcBlock::new(
+            move |_: std::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                // SAFETY: the range lies inside the page; the device wrote
+                // it before completing.
+                let values = crate::pooled(|| unsafe {
+                    page.resolveCounterRange(NSRange::new(0, samples))
+                        .map(|data| {
+                            data.to_vec()
+                                .chunks_exact(8)
+                                .map(|bytes| {
+                                    u64::from_le_bytes(bytes.try_into().expect("eight bytes"))
+                                })
+                                .collect()
+                        })
+                });
+                let mut pool = self.lock();
+                resolved
+                    .set(values)
+                    .expect("a command buffer completes once");
+                pool.free.push(page.clone());
+                drop(pool);
+                self.changed.notify_all();
+            },
+        );
+        // SAFETY: Metal copies the block, which owns everything it uses.
+        crate::pooled(|| unsafe { command.addCompletedHandler(block2::RcBlock::as_ptr(&handler)) });
+        ticks
+    }
+
+    /// A committed part's ticks, once its completion handler has resolved
+    /// them: the caller has seen the command buffer complete, and Metal runs
+    /// the handler on completion.
+    fn resolved<'a>(&self, ticks: &'a PartTicks) -> Option<&'a [u64]> {
+        let mut pool = self.lock();
+        while ticks.get().is_none() {
+            pool = self
+                .changed
+                .wait(pool)
+                .expect("timestamp pool lock is never poisoned");
         }
-        *next += samples;
-        Ok(first)
-    }
-
-    /// The page holding sample `index`, and the index within it.
-    fn locate(
-        &self,
-        index: usize,
-    ) -> (Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>, usize) {
-        let pages = self.pages.lock().expect("timestamp page lock is never poisoned");
-        (pages[index / PAGE_SAMPLES].clone(), index % PAGE_SAMPLES)
-    }
-
-    /// The resolved ticks of samples `first..first + count`, page by page.
-    fn resolve(&self, first: usize, count: usize) -> Option<Vec<u64>> {
-        let mut ticks = Vec::with_capacity(count);
-        let mut index = first;
-        while index < first + count {
-            let (page, offset) = self.locate(index);
-            let length = (PAGE_SAMPLES - offset).min(first + count - index);
-            // SAFETY: the range lies inside the page and the batch's reserved samples.
-            let data = crate::pooled(|| unsafe {
-                page.resolveCounterRange(NSRange::new(offset, length))
-            })?;
-            ticks.extend(
-                data.to_vec()
-                    .chunks_exact(8)
-                    .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("eight bytes"))),
-            );
-            index += length;
-        }
-        Some(ticks)
-    }
-
-    /// Release every range. Only valid once every timed batch that reserved
-    /// one has been resolved.
-    pub fn reset(&self) {
-        *self
-            .next
-            .lock()
-            .expect("timestamp cursor lock is never poisoned") = 0;
+        ticks.get().expect("resolved above").as_deref()
     }
 }
 
@@ -225,50 +368,83 @@ enum Encoding {
     /// launch opens the next encoder.
     Serial(Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>),
     /// Every launch in its own encoder, with the encoder's start and end
-    /// timestamps sampled at stage boundaries into its range of
-    /// `timestamps`. Encoders of one command buffer run in order over
-    /// tracked resources.
+    /// timestamps sampled at stage boundaries into the page its command
+    /// buffer leased from `timestamps`; each encoder runs after the one
+    /// before ([`ordered`]). A command buffer whose page is full is
+    /// committed and the next leases another.
     Timed {
-        timestamps: std::sync::Arc<LaunchTimestamps>,
-        /// First sample of this batch's range.
-        first: usize,
-        capacity: usize,
-        /// Per `encode` call, the launch's sample pair (absent when the
-        /// launch was empty and encoded nothing).
+        timestamps: &'static LaunchTimestamps,
+        /// The current command buffer's page, from its first launch.
+        lease: Option<Lease>,
+        /// The committed command buffers' ticks, in order: together the
+        /// sample pairs of the launches encoded before the current one's.
+        parts: Vec<PartTicks>,
+        /// The batch's host gates, in order.
+        gates: Vec<Gate>,
+        /// Per `encode` call, the launch's sample pair in the batch's order
+        /// (absent when the launch was empty and encoded nothing).
         launches: Vec<Option<usize>>,
         encoded: usize,
         calibration: TimestampPair,
     },
 }
 
+/// A host gate of a timed batch ([`DirectBatch::wait_event`]): the parts
+/// from `first_part` on run after it, so their pages free only once
+/// `event` reaches `value`.
+struct Gate {
+    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    value: u64,
+    first_part: usize,
+}
+
+/// The parts of `parts` that wait behind a gate of `gates` not yet open:
+/// those from the first such gate's on, uncompleted.
+fn blocked_parts(gates: &[Gate], parts: &[PartTicks]) -> usize {
+    gates
+        .iter()
+        .find(|gate| crate::pooled(|| gate.event.signaledValue()) < gate.value)
+        .map_or(0, |gate| {
+            parts[gate.first_part..]
+                .iter()
+                .filter(|ticks| ticks.get().is_none())
+                .count()
+        })
+}
+
+impl Encoding {
+    /// `command` is about to be committed: a timed batch's page goes in
+    /// flight with it.
+    fn committing(&mut self, command: &ProtocolObject<dyn MTLCommandBuffer>) {
+        if let Self::Timed {
+            timestamps,
+            lease,
+            parts,
+            ..
+        } = self
+        {
+            if let Some(lease) = lease.take() {
+                parts.push(timestamps.commit(lease, command));
+            }
+        }
+    }
+}
+
 /// Ordered direct launches encoded into command buffers: one, and one more
 /// after each host gate ([`DirectBatch::wait_event`]). The production form
 /// uses one serial compute encoder, which orders every launch after the
-/// previous one's writes.
+/// previous one's writes. A batch ends in [`DirectBatch::commit`], or in
+/// [`DirectBatch::abandon`] after a failure: either hands the caller every
+/// command buffer it committed, which run on the caller's storage, as a
+/// submission to fence.
 pub struct DirectBatch {
     device: MetalDevice,
     /// The command buffers committed before the current one, in order.
-    committed: Committed,
+    committed: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     /// Whether anything is encoded in `command`.
     used: bool,
     encoding: Encoding,
-}
-
-/// Command buffers a batch committed before its last. Dropped with them
-/// (the batch failed after committing some), it waits for them: they run on
-/// storage the caller regains.
-#[derive(Default)]
-struct Committed(Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>);
-
-impl Drop for Committed {
-    fn drop(&mut self) {
-        for command in &self.0 {
-            while !complete(command) {
-                std::thread::sleep(WAIT_POLL);
-            }
-        }
-    }
 }
 
 fn complete(command: &ProtocolObject<dyn MTLCommandBuffer>) -> bool {
@@ -346,7 +522,7 @@ impl DirectBatch {
         let encoder = serial_encoder(&command)?;
         Ok(Self {
             device: device.clone(),
-            committed: Committed::default(),
+            committed: Vec::new(),
             command,
             used: false,
             encoding: Encoding::Serial(Some(encoder)),
@@ -363,19 +539,40 @@ impl DirectBatch {
     /// 16 runs on a CPU-loaded M4 Pro, and none in 48 with a command buffer
     /// begun before each read (2026-10-24). A wait before anything is
     /// encoded begins the current command buffer.
+    ///
+    /// The gate's opener must not be the thread encoding the batch: work
+    /// behind the gate cannot complete before it opens. A timed batch whose
+    /// every timestamp page is in flight behind a gate of its own not yet
+    /// open fails [`Self::encode`] ("timestamp pool exhausted") rather than
+    /// wait for a page that cannot free.
     pub fn wait_event(&mut self, event: &SharedEvent, value: u64) -> Result<(), ExecutionError> {
         self.end_serial();
         if self.used {
-            // Formed before the commit: a failure commits nothing.
-            let next = command_buffer(&self.device)?;
-            let previous = std::mem::replace(&mut self.command, next);
-            crate::pooled(|| previous.commit());
-            self.committed.0.push(previous);
+            self.cut()?;
         }
         crate::pooled(|| {
             self.command
                 .encodeWaitForEvent_value(event.as_event(), value)
         });
+        if let Encoding::Timed { parts, gates, .. } = &mut self.encoding {
+            gates.push(Gate {
+                event: event.event.clone(),
+                value,
+                first_part: parts.len(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Commit the current command buffer and continue in a new one, which
+    /// the queue runs after it. Encoders end before this.
+    fn cut(&mut self) -> Result<(), ExecutionError> {
+        // Formed before the commit: a failure commits nothing.
+        let next = command_buffer(&self.device)?;
+        let previous = std::mem::replace(&mut self.command, next);
+        self.encoding.committing(&previous);
+        crate::pooled(|| previous.commit());
+        self.committed.push(previous);
         Ok(())
     }
 
@@ -400,25 +597,25 @@ impl DirectBatch {
         }
     }
 
-    /// A measurement batch of at most `launches` launches: each launch gets
-    /// its own encoder, whose GPU start and end are timestamped. Encoder
-    /// boundaries add device time, so a timed batch attributes time to
-    /// launches but does not measure the production step.
+    /// A measurement batch: each launch gets its own encoder, whose GPU
+    /// start and end are timestamped, and the batch commits a command
+    /// buffer each time one fills its page of samples. Encoder boundaries
+    /// add device time, so a timed batch attributes time to launches but
+    /// does not measure the production step.
     pub fn timed(
         device: &MetalDevice,
-        timestamps: &std::sync::Arc<LaunchTimestamps>,
-        launches: usize,
+        timestamps: &'static LaunchTimestamps,
     ) -> Result<Self, ExecutionError> {
-        let first = timestamps.reserve(2 * launches)?;
         Ok(Self {
             device: device.clone(),
-            committed: Committed::default(),
+            committed: Vec::new(),
             command: command_buffer(device)?,
             used: false,
             encoding: Encoding::Timed {
-                timestamps: timestamps.clone(),
-                first,
-                capacity: launches,
+                timestamps,
+                lease: None,
+                parts: Vec::new(),
+                gates: Vec::new(),
                 launches: Vec::new(),
                 encoded: 0,
                 calibration: sample_timestamps(device),
@@ -458,8 +655,17 @@ impl DirectBatch {
                 "native ABI words exceed Metal setBytes limit".into(),
             ));
         }
+        if let Encoding::Timed {
+            lease: Some(lease), ..
+        } = &self.encoding
+        {
+            if lease.full() {
+                self.cut()?;
+            }
+        }
         self.used = true;
         let command = &self.command;
+        let device = &self.device;
         match &mut self.encoding {
             Encoding::Serial(encoder) => {
                 let encoder = match encoder {
@@ -470,27 +676,28 @@ impl DirectBatch {
             }
             Encoding::Timed {
                 timestamps,
-                first,
-                capacity,
+                lease,
+                parts,
+                gates,
                 launches,
                 encoded,
                 ..
             } => {
-                if *encoded == *capacity {
-                    return Err(ExecutionError::SubmissionFailed(
-                        "timed Metal batch exceeds its declared launch count".into(),
-                    ));
-                }
-                let (page, offset) = timestamps.locate(*first + 2 * *encoded);
+                let lease = match lease {
+                    Some(lease) => lease,
+                    None => lease.insert(timestamps.lease(device, || blocked_parts(gates, parts))?),
+                };
+                let page = lease.page.as_ref().expect("a lease holds its page until committed");
+                let offset = lease.samples;
                 crate::pooled(|| {
                     let pass = MTLComputePassDescriptor::computePassDescriptor();
                     pass.setDispatchType(MTLDispatchType::Serial);
                     // SAFETY: index 0 always exists; the pair lies inside
-                    // one page of the batch's reserved range.
+                    // the leased page, which is not full.
                     unsafe {
                         let attachment =
                             pass.sampleBufferAttachments().objectAtIndexedSubscript(0);
-                        attachment.setSampleBuffer(Some(&page));
+                        attachment.setSampleBuffer(Some(page));
                         attachment.setStartOfEncoderSampleIndex(offset);
                         attachment.setEndOfEncoderSampleIndex(offset + 1);
                     }
@@ -505,6 +712,7 @@ impl DirectBatch {
                     encoder.endEncoding();
                     Ok(())
                 })?;
+                lease.samples += 2;
                 launches.push(Some(*encoded));
                 *encoded += 1;
             }
@@ -515,36 +723,43 @@ impl DirectBatch {
     /// Commit without waiting. The queue runs command buffers in commit
     /// order.
     pub fn commit(mut self) -> DirectSubmission {
+        self.end_serial();
+        self.encoding.committing(&self.command);
+        crate::pooled(|| self.command.commit());
         let timing = match self.encoding {
-            Encoding::Serial(encoder) => {
-                if let Some(encoder) = encoder {
-                    crate::pooled(|| encoder.endEncoding());
-                }
-                None
-            }
+            Encoding::Serial(_) => None,
             Encoding::Timed {
                 timestamps,
-                first,
+                parts,
                 launches,
-                encoded,
                 calibration,
                 ..
             } => Some(LaunchTiming {
                 timestamps,
-                first,
+                parts,
                 launches,
-                encoded,
                 calibration,
             }),
         };
-        crate::pooled(|| self.command.commit());
-        let mut commands = std::mem::take(&mut self.committed.0);
+        let mut commands = self.committed;
         commands.push(self.command);
         DirectSubmission {
             device: self.device,
             commands,
             timing,
         }
+    }
+
+    /// End a batch that failed: the current command buffer is dropped
+    /// uncommitted, and the command buffers committed before it, which run
+    /// on, form the returned submission (`None` when there are none).
+    pub fn abandon(mut self) -> Option<DirectSubmission> {
+        self.end_serial();
+        (!self.committed.is_empty()).then(|| DirectSubmission {
+            device: self.device,
+            commands: self.committed,
+            timing: None,
+        })
     }
 }
 
@@ -594,10 +809,9 @@ fn encode_launch(
 }
 
 struct LaunchTiming {
-    timestamps: std::sync::Arc<LaunchTimestamps>,
-    first: usize,
+    timestamps: &'static LaunchTimestamps,
+    parts: Vec<PartTicks>,
     launches: Vec<Option<usize>>,
-    encoded: usize,
     calibration: TimestampPair,
 }
 
@@ -680,14 +894,15 @@ impl DirectSubmission {
         if !self.is_complete() {
             return Err(failed("timed Metal batch is read before completion"));
         }
-        let samples = if timing.encoded == 0 {
-            Vec::new()
-        } else {
-            timing
-                .timestamps
-                .resolve(timing.first, 2 * timing.encoded)
-                .ok_or_else(|| failed("Metal did not resolve the timed batch's samples"))?
-        };
+        let mut samples = Vec::new();
+        for part in &timing.parts {
+            samples.extend_from_slice(
+                timing
+                    .timestamps
+                    .resolved(part)
+                    .ok_or_else(|| failed("Metal did not resolve the timed batch's samples"))?,
+            );
+        }
         // GPU ticks map linearly onto the host clock between the pair taken
         // when the batch was formed and one taken now.
         let early = timing.calibration;

@@ -104,9 +104,9 @@ enum Timeline {
     /// Device intervals are already host times (CPU, and Metal at
     /// submission detail).
     Host,
-    /// Metal at launch detail: the trace's shared timestamp samples.
+    /// Metal at launch detail: the process's timestamp page pool.
     #[cfg(target_os = "macos")]
-    Metal(Arc<seismic_metal::LaunchTimestamps>),
+    Metal(&'static seismic_metal::LaunchTimestamps),
     Cuda(seismic_cuda::direct::TimelineAnchor),
     #[cfg(not(target_os = "macos"))]
     Vulkan(seismic_vulkan::direct::TimelineAnchor),
@@ -123,12 +123,12 @@ impl TraceSink {
         self.detail
     }
 
-    /// The timestamp samples of a Metal launch-detail trace.
+    /// The timestamp pages of a Metal launch-detail trace.
     #[cfg(target_os = "macos")]
-    pub(super) fn metal_timestamps(&self) -> &Arc<seismic_metal::LaunchTimestamps> {
-        match &self.timeline {
+    pub(super) fn metal_timestamps(&self) -> &'static seismic_metal::LaunchTimestamps {
+        match self.timeline {
             Timeline::Metal(timestamps) => timestamps,
-            _ => unreachable!("a Metal launch-detail trace always holds timestamp samples"),
+            _ => unreachable!("a Metal launch-detail trace always holds timestamp pages"),
         }
     }
 
@@ -171,10 +171,10 @@ impl SubmissionTrace {
             ),
             #[cfg(target_os = "macos")]
             OpenedKind::Metal(opened) if detail == TraceDetail::Launches => {
-                Timeline::Metal(Arc::new(
-                    seismic_metal::LaunchTimestamps::new(opened.service())
+                Timeline::Metal(
+                    seismic_metal::LaunchTimestamps::shared(opened.service())
                         .map_err(TraceError::Execution)?,
-                ))
+                )
             }
             _ => Timeline::Host,
         };
@@ -198,9 +198,7 @@ impl SubmissionTrace {
     }
 
     /// Wait for every submission recorded so far and return them in
-    /// submission order, leaving the trace active and empty. Launch-detail
-    /// traces reuse their timestamp samples afterwards, so no submission on
-    /// the device may be in flight outside the trace (single-submitter use).
+    /// submission order, leaving the trace active and empty.
     pub fn collect(&self) -> Result<Vec<TracedSubmission>, TraceError> {
         let pending = std::mem::take(
             &mut *self
@@ -209,15 +207,10 @@ impl SubmissionTrace {
                 .lock()
                 .expect("trace sink lock is never poisoned"),
         );
-        let resolved = pending
+        pending
             .into_iter()
             .map(|pending| self.resolve(pending))
-            .collect();
-        #[cfg(target_os = "macos")]
-        if let Timeline::Metal(timestamps) = &self.sink.timeline {
-            timestamps.reset();
-        }
-        resolved
+            .collect()
     }
 
     fn resolve(&self, pending: Pending) -> Result<TracedSubmission, TraceError> {

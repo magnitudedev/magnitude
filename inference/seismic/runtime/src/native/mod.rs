@@ -2516,7 +2516,20 @@ pub(crate) fn submit(
         .as_deref()
         .filter(|sink| sink.detail() == trace::TraceDetail::Launches)
         .map(|sink| (sink, labels.as_ref().map_or(0, Vec::len)));
-    let route = Arc::new(encode(first, list, repetitions, timed, &retained)?);
+    let route = match encode(first, list, repetitions, timed, &retained) {
+        Ok(route) => Arc::new(route),
+        Err(EncodeFailure { error, committed }) => {
+            // Work committed before the failure runs on: later host access
+            // and the storage's release order after it, as after a submission.
+            if let Some(committed) = committed {
+                let completion: Arc<dyn DeviceCompletion> = Arc::new(committed);
+                for (allocation, write) in access {
+                    allocation.record_device_use(completion.clone(), *write);
+                }
+            }
+            return Err(error);
+        }
+    };
     if let (Some(sink), Some(labels)) = (trace, labels) {
         sink.record(route.clone(), labels, encode_start, trace::host_seconds());
     }
@@ -2572,7 +2585,7 @@ fn encode(
     repetitions: usize,
     timed: Option<(&trace::TraceSink, usize)>,
     retained: &Arc<dyn std::any::Any + Send + Sync>,
-) -> Result<RouteSubmission, CallError> {
+) -> Result<RouteSubmission, EncodeFailure> {
     #[cfg(target_os = "macos")]
     let mut buffers = Vec::new();
     match &first.route {
@@ -2585,14 +2598,13 @@ fn encode(
             type Metal = seismic_metal::Metal;
             type Executor = seismic_metal::MetalExecutor;
             let mut batch = match timed {
-                Some((sink, launches)) => seismic_metal::DirectBatch::timed(
-                    opened.service(),
-                    sink.metal_timestamps(),
-                    launches,
-                ),
+                Some((sink, _)) => {
+                    seismic_metal::DirectBatch::timed(opened.service(), sink.metal_timestamps())
+                }
                 None => seismic_metal::DirectBatch::new(opened.service()),
             }
-            .map_err(CallError::Execution)?;
+            .map_err(CallError::Execution)
+            .map_err(EncodeFailure::uncommitted)?;
             let mut typed = Vec::new();
             let timelines = |batch: &mut seismic_metal::DirectBatch, boundary: usize| {
                 for operation in list.timelines(boundary) {
@@ -2610,52 +2622,61 @@ fn encode(
                 }
                 Ok::<(), CallError>(())
             };
-            for _ in 0..repetitions {
-                for index in 0..list.count() {
-                    timelines(&mut batch, index)?;
-                    buffers.clear();
-                    let dispatch = list.dispatch(index, &mut buffers);
-                    let NativeRoute::Metal {
-                        launches: pipelines,
-                        ..
-                    } = &dispatch.kernel.route
-                    else {
-                        unreachable!("one device has one native route");
-                    };
-                    typed.clear();
-                    typed.extend(buffers.iter().map(|(allocation, offset)| {
-                        (typed_buffer::<Metal, Executor>(allocation), *offset)
-                    }));
-                    let scalars = dispatch
-                        .kernel
-                        .scalar_slots()
-                        .map(|slots| (typed_buffer::<Metal, Executor>(slots), 0));
-                    for ordinal in dispatch
-                        .kernel
-                        .implementation
-                        .dispatch_order(dispatch.rounds)
-                    {
-                        let Some(launch) = &dispatch.launches[ordinal] else {
-                            batch.skip();
-                            continue;
+            let mut encode_all = |batch: &mut seismic_metal::DirectBatch| {
+                for _ in 0..repetitions {
+                    for index in 0..list.count() {
+                        timelines(batch, index)?;
+                        buffers.clear();
+                        let dispatch = list.dispatch(index, &mut buffers);
+                        let NativeRoute::Metal {
+                            launches: pipelines,
+                            ..
+                        } = &dispatch.kernel.route
+                        else {
+                            unreachable!("one device has one native route");
                         };
-                        let pipeline = pipelines.pipeline(ordinal);
-                        batch
-                            .encode(&seismic_metal::DirectLaunch {
-                                pipeline,
-                                buffers: &typed,
-                                words: dispatch.word_bytes,
-                                scalar_results: scalars,
-                                threadgroups: launch.groups,
-                                threads_per_threadgroup: launch.threads,
-                                threadgroup_bytes: launch.shared_bytes,
-                            })
-                            .map_err(CallError::Execution)?;
+                        typed.clear();
+                        typed.extend(buffers.iter().map(|(allocation, offset)| {
+                            (typed_buffer::<Metal, Executor>(allocation), *offset)
+                        }));
+                        let scalars = dispatch
+                            .kernel
+                            .scalar_slots()
+                            .map(|slots| (typed_buffer::<Metal, Executor>(slots), 0));
+                        for ordinal in dispatch
+                            .kernel
+                            .implementation
+                            .dispatch_order(dispatch.rounds)
+                        {
+                            let Some(launch) = &dispatch.launches[ordinal] else {
+                                batch.skip();
+                                continue;
+                            };
+                            let pipeline = pipelines.pipeline(ordinal);
+                            batch
+                                .encode(&seismic_metal::DirectLaunch {
+                                    pipeline,
+                                    buffers: &typed,
+                                    words: dispatch.word_bytes,
+                                    scalar_results: scalars,
+                                    threadgroups: launch.groups,
+                                    threads_per_threadgroup: launch.threads,
+                                    threadgroup_bytes: launch.shared_bytes,
+                                })
+                                .map_err(CallError::Execution)?;
+                        }
                     }
+                    timelines(batch, list.count())?;
                 }
-                timelines(&mut batch, list.count())?;
+                Ok::<(), CallError>(())
+            };
+            match encode_all(&mut batch) {
+                Ok(()) => Ok(RouteSubmission::Metal(batch.commit())),
+                Err(error) => Err(EncodeFailure {
+                    error,
+                    committed: batch.abandon().map(RouteSubmission::Metal),
+                }),
             }
-            Ok(RouteSubmission::Metal(batch.commit()))
         }
         NativeRoute::Cuda { opened, .. } => cuda::encode(
             opened.service(),
@@ -2664,7 +2685,8 @@ fn encode(
             repetitions,
             timed.is_some(),
             retained,
-        ),
+        )
+        .map_err(EncodeFailure::uncommitted),
         #[cfg(not(target_os = "macos"))]
         NativeRoute::Vulkan { opened, .. } => vulkan::encode(
             opened.service(),
@@ -2673,7 +2695,25 @@ fn encode(
             repetitions,
             timed.map(|(_, launches)| launches),
             retained,
-        ),
+        )
+        .map_err(EncodeFailure::uncommitted),
+    }
+}
+
+/// Encoding failed: the error, and the device work committed before it,
+/// which runs on the storage the work touches.
+struct EncodeFailure {
+    error: CallError,
+    committed: Option<RouteSubmission>,
+}
+
+impl EncodeFailure {
+    /// A failure before any device work was committed.
+    fn uncommitted(error: CallError) -> Self {
+        Self {
+            error,
+            committed: None,
+        }
     }
 }
 
