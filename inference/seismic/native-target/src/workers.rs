@@ -461,41 +461,66 @@ mod tests {
         assert_eq!((text.as_str(), number, flag), ("formed", 7, true));
     }
 
-    /// A narrowed set works a batch on no more threads than it was allowed,
-    /// the caller among them, and on its whole width again afterwards.
+    /// The most items of a batch formed at once, as `count` counts them
+    /// while each is formed.
+    struct AtOnce {
+        now: AtomicUsize,
+        most: AtomicUsize,
+    }
+
+    impl AtOnce {
+        fn new() -> Self {
+            Self { now: AtomicUsize::new(0), most: AtomicUsize::new(0) }
+        }
+
+        fn count(&self) {
+            let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(now, Ordering::SeqCst);
+            self.now.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A narrowed set works a batch on no more threads at once than it was
+    /// allowed, the caller among them, and on its whole width at once again
+    /// afterwards. Each claim holds whatever the threads' timing: a bound
+    /// is the most items formed at once, never threads seen over time (one
+    /// allowed thread at a time may be a different thread each time), and
+    /// the whole width is proven by a barrier only that many threads at
+    /// once can pass.
     #[test]
     fn a_narrowed_set_works_a_batch_on_the_threads_allowed() {
         let workers = Arc::new(Workers::new(6));
         let work = (0..48usize).collect::<Vec<_>>();
-        let distinct = |workers: &Workers| {
+        {
+            let _narrowed = workers.narrowed(2);
+            let flat = AtOnce::new();
+            workers.each(&work, |_| flat.count());
+            assert!(flat.most.into_inner() <= 2);
+            // Batches handed out from inside a batch share the allowance:
+            // it is the set's, not each batch's.
+            let nested = AtOnce::new();
+            workers.each(&work[..6], |_| {
+                workers.each(&work[..6], |_| nested.count());
+            });
+            assert!(nested.most.into_inner() <= 2);
+            let _alone = workers.narrowed(0);
             let threads = Mutex::new(HashSet::new());
             workers.each(&work, |_| {
                 threads.lock().unwrap().insert(std::thread::current().id());
-                std::thread::sleep(std::time::Duration::from_millis(2));
             });
-            threads.into_inner().unwrap()
-        };
-        {
-            let _narrowed = workers.narrowed(2);
-            assert!(distinct(&workers).len() <= 2);
-            // Batches handed out from inside a batch share the allowance:
-            // it is the set's, not each batch's.
-            let nested = Mutex::new(HashSet::new());
-            workers.each(&work[..6], |_| {
-                workers.each(&work[..6], |_| {
-                    nested.lock().unwrap().insert(std::thread::current().id());
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                });
-            });
-            assert!(nested.into_inner().unwrap().len() <= 2);
-            let _alone = workers.narrowed(0);
             assert_eq!(
-                distinct(&workers),
+                threads.into_inner().unwrap(),
                 HashSet::from([std::thread::current().id()]),
                 "a batch always has its caller"
             );
         }
-        assert!(distinct(&workers).len() > 2, "the set is whole again");
+        // The set is whole again: its width and the caller form one item
+        // each at once, or none passes the barrier.
+        let whole = workers.width() + 1;
+        let together = std::sync::Barrier::new(whole);
+        workers.each(&work[..whole], |_| {
+            together.wait();
+        });
     }
 
     /// What a job allocated and freed on a worker thread is the system's

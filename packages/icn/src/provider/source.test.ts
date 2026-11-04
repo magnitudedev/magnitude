@@ -302,7 +302,7 @@ describe("ICN local provider", () => {
 
     expect(first).toEqual(Option.some({
       _tag: "preparation_update",
-      preparation: { phase: "model_loading", stage: "loading_weights", fraction: 0.25 },
+      preparation: { phase: "model_loading", stage: "loading_weights", fraction: 0.25, details: Option.none() },
       requestId: "request-1",
     }))
   })

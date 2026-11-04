@@ -611,39 +611,47 @@ fn ready_target_can_abort_then_reconcile() {
 /// A launch is charged the host work since the flight before it finished
 /// when that flight carried its request: a round's host time is part of its
 /// cost. Time the owner spent idle, or a flight of other requests, is
-/// charged to no launch.
+/// charged to no launch. Where the service starts is an order, so each
+/// charge is bounded by instants the test takes around it, whatever the
+/// machine's load: one charged from the turn before it spans the gap the
+/// test slept there, and one charged from its submission fits within its
+/// own step, which excludes that gap.
 #[test]
 fn a_launch_is_charged_its_requests_host_turn_but_not_idle_time() {
     let Some((mut domain, mut bindings)) = fixture(None) else {
         return;
     };
-    let gap = std::time::Duration::from_millis(60);
+    let gap = std::time::Duration::from_millis(20);
     let (first, second) = (RequestId(70), RequestId(71));
     open(&mut domain, &mut bindings, first);
     open(&mut domain, &mut bindings, second);
+    // A step's charge, and the time from just before its submission to
+    // just after its finish.
     let step = |domain: &mut ExecutorDomain<TestFamily>,
                 bindings: StateBindings<TestFamily>,
                 request: RequestId,
                 position: usize| {
+        let before = std::time::Instant::now();
         let flight = submit_reserved_target(domain, bindings, vec![forward(request, position)]);
         let (pending, bindings) = finish_one(domain, flight);
+        let within = before.elapsed();
         let duration = pending.physical_duration();
         domain
             .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
             .unwrap();
-        (duration, bindings)
+        (duration, within, bindings)
     };
-    let (_, bindings) = step(&mut domain, bindings, first, 0);
+    let (_, _, bindings) = step(&mut domain, bindings, first, 0);
     std::thread::sleep(gap);
-    let (charged, bindings) = step(&mut domain, bindings, first, 1);
+    let (charged, _, bindings) = step(&mut domain, bindings, first, 1);
     assert!(charged >= gap, "the host turn of its own request: {charged:?}");
     std::thread::sleep(gap);
-    let (other, bindings) = step(&mut domain, bindings, second, 0);
-    assert!(other < gap, "another request's turn: {other:?}");
+    let (other, within, bindings) = step(&mut domain, bindings, second, 0);
+    assert!(other <= within, "another request's turn: {other:?}, its step {within:?}");
     std::thread::sleep(gap);
     domain.host_idle();
-    let (idle, _) = step(&mut domain, bindings, second, 1);
-    assert!(idle < gap, "after the owner idled: {idle:?}");
+    let (idle, within, _) = step(&mut domain, bindings, second, 1);
+    assert!(idle <= within, "after the owner idled: {idle:?}, its step {within:?}");
 }
 
 /// A request that stops continuing its queued step discards it, and waiting

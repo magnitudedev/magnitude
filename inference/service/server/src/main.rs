@@ -74,7 +74,7 @@ enum Command {
         /// Magnitude-owned root for all disposable derived cache data, including formed kernels.
         #[arg(long)]
         cache_root: Option<PathBuf>,
-        /// JSON local-models configuration (roots, declarations, hidden models, drafters) in
+        /// JSON local-models configuration (roots, added models, hidden models, drafters) in
         /// effect before the first scan; the owner replaces it at runtime.
         #[arg(long)]
         local_models_config: Option<PathBuf>,
@@ -433,7 +433,7 @@ mod tests {
             &path,
             serde_json::json!({
                 "roots": [{ "kind": "Ollama", "path": "/home/u/.ollama/models", "enabled": true }],
-                "declarations": [],
+                "added": [],
                 "hidden": [],
                 "drafters": []
             })

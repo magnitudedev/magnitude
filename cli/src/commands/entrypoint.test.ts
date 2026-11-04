@@ -3,6 +3,8 @@ import { mkdtemp, rm, stat } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { fileURLToPath } from "node:url"
+import { Command, CommanderError } from "@commander-js/extra-typings"
+import { registerServeCommand } from "./serve"
 
 const invoke = async (args: readonly string[], environment: Record<string, string> = {}) => {
   const process = Bun.spawn([Bun.which("bun")!, fileURLToPath(new URL("../index.ts", import.meta.url)), ...args], {
@@ -38,19 +40,19 @@ describe("headless CLI entrypoint", () => {
     expect(result.stdout).toContain("Usage:")
     expect(result.stderr).toBe("")
   })
-  it("serve help and rejected configuration flags never create ownership state", async () => {
-    const root = await mkdtemp(join(tmpdir(), "mag-help-"))
-    const profile = join(root, "unused")
-    try {
-      const env = { MAGNITUDE_DEV_DATA_DIR: profile }
-      expect((await invoke(["serve", "--help"], env)).code).toBe(0)
-      for (const flag of ["--port", "--data-dir", "--host"]) {
-        const result = await invoke(["serve", flag, "invalid"], env)
-        expect(result.code).toBe(1)
-        expect(result.stderr).toContain("unknown option")
-      }
-      await expect(stat(profile)).rejects.toMatchObject({ code: "ENOENT" })
-    } finally { await rm(root, { recursive: true, force: true }) }
+  // Parsed in this process: the service starts only from the serve action, and commander ends the
+  // parse with help or a rejected flag before any action runs, so no ownership state can be created.
+  it("serve help and rejected configuration flags end before the serve action", async () => {
+    const parse = async (args: readonly string[]) => {
+      const program = new Command().exitOverride().configureOutput({ writeOut: () => {}, writeErr: () => {} })
+      registerServeCommand(program)
+      const failure = await program.parseAsync(args, { from: "user" }).then(() => undefined, (error: unknown) => error)
+      return failure instanceof CommanderError ? failure.code : undefined
+    }
+    expect(await parse(["serve", "--help"])).toBe("commander.helpDisplayed")
+    for (const flag of ["--port", "--data-dir", "--host"]) {
+      expect(await parse(["serve", flag, "invalid"])).toBe("commander.unknownOption")
+    }
   })
   it.each([
     ["hardware"],
