@@ -46,6 +46,8 @@ harness = false
 [dev-dependencies]
 magnitude-family-common = { path = "families/common", features = ["catalog-headers"] }
 flate2.workspace = true
+# The recorded machines (`seismic::fixtures::recorded`), to assess on.
+seismic = { workspace = true, features = ["fixtures"] }
 tempfile = "3.24.0"
 
 [build-dependencies]

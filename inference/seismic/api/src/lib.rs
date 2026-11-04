@@ -3575,21 +3575,27 @@ pub mod generated {
     /// inspect or construct the compiler artifact it owns.
     pub struct Module {
         checked: seismic_lang::checked::CheckedModule,
-        /// A checked entry's semantics depend only on its entry identity and
-        /// element bindings. Graph metadata asks for many port shapes under
-        /// the same binding, so every immutable monomorphization the process
-        /// forms is retained instead of rebuilt per port and node: the set is
-        /// the bindings the process's models use (about 260 for the whole
-        /// catalog, some 45 MB), and assessing models in parallel touches
-        /// many of them at once.
-        logical_entries: std::sync::Mutex<Vec<LogicalEntryCacheItem>>,
+        /// The contract of every entry and element binding graph metadata
+        /// has bound in this process (`EntryContract`), each formed once:
+        /// graphs bind the same few over and over, and forming one per graph
+        /// makes assessment many times slower. After assessing every
+        /// assessment fixture on Metal, these and their evaluated shapes
+        /// are at most 42 MB of what the process holds beyond the decoded
+        /// module (3 MB of it evaluated shapes), and assessing them all
+        /// again adds nothing.
+        entry_contracts: std::sync::Mutex<Vec<EntryContract>>,
     }
 
-    struct LogicalEntryCacheItem {
+    /// What graph metadata reads of one checked entry at one element
+    /// binding: its call schema and its compiled tensor shapes. The
+    /// monomorphized entry they are derived from (`LogicalEntry`, its
+    /// arena and semantic program) is formed to derive them and dropped:
+    /// nothing else of it is read, and it is most of its size.
+    struct EntryContract {
         entry: seismic_lang::ids::EntryId,
         bindings: seismic_lang::entry::ElementBindings,
-        logical: Arc<seismic_lang::entry::LogicalEntry>,
-        compiled_shapes: Arc<OnceLock<Arc<seismic_lang::entry::CompiledEntryShapes>>>,
+        schema: Arc<seismic_lang::entry::CallSchema>,
+        shapes: Arc<seismic_lang::entry::CompiledEntryShapes>,
     }
 
     /// The compiled shapes every module of the process retains in its
@@ -3648,7 +3654,7 @@ pub mod generated {
         fn new(checked: seismic_lang::checked::CheckedModule) -> Self {
             Self {
                 checked,
-                logical_entries: std::sync::Mutex::new(Vec::new()),
+                entry_contracts: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -3660,87 +3666,65 @@ pub mod generated {
             self.checked.entry_named(name).map(EntryToken)
         }
 
-        fn logical_entry(
+        /// The call schema and compiled tensor shapes of `entry` at
+        /// `bindings` (`EntryContract`), formed on first use.
+        fn entry_contract(
             &self,
             entry: seismic_lang::ids::EntryId,
             bindings: &seismic_lang::entry::ElementBindings,
-        ) -> Result<Arc<seismic_lang::entry::LogicalEntry>, seismic_lang::checked::SourceError>
-        {
-            if let Some(logical) = self
-                .logical_entries
-                .lock()
-                .expect("checked-entry cache mutex poisoned")
-                .iter()
-                .find(|item| item.entry == entry && item.bindings == *bindings)
-                .map(|item| item.logical.clone())
-            {
-                return Ok(logical);
+        ) -> Result<
+            (
+                Arc<seismic_lang::entry::CallSchema>,
+                Arc<seismic_lang::entry::CompiledEntryShapes>,
+            ),
+            seismic_lang::checked::SourceError,
+        > {
+            let held = |contracts: &[EntryContract]| {
+                contracts
+                    .iter()
+                    .find(|contract| contract.entry == entry && contract.bindings == *bindings)
+                    .map(|contract| (contract.schema.clone(), contract.shapes.clone()))
+            };
+            if let Some(contract) = held(
+                &self
+                    .entry_contracts
+                    .lock()
+                    .expect("entry contract mutex poisoned"),
+            ) {
+                return Ok(contract);
             }
-            let logical = Arc::new(self.checked.entry(entry, bindings)?);
-            let mut cache = self
-                .logical_entries
+            let logical = self.checked.entry(entry, bindings)?;
+            let schema = logical.shared_schema();
+            let shapes = Arc::new(logical.compile_tensor_shapes());
+            drop(logical);
+            let mut contracts = self
+                .entry_contracts
                 .lock()
-                .expect("checked-entry cache mutex poisoned");
-            if let Some(item) = cache
-                .iter()
-                .find(|item| item.entry == entry && item.bindings == *bindings)
-            {
-                return Ok(item.logical.clone());
+                .expect("entry contract mutex poisoned");
+            if let Some(contract) = held(&contracts) {
+                return Ok(contract);
             }
-            cache.push(LogicalEntryCacheItem {
+            RETAINED_ENTRY_SHAPES
+                .lock()
+                .expect("retained entry shapes poisoned")
+                .push(Arc::downgrade(&shapes));
+            contracts.push(EntryContract {
                 entry,
                 bindings: bindings.clone(),
-                logical: logical.clone(),
-                compiled_shapes: Arc::new(OnceLock::new()),
+                schema: schema.clone(),
+                shapes: shapes.clone(),
             });
-            Ok(logical)
-        }
-
-        fn compiled_entry_shapes(
-            &self,
-            entry: seismic_lang::ids::EntryId,
-            bindings: &seismic_lang::entry::ElementBindings,
-        ) -> Result<Arc<seismic_lang::entry::CompiledEntryShapes>, seismic_lang::checked::SourceError>
-        {
-            let logical = self.logical_entry(entry, bindings)?;
-            let cell = self
-                .logical_entries
-                .lock()
-                .expect("checked-entry cache mutex poisoned")
-                .iter()
-                .find(|item| item.entry == entry && item.bindings == *bindings)
-                .map(|item| item.compiled_shapes.clone());
-            Ok(match cell {
-                Some(cell) => cell
-                    .get_or_init(|| {
-                        let shapes = Arc::new(logical.compile_tensor_shapes());
-                        RETAINED_ENTRY_SHAPES
-                            .lock()
-                            .expect("retained entry shapes poisoned")
-                            .push(Arc::downgrade(&shapes));
-                        shapes
-                    })
-                    .clone(),
-                None => Arc::new(logical.compile_tensor_shapes()),
-            })
-        }
-
-        #[cfg(test)]
-        fn cached_logical_entries(&self) -> usize {
-            self.logical_entries
-                .lock()
-                .expect("checked-entry cache mutex poisoned")
-                .len()
+            Ok((schema, shapes))
         }
     }
 
     #[cfg(test)]
-    mod logical_entry_cache_tests {
+    mod entry_contract_tests {
         use super::*;
         use seismic_lang::checked::{check_source, SourceFile, SourceSet};
 
         #[test]
-        fn reuses_one_semantic_entry_per_element_binding() {
+        fn forms_one_contract_per_element_binding() {
             let source = SourceSet::new(vec![SourceFile {
                 path: "cache.seismic".into(),
                 text:
@@ -3751,10 +3735,11 @@ pub mod generated {
             let entry = module.entry_named("copy").unwrap().id();
             let f32_binding =
                 seismic_lang::entry::ElementBindings::new().bind("A", Element::f32().id());
-            let first = module.logical_entry(entry, &f32_binding).unwrap();
-            let again = module.logical_entry(entry, &f32_binding).unwrap();
-            assert!(Arc::ptr_eq(&first, &again));
-            assert_eq!(module.cached_logical_entries(), 1);
+            let (first_schema, first_shapes) = module.entry_contract(entry, &f32_binding).unwrap();
+            let (schema, shapes) = module.entry_contract(entry, &f32_binding).unwrap();
+            assert!(Arc::ptr_eq(&first_schema, &schema));
+            assert!(Arc::ptr_eq(&first_shapes, &shapes));
+            assert_eq!(module.entry_contracts.lock().unwrap().len(), 1);
         }
     }
 
@@ -4058,21 +4043,17 @@ pub mod generated {
                     backend.as_str()
                 )));
             };
-            let shapes = match module.compiled_entry_shapes(entry.id(), &bindings) {
-                Ok(shapes) => shapes,
-                Err(error) => return Ok(Err(error.to_string())),
-            };
-            let sealed_node = match module.logical_entry(entry.id(), &bindings) {
-                Ok(logical) => seismic_runtime::native::graph::SealedNodeShape::of(
-                    logical.schema(),
-                    implementation,
-                ),
+            let (schema, shapes) = match module.entry_contract(entry.id(), &bindings) {
+                Ok(contract) => contract,
                 Err(error) => return Ok(Err(error.to_string())),
             };
             Ok(Ok(Self {
                 shapes,
                 implementation,
-                sealed_node,
+                sealed_node: seismic_runtime::native::graph::SealedNodeShape::of(
+                    &schema,
+                    implementation,
+                ),
             }))
         }
 
@@ -4212,7 +4193,8 @@ pub mod generated {
             )));
         }
         Ok(module
-            .logical_entry(entry.id(), &element_bindings(elements))
+            .checked()
+            .entry(entry.id(), &element_bindings(elements))
             .map(|_| NativeBindingCheck::AcceptedByCheckedEntry)
             .unwrap_or_else(|error| NativeBindingCheck::Unsupported(error.to_string())))
     }
@@ -4240,7 +4222,7 @@ pub mod generated {
                 backend.as_str()
             )));
         }
-        let logical = match module.logical_entry(entry.id(), &element_bindings(elements)) {
+        let logical = match module.checked().entry(entry.id(), &element_bindings(elements)) {
             Ok(logical) => logical,
             Err(error) => return Ok(NativeTensorParameterCheck::Unsupported(error.to_string())),
         };
@@ -4280,7 +4262,7 @@ pub mod generated {
                 backend.as_str()
             )));
         }
-        let logical = match module.logical_entry(entry.id(), &element_bindings(elements)) {
+        let logical = match module.checked().entry(entry.id(), &element_bindings(elements)) {
             Ok(logical) => logical,
             Err(error) => return Ok(NativeTensorResultsCheck::Unsupported(error.to_string())),
         };
@@ -4332,7 +4314,7 @@ pub mod generated {
                 backend.as_str()
             )));
         }
-        let logical = match module.logical_entry(entry.id(), &element_bindings(elements)) {
+        let logical = match module.checked().entry(entry.id(), &element_bindings(elements)) {
             Ok(logical) => logical,
             Err(error) => return Ok(NativeTensorResultsCheck::Unsupported(error.to_string())),
         };
