@@ -122,4 +122,37 @@ pub trait Toolchain: Send + Sync {
         artifact: &Self::Artifact,
         entries: &[ProgramEntry],
     ) -> Result<Self::Program, NativeCompilationError>;
+
+    /// What the backend's compiler reports `program`'s entry `entry` uses
+    /// ([`ProgramStatistic`]), read from the driver when the program was
+    /// formed; none for a backend whose compiler reports nothing.
+    fn statistics(program: &Self::Program, entry: usize) -> &[ProgramStatistic];
+}
+
+/// What one launch's formed program uses: the statistics its backend's
+/// compiler reports of it.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LaunchProgram {
+    pub statistics: Vec<ProgramStatistic>,
+}
+
+/// One statistic a backend's compiler reports of a formed program, named
+/// and described as the backend reports it: CUDA's function attributes,
+/// Vulkan's pipeline executable statistics. Both backends read them from
+/// the driver of every program they form, compiled or loaded, so no
+/// artifact carries them.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProgramStatistic {
+    pub name: String,
+    pub description: String,
+    pub value: StatisticValue,
+}
+
+/// A reported statistic's value, in the type it is reported in.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum StatisticValue {
+    Bool(bool),
+    Int(i64),
+    Uint(u64),
+    Float(f64),
 }

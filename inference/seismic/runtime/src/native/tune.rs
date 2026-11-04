@@ -493,6 +493,10 @@ pub struct ConfigurationRecord {
     /// configurations.
     #[serde(default)]
     pub formation: Option<FormationRecord>,
+    /// What each of its launches' programs uses, in ordinal order
+    /// ([`NativePrepared::launch_programs`]); empty when nothing was
+    /// formed.
+    pub launches: Vec<Option<seismic_native_target::LaunchProgram>>,
 }
 
 /// How a search formed a configuration before it first measured it.
@@ -2711,6 +2715,8 @@ struct Contender {
     kernel: Option<Arc<NativePrepared>>,
     /// The identity of its formed artifact.
     artifact: String,
+    /// What its launches' programs use ([`NativePrepared::launch_programs`]).
+    launches: Vec<Option<seismic_native_target::LaunchProgram>>,
     /// Its time at every timed point in the unit's canonical units
     /// ([`Matched`]), as last measured: in the session that first measured
     /// it, then in each session of its conversion.
@@ -2805,6 +2811,7 @@ impl Ledger {
                 Contender {
                     specialization: default.clone(),
                     artifact: kernel.artifact().0.clone(),
+                    launches: kernel.launch_programs(),
                     kernel: Some(kernel),
                     points: canonical,
                     confirmed: Vec::new(),
@@ -2878,6 +2885,7 @@ impl Ledger {
             Contender {
                 specialization,
                 artifact,
+                launches: kernel.as_deref().map(NativePrepared::launch_programs).unwrap_or_default(),
                 kernel,
                 points,
                 confirmed: Vec::new(),
@@ -3019,6 +3027,11 @@ impl Ledger {
         self.order
             .iter()
             .map(|configuration| {
+                let launches = self
+                    .contenders
+                    .get(configuration)
+                    .map(|contender| contender.launches.clone())
+                    .unwrap_or_default();
                 let (artifact, outcome) = match (
                     self.contenders.get(configuration),
                     self.excluded.get(configuration),
@@ -3042,6 +3055,7 @@ impl Ledger {
                 };
                 ConfigurationRecord {
                     formation: self.formations.get(configuration).copied(),
+                    launches,
                     configuration: configuration.clone(),
                     observations: artifact
                         .as_deref()
@@ -5376,6 +5390,7 @@ impl Unit {
         } else {
             vec![ConfigurationRecord {
                 formation: None,
+                launches: kernel.launch_programs(),
                 configuration: Configuration::of(default),
                 artifact: Some(kernel.artifact().0.clone()),
                 observations: Vec::new(),
@@ -7308,6 +7323,7 @@ impl Tuned<'_> {
             time.forming_seconds += began.elapsed().as_secs_f64();
             for (specialization, kernel) in batch.into_iter().zip(kernels) {
                 let began = Instant::now();
+                let launches = kernel.as_ref().map(|kernel| kernel.launch_programs()).unwrap_or_default();
                 let (artifact, outcome) = match kernel {
                     Err(exclusion) => (None, Outcome::Excluded(exclusion)),
                     Ok(kernel) => (
@@ -7333,6 +7349,7 @@ impl Tuned<'_> {
                 time.measuring_seconds += began.elapsed().as_secs_f64();
                 records.push(ConfigurationRecord {
                     formation: None,
+                    launches,
                     configuration: Configuration::of(&specialization),
                     observations: artifact
                         .as_deref()

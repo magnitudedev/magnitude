@@ -20,8 +20,8 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSError, NSString};
 use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLFunction, MTLLibrary};
 use seismic_native_target::{
-    Artifact, Load, NativeCompilationError, ProgramEntry, ProgramSource, Toolchain,
-    ToolchainIdentity,
+    Artifact, Load, NativeCompilationError, ProgramEntry, ProgramSource, ProgramStatistic,
+    Toolchain, ToolchainIdentity,
 };
 
 pub struct MetalToolchain {
@@ -166,6 +166,11 @@ impl Toolchain for MetalToolchain {
         entries: &[ProgramEntry],
     ) -> Result<Vec<DirectPipeline>, NativeCompilationError> {
         crate::pooled(|| self.pipelines(&artifact.source, entries))
+    }
+
+    /// Metal's compiler reports nothing of a pipeline.
+    fn statistics(_: &Vec<DirectPipeline>, _: usize) -> &[ProgramStatistic] {
+        &[]
     }
 }
 

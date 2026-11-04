@@ -583,6 +583,9 @@ mod tests {
                 })
                 .collect()
         }
+        fn statistics(_: &Vec<String>, _: usize) -> &[seismic_native_target::ProgramStatistic] {
+            &[]
+        }
     }
 
     #[derive(Default)]

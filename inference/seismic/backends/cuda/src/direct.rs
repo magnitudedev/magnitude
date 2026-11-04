@@ -8,7 +8,7 @@ use crate::executor::Device;
 use crate::nvrtc::NvrtcError;
 use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::graph_cost::GraphCensus;
-use seismic_native_target::NativeCompilationError;
+use seismic_native_target::{NativeCompilationError, ProgramStatistic, StatisticValue};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -16,6 +16,8 @@ use std::sync::{Arc, Condvar, Mutex};
 // cuFuncGetAttribute / cuFuncSetAttribute keys.
 const MAX_THREADS_PER_BLOCK: i32 = 0;
 const SHARED_SIZE_BYTES: i32 = 1;
+const LOCAL_SIZE_BYTES: i32 = 3;
+const NUM_REGS: i32 = 4;
 const MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
 
 /// The kernel functions of one CUDA program, loaded on one device.
@@ -37,6 +39,10 @@ struct DirectFunction {
     raw: Handle,
     max_threads: u64,
     static_shared: u64,
+    /// What the driver reports the function uses: its registers, local
+    /// (spill and stack) and static shared bytes, and the block size those
+    /// admit.
+    statistics: Vec<ProgramStatistic>,
     /// Largest dynamic shared size currently admitted by the function
     /// attribute; raised on demand.
     dynamic_shared_limit: AtomicU64,
@@ -111,12 +117,36 @@ impl DirectModule {
             let attribute = |key| {
                 driver::function_attribute(context, raw, key)
                     .map_err(driver_failure)
-                    .map(|value| u64::try_from(value).unwrap_or(0))
+                    .map(|value| {
+                        u64::try_from(value).expect("the driver reports a non-negative function attribute")
+                    })
             };
+            let max_threads = attribute(MAX_THREADS_PER_BLOCK)?;
+            let static_shared = attribute(SHARED_SIZE_BYTES)?;
+            let statistic = |name: &str, description: &str, value| ProgramStatistic {
+                name: name.into(),
+                description: description.into(),
+                value: StatisticValue::Uint(value),
+            };
+            let statistics = vec![
+                statistic("registers", "CU_FUNC_ATTRIBUTE_NUM_REGS: registers of one thread", attribute(NUM_REGS)?),
+                statistic(
+                    "local bytes",
+                    "CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES: local memory of one thread (spills and stack)",
+                    attribute(LOCAL_SIZE_BYTES)?,
+                ),
+                statistic("static shared bytes", "CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES: static shared memory of one block", static_shared),
+                statistic(
+                    "max threads per block",
+                    "CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK: the most threads a block may have, given its registers",
+                    max_threads,
+                ),
+            ];
             functions.push(DirectFunction {
                 raw,
-                max_threads: attribute(MAX_THREADS_PER_BLOCK)?,
-                static_shared: attribute(SHARED_SIZE_BYTES)?,
+                max_threads,
+                static_shared,
+                statistics,
                 dynamic_shared_limit: AtomicU64::new(attribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)?),
             });
         }
@@ -140,6 +170,11 @@ impl DirectModule {
 
     pub fn static_shared_bytes(&self, function: usize) -> u64 {
         self.functions[function].static_shared
+    }
+
+    /// What the driver reports `function` uses.
+    pub fn statistics(&self, function: usize) -> &[ProgramStatistic] {
+        &self.functions[function].statistics
     }
 
     /// The blocks of `function` one multiprocessor holds at once with

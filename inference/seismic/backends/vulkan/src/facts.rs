@@ -309,6 +309,10 @@ pub struct Facts {
     /// `seismic_fma_rn` is bound to `OpFmaKHR`, so it is fused. Without it,
     /// `seismic_fma_rn` is GLSL `fma`, which the driver may fuse or round twice.
     pub shader_fma: ShaderFma,
+    /// `VK_KHR_pipeline_executable_properties` with `pipelineExecutableInfo`:
+    /// a formed pipeline reports its executables' statistics (registers,
+    /// spills, memory and others, as the driver names them).
+    pub pipeline_statistics: bool,
     pub f32_atomic_add: bool,
     pub shared_int64_atomics: bool,
     pub calibration: Option<Calibration>,
@@ -715,6 +719,7 @@ pub(crate) fn describe(instance: &Arc<Instance>, physical: vk::PhysicalDevice) -
     let mut atomic_float = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default();
     let mut cooperative = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
     let mut shader_fma = ShaderFmaFeatures::default();
+    let mut executables = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default();
     let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
     let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
     let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
@@ -733,6 +738,9 @@ pub(crate) fn describe(instance: &Arc<Instance>, physical: vk::PhysicalDevice) -
     }
     if has(SHADER_FMA_EXTENSION) {
         features = features.push_next(&mut shader_fma);
+    }
+    if has(ash::khr::pipeline_executable_properties::NAME) {
+        features = features.push_next(&mut executables);
     }
     unsafe { raw.get_physical_device_features2(physical, &mut features) };
     let core = features.features;
@@ -846,6 +854,7 @@ pub(crate) fn describe(instance: &Arc<Instance>, physical: vk::PhysicalDevice) -
             float32: shader_fma.float32 == vk::TRUE,
             float64: shader_fma.float64 == vk::TRUE,
         },
+        pipeline_statistics: executables.pipeline_executable_info == vk::TRUE,
         f32_atomic_add: atomic_float.shader_buffer_float32_atomic_add == vk::TRUE,
         shared_int64_atomics: f12.shader_shared_int64_atomics == vk::TRUE,
         calibration,

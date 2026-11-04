@@ -77,6 +77,15 @@ for, so the cache serves it: measured at 0.5 s to re-form a 35B model's programs
 process. Each process counts its compiles, and counts and times its re-formations through a
 platform cache, whose time shows whether the platform still serves them.
 
+Tuning records what each launch's program uses as its backend's compiler reports it, read from
+the driver of every program formed, compiled or loaded, so no artifact carries it: CUDA's function
+attributes of the loaded module, and Vulkan's pipeline executable statistics where the device
+offers them. On such a device every Vulkan pipeline, a load's as a compile's, is created capturing
+statistics besides what its operation adds (a load's `FAIL_ON_PIPELINE_COMPILE_REQUIRED`): a
+driver may key pipeline data by the capture, and the toolchain identity names it. Each backend's
+toolchain states what it reports of a program it formed: Metal's reports nothing, and the CPU
+backend forms no programs.
+
 ## One first-load clock
 
 The serving allowance is 60 seconds for the load's tuning work. Evaluation may select an explicit

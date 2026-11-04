@@ -233,6 +233,7 @@ fn demanded_cache_requires_selected_native_default_evidence_for_every_case() {
         implementation_identity: "fixture-implementation".into(),
         parameters: Vec::new(),
         configurations: vec![ConfigurationRecord {
+            launches: Vec::new(),
             formation: None,
             configuration: overall.clone(),
             artifact: Some("selected".into()),
@@ -1079,6 +1080,7 @@ impl EntrySearch<dense_output::Entry> for FakeSearch {
         let mut observations = Vec::new();
         if self.discovered > 0 {
             configurations.push(ConfigurationRecord {
+                launches: Vec::new(),
                 formation: None,
                 configuration: self.case.defaults.clone(),
                 artifact: Some("a".into()),
@@ -1100,6 +1102,7 @@ impl EntrySearch<dense_output::Entry> for FakeSearch {
                     .map(|spec| observation(&spec.label, 2, self.alpha / 4.)),
             );
             configurations.push(ConfigurationRecord {
+                launches: Vec::new(),
                 formation: None,
                 configuration: self.case.chosen.clone(),
                 artifact: Some("b".into()),
@@ -1111,6 +1114,7 @@ impl EntrySearch<dense_output::Entry> for FakeSearch {
             });
             let beyond = observation(&self.specs[0].label, 4, self.alpha * 1.5);
             configurations.push(ConfigurationRecord {
+                launches: Vec::new(),
                 formation: None,
                 configuration: rejected,
                 artifact: Some("c".into()),

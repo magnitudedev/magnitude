@@ -7,4 +7,5 @@ license.workspace = true
 [dependencies]
 seismic-ir.workspace = true
 seismic-lang.workspace = true
+serde.workspace = true
 

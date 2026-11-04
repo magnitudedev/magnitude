@@ -11,8 +11,8 @@ use crate::direct::{formation_error, DirectModule};
 use crate::executor::Device;
 use crate::nvrtc;
 use seismic_native_target::{
-    Artifact, Load, NativeCompilationError, ProgramEntry, ProgramSource, Toolchain,
-    ToolchainIdentity,
+    Artifact, Load, NativeCompilationError, ProgramEntry, ProgramSource, ProgramStatistic,
+    Toolchain, ToolchainIdentity,
 };
 
 pub struct CudaToolchain {
@@ -127,6 +127,10 @@ impl Toolchain for CudaToolchain {
             })
             .collect::<Result<Vec<_>, _>>()?;
         DirectModule::load(&self.device, &artifact.image, &kernels)
+    }
+
+    fn statistics(program: &DirectModule, entry: usize) -> &[ProgramStatistic] {
+        program.statistics(entry)
     }
 }
 

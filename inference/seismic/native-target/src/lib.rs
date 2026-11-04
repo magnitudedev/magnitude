@@ -26,4 +26,7 @@ pub use native::{
     NativeKernelDescription, NativeKernelIdentity, NativeKernelReflection, NativeLaunchDomain,
     NativeResourceUsage, NativeResources,
 };
-pub use program::{Artifact, Load, ProgramEntry, ProgramSource, Toolchain, ToolchainIdentity};
+pub use program::{
+    Artifact, LaunchProgram, Load, ProgramEntry, ProgramSource, ProgramStatistic, StatisticValue,
+    Toolchain, ToolchainIdentity,
+};

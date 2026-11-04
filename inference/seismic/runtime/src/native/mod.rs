@@ -494,10 +494,27 @@ impl<P> Launches<P> {
     /// ([`NativePrepared::launches`] refuses any other), and every launch
     /// such a call can activate is formed.
     fn launch(&self, ordinal: usize) -> (&P, usize) {
-        let (compile, entry, _) = self.launches[ordinal]
+        self.formed(ordinal)
+            .expect("an active launch is formed: its call is within the specialization's ranges")
+    }
+
+    /// The program and entry of launch `ordinal`, where it is formed.
+    fn formed(&self, ordinal: usize) -> Option<(&P, usize)> {
+        self.launches[ordinal]
             .as_ref()
-            .expect("an active launch is formed: its call is within the specialization's ranges");
-        (compile.program(), *entry)
+            .map(|(compile, entry, _)| (compile.program(), *entry))
+    }
+
+    /// What each launch's program uses, in ordinal order, as `T`, the
+    /// toolchain that formed it, reports it; none for a launch not formed.
+    fn programs<T: Toolchain<Program = P>>(&self) -> Vec<Option<seismic_native_target::LaunchProgram>> {
+        (0..self.launches.len())
+            .map(|ordinal| {
+                self.formed(ordinal).map(|(program, entry)| seismic_native_target::LaunchProgram {
+                    statistics: T::statistics(program, entry).to_vec(),
+                })
+            })
+            .collect()
     }
 
     /// Each launch's program text address and entry, which with the
@@ -1360,6 +1377,22 @@ pub(crate) fn backend_name(kind: &OpenedKind) -> BackendName {
 }
 
 impl NativePrepared {
+    /// What each launch's program uses, in ordinal order, as its backend's
+    /// compiler reports it ([`Toolchain::statistics`]: CUDA's function
+    /// attributes, Vulkan's pipeline executable statistics): none for a
+    /// launch not formed, and nothing of the CPU backend, which forms no
+    /// programs.
+    pub fn launch_programs(&self) -> Vec<Option<seismic_native_target::LaunchProgram>> {
+        match &self.route {
+            NativeRoute::Cpu(_) => Vec::new(),
+            #[cfg(target_os = "macos")]
+            NativeRoute::Metal { launches, .. } => launches.programs::<seismic_metal::toolchain::MetalToolchain>(),
+            NativeRoute::Cuda { launches, .. } => launches.programs::<seismic_cuda::toolchain::CudaToolchain>(),
+            #[cfg(not(target_os = "macos"))]
+            NativeRoute::Vulkan { launches, .. } => launches.programs::<seismic_vulkan::toolchain::VulkanToolchain>(),
+        }
+    }
+
     /// Hand this kernel's formed programs, chosen by tuning, to the serving
     /// preparation of its specialization on its device: serving gets its own
     /// kernel over the same programs, with fresh call state, and forms

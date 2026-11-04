@@ -304,6 +304,7 @@ mod tests {
             implementation_identity: "native-source".into(),
             parameters: Vec::new(),
             configurations: vec![seismic::ConfigurationRecord {
+                launches: Vec::new(),
                 formation: None,
                 configuration: configuration.clone(),
                 artifact: Some("retained-artifact".into()),

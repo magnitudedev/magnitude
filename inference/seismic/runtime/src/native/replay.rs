@@ -695,6 +695,7 @@ mod tests {
                     rotation_bytes: 0,
                 };
                 configurations.push(ConfigurationRecord {
+                    launches: Vec::new(),
                     formation: None,
                     configuration: Configuration {
                         statics: Default::default(),

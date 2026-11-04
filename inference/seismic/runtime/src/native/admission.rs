@@ -446,6 +446,7 @@ mod tests {
         };
         let mut observations = Vec::new();
         let mut record = |rows: u64, ratios: &[f64], outcome: Outcome| ConfigurationRecord {
+            launches: Vec::new(),
             formation: None,
             configuration: configuration(rows),
             artifact: Some(format!("artifact-{rows}")),

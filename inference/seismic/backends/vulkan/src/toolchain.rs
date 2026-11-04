@@ -7,13 +7,16 @@
 //! the pipelines from that data and compiles nothing. A compile hands back
 //! the pipelines it created, and first creates them again from its data, so
 //! an artifact whose data would not serve a load fails its compile rather
-//! than being stored and failing every later load.
+//! than being stored and failing every later load. Where the device
+//! reports pipeline statistics, every pipeline, a load's as a compile's,
+//! is created capturing them, and the program a compile or load hands back
+//! reads them from the driver, so the artifact carries none.
 
 use crate::device::Device;
 use crate::formation::{self, DirectModule};
 use seismic_native_target::{
-    Artifact, Load, NativeCompilationError, ProgramEntry, ProgramSource, Toolchain,
-    ToolchainIdentity,
+    Artifact, Load, NativeCompilationError, ProgramEntry, ProgramSource, ProgramStatistic,
+    Toolchain, ToolchainIdentity,
 };
 
 pub struct VulkanToolchain {
@@ -128,7 +131,7 @@ impl Toolchain for VulkanToolchain {
             .zip(&source.entries)
             .collect::<Vec<_>>();
         let (program, pipelines) = DirectModule::compile(&self.device, &entries)?;
-        drop(DirectModule::load(&self.device, &entries, &pipelines)?);
+        DirectModule::serves(&self.device, &entries, &pipelines)?;
         let artifact = SpirvPipelines {
             modules: source
                 .entries
@@ -163,6 +166,10 @@ impl Toolchain for VulkanToolchain {
             })
             .collect::<Result<Vec<_>, _>>()?;
         DirectModule::load(&self.device, &held, &artifact.pipelines)
+    }
+
+    fn statistics(program: &DirectModule, entry: usize) -> &[ProgramStatistic] {
+        program.statistics(entry)
     }
 }
 

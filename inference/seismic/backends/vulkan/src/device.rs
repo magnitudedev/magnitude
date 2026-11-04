@@ -356,6 +356,9 @@ pub(crate) struct Inner {
     /// `VK_KHR_map_memory2`'s functions, where the device maps memory at a
     /// placed host address (`Facts::placed_map_alignment`).
     placed_maps: Option<ash::khr::map_memory2::Device>,
+    /// `VK_KHR_pipeline_executable_properties`' functions, where formed
+    /// pipelines report their statistics (`Facts::pipeline_statistics`).
+    pub(crate) executables: Option<ash::khr::pipeline_executable_properties::Device>,
     recording: Mutex<Recording>,
     staging: Mutex<Option<Staging>>,
     /// Device memory recorded graphs took (their command memory), measured
@@ -1137,6 +1140,9 @@ impl Inner {
             extensions.push(ash::khr::map_memory2::NAME);
             extensions.push(ash::ext::map_memory_placed::NAME);
         }
+        if facts.pipeline_statistics {
+            extensions.push(ash::khr::pipeline_executable_properties::NAME);
+        }
         let extension_names = extensions
             .iter()
             .map(|name| name.as_ptr())
@@ -1200,6 +1206,11 @@ impl Inner {
         if facts.placed_map_alignment.is_some() {
             features = features.push_next(&mut placed);
         }
+        let mut executables =
+            vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default().pipeline_executable_info(true);
+        if facts.pipeline_statistics {
+            features = features.push_next(&mut executables);
+        }
         let priorities = [1.0f32; 2];
         // The second queue, of the first's family or of a family of its own.
         let side_family = facts.side_family;
@@ -1233,6 +1244,9 @@ impl Inner {
             .host_import_alignment
             .map(|_| ash::ext::external_memory_host::Device::new(raw, &device));
         let placed_maps = facts.placed_map_alignment.map(|_| ash::khr::map_memory2::Device::new(raw, &device));
+        let executables = facts
+            .pipeline_statistics
+            .then(|| ash::khr::pipeline_executable_properties::Device::new(raw, &device));
         let memory = match Memory::new(&facts, instance.clone(), physical, usage_before) {
             Ok(memory) => memory,
             Err(reason) => {
@@ -1258,6 +1272,7 @@ impl Inner {
             side,
             host_import,
             placed_maps,
+            executables,
             recording: Mutex::new(Recording {
                 pool: vk::CommandPool::null(),
                 free_commands: Vec::new(),
