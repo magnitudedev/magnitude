@@ -332,9 +332,9 @@ fn cgroup_v2_limits(
             kind: ProcessLimitKind::CgroupV2 { cgroup },
             limit_bytes: parse_bytes(&max, value)?,
             used_bytes: read_bytes(&directory.join("memory.current"))?,
-            reclaimable_bytes: inactive_file_headroom(
+            reclaimable_bytes: file_cache_headroom(
                 directory,
-                ["inactive_file", "file_dirty", "file_writeback"],
+                ["active_file", "inactive_file", "file_dirty", "file_writeback"],
             )?,
         });
         Ok(())
@@ -373,9 +373,9 @@ fn cgroup_v1_limits(
             kind: ProcessLimitKind::CgroupV1 { cgroup },
             limit_bytes,
             used_bytes: read_bytes(&directory.join("memory.usage_in_bytes"))?,
-            reclaimable_bytes: inactive_file_headroom(
+            reclaimable_bytes: file_cache_headroom(
                 directory,
-                ["total_inactive_file", "total_dirty", "total_writeback"],
+                ["total_active_file", "total_inactive_file", "total_dirty", "total_writeback"],
             )?,
         });
         Ok(())
@@ -391,15 +391,18 @@ fn cgroup_v1_limits(
 }
 
 /// Cgroup usage includes reclaimable page cache, unlike Linux MemAvailable.
-/// Credit only inactive filesystem pages, conservatively excluding all dirty
-/// and writeback pages. Anonymous memory, tmpfs/shmem (on the anon lists),
-/// active cache and kernel allocations receive no credit. V1 counters must be
-/// hierarchical, like memory.usage_in_bytes, so ancestor limits include their
-/// children's cache. Missing counters cannot establish reclaimability.
-fn inactive_file_headroom(directory: &Path, keys: [&str; 3]) -> Result<u64, ObservationError> {
+/// Credit filesystem pages on either LRU list, conservatively excluding all
+/// dirty and writeback pages: a charge at the limit reclaims active cache too
+/// (a v1 docker cgroup on Linux gave up all of its 58.7 GB at an unchanged
+/// allocation rate, with no failed charge or OOM kill). Anonymous memory,
+/// tmpfs/shmem (on the anon lists) and kernel allocations receive no credit.
+/// V1 counters must be hierarchical, like memory.usage_in_bytes, so ancestor
+/// limits include their children's cache. Missing counters cannot establish
+/// reclaimability.
+fn file_cache_headroom(directory: &Path, keys: [&str; 4]) -> Result<u64, ObservationError> {
     let path = directory.join("memory.stat");
     let stat = read(&path)?;
-    let mut values = [None; 3];
+    let mut values = [None; 4];
     for line in stat.lines() {
         let mut fields = line.split_whitespace();
         let Some(key) = fields.next() else { continue };
@@ -409,8 +412,8 @@ fn inactive_file_headroom(directory: &Path, keys: [&str; 3]) -> Result<u64, Obse
         }
     }
     Ok(match values {
-        [Some(inactive), Some(dirty), Some(writeback)] => {
-            inactive.saturating_sub(dirty.saturating_add(writeback))
+        [Some(active), Some(inactive), Some(dirty), Some(writeback)] => {
+            active.saturating_add(inactive).saturating_sub(dirty.saturating_add(writeback))
         }
         _ => 0,
     })
@@ -769,31 +772,33 @@ mod tests {
     }
 
     #[test]
-    fn v2_headroom_credits_only_clean_inactive_file_cache() {
+    fn v2_headroom_credits_only_clean_file_cache() {
         let fixture = Fixture::new("v2-cache", "0::/worker\n", V2_HOST_MOUNT);
         fixture.write("sys/fs/cgroup/worker/memory.max", "1000\n");
         fixture.write("sys/fs/cgroup/worker/memory.current", "900\n");
         for (stat, reclaimable, remaining) in [
             (
-                "inactive_file 600\nfile_dirty 100\nfile_writeback 50\nanon 300\n",
+                "active_file 200\ninactive_file 400\nfile_dirty 100\nfile_writeback 50\nanon 300\n",
                 450,
                 550,
             ),
             (
-                "inactive_file 0\nfile_dirty 0\nfile_writeback 0\nanon 900\n",
+                "active_file 0\ninactive_file 0\nfile_dirty 0\nfile_writeback 0\nanon 900\n",
                 0,
                 100,
             ),
+            // Dirty pages may lie on either list.
             (
-                "inactive_file 600\nfile_dirty 700\nfile_writeback 0\n",
+                "active_file 300\ninactive_file 300\nfile_dirty 700\nfile_writeback 0\n",
                 0,
                 100,
             ),
-            ("inactive_file 600\nfile_writeback 0\n", 0, 100),
+            ("active_file 0\ninactive_file 600\nfile_writeback 0\n", 0, 100),
+            ("inactive_file 600\nfile_dirty 0\nfile_writeback 0\n", 0, 100),
             // Non-atomic counters can briefly disagree; never grant more
             // than the limit even when the cache counter exceeds usage.
             (
-                "inactive_file 1200\nfile_dirty 0\nfile_writeback 0\n",
+                "active_file 600\ninactive_file 600\nfile_dirty 0\nfile_writeback 0\n",
                 1200,
                 1000,
             ),
@@ -819,7 +824,7 @@ mod tests {
         );
         fixture.write("sys/fs/cgroup/memory/parent/memory.usage_in_bytes", "900\n");
         fixture.write("sys/fs/cgroup/memory/parent/memory.stat",
-            "inactive_file 0\ndirty 0\nwriteback 0\ntotal_inactive_file 600\ntotal_dirty 100\ntotal_writeback 50\n");
+            "active_file 0\ninactive_file 0\ndirty 0\nwriteback 0\ntotal_active_file 200\ntotal_inactive_file 400\ntotal_dirty 100\ntotal_writeback 50\n");
         fixture.write(
             "sys/fs/cgroup/memory/memory.limit_in_bytes",
             &v1_unlimited_bytes().unwrap().to_string(),
