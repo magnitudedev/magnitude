@@ -18,7 +18,7 @@ use magnitude_engine::{
     assessment::{
         finish_model_assessment, prepare_model_assessment, AssessmentSetup, AssessmentStructure,
         DrafterVerdict, Measurements, ModelAssessment, ModelExecution, ModelPackagePaths,
-        Performance, PreparedModelAssessment,
+        Performance, PreparedModelAssessment, served_contexts,
     },
     error::UnsupportedModel,
     options::{standard_service_limits, ModelMethod, ModelPolicy, PROFILE_SEQUENCES},
@@ -299,7 +299,19 @@ fn run() -> Result<bool, String> {
             if options.breakdown {
                 print_breakdown(model, &prepared, &setup, &options)?;
             }
-            finish_model_assessment(&prepared, &setup, &options.depths, options.sequences)
+            let contexts = match &prepared {
+                PreparedModelAssessment::Planned { facts, .. } => {
+                    served_contexts(facts.context_limit)
+                }
+                PreparedModelAssessment::Unsupported { .. } => Vec::new(),
+            };
+            finish_model_assessment(
+                &prepared,
+                &setup,
+                &contexts,
+                &options.depths,
+                options.sequences,
+            )
         });
         match assessed {
             Ok(assessment) => {
@@ -545,10 +557,15 @@ fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
     };
     let mut object = match execution {
         ModelExecution::Fits {
-            fit: ExecutionFit { domains, .. },
+            fit:
+                ExecutionFit {
+                    fit_context_tokens,
+                    domains,
+                },
             performance,
         } => json!({
             "_tag": "Fits",
+            "servedContextTokens": fit_context_tokens,
             "memory": memory(domains),
             "performance": match performance {
                 Performance::Pending => json!({ "_tag": "Pending" }),
@@ -565,12 +582,13 @@ fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
             },
         }),
         ModelExecution::DoesNotFit(ExecutionShortfall {
+            fit_context_tokens,
             domains,
             limiting,
             deficit_bytes,
-            ..
         }) => json!({
             "_tag": "DoesNotFit",
+            "shortfallContextTokens": fit_context_tokens,
             "memory": memory(domains),
             "limitingResource": domain_id(setup, *limiting),
             "deficitBytes": deficit_bytes,

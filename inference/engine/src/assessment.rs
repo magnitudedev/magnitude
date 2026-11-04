@@ -321,12 +321,39 @@ pub enum PreparedModelAssessment {
     },
 }
 
-/// Complete a prepared model against stable capacity and, when it fits,
-/// estimate its decode speed with `sequences` conversations decoding at
-/// once from the setup's measurements: arithmetic over the prepared demand.
+/// The smallest context a model is served at when its trained limit allows
+/// more: a coding harness's prompt and tools alone fill much of 16K.
+pub const SERVED_CONTEXT_FLOOR: u32 = 32_768;
+
+/// The contexts a model trained for `context_limit` tokens may be served at,
+/// largest first: the limit, then every power of two below it down to
+/// [`SERVED_CONTEXT_FLOOR`]. A model trained for less than the floor is
+/// served only at its limit. Tiers rather than the exact largest context
+/// keep the served context stable when a build's footprint shifts slightly.
+pub fn served_contexts(context_limit: u32) -> Vec<u32> {
+    let mut contexts = vec![context_limit];
+    let mut tier = SERVED_CONTEXT_FLOOR;
+    let mut below = Vec::new();
+    while tier < context_limit {
+        below.push(tier);
+        match tier.checked_mul(2) {
+            Some(next) => tier = next,
+            None => break,
+        }
+    }
+    contexts.extend(below.into_iter().rev());
+    contexts
+}
+
+/// Complete a prepared model against stable capacity at the largest of
+/// `served_contexts` (see [`served_contexts`]) it fits and, when it fits,
+/// estimate its decode speed at the requested depths within that context
+/// with `sequences` conversations decoding at once from the setup's
+/// measurements: arithmetic over the prepared demand.
 pub fn finish_model_assessment(
     prepared: &PreparedModelAssessment,
     setup: &AssessmentSetup,
+    served_contexts: &[u32],
     performance_depths: &[u32],
     sequences: u32,
 ) -> Result<ModelAssessment, ModelAssessmentError> {
@@ -349,6 +376,7 @@ pub fn finish_model_assessment(
     let structure = &setup.structure;
     let request = AssessmentRequest {
         context_limit: facts.context_limit,
+        served_contexts: served_contexts.to_vec(),
         performance_depths: performance_depths.to_vec(),
         reserves: structure.reserves,
         sequences,
@@ -364,17 +392,17 @@ pub fn finish_model_assessment(
     let execution = match fit {
         ExecutionAssessment::DoesNotFit(shortfall) => ModelExecution::DoesNotFit(shortfall),
         ExecutionAssessment::Fits(fit) => ModelExecution::Fits {
-            fit,
             performance: match &setup.measurements {
                 Measurements::Pending => Performance::Pending,
                 Measurements::Unavailable { reason } => Performance::Unavailable {
                     reason: reason.clone(),
                 },
                 Measurements::Measured { costs, .. } => Performance::Estimated(
-                    estimate_execution(preparation, draft, costs, &request)
+                    estimate_execution(preparation, draft, costs, &request, fit.fit_context_tokens)
                         .map_err(ModelAssessmentError::Assessment)?,
                 ),
             },
+            fit,
         },
     };
     Ok(ModelAssessment::Assessed {
@@ -391,7 +419,11 @@ pub fn assess_model(
     sequences: u32,
 ) -> Result<ModelAssessment, ModelAssessmentError> {
     let prepared = prepare_model_assessment(package, &setup.structure)?;
-    finish_model_assessment(&prepared, setup, performance_depths, sequences)
+    let contexts = match &prepared {
+        PreparedModelAssessment::Planned { facts, .. } => served_contexts(facts.context_limit),
+        PreparedModelAssessment::Unsupported { .. } => Vec::new(),
+    };
+    finish_model_assessment(&prepared, setup, &contexts, performance_depths, sequences)
 }
 
 /// Prepare one package from its headers on the selected execution
@@ -1074,4 +1106,27 @@ fn unsupported_weights<'a>(
         layout.as_str()
     );
     Some(UnsupportedModel::reason(reason, detail))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{served_contexts, SERVED_CONTEXT_FLOOR};
+
+    #[test]
+    fn served_contexts_are_the_limit_then_powers_of_two_to_the_floor() {
+        assert_eq!(
+            served_contexts(262_144),
+            vec![262_144, 131_072, 65_536, 32_768]
+        );
+        assert_eq!(
+            served_contexts(1_048_576),
+            vec![1_048_576, 524_288, 262_144, 131_072, 65_536, 32_768]
+        );
+        assert_eq!(served_contexts(40_960), vec![40_960, 32_768]);
+        assert_eq!(served_contexts(131_000), vec![131_000, 65_536, 32_768]);
+        assert_eq!(served_contexts(SERVED_CONTEXT_FLOOR), vec![SERVED_CONTEXT_FLOOR]);
+        assert_eq!(served_contexts(8_192), vec![8_192]);
+        assert_eq!(served_contexts(u32::MAX).last(), Some(&SERVED_CONTEXT_FLOOR));
+        assert!(served_contexts(u32::MAX).windows(2).all(|pair| pair[0] > pair[1]));
+    }
 }

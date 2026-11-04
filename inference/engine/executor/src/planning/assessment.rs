@@ -1,7 +1,7 @@
 //! Model-derived memory charges for metadata-only assessment.
 //!
-//! The standard assessment workload is one conversation at the fit depth
-//! `min(context_limit, 100_000)` on a clean load. Its charge is composed of
+//! The standard assessment workload is one conversation at the fit depth,
+//! the served context limit, on a clean load. Its charge is composed of
 //! exact header terms (resident weights, history at the fit depth, recurrent
 //! banks, the prepared programs' owner) and upper bounds taken from the same
 //! checked class enumeration and slot multipliers production preparation
@@ -691,10 +691,10 @@ impl AssessmentHeaderBounds {
 /// their occupied state exceeds it.
 pub const CONVERSATION_CHECKPOINTS: usize = 3;
 
-/// The depth of the standard workload's one conversation: the lesser of the
-/// supported context and 100,000 tokens.
+/// The depth of the standard workload's one conversation: the context the
+/// definition is served at.
 pub(super) fn fit_depth(definition: &ModelDefinition) -> u64 {
-    definition.decoder.context_limit.min(100_000)
+    definition.decoder.context_limit
 }
 
 /// The state store's own capacity rule for the standard workload's one
@@ -713,8 +713,8 @@ pub(super) fn conversation_banks(lookahead: bool) -> Result<u64, String> {
 }
 
 impl AssessmentMemoryTerms {
-    /// The standard assessment workload is one conversation at the lesser
-    /// of the supported context and 100,000 tokens. Method state and optional
+    /// The standard assessment workload is one conversation at the served
+    /// context. Method state and optional
     /// components are included only when selected by the planned method; the
     /// conversation's in-flight banks follow the planned lookahead.
     pub fn derive(
@@ -2680,7 +2680,7 @@ mod tests {
         );
         assert_eq!(charge.staging_bytes, header.staging_upload_bytes);
 
-        // The fit depth is the context limit capped at 100,000 tokens.
+        // The fit depth is the served context limit, uncapped.
         definition.decoder.context_limit = 262_144;
         let long = AssessmentMemoryTerms::derive(
             &definition,
@@ -2691,10 +2691,10 @@ mod tests {
             limits,
         )
         .unwrap();
-        assert_eq!(long.fit_depth, 100_000);
+        assert_eq!(long.fit_depth, definition.decoder.context_limit);
         assert_eq!(
             long.history_at_fit_depth().unwrap(),
-            100_000 * terms.history_per_token
+            definition.decoder.context_limit * terms.history_per_token
         );
     }
 

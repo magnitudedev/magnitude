@@ -897,6 +897,22 @@ fn fit_state_bytes(
 }
 
 impl StateResourcePlan {
+    /// This plan with the model served at `context_tokens`, as a load bounded
+    /// to that context plans it: retention and address tables follow the
+    /// context, so the plan is derived anew rather than re-priced.
+    pub fn at_context(&self, method: PlannedMethod, context_tokens: u64) -> Result<Self, String> {
+        let mut definition = self.definition.clone();
+        definition.decoder.context_limit = context_tokens;
+        ResourcePlanner::state_plan(
+            &definition,
+            &self.load,
+            method,
+            self.codec,
+            self.limits,
+            self.capacity_bytes,
+        )
+    }
+
     pub fn limits(&self) -> ResourceLimits {
         self.limits
     }

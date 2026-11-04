@@ -14,8 +14,9 @@ use super::AssessmentError;
 use crate::platform::{DomainRole, MemoryReserves};
 use crate::{
     AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
-    AssessmentMemoryCharge, AssessmentMemoryTerms, DeviceProcessBytes, ExecutionPlanDraft,
-    HostProcessBytes, ResourceCapacity, ResourcePlanner,
+    AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, DeviceProcessBytes,
+    ExecutionPlanDraft, HostProcessBytes, PlannedMethod, ResourceCapacity, ResourcePlanner,
+    StateResourcePlan,
 };
 use magnitude_family_contracts::ModelDefinition;
 use seismic::{DeviceTopology, Executor, Status, StoreId};
@@ -25,7 +26,11 @@ use seismic::{DeviceTopology, Executor, Status, StoreId};
 pub struct AssessmentRequest {
     /// The served context ceiling: the model's supported maximum.
     pub context_limit: u32,
-    /// Requested decode-speed depths before filtering.
+    /// The contexts the model may be served at, largest first, none above
+    /// the ceiling. The served context is the first at which the standard
+    /// workload fits; a shortfall is reported at the last.
+    pub served_contexts: Vec<u32>,
+    /// Requested decode-speed depths before filtering by the served context.
     pub performance_depths: Vec<u32>,
     /// The conversations decoding together: the serving profile's decode
     /// concurrency.
@@ -56,15 +61,17 @@ pub enum ExecutionAssessment {
     DoesNotFit(ExecutionShortfall),
 }
 
-/// The standard workload fits every domain the load touches.
+/// The standard workload fits every domain the load touches at the served
+/// context `fit_context_tokens`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionFit {
     pub fit_context_tokens: u32,
     pub domains: Vec<DomainFit>,
 }
 
-/// The standard workload exceeds some domain; `limiting` is the one with
-/// the largest deficit.
+/// The standard workload exceeds some domain at every served context;
+/// `fit_context_tokens` is the smallest, and `limiting` the domain with the
+/// largest deficit there.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionShortfall {
     pub fit_context_tokens: u32,
@@ -74,11 +81,18 @@ pub struct ExecutionShortfall {
 }
 
 /// Basis-independent decode demand and the standard workload's checked
-/// memory charge.
+/// memory charge, at the context ceiling and at any served context below it.
+/// The graphs and their bounds are prepared once at the ceiling; the state
+/// plan is derived at each served context, as a load at that context plans
+/// it.
 pub struct PreparedExecutionAssessment {
     demand: DecodeDemand,
     fit_context_tokens: u32,
     charge: AssessmentMemoryCharge,
+    terms: AssessmentMemoryTerms,
+    bounds: AssessmentMemoryBounds,
+    state: StateResourcePlan,
+    method: PlannedMethod,
 }
 
 impl PreparedExecutionAssessment {
@@ -87,9 +101,29 @@ impl PreparedExecutionAssessment {
         &self.demand
     }
 
-    /// The checked header and graph charge, shared with physical finalization.
+    /// The checked header and graph charge at the ceiling, shared with
+    /// physical finalization.
     pub fn memory_charge(&self) -> &AssessmentMemoryCharge {
         &self.charge
+    }
+
+    /// The charge with the standard workload's one conversation at
+    /// `context_tokens`, which must not exceed the ceiling.
+    pub fn memory_charge_at(&self, context_tokens: u32) -> Result<AssessmentMemoryCharge, String> {
+        if context_tokens == 0 || context_tokens > self.fit_context_tokens {
+            return Err(format!(
+                "served context {context_tokens} is outside the ceiling {}",
+                self.fit_context_tokens
+            ));
+        }
+        if context_tokens == self.fit_context_tokens {
+            return Ok(self.charge);
+        }
+        let state = self.state.at_context(self.method, u64::from(context_tokens))?;
+        let state_bytes =
+            state.fit_state_bytes(u64::from(context_tokens), self.terms.recurrent_banks)?;
+        self.terms
+            .charge(self.bounds, state_bytes, state.startup_state_bytes()?)
     }
 }
 
@@ -155,15 +189,12 @@ pub fn prepare_execution_assessment(
     let device_process =
         DeviceProcessBytes::derive(draft.device().backend(), host_process.kernels)
             .map_err(AssessmentError::Memory)?;
-    let charge = header
+    let bounds = header
         .with_graph_resource_bound(&graph, host_process, device_process)
-        .and_then(|bounds| {
-            state
-                .fit_state_bytes(terms.fit_depth, terms.recurrent_banks)
-                .and_then(|state_bytes| {
-                    terms.charge(bounds, state_bytes, state.startup_state_bytes()?)
-                })
-        })
+        .map_err(AssessmentError::Memory)?;
+    let charge = state
+        .fit_state_bytes(terms.fit_depth, terms.recurrent_banks)
+        .and_then(|state_bytes| terms.charge(bounds, state_bytes, state.startup_state_bytes()?))
         .map_err(AssessmentError::Memory)?;
     // The kernels a load prepares, at the statics it prepares them with:
     // what each call's launches are declared over.
@@ -179,6 +210,10 @@ pub fn prepare_execution_assessment(
         demand,
         fit_context_tokens,
         charge,
+        terms,
+        bounds,
+        state,
+        method: policy.method(),
     })
 }
 
@@ -196,7 +231,10 @@ fn planned_executor<'a>(
 }
 
 /// Whether the standard workload of one prepared model fits stable
-/// capacity. No graph or model material is constructed here.
+/// capacity at one of the request's served contexts: the first, largest
+/// first, at which it fits, or the shortfall at the smallest. Only the
+/// conversation's state differs between them. No graph or model material is
+/// constructed here.
 pub fn assess_execution_fit(
     prepared: &PreparedExecutionAssessment,
     draft: &ExecutionPlanDraft,
@@ -204,27 +242,52 @@ pub fn assess_execution_fit(
     status: &Status,
     request: &AssessmentRequest,
 ) -> Result<ExecutionAssessment, AssessmentError> {
+    if request.context_limit != prepared.fit_context_tokens {
+        return Err(AssessmentError::Plan(format!(
+            "assessed context limit {} differs from the prepared {}",
+            request.context_limit, prepared.fit_context_tokens
+        )));
+    }
+    if request.served_contexts.is_empty()
+        || request
+            .served_contexts
+            .windows(2)
+            .any(|pair| pair[0] <= pair[1])
+    {
+        return Err(AssessmentError::Plan(
+            "served contexts must be nonempty and strictly decreasing".into(),
+        ));
+    }
     let device = planned_executor(draft, topology)?;
-    let fit = prepared
-        .charge
-        .assess_fit(topology, device, status, &request.reserves)
-        .map_err(AssessmentError::Memory)?;
-    let fit_context_tokens = prepared.fit_context_tokens;
-    Ok(match fit.verdict {
-        AssessmentFitVerdict::DoesNotFit {
-            limiting,
-            deficit_bytes,
-        } => ExecutionAssessment::DoesNotFit(ExecutionShortfall {
-            fit_context_tokens,
-            domains: fit.domains,
-            limiting,
-            deficit_bytes,
-        }),
-        AssessmentFitVerdict::Fits => ExecutionAssessment::Fits(ExecutionFit {
-            fit_context_tokens,
-            domains: fit.domains,
-        }),
-    })
+    let mut shortfall = None;
+    for &fit_context_tokens in &request.served_contexts {
+        let fit = prepared
+            .memory_charge_at(fit_context_tokens)
+            .and_then(|charge| charge.assess_fit(topology, device, status, &request.reserves))
+            .map_err(AssessmentError::Memory)?;
+        match fit.verdict {
+            AssessmentFitVerdict::Fits => {
+                return Ok(ExecutionAssessment::Fits(ExecutionFit {
+                    fit_context_tokens,
+                    domains: fit.domains,
+                }));
+            }
+            AssessmentFitVerdict::DoesNotFit {
+                limiting,
+                deficit_bytes,
+            } => {
+                shortfall = Some(ExecutionShortfall {
+                    fit_context_tokens,
+                    domains: fit.domains,
+                    limiting,
+                    deficit_bytes,
+                });
+            }
+        }
+    }
+    Ok(ExecutionAssessment::DoesNotFit(
+        shortfall.expect("served contexts are nonempty"),
+    ))
 }
 
 /// What the draft's decode is priced with on `costs`: its resolved
@@ -236,19 +299,21 @@ pub fn decode_pricing<'a>(draft: &ExecutionPlanDraft, costs: &'a ExecutorCosts) 
     }
 }
 
-/// One prepared model's decode speed at each requested depth, from the
-/// planned executor's measured kernel costs.
+/// One prepared model's decode speed at each requested depth within the
+/// context it is served at, from the planned executor's measured kernel
+/// costs.
 pub fn estimate_execution(
     prepared: &PreparedExecutionAssessment,
     draft: &ExecutionPlanDraft,
     costs: &ExecutorCosts,
     request: &AssessmentRequest,
+    served_context: u32,
 ) -> Result<Vec<PerformanceEstimate>, AssessmentError> {
     estimate_decode(
         &prepared.demand,
         &decode_pricing(draft, costs),
         u64::from(request.sequences),
-        &performance_depths(request.context_limit, &request.performance_depths),
+        &performance_depths(served_context, &request.performance_depths),
     )
 }
 
@@ -256,7 +321,7 @@ pub fn estimate_execution(
 pub(crate) mod tests {
     use super::*;
     use crate::{
-        ComponentSelection, ExecutionPath, ExecutionPlanner, PlannedMethod, ResourceLimits,
+        ComponentSelection, ExecutionPath, ExecutionPlanner, ResourceLimits,
     };
     use magnitude_state::KvCodec;
 
@@ -322,8 +387,13 @@ pub(crate) mod tests {
     }
 
     fn request(context_limit: u32, depths: &[u32]) -> AssessmentRequest {
+        tiered(context_limit, &[context_limit], depths)
+    }
+
+    fn tiered(context_limit: u32, served_contexts: &[u32], depths: &[u32]) -> AssessmentRequest {
         AssessmentRequest {
             context_limit,
+            served_contexts: served_contexts.to_vec(),
             performance_depths: depths.to_vec(),
             sequences: 1,
             reserves: MemoryReserves::standard(),
@@ -360,7 +430,7 @@ pub(crate) mod tests {
         else {
             panic!("the fixture fits every supported host");
         };
-        assert_eq!(fit_context_tokens, 100_000);
+        assert_eq!(fit_context_tokens, 150_000);
         assert!(domains
             .iter()
             .any(|domain| domain.role == DomainRole::Allocation));
@@ -393,8 +463,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// The estimate covers the requested depths within the limit and the
-    /// limit itself, slowing with depth.
+    /// The estimate covers the requested depths within the served context
+    /// and the served context itself, slowing with depth.
     #[test]
     fn a_fitting_model_is_estimated_at_each_depth() {
         let environment = environment(150_000);
@@ -404,13 +474,22 @@ pub(crate) mod tests {
                 .unwrap();
         let costs = crate::assessment::fixtures::costs();
         let estimates =
-            estimate_execution(&prepared, &environment.draft, &costs, &request).unwrap();
+            estimate_execution(&prepared, &environment.draft, &costs, &request, 150_000).unwrap();
         assert_eq!(
             estimates
                 .iter()
                 .map(|estimate| estimate.context_tokens)
                 .collect::<Vec<_>>(),
             vec![25_000, 50_000, 150_000]
+        );
+        let served =
+            estimate_execution(&prepared, &environment.draft, &costs, &request, 32_768).unwrap();
+        assert_eq!(
+            served
+                .iter()
+                .map(|estimate| estimate.context_tokens)
+                .collect::<Vec<_>>(),
+            vec![25_000, 32_768]
         );
         for pair in estimates.windows(2) {
             assert!(pair[0].tokens_per_second > pair[1].tokens_per_second);
@@ -432,7 +511,7 @@ pub(crate) mod tests {
         let prepared =
             prepare_execution_assessment(&environment.definition, &environment.draft, 150_000)
                 .expect("a context the domain cannot back is not a planning failure");
-        assert_eq!(prepared.fit_context_tokens, 100_000);
+        assert_eq!(prepared.fit_context_tokens, 150_000);
         assert!(assess_execution_fit(
             &prepared,
             &environment.draft,
@@ -441,6 +520,150 @@ pub(crate) mod tests {
             &request,
         )
         .is_ok());
+    }
+
+    /// A ceiling whose one conversation exceeds any host (the fixture's
+    /// 256 history bytes per token make two billion tokens 512 GB) is served
+    /// at the largest context below it that fits: it fits there, and the
+    /// next larger does not.
+    #[test]
+    fn the_served_context_is_the_largest_that_fits() {
+        const CEILING: u32 = 2_000_000_000;
+        let environment = environment(u64::from(CEILING));
+        let prepared =
+            prepare_execution_assessment(&environment.definition, &environment.draft, CEILING)
+                .unwrap();
+        let mut contexts = vec![CEILING];
+        let mut tier = 1u32 << 30;
+        while tier >= 32_768 {
+            contexts.push(tier);
+            tier /= 2;
+        }
+        let request = tiered(CEILING, &contexts, &[25_000]);
+        let fits = |context: u32| {
+            let device = planned_executor(&environment.draft, &environment.topology).unwrap();
+            prepared
+                .memory_charge_at(context)
+                .unwrap()
+                .assess_fit(&environment.topology, device, &environment.status, &request.reserves)
+                .unwrap()
+                .verdict
+                == AssessmentFitVerdict::Fits
+        };
+        let ExecutionAssessment::Fits(ExecutionFit {
+            fit_context_tokens, ..
+        }) = assess_execution_fit(
+            &prepared,
+            &environment.draft,
+            &environment.topology,
+            &environment.status,
+            &request,
+        )
+        .unwrap()
+        else {
+            panic!("the fixture fits every supported host at 32K");
+        };
+        assert!(fit_context_tokens < CEILING);
+        assert!(fits(fit_context_tokens));
+        let larger = contexts
+            .iter()
+            .rev()
+            .find(|context| **context > fit_context_tokens)
+            .copied()
+            .unwrap();
+        assert!(!fits(larger));
+    }
+
+    /// When no served context fits, the shortfall is the smallest's.
+    #[test]
+    fn a_shortfall_is_reported_at_the_smallest_context() {
+        const CEILING: u32 = 2_000_000_000;
+        let environment = environment(u64::from(CEILING));
+        let prepared =
+            prepare_execution_assessment(&environment.definition, &environment.draft, CEILING)
+                .unwrap();
+        let ExecutionAssessment::DoesNotFit(shortfall) = assess_execution_fit(
+            &prepared,
+            &environment.draft,
+            &environment.topology,
+            &environment.status,
+            &tiered(CEILING, &[CEILING, 1_900_000_000], &[]),
+        )
+        .unwrap()
+        else {
+            panic!("512 GB of history fits no host");
+        };
+        assert_eq!(shortfall.fit_context_tokens, 1_900_000_000);
+        let device = planned_executor(&environment.draft, &environment.topology).unwrap();
+        let AssessmentFitVerdict::DoesNotFit { deficit_bytes, .. } = prepared
+            .memory_charge_at(1_900_000_000)
+            .unwrap()
+            .assess_fit(
+                &environment.topology,
+                device,
+                &environment.status,
+                &MemoryReserves::standard(),
+            )
+            .unwrap()
+            .verdict
+        else {
+            panic!("expected a shortfall");
+        };
+        assert_eq!(shortfall.deficit_bytes, deficit_bytes);
+    }
+
+    /// The charge at a served context below the ceiling is exactly what a
+    /// load prepared at that context charges. It need not grow with the
+    /// context: a smaller one retains more prefixes, whose address tables
+    /// the stores commit at startup.
+    #[test]
+    fn a_served_context_charge_bounds_a_load_at_that_context() {
+        let ceiling = prepare_execution_assessment(
+            &environment(262_144).definition,
+            &environment(262_144).draft,
+            262_144,
+        )
+        .unwrap();
+        for context in [32_768u32, 65_536, 131_072, 262_144] {
+            let at = environment(u64::from(context));
+            let direct = *prepare_execution_assessment(&at.definition, &at.draft, context)
+                .unwrap()
+                .memory_charge();
+            let tiered = ceiling.memory_charge_at(context).unwrap();
+            assert_eq!(tiered, direct, "{context}");
+            // Prefix retention is bounded by the same conversation at the
+            // served context, not at the ceiling.
+            let state = ceiling.state.at_context(ceiling.method, u64::from(context)).unwrap();
+            assert_eq!(
+                state.capacity().workload_state_bytes,
+                state
+                    .fit_state_bytes(u64::from(context), ceiling.terms.recurrent_banks)
+                    .unwrap()
+            );
+            assert_eq!(tiered.state_bytes, state.capacity().workload_state_bytes);
+        }
+        assert!(ceiling.memory_charge_at(262_145).is_err());
+        assert!(ceiling.memory_charge_at(0).is_err());
+    }
+
+    #[test]
+    fn served_contexts_must_decrease() {
+        let environment = environment(65_536);
+        let prepared =
+            prepare_execution_assessment(&environment.definition, &environment.draft, 65_536)
+                .unwrap();
+        for contexts in [&[][..], &[32_768, 65_536][..], &[65_536, 65_536][..]] {
+            assert!(matches!(
+                assess_execution_fit(
+                    &prepared,
+                    &environment.draft,
+                    &environment.topology,
+                    &environment.status,
+                    &tiered(65_536, contexts, &[]),
+                ),
+                Err(AssessmentError::Plan(_))
+            ));
+        }
     }
 
     #[test]
