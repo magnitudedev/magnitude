@@ -124,7 +124,6 @@ pub struct SlabTensor {
     slabs: Vec<Option<Slab>>,
     addresses: Tensor,
     region_tables: Vec<Tensor>,
-    address_words: Vec<u8>,
     lease: Arc<AtomicUsize>,
 }
 
@@ -147,8 +146,6 @@ impl SlabTensor {
                     .reshape(&[capacity_u64, 2])
             })
             .collect::<Result<Vec<_>, TensorError>>()?;
-        let table_bytes = usize::try_from(table.byte_len())
-            .map_err(|_| TensorError::SlabLayout("address table exceeds host domain".into()))?;
         Ok(Self {
             device: device.clone(),
             rows_per_slab,
@@ -163,7 +160,6 @@ impl SlabTensor {
             slabs: Vec::new(),
             addresses: table,
             region_tables,
-            address_words: vec![0; table_bytes],
             lease: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -386,7 +382,11 @@ impl SlabTensor {
     /// history rows to read.
     fn publish_addresses(&mut self) -> Result<(), TensorError> {
         let stand_in = self.slabs().next().map(|(_, slab)| slab.device_address());
-        let mut next = vec![0; self.address_words.len()];
+        // Built once per publish and written whole: the host keeps no copy
+        // of the table beside the device's.
+        let table_bytes = usize::try_from(self.addresses.byte_len())
+            .map_err(|_| TensorError::SlabLayout("address table exceeds host domain".into()))?;
+        let mut next = vec![0; table_bytes];
         for index in 0..self.capacity {
             let Some(base) = self
                 .slab(index)
@@ -403,11 +403,7 @@ impl SlabTensor {
                 next[position..position + 8].copy_from_slice(&address.to_le_bytes());
             }
         }
-        if next != self.address_words {
-            self.addresses.write_from_host(&next)?;
-            self.address_words = next;
-        }
-        Ok(())
+        self.addresses.write_from_host(&next)
     }
 
     fn ensure_unbound(&self) -> Result<(), TensorError> {

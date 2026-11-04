@@ -129,6 +129,17 @@ impl HostHeap {
     }
 }
 
+/// `vector` in an allocation of exactly its length. A vector grown by
+/// pushes and then shrunk in place (`shrink_to_fit`) reports its length as
+/// its capacity while the allocator may keep the grown block, so a sealed
+/// plan copies each grown vector once into a new allocation of its length:
+/// what its host heap counts is then what the allocator holds.
+fn exact<T>(vector: Vec<T>) -> Vec<T> {
+    let mut exact = Vec::with_capacity(vector.len());
+    exact.extend(vector);
+    exact
+}
+
 /// The lengths of one sealed node's vectors. Its entry's call schema and its
 /// backend's native declaration fix them, whatever the call's extents and
 /// the kernel's tuning: a graph's host heap is known from them before any
@@ -141,20 +152,18 @@ pub struct SealedNodeShape {
     words: usize,
     /// Declared launches, active or not.
     launches: usize,
-    /// Per pair of parameters the entry requires disjoint: each one's
-    /// ordinal and the bytes of its name.
-    disjoint: Vec<[(usize, usize); 2]>,
+    /// Per pair of parameters the entry requires disjoint: their ordinals.
+    disjoint: Vec<[usize; 2]>,
 }
 
 impl SealedNodeShape {
     pub fn of(schema: &CallSchema, implementation: &NativeImplementation) -> Self {
         let parameter = |id| {
-            let ordinal = schema
+            schema
                 .parameters()
                 .iter()
                 .position(|parameter| parameter.id == id)
-                .expect("alias rule names a schema parameter");
-            (ordinal, schema.parameters()[ordinal].name.len())
+                .expect("alias rule names a schema parameter")
         };
         Self {
             buffers: sealed_buffers(schema, implementation),
@@ -470,12 +479,12 @@ impl NativeGraphDraft {
         // A sealed plan's vectors hold exactly their lengths, so its host
         // heap follows from its topology (`NativeGraphPlan::host_heap`,
         // `NativeGraphMetadataDraft::plan_heap`).
-        self.ports.shrink_to_fit();
+        self.ports = exact(self.ports);
         for port in &mut self.ports {
-            port.extents.shrink_to_fit();
-            port.strides.shrink_to_fit();
+            port.extents = exact(std::mem::take(&mut port.extents));
+            port.strides = exact(std::mem::take(&mut port.strides));
         }
-        self.exports.shrink_to_fit();
+        self.exports = exact(self.exports);
         let identity = self.identity;
         let device_identity = self.device.kind.identity();
         let mut results: Vec<Vec<Option<NativeTensorSpec>>> = Vec::with_capacity(self.nodes.len());
@@ -507,20 +516,19 @@ impl NativeGraphDraft {
         } else {
             plan_storage(&self.ports, &planned, &results, &self.exports, &self.stores)
         };
-        self.timelines.shrink_to_fit();
         let mut executable = Executable {
             nodes: Vec::with_capacity(planned.len()),
             external_writes: vec![false; self.ports.len()],
             upload_written: false,
             disjoint: Vec::new(),
-            timelines: self.timelines,
+            timelines: exact(self.timelines),
         };
         for (node, ((kernel, arguments, shape), planned)) in
             shaped.into_iter().zip(&planned).enumerate()
         {
             executable.seal_node(kernel, &arguments, shape, &planned.args, &storage, node);
         }
-        executable.disjoint.shrink_to_fit();
+        executable.disjoint = exact(executable.disjoint);
         Ok(NativeGraphPlan {
             identity,
             device: self.device,
@@ -765,12 +773,10 @@ impl NativeGraphMetadataDraft {
                     })
                     .map(|reference| reference.result)
             };
-            for [(first, first_name), (second, second_name)] in &shape.disjoint {
+            for [first, second] in &shape.disjoint {
                 if let (Some(first), Some(second)) = (external(*first), external(*second)) {
                     if first != second {
                         disjoint += 1;
-                        heap.hold(*first_name, size_of::<u8>());
-                        heap.hold(*second_name, size_of::<u8>());
                     }
                 }
             }
@@ -1381,8 +1387,18 @@ struct PortRange {
     port: usize,
     offset: u64,
     bytes: u64,
-    /// The entry parameter, for the aliasing error.
-    parameter: String,
+    /// The node and the ordinal of its entry parameter, which name the
+    /// parameter in the aliasing error from the node's own schema.
+    node: usize,
+    parameter: usize,
+}
+
+impl PortRange {
+    fn parameter_name(&self, nodes: &[SealedNode]) -> String {
+        nodes[self.node].kernel.schema().parameters()[self.parameter]
+            .name
+            .clone()
+    }
 }
 
 /// The sealed nodes and what a run must check of its external bindings.
@@ -1440,7 +1456,8 @@ impl Executable {
                             port,
                             offset: descriptor.byte_offset,
                             bytes: descriptor.byte_len,
-                            parameter: parameter.name.clone(),
+                            node,
+                            parameter: ordinal,
                         });
                         (Region::External(port), 0)
                     }
@@ -1860,10 +1877,6 @@ impl NativeGraphPlan {
         heap.hold_vec(&self.executable.external_writes);
         heap.hold_vec(&self.executable.timelines);
         heap.hold_vec(&self.executable.disjoint);
-        for (first, second) in &self.executable.disjoint {
-            heap.hold(first.parameter.capacity(), 1);
-            heap.hold(second.parameter.capacity(), 1);
-        }
         heap.hold_vec(&self.results);
         for row in &self.results {
             heap.hold_vec(row);
@@ -2511,9 +2524,10 @@ impl NativeGraphSlot {
                 && first_start < second_end
                 && second_start < first_end
             {
+                let nodes = &self.plan.executable.nodes;
                 return Err(CallError::Invocation(InvocationError::IllegalAliasing {
-                    first: first.parameter.clone(),
-                    second: second.parameter.clone(),
+                    first: first.parameter_name(nodes),
+                    second: second.parameter_name(nodes),
                 }));
             }
         }
