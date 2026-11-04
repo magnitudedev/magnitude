@@ -49,7 +49,7 @@ def plan(arguments, source) -> Plan:
     if arguments.model is not None:
         env += (("MAGNITUDE_ARTIFACTS", "{artifacts}"),)
     if arguments.catalog:
-        env += (("MAGNITUDE_CATALOG_HEADERS", "{catalog}"),)
+        env += (("MAGNITUDE_CATALOG_HEADERS", "{catalog}/headers"),)
     if arguments.suite == "cargo":
         own, binary = cargo.split(_given(arguments))
         build = Step("test build", ("cargo", "test", "--message-format=short", "--no-run", *own))
