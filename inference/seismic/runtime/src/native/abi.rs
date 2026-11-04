@@ -16,6 +16,7 @@ use seismic_lang::entry::{
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::ids::RepresentationId;
+use seismic_lang::native_parameter::native_parameter_names;
 use seismic_lang::registry;
 use seismic_lang::repack::WordTable;
 
@@ -403,26 +404,23 @@ fn render_source_with(
         }
         word += 1;
     }
-    for (ordinal, parameter) in schema.parameters().iter().enumerate() {
-        let name = native_macro(&parameter.name);
-        let named = schema
+    let names = native_parameter_names(
+        &schema
             .parameters()
             .iter()
-            .filter(|candidate| candidate.name == parameter.name)
-            .count()
-            == 1;
+            .map(|parameter| parameter.name.as_str())
+            .collect::<Vec<_>>(),
+    );
+    for ((ordinal, parameter), names) in schema.parameters().iter().enumerate().zip(&names) {
         match &parameter.kind {
             ParameterKind::Tensor {
                 axes,
                 representation,
                 ..
             } => {
-                if named {
-                    prefix.push_str(&format!("#define SEISMIC_BUFFER_{name} {buffer}\n"));
+                for symbol in names.tensor_buffers() {
+                    prefix.push_str(&format!("#define {symbol} {buffer}\n"));
                 }
-                prefix.push_str(&format!(
-                    "#define SEISMIC_PARAM_{ordinal}_BUFFER {buffer}\n"
-                ));
                 let tensor = TensorAbi {
                     representation: *representation,
                     rank: axes.len(),
@@ -432,35 +430,27 @@ fn render_source_with(
                         .expect("a tensor parameter has static geometry"),
                     dialect,
                 };
-                tensor.render(&mut prefix, &format!("SEISMIC_PARAM_{ordinal}"));
-                if named {
-                    tensor.render(&mut prefix, &format!("SEISMIC_{name}"));
+                for symbol in names.tensor_prefixes() {
+                    tensor.render(&mut prefix, &symbol);
                 }
                 buffer += 1;
                 word += axes.len() * 2;
             }
             ParameterKind::Scalar { .. } | ParameterKind::Index { .. } => {
-                prefix.push_str(&format!(
-                    "#define SEISMIC_PARAM_{ordinal} (seismic_words[{word}])\n"
-                ));
-                if named {
-                    prefix.push_str(&format!(
-                        "#define SEISMIC_PARAM_{name} SEISMIC_PARAM_{ordinal}\n"
-                    ));
+                let (symbol, alias) = names.word();
+                prefix.push_str(&format!("#define {symbol} (seismic_words[{word}])\n"));
+                if let Some(alias) = alias {
+                    prefix.push_str(&format!("#define {alias} {symbol}\n"));
                 }
                 word += 1;
             }
             ParameterKind::Range { .. } => {
-                prefix.push_str(&format!(
-                    "#define SEISMIC_PARAM_{ordinal}_START (seismic_words[{word}])\n"
-                ));
-                prefix.push_str(&format!(
-                    "#define SEISMIC_PARAM_{ordinal}_END (seismic_words[{}])\n",
-                    word + 1
-                ));
-                if named {
+                let ([start, end], aliases) = names.range();
+                prefix.push_str(&format!("#define {start} (seismic_words[{word}])\n"));
+                prefix.push_str(&format!("#define {end} (seismic_words[{}])\n", word + 1));
+                if let Some([start_alias, end_alias]) = aliases {
                     prefix.push_str(&format!(
-                        "#define SEISMIC_PARAM_{name}_START SEISMIC_PARAM_{ordinal}_START\n#define SEISMIC_PARAM_{name}_END SEISMIC_PARAM_{ordinal}_END\n"
+                        "#define {start_alias} {start}\n#define {end_alias} {end}\n"
                     ));
                 }
                 word += 2;
