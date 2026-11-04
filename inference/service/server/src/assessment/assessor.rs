@@ -14,7 +14,7 @@ use magnitude_engine::assessment::{
     ModelCapabilities as EngineCapabilities, ModelExecution, ModelPackagePaths, Performance,
     PreparedModelAssessment, ProjectorVerdict as EngineProjectorVerdict,
     SpeculativeMethod as EngineSpeculativeMethod, finish_model_assessment, header_refusal,
-    prepare_model_assessment,
+    prepare_model_assessment, served_contexts,
 };
 use magnitude_artifacts::gguf::Directory;
 use magnitude_engine::error::{UnsupportedModel, UnsupportedReason as EngineUnsupportedReason};
@@ -42,7 +42,9 @@ use sha2::{Digest, Sha256};
 use super::environment::AssessmentEnvironment;
 
 /// The service's performance depths: 25K, 50K and 75K where the context admits them, then the
-/// full context. ACN ranking reads `min(50_000, context)`, which this set contains.
+/// full context. ACN ranking reads `min(50_000, context)`, which this set contains. A profile
+/// asks for the depths of its ceiling; a model is estimated at those of the context it is served
+/// at.
 pub fn performance_depths(context_length: u32) -> Vec<u32> {
     let mut depths = [25_000, 50_000, 75_000]
         .into_iter()
@@ -429,9 +431,10 @@ async fn assess_prepared(
     let depths = profile.performance_context_tokens.clone();
     let engine_environment = Arc::clone(&environment);
     let started = std::time::Instant::now();
+    let contexts = served_contexts(profile.profile.context_length);
     let assessed = crate::spawn_blocking_traced(move || {
         let setup = &engine_environment.setup;
-        finish_model_assessment(&prepared, setup, &depths, PROFILE_SEQUENCES)
+        finish_model_assessment(&prepared, setup, &contexts, &depths, PROFILE_SEQUENCES)
     })
     .await
     .map_err(|error| InventoryError::Internal(format!("model assessment task failed: {error}")))?;
@@ -489,29 +492,36 @@ pub(crate) fn model_assessment(
     let projector = projector_verdict(facts.projector);
     let drafter = drafter_verdict(facts.drafter);
     let assessment_id = assessment_id(bundle_key, &requested, &environment.id);
-    let ModelAssessmentProfile {
-        profile,
-        performance_context_tokens,
-    } = requested;
+    let profile = requested.profile;
     let assessment = match execution {
         ModelExecution::Fits {
-            fit: ExecutionFit { domains, .. },
+            fit:
+                ExecutionFit {
+                    fit_context_tokens,
+                    domains,
+                },
             performance,
         } => ModelAssessment::Fits {
             profile,
+            served: magnitude_service_contracts::models::ServingProfile {
+                context_length: fit_context_tokens,
+            },
             assessment_id,
             memory: memory_assessments(&domains, environment),
-            performance: model_performance(performance, &performance_context_tokens)?,
+            performance: model_performance(performance, &performance_depths(fit_context_tokens))?,
             projector,
             drafter,
         },
         ModelExecution::DoesNotFit(ExecutionShortfall {
+            fit_context_tokens,
             domains,
             limiting,
             deficit_bytes,
-            ..
         }) => ModelAssessment::DoesNotFit {
             profile,
+            shortfall: magnitude_service_contracts::models::ServingProfile {
+                context_length: fit_context_tokens,
+            },
             assessment_id,
             memory: memory_assessments(&domains, environment),
             limiting_resource: domain_id(limiting, environment).as_str().to_owned(),

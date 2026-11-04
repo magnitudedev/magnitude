@@ -2393,19 +2393,24 @@ pub enum MeasurementState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase")]
 pub enum ModelAssessment {
-    /// A fitting model, with its decode-speed estimates.
+    /// A fitting model at `served`, the largest context tier within `profile` at which its
+    /// standard workload fits this computer, with its decode-speed estimates up to it.
     #[serde(rename_all = "camelCase")]
     Fits {
         profile: ServingProfile,
+        served: ServingProfile,
         assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
         performance: ModelPerformance,
         projector: ProjectorVerdict,
         drafter: DrafterVerdict,
     },
+    /// A model that fits at no context tier: `deficit_bytes` is its shortfall at the smallest,
+    /// `shortfall`.
     #[serde(rename_all = "camelCase")]
     DoesNotFit {
         profile: ServingProfile,
+        shortfall: ServingProfile,
         assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
         limiting_resource: String,

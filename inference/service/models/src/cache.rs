@@ -391,6 +391,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let fits = ModelAssessment::Fits {
             profile: profile(50_000),
+            served: profile(50_000),
             assessment_id: ModelAssessmentId("fits-assessment".to_owned()),
             memory: vec![MemoryAssessment {
                 memory_domain_id: MemoryDomainId::system(),
@@ -410,6 +411,7 @@ mod tests {
         };
         let does_not_fit = ModelAssessment::DoesNotFit {
             profile: profile(100_000),
+            shortfall: profile(32_768),
             assessment_id: ModelAssessmentId("non-fit-assessment".to_owned()),
             memory: vec![MemoryAssessment {
                 memory_domain_id: MemoryDomainId::system(),

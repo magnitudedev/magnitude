@@ -154,17 +154,44 @@ impl ModelInstances {
         let _ = self.assessments.set(assessments);
     }
 
-    /// Refuse a load the assessment says cannot fit or the engine cannot run, before the residency
-    /// replaces anything. A model not yet assessed is admitted: the engine's own resource plan
-    /// still guards it.
-    async fn admit(&self, target: &ResolvedResidencyTarget) -> Result<(), InventoryError> {
+    /// The residency target serving `model_id`: its configuration at the context its assessment
+    /// serves it at, so a change of that context is a different instance. A load the assessment
+    /// says cannot fit or the engine cannot run is refused before the residency replaces anything.
+    /// A model still being assessed waits for its verdict, since nothing else bounds the context
+    /// it would serve. A model whose assessment failed, or a service without an assessment pool,
+    /// serves the full context, guarded only by the engine's own resource plan.
+    async fn serving_target(&self, model_id: &str) -> Result<ResolvedResidencyTarget, InventoryError> {
+        let target = self.target(model_id)?;
         let Some(assessments) = self.assessments.get() else {
-            return Ok(());
+            return Ok(target);
         };
-        let snapshot = assessments.snapshot().await?;
-        match assessed_refusal(&snapshot, &target.model_id, &target.configuration.profile) {
-            Some(refusal) => Err(refusal),
-            None => Ok(()),
+        let mut changes = assessments.watch();
+        let deadline = tokio::time::Instant::now() + ASSESSMENT_WAIT;
+        loop {
+            let snapshot = assessments.snapshot().await?;
+            match served_profile(&snapshot, &target.model_id, &target.configuration.profile) {
+                ServedProfile::Served(profile) => {
+                    return Ok(residency_target(
+                        target.model_id,
+                        ModelServingConfiguration {
+                            profile,
+                            ..target.configuration
+                        },
+                    ));
+                }
+                ServedProfile::Refused(refusal) => return Err(refusal),
+                ServedProfile::Unassessed => return Ok(target),
+                ServedProfile::Assessing => {}
+            }
+            match tokio::time::timeout_at(deadline, changes.next()).await {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => {
+                    return Err(InventoryError::NotReady(format!(
+                        "{} is still being assessed for this computer",
+                        target.model_id
+                    )));
+                }
+            }
         }
     }
 
@@ -184,7 +211,7 @@ impl ModelInstances {
 
     /// What loading `model_id` now would use: the engine's preview on this service's catalog.
     pub async fn preview_load(&self, model_id: &str) -> Result<ModelLoadPlan, InventoryError> {
-        let target = self.target(model_id)?;
+        let target = self.serving_target(model_id).await?;
         let resolved = self
             .environment
             .configurations
@@ -198,8 +225,7 @@ impl ModelInstances {
 
     /// Make `model_id` resident without leasing it.
     pub async fn ensure_resident(&self, model_id: &str) -> Result<ModelInstance, InventoryError> {
-        let target = self.target(model_id)?;
-        self.admit(&target).await?;
+        let target = self.serving_target(model_id).await?;
         let _request = self.requested(&target);
         match self
             .residency
@@ -217,8 +243,7 @@ impl ModelInstances {
         model_id: &str,
         progress: Option<LoadingObserver>,
     ) -> Result<ResidencyLease<ResidentEngine>, InventoryError> {
-        let target = self.target(model_id)?;
-        self.admit(&target).await?;
+        let target = self.serving_target(model_id).await?;
         let _request = self.requested(&target);
         match self
             .residency
@@ -361,42 +386,90 @@ impl CatalogPackageRemover for ModelInstances {
     }
 }
 
-/// The refusal for `model_id` served at `profile` when its assessment does not fit there, or when
-/// the engine cannot run it at all, with the engine's reasons.
-fn assessed_refusal(
+/// How long a load waits for its model's assessment, which reads only headers.
+const ASSESSMENT_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// What the assessment of `model_id` at `profile`, its ceiling, says it serves.
+enum ServedProfile {
+    /// It fits at this context.
+    Served(ServingProfile),
+    /// It fits at no context, or the engine cannot run it, with the engine's reasons.
+    Refused(InventoryError),
+    /// Its assessment is still to come.
+    Assessing,
+    /// Its assessments ended without a verdict for the profile: one failed.
+    Unassessed,
+}
+
+fn served_profile(
     snapshot: &ModelAssessmentsSnapshot,
     model_id: &ModelId,
     profile: &ServingProfile,
-) -> Option<InventoryError> {
-    [&snapshot.catalog, &snapshot.custom]
+) -> ServedProfile {
+    let entries = [&snapshot.catalog, &snapshot.custom]
         .into_iter()
         .flat_map(|domain| match domain {
             ModelAssessmentDomainSnapshot::Available { entries, .. } => entries.as_slice(),
             ModelAssessmentDomainSnapshot::Pending { .. } => &[],
         })
         .filter(|entry| entry.subject.model_id() == model_id)
+        .collect::<Vec<_>>();
+    let assessed = entries
+        .iter()
         .filter_map(|entry| match &entry.state {
             ModelAssessmentEntryState::Assessed { profiles, .. } => Some(profiles),
             _ => None,
         })
         .flatten()
         .find_map(|assessment| match assessment {
+            ModelAssessment::Fits {
+                profile: assessed,
+                served,
+                ..
+            } if assessed == profile => Some(ServedProfile::Served(served.clone())),
             ModelAssessment::DoesNotFit {
                 profile: assessed,
+                shortfall,
                 deficit_bytes,
                 ..
-            } if assessed == profile => Some(InventoryError::DoesNotFit(format!(
-                "{model_id} needs {} more memory than this computer can provide",
-                memory_size(*deficit_bytes)
+            } if assessed == profile => Some(ServedProfile::Refused(InventoryError::DoesNotFit(
+                format!(
+                    "{model_id} needs {} more memory than this computer can provide, even for a {} context",
+                    memory_size(*deficit_bytes),
+                    context_size(shortfall.context_length)
+                ),
             ))),
             ModelAssessment::Unsupported {
                 reasons, detail, ..
-            } => Some(InventoryError::ModelUnsupported {
+            } => Some(ServedProfile::Refused(InventoryError::ModelUnsupported {
                 message: format!("Magnitude can't run {model_id}: {detail}"),
                 reasons: reasons.clone(),
-            }),
+            })),
             _ => None,
-        })
+        });
+    // Without a verdict for the profile, the load waits while any of the model's assessments is
+    // still to come (none listed yet, or one assessing); once all have ended without one, it
+    // has none to wait for.
+    match assessed {
+        Some(served) => served,
+        None if entries.is_empty()
+            || entries
+                .iter()
+                .any(|entry| matches!(entry.state, ModelAssessmentEntryState::Assessing)) =>
+        {
+            ServedProfile::Assessing
+        }
+        None => ServedProfile::Unassessed,
+    }
+}
+
+/// A context as people name it: 32K for 32,768 tokens.
+fn context_size(tokens: u32) -> String {
+    if tokens >= 1024 && tokens % 1024 == 0 {
+        format!("{}K", tokens / 1024)
+    } else {
+        format!("{tokens}-token")
+    }
 }
 
 /// `bytes` as the clients show a shortfall: binary units from MB, one decimal, rounded up.
@@ -956,6 +1029,21 @@ mod tests {
     const MODEL: &str = "qwen3.5-4b:gguf:q4";
 
     fn snapshot(model: &str, assessment: serde_json::Value) -> ModelAssessmentsSnapshot {
+        snapshot_in(
+            model,
+            serde_json::json!({
+                "_tag": "Assessed",
+                "capabilities": {
+                    "vision": false, "tools": true, "structuredOutput": true,
+                    "reasoning": { "supported": false, "efforts": [] },
+                },
+                "templateFingerprint": "template",
+                "profiles": [assessment],
+            }),
+        )
+    }
+
+    fn snapshot_in(model: &str, state: serde_json::Value) -> ModelAssessmentsSnapshot {
         serde_json::from_value(serde_json::json!({
             "revision": 1,
             "environmentId": "environment",
@@ -964,15 +1052,7 @@ mod tests {
                 "sourceRevision": 1,
                 "entries": [{
                     "subject": { "_tag": "Catalog", "modelId": model, "selection": "Effective" },
-                    "state": {
-                        "_tag": "Assessed",
-                        "capabilities": {
-                            "vision": false, "tools": true, "structuredOutput": true,
-                            "reasoning": { "supported": false, "efforts": [] },
-                        },
-                        "templateFingerprint": "template",
-                        "profiles": [assessment],
-                    },
+                    "state": state,
                 }],
             },
             "custom": { "_tag": "Pending", "sourceRevision": 0 },
@@ -985,6 +1065,7 @@ mod tests {
         serde_json::json!({
             "_tag": "DoesNotFit",
             "profile": { "contextLength": context_length },
+            "shortfall": { "contextLength": 32_768 },
             "assessmentId": "assessment",
             "memory": [],
             "limitingResource": "gpu",
@@ -994,44 +1075,75 @@ mod tests {
         })
     }
 
-    fn model_id(model: &str) -> ModelId {
-        model.parse().expect("model id")
-    }
-
-    #[test]
-    fn a_load_assessed_as_not_fitting_is_refused_with_the_shortfall() {
-        let snapshot = snapshot(MODEL, does_not_fit(262_144, 1_825_361_000));
-        let refusal = assessed_refusal(
-            &snapshot,
-            &model_id(MODEL),
-            &ServingProfile { context_length: 262_144 },
-        );
-        let Some(InventoryError::DoesNotFit(message)) = refusal else {
-            panic!("expected a does-not-fit refusal, got {refusal:?}");
-        };
-        assert_eq!(
-            message,
-            format!("{MODEL} needs 1.7 GB more memory than this computer can provide")
-        );
-    }
-
-    #[test]
-    fn fitting_unassessed_or_other_profile_loads_are_admitted() {
-        let fits = serde_json::json!({
+    fn fits(context_length: u32, served: u32) -> serde_json::Value {
+        serde_json::json!({
             "_tag": "Fits",
-            "profile": { "contextLength": 262_144 },
+            "profile": { "contextLength": context_length },
+            "served": { "contextLength": served },
             "assessmentId": "assessment",
             "memory": [],
             "performance": { "_tag": "Pending" },
             "projector": { "_tag": "None" },
             "drafter": { "_tag": "None" },
-        });
-        let profile = ServingProfile { context_length: 262_144 };
-        assert!(assessed_refusal(&snapshot(MODEL, fits), &model_id(MODEL), &profile).is_none());
-        let other_profile = snapshot(MODEL, does_not_fit(131_072, 1));
-        assert!(assessed_refusal(&other_profile, &model_id(MODEL), &profile).is_none());
-        let other_model = snapshot("other:gguf:q4", does_not_fit(262_144, 1));
-        assert!(assessed_refusal(&other_model, &model_id(MODEL), &profile).is_none());
+        })
+    }
+
+    fn model_id(model: &str) -> ModelId {
+        model.parse().expect("model id")
+    }
+
+    const CEILING: ServingProfile = ServingProfile { context_length: 262_144 };
+
+    #[test]
+    fn a_load_assessed_as_not_fitting_is_refused_with_the_shortfall() {
+        let snapshot = snapshot(MODEL, does_not_fit(262_144, 1_825_361_000));
+        let ServedProfile::Refused(InventoryError::DoesNotFit(message)) =
+            served_profile(&snapshot, &model_id(MODEL), &CEILING)
+        else {
+            panic!("expected a does-not-fit refusal");
+        };
+        assert_eq!(
+            message,
+            format!(
+                "{MODEL} needs 1.7 GB more memory than this computer can provide, even for a 32K context"
+            )
+        );
+    }
+
+    #[test]
+    fn a_fitting_load_serves_its_assessed_context() {
+        let ServedProfile::Served(served) =
+            served_profile(&snapshot(MODEL, fits(262_144, 65_536)), &model_id(MODEL), &CEILING)
+        else {
+            panic!("expected the served profile");
+        };
+        assert_eq!(served, ServingProfile { context_length: 65_536 });
+    }
+
+    #[test]
+    fn a_load_waits_for_its_assessment() {
+        let pending = |snapshot: &ModelAssessmentsSnapshot| {
+            matches!(
+                served_profile(snapshot, &model_id(MODEL), &CEILING),
+                ServedProfile::Assessing
+            )
+        };
+        assert!(pending(&snapshot_in(MODEL, serde_json::json!({ "_tag": "Assessing" }))));
+        assert!(pending(&snapshot("other:gguf:q4", does_not_fit(262_144, 1))));
+        // A verdict for another profile only, with no assessment to come, leaves nothing to wait
+        // for; nor does a failed one.
+        assert!(matches!(
+            served_profile(&snapshot(MODEL, does_not_fit(131_072, 1)), &model_id(MODEL), &CEILING),
+            ServedProfile::Unassessed
+        ));
+        assert!(matches!(
+            served_profile(
+                &snapshot_in(MODEL, serde_json::json!({ "_tag": "Dropped" })),
+                &model_id(MODEL),
+                &CEILING
+            ),
+            ServedProfile::Unassessed
+        ));
     }
 
     #[test]
@@ -1045,13 +1157,10 @@ mod tests {
                 "detail": "no family recognizes deepseek4",
             }),
         );
-        let refusal = assessed_refusal(
-            &snapshot,
-            &model_id(MODEL),
-            &ServingProfile { context_length: 262_144 },
-        );
-        let Some(InventoryError::ModelUnsupported { message, reasons }) = refusal else {
-            panic!("expected an unsupported refusal, got {refusal:?}");
+        let ServedProfile::Refused(InventoryError::ModelUnsupported { message, reasons }) =
+            served_profile(&snapshot, &model_id(MODEL), &CEILING)
+        else {
+            panic!("expected an unsupported refusal");
         };
         assert_eq!(
             message,
@@ -1061,6 +1170,14 @@ mod tests {
             serde_json::to_value(&reasons).unwrap(),
             serde_json::json!([{ "_tag": "Architecture", "architecture": "deepseek4" }])
         );
+    }
+
+    #[test]
+    fn contexts_read_as_people_name_them() {
+        assert_eq!(context_size(32_768), "32K");
+        assert_eq!(context_size(262_144), "256K");
+        assert_eq!(context_size(40_960), "40K");
+        assert_eq!(context_size(8_000), "8000-token");
     }
 
     #[test]

@@ -1227,6 +1227,7 @@ mod tests {
             template_fingerprint: String::new(),
             fingerprint: None,
             profile: ModelAssessment::Fits {
+                served: profile.clone(),
                 profile,
                 assessment_id: magnitude_service_contracts::models::ModelAssessmentId(
                     "assessment".to_owned(),

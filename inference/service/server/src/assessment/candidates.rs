@@ -14,7 +14,7 @@ use futures_util::future::BoxFuture;
 use magnitude_artifacts::Error as ArtifactError;
 use magnitude_artifacts::gguf::{FileHeader, HeaderSource};
 use magnitude_engine::assessment::{
-    ModelPackagePaths, PreparedModelAssessment, finish_model_assessment,
+    ModelPackagePaths, PreparedModelAssessment, finish_model_assessment, served_contexts,
     prepare_model_assessment_from,
 };
 use magnitude_engine::fingerprint::ModelFingerprint as EngineModelFingerprint;
@@ -863,9 +863,16 @@ impl ManagedModelCandidates {
             performance_context_tokens: performance_depths(context),
         };
         let depths = profile.performance_context_tokens.clone();
+        let contexts = served_contexts(context);
         let finish_environment = Arc::clone(&environment);
         let assessed = crate::spawn_blocking_traced(move || {
-            finish_model_assessment(&prepared, &finish_environment.setup, &depths, PROFILE_SEQUENCES)
+            finish_model_assessment(
+                &prepared,
+                &finish_environment.setup,
+                &contexts,
+                &depths,
+                PROFILE_SEQUENCES,
+            )
         })
         .await
         .map_err(|error| InventoryError::Internal(format!("candidate assessment failed: {error}")))?
@@ -3860,25 +3867,38 @@ fn candidate_versions(
         .collect()
 }
 
-/// The recommended version: the largest fitting Q4_K-class version, else the largest fitting one.
+/// The recommended version: among the fitting versions, those served at a working context first
+/// (see [`WORKING_CONTEXT`]), then Q4_K-class ones, then the largest. A Q8 served at 32K is a
+/// worse coding model than a Q6 served at 128K.
 fn recommended_version<'a>(
     versions: impl Iterator<Item = (&'a ClassifiedGroup, Option<&'a CachedModelAssessment>)>,
 ) -> Option<usize> {
     versions
         .enumerate()
-        .filter(|(_, (_, assessment))| {
-            matches!(
-                assessment.map(|assessment| &assessment.profile),
-                Some(ModelAssessment::Fits { .. })
-            )
+        .filter_map(|(index, (group, assessment))| {
+            match assessment.map(|assessment| &assessment.profile) {
+                Some(ModelAssessment::Fits {
+                    profile, served, ..
+                }) => Some((index, group, working_context(profile, served))),
+                _ => None,
+            }
         })
-        .max_by_key(|(_, (group, _))| {
+        .max_by_key(|(_, group, working)| {
             (
+                *working,
                 group.quantization.as_deref().is_some_and(is_q4_k_class),
                 group.group.size_bytes(),
             )
         })
-        .map(|(index, _)| index)
+        .map(|(index, _, _)| index)
+}
+
+/// The context a version should be served at to be recommended over one that fits only a smaller
+/// context: 64K, or the model's whole context when it is trained for less.
+const WORKING_CONTEXT: u32 = 65_536;
+
+fn working_context(profile: &ServingProfile, served: &ServingProfile) -> bool {
+    served.context_length >= profile.context_length.min(WORKING_CONTEXT)
 }
 
 /// Each version's label, distinct among its candidate's: its quantization label (see
@@ -4006,6 +4026,79 @@ mod hub_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_recommended_version_is_served_at_a_working_context_first() {
+        let group = |name: &str, quantization: &str, size_bytes: u64| ClassifiedGroup {
+            group: GgufGroup {
+                files: vec![CandidateGguf {
+                    path: PathBuf::from(name),
+                    size_bytes,
+                }],
+            },
+            role: CandidateFileRole::Target { architecture: None },
+            header_digest: String::new(),
+            local_digest: None,
+            local_id: None,
+            quantization: Some(quantization.to_owned()),
+            embedded_mtp: false,
+            unreadable: None,
+        };
+        let fits = |ceiling: u32, served: u32| CachedModelAssessment {
+            capabilities: serde_json::from_value(serde_json::json!({
+                "vision": false, "tools": false, "structuredOutput": false,
+                "reasoning": { "supported": false, "efforts": [] },
+            }))
+            .unwrap(),
+            template_fingerprint: String::new(),
+            fingerprint: None,
+            profile: ModelAssessment::Fits {
+                profile: ServingProfile {
+                    context_length: ceiling,
+                },
+                served: ServingProfile {
+                    context_length: served,
+                },
+                assessment_id: magnitude_service_contracts::models::ModelAssessmentId(String::new()),
+                memory: Vec::new(),
+                performance: magnitude_service_contracts::models::ModelPerformance::Pending,
+                projector: magnitude_service_contracts::models::ProjectorVerdict::None,
+                drafter: magnitude_service_contracts::models::DrafterVerdict::None,
+            },
+        };
+        let versions = [
+            group("q8.gguf", "Q8_0", 30),
+            group("q6.gguf", "Q6_K", 22),
+            group("q4.gguf", "Q4_K_M", 16),
+        ];
+        let pick = |assessments: [CachedModelAssessment; 3]| {
+            recommended_version(versions.iter().zip(assessments.iter().map(Some)))
+        };
+        // Every version at 256K: the Q4_K-class one.
+        assert_eq!(
+            pick([fits(262_144, 262_144), fits(262_144, 262_144), fits(262_144, 262_144)]),
+            Some(2)
+        );
+        // The Q4 and Q6 reach 64K, the Q8 only 32K: the largest at 64K or more.
+        assert_eq!(
+            pick([fits(262_144, 32_768), fits(262_144, 65_536), fits(262_144, 131_072)]),
+            Some(2)
+        );
+        assert_eq!(
+            pick([fits(262_144, 32_768), fits(262_144, 65_536), fits(262_144, 32_768)]),
+            Some(1)
+        );
+        // None reaches 64K: the Q4_K-class one at 32K.
+        assert_eq!(
+            pick([fits(262_144, 32_768), fits(262_144, 32_768), fits(262_144, 32_768)]),
+            Some(2)
+        );
+        // A model trained for 40K works at its whole context.
+        assert_eq!(
+            pick([fits(40_960, 40_960), fits(40_960, 32_768), fits(40_960, 32_768)]),
+            Some(0)
+        );
+    }
 
     fn minimal_gguf() -> Vec<u8> {
         let string = |bytes: &mut Vec<u8>, value: &str| {
