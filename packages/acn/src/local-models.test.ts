@@ -36,6 +36,7 @@ describe("local model serving projection", () => {
       assessment: {
         _tag: "Fits",
         profile: { contextLength: 32_768 },
+        served: { contextLength: 32_768 },
         performance: { _tag: "Pending", measurement: { _tag: "Measuring" } },
       },
       capabilities: {
@@ -87,6 +88,7 @@ describe("local model serving projection", () => {
               _tag: "Fits",
               assessmentId: "assessment",
               profile: { contextLength: 4096 },
+              served: { contextLength: 4096 },
               memory: [],
               performance: { _tag: "Estimated", samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }] },
               drafter: { _tag: "None" },
@@ -182,6 +184,7 @@ describe("automatic assessment projection", () => {
           _tag: "Fits",
           assessmentId: "assessment",
           profile: { contextLength: 4096 },
+          served: { contextLength: 4096 },
           memory: [],
           performance: { _tag: "Estimated", samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }] },
           drafter: { _tag: "None" },
@@ -228,6 +231,7 @@ describe("automatic assessment projection", () => {
             profiles: [{
               _tag: "Fits",
               profile: { contextLength: 32_768 },
+              served: { contextLength: 32_768 },
               assessmentId: "assessment",
               memory: [],
               performance: { _tag: "Pending" },

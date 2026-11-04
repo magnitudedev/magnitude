@@ -1108,7 +1108,7 @@ describe("--json internal identities", () => {
   it("keeps the product facts of each assessment", () => {
     const status = encode(modelsStatusJson, statusView({ models: [makeFoundModel()] }))
     expect((status.models as { servingState: { assessment: Record<string, unknown> } }[])[0]!.servingState.assessment)
-      .toMatchObject({ _tag: "Fits", profile: { contextLength: expect.any(Number) }, memory: { totalRequiredBytes: expect.any(Number) } })
+      .toMatchObject({ _tag: "Fits", profile: { contextLength: expect.any(Number) }, served: { contextLength: expect.any(Number) }, memory: { totalRequiredBytes: expect.any(Number) } })
     const hardware = encode(hardwareJson, { hardware: makeHardware(), models: [loading(makeFoundModel())] })
     expect(hardware.currentModel).toMatchObject({ _tag: "Custom", modelId: FOUND_MODEL_ID, servingState: { _tag: "Assessed" } })
     const inspection = encode(inspectionJson, { inspection: makeInspection(), drafters: [], models: [] })

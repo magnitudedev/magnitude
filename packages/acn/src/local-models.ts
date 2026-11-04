@@ -177,6 +177,7 @@ export const projectAssessment = (
     return decodeLocalModelAssessment({
       _tag: "Fits", assessmentId: assessment.assessmentId, environmentId,
       profile: assessment.profile,
+      served: assessment.served,
       memory: {
         domains: assessment.memory, totalRequiredBytes, requiredSystemMemoryBytes,
       },
@@ -187,6 +188,7 @@ export const projectAssessment = (
     return decodeLocalModelAssessment({
       _tag: "DoesNotFit", assessmentId: assessment.assessmentId, environmentId,
       profile: assessment.profile,
+      shortfall: assessment.shortfall,
       memoryDomains: assessment.memory,
       totalRequiredBytes: assessment.memory.reduce((total, item) => total + item.requiredBytes, 0),
       deficitBytes: assessment.deficitBytes, limitingResource: assessment.limitingResource,
@@ -316,7 +318,7 @@ export const catalogModelServingState = (
         _tag: "Assessed", ...assessed, assessment: assessment.assessment,
         rankingScores: modelRankingScores({
           ...catalogScores,
-          profile: assessment.assessment.profile,
+          profile: assessment.assessment.served,
           performance: assessment.assessment.performance,
         }),
       }

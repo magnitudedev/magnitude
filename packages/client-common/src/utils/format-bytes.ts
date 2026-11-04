@@ -120,3 +120,10 @@ export const formatTransferRate = (bytesPerSecond: number): string => {
   const megabytes = bytesPerSecond / DECIMAL_MEGABYTE
   return `${megabytes >= 10 ? Math.round(megabytes) : megabytes.toFixed(1)} MB/s`
 }
+
+/** A context length as people name it: 32K for 32,768 tokens. */
+export const formatContext = (tokens: number): string => tokens < 1_000
+  ? String(tokens)
+  : tokens % 1_024 === 0
+    ? `${tokens / 1_024}K`
+    : `${Math.round(tokens / 1_000)}K`

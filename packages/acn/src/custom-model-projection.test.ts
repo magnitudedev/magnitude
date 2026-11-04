@@ -36,6 +36,7 @@ const fits = assessed({
   assessmentId: "assessment",
   environmentId: "environment",
   profile: { contextLength: 32_768 },
+  served: { contextLength: 32_768 },
   memory: { domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0 },
   performance: { _tag: "Estimated", samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 30 }] },
 })
@@ -359,6 +360,7 @@ describe("local models state", () => {
             memory: [],
             performance: { _tag: "Estimated", samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 30 }] },
             profile: { contextLength: 32_768 },
+            served: { contextLength: 32_768 },
           }],
         },
       })),

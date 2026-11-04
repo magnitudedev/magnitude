@@ -264,6 +264,7 @@ describe("LocalModelSchema invariants", () => {
         assessmentId: "assessment",
         environmentId: "environment",
         profile: { contextLength: 4096 },
+        served: { contextLength: 4096 },
         memory: {
           domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0,
         },
@@ -295,6 +296,7 @@ describe("LocalModelSchema invariants", () => {
         assessmentId: "assessment",
         environmentId: "environment",
         profile: { contextLength: 4096 },
+        served: { contextLength: 4096 },
         memory: {
           domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0,
         },

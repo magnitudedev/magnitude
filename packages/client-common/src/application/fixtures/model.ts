@@ -57,6 +57,7 @@ export const makeSetupModel = (installed: boolean): Extract<LocalModel, { readon
       assessment: {
         _tag: "Fits",
         profile: { contextLength: 32_768 },
+        served: { contextLength: 32_768 },
         assessmentId: ModelAssessmentIdSchema.make("setup-assessment"),
         environmentId: AssessmentEnvironmentIdSchema.make("setup-environment"),
         memory: {
@@ -127,6 +128,7 @@ export const makeFoundModel = (
     assessment: {
       _tag: "Fits",
       profile: { contextLength: 32_768 },
+      served: { contextLength: 32_768 },
       assessmentId: ModelAssessmentIdSchema.make("found-assessment"),
       environmentId: AssessmentEnvironmentIdSchema.make("setup-environment"),
       memory: { domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0 },

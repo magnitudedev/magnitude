@@ -95,6 +95,7 @@ const metadata = {
 export const fitsAssessment = (): Extract<LocalModelAssessment, { readonly _tag: "Fits" }> => ({
   _tag: "Fits",
   profile: { contextLength: CONTEXT_LENGTH },
+  served: { contextLength: CONTEXT_LENGTH },
   assessmentId: ModelAssessmentIdSchema.make("assessment_test"),
   environmentId: ENVIRONMENT_ID,
   memory: { domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0 },
@@ -104,6 +105,7 @@ export const fitsAssessment = (): Extract<LocalModelAssessment, { readonly _tag:
 export const doesNotFitAssessment = (): LocalModelAssessment => ({
   _tag: "DoesNotFit",
   profile: { contextLength: CONTEXT_LENGTH },
+  shortfall: { contextLength: 32_768 },
   assessmentId: ModelAssessmentIdSchema.make("assessment_large"),
   environmentId: ENVIRONMENT_ID,
   memoryDomains: [],

@@ -759,20 +759,26 @@ export const LocalModelMemorySchema = Schema.Struct({
 }, { message: () => "local model memory totals and domains must agree with their evidence" }))
 export type LocalModelMemory = typeof LocalModelMemorySchema.Type
 
-/** A fitting model, with its decode speed. */
+/**
+ * A fitting model served at `served`, the largest context tier within its own `profile` that fits
+ * this computer, with its decode speed up to it.
+ */
 export const LocalModelFitsAssessmentSchema = Schema.TaggedStruct("Fits", {
   assessmentId: ModelAssessmentIdSchema,
   environmentId: AssessmentEnvironmentIdSchema,
   profile: ServingProfileSchema,
+  served: ServingProfileSchema,
   memory: LocalModelMemorySchema,
   performance: LocalModelPerformanceSchema,
 })
 export type LocalModelFitsAssessment = typeof LocalModelFitsAssessmentSchema.Type
 
+/** A model that fits at no context tier: `deficitBytes` is its shortfall at the smallest, `shortfall`. */
 export const LocalModelDoesNotFitAssessmentSchema = Schema.TaggedStruct("DoesNotFit", {
   assessmentId: ModelAssessmentIdSchema,
   environmentId: AssessmentEnvironmentIdSchema,
   profile: ServingProfileSchema,
+  shortfall: ServingProfileSchema,
   memoryDomains: Schema.Array(MemoryAssessmentSchema),
   totalRequiredBytes: NonNegativeSafeInteger,
   deficitBytes: NonNegativeSafeInteger,

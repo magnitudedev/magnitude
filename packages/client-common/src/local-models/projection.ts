@@ -11,6 +11,7 @@ export {
   localModelProviderModelId,
   localModelResidency,
   localModelServingState,
+  localModelContextLimit,
   localModelServingProfile,
   localModelStorageBytes,
   preselectedDrafterCandidate,

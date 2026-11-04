@@ -35,12 +35,29 @@ export const localModelAssessmentProfile = (
   ? assessment.profile
   : Option.some(assessment.profile)
 
+/** The context a fitting model is served at on this computer; one that doesn't fit is served at none. */
+export const localModelAssessmentServedProfile = (
+  assessment: LocalModelAssessment,
+): Option.Option<ServingProfile> => assessment._tag === "Fits"
+  ? Option.some(assessment.served)
+  : Option.none()
+
 /**
- * The profile a model's assessment was made for, the context clients show. Until the model is
- * assessed (still downloading, or assessing) its serving state names only the profile it will be
- * assessed for, a placeholder for a model whose files aren't read yet, so there is none to show.
+ * The context clients show: the one a fitting model is served at, otherwise the profile its
+ * assessment was made for. Until the model is assessed (still downloading, or assessing) its
+ * serving state names only the profile it will be assessed for, a placeholder for a model whose
+ * files aren't read yet, so there is none to show.
  */
 export const localModelServingProfile = (
+  model: LocalModel,
+): Option.Option<ServingProfile> => {
+  if (model.servingState._tag !== "Assessed") return Option.none()
+  const { assessment } = model.servingState
+  return assessment._tag === "Fits" ? Option.some(assessment.served) : localModelAssessmentProfile(assessment)
+}
+
+/** The model's own context, which a fitting model may be served below on this computer. */
+export const localModelContextLimit = (
   model: LocalModel,
 ): Option.Option<ServingProfile> => model.servingState._tag === "Assessed"
   ? localModelAssessmentProfile(model.servingState.assessment)

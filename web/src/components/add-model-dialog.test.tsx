@@ -88,6 +88,9 @@ describe("repository step", () => {
     expect(versionVerdict(version("Q4_K_P", { recommended: true }))).toMatchObject({ label: "Recommended", selectable: true })
     expect(versionVerdict(version("Q5_K_P"))).toMatchObject({ label: "Fits your machine", selectable: true })
     expect(versionVerdict(version("Q8_K_P", { assessment: Option.some(doesNotFit) }))).toMatchObject({ label: "Too large for this machine", selectable: false })
+    const reduced = Option.some({ ...fits, profile: { contextLength: 262_144 }, served: { contextLength: 65_536 } })
+    expect(versionVerdict(version("Q6_K", { assessment: reduced }))).toMatchObject({ label: "Fits your machine · 64K context", selectable: true })
+    expect(versionVerdict(version("Q4_K_M", { assessment: reduced, recommended: true }))).toMatchObject({ label: "Recommended · 64K context" })
     expect(versionVerdict(version("IQ2_M", { assessment: Option.some(unsupported({ _tag: "WeightTypes", types: [{ ggmlType: "IQ2_S", tensorCount: 100 }] })) }))).toMatchObject({ label: "Not supported yet", detail: "Uses IQ2_S weights, which Magnitude doesn't support yet", selectable: false })
   })
   it("says Not supported only for an architecture without kernels, Can't read this file when unreadable, and Not supported yet otherwise", () => {

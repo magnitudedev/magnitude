@@ -10,6 +10,7 @@ import {
   describeModelLoadFailure,
   modelStoppedForMemory,
   localModelResidency,
+  localModelContextLimit,
   localModelServingProfile,
   localModelServingState,
 } from "@magnitudedev/client-common"
@@ -47,9 +48,15 @@ export const isCatalogModel = (model: LocalModel): model is CatalogLocalModel =>
 
 export const residencyState = (model: LocalModel) => Option.getOrUndefined(localModelResidency(model))
 
+/** The context a model is served at, with its own when this computer serves it at less. */
 export const modelContext = (model: LocalModel): string => Option.match(localModelServingProfile(model), {
   onNone: () => "—",
-  onSome: ({ contextLength }) => formatContext(contextLength),
+  onSome: ({ contextLength }) => Option.match(localModelContextLimit(model), {
+    onNone: () => formatContext(contextLength),
+    onSome: (limit) => limit.contextLength > contextLength
+      ? `${formatContext(contextLength)} of ${formatContext(limit.contextLength)}`
+      : formatContext(contextLength),
+  }),
 })
 
 export const modelMemoryBytes = (model: LocalModel): number | undefined => {

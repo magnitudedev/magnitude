@@ -3,7 +3,7 @@ import { Cause, Exit, Option } from "effect"
 import { Result, useAtomRefresh, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { ArrowLeftIcon, ArrowUpRightIcon, DownloadSimpleIcon, LinkIcon, MagnifyingGlassIcon, PlusIcon } from "@phosphor-icons/react"
 import {
-  candidateDownloadBytes, catalogVariantOfName, formatStorageSize, noRunnableVersionReason, GATED_SEARCH_RESULT_LABEL, searchResultUnsupportedMessage, unsupportedReasonMessages, useAgentClient,
+  candidateDownloadBytes, catalogVariantOfName, formatContext, formatStorageSize, noRunnableVersionReason, GATED_SEARCH_RESULT_LABEL, searchResultUnsupportedMessage, unsupportedReasonMessages, useAgentClient,
   type AddModelRequest,
 } from "@magnitudedev/client-common"
 import type { CandidateInspection, CandidateInspectionPhase, CandidateInspectionProgress, CandidateInspectionUpdate, CandidateVersion, CandidateVersionProgress, DrafterCandidate, DrafterChoice, HuggingFaceRepositoryId, HuggingFaceSearchResponse, HuggingFaceSearchResult, LocalModel, LocalModelAssessment, UnsupportedReason } from "@magnitudedev/sdk"
@@ -392,9 +392,14 @@ export const assessmentVerdict = (assessment: LocalModelAssessment, recommended:
   switch (assessment._tag) {
     case "Unsupported": return { label: unsupportedVersionLabel(assessment.reasons), detail: unsupportedReasonMessages(assessment.reasons).join(". "), selectable: false, recommended: false }
     case "DoesNotFit": return { label: "Too large for this machine", selectable: false, recommended: false }
-    case "Fits": return recommended
-      ? { label: "Recommended", selectable: true, recommended: true }
-      : { label: "Fits your machine", selectable: true, recommended: false }
+    case "Fits": {
+      const served = assessment.served.contextLength < assessment.profile.contextLength
+        ? ` · ${formatContext(assessment.served.contextLength)} context`
+        : ""
+      return recommended
+        ? { label: `Recommended${served}`, selectable: true, recommended: true }
+        : { label: `Fits your machine${served}`, selectable: true, recommended: false }
+    }
   }
 }
 

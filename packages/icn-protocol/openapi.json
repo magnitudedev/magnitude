@@ -7752,9 +7752,10 @@
         "oneOf": [
           {
             "type": "object",
-            "description": "A fitting model, with its decode-speed estimates.",
+            "description": "A fitting model at `served`, the largest context tier within `profile` at which its\nstandard workload fits this computer, with its decode-speed estimates up to it.",
             "required": [
               "profile",
+              "served",
               "assessmentId",
               "memory",
               "performance",
@@ -7764,6 +7765,9 @@
             ],
             "properties": {
               "profile": {
+                "$ref": "#/components/schemas/ServingProfile"
+              },
+              "served": {
                 "$ref": "#/components/schemas/ServingProfile"
               },
               "assessmentId": {
@@ -7794,8 +7798,10 @@
           },
           {
             "type": "object",
+            "description": "A model that fits at no context tier: `deficit_bytes` is its shortfall at the smallest,\n`shortfall`.",
             "required": [
               "profile",
+              "shortfall",
               "assessmentId",
               "memory",
               "limitingResource",
@@ -7806,6 +7812,9 @@
             ],
             "properties": {
               "profile": {
+                "$ref": "#/components/schemas/ServingProfile"
+              },
+              "shortfall": {
                 "$ref": "#/components/schemas/ServingProfile"
               },
               "assessmentId": {

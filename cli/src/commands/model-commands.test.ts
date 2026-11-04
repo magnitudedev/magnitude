@@ -575,7 +575,7 @@ const leakyModels = () => {
   const assessed = makeAddedModel().servingState as Extract<CustomLocalModel["servingState"], { _tag: "Assessed" }>
   const tooLarge = makeFolderModel({
     modelId: CustomFormModelIdSchema.make("local:too-large-q8_0:ffffffffffff"),
-    servingState: { ...assessed, assessment: { _tag: "DoesNotFit", assessmentId: ModelAssessmentIdSchema.make("assessment_large"), environmentId: AssessmentEnvironmentIdSchema.make("environment_test"), profile: { contextLength: 4096 }, memoryDomains: [memoryEvidence], totalRequiredBytes: 10, deficitBytes: 4, limitingResource: "cuda0" } },
+    servingState: { ...assessed, assessment: { _tag: "DoesNotFit", assessmentId: ModelAssessmentIdSchema.make("assessment_large"), environmentId: AssessmentEnvironmentIdSchema.make("environment_test"), profile: { contextLength: 4096 }, shortfall: { contextLength: 32_768 }, memoryDomains: [memoryEvidence], totalRequiredBytes: 10, deficitBytes: 4, limitingResource: "cuda0" } },
   })
   return { catalog, catalogs, optimizing, found, loadingFound, tooLarge, added: withEvidence(makeAddedModel()) }
 }
