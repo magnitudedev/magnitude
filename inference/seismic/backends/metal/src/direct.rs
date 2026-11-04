@@ -241,13 +241,41 @@ enum Encoding {
     },
 }
 
-/// Ordered direct launches encoded into one command buffer. The production
-/// form uses one serial compute encoder, which orders every launch after the
+/// Ordered direct launches encoded into command buffers: one, and one more
+/// after each host gate ([`DirectBatch::wait_event`]). The production form
+/// uses one serial compute encoder, which orders every launch after the
 /// previous one's writes.
 pub struct DirectBatch {
     device: MetalDevice,
+    /// The command buffers committed before the current one, in order.
+    committed: Committed,
     command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    /// Whether anything is encoded in `command`.
+    used: bool,
     encoding: Encoding,
+}
+
+/// Command buffers a batch committed before its last. Dropped with them
+/// (the batch failed after committing some), it waits for them: they run on
+/// storage the caller regains.
+#[derive(Default)]
+struct Committed(Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>);
+
+impl Drop for Committed {
+    fn drop(&mut self) {
+        for command in &self.0 {
+            while !complete(command) {
+                std::thread::sleep(WAIT_POLL);
+            }
+        }
+    }
+}
+
+fn complete(command: &ProtocolObject<dyn MTLCommandBuffer>) -> bool {
+    matches!(
+        crate::pooled(|| command.status()),
+        MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+    )
 }
 
 fn command_buffer(
@@ -318,25 +346,44 @@ impl DirectBatch {
         let encoder = serial_encoder(&command)?;
         Ok(Self {
             device: device.clone(),
+            committed: Committed::default(),
             command,
+            used: false,
             encoding: Encoding::Serial(Some(encoder)),
         })
     }
 
-    /// The command buffer's following work waits until `event` reaches
-    /// `value` (`encodeWaitForEvent`): the host gate.
-    pub fn wait_event(&mut self, event: &SharedEvent, value: u64) {
+    /// The host gate: the work encoded after this waits until `event`
+    /// reaches `value`, and reads what the host wrote before raising it.
+    /// The work encoded before is committed in its own command buffer, and
+    /// the next begins with the wait (`encodeWaitForEvent`). Within one
+    /// command buffer a load after the wait can return bytes an earlier
+    /// load in the buffer read before the host rewrote them: chained
+    /// prompts' n-gram table reads behind their gates saw stale rows in 1 of
+    /// 16 runs on a CPU-loaded M4 Pro, and none in 48 with a command buffer
+    /// begun before each read (2026-10-24). A wait before anything is
+    /// encoded begins the current command buffer.
+    pub fn wait_event(&mut self, event: &SharedEvent, value: u64) -> Result<(), ExecutionError> {
         self.end_serial();
+        if self.used {
+            // Formed before the commit: a failure commits nothing.
+            let next = command_buffer(&self.device)?;
+            let previous = std::mem::replace(&mut self.command, next);
+            crate::pooled(|| previous.commit());
+            self.committed.0.push(previous);
+        }
         crate::pooled(|| {
             self.command
                 .encodeWaitForEvent_value(event.as_event(), value)
         });
+        Ok(())
     }
 
     /// `event` reaches `value` once the work encoded before it completes
     /// (`encodeSignalEvent`).
     pub fn signal_event(&mut self, event: &SharedEvent, value: u64) {
         self.end_serial();
+        self.used = true;
         crate::pooled(|| {
             self.command
                 .encodeSignalEvent_value(event.as_event(), value)
@@ -365,7 +412,9 @@ impl DirectBatch {
         let first = timestamps.reserve(2 * launches)?;
         Ok(Self {
             device: device.clone(),
+            committed: Committed::default(),
             command: command_buffer(device)?,
+            used: false,
             encoding: Encoding::Timed {
                 timestamps: timestamps.clone(),
                 first,
@@ -409,6 +458,7 @@ impl DirectBatch {
                 "native ABI words exceed Metal setBytes limit".into(),
             ));
         }
+        self.used = true;
         let command = &self.command;
         match &mut self.encoding {
             Encoding::Serial(encoder) => {
@@ -464,7 +514,7 @@ impl DirectBatch {
 
     /// Commit without waiting. The queue runs command buffers in commit
     /// order.
-    pub fn commit(self) -> DirectSubmission {
+    pub fn commit(mut self) -> DirectSubmission {
         let timing = match self.encoding {
             Encoding::Serial(encoder) => {
                 if let Some(encoder) = encoder {
@@ -488,9 +538,11 @@ impl DirectBatch {
             }),
         };
         crate::pooled(|| self.command.commit());
+        let mut commands = std::mem::take(&mut self.committed.0);
+        commands.push(self.command);
         DirectSubmission {
             device: self.device,
-            command: self.command,
+            commands,
             timing,
         }
     }
@@ -561,10 +613,10 @@ struct LaunchTiming {
 /// Measurements: `specs/26-09-23/benchmark-results.md`, "Metal host wait".
 const WAIT_POLL: std::time::Duration = std::time::Duration::from_micros(20);
 
-/// A committed direct command buffer.
+/// A committed direct batch: its command buffers, in commit order.
 pub struct DirectSubmission {
     device: MetalDevice,
-    command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    commands: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     timing: Option<LaunchTiming>,
 }
 
@@ -573,11 +625,9 @@ unsafe impl Send for DirectSubmission {}
 unsafe impl Sync for DirectSubmission {}
 
 impl DirectSubmission {
+    /// Whether every command buffer has completed.
     pub fn is_complete(&self) -> bool {
-        matches!(
-            crate::pooled(|| self.command.status()),
-            MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
-        )
+        self.commands.iter().all(|command| complete(command))
     }
 
     /// Wait for completion by polling the status every [`WAIT_POLL`].
@@ -587,27 +637,36 @@ impl DirectSubmission {
         }
     }
 
-    /// Wait and report the command buffer's outcome.
+    /// Wait and report the outcome: the first command buffer's failure.
     pub fn finish(&self) -> Result<(), ExecutionError> {
         self.wait_complete();
-        crate::pooled(|| match self.command.error() {
-            Some(error) => Err(ExecutionError::SubmissionFailed(
-                error.localizedDescription().to_string(),
-            )),
-            None => Ok(()),
+        crate::pooled(|| {
+            self.commands
+                .iter()
+                .find_map(|command| command.error())
+                .map_or(Ok(()), |error| {
+                    Err(ExecutionError::SubmissionFailed(
+                        error.localizedDescription().to_string(),
+                    ))
+                })
         })
     }
 
-    /// Device execution time of the completed command buffer.
+    /// Device execution time of the completed submission.
     pub fn device_seconds(&self) -> f64 {
         let (start, end) = self.device_interval();
         end - start
     }
 
-    /// The completed command buffer's device execution interval on the
-    /// [`host_seconds`] clock.
+    /// The completed submission's device execution interval on the
+    /// [`host_seconds`] clock: from its first command buffer's start to its
+    /// last's end, gate waits included, as within one command buffer.
     pub fn device_interval(&self) -> (f64, f64) {
-        crate::pooled(|| (self.command.GPUStartTime(), self.command.GPUEndTime()))
+        let (first, last) = (
+            self.commands.first().expect("a submission has a command buffer"),
+            self.commands.last().expect("a submission has a command buffer"),
+        );
+        crate::pooled(|| (first.GPUStartTime(), last.GPUEndTime()))
     }
 
     /// For a timed batch, each `encode` call's device interval on the

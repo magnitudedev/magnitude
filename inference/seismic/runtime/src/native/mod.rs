@@ -2600,16 +2600,19 @@ fn encode(
                         unreachable!("a run binds timelines of its own device");
                     };
                     match operation.node {
-                        timeline::TimelineNode::Wait => batch.wait_event(event, operation.value),
+                        timeline::TimelineNode::Wait => batch
+                            .wait_event(event, operation.value)
+                            .map_err(CallError::Execution)?,
                         timeline::TimelineNode::Signal => {
                             batch.signal_event(event, operation.value)
                         }
                     }
                 }
+                Ok::<(), CallError>(())
             };
             for _ in 0..repetitions {
                 for index in 0..list.count() {
-                    timelines(&mut batch, index);
+                    timelines(&mut batch, index)?;
                     buffers.clear();
                     let dispatch = list.dispatch(index, &mut buffers);
                     let NativeRoute::Metal {
@@ -2650,7 +2653,7 @@ fn encode(
                             .map_err(CallError::Execution)?;
                     }
                 }
-                timelines(&mut batch, list.count());
+                timelines(&mut batch, list.count())?;
             }
             Ok(RouteSubmission::Metal(batch.commit()))
         }

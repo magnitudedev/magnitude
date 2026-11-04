@@ -16,7 +16,7 @@
 //!
 //! | Backend | Timeline | Wait | Signal |
 //! |---|---|---|---|
-//! | Metal | `MTLSharedEvent` | `encodeWaitForEvent` | `encodeSignalEvent` |
+//! | Metal | `MTLSharedEvent` | the command buffer after the node begins with `encodeWaitForEvent` | `encodeSignalEvent` |
 //! | CUDA | a 32-bit word in mapped pinned host memory | `cuStreamWaitValue32` (cyclic `>=`) | `cuStreamWriteValue32` |
 //! | Vulkan | a timeline semaphore | the queue submission after the node waits on it | the queue submission before the node signals it |
 //! | CPU | a value under a mutex | the run blocks before the node's launches | set when the launches before it return |
