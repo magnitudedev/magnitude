@@ -1063,11 +1063,15 @@ fn a_projector_binds_by_its_width_not_the_base_model_names() {
     );
 }
 
-/// A text-only family given a repository's projector (Nemotron 3.5 VL repositories ship an
-/// mmproj the nemotron_h family has no vision for) gets the same verdict as without it, the
-/// projector `Rejected` with a mismatch: never an unreadable target.
+/// Why the Nemotron family rejects the Qwen3-VL fixture projector.
+const FOREIGN_PROJECTOR: &str =
+    "a qwen3vl_merger projector is not one this model reads (nemotron_omni)";
+
+/// A target given another model's projector (a Qwen3-VL mmproj beside a Nemotron target, whose
+/// family reads Nemotron Omni projectors) gets the same verdict as without it, the projector
+/// `Rejected` with a mismatch: never an unreadable target or projector.
 #[test]
-fn a_text_only_family_is_assessed_without_a_projector_it_cannot_bind() {
+fn a_target_is_assessed_without_another_models_projector() {
     let scratch = Scratch::new("text-only-projector");
     let target = real_header(&scratch, "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4.gguf");
     let projector = real_header(&scratch, "mmproj-F16.gguf");
@@ -1084,12 +1088,12 @@ fn a_text_only_family_is_assessed_without_a_projector_it_cannot_bind() {
     };
     assert!(!facts.capabilities.vision);
     let ProjectorVerdict::Rejected(rejection) = &facts.projector else {
-        panic!("Nemotron-H has no vision projector: {:?}", facts.projector);
+        panic!("a Qwen3-VL projector is rejected: {:?}", facts.projector);
     };
     assert_eq!(
         rejection.reasons,
         vec![UnsupportedReason::TargetMismatch {
-            detail: "Nemotron-H has no vision projector".to_owned()
+            detail: FOREIGN_PROJECTOR.to_owned()
         }]
     );
     assert_eq!(
@@ -1130,8 +1134,8 @@ fn an_unknown_tensor_type_is_an_unsupported_weight_type() {
     );
 }
 
-/// A load interprets the same way: a Nemotron package opened with a projector the family has no
-/// vision for defines its text model, with no image input, and keeps the projector's refusal.
+/// A load interprets the same way: a Nemotron package opened with another model's projector
+/// defines its text model, with no image input, and keeps the projector's refusal.
 #[test]
 fn a_load_serves_text_beside_a_projector_the_family_cannot_bind() {
     let scratch = Scratch::new("text-only-projector-load");
@@ -1154,7 +1158,7 @@ fn a_load_serves_text_beside_a_projector_the_family_cannot_bind() {
     assert_eq!(
         admitted.projector_unavailable.map(|refusal| refusal.reasons),
         Some(vec![UnsupportedReason::TargetMismatch {
-            detail: "Nemotron-H has no vision projector".to_owned()
+            detail: FOREIGN_PROJECTOR.to_owned()
         }])
     );
 }

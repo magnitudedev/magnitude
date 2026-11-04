@@ -192,7 +192,7 @@ fn check(vision: &VisionDescription, fused: bool) {
 fn both_released_projectors_bind_the_radio_tower_and_projection() {
     for (model, fused) in [(BOLT, false), (SUPER, true)] {
         let directory = headers::projector(model);
-        let vision = describe_projector(&directory).unwrap();
+        let vision = describe_projector(&directory, embedding_length(model)).unwrap();
         check(&vision, fused);
         // Features have the width of the target each projector ships with.
         assert_eq!(vision.output_hidden, embedding_length(model));
@@ -225,13 +225,36 @@ fn both_targets_inspect_with_their_projectors_and_place_images() {
     }
 }
 
+/// Another model's projector, or one of another width, disagrees with the target; a header that
+/// is no projector is unreadable.
+#[test]
+fn another_models_projector_is_a_mismatch() {
+    let reasons = |directory: Directory, width| {
+        FamilyError::from(describe_projector(&directory, width).unwrap_err()).reasons
+    };
+    let bolt = embedding_length(BOLT);
+    for (projector, width) in [
+        (headers::projector("muse-glimmer-30b:gguf:q4"), bolt),
+        (headers::projector(BOLT), bolt + 1),
+    ] {
+        assert!(matches!(
+            reasons(projector, width)[..],
+            [magnitude_artifacts::UnsupportedReason::TargetMismatch { .. }]
+        ));
+    }
+    assert_eq!(
+        reasons(headers::target(BOLT), bolt),
+        [magnitude_artifacts::UnsupportedReason::Unreadable]
+    );
+}
+
 #[test]
 fn unknown_misshapen_or_mismatched_projectors_are_refused() {
     let original = headers::projector(BOLT);
     let refused = |edit: &dyn Fn(&mut Directory)| {
         let mut directory = original.clone();
         edit(&mut directory);
-        describe_projector(&directory).unwrap_err()
+        describe_projector(&directory, embedding_length(BOLT)).unwrap_err()
     };
     refused(&|d| {
         set(
@@ -268,9 +291,9 @@ fn unknown_misshapen_or_mismatched_projectors_are_refused() {
         Value::Scalar(Scalar::Unsigned(2048)),
     );
     reshape_tensor(&mut narrow, "mm.model.mlp.3.weight", &[2048, 20_480]);
-    describe_projector(&narrow).unwrap();
+    describe_projector(&narrow, 2048).unwrap();
     let error = super_vl(&narrow).unwrap_err();
-    assert!(error.contains("decoder's width"), "{error}");
+    assert!(error.contains("projector width 2048 differs"), "{error}");
 }
 
 /// The C-RADIO cropped position embedding: PyTorch's bilinear

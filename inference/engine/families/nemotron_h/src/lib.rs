@@ -97,6 +97,9 @@ pub enum Error {
     Structure(String),
     /// A projector the family does not interpret.
     Projector(String),
+    /// A header given as a projector that is not a Nemotron Omni projector
+    /// of the target's width.
+    ProjectorIdentity(magnitude_family_common::ProjectorIdentityError),
     /// The assembled definition failed contract validation.
     Definition(String),
 }
@@ -110,6 +113,7 @@ impl fmt::Display for Error {
             | Self::Structure(message)
             | Self::Projector(message)
             | Self::Definition(message) => formatter.write_str(message),
+            Self::ProjectorIdentity(error) => error.fmt(formatter),
             Self::MissingMetadata(key) => write!(formatter, "missing metadata {key}"),
             Self::UnknownMetadata(keys) => write!(formatter, "unknown Nemotron-H metadata {keys:?}"),
             Self::UnboundWeights(names) => write!(
@@ -125,8 +129,9 @@ impl error::Error for Error {}
 impl Error {
     /// The unsupported features this error names; a header missing a key
     /// names it, one missing a weight the family needs, or whose values or
-    /// layers contradict each other, is `Unreadable`, as is a projector the
-    /// family cannot interpret.
+    /// layers contradict each other, is `Unreadable`, as is a Nemotron Omni
+    /// projector the family cannot interpret; another model's projector
+    /// disagrees with the target.
     pub fn reasons(&self) -> Vec<UnsupportedReason> {
         match self {
             Self::MissingMetadata(key) => {
@@ -146,6 +151,7 @@ impl Error {
             | Self::Structure(_)
             | Self::Projector(_)
             | Self::Definition(_) => vec![UnsupportedReason::Unreadable],
+            Self::ProjectorIdentity(error) => error.reasons(),
         }
     }
 }
@@ -683,7 +689,9 @@ pub fn inspect_components(
         head.validate(&decoder, inputs.coordinate_axes)?;
     }
     binder.finish()?;
-    let vision = projector.map(projector::describe_projector).transpose()?;
+    let vision = projector
+        .map(|projector| projector::describe_projector(projector, hidden))
+        .transpose()?;
     let definition = ModelDefinition {
         family: FamilyId(ARCHITECTURE.into()),
         artifact_identity: identity,

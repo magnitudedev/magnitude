@@ -184,9 +184,9 @@ pub fn inspect_components(
 ) -> Result<ModelDefinition, Error> {
     let architecture = recognize(directory)?;
     // Only LFM3-VL binds an image tower.
-    let vision = match (architecture, projector) {
+    let projector = match (architecture, projector) {
         (_, None) => None,
-        (Architecture::Lfm3, Some(projector)) => Some(describe_projector(projector)?),
+        (Architecture::Lfm3, Some(projector)) => Some(projector),
         (Architecture::Dense | Architecture::Routed, Some(_)) => {
             return Err(Error::mismatch("LFM2 has no vision projector"));
         }
@@ -205,6 +205,9 @@ pub fn inspect_components(
     let kv_heads = m.layer_counts("attention.head_count_kv", layer_count)?;
 
     let hidden = m.integer("embedding_length")?;
+    let vision = projector
+        .map(|projector| describe_projector(projector, hidden))
+        .transpose()?;
     let heads = m.integer("attention.head_count")?;
     if !hidden.is_multiple_of(heads) {
         return Err(invalid("LFM2 hidden width is not a multiple of its heads"));

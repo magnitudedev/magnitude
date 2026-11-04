@@ -507,17 +507,3 @@ impl Geometry {
         })
     }
 }
-
-/// Rejects a projector whose output width isn't the target's embedding width: it can't feed this
-/// decoder. Names (a base model's) never decide; a fine-tune keeps its base's width.
-pub fn check_projector_width(projector: &Directory, hidden: u64) -> Result<(), Error> {
-    match projector
-        .value("clip.vision.projection_dim")
-        .and_then(Value::unsigned)
-    {
-        Some(width) if width != hidden => Err(Error::mismatch(format!(
-            "projector width {width} differs from the target's {hidden}"
-        ))),
-        _ => Ok(()),
-    }
-}

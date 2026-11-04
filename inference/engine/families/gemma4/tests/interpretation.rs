@@ -415,6 +415,24 @@ fn encoder_projectors_bind_sandwich_blocks_pooling_and_axial_rotary() {
     assert!(model.vision.is_some());
 }
 
+/// Another model's projector, or one of another width (the 12B's 3840-wide features beside a
+/// 2560-wide target), disagrees with the target.
+#[test]
+fn another_models_projector_is_a_mismatch() {
+    for error in [
+        describe_projector(&headers::projector("muse-glimmer-30b:gguf:q4"), 2560).unwrap_err(),
+        describe_projector(&headers::projector("gemma-4-12b-it-qat:gguf:q4"), 2560).unwrap_err(),
+    ] {
+        assert!(
+            matches!(
+                error.reasons[..],
+                [magnitude_artifacts::UnsupportedReason::TargetMismatch { .. }]
+            ),
+            "{error}"
+        );
+    }
+}
+
 #[test]
 fn the_unified_projector_is_a_normalized_patch_projection() {
     let projector = headers::projector("gemma-4-12b-it-qat:gguf:q4");
@@ -434,8 +452,6 @@ fn the_unified_projector_is_a_normalized_patch_projection() {
         vision.stem.positions().expect("position table").sampling,
         PositionSampling::Axes { length: 1120 }
     );
-    assert_eq!(describe_projector(&projector, 2560).unwrap_err().to_string(),
-        "projector width differs from the decoder width");
 }
 
 #[test]

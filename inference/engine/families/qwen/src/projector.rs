@@ -1,8 +1,8 @@
 //! The Qwen3-VL projector (`qwen3vl_merger`).
 
 use crate::{Error, product};
-use magnitude_artifacts::gguf::{Directory, Element, PROJECTOR_ARCHITECTURE, Scalar, Value};
-use magnitude_family_common::Tensors;
+use magnitude_artifacts::gguf::{Directory, Element, Scalar, Value};
+use magnitude_family_common::{Tensors, projector_type};
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, ImportTransform, MergerStage, PositionSampling, RowRange,
     VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock,
@@ -53,27 +53,13 @@ fn triple(directory: &Directory, key: &str) -> Result<[f64; 3], Error> {
     <[f64; 3]>::try_from(values).map_err(|_| invalid(format!("{key} must contain three numbers")))
 }
 
-/// Interpret a validated Qwen3-VL projector inventory without importing it.
-pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Error> {
-    if directory
-        .value("general.architecture")
-        .and_then(Value::string)
-        != Some(PROJECTOR_ARCHITECTURE)
-        || directory.value("general.type").and_then(Value::string) != Some("mmproj")
-        || directory
-            .value("clip.has_vision_encoder")
-            .and_then(|value| match value {
-                Value::Scalar(Scalar::Bool(value)) => Some(*value),
-                _ => None,
-            })
-            != Some(true)
-        || directory
-            .value("clip.projector_type")
-            .and_then(Value::string)
-            != Some("qwen3vl_merger")
-    {
-        return Err(invalid("unsupported Qwen3-VL projector identity"));
-    }
+/// Interpret a validated Qwen3-VL projector inventory for a target of
+/// `target_width` without importing it.
+pub fn describe_projector(
+    directory: &Directory,
+    target_width: u64,
+) -> Result<VisionDescription, Error> {
+    projector_type(directory, &[("qwen3vl_merger", ())], target_width)?;
     let depth = positive(directory, "clip.vision.block_count")?;
     let hidden = positive(directory, "clip.vision.embedding_length")?;
     let intermediate = positive(directory, "clip.vision.feed_forward_length")?;

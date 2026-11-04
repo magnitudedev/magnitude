@@ -273,6 +273,9 @@ fn routed_header_ignores_the_dense_feed_forward_width() {
     }
 }
 
+/// The synthetic projector's feature width, the synthetic target's embedding width.
+const PROJECTOR_WIDTH: u64 = 8;
+
 fn projector() -> Directory {
     let scalar = |name: &str, value: Scalar| Metadata {
         name: name.into(),
@@ -299,7 +302,7 @@ fn projector() -> Directory {
         scalar("clip.vision.spatial_merge_size", Scalar::Unsigned(2)),
         scalar("clip.vision.image_size", Scalar::Unsigned(4)),
         // Features of the decoder's width (`embedding_length`).
-        scalar("clip.vision.projection_dim", Scalar::Unsigned(8)),
+        scalar("clip.vision.projection_dim", Scalar::Unsigned(PROJECTOR_WIDTH)),
         scalar(
             "clip.vision.attention.layer_norm_epsilon",
             Scalar::Float(1e-6),
@@ -595,7 +598,7 @@ fn binds_every_mtp_role_outside_the_target_geometry() {
 #[test]
 fn projector_description_validates_roles_and_fused_qkv_ranges() {
     let projector = projector();
-    let vision = describe_projector(&projector).unwrap();
+    let vision = describe_projector(&projector, PROJECTOR_WIDTH).unwrap();
     assert_eq!(
         vision.stem.positions().expect("position table").sampling,
         PositionSampling::AlignedCorners { side: 2 }
@@ -691,7 +694,7 @@ fn projector_description_validates_roles_and_fused_qkv_ranges() {
         offset: 0,
         nbytes: 4,
     });
-    assert!(describe_projector(&malformed).is_err());
+    assert!(describe_projector(&malformed, PROJECTOR_WIDTH).is_err());
 }
 
 #[test]
@@ -707,7 +710,7 @@ fn projector_pixel_bounds_override_processor_defaults() {
             value: Value::Scalar(Scalar::Unsigned(4_096)),
         },
     ]);
-    let vision = describe_projector(&projector).unwrap();
+    let vision = describe_projector(&projector, PROJECTOR_WIDTH).unwrap();
     assert_eq!(
         vision.preprocessing.resize,
         VisionResize::PixelBounds {
@@ -723,7 +726,7 @@ fn projector_deepstack_metadata_is_optional_but_rejects_enabled_layers() {
     without_deepstack
         .metadata
         .retain(|metadata| metadata.name != "clip.vision.is_deepstack_layers");
-    assert!(describe_projector(&without_deepstack).is_ok());
+    assert!(describe_projector(&without_deepstack, PROJECTOR_WIDTH).is_ok());
 
     let mut enabled = projector();
     enabled
@@ -732,7 +735,7 @@ fn projector_deepstack_metadata_is_optional_but_rejects_enabled_layers() {
         .find(|metadata| metadata.name == "clip.vision.is_deepstack_layers")
         .unwrap()
         .value = Value::Array(vec![true].into());
-    assert!(describe_projector(&enabled).is_err());
+    assert!(describe_projector(&enabled, PROJECTOR_WIDTH).is_err());
 }
 
 #[test]
@@ -759,7 +762,7 @@ fn projector_rejects_malformed_shapes_for_every_role_class() {
             .unwrap()
             .shape[0] += 1;
         assert!(
-            describe_projector(&malformed).is_err(),
+            describe_projector(&malformed, PROJECTOR_WIDTH).is_err(),
             "malformed projector role {name:?} was accepted"
         );
     }

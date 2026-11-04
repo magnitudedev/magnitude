@@ -23,7 +23,7 @@ use magnitude_family_contracts::{
 };
 use magnitude_family_qwen::{
     DENSE_KEYS, GEOMETRY_KEYS, Geometry, MIXER_KEYS, Metadata, MixerKind, ROUTED_KEYS, Weight,
-    check_projector_width, mixer_kinds, prediction_blocks, product, stores_prediction_blocks,
+    mixer_kinds, prediction_blocks, product, stores_prediction_blocks,
 };
 
 pub use magnitude_family_qwen::Error;
@@ -232,19 +232,20 @@ pub fn inspect_components(
         })
     };
     tensors.finish()?;
-    if let Some(projector) = projector {
-        check_projector_width(projector, hidden)?;
-    }
     let vision = projector
         .map(|projector| {
-            if projector
-                .value("clip.projector_type")
-                .and_then(Value::string)
-                == Some("minicpmv4_7")
-            {
-                minicpm::describe_projector(projector)
-            } else {
-                magnitude_family_qwen::describe_projector(projector)
+            #[derive(Clone, Copy)]
+            enum Reader {
+                MiniCpm,
+                Qwen,
+            }
+            match magnitude_family_common::projector_type(
+                projector,
+                &[("minicpmv4_7", Reader::MiniCpm), ("qwen3vl_merger", Reader::Qwen)],
+                hidden,
+            )? {
+                Reader::MiniCpm => minicpm::describe_projector(projector, hidden),
+                Reader::Qwen => magnitude_family_qwen::describe_projector(projector, hidden),
             }
         })
         .transpose()?;

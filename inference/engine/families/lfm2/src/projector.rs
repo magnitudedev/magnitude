@@ -5,8 +5,8 @@
 //! cell concatenation into a two-stage GELU projector.
 
 use crate::Error;
-use magnitude_artifacts::gguf::{Directory, Element, Scalar, Value, PROJECTOR_ARCHITECTURE};
-use magnitude_family_common::Tensors;
+use magnitude_artifacts::gguf::{Directory, Element, Scalar, Value};
+use magnitude_family_common::{projector_type, Tensors};
 use magnitude_family_contracts::{
     checked_product, ActivationDType, CellReduction, ImportTransform, MergerStage, RmsNorm,
     RowRange, VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan,
@@ -76,21 +76,17 @@ fn triple(directory: &Directory, key: &str) -> Result<[f64; 3], Error> {
     <[f64; 3]>::try_from(values).map_err(|_| invalid(format!("{key} must contain three numbers")))
 }
 
-/// Interpret an LFM3-VL projector inventory without importing it.
-pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Error> {
-    if directory
-        .value("general.architecture")
-        .and_then(Value::string)
-        != Some(PROJECTOR_ARCHITECTURE)
-        || directory.value("general.type").and_then(Value::string) != Some("mmproj")
-        || directory.value("clip.has_vision_encoder") != Some(&Value::Scalar(Scalar::Bool(true)))
-        || directory
-            .value("clip.vision.projector_type")
-            .and_then(Value::string)
-            != Some("lfm3vl")
-    {
-        return Err(invalid("unsupported LFM3-VL projector identity"));
-    }
+/// Interpret an LFM3-VL projector inventory for a target of `target_width`
+/// without importing it.
+pub fn describe_projector(
+    directory: &Directory,
+    target_width: u64,
+) -> Result<VisionDescription, Error> {
+    projector_type(
+        directory,
+        &[("lfm3vl", ())],
+        target_width,
+    )?;
     if let Some(entry) = directory
         .metadata
         .iter()

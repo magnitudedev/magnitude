@@ -3,7 +3,7 @@ pub mod inputs;
 
 use crate::{Error, invalid};
 use magnitude_artifacts::gguf::{Directory, Element, PROJECTOR_ARCHITECTURE, Scalar, Value};
-use magnitude_family_common::{Tensors, architecture_keys};
+use magnitude_family_common::{Tensors, architecture_keys, projector_type};
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, MergerStage, PositionSampling, VisionActivation,
     VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock, VisionDescription,
@@ -76,20 +76,12 @@ impl Reader<'_> {
     }
 }
 
-pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Error> {
-    if directory
-        .value("general.architecture")
-        .and_then(Value::string)
-        != Some(PROJECTOR_ARCHITECTURE)
-        || directory.value("general.type").and_then(Value::string) != Some("mmproj")
-        || directory
-            .value("clip.projector_type")
-            .and_then(Value::string)
-            != Some("minicpmv4_7")
-        || directory.value("clip.has_vision_encoder") != Some(&Value::Scalar(Scalar::Bool(true)))
-    {
-        return Err(invalid("unsupported MiniCPM-V projector identity"));
-    }
+/// Interpret a MiniCPM-V projector for a target of `target_width`.
+pub fn describe_projector(
+    directory: &Directory,
+    target_width: u64,
+) -> Result<VisionDescription, Error> {
+    projector_type(directory, &[("minicpmv4_7", ())], target_width)?;
     if let Some((_, entry)) = architecture_keys(directory, PROJECTOR_ARCHITECTURE)
         .find(|(_, entry)| !KEYS.contains(&entry.name.as_str()))
     {
