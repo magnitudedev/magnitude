@@ -116,7 +116,8 @@ fn decoded_kernel_bundle_forms_identical_native_sources() {
     let checked = seismic_lang::source::load(&[kernels], seismic_std::sources())
         .expect("the engine kernel library checks")
         .module;
-    let decoded = decode_checked_bundle(&encode_checked_bundle(&checked))
+    // Held for the process, as a build embeds a bundle.
+    let decoded = decode_checked_bundle(encode_checked_bundle(&checked).leak())
         .expect("the engine kernel bundle decodes");
     let representations = qwen_representations();
     let dialects = [

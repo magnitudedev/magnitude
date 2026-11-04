@@ -24,6 +24,7 @@ use crate::registry::{self, BackendName, RepresentationAccess, RepresentationKin
 use crate::span::Span;
 use crate::types::DType;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::sync::Arc;
 
 /// One source file. Paths are diagnostic labels; they grant nothing.
@@ -333,7 +334,10 @@ pub fn check_source(sources: SourceSet) -> Result<CheckedModule, SourceError> {
 #[derive(Clone, Debug)]
 pub struct CheckedModule {
     inner: Arc<internals::Module>,
-    pub(crate) assets: std::collections::BTreeMap<(EntryId, BackendName), String>,
+    /// Native asset sources, borrowed from the bundle a build embedded
+    /// (`decode_checked_bundle`), so a process holds none of them on its
+    /// heap: they are most of a bundle, and a process reads one backend's.
+    pub(crate) assets: std::collections::BTreeMap<(EntryId, BackendName), Cow<'static, str>>,
     /// Each native implementation's declarations at element bindings, one
     /// per combination of the values of the element reads it makes, formed
     /// when first asked for (`native_implementation_at`).
@@ -451,7 +455,7 @@ impl CheckedModule {
         &mut self,
         entry: EntryId,
         backend: BackendName,
-        source: String,
+        source: Cow<'static, str>,
     ) -> Result<(), String> {
         if self.native_implementation(entry, backend).is_none() {
             return Err(format!(
@@ -465,7 +469,7 @@ impl CheckedModule {
     }
 
     pub fn native_asset(&self, entry: EntryId, backend: BackendName) -> Option<&str> {
-        self.assets.get(&(entry, backend)).map(String::as_str)
+        self.assets.get(&(entry, backend)).map(|source| &**source)
     }
 
     /// The source set this module was checked from, for diagnostics and

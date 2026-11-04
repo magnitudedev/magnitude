@@ -339,7 +339,7 @@ pub fn capture_assets(
             BackendName::Vulkan => expand_includes(&asset, "glsl", roots)?,
         };
         module
-            .capture_native_asset(entry, backend, expansion.source)
+            .capture_native_asset(entry, backend, expansion.source.into())
             .map_err(LoadError::Invalid)?;
         captured.push(CapturedAsset {
             entry,
