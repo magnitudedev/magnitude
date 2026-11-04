@@ -8,7 +8,6 @@ The file runs by its `#!` line (`sh` without one), from the checkout's source ro
 """
 
 import argparse
-import base64
 import shlex
 from pathlib import Path
 
@@ -17,8 +16,8 @@ from ..engine import Step, Weights
 from . import Answer, Instrument, JobResult, Plan
 
 RUNNER = (
-    "import base64, os, stat, sys; d = os.environ['MRIG_RUN']; os.makedirs(d, exist_ok=True); "
-    "p = os.path.join(d, 'script'); open(p, 'wb').write(base64.b64decode(sys.argv[1])); "
+    "import os, shutil, stat, sys; d = os.environ['MRIG_RUN']; os.makedirs(d, exist_ok=True); "
+    "p = os.path.join(d, 'script'); shutil.copyfile(sys.argv[1], p); "
     "os.chmod(p, os.stat(p).st_mode | stat.S_IXUSR); "
     "first = open(p, 'rb').readline(); "
     "os.execv(p, [p]) if first.startswith(b'#!') else os.execvp('sh', ['sh', p])"
@@ -43,12 +42,12 @@ def configure(parser: argparse.ArgumentParser) -> None:
 def plan(arguments, source) -> Plan:
     if not arguments.file.is_file():
         raise SystemExit(f"script: {arguments.file} is not a file")
-    content = base64.b64encode(arguments.file.read_bytes()).decode()
     builds = tuple(Step("prepare", tuple(argv)) for argv in arguments.prepare)
-    job = Step("script", ("{python}", "-c", RUNNER, content), ENV)
+    job = Step("script", ("{python}", "-c", RUNNER, "{inputs}/" + arguments.file.name), ENV)
     device = None if arguments.hold == "build" else arguments.hold
     acquires = None if arguments.model is None else Weights(arguments.model)
-    return Plan(builds=builds, jobs=(("script", job),), device=device, acquires=acquires)
+    return Plan(builds=builds, jobs=(("script", job),), device=device, acquires=acquires,
+                files=(arguments.file,))
 
 
 def answer(arguments, results: dict[str, JobResult]) -> Answer:

@@ -33,6 +33,13 @@ def _atomic(path: Path, value: dict) -> None:
 
 
 def alive(pid: int) -> bool:
+    """Whether process `pid` has not ended. A child of this process that has exited still answers
+    signals until it is reaped, so it is reaped here: a run's caller follows its own child."""
+    try:
+        if os.waitpid(pid, os.WNOHANG)[0] == pid:
+            return False
+    except ChildProcessError:  # not this process's child: its own parent reaps it
+        pass
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

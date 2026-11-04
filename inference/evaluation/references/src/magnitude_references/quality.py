@@ -54,8 +54,13 @@ def compare_rows(truth: np.ndarray, test: np.ndarray) -> tuple[np.ndarray, np.nd
     for start in range(0, truth.shape[0], CHUNK_ROWS):
         p = np.asarray(truth[start : start + CHUNK_ROWS], dtype=np.float64)
         q = np.asarray(test[start : start + CHUNK_ROWS], dtype=np.float64)
-        if not (np.isfinite(p).all() and np.isfinite(q).all()):
-            raise ValueError(f"non-finite logits in rows {start}..{start + len(p)}")
+        for side, values in (("truth", p), ("test", q)):
+            finite = np.isfinite(values).all(axis=1)
+            if not finite.all():
+                rows = start + np.flatnonzero(~finite)
+                raise ValueError(
+                    f"non-finite {side} logits in {len(rows)} of rows {start}..{start + len(p)}: first {rows[:8].tolist()}"
+                )
         log_p, log_q = _log_softmax(p), _log_softmax(q)
         # Rounding can leave an exact-zero divergence a hair below zero.
         kl[start : start + len(p)] = np.maximum((np.exp(log_p) * (log_p - log_q)).sum(axis=1), 0.0)

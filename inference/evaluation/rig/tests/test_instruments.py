@@ -3,6 +3,8 @@ judges only beyond what both sides resolved."""
 
 import argparse
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -101,6 +103,21 @@ def test_script_ships_the_file_and_runs_it_by_its_interpreter(tmp_path):
     assert plan.device == "timed" and plan.builds[0].argv == ("cargo", "build", "-p", "x")
     job = plan.jobs[0][1]
     assert job.argv[:2] == ("{python}", "-c") and dict(job.env)["MRIG_RUN"] == "{run_dir}"
+    assert plan.files == (script,) and job.argv[-1] == "{inputs}/probe.sh"
+
+
+def test_large_script_uses_staged_input_without_command_line_payload(tmp_path):
+    script = tmp_path / "large.py"
+    script.write_text(f"#!{sys.executable}\n#" + "x" * 262144 + "\nprint('staged script ran')\n")
+    arguments = parse("script", *COMMON, str(script))
+    plan = REGISTRY["script"].plan(arguments, None)
+    job = plan.jobs[0][1]
+    run = tmp_path / "run"
+    argv = engine._substitute(job.argv, {"python": sys.executable, "inputs": str(tmp_path)})
+    assert max(map(len, argv)) < 4096
+    result = subprocess.run(argv, env={"MRIG_RUN": str(run)}, text=True, capture_output=True, check=True)
+    assert result.stdout == "staged script ran\n"
+    assert (run / "script").read_bytes() == script.read_bytes()
 
 
 def test_the_median_interval_is_distribution_free():

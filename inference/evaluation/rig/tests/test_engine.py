@@ -152,6 +152,24 @@ def test_a_run_that_ends_first_returns_its_answer_and_code(tmp_path, capsys):
     assert code == 0 and "the answer" in capsys.readouterr().out
 
 
+def test_a_run_whose_process_ends_without_an_answer_returns_at_once_with_its_output(tmp_path, capsys):
+    # A run refused before it registers (its plan exits with why) has no estimate to end at:
+    # its caller learns of its end from its process, which is the caller's own child.
+    directory = tmp_path / "20261023T000000Z-fake-000002"
+    directory.mkdir()
+    with open(directory / engine.TRANSCRIPT, "w") as transcript:
+        child = subprocess.Popen([PY, "-c", "import sys; sys.exit('memory: refused')"], stdout=transcript,
+                                 stderr=subprocess.STDOUT)
+    ended = []
+    follower = threading.Thread(target=lambda: ended.append(results.follow(directory.name, directory, child.pid, None)),
+                                daemon=True)
+    follower.start()
+    follower.join(10)
+    assert ended == [1]
+    output = capsys.readouterr().out
+    assert "memory: refused" in output and "ended without an answer" in output
+
+
 def test_waiting_records_its_estimate_and_justification(rig, capsys):
     directory = engine.RESULTS / "20261023T000000Z-fake-000001"
     directory.mkdir(parents=True)
