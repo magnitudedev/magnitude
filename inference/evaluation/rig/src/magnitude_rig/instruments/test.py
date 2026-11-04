@@ -29,7 +29,8 @@ def configure(parser: argparse.ArgumentParser) -> None:
     acquired.add_argument("--model", type=selectors.model,
                           help="catalog model to acquire first, as MAGNITUDE_ARTIFACTS for the tests")
     acquired.add_argument("--catalog", action="store_true",
-                          help="export the catalog's headers first, as {catalog} in the suite's arguments")
+                          help="export the catalog's headers first, as {catalog} in the suite's arguments and "
+                               "MAGNITUDE_CATALOG_HEADERS for the tests")
     parser.add_argument("arguments", nargs=argparse.REMAINDER,
                         help="the suite's arguments after --: cargo test's, e.g. -- -p magnitude-kernels "
                              "--release --test routed -- general_routed; or pytest's, e.g. -- "
@@ -47,6 +48,8 @@ def plan(arguments, source) -> Plan:
     env = (("SEISMIC_TEST_BACKEND", "vulkan"),) if arguments.backend == "vulkan" else ()
     if arguments.model is not None:
         env += (("MAGNITUDE_ARTIFACTS", "{artifacts}"),)
+    if arguments.catalog:
+        env += (("MAGNITUDE_CATALOG_HEADERS", "{catalog}"),)
     if arguments.suite == "cargo":
         own, binary = cargo.split(_given(arguments))
         build = Step("test build", ("cargo", "test", "--message-format=short", "--no-run", *own))
