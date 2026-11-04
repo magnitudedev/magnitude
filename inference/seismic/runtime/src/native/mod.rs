@@ -2685,8 +2685,7 @@ fn encode(
             repetitions,
             timed.is_some(),
             retained,
-        )
-        .map_err(EncodeFailure::uncommitted),
+        ),
         #[cfg(not(target_os = "macos"))]
         NativeRoute::Vulkan { opened, .. } => vulkan::encode(
             opened.service(),

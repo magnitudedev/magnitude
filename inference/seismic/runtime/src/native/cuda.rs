@@ -20,7 +20,7 @@
 
 use super::graph_replays::Replays;
 use super::timeline::{TimelineKind, TimelineNode, TimelineOperation};
-use super::{DispatchList, NativeRoute, RouteSubmission};
+use super::{DispatchList, EncodeFailure, NativeRoute, RouteSubmission};
 use std::ops::Range;
 use crate::api::CallError;
 use crate::driver::{Allocation, typed_buffer};
@@ -42,7 +42,9 @@ impl super::graph_replays::RecordedGraph for DirectGraph {
 }
 
 /// Encode `list` on the device's stream: a replay when the list is made of
-/// sealed plans and is not timed, else launch by launch.
+/// sealed plans and is not timed, else launch by launch. A failure after
+/// work was issued abandons the batch: the issued work runs on, fenced by
+/// the abandoned submission.
 pub(super) fn encode(
     device: &seismic_cuda::Device,
     replays: &CudaReplays,
@@ -50,13 +52,35 @@ pub(super) fn encode(
     repetitions: usize,
     timed: bool,
     retained: &Arc<dyn Any + Send + Sync>,
-) -> Result<RouteSubmission, CallError> {
+) -> Result<RouteSubmission, EncodeFailure> {
     let mut batch = if timed {
         DirectBatch::timed(device)
     } else {
         DirectBatch::new(device)
     }
-    .map_err(CallError::Execution)?;
+    .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error)))?;
+    match issue(&mut batch, device, replays, list, repetitions, timed, retained) {
+        Ok(()) => batch
+            .commit()
+            .map(RouteSubmission::Cuda)
+            .map_err(|error| EncodeFailure::uncommitted(CallError::Execution(error))),
+        Err(error) => Err(EncodeFailure {
+            error,
+            committed: batch.abandon().map(RouteSubmission::Cuda),
+        }),
+    }
+}
+
+/// Issue `list`'s work on `batch`'s stream.
+fn issue(
+    batch: &mut DirectBatch,
+    device: &seismic_cuda::Device,
+    replays: &CudaReplays,
+    list: &impl DispatchList,
+    repetitions: usize,
+    timed: bool,
+    retained: &Arc<dyn Any + Send + Sync>,
+) -> Result<(), CallError> {
     // The calls between timeline boundaries form one segment: a graph of
     // its own when replayed, the stream waiting on or writing the
     // boundary's words between segments.
@@ -85,7 +109,7 @@ pub(super) fn encode(
                             |graph| batch.replay(graph).map_err(CallError::Execution),
                         )?;
                     }
-                    timelines(&mut batch, list.timelines(*boundary))?;
+                    timelines(batch, list.timelines(*boundary))?;
                 }
             }
         }
@@ -99,15 +123,12 @@ pub(super) fn encode(
                             Ok(())
                         }
                     })?;
-                    timelines(&mut batch, list.timelines(*boundary))?;
+                    timelines(batch, list.timelines(*boundary))?;
                 }
             }
         }
     }
-    batch
-        .commit()
-        .map(RouteSubmission::Cuda)
-        .map_err(CallError::Execution)
+    Ok(())
 }
 
 /// The calls of `list` between timeline boundaries, each range with the

@@ -509,13 +509,39 @@ impl DirectBatch {
 
     /// Record completion without waiting.
     pub fn commit(self) -> Result<DirectSubmission, ExecutionError> {
-        let end = Event::new(self.device.context()).map_err(submission)?;
-        end.record(self.device.stream()).map_err(submission)?;
-        Ok(DirectSubmission {
-            start: self.start,
-            end,
-            marks: self.marks,
-        })
+        self.end()
+    }
+
+    /// End a batch that failed: the work it issued runs on, and the
+    /// returned submission completes behind it (`None` when its end event
+    /// could not be recorded, the stream then waited for).
+    pub fn abandon(mut self) -> Option<DirectSubmission> {
+        self.marks = None;
+        self.end().ok()
+    }
+
+    /// The submission an end event recorded behind every issued launch
+    /// completes. Where the event cannot be recorded the stream is waited
+    /// for first: the issued launches have finished, or the context's
+    /// sticky error lets nothing more run, so no storage they reach is
+    /// reused while they run.
+    fn end(self) -> Result<DirectSubmission, ExecutionError> {
+        let end = Event::new(self.device.context()).and_then(|end| {
+            end.record(self.device.stream())?;
+            Ok(end)
+        });
+        match end {
+            Ok(end) => Ok(DirectSubmission {
+                start: self.start,
+                end,
+                marks: self.marks,
+            }),
+            Err(error) => {
+                // Its failure is the context's, reported by `error`.
+                let _ = self.device.stream().synchronize();
+                Err(submission(error))
+            }
+        }
     }
 }
 
@@ -616,5 +642,70 @@ impl DirectSubmission {
             intervals.push(Some((anchor.place(mark)?, anchor.place(end)?)));
         }
         Ok(Some(intervals))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each launch spins (about 0.1 s) before writing `slot + 1` to
+    /// `out[slot]`, so a completion not behind it is seen as an unwritten
+    /// slot.
+    const SOURCE: &str = r#"
+struct Words { unsigned long long slot; };
+extern "C" __global__ void mark(unsigned int* out, Words words, unsigned int* scalars) {
+    long long start = clock64();
+    while (clock64() - start < 200000000LL) {}
+    out[words.slot] = (unsigned int)words.slot + 1;
+}
+"#;
+
+    /// A batch whose third launch fails to form after two were issued is
+    /// abandoned into a submission that completes behind both, so the
+    /// storage they write is fenced until they finish.
+    #[test]
+    fn an_abandoned_batch_completes_behind_the_launches_it_issued() {
+        let Ok(crate::OpenedCuda {
+            service: device,
+            device: description,
+        }) = crate::open(0)
+        else {
+            return;
+        };
+        let capability = description.facts().compute_capability;
+        let architecture = u32::from(capability.major) * 10 + u32::from(capability.minor);
+        let cubin =
+            crate::nvrtc::compile_cubin_named(SOURCE, "abandon.cu", architecture, &["mark"])
+                .unwrap();
+        let module =
+            DirectModule::load(&device, &cubin.image, &[cubin.lowered_names[0].as_str()]).unwrap();
+        let out = device.allocate_mapped(8).unwrap();
+        let scalars = device.allocate_mapped(4).unwrap();
+        out.upload_at(0, &[0; 8]).unwrap();
+        let buffers = [(&out, 0)];
+        let words = [0u64.to_le_bytes(), 1u64.to_le_bytes()];
+        let launch = |slot: usize, threads: u64| DirectLaunch {
+            module: &module,
+            function: 0,
+            buffers: &buffers,
+            words: &words[slot],
+            scalar_results: Some((&scalars, 0)),
+            grid: [1, 1, 1],
+            block: [threads, 1, 1],
+            shared_bytes: 0,
+        };
+        let mut batch = DirectBatch::new(&device).unwrap();
+        batch.launch(&launch(0, 1)).unwrap();
+        batch.launch(&launch(1, 1)).unwrap();
+        let too_many = module.max_threads_per_block(0) + 1;
+        assert!(batch.launch(&launch(0, too_many)).is_err());
+        let submission = batch
+            .abandon()
+            .expect("the launches issued before the failure are fenced");
+        submission.finish().unwrap();
+        let mut written = [0; 8];
+        out.download_at(0, &mut written).unwrap();
+        assert_eq!(written, [1, 0, 0, 0, 2, 0, 0, 0]);
     }
 }
