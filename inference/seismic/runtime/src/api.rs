@@ -1912,6 +1912,10 @@ pub mod tensor {
                 view.strides,
             ))
         }
+        /// The view's range in its alias space. A slab view's alias space is
+        /// its own logical tensor, which starts at 0; its `byte_offset` is
+        /// where its address table's entries lie, what it binds, not where
+        /// its elements do.
         pub fn descriptor(&self) -> TensorDescriptor {
             TensorDescriptor {
                 device: self.device.kind.identity(),
@@ -1919,7 +1923,7 @@ pub mod tensor {
                 extents: self.extents.clone(),
                 strides: self.strides.clone(),
                 allocation: self.alias_identity(),
-                byte_offset: self.byte_offset,
+                byte_offset: if self.slabs.is_some() { 0 } else { self.byte_offset },
                 byte_len: self.byte_len,
             }
         }

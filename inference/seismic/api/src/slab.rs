@@ -485,6 +485,12 @@ mod tests {
             logical.descriptor().allocation,
             sibling.descriptor().allocation
         );
+        // Each region's view describes its own logical tensor from 0, however
+        // far into the address table its entries lie.
+        for view in [&logical, &sibling] {
+            let descriptor = view.descriptor();
+            assert_eq!((descriptor.byte_offset, descriptor.byte_len), (0, view.byte_len()));
+        }
         assert_eq!(logical.slice_leading(255, 256).unwrap().extents(), &[1, 2]);
         assert!(logical.slice_leading(255, 257).is_err());
         assert_eq!(logical.read_to_host().unwrap().len(), 768 * 2 * 4);
