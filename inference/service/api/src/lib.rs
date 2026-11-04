@@ -45,6 +45,13 @@ use utoipa::{OpenApi, PartialSchema, ToSchema};
 
 const CONNECTOR_MAX_OUTPUT_TOKENS: u32 = 32_768;
 
+/// The output a listed model offers harnesses: a quarter of its served context, at most
+/// [`CONNECTOR_MAX_OUTPUT_TOKENS`]. Harnesses keep this much of the window free for the reply, so
+/// a model served at 32K leaves 24K for the conversation rather than none.
+fn connector_max_output_tokens(context_length: u32) -> u32 {
+    (context_length / 4).min(CONNECTOR_MAX_OUTPUT_TOKENS)
+}
+
 use magnitude_serving::chat::{
     AllowedToolRequest, AllowedToolsChoiceRequest, AllowedToolsModeRequest, AllowedToolsRequest,
     AllowedToolsType, ApplyTemplateRequest, ApplyTemplateResponse, ChatCompletionChoice,
@@ -1841,7 +1848,7 @@ fn open_ai_model(
         reasoning,
         top_provider: OpenAiTopProvider {
             context_length,
-            max_completion_tokens: context_length.min(CONNECTOR_MAX_OUTPUT_TOKENS),
+            max_completion_tokens: connector_max_output_tokens(context_length),
         },
     })
 }
@@ -2352,7 +2359,7 @@ mod tests {
 
         let value = serde_json::to_value(model).expect("serializable model");
         assert_eq!(value["context_length"], 65_536);
-        assert_eq!(value["top_provider"]["max_completion_tokens"], 32_768);
+        assert_eq!(value["top_provider"]["max_completion_tokens"], 16_384);
         assert_eq!(
             value["architecture"]["input_modalities"],
             json!(["text", "image"])
@@ -3888,6 +3895,15 @@ mod tests {
         assert_eq!(body["data"][0]["name"], "Fine Tune");
         assert_eq!(body["data"][0]["description"], "Found in Ollama");
         assert_eq!(body["data"][0]["context_length"], 8192);
+    }
+
+    #[test]
+    fn listed_output_leaves_three_quarters_of_the_served_context_for_the_conversation() {
+        assert_eq!(connector_max_output_tokens(32_768), 8_192);
+        assert_eq!(connector_max_output_tokens(65_536), 16_384);
+        assert_eq!(connector_max_output_tokens(131_072), 32_768);
+        assert_eq!(connector_max_output_tokens(1_048_576), 32_768);
+        assert_eq!(connector_max_output_tokens(8_192), 2_048);
     }
 
     /// A model served at a smaller context than its own lists the context it is served at, which
