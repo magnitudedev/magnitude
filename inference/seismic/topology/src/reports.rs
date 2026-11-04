@@ -1,102 +1,98 @@
-//! Discovery (spec §2.3): what the backend crates and the OS report, and the
-//! rules that turn those reports into a topology revision.
+//! What the backend crates and the OS report of the machine, and the rules
+//! that turn those reports into a topology revision (spec §2.3).
 //!
-//! [`gather`] reads the reports; [`build`] applies the placement and grant
-//! rules to them. The rules branch only on what the reports state (whether
-//! a device's memory is the host's, its heaps, the dedicated memory the OS
-//! reports for its adapter, the capabilities its backend requires), never
-//! on a vendor, driver or model.
+//! [`build`] applies the placement and grant rules to the reports
+//! (`seismic-discovery` gathers them). The rules branch only on what the
+//! reports state (whether a device's memory is the host's, its heaps, the
+//! dedicated memory the OS reports for its adapter, the capabilities its
+//! backend requires), never on a vendor, driver or model.
 //!
 //! Whose memory a device's is, `build` decides once per physical device from
 //! every backend's report of it ([`device_memory`]); every executor of the
 //! device then places by that one decision.
 
-use crate::host;
 use crate::model::{
-    AccessRoute, Availability, Builder, DeviceMemory, DeviceTopology, Diagnostic, DiagnosticSource,
-    ExecutorBuilder, ExecutorKind, ExecutorReport, GrantSource, Limits, OwnPath, PhysicalDeviceId,
-    PhysicalIdentity, Reported, ReportedBy, Revision, StorageKind, StoreId, StoreKind, VolumeId,
+    AccessRoute, Availability, Builder, DeviceMemory, DeviceTopology, Diagnostic, ExecutorBuilder,
+    ExecutorKind, ExecutorReport, GrantSource, Limits, OwnPath, PhysicalDeviceId, PhysicalIdentity,
+    Reported, ReportedBy, Revision, StorageKind, StoreId, StoreKind, VolumeId,
 };
 use crate::selector::ExecutorSelector;
-use seismic_lang::registry::BackendName;
 use std::collections::HashMap;
-use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
 
 /// Everything discovery reads, before the rules apply.
 #[derive(Debug)]
-pub(crate) struct Reports {
+pub struct Reports {
     /// Host RAM capacity.
-    pub(crate) host: Reported<u64>,
+    pub host: Reported<u64>,
     /// The OS build: the CPU's and Metal's driver.
-    pub(crate) os_build: String,
-    pub(crate) cpu: CpuReport,
-    pub(crate) metal: Vec<MetalReport>,
-    pub(crate) cuda: Vec<CudaReport>,
-    pub(crate) vulkan: Vec<VulkanReport>,
+    pub os_build: String,
+    pub cpu: CpuReport,
+    pub metal: Vec<MetalReport>,
+    pub cuda: Vec<CudaReport>,
+    pub vulkan: Vec<VulkanReport>,
     /// The OS's display adapters (DXGI); empty where the OS has no adapter
     /// interface.
-    pub(crate) adapters: Vec<AdapterReport>,
-    pub(crate) volumes: Vec<VolumeReport>,
-    pub(crate) diagnostics: Vec<Diagnostic>,
+    pub adapters: Vec<AdapterReport>,
+    pub volumes: Vec<VolumeReport>,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 #[derive(Debug)]
-pub(crate) struct CpuReport {
-    pub(crate) name: String,
+pub struct CpuReport {
+    pub name: String,
     /// The CPU as the OS reports it: model, instruction set and caches.
-    pub(crate) identity: String,
+    pub identity: String,
     /// Its last-level caches, summed over their instances
     /// ([`host::last_level_cache`]).
-    pub(crate) cache: Option<Reported<u64>>,
-    pub(crate) availability: Availability,
-    pub(crate) max_allocation: u64,
+    pub cache: Option<Reported<u64>>,
+    pub availability: Availability,
+    pub max_allocation: u64,
 }
 
 #[derive(Debug)]
-pub(crate) struct MetalReport {
-    pub(crate) registry_id: u64,
-    pub(crate) name: String,
+pub struct MetalReport {
+    pub registry_id: u64,
+    pub name: String,
     /// `MTLDevice.hasUnifiedMemory`: its memory is the host's.
-    pub(crate) unified: bool,
+    pub unified: bool,
     /// What the backend's kernels require: a compiler accepting one of the
     /// language versions it emits (`seismic_metal::profile::language`).
-    pub(crate) admission: Result<(), String>,
+    pub admission: Result<(), String>,
     /// `seismic_metal::profile::forms_tensor_operations`, for a device the
     /// backend admits.
-    pub(crate) tensor_operations: bool,
-    pub(crate) working_set: u64,
-    pub(crate) max_allocation: u64,
+    pub tensor_operations: bool,
+    pub working_set: u64,
+    pub max_allocation: u64,
 }
 
 #[derive(Debug)]
-pub(crate) struct CudaReport {
-    pub(crate) uuid: [u8; 16],
+pub struct CudaReport {
+    pub uuid: [u8; 16],
     /// `cuDeviceGetLuid`, where the driver reports one (WDDM): what matches
     /// the device to the dedicated memory the OS reports for its adapter.
-    pub(crate) luid: Option<[u8; 8]>,
-    pub(crate) name: String,
+    pub luid: Option<[u8; 8]>,
+    pub name: String,
     /// `cuDriverGetVersion`.
-    pub(crate) driver: String,
+    pub driver: String,
     /// The compute-capability and driver floors of the backend's kernels.
-    pub(crate) admission: Result<(), String>,
+    pub admission: Result<(), String>,
     /// `cuDeviceTotalMem`.
-    pub(crate) total: u64,
-    pub(crate) max_allocation: u64,
+    pub total: u64,
+    pub max_allocation: u64,
     /// `CU_DEVICE_ATTRIBUTE_INTEGRATED`, which describes the device.
-    pub(crate) integrated: bool,
+    pub integrated: bool,
     /// `CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE`; none where it reads zero.
-    pub(crate) l2: Option<u64>,
-    pub(crate) memory: CudaMemory,
+    pub l2: Option<u64>,
+    pub memory: CudaMemory,
     /// The CUDA devices whose memory it reads and writes directly
     /// (`cuDeviceCanAccessPeer`).
-    pub(crate) peers: Vec<[u8; 16]>,
+    pub peers: Vec<[u8; 16]>,
 }
 
 /// Whose memory a CUDA device reports its memory is.
 #[derive(Debug)]
-pub(crate) enum CudaMemory {
+pub enum CudaMemory {
     /// The host's: an integrated device (`CU_DEVICE_ATTRIBUTE_INTEGRATED`),
     /// or one whose memory is an OS NUMA node
     /// (`CU_DEVICE_ATTRIBUTE_NUMA_CONFIG`).
@@ -106,97 +102,58 @@ pub(crate) enum CudaMemory {
 }
 
 #[derive(Debug)]
-pub(crate) struct VulkanReport {
-    pub(crate) uuid: [u8; 16],
+pub struct VulkanReport {
+    pub uuid: [u8; 16],
     /// Its device type, which describes it.
-    pub(crate) kind: ExecutorKind,
+    pub kind: ExecutorKind,
     /// Whether its memory is the host's, as its device type states it
     /// (`seismic_vulkan::DeviceType::memory_is_host`); none for a type that
     /// states neither.
-    pub(crate) memory_is_host: Option<bool>,
-    pub(crate) name: String,
+    pub memory_is_host: Option<bool>,
+    pub name: String,
     /// The device floor: `Err` names the first missing item.
-    pub(crate) floor: Result<(), String>,
+    pub floor: Result<(), String>,
     /// `VkDriverId` and the driver version.
-    pub(crate) driver: String,
-    pub(crate) max_allocation: u64,
-    pub(crate) memory: VulkanMemory,
+    pub driver: String,
+    pub max_allocation: u64,
+    pub memory: VulkanMemory,
 }
 
 /// A Vulkan device's memory as the backend reports it.
 #[derive(Debug)]
-pub(crate) struct VulkanMemory {
+pub struct VulkanMemory {
     /// `VkPhysicalDeviceIDProperties::deviceLUID`, when valid: what matches
     /// the device to the dedicated memory the OS reports for its adapter.
-    pub(crate) luid: Option<[u8; 8]>,
-    pub(crate) heaps: Vec<VulkanHeap>,
+    pub luid: Option<[u8; 8]>,
+    pub heaps: Vec<VulkanHeap>,
     /// For each storage kind, the heaps the backend allocates it from, in
     /// order.
-    pub(crate) allocates: [Vec<usize>; StorageKind::COUNT],
+    pub allocates: [Vec<usize>; StorageKind::COUNT],
 }
 
 #[derive(Debug)]
-pub(crate) struct VulkanHeap {
-    pub(crate) bytes: u64,
+pub struct VulkanHeap {
+    pub bytes: u64,
     /// `VK_MEMORY_HEAP_DEVICE_LOCAL_BIT`.
-    pub(crate) device_local: bool,
+    pub device_local: bool,
 }
 
 /// One display adapter as the OS reports it.
 #[derive(Debug)]
-pub(crate) struct AdapterReport {
+pub struct AdapterReport {
     /// The adapter's LUID, in `LUID` memory layout.
-    pub(crate) luid: [u8; 8],
+    pub luid: [u8; 8],
     /// Memory the OS reports as dedicated to the adapter, which it does not
     /// manage.
-    pub(crate) dedicated: u64,
+    pub dedicated: u64,
 }
 
 #[derive(Debug)]
-pub(crate) struct VolumeReport {
-    pub(crate) path: PathBuf,
-    pub(crate) id: VolumeId,
-    pub(crate) size: Reported<u64>,
+pub struct VolumeReport {
+    pub path: PathBuf,
+    pub id: VolumeId,
+    pub size: Reported<u64>,
 }
-
-/// Why no topology could be discovered.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DiscoveryError {
-    /// Host RAM capacity could not be established; no topology is complete
-    /// without it.
-    HostMemory(String),
-    /// The OS build, the CPU's and Metal's driver, could not be read.
-    OsBuild(String),
-    /// The CPU as the OS reports it could not be read.
-    CpuIdentity(String),
-    /// A cache the OS reports for the CPU, part of its identity, could not
-    /// be read.
-    CpuCache(String),
-    /// A served path's volume could not be identified or sized.
-    Volume { path: PathBuf, message: String },
-}
-
-impl fmt::Display for DiscoveryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::HostMemory(message) => write!(f, "host memory discovery failed: {message}"),
-            Self::OsBuild(message) => write!(f, "the OS build could not be read: {message}"),
-            Self::CpuIdentity(message) => {
-                write!(f, "the CPU identity could not be read: {message}")
-            }
-            Self::CpuCache(message) => write!(f, "the CPU's caches could not be read: {message}"),
-            Self::Volume { path, message } => {
-                write!(
-                    f,
-                    "the volume of {} could not be read: {message}",
-                    path.display()
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for DiscoveryError {}
 
 fn availability(admission: Result<(), String>) -> Availability {
     match admission {
@@ -278,7 +235,7 @@ fn undecided(reports: &Reports, uuid: [u8; 16]) -> String {
 }
 
 /// The revision `revision` of the machine `reports` describe.
-pub(crate) fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
+pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
     let machine = format!("{};ram={}", reports.cpu.identity, reports.host.value);
     let mut builder = Builder::new(
         revision,
@@ -301,18 +258,13 @@ pub(crate) fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
         };
         builder.physical(PhysicalIdentity::Registry(metal.registry_id), memory, None);
     }
-    for uuid in reports
-        .cuda
-        .iter()
-        .map(|cuda| cuda.uuid)
-        .chain(
-            reports
-                .vulkan
-                .iter()
-                .filter(|vulkan| vulkan.kind != ExecutorKind::Cpu)
-                .map(|vulkan| vulkan.uuid),
-        )
-    {
+    for uuid in reports.cuda.iter().map(|cuda| cuda.uuid).chain(
+        reports
+            .vulkan
+            .iter()
+            .filter(|vulkan| vulkan.kind != ExecutorKind::Cpu)
+            .map(|vulkan| vulkan.uuid),
+    ) {
         builder.physical(
             PhysicalIdentity::Uuid(uuid),
             device_memory(reports, uuid),
@@ -748,344 +700,4 @@ fn dedicated(adapters: &[AdapterReport], luid: Option<[u8; 8]>) -> Option<u64> {
         .find(|adapter| adapter.luid == luid)
         .map(|adapter| adapter.dedicated)
         .filter(|bytes| *bytes > 0)
-}
-
-/// What discovery reads, with the native handles status sampling reads
-/// again.
-pub(crate) struct Gathered {
-    pub(crate) reports: Reports,
-    pub(crate) natives: Natives,
-}
-
-/// Unopened native handles a sample reads.
-#[derive(Default)]
-pub(crate) struct Natives {
-    #[cfg(target_os = "macos")]
-    pub(crate) metal: Vec<seismic_metal::DeviceHandle>,
-    /// Each Vulkan device's handle, by UUID.
-    #[cfg(not(target_os = "macos"))]
-    pub(crate) vulkan: Vec<([u8; 16], seismic_vulkan::DeviceHandle)>,
-}
-
-/// The diagnostic of a backend whose enumeration succeeded with no device:
-/// every backend yields devices or a diagnostic.
-fn no_device(backend: BackendName) -> Diagnostic {
-    Diagnostic {
-        source: DiagnosticSource::Backend(backend),
-        message: format!("{} reports no device", backend.as_str()),
-    }
-}
-
-/// Read the backend crates and the OS. Only cheap native queries run, except
-/// what the backends themselves need to establish availability, grants and
-/// capability: a Metal device's language and tensor-operation probes
-/// (compiles), and a discrete CUDA device's usable memory, which needs its
-/// context (once per process).
-pub(crate) fn gather(paths: &[PathBuf]) -> Result<Gathered, DiscoveryError> {
-    let host = host::capacity().map_err(DiscoveryError::HostMemory)?;
-    let os_build = host::os_build().map_err(DiscoveryError::OsBuild)?;
-    let mut diagnostics = Vec::new();
-
-    let cache = host::last_level_cache().map_err(DiscoveryError::CpuCache)?;
-    let cpu = CpuReport {
-        name: format!("Host CPU ({})", std::env::consts::ARCH),
-        identity: host::cpu_identity(cache.map(|cache| cache.value))
-            .map_err(DiscoveryError::CpuIdentity)?,
-        cache,
-        availability: cpu_availability(seismic_native_cpu::Tier::detected()),
-        max_allocation: seismic_cpu::MAX_ALLOCATION_BYTES,
-    };
-
-    #[cfg(target_os = "macos")]
-    let natives = Natives {
-        metal: seismic_metal::DeviceHandle::discover(),
-    };
-    #[cfg(not(target_os = "macos"))]
-    let mut natives = Natives::default();
-    #[cfg(target_os = "macos")]
-    if natives.metal.is_empty() {
-        diagnostics.push(no_device(BackendName::Metal));
-    }
-    #[cfg(target_os = "macos")]
-    let metal = natives
-        .metal
-        .iter()
-        .map(|handle| {
-            let admission = seismic_metal::profile::language(handle)
-                .map(|_| ())
-                .map_err(|error| error.to_string());
-            MetalReport {
-                registry_id: handle.registry_id(),
-                name: handle.name(),
-                unified: handle.has_unified_memory(),
-                tensor_operations: admission.is_ok()
-                    && seismic_metal::profile::forms_tensor_operations(handle),
-                admission,
-                working_set: handle.recommended_working_set_bytes(),
-                max_allocation: handle.max_allocation_bytes(),
-            }
-        })
-        .collect();
-    #[cfg(not(target_os = "macos"))]
-    let metal = Vec::new();
-
-    let cuda = cuda_reports(&mut diagnostics);
-
-    #[cfg(not(target_os = "macos"))]
-    let vulkan = match seismic_vulkan::discover() {
-        Err(error) => {
-            diagnostics.push(Diagnostic {
-                source: DiagnosticSource::Backend(BackendName::Vulkan),
-                message: error.to_string(),
-            });
-            Vec::new()
-        }
-        Ok(descriptions) => {
-            if descriptions.is_empty() {
-                diagnostics.push(no_device(BackendName::Vulkan));
-            }
-            natives.vulkan = descriptions
-                .iter()
-                .map(|description| (description.facts.uuid, description.handle))
-                .collect();
-            descriptions.iter().map(vulkan_report).collect()
-        }
-    };
-    // Vulkan is not built on macOS (MoltenVK is not supported).
-    #[cfg(target_os = "macos")]
-    let vulkan = {
-        diagnostics.push(Diagnostic {
-            source: DiagnosticSource::Backend(BackendName::Vulkan),
-            message: "this build has no Vulkan runtime".into(),
-        });
-        Vec::new()
-    };
-
-    #[cfg(windows)]
-    let adapters = match crate::adapters::adapters() {
-        Ok(adapters) => adapters,
-        Err(message) => {
-            diagnostics.push(Diagnostic {
-                source: DiagnosticSource::Adapters,
-                message,
-            });
-            Vec::new()
-        }
-    };
-    #[cfg(not(windows))]
-    let adapters = Vec::new();
-
-    let volumes = paths
-        .iter()
-        .map(|path| {
-            let failed = |error: std::io::Error| DiscoveryError::Volume {
-                path: path.clone(),
-                message: error.to_string(),
-            };
-            Ok(VolumeReport {
-                path: path.clone(),
-                id: crate::volume::identify(path).map_err(failed)?,
-                size: crate::volume::size(path).map_err(failed)?,
-            })
-        })
-        .collect::<Result<_, DiscoveryError>>()?;
-
-    Ok(Gathered {
-        reports: Reports {
-            host,
-            os_build,
-            cpu,
-            metal,
-            cuda,
-            vulkan,
-            adapters,
-            volumes,
-            diagnostics,
-        },
-        natives,
-    })
-}
-
-/// Every CUDA device's report, and which of the others each reads directly.
-fn cuda_reports(diagnostics: &mut Vec<Diagnostic>) -> Vec<CudaReport> {
-    let diagnostic = |message: String| Diagnostic {
-        source: DiagnosticSource::Backend(BackendName::Cuda),
-        message,
-    };
-    let count = match seismic_cuda::device_count() {
-        Ok(0) => {
-            diagnostics.push(no_device(BackendName::Cuda));
-            return Vec::new();
-        }
-        Ok(count) => count,
-        Err(error) => {
-            diagnostics.push(diagnostic(error.to_string()));
-            return Vec::new();
-        }
-    };
-    let mut described = Vec::new();
-    for ordinal in 0..count {
-        match seismic_cuda::describe(ordinal) {
-            Ok(descriptor) => described.push(descriptor),
-            Err(error) => {
-                diagnostics.push(diagnostic(format!("device ordinal {ordinal}: {error}")))
-            }
-        }
-    }
-    let mut reports = Vec::new();
-    for descriptor in &described {
-        let mut peers = Vec::new();
-        for peer in &described {
-            if peer.ordinal == descriptor.ordinal {
-                continue;
-            }
-            match seismic_cuda::can_access_peer(descriptor.ordinal, peer.ordinal) {
-                Ok(true) => peers.push(peer.uuid),
-                Ok(false) => {}
-                Err(error) => diagnostics.push(diagnostic(format!(
-                    "peer access of ordinal {} to {}: {error}",
-                    descriptor.ordinal, peer.ordinal
-                ))),
-            }
-        }
-        let (ordinal, uuid) = (descriptor.ordinal, descriptor.uuid);
-        reports.push(CudaReport {
-            uuid,
-            luid: descriptor.luid,
-            name: descriptor.name.clone(),
-            driver: format!("cuda driver {}", descriptor.driver_api),
-            admission: descriptor.admission().map_err(|error| error.to_string()),
-            total: descriptor.total_memory_bytes,
-            max_allocation: seismic_cuda::max_allocation_bytes(descriptor.total_memory_bytes),
-            integrated: descriptor.integrated,
-            l2: (descriptor.l2_cache_bytes > 0).then_some(descriptor.l2_cache_bytes),
-            memory: if descriptor.integrated || descriptor.numa_node {
-                CudaMemory::Host
-            } else {
-                CudaMemory::Own {
-                    usable: usable_at_first_read(uuid, || {
-                        seismic_cuda::usable_memory_bytes(ordinal, uuid)
-                            .map_err(|error| error.to_string())
-                    }),
-                }
-            },
-            peers,
-        });
-    }
-    reports
-}
-
-/// The Vulkan backend's description of one device.
-#[cfg(not(target_os = "macos"))]
-fn vulkan_report(description: &seismic_vulkan::Description) -> VulkanReport {
-    let device = &description.facts;
-    let heaps = |types: &[u32]| {
-        seismic_vulkan::Allocation::heaps(&device.memory, types)
-            .into_iter()
-            .map(|heap| heap as usize)
-            .collect()
-    };
-    let kind = match device.device_type {
-        seismic_vulkan::DeviceType::Cpu => ExecutorKind::Cpu,
-        seismic_vulkan::DeviceType::Integrated => ExecutorKind::IntegratedGpu,
-        seismic_vulkan::DeviceType::Discrete => ExecutorKind::DiscreteGpu,
-        seismic_vulkan::DeviceType::Other => ExecutorKind::Other,
-    };
-    VulkanReport {
-        uuid: device.uuid,
-        kind,
-        memory_is_host: (device.device_type != seismic_vulkan::DeviceType::Other)
-            .then(|| device.device_type.memory_is_host()),
-        name: device.name.clone(),
-        floor: description.floor.clone(),
-        driver: format!(
-            "vulkan driver {} version {}",
-            device.driver_id, device.driver_version
-        ),
-        max_allocation: device.limits.max_allocation_bytes,
-        memory: VulkanMemory {
-            luid: device.luid,
-            heaps: device
-                .memory
-                .heaps
-                .iter()
-                .map(|heap| VulkanHeap {
-                    bytes: heap.bytes,
-                    device_local: heap.device_local,
-                })
-                .collect(),
-            allocates: [
-                heaps(&device.allocation.device),
-                heaps(&device.allocation.upload),
-            ],
-        },
-    }
-}
-
-/// Discovery must enforce the same minimum instruction set as native
-/// specialization. Otherwise assessment promises a CPU that cannot form even
-/// the first import kernel (for example QEMU's default virtual CPU).
-pub(crate) fn cpu_availability(tier: Option<seismic_native_cpu::Tier>) -> Availability {
-    match tier {
-        Some(_) => Availability::Available,
-        None => Availability::Unavailable {
-            reason: format!(
-                "CPU execution requires {} ({}) or higher; \
-                 expose these CPU features to the virtual machine",
-                seismic_native_cpu::Tier::all()[0].name(),
-                seismic_native_cpu::Tier::all()[0].features(),
-            ),
-        },
-    }
-}
-
-/// The memory a discrete CUDA device lets this process use, as the driver
-/// reports it once this process first creates the device's context
-/// (`seismic_cuda::usable_memory_bytes`), read once per process and
-/// device: the first read precedes any allocation of this process, so a
-/// later discovery (a refresh, or another inventory) keeps it rather than
-/// reading the process's own holdings. A failed read is not kept.
-fn usable_at_first_read(
-    uuid: [u8; 16],
-    read: impl FnOnce() -> Result<u64, String>,
-) -> Result<u64, String> {
-    static USABLE: OnceLock<Mutex<HashMap<[u8; 16], u64>>> = OnceLock::new();
-    let mut usable = USABLE
-        .get_or_init(Mutex::default)
-        .lock()
-        .expect("the usable-memory registry lock is never poisoned");
-    if let Some(bytes) = usable.get(&uuid) {
-        return Ok(*bytes);
-    }
-    let bytes = read()?;
-    usable.insert(uuid, bytes);
-    Ok(bytes)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{cpu_availability, usable_at_first_read};
-    use crate::model::Availability;
-
-    #[test]
-    fn cpu_discovery_enforces_the_native_instruction_set_floor() {
-        let Availability::Unavailable { reason } = cpu_availability(None) else {
-            panic!("a CPU with no native instruction-set tier was admitted");
-        };
-        assert!(reason.contains(seismic_native_cpu::Tier::all()[0].features()));
-        for tier in seismic_native_cpu::Tier::all() {
-            assert_eq!(cpu_availability(Some(*tier)), Availability::Available);
-        }
-    }
-
-    /// The first successful read stands for the process; after a failure it
-    /// is read again.
-    #[test]
-    fn usable_memory_is_kept_for_the_process_and_a_failure_is_not() {
-        let uuid = [0xa5; 16];
-        let busy = || Err("busy".to_owned());
-        assert_eq!(usable_at_first_read(uuid, busy), Err("busy".to_owned()));
-        assert_eq!(usable_at_first_read(uuid, || Ok(6 << 30)), Ok(6 << 30));
-        assert_eq!(usable_at_first_read(uuid, || Ok(1 << 30)), Ok(6 << 30));
-    }
 }

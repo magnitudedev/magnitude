@@ -25,6 +25,7 @@ pub mod facts;
 pub mod intrinsic;
 pub mod profile;
 pub mod toolchain;
+pub mod topology;
 
 mod command;
 mod compile;

@@ -2,7 +2,7 @@
 //! backend contracts (spec §2.3, §12, §24.1 R9). No planning lives here.
 //!
 //! The public surface is [`devices`] (opened execution resources over
-//! seismic-topology's inventory) and [`api`] (the opened device, the
+//! seismic-discovery's inventory) and [`api`] (the opened device, the
 //! tensor, and the call driver) which the public `seismic` crate composes.
 //! Everything else is private:
 //!

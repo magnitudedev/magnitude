@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+seismic-topology.workspace = true
 seismic-estimator-metal.workspace = true
 seismic-ir.workspace = true
 seismic-estimator.workspace = true

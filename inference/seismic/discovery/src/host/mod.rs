@@ -16,7 +16,7 @@ use macos as platform;
 #[cfg(target_os = "windows")]
 use windows as platform;
 
-use crate::model::Reported;
+use seismic_topology::Reported;
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -389,7 +389,7 @@ mod tests {
             macos::sample_of(&reading).unwrap().headroom,
             Reported::new(
                 movable * reading.page_size,
-                crate::model::ReportedBy::MachMovablePages
+                seismic_topology::ReportedBy::MachMovablePages
             )
         );
         let mut history = DisplacementHistory::default();

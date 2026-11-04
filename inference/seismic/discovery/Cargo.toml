@@ -1,0 +1,38 @@
+[package]
+name = "seismic-discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# What the machine has, as the backend crates and the OS report it: the
+# inventory of its topology and status samples.
+[dependencies]
+seismic-topology.workspace = true
+seismic-cpu.workspace = true
+seismic-native-cpu.workspace = true
+seismic-cuda.workspace = true
+seismic-metal.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# Vulkan is built on Linux and Windows only.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+seismic-vulkan.workspace = true
+
+[dev-dependencies]
+# The recorded machines the inventory's tests discover from.
+seismic-topology = { workspace = true, features = ["fixtures"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Wdk_System_SystemServices",
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_JobObjects",
+  "Win32_System_ProcessStatus",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Dxgi"] }

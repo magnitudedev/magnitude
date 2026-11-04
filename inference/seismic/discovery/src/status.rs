@@ -5,9 +5,9 @@
 //! combines both, the input fit reads. Each driver figure's meaning is
 //! decided here, beside the reading.
 
-use crate::discovery::Natives;
+use crate::gather::Natives;
 use crate::host::{self, DisplacementHistory, HostStatus, ObservationError};
-use crate::model::{
+use seismic_topology::{
     AccessPath, AccessPathId, DeviceTopology, ExecutorId, GrantSource, Reported, ReportedBy, Store,
     StoreId, StoreKind,
 };

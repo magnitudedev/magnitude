@@ -7,6 +7,7 @@ license.workspace = true
 # The Vulkan backend of Seismic's direct native route. It is built on Linux
 # and Windows only; dependents gate it with `cfg(not(target_os = "macos"))`.
 [dependencies]
+seismic-topology.workspace = true
 seismic-compiler.workspace = true
 seismic-native-target.workspace = true
 ash = "=0.38.0"

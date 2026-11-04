@@ -14,6 +14,7 @@ mod instance;
 mod memory;
 pub mod seal;
 pub mod toolchain;
+pub mod topology;
 
 pub use device::{Device, DeviceHandle, HeapBudget, MemoryBudget, OpenError};
 pub use facts::{

@@ -2,67 +2,26 @@
 //! spec's §3, their placements and grants, revisions, and identities. The
 //! recorded machines and their sources are `crate::fixtures`'.
 
-use crate::discovery::{Gathered, Natives, Reports, VolumeReport, VulkanReport};
 use crate::fixtures::{
-    a10_8q, gb10, linux_host, lunar_lake, m4_pro, m4_pro_without_unified_memory, rtx3090,
-    rtx3090_cuda, rtx3090_host, rtx3090_uuid, rtx3090_vulkan, ryzen_igpu_and_rtx4070,
-    strix_halo_linux, strix_halo_linux_vulkan, strix_halo_windows, topology, uuid,
-    A10_8Q_CUDA_USABLE, A10_8Q_VULKAN_HEAP, GB, GB10_CUDA_TOTAL, GB10_UUID, GB10_VULKAN_HEAP,
-    LUNAR_LAKE_HEAP, LUNAR_LAKE_UUID, M4_PRO_REGISTRY, M4_PRO_WORKING_SET, RTX3090_CUDA_TOTAL,
-    RTX3090_CUDA_USABLE, RTX3090_HOST, RTX3090_VOLUME, RTX3090_VULKAN_DRIVER, RTX3090_VULKAN_HEAP,
-    RTX4070_HEAP, RTX4070_UUID, RYZEN_IGPU_HEAPS, RYZEN_IGPU_UUID, STRIX_HALO_LINUX_HEAPS,
-    STRIX_HALO_LINUX_UUID, STRIX_HALO_WINDOWS_DEDICATED, STRIX_HALO_WINDOWS_HEAPS,
-    STRIX_HALO_WINDOWS_LUID, STRIX_HALO_WINDOWS_UUID,
+    a10_8q, assert_consistent, executor, gb10, linux_host, lunar_lake, m4_pro,
+    m4_pro_without_unified_memory, placement, rtx3090, rtx3090_cuda, rtx3090_host, rtx3090_uuid,
+    rtx3090_volume, rtx3090_vulkan, ryzen_igpu_and_rtx4070, show, strix_halo_linux,
+    strix_halo_windows, topology, uuid, volume, A10_8Q_CUDA_USABLE, A10_8Q_VULKAN_HEAP, GB,
+    GB10_CUDA_TOTAL, GB10_UUID, GB10_VULKAN_HEAP, LUNAR_LAKE_HEAP, LUNAR_LAKE_UUID,
+    M4_PRO_REGISTRY, M4_PRO_WORKING_SET, RTX3090_CUDA_TOTAL, RTX3090_CUDA_USABLE, RTX3090_HOST,
+    RTX3090_VULKAN_DRIVER, RTX3090_VULKAN_HEAP, RTX4070_HEAP, RTX4070_UUID, RYZEN_IGPU_HEAPS,
+    RYZEN_IGPU_UUID, STRIX_HALO_LINUX_HEAPS, STRIX_HALO_LINUX_UUID, STRIX_HALO_WINDOWS_DEDICATED,
+    STRIX_HALO_WINDOWS_HEAPS, STRIX_HALO_WINDOWS_LUID, STRIX_HALO_WINDOWS_UUID,
 };
 use crate::model::{
-    AccessRoute, Availability, DeviceMemory, DeviceTopology, Executor, PhysicalDeviceId,
-    PhysicalIdentity, Reported, ReportedBy, Revision, StorageKind, StoreId, StoreKind, VolumeId,
+    AccessRoute, Availability, DeviceMemory, DeviceTopology, PhysicalIdentity, Reported,
+    ReportedBy, StorageKind, StoreId, StoreKind,
 };
+use crate::reports::Reports;
 use crate::selector::ExecutorSelector;
-use crate::Inventory;
 use seismic_lang::registry::BackendName;
-use std::fmt::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-
-/// The executor of `backend` on the physical device of `identity`.
-fn executor<'a>(
-    topology: &'a DeviceTopology,
-    backend: BackendName,
-    identity: &PhysicalIdentity,
-) -> &'a Executor {
-    topology
-        .executors()
-        .iter()
-        .find(|executor| {
-            executor.backend() == backend
-                && topology
-                    .physical_device(executor.physical())
-                    .unwrap()
-                    .identity()
-                    == identity
-        })
-        .unwrap()
-}
-
-/// Where a placement lands: each path's store and grant.
-fn placement(
-    topology: &DeviceTopology,
-    executor: &Executor,
-    kind: StorageKind,
-) -> Vec<(StoreKind, Option<Reported<u64>>)> {
-    executor
-        .placement(kind)
-        .iter()
-        .map(|&id| {
-            let path = topology.access_path(id).unwrap();
-            (
-                topology.store(path.store()).unwrap().kind().clone(),
-                path.grant(),
-            )
-        })
-        .collect()
-}
 
 fn device_memory(topology: &DeviceTopology, uuid: [u8; 16]) -> StoreKind {
     let executor = topology
@@ -83,120 +42,6 @@ fn store_of(topology: &DeviceTopology, kind: &StoreKind) -> StoreId {
 
 fn reported(value: u64, by: ReportedBy) -> Option<Reported<u64>> {
     Some(Reported::new(value, by))
-}
-
-/// The volume store the inventory serves `path` on.
-fn volume(topology: &DeviceTopology, path: &Path) -> Option<StoreId> {
-    topology
-        .stores()
-        .iter()
-        .map(|store| store.id())
-        .find(|&store| topology.volume_paths(store).any(|served| served == path))
-}
-
-/// The topology as text: what each row's test produced.
-fn describe(topology: &DeviceTopology) -> String {
-    let store = |id: StoreId| match topology.store(id).unwrap().kind() {
-        StoreKind::HostRam => "host".to_owned(),
-        StoreKind::DeviceMemory(device) => format!("device{}", physical_index(topology, *device)),
-        StoreKind::Volume(volume) => format!("volume {}", volume.device),
-    };
-    let mut text = String::new();
-    for each in topology.stores() {
-        writeln!(
-            text,
-            "  store {}: {} ({:?})",
-            store(each.id()),
-            gb(each.capacity().value),
-            each.capacity().by
-        )
-        .unwrap();
-    }
-    for executor in topology.executors() {
-        write!(
-            text,
-            "  {:?} on device{} ({:?} memory) [{}]",
-            executor.backend(),
-            physical_index(topology, executor.physical()),
-            topology
-                .physical_device(executor.physical())
-                .unwrap()
-                .memory(),
-            executor.driver(),
-        )
-        .unwrap();
-        if let Availability::Unavailable { reason } = executor.availability() {
-            writeln!(text, ": unavailable ({reason})").unwrap();
-            continue;
-        }
-        for kind in StorageKind::ALL {
-            let places = executor
-                .placement(kind)
-                .iter()
-                .map(|&id| {
-                    let path = topology.access_path(id).unwrap();
-                    match path.grant() {
-                        Some(grant) => format!(
-                            "{} under {} ({:?})",
-                            store(path.store()),
-                            gb(grant.value),
-                            grant.by
-                        ),
-                        None => format!("{} ungranted", store(path.store())),
-                    }
-                })
-                .collect::<Vec<_>>();
-            write!(text, "; {kind:?} -> [{}]", places.join(", ")).unwrap();
-        }
-        writeln!(text).unwrap();
-    }
-    for path in topology.transfer_paths() {
-        writeln!(
-            text,
-            "  transfer {} -> {} by {:?}",
-            store(path.from()),
-            store(path.to()),
-            topology.executor(path.by()).unwrap().backend()
-        )
-        .unwrap();
-    }
-    text
-}
-
-fn physical_index(topology: &DeviceTopology, id: PhysicalDeviceId) -> usize {
-    topology
-        .physical_devices()
-        .iter()
-        .position(|device| device.id() == id)
-        .unwrap()
-}
-
-fn gb(bytes: u64) -> String {
-    format!("{:.2} GB ({bytes})", bytes as f64 / GB as f64)
-}
-
-fn show(row: &str, topology: &DeviceTopology) {
-    eprintln!("{row}\n{}", describe(topology));
-}
-
-/// Every path names nodes of its revision, and every placement names the
-/// executor's own access paths.
-fn assert_consistent(topology: &DeviceTopology) {
-    for path in topology.access_paths() {
-        assert!(topology.executor(path.executor()).is_some());
-        assert!(topology.store(path.store()).is_some());
-    }
-    for path in topology.transfer_paths() {
-        assert!(topology.store(path.from()).is_some() && topology.store(path.to()).is_some());
-        assert!(topology.executor(path.by()).is_some());
-    }
-    for executor in topology.executors() {
-        for kind in StorageKind::ALL {
-            for &id in executor.placement(kind) {
-                assert_eq!(topology.access_path(id).unwrap().executor(), executor.id());
-            }
-        }
-    }
 }
 
 #[test]
@@ -469,19 +314,6 @@ fn a_discrete_gpu_has_an_access_path_to_host_ram() {
         .any(|path| path.executor() == cuda.id() && path.store() == topology.host_ram().id()));
 }
 
-/// The rtx3090 host's evaluation volume, served at two paths.
-fn rtx3090_volume(path: &str) -> VolumeReport {
-    let (device, uuid, size) = RTX3090_VOLUME;
-    VolumeReport {
-        path: PathBuf::from(path),
-        id: VolumeId {
-            device,
-            uuid: uuid.map(str::to_owned),
-        },
-        size: Reported::new(size, ReportedBy::FilesystemSize),
-    }
-}
-
 #[test]
 fn a_served_volume_is_read_into_host_ram_by_the_cpu() {
     let mut reports = rtx3090();
@@ -520,21 +352,6 @@ fn a_machine_has_one_host_ram_store() {
         .map(|store| store.id())
         .collect::<Vec<_>>();
     assert_eq!(host_ram, [topology.host_ram().id()]);
-}
-
-#[test]
-fn a_cpu_without_the_instruction_set_floor_is_unavailable_with_its_reason() {
-    let mut reports = rtx3090_host();
-    // What discovery reads where the CPU reports no native tier.
-    reports.cpu.availability = crate::discovery::cpu_availability(None);
-    let topology = topology(&reports);
-    show("CPU-only VM without AVX", &topology);
-    let cpu = topology.resolve(ExecutorSelector::HostCpu).unwrap();
-    assert!(matches!(
-        cpu.availability(),
-        Availability::Unavailable { .. }
-    ));
-    assert!(topology.access_paths().is_empty());
 }
 
 #[test]
@@ -590,23 +407,6 @@ fn a_metal_device_without_unified_memory_is_unavailable_with_its_reason() {
     );
 }
 
-/// The backend's allocation rule on the recorded layouts: device storage on
-/// the heap of the type it allocates from.
-#[test]
-fn vulkan_device_storage_reads_its_memory_types_heap() {
-    let allocates = |report: &VulkanReport| report.memory.allocates.clone();
-    // Discrete with ReBAR: both kinds on the device-local heap.
-    assert_eq!(
-        allocates(&rtx3090_vulkan(rtx3090_uuid())),
-        [vec![0], vec![0]]
-    );
-    // RADV: the device-local heap, then the GTT heap.
-    assert_eq!(
-        allocates(&strix_halo_linux_vulkan()),
-        [vec![1, 0], vec![1, 0]]
-    );
-}
-
 #[test]
 fn integrated_accounting_grants_share_a_route_but_discrete_heaps_are_selectable() {
     let integrated = topology(&strix_halo_windows());
@@ -630,90 +430,6 @@ fn integrated_accounting_grants_share_a_route_but_discrete_heaps_are_selectable(
     for path in vulkan {
         assert!(matches!(path.route(), AccessRoute::VulkanHeap(_)));
     }
-}
-
-fn gathered(reports: Reports) -> Gathered {
-    Gathered {
-        reports,
-        natives: Natives::default(),
-    }
-}
-
-/// Every identifier `topology` holds.
-fn identifiers(topology: &DeviceTopology) -> Vec<Revision> {
-    let mut revisions = Vec::new();
-    for device in topology.physical_devices() {
-        revisions.push(device.id().revision());
-    }
-    for store in topology.stores() {
-        revisions.push(store.id().revision());
-        if let StoreKind::DeviceMemory(device) = store.kind() {
-            revisions.push(device.revision());
-        }
-    }
-    for executor in topology.executors() {
-        revisions.push(executor.id().revision());
-        revisions.push(executor.physical().revision());
-        for kind in StorageKind::ALL {
-            revisions.extend(executor.placement(kind).iter().map(|id| id.revision()));
-        }
-    }
-    for path in topology.access_paths() {
-        revisions.extend([
-            path.id().revision(),
-            path.executor().revision(),
-            path.store().revision(),
-        ]);
-    }
-    for path in topology.transfer_paths() {
-        revisions.extend([
-            path.id().revision(),
-            path.from().revision(),
-            path.to().revision(),
-            path.by().revision(),
-        ]);
-    }
-    revisions
-}
-
-#[test]
-fn a_changed_refresh_leaves_no_identifier_at_its_old_revision() {
-    // A BIOS change of the carve-out: RADV's device-local heap grows by it.
-    let strix = |carve_out: u64| {
-        let mut reports = strix_halo_linux();
-        reports.vulkan[0].memory.heaps[1].bytes += carve_out;
-        reports.volumes.push(rtx3090_volume("/models"));
-        gathered(reports)
-    };
-    let inventory = Inventory::from_gathered(vec![PathBuf::from("/models")], strix(0));
-    let before = inventory.topology();
-    // The same machine keeps its revision and identifiers.
-    let same = inventory.advance(strix(0));
-    assert!(Arc::ptr_eq(&before, &same));
-    let rebuilt = topology(&strix(0).reports);
-    assert_ne!(rebuilt.revision(), before.revision());
-    assert_eq!(rebuilt.normalized(), before.normalized());
-    let after = inventory.advance(strix(1 << 30));
-    assert_ne!(after.revision(), before.revision());
-    assert_ne!(after.normalized(), before.normalized());
-    assert!(identifiers(&after)
-        .into_iter()
-        .all(|revision| revision == after.revision()));
-    assert!(identifiers(&before)
-        .into_iter()
-        .all(|revision| revision == before.revision()));
-    let gpu = PhysicalIdentity::Uuid(uuid(STRIX_HALO_LINUX_UUID));
-    let old = executor(&before, BackendName::Vulkan, &gpu);
-    assert!(after.executor(old.id()).is_none());
-    assert!(after.store(before.host_ram().id()).is_none());
-    assert!(after
-        .access_path(old.placement(StorageKind::Device)[0])
-        .is_none());
-    assert_eq!(
-        volume(&after, Path::new("/models")).unwrap().revision(),
-        after.revision()
-    );
-    assert_consistent(&after);
 }
 
 /// CUDA and Vulkan views reporting one device UUID are one physical device,
@@ -757,7 +473,8 @@ fn a_software_vulkan_device_is_an_executor_of_the_host() {
         "llvmpipe (LLVM 17.0.6, 256 bits)",
         "vulkan driver MESA_LLVMPIPE version 24.0.9",
         true,
-        crate::fixtures::layout(&[(RTX3090_HOST, true, &["DL|HV|HC|C"])]),
+        &[(RTX3090_HOST, true)],
+        [vec![0], vec![0]],
         1 << 31,
         None,
     );
@@ -854,7 +571,7 @@ fn every_view_of_a_device_whose_memory_is_the_hosts_places_its_dedicated_memory_
     let dedicated = 32 * GB;
     reports
         .adapters
-        .push(crate::discovery::AdapterReport { luid, dedicated });
+        .push(crate::reports::AdapterReport { luid, dedicated });
     reports.cuda[0].luid = Some(luid);
     let topology = topology(&reports);
     assert_consistent(&topology);
@@ -996,78 +713,9 @@ fn a_driver_update_changes_only_its_executor_identity() {
     assert_eq!(vulkan.physical, gpu);
 }
 
-/// A sample reads the grants of the executors it is for alone: the RTX
-/// 3090's CUDA executor reads no Vulkan heap budget, though its Vulkan
-/// executor on the same device has grants a heap budget reads.
-#[test]
-fn a_sample_reads_the_grants_of_its_executors_alone() {
-    let inventory = Inventory::from_gathered(Vec::new(), gathered(rtx3090()));
-    let topology = inventory.topology();
-    let gpu = PhysicalIdentity::Uuid(rtx3090_uuid());
-    let cuda = executor(&topology, BackendName::Cuda, &gpu).id();
-    let vulkan = executor(&topology, BackendName::Vulkan, &gpu).id();
-    let sourced = |of| {
-        topology
-            .grant_sources()
-            .filter(|(path, _, _)| path.executor() == of)
-            .map(|(path, _, _)| path.id())
-            .collect::<Vec<_>>()
-    };
-    assert!(sourced(cuda).is_empty());
-    assert!(!sourced(vulkan).is_empty());
-    let read = |executors: &[_]| {
-        inventory
-            .sample(&topology, executors)
-            .grants
-            .into_iter()
-            .map(|(path, _)| path)
-            .collect::<Vec<_>>()
-    };
-    assert!(read(&[cuda]).is_empty());
-    assert_eq!(read(&[vulkan]), sourced(vulkan));
-    assert_eq!(read(&[cuda, vulkan]), sourced(vulkan));
-}
-
 /// The rtx3090 machine with Vulkan driver `driver`.
 fn rtx3090_topology(driver: &str) -> Arc<DeviceTopology> {
     let mut reports = rtx3090();
     reports.vulkan[0].driver = driver.into();
     Arc::new(topology(&reports))
-}
-
-/// The machine this runs on: its reports, the topology they make, and one
-/// sample of it.
-#[test]
-fn the_machine_is_discovered_and_sampled() {
-    let directory = std::env::temp_dir();
-    let gathered = crate::discovery::gather(&[directory.clone()]).unwrap();
-    eprintln!("{:#?}", gathered.reports);
-    let inventory = Inventory::from_gathered(vec![directory.clone()], gathered);
-    let topology = inventory.topology();
-    show("This machine", &topology);
-    assert_consistent(&topology);
-    let cpu = topology.resolve(ExecutorSelector::HostCpu).unwrap();
-    if *cpu.availability() == Availability::Available {
-        assert_eq!(
-            placement(&topology, cpu, StorageKind::Device),
-            [(StoreKind::HostRam, None)]
-        );
-    }
-    let served = volume(&topology, &directory).unwrap();
-    let every = topology
-        .executors()
-        .iter()
-        .map(|executor| executor.id())
-        .collect::<Vec<_>>();
-    let sample = inventory.sample(&topology, &every);
-    assert!(sample.host_ram.as_ref().unwrap().headroom.value > 0);
-    assert_eq!(sample.volumes.len(), 1);
-    assert_eq!(sample.volumes[0].0, served);
-    assert!(sample.volumes[0].1.as_ref().unwrap().value > 0);
-    // Every grant whose status needs no opened executor is read, from the
-    // handles discovery found.
-    assert_eq!(sample.grants.len(), topology.grant_sources().count());
-    assert!(sample.grants.iter().all(|(_, left)| left.is_ok()));
-    eprintln!("{sample:#?}");
-    assert_eq!(inventory.refresh().unwrap().revision(), topology.revision());
 }

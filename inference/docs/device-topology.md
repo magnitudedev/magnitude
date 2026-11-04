@@ -1,7 +1,7 @@
 # Device topology
 
 **One model of the machine: where computation runs, where bytes live, and what each executor may
-place where.** `seismic-topology` discovers it from standard interfaces; it measures nothing, and
+place where.** `seismic-discovery` discovers it from standard interfaces; it measures nothing, and
 every value in it is one an interface reports. How fast work runs on it is measured apart from it
 (`seismic-measure`, below).
 
@@ -134,15 +134,18 @@ The topology describes the machine. It knows nothing of models, loads or reserve
 
 | Owner | Responsibility |
 | --- | --- |
-| `seismic-topology` | What the machine is, end to end: the graph, discovery through the backend crates and the OS, status samples, and executor identities |
+| `seismic-topology` | What the machine is, as data: the graph, the rules that build it from the reports of the backends and the OS, executor identities, and the recorded machines |
+| Backend crates | Each describes its own devices in the topology's terms (`<backend>::topology`) |
+| `seismic-discovery` | What the machine has: the backends' and the OS's reports gathered into the inventory, and status samples |
 | `seismic-measure` | Timing work: the session, the sustained clock, the statistics and stopping rule, deadlines, and the records of measured points |
 | Seismic runtime | Opening executors by identity, allocation and ledgers, the measurable work (kernel calls, graph runs), kernel identities, and tuning |
 | Engine | Interpreting the topology for inference, in one place per use (below), and which points to measure |
 
-`seismic-topology` and `seismic-measure` are internal to Seismic and published through the
+`seismic-topology`, `seismic-discovery` and `seismic-measure` are internal to Seismic and published through the
 `seismic` crate, like every Seismic crate; consumers, including anything that only needs to know the
-machine, depend on `seismic`. Inside Seismic, `seismic-runtime` depends on `seismic-topology`
-(which depends on the backend crates) and on `seismic-measure` (which depends on no Seismic crate).
+machine, depend on `seismic`. Inside Seismic, the backend crates depend on `seismic-topology`
+(which depends on no backend), `seismic-discovery` on both, and `seismic-runtime` on
+`seismic-discovery` and on `seismic-measure` (which depends on no Seismic crate).
 
 ## Consumption
 

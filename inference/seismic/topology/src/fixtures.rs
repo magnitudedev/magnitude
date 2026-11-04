@@ -6,17 +6,28 @@
 //! Every recorded value names its source: a run on our hosts
 //! (an evaluation run id), a Vulkan Hardware Database report
 //! (vulkan.gpuinfo.org/displayreport.php?id=N), or the issue that reported
-//! the machine. The database's reports list memory types under their heap
-//! and do not give the types' global order; each layout here lists them heap
-//! by heap, which the allocation rule reads only within a heap.
+//! the machine. A Vulkan device records the heaps the backend's allocation
+//! rule takes from its report's memory types, which `seismic_vulkan`'s tests
+//! hold the rule to.
 
-use crate::discovery::{
-    build, AdapterReport, CpuReport, CudaMemory, CudaReport, MetalReport, Reports, VulkanHeap,
-    VulkanMemory, VulkanReport,
+use crate::model::{
+    Availability, DeviceTopology, Executor, ExecutorKind, PhysicalDeviceId, PhysicalIdentity,
+    Reported, ReportedBy, Revision, StorageKind, StoreId, StoreKind, VolumeId,
 };
-use crate::model::{Availability, DeviceTopology, ExecutorKind, Reported, ReportedBy, Revision};
+use crate::reports::{
+    build, AdapterReport, CpuReport, CudaMemory, CudaReport, MetalReport, Reports, VolumeReport,
+    VulkanHeap, VulkanMemory, VulkanReport,
+};
+use seismic_lang::registry::BackendName;
+use std::fmt::Write;
+use std::path::{Path, PathBuf};
 
-pub(crate) const GB: u64 = 1_000_000_000;
+pub const GB: u64 = 1_000_000_000;
+
+/// The CPU backend's largest allocation on a 64-bit host
+/// (`seismic_cpu::MAX_ALLOCATION_BYTES`): `isize::MAX` down to its 4 KiB
+/// scratch alignment.
+const CPU_MAX_ALLOCATION: u64 = 0x7fff_ffff_ffff_f000;
 
 /// The topology of each recorded machine, each built at a revision of its
 /// own.
@@ -72,30 +83,29 @@ pub mod recorded {
     }
 }
 
-pub(crate) fn topology(reports: &Reports) -> DeviceTopology {
+pub fn topology(reports: &Reports) -> DeviceTopology {
     build(Revision::next(), reports)
 }
 
 // rtx3090 (Linux, RTX 3090), run 20261018T194135Z-cargo.test-0f6481 and
 // the live run recorded below.
-pub(crate) const RTX3090_HOST: u64 = 50_437_746_688;
-pub(crate) const RTX3090_OS: &str = "Linux";
-pub(crate) const RTX3090_CUDA_TOTAL: u64 = 25_298_141_184;
-pub(crate) const RTX3090_CUDA_USABLE: u64 = 25_024_135_168;
+pub const RTX3090_HOST: u64 = 50_437_746_688;
+pub const RTX3090_OS: &str = "Linux";
+pub const RTX3090_CUDA_TOTAL: u64 = 25_298_141_184;
+pub const RTX3090_CUDA_USABLE: u64 = 25_024_135_168;
 /// The RTX 3090's L2, as rtx3090 reported it (run
 /// 20261019T040157Z-fix.seismic-088b6b).
-pub(crate) const RTX3090_CUDA_L2: u64 = 6_291_456;
-pub(crate) const RTX3090_CUDA_DRIVER: &str = "cuda driver 12.8";
-#[cfg(test)]
-pub(crate) const RTX3090_VOLUME: (u64, Option<&str>, u64) = (82, None, 128_849_018_880);
+pub const RTX3090_CUDA_L2: u64 = 6_291_456;
+pub const RTX3090_CUDA_DRIVER: &str = "cuda driver 12.8";
+pub const RTX3090_VOLUME: (u64, Option<&str>, u64) = (82, None, 128_849_018_880);
 // Report 52089 (NVIDIA 615.71.09, Linux).
-pub(crate) const RTX3090_UUID: &str = "D37CB696763FCACE0D8DCBA6B3D100D0";
-pub(crate) const RTX3090_VULKAN_DRIVER: &str = "vulkan driver 4 version 615.71.9";
-pub(crate) const RTX3090_VULKAN_HEAP: u64 = 25_769_803_776;
+pub const RTX3090_UUID: &str = "D37CB696763FCACE0D8DCBA6B3D100D0";
+pub const RTX3090_VULKAN_DRIVER: &str = "vulkan driver 4 version 615.71.9";
+pub const RTX3090_VULKAN_HEAP: u64 = 25_769_803_776;
 /// NVIDIA's `min(maxMemoryAllocationSize, maxBufferSize)`: 2^64 − 1 and
 /// 2^40 alike in reports 52089 (RTX 3090) and 51857 (RTX 4070), of driver
 /// 615.71.09, and 52552 (GB10).
-pub(crate) const NVIDIA_VULKAN_MAX_ALLOCATION: u64 = 1_099_511_627_776;
+pub const NVIDIA_VULKAN_MAX_ALLOCATION: u64 = 1_099_511_627_776;
 
 /// The CPU executor of a host, as discovery reads it there.
 fn cpu() -> CpuReport {
@@ -104,7 +114,7 @@ fn cpu() -> CpuReport {
         identity: "recorded x86_64 host".into(),
         cache: None,
         availability: Availability::Available,
-        max_allocation: seismic_cpu::MAX_ALLOCATION_BYTES,
+        max_allocation: CPU_MAX_ALLOCATION,
     }
 }
 
@@ -123,7 +133,7 @@ fn reports(host: Reported<u64>, os_build: &str, cpu: CpuReport) -> Reports {
 }
 
 /// The rtx3090 host: its RAM, OS and CPU.
-pub(crate) fn rtx3090_host() -> Reports {
+pub fn rtx3090_host() -> Reports {
     reports(
         Reported::new(RTX3090_HOST, ReportedBy::LinuxMemTotal),
         RTX3090_OS,
@@ -133,13 +143,13 @@ pub(crate) fn rtx3090_host() -> Reports {
 
 /// A Linux host whose RAM an issue reports, with rtx3090's OS and CPU
 /// standing in for the parts the issue does not report.
-pub(crate) fn linux_host(bytes: u64) -> Reports {
+pub fn linux_host(bytes: u64) -> Reports {
     let mut reports = rtx3090_host();
     reports.host = Reported::new(bytes, ReportedBy::LinuxMemTotal);
     reports
 }
 
-pub(crate) fn uuid(hex: &str) -> [u8; 16] {
+pub fn uuid(hex: &str) -> [u8; 16] {
     let mut uuid = [0u8; 16];
     for (index, byte) in uuid.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
@@ -147,52 +157,22 @@ pub(crate) fn uuid(hex: &str) -> [u8; 16] {
     uuid
 }
 
-/// A memory layout from a report: each heap's size, whether it is
-/// device-local, and its memory types' flags (`DL`, `HV`, `HC`, `C`).
-pub(crate) fn layout(heaps: &[(u64, bool, &[&str])]) -> seismic_vulkan::MemoryLayout {
-    let mut layout = seismic_vulkan::MemoryLayout {
-        heaps: Vec::new(),
-        types: Vec::new(),
-    };
-    for (heap, &(bytes, device_local, types)) in heaps.iter().enumerate() {
-        layout.heaps.push(seismic_vulkan::MemoryHeap {
-            bytes,
-            device_local,
-        });
-        for flags in types {
-            let has = |flag: &str| flags.split('|').any(|each| each == flag);
-            layout.types.push(seismic_vulkan::MemoryType {
-                heap: heap as u32,
-                device_local: has("DL"),
-                host_visible: has("HV"),
-                host_coherent: has("HC"),
-                host_cached: has("C"),
-            });
-        }
-    }
-    layout
-}
-
-/// A Vulkan device meeting the floor, allocating as the backend does
-/// (`seismic_vulkan::Allocation::of`), whose largest allocation is
-/// `max_allocation`: the report's `min(maxMemoryAllocationSize,
-/// maxBufferSize)`, as the backend reads it.
-pub(crate) fn vulkan(
+/// A Vulkan device meeting the floor, as the backend reports it: its heaps
+/// (each one's size and whether it is device-local), the heaps the
+/// backend allocates device and upload storage from in order
+/// (`seismic_vulkan::Allocation::of` on the report's memory types), and
+/// whose largest allocation is `max_allocation`: the report's
+/// `min(maxMemoryAllocationSize, maxBufferSize)`, as the backend reads it.
+pub fn vulkan(
     uuid: [u8; 16],
     name: &str,
     driver: &str,
     memory_is_host: bool,
-    layout: seismic_vulkan::MemoryLayout,
+    heaps: &[(u64, bool)],
+    allocates: [Vec<usize>; StorageKind::COUNT],
     max_allocation: u64,
     luid: Option<[u8; 8]>,
 ) -> VulkanReport {
-    let allocation = seismic_vulkan::Allocation::of(&layout, memory_is_host);
-    let heaps = |types: &[u32]| {
-        seismic_vulkan::Allocation::heaps(&layout, types)
-            .into_iter()
-            .map(|heap| heap as usize)
-            .collect()
-    };
     VulkanReport {
         uuid,
         kind: if memory_is_host {
@@ -207,37 +187,36 @@ pub(crate) fn vulkan(
         max_allocation,
         memory: VulkanMemory {
             luid,
-            heaps: layout
-                .heaps
+            heaps: heaps
                 .iter()
-                .map(|heap| VulkanHeap {
-                    bytes: heap.bytes,
-                    device_local: heap.device_local,
+                .map(|&(bytes, device_local)| VulkanHeap {
+                    bytes,
+                    device_local,
                 })
                 .collect(),
-            allocates: [heaps(&allocation.device), heaps(&allocation.upload)],
+            allocates,
         },
     }
 }
 
 /// RTX 3090, report 52089 (NVIDIA 615.71.09, Linux).
-pub(crate) fn rtx3090_vulkan(uuid: [u8; 16]) -> VulkanReport {
+pub fn rtx3090_vulkan(uuid: [u8; 16]) -> VulkanReport {
     vulkan(
         uuid,
         "NVIDIA GeForce RTX 3090",
         RTX3090_VULKAN_DRIVER,
         false,
-        layout(&[
-            (RTX3090_VULKAN_HEAP, true, &["DL", "DL", "DL|HV|HC"]),
-            (101_123_254_272, false, &["", "HV|HC", "HV|HC|C"]),
-        ]),
+        &[(RTX3090_VULKAN_HEAP, true), (101_123_254_272, false)],
+        // Its types `DL`, `DL`, `DL|HV|HC` on the device-local heap: both
+        // kinds on it (ReBAR).
+        [vec![0], vec![0]],
         NVIDIA_VULKAN_MAX_ALLOCATION,
         None,
     )
 }
 
 /// The rtx3090 host's CUDA view of its RTX 3090.
-pub(crate) fn rtx3090_cuda(uuid: [u8; 16], peers: Vec<[u8; 16]>) -> CudaReport {
+pub fn rtx3090_cuda(uuid: [u8; 16], peers: Vec<[u8; 16]>) -> CudaReport {
     CudaReport {
         uuid,
         luid: None,
@@ -256,13 +235,13 @@ pub(crate) fn rtx3090_cuda(uuid: [u8; 16], peers: Vec<[u8; 16]>) -> CudaReport {
 }
 
 /// The RTX 3090's UUID, as report 52089 gives it.
-pub(crate) fn rtx3090_uuid() -> [u8; 16] {
+pub fn rtx3090_uuid() -> [u8; 16] {
     uuid(RTX3090_UUID)
 }
 
 /// The rtx3090 machine: its host, and the CUDA and Vulkan views of its RTX
 /// 3090.
-pub(crate) fn rtx3090() -> Reports {
+pub fn rtx3090() -> Reports {
     let gpu = rtx3090_uuid();
     let mut reports = rtx3090_host();
     reports.cuda.push(rtx3090_cuda(gpu, Vec::new()));
@@ -271,16 +250,16 @@ pub(crate) fn rtx3090() -> Reports {
 }
 
 // m4-pro-04 (macOS, M4 Pro, 48 GB), run 20261018T200619Z-cargo.test-f7c5b0.
-pub(crate) const M4_PRO_HOST: u64 = 51_539_607_552;
-pub(crate) const M4_PRO_OS: &str = "Version 15.7.9 (Build 24G830)";
-pub(crate) const M4_PRO_REGISTRY: u64 = 4_294_968_578;
-pub(crate) const M4_PRO_WORKING_SET: u64 = 38_654_705_664;
-pub(crate) const M4_PRO_MAX_BUFFER: u64 = 28_991_029_248;
+pub const M4_PRO_HOST: u64 = 51_539_607_552;
+pub const M4_PRO_OS: &str = "Version 15.7.9 (Build 24G830)";
+pub const M4_PRO_REGISTRY: u64 = 4_294_968_578;
+pub const M4_PRO_WORKING_SET: u64 = 38_654_705_664;
+pub const M4_PRO_MAX_BUFFER: u64 = 28_991_029_248;
 /// Two 16 MiB performance-cluster L2s and one 4 MiB efficiency-cluster L2,
 /// as m4-pro-01 reported them (run 20261019T040157Z-fix.seismic-24bcae).
-pub(crate) const M4_PRO_CPU_CACHE: u64 = 37_748_736;
+pub const M4_PRO_CPU_CACHE: u64 = 37_748_736;
 
-pub(crate) fn m4_pro() -> Reports {
+pub fn m4_pro() -> Reports {
     let mut reports = reports(
         Reported::new(M4_PRO_HOST, ReportedBy::MacOsMemsize),
         M4_PRO_OS,
@@ -292,7 +271,7 @@ pub(crate) fn m4_pro() -> Reports {
                 ReportedBy::MacOsSysctlCache,
             )),
             availability: Availability::Available,
-            max_allocation: seismic_cpu::MAX_ALLOCATION_BYTES,
+            max_allocation: CPU_MAX_ALLOCATION,
         },
     );
     reports.metal.push(MetalReport {
@@ -311,7 +290,7 @@ pub(crate) fn m4_pro() -> Reports {
 
 /// The m4-pro report with `hasUnifiedMemory` false, the rule's input (no
 /// host of ours has a discrete Metal GPU).
-pub(crate) fn m4_pro_without_unified_memory() -> Reports {
+pub fn m4_pro_without_unified_memory() -> Reports {
     let mut reports = m4_pro();
     reports.metal[0].unified = false;
     reports
@@ -319,22 +298,22 @@ pub(crate) fn m4_pro_without_unified_memory() -> Reports {
 
 // sparky (Linux, GB10), run 20261018T200619Z-cargo.test-1cc1e4; the
 // Vulkan layout's types are report 52552's (one heap holding every type).
-pub(crate) const GB10_HOST: u64 = 130_663_231_488;
-pub(crate) const GB10_UUID: [u8; 16] = [
+pub const GB10_HOST: u64 = 130_663_231_488;
+pub const GB10_UUID: [u8; 16] = [
     126, 167, 120, 13, 84, 128, 7, 101, 28, 72, 157, 41, 75, 23, 164, 144,
 ];
-pub(crate) const GB10_CUDA_TOTAL: u64 = 130_663_231_488;
-pub(crate) const GB10_CUDA_DRIVER: &str = "cuda driver 13.0";
-pub(crate) const GB10_VULKAN_HEAP: u64 = 97_997_423_616;
-pub(crate) const GB10_VULKAN_DRIVER: &str = "vulkan driver 4 version 2435301568";
-pub(crate) const GB10_OS: &str =
+pub const GB10_CUDA_TOTAL: u64 = 130_663_231_488;
+pub const GB10_CUDA_DRIVER: &str = "cuda driver 13.0";
+pub const GB10_VULKAN_HEAP: u64 = 97_997_423_616;
+pub const GB10_VULKAN_DRIVER: &str = "vulkan driver 4 version 2435301568";
+pub const GB10_OS: &str =
     "Linux 6.17.0-1026-nvidia #26-Ubuntu SMP PREEMPT_DYNAMIC Thu Jun 25 00:57:17 UTC 2026";
 /// The CPU's last-level caches together, and the GPU's L2, as sparky
 /// reported them (run 20261019T040157Z-fix.seismic-24d66f).
-pub(crate) const GB10_CPU_CACHE: u64 = 25_165_824;
-pub(crate) const GB10_CUDA_L2: u64 = 25_165_824;
+pub const GB10_CPU_CACHE: u64 = 25_165_824;
+pub const GB10_CUDA_L2: u64 = 25_165_824;
 
-pub(crate) fn gb10() -> Reports {
+pub fn gb10() -> Reports {
     let mut reports = reports(
         Reported::new(GB10_HOST, ReportedBy::LinuxMemTotal),
         GB10_OS,
@@ -343,7 +322,7 @@ pub(crate) fn gb10() -> Reports {
             identity: "NVIDIA GB10".into(),
             cache: Some(Reported::new(GB10_CPU_CACHE, ReportedBy::LinuxSysfsCache)),
             availability: Availability::Available,
-            max_allocation: seismic_cpu::MAX_ALLOCATION_BYTES,
+            max_allocation: CPU_MAX_ALLOCATION,
         },
     );
     reports.cuda.push(CudaReport {
@@ -364,11 +343,8 @@ pub(crate) fn gb10() -> Reports {
         "NVIDIA GB10",
         GB10_VULKAN_DRIVER,
         true,
-        layout(&[(
-            GB10_VULKAN_HEAP,
-            true,
-            &["DL", "DL", "DL|HV|HC", "DL|HV|HC|C"],
-        )]),
+        &[(GB10_VULKAN_HEAP, true)],
+        [vec![0], vec![0]],
         NVIDIA_VULKAN_MAX_ALLOCATION,
         None,
     ));
@@ -379,38 +355,30 @@ pub(crate) fn gb10() -> Reports {
 // RADV's split of GTT plus carve-out (§4.1). The RAM is #199's ("58GB of
 // RAM available"); the report's machine is a larger one, whose RAM the
 // database does not record.
-pub(crate) const STRIX_HALO_LINUX_HOST: u64 = 58 * GB;
-pub(crate) const STRIX_HALO_LINUX_UUID: &str = "00000000C60000000000000000000000";
-pub(crate) const STRIX_HALO_LINUX_HEAPS: [u64; 2] = [39_904_485_376, 79_808_970_752];
+pub const STRIX_HALO_LINUX_HOST: u64 = 58 * GB;
+pub const STRIX_HALO_LINUX_UUID: &str = "00000000C60000000000000000000000";
+pub const STRIX_HALO_LINUX_HEAPS: [u64; 2] = [39_904_485_376, 79_808_970_752];
 /// RADV's `maxMemoryAllocationSize` and `maxBufferSize`, both 2^32 − 4 in
 /// reports 42266 (Strix Halo) and 39430 (Ryzen iGPU).
-pub(crate) const RADV_MAX_ALLOCATION: u64 = 4_294_967_292;
+pub const RADV_MAX_ALLOCATION: u64 = 4_294_967_292;
 
-pub(crate) fn strix_halo_linux_vulkan() -> VulkanReport {
+pub fn strix_halo_linux_vulkan() -> VulkanReport {
     let [gtt, device_local] = STRIX_HALO_LINUX_HEAPS;
     vulkan(
         uuid(STRIX_HALO_LINUX_UUID),
         "AMD Radeon Graphics (RADV GFX1151)",
         "vulkan driver 3 version 25.0.7",
         true,
-        layout(&[
-            (
-                gtt,
-                false,
-                &["HV|HC", "HV|HC|C", "HV|HC|C", "HV|HC", "HV|HC|C"],
-            ),
-            (
-                device_local,
-                true,
-                &["DL", "DL", "DL|HV|HC", "DL|HV|HC", "DL", "DL|HV|HC"],
-            ),
-        ]),
+        &[(gtt, false), (device_local, true)],
+        // Its memory is the host's: the device-local heap, then the GTT
+        // heap, each holding a mappable type.
+        [vec![1, 0], vec![1, 0]],
         RADV_MAX_ALLOCATION,
         None,
     )
 }
 
-pub(crate) fn strix_halo_linux() -> Reports {
+pub fn strix_halo_linux() -> Reports {
     let mut reports = linux_host(STRIX_HALO_LINUX_HOST);
     reports.vulkan.push(strix_halo_linux_vulkan());
     reports
@@ -420,21 +388,21 @@ pub(crate) fn strix_halo_linux() -> Reports {
 // 313A010000000000. #207's machine (128 GB, "96 assigned to gpu", Windows
 // reporting "32Gb unified memory") supplies the DXGI dedicated memory and
 // host RAM, in GB as the issue states them.
-pub(crate) const STRIX_HALO_WINDOWS_HOST: u64 = 32 * GB;
-pub(crate) const STRIX_HALO_WINDOWS_DEDICATED: u64 = 96 * GB;
-pub(crate) const STRIX_HALO_WINDOWS_UUID: &str = "00000000BC0000000000000000000000";
-pub(crate) const STRIX_HALO_WINDOWS_LUID: [u8; 8] = [0x31, 0x3A, 0x01, 0, 0, 0, 0, 0];
-pub(crate) const STRIX_HALO_WINDOWS_HEAPS: [u64; 2] = [36_692_557_824, 73_385_115_648];
+pub const STRIX_HALO_WINDOWS_HOST: u64 = 32 * GB;
+pub const STRIX_HALO_WINDOWS_DEDICATED: u64 = 96 * GB;
+pub const STRIX_HALO_WINDOWS_UUID: &str = "00000000BC0000000000000000000000";
+pub const STRIX_HALO_WINDOWS_LUID: [u8; 8] = [0x31, 0x3A, 0x01, 0, 0, 0, 0, 0];
+pub const STRIX_HALO_WINDOWS_HEAPS: [u64; 2] = [36_692_557_824, 73_385_115_648];
 /// The OS as report 52227 states it (Windows 11, x86_64). The report gives
 /// no build number, which discovery's `Windows <major>.<minor>.<build>`
 /// carries.
-pub(crate) const STRIX_HALO_WINDOWS_OS: &str = "Windows 11";
+pub const STRIX_HALO_WINDOWS_OS: &str = "Windows 11";
 /// AMD's Windows driver's `maxMemoryAllocationSize` and `maxBufferSize`,
 /// both 2^31 in report 52227.
-pub(crate) const STRIX_HALO_WINDOWS_MAX_ALLOCATION: u64 = 2_147_483_648;
+pub const STRIX_HALO_WINDOWS_MAX_ALLOCATION: u64 = 2_147_483_648;
 
 /// A Windows host whose RAM and OS a record reports, with an x86_64 CPU.
-pub(crate) fn windows_host(bytes: u64, os_build: &str) -> Reports {
+pub fn windows_host(bytes: u64, os_build: &str) -> Reports {
     reports(
         Reported::new(bytes, ReportedBy::WindowsTotalPhys),
         os_build,
@@ -442,7 +410,7 @@ pub(crate) fn windows_host(bytes: u64, os_build: &str) -> Reports {
     )
 }
 
-pub(crate) fn strix_halo_windows() -> Reports {
+pub fn strix_halo_windows() -> Reports {
     let [shared, device_local] = STRIX_HALO_WINDOWS_HEAPS;
     let mut reports = windows_host(STRIX_HALO_WINDOWS_HOST, STRIX_HALO_WINDOWS_OS);
     reports.adapters.push(AdapterReport {
@@ -454,22 +422,10 @@ pub(crate) fn strix_halo_windows() -> Reports {
         "AMD Radeon(TM) 8060S Graphics",
         "vulkan driver 1 version 2.0.406",
         true,
-        layout(&[
-            (
-                shared,
-                false,
-                &[
-                    "HV|HC", "HV|HC|C", "HV|HC", "HV|HC|C", "HV|HC", "HV|HC|C", "HV|HC", "HV|HC|C",
-                ],
-            ),
-            (
-                device_local,
-                true,
-                &[
-                    "DL", "DL|HV|HC", "DL", "DL|HV|HC", "DL", "DL|HV|HC", "DL", "DL|HV|HC",
-                ],
-            ),
-        ]),
+        &[(shared, false), (device_local, true)],
+        // The device-local heap, then the shared heap, each holding a
+        // mappable type.
+        [vec![1, 0], vec![1, 0]],
         STRIX_HALO_WINDOWS_MAX_ALLOCATION,
         Some(STRIX_HALO_WINDOWS_LUID),
     ));
@@ -479,25 +435,22 @@ pub(crate) fn strix_halo_windows() -> Reports {
 // Lunar Lake: report 52450 (Mesa 26.2.3, ANV), one heap. The RAM is #206's
 // ("14.8 GB unified memory"); the report's machine is another, whose RAM
 // the database does not record.
-pub(crate) const LUNAR_LAKE_HOST: u64 = 14_800_000_000;
-pub(crate) const LUNAR_LAKE_UUID: &str = "8680A064040000000002000000000000";
-pub(crate) const LUNAR_LAKE_HEAP: u64 = 24_869_332_992;
+pub const LUNAR_LAKE_HOST: u64 = 14_800_000_000;
+pub const LUNAR_LAKE_UUID: &str = "8680A064040000000002000000000000";
+pub const LUNAR_LAKE_HEAP: u64 = 24_869_332_992;
 /// ANV's `maxBufferSize`, 2^32, below its `maxMemoryAllocationSize` (the
 /// heap's size) in report 52450.
-pub(crate) const LUNAR_LAKE_MAX_ALLOCATION: u64 = 4_294_967_296;
+pub const LUNAR_LAKE_MAX_ALLOCATION: u64 = 4_294_967_296;
 
-pub(crate) fn lunar_lake() -> Reports {
+pub fn lunar_lake() -> Reports {
     let mut reports = linux_host(LUNAR_LAKE_HOST);
     reports.vulkan.push(vulkan(
         uuid(LUNAR_LAKE_UUID),
         "Intel(R) Graphics (LNL)",
         "vulkan driver 6 version 26.2.3",
         true,
-        layout(&[(
-            LUNAR_LAKE_HEAP,
-            true,
-            &["DL", "DL|HV|HC", "DL|HV|HC|C", "DL|HV|HC", "DL|HV|HC|C"],
-        )]),
+        &[(LUNAR_LAKE_HEAP, true)],
+        [vec![0], vec![0]],
         LUNAR_LAKE_MAX_ALLOCATION,
         None,
     ));
@@ -508,12 +461,12 @@ pub(crate) fn lunar_lake() -> Reports {
 // 4070, report 51857 (NVIDIA 615.71.09, Linux), on the rtx3090 host's RAM:
 // no report pairs them with RAM or with the 4070's CUDA view, so the 4070
 // is its Vulkan view alone.
-pub(crate) const RYZEN_IGPU_UUID: &str = "00000000C40000000000000000000000";
-pub(crate) const RYZEN_IGPU_HEAPS: [u64; 2] = [11_902_001_152, 23_804_002_304];
-pub(crate) const RTX4070_UUID: &str = "BC93928CFFA26FA92292A87860C54187";
-pub(crate) const RTX4070_HEAP: u64 = 12_878_610_432;
+pub const RYZEN_IGPU_UUID: &str = "00000000C40000000000000000000000";
+pub const RYZEN_IGPU_HEAPS: [u64; 2] = [11_902_001_152, 23_804_002_304];
+pub const RTX4070_UUID: &str = "BC93928CFFA26FA92292A87860C54187";
+pub const RTX4070_HEAP: u64 = 12_878_610_432;
 
-pub(crate) fn ryzen_igpu_and_rtx4070() -> Reports {
+pub fn ryzen_igpu_and_rtx4070() -> Reports {
     let [gtt, device_local] = RYZEN_IGPU_HEAPS;
     let mut reports = rtx3090_host();
     reports.vulkan.push(vulkan(
@@ -521,18 +474,9 @@ pub(crate) fn ryzen_igpu_and_rtx4070() -> Reports {
         "AMD Radeon Graphics (RADV GFX1103_R1)",
         "vulkan driver 3 version 24.2.8",
         true,
-        layout(&[
-            (
-                gtt,
-                false,
-                &["HV|HC", "HV|HC|C", "HV|HC|C", "HV|HC", "HV|HC|C"],
-            ),
-            (
-                device_local,
-                true,
-                &["DL", "DL", "DL|HV|HC", "DL|HV|HC", "DL", "DL|HV|HC"],
-            ),
-        ]),
+        &[(gtt, false), (device_local, true)],
+        // RADV's layout, as Strix Halo's.
+        [vec![1, 0], vec![1, 0]],
         RADV_MAX_ALLOCATION,
         None,
     ));
@@ -541,10 +485,10 @@ pub(crate) fn ryzen_igpu_and_rtx4070() -> Reports {
         "NVIDIA GeForce RTX 4070",
         "vulkan driver 4 version 615.71.9",
         false,
-        layout(&[
-            (RTX4070_HEAP, true, &["DL", "DL|HV|HC"]),
-            (25_065_572_352, false, &["", "HV|HC", "HV|HC|C"]),
-        ]),
+        &[(RTX4070_HEAP, true), (25_065_572_352, false)],
+        // Its types `DL`, `DL|HV|HC` on the device-local heap: both kinds on
+        // it (ReBAR).
+        [vec![0], vec![0]],
         NVIDIA_VULKAN_MAX_ALLOCATION,
         None,
     ));
@@ -559,11 +503,11 @@ pub(crate) fn ryzen_igpu_and_rtx4070() -> Reports {
 // Hardware Database holds no A10-8Q report: the rtx3090 host, the RTX
 // 3090's UUID and drivers, and NVIDIA's Vulkan allocation limit stand in,
 // and the slice has no L2, which no record gives.
-pub(crate) const A10_8Q_CUDA_TOTAL: u64 = 8_589_475_840;
-pub(crate) const A10_8Q_CUDA_USABLE: u64 = 6_603_640_832;
-pub(crate) const A10_8Q_VULKAN_HEAP: u64 = 7_643_791_360;
+pub const A10_8Q_CUDA_TOTAL: u64 = 8_589_475_840;
+pub const A10_8Q_CUDA_USABLE: u64 = 6_603_640_832;
+pub const A10_8Q_VULKAN_HEAP: u64 = 7_643_791_360;
 
-pub(crate) fn a10_8q() -> Reports {
+pub fn a10_8q() -> Reports {
     let slice = rtx3090_uuid();
     let mut reports = rtx3090_host();
     reports.cuda.push(CudaReport {
@@ -586,9 +530,179 @@ pub(crate) fn a10_8q() -> Reports {
         "NVIDIA A10-8Q",
         RTX3090_VULKAN_DRIVER,
         false,
-        layout(&[(A10_8Q_VULKAN_HEAP, true, &["DL", "DL|HV|HC"])]),
+        &[(A10_8Q_VULKAN_HEAP, true)],
+        [vec![0], vec![0]],
         NVIDIA_VULKAN_MAX_ALLOCATION,
         None,
     ));
     reports
+}
+
+// Reading topologies in tests: this crate's, and the inventory's in
+// `seismic-discovery`.
+
+/// The executor of `backend` on the physical device of `identity`.
+pub fn executor<'a>(
+    topology: &'a DeviceTopology,
+    backend: BackendName,
+    identity: &PhysicalIdentity,
+) -> &'a Executor {
+    topology
+        .executors()
+        .iter()
+        .find(|executor| {
+            executor.backend() == backend
+                && topology
+                    .physical_device(executor.physical())
+                    .unwrap()
+                    .identity()
+                    == identity
+        })
+        .unwrap()
+}
+
+/// Where a placement lands: each path's store and grant.
+pub fn placement(
+    topology: &DeviceTopology,
+    executor: &Executor,
+    kind: StorageKind,
+) -> Vec<(StoreKind, Option<Reported<u64>>)> {
+    executor
+        .placement(kind)
+        .iter()
+        .map(|&id| {
+            let path = topology.access_path(id).unwrap();
+            (
+                topology.store(path.store()).unwrap().kind().clone(),
+                path.grant(),
+            )
+        })
+        .collect()
+}
+
+/// The volume store the inventory serves `path` on.
+pub fn volume(topology: &DeviceTopology, path: &Path) -> Option<StoreId> {
+    topology
+        .stores()
+        .iter()
+        .map(|store| store.id())
+        .find(|&store| topology.volume_paths(store).any(|served| served == path))
+}
+
+/// The topology as text: what each row's test produced.
+pub fn describe(topology: &DeviceTopology) -> String {
+    let store = |id: StoreId| match topology.store(id).unwrap().kind() {
+        StoreKind::HostRam => "host".to_owned(),
+        StoreKind::DeviceMemory(device) => format!("device{}", physical_index(topology, *device)),
+        StoreKind::Volume(volume) => format!("volume {}", volume.device),
+    };
+    let mut text = String::new();
+    for each in topology.stores() {
+        writeln!(
+            text,
+            "  store {}: {} ({:?})",
+            store(each.id()),
+            gb(each.capacity().value),
+            each.capacity().by
+        )
+        .unwrap();
+    }
+    for executor in topology.executors() {
+        write!(
+            text,
+            "  {:?} on device{} ({:?} memory) [{}]",
+            executor.backend(),
+            physical_index(topology, executor.physical()),
+            topology
+                .physical_device(executor.physical())
+                .unwrap()
+                .memory(),
+            executor.driver(),
+        )
+        .unwrap();
+        if let Availability::Unavailable { reason } = executor.availability() {
+            writeln!(text, ": unavailable ({reason})").unwrap();
+            continue;
+        }
+        for kind in StorageKind::ALL {
+            let places = executor
+                .placement(kind)
+                .iter()
+                .map(|&id| {
+                    let path = topology.access_path(id).unwrap();
+                    match path.grant() {
+                        Some(grant) => format!(
+                            "{} under {} ({:?})",
+                            store(path.store()),
+                            gb(grant.value),
+                            grant.by
+                        ),
+                        None => format!("{} ungranted", store(path.store())),
+                    }
+                })
+                .collect::<Vec<_>>();
+            write!(text, "; {kind:?} -> [{}]", places.join(", ")).unwrap();
+        }
+        writeln!(text).unwrap();
+    }
+    for path in topology.transfer_paths() {
+        writeln!(
+            text,
+            "  transfer {} -> {} by {:?}",
+            store(path.from()),
+            store(path.to()),
+            topology.executor(path.by()).unwrap().backend()
+        )
+        .unwrap();
+    }
+    text
+}
+
+fn physical_index(topology: &DeviceTopology, id: PhysicalDeviceId) -> usize {
+    topology
+        .physical_devices()
+        .iter()
+        .position(|device| device.id() == id)
+        .unwrap()
+}
+
+fn gb(bytes: u64) -> String {
+    format!("{:.2} GB ({bytes})", bytes as f64 / GB as f64)
+}
+
+pub fn show(row: &str, topology: &DeviceTopology) {
+    eprintln!("{row}\n{}", describe(topology));
+}
+
+/// Every path names nodes of its revision, and every placement names the
+/// executor's own access paths.
+pub fn assert_consistent(topology: &DeviceTopology) {
+    for path in topology.access_paths() {
+        assert!(topology.executor(path.executor()).is_some());
+        assert!(topology.store(path.store()).is_some());
+    }
+    for path in topology.transfer_paths() {
+        assert!(topology.store(path.from()).is_some() && topology.store(path.to()).is_some());
+        assert!(topology.executor(path.by()).is_some());
+    }
+    for executor in topology.executors() {
+        for kind in StorageKind::ALL {
+            for &id in executor.placement(kind) {
+                assert_eq!(topology.access_path(id).unwrap().executor(), executor.id());
+            }
+        }
+    }
+}
+
+/// The rtx3090 host's evaluation volume, served at two paths.
+pub fn rtx3090_volume(path: &str) -> VolumeReport {
+    let (device, uuid, size) = RTX3090_VOLUME;
+    VolumeReport {
+        path: PathBuf::from(path),
+        id: VolumeId {
+            device,
+            uuid: uuid.map(str::to_owned),
+        },
+        size: Reported::new(size, ReportedBy::FilesystemSize),
+    }
 }

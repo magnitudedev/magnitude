@@ -23,8 +23,9 @@ use seismic_compiler::feedback::PreparationOptions;
 use seismic_lang::checked::CheckedModule;
 use seismic_lang::entry::{ElementBindings, LogicalEntry};
 use seismic_lang::ids::{EntryId, RepresentationId};
+use seismic_discovery::ObservationError;
 use seismic_native_target::TargetFamily;
-use seismic_topology::{DeviceTopology, Executor, ExecutorSelector, ObservationError, StorageKind};
+use seismic_topology::{DeviceTopology, Executor, ExecutorSelector, StorageKind};
 use std::sync::Arc;
 
 type CpuExecutor = seismic_cpu::Executor;

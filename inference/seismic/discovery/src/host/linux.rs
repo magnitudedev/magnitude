@@ -8,7 +8,7 @@
 //! mount are reported as such, never presumed unlimited.
 
 use super::{HostSample, LimitVisibility, ObservationError, ProcessLimitKind, ProcessMemoryLimit};
-use crate::model::{Reported, ReportedBy};
+use seismic_topology::{Reported, ReportedBy};
 use std::path::{Path, PathBuf};
 
 /// The `/proc/cpuinfo` fields that identify a processor (x86's and Arm's):

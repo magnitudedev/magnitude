@@ -863,4 +863,97 @@ mod tests {
         let large = Allocation::of(&discrete(SMALL_BAR_BYTES + 1), false);
         assert_eq!((large.device, large.upload), (vec![0], vec![2]));
     }
+
+    /// A memory layout from a report: each heap's size, whether it is
+    /// device-local, and its memory types' flags (`DL`, `HV`, `HC`, `C`).
+    /// The Vulkan Hardware Database's reports list memory types under their
+    /// heap and do not give the types' global order; each layout here lists
+    /// them heap by heap, which the allocation rule reads only within a heap.
+    fn layout(heaps: &[(u64, bool, &[&str])]) -> MemoryLayout {
+        let mut layout = MemoryLayout {
+            heaps: Vec::new(),
+            types: Vec::new(),
+        };
+        for (heap, &(bytes, device_local, types)) in heaps.iter().enumerate() {
+            layout.heaps.push(MemoryHeap {
+                bytes,
+                device_local,
+            });
+            for flags in types {
+                let has = |flag: &str| flags.split('|').any(|each| each == flag);
+                layout.types.push(MemoryType {
+                    heap: heap as u32,
+                    device_local: has("DL"),
+                    host_visible: has("HV"),
+                    host_coherent: has("HC"),
+                    host_cached: has("C"),
+                });
+            }
+        }
+        layout
+    }
+
+    /// The allocation rule on the layouts of the recorded machines
+    /// (`seismic_topology::fixtures`, which records the heaps it chooses):
+    /// device storage on the heap of the type it allocates from.
+    #[test]
+    fn the_recorded_layouts_allocate_from_the_heaps_their_fixtures_record() {
+        let heaps = |layout: &MemoryLayout, memory_is_host: bool| {
+            let allocation = Allocation::of(layout, memory_is_host);
+            [
+                Allocation::heaps(layout, &allocation.device),
+                Allocation::heaps(layout, &allocation.upload),
+            ]
+        };
+        let radv = |gtt: u64, device_local: u64| {
+            layout(&[
+                (gtt, false, &["HV|HC", "HV|HC|C", "HV|HC|C", "HV|HC", "HV|HC|C"]),
+                (device_local, true, &["DL", "DL", "DL|HV|HC", "DL|HV|HC", "DL", "DL|HV|HC"]),
+            ])
+        };
+        // Report 52089 (RTX 3090): discrete with ReBAR, both kinds on the
+        // device-local heap.
+        let rtx3090 = layout(&[
+            (25_769_803_776, true, &["DL", "DL", "DL|HV|HC"]),
+            (101_123_254_272, false, &["", "HV|HC", "HV|HC|C"]),
+        ]);
+        assert_eq!(heaps(&rtx3090, false), [vec![0], vec![0]]);
+        // Report 52552 (GB10): one heap holding every type.
+        let gb10 = layout(&[(97_997_423_616, true, &["DL", "DL", "DL|HV|HC", "DL|HV|HC|C"])]);
+        assert_eq!(heaps(&gb10, true), [vec![0], vec![0]]);
+        // RADV, reports 42266 (Strix Halo) and 39430 (Ryzen iGPU): the
+        // device-local heap, then the GTT heap.
+        assert_eq!(heaps(&radv(39_904_485_376, 79_808_970_752), true), [vec![1, 0], vec![1, 0]]);
+        assert_eq!(heaps(&radv(11_902_001_152, 23_804_002_304), true), [vec![1, 0], vec![1, 0]]);
+        // Report 52227 (Strix Halo on Windows).
+        let strix_halo_windows = layout(&[
+            (
+                36_692_557_824,
+                false,
+                &["HV|HC", "HV|HC|C", "HV|HC", "HV|HC|C", "HV|HC", "HV|HC|C", "HV|HC", "HV|HC|C"],
+            ),
+            (
+                73_385_115_648,
+                true,
+                &["DL", "DL|HV|HC", "DL", "DL|HV|HC", "DL", "DL|HV|HC", "DL", "DL|HV|HC"],
+            ),
+        ]);
+        assert_eq!(heaps(&strix_halo_windows, true), [vec![1, 0], vec![1, 0]]);
+        // Report 52450 (Lunar Lake): one heap.
+        let lunar_lake = layout(&[(
+            24_869_332_992,
+            true,
+            &["DL", "DL|HV|HC", "DL|HV|HC|C", "DL|HV|HC", "DL|HV|HC|C"],
+        )]);
+        assert_eq!(heaps(&lunar_lake, true), [vec![0], vec![0]]);
+        // Report 51857 (RTX 4070): discrete with ReBAR.
+        let rtx4070 = layout(&[
+            (12_878_610_432, true, &["DL", "DL|HV|HC"]),
+            (25_065_572_352, false, &["", "HV|HC", "HV|HC|C"]),
+        ]);
+        assert_eq!(heaps(&rtx4070, false), [vec![0], vec![0]]);
+        // The A10-8Q vGPU slice's one heap.
+        let a10_8q = layout(&[(7_643_791_360, true, &["DL", "DL|HV|HC"])]);
+        assert_eq!(heaps(&a10_8q, false), [vec![0], vec![0]]);
+    }
 }

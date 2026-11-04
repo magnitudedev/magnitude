@@ -4,7 +4,7 @@
 //! figures are process-scoped ("the maximum this process can commit").
 
 use super::{HostSample, LimitVisibility, ObservationError, ProcessLimitKind, ProcessMemoryLimit};
-use crate::model::{Reported, ReportedBy};
+use seismic_topology::{Reported, ReportedBy};
 use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
 use windows_sys::Win32::System::JobObjects::{
     IsProcessInJob, JobObjectExtendedLimitInformation, QueryInformationJobObject,

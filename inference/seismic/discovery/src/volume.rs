@@ -2,7 +2,7 @@
 //! on it (spec §2.1).
 
 use crate::host::ObservationError;
-use crate::model::{Reported, ReportedBy, VolumeId};
+use seismic_topology::{Reported, ReportedBy, VolumeId};
 use std::path::Path;
 
 /// The identity of the volume holding `path`.
@@ -48,7 +48,7 @@ fn statvfs(path: &Path) -> std::io::Result<Space> {
 #[cfg(target_os = "macos")]
 mod platform {
     use super::Space;
-    use crate::model::VolumeId;
+    use seismic_topology::VolumeId;
     use std::ffi::{CStr, CString};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
@@ -125,7 +125,7 @@ mod platform {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::Space;
-    use crate::model::VolumeId;
+    use seismic_topology::VolumeId;
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
@@ -189,7 +189,7 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use super::Space;
-    use crate::model::VolumeId;
+    use seismic_topology::VolumeId;
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
     use windows_sys::Win32::Storage::FileSystem::{

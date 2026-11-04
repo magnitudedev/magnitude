@@ -18,6 +18,7 @@ mod profile;
 mod ptx;
 mod registry;
 pub mod toolchain;
+pub mod topology;
 
 pub use buffer::Buffer;
 pub use capability::CudaIntrinsic;

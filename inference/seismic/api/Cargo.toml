@@ -10,6 +10,7 @@ seismic-lang.workspace = true
 seismic-compiler.workspace = true
 seismic-runtime.workspace = true
 seismic-topology.workspace = true
+seismic-discovery.workspace = true
 seismic-measure.workspace = true
 seismic-native-cpu.workspace = true
 serde.workspace = true

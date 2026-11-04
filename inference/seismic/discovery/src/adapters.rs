@@ -3,7 +3,7 @@
 //! `DedicatedSystemMemory`), by the adapter's LUID, which Vulkan reports as
 //! `VkPhysicalDeviceIDProperties::deviceLUID` and CUDA as `cuDeviceGetLuid`.
 
-use crate::discovery::AdapterReport;
+use seismic_topology::AdapterReport;
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, DXGI_ERROR_NOT_FOUND};
 
 /// Every adapter DXGI enumerates.

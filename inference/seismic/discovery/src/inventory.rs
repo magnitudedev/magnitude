@@ -1,10 +1,10 @@
 //! The inventory: the current topology revision of the machine, refreshed
 //! on request, and its status samples.
 
-use crate::discovery::{self, DiscoveryError, Gathered, Natives};
+use crate::gather::{self, DiscoveryError, Gathered, Natives};
 use crate::host::{self, DisplacementHistory, HostStatus, ObservationError};
-use crate::model::{DeviceTopology, ExecutorId, Identity, Revision};
 use crate::status::{self, Sample};
+use seismic_topology::{DeviceTopology, ExecutorId, Identity, Revision};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -32,17 +32,14 @@ impl Inventory {
     /// report of each device, the OS's memory, CPU, adapter and filesystem
     /// interfaces, and nothing timed.
     pub fn discover(paths: &[PathBuf]) -> Result<Self, DiscoveryError> {
-        Ok(Self::from_gathered(
-            paths.to_vec(),
-            discovery::gather(paths)?,
-        ))
+        Ok(Self::from_gathered(paths.to_vec(), gather::gather(paths)?))
     }
 
     pub(crate) fn from_gathered(paths: Vec<PathBuf>, gathered: Gathered) -> Self {
         Self {
             paths,
             state: Mutex::new(State {
-                topology: Arc::new(discovery::build(Revision::next(), &gathered.reports)),
+                topology: Arc::new(seismic_topology::build(Revision::next(), &gathered.reports)),
                 natives: gathered.natives,
                 displacement: DisplacementHistory::default(),
             }),
@@ -62,16 +59,16 @@ impl Inventory {
     /// identifiers; one that reads differently is a new revision, whose
     /// identifiers are all its own.
     pub fn refresh(&self) -> Result<Arc<DeviceTopology>, DiscoveryError> {
-        let gathered = discovery::gather(&self.paths)?;
+        let gathered = gather::gather(&self.paths)?;
         Ok(self.advance(gathered))
     }
 
     pub(crate) fn advance(&self, gathered: Gathered) -> Arc<DeviceTopology> {
         let mut state = self.state();
         state.natives = gathered.natives;
-        let unchanged = discovery::build(state.topology.revision(), &gathered.reports);
+        let unchanged = seismic_topology::build(state.topology.revision(), &gathered.reports);
         if unchanged != *state.topology {
-            state.topology = Arc::new(discovery::build(Revision::next(), &gathered.reports));
+            state.topology = Arc::new(seismic_topology::build(Revision::next(), &gathered.reports));
         }
         state.topology.clone()
     }

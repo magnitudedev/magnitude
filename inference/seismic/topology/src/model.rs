@@ -22,7 +22,7 @@ pub struct Revision(u64);
 
 impl Revision {
     /// A revision no topology of this process has had.
-    pub(crate) fn next() -> Self {
+    pub fn next() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         Self(NEXT.fetch_add(1, Ordering::Relaxed))
     }
@@ -556,6 +556,17 @@ pub struct Diagnostic {
     pub message: String,
 }
 
+impl Diagnostic {
+    /// The diagnostic of a backend whose enumeration succeeded with no
+    /// device: every backend yields devices or a diagnostic.
+    pub fn no_device(backend: BackendName) -> Self {
+        Self {
+            source: DiagnosticSource::Backend(backend),
+            message: format!("{} reports no device", backend.as_str()),
+        }
+    }
+}
+
 /// One immutable revision of the graph.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceTopology {
@@ -572,7 +583,7 @@ pub struct DeviceTopology {
 
 /// Where a grant's live status is read without an opened executor.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum GrantSource {
+pub enum GrantSource {
     /// The `VK_EXT_memory_budget` of the Vulkan device `uuid`'s `heaps`:
     /// their budgets less usage, of which the path's grant takes what is
     /// left once `before` bytes of usage are attributed to the paths placed
@@ -687,7 +698,7 @@ impl DeviceTopology {
 
     /// Each grant whose status is read without an opened executor: its
     /// path, its size and where it is read.
-    pub(crate) fn grant_sources(&self) -> impl Iterator<Item = (&AccessPath, u64, &GrantSource)> {
+    pub fn grant_sources(&self) -> impl Iterator<Item = (&AccessPath, u64, &GrantSource)> {
         self.access.iter().filter_map(|path| {
             let (grant, source) = path.grant_source()?;
             Some((path, grant, source))

@@ -4120,6 +4120,7 @@ version = "0.1.0"
 dependencies = [
  "magnitude-ggml",
  "seismic-compiler",
+ "seismic-discovery",
  "seismic-lang",
  "seismic-measure",
  "seismic-native-cpu",
@@ -4198,7 +4199,24 @@ dependencies = [
  "seismic-ir",
  "seismic-lang",
  "seismic-native-target",
+ "seismic-topology",
  "sha2 0.11.0",
+]
+
+[[package]]
+name = "seismic-discovery"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "seismic-cpu",
+ "seismic-cuda",
+ "seismic-metal",
+ "seismic-native-cpu",
+ "seismic-topology",
+ "seismic-vulkan",
+ "serde_json",
+ "windows",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4264,6 +4282,7 @@ dependencies = [
  "seismic-ir",
  "seismic-lang",
  "seismic-native-target",
+ "seismic-topology",
  "sha2 0.11.0",
 ]
 
@@ -4311,6 +4330,7 @@ dependencies = [
  "seismic-compiler",
  "seismic-cpu",
  "seismic-cuda",
+ "seismic-discovery",
  "seismic-ir",
  "seismic-lang",
  "seismic-measure",
@@ -4337,17 +4357,9 @@ dependencies = [
 name = "seismic-topology"
 version = "0.1.0"
 dependencies = [
- "libc",
- "seismic-cpu",
- "seismic-cuda",
  "seismic-lang",
- "seismic-metal",
- "seismic-native-cpu",
- "seismic-vulkan",
  "serde",
  "serde_json",
- "windows",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4358,6 +4370,7 @@ dependencies = [
  "glslang",
  "seismic-compiler",
  "seismic-native-target",
+ "seismic-topology",
  "spirv-tools",
 ]
 

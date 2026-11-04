@@ -5,7 +5,7 @@
 //! no process memory limit applies.
 
 use super::{DisplacementCounters, HostSample, KernelPressure, LimitVisibility, ObservationError};
-use crate::model::{Reported, ReportedBy};
+use seismic_topology::{Reported, ReportedBy};
 use std::io;
 
 /// `sysctlbyname(name)` into `buffer`, or its length alone without one: the
@@ -58,7 +58,7 @@ fn sysctl_u64(name: &str) -> Result<Option<u64>, String> {
         // `ENOENT`: the OS defines no such name. `EINVAL`: it defines the
         // name but reports no value for this machine, as macOS 15 does for
         // `hw.perflevel0.l3cachesize` and `hw.l3cachesize` on an M4 Pro
-        // (read on m4-pro-01, where `hw.nonexistent` is `ENOENT`), though
+        // (read on an M4 Pro, where `hw.nonexistent` is `ENOENT`), though
         // the buffer holds any 32- or 64-bit value.
         Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::EINVAL)) => {
             return Ok(None);

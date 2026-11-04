@@ -191,14 +191,16 @@ pub use seismic_runtime::devices::{LimitError, MemoryUsage, OpenError, ResolveEr
 pub use seismic_runtime::native::{
     GraphPending, GraphPoint, GraphTiming, KernelPoint, Point, PointPending,
 };
+pub use seismic_discovery::{
+    volume_available, DiscoveryError, DisplacementWindow, HostDisplacement, HostStatus, Inventory,
+    KernelPressure, LimitVisibility, ObservationError, ProcessLimitKind, ProcessMemoryLimit,
+    RuntimeStatus, Sample, Status, DISPLACEMENT_HISTORY,
+};
 pub use seismic_topology::{
-    volume_available, AccessPath, AccessPathId, AccessRoute, Availability, DeviceMemory,
-    DeviceTopology, Diagnostic, DiagnosticSource, DiscoveryError, DisplacementWindow, Executor,
-    ExecutorId, ExecutorKind, ExecutorSelector, HostDisplacement, HostStatus, Identity, Inventory,
-    KernelPressure, LimitVisibility, Limits, ObservationError, PhysicalDevice, PhysicalDeviceId,
-    PhysicalIdentity, ProcessLimitKind, ProcessMemoryLimit, Reported, ReportedBy, Revision,
-    RuntimeStatus, Sample, Status, StorageKind, Store, StoreId, StoreIdentity, StoreKind,
-    TransferPath, TransferPathId, VolumeId, DISPLACEMENT_HISTORY,
+    AccessPath, AccessPathId, AccessRoute, Availability, DeviceMemory, DeviceTopology, Diagnostic,
+    DiagnosticSource, Executor, ExecutorId, ExecutorKind, ExecutorSelector, Identity, Limits,
+    PhysicalDevice, PhysicalDeviceId, PhysicalIdentity, Reported, ReportedBy, Revision,
+    StorageKind, Store, StoreId, StoreIdentity, StoreKind, TransferPath, TransferPathId, VolumeId,
 };
 mod measurer;
 pub use measurer::{KernelIdentity, Measurer, PointKey};

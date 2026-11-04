@@ -2,9 +2,10 @@ use super::{OpenError, ResolveError};
 use crate::api::device::DeviceInner;
 use crate::artifacts::DeviceOptions;
 use crate::memory::{path_claim, store_ledger, ExecutorMemory};
+use seismic_discovery::{DiscoveryError, Inventory, RuntimeStatus, Status};
 use seismic_topology::{
-    Availability, BackendName, DeviceMemory, DeviceTopology, DiagnosticSource, DiscoveryError,
-    ExecutorId, ExecutorSelector, Inventory, Reported, ReportedBy, RuntimeStatus, Status,
+    Availability, BackendName, DeviceMemory, DeviceTopology, DiagnosticSource, ExecutorId,
+    ExecutorSelector, Reported, ReportedBy,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;

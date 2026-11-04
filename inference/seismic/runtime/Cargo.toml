@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 seismic-topology.workspace = true
+seismic-discovery.workspace = true
 seismic-measure.workspace = true
 seismic-ir.workspace = true
 seismic-lang.workspace = true
