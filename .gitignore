@@ -1,7 +1,4 @@
 node_modules
-# Rust outputs.
-inference/target/
-inference/**/target/
 # Per-agent Cargo target directories and scratch source mirrors.
 **/.agent-targets/
 .turbo
