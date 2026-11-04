@@ -27,7 +27,8 @@ use magnitude_executor::platform::{Fit, MemoryReserves};
 use magnitude_service_contracts::models::{
     CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover,
     InstalledModelPackages as _, MemoryShortage, ModelAssessment, ModelAssessmentDomainSnapshot,
-    ModelAssessmentEntryState, ModelAssessments, ModelAssessmentsSnapshot, ModelId, ModelInstance,
+    CatalogModelSelection, ModelAssessmentEntryState, ModelAssessmentSubject, ModelAssessments,
+    ModelAssessmentsSnapshot, ModelId, ModelInstance,
     ModelInstanceId,
     ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadDevice, ModelLoadPlan,
     ModelLoadStage, ModelPackageId, ModelServingConfiguration, ServingProfile,
@@ -413,6 +414,17 @@ fn served_profile(
             ModelAssessmentDomainSnapshot::Pending { .. } => &[],
         })
         .filter(|entry| entry.subject.model_id() == model_id)
+        // A catalog model is served as its effective selection; its desired one may be another
+        // bundle at the same profile.
+        .filter(|entry| {
+            !matches!(
+                entry.subject,
+                ModelAssessmentSubject::Catalog {
+                    selection: CatalogModelSelection::Desired,
+                    ..
+                }
+            )
+        })
         .collect::<Vec<_>>();
     let assessed = entries
         .iter()
@@ -1118,6 +1130,28 @@ mod tests {
             panic!("expected the served profile");
         };
         assert_eq!(served, ServingProfile { context_length: 65_536 });
+    }
+
+    #[test]
+    fn a_catalog_load_serves_its_effective_selection() {
+        let mut snapshot = snapshot(MODEL, fits(262_144, 131_072));
+        let ModelAssessmentDomainSnapshot::Available { entries, .. } = &mut snapshot.catalog else {
+            unreachable!()
+        };
+        let mut desired = entries[0].clone();
+        desired.subject = ModelAssessmentSubject::Catalog {
+            model_id: model_id(MODEL),
+            selection: CatalogModelSelection::Desired,
+        };
+        if let ModelAssessmentEntryState::Assessed { profiles, .. } = &mut desired.state {
+            profiles[0] = serde_json::from_value(fits(262_144, 32_768)).unwrap();
+        }
+        entries.insert(0, desired);
+        let ServedProfile::Served(served) = served_profile(&snapshot, &model_id(MODEL), &CEILING)
+        else {
+            panic!("expected the served profile");
+        };
+        assert_eq!(served.context_length, 131_072);
     }
 
     #[test]
