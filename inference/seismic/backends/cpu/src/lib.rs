@@ -195,4 +195,6 @@ impl seismic_ir::identity::CanonicalIdentity for CpuLaunchMode {
 }
 
 #[cfg(test)]
+mod code_tests;
+#[cfg(test)]
 mod plane_tests;

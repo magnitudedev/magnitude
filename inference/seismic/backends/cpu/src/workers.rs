@@ -196,6 +196,21 @@ impl TeamBarrier {
     }
 }
 
+/// Discards the instructions this core fetched before it observed the
+/// launch it is about to run. The launch's kernel may be code compiled at
+/// an address this core ran other code at: compilation invalidated the
+/// instruction caches (`CoherentCode`), but on aarch64 a core only stops
+/// executing what it already fetched at a context synchronization, which a
+/// participant that spun rather than parked has not passed. x86 instruction
+/// fetch is coherent with data writes.
+fn synchronize_instructions() {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: an instruction synchronization barrier has no operands.
+    unsafe {
+        core::arch::asm!("isb")
+    };
+}
+
 /// The host entry a workgroup barrier compiles to.
 pub(crate) extern "C" fn seismic_cpu_barrier(team: *const TeamBarrier) -> i32 {
     // The kernel received this pointer from the participant that runs it;
@@ -569,6 +584,7 @@ impl Job for LaunchJob {
         if team >= self.teams {
             return;
         }
+        synchronize_instructions();
         let team_state = &shared.teams[team];
         let (team_scratch, my_scratch, my_registers) = unsafe {
             (
