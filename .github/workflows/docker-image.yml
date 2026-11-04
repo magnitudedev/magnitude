@@ -1,9 +1,10 @@
 name: Docker image
 
-# Builds the image of a published release from its own .deb and engine, natively per
-# architecture, pushes each by digest (untagged), smoke-tests exactly that digest, then publishes
-# one multi-arch manifest under the release's tags. Called by the release after publication; dispatch it to rebuild a
-# published version or to push to another repository, such as magnitudedev/magnitude-qa.
+# Builds the image of a release from its own .deb and engine, natively per architecture, pushes
+# each by digest (untagged, so unpublished) and smoke-tests exactly that digest. The release build
+# calls it with the candidate's artifacts before anything is published, and the release tags the
+# tested digests after publication with docker-tags.yml. Dispatch it to rebuild and tag a published
+# version or to push to another repository, such as magnitudedev/magnitude-qa.
 on:
   workflow_call:
     inputs:
@@ -15,13 +16,12 @@ on:
         required: true
         type: string
       repository:
-        required: false
+        required: true
         type: string
-        default: magnitudedev/magnitude
-      channel_tag:
-        required: false
+      candidate:
+        description: Build from this run's release candidate instead of a published release
+        required: true
         type: boolean
-        default: true
     secrets:
       DOCKERHUB_TOKEN:
         required: true
@@ -61,8 +61,10 @@ jobs:
       matrix:
         include:
           - arch: amd64
+            host: linux-x64-gnu
             runner: blacksmith-8vcpu-ubuntu-2404
           - arch: arm64
+            host: linux-arm64-gnu
             runner: blacksmith-8vcpu-ubuntu-2404-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
@@ -80,6 +82,21 @@ jobs:
         with:
           bun-version: ${{ env.BUN_VERSION }}
       - run: bun install --frozen-lockfile
+      - name: Download the candidate's Linux artifacts
+        if: inputs.candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: host-${{ matrix.host }}
+          path: ${{ runner.temp }}/artifacts
+      - name: Assemble the candidate for this architecture
+        if: inputs.candidate
+        run: |
+          sudo apt-get update && sudo apt-get install -y binutils rpm libarchive-tools
+          bun run packages/release/scripts/assemble.ts "$RUNNER_TEMP/artifacts" "$RUNNER_TEMP/candidate" --host "${{ matrix.host }}"
+          echo "CANDIDATE=$RUNNER_TEMP/candidate" >> "$GITHUB_ENV"
+        env:
+          MAGNITUDE_RELEASE_VERSION: ${{ inputs.version }}
+          MAGNITUDE_SOURCE_COMMIT: ${{ inputs.ref }}
       - uses: docker/login-action@v3
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
@@ -88,7 +105,7 @@ jobs:
       - name: Prepare the build context from the release
         run: >-
           bun packages/release/scripts/docker/prepare-context.ts
-          --version "$VERSION" --arch "${{ matrix.arch }}" --output "$RUNNER_TEMP/context"
+          --version "$VERSION" --arch "${{ matrix.arch }}" --output "$RUNNER_TEMP/context" ${CANDIDATE:+--candidate "$CANDIDATE"}
         env:
           VERSION: ${{ inputs.version }}
       # Docker media types without attestations: Podman reads HEALTHCHECK only from a Docker image config.
@@ -125,40 +142,14 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  manifest:
+  tags:
     needs: build
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: ${{ env.BUN_VERSION }}
-      - run: bun install --frozen-lockfile
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: docker-digest-*
-          path: ${{ runner.temp }}/digests
-          merge-multiple: true
-      - uses: docker/login-action@v3
-        with:
-          username: ${{ env.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@v3
-      - name: Publish the multi-arch manifest under the release's tags
-        env:
-          VERSION: ${{ inputs.version }}
-          CHANNEL_TAG: ${{ inputs.channel_tag }}
-        run: |
-          mapfile -t tags < <(bun packages/release/scripts/docker/tags.ts "docker.io/$REPOSITORY" "$VERSION")
-          test "${#tags[@]}" -eq 2
-          test "$CHANNEL_TAG" = true || tags=("${tags[0]}")
-          sources=()
-          for file in "$RUNNER_TEMP"/digests/*; do sources+=("docker.io/$REPOSITORY@sha256:$(basename "$file")"); done
-          test "${#sources[@]}" -eq 2
-          arguments=()
-          for tag in "${tags[@]}"; do arguments+=(--tag "$tag"); done
-          docker buildx imagetools create "${arguments[@]}" "${sources[@]}"
-          docker buildx imagetools inspect "${tags[0]}"
-          test "$(docker buildx imagetools inspect --raw "${tags[0]}" | jq -r .mediaType)" = application/vnd.docker.distribution.manifest.list.v2+json
+    if: ${{ !inputs.candidate }}
+    uses: ./.github/workflows/docker-tags.yml
+    with:
+      version: ${{ inputs.version }}
+      ref: ${{ inputs.ref || github.sha }}
+      repository: ${{ inputs.repository }}
+      channel_tag: ${{ inputs.channel_tag }}
+    secrets:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}

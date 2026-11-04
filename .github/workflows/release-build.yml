@@ -17,6 +17,11 @@ on:
       validate_candidate:
         required: true
         type: boolean
+      docker_repository:
+        description: Docker Hub repository to push the candidate's untagged, smoke-tested image to; empty builds none
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -372,6 +377,20 @@ jobs:
         run: ./packages/release/scripts/test-windows-installed.ps1 -Directory release/windows-x64-msvc -Version '${{ needs.matrix.outputs.version }}' -RequireSignature:([bool]::Parse('${{ inputs.windows_distribution }}'))
         env:
           MAGNITUDE_WINDOWS_PUBLISHER: ${{ vars.WINDOWS_SIGNING_PUBLISHER }}
+
+  docker:
+    needs: [matrix, linux-consumer]
+    if: inputs.docker_repository != ''
+    permissions:
+      contents: read
+    uses: ./.github/workflows/docker-image.yml
+    with:
+      version: ${{ needs.matrix.outputs.version }}
+      ref: ${{ inputs.source_commit }}
+      repository: ${{ inputs.docker_repository }}
+      candidate: true
+    secrets:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
   candidate:
     needs: [matrix, host, linux-consumer, apple-consumer, windows-consumer]
