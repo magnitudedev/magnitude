@@ -158,12 +158,23 @@ pub fn run(
         file.flush()
             .map_err(|error| format!("{}: {error}", data.display()))?;
     }
+    // A streamed load's decode misses: the fewest any streamed layer took
+    // (none means some layer never read past its bank), all of them, and
+    // those its CPU site served.
+    let experts = engine.domain.expert_costs().map(|costs| {
+        json!({
+            "least_layer_misses": costs.layers.iter().map(|layer| layer.misses).min(),
+            "misses": costs.layers.iter().map(|layer| layer.misses).sum::<u64>(),
+            "sited": costs.layers.iter().map(|layer| layer.sited).sum::<u64>(),
+        })
+    });
     let metadata = json!({
         "producer": "harness",
         "model": artifacts.model,
         "rendered_digest": rendered_digest,
         "vocabulary": vocabulary,
         "rows": rows,
+        "experts": experts,
     });
     let path = stem.with_extension("json");
     std::fs::write(

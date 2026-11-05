@@ -14,16 +14,33 @@ what the trace states of each chosen unit's precision (its error in the rounding
 govern its admission, squared: a dimensionless contribution relative to resolution noise, not
 a predicted KL). Under `ab` with a selection, both builds run the selection.
 
-`--weight-cap BYTES` (repeatable) asks whether streaming the experts keeps the output: the
-uncapped load's logits and each streamed load's (its experts read from storage, `fresh`), on
-the uncapped load's tokens, every entry at its declared default. Each streamed load is judged
-against the reference as a candidate against the uncapped load (paired, as `ab kl` judges
-builds), and whether it is bit-identical is reported beside: a streamed load that computes a
-choice's features in another arithmetic (the CPU site) is held to the reference, never to
-bit identity.
+`--weight-cap BYTES` (repeatable) asks whether streaming the experts changes only where they
+live: the uncapped load's logits and each streamed load's (its experts read from storage,
+`fresh`), on the uncapped load's tokens, every entry at its declared default. A streamed load
+whose logits equal the uncapped load's, bit for bit, passes. One whose logits differ fails with
+where they part: the rows that differ, the first of them, the largest difference, and its KL
+against its base (mean, p99 and max over the rows) and top-1 agreement. A non-finite logit in
+either load fails it. A float32 reference of the whole model does not say where two loads
+diverge, so none is read. `--context` sizes the prompt: a few hundred tokens already miss at
+every streamed layer of a bank below its experts.
 
-`--repeat PASSES` under one `--weight-cap` asks whether one load gives one answer: PASSES passes
-over the fixtures on one load, the file left in the page cache, each compared with the first.
+Each streamed load must also have missed at every streamed layer, or it did not ask the
+question; a load that held its experts whole streamed nothing.
+
+A load whose CPU site served misses computed them in the site's own arithmetic, which its
+qualification admitted against α, not exact: its logits are not held to equality, only reported
+against its base (KL and top-1). `--without-site` judges such a load on a discrete device:
+beside each streamed load, the same load under a numerical profile that approves no CPU site, so
+it requests and uses no site verdict and every miss is the device's. That load's logits must
+equal the uncapped load's, its site serving nothing, and the other's site must have served misses
+(its stored verdict admitted it). Without it, a sited load's question is unanswered, which fails.
+
+`--between` with two `--weight-cap`s asks the same for a model no uncapped load fits: the
+second streamed load against the first.
+
+`--repeat PASSES` under one `--weight-cap`, without `--between` or `--without-site`, asks whether
+one load gives one answer: PASSES passes over the fixtures on one load, the file left in the page
+cache, each compared with the first.
 """
 
 import argparse
@@ -74,6 +91,52 @@ REPEATS = (
 )
 
 
+# A streamed load's comparison with its base on the host: whether the logits are equal bit for bit,
+# and where not, the rows that differ, the first and the largest difference, and the candidate's
+# KL against its base (mean, p99 and max over the rows) and top-1 agreement; the rows of each load
+# holding a non-finite logit, the first of them, which no difference or KL covers; beside the
+# candidate's expert misses. The candidate's logits are then removed, and the base's unless a later
+# comparison reads them (`keep`).
+COMPARE = (
+    "import json, os, sys\n"
+    "import numpy\n"
+    "base, candidate, output, keep = sys.argv[1:5]\n"
+    "header = json.load(open(os.path.join(base, 'logits.json')))\n"
+    "rows = lambda run: numpy.memmap(os.path.join(run, 'logits.f32'), dtype='<f4', mode='r').reshape(-1, header['vocabulary'])\n"
+    "a, b = rows(base), rows(candidate)\n"
+    "differing, unfinished, largest, kl, agree = [], {'base': [], 'candidate': []}, 0.0, [], 0\n"
+    "logsoftmax = lambda x: x - (numpy.log(numpy.exp(x - x.max(axis=1, keepdims=True)).sum(axis=1, keepdims=True)) + x.max(axis=1, keepdims=True))\n"
+    "for start in range(0, len(a), 64):\n"
+    "    x, y = a[start:start + 64], b[start:start + 64]\n"
+    "    differing += (numpy.flatnonzero((x.view('<u4') != y.view('<u4')).any(axis=1)) + start).tolist()\n"
+    "    finite = {'base': numpy.isfinite(x).all(axis=1), 'candidate': numpy.isfinite(y).all(axis=1)}\n"
+    "    for load, held in finite.items():\n"
+    "        unfinished[load] += (numpy.flatnonzero(~held) + start).tolist()\n"
+    "    both = finite['base'] & finite['candidate']\n"
+    "    if not both.any():\n"
+    "        continue\n"
+    "    x, y = x[both].astype(numpy.float64), y[both].astype(numpy.float64)\n"
+    "    largest = max(largest, float(numpy.abs(x - y).max()))\n"
+    "    p, q = logsoftmax(x), logsoftmax(y)\n"
+    "    kl += (numpy.exp(p) * (p - q)).sum(axis=1).tolist()\n"
+    "    agree += int((x.argmax(axis=1) == y.argmax(axis=1)).sum())\n"
+    "kl = numpy.maximum(numpy.array(kl), 0.0)\n"
+    "first = min(unfinished['base'] + unfinished['candidate'], default=None)\n"
+    "experts = json.load(open(os.path.join(candidate, 'logits.json')))['experts']\n"
+    "summary = {'rows': len(a), 'differing': len(differing), 'largest': largest,\n"
+    "           'first': header['rows'][differing[0]] if differing else None, 'experts': experts,\n"
+    "           'nonfinite': {'base': len(unfinished['base']), 'candidate': len(unfinished['candidate']),\n"
+    "                         'first': None if first is None else header['rows'][first]},\n"
+    "           'kl': {'mean': float(kl.mean()), 'p99': float(numpy.percentile(kl, 99)), 'max': float(kl.max())} if len(kl) else None,\n"
+    "           'top1': agree / len(kl) if len(kl) else None}\n"
+    "json.dump(summary, open(output, 'w'))\n"
+    "del a, b\n"
+    "os.unlink(os.path.join(candidate, 'logits.f32'))\n"
+    "if keep != 'keep':\n"
+    "    os.unlink(os.path.join(base, 'logits.f32'))\n"
+)
+
+
 def configure(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--selection", type=_trace, metavar="TRACE",
                         help="a tuning trace (or its run directory): judge its chosen configurations against the defaults")
@@ -81,6 +144,12 @@ def configure(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--unit", help="select only the units matching this (any part of `entry [bindings] {statics}`)")
     parser.add_argument("--weight-cap", type=int, action="append", metavar="BYTES",
                         help="whether streaming under this weight cap changes the logits (repeatable)")
+    parser.add_argument("--without-site", action="store_true",
+                        help="with --weight-cap on a discrete device: each streamed load also under a profile that "
+                             "approves no CPU site, every miss on the GPU, which must equal the uncapped load")
+    parser.add_argument("--between", action="store_true",
+                        help="with two --weight-cap: the second streamed load against the first, for a model "
+                             "no uncapped load fits")
     parser.add_argument("--repeat", type=int, metavar="PASSES",
                         help="under one --weight-cap: whether PASSES passes on one load, one row a step, give the "
                              "same logits, the file left in the page cache: where they part, and the margin there")
@@ -106,21 +175,6 @@ def logits(arguments, *, rendered: str | None = None, pinning: tuple[str, ...] =
     ), fresh=weight_cap is not None if fresh is None else fresh)  # fmt: skip
 
 
-# The SHA-256 of each file named after the output path, as a JSON list in order: run on the
-# host, where the logits stay (`sync.HOST_ONLY`).
-DIGESTS = (
-    "import hashlib, json, sys\n"
-    "digests = []\n"
-    "for path in sys.argv[2:]:\n"
-    "    digest = hashlib.sha256()\n"
-    "    with open(path, 'rb') as file:\n"
-    "        for block in iter(lambda: file.read(1 << 24), b''):\n"
-    "            digest.update(block)\n"
-    "    digests.append(digest.hexdigest())\n"
-    "json.dump(digests, open(sys.argv[1], 'w'))\n"
-)
-
-
 def render(arguments) -> Step:
     return Step("render", (
         harness.EXECUTABLE, "render", "--artifacts", "{artifacts}",
@@ -129,13 +183,12 @@ def render(arguments) -> Step:
     ))  # fmt: skip
 
 
-def judge(logits_run: str, *, base: str | None = None, own_rendering: str | None = None,
-          keep: bool = False) -> Step:
+def judge(logits_run: str, *, base: str | None = None, own_rendering: str | None = None) -> Step:
     """The judgement of `logits_run` against the reference (and `base`), which then removes the
-    logits it read from the host, unless a later judgement reads them too (`keep`)."""
+    logits it read from the host."""
     extra = (("--base", f"{{runs}}/{base}") if base else ()) + (
         ("--own-rendering", f"{{runs}}/{own_rendering}/rendered.jsonl") if own_rendering else ()
-    ) + (("--keep-logits",) if keep else ())
+    )
     return Step("kl", (
         REFERENCES, "kl", "--logits", f"{{runs}}/{logits_run}", *extra,
         "--artifacts", "{artifacts}", "--build-identity", "{build_file}",
@@ -153,28 +206,61 @@ def _repeated(arguments) -> tuple[tuple[str, Step], ...]:
             ("repeats", Step("repeats", ("{venv}/bin/python", "-c", REPEATS, "{runs}/passes", str(arguments.repeat)))))
 
 
+# The numerical profile under which a streamed load approves no CPU site (the standard α), which
+# the `profile` job writes on the host.
+UNSITED = "{runs}/profile/unsited.json"
+UNSITED_PROFILE = Step("profile", ("{python}", "-c", "import json, sys; json.dump({'cpu_sites': False}, open(sys.argv[1], 'w'))",
+                                   "{run_dir}/unsited.json"))
+
+
+def _loads(arguments) -> tuple[str | None, list[tuple[str, int, bool]]]:
+    """The base's cap (none: the uncapped load) and each streamed load compared with it: its run,
+    cap and whether its profile approves a CPU site."""
+    base, *capped = arguments.weight_cap if arguments.between else (None, *arguments.weight_cap)
+    loads = [(harness.streamed(cap), cap, True) for cap in capped]
+    if arguments.without_site:
+        loads += [(f"unsited-{cap}", cap, False) for cap in capped]
+    return base, loads
+
+
+def _capped(arguments) -> tuple[tuple[str, Step], ...]:
+    """`--weight-cap`'s loads at the defaults, each streamed load on its base's tokens (the
+    uncapped load's, or under `--between` the first streamed load's), then each one's comparison
+    with its base."""
+    defaults = ("--tuning-defaults",)
+    base, loads = _loads(arguments)
+    base_run = "logits" if base is None else harness.streamed(base)
+    jobs = [(base_run, logits(arguments, pinning=defaults, weight_cap=base))]
+    if arguments.without_site:
+        jobs.append(("profile", UNSITED_PROFILE))
+    for run, cap, approved in loads:
+        profile = () if approved else ("--numerical-profile", UNSITED)
+        jobs.append((run, logits(arguments, rendered=f"{{runs}}/{base_run}/rendered.jsonl",
+                                 pinning=(*defaults, *profile), weight_cap=cap)))
+    for index, (run, _, _) in enumerate(loads):
+        keep = index + 1 < len(loads)  # a later comparison reads the base's logits
+        jobs.append((_compared(run), Step("compare", (
+            "{venv}/bin/python", "-c", COMPARE, f"{{runs}}/{base_run}", f"{{runs}}/{run}",
+            "{run_dir}/compare.json", "keep" if keep else "drop",
+        ))))  # fmt: skip
+    return tuple(jobs)
+
+
 def plan(arguments, source, host) -> Plan:
+    if arguments.between and len(arguments.weight_cap or ()) != 2:
+        raise SystemExit("kl: --between compares the loads under exactly two --weight-cap")
+    if arguments.without_site and (arguments.between or not arguments.weight_cap):
+        raise SystemExit("kl: --without-site compares streamed loads with the uncapped load")
+    if arguments.repeat and (arguments.between or arguments.without_site or len(arguments.weight_cap or ()) != 1):
+        raise SystemExit("kl: --repeat runs its passes on one load, under exactly one --weight-cap, "
+                         "without --between or --without-site")
     if arguments.repeat:
         return Plan(builds=BUILDS, jobs=_repeated(arguments), device="device", acquires=Weights(arguments.model),
                     files=(arguments.fixture,))
     if arguments.weight_cap:
         if arguments.selection is not None:
             raise SystemExit("kl: --weight-cap compares loads at the defaults, not a selection")
-        defaults = ("--tuning-defaults",)
-        jobs = (
-            ("logits", logits(arguments, pinning=defaults)),
-            *((harness.streamed(cap), logits(arguments, rendered="{runs}/logits/rendered.jsonl",
-                                     pinning=defaults, weight_cap=cap))
-              for cap in arguments.weight_cap),
-            ("digests", Step("digests", (
-                "{python}", "-c", DIGESTS, "{run_dir}/digests.json", "{runs}/logits/logits.f32",
-                *(f"{{runs}}/{harness.streamed(cap)}/logits.f32" for cap in arguments.weight_cap),
-            ))),
-            # Each judgement reads the uncapped logits: all but the last keep them on the host.
-            *((_judged(cap), judge(harness.streamed(cap), base="logits",
-                                   keep=index + 1 < len(arguments.weight_cap)))
-              for index, cap in enumerate(arguments.weight_cap)),
-        )  # fmt: skip
+        jobs = _capped(arguments)
     elif arguments.selection is None:
         jobs = (("logits", logits(arguments)), ("kl", judge("logits")))
     else:
@@ -241,32 +327,60 @@ def _selection(arguments, results: dict[str, JobResult]) -> Answer:
     return Answer(tuple(lines), not regressed)
 
 
-def _judged(cap: int) -> str:
-    """The job judging the load streamed under weight cap `cap` against the reference."""
-    return f"kl-{cap}"
+def _compared(run: str) -> str:
+    """The job comparing streamed load `run` with its base."""
+    return f"compare-{run}"
+
+
+def _parted(summary: dict) -> str:
+    """Where a streamed load's logits part from its base's, and its KL and top-1 against it."""
+    first, kl = summary["first"], summary["kl"]
+    return (f"logits differ at {summary['differing']} of {summary['rows']} rows, first "
+            f"{first['fixture_id']}@{first['position']}, largest {summary['largest']:.3g}; "
+            f"KL against its base mean {kl['mean']:.3g}, p99 {kl['p99']:.3g}, max {kl['max']:.3g}, "
+            f"top-1 {100 * summary['top1']:.2f}%")
 
 
 def _streamed(arguments, results: dict[str, JobResult]) -> Answer:
-    uncapped, *capped = json.loads((results["digests"].directory / "digests.json").read_text())
-    lines = [f"{arguments.model} · {arguments.fixture.stem} @{arguments.context} · "
-             f"uncapped logits {uncapped[:16]}"]
-    regressed = False
-    for cap, digest in zip(arguments.weight_cap, capped, strict=True):
-        summary = json.loads((results[_judged(cap)].directory / "kl.json").read_text())
-        identity = "bit-identical" if digest == uncapped else f"not bit-identical ({digest[:16]})"
-        lines += [
-            f"streamed {cap}: {identity}",
-            _line("  uncapped vs reference", summary["base"]),
-            _line("  streamed vs reference", summary["build"]),
-            _line("  streamed vs uncapped", summary["between_builds"]),
-            *(f"  worst row {row['fixture_id']}@{row['position']}: KL {row['kl']:.4f}, "
-              + ("top-1 agrees" if row["agree"] else "top-1 differs")
-              for row in summary["build"]["worst"][:1]),
-        ]
-        changes, worse = _changes(summary)
-        lines += changes
-        regressed |= worse
-    return Answer(tuple(lines), not regressed)
+    """Each streamed load against its base. A load holds when it missed at every streamed layer
+    and its logits are equal, all of them finite. A load whose CPU site served misses is not an
+    equality check (the site's arithmetic is admitted against α): it is reported, and holds under
+    `--without-site`, whose load approving no CPU site judges its row; there the approved load
+    must have had its site serve misses."""
+    base, loads = _loads(arguments)
+    lines = [f"{arguments.model} · {arguments.fixture.stem} @{arguments.context} · against {base or 'uncapped'}"]
+    holds = True
+    for run, cap, approved in loads:
+        summary = json.loads((results[_compared(run)].directory / "compare.json").read_text())
+        label = f"streamed {cap}" + ("" if approved else " approving no CPU site")
+        experts = summary["experts"]
+        if experts is None:
+            lines.append(f"{label}: held its experts whole, so it streamed nothing")
+            holds = False
+            continue
+        least, sited = experts["least_layer_misses"], experts["sited"]
+        assert approved or sited == 0, f"{label}: its CPU site served {sited} misses under a profile approving none"
+        nonfinite = summary["nonfinite"]
+        if nonfinite["base"] or nonfinite["candidate"]:
+            first = nonfinite["first"]
+            outcome = (f"non-finite logits at {nonfinite['base']} rows of its base and {nonfinite['candidate']} "
+                       f"of its own of {summary['rows']}, first {first['fixture_id']}@{first['position']}")
+            held = False
+        else:
+            compared = f"equal logits ({summary['rows']} rows)" if summary["differing"] == 0 else _parted(summary)
+            if sited:
+                judged = ("the load approving no CPU site judges it" if arguments.without_site
+                          else "unjudged: --without-site judges it")
+                outcome = (f"its CPU site served misses in arithmetic admitted against α, so this is not an "
+                           f"equality check ({judged}): {compared}")
+                held = arguments.without_site
+            elif arguments.without_site and approved:
+                outcome, held = f"{compared}; its CPU site served no miss, so the site went untested", False
+            else:
+                outcome, held = compared, summary["differing"] == 0
+        lines.append(f"{label}: {outcome}; fewest misses at a streamed layer {least}, {sited} sited")
+        holds &= held and least > 0
+    return Answer(tuple(lines), holds)
 
 
 def answer(arguments, results: dict[str, JobResult]) -> Answer:

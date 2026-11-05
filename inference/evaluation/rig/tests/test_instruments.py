@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy
 import pytest
 
 from magnitude_rig import ab, cli, engine, selectors, store
@@ -666,49 +667,169 @@ def test_a_streamed_only_step_times_no_resident_cell_and_answers_absolute_terms_
         REGISTRY["step"].answer(arguments, results)
 
 
-def test_kl_with_weight_caps_judges_each_streamed_load_against_the_reference(tmp_path):
-    arguments = parse("kl", "--backend", "metal", "--model", MODEL, "--context", "4096", "--purpose", "p",
+def test_kl_with_weight_caps_passes_equal_logits_and_says_where_others_part(tmp_path):
+    arguments = parse("kl", "--backend", "metal", "--model", MODEL, "--context", "512", "--purpose", "p",
                       "--estimate", "5m", "--weight-cap", "7", "--weight-cap", "9")
     plan = REGISTRY["kl"].plan(arguments, None, "alpha")
-    assert [name for name, _ in plan.jobs] == ["logits", "streamed-7", "streamed-9", "digests", "kl-7", "kl-9"]
+    assert [name for name, _ in plan.jobs] == ["logits", "streamed-7", "streamed-9", "compare-streamed-7",
+                                               "compare-streamed-9"]
+    assert "magnitude-references" not in " ".join(" ".join(step.argv) for _, step in plan.jobs), "no reference is read"
     jobs = dict(plan.jobs)
-    resident, digests = jobs["logits"], jobs["digests"]
-    assert "--tuning-defaults" in resident.argv and not resident.fresh
+    resident = jobs["logits"]
+    assert "--tuning-defaults" in resident.argv and not resident.fresh and "--weight-cap" not in resident.argv
     for cap in (7, 9):
         step = jobs[f"streamed-{cap}"]
         assert step.fresh and "--tuning-defaults" in step.argv
         assert step.argv[step.argv.index("--rendered") + 1] == "{runs}/logits/rendered.jsonl"
-        # Each streamed load is judged against the reference, the uncapped load its base.
-        judge = jobs[f"kl-{cap}"].argv
-        assert judge[judge.index("--logits") + 1] == f"{{runs}}/streamed-{cap}"
-        assert judge[judge.index("--base") + 1] == "{runs}/logits"
-        # The uncapped logits stay on the host until the last judgement has read them.
-        assert ("--keep-logits" in judge) == (cap == 7)
-    # The digests are taken where the logits are, by the job's own script.
-    for name, values in (("logits", b"\x01"), ("streamed-7", b"\x01"), ("streamed-9", b"\x02")):
+    # On the host: each comparison writes where the logits part, removes the candidate's logits,
+    # and keeps the base's until the last comparison has read them.
+    rows = [{"fixture_id": "f", "position": position} for position in range(3)]
+    loads = (("logits", [[0, 1], [2, 3], [4, 5]], None),
+             ("streamed-7", [[0, 1], [2, 3], [4, 5]], {"least_layer_misses": 2, "misses": 9, "sited": 0}),
+             ("streamed-9", [[0, 1], [2, 3.5], [4, 5]], {"least_layer_misses": 1, "misses": 5, "sited": 0}))
+    for name, values, experts in loads:
         (tmp_path / name).mkdir()
-        (tmp_path / name / "logits.f32").write_bytes(values)
-    (tmp_path / "digests").mkdir()
-    tokens = {"{python}": sys.executable, "{run_dir}": str(tmp_path / "digests"), "{runs}": str(tmp_path)}
-    argv = [next((part.replace(k, v) for k, v in tokens.items() if k in part), part) for part in digests.argv]
-    subprocess.run(argv, check=True)
-    line = {"mean_kl": 0.01, "p99_kl": 0.1, "max_kl": 0.5, "top1_agreement": 0.98, "positions": 10}
-    worst = {**line, "worst": [{"fixture_id": "f", "position": 3, "kl": 0.5, "agree": False}]}
-    change = {"metric": "mean_kl", "base": 0.01, "candidate": 0.011, "relative": 0.1, "interval": [-0.001, 0.002]}
-    for cap, verdict in ((7, "within noise"), (9, "regressed")):
-        (tmp_path / f"kl-{cap}").mkdir()
-        summary = {"base": line, "build": worst, "between_builds": line, "changes": [{**change, "verdict": verdict}]}
-        (tmp_path / f"kl-{cap}" / "kl.json").write_text(json.dumps(summary))
-    names = ("streamed-7", "streamed-9", "digests", "kl-7", "kl-9")
-    results = {name: JobResult(tmp_path / name, tmp_path / "log", 0) for name in names}
+        numpy.array(values, dtype="<f4").tofile(tmp_path / name / "logits.f32")
+        (tmp_path / name / "logits.json").write_text(json.dumps({"vocabulary": 2, "rows": rows, "experts": experts}))
+    for cap in (7, 9):
+        name = f"compare-streamed-{cap}"
+        (tmp_path / name).mkdir()
+        tokens = {"{venv}/bin/python": sys.executable, "{run_dir}": str(tmp_path / name), "{runs}": str(tmp_path)}
+        argv = [next((part.replace(k, v) for k, v in tokens.items() if k in part), part) for part in jobs[name].argv]
+        subprocess.run(argv, check=True)
+        assert not (tmp_path / f"streamed-{cap}" / "logits.f32").exists()
+        assert (tmp_path / "logits" / "logits.f32").exists() == (cap == 7)
+    results = {name: JobResult(tmp_path / name, tmp_path / "log", 0)
+               for name in ("compare-streamed-7", "compare-streamed-9")}
     answer = REGISTRY["kl"].answer(arguments, results)
-    assert answer.lines[1] == "streamed 7: bit-identical"
-    assert any(line.startswith("streamed 9: not bit-identical") for line in answer.lines)
-    assert not answer.ok, "a regressed streamed load fails, a bit difference alone does not"
-    assert "  worst row f@3: KL 0.5000, top-1 differs" in answer.lines, "a differing run shows its divergence"
-    (tmp_path / "kl-9" / "kl.json").write_text(json.dumps({"base": line, "build": worst, "between_builds": line,
-                                                           "changes": [{**change, "verdict": "within noise"}]}))
+    assert answer.lines[1] == "streamed 7: equal logits (3 rows); fewest misses at a streamed layer 2, 0 sited"
+    # The differing row's KL against its base: softmax([2, 3]) against softmax([2, 3.5]).
+    p, q = (numpy.exp(row) / numpy.exp(row).sum() for row in (numpy.array([2., 3.]), numpy.array([2., 3.5])))
+    kl = numpy.array([0., float((p * numpy.log(p / q)).sum()), 0.])
+    assert answer.lines[2] == ("streamed 9: logits differ at 1 of 3 rows, first f@1, largest 0.5; "
+                               f"KL against its base mean {kl.mean():.3g}, p99 {numpy.percentile(kl, 99):.3g}, "
+                               f"max {kl.max():.3g}, top-1 100.00%; fewest misses at a streamed layer 1, 0 sited")
+    assert not answer.ok
+    # Equal logits from a load that never missed at some streamed layer did not ask the question.
+    summary = json.loads((tmp_path / "compare-streamed-9" / "compare.json").read_text())
+    (tmp_path / "compare-streamed-9" / "compare.json").write_text(json.dumps(
+        {**summary, "differing": 0, "first": None, "experts": {"least_layer_misses": 0, "misses": 3, "sited": 0}}))
+    assert not REGISTRY["kl"].answer(arguments, results).ok
+    (tmp_path / "compare-streamed-9" / "compare.json").write_text(json.dumps(
+        {**summary, "differing": 0, "first": None, "experts": {"least_layer_misses": 1, "misses": 3, "sited": 0}}))
     assert REGISTRY["kl"].answer(arguments, results).ok
+    # On a discrete device, each streamed load also runs under a profile approving no CPU site:
+    # that one must equal the uncapped load with its site serving nothing, and the other's site
+    # must have served misses.
+    discrete = parse("kl", "--backend", "cuda", "--model", MODEL, "--context", "512", "--purpose", "p",
+                     "--estimate", "5m", "--weight-cap", "7", "--without-site")
+    jobs = dict(REGISTRY["kl"].plan(discrete, None, "alpha").jobs)
+    assert list(jobs) == ["logits", "profile", "streamed-7", "unsited-7", "compare-streamed-7", "compare-unsited-7"]
+    assert all("--cache-dir" in jobs[name].argv for name in ("streamed-7", "unsited-7")), "both keep the kernel cache"
+    assert "--numerical-profile" not in jobs["streamed-7"].argv
+    unsited = jobs["unsited-7"].argv
+    assert unsited[unsited.index("--numerical-profile") + 1] == "{runs}/profile/unsited.json"
+    profile = jobs["profile"].argv
+    subprocess.run([sys.executable if part == "{python}" else part.replace("{run_dir}", str(tmp_path)) for part in profile],
+                   check=True)
+    assert json.loads((tmp_path / "unsited.json").read_text()) == {"cpu_sites": False}
+    compared = lambda differing, sited: {"rows": 3, "differing": differing, "largest": 0.5 * differing,
+                                         "first": rows[1] if differing else None,
+                                         "experts": {"least_layer_misses": 2, "misses": 9, "sited": sited},
+                                         "nonfinite": {"base": 0, "candidate": 0, "first": None},
+                                         "kl": {"mean": 0.01, "p99": 0.02, "max": 0.03}, "top1": 1.0}
+    for name, summary in (("compare-streamed-7", compared(1, 4)), ("compare-unsited-7", compared(0, 0))):
+        (tmp_path / name).mkdir(exist_ok=True)
+        (tmp_path / name / "compare.json").write_text(json.dumps(summary))
+    results = {name: JobResult(tmp_path / name, tmp_path / "log", 0) for name in ("compare-streamed-7", "compare-unsited-7")}
+    answer = REGISTRY["kl"].answer(discrete, results)
+    # The sited load's logits are reported against its base, not held to equality: its row's
+    # verdict is the load approving no CPU site's.
+    assert answer.lines[1] == ("streamed 7: its CPU site served misses in arithmetic admitted against α, so this is "
+                               "not an equality check (the load approving no CPU site judges it): logits differ at "
+                               "1 of 3 rows, first f@1, largest 0.5; KL against its base mean 0.01, p99 0.02, max "
+                               "0.03, top-1 100.00%; fewest misses at a streamed layer 2, 4 sited")
+    assert answer.ok and answer.lines[2] == ("streamed 7 approving no CPU site: equal logits (3 rows); "
+                                             "fewest misses at a streamed layer 2, 0 sited")
+    (tmp_path / "compare-unsited-7" / "compare.json").write_text(json.dumps(compared(1, 0)))
+    assert not REGISTRY["kl"].answer(discrete, results).ok, "the load approving no CPU site differs"
+    (tmp_path / "compare-unsited-7" / "compare.json").write_text(json.dumps(compared(0, 0)))
+    (tmp_path / "compare-streamed-7" / "compare.json").write_text(json.dumps(compared(0, 0)))
+    answer = REGISTRY["kl"].answer(discrete, results)
+    assert not answer.ok, "an approved site that served nothing was not admitted"
+    assert answer.lines[1] == ("streamed 7: equal logits (3 rows); its CPU site served no miss, so the site went untested; "
+                               "fewest misses at a streamed layer 2, 0 sited")
+    # A site serving misses under a profile approving none is an invariant violated.
+    (tmp_path / "compare-unsited-7" / "compare.json").write_text(json.dumps(compared(0, 1)))
+    with pytest.raises(AssertionError, match="approving none"):
+        REGISTRY["kl"].answer(discrete, results)
+    # Without --without-site, a sited load's row is unjudged.
+    sited = parse("kl", "--backend", "cuda", "--model", MODEL, "--context", "512", "--purpose", "p",
+                  "--estimate", "5m", "--weight-cap", "7")
+    (tmp_path / "compare-streamed-7" / "compare.json").write_text(json.dumps(compared(0, 4)))
+    answer = REGISTRY["kl"].answer(sited, {"compare-streamed-7": results["compare-streamed-7"]})
+    assert not answer.ok and answer.lines[1] == (
+        "streamed 7: its CPU site served misses in arithmetic admitted against α, so this is not an equality "
+        "check (unjudged: --without-site judges it): equal logits (3 rows); fewest misses at a streamed layer 2, 4 sited")
+    # A load that held its experts whole streamed nothing, and says nothing of misses.
+    (tmp_path / "compare-streamed-7" / "compare.json").write_text(json.dumps({**compared(0, 0), "experts": None}))
+    answer = REGISTRY["kl"].answer(sited, {"compare-streamed-7": results["compare-streamed-7"]})
+    assert not answer.ok and answer.lines[1] == "streamed 7: held its experts whole, so it streamed nothing"
+    # Under --between the first streamed load is the base, and no uncapped load runs.
+    between = parse("kl", "--backend", "metal", "--model", MODEL, "--context", "512", "--purpose", "p",
+                    "--estimate", "5m", "--weight-cap", "7", "--weight-cap", "9", "--between")
+    jobs = dict(REGISTRY["kl"].plan(between, None, "alpha").jobs)
+    assert list(jobs) == ["streamed-7", "streamed-9", "compare-streamed-9"]
+    assert jobs["streamed-9"].argv[jobs["streamed-9"].argv.index("--rendered") + 1] == "{runs}/streamed-7/rendered.jsonl"
+    assert "--weight-cap" in jobs["streamed-7"].argv and jobs["streamed-7"].fresh, "the base is itself streamed"
+    # The second cap holds where its logits equal the first's and it missed at every streamed layer.
+    (tmp_path / "between").mkdir()
+    unfinished = {"base": 0, "candidate": 0, "first": None}
+    (tmp_path / "between" / "compare.json").write_text(json.dumps(
+        {"rows": 3, "differing": 0, "largest": 0.0, "first": None, "experts": {"least_layer_misses": 4, "misses": 9, "sited": 0},
+         "nonfinite": unfinished, "kl": {"mean": 0.0, "p99": 0.0, "max": 0.0}, "top1": 1.0}))
+    results = {"compare-streamed-9": JobResult(tmp_path / "between", tmp_path / "log", 0)}
+    answer = REGISTRY["kl"].answer(between, results)
+    assert answer.ok and answer.lines[0].endswith("against 7")
+    assert answer.lines[1] == "streamed 9: equal logits (3 rows); fewest misses at a streamed layer 4, 0 sited"
+    (tmp_path / "between" / "compare.json").write_text(json.dumps(
+        {"rows": 3, "differing": 1, "largest": 0.5, "first": rows[1], "experts": {"least_layer_misses": 4, "misses": 9, "sited": 0},
+         "nonfinite": unfinished, "kl": {"mean": 0.01, "p99": 0.02, "max": 0.03}, "top1": 1.0}))
+    assert not REGISTRY["kl"].answer(between, results).ok
+    # --repeat runs its passes on one load under one cap: neither comparison of loads takes it.
+    for refused in (("--weight-cap", "9", "--between"), ("--without-site",)):
+        repeated = parse("kl", "--backend", "cuda", "--model", MODEL, "--context", "512", "--purpose", "p",
+                         "--estimate", "5m", "--weight-cap", "7", "--repeat", "2", *refused)
+        with pytest.raises(SystemExit, match="--repeat"):
+            REGISTRY["kl"].plan(repeated, None, "alpha")
+
+
+def test_kl_fails_a_streamed_load_whose_logits_are_not_finite(tmp_path):
+    """A NaN row is neither equal logits nor a difference: it fails by name, whichever load holds
+    it, even where both loads hold the same bits."""
+    arguments = parse("kl", "--backend", "metal", "--model", MODEL, "--context", "512", "--purpose", "p",
+                      "--estimate", "5m", "--weight-cap", "7")
+    jobs = dict(REGISTRY["kl"].plan(arguments, None, "alpha").jobs)
+    rows = [{"fixture_id": "f", "position": position} for position in range(3)]
+    nan = float("nan")
+    for base, candidate, counts in (([[0, 1], [2, 3], [4, 5]], [[0, 1], [nan, nan], [4, 5]], (0, 1)),
+                                    ([[0, 1], [2, nan], [4, 5]], [[0, 1], [2, nan], [4, 5]], (1, 1))):
+        for name, values, experts in (("logits", base, None),
+                                      ("streamed-7", candidate, {"least_layer_misses": 2, "misses": 9, "sited": 0})):
+            (tmp_path / name).mkdir(exist_ok=True)
+            numpy.array(values, dtype="<f4").tofile(tmp_path / name / "logits.f32")
+            (tmp_path / name / "logits.json").write_text(json.dumps({"vocabulary": 2, "rows": rows, "experts": experts}))
+        (tmp_path / "compare").mkdir(exist_ok=True)
+        tokens = {"{venv}/bin/python": sys.executable, "{run_dir}": str(tmp_path / "compare"), "{runs}": str(tmp_path)}
+        argv = [next((part.replace(k, v) for k, v in tokens.items() if k in part), part)
+                for part in jobs["compare-streamed-7"].argv]
+        subprocess.run(argv, check=True)
+        summary = json.loads((tmp_path / "compare" / "compare.json").read_text())
+        assert summary["largest"] == 0.0 and summary["kl"]["max"] == 0.0, "only finite rows are measured"
+        answer = REGISTRY["kl"].answer(arguments, {"compare-streamed-7": JobResult(tmp_path / "compare", tmp_path / "log", 0)})
+        assert not answer.ok
+        assert answer.lines[1] == (f"streamed 7: non-finite logits at {counts[0]} rows of its base and {counts[1]} of its "
+                                   "own of 3, first f@1; fewest misses at a streamed layer 2, 0 sited")
 
 
 def test_bench_takes_its_measurement_options_and_builds_our_binaries_apart():

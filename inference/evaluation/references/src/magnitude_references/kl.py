@@ -16,7 +16,7 @@ QUALITY_BAR = 0.02  # relative change a metric must exceed, beyond its paired 95
 
 
 def run(logits: Path, artifacts: Path, build_identity: Path, cache: Path, output: Path,
-        base: Path | None, own_rendering: Path | None, keep_logits: bool) -> dict:
+        base: Path | None, own_rendering: Path | None) -> dict:
     measured = base if base is not None else logits
     rendered = measured / rendering.RENDERED
     reference = check(obtain(rendered, artifacts, build_identity, cache, output.with_name("reference.log")))
@@ -36,10 +36,9 @@ def run(logits: Path, artifacts: Path, build_identity: Path, cache: Path, output
         if own_rendering is not None:
             summary["rendering_differences"] = rendering.compare_files(rendered, own_rendering)
     finally:
-        if not keep_logits:
-            for directory in (logits, base):
-                for values in directory.glob("*.f32") if directory is not None else ():
-                    values.unlink()
+        for directory in (logits, base):
+            for values in directory.glob("*.f32") if directory is not None else ():
+                values.unlink()
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(summary, indent=1))
     return summary
