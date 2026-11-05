@@ -97,6 +97,8 @@ struct Inbox<C> {
 struct Mailbox<C> {
     state: Mutex<Inbox<C>>,
     changed: Condvar,
+    /// Notified once execution stops ([`Worker::stop`]).
+    stopped: Condvar,
     capacity: usize,
 }
 
@@ -140,6 +142,7 @@ impl<C: Clone> Mailbox<C> {
             state.stopped = Some(cause.clone());
             (std::mem::take(&mut state.items), state.stop_watcher.take())
         };
+        self.stopped.notify_all();
         if let Some(watcher) = watcher {
             watcher.wake();
         }
@@ -329,6 +332,7 @@ impl<C: Clone + Send + From<Panicked> + 'static> Worker<C> {
                 outstanding: 0,
             }),
             changed: Condvar::new(),
+            stopped: Condvar::new(),
             capacity,
         });
         let queue = mailbox.clone();
@@ -367,6 +371,16 @@ impl<C: Clone + Send + From<Panicked> + 'static> Worker<C> {
         Client {
             mailbox: self.mailbox.clone(),
         }
+    }
+    /// Terminate every request, let the flight finish, and return once
+    /// execution has stopped, with why: its owner has settled what it owes,
+    /// and its teardown runs on from here until [`Self::close`] (or the
+    /// drop) joins it.
+    pub fn stop(&self) -> C {
+        self.mailbox.push(Event::Close);
+        let state = self.mailbox.state.lock().unwrap();
+        let state = self.mailbox.stopped.wait_while(state, |state| state.stopped.is_none()).unwrap();
+        state.stopped.clone().expect("execution stopped")
     }
     /// Terminate every request, let the flight finish, and join the thread.
     pub fn close(&mut self) {

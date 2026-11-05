@@ -45,14 +45,14 @@ pub fn worker_exit_code(exit: &WorkerExit) -> i32 {
 }
 
 /// The `inference-worker` process entry: serve one load over standard streams until shutdown,
-/// host loss or unload.
-pub fn run_inference_worker() -> i32 {
-    let exit = serve_worker(stdio_worker_transport());
-    let code = worker_exit_code(&exit);
+/// host loss or unload, then end the process, which releases what the load holds.
+pub fn run_inference_worker() -> ! {
+    let served = serve_worker(stdio_worker_transport());
+    let code = worker_exit_code(&served.exit);
     if code != 0 {
-        eprintln!("inference worker ended: {exit:?}");
+        eprintln!("inference worker ended: {:?}", served.exit);
     }
-    code
+    served.end_process(code)
 }
 
 /// How long a load failure waits for an ended worker's exit status.
@@ -420,6 +420,13 @@ impl ResidencyWorker for EngineWorker {
             }
             None => self.end("worker_shutdown", "the worker was not ready"),
         }
+    }
+
+    /// The worker's `Unloaded` answer arrived. A connection that merely closed is no answer: a
+    /// process still running behind it is killed at the deadline. A worker that never became
+    /// ready has no session to answer, and is killed by its shutdown.
+    fn answered_shutdown(&self) -> bool {
+        self.client.get().is_none_or(|client| client.unloaded())
     }
 }
 

@@ -271,12 +271,13 @@ fn worker_process(arguments: &Arguments) -> Result<(Vec<TokenId>, FinishReason),
 
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("--worker") {
-        let exit = serve_worker(stdio_worker_transport());
-        eprintln!("worker process: exited: {exit:?}");
-        std::process::exit(match exit {
+        let served = serve_worker(stdio_worker_transport());
+        eprintln!("worker process: exited: {:?}", served.exit);
+        let code = match served.exit {
             magnitude_engine::worker::WorkerExit::Shutdown => 0,
             _ => 1,
-        });
+        };
+        served.end_process(code);
     }
     let arguments = match arguments() {
         Ok(Some(arguments)) => arguments,

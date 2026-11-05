@@ -199,6 +199,8 @@ pub(super) struct Shared {
     /// priced (`Self::price`): what a scratch-served group's merge sets are
     /// chosen by (`Shared::begin`).
     passes: Mutex<Option<Arc<crate::assessment::ExpertPass>>>,
+    /// Whether the load's account was given as it settled.
+    settled: crate::settle::Once,
 }
 
 /// A growth's slot being backed ([`Shared::backing_slot`]), until it drops:
@@ -672,7 +674,9 @@ impl Watcher {
             lent: lent::LentRecords::new(),
             filled: std::sync::atomic::AtomicBool::new(false),
             passes: Mutex::new(None),
+            settled: Default::default(),
         });
+        crate::settle::owe_shared(Arc::downgrade(&shared));
         // The transfer queue the promotions queue on, whose completions its
         // watch announces.
         let copies = copier.as_ref().map(|copier| copier.copies.clone());
@@ -778,6 +782,17 @@ impl Watcher {
     }
 }
 
+/// The load's account of its landings and of its starved steps, once
+/// serving stopped: as the load settles, or else as the watcher drops.
+impl crate::settle::Owed for Shared {
+    fn settle(&self) {
+        if self.settled.first() {
+            tracing::info!("expert {}", self.landings.line());
+            tracing::info!("expert {}", self.steps.interruptions());
+        }
+    }
+}
+
 impl Drop for Watcher {
     fn drop(&mut self) {
         // Nothing is answered once serving stops: the watchdog stops first.
@@ -795,8 +810,7 @@ impl Drop for Watcher {
         // Nothing submits to the executor any more: it stops, and the jobs
         // it never ran drop.
         drop(self.compute.take());
-        tracing::info!("expert {}", self.shared.landings.line());
-        tracing::info!("expert {}", self.shared.steps.interruptions());
+        crate::settle::Owed::settle(&*self.shared);
     }
 }
 

@@ -87,7 +87,7 @@ fn main() -> anyhow::Result<()> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     if arguments.first().map(String::as_str) == Some("inference-worker") {
         install_parent_watchdog()?;
-        std::process::exit(run_inference_worker());
+        run_inference_worker()
     }
     if !arguments.iter().any(|argument| argument == "--bundle") {
         println!("residency_lifecycle: not run (it needs a device host's models: --bundle and the rest)");

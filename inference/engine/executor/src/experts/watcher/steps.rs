@@ -1085,6 +1085,7 @@ impl ExpertStep {
             landings: Default::default(),
             priced: std::sync::Mutex::new(None),
             passes: std::sync::Mutex::new(None),
+            settled: Default::default(),
             promoted: Default::default(),
             copy: std::sync::Mutex::new(None),
         })

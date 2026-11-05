@@ -106,6 +106,9 @@ pub trait ResidencyWorker: Send + Sync {
     }
     /// Ask the worker to unload and exit; attached requests end with the unload.
     fn shutdown(&self);
+    /// Whether the worker has answered its shutdown: it serves nothing more, every request it
+    /// held answered, and what is left of it is its release.
+    fn answered_shutdown(&self) -> bool;
 }
 
 fn verify_worker_retirement(worker: &dyn ResidencyWorker) -> Result<(), ModelOperationFailure> {
@@ -1959,6 +1962,11 @@ mod tests {
                 !self.fail_retirement.load(Ordering::Acquire),
                 Ordering::Release,
             );
+        }
+
+        /// Its shutdown retires it at once, or leaves it to the bound and its kill.
+        fn answered_shutdown(&self) -> bool {
+            false
         }
     }
 

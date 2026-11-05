@@ -818,7 +818,9 @@ impl ResidencyStore {
         )
         .map_err(invalid)?;
         table.seed().map_err(invalid)?;
-        Ok(Rc::new(table))
+        let table = Rc::new(table);
+        crate::settle::owe(Rc::downgrade(&table));
+        Ok(table)
     }
 
     /// The stored table of the streamed gathered table `plan`
@@ -891,7 +893,9 @@ impl ResidencyStore {
         )
         .map_err(invalid)?;
         table.seed().map_err(invalid)?;
-        Ok(Arc::new(table))
+        let table = Arc::new(table);
+        crate::settle::owe_shared(Arc::downgrade(&table));
+        Ok(table)
     }
 
     /// The load's expert bank (`ExpertBankPlan`), allocated over the files

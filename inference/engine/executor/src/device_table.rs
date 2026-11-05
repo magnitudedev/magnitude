@@ -222,6 +222,8 @@ pub struct DeviceTable {
     flights: TableFlights,
     source: Box<dyn TileSource>,
     kept: Option<KeptRows>,
+    /// Whether the kept rows were written as the load settled.
+    settled: crate::settle::Once,
     shared: Arc<Shared>,
     /// The reads the filler takes: each one's value and rows.
     reads: Mutex<Option<mpsc::Sender<(u64, u64)>>>,
@@ -430,8 +432,18 @@ impl Drop for DeviceTable {
         if let Some(filler) = self.filler.take() {
             let _ = filler.join();
         }
-        let state = self.state();
-        self.keep(&state);
+        crate::settle::Owed::settle(self);
+    }
+}
+
+/// The rows its steps named are kept for the next load, once: as the load
+/// settles, or else as the table drops.
+impl crate::settle::Owed for DeviceTable {
+    fn settle(&self) {
+        if self.settled.first() {
+            let state = self.state();
+            self.keep(&state);
+        }
     }
 }
 
@@ -542,6 +554,7 @@ impl DeviceTable {
                 .map_err(|error| failed(&error))?
         };
         let table = Self {
+            settled: Default::default(),
             staging: RefCell::default(),
             staging_rows,
             stored,
@@ -1313,16 +1326,19 @@ mod tests {
             std::process::id()
         ));
         let file = KeptRows::of(&kept, "table").0;
-        let table = ResidentTable::streamed(device_table(Some(&kept)));
+        let table = device_table(Some(&kept));
+        crate::settle::owe(Rc::downgrade(&table));
+        let table = ResidentTable::streamed(table);
         table.indices(&[6, 1]).unwrap();
-        // The rows are kept when the table is dropped, and once after its
-        // first steps.
+        // The rows are kept as the load settles, and once after its first
+        // steps.
         assert!(!file.exists());
         for _ in 1..DeviceTable::KEPT_AFTER_STEPS {
             table.indices(&[1]).unwrap();
         }
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "1 6");
         table.indices(&[3]).unwrap();
+        crate::settle::settle();
         drop(table);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "1 3 6");
 

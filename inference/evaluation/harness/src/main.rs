@@ -516,10 +516,15 @@ fn run(command: Command) -> Result<(), String> {
                 WorkerExit, serve_worker, transport::stdio_worker_transport,
             };
             survey.install()?;
-            match serve_worker(stdio_worker_transport()) {
-                WorkerExit::Prepared | WorkerExit::Shutdown => Ok(()),
-                exit => Err(format!("worker ended: {exit:?}")),
-            }
+            let served = serve_worker(stdio_worker_transport());
+            let code = match &served.exit {
+                WorkerExit::Prepared | WorkerExit::Shutdown => 0,
+                exit => {
+                    eprintln!("magnitude-harness: worker ended: {exit:?}");
+                    1
+                }
+            };
+            served.end_process(code)
         }
         Command::Render { run, context } => {
             let inputs = Inputs::read(&run, "harness.render")?;

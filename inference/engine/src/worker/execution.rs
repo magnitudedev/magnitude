@@ -24,6 +24,10 @@ enum Execution<F: ProgramFamily> {
 
 pub(crate) struct ExecutionOwner<F: ProgramFamily> {
     execution: Execution<F>,
+    /// The owner whose execution stopped, what it owed settled: it drops
+    /// after the stop is announced, so a worker process's end, which needs
+    /// none of its teardown, can answer first and cut that teardown short.
+    ended: Option<Owner<F>>,
     method: Arc<dyn Method>,
     /// What prices the bank's experts, which prices them again, measuring
     /// nothing, once the service stores new measurement records; none
@@ -35,6 +39,7 @@ impl<F: ProgramFamily> ExecutionOwner<F> {
     pub fn new(owner: Owner<F>, method: Arc<dyn Method>, pricing: Option<ExpertPricing>) -> Self {
         Self {
             execution: Execution::Serving(owner),
+            ended: None,
             method,
             pricing,
         }
@@ -170,7 +175,8 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                     Err(error) => self.execution = Execution::Stopped(UnloadCause::from(&error)),
                 },
                 Execution::Draining(owner, cause) => match owner.run(now) {
-                    Ok((_, Ran { in_flight: false, .. })) => {
+                    Ok((owner, Ran { in_flight: false, .. })) => {
+                        self.ended = Some(owner);
                         self.execution = Execution::Stopped(cause)
                     }
                     Ok((owner, Ran { due, .. })) => {
@@ -180,6 +186,9 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                     Err(error) => self.execution = Execution::Stopped(UnloadCause::from(&error)),
                 },
                 Execution::Stopped(cause) => {
+                    // Before the stop is announced, every durable effect of
+                    // the load is made (`magnitude_executor::settle`).
+                    magnitude_executor::settle::settle();
                     self.execution = Execution::Stopped(cause.clone());
                     return Err(cause);
                 }

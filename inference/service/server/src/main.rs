@@ -116,7 +116,7 @@ fn main() -> anyhow::Result<()> {
         Command::InferenceWorker => {
             worker_process::install_parent_watchdog()?;
             telemetry::init_worker()?;
-            std::process::exit(run_inference_worker());
+            run_inference_worker()
         }
         command => {
             if matches!(command, Command::Serve { .. }) {

@@ -99,52 +99,76 @@ pub fn run_worker(
     transport: impl WorkerTransport,
 ) -> WorkerExit {
     let (receiver, sender) = transport.split();
-    serve(manifest, unprepared, receiver, Box::new(sender))
+    serve(manifest, unprepared, receiver, Box::new(sender)).exit
 }
 
 /// A worker process's entry: accept the host's `Hello`, then either run the
 /// worker on a `Load`'s manifest, only prepare a `Prepare`'s, or only
 /// measure the machine for a `Measure`.
-pub fn serve_worker(transport: impl WorkerTransport) -> WorkerExit {
+pub fn serve_worker(transport: impl WorkerTransport) -> Served {
     let (mut receiver, mut sender) = transport.split();
     let worker = EngineBuild::current();
     let host = match receiver.receive() {
         Ok(Some(HostMessage::Hello { build })) => build,
-        Ok(Some(_)) => return WorkerExit::ProtocolViolation("expected Hello".into()),
-        Ok(None) => return WorkerExit::HostLost { reason: None },
-        Err(error) => {
-            return WorkerExit::HostLost {
-                reason: Some(error.to_string()),
-            }
-        }
+        Ok(Some(_)) => return WorkerExit::ProtocolViolation("expected Hello".into()).into(),
+        Ok(None) => return WorkerExit::HostLost { reason: None }.into(),
+        Err(error) => return WorkerExit::HostLost { reason: Some(error.to_string()) }.into(),
     };
     if host != worker {
         // The host learns the mismatch from our Hello.
         let _ = sender.send(WorkerMessage::Hello {
             build: worker.clone(),
         });
-        return WorkerExit::BuildMismatch { host, worker };
+        return WorkerExit::BuildMismatch { host, worker }.into();
     }
     let (manifest, unprepared) = match receiver.receive() {
         Ok(Some(HostMessage::Load {
             manifest,
             unprepared,
         })) => (manifest, unprepared),
-        Ok(Some(HostMessage::Prepare { manifest })) => return prepare_only(manifest, sender),
+        Ok(Some(HostMessage::Prepare { manifest })) => return prepare_only(manifest, sender).into(),
         Ok(Some(HostMessage::Measure { request })) => {
-            return measure::measure_only(request, sender)
+            return measure::measure_only(request, sender).into()
         }
         Ok(Some(_)) => {
-            return WorkerExit::ProtocolViolation("expected Load, Prepare or Measure".into())
+            return WorkerExit::ProtocolViolation("expected Load, Prepare or Measure".into()).into()
         }
-        Ok(None) => return WorkerExit::HostLost { reason: None },
-        Err(error) => {
-            return WorkerExit::HostLost {
-                reason: Some(error.to_string()),
-            }
-        }
+        Ok(None) => return WorkerExit::HostLost { reason: None }.into(),
+        Err(error) => return WorkerExit::HostLost { reason: Some(error.to_string()) }.into(),
     };
     serve(manifest, unprepared, receiver, Box::new(sender))
+}
+
+/// How a worker's serving ended: its exit, and the load it served, if it
+/// loaded one: stopped, every durable effect it owed made
+/// (`magnitude_executor::settle`), a shutdown answered. Dropping it joins
+/// the load's teardown; a worker process instead ends with
+/// [`Self::end_process`], cutting that teardown short.
+#[must_use]
+pub struct Served {
+    pub exit: WorkerExit,
+    /// Held for its drop, which joins the load's teardown.
+    _loaded: Option<Loaded>,
+}
+
+impl From<WorkerExit> for Served {
+    fn from(exit: WorkerExit) -> Self {
+        Self { exit, _loaded: None }
+    }
+}
+
+impl Served {
+    /// End this worker process with `code`. A process that served a load
+    /// ends at once: what the load still holds is released by the process's
+    /// end, as by a kill, with no teardown of its own, which on CUDA takes
+    /// longer than the kernel's. Any other exits normally, its exit handlers
+    /// run (a Prepare's leave the system's compiled-kernel caches written).
+    pub fn end_process(self, code: i32) -> ! {
+        match self._loaded {
+            Some(_) => magnitude_service_utils::process::end(code),
+            None => std::process::exit(code),
+        }
+    }
 }
 
 /// A Prepare: search the tuning units of `manifest`'s model the kernel cache
@@ -208,13 +232,13 @@ fn serve(
     unprepared: UnpreparedUnits,
     receiver: impl MessageReceiver<HostMessage>,
     sender: Box<dyn MessageSender<WorkerMessage>>,
-) -> WorkerExit {
+) -> Served {
     let outbound: Outbound = Arc::new(Mutex::new(sender));
     let hello = WorkerMessage::Hello {
         build: EngineBuild::current(),
     };
     if let Err(error) = outbound.lock().unwrap().send(hello) {
-        return WorkerExit::TransportFailed(error.to_string());
+        return WorkerExit::TransportFailed(error.to_string()).into();
     }
     let signal = Arc::new(Signal::default());
     // Host messages that arrive during the load wait in the session inbox.
@@ -222,9 +246,10 @@ fn serve(
     match load(manifest, unprepared, &outbound) {
         Ok(LoadAttempt::Loaded((loaded, ready))) => {
             if let Err(error) = outbound.lock().unwrap().send(WorkerMessage::Ready { ready }) {
-                return WorkerExit::TransportFailed(error.to_string());
+                return WorkerExit::TransportFailed(error.to_string()).into();
             }
-            Session::new(outbound, signal, loaded).run()
+            let (exit, loaded) = Session::new(outbound, signal, loaded).run();
+            Served { exit, _loaded: Some(loaded) }
         }
         // Nothing of the model was placed, and everything the attempt
         // opened was dropped before this answer.
@@ -232,7 +257,8 @@ fn serve(
         {
             Ok(()) => WorkerExit::Unprepared,
             Err(transport) => WorkerExit::TransportFailed(transport.to_string()),
-        },
+        }
+        .into(),
         Err(error) => {
             let failed = WorkerMessage::LoadFailed {
                 error: error.clone(),
@@ -241,6 +267,7 @@ fn serve(
                 Ok(()) => WorkerExit::LoadFailed(error),
                 Err(transport) => WorkerExit::TransportFailed(transport.to_string()),
             }
+            .into()
         }
     }
 }

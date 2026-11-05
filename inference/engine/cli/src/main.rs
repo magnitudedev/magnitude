@@ -319,14 +319,15 @@ fn main() {
             eprintln!("magnitude-engine: {error}");
             std::process::exit(1);
         }
-        let exit = serve_worker(stdio_worker_transport());
-        std::process::exit(match exit {
+        let served = serve_worker(stdio_worker_transport());
+        let code = match &served.exit {
             WorkerExit::Prepared | WorkerExit::Shutdown => 0,
             exit => {
                 eprintln!("magnitude-engine: worker ended: {exit:?}");
                 1
             }
-        });
+        };
+        served.end_process(code);
     }
     if let Err(error) = run() {
         eprintln!("magnitude-engine: {error}");

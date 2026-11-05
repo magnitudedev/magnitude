@@ -518,6 +518,9 @@ mod tests {
             Ok(())
         }
         fn shutdown(&self) {}
+        fn answered_shutdown(&self) -> bool {
+            false
+        }
     }
 
     const GIB: u64 = 1 << 30;

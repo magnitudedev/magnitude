@@ -216,8 +216,9 @@ impl Session {
         self.outbound.lock().unwrap().send(message)
     }
 
-    /// Serve the connection until shutdown, host loss or unload.
-    pub fn run(mut self) -> WorkerExit {
+    /// Serve the connection until shutdown, host loss or unload; then the
+    /// load, stopped, its durable effects made, still holding the device.
+    pub fn run(mut self) -> (WorkerExit, Loaded) {
         loop {
             let inbound = self.signal.wait();
             for inbound in inbound {
@@ -241,17 +242,26 @@ impl Session {
         }
     }
 
-    fn finish(mut self, exit: WorkerExit) -> WorkerExit {
-        // Dropping receivers cancels their requests; closing the execution
-        // owner then releases the device.
+    /// Stop the load: dropping receivers cancels their requests, then
+    /// execution stops with every durable effect of the load made
+    /// (`magnitude_executor::settle`). Only then is a shutdown answered, so
+    /// its answer means nothing remains but releasing what the load holds.
+    fn finish(mut self, exit: WorkerExit) -> (WorkerExit, Loaded) {
         self.admissions.clear();
         self.streams.clear();
         self.unanswered.clear();
         self.room = None;
         self.statuses.clear();
         self.observations.clear();
-        self.loaded.execution.close();
-        exit
+        self.loaded.execution.stop();
+        let exit = match exit {
+            WorkerExit::Shutdown => match self.send(WorkerMessage::Unloaded { cause: UnloadCause::Shutdown }) {
+                Ok(()) => WorkerExit::Shutdown,
+                Err(error) => WorkerExit::TransportFailed(error.to_string()),
+            },
+            exit => exit,
+        };
+        (exit, self.loaded)
     }
 
     fn dispatch(
@@ -342,12 +352,8 @@ impl Session {
                 self.unanswer(WorkerCommand::ReleaseMeasurementRoom);
             }
             HostMessage::Reprice => self.unanswer(WorkerCommand::Reprice),
-            HostMessage::Shutdown => {
-                self.send(WorkerMessage::Unloaded {
-                    cause: UnloadCause::Shutdown,
-                })?;
-                return Ok(Flow::Exit(WorkerExit::Shutdown));
-            }
+            // Answered once the load has stopped (`Session::finish`).
+            HostMessage::Shutdown => return Ok(Flow::Exit(WorkerExit::Shutdown)),
         }
         Ok(Flow::Continue)
     }

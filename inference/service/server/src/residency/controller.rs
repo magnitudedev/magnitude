@@ -55,10 +55,13 @@ use crate::worker_process::WorkerLauncher;
 
 /// How long a ready instance with no lease stays resident.
 pub const MODEL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
-/// How long a released worker has to unload and exit before it is killed.
+/// How long a released worker has to answer its shutdown before it is killed: to end every
+/// request it holds and make every durable effect of its load. Its process then ends at once,
+/// and the system's release of what it held is waited for however long it takes, as a kill's
+/// is: a kill cannot shorten it.
 pub(crate) const GRACEFUL_EXIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// The same bound for an explicit stop, which must end active execution promptly.
-const INTERRUPTED_EXIT: std::time::Duration = std::time::Duration::from_millis(500);
+const INTERRUPTED_ANSWER: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// A ready instance's engine: its host chat semantics and its worker client. A lease hands it
 /// out; the protocol layer binds requests to it. It holds its resolved configuration, so
@@ -883,23 +886,24 @@ impl ModelResidencyDriver for EngineResidency {
         let notifier = self.client.notifier();
         magnitude_service_utils::owner::spawn("a worker's release", async move {
             // Shutdown first in every case: the worker ends its open requests with
-            // `ModelUnloaded { Shutdown }` (`model_instance_stopped`) before it exits. An
-            // interrupted release then kills it after a short bound instead of the graceful one.
+            // `ModelUnloaded { Shutdown }` (`model_instance_stopped`), then its process ends. An
+            // interrupted release bounds its answer by the short bound instead of the graceful
+            // one.
             worker.shutdown();
-            let mut deadline = tokio::time::Instant::now()
-                + if interrupt_immediately { INTERRUPTED_EXIT } else { GRACEFUL_EXIT };
-            // Once killed, the worker is polled until the kernel reaps it, however long that
-            // takes: the release ends only with its retirement shown, and nothing waits on it.
+            let mut deadline = tokio::time::Instant::now() + if interrupt_immediately { INTERRUPTED_ANSWER } else { GRACEFUL_EXIT };
+            // Once it answered, or once killed, the worker is polled until the kernel reaps it,
+            // however long that takes: the release ends only with its retirement shown, and
+            // nothing waits on it.
             let mut killed = false;
             let result = loop {
                 match worker.try_wait() {
                     Ok(Some(_)) => break Ok(()),
-                    Ok(None) if killed || tokio::time::Instant::now() < deadline => {
+                    Ok(None) if killed || worker.answered_shutdown() || tokio::time::Instant::now() < deadline => {
                         tokio::select! {
                             biased;
                             changed = interruption.changed() => {
                                 if changed.is_ok() && *interruption.borrow() {
-                                    deadline = deadline.min(tokio::time::Instant::now() + INTERRUPTED_EXIT);
+                                    deadline = deadline.min(tokio::time::Instant::now() + INTERRUPTED_ANSWER);
                                 }
                             }
                             () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
@@ -907,7 +911,7 @@ impl ModelResidencyDriver for EngineResidency {
                     }
                     Ok(None) => match worker.terminate(
                         "worker_unresponsive",
-                        "inference worker did not exit after shutdown",
+                        "inference worker did not answer its shutdown",
                     ) {
                         Ok(()) => killed = true,
                         Err(error) => {

@@ -109,6 +109,9 @@ struct State {
     /// ends after that ends for the stop, however the worker's end came (its own unload, or
     /// its kill once it overran its exit).
     shutting_down: bool,
+    /// The worker itself answered that its model is unloaded: its process is ending by its own
+    /// choice, unlike a connection that merely closed.
+    unloaded: bool,
 }
 
 impl State {
@@ -226,6 +229,7 @@ impl State {
                 }
             }
             WorkerMessage::Unloaded { cause } => {
+                self.unloaded = true;
                 self.close(RequestError::ModelUnloaded { cause });
             }
             WorkerMessage::Hello { .. }
@@ -431,6 +435,11 @@ pub(super) fn receive<E>(
 impl EngineClient {
     pub fn ready_info(&self) -> &ReadyInfo {
         &self.connection.ready
+    }
+
+    /// Whether the worker itself answered that its model is unloaded ([`State::unloaded`]).
+    pub fn unloaded(&self) -> bool {
+        self.connection.state.lock().unwrap().unloaded
     }
 
     /// `Ok` while the worker serves; otherwise why it stopped.

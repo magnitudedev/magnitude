@@ -212,6 +212,8 @@ pub struct StoredTable {
     /// What resizes reserved slots (`StoredSlots::Reserved`); none of slots
     /// allocated whole.
     resizer: Mutex<Option<seismic::Resizer>>,
+    /// Whether the kept rows were written as the load settled.
+    settled: crate::settle::Once,
 }
 
 struct Job {
@@ -476,6 +478,7 @@ impl StoredTable {
             filler: Some(filler),
             queued: Mutex::new(0),
             resizer: Mutex::new(resizer),
+            settled: Default::default(),
         })
     }
 
@@ -668,8 +671,18 @@ impl Drop for StoredTable {
         if let Some(filler) = self.filler.take() {
             let _ = filler.join();
         }
-        let state = self.shared.state.lock().expect("stored table lock");
-        self.shared.keep(&state);
+        crate::settle::Owed::settle(self);
+    }
+}
+
+/// The rows its steps named are kept for the next load, once: as the load
+/// settles, or else as the table drops.
+impl crate::settle::Owed for StoredTable {
+    fn settle(&self) {
+        if self.settled.first() {
+            let state = self.shared.state.lock().expect("stored table lock");
+            self.shared.keep(&state);
+        }
     }
 }
 

@@ -53,6 +53,7 @@ pub use programs::{
 };
 pub mod platform;
 mod residency;
+pub mod settle;
 mod resident_weights;
 mod resources;
 
