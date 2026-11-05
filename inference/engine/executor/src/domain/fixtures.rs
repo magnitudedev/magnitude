@@ -32,8 +32,12 @@ use std::sync::{Arc, Mutex};
 /// (each fixture opens its own device, and tests run side by side in one
 /// process, on one GPU), and a release the device makes (a bank's shrink)
 /// is room the next reading sees, as the machine's would once the host
-/// takes it back. Another program's hold on a store ([`Press`]) takes its
-/// bytes of the room left there while it lasts.
+/// takes it back. Each process limit enforced against charged memory (a
+/// cgroup's, a Windows job's commit) moves with the device's charges to
+/// host RAM the same way; an address-space or data-segment limit counts the
+/// reservation, which a resize keeps. Another program's hold on a store
+/// ([`Press`]) takes its bytes of the room left there while it lasts, and,
+/// sharing the process's cgroups, of what each cgroup limit has left.
 struct StillHost {
     device: Rc<seismic::Device>,
     topology: std::sync::Arc<seismic::DeviceTopology>,
@@ -97,10 +101,14 @@ impl StatusReading for StillHost {
         // `left` of `store`, less what the device took of it since the first
         // reading and what another program holds of it now.
         let pressed = self.pressed.borrow();
+        let held = |store| pressed.get(&store).copied().unwrap_or(0);
         let moved = |left: u64, store| {
-            (left + charged(&self.charged, store))
-                .saturating_sub(charged(&now, store))
-                .saturating_sub(pressed.get(&store).copied().unwrap_or(0))
+            (left + charged(&self.charged, store)).saturating_sub(charged(&now, store) + held(store))
+        };
+        // `used` of a limit on `store`, plus what the device took of it since
+        // the first reading and what another program sharing it holds.
+        let used = |used: u64, store, held: u64| {
+            (used + charged(&now, store) + held).saturating_sub(charged(&self.charged, store))
         };
         let topology = &self.topology;
         let seismic::Status { mut sample, mut runtime } = self.first.clone();
@@ -120,6 +128,15 @@ impl StatusReading for StillHost {
             let store = topology.host_ram().id();
             host.allocatable.value = moved(host.allocatable.value, store);
             host.obtainable.value = moved(host.obtainable.value, store);
+            for limit in &mut host.limits {
+                limit.used_bytes = match limit.kind {
+                    seismic::ProcessLimitKind::CgroupV1 { .. } | seismic::ProcessLimitKind::CgroupV2 { .. } => {
+                        used(limit.used_bytes, store, held(store))
+                    }
+                    seismic::ProcessLimitKind::WindowsJobProcess => used(limit.used_bytes, store, 0),
+                    seismic::ProcessLimitKind::AddressSpace | seismic::ProcessLimitKind::DataSegment => limit.used_bytes,
+                };
+            }
         }
         for (path, grant) in sample.grants.iter_mut().chain(runtime.grants.iter_mut()) {
             if let Ok(grant) = grant {
