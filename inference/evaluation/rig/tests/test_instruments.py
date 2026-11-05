@@ -1144,6 +1144,19 @@ def test_a_served_run_on_vulkan_hides_cuda_and_fails_when_the_service_selects_an
     assert not answer.ok and "did not select vulkan" in answer.lines[0]
 
 
+def test_a_served_run_counts_overlapping_workers_from_the_services_own_records():
+    """Workers counted from the service's start and exit records, in their order: a start before
+    the last worker's exit is two at once, however briefly; one after it is one."""
+    from magnitude_rig.host.served import most_workers
+    line = "2026-11-05T09:38:58.138001Z  INFO tokio-rt-worker magnitude_service_server::residency::worker: "
+    started = lambda pid: f"{line}inference worker started worker.pid={pid}\n"
+    exited = lambda pid: f"{line}inference worker exited worker.pid={pid} status=signal: 9 (SIGKILL)\n"
+    relayed = f"{line}inference worker worker.pid=7 message=inference worker ended: Shutdown\n"
+    assert most_workers(started(7) + relayed + exited(7) + started(8) + exited(8)) == 1
+    assert most_workers(started(7) + started(8) + exited(7) + exited(8)) == 2
+    assert most_workers("") == 0
+
+
 def test_a_header_export_names_a_models_components_by_its_whole_reference(tmp_path):
     from magnitude_rig.host.__main__ import _header_artifacts
     file = {"repository": "owner/repo", "revision": "r"}

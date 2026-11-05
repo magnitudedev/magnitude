@@ -58,6 +58,12 @@ pub fn run_inference_worker() -> i32 {
 /// How long a load failure waits for an ended worker's exit status.
 const EXIT_OBSERVATION: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Record a worker's start as it is spawned: with its exit ([`log_exit`]), the service's record
+/// of which workers ran when.
+fn log_start(pid: u32) {
+    tracing::info!(worker.pid = pid, "inference worker started");
+}
+
 /// Record a worker's exit once, when its retirement is first observed: a crash (on Windows an
 /// NTSTATUS such as 0xc0000005) is otherwise visible nowhere.
 fn log_exit(pid: u32, status: ExitStatus) {
@@ -147,6 +153,7 @@ impl EngineWorker {
             stderr,
         } = launcher.spawn_blocking_io(command)?;
         let pid = process_id(&process);
+        log_start(pid);
         let worker = Arc::new(Self {
             process: Mutex::new(Some(ProcessState::Owned {
                 process,
@@ -311,6 +318,7 @@ impl JobWorker {
             stderr,
         } = launcher.spawn_blocking_io(command)?;
         let pid = process_id(&process);
+        log_start(pid);
         let worker = Self {
             process,
             diagnostics: Arc::new(Mutex::new(DiagnosticTail::default())),

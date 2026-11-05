@@ -446,37 +446,25 @@ def parted(answer: dict, reference: dict) -> int | None:
     return at
 
 
-class Workers:
-    """The service's inference workers, sampled until stopped: the most that ran at once."""
+# The service's records of its inference workers: each one's start, logged as it is spawned, and
+# its exit, logged once the service has shown it reaped.
+WORKER = re.compile(r"inference worker (started|exited) worker\.pid=(\d+)")
 
-    def __init__(self, service: Service) -> None:
-        self.pid, self.most, self.running = service.process.pid, 0, True
-        self.thread = threading.Thread(target=self.sample, daemon=True)
-        self.thread.start()
 
-    def count(self) -> int:
-        table = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,command="], capture_output=True, text=True).stdout
-        rows = [line.split(None, 2) for line in table.splitlines() if line.strip()]
-        children: dict[int, list[tuple[int, str]]] = {}
-        for row in rows:
-            if len(row) == 3:
-                children.setdefault(int(row[1]), []).append((int(row[0]), row[2]))
-        found, pending = 0, [self.pid]
-        while pending:
-            for pid, command in children.get(pending.pop(), []):
-                found += "inference-worker" in command
-                pending.append(pid)
-        return found
-
-    def sample(self) -> None:
-        while self.running:
-            self.most = max(self.most, self.count())
-            time.sleep(0.05)
-
-    def stop(self) -> int:
-        self.running = False
-        self.thread.join()
-        return self.most
+def most_workers(log: str) -> int:
+    """The most inference workers the service ran at once, by its own records in the order it
+    wrote them. A start is recorded right after the spawn returns and an exit only once the reap
+    is shown, so an overlap is missed only if it is shorter than the moment between a spawn and
+    its record."""
+    live: set[str] = set()
+    most = 0
+    for event, pid in WORKER.findall(log):
+        if event == "started":
+            live.add(pid)
+            most = max(most, len(live))
+        else:
+            live.discard(pid)
+    return most
 
 
 def stop_prepare(run: Run) -> None:
@@ -485,7 +473,6 @@ def stop_prepare(run: Run) -> None:
     inference workers run."""
     service = Service(run, "stop-prepare", run.capped)
     model = service.model(run.arguments.model)
-    workers = Workers(service)
     first, cold = in_thread(lambda: service.load(model))
     end = time.monotonic() + LOAD_SECONDS
     while '"optimizing"' not in (state := json.dumps(service.instances())):
@@ -509,9 +496,12 @@ def stop_prepare(run: Run) -> None:
     if "error" in next_load:
         raise Failed(f"the load queued behind the stop: {next_load['error']}")
     answer = service.chat(model, run.messages)
-    most = workers.stop()
-    run.note("queued load's answer", seconds=answer["seconds"], text=answer["text"][:60], most_workers=most)
+    run.note("queued load's answer", seconds=answer["seconds"], text=answer["text"][:60])
     run.note("service ended", code=service.end())
+    most = most_workers(service.log_path.read_text(errors="replace"))
+    run.note("workers", most_at_once=most)
+    if most == 0:
+        raise Failed("the service recorded no inference worker's start")
     if most > 1:
         raise Failed(f"{most} inference workers ran at once")
 
