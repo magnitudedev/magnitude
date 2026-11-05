@@ -3279,7 +3279,7 @@ fn encode(first: &NativePrepared, work: &Encoding<'_, impl DispatchList>) -> Res
                             // waits for nothing.
                             let budget = first.public_device.native.graph_budget();
                             let taken = schedules.record(std::slice::from_ref(&shaped), budget, retained, |_| Ok(derive()))?;
-                            schedules.replay(&shaped, taken[0], |_| unreachable!("a schedule binds no parameter"), |schedule| scheduled(schedule))?
+                            schedules.replay(&shaped, taken[0], |_, _| unreachable!("a schedule binds no parameter"), |schedule| scheduled(schedule))?
                         }
                         None => scheduled(&derive())?,
                     }
@@ -3604,20 +3604,24 @@ mod tests {
 
 /// One sealed plan's run in a submission ([`DispatchList::runs`]): the
 /// plan, what its graphs are keyed by (`graph::PlanShape`), the run's calls,
-/// from its first call where its timeline nodes sit, each of which ends a
-/// graph whether or not the run binds it, and where the span marks its graphs
-/// hold sit, and whether its plan is launched
-/// (`NativeGraphDraft::seal_launched`).
+/// its timeline nodes, each where it sits from the run's first call (where
+/// graphs hold none, each ends a graph whether or not the run binds it,
+/// [`graph_segments`]), where the span marks its graphs hold sit, whether
+/// its plan is launched (`NativeGraphDraft::seal_launched`), and whether
+/// its graph holds its timeline nodes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlanRun {
     pub(crate) plan: u64,
     pub(crate) layout: u64,
     pub(crate) calls: Range<usize>,
-    pub(crate) bounds: Vec<usize>,
+    pub(crate) timelines: Vec<(usize, timeline::TimelineNode)>,
     /// The span marks inside its graphs, each the call it precedes, in
     /// order (`NativeGraphPlan::held_marks`).
     pub(crate) marks: Vec<usize>,
     pub(crate) launched: bool,
+    /// Whether its graph holds the timeline nodes inside it, as nodes of
+    /// its own (`NativeGraphPlan::holds_timelines`).
+    pub(crate) holds_timelines: bool,
     /// The words of its layout's graph on its slot ([`LayoutForms`]), a
     /// word per call of the run.
     pub(crate) form: Arc<[u64]>,
@@ -3625,27 +3629,36 @@ pub(crate) struct PlanRun {
 
 /// The calls of `list` a graph each, every range with the boundary that
 /// ends it: those between timeline operations and, where the list is made
-/// of `runs`, between runs and at each run's timeline nodes (a graph is one
-/// run's, divided where its plan may bind a timeline, so a run binding none
-/// there divides alike), from a leading empty range for the operations
-/// before the first call to the range ending at the list's end. A boundary
-/// that divides only runs or unbound nodes has no timeline operations. A
-/// stamp divides only where no graph holds its mark ([`PlanRun::marks`]):
-/// at a run's edges and in lists launched one by one, where it falls between
-/// launches on the stream and a graph is not cut.
+/// of `runs`, between runs and at each run's timeline nodes its graphs do
+/// not hold (a graph is one run's, divided where its plan may bind a
+/// timeline, so a run binding none there divides alike), from a leading
+/// empty range for the operations before the first call to the range
+/// ending at the list's end. A boundary that divides only runs or unbound
+/// nodes has no timeline operations. A run whose graph holds the timeline
+/// nodes inside it ([`PlanRun::holds_timelines`]) is not divided at them.
+/// A stamp divides only where no graph holds
+/// its mark ([`PlanRun::marks`]): at a run's edges and in lists launched one
+/// by one, where it falls between launches on the stream and a graph is not
+/// cut.
 pub(super) fn graph_segments(list: &impl DispatchList, runs: Option<&[PlanRun]>) -> Vec<(Range<usize>, usize)> {
+    let runs = runs.unwrap_or_default();
     let starts = runs
-        .into_iter()
-        .flatten()
-        .flat_map(|run| std::iter::once(run.calls.start).chain(run.bounds.iter().map(|bound| run.calls.start + bound)))
+        .iter()
+        .flat_map(|run| {
+            let bounds = run.timelines.iter().filter(|_| !run.holds_timelines);
+            std::iter::once(run.calls.start).chain(bounds.map(|&(position, _)| run.calls.start + position))
+        })
         .collect::<std::collections::BTreeSet<_>>();
     let mut segments = Vec::new();
     let mut first = 0;
     for boundary in 0..=list.count() {
         let divides = boundary > first && starts.contains(&boundary);
-        let held = || runs.into_iter().flatten().any(|run| run.holds(boundary));
+        let inside = || runs.iter().find(|run| run.inside(boundary));
+        let held = || inside().is_some_and(|run| run.holds(boundary));
         let stamped = !list.stamps(boundary).is_empty() && !held();
-        if boundary == list.count() || !list.timelines(boundary).is_empty() || stamped || divides {
+        let timelines = !list.timelines(boundary).is_empty()
+            && !inside().is_some_and(|run| run.holds_timelines);
+        if boundary == list.count() || timelines || stamped || divides {
             segments.push((first..boundary, boundary));
             first = boundary;
         }
@@ -3654,9 +3667,28 @@ pub(super) fn graph_segments(list: &impl DispatchList, runs: Option<&[PlanRun]>)
 }
 
 impl PlanRun {
+    /// Whether `boundary` of the list lies inside the run, between two of
+    /// its calls.
+    fn inside(&self, boundary: usize) -> bool {
+        self.calls.start < boundary && boundary < self.calls.end
+    }
+
     /// Whether a graph of the run holds its marks at `boundary` of the list.
     fn holds(&self, boundary: usize) -> bool {
-        self.calls.contains(&boundary) && self.marks.binary_search(&(boundary - self.calls.start)).is_ok()
+        self.inside(boundary) && self.marks.binary_search(&(boundary - self.calls.start)).is_ok()
+    }
+
+    /// The run's timeline nodes its graph of `calls` holds, each the call of
+    /// the list it precedes, with what it does, in order: those strictly
+    /// inside the graph, of a run whose graph holds them.
+    pub(super) fn held_timelines<'a>(&'a self, calls: &Range<usize>) -> impl Iterator<Item = (usize, timeline::TimelineNode)> + 'a {
+        let inside = calls.start + 1..calls.end;
+        let start = self.calls.start;
+        self.timelines
+            .iter()
+            .filter(move |_| self.holds_timelines)
+            .map(move |&(position, node)| (start + position, node))
+            .filter(move |(at, _)| inside.contains(at))
     }
 }
 

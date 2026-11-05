@@ -315,14 +315,15 @@ impl<G: RecordedGraph> Replays<G> {
 
     /// Run `replay` with graph `identity` of `shaped`'s shape, which
     /// [`Self::record`] chose for this run, having first run `update` on it
-    /// where it binds other parameters than `shaped`'s: on CUDA the changed
-    /// launches' parameters set and their enable bits, on Vulkan their
-    /// argument blocks rewritten in queue order.
+    /// where it binds other parameters than `shaped`'s, given those it binds
+    /// where known: on CUDA the changed launches' parameters set and their
+    /// enable bits, and its words, on Vulkan their argument blocks rewritten
+    /// in queue order.
     pub(crate) fn replay(
         &self,
         shaped: &Shaped,
         identity: u64,
-        update: impl FnOnce(&mut G) -> Result<(), CallError>,
+        update: impl FnOnce(&mut G, Option<&[u64]>) -> Result<(), CallError>,
         replay: impl FnOnce(&mut G) -> Result<(), CallError>,
     ) -> Result<(), CallError> {
         let mut entries = self
@@ -340,8 +341,8 @@ impl<G: RecordedGraph> Replays<G> {
         if instance.bound.as_ref() != Some(&shaped.bound) {
             // Unknown until the update is queued: a failure in it leaves the
             // graph to be updated whole.
-            instance.bound = None;
-            update(&mut instance.graph)?;
+            let bound = instance.bound.take();
+            update(&mut instance.graph, bound.as_deref())?;
             instance.bound = Some(shaped.bound.clone());
             self.count_updated(&shaped.key);
         }
@@ -502,7 +503,7 @@ mod tests {
         let mut bound = Vec::new();
         for (run, &identity) in runs.iter().zip(&taken) {
             replays
-                .replay(run, identity, |graph| Ok(graph.1.clone_from(&run.bound)), |graph| Ok(bound.push(graph.1.clone())))
+                .replay(run, identity, |graph, _| Ok(graph.1.clone_from(&run.bound)), |graph| Ok(bound.push(graph.1.clone())))
                 .unwrap();
         }
         bound
@@ -633,7 +634,7 @@ mod tests {
         distinct.dedup();
         assert_eq!(distinct.len(), PLACES as usize, "each run in flight takes a graph of its own");
         for (run, &identity) in chain.iter().zip(&taken) {
-            replays.replay(run, identity, |graph| Ok(graph.1.clone_from(&run.bound)), |_| Ok(())).unwrap();
+            replays.replay(run, identity, |graph, _| Ok(graph.1.clone_from(&run.bound)), |_| Ok(())).unwrap();
         }
         assert_eq!(replays.counts(), GraphReplays { recorded: PLACES, updated: PLACES });
     }
@@ -648,7 +649,7 @@ mod tests {
         let (first, second) = (shaped(0, 1), shaped(0, 2));
         submit(&replays, std::slice::from_ref(&first), budget, |_| ());
         let taken = replays.record(std::slice::from_ref(&second), budget, &retained(), |_| unreachable!()).unwrap();
-        replays.replay(&second, taken[0], |graph| Ok(graph.1.clone_from(&second.bound)), |_| Ok(())).unwrap();
+        replays.replay(&second, taken[0], |graph, _| Ok(graph.1.clone_from(&second.bound)), |_| Ok(())).unwrap();
         replays.unbind(std::slice::from_ref(&second), |graph| graph.1.clear());
         let updates = std::cell::Cell::new(0);
         let count = |graph: &mut Graph<true>, run: &Shaped| {
@@ -656,11 +657,11 @@ mod tests {
             graph.1.clone_from(&run.bound);
             Ok(())
         };
-        replays.replay(&second, taken[0], |graph| count(graph, &second), |_| Ok(())).unwrap();
+        replays.replay(&second, taken[0], |graph, _| count(graph, &second), |_| Ok(())).unwrap();
         assert_eq!(updates.get(), 1, "updated again after the failed submission");
-        let failed = replays.replay(&first, taken[0], |_| Err(CallError::Workflow(crate::api::WorkflowError::Empty)), |_| Ok(()));
+        let failed = replays.replay(&first, taken[0], |_, _| Err(CallError::Workflow(crate::api::WorkflowError::Empty)), |_| Ok(()));
         assert!(failed.is_err());
-        replays.replay(&first, taken[0], |graph| count(graph, &first), |_| Ok(())).unwrap();
+        replays.replay(&first, taken[0], |graph, _| count(graph, &first), |_| Ok(())).unwrap();
         assert_eq!(updates.get(), 2, "updated again after its own failure");
     }
 }

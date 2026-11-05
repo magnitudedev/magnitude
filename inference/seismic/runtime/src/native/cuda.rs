@@ -1,8 +1,9 @@
 //! CUDA submission of native dispatch lists.
 //!
 //! A submission of sealed graph runs (one run, or a sequence of runs
-//! submitted together) replays CUDA graphs: one per run's calls between
-//! timeline boundaries, launched with one driver call. A graph is keyed by
+//! submitted together) replays CUDA graphs: one per run, launched with one
+//! driver call, which holds the timeline nodes inside the run as nodes of
+//! its own. A graph is keyed by
 //! its shape (`ReplayKeys`): the run's layout, the calls' place in it and
 //! the launches its slot's graph of the layout holds (`LayoutForms`: every
 //! launch any plan of the layout the slot runs makes), never the class or
@@ -14,6 +15,13 @@
 //! arguments: host-written inputs are written into each run's upload region,
 //! which the graph addresses. A graph's launches run in stream order, a
 //! chain.
+//!
+//! A timeline node inside a run (`graph_segments`) is a node of its graph,
+//! in its chain (`timeline_nodes`): a wait on a gate's host word, or a write
+//! of a signal's, each bound to the run's word and value as its launches
+//! are (`DirectGraph::bind_word`), so a block's run is one graph whatever
+//! parks, publications and waits it holds. A write's waiters wake as it
+//! lands (`DirectBatch::replay`).
 //!
 //! Graphs are instantiated only as a graph slot is created
 //! ([`instantiate`]), a graph of each layout for each run of it its launch
@@ -42,13 +50,13 @@
 //! end events of the other stream's submissions it must follow by what it
 //! touches (`Allocation::queue_order`, `cuStreamWaitEvent`).
 //!
-//! A timeline boundary (`timeline`) divides the calls: those between two
-//! boundaries replay a graph of their own, and at the boundary the stream
-//! waits on a gate's host word (`cuStreamWaitValue32`) or writes a signal's
+//! A timeline boundary between runs, or in a list launched call by call
+//! (`timeline`), divides the calls: at it the stream waits on a gate's host
+//! word (`cuStreamWaitValue32`) or writes a signal's
 //! (`cuStreamWriteValue32`).
 
 use super::graph_replays::{Replays, Shaped};
-use super::timeline::{TimelineAction, TimelineKind, TimelineOperation};
+use super::timeline::{TimelineAction, TimelineKind, TimelineNode, TimelineOperation};
 use super::{graph_segments, DispatchList, EncodeFailure, Encoding, NativeRoute, ReplayKeys};
 use crate::completion::Committed;
 use seismic_cuda::NativeStream;
@@ -57,7 +65,8 @@ use crate::api::CallError;
 use crate::driver::{Allocation, typed_buffer};
 use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::graph_cost::GraphCensus;
-use seismic_cuda::direct::{DirectBatch, DirectGraph, DirectGraphBuilder, DirectLaunch};
+use seismic_cuda::direct::{DirectBatch, DirectGraph, DirectGraphBuilder, DirectLaunch, HostWord};
+use seismic_lang::registry::BackendName;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -149,17 +158,21 @@ fn issue(
     let encoded = list.encoded();
     match list.runs().filter(|_| !timed) {
         Some(runs) => {
-            // Each run's calls between timeline nodes are one graph of their
-            // shape, instantiated with the run's slot
+            // Each run's calls are one graph of their shape, its timeline
+            // nodes inside it, instantiated with the run's slot
             // ([`instantiate`]), except a launched plan's, launched call by
-            // call in their place; the stream waits on or writes the
-            // boundaries' words between graphs.
+            // call in their place; the stream waits on or writes the words
+            // of the boundaries between graphs.
             let segments = graph_segments(list, Some(&runs));
             let keys = ReplayKeys { runs, encoded: None };
-            let (graphed, shaped): (Vec<Range<usize>>, Vec<Shaped>) = segments
+            let (graphed, shaped): (Vec<_>, Vec<Shaped>) = segments
                 .iter()
                 .filter(|(calls, _)| !calls.is_empty() && !keys.launched(calls))
-                .map(|(calls, _)| (calls.clone(), shaped(list, &keys, calls, &encoded)))
+                .map(|(calls, _)| {
+                    let words = held_operations(list, &keys, calls);
+                    let shaped = shaped(list, &keys, calls, &encoded, &words);
+                    ((calls.clone(), words), shaped)
+                })
                 .unzip();
             // Serving never instantiates: a graph its slots lack is a gap in
             // their census.
@@ -175,33 +188,24 @@ fn issue(
                     if !calls.is_empty() && keys.launched(calls) {
                         launch(batch, list, calls.clone(), &encoded)?;
                     } else if !calls.is_empty() {
-                        let ((calls, shaped), &identity) = graphs.next().expect("a graph per segment of calls");
+                        let (((calls, words), shaped), &identity) = graphs.next().expect("a graph per segment of calls");
                         replays.replay(
                             shaped,
                             identity,
                             // The graph's launches, in the order its nodes
                             // were added, bound to this run's storage and
-                            // run where encoded.
-                            |graph| {
-                                let form = keys.form(calls);
-                                let mut node = 0;
-                                each_launch(list, calls.clone(), &encoded, |index, ordinal, launch, runs| {
-                                    if !holds(form[index - calls.start], ordinal) {
-                                        assert!(launch.is_none(), "a run makes only launches its layout's graph holds");
-                                        return Ok(());
-                                    }
-                                    match launch {
-                                        Some(launch) => graph.bind(device, node, launch, runs)?,
-                                        // Another plan of the layout makes it.
-                                        None => graph.disable(node)?,
-                                    }
-                                    node += 1;
-                                    Ok(())
-                                })
-                                .map_err(CallError::Execution)?;
-                                assert_eq!(node, graph.nodes(), "a shape's launches are its graph's nodes");
-                                let stamped = keys.stamps(list, calls).into_iter().map(|stamp| (cuda_stamps(stamp), stamp.mark));
-                                graph.sample(&stamped.collect::<Vec<_>>()).map_err(CallError::Execution)
+                            // run where encoded, unless they bind what they
+                            // bound before; then its words, to this run's.
+                            |graph, before| {
+                                let launches = shaped.bound.len() - 2 * words.len();
+                                if before.is_none_or(|before| before.get(..launches) != shaped.bound.get(..launches)) {
+                                    bind_launches(device, graph, list, &keys, calls, &encoded)?;
+                                }
+                                assert_eq!(words.len(), graph.words(), "a run's timeline nodes are its graph's words");
+                                for (index, &(word, value)) in words.iter().enumerate() {
+                                    graph.bind_word(index, word, value).map_err(CallError::Execution)?;
+                                }
+                                Ok(())
                             },
                             |graph| batch.replay(graph).map_err(CallError::Execution),
                         )?;
@@ -224,6 +228,86 @@ fn issue(
     Ok(())
 }
 
+/// Bind `graph`'s launches, in the order its nodes were added, to the run
+/// of `calls` of `list`: its storage, each run where encoded, and the
+/// stamps of a sampled run at its marks.
+fn bind_launches(
+    device: &seismic_cuda::Device,
+    graph: &mut DirectGraph,
+    list: &impl DispatchList,
+    keys: &ReplayKeys<'_>,
+    calls: &Range<usize>,
+    encoded: &[Vec<bool>],
+) -> Result<(), CallError> {
+    let form = keys.form(calls);
+    let mut node = 0;
+    each_launch(list, calls.clone(), encoded, |index, ordinal, launch, runs| {
+        if !holds(form[index - calls.start], ordinal) {
+            assert!(launch.is_none(), "a run makes only launches its layout's graph holds");
+            return Ok(());
+        }
+        match launch {
+            Some(launch) => graph.bind(device, node, launch, runs)?,
+            // Another plan of the layout makes it.
+            None => graph.disable(node)?,
+        }
+        node += 1;
+        Ok(())
+    })
+    .map_err(CallError::Execution)?;
+    assert_eq!(node, graph.nodes(), "a shape's launches are its graph's nodes");
+    let stamped = keys.stamps(list, calls).into_iter().map(|stamp| (cuda_stamps(stamp), stamp.mark));
+    graph.sample(&stamped.collect::<Vec<_>>()).map_err(CallError::Execution)
+}
+
+/// The nodes a CUDA graph holds of a timeline node inside it
+/// (`graph_segments`): a wait's one, a signal's write and the event its
+/// word's waiters wake behind (`DirectGraphBuilder::write_word`); none of a
+/// park's or a publication's, whose kernels park themselves.
+pub(super) fn timeline_nodes(node: TimelineNode) -> u64 {
+    const _: () = assert!(BackendName::Cuda.parks_in_kernels());
+    match node {
+        TimelineNode::Wait => 1,
+        TimelineNode::Signal => 2,
+        TimelineNode::Park | TimelineNode::Publish => 0,
+    }
+}
+
+/// The calls of `list` each timeline node the graph of `calls` holds
+/// precedes, in order, once each: those of a wait or a signal inside it
+/// (`PlanRun::held_timelines`).
+fn held_boundaries(keys: &ReplayKeys<'_>, calls: &Range<usize>) -> Vec<usize> {
+    let mut boundaries = keys
+        .run(calls)
+        .held_timelines(calls)
+        .filter(|&(_, node)| timeline_nodes(node) != 0)
+        .map(|(at, _)| at)
+        .collect::<Vec<_>>();
+    boundaries.dedup();
+    boundaries
+}
+
+/// What the run binds the words of the graph of `calls` of `list` to, in
+/// the order its word nodes were added: each timeline operation at a node
+/// it holds, its host word (a gate's, or a signal's reached word) and the
+/// value's low 32 bits (`timeline`).
+fn held_operations<'l>(list: &'l impl DispatchList, keys: &ReplayKeys<'_>, calls: &Range<usize>) -> Vec<(&'l HostWord, u32)> {
+    held_boundaries(keys, calls)
+        .into_iter()
+        .flat_map(|boundary| list.timelines(boundary))
+        .map(|operation| {
+            let TimelineKind::Cuda(timeline) = operation.timeline.kind() else {
+                unreachable!("a run binds timelines of its own device");
+            };
+            let word = match operation.action {
+                TimelineAction::Wait => &timeline.gate,
+                TimelineAction::Signal => &timeline.reached,
+            };
+            (word, operation.value as u32)
+        })
+        .collect()
+}
+
 /// Launch the calls `calls` of `list` on `batch`'s stream one by one, each
 /// launch where `encoded`.
 fn launch(batch: &mut DirectBatch, list: &impl DispatchList, calls: Range<usize>, encoded: &[Vec<bool>]) -> Result<(), CallError> {
@@ -241,12 +325,15 @@ fn launch(batch: &mut DirectBatch, list: &impl DispatchList, calls: Range<usize>
 /// layout, its place in the run and the launches the layout's graph holds
 /// of each call (`LayoutForms`), bound to every parameter a replay sets
 /// (the run's plan, its launches' functions, geometry and words; the
-/// launches it encodes; the buffers' addresses; the stamps its marks record).
-fn shaped(list: &impl DispatchList, keys: &ReplayKeys<'_>, calls: &Range<usize>, encoded: &[Vec<bool>]) -> Shaped {
+/// launches it encodes; the buffers' addresses; the stamps its marks
+/// record), and last, two words each, its word nodes' words and values
+/// (`words`, [`held_operations`]).
+fn shaped(list: &impl DispatchList, keys: &ReplayKeys<'_>, calls: &Range<usize>, encoded: &[Vec<bool>], words: &[(&HostWord, u32)]) -> Shaped {
     let mut bound = vec![keys.plan(calls)];
     bound.extend(super::encoded_words(encoded, calls.clone()));
     bound.extend(addresses(list, calls.clone()));
     bound.push(keys.stamps(list, calls).first().map_or(0, |stamp| cuda_stamps(stamp).identity()));
+    bound.extend(words.iter().flat_map(|&(word, value)| [word.device_address(), u64::from(value)]));
     keys.shaped(calls, keys.form(calls).iter().copied(), bound)
 }
 
@@ -262,23 +349,35 @@ fn holds(word: u64, ordinal: usize) -> bool {
 /// first run's, run where it encodes it and does device work, or where
 /// that run does not make it, another's that does, disabled until a run
 /// making it binds it ([`DirectGraph::bind`]). How a node follows the one
-/// before is its kernel entry's, alike for every plan of a layout. A node
-/// more stands at each of `marks`, the calls a mark the graph holds precedes,
-/// in order.
+/// before is its kernel entry's, alike for every plan of a layout. Before
+/// each call stand a node for each of `marks` the graph holds there, then
+/// the nodes of each of `timelines` there (`timeline_nodes`), each on
+/// `placeholder` until a replay binds its run's word
+/// ([`DirectGraph::bind_word`]).
 fn record<L: DispatchList>(
     device: &seismic_cuda::Device,
     lists: &[L],
     calls: Range<usize>,
     form: &[u64],
     marks: &[usize],
+    timelines: &[(usize, TimelineNode)],
+    placeholder: &HostWord,
 ) -> Result<DirectGraph, ExecutionError> {
     let encoded = lists[0].encoded();
     let mut builder = DirectGraphBuilder::new(device)?;
     let mut nodes = 0usize;
     let mut marks = marks.iter().peekable();
+    let mut timelines = timelines.iter().peekable();
     for index in calls {
         while marks.next_if_eq(&&index).is_some() {
             builder.mark()?;
+        }
+        while let Some((_, node)) = timelines.next_if(|(at, _)| *at == index) {
+            match node {
+                TimelineNode::Wait => builder.wait_word(placeholder, 0)?,
+                TimelineNode::Signal => builder.write_word(placeholder, 0)?,
+                TimelineNode::Park | TimelineNode::Publish => {}
+            }
         }
         for ordinal in (0..u64::BITS as usize).filter(|&ordinal| holds(form[index], ordinal)) {
             let previous = nodes.checked_sub(1);
@@ -328,11 +427,15 @@ pub(super) fn instantiate<L: DispatchList>(
     let form = runs[0].form.clone();
     let segments = graph_segments(list, Some(&runs));
     let keys = ReplayKeys { runs, encoded: None };
+    // What the graphs' word nodes bind until a replay binds its run's.
+    let placeholder = HostWord::new(device)?;
     for (calls, _) in segments.iter().filter(|(calls, _)| !calls.is_empty()) {
-        let key = shaped(list, &keys, calls, &encoded).key;
+        // A placeholder run binds no timeline.
+        let key = shaped(list, &keys, calls, &encoded, &[]).key;
         let marks = keys.marks(calls).collect::<Vec<_>>();
+        let timelines = keys.run(calls).held_timelines(calls).collect::<Vec<_>>();
         for _ in 0..count {
-            let graph = record(device, lists, calls.clone(), &form, &marks)?;
+            let graph = record(device, lists, calls.clone(), &form, &marks, &timelines, &placeholder)?;
             owned.push((key.clone(), replays.instantiated(key.clone(), graph, budget, retained)));
         }
     }

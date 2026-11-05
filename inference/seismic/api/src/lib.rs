@@ -3019,7 +3019,7 @@ impl NativeGraphMetadata {
     pub fn new(backend: BackendName) -> Self {
         Self {
             backend,
-            inner: seismic_runtime::native::graph::NativeGraphMetadataDraft::new(),
+            inner: seismic_runtime::native::graph::NativeGraphMetadataDraft::new(backend),
             template: None,
             class_scope: None,
             checked: CheckedCalls::default(),
@@ -3029,7 +3029,7 @@ impl NativeGraphMetadata {
     pub fn new_template(backend: BackendName) -> Self {
         Self {
             backend,
-            inner: seismic_runtime::native::graph::NativeGraphMetadataDraft::new(),
+            inner: seismic_runtime::native::graph::NativeGraphMetadataDraft::new(backend),
             template: Some(MetadataTemplateRecorder {
                 ports: Vec::new(),
                 nodes: Vec::new(),

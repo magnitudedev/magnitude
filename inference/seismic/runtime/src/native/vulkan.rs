@@ -247,7 +247,7 @@ pub(super) fn encode(
                     replays.graphs.replay(
                         shaped,
                         identity,
-                        |divided| {
+                        |divided, _| {
                             divided.stale = true;
                             Ok(())
                         },

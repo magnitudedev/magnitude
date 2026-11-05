@@ -123,8 +123,11 @@ driver! {
     occupancy_max_active_blocks: unsafe extern "system" fn(*mut c_int, Handle, c_int, usize) -> ResultCode => "cuOccupancyMaxActiveBlocksPerMultiprocessor",
     error_string: unsafe extern "system" fn(ResultCode, *mut *const c_char) -> ResultCode => "cuGetErrorString";
     optional {
-        // Driver API 11.7+: stream memory operations on a 32-bit word (a
-        // host gate's wait, a device signal to the host).
+        // Driver API 11.7+: a graph node of stream memory operations on a
+        // 32-bit word (a host gate's wait, a device signal to the host), and
+        // its word and value set on an executable graph.
+        graph_add_batch_mem_op_node: unsafe extern "system" fn(*mut Handle, Handle, *const Handle, usize, *const BatchMemOpNodeParams) -> ResultCode => "cuGraphAddBatchMemOpNode",
+        graph_exec_batch_mem_op_node_set_params: unsafe extern "system" fn(Handle, Handle, *const BatchMemOpNodeParams) -> ResultCode => "cuGraphExecBatchMemOpNodeSetParams",
         // Driver API 11.4+: identifies the exposed device, including a MIG
         // partition, rather than its parent GPU.
         device_uuid_v2: unsafe extern "system" fn(*mut [u8; 16], c_int) -> ResultCode => "cuDeviceGetUuid_v2",
@@ -1257,17 +1260,83 @@ fn graph_symbol<F: Copy>(symbol: Option<F>) -> Result<F, DriverError> {
     })
 }
 
+/// `CUstreamBatchMemOpParams`: a union of 48 bytes, of which a 32-bit wait
+/// or write (`CUstreamMemOpWaitValueParams_st`,
+/// `CUstreamMemOpWriteValueParams_st`) uses the operation, the address, the
+/// value, the flags and the alias.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct StreamMemOp {
+    operation: u32,
+    address: u64,
+    value: u64,
+    flags: u32,
+    alias: u64,
+    reserved: u64,
+}
+
+const _: () = assert!(size_of::<StreamMemOp>() == 48);
+
+/// `CUDA_BATCH_MEM_OP_NODE_PARAMS`.
+#[repr(C)]
+pub(crate) struct BatchMemOpNodeParams {
+    context: Handle,
+    count: c_uint,
+    operations: *mut StreamMemOp,
+    flags: c_uint,
+}
+
+/// A 32-bit stream memory operation on a word at a device address.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WordOperation {
+    /// Wait until the word reaches the value (`CU_STREAM_WAIT_VALUE_GEQ`,
+    /// compared cyclically: `word - value` as I32 at least 0).
+    Wait,
+    /// Write the value once the work before completes, its writes visible
+    /// first (`CU_STREAM_WRITE_VALUE_DEFAULT`, with its memory barrier).
+    Write,
+}
+
+impl WordOperation {
+    /// Its flags, a stream's (`cuStreamWaitValue32`, `cuStreamWriteValue32`)
+    /// and a graph node's alike: `CU_STREAM_WAIT_VALUE_GEQ` and
+    /// `CU_STREAM_WRITE_VALUE_DEFAULT`.
+    pub(crate) fn flags(self) -> u32 {
+        match self {
+            Self::Wait | Self::Write => 0,
+        }
+    }
+
+    fn of(self, address: u64, value: u32) -> StreamMemOp {
+        // CU_STREAM_MEM_OP_WAIT_VALUE_32 and _WRITE_VALUE_32.
+        let operation = match self {
+            Self::Wait => 1,
+            Self::Write => 2,
+        };
+        StreamMemOp { operation, address, value: u64::from(value), flags: self.flags(), alias: 0, reserved: 0 }
+    }
+}
+
 /// A kernel graph under construction: kernel nodes, each depending on the
-/// earlier nodes it names, and event-record nodes among them.
+/// earlier nodes it names, and event-record and word-operation nodes among
+/// them, each after the node added before it.
 pub(crate) struct Graph {
     raw: Handle,
     /// Every kernel node, in order of addition.
     nodes: Vec<Handle>,
-    /// Every event-record node, in order of addition.
+    /// Every event-record node of a mark ([`Self::push_mark`]), in order of
+    /// addition.
     marks: Vec<Handle>,
-    /// The event-record node added since the last kernel node, which the
-    /// next one follows.
-    tail: Option<Handle>,
+    /// Every word-operation node, in order of addition.
+    operations: Vec<Handle>,
+    /// The node added last.
+    last: Option<Handle>,
+    /// The node added last since the last kernel node, where one was: the
+    /// next kernel node follows it.
+    since: Option<Handle>,
+    /// Whether a wait was added since the last kernel node: the next kernel
+    /// node follows it to completion, whatever its edge.
+    gated: bool,
     context: Arc<Context>,
 }
 
@@ -1285,9 +1354,21 @@ impl Graph {
             raw,
             nodes: Vec::new(),
             marks: Vec::new(),
-            tail: None,
+            operations: Vec::new(),
+            last: None,
+            since: None,
+            gated: false,
             context: context.clone(),
         })
+    }
+
+    /// Add an event-record node of a mark, recording `event` once the node
+    /// added last completes, or as the graph starts where none was
+    /// ([`Self::push_event`]).
+    pub fn push_mark(&mut self, event: &Event) -> Result<(), DriverError> {
+        let raw = self.push_event(event)?;
+        self.marks.push(raw);
+        Ok(())
     }
 
     /// Add an event-record node recording `event` once the node added last
@@ -1295,37 +1376,67 @@ impl Graph {
     /// runs through it, so the graph stays one chain, but for a programmatic
     /// edge, which only a kernel can source: there the node hangs off the
     /// chain (`push_kernel`).
-    pub fn push_mark(&mut self, event: &Event) -> Result<(), DriverError> {
+    pub fn push_event(&mut self, event: &Event) -> Result<Handle, DriverError> {
         let add = graph_symbol(self.context.driver.graph_add_event_record_node)?;
         let _current = self.context.enter()?;
         let mut raw = std::ptr::null_mut();
-        let dependencies = self.tail.or(self.nodes.last().copied());
+        let dependencies = self.last;
         unsafe {
             self.context.driver.check(
                 add(&mut raw, self.raw, dependencies.as_slice().as_ptr(), dependencies.as_slice().len(), event.raw()),
                 "kernel graph event record node",
             )?;
         }
-        self.marks.push(raw);
-        self.tail = Some(raw);
+        self.last = Some(raw);
+        self.since = Some(raw);
+        Ok(raw)
+    }
+
+    /// Add a node of one word operation on the word at device address
+    /// `address`, once the node added last completes, or as the graph starts
+    /// where none was. A wait holds every later node of the chain, a
+    /// programmatic launch's too (`push_kernel`); a write hangs off a
+    /// programmatic edge as an event-record node does. Following the node
+    /// added last follows the whole chain before it: a kernel on a
+    /// programmatic edge waits for its predecessor's completion itself
+    /// ([`Edge::Programmatic`]), so it completes only after it.
+    pub fn push_word(&mut self, operation: WordOperation, address: u64, value: u32) -> Result<(), DriverError> {
+        let add = graph_symbol(self.context.driver.graph_add_batch_mem_op_node)?;
+        let _current = self.context.enter()?;
+        let mut raw = std::ptr::null_mut();
+        let dependencies = self.last;
+        let mut word = operation.of(address, value);
+        let params = BatchMemOpNodeParams { context: self.context.raw, count: 1, operations: &mut word, flags: 0 };
+        unsafe {
+            self.context.driver.check(
+                add(&mut raw, self.raw, dependencies.as_slice().as_ptr(), dependencies.as_slice().len(), &params),
+                "kernel graph word operation node",
+            )?;
+        }
+        self.operations.push(raw);
+        self.last = Some(raw);
+        self.since = Some(raw);
+        self.gated |= operation == WordOperation::Wait;
         Ok(())
     }
 
     /// Add a kernel node after the nodes `after` names (by order of
-    /// addition), by `edge` from each, and after an event-record node added
-    /// since them, unless the edge is programmatic: it starts before they
-    /// complete, which waiting on the event would undo. The driver copies
-    /// the parameter values the node's `parameters` point to.
+    /// addition), by `edge` from each, and after a node added since them,
+    /// unless the edge is programmatic: it starts before they complete,
+    /// which waiting on that node would undo. After a wait it follows the
+    /// wait to completion, whatever its edge. The driver copies the
+    /// parameter values the node's `parameters` point to.
     pub fn push_kernel(&mut self, node: &KernelNodeParams, edge: Edge, after: &[usize]) -> Result<(), DriverError> {
         let add = graph_symbol(self.context.driver.graph_add_kernel_node)?;
         let _current = self.context.enter()?;
         let mut raw = std::ptr::null_mut();
         let after = after.iter().map(|&node| self.nodes[node]).collect::<Vec<_>>();
-        let programmatic = edge == Edge::Programmatic && !after.is_empty();
-        let mark = self.tail.take();
-        let dependencies = match mark {
+        let gated = std::mem::take(&mut self.gated);
+        let programmatic = edge == Edge::Programmatic && !after.is_empty() && !gated;
+        let since = self.since.take();
+        let dependencies = match since {
             _ if programmatic => &[][..],
-            Some(ref mark) => std::slice::from_ref(mark),
+            Some(ref since) => std::slice::from_ref(since),
             None => after.as_slice(),
         };
         unsafe {
@@ -1363,6 +1474,7 @@ impl Graph {
             }
         }
         self.nodes.push(raw);
+        self.last = Some(raw);
         Ok(())
     }
 
@@ -1374,6 +1486,11 @@ impl Graph {
     /// Event-record node `index`, by order of addition.
     pub fn mark(&self, index: usize) -> Handle {
         self.marks[index]
+    }
+
+    /// Word-operation node `index`, by order of addition.
+    pub fn word(&self, index: usize) -> Handle {
+        self.operations[index]
     }
 
     /// An executable graph of the nodes added. The graph is kept by the
@@ -1463,6 +1580,22 @@ impl GraphExec {
             self.context
                 .driver
                 .check(set(self.raw, node, event.raw()), "kernel graph event update")
+        }
+    }
+
+    /// Have `node`, a word-operation node of the graph this executable was
+    /// instantiated from, do `operation` (its own) on the word at `address`
+    /// with `value` for every launch after this call. Launches already
+    /// queued keep what they were queued with.
+    pub fn set_word(&self, node: Handle, operation: WordOperation, address: u64, value: u32) -> Result<(), DriverError> {
+        let set = graph_symbol(self.context.driver.graph_exec_batch_mem_op_node_set_params)?;
+        let _current = self.context.enter()?;
+        let mut word = operation.of(address, value);
+        let params = BatchMemOpNodeParams { context: self.context.raw, count: 1, operations: &mut word, flags: 0 };
+        unsafe {
+            self.context
+                .driver
+                .check(set(self.raw, node, &params), "kernel graph word operation update")
         }
     }
 

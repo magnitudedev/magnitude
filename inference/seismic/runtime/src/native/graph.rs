@@ -677,7 +677,8 @@ impl NativeGraphDraft {
             shaped
                 .iter()
                 .map(|(kernel, _, _)| SealedNodeShape::of(kernel.schema(), kernel.implementation()).census),
-            self.timelines.len(),
+            &self.timelines,
+            super::backend_name(&self.device.kind),
         );
         let storage = if let Some(layout) = &self.layout {
             layout
@@ -729,6 +730,8 @@ impl NativeGraphDraft {
 /// same port identities and interval allocator as a prepared native graph,
 /// but owns no device, formed kernel, or executable node.
 pub struct NativeGraphMetadataDraft {
+    /// The backend whose native declarations it checks, which records it.
+    backend: BackendName,
     identity: u64,
     ports: Vec<PortSpec>,
     nodes: Vec<PlannedNode>,
@@ -974,23 +977,31 @@ impl PlanShape {
     }
 }
 
-/// What recording one run of a graph of `shapes`' nodes and `timelines`
-/// timeline nodes takes: every launch its nodes declare, in a graph of the
-/// run's own (a run's calls are a graph of their shape, `ReplayKeys`), and a
-/// graph more for each timeline node, which ends the graph the calls before
-/// it are recorded in whether or not a run binds it (`graph_segments`).
-/// Every run of the plan, on any slot or place, replays these graphs.
-fn recorded_census(shapes: impl IntoIterator<Item = GraphCensus>, timelines: usize) -> GraphCensus {
+/// What recording one run of a graph of `shapes`' nodes and the timeline
+/// nodes `timelines` takes at most on `backend`: every launch its nodes
+/// declare, in a graph of the run's own (a run's calls are a graph of their
+/// shape, `ReplayKeys`), and for each timeline node a graph more, where it
+/// ends the graph the calls before it are recorded in whether or not a run
+/// binds it (`graph_segments`), or on CUDA the nodes of it a graph holds
+/// instead (`cuda::timeline_nodes`). Every run of the plan, on any slot or
+/// place, replays these graphs.
+fn recorded_census(shapes: impl IntoIterator<Item = GraphCensus>, timelines: &[(usize, TimelineNode)], backend: BackendName) -> GraphCensus {
     let launches = shapes
         .into_iter()
         .try_fold(GraphCensus::default(), GraphCensus::plus)
         .expect("a graph's launch census fits u64");
-    GraphCensus { graphs: 1 + timelines as u64, ..launches }
+    let (graphs, held) = match backend {
+        BackendName::Cuda => (0, timelines.iter().map(|&(_, node)| super::cuda::timeline_nodes(node)).sum()),
+        BackendName::Vulkan | BackendName::Metal | BackendName::Cpu => (timelines.len() as u64, 0),
+    };
+    GraphCensus { graphs: 1 + graphs, launches: launches.launches + held, ..launches }
 }
 
 impl NativeGraphMetadataDraft {
-    pub fn new() -> Self {
+    /// An empty graph of `backend`'s native declarations.
+    pub fn new(backend: BackendName) -> Self {
         Self {
+            backend,
             identity: NEXT_NATIVE_GRAPH.fetch_add(1, Ordering::Relaxed),
             ports: Vec::new(),
             nodes: Vec::new(),
@@ -1201,7 +1212,7 @@ impl NativeGraphMetadataDraft {
 
     /// What recording one run of this graph takes ([`recorded_census`]).
     fn recorded(&self) -> GraphCensus {
-        recorded_census(self.shapes.iter().map(|shape| shape.census), self.timelines.len())
+        recorded_census(self.shapes.iter().map(|shape| shape.census), &self.timelines, self.backend)
     }
 
     /// Verify an exact checked metadata graph against the storage certificate
@@ -1864,9 +1875,9 @@ struct Executable {
 }
 
 impl Executable {
-    /// The node positions its graphs divide at: each timeline node's.
-    fn bounds(&self) -> Vec<usize> {
-        self.timelines.iter().map(|&(position, _)| position).collect()
+    /// The node positions its timeline nodes sit at.
+    fn bounds(&self) -> impl Iterator<Item = usize> + '_ {
+        self.timelines.iter().map(|&(position, _)| position)
     }
 
     fn seal_node(
@@ -2669,12 +2680,13 @@ impl NativeGraphPlan {
         })
     }
     /// What one run's graphs hold when its layout's graph holds the
-    /// launches `form` names (`super::LayoutForms`): on CUDA a graph of each
-    /// of its segments of calls between timeline nodes (`graph_segments`)
-    /// with a node for each launch the form holds, exactly what
-    /// `cuda::instantiate` makes, none of a launched plan, whose runs launch
-    /// call by call ([`NativeGraphDraft::seal_launched`]); elsewhere what
-    /// recording its run takes at most ([`Self::recorded`]).
+    /// launches `form` names (`super::LayoutForms`): on CUDA one graph
+    /// (`graph_segments`) with a node for each launch the form holds, each
+    /// mark it holds and the nodes of each timeline node inside it
+    /// (`cuda::timeline_nodes`), exactly what `cuda::instantiate` makes,
+    /// none of a launched plan, whose runs launch call by call
+    /// ([`NativeGraphDraft::seal_launched`]); elsewhere what recording its
+    /// run takes at most ([`Self::recorded`]).
     fn run_graphs(&self, form: &[u64]) -> GraphCensus {
         if !self.graphed() {
             return GraphCensus::default();
@@ -2682,13 +2694,17 @@ impl NativeGraphPlan {
         match super::backend_name(&self.device.kind) {
             BackendName::Cuda => {
                 let nodes = self.executable.nodes.len();
-                let mut cuts = self.executable.bounds();
-                cuts.extend([0, nodes]);
-                cuts.sort_unstable();
-                cuts.dedup();
+                let timelines = self
+                    .executable
+                    .timelines
+                    .iter()
+                    .filter(|(position, _)| (1..nodes).contains(position))
+                    .map(|&(_, node)| super::cuda::timeline_nodes(node))
+                    .sum::<u64>();
+                let launches = form.iter().map(|word| u64::from(word.count_ones())).sum::<u64>();
                 GraphCensus {
-                    graphs: cuts.windows(2).filter(|cut| cut[0] < cut[1]).count() as u64,
-                    launches: form.iter().map(|word| u64::from(word.count_ones())).sum::<u64>() + self.held_marks().len() as u64,
+                    graphs: u64::from(nodes > 0),
+                    launches: launches + self.held_marks().len() as u64 + timelines,
                     arguments: 0,
                     largest: 0,
                 }
@@ -2699,14 +2715,16 @@ impl NativeGraphPlan {
 
     /// The span marks its graphs hold, each the node it precedes, in order
     /// ([`NativeGraphDraft::span_mark`]): those inside a graph, of a plan
-    /// whose runs replay graphs. A mark at a run's edge or a timeline node
+    /// whose runs replay graphs. A mark at a run's edge, or at a timeline
+    /// node where graphs divide there (all but CUDA's, `graph_segments`),
     /// falls between graphs, and costs a run not sampled nothing.
     fn held_marks(&self) -> Vec<usize> {
         if !self.graphed() {
             return Vec::new();
         }
-        let (nodes, bounds) = (self.executable.nodes.len(), self.executable.bounds());
-        let held = self.executable.marks.iter().copied().filter(|mark| (1..nodes).contains(mark) && !bounds.contains(mark));
+        let nodes = self.executable.nodes.len();
+        let divides = |mark: &usize| !self.holds_timelines() && self.executable.bounds().any(|bound| bound == *mark);
+        let held = self.executable.marks.iter().copied().filter(|mark| (1..nodes).contains(mark) && !divides(mark));
         held.collect()
     }
 
@@ -2714,6 +2732,13 @@ impl NativeGraphPlan {
     /// which launch call by call ([`NativeGraphDraft::seal_launched`]).
     fn graphed(&self) -> bool {
         !(self.launched && super::backend_name(&self.device.kind) == BackendName::Cuda)
+    }
+
+    /// Whether its run's graph holds the timeline nodes inside it, as nodes
+    /// of its own (`cuda::timeline_nodes`), rather than dividing there
+    /// (`graph_segments`): a graphed plan's on CUDA.
+    pub(super) fn holds_timelines(&self) -> bool {
+        self.graphed() && super::backend_name(&self.device.kind) == BackendName::Cuda
     }
 
     /// A slot's share of its device's graph budget ([`super::SlotGraphs`]):
@@ -3000,6 +3025,13 @@ impl NativeGraphFamily {
             assert!(
                 graphs.plans.iter().all(|plan| plan.shape.structure.len() == calls),
                 "a layout's plans make launches of the same calls"
+            );
+            // On CUDA a graph holds its run's timeline nodes, so they are
+            // part of the form one graph of the layout serves.
+            assert!(
+                super::backend_name(&first.device.kind) != BackendName::Cuda
+                    || graphs.plans.iter().all(|plan| plan.executable.timelines == graphs.plans[0].executable.timelines),
+                "a layout's plans hold the same timeline nodes"
             );
             graphs.form = (0..calls)
                 .map(|call| graphs.plans.iter().fold(0, |made, plan| made | plan.shape.structure[call]))
@@ -4420,14 +4452,14 @@ impl DispatchList for PlaceholderRun<'_> {
     fn reaches<'s>(&'s self, _index: usize, _reaches: &mut Vec<Reach<'s>>) {}
 
     fn runs(&self) -> Option<Vec<super::PlanRun>> {
-        let bounds = self.plan.executable.bounds();
         Some(vec![super::PlanRun {
             plan: self.plan.identity,
             layout: self.plan.shape.layout,
             calls: 0..self.count(),
-            bounds,
+            timelines: self.plan.executable.timelines.clone(),
             marks: self.plan.held_marks(),
             launched: !self.plan.graphed(),
+            holds_timelines: self.plan.holds_timelines(),
             form: self.form.clone(),
         }])
     }
@@ -4518,15 +4550,15 @@ impl DispatchList for SequenceList<'_> {
                 .map(|run| {
                     let calls = first..first + run.plan.executable.nodes.len();
                     first = calls.end;
-                    let bounds = run.plan.executable.bounds();
                     let form = run.hold.form(run.plan.shape.layout);
                     super::PlanRun {
                         plan: run.plan.identity,
                         layout: run.plan.shape.layout,
                         calls,
-                        bounds,
+                        timelines: run.plan.executable.timelines.clone(),
                         marks: run.plan.held_marks(),
                         launched: !run.plan.graphed(),
+                        holds_timelines: run.plan.holds_timelines(),
                         form,
                     }
                 })

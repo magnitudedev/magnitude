@@ -364,8 +364,23 @@ pub struct DirectGraphBuilder {
     /// What its marks record until a sampled run sets its own
     /// ([`DirectGraph::sample`]), where it has any.
     rest: Option<Arc<Event>>,
+    /// Each word-operation node as bound now, in order of addition.
+    words: Vec<WordNode>,
     /// The launches added so far ([`DirectGraph::census`]).
     launches: GraphCensus,
+}
+
+/// A word-operation node of a [`DirectGraph`]: a host gate's wait, or a
+/// write the word's host waiters wake behind.
+struct WordNode {
+    operation: driver::WordOperation,
+    /// The device address of the word it binds, and the value.
+    address: u64,
+    value: u32,
+    /// A write's: the event recorded as it lands, which the waiters' wake
+    /// follows ([`DirectBatch::replay`]), and the wake of the word it binds
+    /// ([`DirectGraph::bind_word`]).
+    written: Option<(Event, Arc<Wake>)>,
 }
 
 impl DirectGraphBuilder {
@@ -376,8 +391,50 @@ impl DirectGraphBuilder {
             formed: Vec::new(),
             enabled: Vec::new(),
             rest: None,
+            words: Vec::new(),
             launches: GraphCensus::default(),
         })
+    }
+
+    /// One launch more of the graph's memory.
+    fn count_launch(&mut self) -> Result<(), ExecutionError> {
+        self.launches = self.launches.plus(GraphCensus::launch(0)).ok_or_else(|| {
+            ExecutionError::SubmissionFailed("a graph's launch census overflows".into())
+        })?;
+        Ok(())
+    }
+
+    /// Add a gate after the nodes added so far: the graph's later nodes run
+    /// once `word` reaches `value` (compared as [`DirectBatch::wait_word`]
+    /// does). A replay binds its word and value ([`DirectGraph::bind_word`]).
+    /// It counts as a launch of the graph's memory.
+    pub fn wait_word(&mut self, word: &HostWord, value: u32) -> Result<(), ExecutionError> {
+        self.word(driver::WordOperation::Wait, word, value, None)
+    }
+
+    /// Add a write after the nodes added so far: `word` becomes `value` once
+    /// they complete, their writes visible first (as
+    /// [`DirectBatch::write_word`]), followed by an event-record node of its
+    /// own the word's waiters wake behind as each replay lands it
+    /// ([`DirectBatch::replay`]). A replay binds its word and value
+    /// ([`DirectGraph::bind_word`]). It counts as two launches of the
+    /// graph's memory.
+    pub fn write_word(&mut self, word: &HostWord, value: u32) -> Result<(), ExecutionError> {
+        let written = Event::new(self.device.context()).map_err(submission)?;
+        self.word(driver::WordOperation::Write, word, value, Some(written))
+    }
+
+    fn word(&mut self, operation: driver::WordOperation, word: &HostWord, value: u32, written: Option<Event>) -> Result<(), ExecutionError> {
+        let address = word.device_address();
+        self.graph.push_word(operation, address, value).map_err(submission)?;
+        self.count_launch()?;
+        if let Some(written) = &written {
+            self.graph.push_event(written).map_err(submission)?;
+            self.count_launch()?;
+        }
+        let written = written.map(|written| (written, word.wake.clone()));
+        self.words.push(WordNode { operation, address, value, written });
+        Ok(())
     }
 
     /// Add a mark after the launches added so far: an event-record node in
@@ -391,10 +448,7 @@ impl DirectGraphBuilder {
         };
         self.graph.push_mark(&rest).map_err(submission)?;
         self.rest = Some(rest);
-        self.launches = self.launches.plus(GraphCensus::launch(0)).ok_or_else(|| {
-            ExecutionError::SubmissionFailed("a graph's launch census overflows".into())
-        })?;
-        Ok(())
+        self.count_launch()
     }
 
     /// Add a launch after the launches `after` names, by their order of
@@ -413,10 +467,7 @@ impl DirectGraphBuilder {
         self.enabled.push(enabled);
         // Its memory follows no parameter byte
         // (`seismic_compiler::graph_cost::argument_bytes`).
-        self.launches = self.launches.plus(GraphCensus::launch(0)).ok_or_else(|| {
-            ExecutionError::SubmissionFailed("a graph's launch census overflows".into())
-        })?;
-        Ok(())
+        self.count_launch()
     }
 
     /// Instantiate the graph and upload it to the device
@@ -452,6 +503,7 @@ impl DirectGraphBuilder {
             graph: self.graph,
             formed: self.formed,
             enabled: self.enabled,
+            words: self.words,
             device_bytes,
             census,
             held,
@@ -481,6 +533,8 @@ pub struct DirectGraph {
     /// runs.
     formed: Vec<FormedLaunch>,
     enabled: Vec<bool>,
+    /// Each word-operation node as the executable binds it now.
+    words: Vec<WordNode>,
     device_bytes: u64,
     /// What the graph is made of, as its driver memory follows it.
     census: GraphCensus,
@@ -499,6 +553,29 @@ impl DirectGraph {
     /// The graph's launches, enabled or not.
     pub fn nodes(&self) -> usize {
         self.formed.len()
+    }
+
+    /// The graph's word-operation nodes ([`DirectGraphBuilder::wait_word`],
+    /// [`DirectGraphBuilder::write_word`]).
+    pub fn words(&self) -> usize {
+        self.words.len()
+    }
+
+    /// Bind word-operation node `index` (by order of addition) to `word` at
+    /// `value` for every launch of the graph after this call: a write's
+    /// waiters are then `word`'s. Launches already queued keep what they
+    /// were queued with; its owner binds only an idle graph ([`Self::bind`]).
+    pub fn bind_word(&mut self, index: usize, word: &HostWord, value: u32) -> Result<(), ExecutionError> {
+        let node = &mut self.words[index];
+        let address = word.device_address();
+        if (node.address, node.value) != (address, value) {
+            self.exec.set_word(self.graph.word(index), node.operation, address, value).map_err(submission)?;
+            (node.address, node.value) = (address, value);
+        }
+        if let Some((_, wake)) = &mut node.written {
+            *wake = word.wake.clone();
+        }
+        Ok(())
     }
 
     /// Have its marks stamp `marks`, in order, for every launch of the graph
@@ -588,7 +665,8 @@ impl Drop for DirectGraph {
 /// A 32-bit word in pinned host memory mapped into the device's address
 /// space, which the host and the device's stream both write and wait on.
 /// A host thread waiting for it sleeps ([`Self::wait`]): every write, the
-/// host's or a stream's ([`DirectBatch::write_word`]), wakes it.
+/// host's, a stream's ([`DirectBatch::write_word`]) or a graph's
+/// ([`DirectGraphBuilder::write_word`]), wakes it.
 pub struct HostWord {
     mapped: driver::HostMapped,
     wake: Arc<Wake>,
@@ -607,12 +685,33 @@ impl Wake {
         drop(self.lock.lock().expect("host word wake lock"));
         self.changed.notify_all();
     }
+
+    /// Wake the waiters once `written`'s last record completes: the
+    /// context's notify stream waits for it, then runs the wake, so no
+    /// work of the stream recording it waits for the host.
+    fn behind(self: &Arc<Self>, context: &Arc<driver::Context>, written: &Event) -> Result<(), ExecutionError> {
+        let _current = context.enter().map_err(submission)?;
+        let issue = context.issuing().map_err(submission)?;
+        let notify = context.notify_stream();
+        // SAFETY: both handles are this context's; the event may be
+        // destroyed once the wait is queued, and the wake's reference is the
+        // host function's to release.
+        unsafe {
+            context.driver.check(issue.stream_wait_event(notify, written.raw()), "wake wait").map_err(submission)?;
+            let wake = Arc::into_raw(self.clone()).cast_mut().cast::<c_void>();
+            let status = issue.launch_host_function(notify, wake_after_write, wake);
+            if status != 0 {
+                drop(Arc::from_raw(wake.cast::<Wake>().cast_const()));
+            }
+            context.driver.check(status, "wake launch").map_err(submission)
+        }
+    }
 }
 
 /// The host function a stream runs behind a device write of a word: `data`
-/// is the word's [`Wake`], an `Arc` the write leaked for it.
+/// is the word's [`Wake`], an `Arc` leaked for it ([`Wake::behind`]).
 unsafe extern "system" fn wake_after_write(data: *mut c_void) {
-    // SAFETY: `DirectBatch::write_word` leaked one reference for this call.
+    // SAFETY: `Wake::behind` leaked one reference for this call.
     let wake = unsafe { Arc::from_raw(data.cast::<Wake>().cast_const()) };
     wake.notify();
 }
@@ -634,27 +733,13 @@ impl HostWord {
     /// Wake the word's waiters once `stream`'s work queued so far completes,
     /// a device write of the word among it: an event recorded behind it,
     /// which the context's notify stream waits for before it runs their
-    /// wake, so no work of `stream` waits for the host. Every device write
-    /// of a host word is followed by this, so every host wait sleeps.
+    /// wake, so no work of `stream` waits for the host. Every stream write
+    /// of a host word is followed by this, and every graph write by its own
+    /// event's wake ([`DirectBatch::replay`]), so every host wait sleeps.
     pub(crate) fn wake_after(&self, stream: &driver::Stream) -> Result<(), ExecutionError> {
-        let context = stream.context();
-        let written = Event::new(context).map_err(submission)?;
+        let written = Event::new(stream.context()).map_err(submission)?;
         written.record(stream).map_err(submission)?;
-        let _current = context.enter().map_err(submission)?;
-        let issue = context.issuing().map_err(submission)?;
-        let notify = context.notify_stream();
-        // SAFETY: both handles are this context's; the event may be
-        // destroyed once the wait is queued, and the wake's reference is the
-        // host function's to release.
-        unsafe {
-            context.driver.check(issue.stream_wait_event(notify, written.raw()), "wake wait").map_err(submission)?;
-            let wake = Arc::into_raw(self.wake.clone()).cast_mut().cast::<c_void>();
-            let status = issue.launch_host_function(notify, wake_after_write, wake);
-            if status != 0 {
-                drop(Arc::from_raw(wake.cast::<Wake>().cast_const()));
-            }
-            context.driver.check(status, "wake launch").map_err(submission)
-        }
+        self.wake.behind(stream.context(), &written)
     }
 
     /// Wait at most `timeout` until `reached` holds of the word, sleeping
@@ -692,7 +777,7 @@ impl HostWord {
     }
 
     /// The address device work writes and waits on the word at.
-    pub(crate) fn device_address(&self) -> u64 {
+    pub fn device_address(&self) -> u64 {
         self.mapped.device
     }
 }
@@ -829,9 +914,7 @@ impl DirectBatch {
     /// (`cuStreamWaitValue32`, compared cyclically: `word - value` as I32
     /// at least 0): the host gate.
     pub fn wait_word(&mut self, word: &HostWord, value: u32) -> Result<(), ExecutionError> {
-        // CU_STREAM_WAIT_VALUE_GEQ
-        const GEQ: u32 = 0;
-        self.word_operation(word, value, GEQ, |issue, stream, address, value, flags| unsafe {
+        self.word_operation(word, value, driver::WordOperation::Wait.flags(), |issue, stream, address, value, flags| unsafe {
             issue.wait_value_32(stream, address, value, flags)
         })
     }
@@ -840,9 +923,7 @@ impl DirectBatch {
     /// its writes visible first (`cuStreamWriteValue32` with its memory
     /// barrier); the word's waiters wake then ([`HostWord::wake_after`]).
     pub fn write_word(&mut self, word: &HostWord, value: u32) -> Result<(), ExecutionError> {
-        // CU_STREAM_WRITE_VALUE_DEFAULT
-        const DEFAULT: u32 = 0;
-        self.word_operation(word, value, DEFAULT, |issue, stream, address, value, flags| unsafe {
+        self.word_operation(word, value, driver::WordOperation::Write.flags(), |issue, stream, address, value, flags| unsafe {
             issue.write_value_32(stream, address, value, flags)
         })?;
         word.wake_after(&self.stream)
@@ -869,15 +950,21 @@ impl DirectBatch {
             .map_err(submission)
     }
 
-    /// Queue every launch of `graph`, in its order. A timed batch launches
-    /// individually instead, so it never replays.
+    /// Queue every launch of `graph`, in its order, and behind each of its
+    /// writes of a word the wake of that word's waiters, as the write lands
+    /// ([`DirectGraphBuilder::write_word`]), not as the graph ends. A timed
+    /// batch launches individually instead, so it never replays.
     pub fn replay(&mut self, graph: &DirectGraph) -> Result<(), ExecutionError> {
         assert!(
             self.marks.is_none(),
             "DirectBatch::replay precondition: a timed batch times each launch"
         );
         graph.exec.launch(&self.stream).map_err(submission)?;
-        graph.launched.record(&self.stream).map_err(submission)
+        graph.launched.record(&self.stream).map_err(submission)?;
+        for (written, wake) in graph.words.iter().filter_map(|node| node.written.as_ref()) {
+            wake.behind(self.device.context(), written)?;
+        }
+        Ok(())
     }
 
     /// Record completion without waiting.
