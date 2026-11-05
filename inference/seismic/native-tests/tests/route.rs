@@ -52,12 +52,6 @@ fn search_hinted(hints: &[(&str, u64)]) -> Strategy {
     Strategy::Search(plan)
 }
 
-/// Every backend whose executor the topology reports available on this
-/// host; each must open.
-fn devices() -> Vec<Device> {
-    seismic_native_tests::devices(&[BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan])
-}
-
 /// What `device` charges on each store it reaches: its own ledgers.
 fn storage_charged(device: &Device) -> std::collections::BTreeMap<seismic::StoreId, u64> {
     device.ledgers().own.iter().map(|(store, view)| (*store, view.charged)).collect()
@@ -201,7 +195,7 @@ fn metal_launch_dispatches_the_grid_it_reads() {
 #[test]
 fn a_launch_dispatches_the_grid_its_call_wrote() {
     let words = |values: &[i32]| values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let kernel = written_marks::native_for_device(&device, &NativeSpecialization::new())
             .expect("every backend has the written-grid fixture");
         for (n, count) in [(8u64, 0i32), (8, 3), (8, 8), (4096, 4093)] {
@@ -557,7 +551,7 @@ fn metal_scoped_tuning_without_budget_serves_its_formed_defaults() {
 
 #[test]
 fn every_admissible_split_sum_configuration_matches_the_reference() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let n = 1000usize;
         let values = exact_values(n);
         let expected: f32 = values.iter().sum();
@@ -588,7 +582,7 @@ fn every_admissible_split_sum_configuration_matches_the_reference() {
 
 #[test]
 fn where_filters_configurations_at_small_static_values() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let implementation = split_sum::native_implementation(&device).unwrap().unwrap();
         let admissible = implementation.admissible(&statics(2)).unwrap();
         // PARTS <= N keeps parts 1 and 2 at N = 2.
@@ -605,7 +599,7 @@ fn where_filters_configurations_at_small_static_values() {
 
 #[test]
 fn specialization_errors_are_typed_at_preparation() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let missing_static = NativeSpecialization::new()
             .with_param("PARTS", 1)
             .with_param("WIDTH", 32);
@@ -622,7 +616,7 @@ fn specialization_errors_are_typed_at_preparation() {
 
 #[test]
 fn a_call_whose_static_dimension_differs_is_rejected() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let kernel = split_sum::native_for_device(
             &device,
             &statics(64).with_param("PARTS", 2).with_param("WIDTH", 32),
@@ -647,7 +641,7 @@ fn a_call_whose_static_dimension_differs_is_rejected() {
 /// without waiting must each read their own input.
 #[test]
 fn graph_runs_submit_without_waiting_and_keep_their_inputs() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let (m, n) = (5u64, 37u64);
         let kernel = scale_rows::native_for_device(
             &device,
@@ -712,7 +706,7 @@ fn graph_runs_submit_without_waiting_and_keep_their_inputs() {
 
 #[test]
 fn measurement_reports_device_time() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let kernel = split_sum::native_for_device(
             &device,
             &statics(4096).with_param("PARTS", 4).with_param("WIDTH", 64),
@@ -741,7 +735,7 @@ fn measurement_reports_device_time() {
 
 #[test]
 fn tuning_searches_from_the_defaults_and_validates_its_choice() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let n = 4096u64;
         let inputs = (0..2)
             .map(|_| f32_tensor(&device, &[n], &exact_values(n as usize)))
@@ -1546,7 +1540,7 @@ fn a_search_choice_passes_validation_at_every_point_or_gives_way_to_the_defaults
 /// rejected when the graph is sealed, not when it runs.
 #[test]
 fn a_graph_whose_static_dimension_differs_is_rejected_at_seal() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let kernel = split_sum::native_for_device(
             &device,
             &statics(64).with_param("PARTS", 2).with_param("WIDTH", 32),
@@ -1588,7 +1582,7 @@ fn a_graph_whose_static_dimension_differs_is_rejected_at_seal() {
 /// node without scratch run correctly across repeated runs of one slot.
 #[test]
 fn graph_nodes_with_scratch_run_from_the_slot_workspace() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let n = 1000u64;
         let kernel = split_sum::native_for_device(
             &device,
@@ -1721,7 +1715,7 @@ fn scale_chain(
 /// serial encoder), and give the bits of the per-launch-encoder form.
 #[test]
 fn a_graph_submission_encodes_every_node_into_one_encoder() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let nodes = 8;
         let (m, n) = (3u64, 50u64);
         let (plan, input, value) = scale_chain(&device, nodes, m, n);
@@ -1783,7 +1777,7 @@ fn a_graph_submission_encodes_every_node_into_one_encoder() {
 /// (the same storage every time) each read their own input.
 #[test]
 fn a_sequence_submits_chained_runs_as_one_unit_in_queue_order() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let (m, n) = (3u64, 64u64);
         let blocks = 5;
         let (entry, input, entry_value) = scale_chain(&device, 1, m, n);
@@ -1900,7 +1894,7 @@ fn a_sequence_submits_chained_runs_as_one_unit_in_queue_order() {
 /// (on CUDA, one graph). Each still reads the input written for it.
 #[test]
 fn runs_rebinding_the_same_storage_read_their_own_inputs() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let nodes = 6;
         let (m, n) = (4u64, 70u64);
         let (plan, input, value) = scale_chain(&device, nodes, m, n);
@@ -1938,7 +1932,7 @@ fn runs_rebinding_the_same_storage_read_their_own_inputs() {
 /// waits for the run and returns the final bytes.
 #[test]
 fn a_host_read_before_completion_returns_the_final_bytes() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let (m, n) = (64u64, 1024u64);
         let nodes = 64;
         let (plan, input, value) = scale_chain(&device, nodes, m, n);
@@ -1999,7 +1993,7 @@ fn standalone_scratch_bytes(
 /// the prepared kernel holds only its scalar-result slots.
 #[test]
 fn standalone_scratch_is_the_calls_own() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let kernel = split_sum::native_for_device(
             &device,
             &statics(64).with_param("PARTS", 4).with_param("WIDTH", 32),
@@ -2040,7 +2034,7 @@ fn zeroed(device: &Device, n: u64) -> Tensor {
 /// without an initializer is rejected before anything runs.
 #[test]
 fn tuning_rejects_shared_mutable_state_without_an_initializer() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let n = 256u64;
         let mut state = zeroed(&device, n);
         let x = f32_tensor(&device, &[n], &exact_values(n as usize));
@@ -2079,7 +2073,7 @@ fn tuning_rejects_shared_mutable_state_without_an_initializer() {
 /// makes every configuration start from the same state.
 #[test]
 fn tuning_validates_in_place_parameters_and_excludes_misclassified_ones() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let n = 256u64;
         let mut state = zeroed(&device, n);
         let mut restore = state.clone();
@@ -2171,7 +2165,7 @@ fn tuning_validates_in_place_parameters_and_excludes_misclassified_ones() {
 /// external ports before anything is encoded.
 #[test]
 fn external_bindings_are_checked_at_attach() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let (m, n) = (2u64, 40u64);
         let scale = scale_rows::native_for_device(
             &device,
@@ -2355,7 +2349,7 @@ fn gated(device: &Device, small: u64) -> seismic::NativeKernel<gated_sum::Entry>
 /// divide by zero, and below `SMALL` it and the scratch size would underflow.
 #[test]
 fn conditional_launches_run_only_the_active_launch() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         // (N, SMALL, active launch ordinal). Vulkan forms group memory at
         // preparation, so SMALL = 2^20 (4 MiB staged) does not prepare there
         // (`inactive_launches_are_exempt_from_device_limits`).
@@ -2434,7 +2428,7 @@ fn conditional_launches_run_only_the_active_launch() {
 /// refused at preparation, whether or not a call would activate it.
 #[test]
 fn inactive_launches_are_exempt_from_device_limits() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let n = 1u64 << 17;
         let values = exact_values(n as usize);
         let x = f32_tensor(&device, &[n], &values);
@@ -2491,7 +2485,7 @@ fn inactive_launches_are_exempt_from_device_limits() {
 /// size is not evaluated (it would underflow below `SMALL`).
 #[test]
 fn inactive_scratch_is_charged_the_minimum() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let kernel = gated(&device, 64);
         let scratch = |n: u64| {
             let values = exact_values(n as usize);
@@ -2535,7 +2529,7 @@ fn inactive_scratch_is_charged_the_minimum() {
 /// Every opened backend whose topology reports device reservations. Refusal
 /// is checked against that capability, independently of the backend name.
 fn reserving_devices() -> Vec<Device> {
-    devices().into_iter().filter(|device| {
+    seismic_native_tests::every_device().into_iter().filter(|device| {
         let reserving = device.info().reserving(ReservedContract::DeviceOnly).map(|reservation| reservation.is_some()).map_err(Clone::clone);
         let probe = Tensor::reserved(device, Element::f32(), &[2, 4], 1);
         let supported = reserving == Ok(true);
@@ -3051,7 +3045,7 @@ fn a_reserved_region_is_host_addressed_where_reservations_are_host_memory() {
 /// in, which is never host storage.
 #[test]
 fn a_reserved_host_tensor_is_written_in_place_and_read_on_the_device() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let backend = device.backend();
         let reservation = device.info().reserving(ReservedContract::Shared).expect("the device says how it reserves");
         let (rows, n) = (8192u64, 256u64);
@@ -3161,7 +3155,7 @@ fn disagreeing_candidate_is_not_served(
 #[test]
 fn candidates_disagreeing_with_the_native_default_are_never_served() {
     use seismic_native_tests::wrong_default;
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let mut state = f32_tensor(&device, &[4], &[2.; 4]);
         let x = f32_tensor(&device, &[4], &[1.; 4]);
         let mut reset = state.clone();
@@ -3266,7 +3260,7 @@ fn candidates_disagreeing_with_the_native_default_are_never_served() {
 fn a_disagreeing_candidate_ahead_in_its_rounds_is_witnessed_and_excluded() {
     use seismic_native_tests::paced_wrong_default;
     const N: usize = 64;
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let mut state = f32_tensor(&device, &[N as u64], &[2.; N]);
         let x = f32_tensor(&device, &[N as u64], &[1.; N]);
         let mut reset = state.clone();
@@ -3399,7 +3393,7 @@ fn a_search_of_launch_groups_keeps_the_defaults_when_every_candidate_disagrees()
 /// α judges them and changes none.
 #[test]
 fn measurements_are_the_same_facts_under_every_alpha() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let x = f32_tensor(&device, &[4], &[1.; 4]);
         let mut state = f32_tensor(&device, &[4], &[0.; 4]);
         let mut run = |policy: NumericalRequirement| {
@@ -3463,7 +3457,7 @@ fn measurements_are_the_same_facts_under_every_alpha() {
 #[test]
 fn rejected_candidates_stop_after_the_first_timed_invocation() {
     use seismic_native_tests::wrong_default;
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let x = f32_tensor(&device, &[4], &[1.; 4]);
         let mut state = f32_tensor(&device, &[4], &[2.; 4]);
         let mut reset = state.clone();
@@ -3526,7 +3520,7 @@ fn rejected_candidates_stop_after_the_first_timed_invocation() {
 #[test]
 fn pooled_results_cannot_hide_a_candidates_missing_writes() {
     use seismic_native_tests::omitted_write;
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let x = f32_tensor(&device, &[4], &[1., 2., 3., 4.]);
         let result = omitted_write::native_tune(
             &device,
@@ -3570,7 +3564,7 @@ fn pooled_results_cannot_hide_a_candidates_missing_writes() {
 /// that declares no rows holds the whole storage to the requirement.
 #[test]
 fn declared_rows_scope_state_observation_and_observing_the_rest_rejects_stray_writes() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         stray_writes_are_observed_where_declared(device);
     }
 }
@@ -3888,7 +3882,7 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
 /// refused at preparation.
 #[test]
 fn a_ranged_kernel_forms_and_serves_only_its_range() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let ranged = NativeSpecialization::new()
             .with_param("SMALL", 64)
             .with_range("N", 65, 1000);

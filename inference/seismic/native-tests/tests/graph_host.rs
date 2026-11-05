@@ -7,7 +7,7 @@
 //! -- --ignored --nocapture`.
 
 use seismic::{
-    BackendName, Device, Element, HostHeap, NativeGraphFamily,
+    Device, Element, HostHeap, NativeGraphFamily,
     NativeGraphMetadata, NativeSpecialization, Tensor,
 };
 use seismic_native_tests::{accumulate, scale_rows};
@@ -16,15 +16,6 @@ use std::time::Instant;
 const NODES: usize = 300;
 const WARM: usize = 20;
 const RUNS: usize = 200;
-
-fn devices() -> Vec<Device> {
-    seismic_native_tests::devices(&[
-        BackendName::Cpu,
-        BackendName::Metal,
-        BackendName::Cuda,
-        BackendName::Vulkan,
-    ])
-}
 
 /// The host heap of the plan sealed from `nodes` chained `scale_rows` calls
 /// and one `accumulate` on two external ports (a disjoint pair a run
@@ -110,7 +101,7 @@ fn sealed_and_planned_heap(device: &Device, nodes: usize) -> (HostHeap, HostHeap
 /// holds exactly its length, and each added node adds one node's heap.
 #[test]
 fn a_sealed_plan_holds_the_host_heap_its_topology_plans() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let heaps = [1usize, 2, 9].map(|nodes| sealed_and_planned_heap(&device, nodes));
         for (nodes, (sealed, planned)) in [1usize, 2, 9].into_iter().zip(heaps) {
             assert_eq!(
@@ -139,7 +130,7 @@ fn median(values: &mut [f64]) -> f64 {
 #[test]
 #[ignore = "host-time micro-benchmark; run explicitly with --ignored --nocapture"]
 fn host_time_per_run_of_a_300_node_graph() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let (m, n) = (1u64, 8u64);
         let kernel = scale_rows::native_for_device(
             &device,
@@ -224,7 +215,7 @@ fn host_time_per_run_of_a_300_node_graph() {
 /// handle before submission. A weak census handle does not supply that lifetime.
 #[test]
 fn graph_completion_retains_inputs_until_its_outcome_is_taken() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let kernel = scale_rows::native_for_device(
             &device, &NativeSpecialization::new().with_param("ROWS", 1),
         ).unwrap();

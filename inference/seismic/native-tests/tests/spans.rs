@@ -5,12 +5,8 @@
 //! span (Metal, the CPU) refuses a sampled run and runs an unsampled one as
 //! ever.
 
-use seismic::{BackendName, Device, Element, NativeGraphFamily, NativeSpecialization, Tensor};
+use seismic::{BackendName, Element, NativeGraphFamily, NativeSpecialization, Tensor};
 use seismic_native_tests::scale_rows;
-
-fn devices() -> Vec<Device> {
-    seismic_native_tests::devices(&[BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan])
-}
 
 /// A graph of `first` then `second` calls scaling a large row, marked at
 /// its start, between the two and at its end. The mark inside is a node of
@@ -22,7 +18,7 @@ fn devices() -> Vec<Device> {
 fn a_sampled_run_reads_the_device_time_between_its_marks() {
     let (rows, width) = (1u64, 1u64 << 20);
     let (first, second) = (8usize, 16usize);
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let backend = device.backend();
         let kernel = scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1)).unwrap();
         let mut graph = device.native_graph();

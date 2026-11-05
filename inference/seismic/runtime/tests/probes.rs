@@ -15,26 +15,12 @@ fn main() {
 
 #[cfg(not(target_os = "macos"))]
 fn every_probe_answers_in_its_process() {
-    use seismic_runtime::artifacts::{ArtifactKey, ArtifactStore};
+    use seismic_runtime::artifacts::MemoryStore;
     use seismic_topology::{Availability, ExecutorSelector};
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    #[derive(Default)]
-    struct Memory(Mutex<HashMap<(String, ArtifactKey), Vec<u8>>>);
-
-    impl ArtifactStore for Memory {
-        fn get(&self, namespace: &str, key: &ArtifactKey) -> Option<Vec<u8>> {
-            self.0.lock().unwrap().get(&(namespace.to_owned(), key.clone())).cloned()
-        }
-        fn put(&self, namespace: &str, key: &ArtifactKey, bytes: &[u8]) {
-            self.0.lock().unwrap().insert((namespace.to_owned(), key.clone()), bytes.to_vec());
-        }
-    }
 
     let devices = seismic_runtime::devices::Devices::discover(&[]).expect("the machine is discovered");
     let topology = devices.topology();
-    let store = Memory::default();
+    let store = MemoryStore::default();
     for executor in topology.executors() {
         if !matches!(executor.selector(), ExecutorSelector::Vulkan { .. }) || *executor.availability() != Availability::Available {
             continue;

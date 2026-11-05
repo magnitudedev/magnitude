@@ -29,7 +29,14 @@ const H: usize = 64;
 const E: usize = 32;
 const K: usize = 4;
 
+/// The checked routed module, checked once per process: every test and
+/// device reads the same sources.
 fn module() -> CheckedModule {
+    static CHECKED: std::sync::OnceLock<CheckedModule> = std::sync::OnceLock::new();
+    CHECKED.get_or_init(check_module).clone()
+}
+
+fn check_module() -> CheckedModule {
     let mut sources = seismic_std::sources();
     sources.push(SourceFile {
         path: "routed.seismic".into(),
@@ -395,11 +402,31 @@ fn native_device() -> Option<seismic::Device> {
     seismic_native_tests::devices(&[Cuda, Metal, Vulkan]).into_iter().next()
 }
 
-/// Every available device under test, GPUs and the CPU, or the backend
-/// `SEISMIC_TEST_BACKEND` selects (`seismic_native_tests::devices`).
-fn devices() -> Vec<seismic::Device> {
-    use seismic::BackendName::{Cpu, Cuda, Metal, Vulkan};
-    seismic_native_tests::devices(&[Cuda, Metal, Vulkan, Cpu])
+/// `item(index)` of every index below `count`, in index order, computed
+/// across the host's cores: the host references are independent per row,
+/// case and packet row.
+fn parallel<T: Send>(count: usize, item: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism().map_or(1, usize::from).min(count);
+    let mut items = std::thread::scope(|scope| {
+        let work = || {
+            let mut taken = Vec::new();
+            loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if index >= count {
+                    return taken;
+                }
+                taken.push((index, item(index)));
+            }
+        };
+        let workers = (0..workers).map(|_| scope.spawn(work)).collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+            .collect::<Vec<_>>()
+    });
+    items.sort_unstable_by_key(|(index, _)| *index);
+    items.into_iter().map(|(_, item)| item).collect()
 }
 
 fn is_cpu(device: &seismic::Device) -> bool {
@@ -483,8 +510,9 @@ fn route_mapping(
 
 #[test]
 fn native_route_matches_portable_body_for_every_mapping() {
-    for device in devices() {
-        native_route_matches_portable_body_for_every_mapping_on(&device);
+    let checks = RouteCheck::all();
+    for device in seismic_native_tests::every_device() {
+        native_route_matches_portable_body_for_every_mapping_on(&device, &checks);
     }
 }
 
@@ -494,90 +522,125 @@ fn native_route_matches_portable_body_for_every_mapping() {
 /// register).
 const ROUTE_EXPERTS: [usize; 3] = [E, 23, 240];
 
-fn native_route_matches_portable_body_for_every_mapping_on(device: &seismic::Device) {
-    let module = module();
-    for (activation, element, experts) in [
-        (DType::F32, seismic::Element::f32()),
-        (DType::BF16, seismic::Element::bf16()),
-    ]
-    .into_iter()
-    .flat_map(|(activation, element)| {
-        ROUTE_EXPERTS.map(|experts| (activation, element, experts))
-    }) {
-        for ((rows, normalize), expert_scale) in [(1usize, 1), (5, 0), (9, 1)]
+/// One route check: the activation, case and per-expert score scales, with
+/// the portable body's (normalized, coefficient, routes, scores), which no
+/// device changes.
+struct RouteCheck {
+    activation: DType,
+    element: seismic::Element,
+    expert_scale: Vec<f32>,
+    case: RouteCase,
+    portable: (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>),
+}
+
+impl RouteCheck {
+    /// Every route check, each portable body interpreted once for every
+    /// device.
+    fn all() -> Vec<Self> {
+        let checks = [
+            (DType::F32, seismic::Element::f32()),
+            (DType::BF16, seismic::Element::bf16()),
+        ]
+        .into_iter()
+        .flat_map(|(activation, element)| ROUTE_EXPERTS.map(|experts| (activation, element, experts)))
+        .flat_map(|(activation, element, experts)| {
+            [(1usize, 1), (5, 0), (9, 1)].into_iter().flat_map(move |(rows, normalize)| {
+                [Vec::new(), expert_scales(experts)].map(|expert_scale| {
+                    (activation, element, expert_scale, RouteCase::new(rows, normalize, experts))
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+        let module = module();
+        let portable = parallel(checks.len(), |index| {
+            let (activation, _, expert_scale, case) = &checks[index];
+            case.portable_scaled(&module, *activation, expert_scale)
+        });
+        checks
             .into_iter()
-            .flat_map(|case| [Vec::new(), expert_scales(experts)].map(|scale| (case, scale)))
-        {
-            let case = RouteCase::new(rows, normalize, experts);
-            let (normalized, coefficient, routes, scores) =
-                case.portable_scaled(&module, activation, &expert_scale);
-            for (simdgroups, split) in [8, 4, 2].into_iter().flat_map(|simdgroups| {
-                route_splits(&device)
-                    .into_iter()
-                    .map(move |split| (simdgroups, split))
-            }) {
-                let specialization = specialization_on(
-                    device,
-                    &route_statics(
-                        &[("H", H as u64), ("E", experts as u64), ("K", K as u64)],
-                        H as u64,
-                        expert_scale.len() as u64,
-                    ),
-                    &route_mapping(&device, simdgroups, split),
-                );
-                let kernel = routed_route::native_for_device_with(
-                    &device,
-                    routed_route::Elements {
-                        NW: seismic::Element::f32(),
-                        RW: seismic::Element::f32(),
-                        A: element,
-                    },
-                    &specialization,
-                )
+            .zip(portable)
+            .map(|((activation, element, expert_scale, case), portable)| Self {
+                activation,
+                element,
+                expert_scale,
+                case,
+                portable,
+            })
+            .collect()
+    }
+}
+
+fn native_route_matches_portable_body_for_every_mapping_on(device: &seismic::Device, checks: &[RouteCheck]) {
+    for RouteCheck { activation, element, expert_scale, case, portable } in checks {
+        let (activation, element) = (*activation, *element);
+        let (rows, normalize, experts) = (case.rows, case.normalize, case.experts);
+        let (normalized, coefficient, routes, scores) = portable;
+        for (simdgroups, split) in [8, 4, 2].into_iter().flat_map(|simdgroups| {
+            route_splits(&device)
+                .into_iter()
+                .map(move |split| (simdgroups, split))
+        }) {
+            let specialization = specialization_on(
+                device,
+                &route_statics(
+                    &[("H", H as u64), ("E", experts as u64), ("K", K as u64)],
+                    H as u64,
+                    expert_scale.len() as u64,
+                ),
+                &route_mapping(&device, simdgroups, split),
+            );
+            let kernel = routed_route::native_for_device_with(
+                &device,
+                routed_route::Elements {
+                    NW: seismic::Element::f32(),
+                    RW: seismic::Element::f32(),
+                    A: element,
+                },
+                &specialization,
+            )
+            .unwrap();
+            let mut native_routes =
+                i32_tensor(&device, &[rows as u64, K as u64], &vec![-7; rows * K]);
+            let mut native_scores =
+                f32_tensor(&device, &[rows as u64, K as u64], &vec![-7.0; rows * K]);
+            let outcome = kernel
+                .call(routed_route::Args {
+                    residual: &f32_tensor(&device, &[rows as u64, H as u64], &case.residual),
+                    norm: &f32_tensor(&device, &[H as u64], &case.norm),
+                    router: &f32_tensor(&device, &[experts as u64, H as u64], &case.router),
+                    shared_router: &f32_tensor(&device, &[H as u64], &case.shared_router),
+                    routes: &mut native_routes,
+                    scores: &mut native_scores,
+                    eps: 1e-6,
+                    normalize,
+                    expert_scale: &scale_port(device, &expert_scale),
+                })
                 .unwrap();
-                let mut native_routes =
-                    i32_tensor(&device, &[rows as u64, K as u64], &vec![-7; rows * K]);
-                let mut native_scores =
-                    f32_tensor(&device, &[rows as u64, K as u64], &vec![-7.0; rows * K]);
-                let outcome = kernel
-                    .call(routed_route::Args {
-                        residual: &f32_tensor(&device, &[rows as u64, H as u64], &case.residual),
-                        norm: &f32_tensor(&device, &[H as u64], &case.norm),
-                        router: &f32_tensor(&device, &[experts as u64, H as u64], &case.router),
-                        shared_router: &f32_tensor(&device, &[H as u64], &case.shared_router),
-                        routes: &mut native_routes,
-                        scores: &mut native_scores,
-                        eps: 1e-6,
-                        normalize,
-                        expert_scale: &scale_port(device, &expert_scale),
-                    })
-                    .unwrap();
-                let label = format!(
-                    "{activation:?} E {experts} ES {} rows {rows} SIMDGROUPS {simdgroups} SPLIT {split}",
-                    expert_scale.len()
-                );
-                let expected_routes = routes.iter().map(|v| *v as i32).collect::<Vec<_>>();
-                assert_eq!(read_i32(&native_routes), expected_routes, "{label} routes");
-                assert_close(
-                    &format!("{label} scores"),
-                    &read_f32(&native_scores),
-                    &scores,
-                    1e-5,
-                );
-                let rounding = if activation == DType::F32 { 1e-5 } else { 8e-3 };
-                assert_close(
-                    &format!("{label} normalized"),
-                    &read_activation(&outcome.r0, activation),
-                    &normalized,
-                    rounding,
-                );
-                assert_close(
-                    &format!("{label} coefficient"),
-                    &read_f32(&outcome.r1),
-                    &coefficient,
-                    1e-4,
-                );
-            }
+            let label = format!(
+                "{activation:?} E {experts} ES {} rows {rows} SIMDGROUPS {simdgroups} SPLIT {split}",
+                expert_scale.len()
+            );
+            let expected_routes = routes.iter().map(|v| *v as i32).collect::<Vec<_>>();
+            assert_eq!(read_i32(&native_routes), expected_routes, "{label} routes");
+            assert_close(
+                &format!("{label} scores"),
+                &read_f32(&native_scores),
+                &scores,
+                1e-5,
+            );
+            let rounding = if activation == DType::F32 { 1e-5 } else { 8e-3 };
+            assert_close(
+                &format!("{label} normalized"),
+                &read_activation(&outcome.r0, activation),
+                &normalized,
+                rounding,
+            );
+            assert_close(
+                &format!("{label} coefficient"),
+                &read_f32(&outcome.r1),
+                &coefficient,
+                1e-4,
+            );
         }
     }
 }
@@ -632,7 +695,7 @@ fn native_route_ranks_nan_as_negative_infinity() {
             (case, portable)
         })
         .collect::<Vec<_>>();
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         for (case, (normalized, coefficient, routes, scores)) in &cases {
             let (rows, experts) = (case.rows, case.experts);
             let label = format!("{:?} E {experts} rows {rows}", device.backend());
@@ -741,7 +804,7 @@ fn native_select_ranks_nan_as_negative_infinity() {
             (experts, rows, choices, router, bias, residual, norm, routes, input(&outcome, 7), result(&outcome, 0))
         })
         .collect::<Vec<_>>();
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         for (experts, rows, choices, router, bias, residual, norm, routes, weights, normalized) in &cases {
             let (experts, rows, choices) = (*experts, *rows, *choices);
             let label = format!("{:?} E {experts} rows {rows}", device.backend());
@@ -983,7 +1046,7 @@ fn portable_group_is_a_stable_expert_permutation() {
 
 #[test]
 fn native_group_matches_portable_tables() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         native_group_matches_portable_tables_on(&device);
     }
 }
@@ -1022,7 +1085,7 @@ fn native_group_matches_portable_tables_on(device: &seismic::Device) {
 /// tables: the tables of 512 rows inside 16,384 are those of 512 alone.
 #[test]
 fn native_group_spans_chunks_and_groups_rows_below_capacity() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         for rows in [512, 4096, 16_384] {
             let case = GroupCase::new(rows, 256, 32);
             let expected = case.contract(case.host());
@@ -1517,28 +1580,33 @@ impl Routed {
     /// to each published product.
     fn expand(&self, routing: &Routing, round: fn(f32) -> f32) -> (Vec<f32>, Vec<f32>) {
         let (h, k, f, s) = (self.hidden, self.choices, self.features, self.shared);
-        let mut expert = vec![0.0; routing.rows * k * f];
-        let mut shared = vec![0.0; routing.rows * s];
-        for m in 0..routing.rows {
+        let rows = parallel(routing.rows, |m| {
             let normalized = &routing.normalized[m * h..(m + 1) * h];
             let x = operands::operand_rows(normalized, h, self.nvfp4.expert_gate_up);
-            for choice in 0..k {
-                let e = routing.routes[m * k + choice] as usize;
-                for feature in 0..f {
+            let expert = (0..k)
+                .flat_map(|choice| {
+                    let e = routing.routes[m * k + choice] as usize;
+                    (0..f).map(move |feature| (e, feature))
+                })
+                .map(|(e, feature)| {
                     let row = (e * f + feature) * h;
                     let gate = scaled(&self.gate_scale, e, dot(&x, &self.expert_gate[row..row + h]));
                     let up = scaled(&self.up_scale, e, dot(&x, &self.expert_up[row..row + h]));
-                    expert[(m * k + choice) * f + feature] = glu(gate, up, round);
-                }
-            }
+                    glu(gate, up, round)
+                })
+                .collect::<Vec<_>>();
             let x = operands::operand_rows(normalized, h, self.nvfp4.shared_gate_up);
-            for feature in 0..s {
-                let gate = dot(&x, &self.shared_gate[feature * h..(feature + 1) * h]);
-                let up = dot(&x, &self.shared_up[feature * h..(feature + 1) * h]);
-                shared[m * s + feature] = glu(gate, up, round);
-            }
-        }
-        (expert, shared)
+            let shared = (0..s)
+                .map(|feature| {
+                    let gate = dot(&x, &self.shared_gate[feature * h..(feature + 1) * h]);
+                    let up = dot(&x, &self.shared_up[feature * h..(feature + 1) * h]);
+                    glu(gate, up, round)
+                })
+                .collect::<Vec<_>>();
+            (expert, shared)
+        });
+        let (expert, shared): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+        (expert.concat(), shared.concat())
     }
 
     /// Each choice's product row and each shared product row as its down
@@ -1559,26 +1627,26 @@ impl Routed {
     ) -> Vec<f32> {
         let (h, k, f, s) = (self.hidden, self.choices, self.features, self.shared);
         let (expert, shared) = &self.down_rows(expert, shared);
-        let mut value = vec![0.0; routing.rows * h];
-        for m in 0..routing.rows {
-            for column in 0..h {
-                let mut selected = 0.0f32;
-                for choice in 0..k {
-                    let e = routing.routes[m * k + choice] as usize;
-                    let row = (e * h + column) * f;
-                    let product = &expert[(m * k + choice) * f..(m * k + choice + 1) * f];
-                    let published = round(dot(product, &self.expert_down[row..row + f]));
-                    selected = routing.scores[m * k + choice].mul_add(published, selected);
-                }
-                let down = round(dot(
-                    &shared[m * s..(m + 1) * s],
-                    &self.shared_down[column * s..(column + 1) * s],
-                ));
-                value[m * h + column] =
-                    routing.residual[m * h + column] + selected + down * routing.coefficient[m];
-            }
-        }
-        value
+        parallel(routing.rows, |m| {
+            (0..h)
+                .map(|column| {
+                    let mut selected = 0.0f32;
+                    for choice in 0..k {
+                        let e = routing.routes[m * k + choice] as usize;
+                        let row = (e * h + column) * f;
+                        let product = &expert[(m * k + choice) * f..(m * k + choice + 1) * f];
+                        let published = round(dot(product, &self.expert_down[row..row + f]));
+                        selected = routing.scores[m * k + choice].mul_add(published, selected);
+                    }
+                    let down = round(dot(
+                        &shared[m * s..(m + 1) * s],
+                        &self.shared_down[column * s..(column + 1) * s],
+                    ));
+                    routing.residual[m * h + column] + selected + down * routing.coefficient[m]
+                })
+                .collect::<Vec<_>>()
+        })
+        .concat()
     }
 
     /// The publication slack of [`Routed::output`] at bf16: each published
@@ -1588,25 +1656,26 @@ impl Routed {
     fn publication_slack(&self, routing: &Routing, expert: &[f32], shared: &[f32]) -> Vec<f32> {
         let (h, k, f, s) = (self.hidden, self.choices, self.features, self.shared);
         let (expert, shared) = &self.down_rows(expert, shared);
-        let mut slack = vec![0.0; routing.rows * h];
-        for m in 0..routing.rows {
-            for column in 0..h {
-                let mut total = 0.0f32;
-                for choice in 0..k {
-                    let e = routing.routes[m * k + choice] as usize;
-                    let row = (e * h + column) * f;
-                    let product = &expert[(m * k + choice) * f..(m * k + choice + 1) * f];
-                    total += routing.scores[m * k + choice].abs()
-                        * bf16_ulp(dot(product, &self.expert_down[row..row + f]));
-                }
-                let down = dot(
-                    &shared[m * s..(m + 1) * s],
-                    &self.shared_down[column * s..(column + 1) * s],
-                );
-                slack[m * h + column] = total + routing.coefficient[m].abs() * bf16_ulp(down);
-            }
-        }
-        slack
+        parallel(routing.rows, |m| {
+            (0..h)
+                .map(|column| {
+                    let mut total = 0.0f32;
+                    for choice in 0..k {
+                        let e = routing.routes[m * k + choice] as usize;
+                        let row = (e * h + column) * f;
+                        let product = &expert[(m * k + choice) * f..(m * k + choice + 1) * f];
+                        total += routing.scores[m * k + choice].abs()
+                            * bf16_ulp(dot(product, &self.expert_down[row..row + f]));
+                    }
+                    let down = dot(
+                        &shared[m * s..(m + 1) * s],
+                        &self.shared_down[column * s..(column + 1) * s],
+                    );
+                    total + routing.coefficient[m].abs() * bf16_ulp(down)
+                })
+                .collect::<Vec<_>>()
+        })
+        .concat()
     }
 }
 
@@ -1745,8 +1814,7 @@ fn packed_weight(
 }
 
 fn packed_router_matches_dense_decoding(representation: &str, backend: seismic::BackendName) {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    let Ok(device) = catalog.open_backend(backend) else {
+    let Some(device) = seismic_native_tests::devices(&[backend]).into_iter().next() else {
         return;
     };
     const HIDDEN: usize = 256;
@@ -1896,45 +1964,81 @@ type Planes = (seismic::Element, Vec<u8>, Vec<f32>);
 /// The resident element, layout bytes and decoded values of a
 /// `representation` weight of `shape` with pseudo-random planes. Decoding
 /// through the reference recipe is slow in a test build, so every device and
-/// test of one resident layout shares one decoding.
+/// test shares one decoding of the packets, and every device and test of one
+/// resident layout one placement of them.
 fn packed_planes(
     device: &seismic::Device,
     representation: &str,
     shape: &[u64],
     seed: u32,
 ) -> Planes {
-    type Key = (registry::Layout, String, Vec<u64>, u32);
-    static DECODED: std::sync::Mutex<Vec<(Key, Planes)>> = std::sync::Mutex::new(Vec::new());
-    let key = (
-        resident_layout(device),
-        representation.to_owned(),
-        shape.to_vec(),
-        seed,
-    );
+    type Key = (String, Vec<u64>, u32);
+    static DECODED: std::sync::Mutex<Vec<(Key, Packets)>> = std::sync::Mutex::new(Vec::new());
+    let key = (representation.to_owned(), shape.to_vec(), seed);
+    let layout = resident_layout(device);
     let mut decoded = DECODED.lock().unwrap();
-    if let Some((_, planes)) = decoded.iter().find(|(known, _)| *known == key) {
-        return planes.clone();
-    }
-    let planes = decode_packed_planes(key.0, representation, shape, seed);
-    decoded.push((key, planes.clone()));
-    planes
-}
-
-fn decode_packed_planes(
-    layout: registry::Layout,
-    representation: &str,
-    shape: &[u64],
-    seed: u32,
-) -> Planes {
-    use registry::{Layout, RepresentationKind};
-    let packet_id = registry::storage(representation, Layout::Packet).unwrap();
-    let RepresentationKind::Packed(packet) = &registry::representation_info(packet_id).kind else {
-        panic!("{representation} is packed")
+    let index = match decoded.iter().position(|(known, _)| *known == key) {
+        Some(index) => index,
+        None => {
+            decoded.push((key, Packets::decoded(representation, shape, seed)));
+            decoded.len() - 1
+        }
     };
+    let packets = &mut decoded[index].1;
     let rows_id = registry::storage(representation, layout).unwrap();
-    let RepresentationKind::PackedRows(rows) = &registry::representation_info(rows_id).kind else {
+    let registry::RepresentationKind::PackedRows(rows) = &registry::representation_info(rows_id).kind else {
         panic!("{representation} resident storage is a row layout")
     };
+    let placed = match packets.placed.iter().find(|(known, _)| *known == layout) {
+        Some((_, placed)) => placed.clone(),
+        None => {
+            let placed = rows.place(shape, &packets.bytes);
+            packets.placed.push((layout, placed.clone()));
+            placed
+        }
+    };
+    let element = seismic::Element::named(registry::representation_info(rows_id).name).unwrap();
+    (element, placed, packets.values.clone())
+}
+
+/// A packed weight's pseudo-random packets, their decoded values, and their
+/// placements in the resident layouts asked for so far.
+struct Packets {
+    bytes: Vec<u8>,
+    values: Vec<f32>,
+    placed: Vec<(registry::Layout, Vec<u8>)>,
+}
+
+impl Packets {
+    /// The packets of a `representation` weight of `shape` from `seed`,
+    /// decoded in the packet layout, whose values every row layout's
+    /// placement keeps: each packet row decodes on its own, across the
+    /// host's cores.
+    fn decoded(representation: &str, shape: &[u64], seed: u32) -> Self {
+        let packet_id = registry::storage(representation, registry::Layout::Packet).unwrap();
+        let registry::RepresentationKind::Packed(packet) = &registry::representation_info(packet_id).kind else {
+            panic!("{representation} is packed")
+        };
+        let bytes = random_packets(packet, shape, seed);
+        let (&last, leading) = shape.split_last().unwrap();
+        let row_bytes = bytes.len() / leading.iter().product::<u64>() as usize;
+        let values = parallel(bytes.len() / row_bytes, |row| {
+            TensorData::encoded(packet_id, vec![1, last as usize], bytes[row * row_bytes..(row + 1) * row_bytes].to_vec())
+                .unwrap()
+                .values()
+                .unwrap()
+        })
+        .into_iter()
+        .flatten()
+        .map(|value| value as f32)
+        .collect();
+        Self { bytes, values, placed: Vec::new() }
+    }
+}
+
+/// Pseudo-random packets of a weight of `shape` in `packet`'s form, with
+/// GGUF-like scale magnitudes.
+fn random_packets(packet: &registry::PackedPacketLayout, shape: &[u64], seed: u32) -> Vec<u8> {
     let (last, leading) = shape.split_last().unwrap();
     let packets = leading.iter().product::<u64>() * last.div_ceil(u64::from(packet.group));
     let size = packet.packet_size as usize;
@@ -1977,20 +2081,7 @@ fn decode_packed_planes(
             }
         }
     }
-    let placed = rows.place(shape, &bytes);
-    let shape_usize = shape
-        .iter()
-        .map(|extent| *extent as usize)
-        .collect::<Vec<_>>();
-    let values = TensorData::encoded(rows_id, shape_usize, placed.clone())
-        .unwrap()
-        .values()
-        .unwrap()
-        .into_iter()
-        .map(|value| value as f32)
-        .collect();
-    let element = seismic::Element::named(registry::representation_info(rows_id).name).unwrap();
-    (element, placed, values)
+    bytes
 }
 
 fn bf16_tensor(device: &seismic::Device, shape: &[u64], values: &[f32]) -> seismic::Tensor {
@@ -2381,7 +2472,7 @@ fn joined_statics(statics: &[(&'static str, u64)]) -> Vec<(&'static str, u64)> {
 
 #[test]
 fn native_decode_expand_and_output_match_reference() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         native_decode_expand_and_output_match_reference_on(&device, false);
         if is_cpu(&device) {
             native_decode_expand_and_output_match_reference_on(&device, true);
@@ -2393,7 +2484,7 @@ fn native_decode_expand_and_output_match_reference() {
 /// its own row stride (no tile padding).
 #[test]
 fn native_decode_expand_and_output_match_reference_with_bf16_experts() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         native_decode_expand_and_output_match_reference_rows(
             &device,
             PackedBlock::new(&device, Experts::Bf16),
@@ -2407,7 +2498,7 @@ fn native_decode_expand_and_output_match_reference_with_bf16_experts() {
 /// Routed and shared experts all IQ2_XXS (Nemotron 3.5 Bolt).
 #[test]
 fn native_decode_expand_and_output_match_reference_with_iq2_xxs_experts() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         native_decode_expand_and_output_match_reference_rows(
             &device,
             PackedBlock::new(&device, Experts::Iq2Xxs),
@@ -2422,7 +2513,7 @@ fn native_decode_expand_and_output_match_reference_with_iq2_xxs_experts() {
 /// and IQ3_XXS.
 #[test]
 fn native_decode_expand_and_output_match_reference_with_coded_experts() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         for experts in [Experts::Coded, Experts::Fp4, Experts::Fp4A4, Experts::Grid] {
             native_decode_expand_and_output_match_reference_rows(
                 &device,
@@ -2437,7 +2528,7 @@ fn native_decode_expand_and_output_match_reference_with_coded_experts() {
 
 #[test]
 fn vulkan_decode_expand_and_output_match_reference_with_iq4_experts() {
-    for device in devices()
+    for device in seismic_native_tests::every_device()
         .into_iter()
         .filter(|device| device.backend() == seismic::BackendName::Vulkan)
     {
@@ -2868,7 +2959,7 @@ fn cuda_scoped_routed_output_tunes_declared_candidates() {
 
 #[test]
 fn native_grouped_prefill_matches_reference() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         native_grouped_prefill_matches_reference_on(
             &device,
             PackedBlock::new(&device, Experts::Packed),
@@ -2891,7 +2982,7 @@ fn native_grouped_prefill_matches_reference() {
 /// grouped GEMMs.
 #[test]
 fn native_routed_experts_match_reference_with_nvfp4_experts() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         for experts in [Experts::Fp4, Experts::Fp4A4] {
             native_decode_expand_and_output_match_reference_rows(
                 &device,
@@ -3028,7 +3119,7 @@ fn grouped_experts(device: &seismic::Device, block: &PackedBlock, mapping: &[(&'
 /// give each row the bits of its own chunk's 512-row pass.
 #[test]
 fn native_merged_expert_pass_keeps_each_chunks_bits_at_any_capacity() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let block = PackedBlock::new(&device, Experts::Packed);
         let routing = PackedBlock::routing(2048, 77);
         let (scales, map) = (block.routed.expansion_scales(&device), [absent_map(&device), absent_step(&device)]);
@@ -3067,7 +3158,7 @@ fn native_merged_expert_pass_keeps_each_chunks_bits_at_any_capacity() {
 #[test]
 fn native_expert_row_keeps_its_bits_at_any_tile_occupancy() {
     let (h, k) = (PackedBlock::HIDDEN, PackedBlock::CHOICES);
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let block = PackedBlock::new(&device, Experts::Packed);
         let mut routing = PackedBlock::routing(32, 79);
         routing.routes = routing.routes[..k].repeat(32);
@@ -3091,7 +3182,7 @@ fn native_expert_row_keeps_its_bits_at_any_tile_occupancy() {
 /// and the grouped (prefill) expert GEMMs.
 #[test]
 fn native_routed_experts_match_reference_with_iq4_block_experts() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         native_decode_expand_and_output_match_reference_rows(
             &device,
             PackedBlock::new(&device, Experts::Iq4Blocks),
@@ -3111,7 +3202,7 @@ fn native_routed_experts_match_reference_with_iq4_block_experts() {
 /// Dense bf16 experts in the grouped (prefill) expert GEMMs.
 #[test]
 fn native_grouped_prefill_matches_reference_with_bf16_experts() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         native_grouped_prefill_matches_reference_on(
             &device,
             PackedBlock::new(&device, Experts::Bf16),
@@ -3123,7 +3214,7 @@ fn native_grouped_prefill_matches_reference_with_bf16_experts() {
 
 #[test]
 fn cuda_grouped_physical_f16_operands_match_reference() {
-    let device = devices()
+    let device = seismic_native_tests::every_device()
         .into_iter()
         .find(|device| device.backend() == seismic::BackendName::Cuda);
     if let Some(device) = device {
@@ -3745,7 +3836,7 @@ impl TilePool {
 
 #[test]
 fn native_35b_geometry_chain_matches_reference() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         native_35b_geometry_chain_matches_reference_on(&device);
     }
 }
@@ -4252,7 +4343,7 @@ fn native_35b_shared_route_cases(
 /// for all 256 experts, and the combined rows must keep every bit.
 #[test]
 fn native_35b_grouped_capacity_keeps_every_bit() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         native_35b_grouped_capacity_keeps_every_bit_on(&device);
     }
 }

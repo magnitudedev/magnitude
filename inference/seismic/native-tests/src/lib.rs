@@ -12,13 +12,31 @@ include!(concat!(env!("OUT_DIR"), "/fixtures.rs"));
 /// the backends it runs on, so under a requested backend outside it the
 /// test selects none; a requested backend inside it must be available and
 /// open, as absence is never a successful empty run.
+///
+/// Every device opens with the test binary's one store of compiled
+/// programs: a program its tests form again, for another case, device or
+/// test, compiles once in the process, the first time any test forms it,
+/// and loads from the store after. A test that observes its compiles opens
+/// its devices with its own store ([`devices_with`]).
 pub fn devices(backends: &[seismic::BackendName]) -> Vec<seismic::Device> {
-    devices_with(backends, seismic::DeviceOptions::default())
+    static COMPILED: std::sync::LazyLock<std::sync::Arc<seismic::MemoryStore>> =
+        std::sync::LazyLock::new(Default::default);
+    devices_with(
+        backends,
+        seismic::DeviceOptions { artifacts: Some(COMPILED.clone()), ..Default::default() },
+    )
+}
+
+/// Every available backend's device, the CPU's included, or the backend
+/// the runner requests ([`devices`]): for a test every backend runs.
+pub fn every_device() -> Vec<seismic::Device> {
+    use seismic::BackendName::{Cpu, Cuda, Metal, Vulkan};
+    devices(&[Cpu, Metal, Cuda, Vulkan])
 }
 
 /// Select test devices with the caller's artifact-store configuration. Each
 /// call discovers and opens fresh devices; selection has the same contract
-/// as `devices`.
+/// as [`devices`].
 pub fn devices_with(
     backends: &[seismic::BackendName],
     options: seismic::DeviceOptions,

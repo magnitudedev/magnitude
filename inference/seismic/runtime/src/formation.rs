@@ -522,6 +522,7 @@ impl<T: Toolchain> ProgramFormer<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifacts::MemoryStore;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Compiles a source to its entries' symbols, its artifact their names
@@ -588,26 +589,7 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct Memory(Mutex<HashMap<(String, ArtifactKey), Vec<u8>>>);
-
-    impl ArtifactStore for Memory {
-        fn get(&self, namespace: &str, key: &ArtifactKey) -> Option<Vec<u8>> {
-            self.0
-                .lock()
-                .unwrap()
-                .get(&(namespace.to_owned(), key.clone()))
-                .cloned()
-        }
-        fn put(&self, namespace: &str, key: &ArtifactKey, bytes: &[u8]) {
-            self.0
-                .lock()
-                .unwrap()
-                .insert((namespace.to_owned(), key.clone()), bytes.to_vec());
-        }
-    }
-
-    fn former(store: Option<Arc<Memory>>) -> ProgramFormer<Echo> {
+    fn former(store: Option<Arc<MemoryStore>>) -> ProgramFormer<Echo> {
         ProgramFormer::new(
             Echo {
                 identity: seismic_native_target::ToolchainIdentity {
@@ -717,7 +699,7 @@ mod tests {
         assert_eq!(class(&former, &[wide.clone()]), (Kept, 0));
         drop(held);
         assert_eq!(class(&former, &[wide.clone()]), (Compiled, 2));
-        let former = self::former(Some(Arc::new(Memory::default())));
+        let former = self::former(Some(Arc::new(MemoryStore::default())));
         let other = source("other", &["k"]);
         assert_eq!(class(&former, &[other.clone()]), (Compiled, 1));
         drop(former.form(&[other.clone()]).unwrap());
@@ -729,7 +711,7 @@ mod tests {
     /// nothing the first compiled.
     #[test]
     fn another_process_loads_every_entry_from_the_store_and_compiles_none() {
-        let store = Arc::new(Memory::default());
+        let store = Arc::new(MemoryStore::default());
         let first = former(Some(store.clone()));
         let _narrow = first.form(&[source("launch", &["k<8>"])]).unwrap();
         // The second call compiles only what the first did not.
@@ -754,7 +736,7 @@ mod tests {
     /// compile rewrites it.
     #[test]
     fn only_a_dropped_artifact_is_a_miss() {
-        let store = Arc::new(Memory::default());
+        let store = Arc::new(MemoryStore::default());
         let first = former(Some(store.clone()));
         let narrow = source("launch", &["k<8>"]);
         drop(first.form(&[narrow.clone()]).unwrap());
@@ -765,14 +747,14 @@ mod tests {
                 ProgramFormer::<Echo>::artifact_key(&key, &listed(entries)),
             )
         };
-        store.0.lock().unwrap().remove(&stored(&narrow.entries)).expect("the artifact was stored");
+        store.entries().remove(&stored(&narrow.entries)).expect("the artifact was stored");
         let wide = source("launch", &["k<8>", "k<16>"]);
         let fresh = former(Some(store.clone()));
         assert_eq!(class(&fresh, &[narrow.clone()]), (FormationClass::Compiled, 1));
         drop(fresh.form(&[wide.clone()]).unwrap());
         assert_eq!((compiles(&fresh), entries(&fresh)), (1, 2));
         let (namespace, artifact) = stored(&wide.entries);
-        store.0.lock().unwrap().insert((namespace, artifact), vec![0xff]);
+        store.entries().insert((namespace, artifact), vec![0xff]);
         let damaged = former(Some(store.clone()));
         drop(damaged.form(&[narrow.clone()]).unwrap());
         assert_eq!(compiles(&damaged), 1, "an undecodable artifact is compiled again");
@@ -784,7 +766,7 @@ mod tests {
     /// the compile rewrites the pointer, which a later former then follows.
     #[test]
     fn a_damaged_pointer_is_a_miss_and_is_rewritten() {
-        let store = Arc::new(Memory::default());
+        let store = Arc::new(MemoryStore::default());
         let first = former(Some(store.clone()));
         let narrow = source("launch", &["k<8>"]);
         drop(first.form(&[narrow.clone()]).unwrap());
@@ -792,12 +774,12 @@ mod tests {
             String::from("echo"),
             ProgramFormer::<Echo>::entry_key(&first.key(&narrow), &narrow.entries[0]),
         );
-        store.0.lock().unwrap().insert(pointer.clone(), b"not a key".to_vec());
+        store.entries().insert(pointer.clone(), b"not a key".to_vec());
         let damaged = former(Some(store.clone()));
         assert_eq!(class(&damaged, &[narrow.clone()]), (FormationClass::Compiled, 1));
         drop(damaged.form(&[narrow.clone()]).unwrap());
         assert_eq!(compiles(&damaged), 1);
-        let rewritten = store.0.lock().unwrap()[&pointer].clone();
+        let rewritten = store.entries()[&pointer].clone();
         let parsed = std::str::from_utf8(&rewritten).ok().and_then(ArtifactKey::parse);
         assert!(parsed.is_some(), "the compile rewrote the pointer");
         let after = former(Some(store));
@@ -809,7 +791,7 @@ mod tests {
     /// serve every entry, compiled otherwise.
     #[test]
     fn a_formation_is_classed_by_the_live_compiles_and_the_store_before_it_runs() {
-        let store = Arc::new(Memory::default());
+        let store = Arc::new(MemoryStore::default());
         let first = former(Some(store.clone()));
         let wide = source("launch", &["k<16>", "k<32>"]);
         use FormationClass::{Compiled, Kept};

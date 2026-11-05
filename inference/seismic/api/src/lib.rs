@@ -48,7 +48,7 @@ pub mod testing {
             .find(|executor| executor.backend() == backend && matches!(executor.availability(), Availability::Available))
     }
 }
-pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactStore, DeviceOptions};
+pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactStore, DeviceOptions, MemoryStore};
 pub use seismic_runtime::probes::{serve_probe_if_asked, KeptProbe, ProbeFailure, ProbeRun, NAMESPACE as PROBE_NAMESPACE};
 /// What a native declaration reads of the device it runs on, `device.NAME`,
 /// and how each backend establishes it.

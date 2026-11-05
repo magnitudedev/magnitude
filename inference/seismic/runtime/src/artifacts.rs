@@ -63,6 +63,32 @@ pub trait ArtifactStore: Send + Sync {
     fn put(&self, namespace: &str, key: &ArtifactKey, bytes: &[u8]);
 }
 
+/// Artifacts held in memory for the life of the store: a store that keeps
+/// nothing between processes. Shared by every device opened with it, it
+/// forms each program once in the process.
+#[derive(Default)]
+pub struct MemoryStore(std::sync::Mutex<MemoryEntries>);
+
+/// What a [`MemoryStore`] holds, by namespace and key.
+pub type MemoryEntries = std::collections::HashMap<(String, ArtifactKey), Vec<u8>>;
+
+impl MemoryStore {
+    /// What the store holds, to read or change in place (a test's damage).
+    pub fn entries(&self) -> std::sync::MutexGuard<'_, MemoryEntries> {
+        self.0.lock().expect("the memory store")
+    }
+}
+
+impl ArtifactStore for MemoryStore {
+    fn get(&self, namespace: &str, key: &ArtifactKey) -> Option<Vec<u8>> {
+        self.entries().get(&(namespace.to_owned(), key.clone())).cloned()
+    }
+
+    fn put(&self, namespace: &str, key: &ArtifactKey, bytes: &[u8]) {
+        self.entries().insert((namespace.to_owned(), key.clone()), bytes.to_vec());
+    }
+}
+
 /// How a device is opened.
 #[derive(Clone, Default)]
 pub struct DeviceOptions {

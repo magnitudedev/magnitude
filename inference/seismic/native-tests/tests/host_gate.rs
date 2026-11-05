@@ -5,20 +5,11 @@
 //! submitting thread, so its gate blocks that thread until another opens it.
 
 use seismic::{
-    BackendName, Device, Devices, Element, NativeGraphFamily, NativeGraphMetadata,
+    BackendName, Devices, Element, NativeGraphFamily, NativeGraphMetadata,
     NativeSpecialization, Tensor, Timeline, TimelineNode,
 };
 use seismic_native_tests::scale_rows;
 use std::time::Duration;
-
-fn devices() -> Vec<Device> {
-    seismic_native_tests::devices(&[
-        BackendName::Cpu,
-        BackendName::Metal,
-        BackendName::Cuda,
-        BackendName::Vulkan,
-    ])
-}
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
     values.iter().flat_map(|value| value.to_le_bytes()).collect()
@@ -40,7 +31,7 @@ fn read_f32(tensor: &Tensor) -> Vec<f32> {
 #[test]
 fn a_gate_holds_the_work_after_it_until_the_host_opens_it() {
     let (m, n) = (1u64, 8u64);
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let backend = device.backend();
         let kernel =
             scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
@@ -144,7 +135,7 @@ fn a_gate_holds_the_work_after_it_until_the_host_opens_it() {
 #[test]
 fn an_open_gate_lets_the_run_through() {
     let (m, n) = (2u64, 4u64);
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let kernel =
             scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
                 .unwrap();

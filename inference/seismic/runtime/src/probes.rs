@@ -330,21 +330,8 @@ fn serve(arguments: &[String]) -> i32 {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::artifacts::MemoryStore;
     use seismic_lang::device::vulkan::Probed;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    #[derive(Default)]
-    struct Memory(Mutex<HashMap<(String, ArtifactKey), Vec<u8>>>);
-
-    impl ArtifactStore for Memory {
-        fn get(&self, namespace: &str, key: &ArtifactKey) -> Option<Vec<u8>> {
-            self.0.lock().unwrap().get(&(namespace.to_owned(), key.clone())).cloned()
-        }
-        fn put(&self, namespace: &str, key: &ArtifactKey, bytes: &[u8]) {
-            self.0.lock().unwrap().insert((namespace.to_owned(), key.clone()), bytes.to_vec());
-        }
-    }
 
     /// A process's answer is kept, and its crash after it began probing is
     /// kept as unanswerable; its failure (exit 1), a crash before it began or
@@ -369,7 +356,7 @@ mod tests {
             backend: seismic_topology::BackendName::Vulkan,
             driver: "vulkan driver 4 version 1".into(),
         };
-        let store = Memory::default();
+        let store = MemoryStore::default();
         let later = Instant::now() + std::time::Duration::from_secs(30);
         let device = ["vulkan", "device"];
         let first = run::<Probed>(&store, &identity, 1, &program, &device, later).unwrap();

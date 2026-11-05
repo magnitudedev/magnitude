@@ -4,19 +4,10 @@
 //! updated to the storage each run binds. Run on every available device.
 
 use seismic::{
-    BackendName, Device, Element, GraphReplays, NativeGraphClassSlice, NativeGraphFamily, NativeGraphMetadata,
+    BackendName, Element, GraphReplays, NativeGraphClassSlice, NativeGraphFamily, NativeGraphMetadata,
     NativeSpecialization, Tensor,
 };
 use seismic_native_tests::{gated_sum, scale_rows};
-
-fn devices() -> Vec<Device> {
-    seismic_native_tests::devices(&[
-        BackendName::Cpu,
-        BackendName::Metal,
-        BackendName::Cuda,
-        BackendName::Vulkan,
-    ])
-}
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
     values.iter().flat_map(|value| value.to_le_bytes()).collect()
@@ -43,7 +34,7 @@ fn read_f32(tensor: &Tensor) -> Vec<f32> {
 fn a_chains_places_replay_their_shapes_graphs_bit_for_bit() {
     const PLACES: usize = 7;
     let (m, n) = (2u64, 8u64);
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let backend = device.backend();
         let kernel =
             scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
@@ -162,7 +153,7 @@ fn a_launched_plans_slots_are_made_and_run_while_earlier_steps_are_in_flight() {
     // are still running as it is made.
     const BUSY_NODES: usize = 16;
     let (busy_rows, n) = (4096u64, 256u64);
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let backend = device.backend();
         let kernel =
             scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1)).unwrap();
@@ -234,7 +225,7 @@ fn interleaved_classes_slots_and_places_record_each_shape_once() {
     const PLACES: usize = 7;
     let n = 8u64;
     let classes = [1u64, 2, 4];
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let backend = device.backend();
         let mut template = NativeGraphMetadata::new_template(backend);
         let input = template.port_with_class_extent(Element::f32(), &[4, n], 0, "M").unwrap();
@@ -333,7 +324,7 @@ fn interleaved_classes_slots_and_places_record_each_shape_once() {
 fn a_layouts_classes_making_different_launches_replay_one_graph() {
     const SLOTS: usize = 3;
     let classes = [32u64, 128];
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let backend = device.backend();
         let mut template = NativeGraphMetadata::new_template(backend);
         let input = template.port_with_class_extent(Element::f32(), &[128], 0, "N").unwrap();
@@ -398,7 +389,7 @@ fn a_layouts_classes_making_different_launches_replay_one_graph() {
 /// chunks on Vulkan.
 #[test]
 fn the_device_states_its_graph_cost() {
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let cost = device.graph_cost();
         eprintln!("graph cost {:?}: {cost:?}", device.backend());
         match device.backend() {

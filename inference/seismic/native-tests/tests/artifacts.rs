@@ -7,17 +7,17 @@
 //! the binary) keeps nothing.
 
 use seismic::{
-    ArtifactKey, ArtifactStore, BackendName, Device, DeviceOptions, Element,
+    ArtifactKey, ArtifactStore, BackendName, Device, DeviceOptions, Element, MemoryStore,
     NativeSpecialization, Tensor,
 };
 use seismic_native_tests::split_sum;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// An in-memory store that counts lookups, hits and writes.
+/// Seismic's in-memory store, counting its lookups, hits and writes.
 #[derive(Default)]
 struct RecordingStore {
-    entries: Mutex<HashMap<(String, ArtifactKey), Vec<u8>>>,
+    store: MemoryStore,
     counts: Mutex<Counts>,
 }
 
@@ -35,12 +35,12 @@ impl RecordingStore {
 
     /// Everything the store holds, by namespace and key.
     fn stored(&self) -> HashMap<(String, ArtifactKey), Vec<u8>> {
-        self.entries.lock().unwrap().clone()
+        self.store.entries().clone()
     }
 
     /// Replace every stored artifact with bytes no toolchain loads.
     fn corrupt(&self) {
-        for bytes in self.entries.lock().unwrap().values_mut() {
+        for bytes in self.store.entries().values_mut() {
             *bytes = b"not an artifact".to_vec();
         }
     }
@@ -48,12 +48,7 @@ impl RecordingStore {
 
 impl ArtifactStore for RecordingStore {
     fn get(&self, namespace: &str, key: &ArtifactKey) -> Option<Vec<u8>> {
-        let found = self
-            .entries
-            .lock()
-            .unwrap()
-            .get(&(namespace.to_owned(), key.clone()))
-            .cloned();
+        let found = self.store.get(namespace, key);
         let mut counts = self.counts.lock().unwrap();
         counts.gets += 1;
         counts.hits += usize::from(found.is_some());
@@ -61,10 +56,7 @@ impl ArtifactStore for RecordingStore {
     }
 
     fn put(&self, namespace: &str, key: &ArtifactKey, bytes: &[u8]) {
-        self.entries
-            .lock()
-            .unwrap()
-            .insert((namespace.to_owned(), key.clone()), bytes.to_vec());
+        self.store.put(namespace, key, bytes);
         self.counts.lock().unwrap().puts += 1;
     }
 }

@@ -460,17 +460,9 @@ macro_rules! prefill_args {
     };
 }
 
-/// The devices with k8v4 natives: every accelerator present (Metal, CUDA,
-/// Vulkan) and the CPU, or the requested backend alone
-/// ([`seismic_native_tests::devices`]).
-fn k8v4_devices() -> Vec<Device> {
-    use BackendName::{Cpu, Cuda, Metal, Vulkan};
-    seismic_native_tests::devices(&[Metal, Cuda, Vulkan, Cpu])
-}
-
 /// The Metal device, where one is present: the Metal-only tests' device.
 fn metal_device() -> Option<Device> {
-    k8v4_devices().into_iter().find(|device| device.backend() == BackendName::Metal)
+    seismic_native_tests::every_device().into_iter().find(|device| device.backend() == BackendName::Metal)
 }
 
 /// Whether Vulkan's vector decode form (SIMDS, SLICES, KEYWISE) is within the
@@ -1224,7 +1216,7 @@ fn metal_coissue_prefill_of_two_windows_agrees_with_the_default() {
 /// partitions and slab-stored history.
 #[test]
 fn cuda_prefill_of_two_piece_heads_matches_host_model() {
-    let Some(device) = k8v4_devices()
+    let Some(device) = seismic_native_tests::every_device()
         .into_iter()
         .find(|device| device.backend() == BackendName::Cuda)
     else {
@@ -1990,7 +1982,7 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
 fn decode_matches_portable_body() {
     let encoded = Encoded::new(Case::new(GROUPED, 64, 2, &decode_rows(5), 11));
     check_host_model_against_portable_body("attention_decode_k8v4", &encoded);
-    for device in k8v4_devices() {
+    for device in seismic_native_tests::every_device() {
         decode_matches_portable_body_on(&device, &encoded);
     }
 }
@@ -2040,7 +2032,7 @@ fn sinks_decode_and_prefill_match_host_model() {
     let bolt_prefill = Encoded::new(
         Case::new(BOLT_DRAFT, 1200, 2, &prefill_rows(64, 1000), 87).with_sinks(88),
     );
-    for device in k8v4_devices() {
+    for device in seismic_native_tests::every_device() {
         let backend = device.backend();
         for (geometry, encoded) in [(GROUPED, &decode), (BOLT_DRAFT, &bolt_decode)] {
             let expected = encoded.expected();
@@ -2099,7 +2091,7 @@ fn decode_reads_and_writes_across_affine_history_slabs() {
     ];
     let encoded = Encoded::new(Case::new(GROUPED, 96, 3, &rows, 73));
     let expected = encoded.expected();
-    for device in k8v4_devices() {
+    for device in seismic_native_tests::every_device() {
         let backend = device.backend();
         let config = decode_configs(backend, GROUPED).into_iter().next().unwrap();
         let kernel = decode_kernel(&device, GROUPED, &config);
@@ -2141,7 +2133,7 @@ fn decode_reads_spans_crossing_affine_history_slabs() {
     ];
     let encoded = Encoded::new(Case::new(GROUPED, 224, 2, &rows, 79));
     let expected = encoded.expected();
-    for device in k8v4_devices() {
+    for device in seismic_native_tests::every_device() {
         let backend = device.backend();
         for config in decode_configs(backend, GROUPED) {
             let kernel = decode_kernel(&device, GROUPED, &config);
@@ -2173,7 +2165,7 @@ fn prefill_matches_portable_body() {
     // the Qwen geometry test covers eight groups.
     let encoded = Encoded::new(Case::new(SMALL, 400, 2, &prefill_rows(20, 300), 23));
     check_host_model_against_portable_body("attention_prefill_k8v4", &encoded);
-    for device in k8v4_devices() {
+    for device in seismic_native_tests::every_device() {
         prefill_matches_portable_body_on(&device, &encoded);
     }
 }
@@ -2222,7 +2214,7 @@ fn prefill_reads_and_writes_across_affine_history_slabs() {
     ];
     let encoded = Encoded::new(Case::new(GROUPED, 96, 3, &rows, 79));
     let expected = encoded.expected();
-    for device in k8v4_devices() {
+    for device in seismic_native_tests::every_device() {
         let backend = device.backend();
         let config = prefill_configs(backend, GROUPED)
             .into_iter()
@@ -2246,7 +2238,7 @@ fn prefill_reads_and_writes_across_affine_history_slabs() {
 
 #[test]
 fn qwen_geometry_decode_and_prefill_match_host_model() {
-    for device in k8v4_devices() {
+    for device in seismic_native_tests::every_device() {
         qwen_geometry_decode_and_prefill_match_host_model_on(&device);
     }
 }
@@ -2379,7 +2371,7 @@ fn wide_head_decode_and_prefill_match_host_model() {
         p: 64,
         s: 384,
     };
-    for device in k8v4_devices() {
+    for device in seismic_native_tests::every_device() {
         let backend = device.backend();
         let context = 1024;
         let decode = Encoded::new(Case::new(
@@ -2452,7 +2444,7 @@ fn wide_head_decode_and_prefill_match_host_model() {
 
 fn large_group_decode_and_prefill_at_4k_match_host_model(geometry: Geometry) {
     let group = geometry.g;
-    for device in k8v4_devices() {
+    for device in seismic_native_tests::every_device() {
         let backend = device.backend();
         let context = 4096;
         let encoded = Encoded::new(Case::new(
@@ -2676,7 +2668,7 @@ fn metal_packed_four_qwen35b_long_context_matches_host_model() {
 
 #[test]
 fn metal_packed_four_padded_heads_match_host_model() {
-    let Some(device) = k8v4_devices()
+    let Some(device) = seismic_native_tests::every_device()
         .into_iter()
         .find(|d| d.backend() == BackendName::Metal)
     else {
@@ -3161,7 +3153,7 @@ fn prepared_causal_verification_matches_committed_prefix() {
     serial.destinations[0] = -1;
     let batch = Encoded::new(batch);
     let serial = Encoded::new(serial);
-    for device in k8v4_devices() {
+    for device in seismic_native_tests::every_device() {
         for config in decode_configs(device.backend(), geometry) {
             let kernel = decode_kernel(&device, geometry, &config);
             let run = |encoded: &Encoded| {
@@ -3224,7 +3216,7 @@ fn prepared_causal_verification_matches_committed_prefix() {
 /// narrow rounding and codec as serial fused append, including absent rows.
 #[test]
 fn ordered_append_matches_fused_codec() {
-    for device in k8v4_devices() {
+    for device in seismic_native_tests::every_device() {
         for geometry in [
             GROUPED,
             QWEN,
@@ -3358,7 +3350,7 @@ fn append_specialization(specialization: &NativeSpecialization) -> NativeSpecial
 /// codes or affine coefficients, and one visible key returns its value.
 #[test]
 fn codec_group32_storage_and_single_history_value_match_independent_recipe() {
-    for device in k8v4_devices() {
+    for device in seismic_native_tests::every_device() {
         let geometry = Geometry {
             kv: 1,
             g: 16,
@@ -3527,7 +3519,7 @@ fn actual_gemma_dense_and_affine_publication_share_prepared_values() {
                 position: i as i32,
             })
             .collect::<Vec<_>>();
-        for device in k8v4_devices() {
+        for device in seismic_native_tests::every_device() {
             let mut case = Case::new(geometry, m, 1, &rows, 8107);
             case.key = raw_key.clone();
             case.value = raw_value.clone();
@@ -3877,7 +3869,7 @@ fn actual_gemma_prepared_history_consumers_match_decoded_oracle() {
         let queries = q.floats(m * heads * w);
         assert_eq!(heads % kv, 0);
         assert!(m >= 129);
-        for device in k8v4_devices() {
+        for device in seismic_native_tests::every_device() {
             // Publish the actual raw projections through Dense native prep,
             // not an independently normalized substitute.
             let prep_geometry = Geometry {
@@ -4165,7 +4157,7 @@ fn actual_gemma_sequential_publication_matches_batch() {
         case.frequencies = frequencies.clone();
         case.epsilon = epsilon;
         let encoded = Encoded::new(case);
-        for device in k8v4_devices() {
+        for device in seismic_native_tests::every_device() {
             let append_spec = append_specialization(
                 &specialization_on(&device, geometry, &[]).with_static("NV", 1),
             );

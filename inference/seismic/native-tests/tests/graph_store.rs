@@ -4,19 +4,10 @@
 //! available device.
 
 use seismic::{
-    BackendName, Device, Devices, Element, NativeGraphClassSlice, NativeGraphFamily,
+    BackendName, Devices, Element, NativeGraphClassSlice, NativeGraphFamily,
     NativeGraphMetadata, NativeSpecialization, Tensor,
 };
 use seismic_native_tests::scale_rows;
-
-fn devices() -> Vec<Device> {
-    seismic_native_tests::devices(&[
-        BackendName::Cpu,
-        BackendName::Metal,
-        BackendName::Cuda,
-        BackendName::Vulkan,
-    ])
-}
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
     values.iter().flat_map(|value| value.to_le_bytes()).collect()
@@ -37,7 +28,7 @@ fn read_f32(tensor: &Tensor) -> Vec<f32> {
 #[test]
 fn a_stored_result_is_written_into_the_bound_tensor() {
     let (m, n) = (2u64, 8u64);
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let backend = device.backend();
         let kernel =
             scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
@@ -114,7 +105,7 @@ fn a_stored_result_is_written_into_the_bound_tensor() {
 #[test]
 fn a_templates_classes_seal_their_store_into_its_layout() {
     let n = 8u64;
-    for device in devices() {
+    for device in seismic_native_tests::every_device() {
         let backend = device.backend();
         let mut template = NativeGraphMetadata::new_template(backend);
         let input = template
