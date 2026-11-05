@@ -460,6 +460,11 @@ pub enum ModelOperationFailure {
         retryable: bool,
     },
     MemoryShortage(MemoryShortage),
+    /// The weight cap is below the load's least weights: the caller's bound, which no wait
+    /// clears, so never retryable. Reported to clients as an operation failure of its own code
+    /// with both numbers in its message: the cap is a bound of the service's evaluation
+    /// (`serve --weight-cap`), which no client sets.
+    WeightCap(magnitude_engine::error::WeightCapBelowWeights),
 }
 
 fn memory_shortage_message(shortage: &MemoryShortage) -> String {
@@ -489,6 +494,7 @@ impl ModelOperationFailure {
         match self {
             Self::Operation { code, .. } => code,
             Self::MemoryShortage(_) => MEMORY_SHORTAGE_FAILURE_CODE,
+            Self::WeightCap(_) => magnitude_serving::error::WEIGHT_CAP_BELOW_WEIGHTS,
         }
     }
 
@@ -496,6 +502,7 @@ impl ModelOperationFailure {
         match self {
             Self::Operation { message, .. } => message.clone(),
             Self::MemoryShortage(shortage) => memory_shortage_message(shortage),
+            Self::WeightCap(cap) => cap.to_string(),
         }
     }
 
@@ -503,6 +510,7 @@ impl ModelOperationFailure {
         match self {
             Self::Operation { retryable, .. } => *retryable,
             Self::MemoryShortage(_) => true,
+            Self::WeightCap(_) => false,
         }
     }
 
@@ -522,6 +530,11 @@ impl ModelOperationFailure {
                 message: memory_shortage_message(&shortage),
                 retryable: true,
                 shortage,
+            },
+            Self::WeightCap(cap) => ModelInstanceFailure::Operation {
+                code: magnitude_serving::error::WEIGHT_CAP_BELOW_WEIGHTS.to_owned(),
+                message: cap.to_string(),
+                retryable: false,
             },
         }
     }

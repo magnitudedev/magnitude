@@ -703,7 +703,7 @@ fn a_weight_cap_grants_the_largest_bank_it_holds() {
     // floor's weights, not a model the backend does not support.
     assert!(matches!(
         assess(Some(floor_weights - 1)),
-        Err(ModelAssessmentError::Configuration(reason)) if reason.contains(&floor_weights.to_string())
+        Err(ModelAssessmentError::WeightCap(error)) if error.needed == floor_weights
     ));
     for slots in [bank.floor(), 128, 240] {
         let cap = weights(slots);

@@ -376,6 +376,8 @@ pub enum ModelAssessmentError {
     Artifact(magnitude_artifacts::Error),
     ContextLimit(u64),
     Configuration(String),
+    /// The weight cap is below the load's least weights.
+    WeightCap(crate::error::WeightCapBelowWeights),
     Planning(String),
     Platform(PlatformError),
     Assessment(AssessmentError),
@@ -392,6 +394,7 @@ impl fmt::Display for ModelAssessmentError {
                 )
             }
             Self::Configuration(error) => write!(formatter, "engine configuration: {error}"),
+            Self::WeightCap(error) => error.fmt(formatter),
             Self::Planning(error) => write!(formatter, "execution planning: {error}"),
             Self::Platform(error) => write!(formatter, "platform: {error}"),
             Self::Assessment(error) => error.fmt(formatter),
@@ -863,7 +866,7 @@ fn inventory(
 ) -> Result<Result<Vec<seismic::KernelRequest>, UnsupportedModel>, ModelAssessmentError> {
     let refused = |outcome: PlanOutcome| match outcome {
         PlanOutcome::Unsupported(unsupported) => Ok(Err(unsupported)),
-        PlanOutcome::Configuration(reason) => Err(ModelAssessmentError::Configuration(reason)),
+        PlanOutcome::WeightCap(error) => Err(ModelAssessmentError::WeightCap(error)),
         PlanOutcome::Internal(reason) => Err(ModelAssessmentError::Planning(reason)),
     };
     let plan = match plan_backend(manifest, backend) {
@@ -902,7 +905,7 @@ fn prepare_plan(
 ) -> Result<(ModelDefinition, ExecutionPlanDraft, PreparedExecutionAssessment), Refusal> {
     let refused = |outcome: PlanOutcome| match outcome {
         PlanOutcome::Unsupported(unsupported) => Refusal::Unsupported(unsupported),
-        PlanOutcome::Configuration(reason) => Refusal::Failed(ModelAssessmentError::Configuration(reason)),
+        PlanOutcome::WeightCap(error) => Refusal::Failed(ModelAssessmentError::WeightCap(error)),
         PlanOutcome::Internal(reason) => Refusal::Failed(ModelAssessmentError::Planning(reason)),
     };
     let draft = match plan_execution(&manifest, selected) {
