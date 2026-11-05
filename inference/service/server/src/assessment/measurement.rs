@@ -12,8 +12,9 @@
 //! request for the idle model it runs beside, preempts it, killing it at once. A killed job's records stand, as each is stored as it is
 //! made; its attempts are released rather than counted, and the next job resumes from what is
 //! stored. Its state moves `Unmeasured → Measuring → Measured | Failed { retry_at }` (a
-//! preempted job back to `Unmeasured`); it is `Measured` once what is stored gives assessment
-//! its costs, and the jobs that measure the rest leave it so. What each job stores reaches the
+//! preempted job to what is stored, as the records it stored price the model it ran beside); it
+//! is `Measured` once what is stored gives assessment its costs, and the jobs that measure the
+//! rest leave it so. What each job stores reaches the
 //! assessment pool, which re-finishes every assessed model under it.
 
 use std::sync::Arc;
@@ -340,10 +341,11 @@ async fn run<M: MeasuredMachine>(
             let (outcome, recorded) = match end {
                 JobEnd::Ended(outcome, recorded) => (Some(outcome), recorded),
                 JobEnd::Expired(recorded) => (None, recorded),
+                // No failure and no progress: the state is what is stored, the records the job
+                // stored before it was killed among it, as they already price the model it ran
+                // beside.
                 JobEnd::Preempted(_) => {
-                    if !measured {
-                        status.send_modify(|status| status.state = MeasurementState::Unmeasured);
-                    }
+                    status.send_replace(MeasurementStatus::stored(read_stored(&machine).await));
                     continue;
                 }
             };
@@ -998,8 +1000,8 @@ mod tests {
 
     /// A request for the idle model the job runs beside preempts it as a load does: the job is
     /// killed at once and its attempts released, its room released and what it stored reprices
-    /// the model, and the state goes back to `Unmeasured`. The next job runs once the model is
-    /// idle again.
+    /// the model, and the state is what is stored, those records among it. The next job runs once
+    /// the model is idle again.
     #[tokio::test(start_paused = true)]
     async fn a_request_for_the_idle_model_preempts_the_job() {
         let record = Record::Measured(seismic::measure::Timing {
@@ -1013,7 +1015,7 @@ mod tests {
             JobFrame::Attempting(key("launch")),
         ]);
         let (finishing, _, _finished) = job(vec![JobFrame::Finished(Ok(Vec::new()))]);
-        let machine = ScriptedMachine::new(vec![running, finishing], vec![COMPLETE]);
+        let machine = ScriptedMachine::new(vec![running, finishing], vec![REFINING, COMPLETE]);
         let device = DeviceLock::default();
         let _resident = device.try_share().unwrap();
         let idle = room(&machine, RoomAnswer::Made);
@@ -1030,7 +1032,7 @@ mod tests {
         device.admit_request().await;
         assert_eq!(*retired.lock().unwrap(), Some(false), "the job was killed before the request was served");
         status
-            .wait_for(|status| status.state == MeasurementState::Unmeasured)
+            .wait_for(|status| status.state == MeasurementState::Measured && status.measurements == REFINING)
             .await
             .unwrap();
         settle().await;
@@ -1047,7 +1049,7 @@ mod tests {
         // The request ended.
         device.resident_idle(Some(idle));
         status
-            .wait_for(|status| status.state == MeasurementState::Measured)
+            .wait_for(|status| status.measurements == COMPLETE)
             .await
             .unwrap();
         assert_eq!(machine.started.load(Ordering::SeqCst), 2);
@@ -1126,7 +1128,7 @@ mod tests {
             JobFrame::Attempting(key("history")),
         ]);
         let (finishing, _, _finished) = job(vec![JobFrame::Finished(Ok(Vec::new()))]);
-        let machine = ScriptedMachine::new(vec![running, finishing], vec![COMPLETE]);
+        let machine = ScriptedMachine::new(vec![running, finishing], vec![PENDING, COMPLETE]);
         let device = DeviceLock::default();
         let mut status = start(machine.clone(), PENDING, device.clone(), settled());
         status
