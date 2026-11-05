@@ -438,7 +438,9 @@ fn open_platform(backend: BackendName) -> Result<OpenedPlatform, String> {
 /// the host's (freeing 107 GB on a GB10 took 14 s). The bytes are pseudo-random
 /// words, as an application's data is: zeroed pages the OS compresses to
 /// nothing would press nothing. They are written on every core the host
-/// has, as fast as its memory takes them.
+/// has, as fast as its memory takes them, by threads that yield any core
+/// other work wants ([`yielding`]): the press takes the host's memory, never
+/// the engine's processors.
 pub fn occupy(backend: BackendName, selected: PressureStore, deficit: u64) -> Result<(), String> {
     let target = store::Target::open(backend, selected)?;
     let before = target.snapshot()?;
@@ -480,8 +482,9 @@ fn written(bytes: u64, writers: usize, first: usize) -> Result<Vec<u64>, String>
     // One writer's share of the words, at least one word for a chunk size.
     let share = held.len().div_ceil(writers).max(1);
     std::thread::scope(|scope| {
-        for (writer, words) in held.chunks_mut(share).enumerate() {
+        let written = held.chunks_mut(share).enumerate().map(|(writer, words)| {
             scope.spawn(move || {
+                yielding()?;
                 // xorshift64 from a seed of its own (an odd multiple, never
                 // zero): every word differs, so no page compresses.
                 let mut word = 0x9e37_79b9_7f4a_7c15_u64.wrapping_mul(2 * (first + writer) as u64 + 1);
@@ -491,10 +494,38 @@ fn written(bytes: u64, writers: usize, first: usize) -> Result<Vec<u64>, String>
                     word ^= word << 17;
                     *slot = word;
                 }
-            });
-        }
-    });
+                Ok::<(), String>(())
+            })
+        });
+        written.collect::<Vec<_>>().into_iter().try_for_each(|writer| writer.join().expect("a writer panicked"))
+    })?;
     Ok(held)
+}
+
+/// Put the calling thread in the scheduling class that runs only on a
+/// processor no other work wants: Linux's `SCHED_IDLE`, macOS's background
+/// quality of service. Without one the press would take processors as well
+/// as memory, so a host offering neither is refused.
+fn yielding() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let unprioritized = libc::sched_param { sched_priority: 0 };
+        // SAFETY: sets the calling thread's policy from a valid parameter.
+        if unsafe { libc::sched_setscheduler(0, libc::SCHED_IDLE, &unprioritized) } != 0 {
+            return Err(format!("a pressing thread cannot take SCHED_IDLE: {}", std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: sets the calling thread's own class.
+        match unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_BACKGROUND, 0) } {
+            0 => Ok(()),
+            code => Err(format!("a pressing thread cannot take the background class: {}", std::io::Error::from_raw_os_error(code))),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    Err("this host has no scheduling class that yields every processor to other work".into())
 }
 
 /// Seconds since the Unix epoch, as the worker's diagnostic lines stamp
@@ -1135,6 +1166,27 @@ impl tracing::field::Visit for Fields {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pressing thread runs in the class that yields every processor to
+    /// other work.
+    #[test]
+    fn a_pressing_thread_yields_every_processor() {
+        std::thread::spawn(|| {
+            yielding().expect("the host has a yielding class");
+            #[cfg(target_os = "linux")]
+            // SAFETY: reads the calling thread's policy.
+            assert_eq!(unsafe { libc::sched_getscheduler(0) }, libc::SCHED_IDLE);
+            #[cfg(target_os = "macos")]
+            {
+                let (mut class, mut priority) = (libc::qos_class_t::QOS_CLASS_UNSPECIFIED, 0);
+                // SAFETY: reads the calling thread's own class into locals.
+                assert_eq!(unsafe { libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut priority) }, 0);
+                assert!(matches!(class, libc::qos_class_t::QOS_CLASS_BACKGROUND));
+            }
+        })
+        .join()
+        .expect("the pressing thread's class");
+    }
 
     /// Drive `window` over outputs of one token each, half a second apart,
     /// the pressure landing from output `landing`, held from output `held`
