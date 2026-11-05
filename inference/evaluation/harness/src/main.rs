@@ -5,8 +5,7 @@
 //! (`result.json`) with its traces
 //! into a run directory. `mrig` runs it; each subcommand serves instruments:
 //!
-//! - `render`: the exact tokens of each fixture (`rendered.jsonl`), or with
-//!   `--stdin` one rendered fixture per request line, for sizing searches.
+//! - `render`: the exact tokens of each fixture (`rendered.jsonl`).
 //! - `time`: prefill and decode throughput at context lengths and
 //!   concurrency (`step`).
 //! - `logits`: the distributions at every scored position (`logits.f32`,
@@ -87,20 +86,15 @@ enum Command {
     /// Render fixtures to the exact tokens the engine serves.
     Render {
         #[command(flatten)]
-        common: Common,
+        run: RunArgs,
         /// Size each fixture to this many tokens.
         #[arg(long)]
         context: Option<usize>,
-        /// Render on request instead of writing a run: each stdin line is
-        /// `{"fixture_id": ID, "context": N | null}`, answered by one stdout
-        /// line, the rendered fixture or `{"error": MESSAGE}`.
-        #[arg(long, conflicts_with_all = ["context", "output", "build_identity"])]
-        stdin: bool,
     },
     /// Prefill and decode throughput.
     Time {
         #[command(flatten)]
-        common: Common,
+        run: RunArgs,
         #[command(flatten)]
         engine: EngineArgs,
         /// Context lengths the fixtures are sized to.
@@ -220,7 +214,7 @@ enum Command {
     /// Next-token distributions at every scored position.
     Logits {
         #[command(flatten)]
-        common: Common,
+        run: RunArgs,
         #[command(flatten)]
         engine: EngineArgs,
         /// Size each fixture to this many tokens.
@@ -246,7 +240,7 @@ enum Command {
     /// The model's Prepare alone: its tuning search, nothing imported.
     Prepare {
         #[command(flatten)]
-        common: Common,
+        run: RunArgs,
         #[command(flatten)]
         engine: EngineArgs,
         /// Context length the load would serve: the tuning points' histories.
@@ -256,7 +250,7 @@ enum Command {
     /// The catalog drafter's proposals at anchors in the scored spans.
     Draft {
         #[command(flatten)]
-        common: Common,
+        run: RunArgs,
         #[command(flatten)]
         engine: EngineArgs,
         /// Size each fixture to this many tokens.
@@ -283,13 +277,6 @@ struct Common {
     /// The fixture set (JSON Lines).
     #[arg(long, value_name = "FILE")]
     fixtures: PathBuf,
-    /// The run directory; a new one under evaluation/results by default.
-    #[arg(long, value_name = "DIR")]
-    output: Option<PathBuf>,
-    /// The build identity (`{"commit", "dirty_digest"}`) from the evaluation
-    /// remote package; the record's build is `null` without it.
-    #[arg(long, value_name = "FILE")]
-    build_identity: Option<PathBuf>,
     /// Chat-completions request fields every rendered request carries, as
     /// the serving benchmark sends them (a JSON object); by default
     /// `{"chat_template_kwargs": {"enable_thinking": false}}`.
@@ -306,6 +293,20 @@ impl Common {
     }
 }
 
+/// What every subcommand that writes a run takes.
+#[derive(Args)]
+struct RunArgs {
+    #[command(flatten)]
+    common: Common,
+    /// The run directory.
+    #[arg(long, value_name = "DIR")]
+    output: PathBuf,
+    /// The build identity (`{"commit", "dirty_digest"}`) from the evaluation
+    /// remote package; the record's build is `null` without it.
+    #[arg(long, value_name = "FILE")]
+    build_identity: Option<PathBuf>,
+}
+
 /// The model's host artifacts, opened for rendering as the target serves.
 fn host(artifacts: &ArtifactsFile) -> Result<HostArtifacts, String> {
     HostArtifacts::open(&PackageOptions {
@@ -314,52 +315,6 @@ fn host(artifacts: &ArtifactsFile) -> Result<HostArtifacts, String> {
         draft: None,
     })
     .map_err(|error| error.to_string())
-}
-
-/// `render --stdin`: answer render requests over stdin until it closes.
-fn serve_render(common: &Common) -> Result<(), String> {
-    use std::io::{BufRead, Write};
-    let options = common.request_options()?;
-    let artifacts = ArtifactsFile::read(&common.artifacts)?;
-    let set = FixtureSet::read(&common.fixtures)?;
-    let host = host(&artifacts)?;
-    let renderer = Renderer::new(&host, &artifacts.artifacts.model, &options);
-    let render = |line: &str| -> Result<Value, String> {
-        #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Request {
-            fixture_id: String,
-            context: Option<usize>,
-        }
-        let request: Request =
-            serde_json::from_str(line).map_err(|error| format!("render request: {error}"))?;
-        let fixture = set
-            .fixtures
-            .iter()
-            .find(|fixture| fixture.id == request.fixture_id)
-            .ok_or_else(|| format!("no fixture {} in the set", request.fixture_id))?;
-        let rendered = renderer.render(fixture, request.context)?;
-        serde_json::to_value(rendered.line(
-            &set.digest,
-            &artifacts.artifacts.model,
-            &artifacts.artifacts.target_sha256,
-        ))
-        .map_err(|error| error.to_string())
-    };
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    for line in std::io::stdin().lock().lines() {
-        let line = line.map_err(|error| format!("reading stdin: {error}"))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let answer = render(&line).unwrap_or_else(|error| json!({ "error": error }));
-        serde_json::to_writer(&mut out, &answer)
-            .map_err(|error| error.to_string())
-            .and_then(|()| out.write_all(b"\n").map_err(|error| error.to_string()))
-            .and_then(|()| out.flush().map_err(|error| error.to_string()))?;
-    }
-    Ok(())
 }
 
 #[derive(Args)]
@@ -419,12 +374,12 @@ struct Inputs {
 }
 
 impl Inputs {
-    fn read(common: &Common, tool: &'static str) -> Result<Self, String> {
-        let build = record::build(common.build_identity.as_deref())?;
-        let request_options = common.request_options()?;
-        let artifacts = ArtifactsFile::read(&common.artifacts)?;
-        let set = FixtureSet::read(&common.fixtures)?;
-        let run = Run::create(common.output.clone(), tool)?;
+    fn read(args: &RunArgs, tool: &'static str) -> Result<Self, String> {
+        let build = record::build(args.build_identity.as_deref())?;
+        let request_options = args.common.request_options()?;
+        let artifacts = ArtifactsFile::read(&args.common.artifacts)?;
+        let set = FixtureSet::read(&args.common.fixtures)?;
+        let run = Run::create(args.output.clone(), tool)?;
         Ok(Self {
             run,
             build,
@@ -580,21 +535,14 @@ fn run(command: Command) -> Result<(), String> {
                 exit => Err(format!("worker ended: {exit:?}")),
             }
         }
-        Command::Render {
-            common,
-            stdin: true,
-            ..
-        } => serve_render(&common),
-        Command::Render {
-            common, context, ..
-        } => {
-            let inputs = Inputs::read(&common, "harness.render")?;
+        Command::Render { run, context } => {
+            let inputs = Inputs::read(&run, "harness.render")?;
             let rendered = inputs.render(context)?;
             let digest = inputs.write_rendered(&rendered)?;
             inputs.finish(digest, None, Map::new(), Map::new())
         }
         Command::Time {
-            common,
+            run,
             engine,
             contexts,
             concurrency,
@@ -620,7 +568,7 @@ fn run(command: Command) -> Result<(), String> {
             if prefill_samples < 2 {
                 return Err("--prefill-samples needs a cold and a warm sample".into());
             }
-            let inputs = Inputs::read(&common, "harness.time")?;
+            let inputs = Inputs::read(&run, "harness.time")?;
             let (options, development) = engine_options(&engine, &inputs)?;
             let host = host(&inputs.artifacts)?;
             let renderer = Renderer::new(
@@ -654,11 +602,11 @@ fn run(command: Command) -> Result<(), String> {
             inputs.finish(digest, Some(timed.devices), measurements, traces)
         }
         Command::Prepare {
-            common,
+            run,
             engine,
             context,
         } => {
-            let inputs = Inputs::read(&common, "harness.prepare")?;
+            let inputs = Inputs::read(&run, "harness.prepare")?;
             let rendered = inputs.render(Some(context))?;
             let digest = inputs.write_rendered(&rendered)?;
             let (options, development) = engine_options(&engine, &inputs)?;
@@ -680,7 +628,7 @@ fn run(command: Command) -> Result<(), String> {
             inputs.finish(digest, None, measurements, traces)
         }
         Command::Logits {
-            common,
+            run,
             engine,
             context,
             rendered,
@@ -691,7 +639,7 @@ fn run(command: Command) -> Result<(), String> {
             if batch == 0 || verify_width == 0 || passes == 0 {
                 return Err("--batch, --verify-width and --passes must be positive".into());
             }
-            let inputs = Inputs::read(&common, "harness.logits")?;
+            let inputs = Inputs::read(&run, "harness.logits")?;
             let (rendered, digest) = match rendered {
                 Some(path) => {
                     let file = render::RenderedFile::read(
@@ -775,14 +723,14 @@ fn run(command: Command) -> Result<(), String> {
         Command::Occupy { device, deficit, pressure_store } => memory::occupy(memory::backend(&device)?, pressure_store, deficit),
         Command::OccupyTime { device, pressure_store } => memory::time_occupying(memory::backend(&device)?, pressure_store),
         Command::Draft {
-            common,
+            run,
             engine,
             context,
             anchors,
             proposals,
             attribute,
         } => {
-            let inputs = Inputs::read(&common, "harness.draft")?;
+            let inputs = Inputs::read(&run, "harness.draft")?;
             let rendered = inputs.render(context)?;
             let digest = inputs.write_rendered(&rendered)?;
             let (options, development) = engine_options(&engine, &inputs)?;
