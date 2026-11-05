@@ -7,6 +7,11 @@ use magnitude_executor::{
 pub enum RoundError {
     Logical(String),
     Physical(DomainError),
+    /// The round's step was interrupted (a late beat of its load's pulse),
+    /// for this reason: its outcome was aborted and the generation returned
+    /// unfinished, to run the round again (resident) or to re-prefill (its
+    /// state released with a chain it was a chunk of). Not a failure.
+    Interrupted(String),
 }
 
 impl std::fmt::Display for RoundError {
@@ -14,6 +19,7 @@ impl std::fmt::Display for RoundError {
         match self {
             Self::Logical(error) => formatter.write_str(error),
             Self::Physical(error) => error.fmt(formatter),
+            Self::Interrupted(reason) => formatter.write_str(reason),
         }
     }
 }
@@ -47,12 +53,27 @@ pub fn reconcile_forward<F: ProgramFamily>(
     request: RequestId,
     pending: PendingOperationOutcome,
 ) -> Result<(Generation, MethodEffects), (Generation, RoundError)> {
+    // The round's step was interrupted: its outputs are discarded and its
+    // accepted state returns; the round runs again from it, or, where its
+    // state was released with its chain, the generation re-prefills.
+    if let Outcome::Interrupted { reason, resident } = pending.outcome() {
+        let (reason, resident) = (reason.clone(), *resident);
+        if let Err(physical) = domain.abort(pending) {
+            return Err((round.fail(), RoundError::Physical(physical)));
+        }
+        let generation = if resident {
+            round.abandon()
+        } else {
+            round.evicted().expect("an evicted generation keeps its logical history")
+        };
+        return Err((generation, RoundError::Interrupted(reason)));
+    }
     // The sequence's table rows could not be read: its outputs are
     // discarded and the round fails with the typed cause.
-    if let Outcome::TableReadFailed(error) = pending.outcome() {
+    if let Outcome::WeightReadFailed(error) = pending.outcome() {
         let error = error.clone();
         let error = match domain.abort(pending) {
-            Ok(()) => RoundError::Physical(DomainError::TableRead(error)),
+            Ok(()) => RoundError::Physical(DomainError::WeightRead(error)),
             Err(physical) => RoundError::Physical(physical),
         };
         return Err((round.fail(), error));

@@ -19,20 +19,22 @@ use super::{
         CachePoint, MIN_BRANCH_GAIN, MIN_PREFIX_HIT, PrefixCache, PrefixCacheCapacity, PrefixPath,
         PrefixRetention,
     },
-    protocol::{RequestSnapshot, WorkerReply},
+    protocol::{RequestSnapshot, RoomGrant, RoomGranter, RoomRefusal, WorkerReply},
     publication::{
         CapacityResource, ModelUnloadCause, PhysicalTimings, PublicationPermit, PublicationQueue,
         PublicationReceiver, PublicationSender, PublicationWake, PublicationWakeKind, PublishError,
         RequestError, ServiceCapacityError,
     },
+    release::{self, Release, Releases, Rung},
     round_driver::{RoundError, lower_round, reconcile_forward},
+    serving::ServingCensus,
     worker::Wakes,
 };
 use magnitude_executor::{
-    DomainError, InvariantError, MemoryChargeReconciliation,
-    NativeFamily,
+    BankResize, BankResized, BankStep, DomainError, ExpertMeasures, InvariantError, MeasurementRoom,
+    MemoryChargeReconciliation, MemoryMoment, NativeFamily,
     OpenRequirements, Operation, Outcome, PendingOperationOutcome, PhysicalDecision,
-    ProgramFamily, RequestId, ResourceKind, ResourcePlan, StateBindings, SubmitError,
+    ProgramFamily, RequestId, ResourceKind, ResourcePlan, ShrinkCause, StateBindings, SubmitError,
     SubmitFailure, WorkKind, platform::DomainRole,
 };
 use magnitude_family_contracts::PreparedModelInput;
@@ -42,6 +44,7 @@ use magnitude_generation::{
 use magnitude_state::ShrinkPolicy;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    num::NonZeroU64,
     sync::Arc,
     time::Duration,
 };
@@ -149,6 +152,45 @@ fn next_stop(record: &Record, generation: &Generation, position: usize) -> Optio
         .flatten()
         .filter(|&stop| stop > position)
         .min()
+}
+
+/// The prompt chunks, at most `chunks` of at most `chunk_rows` rows, a lone
+/// prefill group's request submits next, when they are known now, so the
+/// domain queues them behind this group (a chain, or a pipelined successor;
+/// `ExecutorDomain::plan_prompt`). Planning stops at a planned branch or
+/// retention point: the chunk ending there is followed by that retention,
+/// not planned past.
+fn planned_prefill(
+    round: &Round,
+    operations: &[Operation],
+    chunk_rows: usize,
+    chunks: usize,
+) -> Result<Vec<Operation>, RequestError> {
+    let [Operation::Forward {
+        request,
+        kind: WorkKind::Prefill,
+        tokens,
+        position,
+        ..
+    }] = operations
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(Member {
+        record,
+        state: Membership::Started(started),
+    }) = round.members.get(request)
+    else {
+        return Ok(Vec::new());
+    };
+    let end = position + tokens.len();
+    let stop = next_stop(record, started.generation(), *position);
+    if stop.is_some_and(|stop| stop <= end) {
+        return Ok(Vec::new());
+    }
+    started
+        .planned_prefill(*request, chunk_rows, stop, chunks)
+        .map_err(invariant("planned prefill"))
 }
 
 /// The selection bound `operations` spend: every selected target row, and one
@@ -476,9 +518,9 @@ fn classify_domain_error(error: DomainError) -> RequestError {
             context: "device memory observation",
             detail: message,
         }),
-        DomainError::Reclaim => RequestError::Invariant(InvariantError {
+        error @ DomainError::Reclaim(_) => RequestError::Invariant(InvariantError {
             context: "memory reclaim",
-            detail: DomainError::Reclaim.to_string(),
+            detail: error.to_string(),
         }),
         DomainError::Input(error) => RequestError::Input(error),
         DomainError::State(error) => RequestError::State(error),
@@ -488,7 +530,7 @@ fn classify_domain_error(error: DomainError) -> RequestError {
         DomainError::Invariant(error) | DomainError::Submit(SubmitError::Invariant(error)) => {
             RequestError::Invariant(error)
         }
-        DomainError::TableRead(error) => RequestError::TableRead(error),
+        DomainError::WeightRead(error) => RequestError::WeightRead(error),
         error @ DomainError::StateCeiling { .. } => RequestError::Invariant(InvariantError {
             context: "state ceiling",
             detail: error.to_string(),
@@ -511,12 +553,22 @@ fn invariant(context: &'static str) -> impl FnOnce(String) -> RequestError {
     move |detail| RequestError::Invariant(InvariantError { context, detail })
 }
 
+/// A release that failed an engine invariant, as the domain's own releases
+/// fail ([`Releasing`]).
+fn release_invariant(context: &'static str) -> impl FnOnce(String) -> DomainError {
+    move |detail| DomainError::Invariant(InvariantError { context, detail })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Runnable,
     AwaitingCompletion,
     OutputBlocked,
     Preempted,
+    /// It never ran, and waits for the release ladder to make room in
+    /// memory; it is refused (`RequestError::MemoryReclaim`) once only the
+    /// model's unload could.
+    MemoryBlocked,
     CapacityBlocked { required: u64, available: u64 },
     Terminal(FinishReason),
 }
@@ -527,9 +579,6 @@ pub enum AdmissionError {
     /// A required device-memory observation failed. The caller may retry
     /// after the platform can report availability again.
     MemoryObservationUnavailable(String),
-    /// A domain the model uses has headroom at or below its planning
-    /// reserve; admission pauses while memory is reclaimed. Retryable.
-    MemoryReclaim,
     ModelUnloaded {
         cause: ModelUnloadCause,
     },
@@ -554,9 +603,6 @@ impl std::fmt::Display for AdmissionError {
                     "device memory observation unavailable: {message}"
                 )
             }
-            Self::MemoryReclaim => formatter.write_str(
-                "memory headroom is at or below the planning reserve; reclaiming memory",
-            ),
             Self::ModelUnloaded {
                 cause: ModelUnloadCause::MemoryPressure,
             } => formatter.write_str("model unloaded due to memory pressure"),
@@ -571,7 +617,6 @@ impl From<DomainError> for AdmissionError {
     fn from(error: DomainError) -> Self {
         match error {
             DomainError::Blind(message) => Self::MemoryObservationUnavailable(message),
-            DomainError::Reclaim => Self::MemoryReclaim,
             other => Self::Refused(classify_domain_error(other)),
         }
     }
@@ -596,6 +641,9 @@ const MEMORY_ESCALATION_NS: u64 = 1_000_000_000;
 
 /// How often the owner observes memory without another reason to run.
 const OBSERVATION_INTERVAL_NS: u64 = 100_000_000;
+
+/// [`OBSERVATION_INTERVAL_NS`], as the domain's memory probes take it.
+const OBSERVATION_INTERVAL: std::time::Duration = std::time::Duration::from_nanos(OBSERVATION_INTERVAL_NS);
 
 /// One probe of every domain the loaded model uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -658,6 +706,133 @@ impl MemoryCondition {
     }
 }
 
+/// What of the release ladder is still in motion between flight
+/// boundaries. Only once nothing is are requests waiting on memory refused,
+/// or the model unloaded, for memory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Ladder {
+    /// Reclaim was observed while a flight held the bindings; its releases
+    /// run once they return.
+    owed: bool,
+    /// A release runs that a later flight boundary finishes (a bank
+    /// resize): the ladder resumes once it has.
+    pending: bool,
+    /// A release waits for a gap between flights (a bank shrink a step
+    /// still running deferred, `BankStep::Deferred`): the next boundary
+    /// tries it again.
+    deferred: bool,
+    /// The last release found what is short released already, the host yet
+    /// to show it (`Release::Covered`): the next reading decides again.
+    covered: bool,
+}
+
+impl Ladder {
+    /// Take what one release at a rung came to.
+    fn released(&mut self, release: Release) {
+        self.pending |= release == Release::Pending;
+        self.deferred |= release == Release::Deferred;
+        self.covered |= release == Release::Covered;
+    }
+
+    /// Whether nothing of the ladder is in motion.
+    fn settled(&self) -> bool {
+        !self.owed && !self.pending && !self.deferred && !self.covered
+    }
+
+    /// At a flight boundary: whether a release was deferred to it, which is
+    /// tried again now.
+    fn retry_deferred(&mut self) -> bool {
+        std::mem::take(&mut self.deferred)
+    }
+}
+
+/// Whether the measurement room's claim is owed a decision: memory was
+/// probed with no resize of the expert bank under way, and none has
+/// finished since. A probe while a flight holds the bindings stays owed
+/// until they return.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RoomOwed(bool);
+
+impl RoomOwed {
+    /// Memory was probed, a resize of the bank `resizing` or not.
+    fn probed(&mut self, resizing: bool) {
+        self.0 = !resizing;
+    }
+
+    /// A resize finished: the probe before it no longer reads the room.
+    fn resized(&mut self) {
+        self.0 = false;
+    }
+
+    /// Whether the decision is taken now, where the claim can be decided
+    /// (`ready`): it is owed no longer.
+    fn take(&mut self, ready: bool) -> bool {
+        ready && std::mem::take(&mut self.0)
+    }
+}
+
+/// The measurement job's claim of room beside the model, until it is
+/// answered (`Owner::claim_measurement_room`).
+struct RoomClaim(RoomGranter);
+
+impl RoomClaim {
+    /// Decide the claim at a probe no resize ran across, where it stands at
+    /// `standing`: made, it is answered; short beyond what the bank holds
+    /// above its floor, it is answered with why before anything shrinks;
+    /// short within it, the bank shrinks by the rest through `shrink`, and
+    /// the claim waits for a later probe to read what that freed, unless the
+    /// shrink finds the bank at its floor, or the bank's storage `refused` a
+    /// shrink before, which answers it with why. The claim, while it waits.
+    fn decide<E>(
+        self,
+        standing: MeasurementRoom,
+        refused: bool,
+        shrink: impl FnOnce(u64) -> Result<BankStep, E>,
+    ) -> Result<Option<Self>, E> {
+        let answer = match standing {
+            MeasurementRoom::Made => Ok(()),
+            MeasurementRoom::Unread => return Ok(Some(self)),
+            MeasurementRoom::Beyond { short, releasable } => Err(RoomRefusal::BeyondFloor { short, releasable }),
+            MeasurementRoom::Short(short) if refused => Err(RoomRefusal::ShrinkRefused { short }),
+            MeasurementRoom::Short(short) => match shrink(short)? {
+                BankStep::Begun | BankStep::Running | BankStep::Deferred => return Ok(Some(self)),
+                BankStep::AtLimit => Err(RoomRefusal::AtFloor { short }),
+            },
+        };
+        self.0.answer(answer);
+        Ok(None)
+    }
+}
+
+/// A running expert bank resize: what the process held when it began, and
+/// why it began.
+#[derive(Clone, Copy, Debug)]
+struct BankBegun {
+    held: MemoryMoment,
+    cause: BankBegunFor,
+}
+
+/// Why an expert bank resize began: a shrink, for its cause, or a growth
+/// into free memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BankBegunFor {
+    Shrink(ShrinkCause),
+    Growth,
+}
+
+impl BankBegunFor {
+    /// The resize from `from` to `to` that finished, at `at_unix_ms`, as the
+    /// census states it: the shrink or growth it began as, by at least one.
+    fn finished(self, from: u64, to: u64, at_unix_ms: u64) -> Result<BankResize, String> {
+        let by = |less: u64, more: u64| more.checked_sub(less).and_then(NonZeroU64::new);
+        match self {
+            Self::Shrink(cause) => by(to, from).map(|by| BankResize::Shrank { cause, to, by, at_unix_ms }),
+            Self::Growth => by(from, to).map(|by| BankResize::Grew { from, by, at_unix_ms }),
+        }
+        .ok_or_else(|| format!("a resize begun for {self:?} went from {from} to {to}"))
+    }
+}
+
 struct ActiveGroup<F: ProgramFamily> {
     flight: DomainFlight<F>,
     operations: Vec<Operation>,
@@ -675,7 +850,7 @@ struct Round {
 
 enum Pipeline<F: ProgramFamily> {
     /// Between flights: the right to change store bindings is here.
-    Idle(StateBindings<F>),
+    Idle(StateBindings),
     /// One group on the device. Its flight holds the bindings until
     /// completion returns them.
     InFlight(Round, ActiveGroup<F>),
@@ -707,15 +882,91 @@ struct Service<F: ProgramFamily> {
     next_id: u64,
     now: u64,
     prefix_cache: PrefixCache<ResumeState>,
-    memory_condition: MemoryCondition,
+    /// What the owner holds of memory between flights ([`between_flights`]).
+    memory: BetweenFlights,
+    wakes: Arc<dyn Wakes>,
+}
+
+/// What a loaded model's owner holds of its memory between flights
+/// ([`between_flights`]): its condition, the release ladder's motion, the
+/// expert bank's running and finished resizes, and when it observes next.
+pub struct BetweenFlights {
+    condition: MemoryCondition,
     /// Per domain role, the least memory a capacity-blocked request still
     /// needs from that domain's ceiling after every release was exhausted.
-    memory_deficits: Vec<MemoryDeficit>,
-    /// Reclaim was observed while a flight held the bindings; its releases
-    /// run once they return.
-    release_owed: bool,
+    deficits: Vec<MemoryDeficit>,
+    /// What of the release ladder is still in motion.
+    ladder: Ladder,
+    /// Memory was observed recovered while a flight held the bindings; a
+    /// growth step of the expert bank is considered once they return.
+    grow_owed: bool,
+    /// The offers of the last growth decision that began nothing, as they
+    /// were decided (`GrowthOffer::decided`): the same offers make the same
+    /// decision, so it is not made again until one differs.
+    declined: Option<Vec<magnitude_executor::GrowthDecided>>,
+    /// Whether the measurement room's claim is owed a decision.
+    room_owed: RoomOwed,
+    /// Whether memory has stayed free (`platform::Recovery`), on the
+    /// service clock: what the bank's growth waits on.
+    recovery: magnitude_executor::platform::Recovery<u64>,
+    /// The running expert bank resize.
+    bank_began: Option<BankBegun>,
+    /// The bank's storage refused a shrink: no shrink begins again, and the
+    /// ladder's bank rung releases nothing, until memory changes (its
+    /// condition, or a finished resize).
+    shrink_refused: bool,
+    /// The measurement job's room claimed of the domain and not yet
+    /// answered ([`Owner::claim_measurement_room`]).
+    measurement_room: Option<RoomClaim>,
     next_observation: u64,
-    wakes: Arc<dyn Wakes>,
+}
+
+impl BetweenFlights {
+    /// A load's memory as it opens: Normal, nothing in motion, observed at
+    /// its first boundary.
+    pub fn new() -> Self {
+        Self {
+            condition: MemoryCondition::Normal,
+            deficits: Vec::new(),
+            ladder: Ladder::default(),
+            grow_owed: false,
+            declined: None,
+            room_owed: RoomOwed::default(),
+            recovery: magnitude_executor::platform::Recovery::new(),
+            bank_began: None,
+            shrink_refused: false,
+            measurement_room: None,
+            next_observation: 0,
+        }
+    }
+}
+
+/// What [`between_flights`] runs on: the loaded model's domain and the
+/// owner's memory, the service clock and its completion wakes, and what it
+/// does to the requests its owner holds (none, below the scheduler): the
+/// one owner of the between-flight memory step is that function, and a host
+/// gives it only these.
+pub trait MemoryHost {
+    type Family: ProgramFamily;
+    fn domain(&mut self) -> &mut ExecutorDomain<Self::Family>;
+    fn memory(&mut self) -> &mut BetweenFlights;
+    /// The service clock, in nanoseconds.
+    fn now(&self) -> u64;
+    fn completion(&self) -> magnitude_executor::CompletionWake;
+    /// An availability change: what waits on one retries.
+    fn advance_epoch(&mut self);
+    /// Evict the least recently used retained prefix: whether one was.
+    /// The cached entries live requests hold, which the prefix rung
+    /// releases last.
+    fn held_prefixes(&self) -> BTreeSet<u64>;
+    fn evict_prefix(&mut self, held: &BTreeSet<u64>) -> bool;
+    /// Preempt eligible live requests, sparing `spared`, and with
+    /// `resident_slot` those that free no bytes: whether any was.
+    fn evict_victims(&mut self, spared: &[RequestId], resident_slot: bool) -> Result<bool, DomainError>;
+    /// Refuse every request waiting on memory to become resident.
+    fn refuse_memory_waiters(&mut self);
+    /// Unload the model for memory pressure: every request is terminated.
+    fn unload(&mut self);
 }
 
 pub struct Owner<F: ProgramFamily = NativeFamily> {
@@ -726,7 +977,7 @@ pub struct Owner<F: ProgramFamily = NativeFamily> {
 impl<F: ProgramFamily> Owner<F> {
     pub fn new(
         domain: ExecutorDomain<F>,
-        bindings: StateBindings<F>,
+        bindings: StateBindings,
         limits: ServiceLimits,
         wakes: Arc<dyn Wakes>,
     ) -> Result<Self, String> {
@@ -741,7 +992,7 @@ impl<F: ProgramFamily> Owner<F> {
 
     pub fn with_prefix_cache_capacity(
         domain: ExecutorDomain<F>,
-        bindings: StateBindings<F>,
+        bindings: StateBindings,
         limits: ServiceLimits,
         capacity: PrefixCacheCapacity,
         wakes: Arc<dyn Wakes>,
@@ -755,10 +1006,7 @@ impl<F: ProgramFamily> Owner<F> {
                 next_id: 1,
                 now: 0,
                 prefix_cache: PrefixCache::new(capacity),
-                memory_condition: MemoryCondition::Normal,
-                memory_deficits: Vec::new(),
-                release_owed: false,
-                next_observation: 0,
+                memory: BetweenFlights::new(),
                 wakes,
             },
             pipeline: Pipeline::Idle(bindings),
@@ -767,7 +1015,7 @@ impl<F: ProgramFamily> Owner<F> {
 
     pub fn with_resource_plan(
         domain: ExecutorDomain<F>,
-        bindings: StateBindings<F>,
+        bindings: StateBindings,
         limits: ServiceLimits,
         plan: &ResourcePlan,
         wakes: Arc<dyn Wakes>,
@@ -867,6 +1115,18 @@ impl<F: ProgramFamily> Owner<F> {
                 .refresh_memory()
                 .map_err(|error| error.to_string())?,
             reconciliation: self.reconcile_memory_charge()?,
+            serving: self.serving_census()?,
+        })
+    }
+
+    /// How the model serves now ([`ServingCensus`]).
+    pub fn serving_census(&self) -> Result<ServingCensus, String> {
+        let service = &self.service;
+        let experts = service.domain.expert_residency().map_err(|error| error.to_string())?;
+        Ok(ServingCensus {
+            group_places: service.domain.group_places(),
+            group_capacity: service.domain.chain_capacity(),
+            experts,
         })
     }
 
@@ -884,6 +1144,31 @@ impl<F: ProgramFamily> Owner<F> {
 
     pub fn cached_prefixes(&self) -> usize {
         self.service.prefix_cache.len()
+    }
+
+    /// Claim `bytes` of device memory beside the model for the service's
+    /// measurement job, in place of any claim before, which is released
+    /// (`ExecutorDomain::claim_measurement_room`): at flight boundaries the
+    /// bank shrinks toward its floor until the room is made, and the grant
+    /// is answered then, or once the floor leaves it short.
+    pub fn claim_measurement_room(&mut self, bytes: u64) -> RoomGrant {
+        self.service.domain.claim_measurement_room(bytes);
+        let (granter, grant) = RoomGrant::new();
+        self.service.memory.measurement_room = Some(RoomClaim(granter));
+        grant
+    }
+
+    /// The measurement job ended: its claim, answered or not, is released.
+    pub fn release_measurement_room(&mut self) {
+        self.service.domain.release_measurement_room();
+        self.service.memory.measurement_room = None;
+    }
+
+    /// Measure the experts by `measures` from now on
+    /// (`ExecutorDomain::measure_experts`): the bank's growth is priced on
+    /// them at the next observation.
+    pub fn measure_experts(&mut self, measures: ExpertMeasures) -> Result<(), String> {
+        self.service.domain.measure_experts(measures).map_err(|error| error.to_string())
     }
 
     pub fn inspect_domain<R>(
@@ -972,9 +1257,6 @@ impl<F: ProgramFamily> Service<F> {
         members: Option<&mut BTreeMap<RequestId, Member>>,
     ) -> Result<(RequestId, PublicationReceiver), AdmissionError> {
         self.time(now).map_err(AdmissionError::Refused)?;
-        if matches!(self.memory_condition, MemoryCondition::Reclaim { .. }) {
-            return Err(AdmissionError::MemoryReclaim);
-        }
         if generation.is_resident() || generation.usage().completion_tokens != 0 {
             return Err(AdmissionError::invariant("admission")(
                 "only a fresh generation can be admitted".into(),
@@ -996,7 +1278,15 @@ impl<F: ProgramFamily> Service<F> {
                 "a cache point must be an exact boundary inside the prompt".into(),
             ));
         }
-        self.domain.probe_memory().map_err(AdmissionError::from)?;
+        // A request arriving in Reclaim waits while the ladder gives memory
+        // back: it is refused only once the ladder's next release would be
+        // the model's unload (`MemoryStep::release_for_reclaim`).
+        match self.domain.probe_memory(OBSERVATION_INTERVAL) {
+            Err(error @ DomainError::Reclaim(_)) => self.refused_for_memory(&error),
+            observed => {
+                observed.map_err(AdmissionError::from)?;
+            }
+        }
         let id = RequestId(self.next_id);
         self.next_id = self.next_id.checked_add(1).ok_or_else(|| {
             AdmissionError::invariant("service identity")("identity exhausted".into())
@@ -1184,7 +1474,9 @@ impl<F: ProgramFamily> Service<F> {
                     available,
                 };
             }
+            Some(Wait::Memory) if self.waits_on_memory(request) => return Status::MemoryBlocked,
             Some(Wait::Memory) => return Status::Preempted,
+            None if self.waits_on_memory(request) => return Status::MemoryBlocked,
             None => {}
         }
         match &request.state {
@@ -1339,7 +1631,12 @@ impl<F: ProgramFamily> Service<F> {
             pipeline = match pipeline {
                 Pipeline::InFlight(round, mut active) => {
                     if submitted || !active.flight.completion().is_complete() {
-                        unload |= self.observe(None).map_err(|error| (None, error))?;
+                        // The round's members end with a fatal error, not
+                        // dropped with the round.
+                        unload |= match self.observe(None) {
+                            Ok(unload) => unload,
+                            Err(error) => return Err((Some(round.members), error)),
+                        };
                         return Ok((
                             Pipeline::InFlight(round, active),
                             self.ran(true, unload),
@@ -1383,55 +1680,139 @@ impl<F: ProgramFamily> Service<F> {
 
     fn ran(&self, in_flight: bool, unload: bool) -> Ran {
         Ran {
-            due: self.next_observation,
+            due: self.memory.next_observation,
             in_flight,
             unload,
         }
     }
+}
 
+/// The owner's memory between flights, on what a host gives it
+/// ([`MemoryHost`]): every host takes these, and none has its own.
+trait MemoryStep: MemoryHost + Sized {
     /// Observe memory when due. Reclaim releases need the bindings; while a
     /// flight holds them they are owed until it completes. Returns whether
     /// memory escalation decided to unload, after terminating every request.
-    fn observe(&mut self, bindings: Option<&mut StateBindings<F>>) -> Result<bool, RequestError> {
+    fn observe(&mut self, bindings: Option<&mut StateBindings>) -> Result<bool, RequestError> {
         let memory = |error: String| invariant("memory observation")(error);
-        if self.now >= self.next_observation {
-            self.next_observation = self.now.saturating_add(OBSERVATION_INTERVAL_NS);
-            let observation = memory_observation(self.domain.probe_memory()).map_err(memory)?;
-            self.enter_memory_condition(self.memory_condition.observe(observation, self.now));
-            if !matches!(self.memory_condition, MemoryCondition::Reclaim { .. }) {
-                self.release_owed = false;
+        let now = self.now();
+        if now >= self.memory().next_observation {
+            let resizing = self.memory().bank_began.is_some();
+            self.memory().room_owed.probed(resizing);
+            self.memory().next_observation = now.saturating_add(OBSERVATION_INTERVAL_NS);
+            let observation = memory_observation(self.domain().probe_memory(OBSERVATION_INTERVAL)).map_err(memory)?;
+            let next = self.memory().condition.observe(observation, now);
+            self.enter_memory_condition(next);
+            // The bank grows only once memory has stayed free, as a
+            // service reopens load admission.
+            let recovered = self.memory().recovery.observe(observation == MemoryObservation::Normal, now, |since, now| {
+                std::time::Duration::from_nanos(now - since)
+            });
+            self.memory().grow_owed = false;
+            if !matches!(self.memory().condition, MemoryCondition::Reclaim { .. }) {
+                self.memory().ladder.owed = false;
+                self.memory().ladder.covered = false;
                 if observation == MemoryObservation::Normal {
                     self.reopen_memory_deficits().map_err(memory)?;
+                    self.memory().grow_owed = recovered;
                 }
             } else if observation == MemoryObservation::Reclaim {
                 // Releases are measured against a fresh reading; a Blind
                 // escalation has none, so it goes straight to the unload
                 // decision.
-                self.release_owed = true;
+                self.memory().ladder.owed = true;
             }
         }
-        if let (true, Some(bindings)) = (self.release_owed, bindings) {
-            self.release_owed = false;
+        let mut bindings = bindings;
+        // A flight boundary: the expert bank's resize advances first, and a
+        // finished one frees what waited on it.
+        if bindings.is_some() {
+            self.advance_expert_bank()?;
+            // A release deferred for want of a gap is tried again at this
+            // boundary: what waited on it retries, and a Reclaim release is
+            // owed again.
+            if self.memory().ladder.retry_deferred() {
+                self.advance_epoch();
+                let reclaim = matches!(self.memory().condition, MemoryCondition::Reclaim { .. });
+                self.memory().ladder.owed |= reclaim;
+            }
+        }
+        // A prompt's places that won memory from the bank's slots take it
+        // through the bank's shrink (`ExecutorDomain::places_shrink`), as a
+        // release waits, for no chain under way.
+        let refused = self.memory().shrink_refused;
+        if let (None, Some(bindings), false) = (self.domain().chain_holder(), bindings.as_deref_mut(), refused) {
+            if let Some(bytes) = self.domain().places_shrink().map_err(classify_domain_error)? {
+                let before = self.domain().memory_moment();
+                let wake = self.completion();
+                let step = self.domain().shrink_expert_bank_by(bindings, bytes, wake);
+                if step.map_err(classify_domain_error)? == BankStep::Begun {
+                    self.memory().bank_began = Some(BankBegun { held: before, cause: BankBegunFor::Shrink(ShrinkCause::LiveClaim) });
+                }
+            }
+        }
+        // The measurement job's claim takes its room through the bank's
+        // shrink toward its floor, read at a probe no resize ran across
+        // (`room_owed`), so each shrink is seen before the next is decided:
+        // answered once the room is made, or once the floor, or the bank's
+        // storage refusing, leaves it short.
+        let ready = self.memory().bank_began.is_none() && self.domain().chain_holder().is_none() && bindings.is_some();
+        let deciding = match self.memory().room_owed.take(ready) {
+            true => self.domain().measurement_room().map_err(classify_domain_error)?,
+            false => None,
+        };
+        if let (Some(standing), Some(bindings), Some(claim)) =
+            (deciding, bindings.as_deref_mut(), deciding.and_then(|_| self.memory().measurement_room.take()))
+        {
+            let (refused, mut began) = (self.memory().shrink_refused, None);
+            let wake = self.completion();
+            let domain = self.domain();
+            let waiting = claim.decide(standing, refused, |bytes| {
+                let before = domain.memory_moment();
+                let step = domain.shrink_expert_bank_by(bindings, bytes, wake);
+                let step = step.map_err(classify_domain_error)?;
+                began = (step == BankStep::Begun).then_some(before);
+                Ok(step)
+            })?;
+            self.memory().measurement_room = waiting;
+            if let Some(held) = began {
+                self.memory().bank_began = Some(BankBegun { held, cause: BankBegunFor::Shrink(ShrinkCause::Measurement) });
+            }
+        }
+        // Every release changes bindings, so it waits for a chain under way
+        // to end: the chain's device work is done when its first chunk
+        // finishes, and its holder claims the rest first (`chain_holder`).
+        let releasable = self.memory().ladder.owed && self.domain().chain_holder().is_none();
+        if let (true, Some(bindings)) = (releasable, bindings.as_deref_mut()) {
+            self.memory().ladder.owed = false;
             if self.release_for_reclaim(bindings)? {
-                self.memory_condition = self.memory_condition.released(self.now);
-                let after = memory_observation(self.domain.probe_memory()).map_err(memory)?;
-                self.enter_memory_condition(self.memory_condition.observe(after, self.now));
+                let now = self.now();
+                self.memory().condition = self.memory().condition.released(now);
+                let after = memory_observation(self.domain().probe_memory(OBSERVATION_INTERVAL)).map_err(memory)?;
+                let next = self.memory().condition.observe(after, now);
+                self.enter_memory_condition(next);
             }
         }
-        // Unloading is the last step of the release order: while a flight
-        // holds the bindings, the releases owed to it (cached prefixes first)
-        // have not run yet, so the decision waits for them.
-        if !self.release_owed && self.memory_condition.should_unload(self.now) {
-            tracing::error!(
-                requests = self.requests.len(),
-                "unloading the model: memory stayed below the reclaim reserve"
-            );
-            self.terminalize_all(
-                RequestError::ModelUnloaded {
-                    cause: ModelUnloadCause::MemoryPressure,
-                },
-                None,
-            );
+        if let (true, Some(_)) = (self.memory().grow_owed, bindings) {
+            self.memory().grow_owed = false;
+            self.grow_expert_bank()?;
+        }
+        // Unloading is the last step of the release order, past the ladder's
+        // last rung (`release::Rung`): while a flight holds the bindings, the
+        // releases owed to it have not run yet, while one is pending it has
+        // not finished, and one deferred for a gap is tried again at the next
+        // boundary, so the decision waits for them.
+        let now = self.now();
+        // Reclaim outlasted the clock on what was released: the bank is asked
+        // again on the reading alone (`MemoryPace::lapse_credit`).
+        if self.memory().ladder.covered && self.memory().condition.should_unload(now) {
+            self.domain().lapse_expert_reclaim_credit();
+            self.memory().condition = self.memory().condition.released(now);
+            self.memory().ladder.covered = false;
+            self.memory().ladder.owed = true;
+        }
+        if self.memory().ladder.settled() && self.memory().condition.should_unload(now) {
+            self.unload();
             return Ok(true);
         }
         Ok(false)
@@ -1444,27 +1825,29 @@ impl<F: ProgramFamily> Service<F> {
     /// before the next timed observation could see the band.
     fn refused_for_memory(&mut self, error: &DomainError) {
         let observation = match error {
-            DomainError::Reclaim => MemoryObservation::Reclaim,
+            DomainError::Reclaim(_) => MemoryObservation::Reclaim,
             DomainError::Blind(_) => MemoryObservation::Blind,
             _ => return,
         };
-        self.enter_memory_condition(self.memory_condition.observe(observation, self.now));
-        if matches!(self.memory_condition, MemoryCondition::Reclaim { .. }) {
-            self.release_owed = true;
+        let next = self.memory().condition.observe(observation, self.now());
+        self.enter_memory_condition(next);
+        if matches!(self.memory().condition, MemoryCondition::Reclaim { .. }) {
+            self.memory().ladder.owed = true;
         }
     }
 
     /// Enter `next`. Memory returning to Normal is an availability change,
     /// and it ends every memory wait.
     fn enter_memory_condition(&mut self, next: MemoryCondition) {
-        let recovered =
-            self.memory_condition != MemoryCondition::Normal && next == MemoryCondition::Normal;
-        if std::mem::discriminant(&self.memory_condition) != std::mem::discriminant(&next) {
-            tracing::warn!(from = ?self.memory_condition, to = ?next, "memory condition changed");
+        let memory = self.memory();
+        let recovered = memory.condition != MemoryCondition::Normal && next == MemoryCondition::Normal;
+        if std::mem::discriminant(&memory.condition) != std::mem::discriminant(&next) {
+            tracing::warn!(from = ?memory.condition, to = ?next, "memory condition changed");
+            memory.shrink_refused = false;
         }
-        self.memory_condition = next;
+        memory.condition = next;
         if recovered {
-            self.epoch.advance();
+            self.advance_epoch();
         }
     }
 
@@ -1472,28 +1855,286 @@ impl<F: ProgramFamily> Service<F> {
     /// change. Memory another process frees is one: advance the epoch once a
     /// deficit's domain ceiling covers it, so blocked work retries.
     fn reopen_memory_deficits(&mut self) -> Result<(), String> {
-        if self.memory_deficits.is_empty() {
+        if self.memory().deficits.is_empty() {
             return Ok(());
         }
-        let readings = match self.domain.refresh_memory() {
+        let readings = match self.domain().refresh_memory() {
             Ok(readings) => readings,
             // A failed reading says nothing about the deficit; the next
             // periodic observation looks again.
             Err(DomainError::Blind(_)) => return Ok(()),
             Err(error) => return Err(error.to_string()),
         };
-        let before = self.memory_deficits.len();
-        self.memory_deficits.retain(|deficit| {
+        let deficits = &mut self.memory().deficits;
+        let before = deficits.len();
+        deficits.retain(|deficit| {
             !readings.iter().any(|reading| {
                 reading.role == deficit.role && reading.ceiling_bytes >= deficit.required
             })
         });
-        if self.memory_deficits.len() != before {
-            self.epoch.advance();
+        if deficits.len() != before {
+            self.advance_epoch();
         }
         Ok(())
     }
 
+    /// Begin one growth step of the expert bank: while memory is Normal and
+    /// no blocked request waits on memory (what is free is theirs first),
+    /// the first store's step that pays (`ExecutorDomain::expert_bank_growths`,
+    /// each step within what its store's claim admits). A store whose claim
+    /// is refused passes to the next, so a full device never holds back the
+    /// host tier; a Reclaim or Blind refusal is the memory observation it
+    /// is. Each step offered is logged with what came of it.
+    fn grow_expert_bank(&mut self) -> Result<(), RequestError> {
+        // A resize begun and not yet finished decides the next: none is
+        // made beside it.
+        if self.memory().condition != MemoryCondition::Normal
+            || !self.memory().deficits.is_empty()
+            || self.memory().bank_began.is_some()
+        {
+            return Ok(());
+        }
+        // A decision made on these offers already began nothing.
+        let offers = self.domain().expert_bank_growths().map_err(classify_domain_error)?;
+        let decided = offers.iter().map(magnitude_executor::GrowthOffer::decided).collect::<Vec<_>>();
+        if self.memory().declined.as_ref() == Some(&decided) {
+            return Ok(());
+        }
+        self.memory().declined = Some(decided);
+        for offer in offers {
+            let magnitude_executor::Growth { holding, kind, from, to, bytes, saving, justified } = offer.growth;
+            // One line a decision: the step offered, and what came of it.
+            let decided = |outcome: &dyn std::fmt::Display| {
+                tracing::info!(?holding, ?kind, from, to, justified, bytes, ?saving, %outcome, "expert bank growth decision");
+            };
+            if !offer.pays {
+                decided(&"not paying");
+                continue;
+            }
+            let before = self.domain().memory_moment();
+            let wake = self.completion();
+            match self.domain().grow_expert_bank(kind, wake) {
+                Ok(BankStep::Begun) => {
+                    decided(&"begun");
+                    self.memory().bank_began = Some(BankBegun { held: before, cause: BankBegunFor::Growth });
+                    self.memory().declined = None;
+                    return Ok(());
+                }
+                // A growth waits for no gap, and every resize that runs is
+                // one this owner began (`bank_began`, which no decision is
+                // made beside): the offers decided these, and the same
+                // offers are not decided again.
+                Ok(step @ (BankStep::Running | BankStep::Deferred | BankStep::AtLimit)) => {
+                    decided(&format_args!("{step:?}"));
+                    return Ok(());
+                }
+                // Sized within what the claim admitted, a refusal is the
+                // machine's change since: the next decision reads its room
+                // afresh.
+                Err(DomainError::Capacity(refusal)) => decided(&format_args!(
+                    "refused: {} bytes required, {} available",
+                    refusal.required, refusal.available
+                )),
+                Err(error @ (DomainError::Reclaim(_) | DomainError::Blind(_))) => {
+                    decided(&format_args!("refused: {error}"));
+                    self.refused_for_memory(&error);
+                    return Ok(());
+                }
+                Err(error) => return Err(classify_domain_error(error)),
+            }
+        }
+        Ok(())
+    }
+
+    /// At a flight boundary, advance the expert bank's resize
+    /// (`ExecutorDomain::advance_expert_bank`). A finished one is recorded as
+    /// a release is (a shrink as the bank rung's, a growth as memory grown):
+    /// how long it held this thread, the bank's slots after it, and what the
+    /// process held when it began and now. A finished shrink freed memory:
+    /// the reclaim clock restarts, what waited on memory may retry, and the
+    /// ladder resumes while memory is short.
+    fn advance_expert_bank(&mut self) -> Result<(), RequestError> {
+        let wake = self.completion();
+        let Some((finished, held)) = self.domain().advance_expert_bank(wake).map_err(classify_domain_error)? else {
+            return Ok(());
+        };
+        self.memory().ladder.pending = false;
+        self.memory().room_owed.resized();
+        let after = self.domain().memory_moment();
+        let BankBegun { held: before, cause } = self
+            .memory()
+            .bank_began
+            .take()
+            .ok_or_else(|| invariant("expert bank")("a resize finished that never began".into()))?;
+        let at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| invariant("expert bank")(format!("the clock is before the Unix epoch: {error}")))?
+            .as_millis() as u64;
+        let resized = |from, to| cause.finished(from, to, at_unix_ms).map_err(invariant("expert bank"));
+        // A finished resize has held this thread for a measured time.
+        let micros = (held * 1e6) as u64;
+        // Each step of the resize, in microseconds: those on this thread, and
+        // how long before now the others happened, so a decode stall around
+        // it is placed on the decode's timeline.
+        let now = std::time::Instant::now();
+        let before_now = |at: std::time::Instant| now.duration_since(at).as_micros() as u64;
+        if matches!(finished, BankResized::Shrunk { .. } | BankResized::Grown { .. }) {
+            self.memory().shrink_refused = false;
+        }
+        match finished {
+            BankResized::Shrunk { holding, from, to, released, times } => {
+                self.domain().record_expert_resize(holding, resized(from, to)?);
+                tracing::info!(
+                    rung = ?Rung::Bank,
+                    micros,
+                    bank_slots = self.domain().expert_bank_slots(),
+                    ?holding,
+                    from,
+                    to,
+                    released,
+                    charged_before = before.charged,
+                    charged_after = after.charged,
+                    footprint_before = before.footprint,
+                    footprint_after = after.footprint,
+                    queued_micros = times.queued.as_micros() as u64,
+                    planned_micros = times.planned.as_micros() as u64,
+                    plan_picked_micros = times.trips[0].picked.as_micros() as u64,
+                    plan_served_micros = times.trips[0].served.as_micros() as u64,
+                    commit_picked_micros = times.trips[1].picked.as_micros() as u64,
+                    commit_served_micros = times.trips[1].served.as_micros() as u64,
+                    moves_micros = times.moves.as_micros() as u64,
+                    decided_before = before_now(times.decided),
+                    prepared_before = before_now(times.prepared),
+                    installed_before = before_now(times.installed),
+                    released_before = before_now(times.released),
+                    "memory released"
+                );
+                let now = self.now();
+                self.memory().condition = self.memory().condition.released(now);
+                self.advance_epoch();
+            }
+            // A growth's `prepared` is when its first slot joined and
+            // `installed` its last (`ResizeTimes`).
+            BankResized::Grown { holding, from, to, grown, refused, times } => {
+                self.domain().record_expert_resize(holding, resized(from, to)?);
+                tracing::info!(
+                    micros,
+                    bank_slots = self.domain().expert_bank_slots(),
+                    ?holding,
+                    from,
+                    to,
+                    grown,
+                    refused = refused.as_ref().map(ToString::to_string),
+                    charged_before = before.charged,
+                    charged_after = after.charged,
+                    footprint_before = before.footprint,
+                    footprint_after = after.footprint,
+                    decided_before = before_now(times.decided),
+                    prepared_before = before_now(times.prepared),
+                    installed_before = before_now(times.installed),
+                    released_before = before_now(times.released),
+                    "memory grown"
+                )
+            }
+            // Nothing changed: no resize of the holding is recorded.
+            BankResized::Stopped { holding, at } => {
+                tracing::info!(?holding, at, "the expert bank's growth stopped before its first slot")
+            }
+            BankResized::Refused { holding, at, refusal } => {
+                self.memory().shrink_refused |= cause != BankBegunFor::Growth;
+                tracing::warn!(?holding, at, ?cause, %refusal, "the expert bank's storage refused a resize")
+            }
+        }
+        if matches!(self.memory().condition, MemoryCondition::Reclaim { .. }) {
+            self.memory().ladder.owed = true;
+        }
+        Ok(())
+    }
+
+    /// Whether a fresh reading is still in the Reclaim band. A failed reading
+    /// cannot measure a release, so it stops releasing.
+    fn reclaim_needed(&mut self) -> Result<bool, RequestError> {
+        Ok(memory_observation(self.domain().probe_memory(OBSERVATION_INTERVAL))
+            .map_err(invariant("memory observation"))?
+            == MemoryObservation::Reclaim)
+    }
+
+    /// Release once at the cheapest rung up to `through` that releases
+    /// anything ([`release::release_once`]): whether it released now;
+    /// preemption spares `spared`, and with `resident_slot` takes requests
+    /// that free no bytes, since what is short is a resident slot. A pending
+    /// release (a bank resize) is recorded: no costlier rung runs, and the
+    /// model is not unloaded, before the boundary that finishes it.
+    fn release_once(
+        &mut self,
+        bindings: &mut StateBindings,
+        cause: ReleaseCause,
+        through: Rung,
+        held: &BTreeSet<u64>,
+        spared: &[RequestId],
+        resident_slot: bool,
+    ) -> Result<bool, DomainError> {
+        let release = release::release_once(
+            &mut Releasing {
+                host: self,
+                bindings,
+                cause,
+                held,
+                spared,
+                resident_slot,
+            },
+            through,
+        )?;
+        self.memory().ladder.released(release);
+        Ok(release == Release::Released)
+    }
+
+    /// Release down the whole ladder until every domain is back above its
+    /// planning reserve, or a release is pending. Preempted requests replay
+    /// only after the band is Normal again, so no victim is chosen twice.
+    /// Returns whether anything was released. With the ladder exhausted and
+    /// memory still short, the next release would be the model's unload:
+    /// every request waiting on memory to become resident is refused.
+    fn release_for_reclaim(&mut self, bindings: &mut StateBindings) -> Result<bool, RequestError> {
+        let mut released = false;
+        self.memory().ladder.covered = false;
+        let held = self.held_prefixes();
+        while self.reclaim_needed()?
+            && self
+                .release_once(bindings, ReleaseCause::Reclaim, Rung::Preemption, &held, &[], false)
+                .map_err(classify_domain_error)?
+        {
+            released = true;
+        }
+        if released {
+            self.advance_epoch();
+        }
+        if self.memory().ladder.settled() && self.reclaim_needed()? {
+            self.refuse_memory_waiters();
+        }
+        Ok(released)
+    }
+}
+
+impl<H: MemoryHost> MemoryStep for H {}
+
+/// The owner's memory step at a flight boundary, `bindings` there where no
+/// flight holds them: memory observed when due (and growth owed once it has
+/// stayed free), the expert bank's running resize advanced, a prompt's
+/// places and the measurement job's claim taken through the bank's shrink,
+/// the release ladder run while memory is short, a growth step of the bank
+/// begun where owed, and the model unloaded once Reclaim outlasts every
+/// release. Whether it unloaded. The one step every host runs: the owner at
+/// each of its boundaries, and an instrument that drives the domain below
+/// the scheduler at each of its own.
+pub fn between_flights<H: MemoryHost>(
+    host: &mut H,
+    bindings: Option<&mut StateBindings>,
+) -> Result<bool, RequestError> {
+    host.observe(bindings)
+}
+
+impl<F: ProgramFamily> Service<F> {
     /// Record that blocked work needs `required` bytes from `role`'s domain,
     /// keeping the least requirement per role so the earliest retry is kept.
     fn record_memory_deficit(&mut self, resource: ResourceKind, required: u64) {
@@ -1503,12 +2144,13 @@ impl<F: ProgramFamily> Service<F> {
             _ => return,
         };
         match self
-            .memory_deficits
+            .memory
+            .deficits
             .iter_mut()
             .find(|deficit| deficit.role == role)
         {
             Some(deficit) => deficit.required = deficit.required.min(required),
-            None => self.memory_deficits.push(MemoryDeficit { role, required }),
+            None => self.memory.deficits.push(MemoryDeficit { role, required }),
         }
     }
 
@@ -1524,79 +2166,47 @@ impl<F: ProgramFamily> Service<F> {
         }
     }
 
-    /// Whether a fresh reading is still in the Reclaim band. A failed reading
-    /// cannot measure a release, so it stops releasing.
-    fn reclaim_needed(&mut self) -> Result<bool, RequestError> {
-        Ok(memory_observation(self.domain.probe_memory())
-            .map_err(invariant("memory observation"))?
-            == MemoryObservation::Reclaim)
+    /// Whether `request` waits on memory to become resident: it never was,
+    /// and memory is being reclaimed or its last attempt was refused for
+    /// memory. Preemption is the only eviction and it counts itself
+    /// (`preemption_debt`), so a non-resident request without that debt never
+    /// was resident; a preempted one is not refused, mid-prefill included.
+    /// Such a request is the one refused once only the model's unload could
+    /// make room for it.
+    fn waits_on_memory(&self, request: &Request) -> bool {
+        request.record.preemption_debt == 0
+            && matches!(&request.state, State::Between(_, Stage::NonResident(wait @ (None | Some(Wait::Memory))))
+                if wait.is_some() || matches!(self.memory.condition, MemoryCondition::Reclaim { .. }))
     }
 
-    /// Release in the Reclaim order until every domain is back above its
-    /// planning reserve: surplus state backing, retained prefixes (least
-    /// recently used first), dormant optional components, then preemption of
-    /// each eligible victim once. Preempted requests replay only after the
-    /// band is Normal again, so no victim is chosen twice. Returns whether
-    /// anything was released.
-    fn release_for_reclaim(&mut self, bindings: &mut StateBindings<F>) -> Result<bool, RequestError> {
-        let mut released = self.release_surplus(bindings)?;
-        while self.reclaim_needed()? {
-            let held = self.held_entries(None);
-            if !self.prefix_cache.evict_one(&held) {
-                break;
-            }
-            // Eviction drops claims, but committed rows and banks remain
-            // charged until the stores shrink.
-            self.release_surplus(bindings)?;
-            released = true;
+    /// Refuse every request waiting on memory to become resident: it never
+    /// was, and only the model's unload could make room for it.
+    fn refuse_memory_waiters(&mut self) {
+        let waiting = self
+            .requests
+            .iter()
+            .filter(|(_, request)| self.waits_on_memory(request))
+            .map(|(&id, _)| id)
+            .collect::<Vec<_>>();
+        for id in waiting {
+            let Request { mut record, state } = self.requests.remove(&id).expect("waiting request");
+            let mut generation = state.terminate(false);
+            Self::fail_generation(&mut record, &mut generation, RequestError::MemoryReclaim);
+            self.requests.insert(
+                id,
+                Request {
+                    record,
+                    state: State::Between(generation, Stage::Ready),
+                },
+            );
         }
-        if self.reclaim_needed()? {
-            released |= self
-                .domain
-                .release_idle_optional_components(bindings)
-                .map_err(invariant("optional component release"))?
-                != 0;
-        }
-        while self.reclaim_needed()? {
-            if !self.evict_victims(&[], false)? {
-                break;
-            }
-            self.release_surplus(bindings)?;
-            released = true;
-        }
-        // Preemption can leave the optional components dormant.
-        if self.reclaim_needed()? {
-            released |= self
-                .domain
-                .release_idle_optional_components(bindings)
-                .map_err(invariant("optional component release"))?
-                != 0;
-        }
-        if released {
-            self.epoch.advance();
-        }
-        Ok(released)
-    }
-
-    /// Release state backing beyond what the stores need, including idle
-    /// state. Returns whether any bytes were released.
-    fn release_surplus(&mut self, bindings: &mut StateBindings<F>) -> Result<bool, RequestError> {
-        let shrunk = self
-            .domain
-            .shrink_state(bindings, ShrinkPolicy::Reclaim)
-            .map_err(classify_domain_error)?;
-        let idle = self
-            .domain
-            .reclaim_idle(bindings)
-            .map_err(invariant("idle state release"))?;
-        Ok(shrunk != 0 || idle != 0)
     }
 
     /// When nothing can move the epoch (no flight: this runs in `Idle`, no
     /// request waits on its host or on memory, and memory is Normal), every
     /// capacity wait ends in its typed error. Returns whether any did.
     fn fail_capacity_waiters(&mut self) -> bool {
-        if self.memory_condition != MemoryCondition::Normal {
+        if self.memory.condition != MemoryCondition::Normal {
             return false;
         }
         let independent = self.requests.values().any(|request| {
@@ -1650,7 +2260,7 @@ impl<F: ProgramFamily> Service<F> {
     /// End the waits that have ended, then take the requests selection can
     /// start out of the map.
     fn candidates(&mut self) -> BTreeMap<RequestId, (Record, Candidate)> {
-        let memory_normal = self.memory_condition == MemoryCondition::Normal;
+        let memory_normal = self.memory.condition == MemoryCondition::Normal;
         let epoch = self.epoch;
         let ended_wait = |wait: Option<Wait>| match wait {
             Some(Wait::Capacity { at, .. }) => epoch.changed_since(at),
@@ -1715,8 +2325,17 @@ impl<F: ProgramFamily> Service<F> {
             .collect()
     }
 
-    fn select(&mut self, bindings: &mut StateBindings<F>) -> Result<Selected, Fatal> {
+    fn select(&mut self, bindings: &mut StateBindings) -> Result<Selected, Fatal> {
         let mut candidates = self.candidates();
+        let mut holder = self.domain.chain_holder();
+        // A holder that is no longer scheduled ended mid-chain: its chain is
+        // released, and its state with it.
+        if holder.is_some_and(|holder| !candidates.contains_key(&holder)) {
+            self.domain
+                .release_chain()
+                .map_err(|error| (None, classify_domain_error(error)))?;
+            holder = None;
+        }
         let operations = candidates
             .iter()
             .map(|(&id, (record, candidate))| {
@@ -1733,6 +2352,9 @@ impl<F: ProgramFamily> Service<F> {
                     waiting_since_ns: record.waiting_since,
                     service_ns: record.service_ns,
                     preemption_debt: record.preemption_debt,
+                    // Its next chunk claims the chain's queued launch before
+                    // any other round could orphan it.
+                    holds_chain: holder == Some(id),
                 }
             })
             .collect::<Vec<_>>();
@@ -1821,14 +2443,24 @@ impl<F: ProgramFamily> Service<F> {
                 );
                 continue;
             }
-            match self.start(
+            // On a fatal error every selected request, started or not, goes
+            // back where the owner terminates it with that error: one held
+            // here would be dropped without its outcome.
+            let started = match self.start(
                 id,
                 record,
                 candidate,
                 allowance,
                 remaining_selections,
                 bindings,
-            )? {
+            ) {
+                Ok(started) => started,
+                Err((_, error)) => {
+                    self.return_candidates(candidates);
+                    return Err((Some(members), error));
+                }
+            };
+            match started {
                 Start::Joined(member, mut next) => {
                     let rows = next
                         .iter()
@@ -1838,18 +2470,17 @@ impl<F: ProgramFamily> Service<F> {
                         .map(Operation::row_count)
                         .sum::<usize>();
                     remaining_rows = remaining_rows.saturating_sub(rows);
-                    remaining_selections = remaining_selections
-                        .checked_sub(selection_charge(&next))
-                        .ok_or_else(|| {
-                            (
-                                None,
-                                invariant("scheduler")(
-                                    "a started member exceeds the round's selection bound".into(),
-                                ),
-                            )
-                        })?;
-                    operations.append(&mut next);
+                    let charge = selection_charge(&next);
                     members.insert(id, member);
+                    let Some(left) = remaining_selections.checked_sub(charge) else {
+                        self.return_candidates(candidates);
+                        let error = invariant("scheduler")(
+                            "a started member exceeds the round's selection bound".into(),
+                        );
+                        return Err((Some(members), error));
+                    };
+                    remaining_selections = left;
+                    operations.append(&mut next);
                 }
                 Start::Returned(request) => {
                     self.requests.insert(id, request);
@@ -1892,7 +2523,7 @@ impl<F: ProgramFamily> Service<F> {
         candidate: Candidate,
         allowance: usize,
         selections: usize,
-        bindings: &mut StateBindings<F>,
+        bindings: &mut StateBindings,
     ) -> Result<Start, Fatal> {
         record.begin_service(&candidate);
         let generation = match candidate {
@@ -1916,7 +2547,17 @@ impl<F: ProgramFamily> Service<F> {
             }
             Candidate::Ready(generation) => generation,
             Candidate::NonResident(generation) => {
-                match self.make_resident(id, &mut record, generation, bindings)? {
+                let residency = match self.make_resident(id, &mut record, generation, bindings) {
+                    Ok(residency) => residency,
+                    // No map holds `record` now: it takes the error itself.
+                    Err((members, error)) => {
+                        if let Some(sender) = record.publication.take() {
+                            sender.fail(error.clone());
+                        }
+                        return Err((members, error));
+                    }
+                };
+                match residency {
                     Residency::Resident(generation, encodes) => match Work::new(encodes) {
                         Some(work) => {
                             return Ok(Start::Joined(
@@ -2071,7 +2712,7 @@ impl<F: ProgramFamily> Service<F> {
         id: RequestId,
         record: &mut Record,
         mut generation: Generation,
-        bindings: &mut StateBindings<F>,
+        bindings: &mut StateBindings,
     ) -> Result<Residency, Fatal> {
         let fatal = |error: RequestError| (None, error);
         let hit = if record.prefix_cache {
@@ -2099,7 +2740,7 @@ impl<F: ProgramFamily> Service<F> {
                 let wait = self.capacity_wait(error.resource, error.required, error.available);
                 return Ok(Residency::Waiting(generation, wait));
             }
-            Err(DomainError::Reclaim | DomainError::Blind(_)) => {
+            Err(DomainError::Reclaim(_) | DomainError::Blind(_)) => {
                 return Ok(Residency::Waiting(generation, Wait::Memory));
             }
             Err(error) if is_fatal(&error) => return Err(fatal(classify_domain_error(error))),
@@ -2127,48 +2768,22 @@ impl<F: ProgramFamily> Service<F> {
             };
         }
         record.prefix_source = hit.map(|hit| hit.id());
+        // Its host answers it admitted only now: one refused before this
+        // never was.
+        if let Some(sender) = &record.publication {
+            sender.began();
+        }
         Ok(Residency::Resident(generation, encodes))
     }
 
-    fn ensure_open_capacity(&mut self, bindings: &mut StateBindings<F>) -> Result<(), DomainError> {
-        let release = |context: &'static str| {
-            move |detail: String| DomainError::Invariant(InvariantError { context, detail })
-        };
+    /// Release down the whole ladder until a new request's state opens.
+    fn ensure_open_capacity(&mut self, bindings: &mut StateBindings) -> Result<(), DomainError> {
         let requirements = self.domain.open_requirements();
         let mut current = self.open_capacity(bindings, requirements);
-        if !matches!(current, Err(DomainError::Capacity(_))) {
-            return current;
-        }
-        self.domain.shrink_state(bindings, ShrinkPolicy::Reclaim)?;
-        current = self.open_capacity(bindings, requirements);
-        if matches!(current, Err(DomainError::Capacity(_))) {
-            self.domain
-                .reclaim_idle(bindings)
-                .map_err(release("idle state release"))?;
-            current = self.open_capacity(bindings, requirements);
-        }
-        while matches!(current, Err(DomainError::Capacity(_))) {
-            let held = self.held_entries(None);
-            if !self.prefix_cache.evict_one(&held) {
-                break;
-            }
-            self.domain.shrink_state(bindings, ShrinkPolicy::Reclaim)?;
-            current = self.open_capacity(bindings, requirements);
-        }
-        if matches!(current, Err(DomainError::Capacity(_))) {
-            self.domain
-                .release_idle_optional_components(bindings)
-                .map_err(release("optional component release"))?;
-            current = self.open_capacity(bindings, requirements);
-        }
-        while matches!(current, Err(DomainError::Capacity(_))) {
-            if !self
-                .evict_victims(&[], true)
-                .map_err(|error| release("preemption")(error.to_string()))?
-            {
-                break;
-            }
-            self.domain.shrink_state(bindings, ShrinkPolicy::Reclaim)?;
+        let held = self.held_entries(None);
+        while matches!(current, Err(DomainError::Capacity(_)))
+            && self.release_once(bindings, ReleaseCause::LiveClaim, Rung::Preemption, &held, &[], true)?
+        {
             current = self.open_capacity(bindings, requirements);
         }
         current
@@ -2176,7 +2791,7 @@ impl<F: ProgramFamily> Service<F> {
 
     fn open_capacity(
         &mut self,
-        bindings: &mut StateBindings<F>,
+        bindings: &mut StateBindings,
         requirements: OpenRequirements,
     ) -> Result<(), DomainError> {
         self.domain.provision_open(bindings)?;
@@ -2187,7 +2802,7 @@ impl<F: ProgramFamily> Service<F> {
 
     /// Submit the round's next groups until one is on the device or the
     /// round is exhausted.
-    fn advance(&mut self, mut round: Round, mut bindings: StateBindings<F>) -> Result<Pipeline<F>, Fatal> {
+    fn advance(&mut self, mut round: Round, mut bindings: StateBindings) -> Result<Pipeline<F>, Fatal> {
         loop {
             let Some(group_) = round.groups.pop_front() else {
                 self.finish_round(round)
@@ -2220,11 +2835,19 @@ impl<F: ProgramFamily> Service<F> {
                 }
                 continue;
             }
-            let planned = match self.planned_prefill(&round, group_.operations()) {
-                Ok(planned) => planned,
-                Err(error) => return Err((Some(round.members), error)),
-            };
-            self.domain.plan_successors(planned);
+            let chunk_rows = self.scheduler.limits().prefill_tokens.max(1);
+            let decode_owed = round.selection.contended().then(|| self.scheduler.limits().decode_owed());
+            let alone = round.members.len() == 1
+                && !self
+                    .requests
+                    .values()
+                    .any(|other| competes(other, self.status(other)));
+            let planned = self.domain.plan_prompt(decode_owed, alone, |chunks| {
+                planned_prefill(&round, group_.operations(), chunk_rows, chunks)
+            });
+            if let Err(error) = planned {
+                return Err((Some(round.members), error));
+            }
             let group_ = match self.provision(&mut bindings, &round, group_) {
                 Ok(Provisioned::Fits(group_)) => group_,
                 Ok(Provisioned::Split(leading, trailing)) => {
@@ -2273,7 +2896,7 @@ impl<F: ProgramFamily> Service<F> {
                 Err(SubmitFailure::Refused(error, returned)) => {
                     bindings = returned;
                     match error {
-                        DomainError::Blind(_) | DomainError::Reclaim => {
+                        DomainError::Blind(_) | DomainError::Reclaim(_) => {
                             self.refused_for_memory(&error);
                             self.park(&mut round, group_, Wait::Memory);
                         }
@@ -2302,68 +2925,15 @@ impl<F: ProgramFamily> Service<F> {
         }
     }
 
-    /// The prompt chunk a lone prefill group's request submits next, when it
-    /// is known now, so the domain queues it behind this group. A chunk
-    /// ending at a planned branch or retention point is followed by that
-    /// retention, not planned past.
-    ///
-    /// Only a request the device serves alone plans one: the queued chunk is
-    /// claimed only when the next group submitted is that chunk. Any other
-    /// group first waits for the queued chunk and discards it, so a lone
-    /// group (a primed chunk launches alone) among other requests' work would
-    /// compute a full chunk it throws away in every round.
-    fn planned_prefill(&self, round: &Round, operations: &[Operation]) -> Result<Vec<Operation>, RequestError> {
-        let [Operation::Forward {
-            request,
-            kind: WorkKind::Prefill,
-            tokens,
-            position,
-            ..
-        }] = operations
-        else {
-            return Ok(Vec::new());
-        };
-        if round.members.len() != 1
-            || self
-                .requests
-                .values()
-                .any(|other| competes(other, self.status(other)))
-        {
-            return Ok(Vec::new());
-        }
-        let Some(Member {
-            record,
-            state: Membership::Started(started),
-        }) = round.members.get(request)
-        else {
-            return Ok(Vec::new());
-        };
-        let end = position + tokens.len();
-        let stop = next_stop(record, started.generation(), *position);
-        if stop.is_some_and(|stop| stop <= end) {
-            return Ok(Vec::new());
-        }
-        let allowance = stop
-            .map(|stop| stop - end)
-            .into_iter()
-            .fold(self.scheduler.limits().prefill_tokens.max(1), usize::min);
-        Ok(started
-            .planned_prefill(*request, allowance)
-            .map_err(invariant("planned prefill"))?
-            .into_iter()
-            .collect())
-    }
-
     /// Provision a group's state and check its reservation. A requirement
     /// and a growth claim are one capacity question: recheck both after each
     /// release. Selection is provisional until every exact requirement is
-    /// available: a deficit first releases state backing beyond what the
-    /// stores need, then least-recently-used retention until the
-    /// requirement fits, then idle residency, then the group's trailing
-    /// operations, then eligible live victims outside the round.
+    /// available: a deficit releases down the ladder short of preemption,
+    /// then sheds the group's trailing operations, which loses no work, and
+    /// only then preempts eligible live victims outside the round.
     fn provision(
         &mut self,
-        bindings: &mut StateBindings<F>,
+        bindings: &mut StateBindings,
         round: &Round,
         group_: OperationGroup,
     ) -> Result<Provisioned, RequestError> {
@@ -2379,28 +2949,11 @@ impl<F: ProgramFamily> Service<F> {
             self.prefix_cache.release_unspared(&held);
             current = self.fits(bindings, round, &group_);
         }
-        if short(&current) {
-            self.domain
-                .shrink_state(bindings, ShrinkPolicy::Reclaim)
-                .map_err(classify_domain_error)?;
-            current = self.fits(bindings, round, &group_);
-        }
-        if short(&current) {
-            self.domain
-                .reclaim_idle(bindings)
-                .map_err(invariant("idle state release"))?;
-            current = self.fits(bindings, round, &group_);
-        }
-        while short(&current) && self.prefix_cache.evict_one(&held) {
-            self.domain
-                .shrink_state(bindings, ShrinkPolicy::Reclaim)
-                .map_err(classify_domain_error)?;
-            current = self.fits(bindings, round, &group_);
-        }
-        if short(&current) {
-            self.domain
-                .release_idle_optional_components(bindings)
-                .map_err(invariant("optional component release"))?;
+        while short(&current)
+            && self
+                .release_once(bindings, ReleaseCause::LiveClaim, Rung::Optional, &held, &[], false)
+                .map_err(classify_domain_error)?
+        {
             current = self.fits(bindings, round, &group_);
         }
         if short(&current) {
@@ -2409,16 +2962,17 @@ impl<F: ProgramFamily> Service<F> {
                 Err(whole) => whole,
             };
             let selected = round.members.keys().copied().collect::<Vec<_>>();
-            while short(&current) && self.evict_victims(&selected, false)? {
-                self.domain
-                    .shrink_state(bindings, ShrinkPolicy::Reclaim)
-                    .map_err(classify_domain_error)?;
+            while short(&current)
+                && self
+                    .release_once(bindings, ReleaseCause::LiveClaim, Rung::Preemption, &held, &selected, false)
+                    .map_err(classify_domain_error)?
+            {
                 current = self.fits(bindings, round, &group_);
             }
         }
         match current {
             Ok(()) => Ok(Provisioned::Fits(group_)),
-            Err(error @ (DomainError::Blind(_) | DomainError::Reclaim)) => {
+            Err(error @ (DomainError::Blind(_) | DomainError::Reclaim(_))) => {
                 self.refused_for_memory(&error);
                 Ok(Provisioned::Short(group_, Wait::Memory))
             }
@@ -2436,7 +2990,7 @@ impl<F: ProgramFamily> Service<F> {
     /// state growth stops at the workload state the plan charges.
     fn fits(
         &mut self,
-        bindings: &mut StateBindings<F>,
+        bindings: &mut StateBindings,
         round: &Round,
         group_: &OperationGroup,
     ) -> Result<(), DomainError> {
@@ -2446,7 +3000,7 @@ impl<F: ProgramFamily> Service<F> {
             .holds_unspared(&held)
             .then(|| self.prefix_cache.workload_state_bytes());
         self.domain.provision(bindings, group_.operations(), ceiling)?;
-        let requirement = requirements(&self.domain, bindings, group_)?;
+        let requirement = requirements(&self.domain, group_)?;
         self.domain
             .can_reserve(&requirement)
             .map_err(DomainError::from)
@@ -2460,6 +3014,13 @@ impl<F: ProgramFamily> Service<F> {
             .iter()
             .map(Operation::request)
             .collect::<BTreeSet<_>>();
+        if wait == Wait::Memory {
+            tracing::info!(
+                requests = ?requests,
+                rows = group_.operations().iter().map(Operation::row_count).sum::<usize>(),
+                "a group waits on memory"
+            );
+        }
         let mut operations = group_.into_operations();
         let groups = std::mem::take(&mut round.groups);
         let mut kept = Vec::new();
@@ -2582,24 +3143,30 @@ impl<F: ProgramFamily> Service<F> {
                 continue;
             };
             record.add_physical_duration(item.physical_duration());
-            let state = match state {
+            // The member returns to the round before any fatal error is
+            // returned: the owner terminates the round's members with it, and
+            // a member held here would be dropped without its outcome.
+            let (state, fatal) = match state {
                 Membership::Started(mut started) if !ended(started.generation()) => {
                     started.timed(TimedLaunch::Target, item.launch_duration(), sequences, rows);
                     match reconcile_forward(started, &mut self.domain, request, item) {
                         Ok((generation, effects)) => {
                             followups.extend(effects.operations);
-                            Membership::Generation(generation)
+                            (Membership::Generation(generation), None)
                         }
+                        // Interrupted: the generation runs the round again
+                        // (or re-prefills), unfailed.
+                        Err((generation, RoundError::Interrupted(_))) => (Membership::Generation(generation), None),
                         Err((mut generation, RoundError::Logical(detail))) => {
                             Self::fail_generation(
                                 &mut record,
                                 &mut generation,
                                 invariant("generation round")(detail),
                             );
-                            Membership::Generation(generation)
+                            (Membership::Generation(generation), None)
                         }
-                        Err((_, RoundError::Physical(error))) if is_fatal(&error) => {
-                            return Err(classify_domain_error(error));
+                        Err((generation, RoundError::Physical(error))) if is_fatal(&error) => {
+                            (Membership::Generation(generation), Some(classify_domain_error(error)))
                         }
                         Err((mut generation, RoundError::Physical(error))) => {
                             Self::fail_generation(
@@ -2607,16 +3174,19 @@ impl<F: ProgramFamily> Service<F> {
                                 &mut generation,
                                 classify_domain_error(error),
                             );
-                            Membership::Generation(generation)
+                            (Membership::Generation(generation), None)
                         }
                     }
                 }
                 state => {
-                    self.domain.abort(item).map_err(classify_domain_error)?;
-                    state
+                    let fatal = self.domain.abort(item).map_err(classify_domain_error).err();
+                    (state, fatal)
                 }
             };
             round.members.insert(request, Member { record, state });
+            if let Some(error) = fatal {
+                return Err(error);
+            }
         }
         if !followups.is_empty() {
             round
@@ -3100,7 +3670,7 @@ impl<F: ProgramFamily> Service<F> {
         &mut self,
         selected: &[RequestId],
         release_resident_slot: bool,
-    ) -> Result<bool, RequestError> {
+    ) -> Result<bool, DomainError> {
         let mut victims = Vec::new();
         for (&id, request) in &self.requests {
             let State::Between(generation, stage @ (Stage::Ready | Stage::AwaitingCredit)) =
@@ -3118,14 +3688,14 @@ impl<F: ProgramFamily> Service<F> {
             let executor_bytes = self
                 .domain
                 .reclaimable(&[id])
-                .map_err(invariant("preemption"))?;
+                .map_err(release_invariant("preemption"))?;
             victims.push(Victim {
                 identity: id,
                 output_blocked: matches!(stage, Stage::AwaitingCredit),
                 preemption_debt: request.record.preemption_debt,
                 exclusive_bytes: executor_bytes
                     .checked_add(generation.method_reclaimable())
-                    .ok_or_else(|| invariant("preemption")("request reclaim byte count overflow".into()))?,
+                    .ok_or_else(|| release_invariant("preemption")("request reclaim byte count overflow".into()))?,
                 replay_tokens: generation.accepted_position() as u64,
                 service_ns: request.record.service_ns,
             });
@@ -3137,19 +3707,19 @@ impl<F: ProgramFamily> Service<F> {
             let method_bytes = set.iter().try_fold(0u64, |total, request| {
                 total
                     .checked_add(self.requests[request].state.generation().method_reclaimable())
-                    .ok_or_else(|| invariant("preemption")("method reclaim byte count overflow".into()))
+                    .ok_or_else(|| release_invariant("preemption")("method reclaim byte count overflow".into()))
             })?;
             let reclaimable = self
                 .domain
                 .reclaimable(&set)
-                .map_err(invariant("preemption"))?;
+                .map_err(release_invariant("preemption"))?;
             if !release_resident_slot && reclaimable == 0 && method_bytes == 0 {
                 continue;
             }
             let released = self
                 .domain
                 .release_state(&set)
-                .map_err(invariant("preemption"))?;
+                .map_err(release_invariant("preemption"))?;
             if !release_resident_slot && released == 0 && method_bytes == 0 {
                 continue;
             }
@@ -3160,7 +3730,7 @@ impl<F: ProgramFamily> Service<F> {
                 };
                 record.protected_until = Some(generation.accepted_position());
                 record.preemption_debt = record.preemption_debt.saturating_add(1);
-                generation.evicted().map_err(invariant("preemption"))?;
+                generation.evicted().map_err(release_invariant("preemption"))?;
                 self.requests.insert(
                     id,
                     Request {
@@ -3173,6 +3743,174 @@ impl<F: ProgramFamily> Service<F> {
             return Ok(true);
         }
         Ok(false)
+    }
+}
+
+/// The owner's releases, between flights: the bindings every one of them
+/// changes are here.
+struct Releasing<'a, H: MemoryHost> {
+    host: &'a mut H,
+    bindings: &'a mut StateBindings,
+    cause: ReleaseCause,
+    held: &'a BTreeSet<u64>,
+    spared: &'a [RequestId],
+    resident_slot: bool,
+}
+
+/// Why the owner releases memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReleaseCause {
+    /// Memory is in the Reclaim band.
+    Reclaim,
+    /// A live request's claim is short.
+    LiveClaim,
+}
+
+impl ReleaseCause {
+    /// The cause of an expert bank shrink this release begins.
+    fn shrink(self) -> BankBegunFor {
+        BankBegunFor::Shrink(match self {
+            Self::Reclaim => ShrinkCause::Reclaim,
+            Self::LiveClaim => ShrinkCause::LiveClaim,
+        })
+    }
+}
+
+impl<H: MemoryHost> Releases for Releasing<'_, H> {
+    type Error = DomainError;
+
+    /// Each release is recorded: its rung, how long it took, the bank's
+    /// slots after it, and what the process held on each side of it (a bank
+    /// step's when it finishes, `MemoryStep::advance_expert_bank`).
+    fn release(&mut self, rung: Rung) -> Result<Release, DomainError> {
+        let before = self.host.domain().memory_moment();
+        // The bank decision's deficits, before this release can change
+        // memory: what the release is attributed to.
+        let mut deficit = |holding| {
+            let domain = self.host.domain();
+            domain
+                .expert_bank_plan()
+                .and_then(|bank| bank.holding_storage(holding))
+                .map_or(0, |kind| domain.expert_reclaim_deficit(kind.storage()))
+        };
+        let device_deficit = deficit(magnitude_executor::BankHolding::Experts);
+        let host_deficit = deficit(magnitude_executor::BankHolding::Host);
+        let started = std::time::Instant::now();
+        let released = self.release_at(rung)?;
+        if released == Release::Pending && self.host.memory().bank_began.is_none() {
+            self.host.memory().bank_began = Some(BankBegun { held: before, cause: self.cause.shrink() });
+        }
+        if released == Release::Released {
+            let domain = self.host.domain();
+            let after = domain.memory_moment();
+            // Unread values are absent fields.
+            tracing::info!(
+                rung = ?rung,
+                cause = ?self.cause,
+                reclaim_device_deficit_bytes = device_deficit,
+                reclaim_host_deficit_bytes = host_deficit,
+                micros = started.elapsed().as_micros() as u64,
+                bank_slots = domain.expert_bank_slots(),
+                group_places = domain.group_places(),
+                charged_before = before.charged,
+                charged_after = after.charged,
+                footprint_before = before.footprint,
+                footprint_after = after.footprint,
+                "memory released"
+            );
+        }
+        Ok(released)
+    }
+}
+
+impl<H: MemoryHost> Releasing<'_, H> {
+    fn release_at(&mut self, rung: Rung) -> Result<Release, DomainError> {
+        let released = |released: bool| match released {
+            true => Release::Released,
+            false => Release::Nothing,
+        };
+        Ok(match rung {
+            Rung::Surplus => released(self.host.domain().shrink_state(self.bindings, ShrinkPolicy::Reclaim)? != 0),
+            Rung::Idle => released(
+                self.host
+                    .domain()
+                    .reclaim_idle(self.bindings)
+                    .map_err(release_invariant("idle state release"))?
+                    != 0,
+            ),
+            // A refused shrink is not begun again before memory changes.
+            Rung::Bank if self.host.memory().shrink_refused => Release::Nothing,
+            Rung::Bank if self.host.domain().expert_reclaim_covered() => Release::Covered,
+            // A step begun, or a resize running, releases at a later flight
+            // boundary; the bank's floor releases nothing.
+            Rung::Bank => {
+                let wake = self.host.completion();
+                match self.host.domain().shrink_expert_bank(self.bindings, wake)? {
+                    BankStep::Begun | BankStep::Running => Release::Pending,
+                    BankStep::Deferred => Release::Deferred,
+                    BankStep::AtLimit => Release::Nothing,
+                }
+            }
+            Rung::Prefix => released(self.host.evict_prefix(self.held)),
+            Rung::Optional => released(
+                self.host
+                    .domain()
+                    .release_idle_optional_components(self.bindings)
+                    .map_err(release_invariant("optional component release"))?
+                    != 0,
+            ),
+            Rung::Preemption => released(self.host.evict_victims(self.spared, self.resident_slot)?),
+        })
+    }
+}
+
+impl<F: ProgramFamily> MemoryHost for Service<F> {
+    type Family = F;
+
+    fn domain(&mut self) -> &mut ExecutorDomain<F> {
+        &mut self.domain
+    }
+
+    fn memory(&mut self) -> &mut BetweenFlights {
+        &mut self.memory
+    }
+
+    fn now(&self) -> u64 {
+        self.now
+    }
+
+    fn completion(&self) -> magnitude_executor::CompletionWake {
+        self.wakes.completion()
+    }
+
+    fn advance_epoch(&mut self) {
+        self.epoch.advance();
+    }
+
+    fn held_prefixes(&self) -> BTreeSet<u64> {
+        self.held_entries(None)
+    }
+
+    fn evict_prefix(&mut self, held: &BTreeSet<u64>) -> bool {
+        self.prefix_cache.evict_one(held)
+    }
+
+    fn evict_victims(&mut self, spared: &[RequestId], resident_slot: bool) -> Result<bool, DomainError> {
+        Service::evict_victims(self, spared, resident_slot)
+    }
+
+    fn refuse_memory_waiters(&mut self) {
+        Service::refuse_memory_waiters(self)
+    }
+
+    fn unload(&mut self) {
+        tracing::error!(requests = self.requests.len(), "unloading the model: memory stayed below the reclaim reserve");
+        self.terminalize_all(
+            RequestError::ModelUnloaded {
+                cause: ModelUnloadCause::MemoryPressure,
+            },
+            None,
+        );
     }
 }
 
@@ -3191,7 +3929,7 @@ enum Residency {
 fn memory_observation(result: Result<(), DomainError>) -> Result<MemoryObservation, String> {
     match result {
         Ok(()) => Ok(MemoryObservation::Normal),
-        Err(DomainError::Reclaim) => Ok(MemoryObservation::Reclaim),
+        Err(DomainError::Reclaim(_)) => Ok(MemoryObservation::Reclaim),
         Err(DomainError::Blind(_)) => Ok(MemoryObservation::Blind),
         Err(error) => Err(error.to_string()),
     }
@@ -3404,6 +4142,20 @@ mod termination_tests {
         assert_eq!(failed.finish_reason(), Some(FinishReason::Failed));
         let cancelled = Membership::Started(started()).terminate(true);
         assert_eq!(cancelled.finish_reason(), Some(FinishReason::Cancelled));
+    }
+
+    /// An interrupted round (`RoundError::Interrupted`) is abandoned: its
+    /// generation stays unfinished and starts the same round again.
+    #[test]
+    fn an_abandoned_round_runs_again() {
+        let round = started();
+        let forward = round.round_forward().clone();
+        let generation = round.abandon();
+        assert_eq!(generation.finish_reason(), None, "an abandoned round finishes its generation");
+        match generation.start_round(magnitude_generation::RequestId(1), 4) {
+            Ok(RoundStart::Target(again)) => assert_eq!(again.round_forward(), &forward, "the round starts again as it was"),
+            _ => panic!("expected the target round again"),
+        }
     }
 
     #[test]
@@ -3650,5 +4402,138 @@ mod pending_retention_tests {
         let State::Between(generation, _) = state else { unreachable!() };
         let state = State::Between(generation, Stage::AwaitingPrefix { through: 1 });
         assert!(state.settled().is_some());
+    }
+}
+
+#[cfg(test)]
+mod ladder_tests {
+    use super::{Ladder, Release, RoomOwed};
+
+    /// A probe with no resize under way owes the claim one decision, taken
+    /// at the first boundary that can decide it, however many observations
+    /// without the bindings pass first; a resize finishing since, or under
+    /// way at the probe, leaves nothing owed.
+    #[test]
+    fn a_probe_owes_the_room_one_decision_until_the_bindings_return() {
+        let mut owed = RoomOwed::default();
+        owed.probed(false);
+        assert!(!owed.take(false), "a flight holds the bindings");
+        assert!(!owed.take(false));
+        assert!(owed.take(true));
+        assert!(!owed.take(true), "decided once");
+        owed.probed(false);
+        owed.resized();
+        assert!(!owed.take(true), "a resize finished since the probe");
+        owed.probed(true);
+        assert!(!owed.take(true), "a resize ran across the probe");
+    }
+
+    /// A release deferred for a gap keeps the ladder in motion, so nothing
+    /// is refused or unloaded for memory meanwhile, until the next boundary
+    /// takes it to try again; one pending keeps it in motion until its
+    /// resize finishes.
+    #[test]
+    fn a_deferred_release_holds_refusal_and_unload_until_its_boundary() {
+        let mut ladder = Ladder::default();
+        assert!(ladder.settled());
+        ladder.released(Release::Deferred);
+        assert!(!ladder.settled(), "a deferred shrink is not an exhausted ladder");
+        assert!(ladder.retry_deferred(), "the next boundary tries it again");
+        assert!(ladder.settled() && !ladder.retry_deferred());
+        ladder.released(Release::Pending);
+        assert!(!ladder.settled());
+        ladder.released(Release::Nothing);
+        assert!(!ladder.settled(), "nothing more at a rung leaves the pending release");
+    }
+
+    /// What the host has yet to show released holds refusal and unload, as a
+    /// running release does.
+    #[test]
+    fn a_covered_release_holds_refusal_and_unload() {
+        let mut ladder = Ladder::default();
+        ladder.released(Release::Covered);
+        assert!(!ladder.settled());
+    }
+}
+
+#[cfg(test)]
+mod measurement_room_tests {
+    use super::{BankStep, MeasurementRoom, RoomClaim};
+    use crate::protocol::{RoomAnswer, RoomGrant, RoomRefusal};
+    use std::task::{Context, Poll, Waker};
+
+    /// A claim, and the grant its job waits on.
+    fn claimed() -> (RoomClaim, RoomGrant) {
+        let (granter, grant) = RoomGrant::new();
+        (RoomClaim(granter), grant)
+    }
+
+    fn answer(grant: &mut RoomGrant) -> Option<RoomAnswer> {
+        match grant.poll_answer(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(answer) => Some(answer),
+            Poll::Pending => None,
+        }
+    }
+
+    /// A claim short of its room shrinks the bank by the rest and waits; it
+    /// is answered only at a later probe that reads the room made.
+    #[test]
+    fn a_claim_is_answered_after_its_shrink_makes_the_room() {
+        let (claim, mut grant) = claimed();
+        let mut asked = None;
+        let claim = claim
+            .decide::<()>(MeasurementRoom::Short(4096), false, |bytes| {
+                asked = Some(bytes);
+                Ok(BankStep::Begun)
+            })
+            .unwrap()
+            .expect("the claim waits for its shrink");
+        assert_eq!(asked, Some(4096), "the bank shrinks by what the room is short");
+        assert_eq!(answer(&mut grant), None, "not answered before the shrink is read");
+        let unshrunk = |_| -> Result<BankStep, ()> { panic!("a made room shrinks nothing") };
+        assert!(claim.decide(MeasurementRoom::Made, false, unshrunk).unwrap().is_none());
+        assert_eq!(answer(&mut grant), Some(RoomAnswer::Made));
+    }
+
+    /// A shrink that cannot run yet (no gap, or another resize) leaves the
+    /// claim waiting for the next probe, which shrinks again; one at the
+    /// bank's floor refuses it, as does a storage that refused a shrink.
+    #[test]
+    fn a_claim_at_the_floor_is_refused_and_one_without_a_gap_waits() {
+        let (claim, mut grant) = claimed();
+        let claim = claim
+            .decide::<()>(MeasurementRoom::Short(4096), false, |_| Ok(BankStep::Deferred))
+            .unwrap()
+            .expect("a deferred shrink waits");
+        let claim = claim
+            .decide::<()>(MeasurementRoom::Unread, false, |_| panic!("an unread room shrinks nothing"))
+            .unwrap()
+            .expect("an unread room waits");
+        assert_eq!(answer(&mut grant), None);
+        assert!(claim
+            .decide::<()>(MeasurementRoom::Short(4096), false, |_| Ok(BankStep::AtLimit))
+            .unwrap()
+            .is_none());
+        assert_eq!(answer(&mut grant), Some(RoomAnswer::Refused(RoomRefusal::AtFloor { short: 4096 })));
+        let (claim, mut grant) = claimed();
+        assert!(claim
+            .decide::<()>(MeasurementRoom::Short(1), true, |_| panic!("no shrink after a refusal"))
+            .unwrap()
+            .is_none());
+        assert_eq!(answer(&mut grant), Some(RoomAnswer::Refused(RoomRefusal::ShrinkRefused { short: 1 })));
+    }
+
+    /// A claim short by more than the bank holds above its floor is refused
+    /// at once, before anything shrinks.
+    #[test]
+    fn a_claim_beyond_the_banks_floor_is_refused_without_a_shrink() {
+        let (claim, mut grant) = claimed();
+        let beyond = MeasurementRoom::Beyond { short: 8192, releasable: 4096 };
+        assert!(claim
+            .decide::<()>(beyond, false, |_| panic!("a claim no shrink can meet shrinks nothing"))
+            .unwrap()
+            .is_none());
+        let refused = RoomRefusal::BeyondFloor { short: 8192, releasable: 4096 };
+        assert_eq!(answer(&mut grant), Some(RoomAnswer::Refused(refused)));
     }
 }

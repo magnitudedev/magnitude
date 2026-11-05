@@ -8,6 +8,7 @@ fn limits() -> ServiceLimits {
         decode_tokens: 1,
         decode_share: 0.5,
         locality_seconds: 0.0,
+        conversations: std::num::NonZeroUsize::MIN,
     }
 }
 
@@ -20,6 +21,7 @@ fn operation(identity: u64, phase: Phase, waiting_since_ns: u64) -> Operation {
         waiting_since_ns,
         service_ns: 0,
         preemption_debt: 0,
+        holds_chain: false,
     }
 }
 
@@ -42,6 +44,45 @@ fn contended_phase_share_is_charged_by_completed_service_time() {
     let third = scheduler.select(&candidates, 50).unwrap().unwrap();
     assert_eq!(third.phase(), Phase::Decode);
     assert_eq!(scheduler.completed_service_ns(), 40);
+}
+
+/// A decode arriving while a prefill chain runs is seen by the round that
+/// continues the chain: the holder continues alone, charged under the
+/// contention the decode makes, so the chain's time is owed to the decode,
+/// which is served right after it.
+#[test]
+fn decode_arriving_during_a_chain_is_seen_and_charged() {
+    let mut scheduler = Scheduler::new(limits()).unwrap();
+    // The prompt chunk opens a chain, uncontended.
+    let alone = [operation(1, Phase::Prefill, 0)];
+    let opening = scheduler.select(&alone, 10).unwrap().unwrap();
+    assert!(!opening.contended());
+    scheduler.completed(opening, 20);
+    // A decode arrives; the holder's next chunk claims the chain.
+    let holder = Operation {
+        holds_chain: true,
+        ..operation(1, Phase::Prefill, 0)
+    };
+    let candidates = [holder, operation(2, Phase::Decode, 30)];
+    let continued = scheduler.select(&candidates, 30).unwrap().unwrap();
+    assert_eq!(
+        (continued.phase(), continued.requests(), continued.contended()),
+        (Phase::Prefill, &[RequestId(1)][..], true)
+    );
+    scheduler.completed(continued, 20);
+    // The chain has ended: the decode is owed the chain's 20 ns and runs
+    // until it has repaid them.
+    let ended = [
+        operation(1, Phase::Prefill, 0),
+        operation(2, Phase::Decode, 30),
+    ];
+    for now in [50, 60] {
+        let next = scheduler.select(&ended, now).unwrap().unwrap();
+        assert_eq!(next.phase(), Phase::Decode);
+        scheduler.completed(next, 10);
+    }
+    let repaid = scheduler.select(&ended, 70).unwrap().unwrap();
+    assert_eq!(repaid.phase(), Phase::Prefill);
 }
 
 #[test]

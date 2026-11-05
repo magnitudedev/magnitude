@@ -312,6 +312,7 @@ fn request_class(error: &RequestError) -> Class {
 fn load_class(error: &LoadError) -> Class {
     match error {
         LoadError::Unsupported(_) => (StatusCode::CONFLICT, MODEL, "unsupported_model", false),
+        LoadError::Configuration { .. } => (StatusCode::CONFLICT, MODEL, "invalid_model_configuration", false),
         LoadError::Artifact(_) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             INVALID,
