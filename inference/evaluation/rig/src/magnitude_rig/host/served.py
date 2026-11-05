@@ -40,21 +40,39 @@ SHIM = r"""
 #include <stdlib.h>
 #include <sys/types.h>
 #include <unistd.h>
+static long long first, last;
+static char trigger[4096];
+__attribute__((constructor)) static void bounds(void) {
+  sscanf(getenv("MAGNITUDE_FAILED_READS"), "%lld,%lld,%4095s", &first, &last, trigger);
+}
+static int failed(off_t offset, size_t count) {
+  return offset < last && offset + (off_t)count > first && access(trigger, F_OK) == 0;
+}
+#ifdef __APPLE__
+static ssize_t failing_pread(int fd, void *buffer, size_t count, off_t offset) {
+  if (failed(offset, count)) {
+    errno = EIO;
+    return -1;
+  }
+  return pread(fd, buffer, count, offset);
+}
+__attribute__((used, section("__DATA,__interpose"))) static struct { const void *replacement, *replaced; }
+    interposed = {(const void *)failing_pread, (const void *)pread};
+#else
 ssize_t pread64(int fd, void *buffer, size_t count, off64_t offset) {
   static ssize_t (*real)(int, void *, size_t, off64_t);
-  static char trigger[4096];
-  static long long first, last;
-  if (!real) {
+  if (!real)
     real = dlsym(RTLD_NEXT, "pread64");
-    sscanf(getenv("MAGNITUDE_FAILED_READS"), "%lld,%lld,%4095s", &first, &last, trigger);
-  }
-  if (offset < last && offset + (off64_t)count > first && access(trigger, F_OK) == 0) {
+  if (failed(offset, count)) {
     errno = EIO;
     return -1;
   }
   return real(fd, buffer, count, offset);
 }
+#endif
 """
+# How each system loads the shim into the service and the workers it starts.
+PRELOAD = "DYLD_INSERT_LIBRARIES" if sys.platform == "darwin" else "LD_PRELOAD"
 
 
 class Failed(Exception):
@@ -438,9 +456,9 @@ def failure(run: Run) -> None:
     shim = run.scratch / "failed_reads.so"
     source = run.scratch / "failed_reads.c"
     source.write_text(SHIM)
-    subprocess.check_call(["cc", "-shared", "-fPIC", "-o", str(shim), str(source), "-ldl"])
+    subprocess.check_call(["cc", "-shared", "-fPIC", "-o", str(shim), str(source), *(() if sys.platform == "darwin" else ("-ldl",))])
     trigger = run.scratch / "fail"
-    environment = {"LD_PRELOAD": str(shim), "MAGNITUDE_FAILED_READS": f"{size // 2},{size // 2 + FAILED_BYTES},{trigger}"}
+    environment = {PRELOAD: str(shim), "MAGNITUDE_FAILED_READS": f"{size // 2},{size // 2 + FAILED_BYTES},{trigger}"}
     service = Service(run, "failure", run.capped, environment)
     model = service.model(run.arguments.model)
     instance = service.load(model)
