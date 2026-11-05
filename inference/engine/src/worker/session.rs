@@ -756,7 +756,7 @@ mod tests {
     use crate::inputs::{BpeConfig, ByteBpeTokenizer, PieceKind, TokenId};
     use crate::worker::execution::ExecutionOwner;
     use magnitude_chat::{Normalization, PieceEncoding};
-    use magnitude_executor::fixtures::{banked, tiny_definition};
+    use magnitude_executor::fixtures::{bank_backends, banked, tiny_definition};
     use magnitude_generation::Plain;
     use magnitude_scheduler::{
         owner::Owner,
@@ -796,10 +796,6 @@ mod tests {
         assert!(matches!(ended.answer(id, Some(None)), Some(WorkerMessage::Admitted { .. })));
     }
 
-    /// Why the execution owner was not built: the device reserves no
-    /// storage, so no expert bank can exist on it.
-    const UNBANKED: &str = "the device reserves no storage";
-
     /// Records every message the session sends the host.
     struct Recorded(Arc<Mutex<Vec<WorkerMessage>>>);
 
@@ -836,9 +832,9 @@ mod tests {
     }
 
     /// A session whose execution owner serves the controlled domain with a
-    /// fake expert bank of four slots, and what it sends the host; none on a
-    /// device that reserves no storage.
-    fn session() -> Option<(Session, Arc<Mutex<Vec<WorkerMessage>>>)> {
+    /// fake expert bank of four slots on `backend`'s device, and what it
+    /// sends the host.
+    fn session(backend: seismic::BackendName) -> (Session, Arc<Mutex<Vec<WorkerMessage>>>) {
         let limits = ServiceLimits {
             prefill_tokens: 2,
             decode_tokens: 2,
@@ -848,17 +844,13 @@ mod tests {
         };
         let spawned = Worker::spawn(
             move |wakes| {
-                let (domain, bindings) = banked(4, 4).ok_or(UNBANKED)?;
+                let (domain, bindings) = banked(backend, 4, 4);
                 let owner = Owner::new(domain, bindings, limits, Arc::new(wakes) as Arc<dyn Wakes>)?;
                 Ok(Box::new(ExecutionOwner::new(owner, Arc::new(Plain), None)) as Box<dyn Driven<Stopped = UnloadCause>>)
             },
             usize::MAX,
         );
-        let execution = match spawned {
-            Ok(execution) => execution,
-            Err(error) if error.contains(UNBANKED) => return None,
-            Err(error) => panic!("{error}"),
-        };
+        let execution = spawned.unwrap_or_else(|error| panic!("{backend:?}: {error}"));
         let sent = Arc::new(Mutex::new(Vec::new()));
         let outbound: Outbound = Arc::new(Mutex::new(Box::new(Recorded(sent.clone()))));
         let loaded = Loaded {
@@ -867,7 +859,7 @@ mod tests {
             definition: tiny_definition(),
             host_table_bytes: 0,
         };
-        Some((Session::new(outbound, Arc::new(Signal::default()), loaded), sent))
+        (Session::new(outbound, Arc::new(Signal::default()), loaded), sent)
     }
 
     /// The room answers the session has sent the host, in order.
@@ -899,21 +891,21 @@ mod tests {
     /// stopped execution cannot take is answered refused at once.
     #[test]
     fn each_room_claim_is_answered_under_its_id() {
-        let Some((mut session, sent)) = session() else {
-            return;
-        };
-        let claim = |claim, bytes| HostMessage::ClaimMeasurementRoom { claim: RoomClaimId(claim), bytes };
-        assert!(matches!(session.handle(claim(1, 0)), Ok(Flow::Continue)));
-        progress_until(&mut session, &sent, 1);
-        assert!(matches!(session.handle(claim(2, u64::MAX / 4)), Ok(Flow::Continue)));
-        assert!(matches!(session.handle(HostMessage::ReleaseMeasurementRoom), Ok(Flow::Continue)));
-        assert!(matches!(session.handle(claim(3, 0)), Ok(Flow::Continue)));
-        progress_until(&mut session, &sent, 2);
-        session.loaded.execution.close();
-        assert!(matches!(session.handle(claim(4, 0)), Ok(Flow::Continue)));
-        let answers = answers(&sent);
-        let made = Ok(RoomAnswer::Made);
-        assert_eq!(answers[..2], [(RoomClaimId(1), made.clone()), (RoomClaimId(3), made)], "{answers:?}");
-        assert!(matches!(&answers[2..], [(RoomClaimId(4), Err(RequestError::ModelUnloaded { .. }))]), "{answers:?}");
+        for backend in bank_backends() {
+            let (mut session, sent) = session(backend);
+            let claim = |claim, bytes| HostMessage::ClaimMeasurementRoom { claim: RoomClaimId(claim), bytes };
+            assert!(matches!(session.handle(claim(1, 0)), Ok(Flow::Continue)));
+            progress_until(&mut session, &sent, 1);
+            assert!(matches!(session.handle(claim(2, u64::MAX / 4)), Ok(Flow::Continue)));
+            assert!(matches!(session.handle(HostMessage::ReleaseMeasurementRoom), Ok(Flow::Continue)));
+            assert!(matches!(session.handle(claim(3, 0)), Ok(Flow::Continue)));
+            progress_until(&mut session, &sent, 2);
+            session.loaded.execution.close();
+            assert!(matches!(session.handle(claim(4, 0)), Ok(Flow::Continue)));
+            let answers = answers(&sent);
+            let made = Ok(RoomAnswer::Made);
+            assert_eq!(answers[..2], [(RoomClaimId(1), made.clone()), (RoomClaimId(3), made)], "{answers:?}");
+            assert!(matches!(&answers[2..], [(RoomClaimId(4), Err(RequestError::ModelUnloaded { .. }))]), "{answers:?}");
+        }
     }
 }

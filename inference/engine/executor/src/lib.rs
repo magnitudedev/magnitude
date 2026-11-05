@@ -33,7 +33,7 @@ pub mod memory;
 mod native;
 #[cfg(test)]
 mod ngram_steps_tests;
-#[cfg(test)]
+#[cfg(any(test, feature = "fixtures"))]
 mod test_support;
 mod operation;
 mod operators;

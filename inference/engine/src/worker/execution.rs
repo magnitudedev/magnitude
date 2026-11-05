@@ -234,20 +234,20 @@ mod tests {
     /// nothing, however long memory stays free; once the measurement job
     /// stores them (here its probe, which gives the executor's costs) and
     /// the host asks it to reprice, the execution owner prices the bank
-    /// again from what is stored, and the bank grows.
+    /// again from what is stored, and the bank grows. On Metal, which every
+    /// macOS host has: a device that does not open fails the test.
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "the required figures alone give the costs where the bank moves natively (Metal)")]
     fn a_live_load_reprices_on_newly_stored_costs_and_grows() {
-        let Some((mut domain, bindings)) = fixtures::banked(4, 2) else {
-            return;
-        };
+        let backend = seismic::BackendName::Metal;
+        let (mut domain, bindings) = fixtures::banked(backend, 4, 2);
         fixtures::record_misses(&mut domain, fixtures::misses_at(3, 100, 4));
         // The pricing: the streamed fixture model planned on this device,
         // its bank and resident plan, its costs kept in an empty cache.
         let catalog = seismic::Devices::discover(&[]).unwrap();
         let reserves = platform::MemoryReserves::standard();
         let selected =
-            platform::select_device(&catalog, ExecutionPath::Native, platform::DeviceRequest::Automatic, &reserves)
+            platform::select_device(&catalog, ExecutionPath::Native, platform::DeviceRequest::Backend(backend), &reserves)
                 .unwrap();
         let device = catalog.open(catalog.resolve(selected.info.selector()).unwrap()).unwrap();
         let definition = fixtures::qwen4exp_fixture_definition();

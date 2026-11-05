@@ -1,5 +1,7 @@
-//! What the crate's tests share.
+//! What the crate's tests, and its fixtures (`fixtures`) for the tests
+//! above it, share.
 
+#[cfg(test)]
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// The process's CPU placement, for a test: libtest runs the crate's tests
@@ -9,6 +11,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 /// a serving executor (a load with an expert bank), or sizes a pool from
 /// the CPUs the process may run on (a CPU site's admission, a test's pool),
 /// holds it while it does.
+#[cfg(test)]
 pub(crate) fn process_placement() -> MutexGuard<'static, ()> {
     static PLACEMENT: Mutex<()> = Mutex::new(());
     // A test that failed holding it leaves nothing to repair: its placement

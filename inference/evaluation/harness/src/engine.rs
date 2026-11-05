@@ -701,45 +701,46 @@ pub fn tokens(ids: &[u32]) -> Vec<TokenId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magnitude_executor::fixtures::{banked, host_tier, misses_at, record_misses};
+    use magnitude_executor::fixtures::{bank_backends, banked, host_tier, misses_at, record_misses};
 
     /// A capped load on a discrete-shaped device, its bank whole on the
     /// device and a host tier beside it, grows that tier across the
     /// harness's step boundaries as the owner's do: once memory has stayed
     /// free, one step to every expert (the tier is the inclusive copy every
-    /// miss reaches, priced by no record), and no further.
+    /// miss reaches, priced by no record), and no further. On every backend
+    /// discovery reports available.
     #[test]
     fn a_capped_load_grows_its_host_tier_across_step_boundaries() {
-        let Some((mut domain, mut bindings)) = banked(2, 2) else {
-            return;
-        };
-        host_tier(&mut domain, 4);
-        record_misses(&mut domain, misses_at(4, 100, 4));
-        domain.measure_experts(magnitude_executor::ExpertMeasures {
-            lines: magnitude_executor::assessment::Priced::Measured(std::sync::Arc::from([])),
-            store: None,
-            resident: magnitude_executor::assessment::Priced::Measured(Box::new(|_, _| Ok(0.015))),
-            pass: magnitude_executor::assessment::Priced::Pending("unpriced".into()),
-            moves: magnitude_executor::assessment::Priced::Pending("unmeasured".into()),
-            tier_copy: magnitude_executor::assessment::Priced::Measured(None),
-            convert: magnitude_executor::assessment::Priced::Measured(None),
-        }).unwrap();
-        let host_slots = |domain: &magnitude_executor::ExecutorDomain<_>| {
-            domain.expert_residency().unwrap().unwrap().host.unwrap().slots
-        };
-        let mut memory = BetweenFlights::new();
-        // A boundary every 200 ms of the service clock, past the memory
-        // observation interval, for 12 s: past the 5 s memory must stay
-        // free before the bank grows.
-        let slots = (0..60u64)
-            .map(|boundary| {
-                between_steps(&mut domain, &mut memory, &mut bindings, boundary * 200_000_000).unwrap();
-                host_slots(&domain)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(slots[0], 0, "nothing grows before memory has stayed free");
-        assert_eq!(slots.last(), Some(&4), "grown to every expert: {slots:?}");
-        let grown = slots.windows(2).filter(|pair| pair[1] != pair[0]).count();
-        assert_eq!(grown, 1, "one step: {slots:?}");
+        for backend in bank_backends() {
+            let (mut domain, mut bindings) = banked(backend, 2, 2);
+            host_tier(&mut domain, 4);
+            record_misses(&mut domain, misses_at(4, 100, 4));
+            domain.measure_experts(magnitude_executor::ExpertMeasures {
+                lines: magnitude_executor::assessment::Priced::Measured(std::sync::Arc::from([])),
+                store: None,
+                resident: magnitude_executor::assessment::Priced::Measured(Box::new(|_, _| Ok(0.015))),
+                pass: magnitude_executor::assessment::Priced::Pending("unpriced".into()),
+                moves: magnitude_executor::assessment::Priced::Pending("unmeasured".into()),
+                tier_copy: magnitude_executor::assessment::Priced::Measured(None),
+                convert: magnitude_executor::assessment::Priced::Measured(None),
+            }).unwrap();
+            let host_slots = |domain: &magnitude_executor::ExecutorDomain<_>| {
+                domain.expert_residency().unwrap().unwrap().host.unwrap().slots
+            };
+            let mut memory = BetweenFlights::new();
+            // A boundary every 200 ms of the service clock, past the memory
+            // observation interval, for 12 s: past the 5 s memory must stay
+            // free before the bank grows.
+            let slots = (0..60u64)
+                .map(|boundary| {
+                    between_steps(&mut domain, &mut memory, &mut bindings, boundary * 200_000_000).unwrap();
+                    host_slots(&domain)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(slots[0], 0, "nothing grows before memory has stayed free");
+            assert_eq!(slots.last(), Some(&4), "grown to every expert: {slots:?}");
+            let grown = slots.windows(2).filter(|pair| pair[1] != pair[0]).count();
+            assert_eq!(grown, 1, "one step: {slots:?}");
+        }
     }
 }
