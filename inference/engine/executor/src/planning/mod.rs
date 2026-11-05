@@ -17,7 +17,7 @@ mod weights;
 pub use assessment::{
     AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
     AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, CONVERSATION_CHECKPOINTS,
-    DeviceProcessBytes, HostProcessBytes, SealedGraphHostBytes,
+    DeviceProcessBytes, HostProcessBytes, SealedGraphHostBytes, measurement_process_bytes,
 };
 pub use bank::{
     BankAllocation, BankBinding, BankTable, BankLayout, BankPart, ConveyorCarrier,

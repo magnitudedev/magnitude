@@ -1058,6 +1058,15 @@ struct ProgramSet {
 }
 
 impl ProgramSet {
+    /// The native programs the set prepares: one per measured format's
+    /// expand, and one per formation beside them, each named here so a
+    /// formation added to the set is counted.
+    fn kernels(&self) -> u64 {
+        let Self { sizes: _, expands, chain: _, output, dense, affine, copy, moves } = self;
+        let beside = [output as &dyn std::any::Any, dense, affine, copy, moves].len() as u64;
+        expands.len() as u64 + beside
+    }
+
     /// The programs of `formats` ([`measured_formats`]) at `sizes` on an
     /// executor whose largest allocation is `largest`, the chain in `chain`.
     fn new(
@@ -4608,8 +4617,27 @@ impl ExecutorCosts {
     /// largest cache beyond one set, at least two ([`rotation_sets`]); or,
     /// along device storage's first route alone, where the history ladders
     /// run, a rung's rotation within the walk's room ([`rotation_room`]).
-    /// Beside them, the move point's records ([`MoveCase`]).
-    pub fn scratch(topology: &DeviceTopology, executor: &Executor) -> Result<u64, ExecutorCostsError> {
+    /// Beside them, the move point's records ([`MoveCase`]); and the job's
+    /// worker's own bytes there, its runtime and the programs it prepares
+    /// (`measurement_process_bytes`), which hold the same room.
+    pub fn room(topology: &DeviceTopology, executor: &Executor) -> Result<u64, ExecutorCostsError> {
+        let (backings, kernels) = Self::backings(topology, executor)?;
+        let process = crate::planning::measurement_process_bytes(
+            executor.backend(),
+            kernels,
+            topology.shared_ranges_lie_in_device_memory(executor),
+        )
+        .map_err(ExecutorCostsError)?;
+        Ok(backings + process)
+    }
+
+    /// What the walk's points lay out in device memory at once, the room's
+    /// backings ([`Self::room`]), with the count of kernels the job
+    /// prepares for them.
+    fn backings(
+        topology: &DeviceTopology,
+        executor: &Executor,
+    ) -> Result<(u64, u64), ExecutorCostsError> {
         let backend = executor.backend();
         let largest = executor.limits().max_allocation.value;
         let chain = chain_element(backend).ok_or_else(|| {
@@ -4644,7 +4672,8 @@ impl ExecutorCosts {
             true => 2 * MOVED_RECORDS * moved_record_bytes(chain)?,
             false => 0,
         };
-        Ok(rotation.max(rotation_room(topology, &routes.device)) + rotation * others + moved)
+        let backings = rotation.max(rotation_room(topology, &routes.device)) + rotation * others + moved;
+        Ok((backings, programs.kernels()))
     }
 }
 
@@ -4696,7 +4725,7 @@ mod tests {
             topology.executors().iter().find(|executor| executor.backend() == seismic::BackendName::Cuda).unwrap();
         let (routes, _) = Route::all(&topology, executor).unwrap();
         let room = rotation_room(&topology, &routes.device);
-        let scratch = ExecutorCosts::scratch(&topology, executor).unwrap();
+        let (scratch, _) = ExecutorCosts::backings(&topology, executor).unwrap();
         assert!(!routes.others.is_empty(), "the 3090 has a host-backed route");
         assert!(scratch >= room && scratch < 2 * room, "scratch {scratch}, the device route's room {room}");
     }

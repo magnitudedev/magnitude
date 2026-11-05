@@ -130,9 +130,9 @@ pub trait MeasuredMachine: Send + Sync + 'static {
     fn start(&self, time: Duration) -> anyhow::Result<StartedJob>;
     /// Release killed `job`'s attempts of `keys`, so none is counted. Blocking.
     fn release_killed(&self, job: MeasureJob, keys: &[PointKey]) -> anyhow::Result<()>;
-    /// The device bytes a job lays out at most, which a job beside an idle resident model claims
-    /// of it first. Blocking.
-    fn scratch(&self) -> anyhow::Result<u64>;
+    /// The room a job takes of its device's storage at most, its worker's own bytes among it,
+    /// which a job beside an idle resident model claims of it first. Blocking.
+    fn room(&self) -> anyhow::Result<u64>;
 }
 
 /// This service's machine: the assessment structure and the job it runs in an inference worker
@@ -223,8 +223,8 @@ impl MeasuredMachine for ServiceMachine {
         Ok(())
     }
 
-    fn scratch(&self) -> anyhow::Result<u64> {
-        self.structure.measurement_scratch().map_err(anyhow::Error::msg)
+    fn room(&self) -> anyhow::Result<u64> {
+        self.structure.measurement_room().map_err(anyhow::Error::msg)
     }
 }
 
@@ -306,7 +306,7 @@ async fn run<M: MeasuredMachine>(
                     Room::Preempted => continue,
                     // The job cannot say what it lays out: it fails, as one that stored nothing.
                     Room::Unsized(error) => {
-                        tracing::warn!(%error, "the measurement job's scratch could not be computed");
+                        tracing::warn!(%error, "the measurement job's room could not be computed");
                         drop(held);
                         retry(&status, &mut backoff, Duration::ZERO).await;
                         continue;
@@ -447,7 +447,7 @@ enum Room {
     Made,
     /// The job was preempted first.
     Preempted,
-    /// Why the job's scratch, the room it needs, could not be computed.
+    /// Why the job's room could not be computed.
     Unsized(String),
     /// Why the room is not made.
     Unmade(Unmade),
@@ -471,13 +471,13 @@ impl std::fmt::Display for Unmade {
 }
 
 /// Ask `resident`'s worker to make room for what the job lays out at most
-/// ([`MeasuredMachine::scratch`]), unless `job` is preempted first.
+/// ([`MeasuredMachine::room`]), unless `job` is preempted first.
 async fn make_room<M: MeasuredMachine>(machine: &Arc<M>, resident: &dyn ResidentRoom, job: &mut DeviceJob) -> Room {
-    let scratch = {
+    let room = {
         let machine = Arc::clone(machine);
-        magnitude_service_utils::blocking::run(move || machine.scratch()).await
+        magnitude_service_utils::blocking::run(move || machine.room()).await
     };
-    let bytes = match scratch {
+    let bytes = match room {
         Ok(bytes) => bytes,
         Err(error) => return Room::Unsized(format!("{error:#}")),
     };
@@ -747,7 +747,7 @@ mod tests {
             Ok(())
         }
 
-        fn scratch(&self) -> anyhow::Result<u64> {
+        fn room(&self) -> anyhow::Result<u64> {
             Ok(SCRATCH)
         }
     }

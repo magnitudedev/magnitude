@@ -149,11 +149,12 @@ impl AssessmentStructure {
         }
     }
 
-    /// The device bytes a measurement job on the selected executor lays
-    /// out at most (`ExecutorCosts::scratch`): what a job beside a resident
-    /// model claims of it first.
-    pub fn measurement_scratch(&self) -> Result<u64, String> {
-        ExecutorCosts::scratch(&self.topology, &self.selected.info).map_err(|error| error.to_string())
+    /// The room a measurement job on the selected executor takes of its
+    /// device's storage at most, its worker's own bytes among it
+    /// (`ExecutorCosts::room`): what a job beside a resident model claims of
+    /// it first.
+    pub fn measurement_room(&self) -> Result<u64, String> {
+        ExecutorCosts::room(&self.topology, &self.selected.info).map_err(|error| error.to_string())
     }
 }
 

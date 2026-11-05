@@ -226,6 +226,14 @@ struct HostProcessCosts {
 }
 
 impl HostProcessCosts {
+    /// The host bytes of `kernels` prepared native programs: a load's worker's and a measurement
+    /// job's alike.
+    fn programs(&self, kernels: u64) -> Result<u64, String> {
+        self.per_kernel
+            .checked_mul(kernels)
+            .ok_or_else(|| "prepared program host bytes overflow".to_owned())
+    }
+
     /// Each backend's costs are measured from its loads: the process
     /// footprint at load end less everything the plan holds then is the
     /// worker's own memory, and the costs are the least-overestimating ones
@@ -275,6 +283,23 @@ impl HostProcessCosts {
     }
 }
 
+/// What a measurement job's worker holds beyond what its points lay out, in its device's
+/// storage: its device bytes for `kernels` programs (`DeviceProcessBytes`), and where that
+/// storage is host RAM (`host`, a unified device), its runtime and programs' host bytes
+/// (`HostProcessCosts`), which a load's worker is charged for the same.
+pub fn measurement_process_bytes(backend: BackendName, kernels: u64, host: bool) -> Result<u64, String> {
+    let device = DeviceProcessBytes::derive(backend, kernels)?.bytes()?;
+    if !host {
+        return Ok(device);
+    }
+    let costs = HostProcessCosts::of(backend);
+    costs
+        .programs(kernels)?
+        .checked_add(costs.runtime)
+        .and_then(|bytes| bytes.checked_add(device))
+        .ok_or_else(|| "measurement process bytes overflow".to_owned())
+}
+
 const METAL_RUNTIME: u64 = 80_992_000;
 const METAL_PER_TOKEN: u64 = 612;
 const METAL_PER_KERNEL: u64 = 5_443_000;
@@ -309,10 +334,7 @@ impl HostProcessBytes {
                 .per_token
                 .checked_mul(definition.decoder.vocabulary)
                 .ok_or("vocabulary host bytes overflow")?,
-            programs: costs
-                .per_kernel
-                .checked_mul(kernels)
-                .ok_or("prepared program host bytes overflow")?,
+            programs: costs.programs(kernels)?,
             vision: if programs.vision().is_some() {
                 costs.vision
             } else {
