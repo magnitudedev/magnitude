@@ -512,11 +512,10 @@ impl<'a> Checker<'a> {
             ));
         }
         if !self.poisoned.contains(&n.name) {
-            self.error(
-                DiagnosticRule::Resolution,
-                n.span,
-                format!("`{}` is not declared", n.name),
-            );
+            let message = self
+                .host_port(&n.name)
+                .unwrap_or_else(|| format!("`{}` is not declared", n.name));
+            self.error(DiagnosticRule::Resolution, n.span, message);
         }
         None
     }
@@ -558,11 +557,10 @@ impl<'a> Checker<'a> {
     fn place_name(&mut self, name: &ast::Ident) -> Option<LocalId> {
         let Some(id) = self.lookup(&name.name) else {
             if !self.poisoned.contains(&name.name) {
-                self.error(
-                    DiagnosticRule::Resolution,
-                    name.span,
-                    format!("`{}` is not declared", name.name),
-                );
+                let message = self
+                    .host_port(&name.name)
+                    .unwrap_or_else(|| format!("`{}` is not declared", name.name));
+                self.error(DiagnosticRule::Resolution, name.span, message);
             }
             return None;
         };

@@ -1,0 +1,6 @@
+#include <seismic/slab.glsl>
+
+#define SCALE_ROW(row) slab_region(SEISMIC_PTR(SEISMIC_BUFFER_X), (row))
+#include "scale_rows.glsl"
+
+void scale_records() { scale_rows_body(); }

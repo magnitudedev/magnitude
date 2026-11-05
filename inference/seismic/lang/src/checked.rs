@@ -19,7 +19,7 @@
 //! W1 owns the internals behind `internals::Module`.
 
 use crate::entry::{ElementBindings, LogicalEntry, ResultClass};
-use crate::ids::{EntryId, ModuleHash, RepresentationId, StableEntryId};
+use crate::ids::{EntryContent, EntryId, ModuleHash, RepresentationId, StableEntryId};
 use crate::registry::{self, BackendName, RepresentationAccess, RepresentationKind};
 use crate::span::Span;
 use crate::types::DType;
@@ -327,6 +327,15 @@ pub fn check_source(sources: SourceSet) -> Result<CheckedModule, SourceError> {
     internals::check(sources).map(CheckedModule::decoded)
 }
 
+/// A native implementation's source, includes expanded, and the constants of
+/// its module: a rendered source defines `SEISMIC_CONST_NAME` for each it
+/// names.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeAsset<'a> {
+    pub text: &'a str,
+    pub constants: &'a [(String, u64)],
+}
+
 /// An opaque checked semantic object: source semantics, types, effects,
 /// canonical bodies, lowering declarations, capability requirements, and
 /// stable identities. It decides nothing about targets, schedules,
@@ -360,6 +369,13 @@ impl CheckedModule {
     /// Content-derived semantic hash; the cache identity of this module.
     pub fn semantic_hash(&self) -> ModuleHash {
         self.inner.semantic_hash()
+    }
+
+    /// The module constants (`const NAME = INTEGER`), in source order: every
+    /// native reads each as `SEISMIC_CONST_NAME`, and the generated Rust API
+    /// exports them.
+    pub fn constants(&self) -> &[(String, u64)] {
+        &self.inner.constants
     }
 
     /// Every exported entry, in declaration order.
@@ -468,8 +484,13 @@ impl CheckedModule {
         Ok(())
     }
 
-    pub fn native_asset(&self, entry: EntryId, backend: BackendName) -> Option<&str> {
-        self.assets.get(&(entry, backend)).map(|source| &**source)
+    /// The native source `entry` declares for `backend`, with the module
+    /// constants its rendered prefix defines.
+    pub fn native_asset(&self, entry: EntryId, backend: BackendName) -> Option<NativeAsset<'_>> {
+        self.assets.get(&(entry, backend)).map(|source| NativeAsset {
+            text: source,
+            constants: self.constants(),
+        })
     }
 
     /// The source set this module was checked from, for diagnostics and
@@ -505,8 +526,13 @@ impl CheckedModule {
 pub struct EntryInfo {
     pub id: EntryId,
     pub stable: StableEntryId,
+    /// What the entry's meaning depends on and nothing else
+    /// ([`EntryContent`]): what identifies its implementation across
+    /// modules, where its stable identity names its whole module.
+    pub content: EntryContent,
     pub name: String,
-    /// Runtime-inferred shape dimensions, in contract order.
+    /// Shape dimensions, in contract order: each inferred at a call, or
+    /// `static` (bound by its specialization).
     pub dimensions: Vec<String>,
     /// Compile-time element parameters (`T`, `U`) an entry is polymorphic in.
     pub element_parameters: Vec<String>,
@@ -544,6 +570,9 @@ pub struct ElementUses {
     /// The component additionally requires an interpreted integer code.
     pub integer_code_read: bool,
     pub stored: bool,
+    /// A `&mut` parameter, or a store of whole trailing matrices
+    /// (`registry::record_writable`).
+    pub record_stored: bool,
     pub conversion_source: bool,
     /// `to_owned` of a view selecting part of the packing axis.
     pub partial_copy: bool,
@@ -668,6 +697,27 @@ impl std::fmt::Display for ElementBindingError {
 impl std::error::Error for ElementBindingError {}
 
 impl ElementUses {
+    /// Adds every use of `other`: the uses of a parameter seen through two
+    /// paths are the union of each path's.
+    pub fn merge(&mut self, other: ElementUses) {
+        let ElementUses {
+            decoded_read,
+            component_read,
+            integer_code_read,
+            stored,
+            record_stored,
+            conversion_source,
+            partial_copy,
+        } = other;
+        self.decoded_read |= decoded_read;
+        self.component_read |= component_read;
+        self.integer_code_read |= integer_code_read;
+        self.stored |= stored;
+        self.record_stored |= record_stored;
+        self.conversion_source |= conversion_source;
+        self.partial_copy |= partial_copy;
+    }
+
     /// Whether an element parameter with these uses may be bound to `representation`.
     pub fn admits(self, representation: RepresentationId) -> bool {
         let info = registry::representation_info(representation);
@@ -682,6 +732,7 @@ impl ElementUses {
             ) && registry::decode_recipe(representation, DType::F32).is_some());
         info.decoded.is_float()
             && (!self.stored || (info.access == RepresentationAccess::ReadWrite && dense_float))
+            && (!self.record_stored || registry::record_writable(representation))
             && (!self.decoded_read
                 || (matches!(
                     info.access,
@@ -722,6 +773,25 @@ impl ElementDomain {
 
     pub fn predicates(&self) -> &[ElementPredicate] {
         &self.predicates
+    }
+
+    /// Whether element parameter `name` is a weight the entry only reads:
+    /// neither stored nor copied, not a conversion's target, and not only a
+    /// conversion's source (a CPU form's weight operand).
+    pub fn read_as_weight(&self, name: &str) -> bool {
+        let converted = self
+            .conversions
+            .iter()
+            .any(|conversion| conversion.target == ElementTarget::Parameter(name.to_owned()));
+        self.parameters
+            .iter()
+            .find(|parameter| parameter.name == name)
+            .is_some_and(|parameter| {
+                let uses = parameter.uses;
+                !converted
+                    && !(uses.stored || uses.partial_copy)
+                    && !(uses.conversion_source && !uses.decoded_read)
+            })
     }
 
     /// Whether parameter names are unique and every conversion and predicate
@@ -796,7 +866,9 @@ impl ElementDomain {
                 ElementTarget::Parameter(name) => bound(name),
                 ElementTarget::Concrete(representation) => *representation,
             };
-            if registry::representation_conversion(source, target).is_none() {
+            if registry::representation_conversion(source, target).is_none()
+                && registry::dense_conversion(source, target).is_none()
+            {
                 return Err(ElementBindingError::NoConversion { source, target });
             }
         }
@@ -854,9 +926,12 @@ pub struct NativeImplementation {
     /// On CPU, the dense element types the form is compiled for, for element
     /// parameters that do not take the default (`f32`, `bf16`, `f16`).
     pub elements: Vec<NativeElementCoverage>,
+    /// Tensor ports bound through a table of their records' device
+    /// addresses (`records`).
+    pub records: Vec<RecordPort>,
     /// The `where` condition restricting admissible parameter
     /// configurations. It reads only static dimensions, parameters and the
-    /// elements (`operands(W)`, `form(W, NAME)`, `unit_columns(W)`), whose reads make the
+    /// elements (`operands(W)`, `form(W, NAME)`, `packed(W)`, `unit_columns(W)`), whose reads make the
     /// configurations the implementation's at its bindings
     /// ([`Self::at_elements`]).
     pub constraint: Option<NativeCondition>,
@@ -883,7 +958,7 @@ pub struct NativeRepeat {
 
 impl NativeImplementation {
     /// The implementation as formed at `bindings`: every element read
-    /// (`operands(W)`, `form(W, NAME)`, `unit_columns(W)`) is its value for the representation
+    /// (`operands(W)`, `form(W, NAME)`, `packed(W)`, `unit_columns(W)`) is its value for the representation
     /// `W` is bound to. The checker admits element reads only over the
     /// entry's element parameters, and a formation binds every one of them.
     pub fn at_elements(&self, bindings: &ElementBindings) -> Self {
@@ -963,6 +1038,15 @@ impl NativeImplementation {
             .chain((0..rounds).flat_map(move |_| first..end))
             .chain(end..self.launches.len())
     }
+}
+
+/// A native tensor port bound through a table of its records' device
+/// addresses: a tensor parameter by name, or a tensor result by its result
+/// ordinal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecordPort {
+    Parameter(String),
+    Result(u32),
 }
 
 /// The dense element types a build-time compiled native form binds one
@@ -1120,12 +1204,76 @@ pub struct NativeLaunch {
     /// encoded, not limit-checked, and its geometry is not evaluated. It
     /// keeps its ordinal. `None` is always active.
     pub when: Option<NativeCondition>,
-    /// Number of groups on each axis.
+    /// Number of groups on each axis; with `grid`, the most the grid holds.
     pub groups: [NativeNatExpr; 3],
+    /// The three `i32` group counts the launch dispatches, written by an
+    /// earlier launch and read when this one runs. It is a read like any
+    /// other, so the launch is ordered after its writer. Nothing gates a
+    /// written grid's launch on its words: an empty grid runs nothing by
+    /// itself where it is dispatched indirectly (Metal, Vulkan) or read as
+    /// the launch runs (the CPU), and on CUDA, which loops over it with the
+    /// device's resident blocks, costs about what any launch does, which a
+    /// conditional graph node would cost more than on every replay (on an
+    /// RTX 3090, an empty grid 0.7 us at one block and 1.3 us at 656 blocks
+    /// of 256 threads, a conditional node holding its launch
+    /// 7.4 us, and 112 KiB more of an instantiated graph).
+    pub grid: Option<LaunchGrid>,
+    /// The launch conditions it is encoded under (`if (w)`, `unless (w)`),
+    /// a conjunction of distinct host-written words: encoded while every
+    /// one holds.
+    pub conditions: Vec<LaunchCondition>,
     /// Participants of one group on each axis.
     pub group_extent: [NativeNatExpr; 3],
     /// Dynamic group-shared memory in bytes.
     pub shared_bytes: NativeNatExpr,
+}
+
+/// Where a launch's written grid lives.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LaunchGrid {
+    /// An entry tensor parameter (`&tensor[3] i32`): an earlier call wrote
+    /// it.
+    Parameter(String),
+    /// A 12-byte scratch buffer of the implementation: an earlier launch of
+    /// the same call wrote it.
+    Scratch(String),
+}
+
+/// A launch's condition: word `index` of an entry tensor parameter
+/// `word` (`&tensor[N] i32`, `index` < N, checked as the program forms),
+/// written by the host between submissions and read when the run is
+/// encoded; under the other value the launch is not encoded at all, so it
+/// costs nothing, not even a dispatch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchCondition {
+    pub word: String,
+    pub index: u64,
+    pub encoded: Encoded,
+}
+
+/// The value of a launch condition's word the launch is encoded under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Encoded {
+    /// `if (w)`: while the word is nonzero.
+    WhileSet,
+    /// `unless (w)`: while the word is zero.
+    WhileClear,
+}
+
+impl Encoded {
+    /// Its clause's keyword.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Encoded::WhileSet => "if",
+            Encoded::WhileClear => "unless",
+        }
+    }
+
+    /// Whether a launch under this condition is encoded while its word is
+    /// `word`.
+    pub fn encodes(self, word: u32) -> bool {
+        (word != 0) == (self == Encoded::WhileSet)
+    }
 }
 
 /// Closed integer language used by native declarations.
@@ -1135,7 +1283,7 @@ pub enum NativeNatExpr {
     Dimension(String),
     Parameter(String),
     /// `query` of the representation element parameter `W` is bound to
-    /// (`operands(W)`, `form(W, NAME)`, `unit_columns(W)`). It has a value only in an
+    /// (`operands(W)`, `form(W, NAME)`, `packed(W)`, `unit_columns(W)`). It has a value only in an
     /// implementation instantiated at its bindings
     /// ([`NativeImplementation::at_elements`]).
     Element(String, ElementQuery),
@@ -1165,6 +1313,9 @@ pub enum ElementQuery {
     /// only over an entry's conversion destination (`repack[U = W]`), which
     /// its bindings bind to a registered conversion's packed destination.
     UnitColumns,
+    /// `packed(W)`: 1 where `W` is a packed representation (a packet or row
+    /// layout), else 0 (dense or external).
+    Packed,
 }
 
 impl ElementQuery {
@@ -1178,6 +1329,10 @@ impl ElementQuery {
                     .expect(
                         "`unit_columns` reads a conversion destination, a packed representation",
                     ),
+            )),
+            Self::Packed => u64::from(matches!(
+                registry::representation_info(representation).kind,
+                registry::RepresentationKind::Packed(_) | registry::RepresentationKind::PackedRows(_)
             )),
         }
     }
@@ -1201,6 +1356,7 @@ impl ElementQuery {
                 columns.dedup();
                 columns
             }
+            Self::Packed => vec![0, 1],
         }
     }
 
@@ -1210,6 +1366,7 @@ impl ElementQuery {
             Self::Operands => format!("operands({element})"),
             Self::Form(form) => format!("form({element}, {})", form.name()),
             Self::UnitColumns => format!("unit_columns({element})"),
+            Self::Packed => format!("packed({element})"),
         }
     }
 }
@@ -1804,11 +1961,15 @@ impl NativeImplementation {
     }
 
     /// A launch-local choice or an explicit kernel read needs per-launch
-    /// source formation rather than entry-wide tuning macros.
+    /// source formation rather than entry-wide tuning macros, and so does a
+    /// written grid authored as a block: its launch's whole source sees the
+    /// grid's blocks (the runtime's `abi::WRITTEN_GRID_BLOCK`).
     pub fn launch_scoped(&self) -> bool {
-        self.launches
-            .iter()
-            .any(|launch| !launch.params.is_empty() || !launch.reads.is_empty())
+        self.launches.iter().any(|launch| {
+            !launch.params.is_empty()
+                || !launch.reads.is_empty()
+                || (self.backend.authors_written_grid_blocks() && launch.grid.is_some())
+        })
     }
 }
 
@@ -2807,6 +2968,10 @@ pub enum TensorAccess {
     Owned,
     Shared,
     Mutable,
+    /// A host port (`&host tensor`, `&host mut tensor`): the host reads it,
+    /// or rewrites it (`write`), once it sees the launch; the kernel never
+    /// accesses it.
+    Host { write: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2860,12 +3025,16 @@ pub(crate) mod internals {
         /// The owner of every `FunctionId` and `FamilyId` below.
         pub(crate) program: ProgramId,
         pub(crate) semantic_hash: ModuleHash,
-        pub(crate) sources: SourceSet,
+        /// Shared with every entry built from the module (its program's
+        /// subject), never copied per entry.
+        pub(crate) sources: std::sync::Arc<SourceSet>,
         pub(crate) entries: Vec<EntryInfo>,
         pub(crate) native_implementations: Vec<NativeImplementation>,
         pub(crate) entry_families: Vec<usize>,
         pub(crate) definitions: Vec<crate::check::ir::Definition>,
         pub(crate) families: Vec<crate::check::ir::Family>,
+        /// The module constants (`const NAME = INTEGER`), in source order.
+        pub(crate) constants: Vec<(String, u64)>,
     }
 
     pub(crate) fn check(sources: SourceSet) -> Result<Module, SourceError> {
@@ -3939,6 +4108,207 @@ mod native_tests {
         }
     }
 
+    /// A launch grid is a `&tensor[3] i32` the launch reads, or a 12-byte
+    /// scratch buffer of the implementation, on every backend: any other
+    /// extent, element, access or scratch declaration is refused.
+    #[test]
+    fn a_launch_grid_is_three_words_an_earlier_launch_wrote() {
+        let declaration = |parameter: &str, scratch: &str, grid: &str, backend: &str| {
+            format!(
+                "fn fill[N](grid: {parameter}, x: &mut tensor[N] f32):\n    for i in 0..N:\n        x[i] = 0.0\n\nnative fill for {backend} from \"fill.src\":\n{scratch}    launch fill:\n        threadgroups (N, 1, 1)\n        grid ({grid})\n        threads_per_threadgroup (1, 1, 1)\n"
+            )
+        };
+        let check = |text: String| {
+            check_source(SourceSet::new(vec![SourceFile {
+                path: "fill.seismic".to_owned(),
+                text,
+            }]))
+        };
+        for (backend, name) in [
+            ("metal", BackendName::Metal),
+            ("cuda", BackendName::Cuda),
+            ("vulkan", BackendName::Vulkan),
+            ("cpu", BackendName::Cpu),
+        ] {
+            for (scratch, grid, expected) in [
+                ("", "grid", LaunchGrid::Parameter("grid".to_owned())),
+                ("    scratch written bytes (12)\n", "written", LaunchGrid::Scratch("written".to_owned())),
+            ] {
+                let module = check(declaration("&tensor[3] i32", scratch, grid, backend)).expect("a three-word grid checks");
+                let native = module
+                    .native_implementation(module.entries()[0].id, name)
+                    .expect("native implementation");
+                assert_eq!(native.launches[0].grid, Some(expected), "{backend}");
+            }
+        }
+        for (parameter, scratch, grid, expected) in [
+            ("&tensor[4] i32", "", "grid", "must be a `&tensor[3] i32`"),
+            ("&tensor[N] i32", "", "grid", "must be a `&tensor[3] i32`"),
+            ("&tensor[3] u32", "", "grid", "must be a `&tensor[3] i32`"),
+            ("&mut tensor[3] i32", "", "grid", "must be a `&tensor[3] i32`"),
+            ("&tensor[3] i32", "    scratch written bytes (16)\n", "written", "must be a scratch buffer of `bytes (12)`"),
+            ("&tensor[3] i32", "    scratch written bytes (12) sync\n", "written", "must be a scratch buffer of `bytes (12)`"),
+            ("&tensor[3] i32", "    scratch grid bytes (12)\n", "grid", "names both"),
+            ("&tensor[3] i32", "", "written", "is not an entry parameter or scratch buffer"),
+        ] {
+            let error = check(declaration(parameter, scratch, grid, "metal"))
+                .expect_err("an inadmissible grid must fail checking");
+            assert!(
+                error.to_string().contains(expected),
+                "{parameter} {scratch:?} {grid}: expected {expected:?}, got {error}"
+            );
+        }
+    }
+
+    /// A record port is a device tensor parameter or tensor result with a
+    /// leading record axis, named once, on a backend that binds record tables
+    /// (`BackendName::binds_record_tables`): anything else is refused.
+    #[test]
+    fn a_record_port_is_a_device_tensor_named_once_where_record_tables_bind() {
+        let declaration = |records: &str, backend: &str| {
+            format!(
+                "fn scale[M, N](x: &tensor[M, N] f32, served: &host tensor[4] i32, factor: f32) -> tensor[M, N] f32:\n    let mut result = zeros_like(x)\n    parallel for row in 0..M:\n        parallel for column in 0..N:\n            result[row, column] = x[row, column] * factor\n    return result\n\nnative scale for {backend} from \"scale.src\":\n    records ({records})\n    launch scale:\n        threadgroups (M, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n"
+            )
+        };
+        let check = |text: String| {
+            check_source(SourceSet::new(vec![SourceFile {
+                path: "scale.seismic".to_owned(),
+                text,
+            }]))
+        };
+        let module = check(declaration("x, result 0", "metal")).expect("record ports check");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .expect("native implementation");
+        assert_eq!(
+            native.records,
+            vec![RecordPort::Parameter("x".to_owned()), RecordPort::Result(0)]
+        );
+        check(declaration("x, result 0", "vulkan")).expect("Vulkan binds record tables");
+        for (records, backend, expected) in [
+            ("x", "cuda", "cuda binds no record tables"),
+            ("x", "cpu", "cpu binds no record tables"),
+            ("served", "metal", "record port `served` must be a device tensor"),
+            ("factor", "metal", "record port `factor` must be a device tensor"),
+            ("y", "metal", "record port `y` is not an entry parameter"),
+            ("result 1", "metal", "record port `result 1` is not an entry result"),
+            ("x, x", "metal", "record port `x` is listed twice"),
+            ("result 0, result 0", "metal", "record port `result 0` is listed twice"),
+        ] {
+            let error = check(declaration(records, backend))
+                .expect_err("an inadmissible record port must fail checking");
+            assert!(
+                error.to_string().contains(expected),
+                "{records} {backend}: expected {expected:?}, got {error}"
+            );
+        }
+    }
+
+    /// A launch condition is one `i32` word the host writes, on a backend
+    /// that encodes each run's launches (`BackendName::encodes_runs`): word
+    /// 0 of a `&tensor[1] i32` (`(w)`), or word INDEX of a `&tensor[N] i32`
+    /// (`(w[INDEX])`, INDEX a constant below N). Any other element, rank,
+    /// access, index past the extent, or backend, is refused.
+    #[test]
+    fn a_launch_condition_is_one_word_a_run_encoding_backend_reads() {
+        let declaration = |clause: &str, word: &str, parameter: &str, backend: &str| {
+            format!(
+                "fn fill[N](whole: {parameter}, x: &mut tensor[N] f32):\n    for i in 0..N:\n        x[i] = 0.0\n\nnative fill for {backend} from \"fill.src\":\n    launch fill:\n        threadgroups (N, 1, 1)\n        {clause} ({word})\n        threads_per_threadgroup (1, 1, 1)\n"
+            )
+        };
+        let check = |text: String| {
+            check_source(SourceSet::new(vec![SourceFile {
+                path: "fill.seismic".to_owned(),
+                text,
+            }]))
+        };
+        for (clause, encoded) in [("unless", Encoded::WhileClear), ("if", Encoded::WhileSet)] {
+            for (word, parameter, index) in
+                [("whole", "&tensor[1] i32", 0), ("whole[0]", "&tensor[1] i32", 0), ("whole[2]", "&tensor[3] i32", 2)]
+            {
+                for backend in BackendName::ALL {
+                    let checked = check(declaration(clause, word, parameter, backend.as_str()));
+                    if !backend.encodes_runs() {
+                        let error = checked.expect_err("a backend encoding no run refuses a condition");
+                        let expected = format!("{} does not encode each run", backend.as_str());
+                        assert!(error.to_string().contains(&expected), "{clause} on {backend:?}: got {error}");
+                        continue;
+                    }
+                    let module = checked.expect("a one-word condition checks");
+                    let native = module
+                        .native_implementation(module.entries()[0].id, backend)
+                        .expect("native implementation");
+                    assert_eq!(
+                        native.launches[0].conditions,
+                        [LaunchCondition {
+                            word: "whole".to_owned(),
+                            index,
+                            encoded,
+                        }],
+                        "{clause} ({word}) on {backend:?}"
+                    );
+                }
+            }
+            for (word, parameter, expected) in [
+                ("whole", "&tensor[1] f32", "must be a word of a `&tensor[N] i32`"),
+                ("whole", "&mut tensor[1] i32", "must be a word of a `&tensor[N] i32`"),
+                ("whole", "&tensor[1, 1] i32", "must be a word of a `&tensor[N] i32`"),
+                ("whole[1]", "&tensor[1] i32", "`whole[1]` indexes past its `&tensor[1] i32`"),
+                ("whole[3]", "&tensor[3] i32", "`whole[3]` indexes past its `&tensor[3] i32`"),
+                ("whole[0]", "&tensor[N] i32", "of a constant N"),
+            ] {
+                let error = check(declaration(clause, word, parameter, "metal"))
+                    .expect_err("an inadmissible condition must fail checking");
+                assert!(
+                    error.to_string().contains(expected),
+                    "{clause} {word} {parameter}: expected {expected:?}, got {error}"
+                );
+            }
+        }
+        // A conjunction names each word once; distinct words of one tensor
+        // are distinct conditions.
+        for second in ["if", "unless"] {
+            let repeated = declaration("unless", "whole", "&tensor[1] i32", "metal")
+                .replace("unless (whole)\n", &format!("unless (whole)\n        {second} (whole[0])\n"));
+            let error = check(repeated).expect_err("a word named twice must fail checking");
+            assert!(error.to_string().contains("`whole[0]` is named twice"), "{second}: got {error}");
+        }
+        let distinct = declaration("unless", "whole[0]", "&tensor[2] i32", "metal")
+            .replace("unless (whole[0])\n", "unless (whole[0])\n        if (whole[1])\n");
+        let module = check(distinct).expect("distinct words of one tensor check");
+        let native = module.native_implementation(module.entries()[0].id, BackendName::Metal).unwrap();
+        assert_eq!(native.launches[0].conditions.iter().map(|condition| condition.index).collect::<Vec<_>>(), [0, 1]);
+        assert!(Encoded::WhileSet.encodes(1) && !Encoded::WhileSet.encodes(0));
+        assert!(Encoded::WhileClear.encodes(0) && !Encoded::WhileClear.encodes(1));
+    }
+
+    /// A written grid's word gates no launch, its own or another, on any
+    /// backend (`NativeLaunch::grid`).
+    #[test]
+    fn a_written_grids_word_gates_no_launch() {
+        let declaration = |backend: &str, launches: &str| {
+            format!(
+                "fn fill[N](grid: &tensor[3] i32, x: &mut tensor[N] f32):\n    for i in 0..N:\n        x[i] = 0.0\n\nnative fill for {backend} from \"fill.src\":\n{launches}"
+            )
+        };
+        let check = |text: String| {
+            check_source(SourceSet::new(vec![SourceFile {
+                path: "fill.seismic".to_owned(),
+                text,
+            }]))
+        };
+        let gridded = "    launch fill:\n        threadgroups (N, 1, 1)\n        grid (grid)\n        threads_per_threadgroup (1, 1, 1)\n";
+        for backend in BackendName::ALL {
+            for launches in [
+                gridded.replace("grid (grid)\n", "grid (grid)\n        if (grid[1])\n"),
+                format!("{gridded}    launch other:\n        threadgroups (1, 1, 1)\n        unless (grid[0])\n        threads_per_threadgroup (1, 1, 1)\n"),
+            ] {
+                let error = check(declaration(backend.as_str(), &launches)).expect_err("a grid word's condition fails");
+                assert!(error.to_string().contains("a written grid's word gates no launch"), "{backend:?}: got {error}");
+            }
+        }
+    }
+
     #[test]
     fn equivalent_family_bodies_propagate_renamed_element_bindings() {
         let module = check_source(SourceSet::new(vec![SourceFile {
@@ -4042,6 +4412,14 @@ mod diagnostic_tests {
         assert_eq!(line_column(text, Span::new(0, 1)), (1, 1));
         assert_eq!(line_column(text, Span::new(3, 4)), (2, 1));
         assert_eq!(line_column(text, Span::new(6, 7)), (2, 2));
+    }
+
+    #[test]
+    fn a_call_binds_a_dimension_at_most_once() {
+        let error = rejected(
+            "fn fill[N](output: &mut tensor[N] i32):\n    output[0] = 1\n\nfn caller[N](output: &mut tensor[N] i32):\n    fill[N = 3, N = 4](output)\n",
+        );
+        assert!(error.to_string().contains("binds `fill`'s dimension `N` twice"), "{error}");
     }
 
     #[test]

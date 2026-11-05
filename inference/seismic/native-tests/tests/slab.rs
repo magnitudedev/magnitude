@@ -1,4 +1,4 @@
-use seismic::{BackendName, Devices, Element, NativeSpecialization, SlabRegion, SlabTensor};
+use seismic::{BackendName, Devices, Element, NativeSpecialization, NativeTensorBatch, SlabRegion, SlabTensor, Tensor};
 use seismic_native_tests::{scale_rows, slab_probe, slab_scale};
 
 #[test]
@@ -219,7 +219,7 @@ fn metal_submission_cost_with_one_and_one_hundred_slabs() {
             let outputs = plan.new_outputs().unwrap();
             let mut slot = plan.new_slot().unwrap();
             let ready = slot.attach(bindings, outputs).unwrap();
-            let mut sequence = device.native_sequence();
+            let mut sequence = device.native_sequence(seismic::NativeQueue::Compute);
             let start = Instant::now();
             let outputs = ready.queue(&mut sequence).unwrap();
             let queue_nanos = start.elapsed().as_nanos();
@@ -378,9 +378,81 @@ fn queued_graph_keeps_slab_placement_fixed_until_submission_or_drop() {
     drop(logical);
     assert!(slabs.free_slab(0).is_err());
 
-    let mut sequence = device.native_sequence();
+    let mut sequence = device.native_sequence(seismic::NativeQueue::Compute);
     ready.queue(&mut sequence).unwrap();
     assert!(slabs.free_slab(0).is_err());
     drop(sequence);
     assert!(slabs.free_slab(0).unwrap().is_some());
+}
+
+#[test]
+fn freeing_a_slab_after_a_submitted_batch_read() {
+    free_after_batch_read(BackendName::Cpu);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_frees_slab_after_a_submitted_batch_read() {
+    free_after_batch_read(BackendName::Metal);
+}
+
+/// A batch holds its calls' slab placements only until it records its
+/// fences: a slab freed while the batch's read is in flight is released
+/// physically once the batch completes, and the read sees the old rows.
+fn free_after_batch_read(backend: BackendName) {
+    let device = Devices::discover(&[])
+        .unwrap()
+        .open_backend(backend)
+        .unwrap();
+    let mut slabs = SlabTensor::new(
+        &device,
+        256,
+        300,
+        vec![SlabRegion {
+            element: Element::f32(),
+            row_shape: vec![1],
+        }],
+    )
+    .unwrap();
+    slabs.add_slab().unwrap();
+    slabs.add_slab().unwrap();
+    for (start, rows) in [(0, 256), (256, 44)] {
+        let values = (start..start + rows)
+            .flat_map(|row| (row as f32).to_le_bytes())
+            .collect::<Vec<_>>();
+        slabs
+            .region_rows(0, start, rows)
+            .unwrap()
+            .write_from_host(&values)
+            .unwrap();
+    }
+    let kernel = slab_scale::native_for_device(&device, &NativeSpecialization::new()).unwrap();
+    let logical = slabs.logical_region(0).unwrap();
+    let mut value = Tensor::zeros(&device, Element::f32(), &[300, 1]).unwrap();
+    let mut batch = NativeTensorBatch::new(&device);
+    batch
+        .push(
+            &kernel,
+            slab_scale::Args {
+                x: &logical,
+                slab_rows: 256,
+                factor: 2.0,
+                delay_ms: 80,
+            },
+            slab_scale::OutputArgs { value: &mut value },
+        )
+        .unwrap();
+    let completion = batch.submit().unwrap();
+    drop(logical);
+    let observer = slabs.free_slab(0).unwrap().unwrap();
+    completion.wait().unwrap();
+    assert_eq!(observer.charged_bytes(), None);
+    assert_eq!(slabs.add_slab().unwrap(), 0);
+    let values = value.read_to_host().unwrap();
+    for (row, bytes) in values.chunks_exact(4).enumerate() {
+        assert_eq!(
+            f32::from_le_bytes(bytes.try_into().unwrap()),
+            row as f32 * 2.0
+        );
+    }
 }

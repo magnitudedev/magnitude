@@ -30,10 +30,15 @@
 //! interprets the portable body.
 
 pub mod api;
+/// What the process's large-page host backing came to (the host pages of
+/// reservations whose granules are whole large pages, backed in them or not),
+/// and the time its reservations' backing took by phase.
+pub use seismic_reservation::{backing_times, large_page_backing, BackingTimes, LargePageBacking};
 pub mod artifacts;
 pub mod devices;
 
 mod backends;
+mod completion;
 mod driver;
 mod execution;
 pub mod formation;

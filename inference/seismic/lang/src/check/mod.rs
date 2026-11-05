@@ -111,6 +111,9 @@ pub(crate) struct Checker<'a> {
     pub diagnostics: Vec<Diagnostic>,
     /// Names whose binding was rejected; uses of them are not reported again.
     pub poisoned: HashSet<String>,
+    /// The host ports (`&host tensor`): parameters the body never names,
+    /// so none is in scope.
+    pub host_ports: HashSet<String>,
     pub arena: ExprArena,
     pub elements: elements::ElementUseSet,
     pub placement: Placement,
@@ -142,6 +145,7 @@ impl<'a> Checker<'a> {
             block_depth: 0,
             diagnostics: Vec::new(),
             poisoned: HashSet::new(),
+            host_ports: HashSet::new(),
             arena,
             elements: elements::ElementUseSet::default(),
             placement: Placement::default(),
@@ -170,9 +174,17 @@ impl<'a> Checker<'a> {
             let value = c.source_value(&p.ty, None, true);
             c.locals[id.index()].value = value.clone();
             c.source_values.insert(id, value);
+            // A host port keeps its local, so parameters and locals stay
+            // aligned, but leaves the scope: naming it is an error.
+            if matches!(p.ownership, ParamOwnership::Host { .. }) {
+                if let Some(scope) = c.scopes.last_mut() {
+                    scope.remove(&p.name);
+                }
+                c.host_ports.insert(p.name.clone());
+            }
             if p.ownership == ParamOwnership::Exclusive {
                 for element in tensor_elements(&p.ty) {
-                    c.elements.stored(element);
+                    c.elements.record_stored(element);
                 }
             }
         }
@@ -244,6 +256,16 @@ impl<'a> Checker<'a> {
 
     pub fn lookup(&self, name: &str) -> Option<LocalId> {
         self.scopes.iter().rev().find_map(|s| s.get(name).copied())
+    }
+
+    /// Why `name`, which [`Self::lookup`] does not find, names nothing the
+    /// body may use, when it is a host port; `None` when it is undeclared.
+    pub fn host_port(&self, name: &str) -> Option<String> {
+        self.host_ports.contains(name).then(|| {
+            format!(
+                "`{name}` is a host port: the host reads or rewrites it once it sees the launch, and the kernel never accesses it"
+            )
+        })
     }
 
     /// Whether a local is visible at this point: declared in a live scope.
@@ -475,7 +497,16 @@ impl<'a> Checker<'a> {
 
     /// Check that the selected storage can be written. The source-order
     /// region walk decides independent-loop access legality for the body.
-    pub fn write(&mut self, root: LocalId, binding: LocalId, span: Span) -> Option<LocalId> {
+    ///
+    /// `record` is a store of whole trailing matrices, the one write packed
+    /// storage takes (`registry::store_rule`).
+    pub fn write(
+        &mut self,
+        root: LocalId,
+        binding: LocalId,
+        record: bool,
+        span: Span,
+    ) -> Option<LocalId> {
         let binding_name = self.locals[binding.index()].name.clone();
         match &self.kinds[binding.index()] {
             LocalKind::Param(i) if self.sig.params[*i].ownership == ParamOwnership::Owned => {
@@ -510,22 +541,17 @@ impl<'a> Checker<'a> {
         }
         if let ValueType::Tensor(tensor) = &self.locals[root.index()].ty {
             if let Elem::Repr(representation) = &tensor.elem {
-                if crate::registry::representation_info(*representation).access
-                    != crate::registry::RepresentationAccess::ReadWrite
-                {
-                    self.error(
-                        DiagnosticRule::Type,
-                        span,
-                        format!(
-                            "representation `{}` is decode-only and has no canonical write contract",
-                            crate::registry::representation_info(*representation).name
-                        ),
-                    );
+                if let Err(refusal) = crate::registry::store_rule(*representation).admits(record) {
+                    self.error(DiagnosticRule::Type, span, refusal);
                     return None;
                 }
             }
             let element = tensor.elem.clone();
-            self.elements.stored(&element);
+            if record {
+                self.elements.record_stored(&element);
+            } else {
+                self.elements.stored(&element);
+            }
         }
         if self
             .live_borrows()
@@ -644,14 +670,16 @@ fn divisors(arena: &ExprArena, e: IntExpr) -> Vec<IntExpr> {
 }
 
 /// Whether publishing/assigning elements of `value` into storage of `target`
-/// is a defined rounding.
+/// is a defined rounding. An element parameter binds a float-decoded
+/// representation, so a pairing with one that some binding admits is decided
+/// where lowering binds it (`install_value`).
 pub(crate) fn elem_rounds(value: &Elem, target: &Elem) -> bool {
     match (value, target) {
         (Elem::Repr(a), Elem::Repr(b)) => a == b,
-        (Elem::Repr(_), _) | (_, Elem::Repr(_)) => false,
+        (Elem::Repr(_), Elem::Dtype(_)) | (Elem::Dtype(_), Elem::Repr(_)) => false,
         (Elem::Dtype(a), Elem::Dtype(b)) => a == b || (a.is_float() && b.is_float()),
         (Elem::Dtype(a), Elem::Param(_)) | (Elem::Param(_), Elem::Dtype(a)) => a.is_float(),
-        (Elem::Param(_), Elem::Param(_)) => true,
+        (Elem::Repr(_) | Elem::Param(_), Elem::Param(_)) | (Elem::Param(_), Elem::Repr(_)) => true,
     }
 }
 
@@ -692,7 +720,7 @@ pub(crate) fn check_program(
     program: ProgramId,
     semantic_hash: ModuleHash,
     diagnostics: &mut Vec<Located>,
-) -> Option<(Vec<ir::Definition>, Vec<ir::Family>)> {
+) -> Option<(Vec<ir::Definition>, Vec<ir::Family>, Vec<[u8; 32]>)> {
     let resolved = resolve::resolve(files, program, diagnostics);
     let count = resolved.declared.len();
     // L20: every recursion is one diagnostic, and every definition that
@@ -774,6 +802,7 @@ pub(crate) fn check_program(
         count,
         "definition checking order omitted a body"
     );
+    let contents = family_contents(&resolved, &order);
     let families = resolved
         .families
         .iter()
@@ -794,6 +823,7 @@ pub(crate) fn check_program(
             .map(|(i, p)| ir::Param {
                 name: p.name.clone(),
                 ownership: p.ownership.clone(),
+                awaited: p.awaited,
                 ty: p.ty.clone(),
                 local: LocalId::new(
                     u32::try_from(i).expect("definition has more than u32::MAX parameters"),
@@ -830,7 +860,70 @@ pub(crate) fn check_program(
             span: declared.span,
         });
     }
-    Some((definitions, families))
+    Some((definitions, families, contents))
+}
+
+/// The content of each family, by family index: everything a call to it,
+/// or the entry it is, depends on. A definition's content is its
+/// declaration's structure (module constants are integers in it; source
+/// positions are not) with the content of every family it may call (the
+/// name call graph, the single owner of what a body may reach); a family's
+/// is its contract's content, then its other bodies' and its lowerings',
+/// each set in content order. So a change anywhere in a family's closure
+/// changes its content, and nothing outside the closure (another
+/// definition, a source path, where text sits) is in it. `order` is
+/// bottom-up and holds every definition: a module that checked has no
+/// recursion.
+fn family_contents(resolved: &Resolved<'_>, order: &[usize]) -> Vec<[u8; 32]> {
+    use sha2::Digest as _;
+    fn family(family: &resolve::DeclaredFamily, definitions: &[Option<[u8; 32]>]) -> [u8; 32] {
+        let content = |member: &crate::ids::FunctionId| {
+            definitions[member.index()].expect("a family's members precede its callers bottom-up")
+        };
+        let sorted = |members: &mut dyn Iterator<Item = &crate::ids::FunctionId>| {
+            let mut contents = members.map(content).collect::<Vec<_>>();
+            contents.sort_unstable();
+            contents
+        };
+        let bodies = sorted(&mut family.bodies.iter().filter(|body| **body != family.contract));
+        let lowerings = sorted(&mut family.lowerings.iter());
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"seismic-family-content-v1");
+        hasher.update(content(&family.contract));
+        for set in [bodies, lowerings] {
+            hasher.update((set.len() as u64).to_le_bytes());
+            set.iter().for_each(|member| hasher.update(member));
+        }
+        hasher.finalize().into()
+    }
+    let mut definitions = vec![None; resolved.declared.len()];
+    for &definition in order {
+        let declared = &resolved.declared[definition];
+        let called = resolved
+            .call_graph
+            .callees(definition)
+            .iter()
+            .map(|callee| resolved.declared[*callee].family.index())
+            .collect::<BTreeSet<_>>();
+        let mut callees = called
+            .into_iter()
+            .map(|called| family(&resolved.families[called], &definitions))
+            .collect::<Vec<_>>();
+        callees.sort_unstable();
+        let structure = ast::structure(declared.declaration);
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"seismic-definition-content-v1");
+        hasher.update((structure.len() as u64).to_le_bytes());
+        hasher.update(structure.as_bytes());
+        hasher.update((callees.len() as u64).to_le_bytes());
+        callees.iter().for_each(|callee| hasher.update(callee));
+        definitions[definition] = Some(hasher.finalize().into());
+    }
+    resolved
+        .families
+        .iter()
+        .map(|declared| family(declared, &definitions))
+        .collect()
 }
 
 pub(crate) fn check_closed(
@@ -839,11 +932,56 @@ pub(crate) fn check_closed(
     program: ProgramId,
 ) -> Result<crate::checked::internals::Module, crate::checked::SourceError> {
     use crate::checked::{Diagnostics, SourceDiagnostic, SourceError};
-    let mut parsed = Vec::new();
+    // Two passes: the first finds every file's module constants, which the
+    // second reads as the integers they name.
+    let mut constants = std::collections::BTreeMap::new();
+    let mut declared = Vec::new();
     let mut parse_diagnostics = Vec::new();
+    let empty = std::collections::BTreeMap::new();
+    for source in sources.files() {
+        match crate::syntax::parse(&source.text, &empty) {
+            Ok(ast) => {
+                for constant in &ast.constants {
+                    if constants.contains_key(&constant.name.name) {
+                        parse_diagnostics.push(SourceDiagnostic::located(
+                            source,
+                            crate::span::Diagnostic::with_rule(
+                                crate::checked::DiagnosticRule::Resolution,
+                                constant.name.span,
+                                format!("`{}` is declared twice", constant.name.name),
+                            ),
+                        ));
+                    }
+                    constants.insert(constant.name.name.clone(), constant.value);
+                    declared.push((constant.name.name.clone(), constant.value));
+                }
+            }
+            Err(diagnostic) => {
+                parse_diagnostics.push(SourceDiagnostic::located(source, diagnostic))
+            }
+        }
+    }
+    if let Some(diagnostics) = Diagnostics::new(std::mem::take(&mut parse_diagnostics)) {
+        return Err(SourceError::new(diagnostics));
+    }
+    let mut parsed = Vec::new();
     for (file, source) in sources.files().iter().enumerate() {
-        match crate::syntax::parse(&source.text) {
-            Ok(ast) => parsed.push((file, ast)),
+        match crate::syntax::parse(&source.text, &constants) {
+            Ok(ast) => {
+                for decl in &ast.decls {
+                    if constants.contains_key(&decl.name().name) {
+                        parse_diagnostics.push(SourceDiagnostic::located(
+                            source,
+                            crate::span::Diagnostic::with_rule(
+                                crate::checked::DiagnosticRule::Resolution,
+                                decl.name().span,
+                                format!("`{}` is a module constant's name", decl.name().name),
+                            ),
+                        ));
+                    }
+                }
+                parsed.push((file, ast));
+            }
             Err(diagnostic) => {
                 parse_diagnostics.push(SourceDiagnostic::located(source, diagnostic))
             }
@@ -879,7 +1017,8 @@ pub(crate) fn check_closed(
     if let Some(diagnostics) = Diagnostics::new(diagnostics) {
         return Err(SourceError::new(diagnostics));
     }
-    let (definitions, families) = checked.expect("a program without diagnostics is checked");
+    let (definitions, families, contents) =
+        checked.expect("a program without diagnostics is checked");
 
     let mut entries = Vec::new();
     let mut entry_families = Vec::new();
@@ -893,7 +1032,13 @@ pub(crate) fn check_closed(
         stable_hasher.update(semantic_hash.digest());
         stable_hasher.update((family_ordinal as u64).to_le_bytes());
         let stable = crate::ids::StableEntryId::new(stable_hasher.finalize().into());
-        entries.push(entry_info(id, stable, contract));
+        let mut content_hasher = sha2::Sha256::new();
+        content_hasher.update(b"seismic-entry-content-v1");
+        content_hasher.update(crate::bundle::COMPILER_SEMANTIC_VERSION.as_bytes());
+        content_hasher.update(crate::registry::REGISTRY_REVISION.as_bytes());
+        content_hasher.update(contents[family_ordinal]);
+        let content = crate::ids::EntryContent::new(content_hasher.finalize().into());
+        entries.push(entry_info(id, stable, content, contract));
         entry_families.push(family_ordinal);
     }
     let mut native_implementations = Vec::new();
@@ -960,9 +1105,15 @@ pub(crate) fn check_closed(
                 ));
                 continue;
             }
+            let ordinal = entries
+                .iter()
+                .position(|candidate| candidate.id == entry.id)
+                .expect("a matched entry is one of the module's");
+            let contract = &definitions[families[entry_families[ordinal]].contract.index()];
             match check_native(
                 native,
                 entry,
+                contract,
                 backend,
                 &sources.files()[*file].path,
             ) {
@@ -987,12 +1138,13 @@ pub(crate) fn check_closed(
         id: module_id,
         program,
         semantic_hash,
-        sources,
+        sources: std::sync::Arc::new(sources),
         entries,
         native_implementations,
         entry_families,
         definitions,
         families,
+        constants: declared,
     })
 }
 
@@ -1000,6 +1152,7 @@ pub(crate) fn check_closed(
 fn check_native(
     native: &crate::syntax::ast::NativeDecl,
     entry: &crate::checked::EntryInfo,
+    contract: &ir::Definition,
     backend: crate::registry::BackendName,
     declared_in: &str,
 ) -> Result<crate::checked::NativeImplementation, Vec<(Span, String)>> {
@@ -1146,6 +1299,62 @@ fn check_native(
         expanded = declaration;
         &expanded
     };
+
+    let mut records = Vec::new();
+    let results = result_leaves(&contract.result);
+    for record in &native.records {
+        let recorded = |ty: &ValueType| matches!(ty, ValueType::Tensor(tensor) if !tensor.axes.is_empty());
+        let (span, port) = match record {
+            ast::NativeRecordDecl::Parameter(name) => (
+                name.span,
+                match contract.params.iter().find(|parameter| parameter.name == name.name) {
+                    Some(ir::Param {
+                        ownership:
+                            ir::Ownership::Owned | ir::Ownership::Shared | ir::Ownership::Exclusive,
+                        ty,
+                        ..
+                    }) if recorded(ty) => Ok(crate::checked::RecordPort::Parameter(name.name.clone())),
+                    Some(_) => Err(format!(
+                        "record port `{}` must be a device tensor with a leading record axis",
+                        name.name
+                    )),
+                    None => Err(format!("record port `{}` is not an entry parameter", name.name)),
+                },
+            ),
+            ast::NativeRecordDecl::Result { ordinal, span } => (
+                *span,
+                match usize::try_from(*ordinal).ok().and_then(|ordinal| results.get(ordinal)) {
+                    Some((_, ty)) if recorded(ty) => {
+                        Ok(crate::checked::RecordPort::Result(*ordinal as u32))
+                    }
+                    Some(_) => Err(format!(
+                        "record port `result {ordinal}` must be a tensor with a leading record axis"
+                    )),
+                    None => Err(format!("record port `result {ordinal}` is not an entry result")),
+                },
+            ),
+        };
+        match port {
+            _ if !backend.binds_record_tables() => errors.push((
+                span,
+                format!("`records`: {} binds no record tables", backend.as_str()),
+            )),
+            Ok(port) if records.contains(&port) => errors.push((
+                span,
+                match record {
+                    ast::NativeRecordDecl::Parameter(name) => {
+                        format!("record port `{}` is listed twice", name.name)
+                    }
+                    ast::NativeRecordDecl::Result { ordinal, .. } => {
+                        format!("record port `result {ordinal}` is listed twice")
+                    }
+                },
+            )),
+            Ok(port) => records.push(port),
+            Err(message) => errors.push((span, message)),
+        }
+    }
+
 
     let mut elements: Vec<crate::checked::NativeElementCoverage> = Vec::new();
     for coverage in &native.elements {
@@ -1403,6 +1612,138 @@ fn check_native(
                 reads.push(read.name.clone());
             }
         }
+        // A grid is three `i32` group counts an earlier launch wrote: a
+        // shared rank-1 tensor of the entry, or a 12-byte scratch buffer
+        // of the implementation, read when the launch runs. Every backend
+        // dispatches one: Metal and Vulkan indirectly, the CPU reading the
+        // words when the launch runs, CUDA as a grid-stride loop over them
+        // (the runtime's `abi::written_grid_loop`).
+        let grid = launch.grid.as_ref().and_then(|grid| {
+            let declared = contract.params.iter().find(|parameter| parameter.name == grid.name);
+            let held = scratch.iter().find(|buffer| buffer.name == grid.name);
+            let refusal = match (declared, held) {
+                (Some(_), Some(_)) => Some(format!(
+                    "launch grid `{}` names both an entry parameter and a scratch buffer",
+                    grid.name
+                )),
+                (None, None) => Some(format!(
+                    "launch grid `{}` is not an entry parameter or scratch buffer",
+                    grid.name
+                )),
+                (
+                    Some(ir::Param {
+                        ownership: ir::Ownership::Shared,
+                        ty: ValueType::Tensor(tensor),
+                        ..
+                    }),
+                    None,
+                ) if tensor.elem == crate::types::Elem::Dtype(DType::I32)
+                    && matches!(tensor.axes.as_slice(), [extent] if prove::constant(&contract.arena, *extent) == Some(3)) =>
+                {
+                    None
+                }
+                (Some(_), None) => Some(format!(
+                    "launch grid `{}` must be a `&tensor[3] i32` the launch reads",
+                    grid.name
+                )),
+                (None, Some(NativeScratch { bytes: NativeNatExpr::Constant(12), sync: false, when: None, .. })) => None,
+                (None, Some(_)) => Some(format!(
+                    "launch grid `{}` must be a scratch buffer of `bytes (12)`, neither `sync` nor `when`",
+                    grid.name
+                )),
+            };
+            match (refusal, held) {
+                (Some(message), _) => {
+                    errors.push((grid.span, message));
+                    None
+                }
+                (None, None) => Some(crate::checked::LaunchGrid::Parameter(grid.name.clone())),
+                (None, Some(_)) => Some(crate::checked::LaunchGrid::Scratch(grid.name.clone())),
+            }
+        });
+        // A launch condition's word is one `i32` the host writes between
+        // submissions: word `index` (0 unless written) of a shared rank-1
+        // `i32` tensor of the entry, of a constant extent past it, read when
+        // the run is encoded (`BackendName::encodes_runs`). A written grid's
+        // word is the device's, so it gates no launch
+        // (`checked::NativeLaunch::grid`). The launch's conditions are a
+        // conjunction, each of its own word: a word named twice is
+        // redundant or, under both values, leaves the launch never encoded.
+        let mut named: Vec<(&str, u64)> = Vec::new();
+        let conditions = launch
+            .conditions
+            .iter()
+            .filter_map(|condition| {
+                let word = &condition.word;
+                // The index a constant (module constants read as their
+                // integers), else unrepresentable: refused here.
+                let index = match &condition.index {
+                    None => Some(0),
+                    Some(index) => match index.kind {
+                        crate::syntax::ast::ExprKind::Int(index) => Some(index),
+                        _ => None,
+                    },
+                };
+                let Some(index) = index else {
+                    errors.push((word.span, format!("launch condition `{}`'s index must be a constant", word.name)));
+                    return None;
+                };
+                let written = match condition.index {
+                    Some(_) => format!("{}[{index}]", word.name),
+                    None => word.name.clone(),
+                };
+                let repeated = named.contains(&(word.name.as_str(), index));
+                named.push((&word.name, index));
+                let declared = contract.params.iter().find(|parameter| parameter.name == word.name);
+                let written_grid = native
+                    .launches
+                    .iter()
+                    .any(|other| other.grid.as_ref().is_some_and(|grid| grid.name == word.name));
+                let refusal = match declared {
+                    _ if written_grid => Some(format!(
+                        "launch condition `{written}`: a written grid's word gates no launch"
+                    )),
+                    _ if !backend.encodes_runs() => Some(format!(
+                        "launch condition `{written}`: {} does not encode each run's launches",
+                        backend.as_str()
+                    )),
+                    _ if repeated => Some(format!("launch condition `{written}` is named twice")),
+                    None => Some(format!("launch condition `{}` is not an entry parameter", word.name)),
+                    Some(ir::Param {
+                        ownership: ir::Ownership::Shared,
+                        ty: ValueType::Tensor(tensor),
+                        ..
+                    }) if tensor.elem == crate::types::Elem::Dtype(DType::I32) => match tensor.axes.as_slice() {
+                        [extent] => match prove::constant(&contract.arena, *extent) {
+                            Some(extent) if i64::try_from(index).is_ok_and(|index| index < extent) => None,
+                            Some(extent) => Some(format!(
+                                "launch condition `{written}` indexes past its `&tensor[{extent}] i32`"
+                            )),
+                            None => Some(format!(
+                                "launch condition `{written}` must be a word of a `&tensor[N] i32` of a constant N"
+                            )),
+                        },
+                        _ => Some(format!(
+                            "launch condition `{written}` must be a word of a `&tensor[N] i32` the host writes"
+                        )),
+                    },
+                    Some(_) => Some(format!(
+                        "launch condition `{written}` must be a word of a `&tensor[N] i32` the host writes"
+                    )),
+                };
+                match refusal {
+                    Some(message) => {
+                        errors.push((word.span, message));
+                        None
+                    }
+                    None => Some(crate::checked::LaunchCondition {
+                        word: word.name.clone(),
+                        index,
+                        encoded: condition.encoded,
+                    }),
+                }
+            })
+            .collect::<Vec<_>>();
         let launch_names = parameter_names
             .iter()
             .cloned()
@@ -1478,15 +1819,16 @@ fn check_native(
             reads,
             when,
             groups: [x, y, z],
+            grid,
+            conditions,
             group_extent: [ex, ey, ez],
             shared_bytes,
         });
     }
 
-    // Only the Metal encoder dispatches a block more than once.
     let repeat = match &native.repeat {
         None => None,
-        Some(repeat) if backend != crate::registry::BackendName::Metal => {
+        Some(repeat) if !backend.repeats_launches() => {
             errors.push((
                 repeat.span,
                 format!("`repeat` is not implemented for {}", native.target.name),
@@ -1513,6 +1855,7 @@ fn check_native(
         statics,
         params,
         elements,
+        records,
         constraint,
 
         scratch,
@@ -1702,6 +2045,16 @@ fn native_nat_expr(
             callee,
             bindings,
             args,
+        } if matches!(&callee.kind, ExprKind::Name(name) if name.name == "packed") => {
+            match (bindings.is_empty(), args.as_slice()) {
+                (true, [arg]) => Ok(N::Element(elements.parameter("packed", arg)?, ElementQuery::Packed)),
+                _ => Err("`packed` takes one element parameter".to_owned()),
+            }
+        }
+        ExprKind::Call {
+            callee,
+            bindings,
+            args,
         } if matches!(&callee.kind, ExprKind::Name(name) if name.name == "unit_columns") => {
             match (bindings.is_empty(), args.as_slice()) {
                 (true, [arg]) => {
@@ -1757,7 +2110,7 @@ fn native_nat_expr(
                 ExprKind::Name(name) if name.name == "max" => N::Max,
                 _ => {
                     return Err(
-                        "native expressions call only `ceil_div`, `min`, `max`, `operands`, `form` and `unit_columns`"
+                        "native expressions call only `ceil_div`, `min`, `max`, `operands`, `form`, `packed` and `unit_columns`"
                             .to_owned()
                     );
                 }
@@ -1816,6 +2169,7 @@ pub(super) fn result_leaves(ty: &ValueType) -> Vec<(Vec<u32>, &ValueType)> {
 fn entry_info(
     id: crate::ids::EntryId,
     stable: crate::ids::StableEntryId,
+    content: crate::ids::EntryContent,
     definition: &ir::Definition,
 ) -> crate::checked::EntryInfo {
     use crate::checked::{
@@ -1846,6 +2200,7 @@ fn entry_info(
                     ParamOwnership::Owned | ParamOwnership::Value => TensorAccess::Owned,
                     ParamOwnership::Shared => TensorAccess::Shared,
                     ParamOwnership::Exclusive => TensorAccess::Mutable,
+                    ParamOwnership::Host { write } => TensorAccess::Host { write: *write },
                     ParamOwnership::Tuple(_) => {
                         unreachable!("tensor leaf ownership is not a tuple")
                     }
@@ -1907,6 +2262,7 @@ fn entry_info(
                 access: match ownership {
                     ParamOwnership::Shared => TensorAccess::Shared,
                     ParamOwnership::Exclusive => TensorAccess::Mutable,
+                    ParamOwnership::Host { write } => TensorAccess::Host { write: *write },
                     _ => TensorAccess::Owned,
                 },
                 rank: t.rank() as u32,
@@ -1940,6 +2296,7 @@ fn entry_info(
     EntryInfo {
         id,
         stable,
+        content,
         name: definition.name.clone(),
         dimensions: definition
             .dimensions

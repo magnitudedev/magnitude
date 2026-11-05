@@ -2,10 +2,11 @@
 //!
 //! Compiling a program compiles its source once per entry (the entry is
 //! selected by `SEISMIC_KERNEL`) to sealed, validated SPIR-V, then binds
-//! `fma` for the device and creates each entry's pipeline with its constants
-//! through the device's pipeline cache. It keeps each entry's SPIR-V: a kept
-//! module is used when it validates, and a program whose modules are not all
-//! kept is compiled again.
+//! `fma` for the device and creates each entry's pipeline with its constants.
+//! It keeps each entry's SPIR-V, with what creating the program's pipelines
+//! left in a pipeline cache: a kept module is used when it validates, a
+//! program whose modules are not all kept is compiled again, and a driver
+//! given the kept pipelines compiles nothing.
 
 use crate::device::Device;
 use crate::formation::{self, DirectModule};
@@ -43,6 +44,29 @@ impl VulkanToolchain {
             })
             .collect()
     }
+}
+
+/// The kept entry that holds a program's pipeline cache data: no symbol of
+/// a source, its words the data's length and then the data.
+const PIPELINES: &str = "\0pipelines";
+
+fn pipelines_words(data: &[u8]) -> Vec<u32> {
+    let mut words = vec![u32::try_from(data.len()).expect("pipeline cache data fits u32")];
+    words.extend(data.chunks(4).map(|chunk| {
+        let mut word = [0; 4];
+        word[..chunk.len()].copy_from_slice(chunk);
+        u32::from_le_bytes(word)
+    }));
+    words
+}
+
+fn pipelines_data(words: &[u32]) -> Vec<u8> {
+    let Some((length, rest)) = words.split_first() else {
+        return Vec::new();
+    };
+    let mut data = rest.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+    data.truncate(*length as usize);
+    data
 }
 
 /// Each module's symbol and words, length-prefixed, little-endian.
@@ -101,29 +125,25 @@ impl Toolchain for VulkanToolchain {
         source: &ProgramSource,
         cache: Option<&dyn ProgramCache>,
     ) -> Result<DirectModule, NativeCompilationError> {
-        let kept = cache
-            .and_then(|cache| cache.get())
-            .and_then(|kept| self.load(source, &kept));
+        let bytes = cache.and_then(|cache| cache.get());
+        let pipelines = bytes
+            .as_deref()
+            .and_then(unpack)
+            .and_then(|modules| modules.into_iter().find(|(symbol, _)| symbol == PIPELINES))
+            .map_or_else(Vec::new, |(_, words)| pipelines_data(&words));
+        let kept = bytes.and_then(|kept| self.load(source, &kept));
+        // What is kept is written again whenever any of it was missing: the
+        // modules, or the pipelines of modules kept before them.
+        let rewrite = kept.is_none() || pipelines.is_empty();
         let modules = match kept {
             Some(modules) => modules,
             None => {
                 let environment = self.device.facts().environment();
-                let modules = source
+                source
                     .entries
                     .iter()
                     .map(|entry| formation::compile(&source.text, &entry.symbol, environment))
-                    .collect::<Result<Vec<_>, _>>()?;
-                if let Some(cache) = cache {
-                    cache.put(&pack(
-                        &source
-                            .entries
-                            .iter()
-                            .map(|entry| entry.symbol.as_str())
-                            .zip(modules.iter().cloned())
-                            .collect::<Vec<_>>(),
-                    ));
-                }
-                modules
+                    .collect::<Result<Vec<_>, _>>()?
             }
         };
         let entries = modules
@@ -131,13 +151,31 @@ impl Toolchain for VulkanToolchain {
             .map(Vec::as_slice)
             .zip(&source.entries)
             .collect::<Vec<_>>();
-        DirectModule::new(&self.device, &entries)
+        let (program, created) = DirectModule::new(&self.device, &entries, &pipelines)?;
+        if let Some(cache) = cache.filter(|_| rewrite) {
+            let mut kept = source
+                .entries
+                .iter()
+                .map(|entry| entry.symbol.as_str())
+                .zip(modules.iter().cloned())
+                .collect::<Vec<_>>();
+            kept.push((PIPELINES, pipelines_words(&created)));
+            cache.put(&pack(&kept));
+        }
+        Ok(program)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipeline_data_of_any_length_comes_back_as_it_went() {
+        for data in [&b""[..], b"a", b"abcd", b"abcdefg"] {
+            assert_eq!(pipelines_data(&pipelines_words(data)), data);
+        }
+    }
 
     #[test]
     fn packed_modules_keep_their_symbols() {

@@ -13,15 +13,6 @@ fn element(name: &str) -> PyResult<seismic::Element> {
     seismic::Element::named(name)
         .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("unknown element {name}")))
 }
-fn storage_kind(name: &str) -> PyResult<seismic::StorageKind> {
-    match name {
-        "device" => Ok(seismic::StorageKind::Device),
-        "upload" => Ok(seismic::StorageKind::Upload),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "unknown storage kind {name}"
-        ))),
-    }
-}
 /// The process's devices, over the inventory discovered on first use.
 fn discovered() -> PyResult<&'static Mutex<seismic::Devices>> {
     static DISCOVERED: OnceLock<Mutex<seismic::Devices>> = OnceLock::new();
@@ -52,13 +43,14 @@ impl Device {
     fn capabilities(&self) -> Vec<String> {
         self.inner.capabilities().to_vec()
     }
-    fn storage_usage(&self, kind: &str) -> PyResult<(u64, Option<u64>, u64)> {
-        let m = self.inner.storage_usage(storage_kind(kind)?);
-        Ok((m.charged, m.limit, m.store_charged))
+    fn device_ledger(&self) -> (u64, u64, Option<u64>, u64) {
+        let ledger = self.inner.device_ledger();
+        (ledger.charged, ledger.claim, ledger.bound, ledger.high_water)
     }
-    fn set_storage_limit(&self, kind: &str, bytes: Option<u64>) -> PyResult<()> {
-        self.inner.set_storage_limit(storage_kind(kind)?, bytes);
-        Ok(())
+    fn set_device_bound(&self, bytes: Option<u64>) -> PyResult<()> {
+        self.inner
+            .bound(seismic::Ledger::Own(self.inner.device_store()), bytes)
+            .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
     }
     fn __repr__(&self) -> String {
         format!("Device({}, {:?})", self.backend(), self.name())

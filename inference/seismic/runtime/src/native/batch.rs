@@ -4,7 +4,8 @@ use super::*;
 
 /// A preparation-time batch of independent native calls on one device. Each
 /// call keeps its own arguments and result allocations; the calls share one
-/// scratch arena because their launches execute in submission order.
+/// scratch arena because a launch waits for the earlier launches over the
+/// bytes it reaches.
 pub(crate) struct NativeTensorBatch {
     device: Arc<DeviceInner>,
     calls: Vec<(Arc<NativePrepared>, NativeBoundCall)>,
@@ -40,12 +41,12 @@ impl NativeTensorBatch {
                 crate::api::WorkflowError::HostBoundaryRequired,
             ));
         }
-        let call = kernel.prepare_call(&mut self.scratch, args, Some(outputs))?;
+        let call = kernel.prepare_call(&mut self.scratch, args, Some(outputs), super::Parking::Unanswered)?;
         self.calls.push((kernel.clone(), call));
         Ok(())
     }
 
-    pub(crate) fn submit(self) -> Result<NativeTensorBatchCompletion, CallError> {
+    pub(crate) fn submit(mut self) -> Result<NativeTensorBatchCompletion, CallError> {
         if self.calls.is_empty() {
             return Err(CallError::Workflow(crate::api::WorkflowError::Empty));
         }
@@ -60,7 +61,13 @@ impl NativeTensorBatch {
                 .map(|(kernel, _)| kernel.clone())
                 .collect::<Vec<_>>(),
         );
-        let submission = submit(&BatchCalls(&self.calls), &access, retained, 1)?;
+        let submission = submit(&BatchCalls(&self.calls), &access, retained, 1, false, super::NativeQueue::Compute)?;
+        // The fences are recorded: the calls' views, and their leases, end
+        // here; a slab freed or a region shrunk from now on is released
+        // physically once the batch completes (allocation fences).
+        for (_, call) in &mut self.calls {
+            call.release_views();
+        }
         Ok(NativeTensorBatchCompletion {
             submission,
             _calls: self.calls,
@@ -82,22 +89,31 @@ impl DispatchList for BatchCalls<'_> {
         buffers: &mut Vec<(&'s Allocation, u64)>,
     ) -> Dispatch<'s> {
         let (kernel, call) = &self.0[index];
-        buffers.extend(
+        kernel.bind(
             call.buffers
                 .iter()
-                .map(|(allocation, offset)| (&**allocation, *offset)),
+                .map(|(allocation, offset, _)| (&**allocation, *offset)),
+            buffers,
         );
         Dispatch {
             kernel,
             words: &call.words,
-            word_bytes: &call.word_bytes,
             launches: &call.launches.geometry,
             rounds: call.launches.rounds,
             representations: &call.representations,
         }
     }
 
-    fn plans(&self) -> Option<Vec<u64>> {
+    fn reaches<'s>(&'s self, index: usize, reaches: &mut Vec<hazard::Reach<'s>>) {
+        self.0[index].1.reaches(reaches);
+    }
+
+    fn encodes(&self, index: usize, ordinal: usize) -> bool {
+        let (kernel, call) = &self.0[index];
+        call.encodes(kernel, ordinal)
+    }
+
+    fn runs(&self) -> Option<Vec<super::PlanRun>> {
         None
     }
 }
@@ -111,6 +127,12 @@ pub(crate) struct NativeTensorBatchCompletion {
 }
 
 impl NativeTensorBatchCompletion {
+    /// Whether the batch ended, without waiting: completed, or faulted, the
+    /// outcome [`Self::wait`] reports.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.submission.is_complete()
+    }
+
     pub(crate) fn wait(mut self) -> Result<(), CallError> {
         let result = self.submission.wait();
         self.finished = true;

@@ -8,6 +8,7 @@
 
 mod description;
 mod error;
+mod gate;
 mod native;
 pub mod process;
 mod program;
@@ -18,6 +19,7 @@ pub use description::{
     NativeNumericalModeIdentity, NumericalEnvironmentIdentity, TargetFamily,
 };
 pub use error::{NativeCompilationError, TargetDescriptionError, ToolchainUnavailable};
+pub use gate::{AnsweredBy, GateOpening, ParkAnswer};
 pub use native::{
     form_native_kernel, reconcile_native_kernel, ClusterPortability, NativeArtifactMetrics,
     NativeClusterDomain, NativeCompiler, NativeFormation, NativeKernel, NativeKernelCandidate,

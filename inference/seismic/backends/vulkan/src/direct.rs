@@ -8,12 +8,14 @@
 //! The launch's only push constant is the block's address.
 
 use crate::device::{
-    barrier, call, Device, Recording, Retired, RetiredCommand, ARGUMENT_CHUNK_BYTES,
+    barrier, call, Device, Handed, Recording, Retired, RetiredCommand, ARGUMENT_CHUNK_BYTES,
 };
 use crate::formation::DirectModule;
 use crate::memory::{Buffer, Range};
 use ash::vk::{self, Handle};
 use seismic_compiler::errors::ExecutionError;
+use seismic_native_target::{GateOpening, ParkAnswer};
+use seismic_compiler::graph_cost::GraphCensus;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// One launch as issued. Its workgroup size and group memory are the
@@ -28,7 +30,11 @@ pub struct DirectLaunch<'a> {
     /// Scalar-result slots, addressed after the buffers; address 0 for an
     /// entry without scalar results.
     pub scalar_results: Option<(&'a Buffer, u64)>,
+    /// The group counts; with `grid`, the most the grid holds.
     pub groups: [u64; 3],
+    /// The three 32-bit group counts an earlier launch wrote, as `(buffer,
+    /// byte offset)`, dispatched indirectly.
+    pub grid: Option<(&'a Buffer, u64)>,
 }
 
 /// What fixes a launch's device work apart from the values it reads: its
@@ -46,6 +52,35 @@ impl DirectLaunch<'_> {
             groups: self.groups,
         }
     }
+
+    /// Whether the launch does no device work (an empty grid): it is
+    /// recorded as nothing.
+    pub fn is_empty(&self) -> bool {
+        self.groups.contains(&0)
+    }
+
+    /// The launch's argument block: each buffer's address, the
+    /// scalar-result address, then the words.
+    pub fn argument_block(&self) -> Vec<u8> {
+        let mut block = Vec::with_capacity((self.buffers.len() + 1) * 8 + self.words.len());
+        for (buffer, offset) in self.buffers {
+            block.extend_from_slice(&(buffer.address() + offset).to_le_bytes());
+        }
+        let scalar_results = self
+            .scalar_results
+            .map_or(0, |(buffer, offset)| buffer.address() + offset);
+        block.extend_from_slice(&scalar_results.to_le_bytes());
+        block.extend_from_slice(self.words);
+        block
+    }
+}
+
+/// Where a recorded launch's argument block lies in its graph's chunks, and
+/// the bytes it holds now.
+struct Block {
+    chunk: usize,
+    offset: u64,
+    bytes: Vec<u8>,
 }
 
 /// Argument blocks written into upload chunks for one command buffer.
@@ -70,32 +105,41 @@ impl Arguments {
         recording: &mut Recording,
         launch: &DirectLaunch<'_>,
     ) -> Result<u64, ExecutionError> {
-        let mut block = Vec::with_capacity((launch.buffers.len() + 1) * 8 + launch.words.len());
-        for (buffer, offset) in launch.buffers {
-            block.extend_from_slice(&(buffer.address() + offset).to_le_bytes());
-        }
-        let scalar_results = launch
-            .scalar_results
-            .map_or(0, |(buffer, offset)| buffer.address() + offset);
-        block.extend_from_slice(&scalar_results.to_le_bytes());
-        block.extend_from_slice(launch.words);
-        let bytes = block.len() as u64;
+        self.write_block(device, recording, launch).map(|(address, _)| address)
+    }
+
+    /// Write the block of `launch`; its device address, and where it lies
+    /// with the bytes it holds.
+    fn write_block(
+        &mut self,
+        device: &Device,
+        recording: &mut Recording,
+        launch: &DirectLaunch<'_>,
+    ) -> Result<(u64, Block), ExecutionError> {
+        let block = launch.argument_block();
+        let bytes = argument_block_bytes(launch.buffers.len() as u64, launch.words.len() as u64);
         if bytes > ARGUMENT_CHUNK_BYTES {
             return Err(ExecutionError::SubmissionFailed(format!(
                 "a launch's argument block needs {bytes} bytes; a chunk holds {ARGUMENT_CHUNK_BYTES}"
             )));
         }
-        let start = self.used.next_multiple_of(16);
-        if start + bytes > ARGUMENT_CHUNK_BYTES {
+        if self.used + bytes > ARGUMENT_CHUNK_BYTES {
             self.chunks.push(device.argument_chunk(recording)?);
             self.used = 0;
         }
-        let start = self.used.next_multiple_of(16);
+        let start = self.used;
         let chunk = self.chunks.last().expect("a chunk was taken above");
         chunk.write_mapped(start, &block);
         self.used = start + bytes;
-        Ok(chunk.address() + start)
+        let address = chunk.address() + start;
+        Ok((address, Block { chunk: self.chunks.len() - 1, offset: start, bytes: block }))
     }
+}
+
+/// The bytes `launch`'s argument block takes in its chunk, as Vulkan's
+/// layout counts them ([`seismic_compiler::graph_cost::argument_bytes`]).
+pub(crate) const fn argument_block_bytes(buffers: u64, words: u64) -> u64 {
+    seismic_compiler::graph_cost::argument_bytes(seismic_lang::registry::BackendName::Vulkan, buffers, words)
 }
 
 /// Record one launch: its barrier after the previous launch's writes, the
@@ -124,18 +168,25 @@ unsafe fn record_launch(
         0,
         &address.to_le_bytes(),
     );
-    raw.cmd_dispatch(command, groups[0], groups[1], groups[2]);
+    match launch.grid {
+        Some((buffer, offset)) => {
+            let range = buffer.range();
+            raw.cmd_dispatch_indirect(command, range.raw(), range.offset() + offset);
+        }
+        None => raw.cmd_dispatch(command, groups[0], groups[1], groups[2]),
+    }
 }
 
-/// Each launch follows the previous launch's writes, as on a CUDA stream.
+/// Each launch follows the previous launch's writes, as on a CUDA stream,
+/// its indirect dispatch's read of a grid among them.
 unsafe fn compute_barrier(raw: &ash::Device, command: vk::CommandBuffer) {
     barrier(
         raw,
         command,
         vk::PipelineStageFlags2::COMPUTE_SHADER,
         vk::AccessFlags2::SHADER_WRITE,
-        vk::PipelineStageFlags2::COMPUTE_SHADER,
-        vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+        vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::DRAW_INDIRECT,
+        vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::INDIRECT_COMMAND_READ,
     );
 }
 
@@ -184,7 +235,11 @@ pub struct DirectGraphBuilder {
     /// chunks it wrote) unsubmitted.
     graph: Option<GraphInner>,
     arguments: Arguments,
+    /// Each launch's argument block, in launch order.
+    blocks: Vec<Block>,
     launched: bool,
+    /// The launches recorded so far ([`DirectGraph::census`]).
+    launches: GraphCensus,
 }
 
 impl DirectGraphBuilder {
@@ -199,7 +254,9 @@ impl DirectGraphBuilder {
                 last_use: AtomicU64::new(0),
             }),
             arguments: Arguments::new(),
+            blocks: Vec::new(),
             launched: false,
+            launches: GraphCensus::default(),
         };
         builder.begin_segment()?;
         Ok(builder)
@@ -222,7 +279,7 @@ impl DirectGraphBuilder {
     /// Allocate and begin the secondary buffer of the next segment.
     fn begin_segment(&mut self) -> Result<(), ExecutionError> {
         let device = self.device.clone();
-        let mut recording = device.recording();
+        let mut recording = device.recording()?;
         let command = device.command(&mut recording, vk::CommandBufferLevel::SECONDARY)?;
         self.graph().commands.push(command);
         let inheritance = vk::CommandBufferInheritanceInfo::default();
@@ -239,7 +296,7 @@ impl DirectGraphBuilder {
     }
 
     fn end_segment(&self) -> Result<(), ExecutionError> {
-        let recording = self.device.recording();
+        let recording = self.device.locked();
         let ended = call(
             unsafe { self.device.inner.device.end_command_buffer(self.command()) },
             "vkEndCommandBuffer",
@@ -263,8 +320,9 @@ impl DirectGraphBuilder {
         let Some(groups) = groups(&self.device, launch)? else {
             return Ok(());
         };
-        let mut recording = self.device.recording();
-        let address = self.arguments.write(&self.device, &mut recording, launch)?;
+        let mut recording = self.device.recording()?;
+        let (address, block) = self.arguments.write_block(&self.device, &mut recording, launch)?;
+        self.blocks.push(block);
         unsafe {
             record_launch(
                 &self.device,
@@ -276,22 +334,34 @@ impl DirectGraphBuilder {
             )
         };
         self.launched = true;
+        let census = GraphCensus::launch(argument_block_bytes(launch.buffers.len() as u64, launch.words.len() as u64));
+        self.launches = self
+            .launches
+            .plus(census)
+            .ok_or_else(|| ExecutionError::SubmissionFailed("a graph's launch census overflows".into()))?;
         Ok(())
     }
 
     /// Finish recording. The device memory recording took beyond blocks
-    /// (command memory) is the graph's; the device keeps it after the graph
-    /// is dropped, for the command buffers it reuses, so it stays held.
+    /// (command memory) and its argument chunks are the graph's; the device
+    /// keeps both after the graph is dropped, for the graphs recorded after
+    /// it (command buffers it reuses, chunks it hands out again), so they
+    /// stay held. Only the command memory is the driver's: the chunks are
+    /// charged as the upload blocks they lie in.
     pub fn instantiate(mut self) -> Result<DirectGraph, ExecutionError> {
         self.end_segment()?;
         let mut graph = self.graph.take().expect("a live builder holds its graph");
         graph.arguments = std::mem::take(&mut self.arguments.chunks);
-        let device_bytes = self.device.inner.unheld_since(self.mark);
         let inner = &self.device.inner;
-        inner.record_driver_memory(&inner.graphs, device_bytes);
+        let command = inner.unheld_since(self.mark);
+        inner.graphs.fetch_add(command, Ordering::Relaxed);
+        let arguments = graph.arguments.iter().map(Range::bytes).sum::<u64>();
         Ok(DirectGraph {
             inner: std::sync::Arc::new(graph),
-            device_bytes,
+            blocks: std::mem::take(&mut self.blocks),
+            device_bytes: command + arguments,
+            census: GraphCensus::graph(self.launches)
+                .ok_or_else(|| ExecutionError::SubmissionFailed("a graph's census overflows".into()))?,
         })
     }
 }
@@ -309,7 +379,12 @@ impl Drop for DirectGraphBuilder {
 /// individual recording.
 pub struct DirectGraph {
     inner: std::sync::Arc<GraphInner>,
+    /// Each launch's argument block as the device holds it once the work
+    /// queued so far ran ([`DirectBatch::rebind`]).
+    blocks: Vec<Block>,
     device_bytes: u64,
+    /// What the graph is made of, as its memory follows it.
+    census: GraphCensus,
 }
 
 impl DirectGraph {
@@ -317,9 +392,30 @@ impl DirectGraph {
         self.inner.commands.len()
     }
 
-    /// Device memory recording the graph took beyond blocks.
-    pub fn device_bytes(&self) -> u64 {
-        self.device_bytes
+    /// Its launches (each not [`DirectLaunch::is_empty`]).
+    pub fn launches(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Forget what its argument blocks hold, after a rewrite queued in a
+    /// batch that never committed ([`DirectBatch::rebind`]): the next
+    /// rebind rewrites every block.
+    pub fn unbind(&mut self) {
+        for block in &mut self.blocks {
+            block.bytes.clear();
+        }
+    }
+
+    /// Its launches and their argument blocks' bytes
+    /// ([`argument_block_bytes`]).
+    pub fn census(&self) -> GraphCensus {
+        self.census
+    }
+
+    /// The driver's command memory recording it took: what it holds less
+    /// its argument chunks.
+    pub(crate) fn command_bytes(&self) -> u64 {
+        self.device_bytes - self.inner.arguments.iter().map(Range::bytes).sum::<u64>()
     }
 }
 
@@ -351,17 +447,16 @@ impl Drop for GraphInner {
 
 /// Launches recorded into one primary command buffer and submitted to the
 /// device's queue. A leading barrier orders the batch after every earlier
-/// submission; each launch follows the previous launch's writes; a trailing
-/// barrier makes results visible to the host.
-pub struct DirectBatch {
+/// submission (its writes to every later read, indirect grids included);
+/// each launch follows the previous launch's writes; a trailing barrier
+/// makes results visible to the host. Whether it writes device timestamps is
+/// its type ([`Timing`]): a [`Measured`] batch resets its queries and
+/// stamps its start and end (and, timed, each launch), an [`Unmeasured`]
+/// one writes none.
+pub struct DirectBatch<T: Timing = Measured> {
     device: Device,
     command: vk::CommandBuffer,
-    queries: (vk::QueryPool, u32),
-    /// Queries written so far (the first is the batch start).
-    written: u32,
-    /// For a timed batch, per `launch` call, the query written just before
-    /// the launch (absent for an empty launch).
-    marks: Option<Vec<Option<u32>>>,
+    timing: T,
     arguments: Arguments,
     /// Whether a dispatch or replay has been recorded (the next one needs a
     /// barrier).
@@ -377,14 +472,242 @@ pub struct DirectBatch {
     committed: bool,
 }
 
-/// A timeline semaphore the host and the device's queue submissions both
-/// advance and wait on.
-pub struct HostTimeline {
-    device: Device,
-    semaphore: vk::Semaphore,
+mod sealed {
+    pub trait Sealed {}
 }
 
-impl HostTimeline {
+/// Whether a batch writes device timestamps (see [`DirectBatch`]).
+pub trait Timing: sealed::Sealed + Sized {
+    /// What its submission keeps of them.
+    type Stamps;
+
+    /// Its queries, taken under the recording lock.
+    #[doc(hidden)]
+    fn open(device: &Device, recording: &mut Recording, launches: Option<usize>) -> Result<Self, ExecutionError>;
+
+    /// Its query pool, returned with the batch.
+    #[doc(hidden)]
+    fn queries(&self) -> Option<(vk::QueryPool, u32)>;
+
+    /// Reset its queries, before the leading barrier.
+    #[doc(hidden)]
+    fn reset(&self, raw: &ash::Device, command: vk::CommandBuffer);
+
+    /// Stamp the batch's start, after the leading barrier.
+    #[doc(hidden)]
+    fn start(&mut self, raw: &ash::Device, command: vk::CommandBuffer);
+
+    /// Stamp the batch's end, after the trailing barrier, and keep what its
+    /// submission reads.
+    #[doc(hidden)]
+    fn end(&mut self, raw: &ash::Device, command: vk::CommandBuffer) -> Self::Stamps;
+
+    /// For a timed batch, stamp a launch's start, after the previous
+    /// launch's writes where one was recorded, and keep its mark: whether
+    /// it did (the launch then needs no barrier of its own).
+    #[doc(hidden)]
+    fn mark(&mut self, raw: &ash::Device, command: vk::CommandBuffer, launched: bool) -> bool;
+
+    /// For a timed batch, keep an empty launch's place.
+    #[doc(hidden)]
+    fn skip(&mut self);
+
+    /// Whether the batch times each launch.
+    #[doc(hidden)]
+    fn timed(&self) -> bool;
+}
+
+/// Device timestamps at marks of work on the device's queue
+/// ([`DirectBatch::stamp`]): a query of a pool of their own per mark, each
+/// reset and written as the queue passes its mark, so the device time
+/// between two marks is read once the work has passed both. Marks may lie
+/// in different batches of one queue: its timestamps share one domain.
+pub struct Stamps {
+    device: Device,
+    pool: vk::QueryPool,
+    marks: u32,
+}
+
+impl Stamps {
+    /// The stamps of `marks` marks on `device`.
+    pub fn new(device: &Device, marks: usize) -> Result<Self, ExecutionError> {
+        let marks = u32::try_from(marks).map_err(|_| ExecutionError::SubmissionFailed("too many timestamp marks".into()))?;
+        let info = vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(marks.max(1));
+        let pool = call(unsafe { device.inner.device.create_query_pool(&info, None) }, "vkCreateQueryPool")?;
+        Ok(Self { device: device.clone(), pool, marks })
+    }
+
+    /// The device seconds from mark `from` to mark `to`, once the queue has
+    /// passed both (waited for here).
+    pub fn seconds(&self, from: usize, to: usize) -> Result<f64, ExecutionError> {
+        let mut values = vec![0u64; self.marks as usize];
+        call(
+            unsafe {
+                self.device.inner.device.get_query_pool_results(
+                    self.pool,
+                    0,
+                    &mut values,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                )
+            },
+            "vkGetQueryPoolResults",
+        )?;
+        let limits = self.device.facts().limits;
+        let ticks = values[to].wrapping_sub(values[from]) & mask(limits.timestamp_valid_bits);
+        Ok(ticks as f64 * limits.timestamp_period / 1e9)
+    }
+}
+
+impl Drop for Stamps {
+    fn drop(&mut self) {
+        // The work that wrote them has completed or never ran: its owner
+        // retires it before the stamps it holds.
+        unsafe { self.device.inner.device.destroy_query_pool(self.pool, None) };
+    }
+}
+
+/// A batch that writes its start and end timestamps, and, timed, one before
+/// each launch: its submission's device interval is known.
+pub struct Measured {
+    queries: (vk::QueryPool, u32),
+    /// Queries written so far (the first is the batch start).
+    written: u32,
+    /// For a timed batch, per `launch` call, the query written just before
+    /// the launch (absent for an empty launch).
+    marks: Option<Vec<Option<u32>>>,
+}
+
+/// A batch that writes no timestamp and resets no query.
+pub struct Unmeasured;
+
+/// What a measured submission reads: its end query (the start is query 0),
+/// and a timed batch's marks.
+pub struct MeasuredStamps {
+    end: u32,
+    marks: Option<Vec<Option<u32>>>,
+}
+
+impl sealed::Sealed for Measured {}
+impl sealed::Sealed for Unmeasured {}
+
+impl Measured {
+    fn stamp(&mut self, raw: &ash::Device, command: vk::CommandBuffer) -> u32 {
+        let query = self.written;
+        unsafe { raw.cmd_write_timestamp2(command, vk::PipelineStageFlags2::ALL_COMMANDS, self.queries.0, query) };
+        self.written += 1;
+        query
+    }
+}
+
+impl Timing for Measured {
+    type Stamps = MeasuredStamps;
+
+    fn open(device: &Device, recording: &mut Recording, launches: Option<usize>) -> Result<Self, ExecutionError> {
+        let queries = u32::try_from(launches.unwrap_or(0) + 2)
+            .map_err(|_| ExecutionError::SubmissionFailed("too many timed launches".into()))?;
+        Ok(Self {
+            queries: device.queries(recording, queries)?,
+            written: 0,
+            marks: launches.map(Vec::with_capacity),
+        })
+    }
+
+    fn queries(&self) -> Option<(vk::QueryPool, u32)> {
+        Some(self.queries)
+    }
+
+    fn reset(&self, raw: &ash::Device, command: vk::CommandBuffer) {
+        unsafe { raw.cmd_reset_query_pool(command, self.queries.0, 0, self.queries.1) };
+    }
+
+    fn start(&mut self, raw: &ash::Device, command: vk::CommandBuffer) {
+        self.stamp(raw, command);
+    }
+
+    fn end(&mut self, raw: &ash::Device, command: vk::CommandBuffer) -> MeasuredStamps {
+        MeasuredStamps { end: self.stamp(raw, command), marks: self.marks.take() }
+    }
+
+    fn mark(&mut self, raw: &ash::Device, command: vk::CommandBuffer, launched: bool) -> bool {
+        if self.marks.is_none() {
+            return false;
+        }
+        if launched {
+            unsafe { compute_barrier(raw, command) };
+        }
+        let mark = self.stamp(raw, command);
+        self.marks.as_mut().expect("a timed batch has marks").push(Some(mark));
+        true
+    }
+
+    fn skip(&mut self) {
+        if let Some(marks) = &mut self.marks {
+            marks.push(None);
+        }
+    }
+
+    fn timed(&self) -> bool {
+        self.marks.is_some()
+    }
+}
+
+impl Timing for Unmeasured {
+    type Stamps = ();
+
+    fn open(_: &Device, _: &mut Recording, launches: Option<usize>) -> Result<Self, ExecutionError> {
+        assert!(launches.is_none(), "an unmeasured batch times no launch");
+        Ok(Self)
+    }
+
+    fn queries(&self) -> Option<(vk::QueryPool, u32)> {
+        None
+    }
+
+    fn reset(&self, _: &ash::Device, _: vk::CommandBuffer) {}
+
+    fn start(&mut self, _: &ash::Device, _: vk::CommandBuffer) {}
+
+    fn end(&mut self, _: &ash::Device, _: vk::CommandBuffer) {}
+
+    fn mark(&mut self, _: &ash::Device, _: vk::CommandBuffer, _: bool) -> bool {
+        false
+    }
+
+    fn skip(&mut self) {}
+
+    fn timed(&self) -> bool {
+        false
+    }
+}
+
+/// Which side raises a host timeline, so a batch can only wait on what the
+/// host raises and only signal what the host waits on: a gate no device
+/// signal can satisfy, by type.
+pub trait Side: sealed::Sealed {}
+
+/// The host raises the timeline ([`HostTimeline::signal`]) and the device's
+/// submissions wait on it ([`DirectBatch::wait_timeline`]): a gate.
+pub enum Gate {}
+
+/// The device's submissions raise the timeline
+/// ([`DirectBatch::signal_timeline`]) and the host waits on it
+/// ([`HostTimeline::wait`]).
+pub enum Reached {}
+
+impl sealed::Sealed for Gate {}
+impl sealed::Sealed for Reached {}
+impl Side for Gate {}
+impl Side for Reached {}
+
+/// A timeline semaphore between the host and the device's queue
+/// submissions, raised by side `S`.
+pub struct HostTimeline<S: Side> {
+    device: Device,
+    semaphore: vk::Semaphore,
+    side: std::marker::PhantomData<fn() -> S>,
+}
+
+impl<S: Side> HostTimeline<S> {
     /// A timeline at 0.
     pub fn new(device: &Device) -> Result<Self, ExecutionError> {
         let mut timeline = vk::SemaphoreTypeCreateInfo::default()
@@ -402,11 +725,16 @@ impl HostTimeline {
         Ok(Self {
             device: device.clone(),
             semaphore,
+            side: std::marker::PhantomData,
         })
     }
 
     /// Raise the timeline to `value` from the host; a value it has reached
-    /// already changes nothing.
+    /// already changes nothing. A device's timeline ([`Reached`]) is raised
+    /// so only by a host that plays the device (a test). Precondition: no
+    /// other signal of the timeline runs at once (`vkSignalSemaphore`'s
+    /// value must exceed the semaphore's, which a concurrent signal may
+    /// pass between this one's read and its signal).
     ///
     /// Host writes made before the signal are visible to the device work
     /// that waits on `value` (`DirectBatch::wait_timeline`):
@@ -423,7 +751,11 @@ impl HostTimeline {
     ///   stages of its wait mask (spec, "Semaphore Waiting"), which is
     ///   `COMPUTE_SHADER | ALL_COMMANDS` (`Device::submit_with`).
     pub fn signal(&self, value: u64) -> Result<(), ExecutionError> {
-        if self.value() >= value {
+        self.raise(value, GateOpening::Signalled)
+    }
+
+    fn raise(&self, value: u64, opening: GateOpening) -> Result<(), ExecutionError> {
+        if self.value()? >= value {
             return Ok(());
         }
         let info = vk::SemaphoreSignalInfo::default()
@@ -432,48 +764,69 @@ impl HostTimeline {
         call(
             unsafe { self.device.inner.device.signal_semaphore(&info) },
             "vkSignalSemaphore",
+        )?;
+        // The submissions held on this gate go to the queue now
+        // (`Device::submit_with`).
+        self.device.release(opening);
+        Ok(())
+    }
+
+    /// The value reached; the device's loss where it cannot say.
+    pub fn value(&self) -> Result<u64, ExecutionError> {
+        call(
+            unsafe {
+                self.device
+                    .inner
+                    .device
+                    .get_semaphore_counter_value(self.semaphore)
+            },
+            "vkGetSemaphoreCounterValue",
         )
     }
 
-    /// The value reached. A failed query reads as reached everything: the
-    /// device cannot make progress.
-    pub fn value(&self) -> u64 {
-        unsafe {
-            self.device
-                .inner
-                .device
-                .get_semaphore_counter_value(self.semaphore)
-        }
-        .unwrap_or(u64::MAX)
-    }
-
     /// Wait at most `timeout` for the timeline to reach `value`; whether it
-    /// did.
-    pub fn wait(&self, value: u64, timeout: std::time::Duration) -> bool {
+    /// did, or the device's loss where it cannot say.
+    pub fn wait(&self, value: u64, timeout: std::time::Duration) -> Result<bool, ExecutionError> {
         let semaphores = [self.semaphore];
         let values = [value];
         let info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
             .values(&values);
         let nanoseconds = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
-        unsafe { self.device.inner.device.wait_semaphores(&info, nanoseconds) }.is_ok()
-            && self.value() >= value
+        match unsafe { self.device.inner.device.wait_semaphores(&info, nanoseconds) } {
+            Ok(()) => Ok(true),
+            Err(vk::Result::TIMEOUT) => Ok(false),
+            Err(error) => call(Err(error), "vkWaitSemaphores"),
+        }
     }
 }
 
-impl Drop for HostTimeline {
+impl HostTimeline<Gate> {
+    /// [`Self::signal`] as a park's answer: the submission waiting on it in
+    /// the driver records when it opened and `answer`
+    /// ([`DirectSubmission::opened`]).
+    pub fn answer(&self, value: u64, answer: ParkAnswer) -> Result<(), ExecutionError> {
+        self.raise(value, GateOpening::Answered(answer))
+    }
+}
+
+impl<S: Side> Drop for HostTimeline<S> {
     /// A submission may still wait on or signal the semaphore: every one
     /// submitted so far completes first. Precondition: every value a
     /// submission waits on was signaled, or is signaled by one before it.
+    /// Where the wait fails (the device is lost) the semaphore is never
+    /// destroyed: a submission may still use it.
     fn drop(&mut self) {
-        let _ = self.device.wait(self.device.submitted());
-        unsafe { self.device.inner.device.destroy_semaphore(self.semaphore, None) };
+        if self.device.ended(self.device.submitted()).is_ok() {
+            unsafe { self.device.inner.device.destroy_semaphore(self.semaphore, None) };
+        }
     }
 }
 
-impl DirectBatch {
+impl DirectBatch<Measured> {
+    /// A batch that stamps its start and end.
     pub fn new(device: &Device) -> Result<Self, ExecutionError> {
-        Self::create(device, 2, None)
+        Self::create(device, None)
     }
 
     /// A measurement batch that writes a timestamp before every launch, so
@@ -481,20 +834,23 @@ impl DirectBatch {
     /// of `launch` and `skip`. A timed batch attributes time but does not
     /// measure production, and never replays.
     pub fn timed(device: &Device, launches: usize) -> Result<Self, ExecutionError> {
-        let queries = u32::try_from(launches + 2)
-            .map_err(|_| ExecutionError::SubmissionFailed("too many timed launches".into()))?;
-        Self::create(device, queries, Some(Vec::with_capacity(launches)))
+        Self::create(device, Some(launches))
     }
+}
 
-    fn create(
-        device: &Device,
-        queries: u32,
-        marks: Option<Vec<Option<u32>>>,
-    ) -> Result<Self, ExecutionError> {
-        let mut recording = device.recording();
+impl DirectBatch<Unmeasured> {
+    /// A batch that writes no timestamp.
+    pub fn unmeasured(device: &Device) -> Result<Self, ExecutionError> {
+        Self::create(device, None)
+    }
+}
+
+impl<T: Timing> DirectBatch<T> {
+    fn create(device: &Device, launches: Option<usize>) -> Result<Self, ExecutionError> {
+        let mut recording = device.recording()?;
         let command = device.command(&mut recording, vk::CommandBufferLevel::PRIMARY)?;
-        let pool = match device.queries(&mut recording, queries) {
-            Ok(pool) => pool,
+        let timing = match T::open(device, &mut recording, launches) {
+            Ok(timing) => timing,
             Err(error) => {
                 recording.free_command(command);
                 return Err(error);
@@ -503,9 +859,7 @@ impl DirectBatch {
         let mut batch = Self {
             device: device.clone(),
             command,
-            queries: pool,
-            written: 0,
-            marks,
+            timing,
             arguments: Arguments::new(),
             launched: false,
             replayed: Vec::new(),
@@ -521,43 +875,36 @@ impl DirectBatch {
         );
         if begun.is_ok() {
             let raw = &device.inner.device;
+            batch.timing.reset(raw, command);
+            // After every earlier submission's writes (whose trailing
+            // barrier reaches only the host), for every read and write of
+            // this one, an indirect grid's included.
             unsafe {
-                raw.cmd_reset_query_pool(command, pool.0, 0, pool.1);
                 barrier(
                     raw,
                     command,
                     vk::PipelineStageFlags2::ALL_COMMANDS,
                     vk::AccessFlags2::MEMORY_WRITE,
-                    vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::TRANSFER,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER
+                        | vk::PipelineStageFlags2::TRANSFER
+                        | vk::PipelineStageFlags2::DRAW_INDIRECT,
                     vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
                 );
             }
-            batch.timestamp();
+            batch.timing.start(raw, command);
         }
         // Released before an error drops the batch, which retires under it.
         drop(recording);
         begun.map(|()| batch)
     }
 
-    /// Write the next timestamp; the recording lock is held.
-    fn timestamp(&mut self) -> u32 {
-        let query = self.written;
-        unsafe {
-            self.device.inner.device.cmd_write_timestamp2(
-                self.command,
-                vk::PipelineStageFlags2::ALL_COMMANDS,
-                self.queries.0,
-                query,
-            )
-        };
-        self.written += 1;
-        query
-    }
-
     /// The batch's queue submission waits, before any of its work, until
-    /// `timeline` reaches `value`: the host gate. Precondition: nothing is
-    /// recorded in the batch yet.
-    pub fn wait_timeline(&mut self, timeline: &HostTimeline, value: u64) {
+    /// `timeline` reaches `value`: the host gate, which only the host raises
+    /// ([`HostTimeline::signal`]); until then the submission waits in the
+    /// driver, or, behind another that does, on the host, as every one
+    /// after it does (`Device::submit_with`). Precondition:
+    /// nothing is recorded in the batch yet.
+    pub fn wait_timeline(&mut self, timeline: &HostTimeline<Gate>, value: u64) {
         assert!(
             !self.launched,
             "DirectBatch::wait_timeline precondition: the batch records nothing yet"
@@ -567,7 +914,7 @@ impl DirectBatch {
 
     /// `timeline` reaches `value` once the batch's queue submission
     /// completes. Precondition: the batch records nothing after this.
-    pub fn signal_timeline(&mut self, timeline: &HostTimeline, value: u64) {
+    pub fn signal_timeline(&mut self, timeline: &HostTimeline<Reached>, value: u64) {
         self.signals.push((timeline.semaphore, value));
     }
 
@@ -575,9 +922,7 @@ impl DirectBatch {
     /// grid): nothing is recorded, and a timed batch keeps its place with no
     /// interval.
     pub fn skip(&mut self) {
-        if let Some(marks) = &mut self.marks {
-            marks.push(None);
-        }
+        self.timing.skip();
     }
 
     pub fn launch(&mut self, launch: &DirectLaunch<'_>) -> Result<(), ExecutionError> {
@@ -586,17 +931,9 @@ impl DirectBatch {
             return Ok(());
         };
         let device = self.device.clone();
-        let mut recording = device.recording();
+        let mut recording = device.recording()?;
         let address = self.arguments.write(&device, &mut recording, launch)?;
-        if self.marks.is_some() {
-            if self.launched {
-                unsafe { compute_barrier(&device.inner.device, self.command) };
-            }
-            let mark = self.timestamp();
-            self.marks
-                .as_mut()
-                .expect("a timed batch has marks")
-                .push(Some(mark));
+        if self.timing.mark(&device.inner.device, self.command, self.launched) {
             unsafe { record_launch(&device, self.command, launch, address, groups, true) };
         } else {
             unsafe {
@@ -614,18 +951,89 @@ impl DirectBatch {
         Ok(())
     }
 
+    /// Rewrite, in queue order, the argument blocks of `graph` whose bytes
+    /// differ from `blocks` (each launch's [`DirectLaunch::argument_block`],
+    /// in launch order), so the graph's launches replayed after this in the
+    /// batch, or in a later submission, take them: a graph is recorded once
+    /// for its shape and bound to the storage of each replay. The rewrite
+    /// follows every earlier use of the blocks (the batch's leading barrier
+    /// orders it after earlier submissions, a barrier here after this
+    /// batch's launches) and precedes every later one. The bytes are
+    /// carried in the command buffer (`vkCmdUpdateBuffer`): nothing is
+    /// written through the mapping, which work in flight may still read.
+    pub fn rebind(&mut self, graph: &mut DirectGraph, blocks: Vec<Vec<u8>>) -> Result<(), ExecutionError> {
+        assert!(
+            !self.timing.timed(),
+            "DirectBatch::rebind precondition: a timed batch times each launch"
+        );
+        assert_eq!(blocks.len(), graph.blocks.len(), "a shape's launches are its graph's");
+        if graph.blocks.iter().zip(&blocks).all(|(held, block)| held.bytes == *block) {
+            return Ok(());
+        }
+        let _recording = self.device.locked();
+        let raw = &self.device.inner.device;
+        unsafe {
+            if self.launched {
+                barrier(
+                    raw,
+                    self.command,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_READ,
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                );
+            }
+            for (held, block) in graph.blocks.iter_mut().zip(blocks) {
+                if held.bytes != block {
+                    let chunk = &graph.inner.arguments[held.chunk];
+                    raw.cmd_update_buffer(self.command, chunk.raw(), chunk.offset() + held.offset, &block);
+                    held.bytes = block;
+                }
+            }
+            barrier(
+                raw,
+                self.command,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_READ,
+            );
+        }
+        self.launched = true;
+        if !self
+            .replayed
+            .iter()
+            .any(|replayed| std::sync::Arc::ptr_eq(replayed, &graph.inner))
+        {
+            self.replayed.push(graph.inner.clone());
+        }
+        Ok(())
+    }
+
     /// Execute every launch of `graph` in its order.
     pub fn replay(&mut self, graph: &DirectGraph) -> Result<(), ExecutionError> {
         self.execute(graph, &graph.inner.commands)
     }
 
-    /// Execute the launches of one segment of `graph`.
-    pub fn replay_segment(
+    /// Stamp mark `mark` of `stamps` once the queue's preceding work
+    /// completes ([`Stamps`]).
+    pub fn stamp(&mut self, stamps: &Stamps, mark: usize) {
+        let _recording = self.device.locked();
+        let raw = &self.device.inner.device;
+        let query = u32::try_from(mark).expect("a mark of its stamps");
+        unsafe {
+            raw.cmd_reset_query_pool(self.command, stamps.pool, query, 1);
+            raw.cmd_write_timestamp2(self.command, vk::PipelineStageFlags2::ALL_COMMANDS, stamps.pool, query);
+        }
+    }
+
+    /// Execute the launches of the segments `segments` of `graph`, in order.
+    pub fn replay_segments(
         &mut self,
         graph: &DirectGraph,
-        segment: usize,
+        segments: std::ops::Range<usize>,
     ) -> Result<(), ExecutionError> {
-        self.execute(graph, std::slice::from_ref(&graph.inner.commands[segment]))
+        self.execute(graph, &graph.inner.commands[segments])
     }
 
     fn execute(
@@ -634,10 +1042,10 @@ impl DirectBatch {
         commands: &[vk::CommandBuffer],
     ) -> Result<(), ExecutionError> {
         assert!(
-            self.marks.is_none(),
+            !self.timing.timed(),
             "DirectBatch::replay precondition: a timed batch times each launch"
         );
-        let _recording = self.device.recording();
+        let _recording = self.device.locked();
         let raw = &self.device.inner.device;
         unsafe {
             if self.launched {
@@ -657,32 +1065,40 @@ impl DirectBatch {
     }
 
     /// Submit without waiting.
-    pub fn commit(mut self) -> Result<DirectSubmission, ExecutionError> {
+    pub fn commit(self) -> Result<DirectSubmission<T>, ExecutionError> {
+        self.commit_by(Device::submit_with)
+    }
+
+    /// [`Self::commit`] through `submit`, which hands the recorded batch to
+    /// the queue (`Device::submit_with`, or a probe's own).
+    fn commit_by(
+        mut self,
+        submit: impl FnOnce(&Device, vk::CommandBuffer, &[(vk::Semaphore, u64)], &[(vk::Semaphore, u64)], Handed) -> Result<u64, ExecutionError>,
+    ) -> Result<DirectSubmission<T>, ExecutionError> {
         let device = self.device.clone();
-        let recording = device.recording();
+        let recording = device.recording()?;
         let raw = &device.inner.device;
+        // The batch's writes to the host. A later submission's reads follow
+        // them by its own leading barrier.
         unsafe {
             barrier(
                 raw,
                 self.command,
                 vk::PipelineStageFlags2::COMPUTE_SHADER,
                 vk::AccessFlags2::SHADER_WRITE,
-                vk::PipelineStageFlags2::HOST | vk::PipelineStageFlags2::ALL_COMMANDS,
-                vk::AccessFlags2::HOST_READ
-                    | vk::AccessFlags2::MEMORY_READ
-                    | vk::AccessFlags2::MEMORY_WRITE,
+                vk::PipelineStageFlags2::HOST,
+                vk::AccessFlags2::HOST_READ,
             );
         }
-        let end = self.timestamp();
+        let stamps = self.timing.end(raw, self.command);
         let ended = call(
             unsafe { raw.end_command_buffer(self.command) },
             "vkEndCommandBuffer",
         );
         drop(recording);
         ended?;
-        let value = self
-            .device
-            .submit_with(self.command, &self.waits, &self.signals)?;
+        let handed = Handed::default();
+        let value = submit(&self.device, self.command, &self.waits, &self.signals, handed.clone())?;
         for graph in &self.replayed {
             graph.last_use.fetch_max(value, Ordering::AcqRel);
         }
@@ -693,33 +1109,39 @@ impl DirectBatch {
             retired: Some(Retired {
                 value,
                 command: RetiredCommand::Primary(self.command),
-                queries: Some(self.queries),
+                queries: self.timing.queries(),
                 arguments: std::mem::take(&mut self.arguments.chunks),
             }),
             _graphs: std::mem::take(&mut self.replayed),
-            end,
-            marks: self.marks.take(),
+            stamps,
+            handed,
         })
     }
 }
 
-impl Drop for DirectBatch {
+impl<T: Timing> Drop for DirectBatch<T> {
     fn drop(&mut self) {
         if !self.committed {
             // Nothing was submitted: everything is reusable at once.
             self.device.retire(Retired {
                 value: 0,
                 command: RetiredCommand::Primary(self.command),
-                queries: Some(self.queries),
+                queries: self.timing.queries(),
                 arguments: std::mem::take(&mut self.arguments.chunks),
             });
         }
     }
 }
 
+/// The samples of a [`TimelineAnchor`].
+const ANCHOR_SAMPLES: usize = 16;
+
 /// A batch's device timestamps paired with the host clock: the origin that
 /// places device times on the host timeline. Recorded on the idle queue,
-/// waited on, and paired with the host clock read just after.
+/// polled to its completion and paired with the host clock read at once: a
+/// blocking wait returns tens of microseconds after the value is reached,
+/// which would place every device time as late. The pair read soonest after
+/// its batch's end, of [`ANCHOR_SAMPLES`], is the anchor.
 pub struct TimelineAnchor {
     ticks: u64,
     host_seconds: f64,
@@ -728,22 +1150,24 @@ pub struct TimelineAnchor {
 }
 
 impl TimelineAnchor {
-    pub fn record(
-        device: &Device,
-        host_clock: impl FnOnce() -> f64,
-    ) -> Result<Self, ExecutionError> {
-        let batch = DirectBatch::new(device)?;
-        let submission = batch.commit()?;
-        submission.finish()?;
-        let host_seconds = host_clock();
-        let ticks = submission.timestamps(2)?[1];
+    pub fn record(device: &Device, host_clock: impl Fn() -> f64) -> Result<Self, ExecutionError> {
         let limits = device.facts().limits;
-        Ok(Self {
-            ticks,
-            host_seconds,
-            period: limits.timestamp_period,
-            mask: mask(limits.timestamp_valid_bits),
-        })
+        let (period, mask) = (limits.timestamp_period, mask(limits.timestamp_valid_bits));
+        let mut anchor: Option<Self> = None;
+        for _ in 0..ANCHOR_SAMPLES {
+            let submission = DirectBatch::new(device)?.commit()?;
+            while !submission.completed()? {
+                std::hint::spin_loop();
+            }
+            let host_seconds = host_clock();
+            let sample = Self { ticks: submission.timestamps(2)?[1], host_seconds, period, mask };
+            // Read before the anchor so far places its end: read sooner
+            // after it.
+            if anchor.as_ref().is_none_or(|anchor| sample.host_seconds < anchor.place(sample.ticks)) {
+                anchor = Some(sample);
+            }
+        }
+        Ok(anchor.expect("an anchor takes samples"))
     }
 
     fn place(&self, ticks: u64) -> f64 {
@@ -766,32 +1190,50 @@ fn mask(bits: u32) -> u64 {
     }
 }
 
-/// Submitted launches, observed through the device's timeline semaphore.
-pub struct DirectSubmission {
+/// Submitted launches, observed through the device's timeline semaphore; a
+/// [`Measured`] one's timestamps read once it completes.
+pub struct DirectSubmission<T: Timing = Measured> {
     device: Device,
     value: u64,
     /// Returned to the device for reuse when this submission is dropped.
     retired: Option<Retired>,
     /// The graphs it replays, alive until it is.
     _graphs: Vec<std::sync::Arc<GraphInner>>,
-    /// Query of the batch's end timestamp (the start is query 0).
-    end: u32,
-    marks: Option<Vec<Option<u32>>>,
+    stamps: T::Stamps,
+    handed: Handed,
 }
 
-impl DirectSubmission {
-    pub fn is_complete(&self) -> bool {
-        self.device.completed() >= self.value
+impl<T: Timing> DirectSubmission<T> {
+    /// When the batch was handed to the queue, before and after the call
+    /// that took it: at its commit, or, where it was held behind a host
+    /// gate, when the gate's raising released it (`None` while it is held,
+    /// or where the queue refused it).
+    pub fn handed(&self) -> Option<(std::time::Instant, std::time::Instant)> {
+        self.handed.handed.get().copied()
     }
 
-    pub fn wait_complete(&self) {
-        let _ = self.device.wait(self.value);
+    /// When the host raised the last gate the batch was handed to the queue
+    /// waiting on, and why; `None` where it was handed over with its gates
+    /// raised (or none), or the queue refused it.
+    pub fn opened(&self) -> Option<(std::time::Instant, GateOpening)> {
+        self.handed.opened.get().copied()
     }
 
+    /// Whether the batch completed, without waiting: `Ok(false)` while it
+    /// runs, and its error where the queue refused it or the device is
+    /// lost.
+    pub fn completed(&self) -> Result<bool, ExecutionError> {
+        self.device.reached(self.value)
+    }
+
+    /// Wait for the batch to end and report its outcome.
     pub fn finish(&self) -> Result<(), ExecutionError> {
         self.device.wait(self.value)
     }
 
+}
+
+impl DirectSubmission<Measured> {
     /// The first `count` timestamps of the completed batch.
     fn timestamps(&self, count: u32) -> Result<Vec<u64>, ExecutionError> {
         self.finish()?;
@@ -817,20 +1259,19 @@ impl DirectSubmission {
 
     /// Device execution time between the batch's start and end timestamps.
     pub fn device_seconds(&self) -> Result<f64, ExecutionError> {
-        let values = self.timestamps(self.end + 1)?;
+        let end = self.stamps.end;
+        let values = self.timestamps(end + 1)?;
         let limits = self.device.facts().limits;
         let ticks =
-            values[self.end as usize].wrapping_sub(values[0]) & mask(limits.timestamp_valid_bits);
+            values[end as usize].wrapping_sub(values[0]) & mask(limits.timestamp_valid_bits);
         Ok(ticks as f64 * limits.timestamp_period / 1e9)
     }
 
     /// The completed batch's device interval on the anchor's host clock.
     pub fn device_interval(&self, anchor: &TimelineAnchor) -> Result<(f64, f64), ExecutionError> {
-        let values = self.timestamps(self.end + 1)?;
-        Ok((
-            anchor.place(values[0]),
-            anchor.place(values[self.end as usize]),
-        ))
+        let end = self.stamps.end;
+        let values = self.timestamps(end + 1)?;
+        Ok((anchor.place(values[0]), anchor.place(values[end as usize])))
     }
 
     /// For a timed batch, each `launch` call's device interval on the
@@ -841,10 +1282,10 @@ impl DirectSubmission {
         &self,
         anchor: &TimelineAnchor,
     ) -> Result<Option<Vec<Option<(f64, f64)>>>, ExecutionError> {
-        let Some(marks) = &self.marks else {
+        let Some(marks) = &self.stamps.marks else {
             return Ok(None);
         };
-        let values = self.timestamps(self.end + 1)?;
+        let values = self.timestamps(self.stamps.end + 1)?;
         let mut intervals = Vec::with_capacity(marks.len());
         for (index, mark) in marks.iter().enumerate() {
             let Some(mark) = mark else {
@@ -856,7 +1297,7 @@ impl DirectSubmission {
                 .flatten()
                 .next()
                 .copied()
-                .unwrap_or(self.end);
+                .unwrap_or(self.stamps.end);
             intervals.push(Some((
                 anchor.place(values[*mark as usize]),
                 anchor.place(values[end as usize]),
@@ -866,10 +1307,267 @@ impl DirectSubmission {
     }
 }
 
-impl Drop for DirectSubmission {
+impl<T: Timing> Drop for DirectSubmission<T> {
     fn drop(&mut self) {
         if let Some(retired) = self.retired.take() {
             self.device.retire(retired);
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod park_tests {
+    //! A submission behind a host gate the host has not raised (a park)
+    //! never reaches the driver: on NVIDIA's driver, with one in the queue,
+    //! `vkQueueSubmit2` blocks after ~2,000 more submissions (2,182 plain,
+    //! 2,046 that each park; RTX 3090, 2026-11-02), and so does every
+    //! queue's, the second's included, until the host raises the gate; a
+    //! host whose raising waits on a submission then never raises it.
+    //! `vkSignalSemaphore` and counter queries still return.
+
+    use super::*;
+    use crate::transfer::{TransferEnd, TransferItem, TransferQueue, TransferRun};
+    use std::sync::{mpsc, Arc};
+    use std::time::{Duration, Instant};
+
+    /// Submissions queued behind the park: past the driver's depth.
+    const DEPTH: u64 = 4096;
+    /// The longest any step here may take.
+    const BOUND: Duration = Duration::from_secs(5);
+
+    /// Run `call` on a thread of its own and require it to return within
+    /// [`BOUND`]; what it returned.
+    fn returns<R: Send + 'static>(label: &str, call: impl FnOnce() -> R + Send + 'static) -> R {
+        let (send, receive) = mpsc::channel();
+        let start = Instant::now();
+        std::thread::spawn(move || {
+            let _ = send.send(call());
+        });
+        match receive.recv_timeout(BOUND) {
+            Ok(returned) => {
+                eprintln!("  {label}: {:?}", start.elapsed());
+                returned
+            }
+            Err(_) => {
+                eprintln!("{label}: BLOCKED past {BOUND:?}");
+                // A driver call that never returns: no unwinding ends it.
+                std::process::abort();
+            }
+        }
+    }
+
+    /// A park, then `DEPTH` submissions behind it (each itself a park on a
+    /// second timeline where `chained`), a copy on the second queue, then
+    /// the answers: every call returns, and the work completes in order.
+    fn case(device: &Device, chained: bool) {
+        eprintln!("{}:", if chained { "submissions that each park" } else { "plain submissions" });
+        let (arrived, park) = (Arc::new(HostTimeline::new(device).unwrap()), Arc::new(HostTimeline::new(device).unwrap()));
+        let (chain_arrived, chain) = (Arc::new(HostTimeline::new(device).unwrap()), Arc::new(HostTimeline::new(device).unwrap()));
+        let mut reached = DirectBatch::new(device).unwrap();
+        reached.signal_timeline(&arrived, 1);
+        let _reached = reached.commit().unwrap();
+        let mut held = DirectBatch::new(device).unwrap();
+        held.wait_timeline(&park, 2);
+        let held = held.commit().unwrap();
+        assert!(arrived.wait(1, BOUND).unwrap(), "the device reaches the park");
+
+        let submissions = returns("queued behind the park", {
+            let (device, chain, chain_arrived) = (device.clone(), chain.clone(), chain_arrived.clone());
+            move || {
+                (0..DEPTH)
+                    .map(|index| {
+                        let mut batch = DirectBatch::new(&device).unwrap();
+                        if chained {
+                            // Park `index` of the chain: the device reaches
+                            // 2·index + 1, the next waits for 2·index + 2.
+                            if index > 0 {
+                                batch.wait_timeline(&chain, 2 * index);
+                            }
+                            batch.signal_timeline(&chain_arrived, 2 * index + 1);
+                        }
+                        batch.commit().unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            }
+        });
+        if device.has_side_queue() {
+            let (queue, source, destination) = (
+                TransferQueue::new(device).unwrap(),
+                device.allocate_upload(4096, 256, None).unwrap(),
+                device.allocate_upload(4096, 256, None).unwrap(),
+            );
+            assert!(returns("a copy on the second queue while parked", move || {
+                let run = TransferRun { source: TransferEnd::Buffer(&source, 0), destination: TransferEnd::Buffer(&destination, 0), bytes: 4096 };
+                queue.copy(&[TransferItem::Run(run)], 1).unwrap();
+                queue.wait(1, BOUND).unwrap()
+            }));
+        }
+        assert!(!held.completed().unwrap(), "the parked submission waits for its answer");
+        returns("the park's answer", {
+            let park = park.clone();
+            move || park.signal(2).unwrap()
+        });
+        if chained {
+            returns("the chain's answers, each as the device reaches it", {
+                let (chain, chain_arrived) = (chain.clone(), chain_arrived.clone());
+                move || {
+                    for index in 0..DEPTH {
+                        assert!(chain_arrived.wait(2 * index + 1, BOUND).unwrap(), "the device reaches park {index}");
+                        chain.signal(2 * index + 2).unwrap();
+                    }
+                }
+            });
+        }
+        returns("the work completes", move || {
+            held.finish().unwrap();
+            for submission in &submissions {
+                submission.finish().unwrap();
+            }
+        });
+    }
+
+    /// How the keeper's wait on the park timeline (`HostTimeline::wait`,
+    /// `vkWaitSemaphores`) spends its thread while the device works toward
+    /// the value, by how long the device takes: the share of the wait the
+    /// thread ran (1.0 is a spin), and how long after the device reached
+    /// the value (as a polling thread first reads it) it returned. A
+    /// measurement, which asserts nothing of its figures: run it by name
+    /// with `--ignored`. Its thread's run time is Linux's
+    /// (`/proc/thread-self/schedstat`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "a measurement: run it by name with --ignored"]
+    fn the_keepers_wait_is_measured() {
+        const WAITS: u64 = 100;
+        let Ok(devices) = crate::discover() else {
+            return;
+        };
+        // This thread's run time so far (`/proc/thread-self/schedstat`).
+        let ran = || -> f64 {
+            let text = std::fs::read_to_string("/proc/thread-self/schedstat").expect("schedstat");
+            text.split_whitespace().next().unwrap().parse::<f64>().unwrap() / 1e9
+        };
+        for description in devices.into_iter().filter(|description| description.floor.is_ok()) {
+            let device = Device::open(description.facts.uuid, crate::test_accounts(&description.facts)).expect("a device meeting the floor opens");
+            for work in [Duration::from_micros(50), Duration::from_micros(300), Duration::from_millis(2)] {
+                let gate = Arc::new(HostTimeline::new(&device).unwrap());
+                let reached = Arc::new(HostTimeline::new(&device).unwrap());
+                let (mut ran_share, mut late) = (0.0, 0.0);
+                for index in 1..=WAITS {
+                    let mut batch = DirectBatch::new(&device).unwrap();
+                    batch.wait_timeline(&gate, index);
+                    batch.signal_timeline(&reached, index);
+                    let submission = batch.commit().unwrap();
+                    let (raiser, poller) = {
+                        let (gate, reached) = (gate.clone(), reached.clone());
+                        let raiser = std::thread::spawn(move || {
+                            let until = Instant::now() + work;
+                            while Instant::now() < until {
+                                std::hint::spin_loop();
+                            }
+                            gate.signal(index).unwrap();
+                        });
+                        let poller = std::thread::spawn(move || {
+                            while reached.value().unwrap() < index {
+                                std::hint::spin_loop();
+                            }
+                            Instant::now()
+                        });
+                        (raiser, poller)
+                    };
+                    let (start, cpu) = (Instant::now(), ran());
+                    assert!(reached.wait(index, BOUND).unwrap(), "the device reaches {index}");
+                    let (returned, spent) = (Instant::now(), ran() - cpu);
+                    raiser.join().unwrap();
+                    let seen = poller.join().unwrap();
+                    ran_share += spent / (returned - start).as_secs_f64();
+                    late += returned.saturating_duration_since(seen).as_secs_f64();
+                    submission.finish().unwrap();
+                }
+                eprintln!(
+                    "{}: device reaching the value {work:?} after the wait began: the wait ran {:.0}% of it and returned {:.1} µs after a polling thread saw it",
+                    description.facts.name,
+                    100.0 * ran_share / WAITS as f64,
+                    late / WAITS as f64 * 1e6
+                );
+            }
+        }
+    }
+
+    /// What a park costs the device's timeline: `PARKS` empty submissions,
+    /// each after a park the host answers as the keeper does (a blocking
+    /// wait on the timeline, then the answer), against the same submissions
+    /// ungated. Prints the line the cost function prices a park at: the
+    /// difference per park, which holds the submission boundary, the host's
+    /// wake and its answer's submission. A measurement: run it by name with
+    /// `--ignored`.
+    #[test]
+    #[ignore = "a measurement: run it by name with --ignored"]
+    fn a_parks_cost_is_measured() {
+        const PARKS: u64 = 2000;
+        let Ok(devices) = crate::discover() else {
+            return;
+        };
+        for description in devices.into_iter().filter(|description| description.floor.is_ok()) {
+            let device = Device::open(description.facts.uuid, crate::test_accounts(&description.facts)).expect("a device meeting the floor opens");
+            let run = |parked: bool| {
+                let (reached, gate) = (Arc::new(HostTimeline::new(&device).unwrap()), Arc::new(HostTimeline::new(&device).unwrap()));
+                let answerer = parked.then(|| {
+                    let (reached, gate) = (reached.clone(), gate.clone());
+                    std::thread::spawn(move || {
+                        for index in 0..PARKS {
+                            assert!(reached.wait(2 * index + 1, BOUND).unwrap(), "the device reaches park {index}");
+                            gate.signal(2 * index + 2).unwrap();
+                        }
+                    })
+                });
+                let start = Instant::now();
+                let submissions = (0..=PARKS)
+                    .map(|index| {
+                        let mut batch = DirectBatch::new(&device).unwrap();
+                        if parked && index > 0 {
+                            batch.wait_timeline(&gate, 2 * index);
+                        }
+                        if parked && index < PARKS {
+                            batch.signal_timeline(&reached, 2 * index + 1);
+                        }
+                        batch.commit().unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                submissions.last().unwrap().finish().unwrap();
+                let seconds = start.elapsed().as_secs_f64();
+                if let Some(answerer) = answerer {
+                    answerer.join().unwrap();
+                }
+                seconds
+            };
+            // Warm the queue and the driver, then the median of five each.
+            run(false);
+            run(true);
+            let median = |parked: bool| {
+                let mut seconds = (0..5).map(|_| run(parked)).collect::<Vec<_>>();
+                seconds.sort_by(f64::total_cmp);
+                seconds[2]
+            };
+            let (plain, parked) = (median(false), median(true));
+            eprintln!(
+                "{}: {PARKS} submissions {:.1} µs each ungated, {:.1} µs each after a park: a park costs {:.1} µs",
+                description.facts.name,
+                plain / PARKS as f64 * 1e6,
+                parked / PARKS as f64 * 1e6,
+                (parked - plain) / PARKS as f64 * 1e6
+            );
+        }
+    }
+
+    #[test]
+    fn a_park_holds_what_follows_it_on_the_host() {
+        for description in crate::test_devices() {
+            eprintln!("{}:", description.facts.name);
+            let device = Device::open(description.facts.uuid, crate::test_accounts(&description.facts)).expect("a device meeting the floor opens");
+            case(&device, false);
+            case(&device, true);
         }
     }
 }

@@ -1,0 +1,23 @@
+// `written_marks` (conditional.seismic): the grid written, every mark
+// cleared, then each workgroup of the written grid marks its own.
+void written_marks_grid() {
+    seismic_i32 grid = seismic_i32(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GRID));
+    grid[0].v = seismic_i32(SEISMIC_PTR(SEISMIC_BUFFER_COUNT))[0].v;
+    grid[1].v = 2;
+    grid[2].v = 1;
+}
+
+void written_marks_clear() {
+    seismic_i32 marks = seismic_i32(SEISMIC_PTR(SEISMIC_BUFFER_MARKS));
+    const uint64_t index = uint64_t(gl_WorkGroupID.x) * 32ul + gl_LocalInvocationID.x;
+    if (index < SEISMIC_DIM_N * 2ul) {
+        marks[uint(index / SEISMIC_DIM_N * SEISMIC_MARKS_STRIDE_0 + index % SEISMIC_DIM_N * SEISMIC_MARKS_STRIDE_1)].v = 0;
+    }
+}
+
+void written_marks() {
+    seismic_i32 marks = seismic_i32(SEISMIC_PTR(SEISMIC_BUFFER_MARKS));
+    if (gl_LocalInvocationID.x == 0u) {
+        marks[uint(gl_WorkGroupID.y * SEISMIC_MARKS_STRIDE_0 + gl_WorkGroupID.x * SEISMIC_MARKS_STRIDE_1)].v = 1;
+    }
+}

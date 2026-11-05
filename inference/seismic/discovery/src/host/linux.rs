@@ -194,15 +194,41 @@ pub(super) fn sample() -> Result<HostSample, ObservationError> {
     let mut limits = resource_limits()?;
     let limit_visibility = cgroup_limits(Path::new("/"), &mut limits)?;
     Ok(HostSample {
-        headroom: Reported::new(mem_available_bytes, ReportedBy::LinuxMemAvailable),
+        // `MemAvailable` is what can be taken without swapping: page cache
+        // and reclaimable slab, not other programs' anonymous memory. Linux
+        // reports no larger figure that swapping would make available, so
+        // a load obtains what any growth may take.
+        allocatable: Reported::new(mem_available_bytes, ReportedBy::LinuxMemAvailable),
+        obtainable: Reported::new(mem_available_bytes, ReportedBy::LinuxMemAvailable),
         limits,
         limit_visibility,
-        // `MemAvailable` is the kernel's estimate of what is usable without
-        // swapping, so no displacement is read beside it.
-        displacement: None,
         kernel_pressure: None,
+        held: None,
+        // The swap in use, and what zswap saves of the pages it holds
+        // (`Zswapped` uncompressed, `Zswap` compressed, where the kernel
+        // has it).
+        displaced_bytes: Some(displaced_bytes(&meminfo)?),
     })
 }
+
+fn displaced_bytes(meminfo: &str) -> Result<u64, ObservationError> {
+    let field = |name| {
+        kib_field(meminfo, name)
+            .ok_or_else(|| ObservationError::Failed(format!("/proc/meminfo has no {name}")))
+    };
+    let swapped = field("SwapTotal:")?.saturating_sub(field("SwapFree:")?);
+    let zswap_saved = kib_field(meminfo, "Zswapped:")
+        .zip(kib_field(meminfo, "Zswap:"))
+        .map_or(0, |(uncompressed, compressed)| {
+            uncompressed.saturating_sub(compressed)
+        });
+    Ok(swapped + zswap_saved)
+}
+
+/// Linux counts no displacement here: `MemAvailable` is the kernel's
+/// estimate of what is usable without swapping, so no displacement is read
+/// beside it.
+pub(super) const DISPLACEMENT_COUNTERS: Option<super::ReadCounters> = None;
 
 fn read(path: impl AsRef<Path>) -> Result<String, ObservationError> {
     let path = path.as_ref();
@@ -334,7 +360,12 @@ fn cgroup_v2_limits(
             used_bytes: read_bytes(&directory.join("memory.current"))?,
             reclaimable_bytes: file_cache_headroom(
                 directory,
-                ["active_file", "inactive_file", "file_dirty", "file_writeback"],
+                [
+                    "active_file",
+                    "inactive_file",
+                    "file_dirty",
+                    "file_writeback",
+                ],
             )?,
         });
         Ok(())
@@ -375,7 +406,12 @@ fn cgroup_v1_limits(
             used_bytes: read_bytes(&directory.join("memory.usage_in_bytes"))?,
             reclaimable_bytes: file_cache_headroom(
                 directory,
-                ["total_active_file", "total_inactive_file", "total_dirty", "total_writeback"],
+                [
+                    "total_active_file",
+                    "total_inactive_file",
+                    "total_dirty",
+                    "total_writeback",
+                ],
             )?,
         });
         Ok(())
@@ -412,9 +448,9 @@ fn file_cache_headroom(directory: &Path, keys: [&str; 4]) -> Result<u64, Observa
         }
     }
     Ok(match values {
-        [Some(active), Some(inactive), Some(dirty), Some(writeback)] => {
-            active.saturating_add(inactive).saturating_sub(dirty.saturating_add(writeback))
-        }
+        [Some(active), Some(inactive), Some(dirty), Some(writeback)] => active
+            .saturating_add(inactive)
+            .saturating_sub(dirty.saturating_add(writeback)),
         _ => 0,
     })
 }
@@ -525,6 +561,128 @@ fn parse_bytes(path: &Path, value: &str) -> Result<u64, ObservationError> {
     value
         .parse::<u64>()
         .map_err(|_| ObservationError::Failed(format!("{} contains {value}", path.display())))
+}
+
+/// `crate::processors::sysfs_nodes` over `/sys/devices`, with the CPUs
+/// `sched_getaffinity` lets the process run on.
+pub(super) fn processors() -> Result<crate::Processors, String> {
+    let nodes = crate::processors::sysfs_nodes(Path::new("/sys/devices"))?;
+    // SAFETY: a zeroed set the kernel fills for the calling thread.
+    let allowed = unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return Err(format!(
+                "sched_getaffinity: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|cpu| libc::CPU_ISSET(*cpu, &set))
+            .collect()
+    };
+    crate::Processors::new(nodes, allowed, crate::ProcessorsReportedBy::LinuxSysfs)
+}
+
+/// `cpus` as a CPU set.
+fn cpu_set(cpus: &[usize]) -> Result<libc::cpu_set_t, String> {
+    if let Some(cpu) = cpus.iter().find(|&&cpu| cpu >= libc::CPU_SETSIZE as usize) {
+        return Err(format!("CPU {cpu} is beyond a CPU set"));
+    }
+    // SAFETY: a zeroed set holding `cpus`.
+    Ok(unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        cpus.iter().for_each(|&cpu| libc::CPU_SET(cpu, &mut set));
+        set
+    })
+}
+
+/// `sched_setaffinity` of thread `tid` of the process to `set`; a thread
+/// that exited needs none.
+fn place_thread(tid: libc::pid_t, set: &libc::cpu_set_t, cpus: &[usize]) -> Result<(), String> {
+    // SAFETY: a CPU set, applied to thread `tid` of this process.
+    if unsafe { libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), set) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(format!(
+                "sched_setaffinity of thread {tid} to CPUs {cpus:?}: {error}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The threads [`pin`] placed, by id, while they run: [`place_process`]
+/// places none of them.
+static PINNED: std::sync::Mutex<std::collections::BTreeSet<libc::pid_t>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// The calling thread's entry in [`PINNED`], taken out as it exits.
+struct Pinned(libc::pid_t);
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        PINNED.lock().expect("the pinned threads").remove(&self.0);
+    }
+}
+
+thread_local! {
+    static PIN: std::cell::OnceCell<Pinned> = const { std::cell::OnceCell::new() };
+}
+
+/// `sched_setaffinity` of every thread of the process (`/proc/self/task`)
+/// but those [`pin`] placed to `cpus`, pass after pass until one finds no
+/// thread it had not placed: a thread started during a pass by one not yet
+/// placed is placed by the next.
+pub(super) fn place_process(cpus: &[usize]) -> Result<(), String> {
+    let set = cpu_set(cpus)?;
+    let mut placed = PINNED.lock().expect("the pinned threads").clone();
+    loop {
+        let tasks = std::fs::read_dir("/proc/self/task")
+            .map_err(|error| format!("/proc/self/task: {error}"))?;
+        let mut new = false;
+        for task in tasks {
+            let name = task
+                .map_err(|error| format!("/proc/self/task: {error}"))?
+                .file_name();
+            let tid = name
+                .to_str()
+                .and_then(|name| name.parse::<libc::pid_t>().ok())
+                .ok_or_else(|| format!("/proc/self/task/{name:?} is no thread"))?;
+            if placed.insert(tid) {
+                new = true;
+                place_thread(tid, &set, cpus)?;
+            }
+        }
+        if !new {
+            return Ok(());
+        }
+    }
+}
+
+/// `sched_setaffinity` of the calling thread to `cpus`, which [`place_process`]
+/// then leaves where it is.
+pub(super) fn pin(cpus: &[usize]) -> Result<(), String> {
+    let set = cpu_set(cpus)?;
+    // SAFETY: a CPU set, applied to the calling thread.
+    let placed =
+        unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
+    match placed {
+        0 => {
+            // SAFETY: the calling thread's id.
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
+            PIN.with(|pin| {
+                pin.get_or_init(|| {
+                    PINNED.lock().expect("the pinned threads").insert(tid);
+                    Pinned(tid)
+                });
+            });
+            Ok(())
+        }
+        _ => Err(format!(
+            "sched_setaffinity to CPUs {cpus:?}: {}",
+            std::io::Error::last_os_error()
+        )),
+    }
 }
 
 /// mountinfo escapes space, tab, newline and backslash as octal.
@@ -793,8 +951,16 @@ mod tests {
                 0,
                 100,
             ),
-            ("active_file 0\ninactive_file 600\nfile_writeback 0\n", 0, 100),
-            ("inactive_file 600\nfile_dirty 0\nfile_writeback 0\n", 0, 100),
+            (
+                "active_file 0\ninactive_file 600\nfile_writeback 0\n",
+                0,
+                100,
+            ),
+            (
+                "inactive_file 600\nfile_dirty 0\nfile_writeback 0\n",
+                0,
+                100,
+            ),
             // Non-atomic counters can briefly disagree; never grant more
             // than the limit even when the cache counter exceeds usage.
             (
@@ -867,4 +1033,16 @@ mod tests {
             Err(ObservationError::Unsupported(_))
         ));
     }
+}
+
+/// The PCI function's `numa_node` (`crate::processors::device_node`).
+pub(super) fn device_node(location: crate::PciLocation) -> Result<crate::DeviceNode, String> {
+    let crate::PciLocation {
+        domain,
+        bus,
+        device,
+    } = location;
+    let path = format!("/sys/bus/pci/devices/{domain:04x}:{bus:02x}:{device:02x}.0/numa_node");
+    let text = std::fs::read_to_string(&path).map_err(|error| format!("{path}: {error}"))?;
+    crate::processors::parse_device_node(&text).map_err(|error| format!("{path}: {error}"))
 }

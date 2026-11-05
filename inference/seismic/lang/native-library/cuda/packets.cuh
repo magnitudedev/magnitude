@@ -20,7 +20,8 @@
 // which defines `packets::W0` (the decoder type of the bound representation)
 // and `KERNEL_W0_AT(pointer)` (its value for a tensor base pointer) and
 // `KERNEL_W0_MATRIX(pointer, index)` (its value for one matrix of a stacked
-// [B, N, K] tensor, such as one expert). Slots W0..W3 exist. Dense element types are `element` (<seismic/element.cuh>).
+// [B, N, K] tensor, such as one expert) and `KERNEL_W0_MATRIX_BYTES` (the
+// bytes of one such matrix: a stacked tensor's record). Slots W0..W3 exist. Dense element types are `element` (<seismic/element.cuh>).
 
 #pragma once
 
@@ -2283,12 +2284,6 @@ template <class E> struct Dense {
     static constexpr bool DENSE = true;
     static constexpr bool SCALED_GEMM = false;
     static constexpr int WORDS = E::bytes / 2; // 32-bit words per fragment register
-    // Matrix `index` of a stacked tensor whose matrices are `matrix_stride`
-    // elements apart.
-    __device__ static __forceinline__ Dense matrix(const u8 *base, u64 index, u64 matrix_stride, u64 stride,
-                                                   u64 rows) {
-        return Dense{base + index * matrix_stride * E::bytes, stride, rows};
-    }
     // Fragment register i of k16 step s: elements (2 per register) in words
     // w[s][i][0..WORDS).
     struct Raw {
@@ -2607,20 +2602,22 @@ template <class W> __device__ __forceinline__ void row_values16(const W &w, u64 
     }
 
 // Matrix `index` of a stacked rank-3 [B, N, K] tensor (such as expert
-// weights [E, N, K]). Dense: N rows at row stride stride 1 from element
-// index * stride 0. Packed: every matrix's N rows are padded to whole row
-// tiles, so matrix `index` starts at stored row index * N (tile-padded).
+// weights [E, N, K]), at `index` matrices' bytes from the tensor's base, the
+// one statement of a matrix's bytes (a stacked tensor's record): dense, its
+// matrix stride (stride 0, elements), N rows at row stride stride 1 within
+// it; packed, its N rows padded to whole row tiles at the layout's row
+// stride.
+#define PACKETS_DENSE_MATRIX_BYTES(P) ((packets::u64)ELEMENT_CAT(P, _STRIDE_0) * element::Of<ELEMENT_KIND(P)>::type::bytes)
+#define PACKETS_PACKED_MATRIX_BYTES(P)                                                                   \
+    (((packets::u64)ELEMENT_CAT(P, _EXTENT_1) + ELEMENT_CAT(P, _TILE_ROWS) - 1) /                        \
+     ELEMENT_CAT(P, _TILE_ROWS) * ELEMENT_CAT(P, _TILE_ROWS) * (packets::u64)ELEMENT_CAT(P, _ROW_STRIDE_BYTES))
 #define PACKETS_DENSE_MATRIX(P, pointer, index)                                                          \
-    packets::Dense<ELEMENT_OF(P)>::matrix((const packets::u8 *)(pointer), (packets::u64)(index),         \
-                                          (packets::u64)ELEMENT_CAT(P, _STRIDE_0),                       \
-                                          (packets::u64)ELEMENT_CAT(P, _STRIDE_1),                       \
-                                          (packets::u64)ELEMENT_CAT(P, _EXTENT_1))
+    packets::Dense<ELEMENT_OF(P)> {                                                                      \
+        (const packets::u8 *)(pointer) + (packets::u64)(index) * PACKETS_DENSE_MATRIX_BYTES(P),          \
+            (packets::u64)ELEMENT_CAT(P, _STRIDE_1), (packets::u64)ELEMENT_CAT(P, _EXTENT_1)             \
+    }
 #define PACKETS_PACKED_MATRIX(P, pointer, index)                                                         \
-    ((const packets::u8 *)(pointer) +                                                                    \
-     (packets::u64)(index) *                                                                             \
-         (((packets::u64)ELEMENT_CAT(P, _EXTENT_1) + ELEMENT_CAT(P, _TILE_ROWS) - 1) /                   \
-          ELEMENT_CAT(P, _TILE_ROWS) * ELEMENT_CAT(P, _TILE_ROWS)) *                                     \
-         (packets::u64)ELEMENT_CAT(P, _ROW_STRIDE_BYTES))
+    ((const packets::u8 *)(pointer) + (packets::u64)(index) * PACKETS_PACKED_MATRIX_BYTES(P))
 
 // Slot bindings. Each bound slot must name a dense tensor or a tensor in the
 // mma16 layout. `KERNEL_Wn_MATRIX(pointer, index)` is the decoder value of
@@ -2646,8 +2643,10 @@ namespace packets { typedef PACKETS_DECODER(KERNEL_W0) W0; }
 #endif
 #if ELEMENT_HAS(KERNEL_W0, _KIND_DENSE)
 #define KERNEL_W0_MATRIX(pointer, index) PACKETS_DENSE_MATRIX(KERNEL_W0, pointer, index)
+#define KERNEL_W0_MATRIX_BYTES PACKETS_DENSE_MATRIX_BYTES(KERNEL_W0)
 #else
 #define KERNEL_W0_MATRIX(pointer, index) KERNEL_W0_AT(PACKETS_PACKED_MATRIX(KERNEL_W0, pointer, index))
+#define KERNEL_W0_MATRIX_BYTES PACKETS_PACKED_MATRIX_BYTES(KERNEL_W0)
 #endif
 // The slot's operand recipe (`operands(W)`): whether products over it take
 // NVFP4 operand rows.
@@ -2670,8 +2669,10 @@ namespace packets { typedef PACKETS_DECODER(KERNEL_W1) W1; }
 #endif
 #if ELEMENT_HAS(KERNEL_W1, _KIND_DENSE)
 #define KERNEL_W1_MATRIX(pointer, index) PACKETS_DENSE_MATRIX(KERNEL_W1, pointer, index)
+#define KERNEL_W1_MATRIX_BYTES PACKETS_DENSE_MATRIX_BYTES(KERNEL_W1)
 #else
 #define KERNEL_W1_MATRIX(pointer, index) KERNEL_W1_AT(PACKETS_PACKED_MATRIX(KERNEL_W1, pointer, index))
+#define KERNEL_W1_MATRIX_BYTES PACKETS_PACKED_MATRIX_BYTES(KERNEL_W1)
 #endif
 namespace packets { constexpr bool W1_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W1, _OPERANDS_NVFP4); }
 #endif
@@ -2692,8 +2693,10 @@ namespace packets { typedef PACKETS_DECODER(KERNEL_W2) W2; }
 #endif
 #if ELEMENT_HAS(KERNEL_W2, _KIND_DENSE)
 #define KERNEL_W2_MATRIX(pointer, index) PACKETS_DENSE_MATRIX(KERNEL_W2, pointer, index)
+#define KERNEL_W2_MATRIX_BYTES PACKETS_DENSE_MATRIX_BYTES(KERNEL_W2)
 #else
 #define KERNEL_W2_MATRIX(pointer, index) KERNEL_W2_AT(PACKETS_PACKED_MATRIX(KERNEL_W2, pointer, index))
+#define KERNEL_W2_MATRIX_BYTES PACKETS_PACKED_MATRIX_BYTES(KERNEL_W2)
 #endif
 namespace packets { constexpr bool W2_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W2, _OPERANDS_NVFP4); }
 #endif
@@ -2714,8 +2717,10 @@ namespace packets { typedef PACKETS_DECODER(KERNEL_W3) W3; }
 #endif
 #if ELEMENT_HAS(KERNEL_W3, _KIND_DENSE)
 #define KERNEL_W3_MATRIX(pointer, index) PACKETS_DENSE_MATRIX(KERNEL_W3, pointer, index)
+#define KERNEL_W3_MATRIX_BYTES PACKETS_DENSE_MATRIX_BYTES(KERNEL_W3)
 #else
 #define KERNEL_W3_MATRIX(pointer, index) KERNEL_W3_AT(PACKETS_PACKED_MATRIX(KERNEL_W3, pointer, index))
+#define KERNEL_W3_MATRIX_BYTES PACKETS_PACKED_MATRIX_BYTES(KERNEL_W3)
 #endif
 namespace packets { constexpr bool W3_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W3, _OPERANDS_NVFP4); }
 #endif

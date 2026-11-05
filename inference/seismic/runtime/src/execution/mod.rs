@@ -273,7 +273,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> CompletedRun<T, E> {
     pub(crate) fn read_tensor(
         &self,
         tensor: &crate::api::tensor::TensorInner,
-    ) -> Result<Vec<u8>, ExecutionError> {
+    ) -> Result<Vec<u8>, crate::api::TensorError> {
         tensor.read_with(self.state.retained.access(tensor.allocation()))
     }
 

@@ -6,7 +6,7 @@
 //! decided here, beside the reading.
 
 use crate::gather::Natives;
-use crate::host::{self, DisplacementHistory, HostStatus, ObservationError};
+use crate::host::{HostStatus, ObservationError};
 use seismic_topology::{
     AccessPath, AccessPathId, DeviceTopology, ExecutorId, GrantSource, Reported, ReportedBy, Store,
     StoreId, StoreKind,
@@ -38,9 +38,9 @@ pub struct RuntimeStatus {
     /// Each store's ledger: the bytes this process's executors have charged
     /// to it. A store absent here has no charge.
     pub charges: Vec<(StoreId, u64)>,
-    /// What is left of each grant only an opened executor reads: a discrete
-    /// CUDA device's free memory (`ReportedBy::CudaFree`), and an
-    /// integrated CUDA device's grant less what the executor holds.
+    /// What is left of each grant of the status's executor only an opened
+    /// executor reads: a discrete CUDA device's free memory (`ReportedBy::CudaFree`),
+    /// and an integrated CUDA device's grant less what the executor holds.
     pub grants: Vec<(AccessPathId, Result<Reported<u64>, ObservationError>)>,
 }
 
@@ -65,8 +65,8 @@ impl Status {
             .sum()
     }
 
-    /// What `store` has left for this process: host RAM's availability as
-    /// the OS reports it, within every process limit; a volume's space
+    /// What `store` has left for this process: host RAM's allocatable bytes
+    /// ([`HostStatus::allocatable`]) within every process limit; a volume's space
     /// available to this process; a device memory store's capacity less the
     /// process's charges, which the OS does not report.
     pub fn headroom(&self, store: &Store) -> Result<u64, ObservationError> {
@@ -75,7 +75,7 @@ impl Status {
                 .sample
                 .host_ram
                 .as_ref()
-                .map(HostStatus::available)
+                .map(HostStatus::allocatable_bytes)
                 .map_err(Clone::clone),
             StoreKind::Volume(_) => self
                 .sample
@@ -126,10 +126,9 @@ pub(crate) fn sample(
     topology: &DeviceTopology,
     executors: &[ExecutorId],
     natives: &Natives,
-    history: &mut DisplacementHistory,
+    host_ram: Result<HostStatus, ObservationError>,
 ) -> Sample {
     let taken = SystemTime::now();
-    let host_ram = host::status(history);
     let volumes = topology
         .stores()
         .iter()

@@ -49,6 +49,14 @@ impl ElementUseSet {
         }
     }
 
+    /// A `&mut` parameter of `T` storage, or a store of whole trailing
+    /// matrices of it (`registry::record_writable`).
+    pub(crate) fn record_stored(&mut self, element: &Elem) {
+        if let Elem::Param(parameter) = element {
+            self.entry(parameter).record_stored = true;
+        }
+    }
+
     /// `to_owned` of a `T` view selecting part of its packing axis (L22).
     pub(crate) fn partial_copy(&mut self, element: &Elem) {
         if let Elem::Param(parameter) = element {
@@ -85,13 +93,7 @@ impl ElementUseSet {
             let Some(Elem::Param(own)) = argument(&parameter.name) else {
                 continue;
             };
-            let uses = self.entry(own);
-            uses.decoded_read |= parameter.uses.decoded_read;
-            uses.component_read |= parameter.uses.component_read;
-            uses.integer_code_read |= parameter.uses.integer_code_read;
-            uses.stored |= parameter.uses.stored;
-            uses.conversion_source |= parameter.uses.conversion_source;
-            uses.partial_copy |= parameter.uses.partial_copy;
+            self.entry(own).merge(parameter.uses);
         }
         for conversion in callee.conversions() {
             let Some(source) = argument(&conversion.source) else {
@@ -173,6 +175,27 @@ impl ElementUseSet {
 #[cfg(test)]
 mod tests {
     use crate::checked::{check_source, SourceFile, SourceSet};
+
+    /// A caller's element passed to a callee element takes every one of the
+    /// callee's uses of it.
+    #[test]
+    fn a_call_imposes_every_callee_use() {
+        use super::ElementUseSet;
+        use crate::types::Elem;
+        let mut callee = ElementUseSet::default();
+        let own = Elem::Param("U".into());
+        callee.decoded_read(&own);
+        callee.component_read(&own, crate::registry::QuantizedComponent::Code);
+        callee.stored(&own);
+        callee.record_stored(&own);
+        callee.partial_copy(&own);
+        callee.conversion(&own, crate::checked::ElementTarget::Parameter("U".into()));
+        let callee = callee.domain(&["U".into()], &[]);
+        let mut caller = ElementUseSet::default();
+        caller.call(&callee, &[("U".into(), Elem::Param("T".into()))]);
+        let caller = caller.domain(&["T".into()], &[]);
+        assert_eq!(caller.parameters()[0].uses, callee.parameters()[0].uses);
+    }
 
     #[test]
     fn an_entry_admits_only_bindings_its_element_predicates_hold() {

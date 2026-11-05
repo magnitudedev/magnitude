@@ -44,7 +44,7 @@ use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 
 /// Format version of the bundle wire schema. Bumped on any wire change.
-pub const BUNDLE_FORMAT_VERSION: u32 = 7;
+pub const BUNDLE_FORMAT_VERSION: u32 = 10;
 
 /// Semantic version of the checker whose output this crate can decode.
 /// Bundles produced under a different semantic version are incompatible.
@@ -211,6 +211,7 @@ struct CheckedFields<'a> {
     entry_families: &'a [usize],
     definitions: &'a [Definition],
     families: &'a [Family],
+    constants: &'a [(String, u64)],
 }
 
 impl<'a> CheckedFields<'a> {
@@ -227,6 +228,7 @@ impl<'a> CheckedFields<'a> {
             entry_families,
             definitions,
             families,
+            constants,
         } = module;
         Self {
             entries,
@@ -234,6 +236,7 @@ impl<'a> CheckedFields<'a> {
             entry_families,
             definitions,
             families,
+            constants,
         }
     }
 }
@@ -249,6 +252,7 @@ struct CheckedParts {
     definitions: Vec<(Definition, Scope)>,
     #[serde(deserialize_with = "wire::deserialize_scoped")]
     families: Vec<(Family, Scope)>,
+    constants: Vec<(String, u64)>,
 }
 
 impl CheckedParts {
@@ -266,6 +270,7 @@ impl CheckedParts {
             entry_families,
             definitions,
             families,
+            constants,
         } = self;
         let within = |reached: u32, length: usize| reached as usize <= length;
         let valid = within(decoded.entries, entries.len())
@@ -277,6 +282,7 @@ impl CheckedParts {
                 .all(|(ordinal, entry)| entry.id.index() == ordinal)
             && unique(entries.iter().map(|entry| entry.name.as_str()))
             && unique(entries.iter().map(|entry| entry.stable))
+            && unique(constants.iter().map(|(name, _)| name.as_str()))
             && entry_families.len() == entries.len()
             && entry_families.iter().all(|family| *family < families.len())
             && entries
@@ -325,7 +331,7 @@ impl CheckedParts {
             id: decoded.module,
             program: decoded.program,
             semantic_hash,
-            sources,
+            sources: std::sync::Arc::new(sources),
             entries,
             native_implementations,
             entry_families,
@@ -334,6 +340,7 @@ impl CheckedParts {
                 .map(|(definition, _)| definition)
                 .collect(),
             families: families.into_iter().map(|(family, _)| family).collect(),
+            constants,
         })
     }
 }
@@ -506,6 +513,28 @@ mod tests {
         bytes.leak()
     }
 
+    /// A module constant declared in one file is the integer it names in
+    /// every file, the checked module exports it, and its bundle carries it;
+    /// two of one name, or one named like a function, are refused.
+    #[test]
+    fn module_constants_are_shared_by_the_source_set_and_carried_by_the_bundle() {
+        let file = |path: &str, text: &str| SourceFile { path: path.into(), text: text.into() };
+        let words = file("words.seismic", "const FIRST = 2\nconst STRIDE = 3\n");
+        let user = file(
+            "user.seismic",
+            "fn pick[C](control: &tensor[C] i32) -> i32 where C >= FIRST + STRIDE:\n    return control[FIRST + STRIDE - 1]\n",
+        );
+        let module = check_source(SourceSet::new(vec![words.clone(), user])).unwrap();
+        let expected = [("FIRST".to_owned(), 2), ("STRIDE".to_owned(), 3)];
+        assert_eq!(module.constants(), expected);
+        let decoded = decode_checked_bundle(embedded(encode_checked_bundle(&module))).unwrap();
+        assert_eq!(decoded.constants(), expected);
+        let twice = file("twice.seismic", "const FIRST = 5\n");
+        assert!(check_source(SourceSet::new(vec![words.clone(), twice])).is_err());
+        let clash = file("clash.seismic", "fn FIRST() -> i32:\n    return 1\n");
+        assert!(check_source(SourceSet::new(vec![words, clash])).is_err());
+    }
+
     #[test]
     fn decoding_rebuilds_the_checked_module_under_fresh_owners() {
         let module = checked();
@@ -518,6 +547,7 @@ mod tests {
         assert_eq!(first.entries().len(), module.entries().len());
         for (decoded, original) in first.entries().iter().zip(module.entries()) {
             assert_eq!(decoded.stable, original.stable);
+            assert_eq!(decoded.content, original.content);
             assert_eq!(decoded.parameter_types, original.parameter_types);
             assert_eq!(decoded.element_domain, original.element_domain);
         }
@@ -525,7 +555,7 @@ mod tests {
         assert_ne!(first.entries()[0].id, second.entries()[0].id);
         let twice = first.entry_named("twice").unwrap();
         assert_eq!(
-            first.native_asset(twice, BackendName::Metal),
+            first.native_asset(twice, BackendName::Metal).map(|asset| asset.text),
             Some("kernel version one")
         );
         for info in first.entries() {

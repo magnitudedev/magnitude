@@ -1,7 +1,7 @@
 //! Revision-independent material for hardware fingerprints. Stable native
 //! selectors and store identities replace every revision-local identifier.
 
-use crate::{AccessPath, DeviceTopology, ExecutorId, StorageKind, StoreId};
+use crate::{AccessPath, DeviceTopology, ExecutorId, Placing, StoreId};
 use serde_json::{json, Value};
 
 impl DeviceTopology {
@@ -21,7 +21,7 @@ impl DeviceTopology {
             json!({
                 "executor": selector(path.executor()),
                 "store": store(path.store()),
-                "route": path.route(),
+                "grant": path.grant(),
             })
         };
 
@@ -57,17 +57,33 @@ impl DeviceTopology {
                 let physical = self
                     .physical_device(executor.physical())
                     .expect("an executor's device is of its revision");
-                let placements = StorageKind::ALL
-                    .iter()
-                    .map(|&kind| {
+                let placements = Placing::ALL
+                    .into_iter()
+                    .map(|placing| {
                         executor
-                            .placement(kind)
+                            .placement(placing)
                             .iter()
                             .map(|&id| {
-                                access_key(
-                                    self.access_path(id)
-                                        .expect("a placement names paths of its revision"),
-                                )
+                                let kind = self
+                                    .kind(id)
+                                    .expect("a placement names kinds of its revision");
+                                let paths = kind
+                                    .paths()
+                                    .iter()
+                                    .map(|&path| {
+                                        access_key(
+                                            self.access_path(path)
+                                                .expect("a kind names paths of its revision"),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
+                                json!({
+                                    "native": kind.native(),
+                                    "name": kind.name(),
+                                    "reach": kind.reach(),
+                                    "obtained": kind.obtained(),
+                                    "paths": paths,
+                                })
                             })
                             .collect::<Vec<_>>()
                     })
@@ -90,12 +106,7 @@ impl DeviceTopology {
         let mut access = self
             .access_paths()
             .iter()
-            .map(|path| {
-                json!({
-                    "path": access_key(path),
-                    "grant": path.grant(),
-                })
-            })
+            .map(|path| access_key(path))
             .collect::<Vec<_>>();
         access.sort_by_key(Value::to_string);
 

@@ -7,7 +7,7 @@
 //! (compiled into the binary) keeps nothing.
 
 use seismic::{
-    ArtifactKey, ArtifactStore, Availability, BackendName, Device, DeviceOptions, Devices, Element,
+    ArtifactKey, ArtifactStore, BackendName, Device, DeviceOptions, Element,
     NativeSpecialization, Tensor,
 };
 use seismic_native_tests::split_sum;
@@ -72,32 +72,12 @@ impl ArtifactStore for RecordingStore {
 /// The available devices of `backends`, opened from fresh `Devices` with
 /// `store`, so nothing formed by an earlier open is reused in this process.
 fn devices_of(backends: &[BackendName], store: &Arc<RecordingStore>) -> Vec<Device> {
-    let devices = Devices::discover(&[]).expect("device discovery");
-    let topology = devices.topology();
-    backends
-        .iter()
-        .copied()
-        .filter_map(|backend| {
-            topology
-                .executors()
-                .iter()
-                .find(|device| {
-                    device.backend() == backend
-                        && matches!(device.availability(), Availability::Available)
-                })
-                .map(|device| device.id())
-        })
-        .map(|id| {
-            devices
-                .open_with(
-                    id,
-                    DeviceOptions {
-                        artifacts: Some(store.clone()),
-                    },
-                )
-                .expect("available device opens")
-        })
-        .collect()
+    seismic_native_tests::devices_with(
+        backends,
+        DeviceOptions {
+            artifacts: Some(store.clone()), graph_cost: None
+        },
+    )
 }
 
 /// Form and run the defaults of `split_sum` at N = 1000.
@@ -137,40 +117,42 @@ fn formation_uses_the_store(backend: BackendName) {
         assert_eq!(first, Counts::default(), "{backend:?} keeps nothing");
         return;
     }
-    // Every program is a miss, compiled and stored.
-    let programs = first.gets;
-    assert!(programs > 0);
+    // Every program is a miss, compiled and stored. As on Metal, each
+    // compile reads four records, all absent (the former: the record of
+    // exactly its entry list, then the text's entry lists; the toolchain:
+    // its program; the former: the text's entry lists, to add to) and writes
+    // two (the program, the entry lists).
+    let compiles = first.puts / 2;
+    assert!(compiles > 0);
     assert_eq!(
         first,
         Counts {
-            gets: programs,
+            gets: 4 * compiles,
             hits: 0,
-            puts: programs
-        }
+            puts: 2 * compiles
+        },
+        "{backend:?}"
     );
 
-    // A fresh device forms the same programs from the store: nothing compiles.
+    // A fresh device forms the same programs from the store: the former
+    // finds the record of exactly its entry list and the toolchain loads
+    // the program from it. Nothing compiles, so nothing is written.
     formed(&store);
     assert_eq!(
         store.counts(),
         Counts {
-            gets: 2 * programs,
-            hits: programs,
-            puts: programs
-        }
+            gets: 6 * compiles,
+            hits: 2 * compiles,
+            puts: 2 * compiles
+        },
+        "{backend:?}"
     );
 
-    // A damaged entry is a miss: compiled and stored again.
+    // A damaged entry is a miss: every program is compiled and stored again.
+    // (How many damaged records formation reads on its way is the damage's.)
     store.corrupt();
     formed(&store);
-    assert_eq!(
-        store.counts(),
-        Counts {
-            gets: 3 * programs,
-            hits: 2 * programs,
-            puts: 2 * programs
-        }
-    );
+    assert_eq!(store.counts().puts, 4 * compiles, "{backend:?}: compiled again");
 }
 
 #[test]

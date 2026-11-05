@@ -1,7 +1,7 @@
 use super::{OpenError, ResolveError};
 use crate::api::device::DeviceInner;
 use crate::artifacts::DeviceOptions;
-use crate::memory::{path_claim, store_ledger, ExecutorMemory};
+use crate::memory::{path_claim, store_ledger, DeviceLedgers};
 use seismic_discovery::{DiscoveryError, Inventory, RuntimeStatus, Status};
 use seismic_topology::{
     Availability, BackendName, DeviceMemory, DeviceTopology, DiagnosticSource, ExecutorId,
@@ -87,7 +87,7 @@ impl Devices {
                 reason: reason.clone(),
             });
         }
-        let memory = ExecutorMemory::new(&topology, &info);
+        let memory = DeviceLedgers::new(&topology, &info);
         let device = crate::backends::open(info, topology, memory, options)?;
         opened.insert(id, Arc::downgrade(&device));
         Ok(device)
@@ -123,13 +123,23 @@ impl Devices {
         }
     }
 
+    /// [`Self::status`] with host RAM as the inventory's sampler last read
+    /// it (`Inventory::observe`): an observation between claims, which
+    /// reads no host file on the caller's thread.
+    pub fn observed_status(&self, topology: &DeviceTopology, executor: ExecutorId) -> Status {
+        Status {
+            sample: self.inventory.observe(topology, &[executor]),
+            runtime: self.runtime_status(topology, executor),
+        }
+    }
+
     /// What only opened executors know: each store's ledger, and what is
     /// left of each grant of `of` when it is an opened CUDA executor.
     fn runtime_status(&self, topology: &DeviceTopology, of: ExecutorId) -> RuntimeStatus {
         let charges = topology
             .stores()
             .iter()
-            .map(|store| (store.id(), store_ledger(topology, store.id()).bytes()))
+            .map(|store| (store.id(), store_ledger(topology, store.id()).claim()))
             .collect();
         // Read outside the lock: a driver query must not hold up an open.
         let devices = opened()

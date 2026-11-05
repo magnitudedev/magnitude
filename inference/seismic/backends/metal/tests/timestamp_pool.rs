@@ -33,6 +33,7 @@ fn a_timed_batch_behind_its_own_shut_gate_fails_when_the_pool_is_exhausted() {
         words: &[],
         scalar_results: None,
         threadgroups: [1, 1, 1],
+        grid: None,
         threads_per_threadgroup: [64, 1, 1],
         threadgroup_bytes: 0,
     };

@@ -3,7 +3,6 @@ use super::*;
 use seismic_compiler::feedback::{FeedbackOptions, ObservationCase, ObservationProtocol};
 use seismic_lang::checked::{check_source, SourceFile, SourceSet};
 use seismic_lang::entry::{ElementBindings, LogicalEntry};
-use seismic_topology::StorageKind;
 
 fn validate_failure<T: TargetFamily, E: NativeExecutor<T>>(
     prepared: &Prepared<T, E>,
@@ -181,8 +180,8 @@ fn reached_private_allocation_preserves_prefix(source: &str) {
         )
         .unwrap(),
     );
-    let baseline = device.storage_usage(StorageKind::Device).charged;
-    device.set_storage_limit(StorageKind::Device, Some(baseline + 4096));
+    let baseline = device.device_ledger().charged;
+    device.bound(crate::devices::Ledger::Own(device.device_store()), Some(baseline + 4096)).unwrap();
     let mut args = EncodedArgs::new();
     args.push_tensor(output.clone());
     args.push_scalar(crate::api::kernel::EncodedScalar::I32(0));
@@ -198,7 +197,7 @@ fn reached_private_allocation_preserves_prefix(source: &str) {
     );
     assert_eq!(output.read_to_host().unwrap(), 7i32.to_le_bytes());
     assert_eq!(
-        device.storage_usage(StorageKind::Device).charged,
+        device.device_ledger().charged,
         baseline,
         "failed run released its private backing"
     );
@@ -261,8 +260,8 @@ fn reached_geometry_outcome(source: &str, with_inputs: bool, expected: &[i32]) {
     let output = tensor(&[4], &[0; 4]);
     let input = tensor(&[8, 2], &[0; 16]);
     let visible = tensor(&[4, 2], &[0, 0, 1, 4, 0, 8, 4, 5]);
-    let baseline = device.storage_usage(StorageKind::Device).charged;
-    device.set_storage_limit(StorageKind::Device, Some(baseline + 4096));
+    let baseline = device.device_ledger().charged;
+    device.bound(crate::devices::Ledger::Own(device.device_store()), Some(baseline + 4096)).unwrap();
     let mut args = EncodedArgs::new();
     if with_inputs {
         args.push_tensor(input.clone());
@@ -277,7 +276,7 @@ fn reached_geometry_outcome(source: &str, with_inputs: bool, expected: &[i32]) {
         .collect::<Vec<_>>();
     assert_eq!(actual, expected);
     assert_eq!(
-        device.storage_usage(StorageKind::Device).charged,
+        device.device_ledger().charged,
         baseline,
         "completed region releases private instances"
     );

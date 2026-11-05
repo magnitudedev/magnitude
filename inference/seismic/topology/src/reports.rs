@@ -1,5 +1,5 @@
 //! What the backend crates and the OS report of the machine, and the rules
-//! that turn those reports into a topology revision (spec §2.3).
+//! that turn those reports into a topology revision.
 //!
 //! [`build`] applies the placement and grant rules to the reports
 //! (`seismic-discovery` gathers them). The rules branch only on what the
@@ -11,11 +11,13 @@
 //! every backend's report of it ([`device_memory`]); every executor of the
 //! device then places by that one decision.
 
+use crate::kind::{KindMemory, KindReport};
 use crate::model::{
-    AccessRoute, Availability, Builder, DeviceMemory, DeviceTopology, Diagnostic, ExecutorBuilder,
-    ExecutorKind, ExecutorReport, GrantSource, Limits, OwnPath, PhysicalDeviceId, PhysicalIdentity,
-    Reported, ReportedBy, Revision, StorageKind, StoreId, StoreKind, VolumeId,
+    Availability, Builder, DeviceMemory, DeviceTopology, Diagnostic, ExecutorBuilder, ExecutorKind,
+    ExecutorReport, GrantSource, Limits, OwnKind, OwnPath, PhysicalDeviceId, PhysicalIdentity,
+    Reported, ReportedBy, Revision, StoreId, StoreKind, VolumeId,
 };
+use crate::placement::{place, reserving, Contract, Placing};
 use crate::selector::ExecutorSelector;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -44,10 +46,12 @@ pub struct CpuReport {
     /// The CPU as the OS reports it: model, instruction set and caches.
     pub identity: String,
     /// Its last-level caches, summed over their instances
-    /// ([`host::last_level_cache`]).
+    /// (`seismic-discovery` reads them from the OS).
     pub cache: Option<Reported<u64>>,
     pub availability: Availability,
     pub max_allocation: u64,
+    /// Its one kind, which every contract is allocated in.
+    pub kind: KindReport,
 }
 
 #[derive(Debug)]
@@ -64,6 +68,8 @@ pub struct MetalReport {
     pub tensor_operations: bool,
     pub working_set: u64,
     pub max_allocation: u64,
+    /// Its one kind, which every contract is allocated in.
+    pub kind: KindReport,
 }
 
 #[derive(Debug)]
@@ -88,6 +94,8 @@ pub struct CudaReport {
     /// The CUDA devices whose memory it reads and writes directly
     /// (`cuDeviceCanAccessPeer`).
     pub peers: Vec<[u8; 16]>,
+    /// The kinds it allocates, each with how it reserves.
+    pub kinds: Vec<KindReport>,
 }
 
 /// Whose memory a CUDA device reports its memory is.
@@ -117,6 +125,9 @@ pub struct VulkanReport {
     pub driver: String,
     pub max_allocation: u64,
     pub memory: VulkanMemory,
+    /// The kinds it allocates: its memory types, each on its heap, and
+    /// imported host pages where it imports them, each with how it reserves.
+    pub kinds: Vec<KindReport>,
 }
 
 /// A Vulkan device's memory as the backend reports it.
@@ -126,9 +137,6 @@ pub struct VulkanMemory {
     /// the device to the dedicated memory the OS reports for its adapter.
     pub luid: Option<[u8; 8]>,
     pub heaps: Vec<VulkanHeap>,
-    /// For each storage kind, the heaps the backend allocates it from, in
-    /// order.
-    pub allocates: [Vec<usize>; StorageKind::COUNT],
 }
 
 #[derive(Debug)]
@@ -289,13 +297,15 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
         if device_memory(reports, vulkan.uuid) != DeviceMemory::Own {
             continue;
         }
-        let memory = &vulkan.memory;
-        let local = memory.allocates[StorageKind::Device as usize]
-            .iter()
-            .map(|&heap| &memory.heaps[heap])
-            .filter(|heap| heap.device_local)
-            .map(|heap| heap.bytes)
-            .reduce(|total, bytes| total + bytes);
+        let mut heaps = Vec::new();
+        for id in place(&vulkan.kinds, false, Placing::Fixed(Contract::DeviceOnly)) {
+            if let KindMemory::Heap { index, device_local: true, bytes } = reported_kind(&vulkan.kinds, id).memory {
+                if !heaps.contains(&(index, bytes)) {
+                    heaps.push((index, bytes));
+                }
+            }
+        }
+        let local = heaps.iter().map(|&(_, bytes)| bytes).reduce(|total, bytes| total + bytes);
         if let Some(bytes) = local {
             own.push((
                 PhysicalIdentity::Uuid(vulkan.uuid),
@@ -349,8 +359,13 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
             tensor_operations: false,
         });
         if reports.cpu.availability == Availability::Available {
-            let path = executor.ungranted(host_ram, AccessRoute::Device);
-            place_all(&mut executor, &[path]);
+            let path = executor.ungranted(host_ram);
+            place_kinds(
+                &mut executor,
+                std::slice::from_ref(&reports.cpu.kind),
+                true,
+                |executor, kind| executor.kind(kind, &[path]),
+            );
         }
         executor.id()
     };
@@ -390,7 +405,7 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
             tensor_operations: metal.tensor_operations,
         });
         if available {
-            place_host_class(
+            let paths = host_class_paths(
                 &mut executor,
                 own,
                 host_ram,
@@ -402,6 +417,12 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                         before,
                     })
                 },
+            );
+            place_kinds(
+                &mut executor,
+                std::slice::from_ref(&metal.kind),
+                true,
+                |executor, kind| executor.kind(kind, &paths),
             );
         }
     }
@@ -444,17 +465,23 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
             },
             tensor_operations: false,
         });
-        match placement {
-            Ok(None) => place_host_class(
-                &mut executor,
-                own,
-                host_ram,
-                Reported::new(cuda.total, ReportedBy::CudaTotalMemory),
-                ReportedBy::CudaTotalBeyondDedicated,
-                // What is left of these grants only the opened executor
-                // knows (`RuntimeStatus`).
-                |_| None,
-            ),
+        // Each kind's paths: on a device whose memory is the host's every
+        // kind is charged alike, along the host-class paths; on one whose
+        // memory is its own, along the path of the memory it lies in.
+        let (alike, own_paths) = match placement {
+            Ok(None) => {
+                let paths = host_class_paths(
+                    &mut executor,
+                    own,
+                    host_ram,
+                    Reported::new(cuda.total, ReportedBy::CudaTotalMemory),
+                    ReportedBy::CudaTotalBeyondDedicated,
+                    // What is left of these grants only the opened executor
+                    // knows (`RuntimeStatus`).
+                    |_| None,
+                );
+                (Some(paths), None)
+            }
             Ok(Some(usable)) => {
                 let device = executor.granted(
                     own.expect("a CUDA device whose memory is its own has a store")
@@ -462,14 +489,27 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                     Reported::new(usable, ReportedBy::CudaUsableMemory),
                     // What is left of it only the opened executor knows.
                     None,
-                    AccessRoute::Device,
                 );
-                let pinned = executor.ungranted(host_ram, AccessRoute::Upload);
-                executor.place(StorageKind::Device, &[device]);
-                executor.place(StorageKind::Upload, &[pinned]);
+                (None, Some((device, executor.ungranted(host_ram))))
             }
-            Err(_) => {}
-        }
+            Err(_) => continue,
+        };
+        place_kinds(
+            &mut executor,
+            &cuda.kinds,
+            memory == DeviceMemory::Host,
+            |executor, kind| {
+                let along = match (&alike, own_paths, kind.memory) {
+                    (Some(paths), _, _) => paths.clone(),
+                    (None, Some((device, _)), KindMemory::DeviceMemory) => vec![device],
+                    (None, Some((_, host)), KindMemory::HostRam) => vec![host],
+                    (None, _, memory) => unreachable!(
+                        "a CUDA kind lies in its device's memory or host RAM, not {memory:?}"
+                    ),
+                };
+                executor.kind(kind, &along)
+            },
+        );
     }
 
     for vulkan in &reports.vulkan {
@@ -501,45 +541,18 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
             },
             tensor_operations: false,
         });
-        match placement {
-            // A device whose memory is its own: one access path per heap the
-            // backend allocates from, a device-local heap's to its own
-            // memory granted the heap's size, another heap's to host RAM,
-            // ungranted.
-            Ok(Decided::Own) => {
-                let mut paths: HashMap<usize, OwnPath> = HashMap::new();
-                for kind in StorageKind::ALL {
-                    let placement = heaps.allocates[kind as usize]
-                        .iter()
-                        .map(|&heap| {
-                            *paths.entry(heap).or_insert_with(|| {
-                                let route = AccessRoute::VulkanHeap(heap as u32);
-                                if !heaps.heaps[heap].device_local {
-                                    return executor.ungranted(host_ram, route);
-                                }
-                                executor.granted(
-                                    own.expect("a device-local heap is its own memory").0,
-                                    Reported::new(heaps.heaps[heap].bytes, ReportedBy::VulkanHeap),
-                                    Some(GrantSource::VulkanHeaps {
-                                        uuid: vulkan.uuid,
-                                        heaps: vec![heap],
-                                        before: 0,
-                                    }),
-                                    route,
-                                )
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    executor.place(kind, &placement);
-                }
-            }
-            // A device whose memory is the host's: its heaps together state
-            // one total, split across heaps only as a presentation (§4); the
-            // heaps' live budget is attributed along the placement.
+        // A device whose memory is the host's: its heaps together state one
+        // total, split across heaps only as a presentation; the heaps'
+        // live budget is attributed along the placement, which every kind is
+        // charged along. A device whose memory is its own: one access path
+        // per device-local heap its kinds lie on, to its own memory, granted
+        // the heap's size; one to host RAM, ungranted, for every kind on
+        // another heap and for imported host pages.
+        let alike = match placement {
             Ok(Decided::Host) => {
                 let total = heaps.heaps.iter().map(|heap| heap.bytes).sum::<u64>();
                 let all = (0..heaps.heaps.len()).collect::<Vec<_>>();
-                place_host_class(
+                Some(host_class_paths(
                     &mut executor,
                     own,
                     host_ram,
@@ -552,10 +565,42 @@ pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                             before,
                         })
                     },
-                );
+                ))
             }
-            Err(_) => {}
-        }
+            Ok(Decided::Own) => None,
+            Err(_) => continue,
+        };
+        let mut local: HashMap<usize, OwnPath> = HashMap::new();
+        place_kinds(
+            &mut executor,
+            &vulkan.kinds,
+            memory == DeviceMemory::Host,
+            |executor, kind| {
+                let along = match (&alike, kind.memory) {
+                    (Some(paths), _) => paths.clone(),
+                    (None, KindMemory::Heap { index, device_local: true, bytes }) => {
+                        vec![*local.entry(index).or_insert_with(|| {
+                            executor.granted(
+                                own.expect("a device-local heap is its own memory").0,
+                                Reported::new(bytes, ReportedBy::VulkanHeap),
+                                Some(GrantSource::VulkanHeaps {
+                                    uuid: vulkan.uuid,
+                                    heaps: vec![index],
+                                    before: 0,
+                                }),
+                            )
+                        })]
+                    }
+                    (None, KindMemory::Heap { device_local: false, .. } | KindMemory::HostRam) => {
+                        vec![executor.ungranted(host_ram)]
+                    }
+                    (None, KindMemory::DeviceMemory) => {
+                        unreachable!("a Vulkan kind lies on a heap or in host RAM")
+                    }
+                };
+                executor.kind(kind, &along)
+            },
+        );
     }
 
     // Transfer paths: each executor's copies between host RAM and the other
@@ -639,33 +684,67 @@ fn own_memory(builder: &Builder, physical: PhysicalDeviceId) -> Option<(StoreId,
     Some((store, capacity))
 }
 
-fn place_all(executor: &mut ExecutorBuilder<'_>, paths: &[OwnPath]) {
-    for kind in StorageKind::ALL {
-        executor.place(kind, paths);
+/// The kind of `id` among a backend's `kinds`.
+fn reported_kind(kinds: &[KindReport], id: u32) -> &KindReport {
+    kinds
+        .iter()
+        .find(|kind| kind.id == id)
+        .expect("the rule places only kinds a backend reports")
+}
+
+/// Apply the placement rule to a backend's `kinds`: every contract and shape
+/// is placed, and every kind placed anywhere joins the executor by `add`, in
+/// the order the placements name them, which is the order their paths are
+/// made in.
+fn place_kinds(
+    executor: &mut ExecutorBuilder<'_>,
+    kinds: &[KindReport],
+    memory_is_host: bool,
+    mut add: impl FnMut(&mut ExecutorBuilder<'_>, &KindReport) -> OwnKind,
+) {
+    let mut added: Vec<(u32, OwnKind)> = Vec::new();
+    for placing in Placing::ALL {
+        let mut placed = Vec::new();
+        for id in place(kinds, memory_is_host, placing) {
+            let own = match added.iter().find(|(kind, _)| *kind == id) {
+                Some((_, own)) => *own,
+                None => {
+                    let own = add(executor, reported_kind(kinds, id));
+                    added.push((id, own));
+                    own
+                }
+            };
+            placed.push(own);
+        }
+        executor.place(placing, &placed);
+        if let Placing::Reserved(contract) = placing {
+            executor.reserves(contract, reserving(kinds, memory_is_host, contract));
+        }
     }
 }
 
-/// Place both kinds of storage of an executor of a device whose memory is
-/// the host's: on its own memory `own` (the store of the dedicated memory
-/// the OS reports for its adapter, and that memory's size), where it has
-/// some, under the lesser of it and the executor's `total`, then on host
-/// RAM under what `total` leaves beyond it (`beyond`). `status` names each
-/// path's live grant source from the bytes placed ahead of it.
-fn place_host_class(
+/// The access paths of an executor of a device whose memory is the host's,
+/// which every kind of it is charged along: its own memory `own` (the store
+/// of the dedicated memory the OS reports for its adapter, and that
+/// memory's size), where it has some, under the lesser of it and the
+/// executor's `total`, then host RAM under what `total` leaves beyond it
+/// (`beyond`). `status` names each path's live grant source from the bytes
+/// placed ahead of it.
+fn host_class_paths(
     executor: &mut ExecutorBuilder<'_>,
     own: Option<(StoreId, Reported<u64>)>,
     host_ram: StoreId,
     total: Reported<u64>,
     beyond: ReportedBy,
     status: impl Fn(u64) -> Option<GrantSource>,
-) {
-    let mut placement = Vec::new();
+) -> Vec<OwnPath> {
+    let mut paths = Vec::new();
     let mut before = 0;
     let mut grant =
         |executor: &mut ExecutorBuilder<'_>, store: StoreId, reported: Reported<u64>| {
-            let path = executor.granted(store, reported, status(before), AccessRoute::Device);
+            let path = executor.granted(store, reported, status(before));
             before += reported.value;
-            placement.push(path);
+            paths.push(path);
         };
     match own {
         Some((store, dedicated)) => {
@@ -688,7 +767,7 @@ fn place_host_class(
         }
         None => grant(executor, host_ram, total),
     }
-    place_all(executor, &placement);
+    paths
 }
 
 /// The dedicated memory the OS reports for the adapter of `luid`, when it

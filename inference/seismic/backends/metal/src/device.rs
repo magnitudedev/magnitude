@@ -13,7 +13,9 @@ use objc2_metal::{
 };
 use seismic_compiler::errors::{ExecutionError, TargetError};
 use seismic_compiler::executable::DeviceService;
+use seismic_lang::registry::{chunk_entries, record_table_bytes, record_table_entry, RECORD_TABLE_ENTRY_BYTES};
 use std::fmt;
+use seismic_reservation::{Backing, HostRange, PageSize, Reserved, Resizer};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -79,6 +81,10 @@ impl DeviceHandle {
 
     /// `MTLDevice.currentAllocatedSize`: bytes of resources this process has
     /// allocated on the device, including resources Seismic does not own.
+    /// Each buffer counts its whole length (a reservation's chunks each
+    /// once); the device holds the working set to that count (its command
+    /// buffers fail with out-of-memory beyond the recommended working set,
+    /// M4 Pro, 2026-10-27).
     pub fn current_allocated_bytes(&self) -> u64 {
         self.device.currentAllocatedSize() as u64
     }
@@ -150,11 +156,22 @@ impl Residency {
         self.wired.lock().expect("Metal residency lock poisoned")
     }
 
-    fn add(self: &Arc<Self>, buffer: &ProtocolObject<dyn MTLBuffer>) {
+    /// Add `buffers` to the set and wire them now, on the calling thread, in
+    /// one commit. A buffer the set only holds is wired by the first GPU
+    /// work that binds it, on the thread submitting that work (a 20 GiB
+    /// buffer: +142 ms before its first read, M4 Pro, 2026-10-25), which a
+    /// reservation's resize prepares away from.
+    fn add(self: &Arc<Self>, buffers: &[Retained<ProtocolObject<dyn MTLBuffer>>]) {
+        if buffers.is_empty() {
+            return;
+        }
         let mut wired = self.lock();
         crate::pooled(|| {
-            wired.set.addAllocation(ProtocolObject::from_ref(buffer));
+            for buffer in buffers {
+                wired.set.addAllocation(ProtocolObject::from_ref(&**buffer));
+            }
             wired.set.commit();
+            wired.set.requestResidency();
         });
         if wired.renewer.is_none() {
             let residency = self.clone();
@@ -167,11 +184,17 @@ impl Residency {
         }
     }
 
-    fn remove(&self, buffer: &ProtocolObject<dyn MTLBuffer>) {
+    /// Remove `buffers` from the set in one commit.
+    fn remove(&self, buffers: &[Retained<ProtocolObject<dyn MTLBuffer>>]) {
+        if buffers.is_empty() {
+            return;
+        }
         let renewer = {
             let mut wired = self.lock();
             crate::pooled(|| {
-                wired.set.removeAllocation(ProtocolObject::from_ref(buffer));
+                for buffer in buffers {
+                    wired.set.removeAllocation(ProtocolObject::from_ref(&**buffer));
+                }
                 wired.set.commit();
             });
             if wired.set.allocationCount() > 0 {
@@ -203,56 +226,102 @@ impl Residency {
     }
 }
 
-/// A buffer's membership of its device's residency set. The buffer is wired
-/// from the commit that adds it until its last handle is dropped, so the
-/// kernel never compresses or swaps it while macOS honors the set's renewed
-/// residency.
-struct WiredAllocation {
+/// Buffers' membership of their device's residency set. Each is wired from
+/// the commit that adds it until it leaves (dropped, or split off and that
+/// part dropped), so the kernel never compresses or swaps it while macOS
+/// honors the set's renewed residency.
+pub struct WiredAllocation {
     residency: Arc<Residency>,
-    buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    buffers: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
 }
 
 unsafe impl Send for WiredAllocation {}
 unsafe impl Sync for WiredAllocation {}
 
 impl WiredAllocation {
-    fn wire(residency: &Arc<Residency>, buffer: &Retained<ProtocolObject<dyn MTLBuffer>>) -> Self {
-        residency.add(buffer);
+    fn wire(
+        residency: &Arc<Residency>,
+        buffers: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    ) -> Self {
+        residency.add(&buffers);
         Self {
             residency: residency.clone(),
-            buffer: buffer.clone(),
+            buffers,
+        }
+    }
+
+    /// Join `other`'s buffers, which stay wired.
+    fn append(&mut self, mut other: Self) {
+        self.buffers.append(&mut other.buffers);
+    }
+
+    /// The buffers from `at` on, which stay wired until it is dropped.
+    fn split_off(&mut self, at: usize) -> Self {
+        Self {
+            residency: self.residency.clone(),
+            buffers: self.buffers.split_off(at),
         }
     }
 }
 
 impl Drop for WiredAllocation {
     fn drop(&mut self) {
-        self.residency.remove(&self.buffer);
+        self.residency.remove(&self.buffers);
     }
 }
 
-/// One shared-storage Metal buffer.
+/// One shared-storage Metal buffer of fixed length: allocated by Metal
+/// (wired), or wrapping a read-only host mapping. Device work binds it
+/// ([`MetalBuffer::raw`]) and the host reads it; the host writes only a
+/// [`WritableMetalBuffer`], the form of a buffer Metal allocated.
 #[derive(Clone)]
 pub struct MetalBuffer {
     buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     len: u64,
     _host_owner: Option<Arc<dyn Any + Send + Sync>>,
-    /// Absent for a read-only host mapping, whose pages stay file-backed.
+    /// Absent for a read-only host mapping, whose pages stay file-backed
+    /// and outside the residency set: resident only where it is bound, so
+    /// no record table addresses it.
     _wired: Option<Arc<WiredAllocation>>,
-    read_only: bool,
+}
+
+/// A [`MetalBuffer`] Metal allocated, which the host also writes.
+#[derive(Clone)]
+pub struct WritableMetalBuffer(MetalBuffer);
+
+impl WritableMetalBuffer {
+    pub(crate) fn write_bytes(&self, offset: u64, bytes: &[u8]) {
+        // Shared storage Metal allocated: host-writable for its lifetime.
+        unsafe { self.0.write_device_bytes(offset, bytes) }
+    }
+}
+
+impl std::ops::Deref for WritableMetalBuffer {
+    type Target = MetalBuffer;
+    fn deref(&self) -> &MetalBuffer {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<MetalBuffer> for WritableMetalBuffer {
+    fn borrow(&self) -> &MetalBuffer {
+        &self.0
+    }
 }
 
 unsafe impl Send for MetalBuffer {}
 unsafe impl Sync for MetalBuffer {}
 
 impl MetalBuffer {
+    /// The Metal buffer device work binds.
     pub(crate) fn raw(&self) -> &ProtocolObject<dyn MTLBuffer> {
         &self.buffer
     }
 
-    /// GPU virtual address used by slab address tables on macOS 15 and later.
-    pub fn gpu_address(&self) -> u64 {
-        self.buffer.gpuAddress()
+    /// The GPU virtual address of byte `offset`, held by slab and record
+    /// tables (macOS 15 and later).
+    pub fn gpu_address(&self, offset: u64) -> u64 {
+        self.buffer.gpuAddress() + offset
     }
 
     pub fn len(&self) -> u64 {
@@ -260,43 +329,370 @@ impl MetalBuffer {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
     }
 
-    /// Host view of `[offset, offset + len)`. Precondition (FFI wrapper,
-    /// §13.3.3): the range lies inside the buffer.
-    fn host_range(&self, offset: u64, len: usize) -> *mut u8 {
-        let end = offset
-            .checked_add(len as u64)
-            .filter(|end| *end <= self.len);
-        assert!(
-            end.is_some(),
-            "MetalBuffer host access [{offset}, +{len}) exceeds the {}-byte buffer",
-            self.len
-        );
-        // Shared storage mode: `contents()` is host-visible for the buffer's
-        // whole lifetime.
-        unsafe {
-            self.buffer
-                .contents()
-                .as_ptr()
-                .cast::<u8>()
-                .add(offset as usize)
-        }
+    /// The host address of byte 0: shared storage mode's `contents()`,
+    /// host-visible for the buffer's whole lifetime.
+    fn host_base(&self) -> *mut u8 {
+        self.buffer.contents().as_ptr().cast::<u8>()
     }
 
-    pub(crate) fn write_bytes(&self, offset: u64, bytes: &[u8]) {
-        assert!(
-            !self.read_only,
-            "cannot write to a read-only mapped Metal buffer"
-        );
-        let destination = self.host_range(offset, bytes.len());
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len()) };
+    /// Write `bytes` at `offset` as device work does: the bound executor's
+    /// own inputs, under the schedule's access plan.
+    ///
+    /// # Safety
+    /// The schedule plans these bytes as written by this work, so the
+    /// buffer is one Metal allocated, never a read-only host mapping.
+    pub(crate) unsafe fn write_device_bytes(&self, offset: u64, bytes: &[u8]) {
+        unsafe { host_write(self.host_base(), self.len, offset, bytes) }
     }
 
     pub(crate) fn read_bytes(&self, offset: u64, into: &mut [u8]) {
-        let source = self.host_range(offset, into.len());
-        unsafe { std::ptr::copy_nonoverlapping(source, into.as_mut_ptr(), into.len()) };
+        unsafe { host_read(self.host_base(), self.len, offset, into) }
+    }
+}
+
+/// The committed prefix of a host address reservation, resized in place
+/// ([`MetalResizer::prepare`]): chunks, each its own Metal buffer, which
+/// device work reaches only through the reservation's record table (a
+/// [`MetalBuffer`]), never bound. The host addresses the range in place.
+#[derive(Clone)]
+pub struct ReservedBuffer {
+    reservation: Arc<Reservation>,
+}
+
+impl ReservedBuffer {
+    /// Committed bytes.
+    pub fn len(&self) -> u64 {
+        self.reservation.state().bytes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The host address of byte 0: the range's base, which never moves.
+    pub fn host_base(&self) -> NonNull<u8> {
+        self.reservation.backing().range.base()
+    }
+
+    /// The record table device work reaches the records through, which the
+    /// reservation formed with it and keeps as its chunks change.
+    pub fn table(&self) -> WritableMetalBuffer {
+        self.reservation.backing().table.clone()
+    }
+
+    /// The GPU virtual address of byte `offset`, in the chunk holding it,
+    /// which must be backed; its address is fixed while it is.
+    pub fn gpu_address(&self, offset: u64) -> u64 {
+        let granule = self.reservation.backing().range.granule() as u64;
+        let chunk = &self.reservation.state().view.buffers[(offset / granule) as usize];
+        chunk.gpuAddress() + offset % granule
+    }
+
+    /// Write `bytes` at `offset` of the committed bytes.
+    pub fn write_bytes(&self, offset: u64, bytes: &[u8]) {
+        unsafe { host_write(self.host_base().as_ptr(), self.len(), offset, bytes) }
+    }
+
+    /// Read committed bytes from `offset` into `into`.
+    pub fn read_bytes(&self, offset: u64, into: &mut [u8]) {
+        unsafe { host_read(self.host_base().as_ptr(), self.len(), offset, into) }
+    }
+}
+
+/// The host address of `[offset, offset + len)` of `length` bytes at
+/// `base`. Precondition (FFI wrapper): the range lies inside them.
+fn host_range(base: *mut u8, length: u64, offset: u64, len: usize) -> *mut u8 {
+    let end = offset.checked_add(len as u64).filter(|end| *end <= length);
+    assert!(
+        end.is_some(),
+        "Metal host access [{offset}, +{len}) exceeds the {length}-byte buffer"
+    );
+    unsafe { base.add(offset as usize) }
+}
+
+/// # Safety
+/// `base` addresses `length` writable host bytes.
+unsafe fn host_write(base: *mut u8, length: u64, offset: u64, bytes: &[u8]) {
+    let destination = host_range(base, length, offset, bytes.len());
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len()) };
+}
+
+/// # Safety
+/// `base` addresses `length` readable host bytes.
+unsafe fn host_read(base: *mut u8, length: u64, offset: u64, into: &mut [u8]) {
+    let source = host_range(base, length, offset, into.len());
+    unsafe { std::ptr::copy_nonoverlapping(source, into.as_mut_ptr(), into.len()) };
+}
+
+/// The least chunk in which a reservation backs its committed bytes. Each
+/// chunk is its own VM object (a named memory entry), so releasing one frees
+/// its pages at once: a VM object shared by kept and released bytes would
+/// keep the released pages while Metal still references the object.
+///
+/// A chunk costs a fixed ~4.9 us to form (its memory entry and mapping, its
+/// no-copy buffer and table entries; the residency set's commit is under
+/// 0.1 us of it) beside ~34 us per MiB to back its bytes, so the granule is
+/// the least power-of-two chunk whose fixed cost is at most 10% of its
+/// bytes': 2 MiB (7%; 1 MiB would be 14%). Backing 1 GiB at once
+/// (`reservation_chunk_cost`, M4 Pro):
+/// 355 ms in 16 KiB chunks, 54 ms in 256 KiB, 40 ms in 1 MiB,
+/// 37.6 ms in 2 MiB, 35.4 ms in 32 MiB; a growth by one chunk, 5.8 us at
+/// 16 KiB and 66 us at 2 MiB. GPU reads through the record table took
+/// 4.4-5.7 ms a GiB at every chunk size, so the chunk count costs device
+/// work nothing.
+pub const RESERVATION_GRANULE: usize = 2 << 20;
+
+/// Whether the host addresses a reservation's backed bytes in place: its
+/// buffer wraps the host range without copying (`newBufferWithBytesNoCopy`).
+pub const RESERVATIONS_HOST_ADDRESSED: bool = true;
+
+/// What device work reaches a reservation's backed bytes through chunks of:
+/// each chunk is its own buffer (a buffer GPU work touches is wired whole,
+/// so one buffer over the range would hold every page a release frees; M4
+/// Pro, macOS 15.7, 2026-10-27) of whole [`CHUNK_UNIT`]s.
+pub const RESERVATION_CHUNKS: Option<u64> = Some(CHUNK_UNIT);
+
+/// 16 KiB, the largest macOS page: every chunk's no-copy buffer starts and
+/// ends on a host page.
+const CHUNK_UNIT: u64 = 16 << 10;
+
+/// Metal's backing of a host reservation (`seismic_reservation`):
+/// granules of anonymous memory, each its own VM object and its own Metal
+/// buffer (a chunk), and the reservation's record table.
+///
+/// GPU work that touches a buffer wires all of it, so one buffer over the
+/// range would hold every page a shrink frees. Each chunk is wrapped once
+/// when it is backed (`newBufferWithBytesNoCopy`) and joins the residency
+/// set, so only committed chunks are wired; device work reaches records
+/// through the table, entry `r` the device address of record `r` in its
+/// chunk (no record crosses one). A growth forms only its new chunks; a
+/// shrink retires its tail chunks, dropped (leaving the set) by its release
+/// before their granules are unmapped, so device work never reads a page
+/// remapped under a live buffer.
+pub struct Granules {
+    /// The host address range the granules are of.
+    range: HostRange,
+    device: DeviceHandle,
+    residency: Arc<Residency>,
+    /// The record table, whose entries for a chunk's records are written as
+    /// it is formed: entries of released chunks are never read.
+    table: WritableMetalBuffer,
+    /// Bytes of one record, a divisor of the granule.
+    record: usize,
+}
+
+unsafe impl Send for Granules {}
+unsafe impl Sync for Granules {}
+
+/// A change of a reservation's chunks: the new chunks of a growth, or the
+/// chunks a shrink keeps.
+pub enum ChunkChange {
+    Grow(WiredAllocation),
+    Shrink(usize),
+}
+
+type Reservation = Reserved<Granules>;
+pub type MetalResizer = Resizer<Granules>;
+
+impl Granules {
+    /// The chunk buffers over granules `[from, to)` of `range`, wired, with
+    /// their records' table entries written.
+    fn form(&self, range: &HostRange, from: usize, to: usize) -> Result<WiredAllocation, ExecutionError> {
+        let granule = range.granule();
+        let buffers = (from..to)
+            .map(|index| {
+                crate::pooled(|| unsafe {
+                    self.device
+                        .raw()
+                        .newBufferWithBytesNoCopy_length_options_deallocator(
+                            NonNull::new_unchecked(range.at(index)).cast(),
+                            granule,
+                            MTLResourceOptions::StorageModeShared,
+                            None,
+                        )
+                })
+                // As for an allocated buffer, Metal states no reason for a
+                // buffer it does not create: the device's memory refused it.
+                .ok_or(ExecutionError::AllocationCapacity {
+                    required: (granule as u64).into(),
+                    available: 0,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let records = self.table.len() / RECORD_TABLE_ENTRY_BYTES;
+        for (index, buffer) in (from as u64..to as u64).zip(&buffers) {
+            let (first, entries) = chunk_entries(index, granule as u64, self.record as u64, records, buffer.gpuAddress());
+            self.table.write_bytes(record_table_entry(first), &entries);
+        }
+        Ok(WiredAllocation::wire(&self.residency, buffers))
+    }
+}
+
+impl Backing for Granules {
+    type Error = ExecutionError;
+    /// The chunks over the backed granules, in order.
+    type View = WiredAllocation;
+    type Change = ChunkChange;
+    /// The chunks a shrink released.
+    type Retired = Option<WiredAllocation>;
+
+    fn granule(&self) -> usize {
+        self.range.granule()
+    }
+
+    fn granules(&self) -> usize {
+        self.range.granules()
+    }
+
+    /// Map fresh zero granules `[from, to)`. On failure nothing new stays
+    /// mapped.
+    fn back(&self, from: usize, to: usize) -> Result<(), ExecutionError> {
+        let range = &self.range;
+        for index in from..to {
+            if let Err(error) = unsafe { host::map_granule(range.at(index), range.granule(), range.page()) } {
+                range.unback(from, index);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn unback(&self, from: usize, to: usize) {
+        self.range.unback(from, to);
+    }
+
+    fn zero(&self, bytes: std::ops::Range<u64>) -> Result<(), ExecutionError> {
+        self.range.zero(bytes);
+        Ok(())
+    }
+
+    /// The chunks over the first `granules` granules, wired.
+    fn view(&self, granules: usize) -> Result<WiredAllocation, ExecutionError> {
+        self.form(&self.range, 0, granules)
+    }
+
+    /// A growth forms its new chunks; a shrink keeps the leading ones.
+    fn change(&self, installed: usize, granules: usize) -> Result<ChunkChange, ExecutionError> {
+        match granules > installed {
+            true => self.form(&self.range, installed, granules).map(ChunkChange::Grow),
+            false => Ok(ChunkChange::Shrink(granules)),
+        }
+    }
+
+    fn apply(&self, view: &mut WiredAllocation, change: ChunkChange) -> Option<WiredAllocation> {
+        match change {
+            ChunkChange::Grow(chunks) => {
+                view.append(chunks);
+                None
+            }
+            ChunkChange::Shrink(granules) => Some(view.split_off(granules)),
+        }
+    }
+}
+
+/// Mach virtual memory for reservations' granules.
+mod host {
+    use seismic_compiler::errors::ExecutionError;
+
+    type KernReturn = libc::c_int;
+    type MachPort = libc::c_uint;
+    // <mach/memory_object_types.h>
+    const MAP_MEM_NAMED_CREATE: libc::c_int = 0x020000;
+    const VM_PROT_READ_WRITE: libc::c_int = 0x3;
+    const VM_INHERIT_NONE: libc::c_uint = 2;
+    // <mach/vm_statistics.h>
+    const VM_FLAGS_FIXED: libc::c_int = 0x0000;
+    const VM_FLAGS_OVERWRITE: libc::c_int = 0x4000;
+    unsafe extern "C" {
+        fn mach_make_memory_entry_64(
+            target_task: MachPort,
+            size: *mut u64,
+            offset: u64,
+            permission: libc::c_int,
+            object_handle: *mut MachPort,
+            parent_entry: MachPort,
+        ) -> KernReturn;
+        fn mach_vm_map(
+            target_task: MachPort,
+            address: *mut u64,
+            size: u64,
+            mask: u64,
+            flags: libc::c_int,
+            object: MachPort,
+            offset: u64,
+            copy: libc::c_int,
+            cur_protection: libc::c_int,
+            max_protection: libc::c_int,
+            inheritance: libc::c_uint,
+        ) -> KernReturn;
+        fn mach_port_deallocate(task: MachPort, name: MachPort) -> KernReturn;
+    }
+
+    fn task() -> MachPort {
+        #[allow(deprecated)]
+        unsafe {
+            libc::mach_task_self()
+        }
+    }
+
+    /// Map one fresh, zero-filled granule of its own VM object at `address`,
+    /// every `page`-byte host page of it backed: a committed granule is
+    /// charged, so it is held as an allocated buffer's bytes are, and device
+    /// work never takes a first-touch fault on it.
+    ///
+    /// # Safety
+    /// The range lies inside a reservation of the caller's.
+    pub(super) unsafe fn map_granule(address: *mut u8, bytes: usize, page: usize) -> Result<(), ExecutionError> {
+        let failed = |what: &str, code: KernReturn| {
+            ExecutionError::AllocationFailed(format!(
+                "{what} for a reserved granule failed ({code})"
+            ))
+        };
+        let mut size = bytes as u64;
+        let mut entry: MachPort = 0;
+        let code = unsafe {
+            mach_make_memory_entry_64(
+                task(),
+                &mut size,
+                0,
+                MAP_MEM_NAMED_CREATE | VM_PROT_READ_WRITE,
+                &mut entry,
+                0,
+            )
+        };
+        if code != 0 {
+            return Err(failed("mach_make_memory_entry_64", code));
+        }
+        let mut at = address as u64;
+        let code = unsafe {
+            mach_vm_map(
+                task(),
+                &mut at,
+                bytes as u64,
+                0,
+                VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                entry,
+                0,
+                0,
+                VM_PROT_READ_WRITE,
+                VM_PROT_READ_WRITE,
+                VM_INHERIT_NONE,
+            )
+        };
+        // The mapping holds the object; the entry's port is not needed.
+        unsafe { mach_port_deallocate(task(), entry) };
+        if code != 0 {
+            return Err(failed("mach_vm_map", code));
+        }
+        // A write to each page makes the kernel back it with a zero page;
+        // the granule's bytes stay zero.
+        for offset in (0..bytes).step_by(page) {
+            unsafe { std::ptr::write_volatile(address.add(offset), 0) };
+        }
+        Ok(())
     }
 }
 
@@ -308,6 +704,10 @@ pub struct MetalDevice {
     /// Every buffer this device allocates. The queue carries the set, so
     /// command buffers inherit it without per-buffer encodings.
     residency: Arc<Residency>,
+    /// A buffer every direct encoder declares it writes and no launch binds
+    /// (`direct::DirectBatch`): hazard tracking then orders each encoder on
+    /// the queue after the one before it.
+    order: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
 unsafe impl Send for MetalDevice {}
@@ -333,11 +733,23 @@ impl MetalDevice {
                 "could not create a Metal residency set: {error}"
             )))?;
         queue.addResidencySet(&residency);
+        // Metal rejects a zero-length buffer; nothing reads or writes it.
+        let order = handle
+            .raw()
+            .newBufferWithLength_options(1, MTLResourceOptions::StorageModePrivate)
+            .ok_or_else(|| {
+                TargetError::DeviceUnavailable("could not create the Metal order buffer".into())
+            })?;
         Ok(Self {
             handle,
             queue,
             residency: Residency::new(residency),
+            order,
         })
+    }
+
+    pub(crate) fn order(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        &self.order
     }
 
     pub fn handle(&self) -> &DeviceHandle {
@@ -351,7 +763,7 @@ impl MetalDevice {
     /// Allocates a wired shared buffer of `bytes`. Metal rejects a
     /// zero-length buffer, so a zero-byte allocation reserves one byte while
     /// reporting its requested length.
-    pub(crate) fn allocate_bytes(&self, bytes: u64) -> Result<MetalBuffer, ExecutionError> {
+    pub(crate) fn allocate_bytes(&self, bytes: u64) -> Result<WritableMetalBuffer, ExecutionError> {
         let length = usize::try_from(bytes.max(1)).map_err(|_| {
             ExecutionError::AllocationFailed(format!("{bytes} bytes exceed the host address space"))
         })?;
@@ -367,14 +779,56 @@ impl MetalDevice {
             required: bytes.into(),
             available: 0,
         })?;
-        let wired = WiredAllocation::wire(&self.residency, &buffer);
-        Ok(MetalBuffer {
+        let wired = WiredAllocation::wire(&self.residency, vec![buffer.clone()]);
+        Ok(WritableMetalBuffer(MetalBuffer {
             buffer,
             len: bytes,
             _host_owner: None,
             _wired: Some(Arc::new(wired)),
-            read_only: false,
-        })
+        }))
+    }
+
+    /// Zero-filled memory over a host address reservation of `reserved`
+    /// bytes of `record`-byte records in `granule`-byte granules (chunks of
+    /// whole records and whole [`RESERVATION_CHUNKS`] units, none smaller
+    /// than [`RESERVATION_GRANULE`]), the leading
+    /// `committed` bytes backed, and its resizer, which changes the backed
+    /// prefix without moving its host address. `table` holds one device
+    /// address per record of the range, written as chunks are formed. Each
+    /// chunk is a buffer: `maxBufferLength` bounds a chunk (the runtime
+    /// admits it), not the address range.
+    pub fn allocate_reserved(
+        &self,
+        committed: u64,
+        reserved: u64,
+        granule: u64,
+        record: u64,
+    ) -> Result<(ReservedBuffer, MetalResizer), ExecutionError> {
+        if granule < RESERVATION_GRANULE as u64
+            || granule % CHUNK_UNIT != 0
+            || record == 0
+            || granule % record != 0
+        {
+            return Err(ExecutionError::AllocationFailed(format!(
+                "a {granule}-byte granule of {record}-byte records is not whole {CHUNK_UNIT}-byte \
+                 units and whole records, at least {RESERVATION_GRANULE} bytes"
+            )));
+        }
+        // One device address a record of the range.
+        let table = self.allocate_bytes(record_table_bytes(reserved / record).ok_or_else(|| {
+            ExecutionError::AllocationFailed(format!("the record table of a {reserved}-byte reservation overflows"))
+        })?)?;
+        let backing = Granules {
+            range: HostRange::reserve(reserved.max(committed), granule, PageSize::Host).map_err(|failure| {
+                ExecutionError::AllocationFailed(format!("a Metal reservation's address range: {failure}"))
+            })?,
+            device: self.handle.clone(),
+            residency: self.residency.clone(),
+            table,
+            record: record as usize,
+        };
+        let (reservation, resizer) = Reserved::new(backing, committed)?;
+        Ok((ReservedBuffer { reservation }, resizer))
     }
 
     /// Wrap an immutable, page-aligned host mapping. The retained owner keeps
@@ -422,15 +876,15 @@ impl MetalDevice {
             len: length as u64,
             _host_owner: Some(owner),
             _wired: None,
-            read_only: true,
         })
     }
 }
 
 impl DeviceService<Metal> for MetalDevice {
     type Buffer = MetalBuffer;
+    type Writable = WritableMetalBuffer;
 
-    fn allocate(&self, bytes: u64, _alignment: u64) -> Result<Self::Buffer, ExecutionError> {
+    fn allocate(&self, bytes: u64, _alignment: u64) -> Result<Self::Writable, ExecutionError> {
         // The profile advertises the alignment returned by
         // `heapBufferSizeAndAlignWithLength:options:` for this same shared
         // buffer class; direct device buffers satisfy that requirement.
@@ -439,15 +893,10 @@ impl DeviceService<Metal> for MetalDevice {
 
     fn write(
         &self,
-        buffer: &Self::Buffer,
+        buffer: &Self::Writable,
         offset: u64,
         bytes: &[u8],
     ) -> Result<(), ExecutionError> {
-        if buffer.read_only {
-            return Err(ExecutionError::SubmissionFailed(
-                "write to a read-only mapped Metal buffer".into(),
-            ));
-        }
         buffer.write_bytes(offset, bytes);
         Ok(())
     }
@@ -463,7 +912,13 @@ impl DeviceService<Metal> for MetalDevice {
     }
 
     fn buffer_len(&self, buffer: &Self::Buffer) -> u64 {
-        buffer.len
+        buffer.len()
+    }
+
+    /// Every buffer: Metal storage is `MTLStorageModeShared`, whose
+    /// `contents()` the host addresses for the buffer's whole lifetime.
+    fn host_address(&self, buffer: &Self::Writable) -> Option<NonNull<u8>> {
+        NonNull::new(buffer.host_base())
     }
 }
 
@@ -524,7 +979,6 @@ mod mapped_tests {
         let mut byte = [0];
         buffer.read_bytes(0, &mut byte);
         assert_eq!(byte, [73]);
-        assert!(device.write(&buffer, 0, &[1]).is_err());
         // A host mapping stays file-backed: it never joins the residency set.
         assert_eq!(device.residency.lock().set.allocationCount(), 0);
         drop(buffer);
@@ -540,7 +994,7 @@ mod mapped_tests {
         let wired = |buffer: &MetalBuffer| {
             let set = &device.residency.lock().set;
             (
-                set.containsAllocation(ProtocolObject::from_ref(buffer.raw())),
+                set.containsAllocation(ProtocolObject::from_ref(&*buffer.raw())),
                 set.allocationCount(),
                 set.allocatedSize(),
             )
@@ -606,5 +1060,311 @@ mod mapped_tests {
             assert!(started.elapsed() < RESIDENCY_RENEWAL / 2);
         }
         assert_eq!(device.residency.lock().generation, 20);
+    }
+}
+
+#[cfg(test)]
+mod reserved_tests {
+    use super::*;
+    use objc2_metal::{
+        MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder, MTLComputePipelineState,
+        MTLLibrary, MTLSize,
+    };
+
+    const MIB: u64 = 1 << 20;
+
+    /// The process's `phys_footprint`, the memory macOS charges the process
+    /// with.
+    fn footprint() -> u64 {
+        let mut usage = unsafe { std::mem::zeroed::<libc::rusage_info_v2>() };
+        let status = unsafe {
+            libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V2,
+                (&raw mut usage).cast(),
+            )
+        };
+        assert_eq!(status, 0);
+        usage.ri_phys_footprint
+    }
+
+    /// Reads `bytes` of a buffer as `uint4` words on the GPU: their wrapping
+    /// sum, and the GPU time of the read.
+    struct Reader {
+        pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        output: WritableMetalBuffer,
+    }
+
+    impl Reader {
+        fn new(device: &MetalDevice) -> Self {
+            let source = objc2_foundation::NSString::from_str(
+                "#include <metal_stdlib>\nusing namespace metal;\n\
+                 kernel void total(device const ulong* table [[buffer(0)]],\n\
+                                   device atomic_uint* output [[buffer(1)]],\n\
+                                   constant uint2& shape [[buffer(2)]],\n\
+                                   uint index [[thread_position_in_grid]],\n\
+                                   uint threads [[threads_per_grid]]) {\n\
+                     uint4 sum = 0;\n\
+                     for (uint word = index; word < shape.x; word += threads)\n\
+                         sum += ((device const uint4*)table[word / shape.y])[word % shape.y];\n\
+                     atomic_fetch_add_explicit(output, sum.x + sum.y + sum.z + sum.w, memory_order_relaxed);\n\
+                 }",
+            );
+            let library = device
+                .handle()
+                .raw()
+                .newLibraryWithSource_options_error(&source, None)
+                .unwrap();
+            let function = library
+                .newFunctionWithName(&objc2_foundation::NSString::from_str("total"))
+                .unwrap();
+            let pipeline = device
+                .handle()
+                .raw()
+                .newComputePipelineStateWithFunction_error(&function)
+                .unwrap();
+            Self {
+                pipeline,
+                output: device.allocate_bytes(4).unwrap(),
+            }
+        }
+
+        /// The first `bytes` of the `GRANULE`-byte records `table` addresses.
+        fn total(&self, device: &MetalDevice, table: &MetalBuffer, bytes: u64) -> (u32, f64) {
+            self.total_of(device, table, bytes, GRANULE)
+        }
+
+        /// The first `bytes` of the `record`-byte records `table` addresses.
+        fn total_of(&self, device: &MetalDevice, table: &MetalBuffer, bytes: u64, record: u64) -> (u32, f64) {
+            self.output.write_bytes(0, &[0; 4]);
+            let shape = [u32::try_from(bytes / 16).unwrap(), (record / 16) as u32];
+            let command = device.queue().commandBuffer().unwrap();
+            let encoder = command.computeCommandEncoder().unwrap();
+            encoder.setComputePipelineState(&self.pipeline);
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(table.raw()), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(self.output.raw()), 0, 1);
+                encoder.setBytes_length_atIndex(NonNull::from(&shape).cast(), 8, 2);
+            }
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: 1 << 18,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.endEncoding();
+            let time = crate::timing::SubmissionTime::before_commit();
+            command.commit();
+            command.waitUntilCompleted();
+            assert!(command.error().is_none(), "{:?}", command.error());
+            let mut total = [0; 4];
+            self.output.read_bytes(0, &mut total);
+            let (start, end) = time.interval(command.GPUStartTime(), command.GPUEndTime()).unwrap();
+            (u32::from_le_bytes(total), end - start)
+        }
+    }
+
+    const GRANULE: u64 = RESERVATION_GRANULE as u64;
+
+    /// A resize to `bytes`, prepared.
+    fn prepare(resizer: MetalResizer, bytes: u64) -> seismic_reservation::Prepared<Granules> {
+        resizer.prepare(bytes).map_err(|(_, error)| error).unwrap()
+    }
+
+    /// One resize to `bytes`: prepared, installed, released.
+    fn resize(resizer: MetalResizer, bytes: u64) -> MetalResizer {
+        prepare(resizer, bytes).install().release()
+    }
+
+    fn pattern(bytes: u64) -> Vec<u8> {
+        (0..bytes).map(|index| (index % 251) as u8 + 1).collect()
+    }
+
+    /// The wrapping sum of `bytes` as little-endian `u32` words.
+    fn word_total(bytes: &[u8]) -> u32 {
+        bytes.chunks_exact(4).fold(0u32, |sum, word| {
+            sum.wrapping_add(u32::from_le_bytes(word.try_into().unwrap()))
+        })
+    }
+
+    /// A reserved buffer resizes in place after GPU use: its host address
+    /// and handles stay valid, kernels read the committed bytes through its
+    /// record table correctly after a shrink and a grow, only committed
+    /// chunks are wired, a shrink returns its pages to the system at once,
+    /// and kept chunks keep their buffers.
+    #[test]
+    fn a_reserved_buffer_resizes_in_place_and_releases_what_it_shrinks() {
+        let device = crate::test_support::metal_device();
+        let reader = Reader::new(&device);
+        // Chunk bytes the residency set wires beyond what was wired before,
+        // the reservation's record table aside.
+        let others = device.residency.lock().set.allocatedSize() as u64;
+        let (buffer, resizer) = device
+            .allocate_reserved(256 * MIB, 4096 * MIB, GRANULE, GRANULE)
+            .unwrap();
+        let table = buffer.table();
+        let wired = || device.residency.lock().set.allocatedSize() as u64 - others - table.len();
+        let handle = buffer.clone();
+        let address = buffer.host_base();
+        let first = buffer.gpu_address(0);
+        assert_eq!(wired(), 256 * MIB, "only committed chunks are wired");
+        let contents = pattern(256 * MIB);
+        buffer.write_bytes(0, &contents);
+        assert_eq!(
+            reader.total(&device, &table, 256 * MIB).0,
+            word_total(&contents)
+        );
+
+        let kept = 64 * MIB + 3;
+        let before = footprint();
+        let started = std::time::Instant::now();
+        let resizer = resize(resizer, kept);
+        let shrink = started.elapsed();
+        let released = before.saturating_sub(footprint());
+        eprintln!(
+            "a 192 MiB shrink after GPU use took {shrink:?} and lowered phys_footprint by {released} bytes"
+        );
+        assert!(
+            released.abs_diff(192 * MIB) <= 4 * MIB,
+            "a 192 MiB shrink released {released} bytes"
+        );
+        assert_eq!(handle.len(), kept);
+        assert_eq!(handle.host_base(), address);
+        assert_eq!(wired(), 66 * MIB);
+        assert_eq!(handle.gpu_address(0), first, "a kept chunk keeps its buffer");
+        let mut read = vec![0; kept as usize];
+        handle.read_bytes(0, &mut read);
+        assert!(
+            read == contents[..kept as usize],
+            "kept bytes survive a shrink"
+        );
+        let words = 64 * MIB;
+        assert_eq!(
+            reader.total(&device, &table, words).0,
+            word_total(&contents[..words as usize])
+        );
+
+        let mut grown = vec![1; (128 * MIB) as usize];
+        let before = footprint();
+        let resizer = resize(resizer, 128 * MIB);
+        assert_eq!(buffer.host_base(), address);
+        assert_eq!(wired(), 128 * MIB);
+        buffer.read_bytes(0, &mut grown);
+        let grown_by = footprint().saturating_sub(before);
+        assert!(grown[..kept as usize] == contents[..kept as usize]);
+        assert!(
+            grown[kept as usize..].iter().all(|byte| *byte == 0),
+            "bytes backed again read zero"
+        );
+        eprintln!("a 62 MiB growth raised phys_footprint by {grown_by} bytes once read");
+        assert_eq!(
+            reader.total(&device, &table, 128 * MIB).0,
+            word_total(&grown)
+        );
+        drop((buffer, handle, resizer));
+        assert_eq!(wired(), 0);
+        drop(table);
+    }
+
+    /// What a reservation's chunk costs against its size
+    /// ([`RESERVATION_GRANULE`]): for each chunk size, 1 GiB of chunk-sized
+    /// records backed whole at once as a load forms it (`Reserved::new`),
+    /// then GPU reads of it through its record table, and its unload; the
+    /// load's parts by hand (mapping the granules, forming their buffers and
+    /// table entries, the residency set's commit of them); and growths by
+    /// one chunk through the resizer. Without the validation layer the
+    /// other tests enable. Run on a quiet host:
+    /// `cargo test -p seismic-metal --release --lib reservation_chunk_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement"]
+    fn reservation_chunk_cost() {
+        use std::time::Instant;
+        const TOTAL: u64 = 1 << 30;
+        const KIB: u64 = 1 << 10;
+        let device = MetalDevice::open(DeviceHandle::system_default().unwrap()).unwrap();
+        let reader = Reader::new(&device);
+        let ms = |started: Instant| started.elapsed().as_secs_f64() * 1e3;
+        let granules = |chunk: u64| Granules {
+            range: HostRange::reserve(TOTAL, chunk, PageSize::Host).unwrap(),
+            device: device.handle.clone(),
+            residency: device.residency.clone(),
+            table: device.allocate_bytes(record_table_bytes(TOTAL / chunk).unwrap()).unwrap(),
+            record: chunk as usize,
+        };
+        eprintln!(
+            "{:>9} {:>7} | {:>9} {:>9} | {:>8} {:>8} {:>8} {:>8} | {:>8} {:>8} | {:>8} | {:>9}",
+            "chunk", "chunks", "load ms", "us/chunk", "map ms", "buffers", "add ms", "remove", "read1 ms",
+            "read2 ms", "unload", "grow us"
+        );
+        for chunk in [16 * KIB, 64 * KIB, 256 * KIB, MIB, 2 * MIB, 4 * MIB, 8 * MIB, 32 * MIB] {
+            let chunks = (TOTAL / chunk) as usize;
+
+            // A load: the whole commitment backed and formed at once.
+            let started = Instant::now();
+            let (reservation, resizer) = Reserved::new(granules(chunk), TOTAL).unwrap();
+            let load = ms(started);
+            assert_eq!(reservation.state().view.buffers.len(), chunks);
+            let table = reservation.backing().table.clone();
+            let (sum, first) = reader.total_of(&device, &table, TOTAL, chunk);
+            assert_eq!(sum, 0, "backed bytes read zero");
+            let (_, second) = reader.total_of(&device, &table, TOTAL, chunk);
+            let started = Instant::now();
+            drop((resizer, reservation));
+            let unload = ms(started);
+            drop(table);
+
+            // The load's parts, over an empty reservation of the same range.
+            let (reservation, resizer) = Reserved::new(granules(chunk), 0).unwrap();
+            let backing = reservation.backing();
+            let range = &backing.range;
+            let started = Instant::now();
+            backing.back(0, chunks).unwrap();
+            let map = ms(started);
+            let started = Instant::now();
+            let wired = backing.form(range, 0, chunks).unwrap();
+            let form = ms(started);
+            let buffers = wired.buffers.clone();
+            let started = Instant::now();
+            device.residency.remove(&buffers);
+            let remove = ms(started);
+            let started = Instant::now();
+            device.residency.add(&buffers);
+            let add = ms(started);
+            drop((wired, buffers));
+            range.unback(0, chunks);
+
+            // Growths by one chunk, each prepared, installed and released.
+            let mut resizer = resizer;
+            let mut steps = Vec::new();
+            for step in 1..=chunks.min(64) as u64 {
+                let started = Instant::now();
+                resizer = resize(resizer, step * chunk);
+                steps.push(ms(started) * 1e3);
+            }
+            steps.sort_by(f64::total_cmp);
+            drop((resize(resizer, 0), reservation));
+
+            eprintln!(
+                "{:>6} KiB {:>7} | {:>9.1} {:>9.2} | {:>8.1} {:>8.1} {:>8.1} {:>8.1} | {:>8.2} {:>8.2} | {:>8.1} | {:>9.1}",
+                chunk / KIB,
+                chunks,
+                load,
+                load * 1e3 / chunks as f64,
+                map,
+                form - add,
+                add,
+                remove,
+                first * 1e3,
+                second * 1e3,
+                unload,
+                steps[steps.len() / 2]
+            );
+        }
     }
 }

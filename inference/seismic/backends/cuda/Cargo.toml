@@ -11,5 +11,12 @@ seismic-estimator.workspace = true
 seismic-lang.workspace = true
 seismic-native-target.workspace = true
 seismic-compiler.workspace = true
+seismic-reservation.workspace = true
 libloading = "0.8.9"
 sha2 = "=0.11.0"
+
+[dev-dependencies]
+seismic-compiler = { workspace = true, features = ["fixtures"] }
+# The recorded GB10, whose reservation granule the driver is held to.
+seismic-topology = { workspace = true, features = ["fixtures"] }
+libc = "0.2"

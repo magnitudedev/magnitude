@@ -208,7 +208,7 @@ impl<'a> PointTiming<'a> {
                 kernel,
                 calls: std::slice::from_ref(call),
             }
-            .submit(1)
+            .submit(1, false)
             .and_then(|submission| submission.wait())
             .map_err(Exclusion::execution)?;
             let actual = kernel.read_call_results(call).map_err(Exclusion::execution)?;

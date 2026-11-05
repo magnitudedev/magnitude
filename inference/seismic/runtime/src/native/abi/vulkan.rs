@@ -82,7 +82,7 @@ pub(crate) fn shared_footprint(shared_bytes: u64) -> u64 {
 const PRELUDE: &str = include_str!("../vulkan_prelude.glsl");
 
 /// Extensions every Vulkan source enables: the device floor's.
-const EXTENSIONS: [&str; 21] = [
+const EXTENSIONS: [&str; 22] = [
     "GL_GOOGLE_cpp_style_line_directive",
     "GL_EXT_buffer_reference",
     "GL_EXT_buffer_reference2",
@@ -104,6 +104,7 @@ const EXTENSIONS: [&str; 21] = [
     "GL_KHR_shader_subgroup_clustered",
     "GL_KHR_shader_subgroup_quad",
     "GL_EXT_shader_subgroup_extended_types_int8",
+    "GL_EXT_shader_atomic_int64",
 ];
 
 /// `#version`, the extensions, the device feature macros and the prelude.
@@ -116,7 +117,6 @@ pub(super) fn header(features: VulkanFeatures) -> String {
         ),
         (features.matrix, "GL_KHR_cooperative_matrix"),
         (features.f32_atomic_add, "GL_EXT_shader_atomic_float"),
-        (features.shared_int64_atomics, "GL_EXT_shader_atomic_int64"),
     ];
     for extension in EXTENSIONS
         .iter()
@@ -243,7 +243,7 @@ void main() {
             eprintln!("no Vulkan GPU meets the floor");
             return;
         };
-        let device = seismic_vulkan::Device::open(description.facts.uuid).expect("device opens");
+        let device = seismic_vulkan::Device::open(description.facts.uuid, crate::backends::vulkan::test_accounts(&description.facts)).expect("device opens");
         let features = VulkanFeatures {
             subgroup_lanes: device.facts().subgroup_width().lanes(),
             float16: device.facts().float16,
@@ -341,6 +341,7 @@ void main() {
                 words: &[],
                 scalar_results: Some((&data, 0)),
                 groups: [u64::from(count.div_ceil(64)), 1, 1],
+                grid: None,
             })
             .expect("launch");
         batch
@@ -443,7 +444,7 @@ void main() {
             eprintln!("no Vulkan GPU meets the floor");
             return;
         };
-        let device = seismic_vulkan::Device::open(description.facts.uuid).expect("device opens");
+        let device = seismic_vulkan::Device::open(description.facts.uuid, crate::backends::vulkan::test_accounts(&description.facts)).expect("device opens");
         let features = VulkanFeatures {
             subgroup_lanes: device.facts().subgroup_width().lanes(),
             float16: false,
@@ -511,6 +512,7 @@ void main() {
                 words: &[],
                 scalar_results: Some((&data, 0)),
                 groups: [u64::from(count.div_ceil(64)), 1, 1],
+                grid: None,
             })
             .expect("launch");
         batch

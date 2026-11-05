@@ -294,6 +294,23 @@ impl PlaneEncoding {
             PlaneEncoding::FloatCode { format } => format.bits(),
         }
     }
+
+    /// The bit of an entry ([`Self::entry_bits`]) whose clearing leaves any
+    /// entry a finite number, in a plane of floating-point numbers: its
+    /// exponent's highest. None for a plane whose every entry is finite.
+    pub(crate) fn finite_bit(&self) -> Option<u32> {
+        match *self {
+            PlaneEncoding::Dense(DType::F16 | DType::BF16) => Some(14),
+            PlaneEncoding::Dense(DType::F32) => Some(30),
+            PlaneEncoding::FloatCode { format: FloatCodeFormat::E4M3 | FloatCodeFormat::UE4M3 } => Some(6),
+            PlaneEncoding::FloatCode { format: FloatCodeFormat::E8M0 } => Some(7),
+            PlaneEncoding::Dense(_)
+            | PlaneEncoding::FloatCode { format: FloatCodeFormat::E2M1 }
+            | PlaneEncoding::Packed { .. }
+            | PlaneEncoding::SignedLocal { .. }
+            | PlaneEncoding::Grid(_) => None,
+        }
+    }
 }
 impl Plane {
     pub(crate) fn dtype(&self) -> DType {

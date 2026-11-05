@@ -156,6 +156,11 @@ pub enum InvocationError {
     NoncanonicalStaticTensor {
         parameter: String,
     },
+    /// A slab view bound to a parameter a launch reads its grid from: a grid
+    /// is read whole from its binding, which a slab view's is not.
+    SlabGrid {
+        parameter: String,
+    },
 }
 
 /// Execution failures after a valid invocation was accepted.
@@ -318,6 +323,10 @@ impl fmt::Display for InvocationError {
             Self::NoncanonicalStaticTensor { parameter } => write!(
                 f,
                 "`{parameter}` has static extents, so the native implementation requires its canonical strides"
+            ),
+            Self::SlabGrid { parameter } => write!(
+                f,
+                "`{parameter}` is a launch grid, which binds no slab view"
             ),
         }
     }

@@ -10,8 +10,11 @@ pub(crate) fn print(file: &File) -> String {
         out: String::new(),
         level: 0,
     };
+    for constant in &file.constants {
+        let _ = writeln!(p.out, "const {} = {}", constant.name.name, constant.value);
+    }
     for (i, decl) in file.decls.iter().enumerate() {
-        if i > 0 {
+        if i > 0 || !file.constants.is_empty() {
             p.out.push('\n');
         }
         p.decl(decl);
@@ -93,6 +96,17 @@ impl Printer {
                     });
                     self.out.push_str(")\n");
                 }
+                if !n.records.is_empty() {
+                    self.indent();
+                    self.out.push_str("records (");
+                    self.list(&n.records, |p, record| match record {
+                        NativeRecordDecl::Parameter(name) => p.out.push_str(&name.name),
+                        NativeRecordDecl::Result { ordinal, .. } => {
+                            let _ = write!(p.out, "result {ordinal}");
+                        }
+                    });
+                    self.out.push_str(")\n");
+                }
                 for term in &n.terms {
                     self.indent();
                     let _ = write!(self.out, "let {} = ", term.name.name);
@@ -150,6 +164,24 @@ impl Printer {
                     self.out.push_str("threadgroups (");
                     self.list(&launch.threadgroups, |p, expr| p.expr(expr, 0));
                     self.out.push_str(")\n");
+                    if let Some(grid) = &launch.grid {
+                        self.indent();
+                        self.out.push_str("grid (");
+                        self.out.push_str(&grid.name);
+                        self.out.push_str(")\n");
+                    }
+                    for condition in &launch.conditions {
+                        self.indent();
+                        self.out.push_str(condition.encoded.keyword());
+                        self.out.push_str(" (");
+                        self.out.push_str(&condition.word.name);
+                        if let Some(index) = &condition.index {
+                            self.out.push('[');
+                            self.expr(index, 0);
+                            self.out.push(']');
+                        }
+                        self.out.push_str(")\n");
+                    }
                     self.indent();
                     self.out.push_str("threads_per_threadgroup (");
                     self.list(&launch.threads_per_threadgroup, |p, expr| p.expr(expr, 0));
@@ -250,6 +282,10 @@ impl Printer {
                     ShapedHead::Tensor => "tensor",
                     ShapedHead::SharedTensor => "&tensor",
                     ShapedHead::MutTensor => "&mut tensor",
+                    ShapedHead::HostTensor { write: false } => "&host tensor",
+                    ShapedHead::HostTensor { write: true } => "&host mut tensor",
+                    ShapedHead::AwaitTensor { write: false } => "&await tensor",
+                    ShapedHead::AwaitTensor { write: true } => "&await mut tensor",
                 });
                 self.shape_and_elem(shape, elem);
             }

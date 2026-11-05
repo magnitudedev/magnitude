@@ -691,6 +691,177 @@ mod result_schema_tests {
     }
 
     #[test]
+    fn packed_storage_takes_only_whole_records_of_its_representation() {
+        use crate::registry::{Layout, representation, storage};
+        let source = "\
+fn copied(dst: &mut tensor[2, 32, 256] U, src: &tensor[32, 256] V):
+    dst[1, :, :] = src
+
+fn repacked(dst: &mut tensor[2, 32, 256] U, src: &tensor[32, 256] E):
+    dst[1, :, :] = repack[U = U](src)
+
+fn element(dst: &mut tensor[2, 32, 256] U, src: &tensor[32, 256] U):
+    dst[1, 0, :] = src[0, :]
+
+fn partial(dst: &mut tensor[2, 32, 256] U, src: &tensor[16, 256] U):
+    dst[1, 0:16, :] = src
+";
+        let module = module(source);
+        let q4k = storage("q4k", Layout::Rows32).unwrap();
+        let q5k = storage("q5k", Layout::Rows32).unwrap();
+        let gguf = representation("gguf_q4_k").unwrap();
+        let build = |name: &str, bindings: ElementBindings| {
+            module.entry(module.entry_named(name).unwrap(), &bindings)
+        };
+        let copied = build("copied", ElementBindings::new().bind("U", q4k).bind("V", q4k))
+            .expect("a whole-record copy of the same representation");
+        // The reference copies the record's encoded bytes.
+        let crate::registry::RepresentationKind::PackedRows(layout) =
+            &crate::registry::representation_info(q4k).kind
+        else {
+            panic!("q4k@rows32 is a row layout")
+        };
+        let record = layout.bytes(&[32, 256]).unwrap() as usize;
+        let stored = (0..record).map(|byte| (byte * 7 + 3) as u8).collect::<Vec<_>>();
+        let mut interpreter = Interpreter::new(&copied);
+        let dst = interpreter.add_tensor(TensorData::encoded(q4k, vec![2, 32, 256], vec![0; 2 * record]).unwrap());
+        let src = interpreter.add_tensor(TensorData::encoded(q4k, vec![32, 256], stored.clone()).unwrap());
+        let outcome = interpreter.run(&[Arg::Tensor(dst), Arg::Tensor(src)]).unwrap();
+        let written = outcome
+            .inputs()
+            .find(|input| input.ordinal() == 0)
+            .unwrap()
+            .tensor()
+            .canonical_bytes()
+            .unwrap()
+            .unwrap()
+            .to_vec();
+        assert_eq!(written[..record], vec![0; record][..], "record 0 untouched");
+        assert_eq!(written[record..], stored[..], "record 1 copied");
+        build("repacked", ElementBindings::new().bind("U", q4k).bind("E", gguf))
+            .expect("a whole-record repack into the representation");
+        let rule = crate::registry::store_rule(q4k).admits(false).unwrap_err();
+        for (name, bindings) in [
+            ("element", ElementBindings::new().bind("U", q4k)),
+            ("partial", ElementBindings::new().bind("U", q4k)),
+            ("copied", ElementBindings::new().bind("U", q4k).bind("V", q5k)),
+        ] {
+            let error = build(name, bindings).unwrap_err();
+            assert!(
+                error.diagnostics().items().iter().any(|item| {
+                    item.rule == crate::checked::DiagnosticRule::Type && item.message == rule
+                }),
+                "{name}: {error:?}"
+            );
+        }
+    }
+
+    /// A packed store takes any contiguous run of whole records (a range of
+    /// a leading axis, then whole axes), and a concrete packed destination
+    /// takes a value of an element parameter that binds to its own
+    /// representation: the value's rule is decided where lowering binds it.
+    #[test]
+    fn packed_storage_takes_runs_of_whole_records_and_generic_values() {
+        use crate::registry::representation;
+        let source = "\
+fn every(dst: &mut tensor[2, 32, 256] U, src: &tensor[2, 32, 256] U):
+    dst[:, :, :] = src
+
+fn run(dst: &mut tensor[3, 32, 256] U, src: &tensor[2, 32, 256] U):
+    dst[1:3, :, :] = src
+
+fn nested(dst: &mut tensor[2, 3, 32, 256] U, src: &tensor[2, 32, 256] U):
+    dst[1, 0:2] = src
+
+fn generic(dst: &mut tensor[2, 32, 256] q4k, src: &tensor[32, 256] V):
+    dst[1, :, :] = src
+
+fn strided(dst: &mut tensor[2, 2, 32, 256] U, src: &tensor[2, 32, 256] U):
+    dst[:, 1, :, :] = src
+";
+        let module = module(source);
+        let q4k = representation("q4k").unwrap();
+        let q5k = representation("q5k").unwrap();
+        let build = |name: &str, bindings: ElementBindings| {
+            module.entry(module.entry_named(name).unwrap(), &bindings)
+        };
+        let record = crate::registry::canonical_bytes(q4k, &[32, 256]).unwrap() as usize;
+        for (name, extents, written) in [
+            ("every", vec![2, 32, 256], 0..2),
+            ("run", vec![3, 32, 256], 1..3),
+            ("nested", vec![2, 3, 32, 256], 3..5),
+        ] {
+            let entry = build(name, ElementBindings::new().bind("U", q4k)).expect(name);
+            let records = extents[..extents.len() - 2].iter().product::<usize>();
+            let stored = (0..2 * record).map(|byte| (byte * 7 + 3) as u8).collect::<Vec<_>>();
+            let mut interpreter = Interpreter::new(&entry);
+            let dst = interpreter
+                .add_tensor(TensorData::encoded(q4k, extents, vec![0; records * record]).unwrap());
+            let src = interpreter
+                .add_tensor(TensorData::encoded(q4k, vec![2, 32, 256], stored.clone()).unwrap());
+            let outcome = interpreter.run(&[Arg::Tensor(dst), Arg::Tensor(src)]).unwrap();
+            let bytes = outcome
+                .inputs()
+                .find(|input| input.ordinal() == 0)
+                .unwrap()
+                .tensor()
+                .canonical_bytes()
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            let mut expected = vec![0; records * record];
+            expected[written.start * record..written.end * record].copy_from_slice(&stored);
+            assert_eq!(bytes, expected, "{name}");
+        }
+        build("generic", ElementBindings::new().bind("V", q4k))
+            .expect("a whole-record copy of the destination's representation");
+        let rule = crate::registry::store_rule(q4k).admits_value(Some(q5k)).unwrap_err();
+        let error = build("generic", ElementBindings::new().bind("V", q5k)).unwrap_err();
+        assert!(
+            error.diagnostics().items().iter().any(|item| item.message == rule),
+            "{error:?}"
+        );
+        let rule = crate::registry::store_rule(q4k).admits(false).unwrap_err();
+        let error = build("strided", ElementBindings::new().bind("U", q4k)).unwrap_err();
+        assert!(
+            error.diagnostics().items().iter().any(|item| item.message == rule),
+            "{error:?}"
+        );
+    }
+
+    /// `repack` between two dense float representations is the element
+    /// conversion `import_dense` makes (F32, then rounded into the
+    /// destination); a dense source into packed storage stays refused at
+    /// binding, as no exact conversion is registered for it.
+    #[test]
+    fn repack_between_dense_floats_converts_each_element() {
+        use crate::registry::{Layout, dense, storage};
+        let source = "\
+fn repacked(dst: &mut tensor[2, 4, 8] U, src: &tensor[4, 8] E):
+    dst[1, :, :] = repack[U = U](src)
+";
+        let module = module(source);
+        let entry = |bindings: &ElementBindings| module.entry(module.entry_named("repacked").unwrap(), bindings);
+        let values = (0..32).map(|index| (index as f64 - 15.5) * 0.375).collect::<Vec<_>>();
+        for (from, to) in [(DType::BF16, DType::BF16), (DType::BF16, DType::F32), (DType::F32, DType::BF16)] {
+            let logical = entry(&ElementBindings::new().bind("U", dense(to)).bind("E", dense(from)))
+                .unwrap_or_else(|error| panic!("{from:?} -> {to:?}: {error:?}"));
+            let mut interpreter = Interpreter::new(&logical);
+            let dst = interpreter.add_tensor(TensorData::dense(to, vec![2, 4, 8], vec![0.0; 64]));
+            let src = interpreter.add_tensor(TensorData::dense(from, vec![4, 8], values.clone()));
+            let outcome = interpreter.run(&[Arg::Tensor(dst), Arg::Tensor(src)]).unwrap();
+            let input = outcome.inputs().find(|input| input.ordinal() == 0).unwrap();
+            let written = input.tensor();
+            for index in 0..64 {
+                let expected = if index < 32 { 0.0 } else { values[index - 32] };
+                assert_eq!(written.read(index).unwrap(), expected, "{from:?} -> {to:?} element {index}");
+            }
+        }
+        let q4k = storage("q4k", Layout::Rows32).unwrap();
+        assert!(entry(&ElementBindings::new().bind("U", q4k).bind("E", dense(DType::BF16))).is_err());
+    }
+
+    #[test]
     fn generic_assignment_store_and_explicit_cast_use_concrete_rules() {
         // L23 (a): a reassigned `T` local takes only a `T` value, whatever
         // the bindings; storing a `U` value into it is the installation.
@@ -1181,7 +1352,7 @@ pub(crate) fn build_entry(
         })
         .collect();
     let subject = std::sync::Arc::new(crate::entry::CheckedProgramSubject::new(
-        std::sync::Arc::new(module.sources.clone()),
+        module.sources.clone(),
         element_bindings.into_iter().collect(),
     ));
     let program = SemanticProgram::new(crate::entry::internals::Program::new(
@@ -1584,6 +1755,7 @@ fn build_schema_parameters(
                     ParameterAccess::Owned => TensorAccess::Owned,
                     ParameterAccess::Shared => TensorAccess::Shared,
                     ParameterAccess::Mutable => TensorAccess::Mutable,
+                    ParameterAccess::Host { write } => TensorAccess::Host { write },
                     ParameterAccess::Scalar => {
                         panic!("checked tensor parameter has scalar access")
                     }
@@ -1648,6 +1820,7 @@ fn build_schema_parameters(
             name: semantic.name.clone(),
             kind,
             value: semantic.value,
+            awaited: semantic.awaited,
         });
     }
     // Tensor pairs are disjoint whenever either side is mutable/owned.
@@ -1910,6 +2083,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     name: dimension.name.clone(),
                     value,
                     access: ParameterAccess::Scalar,
+                    awaited: false,
                 });
                 let actual = self.runtime_int(value);
                 // A propagated private recipe remains an exact value even
@@ -1935,6 +2109,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 &[],
                 ty,
                 &parameter.ownership,
+                parameter.awaited,
                 parameter.span,
             )?;
             self.locals[parameter.local.index()] = Some(value);
@@ -2064,6 +2239,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         path: &[u32],
         ty: SemanticType,
         ownership: &ir::Ownership,
+        awaited: bool,
         span: crate::span::Span,
     ) -> Result<SemanticValueId, SourceDiagnostic> {
         if let SemanticType::Tuple(items) = &ty {
@@ -2081,6 +2257,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     &child,
                     item,
                     &parts[ordinal],
+                    awaited,
                     span,
                 )?);
             }
@@ -2090,14 +2267,14 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             ir::Ownership::Owned => ParameterAccess::Owned,
             ir::Ownership::Shared => ParameterAccess::Shared,
             ir::Ownership::Exclusive => ParameterAccess::Mutable,
+            ir::Ownership::Host { write } => ParameterAccess::Host { write: *write },
             ir::Ownership::Value => ParameterAccess::Scalar,
             ir::Ownership::Tuple(_) => panic!("non-tuple parameter has tuple ownership"),
         };
         let mut ty = ty;
         if let SemanticType::Tensor(tensor) = &mut ty {
             if leaf_access == ParameterAccess::Mutable
-                && crate::registry::representation_info(tensor.representation).access
-                    != crate::registry::RepresentationAccess::ReadWrite
+                && !crate::registry::record_writable(tensor.representation)
             {
                 return Err(SourceDiagnostic::new(
                     &self.module.sources.files()[self.definition.file],
@@ -2125,6 +2302,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             name: leaf_name,
             value,
             access: leaf_access,
+            awaited,
         });
         Ok(value)
     }
@@ -3246,17 +3424,16 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     participants
                 });
                 if let SemanticType::Tensor(tensor) = &self.values[base.index()].ty {
-                    if crate::registry::representation_info(tensor.representation).access
-                        != crate::registry::RepresentationAccess::ReadWrite
+                    // The selection the representation's store rule takes
+                    // (`registry::store_rule`); `assign` checks the value.
+                    if let Err(refusal) = crate::registry::store_rule(tensor.representation)
+                        .admits(ir::whole_records(indices, tensor.axes.len()))
                     {
                         return Err(SourceDiagnostic::new(
                             &self.module.sources.files()[self.definition.file],
                             span,
                             crate::checked::DiagnosticRule::Type,
-                            format!(
-                                "representation `{}` is decode-only and has no canonical write contract",
-                                crate::registry::representation_info(tensor.representation).name
-                            ),
+                            refusal,
                         ));
                     }
                 }
@@ -3432,6 +3609,24 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 participants: semantic_participants,
                 ty,
             } => {
+                // The value the representation's store rule takes
+                // (`prepare_assignment` admitted the selection).
+                if let SemanticType::Tensor(target) = &ty {
+                    let stored = match &self.values[value.index()].ty {
+                        SemanticType::Tensor(stored) => Some(stored.representation),
+                        _ => None,
+                    };
+                    if let Err(refusal) =
+                        crate::registry::store_rule(target.representation).admits_value(stored)
+                    {
+                        return Err(SourceDiagnostic::new(
+                            &self.module.sources.files()[self.definition.file],
+                            span,
+                            crate::checked::DiagnosticRule::Type,
+                            refusal,
+                        ));
+                    }
+                }
                 let stored_value = self.install_value(region, value, &ty, span)?;
                 let tensor_store = matches!(
                     self.values[stored_value.index()].ty,
@@ -4339,6 +4534,19 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             let SemanticType::Tensor(destination) = &mut ty else {
                 panic!("checked representation conversion result is not a tensor")
             };
+            // Between dense floats: the element conversion.
+            if let Some(dtype) =
+                crate::registry::dense_conversion(source.representation, destination.representation)
+            {
+                destination.storage = TensorStorage::Computed;
+                return Ok(self.emit(
+                    region,
+                    NodeKind::Elementwise(PrimitiveId::Cast(dtype)),
+                    vec![*input],
+                    vec![ty],
+                    expression.span,
+                )[0]);
+            }
             let Some(conversion) = crate::registry::representation_conversion(
                 source.representation,
                 destination.representation,

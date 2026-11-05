@@ -336,6 +336,9 @@ pub struct CudaFacts {
 
 /// Device attribute keys (`CUdevice_attribute`).
 mod attr {
+    pub const PCI_BUS_ID: i32 = 33;
+    pub const PCI_DEVICE_ID: i32 = 34;
+    pub const PCI_DOMAIN_ID: i32 = 50;
     pub const MAX_THREADS_PER_BLOCK: i32 = 1;
     pub const MAX_BLOCK_DIM_X: i32 = 2;
     pub const MAX_BLOCK_DIM_Y: i32 = 3;
@@ -401,6 +404,9 @@ pub struct DeviceDescriptor {
     /// boots; it matches the memory the OS reports as dedicated to the
     /// adapter.
     pub luid: Option<[u8; 8]>,
+    /// `CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID`, `_PCI_BUS_ID`, `_PCI_DEVICE_ID`:
+    /// where the device sits on its bus (domain, bus, device).
+    pub pci: [u32; 3],
 }
 
 impl DeviceDescriptor {
@@ -408,6 +414,12 @@ impl DeviceDescriptor {
     /// they cannot.
     pub fn admission(&self) -> Result<(), TargetError> {
         admit_device(&self.name, self.compute_capability, self.driver_api)
+    }
+
+    /// Whether the device's memory is the host's: an integrated device's,
+    /// or one the OS manages as a NUMA node.
+    pub fn memory_is_host(&self) -> bool {
+        self.integrated || self.numa_node
     }
 }
 
@@ -505,6 +517,10 @@ pub fn describe(ordinal: u32) -> Result<DeviceDescriptor, TargetError> {
         .attribute(attr::INTEGRATED, device)
         .map_err(unavailable)?
         != 0;
+    let pci = |key: c_int| {
+        let value = driver.attribute(key, device).map_err(unavailable)?;
+        u32::try_from(value).map_err(|_| TargetError::DeviceUnavailable(format!("PCI attribute {key} of {value}")))
+    };
     Ok(DeviceDescriptor {
         ordinal,
         uuid,
@@ -525,6 +541,7 @@ pub fn describe(ordinal: u32) -> Result<DeviceDescriptor, TargetError> {
         compute_capability: read_compute_capability(&driver, device)?,
         numa_node: numa_node(&driver, device)?,
         luid: luid(&driver, device)?,
+        pci: [pci(attr::PCI_DOMAIN_ID)?, pci(attr::PCI_BUS_ID)?, pci(attr::PCI_DEVICE_ID)?],
     })
 }
 
@@ -1253,27 +1270,10 @@ fn enqueue_kernel(
     block: [u32; 3],
     params: &mut [*mut std::ffi::c_void; 1],
 ) -> Result<(), TargetError> {
-    unsafe {
-        context
-            .driver
-            .check(
-                (context.driver.launch)(
-                    function,
-                    grid[0],
-                    grid[1],
-                    grid[2],
-                    block[0],
-                    block[1],
-                    block[2],
-                    0,
-                    stream.raw(),
-                    params.as_mut_ptr(),
-                    std::ptr::null_mut(),
-                ),
-                "profile probe launch",
-            )
-            .map_err(unavailable)?;
-    }
+    let status = unsafe {
+        context.issuing().map_err(unavailable)?.launch(false, function, grid, block, 0, stream.raw(), params.as_mut_ptr(), std::ptr::null_mut())
+    };
+    context.driver.check(status, "profile probe launch").map_err(unavailable)?;
     Ok(())
 }
 
@@ -1790,7 +1790,7 @@ fn acquire_core_services(
         "probe_device_copy",
         || unsafe {
             context.driver.check(
-                (context.driver.memcpy_device_async)(
+                context.issuing()?.memcpy_device_async(
                     transfer_destination.pointer,
                     transfer_source.pointer,
                     bytes,
@@ -1809,7 +1809,7 @@ fn acquire_core_services(
         "probe_device_fill",
         || unsafe {
             context.driver.check(
-                (context.driver.memset_d8_async)(transfer_source.pointer, 0, bytes, stream.raw()),
+                context.issuing()?.memset_d8_async(transfer_source.pointer, 0, bytes, stream.raw()),
                 "profile device fill",
             )
         },

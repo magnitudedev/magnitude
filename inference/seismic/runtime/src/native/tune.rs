@@ -594,10 +594,6 @@ pub struct TuningResult {
     pub points: Vec<PointRecord>,
     /// What `overall` was chosen under.
     pub requirement: NumericalRequirement,
-    /// What every observation is a measurement of besides its point and
-    /// key: the comparison's version, the default's artifact, the entry and
-    /// the device. No requirement's α is part of it.
-    pub measurement_identity: String,
     /// Every observation made of the unit's candidates, each made once, in
     /// the order made. A candidate's record names its own.
     pub observations: Vec<NumericalObservation>,
@@ -860,7 +856,7 @@ fn held_bytes(device: &DeviceInner, charged: u64, retained: u64, footprint: Opti
 /// admitted on a footprint below what the build demands, which an unbuilt
 /// point's price only forecasts. The point's price (`resident`) is raised to
 /// what the build demanded: what it took of what the device's storage could
-/// take before it ([`DeviceInner::storage_available`]) until the refusal
+/// take before it ([`DeviceInner::room`]) until the refusal
 /// left `available`, and the `required` bytes refused. `None` ends the
 /// piece. Offered again at that price, it is admitted as any priced piece:
 /// once enough is free, so the same allocation is not refused again, or
@@ -874,7 +870,7 @@ fn build_point<'a>(
     index: usize,
     resident: &mut Observed,
 ) -> Result<Option<TuningPoint<'a>>, TuneError> {
-    let before = device.storage_available(seismic_topology::StorageKind::Device);
+    let before = device.room(seismic_topology::Contract::DeviceOnly);
     let built = match source.build(index) {
         Ok(inputs) => TuningPoint::new(spec, inputs)?.timed(device),
         Err(error) => Err(error),
@@ -1316,7 +1312,7 @@ impl Forming<'_> {
         let held = |device: &DeviceInner| {
             held_bytes(
                 device,
-                device.storage_usage(seismic_topology::StorageKind::Device).charged,
+                device.device_ledger().charged,
                 0,
                 ProcessMemory::footprint_now(),
             )
@@ -3748,7 +3744,6 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     pub fn grounded(&mut self, grounded: Grounded) -> Result<(), TuneError> {
         let kernel = grounded.kernel?;
         let validator = Validator::new(
-            &self.device,
             &self.logical,
             &self.mutable,
             &self.unit.requirement,
@@ -4065,7 +4060,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     fn held(&self) -> u64 {
         held_bytes(
             &self.device,
-            self.device.storage_usage(seismic_topology::StorageKind::Device).charged,
+            self.device.device_ledger().charged,
             self.ground
                 .as_ref()
                 .map_or(0, |ground| ground.validator.retained_bytes()),
@@ -4109,7 +4104,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         let held = || {
             held_bytes(
                 device,
-                device.storage_usage(seismic_topology::StorageKind::Device).charged,
+                device.device_ledger().charged,
                 validator.retained_bytes(),
                 ProcessMemory::footprint_now(),
             )
@@ -4577,7 +4572,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // What the piece holds is read from the ledgers' high-water marks,
         // started again here: what it took and gave back within itself is
         // seen.
-        self.device.restart_memory_high_water();
+        self.device.restart_high_water();
         if let Some(ground) = &self.ground {
             ground.validator.restart_retained_high_water();
         }
@@ -4587,7 +4582,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // within it is over this.
         let ledgers = |unit: &Self| {
             (
-                unit.device.storage_usage(seismic_topology::StorageKind::Device),
+                unit.device.device_ledger(),
                 unit.ground.as_ref().map_or((0, 0), |ground| {
                     (
                         ground.validator.retained_bytes(),
@@ -4666,7 +4661,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             began_bytes,
             peak_bytes: held_bytes(
                 &self.device,
-                self.device.storage_usage(seismic_topology::StorageKind::Device).high_water,
+                self.device.device_ledger().high_water,
                 self.ground
                     .as_ref()
                     .map_or(0, |ground| ground.validator.retained_high_water()),
@@ -4674,7 +4669,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             ),
             ended_bytes: held_bytes(
                 &self.device,
-                self.device.storage_usage(seismic_topology::StorageKind::Device).charged,
+                self.device.device_ledger().charged,
                 self.ground
                     .as_ref()
                     .map_or(0, |ground| ground.validator.retained_bytes()),
@@ -4682,7 +4677,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             ),
             ledger_peak_bytes: self
                 .device
-                .storage_usage(seismic_topology::StorageKind::Device)
+                .device_ledger()
                 .high_water
                 + self
                     .ground
@@ -4734,7 +4729,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // within it is priced from what the piece took of it.
         let before = self
             .device
-            .storage_available(seismic_topology::StorageKind::Device);
+            .room(seismic_topology::Contract::DeviceOnly);
         let building = Instant::now();
         let Some(point) = build_point(
             &self.device,
@@ -4763,7 +4758,8 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         }
         let mut point = ground.validator.point(point)?;
         let shape =
-            point_shapes(&self.device, &self.logical, std::slice::from_ref(&point))?.remove(0);
+            point_shapes(&self.device, &self.logical, std::slice::from_ref(&point))?
+                .remove(0);
         // The defaults' time here is the unit of every time the unit
         // records and the point's weight in what it optimises: the median
         // of three samples, the fewest whose median one sample cannot
@@ -5269,7 +5265,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 points: point_records(&self.specs),
                 records: ledger.records(&ground.validator),
                 served: ledger.served.clone(),
-                evidence: Evidence::of(&ground.validator),
+                observations: ground.validator.observations(),
             },
             &incumbent.specialization,
             method,
@@ -5539,8 +5535,7 @@ impl Unit {
             backend: self.backend.clone(),
             points: configurations.points,
             requirement: self.requirement.clone(),
-            measurement_identity: configurations.evidence.identity,
-            observations: configurations.evidence.observations,
+            observations: configurations.observations,
             served: configurations.served,
             reselection: None,
             implementation_identity: self.implementation_identity.clone(),
@@ -5587,7 +5582,7 @@ impl Unit {
                 points: records,
                 records: configurations,
                 served: vec![Configuration::of(default)],
-                evidence: Evidence::of(&ground.validator),
+                observations: ground.validator.observations(),
             },
             default,
             TuningMethod::Census,
@@ -7253,10 +7248,10 @@ pub fn implementation_digest(
 /// (`SEISMIC_NVRTC_DIRECTORY`) and changes without a driver change, so its
 /// release and this build's compile options are digested; NVRTC that
 /// cannot be loaded is an error. Vulkan's shader compiler is built into
-/// this binary, which the rendered source and the CPU digest do not name
-/// but the engine build's identity does. Metal's compiler is the operating
-/// system's, named by the OS build in the executor's identity. CPU kernels
-/// are compiled into the binary, named by their digest.
+/// this binary, so its release, SPIR-V target and seal passes are digested
+/// (`seismic_vulkan::formation::compiler`). Metal's compiler is the
+/// operating system's, named by the OS build in the executor's identity.
+/// CPU kernels are compiled into the binary, named by their digest.
 pub fn kernel_digest(
     backend: BackendName,
     module: &CheckedModule,
@@ -7315,17 +7310,20 @@ pub fn kernel_digest(
         // The lane count is a value the prefix states, not a feature: any
         // one renders the same source otherwise.
         #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-        BackendName::Vulkan => Some(super::abi::Dialect::Vulkan(
-            super::abi::vulkan::VulkanFeatures {
-                subgroup_lanes: 32,
-                float16: false,
-                matrix: false,
-                wide_accumulators: false,
-                mixed_dot: false,
-                f32_atomic_add: false,
-                shared_int64_atomics: false,
-            },
-        )),
+        BackendName::Vulkan => {
+            digest.update(seismic_vulkan::formation::compiler().as_bytes());
+            Some(super::abi::Dialect::Vulkan(
+                super::abi::vulkan::VulkanFeatures {
+                    subgroup_lanes: 32,
+                    float16: false,
+                    matrix: false,
+                    wide_accumulators: false,
+                    mixed_dot: false,
+                    f32_atomic_add: false,
+                    shared_int64_atomics: false,
+                },
+            ))
+        }
         #[cfg(not(any(not(target_os = "macos"), test, feature = "coverage")))]
         BackendName::Vulkan => {
             return Err(declaration(
@@ -7351,46 +7349,54 @@ pub fn kernel_digest(
 }
 
 /// Checked entry IDs carry a process-local owner. A tuning result names the
-/// declaration's values and stable source identity, never that owner. Where
-/// the declaring file was read from is not the implementation either: a build
-/// canonicalizes its sources to absolute paths, so the same sources built in
-/// another directory must keep their stored results. The native source the
-/// declaration names is digested by content, rendered for the entry.
+/// declaration's values and the entry's content, never that owner. The
+/// content is what the entry's meaning depends on and nothing else of its
+/// module ([`seismic_lang::ids::EntryContent`]): an edit to another entry
+/// keeps this one's stored results, and an edit to anything it may call
+/// does not. Where the declaring file was read from is not the
+/// implementation either: a build canonicalizes its sources to absolute
+/// paths, so the same sources built in another directory must keep their
+/// stored results. The native source the declaration names is digested by
+/// content, rendered for the entry.
 fn update_declaration_digest(
     digest: &mut Sha256,
     module: &CheckedModule,
     entry_name: &str,
     implementation: &NativeImplementation,
 ) {
-    digest.update(b"native-declaration-v2");
+    // Every field of the declaration but its process-local entry and the
+    // label of the file it sits in: a field added to it is in the digest
+    // or named here.
+    let NativeImplementation {
+        entry,
+        backend,
+        declared_in: _,
+        source_path,
+        statics,
+        params,
+        elements,
+        records,
+        constraint,
+        scratch,
+        launches,
+        repeat,
+    } = implementation;
+    digest.update(b"native-declaration-v3");
     digest.update(format!("{entry_name:?}").as_bytes());
     digest.update(
         format!(
             "{:?}",
             (
-                implementation.backend,
-                &implementation.source_path,
-                &implementation.statics,
-                &implementation.params,
-                &implementation.elements,
-                &implementation.constraint,
-                &implementation.scratch,
-                &implementation.launches,
+                backend, source_path, statics, params, elements, records, constraint,
+                scratch, launches, repeat,
             )
         )
         .as_bytes(),
     );
-    // The declaration is named by entry within the module's source text. A
-    // stable entry identity also hashes the paths the sources were built
-    // from, which never identify an implementation.
-    digest.update(b"checked-native-source-v4");
-    for file in module.sources().files() {
-        digest.update((file.text.len() as u64).to_le_bytes());
-        digest.update(file.text.as_bytes());
-    }
-    let name = super::entry_name(module, implementation.entry);
-    digest.update((name.len() as u64).to_le_bytes());
-    digest.update(name.as_bytes());
+    // A stable entry identity names the whole module, with the paths its
+    // sources were built from; the content names the entry's closure alone.
+    digest.update(b"checked-entry-content-v1");
+    digest.update(super::entry_info(module, *entry).content.digest());
 }
 
 /// Fix the parameters a unit's statics value (a parameter its bindings
@@ -7446,22 +7452,8 @@ struct Records {
     records: Vec<ConfigurationRecord>,
     /// The choices served in turn ([`TuningResult::served`]).
     served: Vec<Configuration>,
-    evidence: Evidence,
-}
-
-/// What a unit observed of its candidates against its default.
-struct Evidence {
-    identity: String,
+    /// What the unit observed of its candidates against its default.
     observations: Vec<NumericalObservation>,
-}
-
-impl Evidence {
-    fn of(validator: &Validator) -> Self {
-        Self {
-            identity: validator.identity().to_owned(),
-            observations: validator.observations(),
-        }
-    }
 }
 
 /// One entry's survey.
@@ -7610,7 +7602,7 @@ impl Tuned<'_> {
                 points: labels(points),
                 records,
                 served,
-                evidence: Evidence::of(validator),
+                observations: validator.observations(),
             },
             chosen,
             TuningMethod::Survey {
@@ -8959,7 +8951,7 @@ mod tests {
                     points: Vec::new(),
                     records: self.ledger.records(&self.validator),
                     served: self.ledger.served.clone(),
-                    evidence: Evidence::of(&self.validator),
+                    observations: self.validator.observations(),
                 },
                 &self.ledger.incumbent().specialization,
                 TuningMethod::Census,
@@ -9017,7 +9009,7 @@ mod tests {
         .unwrap();
         let logical = Arc::new(module.entry(entry, &ElementBindings::new()).unwrap());
         let requirement = NumericalRequirement::BitExact;
-        let validator = Validator::new(&device, &logical, &[], &requirement, &kernel);
+        let validator = Validator::new(&logical, &[], &requirement, &kernel);
         let canonical = timed(points, |_| 0, |_| 1.);
         let cost = Weighing {
             weights: vec![1.; points],
@@ -9398,7 +9390,7 @@ mod tests {
     }
 
     #[test]
-    fn declaration_digest_uses_stable_entry_identity() {
+    fn declaration_digest_uses_the_entry_content() {
         let source = |domain: &str| {
             format!(
                 "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    launch scale:\n        params (code ROWS in {domain})\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
@@ -9446,6 +9438,23 @@ mod tests {
             digest(&first, first_entry),
             digest(&changed, changed.entry_named("scale").unwrap())
         );
+        // Another entry of the module, ahead of this one in its file, is
+        // not this implementation; a change to its own body is.
+        let other = |body: &str| {
+            check(
+                "/build/one/kernels/scale.seismic",
+                format!("fn other(x: f32) -> f32:\n    return {body}\n\n{}", source("[1, 2]")),
+            )
+        };
+        let (one, two) = (other("x + 1.0"), other("x * 2.0 + 1.0"));
+        let at = |module: &CheckedModule| digest(module, module.entry_named("scale").unwrap());
+        assert_eq!(at(&one), at(&two));
+        assert_eq!(at(&one), digest(&first, first_entry));
+        let copied = check(
+            "/build/one/kernels/scale.seismic",
+            source("[1, 2]").replace("return to_owned(x)", "let y = to_owned(x)\n    return y"),
+        );
+        assert_ne!(at(&copied), digest(&first, first_entry));
     }
 
     #[test]

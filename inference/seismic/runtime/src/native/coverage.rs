@@ -842,7 +842,7 @@ struct Subject<'m> {
     info: &'m EntryInfo,
     backend: BackendName,
     declaration: &'m NativeImplementation,
-    asset: &'m str,
+    asset: seismic_lang::checked::NativeAsset<'m>,
     label: String,
     /// Each element parameter's candidate representations.
     candidates: Vec<(String, Vec<RepresentationId>)>,
@@ -1121,7 +1121,7 @@ impl<'m> Subject<'m> {
         let dialect = row.configuration.dialect();
         self.programs(row)
             .iter()
-            .map(|program| skeleton(&program.text, self.asset, &self.label, dialect, &preamble))
+            .map(|program| skeleton(&program.text, self.asset.text, &self.label, dialect, &preamble))
             .collect()
     }
 

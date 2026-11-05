@@ -109,5 +109,5 @@ Check at least:
 
 For llama.cpp comparisons on the same GPU, use an official llama.cpp Vulkan release binary, and
 optionally a HIP build for gfx1101 (a ROCm installation or the ROCm Python wheels, run with the ROCm
-libraries on `LD_LIBRARY_PATH`). Compare through `mrig serve --backend vulkan --host <machine>
--- --engine llama.cpp …`, which holds the machine and passes the thermal gate before timing.
+libraries on `LD_LIBRARY_PATH`). Compare through the evaluation rig's `serve` instrument at
+`--backend vulkan`, which holds the machine and passes the thermal gate before timing.

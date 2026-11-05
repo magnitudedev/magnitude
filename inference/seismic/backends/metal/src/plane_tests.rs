@@ -167,7 +167,7 @@ fn plane_storage_views_preserve_types_packet_offsets_and_partial_words() {
             .enumerate()
             {
                 unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(buffer.raw()), 0, index);
+                    encoder.setBuffer_offset_atIndex(Some(&buffer.raw()), 0, index);
                 }
             }
             unsafe {
@@ -265,7 +265,7 @@ fn native_subgroup_ordinal_uses_the_actual_two_dimensional_cohort() {
         .enumerate()
     {
         unsafe {
-            encoder.setBuffer_offset_atIndex(Some(buffer.raw()), 0, index);
+            encoder.setBuffer_offset_atIndex(Some(&buffer.raw()), 0, index);
         }
     }
     unsafe {

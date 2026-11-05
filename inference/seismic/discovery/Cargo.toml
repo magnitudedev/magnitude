@@ -5,7 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 # What the machine has, as the backend crates and the OS report it: the
-# inventory of its topology and status samples.
+# inventory of its topology, status samples, and the host's processors and
+# their pinning.
 [dependencies]
 seismic-topology.workspace = true
 seismic-cpu.workspace = true

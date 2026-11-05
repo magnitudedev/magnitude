@@ -20,6 +20,11 @@ use crate::ids::EntryId;
 use crate::registry::BackendName;
 use std::path::{Path, PathBuf};
 
+/// The extension of a relative include that every GPU backend's assets admit:
+/// a header written in the language MSL, CUDA C++ and GLSL have in common,
+/// over definitions each backend's including files provide.
+const SHARED_EXTENSION: &str = "hpp";
+
 /// Seismic's native library: `(name, text)`, included as `<seismic/<name>>`. A
 /// name's extension selects its backend (`.h` Metal, `.cuh` CUDA, `.glsl`
 /// Vulkan).
@@ -139,7 +144,7 @@ impl std::fmt::Display for NativeIncludeError {
             }
             NativeIncludeReason::Absolute => "include paths are relative to the including file",
             NativeIncludeReason::Extension => {
-                "only `.h` (Metal), `.cuh` (CUDA) or `.glsl` (Vulkan) files of the asset's backend may be included"
+                "only `.h` (Metal), `.cuh` (CUDA) or `.glsl` (Vulkan) files of the asset's backend, or `.hpp` files the GPU backends share (relative includes), may be included"
             }
             NativeIncludeReason::OutsideSourceRoots => {
                 "the included file lies outside the build's source roots"
@@ -542,17 +547,17 @@ impl Expansion<'_> {
         if target.is_empty() {
             return Err(NativeIncludeReason::Malformed);
         }
-        let extension_matches = |name: &str| {
+        let extension_of = |name: &str| {
             Path::new(name)
                 .extension()
                 .and_then(|extension| extension.to_str())
-                == Some(self.extension)
+                .map(str::to_owned)
         };
         if angled {
             let Some(name) = target.strip_prefix("seismic/") else {
                 return Err(NativeIncludeReason::System);
             };
-            if !extension_matches(name) {
+            if extension_of(name).as_deref() != Some(self.extension) {
                 return Err(NativeIncludeReason::Extension);
             }
             return NATIVE_LIBRARY
@@ -564,7 +569,11 @@ impl Expansion<'_> {
         if Path::new(target).is_absolute() {
             return Err(NativeIncludeReason::Absolute);
         }
-        if !extension_matches(target) {
+        // The asset's backend's own files, and the headers written in the
+        // language the GPU backends share.
+        let extension = extension_of(target);
+        let shared = matches!(self.extension, "h" | "cuh" | "glsl") && extension.as_deref() == Some(SHARED_EXTENSION);
+        if extension.as_deref() != Some(self.extension) && !shared {
             return Err(NativeIncludeReason::Extension);
         }
         Ok(Include::Relative(target.to_owned()))
@@ -627,6 +636,29 @@ mod tests {
             .map(|file| file.path.file_name().unwrap().to_str().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(names, ["a.h", "b.h"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gpu_backends_share_hpp_headers() {
+        let root = fixture("shared");
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        std::fs::write(root.join("shared/protocol.hpp"), "PROTOCOL\n").unwrap();
+        let shared = asset(&root, "#include \"../shared/protocol.hpp\"\nBODY\n");
+        for extension in ["h", "cuh", "glsl"] {
+            let Expanded { source, .. } = expand_includes(&shared, extension, &[root.clone()]).unwrap();
+            assert_eq!(
+                source,
+                "#line 1 \"../shared/protocol.hpp\"\nPROTOCOL\n#line 2 \"kernel.metal\"\nBODY\n",
+                "{extension}"
+            );
+        }
+        // Seismic's library stays per backend.
+        let library = asset(&root, "#include <seismic/element.hpp>\n");
+        match expand_includes(&library, "h", &[root.clone()]) {
+            Err(LoadError::NativeInclude(error)) => assert_eq!(error.reason, NativeIncludeReason::Extension),
+            other => panic!("unexpected {other:?}"),
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

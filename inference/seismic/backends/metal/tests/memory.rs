@@ -70,7 +70,7 @@ fn a_long_run_of_submissions_leaves_no_live_heap() {
     let values = device.allocate(4096, 16).unwrap();
     let scalars = device.allocate(64, 16).unwrap();
     let submit = || {
-        let mut batch = DirectBatch::new(&device).unwrap();
+        let mut batch = DirectBatch::observed(&device).unwrap();
         batch
             .encode(&DirectLaunch {
                 pipeline: &pipelines[0],
@@ -78,13 +78,14 @@ fn a_long_run_of_submissions_leaves_no_live_heap() {
                 words: &[],
                 scalar_results: Some((&scalars, 0)),
                 threadgroups: [4, 1, 1],
+                grid: None,
                 threads_per_threadgroup: [64, 1, 1],
                 threadgroup_bytes: 0,
             })
             .unwrap();
         let submission = batch.commit();
         submission.finish().unwrap();
-        assert!(submission.device_seconds() >= 0.);
+        assert!(submission.device_seconds().unwrap() >= 0.);
     };
     // What the first submissions set up once is not what each one leaves.
     for _ in 0..SUBMISSIONS / 10 {

@@ -4,7 +4,8 @@
 //!
 //! Every parameter has ordinal names (`SEISMIC_PARAM_<n>`). A parameter
 //! whose name is unique among the entry's parameters also has named
-//! aliases.
+//! aliases. A host port defines no name at all: the kernel never accesses
+//! it, so callers skip it.
 
 use crate::native_name::native_macro;
 

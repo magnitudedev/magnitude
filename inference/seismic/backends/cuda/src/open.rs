@@ -1,6 +1,6 @@
 //! CUDA backend composition over one exact native context and stream.
 
-use crate::{Cuda, Device};
+use crate::{Cuda, Device, MemoryAccounts};
 use seismic_compiler::errors::{ExecutionError, TargetError};
 use seismic_compiler::evaluation::AnalyticalEvaluationContext;
 
@@ -9,8 +9,9 @@ pub struct OpenedCuda {
     pub device: std::sync::Arc<seismic_native_target::DeviceDescription<Cuda>>,
 }
 
-pub fn open(ordinal: u32) -> Result<OpenedCuda, ExecutionError> {
-    let service = Device::open(ordinal)?;
+/// Device `ordinal`, its own allocations charged to `accounts`.
+pub fn open(ordinal: u32, accounts: MemoryAccounts) -> Result<OpenedCuda, ExecutionError> {
+    let service = Device::open(ordinal, accounts)?;
     let device = crate::profile::device_for_opened(ordinal)
         .map_err(|error| ExecutionError::SubmissionFailed(error.to_string()))?;
     Ok(OpenedCuda { service, device })
@@ -32,7 +33,7 @@ pub fn usable_memory_bytes(ordinal: u32, uuid: [u8; 16]) -> Result<u64, Executio
     #[cfg(target_os = "windows")]
     {
         let _ = uuid;
-        Ok(Device::open(ordinal)?.memory_info()?.free_bytes)
+        Ok(crate::executor::memory_info(&context(ordinal)?)?.free_bytes)
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -45,10 +46,10 @@ pub fn usable_memory_bytes(ordinal: u32, uuid: [u8; 16]) -> Result<u64, Executio
             .map_err(|error| ExecutionError::SubmissionFailed(error.to_string()))?;
         let nvml = fresh.then(|| crate::nvml::NvmlDevice::open(uuid)).flatten();
         let before = nvml.as_ref().and_then(|nvml| nvml.sample());
-        let device = Device::open(ordinal)?;
-        let free = device.memory_info()?.free_bytes;
+        let context = context(ordinal)?;
+        let free = crate::executor::memory_info(&context)?.free_bytes;
         let after = nvml.as_ref().and_then(|nvml| nvml.sample());
-        drop(device);
+        drop(context);
         let accounting = before.zip(after).map(|(before, after)| DeviceAccounting {
             total: after.total,
             reserved: after.reserved,
@@ -57,6 +58,15 @@ pub fn usable_memory_bytes(ordinal: u32, uuid: [u8; 16]) -> Result<u64, Executio
         });
         Ok(usable_capacity(free, accounting))
     }
+}
+
+/// Ordinal `ordinal`'s primary context, retained: what a measurement of the
+/// context's cost opens, allocating nothing.
+fn context(ordinal: u32) -> Result<std::sync::Arc<crate::driver::Context>, ExecutionError> {
+    let driver = crate::driver::Driver::load().map_err(ExecutionError::SubmissionFailed)?;
+    let ordinal = std::ffi::c_int::try_from(ordinal)
+        .map_err(|_| ExecutionError::SubmissionFailed("CUDA device ordinal exceeds driver ABI".into()))?;
+    crate::driver::Context::retain(driver, ordinal).map_err(|error| ExecutionError::SubmissionFailed(error.to_string()))
 }
 
 /// A device's memory accounting across opening this process's context, in

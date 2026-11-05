@@ -51,4 +51,7 @@ pub struct DeviceOptions {
     /// Where compiled artifacts are looked up and kept. Without a store,
     /// every program is compiled.
     pub artifacts: Option<Arc<dyn ArtifactStore>>,
+    /// What its recorded graphs hold, as records hold it. Without one its
+    /// backend measures it on opening, once a process.
+    pub graph_cost: Option<seismic_compiler::graph_cost::GraphCost>,
 }

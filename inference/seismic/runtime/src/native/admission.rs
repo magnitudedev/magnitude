@@ -511,7 +511,6 @@ mod tests {
                 })
                 .into(),
             requirement: steps(8.),
-            measurement_identity: "measurements".into(),
             observations,
             served: [1, 2, 4].map(configuration).into(),
             reselection: None,

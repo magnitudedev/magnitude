@@ -727,7 +727,6 @@ mod tests {
                 })
                 .collect(),
             requirement: crate::native::tune::NumericalRequirement::BitExact,
-            measurement_identity: String::new(),
             observations: Vec::new(),
             served: Vec::new(),
             reselection: None,

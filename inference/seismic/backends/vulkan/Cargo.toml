@@ -9,7 +9,14 @@ license.workspace = true
 [dependencies]
 seismic-topology.workspace = true
 seismic-compiler.workspace = true
+seismic-reservation.workspace = true
+seismic-lang.workspace = true
 seismic-native-target.workspace = true
 ash = "=0.38.0"
 glslang = "=0.8.1"
 spirv-tools = "=0.13.3"
+
+[dev-dependencies]
+seismic-compiler = { workspace = true, features = ["fixtures"] }
+# The recorded RTX 3090, whose heaps and reservations the backend is held to.
+seismic-topology = { workspace = true, features = ["fixtures"] }

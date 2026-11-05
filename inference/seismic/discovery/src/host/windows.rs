@@ -141,19 +141,234 @@ pub(super) fn last_level_cache() -> Result<Option<Reported<u64>>, String> {
     Ok(last.map(|(_, total)| Reported::new(total, ReportedBy::WindowsProcessorCache)))
 }
 
+/// The records `GetLogicalProcessorInformationEx(relationship)` writes,
+/// each `Size` bytes, in a buffer aligned for them.
+fn processor_records(
+    relationship: windows_sys::Win32::System::SystemInformation::LOGICAL_PROCESSOR_RELATIONSHIP,
+) -> Result<Vec<u64>, String> {
+    use windows_sys::Win32::System::SystemInformation::GetLogicalProcessorInformationEx;
+    let mut length = 0u32;
+    unsafe { GetLogicalProcessorInformationEx(relationship, std::ptr::null_mut(), &mut length) };
+    let mut buffer = vec![0u64; (length as usize).div_ceil(8)];
+    if unsafe {
+        GetLogicalProcessorInformationEx(relationship, buffer.as_mut_ptr().cast(), &mut length)
+    } == 0
+    {
+        return Err(format!(
+            "GetLogicalProcessorInformationEx({relationship}) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    buffer.truncate((length as usize).div_ceil(8));
+    Ok(buffer)
+}
+
+/// Each record of `buffer` ([`processor_records`]), in order.
+fn each_record(
+    buffer: &[u64],
+    mut each: impl FnMut(
+        &windows_sys::Win32::System::SystemInformation::SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    ),
+) {
+    let (bytes, length) = (buffer.as_ptr().cast::<u8>(), buffer.len() * 8);
+    let mut offset = 0usize;
+    while offset < length {
+        // SAFETY: the OS wrote consecutive records, each `Size` bytes long.
+        let record = unsafe {
+            &*(bytes.add(offset) as *const windows_sys::Win32::System::SystemInformation::SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)
+        };
+        if record.Size == 0 {
+            break;
+        }
+        each(record);
+        offset += record.Size as usize;
+    }
+}
+
+/// The CPUs of `masks`, each its group's 64 times its group plus its bit.
+fn group_cpus(
+    masks: &[windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY],
+) -> Vec<usize> {
+    let mut cpus = masks
+        .iter()
+        .flat_map(|mask| {
+            (0..usize::BITS as usize)
+                .filter(move |bit| mask.Mask >> bit & 1 == 1)
+                .map(move |bit| usize::from(mask.Group) * 64 + bit)
+        })
+        .collect::<Vec<_>>();
+    cpus.sort_unstable();
+    cpus
+}
+
+/// Each NUMA node (`RelationNumaNode`), with memory where
+/// `GetNumaAvailableMemoryNodeEx` reports any available on it, its cores
+/// (`RelationProcessorCore`) those whose threads lie in it, each a
+/// performance core of the highest `EfficiencyClass`; the process may run
+/// on the CPUs of its groups (`GetProcessGroupAffinity`), within its
+/// affinity mask where it has one group (`GetProcessAffinityMask`).
+pub(super) fn processors() -> Result<crate::Processors, String> {
+    use windows_sys::Win32::System::SystemInformation::{RelationNumaNode, RelationProcessorCore};
+    use windows_sys::Win32::System::Threading::{
+        GetNumaAvailableMemoryNodeEx, GetProcessAffinityMask, GetProcessGroupAffinity,
+    };
+    let mut cores = Vec::new();
+    each_record(&processor_records(RelationProcessorCore)?, |record| {
+        // SAFETY: a `RelationProcessorCore` record's union is its processor.
+        let core = unsafe { &record.Anonymous.Processor };
+        // SAFETY: the record holds `GroupCount` masks.
+        let masks = unsafe {
+            std::slice::from_raw_parts(core.GroupMask.as_ptr(), usize::from(core.GroupCount))
+        };
+        cores.push((group_cpus(masks), core.EfficiencyClass));
+    });
+    let fastest = cores
+        .iter()
+        .map(|(_, class)| *class)
+        .max()
+        .ok_or("Windows reports no processor core")?;
+    let mut nodes = Vec::new();
+    let mut failed = None;
+    each_record(&processor_records(RelationNumaNode)?, |record| {
+        // SAFETY: a `RelationNumaNode` record's union is its node, holding
+        // `GroupCount` masks (one where it reports none).
+        let node = unsafe { &record.Anonymous.NumaNode };
+        let masks = unsafe {
+            std::slice::from_raw_parts(
+                node.Anonymous.GroupMasks.as_ptr(),
+                usize::from(node.GroupCount).max(1),
+            )
+        };
+        let cpus = group_cpus(masks);
+        let mut available = 0u64;
+        let Ok(number) = u16::try_from(node.NodeNumber) else {
+            failed.get_or_insert(format!("NUMA node {}", node.NodeNumber));
+            return;
+        };
+        if unsafe { GetNumaAvailableMemoryNodeEx(number, &mut available) } == 0 {
+            failed.get_or_insert(format!(
+                "GetNumaAvailableMemoryNodeEx({number}): {}",
+                std::io::Error::last_os_error()
+            ));
+            return;
+        }
+        let cores = cores
+            .iter()
+            .filter(|(threads, _)| threads.first().is_some_and(|first| cpus.contains(first)))
+            .map(|(threads, class)| crate::Core {
+                threads: threads.clone(),
+                performance: *class == fastest,
+            })
+            .collect();
+        nodes.push(crate::MemoryNode {
+            id: usize::from(number),
+            memory: available > 0,
+            cores,
+        });
+    });
+    if let Some(failed) = failed {
+        return Err(failed);
+    }
+    let process = unsafe { GetCurrentProcess() };
+    let mut count = 0u16;
+    unsafe { GetProcessGroupAffinity(process, &mut count, std::ptr::null_mut()) };
+    let mut groups = vec![0u16; usize::from(count)];
+    if unsafe { GetProcessGroupAffinity(process, &mut count, groups.as_mut_ptr()) } == 0 {
+        return Err(format!(
+            "GetProcessGroupAffinity: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let every = cores
+        .iter()
+        .flat_map(|(threads, _)| threads.iter().copied());
+    let allowed = match groups.as_slice() {
+        [group] => {
+            let (mut mask, mut system) = (0usize, 0usize);
+            if unsafe { GetProcessAffinityMask(process, &mut mask, &mut system) } == 0 {
+                return Err(format!(
+                    "GetProcessAffinityMask: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            every
+                .filter(|cpu| cpu / 64 == usize::from(*group) && mask >> (cpu % 64) & 1 == 1)
+                .collect()
+        }
+        groups => every
+            .filter(|cpu| groups.iter().any(|group| cpu / 64 == usize::from(*group)))
+            .collect(),
+    };
+    crate::Processors::new(
+        nodes,
+        allowed,
+        crate::ProcessorsReportedBy::WindowsProcessorInformation,
+    )
+}
+
+/// Nothing: the process's affinity mask would bound every thread's,
+/// [`pin`]'s workers among them, and the process's threads are not
+/// enumerated here.
+pub(super) fn place_process(_cpus: &[usize]) -> Result<(), String> {
+    Ok(())
+}
+
+/// `SetThreadGroupAffinity` of the calling thread to `cpus`: a thread runs
+/// in one processor group, so to those of the group holding the most of
+/// them (the first such).
+pub(super) fn pin(cpus: &[usize]) -> Result<(), String> {
+    use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadGroupAffinity};
+    let in_group = |group: usize| cpus.iter().filter(|&&cpu| cpu / 64 == group).count();
+    let group = cpus
+        .iter()
+        .map(|&cpu| cpu / 64)
+        .max_by_key(|&group| (in_group(group), std::cmp::Reverse(group)))
+        .ok_or("a thread placed on no CPU")?;
+    let mask = cpus
+        .iter()
+        .filter(|&&cpu| cpu / 64 == group)
+        .fold(0usize, |mask, &cpu| mask | 1 << (cpu % 64));
+    let group = u16::try_from(group).map_err(|_| format!("CPUs {cpus:?} beyond every group"))?;
+    let affinity = GROUP_AFFINITY {
+        Mask: mask,
+        Group: group,
+        Reserved: [0; 3],
+    };
+    match unsafe { SetThreadGroupAffinity(GetCurrentThread(), &affinity, std::ptr::null_mut()) } {
+        0 => Err(format!(
+            "SetThreadGroupAffinity to CPUs {cpus:?}: {}",
+            std::io::Error::last_os_error()
+        )),
+        _ => Ok(()),
+    }
+}
+
 pub(super) fn sample() -> Result<HostSample, ObservationError> {
     let status = memory_status().map_err(ObservationError::Failed)?;
     Ok(HostSample {
-        headroom: Reported::new(
+        // Available physical memory is standby and free pages, neither of
+        // which holds another program's working set; Windows reports no
+        // larger figure trimming working sets would make available, so a
+        // load obtains what any growth may take.
+        allocatable: Reported::new(
+            status.ullAvailPhys.min(status.ullAvailPageFile),
+            ReportedBy::WindowsPhysicalAndCommit,
+        ),
+        obtainable: Reported::new(
             status.ullAvailPhys.min(status.ullAvailPageFile),
             ReportedBy::WindowsPhysicalAndCommit,
         ),
         limits: job_limits()?,
         limit_visibility: LimitVisibility::Complete,
-        displacement: None,
         kernel_pressure: None,
+        held: None,
+        displaced_bytes: None,
     })
 }
+
+/// Windows counts no displacement here.
+pub(super) const DISPLACEMENT_COUNTERS: Option<super::ReadCounters> = None;
 
 fn job_limits() -> Result<Vec<ProcessMemoryLimit>, ObservationError> {
     let process = unsafe { GetCurrentProcess() };
@@ -211,4 +426,9 @@ fn job_limits() -> Result<Vec<ProcessMemoryLimit>, ObservationError> {
         used_bytes: counters.PagefileUsage as u64,
         reclaimable_bytes: 0,
     }])
+}
+
+/// No device's memory node is read here.
+pub(super) fn device_node(_location: crate::PciLocation) -> Result<crate::DeviceNode, String> {
+    Ok(crate::DeviceNode::Unknown)
 }

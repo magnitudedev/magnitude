@@ -1,7 +1,7 @@
 //! JIT code freed with its last kernel is reused for the next kernel
 //! compiled; every participant must run the code written there last.
 use crate::workers::{LaunchFrame, Workers};
-use crate::{compile, open_host, Cpu};
+use crate::{compile, open::open_quota, Cpu};
 use seismic_ir::construction::Construction;
 use seismic_ir::kernel::ops::{ConstantValue, ValueType};
 use seismic_ir::storage::GlobalBufferKind;
@@ -55,9 +55,9 @@ fn constant_writer(
 
 #[test]
 fn every_participant_runs_the_kernel_last_compiled_at_a_reused_code_address() {
-    let opened = open_host().unwrap();
+    let opened = open_quota().unwrap();
     let target = &opened.device;
-    let mut workers = Workers::host().unwrap();
+    let mut workers = Workers::host(std::thread::available_parallelism().unwrap()).unwrap();
     let workgroups = workers.count() as u64 * 64;
     for round in 0..256u32 {
         // Each round's kernel differs from the last only in its constant,

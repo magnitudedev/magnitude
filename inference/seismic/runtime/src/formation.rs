@@ -76,6 +76,15 @@ impl<P> Formed<P> {
     }
 }
 
+/// The programs a device's toolchain has formed (compiled, or loaded from
+/// its artifact store) and the seconds its calls took, summed over the
+/// threads that formed them.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FormedPrograms {
+    pub programs: usize,
+    pub seconds: f64,
+}
+
 /// What forming a program does, known before it is formed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum FormationClass {
@@ -94,8 +103,9 @@ pub(crate) struct ProgramFormer<T: Toolchain> {
     /// compile lives as long as some caller holds it.
     live: Mutex<HashMap<ArtifactKey, Vec<Weak<Compile<T::Program>>>>>,
     /// Compiles formed by the toolchain (compiled, or loaded from the
-    /// store) rather than found live.
+    /// store) rather than found live, and the nanoseconds its calls took.
     formed: std::sync::atomic::AtomicUsize,
+    forming_nanos: std::sync::atomic::AtomicU64,
     /// What the store was read to keep, by the key of a text and the entry
     /// list asked: the compile that serves them ([`ProgramFormer::kept`]),
     /// and whether it keeps a compile of exactly that list
@@ -171,6 +181,7 @@ impl<T: Toolchain> ProgramFormer<T> {
             store,
             live: Mutex::new(HashMap::new()),
             formed: std::sync::atomic::AtomicUsize::new(0),
+            forming_nanos: std::sync::atomic::AtomicU64::new(0),
             stored: Mutex::default(),
             listing: Mutex::new(()),
             compiled: Mutex::new(Linear::default()),
@@ -201,9 +212,14 @@ impl<T: Toolchain> ProgramFormer<T> {
             .expect("compile observation lock is never poisoned")
     }
 
-    /// How many compiles the toolchain has formed for this device.
-    pub(crate) fn formed(&self) -> usize {
-        self.formed.load(std::sync::atomic::Ordering::Relaxed)
+    /// The compiles the toolchain has formed for this device, and the time
+    /// its calls took.
+    pub(crate) fn programs_formed(&self) -> FormedPrograms {
+        FormedPrograms {
+            programs: self.formed.load(std::sync::atomic::Ordering::Relaxed),
+            seconds: std::time::Duration::from_nanos(self.forming_nanos.load(std::sync::atomic::Ordering::Relaxed))
+                .as_secs_f64(),
+        }
     }
 
     pub(crate) fn toolchain(&self) -> &T {
@@ -448,6 +464,9 @@ impl<T: Toolchain> ProgramFormer<T> {
             &missing,
             cache.as_ref().map(|cache| cache as &dyn ProgramCache),
         )?;
+        let took = u64::try_from(began.elapsed().as_nanos()).expect("a compile's nanoseconds fit 64 bits");
+        self.forming_nanos
+            .fetch_add(took, std::sync::atomic::Ordering::Relaxed);
         if new {
             self.compiled
                 .lock()

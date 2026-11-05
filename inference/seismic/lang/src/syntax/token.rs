@@ -41,10 +41,11 @@ pub enum Kw {
     Mut,
     Parallel,
     Return,
+    Const,
 }
 
 impl Kw {
-    pub const ALL: [Kw; 20] = [
+    pub const ALL: [Kw; 21] = [
         Kw::Fn,
         Kw::Native,
         Kw::Lower,
@@ -65,6 +66,7 @@ impl Kw {
         Kw::Mut,
         Kw::Parallel,
         Kw::Return,
+        Kw::Const,
     ];
 
     pub fn from_name(name: &str) -> Option<Kw> {
@@ -93,6 +95,7 @@ impl Kw {
             Kw::Mut => "mut",
             Kw::Parallel => "parallel",
             Kw::Return => "return",
+            Kw::Const => "const",
         }
     }
 }

@@ -7,12 +7,104 @@
 //! bound on what a load holds is a bound on all of it, so all of it is read
 //! here, by the parts the system reports.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak};
+
+/// Host memory a device's driver holds for this process outside the
+/// process's resident set. A device whose memory is the host's allocates
+/// from host RAM through its driver, and on Linux that is no resident
+/// anonymous or shared memory: on a GB10, 4 GiB of CUDA device allocations
+/// (`cuMemAlloc` and `cuMemCreate`, written) moved `RssAnon`, `RssShmem`
+/// and the cgroup's charge by none of it, and 2 GiB of `cuMemCreate` at a
+/// host NUMA location lands in `RssFile`, which the footprint leaves out.
+/// The backend counts each such allocation as it makes and frees it, beside
+/// what its device's context holds from its creation; all of it is part of
+/// the footprint ([`ProcessMemory::footprint_now`]).
+#[derive(Debug)]
+pub struct DriverMemory {
+    /// What the device's context holds from its creation.
+    context: u64,
+    /// What the backend's allocations on the device hold now.
+    allocated: AtomicU64,
+}
+
+impl DriverMemory {
+    /// `bytes` more allocated through the driver.
+    pub fn allocated(&self, bytes: u64) {
+        self.allocated.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// `bytes` of what was allocated freed.
+    pub fn freed(&self, bytes: u64) {
+        let before = self.allocated.fetch_sub(bytes, Ordering::Relaxed);
+        assert!(before >= bytes, "driver memory frees {bytes} bytes of {before} allocated");
+    }
+
+    /// What the driver holds for the process on the device now.
+    pub fn held_bytes(&self) -> u64 {
+        self.context + self.allocated.load(Ordering::Relaxed)
+    }
+}
+
+/// The driver memory the footprint counts: one account per device while
+/// any opening of it holds the account ([`count_driver_memory`]). Readings
+/// share it; only an opening changes it.
+static DRIVER_MEMORY: RwLock<Vec<(u128, Weak<DriverMemory>)>> = RwLock::new(Vec::new());
+/// Serializes openings, so a device is measured and counted once.
+static OPENING: Mutex<()> = Mutex::new(());
+
+/// Count the driver memory of the device `key` in the footprint for as long
+/// as the returned account is held: the device's live account, or a new one
+/// whose context holds what `context` measures, so a device opened twice is
+/// counted once.
+pub fn count_driver_memory<E>(
+    key: u128,
+    context: impl FnOnce() -> Result<u64, E>,
+) -> Result<Arc<DriverMemory>, E> {
+    let _opening = OPENING.lock().expect("no opening panics while counted");
+    let live = DRIVER_MEMORY
+        .read()
+        .expect("the driver memory accounts' lock is never poisoned")
+        .iter()
+        .find(|(device, _)| *device == key)
+        .and_then(|(_, account)| account.upgrade());
+    if let Some(live) = live {
+        return Ok(live);
+    }
+    let account = Arc::new(DriverMemory {
+        context: context()?,
+        allocated: AtomicU64::new(0),
+    });
+    let mut accounts = DRIVER_MEMORY
+        .write()
+        .expect("the driver memory accounts' lock is never poisoned");
+    accounts.retain(|(_, account)| account.strong_count() > 0);
+    accounts.push((key, Arc::downgrade(&account)));
+    Ok(account)
+}
+
+/// What every counted device's driver holds for this process now. Read on
+/// Linux, where it is outside the resident set; macOS charges a device's
+/// memory to the footprint itself.
+#[cfg(target_os = "linux")]
+fn driver_bytes() -> u64 {
+    DRIVER_MEMORY
+        .read()
+        .expect("the driver memory accounts' lock is never poisoned")
+        .iter()
+        .filter_map(|(_, account)| account.upgrade())
+        .map(|account| account.held_bytes())
+        .sum()
+}
+
 /// One reading of the process's memory. A part the system does not report
 /// is none.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProcessMemory {
     /// The physical footprint: what memory pressure and the peak-footprint
-    /// accounting count.
+    /// accounting count. On Linux, the resident anonymous and shared memory
+    /// and what a driver holds for the process in host RAM
+    /// ([`DriverMemory`]).
     pub footprint_bytes: Option<u64>,
     /// Heap blocks in use: what the process's own code and the frameworks
     /// it calls have allocated and not freed, by the sizes allocated. Pages
@@ -26,6 +118,8 @@ pub struct ProcessMemory {
     /// allocates are wired through one and are not (a load holding 2.8 GB
     /// on the device read zero here), so on Metal the device's allocations
     /// are footprint that no part of this reading separates from the rest.
+    /// On Linux, what drivers hold for the process in host RAM
+    /// ([`DriverMemory`]).
     pub graphics_bytes: Option<u64>,
     /// Resident pages of mapped files: outside the footprint, and reclaimed
     /// by the system without swapping.
@@ -128,26 +222,15 @@ impl ProcessMemory {
             let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
                 return Self::default();
             };
-            let bytes = |field: &str| {
-                status
-                    .lines()
-                    .find_map(|line| line.strip_prefix(field))?
-                    .trim()
-                    .strip_suffix("kB")?
-                    .trim()
-                    .parse::<u64>()
-                    .ok()
-                    .map(|kibibytes| kibibytes * 1024)
-            };
+            // A device with memory of its own holds its allocations outside
+            // the process; one whose memory is the host's, through its
+            // driver beside the resident set.
+            let driver = driver_bytes();
             Self {
-                footprint_bytes: bytes("RssAnon:")
-                    .zip(bytes("RssShmem:"))
-                    .map(|(anonymous, shared)| anonymous + shared),
+                footprint_bytes: linux::footprint_of(&status, driver),
                 malloc_live_bytes: linux::malloc_live_bytes(),
-                // A device with memory of its own holds its allocations
-                // outside the process; nothing of the footprint is tagged.
-                graphics_bytes: Some(0),
-                mapped_bytes: bytes("RssFile:"),
+                graphics_bytes: Some(driver),
+                mapped_bytes: linux::field_bytes(&status, "RssFile:"),
             }
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -171,10 +254,15 @@ mod linux {
     }
 
     /// The footprint: resident anonymous and shared memory, in one reading
-    /// of the process's status.
+    /// of the process's status, and what drivers hold for the process in
+    /// host RAM.
     pub(super) fn footprint_bytes() -> Option<u64> {
-        let status = std::fs::read_to_string("/proc/self/status").ok()?;
-        Some(field_bytes(&status, "RssAnon:")? + field_bytes(&status, "RssShmem:")?)
+        footprint_of(&std::fs::read_to_string("/proc/self/status").ok()?, super::driver_bytes())
+    }
+
+    /// The footprint in `status`, with what drivers hold, `driver`.
+    pub(super) fn footprint_of(status: &str, driver: u64) -> Option<u64> {
+        Some(field_bytes(status, "RssAnon:")? + field_bytes(status, "RssShmem:")? + driver)
     }
 
     /// A field of `/proc/self/status` the kernel states in kibibytes.
@@ -182,7 +270,7 @@ mod linux {
         field_bytes(&std::fs::read_to_string("/proc/self/status").ok()?, field)
     }
 
-    fn field_bytes(status: &str, field: &str) -> Option<u64> {
+    pub(super) fn field_bytes(status: &str, field: &str) -> Option<u64> {
         status
             .lines()
             .find_map(|line| line.strip_prefix(field))?
@@ -400,6 +488,38 @@ pub(crate) static MEASURING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A device's driver memory is counted once however often it is opened,
+    /// its context measured once, and it holds its context and what is
+    /// allocated and not freed; once no opening holds it, the next opening
+    /// measures again.
+    #[test]
+    fn a_device_is_counted_once_while_open() {
+        let _measuring = MEASURING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = u128::from_le_bytes(*b"driver-memory-01");
+        let measured = AtomicU64::new(0);
+        let measure = || -> Result<u64, ()> {
+            measured.fetch_add(1, Ordering::SeqCst);
+            Ok(100)
+        };
+        let first = count_driver_memory(key, measure).unwrap();
+        let second = count_driver_memory(key, measure).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(measured.load(Ordering::SeqCst), 1);
+        first.allocated(30);
+        second.allocated(12);
+        second.freed(30);
+        assert_eq!(first.held_bytes(), 112);
+        #[cfg(target_os = "linux")]
+        assert!(driver_bytes() >= 112);
+        drop((first, second));
+        let again = count_driver_memory(key, measure).unwrap();
+        assert_eq!(measured.load(Ordering::SeqCst), 2);
+        assert_eq!(again.held_bytes(), 100);
+        // A device whose context cannot be measured is not counted.
+        let other = u128::from_le_bytes(*b"driver-memory-02");
+        assert_eq!(count_driver_memory(other, || Err::<u64, _>("unlisted")).unwrap_err(), "unlisted");
+    }
 
     /// The reading follows the heap: bytes allocated and touched are live
     /// heap and footprint, and freed they are neither once returned.

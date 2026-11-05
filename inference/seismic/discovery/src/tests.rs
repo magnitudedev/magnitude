@@ -8,8 +8,8 @@ use seismic_topology::fixtures::{
     show, strix_halo_linux, topology, uuid, volume, STRIX_HALO_LINUX_UUID,
 };
 use seismic_topology::{
-    Availability, BackendName, DeviceTopology, ExecutorSelector, PhysicalIdentity, Reports,
-    Revision, StorageKind, StoreKind,
+    Availability, BackendName, Contract, DeviceTopology, ExecutorSelector, PhysicalIdentity,
+    Placing, Reports, Revision, StoreKind,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -36,8 +36,13 @@ fn identifiers(topology: &DeviceTopology) -> Vec<Revision> {
     for executor in topology.executors() {
         revisions.push(executor.id().revision());
         revisions.push(executor.physical().revision());
-        for kind in StorageKind::ALL {
-            revisions.extend(executor.placement(kind).iter().map(|id| id.revision()));
+        for kind in Contract::ALL {
+            revisions.extend(
+                executor
+                    .paths(Placing::Fixed(kind))
+                    .iter()
+                    .map(|id| id.revision()),
+            );
         }
     }
     for path in topology.access_paths() {
@@ -89,7 +94,7 @@ fn a_changed_refresh_leaves_no_identifier_at_its_old_revision() {
     assert!(after.executor(old.id()).is_none());
     assert!(after.store(before.host_ram().id()).is_none());
     assert!(after
-        .access_path(old.placement(StorageKind::Device)[0])
+        .access_path(old.paths(Placing::Fixed(Contract::DeviceOnly))[0])
         .is_none());
     assert_eq!(
         volume(&after, Path::new("/models")).unwrap().revision(),
@@ -144,7 +149,7 @@ fn the_machine_is_discovered_and_sampled() {
     let cpu = topology.resolve(ExecutorSelector::HostCpu).unwrap();
     if *cpu.availability() == Availability::Available {
         assert_eq!(
-            placement(&topology, cpu, StorageKind::Device),
+            placement(&topology, cpu, Contract::DeviceOnly),
             [(StoreKind::HostRam, None)]
         );
     }
@@ -155,7 +160,9 @@ fn the_machine_is_discovered_and_sampled() {
         .map(|executor| executor.id())
         .collect::<Vec<_>>();
     let sample = inventory.sample(&topology, &every);
-    assert!(sample.host_ram.as_ref().unwrap().headroom.value > 0);
+    let host = sample.host_ram.as_ref().unwrap();
+    assert!(host.allocatable.value > 0);
+    assert!(host.obtainable.value >= host.allocatable.value);
     assert_eq!(sample.volumes.len(), 1);
     assert_eq!(sample.volumes[0].0, served);
     assert!(sample.volumes[0].1.as_ref().unwrap().value > 0);

@@ -103,10 +103,10 @@ fn canonical_formation_alone_serves_a_legal_choice_without_building_observations
             NumericalRequirement::BitExact,
         )
         .unwrap();
-        let formed = device.programs_formed();
+        let formed = device.programs_formed().programs;
         assert!(unprepared.terminal().is_err());
         assert_eq!(
-            device.programs_formed(),
+            device.programs_formed().programs,
             formed,
             "a record cannot compile a missing default"
         );
@@ -117,7 +117,7 @@ fn canonical_formation_alone_serves_a_legal_choice_without_building_observations
         )
         .unwrap();
         search.prepare_defaults(&mut points).unwrap();
-        let formed = device.programs_formed();
+        let formed = device.programs_formed().programs;
         // From its mandatory work on the unit holds a legal served choice:
         // the canonical default, with its unmeasured scope explicit.
         let result = search.terminal().unwrap();
@@ -136,7 +136,7 @@ fn canonical_formation_alone_serves_a_legal_choice_without_building_observations
         ));
         assert_eq!(result, search.terminal().unwrap());
         assert_eq!(
-            device.programs_formed(),
+            device.programs_formed().programs,
             formed,
             "the record reuses the prepared default"
         );

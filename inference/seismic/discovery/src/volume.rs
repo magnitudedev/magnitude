@@ -5,8 +5,10 @@ use crate::host::ObservationError;
 use seismic_topology::{Reported, ReportedBy, VolumeId};
 use std::path::Path;
 
-/// The identity of the volume holding `path`.
-pub(crate) fn identify(path: &Path) -> std::io::Result<VolumeId> {
+/// The identity of the volume holding `path`: what a volume's measured
+/// figures are keyed by, for a caller that reads a file there without an
+/// inventory.
+pub fn identify(path: &Path) -> std::io::Result<VolumeId> {
     platform::identify(path)
 }
 

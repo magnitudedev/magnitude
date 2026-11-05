@@ -10,19 +10,15 @@
 //! applicability for a native implementation.
 use super::NativePrepared;
 use super::admission::{NumericalObservation, NumericalRequirement, admit};
-use super::comparison::{COMPARISON_VERSION, SubjectMeasurement, compare};
+use super::comparison::{SubjectMeasurement, compare};
 use super::budget::PointPrices;
 use super::observation::{Observation, ReferencePages, StateRegion, Subject, observe, subjects};
 use super::search::LaunchKey;
 use super::timing::PointTiming;
 use super::tune::{Exclusion, TuneError, TuningInitializer, TuningPoint};
-use crate::api::{
-    device::DeviceInner,
-    kernel::{DecodedValue, EncodedArgs},
-};
+use crate::api::kernel::{DecodedValue, EncodedArgs};
 use seismic_lang::entry::LogicalEntry;
 use seismic_measure::{Deadline, WorkError};
-use sha2::{Digest, Sha256};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -425,32 +421,15 @@ impl<'a> PreparedPoint<'a> {
 pub(super) struct Validator {
     mutable: Vec<(usize, String)>,
     shared: Rc<Shared>,
-    identity: String,
 }
 
 impl Validator {
     pub(super) fn new(
-        device: &Arc<DeviceInner>,
         logical: &Arc<LogicalEntry>,
         mutable: &[(usize, String)],
         requirement: &NumericalRequirement,
         default: &Arc<NativePrepared>,
     ) -> Self {
-        // What every measurement of the unit is a measurement of, besides
-        // its point and key: the comparison, the default it is against, the
-        // entry and the device. Tensor contents are generated test data;
-        // the caller's tuning key names what they are generated from. The
-        // requirement's α is not part of it: it judges measurements and
-        // changes none.
-        let mut identity = Sha256::new();
-        identity.update(b"native-measurement");
-        identity.update(COMPARISON_VERSION.to_le_bytes());
-        identity.update(format!("{:?}", requirement.activation()).as_bytes());
-        identity.update(default.artifact().0.as_bytes());
-        identity.update(seismic_lang::reference_math::VERSION);
-        identity.update(logical.identity().digest());
-        identity.update(logical.module_hash().digest());
-        identity.update(device.tuning_identity());
         Self {
             mutable: mutable.to_vec(),
             shared: Rc::new(Shared {
@@ -461,13 +440,7 @@ impl Validator {
                 seconds: RefCell::new(0.),
                 evidence: RefCell::new(Evidence::default()),
             }),
-            identity: crate::telemetry::hex(&identity.finalize()),
         }
-    }
-
-    /// The identity of the unit's measurements.
-    pub(super) fn identity(&self) -> &str {
-        &self.identity
     }
 
     /// Time spent executing the default as the reference so far.

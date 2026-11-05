@@ -27,6 +27,7 @@ pub mod errors;
 pub mod evaluation;
 pub mod executable;
 pub mod feedback;
+pub mod graph_cost;
 pub mod implementation;
 pub mod numerics;
 pub mod planning;

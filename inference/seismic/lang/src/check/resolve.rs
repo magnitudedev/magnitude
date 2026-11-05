@@ -22,6 +22,9 @@ pub(crate) struct Located {
 pub(crate) struct SigParam {
     pub name: String,
     pub ownership: Ownership,
+    /// An awaited port (`&await`): the launch parks on the host's writes
+    /// to it ([`ShapedHead::AwaitTensor`]).
+    pub awaited: bool,
     pub ty: ValueType,
     pub span: Span,
 }
@@ -103,6 +106,7 @@ impl Sig {
             .map(|parameter| SigParam {
                 name: parameter.name.clone(),
                 ownership: parameter.ownership.clone(),
+                awaited: parameter.awaited,
                 ty: transfer_type(&self.arena, &parameter.ty, &mut arena, &mut map),
                 span: parameter.span,
             })
@@ -208,6 +212,9 @@ pub(crate) struct Declared<'a> {
     pub family: FamilyId,
     pub elem_bindings: Vec<(String, Elem)>,
     pub body: &'a ast::Block,
+    /// The declaration this definition was resolved from (an `fn` or a
+    /// `lower`): its structure is the definition's own content.
+    pub declaration: &'a ast::Decl,
     pub file: usize,
     pub span: Span,
     pub name_span: Span,
@@ -1020,16 +1027,59 @@ pub(crate) fn signature_of(
                     head: ShapedHead::MutTensor,
                     ..
                 } => Ownership::Exclusive,
+                TypeKind::Shaped {
+                    head: ShapedHead::HostTensor { write },
+                    ..
+                } => Ownership::Host { write: *write },
+                TypeKind::Shaped {
+                    head: ShapedHead::AwaitTensor { write: false },
+                    ..
+                } => Ownership::Shared,
+                TypeKind::Shaped {
+                    head: ShapedHead::AwaitTensor { write: true },
+                    ..
+                } => Ownership::Exclusive,
                 _ => Ownership::Value,
             }
         }
         let ownership = ownership(&p.ty);
+        fn holds_await(ty: &ast::TypeExpr) -> bool {
+            match &ty.kind {
+                TypeKind::Shaped {
+                    head: ShapedHead::AwaitTensor { .. },
+                    ..
+                } => true,
+                TypeKind::Tuple(parts) => parts.iter().any(holds_await),
+                _ => false,
+            }
+        }
+        let awaited = holds_await(&p.ty);
+        if awaited && matches!(ownership, Ownership::Tuple(_)) {
+            return Err(Diagnostic::with_rule(
+                DiagnosticRule::Ownership,
+                p.ty.span,
+                "an awaited port is a parameter of its own, never a tuple's part",
+            ));
+        }
+        // The body never names a host port, so none is a tuple's part.
+        fn holds_host(ownership: &Ownership) -> bool {
+            match ownership {
+                Ownership::Host { .. } => true,
+                Ownership::Tuple(parts) => parts.iter().any(holds_host),
+                _ => false,
+            }
+        }
+        if matches!(ownership, Ownership::Tuple(_)) && holds_host(&ownership) {
+            return Err(Diagnostic::with_rule(
+                DiagnosticRule::Ownership,
+                p.ty.span,
+                "a host port is a parameter of its own, never a tuple's part",
+            ));
+        }
         if ownership == Ownership::Exclusive {
             if let ValueType::Tensor(tensor) = &ty {
                 if let Elem::Repr(representation) = &tensor.elem {
-                    if crate::registry::representation_info(*representation).access
-                        != crate::registry::RepresentationAccess::ReadWrite
-                    {
+                    if !crate::registry::record_writable(*representation) {
                         return Err(Diagnostic::with_rule(
                             DiagnosticRule::Type,
                             p.ty.span,
@@ -1045,6 +1095,7 @@ pub(crate) fn signature_of(
         params.push(SigParam {
             name: p.name.name.clone(),
             ownership,
+            awaited,
             ty,
             span: p.name.span,
         });
@@ -1052,7 +1103,10 @@ pub(crate) fn signature_of(
     fn borrowed_result(ty: &ast::TypeExpr) -> bool {
         match &ty.kind {
             TypeKind::Shaped {
-                head: ShapedHead::SharedTensor | ShapedHead::MutTensor,
+                head: ShapedHead::SharedTensor
+                    | ShapedHead::MutTensor
+                    | ShapedHead::HostTensor { .. }
+                    | ShapedHead::AwaitTensor { .. },
                 ..
             } => true,
             TypeKind::Tuple(parts) => parts.iter().any(borrowed_result),
@@ -1329,6 +1383,12 @@ fn contract_mismatch(a: &Sig, b: &Sig) -> Option<String> {
             q.name, p.name, a.name
         ));
     }
+    if let Some((p, q)) = a.params.iter().zip(&b.params).find(|(p, q)| p.awaited != q.awaited) {
+        return Some(format!(
+            "parameter `{}` has different awaited state than `{}` of an overlapping definition of `{}`",
+            q.name, p.name, a.name
+        ));
+    }
     if let Some((p, q)) = a
         .params
         .iter()
@@ -1564,6 +1624,7 @@ pub(crate) fn resolve<'a>(
                         family: FamilyId::new(program, 0),
                         elem_bindings: Vec::new(),
                         body: &f.body,
+                        declaration: decl,
                         file: *file,
                         span: f.span,
                         name_span: f.name.span,
@@ -1751,6 +1812,7 @@ pub(crate) fn resolve<'a>(
                     ),
                     elem_bindings,
                     body,
+                    declaration: decl,
                     file: *file,
                     span: l.span,
                     name_span: l.name.span,

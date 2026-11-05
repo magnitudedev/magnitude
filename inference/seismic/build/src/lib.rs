@@ -20,6 +20,7 @@
 //! static __MODULE: seismic::generated::OnceLock<Result<seismic::generated::Module, seismic::CheckedBundleError>> = ...;
 //! pub fn module() -> Result<&'static seismic::generated::Module, seismic::CheckedBundleError>;
 //! pub const IDENTITY: &str = "<hex digest of sources + compiler semantic version>";
+//! pub mod constants { pub const <NAME>: u64 = <value>; .. }   // every `const NAME = INTEGER`
 //!
 //! pub mod <entry> {                       // one per exported entry (every portable family)
 //!     pub struct Args<'a> {               // source parameter order, source names
@@ -423,7 +424,8 @@ mod internals {
                 any = true;
                 let source = module
                     .native_asset(entry.id, backend)
-                    .expect("shared loader captures native assets");
+                    .expect("shared loader captures native assets")
+                    .text;
                 // CPU assets are Rust, compiled into the embedding crate from
                 // their authored path, so compiler diagnostics and tools point
                 // at the authored file.
@@ -453,7 +455,7 @@ mod internals {
                 // Included files are validated against the including entry's
                 // ABI, exactly like the asset itself. The ABI is independent
                 // of the file, so build its symbol set once for this entry.
-                let allowed = native_abi_symbols(entry, definition, dialect)?;
+                let allowed = native_abi_symbols(entry, definition, dialect, module.constants())?;
                 for file in std::iter::once(&files.asset).chain(&files.includes) {
                     validate_native_abi(entry, &allowed, &file.path, &file.text)?;
                     if dialect == SourceDialect::Vulkan {
@@ -467,6 +469,7 @@ mod internals {
                         entry,
                         definition,
                         dialect,
+                        backend.authors_written_grid_blocks(),
                         &files.asset.path,
                         source,
                     )?;
@@ -511,10 +514,13 @@ mod internals {
         Ok(())
     }
 
+    /// `grid_blocks`: the backend authors a written-grid launch as a block
+    /// (`BackendName::authors_written_grid_blocks`).
     fn validate_launch_templates(
         entry: &EntryInfo,
         definition: &NativeImplementation,
         dialect: SourceDialect,
+        grid_blocks: bool,
         path: &std::path::Path,
         source: &str,
     ) -> Result<(), BuildError> {
@@ -526,25 +532,29 @@ mod internals {
                 kernel: launch.kernel.clone(),
                 detail,
             };
+            // A written-grid launch of a backend that authors it as a block
+            // is that block's body, which the runtime's generated kernel
+            // runs.
+            let (qualified, defined) = match dialect {
+                SourceDialect::Metal => ("kernel", launch.kernel.clone()),
+                SourceDialect::Cuda if grid_blocks && launch.grid.is_some() => {
+                    ("__device__", seismic_lang::registry::written_grid_block(&launch.kernel))
+                }
+                SourceDialect::Cuda => ("__global__", launch.kernel.clone()),
+                SourceDialect::Vulkan => ("", String::new()),
+            };
             let definitions = tokens
                 .windows(3)
                 .filter_map(|triple| {
                     let [(qualifier, offset), (void, _), (name, _)] = triple else {
                         unreachable!()
                     };
-                    let matches = match dialect {
-                        SourceDialect::Metal => *qualifier == "kernel" && *void == "void",
-                        SourceDialect::Cuda => *qualifier == "__global__" && *void == "void",
-                        SourceDialect::Vulkan => false,
-                    };
-                    (matches && *name == launch.kernel).then_some(*offset)
+                    (!qualified.is_empty() && *qualifier == qualified && *void == "void" && *name == defined)
+                        .then_some(*offset)
                 })
                 .collect::<Vec<_>>();
             let [kernel_at] = definitions.as_slice() else {
-                return Err(fail(format!(
-                    "expected one GPU kernel definition for `{}`",
-                    launch.kernel
-                )));
+                return Err(fail(format!("expected one GPU kernel definition for `{defined}`")));
             };
             let guard = format!("SEISMIC_FORMING_{}", native_macro(&launch.kernel));
             let mut guards = Vec::<(Option<&str>, usize)>::new();
@@ -637,9 +647,10 @@ mod internals {
     }
 
     /// Metal's argument table holds 31 buffers. The native ABI binds every
-    /// tensor parameter, every tensor result, every scratch buffer, the
-    /// argument words and the scalar-result slots; all of them are known from
-    /// the declaration, so the limit is checked here rather than at encode.
+    /// tensor parameter but a host port (which the kernel never accesses),
+    /// every tensor result, every scratch buffer, the argument words and the
+    /// scalar-result slots; all of them are known from the declaration, so
+    /// the limit is checked here rather than at encode.
     fn validate_metal_buffer_slots(
         entry: &EntryInfo,
         definition: &NativeImplementation,
@@ -647,7 +658,10 @@ mod internals {
         let tensors = entry
             .parameters
             .iter()
-            .filter(|parameter| matches!(parameter.kind, ParameterSummaryKind::Tensor { .. }))
+            .filter(|parameter| match &parameter.kind {
+                ParameterSummaryKind::Tensor { access, .. } => !matches!(access, TensorAccess::Host { .. }),
+                _ => false,
+            })
             .count()
             + entry
                 .results
@@ -794,11 +808,19 @@ mod internals {
         entry: &EntryInfo,
         definition: &NativeImplementation,
         dialect: SourceDialect,
+        constants: &[(String, u64)],
     ) -> Result<HashSet<String>, BuildError> {
         let mut abi = AbiSymbols {
             entry: &entry.name,
             symbols: HashMap::new(),
         };
+        // Every module constant, which the rendered source defines when named.
+        for (name, _) in constants {
+            abi.define(
+                AbiMeaning::Constant(name.clone()),
+                [format!("SEISMIC_CONST_{}", native_macro(name))],
+            )?;
+        }
         if !definition.launch_scoped() {
             for parameter in &definition.params {
                 abi.define(
@@ -834,9 +856,11 @@ mod internals {
                 [format!("SEISMIC_BUFFER_SCRATCH_{}", native_macro(&scratch.name))],
             )?;
         }
-        // The ABI's own names, fixed by the dialect.
+        // The ABI's own names, fixed by the dialect; and the backend's
+        // fact every dialect's prefix states.
         let mut symbols = HashSet::new();
         symbols.insert("SEISMIC_BUFFER_SCALAR_RESULTS".to_owned());
+        symbols.insert("SEISMIC_PARKS_IN_KERNELS".to_owned());
         match dialect {
             SourceDialect::Cuda => {
                 symbols.insert("SEISMIC_BUFFER_WORDS".to_owned());
@@ -928,6 +952,9 @@ mod internals {
                     "FIXED",
                     "LEADING_ALIGNMENT",
                     "TRAILING_ALIGNMENT",
+                    "CHUNK_COLUMNS",
+                    "KBLOCK_BYTES",
+                    "KBLOCK_ALIGNMENT",
                 ] {
                     symbols.insert(format!("{prefix}_{suffix}"));
                 }
@@ -948,6 +975,9 @@ mod internals {
                     symbols.insert(format!("{prefix}_{role}_FIRST"));
                     symbols.insert(format!("{prefix}_{role}_UNIT_WORDS"));
                     symbols.insert(format!("{prefix}_{role}_REST_ALIGNMENT"));
+                    symbols.insert(format!("{prefix}_{role}_CHUNK_BYTES"));
+                    symbols.insert(format!("{prefix}_{role}_CHUNK_ALIGNMENT"));
+                    symbols.insert(format!("{prefix}_{role}_FRAGMENT_ALIGNMENT"));
                 }
                 symbols.insert(prefix);
                 abi.define(AbiMeaning::Conversion(from.clone(), to.clone()), symbols)?;
@@ -964,6 +994,11 @@ mod internals {
         for ((ordinal, parameter), names) in entry.parameters.iter().enumerate().zip(&names) {
             let mut symbols = HashSet::new();
             match &parameter.kind {
+                // A host port defines nothing: the kernel never accesses it.
+                ParameterSummaryKind::Tensor {
+                    access: seismic_lang::checked::TensorAccess::Host { .. },
+                    ..
+                } => {}
                 ParameterSummaryKind::Tensor { rank, element, .. } => {
                     symbols.extend(names.tensor_buffers());
                     for prefix in names.tensor_prefixes() {
@@ -1023,6 +1058,7 @@ mod internals {
         /// A name the ABI itself fixes: its words and scalar-result
         /// buffers, and the dialect's helpers and device facts.
         Abi,
+        Constant(String),
         Tune(String),
         Runtime(String),
         Forming(String),
@@ -1038,6 +1074,7 @@ mod internals {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
                 Self::Abi => write!(f, "the ABI's own buffers and helpers"),
+                Self::Constant(name) => write!(f, "module constant `{name}`"),
                 Self::Tune(name) => write!(f, "tuning parameter `{name}`"),
                 Self::Runtime(name) => write!(f, "runtime parameter `{name}`"),
                 Self::Forming(kernel) => write!(f, "launch `{kernel}`"),
@@ -1163,6 +1200,13 @@ mod internals {
                         "TILE_ROWS",
                         "MMA_KBLOCK",
                         "MMA_LANES",
+                        "MMA_STEP",
+                        "MMA_STEP_SLOTS",
+                        "MMA_FRAGMENT_ROW",
+                        "MMA_FRAGMENT_COLUMN",
+                        "MMA_FRAGMENT_BYTE",
+                        "RECORD_ENTRY",
+                        "RECORD_FACTOR",
                     ] {
                         symbols.insert(format!("{prefix}_{suffix}"));
                     }
@@ -1178,6 +1222,7 @@ mod internals {
                             "ENTRY_BYTES",
                             "FACTORS_OFFSET",
                             "ENTRY_BITS",
+                            "KBLOCK_ENTRIES",
                         ] {
                             symbols.insert(format!("{plane_prefix}_{suffix}"));
                         }
@@ -1289,6 +1334,11 @@ mod internals {
         );
         out.push_str("pub fn module() -> Result<&'static seismic::generated::Module, seismic::CheckedBundleError> { seismic::generated::module_from_bundle(&__MODULE, __BUNDLE) }\n");
         out.push_str(&format!("pub const IDENTITY: &str = {:?};\n", identity));
+        out.push_str("/// The module constants (`const NAME = INTEGER`), which natives read as `SEISMIC_CONST_NAME`.\npub mod constants {\n");
+        for (name, value) in module.constants() {
+            out.push_str(&format!("  pub const {name}: u64 = {value};\n"));
+        }
+        out.push_str("}\n");
         if let Some(library) = cpu_library {
             render_cpu_library(&mut out, library);
         }
@@ -1311,7 +1361,7 @@ mod internals {
             matches!(
                 parameter.kind,
                 ParameterSummaryKind::Tensor {
-                    access: TensorAccess::Shared | TensorAccess::Mutable,
+                    access: TensorAccess::Shared | TensorAccess::Mutable | TensorAccess::Host { .. },
                     ..
                 }
             )
@@ -1451,7 +1501,7 @@ mod internals {
                         TensorAccess::Owned => {
                             out.push_str(&format!("      encoder.tensor(&{expression});\n"));
                         }
-                        TensorAccess::Shared | TensorAccess::Mutable => {
+                        TensorAccess::Shared | TensorAccess::Mutable | TensorAccess::Host { .. } => {
                             out.push_str(&format!("      encoder.tensor({expression});\n"));
                         }
                     },
@@ -1522,7 +1572,8 @@ mod internals {
                     ParameterSummaryKind::Tensor { access, .. } => {
                         let method = match access {
                             TensorAccess::Owned => "owned_tensor",
-                            TensorAccess::Shared => "shared_tensor",
+                            // A host port binds as the device sees it.
+                            TensorAccess::Shared | TensorAccess::Host { .. } => "shared_tensor",
                             TensorAccess::Mutable => "mutable_tensor",
                         };
                         out.push_str(&format!("      encoder.{method}({expression});\n"));
@@ -2248,7 +2299,7 @@ mod internals {
         match kind {
             ParameterSummaryKind::Tensor { access, .. } => match access {
                 TensorAccess::Owned => "seismic::Tensor".to_owned(),
-                TensorAccess::Shared => "&'a seismic::Tensor".to_owned(),
+                TensorAccess::Shared | TensorAccess::Host { .. } => "&'a seismic::Tensor".to_owned(),
                 TensorAccess::Mutable => "&'a mut seismic::Tensor".to_owned(),
             },
             ParameterSummaryKind::Scalar(dtype) => scalar_type(*dtype).to_owned(),
@@ -2261,7 +2312,9 @@ mod internals {
         match kind {
             ParameterSummaryKind::Tensor { access, .. } => match access {
                 TensorAccess::Owned => "seismic::WorkflowTensorOwned<'a>".to_owned(),
-                TensorAccess::Shared => "seismic::WorkflowTensorRef<'a>".to_owned(),
+                TensorAccess::Shared | TensorAccess::Host { .. } => {
+                    "seismic::WorkflowTensorRef<'a>".to_owned()
+                }
                 TensorAccess::Mutable => "seismic::WorkflowTensorMut<'a>".to_owned(),
             },
             ParameterSummaryKind::Scalar(dtype) => scalar_type(*dtype).to_owned(),
@@ -2857,6 +2910,28 @@ mod native_tests {
         }
     }
 
+    /// A host port defines no ABI symbol (the kernel never accesses it), so
+    /// an asset naming one is refused, and its name collides with nothing.
+    #[test]
+    fn host_ports_define_no_abi_symbols() {
+        match build_request(
+            "abi-host-staged",
+            "[N](staged: &host mut tensor[N] i32, out: &mut tensor[1] i32)",
+            "kernel void request() { ulong b = SEISMIC_BUFFER_STAGED; }\n",
+        ) {
+            Err(BuildError::NativeAbi { symbol, .. }) => {
+                assert_eq!(symbol, "SEISMIC_BUFFER_STAGED");
+            }
+            other => panic!("unexpected result: {:?}", other.err()),
+        }
+        build_request(
+            "abi-host-words",
+            "[N](words: &host tensor[N] i32, out: &mut tensor[1] i32)",
+            "kernel void request(device int *out [[buffer(SEISMIC_BUFFER_OUT)]]) { out[0] = 1; }\n",
+        )
+        .expect("a host port named `words` collides with no ABI symbol");
+    }
+
     #[test]
     fn native_asset_accepts_exact_generated_tensor_and_result_symbols() {
         let unique = SystemTime::now()
@@ -2888,6 +2963,37 @@ mod native_tests {
             .out_dir(&output)
             .run()
             .expect("exact entry ABI symbols must pass the consumer build");
+        fs::remove_dir_all(&root).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn module_constants_are_generated_and_admitted_by_name() {
+        let root = fixture("constants");
+        let source = root.join("ops.seismic");
+        fs::write(&source, "const WIDTH = 256\n\nfn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"native/scale.metal\":\n    launch scale:\n        threadgroups (ceil_div(N, WIDTH), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n").unwrap();
+        let asset = root.join("native/scale.metal");
+        let build = |text: &str, name: &str| {
+            fs::write(&asset, text).unwrap();
+            Build::new("fixture")
+                .source(&source)
+                .std(false)
+                .out_dir(root.join(name))
+                .run()
+        };
+        let built = build(
+            "kernel void scale(uint index [[thread_position_in_grid]]) { if (index < SEISMIC_CONST_WIDTH) {} }\n",
+            "named",
+        )
+        .expect("a declared module constant is part of the ABI");
+        let generated = fs::read_to_string(&built.bindings).unwrap();
+        assert!(generated.contains("pub mod constants {\n  pub const WIDTH: u64 = 256;\n}"));
+        match build(
+            "kernel void scale(uint index [[thread_position_in_grid]]) { if (index < SEISMIC_CONST_HEIGHT) {} }\n",
+            "unknown",
+        ) {
+            Err(BuildError::NativeAbi { symbol, .. }) => assert_eq!(symbol, "SEISMIC_CONST_HEIGHT"),
+            other => panic!("expected an unknown constant, got {other:?}"),
+        }
         fs::remove_dir_all(&root).expect("remove fixture directory");
     }
 

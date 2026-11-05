@@ -1841,6 +1841,17 @@ impl<'a> Checker<'a> {
                 );
                 return None;
             };
+            if seeded.iter().any(|(bound, _)| *bound as usize == ordinal) {
+                self.error(
+                    DiagnosticRule::Dimension,
+                    parameter.span,
+                    format!(
+                        "the call binds `{}`'s dimension `{}` twice",
+                        name.name, parameter.name
+                    ),
+                );
+                return None;
+            }
             let value = value.integer().expect("a checked seed has its symbol");
             seeded.push((
                 u32::try_from(ordinal).expect("dimension ordinal fits u32"),
@@ -2084,6 +2095,11 @@ impl<'a> Checker<'a> {
         // Logical ownership is checked at the static call boundary.
         let mut arguments = Vec::new();
         for (parameter, ordinal) in params.iter().zip(&order) {
+            if parameter.awaited {
+                self.error(DiagnosticRule::Ownership, args[*ordinal].span,
+                    "a function with awaited ports is an entry, which no definition calls");
+                return None;
+            }
             super::ownership::argument_leaves(
                 &parameter.ownership,
                 &args[*ordinal],
@@ -2095,6 +2111,16 @@ impl<'a> Checker<'a> {
         for (ownership, argument) in &arguments {
             if *ownership == ParamOwnership::Value {
                 continue;
+            }
+            // A host port is a launch's, which its host serves: only an
+            // entry's caller binds one.
+            if matches!(ownership, ParamOwnership::Host { .. }) {
+                self.error(
+                    DiagnosticRule::Ownership,
+                    argument.span,
+                    "a function with host ports is an entry, which no definition calls",
+                );
+                return None;
             }
             if *ownership == ParamOwnership::Owned {
                 let (_, taken) = match self.owned_consumption(argument) {
@@ -2183,7 +2209,7 @@ impl<'a> Checker<'a> {
                 return None;
             };
             let storage_root = self.root_var_local(binding_local);
-            self.write(storage_root, binding_local, arg.span)?;
+            self.write(storage_root, binding_local, false, arg.span)?;
         }
 
         // The members that apply at this call: the contract, then every

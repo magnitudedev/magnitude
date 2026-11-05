@@ -3,8 +3,8 @@
 //! module, the `OpFmaKHR` binding of `fma` on devices with
 //! `VK_KHR_shader_fma` (§16.1) and one compute pipeline per entry with its
 //! workgroup size and group-memory views as specialization constants, a
-//! required subgroup size of 32 where the device takes one, and the device's
-//! pipeline cache ([`DirectModule::new`]).
+//! required subgroup size of 32 where the device takes one, and a pipeline
+//! cache of the program's own, kept with it ([`DirectModule::new`]).
 
 use crate::device::Device;
 use crate::facts::{SubgroupWidth, SUBGROUP_WIDTH};
@@ -156,31 +156,63 @@ impl DirectModule {
     /// The pipelines of `entries`, each from its sealed SPIR-V, with its
     /// constants: the workgroup size (ids 0..3), then the rest (ids 3..). A
     /// pipeline-creation failure is a toolchain failure.
+    ///
+    /// `kept` is what creating them left before, [`vk::PipelineCache`] data,
+    /// empty when there is none; what creating them leaves now is returned
+    /// beside the module. A driver compiles a pipeline nothing serves, which
+    /// is most of a Vulkan load: 130 s of every load of Qwen3.6 35B Q4 on an
+    /// RTX 3090, one pipeline after another, its SPIR-V already kept. Data a
+    /// driver does not recognize it ignores, and the pipelines are compiled.
     pub(crate) fn new(
         device: &Device,
         entries: &[(&[u32], &ProgramEntry)],
-    ) -> Result<Self, NativeCompilationError> {
+        kept: &[u8],
+    ) -> Result<(Self, Vec<u8>), NativeCompilationError> {
         let mut module = Self {
             device: device.clone(),
             pipelines: Vec::with_capacity(entries.len()),
         };
+        let vulkan = &device.inner.device;
+        let cache = unsafe {
+            vulkan.create_pipeline_cache(
+                &vk::PipelineCacheCreateInfo::default().initial_data(kept),
+                None,
+            )
+        }
+        .map_err(|error| toolchain(format!("vkCreatePipelineCache failed: {error}")))?;
+        let created = module.create(cache, entries);
+        let data = created.and_then(|()| {
+            unsafe { vulkan.get_pipeline_cache_data(cache) }
+                .map_err(|error| toolchain(format!("vkGetPipelineCacheData failed: {error}")))
+        });
+        unsafe { vulkan.destroy_pipeline_cache(cache, None) };
+        Ok((module, data?))
+    }
+
+    fn create(
+        &mut self,
+        cache: vk::PipelineCache,
+        entries: &[(&[u32], &ProgramEntry)],
+    ) -> Result<(), NativeCompilationError> {
+        let device = self.device.clone();
         for (words, entry) in entries {
             // The `OpFmaKHR` binding follows validation, which the linked
             // validator does not know.
             let pipeline = if device.facts().shader_fma.float32 {
                 let bound = seal::fma_khr(words)
                     .map_err(|error| NativeCompilationError::MalformedToolchainOutput(error.0))?;
-                module.pipeline(&bound, entry)?
+                self.pipeline(cache, &bound, entry)?
             } else {
-                module.pipeline(words, entry)?
+                self.pipeline(cache, words, entry)?
             };
-            module.pipelines.push(pipeline);
+            self.pipelines.push(pipeline);
         }
-        Ok(module)
+        Ok(())
     }
 
     fn pipeline(
         &self,
+        cache: vk::PipelineCache,
         words: &[u32],
         entry: &ProgramEntry,
     ) -> Result<vk::Pipeline, NativeCompilationError> {
@@ -241,9 +273,10 @@ impl DirectModule {
         let info = vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(inner.layout);
-        let created = inner.measured(|| unsafe {
-            device.create_compute_pipelines(inner.cache, &[info], None)
-        });
+        let created = {
+            let _creating = crate::device::creating_pipelines();
+            unsafe { device.create_compute_pipelines(cache, &[info], None) }
+        };
         unsafe { device.destroy_shader_module(shader, None) };
         created.map(|pipelines| pipelines[0]).map_err(|(_, error)| {
             toolchain(format!(

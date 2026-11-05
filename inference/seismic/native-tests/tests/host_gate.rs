@@ -5,33 +5,19 @@
 //! submitting thread, so its gate blocks that thread until another opens it.
 
 use seismic::{
-    Availability, BackendName, Device, Devices, Element, NativeGraphFamily, NativeGraphMetadata,
+    BackendName, Device, Devices, Element, NativeGraphFamily, NativeGraphMetadata,
     NativeSpecialization, Tensor, Timeline, TimelineNode,
 };
 use seismic_native_tests::scale_rows;
 use std::time::Duration;
 
 fn devices() -> Vec<Device> {
-    let devices = Devices::discover(&[]).expect("device discovery");
-    let topology = devices.topology();
-    [
+    seismic_native_tests::devices(&[
         BackendName::Cpu,
         BackendName::Metal,
         BackendName::Cuda,
         BackendName::Vulkan,
-    ]
-    .into_iter()
-    .filter(|backend| {
-        topology.executors().iter().any(|device| {
-            device.backend() == *backend && matches!(device.availability(), Availability::Available)
-        })
-    })
-    .map(|backend| {
-        devices
-            .open_backend(backend)
-            .expect("available device opens")
-    })
-    .collect()
+    ])
 }
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
@@ -71,6 +57,7 @@ fn a_gate_holds_the_work_after_it_until_the_host_opens_it() {
             )
             .unwrap()
             .value;
+        let arrival = graph.timeline(TimelineNode::Signal);
         let gate = graph.timeline(TimelineNode::Wait);
         let after = graph
             .enqueue(
@@ -87,7 +74,7 @@ fn a_gate_holds_the_work_after_it_until_the_host_opens_it() {
         graph.export(&after).unwrap();
         let plan = graph.seal().unwrap();
         let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
-        let mut slot = family.new_slot(1).unwrap();
+        let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
         let output_slot = family.new_output_slot().unwrap();
 
         let first = (0..n).map(|value| value as f32).collect::<Vec<_>>();
@@ -95,33 +82,45 @@ fn a_gate_holds_the_work_after_it_until_the_host_opens_it() {
         let shared = Tensor::shared(&device, Element::f32(), &[m, n]).unwrap();
         // SAFETY: no device work uses the tensor yet.
         unsafe { shared.write_shared(0, &f32_bytes(&first)).unwrap() };
-        let (opened, done) = (Timeline::new(&device).unwrap(), Timeline::new(&device).unwrap());
+        let (arrived, opened, done) = (
+            Timeline::new(&device).unwrap(),
+            Timeline::new(&device).unwrap(),
+            Timeline::new(&device).unwrap(),
+        );
         // Two runs: the second's values are past the first's.
         for step in 1..=2u64 {
             let outputs = family.new_output_slot().unwrap().activate(&plan).unwrap();
             let mut bindings = plan.bindings();
             bindings.set(&input, &shared).unwrap();
+            bindings.set_timeline(arrival, &arrived, step).unwrap();
             bindings.set_timeline(gate, &opened, step).unwrap();
             bindings.set_timeline(signal, &done, step).unwrap();
             let mut active = slot.activate(&plan).unwrap();
             let ready = active.attach(bindings, outputs).unwrap();
             let opener = {
-                let (opened, done, shared, second) =
-                    (opened.clone(), done.clone(), shared.clone(), second.clone());
+                let (arrived, opened, done, shared, second) = (
+                    arrived.clone(),
+                    opened.clone(),
+                    done.clone(),
+                    shared.clone(),
+                    second.clone(),
+                );
                 std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(50));
-                    // The device holds at the gate: nothing after it ran.
-                    let held = !done.reached(step);
+                    // The device signals its arrival at the gate: the work
+                    // before it has completed.
+                    let arrived = arrived.wait(step, Duration::from_secs(10)).unwrap();
+                    // It holds there: nothing after the gate ran.
+                    let held = arrived && !done.reached(step).unwrap();
                     // SAFETY: the work after the gate, which reads the
                     // input, waits until the gate opens; the work before it
-                    // read the input 50 ms ago.
+                    // has completed.
                     unsafe { shared.write_shared(0, &f32_bytes(&second)).unwrap() };
                     opened.signal(step).unwrap();
                     held
                 })
             };
             let (outputs, completion) = ready.submit().unwrap();
-            assert!(done.wait(step, Duration::from_secs(10)), "{backend:?}: signal");
+            assert!(done.wait(step, Duration::from_secs(10)).unwrap(), "{backend:?}: signal");
             completion.wait().unwrap();
             assert!(opener.join().unwrap(), "{backend:?}: the gate held the device");
             assert_eq!(
@@ -165,7 +164,7 @@ fn an_open_gate_lets_the_run_through() {
         graph.export(&value).unwrap();
         let plan = graph.seal().unwrap();
         let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
-        let mut slot = family.new_slot(1).unwrap();
+        let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
         let values = (0..m * n).map(|value| value as f32).collect::<Vec<_>>();
         let tensor = Tensor::from_host(&device, Element::f32(), &[m, n], &f32_bytes(&values))
             .unwrap();
@@ -213,7 +212,7 @@ fn a_run_binds_every_timeline_node() {
     graph.export(&value).unwrap();
     let plan = graph.seal().unwrap();
     let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
-    let mut slot = family.new_slot(1).unwrap();
+    let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
     let tensor = Tensor::zeros(&device, Element::f32(), &[1, 4]).unwrap();
     let outputs = family.new_output_slot().unwrap().activate(&plan).unwrap();
     let mut bindings = plan.bindings();

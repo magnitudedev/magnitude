@@ -815,7 +815,7 @@ fn capture_invocation<T: TargetFamily, H>(
     termination: SourceTermination<Vec<DecodedValue>>,
     inputs: &[Input],
     live: u64,
-    mut read: impl FnMut(&TensorInner) -> Result<Vec<u8>, ExecutionError>,
+    mut read: impl FnMut(&TensorInner) -> Result<Vec<u8>, crate::api::TensorError>,
 ) -> Result<ObservedInvocation, ObservationError> {
     let outputs = match &termination {
         SourceTermination::Returned(values) => values.as_slice(),
@@ -861,7 +861,7 @@ fn capture_invocation<T: TargetFamily, H>(
         Ok(ObservedTensor {
             representation: t.representation(),
             shape: t.extents().iter().map(|n| *n as usize).collect(),
-            bytes: read(t).map_err(ObservationError::Execution)?,
+            bytes: read(t).map_err(tensor_error)?,
         })
     };
     let mut results = Vec::with_capacity(outputs.len());
@@ -1130,7 +1130,7 @@ mod tests {
                 reference_work_limit: 10000,
             };
             if corpus_case == ValidationCase::CORPUS[0].0 {
-                let before = device.storage_usage(seismic_topology::StorageKind::Device);
+                let before = device.device_ledger();
                 let mut wrong = case.clone();
                 wrong.values.bind(
                     prepared.kernel.schema().dimensions()[0].symbol,
@@ -1147,7 +1147,7 @@ mod tests {
                     Err(ObservationError::InvalidCase(_))
                 ));
                 assert_eq!(
-                    device.storage_usage(seismic_topology::StorageKind::Device),
+                    device.device_ledger(),
                     before,
                     "rejected point releases admitted resources"
                 );
@@ -1162,7 +1162,7 @@ mod tests {
                     Err(ObservationError::DeadlineExpired)
                 ));
                 assert_eq!(
-                    device.storage_usage(seismic_topology::StorageKind::Device),
+                    device.device_ledger(),
                     before,
                     "expired observation allocates no resources"
                 );
@@ -1177,7 +1177,7 @@ mod tests {
                     Err(ObservationError::Capacity { .. })
                 ));
                 assert_eq!(
-                    device.storage_usage(seismic_topology::StorageKind::Device),
+                    device.device_ledger(),
                     before,
                     "capacity rejection retains no resources"
                 );

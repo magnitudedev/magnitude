@@ -461,48 +461,64 @@ mod tests {
         assert_eq!((text.as_str(), number, flag), ("formed", 7, true));
     }
 
-    /// The most items of a batch formed at once, as `count` counts them
-    /// while each is formed.
+    /// A rendezvous of items formed at once: each item holds its thread
+    /// until `parties` items have been formed at once or its patience runs
+    /// out, so items that may overlap do, and the most formed at once is
+    /// what the threads allowed, not their timing, decides.
     struct AtOnce {
-        now: AtomicUsize,
-        most: AtomicUsize,
+        parties: usize,
+        patience: std::time::Duration,
+        /// Items being formed now, and the most ever formed at once.
+        state: Mutex<(usize, usize)>,
+        met: Condvar,
     }
 
     impl AtOnce {
-        fn new() -> Self {
-            Self { now: AtomicUsize::new(0), most: AtomicUsize::new(0) }
+        fn new(parties: usize, patience: std::time::Duration) -> Self {
+            Self { parties, patience, state: Mutex::new((0, 0)), met: Condvar::new() }
         }
 
-        fn count(&self) {
-            let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
-            self.most.fetch_max(now, Ordering::SeqCst);
-            self.now.fetch_sub(1, Ordering::SeqCst);
+        fn form(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.0 += 1;
+            state.1 = state.1.max(state.0);
+            self.met.notify_all();
+            let (mut state, _) = self
+                .met
+                .wait_timeout_while(state, self.patience, |state| state.1 < self.parties)
+                .unwrap();
+            state.0 -= 1;
+        }
+
+        fn most(self) -> usize {
+            self.state.into_inner().unwrap().1
         }
     }
 
     /// A narrowed set works a batch on no more threads at once than it was
     /// allowed, the caller among them, and on its whole width at once again
-    /// afterwards. Each claim holds whatever the threads' timing: a bound
-    /// is the most items formed at once, never threads seen over time (one
-    /// allowed thread at a time may be a different thread each time), and
-    /// the whole width is proven by a barrier only that many threads at
-    /// once can pass.
+    /// afterwards. Each item holds its thread until one more item than
+    /// allowed is formed beside it, or a few milliseconds pass, so a bound
+    /// fails whenever more threads are let in; the whole width is a
+    /// rendezvous only that many threads at once complete, with a deadline,
+    /// so a regression fails instead of hanging.
     #[test]
     fn a_narrowed_set_works_a_batch_on_the_threads_allowed() {
+        const HOLD: std::time::Duration = std::time::Duration::from_millis(10);
         let workers = Arc::new(Workers::new(6));
         let work = (0..48usize).collect::<Vec<_>>();
         {
             let _narrowed = workers.narrowed(2);
-            let flat = AtOnce::new();
-            workers.each(&work, |_| flat.count());
-            assert!(flat.most.into_inner() <= 2);
+            let flat = AtOnce::new(3, HOLD);
+            workers.each(&work, |_| flat.form());
+            assert!(flat.most() <= 2);
             // Batches handed out from inside a batch share the allowance:
             // it is the set's, not each batch's.
-            let nested = AtOnce::new();
+            let nested = AtOnce::new(3, HOLD);
             workers.each(&work[..6], |_| {
-                workers.each(&work[..6], |_| nested.count());
+                workers.each(&work[..6], |_| nested.form());
             });
-            assert!(nested.most.into_inner() <= 2);
+            assert!(nested.most() <= 2);
             let _alone = workers.narrowed(0);
             let threads = Mutex::new(HashSet::new());
             workers.each(&work, |_| {
@@ -515,12 +531,11 @@ mod tests {
             );
         }
         // The set is whole again: its width and the caller form one item
-        // each at once, or none passes the barrier.
+        // each at once.
         let whole = workers.width() + 1;
-        let together = std::sync::Barrier::new(whole);
-        workers.each(&work[..whole], |_| {
-            together.wait();
-        });
+        let together = AtOnce::new(whole, std::time::Duration::from_secs(2));
+        workers.each(&work[..whole], |_| together.form());
+        assert_eq!(together.most(), whole);
     }
 
     /// What a job allocated and freed on a worker thread is the system's

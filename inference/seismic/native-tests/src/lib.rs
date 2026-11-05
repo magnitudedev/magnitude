@@ -6,3 +6,51 @@
 #![allow(non_snake_case)]
 
 include!(concat!(env!("OUT_DIR"), "/fixtures.rs"));
+
+/// Available test backends of this test's capability domain, or exactly
+/// the backend explicitly requested by the runner. A test's domain states
+/// the backends it runs on, so under a requested backend outside it the
+/// test selects none; a requested backend inside it must be available and
+/// open, as absence is never a successful empty run.
+pub fn devices(backends: &[seismic::BackendName]) -> Vec<seismic::Device> {
+    devices_with(backends, seismic::DeviceOptions::default())
+}
+
+/// Select test devices with the caller's artifact-store configuration. Each
+/// call discovers and opens fresh devices; selection has the same contract
+/// as `devices`.
+pub fn devices_with(
+    backends: &[seismic::BackendName],
+    options: seismic::DeviceOptions,
+) -> Vec<seismic::Device> {
+    use seismic::{Availability, BackendName, Devices};
+    let selected = match std::env::var("SEISMIC_TEST_BACKEND") {
+        Ok(name) => Some(name),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => panic!("invalid SEISMIC_TEST_BACKEND: {error}"),
+    }.map(|name| match name.as_str() {
+        "cpu" => BackendName::Cpu,
+        "metal" => BackendName::Metal,
+        "cuda" => BackendName::Cuda,
+        "vulkan" => BackendName::Vulkan,
+        _ => panic!("unknown SEISMIC_TEST_BACKEND {name:?}"),
+    });
+    if let Some(backend) = selected.filter(|backend| !backends.contains(backend)) {
+        eprintln!("native test backends: none, {backend:?} is outside this test's backend domain");
+        return Vec::new();
+    }
+    let discovery = Devices::discover(&[]).expect("test device discovery");
+    let topology = discovery.topology();
+    let opened = backends.iter().copied().filter(|backend| selected.is_none_or(|selected| selected == *backend))
+        .filter_map(|backend| topology.executors().iter().find(|device| {
+            device.backend() == backend && matches!(device.availability(), Availability::Available)
+        }).map(|device| (backend, device.id())))
+        .map(|(backend, id)| discovery.open_with(id, options.clone())
+            .unwrap_or_else(|error| panic!("available {backend:?} test device must open: {error}")))
+        .collect::<Vec<_>>();
+    if let Some(backend) = selected {
+        assert!(!opened.is_empty(), "selected {backend:?} test backend is unavailable");
+    }
+    eprintln!("native test backends: {:?}", opened.iter().map(seismic::Device::backend).collect::<Vec<_>>());
+    opened
+}

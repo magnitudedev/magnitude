@@ -7,7 +7,7 @@
 //! -- --ignored --nocapture`.
 
 use seismic::{
-    Availability, BackendName, Device, Devices, Element, HostHeap, NativeGraphFamily,
+    BackendName, Device, Element, HostHeap, NativeGraphFamily,
     NativeGraphMetadata, NativeSpecialization, Tensor,
 };
 use seismic_native_tests::{accumulate, scale_rows};
@@ -18,26 +18,12 @@ const WARM: usize = 20;
 const RUNS: usize = 200;
 
 fn devices() -> Vec<Device> {
-    let devices = Devices::discover(&[]).expect("device discovery");
-    let topology = devices.topology();
-    [
+    seismic_native_tests::devices(&[
         BackendName::Cpu,
         BackendName::Metal,
         BackendName::Cuda,
         BackendName::Vulkan,
-    ]
-    .into_iter()
-    .filter(|backend| {
-        topology.executors().iter().any(|device| {
-            device.backend() == *backend && matches!(device.availability(), Availability::Available)
-        })
-    })
-    .map(|backend| {
-        devices
-            .open_backend(backend)
-            .expect("available device opens")
-    })
-    .collect()
+    ])
 }
 
 /// The host heap of the plan sealed from `nodes` chained `scale_rows` calls
@@ -188,7 +174,7 @@ fn host_time_per_run_of_a_300_node_graph() {
         let plan = graph.seal().unwrap();
         let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
         // The plan writes no input, so the slot holds no upload region.
-        let mut slot = family.new_slot(1).unwrap();
+        let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
         let mut output_slot = Some(family.new_output_slot().unwrap());
         let inputs = (0..2)
             .map(|index| {
@@ -231,5 +217,37 @@ fn host_time_per_run_of_a_300_node_graph() {
             (attach + submit) * 1e6,
             (attach + submit) * 1e6 / NODES as f64
         );
+    }
+}
+
+/// Inputs have a completion lifetime even if the caller releases every tensor
+/// handle before submission. A weak census handle does not supply that lifetime.
+#[test]
+fn graph_completion_retains_inputs_until_its_outcome_is_taken() {
+    for device in devices() {
+        let kernel = scale_rows::native_for_device(
+            &device, &NativeSpecialization::new().with_param("ROWS", 1),
+        ).unwrap();
+        let mut graph = device.native_graph();
+        let input = graph.port(Element::f32(), &[1, 8]).unwrap();
+        let value = graph.enqueue(&kernel, scale_rows::WorkflowArgs {
+            x: input.tensor().into(), factor: 2.0,
+        }).unwrap().value;
+        graph.export(&value).unwrap();
+        let plan = graph.seal().unwrap();
+        let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
+        let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
+        let source = Tensor::from_host(&device, Element::f32(), &[1, 8], &[0; 32]).unwrap();
+        let observer = source.observe_storage();
+        let mut bindings = plan.bindings();
+        bindings.set(&input, &source).unwrap();
+        drop(source);
+        let mut active = slot.activate(&plan).unwrap();
+        let ready = active.attach(bindings, plan.new_outputs().unwrap()).unwrap();
+        let (outputs, completion) = ready.submit().unwrap();
+        assert_eq!(observer.charged_bytes(), Some(32));
+        completion.wait().unwrap();
+        assert_eq!(observer.charged_bytes(), None);
+        drop(outputs);
     }
 }

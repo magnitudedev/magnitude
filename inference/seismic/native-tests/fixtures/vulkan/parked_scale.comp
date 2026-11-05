@@ -1,0 +1,10 @@
+// `parked_scale` (route.seismic): Vulkan parks the call at a submission
+// boundary, so the host's answer is in place before the kernel starts; it
+// reads the word once.
+void parked_scale() {
+    const int answer = seismic_i32(SEISMIC_PTR(SEISMIC_BUFFER_ANSWER))[0].v;
+    seismic_f32 x = seismic_f32(SEISMIC_PTR(SEISMIC_BUFFER_X));
+    seismic_f32 result = seismic_f32(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+    for (uint64_t index = 0ul; index < SEISMIC_DIM_N; ++index)
+        result[uint(index * SEISMIC_RESULT_0_STRIDE_0)].v = x[uint(index * SEISMIC_X_STRIDE_0)].v * float(answer);
+}

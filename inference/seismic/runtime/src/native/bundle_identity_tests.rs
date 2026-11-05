@@ -181,19 +181,20 @@ fn decoded_kernel_bundle_forms_identical_native_sources() {
                     .native_implementation_at(decoded_entry, *backend, bound)
                     .expect("the decoded module has the native implementation");
                 let specialization = specialization(native);
-                let asset = |module: &CheckedModule, entry| {
-                    module
-                        .native_asset(entry, *backend)
-                        .expect("the asset is captured")
-                        .to_owned()
-                };
+                fn asset(
+                    module: &CheckedModule,
+                    entry: seismic_lang::ids::EntryId,
+                    backend: BackendName,
+                ) -> seismic_lang::checked::NativeAsset<'_> {
+                    module.native_asset(entry, backend).expect("the asset is captured")
+                }
                 let expected = render_source(
                     *dialect,
                     &from_source,
                     bound,
                     native,
                     &specialization,
-                    &asset(&checked, info.id),
+                    asset(&checked, info.id, *backend),
                 );
                 let actual = render_source(
                     *dialect,
@@ -201,7 +202,7 @@ fn decoded_kernel_bundle_forms_identical_native_sources() {
                     bound,
                     decoded_native,
                     &specialization,
-                    &asset(&decoded, decoded_entry),
+                    asset(&decoded, decoded_entry, *backend),
                 );
                 assert!(
                     expected == actual,

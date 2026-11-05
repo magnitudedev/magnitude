@@ -228,6 +228,7 @@ fn describe(entry: &ash::Entry, instance: &ash::Instance, pd: vk::PhysicalDevice
         "pipelineCreationCacheControl": b(f13.pipeline_creation_cache_control),
         "vulkanMemoryModel": b(f12.vulkan_memory_model),
         "vulkanMemoryModelDeviceScope": b(f12.vulkan_memory_model_device_scope),
+        "vulkanMemoryModelAvailabilityVisibilityChains": b(f12.vulkan_memory_model_availability_visibility_chains),
         "shaderSubgroupExtendedTypes": b(f12.shader_subgroup_extended_types),
         "shaderIntegerDotProduct": b(f13.shader_integer_dot_product),
         "subgroupSizeControl": b(f13.subgroup_size_control),

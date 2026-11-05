@@ -654,14 +654,19 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
-                // Packed representations are readable and decodable but never writable.
-                if let Some(shaped) = self.locals[binding.index()].ty.shaped() {
-                    if matches!(shaped.elem, Elem::Repr(_)) {
-                        self.error(
-                            DiagnosticRule::Type,
-                            target.span,
-                            "packed representations are readable and decodable but not writable",
-                        );
+                // The selection, then the value, the representation's store
+                // rule takes (`registry::store_rule`).
+                let shaped = self.locals[binding.index()].ty.shaped().cloned();
+                let record = shaped
+                    .as_ref()
+                    .is_some_and(|shaped| super::ir::whole_records(&indices, shaped.rank()));
+                let packed = match shaped.as_ref().map(|shaped| &shaped.elem) {
+                    Some(Elem::Repr(representation)) => Some(*representation),
+                    _ => None,
+                };
+                if let Some(representation) = packed {
+                    if let Err(refusal) = crate::registry::store_rule(representation).admits(record) {
+                        self.error(DiagnosticRule::Type, target.span, refusal);
                         return None;
                     }
                 }
@@ -688,6 +693,22 @@ impl<'a> Checker<'a> {
                 } else {
                     self.compound_value(target, op, value, Some(&selected))?
                 };
+                // A value of an element parameter is decided where lowering
+                // binds it (`entry_build`).
+                let stored = match &value.ty {
+                    ValueType::Tensor(stored) => match &stored.elem {
+                        Elem::Param(_) => None,
+                        Elem::Repr(stored) => Some(Some(*stored)),
+                        Elem::Dtype(_) => Some(None),
+                    },
+                    _ => Some(None),
+                };
+                if let (Some(representation), Some(stored)) = (packed, stored) {
+                    if let Err(refusal) = crate::registry::store_rule(representation).admits_value(stored) {
+                        self.error(DiagnosticRule::Type, value.span, refusal);
+                        return None;
+                    }
+                }
                 let value = match (&selected, &value.ty) {
                     (ValueType::Scalar(dtype), ValueType::Scalar(actual))
                         if !(*actual == *dtype || (actual.is_float() && dtype.is_float())) =>
@@ -736,7 +757,7 @@ impl<'a> Checker<'a> {
                         "this selection has type",
                     )?,
                 };
-                self.write(root, binding, target.span)?;
+                self.write(root, binding, record, target.span)?;
                 let checked_place = CheckedPlace::Element {
                     root: super::ownership::LocalPlace::root(root),
                     indices,
@@ -776,7 +797,7 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
-                self.write(root.local, root.local, span)
+                self.write(root.local, root.local, false, span)
             }
             CheckedPlace::Element { root, .. } => {
                 if !self.writable_place(root) {
@@ -787,7 +808,7 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
-                self.write(root.local, root.local, span)
+                self.write(root.local, root.local, false, span)
             }
             CheckedPlace::Tuple(places) => {
                 let mut last = None;
@@ -802,14 +823,13 @@ impl<'a> Checker<'a> {
     fn state_place(&mut self, name: &ast::Ident) -> Option<CheckedPlace> {
         let Some(id) = self.lookup(&name.name) else {
             if !self.poisoned.contains(&name.name) {
-                self.error(
-                    DiagnosticRule::Resolution,
-                    name.span,
+                let message = self.host_port(&name.name).unwrap_or_else(|| {
                     format!(
                         "`{}` is not declared; introduce state with `let mut`",
                         name.name
-                    ),
-                );
+                    )
+                });
+                self.error(DiagnosticRule::Resolution, name.span, message);
             }
             return None;
         };

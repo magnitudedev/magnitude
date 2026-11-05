@@ -20,8 +20,9 @@ pub use seismic_compiler::feedback::{
     PreparationOptions,
 };
 pub use seismic_lang::checked::{
-    NativeComparison, NativeCondition, NativeImplementation, NativeLaunch, NativeNatExpr,
-    NativeParameter, NativeScratch, NativeSpecialization, NativeSpecializationError,
+    Encoded as LaunchEncoding, NativeComparison, NativeCondition, NativeImplementation,
+    NativeLaunch, NativeNatExpr, NativeParameter, NativeScratch, NativeSpecialization,
+    NativeSpecializationError,
 };
 pub use seismic_lang::precision::{Limit, PrecisionPolicy, SpecialPolicy, Tolerance};
 pub use seismic_native_cpu::repack::ScaledCodeRows;
@@ -30,15 +31,17 @@ pub mod testing {
     pub use seismic_compiler::numerics::{compare_element, ElementComparison};
 }
 pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactStore, DeviceOptions};
+pub use seismic_runtime::formation::FormedPrograms;
+pub use seismic_runtime::{backing_times, large_page_backing, BackingTimes, LargePageBacking};
 /// Offline formation coverage of a generated module's native
 /// implementations, and offline formation of the kernels a program requests.
 #[cfg(feature = "coverage")]
 pub mod coverage {
     use crate::{generated::Module, KernelRequest, NativeSpecialization};
     pub use seismic_runtime::native::coverage::{
-        Configuration, Coverage, CoverageError, Formation, FormationFailure, Forming, GroupSite,
-        InProcess, ProgramEntry, ProgramSource, Progress, RequestFailure, Target, Toolchain,
-        Untaken, Verdict, form,
+        form, Configuration, Coverage, CoverageError, Formation, FormationFailure, Forming,
+        GroupSite, InProcess, ProgramEntry, ProgramSource, Progress, RequestFailure, Target,
+        Toolchain, Untaken, Verdict,
     };
 
     /// Every resident weight representation a weight slot of `module`'s
@@ -112,8 +115,8 @@ pub use seismic_runtime::native::search::{
     Cost, LaunchKey, ParameterValues, SearchSettings, SearchStop,
 };
 pub use seismic_runtime::native::trace::{
-    host_seconds, SubmissionTrace, TraceDetail, TraceError, TracedLaunch, TracedLaunchGeometry,
-    TracedSubmission,
+    host_seconds, GateOpening, SubmissionTrace, TraceDetail, TraceError, TracedLaunch,
+    TracedLaunchGeometry, TracedQueueSubmission, TracedSubmission,
 };
 pub use seismic_runtime::native::tune::{
     admit, governing_ratio, reselect, return_freed_pages, BuildError, Configuration,
@@ -125,7 +128,9 @@ pub use seismic_runtime::native::tune::{
     TuningDisposition, TuningInitializer, TuningMethod, TuningResult, TuningTime, UnitPlan,
     Violation, Work, Workers, WorkloadRotation, WrittenRows, COMPARISON_VERSION, GOVERNING_STEP,
 };
-pub use seismic_runtime::native::{Footprint, NativeArtifactIdentity, Observed, Quote};
+pub use seismic_runtime::native::{
+    Footprint, GraphReplays, NativeArtifactIdentity, NativeQueue, Observed, Quote,
+};
 
 /// Result of checking one native entry's element bindings without device
 /// formation. Acceptance proves only checked source semantics.
@@ -166,41 +171,56 @@ pub mod native_cpu {
     };
 }
 
+/// What recorded graphs are made of and what a device's hold for it.
+pub use seismic_compiler::graph_cost::{GraphBytes, GraphCensus, GraphCost};
 pub use seismic_lang::expr::{BigInt, BigUint};
 pub use seismic_lang::ids::StableEntryId;
 pub use seismic_lang::reference_math::conversion::exact_f64;
-pub use seismic_lang::registry::{f16_bits, f16_to_f32, BackendName, Layout, OperandRecipe};
+pub use seismic_lang::registry::{f16_bits, f16_to_f32, record_table_bytes, BackendName, Layout, OperandRecipe};
 pub use seismic_lang::types::DType;
 /// The Seismic CPU library every CPU native kernel builds on.
 pub use seismic_native_cpu as cpu;
+pub use seismic_runtime::api::tensor::{
+    PreparedRecommit, RecommitRefusal, RecommitRelease, RecordPlacement, Resizer,
+};
 pub use seismic_runtime::api::HostRegion;
 pub use seismic_runtime::api::{
-    CallError, OutputError, RegionError, TensorError, ViewChargeError, WorkflowError,
+    CallError, OutputError, RegionError, SharedWordError, TensorError, ViewChargeError,
+    WorkflowError,
 };
-pub use seismic_runtime::native::recorded_graph_device_bytes;
+
 /// The largest block a dedicated device's allocator takes from its driver
 /// for an ordinary allocation (blocks grow from 64 MiB to it).
 pub use seismic_compiler::blocks::BLOCK_CAP_BYTES as DEVICE_BLOCK_CAP_BYTES;
+mod flight;
+pub use flight::{FlightCompletion, FlightRing};
 mod slab;
+pub use seismic_discovery::{
+    device_node, pin, place_process, volume_available, volume_identity, Core, DeviceNode,
+    DiscoveryError, DisplacementWindow, HostDisplacement, HostHeld, HostStatus, Inventory,
+    KernelPressure, LimitVisibility, MemoryNode, ObservationError, PciLocation, ProcessLimitKind,
+    ProcessMemoryLimit, ProcessPlacement, Processors, ProcessorsReportedBy, RuntimeStatus, Sample, Status,
+    DISPLACEMENT_CADENCE, DISPLACEMENT_HISTORY,
+};
+pub use seismic_lang::forms::MetalPacking;
 /// Measuring work on a device (`seismic-measure`): the timing session, the
 /// sustained clock, the statistics and the records of measured points. The
 /// runtime's measurable work is [`KernelPoint`] and [`GraphPoint`].
 pub use seismic_measure as measure;
-pub use seismic_lang::forms::MetalPacking;
-pub use seismic_runtime::devices::{LimitError, MemoryUsage, OpenError, ResolveError};
-pub use seismic_runtime::native::{
-    GraphPending, GraphPoint, GraphTiming, KernelPoint, Point, PointPending,
+pub use seismic_runtime::devices::{
+    BackendHeld, DeviceLedgerView, Ledger, Ledgers, LimitError, OpenError, PathLedgerView,
+    ResolveError, StoreLedgerView,
 };
-pub use seismic_discovery::{
-    volume_available, DiscoveryError, DisplacementWindow, HostDisplacement, HostStatus, Inventory,
-    KernelPressure, LimitVisibility, ObservationError, ProcessLimitKind, ProcessMemoryLimit,
-    RuntimeStatus, Sample, Status, DISPLACEMENT_HISTORY,
+pub use seismic_runtime::native::{
+    GraphPending, GraphPoint, GraphTiming, KernelPoint, NativeSpans, Point, PointPending,
 };
 pub use seismic_topology::{
-    AccessPath, AccessPathId, AccessRoute, Availability, DeviceMemory, DeviceTopology, Diagnostic,
-    DiagnosticSource, Executor, ExecutorId, ExecutorKind, ExecutorSelector, Identity, Limits,
-    PhysicalDevice, PhysicalDeviceId, PhysicalIdentity, Reported, ReportedBy, Revision,
-    StorageKind, Store, StoreId, StoreIdentity, StoreKind, TransferPath, TransferPathId, VolumeId,
+    AccessPath, AccessPathId, Availability, Contract, DeviceMemory, DeviceTopology, Diagnostic,
+    DiagnosticSource, Executor, ExecutorId, ExecutorKind, ExecutorSelector, HostReads, Identity,
+    Kind, KindId, KindMemory, Limits, NativeKind, Obtained, Packing, PhysicalDevice,
+    PhysicalDeviceId, PhysicalIdentity, Reach, Reported, ReportedBy, Reservation,
+    ReservationCharges, ReservationChunks, ReservedContract, ReservedRecords, Revision, Placing, Store, StoreId,
+    StoreIdentity, StoreKind, TableCharge, TransferPath, TransferPathId, Unreservable, VolumeId,
 };
 mod measurer;
 pub use measurer::{KernelIdentity, Measurer, PointKey};
@@ -211,6 +231,7 @@ pub use slab::{Slab, SlabLayout, SlabRegion, SlabTensor};
 
 use seismic_compiler::prepared::ArgumentValue;
 use seismic_lang::ids::RepresentationId;
+use seismic_runtime::api::tensor::Ordinary;
 use std::fmt;
 use std::sync::Arc;
 
@@ -281,6 +302,21 @@ impl Devices {
     pub fn status(&self, topology: &DeviceTopology, executor: ExecutorId) -> Status {
         self.inner.status(topology, executor)
     }
+
+    /// [`Self::status`] with host RAM as last sampled, no older than
+    /// [`DISPLACEMENT_CADENCE`](crate::DISPLACEMENT_CADENCE): an observation
+    /// between claims, which reads no host file on the caller's thread.
+    pub fn observed_status(&self, topology: &DeviceTopology, executor: ExecutorId) -> Status {
+        self.inner.observed_status(topology, executor)
+    }
+
+    /// What executor `id`'s recorded graphs hold for their census
+    /// ([`Device::graph_cost`]): its backend measures it on opening, once
+    /// per device in a process, so this opens the executor, sharing it
+    /// where it is open. A load reads it from records and never calls this.
+    pub fn graph_cost(&self, id: ExecutorId) -> Result<GraphCost, OpenError> {
+        self.open(id).map(|device| device.graph_cost())
+    }
 }
 
 impl fmt::Debug for Devices {
@@ -304,11 +340,25 @@ impl Device {
     pub fn info(&self) -> &Executor {
         self.inner.info()
     }
-    /// Graphs recorded for this device's submissions so far: a submission
-    /// during which the count grew recorded one on the host, so its duration
-    /// is not its launches' alone.
-    pub fn recorded_graphs(&self) -> u64 {
-        self.inner.recorded_graphs()
+    /// What this device's graphs cost its submissions so far: graphs
+    /// recorded (a submission during which that count grew recorded one on
+    /// the host, so its duration is not its launches' alone) and replays
+    /// that updated a graph's parameters first. Serving records none in
+    /// steady state: every shape's graph is recorded at its first use and
+    /// shared by every place after.
+    pub fn graph_replays(&self) -> GraphReplays {
+        self.inner.graph_replays()
+    }
+    /// What the graphs the device keeps may be made of: what its graph
+    /// families' and plans' live slots hold
+    /// ([`NativeGraphFamily::slot_graphs`]).
+    pub fn graph_budget(&self) -> GraphCensus {
+        self.inner.graph_budget()
+    }
+    /// What the device's recorded graphs hold for their census, measured
+    /// when it opened.
+    pub fn graph_cost(&self) -> GraphCost {
+        self.inner.graph_cost()
     }
     /// Complete capability summary acquired from this opened device.
     pub fn capabilities(&self) -> &[String] {
@@ -316,6 +366,16 @@ impl Device {
     }
     pub fn backend(&self) -> BackendName {
         self.inner.info().backend()
+    }
+    /// The host threads this device's own execution keeps busy while its
+    /// work runs: a CPU device's worker pool's participants, the submitting
+    /// thread among them; an accelerator's submitting thread alone.
+    pub fn host_threads(&self) -> usize {
+        self.inner.host_threads()
+    }
+    /// The host memory node the device is attached to.
+    pub fn host_node(&self) -> Result<DeviceNode, String> {
+        self.inner.host_node()
     }
     /// Stable key of this device's model and configuration for native
     /// tuning records.
@@ -360,64 +420,63 @@ impl Device {
             ),
         }
     }
-    /// An empty sequence of graph runs to submit together.
-    pub fn native_sequence(&self) -> NativeGraphSequence {
+    /// An empty sequence of graph runs to submit together on `queue`.
+    pub fn native_sequence(&self, queue: NativeQueue) -> NativeGraphSequence {
         NativeGraphSequence {
-            inner: seismic_runtime::native::graph::NativeGraphSequence::new(&self.inner),
+            inner: seismic_runtime::native::graph::NativeGraphSequence::new(&self.inner, queue),
         }
     }
-    /// How many native programs this device has formed (compiled, or loaded
-    /// from its artifact store), for checks that preparation forms nothing.
-    pub fn programs_formed(&self) -> usize {
+    /// The native programs this device has formed (compiled, or loaded from
+    /// its artifact store) and the seconds forming took: for checks that
+    /// preparation forms nothing, and a load's account of its time.
+    pub fn programs_formed(&self) -> FormedPrograms {
         self.inner.programs_formed()
-    }
-    /// Start device storage's [`MemoryUsage::high_water`] again from its
-    /// current charge: the next reading is the most charged since this call.
-    pub fn restart_memory_high_water(&self) {
-        self.inner.restart_memory_high_water()
     }
     /// The topology revision this device was opened in.
     pub fn topology(&self) -> &Arc<DeviceTopology> {
         self.inner.topology()
-    }
-    /// What this process has charged to each store this device reaches.
-    pub fn store_charges(&self) -> Vec<(StoreId, u64)> {
-        self.inner.store_charges()
-    }
-    /// What this device has charged along each of its access paths.
-    pub fn path_charges(&self) -> Vec<(AccessPathId, u64)> {
-        self.inner.path_charges()
     }
     /// Whether this device's allocations count in the process's footprint
     /// (CPU, Metal) rather than being held by a driver beside it.
     pub fn allocations_in_process_footprint(&self) -> bool {
         self.inner.allocations_in_process_footprint()
     }
-    /// Seismic-owned charges and limits of `kind` storage on this device:
-    /// its allocations' charges, what its backend holds for it beyond them,
-    /// and the charges to the stores its placement reaches.
-    pub fn storage_usage(&self, kind: StorageKind) -> MemoryUsage {
-        self.inner.storage_usage(kind)
+    /// The ledgers this device reaches: each store's (every executor of
+    /// the process), each of its paths' accounts (every open of its
+    /// executor), and its own on each store.
+    pub fn ledgers(&self) -> Ledgers {
+        self.inner.ledgers()
     }
-    /// The native memory `kind` storage can still take on this device: an
+    /// The store device storage is placed on first, whose own ledger is the
+    /// device's charge: on a device whose memory is the host's, every charge
+    /// it makes in that memory.
+    pub fn device_store(&self) -> StoreId {
+        self.inner.device_store()
+    }
+    /// The device's own ledger on its device store ([`Self::device_store`]).
+    pub fn device_ledger(&self) -> DeviceLedgerView {
+        self.inner.device_ledger()
+    }
+    /// Hold `ledger` to `bound`. A lower bound refuses growth; it never
+    /// revokes what is charged.
+    pub fn bound(&self, ledger: Ledger, bound: Option<u64>) -> Result<(), LimitError> {
+        self.inner.bound(ledger, bound)
+    }
+    /// Start the high-water mark of each of the device's own ledgers again
+    /// from what it charges now: the next reading is the most charged since
+    /// this call.
+    pub fn restart_high_water(&self) {
+        self.inner.restart_high_water()
+    }
+    /// What fixed buffers of `contract` can still take on this device: an
     /// allocation needing more is refused as a capacity shortfall.
-    pub fn storage_available(&self, kind: StorageKind) -> u64 {
-        self.inner.storage_available(kind)
+    pub fn room(&self, contract: Contract) -> u64 {
+        self.inner.room(contract)
     }
-    /// Bounds `kind` storage allocated through this device. Charges already
-    /// made count against the limit; they are never charged twice.
-    pub fn set_storage_limit(&self, kind: StorageKind, limit: Option<u64>) {
-        self.inner.set_storage_limit(kind, limit)
-    }
-    /// Holds the charges to `store`, from every executor of the process
-    /// that reaches it, to `limit` on top of its capacity.
-    pub fn set_store_limit(&self, store: StoreId, limit: Option<u64>) -> Result<(), LimitError> {
-        self.inner.set_store_limit(store, limit)
-    }
-    /// Holds this device's claim along its access path `path` to `limit`
-    /// on top of the path's grant.
-    pub fn set_path_limit(&self, path: AccessPathId, limit: Option<u64>) -> Result<(), LimitError> {
-        self.inner.set_path_limit(path, limit)
+    /// What the backend holds for fixed buffers of `kind` beyond their
+    /// allocations.
+    pub fn backend_held(&self, kind: Contract) -> BackendHeld {
+        self.inner.backend_held(kind)
     }
     /// A planned workflow on this device; refused on a native-only backend.
     pub fn workflow(&self) -> Result<WorkflowDraft, WorkflowError> {
@@ -441,6 +500,23 @@ impl fmt::Debug for Device {
 /// An element representation by registry identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Element(RepresentationId);
+
+/// An element is kept by its unique storage name ([`Element::name`]), the
+/// registry's stable identity of it; a name the registry no longer holds
+/// reads as no element.
+impl serde::Serialize for Element {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Element {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Element::named(&name)
+            .ok_or_else(|| serde::de::Error::custom(format!("no element is named {name}")))
+    }
+}
 
 /// The integer codes of a packed representation ([`Element::integer_codes`]):
 /// every code is a value in `min ..= max`, and `group` consecutive values
@@ -493,6 +569,12 @@ impl Element {
     /// Unique storage name.
     pub fn name(&self) -> &'static str {
         seismic_lang::registry::representation_info(self.0).name
+    }
+    /// This element as a weight operand of the CPU's components on `tier`,
+    /// read where it lies, a device's row layout too
+    /// (`cpu::WeightOperand::of`); `None` when the CPU reads no rows of it.
+    pub fn cpu_operand(&self, tier: cpu::Tier) -> Option<cpu::WeightOperand> {
+        cpu::WeightOperand::of(tier, self.0)
     }
     /// The logical representation this storage encodes.
     pub fn representation(&self) -> &'static str {
@@ -580,20 +662,79 @@ impl Element {
             _ => 1,
         }
     }
-    /// The host's repack of a tensor of `shape` by the registered
-    /// conversion from `source` into this storage (`cpu::repack::convert`).
-    /// `None` when no conversion is registered or `bytes` is not the
-    /// source's canonical byte count.
+    /// The host's repack of a tensor of `shape` from `source` into this
+    /// storage, as a device's repack binding converts it: between dense
+    /// float elements by elements, each decoded to F32 and rounded into
+    /// this element (`import_dense`'s conversion, which no registry entry
+    /// holds); otherwise by the registered conversion
+    /// (`cpu::repack::convert`). `None` when neither converts the pair or
+    /// `bytes` is not the source's canonical byte count.
     pub fn repack_host(self, source: Element, shape: &[u64], bytes: &[u8]) -> Option<Vec<u8>> {
+        match (source.dtype(), self.dtype()) {
+            (Some(from), Some(to)) if from.is_float() && to.is_float() => {
+                let width = to.bytes() as usize;
+                let values = source.decode_host(shape, bytes)?;
+                Some(
+                    values
+                        .into_iter()
+                        .flat_map(|value| {
+                            let decoded = f64::from(value as f32);
+                            let rounded = seismic_lang::reference_math::float_literal(to, decoded);
+                            rounded.bits().to_le_bytes().into_iter().take(width)
+                        })
+                        .collect(),
+                )
+            }
+            _ => {
+                let conversion =
+                    seismic_lang::registry::representation_conversion(source.0, self.0)?;
+                seismic_native_cpu::repack::convert(conversion, shape, bytes)
+            }
+        }
+    }
+    /// The registry's reference of [`Element::repack_host`]'s conversion
+    /// (`seismic_lang::interp::repack`), for other crates' tests of the
+    /// host's conversions. `None` as `repack_host`, or for a pair of dense
+    /// float elements, which no registry entry converts.
+    #[cfg(feature = "fixtures")]
+    pub fn repack_reference(self, source: Element, shape: &[u64], bytes: &[u8]) -> Option<Vec<u8>> {
         let conversion = seismic_lang::registry::representation_conversion(source.0, self.0)?;
-        seismic_native_cpu::repack::convert(conversion, shape, bytes)
+        let shape = shape
+            .iter()
+            .map(|extent| usize::try_from(*extent).ok())
+            .collect::<Option<Vec<_>>>()?;
+        seismic_lang::interp::repack(conversion.id, &shape, bytes)
     }
     /// `bytes`, arbitrary bytes of whole packets of `source`, brought into
     /// the domain of the registered conversion from `source` into this
     /// storage (`RepresentationConversion::admit_source`): what a check of a
     /// repack against [`Element::repack_host`] may convert. `None` when no
     /// conversion is registered or `bytes` is not whole source packets.
-    pub fn repack_source(self, source: Element, mut bytes: Vec<u8>) -> Option<Vec<u8>> {
+    pub fn repack_source(self, source: Element, bytes: Vec<u8>) -> Option<Vec<u8>> {
+        self.sourced(
+            source,
+            bytes,
+            seismic_lang::registry::RepresentationConversion::admit_source,
+        )
+    }
+    /// `bytes`, arbitrary bytes of whole packets of `source`, brought into
+    /// the domain of the registered conversion from `source` into this
+    /// storage with every number this storage reads from them finite
+    /// (`RepresentationConversion::finite_source`): a record whose
+    /// arithmetic compares. `None` as [`Element::repack_source`].
+    pub fn finite_source(self, source: Element, bytes: Vec<u8>) -> Option<Vec<u8>> {
+        self.sourced(
+            source,
+            bytes,
+            seismic_lang::registry::RepresentationConversion::finite_source,
+        )
+    }
+    fn sourced(
+        self,
+        source: Element,
+        mut bytes: Vec<u8>,
+        admit: fn(&seismic_lang::registry::RepresentationConversion, &mut [u8]),
+    ) -> Option<Vec<u8>> {
         let conversion = seismic_lang::registry::representation_conversion(source.0, self.0)?;
         if !bytes
             .len()
@@ -601,7 +742,7 @@ impl Element {
         {
             return None;
         }
-        conversion.admit_source(&mut bytes);
+        admit(conversion, &mut bytes);
         Some(bytes)
     }
     /// Host reference decode of canonical packed or dense bytes of a tensor
@@ -730,7 +871,7 @@ impl BF16 {
 }
 
 pub use seismic_runtime::native::graph::NativeTimelinePort;
-pub use seismic_runtime::native::timeline::TimelineNode;
+pub use seismic_runtime::native::timeline::{AnsweredBy, ParkAnswer, TimelineNode};
 
 /// A monotonic value one device's native work and the host both advance
 /// and wait on (`seismic_runtime::native::timeline`). A sealed graph's
@@ -738,33 +879,183 @@ pub use seismic_runtime::native::timeline::TimelineNode;
 /// runs nothing after it until the host has raised the timeline to the run's
 /// value; at a signal node the device raises it to the run's value once the
 /// work before has completed, its writes visible to the host.
+///
+/// Clones are handles of one timeline. Dropping the last opens every wait a
+/// run binds on it, and each such run whose wait was never reached fails its
+/// completion: a teardown leaves no device work waiting. So a handle lives
+/// as long as runs wait on the timeline, whoever is to raise it.
 #[derive(Clone)]
 pub struct Timeline {
-    inner: Arc<seismic_runtime::native::timeline::TimelineInner>,
+    host: Arc<seismic_runtime::native::timeline::TimelineHost>,
 }
 
 impl Timeline {
     /// A timeline at 0 on `device`.
     pub fn new(device: &Device) -> Result<Self, TensorError> {
-        seismic_runtime::native::timeline::TimelineInner::new(device.inner()).map(|inner| Self {
+        seismic_runtime::native::timeline::TimelineInner::new(device.inner()).map(Self::of)
+    }
+
+    fn of(inner: seismic_runtime::native::timeline::TimelineInner) -> Self {
+        Self {
+            host: Arc::new(seismic_runtime::native::timeline::TimelineHost::new(inner)),
+        }
+    }
+
+    fn inner(&self) -> &Arc<seismic_runtime::native::timeline::TimelineInner> {
+        self.host.inner()
+    }
+
+    /// Raise the timeline's gates to `value` from the host, after every
+    /// host write before it; a value it has reached already changes
+    /// nothing. Where the device's side is its own (every device), this raises
+    /// only what device work waits on, never what the host waits on
+    /// ([`Self::reached`], [`Self::wait`]).
+    pub fn signal(&self, value: u64) -> Result<(), ExecutionError> {
+        self.inner().signal(value)
+    }
+
+    /// Raise what the device raises to `value`, as the device would: a host
+    /// that plays the device (a test). On the CPU, whose one value both
+    /// raise, [`Self::signal`].
+    pub fn reach(&self, value: u64) -> Result<(), ExecutionError> {
+        self.inner().reach(value)
+    }
+
+    /// Whether the timeline has reached `value`; the device's loss where it
+    /// cannot say.
+    pub fn reached(&self, value: u64) -> Result<bool, ExecutionError> {
+        self.inner().reached(value)
+    }
+
+    /// The value the timeline holds now; the device's loss where it cannot
+    /// say.
+    pub fn current(&self) -> Result<u64, ExecutionError> {
+        self.inner().current()
+    }
+
+    /// Whether the device reached the park that took `value`
+    /// (`NativeGraphOutputs::park`), every device write before it visible
+    /// to the host; its call waits there unless the host answered it. The
+    /// device's loss where it cannot say.
+    pub fn parked(&self, value: u64) -> Result<bool, ExecutionError> {
+        self.inner().parked(value)
+    }
+
+    /// Whether the host answered the park that took `value`, whether or not
+    /// the device reached it; never where the dropping of the last handle
+    /// opened its gate unanswered. The device's loss where it cannot say.
+    pub fn answered(&self, value: u64) -> Result<bool, ExecutionError> {
+        self.inner().answered(value)
+    }
+
+    /// Whether the device's kernels wait for a park's answer themselves, so
+    /// a park binds no operation of this timeline.
+    pub fn parks_in_kernels(&self) -> bool {
+        self.inner().parks_in_kernels()
+    }
+
+    /// Answer the park that took `value`, after every host write the call
+    /// reads, before or after the device reaches it: where the device's
+    /// side is its own (Vulkan) the device runs on through it, and an
+    /// answer never reads as the device reaching anything.
+    /// `answer` is why the host answers now, which a trace keeps
+    /// (`TracedQueueSubmission::opened`).
+    pub fn answer(&self, value: u64, answer: ParkAnswer) -> Result<(), ExecutionError> {
+        self.inner().answer(value, answer)
+    }
+
+    /// Wait at most `timeout` for the timeline to reach `value`, after which
+    /// the host sees every device write before the signal; whether it did,
+    /// or the device's loss where it cannot say.
+    pub fn wait(&self, value: u64, timeout: std::time::Duration) -> Result<bool, ExecutionError> {
+        self.inner().wait(value, timeout)
+    }
+}
+
+pub use seismic_runtime::native::transfer::TransferError;
+
+/// One device's transfer queue (`seismic_runtime::native::transfer`):
+/// batches of copies between host memory and the device's storage, either
+/// way, that run beside its compute, each batch complete once its value is
+/// reached. Where the device's every storage is
+/// host-addressed (Metal) there is none, and the host writes in place.
+///
+/// The caller orders each batch against device work: it copies only into
+/// bytes no queued work reaches, and lets work read them only after seeing
+/// the batch complete (a host gate it answers then). The sources' bytes
+/// stay untouched until then.
+#[derive(Clone)]
+pub struct Transfer {
+    inner: Arc<seismic_runtime::native::transfer::TransferInner>,
+}
+
+/// One copy of a [`Transfer`] batch: `bytes` bytes of `source` from byte
+/// `source_offset` of its view into `destination` from byte
+/// `destination_offset` of its view: host memory into the device's storage,
+/// or back.
+pub struct TransferRun<'a> {
+    pub source: &'a Tensor,
+    pub source_offset: u64,
+    pub destination: &'a Tensor,
+    pub destination_offset: u64,
+    pub bytes: u64,
+}
+
+/// One step of a [`Transfer`] batch, in order: a copy, or a signal: the i32
+/// word `index` of `word` (the device's storage, a dense i32 tensor) set to
+/// `value` once every run of the batch before it has landed, which device
+/// work may wait for by equality.
+pub enum TransferItem<'a> {
+    Run(TransferRun<'a>),
+    Signal {
+        word: &'a Tensor,
+        index: u64,
+        value: i32,
+    },
+}
+
+impl Transfer {
+    /// The transfer queue of `device`; why it has none.
+    pub fn new(device: &Device) -> Result<Self, TransferError> {
+        seismic_runtime::native::transfer::TransferInner::new(device.inner()).map(|inner| Self {
             inner: Arc::new(inner),
         })
     }
 
-    /// Raise the timeline to `value` from the host, after every host write
-    /// before it; a value it has reached already changes nothing.
-    pub fn signal(&self, value: u64) -> Result<(), ExecutionError> {
-        self.inner.signal(value)
+    /// Queue `items` as one batch: the value it completes at. The caller
+    /// queues it only once the device work that read the bytes it
+    /// overwrites has ended.
+    pub fn copy(&self, items: &[TransferItem<'_>]) -> Result<u64, TransferError> {
+        use seismic_runtime::native::transfer as native;
+        let items = items
+            .iter()
+            .map(|item| match item {
+                TransferItem::Run(run) => native::TransferItem::Run(native::TransferRun {
+                    source: run.source.inner(),
+                    source_offset: run.source_offset,
+                    destination: run.destination.inner(),
+                    destination_offset: run.destination_offset,
+                    bytes: run.bytes,
+                }),
+                TransferItem::Signal { word, index, value } => native::TransferItem::Signal {
+                    word: word.inner(),
+                    offset: index * 4,
+                    value: *value,
+                },
+            })
+            .collect::<Vec<_>>();
+        self.inner.copy(&items)
     }
 
-    /// Whether the timeline has reached `value`.
-    pub fn reached(&self, value: u64) -> bool {
-        self.inner.reached(value)
+    /// Whether the batch that took `value` is complete; why none can
+    /// complete (a copy faulted, or the device is lost).
+    pub fn completed(&self, value: u64) -> Result<bool, TransferError> {
+        self.inner.completed(value)
     }
 
-    /// Wait at most `timeout` for the timeline to reach `value`, after which
-    /// the host sees every device write before the signal; whether it did.
-    pub fn wait(&self, value: u64, timeout: std::time::Duration) -> bool {
+    /// Wait at most `timeout` for the batch that took `value`; whether it
+    /// completed, or why none can.
+    pub fn wait(&self, value: u64, timeout: std::time::Duration) -> Result<bool, TransferError> {
         self.inner.wait(value, timeout)
     }
 }
@@ -849,29 +1140,37 @@ impl TensorStorageObserver {
 
 impl Tensor {
     pub(crate) fn slabbed(
-        table: &Tensor,
+        table: &Ordinary,
         element: Element,
         rows_per_slab: u64,
         logical_rows: u64,
         alias_identity: u64,
-        regions: Vec<Option<Tensor>>,
+        regions: Vec<Option<Ordinary>>,
         lease: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Result<Tensor, TensorError> {
         seismic_runtime::api::tensor::TensorInner::slabbed(
-            &table.inner,
+            table,
             element.id(),
             rows_per_slab,
             logical_rows,
             alias_identity,
-            regions
-                .into_iter()
-                .map(|region| region.map(|tensor| tensor.inner))
-                .collect(),
+            regions,
             lease,
         )
         .map(|inner| Tensor {
             inner: Arc::new(inner),
         })
+    }
+
+    /// This tensor as an ordinary one, unless it views a reservation.
+    pub(crate) fn ordinary(&self) -> Option<Ordinary> {
+        Ordinary::of(self.inner.clone())
+    }
+
+    pub(crate) fn of_ordinary(tensor: &Ordinary) -> Tensor {
+        Tensor {
+            inner: tensor.tensor().clone(),
+        }
     }
 
     pub(crate) fn new_slab_alias() -> u64 {
@@ -886,9 +1185,14 @@ impl Tensor {
     /// A canonical-layout tensor of `element` and `extents` viewing this
     /// tensor's bytes from `byte_offset`: it shares the allocation and its
     /// device-use lifetime. This tensor must be one contiguous byte range of
-    /// a backed allocation (not reserved or slabbed), and the region must lie
-    /// within it, starting at a multiple of its layout's alignment in the
-    /// allocation ([`TensorError::Region`] otherwise).
+    /// an allocation (not slabbed), and the region must lie within it,
+    /// starting at a multiple of its layout's alignment in the allocation
+    /// ([`TensorError::Region`] otherwise). A region of a reserved tensor
+    /// lies within its backed bytes and pins them; on chunked storage
+    /// (Metal) its records are packed, none crossing a chunk: it starts
+    /// where its first record fits in one chunk (such as the end of an
+    /// earlier packed region, `seismic_topology::Packing::end`),
+    /// and its records are where [`Tensor::record_placement`] says.
     pub fn region(
         &self,
         element: Element,
@@ -902,12 +1206,31 @@ impl Tensor {
             })
     }
 
-    pub(crate) fn device_address(&self) -> u64 {
-        self.inner.device_address()
+    /// Where this canonical tensor's records (leading-axis rows) lie:
+    /// packed from its first byte on chunked reserved storage
+    /// (`seismic_topology::Packing`), otherwise one after another. None for
+    /// a tensor without records of their own (no rows, rows of no bytes, or
+    /// rows laid out together), or on chunked storage with records larger
+    /// than a chunk, which no chunk holds whole.
+    pub fn record_placement(&self) -> Option<RecordPlacement> {
+        self.inner.record_placement()
     }
 
-    pub(crate) fn share_slab_access_with(&self, other: &Tensor) {
-        self.inner.share_slab_access_with(&other.inner)
+    /// Form now the address table a native record port binds this view's
+    /// records through, where its backend binds record tables (Metal,
+    /// Vulkan), so
+    /// binding this view later allocates nothing: for a view first bound
+    /// while its device may refuse an allocation, such as a release under
+    /// memory pressure. A fixed allocation holds the table with its storage,
+    /// and a view of a single record later binds any table it holds with an
+    /// entry at that record's address.
+    pub fn hold_record_table(&self) -> Result<(), TensorError> {
+        self.inner.hold_records()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn device_address(&self) -> u64 {
+        self.inner.device_address()
     }
 
     /// Allocate without initializing storage. A pure-output kernel can use
@@ -935,16 +1258,71 @@ impl Tensor {
     }
 
     /// A zero-filled tensor in storage the host writes and reads in place
-    /// while device work that uses it is queued or running (host-visible on
-    /// every backend, mapped pinned host memory on CUDA): the slots and the
-    /// directory of a table the host fills while steps that read it wait at
-    /// a gate (`Timeline`), or a notice the device writes for the host.
+    /// while device work that uses it is queued or running
+    /// (`Contract::Shared`): memory cached for the host's reads and stores
+    /// on every backend (mapped pinned host memory on CUDA, a host-cached
+    /// type on Vulkan, never a BAR window): the slots of a table the host
+    /// fills while steps that read it wait at a gate (`Timeline`), or a
+    /// notice the device writes for the host. On Metal it is
+    /// `MTLStorageModeShared`, as is every Metal tensor.
     pub fn shared(
         device: &Device,
         element: Element,
         extents: &[u64],
     ) -> Result<Tensor, TensorError> {
         seismic_runtime::api::tensor::TensorInner::shared(device.inner(), element.id(), extents)
+            .map(|inner| Tensor {
+                inner: Arc::new(inner),
+            })
+    }
+
+    /// A zero-filled tensor of coherent words the host and running device
+    /// work exchange (`Contract::Words`; [`Tensor::load_acquire`],
+    /// [`Tensor::store_release`]): timelines, park and answer words, maps
+    /// and directories.
+    pub fn words(
+        device: &Device,
+        element: Element,
+        extents: &[u64],
+    ) -> Result<Tensor, TensorError> {
+        seismic_runtime::api::tensor::TensorInner::words(device.inner(), element.id(), extents).map(
+            |inner| Tensor {
+                inner: Arc::new(inner),
+            },
+        )
+    }
+
+    /// A [`Tensor::words`] tensor whose every order across the
+    /// device's queues the protocol of the work that uses them gives: work
+    /// of one native queue never waits for another's use of them (host
+    /// access still waits for every use). A slot of an exchange that one
+    /// queue's work requests and another's waits on, which the host
+    /// answers.
+    pub fn protocol_words(
+        device: &Device,
+        element: Element,
+        extents: &[u64],
+    ) -> Result<Tensor, TensorError> {
+        seismic_runtime::api::tensor::TensorInner::protocol_words(
+            device.inner(),
+            element.id(),
+            extents,
+        )
+        .map(|inner| Tensor {
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// A zero-filled tensor in upload storage (`Contract::Upload`): what
+    /// the host only writes in place while device work reads it, where a
+    /// graph run's inputs lie (a large BAR's on Vulkan, whose host reads
+    /// are uncached). The host never reads it.
+    pub fn upload(
+        device: &Device,
+        element: Element,
+        extents: &[u64],
+    ) -> Result<Tensor, TensorError> {
+        seismic_runtime::api::tensor::TensorInner::upload(device.inner(), element.id(), extents)
             .map(|inner| Tensor {
                 inner: Arc::new(inner),
             })
@@ -962,6 +1340,15 @@ impl Tensor {
         unsafe { self.inner.write_shared(offset, bytes) }
     }
 
+    /// The host address of this view's first byte, where the host addresses
+    /// its storage in place (a [`Tensor::shared`] view); none otherwise.
+    /// Valid while the tensor lives. Bytes written through it are written
+    /// under [`Tensor::write_shared`]'s contract, in place: a read from a
+    /// file landing straight in a staging record, say.
+    pub fn shared_address(&self) -> Option<std::ptr::NonNull<u8>> {
+        self.inner.host_address()
+    }
+
     /// Read `into.len()` bytes at `offset` bytes into this view without
     /// waiting for device work that uses its storage.
     ///
@@ -972,6 +1359,62 @@ impl Tensor {
     pub unsafe fn read_shared(&self, offset: u64, into: &mut [u8]) -> Result<(), TensorError> {
         // SAFETY: the caller upholds the contract.
         unsafe { self.inner.read_shared(offset, into) }
+    }
+
+    /// A [`Tensor::shared`] view's 32-bit words, for stores that order
+    /// nothing: a device reading one sees the store in time, and no other
+    /// write by it. [`TensorError::SharedWord`] as [`Tensor::load_acquire`].
+    pub fn shared_words(&self) -> Result<&[std::sync::atomic::AtomicU32], TensorError> {
+        self.inner.shared_words()
+    }
+
+    /// The 32-bit word at `offset` bytes into a [`Tensor::shared`] view (or
+    /// any view of host-addressed storage), loaded with acquire ordering
+    /// while device work that uses it may be running: what the device wrote
+    /// before publishing the word (a store after a system-scope fence) is
+    /// visible after it. It neither waits for nor excludes device work.
+    /// [`TensorError::SharedWord`] when the word is not 4-byte aligned, lies
+    /// outside the view, or its storage is not host-addressed.
+    pub fn load_acquire(&self, offset: u64) -> Result<u32, TensorError> {
+        self.inner.load_acquire(offset)
+    }
+
+    /// Publish `value` as the 32-bit word at `offset` bytes into a
+    /// [`Tensor::shared`] view to device work that may be running: a
+    /// release store, then a sequentially consistent fence. Every earlier
+    /// host write is visible to a device load of the word under a
+    /// system-scope acquire (a system-coherent load, then a system-scope
+    /// fence), and the store is ordered before every later host load. It
+    /// neither waits for nor excludes device work; errors as
+    /// [`Tensor::load_acquire`].
+    pub fn store_release(&self, offset: u64, value: u32) -> Result<(), TensorError> {
+        self.inner.store_release(offset, value)
+    }
+
+    /// The 64-bit word at `offset` bytes, loaded as one access with acquire
+    /// ordering, as [`Tensor::load_acquire`] loads a 32-bit one; the word
+    /// 8-byte aligned.
+    pub fn load_acquire_u64(&self, offset: u64) -> Result<u64, TensorError> {
+        self.inner.load_acquire_u64(offset)
+    }
+
+    /// Publish `value` as the 64-bit word at `offset` bytes as one store, as
+    /// [`Tensor::store_release`] publishes a 32-bit one: a reader never
+    /// assembles a value the host never held. The word 8-byte aligned.
+    pub fn store_release_u64(&self, offset: u64, value: u64) -> Result<(), TensorError> {
+        self.inner.store_release_u64(offset, value)
+    }
+
+    /// Publish `update` of the 64-bit word at `offset` bytes as one
+    /// read-modify-write, where it returns a value for what the word holds,
+    /// as [`Tensor::store_release_u64`] publishes a store; none leaves the
+    /// word as it is. Whether it published. The word 8-byte aligned.
+    pub fn update_release_u64(
+        &self,
+        offset: u64,
+        update: impl FnMut(u64) -> Option<u64>,
+    ) -> Result<bool, TensorError> {
+        self.inner.update_release_u64(offset, update)
     }
 
     /// A zero-filled owned tensor.
@@ -1005,83 +1448,71 @@ impl Tensor {
         })
     }
     /// A zero-filled tensor over `extents` whose leading-axis rows
-    /// `[0, committed)` are physically backed and charged. The rest of the
-    /// leading extent is reserved address space: graphs are sealed over the
-    /// whole shape, while device work bound to the tensor must stay within
-    /// the committed rows, and host access to the tensor is refused (views
-    /// within the committed rows are ordinary tensors).
+    /// `[0, committed)` are physically backed and charged, and the
+    /// [`Resizer`] that backs and releases the rest of the leading extent's
+    /// reserved address space in place, one resize at a time. Its owner
+    /// installs a resize between submissions (never between queuing a
+    /// sequence that binds the tensor and submitting that sequence). Graphs
+    /// are sealed over the whole shape, while device work bound to the
+    /// tensor must stay within the committed rows, and host access reaching
+    /// past them is refused (views within them read and write as ordinary
+    /// tensors). The CPU backend, Metal and CUDA with virtual memory
+    /// management reserve; elsewhere it is refused
+    /// ([`TensorError::Unreservable`]). A reserved tensor is never slabbed.
     pub fn reserved(
         device: &Device,
         element: Element,
         extents: &[u64],
         committed: u64,
-    ) -> Result<Tensor, TensorError> {
+    ) -> Result<(Tensor, Resizer), TensorError> {
+        Self::reserved_in(
+            ReservedContract::DeviceOnly,
+            device,
+            element,
+            extents,
+            committed,
+            None,
+        )
+    }
+
+    /// [`Tensor::reserved`] under `contract`, where the device reserves it
+    /// (`Executor::reserving`); elsewhere it is refused
+    /// ([`TensorError::Unreservable`]). A `Shared` range is one the host
+    /// writes and reads in place while device work that uses it is queued
+    /// or running, wherever the placement rule puts it; its host address
+    /// never moves, and a region of its committed rows is host-addressed while it
+    /// pins them ([`Tensor::shared_address`]). Its records may carry views
+    /// of up to `carries` bytes whole (another form's records packed in
+    /// them, [`ReservedRecords::carries`]), which no chunk boundary crosses.
+    pub fn reserved_in(
+        kind: ReservedContract,
+        device: &Device,
+        element: Element,
+        extents: &[u64],
+        committed: u64,
+        carries: Option<std::num::NonZeroU64>,
+    ) -> Result<(Tensor, Resizer), TensorError> {
         seismic_runtime::api::tensor::TensorInner::reserved(
             device.inner(),
+            kind,
             element.id(),
             extents,
             committed,
+            carries,
         )
-        .map(|inner| Tensor {
-            inner: Arc::new(inner),
+        .map(|(inner, resizer)| {
+            let tensor = Tensor {
+                inner: Arc::new(inner),
+            };
+            (tensor, resizer)
         })
     }
-    /// Leading rows physically backed: every row unless the tensor is reserved.
+    /// Leading rows physically backed: every row unless the tensor reaches
+    /// past a reservation's committed rows.
     pub fn committed_rows(&self) -> u64 {
         self.inner.committed_rows()
     }
-    /// The same reserved shape with `committed` leading rows backed. Rows
-    /// below the smaller commitment keep their contents (copied after every
-    /// submitted device write of this tensor completes); new rows are zero.
-    /// The result is a new allocation: work bound to `self` is not ordered
-    /// with work bound to the result, so the owner switches only between
-    /// submissions. An in-place growth can be abandoned while the old tensor
-    /// is live; dropping the new tensor restores its former backed prefix.
-    /// A successful in-place shrink must be published by dropping the old
-    /// tensor, since the released tail's contents cannot be restored.
-    pub fn recommitted(&self, committed: u64) -> Result<Tensor, TensorError> {
-        self.inner
-            .recommitted(committed, self.can_recommit_in_place())
-            .map(|inner| Tensor {
-                inner: Arc::new(inner),
-            })
-    }
-    /// Recommit into separate backing even when this tensor owns a reserved
-    /// address. This lets an owner prepare a multi-tensor replacement before
-    /// releasing any old rows through an in-place shrink.
-    pub fn recommitted_separately(&self, committed: u64) -> Result<Tensor, TensorError> {
-        self.inner
-            .recommitted(committed, false)
-            .map(|inner| Tensor {
-                inner: Arc::new(inner),
-            })
-    }
-    /// Whether [`Tensor::recommitted`] keeps this tensor's address: the backend
-    /// reserved its address range (CUDA virtual memory management).
-    pub fn resizes_in_place(&self) -> bool {
-        self.inner.resizes_in_place()
-    }
-    /// Whether this tensor currently has sole ownership of its reserved
-    /// backing, allowing a recommit without a second physical allocation.
-    pub fn can_recommit_in_place(&self) -> bool {
-        Arc::strong_count(&self.inner) == 1 && self.inner.can_recommit_in_place()
-    }
-    /// The same reserved shape with `committed` leading rows backed by a new
-    /// allocation holding the rows `moves` names: each `(from, to, rows)`
-    /// copies rows `[from, from + rows)` (after every submitted device write
-    /// of this tensor completes) to rows `[to, to + rows)`; every other row is
-    /// zero. The address always changes, so the owner switches only between
-    /// submissions.
-    pub fn relocated(
-        &self,
-        committed: u64,
-        moves: &[(u64, u64, u64)],
-    ) -> Result<Tensor, TensorError> {
-        self.inner.relocated(committed, moves).map(|inner| Tensor {
-            inner: Arc::new(inner),
-        })
-    }
-    pub fn read_to_host(&self) -> Result<Vec<u8>, ExecutionError> {
+    pub fn read_to_host(&self) -> Result<Vec<u8>, TensorError> {
         self.inner.read_to_host()
     }
     /// Replaces the bytes of this exact tensor view.  The byte count must
@@ -1128,6 +1559,11 @@ impl Tensor {
     }
     pub fn storage_bytes(&self) -> u64 {
         self.inner.storage_bytes()
+    }
+    /// What this tensor's allocation is charged, the record tables its
+    /// storage holds included.
+    pub fn charged_bytes(&self) -> u64 {
+        self.inner.charged_bytes()
     }
     /// The bytes of this contiguous view charged to each store: the share
     /// of its allocation's path charges its byte range covers.
@@ -1516,6 +1952,11 @@ impl NativeTensorBatch {
 }
 
 impl NativeTensorBatchCompletion {
+    /// Whether the device has finished the batch, without waiting.
+    pub fn is_complete(&self) -> bool {
+        self.inner.is_complete()
+    }
+
     /// Observe completion and any device failure. Dropping an unobserved
     /// completion still waits so its mapped inputs stay alive.
     pub fn wait(self) -> Result<(), CallError> {
@@ -2512,6 +2953,15 @@ impl<E: Entry> BoundEntry<E> {
         generated::native_specialization_valid::<E>(device, specialization, &self.elements)
     }
 
+    /// The identity of this entry's implementation at `statics` on `device`.
+    pub fn digest(
+        &self,
+        device: &Device,
+        statics: &NativeSpecialization,
+    ) -> Result<String, TuneError> {
+        generated::digest_native::<E>(device, statics, &self.elements, self.cpu)
+    }
+
     pub fn prepare(
         &self,
         device: &Device,
@@ -2599,6 +3049,12 @@ impl NativeGraphMetadata {
     /// (`NativeGraph::timeline`).
     pub fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort {
         self.inner.timeline(node)
+    }
+
+    /// A span mark after every node enqueued so far, its ordinal returned
+    /// (`NativeGraph::span_mark`).
+    pub fn span_mark(&mut self) -> usize {
+        self.inner.span_mark()
     }
 
     /// Tag following checked ports and nodes with a semantic class extent
@@ -2690,6 +3146,7 @@ impl NativeGraphMetadata {
         elements: &[(&str, Element)],
         parameter: &str,
         dimensions: &[(&str, u64)],
+        local: bool,
         owned_input: bool,
     ) -> Result<NativePort, NativeGraphMetadataError> {
         let checked = self.bind_checked::<E>(elements)?;
@@ -2698,7 +3155,7 @@ impl NativeGraphMetadata {
             .map_err(NativeGraphMetadataError::Unsupported)?;
         let inner = self
             .inner
-            .port(metadata.element.id(), &metadata.extents, true, owned_input)
+            .port(metadata.element.id(), &metadata.extents, local, owned_input)
             .map_err(NativeGraphMetadataError::Tensor)?;
         if let Some(template) = &mut self.template {
             template.ports.push(MetadataPortSource::Checked {
@@ -2723,7 +3180,7 @@ impl NativeGraphMetadata {
         parameter: &str,
         dimensions: &[(&str, u64)],
     ) -> Result<NativePort, NativeGraphMetadataError> {
-        self.checked_port::<E>(elements, parameter, dimensions, true)
+        self.checked_port::<E>(elements, parameter, dimensions, true, true)
     }
 
     pub fn local_for<E: Entry>(
@@ -2732,7 +3189,17 @@ impl NativeGraphMetadata {
         parameter: &str,
         dimensions: &[(&str, u64)],
     ) -> Result<NativePort, NativeGraphMetadataError> {
-        self.checked_port::<E>(elements, parameter, dimensions, false)
+        self.checked_port::<E>(elements, parameter, dimensions, true, false)
+    }
+
+    /// An external port from a checked parameter (`NativeGraph::port_for`).
+    pub fn port_for<E: Entry>(
+        &mut self,
+        elements: &[(&str, Element)],
+        parameter: &str,
+        dimensions: &[(&str, u64)],
+    ) -> Result<NativePort, NativeGraphMetadataError> {
+        self.checked_port::<E>(elements, parameter, dimensions, false, false)
     }
 
     pub fn prewrite(&mut self, port: &NativePort) -> Result<(), NativeGraphMetadataError> {
@@ -2747,17 +3214,64 @@ impl NativeGraphMetadata {
         dimensions: &[(&str, u64)],
         args: E::WorkflowArgs<'_>,
     ) -> Result<E::WorkflowResults, NativeGraphMetadataError> {
+        self.enqueue_node::<E>(elements, dimensions, args, None)
+    }
+
+    /// [`Self::enqueue`] under a condition (`NativeGraph::enqueue_under`):
+    /// planning holds the node as any other, its condition kept for the
+    /// proof that results may share storage ([`Self::share`]).
+    pub fn enqueue_under<E: Entry>(
+        &mut self,
+        elements: &[(&str, Element)],
+        dimensions: &[(&str, u64)],
+        args: E::WorkflowArgs<'_>,
+        port: &NativePort,
+        index: u64,
+        encoded: LaunchEncoding,
+    ) -> Result<E::WorkflowResults, NativeGraphMetadataError> {
+        let condition = seismic_runtime::native::graph::NodeCondition {
+            port: port.inner,
+            index,
+            encoded,
+        };
+        self.enqueue_node::<E>(elements, dimensions, args, Some(condition))
+    }
+
+    /// `NativeGraph::share`.
+    pub fn share(
+        &mut self,
+        other: &WorkflowTensor,
+        primary: &WorkflowTensor,
+    ) -> Result<(), NativeGraphMetadataError> {
+        self.inner
+            .share(other.inner, primary.inner)
+            .map_err(NativeGraphMetadataError::Workflow)
+    }
+
+    fn enqueue_node<E: Entry>(
+        &mut self,
+        elements: &[(&str, Element)],
+        dimensions: &[(&str, u64)],
+        args: E::WorkflowArgs<'_>,
+        condition: Option<seismic_runtime::native::graph::NodeCondition>,
+    ) -> Result<E::WorkflowResults, NativeGraphMetadataError> {
         let node = self.checked_node::<E>(elements, dimensions)?;
-        let pending = self
-            .inner
-            .enqueue(
-                E::encode_workflow(args),
-                node.parameters.clone(),
-                node.results.clone(),
-                node.scratch.clone(),
-                node.checked.sealed_node().clone(),
-            )
-            .map_err(NativeGraphMetadataError::Call)?;
+        let encoded = E::encode_workflow(args);
+        let (parameters, results, scratch, sealed) = (
+            node.parameters.clone(),
+            node.results.clone(),
+            node.scratch.clone(),
+            node.checked.sealed_node().clone(),
+        );
+        let pending = match condition {
+            Some(condition) => self
+                .inner
+                .enqueue_under(encoded, parameters, results, scratch, sealed, condition),
+            None => self
+                .inner
+                .enqueue(encoded, parameters, results, scratch, sealed),
+        }
+        .map_err(NativeGraphMetadataError::Call)?;
         if let Some(template) = &mut self.template {
             template.nodes.push(MetadataNodeSource {
                 checked: node.checked.clone(),
@@ -2924,9 +3438,19 @@ impl NativePort {
 impl NativeGraph {
     /// A timeline node after every node enqueued so far: a host gate the
     /// device waits at, or a signal the host waits for (`Timeline`). Each
-    /// run binds it (`NativeGraphBindings::set_timeline`).
+    /// run binds it (`NativeGraphBindings::set_timeline`; a park,
+    /// `set_park` or `set_answered`).
     pub fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort {
         self.inner.timeline(node)
+    }
+
+    /// A span mark after every node enqueued so far, its ordinal returned: a
+    /// boundary of the plan's calls where a sampled run
+    /// ([`ReadyNativeGraphRun::queue_sampled`]) stamps the device's time, so
+    /// the device time between two marks is the calls' between them. It
+    /// divides no graph. Every plan of one layout marks alike.
+    pub fn span_mark(&mut self) -> usize {
+        self.inner.span_mark()
     }
 
     /// Declare an external tensor descriptor from model metadata. Sealing
@@ -2976,6 +3500,24 @@ impl NativeGraph {
         })
     }
 
+    /// Declare an external tensor from a checked parameter: each run binds
+    /// it, in the layout the entry contract derives from the dimension
+    /// values.
+    pub fn port_for<E: Entry>(
+        &mut self,
+        kernel: &NativeKernel<E>,
+        parameter: &str,
+        dimensions: &[(&str, u64)],
+    ) -> Result<NativePort, CallError> {
+        let inner = self.inner.port_for(&kernel.inner, parameter, dimensions)?;
+        Ok(NativePort {
+            tensor: WorkflowTensor {
+                inner: inner.reference(),
+            },
+            inner,
+        })
+    }
+
     /// Mark a checked local as filled before graph execution. Seismic keeps
     /// its storage live from the start, including across earlier nodes.
     pub fn prewrite(&mut self, port: &NativePort) -> Result<(), WorkflowError> {
@@ -2993,21 +3535,70 @@ impl NativeGraph {
         Ok(E::decode_workflow(pending))
     }
 
+    /// [`Self::enqueue`] under a condition on word `index` of the i32 tensor
+    /// each run binds to external port `port`: the node's launches are
+    /// encoded only while the word is nonzero (`LaunchEncoding::WhileSet`)
+    /// or zero (`WhileClear`), as the host reads it when the run is queued,
+    /// and a park before it waits only where they are.
+    pub fn enqueue_under<E: Entry>(
+        &mut self,
+        kernel: &NativeKernel<E>,
+        args: E::WorkflowArgs<'_>,
+        port: &NativePort,
+        index: u64,
+        encoded: LaunchEncoding,
+    ) -> Result<E::WorkflowResults, WorkflowError> {
+        let condition = seismic_runtime::native::graph::NodeCondition {
+            port: port.inner,
+            index,
+            encoded,
+        };
+        let pending =
+            self.inner
+                .enqueue_under(&kernel.inner, E::encode_workflow(args), condition)?;
+        Ok(E::decode_workflow(pending))
+    }
+
     /// Keep a result beyond the graph run. Exported tensors receive separate
     /// storage so releasing a scratch slot does not reclaim a retained output.
     pub fn export(&mut self, result: &WorkflowTensor) -> Result<(), WorkflowError> {
         self.inner.export(result.inner)
     }
 
+    /// Place node result `other` where node result `primary` lies, one
+    /// storage for both: their nodes' conditions are on one word, under
+    /// opposite encodings (`enqueue_under`), so each run has exactly one
+    /// writer, and every reader reads `primary`. Sealing proves it.
+    pub fn share(
+        &mut self,
+        other: &WorkflowTensor,
+        primary: &WorkflowTensor,
+    ) -> Result<(), WorkflowError> {
+        self.inner.share(other.inner, primary.inner)
+    }
+
     /// Write the node result `result` into the tensor each run binds to the
     /// external port `port`, which describes exactly that result, instead of
     /// into graph storage.
-    pub fn store(&mut self, result: &WorkflowTensor, port: &NativePort) -> Result<(), WorkflowError> {
+    pub fn store(
+        &mut self,
+        result: &WorkflowTensor,
+        port: &NativePort,
+    ) -> Result<(), WorkflowError> {
         self.inner.store(result.inner, port.inner)
     }
 
     pub fn seal(self) -> Result<NativeGraphPlan, CallError> {
         self.inner.seal().map(|inner| NativeGraphPlan {
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// Seal per-use work whose shapes no load can enumerate ahead (rows a
+    /// request brings): no slot of it instantiates a graph, so one may be
+    /// made with work in flight (`seismic_runtime`'s `seal_launched`).
+    pub fn seal_launched(self) -> Result<NativeGraphPlan, CallError> {
+        self.inner.seal_launched().map(|inner| NativeGraphPlan {
             inner: Arc::new(inner),
         })
     }
@@ -3039,6 +3630,16 @@ impl NativeGraphPlan {
     /// Bytes of one submission's host-written inputs.
     pub fn upload_bytes(&self) -> u64 {
         self.inner.upload_bytes()
+    }
+    /// What recording one of its runs takes: its graphs, which every run of
+    /// it replays.
+    pub fn recorded(&self) -> GraphCensus {
+        self.inner.recorded()
+    }
+    /// What its runs' graphs cost serving so far: graphs recorded and
+    /// replays that updated them ([`Device::graph_replays`]).
+    pub fn graph_replays(&self) -> GraphReplays {
+        self.inner.graph_replays()
     }
     pub fn new_slot(&self) -> Result<NativeGraphSlot, TensorError> {
         self.inner.new_slot().map(|inner| NativeGraphSlot { inner })
@@ -3112,14 +3713,45 @@ pub struct NativeGraphFamily {
 }
 
 impl NativeGraphFamily {
+    /// A family of `plans` whose launch is one run of one of them.
     pub fn new(plans: &[NativeGraphPlan]) -> Result<Self, WorkflowError> {
-        let members = plans
+        let launches = plans
             .iter()
-            .map(|plan| plan.inner.clone())
+            .map(|plan| vec![plan.clone()])
             .collect::<Vec<_>>();
-        seismic_runtime::native::graph::NativeGraphFamily::new(&members).map(|inner| Self {
-            inner: Arc::new(inner),
-        })
+        Self::with_launches(plans, &launches)
+    }
+    /// A family of `plans` whose launches each make the runs of one of
+    /// `launches`, a plan once for each of its runs: its plans of one layout
+    /// share one graph, and a slot holds each layout's graph for each run
+    /// of it the launch making most of them makes
+    /// ([`Self::slot_graphs`]).
+    pub fn with_launches(
+        plans: &[NativeGraphPlan],
+        launches: &[Vec<NativeGraphPlan>],
+    ) -> Result<Self, WorkflowError> {
+        let inner = |plans: &[NativeGraphPlan]| {
+            plans
+                .iter()
+                .map(|plan| plan.inner.clone())
+                .collect::<Vec<_>>()
+        };
+        let launches = launches.iter().map(|runs| inner(runs)).collect::<Vec<_>>();
+        seismic_runtime::native::graph::NativeGraphFamily::with_launches(&inner(plans), &launches)
+            .map(|inner| Self {
+                inner: Arc::new(inner),
+            })
+    }
+    /// What one live slot of the family holds of its device's graph
+    /// budget: each layout's graph for each run of it one launch makes.
+    pub fn slot_graphs(&self) -> GraphCensus {
+        self.inner.slot_graphs()
+    }
+    /// What its plans' graphs cost serving so far: graphs recorded and
+    /// replays that updated them, this family's alone of what its device
+    /// counts ([`Device::graph_replays`]).
+    pub fn graph_replays(&self) -> GraphReplays {
+        self.inner.graph_replays()
     }
     pub fn workspace_bytes(&self) -> u64 {
         self.inner.workspace_bytes()
@@ -3131,7 +3763,7 @@ impl NativeGraphFamily {
     pub fn output_bytes(&self) -> u64 {
         self.inner.output_bytes()
     }
-    /// Bytes of one upload region; a slot holds one per run in flight.
+    /// The most input bytes one of the family's runs writes.
     pub fn upload_bytes(&self) -> u64 {
         self.inner.upload_bytes()
     }
@@ -3140,19 +3772,27 @@ impl NativeGraphFamily {
             .new_output_slot()
             .map(|inner| NativeGraphFamilyOutputSlot { inner })
     }
-    /// A slot whose `regions` upload regions (one per run it keeps in flight
-    /// at once) are allocated here; activation never allocates.
-    pub fn new_slot(&self, regions: usize) -> Result<NativeGraphFamilySlot, TensorError> {
+    /// [`Self::new_output_slot`] of outputs the host reads as they complete
+    /// (`Contract::Shared`), with no copy queued behind later runs.
+    pub fn new_host_output_slot(&self) -> Result<NativeGraphFamilyOutputSlot, TensorError> {
+        self.inner
+            .new_host_output_slot()
+            .map(|inner| NativeGraphFamilyOutputSlot { inner })
+    }
+    /// A slot whose upload regions, of `regions` bytes each (one per run it
+    /// keeps in flight at once, holding that run's input), are allocated
+    /// here; activation never allocates.
+    pub fn new_slot(&self, regions: &[u64]) -> Result<NativeGraphFamilySlot, TensorError> {
         self.inner
             .new_slot(regions)
             .map(|inner| NativeGraphFamilySlot { inner })
     }
-    /// A slot whose workspace is the shared `arena`, with `regions` upload
-    /// regions of its own.
+    /// A slot whose workspace is the shared `arena`, with upload regions of
+    /// `regions` bytes each of its own.
     pub fn new_slot_in(
         &self,
         arena: &NativeExecutionArena,
-        regions: usize,
+        regions: &[u64],
     ) -> Result<NativeGraphFamilySlot, WorkflowError> {
         self.inner
             .new_slot_in(&arena.inner, regions)
@@ -3170,6 +3810,12 @@ impl NativeExecutionArena {
     pub fn bytes(&self) -> u64 {
         self.inner.bytes()
     }
+
+    /// What the arena is charged: its bytes, and the record tables graph
+    /// slots formed over it while they live.
+    pub fn charged_bytes(&self) -> u64 {
+        self.inner.charged_bytes()
+    }
 }
 
 pub struct NativeGraphFamilySlot {
@@ -3185,6 +3831,37 @@ impl NativeGraphFamilySlot {
             .activate(&plan.inner)
             .map(|inner| NativeGraphFamilyActive { inner })
     }
+
+    /// Tensors of `tensors`' elements and extents, each holding its bytes,
+    /// written once into one of the slot's idle upload regions for several
+    /// runs to bind as external ports. The region stays taken while any of
+    /// them or a view of one lives and until the device's last use of it
+    /// completes. It holds [`upload_region_bytes`] of them.
+    pub fn upload(
+        &mut self,
+        tensors: &[(Element, &[u64], &[u8])],
+    ) -> Result<Vec<Tensor>, WorkflowError> {
+        let tensors = tensors
+            .iter()
+            .map(|&(element, extents, bytes)| (element.id(), extents, bytes))
+            .collect::<Vec<_>>();
+        Ok(self
+            .inner
+            .upload(&tensors)?
+            .into_iter()
+            .map(|inner| Tensor { inner })
+            .collect())
+    }
+}
+
+/// The bytes of the upload region [`NativeGraphFamilySlot::upload`] takes
+/// for tensors of `tensors`' elements and extents.
+pub fn upload_region_bytes(tensors: &[(Element, &[u64])]) -> Result<u64, WorkflowError> {
+    let tensors = tensors
+        .iter()
+        .map(|&(element, extents)| (element.id(), extents))
+        .collect::<Vec<_>>();
+    seismic_runtime::native::graph::upload_region_bytes(&tensors)
 }
 
 pub struct NativeGraphFamilyActive<'a> {
@@ -3228,7 +3905,30 @@ impl NativeGraphBindings {
         timeline: &Timeline,
         value: u64,
     ) -> Result<(), WorkflowError> {
-        self.inner.set_timeline(port, timeline.inner.clone(), value)
+        self.inner
+            .set_timeline(port, timeline.inner().clone(), value)
+    }
+
+    /// Bind park node `port` to `timeline`: where the device's kernels do
+    /// not wait for the host themselves, a queued run that encodes the
+    /// park's call takes the timeline's next park value `v`, reported by
+    /// its outputs (`NativeGraphOutputs::park`): the device signals `v`
+    /// once the call waits, every write before visible to the host, and
+    /// goes on once the host answers (`Timeline::answer`). The timeline's
+    /// values are the runtime's: bind no wait or signal on it.
+    pub fn set_park(
+        &mut self,
+        port: NativeTimelinePort,
+        timeline: &Timeline,
+    ) -> Result<(), WorkflowError> {
+        self.inner.set_park(port, timeline.inner().clone())
+    }
+
+    /// Bind park node `port` as answered before the run is submitted (the
+    /// words its call awaits already hold the answer): it binds no
+    /// operation, and a run of only such parks is the same work each time.
+    pub fn set_answered(&mut self, port: NativeTimelinePort) -> Result<(), WorkflowError> {
+        self.inner.set_answered(port)
     }
 
     /// Bind an unsubmitted exported output lease as a graph destination.
@@ -3278,6 +3978,14 @@ impl NativeGraphOutputs {
             .exported_tensor(result.inner)
             .map(|inner| Tensor { inner })
     }
+
+    /// The value park node `port` of the queued run took on its timeline
+    /// (`NativeGraphBindings::set_park`); `None` where it binds nothing:
+    /// the device's kernels park themselves, it was bound answered, or the
+    /// run encodes none of its call's launches.
+    pub fn park(&self, port: NativeTimelinePort) -> Option<u64> {
+        self.inner.park(port)
+    }
 }
 
 pub struct ReadyNativeGraphRun<'a> {
@@ -3309,6 +4017,20 @@ impl ReadyNativeGraphRun<'_> {
         self.inner
             .queue(&mut sequence.inner)
             .map(|inner| NativeGraphOutputs { inner })
+    }
+
+    /// [`Self::queue`], the run sampled for its spans' device time: each
+    /// mark of its plan ([`NativeGraph::span_mark`]) stamped as the device
+    /// passes it, read through the returned spans once the run's work
+    /// completes ([`NativeSpans::seconds`]). Why the device's backend times
+    /// no span (Metal, the CPU).
+    pub fn queue_sampled(
+        self,
+        sequence: &mut NativeGraphSequence,
+    ) -> Result<(NativeGraphOutputs, NativeSpans), CallError> {
+        self.inner
+            .queue_sampled(&mut sequence.inner)
+            .map(|(inner, spans)| (NativeGraphOutputs { inner }, spans))
     }
 }
 
@@ -3504,9 +4226,32 @@ impl<E: Entry> NativeKernel<E> {
             .point(rotation.into_iter().map(E::encode).collect())
     }
 
+    /// Calls cycling through `rotation`, as [`Self::point`], timed with
+    /// `beside` (work another thread does on the device) running for as
+    /// long as the point, or any gauge of it, is held.
+    pub fn point_beside(
+        &self,
+        rotation: Vec<E::Args<'_>>,
+        beside: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<KernelPoint, CallError> {
+        self.inner
+            .point_beside(rotation.into_iter().map(E::encode).collect(), beside)
+    }
+
     pub fn call(&self, args: E::Args<'_>) -> Result<E::Results, CallError> {
         let encoded = E::encode(args);
         let decoded = seismic_runtime::api::kernel::call_native(&self.inner, encoded)?;
+        Ok(E::decode(decoded))
+    }
+
+    /// [`Self::call`] of a call whose every awaited (`&await`) word already
+    /// holds its answer, written by the host before the call: it waits for
+    /// nothing, so it runs on every backend, where kernels park and where a
+    /// graph's park is a submission boundary alike (a graph binds such a
+    /// park answered: `NativeGraphBindings::set_answered`).
+    pub fn call_answered(&self, args: E::Args<'_>) -> Result<E::Results, CallError> {
+        let encoded = E::encode(args);
+        let decoded = seismic_runtime::api::kernel::call_native_answered(&self.inner, encoded)?;
         Ok(E::decode(decoded))
     }
 
@@ -3773,6 +4518,9 @@ pub mod generated {
         pub fn u32(&mut self, value: u32) {
             self.inner.push_scalar(EncodedScalar::U32(value));
         }
+        pub fn u64(&mut self, value: u64) {
+            self.inner.push_scalar(EncodedScalar::U64(value));
+        }
         pub fn bool(&mut self, value: bool) {
             self.inner.push_scalar(EncodedScalar::Bool(value));
         }
@@ -3865,6 +4613,9 @@ pub mod generated {
         }
         pub fn u32(&mut self, value: u32) {
             self.inner.push_scalar(EncodedScalar::U32(value));
+        }
+        pub fn u64(&mut self, value: u64) {
+            self.inner.push_scalar(EncodedScalar::U64(value));
         }
         pub fn bool(&mut self, value: bool) {
             self.inner.push_scalar(EncodedScalar::Bool(value));
@@ -3994,9 +4745,11 @@ pub mod generated {
     ) -> Result<Option<&'static NativeImplementation>, CheckedBundleError> {
         let module = E::module()?;
         let entry = E::resolve(module)?;
-        Ok(module
-            .checked()
-            .native_implementation_at(entry.id(), backend, &element_bindings(elements)))
+        Ok(module.checked().native_implementation_at(
+            entry.id(),
+            backend,
+            &element_bindings(elements),
+        ))
     }
 
     /// Resolve one metadata graph call from one checked entry and one set of
@@ -4035,7 +4788,9 @@ pub mod generated {
             let entry = E::resolve(module)?;
             let bindings = element_bindings(elements);
             let Some(implementation) =
-                module.checked().native_implementation_at(entry.id(), backend, &bindings)
+                module
+                    .checked()
+                    .native_implementation_at(entry.id(), backend, &bindings)
             else {
                 return Ok(Err(format!(
                     "`{}` has no native implementation for `{}`",
@@ -4222,7 +4977,10 @@ pub mod generated {
                 backend.as_str()
             )));
         }
-        let logical = match module.checked().entry(entry.id(), &element_bindings(elements)) {
+        let logical = match module
+            .checked()
+            .entry(entry.id(), &element_bindings(elements))
+        {
             Ok(logical) => logical,
             Err(error) => return Ok(NativeTensorParameterCheck::Unsupported(error.to_string())),
         };
@@ -4262,7 +5020,10 @@ pub mod generated {
                 backend.as_str()
             )));
         }
-        let logical = match module.checked().entry(entry.id(), &element_bindings(elements)) {
+        let logical = match module
+            .checked()
+            .entry(entry.id(), &element_bindings(elements))
+        {
             Ok(logical) => logical,
             Err(error) => return Ok(NativeTensorResultsCheck::Unsupported(error.to_string())),
         };
@@ -4314,7 +5075,10 @@ pub mod generated {
                 backend.as_str()
             )));
         }
-        let logical = match module.checked().entry(entry.id(), &element_bindings(elements)) {
+        let logical = match module
+            .checked()
+            .entry(entry.id(), &element_bindings(elements))
+        {
             Ok(logical) => logical,
             Err(error) => return Ok(NativeTensorResultsCheck::Unsupported(error.to_string())),
         };
@@ -4490,6 +5254,7 @@ pub mod generated {
     scalar_result!(take_bf16, BF16, BF16, BF16::from_bits);
     scalar_result!(take_i32, I32, i32, |value| value);
     scalar_result!(take_u32, U32, u32, |value| value);
+    scalar_result!(take_u64, U64, u64, |value| value);
     scalar_result!(take_bool, Bool, bool, |value| value);
     scalar_result!(take_index, Index, BigUint, |value| value);
 

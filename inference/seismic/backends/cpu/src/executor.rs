@@ -1,6 +1,7 @@
 //! Synchronous execution of the core-owned executable command vocabulary.
 
-use crate::buffer::{AllocationFailure, Buffer};
+use crate::buffer::{Buffer, WritableBuffer};
+use seismic_reservation::{AllocationFailure, Pages, Resizer};
 use crate::workers::{LaunchFailure, LaunchFrame, NativeSteps, Workers};
 use crate::Cpu;
 use seismic_compiler::errors::ExecutionError;
@@ -16,14 +17,29 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Device;
 
+impl Device {
+    /// Zeroed memory over a host address reservation of `reserved` bytes in
+    /// `granule`-byte granules with the leading `committed` bytes backed,
+    /// and its resizer; see [`WritableBuffer::reserved`].
+    pub fn allocate_reserved(
+        &self,
+        committed: u64,
+        reserved: u64,
+        granule: u64,
+    ) -> Result<(WritableBuffer, Resizer<Pages>), ExecutionError> {
+        WritableBuffer::reserved(committed, reserved, granule).map_err(allocation_error)
+    }
+}
+
 impl DeviceService<Cpu> for Device {
     type Buffer = Buffer;
+    type Writable = WritableBuffer;
 
-    fn allocate(&self, bytes: u64, alignment: u64) -> Result<Buffer, ExecutionError> {
-        Buffer::new(bytes, alignment).map_err(allocation_error)
+    fn allocate(&self, bytes: u64, alignment: u64) -> Result<WritableBuffer, ExecutionError> {
+        WritableBuffer::new(bytes, alignment).map_err(allocation_error)
     }
 
-    fn write(&self, buffer: &Buffer, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
+    fn write(&self, buffer: &WritableBuffer, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
         buffer.write(offset, bytes);
         Ok(())
     }
@@ -35,6 +51,10 @@ impl DeviceService<Cpu> for Device {
 
     fn buffer_len(&self, buffer: &Buffer) -> u64 {
         buffer.len()
+    }
+
+    fn host_address(&self, buffer: &WritableBuffer) -> Option<std::ptr::NonNull<u8>> {
+        std::ptr::NonNull::new(buffer.data_pointer())
     }
 }
 

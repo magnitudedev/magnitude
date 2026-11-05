@@ -97,6 +97,160 @@ impl BackendName {
             BackendName::Vulkan => false,
         }
     }
+
+    /// Whether its runtime encodes each run's launches on the host, so a
+    /// launch can be left out by a word the host reads then (`launch …
+    /// if (w)`, `unless (w)`). CUDA and Vulkan replay the graph of the
+    /// launches a submission encodes, keyed by them.
+    pub const fn encodes_runs(self) -> bool {
+        match self {
+            BackendName::Metal | BackendName::Cuda | BackendName::Vulkan => true,
+            BackendName::Cpu => false,
+        }
+    }
+
+    /// Whether the backend's devices see the host's writes while work runs,
+    /// so a call that parks (an awaited port, `&await`) waits inside its
+    /// kernel, which spins on the awaited words. Where they do not, the
+    /// runtime parks the call at a submission boundary: the work before it
+    /// ends its submission and signals the host, and the call's submission
+    /// waits for the host's answer (`NativeGraphDraft::enqueue`). A Vulkan
+    /// device's running work neither sees a host write nor makes its own
+    /// visible to the host before it ends (the Vulkan spec has no host domain
+    /// operation within a submission; measured on GB10, and on an RTX 3090
+    /// outside its BAR).
+    pub const fn parks_in_kernels(self) -> bool {
+        match self {
+            BackendName::Cpu | BackendName::Metal | BackendName::Cuda => true,
+            BackendName::Vulkan => false,
+        }
+    }
+
+    /// Whether the backend's plain device loads read what the host last
+    /// wrote of the records a record parameter binds (`records`), which the
+    /// host lands while work that reads them runs (a bank's records, a
+    /// tier's, a conveyor's). Where they do not, the generated prefix marks
+    /// each record parameter host-written (`<PORT>_HOST_WRITTEN`), and the
+    /// backend's native library reads a host-written port's records with
+    /// loads that do. Metal's plain loads return stale bytes of a record the
+    /// host rewrites and the device reads again within one command buffer,
+    /// which neither a system-scope fence nor a kernel boundary prevents;
+    /// `volatile coherent(system)` loads are exact, at 8% of a whole
+    /// `routed_down` launch on an M4 Pro, which a launch that runs while
+    /// nothing lands in its records avoids. A CUDA device whose
+    /// memory is the host's (GB10) is coherent with the host's writes, as
+    /// measured on that device, and a Vulkan device reads a host write only
+    /// across a submission boundary, where a call that waits for one parks
+    /// (`parks_in_kernels`), so their plain loads do. The CPU's loads are the
+    /// host's.
+    pub const fn plain_loads_read_host_writes(self) -> bool {
+        match self {
+            BackendName::Cpu | BackendName::Cuda | BackendName::Vulkan => true,
+            BackendName::Metal => false,
+        }
+    }
+
+    /// Whether a recorded graph is updated to another run's storage in
+    /// queue order beside its launches in flight, so one graph serves every
+    /// run of its shape: Vulkan rewrites argument blocks on the queue, and a
+    /// Metal schedule binds nothing. CUDA sets a graph's parameters on the
+    /// host, which waits behind its launches in flight, so a CUDA graph is
+    /// updated only once idle and every run in flight keeps its own.
+    pub const fn graphs_update_in_flight(self) -> bool {
+        match self {
+            BackendName::Cuda => false,
+            BackendName::Cpu | BackendName::Metal | BackendName::Vulkan => true,
+        }
+    }
+
+    /// Whether the backend runs fill work (a native submission queued on the
+    /// fill queue, `NativeQueue::Fill`) on a device queue of its own beside
+    /// compute, so a fill's moves and its parks overlap compute and hold
+    /// only later fills. CUDA runs it on a second native stream. Vulkan (a
+    /// second queue with timeline semaphores) and Metal (a second command
+    /// queue with a shared event) have none yet, so their fill queue is the
+    /// compute queue; the CPU's work completes as it is submitted.
+    pub const fn fills_beside_compute(self) -> bool {
+        match self {
+            BackendName::Cuda => true,
+            BackendName::Cpu | BackendName::Metal | BackendName::Vulkan => false,
+        }
+    }
+
+    /// Whether a native implementation dispatches a block of its launches
+    /// more than once (`repeat`): its runtime's encoder replays the block.
+    pub const fn repeats_launches(self) -> bool {
+        match self {
+            BackendName::Metal => true,
+            BackendName::Cpu | BackendName::Cuda | BackendName::Vulkan => false,
+        }
+    }
+
+    /// Whether a launch with a written grid (`grid (w)`) is authored as the
+    /// body of one block ([`written_grid_block`]), which the runtime's
+    /// generated kernel runs over the grid's blocks: CUDA has no indirect
+    /// launch. Elsewhere the launch is the kernel, dispatched indirectly.
+    pub const fn authors_written_grid_blocks(self) -> bool {
+        match self {
+            BackendName::Cuda => true,
+            BackendName::Cpu | BackendName::Metal | BackendName::Vulkan => false,
+        }
+    }
+
+    /// Whether a native implementation reaches tensors a record at a time
+    /// through a table of record addresses (`records`): its runtime binds
+    /// such a parameter as that table, which reserved storage held as
+    /// chunks requires.
+    pub const fn binds_record_tables(self) -> bool {
+        match self {
+            BackendName::Metal | BackendName::Vulkan => true,
+            BackendName::Cpu | BackendName::Cuda => false,
+        }
+    }
+}
+
+/// The bytes of one entry of a record table: the 8-byte device address of
+/// its record.
+pub const RECORD_TABLE_ENTRY_BYTES: u64 = 8;
+
+/// The bytes of a record table of `records` entries, one device address a
+/// record; `None` past the bytes a `u64` counts.
+pub const fn record_table_bytes(records: u64) -> Option<u64> {
+    records.checked_mul(RECORD_TABLE_ENTRY_BYTES)
+}
+
+/// Where entry `index` of a formed record table lies, in bytes from its
+/// first: an entry of a table whose bytes [`record_table_bytes`] counted,
+/// so it lies within them.
+pub const fn record_table_entry(index: u64) -> u64 {
+    index * RECORD_TABLE_ENTRY_BYTES
+}
+
+/// The bytes of a record table whose entries are `addresses` in turn, each
+/// a record's device address, little-endian.
+pub fn record_table(addresses: impl IntoIterator<Item = u64>) -> Vec<u8> {
+    addresses
+        .into_iter()
+        .flat_map(u64::to_le_bytes)
+        .collect()
+}
+
+/// The table entries of chunk `index` of `granule` bytes, at device address
+/// `address`, in a reservation of `records` records of `record` bytes: its
+/// first record, and the table bytes of its records' addresses, each
+/// record's within the chunk (the last chunk may hold fewer).
+pub fn chunk_entries(index: u64, granule: u64, record: u64, records: u64, address: u64) -> (u64, Vec<u8>) {
+    let per = granule / record;
+    let start = (index * per).min(records);
+    let end = ((index + 1) * per).min(records);
+    (start, record_table((start..end).map(|entry| address + (entry - index * per) * record)))
+}
+
+/// The function a written-grid launch `kernel` is authored as where its
+/// backend authors written grids as blocks
+/// ([`BackendName::authors_written_grid_blocks`]): the body of one block.
+pub fn written_grid_block(kernel: &str) -> String {
+    format!("{kernel}_block")
 }
 
 /// The source dialect of a backend's native implementations: the sources a
@@ -113,7 +267,7 @@ pub enum SourceDialect {
 /// Revision of the whole registry. Any semantic change to a primitive,
 /// capability, intrinsic, or representation changes this string, and with it
 /// every cache identity.
-pub const REGISTRY_REVISION: &str = "seismic-registry-v16";
+pub const REGISTRY_REVISION: &str = "seismic-registry-v17";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapabilityInfo {
@@ -494,11 +648,39 @@ impl RepresentationConversion {
     /// conversion quiets a signaling NaN where the host reference widens its
     /// bits. Each such field has the high bit of its exponent cleared.
     pub fn admit_source(&self, packets: &mut [u8]) {
-        let fields = self.recipe.converted_f16_fields();
+        let bits = self.recipe.converted_f16_fields().iter().map(|field| field + 14).collect::<Vec<_>>();
+        self.clear(packets, &bits);
+    }
+
+    /// Brings `packets`, whole source packets of arbitrary bytes, into the
+    /// conversion's domain ([`Self::admit_source`]) with every number the
+    /// destination reads from them finite: also each floating-point field
+    /// it carries bit for bit into a plane of floating-point numbers (a
+    /// GGUF scale it keeps as stored) has the high bit of its exponent
+    /// cleared. A record of such packets has a finite value everywhere, so
+    /// arithmetic over it compares; one of a carried NaN or infinity does
+    /// not.
+    pub fn finite_source(&self, packets: &mut [u8]) {
+        let mut bits = self.recipe.converted_f16_fields().iter().map(|field| field + 14).collect::<Vec<_>>();
+        for (plane, recipe) in self.destination_layout.packet().planes.iter().zip(&self.recipe.planes) {
+            // A typed recipe's numbers are converted (above) or a
+            // codebook's, never carried bits.
+            if let (Some(high), PlaneRepackRecipe::BitRoutes(routes)) = (plane.encoding.finite_bit(), recipe) {
+                bits.extend(
+                    routes
+                        .chunks_exact(plane.encoding.entry_bits() as usize)
+                        .filter_map(|entry| entry[high as usize]),
+                );
+            }
+        }
+        self.clear(packets, &bits);
+    }
+
+    /// Clear source bits `bits` of every packet of `packets`.
+    fn clear(&self, packets: &mut [u8], bits: &[u32]) {
         for packet in packets.chunks_exact_mut(self.source_layout.packet_size as usize) {
-            for field in &fields {
-                let bit = (field + 14) as usize;
-                packet[bit / 8] &= !(1 << (bit % 8));
+            for &bit in bits {
+                packet[bit as usize / 8] &= !(1 << (bit % 8));
             }
         }
     }
@@ -785,6 +967,30 @@ pub const ROWS32_TILE_ROWS: u64 = 32;
 pub const ROWS32_CHUNK: u64 = 32;
 /// Lanes of the warp that owns one `mma16` tile.
 pub const MMA_LANES: u64 = 32;
+/// Columns per `k16` fragment step of an `mma16` k-block.
+pub const MMA_STEP: u64 = 16;
+/// Fragment slots per `k16` step of an `mma16` lane.
+pub const MMA_STEP_SLOTS: u64 = 8;
+// `mma_fragment_byte` is written over these, in a kernel's terms.
+const _: () = assert!(MMA_LANES == 32 && MMA_STEP_SLOTS == 8 && MMA_KBLOCK == 4 * MMA_STEP);
+
+/// A placement rule, in one source: `$name` here, and `$text` the same
+/// expression as the parameter list and body of a native ABI macro. Its
+/// parameters are parenthesized for that macro, and its body is only integer
+/// arithmetic every kernel dialect reads alike.
+macro_rules! placement_rule {
+    ($(#[$doc:meta])* $name:ident, $text:ident ($($parameter:ident),*) = $body:expr) => {
+        $(#[$doc])*
+        #[inline]
+        #[allow(unused_parens)]
+        pub const fn $name($($parameter: u64),*) -> u64 {
+            $body
+        }
+        #[doc = concat!("[`Self::", stringify!($name), "`] as a native ABI macro's parameters and body.")]
+        pub const $text: &'static str =
+            concat!("(", stringify!($($parameter),*), ") (", stringify!($body), ")");
+    };
+}
 
 /// The byte geometry of a packed representation in a row layout (`rows16`,
 /// `mma16`). A tensor `[..., N, K]` is stored as rows of `K` logical values
@@ -830,6 +1036,7 @@ pub struct RowGeometry {
     pub offsets: Vec<u64>,
     pub bytes_per_row: Vec<u64>,
 }
+
 
 /// One plane of a row layout.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1085,8 +1292,7 @@ impl PackedRowLayout {
                 let entry = column % u64::from(self.packet.group) / u64::from(GRID_VALUES);
                 let packet = column / u64::from(self.packet.group);
                 let byte = self.record_byte(geometry, row, packet, Record::Entries, |r| {
-                    let (q, e) = (entry / 8, entry % 8);
-                    q / 2 * 512 + (4 * (r % 8) + e % 4) * 16 + (q % 2 * 2 + r / 8) * 4 + e / 4 * 2
+                    Self::record_entry(r, entry / 8, entry % 8)
                 });
                 return byte * 8 + column % u64::from(GRID_VALUES) * u64::from(bits);
             }
@@ -1124,10 +1330,10 @@ impl PackedRowLayout {
                 let bit = if grids {
                     ((block * MMA_TILE_ROWS + r) * (MMA_KBLOCK / unit) + c / unit) * bits
                 } else {
-                    let (step, k) = (c / 16, c % 16);
+                    let (step, k) = (c / MMA_STEP, c % MMA_STEP);
                     let lane = 4 * (r % 8) + (k % 8) / 2;
                     let slot = (k / 8) * 2 + r / 8 + 4 * (k % 2);
-                    (block * MMA_LANES + lane) * 32 * bits + 8 * bits * step + bits * slot
+                    Self::mma_fragment_byte(block, lane, bits, step) * 8 + bits * slot
                 };
                 let (byte, within) = (bit / 8, bit % 8);
                 let stored = tile * MMA_TILE_ROWS + byte / row_bytes;
@@ -1181,6 +1387,42 @@ impl PackedRowLayout {
     /// every stored group's entries (`record_byte`).
     pub fn record_entry_bytes(&self) -> u64 {
         MMA_TILE_ROWS * u64::from(self.packet.planes[0].bytes_per_group)
+    }
+
+    placement_rule! {
+        /// The byte of entry `entry` (of eight) of k-block `block` (of four) of
+        /// row `r` of its tile within a storage group's entries of a `records`
+        /// tile (`record_byte`'s GEMV lane order): half `block / 2`, lane
+        /// `4 (r % 8) + entry % 4`, word `2 (block % 2) + r / 8`, its low or
+        /// high half by `entry / 4`.
+        record_entry, RECORD_ENTRY_RULE(r, block, entry) =
+            (block) / 2 * 512 + (4 * ((r) % 8) + (entry) % 4) * 16 + ((block) % 2 * 2 + (r) / 8) * 4 + (entry) / 4 * 2
+    }
+
+    placement_rule! {
+        /// The place of row `r` of its tile among a storage group's factors of
+        /// a `records` tile (`[g][row g, row g + 8]`), in factor widths.
+        record_factor, RECORD_FACTOR_RULE(r) = 2 * ((r) % 8) + (r) / 8
+    }
+
+    placement_rule! {
+        /// The row of a tile that slot `slot` of lane `lane`'s `k16` step of
+        /// an `mma16` code plane holds (`code_bit`, inverted).
+        mma_fragment_row, MMA_FRAGMENT_ROW_RULE(lane, slot) = (lane) / 4 + 8 * ((slot) % 2)
+    }
+
+    placement_rule! {
+        /// The column of a `k16` step that slot `slot` of lane `lane`'s step
+        /// of an `mma16` code plane holds (`code_bit`, inverted).
+        mma_fragment_column, MMA_FRAGMENT_COLUMN_RULE(lane, slot) =
+            2 * ((lane) % 4) + 8 * (((slot) % 4) / 2) + (slot) / 4
+    }
+
+    placement_rule! {
+        /// The byte of `k16` step `step` of lane `lane` of k-block `block` in
+        /// an `mma16` code plane's tile sequence, `bits` a column (`code_bit`).
+        mma_fragment_byte, MMA_FRAGMENT_BYTE_RULE(block, lane, bits, step) =
+            ((block) * 32 + (lane)) * 4 * (bits) + (bits) * (step)
     }
 
     /// The bytes of a `records` plane (`mma16`, its layout's only plane) of
@@ -1392,7 +1634,7 @@ impl PackedRowLayout {
                     .sum::<u64>();
                 let within = share - self.packet.group * bits;
                 let byte = self.record_byte(geometry, row, packet, Record::Factors, |r| {
-                    (2 * (r % 8) + r / 8) * width + u64::from(within / 8)
+                    Self::record_factor(r) * width + u64::from(within / 8)
                 });
                 byte * 8 + u64::from(within % 8)
             }
@@ -1607,9 +1849,92 @@ pub fn representation(name: &str) -> Option<RepresentationId> {
 pub fn representation_info(id: RepresentationId) -> &'static RepresentationInfo {
     internals::representation_info(id)
 }
+
+/// The stores storage of one representation takes: the one write rule every
+/// checker and lowering site asks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreRule {
+    /// Writable storage (`RepresentationAccess::ReadWrite`) takes every store.
+    Any,
+    /// Packed storage (`Packed`, `PackedRows`) has no canonical logical
+    /// write: it takes exactly the store of whole trailing matrices (its last
+    /// two axes) from a value of this same representation, whose encoded
+    /// bytes the store copies.
+    Records(RepresentationId),
+    /// Every other storage of this representation takes no store.
+    Refused(RepresentationId),
+}
+
+impl StoreRule {
+    /// A store selecting whole trailing matrices (`whole_records`), or any
+    /// other part: taken, or refused with the diagnostic of its rule.
+    pub fn admits(self, whole_records: bool) -> Result<(), String> {
+        match self {
+            Self::Any => Ok(()),
+            Self::Records(_) if whole_records => Ok(()),
+            Self::Records(own) => Err(decode_only(own)),
+            Self::Refused(own) => Err(storeless(own)),
+        }
+    }
+
+    /// A stored value of representation `value` (`None` for a value that is
+    /// not a tensor of one): taken, or refused with the diagnostic of its
+    /// rule.
+    pub fn admits_value(self, value: Option<RepresentationId>) -> Result<(), String> {
+        match self {
+            Self::Any => Ok(()),
+            Self::Records(own) if value == Some(own) => Ok(()),
+            Self::Records(own) => Err(decode_only(own)),
+            Self::Refused(own) => Err(storeless(own)),
+        }
+    }
+}
+
+/// The diagnostic of a store packed storage of `id` does not take.
+fn decode_only(id: RepresentationId) -> String {
+    format!(
+        "representation `{}` is decode-only: it is written only by whole trailing matrices of the same representation",
+        representation_info(id).name
+    )
+}
+
+/// The diagnostic of any store into storage of `id`, which takes none.
+fn storeless(id: RepresentationId) -> String {
+    format!("representation `{}` is read-only: it takes no store", representation_info(id).name)
+}
+
+pub fn store_rule(id: RepresentationId) -> StoreRule {
+    let info = representation_info(id);
+    match info.kind {
+        _ if info.access == RepresentationAccess::ReadWrite => StoreRule::Any,
+        RepresentationKind::Packed(_) | RepresentationKind::PackedRows(_) => {
+            StoreRule::Records(id)
+        }
+        _ => StoreRule::Refused(id),
+    }
+}
+
+/// Whether storage of `id` takes some store, so binds a `&mut` parameter.
+pub fn record_writable(id: RepresentationId) -> bool {
+    store_rule(id).admits(true).is_ok()
+}
+
 pub fn representations() -> &'static [RepresentationInfo] {
     internals::representations()
 }
+/// The destination dtype of `repack` between two dense float representations:
+/// an element conversion, each element decoded to F32 and rounded into the
+/// destination (as `import_dense` imports a dense weight). `None` unless both
+/// are dense floats, whose exact conversions are the registered ones
+/// (`representation_conversion`).
+pub fn dense_conversion(source: RepresentationId, destination: RepresentationId) -> Option<DType> {
+    let float = |id| match representation_info(id).kind {
+        RepresentationKind::Dense(dtype) if dtype.is_float() => Some(dtype),
+        _ => None,
+    };
+    float(source).and(float(destination))
+}
+
 pub fn representation_conversion(
     source: RepresentationId,
     destination: RepresentationId,
@@ -1802,6 +2127,30 @@ pub fn canonical_bytes(id: RepresentationId, extents: &[u64]) -> Option<u64> {
         }
     }
 }
+
+/// Bytes of one record (a row of the leading axis) of a tensor of
+/// representation `id` with `extents`, where every record lies in its own
+/// consecutive bytes, one after another ([`canonical_bytes`] of the trailing
+/// extents), whatever its count of records, none included (a view of no
+/// records binds a record port as a table of no entries). `None` for a
+/// tensor of empty records, and for one whose layout interleaves its
+/// leading axis: a packed or external tensor's only axis (its packing
+/// axis), or a row layout's tiled rows.
+pub fn record_bytes(id: RepresentationId, extents: &[u64]) -> Option<std::num::NonZeroU64> {
+    let (_, trailing) = extents.split_first()?;
+    let own = match &representation_info(id).kind {
+        RepresentationKind::Dense(_) => true,
+        RepresentationKind::Packed(_) | RepresentationKind::External(_) => !trailing.is_empty(),
+        RepresentationKind::PackedRows(layout) => {
+            trailing.len() >= 2 || (trailing.len() == 1 && layout.tile_rows() == 1)
+        }
+    };
+    if !own {
+        return None;
+    }
+    std::num::NonZeroU64::new(canonical_bytes(id, trailing)?)
+}
+
 /// The dense representation of a dtype.
 pub fn dense(dtype: DType) -> RepresentationId {
     internals::dense(dtype)
@@ -3515,6 +3864,38 @@ pub(crate) mod internals {
 
 #[cfg(test)]
 mod tests {
+    /// A chunk's entries are its records' addresses within it, from its
+    /// first record; the last chunk's stop at the reservation's last.
+    #[test]
+    fn a_chunk_enters_its_records_from_its_first() {
+        let address = |entries: &[u8]| {
+            entries
+                .chunks_exact(super::RECORD_TABLE_ENTRY_BYTES as usize)
+                .map(|entry| u64::from_le_bytes(entry.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        // 4 records of 512 bytes a 2 KiB chunk, 10 records in all.
+        let (start, entries) = super::chunk_entries(1, 2048, 512, 10, 0x10_0000);
+        assert_eq!((start, address(&entries)), (4, vec![0x10_0000, 0x10_0200, 0x10_0400, 0x10_0600]));
+        let (start, entries) = super::chunk_entries(2, 2048, 512, 10, 0x20_0000);
+        assert_eq!((start, address(&entries)), (8, vec![0x20_0000, 0x20_0200]));
+    }
+
+    /// The fragment slots a kernel places from are the inverse of `code_bit`:
+    /// every (row, column) of a tile's k16 step, by the lane and slot that
+    /// hold it.
+    #[test]
+    fn fragment_slots_invert_the_code_placement() {
+        for r in 0..MMA_TILE_ROWS {
+            for k in 0..MMA_STEP {
+                let lane = 4 * (r % 8) + (k % 8) / 2;
+                let slot = (k / 8) * 2 + r / 8 + 4 * (k % 2);
+                assert_eq!(PackedRowLayout::mma_fragment_row(lane, slot), r);
+                assert_eq!(PackedRowLayout::mma_fragment_column(lane, slot), k);
+            }
+        }
+    }
+
     use super::*;
 
     /// Code planes split a width into a power-of-two low plane and a high
@@ -3756,6 +4137,38 @@ mod tests {
                         if scale_high { 0xbf } else { 0xff },
                         "{source} packet {packet} byte {index}"
                     );
+                }
+            }
+        }
+    }
+
+    /// A finite source also makes the scales a conversion carries bit for
+    /// bit finite: Q4_0's and Q8_0's binary16 `d` (bytes 0 and 1) and
+    /// MXFP4's E8M0 exponent (byte 0), every other byte kept; IQ2_XS's
+    /// converted factor as its domain does.
+    #[test]
+    fn a_finite_source_makes_every_scale_its_destination_reads_finite() {
+        for (source, destination, cleared) in [
+            ("gguf_q4_0", "q4g32s@rows16", (1, 0xbf)),
+            ("gguf_q8_0", "q8g32s@rows16", (1, 0xbf)),
+            ("gguf_iq2_xs", "iq2xs@rows16", (1, 0xbf)),
+            ("gguf_mxfp4", "mxfp4g32@rows16", (0, 0x7f)),
+        ] {
+            let conversion = representation_conversion(
+                representation(source).unwrap(),
+                representation(destination).unwrap(),
+            )
+            .unwrap();
+            let RepresentationKind::External(layout) = &representation_info(conversion.source).kind
+            else {
+                panic!("{source} is external storage")
+            };
+            let mut packets = vec![0xffu8; 2 * layout.packet_size as usize];
+            conversion.finite_source(&mut packets);
+            for (packet, bytes) in packets.chunks_exact(layout.packet_size as usize).enumerate() {
+                for (index, byte) in bytes.iter().enumerate() {
+                    let expected = if index == cleared.0 { cleared.1 } else { 0xff };
+                    assert_eq!(*byte, expected, "{source} packet {packet} byte {index}");
                 }
             }
         }
@@ -4169,6 +4582,21 @@ mod tests {
         }
     }
 
+    /// A refused store's diagnostic is its rule's: packed storage takes
+    /// whole records, external storage no store at all.
+    #[test]
+    fn a_refused_store_reports_its_rule() {
+        let packed = representation("q4g64").unwrap();
+        let external = representation("gguf_q4_k").unwrap();
+        assert_eq!(store_rule(dense(DType::F32)).admits(false), Ok(()));
+        assert_eq!(store_rule(packed).admits(true), Ok(()));
+        assert!(store_rule(packed).admits(false).unwrap_err().contains("decode-only"));
+        assert!(store_rule(packed).admits_value(None).unwrap_err().contains("decode-only"));
+        assert_eq!(store_rule(external), StoreRule::Refused(external));
+        assert!(store_rule(external).admits(true).unwrap_err().contains("takes no store"));
+        assert!(!record_writable(external));
+    }
+
     #[test]
     fn canonical_bytes_follow_the_representation_layout() {
         let q4g64 = representation("q4g64").unwrap();
@@ -4184,6 +4612,30 @@ mod tests {
         assert_eq!(canonical_bytes(q4_k, &[]), None);
         assert_eq!(canonical_bytes(dense(DType::F32), &[u64::MAX, 2]), None);
         assert_eq!(canonical_bytes(q4g64, &[u64::MAX, 64]), None);
+    }
+
+    /// A record is a leading-axis row in its own bytes: a matrix of a row
+    /// layout's tensor of matrices, never a row its tiles interleave.
+    #[test]
+    fn records_are_leading_rows_in_their_own_bytes() {
+        let bytes = |id, extents: &[u64]| record_bytes(id, extents).map(std::num::NonZeroU64::get);
+        let q4_k = representation("gguf_q4_k").unwrap();
+        assert_eq!(bytes(dense(DType::F32), &[3, 5]), Some(20));
+        assert_eq!(bytes(dense(DType::F32), &[0, 5]), Some(20), "a view of no records has records of a size");
+        assert_eq!(bytes(dense(DType::F32), &[3, 0]), None, "empty records have none");
+        assert_eq!(bytes(q4_k, &[2, 257]), Some(2 * 144));
+        assert_eq!(bytes(q4_k, &[512]), None);
+        for layout in [Layout::Rows16, Layout::Rows8, Layout::Mma16, Layout::Rows32] {
+            let id = storage("q4k", layout).unwrap();
+            let matrix = canonical_bytes(id, &[24, 256]).unwrap();
+            assert_eq!(bytes(id, &[3, 24, 256]), Some(matrix), "{}", layout.as_str());
+            assert_eq!(canonical_bytes(id, &[3, 24, 256]), Some(3 * matrix));
+            let RepresentationKind::PackedRows(rows) = &representation_info(id).kind else {
+                unreachable!("a row layout's storage")
+            };
+            let row = (rows.tile_rows() == 1).then(|| canonical_bytes(id, &[256]).unwrap());
+            assert_eq!(bytes(id, &[32, 256]), row, "{}", layout.as_str());
+        }
     }
 
     #[test]

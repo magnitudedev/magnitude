@@ -1,9 +1,10 @@
 //! CUDA storage exposed through the generic device service: device memory,
 //! pinned host memory mapped into the device address space, or the backed
-//! prefix of a reserved device address range.
+//! prefix of a reserved address range of either.
 
 use crate::blocks::Range;
-use crate::driver::{self, DriverError, HostMapped, Reservation};
+use crate::driver::{self, DriverError, HostMapped, ReservedMemory};
+use seismic_reservation::Reserved;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -16,12 +17,9 @@ enum Memory {
     Device(Range),
     /// Host-written inputs: filled by the host without a driver call.
     Mapped(HostMapped),
-    /// The leading `bytes` of a reservation, which are backed. Buffers of
-    /// one reservation share its base address.
-    Reserved {
-        reservation: Arc<Reservation>,
-        bytes: usize,
-    },
+    /// The committed bytes of a reservation, which are backed.
+    /// Its `Resizer` changes them in place.
+    Reserved(Arc<Reserved<ReservedMemory>>),
 }
 
 impl Buffer {
@@ -35,20 +33,15 @@ impl Buffer {
             memory: Arc::new(Memory::Mapped(mapped)),
         }
     }
-    pub(crate) fn reserved(reservation: Arc<Reservation>, bytes: usize) -> Self {
+    pub(crate) fn reserved(reservation: Arc<Reserved<ReservedMemory>>) -> Self {
         Self {
-            memory: Arc::new(Memory::Reserved { reservation, bytes }),
+            memory: Arc::new(Memory::Reserved(reservation)),
         }
     }
-    /// Whether this buffer is the backed prefix of a reservation, which
-    /// `Device::recommit` resizes in place.
-    pub fn is_reserved(&self) -> bool {
-        self.reservation().is_some()
-    }
     /// The reservation this buffer is a backed prefix of.
-    pub(crate) fn reservation(&self) -> Option<&Arc<Reservation>> {
+    pub(crate) fn reservation(&self) -> Option<&ReservedMemory> {
         match &*self.memory {
-            Memory::Reserved { reservation, .. } => Some(reservation),
+            Memory::Reserved(reservation) => Some(reservation.backing()),
             Memory::Device(_) | Memory::Mapped(_) => None,
         }
     }
@@ -56,15 +49,34 @@ impl Buffer {
         match &*self.memory {
             Memory::Device(range) => range.bytes(),
             Memory::Mapped(mapped) => mapped.bytes as u64,
-            Memory::Reserved { bytes, .. } => *bytes as u64,
+            Memory::Reserved(reservation) => reservation.state().bytes,
         }
+    }
+    /// The host address of host memory's first byte (mapped memory, or a
+    /// reservation of host memory, which the host maps at the device's
+    /// addresses); device memory has none (the host reaches it by driver
+    /// copies).
+    pub(crate) fn host_address(&self) -> Option<std::ptr::NonNull<u8>> {
+        match &*self.memory {
+            Memory::Mapped(mapped) => std::ptr::NonNull::new(mapped.host()),
+            Memory::Reserved(reservation) => {
+                let memory = reservation.backing();
+                memory.memory.host_addressed().then(|| std::ptr::NonNull::new(memory.base as *mut u8)).flatten()
+            }
+            Memory::Device(_) => None,
+        }
+    }
+    /// The bytes no driver copy of this buffer's crosses, from its start
+    /// ([`ReservedMemory::copy_span`]); none where a copy may span it whole.
+    fn copy_span(&self) -> Option<u64> {
+        self.reservation().and_then(|reservation| reservation.copy_span())
     }
     /// The address kernels use.
     pub fn pointer(&self) -> u64 {
         match &*self.memory {
             Memory::Device(range) => range.pointer(),
             Memory::Mapped(mapped) => mapped.device,
-            Memory::Reserved { reservation, .. } => reservation.base,
+            Memory::Reserved(reservation) => reservation.backing().base,
         }
     }
     /// Synchronous host write. Device memory is written by a driver copy
@@ -77,16 +89,20 @@ impl Buffer {
                 mapped.write_at(offset, bytes);
                 Ok(())
             }
-            Memory::Reserved {
-                reservation,
-                bytes: backed,
-            } => {
-                assert_within(offset, bytes.len(), *backed, "upload_at");
-                driver::upload(
-                    reservation.context(),
-                    reservation.base + offset as u64,
-                    bytes,
-                )
+            Memory::Reserved(reservation) => {
+                assert_within(offset, bytes.len(), reservation.state().bytes as usize, "upload_at");
+                match self.host_address() {
+                    // SAFETY: within the backed bytes, which the host maps.
+                    Some(base) => unsafe {
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.as_ptr().add(offset), bytes.len());
+                        Ok(())
+                    },
+                    None => driver::upload(
+                        reservation.backing().context(),
+                        reservation.backing().base + offset as u64,
+                        bytes,
+                    ),
+                }
             }
         }
     }
@@ -98,16 +114,20 @@ impl Buffer {
                 mapped.read_at(offset, bytes);
                 Ok(())
             }
-            Memory::Reserved {
-                reservation,
-                bytes: backed,
-            } => {
-                assert_within(offset, bytes.len(), *backed, "download_at");
-                driver::download(
-                    reservation.context(),
-                    reservation.base + offset as u64,
-                    bytes,
-                )
+            Memory::Reserved(reservation) => {
+                assert_within(offset, bytes.len(), reservation.state().bytes as usize, "download_at");
+                match self.host_address() {
+                    // SAFETY: within the backed bytes, which the host maps.
+                    Some(base) => unsafe {
+                        std::ptr::copy_nonoverlapping(base.as_ptr().add(offset), bytes.as_mut_ptr(), bytes.len());
+                        Ok(())
+                    },
+                    None => driver::download(
+                        reservation.backing().context(),
+                        reservation.backing().base + offset as u64,
+                        bytes,
+                    ),
+                }
             }
         }
     }
@@ -126,5 +146,90 @@ impl std::fmt::Debug for Buffer {
         f.debug_struct("Buffer")
             .field("bytes", &self.len())
             .finish()
+    }
+}
+
+/// The driver copies of `bytes` bytes from `source` at `source_offset` to
+/// `destination` at `destination_offset`, in order, as (source offset,
+/// destination offset, bytes): one, cut wherever either side's bytes leave
+/// one of its copy spans ([`Buffer::copy_span`]).
+pub(crate) fn copy_pieces(
+    source: &Buffer,
+    source_offset: u64,
+    destination: &Buffer,
+    destination_offset: u64,
+    bytes: u64,
+) -> Vec<(u64, u64, u64)> {
+    cut(&[(source_offset, source.copy_span()), (destination_offset, destination.copy_span())], bytes)
+        .into_iter()
+        .map(|(done, piece)| (source_offset + done, destination_offset + done, piece))
+        .collect()
+}
+
+/// The driver fills of `bytes` bytes of `destination` at `offset`, in
+/// order, as (offset, bytes): one, cut wherever they leave one of its copy
+/// spans, which bound a fill as they bound a copy.
+pub(crate) fn fill_pieces(destination: &Buffer, offset: u64, bytes: u64) -> Vec<(u64, u64)> {
+    cut(&[(offset, destination.copy_span())], bytes)
+        .into_iter()
+        .map(|(done, piece)| (offset + done, piece))
+        .collect()
+}
+
+/// `bytes` bytes run from each of `sides`' offsets, cut wherever a side's
+/// bytes leave one of its spans (a span from its buffer's start, or none):
+/// the pieces as (bytes done before it, its bytes), in order.
+fn cut(sides: &[(u64, Option<u64>)], bytes: u64) -> Vec<(u64, u64)> {
+    let mut pieces = Vec::new();
+    let mut done = 0;
+    while done < bytes {
+        let room = sides
+            .iter()
+            .map(|&(offset, span)| span.map_or(u64::MAX, |span| span - (offset + done) % span))
+            .min()
+            .unwrap_or(u64::MAX);
+        let piece = (bytes - done).min(room);
+        pieces.push((done, piece));
+        done += piece;
+    }
+    pieces
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cut;
+
+    /// Pieces end exactly at each side's span boundaries, from any offset
+    /// within a span, and cover the bytes once, in order.
+    #[test]
+    fn copies_are_cut_at_every_side_s_span() {
+        const SPAN: u64 = 2 << 20;
+        // Unbounded sides: one piece, whatever the offsets.
+        assert_eq!(cut(&[(123, None), (SPAN - 1, None)], 5 * SPAN), vec![(0, 5 * SPAN)]);
+        assert_eq!(cut(&[(0, Some(SPAN))], 0), vec![]);
+        // Within one span: one piece.
+        assert_eq!(cut(&[(SPAN + 16, Some(SPAN))], SPAN - 16), vec![(0, SPAN - 16)]);
+        // Mid-span start over two boundaries.
+        let at = SPAN / 2 + 3;
+        assert_eq!(
+            cut(&[(at, Some(SPAN))], 2 * SPAN),
+            vec![(0, SPAN - at), (SPAN - at, SPAN), (2 * SPAN - at, at)]
+        );
+        // Two bounded sides at different phases: cut at both.
+        let pieces = cut(&[(SPAN - 100, Some(SPAN)), (SPAN - 300, Some(SPAN))], SPAN);
+        assert_eq!(pieces, vec![(0, 100), (100, 200), (300, SPAN - 300)]);
+        for (sides, bytes) in [(vec![(7u64, Some(4096u64)), (4095, Some(8192))], 100_000u64), (vec![(1, Some(3))], 10)] {
+            let pieces = cut(&sides, bytes);
+            assert_eq!(pieces.iter().map(|piece| piece.1).sum::<u64>(), bytes);
+            let mut done = 0;
+            for &(start, piece) in &pieces {
+                assert_eq!(start, done, "pieces in order with no gap");
+                for &(offset, span) in &sides {
+                    let span = span.unwrap();
+                    assert_eq!((offset + start) / span, (offset + start + piece - 1) / span, "no piece crosses a span");
+                }
+                done += piece;
+            }
+        }
     }
 }

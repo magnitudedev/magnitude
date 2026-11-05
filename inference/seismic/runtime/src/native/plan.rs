@@ -138,6 +138,20 @@ pub fn code_values(
     specialization: &NativeSpecialization,
     launch: usize,
 ) -> Vec<u64> {
+    code_parameters(implementation, launch)
+        .into_iter()
+        .map(|(local, name)| match local {
+            false => specialization.param(name).expect("validated entry code parameter"),
+            true => specialization
+                .launch_param(launch, name)
+                .expect("validated launch code parameter"),
+        })
+        .collect()
+}
+
+/// The code parameters of the launch's template header, in order, each
+/// with whether it is launch-local.
+pub(crate) fn code_parameters(implementation: &NativeImplementation, launch: usize) -> Vec<(bool, &str)> {
     let reads = implementation.launches[launch].parameters();
     implementation
         .params
@@ -150,21 +164,13 @@ pub fn code_values(
                         .iter()
                         .any(|candidate| candidate.parameters().contains(&parameter.name)))
         })
-        .map(|parameter| {
-            specialization
-                .param(&parameter.name)
-                .expect("validated entry code parameter")
-        })
+        .map(|parameter| (false, parameter.name.as_str()))
         .chain(
             implementation.launches[launch]
                 .params
                 .iter()
                 .filter(|parameter| parameter.code)
-                .map(|parameter| {
-                    specialization
-                        .launch_param(launch, &parameter.name)
-                        .expect("validated launch code parameter")
-                }),
+                .map(|parameter| (true, parameter.name.as_str())),
         )
         .collect()
 }

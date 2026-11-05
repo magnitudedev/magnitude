@@ -141,10 +141,11 @@ pub fn compare_outcome(
         }
     }
     // Shared input identity is a storage contract, independently of floating
-    // tolerance and of any allowed numerical associations in the invocation.
+    // tolerance and of any allowed numerical associations in the invocation;
+    // a host port, which the kernel never accesses, keeps it too.
     for (expected, observed) in reference.inputs().zip(&actual.inputs) {
         let tensor = expected.tensor();
-        if expected.access() == TensorAccess::Shared {
+        if matches!(expected.access(), TensorAccess::Shared | TensorAccess::Host { .. }) {
             allowance(tensor.element_count() as u64)?;
             let bytes = tensor
                 .canonical_bytes()
@@ -277,7 +278,7 @@ pub fn compare_outcome(
     }
     for (expected, observed) in reference.inputs().zip(&actual.inputs) {
         let tensor = expected.tensor();
-        if expected.access() == TensorAccess::Shared
+        if matches!(expected.access(), TensorAccess::Shared | TensorAccess::Host { .. })
             || !matches!(
                 registry::representation_info(tensor.representation()).kind,
                 registry::RepresentationKind::Dense(_)

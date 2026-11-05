@@ -368,6 +368,16 @@ fn pages(bytes: &[u8], retain: Option<&mut ReferencePages>) -> Result<Vec<Page>,
     .map_err(|error| Exclusion::Execution(format!("host memory for an observation: {error}")))
 }
 
+/// The bytes of each row of a dense tensor of `rows` rows in `bytes`
+/// bytes, where they divide evenly: a tensor of no rows has rows of no
+/// bytes (a `&mut` operand a call binds empty, every row outside none).
+fn row_bytes(bytes: u64, rows: u64) -> Option<u64> {
+    match rows {
+        0 => (bytes == 0).then_some(0),
+        rows => bytes.checked_div(rows).filter(|row| row * rows == bytes),
+    }
+}
+
 /// Capture the subjects of one completed call: its returned `values`, and
 /// the observed regions of the `&mut` tensors `args` binds. `retain` holds
 /// the reference's pages.
@@ -437,10 +447,7 @@ pub(super) fn observe(
             Some(written) => {
                 let bytes = tensor.read_to_host().map_err(|e| execution(&e))?;
                 let rows = shape[0];
-                let row = (bytes.len() as u64)
-                    .checked_div(rows)
-                    .filter(|row| row * rows == bytes.len() as u64 && written.rows.end <= rows);
-                let Some(row) = row else {
+                let Some(row) = row_bytes(bytes.len() as u64, rows).filter(|_| written.rows.end <= rows) else {
                     return Err(Exclusion::Execution(format!(
                         "the rows of `&mut` parameter {} outside {:?} cannot be told from its {} bytes",
                         state.ordinal,
@@ -484,6 +491,16 @@ pub(super) fn observe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dense tensor's rows divide its bytes evenly, and a tensor of no
+    /// rows has rows of no bytes; uneven bytes have no row.
+    #[test]
+    fn a_tensor_of_no_rows_has_rows_of_no_bytes() {
+        assert_eq!(row_bytes(24, 3), Some(8));
+        assert_eq!(row_bytes(0, 0), Some(0));
+        assert_eq!(row_bytes(25, 3), None);
+        assert_eq!(row_bytes(4, 0), None);
+    }
 
     #[test]
     fn reference_pages_share_identical_prefixes_but_keep_distinct_tails() {

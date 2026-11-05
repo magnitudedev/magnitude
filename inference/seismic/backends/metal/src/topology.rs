@@ -3,7 +3,27 @@
 
 use crate::DeviceHandle;
 use seismic_lang::registry::BackendName;
-use seismic_topology::{Diagnostic, MetalReport};
+use seismic_topology::{
+    Contract, Diagnostic, HostReads, KindMemory, KindReport, MetalReport, Obtained, Reach, Reservation,
+    ReservationChunks,
+};
+
+/// The backend's one kind: shared storage mode, which every contract is
+/// allocated in, in host RAM on a device whose memory is the host's.
+pub fn kind() -> KindReport {
+    KindReport {
+        id: 0,
+        name: "shared storage".into(),
+        reach: Reach::Mapped { reads: HostReads::Cached },
+        obtained: Obtained::Allocated,
+        memory: KindMemory::HostRam,
+        reservation: Ok(Some(Reservation {
+            granule: crate::device::RESERVATION_GRANULE as u64,
+            host_addressed: crate::device::RESERVATIONS_HOST_ADDRESSED,
+            chunks: crate::device::RESERVATION_CHUNKS.map(|unit| ReservationChunks { unit, table: Contract::DeviceOnly }),
+        })),
+    }
+}
 
 /// Every Metal device's report, with its handle, which status samples
 /// read; that there is none, as `diagnostics`. A device's language and
@@ -28,6 +48,7 @@ pub fn describe(diagnostics: &mut Vec<Diagnostic>) -> Vec<(MetalReport, DeviceHa
                 admission,
                 working_set: handle.recommended_working_set_bytes(),
                 max_allocation: handle.max_allocation_bytes(),
+                kind: kind(),
             };
             (report, handle)
         })

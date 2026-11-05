@@ -4,7 +4,9 @@
 //! macOS does not enforce `RLIMIT_AS`/`RLIMIT_DATA` against allocations, so
 //! no process memory limit applies.
 
-use super::{DisplacementCounters, HostSample, KernelPressure, LimitVisibility, ObservationError};
+use super::{
+    DisplacementCounters, HostHeld, HostSample, KernelPressure, LimitVisibility, ObservationError,
+};
 use seismic_topology::{Reported, ReportedBy};
 use std::io;
 
@@ -146,6 +148,18 @@ fn kernel_pressure() -> Result<KernelPressure, ObservationError> {
     }
 }
 
+/// The swap in use (`vm.swapusage`'s `xsw_used`: a `struct xsw_usage` of
+/// total, available and used bytes, then the page size and whether it is
+/// encrypted).
+fn swap_used() -> Result<u64, ObservationError> {
+    let name = "vm.swapusage";
+    let bytes = sysctl_bytes(name).map_err(ObservationError::Failed)?;
+    let used = bytes.get(16..24).ok_or_else(|| {
+        ObservationError::Failed(format!("sysctl {name} returned {} bytes", bytes.len()))
+    })?;
+    Ok(u64::from_ne_bytes(used.try_into().expect("eight bytes")))
+}
+
 /// One Mach `HOST_VM_INFO64` reading, and the page size it counts in.
 pub(super) struct VmReading {
     pub(super) page_size: u64,
@@ -186,30 +200,142 @@ pub(super) fn sample() -> Result<HostSample, ObservationError> {
     sample_of(&vm_reading()?)
 }
 
+/// macOS counts displacement: the Mach compressor's and swap's page
+/// counters.
+pub(super) const DISPLACEMENT_COUNTERS: Option<super::ReadCounters> = Some(displacement);
+
+fn displacement() -> Result<DisplacementCounters, ObservationError> {
+    let statistics = vm_reading()?.statistics;
+    Ok(DisplacementCounters {
+        compressed_pages: statistics.compressions,
+        decompressed_pages: statistics.decompressions,
+        swapped_out_pages: statistics.swapouts,
+        swapped_in_pages: statistics.swapins,
+    })
+}
+
 /// The sample of one `HOST_VM_INFO64` reading.
 pub(super) fn sample_of(reading: &VmReading) -> Result<HostSample, ObservationError> {
     let statistics = &reading.statistics;
-    let free_pages = u64::from(statistics.free_count);
-    let active_pages = u64::from(statistics.active_count);
-    let inactive_pages = u64::from(statistics.inactive_count);
-    // Neither list says whether its pages are needed: a program's fresh data
-    // sits on the inactive list and idle file cache on the active one. Their
-    // sum with free pages is everything that is not wired or compressed.
-    let headroom = free_pages
-        .checked_add(active_pages)
-        .and_then(|pages| pages.checked_add(inactive_pages))
+    // What can be taken without compressing or swapping a program's data:
+    // free pages, file-backed pages (clean ones are dropped, dirty ones
+    // written back to their files) and volatile purgeable pages (purged).
+    // A program's anonymous pages, on the active and inactive lists alike,
+    // leave RAM only through the compressor, so they are not available
+    // however idle. `free_count` includes speculative (read-ahead file)
+    // pages, which the external count may include too; they are left out of
+    // the free pages, so they are never counted twice and at most read-ahead
+    // is not counted.
+    let free_pages = u64::from(statistics.free_count)
+        .checked_sub(u64::from(statistics.speculative_count))
+        .ok_or_else(|| {
+            ObservationError::Failed("Mach speculative pages exceed free pages".into())
+        })?;
+    let allocatable = free_pages
+        .checked_add(u64::from(statistics.external_page_count))
+        .and_then(|pages| pages.checked_add(u64::from(statistics.purgeable_count)))
         .and_then(|pages| pages.checked_mul(reading.page_size))
-        .ok_or_else(|| ObservationError::Failed("Mach headroom overflow".into()))?;
+        .ok_or_else(|| ObservationError::Failed("Mach allocatable overflow".into()))?;
+    // What the OS can make available by compressing other programs' data
+    // too: every page neither wired nor held by the compressor.
+    let obtainable = u64::from(statistics.free_count)
+        .checked_add(u64::from(statistics.active_count))
+        .and_then(|pages| pages.checked_add(u64::from(statistics.inactive_count)))
+        .and_then(|pages| pages.checked_mul(reading.page_size))
+        .ok_or_else(|| ObservationError::Failed("Mach obtainable overflow".into()))?;
+    let swap = swap_used()?;
     Ok(HostSample {
-        headroom: Reported::new(headroom, ReportedBy::MachMovablePages),
+        allocatable: Reported::new(allocatable, ReportedBy::MachAllocatablePages),
+        obtainable: Reported::new(obtainable, ReportedBy::MachMovablePages),
         limits: Vec::new(),
         limit_visibility: LimitVisibility::Complete,
-        displacement: Some(DisplacementCounters {
-            compressed_pages: statistics.compressions,
-            decompressed_pages: statistics.decompressions,
-            swapped_out_pages: statistics.swapouts,
-            swapped_in_pages: statistics.swapins,
-        }),
         kernel_pressure: Some(kernel_pressure()?),
+        held: Some(HostHeld {
+            wired_bytes: pages_bytes(reading, statistics.wire_count, "wired")?,
+            compressed_bytes: pages_bytes(reading, statistics.compressor_page_count, "compressor")?,
+        }),
+        // The pages the compressor's data would take uncompressed, less those
+        // it occupies, and the swap in use.
+        displaced_bytes: Some(
+            statistics
+                .total_uncompressed_pages_in_compressor
+                .saturating_sub(u64::from(statistics.compressor_page_count))
+                .checked_mul(reading.page_size)
+                .and_then(|saved| saved.checked_add(swap))
+                .ok_or_else(|| ObservationError::Failed("Mach displaced bytes overflow".into()))?,
+        ),
     })
+}
+
+/// The bytes of `pages` pages of `reading`'s size; an error naming `what`
+/// past the bytes a `u64` counts.
+fn pages_bytes(reading: &VmReading, pages: u32, what: &str) -> Result<u64, ObservationError> {
+    u64::from(pages)
+        .checked_mul(reading.page_size)
+        .ok_or_else(|| ObservationError::Failed(format!("Mach {what} bytes overflow")))
+}
+
+/// One memory node of every core: per performance level (`hw.nperflevels`,
+/// level 0 the performance cores), its `physicalcpu` cores of
+/// `logicalcpu / physicalcpu` threads each; with no levels (Intel), the
+/// `hw.physicalcpu` cores of `hw.logicalcpu` threads, every one a
+/// performance core. A CPU is its ordinal, performance cores first, and the
+/// process may run on every one ([`crate::ProcessorsReportedBy::MacOsSysctl`]).
+pub(super) fn processors() -> Result<crate::Processors, String> {
+    let reported =
+        |name: &str| sysctl_u64(name)?.ok_or_else(|| format!("sysctl {name} reports no value"));
+    let levels = match sysctl_u64("hw.nperflevels")? {
+        Some(levels) => (0..levels)
+            .map(|level| {
+                let field = |name: &str| reported(&format!("hw.perflevel{level}.{name}"));
+                Ok((field("physicalcpu")?, field("logicalcpu")?, level == 0))
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+        None => vec![(
+            reported("hw.physicalcpu")?,
+            reported("hw.logicalcpu")?,
+            true,
+        )],
+    };
+    let mut cores = Vec::new();
+    let mut next = 0usize;
+    for (physical, logical, performance) in levels {
+        if logical % physical != 0 {
+            return Err(format!("{logical} logical CPUs over {physical} cores"));
+        }
+        let threads = usize::try_from(logical / physical).map_err(|error| error.to_string())?;
+        for _ in 0..physical {
+            cores.push(crate::Core {
+                threads: (next..next + threads).collect(),
+                performance,
+            });
+            next += threads;
+        }
+    }
+    crate::Processors::new(
+        vec![crate::MemoryNode {
+            id: 0,
+            memory: true,
+            cores,
+        }],
+        (0..next).collect(),
+        crate::ProcessorsReportedBy::MacOsSysctl,
+    )
+}
+
+/// macOS places no thread on a core it names: its scheduler places every
+/// thread, so nothing is placed.
+pub(super) fn place_process(_cpus: &[usize]) -> Result<(), String> {
+    Ok(())
+}
+
+/// macOS places no thread on a core it names: its scheduler places every
+/// thread, so nothing is placed.
+pub(super) fn pin(_cpus: &[usize]) -> Result<(), String> {
+    Ok(())
+}
+
+/// macOS reads no device's memory node.
+pub(super) fn device_node(_location: crate::PciLocation) -> Result<crate::DeviceNode, String> {
+    Ok(crate::DeviceNode::Unknown)
 }

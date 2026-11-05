@@ -13,11 +13,14 @@ pub struct OpenedCpu {
 }
 
 /// The host pool while any opened CPU device holds it. The pool has one
-/// participant per physical performance core, so every CPU device of the
-/// process shares it: two pools would place two participants on each core.
+/// participant per performance core, so every CPU device of the process
+/// shares it: two pools would place two participants on each core.
 static HOST: Mutex<Weak<Mutex<Workers>>> = Mutex::new(Weak::new());
 
-pub fn open_host() -> Result<OpenedCpu, TargetError> {
+/// The host CPU over its pool of the `cores` performance cores the process
+/// may run on ([`Workers::host`]): the pool any open CPU device of the
+/// process holds already.
+pub fn open_host(cores: std::num::NonZeroUsize) -> Result<OpenedCpu, TargetError> {
     let workers = {
         let mut host = HOST
             .lock()
@@ -26,7 +29,7 @@ pub fn open_host() -> Result<OpenedCpu, TargetError> {
             Some(workers) => workers,
             None => {
                 let workers =
-                    Arc::new(Mutex::new(Workers::host().map_err(|error| {
+                    Arc::new(Mutex::new(Workers::host(cores).map_err(|error| {
                         TargetError::DeviceUnavailable(error.to_string())
                     })?));
                 *host = Arc::downgrade(&workers);
@@ -35,6 +38,13 @@ pub fn open_host() -> Result<OpenedCpu, TargetError> {
         }
     };
     open_workers(workers)
+}
+
+/// The host CPU over a pool of the process's quota, for this crate's tests,
+/// which need no particular pool of it.
+#[cfg(test)]
+pub(crate) fn open_quota() -> Result<OpenedCpu, TargetError> {
+    open_host(std::thread::available_parallelism().map_err(|error| TargetError::DeviceUnavailable(error.to_string()))?)
 }
 
 /// Opens execution over the production worker pool. Profiling is acquired

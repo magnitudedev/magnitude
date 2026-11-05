@@ -11,8 +11,8 @@ use objc2_metal::{
     MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
     MTLCommonCounterSetTimestamp, MTLComputeCommandEncoder, MTLComputePassDescriptor,
     MTLComputePipelineState, MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor,
-    MTLCounterSamplingPoint, MTLCounterSet, MTLDevice, MTLDispatchType, MTLEvent, MTLSharedEvent,
-    MTLSize, MTLStorageMode,
+    MTLCounterSamplingPoint, MTLCounterSet, MTLDevice, MTLDispatchType, MTLEvent,
+    MTLResourceUsage, MTLSharedEvent, MTLSize, MTLStorageMode,
 };
 use seismic_compiler::errors::ExecutionError;
 
@@ -57,21 +57,25 @@ pub struct DirectLaunch<'a> {
     /// Scalar-result slots, bound after the words; nothing is bound there
     /// for an entry without scalar results.
     pub scalar_results: Option<(&'a MetalBuffer, u64)>,
+    /// The groups on each axis; with `grid`, the most the grid holds.
     pub threadgroups: [u64; 3],
+    /// Three 32-bit group counts an earlier launch wrote, at this offset of
+    /// this buffer: dispatched as they are when the launch runs.
+    pub grid: Option<(&'a MetalBuffer, u64)>,
     pub threads_per_threadgroup: [u64; 3],
     pub threadgroup_bytes: u64,
 }
 
-/// The host monotonic clock in seconds, in the time base of Metal's
-/// command-buffer `GPUStartTime`/`GPUEndTime` (mach absolute time).
-pub fn host_seconds() -> f64 {
-    unsafe extern "C" {
-        fn clock_gettime_nsec_np(clock_id: std::ffi::c_int) -> u64;
+impl DirectLaunch<'_> {
+    /// Whether the launch's grid is empty: it does no device work and
+    /// encodes nothing.
+    pub fn is_empty(&self) -> bool {
+        self.threadgroups.contains(&0) || self.threads_per_threadgroup.contains(&0)
     }
-    const CLOCK_UPTIME_RAW: std::ffi::c_int = 8;
-    // SAFETY: a pure libc clock read.
-    unsafe { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) as f64 / 1e9 }
 }
+
+pub use crate::timing::host_seconds;
+use crate::timing::SubmissionTime;
 
 /// A GPU timestamp correlated with the [`host_seconds`] clock.
 #[derive(Clone, Copy)]
@@ -363,29 +367,34 @@ impl LaunchTimestamps {
 
 /// How a batch places its launches in compute encoders.
 enum Encoding {
-    /// Every launch between two event commands in one serial encoder: the
-    /// production form. `None` after an event command, until the next
-    /// launch opens the next encoder.
-    Serial(Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>),
+    /// The production form: each group of launches ([`DirectBatch::group`])
+    /// in a concurrent encoder of its own, except that consecutive groups of
+    /// one launch share a serial encoder, which runs them in order. Each
+    /// encoder runs after the one before ([`ordered`]). `open` is `None`
+    /// after an event command or a group boundary, until the next launch
+    /// opens an encoder of the `next` dispatch type.
+    Grouped {
+        open: Option<(
+            Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+            MTLDispatchType,
+        )>,
+        next: MTLDispatchType,
+        /// Whether each command's device interval is observed
+        /// ([`DirectBatch::observed`]).
+        observed: bool,
+    },
     /// Every launch in its own encoder, with the encoder's start and end
     /// timestamps sampled at stage boundaries into the page its command
     /// buffer leased from `timestamps`; each encoder runs after the one
     /// before ([`ordered`]). A command buffer whose page is full is
     /// committed and the next leases another.
     Timed {
-        timestamps: &'static LaunchTimestamps,
+        timing: Box<LaunchTiming>,
         /// The current command buffer's page, from its first launch.
         lease: Option<Lease>,
-        /// The committed command buffers' ticks, in order: together the
-        /// sample pairs of the launches encoded before the current one's.
-        parts: Vec<PartTicks>,
         /// The batch's host gates, in order.
         gates: Vec<Gate>,
-        /// Per `encode` call, the launch's sample pair in the batch's order
-        /// (absent when the launch was empty and encoded nothing).
-        launches: Vec<Option<usize>>,
         encoded: usize,
-        calibration: TimestampPair,
     },
 }
 
@@ -413,41 +422,58 @@ fn blocked_parts(gates: &[Gate], parts: &[PartTicks]) -> usize {
 }
 
 impl Encoding {
-    /// `command` is about to be committed: a timed batch's page goes in
-    /// flight with it.
-    fn committing(&mut self, command: &ProtocolObject<dyn MTLCommandBuffer>) {
-        if let Self::Timed {
-            timestamps,
-            lease,
-            parts,
-            ..
-        } = self
-        {
-            if let Some(lease) = lease.take() {
-                parts.push(timestamps.commit(lease, command));
+    /// Commit `command`: a timed batch's page goes in flight with it, and
+    /// an observed one's envelope starts immediately before the commit.
+    fn commit(&mut self, command: Retained<ProtocolObject<dyn MTLCommandBuffer>>) -> CommittedCommand {
+        let observed = match self {
+            Self::Grouped { observed, .. } => *observed,
+            Self::Timed { timing, lease, .. } => {
+                if let Some(lease) = lease.take() {
+                    timing.parts.push(timing.timestamps.commit(lease, &command));
+                }
+                true
             }
+        };
+        let time = observed.then(SubmissionTime::before_commit);
+        crate::pooled(|| command.commit());
+        CommittedCommand { command, time }
+    }
+
+    /// The launch attribution of a timed batch.
+    fn launch_timing(self) -> Option<Box<LaunchTiming>> {
+        match self {
+            Self::Grouped { .. } => None,
+            Self::Timed { timing, .. } => Some(timing),
         }
     }
 }
 
-/// Ordered direct launches encoded into command buffers: one, and one more
-/// after each host gate ([`DirectBatch::wait_event`]). The production form
-/// uses one serial compute encoder, which orders every launch after the
-/// previous one's writes. A batch ends in [`DirectBatch::commit`], or in
+/// A committed command buffer, with the lower end of its submission
+/// envelope where its batch observes device intervals.
+struct CommittedCommand {
+    command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    time: Option<SubmissionTime>,
+}
+
+/// Direct launches encoded into command buffers: one, and one more after
+/// each host gate ([`DirectBatch::wait_event`]). The production form runs
+/// each group of launches concurrently and the groups one after another
+/// ([`DirectBatch::group`]). A batch ends in [`DirectBatch::commit`], or in
 /// [`DirectBatch::abandon`] after a failure: either hands the caller every
 /// command buffer it committed, which run on the caller's storage, as a
 /// submission to fence.
 pub struct DirectBatch {
     device: MetalDevice,
     /// The command buffers committed before the current one, in order.
-    committed: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+    committed: Vec<CommittedCommand>,
     command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     /// Whether anything is encoded in `command`.
     used: bool,
     encoding: Encoding,
 }
 
-fn complete(command: &ProtocolObject<dyn MTLCommandBuffer>) -> bool {
+/// Whether the command buffer ended: completed, or failed.
+fn ended(command: &ProtocolObject<dyn MTLCommandBuffer>) -> bool {
     matches!(
         crate::pooled(|| command.status()),
         MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
@@ -462,16 +488,39 @@ fn command_buffer(
     })
 }
 
-fn serial_encoder(
+/// Declare `encoder` a writer of the device's order buffer, which no launch
+/// binds. The buffer is tracked (created by the device), and for a tracked
+/// resource `useResource:usage:` protects against data hazards: the encoder
+/// starts after every earlier encoder that declared it has completed, so
+/// the queue's direct encoders run one after another whatever their
+/// dispatches bind.
+fn ordered(
+    device: &MetalDevice,
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+) {
+    encoder.useResource_usage(
+        ProtocolObject::from_ref(device.order()),
+        MTLResourceUsage::Read | MTLResourceUsage::Write,
+    );
+}
+
+fn grouped_encoder(
+    device: &MetalDevice,
     command: &ProtocolObject<dyn MTLCommandBuffer>,
+    dispatch: MTLDispatchType,
 ) -> Result<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>, ExecutionError> {
-    crate::pooled(|| command.computeCommandEncoder()).ok_or_else(|| {
+    crate::pooled(|| {
+        let encoder = command.computeCommandEncoderWithDispatchType(dispatch)?;
+        ordered(device, &encoder);
+        Some(encoder)
+    })
+    .ok_or_else(|| {
         ExecutionError::SubmissionFailed("Metal could not create a native compute encoder".into())
     })
 }
 
-/// A 64-bit value the host and the device's command buffers both advance
-/// and wait on (`MTLSharedEvent`).
+/// A 64-bit value the host or the device's command buffers advance
+/// and the other waits on (`MTLSharedEvent`).
 pub struct SharedEvent {
     event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
 }
@@ -517,15 +566,30 @@ impl SharedEvent {
 }
 
 impl DirectBatch {
+    /// A production batch. Each launch belongs to a group its caller begins
+    /// ([`Self::group`]) before encoding it.
     pub fn new(device: &MetalDevice) -> Result<Self, ExecutionError> {
-        let command = command_buffer(device)?;
-        let encoder = serial_encoder(&command)?;
+        Self::grouped(device, false)
+    }
+
+    /// Production encoding with command-buffer interval observation. Unlike
+    /// launch attribution, this does not change encoder boundaries.
+    pub fn observed(device: &MetalDevice) -> Result<Self, ExecutionError> {
+        Self::grouped(device, true)
+    }
+
+    fn grouped(device: &MetalDevice, observed: bool) -> Result<Self, ExecutionError> {
         Ok(Self {
             device: device.clone(),
             committed: Vec::new(),
-            command,
+            command: command_buffer(device)?,
             used: false,
-            encoding: Encoding::Serial(Some(encoder)),
+            encoding: Encoding::Grouped {
+                open: None,
+                // The first group sets it.
+                next: MTLDispatchType::Serial,
+                observed,
+            },
         })
     }
 
@@ -546,7 +610,7 @@ impl DirectBatch {
     /// open fails [`Self::encode`] ("timestamp pool exhausted") rather than
     /// wait for a page that cannot free.
     pub fn wait_event(&mut self, event: &SharedEvent, value: u64) -> Result<(), ExecutionError> {
-        self.end_serial();
+        self.end_open();
         if self.used {
             self.cut()?;
         }
@@ -554,11 +618,11 @@ impl DirectBatch {
             self.command
                 .encodeWaitForEvent_value(event.as_event(), value)
         });
-        if let Encoding::Timed { parts, gates, .. } = &mut self.encoding {
+        if let Encoding::Timed { timing, gates, .. } = &mut self.encoding {
             gates.push(Gate {
                 event: event.event.clone(),
                 value,
-                first_part: parts.len(),
+                first_part: timing.parts.len(),
             });
         }
         Ok(())
@@ -570,16 +634,15 @@ impl DirectBatch {
         // Formed before the commit: a failure commits nothing.
         let next = command_buffer(&self.device)?;
         let previous = std::mem::replace(&mut self.command, next);
-        self.encoding.committing(&previous);
-        crate::pooled(|| previous.commit());
-        self.committed.push(previous);
+        let committed = self.encoding.commit(previous);
+        self.committed.push(committed);
         Ok(())
     }
 
     /// `event` reaches `value` once the work encoded before it completes
     /// (`encodeSignalEvent`).
     pub fn signal_event(&mut self, event: &SharedEvent, value: u64) {
-        self.end_serial();
+        self.end_open();
         self.used = true;
         crate::pooled(|| {
             self.command
@@ -587,14 +650,42 @@ impl DirectBatch {
         });
     }
 
-    /// End the open serial encoder: an event command is encoded between
-    /// encoders.
-    fn end_serial(&mut self) {
-        if let Encoding::Serial(encoder) = &mut self.encoding {
-            if let Some(encoder) = encoder.take() {
+    /// End the open encoder: an event command is encoded between encoders.
+    fn end_open(&mut self) {
+        if let Encoding::Grouped { open, .. } = &mut self.encoding {
+            if let Some((encoder, _)) = open.take() {
                 crate::pooled(|| encoder.endEncoding());
             }
         }
+    }
+
+    /// The next `launches` launches (those that do device work) form a
+    /// group: none depends on another, and every launch encoded before them
+    /// completes before any of them starts. A group of several runs in a
+    /// concurrent encoder; a group of one joins an open serial encoder, whose
+    /// dispatches run in order, or opens one. Measured per dependent launch
+    /// against a single serial encoder: an encoder per launch costs about
+    /// 0.2 µs more at 64 KiB, a barrier in one concurrent encoder 0.5 µs
+    /// (`tests/barrier.rs`). A timed batch's launches each have an encoder
+    /// of their own already.
+    pub fn group(&mut self, launches: usize) {
+        let Encoding::Grouped { open, next, .. } = &mut self.encoding else {
+            return;
+        };
+        let dispatch = if launches > 1 {
+            MTLDispatchType::Concurrent
+        } else {
+            MTLDispatchType::Serial
+        };
+        if dispatch == MTLDispatchType::Serial
+            && open
+                .as_ref()
+                .is_some_and(|(_, open)| *open == MTLDispatchType::Serial)
+        {
+            return;
+        }
+        *next = dispatch;
+        self.end_open();
     }
 
     /// A measurement batch: each launch gets its own encoder, whose GPU
@@ -612,13 +703,15 @@ impl DirectBatch {
             command: command_buffer(device)?,
             used: false,
             encoding: Encoding::Timed {
-                timestamps,
+                timing: Box::new(LaunchTiming {
+                    timestamps,
+                    parts: Vec::new(),
+                    launches: Vec::new(),
+                    calibration: sample_timestamps(device),
+                }),
                 lease: None,
-                parts: Vec::new(),
                 gates: Vec::new(),
-                launches: Vec::new(),
                 encoded: 0,
-                calibration: sample_timestamps(device),
             },
         })
     }
@@ -627,13 +720,13 @@ impl DirectBatch {
     /// grid): nothing is encoded, and a timed batch keeps its place with no
     /// interval.
     pub fn skip(&mut self) {
-        if let Encoding::Timed { launches, .. } = &mut self.encoding {
-            launches.push(None);
+        if let Encoding::Timed { timing, .. } = &mut self.encoding {
+            timing.launches.push(None);
         }
     }
 
     pub fn encode(&mut self, launch: &DirectLaunch<'_>) -> Result<(), ExecutionError> {
-        if launch.threadgroups.contains(&0) || launch.threads_per_threadgroup.contains(&0) {
+        if launch.is_empty() {
             self.skip();
             return Ok(());
         }
@@ -667,22 +760,15 @@ impl DirectBatch {
         let command = &self.command;
         let device = &self.device;
         match &mut self.encoding {
-            Encoding::Serial(encoder) => {
-                let encoder = match encoder {
-                    Some(encoder) => encoder,
-                    None => encoder.insert(serial_encoder(command)?),
+            Encoding::Grouped { open, next, .. } => {
+                let (encoder, _) = match open {
+                    Some(open) => open,
+                    None => open.insert((grouped_encoder(device, command, *next)?, *next)),
                 };
                 crate::pooled(|| encode_launch(encoder, launch))
             }
-            Encoding::Timed {
-                timestamps,
-                lease,
-                parts,
-                gates,
-                launches,
-                encoded,
-                ..
-            } => {
+            Encoding::Timed { timing, lease, gates, encoded } => {
+                let LaunchTiming { timestamps, parts, launches, .. } = &mut **timing;
                 let lease = match lease {
                     Some(lease) => lease,
                     None => lease.insert(timestamps.lease(device, || blocked_parts(gates, parts))?),
@@ -708,6 +794,7 @@ impl DirectBatch {
                                 "Metal could not create a timed compute encoder".into(),
                             )
                         })?;
+                    ordered(device, &encoder);
                     encode_launch(&encoder, launch);
                     encoder.endEncoding();
                     Ok(())
@@ -723,30 +810,14 @@ impl DirectBatch {
     /// Commit without waiting. The queue runs command buffers in commit
     /// order.
     pub fn commit(mut self) -> DirectSubmission {
-        self.end_serial();
-        self.encoding.committing(&self.command);
-        crate::pooled(|| self.command.commit());
-        let timing = match self.encoding {
-            Encoding::Serial(_) => None,
-            Encoding::Timed {
-                timestamps,
-                parts,
-                launches,
-                calibration,
-                ..
-            } => Some(LaunchTiming {
-                timestamps,
-                parts,
-                launches,
-                calibration,
-            }),
-        };
+        self.end_open();
+        let last = self.encoding.commit(self.command);
         let mut commands = self.committed;
-        commands.push(self.command);
+        commands.push(last);
         DirectSubmission {
             device: self.device,
             commands,
-            timing,
+            timing: self.encoding.launch_timing(),
         }
     }
 
@@ -754,10 +825,12 @@ impl DirectBatch {
     /// uncommitted, and the command buffers committed before it, which run
     /// on, form the returned submission (`None` when there are none).
     pub fn abandon(mut self) -> Option<DirectSubmission> {
-        self.end_serial();
+        self.end_open();
         (!self.committed.is_empty()).then(|| DirectSubmission {
             device: self.device,
             commands: self.committed,
+            // Launch attribution covers the whole batch; the committed
+            // prefix keeps only its commands' envelopes.
             timing: None,
         })
     }
@@ -794,18 +867,30 @@ fn encode_launch(
         let bytes = launch.threadgroup_bytes.div_ceil(16) * 16;
         unsafe { encoder.setThreadgroupMemoryLength_atIndex(bytes as usize, 0) };
     }
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize {
-            width: launch.threadgroups[0] as usize,
-            height: launch.threadgroups[1] as usize,
-            depth: launch.threadgroups[2] as usize,
+    let threads = MTLSize {
+        width: launch.threads_per_threadgroup[0] as usize,
+        height: launch.threads_per_threadgroup[1] as usize,
+        depth: launch.threads_per_threadgroup[2] as usize,
+    };
+    match launch.grid {
+        // SAFETY: the grid is three 32-bit words at a 4-byte-aligned offset
+        // of one of the launch's own bindings, set above.
+        Some((buffer, offset)) => unsafe {
+            encoder.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                buffer.raw(),
+                offset as usize,
+                threads,
+            )
         },
-        MTLSize {
-            width: launch.threads_per_threadgroup[0] as usize,
-            height: launch.threads_per_threadgroup[1] as usize,
-            depth: launch.threads_per_threadgroup[2] as usize,
-        },
-    );
+        None => encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: launch.threadgroups[0] as usize,
+                height: launch.threadgroups[1] as usize,
+                depth: launch.threadgroups[2] as usize,
+            },
+            threads,
+        ),
+    }
 }
 
 struct LaunchTiming {
@@ -824,14 +909,14 @@ struct LaunchTiming {
 /// Polling costs about 0.8 W of CPU (about 3% more energy per decoded
 /// token) and observes completion about 20 µs sooner than the blocking
 /// wait's wake-up. Polling every 100 µs keeps only a third of the gain.
-/// Measurements: `specs/26-09-23/benchmark-results.md`, "Metal host wait".
 const WAIT_POLL: std::time::Duration = std::time::Duration::from_micros(20);
 
 /// A committed direct batch: its command buffers, in commit order.
 pub struct DirectSubmission {
     device: MetalDevice,
-    commands: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
-    timing: Option<LaunchTiming>,
+    commands: Vec<CommittedCommand>,
+    /// A timed batch's launch attribution.
+    timing: Option<Box<LaunchTiming>>,
 }
 
 // Waiting on and querying a committed command buffer is thread-safe.
@@ -839,26 +924,18 @@ unsafe impl Send for DirectSubmission {}
 unsafe impl Sync for DirectSubmission {}
 
 impl DirectSubmission {
-    /// Whether every command buffer has completed.
-    pub fn is_complete(&self) -> bool {
-        self.commands.iter().all(|command| complete(command))
-    }
-
-    /// Wait for completion by polling the status every [`WAIT_POLL`].
-    pub fn wait_complete(&self) {
-        while !self.is_complete() {
-            std::thread::sleep(WAIT_POLL);
+    /// Whether the work completed, without waiting: `Ok(false)` while a
+    /// command buffer runs, and the first one's failure once every one
+    /// ended and one failed.
+    pub fn completed(&self) -> Result<bool, ExecutionError> {
+        if !self.commands.iter().all(|committed| ended(&committed.command)) {
+            return Ok(false);
         }
-    }
-
-    /// Wait and report the outcome: the first command buffer's failure.
-    pub fn finish(&self) -> Result<(), ExecutionError> {
-        self.wait_complete();
         crate::pooled(|| {
             self.commands
                 .iter()
-                .find_map(|command| command.error())
-                .map_or(Ok(()), |error| {
+                .find_map(|committed| committed.command.error())
+                .map_or(Ok(true), |error| {
                     Err(ExecutionError::SubmissionFailed(
                         error.localizedDescription().to_string(),
                     ))
@@ -866,32 +943,54 @@ impl DirectSubmission {
         })
     }
 
-    /// Device execution time of the completed submission.
-    pub fn device_seconds(&self) -> f64 {
-        let (start, end) = self.device_interval();
-        end - start
+    /// Wait for the work to end, polling its status every [`WAIT_POLL`],
+    /// and report its outcome: the first command buffer's failure.
+    pub fn finish(&self) -> Result<(), ExecutionError> {
+        while !self.completed()? {
+            std::thread::sleep(WAIT_POLL);
+        }
+        Ok(())
+    }
+
+    /// Device execution time when interval observation was requested with
+    /// [`DirectBatch::observed`] or [`DirectBatch::timed`]. Invalid driver
+    /// timestamps (including missing zero-work timestamps) are errors.
+    pub fn device_seconds(&self) -> Result<f64, ExecutionError> {
+        let (start, end) = self.device_interval()?;
+        Ok(end - start)
     }
 
     /// The completed submission's device execution interval on the
     /// [`host_seconds`] clock: from its first command buffer's start to its
     /// last's end, gate waits included, as within one command buffer.
-    pub fn device_interval(&self) -> (f64, f64) {
-        let (first, last) = (
-            self.commands.first().expect("a submission has a command buffer"),
-            self.commands.last().expect("a submission has a command buffer"),
-        );
-        crate::pooled(|| (first.GPUStartTime(), last.GPUEndTime()))
+    /// Observation must have been requested before submission.
+    pub fn device_interval(&self) -> Result<(f64, f64), ExecutionError> {
+        self.finish()?;
+        crate::pooled(|| {
+            let mut span = None;
+            for CommittedCommand { command, time } in &self.commands {
+                let time = time.as_ref().ok_or_else(|| ExecutionError::SubmissionFailed(
+                    "Metal submission interval observation was not requested".into()))?;
+                let interval = time.interval(command.GPUStartTime(), command.GPUEndTime())
+                    .map_err(ExecutionError::SubmissionFailed)?;
+                span = Some(match span {
+                    None => interval,
+                    Some((start, _)) => (start, interval.1),
+                });
+            }
+            Ok(span.expect("a submission has a command buffer"))
+        })
     }
 
     /// For a timed batch, each `encode` call's device interval on the
     /// [`host_seconds`] clock, in encode order (`None` for an empty launch).
     /// `None` for a production batch. Call after completion.
     pub fn launch_intervals(&self) -> Result<Option<Vec<Option<(f64, f64)>>>, ExecutionError> {
-        let Some(timing) = &self.timing else {
+        let Some(timing) = self.timing.as_deref() else {
             return Ok(None);
         };
         let failed = |detail: &str| ExecutionError::SubmissionFailed(detail.into());
-        if !self.is_complete() {
+        if !self.completed()? {
             return Err(failed("timed Metal batch is read before completion"));
         }
         let mut samples = Vec::new();

@@ -1,4 +1,4 @@
-//! Discovery (spec §2.3): what the backend crates and the OS report of the
+//! Discovery: what the backend crates and the OS report of the
 //! machine, read into the reports `seismic_topology::build` turns into a
 //! topology revision.
 
@@ -81,6 +81,8 @@ pub(crate) fn gather(paths: &[PathBuf]) -> Result<Gathered, DiscoveryError> {
         cache,
         availability: cpu_availability(seismic_native_cpu::Tier::detected()),
         max_allocation: seismic_cpu::MAX_ALLOCATION_BYTES,
+        kind: seismic_cpu::topology::kind()
+            .map_err(|error| DiscoveryError::CpuIdentity(format!("the host page: {error}")))?,
     };
 
     #[cfg(target_os = "macos")]
@@ -102,7 +104,7 @@ pub(crate) fn gather(paths: &[PathBuf]) -> Result<Gathered, DiscoveryError> {
         let described = seismic_vulkan::topology::describe(&mut diagnostics);
         natives.vulkan = described
             .iter()
-            .map(|(report, handle)| (report.uuid, *handle))
+            .map(|(report, handle)| (report.uuid, handle.clone()))
             .collect();
         described.into_iter().map(|(report, _)| report).collect()
     };

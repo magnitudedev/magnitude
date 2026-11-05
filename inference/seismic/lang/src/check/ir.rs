@@ -82,12 +82,19 @@ pub(crate) enum Ownership {
     Shared,
     /// An exclusive mutable borrow (`&mut tensor`).
     Exclusive,
+    /// A host port (`&host tensor`, `&host mut tensor`): bound for what the
+    /// host does once it sees the launch, reading it or (`write`) rewriting
+    /// it; the body never names it.
+    Host { write: bool },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Param {
     pub name: String,
     pub ownership: Ownership,
+    /// An awaited port (`&await`): the launch parks on the host's writes
+    /// to it.
+    pub awaited: bool,
     pub ty: ValueType,
     pub local: LocalId,
     pub span: Span,
@@ -402,6 +409,37 @@ pub(crate) enum Index {
     },
     /// An omitted trailing axis: the whole axis.
     Full,
+}
+
+/// Whether `indices` into a tensor of `rank` axes select one contiguous run
+/// of whole trailing matrices (the records of packed storage,
+/// `registry::record_writable`): points on a prefix of the leading axes, then
+/// at most one range of a leading axis, then the whole of every later axis.
+pub(crate) fn whole_records(indices: &[Index], rank: usize) -> bool {
+    let Some(leading) = rank.checked_sub(2) else {
+        return false;
+    };
+    let whole = |axis: usize| {
+        matches!(
+            indices.get(axis),
+            None | Some(Index::Full)
+                | Some(Index::Range {
+                    start: None,
+                    end: None,
+                    ..
+                })
+        )
+    };
+    let points = indices
+        .iter()
+        .take(leading)
+        .take_while(|index| matches!(index, Index::Point { .. }))
+        .count();
+    let run = match indices.get(points) {
+        Some(Index::Range { .. }) if points < leading => points + 1,
+        _ => points,
+    };
+    indices.len() <= rank && (run..rank).all(whole)
 }
 
 /// Exact meaning and its dominating source publication are distinct owners.
