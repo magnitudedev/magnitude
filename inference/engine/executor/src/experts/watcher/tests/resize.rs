@@ -152,9 +152,10 @@ fn a_host_shrink_answers_beside_a_past_prompt_group_still_clearing() {
 
 /// A host tier's shrink asked with a landing in flight answers at once,
 /// cut at the deepest of its candidates that keeps the landing's record: a
-/// demand read queued behind others has taken a record below the three
-/// earlier misses landed in, so a shrink toward one record cuts just above
-/// it, and the read ends into that record once the reads ahead do.
+/// demand read queued behind others has taken the lowest ready record, just
+/// above the three the earlier misses landed in, so a shrink toward one
+/// record cuts just above it, and the read ends into that record once the
+/// reads ahead do.
 #[test]
 fn a_host_shrink_asked_with_a_landing_in_flight_answers_at_once() {
     let _alone = alone();
@@ -187,6 +188,48 @@ fn a_host_shrink_asked_with_a_landing_in_flight_answers_at_once() {
     assert_eq!(harness.watcher.shared().life.ended(), None, "the watcher serves on");
 }
 
+/// A host tier's shrink asked right after a growth, with a landing in
+/// flight, answers at once at the size it grew from: a landing takes the
+/// lowest ready record, below the grown ones a shrink cuts first, so no
+/// growth leaves a landing where its shrink cuts. Beside seven records,
+/// three kept and the reserve's four ready, grown by one, a demand read
+/// queued behind others takes record 3, and a shrink back to seven cuts
+/// there at once.
+#[test]
+fn a_host_shrink_right_after_a_growth_answers_beside_its_landings() {
+    let _alone = alone();
+    let harness = layered("shrink-grown", EXPERTS, 4, 1, 4);
+    for expert in 0..3 {
+        harness.request(&[expert]).complete().unwrap();
+    }
+    harness.tier_ready();
+    let shared = harness.watcher.shared().clone();
+    let step = harness.step();
+    shared.join(super::Join::Landed { records: vec![8], views: vec![harness.host.views(8)] });
+    shared.joins.wait_taken();
+    drop(step);
+    let ahead = Ahead::queue("shrink-grown-ahead", 16);
+    let floor = || residency::lock(&harness.watcher.state).core.directory.host_floor(0);
+    let served = || harness.watcher.shared().costs().layers[0].unanticipated;
+    let before = served();
+    let step = harness.step();
+    assert!(harness.ask_at(&step, 0, &[5]));
+    eventually("the demand never took a record", || floor() != 0);
+    eventually("the request was never served", || served() > before);
+    harness.layer.1.answer(step.sequence(), 0, true);
+    drop(step);
+    assert_eq!(floor(), 4, "the landing took the lowest ready record, below the growth");
+    let candidates = Candidates { shallowest: 7, deepest: 7, records: Box::new(|slots| vec![slots]) };
+    let shrink = std::thread::spawn(move || shared.shrink_tier(candidates));
+    eventually("the shrink waited for the landing", || shrink.is_finished());
+    let cut = shrink.join().unwrap().expect("the shrink is served").expect("the cut answers, not deferred");
+    assert_eq!(cut.slots, 7, "back to the size it grew from");
+    assert_eq!(residency::lock(&harness.watcher.state).core.directory.host(0).records(), 7);
+    ahead.finish();
+    eventually("the landing never ended in the record kept for it", || harness.in_tier(0, 5) == Some(3));
+    assert_eq!(harness.watcher.shared().life.ended(), None, "the watcher serves on");
+}
+
 /// A filled tier whose growth is decided fills again from that decision,
 /// through every slot that joins and the fill of each, until the growth
 /// ends: its slots joining one by one never leave it filled between them.
@@ -210,12 +253,13 @@ fn a_filled_tier_fills_again_while_it_grows() {
 
 /// A host tier grows by its records and the views that address them,
 /// joined beside a running step, and its new record is the next a landing
-/// takes: beside a tier of its reserve and one record more, which expert 0
+/// takes: beside a tier of its reserve and one record more, every one lent
+/// (so the grown record is the lowest ready past them), which expert 0
 /// keeps (none unmapped, so none graced), expert 1 from the file lands into
 /// the grown record, its bytes there once landed.
 #[test]
 fn a_host_tier_grows_by_its_records_alone() {
-    let harness = hosted("host-grow", 4, STAGING + 1);
+    let harness = lending("host-grow", EXPERTS, 4, 1, STAGING, Conveying::of(u64::from(STAGING) + 1), 0, Placer::Tier, false);
     harness.request(&[0]).complete().unwrap();
     let shared = harness.watcher.shared();
     let step = harness.step();

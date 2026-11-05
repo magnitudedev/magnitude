@@ -238,12 +238,13 @@ pub(super) struct HostRecords {
     /// What each record holds, changed only by [`Self::set`].
     records: Vec<Host>,
     /// The indexes of `records`, each kept by [`Self::set`] alone: the
-    /// ready records (a landing takes the last), the graced ones, the
-    /// record keeping each expert, the record each landing in flight
-    /// takes, the outstanding answers, the experts of the group's layers no
-    /// record keeps or lands, per layer the experts held alone, and the
-    /// records claimed.
-    ready: Vec<u32>,
+    /// ready records, in order (a landing takes the lowest past the lent
+    /// ones, [`Self::take_lacked`]), the graced ones, the record keeping
+    /// each expert, the record each landing in flight takes, the
+    /// outstanding answers, the experts of the group's layers no record
+    /// keeps or lands, per layer the experts held alone, and the records
+    /// claimed.
+    ready: BTreeSet<u32>,
     graced: Vec<u32>,
     answering: Vec<u32>,
     kept: HashMap<Staged, u32>,
@@ -274,7 +275,7 @@ impl HostRecords {
         }
         let mut host = Self {
             records: Vec::new(),
-            ready: Vec::new(),
+            ready: BTreeSet::new(),
             graced: Vec::new(),
             answering: Vec::new(),
             kept: HashMap::new(),
@@ -304,8 +305,7 @@ impl HostRecords {
         }
         match old {
             Host::Ready => {
-                let at = self.ready.iter().rposition(|&ready| ready == record).expect("a ready record is listed ready");
-                self.ready.swap_remove(at);
+                assert!(self.ready.remove(&record), "a ready record is listed ready");
             }
             Host::Landing { staged, .. } => {
                 self.landing.remove(&staged);
@@ -323,7 +323,7 @@ impl HostRecords {
             Host::Claimed => self.claimed -= 1,
         }
         match content {
-            Host::Ready => self.ready.push(record),
+            Host::Ready => assert!(self.ready.insert(record), "record {record} is listed ready once"),
             Host::Landing { staged, .. } => assert!(self.landing.insert(staged, record).is_none(), "{staged:?} lands twice"),
             Host::Kept(Whole { staged, kept, .. }) | Host::Answering(Whole { staged, kept, .. }, _) => {
                 assert!(self.kept.insert(staged, record).is_none(), "{staged:?} kept twice");
@@ -553,11 +553,18 @@ impl HostRecords {
         }
     }
 
-    /// Take the last ready record for a landing of `staged`, which the
-    /// tier lacks, answering the request at `answer` where a demand takes
-    /// it: its grant.
+    /// Take a ready record for a landing of `staged`, which the tier
+    /// lacks, answering the request at `answer` where a demand takes it:
+    /// its grant. Every landing takes its record here, the lowest ready one
+    /// past the lent records (a lent one only where none past them is
+    /// ready, as a prompt group's claim waits for a landing into it). A
+    /// shrink keeps a landing in place and cuts only above it
+    /// ([`Self::shrink_floor`]), and from the top down; so a landing lies
+    /// past a cut only where every record past the lent ones below it was
+    /// taken as it began: right after a growth a landing fills the records
+    /// below the growth before it touches the new ones a shrink cuts first.
     fn take_lacked(&mut self, staged: Staged, answer: Option<Point>) -> Grant {
-        let &record = self.ready.last().expect("a record taken is ready");
+        let record = self.ready.range(self.lent..).next().or_else(|| self.ready.first()).copied().expect("a record taken is ready");
         self.set(record, Host::Landing { staged, answer });
         self.grant(staged, record)
     }
@@ -887,7 +894,6 @@ impl HostRecords {
         assert!(self.records[records as usize..].iter().all(|&content| content == Host::Ready), "a shrink keeps nothing past it");
         self.records.truncate(records as usize);
         self.ready.retain(|&record| record < records);
-        self.ready.sort_unstable();
         moves
     }
 }
@@ -1217,12 +1223,12 @@ mod tests {
     fn a_landing_takes_a_ready_record_beyond_what_it_keeps() {
         let (mut tier, maps) = mapped(3, 1, ONE, Resolution::AfterStore);
         let grant = tier.grant_of((0, 5), 2).expect("one ready beyond a reserve of two");
-        assert_eq!(grant.record(), 2);
+        assert_eq!(grant.record(), 0, "the lowest ready");
         assert_eq!(tier.take((0, 6), 2), None, "the reserve is the demand's");
         assert_eq!(maps.held((0, 5)), None, "unmapped until its bytes are whole");
         grant.map(None);
-        tier.landed(2, (0, 5), None, Kept::Alone);
-        assert_eq!(maps.held((0, 5)), Some(2), "its grant mapped it");
+        tier.landed(0, (0, 5), None, Kept::Alone);
+        assert_eq!(maps.held((0, 5)), Some(0), "its grant mapped it");
         assert!(tier.keeps((0, 5)) && tier.holds_alone((0, 5)));
         assert_eq!(tier.alone(), [1]);
         let record = tier.take((0, 6), 0).unwrap();
@@ -1298,9 +1304,9 @@ mod tests {
     fn a_host_tier_shrinks_to_its_most_valuable_records_and_grows_ready() {
         let rank = reads(&[((0, 10), 8), ((0, 11), 2), ((0, 13), 2)]);
         let (mut tier, maps) = mapped(4, 1, ONE, Resolution::AfterStore);
-        let grants = [10, 11, 12, 13].map(|expert| tier.grant_of((0, expert), 0).unwrap());
-        assert_eq!(grants.each_ref().map(Grant::record), [3, 2, 1, 0]);
-        for (grant, expert) in grants.iter().zip([10, 11, 12, 13]) {
+        let grants = [13, 12, 11, 10].map(|expert| tier.grant_of((0, expert), 0).unwrap());
+        assert_eq!(grants.each_ref().map(Grant::record), [0, 1, 2, 3], "each the lowest ready");
+        for (grant, expert) in grants.iter().zip([13, 12, 11, 10]) {
             if expert != 12 {
                 grant.map(None);
                 tier.landed(grant.record(), (0, expert), None, Kept::Alone);
@@ -1328,10 +1334,12 @@ mod tests {
     fn a_host_tier_shrinks_around_its_records_in_flight() {
         let rank = reads(&[((0, 9), 8), ((0, 10), 6)]);
         let (mut tier, maps) = mapped(6, 1, ONE, Resolution::AfterStore);
-        let grants = [9, 10, 11, 12, 13].map(|expert| tier.grant_of((0, expert), 0).unwrap());
-        assert_eq!(grants.each_ref().map(Grant::record), [5, 4, 3, 2, 1]);
-        for (grant, expert) in grants.iter().zip([9, 10, 11, 12, 13]) {
-            if expert != 12 {
+        let grants = [14, 13, 12, 11, 10, 9].map(|expert| tier.grant_of((0, expert), 0).unwrap());
+        assert_eq!(grants.each_ref().map(Grant::record), [0, 1, 2, 3, 4, 5], "each the lowest ready");
+        // Expert 14's read into record 0 fails, leaving it empty.
+        tier.unlanded(0);
+        for (grant, expert) in grants.iter().zip([14, 13, 12, 11, 10, 9]) {
+            if expert != 12 && expert != 14 {
                 grant.map(None);
                 tier.landed(grant.record(), (0, expert), None, Kept::Alone);
             }
@@ -1346,7 +1354,7 @@ mod tests {
         assert_eq!(tier.shrink(4, &rank), [(4, 0), (5, 1)]);
         assert_eq!([9, 10, 11, 13].map(|expert| maps.held((0, expert))), [Some(1), Some(0), Some(3), None]);
         assert!(tier.lands((0, 12)), "the landing is in flight where it was");
-        grants[3].map(None);
+        grants[2].map(None);
         tier.landed(2, (0, 12), None, Kept::Alone);
         tier.unhold(3);
         assert_eq!(maps.held((0, 12)), Some(2));
