@@ -478,18 +478,25 @@ impl DirectGraphBuilder {
     /// once the graph exists, so it is recorded to the device account, never
     /// refused.
     pub fn instantiate(self) -> Result<DirectGraph, ExecutionError> {
-        let before = self.device.memory_info()?.free_bytes;
-        let exec = self.graph.instantiate().map_err(submission)?;
-        for (node, _) in self.enabled.iter().enumerate().filter(|(_, enabled)| !**enabled) {
-            exec.set_enabled(self.graph.node(node), false).map_err(submission)?;
-        }
-        exec.upload(self.device.stream()).map_err(submission)?;
-        let device_bytes = before.saturating_sub(self.device.memory_info()?.free_bytes);
-        let context = self.device.context().clone();
-        let launched = Event::new(&context).map_err(submission)?;
         let census = GraphCensus::graph(self.launches).ok_or_else(|| {
             ExecutionError::SubmissionFailed("a graph's census overflows".into())
         })?;
+        // The driver refusing memory for the graph is a capacity refusal of
+        // what its census takes; any other failure the submission's.
+        let required = crate::graph_cost::census_bytes(&self.device, census);
+        let refused = |error: driver::DriverError| match error.code {
+            crate::executor::OUT_OF_MEMORY => ExecutionError::AllocationCapacity { required: required.into(), available: 0 },
+            _ => submission(error),
+        };
+        let before = self.device.memory_info()?.free_bytes;
+        let exec = self.graph.instantiate().map_err(refused)?;
+        for (node, _) in self.enabled.iter().enumerate().filter(|(_, enabled)| !**enabled) {
+            exec.set_enabled(self.graph.node(node), false).map_err(submission)?;
+        }
+        exec.upload(self.device.stream()).map_err(refused)?;
+        let device_bytes = before.saturating_sub(self.device.memory_info()?.free_bytes);
+        let context = self.device.context().clone();
+        let launched = Event::new(&context).map_err(submission)?;
         let charge = self.device.accounts().device.record(device_bytes);
         let held = self.device.graph_bytes().clone();
         held.fetch_add(device_bytes, std::sync::atomic::Ordering::Relaxed);
@@ -719,7 +726,15 @@ unsafe extern "system" fn wake_after_write(data: *mut c_void) {
 impl HostWord {
     /// A word at 0.
     pub fn new(device: &Device) -> Result<Self, ExecutionError> {
-        let mapped = driver::HostMapped::new(device.context(), &device.accounts().upload, 4)?;
+        Self::on(device.context(), &device.accounts().upload)
+    }
+
+    /// A word at 0 in `context`, charged to `account`.
+    pub(crate) fn on(
+        context: &Arc<driver::Context>,
+        account: &Arc<dyn seismic_compiler::executable::MemoryAccount>,
+    ) -> Result<Self, ExecutionError> {
+        let mapped = driver::HostMapped::new(context, account, 4)?;
         mapped.write_at(0, &0u32.to_le_bytes());
         Ok(Self { mapped, wake: Arc::new(Wake { lock: Mutex::new(()), changed: Condvar::new() }) })
     }

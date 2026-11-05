@@ -115,6 +115,41 @@ impl GraphCensus {
     }
 }
 
+/// What a family's graphs hold with launches in flight: its decode
+/// launch's graphs, and the union of every launch's, each layout's graph
+/// for the most runs of it any one launch makes ([`Self::held`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LaunchGraphs {
+    pub decode: GraphCensus,
+    pub union: GraphCensus,
+}
+
+impl LaunchGraphs {
+    /// What the family holds with `launches` launches in flight: the
+    /// union, within which any one launch's graphs are whatever its class,
+    /// so every submission fits; and beside it each other launch's, a
+    /// decode launch's, so one prompt launch in flight with decode launches
+    /// records no graph it once recorded. Each layout's graphs kept for its
+    /// decode launches, `decode`'s runs of it for every launch, are within
+    /// this, as a layout's union runs are no fewer than its decode runs, so
+    /// no release ever takes them. A second prompt launch in flight (a
+    /// chunk's pipelined successor, where prompt chunks do not chain) still
+    /// fits, releasing graphs only the first prompt launch replays, which
+    /// then record again. None without a launch, none on overflow.
+    pub fn held(self, launches: u64) -> Option<GraphCensus> {
+        match launches {
+            0 => Some(GraphCensus::default()),
+            launches => self.decode.times(launches - 1)?.plus(self.union),
+        }
+    }
+
+    /// Whether both terms are within `bound`'s: what it holds at any count
+    /// of launches is then within what `bound` holds.
+    pub fn within(self, bound: Self) -> bool {
+        self.decode.within(bound.decode) && self.union.within(bound.union)
+    }
+}
+
 /// The memory a set of recorded graphs holds, by the storage it is in:
 /// device memory beyond the device's allocations (driver memory), and
 /// upload storage the backend allocates for them.

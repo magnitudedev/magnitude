@@ -48,10 +48,12 @@ const KERNEL: (&str, &str) = (
 /// so what is planned at it still fits once the device's own cost is read.
 pub const UNMEASURED: GraphCost = GraphCost::Pooled { graph: 256 << 10, launch: 16 << 10, granule: 2 << 20 };
 
+/// Each device's measured cost ([`graph_cost`]), by ordinal.
+static COSTS: Mutex<BTreeMap<u32, GraphCost>> = Mutex::new(BTreeMap::new());
+
 /// What graphs instantiated on `device` hold, measured on its first call
 /// in the process and kept for the device's ordinal after.
 pub fn graph_cost(device: &Device) -> Result<GraphCost, ExecutionError> {
-    static COSTS: Mutex<BTreeMap<u32, GraphCost>> = Mutex::new(BTreeMap::new());
     let mut costs = COSTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(cost) = costs.get(&device.ordinal()) {
         return Ok(*cost);
@@ -59,6 +61,15 @@ pub fn graph_cost(device: &Device) -> Result<GraphCost, ExecutionError> {
     let cost = measure(device)?;
     costs.insert(device.ordinal(), cost);
     Ok(cost)
+}
+
+/// The driver memory graphs of `census` take on `device`, at its cost as
+/// measured in this process, else at [`UNMEASURED`]'s bound. Measures
+/// nothing.
+pub(crate) fn census_bytes(device: &Device, census: seismic_compiler::graph_cost::GraphCensus) -> u64 {
+    let costs = COSTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cost = costs.get(&device.ordinal()).copied().unwrap_or(UNMEASURED);
+    cost.bytes(census).map_or(u64::MAX, |bytes| bytes.device)
 }
 
 fn failure(error: impl std::fmt::Debug) -> ExecutionError {

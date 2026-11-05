@@ -113,11 +113,12 @@ fn a_chains_places_replay_their_shapes_graphs_bit_for_bit() {
         let places = PLACES as u64;
         let replayed = |recorded, updated| GraphReplays { recorded, updated };
         match backend {
-            // A graph per place, instantiated with its slot and updated to
-            // each chain's storage.
+            // A graph per place, recorded by the first chain, its places in
+            // flight together, and updated to each chain's storage.
             BackendName::Cuda => {
-                assert_eq!(created, replayed(places, 0), "{backend:?}: the slots' graphs");
-                assert_eq!(counts, [replayed(0, places); 3], "{backend:?}: every chain records nothing");
+                assert_eq!(created, replayed(0, 0), "{backend:?}: a slot records nothing");
+                assert_eq!(counts[0], replayed(places, places), "{backend:?}: the first chain");
+                assert_eq!(counts[1..], [replayed(0, places); 2], "{backend:?}: every later chain records nothing");
             }
             // A Vulkan division holds its launches' addresses: recorded
             // bound to place 0, updated at the other places, and at every
@@ -309,8 +310,9 @@ fn interleaved_classes_slots_and_places_record_each_shape_once() {
             assert_eq!(read_f32(landed), values.iter().map(|value| 2.0 * value).collect::<Vec<_>>(), "{backend:?}");
         }
         let first = match backend {
-            // Instantiated with the slots, before the rounds.
-            BackendName::Cuda => 0,
+            // The layout's graph for each of the chain's runs in flight at
+            // once, which the decode steps reuse.
+            BackendName::Cuda => PLACES as u64,
             // A plan's graph per class.
             BackendName::Vulkan => classes.len() as u64,
             BackendName::Metal | BackendName::Cpu => 0,
@@ -380,11 +382,12 @@ fn a_layouts_classes_making_different_launches_replay_one_graph() {
         }
         let served = device.graph_replays().since(served);
         if backend == BackendName::Cuda {
-            // One graph of the layout for each slot, both launches its nodes.
-            assert_eq!(created.recorded, SLOTS as u64, "{backend:?}: the slots' graphs");
-            assert_eq!(family.slot_graphs().graphs, 1, "{backend:?}: a slot holds the layout's one graph");
-            assert_eq!(family.slot_graphs().launches, 2, "{backend:?}: the graph's nodes are both classes' launches");
-            assert_eq!(served.recorded, 0, "{backend:?}: serving records nothing");
+            // One graph of the layout, both launches its nodes, recorded at
+            // its first use and serving every class, slot and round after.
+            assert_eq!(created.recorded, 0, "{backend:?}: a slot records nothing");
+            assert_eq!(family.graphs().decode.graphs, 1, "{backend:?}: a launch holds the layout's one graph");
+            assert_eq!(family.graphs().decode.launches, 2, "{backend:?}: the graph's nodes are both classes' launches");
+            assert_eq!(served.recorded, 1, "{backend:?}: one graph serves every class, slot and round");
         }
     }
 }

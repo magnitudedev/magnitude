@@ -31,7 +31,7 @@ use crate::api::{CallError, TensorError, WorkflowError};
 use crate::driver::Allocation;
 use crate::layout;
 use seismic_compiler::errors::{ExecutionError, InvocationError};
-use seismic_compiler::graph_cost::{argument_bytes, GraphCensus};
+use seismic_compiler::graph_cost::{argument_bytes, GraphCensus, LaunchGraphs};
 use seismic_compiler::prepared::{ArgumentValue, DeviceIdentity, TensorDescriptor};
 use seismic_lang::checked::NativeImplementation;
 use seismic_lang::entry::{AliasRule, CallSchema, ParameterKind, TensorAccess};
@@ -606,19 +606,20 @@ impl NativeGraphDraft {
         )
     }
 
-    /// Seal the graph as a plan whose runs replay graphs: on CUDA graphs a
-    /// slot of it instantiates as it is created, between flights.
+    /// Seal the graph as a plan whose runs replay graphs: on CUDA graphs
+    /// recorded as a run first needs one, once the device's queued work has
+    /// drained.
     pub fn seal(self) -> Result<NativeGraphPlan, CallError> {
         self.sealed(false)
     }
 
     /// Seal the graph as a launched plan: per-use work whose shapes no load
-    /// can enumerate ahead (rows a request brings), so no slot instantiates
-    /// a graph of it. On CUDA, which replays only graphs slots instantiated,
-    /// its runs are launched call by call in their submission's stream
-    /// order, and a slot of it holds no graph, so it may be created with
-    /// work in flight; elsewhere its graphs are recorded at a shape's first
-    /// use, as every plan's are.
+    /// can enumerate ahead (rows a request brings), so no graph of it is
+    /// kept. On CUDA, where recording a graph drains the device, its runs
+    /// are launched call by call in their submission's stream order, and a
+    /// slot of it holds no graph, so it runs with work in flight unhindered;
+    /// elsewhere its graphs are recorded at a shape's first use, as every
+    /// plan's are.
     pub fn seal_launched(self) -> Result<NativeGraphPlan, CallError> {
         self.sealed(true)
     }
@@ -2683,7 +2684,7 @@ impl NativeGraphPlan {
     /// launches `form` names (`super::LayoutForms`): on CUDA one graph
     /// (`graph_segments`) with a node for each launch the form holds, each
     /// mark it holds and the nodes of each timeline node inside it
-    /// (`cuda::timeline_nodes`), exactly what `cuda::instantiate` makes,
+    /// (`cuda::timeline_nodes`), exactly what `cuda::record_run` makes,
     /// none of a launched plan, whose runs launch call by call
     /// ([`NativeGraphDraft::seal_launched`]); elsewhere what recording its
     /// run takes at most ([`Self::recorded`]).
@@ -2742,14 +2743,15 @@ impl NativeGraphPlan {
     }
 
     /// A slot's share of its device's graph budget ([`super::SlotGraphs`]):
-    /// a launch of the plan's own slot is one run, its layout's graph of
-    /// the launches it makes, instantiated ([`instantiate`]).
+    /// a launch of the plan's own slot is one run, of its layout's graph of
+    /// the launches it makes, a family of its own.
     fn slot_hold(self: &Arc<Self>) -> Result<Arc<super::SlotGraphs>, TensorError> {
         let form: Arc<[u64]> = self.shape.structure.clone().into();
-        let forms = Arc::new(super::LayoutForms::new([(self.shape.layout, form.clone())]));
-        super::SlotGraphs::new(&self.device, self.run_graphs(&form), forms, |owned| {
-            instantiate(std::slice::from_ref(self), form, 1, owned)
-        })
+        let census = self.run_graphs(&form);
+        let layout = super::LayoutGraph { form, plans: vec![self.clone()] };
+        let layouts = super::LayoutForms::new([(self.shape.layout, layout)]);
+        let graphs = LaunchGraphs { decode: census, union: census };
+        super::FamilyGraphs::new(&self.device, layouts, graphs).slot().map_err(TensorError::Execution)
     }
 
     /// A slot of this plan alone, holding a run's graphs in its device's
@@ -2950,35 +2952,25 @@ pub struct NativeGraphFamily {
     workspace_bytes: u64,
     output_bytes: u64,
     upload_bytes: u64,
-    /// Its plans by layout, each layout's graph and the most runs of it one
-    /// launch makes: a slot instantiates that many graphs of each layout
-    /// ([`instantiate`]), so serving replays them and instantiates none.
-    layouts: Vec<LayoutGraphs>,
-    /// The form of each layout's graph, which its slots' runs replay.
-    forms: Arc<super::LayoutForms>,
-    /// What one slot holds of its device's graph budget
-    /// ([`super::SlotGraphs`]): each layout's graph for each of its runs.
-    slot_graphs: GraphCensus,
+    /// Its layouts' graphs and its share of its device's graph budget,
+    /// which its live slots hold ([`super::FamilyGraphs`]).
+    graphs: Arc<super::FamilyGraphs>,
+    /// Its layouts.
+    layouts: usize,
+    /// Each layout its decode launch (its first) runs, with how many runs
+    /// of it the launch makes, graphed only ([`Self::record_decode`]).
+    decode_layouts: Vec<(u64, usize)>,
     /// What each launch's runs replay, by launch, in the order given:
     /// each run's layout's graph (`GraphFamilyCensus`).
     launch_graphs: Vec<GraphCensus>,
 }
 
-/// What a family's graphs are made of, for a load's report: its layouts,
-/// what one slot instantiates, and what each launch's runs replay.
+/// What a family's graphs are made of, for a load's report: its layouts
+/// and what each launch's runs replay.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GraphFamilyCensus {
     pub layouts: usize,
-    pub slot: GraphCensus,
     pub launches: Vec<GraphCensus>,
-}
-
-/// A family's plans of one layout, which one graph serves
-/// (`super::LayoutForms`), and the most runs of them one launch makes.
-struct LayoutGraphs {
-    plans: Vec<Arc<NativeGraphPlan>>,
-    form: Arc<[u64]>,
-    runs: usize,
 }
 
 impl NativeGraphFamily {
@@ -2989,15 +2981,13 @@ impl NativeGraphFamily {
     }
 
     /// A family of `plans` whose launches each make the runs of one of
-    /// `launches`, by plan, a plan once for each of its runs. Its plans of
-    /// one layout share one graph (`super::LayoutForms`): on CUDA a node for
+    /// `launches`, by plan, a plan once for each of its runs, the first its
+    /// decode launch, which every launch in flight may be. Its plans of one
+    /// layout share one graph (`super::LayoutForms`): on CUDA a node for
     /// each launch any of them makes, each run enabling its own; elsewhere
-    /// their own graphs, recorded at first use, each run of a launch taking
-    /// at most one. A slot holds, of each layout, a graph for each run of
-    /// it the launch making most of them makes, whatever class each run
-    /// is ([`Self::slot_graphs`]); on CUDA it instantiates them as it is
-    /// created, so serving replays them, updated where a run binds other
-    /// storage, and instantiates none.
+    /// their own graphs. Every graph is recorded as a run first needs one,
+    /// within what its live slots hold of the device's graph budget
+    /// ([`Self::graphs`]).
     pub fn with_launches(plans: &[Arc<NativeGraphPlan>], launches: &[Vec<Arc<NativeGraphPlan>>]) -> Result<Self, WorkflowError> {
         let first = plans.first().ok_or(WorkflowError::Empty)?;
         assert!(
@@ -3012,10 +3002,10 @@ impl NativeGraphFamily {
         }
         // Its plans by layout, in order of their first.
         let mut at = std::collections::HashMap::<u64, usize>::new();
-        let mut layouts = Vec::<LayoutGraphs>::new();
+        let mut layouts = Vec::<super::LayoutGraph>::new();
         for plan in plans {
             let index = *at.entry(plan.shape.layout).or_insert_with(|| {
-                layouts.push(LayoutGraphs { plans: Vec::new(), form: Arc::from([]), runs: 0 });
+                layouts.push(super::LayoutGraph { plans: Vec::new(), form: Arc::from([]) });
                 layouts.len() - 1
             });
             layouts[index].plans.push(plan.clone());
@@ -3037,46 +3027,53 @@ impl NativeGraphFamily {
                 .map(|call| graphs.plans.iter().fold(0, |made, plan| made | plan.shape.structure[call]))
                 .collect();
         }
-        // Of each layout, the most runs a launch makes; every plan runs in
-        // some launch, else a run of it would find no graph its slot made.
+        // Every plan runs in some launch, else the graphs its runs record
+        // would lie outside what the family holds.
         let members = plans.iter().map(Arc::as_ptr).collect::<std::collections::HashSet<_>>();
-        let mut launched = std::collections::HashSet::new();
-        for runs in launches {
-            let mut counts = std::collections::HashMap::<usize, usize>::new();
-            for plan in runs {
-                assert!(members.contains(&Arc::as_ptr(plan)), "a family's launches run its plans");
-                launched.insert(Arc::as_ptr(plan));
-                *counts.entry(at[&plan.shape.layout]).or_default() += 1;
-            }
-            for (index, count) in counts {
-                layouts[index].runs = layouts[index].runs.max(count);
-            }
-        }
+        let launched = launches.iter().flatten().map(Arc::as_ptr).collect::<std::collections::HashSet<_>>();
+        assert!(launched.is_subset(&members), "a family's launches run its plans");
         assert_eq!(launched.len(), members.len(), "every plan of a family runs in one of its launches");
-        let slot_graphs = layouts
-            .iter()
-            .try_fold(GraphCensus::default(), |census, graphs| {
-                let graph = graphs
-                    .plans
-                    .iter()
-                    .fold(GraphCensus::default(), |most, plan| most.most(plan.run_graphs(&graphs.form)));
-                census.plus(graph.times(graphs.runs as u64)?)
-            })
-            .expect("a family's graph census fits u64");
         let graph_of = |plan: &Arc<NativeGraphPlan>| plan.run_graphs(&layouts[at[&plan.shape.layout]].form);
         let launch_graphs = launches
             .iter()
             .map(|runs| runs.iter().try_fold(GraphCensus::default(), |census, plan| census.plus(graph_of(plan))))
             .collect::<Option<Vec<_>>>()
             .expect("a family's graph census fits u64");
-        let forms = Arc::new(super::LayoutForms::new(
-            layouts.iter().map(|graphs| (graphs.plans[0].shape.layout, graphs.form.clone())),
-        ));
+        let decode = launch_graphs.first().copied().ok_or(WorkflowError::Empty)?;
+        // Each layout's graph for the most runs of it any one launch makes.
+        let mut most = vec![0usize; layouts.len()];
+        for runs in launches {
+            let mut counts = vec![0usize; layouts.len()];
+            for plan in runs.iter().filter(|plan| plan.graphed()) {
+                counts[at[&plan.shape.layout]] += 1;
+            }
+            for (most, count) in most.iter_mut().zip(counts) {
+                *most = (*most).max(count);
+            }
+        }
+        let union = layouts
+            .iter()
+            .zip(&most)
+            .try_fold(GraphCensus::default(), |census, (graphs, &runs)| {
+                let graph = graphs.plans.iter().fold(GraphCensus::default(), |most, plan| most.most(plan.run_graphs(&graphs.form)));
+                census.plus(graph.times(runs as u64)?)
+            })
+            .expect("a family's graph census fits u64");
+        let graphs = LaunchGraphs { decode, union };
+        let count = layouts.len();
+        let mut decode_layouts = Vec::<(u64, usize)>::new();
+        for plan in launches[0].iter().filter(|plan| plan.graphed()) {
+            match decode_layouts.iter_mut().find(|(layout, _)| *layout == plan.shape.layout) {
+                Some((_, runs)) => *runs += 1,
+                None => decode_layouts.push((plan.shape.layout, 1)),
+            }
+        }
+        let layouts = super::LayoutForms::new(layouts.into_iter().map(|graph| (graph.plans[0].shape.layout, graph)));
         Ok(Self {
+            graphs: super::FamilyGraphs::new(&first.device, layouts, graphs),
+            layouts: count,
+            decode_layouts,
             launch_graphs,
-            layouts,
-            forms,
-            slot_graphs,
             plans: plans.to_vec(),
             device: first.device.clone(),
             workspace_bytes: plans
@@ -3134,25 +3131,56 @@ impl NativeGraphFamily {
         })
     }
 
-    /// What one live slot of the family holds of its device's graph
-    /// budget: each layout's graph for each run of it one launch makes.
-    pub fn slot_graphs(&self) -> GraphCensus {
-        self.slot_graphs
+    /// What its decode launch and the union of its launches replay, which
+    /// its live slots, each a launch in flight, hold of its device's graph
+    /// budget (`LaunchGraphs::held`).
+    pub fn graphs(&self) -> LaunchGraphs {
+        self.graphs.launches()
+    }
+
+    /// Record, ahead of them, every graph its decode launches in flight
+    /// replay that is not kept: on CUDA each of its decode launch's layouts'
+    /// graphs for each run of it the launch makes, for each live slot (a
+    /// launch in flight, as `LaunchGraphs::held` holds them), once the
+    /// device's queued work has drained where one is to be recorded, and
+    /// kept while those slots live, whatever other graphs a submission
+    /// releases (`graph_replays::Pinned`), so a step of it records none, a
+    /// bank shrink's step included; elsewhere a
+    /// graph is recorded at its shape's first use with no wait, and this
+    /// records nothing. Recording allocates nothing of the device's ledger
+    /// (its word nodes name the device's placeholder word), and memory the
+    /// driver refuses it is a capacity refusal.
+    pub fn record_decode(&self) -> Result<(), TensorError> {
+        let crate::backends::OpenedKind::Cuda(opened) = &self.device.kind else {
+            return Ok(());
+        };
+        // The drain and the recordings under one guard, the submission
+        // order lock, so nothing is queued between them (`cuda::record_run`).
+        let _order = self.device.native.order.lock().expect("native submission order lock is never poisoned");
+        let replays = &self.device.native.cuda_replays;
+        for &(layout, count) in &self.decode_layouts {
+            let graph = self.graphs.layout(layout);
+            let key = over_placeholders(&graph, |_, runs| super::cuda::run_key(runs)).map_err(TensorError::Execution)?;
+            let retained: Arc<dyn std::any::Any + Send + Sync> = Arc::new(graph.plans.clone());
+            replays
+                .ensure(&key, count, self.graphs.flights(), self.device.native.graph_budget(), &retained, || opened.service().drain(), || {
+                    let (recorded, graph) = record_layout(&graph)?;
+                    assert_eq!(recorded, key, "a layout's graph is of its key");
+                    Ok(graph)
+                })
+                .map_err(TensorError::Execution)?;
+        }
+        Ok(())
     }
 
     /// What its graphs are made of ([`GraphFamilyCensus`]).
     pub fn census(&self) -> GraphFamilyCensus {
-        GraphFamilyCensus { layouts: self.layouts.len(), slot: self.slot_graphs, launches: self.launch_graphs.clone() }
+        GraphFamilyCensus { layouts: self.layouts, launches: self.launch_graphs.clone() }
     }
 
-    /// A slot's share of its device's graph budget ([`super::SlotGraphs`]),
-    /// with each layout's graphs instantiated ([`instantiate`]).
+    /// A slot's share of its device's graph budget ([`super::SlotGraphs`]).
     fn slot_hold(&self) -> Result<Arc<super::SlotGraphs>, TensorError> {
-        super::SlotGraphs::new(&self.device, self.slot_graphs, self.forms.clone(), |owned| {
-            self.layouts
-                .iter()
-                .try_for_each(|graphs| instantiate(&graphs.plans, graphs.form.clone(), graphs.runs, owned))
-        })
+        self.graphs.slot().map_err(TensorError::Execution)
     }
 
     pub fn new_output_slot(self: &Arc<Self>) -> Result<NativeGraphFamilyOutputSlot, TensorError> {
@@ -4374,57 +4402,48 @@ struct SequenceList<'a> {
     stamps: Vec<Vec<Stamp>>,
 }
 
-/// Instantiate `count` graphs of each segment of a run of the first of
-/// `plans` that replays graphs, for a slot as it is created: on CUDA,
-/// graphs of the plans' one layout whose nodes are the launches `form`
-/// holds, which those plans make (`cuda::instantiate`), over placeholder
-/// storage a replay binds to its run's ([`PlaceholderRun`]). A launched
-/// plan replays none ([`NativeGraphPlan::graphed`]). Elsewhere a graph is
-/// recorded at its shape's first use. Each graph instantiated is pushed to
-/// `owned`, the slot's ([`super::SlotGraphs`]).
-fn instantiate(plans: &[Arc<NativeGraphPlan>], form: Arc<[u64]>, count: usize, owned: &mut Vec<(Vec<u64>, u64)>) -> Result<(), TensorError> {
+/// Record the CUDA graph of a run of `layout`, whose nodes are the
+/// launches its form holds, which its plans make, over placeholder storage
+/// a replay binds to its run's ([`PlaceholderRun`], `cuda::record_run`):
+/// as a run first needs one, with no device work queued
+/// (`graph_replays::Replays::record`). Returns its shape's key with it.
+pub(super) fn record_layout(layout: &Arc<super::LayoutGraph>) -> Result<(Vec<u64>, seismic_cuda::direct::DirectGraph), ExecutionError> {
+    over_placeholders(layout, |device, runs| super::cuda::record_run(device, runs))?
+}
+
+/// `f` of a CUDA device and a run of each of `layout`'s plans over one
+/// placeholder allocation ([`PlaceholderRun`]).
+fn over_placeholders<R>(
+    layout: &Arc<super::LayoutGraph>,
+    f: impl FnOnce(&seismic_cuda::Device, &[PlaceholderRun<'_>]) -> R,
+) -> Result<R, ExecutionError> {
+    let plans = &layout.plans;
     assert!(
-        plans.iter().all(|plan| plan.shape.layout == plans[0].shape.layout),
-        "a graph is one layout's"
+        plans.iter().all(|plan| plan.shape.layout == plans[0].shape.layout && plan.graphed()),
+        "a graph is one layout's, of plans that replay graphs"
     );
-    let plans = plans.iter().filter(|plan| plan.graphed()).cloned().collect::<Vec<_>>();
-    let Some(first) = plans.first() else {
-        return Ok(());
-    };
-    let device = &first.device;
+    let device = &plans[0].device;
     let crate::backends::OpenedKind::Cuda(opened) = &device.kind else {
-        return Ok(());
+        unreachable!("only CUDA records a layout's graph");
     };
     let placeholder = device.allocate_zeroed(BUFFER_ALIGNMENT, BUFFER_ALIGNMENT)?;
     let runs = plans
         .iter()
-        .map(|plan| PlaceholderRun { plan, placeholder: &placeholder, form: form.clone() })
+        .map(|plan| PlaceholderRun { plan, placeholder: &placeholder, layout })
         .collect::<Vec<_>>();
-    // A graph's nodes launch every plan's kernels it was made of.
-    let retained: Arc<dyn std::any::Any + Send + Sync> = Arc::new(plans.to_vec());
-    super::cuda::instantiate(
-        opened.service(),
-        &device.native.cuda_replays,
-        device.native.graph_budget(),
-        &runs,
-        count,
-        &retained,
-        owned,
-    )
-    .map_err(TensorError::Execution)
+    Ok(f(opened.service(), &runs))
 }
 
 /// A sealed plan's run over placeholder storage: every buffer it binds at
 /// `placeholder`, with its sealed words and geometry and every launch
-/// encoded. A slot instantiates its graphs from it
-/// (`NativeGraphPlan::instantiate`); the run's addresses and encoding are
-/// parameters a replay sets, so its graphs are those of every run of its
-/// shape.
+/// encoded. A layout's graph is recorded from it ([`record_layout`]); the
+/// run's addresses and encoding are parameters a replay sets, so its
+/// graphs are those of every run of its shape.
 struct PlaceholderRun<'a> {
     plan: &'a NativeGraphPlan,
     placeholder: &'a Allocation,
-    /// The words of its layout's graph (`super::LayoutForms`).
-    form: Arc<[u64]>,
+    /// Its layout's graph (`super::LayoutForms`).
+    layout: &'a Arc<super::LayoutGraph>,
 }
 
 impl DispatchList for PlaceholderRun<'_> {
@@ -4460,7 +4479,7 @@ impl DispatchList for PlaceholderRun<'_> {
             marks: self.plan.held_marks(),
             launched: !self.plan.graphed(),
             holds_timelines: self.plan.holds_timelines(),
-            form: self.form.clone(),
+            graph: self.layout.clone(),
         }])
     }
 }
@@ -4550,7 +4569,7 @@ impl DispatchList for SequenceList<'_> {
                 .map(|run| {
                     let calls = first..first + run.plan.executable.nodes.len();
                     first = calls.end;
-                    let form = run.hold.form(run.plan.shape.layout);
+                    let graph = run.hold.layout(run.plan.shape.layout);
                     super::PlanRun {
                         plan: run.plan.identity,
                         layout: run.plan.shape.layout,
@@ -4559,7 +4578,7 @@ impl DispatchList for SequenceList<'_> {
                         marks: run.plan.held_marks(),
                         launched: !run.plan.graphed(),
                         holds_timelines: run.plan.holds_timelines(),
-                        form,
+                        graph,
                     }
                 })
                 .collect(),

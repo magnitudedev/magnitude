@@ -23,16 +23,14 @@
 //! parks, publications and waits it holds. A write's waiters wake as it
 //! lands (`DirectBatch::replay`).
 //!
-//! Graphs are instantiated only as a graph slot is created
-//! ([`instantiate`]), a graph of each layout for each run of it its launch
-//! makes, over placeholder storage; serving takes them (`Replays::record`)
-//! and never instantiates. A slot is created only between flights, with no device
-//! work queued: the driver holds the context while instantiation waits on
-//! the device, so behind a parked kernel it would hold every other thread's
-//! driver calls, a park's answer among them (a transfer), until the park
-//! gave up. A run takes a graph bound to its storage, else one whose
-//! launches completed (`DirectGraph::idle`), so setting its parameters
-//! waits for no device work.
+//! A graph is instantiated as a run first needs one ([`record_run`]), of
+//! its layout over placeholder storage, only once the device's queued work
+//! has drained (`Replays::record`'s `prepare`): the driver holds the context
+//! while instantiation waits on the device, so behind a parked kernel it
+//! would hold every other thread's driver calls, a park's answer among them
+//! (a transfer), until the park gave up. A run takes a graph bound to its
+//! storage, else one whose launches completed (`DirectGraph::idle`), so
+//! setting its parameters waits for no device work.
 //!
 //! Standalone calls and every launch of a launch-detail trace (timed one by
 //! one) run launch by launch, in stream order. A launched plan's run
@@ -67,8 +65,6 @@ use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::graph_cost::GraphCensus;
 use seismic_cuda::direct::{DirectBatch, DirectGraph, DirectGraphBuilder, DirectLaunch, HostWord};
 use seismic_lang::registry::BackendName;
-use std::any::Any;
-use std::sync::Arc;
 
 type Cuda = seismic_cuda::Cuda;
 type Executor = seismic_cuda::Executor;
@@ -87,6 +83,10 @@ impl super::graph_replays::RecordedGraph for DirectGraph {
     /// launch against 2.0 µs, `graph_cost::graph_update_cost_probe`).
     fn updates_in_flight() -> bool {
         seismic_lang::registry::BackendName::Cuda.graphs_update_in_flight()
+    }
+    /// Recorded over placeholder storage ([`record_run`]).
+    fn recorded_bound() -> bool {
+        false
     }
 }
 
@@ -169,19 +169,26 @@ fn issue(
                 .iter()
                 .filter(|(calls, _)| !calls.is_empty() && !keys.launched(calls))
                 .map(|(calls, _)| {
+                    assert_eq!(*calls, keys.run(calls).calls, "a graphed run is one graph");
                     let words = held_operations(list, &keys, calls);
                     let shaped = shaped(list, &keys, calls, &encoded, &words);
                     ((calls.clone(), words), shaped)
                 })
                 .unzip();
-            // Serving never instantiates: a graph its slots lack is a gap in
-            // their census.
-            let taken = replays.record(&shaped, budget, retained, |index| {
-                panic!(
-                    "a CUDA run of shape {:?} has no graph its slots instantiated: their census lacks it ({budget:?})",
-                    shaped[index].key
-                )
-            })?;
+            // A run that finds no graph of its shape it may take records its
+            // layout's, once the device's queued work has drained.
+            let taken = replays.record(
+                &shaped,
+                budget,
+                retained,
+                || device.drain().map_err(CallError::Execution),
+                |index| {
+                    let ((calls, _), shaped) = (&graphed[index], &shaped[index]);
+                    let (key, graph) = super::graph::record_layout(&keys.run(calls).graph).map_err(CallError::Execution)?;
+                    assert_eq!(key, shaped.key, "a run's graph is its layout's");
+                    Ok(graph)
+                },
+            )?;
             for _ in 0..repetitions {
                 let mut graphs = graphed.iter().zip(&shaped).zip(&taken);
                 for (calls, boundary) in &segments {
@@ -398,48 +405,40 @@ fn record<L: DispatchList>(
     builder.instantiate()
 }
 
-/// Instantiate `count` graphs of each segment of `lists[0]`, one sealed
-/// plan's run over placeholder storage, for a slot of its family as it is
-/// created ([`super::SlotGraphs`]): each a graph of the plan's layout whose
-/// nodes are the launches `form` holds, which the plans `lists` of that
-/// layout make ([`record`]), each pushed to `owned`, the slot's, which
-/// releases it as it drops. A replay binds a graph to its run's storage
-/// before it runs. A slot is created only between flights, with no device
-/// work queued: instantiation holds the context while the driver waits on
-/// the device, which a kernel parked on a host answer made by driver calls
-/// would hang, so one with work queued is an invariant violation.
-pub(super) fn instantiate<L: DispatchList>(
-    device: &seismic_cuda::Device,
-    replays: &CudaReplays,
-    budget: GraphCensus,
-    lists: &[L],
-    count: usize,
-    retained: &Arc<dyn Any + Send + Sync>,
-    owned: &mut Vec<(Vec<u64>, u64)>,
-) -> Result<(), ExecutionError> {
-    assert!(
-        device.idle()?,
-        "a graph slot is created only between flights, with no device work queued"
-    );
+/// Record the graph of a run of `lists[0]`, one sealed plan's run over
+/// placeholder storage: a graph of the plan's layout whose nodes are the
+/// launches its form holds, which the plans `lists` of that layout make
+/// ([`record`]), its word nodes on a placeholder word. A replay binds it to
+/// its run's storage and words before it runs. Returns its shape's key with
+/// it. Instantiation holds the context while the driver waits on the
+/// device, which a kernel parked on a host answer made by driver calls
+/// would hang, so a recording with work queued is an invariant violation.
+/// It holds by one guard: every recording, and the drain before it, runs
+/// under the device's submission order lock (`NativeState::order`: a
+/// submission's encoding holds it, `submit`, and so does
+/// `NativeGraphFamily::record_decode`), so no native submission is queued
+/// between the drain and the recording; other work on the device's native
+/// streams there would break the invariant this asserts.
+pub(super) fn record_run<L: DispatchList>(device: &seismic_cuda::Device, lists: &[L]) -> Result<(Vec<u64>, DirectGraph), ExecutionError> {
+    assert!(device.idle()?, "a graph is recorded only with no device work queued");
     let list = &lists[0];
-    let encoded = list.encoded();
-    let runs = list.runs().expect("a slot's graphs are a sealed plan's");
-    let form = runs[0].form.clone();
-    let segments = graph_segments(list, Some(&runs));
+    let runs = list.runs().expect("a recorded graph is a sealed plan's");
+    let form = runs[0].graph.form.clone();
     let keys = ReplayKeys { runs, encoded: None };
-    // What the graphs' word nodes bind until a replay binds its run's.
-    let placeholder = HostWord::new(device)?;
-    for (calls, _) in segments.iter().filter(|(calls, _)| !calls.is_empty()) {
-        // A placeholder run binds no timeline.
-        let key = shaped(list, &keys, calls, &encoded, &[]).key;
-        let marks = keys.marks(calls).collect::<Vec<_>>();
-        let timelines = keys.run(calls).held_timelines(calls).collect::<Vec<_>>();
-        for _ in 0..count {
-            let graph = record(device, lists, calls.clone(), &form, &marks, &timelines, &placeholder)?;
-            owned.push((key.clone(), replays.instantiated(key.clone(), graph, budget, retained)));
-        }
-    }
-    Ok(())
+    let calls = 0..list.count();
+    let key = run_key(lists);
+    let marks = keys.marks(&calls).collect::<Vec<_>>();
+    let timelines = keys.run(&calls).held_timelines(&calls).collect::<Vec<_>>();
+    let graph = record(device, lists, calls, &form, &marks, &timelines, device.placeholder_word())?;
+    Ok((key, graph))
+}
+
+/// The key of the graph of a run of `lists[0]`, one sealed plan's run over
+/// placeholder storage ([`record_run`]), which binds no timeline.
+pub(super) fn run_key<L: DispatchList>(lists: &[L]) -> Vec<u64> {
+    let list = &lists[0];
+    let keys = ReplayKeys { runs: list.runs().expect("a recorded graph is a sealed plan's"), encoded: None };
+    shaped(list, &keys, &(0..list.count()), &list.encoded(), &[]).key
 }
 
 /// Stamp a boundary's marks on the stream, once the work before them

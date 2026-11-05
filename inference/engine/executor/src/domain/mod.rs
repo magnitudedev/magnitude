@@ -621,6 +621,10 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     bank_claim: Option<ClaimId>,
     /// What expert bank resizes held the submitting thread.
     resize_held: ResizeHeld,
+    /// A bank shrink began and its step, the next decode launch, has not
+    /// launched: that launch records no graph, as every one it replays was
+    /// recorded and kept as its slots were made.
+    shrink_step: bool,
     /// What the rest of the host does to memory, read by read, and what
     /// sizes the expert bank's resizes from it.
     pace: RefCell<MemoryPace>,
@@ -775,6 +779,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if let Some(bank) = self.family.expert_bank() {
             bank.slow_host_landing();
         }
+    }
+
+    /// The device the domain charges.
+    #[cfg(test)]
+    pub(crate) fn device(&self) -> &seismic::Device {
+        self.domain.device()
     }
 
     /// The landings the device has converted.
@@ -2267,6 +2277,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             experts: None,
             bank_claim: None,
             resize_held: ResizeHeld::default(),
+            shrink_step: false,
             pace: RefCell::new(MemoryPace::new()),
         };
         let bindings = StateBindings {

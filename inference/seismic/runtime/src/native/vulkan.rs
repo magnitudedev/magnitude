@@ -79,6 +79,11 @@ impl VulkanReplays {
         self.graphs.counts()
     }
 
+    /// Release graphs beyond `budget` (`Replays::fit_to`).
+    pub(crate) fn fit_to(&self, budget: GraphCensus) {
+        self.graphs.fit_to(budget);
+    }
+
     /// What the graphs of plan `plan`'s runs cost so far.
     pub(crate) fn plan_counts(&self, plan: u64) -> super::graph_replays::GraphReplays {
         self.graphs.plan_counts(plan)
@@ -215,7 +220,7 @@ pub(super) fn encode(
     // Recording a division takes nothing a park's answer needs (a Vulkan
     // park is a submission boundary, and recording command buffers holds
     // no device-wide lock), so it waits for nothing.
-    let taken = replays.graphs.record(&shaped, budget, retained, |index| {
+    let taken = replays.graphs.record(&shaped, budget, retained, || Ok(()), |index| {
         let (mut launches, mut marks) = (Vec::new(), Vec::new());
         let mut held = keys.marks(&graphed[index]).peekable();
         for call in graphed[index].clone() {

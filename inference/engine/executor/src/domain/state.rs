@@ -1486,7 +1486,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// (`ElasticBank::shrink`), the queued steps orphaned first, as they may
     /// name records it retires; its memory is released at later flight
     /// boundaries ([`Self::advance_expert_bank`]), `wake` completed as it
-    /// progresses. A load without an elastic bank is at its limit.
+    /// progresses. The shrink's step records no graph: the decode launch's
+    /// were recorded as its slots were made (`NativeGraphPool::grow`). A
+    /// load without an elastic bank is at its limit.
     fn shrink_expert_bank_of(
         &mut self,
         bindings: &mut StateBindings,
@@ -1501,7 +1503,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let moves = self.experts.as_ref().and_then(|measures| measures.moves.measured());
         let step = bank.shrink(resident, moves, deficit, &mut || self.queue.orphan(self.experts.as_ref(), bindings), wake)?;
         match step {
-            super::BankStep::Begun => self.resize_held.begin(started),
+            super::BankStep::Begun => {
+                self.resize_held.begin(started);
+                self.shrink_step = true;
+            }
             _ => self.resize_held.hold(started),
         }
         Ok(step)

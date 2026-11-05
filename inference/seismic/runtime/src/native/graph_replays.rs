@@ -6,19 +6,21 @@
 //! plan and encoded launches too). A run whose binding a graph of its shape
 //! holds replays it as it is; another binding takes a graph of its shape
 //! that may be updated now ([`RecordedGraph::updates_in_flight`]), updated
-//! first; only where none may is a graph recorded, on Vulkan and Metal at a
-//! shape's first use. CUDA graphs are instantiated as a graph slot is
-//! created, a graph for each run of its launch ([`Replays::instantiated`]),
-//! so serving instantiates none: every run, of any place, slot, class or
-//! request, replays one of them, with no update in steady state and no wait
-//! ever, since CUDA updates only a graph whose launches completed, by its
-//! completion event.
+//! first; only where none may is a graph recorded, at a shape's first use
+//! or once every graph of it is in flight. A CUDA graph is instantiated
+//! over placeholder storage, bound to nothing until its first replay
+//! ([`RecordedGraph::recorded_bound`]), and only once the device's queued
+//! work has drained (`prepare`, [`Replays::record`]): every run, of any
+//! place, slot, class or request, replays one, with no wait ever, since
+//! CUDA updates only a graph whose launches completed, by its completion
+//! event.
 //!
 //! The graphs kept are bounded by the device's graph budget
 //! ([`super::GraphHold`]): what its owners hold, every graph their runs in
 //! flight can need. A submission's own graphs past it break an invariant;
-//! graphs beyond it that no submission needs (an owner's hold dropped) are
-//! released, the least recently replayed first.
+//! graphs beyond it that no submission needs are released, the least
+//! recently replayed first, as a submission records and as a hold shrinks
+//! ([`Replays::fit_to`]).
 
 use crate::api::CallError;
 use seismic_compiler::graph_cost::GraphCensus;
@@ -39,6 +41,13 @@ pub(crate) trait RecordedGraph {
     /// Whether an update runs in queue order behind the graph's launches in
     /// flight, so one graph serves every run of its shape in a submission.
     fn updates_in_flight() -> bool;
+    /// Whether a graph recorded for a run binds that run's parameters as
+    /// recorded (a Vulkan division, a Metal schedule), rather than nothing
+    /// until its first replay binds them (a CUDA graph, instantiated over
+    /// placeholder storage).
+    fn recorded_bound() -> bool {
+        true
+    }
 }
 
 pub(crate) struct Replays<G> {
@@ -113,6 +122,25 @@ struct Replay<G> {
     graphs: Vec<Instance<G>>,
     /// The plans the graphs' kernels belong to, kept loaded while they live.
     _retained: Arc<dyn Any + Send + Sync>,
+    /// The graphs of it kept for each launch in flight ([`Replays::ensure`]).
+    pinned: Option<Pinned>,
+}
+
+/// Graphs of a shape kept whatever the budget: `per_flight` for each of
+/// `flights`, a family's live slots, each a launch in flight. The family's
+/// hold counts them (`LaunchGraphs::held`: a decode launch's graphs for
+/// each launch beside one, and within the union for that one), so a
+/// release never needs them.
+struct Pinned {
+    per_flight: usize,
+    flights: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl<G> Replay<G> {
+    /// The graphs of it no release takes.
+    fn pinned(&self) -> usize {
+        self.pinned.as_ref().map_or(0, |pinned| pinned.per_flight * pinned.flights.load(std::sync::atomic::Ordering::Acquire))
+    }
 }
 
 struct Instance<G> {
@@ -164,26 +192,125 @@ impl<G> Replays<G> {
 impl<G: RecordedGraph> Replays<G> {
     /// Choose, before a submission issues any work, the graph each of
     /// `graphs` replays, in order, and record those it lacks
-    /// (`record(index)`, bound to that run's storage; on CUDA a gap in its
-    /// slots' census, `cuda::instantiate`). A run takes
-    /// a graph of its shape bound to its storage; else one that may be
-    /// updated now and that no other run of the submission takes, the one
-    /// replayed longest ago; else a graph recorded for it. Graphs no run of
-    /// the submission takes are released, the least recently replayed
-    /// first, while the graphs exceed `budget`; the submission's own past it
-    /// break an invariant. Returns each run's graph's identity, which
+    /// (`record(index)`, on Vulkan and Metal bound to that run's storage,
+    /// on CUDA instantiated over placeholder storage, `cuda::record`), once
+    /// `prepare` has run, outside the lock (CUDA's drain of the device's
+    /// queued work), and the choice is made again. A run takes a graph of
+    /// its shape bound to its storage; else one that may be updated now and
+    /// that no other run of the submission takes, the one replayed longest
+    /// ago; else a graph recorded for it. Graphs no run of the submission
+    /// takes are released, the least recently replayed first, while the
+    /// graphs exceed `budget`; the submission's own past it break an
+    /// invariant. Returns each run's graph's identity, which
     /// [`Self::replay`] takes.
     pub(crate) fn record(
         &self,
         graphs: &[Shaped],
         budget: GraphCensus,
         retained: &Arc<dyn Any + Send + Sync>,
+        prepare: impl FnOnce() -> Result<(), CallError>,
         mut record: impl FnMut(usize) -> Result<G, CallError>,
     ) -> Result<Vec<u64>, CallError> {
-        let mut entries = self
-            .entries
-            .lock()
-            .expect("native graph replays lock is never poisoned");
+        let lock = || self.entries.lock().expect("native graph replays lock is never poisoned");
+        let mut entries = lock();
+        let mut taken = Self::choose(&entries, graphs)?;
+        if taken.contains(&None) {
+            drop(entries);
+            prepare()?;
+            entries = lock();
+            taken = Self::choose(&entries, graphs)?;
+        }
+        // The rest record a graph each, which every later run of that
+        // binding takes, and where updates run in queue order every later
+        // run of its shape.
+        for index in 0..graphs.len() {
+            if taken[index].is_some() {
+                continue;
+            }
+            let Shaped { key, bound } = &graphs[index];
+            let graph = record(index)?;
+            let identity = self.keep(&mut entries, key, graph, G::recorded_bound().then(|| bound.clone()), retained);
+            for later in index..graphs.len() {
+                if taken[later].is_none()
+                    && graphs[later].key == *key
+                    && (G::updates_in_flight() || graphs[later].bound == *bound)
+                {
+                    taken[later] = Some(identity);
+                }
+            }
+        }
+        let taken = taken.into_iter().map(|taken| taken.expect("every run takes a graph")).collect::<Vec<_>>();
+        Self::fit(&mut entries, &taken, budget);
+        Ok(taken)
+    }
+
+    /// Keep `per_flight` graphs of shape `key` for each of `flights`, those
+    /// a launch of `per_flight` runs of it takes for each launch in flight,
+    /// recorded ahead of them (`record`, after `prepare`, which runs only
+    /// where one is to be recorded), each bound to nothing until its first
+    /// replay; no release takes them while `flights` stands ([`Pinned`]).
+    /// Graphs beyond `budget` that it does not keep are released, the least
+    /// recently replayed first; its own past it break an invariant.
+    pub(crate) fn ensure(
+        &self,
+        key: &[u64],
+        per_flight: usize,
+        flights: &Arc<std::sync::atomic::AtomicUsize>,
+        budget: GraphCensus,
+        retained: &Arc<dyn Any + Send + Sync>,
+        prepare: impl FnOnce() -> Result<(), seismic_compiler::errors::ExecutionError>,
+        mut record: impl FnMut() -> Result<G, seismic_compiler::errors::ExecutionError>,
+    ) -> Result<(), seismic_compiler::errors::ExecutionError> {
+        let lock = || self.entries.lock().expect("native graph replays lock is never poisoned");
+        let kept = |entries: &ReplayEntries<G>| entries.graphs.get(key).map_or(0, |replay| replay.graphs.len());
+        let count = per_flight * flights.load(std::sync::atomic::Ordering::Acquire);
+        let mut entries = lock();
+        if kept(&entries) < count {
+            drop(entries);
+            prepare()?;
+            entries = lock();
+        }
+        for _ in kept(&entries)..count {
+            let graph = record()?;
+            self.keep(&mut entries, key, graph, None, retained);
+        }
+        if let Some(replay) = entries.graphs.get_mut(key) {
+            replay.pinned = Some(Pinned { per_flight, flights: flights.clone() });
+        }
+        let own = entries.graphs.get(key).map(|replay| replay.graphs.iter().map(|instance| instance.identity).collect::<Vec<_>>()).unwrap_or_default();
+        Self::fit(&mut entries, &own, budget);
+        Ok(())
+    }
+
+    /// Keep `graph`, just recorded, of shape `key`, binding `bound` (none
+    /// until its first replay binds it): counted recorded, and the most
+    /// recently used, so it is released after every graph kept before it.
+    /// Returns its identity.
+    fn keep(
+        &self,
+        entries: &mut ReplayEntries<G>,
+        key: &[u64],
+        graph: G,
+        bound: Option<Vec<u64>>,
+        retained: &Arc<dyn Any + Send + Sync>,
+    ) -> u64 {
+        self.count_recorded(key);
+        let identity = entries.next;
+        entries.next += 1;
+        entries.clock += 1;
+        let used = entries.clock;
+        entries
+            .graphs
+            .entry(key.to_vec())
+            .or_insert_with(|| Replay { graphs: Vec::new(), _retained: retained.clone(), pinned: None })
+            .graphs
+            .push(Instance { identity, graph, bound, used });
+        identity
+    }
+
+    /// The graph each of `graphs` takes of those kept ([`Self::record`]),
+    /// none where it would record one.
+    fn choose(entries: &ReplayEntries<G>, graphs: &[Shaped]) -> Result<Vec<Option<u64>>, CallError> {
         let mut taken: Vec<Option<u64>> = vec![None; graphs.len()];
         // A run whose binding a graph holds takes it, every run of that
         // binding alike.
@@ -226,88 +353,16 @@ impl<G: RecordedGraph> Replays<G> {
                 }
             }
         }
-        // The rest record a graph each, bound to their storage, which every
-        // later run of that binding takes, and where updates run in queue
-        // order every later run of its shape.
-        for index in 0..graphs.len() {
-            if taken[index].is_some() {
-                continue;
-            }
-            let Shaped { key, bound } = &graphs[index];
-            let graph = record(index)?;
-            self.count_recorded(key);
-            let identity = entries.next;
-            entries.next += 1;
-            let used = entries.clock;
-            entries
-                .graphs
-                .entry(key.clone())
-                .or_insert_with(|| Replay { graphs: Vec::new(), _retained: retained.clone() })
-                .graphs
-                .push(Instance { identity, graph, bound: Some(bound.clone()), used });
-            for later in index..graphs.len() {
-                if taken[later].is_none()
-                    && graphs[later].key == *key
-                    && (G::updates_in_flight() || graphs[later].bound == *bound)
-                {
-                    taken[later] = Some(identity);
-                }
-            }
-        }
-        let taken = taken.into_iter().map(|taken| taken.expect("every run takes a graph")).collect::<Vec<_>>();
-        Self::fit(&mut entries, &taken, budget);
         Ok(taken)
     }
 
-    /// Keep `graph`, of shape `key`, bound to nothing yet: a graph a slot
-    /// instantiates as it is created (`cuda::instantiate`), which its runs'
-    /// first replays update, kept until the slot releases it
-    /// ([`Self::release`]; `super::SlotGraphs`). Returns its identity.
-    pub(crate) fn instantiated(&self, key: Vec<u64>, graph: G, budget: GraphCensus, retained: &Arc<dyn Any + Send + Sync>) -> u64 {
-        let mut entries = self
-            .entries
-            .lock()
-            .expect("native graph replays lock is never poisoned");
-        self.count_recorded(&key);
-        let identity = entries.next;
-        entries.next += 1;
-        // The most recently used: released after every older graph.
-        entries.clock += 1;
-        let used = entries.clock;
-        entries
-            .graphs
-            .entry(key)
-            .or_insert_with(|| Replay { graphs: Vec::new(), _retained: retained.clone() })
-            .graphs
-            .push(Instance { identity, graph, bound: None, used });
-        Self::fit(&mut entries, &[identity], budget);
-        identity
-    }
-
-    /// Release the graphs `owned`, each its shape's key and identity: those
-    /// a slot instantiated, as it drops. A run of a live slot replays any
-    /// graph of its shape, so every live slot's graphs stay kept, whichever
-    /// were replayed last.
-    pub(crate) fn release(&self, owned: &[(Vec<u64>, u64)]) {
+    /// Release graphs while they exceed `budget`, the least recently
+    /// replayed first: as a hold of it shrinks, so the graphs never hold
+    /// more than their owners do.
+    pub(crate) fn fit_to(&self, budget: GraphCensus) {
         let released = {
-            let mut entries = self
-                .entries
-                .lock()
-                .expect("native graph replays lock is never poisoned");
-            let (mut graphs, mut shapes) = (Vec::new(), Vec::new());
-            for (key, identity) in owned {
-                let replay = entries.graphs.get_mut(key).expect("a slot's graphs are kept until it releases them");
-                let at = replay
-                    .graphs
-                    .iter()
-                    .position(|instance| instance.identity == *identity)
-                    .expect("a slot's graphs are kept until it releases them");
-                graphs.push(replay.graphs.swap_remove(at));
-                if replay.graphs.is_empty() {
-                    shapes.extend(entries.graphs.remove(key));
-                }
-            }
-            (graphs, shapes)
+            let mut entries = self.entries.lock().expect("native graph replays lock is never poisoned");
+            Self::release_beyond(&mut entries, &[], budget)
         };
         // Dropped after the lock, as what they keep may drop holds.
         drop(released);
@@ -404,6 +459,18 @@ impl<G: RecordedGraph> Replays<G> {
     /// holds every graph its owners' runs in flight can need, so the submission's
     /// own past it break an invariant.
     fn fit(entries: &mut ReplayEntries<G>, taken: &[u64], budget: GraphCensus) {
+        let (released, held) = Self::release_beyond(entries, taken, budget);
+        assert!(
+            held.within(budget),
+            "a submission's graphs, {held:?}, exceed every graph its owners hold, {budget:?}"
+        );
+        drop(released);
+    }
+
+    /// Take out graphs no run of a submission takes (`taken`), the least
+    /// recently replayed first, while the graphs exceed `budget`; returns
+    /// them, to be dropped, and the census of those kept.
+    fn release_beyond(entries: &mut ReplayEntries<G>, taken: &[u64], budget: GraphCensus) -> (Vec<Instance<G>>, GraphCensus) {
         let census = |entries: &ReplayEntries<G>| {
             entries
                 .graphs
@@ -413,37 +480,35 @@ impl<G: RecordedGraph> Replays<G> {
                 .expect("a device's recorded graphs' census fits u64")
         };
         let mut held = census(entries);
-        // Graphs a slot instantiated are its own until it releases them
-        // (`Self::release`), within the census its hold adds to the budget:
-        // none is released here.
-        assert!(
-            G::updates_in_flight() || held.within(budget),
-            "the instantiated graphs, {held:?}, exceed what their slots hold, {budget:?}"
-        );
-        if !held.within(budget) {
-            let mut others = entries
-                .graphs
-                .iter()
-                .flat_map(|(key, replay)| replay.graphs.iter().map(move |instance| (instance.used, instance.identity, key.clone())))
-                .filter(|(_, identity, _)| !taken.contains(identity))
-                .collect::<Vec<_>>();
-            others.sort_unstable();
-            for (_, identity, key) in others {
-                let replay = entries.graphs.get_mut(&key).expect("an other graph's shape is recorded");
-                replay.graphs.retain(|instance| instance.identity != identity);
-                if replay.graphs.is_empty() {
-                    entries.graphs.remove(&key);
-                }
-                held = census(entries);
-                if held.within(budget) {
-                    break;
-                }
-            }
-            assert!(
-                held.within(budget),
-                "a submission's graphs, {held:?}, exceed every graph its owners hold, {budget:?}"
-            );
+        let mut released = Vec::new();
+        if held.within(budget) {
+            return (released, held);
         }
+        let mut others = entries
+            .graphs
+            .iter()
+            .flat_map(|(key, replay)| replay.graphs.iter().map(move |instance| (instance.used, instance.identity, key.clone())))
+            .filter(|(_, identity, _)| !taken.contains(identity))
+            .collect::<Vec<_>>();
+        others.sort_unstable();
+        for (_, identity, key) in others {
+            let replay = entries.graphs.get_mut(&key).expect("an other graph's shape is recorded");
+            // A shape's graphs kept for its launches in flight stay.
+            if replay.graphs.len() <= replay.pinned() {
+                continue;
+            }
+            let at = replay.graphs.iter().position(|instance| instance.identity == identity).expect("an other graph is kept");
+            let instance = replay.graphs.swap_remove(at);
+            held = held.minus(instance.graph.census()).expect("a kept graph is part of the census");
+            released.push(instance);
+            if replay.graphs.is_empty() {
+                entries.graphs.remove(&key);
+            }
+            if held.within(budget) {
+                break;
+            }
+        }
+        (released, held)
     }
 }
 
@@ -493,7 +558,7 @@ mod tests {
         made: impl Fn(&Graph<QUEUED>),
     ) -> Vec<Vec<u64>> {
         let taken = replays
-            .record(runs, budget, &retained(), |index| {
+            .record(runs, budget, &retained(), || Ok(()), |index| {
                 let mut recorded = graph(4);
                 recorded.1.clone_from(&runs[index].bound);
                 made(&recorded);
@@ -524,6 +589,29 @@ mod tests {
         assert_eq!(kept, vec![vec![1], vec![2]]);
     }
 
+    /// Graphs kept for launches in flight (`Replays::ensure`) stay as other
+    /// submissions release graphs beyond the budget, the oldest replayed
+    /// first; once their launches end, they are released like any other.
+    #[test]
+    fn graphs_kept_for_launches_in_flight_stay_beyond_the_budget() {
+        let replays = Replays::<Graph<false>>::default();
+        let budget = GraphCensus { graphs: 2, launches: 8, arguments: 128, largest: 16 };
+        let flights = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        replays.ensure(&[0], 1, &flights, budget, &retained(), || Ok(()), || Ok(graph(4))).unwrap();
+        for key in 1..4 {
+            submit(&replays, &[shaped(key, 0)], budget, |_| ());
+        }
+        let kept = |replays: &Replays<Graph<false>>| {
+            let mut kept = replays.entries.lock().unwrap().graphs.keys().cloned().collect::<Vec<_>>();
+            kept.sort();
+            kept
+        };
+        assert_eq!(kept(&replays), vec![vec![0], vec![3]], "the kept graph stays, the oldest of the rest go");
+        flights.store(0, std::sync::atomic::Ordering::Release);
+        submit(&replays, &[shaped(4, 0), shaped(5, 0)], budget, |_| ());
+        assert_eq!(kept(&replays), vec![vec![4], vec![5]], "with no launch in flight it is released");
+    }
+
     /// The budget holds every graph its owners' runs in flight can need, so
     /// a submission whose own graphs exceed it breaks an invariant.
     #[test]
@@ -532,31 +620,6 @@ mod tests {
         let replays = Replays::<Graph<true>>::default();
         let budget = GraphCensus { graphs: 2, launches: 8, arguments: 128, largest: 16 };
         submit(&replays, &[shaped(0, 0), shaped(1, 0), shaped(2, 0)], budget, |_| ());
-    }
-
-    /// Where graphs are instantiated with their slots (CUDA), a slot's
-    /// graphs are its own until it releases them: none is released to fit
-    /// the budget, however long ago it was replayed, and graphs beyond what
-    /// the slots hold break an invariant.
-    #[test]
-    fn instantiated_graphs_are_kept_until_their_slot_releases_them() {
-        let replays = Replays::<Graph<false>>::default();
-        let budget = GraphCensus { graphs: 2, launches: 8, arguments: 128, largest: 16 };
-        let first = replays.instantiated(vec![0], graph(4), budget, &retained());
-        let second = replays.instantiated(vec![1], graph(4), budget, &retained());
-        replays.release(&[(vec![0], first)]);
-        let third = replays.instantiated(vec![2], graph(4), budget, &retained());
-        let mut kept = replays.entries.lock().unwrap().graphs.keys().cloned().collect::<Vec<_>>();
-        kept.sort();
-        assert_eq!(kept, vec![vec![1], vec![2]]);
-        replays.release(&[(vec![1], second), (vec![2], third)]);
-        assert!(replays.entries.lock().unwrap().graphs.is_empty());
-        let beyond = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            for key in 0..3 {
-                replays.instantiated(vec![key], graph(4), budget, &retained());
-            }
-        }));
-        assert!(beyond.is_err(), "graphs beyond what their slots hold break an invariant");
     }
 
     const PLACES: u64 = 7;
@@ -617,26 +680,24 @@ mod tests {
         assert_eq!(replays.counts(), GraphReplays { recorded: 2, updated: 1 });
     }
 
-    /// Graphs a slot instantiated as it was created, bound to nothing yet,
-    /// serve a chain's runs in flight together: each run takes one and
-    /// updates it, and serving records none.
+    /// A run that lacks a graph has the device prepared for its recording
+    /// first (CUDA's drain), once a submission, and only then: a run whose
+    /// graph is kept, bound or idle, records nothing and prepares nothing.
     #[test]
-    fn instantiated_graphs_serve_a_chain_without_recording() {
+    fn only_a_recording_prepares_the_device() {
         let replays = Replays::<Graph<false>>::default();
-        let budget = GraphCensus { graphs: PLACES, launches: 4 * PLACES, arguments: 64 * PLACES, largest: 16 };
-        for _ in 0..PLACES {
-            replays.instantiated(vec![0], graph(4), budget, &retained());
-        }
-        let chain = (0..PLACES).map(|place| shaped(0, place)).collect::<Vec<_>>();
-        let taken = replays.record(&chain, budget, &retained(), |_| panic!("serving records no graph")).unwrap();
-        let mut distinct = taken.clone();
-        distinct.sort_unstable();
-        distinct.dedup();
-        assert_eq!(distinct.len(), PLACES as usize, "each run in flight takes a graph of its own");
-        for (run, &identity) in chain.iter().zip(&taken) {
-            replays.replay(run, identity, |graph, _| Ok(graph.1.clone_from(&run.bound)), |_| Ok(())).unwrap();
-        }
-        assert_eq!(replays.counts(), GraphReplays { recorded: PLACES, updated: PLACES });
+        let budget = GraphCensus { graphs: 2, launches: 8, arguments: 128, largest: 16 };
+        let prepared = std::cell::Cell::new(0);
+        let submit = |runs: &[Shaped]| {
+            replays
+                .record(runs, budget, &retained(), || Ok(prepared.set(prepared.get() + 1)), |_| Ok(graph(4)))
+                .unwrap()
+        };
+        submit(&[shaped(0, 1), shaped(1, 1)]);
+        assert_eq!(prepared.get(), 1, "one preparation records both");
+        submit(&[shaped(0, 1), shaped(1, 2)]);
+        assert_eq!(prepared.get(), 1, "a kept graph, bound or idle, prepares nothing");
+        assert_eq!(replays.counts().recorded, 2);
     }
 
     /// An update whose queued work never ran (its submission failed) leaves
@@ -648,7 +709,7 @@ mod tests {
         let budget = GraphCensus { graphs: 1, launches: 4, arguments: 64, largest: 16 };
         let (first, second) = (shaped(0, 1), shaped(0, 2));
         submit(&replays, std::slice::from_ref(&first), budget, |_| ());
-        let taken = replays.record(std::slice::from_ref(&second), budget, &retained(), |_| unreachable!()).unwrap();
+        let taken = replays.record(std::slice::from_ref(&second), budget, &retained(), || unreachable!(), |_| unreachable!()).unwrap();
         replays.replay(&second, taken[0], |graph, _| Ok(graph.1.clone_from(&second.bound)), |_| Ok(())).unwrap();
         replays.unbind(std::slice::from_ref(&second), |graph| graph.1.clear());
         let updates = std::cell::Cell::new(0);

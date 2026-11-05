@@ -194,7 +194,7 @@ pub mod native_cpu {
 }
 
 /// What recorded graphs are made of and what a device's hold for it.
-pub use seismic_compiler::graph_cost::{GraphBytes, GraphCensus, GraphCost};
+pub use seismic_compiler::graph_cost::{GraphBytes, GraphCensus, GraphCost, LaunchGraphs};
 pub use seismic_lang::expr::{BigInt, BigUint};
 pub use seismic_lang::ids::StableEntryId;
 pub use seismic_lang::reference_math::conversion::exact_f64;
@@ -392,7 +392,7 @@ impl Device {
     }
     /// What the graphs the device keeps may be made of: what its graph
     /// families' and plans' live slots hold
-    /// ([`NativeGraphFamily::slot_graphs`]).
+    /// ([`NativeGraphFamily::graphs`]).
     pub fn graph_budget(&self) -> GraphCensus {
         self.inner.graph_budget()
     }
@@ -3739,10 +3739,9 @@ impl NativeGraphFamily {
         Self::with_launches(plans, &launches)
     }
     /// A family of `plans` whose launches each make the runs of one of
-    /// `launches`, a plan once for each of its runs: its plans of one layout
-    /// share one graph, and a slot holds each layout's graph for each run
-    /// of it the launch making most of them makes
-    /// ([`Self::slot_graphs`]).
+    /// `launches`, a plan once for each of its runs, the first its decode
+    /// launch: its plans of one layout share one graph, recorded as a run
+    /// first needs it, within what its live slots hold ([`Self::graphs`]).
     pub fn with_launches(
         plans: &[NativeGraphPlan],
         launches: &[Vec<NativeGraphPlan>],
@@ -3759,13 +3758,21 @@ impl NativeGraphFamily {
                 inner: Arc::new(inner),
             })
     }
-    /// What one live slot of the family holds of its device's graph
-    /// budget: each layout's graph for each run of it one launch makes.
-    pub fn slot_graphs(&self) -> GraphCensus {
-        self.inner.slot_graphs()
+    /// What its decode and largest launches replay, which its live slots,
+    /// each a launch in flight, hold of its device's graph budget
+    /// ([`LaunchGraphs::held`]).
+    pub fn graphs(&self) -> LaunchGraphs {
+        self.inner.graphs()
     }
-    /// What its graphs are made of: its layouts, what a slot instantiates,
-    /// and what each launch's runs replay.
+    /// Record, ahead of it, every graph its decode launch replays that is
+    /// not kept, once the device's queued work has drained (CUDA's; other
+    /// backends record at a shape's first use, with no wait): a step of it
+    /// then records none, even the first after the bank shrank.
+    pub fn record_decode(&self) -> Result<(), TensorError> {
+        self.inner.record_decode()
+    }
+    /// What its graphs are made of: its layouts and what each launch's runs
+    /// replay.
     pub fn census(&self) -> GraphFamilyCensus {
         self.inner.census()
     }

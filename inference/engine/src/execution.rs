@@ -601,24 +601,24 @@ pub(crate) fn build(
         resources.arena_bytes()
     );
     // What the target's graphs are made of, beside what they cost on this
-    // device: a slot's instantiated graphs, and what each launch class's
-    // runs replay, its smallest (decode) and its largest.
-    let census = target_graphs.family().census();
+    // device: what its decode launch's runs replay, as the family is
+    // charged for it (`LaunchGraphs::decode`), and its largest launch
+    // class's, which the family's live slots hold of its device's graph
+    // budget.
+    let family = target_graphs.family();
+    let census = family.census();
     let graph_cost = opened.device().graph_cost();
     // The family was charged at this cost, so its every census prices.
     let cost = |graphs: seismic::GraphCensus| {
         let bytes = graph_cost.bytes(graphs).expect("a charged family's graphs price at its device's cost");
         bytes.device + bytes.upload
     };
+    let decode = family.graphs().decode;
     // Every plan of a family runs in one of its launches, so it has one.
-    let decode = *census.launches.first().expect("a target family has a launch class");
     let largest = census.launches.iter().copied().max_by_key(|graphs| cost(*graphs)).expect("a target family has a launch class");
     tracing::info!(
-        "target graph census: {} layouts; a slot instantiates {} graphs of {} launches ({} bytes); of {} launch classes, the decode class replays {} graphs of {} launches ({} bytes), the largest {} of {} ({} bytes)",
+        "target graph census: {} layouts; of {} launch classes, the decode class replays {} graphs of {} launches ({} bytes charged), the largest {} of {} ({} bytes charged)",
         census.layouts,
-        census.slot.graphs,
-        census.slot.launches,
-        cost(census.slot),
         census.launches.len(),
         decode.graphs,
         decode.launches,

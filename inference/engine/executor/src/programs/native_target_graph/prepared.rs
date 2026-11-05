@@ -773,7 +773,15 @@ impl PreparedTargetGraphs {
         // (`TargetFamilyCertificate::graphs`), which the assessment charged
         // before any plan was sealed, holds it.
         let family = NativeGraphFamily::with_launches(&plans, &launches).map_err(|error| error.to_string())?;
-        let (sealed, bound) = (family.slot_graphs(), certificate.graphs);
+        let (sealed, bound) = (family.graphs(), certificate.graphs);
+        let bytes = |census| device.graph_cost().bytes(census).map_or(0, |bytes| bytes.device + bytes.upload);
+        tracing::info!(
+            "target graphs: a decode launch holds {} bytes, the union of every launch's {} bytes; the plan bounded them at {} and {}",
+            bytes(sealed.decode),
+            bytes(sealed.union),
+            bytes(bound.decode),
+            bytes(bound.union),
+        );
         if !sealed.within(bound) {
             return Err(format!(
                 "the sealed target graphs, {sealed:?}, exceed the plan's bound on them, {bound:?}"

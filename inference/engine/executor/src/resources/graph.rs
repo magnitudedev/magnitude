@@ -50,8 +50,8 @@ pub(crate) enum Outputs {
 impl NativeGraphPool {
     /// The startup slots of `charge`: its activations in `arena`, each with
     /// its upload regions, and its startup output slots. Each activation's
-    /// slot holds the graphs its launches replay
-    /// (`seismic::NativeGraphFamily::slot_graphs`).
+    /// slot is a launch in flight of its family's graph hold
+    /// (`seismic::NativeGraphFamily::graphs`).
     pub(crate) fn new(
         domain: ResourceDomainId,
         family: &NativeGraphFamily,
@@ -95,12 +95,15 @@ impl NativeGraphPool {
     }
 
     /// What the activations up to `slots`' count beyond those allocated
-    /// add to the device's graph budget: each slot's graphs
-    /// (`seismic::NativeGraphFamily::slot_graphs`), which it makes as it
-    /// is allocated ([`Self::grow`]).
+    /// add to the device's graph budget: the family's hold at the larger
+    /// count beyond its hold at those allocated, each a launch in flight
+    /// (`seismic::LaunchGraphs::held`), which grows as they are allocated
+    /// ([`Self::grow`]).
     pub(crate) fn hold_graphs(&self, slots: GraphSlots) -> Option<seismic::GraphCensus> {
-        let more = slots.activations.saturating_sub(self.allocated.activations);
-        self.family.slot_graphs().times(u64::try_from(more).ok()?)
+        let graphs = self.family.graphs();
+        let held = u64::try_from(self.allocated.activations).ok()?;
+        let grown = u64::try_from(slots.activations.max(self.allocated.activations)).ok()?;
+        graphs.held(grown)?.minus(graphs.held(held)?)
     }
 
     /// Allocate activations and output slots up to `slots`' counts, held
@@ -108,6 +111,7 @@ impl NativeGraphPool {
     /// [`Self::hold_bytes`] across this call. On a failure what was
     /// allocated idles until released.
     pub(crate) fn grow(&mut self, slots: GraphSlots) -> Result<(), super::AllocationError> {
+        let grows = self.allocated.activations < slots.activations;
         while self.allocated.activations < slots.activations {
             let slot = self
                 .family
@@ -115,6 +119,12 @@ impl NativeGraphPool {
                 .map_err(super::AllocationError::Workflow)?;
             self.workspace.borrow_mut().push(slot);
             self.allocated.activations += 1;
+        }
+        // Each launch in flight's decode graphs, recorded as the slots are
+        // made, at load and as a class grows, while memory serves them: no
+        // later step records them, a bank shrink's under pressure included.
+        if grows {
+            self.family.record_decode().map_err(super::AllocationError::Tensor)?;
         }
         while self.allocated.output < slots.output {
             self.grow_output().map_err(super::AllocationError::Tensor)?;
@@ -303,10 +313,16 @@ impl VisionGraphPool {
     }
 
     /// What the next activation of the class of `patch_rows` adds to the
-    /// device's graph budget: what its slot holds
-    /// (`seismic::NativeGraphFamily::slot_graphs`).
+    /// device's graph budget: the class family's hold at one activation more
+    /// beyond its hold now (`seismic::LaunchGraphs::held`).
     pub fn activation_graphs(&self, patch_rows: u64) -> Result<seismic::GraphCensus, CapacityError> {
-        Ok(self.class(patch_rows)?.family.slot_graphs())
+        let class = self.class(patch_rows)?;
+        let graphs = class.family.graphs();
+        let held = class.activations as u64;
+        Ok(graphs
+            .held(held + 1)
+            .and_then(|grown| grown.minus(graphs.held(held)?))
+            .expect("a vision class's graph census fits u64"))
     }
 
     /// The charge of one output slot of the class of `patch_rows`.

@@ -408,9 +408,9 @@ pub struct ResourceBytes {
 /// slots beyond `output_slots` are elastic run-time claims of
 /// `output_bytes` each. `workspace_bytes` is not part of `committed_bytes`:
 /// every family binds the device's one workspace arena, which the plan
-/// charges once at the largest family's workspace. Each activation holds
-/// `graphs` of the device's graph budget, what one slot of the family holds
-/// (`seismic::NativeGraphFamily::slot_graphs`).
+/// charges once at the largest family's workspace. Its activations, each a
+/// launch in flight, hold what `graphs` holds at their count of the
+/// device's graph budget (`seismic::LaunchGraphs::held`).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeGraphCharge {
     pub workspace_bytes: u64,
@@ -419,18 +419,18 @@ pub struct NativeGraphCharge {
     pub activations: usize,
     pub output_slots: usize,
     pub committed_bytes: u64,
-    pub graphs: seismic::GraphCensus,
+    pub graphs: seismic::LaunchGraphs,
 }
 
 /// A family's per-slot storage: scratch and output arena bytes, the bytes
-/// of each upload region of an activation, and what one slot's graphs
+/// of each upload region of an activation, and what its launches' graphs
 /// hold.
 #[derive(Clone, Debug)]
 struct FamilyFootprint {
     workspace_bytes: u64,
     output_bytes: u64,
     upload_regions: Vec<u64>,
-    graphs: seismic::GraphCensus,
+    graphs: seismic::LaunchGraphs,
 }
 
 /// The upload regions of a family whose lease runs one graph at a time to
@@ -446,7 +446,7 @@ impl FamilyFootprint {
             workspace_bytes: family.workspace_bytes(),
             output_bytes: family.output_bytes(),
             upload_regions: serial_upload_regions(family.upload_bytes()),
-            graphs: family.slot_graphs(),
+            graphs: family.graphs(),
         }
     }
 }
@@ -460,15 +460,16 @@ impl NativeGraphCharge {
         storage: seismic::NativeGraphStorageBytes,
         slots: GraphSlots,
     ) -> Result<Self, String> {
-        Self::from_checked(storage, serial_upload_regions(storage.upload), slots, storage.recorded)
+        let graphs = seismic::LaunchGraphs { decode: storage.recorded, union: storage.recorded };
+        Self::from_checked(storage, serial_upload_regions(storage.upload), slots, graphs)
     }
 
-    /// The charge of a checked family a slot of which holds `graphs`.
+    /// The charge of a checked family whose launches' graphs hold `graphs`.
     pub(crate) fn from_checked(
         storage: seismic::NativeGraphStorageBytes,
         upload_regions: Vec<u64>,
         slots: GraphSlots,
-        graphs: seismic::GraphCensus,
+        graphs: seismic::LaunchGraphs,
     ) -> Result<Self, String> {
         Self::from_footprint(
             FamilyFootprint {
@@ -487,7 +488,7 @@ impl NativeGraphCharge {
                 workspace_bytes: graphs.workspace_bytes(),
                 output_bytes: graphs.output_bytes(),
                 upload_regions: graphs.upload_regions().to_vec(),
-                graphs: graphs.family().slot_graphs(),
+                graphs: graphs.family().graphs(),
             },
             slots,
         )
@@ -531,14 +532,14 @@ impl NativeGraphCharge {
 }
 
 /// What the startup activations of `charges` hold of their device's graph
-/// budget: each activation's slot its family's graphs
-/// (`NativeGraphCharge::graphs`), whatever places or classes it runs,
-/// which all replay those graphs.
+/// budget: each family's graphs at its activations, each a launch in
+/// flight (`NativeGraphCharge::graphs`), whatever places or classes they
+/// run.
 pub(crate) fn startup_graphs(charges: &[&NativeGraphCharge]) -> Result<seismic::GraphCensus, String> {
     charges.iter().try_fold(seismic::GraphCensus::default(), |census, charge| {
         u64::try_from(charge.activations)
             .ok()
-            .and_then(|activations| charge.graphs.times(activations))
+            .and_then(|activations| charge.graphs.held(activations))
             .and_then(|held| census.plus(held))
             .ok_or_else(|| "the startup graphs' census overflows".to_owned())
     })

@@ -37,7 +37,7 @@ use crate::{
 };
 use magnitude_family_contracts::{Decoder, WeightKind};
 use seismic::{
-    BackendName, GraphCensus, HostHeap, NativeGraphClassSlice, NativeGraphLayout,
+    BackendName, GraphCensus, HostHeap, LaunchGraphs, NativeGraphClassSlice, NativeGraphLayout,
     NativeGraphMetadata,
 };
 use std::collections::BTreeMap;
@@ -70,7 +70,7 @@ pub(crate) fn checked_target_family(
     state: &StateResourcePlan,
     plan: &TargetProgramPlan,
     limits: ResourceLimits,
-) -> Result<(CheckedGraphResources, PlannedSealedGraphs, Vec<u64>, GraphCensus), GraphError> {
+) -> Result<(CheckedGraphResources, PlannedSealedGraphs, Vec<u64>, LaunchGraphs), GraphError> {
     certify_target_family(backend, load, geometry, state, plan, limits).map(|certificate| {
         (certificate.resources, certificate.sealed, certificate.upload_regions, certificate.graphs)
     })
@@ -81,10 +81,10 @@ pub(super) struct TargetFamilyCertificate {
     /// How each block is served (`block_served`).
     pub(super) served: Vec<BlockServed>,
     pub(super) resources: CheckedGraphResources,
-    /// What a slot of the family holds of its device's graph budget
-    /// (`seismic::NativeGraphFamily::slot_graphs`), bounded from the layouts
-    /// the plans seal into.
-    pub(super) graphs: GraphCensus,
+    /// What the family's decode and largest launches replay
+    /// (`seismic::NativeGraphFamily::graphs`), bounded from the layouts the
+    /// plans seal into.
+    pub(super) graphs: LaunchGraphs,
     /// The graphs a load seals into these layouts, and their host heap.
     pub(super) sealed: PlannedSealedGraphs,
     /// The upload regions of a workspace slot: one for each graph run that
@@ -443,20 +443,20 @@ pub(super) fn certify_target_family(
             )
         }))
         .collect();
-    // What a slot of the family holds of its device's graph budget, before
-    // any plan is sealed (`seismic::NativeGraphFamily::slot_graphs`): a
-    // bound the sealed family keeps within, which a load charges before it
-    // seals. Every plan of a layout shares one graph, whatever its class
-    // (on CUDA a node for each launch a plan of it makes, which a layout's
-    // every declared launch bounds; elsewhere a run's own, which its
-    // layout's recording bounds), so a slot holds, of each layout, a graph
-    // for each run of it the launch making most of them makes: both
-    // entries' and the per-layer entry's of its rows, each block's runs of
-    // its class (each sharing an earlier block's plans its own run), and,
-    // where the class splits at a block (`RunStage::Front`), every graph the
-    // block runs once a group (`Stage::Once`, its fill and its passes): a
-    // class served whole, as decode is, runs none. A block's layouts are its
-    // shape's first block's.
+    // What the family's launches replay, before any plan is sealed
+    // (`seismic::NativeGraphFamily::graphs`): a bound the sealed family
+    // keeps within, which a load charges before it seals. Every plan of a
+    // layout shares one graph, whatever its class (on CUDA a node for each
+    // launch a plan of it makes, which a layout's every declared launch
+    // bounds; elsewhere a run's own, which its layout's recording bounds), so
+    // a launch replays, of each layout, a graph for each run of it it
+    // makes: both entries' and the per-layer entry's of its rows, each
+    // block's runs of its class (each sharing an earlier block's plans its
+    // own run), and, where the class splits at a block (`RunStage::Front`),
+    // every graph the block runs once a group (`Stage::Once`, its fill and
+    // its passes): a class served whole, as decode is, runs none. A block's
+    // layouts are its shape's first block's. The first launch class, the
+    // fewest rows, is the decode launch.
     let overflow = || GraphError::from("a target family's graph census overflows");
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     enum Graphed {
@@ -470,7 +470,11 @@ pub(super) fn certify_target_family(
         .copied()
         .chain(enumeration.sharing.iter().map(|&(index, class, _)| (index, class)))
         .collect::<Vec<_>>();
+    // Each launch's runs of each layout, the first launch class's (the
+    // fewest rows, decode's) its decode, and of each layout the most any
+    // launch makes its union.
     let mut most = BTreeMap::<Graphed, u64>::new();
+    let mut decode = None;
     for &class in &enumeration.launch_classes {
         let mut runs = BTreeMap::<Graphed, u64>::new();
         for &source in entries.keys() {
@@ -485,22 +489,30 @@ pub(super) fn certify_target_family(
             }
             *runs.entry(Graphed::Block(outline.first_of_shape(index), class_topology(staged))).or_default() += 1;
         }
-        for (graphed, count) in runs {
+        for (&graphed, &count) in &runs {
             let most = most.entry(graphed).or_default();
             *most = (*most).max(count);
         }
+        decode.get_or_insert(runs);
     }
-    let mut graphs = GraphCensus::default();
-    for (graphed, count) in most {
-        let layout = match graphed {
-            Graphed::Entry(source) => &entries[&source],
-            Graphed::PerLayer => per_layer.as_ref().ok_or("a per-layer run has no layout")?,
-            Graphed::Block(index, topology) => {
-                &blocks[index].get(&topology).ok_or("a block class has no certified layout")?.layout
-            }
-        };
-        graphs = graphs.plus(layout.storage_bytes().recorded.times(count).ok_or_else(overflow)?).ok_or_else(overflow)?;
-    }
+    let census = |runs: &BTreeMap<Graphed, u64>| -> Result<GraphCensus, GraphError> {
+        let mut census = GraphCensus::default();
+        for (&graphed, &count) in runs {
+            let layout = match graphed {
+                Graphed::Entry(source) => &entries[&source],
+                Graphed::PerLayer => per_layer.as_ref().ok_or("a per-layer run has no layout")?,
+                Graphed::Block(index, topology) => {
+                    &blocks[index].get(&topology).ok_or("a block class has no certified layout")?.layout
+                }
+            };
+            census = census.plus(layout.storage_bytes().recorded.times(count).ok_or_else(overflow)?).ok_or_else(overflow)?;
+        }
+        Ok(census)
+    };
+    let graphs = LaunchGraphs {
+        decode: census(&decode.ok_or("a target family has no launch class")?)?,
+        union: census(&most)?,
+    };
     Ok(TargetFamilyCertificate {
         outline,
         served,

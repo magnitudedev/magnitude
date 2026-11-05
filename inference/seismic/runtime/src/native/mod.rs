@@ -74,7 +74,7 @@ pub use graph_replays::GraphReplays;
 pub use point::{GraphPending, GraphPoint, GraphTiming, KernelPoint, Point, PointPending};
 pub use spans::NativeSpans;
 use seismic_compiler::errors::{ExecutionError, InvocationError, PreparationError};
-use seismic_compiler::graph_cost::GraphCensus;
+use seismic_compiler::graph_cost::{GraphCensus, LaunchGraphs};
 use seismic_compiler::prepared::{
     validate_invocation, ArgumentValue, DeviceIdentity, InvocationContract,
 };
@@ -263,6 +263,16 @@ impl NativeState {
         self.graph_budget.lock().expect("graph budget lock is never poisoned").census
     }
 
+    /// Release graphs of every kind beyond `budget`, the device's graph
+    /// budget as a hold of it shrank ([`graph_replays::Replays::fit_to`]).
+    fn fit_graphs(&self, budget: GraphCensus) {
+        self.cuda_replays.fit_to(budget);
+        #[cfg(not(target_os = "macos"))]
+        self.vulkan_replays.fit_to(budget);
+        #[cfg(target_os = "macos")]
+        self.metal_schedules.fit_to(budget);
+    }
+
     /// Drop every recorded graph, of every kind, while no hold of the graph
     /// budget is live, checked under each kind's lock.
     fn clear_unheld_graphs(&self) {
@@ -296,74 +306,154 @@ impl GraphHold {
     }
 }
 
-/// The CUDA graph of each layout a slot runs: per layout, a word per call
-/// of its plans, a bit set for each launch of the call any plan of the
-/// layout the slot runs makes (`cuda::launch_structure`'s words, or'ed),
-/// each a node of the layout's graph. One graph serves every class, block,
-/// place and encoding sealed into the layout, each run enabling the nodes
-/// of the launches it makes (`cuda::issue`), so a slot holds graphs by
-/// layout, never by class. Empty words on every other backend, whose graphs
-/// are their plans'.
-#[derive(Debug)]
+impl GraphHold {
+    /// Hold `census` instead: a growth reserved whole, or refused with
+    /// nothing changed; a shrink releases the graphs beyond the smaller
+    /// budget, the least recently replayed first, so the graphs never hold
+    /// more than their owners do.
+    fn resize(&mut self, census: GraphCensus) -> Result<(), ExecutionError> {
+        let shrinks = census.within(self.census);
+        let budget = {
+            let mut budget = self.device.native.graph_budget.lock().expect("graph budget lock is never poisoned");
+            let resized = budget
+                .census
+                .minus(self.census)
+                .and_then(|rest| rest.plus(census))
+                .expect("a hold's census is part of its device's budget");
+            budget.charge(&self.device, resized)?;
+            budget.census
+        };
+        self.census = census;
+        if shrinks {
+            self.device.native.fit_graphs(budget);
+        }
+        Ok(())
+    }
+}
+
+/// The CUDA graph of one layout a family runs: a word per call of its
+/// plans, a bit set for each launch of the call any plan of the layout
+/// makes (`cuda::launch_structure`'s words, or'ed), each a node of the
+/// layout's graph, and those plans, over which a run that finds no graph
+/// of its shape records one (`graph::record_layout`). One graph serves
+/// every class, block, place and encoding sealed into the layout, each run
+/// enabling the nodes of the launches it makes (`cuda::issue`), so a family
+/// holds graphs by layout, never by class. Empty words on every other
+/// backend, whose graphs are their plans'.
+pub(crate) struct LayoutGraph {
+    pub(crate) form: Arc<[u64]>,
+    pub(crate) plans: Vec<Arc<graph::NativeGraphPlan>>,
+}
+
+/// A family's [`LayoutGraph`]s, by layout.
 pub(crate) struct LayoutForms {
-    forms: std::collections::HashMap<u64, Arc<[u64]>>,
+    forms: std::collections::HashMap<u64, Arc<LayoutGraph>>,
 }
 
 impl LayoutForms {
-    pub(crate) fn new(forms: impl IntoIterator<Item = (u64, Arc<[u64]>)>) -> Self {
-        Self { forms: forms.into_iter().collect() }
+    pub(crate) fn new(forms: impl IntoIterator<Item = (u64, LayoutGraph)>) -> Self {
+        Self { forms: forms.into_iter().map(|(layout, graph)| (layout, Arc::new(graph))).collect() }
     }
 
-    /// The words of `layout`'s graph.
-    pub(crate) fn of(&self, layout: u64) -> Arc<[u64]> {
+    /// `layout`'s graph.
+    pub(crate) fn of(&self, layout: u64) -> Arc<LayoutGraph> {
         self.forms
             .get(&layout)
             .cloned()
-            .expect("a slot runs only plans of layouts its graphs were made for")
+            .expect("a family runs only plans of layouts its graphs were made for")
     }
 }
 
-/// A slot's share of its device's graph budget: every graph its launch
-/// replays, its own (no other launch in flight takes one), and the form of
-/// each layout's graph its runs replay ([`LayoutForms`]). On CUDA it owns
-/// the graphs it instantiated as it was made, which it releases as it
-/// drops, so a live slot's graphs are kept however long ago they were
-/// replayed. Every run queued from the slot holds it until replayed, so a
-/// submission of the slot's runs always fits
+/// A family's share of its device's graph budget and the layouts its runs
+/// replay ([`LayoutForms`]): what its live slots' launches in flight can
+/// need at once ([`Self::census`]), held from its first live slot to its
+/// last. Graphs are recorded as a run first needs one, never as a slot is
+/// made (`cuda::issue`).
+pub struct FamilyGraphs {
+    device: Arc<DeviceInner>,
+    layouts: LayoutForms,
+    /// What its decode launch replays, which each launch in flight beside
+    /// another may hold, and the union of every launch's, which any one may
+    /// (`LaunchGraphs::held`).
+    launches: LaunchGraphs,
+    /// Its live slots, and the hold of their census, none while no slot
+    /// lives.
+    held: Mutex<(u64, Option<GraphHold>)>,
+    /// Its live slots, as the hold counts them: no more than its census
+    /// holds, read without the hold's lock by a release of graphs
+    /// (`graph_replays::Pinned`), which runs beneath it.
+    flights: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FamilyGraphs {
+    /// `layout`'s graph ([`LayoutForms::of`]).
+    pub(crate) fn layout(&self, layout: u64) -> Arc<LayoutGraph> {
+        self.layouts.of(layout)
+    }
+
+    pub(crate) fn new(device: &Arc<DeviceInner>, layouts: LayoutForms, launches: LaunchGraphs) -> Arc<Self> {
+        Arc::new(Self { device: device.clone(), layouts, launches, held: Mutex::new((0, None)), flights: Arc::default() })
+    }
+
+    /// What its decode launch and the union of its launches replay.
+    pub(crate) fn launches(&self) -> LaunchGraphs {
+        self.launches
+    }
+
+    /// Its live slots, each a launch in flight, as its hold counts them.
+    pub(crate) fn flights(&self) -> &Arc<std::sync::atomic::AtomicUsize> {
+        &self.flights
+    }
+
+    /// What the family's graphs hold at most with `slots` live slots, each
+    /// a launch in flight ([`LaunchGraphs::held`]).
+    fn census(&self, slots: u64) -> GraphCensus {
+        self.launches.held(slots).expect("a family's graph census fits u64")
+    }
+
+    /// A live slot's share: the family's hold grown to one more slot's
+    /// census, or refused, holding nothing more, where the ledger has no
+    /// room for it.
+    pub(crate) fn slot(self: &Arc<Self>) -> Result<Arc<SlotGraphs>, ExecutionError> {
+        let mut held = self.held.lock().expect("family graph hold lock is never poisoned");
+        let census = self.census(held.0 + 1);
+        match &mut held.1 {
+            Some(hold) => hold.resize(census)?,
+            None => held.1 = Some(GraphHold::new(&self.device, census)?),
+        }
+        held.0 += 1;
+        // Counted once the hold covers it.
+        self.flights.store(held.0 as usize, std::sync::atomic::Ordering::Release);
+        Ok(Arc::new(SlotGraphs { family: self.clone() }))
+    }
+}
+
+/// A live slot of a family ([`FamilyGraphs::slot`]), held by every run
+/// queued from it until replayed, so a submission of its runs always fits
 /// ([`graph_replays::Replays::record`]).
 pub struct SlotGraphs {
-    hold: GraphHold,
-    forms: Arc<LayoutForms>,
-    /// The graphs it instantiated, each its shape's key and identity.
-    owned: Vec<(Vec<u64>, u64)>,
+    family: Arc<FamilyGraphs>,
 }
 
 impl SlotGraphs {
-    /// A slot's share of `census` on `device`, its runs' graphs of `forms`,
-    /// holding what `instantiate` instantiates beneath its hold: on a
-    /// failure, the graphs instantiated so far are released.
-    pub(crate) fn new<E: From<ExecutionError>>(
-        device: &Arc<DeviceInner>,
-        census: GraphCensus,
-        forms: Arc<LayoutForms>,
-        instantiate: impl FnOnce(&mut Vec<(Vec<u64>, u64)>) -> Result<(), E>,
-    ) -> Result<Arc<Self>, E> {
-        let mut slot = Self { hold: GraphHold::new(device, census)?, forms, owned: Vec::new() };
-        let made = instantiate(&mut slot.owned);
-        made.map(|()| Arc::new(slot))
-    }
-
-    /// The words of `layout`'s graph ([`LayoutForms::of`]).
-    pub(crate) fn form(&self, layout: u64) -> Arc<[u64]> {
-        self.forms.of(layout)
+    /// `layout`'s graph ([`LayoutForms::of`]).
+    pub(crate) fn layout(&self, layout: u64) -> Arc<LayoutGraph> {
+        self.family.layouts.of(layout)
     }
 }
 
 impl Drop for SlotGraphs {
-    /// Its graphs are released, then its hold of the budget.
+    /// The family's hold shrinks to one slot fewer, and goes with its last.
     fn drop(&mut self) {
-        if !self.owned.is_empty() {
-            self.hold.device.native.cuda_replays.release(&self.owned);
+        let mut held = self.family.held.lock().expect("family graph hold lock is never poisoned");
+        held.0 -= 1;
+        // Uncounted before the hold shrinks and releases graphs beyond it.
+        self.family.flights.store(held.0 as usize, std::sync::atomic::Ordering::Release);
+        let census = self.family.census(held.0);
+        if held.0 == 0 {
+            held.1 = None;
+        } else if let Some(hold) = &mut held.1 {
+            hold.resize(census).expect("a smaller census reserves nothing, so its charge is never refused");
         }
     }
 }
@@ -376,17 +466,19 @@ impl Drop for GraphHold {
     /// records or fits graphs holds its runs' holds throughout, so this
     /// never runs beneath one.
     fn drop(&mut self) {
-        let unheld = {
+        let (unheld, shrunk) = {
             let mut budget = self.device.native.graph_budget.lock().expect("graph budget lock is never poisoned");
             let shrunk = budget.census.minus(self.census).expect("a hold's census is part of its device's budget");
             budget
                 .charge(&self.device, shrunk)
                 .expect("a smaller census reserves nothing, so its charge is never refused");
             budget.holds -= 1;
-            budget.holds == 0
+            (budget.holds == 0, shrunk)
         };
-        if unheld {
-            self.device.native.clear_unheld_graphs();
+        match unheld {
+            true => self.device.native.clear_unheld_graphs(),
+            // The graphs never hold more than the holds left do.
+            false => self.device.native.fit_graphs(shrunk),
         }
     }
 }
@@ -3278,7 +3370,7 @@ fn encode(first: &NativePrepared, work: &Encoding<'_, impl DispatchList>) -> Res
                             // Deriving a schedule is host work alone: it
                             // waits for nothing.
                             let budget = first.public_device.native.graph_budget();
-                            let taken = schedules.record(std::slice::from_ref(&shaped), budget, retained, |_| Ok(derive()))?;
+                            let taken = schedules.record(std::slice::from_ref(&shaped), budget, retained, || Ok(()), |_| Ok(derive()))?;
                             schedules.replay(&shaped, taken[0], |_, _| unreachable!("a schedule binds no parameter"), |schedule| scheduled(schedule))?
                         }
                         None => scheduled(&derive())?,
@@ -3609,7 +3701,7 @@ mod tests {
 /// [`graph_segments`]), where the span marks its graphs hold sit, whether
 /// its plan is launched (`NativeGraphDraft::seal_launched`), and whether
 /// its graph holds its timeline nodes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) struct PlanRun {
     pub(crate) plan: u64,
     pub(crate) layout: u64,
@@ -3622,9 +3714,9 @@ pub(crate) struct PlanRun {
     /// Whether its graph holds the timeline nodes inside it, as nodes of
     /// its own (`NativeGraphPlan::holds_timelines`).
     pub(crate) holds_timelines: bool,
-    /// The words of its layout's graph on its slot ([`LayoutForms`]), a
-    /// word per call of the run.
-    pub(crate) form: Arc<[u64]>,
+    /// Its layout's graph ([`LayoutGraph`]): its words, a word per call of
+    /// the run, and the plans it is recorded from.
+    pub(crate) graph: Arc<LayoutGraph>,
 }
 
 /// The calls of `list` a graph each, every range with the boundary that
@@ -3731,7 +3823,7 @@ impl ReplayKeys<'_> {
     /// call ([`LayoutForms`]).
     pub(super) fn form(&self, calls: &Range<usize>) -> &[u64] {
         let run = self.run(calls);
-        &run.form[calls.start - run.calls.start..calls.end - run.calls.start]
+        &run.graph.form[calls.start - run.calls.start..calls.end - run.calls.start]
     }
 
     /// The marks the graph of `calls` holds, each the call of the list it

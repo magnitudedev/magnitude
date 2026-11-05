@@ -729,6 +729,54 @@ fn a_whole_bank_shrunk_between_decode_steps_scores_as_resident() {
     }
 }
 
+/// A whole bank shrunk between decode steps on CUDA, where graphs are
+/// recorded as a run first needs one: the decode launch's graphs were
+/// recorded as its slots were made (`seismic::NativeGraphFamily::record_decode`),
+/// so a shrink with no memory left to allocate, every ledger of the device
+/// bound to what it charges, begins and completes, and its step records
+/// none.
+#[test]
+#[ignore = "needs a CUDA device: run with --ignored on one"]
+fn a_whole_banks_shrink_step_records_no_graph() {
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let cuda = seismic::BackendName::Cuda;
+    assert!(available(&catalog, cuda), "the test runs on a host with a CUDA device");
+    let test = "whole-bank-shrink-records";
+    let (directory, definition, package) = fixture_with(test, qwen4exp_fixture_definition_of(3, 128), streamed_experts_manifest);
+    let (mut domain, mut bindings, _) = load(&catalog, &definition, &package, cuda, limits(2, false, 1, 1), Banked::Whole);
+    let request = RequestId(1);
+    domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
+    domain.open_state(&mut bindings, request, None).unwrap();
+    let (_, mut bindings) = run(&mut domain, bindings, scored(forward(request, WorkKind::Prefill, &[5, 1], 0, true)), false, cuda);
+    let mut position = 2;
+    let mut decode = |domain: &mut ExecutorDomain, bindings: crate::StateBindings| {
+        let token = (position * 37 % 256) as u32;
+        let (_, next, _) = step(domain, bindings, scored(forward(request, WorkKind::Decode, &[token], position, true)), cuda);
+        position += 1;
+        next
+    };
+    bindings = decode(&mut domain, bindings);
+    let whole = domain.expert_bank_slots();
+    let device = domain.device().clone();
+    let own = device.ledgers().own;
+    for (store, view) in &own {
+        device.bound(seismic::Ledger::Own(*store), Some(view.charged)).unwrap();
+    }
+    let step = domain.shrink_expert_bank_by(&mut bindings, u64::MAX / 4, crate::CompletionWake::new(|| {})).unwrap();
+    assert_eq!(step, crate::BankStep::Begun, "a whole bank shrinks");
+    while domain.advance_expert_bank(crate::CompletionWake::new(|| {})).unwrap().is_none() {}
+    assert!(domain.expert_bank_slots() < whole, "the bank shrank from {whole:?}");
+    for (store, view) in &own {
+        device.bound(seismic::Ledger::Own(*store), view.bound).unwrap();
+    }
+    let before = domain.graph_replays().recorded;
+    bindings = decode(&mut domain, bindings);
+    assert_eq!(domain.graph_replays().recorded, before, "the shrink's step records no graph");
+    drop(bindings);
+    std::fs::remove_dir_all(&directory).expect("the fixture's directory is removed");
+}
+
 /// The last routed layer's expert stacks stored as Q4_0, the rest as
 /// [`streamed_experts_manifest`] stores them: two record forms, so two bank
 /// groups.

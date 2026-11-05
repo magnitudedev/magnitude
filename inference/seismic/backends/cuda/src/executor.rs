@@ -51,6 +51,9 @@ pub struct Device {
     fill: Arc<Stream>,
     blocks: Arc<Blocks>,
     graph_bytes: Arc<AtomicU64>,
+    /// The word a graph's word nodes name as it is recorded, before a
+    /// replay binds its run's own ([`Self::placeholder_word`]).
+    placeholder: Arc<crate::direct::HostWord>,
 }
 
 /// One `cuMemGetInfo` sample.
@@ -94,6 +97,7 @@ impl Device {
                 "a context's driver memory is counted once, at its opening"
             );
         }
+        let placeholder = Arc::new(crate::direct::HostWord::on(&context, &accounts.upload)?);
         Ok(Self {
             context,
             accounts,
@@ -101,6 +105,7 @@ impl Device {
             fill,
             blocks,
             graph_bytes: Arc::new(AtomicU64::new(0)),
+            placeholder,
         })
     }
 
@@ -147,6 +152,13 @@ impl Device {
         self.blocks.unallocated_bytes() + self.graph_bytes.load(Ordering::Relaxed)
     }
 
+    /// The word every graph's word nodes name as it is recorded, held from
+    /// the device's opening so a recording allocates no memory of the
+    /// device's ledger.
+    pub fn placeholder_word(&self) -> &crate::direct::HostWord {
+        &self.placeholder
+    }
+
     /// The device's count of instantiated graphs' driver memory.
     pub(crate) fn graph_bytes(&self) -> &Arc<AtomicU64> {
         &self.graph_bytes
@@ -172,6 +184,13 @@ impl Device {
             NativeStream::Compute => &self.stream,
             NativeStream::Fill => &self.fill,
         }
+    }
+
+    /// Wait until every launch queued so far on the device's native streams
+    /// has completed, sleeping ([`crate::driver::Stream::synchronize`]).
+    pub fn drain(&self) -> Result<(), ExecutionError> {
+        self.stream.synchronize().map_err(submission_error)?;
+        self.fill.synchronize().map_err(submission_error)
     }
 
     /// Whether every launch queued on the device's native streams has
@@ -936,9 +955,10 @@ fn encode_symbol(value: SymbolValue) -> Result<u64, ExecutionError> {
 /// a capacity refusal where the driver is out of memory
 /// (`CUDA_ERROR_OUT_OF_MEMORY`), as every backend reports one, else a
 /// failure.
+/// `CUDA_ERROR_OUT_OF_MEMORY`.
+pub(crate) const OUT_OF_MEMORY: i32 = 2;
+
 pub(crate) fn allocation_error(bytes: u64) -> impl FnOnce(DriverError) -> ExecutionError {
-    /// `CUDA_ERROR_OUT_OF_MEMORY`.
-    const OUT_OF_MEMORY: i32 = 2;
     move |error| {
         if error.is_device_loss() {
             ExecutionError::DeviceLost(error.to_string())
