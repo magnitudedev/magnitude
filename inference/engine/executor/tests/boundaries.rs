@@ -1,10 +1,13 @@
-use std::{path::PathBuf, process::Command};
+use std::process::Command;
 
 #[test]
 fn manifest_keeps_the_executor_below_model_and_product_layers() {
     // Cargo resolves dependency tables, target conditions and renamed packages for us.
     // Model families used only by numerical fixtures do not create a production edge.
-    let output = Command::new(env!("CARGO"))
+    let cargo = std::env::var_os("CARGO").expect("cargo sets CARGO when it runs tests");
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .expect("cargo sets CARGO_MANIFEST_DIR when it runs tests");
+    let output = Command::new(cargo)
         .args([
             "metadata",
             "--format-version",
@@ -13,7 +16,7 @@ fn manifest_keeps_the_executor_below_model_and_product_layers() {
             "--offline",
             "--locked",
         ])
-        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+        .current_dir(manifest_dir)
         .output()
         .expect("read Cargo dependency metadata");
     assert!(

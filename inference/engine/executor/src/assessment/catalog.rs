@@ -57,11 +57,8 @@ const STREAMED: [&str; 2] = ["qwen3.8-flash-next:gguf:q4", "qwen3.8-flash-next:g
 /// Each catalog model's support level (`catalog/models.json`), by catalog
 /// model ID.
 fn support_levels() -> BTreeMap<String, String> {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../catalog/models.json");
-    let catalog: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(path).unwrap_or_else(|error| panic!("{path:?}: {error}")),
-    )
-    .unwrap();
+    let catalog: serde_json::Value =
+        serde_json::from_slice(include_bytes!("../../../../catalog/models.json")).unwrap();
     catalog["models"]
         .as_array()
         .unwrap()
