@@ -139,7 +139,7 @@ impl ModelInstances {
             preparations: preparations.clone(),
             next_instance_id: Arc::new(AtomicU64::new(1)),
         };
-        tokio::spawn(ModelResidency::new(driver).run(inbox));
+        magnitude_service_utils::owner::spawn("model residency", ModelResidency::new(driver).run(inbox));
         Self {
             environment,
             residency: client,
@@ -868,7 +868,7 @@ impl ModelResidencyDriver for EngineResidency {
         let (interrupt, mut interruption) = tokio::sync::watch::channel(interrupt_immediately);
         let control = ReleaseControl::new(interrupt, Arc::clone(&worker));
         let notifier = self.client.notifier();
-        tokio::spawn(async move {
+        magnitude_service_utils::owner::spawn("a worker's release", async move {
             // Shutdown first in every case: the worker ends its open requests with
             // `ModelUnloaded { Shutdown }` (`model_instance_stopped`) before it exits. An
             // interrupted release then kills it after a short bound instead of the graceful one.

@@ -322,7 +322,7 @@ impl ManagedModelDownloads {
             .zip(new_attempts.into_iter())
             .zip(streams)
         {
-            tokio::spawn(self.clone().consume(id, package, stream));
+            magnitude_service_utils::owner::spawn("a download's stream", self.clone().consume(id, package, stream));
             admitted.push(attempt);
         }
         let download = if admitted.is_empty() {

@@ -536,7 +536,7 @@ impl HostDevice {
 
 struct ActiveAssessment {
     id: u64,
-    abort: Option<tokio::task::AbortHandle>,
+    abort: Option<magnitude_service_utils::owner::Owner>,
 }
 
 struct ActiveAssessments {
@@ -567,13 +567,13 @@ impl ActiveAssessments {
         &mut self,
         key: &AssessmentWorkKey,
         id: u64,
-        abort: tokio::task::AbortHandle,
-    ) -> bool {
+        abort: magnitude_service_utils::owner::Owner,
+    ) -> Result<(), magnitude_service_utils::owner::Owner> {
         let Some(entry) = self.entries.get_mut(key).filter(|entry| entry.id == id) else {
-            return false;
+            return Err(abort);
         };
         entry.abort = Some(abort);
-        true
+        Ok(())
     }
 
     fn finish(&mut self, key: &AssessmentWorkKey, id: u64) {
@@ -632,7 +632,7 @@ impl ManagedModelAssessments {
             host,
         });
         let owner = Arc::clone(&service);
-        tokio::spawn(async move { owner.run(measurement).await });
+        magnitude_service_utils::owner::spawn("the assessment pool", async move { owner.run(measurement).await });
         service
     }
 
@@ -800,7 +800,7 @@ impl ManagedModelAssessments {
             let service = Arc::clone(self);
             let task_key = item.key.clone();
             let runner_key = task_key.clone();
-            let handle = tokio::spawn(async move {
+            let abort = magnitude_service_utils::owner::spawn("an assessment attempt", async move {
                 if let Some(outcome) = service.attempt(item).await {
                     service.publish_outcome(outcome);
                 }
@@ -810,10 +810,9 @@ impl ManagedModelAssessments {
                     .expect("assessment owner lock poisoned");
                 active.finish(&runner_key, active_id);
             });
-            let abort = handle.abort_handle();
             let mut active = self.active.lock().expect("assessment owner lock poisoned");
-            if !active.attach(&task_key, active_id, abort) {
-                handle.abort();
+            if let Err(abort) = active.attach(&task_key, active_id, abort) {
+                abort.abort();
             }
         }
     }
@@ -882,7 +881,7 @@ impl ManagedModelAssessments {
                 .collect::<std::collections::BTreeMap<_, _>>()
         };
         let service = Arc::clone(self);
-        tokio::spawn(async move {
+        magnitude_service_utils::owner::spawn("an assessment refinish", async move {
             let stale = magnitude_service_utils::blocking::run({
                 let (service, environment) = (Arc::clone(&service), Arc::clone(&environment));
                 move || {
@@ -953,7 +952,7 @@ impl ManagedModelAssessments {
         measurement: tokio::sync::watch::Receiver<MeasurementStatus>,
     ) {
         let service = Arc::clone(self);
-        tokio::spawn(async move {
+        magnitude_service_utils::owner::spawn("an assessment refinish", async move {
             let outcomes = futures_util::future::join_all(
                 refinished
                     .values()

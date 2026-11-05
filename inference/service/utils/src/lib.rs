@@ -2,6 +2,7 @@
 
 pub mod blocking;
 pub mod file_cache;
+pub mod owner;
 pub mod sparse_file;
 
 #[cfg(windows)]

@@ -158,7 +158,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
             context_tokens,
             plain,
         } => {
-            tokio::spawn(allocator::release_free_memory());
+            magnitude_service_utils::owner::spawn("the allocator's release of free memory", allocator::release_free_memory());
             let bounds = LoadBounds { weight_cap, context_tokens, plain };
             let installation = installation::Installation::load(&installation)
                 .context("invalid ICN installation")?;
@@ -279,7 +279,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
             // Requested downloads of custom models resolve against the local-models configuration
             // read before the first scan, so every request resumes once its files can be worked out.
             model_downloads.set_custom_model_acquisition(candidates.clone());
-            tokio::spawn({
+            magnitude_service_utils::owner::spawn("the requested downloads' resumption", {
                 let installations = model_services.installations.clone();
                 async move { installations.resume_requested_downloads().await }
             });

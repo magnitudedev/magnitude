@@ -166,7 +166,7 @@ impl MemorySupervisor {
                 supervised_changed: tokio::sync::Notify::new(),
             }),
         };
-        tokio::spawn(Arc::clone(&supervisor.inner).run());
+        magnitude_service_utils::owner::spawn("the memory supervisor", Arc::clone(&supervisor.inner).run());
         supervisor
     }
 
@@ -203,7 +203,7 @@ impl MemorySupervisor {
             engine: Arc::clone(&engine),
         });
         self.inner.supervised_changed.notify_one();
-        tokio::spawn(Arc::clone(&self.inner).publish_census(
+        magnitude_service_utils::owner::spawn("a resident's memory census", Arc::clone(&self.inner).publish_census(
             instance_id,
             engine,
             context_window_tokens,

@@ -591,7 +591,7 @@ impl ManagedModelCandidates {
     /// unreachable Hub for what its own files decide, and a load meanwhile uses that.
     pub fn start_enrichment(self: &Arc<Self>, resolver: Arc<ModelDomainResolver>) {
         let warmed = Arc::clone(self);
-        tokio::spawn(async move {
+        magnitude_service_utils::owner::spawn("the catalog's facts", async move {
             warmed.catalog_facts().await;
         });
         resolver.set_custom_model_enrichment(self.enrichment.clone());
@@ -599,7 +599,9 @@ impl ManagedModelCandidates {
         for reach in [Reach::Local, Reach::Hub] {
             let candidates = Arc::clone(self);
             let resolver = Arc::clone(&resolver);
-            tokio::spawn(async move { candidates.enrich_custom_models(&resolver, reach).await });
+            magnitude_service_utils::owner::spawn("a custom models' enrichment", async move {
+                candidates.enrich_custom_models(&resolver, reach).await
+            });
         }
     }
 

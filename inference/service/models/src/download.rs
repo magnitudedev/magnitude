@@ -447,7 +447,7 @@ impl ManagedModelStore {
         {
             let companion_bytes = admitted_bytes.saturating_sub(own);
             let manager = self.clone();
-            tokio::spawn(async move {
+            magnitude_service_utils::owner::spawn("a download", async move {
                 manager
                     .run_download(key, operation_id, package, operation, companion_bytes)
                     .await;

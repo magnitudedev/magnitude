@@ -256,7 +256,7 @@ pub fn start<M: MeasuredMachine>(
 ) -> watch::Receiver<MeasurementStatus<M::Stored>> {
     let (status, receiver) = watch::channel(MeasurementStatus::stored(stored));
     let time = Duration::from_secs_f64(magnitude_executor::assessment::MEASUREMENT_SECONDS);
-    tokio::spawn(run(machine, device, settled, status, time));
+    magnitude_service_utils::owner::spawn("the measurement job", run(machine, device, settled, status, time));
     receiver
 }
 

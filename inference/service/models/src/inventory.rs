@@ -747,7 +747,7 @@ impl ManagedModelStore {
             return;
         }
         let store = self.clone();
-        tokio::spawn(async move {
+        magnitude_service_utils::owner::spawn("the Ollama hub's resolution", async move {
             let _lease = ReconciliationLease(Arc::clone(&store.ollama_hub_resolution));
             let roots = store.resolve_ollama_hub_files().await;
             if !roots.is_empty()
@@ -767,7 +767,7 @@ impl ManagedModelStore {
             return;
         }
         let reconciliation = self.clone();
-        tokio::spawn(async move {
+        magnitude_service_utils::owner::spawn("the inventory's reconciliation", async move {
             let _lease = ReconciliationLease(Arc::clone(&reconciliation.reconciliation_running));
             while !reconciliation
                 .reconciliation_complete
