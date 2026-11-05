@@ -22,7 +22,7 @@ identical before and after trimming. The tokenizer digest in a fixture's `ModelF
 trimmed table's, so it does not match the full file.
 
 To add a header, run
-`cargo run -p magnitude-service-catalog-tool -- fixture-header --repository REPO --revision REVISION --path PATH --model-store DIR`
+`cargo run -p magnitude-service-catalog-tool -- fixture-header --repository REPO --revision REVISION --path PATH --model-store DIR --output-dir engine/fixtures/assessment/headers`
 in `inference/`. It reads the header with range requests only (never the whole file), then trims
 and gzips it into `headers/`. `HF_TOKEN` is sent when set. A header from Ollama's registry
 (`ollama-<model>-<tag>.gguf.gz`) is the model layer's blob read the same way and trimmed the same
@@ -35,7 +35,7 @@ files only, so such a header serves the service's tests alone; `ollama-qwen3.6-3
 
 `weight-samples/<repository file name without .gguf>.json` is one real file's weight sample, as the
 service's `WeightSample` serializes it (tensor name to its first 64 values), for the service's weight-lineage tests. To add one,
-run `cargo run -p magnitude-service-catalog-tool -- weight-sample --name NAME SOURCE` in
+run `cargo run -p magnitude-service-catalog-tool -- weight-sample --name NAME --output-dir engine/fixtures/assessment/weight-samples SOURCE` in
 `inference/`, where `SOURCE` is `hub --repository REPO --revision REVISION --path PATH --model-store DIR`,
 `ollama --model MODEL --digest sha256:DIGEST --model-store DIR` or `local PATH`; it reads the
 header and then only the sampled values, with range requests. Sources

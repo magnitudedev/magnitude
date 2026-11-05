@@ -95,10 +95,8 @@ enum Command {
         /// The file's path in the repository.
         #[arg(long)]
         path: PathBuf,
-        #[arg(long, default_value = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../engine/fixtures/assessment/headers"
-        ))]
+        /// The fixture headers' directory, `engine/fixtures/assessment/headers` of the tree.
+        #[arg(long)]
         output_dir: PathBuf,
         #[command(flatten)]
         store: StoreArgs,
@@ -108,10 +106,8 @@ enum Command {
     WeightSample {
         #[arg(long)]
         name: String,
-        #[arg(long, default_value = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../engine/fixtures/assessment/weight-samples"
-        ))]
+        /// The weight samples' directory, `engine/fixtures/assessment/weight-samples` of the tree.
+        #[arg(long)]
         output_dir: PathBuf,
         #[command(subcommand)]
         source: SampleSource,
@@ -271,7 +267,6 @@ async fn weight_sample(
         }
     }
     .context("too few sampled tensors carry values")?;
-    std::fs::create_dir_all(&output_dir)?;
     let output = output_dir.join(format!("{name}.json"));
     std::fs::write(&output, [sample.encode(), b"\n".to_vec()].concat())?;
     println!("{}: {} tensors", output.display(), sample.tensors().count());
@@ -690,7 +685,7 @@ mod tests {
         assert!(!parses(&[&["header"], &hub[..]].concat()));
         assert!(parses(&[&["header"], &hub[..], &["--model-store", "/m"]].concat()));
         assert!(parses(&["slice", "--output", "s.gguf", "local", "m.gguf"]));
-        assert!(parses(&["weight-sample", "--name", "n", "local", "m.gguf"]));
-        assert!(!parses(&["weight-sample", "--name", "n", "ollama", "--model", "q", "--digest", "sha256:0"]));
+        assert!(parses(&["weight-sample", "--name", "n", "--output-dir", "/w", "local", "m.gguf"]));
+        assert!(!parses(&["weight-sample", "--name", "n", "--output-dir", "/w", "ollama", "--model", "q", "--digest", "sha256:0"]));
     }
 }
