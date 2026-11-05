@@ -32,7 +32,13 @@
 //! half-life, decaying at that half-life through the stay, so what earns a
 //! copy and what the ranking holds are judged by one value, and a want is
 //! never weighed against a victim by a measure other than the one that
-//! chose both. A short half-life vouches for few steps: a just-read expert
+//! chose both. An expert is weighed by its own score at the live
+//! half-life, never a score taken before: a score is in one half-life's
+//! units, and weighed at another it would mean nothing (a long half-life's
+//! score of a much-read expert lies far past the latest step, which a short
+//! one weighs as unbounded). A choice that ranks or weighs several experts
+//! reads them all from one hold of the ranking ([`Reuse::of`]), so the live
+//! candidate never changes within it. A short half-life vouches for few steps: a just-read expert
 //! is worth the reads the measure counts, never its latest rate held over
 //! a whole stay.
 //!
@@ -154,13 +160,33 @@ impl Logged {
 /// that read routed to it (of a prompt group's union, how much of the
 /// prompt used it), then its place in the order of logging, which no two
 /// experts read share: a total order over the experts read, which ranks
-/// experts the reads tie as the reads before ranked them.
-type Rank = (Score, Option<Step>, u32, u64);
+/// experts the reads tie as the reads before ranked them. The one order
+/// every choice of what to keep compares, the ranking's and the
+/// directory's alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Rank {
+    score: Score,
+    last: Option<Step>,
+    routed: u32,
+    order: u64,
+}
+
+impl Rank {
+    /// The expert's reuse.
+    pub fn score(self) -> Score {
+        self.score
+    }
+
+    /// The step that last read the expert, if one has.
+    pub fn last(self) -> Option<Step> {
+        self.last
+    }
+}
 
 /// A held expert's place in its group's pool, least reused first: its
 /// [`Rank`] (its own, as every expert held was read), then the (layer,
 /// expert) it holds.
-type Pooled = (Score, Option<Step>, u32, u64, usize, usize);
+type Pooled = (Rank, usize, usize);
 
 /// One bank group's records as a pool at one half-life: the experts it
 /// holds, by their rank, and how many it holds at most.
@@ -204,8 +230,7 @@ impl Measure {
 
     /// `layer`'s `expert`'s place in its group's pool.
     fn pooled_rank(&self, layer: usize, expert: usize) -> Pooled {
-        let (score, last, routed, order) = self.rank(layer, expert);
-        (score, last, routed, order, layer, expert)
+        (self.rank(layer, expert), layer, expert)
     }
 
     /// Group `group`'s pool holds `records` records from now: its least
@@ -228,8 +253,8 @@ impl Measure {
 
     /// `layer`'s `expert`'s rank ([`Rank`]).
     fn rank(&self, layer: usize, expert: usize) -> Rank {
-        let logged = self.layers[layer][expert];
-        (logged.score, logged.last, logged.routed, logged.order)
+        let Logged { score, last, routed, order } = self.layers[layer][expert];
+        Rank { score, last, routed, order }
     }
 
     /// `layer`'s `experts` in the order a read of them enters the stack and
@@ -507,42 +532,46 @@ impl Reuse {
         self.measure().depth(layer, expert)
     }
 
-    /// `layer`'s `expert`'s place in the ranking's order of logging, 0 for
-    /// none: which of experts the reads tie ranks above
-    /// ([`Rank`]).
-    pub fn order(&self, layer: usize, expert: usize) -> u64 {
-        self.measure().layers[layer][expert].order
-    }
-
     /// The step that last read `layer`'s `expert`, if one has.
     pub fn last(&self, layer: usize, expert: usize) -> Option<Step> {
         self.measure().layers[layer][expert].last
     }
 
-    /// The reads an expert of score `score` ([`Self::rank`]) is expected to
-    /// have over a stay in the bank of `stay` steps, as the half-life the
-    /// ranking ranks by expects them from the latest step logged
-    /// ([`Score::expected`]). One value, the ranking's, so it orders experts
-    /// as their ranks do. A stay not yet measured (no promotion has left
-    /// one) is the longest half-life; before any read nothing is expected.
-    pub fn weighed(&self, score: Score, stay: Option<f64>) -> f64 {
+    /// The reads `layer`'s `expert`, ranked beside a read at step `read`
+    /// ([`Self::rank`]), is expected to have over a stay in the bank of
+    /// `stay` steps, as the half-life the ranking ranks by expects them
+    /// from the latest step logged ([`Score::expected`]). One value, the
+    /// ranking's, so it orders experts as their ranks do; and it weighs the
+    /// expert's score at the half-life that scored it. A stay not yet
+    /// measured (no promotion has left one) is the longest half-life;
+    /// before any read nothing is expected.
+    pub fn weighed(&self, layer: usize, expert: usize, read: Option<Step>, stay: Option<f64>) -> f64 {
         let Some(latest) = self.latest else {
             return 0.;
         };
         let stay = stay.unwrap_or(HALF_LIVES[HALF_LIVES.len() - 1]);
-        score.expected(latest, self.measure().half_life, stay)
+        self.rank(layer, expert, read).score.expected(latest, self.measure().half_life, stay)
     }
 
-    /// `layer`'s `expert`'s score, beside a read at step `read` the log may
-    /// not have brought yet (a step still running among them): counted as a
-    /// read where it is past the last logged one.
-    pub fn rank(&self, layer: usize, expert: usize, read: Option<Step>) -> Score {
+    /// `layer`'s `expert`'s rank ([`Rank`]), beside a read at step `read`
+    /// the log may not have brought yet (a step still running among them):
+    /// counted as a read where it is past the last logged one, and then its
+    /// last, the choices it routed unknown (none).
+    pub fn rank(&self, layer: usize, expert: usize, read: Option<Step>) -> Rank {
         let measure = self.measure();
-        let logged = measure.layers[layer][expert];
+        let logged = measure.rank(layer, expert);
         match read.filter(|&read| Some(read) > logged.last) {
-            Some(read) => logged.score.sum(Score::at(read), measure.half_life),
-            None => logged.score,
+            Some(read) => Rank { score: logged.score.sum(Score::at(read), measure.half_life), last: Some(read), routed: 0, ..logged },
+            None => logged,
         }
+    }
+
+    /// Rank by the stack of `half_life` from now, as though its candidate
+    /// had missed least: what each layer's share holds is taken again.
+    #[cfg(test)]
+    pub fn go_live(&mut self, half_life: f64) {
+        self.live = HALF_LIVES.iter().position(|&at| at == half_life).expect("a measured half-life");
+        (0..self.tops.len()).for_each(|layer| self.retop(layer));
     }
 }
 
@@ -647,10 +676,10 @@ pub(super) mod tests {
         assert_eq!(log(&mut reuse, read(5, &[1])), [3]);
         assert_eq!(log(&mut reuse, read(6, &[0])), [1], "one expert read since");
         assert_eq!(reuse.half_life(), 0.);
-        assert_eq!(reuse.rank(0, 0, None), Score(6.));
-        assert_eq!(reuse.rank(0, 0, Some(3)), Score(6.), "a stamp the log has passed adds nothing");
-        assert_eq!(reuse.rank(0, 2, Some(7)), Score(7.), "a stamp past the log is a later read");
-        assert_eq!(reuse.rank(0, 2, None), Score::NEVER);
+        assert_eq!(reuse.rank(0, 0, None).score(), Score(6.));
+        assert_eq!(reuse.rank(0, 0, Some(3)).score(), Score(6.), "a stamp the log has passed adds nothing");
+        assert_eq!(reuse.rank(0, 2, Some(7)).score(), Score(7.), "a stamp past the log is a later read");
+        assert_eq!(reuse.rank(0, 2, None).score(), Score::NEVER);
         assert_eq!(reuse.last(0, 1), Some(5));
     }
 
@@ -669,7 +698,7 @@ pub(super) mod tests {
             for step in 1..=2000 {
                 measure.read(&read(step, &[0]), &[1], 2);
             }
-            let score = measure.rank(0, 0).0;
+            let score = measure.rank(0, 0).score;
             close(score.expected(2000, half_life, 1.), 1.);
             close(score.expected(2000, half_life, 3.), (0..3).map(|k| (-k as f64 / half_life).exp2()).sum());
             close(score.expected(2000, half_life, 1e6), 1. / (1. - (-1. / half_life).exp2()));
@@ -687,14 +716,14 @@ pub(super) mod tests {
     #[test]
     fn reads_weigh_what_the_live_half_life_expects_over_the_stay() {
         let mut reuse = Reuse::new(&[3], &[0], vec![2]);
-        assert_eq!(reuse.weighed(Score::at(6), Some(3.)), 0., "nothing read, nothing expected");
+        assert_eq!(reuse.weighed(0, 0, Some(6), Some(3.)), 0., "nothing read, nothing expected");
         log(&mut reuse, read(6, &[0]));
         log(&mut reuse, read(7, &[1]));
         assert_eq!(reuse.half_life(), 0.);
-        assert_eq!(reuse.weighed(reuse.rank(0, 1, None), Some(3.)), 1.);
-        assert_eq!(reuse.weighed(reuse.rank(0, 1, None), None), 1.);
-        assert_eq!(reuse.weighed(reuse.rank(0, 0, None), Some(3.)), 0.);
-        assert_eq!(reuse.weighed(reuse.rank(0, 2, None), Some(3.)), 0.);
+        assert_eq!(reuse.weighed(0, 1, None, Some(3.)), 1.);
+        assert_eq!(reuse.weighed(0, 1, None, None), 1.);
+        assert_eq!(reuse.weighed(0, 0, None, Some(3.)), 0.);
+        assert_eq!(reuse.weighed(0, 2, None, Some(3.)), 0.);
     }
 
     /// Over a half-life an expert read often outranks one read once more

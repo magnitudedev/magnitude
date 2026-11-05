@@ -30,7 +30,7 @@ mod stack;
 use super::host_records::{Claim, HostRecords, Kept, Located, Resolution};
 use super::map::{LandingMap, StampedMap};
 use super::records::{BankRecords, Lent, Record};
-use super::reuse::{Ranking, Reuse, Score};
+use super::reuse::{Rank, Ranking, Reuse, Score};
 use super::staging::Staged;
 use super::watcher::{Lending, LentRecords, Step, Steps, Unbegun};
 use std::collections::{BTreeSet, HashMap};
@@ -233,14 +233,18 @@ impl BankRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HostRecord(pub u32);
 
-/// How the host records rank what they keep: an expert's reuse beside the
-/// later of a read the log may not have brought yet and the running prompt
-/// group's read of it ([`Directory::read_pending`]).
-fn store_rank<'a>(ranking: &'a Ranking, prompt_reads: &'a HashMap<Staged, Step>) -> impl Fn(Staged, Option<Step>) -> Score + Copy + 'a {
-    move |(layer, expert): Staged, read: Option<Step>| {
-        let read = read.max(prompt_reads.get(&(layer, expert)).copied());
-        Reuse::of(ranking).rank(layer, expert, read)
-    }
+/// The later of `read`, a read of `staged` the log may not have brought
+/// yet, and the running prompt group's read of it
+/// ([`Directory::read_pending`]): what every taking ranks it beside.
+fn beside(prompt_reads: &HashMap<Staged, Step>, staged: Staged, read: Option<Step>) -> Option<Step> {
+    read.max(prompt_reads.get(&staged).copied())
+}
+
+/// How the host records rank what they keep, by `reuse`, one hold of the
+/// ranking for the whole choice: an expert's reuse beside its reads
+/// ([`beside`]).
+fn store_rank<'a>(reuse: &'a Reuse, prompt_reads: &'a HashMap<Staged, Step>) -> impl Fn(Staged, Option<Step>) -> Score + Copy + 'a {
+    move |staged @ (layer, expert): Staged, read: Option<Step>| reuse.rank(layer, expert, beside(prompt_reads, staged, read)).score()
 }
 
 /// A group's wanted experts as their copies price them
@@ -252,15 +256,12 @@ struct Earning {
 }
 
 /// An expert's rank, least first, which every choice of what the bank
-/// keeps compares: its reuse ([`Reuse::rank`], beside the step that last
-/// read it), then that read (recency, the tie-break), then its place in
-/// the ranking's order of logging ([`Reuse::order`]), then the (layer,
-/// expert) (which decides only between experts the log never read).
+/// keeps compares: the ranking's own ([`Rank`], beside its reads,
+/// [`beside`]), then the (layer, expert) (which decides only between
+/// experts the log never read).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Ranked {
-    reuse: Score,
-    read: Step,
-    order: u64,
+    rank: Rank,
     layer: usize,
     expert: usize,
 }
@@ -532,12 +533,9 @@ impl Directory {
     /// record for every expert is filled to every expert, and a smaller
     /// one's records beyond the reserve with each layer's ranked share.
     pub fn fill_order(&self, keep: usize, count: usize, skip: impl Fn(Staged) -> bool, kept: impl Fn(Staged) -> bool) -> Vec<Staged> {
-        let rank = store_rank(&self.ranking, &self.prompt_reads);
-        // Each key is taken once an expert, after its rank: neither holds
-        // the ranking's lock across the other.
-        let order = |score: Score, staged @ (layer, expert): Staged| {
-            (!self.reuse_now().in_top(layer, expert), std::cmp::Reverse(score), !kept(staged), expert, layer)
-        };
+        let reuse = self.reuse_now();
+        let rank = store_rank(&reuse, &self.prompt_reads);
+        let order = |score: Score, staged @ (layer, expert): Staged| (!reuse.in_top(layer, expert), std::cmp::Reverse(score), !kept(staged), expert, layer);
         let mut order = self
             .host
             .iter()
@@ -613,7 +611,8 @@ impl Directory {
     /// record. Short without a tier.
     pub fn claim_demand(&mut self, (layer, expert): Staged, read: &[(usize, u32)], parked: (Point, u64)) -> Claim {
         let group = self.bank.group(layer);
-        let rank = store_rank(&self.ranking, &self.prompt_reads);
+        let reuse = Reuse::of(&self.ranking);
+        let rank = store_rank(&reuse, &self.prompt_reads);
         self.host[group].claim_demand((layer, expert), rank, |record| read.contains(&(group, record)), parked)
     }
 
@@ -649,7 +648,8 @@ impl Directory {
     /// now ([`HostRecords::refill_victims`]), the lent records among them
     /// where `lent`: read from the ranking, changing nothing.
     pub fn refill_victims(&self, reserve: usize, lent: bool) -> Vec<Vec<(u32, Staged)>> {
-        let rank = store_rank(&self.ranking, &self.prompt_reads);
+        let reuse = self.reuse_now();
+        let rank = store_rank(&reuse, &self.prompt_reads);
         self.host.iter().map(|records| records.refill_victims(reserve, rank, lent)).collect()
     }
 
@@ -696,7 +696,7 @@ impl Directory {
     /// `layer`'s `expert`'s reuse ([`Reuse::rank`]), beside a read at step
     /// `read` the log may not have brought yet.
     pub fn reuse(&self, layer: usize, expert: usize, read: Option<Step>) -> Score {
-        self.reuse_now().rank(layer, expert, read)
+        self.reuse_now().rank(layer, expert, read).score()
     }
 
     /// The half-life the reuse ranks by, in steps ([`Reuse::half_life`]).
@@ -705,25 +705,16 @@ impl Directory {
         self.reuse_now().half_life()
     }
 
-    /// The rank of `layer`'s `expert` as of its last read, the log's or the
-    /// running prompt group's.
-    fn ranked_now(&self, layer: usize, expert: usize) -> Ranked {
-        let read = self.reuse_now().last(layer, expert).unwrap_or(0);
-        self.ranked(layer, expert, read)
-    }
-
-    /// The rank of `layer`'s `expert`, last read at step `read`.
-    fn ranked(&self, layer: usize, expert: usize, read: Step) -> Ranked {
-        let read = self.prompt_reads.get(&(layer, expert)).map_or(read, |&pending| read.max(pending));
-        let reuse = self.reuse_now();
-        Ranked { reuse: reuse.rank(layer, expert, Some(read)), read, order: reuse.order(layer, expert), layer, expert }
+    /// The rank of `layer`'s `expert` by `reuse`, beside a read at step
+    /// `read` the log may not have brought yet ([`beside`]).
+    fn ranked(&self, reuse: &Reuse, layer: usize, expert: usize, read: Option<Step>) -> Ranked {
+        Ranked { rank: reuse.rank(layer, expert, beside(&self.prompt_reads, (layer, expert), read)), layer, expert }
     }
 
     /// Each record of group `group`, the step that last read the expert it
-    /// holds as the ranking logged it (`Reuse::last`), 0 for none: what its
+    /// holds as `reuse` logged it (`Reuse::last`), 0 for none: what its
     /// held records rank by ([`Self::least_of`]).
-    fn record_reads(&self, group: usize) -> Vec<Step> {
-        let reuse = self.reuse_now();
+    fn record_reads(&self, reuse: &Reuse, group: usize) -> Vec<Step> {
         self.bank
             .records(group)
             .iter()
@@ -795,9 +786,14 @@ impl Directory {
                 .filter(|&(layer, expert)| self.in_tier(layer, expert))
                 .collect::<Vec<_>>();
             // Earning weighs a victim for each want, and releases take at most
-            // a want's each and the reserve's.
-            let victims = self.victims(group, &members, lending, wanted.len() + self.reserve[group]);
-            let priced = self.earning(group, wanted, &victims, lending, at.next());
+            // a want's each and the reserve's: all ranked and weighed by one
+            // hold of the ranking, so at one half-life.
+            let (victims, priced) = {
+                let reuse = Reuse::of(&self.ranking);
+                let victims = self.victims(&reuse, group, &members, lending, wanted.len() + self.reserve[group]);
+                let priced = self.earning(&reuse, group, wanted, &victims, lending, at.next());
+                (victims, priced)
+            };
             withheld |= priced.withheld;
             let wanted = priced.earning;
             let free = self
@@ -839,12 +835,12 @@ impl Directory {
     /// Group `group`'s records a release may take, in the order releases
     /// take them: each held expert outside its layer's share (`unwanted`)
     /// whose record is usable, its least ranked first: the `most` least
-    /// ranked, selected before they are sorted.
-    fn victims(&self, group: usize, members: &[usize], lending: &Lending, most: usize) -> Vec<(Ranked, usize)> {
+    /// ranked by `reuse`, selected before they are sorted.
+    fn victims(&self, reuse: &Reuse, group: usize, members: &[usize], lending: &Lending, most: usize) -> Vec<(Ranked, usize)> {
         let mut victims = members
             .iter()
             .flat_map(|&layer| self.unwanted[layer].iter().map(move |&expert| (layer, expert)))
-            .map(|(layer, expert)| (self.ranked_now(layer, expert), self.bank.held(layer, expert).expect("an unwanted expert is held")))
+            .map(|(layer, expert)| (self.ranked(reuse, layer, expert, None), self.bank.held(layer, expert).expect("an unwanted expert is held")))
             .filter(|&(_, record)| self.bank.usable(group, record, lending))
             .collect::<Vec<_>>();
         if victims.len() > most {
@@ -860,26 +856,26 @@ impl Directory {
     /// first, each against what it would displace, a usable free record
     /// past the reserve nothing, then each of `victims` in the order
     /// releases take them (`Self::victims`), all read over the stay
-    /// (`Reuse::weighed`) by the reuse they rank by (`Self::ranked`), so a
-    /// victim ranked below another never weighs more. What a copy costs and
-    /// a hit saves are the cost function's (`ExpertLines::copy_hits`).
-    fn earning(&self, group: usize, wanted: Vec<Staged>, victims: &[(Ranked, usize)], lending: &Lending, now: Step) -> Earning {
+    /// (`Reuse::weighed`) by `reuse`, which ranked the victims, beside their
+    /// reads ([`beside`]), so a victim ranked below another never weighs
+    /// more. What a copy costs and a hit saves are the cost function's
+    /// (`ExpertLines::copy_hits`).
+    fn earning(&self, reuse: &Reuse, group: usize, wanted: Vec<Staged>, victims: &[(Ranked, usize)], lending: &Lending, now: Step) -> Earning {
+        let stay = self.stay(group, now);
+        let weighed = |staged @ (layer, expert): Staged| reuse.weighed(layer, expert, beside(&self.prompt_reads, staged, None), stay);
         // A layer whose hit saves nothing earns no promotion at any read:
         // its wants wait for no read, so none is withheld; its lines'
         // repricing asks them again (`Self::price_copies`).
-        let wanted = wanted
+        let mut ranked = wanted
             .into_iter()
-            .filter_map(|(layer, expert)| self.copy_hits[layer].map(|hits| (self.ranked_now(layer, expert).reuse, hits, (layer, expert))))
+            .filter_map(|staged| self.copy_hits[staged.0].map(|hits| (weighed(staged) - hits, staged)))
             .collect::<Vec<_>>();
-        let reuse = Reuse::of(&self.ranking);
-        let stay = self.stay(group, now);
-        let mut ranked = wanted.into_iter().map(|(score, hits, staged)| (reuse.weighed(score, stay) - hits, staged)).collect::<Vec<_>>();
         ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
         // The records past the reserve displace nothing; a promotion into
         // the reserve is paid for by the release that refills it.
         let free = self.bank.free(group).filter(|&record| self.bank.usable(group, record, lending)).count();
         let displaced = std::iter::repeat_n(0., free.saturating_sub(self.reserve[group]))
-            .chain(victims.iter().map(|&(Ranked { reuse: score, .. }, _)| reuse.weighed(score, stay)))
+            .chain(victims.iter().map(|&(Ranked { layer, expert, .. }, _)| weighed((layer, expert))))
             .chain(std::iter::repeat(f64::INFINITY));
         let count = ranked.len();
         let earning = ranked
@@ -1010,7 +1006,8 @@ impl Directory {
         if self.placer == crate::planning::Placer::Bank {
             self.resized(group, records as usize);
         }
-        let rank = store_rank(&self.ranking, &self.prompt_reads);
+        let reuse = Reuse::of(&self.ranking);
+        let rank = store_rank(&reuse, &self.prompt_reads);
         self.host[group].shrink(records, rank).into_iter().map(|(from, to)| (HostRecord(from), HostRecord(to))).collect()
     }
 
@@ -1140,26 +1137,26 @@ impl Directory {
     /// its seed copy and commit commit, with their records, and the experts
     /// evicted, (layer, expert).
     pub fn seed(&mut self, point: Point, layer: usize, routed: &[(usize, Step)], pinned: &[usize], filled: impl Fn(usize) -> bool) -> (Vec<(usize, BankRecord)>, Vec<(usize, usize)>) {
-        let mut reads = self.record_reads(self.bank.group(layer));
-        for &(expert, recency) in routed {
-            if let Some(record) = self.bank.held(layer, expert) {
-                reads[record] = reads[record].max(recency);
-            }
-        }
-        let read = |record: usize| reads[record];
-        let mut absent = routed
-            .iter()
-            .filter(|&&(expert, _)| self.bank.held(layer, expert).is_none() && !self.bank.placing((layer, expert)) && filled(expert))
-            .map(|&(expert, recency)| self.ranked(layer, expert, recency))
-            .collect::<Vec<_>>();
-        absent.sort_unstable_by(|a, b| b.cmp(a));
         let group = self.bank.group(layer);
-        let pinned = pinned.iter().filter_map(|&expert| self.bank.held(layer, expert)).collect::<Vec<_>>();
-        let shared = {
+        let (absent, mut records) = {
             let reuse = self.reuse_now();
-            self.bank.records(group).iter().map(|content| matches!(*content, Record::Held((layer, expert)) if reuse.in_top(layer, expert))).collect::<Vec<_>>()
+            let mut reads = self.record_reads(&reuse, group);
+            for &(expert, recency) in routed {
+                if let Some(record) = self.bank.held(layer, expert) {
+                    reads[record] = reads[record].max(recency);
+                }
+            }
+            let mut absent = routed
+                .iter()
+                .filter(|&&(expert, _)| self.bank.held(layer, expert).is_none() && !self.bank.placing((layer, expert)) && filled(expert))
+                .map(|&(expert, recency)| self.ranked(&reuse, layer, expert, Some(recency)))
+                .collect::<Vec<_>>();
+            absent.sort_unstable_by(|a, b| b.cmp(a));
+            let pinned = pinned.iter().filter_map(|&expert| self.bank.held(layer, expert)).collect::<Vec<_>>();
+            let shared = self.bank.records(group).iter().map(|content| matches!(*content, Record::Held((layer, expert)) if reuse.in_top(layer, expert))).collect::<Vec<_>>();
+            let records = self.least_of(&reuse, group, absent.len(), |record| reads[record], |record| pinned.contains(&record) || shared[record]);
+            (absent, records)
         };
-        let mut records = self.least_of(group, absent.len(), read, |record| pinned.contains(&record) || shared[record]);
         // The most reused seed against the least reused record, while it
         // outranks it.
         let taken = absent
@@ -1247,7 +1244,7 @@ impl Directory {
         absent: &[usize],
         read: impl Fn(usize) -> Step,
     ) -> Option<Placed> {
-        let candidates = self.least(layer, held, absent.len(), &read);
+        let candidates = self.least(&self.reuse_now(), layer, held, absent.len(), &read);
         (candidates.len() == absent.len()).then(|| self.place_into(point, layer, absent, candidates))
     }
 
@@ -1259,7 +1256,8 @@ impl Directory {
         for (&expert, (held, record)) in absent.iter().zip(candidates) {
             let victim = self.bank.fill(point, (layer, expert), record);
             assert_eq!(victim, held.map(|held| (held.layer, held.expert)), "a seed evicts what its record holds");
-            if let Some(Ranked { read, layer: owner, expert, .. }) = held {
+            if let Some(Ranked { rank, layer: owner, expert }) = held {
+                let read = rank.last().expect("a placement ranks what it evicts beside a read");
                 evicted.push((owner, expert, read));
                 self.left_bank(owner, expert, Some(read));
             }
@@ -1273,14 +1271,15 @@ impl Directory {
     /// when the group has fewer), keeping those of its `kept` experts, each
     /// with its eviction rank, least first: free records first (`None`), in
     /// record order (they hold nothing, so which one a fill takes decides
-    /// nothing later), then held ones by their expert's reuse beside
-    /// `read(record)`, the step that last read it, a tie by that read, then
-    /// the held (layer, expert) ([`Ranked`]). The order is a function of
+    /// nothing later), then held ones by their expert's rank beside
+    /// `read(record)`, the step that last read it ([`Ranked`]), all by
+    /// `reuse`. The order is a function of
     /// what the records hold and when they were read, never of where they
     /// lie. None the conveyor claimed ([`Self::claim`]). The held records
     /// are ranked only when the free ones fall short.
     fn least(
         &self,
+        reuse: &Reuse,
         layer: usize,
         kept: &[usize],
         count: usize,
@@ -1291,19 +1290,20 @@ impl Directory {
             .iter()
             .filter_map(|&expert| self.bank.held(layer, expert))
             .collect::<Vec<_>>();
-        self.least_of(self.bank.group(layer), count, read, |record| kept.contains(&record))
+        self.least_of(reuse, self.bank.group(layer), count, read, |record| kept.contains(&record))
     }
 
     /// The one ranking of group `group`'s records, least first, that every
     /// choice of a record to take ranks by (a placement's, [`Self::least`],
     /// and a promotion's, [`Self::promotions`]): its `count` first (fewer
     /// when the group has fewer), free records first (`None`) in record
-    /// order, then held ones by [`Ranked`] (their expert's reuse beside
-    /// `read(record)`, then that read, then the held (layer, expert)); none
+    /// order, then held ones by [`Ranked`] (their expert's rank by `reuse`
+    /// beside `read(record)`); none
     /// claimed, filling or promoting, and none `excluded` names. The held
     /// records are ranked only when the free ones fall short.
     fn least_of(
         &self,
+        reuse: &Reuse,
         group: usize,
         count: usize,
         read: impl Fn(usize) -> Step,
@@ -1321,7 +1321,7 @@ impl Directory {
             .iter()
             .enumerate()
             .filter_map(|(record, content)| match *content {
-                Record::Held((layer, expert)) if !excluded(record) => Some((Some(self.ranked(layer, expert, read(record))), record)),
+                Record::Held((layer, expert)) if !excluded(record) => Some((Some(self.ranked(reuse, layer, expert, Some(read(record)))), record)),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1342,10 +1342,9 @@ impl Directory {
     /// How group `group` retires its records from `records` up, on its way
     /// to `target` records (at most `records`), between flights (no fill
     /// pending), changing nothing yet. The target keeps the group's most
-    /// reused experts, by their reuse beside `last_read(layer, expert)`
-    /// (the step that last read it, none before any: least recent), a tie
-    /// by that read, then (layer, expert), as many as its records below
-    /// `target` hold. Of the experts from
+    /// reused experts, by their rank ([`Ranked`]) beside
+    /// `last_read(layer, expert)` (the step that last read it, none before
+    /// any: least recent), as many as its records below `target` hold. Of the experts from
     /// `records` up, each the target keeps moves to a record below `target`
     /// (a free one, else one whose expert the target drops, least recent
     /// first, which is evicted), and the rest are evicted: so a shrink
@@ -1363,15 +1362,11 @@ impl Directory {
     ) -> Shrink {
         let contents = self.bank.records(group);
         assert!(target <= records && records <= contents.len(), "a shrink of {} records to {records}, then {target}", contents.len());
-        let mut held = contents
+        let held = contents
             .iter()
             .enumerate()
             .filter_map(|(record, content)| match *content {
-                Record::Held((layer, expert)) => {
-                    let read = last_read(layer, expert);
-                    let reuse = self.reuse_now();
-                    Some(((reuse.rank(layer, expert, read), read, reuse.order(layer, expert)), layer, expert, record))
-                }
+                Record::Held((layer, expert)) => Some((layer, expert, last_read(layer, expert), record)),
                 Record::Free => None,
                 Record::Filling(..) => unreachable!("between flights no fill is pending"),
                 Record::Promoting(..) | Record::Releasing { .. } => unreachable!("between flights every promotion and release has ended"),
@@ -1379,31 +1374,37 @@ impl Directory {
                 Record::Shrinking | Record::Moving(_) => unreachable!("a shrink planned while another's is uncommitted"),
             })
             .collect::<Vec<_>>();
+        // Ranked by one hold of the ranking, after `last_read` (which may
+        // hold it) has answered.
+        let mut held = {
+            let reuse = self.reuse_now();
+            held.into_iter().map(|(layer, expert, read, record)| (self.ranked(&reuse, layer, expert, read), record)).collect::<Vec<_>>()
+        };
         held.sort_unstable_by(|a, b| b.cmp(a));
         let (kept, dropped) = held.split_at(target.min(held.len()));
-        let movers = kept.iter().filter(|held| held.3 >= records).collect::<Vec<_>>();
+        let movers = kept.iter().filter(|held| held.1 >= records).collect::<Vec<_>>();
         // Below the target, the free records, then those whose experts the
         // target drops, least recent first.
         let displaced = dropped
             .iter()
             .rev()
-            .filter(|held| held.3 < target)
+            .filter(|held| held.1 < target)
             .take(movers.len().saturating_sub((0..target).filter(|&record| contents[record] == Record::Free).count()))
             .collect::<Vec<_>>();
         let mut to = (0..target)
             .filter(|&record| contents[record] == Record::Free)
-            .chain(displaced.iter().map(|held| held.3));
+            .chain(displaced.iter().map(|held| held.1));
         Shrink {
             records,
             evicted: dropped
                 .iter()
-                .filter(|held| held.3 >= records)
+                .filter(|held| held.1 >= records)
                 .chain(displaced.iter().copied())
-                .map(|&(_, layer, expert, _)| (layer, expert))
+                .map(|&(Ranked { layer, expert, .. }, _)| (layer, expert))
                 .collect(),
             moved: movers
                 .into_iter()
-                .map(|&(_, layer, expert, from)| {
+                .map(|&(Ranked { layer, expert, .. }, from)| {
                     let to = to.next().expect("a kept expert has a record below the target");
                     (layer, expert, from, to)
                 })

@@ -463,6 +463,62 @@ fn a_promotion_waits_until_its_reads_earn_its_copy() {
     assert_eq!(directory.promote(false).promotions.len(), 1, "the price fell, and the want is asked again");
 }
 
+/// A want is weighed against its victim at the half-life that ranked
+/// both, however the live candidate changes while promotions are asked.
+/// Layer 0's victim, expert 1, was read at each of steps 1 to 40, and its
+/// want, expert 2, at each of 100 to 163: at a half-life of 256 the want
+/// expects about 29 reads over the stay, the victim 14, and at one the
+/// want two, the victim none, so it earns its copy either way (at a price
+/// of one read). Mixed, it never does: the victim's score at 256 lies over
+/// a thousand steps past the latest, which a half-life of one weighs as
+/// unbounded, and the want's at one, weighed at 256, expects half a read.
+/// Each layer's share is the one record its top expert takes at both, so
+/// only the half-life changes, switched back and forth throughout.
+#[test]
+fn a_want_and_its_victim_weigh_at_one_half_life_while_the_live_one_switches() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    for round in 0..200 {
+        let mut directory = Directory::new(&[2], &[0, 0], &[8, 8], HostTier::replay(vec![16]));
+        for (layer, expert) in (0..2).flat_map(|layer| (0..8).map(move |expert| (layer, expert))) {
+            let record = directory.land(layer, expert, 0).unwrap();
+            directory.landed(layer, record, expert, None);
+        }
+        directory.place(at(1, 0), 0, &[], &[1], |_| 0).unwrap();
+        directory.place(at(1, 1), 1, &[], &[0], |_| 0).unwrap();
+        directory.retired(Point::after(1), |_, _| 1, |_| Ending::Ended);
+        (0..2).for_each(|layer| directory.price_copies(layer, Some(1.)));
+        for step in 1..=163 {
+            match step {
+                1..=40 => log(&directory, step, 0, &[1]),
+                100.. => log(&directory, step, 0, &[2]),
+                _ => {}
+            }
+            log(&directory, step, 1, &[0]);
+        }
+        let ranking = directory.ranking();
+        let (done, switches) = (AtomicBool::new(false), AtomicU64::new(0));
+        let asked = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(Relaxed) {
+                    let switch = switches.fetch_add(1, Relaxed);
+                    Reuse::of(&ranking).go_live([1., 256.][switch as usize % 2]);
+                }
+            });
+            while switches.load(Relaxed) < 2 {
+                std::hint::spin_loop();
+            }
+            let asked = directory.promote(false);
+            done.store(true, Relaxed);
+            asked
+        });
+        assert_eq!(
+            asked.releases,
+            [Release { group: 0, record: BankRecord(0), layer: 0, expert: 1 }],
+            "round {round}: the want earned its copy, and its victim is released"
+        );
+    }
+}
+
 /// The ranking promotes, across a group's layers, the experts its share
 /// of each layer holds (each layer's top of its stack) that the bank
 /// lacks and the tier keeps, into free records, which no step reads;
