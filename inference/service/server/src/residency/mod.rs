@@ -628,6 +628,10 @@ pub trait ModelResidencyDriver: Clone + Send + Sync + 'static {
         resident: Self::Resident,
     );
     fn idle_timeout(&self) -> std::time::Duration;
+    /// Residency's demand for the device (an instance loading, ready or releasing, or a load
+    /// queued) ended: the driver lets go of the device it held across the gaps between a release
+    /// and the next load.
+    fn demand_ended(&self);
     /// The ready instance holding `resident` is idle (no lease holds it), or none is.
     fn resident_idle(&self, resident: Option<(&ModelInstanceId, &Self::Resident)>);
 }
@@ -646,6 +650,9 @@ pub struct ModelResidency<D: ModelResidencyDriver> {
     )>,
     /// The ready instance last published idle ([`ModelResidencyDriver::resident_idle`]).
     idle: Option<ModelInstanceId>,
+    /// Whether residency has demand for the device, as it last stood: its end is the driver's
+    /// to act on ([`ModelResidencyDriver::demand_ended`]).
+    demanded: bool,
 }
 
 impl<D: ModelResidencyDriver> ModelResidency<D> {
@@ -660,6 +667,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             package_removal_active: false,
             package_removals: std::collections::VecDeque::new(),
             idle: None,
+            demanded: false,
         }
     }
 
@@ -699,9 +707,21 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             }
             self.idle_expired();
             self.publish_idle();
+            self.publish_demand();
         }
         self.shutdown();
         self.publish_idle();
+        self.publish_demand();
+    }
+
+    /// Tell the driver once residency's demand for the device ends: a load takes the device as
+    /// demand begins, so its start is the load's, and only its end the driver's.
+    fn publish_demand(&mut self) {
+        let demanded = !matches!(self.state, ResidencyState::Vacant) || !self.queue.is_empty();
+        if self.demanded && !demanded {
+            self.controller.demand_ended();
+        }
+        self.demanded = demanded;
     }
 
     fn handle(&mut self, command: ResidencyCommand<D::Resident>) {
@@ -1777,7 +1797,7 @@ mod tests {
     use magnitude_service_contracts::models::ServableModelBundle;
     use std::path::PathBuf;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     /// A load's allocation holding nothing, without an expert bank.
     fn allocation(context_window_tokens: u32) -> ModelInstanceAllocation {
@@ -1873,6 +1893,8 @@ mod tests {
         idles: Arc<Mutex<Vec<Option<TestResident>>>>,
         /// Each load's sequence, held by its load's task until the task ends or is aborted.
         sequences: Arc<Mutex<Vec<std::sync::Weak<LoadSequence>>>>,
+        /// How many times residency's demand for the device ended.
+        demand_ends: Arc<AtomicUsize>,
     }
 
     #[derive(Default)]
@@ -2011,6 +2033,10 @@ mod tests {
             self.idle_timeout
         }
 
+        fn demand_ended(&self) {
+            self.demand_ends.fetch_add(1, Ordering::AcqRel);
+        }
+
         fn resident_idle(&self, resident: Option<(&ModelInstanceId, &TestResident)>) {
             self.idles.lock().unwrap().push(resident.map(|(_, resident)| resident.clone()));
         }
@@ -2048,6 +2074,7 @@ mod tests {
             idle_timeout,
             idles: Arc::default(),
             sequences: Arc::default(),
+            demand_ends: Arc::default(),
         };
         let actor = tokio::spawn(ModelResidency::new(driver).run(inbox));
         (client, load_events, workers, actor)
@@ -2069,6 +2096,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(600),
             idles: Arc::clone(&idles),
             sequences: Arc::default(),
+            demand_ends: Arc::default(),
         };
         let _actor = tokio::spawn(ModelResidency::new(driver).run(inbox));
         let published = || idles.lock().unwrap().clone();
@@ -2095,6 +2123,42 @@ mod tests {
         drop(lease);
         client.stop(instance).await.unwrap();
         assert_eq!(published().last(), Some(&None), "a stopped instance is not idle");
+    }
+
+    /// Residency's demand for the device holds from the first load through a replacement, the
+    /// release and the next load among it, and ends only once nothing is resident or queued:
+    /// the device is never free between a release and the load queued behind it.
+    #[tokio::test]
+    async fn the_device_demand_spans_a_replacement_and_ends_when_nothing_is_resident() {
+        let (client, inbox) = ResidencyClient::channel();
+        let (loads, _loads) = tokio::sync::mpsc::unbounded_channel();
+        let demand_ends = Arc::new(AtomicUsize::new(0));
+        let driver = TestResidencyDriver {
+            client: client.clone(),
+            next_instance_id: Arc::new(AtomicU64::new(1)),
+            loads,
+            auto_ready: true,
+            workers: Arc::default(),
+            idle_timeout: std::time::Duration::from_secs(600),
+            idles: Arc::default(),
+            sequences: Arc::default(),
+            demand_ends: Arc::clone(&demand_ends),
+        };
+        let _actor = tokio::spawn(ModelResidency::new(driver).run(inbox));
+        let inference = || ResidencyAcquisition::Inference { progress: None };
+        let ResidencyGrant::Lease(first) = client.acquire(test_target("model-a"), inference()).await.unwrap() else {
+            panic!("an inference acquisition is leased")
+        };
+        drop(first);
+        let ResidencyGrant::Lease(second) = client.acquire(test_target("model-b"), inference()).await.unwrap() else {
+            panic!("an inference acquisition is leased")
+        };
+        assert_eq!(demand_ends.load(Ordering::Acquire), 0, "the replacement keeps the demand");
+        let instance = second.instance_id().clone();
+        drop(second);
+        client.stop(instance).await.unwrap();
+        client.snapshot().await.unwrap();
+        assert_eq!(demand_ends.load(Ordering::Acquire), 1, "the demand ends once nothing is resident");
     }
 
     fn assert_explicit_stop(result: Result<ResidencyGrant<TestResident>, InventoryError>) {
@@ -2569,6 +2633,7 @@ mod tests {
                 idle_timeout: std::time::Duration::from_secs(600),
                 idles: Arc::default(),
                 sequences: Arc::clone(&sequences),
+                demand_ends: Arc::default(),
             };
             let actor = tokio::spawn(ModelResidency::new(driver).run(inbox));
             let loading = tokio::spawn({ let client = client.clone(); async move {

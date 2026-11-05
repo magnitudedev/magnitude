@@ -98,6 +98,10 @@ struct EngineResidency {
     supervisor: MemorySupervisor,
     preparations: PreparationJobs,
     next_instance_id: Arc<AtomicU64>,
+    /// Residency's share of the device while it has demand
+    /// ([`ModelResidencyDriver::demand_ended`]): taken by the first load, held across each release
+    /// and the next queued load, so the device is never free between them.
+    demand: Arc<std::sync::Mutex<Option<Arc<DeviceShare>>>>,
 }
 
 /// The model instances this service holds: residency, load plans and host-only resolution.
@@ -138,6 +142,7 @@ impl ModelInstances {
             supervisor: supervisor.clone(),
             preparations: preparations.clone(),
             next_instance_id: Arc::new(AtomicU64::new(1)),
+            demand: Arc::default(),
         };
         magnitude_service_utils::owner::spawn("model residency", ModelResidency::new(driver).run(inbox));
         Self {
@@ -661,20 +666,34 @@ impl EngineResidency {
     ) -> Result<PreparedResidency<ResidentEngine>, ModelOperationFailure> {
         let environment = &self.environment;
         let resolved = environment.configurations.resolve(&configuration).await?;
-        // The load shares the device for its lifetime: its workers hold the share until each is
-        // proven retired. A job holding it (the measurement job or a catalog optimization, of
-        // this bundle or any other) is preempted: the load waits only for its bounded kill, and
-        // the records an optimization published stand.
-        let device = Arc::new(match environment.device.try_share() {
-            Some(device) => device,
-            None => {
-                self.progress(instance_id, ModelLoadStage::Queued, None);
-                tracing::info!("load preempts the job holding the device and waits for its kill");
-                let device = environment.device.share().await;
-                self.progress(instance_id, ModelLoadStage::Preparing, None);
+        // The load shares the device through residency's demand: its workers hold the share
+        // until each is proven retired, and residency until its demand ends. A load after a
+        // release takes the share residency kept, so no job starts between them; the measurement
+        // job beside the released model, preempted by its release, is gone first. The first load
+        // takes the share: a job holding the device (the measurement job or a catalog
+        // optimization, of this bundle or any other) is preempted, the load waits for its process
+        // to be gone, and the records an optimization published stand.
+        let held = self.demand.lock().expect("device demand").clone();
+        let device = match held {
+            Some(device) => {
+                environment.device.admit_request().await;
                 device
             }
-        });
+            None => {
+                let device = Arc::new(match environment.device.try_share() {
+                    Some(device) => device,
+                    None => {
+                        self.progress(instance_id, ModelLoadStage::Queued, None);
+                        tracing::info!("load preempts the job holding the device and waits for its kill");
+                        let device = environment.device.share().await;
+                        self.progress(instance_id, ModelLoadStage::Preparing, None);
+                        device
+                    }
+                });
+                *self.demand.lock().expect("device demand") = Some(Arc::clone(&device));
+                device
+            }
+        };
         if !self.supervisor.admission_open() {
             self.progress(instance_id, ModelLoadStage::Queued, None);
             tracing::info!("load waits for system memory to recover from pressure");
@@ -925,6 +944,10 @@ impl ModelResidencyDriver for EngineResidency {
 
     fn idle_timeout(&self) -> std::time::Duration {
         self.environment.idle_timeout
+    }
+
+    fn demand_ended(&self) {
+        self.demand.lock().expect("device demand").take();
     }
 
     fn resident_idle(&self, resident: Option<(&ModelInstanceId, &ResidentEngine)>) {
