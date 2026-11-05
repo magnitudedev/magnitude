@@ -246,6 +246,7 @@ def releases(lines):
             found.append({"at": event["at"], "rung": rung, "ms": event["micros"] / 1e3,
                           "bytes": event.get("grown" if rung == "Growth" else "released"),
                           **{key: event.get(key) for key in ("bank_slots", "charged_before", "charged_after",
+                                                              "claimed_before", "claimed_after",
                                                               "footprint_before", "footprint_after", "holding", "from", "to", "cause",
                                                               "reclaim_device_deficit_bytes", "reclaim_host_deficit_bytes")}})
             if rung == "Bank":

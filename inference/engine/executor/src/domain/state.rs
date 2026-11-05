@@ -79,12 +79,16 @@ pub enum MeasurementRoom {
     Draining,
 }
 
-/// What the process holds at one moment: Seismic's device charge and the
-/// process footprint where the platform reports one, read on each side of a
-/// release.
+/// What the process holds at one moment, read on each side of a release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryMoment {
+    /// What the device's allocations charge on its store.
     pub charged: u64,
+    /// What the device claims there: its allocations, or what its backend
+    /// holds natively where that is more (block slack, recorded graphs). A
+    /// release of backend holdings shows here and not in `charged`.
+    pub claimed: u64,
+    /// The process footprint, where the platform reports one.
     pub footprint: Option<u64>,
 }
 
@@ -1424,12 +1428,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// What the process holds now (`MemoryMoment`).
     pub fn memory_moment(&self) -> MemoryMoment {
+        let ledger = self.domain.device().device_ledger();
         MemoryMoment {
-            charged: self
-                .domain
-                .device()
-                .device_ledger()
-                .charged,
+            charged: ledger.charged,
+            claimed: ledger.claim,
             footprint: seismic::ProcessMemory::read().footprint_bytes,
         }
     }
