@@ -4557,6 +4557,24 @@ mod ladder_tests {
         assert!(!ladder.settled(), "nothing more at a rung leaves the pending release");
     }
 
+    /// A slot release and a bank resize pending at once each hold the
+    /// ladder until its own finish: either finishing first leaves the other
+    /// pending.
+    #[test]
+    fn a_slot_release_and_a_bank_resize_pending_at_once_each_finish_alone() {
+        use crate::release::Pending;
+        for (first, second) in [(Pending::Slots, Pending::Bank), (Pending::Bank, Pending::Slots)] {
+            let mut ladder = Ladder::default();
+            ladder.released(Release::Pending(Pending::Slots));
+            ladder.released(Release::Pending(Pending::Bank));
+            *ladder.pending.of(first) = false;
+            assert!(!ladder.settled(), "{second:?} still runs after {first:?} finished");
+            assert!(*ladder.pending.of(second));
+            *ladder.pending.of(second) = false;
+            assert!(ladder.settled());
+        }
+    }
+
     /// What the host has yet to show released holds refusal and unload, as a
     /// running release does.
     #[test]

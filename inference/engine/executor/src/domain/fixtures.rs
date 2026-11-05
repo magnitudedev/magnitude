@@ -988,9 +988,9 @@ impl ElasticBank for FakeBank {
         }
         let mut resize = self.resize.lock().unwrap();
         let (next, finished) = match resize.take().unwrap() {
-            FakeResize::Prepared(prepared, before, _) => match prepared.install() {
+            FakeResize::Prepared(prepared, before, grows) => match prepared.install() {
                 Ok(release) => (FakeResize::Releasing(release, before), None),
-                Err(refused) => (FakeResize::Refused(refused.resizer, refused.error, true), None),
+                Err(refused) => (FakeResize::Refused(refused.resizer, refused.error, !grows), None),
             },
             // The release taken now, or already by the bank's own thread.
             FakeResize::Releasing(release, before) => {
