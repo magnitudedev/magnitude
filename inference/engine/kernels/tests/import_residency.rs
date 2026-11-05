@@ -574,8 +574,10 @@ fn streamed_conversion(
 /// conversion (`routed_convert`, record by record into scratch slots),
 /// so a streamed record holds what the resident import places. Shapes cover
 /// a row count off the 16-row tile, several matrices, a packing axis with an
-/// odd number of q8 packets (mma16 pads rows to whole 64-column k-blocks)
-/// and a partial trailing packet.
+/// odd number of q8 packets (mma16 pads rows to whole 64-column k-blocks),
+/// a partial trailing packet; the streamed conversion of whole tiles of
+/// several records is at a row tile of several windows that a converting
+/// block's mirror does not hold.
 fn repack_matches_the_registered_conversion(
     device: &seismic::Device,
     layouts: &[seismic::Layout],
@@ -588,7 +590,11 @@ fn repack_matches_the_registered_conversion(
     for (source_element, operands) in conversions() {
         let source_name = source_element.name();
         let group = source_element.logical_group().unwrap();
-        for shape in [[1, 17, 3 * group], [3, 5, 2 * group - 8], [2, 16, group]] {
+        // Whole tiles of several records: their streamed conversion runs at
+        // the wide record's width (below), so the streamed entry converts as
+        // many shapes as the others.
+        let whole_tiles = [2, 16, group];
+        for shape in [[1, 17, 3 * group], [3, 5, 2 * group - 8], whole_tiles] {
             let length = source_element.canonical_byte_len(&shape).unwrap();
             let bytes = source_bytes(length, shape[1] as u32);
             let source =
@@ -630,7 +636,7 @@ fn repack_matches_the_registered_conversion(
                     .repack_host(source_element, &shape, &bytes)
                     .unwrap();
                 assert_eq!(actual, expected, "{label}");
-                if streams && layout == device.backend().resident_layout() {
+                if streams && layout == device.backend().resident_layout() && shape != whole_tiles {
                     assert!(
                         streamed_conversion(&device, &source, destination, &shape) == expected,
                         "{label}: streamed"
@@ -649,6 +655,26 @@ fn repack_matches_the_registered_conversion(
                     "{label}"
                 );
             }
+        }
+        // A streamed record whose row tile is wider than a converting
+        // block's mirror (CUDA then converts it in place) and spans several
+        // windows, as the catalog's widest records do.
+        let resident = device.backend().resident_layout();
+        let destination = source_element.converted(resident, operands).filter(|_| streams && layouts.contains(&resident));
+        if let Some(destination) = destination.filter(|&destination| records || !has_records(destination)) {
+            let mut wide = group;
+            while destination.canonical_byte_len(&[1, constants::CONVERT_TILE_ROWS, wide]).unwrap() <= constants::MIRROR_BYTES {
+                wide *= 2;
+            }
+            let shape = [whole_tiles[0], whole_tiles[1], wide];
+            let bytes = source_bytes(source_element.canonical_byte_len(&shape).unwrap(), shape[1] as u32);
+            let source = seismic::Tensor::from_host(&device, source_element, &shape, &bytes).unwrap();
+            assert!(
+                streamed_conversion(&device, &source, destination, &shape)
+                    == destination.repack_host(source_element, &shape, &bytes).unwrap(),
+                "{source_name} -> {} over {shape:?}: streamed",
+                destination.name()
+            );
         }
     }
 }
