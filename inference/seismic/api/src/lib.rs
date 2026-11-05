@@ -339,13 +339,6 @@ impl Devices {
         self.inner.status(topology, executor)
     }
 
-    /// [`Self::status`] with host RAM as last sampled, no older than
-    /// [`DISPLACEMENT_CADENCE`](crate::DISPLACEMENT_CADENCE): an observation
-    /// between claims, which reads no host file on the caller's thread.
-    pub fn observed_status(&self, topology: &DeviceTopology, executor: ExecutorId) -> Status {
-        self.inner.observed_status(topology, executor)
-    }
-
     /// What executor `id`'s recorded graphs hold for their census
     /// ([`Device::graph_cost`]): its backend measures it on opening, once
     /// per device in a process, so this opens the executor, sharing it

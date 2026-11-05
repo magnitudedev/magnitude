@@ -85,25 +85,16 @@ pub(crate) fn pin(cpus: &[usize]) -> Result<(), String> {
 }
 
 /// One host RAM status read now, with the displacement windows `sampler`
-/// has formed: what a claim of host RAM is judged against.
+/// has formed: what every claim of host RAM and every observation between
+/// claims reads, so a decision never stands on a reading older than itself.
 pub(crate) fn status(sampler: &HostSampler) -> Result<HostStatus, ObservationError> {
     sampler.status(platform::sample()?)
 }
 
-/// The host RAM status `sampler` read at its last tick, with its
-/// displacement windows: what an observation between claims reads, no
-/// older than one [`DISPLACEMENT_CADENCE`], with no read of the host on
-/// the observer's thread.
-pub(crate) fn observed(sampler: &HostSampler) -> Result<HostStatus, ObservationError> {
-    let latest = sampler.running.lock().latest.clone()?;
-    sampler.status(latest)
-}
-
-/// The cadence the host is sampled at: the 1 s samples of the M1 Ultra
-/// traces the memory policy's distress rules were judged on. Every
-/// displacement window is about this long however often a consumer reads
-/// the host, so how often it reads changes no verdict; an observed status
-/// ([`observed`]) is this fresh.
+/// The cadence the host's displacement counters are sampled at: the 1 s
+/// samples of the M1 Ultra traces the memory policy's distress rules were
+/// judged on. Every displacement window is about this long however often a
+/// consumer reads the host, so how often it reads changes no verdict.
 pub const DISPLACEMENT_CADENCE: Duration = Duration::from_secs(1);
 
 /// A reading of the host's cumulative displacement counters. Each platform
@@ -112,26 +103,23 @@ pub const DISPLACEMENT_CADENCE: Duration = Duration::from_secs(1);
 /// does, none where it does not.
 type ReadCounters = fn() -> Result<DisplacementCounters, ObservationError>;
 
-/// The host's samples for one inventory, taken by a thread every
+/// The displacement history of one inventory, on a platform that counts
+/// displacement: its counters, read by a thread every
 /// [`DISPLACEMENT_CADENCE`] from its start to the sampler's drop, which
-/// stops and joins it: each tick's host RAM sample, the latest of which an
-/// observation reads ([`observed`]), and, on a platform that counts
-/// displacement, its counters, which form the displacement history.
+/// stops and joins it. Where the platform counts none there is nothing to
+/// sample and no thread.
 pub(crate) struct HostSampler {
-    running: Arc<Sampled>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    running: Option<(Arc<Sampled>, std::thread::JoinHandle<()>)>,
 }
 
 struct Sampled {
-    read: Option<ReadCounters>,
+    read: ReadCounters,
     state: Mutex<SampledState>,
     /// Signalled when the sampler is dropped.
     stop: Condvar,
 }
 
 struct SampledState {
-    /// The last tick's host RAM sample, or why it could not be taken.
-    latest: Result<HostSample, ObservationError>,
     history: DisplacementHistory,
     /// The last tick's failed counter reading: the windows are unknown
     /// until a reading succeeds again, which opens a fresh window.
@@ -142,15 +130,14 @@ struct SampledState {
 impl HostSampler {
     /// Start sampling, from a first reading now.
     pub(crate) fn start() -> Result<Self, ObservationError> {
-        let read = platform::DISPLACEMENT_COUNTERS;
+        let Some(read) = platform::DISPLACEMENT_COUNTERS else {
+            return Ok(Self { running: None });
+        };
         let mut history = DisplacementHistory::default();
-        if let Some(read) = read {
-            history.record(Instant::now(), read()?);
-        }
+        history.record(Instant::now(), read()?);
         let sampled = Arc::new(Sampled {
             read,
             state: Mutex::new(SampledState {
-                latest: Ok(platform::sample()?),
                 history,
                 failed: None,
                 stopped: false,
@@ -165,8 +152,7 @@ impl HostSampler {
             })
             .map_err(|error| ObservationError::Failed(format!("host sampler thread: {error}")))?;
         Ok(Self {
-            running: sampled,
-            thread: Some(thread),
+            running: Some((sampled, thread)),
         })
     }
 
@@ -174,10 +160,10 @@ impl HostSampler {
     /// windows: the completed windows of the last [`DISPLACEMENT_HISTORY`],
     /// none on a platform that counts no displacement.
     fn status(&self, sample: HostSample) -> Result<HostStatus, ObservationError> {
-        let displacement = match self.running.read {
+        let displacement = match &self.running {
             None => None,
-            Some(_) => {
-                let state = self.running.lock();
+            Some((sampled, _)) => {
+                let state = sampled.lock();
                 match &state.failed {
                     Some(error) => return Err(error.clone()),
                     None => Some(state.history.completed.clone()),
@@ -223,17 +209,14 @@ impl Sampled {
                 return;
             }
             drop(state);
-            let sample = platform::sample();
-            let reading = self.read.map(|read| read());
+            let reading = (self.read)();
             state = self.lock();
-            state.latest = sample;
             match reading {
-                None => {}
-                Some(Ok(counters)) => {
+                Ok(counters) => {
                     state.history.record(Instant::now(), counters);
                     state.failed = None;
                 }
-                Some(Err(error)) => {
+                Err(error) => {
                     state.history.open = None;
                     state.failed = Some(error);
                 }
@@ -244,9 +227,9 @@ impl Sampled {
 
 impl Drop for HostSampler {
     fn drop(&mut self) {
-        if let Some(thread) = self.thread.take() {
-            self.running.lock().stopped = true;
-            self.running.stop.notify_all();
+        if let Some((sampled, thread)) = self.running.take() {
+            sampled.lock().stopped = true;
+            sampled.stop.notify_all();
             thread.join().expect("the host sampler does not panic");
         }
     }
@@ -254,7 +237,6 @@ impl Drop for HostSampler {
 
 /// One platform sample, before the displacement history of the inventory
 /// that took it is applied.
-#[derive(Clone)]
 pub(crate) struct HostSample {
     pub(crate) allocatable: Reported<u64>,
     pub(crate) obtainable: Reported<u64>,

@@ -88,11 +88,6 @@ impl StatusReading for StillHost {
         }
         seismic::Status { sample, runtime }
     }
-
-    /// A still host reads the same however it is read.
-    fn observed(&self, device: &seismic::Device) -> seismic::Status {
-        self.status(device)
-    }
 }
 
 /// The planning fixture's model (the smallest geometry every native kernel

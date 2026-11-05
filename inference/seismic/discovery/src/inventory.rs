@@ -77,20 +77,6 @@ impl Inventory {
     /// inventory's sampler has formed. A [`Sample`] reads host RAM the same
     /// way, so its headroom ([`crate::Status::headroom`]) and this agree.
     pub fn host_status(&self) -> Result<HostStatus, ObservationError> {
-        self.with_sampler(host::status)
-    }
-
-    /// Host RAM as this inventory's sampler read it at its last tick, no
-    /// older than [`crate::DISPLACEMENT_CADENCE`]: [`Self::host_status`]
-    /// without reading the host on the caller's thread.
-    pub fn observed_host_status(&self) -> Result<HostStatus, ObservationError> {
-        self.with_sampler(host::observed)
-    }
-
-    fn with_sampler(
-        &self,
-        read: impl FnOnce(&HostSampler) -> Result<HostStatus, ObservationError>,
-    ) -> Result<HostStatus, ObservationError> {
         let mut sampler = self
             .sampler
             .lock()
@@ -98,21 +84,14 @@ impl Inventory {
         if sampler.is_none() {
             *sampler = Some(HostSampler::start()?);
         }
-        read(sampler.as_ref().expect("started above"))
+        host::status(sampler.as_ref().expect("started above"))
     }
 
     /// One reading of the status of `topology`'s stores and of the grants
-    /// of `executors`, host RAM read now: what a claim is judged against.
+    /// of `executors`, host RAM read now: what a claim and every
+    /// observation between claims is judged against.
     pub fn sample(&self, topology: &DeviceTopology, executors: &[ExecutorId]) -> Sample {
         let host_ram = self.host_status();
-        status::sample(topology, executors, &self.state().natives, host_ram)
-    }
-
-    /// [`Self::sample`] with host RAM as the sampler last read it
-    /// ([`Self::observed_host_status`]): what an observation between claims
-    /// reads.
-    pub fn observe(&self, topology: &DeviceTopology, executors: &[ExecutorId]) -> Sample {
-        let host_ram = self.observed_host_status();
         status::sample(topology, executors, &self.state().natives, host_ram)
     }
 

@@ -150,21 +150,14 @@ fn besides(demand: ClaimDemand, beside: u64) -> Result<ClaimDemand, ClaimRefusal
 /// alone: no other executor's grant is read. Seismic's catalog reads the
 /// live machine; a test gives the readings it decides on.
 pub trait StatusReading {
-    /// A sample with host RAM read now: what a claim is judged against.
+    /// A sample with host RAM read now: what a claim, and every observation
+    /// between claims ([`DeviceHeap::refresh`]), is judged against.
     fn status(&self, device: &Device) -> seismic::Status;
-    /// A sample with host RAM as last sampled: what an observation between
-    /// claims ([`DeviceHeap::refresh`]) reads, with no read of the host on
-    /// the observer's thread.
-    fn observed(&self, device: &Device) -> seismic::Status;
 }
 
 impl StatusReading for Devices {
     fn status(&self, device: &Device) -> seismic::Status {
         Devices::status(self, device.topology(), device.info().id())
-    }
-
-    fn observed(&self, device: &Device) -> seismic::Status {
-        Devices::observed_status(self, device.topology(), device.info().id())
     }
 }
 
@@ -248,13 +241,14 @@ impl DeviceHeap {
         &mut self.heap
     }
 
-    /// Observe every domain the device uses, host RAM as last sampled
-    /// (`StatusReading::observed`), set Seismic's allocation ceiling from
-    /// the readings, and refresh the heap's view from them. A claim reads
-    /// its own fresh sample ([`Self::check`]).
-    /// A failed observation revokes unspent grants and leaves the heap Blind.
+    /// Observe every domain the device uses from a sample read now, set
+    /// Seismic's allocation ceiling from the readings, and refresh the
+    /// heap's view from them: a release the process made shows in the next
+    /// one, so no decision stands on a reading older than the release before
+    /// it. A failed observation revokes unspent grants and leaves the heap
+    /// Blind.
     pub fn refresh(&mut self) -> Result<Vec<DomainReading>, MemoryPolicyError> {
-        let status = self.reading.observed(&self.device);
+        let status = self.reading.status(&self.device);
         self.observe(&status)
     }
 

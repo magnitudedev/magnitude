@@ -165,16 +165,6 @@ impl Devices {
         }
     }
 
-    /// [`Self::status`] with host RAM as the inventory's sampler last read
-    /// it (`Inventory::observe`): an observation between claims, which
-    /// reads no host file on the caller's thread.
-    pub fn observed_status(&self, topology: &DeviceTopology, executor: ExecutorId) -> Status {
-        Status {
-            sample: self.inventory.observe(topology, &[executor]),
-            runtime: self.runtime_status(topology, executor),
-        }
-    }
-
     /// What only opened executors know: each store's ledger, and what is
     /// left of each grant of `of` when it is an opened CUDA executor.
     fn runtime_status(&self, topology: &DeviceTopology, of: ExecutorId) -> RuntimeStatus {
