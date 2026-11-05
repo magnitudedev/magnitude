@@ -2,6 +2,7 @@
 in the checkout's own target, jobs recorded and fetched, failures with their logs, and the
 report a run writes when asked; and how a caller follows a run to its end or its estimate."""
 
+import argparse
 import contextlib
 import dataclasses
 import json
@@ -993,3 +994,38 @@ def test_waiting_records_its_estimate_and_justification(rig, capsys):
     assert code == 2 and "the answer" in capsys.readouterr().out
     assert engine.waits(directory)[0]["justification"] == "a cold build of 40 crates"
     assert engine.waits(directory)[0]["estimate_seconds"] == 600
+
+
+def _follower(ignores_stop: bool) -> subprocess.Popen:
+    """A stand-in run caller: one that takes SIGTERM, or one hung past it; returned once it has
+    set its handling up (its "ready" line)."""
+    script = ("import signal, sys, time\n" + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignores_stop else "")
+              + "print('ready', flush=True)\ntime.sleep(60)\n")
+    follower = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True)
+    assert follower.stdout.readline() == "ready\n"
+    return follower
+
+
+def test_a_stopped_caller_that_ends_is_left_to_fetch_its_run(rig, monkeypatch):
+    follower = _follower(ignores_stop=False)
+    record = state.RunState("20261105T000000Z-step-aaaaaa", {"host": "alpha"})
+    record.value["pid"] = follower.pid
+    record.write()
+    assert cli._stop(argparse.Namespace(run="aaaaaa")) == 0
+    follower.wait(5)
+
+
+def test_a_stopped_caller_hung_past_its_stop_is_ended_and_its_runner_stopped(rig, monkeypatch):
+    follower = _follower(ignores_stop=True)
+    record = state.RunState("20261105T000000Z-step-bbbbbb", {"host": "alpha"})
+    record.value["pid"] = follower.pid
+    record.write()
+    state.Launched("20261105T000000Z-step-bbbbbb", "alpha", ["agent"], Path("results"), ()).write()
+    monkeypatch.setattr(cli, "STOP_SECONDS", 1.0)
+    stopped = []
+    monkeypatch.setattr(cli, "connect", lambda host: host)
+    monkeypatch.setattr(cli, "HostRun", lambda remote, run, agent: types.SimpleNamespace(stop=lambda: stopped.append(run) or {"stopped": True}))
+    monkeypatch.setattr(cli.Hosts, "load", lambda: types.SimpleNamespace(host=lambda name: name))
+    assert cli._stop(argparse.Namespace(run="bbbbbb")) == 0
+    assert not state.alive(follower.pid)  # `alive` reaps it, so its own wait reads no signal
+    assert stopped == ["20261105T000000Z-step-bbbbbb"]

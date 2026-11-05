@@ -181,12 +181,19 @@ def _wait(arguments) -> int:
 
 def _stop(arguments) -> int:
     """Stop the run through the process following it, which delivers the stop and fetches the
-    run; with none, stop its runner directly (the next command fetches it)."""
+    run; with none, stop its runner directly (the next command fetches it). A follower that has
+    neither begun delivering its stop nor ended `STOP_SECONDS` after it is hung: it is ended,
+    and its runner is stopped as a run whose caller is gone is."""
     run = state.run_state(arguments.run)
     if run is not None:
         os.kill(run["pid"], signal.SIGTERM)
         print(f"stopping {run['run']} on {run['host']}")
-        return 0
+        if _takes_stop(run, STOP_SECONDS):
+            return 0
+        os.kill(run["pid"], signal.SIGKILL)
+        if not _takes_stop(run, STOP_SECONDS):
+            raise SystemExit(f"{run['run']}: its caller {run['pid']} did not end when killed")
+        print(f"{run['run']}: its caller did not take the stop in {STOP_SECONDS:.0f} s; ended it")
     launched = next((value for value in state.Launched.gone() if value["run"].endswith(arguments.run)), None)
     if launched is None:
         raise SystemExit(f"no run {arguments.run} in flight on this machine")
@@ -194,6 +201,22 @@ def _stop(arguments) -> int:
     stopped = HostRun(remote, launched["run"], launched["agent"]).stop()
     print(f"stopping {launched['run']} on {launched['host']}: {stopped}")
     return 0
+
+
+# How long a run's caller has to begin delivering its stop (`engine._stop_when`).
+STOP_SECONDS = 30.0
+
+
+def _takes_stop(run: dict, seconds: float) -> bool:
+    """Whether run `run`'s caller, within `seconds`, has ended or begun delivering its stop."""
+    deadline = time.monotonic() + seconds
+    while True:
+        current = state.run_state(run["run"])
+        if current is None or current["pid"] != run["pid"] or "stopping" in current:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
 
 
 def _collect(out, *, rest: bool) -> int:

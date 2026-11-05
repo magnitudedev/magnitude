@@ -90,9 +90,9 @@ def live_runs() -> list[dict]:
     runs = []
     for path in sorted(RUNS.glob("*.json")) if RUNS.is_dir() else ():
         try:
-            value = json.loads(path.read_text())
-        except (OSError, ValueError):
-            continue
+            value = json.loads(path.read_text())  # written whole (`_atomic`)
+        except FileNotFoundError:
+            continue  # its run ended since the listing
         if alive(value["pid"]):
             runs.append(value)
         else:

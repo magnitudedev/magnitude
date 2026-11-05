@@ -983,6 +983,7 @@ def _stop_when(run: Run, stop: threading.Event, followed: threading.Event) -> No
     nothing once the run has been followed to its end."""
     stop.wait()
     if not followed.is_set():
+        run.state.update(stopping=time.time())  # `mrig stop` waits for this
         _retrying(run, "stop", run.host.stop)
 
 
