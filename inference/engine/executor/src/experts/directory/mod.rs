@@ -566,16 +566,21 @@ impl Directory {
         self.host.iter().all(HostRecords::complete)
     }
 
-    /// Whether group `group`'s host tier keeps every expert of its layers;
-    /// false where the bank has no tier.
-    pub fn group_tier_complete(&self, group: usize) -> bool {
-        self.host[group].complete()
+    /// Whether group `group`'s host tier keeps every expert of its layers
+    /// where no flight takes it ([`HostRecords::settled`]); false where the
+    /// bank has no tier.
+    pub fn group_tier_settled(&self, group: usize) -> bool {
+        self.host[group].settled()
     }
 
     /// Whether no expert of group `group`'s layers can miss, every one
     /// mapped where a pass reads it in place: beside a host tier, held in
     /// the bank; where the host places, kept in the one store, whose
-    /// records are the bank's.
+    /// records are the bank's, its lent records among them. A lender's
+    /// claimed lent record unmaps its expert, but only a prompt group that
+    /// is not resident claims, and the lender's layers count as whole only
+    /// while every group is, when every prompt group is resident
+    /// (`Residency::publish_policy`).
     pub fn group_whole(&self, group: usize) -> bool {
         match self.placer {
             crate::planning::Placer::Tier => {

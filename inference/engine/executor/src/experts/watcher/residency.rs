@@ -353,11 +353,11 @@ impl Residency {
     /// counts once it holds its record: a group's word turns on a flight
     /// late, never early. Its resolved word is set while it is whole or its
     /// group's host tier keeps every expert outside the conveyor's lent
-    /// records (`HostRecords::complete`): no route of its can find an
+    /// records (`HostRecords::settled`): no route of its can find an
     /// expert absent, so its tier wait is not encoded. The tier gives up a
     /// kept expert mid-flight only to land one it lacks, which a complete
     /// tier never does, or to a prompt group's claim of a lent record,
-    /// which a complete tier keeps none in; otherwise only in a shrink
+    /// which a settled tier keeps none in; otherwise only in a shrink
     /// between flights, after which this publishes.
     pub(super) fn publish_policy(&mut self) {
         let directory = &self.core.directory;
@@ -371,7 +371,7 @@ impl Residency {
             self.whole[index] = whole;
             self.shared.telemetry.whole(index, whole);
             layer.policy.store(constants::POLICY_WHOLE as usize, i32::from(whole));
-            let resolved = whole || self.core.directory.group_tier_complete(layer.group);
+            let resolved = whole || self.core.directory.group_tier_settled(layer.group);
             layer.policy.store(constants::POLICY_RESOLVED as usize, i32::from(resolved));
             layer.policy.store(constants::POLICY_HOME as usize, self.homes[index]);
         }
