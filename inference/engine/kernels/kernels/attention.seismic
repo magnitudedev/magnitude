@@ -228,7 +228,7 @@ native attention_output for cuda from "cuda/attention_output.cu":
 native attention_output for vulkan from "vulkan/attention_output.comp":
     static (D, SN, IN, Q, W, OS)
     params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16,
-            TILE_M in [128, 64, 32] default 128, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32,
+            TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32,
             arithmetic SPLIT in [1, 2, 4] default 1)
     let GEMV_GROUPS = ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES)
     let GEMV_THREADS = SIMDGROUPS * 32
@@ -502,7 +502,7 @@ native attention_project for cuda from "cuda/attention_project.cu":
 native attention_project for vulkan from "vulkan/attention_project.comp":
     static (D, PT, NM, Q, GR, K, V, QS, GS, KS, VS)
     params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16,
-            TILE_M in [128, 64, 32] default 128, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
+            TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
     let GEMV_GROUPS = ceil_div(Q, SIMDGROUPS * ROWS * 32 / LANES) + ceil_div(GR, SIMDGROUPS * ROWS * 32 / LANES) + ceil_div(K, SIMDGROUPS * ROWS * 32 / LANES) + ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES)
     let GEMV_THREADS = SIMDGROUPS * 32
     let GEMV_SHARED = 256 + 32 * operands(QW) + min(8 * ceil_div(D, 32), 288) * 72

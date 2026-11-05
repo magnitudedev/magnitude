@@ -911,7 +911,7 @@ native routed_combine for cuda from "cuda/routed_combine.cu":
 # down GEMM, then the unpermuting combine.
 native routed_combine for vulkan from "vulkan/routed_combine.comp":
     static (H, SN, IN, K, S)
-    params (TILE_M in [128, 64, 32] default 128, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
+    params (TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
     where SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch shared_product bytes (M * S * 2)
     scratch shared_output bytes (M * H * 2)

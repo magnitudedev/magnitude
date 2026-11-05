@@ -776,6 +776,15 @@ void projection_gemv(const int wk, const int uk, const bool paired, const uint r
 //
 // A GEMM launch declares TM * TN * 32 / (WM * WN) invocations and (TM + TN) *
 // 80 shared bytes; TM in {32, 64, 128}, TN in {64, 128}, WM <= TM, WN <= TN.
+// The declarations default to 64 x 128 tiles of 32 x 32 sub-tiles (256
+// invocations). On an RTX 3090 (NVIDIA 595.91.07, attention_project at
+// Qwen3.6 35B prefill shapes) its pipelines' statistics separate the slow
+// shapes: every 64 x 64 sub-tile reaches the 255-register ceiling and spills
+// (6.2-7.1x the best), and 128 x 128 tiles of 32 x 32 sub-tiles take 128
+// registers in each of 512 invocations, the whole register file (6.6x).
+// 64 x 128 / 32 x 32 (128 registers, 256 invocations) is the best there, and
+// on GB10 its recorded time is 1.12x the best of each GEMM entry (geometric
+// mean), where 128 x 128 / 32 x 32 was 1.15x.
 
 #define PROJECTION_GEMM_K 32u
 #define PROJECTION_GEMM_LDA 40u

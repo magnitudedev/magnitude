@@ -194,7 +194,7 @@ native dense_expand for metal from "metal/dense_expand.metal":
 native dense_expand for vulkan from "vulkan/dense_expand.comp":
     static (H, F, GS, US)
     params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16,
-            TILE_M in [128, 64, 32] default 128, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
+            TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
     let GEMV_GROUPS = ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES)
     let GEMV_THREADS = SIMDGROUPS * 32
     let GEMV_SHARED = 256 + 32 * operands(GW) + min(8 * ceil_div(H, 32), 288) * 72
@@ -369,7 +369,7 @@ native dense_output for metal from "metal/dense_output.metal":
 native dense_output for vulkan from "vulkan/dense_output.comp":
     static (H, F, DS)
     params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16,
-            TILE_M in [128, 64, 32] default 128, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32,
+            TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32,
             arithmetic SPLIT in [1, 2, 4] default 1)
     let GEMV_GROUPS = ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES)
     let GEMV_THREADS = SIMDGROUPS * 32
@@ -511,7 +511,7 @@ native dense_up for metal from "metal/dense_up.metal":
 native dense_up for vulkan from "vulkan/dense_up.comp":
     static (H, F, US)
     params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16,
-            TILE_M in [128, 64, 32] default 128, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
+            TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
     let GEMV_GROUPS = ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES)
     let GEMV_THREADS = SIMDGROUPS * 32
     let GEMV_SHARED = 256 + 32 * operands(UW) + min(8 * ceil_div(H, 32), 288) * 72
@@ -589,7 +589,7 @@ native short_conv_project for metal from "metal/short_conv_project.metal":
 native short_conv_project for vulkan from "vulkan/short_conv_project.comp":
     static (H, CH, BS, CS, XS)
     params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16,
-            TILE_M in [128, 64, 32] default 128, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
+            TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
     let GEMV_GROUPS = 2 * ceil_div(CH, SIMDGROUPS * ROWS * 32 / LANES)
     let GEMV_THREADS = SIMDGROUPS * 32
     let GEMV_SHARED = 256 + 32 * operands(BW) + min(8 * ceil_div(H, 32), 288) * 72
@@ -666,7 +666,7 @@ native per_layer_gate for metal from "metal/per_layer_gate.metal":
 native per_layer_gate for vulkan from "vulkan/per_layer_gate.comp":
     static (D, L, P, GS)
     params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16,
-            TILE_M in [128, 64, 32] default 128, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
+            TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
     let GEMV_GROUPS = ceil_div(P, SIMDGROUPS * ROWS * 32 / LANES)
     let GEMV_THREADS = SIMDGROUPS * 32
     let GEMV_SHARED = 256 + 32 * operands(GW) + min(8 * ceil_div(D, 32), 288) * 72
@@ -807,7 +807,7 @@ native project_rows for metal from "metal/project_rows.metal":
 native project_rows for vulkan from "vulkan/project_rows.comp":
     static (K, N, WS)
     params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16,
-            TILE_M in [128, 64, 32] default 128, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32,
+            TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32,
             arithmetic SPLIT in [1, 2, 4] default 1)
     let GEMV_GROUPS = ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES)
     let GEMV_THREADS = SIMDGROUPS * 32

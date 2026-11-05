@@ -161,7 +161,7 @@ native stream_mix_down for cuda from "cuda/stream_mix_down.cu":
 native stream_mix_down for vulkan from "vulkan/stream_mix_down.comp":
     static (H, S, LR, C)
     params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16,
-            TILE_M in [128, 64, 32] default 128, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
+            TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
     let GEMV_GROUPS = ceil_div(LR, SIMDGROUPS * ROWS * 32 / LANES) + ceil_div(C * S, SIMDGROUPS * ROWS * 32 / LANES)
     let GEMV_THREADS = SIMDGROUPS * 32
     let GEMV_SHARED = 256 + min(8 * ceil_div(S * H, 32), 288) * 72
@@ -254,7 +254,7 @@ native stream_mix_up for cuda from "cuda/stream_mix_up.cu":
 native stream_mix_up for vulkan from "vulkan/stream_mix_up.comp":
     static (H, S, LR)
     params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16,
-            TILE_M in [128, 64, 32] default 128, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
+            TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
     let GEMV_GROUPS = ceil_div(S * H, SIMDGROUPS * ROWS * 32 / LANES)
     let GEMV_THREADS = SIMDGROUPS * 32
     let GEMV_SHARED = 256 + min(8 * ceil_div(LR, 32), 288) * 72
