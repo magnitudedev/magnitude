@@ -165,18 +165,15 @@ impl StoreLedger {
 
     /// The store's claim is the sum of its accounts' claims: checked in
     /// debug builds, taking the accounts' locks before the store's, as every
-    /// charge does.
+    /// charge does. The list of accounts stays locked throughout, so no
+    /// account opened meanwhile (by another device's open) is charged on the
+    /// store and missing from the sum.
     fn check(&self) {
         if !cfg!(debug_assertions) {
             return;
         }
-        let mut accounts = self
-            .accounts
-            .lock()
-            .expect("store accounts lock poisoned")
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect::<Vec<_>>();
+        let listed = self.accounts.lock().expect("store accounts lock poisoned");
+        let mut accounts = listed.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
         accounts.sort_by_key(|account| Arc::as_ptr(account));
         let held = accounts.iter().map(|account| account.state()).collect::<Vec<_>>();
         let sum = held.iter().map(|state| state.views.claim()).sum::<u64>();
@@ -252,18 +249,16 @@ impl Account {
     }
 
     /// The account's views are the sums of its shares': checked in debug
-    /// builds, taking the shares' locks before the account's.
+    /// builds, taking the shares' locks before the account's. The list of
+    /// shares stays locked throughout, so no share opened meanwhile (by
+    /// another device's open of the same path) is charged on the account and
+    /// missing from the sum.
     fn check(&self) {
         if !cfg!(debug_assertions) {
             return;
         }
-        let mut shares = self
-            .shares
-            .lock()
-            .expect("account shares lock poisoned")
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect::<Vec<_>>();
+        let listed = self.shares.lock().expect("account shares lock poisoned");
+        let mut shares = listed.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
         shares.sort_by_key(|share| Arc::as_ptr(share));
         let held = shares.iter().map(|share| share.state()).collect::<Vec<_>>();
         let sum = held.iter().fold(Views::default(), |sum, views| Views {
