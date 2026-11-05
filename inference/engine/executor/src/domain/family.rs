@@ -49,6 +49,14 @@ pub trait ElasticBank {
     /// The slots each layer commits now: what its directory serves from.
     fn slots(&self) -> u64;
 
+    /// The device bytes the bank can still grow by: what a growth to its
+    /// ceiling (every expert, or what a weight cap bounds,
+    /// `ExpertBankPlan::ceiling`) backs beyond its slots now; none at it.
+    fn growth_shortfall(&self) -> Result<u64, super::DomainError>;
+
+    /// Whether the bank holds every expert.
+    fn whole(&self) -> bool;
+
     /// Starve the bank's host for `duration`: neither its pulse beats nor a
     /// landing answers a request meanwhile, so a running step's waits end
     /// before their answers (a test's; a bank with no waits has nothing to

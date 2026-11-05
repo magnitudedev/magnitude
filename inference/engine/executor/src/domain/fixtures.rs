@@ -350,7 +350,19 @@ pub fn banked(backend: seismic::BackendName, rows: u64, committed: u64) -> Fixtu
 
 /// [`banked`], its launches pipelined (`lookahead`) or not.
 pub fn banked_with(backend: seismic::BackendName, rows: u64, committed: u64, lookahead: bool) -> Fixture {
-    let (mut domain, bindings) = fixture_on(None, lookahead, false, platform::DeviceRequest::Backend(backend));
+    with_bank(fixture_on(None, lookahead, false, platform::DeviceRequest::Backend(backend)), backend, rows, committed)
+}
+
+/// [`banked`] on a load whose prompt groups chain up to three launches, so
+/// a prompt's group can grow its places.
+pub fn banked_chain(backend: seismic::BackendName, rows: u64, committed: u64) -> Fixture {
+    let fixture = fixture_of(tiny_definition(), limits(2, 3, false), None, false, platform::DeviceRequest::Backend(backend));
+    with_bank(fixture, backend, rows, committed)
+}
+
+/// `fixture`, its family holding a fake bank of `rows` rows, `committed`
+/// of them backed ([`banked`]).
+fn with_bank((mut domain, bindings): Fixture, backend: seismic::BackendName, rows: u64, committed: u64) -> Fixture {
     let device = domain.domain.device();
     let row = match device.info().reserving(seismic::ReservedContract::DeviceOnly) {
         Ok(Some(reservation)) => reservation.granule,
@@ -649,6 +661,12 @@ pub struct FakeBank {
     /// Its charge's rises: none off the domain's thread, so held by none
     /// but the domain.
     rises: std::sync::Mutex<()>,
+    /// The device bytes it can still grow by to its ceiling
+    /// ([`ElasticBank::growth_shortfall`]), a test's: none unless set.
+    pub(crate) shortfall: u64,
+    /// Whether it holds every expert ([`ElasticBank::whole`]), a test's:
+    /// whole unless set; a fake at a weight cap's ceiling is not.
+    pub(crate) whole: bool,
 }
 
 enum FakeResize {
@@ -679,6 +697,8 @@ impl FakeBank {
             last_resize: std::sync::Mutex::new(None),
             host_last_resize: std::sync::Mutex::new(None),
             rises: std::sync::Mutex::new(()),
+            shortfall: 0,
+            whole: true,
         }
     }
 
@@ -738,6 +758,16 @@ impl ElasticBank for FakeBank {
 
     fn hold_rises(&self) -> std::sync::MutexGuard<'_, ()> {
         self.rises.lock().expect("the fake bank's charge rises")
+    }
+
+    /// What the test set ([`FakeBank::shortfall`]): its growth is the
+    /// test's.
+    fn growth_shortfall(&self) -> Result<u64, DomainError> {
+        Ok(self.shortfall)
+    }
+
+    fn whole(&self) -> bool {
+        self.whole
     }
 
     /// The fake's tier is filled as it opens.

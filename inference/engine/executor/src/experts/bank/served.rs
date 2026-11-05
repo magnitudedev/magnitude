@@ -457,6 +457,14 @@ impl ElasticBank for ServedBank {
         self.bank.slots()
     }
 
+    fn growth_shortfall(&self) -> Result<u64, DomainError> {
+        self.bank.growth_bytes(self.bank.plan.ceiling.max(self.bank.slots())).map_err(DomainError::invariant)
+    }
+
+    fn whole(&self) -> bool {
+        self.bank.slots() >= self.bank.plan.widest().get()
+    }
+
     #[cfg(test)]
     fn starve(&self, duration: std::time::Duration) {
         self.bank.starve(duration);

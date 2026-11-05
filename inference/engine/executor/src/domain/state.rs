@@ -1028,6 +1028,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let held = floor.get();
         let limits = self.execution.policy().limits();
         let (room, unborn) = self.opportunistic_room(seismic::Contract::DeviceOnly);
+        // What the bank can still grow by is not the places' to take: a
+        // bank grows to its ceiling (every expert, or a weight cap's bound)
+        // before places grow into its room, and no further.
+        let shortfall = self.family.expert_bank().map(|bank| bank.growth_shortfall()).transpose()?.unwrap_or(0);
+        let room = room.map(|(room, margin)| (room.saturating_sub(shortfall), margin));
         let wait = self.pace.borrow().wait_bound();
         // The bytes of a class of each count of places from those held.
         let device = self.domain.device();
@@ -1133,14 +1138,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// load's latest miss record prices while decode waits (`decode_owed`),
     /// each group's passes by the executor's costs where measured. Before
     /// the load has measured its groups' reads, and on a load without a
-    /// bank, whose places compete with no slot, every chunk, as a group runs
-    /// to capacity until the run has measured its layers
-    /// (`Telemetry::group_size`).
+    /// bank, whose places compete with no slot, or with a whole bank, which
+    /// gives none up, every chunk, as a group runs to capacity until the
+    /// run has measured its layers (`Telemetry::group_size`).
     fn weigh_places(&self, places: Places<'_>) -> Result<(usize, Option<u64>), DomainError> {
         let chunks = places.chunks;
         let Some(bank) = self.family.expert_bank() else {
             return Ok((chunks, None));
         };
+        // A whole bank gives up no slot for places: they grow only into
+        // room beside it.
+        if bank.whole() {
+            return Ok((chunks, None));
+        }
         let Some((reads, slots)) = bank.group_reads()? else {
             return Ok((chunks, None));
         };

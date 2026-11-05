@@ -367,6 +367,51 @@ fn a_prompt_chunk_opens_a_chain_its_holder_claims() {
     assert_eq!(domain.group_places().get(), 1);
 }
 
+/// A bank short of its ceiling keeps the room it can grow into: a prompt's
+/// group grows its places only beyond it, so with the device's gigabyte of
+/// room all the bank's to grow into the group stays at its floor of one
+/// place, and with a bank at its ceiling the same group takes its chunks'
+/// places, whether the ceiling is every expert or a weight cap's short of
+/// them.
+#[test]
+fn places_grow_only_beyond_what_the_bank_can_grow_into() {
+    for backend in bank_backends() {
+        let places = |shortfall: u64, whole: bool| {
+            let (mut domain, mut bindings) = banked_chain(backend, 4, 3);
+            let bank = domain.family.bank.as_mut().expect("the fixture holds a bank");
+            (bank.shortfall, bank.whole) = (shortfall, whole);
+            // A reading of the device's store with a gigabyte of room.
+            let store = domain.domain.device().device_store();
+            let room = 1 << 30;
+            domain.pace.borrow_mut().domains.insert(store, DomainPace {
+                role: DomainRole::Allocation,
+                headroom: room,
+                planning: 0,
+                emergency: 0,
+                ceiling: room,
+                charged: 0,
+                band: MemoryBand::Normal,
+                unseen: 0,
+                available: 0,
+                base: (std::time::Instant::now(), 0),
+                rate: 0.0,
+                fastest: 0.0,
+                fluctuation: Fluctuation::default(),
+            });
+            let request = RequestId(80);
+            open(&mut domain, &mut bindings, request);
+            domain.plan_successors((1..4).map(|position| prefill(request, position)).collect());
+            let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 0)]);
+            let places = domain.group_places().get();
+            let _ = finish_one(&mut domain, flight);
+            places
+        };
+        assert_eq!(places(0, true), 3, "{backend:?}: a whole bank leaves the group its chunks' places");
+        assert_eq!(places(0, false), 3, "{backend:?}: a bank at a weight cap's ceiling leaves the group its chunks' places");
+        assert_eq!(places(u64::MAX / 4, false), 1, "{backend:?}: a bank that can grow into the room keeps it");
+    }
+}
+
 /// A prompt chunk's readout exports at most its final row, so the places a
 /// group's class holds beyond the floor's are charged what that exports,
 /// whatever the load's widest export; the launch pool's floor holds the
