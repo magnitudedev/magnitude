@@ -7,7 +7,7 @@
 
 use crate::device::MetalDevice;
 use crate::facts::{
-    LanguageVersion, MatrixCombination, MetalFacts, MetalFamily, ARGUMENT_TABLE_ENTRIES,
+    LanguageVersion, MatrixCombination, MetalFacts, MetalFamily, Properties, ARGUMENT_TABLE_ENTRIES,
     MSL_GRID_INDEX_MAX, RESERVED_ARGUMENT_ENTRIES,
 };
 use crate::{Metal, BACKEND_REVISION};
@@ -93,7 +93,6 @@ fn discover_device(device: &MetalDevice) -> Result<DeviceDescription<Metal>, Tar
         families: observed_families(raw),
         language,
         max_threads_per_threadgroup: [size.width as u64, size.height as u64, size.depth as u64],
-        max_threadgroup_bytes: raw.maxThreadgroupMemoryLength() as u64,
         max_buffer_bytes: handle.max_allocation_bytes(),
         buffer_alignment: raw
             .heapBufferSizeAndAlignWithLength_options(
@@ -105,7 +104,7 @@ fn discover_device(device: &MetalDevice) -> Result<DeviceDescription<Metal>, Tar
         bfloat_arithmetic: probe_bfloat_arithmetic(raw, language),
         matrix_dtypes: probe_matrix_dtypes(raw, language),
         matrix_combinations: probe_matrix_combinations(raw, language),
-        tensor_ops: tensor_operations_at(raw, language),
+        properties: properties_at(raw, language),
         argument_table_entries: ARGUMENT_TABLE_ENTRIES,
         reserved_argument_entries: RESERVED_ARGUMENT_ENTRIES,
         backend_revision: BACKEND_REVISION,
@@ -206,7 +205,7 @@ fn limits_of(facts: &MetalFacts) -> TargetLimits {
         // its reflected `maxTotalThreadsPerThreadgroup`.
         max_workgroup_threads: facts.max_threads_per_threadgroup.into_iter().product(),
         max_grid: [MSL_GRID_INDEX_MAX; 3],
-        max_workgroup_bytes: facts.max_threadgroup_bytes,
+        max_workgroup_bytes: facts.properties.shared_bytes_per_group.get(),
         // Metal exposes no authoritative private-stack capacity. Participant
         // locals are realized as explicit invocation scratch and constrained
         // by their global allocation topology, not by a fabricated stack
@@ -668,22 +667,39 @@ fn probe_matrix_combinations(
     combinations
 }
 
-/// Whether the device forms tensor operations (`MetalFacts::tensor_ops`):
-/// Apple GPU family 10 or later, and the tensor probe forms a pipeline at
-/// `language`.
-fn tensor_operations_at(device: &ProtocolObject<dyn MTLDevice>, language: LanguageVersion) -> bool {
-    crate::pooled(|| device.supportsFamily(MTLGPUFamily::Apple10))
-        && probe_tensor_ops(device, language)
+/// The sources of a device's properties (`seismic_lang::device::metal`)
+/// at `language`; the tensor probe forms its pipeline when asked.
+struct Sources<'d> {
+    device: &'d ProtocolObject<dyn MTLDevice>,
+    language: LanguageVersion,
 }
 
-/// Whether an unopened device forms tensor operations: the fact its opened
-/// description holds (`MetalFacts::tensor_ops`), from the same family test
-/// and probes at the same language version, so planning before a device is
-/// opened and the opened device agree. It compiles the probes; callers ask
-/// once per decision, not per enumeration.
+impl seismic_lang::device::metal::Sources for Sources<'_> {
+    fn max_threadgroup_memory_length(&self) -> Option<u64> {
+        Some(self.device.maxThreadgroupMemoryLength() as u64)
+    }
+    fn apple10_family(&self) -> Option<bool> {
+        Some(crate::pooled(|| self.device.supportsFamily(MTLGPUFamily::Apple10)))
+    }
+    fn tensor_matmul_forms(&self) -> Option<bool> {
+        Some(probe_tensor_ops(self.device, self.language))
+    }
+}
+
+/// The device's properties at `language`.
+fn properties_at(device: &ProtocolObject<dyn MTLDevice>, language: LanguageVersion) -> Properties {
+    seismic_lang::device::metal::describe(&Sources { device, language })
+        .expect("every Metal property's source answers")
+}
+
+/// Whether an unopened device forms tensor operations: the property its
+/// opened description holds, from the same sources at the same language
+/// version, so planning before a device is opened and the opened device
+/// agree. It compiles the probes; callers ask once per decision, not per
+/// enumeration.
 pub fn forms_tensor_operations(device: &crate::DeviceHandle) -> bool {
     probe_language_version(device)
-        .is_some_and(|language| tensor_operations_at(device.raw(), language))
+        .is_some_and(|language| properties_at(device.raw(), language).tensor_ops.holds())
 }
 
 /// Whether a `matmul2d` over a device and a threadgroup tensor into a

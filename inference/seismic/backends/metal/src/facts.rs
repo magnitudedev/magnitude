@@ -9,6 +9,8 @@
 use seismic_lang::types::DType;
 use std::collections::BTreeSet;
 
+pub use seismic_lang::device::metal::Properties;
+
 /// Vendor GPU families are observations used to derive facts; they never
 /// appear in kernel source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -80,8 +82,6 @@ pub struct MetalFacts {
     pub(crate) language: LanguageVersion,
     /// `MTLDevice.maxThreadsPerThreadgroup`, per axis.
     pub(crate) max_threads_per_threadgroup: [u64; 3],
-    /// `MTLDevice.maxThreadgroupMemoryLength`.
-    pub(crate) max_threadgroup_bytes: u64,
     /// `MTLDevice.maxBufferLength`.
     pub(crate) max_buffer_bytes: u64,
     /// `MTLDevice.heapBufferSizeAndAlignWithLength:options:` alignment for
@@ -96,11 +96,11 @@ pub struct MetalFacts {
     pub(crate) matrix_dtypes: BTreeSet<DType>,
     /// Multiply-accumulate combinations the compiler accepts.
     pub(crate) matrix_combinations: BTreeSet<MatrixCombination>,
-    /// Whether the GPU executes Metal 4 tensor operations (`matmul2d` on
-    /// threadgroup and device tensors into cooperative destinations) on its
-    /// matrix hardware: Apple GPU family 10 or later, and the probe forms a
-    /// pipeline at MSL 4.0.
-    pub(crate) tensor_ops: bool,
+    /// The device's properties (`seismic_lang::device::metal`): its
+    /// threadgroup memory and whether it executes Metal 4 tensor operations
+    /// (`matmul2d` on threadgroup and device tensors into cooperative
+    /// destinations) on its matrix hardware.
+    pub(crate) properties: Properties,
     /// Buffer argument-table entries of one compute pipeline (Metal: 31).
     pub(crate) argument_table_entries: u32,
     /// Argument-table entries this backend reserves for its own kernel
@@ -142,9 +142,9 @@ impl MetalFacts {
         &self.operating_system
     }
 
-    /// Whether native sources may use Metal 4 tensor operations.
-    pub fn tensor_ops(&self) -> bool {
-        self.tensor_ops
+    /// The device's properties.
+    pub fn properties(&self) -> &Properties {
+        &self.properties
     }
 
     /// Every fact, serialized deterministically for the profile fingerprint.
@@ -176,21 +176,20 @@ impl MetalFacts {
             .join(",");
         format!(
             "backend={};arch={};os={};unified={};families={families};msl={};threads={:?};\
-             threadgroup={};buffer={};alignment={};scalar={};bfloat={};matrix={};mma={combinations};\
-             tensor={};args={};reserved={}",
+             buffer={};alignment={};scalar={};bfloat={};matrix={};mma={combinations};\
+             {};args={};reserved={}",
             self.backend_revision,
             self.architecture,
             self.operating_system,
             self.unified_memory,
             self.language.label(),
             self.max_threads_per_threadgroup,
-            self.max_threadgroup_bytes,
             self.max_buffer_bytes,
             self.buffer_alignment,
             dtypes(&self.scalar_collective_dtypes),
             self.bfloat_arithmetic,
             dtypes(&self.matrix_dtypes),
-            self.tensor_ops,
+            self.properties.identity(),
             self.argument_table_entries,
             self.reserved_argument_entries,
         )

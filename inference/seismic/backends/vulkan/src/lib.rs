@@ -20,8 +20,9 @@ pub mod transfer;
 
 pub use device::{Device, DeviceHandle, HeapBudget, MemoryBudget, OpenError};
 pub use facts::{
-    Allocation, Calibration, Description, DeviceType, Facts, FormationFacts, Limits, MemoryHeap,
-    MemoryLayout, MemoryType, ReservationForm, Reserving, SubgroupWidth, SUBGROUP_WIDTH,
+    Allocation, Calibration, Description, DeviceType, DriverRules, Facts, FormationTarget, Limits,
+    MemoryHeap, MemoryLayout, MemoryType, Properties, ReservationForm, Reserving, SubgroupWidth,
+    SUBGROUP_WIDTH,
 };
 pub use graph_cost::graph_cost;
 pub use reservation::{ReservedBuffer, VulkanResizer};
@@ -94,16 +95,13 @@ mod tests {
         };
         for description in devices {
             eprintln!(
-                "{} ({}, {}): floor {:?}, subgroup {:?}, f16 {}, matrix {}, denorm-preserve {}, rte32 {}, shader fma {:?}, uuid {}",
+                "{} ({}, {}): floor {:?}, subgroup {:?}, driver rules {:?}, shader fma {:?}, uuid {}",
                 description.facts.name,
                 description.facts.driver_name,
                 description.facts.driver_info,
-                description.floor,
+                description.floor.as_ref().map(seismic_lang::device::vulkan::Properties::identity),
                 description.facts.subgroup_width,
-                description.facts.float16,
-                description.facts.matrix,
-                description.facts.denorm_preserve_32,
-                description.facts.rounding_rte_32,
+                description.facts.driver_rules,
                 description.facts.shader_fma,
                 facts::hex(&description.facts.uuid)
             );

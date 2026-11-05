@@ -5,7 +5,7 @@
 //! numbers every submission, the block allocator, and host access to
 //! storage.
 
-use crate::facts::{self, Description, Facts};
+use crate::facts::{self, Description, Facts, FormationTarget, Properties};
 use crate::instance::{Instance, LoaderError};
 use crate::memory::{Buffer, Memory, Pool, Range};
 use ash::vk;
@@ -339,6 +339,7 @@ struct Side {
 pub(crate) struct Inner {
     pub(crate) device: ash::Device,
     pub(crate) facts: Facts,
+    pub(crate) properties: Properties,
     pub(crate) memory: Memory,
     pub(crate) layout: vk::PipelineLayout,
     pub(crate) timeline: vk::Semaphore,
@@ -519,14 +520,24 @@ impl Device {
             .map(|physical| facts::describe(&instance, physical))
             .find(|description| description.facts.uuid == uuid)
             .ok_or(OpenError::Missing)?;
-        floor.map_err(OpenError::Floor)?;
-        let inner = Arc::new(Inner::create(instance, handle.physical, facts, &*accounts.driver)?);
+        let properties = floor.map_err(OpenError::Floor)?;
+        let inner = Arc::new(Inner::create(instance, handle.physical, facts, properties, &*accounts.driver)?);
         registry.opened.push((uuid, Arc::downgrade(&inner), inner.destroyed.0.clone()));
         Ok(Self { inner, accounts })
     }
 
     pub fn facts(&self) -> &Facts {
         &self.inner.facts
+    }
+
+    /// The device's properties (`seismic_lang::device::vulkan`).
+    pub fn properties(&self) -> &Properties {
+        &self.inner.properties
+    }
+
+    /// The target this device forms sources in.
+    pub fn formation(&self) -> FormationTarget {
+        self.inner.facts.formation(&self.inner.properties)
     }
 
     /// Storage in the backend's own device placement, for what it allocates
@@ -1114,8 +1125,10 @@ impl Inner {
         instance: Arc<Instance>,
         physical: vk::PhysicalDevice,
         facts: Facts,
+        properties: Properties,
         driver_account: &dyn seismic_compiler::executable::MemoryAccount,
     ) -> Result<Self, OpenError> {
+        let target = facts.formation(&properties);
         let usage_before = memory_budget(
             &instance,
             physical,
@@ -1124,13 +1137,13 @@ impl Inner {
         .heap_usage_bytes;
         let raw = instance.raw();
         let mut extensions: Vec<&CStr> = facts::FLOOR_EXTENSIONS.to_vec();
-        if facts.matrix {
+        if target.matrix {
             extensions.push(ash::khr::cooperative_matrix::NAME);
         }
-        if facts.f32_atomic_add {
+        if target.f32_atomic_add {
             extensions.push(ash::ext::shader_atomic_float::NAME);
         }
-        if facts.shader_fma.float32 {
+        if properties.fma_32.holds() {
             extensions.push(facts::SHADER_FMA_EXTENSION);
         }
         if facts.host_import_alignment.is_some() {
@@ -1149,7 +1162,7 @@ impl Inner {
             .collect::<Vec<_>>();
         let mut shader_fma = facts::ShaderFmaFeatures::default();
         shader_fma.float16 = facts.shader_fma.float16.into();
-        shader_fma.float32 = facts.shader_fma.float32.into();
+        shader_fma.float32 = properties.fma_32.holds().into();
         shader_fma.float64 = facts.shader_fma.float64.into();
 
         let mut explicit = vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR::default()
@@ -1166,7 +1179,7 @@ impl Inner {
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(true)
             .shader_int8(true)
-            .shader_float16(facts.float16)
+            .shader_float16(target.float16)
             .storage_buffer8_bit_access(true)
             .scalar_block_layout(true)
             .timeline_semaphore(true)
@@ -1174,7 +1187,7 @@ impl Inner {
             .vulkan_memory_model_device_scope(true)
             .shader_subgroup_extended_types(true)
             .shader_buffer_int64_atomics(true)
-            .shader_shared_int64_atomics(facts.shared_int64_atomics);
+            .shader_shared_int64_atomics(target.shared_int64_atomics);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
             .synchronization2(true)
             .maintenance4(true)
@@ -1192,13 +1205,13 @@ impl Inner {
             .push_next(&mut f12)
             .push_next(&mut f13)
             .push_next(&mut explicit);
-        if facts.matrix {
+        if target.matrix {
             features = features.push_next(&mut cooperative);
         }
-        if facts.f32_atomic_add {
+        if target.f32_atomic_add {
             features = features.push_next(&mut atomic_float);
         }
-        if facts.shader_fma.float32 {
+        if properties.fma_32.holds() {
             features = features.push_next(&mut shader_fma);
         }
         let mut placed =
@@ -1258,6 +1271,7 @@ impl Inner {
         let mut inner = Self {
             device,
             facts,
+            properties,
             memory,
             layout: vk::PipelineLayout::null(),
             timeline: vk::Semaphore::null(),

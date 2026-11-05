@@ -70,7 +70,7 @@ use std::fmt;
 /// The device facts one formation reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Configuration {
-    Vulkan(seismic_vulkan::FormationFacts),
+    Vulkan(seismic_vulkan::FormationTarget),
     Cuda { architecture: u32 },
     Metal { tensor_ops: bool },
 }
@@ -277,7 +277,7 @@ enum Former {
 
 /// The preparation baseline of the Vulkan floor: a 32-lane fp16 device
 /// without cooperative matrix, declaring every seal mode.
-const VULKAN_BASE: seismic_vulkan::FormationFacts = seismic_vulkan::FormationFacts {
+const VULKAN_BASE: seismic_vulkan::FormationTarget = seismic_vulkan::FormationTarget {
     subgroup_lanes: seismic_vulkan::SUBGROUP_WIDTH,
     float16: true,
     matrix: false,

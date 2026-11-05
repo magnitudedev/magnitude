@@ -68,7 +68,7 @@ impl VulkanOpened {
 
     /// The device features the generated prefix exposes.
     pub(crate) fn features(&self) -> VulkanFeatures {
-        VulkanFeatures::of(&self.service.facts().formation())
+        VulkanFeatures::of(&self.service.formation())
     }
 
     /// What the backend holds for fixed buffers of `contract` beyond their

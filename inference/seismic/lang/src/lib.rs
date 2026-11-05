@@ -12,6 +12,7 @@ pub mod analysis;
 pub mod bundle;
 pub mod cancellation;
 pub mod checked;
+pub mod device;
 pub mod entry;
 pub mod expr;
 pub mod failure;

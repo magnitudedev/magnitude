@@ -25,7 +25,7 @@ pub(crate) struct VulkanFeatures {
 
 impl VulkanFeatures {
     /// The features a device with `facts` exposes.
-    pub(crate) fn of(facts: &seismic_vulkan::FormationFacts) -> Self {
+    pub(crate) fn of(facts: &seismic_vulkan::FormationTarget) -> Self {
         Self {
             subgroup_lanes: facts.subgroup_lanes,
             float16: facts.float16,
@@ -245,8 +245,8 @@ void main() {
         };
         let device = seismic_vulkan::Device::open(description.facts.uuid, crate::backends::vulkan::test_accounts(&description.facts)).expect("device opens");
         let features = VulkanFeatures {
-            subgroup_lanes: device.facts().subgroup_width().lanes(),
-            float16: device.facts().float16,
+            subgroup_lanes: device.formation().subgroup_lanes,
+            float16: device.formation().float16,
             matrix: false,
             wide_accumulators: false,
             mixed_dot: false,
@@ -352,7 +352,7 @@ void main() {
         // Without `DenormPreserve 32` the driver's default applies (NVIDIA:
         // flush to zero, §7.3): `fma` with a subnormal operand or result is
         // then outside the oracle. The integer paths preserve subnormals.
-        let flushes = !device.facts().denorm_preserve_32;
+        let flushes = !device.properties().denorm_preserve_32.holds();
         let subnormal = |value: f32| value.is_subnormal();
         let mut failures = Vec::new();
         for (index, (a, b, c)) in cases.iter().enumerate() {
@@ -443,7 +443,7 @@ void main() {
         };
         let device = seismic_vulkan::Device::open(description.facts.uuid, crate::backends::vulkan::test_accounts(&description.facts)).expect("device opens");
         let features = VulkanFeatures {
-            subgroup_lanes: device.facts().subgroup_width().lanes(),
+            subgroup_lanes: device.formation().subgroup_lanes,
             float16: false,
             matrix: false,
             wide_accumulators: false,

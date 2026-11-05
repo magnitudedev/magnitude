@@ -190,7 +190,9 @@ impl seismic_ir::physical_target::PhysicalDialect for Cuda {
                 Some(CudaLaunchMode::Independent)
             }
             seismic_ir::schedule::LaunchParticipation::CooperativeGrid => facts
+                .properties
                 .cooperative_launch
+                .holds()
                 .then_some(CudaLaunchMode::CooperativeGrid),
         }
     }
@@ -334,7 +336,7 @@ pub(crate) fn native_launch_constraints(
     let one = arena.nat(1);
     let resident =
         active_blocks_expression(arena, &native.properties, threads, locals.workgroup_bytes);
-    let multiprocessors = arena.nat(u64::from(facts.multiprocessors));
+    let multiprocessors = arena.nat(facts.properties.units.get());
     let capacity = arena.nat_mul(multiprocessors, resident);
     let mut constraints = vec![arena.nat_cmp(seismic_lang::expr::CmpOp::Ge, resident, one)];
     if launch.descriptor == CudaLaunchMode::CooperativeGrid {
@@ -628,7 +630,7 @@ impl seismic_native_target::NativeCompiler<Cuda> for CudaNativeCompiler {
             NativeClusterDomain::NotApplicable
         };
         let mut modes = vec![CudaLaunchMode::Independent];
-        if target.facts().cooperative_launch {
+        if target.facts().properties.cooperative_launch.holds() {
             modes.push(CudaLaunchMode::CooperativeGrid);
         }
         let handle = CompiledKernel {

@@ -711,6 +711,7 @@ fn vulkan_geometry(
     specialization: &NativeSpecialization,
 ) -> Result<Vec<([u32; 3], Vec<u32>)>, PrepareError> {
     let limits = opened.service().facts().limits;
+    let properties = *opened.service().properties();
     let narrow = |value: u64, what: &str| {
         u32::try_from(value)
             .map_err(|_| preparation(format!("`{name}`: {what} {value} exceeds the Vulkan ABI")))
@@ -735,20 +736,20 @@ fn vulkan_geometry(
             ];
             let invocations = threads.iter().try_fold(1u64, |product, value| product.checked_mul(*value));
             if threads.contains(&0)
-                || invocations.is_none_or(|invocations| invocations > limits.max_invocations)
+                || invocations.is_none_or(|invocations| invocations > properties.max_group_threads.get())
                 || threads.iter().zip(limits.max_group_size).any(|(threads, limit)| *threads > limit)
             {
                 return Err(preparation(format!(
                     "launch `{kernel}` requests {threads:?} threads per workgroup; the device allows {:?} and {} in total",
-                    limits.max_group_size, limits.max_invocations
+                    limits.max_group_size, properties.max_group_threads.get()
                 )));
             }
             let shared_bytes = evaluate(&launch.shared_bytes)?;
             let footprint = abi::vulkan::shared_footprint(shared_bytes);
-            if footprint > limits.max_shared_bytes {
+            if footprint > properties.shared_bytes_per_group.get() {
                 return Err(preparation(format!(
                     "launch `{kernel}` needs {footprint} shared bytes; the device allows {}",
-                    limits.max_shared_bytes
+                    properties.shared_bytes_per_group.get()
                 )));
             }
             Ok((
@@ -1038,7 +1039,7 @@ fn template_instance(kernel: &str, values: &[u64]) -> ProgramEntry {
 #[cfg(target_os = "macos")]
 pub(crate) fn metal_dialect(opened: &crate::backends::MetalOpened) -> abi::Dialect {
     abi::Dialect::Metal(abi::MetalFeatures {
-        tensor_ops: opened.device_description().facts().tensor_ops(),
+        tensor_ops: opened.device_description().facts().properties().tensor_ops.holds(),
     })
 }
 
@@ -1046,7 +1047,7 @@ pub(crate) fn metal_dialect(opened: &crate::backends::MetalOpened) -> abi::Diale
 /// fact macros.
 pub(crate) fn cuda_dialect(opened: &crate::backends::CudaOpened) -> abi::Dialect {
     abi::Dialect::Cuda(abi::CudaFeatures {
-        multiprocessors: opened.device_description().facts().multiprocessors,
+        multiprocessors: opened.device_description().facts().properties.units.get(),
     })
 }
 
@@ -2144,7 +2145,7 @@ impl NativePrepared {
                         let resident = module
                             .active_blocks(opened.service(), function, participants, shared_bytes)
                             .map_err(CallError::Execution)?
-                            * u64::from(opened.device_description().facts().multiprocessors);
+                            * opened.device_description().facts().properties.units.get();
                         if resident == 0 {
                             return Err(limit(format!(
                                 "launch `{}`: no multiprocessor holds one of its blocks",

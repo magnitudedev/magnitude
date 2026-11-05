@@ -3989,6 +3989,40 @@ mod tests {
         }
     }
 
+    /// A one-multiprocessor device's attributes, with or without
+    /// cooperative launch.
+    struct Attributes {
+        cooperative_launch: bool,
+    }
+
+    impl seismic_lang::device::cuda::Sources for Attributes {
+        fn multiprocessor_count(&self) -> Option<u64> {
+            Some(1)
+        }
+        fn warp_size(&self) -> Option<u64> {
+            Some(32)
+        }
+        fn max_threads_per_block(&self) -> Option<u64> {
+            Some(1024)
+        }
+        fn max_threads_per_multiprocessor(&self) -> Option<u64> {
+            Some(2048)
+        }
+        fn max_shared_memory_per_block_optin(&self) -> Option<u64> {
+            Some(49152)
+        }
+        fn l2_cache_size(&self) -> Option<u64> {
+            Some(1024)
+        }
+        fn cooperative_launch(&self) -> Option<bool> {
+            Some(self.cooperative_launch)
+        }
+    }
+
+    fn properties(cooperative_launch: bool) -> crate::profile::Properties {
+        seismic_lang::device::cuda::describe(&Attributes { cooperative_launch }).unwrap()
+    }
+
     fn facts() -> CudaFacts {
         use crate::profile::{ComputeCapability, DriverApiVersion, PtxTarget, TensorMemory};
         CudaFacts {
@@ -3997,19 +4031,10 @@ mod tests {
             driver_api: DriverApiVersion::MINIMUM,
             ptx: PtxTarget::BASELINE,
             tensor_memory: TensorMemory::Unavailable,
-            warp_size: 32,
-            multiprocessors: 1,
-            max_threads_per_multiprocessor: 2048,
-            max_blocks_per_multiprocessor: 32,
-            registers_per_block: 65536,
-            registers_per_multiprocessor: 65536,
+            properties: properties(true),
             max_registers_per_thread: 255,
             codegen_registers_per_thread: 64,
-            shared_bytes_per_multiprocessor: 65536,
-            shared_bytes_per_block: 49152,
-            l2_cache_bytes: 1024,
             global_memory_bytes: 1048576,
-            cooperative_launch: true,
             kernel_parameter_bytes: 4096,
         }
     }
@@ -4168,13 +4193,13 @@ mod tests {
             schedule::{Launch, LaunchParticipation},
         };
         let mut facts = facts();
-        facts.cooperative_launch = false;
+        facts.properties = properties(false);
         assert_eq!(
             Cuda::launch_for_participation(&facts, LaunchParticipation::CooperativeGrid),
             None
         );
         assert_eq!(Cuda::ordinary_launch(), crate::CudaLaunchMode::Independent);
-        facts.cooperative_launch = true;
+        facts.properties = properties(true);
         let cooperative =
             Cuda::launch_for_participation(&facts, LaunchParticipation::CooperativeGrid).unwrap();
         let mut arena = seismic_lang::expr::ExprArena::new();

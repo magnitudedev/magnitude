@@ -301,37 +301,57 @@ pub struct CudaFacts {
     pub driver_api: DriverApiVersion,
     pub ptx: PtxTarget,
     pub tensor_memory: TensorMemory,
-    /// `CU_DEVICE_ATTRIBUTE_WARP_SIZE`.
-    pub warp_size: u32,
-    /// `CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`.
-    pub multiprocessors: u32,
-    /// `CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR`.
-    pub max_threads_per_multiprocessor: u32,
-    /// `CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR`.
-    pub max_blocks_per_multiprocessor: u32,
-    /// `CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_BLOCK`.
-    pub registers_per_block: u32,
-    /// `CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR`.
-    pub registers_per_multiprocessor: u32,
+    /// The device's properties (`seismic_lang::device::cuda`): its
+    /// multiprocessors, warp, block and shared-memory limits, L2 and
+    /// cooperative launch.
+    pub properties: Properties,
     /// Documented per-thread register ceiling. No reliable pre-JIT register
     /// pressure model exists for PTX, so this is a fact, not a constraint.
     pub max_registers_per_thread: u32,
     /// Fixed physical-register ceiling emitted on every entry.
     pub codegen_registers_per_thread: u32,
-    /// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR`.
-    pub shared_bytes_per_multiprocessor: u64,
-    /// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`: the true
-    /// per-block shared-memory ceiling (native compilation opts every
-    /// kernel in).
-    pub shared_bytes_per_block: u64,
-    /// `CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE`.
-    pub l2_cache_bytes: u64,
     /// `cuDeviceTotalMem`.
     pub global_memory_bytes: u64,
-    /// `CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH`.
-    pub cooperative_launch: bool,
     /// The kernel parameter space, by driver generation.
     pub kernel_parameter_bytes: u64,
+}
+
+pub use seismic_lang::device::cuda::Properties;
+
+/// The device attributes a device's properties are established from
+/// (`seismic_lang::device::cuda`), read once.
+struct Attributes {
+    multiprocessor_count: u64,
+    warp_size: u64,
+    max_threads_per_block: u64,
+    max_threads_per_multiprocessor: u64,
+    max_shared_memory_per_block_optin: u64,
+    l2_cache_size: u64,
+    cooperative_launch: bool,
+}
+
+impl seismic_lang::device::cuda::Sources for Attributes {
+    fn multiprocessor_count(&self) -> Option<u64> {
+        Some(self.multiprocessor_count)
+    }
+    fn warp_size(&self) -> Option<u64> {
+        Some(self.warp_size)
+    }
+    fn max_threads_per_block(&self) -> Option<u64> {
+        Some(self.max_threads_per_block)
+    }
+    fn max_threads_per_multiprocessor(&self) -> Option<u64> {
+        Some(self.max_threads_per_multiprocessor)
+    }
+    fn max_shared_memory_per_block_optin(&self) -> Option<u64> {
+        Some(self.max_shared_memory_per_block_optin)
+    }
+    fn l2_cache_size(&self) -> Option<u64> {
+        Some(self.l2_cache_size)
+    }
+    fn cooperative_launch(&self) -> Option<bool> {
+        Some(self.cooperative_launch)
+    }
 }
 
 /// Device attribute keys (`CUdevice_attribute`).
@@ -347,17 +367,13 @@ mod attr {
     pub const MAX_GRID_DIM_Y: i32 = 6;
     pub const MAX_GRID_DIM_Z: i32 = 7;
     pub const WARP_SIZE: i32 = 10;
-    pub const MAX_REGISTERS_PER_BLOCK: i32 = 12;
     pub const MULTIPROCESSOR_COUNT: i32 = 16;
     pub const L2_CACHE_SIZE: i32 = 38;
     pub const MAX_THREADS_PER_MULTIPROCESSOR: i32 = 39;
     pub const COMPUTE_CAPABILITY_MAJOR: i32 = 75;
     pub const COMPUTE_CAPABILITY_MINOR: i32 = 76;
-    pub const MAX_SHARED_MEMORY_PER_MULTIPROCESSOR: i32 = 81;
-    pub const MAX_REGISTERS_PER_MULTIPROCESSOR: i32 = 82;
     pub const MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: i32 = 97;
     pub const COOPERATIVE_LAUNCH: i32 = 99;
-    pub const MAX_BLOCKS_PER_MULTIPROCESSOR: i32 = 106;
     pub const INTEGRATED: i32 = 18;
     /// `CU_DEVICE_ATTRIBUTE_NUMA_CONFIG`: whether the device's memory is an
     /// OS NUMA node.
@@ -648,9 +664,16 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
     } else {
         TensorMemory::Unavailable
     };
-    let warp_size = unsigned(attr::WARP_SIZE)?;
-    let multiprocessors = unsigned(attr::MULTIPROCESSOR_COUNT)?;
-    let cooperative_launch = unsigned(attr::COOPERATIVE_LAUNCH)? == 1;
+    let properties = seismic_lang::device::cuda::describe(&Attributes {
+        multiprocessor_count: u64::from(unsigned(attr::MULTIPROCESSOR_COUNT)?),
+        warp_size: u64::from(unsigned(attr::WARP_SIZE)?),
+        max_threads_per_block: u64::from(unsigned(attr::MAX_THREADS_PER_BLOCK)?),
+        max_threads_per_multiprocessor: u64::from(unsigned(attr::MAX_THREADS_PER_MULTIPROCESSOR)?),
+        max_shared_memory_per_block_optin: u64::from(unsigned(attr::MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?),
+        l2_cache_size: u64::from(unsigned(attr::L2_CACHE_SIZE)?),
+        cooperative_launch: unsigned(attr::COOPERATIVE_LAUNCH)? == 1,
+    })
+    .expect("every CUDA property's source is an attribute the driver reports");
     let kernel_parameter_bytes = if driver_api >= DriverApiVersion::LARGE_PARAMETERS_MINIMUM {
         KERNEL_PARAMETER_BYTES_LARGE
     } else {
@@ -663,21 +686,10 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
         driver_api,
         ptx,
         tensor_memory,
-        warp_size,
-        multiprocessors,
-        max_threads_per_multiprocessor: unsigned(attr::MAX_THREADS_PER_MULTIPROCESSOR)?,
-        max_blocks_per_multiprocessor: unsigned(attr::MAX_BLOCKS_PER_MULTIPROCESSOR)?,
-        registers_per_block: unsigned(attr::MAX_REGISTERS_PER_BLOCK)?,
-        registers_per_multiprocessor: unsigned(attr::MAX_REGISTERS_PER_MULTIPROCESSOR)?,
+        properties,
         max_registers_per_thread: MAX_REGISTERS_PER_THREAD,
         codegen_registers_per_thread: CODEGEN_REGISTERS_PER_THREAD,
-        shared_bytes_per_multiprocessor: u64::from(unsigned(
-            attr::MAX_SHARED_MEMORY_PER_MULTIPROCESSOR,
-        )?),
-        shared_bytes_per_block: u64::from(unsigned(attr::MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?),
-        l2_cache_bytes: u64::from(unsigned(attr::L2_CACHE_SIZE)?),
         global_memory_bytes,
-        cooperative_launch,
         kernel_parameter_bytes,
     };
     let limits = TargetLimits {
@@ -686,13 +698,13 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
             u64::from(unsigned(attr::MAX_BLOCK_DIM_Y)?),
             u64::from(unsigned(attr::MAX_BLOCK_DIM_Z)?),
         ],
-        max_workgroup_threads: u64::from(unsigned(attr::MAX_THREADS_PER_BLOCK)?),
+        max_workgroup_threads: properties.max_group_threads.get(),
         max_grid: [
             u64::from(unsigned(attr::MAX_GRID_DIM_X)?),
             u64::from(unsigned(attr::MAX_GRID_DIM_Y)?),
             u64::from(unsigned(attr::MAX_GRID_DIM_Z)?),
         ],
-        max_workgroup_bytes: facts.shared_bytes_per_block,
+        max_workgroup_bytes: properties.shared_bytes_per_group.get(),
         participant_local_bytes: Some(LOCAL_BYTES_PER_THREAD),
         // Every binding is one 8-byte pointer word plus its extents and
         // strides (`ptx::ParameterAbi`); the argument byte limit is the
@@ -707,7 +719,7 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
         max_allocation_alignment: ALLOCATION_ALIGNMENT,
         // Kernel index registers are 64-bit (`.address_size 64`).
         max_index_bits: 64,
-        subgroup_width: Some(warp_size),
+        subgroup_width: Some(u32::try_from(properties.subgroup_width.get()).expect("a warp's width fits u32")),
     };
     let dtypes = DataTypeSupport {
         scalars: [
@@ -894,7 +906,7 @@ fn acquire_services(
             * u64::from(latency_block[2])
             * operations_per_thread
             / participants_per_unit;
-        let capacity_grid = [facts.multiprocessors.max(1), 1, 1];
+        let capacity_grid = [u32::try_from(facts.properties.units.get()).expect("a device's multiprocessors fit u32").max(1), 1, 1];
         let capacity_units = u64::from(capacity_grid[0])
             * u64::from(capacity_block[0])
             * u64::from(capacity_block[1])
@@ -968,8 +980,8 @@ fn acquire_services(
         ));
         Ok(())
     };
-    let sms = facts.multiprocessors.max(1);
-    let lanes = facts.max_threads_per_multiprocessor.max(1);
+    let sms = u32::try_from(facts.properties.units.get()).expect("a device's multiprocessors fit u32").max(1);
+    let lanes = u32::try_from(facts.properties.threads_per_unit.get()).expect("a multiprocessor's threads fit u32").max(1);
     let compute_topology = ResourceTopology {
         resources: sms,
         max_concurrency: lanes,
@@ -2083,28 +2095,16 @@ fn fingerprint(
             digest.update(allocation_granularity_columns.to_le_bytes());
         }
     }
+    digest.update(facts.properties.identity().as_bytes());
     for value in [
-        facts.warp_size,
-        facts.multiprocessors,
-        facts.max_threads_per_multiprocessor,
-        facts.max_blocks_per_multiprocessor,
-        facts.registers_per_block,
-        facts.registers_per_multiprocessor,
         facts.max_registers_per_thread,
         facts.codegen_registers_per_thread,
     ] {
         digest.update(value.to_le_bytes());
     }
-    for value in [
-        facts.shared_bytes_per_multiprocessor,
-        facts.shared_bytes_per_block,
-        facts.l2_cache_bytes,
-        facts.global_memory_bytes,
-        facts.kernel_parameter_bytes,
-    ] {
+    for value in [facts.global_memory_bytes, facts.kernel_parameter_bytes] {
         digest.update(value.to_le_bytes());
     }
-    digest.update([u8::from(facts.cooperative_launch)]);
     for value in limits.max_workgroup_size {
         digest.update(value.to_le_bytes());
     }

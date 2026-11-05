@@ -10,7 +10,7 @@ use seismic_native_target::{NativeCompilationError, ProgramSource};
 /// What forms a program: the toolchain and the facts it reads.
 #[derive(Clone, Copy, Debug)]
 pub enum Target {
-    Vulkan(seismic_vulkan::FormationFacts),
+    Vulkan(seismic_vulkan::FormationTarget),
     Cuda {
         architecture: u32,
     },

@@ -349,12 +349,25 @@ pub(crate) fn open(
         #[cfg(target_os = "macos")]
         ExecutorSelector::Vulkan { .. } => unreachable!("this build discovers no Vulkan executor"),
     };
+    let properties = match &kind {
+        OpenedKind::Cpu(opened) => seismic_lang::device::DeviceProperties::Cpu(*opened.executor().properties()),
+        #[cfg(target_os = "macos")]
+        OpenedKind::Metal(opened) => {
+            seismic_lang::device::DeviceProperties::Metal(*opened.device_description().facts().properties())
+        }
+        OpenedKind::Cuda(opened) => {
+            seismic_lang::device::DeviceProperties::Cuda(opened.device_description().facts().properties)
+        }
+        #[cfg(not(target_os = "macos"))]
+        OpenedKind::Vulkan(opened) => seismic_lang::device::DeviceProperties::Vulkan(*opened.service().properties()),
+    };
     Ok(Arc::new(DeviceInner {
         info,
         topology,
         memory,
         capabilities: std::sync::OnceLock::new(),
         kind,
+        properties,
         programs,
         trace: std::sync::Mutex::new(None),
         artifacts: options.artifacts,
@@ -605,7 +618,7 @@ impl OpenedKind {
     /// one: CUDA's L2. Metal, Vulkan and the CPU route report none.
     pub(crate) fn last_level_cache_bytes(&self) -> Option<u64> {
         match self {
-            Self::Cuda(device) => Some(device.device_description().facts().l2_cache_bytes),
+            Self::Cuda(device) => Some(device.device_description().facts().properties.l2_bytes.get()),
             _ => None,
         }
     }
@@ -638,7 +651,7 @@ impl OpenedKind {
                 let facts = device.device_description().facts();
                 format!(
                     "cuda;sm {};multiprocessors {};driver {}",
-                    facts.compute_capability, facts.multiprocessors, facts.driver_api
+                    facts.compute_capability, facts.properties.units.get(), facts.driver_api
                 )
             }
             // A driver update changes the key (§7.5).

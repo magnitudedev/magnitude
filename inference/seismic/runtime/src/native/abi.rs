@@ -84,7 +84,7 @@ fn metal_header(features: MetalFeatures) -> String {
 pub(crate) struct CudaFeatures {
     /// Streaming multiprocessors (`SEISMIC_MULTIPROCESSORS`): a kernel that
     /// states its grid sizes its blocks' residency to the waves they fill.
-    pub(crate) multiprocessors: u32,
+    pub(crate) multiprocessors: u64,
 }
 
 impl CudaFeatures {

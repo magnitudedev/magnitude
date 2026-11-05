@@ -313,7 +313,7 @@ mod tests {
     fn native_tensor_operations_use_the_probed_language() {
         let device = crate::test_support::metal_device();
         let facts = crate::profile::open_device(&device).unwrap();
-        if !facts.facts().tensor_ops {
+        if !facts.facts().properties().tensor_ops.holds() {
             return;
         }
         let source = ProgramSource {

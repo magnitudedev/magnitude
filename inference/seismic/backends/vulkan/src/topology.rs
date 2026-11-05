@@ -104,7 +104,7 @@ fn vulkan_report(description: &crate::Description) -> VulkanReport {
         memory_is_host: (device.device_type != crate::DeviceType::Other)
             .then(|| device.device_type.memory_is_host()),
         name: device.name.clone(),
-        floor: description.floor.clone(),
+        floor: description.floor.as_ref().map(|_| ()).map_err(Clone::clone),
         driver: format!(
             "vulkan driver {} version {}",
             device.driver_id, device.driver_version

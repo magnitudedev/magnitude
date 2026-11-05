@@ -650,6 +650,9 @@ pub mod device {
         pub(crate) memory: Arc<crate::memory::DeviceLedgers>,
         pub(crate) capabilities: std::sync::OnceLock<Vec<String>>,
         pub(crate) kind: OpenedKind,
+        /// The device's properties, described once by its backend when it
+        /// opened.
+        pub(crate) properties: seismic_lang::device::DeviceProperties,
         /// Forms this device's native programs.
         pub(crate) programs: crate::backends::DevicePrograms,
         /// The active submission trace, if any (`native::trace`).
@@ -682,6 +685,10 @@ pub mod device {
         }
         pub fn info(&self) -> &Executor {
             &self.info
+        }
+        /// The device's properties (`seismic_lang::device`).
+        pub fn properties(&self) -> &seismic_lang::device::DeviceProperties {
+            &self.properties
         }
         /// What this device's graphs cost its submissions so far: graphs
         /// recorded (a submission during which that count grew recorded one

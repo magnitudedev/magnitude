@@ -25,7 +25,7 @@ pub(crate) fn formation(device: &Device) -> String {
     format!(
         "{};{};create {}",
         compiler(),
-        device.facts().formation_identity(),
+        device.facts().formation_identity(device.properties()),
         created_with(device).as_raw()
     )
 }
@@ -276,7 +276,7 @@ impl DirectModule {
         for (words, entry) in entries {
             // The `OpFmaKHR` binding follows validation, which the linked
             // validator does not know.
-            let pipeline = if device.facts().shader_fma.float32 {
+            let pipeline = if device.properties().fma_32.holds() {
                 let bound = seal::fma_khr(words)
                     .map_err(|error| NativeCompilationError::MalformedToolchainOutput(error.0))?;
                 self.pipeline(cache, &bound, entry, flags)?
@@ -333,7 +333,8 @@ impl DirectModule {
         // Full subgroups are required whenever the X extent allows it (a
         // multiple of the hardware subgroup); smaller groups run one partial
         // subgroup, as a partial CUDA warp does.
-        let subgroups = if threads[0] % width.lanes() == 0 {
+        let lanes = self.device.properties().subgroup_width.get();
+        let subgroups = if u64::from(threads[0]) % lanes == 0 {
             vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS
         } else {
             vk::PipelineShaderStageCreateFlags::empty()

@@ -61,7 +61,20 @@ impl DeviceService<Cpu> for Device {
 pub struct Executor {
     /// Shared by every CPU device of the process (`open_host`).
     workers: Arc<Mutex<Workers>>,
+    /// The device's properties (`seismic_lang::device::cpu`): its units are
+    /// the pool's participants, the submitting thread included.
+    properties: seismic_lang::device::cpu::Properties,
+}
+
+/// The sources of a CPU device's properties: its worker pool.
+struct Pool {
     participants: usize,
+}
+
+impl seismic_lang::device::cpu::Sources for Pool {
+    fn worker_cores(&self) -> Option<u64> {
+        Some(self.participants as u64)
+    }
 }
 
 impl Executor {
@@ -76,9 +89,15 @@ impl Executor {
         crate::profile::profile_for_workers(&mut workers, device)
     }
 
-    /// Participants of the worker pool, the submitting thread included.
+    /// The device's properties.
+    pub fn properties(&self) -> &seismic_lang::device::cpu::Properties {
+        &self.properties
+    }
+
+    /// Participants of the worker pool, the submitting thread included: the
+    /// device's units.
     pub fn workers(&self) -> usize {
-        self.participants
+        self.properties.units.get() as usize
     }
 
     /// Run a sequence of authored native launches as one pool job and
@@ -103,7 +122,8 @@ impl Executor {
             .count();
         Self {
             workers,
-            participants,
+            properties: seismic_lang::device::cpu::describe(&Pool { participants })
+                .expect("a worker pool answers its participants"),
         }
     }
 }

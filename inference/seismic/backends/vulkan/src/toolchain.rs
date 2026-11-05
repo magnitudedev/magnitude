@@ -119,7 +119,7 @@ impl Toolchain for VulkanToolchain {
         &self,
         source: &ProgramSource,
     ) -> Result<(SpirvPipelines, DirectModule), NativeCompilationError> {
-        let environment = self.device.facts().environment();
+        let environment = self.device.formation().environment();
         let modules = source
             .entries
             .iter()
