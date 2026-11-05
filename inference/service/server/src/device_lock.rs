@@ -187,22 +187,28 @@ impl DeviceJob {
 #[derive(Clone)]
 pub struct Preemption {
     wanted: watch::Receiver<u64>,
-    /// Beside an idle model: the device's sharing, and its idleness when the job took it.
+    /// Beside an idle model: the device's sharing, and its idleness last seen, first when the
+    /// job took the device.
     idle: Option<(watch::Receiver<Sharing>, u64)>,
 }
 
 impl Preemption {
-    /// Return once a share is wanted after the job took the device, or the idle model it runs
-    /// beside changed.
+    /// Return once a share is wanted, or the idle model the job runs beside changed, since the
+    /// job took the device or since this last returned: each preemption is seen once, as a
+    /// change of a watch is.
     pub async fn preempted(&mut self) {
         match &mut self.idle {
             None => changed(&mut self.wanted).await,
             Some((sharing, idleness)) => {
-                let idleness = *idleness;
+                let seen = *idleness;
                 tokio::select! {
                     () = changed(&mut self.wanted) => {}
                     // The sender lives as long as the lock the hold is of.
-                    _ = sharing.wait_for(|sharing| sharing.idleness != idleness) => {}
+                    changed = sharing.wait_for(|sharing| sharing.idleness != seen) => {
+                        if let Ok(sharing) = changed {
+                            *idleness = sharing.idleness;
+                        }
+                    }
                 }
             }
         }
@@ -564,6 +570,24 @@ mod tests {
         drop(job);
         admitted.await.unwrap();
         assert!(lock.try_beside().is_none(), "no measurement starts beside a leased model");
+    }
+
+    /// A preemption is seen once: once the idle model's change preempted the measurement beside
+    /// it, waiting again waits for a further change, so a retirement retried on the preemption
+    /// sleeps between its tries.
+    #[tokio::test]
+    async fn a_measurement_beside_the_idle_model_is_preempted_once_per_change() {
+        use futures_util::FutureExt;
+        let lock = DeviceLock::default();
+        let _resident = lock.try_share().unwrap();
+        lock.resident_idle(idle("load", Arc::new(Room)));
+        let mut job = lock.measurement().await;
+        assert!(job.preempted().now_or_never().is_none(), "preempted before any change");
+        lock.resident_idle(None);
+        assert!(job.preempted().now_or_never().is_some(), "the lease preempts it");
+        assert!(job.preempted().now_or_never().is_none(), "the same lease preempts it again");
+        lock.resident_idle(idle("load", Arc::new(Room)));
+        assert!(job.preempted().now_or_never().is_some(), "a further change preempts it");
     }
 
     /// A load that becomes idle is a change once: a request's lease and its end are none, however
