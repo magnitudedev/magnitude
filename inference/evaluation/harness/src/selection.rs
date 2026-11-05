@@ -318,6 +318,7 @@ mod tests {
             method: seismic::TuningMethod::Census,
             time: seismic::TuningTime::default(),
             coverage: None,
+            default_launches: Vec::new(),
         });
         let mut tuned = TunedEntry {
             receipt: magnitude_executor::Receipt::Held(receipt),

@@ -757,6 +757,7 @@ mod tests {
             method: TuningMethod::Survey { samples: 15 },
             time: TuningTime::default(),
             coverage: None,
+            default_launches: Vec::new(),
         };
         Recording::new(&result).unwrap()
     }

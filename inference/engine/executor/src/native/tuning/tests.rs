@@ -247,6 +247,7 @@ fn demanded_cache_requires_selected_native_default_evidence_for_every_case() {
         method: TuningMethod::Census,
         time: TuningTime::default(),
         coverage: None,
+        default_launches: Vec::new(),
     };
     assert!(ChosenEvidence::of(&result).qualified_at(&shapes).is_err());
     result
@@ -1173,6 +1174,7 @@ impl EntrySearch<dense_output::Entry> for FakeSearch {
             },
             time: TuningTime::default(),
             coverage: None,
+            default_launches: Vec::new(),
         })
     }
 
@@ -3309,6 +3311,7 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
         method: TuningMethod::Census,
         time: TuningTime::default(),
         coverage: None,
+        default_launches: Vec::new(),
     };
     cache.store_tuning(&key, &StoredChoice::of(&record), &record);
     assert!(

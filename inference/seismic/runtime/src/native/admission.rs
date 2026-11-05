@@ -522,6 +522,7 @@ mod tests {
             method: TuningMethod::Census,
             time: TuningTime::default(),
             coverage: None,
+            default_launches: Vec::new(),
         }
     }
 

@@ -622,6 +622,10 @@ pub struct TuningResult {
     /// points; `None` when no leader reached one.
     #[serde(default)]
     pub coverage: Option<CoverageCheck>,
+    /// What the formed defaults' launches use, in ordinal order
+    /// ([`NativePrepared::launch_programs`]), whether or not they were
+    /// measured.
+    pub default_launches: Vec<Option<seismic_native_target::LaunchProgram>>,
 }
 
 /// How the coverage checks of a unit's leaders stand.
@@ -5092,6 +5096,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             &incumbent.specialization,
             method,
             time,
+            ground.kernel.launch_programs(),
         );
         // The native default is the reference: serving it qualifies nothing.
         let default = &ground.kernel.artifact().0;
@@ -5323,7 +5328,8 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             ground: &ground,
         };
         let (configurations, overall, method, time) = tuned.survey(&points, plan)?;
-        let mut result = self.unit.result(configurations, &overall, method, time);
+        let mut result =
+            self.unit.result(configurations, &overall, method, time, ground.kernel.launch_programs());
         result.points = records;
         result.time.building_seconds += self.time.building_seconds;
         result.time.forming_seconds += self.time.forming_seconds;
@@ -5343,12 +5349,16 @@ struct Unit {
 }
 
 impl Unit {
+    /// The unit's record of `configurations`, choosing `overall`, its
+    /// formed defaults' launches `default_launches`
+    /// ([`NativePrepared::launch_programs`]).
     fn result(
         &self,
         configurations: Records,
         overall: &NativeSpecialization,
         method: TuningMethod,
         time: TuningTime,
+        default_launches: Vec<Option<seismic_native_target::LaunchProgram>>,
     ) -> TuningResult {
         TuningResult {
             disposition: TuningDisposition::QualifiedCandidate,
@@ -5367,6 +5377,7 @@ impl Unit {
             method,
             time,
             coverage: None,
+            default_launches,
         }
     }
 
@@ -5383,6 +5394,7 @@ impl Unit {
         time: TuningTime,
     ) -> TuningResult {
         let kernel = &ground.kernel;
+        let launches = kernel.launch_programs();
         // The canonical default is the reference itself: measuring it
         // qualifies nothing.
         let configurations = if defaults.is_empty() {
@@ -5390,7 +5402,7 @@ impl Unit {
         } else {
             vec![ConfigurationRecord {
                 formation: None,
-                launches: kernel.launch_programs(),
+                launches: launches.clone(),
                 configuration: Configuration::of(default),
                 artifact: Some(kernel.artifact().0.clone()),
                 observations: Vec::new(),
@@ -5410,6 +5422,7 @@ impl Unit {
             default,
             TuningMethod::Census,
             time,
+            launches,
         );
         result.disposition = TuningDisposition::CanonicalFallback {
             artifact: kernel.artifact().0.clone(),
@@ -8780,6 +8793,7 @@ mod tests {
                 &self.ledger.incumbent().specialization,
                 TuningMethod::Census,
                 TuningTime::default(),
+                Vec::new(),
             )
         }
     }

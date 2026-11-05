@@ -651,6 +651,7 @@ mod tests {
             method: seismic::TuningMethod::Census,
             time: TuningTime::default(),
             coverage: None,
+            default_launches: Vec::new(),
         };
         cache.store_tuning(&key, &1u32, &result);
         let (choice, evidence) = cache.tuning::<u32>(&key).unwrap();

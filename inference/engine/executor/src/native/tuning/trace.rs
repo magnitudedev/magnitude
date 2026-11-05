@@ -646,6 +646,7 @@ impl Serialize for Finished<'_> {
         record.serialize_entry("reselection", &receipt.reselection)?;
         record.serialize_entry("observations", &receipt.observations)?;
         record.serialize_entry("served", &receipt.served)?;
+        record.serialize_entry("default_launches", &receipt.default_launches)?;
         record.serialize_entry("candidates", &Candidates(receipt))?;
         record.serialize_entry("disposition", &receipt.disposition)?;
         record.serialize_entry("method", &receipt.method)?;
@@ -776,6 +777,8 @@ impl Serialize for Candidate<'_> {
         // The formation calls made for it: their seconds, the programs they
         // formed together, and whether none compiled.
         candidate.serialize_entry("formation", &record.formation)?;
+        // What its launches' programs use, as the compiler reports it.
+        candidate.serialize_entry("launches", &record.launches)?;
         candidate.serialize_entry("observations", &record.observations)?;
         candidate.serialize_entry("error_ratio", &ratio.is_finite().then_some(ratio))?;
         candidate.serialize_entry("admitted", &violation.is_none())?;

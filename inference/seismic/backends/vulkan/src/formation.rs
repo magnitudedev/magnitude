@@ -399,6 +399,14 @@ impl DirectModule {
     /// described as the driver reports it (an executable's name prefixes
     /// the statistic's where the pipeline has more than one); none where
     /// the device reports no statistics.
+    ///
+    /// The NVIDIA proprietary driver (595, RTX 3090) reports "Register
+    /// Count", "Binary Size", "Stack Size", "Local Memory Size" and "Shared
+    /// Memory Size". Two of them are not values: "Local Memory Size" reads
+    /// 2^36 for every pipeline (a sentinel) and "Stack Size" reads 0 for
+    /// every pipeline. Its spill signal is "Register Count" at the 255
+    /// ceiling: the projection GEMM's 64x64 sub-tiles reach it, with binaries
+    /// 2-3x larger, and run 6-7x slower than the best tile.
     fn statistics_of(&self, pipeline: vk::Pipeline) -> Result<Vec<ProgramStatistic>, NativeCompilationError> {
         let Some(executables) = &self.device.inner.executables else {
             return Ok(Vec::new());

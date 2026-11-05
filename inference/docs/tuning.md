@@ -232,6 +232,8 @@ compiled artifacts; it must record that condition when making comparisons.
 The tuning trace explains each decision in one self-contained unit record: its scope and demand,
 measured candidates, numerical yardsticks and their derivation, chosen configuration, reason,
 coverage and stop condition. It also accounts for the whole load's elapsed time and phases.
+Every unit record carries what its formed defaults' launches use, whether or not they were
+measured, and each candidate what its own launches use.
 Unmeasured quantities remain unavailable, never zero or fabricated evidence. Precision surveys
 and pinned-selection probes consume this same evidence through the evaluation system.
 
