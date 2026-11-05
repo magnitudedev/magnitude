@@ -37,7 +37,10 @@ const fits = assessed({
   environmentId: "environment",
   profile: { contextLength: 32_768 },
   memory: { domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0 },
-  performance: { _tag: "Estimated", samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 30 }] },
+  residency: {
+    _tag: "Resident",
+    performance: { _tag: "Estimated", samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 30 }] },
+  },
 })
 
 const unsupported = assessed({
@@ -357,7 +360,10 @@ describe("local models state", () => {
             assessmentId: `a-${modelId}`,
             drafter: { _tag: "None" },
             memory: [],
-            performance: { _tag: "Estimated", samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 30 }] },
+            residency: {
+              _tag: "Resident",
+              performance: { _tag: "Estimated", samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 30 }] },
+            },
             profile: { contextLength: 32_768 },
           }],
         },

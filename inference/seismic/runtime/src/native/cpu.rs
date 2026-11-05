@@ -12,7 +12,7 @@ use seismic_cpu::{NativeStep, NativeSteps};
 use seismic_native_cpu::{Tier, WeightOperand};
 
 use super::trace::host_seconds;
-use super::timeline::{TimelineKind, TimelineNode};
+use super::timeline::{TimelineAction, TimelineKind};
 use super::{Dispatch, DispatchList, NativeRoute};
 use crate::backends::CpuOpened;
 use crate::driver::typed_buffer;
@@ -151,8 +151,27 @@ struct Step<'a> {
     function: CpuKernelFn,
     invocation: CpuInvocation<'a>,
     items: u64,
+    /// The three 32-bit group counts an earlier launch wrote, read when the
+    /// step runs (`NativeLaunch::grid`); `items` is then their bound.
+    grid: Option<*const u32>,
     shared_bytes: u64,
     workers: usize,
+}
+
+// Work items only read the grid, which the steps before them wrote.
+unsafe impl Sync for Step<'_> {}
+
+impl Step<'_> {
+    /// The groups the step runs on each axis.
+    fn groups(&self) -> [u64; 3] {
+        match self.grid {
+            // SAFETY: the grid is a live binding of three aligned words,
+            // which the step only reads; the steps before it, which wrote
+            // them, completed.
+            Some(grid) => std::array::from_fn(|axis| u64::from(unsafe { grid.add(axis).read() })),
+            None => self.invocation.groups,
+        }
+    }
 }
 
 /// The active launches of one pass over a submission's calls, repeated.
@@ -175,9 +194,14 @@ impl NativeSteps for Steps<'_> {
         }
     }
 
+    fn items(&self, index: usize) -> u64 {
+        let step = &self.steps[index % self.steps.len()];
+        step.groups().iter().product()
+    }
+
     fn run(&self, index: usize, item: u64, shared: &mut [u8]) {
         let step = &self.steps[index % self.steps.len()];
-        let [x, y, _] = step.invocation.groups;
+        let [x, y, _] = step.groups();
         // SAFETY: the route selected the function for a tier the device has
         // (`CpuRoute::tier`, validated at preparation).
         unsafe {
@@ -248,9 +272,9 @@ pub(super) fn run(
                 let TimelineKind::Cpu(timeline) = operation.timeline.kind() else {
                     unreachable!("a run binds timelines of its own device");
                 };
-                match operation.node {
-                    TimelineNode::Wait => timeline.wait_unbounded(operation.value),
-                    TimelineNode::Signal => timeline.signal(operation.value),
+                match operation.action {
+                    TimelineAction::Wait => timeline.wait_unbounded(operation.value),
+                    TimelineAction::Signal => timeline.signal(operation.value),
                 }
             }
         }
@@ -356,6 +380,9 @@ fn steps<'a>(
                     threads: launch.threads,
                 },
                 items,
+                grid: launch.grid.map(|buffer| {
+                    tables.pointers[range.start + dispatch.kernel.argument(buffer)].cast_const().cast()
+                }),
                 shared_bytes: launch.shared_bytes,
                 workers: if *workers == 0 {
                     participants

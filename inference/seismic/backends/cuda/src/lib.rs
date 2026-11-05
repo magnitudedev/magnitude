@@ -9,6 +9,7 @@ mod compile;
 pub mod direct;
 mod driver;
 mod executor;
+mod graph_cost;
 pub mod model;
 #[cfg(not(target_os = "windows"))]
 mod nvml;
@@ -16,14 +17,56 @@ pub mod nvrtc;
 mod open;
 mod profile;
 mod ptx;
+mod registered;
 mod registry;
 pub mod toolchain;
+pub mod topology;
+pub mod transfer;
+
+/// The accounts a test opens a device with: none bounds or charges.
+#[cfg(test)]
+pub(crate) fn test_accounts() -> MemoryAccounts {
+    let unbounded = || -> std::sync::Arc<dyn seismic_compiler::executable::MemoryAccount> {
+        std::sync::Arc::new(seismic_compiler::executable::Unbounded)
+    };
+    MemoryAccounts { device: unbounded(), upload: unbounded(), host: unbounded() }
+}
+
+/// Test-only: the first device, opened and held alone for the test; `None`
+/// only where the host has no CUDA driver or device, which is refused where
+/// `SEISMIC_TEST_BACKEND` selects CUDA. A device that is present and fails
+/// to open fails the test.
+///
+/// The tests that open the device run one at a time. They share the
+/// process's one context, and a test that parks a kernel on an answer its
+/// own transfers give (`transfer`'s) must meet no other test's
+/// context-holding call (a module load, a graph's instantiation, a pinned
+/// allocation) while it parks, as a served load keeps those off a flight
+/// (`seismic_runtime::native::cuda`).
+#[cfg(test)]
+pub(crate) fn test_device() -> Option<(std::sync::MutexGuard<'static, ()>, OpenedCuda)> {
+    static DEVICE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let exclusive = DEVICE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let selected = std::env::var("SEISMIC_TEST_BACKEND").is_ok_and(|name| name == "cuda");
+    match device_count() {
+        Ok(count) if count > 0 => {}
+        absent => {
+            assert!(!selected, "no selected CUDA device: {absent:?}");
+            eprintln!("no CUDA device: {absent:?}");
+            return None;
+        }
+    }
+    let opened = open(0, test_accounts()).unwrap_or_else(|error| panic!("the CUDA device fails to open: {error}"));
+    Some((exclusive, opened))
+}
 
 pub use buffer::Buffer;
 pub use capability::CudaIntrinsic;
 pub use command::{CompiledKernel, OccupancyRelation};
 pub use compile::NativeCandidate;
-pub use executor::{Device, Executor, MemoryInfo};
+pub use driver::{reservation_granule, RangeMemory, ReservedMemory, RESERVATION_CHUNKS};
+pub use executor::{CudaResizer, Device, Executor, MemoryAccounts, MemoryInfo, NativeStream};
+pub use graph_cost::{graph_cost, UNMEASURED as UNMEASURED_GRAPH_COST};
 pub use open::{open, open_analytical, usable_memory_bytes, OpenedCuda};
 pub use profile::{
     can_access_peer, describe, device_count, max_allocation_bytes, ComputeCapability, CudaFacts,
@@ -147,7 +190,9 @@ impl seismic_ir::physical_target::PhysicalDialect for Cuda {
                 Some(CudaLaunchMode::Independent)
             }
             seismic_ir::schedule::LaunchParticipation::CooperativeGrid => facts
+                .properties
                 .cooperative_launch
+                .holds()
                 .then_some(CudaLaunchMode::CooperativeGrid),
         }
     }
@@ -291,7 +336,7 @@ pub(crate) fn native_launch_constraints(
     let one = arena.nat(1);
     let resident =
         active_blocks_expression(arena, &native.properties, threads, locals.workgroup_bytes);
-    let multiprocessors = arena.nat(u64::from(facts.multiprocessors));
+    let multiprocessors = arena.nat(facts.properties.units.get());
     let capacity = arena.nat_mul(multiprocessors, resident);
     let mut constraints = vec![arena.nat_cmp(seismic_lang::expr::CmpOp::Ge, resident, one)];
     if launch.descriptor == CudaLaunchMode::CooperativeGrid {
@@ -585,7 +630,7 @@ impl seismic_native_target::NativeCompiler<Cuda> for CudaNativeCompiler {
             NativeClusterDomain::NotApplicable
         };
         let mut modes = vec![CudaLaunchMode::Independent];
-        if target.facts().cooperative_launch {
+        if target.facts().properties.cooperative_launch.holds() {
             modes.push(CudaLaunchMode::CooperativeGrid);
         }
         let handle = CompiledKernel {

@@ -53,7 +53,7 @@ const DECODE_GRID: u64 = 128;
 fn decode_starts(
     mix: &AttentionMix,
     backend: seismic::BackendName,
-    implementation: &seismic::NativeImplementation,
+    implementation: &seismic::OnDevice,
     statics: &seismic::NativeSpecialization,
     limits: TuningLimits,
 ) -> Vec<seismic::ParameterValues> {
@@ -1466,7 +1466,7 @@ macro_rules! mix_entry {
             $(fn search_starts(
                 &self,
                 device: &Device,
-                implementation: &seismic::NativeImplementation,
+                implementation: &seismic::OnDevice,
                 statics: &seismic::NativeSpecialization,
                 limits: TuningLimits,
             ) -> Vec<seismic::ParameterValues> {
@@ -1622,12 +1622,18 @@ mod tests {
                 seismic::BackendName::Metal,
             )
             .unwrap()
-            .unwrap(),
+            .unwrap()
+            .device_independent()
+            .expect("the declaration reads no device property")
+            .owned(),
             seismic::generated::native_implementation_for_backend::<attention_decode_k8v4::Entry>(
                 seismic::BackendName::Metal,
             )
             .unwrap()
-            .unwrap(),
+            .unwrap()
+            .device_independent()
+            .expect("the declaration reads no device property")
+            .owned(),
         ] {
             for group in [1, 2, 3, 4, 8] {
                 let mut mix = AttentionMix {
@@ -1719,7 +1725,10 @@ mod tests {
             attention_decode_k8v4::Entry,
         >(seismic::BackendName::Metal)
         .unwrap()
-        .unwrap();
+        .unwrap()
+            .device_independent()
+            .expect("the declaration reads no device property")
+            .owned();
         // Gemma 4 E2B and 12B full layers (one kv head, 512 columns), Gemma
         // 4 31B full layers (four), Qwen 3.8 27B (four kv heads of six).
         for (kv_heads, group, width, rows, expected) in [
@@ -1798,20 +1807,28 @@ mod tests {
                 BackendName::Cuda,
             )
             .unwrap()
-            .unwrap(),
+            .unwrap()
+            .device_independent()
+            .expect("the declaration reads no device property")
+            .owned(),
             seismic::generated::native_implementation_for_backend::<attention_decode_k8v4::Entry>(
                 BackendName::Cuda,
             )
             .unwrap()
-            .unwrap(),
+            .unwrap()
+            .device_independent()
+            .expect("the declaration reads no device property")
+            .owned(),
         ];
         for implementation in implementations {
-            for (group, width, max_rows, expected_warps) in [
-                (2, 256, 8, 1),
-                (6, 256, 8, 4),
-                (8, 128, 8, 4),
-                (16, 256, 8, 8),
-                (6, 256, 4, 2),
+            // The affine entry's default SLICES: the fewest that hold a lane
+            // to 32 elements, or the most the group splits into.
+            for (group, width, max_rows, expected_warps, affine_slices) in [
+                (2, 256, 8, 1, 1),
+                (6, 256, 8, 4, 2),
+                (8, 128, 8, 4, 1),
+                (16, 256, 8, 8, 4),
+                (6, 256, 4, 2, 2),
             ] {
                 let mut mix = AttentionMix {
                     codec: magnitude_state::KvCodec::AffineK8V4.spec(
@@ -1866,15 +1883,13 @@ mod tests {
                 assert_eq!(choice.param("WARPS"), Some(expected_warps));
                 assert_eq!(choice.param("COLUMNS"), Some(1));
                 assert_eq!(choice.param("STAGES"), Some(2));
-                // The default is the vector form, except on the affine entry
-                // where a lane of the whole group would hold more than 64
-                // elements and the group splits further.
+                // The default is the vector form, the group whole except on
+                // the affine entry, which splits it so a lane holds at most
+                // 32 elements where it can.
                 let affine = implementation.statics.iter().any(|name| name == "KC");
                 let default = implementation.default_specialization(&statics).unwrap();
-                assert_eq!(
-                    default.param("MATRIX"),
-                    Some(u64::from(affine && group * width / 32 > 64))
-                );
+                assert_eq!(default.param("MATRIX"), Some(0));
+                assert_eq!(default.param("SLICES"), Some(if affine { affine_slices } else { 1 }));
 
                 mix.decode_rows = Some(1..2);
                 assert!(

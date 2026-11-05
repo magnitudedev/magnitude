@@ -1,9 +1,16 @@
 // Shared pieces of the routed (mixture-of-experts) Metal entries built on the
-// projection family: expert row offsets in expert-stacked weights, the plain
+// projection family: the record an expert's weights are read from, the plain
 // activation prologue they share, the grouped-row prologue of the expert
-// GEMMs and the live-row count of a grouped block. Weights are bound through
-// the `packets.h` slots (`KERNEL_W0..3`).
+// GEMMs, the live-row count of a grouped block and the choice of a block's
+// GEMM form. Every form gives the GEMM's bits, so a row's output depends on
+// its own row alone, never on how many rows share its block. Weights are
+// bound through the `packets.h` slots (`KERNEL_W0..3`); an expert-stacked
+// weight is a record port, bound as its records' address table, and an
+// expert's weights are rows 0.. of its record's base
+// (`slab::region<const uchar, packets::space>(table, record)`, in the bound
+// weights' space).
 
+#include <seismic/slab.h>
 #include "../projection/projection.h"
 
 namespace routed {
@@ -11,13 +18,64 @@ namespace routed {
 typedef element::Act Act;
 static_assert(Act::bytes == 2, "the Metal routed family requires a bf16 or f16 activation element");
 
-// First row of expert `expert` in an [E, N, K] rows16 tensor of N rows per
-// expert.
-inline ulong expert_row(ulong expert, ulong rows) { return expert * rows; }
+// Expert `expert`'s weights of an expert-stacked weight: record `slot` of
+// `records` where the layer's map holds it for the step (`slot` >= 0), else
+// its place in `experts` by index (the stack, or the scratch tier).
+inline packets::weight_bytes expert_weights(device const ulong *records, device const ulong *experts, int slot,
+    int expert) {
+    return slot >= 0 ? slab::region<const uchar, packets::space>(records, ulong(slot))
+                     : slab::region<const uchar, packets::space>(experts, ulong(expert));
+}
+
+// The record a decode expert entry reads choice (m, k)'s weights from, of
+// expert `expert` (`decode_source`, routed.seismic): the expert itself
+// without sources (`rows` 0, a resident layer), else the step's source
+// (`sources`' SOURCE_RECORD row at strides `row_stride`, `choice_stride`);
+// -1 where that names none (a choice that reads no record and contributes
+// nothing; when is stated there).
+inline int decode_source(device const int *sources, ulong rows, ulong row_stride, ulong choice_stride, ulong m,
+                         ulong k, int expert) {
+    return rows == 0 ? expert : sources[m * row_stride + k * choice_stride];
+}
+
+// The weights a decode source names (`decode_source`, not -1): a record of
+// the bank's records `bank` (>= 0), or record t of the host tier's `tier` as
+// -2 - t, which on unified memory the entries read in place as they read the
+// bank's (both record tables).
+inline packets::weight_bytes source_weights(device const ulong *bank, device const ulong *tier, int source) {
+    return source >= 0 ? slab::region<const uchar, packets::space>(bank, ulong(source))
+                       : slab::region<const uchar, packets::space>(tier, ulong(-2 - source));
+}
+
+// A choice with no record's product row (`decode_source` -1): `count` zero A
+// elements at `out`, element stride `stride`, by `threads` threads from
+// `first`.
+inline void zero_row(device uchar *out, ulong stride, uint count, uint first, uint threads) {
+    for (uint i = first; i < count; i += threads)
+        element::put<Act>(out, ulong(i) * stride, 0.0f);
+}
+
+inline void write_grid(device int *grid, uint x, uint y) {
+    grid[0] = int(x);
+    grid[1] = int(y);
+    grid[2] = 1;
+}
+
+// The grids of an expert pass over `rows` grouped rows and `used` blocks of
+// `tile_rows` rows (`routed_experts`): a stage threadgroup per row, a
+// quantize threadgroup per block row, and `subtiles` row tiles of each used
+// block by the expand's and down's column tiles.
+inline void expert_grids(uint rows, uint used, uint tile_rows, uint subtiles, uint expand_columns,
+    uint down_columns, device int *stage, device int *expand, device int *quantize, device int *down) {
+    write_grid(stage, rows, 1);
+    write_grid(expand, expand_columns, used * subtiles);
+    write_grid(quantize, used * tile_rows, 1);
+    write_grid(down, down_columns, used * subtiles);
+}
 
 // Rows of weight tensor `base` starting at row `first`.
 template <typename W>
-inline projection::Weights<W> weights(device const uchar *base, packets::Rows16 layout, ulong first, uint k) {
+inline projection::Weights<W> weights(packets::weight_bytes base, packets::Rows16 layout, ulong first, uint k) {
     return projection::Weights<W>{base, layout, k, nullptr, first};
 }
 
@@ -30,7 +88,9 @@ inline projection::Plain<Act, projection::AllRows> activation(device const uchar
 // The decode down projections of one simdgroup (the choices of a row, and
 // the shared expert, run side by side, one simdgroup each): channels
 // first + g + G * r (lane group g of G = 32 / LANES, r < ROWS) of weights `w`
-// against the one-row product `in` of COLUMNS values, stored unrounded at
+// against the one-row product `in` of COLUMNS values, over its first
+// `extent` values alone (a multiple of the packet's 32 columns; COLUMNS for
+// every value), stored unrounded at
 // projected[g + G * r]. The lanes of a group own the packets sub,
 // sub + LANES, ... of every channel's row, as the K1 GEMV's lanes do, and
 // sum them in the same order, so every projection is the GEMV's sum for the
@@ -39,11 +99,13 @@ inline projection::Plain<Act, projection::AllRows> activation(device const uchar
 // the weight loads of all its channels before it accumulates any.
 template <typename W, uint ROWS, uint LANES, uint COLUMNS, typename In>
 inline void project_channels(thread const In &in, thread const projection::Weights<W> &w, uint first,
-    uint rows, threadgroup float *projected, uint lane) {
+    uint rows, uint extent, threadgroup float *projected, uint lane) {
     constexpr uint G = 32u / LANES;
-    constexpr uint P = (COLUMNS + 31u) / 32u;
+    constexpr uint COLUMN_PACKETS = (COLUMNS + 31u) / 32u;
+    // The packets read: those of the extent.
+    const uint P = min(COLUMN_PACKETS, (extent + 31u) / 32u);
     // Packets per lane.
-    constexpr uint PL = (P + LANES - 1u) / LANES;
+    constexpr uint PL = (COLUMN_PACKETS + LANES - 1u) / LANES;
     const uint g = lane / LANES, sub = lane % LANES;
     typename W::packet packets[ROWS][PL];
     PROJECTION_UNROLL
@@ -147,38 +209,50 @@ struct Grouped {
     }
 };
 
-// The expert projections of one grouped block tile. A block of at most
-// `batched_rows` live rows runs the batched GEMV body (weights decoded to F32
-// straight into the matrix fragments, no B staging), staged in the GEMM
-// tile's own threadgroup buffer: few rows cannot amortize the GEMM's per-tile
-// weight staging. Other blocks run the TM x TN GEMM over their live rows.
-// The batched body covers the GEMM tile's outputs with the same threads:
-// TN / 16 simdgroups, of 1 (paired: TN / 2 features) or 2 (TN rows) row
-// blocks of 8. Padding rows carry no contract: the batched body leaves them
-// unwritten.
-constant constexpr uint batched_rows = 8;
-
+// The expert projections of one grouped block tile: the TM x TN GEMM over
+// the block's `live` rows, or, on simdgroup matrices, its one-row form
+// (`projection::gemm_row`) when they fit one fragment row, with the same
+// bits and without the GEMM's threadgroup-wide weight staging, which few
+// rows cannot amortize.
+// A tensor-operation device runs the GEMM alone: its products are one
+// `matmul2d` over the staged tile, whose summation order no other form can
+// be shown to reproduce.
 template <typename G, typename U, uint TM, uint TN, typename In, typename Out>
 inline void expert_paired(thread const In &in, thread const Out &out, thread const projection::Weights<G> &gate,
     thread const projection::Weights<U> &up, uint live, uint m_rows, uint rows, uint k, uint tm, uint tn,
     threadgroup uchar *shared, uint sg, uint lane) {
-    static_assert(TM <= 64, "the batched body reuses the 2 * TN threads of a TM <= 64 tile");
-    if (live <= batched_rows && tm == 0)
-        projection::gemv_batch_paired<G, U, TN / 16u, 1u, projection::gemm_tile<TM, TN>::bytes>(in, out, gate, up,
-            live, rows, k, tn, shared, sg, lane);
-    else
-        projection::gemm_paired<G, U, TM, TN>(in, out, gate, up, m_rows, rows, k, tm, tn, shared, sg, lane, live);
+#if !SEISMIC_HAS_TENSOR_OPS
+    if (live <= projection::gemm_row_rows) {
+        if (tm == 0)
+            projection::gemm_row_paired<G, U, TM, TN>(in, out, gate, up, live, rows, k, tn, shared, sg, lane);
+        return;
+    }
+#endif
+    projection::gemm_paired<G, U, TM, TN>(in, out, gate, up, m_rows, rows, k, tm, tn, shared, sg, lane, live);
 }
 
 template <typename W, uint TM, uint TN, typename In, typename Out>
 inline void expert_plain(thread const In &in, thread const Out &out, thread const projection::Weights<W> &w,
     uint live, uint m_rows, uint rows, uint k, uint tm, uint tn, threadgroup uchar *shared, uint sg, uint lane) {
-    static_assert(TM <= 64, "the batched body reuses the 2 * TN threads of a TM <= 64 tile");
-    if (live <= batched_rows && tm == 0)
-        projection::gemv_batch<W, TN / 16u, 2u, projection::gemm_tile<TM, TN>::bytes>(in, out, w, live, rows, k, tn,
-            shared, sg, lane);
-    else
-        projection::gemm<W, TM, TN>(in, out, w, m_rows, rows, k, tm, tn, shared, sg, lane, live);
+#if !SEISMIC_HAS_TENSOR_OPS
+    if (live <= projection::gemm_row_rows) {
+        if (tm == 0)
+            projection::gemm_row<W, TM, TN>(in, out, w, live, rows, k, tn, shared, sg, lane);
+        return;
+    }
+#endif
+    projection::gemm<W, TM, TN>(in, out, w, m_rows, rows, k, tm, tn, shared, sg, lane, live);
 }
+
+// A resident combine's projections of one channel in threadgroup memory:
+// slot k's at `projected[k * TILE + tid]`, A-rounded.
+struct TileProjections {
+    threadgroup const float *projected;
+    uint tile;
+    uint tid;
+    float at(uint k) const thread {
+        return Act::round(projected[k * tile + tid]);
+    }
+};
 
 } // namespace routed

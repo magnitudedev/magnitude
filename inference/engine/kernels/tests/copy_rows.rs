@@ -1,3 +1,5 @@
+mod common;
+
 use magnitude_kernels::copy_rows;
 
 fn slabbed_rows(
@@ -37,17 +39,16 @@ fn slabbed_rows(
 #[test]
 fn portable_copy_moves_only_the_indexed_dense_rows() {
     use seismic_lang::{
-        checked::{check_source, SourceFile, SourceSet},
+        checked::{SourceFile, SourceSet},
         entry::ElementBindings,
         interp::{Arg, Interpreter, TensorData},
         registry,
         types::DType,
     };
-    let module = check_source(SourceSet::new(vec![SourceFile {
+    let module = crate::common::check(SourceSet::new(vec![SourceFile {
         path: "state.seismic".into(),
         text: include_str!("../kernels/state.seismic").into(),
-    }]))
-    .unwrap();
+    }]));
     let logical = module
         .entry(
             module.entry_named("copy_rows").unwrap(),

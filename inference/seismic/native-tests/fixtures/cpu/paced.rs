@@ -1,8 +1,8 @@
 // One work item over all `N` elements, matching the GPU kernels bit for
-// bit: `PACE` rounds of 2^13 generator steps for each element (a CPU takes
+// bit: `PACE` rounds of 2^12 mixer steps for each element (a CPU takes
 // the elements in turn, so a round is shorter than a GPU thread's), then
-// the sum with the pace's bias and the generator's low bit against the
-// index's, which an even number of steps leaves equal.
+// the sum with the pace's bias and whether the generator's whole last state
+// is `0xFFFFFFFF`, which it never is (as `metal/paced.metal` says).
 fn paced<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, _group: [u64; 3], _shared: &mut [u8]) {
     let state = cx.arg_state();
     let x = cx.arg_x();
@@ -14,10 +14,10 @@ fn paced<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, _group: [u64; 3], _sha
     };
     for index in 0..cx.dim_n() as usize {
         let mut generated = index as u32;
-        for _ in 0..pace << 13 {
-            generated = generated.wrapping_mul(1664525).wrapping_add(1013904223);
+        for _ in 0..pace << 12 {
+            generated = (generated ^ (generated >> 16)).wrapping_mul(0x45d9f3b);
         }
-        let unchanged = ((generated ^ index as u32) & 1) as f32;
+        let unchanged = f32::from(u8::from(generated == u32::MAX));
         // SAFETY: the one work item owns the state.
         unsafe { state.set([index], state.get([index]) + (x.get([index]) + bias + unchanged)) };
     }

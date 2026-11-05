@@ -26,6 +26,39 @@ fn definition(large: bool) -> ModelDefinition {
     .unwrap()
 }
 
+/// A projector's declared feature width.
+fn width(projector: &magnitude_artifacts::gguf::Directory) -> u64 {
+    projector
+        .value("clip.vision.projection_dim")
+        .and_then(magnitude_artifacts::gguf::Value::unsigned)
+        .unwrap()
+}
+
+/// Another model's projector, or one of another width, disagrees with the target, before the
+/// MiniCPM-V and Qwen3-VL readers alike; a header that is no projector is unreadable.
+#[test]
+fn another_models_projector_is_a_mismatch() {
+    use magnitude_artifacts::UnsupportedReason;
+    let gemma = headers::projector("gemma-4-e2b-it-qat:gguf:q4");
+    let own = headers::projector("minicpm-v-4.7-1b:gguf:q4");
+    for error in [
+        minicpm::describe_projector(&gemma, width(&gemma)).unwrap_err(),
+        magnitude_family_qwen::describe_projector(&gemma, width(&gemma)).unwrap_err(),
+        // Its own kind of projector, at another target's width.
+        minicpm::describe_projector(&own, width(&own) + 1).unwrap_err(),
+    ] {
+        assert!(
+            matches!(error.reasons[..], [UnsupportedReason::TargetMismatch { .. }]),
+            "{error}"
+        );
+    }
+    let target = headers::target("minicpm-v-4.7-1b:gguf:q4");
+    assert_eq!(
+        minicpm::describe_projector(&target, width(&own)).unwrap_err().reasons,
+        [UnsupportedReason::Unreadable]
+    );
+}
+
 #[test]
 fn both_released_projectors_bind_the_exact_tower_and_merger() {
     for large in [false, true] {
@@ -70,12 +103,12 @@ fn unsupported_compression_and_unknown_weights_are_refused() {
         .find(|e| e.name == "clip.vision.projector.scale_factor")
         .unwrap()
         .value = Value::Scalar(Scalar::Unsigned(4));
-    assert!(minicpm::describe_projector(&p).is_err());
+    assert!(minicpm::describe_projector(&p, width(&p)).is_err());
     p = original;
     let mut t = p.tensors[0].clone();
     t.name = "unexpected.weight".into();
     p.tensors.push(t);
-    assert!(minicpm::describe_projector(&p).is_err());
+    assert!(minicpm::describe_projector(&p, width(&p)).is_err());
 }
 
 struct Markers;

@@ -42,7 +42,8 @@ pub const CHECK_WORK_UNITS: u64 = 1 << 28;
 pub const RANKING_TIME: Duration = Duration::from_secs(2);
 
 pub fn corpus_path(relative: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+    Path::new(&std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"))
+        .join(relative)
 }
 
 /// The backend's device; a missing device is a test failure, never a skip.

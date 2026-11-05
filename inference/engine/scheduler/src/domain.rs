@@ -141,10 +141,10 @@ pub enum FlightOutcomes {
 /// flight and registers `wake` with its completion; a refusal returns them.
 pub fn submit_group<F: ProgramFamily>(
     domain: &mut ExecutorDomain<F>,
-    bindings: StateBindings<F>,
+    bindings: StateBindings,
     group: &OperationGroup,
     wake: CompletionWake,
-) -> Result<DomainFlight<F>, SubmitFailure<F>> {
+) -> Result<DomainFlight<F>, SubmitFailure> {
     let mut flight = submit(domain, bindings, group)?;
     flight.completion().notify(wake);
     Ok(flight)
@@ -152,9 +152,9 @@ pub fn submit_group<F: ProgramFamily>(
 
 fn submit<F: ProgramFamily>(
     domain: &mut ExecutorDomain<F>,
-    mut bindings: StateBindings<F>,
+    mut bindings: StateBindings,
     group: &OperationGroup,
-) -> Result<DomainFlight<F>, SubmitFailure<F>> {
+) -> Result<DomainFlight<F>, SubmitFailure> {
     let operations = group.operations.as_slice();
     let resources = match domain.reserve(&mut bindings, operations) {
         Ok(reservation) => reservation.into_resources(),
@@ -233,10 +233,9 @@ pub fn finish<F: ProgramFamily>(
 
 pub fn requirements<F: ProgramFamily>(
     domain: &ExecutorDomain<F>,
-    bindings: &StateBindings<F>,
     group: &OperationGroup,
 ) -> Result<DomainRequirements, DomainError> {
-    domain.requirements(bindings, &group.operations)
+    domain.requirements(&group.operations)
 }
 
 #[cfg(test)]

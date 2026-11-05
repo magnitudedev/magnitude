@@ -1186,6 +1186,9 @@ mod internals {
                     (ParameterAccess::Owned, TensorAccess::Owned)
                         | (ParameterAccess::Shared, TensorAccess::Shared)
                         | (ParameterAccess::Mutable, TensorAccess::Mutable)
+                ) || matches!(
+                    (parameter.access, access),
+                    (ParameterAccess::Host { write: a }, TensorAccess::Host { write: b }) if a == *b
                 ));
             }
             (SemanticType::Scalar(expected), ParameterKind::Scalar { dtype, .. }) => {

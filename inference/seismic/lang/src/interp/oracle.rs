@@ -1087,7 +1087,66 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    /// A store into encoded storage: whole trailing matrices of the same
+    /// representation, copied as their encoded bytes (the checker admits no
+    /// other store into packed storage, `registry::record_writable`).
+    fn store_records(&mut self, destination: &TensorValue, source: &TensorValue) -> Result<(), EvalError> {
+        let defect = |detail: &str| -> EvalError {
+            OracleError::InterpreterDefect(format!("packed record store: {detail}")).into()
+        };
+        if source.representation != destination.representation || source.shape != destination.shape {
+            return Err(defect("the value is not the selection's representation and shape"));
+        }
+        // The records a view selects: contiguous whole trailing matrices of
+        // its backing.
+        let records = |value: &TensorValue, data: &TensorData| -> Option<std::ops::Range<usize>> {
+            let shape = data.shape();
+            let leading = shape.len().checked_sub(2)?;
+            let matrix: usize = shape[leading..].iter().product();
+            let first = *value.positions.first()?;
+            let count = value.positions.len();
+            (value.shape.len() >= 2
+                && value.shape[value.shape.len() - 2..] == shape[leading..]
+                && first % matrix == 0
+                && count % matrix == 0
+                && value.positions.iter().copied().eq(first..first + count))
+            .then(|| first / matrix..(first + count) / matrix)
+        };
+        let read = |value: &TensorValue, data: &mut TensorData| -> Option<Vec<u8>> {
+            let range = records(value, data)?;
+            data.record_bytes(range).map(|bytes| bytes.to_vec())
+        };
+        let bytes = match &source.backing {
+            Backing::Argument(index) => read(source, &mut self.tensors[*index]),
+            Backing::Owned(data) => read(source, &mut data.borrow_mut()),
+        }
+        .ok_or_else(|| defect("the value is not whole records"))?;
+        self.charge_work(bytes.len() as u64)?;
+        let write = |data: &mut TensorData| {
+            let range = records(destination, data)?;
+            let target = data.record_bytes(range)?;
+            (target.len() == bytes.len()).then(|| target.copy_from_slice(&bytes))
+        };
+        match &destination.backing {
+            Backing::Argument(index) => write(&mut self.tensors[*index]),
+            Backing::Owned(data) => write(&mut data.borrow_mut()),
+        }
+        .ok_or_else(|| defect("the selection is not whole records"))
+    }
+
     fn store_tensor(&mut self, destination: &TensorValue, source: &Value) -> Result<(), EvalError> {
+        match registry::store_rule(destination.representation) {
+            registry::StoreRule::Any => {}
+            registry::StoreRule::Records(_) => {
+                let Value::Tensor(source) = source else {
+                    return Err(OracleError::InterpreterDefect("packed record store of a scalar".into()).into());
+                };
+                return self.store_records(destination, source);
+            }
+            registry::StoreRule::Refused(_) => {
+                return Err(OracleError::InterpreterDefect("store into storage that takes none".into()).into());
+            }
+        }
         self.charge_tensor(&destination.shape)?;
         let _snapshot = self.reserve_elements::<ReferenceScalar>(destination.element_count())?;
         let values = match source {

@@ -669,7 +669,7 @@ impl ManagedCatalogModels {
             return;
         }
         let service = self.clone();
-        tokio::spawn(async move { service.run_maintenance().await });
+        magnitude_service_utils::owner::spawn("the catalog's maintenance", async move { service.run_maintenance().await });
     }
 
     async fn run_maintenance(self) {

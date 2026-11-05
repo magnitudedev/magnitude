@@ -14,7 +14,6 @@ import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .sync import INFERENCE
 
 
 @dataclass(frozen=True)
@@ -38,7 +37,7 @@ def _content(path: Path) -> bytes:
     return path.read_bytes()
 
 
-def identify(tree: Path = INFERENCE) -> BuildIdentity:
+def identify(tree: Path) -> BuildIdentity:
     commit = _git(tree, "rev-parse", "HEAD").decode().strip()
     root = Path(_git(tree, "rev-parse", "--show-toplevel").decode().strip())
     material = hashlib.sha256()

@@ -34,9 +34,10 @@ mod open;
 mod profile;
 mod registry;
 mod services;
+pub mod topology;
 mod workers;
 
-pub use buffer::Buffer;
+pub use buffer::{Buffer, WritableBuffer};
 pub use command::CompiledKernel;
 pub use compile::NativeCandidate;
 pub use executor::{Device, Executor};
@@ -194,5 +195,7 @@ impl seismic_ir::identity::CanonicalIdentity for CpuLaunchMode {
     }
 }
 
+#[cfg(test)]
+mod code_tests;
 #[cfg(test)]
 mod plane_tests;

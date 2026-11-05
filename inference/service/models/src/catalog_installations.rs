@@ -40,7 +40,7 @@ pub struct ManagedCatalogInstallations {
     remover: Arc<dyn CatalogPackageRemover>,
     optimizer: Arc<dyn CatalogModelOptimizer>,
     operations: RwLock<Vec<OperationBinding>>,
-    jobs: Mutex<HashMap<CatalogInstallationOperationId, tokio::task::JoinHandle<()>>>,
+    jobs: Mutex<HashMap<CatalogInstallationOperationId, magnitude_service_utils::owner::Owner>>,
     mutations: tokio::sync::Mutex<()>,
     revision: Arc<AtomicU64>,
     changes: tokio::sync::broadcast::Sender<CatalogInstallationsInvalidation>,
@@ -156,7 +156,7 @@ impl ManagedCatalogInstallations {
         let stopped = optimizing || job.is_some();
         if let Some(job) = job {
             job.abort();
-            let _ = job.await;
+            job.ended().await;
         }
         self.set_optimization(id, None);
         Ok(stopped)
@@ -291,7 +291,7 @@ impl ManagedCatalogInstallations {
         let this = self.this.upgrade().expect("catalog installations are alive while in use");
         // Held across the spawn, so a job that ends at once removes its own entry after it.
         let mut jobs = self.jobs.lock().expect("catalog installation job lock");
-        let job = tokio::spawn(this.run(operation_id.clone(), binding));
+        let job = magnitude_service_utils::owner::spawn("a catalog installation", this.run(operation_id.clone(), binding));
         jobs.insert(operation_id.clone(), job);
         drop(jobs);
         Ok(CatalogInstallationAdmission::Admitted { operation_id })

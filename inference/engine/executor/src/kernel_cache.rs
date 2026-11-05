@@ -5,11 +5,14 @@
 //! one, nothing is cached. Layout:
 //!
 //! ```text
-//! <root>/artifacts/<namespace>/<key>   what each toolchain keeps of the programs
-//!                                      Seismic formed (compiled bytes on CUDA and
-//!                                      Vulkan, a record of what was compiled on
-//!                                      Metal), one namespace per toolchain (its
+//! <root>/artifacts/<namespace>/<key>   the artifacts of the programs Seismic
+//!                                      compiled (CUDA's cubin, Vulkan's SPIR-V with
+//!                                      its pipeline cache data, Metal's source and
+//!                                      entries) and which artifact holds each entry,
+//!                                      one namespace per toolchain (its
 //!                                      ArtifactStore)
+//! <root>/artifacts/probes/<key>        the measurement job's probe results for one
+//!                                      device and driver (`seismic::PROBE_NAMESPACE`)
 //! <root>/tuning/<key>.json             one unit's choice per tuning key: what a load
 //!                                      serves and what it holds that choice to,
 //!                                      replaced whole when the unit's search changes
@@ -23,6 +26,9 @@
 //! <root>/prepared/<key>                a Prepare of the load this key names ran to
 //!                                      its end: a load asked to report unprepared
 //!                                      units finds none before it opens a device
+//! <root>/graph-bounds/<key>.json        a load's checked graph resource bounds, for
+//!                                      the plan and build its key names: what
+//!                                      certifying every graph family derives
 //! <root>/records/<digest>.json         Seismic's measurement records, one outcome
 //!                                      per point key (its timing, or why it is
 //!                                      unobtainable)
@@ -33,7 +39,9 @@
 //!                                      ([`KernelCache::measurement_attempts`])
 //! ```
 //!
-//! The measurement records and their attempts are not the cache's entries.
+//! The measurement records, their attempts and the probe results are not the
+//! cache's entries; a probe result lost would leave loads on its safe value
+//! until a job probed again.
 //! A record is valid while its key (the executor's hardware and driver, the
 //! kernel's source, its configuration and point) matches, and is taken
 //! again when it does not; losing one costs a measurement job. An attempt is
@@ -59,13 +67,18 @@
 //!   entry, of their summed size and their latest use.
 //!
 //! So evidence that a choice names and that cannot be read is a broken
-//! store, reported as that, not a miss.
+//! store, reported as that, not a miss. Program artifacts and entry
+//! pointers are Seismic's cache: one that does not decode or parse is
+//! reported, compiled again and rewritten.
 //!
-//! Every key is a content address, so nothing is ever invalidated: a changed
-//! input gives a new key. Writes go to a temporary file in the same
+//! Every key of a record or a program artifact is a content address, so
+//! neither is ever invalidated: a changed input gives a new key. An entry
+//! pointer's key names the entry, and the artifact it names may be replaced.
+//! Eviction may take an artifact and leave its pointers; a pointer whose
+//! artifact is gone is a miss. Writes go to a temporary file in the same
 //! directory and are renamed into place, so concurrent processes never see a
-//! partial entry. A file that cannot be read or parsed is a miss (it is
-//! rewritten), never an error. Reading an entry refreshes its modification
+//! partial entry. Any other file that cannot be read or parsed is a miss (it
+//! is rewritten), never an error. Reading an entry refreshes its modification
 //! time, and opening the cache evicts the least recently used entries above
 //! its capacity.
 
@@ -92,11 +105,14 @@ const TUNING: &str = "tuning";
 const EVIDENCE: &str = "evidence";
 const READOUT: &str = "readout";
 const PREPARED: &str = "prepared";
+const GRAPH_BOUNDS: &str = "graph-bounds";
 const RECORDS: &str = "records";
 const MEASUREMENT_ATTEMPTS: &str = "measurement-attempts";
+const MISSES: &str = "misses";
+const MEASUREMENT_REQUESTS: &str = "measurement-requests";
 /// The directories under the root that hold no entry: eviction never walks
 /// them.
-const KEPT: [&str; 2] = [RECORDS, MEASUREMENT_ATTEMPTS];
+const KEPT: [&str; 4] = [RECORDS, MEASUREMENT_ATTEMPTS, MISSES, MEASUREMENT_REQUESTS];
 
 /// The bytes at `path`, refreshing its use time; `None` on any failure.
 fn read_entry(path: &Path) -> Option<Vec<u8>> {
@@ -189,7 +205,7 @@ impl KernelCache {
     /// Open the cache at `root`, creating it, and evict the least recently
     /// used entries beyond `capacity` bytes.
     pub fn open(root: PathBuf, capacity: u64) -> Result<Self, KernelCacheError> {
-        for directory in [ARTIFACTS, TUNING, EVIDENCE, READOUT, PREPARED] {
+        for directory in [ARTIFACTS, TUNING, EVIDENCE, READOUT, PREPARED, GRAPH_BOUNDS] {
             let path = root.join(directory);
             fs::create_dir_all(&path).map_err(|error| KernelCacheError::Create { path, error })?;
         }
@@ -220,6 +236,20 @@ impl KernelCache {
         JsonFileStore::new(&root.join(RECORDS))
     }
 
+    /// The point requests kept in the kernel cache at `root`
+    /// (`assessment::PointRequests`): what the measurement job measures
+    /// next, beside the records it stores. Eviction leaves them alone.
+    pub fn measurement_requests(root: &Path) -> JsonFileStore {
+        JsonFileStore::new(&root.join(MEASUREMENT_REQUESTS))
+    }
+
+    /// The streamed loads' miss records kept in the kernel cache at `root`
+    /// (`assessment::StoredMisses`), one per executor and model, every
+    /// load's record merged into it. Eviction leaves them alone.
+    pub fn miss_records(root: &Path) -> JsonFileStore {
+        JsonFileStore::new(&root.join(MISSES))
+    }
+
     fn entry(&self, directory: &str, key: &str, extension: &str) -> PathBuf {
         self.root.join(directory).join(format!("{key}.{extension}"))
     }
@@ -239,8 +269,8 @@ impl KernelCache {
     fn write(&self, path: &Path, bytes: &[u8]) -> bool {
         let directory = path.parent().expect("cache entries live in a directory");
         if let Err(error) = fs::create_dir_all(directory) {
-            eprintln!(
-                "magnitude-engine: kernel cache: cannot create {}: {error}",
+            tracing::warn!(
+                "kernel cache: cannot create {}: {error}",
                 directory.display()
             );
             return false;
@@ -258,8 +288,8 @@ impl KernelCache {
             .and_then(|()| fs::rename(&temporary, path));
         if let Err(error) = &written {
             let _ = fs::remove_file(&temporary);
-            eprintln!(
-                "magnitude-engine: kernel cache: cannot write {}: {error}",
+            tracing::warn!(
+                "kernel cache: cannot write {}: {error}",
                 path.display()
             );
         }
@@ -337,6 +367,23 @@ impl KernelCache {
         self.write(&self.entry(PREPARED, key.as_str(), "json"), b"{}");
     }
 
+    /// The graph resource bounds of the plan `key` names, none where none
+    /// is stored. Its key names the build that wrote it, so an entry that
+    /// does not parse is a store that broke that, not a miss.
+    pub(crate) fn graph_bounds(&self, key: &TuningCacheKey) -> Result<Option<crate::AssessmentGraphResourceBounds>, String> {
+        let path = self.entry(GRAPH_BOUNDS, key.as_str(), "json");
+        let Some(bytes) = self.read(&path) else { return Ok(None) };
+        serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+            format!("kernel cache invariant broken: graph bounds {} do not parse: {error}", path.display())
+        })
+    }
+
+    /// Store the graph resource bounds of the plan `key` names.
+    pub(crate) fn store_graph_bounds(&self, key: &TuningCacheKey, bounds: &crate::AssessmentGraphResourceBounds) {
+        let bytes = serde_json::to_vec(bounds).expect("graph bounds serialize");
+        self.write(&self.entry(GRAPH_BOUNDS, key.as_str(), "json"), &bytes);
+    }
+
     /// Completed composed-recipe choice; false is a permanent canonical
     /// fallback for this first-load identity, including unmeasured scope.
     /// A choice stored before its search's work ended is not settled: it is
@@ -392,7 +439,8 @@ impl KernelCache {
     /// the measurement records and their attempts belongs to an entry
     /// ([`Self::eviction_entry`]); an entry is as large as its files
     /// together, was used when the latest of them was, and is removed whole.
-    /// The directories of [`KEPT`] are never walked.
+    /// The directories of [`KEPT`] and the stored probe results
+    /// (`seismic::PROBE_NAMESPACE`) are never walked.
     fn evict(&self, capacity: u64) {
         let now = SystemTime::now();
         let mut files = Vec::new();
@@ -407,9 +455,10 @@ impl KernelCache {
                 };
                 let path = item.path();
                 if metadata.is_dir() {
-                    // Measurement records and the job's attempts are valid by
-                    // their key, not their use time.
-                    if !KEPT.iter().any(|kept| path == self.root.join(kept)) {
+                    // Measurement records, the job's attempts and its probes'
+                    // results are valid by their key, not their use time.
+                    let probes = self.root.join(ARTIFACTS).join(seismic::PROBE_NAMESPACE);
+                    if path != probes && !KEPT.iter().any(|kept| path == self.root.join(kept)) {
                         directories.push(path);
                     }
                     continue;
@@ -455,6 +504,10 @@ impl KernelCache {
 impl ArtifactStore for KernelCache {
     fn get(&self, namespace: &str, key: &ArtifactKey) -> Option<Vec<u8>> {
         self.read(&self.artifact(namespace, key))
+    }
+
+    fn contains(&self, namespace: &str, key: &ArtifactKey) -> bool {
+        self.artifact(namespace, key).is_file()
     }
 
     fn put(&self, namespace: &str, key: &ArtifactKey, bytes: &[u8]) {
@@ -590,7 +643,6 @@ mod tests {
                 alpha: 4.0,
                 activation: None,
             },
-            measurement_identity: String::new(),
             observations: Vec::new(),
             served: Vec::new(),
             reselection: None,
@@ -605,6 +657,7 @@ mod tests {
             method: seismic::TuningMethod::Census,
             time: TuningTime::default(),
             coverage: None,
+            default_launches: Vec::new(),
         };
         cache.store_tuning(&key, &1u32, &result);
         let (choice, evidence) = cache.tuning::<u32>(&key).unwrap();

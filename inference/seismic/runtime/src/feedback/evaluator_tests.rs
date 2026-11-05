@@ -1,7 +1,23 @@
 //! A downstream evaluator selects ordinary domain coordinates, then executes
 //! admitted native artifacts through the compiler's production command path.
-struct FixedTestResources<'a, B>(&'a [RuntimeBuffer<B>]);
-impl<B> seismic_compiler::executable::ExecutionResources<B> for FixedTestResources<'_, B> {
+struct FixedTestResources<B>(Vec<RuntimeBuffer<B>>);
+impl<B: Clone> FixedTestResources<B> {
+    /// The allocated `buffers` as device work binds them.
+    fn bound<W: std::borrow::Borrow<B>>(buffers: &[RuntimeBuffer<W>]) -> Self {
+        Self(
+            buffers
+                .iter()
+                .map(|buffer| RuntimeBuffer {
+                    tensor: buffer.tensor.clone(),
+                    buffer: buffer.buffer.borrow().clone(),
+                    base_offset: buffer.base_offset,
+                    accessible_bytes: buffer.accessible_bytes,
+                })
+                .collect(),
+        )
+    }
+}
+impl<B> seismic_compiler::executable::ExecutionResources<B> for FixedTestResources<B> {
     fn retire_completed_instances(
         &mut self,
         _: &[seismic_compiler::executable::ExecutableAllocationId],
@@ -396,7 +412,7 @@ lower probe(indices: &tensor[64] i32, later: &tensor[64] i32, input: &tensor[1] 
             variant,
             &mut submission,
             &device,
-            &mut FixedTestResources(&buffers),
+            &mut FixedTestResources::<MetalBuffer>::bound(&buffers),
             &mut values,
         );
         let status = submission
@@ -460,7 +476,7 @@ lower probe(indices: &tensor[64] i32, later: &tensor[64] i32, input: &tensor[1] 
 
 #[test]
 fn cpu_public_evaluator_selects_and_executes_an_independent_body() {
-    let opened = seismic_cpu::open_host().unwrap();
+    let opened = seismic_cpu::open_host(crate::backends::host_cores().unwrap()).unwrap();
     let registry = seismic_cpu::registry();
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "public-evaluator.seismic".into(),
@@ -570,7 +586,7 @@ fn cpu_public_evaluator_selects_and_executes_an_independent_body() {
         variant,
         &mut submission,
         &opened.service,
-        &mut FixedTestResources(&buffers),
+        &mut FixedTestResources::<seismic_cpu::Buffer>::bound(&buffers),
         &mut values,
     );
     let mut execution = submission.submit();

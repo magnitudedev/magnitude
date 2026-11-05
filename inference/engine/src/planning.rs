@@ -10,11 +10,14 @@
 use crate::options::{DraftPolicy, ExecutionManifest, ResolvedMethod, ResolvedModelPolicy};
 use magnitude_batching::MAX_CLASS_ROWS;
 use magnitude_executor::{
-    image_cell_limit, max_image_cells, platform::SelectedDevice, BackendPlan, ComponentSelection,
+    image_cell_limit, max_image_cells,
+    platform::{self, PlatformError, SelectedDevice},
+    BackendPlan, ComponentSelection,
     DraftWidths,
     ExecutionPlanDraft, ExecutionPlanner, PlanError, PlannedMethod, ResourceLimits,
 };
 use magnitude_scheduler::ServiceLimits;
+use seismic::Devices;
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,10 +48,31 @@ impl fmt::Display for ExecutionPlanningError {
 
 impl std::error::Error for ExecutionPlanningError {}
 
+/// Select the manifest's device as a load and its preview do, measuring
+/// nothing: what its graphs hold is the measurement job's point, read from
+/// its kernel cache's records, its backend's bound until stored there
+/// (`platform::select_recorded`).
+pub(crate) fn select_load_device(
+    catalog: &Devices,
+    manifest: &ExecutionManifest,
+) -> Result<SelectedDevice, PlatformError> {
+    platform::select_recorded(catalog, manifest.path, manifest.device, &manifest.reserves, manifest.kernel_cache.as_deref())
+}
+
 /// Plan the manifest's model on the selected device: component selection,
 /// planned method, KV codec and resource limits resolved from the manifest,
-/// then `ExecutionPlanner::prepare`. Opens no device and reads no payload.
+/// then `ExecutionPlanner::prepare`, then its expert bank under the model
+/// policy's weight cap, if any (`ExecutionPlanDraft::with_bank`). Opens no
+/// device and reads no payload.
 pub fn plan_execution(
+    manifest: &ExecutionManifest,
+    selected: &SelectedDevice,
+) -> Result<ExecutionPlanDraft, ExecutionPlanningError> {
+    plan_resident(manifest, selected).and_then(|resident| plan_banked(manifest, resident, None))
+}
+
+/// [`plan_execution`]'s plan before its expert bank: every expert resident.
+pub fn plan_resident(
     manifest: &ExecutionManifest,
     selected: &SelectedDevice,
 ) -> Result<ExecutionPlanDraft, ExecutionPlanningError> {
@@ -64,6 +88,19 @@ pub fn plan_execution(
         limits,
     )
     .map_err(ExecutionPlanningError::Plan)
+}
+
+/// [`plan_execution`]'s plan from its `resident` plan: its expert bank,
+/// under the model policy's weight cap, if any, what its charges derive
+/// kept in `cache`.
+pub fn plan_banked(
+    manifest: &ExecutionManifest,
+    resident: ExecutionPlanDraft,
+    cache: Option<&magnitude_executor::KernelCache>,
+) -> Result<ExecutionPlanDraft, ExecutionPlanningError> {
+    resident
+        .with_bank(&manifest.definition, manifest.model.weight_cap, cache)
+        .map_err(ExecutionPlanningError::Plan)
 }
 
 /// Plan the manifest's model on `backend`, which is all planning reads of a
@@ -169,6 +206,10 @@ fn resource_limits(
         max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
         max_image_cells: image_cells,
         lookahead,
+        // One launch until the load's chain is planned beside its weights
+        // (`ExecutionPlanDraft::with_bank`).
+        chain_capacity: std::num::NonZeroUsize::MIN,
+        conversations: service.conversations,
     })
 }
 
@@ -185,6 +226,7 @@ mod tests {
             lookahead: false,
             exported_logits_rows,
             numerical_profile: None,
+            weight_cap: None,
         }
     }
 
@@ -194,6 +236,7 @@ mod tests {
             decode_tokens,
             decode_share: 0.5,
             locality_seconds: 1.0,
+            conversations: std::num::NonZeroUsize::MIN,
         }
     }
 

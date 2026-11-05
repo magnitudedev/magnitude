@@ -77,7 +77,9 @@ const CASES: &[Case] = &[
 
 #[test]
 fn invalid_public_transitions_do_not_compile() {
-    let compiler = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let compiler = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    );
     let lang = compiler
         .parent()
         .expect("compiler crate has a subsystem directory")
@@ -118,7 +120,7 @@ fn run_case(
     native_target: &Path,
     case: &Case,
 ) -> Option<String> {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let fixture = compiler
         .join("tests")
         .join("ui")
         .join(format!("{}.rs", case.name));
@@ -135,7 +137,7 @@ fn run_case(
     );
     fs::write(directory.join("Cargo.toml"), manifest).expect("write fixture manifest");
 
-    let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+    let output = Command::new(std::env::var_os("CARGO").expect("cargo sets CARGO"))
         .args(["check", "--quiet", "--offline"])
         .current_dir(&directory)
         .env("CARGO_TARGET_DIR", root.join("target"))

@@ -14,12 +14,16 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 libc.workspace = true
+magnitude-artifacts = { path = "../../engine/artifacts" }
 magnitude-chat = { path = "../../engine/chat" }
 # The engine's development tuning tools (pins and the survey), which only the
 # harness enables; a served engine is built without them.
-magnitude-engine = { path = "../../engine", features = ["pinned-tuning", "tuning-survey"] }
+magnitude-engine = { path = "../../engine", features = ["tuning-survey", "expert-routing"] }
 magnitude-executor = { path = "../../engine/executor" }
 magnitude-family-contracts = { path = "../../engine/families/contracts" }
+magnitude-generation = { path = "../../engine/generation" }
+# Kernel entries' names, which a prefill's attribution is read by.
+magnitude-kernels = { path = "../../engine/kernels" }
 magnitude-scheduler = { path = "../../engine/scheduler" }
 magnitude-serving = { path = "../../engine/serving" }
 magnitude-state = { path = "../../engine/state" }
@@ -28,3 +32,11 @@ serde.workspace = true
 # Fixture key order is rendered: chat templates print tool schemas in it.
 serde_json = { workspace = true, features = ["preserve_order"] }
 sha2.workspace = true
+# `memory`'s worker prints the scheduler's events.
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# The controlled execution domain (`magnitude_executor::fixtures`) the
+# harness's step boundary is tested over.
+magnitude-executor = { path = "../../engine/executor", features = ["fixtures"] }

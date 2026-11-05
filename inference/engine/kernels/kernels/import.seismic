@@ -11,6 +11,7 @@ fn import_dense[B, N, K](source: &tensor[B, N, K] E) -> tensor[B, N, K] U:
     return destination
 
 native import_dense for metal from "metal/import_dense.metal":
+    records (result 0)
     launch import_dense:
         threadgroups (ceil_div(B * N * K, 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -65,6 +66,7 @@ fn repack_weight[B, N, K](source: &tensor[B, N, K] E) -> tensor[B, N, K] U:
 # group and so 256); the grid covers whole 32-row tiles, which `rows32` stores
 # in full.
 native repack_weight for metal from "metal/repack_weight.metal":
+    records (result 0)
     launch repack_weight:
         threadgroups (ceil_div(K, 256) * (256 / unit_columns(U)), ceil_div(N, 32) * 2, B)
         threads_per_threadgroup (32, 1, 1)
@@ -85,8 +87,10 @@ native repack_weight for cpu from "cpu/repack_weight.rs":
         threads_per_threadgroup (1, 1, 1)
 
 # Vulkan: a grid-stride loop over every element; the x grid is capped at the
-# 65535-group floor (Vulkan spec §5.3).
+# 65535-group floor (Vulkan spec §5.3). The result is a record port, as
+# `repack_weight`'s.
 native import_dense for vulkan from "vulkan/import_dense.comp":
+    records (result 0)
     launch import_dense:
         threadgroups (min(ceil_div(B * N * K, 256), 65535), 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -102,8 +106,10 @@ native import_dense for cpu from "cpu/import_dense.rs":
 # Vulkan: one workgroup converts one 16-row tile of a conversion unit's
 # columns (`unit_columns(U)`) into rows16 (the Vulkan resident layout).
 # N / 16 stays below 65535 for every model weight (the largest, the
-# 248320-row head, gives 15520).
+# 248320-row head, gives 15520). The result is a record port: Vulkan's
+# reserved storage is chunked, so bank records import through their table.
 native repack_weight for vulkan from "vulkan/repack_weight.comp":
+    records (result 0)
     launch repack_weight:
         threadgroups (ceil_div(K, 256) * (256 / unit_columns(U)), ceil_div(N, 16), B)
         threads_per_threadgroup (32, 1, 1)

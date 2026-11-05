@@ -7,7 +7,7 @@ fn probe[N](x: &tensor[N] f32, factor: f32, out: &mut tensor[N] f32):
         out[i] = x[i] * factor
 
 native probe for cuda from "probe.cu":
-    params (WIDTH in [64, 128])
+    params (WIDTH in [64, 128] default 64)
     where WIDTH <= N
     launch probe:
         threadgroups (ceil_div(N, WIDTH), 1, 1)

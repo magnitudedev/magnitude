@@ -1,0 +1,14 @@
+// Expert streaming: a streamed layer's tier wait (`routed_tier_wait` in
+// routed.seismic); the Vulkan form of `metal/routed_tier_wait.metal`: one
+// workgroup, its invocations reading the step's slot of the layer's file
+// table (answered at the park before the call), then writing the absent
+// choices' sources (streaming/tier_wait.hpp).
+#include "lib/streaming/control.glsl"
+#include "../streaming/tier_wait.hpp"
+
+void routed_tier_wait() {
+    streaming_tier_wait(SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0, SEISMIC_PTR(SEISMIC_BUFFER_FILE),
+        SEISMIC_FILE_STRIDE_0, SEISMIC_FILE_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_SOURCES),
+        SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, gl_LocalInvocationIndex,
+        gl_WorkGroupSize.x);
+}

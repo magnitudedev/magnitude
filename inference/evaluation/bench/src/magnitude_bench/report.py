@@ -3,6 +3,7 @@
 import math
 import statistics
 from collections import Counter, defaultdict
+from collections.abc import Callable
 
 
 def summarize(
@@ -117,6 +118,68 @@ def summarize(
     }
 
 
+def expert_banks(samples: list[dict], banks_of: dict[str, Callable[[dict], dict | None]]) -> list[dict]:
+    """Each pass's elastic expert bank over the run, from the engine's memory observations
+    (``allocations.jsonl``) sampled while it served, as each target's adapter reads a bank from
+    its engine's observation (``banks_of``, by target: ``Adapter.expert_bank``): its experts'
+    slots at the first and last sample and their range, its floor and ceiling, the resizes seen
+    of each of its holdings (its experts, each table, its host tier: each sample shows each
+    holding's last, its ``last_resize``) by cause, and the most recent across them. Passes without a bank
+    are left out."""
+    passes = defaultdict(list)
+    for sample in samples:
+        passes[(sample["target"], sample["label"])].append(sample)
+    banks = []
+    for (target, label), sampled in passes.items():
+        experts = [banks_of[target](s["observation"]) for s in sorted(sampled, key=lambda s: s["at"])]
+        experts = [bank for bank in experts if bank is not None]
+        if not experts:
+            continue
+        slots = [bank["slots"] for bank in experts]
+        seen = defaultdict(dict)  # holding -> resize by when it took effect
+        for bank in experts:
+            for holding, resize in _holdings(bank):
+                seen[holding][resize["at_unix_ms"]] = resize
+        latest = max(((holding, resize) for holding, resizes in seen.items() for resize in resizes.values()),
+                     key=lambda found: found[1]["at_unix_ms"], default=None)
+        banks.append({
+            "target": target,
+            "label": label,
+            "first_slots": slots[0],
+            "last_slots": slots[-1],
+            "min_slots": min(slots),
+            "max_slots": max(slots),
+            "floor": experts[-1]["floor"],
+            "ceiling": experts[-1]["ceiling"],
+            "resizes": {holding: dict(Counter(resize["cause"] for resize in resizes.values()))
+                        for holding, resizes in sorted(seen.items())},
+            "latest_resize": None if latest is None else {"holding": latest[0], **latest[1]},
+        })
+    return banks
+
+
+def _holdings(bank: dict) -> list[tuple[str, dict]]:
+    """Each holding's last resize in one observation (each holding's ``last_resize`` in
+    ``ExpertResidency``), by the holding's name: ``experts``, ``table <index>``, ``host``; a holding
+    not yet resized is absent."""
+    host = bank["host"]
+    named = [("experts", bank["last_resize"]), ("host", None if host is None else host["last_resize"]),
+             *((f"table {index}", table["last_resize"]) for index, table in enumerate(bank["tables"]))]
+    return [(holding, _resize(resize)) for holding, resize in named if resize is not None]
+
+
+def _resize(resize: dict) -> dict:
+    """A resize as the census states it (``BankResize``: ``Shrank`` by ``by`` to ``to`` for its
+    cause, or ``Grew`` by ``by`` from ``from``), as its cause, its size before and after, and when
+    it took effect; a growth's cause is ``Growth``."""
+    ((kind, fields),) = resize.items()
+    if kind == "Shrank":
+        return {"cause": fields["cause"], "from": fields["to"] + fields["by"], "to": fields["to"],
+                "at_unix_ms": fields["at_unix_ms"]}
+    return {"cause": "Growth", "from": fields["from"], "to": fields["from"] + fields["by"],
+            "at_unix_ms": fields["at_unix_ms"]}
+
+
 def markdown(summary: dict) -> str:
     def number(value):
         return "—" if value is None else f"{value:,.1f}"
@@ -228,6 +291,27 @@ def markdown(summary: dict) -> str:
                 f"| {item['target']} | {item['block'] + 1} | "
                 f"{item['baseline_rss_bytes'] / 2**30:.2f} | "
                 f"{item['peak_rss_bytes'] / 2**30:.2f} |"
+            )
+    if summary.get("expert_banks"):
+        lines += [
+            "",
+            "Elastic expert bank (experts' slots, from the engine's memory observations while serving):",
+            "",
+            "| Target | Pass | Slots first → last | Range | Floor | Ceiling | Resizes seen | Latest resize |",
+            "| --- | --- | ---: | ---: | ---: | ---: | --- | --- |",
+        ]
+        for bank in summary["expert_banks"]:
+            resizes = "; ".join(
+                f"{holding} " + ", ".join(f"{cause} {count}" for cause, count in sorted(causes.items()))
+                for holding, causes in bank["resizes"].items()
+            ) or "none"
+            latest = bank["latest_resize"]
+            last = ("none" if latest is None else
+                    f"{latest['holding']} {latest['cause']} {latest['from']} → {latest['to']}")
+            lines.append(
+                f"| {bank['target']} | {bank['label']} | {bank['first_slots']} → {bank['last_slots']} | "
+                f"{bank['min_slots']}–{bank['max_slots']} | {bank['floor']} | {bank['ceiling']} | {resizes} "
+                f"| {last} |"
             )
     if summary.get("error"):
         lines += ["", "Run error:", "```text", summary["error"], "```"]

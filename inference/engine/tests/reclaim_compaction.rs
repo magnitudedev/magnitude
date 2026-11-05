@@ -44,6 +44,7 @@ fn domain() -> (ExecutorDomain, StateBindings, usize, usize, usize) {
             lookahead: false,
             exported_logits_rows: 64,
             numerical_profile: None,
+            weight_cap: None,
         },
         context_tokens: Some(8192),
         service: ServiceLimits {
@@ -51,6 +52,7 @@ fn domain() -> (ExecutorDomain, StateBindings, usize, usize, usize) {
             decode_tokens: 16,
             decode_share: 0.5,
             locality_seconds: 1.0,
+            conversations: std::num::NonZeroUsize::MIN,
         },
         path: ExecutionPath::Native,
         device: std::env::var("MAGNITUDE_TEST_DEVICE")
@@ -218,9 +220,7 @@ fn reclaim_relocates_live_banks_without_changing_continuation() {
     let before = domain.state_compactions().0;
     let charge_before = domain.reconcile_memory_charge(&[]).unwrap();
     assert_eq!(charge_before.unattributed, 0, "{charge_before:?}");
-    let released = domain
-        .shrink_state(&mut bindings, ShrinkPolicy::Reclaim)
-        .unwrap();
+    let released = magnitude_executor::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Reclaim);
     let after = domain.state_compactions().0;
     let charge_after = domain.reconcile_memory_charge(&[]).unwrap();
     assert!(
@@ -298,9 +298,7 @@ fn reclaim_relocates_live_history_and_banks_without_changing_continuation() {
     let before = domain.state_compactions().0;
     let charge_before = domain.reconcile_memory_charge(&[]).unwrap();
     assert_eq!(charge_before.unattributed, 0, "{charge_before:?}");
-    let released = domain
-        .shrink_state(&mut bindings, ShrinkPolicy::Reclaim)
-        .unwrap();
+    let released = magnitude_executor::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Reclaim);
     let after = domain.state_compactions().0;
     let charge_after = domain.reconcile_memory_charge(&[]).unwrap();
     eprintln!(

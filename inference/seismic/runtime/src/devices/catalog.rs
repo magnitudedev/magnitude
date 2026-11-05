@@ -1,10 +1,11 @@
 use super::{OpenError, ResolveError};
 use crate::api::device::DeviceInner;
 use crate::artifacts::DeviceOptions;
-use crate::memory::{path_claim, store_ledger, ExecutorMemory};
+use crate::memory::{path_claim, store_ledger, DeviceLedgers};
+use seismic_discovery::{DiscoveryError, Inventory, RuntimeStatus, Status};
 use seismic_topology::{
-    Availability, BackendName, DeviceMemory, DeviceTopology, DiagnosticSource, DiscoveryError,
-    ExecutorId, ExecutorSelector, Inventory, Reported, ReportedBy, RuntimeStatus, Status,
+    Availability, BackendName, DeviceMemory, DeviceTopology, DiagnosticSource, ExecutorId,
+    ExecutorSelector, Reported, ReportedBy,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -86,10 +87,52 @@ impl Devices {
                 reason: reason.clone(),
             });
         }
-        let memory = ExecutorMemory::new(&topology, &info);
+        let memory = DeviceLedgers::new(&topology, &info);
         let device = crate::backends::open(info, topology, memory, options)?;
         opened.insert(id, Arc::downgrade(&device));
         Ok(device)
+    }
+
+    /// The measurement job's running of executor `id`'s probes: each its
+    /// backend declares (`seismic_lang::device`) that `store` holds no
+    /// result of for the executor's device and driver, in a probe process
+    /// of the running executable, keeping each result in `store` as it
+    /// comes, before `deadline` ([`crate::probes`]). Opening the executor
+    /// afterwards with `store` reads them; nothing here opens it. A backend
+    /// without probes runs none.
+    pub fn probe(
+        &self,
+        id: ExecutorId,
+        store: &dyn crate::artifacts::ArtifactStore,
+        deadline: std::time::Instant,
+    ) -> Result<crate::probes::ProbeRun, OpenError> {
+        let topology = self.topology();
+        let selector = topology.executor(id).ok_or(OpenError::Stale(id))?.selector();
+        match selector {
+            #[cfg(not(target_os = "macos"))]
+            ExecutorSelector::Vulkan { uuid } => {
+                let identity = topology.executor_identity(id).ok_or(OpenError::Stale(id))?;
+                let unavailable = |reason: String| OpenError::Unavailable { selector, reason };
+                let program = std::env::current_exe()
+                    .map_err(|error| unavailable(format!("locating the running executable for its probes: {error}")))?;
+                let device = seismic_vulkan::probe::argument(&uuid);
+                crate::probes::run::<seismic_vulkan::Probed>(
+                    store,
+                    &identity,
+                    seismic_vulkan::probe::REVISION,
+                    &program,
+                    &["vulkan", device.as_str()],
+                    deadline,
+                )
+                .map_err(unavailable)
+            }
+            #[cfg(target_os = "macos")]
+            ExecutorSelector::Vulkan { .. } => unreachable!("this build discovers no Vulkan executor"),
+            // Their backends declare no probes.
+            ExecutorSelector::HostCpu | ExecutorSelector::Metal { .. } | ExecutorSelector::Cuda { .. } => {
+                Ok(crate::probes::ProbeRun::default())
+            }
+        }
     }
 
     /// Low-level control: opens the first discovered executor of a backend.
@@ -128,7 +171,7 @@ impl Devices {
         let charges = topology
             .stores()
             .iter()
-            .map(|store| (store.id(), store_ledger(topology, store.id()).bytes()))
+            .map(|store| (store.id(), store_ledger(topology, store.id()).claim()))
             .collect();
         // Read outside the lock: a driver query must not hold up an open.
         let devices = opened()

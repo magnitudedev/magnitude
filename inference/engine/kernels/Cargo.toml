@@ -16,6 +16,8 @@ seismic-lang.workspace = true
 [dev-dependencies]
 magnitude-ggml.workspace = true
 seismic-lang.workspace = true
+# The shared test-device selector.
+seismic-native-tests.workspace = true
 seismic-std.workspace = true
 # Offline formation of focused requests (`tests/priming_formation.rs`).
 seismic = { workspace = true, features = ["coverage"] }

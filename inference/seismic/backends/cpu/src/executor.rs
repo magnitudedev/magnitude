@@ -1,6 +1,7 @@
 //! Synchronous execution of the core-owned executable command vocabulary.
 
-use crate::buffer::{AllocationFailure, Buffer};
+use crate::buffer::{Buffer, WritableBuffer};
+use seismic_reservation::{AllocationFailure, Pages, Resizer};
 use crate::workers::{LaunchFailure, LaunchFrame, NativeSteps, Workers};
 use crate::Cpu;
 use seismic_compiler::errors::ExecutionError;
@@ -16,14 +17,29 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Device;
 
+impl Device {
+    /// Zeroed memory over a host address reservation of `reserved` bytes in
+    /// `granule`-byte granules with the leading `committed` bytes backed,
+    /// and its resizer; see [`WritableBuffer::reserved`].
+    pub fn allocate_reserved(
+        &self,
+        committed: u64,
+        reserved: u64,
+        granule: u64,
+    ) -> Result<(WritableBuffer, Resizer<Pages>), ExecutionError> {
+        WritableBuffer::reserved(committed, reserved, granule).map_err(allocation_error)
+    }
+}
+
 impl DeviceService<Cpu> for Device {
     type Buffer = Buffer;
+    type Writable = WritableBuffer;
 
-    fn allocate(&self, bytes: u64, alignment: u64) -> Result<Buffer, ExecutionError> {
-        Buffer::new(bytes, alignment).map_err(allocation_error)
+    fn allocate(&self, bytes: u64, alignment: u64) -> Result<WritableBuffer, ExecutionError> {
+        WritableBuffer::new(bytes, alignment).map_err(allocation_error)
     }
 
-    fn write(&self, buffer: &Buffer, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
+    fn write(&self, buffer: &WritableBuffer, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
         buffer.write(offset, bytes);
         Ok(())
     }
@@ -36,12 +52,29 @@ impl DeviceService<Cpu> for Device {
     fn buffer_len(&self, buffer: &Buffer) -> u64 {
         buffer.len()
     }
+
+    fn host_address(&self, buffer: &WritableBuffer) -> Option<std::ptr::NonNull<u8>> {
+        std::ptr::NonNull::new(buffer.data_pointer())
+    }
 }
 
 pub struct Executor {
     /// Shared by every CPU device of the process (`open_host`).
     workers: Arc<Mutex<Workers>>,
+    /// The device's properties (`seismic_lang::device::cpu`): its units are
+    /// the pool's participants, the submitting thread included.
+    properties: seismic_lang::device::cpu::Properties,
+}
+
+/// The sources of a CPU device's properties: its worker pool.
+struct Pool {
     participants: usize,
+}
+
+impl seismic_lang::device::cpu::Queries for Pool {
+    fn worker_cores(&self) -> Option<u64> {
+        Some(self.participants as u64)
+    }
 }
 
 impl Executor {
@@ -56,9 +89,15 @@ impl Executor {
         crate::profile::profile_for_workers(&mut workers, device)
     }
 
-    /// Participants of the worker pool, the submitting thread included.
+    /// The device's properties.
+    pub fn properties(&self) -> &seismic_lang::device::cpu::Properties {
+        &self.properties
+    }
+
+    /// Participants of the worker pool, the submitting thread included: the
+    /// device's units.
     pub fn workers(&self) -> usize {
-        self.participants
+        self.properties.units.get() as usize
     }
 
     /// Run a sequence of authored native launches as one pool job and
@@ -83,7 +122,8 @@ impl Executor {
             .count();
         Self {
             workers,
-            participants,
+            properties: seismic_lang::device::cpu::describe(&Pool { participants }, &Default::default())
+                .expect("a worker pool answers its participants"),
         }
     }
 }

@@ -18,7 +18,10 @@ const metadata = { format: "gguf" as const, quantization: "Q4_K", quantizationNa
 export const fits: Extract<LocalModelAssessment, { readonly _tag: "Fits" }> = {
   _tag: "Fits", assessmentId, environmentId, profile: { contextLength: 32_768 },
   memory: { domains: [], totalRequiredBytes: 24 * GB, requiredSystemMemoryBytes: 0 },
-  performance: { _tag: "Estimated", samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 80 }] },
+  residency: {
+    _tag: "Resident",
+    performance: { _tag: "Estimated", samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 80 }] },
+  },
 }
 export const doesNotFit: Extract<LocalModelAssessment, { readonly _tag: "DoesNotFit" }> = {
   _tag: "DoesNotFit", assessmentId, environmentId, profile: { contextLength: 32_768 }, memoryDomains: [], totalRequiredBytes: 0, deficitBytes: 4 * GB, limitingResource: "system",

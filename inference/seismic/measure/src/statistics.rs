@@ -192,9 +192,8 @@ impl Tally {
 
 /// How close to its median a measured time is resolved, as a fraction of
 /// the median on either side: 10%. Measured times price the engine's
-/// estimate, whose own error is about ±15% typical
-/// (specs/26-10-18/device-topology.md §2.14), so precision finer than 10%
-/// is discarded (§2.6). The one place it is said; [`Timing::resolved`]
+/// estimate, whose own error is about ±15% typical, so precision finer
+/// than 10% is discarded. The one place it is said; [`Timing::resolved`]
 /// reads it.
 pub const MEDIAN_TOLERANCE: f64 = 0.10;
 

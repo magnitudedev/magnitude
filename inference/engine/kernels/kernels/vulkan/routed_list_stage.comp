@@ -1,0 +1,9 @@
+// The workgroup stages a host-written list into device memory.
+#include "lib/streaming/control.glsl"
+#include "../streaming/list.hpp"
+
+void routed_list_stage() {
+    streaming_list_stage(SEISMIC_PTR(SEISMIC_BUFFER_LIST), SEISMIC_LIST_STRIDE_0,
+        element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_STEP)), SEISMIC_PTR(SEISMIC_BUFFER_STAGED), SEISMIC_STAGED_STRIDE_0,
+        gl_LocalInvocationIndex, gl_WorkGroupSize.x);
+}

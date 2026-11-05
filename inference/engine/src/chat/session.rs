@@ -110,10 +110,7 @@ async fn run(
     let prepared = {
         let host = host.clone();
         let input = request.input.clone();
-        tokio::task::spawn_blocking(move || prepare(&host, &input, InputBound::Served))
-            .await
-            .map_err(|error| ChatError::Internal(format!("request preparation failed: {error}")))
-            .and_then(|prepared| prepared)
+        magnitude_service_utils::blocking::run(move || prepare(&host, &input, InputBound::Served)).await
     };
     let PreparedInput {
         chat,
@@ -153,18 +150,22 @@ async fn run(
         Ok(prepared) => prepared,
         Err(error) => return events.send(SessionEvent::Failed(SessionError::Chat(error))).await,
     };
-    let admission = engine
-        .admit(RequestOptions {
-            input,
-            options,
-            constraint: chat.input().constraint.clone(),
-            retention: match request.controls.prompt_cache {
-                PromptCache::Allowed => PrefixRetention::Retain { cache_points },
-                PromptCache::Disabled => PrefixRetention::Transient,
-            },
-            output_capacity: limits.output_capacity,
-        })
-        .await;
+    // Answered once it began: one that cannot begin is refused, before
+    // anything of it is answered.
+    let admission = engine.admit(RequestOptions {
+        input,
+        options,
+        constraint: chat.input().constraint.clone(),
+        retention: match request.controls.prompt_cache {
+            PromptCache::Allowed => PrefixRetention::Retain { cache_points },
+            PromptCache::Disabled => PrefixRetention::Transient,
+        },
+        output_capacity: limits.output_capacity,
+    });
+    let admission = tokio::select! {
+        admission = admission => admission,
+        () = events.sender.closed() => return Err(Abandoned),
+    };
     let mut admitted = match admission {
         Ok(admitted) => admitted,
         Err(error) => {

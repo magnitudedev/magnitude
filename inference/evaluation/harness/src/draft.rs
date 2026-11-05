@@ -53,6 +53,8 @@ pub fn run(
             drafter: true,
             proposals: draft.proposals,
             context_tokens: longest + 2 * usize::from(u8::MAX),
+            // One fixture's sequence at a time.
+            sequences: std::num::NonZeroUsize::MIN,
             decode_rows: 16,
             exported_logits_rows: 0,
             lookahead: false,
@@ -158,6 +160,7 @@ fn head(engine: &mut Engine, operation: Operation, accepted: usize) -> Result<Ou
             )
             .map_err(text)?;
     }
+    engine.between_steps()?;
     outcome.ok_or_else(|| "a drafter operation returned no outcome".into())
 }
 
@@ -354,6 +357,7 @@ fn draft_at(
             )
             .map_err(text)?;
     }
+    engine.between_steps()?;
     let verify_phase = phase(verify_start)?;
     // One plain decode step from the accepted position, for comparison.
     let plain_phase = if attribute {

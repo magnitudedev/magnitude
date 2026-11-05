@@ -11,7 +11,7 @@ fn split_sum[N](x: &tensor[N] f32) -> tensor[1] f32:
 
 native split_sum for metal from "metal/split_sum.metal":
     static (N)
-    params (arithmetic PARTS in [1, 2, 4], WIDTH in [32, 64])
+    params (arithmetic PARTS in [1, 2, 4] default 1, WIDTH in [32, 64] default 32)
     where PARTS <= N
     scratch partials bytes (PARTS * 4)
     launch split_partial:
@@ -24,7 +24,7 @@ native split_sum for metal from "metal/split_sum.metal":
 
 native split_sum for cuda from "cuda/split_sum.cu":
     static (N)
-    params (arithmetic PARTS in [1, 2, 4], WIDTH in [32, 64])
+    params (arithmetic PARTS in [1, 2, 4] default 1, WIDTH in [32, 64] default 32)
     where PARTS <= N
     scratch partials bytes (PARTS * 4)
     launch split_partial:
@@ -37,7 +37,7 @@ native split_sum for cuda from "cuda/split_sum.cu":
 
 native split_sum for vulkan from "vulkan/split_sum.comp":
     static (N)
-    params (arithmetic PARTS in [1, 2, 4], WIDTH in [32, 64])
+    params (arithmetic PARTS in [1, 2, 4] default 1, WIDTH in [32, 64] default 32)
     where PARTS <= N
     scratch partials bytes (PARTS * 4)
     launch split_partial:
@@ -50,7 +50,7 @@ native split_sum for vulkan from "vulkan/split_sum.comp":
 
 native split_sum for cpu from "cpu/split_sum.rs":
     static (N)
-    params (arithmetic PARTS in [1, 2, 4], WIDTH in [32, 64])
+    params (arithmetic PARTS in [1, 2, 4] default 1, WIDTH in [32, 64] default 32)
     where PARTS <= N
     scratch partials bytes (PARTS * 4)
     launch split_partial:
@@ -111,26 +111,107 @@ native slab_probe for metal from "metal/slab_probe.metal":
         threads_per_threadgroup (1, 1, 1)
 
 native scale_rows for metal from "metal/scale_rows.metal":
-    params (ROWS in [1, 2])
+    params (ROWS in [1, 2] default 1)
     launch scale_rows:
         threadgroups (ceil_div(M, ROWS), 1, 1)
         threads_per_threadgroup (min(N, 64), 1, 1)
 
 native scale_rows for cuda from "cuda/scale_rows.cu":
-    params (ROWS in [1, 2])
+    params (ROWS in [1, 2] default 1)
     launch scale_rows:
         threadgroups (ceil_div(M, ROWS), 1, 1)
         threads_per_threadgroup (min(N, 64), 1, 1)
 
 # Vulkan fixes the group size at preparation: the static bound of min(N, 64).
 native scale_rows for vulkan from "vulkan/scale_rows.comp":
-    params (ROWS in [1, 2])
+    params (ROWS in [1, 2] default 1)
     launch scale_rows:
         threadgroups (ceil_div(M, ROWS), 1, 1)
         threads_per_threadgroup (64, 1, 1)
 
 native scale_rows for cpu from "cpu/scale_rows.rs":
-    params (ROWS in [1, 2])
+    params (ROWS in [1, 2] default 1)
     launch scale_rows:
         threadgroups (ceil_div(M, ROWS), 1, 1)
         threads_per_threadgroup (min(N, 64), 1, 1)
+
+# `scale_rows` reaching `x` a row at a time where a backend binds record
+# tables: a reserved tensor's rows on chunked storage bind only to
+# a record port. Backends that bind none share `scale_rows`'s source.
+fn scale_records[M, N](x: &tensor[M, N] f32, factor: f32) -> tensor[M, N] f32:
+    let mut result = zeros_like(x)
+    parallel for row in 0..M:
+        parallel for column in 0..N:
+            result[row, column] = x[row, column] * factor
+    return result
+
+native scale_records for metal from "metal/scale_records.metal":
+    params (ROWS in [1, 2] default 1)
+    records (x)
+    launch scale_records:
+        threadgroups (ceil_div(M, ROWS), 1, 1)
+        threads_per_threadgroup (min(N, 64), 1, 1)
+
+native scale_records for vulkan from "vulkan/scale_records.comp":
+    params (ROWS in [1, 2] default 1)
+    records (x)
+    launch scale_records:
+        threadgroups (ceil_div(M, ROWS), 1, 1)
+        threads_per_threadgroup (64, 1, 1)
+
+native scale_records for cuda from "cuda/scale_rows.cu":
+    params (ROWS in [1, 2] default 1)
+    launch scale_rows:
+        threadgroups (ceil_div(M, ROWS), 1, 1)
+        threads_per_threadgroup (min(N, 64), 1, 1)
+
+native scale_records for cpu from "cpu/scale_rows.rs":
+    params (ROWS in [1, 2] default 1)
+    launch scale_rows:
+        threadgroups (ceil_div(M, ROWS), 1, 1)
+        threads_per_threadgroup (min(N, 64), 1, 1)
+
+# The device's side of a host-shared word exchange (`Tensor::load_acquire`,
+# `Tensor::store_release`) while the kernel runs: writes 42 at word 3, then
+# publishes 1 at word 0, waits a bounded time for the host's word 1, and
+# writes what it saw there at word 2. The reference has no host.
+fn word_exchange[N](exchange: &mut tensor[N] i32) where N >= 4:
+    exchange[3] = 42
+    exchange[0] = 1
+    exchange[2] = exchange[1]
+
+native word_exchange for metal from "metal/word_exchange.metal":
+    launch word_exchange:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# A call that parks (`&await`): `answer`'s word is the host's, written while
+# the call waits for it; then each element of `x` times the answer. Metal and
+# CUDA, whose devices see host writes while work runs, spin on the word in
+# the kernel (bounded, so an unanswered park ends the launch with the answer
+# it last read); Vulkan parks at a submission boundary, so its kernel reads
+# the word once. A run whose `skip` word is set leaves the launch out, so its
+# park waits for nothing.
+fn parked_scale[N](answer: &await tensor[1] i32, skip: &tensor[1] i32, x: &tensor[N] f32) -> tensor[N] f32:
+    let mut result = zeros_like(x)
+    for index in 0..N:
+        result[index] = x[index] * f32(answer[0])
+    return result
+
+native parked_scale for metal from "metal/parked_scale.metal":
+    launch parked_scale:
+        threadgroups (1, 1, 1)
+        unless (skip)
+        threads_per_threadgroup (1, 1, 1)
+
+native parked_scale for cuda from "cuda/parked_scale.cu":
+    launch parked_scale:
+        threadgroups (1, 1, 1)
+        unless (skip)
+        threads_per_threadgroup (1, 1, 1)
+
+native parked_scale for vulkan from "vulkan/parked_scale.comp":
+    launch parked_scale:
+        threadgroups (1, 1, 1)
+        unless (skip)
+        threads_per_threadgroup (1, 1, 1)

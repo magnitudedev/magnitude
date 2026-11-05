@@ -88,8 +88,10 @@ mod tests {
     /// Every committed fixture header is trimmed already, so trimming it again changes no byte.
     #[test]
     fn trimming_a_fixture_header_again_changes_nothing() {
-        let headers =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../engine/fixtures/assessment/headers");
+        let headers = Path::new(
+            &std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+        )
+        .join("../../engine/fixtures/assessment/headers");
         for entry in std::fs::read_dir(headers).expect("fixture headers") {
             let path = entry.expect("fixture header").path();
             let mut header = Vec::new();

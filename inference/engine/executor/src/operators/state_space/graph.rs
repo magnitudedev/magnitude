@@ -9,7 +9,10 @@ use crate::operators::gated_delta::graph::{
     RecurrentControlPorts, RecurrentStatePorts, bank_ports, chunked,
 };
 use crate::operators::{InputForm, Join};
-use crate::programs::graph::{GraphError, draft::GraphDraft};
+use crate::programs::graph::{
+    GraphError,
+    draft::{ControlSource, GraphDraft},
+};
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::{PackingBound, WeightPort, scaled_weight, weight};
 use crate::{
@@ -89,6 +92,8 @@ pub(crate) struct StateSpaceBlock {
     /// Index of this layer's window component in the store's recurrent
     /// components; its state and tape components follow it.
     pub component_index: usize,
+    /// How the graph takes its launch's slot tables.
+    pub controls: ControlSource,
 }
 
 pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
@@ -170,7 +175,9 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
     let dimensions = shape.state_dimensions(block.rows, block.slots, banks, tape_rows);
     // The step and chunk entries share one contract, so their inputs have the
     // same geometry whichever advances this class.
-    let input = |graph: &mut G, name: &str| graph.input_for(kernels.step, name, &dimensions);
+    let input = |graph: &mut G, name: &str| {
+        graph.control_for(block.controls, kernels.step, name, &dimensions)
+    };
     let controls = RecurrentControlPorts {
         segments: input(graph, "segments")?,
         stop: input(graph, "stop")?,
@@ -510,6 +517,8 @@ mod tests {
             max_images_per_request: 1,
             max_image_cells: 0,
             lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
         };
         for backend in [
             BackendName::Cpu,
@@ -525,6 +534,8 @@ mod tests {
                     vision: false,
                 },
                 resident_layout(ExecutionPath::Native, backend),
+                crate::PlannedMethod::Plain,
+                crate::planning::fixtures::LIMITS,
             )
             .unwrap();
             let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
@@ -622,6 +633,8 @@ mod tests {
             max_images_per_request: 1,
             max_image_cells: 0,
             lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
         };
         let selection = ComponentSelection {
             head: false,
@@ -634,7 +647,7 @@ mod tests {
             BackendName::Vulkan,
         ] {
             let layout = resident_layout(ExecutionPath::Native, backend);
-            let load = ModelLoadPlan::derive(&manifest, &definition, selection, layout).unwrap();
+            let load = ModelLoadPlan::derive(&manifest, &definition, selection, layout, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
             let extent = |scope, kind| {
                 let plan = load
                     .target()
@@ -779,7 +792,7 @@ mod tests {
                     .collect::<Vec<_>>()
             };
             let unscaled_load =
-                ModelLoadPlan::derive(&unscaled_manifest, &unscaled, selection, layout).unwrap();
+                ModelLoadPlan::derive(&unscaled_manifest, &unscaled, selection, layout, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
             assert_eq!(shape(&definition, &load), shape(&unscaled, &unscaled_load));
         }
     }
@@ -798,6 +811,8 @@ mod tests {
                 vision: false,
             },
             resident_layout(ExecutionPath::Native, BackendName::Metal),
+            crate::PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
         )
         .unwrap();
         assert_eq!(
@@ -823,6 +838,8 @@ mod tests {
                     vision: false,
                 },
                 resident_layout(ExecutionPath::Native, BackendName::Cpu),
+                crate::PlannedMethod::Plain,
+                crate::planning::fixtures::LIMITS,
             )
         };
         // Neither one value nor one per expert.
@@ -845,6 +862,8 @@ mod tests {
                 vision: false,
             },
             resident_layout(ExecutionPath::Native, BackendName::Cpu),
+            crate::PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
         )
         .unwrap_err();
         assert!(error.contains("absent from its component"), "{error}");

@@ -6,7 +6,7 @@
 # `tokens` has the `sample_rows` result layout (token, status), so a chained
 # draft step embeds the previous step's selection directly; `directory`
 # addresses the table's rows (`gathered_row`). A failed selection (token -1)
-# embeds row 0; its proposal is discarded by the host.
+# and a row without a slot embed zeros; its proposal is discarded by the host.
 fn draft_rows[M, V, D, S, R, F](tokens: &tensor[M, 2] i32, directory: &tensor[R, F] i32,
     table: &tensor[V, D] EW, conditioning: &tensor[M, S * D] C, embedding_norm: &tensor[D] EN,
     hidden_norm: &tensor[S * D] HN, combine: &tensor[D, 2 * D] CW,
@@ -19,7 +19,10 @@ fn draft_rows[M, V, D, S, R, F](tokens: &tensor[M, 2] i32, directory: &tensor[R,
     parallel for row in 0..M:
         let token = gathered_row(directory, tokens[row, 0])
         parallel for column in 0..D:
-            embedded[row, column] = f32(table[token, column])
+            if token >= 0:
+                embedded[row, column] = f32(table[token, column])
+            else:
+                embedded[row, column] = 0.0
     rms_norm(embedded, embedding_norm, normalized_embedding, epsilon)
     parallel for row in 0..M:
         parallel for stream in 0..S:
@@ -93,7 +96,7 @@ native draft_rows for vulkan from "vulkan/draft_rows.comp":
 # weight rows, projected against every joined row (the CPU projection
 # library, `cpu/lib/projection/projection.rs`).
 native draft_rows for cpu from "cpu/draft_rows.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where (INT8 == 0 or form(CW, INT8) == 1)
     scratch quantized bytes (M * S * ceil_div(2 * D, Q8_VALUES) * Q8_BYTES)
     scratch joined bytes (M * S * D * 8)
@@ -138,14 +141,14 @@ fn readout_project_rows[O, V, D, S, I, WS](features: &tensor[O, D] A,
 native readout_project_rows for metal from "metal/readout_project_rows.metal":
     static (V, D, S, I, WS)
     launch readout_project_rows_gemv:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32])
+        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16)
         threadgroups (S * I + (1 - I) * ceil_div(S, SIMDGROUPS * ROWS * 32 / LANES), O, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(D, 32), 448) * 64)
 
 native readout_project_rows for cuda from "cuda/readout_project_rows.cu":
     static (V, D, S, I, WS)
-    params (code arithmetic OPERAND in [0, 1])
+    params (arithmetic OPERAND in [0, 1] default 0)
     where D % 64 == 0 and (I == 0 or OPERAND == 0)
     scratch staged bytes (O * D * 2) when O > 1 or I == 1
     launch readout_project_rows_stage when O > 1 or I == 1:
@@ -153,12 +156,12 @@ native readout_project_rows for cuda from "cuda/readout_project_rows.cu":
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch readout_project_rows_gemv when I == 0 and O <= 8:
-        params (code arithmetic KSPLIT in [4, 2, 8])
+        params (arithmetic KSPLIT in [4, 2, 8] default 4)
         threadgroups (ceil_div(ceil_div(S, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes ((1 - min(1, O - 1)) * D * 2)
     launch readout_project_rows_gemv16 when I == 0 and O > 8 and O <= 16:
-        params (code arithmetic KSPLIT in [4, 2, 8])
+        params (arithmetic KSPLIT in [4, 2, 8] default 4)
         threadgroups (ceil_div(ceil_div(S, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch readout_project_rows_gemm_small when I == 0 and O > 16 and O <= 64:
@@ -167,13 +170,13 @@ native readout_project_rows for cuda from "cuda/readout_project_rows.cu":
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (64 * 144 + 10240) + 2048)
     launch readout_project_rows_gemm when I == 0 and O > 64:
-        params (code ROTATE in [2, 1, 4])
+        params (ROTATE in [2, 1, 4] default 2)
         reads (OPERAND)
         threadgroups (ceil_div(ceil_div(S, 16), 8), ceil_div(O, 128), 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (2 * (128 * 144 + 10240) + 2048)
     launch readout_project_rows_indexed when I == 1:
-        params (code arithmetic KSPLIT in [4, 2, 8])
+        params (arithmetic KSPLIT in [4, 2, 8] default 4)
         threadgroups (S, O, 1)
         threads_per_threadgroup (256, 1, 1)
 
@@ -183,7 +186,7 @@ native readout_project_rows for cuda from "cuda/readout_project_rows.cu":
 # 288 packets a chunk (`lib/projection/projection.glsl`).
 native readout_project_rows for vulkan from "vulkan/readout_project_rows.comp":
     static (V, D, S, I, WS)
-    params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32])
+    params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16)
     where S * I + (1 - I) * ceil_div(S, SIMDGROUPS * ROWS * 32 / LANES) <= 65535
     launch readout_project_rows_gemv:
         threadgroups (S * I + (1 - I) * ceil_div(S, SIMDGROUPS * ROWS * 32 / LANES), O, 1)
@@ -192,7 +195,7 @@ native readout_project_rows for vulkan from "vulkan/readout_project_rows.comp":
 
 native readout_project_rows for cpu from "cpu/readout_project_rows.rs":
     static (WS, I)
-    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where (INT8 == 0 or form(OW, INT8) == 1)
     scratch quantized bytes (O * ceil_div(D, Q8_VALUES) * Q8_BYTES)
     scratch staged bytes (O * D * 4)

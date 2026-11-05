@@ -37,7 +37,7 @@ struct GroupedRows {
     }
 };
 
-// Decode choices that share an expert (M <= 8 rows of K choices, a row's
+// Decode choices that share an expert (M <= DECODE_ROWS rows of K choices, a row's
 // choices distinct experts). Choice c = m * K + k computes when it is its
 // expert's first choice in that order, once for every choice of the expert:
 // a GEMV row per choice, whose result does not depend on its neighbours, so
@@ -60,7 +60,7 @@ __device__ __forceinline__ bool first_choice(const int *routes, u64 row_stride, 
 // The choices of `choice`'s expert in order (at most one per row), into
 // `chosen`; returns their count.
 __device__ __forceinline__ u32 expert_choices(const int *routes, u64 row_stride, u64 slot_stride, u32 rows,
-                                              u32 slots, u32 choice, u32 (&chosen)[8]) {
+                                              u32 slots, u32 choice, u32 (&chosen)[SEISMIC_CONST_DECODE_ROWS]) {
     const int expert = route(routes, row_stride, slot_stride, slots, choice);
     u32 count = 0;
     for (u32 c = choice; c < rows * slots; ++c)
@@ -116,4 +116,78 @@ __device__ __forceinline__ void routed_gemm(u8 *shared, const Rows &source, u32 
     projection::gemm_segment<Shape, Operands>(shared, source, M, K, nblock, rows, wa, wb, epi);
 }
 
+
+// The record a decode expert entry reads choice (m, k)'s weights from, of
+// expert `expert` (`decode_source`, routed.seismic): the expert itself
+// without sources (`rows` 0, a resident layer), else the step's source
+// (`sources`' SOURCE_RECORD row at strides `row_stride`, `choice_stride`): a
+// bank record (>= 0), a host tier record t as -2 - t, or -1 for none (a
+// choice that reads no record and contributes nothing; when is stated
+// there).
+__device__ __forceinline__ int decode_source(const u8 *sources, u64 rows, u64 row_stride, u64 choice_stride, u64 m,
+                                             u64 k, int expert) {
+    return rows == 0 ? expert : reinterpret_cast<const int *>(sources)[m * row_stride + k * choice_stride];
+}
+
+// Where a decode choice's weights are read, of a stack's `bank` and `tier`
+// records: the bank record its source names, or the tier record read in
+// place over the link; no stack
+// (`stack` null) for a choice with no record.
+struct Place {
+    const u8 *stack;
+    u64 record;
+    __device__ __forceinline__ static Place of(const u8 *bank, const u8 *tier, int source) {
+        if (source == -1)
+            return Place{nullptr, 0};
+        return source >= 0 ? Place{bank, (u64)source} : Place{tier, (u64)(-2 - source)};
+    }
+};
+
+// A choice with no record's (`decode_source` -1) share of a decode GEMV's
+// `rows` output rows: this block's (`Shape::GROUPS` tile groups of TPW
+// 16-row tiles), each zeroed by `zero(n)`, by every thread of the block.
+template <class Shape, class Zero> __device__ __forceinline__ void zero_block_rows(u64 rows, Zero zero) {
+    constexpr u64 BLOCK_ROWS = (u64)Shape::GROUPS * Shape::TPW * 16;
+    const u64 first = (u64)blockIdx.x * BLOCK_ROWS;
+    for (u64 n = first + threadIdx.x; n < first + BLOCK_ROWS && n < rows; n += blockDim.x)
+        zero(n);
+}
+
+// Expert `expert`'s matrix of weight slot W: record `slot` of `records`, or
+// matrix `expert` of `experts` (`ROUTED_EXPERT_SLOT`).
+#define ROUTED_EXPERT_MATRIX(W, records, experts, slot, expert) \
+    ((slot) >= 0 ? W##_MATRIX(records, slot) : W##_MATRIX(experts, expert))
+
+__device__ __forceinline__ void write_grid(u8 *grid, u64 x, u64 y, u64 z) {
+    int *words = reinterpret_cast<int *>(grid);
+    words[0] = (int)x;
+    words[1] = (int)y;
+    words[2] = (int)z;
+}
+
+// The grids of an expert pass over rows[0] grouped rows and used[0] blocks
+// of `tile_rows` rows (`routed_experts`): a stage block per row, a quantize
+// block per block row, and the expand's and down's column blocks by the
+// TILE_M row tiles of each used block.
+__device__ __forceinline__ void expert_grids(const u8 *rows, const u8 *used, u64 tile_rows, u64 expand_columns,
+                                             u64 down_columns, u8 *stage, u8 *expand, u8 *quantize, u8 *down) {
+    const u64 grouped = (u64)*reinterpret_cast<const int *>(rows);
+    const u64 blocks = (u64)*reinterpret_cast<const int *>(used);
+    const u64 tiles = (tile_rows + TILE_M - 1) / TILE_M;
+    write_grid(stage, grouped, 1, 1);
+    write_grid(expand, expand_columns, tiles, blocks);
+    write_grid(quantize, blocks * tile_rows, 1, 1);
+    write_grid(down, down_columns, tiles, blocks);
+}
+
 } // namespace routed
+
+// The record holding expert `expert`'s weights for step `q`: the record
+// the layer's map (`map`, `mapped` rows of MAP_WORDS at strides `map0`,
+// `map1`) holds for the step (`streaming_held`), or -1 for its place in the
+// experts by index (the stack, or the scratch tier), which is every
+// expert's without a map. A macro, expanded where it is used, by the
+// entries that include `lib/streaming/control.cuh` (`routed_experts`,
+// `routed_experts_up`).
+#define ROUTED_EXPERT_SLOT(map, mapped, map0, map1, q, expert)                                             \
+    ((mapped) == 0 ? -1 : streaming_held((map) + (u64)(expert) * (map0), (map1), (q)))

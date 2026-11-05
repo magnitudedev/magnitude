@@ -1,4 +1,4 @@
-use magnitude_kernels::{import_dense, repack_weight};
+use magnitude_kernels::{constants, import_dense, list_extent, repack_weight, routed_convert, routed_step};
 
 fn dense_bytes(name: &str, values: &[f32]) -> Vec<u8> {
     match name {
@@ -35,9 +35,11 @@ fn conversions() -> Vec<(seismic::Element, seismic::OperandRecipe)> {
 /// (`tests/support/gguf_reference.py vectors`): their bytes and gguf-py's
 /// dequantization of them.
 fn reference_vectors(encoding: magnitude_ggml::Encoding) -> (Vec<u8>, Vec<f32>) {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/support/gguf_vectors")
-        .join(format!("{}.bin", encoding.ggml_name()));
+    let path = std::path::Path::new(
+        &std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    )
+    .join("tests/support/gguf_vectors")
+    .join(format!("{}.bin", encoding.ggml_name()));
     let file = std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     let blocks = u64::from(u32::from_le_bytes(file[..4].try_into().unwrap()));
     let bytes = (blocks * encoding.block_bytes()) as usize;
@@ -186,6 +188,55 @@ fn device(backend: seismic::BackendName) -> Option<seismic::Device> {
 #[test]
 fn metal_dense_import_matches_host_for_all_nine_pairs() {
     dense_import_matches_host_for_all_nine_pairs(&device(seismic::BackendName::Metal).unwrap());
+}
+
+/// A record port whose records lie in a graph's workspace (an import's
+/// result read by the next node) binds through the slot's workspace record
+/// table: f32 -> f16 -> f32 over 3 matrices of 7 rows returns the source.
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_record_ports_bind_graph_workspace_records() {
+    let device = device(seismic::BackendName::Metal).unwrap();
+    let values = [-3.25f32, -0.0, 0.125, 1.5, 19.0];
+    let extents = [3, 7, values.len() as u64];
+    let bytes = dense_bytes("f32", &values).repeat(21);
+    let [f32, f16] = ["f32", "f16"].map(|name| seismic::Element::named(name).unwrap());
+    let import = |source, destination| {
+        import_dense::native_for_device_with(
+            &device,
+            import_dense::Elements { E: source, U: destination },
+            &seismic::NativeSpecialization::new(),
+        )
+        .unwrap()
+    };
+    let (narrow, widen) = (import(f32, f16), import(f16, f32));
+    let mut graph = device.native_graph();
+    let source_port = graph.port(f32, &extents).unwrap();
+    let result_port = graph.port(f32, &extents).unwrap();
+    let narrowed = graph
+        .enqueue(&narrow, import_dense::WorkflowArgs { source: source_port.tensor().into() })
+        .unwrap()
+        .value;
+    let widened = graph
+        .enqueue(&widen, import_dense::WorkflowArgs { source: (&narrowed).into() })
+        .unwrap()
+        .value;
+    graph.store(&widened, &result_port).unwrap();
+    let plan = graph.seal().unwrap();
+    let source = seismic::Tensor::from_host(&device, f32, &extents, &bytes).unwrap();
+    let result = seismic::Tensor::from_host(&device, f32, &extents, &vec![0; bytes.len()]).unwrap();
+    let mut bindings = plan.bindings();
+    bindings.set(&source_port, &source).unwrap();
+    bindings.set(&result_port, &result).unwrap();
+    let (_, completion) = plan
+        .new_slot()
+        .unwrap()
+        .attach(bindings, plan.new_outputs().unwrap())
+        .unwrap()
+        .submit()
+        .unwrap();
+    completion.wait().unwrap();
+    assert_eq!(result.read_to_host().unwrap(), bytes);
 }
 
 #[test]
@@ -449,21 +500,101 @@ fn has_records(element: seismic::Element) -> bool {
     matches!(&info.kind, RepresentationKind::PackedRows(rows) if rows.records())
 }
 
+/// The columns of a repack unit into `element`'s row layout.
+fn unit_columns(element: seismic::Element) -> u32 {
+    use seismic_lang::{registry, repack};
+    let info = registry::representation_info(registry::representation(element.name()).unwrap());
+    repack::conversion_unit_columns(registry::ConversionLayout::of(&info.kind).unwrap())
+}
+
+/// `routed_convert`'s scratch slots after converting each record of
+/// `source` (a stored [records, N, K] stack, the conveyor) into the slot of
+/// its index.
+fn streamed_conversion(
+    device: &seismic::Device,
+    source: &seismic::Tensor,
+    destination: seismic::Element,
+    shape: &[u64; 3],
+) -> Vec<u8> {
+    const SEQUENCE: i32 = 1;
+    let words = |values: &[i32]| {
+        let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+        seismic::Tensor::from_host(device, seismic::Element::i32(), &[values.len() as u64], &bytes).unwrap()
+    };
+    let mut step = words(&[0, 0]);
+    routed_step::native_for_device(device, &seismic::NativeSpecialization::new())
+        .unwrap()
+        .call(routed_step::Args {
+            step: &mut step,
+            sequence: &words(&[SEQUENCE, 0]),
+        })
+        .unwrap();
+    // Every record into its own slot.
+    let entry = |index: u64| list_extent(index) as usize;
+    let mut list = vec![0; entry(shape[0])];
+    list[constants::LIST_SEQUENCE as usize] = SEQUENCE;
+    list[constants::LIST_COUNT as usize] = shape[0] as i32;
+    for record in 0..shape[0] {
+        list[entry(record) + constants::LIST_FROM as usize] = record as i32;
+        list[entry(record) + constants::LIST_TO as usize] = record as i32;
+    }
+    let list_words = list.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+    let shared = seismic::Tensor::shared(device, seismic::Element::i32(), &[list.len() as u64]).unwrap();
+    // SAFETY: no device work uses the tensor yet.
+    unsafe { shared.write_shared(0, &list_words).unwrap() };
+    let zeros = |element: seismic::Element, shape: &[u64]| {
+        let length = element.canonical_byte_len(shape).unwrap() as usize;
+        seismic::Tensor::from_host(device, element, shape, &vec![0u8; length]).unwrap()
+    };
+    let mut slots = zeros(destination, shape);
+    routed_convert::native_for_device_with(
+        device,
+        routed_convert::Elements {
+            ST: source.element(),
+            U: destination,
+        },
+        &seismic::NativeSpecialization::new(),
+    )
+    .unwrap()
+    .call(routed_convert::Args {
+        conveyor: source,
+        list: &shared,
+        step: &step,
+        destination: &mut slots,
+        // One threadgroup striding over every listed record's items.
+        grid: &words(&[1, 1, 1]),
+    })
+    .unwrap();
+    slots.read_to_host().unwrap()
+}
+
 /// K8: the native repack of every (format, layout) conversion equals the
 /// registry's host reference byte for byte, and its storage decodes to the
-/// source's values. Shapes cover a row count off the 16-row tile, several
-/// matrices, a packing axis with an odd number of q8 packets (mma16 pads
-/// rows to whole 64-column k-blocks) and a partial trailing packet.
+/// source's values; where the backend streams, so does its streamed
+/// conversion (`routed_convert`, record by record into scratch slots),
+/// so a streamed record holds what the resident import places. Shapes cover
+/// a row count off the 16-row tile, several matrices, a packing axis with an
+/// odd number of q8 packets (mma16 pads rows to whole 64-column k-blocks),
+/// a partial trailing packet; the streamed conversion of whole tiles of
+/// several records is at a row tile of several windows that a converting
+/// block's mirror does not hold.
 fn repack_matches_the_registered_conversion(
     device: &seismic::Device,
     layouts: &[seismic::Layout],
     records: bool,
 ) {
     let device = device.clone();
+    let streams = routed_convert::native_implementation(&device)
+        .unwrap()
+        .is_some();
     for (source_element, operands) in conversions() {
         let source_name = source_element.name();
         let group = source_element.logical_group().unwrap();
-        for shape in [[1, 17, 3 * group], [3, 5, 2 * group - 8], [2, 16, group]] {
+        // Whole tiles of several records: their streamed conversion runs at
+        // the wide record's width (below), so the streamed entry converts as
+        // many shapes as the others.
+        let whole_tiles = [2, 16, group];
+        for shape in [[1, 17, 3 * group], [3, 5, 2 * group - 8], whole_tiles] {
             let length = source_element.canonical_byte_len(&shape).unwrap();
             let bytes = source_bytes(length, shape[1] as u32);
             let source =
@@ -480,6 +611,13 @@ fn repack_matches_the_registered_conversion(
                 if !records && has_records(destination) {
                     continue;
                 }
+                // Metal places mma16 code planes as 32-column units only.
+                if device.backend() == seismic::BackendName::Metal
+                    && layout == seismic::Layout::Mma16
+                    && unit_columns(destination) != 32
+                {
+                    continue;
+                }
                 let native = repack_weight::native_for_device_with(
                     &device,
                     repack_weight::Elements {
@@ -494,13 +632,16 @@ fn repack_matches_the_registered_conversion(
                 .value;
                 let actual = native.read_to_host().unwrap();
                 let label = format!("{source_name} -> {} over {shape:?}", destination.name());
-                assert_eq!(
-                    actual,
-                    destination
-                        .repack_host(source_element, &shape, &bytes)
-                        .unwrap(),
-                    "{label}"
-                );
+                let expected = destination
+                    .repack_host(source_element, &shape, &bytes)
+                    .unwrap();
+                assert_eq!(actual, expected, "{label}");
+                if streams && layout == device.backend().resident_layout() && shape != whole_tiles {
+                    assert!(
+                        streamed_conversion(&device, &source, destination, &shape) == expected,
+                        "{label}: streamed"
+                    );
+                }
                 let values = destination.decode_host(&shape, &actual).unwrap();
                 assert_eq!(
                     values
@@ -514,6 +655,26 @@ fn repack_matches_the_registered_conversion(
                     "{label}"
                 );
             }
+        }
+        // A streamed record whose row tile is wider than a converting
+        // block's mirror (CUDA then converts it in place) and spans several
+        // windows, as the catalog's widest records do.
+        let resident = device.backend().resident_layout();
+        let destination = source_element.converted(resident, operands).filter(|_| streams && layouts.contains(&resident));
+        if let Some(destination) = destination.filter(|&destination| records || !has_records(destination)) {
+            let mut wide = group;
+            while destination.canonical_byte_len(&[1, constants::CONVERT_TILE_ROWS, wide]).unwrap() <= constants::MIRROR_BYTES {
+                wide *= 2;
+            }
+            let shape = [whole_tiles[0], whole_tiles[1], wide];
+            let bytes = source_bytes(source_element.canonical_byte_len(&shape).unwrap(), shape[1] as u32);
+            let source = seismic::Tensor::from_host(&device, source_element, &shape, &bytes).unwrap();
+            assert!(
+                streamed_conversion(&device, &source, destination, &shape)
+                    == destination.repack_host(source_element, &shape, &bytes).unwrap(),
+                "{source_name} -> {} over {shape:?}: streamed",
+                destination.name()
+            );
         }
     }
 }

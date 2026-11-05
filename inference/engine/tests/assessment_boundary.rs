@@ -18,10 +18,7 @@ use magnitude_engine::{
     fingerprint::ModelFingerprint,
     options::{standard_service_limits, ModelMethod, ModelPolicy, PROFILE_SEQUENCES},
 };
-use magnitude_executor::{
-    assessment::ExecutionFit,
-    platform::{DeviceRequest, MemoryReserves},
-};
+use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
 use seismic::BackendName;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -356,20 +353,20 @@ fn an_unknown_architecture_is_named() {
 #[test]
 fn every_unsupported_weight_type_is_counted() {
     let mut gguf = llama();
-    gguf.encode("blk.0.ffn_up.weight", Encoding::Q2K);
-    gguf.encode("blk.1.ffn_up.weight", Encoding::Q2K);
-    gguf.encode("blk.1.ffn_gate.weight", Encoding::Iq1M);
+    gguf.encode("blk.0.ffn_up.weight", Encoding::Q8_1);
+    gguf.encode("blk.1.ffn_up.weight", Encoding::Q8_1);
+    gguf.encode("blk.1.ffn_gate.weight", Encoding::Q8K);
     assert_eq!(
         refusal(&gguf, "weights").reasons,
         [UnsupportedReason::WeightTypes {
             types: vec![
                 WeightTypeCount {
-                    ggml_type: "IQ1_M".into(),
-                    tensor_count: 1
+                    ggml_type: "Q8_1".into(),
+                    tensor_count: 2
                 },
                 WeightTypeCount {
-                    ggml_type: "Q2_K".into(),
-                    tensor_count: 2
+                    ggml_type: "Q8_K".into(),
+                    tensor_count: 1
                 },
             ]
         }]
@@ -485,7 +482,7 @@ fn an_unreadable_chat_template_is_named() {
 #[test]
 fn independent_checks_report_every_reason_together() {
     let mut gguf = llama();
-    gguf.encode("blk.0.ffn_down.weight", Encoding::Q2K);
+    gguf.encode("blk.0.ffn_down.weight", Encoding::Q8_1);
     gguf.tensor("rope_freqs.weight", &[WIDTH / 2], Encoding::F32);
     gguf.set("tokenizer.ggml.pre", Meta::Str("deepseek-v3".into()));
     gguf.remove("tokenizer.chat_template");
@@ -496,7 +493,7 @@ fn independent_checks_report_every_reason_together() {
         [
             UnsupportedReason::WeightTypes {
                 types: vec![WeightTypeCount {
-                    ggml_type: "Q2_K".into(),
+                    ggml_type: "Q8_1".into(),
                     tensor_count: 1
                 }]
             },
@@ -510,7 +507,7 @@ fn independent_checks_report_every_reason_together() {
             UnsupportedReason::ChatTemplate,
         ]
     );
-    assert!(refusal.detail.contains("Q2_K"), "{}", refusal.detail);
+    assert!(refusal.detail.contains("Q8_1"), "{}", refusal.detail);
 }
 
 /// A header's own refusal is admission's without the weight types: with the
@@ -525,7 +522,7 @@ fn a_header_refuses_what_admission_does_without_its_weight_types() {
         header_refusal(&directory(gguf), extent).map(|refusal| refusal.reasons)
     };
     let mut quantized = llama();
-    quantized.encode("blk.0.ffn_down.weight", Encoding::Q2K);
+    quantized.encode("blk.0.ffn_down.weight", Encoding::Q8_1);
     assert_eq!(reasons(&quantized, HeaderExtent::Whole), None);
     let mut refused = quantized;
     refused.tensor("blk.0.attn_q.bias", &[HEADS * WIDTH], Encoding::F32);
@@ -688,6 +685,7 @@ fn cpu_structure() -> AssessmentStructure {
     AssessmentStructure::discover(
         &catalog,
         DeviceRequest::Backend(BackendName::Cpu),
+        None,
         MemoryReserves::standard(),
         ModelPolicy::default(),
         standard_service_limits(),
@@ -712,14 +710,14 @@ fn prepared(package: &ModelPackagePaths) -> PreparedModelAssessment {
 fn an_unsupported_target_reports_its_fingerprint() {
     let scratch = Scratch::new("unsupported-fingerprint");
     let mut gguf = llama();
-    gguf.encode("blk.0.ffn_up.weight", Encoding::Q2K);
+    gguf.encode("blk.0.ffn_up.weight", Encoding::Q8_1);
     let target = gguf.write(&scratch.file("target.gguf"));
     let PreparedModelAssessment::Unsupported {
         unsupported,
         fingerprint,
     } = prepared(&package(target.clone()))
     else {
-        panic!("Q2_K is not imported");
+        panic!("Q8_1 is not imported");
     };
     assert!(matches!(
         unsupported.reasons.as_slice(),
@@ -771,7 +769,7 @@ fn a_drafter_with_unsupported_weights_names_them() {
     let scratch = Scratch::new("drafter-weights");
     let target = llama().write(&scratch.file("target.gguf"));
     let mut draft = dflash(HIDDEN);
-    draft.encode("blk.0.ffn_up.weight", Encoding::Iq2S);
+    draft.encode("blk.0.ffn_up.weight", Encoding::Q8K);
     let draft = draft.write(&scratch.file("draft.gguf"));
     let PreparedModelAssessment::Planned { facts, .. } = prepared(&ModelPackagePaths {
         draft: Some(draft),
@@ -781,13 +779,13 @@ fn a_drafter_with_unsupported_weights_names_them() {
         panic!("the target plans without the drafter");
     };
     let DrafterVerdict::Rejected(rejection) = facts.drafter else {
-        panic!("IQ2_S is not imported: {:?}", facts.drafter);
+        panic!("Q8_K is not imported: {:?}", facts.drafter);
     };
     assert_eq!(
         rejection.reasons,
         [UnsupportedReason::WeightTypes {
             types: vec![WeightTypeCount {
-                ggml_type: "IQ2_S".into(),
+                ggml_type: "Q8_K".into(),
                 tensor_count: 1
             }]
         }]
@@ -868,6 +866,7 @@ fn cpu_refusal(package: &ModelPackagePaths, policy: ModelPolicy) -> UnsupportedM
     let structure = AssessmentStructure::discover(
         &catalog,
         DeviceRequest::Backend(BackendName::Cpu),
+        None,
         MemoryReserves::standard(),
         policy,
         standard_service_limits(),
@@ -932,8 +931,9 @@ fn a_kernel_call_outside_its_domain_names_the_kernel_and_its_statics() {
     assert!(!statics.is_empty());
 }
 
-/// Memory is charged as stored after import: Q3_K weights are held widened
-/// as q6k, so a Q3_K file is charged as its Q6_K twin though it is smaller.
+/// Memory is charged as stored after import: TQ1_0's base-3 digits are held
+/// widened as the 2-bit codes TQ2_0 resides as, so a TQ1_0 file is charged
+/// as its TQ2_0 twin though it is smaller.
 #[test]
 fn widened_weights_are_charged_as_resident() {
     let scratch = Scratch::new("widened");
@@ -951,10 +951,7 @@ fn widened_weights_are_charged_as_resident() {
         let target = gguf.write(&scratch.file(name));
         let ModelAssessment::Assessed {
             execution:
-                ModelExecution::Fits {
-                    fit: ExecutionFit { domains, .. },
-                    ..
-                },
+                ModelExecution::Fits { domains, .. },
             ..
         } = assess_model(&package(target), &cpu_setup(), &[], PROFILE_SEQUENCES)
             .unwrap_or_else(|error| panic!("operational failure: {error}"))
@@ -967,19 +964,20 @@ fn widened_weights_are_charged_as_resident() {
             .collect::<Vec<_>>();
         (stored, required)
     };
-    let (q3k_stored, q3k_required) = charged(Encoding::Q3K, "q3k.gguf");
-    let (q6k_stored, q6k_required) = charged(Encoding::Q6K, "q6k.gguf");
-    assert!(q3k_stored < q6k_stored);
-    assert_eq!(q3k_required, q6k_required);
-    assert!(q3k_required.iter().all(|required| *required > q6k_stored));
+    let (tq1_stored, tq1_required) = charged(Encoding::Tq1_0, "tq1_0.gguf");
+    let (tq2_stored, tq2_required) = charged(Encoding::Tq2_0, "tq2_0.gguf");
+    assert!(tq1_stored < tq2_stored);
+    assert_eq!(tq1_required, tq2_required);
+    assert!(tq1_required.iter().all(|required| *required > tq2_stored));
 }
 
 /// A shared real-header fixture (`fixtures/assessment/headers`),
 /// decompressed into `scratch` under its repository file name.
 fn real_header(scratch: &Scratch, name: &str) -> PathBuf {
-    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/assessment/headers")
-        .join(format!("{name}.gz"));
+    let source =
+        Path::new(&std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"))
+            .join("fixtures/assessment/headers")
+            .join(format!("{name}.gz"));
     let mut decoder = flate2::read::GzDecoder::new(
         std::fs::File::open(&source).unwrap_or_else(|error| panic!("{}: {error}", source.display())),
     );
@@ -1063,11 +1061,15 @@ fn a_projector_binds_by_its_width_not_the_base_model_names() {
     );
 }
 
-/// A text-only family given a repository's projector (Nemotron 3.5 VL repositories ship an
-/// mmproj the nemotron_h family has no vision for) gets the same verdict as without it, the
-/// projector `Rejected` with a mismatch: never an unreadable target.
+/// Why the Nemotron family rejects the Qwen3-VL fixture projector.
+const FOREIGN_PROJECTOR: &str =
+    "a qwen3vl_merger projector is not one this model reads (nemotron_omni)";
+
+/// A target given another model's projector (a Qwen3-VL mmproj beside a Nemotron target, whose
+/// family reads Nemotron Omni projectors) gets the same verdict as without it, the projector
+/// `Rejected` with a mismatch: never an unreadable target or projector.
 #[test]
-fn a_text_only_family_is_assessed_without_a_projector_it_cannot_bind() {
+fn a_target_is_assessed_without_another_models_projector() {
     let scratch = Scratch::new("text-only-projector");
     let target = real_header(&scratch, "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4.gguf");
     let projector = real_header(&scratch, "mmproj-F16.gguf");
@@ -1084,12 +1086,12 @@ fn a_text_only_family_is_assessed_without_a_projector_it_cannot_bind() {
     };
     assert!(!facts.capabilities.vision);
     let ProjectorVerdict::Rejected(rejection) = &facts.projector else {
-        panic!("Nemotron-H has no vision projector: {:?}", facts.projector);
+        panic!("a Qwen3-VL projector is rejected: {:?}", facts.projector);
     };
     assert_eq!(
         rejection.reasons,
         vec![UnsupportedReason::TargetMismatch {
-            detail: "Nemotron-H has no vision projector".to_owned()
+            detail: FOREIGN_PROJECTOR.to_owned()
         }]
     );
     assert_eq!(
@@ -1130,8 +1132,8 @@ fn an_unknown_tensor_type_is_an_unsupported_weight_type() {
     );
 }
 
-/// A load interprets the same way: a Nemotron package opened with a projector the family has no
-/// vision for defines its text model, with no image input, and keeps the projector's refusal.
+/// A load interprets the same way: a Nemotron package opened with another model's projector
+/// defines its text model, with no image input, and keeps the projector's refusal.
 #[test]
 fn a_load_serves_text_beside_a_projector_the_family_cannot_bind() {
     let scratch = Scratch::new("text-only-projector-load");
@@ -1154,7 +1156,7 @@ fn a_load_serves_text_beside_a_projector_the_family_cannot_bind() {
     assert_eq!(
         admitted.projector_unavailable.map(|refusal| refusal.reasons),
         Some(vec![UnsupportedReason::TargetMismatch {
-            detail: "Nemotron-H has no vision projector".to_owned()
+            detail: FOREIGN_PROJECTOR.to_owned()
         }])
     );
 }

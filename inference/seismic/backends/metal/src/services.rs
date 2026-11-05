@@ -879,7 +879,7 @@ fn gpu_elapsed_pipeline_batch(
         })?;
         encoder.setComputePipelineState(pipeline);
         unsafe {
-            encoder.setBuffer_offset_atIndex(Some(buffer.raw()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&buffer.raw()), 0, 0);
             encoder.setBytes_length_atIndex(
                 std::ptr::NonNull::from(&iterations).cast(),
                 std::mem::size_of::<u32>(),
@@ -901,24 +901,20 @@ fn gpu_elapsed_pipeline_batch(
             },
         );
         encoder.endEncoding();
+        let time = crate::timing::SubmissionTime::before_commit();
         command.commit();
-        commands.push(command);
+        commands.push((command, time));
     }
     let mut elapsed = Vec::with_capacity(commands.len());
-    for command in commands {
+    for (command, time) in commands {
         command.waitUntilCompleted();
         if let Some(error) = command.error() {
             return Err(seismic_compiler::errors::TargetError::DeviceUnavailable(
                 error.localizedDescription().to_string(),
             ));
         }
-        let start = command.GPUStartTime();
-        let end = command.GPUEndTime();
-        if !(start.is_finite() && end.is_finite() && end >= start && start > 0.0) {
-            return Err(seismic_compiler::errors::TargetError::UnsupportedDriver(
-                "MTLCommandBuffer GPUStartTime/GPUEndTime returned an invalid interval".into(),
-            ));
-        }
+        let (start, end) = time.interval(command.GPUStartTime(), command.GPUEndTime())
+            .map_err(seismic_compiler::errors::TargetError::UnsupportedDriver)?;
         elapsed.push(((end - start) * 1_000_000_000.0).ceil() as u64);
     }
     Ok(elapsed)
@@ -1547,7 +1543,7 @@ fn is_qualified(interval: DurationInterval, percent: u64) -> bool {
 
 fn core_services(
     device: &crate::device::MetalDevice,
-    buffer: &crate::device::MetalBuffer,
+    buffer: &crate::device::WritableMetalBuffer,
 ) -> Result<Vec<ServiceDefinition>, seismic_compiler::errors::TargetError> {
     let mut result = Vec::new();
     result.push(host_definition(
@@ -1565,8 +1561,12 @@ fn core_services(
             })?;
             command.commit();
             command.waitUntilCompleted();
-            std::hint::black_box(command.status());
-            Ok(())
+            match command.error() {
+                Some(error) => Err(seismic_compiler::errors::TargetError::DeviceUnavailable(
+                    error.localizedDescription().to_string(),
+                )),
+                None => Ok(()),
+            }
         },
     )?);
     result.push(host_transfer_definition(
@@ -1625,7 +1625,7 @@ fn core_services(
 fn host_transfer_definition(
     class: ServiceClassId,
     probe: &'static str,
-    buffer: &crate::device::MetalBuffer,
+    buffer: &crate::device::WritableMetalBuffer,
     copy: bool,
 ) -> Result<ServiceDefinition, seismic_compiler::errors::TargetError> {
     const SMALL: usize = 256 * 1024;

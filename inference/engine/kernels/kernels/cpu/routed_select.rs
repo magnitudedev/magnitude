@@ -8,7 +8,7 @@
 
 use lib::core::{activation, reduce};
 use lib::projection::projection;
-use lib::routed::{routed, select};
+use lib::routed::{ranked, routed, select};
 
 fn routed_select_normalize<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
@@ -54,7 +54,7 @@ fn routed_select_select<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: 
     let e = cx.dim_e() as usize;
     let (scores, order) = shared.split_at_mut(4 * e);
     let scores = seismic::cpu::tensor::floats(scores, e);
-    let order = select::indices(order, e);
+    let order = ranked::indices(order, e);
     // SAFETY: the logits launch wrote every row before this launch.
     scores.copy_from_slice(unsafe { cx.scratch_logits().slice::<f32>(4 * row * e, e) });
     select::scores(cx.arg_score(), scores);

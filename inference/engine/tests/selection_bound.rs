@@ -55,6 +55,7 @@ fn plain_owner(limits: ServiceLimits) -> (Host, usize, std::sync::Arc<ByteBpeTok
             lookahead: false,
             exported_logits_rows: 0,
             numerical_profile: None,
+            weight_cap: None,
         },
         context_tokens: Some(1024),
         service: limits.clone(),
@@ -146,6 +147,7 @@ fn a_prefill_round_finishes_at_most_the_selection_bound_and_defers_the_rest() {
         decode_tokens: BOUND,
         decode_share: 0.5,
         locality_seconds: 1.0,
+        conversations: std::num::NonZeroUsize::MIN,
     };
     let (mut host, vocabulary, tokenizer) = plain_owner(limits);
     let prompts = (0..5)
@@ -212,6 +214,7 @@ fn plain_domain(bound: usize, exported: usize) -> (ExecutorDomain, StateBindings
             lookahead: false,
             exported_logits_rows: exported,
             numerical_profile: None,
+            weight_cap: None,
         },
         context_tokens: Some(1024),
         service: ServiceLimits {
@@ -219,6 +222,7 @@ fn plain_domain(bound: usize, exported: usize) -> (ExecutorDomain, StateBindings
             decode_tokens: bound,
             decode_share: 0.5,
             locality_seconds: 1.0,
+            conversations: std::num::NonZeroUsize::MIN,
         },
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,

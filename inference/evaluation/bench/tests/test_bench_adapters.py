@@ -3,7 +3,6 @@ import hashlib
 import pytest
 from magnitude_bench.adapters import ADAPTERS
 from magnitude_bench.adapters.omlx_native import instrumentation
-from magnitude_bench.client import Observation
 from magnitude_bench.models import Acquisition, Drafter, Target, prepare
 from magnitude_bench.options import EngineOptions, LlamaOptions, MagnitudeOptions, SourceBuild
 from magnitude_bench.store import RunStore
@@ -25,7 +24,8 @@ def test_readiness_requires_matching_loaded_capacity(engine, artifact_path, tmp_
     # Readiness checks stay lightweight and don't load an engine or a model.
     adapter = make(engine, artifact_path, tmp_path, acquisition)
     if engine == "magnitude":
-        data = {"ready": True, "model": "magnitude-bench", "context_tokens": 40000, "vocabulary": 9}
+        data = {"ready": True, "model": "magnitude-bench", "context_tokens": 40000, "vocabulary": 9,
+                "drafting": {"method": "dflash", "proposals": 16, "policy": "Adaptive"}}
     elif engine == "mlx-vlm":
         data = {
             "status": "healthy",
@@ -44,10 +44,32 @@ def test_readiness_requires_matching_loaded_capacity(engine, artifact_path, tmp_
             "speculative_backend": "none",
         }
     else:
-        data = {"total_slots": 4, "default_generation_settings": {"n_ctx": 40000}}
+        data = {"total_slots": 4, "default_generation_settings": {
+            "n_ctx": 40000, "params": {"speculative.types": "draft-dflash"}}}
     adapter.verify_ready(data, 40000, 4)
     with pytest.raises(ValueError):
         adapter.verify_ready(data, 41000, 4)
+
+
+def test_readiness_refuses_an_engine_not_serving_the_runs_drafter(artifact_path, tmp_path, acquisition):
+    """Each engine states what it decodes with at readiness; a run that drafts with the catalog's
+    drafter refuses an engine serving anything else (a drafter it could not admit serves plain),
+    and a run that drafts nothing expects plain decoding."""
+    plain = EngineOptions(drafting=False)
+    magnitude = lambda method: {"ready": True, "model": "magnitude-bench", "context_tokens": 40000,
+                                "vocabulary": 9, "drafting": {"method": method, "proposals": 0, "policy": None}}
+    llama = lambda types: {"total_slots": 1, "default_generation_settings": {
+        "n_ctx": 40000, "params": {"speculative.types": types}}}
+    for engine, served, refused in (("magnitude", magnitude("dflash"), magnitude("plain")),
+                                    ("llama.cpp", llama("draft-dflash"), llama("none"))):
+        drafting = make(engine, artifact_path, tmp_path, acquisition)
+        drafting.verify_ready(served, 40000, 1)
+        with pytest.raises(ValueError, match="serves"):
+            drafting.verify_ready(refused, 40000, 1)
+        undrafted = make(engine, artifact_path, tmp_path, acquisition, plain)
+        undrafted.verify_ready(refused, 40000, 1)
+        with pytest.raises(ValueError, match="serves"):
+            undrafted.verify_ready(served, 40000, 1)
 
 
 def test_magnitude_serves_the_catalog_drafter_and_the_run_tuning(
@@ -112,51 +134,43 @@ async def test_magnitude_measures_another_builds_binary(artifact_path, tmp_path,
         MagnitudeOptions(tuning_trace=False, fresh_tuning=True)
 
 
-async def test_magnitude_keeps_a_persistent_cache_per_model_and_binary(
-    artifact_path, tmp_path, acquisition
-):
+async def test_magnitude_serves_from_exactly_the_cache_given(artifact_path, tmp_path, acquisition):
     binary = tmp_path / "engine"
     binary.write_bytes(b"engine")
     binary.chmod(0o755)
-    root = tmp_path / "kernel-cache"
-    options = EngineOptions(magnitude=MagnitudeOptions(binary=binary, kernel_cache_root=root))
-    adapter = make("magnitude", artifact_path, tmp_path, acquisition, options)
-    await adapter.prepare()
-    cache = (
-        root / acquisition.model.replace(":", "-")
-        / hashlib.sha256(b"engine").hexdigest()[:16]
-    )
-    assert adapter.identity["kernel_cache"] == str(cache)
-    assert flag(adapter.argv(1234, 8192, 1, tmp_path), "--cache-dir") == str(cache)
-    # A directory given is used exactly; never both.
     exact = EngineOptions(magnitude=MagnitudeOptions(binary=binary, cache_dir=tmp_path / "c"))
     adapter = make("magnitude", artifact_path, tmp_path, acquisition, exact)
     await adapter.prepare()
+    assert adapter.identity["kernel_cache"] == str(tmp_path / "c")
     assert flag(adapter.argv(1234, 8192, 1, tmp_path), "--cache-dir") == str(tmp_path / "c")
-    with pytest.raises(ValueError, match="kernel cache"):
-        MagnitudeOptions(cache_dir=tmp_path / "c", kernel_cache_root=root)
+    unset = make("magnitude", artifact_path, tmp_path, acquisition,
+                 EngineOptions(magnitude=MagnitudeOptions(binary=binary)))
+    await unset.prepare()
+    assert unset.identity["kernel_cache"] is None and "--cache-dir" not in unset.argv(1234, 8192, 1, tmp_path)
 
 
-def test_drafting_runs_refuse_responses_without_proposals(artifact_path, tmp_path, acquisition):
-    def judged(engine, timings, completion=256, options=None, drafted=acquisition):
-        adapter = make(engine, artifact_path, tmp_path, drafted, options)
-        terminal = {"usage": {"completion_tokens": completion}, "timings": timings}
-        return adapter.verify_observation(
-            Observation(request_id="r", outcome="valid", terminal=terminal)
-        )
+def test_a_request_the_drafter_proposed_nothing_for_is_a_valid_measurement():
+    """An engine's draft controller may choose not to draft a request: its response omits the
+    draft counters (`engine/serving/src/chat.rs`, which states them only when it proposed some),
+    which reports none proposed, not a fault. Such a request is measured, and adds nothing to
+    the drafted totals."""
+    from magnitude_bench import report, validation
 
-    plain = EngineOptions(drafting=False)
-    for engine in ("magnitude", "llama.cpp"):
-        assert judged(engine, {"draft_n": 7, "draft_n_accepted": 0}).outcome == "valid"
-        for timings in ({}, {"draft_n": 0, "draft_n_accepted": 0}):
-            refused = judged(engine, timings)
-            assert refused.outcome == "invalid" and "dflash drafter" in refused.error
-            assert judged(engine, timings, options=plain).outcome == "valid"
-            assert judged(engine, timings, completion=1).outcome == "valid"
-            no_drafter = acquisition.model_copy(update={"drafter": None})
-            assert judged(engine, timings, drafted=no_drafter).outcome == "valid"
-    # Comparison engines without catalog drafting are never judged by draft counters.
-    assert judged("mlx-vlm", {}).outcome == "valid"
+    def response(drafted):
+        timings = {"cache_n": 0, "prompt_n": 10, "predicted_n": 64, "prompt_ms": 5.0, "predicted_ms": 50.0,
+                   **({"draft_n": drafted[0], "draft_n_accepted": drafted[1]} if drafted else {})}
+        payload = {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 64, "total_tokens": 74,
+                                            "prompt_tokens_details": {"cached_tokens": 0}}, "timings": timings}
+        return validation.terminal(payload)
+
+    declined, drafted = response(None), response((7, 5))
+    assert "draft_n" not in declined["timings"]
+    rows = [{"target": "magnitude", "section": "context", "checkpoint": 4096, "concurrency": 1, "family": "prose",
+             "phase": "measured", "timing_basis": "native",
+             "observation": {"outcome": "valid", "terminal": terminal, "ttft_ms": 5, "completed_ms": 55}}
+            for terminal in (declined, drafted)]
+    (row,) = report.summarize(rows, "completed", "c", "id", 2)["rows"]
+    assert row["eligible"] == 2 and row["draft_proposed"] == 7 and row["draft_accepted"] == 5
 
 
 def test_llama_allocates_context_headroom_within_the_model_limit(
@@ -170,7 +184,8 @@ def test_llama_allocates_context_headroom_within_the_model_limit(
     argv = adapter.argv(1234, context, 2, tmp_path)
     assert flag(argv, "--ctx-size") == str((context + 1024) * 2)
     adapter.verify_ready(
-        {"total_slots": 2, "default_generation_settings": {"n_ctx": context + 1024}}, context, 2
+        {"total_slots": 2, "default_generation_settings": {
+            "n_ctx": context + 1024, "params": {"speculative.types": "draft-dflash"}}}, context, 2
     )
     with pytest.raises(ValueError):
         adapter.verify_ready(

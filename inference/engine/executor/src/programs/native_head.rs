@@ -832,6 +832,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                 inject_only,
                 causal_cache: false,
                 selection: None,
+                controls: crate::programs::graph::draft::ControlSource::Uploaded,
             },
         )?;
         let (Some(output_norm), Some(out_rows)) = (&output_norm, &out_rows) else {
@@ -880,7 +881,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
             (HeadFeedForwardEntries::Dense(entries), FeedForwardProgramSlot::Dense(_)) => {
                 graph.set_class_scope((pass == 0).then_some("head-entry-dense"));
                 let feedforward_norm = weight!(feed_forward_scope, WeightKind::InputNorm);
-                let dense_rows = GraphConstant::identity_for_class(
+                let dense_rows = GraphConstant::row_identity(
                     &mut graph,
                     rows,
                     (pass == 0).then_some("head_entry_rows"),
@@ -970,7 +971,10 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                     class: (pass == 0).then_some("head_entry_rows"),
                 };
                 graph.set_class_scope((pass == 0).then_some("head-entry-routed"));
-                let output = routed::routed(
+                // A head's routed layers hold their experts whole: a
+                // streamed one is refused (`routed`: its bank entries
+                // disagree with its plan).
+                let (output, _) = routed::routed(
                     &mut graph,
                     RoutedGraphEntries {
                         route: entries.route,
@@ -980,6 +984,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                         experts: entries.experts,
                         combine: entries.combine,
                     },
+                    None,
                     load,
                     feed_forward_scope,
                     &mut weights,
@@ -996,6 +1001,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                     hidden,
                     &shape,
                     epsilon,
+                    None,
                 )?;
                 graph.set_class_scope((pass == 0).then_some("head-entry"));
                 output
@@ -1236,14 +1242,7 @@ fn certify_head_family(
             .plan
             .seal_template()
             .map_err(|error| GraphError::from(error).context(format!("head class {largest:?}")))?;
-        family.include(
-            NativeGraphStorageBytes {
-                workspace: 0,
-                output: 0,
-                upload: 0,
-            },
-            draft.constants,
-        );
+        family.include(NativeGraphStorageBytes::default(), draft.constants);
         let slices = group
             .iter()
             .map(|class| {
@@ -1289,11 +1288,7 @@ fn certify_head_family(
         for &class in &group {
             if class.steps > 0 && matches!(binding.feed_forward, FeedForwardProgramSlot::Dense(_)) {
                 family.include(
-                    NativeGraphStorageBytes {
-                        workspace: 0,
-                        output: 0,
-                        upload: 0,
-                    },
+                    NativeGraphStorageBytes::default(),
                     [GraphConstant::identity_value(class.entry_rows)?],
                 );
             }

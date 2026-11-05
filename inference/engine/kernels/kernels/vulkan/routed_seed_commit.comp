@@ -1,0 +1,13 @@
+// Expert streaming, a prompt group's seeding (`routed_seed_commit` in
+// routed.seismic); the Vulkan form of `metal/routed_seed_commit.metal`: one
+// workgroup's seeding (streaming/seed.hpp), its group words the count.
+#include "lib/streaming/control.glsl"
+#include "../streaming/list.hpp"
+#include "../streaming/round.hpp"
+#include "../streaming/seed.hpp"
+
+void routed_seed_commit() {
+    streaming_seed_commit(SEISMIC_PTR(SEISMIC_BUFFER_LIST), SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0,
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH), SEISMIC_PTR(SEISMIC_BUFFER_COMMITS),
+        0u, gl_LocalInvocationIndex, gl_WorkGroupSize.x);
+}

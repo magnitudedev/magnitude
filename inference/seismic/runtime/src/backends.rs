@@ -16,15 +16,18 @@ use crate::api::{
 use crate::devices::OpenError;
 use crate::driver::{self, Opened, PreparedHandle};
 use crate::formation::ProgramFormer;
-use crate::memory::ExecutorMemory;
+use crate::memory::DeviceLedgers;
 use seismic_compiler::errors::{ExecutionError, TargetError};
 use seismic_compiler::executable::{DeviceService, NativeExecutor};
 use seismic_compiler::feedback::PreparationOptions;
+use seismic_compiler::graph_cost::GraphCost;
 use seismic_lang::checked::CheckedModule;
 use seismic_lang::entry::{ElementBindings, LogicalEntry};
 use seismic_lang::ids::{EntryId, RepresentationId};
-use seismic_native_target::TargetFamily;
-use seismic_topology::{DeviceTopology, Executor, ExecutorSelector, ObservationError, StorageKind};
+use seismic_reservation as host;
+use seismic_native_target::{TargetFamily, Toolchain};
+use seismic_discovery::ObservationError;
+use seismic_topology::{Contract, DeviceTopology, Executor, ExecutorSelector, Placing};
 use std::sync::Arc;
 
 type CpuExecutor = seismic_cpu::Executor;
@@ -48,9 +51,9 @@ type MetalBoundWorkflow = driver::BoundWorkflowGraph<seismic_metal::Metal, Metal
 type MetalAdmittedRun = crate::execution::AdmittedRun<seismic_metal::Metal, MetalExecutor>;
 
 #[cfg(not(target_os = "macos"))]
-mod vulkan;
+pub(crate) mod vulkan;
 #[cfg(not(target_os = "macos"))]
-pub(crate) use vulkan::{VulkanOpened, vulkan_buffer};
+pub(crate) use vulkan::{VulkanOpened, vulkan_address, vulkan_buffer, vulkan_transfer_end};
 
 type CudaExecutor = seismic_cuda::Executor;
 pub(crate) type CudaOpened = Opened<seismic_cuda::Cuda, CudaExecutor>;
@@ -235,23 +238,45 @@ impl AdmittedWorkflowKind {
     }
 }
 
+/// What a device of `backend` is charged per recorded graph before its own
+/// cost is measured: its backend's bound (`seismic_cuda::UNMEASURED_GRAPH_COST`,
+/// `seismic_vulkan::UNMEASURED_GRAPH_COST`), none where recording holds no
+/// device memory. Opens nothing.
+pub fn unmeasured_graph_cost(backend: seismic_lang::registry::BackendName) -> GraphCost {
+    use seismic_lang::registry::BackendName;
+    match backend {
+        BackendName::Cuda => seismic_cuda::UNMEASURED_GRAPH_COST,
+        #[cfg(not(target_os = "macos"))]
+        BackendName::Vulkan => seismic_vulkan::UNMEASURED_GRAPH_COST,
+        #[cfg(target_os = "macos")]
+        BackendName::Vulkan => unreachable!("no Vulkan executor is discovered on macOS"),
+        BackendName::Cpu | BackendName::Metal => GraphCost::None,
+    }
+}
+
 /// Opens one executor of `topology`, revalidating its native identity, with
 /// its allocations charged to `memory`.
 pub(crate) fn open(
     info: Executor,
     topology: Arc<DeviceTopology>,
-    memory: Arc<ExecutorMemory>,
+    memory: Arc<DeviceLedgers>,
     options: crate::artifacts::DeviceOptions,
 ) -> Result<Arc<DeviceInner>, OpenError> {
     let selector = info.selector();
     let mut programs = DevicePrograms::Cpu;
+    // The CPU records no graphs, and a Metal schedule is host data: only
+    // CUDA's and Vulkan's graphs hold device memory, measured on opening
+    // unless the opener has it.
+    let mut graph_cost = GraphCost::None;
+    let given = options.graph_cost;
     let kind = match selector {
         ExecutorSelector::HostCpu => {
             let seismic_cpu::OpenedCpu {
                 service,
                 executor,
                 device,
-            } = seismic_cpu::open_host().map_err(OpenError::Backend)?;
+            } = seismic_cpu::open_host(host_cores().map_err(|reason| OpenError::Unavailable { selector, reason })?)
+                .map_err(OpenError::Backend)?;
             OpenedKind::Cpu(Arc::new(Opened::new(
                 service,
                 executor,
@@ -294,14 +319,17 @@ pub(crate) fn open(
                 }
             }
             let ordinal = ordinal.ok_or(OpenError::IdentityChanged(selector))?;
+            let account = |placement| -> Arc<dyn seismic_compiler::executable::MemoryAccount> {
+                Arc::new(crate::memory::MemoryAccount(placement))
+            };
+            let accounts = seismic_cuda::MemoryAccounts {
+                device: account(memory.device().physical()),
+                upload: account(memory.upload().physical()),
+                host: account(memory.staging.clone()),
+            };
             let seismic_cuda::OpenedCuda { service, device } =
-                seismic_cuda::open(ordinal).map_err(open_error)?;
-            let account = |domain| Arc::new(crate::memory::MemoryAccount(domain));
-            service.set_host_memory_account(account(memory.staging.clone()));
-            service.set_allocation_accounts(
-                account(memory.device.physical()),
-                account(memory.upload.physical()),
-            );
+                seismic_cuda::open(ordinal, accounts).map_err(open_error)?;
+            graph_cost = given.map_or_else(|| seismic_cuda::graph_cost(&service).map_err(open_error), Ok)?;
             let executor = seismic_cuda::Executor::new(service.clone());
             let capability = device.facts().compute_capability;
             programs = DevicePrograms::Cuda(ProgramFormer::new(
@@ -322,7 +350,13 @@ pub(crate) fn open(
         }
         #[cfg(not(target_os = "macos"))]
         ExecutorSelector::Vulkan { uuid } => {
-            let opened = VulkanOpened::open(uuid, &info, &topology, memory.clone())?;
+            // What the measurement job stored of its probes, keyed by the
+            // executor's identity.
+            let identity = topology.executor_identity(info.id()).expect("the executor is of its topology");
+            let probed = crate::probes::stored(options.artifacts.as_deref(), &identity, seismic_vulkan::probe::REVISION)
+                .map_err(|reason| OpenError::Unavailable { selector, reason })?;
+            let opened = VulkanOpened::open(uuid, &info, memory.clone(), &probed)?;
+            graph_cost = given.map_or_else(|| seismic_vulkan::graph_cost(opened.service()).map_err(open_error), Ok)?;
             programs = DevicePrograms::Vulkan(ProgramFormer::new(
                 seismic_vulkan::toolchain::VulkanToolchain::new(opened.service().clone()),
                 options.artifacts.clone(),
@@ -336,16 +370,30 @@ pub(crate) fn open(
         #[cfg(target_os = "macos")]
         ExecutorSelector::Vulkan { .. } => unreachable!("this build discovers no Vulkan executor"),
     };
+    let properties = match &kind {
+        OpenedKind::Cpu(opened) => seismic_lang::device::DeviceProperties::Cpu(*opened.executor().properties()),
+        #[cfg(target_os = "macos")]
+        OpenedKind::Metal(opened) => {
+            seismic_lang::device::DeviceProperties::Metal(*opened.device_description().facts().properties())
+        }
+        OpenedKind::Cuda(opened) => {
+            seismic_lang::device::DeviceProperties::Cuda(opened.device_description().facts().properties)
+        }
+        #[cfg(not(target_os = "macos"))]
+        OpenedKind::Vulkan(opened) => seismic_lang::device::DeviceProperties::Vulkan(*opened.service().properties()),
+    };
     Ok(Arc::new(DeviceInner {
         info,
         topology,
         memory,
         capabilities: std::sync::OnceLock::new(),
         kind,
+        properties,
         programs,
         trace: std::sync::Mutex::new(None),
         artifacts: options.artifacts,
-        native: crate::native::NativeQueue::default(),
+        native: crate::native::NativeState::default(),
+        graph_cost,
         chosen: std::sync::Mutex::new(std::collections::HashMap::new()),
     }))
 }
@@ -390,32 +438,31 @@ impl DevicePrograms {
         }
     }
 
-    /// How many native programs this device's toolchain has formed.
-    pub(crate) fn formed(&self) -> usize {
+    /// What besides the source determines the programs this device's
+    /// toolchain forms ([`seismic_native_target::ToolchainIdentity`]): its
+    /// compiler, target and options. The CPU backend forms none: its
+    /// kernels are compiled into the binary.
+    pub(crate) fn toolchain(&self) -> Option<&str> {
         match self {
-            Self::Cpu => 0,
+            Self::Cpu => None,
             #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.formed(),
-            Self::Cuda(former) => former.formed(),
+            Self::Metal(former) => Some(&former.toolchain().identity().material),
+            Self::Cuda(former) => Some(&former.toolchain().identity().material),
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.formed(),
+            Self::Vulkan(former) => Some(&former.toolchain().identity().material),
         }
     }
 
-    /// What compiling `source` takes this device's toolchain when nothing
-    /// serves it ([`ProgramFormer::cold`]); nothing on the CPU backend,
-    /// which compiles nothing at run time.
-    pub(crate) fn cold(
-        &self,
-        source: &seismic_native_target::ProgramSource,
-    ) -> Result<std::time::Duration, seismic_native_target::NativeCompilationError> {
+    /// The native programs this device's toolchain has formed, and the
+    /// time its calls took.
+    pub(crate) fn programs_formed(&self) -> crate::formation::FormedPrograms {
         match self {
-            Self::Cpu => Ok(std::time::Duration::ZERO),
+            Self::Cpu => crate::formation::FormedPrograms::default(),
             #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.cold(source),
-            Self::Cuda(former) => former.cold(source),
+            Self::Metal(former) => former.programs_formed(),
+            Self::Cuda(former) => former.programs_formed(),
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.cold(source),
+            Self::Vulkan(former) => former.programs_formed(),
         }
     }
 
@@ -454,48 +501,17 @@ impl DevicePrograms {
         }
     }
 
-    /// What publishing `sources` on this device does, known before it runs
-    /// ([`ProgramFormer::publication`]).
-    pub(crate) fn publication(
-        &self,
-        sources: &[crate::formation::Keyed],
-    ) -> (crate::formation::FormationClass, usize) {
+    /// Whether this device's toolchain loads a stored program through a
+    /// platform cache ([`seismic_native_target::Load::PlatformCached`]):
+    /// a load the platform no longer serves takes a compile's time.
+    pub(crate) fn platform_cached(&self) -> bool {
         match self {
-            Self::Cpu => (crate::formation::FormationClass::Kept, 0),
+            Self::Cpu => false,
             #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.publication(sources),
-            Self::Cuda(former) => former.publication(sources),
+            Self::Metal(former) => former.platform_cached(),
+            Self::Cuda(former) => former.platform_cached(),
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.publication(sources),
-        }
-    }
-
-    /// How many of `sources` publishing them on this device compiles
-    /// ([`ProgramFormer::publishing_sources`]).
-    pub(crate) fn publishing_sources(&self, sources: &[crate::formation::Keyed]) -> usize {
-        match self {
-            Self::Cpu => 0,
-            #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.publishing_sources(sources),
-            Self::Cuda(former) => former.publishing_sources(sources),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.publishing_sources(sources),
-        }
-    }
-
-    /// Publish `sources` as a later process will request them
-    /// ([`ProgramFormer::publish`]).
-    pub(crate) fn publish(
-        &self,
-        sources: &[seismic_native_target::ProgramSource],
-    ) -> Result<(), seismic_native_target::NativeCompilationError> {
-        match self {
-            Self::Cpu => Ok(()),
-            #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.publish(sources),
-            Self::Cuda(former) => former.publish(sources),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.publish(sources),
+            Self::Vulkan(former) => former.platform_cached(),
         }
     }
 
@@ -534,6 +550,13 @@ impl DevicePrograms {
         };
         former
     }
+}
+
+/// The performance cores the process may run on, as the host's processors
+/// report them: the CPU device's pool (`seismic_cpu::open_host`).
+pub(crate) fn host_cores() -> Result<std::num::NonZeroUsize, String> {
+    let processors = seismic_discovery::Processors::discover().map_err(|error| format!("the host's processors: {error}"))?;
+    std::num::NonZeroUsize::new(processors.performance_cores()).ok_or_else(|| "the process may run on no performance core".to_owned())
 }
 
 fn open_error(error: ExecutionError) -> OpenError {
@@ -588,47 +611,16 @@ impl OpenedKind {
         }
     }
 
-    /// The usage of `kind` storage: its domain's charges, with what the
-    /// backend holds for it beyond them.
-    pub(crate) fn usage(&self, kind: StorageKind) -> crate::memory::MemoryUsage {
-        match (self, kind) {
-            (Self::Cpu(device), StorageKind::Device) => device.memory_usage(),
-            #[cfg(target_os = "macos")]
-            (Self::Metal(device), StorageKind::Device) => device.memory_usage(),
-            (Self::Cuda(device), StorageKind::Device) => device.memory_usage(),
-            (Self::Cpu(device), StorageKind::Upload) => device.upload_usage(),
-            #[cfg(target_os = "macos")]
-            (Self::Metal(device), StorageKind::Upload) => device.upload_usage(),
-            (Self::Cuda(device), StorageKind::Upload) => device.upload_usage(),
-            #[cfg(not(target_os = "macos"))]
-            (Self::Vulkan(device), kind) => device.usage(match kind {
-                StorageKind::Device => seismic_vulkan::PlacedStorage::Device,
-                StorageKind::Upload => seismic_vulkan::PlacedStorage::Upload,
-            }),
-        }
-    }
-
-    /// Hold `kind` storage's domain to `limit`. Charges already made count
-    /// against it; they are never charged twice.
-    pub(crate) fn set_limit(&self, kind: StorageKind, limit: Option<u64>) {
+    /// What the backend holds for fixed buffers of `contract` beyond their
+    /// allocations.
+    pub(crate) fn backend_held(&self, kind: Contract) -> crate::devices::BackendHeld {
         match self {
-            Self::Cpu(device) => device.set_limit(kind, limit),
+            Self::Cpu(device) => device.backend_held(kind),
             #[cfg(target_os = "macos")]
-            Self::Metal(device) => device.set_limit(kind, limit),
-            Self::Cuda(device) => device.set_limit(kind, limit),
+            Self::Metal(device) => device.backend_held(kind),
+            Self::Cuda(device) => device.backend_held(kind),
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(device) => device.set_limit(kind, limit),
-        }
-    }
-
-    pub(crate) fn restart_memory_high_water(&self) {
-        match self {
-            Self::Cpu(device) => device.restart_memory_high_water(),
-            #[cfg(target_os = "macos")]
-            Self::Metal(device) => device.restart_memory_high_water(),
-            Self::Cuda(device) => device.restart_memory_high_water(),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(device) => device.restart_memory_high_water(),
+            Self::Vulkan(device) => device.backend_held(kind),
         }
     }
 
@@ -647,15 +639,16 @@ impl OpenedKind {
     /// one: CUDA's L2. Metal, Vulkan and the CPU route report none.
     pub(crate) fn last_level_cache_bytes(&self) -> Option<u64> {
         match self {
-            Self::Cuda(device) => Some(device.device_description().facts().l2_cache_bytes),
+            Self::Cuda(device) => Some(device.device_description().facts().properties.l2_bytes.get()),
             _ => None,
         }
     }
 
     /// Facts that distinguish performance behavior, for keying per-device
-    /// native tuning, including the toolchain and driver versions. Equal
-    /// identities denote the same device model and configuration; there is
-    /// no ordering or closeness.
+    /// native tuning: the device and its driver. The toolchain that forms
+    /// its programs is its program former's to name
+    /// ([`DevicePrograms::toolchain`]). Equal identities denote the same
+    /// device model and configuration; there is no ordering or closeness.
     pub(crate) fn tuning_identity(&self) -> String {
         match self {
             // The detected tier fixes which native forms exist, and the CPU
@@ -671,27 +664,15 @@ impl OpenedKind {
                     seismic_native_cpu::VERSION
                 )
             }
-            // The OS build ships the Metal compiler, and the NVRTC release
-            // and driver form and run CUDA code: an update can change which
-            // configuration wins.
             #[cfg(target_os = "macos")]
-            Self::Metal(device) => {
-                let facts = device.device_description().facts();
-                format!(
-                    "{};os {}",
-                    facts.tuning_material(),
-                    facts.operating_system()
-                )
-            }
+            Self::Metal(device) => device.device_description().facts().tuning_material(),
+            // The driver runs CUDA code: an update can change which
+            // configuration wins.
             Self::Cuda(device) => {
                 let facts = device.device_description().facts();
-                let nvrtc = seismic_cuda::nvrtc::release().map_or_else(
-                    |error| format!("unavailable ({error})"),
-                    |(major, minor)| format!("{major}.{minor}"),
-                );
                 format!(
-                    "cuda;sm {};multiprocessors {};driver {};nvrtc {nvrtc}",
-                    facts.compute_capability, facts.multiprocessors, facts.driver_api
+                    "cuda;sm {};multiprocessors {};driver {}",
+                    facts.compute_capability, facts.properties.units.get(), facts.driver_api
                 )
             }
             // A driver update changes the key (§7.5).
@@ -750,39 +731,100 @@ impl OpenedKind {
         bytes: u64,
         alignment: u64,
     ) -> Result<Arc<driver::Allocation>, ExecutionError> {
+        self.allocate_in(bytes, alignment, None)
+    }
+
+    pub(crate) fn allocate_in(
+        &self,
+        bytes: u64,
+        alignment: u64,
+        access: Option<Arc<driver::AccessGroup>>,
+    ) -> Result<Arc<driver::Allocation>, ExecutionError> {
         match self {
-            Self::Cpu(device) => device.allocate_storage(bytes, alignment),
+            Self::Cpu(device) => device.allocate_storage_in(bytes, alignment, access),
             #[cfg(target_os = "macos")]
-            Self::Metal(device) => device.allocate_storage(bytes, alignment),
-            Self::Cuda(device) => device.allocate_storage(bytes, alignment),
+            Self::Metal(device) => device.allocate_storage_in(bytes, alignment, access),
+            Self::Cuda(device) => device.allocate_storage_in(bytes, alignment, access),
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(device) => device.allocate(bytes, alignment),
+            Self::Vulkan(device) => device.allocate_in(bytes, alignment, access),
         }
     }
 
-    /// Storage for inputs the host writes before each submission. Host
+    /// Storage that reads zero, backed ([`Self::zeroed`]).
+    pub(crate) fn allocate_zeroed(
+        &self,
+        bytes: u64,
+        alignment: u64,
+    ) -> Result<Arc<driver::Allocation>, ExecutionError> {
+        self.zeroed(self.allocate(bytes, alignment)?, bytes)
+    }
+
+    /// A fixed buffer of a mapped `contract` ([`Self::allocate_mapped`]) that
+    /// reads zero, backed as [`Self::zeroed`] says.
+    pub(crate) fn allocate_mapped_zeroed(
+        &self,
+        contract: Contract,
+        bytes: u64,
+        alignment: u64,
+    ) -> Result<Arc<driver::Allocation>, ExecutionError> {
+        self.zeroed(self.allocate_mapped(contract, bytes, alignment)?, bytes)
+    }
+
+    /// A fixed buffer of `contract`, which the host reaches in place, in the
+    /// kinds its placement names, charged to it. CPU and Metal have one kind.
+    pub(crate) fn allocate_mapped(
+        &self,
+        contract: Contract,
+        bytes: u64,
+        alignment: u64,
+    ) -> Result<Arc<driver::Allocation>, ExecutionError> {
+        match self {
+            Self::Cpu(device) => device.allocate_visible_with(contract, bytes, alignment, |service| {
+                service.allocate(bytes, alignment)
+            }),
+            #[cfg(target_os = "macos")]
+            Self::Metal(device) => device.allocate_visible_with(contract, bytes, alignment, |service| {
+                service.allocate(bytes, alignment)
+            }),
+            Self::Cuda(device) => {
+                let kind = device.memory().kinds(Placing::Fixed(contract))[0];
+                device.allocate_visible_with(contract, bytes, alignment, |service| {
+                    service.allocate_kind(kind, bytes, alignment, None)
+                })
+            }
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(device) => device.allocate_mapped(contract, bytes, alignment),
+        }
+    }
+
+    /// `allocation`, fresh storage of `bytes`, reading zero. The CPU's
+    /// allocations are zero-filled (`alloc_zeroed`) and Metal's are cleared
+    /// by Metal (`newBufferWithLength:options:`), each backed as it is
+    /// wired, so they are written no second time; CUDA's and Vulkan's memory
+    /// holds whatever it held, so it is written with zeros.
+    pub(crate) fn zeroed(
+        &self,
+        allocation: Arc<driver::Allocation>,
+        bytes: u64,
+    ) -> Result<Arc<driver::Allocation>, ExecutionError> {
+        match self {
+            Self::Cpu(_) => {}
+            #[cfg(target_os = "macos")]
+            Self::Metal(_) => {}
+            _ => driver::write_zeros(allocation.storage(), bytes)?,
+        }
+        Ok(allocation)
+    }
+
+    /// Storage for inputs the host only writes before each submission. Host
     /// writes to it are plain memory writes that never wait for queued
-    /// device work: CPU and Metal storage is host-visible already, CUDA uses
-    /// mapped pinned host memory, Vulkan persistently mapped host-visible
-    /// memory (device-local with ReBAR or unified memory).
+    /// device work. The host never reads it: what it reads is `Shared`.
     pub(crate) fn allocate_upload(
         &self,
         bytes: u64,
         alignment: u64,
     ) -> Result<Arc<driver::Allocation>, ExecutionError> {
-        match self {
-            Self::Cpu(device) => device.allocate_upload_with(bytes, alignment, |service| {
-                service.allocate(bytes, alignment)
-            }),
-            #[cfg(target_os = "macos")]
-            Self::Metal(device) => device.allocate_upload_with(bytes, alignment, |service| {
-                service.allocate(bytes, alignment)
-            }),
-            Self::Cuda(device) => device
-                .allocate_upload_with(bytes, alignment, |service| service.allocate_mapped(bytes)),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(device) => device.allocate_upload(bytes, alignment),
-        }
+        self.allocate_mapped(Contract::Upload, bytes, alignment)
     }
 
     pub(crate) fn map_read_only_host_region(
@@ -791,6 +833,14 @@ impl OpenedKind {
         alignment: u64,
     ) -> Result<Arc<driver::Allocation>, ExecutionError> {
         match self {
+            // The CPU reads host memory in place: a buffer over the region's
+            // bytes, its owner held with it (`HostRegion::new`'s contract).
+            Self::Cpu(device) => {
+                let bytes = region.len() as u64;
+                device.allocate_read_only_storage_with(bytes, alignment, |_| {
+                    Ok(unsafe { seismic_cpu::Buffer::borrowed(region.pointer(), bytes, region.owner()) })
+                })
+            }
             #[cfg(target_os = "macos")]
             Self::Metal(device) => {
                 let bytes = region.len() as u64;
@@ -808,91 +858,25 @@ impl OpenedKind {
         }
     }
 
-    /// Zero-filled storage of a reserved tensor: `committed` bytes backed of
-    /// a `reserved`-byte logical length. CUDA with virtual memory management
-    /// reserves the whole address range, so [`OpenedKind::recommit_in_place`]
-    /// keeps its address; elsewhere only the committed bytes are allocated
-    /// and recommitting reallocates.
-    pub(crate) fn allocate_reserved_tensor(
-        &self,
-        committed: u64,
-        reserved: u64,
-        alignment: u64,
-    ) -> Result<Arc<driver::Allocation>, ExecutionError> {
-        if let Self::Cuda(device) = self {
-            if device.service().supports_reservation() {
-                return device.allocate_storage_with(committed, alignment, |service| {
-                    service.allocate_reserved(committed, reserved)
-                });
-            }
-        }
-        let allocation = self.allocate(committed, alignment)?;
-        driver::write_zeros(allocation.storage(), committed)?;
-        Ok(allocation)
-    }
-
-    /// Whether `allocation` is a reserved address range the backend resizes
-    /// in place (CUDA virtual memory management).
-    pub(crate) fn reserves_address(&self, allocation: &Arc<driver::Allocation>) -> bool {
-        let Self::Cuda(_) = self else {
-            return false;
-        };
-        driver::typed_buffer::<seismic_cuda::Cuda, seismic_cuda::Executor>(allocation).is_reserved()
-    }
-
-    /// Device address of an ordinary allocation's first byte. Only Seismic
-    /// uses this to build slab tables; lifetime still follows the allocation.
-    pub(crate) fn allocation_address(&self, allocation: &Arc<driver::Allocation>) -> u64 {
+    /// Device address of byte `offset` of an allocation (of chunked
+    /// storage, a byte of a backed chunk). Only Seismic uses this to build
+    /// slab and record tables; lifetime still follows the allocation.
+    pub(crate) fn allocation_address(&self, allocation: &Arc<driver::Allocation>, offset: u64) -> u64 {
         match self {
             Self::Cpu(_) => driver::typed_buffer::<seismic_cpu::Cpu, CpuExecutor>(allocation)
-                .data_pointer() as u64,
+                .data_pointer() as u64 + offset,
             #[cfg(target_os = "macos")]
-            Self::Metal(_) => {
-                driver::typed_buffer::<seismic_metal::Metal, MetalExecutor>(allocation)
-                    .gpu_address()
-            }
+            Self::Metal(_) => match allocation.storage().as_any().downcast_ref::<MetalReserved>() {
+                Some(MetalReserved(reserved)) => reserved.gpu_address(offset),
+                None => driver::typed_buffer::<seismic_metal::Metal, MetalExecutor>(allocation)
+                    .gpu_address(offset),
+            },
             Self::Cuda(_) => {
-                driver::typed_buffer::<seismic_cuda::Cuda, CudaExecutor>(allocation).pointer()
+                driver::typed_buffer::<seismic_cuda::Cuda, CudaExecutor>(allocation).pointer() + offset
             }
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(_) => vulkan_buffer(allocation).address(),
+            Self::Vulkan(_) => vulkan_address(allocation, offset),
         }
-    }
-
-    /// The storage of `allocation`'s reserved tensor with `committed` bytes
-    /// backed, resized in place when the backend reserved its address range
-    /// (the new allocation shares the address and the kept bytes; bytes past
-    /// the old commitment are zero). It first waits for every device use of
-    /// `allocation`, so a shrink never releases bytes in use. `None` when
-    /// the storage has to be reallocated.
-    pub(crate) fn recommit_in_place(
-        &self,
-        allocation: &Arc<driver::Allocation>,
-        committed: u64,
-        alignment: u64,
-        exclusive_view: bool,
-    ) -> Result<Option<Arc<driver::Allocation>>, ExecutionError> {
-        let Self::Cuda(device) = self else {
-            return Ok(None);
-        };
-        let buffer = driver::typed_buffer::<seismic_cuda::Cuda, seismic_cuda::Executor>(allocation);
-        if !buffer.is_reserved()
-            || !exclusive_view
-            || Arc::strong_count(allocation) != 1
-            || allocation.has_live_predecessor()
-        {
-            return Ok(None);
-        }
-        let _exclusive = allocation.acquire(true);
-        device
-            .recommit_storage_with(
-                allocation,
-                committed,
-                alignment,
-                |service| service.recommit(buffer, committed),
-                |service, current, old_bytes| service.recommit(current, old_bytes).map(|_| ()),
-            )
-            .map(Some)
     }
 
     pub(crate) fn prepare(
@@ -1033,4 +1017,197 @@ where
         prepared,
         device: public_device.clone(),
     }))
+}
+
+impl OpenedKind {
+    /// Zero-filled storage of a reserved tensor of `reservation`'s records,
+    /// its leading `committed` rows backed and charged for what backs them,
+    /// and the resizer that resizes it in place, under a contract the device
+    /// reserves ([`seismic_topology::Executor::reserving`]).
+    pub(crate) fn allocate_reserved_tensor(
+        &self,
+        reservation: driver::ReservedRange,
+        committed: u64,
+        alignment: u64,
+    ) -> Result<driver::Resizer, crate::api::TensorError> {
+        let bytes = reservation.committed_bytes(committed)?;
+        let (reserved, granule) = (reservation.bytes, reservation.span.granule);
+        Ok(match self {
+            Self::Cpu(device) => device.allocate_reservation_with(reservation, bytes, alignment, |cpu| {
+                cpu.allocate_reserved(bytes, reserved, granule).map(|(buffer, resizer)| {
+                    let storage = driver::buffer_storage::<seismic_cpu::Cpu, CpuExecutor>(cpu, buffer);
+                    (storage, ReservedResizer::Cpu(resizer), None)
+                })
+            }),
+            #[cfg(target_os = "macos")]
+            Self::Metal(device) => device.allocate_reservation_with(reservation, bytes, alignment, |metal| {
+                metal
+                    .allocate_reserved(bytes, reserved, granule, reservation.record.get())
+                    .map(|(buffer, resizer)| {
+                        let table = buffer.table();
+                        let storage: Box<dyn driver::Storage> = Box::new(MetalReserved(buffer));
+                        (storage, ReservedResizer::Metal(resizer), Some(table))
+                    })
+            }),
+            Self::Cuda(device) => device.allocate_reservation_with(reservation, bytes, alignment, |cuda| {
+                let (kind, memory) = (device.memory().kinds(Placing::Reserved(reservation.contract))[0], device.memory());
+                let range = seismic_cuda::RangeMemory::of(kind).expect("the rule reserves only in kinds that reserve");
+                let account: Arc<dyn seismic_compiler::executable::MemoryAccount> =
+                    Arc::new(crate::memory::MemoryAccount(memory.placement(Placing::Reserved(reservation.contract)).physical()));
+                cuda.allocate_reserved(bytes, reserved, granule, range, account)
+                    .map(|(buffer, resizer)| {
+                        let storage =
+                            driver::buffer_storage::<seismic_cuda::Cuda, CudaExecutor>(cuda, buffer);
+                        (storage, ReservedResizer::Cuda(resizer), None)
+                    })
+            }),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(device) => device.allocate_reservation(reservation, bytes, alignment),
+        }?)
+    }
+}
+
+/// Metal's reserved storage: chunks the host reads and writes in place
+/// and device work reaches only through record tables. It is no
+/// `MetalBuffer`, so no binding path can bind it.
+#[cfg(target_os = "macos")]
+struct MetalReserved(seismic_metal::ReservedBuffer);
+
+#[cfg(target_os = "macos")]
+impl driver::Storage for MetalReserved {
+    fn read(&self, offset: u64, into: &mut [u8]) -> Result<(), ExecutionError> {
+        self.0.read_bytes(offset, into);
+        Ok(())
+    }
+    fn write(&self, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
+        self.0.write_bytes(offset, bytes);
+        Ok(())
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn host_address(&self) -> Option<std::ptr::NonNull<u8>> {
+        Some(self.0.host_base())
+    }
+}
+
+/// A reserving backend's resizer (`driver::Resizer`): the one reservation's
+/// over the backend's backing (the CPU backend's pages, Metal's granules,
+/// CUDA's reserved memory, Vulkan's chunks).
+pub(crate) enum ReservedResizer {
+    Cpu(host::Resizer<host::Pages>),
+    #[cfg(target_os = "macos")]
+    Metal(host::Resizer<seismic_metal::Granules>),
+    Cuda(seismic_cuda::CudaResizer),
+    #[cfg(not(target_os = "macos"))]
+    Vulkan(seismic_vulkan::VulkanResizer),
+}
+
+/// A reserving backend's prepared commitment.
+pub(crate) enum ReservedPrepared {
+    Cpu(host::Prepared<host::Pages>),
+    #[cfg(target_os = "macos")]
+    Metal(host::Prepared<seismic_metal::Granules>),
+    Cuda(host::Prepared<seismic_cuda::ReservedMemory>),
+    #[cfg(not(target_os = "macos"))]
+    Vulkan(host::Prepared<seismic_vulkan::reservation::Chunks>),
+}
+
+/// A reserving backend's installed commitment, until its release.
+pub(crate) enum ReservedPending {
+    Cpu(host::Pending<host::Pages>),
+    #[cfg(target_os = "macos")]
+    Metal(host::Pending<seismic_metal::Granules>),
+    Cuda(host::Pending<seismic_cuda::ReservedMemory>),
+    #[cfg(not(target_os = "macos"))]
+    Vulkan(host::Pending<seismic_vulkan::reservation::Chunks>),
+}
+
+impl ReservedResizer {
+    /// The backend's prepare of exactly `bytes`; a refusal returns the
+    /// resizer.
+    pub(crate) fn prepare(self, bytes: u64) -> Result<ReservedPrepared, (Self, ExecutionError)> {
+        match self {
+            Self::Cpu(resizer) => resizer.prepare(bytes).map(ReservedPrepared::Cpu).map_err(
+                |(resizer, failure)| {
+                    let error = ExecutionError::AllocationFailed(failure.to_string());
+                    (Self::Cpu(resizer), error)
+                },
+            ),
+            #[cfg(target_os = "macos")]
+            Self::Metal(resizer) => resizer
+                .prepare(bytes)
+                .map(ReservedPrepared::Metal)
+                .map_err(|(resizer, error)| (Self::Metal(resizer), error)),
+            Self::Cuda(resizer) => resizer
+                .prepare(bytes)
+                .map(ReservedPrepared::Cuda)
+                .map_err(|(resizer, error)| (Self::Cuda(resizer), error)),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(resizer) => resizer
+                .prepare(bytes)
+                .map(ReservedPrepared::Vulkan)
+                .map_err(|(resizer, error)| (Self::Vulkan(resizer), error)),
+        }
+    }
+}
+
+impl ReservedPrepared {
+    pub(crate) fn install(self) -> ReservedPending {
+        match self {
+            Self::Cpu(prepared) => ReservedPending::Cpu(prepared.install()),
+            #[cfg(target_os = "macos")]
+            Self::Metal(prepared) => ReservedPending::Metal(prepared.install()),
+            Self::Cuda(prepared) => ReservedPending::Cuda(prepared.install()),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(prepared) => ReservedPending::Vulkan(prepared.install()),
+        }
+    }
+
+    pub(crate) fn abandon(self) -> ReservedResizer {
+        match self {
+            Self::Cpu(prepared) => ReservedResizer::Cpu(prepared.abandon()),
+            #[cfg(target_os = "macos")]
+            Self::Metal(prepared) => ReservedResizer::Metal(prepared.abandon()),
+            Self::Cuda(prepared) => ReservedResizer::Cuda(prepared.abandon()),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(prepared) => ReservedResizer::Vulkan(prepared.abandon()),
+        }
+    }
+}
+
+impl ReservedPending {
+    pub(crate) fn release(self) -> ReservedResizer {
+        match self {
+            Self::Cpu(pending) => ReservedResizer::Cpu(pending.release()),
+            #[cfg(target_os = "macos")]
+            Self::Metal(pending) => ReservedResizer::Metal(pending.release()),
+            Self::Cuda(pending) => ReservedResizer::Cuda(pending.release()),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(pending) => ReservedResizer::Vulkan(pending.release()),
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use seismic_lang::registry::BackendName;
+
+    /// A stored tuning result is valid only for the programs it measured:
+    /// the toolchain that formed them (Metal's: the OS build and the
+    /// language version) is part of the identity it is keyed by.
+    #[test]
+    fn the_tuning_identity_names_the_toolchain() {
+        let device = crate::devices::Devices::discover(&[])
+            .expect("device discovery")
+            .open_backend(BackendName::Metal)
+            .expect("Metal device");
+        let super::OpenedKind::Metal(metal) = &device.kind else {
+            panic!("a Metal device opens as Metal");
+        };
+        let os = metal.device_description().facts().operating_system().to_owned();
+        let toolchain = device.programs.toolchain().expect("Metal forms programs");
+        assert!(toolchain.starts_with(&format!("metal;{os};msl-")));
+        assert!(device.tuning_identity().contains(&format!(";toolchain {toolchain}")));
+    }
 }

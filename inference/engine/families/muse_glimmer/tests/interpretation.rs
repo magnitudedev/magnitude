@@ -40,6 +40,30 @@ fn transforms(weight: &WeightDescriptor) -> &[ImportTransform] {
     &weight.transforms
 }
 
+/// Another model's projector, or its own at another target's width, disagrees with the target.
+#[test]
+fn another_models_projector_is_a_mismatch() {
+    let own = headers::projector("muse-glimmer-30b:gguf:q4");
+    let width = own
+        .value("clip.vision.projection_dim")
+        .and_then(Value::unsigned)
+        .unwrap();
+    for (projector, width) in [
+        (headers::projector("gemma-4-e2b-it-qat:gguf:q4"), width),
+        (own, width + 1),
+    ] {
+        let error =
+            magnitude_family_muse_glimmer::describe_projector(&projector, width, 1e-6).unwrap_err();
+        assert!(
+            matches!(
+                error.reasons[..],
+                [magnitude_artifacts::UnsupportedReason::TargetMismatch { .. }]
+            ),
+            "{error}"
+        );
+    }
+}
+
 #[test]
 fn every_catalog_variant_binds_to_the_released_geometry() {
     let epsilon = f64::from(1e-5f32);

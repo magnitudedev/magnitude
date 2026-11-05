@@ -2,13 +2,15 @@
 //!
 //! Compiling a program compiles its source once, with an explicit
 //! instantiation for each entry that names a template instance, and forms a
-//! pipeline per entry. Metal keeps no compiled bytes: the OS caches compiled
-//! libraries and pipelines itself, in a shader cache this toolchain can
-//! neither read nor query. What it keeps for a source text is a record of
-//! the entry lists it has compiled of that text ([`compiled`]): that this
-//! OS build compiled exactly this program before, for a process using the
-//! same store. Whether the OS still holds what it compiled then is not
-//! knowable here.
+//! pipeline per entry. Its artifact is the source and its entries, not
+//! compiled bytes ([`Load::PlatformCached`]): loading forms the library of
+//! exactly that source and entry list again, whatever entries it is asked
+//! for, so the OS's shader cache serves what the compile formed. That is
+//! measured, not assumed: a load of Qwen3.6 35B Q4 in a process after the
+//! one that compiled it re-forms its 161 libraries and 202 pipelines in
+//! 0.5 s on an M4 Pro, against 70 s compiling them. The former counts and
+//! times every re-formation, so a platform that stops serving them shows
+//! as their time.
 
 use crate::direct::DirectPipeline;
 use crate::facts::{LanguageVersion, MetalFacts};
@@ -18,7 +20,8 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSError, NSString};
 use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLFunction, MTLLibrary};
 use seismic_native_target::{
-    NativeCompilationError, ProgramCache, ProgramSource, Toolchain, ToolchainIdentity,
+    Artifact, Load, NativeCompilationError, ProgramEntry, ProgramSource, ProgramStatistic,
+    Toolchain, ToolchainIdentity,
 };
 
 pub struct MetalToolchain {
@@ -63,66 +66,124 @@ fn host_name(symbol: &str) -> String {
     }
 }
 
-/// One line of a source text's record: the entries a compile of it formed,
-/// in order, each with the group size its pipeline was formed to admit. The
-/// compiled text and every pipeline are functions of the source text and
-/// this list.
-fn compiled(source: &ProgramSource) -> String {
-    source
-        .entries
-        .iter()
-        .map(|entry| match entry.group_size {
-            Some([x, y, z]) => format!("{}@{x}x{y}x{z}", entry.symbol),
-            None => entry.symbol.clone(),
-        })
-        .collect::<Vec<_>>()
-        .join("\t")
+/// A Metal program's artifact: the source text and its entries, which the
+/// OS's shader cache serves the compiled forms of.
+pub struct MetalSource {
+    source: ProgramSource,
 }
 
-/// Whether the record `kept` of a source text names the entry list `line`.
-fn recorded(kept: &[u8], line: &str) -> bool {
-    std::str::from_utf8(kept).is_ok_and(|record| record.lines().any(|kept| kept == line))
+impl Artifact for MetalSource {
+    const ENCODING: u32 = 2;
+
+    /// The text, then each entry: its symbol, whether it states a group
+    /// size and that size, and its constants, as little-endian words and
+    /// length-prefixed strings.
+    fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let word = |bytes: &mut Vec<u8>, value: u32| bytes.extend_from_slice(&value.to_le_bytes());
+        let text = |bytes: &mut Vec<u8>, text: &str| {
+            word(bytes, u32::try_from(text.len()).expect("a source fits u32"));
+            bytes.extend_from_slice(text.as_bytes());
+        };
+        text(&mut bytes, &self.source.text);
+        for entry in &self.source.entries {
+            text(&mut bytes, &entry.symbol);
+            word(&mut bytes, u32::from(entry.group_size.is_some()));
+            for axis in entry.group_size.into_iter().flatten() {
+                word(&mut bytes, axis);
+            }
+            word(&mut bytes, u32::try_from(entry.constants.len()).expect("an entry's constants fit u32"));
+            for constant in &entry.constants {
+                word(&mut bytes, *constant);
+            }
+        }
+        bytes
+    }
+
+    fn decode(mut bytes: &[u8]) -> Option<Self> {
+        fn word(bytes: &mut &[u8]) -> Option<u32> {
+            let value = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
+            *bytes = &bytes[4..];
+            Some(value)
+        }
+        fn text(bytes: &mut &[u8]) -> Option<String> {
+            let length = word(bytes)? as usize;
+            let text = std::str::from_utf8(bytes.get(..length)?).ok()?.to_owned();
+            *bytes = &bytes[length..];
+            Some(text)
+        }
+        let source = text(&mut bytes)?;
+        let mut entries = Vec::new();
+        while !bytes.is_empty() {
+            let symbol = text(&mut bytes)?;
+            let group_size = match word(&mut bytes)? {
+                0 => None,
+                1 => Some([word(&mut bytes)?, word(&mut bytes)?, word(&mut bytes)?]),
+                _ => return None,
+            };
+            let constants = (0..word(&mut bytes)?)
+                .map(|_| word(&mut bytes))
+                .collect::<Option<Vec<_>>>()?;
+            entries.push(ProgramEntry {
+                symbol,
+                group_size,
+                constants,
+            });
+        }
+        Some(Self {
+            source: ProgramSource { text: source, entries },
+        })
+    }
 }
 
 impl Toolchain for MetalToolchain {
+    type Artifact = MetalSource;
     type Program = Vec<DirectPipeline>;
+    const LOAD: Load = Load::PlatformCached;
 
     fn identity(&self) -> &ToolchainIdentity {
         &self.identity
     }
 
-    fn keeps(&self, source: &ProgramSource, kept: &[u8]) -> bool {
-        recorded(kept, &compiled(source))
-    }
-
+    /// The program compiled of `source`, which the OS cache then holds
+    /// for a later load of the artifact.
     fn compile(
         &self,
         source: &ProgramSource,
-        cache: Option<&dyn ProgramCache>,
+    ) -> Result<(MetalSource, Vec<DirectPipeline>), NativeCompilationError> {
+        let program = crate::pooled(|| self.pipelines(source, &source.entries))?;
+        Ok((
+            MetalSource {
+                source: source.clone(),
+            },
+            program,
+        ))
+    }
+
+    fn load(
+        &self,
+        artifact: &MetalSource,
+        entries: &[ProgramEntry],
     ) -> Result<Vec<DirectPipeline>, NativeCompilationError> {
-        let pipelines = crate::pooled(|| self.pipelines(source))?;
-        if let Some(cache) = cache {
-            let line = compiled(source);
-            let kept = cache.get().unwrap_or_default();
-            if !recorded(&kept, &line) {
-                let mut record = String::from_utf8(kept).unwrap_or_default();
-                record.push_str(&line);
-                record.push('\n');
-                cache.put(record.as_bytes());
-            }
-        }
-        Ok(pipelines)
+        crate::pooled(|| self.pipelines(&artifact.source, entries))
+    }
+
+    /// Metal's compiler reports nothing of a pipeline.
+    fn statistics(_: &Vec<DirectPipeline>, _: usize) -> &[ProgramStatistic] {
+        &[]
     }
 }
 
 impl MetalToolchain {
-    /// Compile `source` and form each entry's pipeline.
+    /// Compile `source`'s library and form the pipeline of each of
+    /// `entries`, entries of `source`.
     fn pipelines(
         &self,
         source: &ProgramSource,
+        entries: &[ProgramEntry],
     ) -> Result<Vec<DirectPipeline>, NativeCompilationError> {
         let device = self.device.handle().raw();
-        let functions = form_functions(self.device.handle(), source, self.language)?;
+        let functions = form_functions(self.device.handle(), source, entries, self.language)?;
         let failure =
             |error: Retained<NSError>| NativeCompilationError::ToolchainFailure(error.to_string());
         // Each symbol's pipeline is formed once. An entry's group size is the
@@ -131,8 +192,8 @@ impl MetalToolchain {
         // to admit them; otherwise it shares the symbol's.
         let mut formed: Vec<(&str, Retained<ProtocolObject<dyn MTLComputePipelineState>>)> =
             Vec::new();
-        let mut pipelines = Vec::with_capacity(source.entries.len());
-        for (entry, function) in source.entries.iter().zip(&functions) {
+        let mut pipelines = Vec::with_capacity(entries.len());
+        for (entry, function) in entries.iter().zip(&functions) {
             let natural = match formed.iter().find(|(symbol, _)| *symbol == entry.symbol) {
                 Some((_, state)) => state.clone(),
                 None => {
@@ -169,14 +230,11 @@ impl MetalToolchain {
     }
 }
 
-/// `source`'s library, compiled with an explicit instantiation for each
-/// entry that names a template instance, and each entry's function in entry
-/// order: everything a Metal program is formed from before its pipelines.
-pub fn form_functions(
-    device: &DeviceHandle,
-    source: &ProgramSource,
-    language: LanguageVersion,
-) -> Result<Vec<Retained<ProtocolObject<dyn MTLFunction>>>, NativeCompilationError> {
+/// The text of `source`'s library: its text with an explicit instantiation
+/// for each entry that names a template instance. It depends on the whole
+/// entry list, so a load forms it of every entry its artifact's compile
+/// formed, not only of those it asks for.
+fn library_text(source: &ProgramSource) -> String {
     let mut text = source.text.clone();
     let mut instantiated = Vec::new();
     for entry in &source.entries {
@@ -191,14 +249,26 @@ pub fn form_functions(
             ));
         }
     }
+    text
+}
+
+/// `source`'s library ([`library_text`]) and the function of each of
+/// `entries`, entries of `source`, in their order: everything a Metal
+/// program is formed from before its pipelines.
+pub fn form_functions(
+    device: &DeviceHandle,
+    source: &ProgramSource,
+    entries: &[ProgramEntry],
+    language: LanguageVersion,
+) -> Result<Vec<Retained<ProtocolObject<dyn MTLFunction>>>, NativeCompilationError> {
+    let text = library_text(source);
     crate::pooled(|| {
         let options = crate::profile::compile_options(language);
         let library = device
             .raw()
             .newLibraryWithSource_options_error(&NSString::from_str(&text), Some(&options))
             .map_err(|error| NativeCompilationError::ToolchainFailure(error.to_string()))?;
-        source
-            .entries
+        entries
             .iter()
             .map(|entry| {
                 let name = host_name(&entry.symbol);
@@ -231,7 +301,7 @@ pub fn forms_tensor_operations(device: &DeviceHandle, language: LanguageVersion)
             .to_owned(),
         entries: vec![seismic_native_target::ProgramEntry::named("seismic_tensor_headers")],
     };
-    crate::pooled(|| form_functions(device, &source, language).is_ok())
+    crate::pooled(|| form_functions(device, &source, &source.entries, language).is_ok())
 }
 
 #[cfg(test)]
@@ -243,7 +313,7 @@ mod tests {
     fn native_tensor_operations_use_the_probed_language() {
         let device = crate::test_support::metal_device();
         let facts = crate::profile::open_device(&device).unwrap();
-        if !facts.facts().tensor_ops {
+        if !facts.facts().properties().tensor_ops.holds() {
             return;
         }
         let source = ProgramSource {
@@ -260,50 +330,64 @@ mod tests {
             entries: vec![ProgramEntry::named("tensor_probe")],
         };
         let toolchain = MetalToolchain::new(device, facts.facts());
-        assert_eq!(toolchain.compile(&source, None).unwrap().len(), 1);
+        assert_eq!(toolchain.compile(&source).unwrap().1.len(), 1);
     }
 
-    /// Metal keeps no compiled bytes: it records each entry list it
-    /// compiled of a text, and only a compile of exactly a recorded list is
-    /// one the OS compiled before.
+    /// The artifact keeps the source and its entries whole: a stated group
+    /// size of zeros is not read back as none.
     #[test]
-    fn a_compile_records_its_entry_list_and_only_that_list_is_kept() {
-        struct Kept(std::cell::RefCell<Option<Vec<u8>>>);
-        impl ProgramCache for Kept {
-            fn get(&self) -> Option<Vec<u8>> {
-                self.0.borrow().clone()
-            }
-            fn put(&self, bytes: &[u8]) {
-                *self.0.borrow_mut() = Some(bytes.to_vec());
-            }
-        }
+    fn an_artifact_comes_back_as_it_went() {
+        let source = ProgramSource {
+            text: "kernel void probe() {}".into(),
+            entries: vec![
+                ProgramEntry::named("probe<2>"),
+                ProgramEntry {
+                    symbol: "probe<4>".into(),
+                    group_size: Some([64, 1, 1]),
+                    constants: vec![3, 9],
+                },
+                ProgramEntry {
+                    symbol: "probe<8>".into(),
+                    group_size: Some([0, 0, 0]),
+                    constants: Vec::new(),
+                },
+            ],
+        };
+        let decoded = MetalSource::decode(&MetalSource { source: source.clone() }.encode()).unwrap();
+        assert_eq!(decoded.source, source);
+    }
+
+    /// A load of some of an artifact's entries forms the library its
+    /// compile formed, every instantiation of the compile included, so the
+    /// OS's shader cache serves it; a library of the requested entries
+    /// alone would be another text, which the cache has never seen.
+    #[test]
+    fn a_subset_of_an_artifact_loads_from_the_library_its_compile_formed() {
         let device = crate::test_support::metal_device();
         let facts = crate::profile::open_device(&device)
             .unwrap()
             .facts()
             .clone();
         let toolchain = MetalToolchain::new(device, &facts);
-        let of = |symbols: &[&str]| ProgramSource {
+        let source = ProgramSource {
             text: "#include <metal_stdlib>\nusing namespace metal;\n\
-                   template <uint TILE> kernel void probe(device float* x [[buffer(0)]], uint i [[thread_position_in_grid]]) { x[i] *= TILE; }\n"
+                   template <uint TILE> kernel void probe(device float* x [[buffer(0)]], \
+                   uint i [[thread_position_in_grid]]) { x[i] *= TILE; }\n"
                 .into(),
-            entries: symbols.iter().copied().map(ProgramEntry::named).collect(),
+            entries: vec![ProgramEntry::named("probe<2>"), ProgramEntry::named("probe<4>")],
         };
-        let kept = Kept(std::cell::RefCell::new(None));
-        let two = of(&["probe<2>", "probe<4>"]);
-        toolchain.compile(&two, Some(&kept)).unwrap();
-        let record = kept.get().expect("the compile was recorded");
-        assert!(toolchain.keeps(&two, &record));
-        // Another instantiation list of the same text is another compile.
-        let one = of(&["probe<4>"]);
-        assert!(!toolchain.keeps(&one, &record));
-        toolchain.compile(&one, Some(&kept)).unwrap();
-        let record = kept.get().unwrap();
-        assert!(toolchain.keeps(&one, &record) && toolchain.keeps(&two, &record));
-        // Compiling a recorded list again records nothing more.
-        toolchain.compile(&two, Some(&kept)).unwrap();
-        assert_eq!(kept.get().unwrap(), record);
-        assert!(!toolchain.keeps(&two, b"\xff not a record"));
+        let artifact = MetalSource::decode(&toolchain.compile(&source).unwrap().0.encode()).unwrap();
+        let wanted = [ProgramEntry::named("probe<4>")];
+        assert_eq!(toolchain.load(&artifact, &wanted).unwrap().len(), 1);
+        let formed = library_text(&artifact.source);
+        assert_eq!(formed, library_text(&source));
+        assert_ne!(
+            formed,
+            library_text(&ProgramSource {
+                text: source.text.clone(),
+                entries: wanted.to_vec(),
+            })
+        );
     }
 
     #[test]
@@ -347,7 +431,7 @@ mod tests {
                 },
             ],
         };
-        let pipelines = toolchain.compile(&source, None).unwrap();
+        let pipelines = toolchain.compile(&source).unwrap().1;
         assert_eq!(pipelines.len(), 4);
         for (pipeline, entry) in pipelines.iter().zip(&source.entries) {
             let declared = entry.group_size.map_or(1, |size| size.iter().product::<u32>());
@@ -375,6 +459,6 @@ mod tests {
                 ProgramEntry::named("plain"),
             ],
         };
-        assert_eq!(toolchain.compile(&source, None).unwrap().len(), 3);
+        assert_eq!(toolchain.compile(&source).unwrap().1.len(), 3);
     }
 }

@@ -1,0 +1,11 @@
+// The device's share of a streamed layer's general decode combine
+// (`routed_down_project` in routed.seismic): `routed_down`'s projections
+// (`lib/routed/down.glsl`), each choice's projection published in A for
+// `routed_down_sited`. The Vulkan form of `metal/routed_down_project.metal`.
+#define ROUTED_SOURCE_ROWS SEISMIC_CONST_SOURCE_ROWS
+#define ROUTED_PROJECTED_BASE SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)
+#define ROUTED_PROJECTED_INDEX(m, k, n) \
+    ((m) * SEISMIC_RESULT_0_STRIDE_0 + (k) * SEISMIC_RESULT_0_STRIDE_1 + (n) * SEISMIC_RESULT_0_STRIDE_2)
+#include "lib/routed/down.glsl"
+
+void routed_down_project() { routed_down_publish(); }

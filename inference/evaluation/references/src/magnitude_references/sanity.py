@@ -3,8 +3,7 @@
 A reference is only worth comparing against when the dense model itself predicts the fixture well.
 On out-of-distribution input (for example an instruct model fed untemplated raw text) the dense
 distributions are garbage or near-flat, and any comparison against them measures noise
-(`handoffs/26-10-08/gemma-kv-investigation-postmortem.md`: Gemma 4 12B on raw text had dense
-perplexity 1,232; on chat-templated text 1.90).
+(Gemma 4 12B on raw text had dense perplexity 1,232; on chat-templated text 1.90).
 
 Measured on every emitted row (row at position p, actual next token tokens[p+1], i.e. every scored
 token):

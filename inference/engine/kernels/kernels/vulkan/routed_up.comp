@@ -1,9 +1,14 @@
-// Decode expansion of up-only experts (M <= 8): workgroup row y = choice
-// (m, k), a K1 GEMV over the feature tile `x` of expert routes[m, k]'s up
-// rows with the Activated epilogue A(act(A(us * up))). The Vulkan form of
-// `metal/routed_up.metal`; lane groups are whole subgroups. `us` is the
-// choice's expert's `up_scale` entry where that port is present (static US),
-// else one.
+// Decode expansion of up-only experts (M <= DECODE_ROWS): a K1 GEMV over the
+// feature tile `x` of a chosen expert's up rows (its source's record,
+// `routed_source_weights`: a bank record, or a host tier record read in
+// place; none for a choice with no record, `routed_decode_source`) with the
+// Activated epilogue A(act(A(us * up))).
+// The Vulkan form of `metal/routed_up.metal`; lane groups are whole
+// subgroups. `us` is the choice's expert's `up_scale` entry where that port
+// is present (static US), else one. Two forms, which tuning admits between
+// (GATHERED), as `routed_gate_up`'s: per choice (`routed_up`), or gathered
+// (`routed_up_gather`, then `routed_up_gathered*`: each chosen expert's
+// first choice over the activation rows of every choice of the expert).
 #if SEISMIC_STATIC_US != 0
 #define PROJECTION_SCALED
 #endif
@@ -24,26 +29,64 @@
 #define ROUTED_OPERANDS PROJECTION_OPERANDS_ROUNDED
 #endif
 
-void routed_up() {
+// The GEMV over the up rows of choice `choice`'s expert for `count`
+// activation rows: GEMV row r reads activation row `rows[r]` (0: the
+// choice's own row) and publishes at `outputs[r]` (0: the choice's
+// product), at activation-row bound `maxm`.
+void routed_up_rows(const uint64_t choice, uint64_t rows, uint64_t outputs, uint count, const uint maxm) {
     const uint rows_per_tile = SEISMIC_SUBGROUPS * SEISMIC_TUNE_ROWS;
     const uint tile = gl_WorkGroupID.x;
-    if (uint64_t(tile) * rows_per_tile >= SEISMIC_DIM_F)
-        return;
     const uint hidden = uint(SEISMIC_DIM_H);
-    const uint64_t m = gl_WorkGroupID.y / SEISMIC_DIM_K, k = gl_WorkGroupID.y % SEISMIC_DIM_K;
+    const uint64_t m = choice / SEISMIC_DIM_K, k = choice % SEISMIC_DIM_K;
     const uint64_t expert = uint64_t(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)
         + (m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1) * 4ul));
+    const int source = routed_decode_source(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_DIM_XS,
+        SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, m, k, int(expert));
+    const uint bytes = ELEMENT_BYTES(ROUTED_ACT);
+    const uint64_t own = rows == 0ul ? m * SEISMIC_NORMALIZED_STRIDE_0 * uint64_t(bytes) : 0ul;
     const projection_prologue x = projection_operands(projection_plain(ROUTED_ACT,
-        SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED) + m * SEISMIC_NORMALIZED_STRIDE_0 * uint64_t(ELEMENT_BYTES(ROUTED_ACT)),
-        SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden, 0ul), ROUTED_OPERANDS);
-    const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), PACKETS_W0_STACKED_ROWS,
-        routed_expert_row(expert, SEISMIC_DIM_F), hidden);
-    const projection_epilogue out_ = projection_scaled(projection_activated(ROUTED_ACT,
-            SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)
-                + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * uint64_t(ELEMENT_BYTES(ROUTED_ACT)),
-            0ul, SEISMIC_RESULT_0_STRIDE_2, int(SEISMIC_PARAM_ACTIVATION)),
+        SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED) + own, SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden,
+        rows), ROUTED_OPERANDS);
+    const uint64_t product = outputs == 0ul
+        ? (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * uint64_t(bytes)
+        : 0ul;
+    const projection_weights up = routed_source_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP),
+        SEISMIC_PTR(SEISMIC_BUFFER_TIER_UP), source, PACKETS_W0_STACKED_ROWS, hidden);
+    const projection_epilogue out_ = projection_scaled(projection_gathered(projection_activated(ROUTED_ACT,
+            SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + product, 0ul, SEISMIC_RESULT_0_STRIDE_2,
+            int(SEISMIC_PARAM_ACTIVATION)), outputs),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0, expert),
         1.0);
-    projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_ROWS, 32u, 1u, PROJECTION_NORM_NONE, x, out_, up, up, 1u,
-        uint(SEISMIC_DIM_F), hidden, tile);
+    // A choice with no record reads none: every tile zeroes its rows.
+    if (source == -1) {
+        routed_zero_features(out_, count, tile * rows_per_tile, rows_per_tile, uint(SEISMIC_DIM_F));
+        return;
+    }
+    projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_ROWS, 32u, maxm, PROJECTION_NORM_NONE, x, out_, up, up,
+        count, uint(SEISMIC_DIM_F), hidden, tile);
 }
+
+void routed_up() { routed_up_rows(gl_WorkGroupID.y, 0ul, 0ul, 1u, 1u); }
+
+void routed_up_gather() {
+    routed_gather(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES), SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
+        uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_K), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GATHERED));
+}
+
+// Choice y's GEMV over its expert's rows where it is the expert's first
+// choice (`routed_gather`'s table), at activation-row bound `maxm`.
+void routed_up_gathered_bounded(const uint maxm) {
+    const uint64_t table = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GATHERED)
+        + uint64_t(gl_WorkGroupID.y) * ROUTED_GATHER_WORDS * 4ul;
+    const uint count = uint(element_i32_at(table));
+    if (count == 0u)
+        return;
+    routed_up_rows(gl_WorkGroupID.y, table + 4ul, table + (1ul + uint64_t(SEISMIC_CONST_DECODE_ROWS)) * 4ul, count,
+        maxm);
+}
+
+void routed_up_gathered1() { routed_up_gathered_bounded(1u); }
+void routed_up_gathered2() { routed_up_gathered_bounded(2u); }
+void routed_up_gathered4() { routed_up_gathered_bounded(4u); }
+void routed_up_gathered8() { routed_up_gathered_bounded(8u); }

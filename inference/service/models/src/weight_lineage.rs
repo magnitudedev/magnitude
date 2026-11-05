@@ -340,8 +340,8 @@ mod tests {
 
     /// A real file's weight sample (see the assessment fixtures' README).
     fn sample(name: &str) -> WeightSample {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../engine/fixtures/assessment/weight-samples")
+        let path = crate::test_gguf::assessment_fixtures()
+            .join("weight-samples")
             .join(format!("{name}.json"));
         WeightSample::decode(&std::fs::read(path).expect("weight sample fixture"))
             .expect("weight sample")

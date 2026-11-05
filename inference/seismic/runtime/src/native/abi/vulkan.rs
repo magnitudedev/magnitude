@@ -25,7 +25,7 @@ pub(crate) struct VulkanFeatures {
 
 impl VulkanFeatures {
     /// The features a device with `facts` exposes.
-    pub(crate) fn of(facts: &seismic_vulkan::FormationFacts) -> Self {
+    pub(crate) fn of(facts: &seismic_vulkan::FormationTarget) -> Self {
         Self {
             subgroup_lanes: facts.subgroup_lanes,
             float16: facts.float16,
@@ -82,7 +82,7 @@ pub(crate) fn shared_footprint(shared_bytes: u64) -> u64 {
 const PRELUDE: &str = include_str!("../vulkan_prelude.glsl");
 
 /// Extensions every Vulkan source enables: the device floor's.
-const EXTENSIONS: [&str; 21] = [
+const EXTENSIONS: [&str; 22] = [
     "GL_GOOGLE_cpp_style_line_directive",
     "GL_EXT_buffer_reference",
     "GL_EXT_buffer_reference2",
@@ -104,6 +104,7 @@ const EXTENSIONS: [&str; 21] = [
     "GL_KHR_shader_subgroup_clustered",
     "GL_KHR_shader_subgroup_quad",
     "GL_EXT_shader_subgroup_extended_types_int8",
+    "GL_EXT_shader_atomic_int64",
 ];
 
 /// `#version`, the extensions, the device feature macros and the prelude.
@@ -116,7 +117,6 @@ pub(super) fn header(features: VulkanFeatures) -> String {
         ),
         (features.matrix, "GL_KHR_cooperative_matrix"),
         (features.f32_atomic_add, "GL_EXT_shader_atomic_float"),
-        (features.shared_int64_atomics, "GL_EXT_shader_atomic_int64"),
     ];
     for extension in EXTENSIONS
         .iter()
@@ -243,10 +243,10 @@ void main() {
             eprintln!("no Vulkan GPU meets the floor");
             return;
         };
-        let device = seismic_vulkan::Device::open(description.facts.uuid).expect("device opens");
+        let device = seismic_vulkan::Device::open(description.facts.uuid, crate::backends::vulkan::test_accounts(&description.facts), &Default::default()).expect("device opens");
         let features = VulkanFeatures {
-            subgroup_lanes: device.facts().subgroup_width().lanes(),
-            float16: device.facts().float16,
+            subgroup_lanes: device.formation().subgroup_lanes,
+            float16: device.formation().float16,
             matrix: false,
             wide_accumulators: false,
             mixed_dot: false,
@@ -254,19 +254,16 @@ void main() {
             shared_int64_atomics: false,
         };
         let source = format!("{}{KERNEL}", header(features));
-        let module = VulkanToolchain::new(device.clone())
-            .compile(
-                &ProgramSource {
-                    text: source,
-                    entries: vec![ProgramEntry {
-                        symbol: "numerics".into(),
-                        group_size: Some([64, 1, 1]),
-                        constants: Vec::new(),
-                    }],
-                },
-                None,
-            )
-            .expect("the numerics kernel forms");
+        let toolchain = VulkanToolchain::new(device.clone());
+        let source = ProgramSource {
+            text: source,
+            entries: vec![ProgramEntry {
+                symbol: "numerics".into(),
+                group_size: Some([64, 1, 1]),
+                constants: Vec::new(),
+            }],
+        };
+        let (_, module) = toolchain.compile(&source).expect("the numerics kernel forms");
 
         let specials = [
             0.0f32,
@@ -341,6 +338,7 @@ void main() {
                 words: &[],
                 scalar_results: Some((&data, 0)),
                 groups: [u64::from(count.div_ceil(64)), 1, 1],
+                grid: None,
             })
             .expect("launch");
         batch
@@ -354,7 +352,7 @@ void main() {
         // Without `DenormPreserve 32` the driver's default applies (NVIDIA:
         // flush to zero, §7.3): `fma` with a subnormal operand or result is
         // then outside the oracle. The integer paths preserve subnormals.
-        let flushes = !device.facts().denorm_preserve_32;
+        let flushes = !device.properties().denorm_preserve_32.holds();
         let subnormal = |value: f32| value.is_subnormal();
         let mut failures = Vec::new();
         for (index, (a, b, c)) in cases.iter().enumerate() {
@@ -443,9 +441,9 @@ void main() {
             eprintln!("no Vulkan GPU meets the floor");
             return;
         };
-        let device = seismic_vulkan::Device::open(description.facts.uuid).expect("device opens");
+        let device = seismic_vulkan::Device::open(description.facts.uuid, crate::backends::vulkan::test_accounts(&description.facts), &Default::default()).expect("device opens");
         let features = VulkanFeatures {
-            subgroup_lanes: device.facts().subgroup_width().lanes(),
+            subgroup_lanes: device.formation().subgroup_lanes,
             float16: false,
             matrix: false,
             wide_accumulators: false,
@@ -454,19 +452,16 @@ void main() {
             shared_int64_atomics: false,
         };
         let source = format!("{}{HALVES}", header(features));
-        let module = VulkanToolchain::new(device.clone())
-            .compile(
-                &ProgramSource {
-                    text: source,
-                    entries: vec![ProgramEntry {
-                        symbol: "halves".into(),
-                        group_size: Some([64, 1, 1]),
-                        constants: Vec::new(),
-                    }],
-                },
-                None,
-            )
-            .expect("the conversion kernel forms");
+        let toolchain = VulkanToolchain::new(device.clone());
+        let source = ProgramSource {
+            text: source,
+            entries: vec![ProgramEntry {
+                symbol: "halves".into(),
+                group_size: Some([64, 1, 1]),
+                constants: Vec::new(),
+            }],
+        };
+        let (_, module) = toolchain.compile(&source).expect("the conversion kernel forms");
 
         let mut inputs = Vec::new();
         for half in 0..=u16::MAX {
@@ -511,6 +506,7 @@ void main() {
                 words: &[],
                 scalar_results: Some((&data, 0)),
                 groups: [u64::from(count.div_ceil(64)), 1, 1],
+                grid: None,
             })
             .expect("launch");
         batch

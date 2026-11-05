@@ -52,35 +52,111 @@ pub struct ToolchainIdentity {
     pub material: String,
 }
 
-/// Bytes a toolchain keeps between processes for one program source.
-pub trait ProgramCache {
-    /// The kept bytes, or `None` on a miss or any failure.
-    fn get(&self) -> Option<Vec<u8>>;
-    /// Keep `bytes`, replacing what was kept. Failures are the cache's to
-    /// report; compiling never fails for them.
-    fn put(&self, bytes: &[u8]);
+/// How a backend's stored artifact serves a later process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Load {
+    /// The artifact is everything that serves the program on this device
+    /// and driver: loading it compiles nothing, and a load that would have
+    /// to compile fails.
+    Complete,
+    /// The artifact names the program, and loading it forms the program
+    /// again through the platform's own cache of what it compiled (Metal's
+    /// shader cache). What loading takes is the platform's: the former
+    /// counts these loads and the time they take, which is what shows
+    /// whether the platform still serves them.
+    PlatformCached,
 }
 
-/// A backend's compiler for one opened device.
+/// What a toolchain compiles and the store keeps, as bytes.
+pub trait Artifact: Sized + Send + Sync {
+    /// The version of [`Artifact::encode`]'s format, part of every key the
+    /// artifact is stored under: a changed encoding takes a new version, so
+    /// the bytes kept under a key always decode.
+    const ENCODING: u32;
+    fn encode(&self) -> Vec<u8>;
+    /// The artifact `bytes` encode; none when they do not.
+    fn decode(bytes: &[u8]) -> Option<Self>;
+}
+
+/// A backend's compiler for one opened device. A program is had in one of
+/// two ways: [`compile`] turns source into an artifact and the program it
+/// formed, and [`load`] makes the program of an artifact.
+///
+/// The runtime's program former is this trait's one caller outside tests,
+/// and nothing else forms the programs a process serves. It keys every artifact by the
+/// source and the toolchain's identity ([`ToolchainIdentity`]) and stores
+/// it, so whenever no live compile holds a program, in this process or a
+/// later one, it is loaded ([`Load`] says what that takes). What compiles
+/// outside it serves nothing: the device probes that toolchain identity is
+/// made of, which precede any toolchain; the device-property probes, which
+/// the measurement job runs in probe processes of their own; the
+/// analytical-service probes, whose measurements feed the estimator;
+/// offline coverage of whether a
+/// program forms; and Seismic's compiler of entries without a native
+/// implementation, which no load runs.
+///
+/// [`compile`]: Toolchain::compile
+/// [`load`]: Toolchain::load
 pub trait Toolchain: Send + Sync {
+    type Artifact: Artifact;
     /// The executable program: one handle per requested entry, in order.
     type Program: Send + Sync + 'static;
+    const LOAD: Load;
 
+    /// The compiler, target, options, device and driver: what keys every
+    /// artifact beside its source.
     fn identity(&self) -> &ToolchainIdentity;
 
-    /// Whether `kept`, what this toolchain kept for `source`'s text, makes
-    /// [`Toolchain::compile`] of `source` run no compiler of this
-    /// toolchain's own: the kept artifact holds every requested entry. A
-    /// toolchain that keeps no compiled bytes says what its kept bytes do
-    /// establish.
-    fn keeps(&self, source: &ProgramSource, kept: &[u8]) -> bool;
-
-    /// The program of `source`'s entries. `cache`, when given, holds what
-    /// this toolchain kept for the same source text; a toolchain that keeps
-    /// nothing ignores it.
+    /// The artifact of `source`'s entries, and the program the compile
+    /// formed of them, which the caller uses instead of loading it again
+    /// from the artifact.
     fn compile(
         &self,
         source: &ProgramSource,
-        cache: Option<&dyn ProgramCache>,
+    ) -> Result<(Self::Artifact, Self::Program), NativeCompilationError>;
+
+    /// The program of `entries` from `artifact`, compiled of a source
+    /// holding them, when no live compile holds them. For a
+    /// [`Load::Complete`] toolchain it compiles nothing: what the artifact
+    /// does not serve without compiling fails.
+    fn load(
+        &self,
+        artifact: &Self::Artifact,
+        entries: &[ProgramEntry],
     ) -> Result<Self::Program, NativeCompilationError>;
+
+    /// What the backend's compiler reports `program`'s entry `entry` uses
+    /// ([`ProgramStatistic`]), read from the driver when the program was
+    /// formed; none for a backend whose compiler reports nothing.
+    fn statistics(program: &Self::Program, entry: usize) -> &[ProgramStatistic];
+}
+
+/// What one launch's formed program uses: the threads of its workgroup,
+/// where formation fixes them, and the statistics its backend's compiler
+/// reports of it.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LaunchProgram {
+    pub threads: Option<u64>,
+    pub statistics: Vec<ProgramStatistic>,
+}
+
+/// One statistic a backend's compiler reports of a formed program, named
+/// and described as the backend reports it: CUDA's function attributes,
+/// Vulkan's pipeline executable statistics. Both backends read them from
+/// the driver of every program they form, compiled or loaded, so no
+/// artifact carries them.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProgramStatistic {
+    pub name: String,
+    pub description: String,
+    pub value: StatisticValue,
+}
+
+/// A reported statistic's value, in the type it is reported in.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum StatisticValue {
+    Bool(bool),
+    Int(i64),
+    Uint(u64),
+    Float(f64),
 }

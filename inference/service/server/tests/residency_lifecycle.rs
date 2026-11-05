@@ -5,11 +5,11 @@
 //! idle release.
 //!
 //! A test without the libtest harness: it runs on a device host with two models in its store,
-//! and without `--bundle` (a plain `cargo test`) it has nothing to run on and says so. On a host
-//! of the rig, `{catalog}` being the catalog's header export:
+//! and without `--bundle` (a plain `cargo test`) it has nothing to run on and says so. On such a
+//! host, `{catalog}` being the catalog's header export:
 //!
 //! ```text
-//! mrig test --catalog ... -- -p magnitude-service-server --test residency_lifecycle -- \
+//! cargo test -p magnitude-service-server --test residency_lifecycle -- \
 //!     --bundle {catalog}/model-planner-inputs.bundle --cache-root {checkout} --model-store {models} \
 //!     --hf-cache DIR --first REPO_SUBSTRING --second REPO_SUBSTRING
 //! ```
@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
-use magnitude_executor::platform::MemoryReserves;
+use magnitude_executor::platform::{HostEmergency, MemoryReserves};
 use magnitude_service_api::{AppState, app};
 use magnitude_service_contracts::HardwareProvider;
 use magnitude_service_contracts::models::{
@@ -64,8 +64,10 @@ impl HostMemoryObserver for ScriptedHostMemory {
         let sample = self.seismic.sample()?;
         Ok(match self.headroom.load(Ordering::Acquire) {
             NO_OVERRIDE => sample,
+            // A scripted shortage is an emergency.
             headroom_bytes => HostMemorySample {
                 headroom_bytes,
+                emergency: Some(HostEmergency::EmergencyReserve),
                 ..sample
             },
         })
@@ -130,6 +132,7 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
         inventory.derived_cache().kernel_directory(),
         reserves,
         serving,
+        Default::default(),
     ));
     let harness = |idle_timeout: Duration, namespace: &str| {
         let instances = ModelInstances::start(ResidencyEnvironment {

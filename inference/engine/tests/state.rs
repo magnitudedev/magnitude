@@ -1,11 +1,15 @@
 use magnitude_state::{
     BankCapacity, CodecSpec, ComponentDescriptor, ComponentSpec, HistoryDomainId,
     HistoryDomainLayout, HistoryDomainPlan, Holder, LayerRef, OwnedAdvanceResolution,
-    OwnedStateAdvance, SequenceState, StateStore, StoreBindings,
+    OwnedStateAdvance, OwnedTailRelocation, SLAB_ROW_TILE, SequenceState, StateStore,
+    StoreBindings,
 };
 
 /// The one history domain of these stores.
 const TOKEN: HistoryDomainId = HistoryDomainId(0);
+/// The rows of a history page of these stores: the smallest page, as their
+/// short histories keep every span limit with it.
+const PAGE: usize = SLAB_ROW_TILE;
 
 /// Rows referenced in every history domain of the store.
 fn occupied(store: &StateStore) -> usize {
@@ -19,7 +23,7 @@ use std::rc::Rc;
 fn device() -> Device {
     seismic::Devices::discover(&[])
         .unwrap()
-        .open_backend(BackendName::Metal)
+        .open_backend(BackendName::Cpu)
         .unwrap()
 }
 fn write(tensor: &Tensor, bytes: &[u8]) -> Result<(), magnitude_state::Error> {
@@ -44,17 +48,24 @@ fn history_component(width: usize, dtype: DType) -> ComponentDescriptor {
     )
     .unwrap()
 }
+/// A store of histories of at most 16 rows, with four history pages: as
+/// many histories as pages can each take one.
 fn store(history: bool, values: bool) -> StoreBindings {
+    store_with(history, values, 16, 4)
+}
+/// A store of histories of at most `context` rows, with `pages` history
+/// pages.
+fn store_with(history: bool, values: bool, context: usize, pages: usize) -> StoreBindings {
     StateStore::new(
         Rc::new(device()),
-        16,
+        context,
         16,
         if history {
             vec![HistoryDomainPlan {
                 layout: HistoryDomainLayout::Token {
                     components: vec![history_component(4, DType::F32)],
                 },
-                logical_rows: 32,
+                logical_rows: pages * PAGE,
             }]
         } else {
             vec![]
@@ -76,8 +87,28 @@ fn store(history: bool, values: bool) -> StoreBindings {
     .unwrap()
     .1
 }
+/// An advance of `count` rows, or the panic of its refusal.
+fn begin(state: SequenceState, count: usize) -> OwnedStateAdvance {
+    OwnedStateAdvance::begin(state, count)
+        .unwrap_or_else(|(_, error)| panic!("an advance of {count} rows was refused: {error}"))
+}
+/// `state`'s blocked last page of `domain` moved to a free page of its own:
+/// its rows copied on the host, then the relocation committed.
+fn relocate(state: SequenceState, domain: HistoryDomainId) -> SequenceState {
+    let relocation = OwnedTailRelocation::prepare(state, domain)
+        .unwrap_or_else(|(_, error)| panic!("the relocation was refused: {error}"));
+    let copy = relocation.copy();
+    for plane in copy.copies() {
+        let tensor = &copy.planes()[plane.plane_index];
+        for (&from, &to) in plane.from.iter().zip(&plane.to) {
+            let row = read(&tensor.slice_leading(from as u64, from as u64 + 1).unwrap());
+            write(&tensor.slice_leading(to as u64, to as u64 + 1).unwrap(), &row).unwrap();
+        }
+    }
+    relocation.commit()
+}
 fn accept(store: &StateStore, state: SequenceState, count: usize) -> SequenceState {
-    let advance = OwnedStateAdvance::begin(state, count).ok().unwrap();
+    let advance = begin(state, count);
     if store.has_recurrent_components() {
         let successor = bank(store, advance.bindings().following_bank);
         write(&successor, &vec![0; successor.byte_len() as usize]).unwrap();
@@ -88,23 +119,37 @@ fn accept(store: &StateStore, state: SequenceState, count: usize) -> SequenceSta
     next
 }
 #[test]
-#[ignore = "requires a Metal device"]
 fn shared_prefix_private_tail_and_parent_first_drop() {
     let store = store(true, true);
     let mut parent = store.create().unwrap();
     parent = accept(&store, parent, 8);
     let checkpoint = parent.checkpoint();
-    let mut branches = (0..6).map(|_| checkpoint.fork()).collect::<Vec<_>>();
-    assert_eq!(occupied(&store), 8);
-    assert!(branches.iter().all(|b| b.history_ranges(TOKEN) == [(0, 8)]));
+    // The parent grows in place within its last page: a checkpoint, unlike
+    // a live fork ending there, takes no row.
     parent = accept(&store, parent, 2);
+    assert_eq!(parent.history_ranges(TOKEN), [(0, 10)]);
+    let mut branches = (0..6).map(|_| checkpoint.fork()).collect::<Vec<_>>();
+    assert_eq!(occupied(&store), 10);
+    assert!(branches.iter().all(|b| b.history_ranges(TOKEN) == [(0, 8)]));
+    // A branch whose last page the parent continued relocates that page's
+    // rows to a free page of its own before it grows: refused until then.
     let branch = branches.remove(0);
-    branches.insert(0, accept(&store, branch, 3));
+    assert!(branch.blocked_tails().contains(&TOKEN));
+    let Err((branch, _)) = OwnedStateAdvance::begin(branch, 3) else {
+        panic!("a blocked last page must relocate before it grows");
+    };
+    let branch = accept(&store, relocate(branch, TOKEN), 3);
     assert_eq!(checkpoint.position(), 8);
-    // The parent grew in place into [8, 10); the branch starts mid-hole.
-    assert_eq!(branches[0].history_ranges(TOKEN), [(0, 8), (19, 3)]);
+    // Its copied prefix and its new rows are one run from the start of a
+    // page apart from the parent's.
+    let &[(start, rows)] = branch.history_ranges(TOKEN).as_slice() else {
+        panic!("a relocated history holds one run");
+    };
+    assert_eq!((start % PAGE, rows), (0, 11));
+    assert!(start >= PAGE);
+    branches.insert(0, branch);
     assert_eq!(branches[1].history_ranges(TOKEN), [(0, 8)]);
-    assert_eq!(occupied(&store), 13);
+    assert_eq!(occupied(&store), 21);
     drop(parent);
     drop(checkpoint);
     assert_eq!(branches[0].position(), 11);
@@ -113,7 +158,6 @@ fn shared_prefix_private_tail_and_parent_first_drop() {
     assert!(store.idle());
 }
 #[test]
-#[ignore = "requires a Metal device"]
 fn failed_and_aborted_work_cannot_publish_or_recycle_early() {
     let store = store(true, true);
     let state = store.create().unwrap();
@@ -150,7 +194,6 @@ fn failed_and_aborted_work_cannot_publish_or_recycle_early() {
     assert_eq!(advance.bindings().destinations[0], [0, 1, 2, 3, 4]);
 }
 #[test]
-#[ignore = "requires a Metal device"]
 fn accepted_component_versions_survive_checkpoint_and_fork() {
     let store = store(false, true);
     let parent = store.create().unwrap();
@@ -173,40 +216,51 @@ fn accepted_component_versions_survive_checkpoint_and_fork() {
     assert_eq!(occupied(&store), 0);
 }
 #[test]
-#[ignore = "requires a Metal device"]
 fn fragmented_reservation_and_capacity_failure_are_atomic() {
-    let store = store(true, false);
-    let a = accept(&store, store.create().unwrap(), 8);
+    // Three pages, and histories long enough to outgrow one.
+    let store = store_with(true, false, 2 * PAGE, 3);
+    let a = accept(&store, store.create().unwrap(), PAGE - 6);
     let b = accept(&store, store.create().unwrap(), 8);
     let c = accept(&store, store.create().unwrap(), 8);
-    assert_eq!(b.history_ranges(TOKEN), [(16, 8)]);
-    // Placement: a [0, 8), b mid-hole [16, 24), c [8, 16).
+    // A fresh history takes the free run at row 0 from its start, else the
+    // middle page of the largest free run.
+    assert_eq!(a.history_ranges(TOKEN), [(0, PAGE - 6)]);
+    assert_eq!(b.history_ranges(TOKEN), [(PAGE, 8)]);
+    assert_eq!(c.history_ranges(TOKEN), [(2 * PAGE, 8)]);
+    // a's last page holds 6 more rows and no page is free: 16 more are
+    // refused, and nothing changes.
+    let Err((a, _)) = OwnedStateAdvance::begin(a, 16) else {
+        panic!("an advance past every free row must be refused");
+    };
+    assert_eq!(a.position(), PAGE - 6);
+    assert_eq!(occupied(&store), PAGE + 10);
+    // With c's page free, a's 16 rows are one reservation over two holes:
+    // in place to its page's end, then that page.
     drop(c);
-    let advance = OwnedStateAdvance::begin(a, 8).ok().unwrap();
-    assert_eq!(advance.bindings().destinations[0], (8..16).collect::<Vec<_>>());
-    let _a = advance.abort();
-    assert_eq!(occupied(&store), 16);
-    let d = store.create().unwrap();
-    let advance = OwnedStateAdvance::begin(d, 16).ok().unwrap();
-    assert_eq!(
-        advance.bindings().destinations[0],
-        (8..16).chain(24..32).collect::<Vec<_>>()
-    );
-    let OwnedAdvanceResolution::Committed(d) = advance.commit_all().ok().unwrap() else {
+    let destinations = (PAGE - 6..PAGE).chain(2 * PAGE..2 * PAGE + 10).collect::<Vec<_>>();
+    let advance = begin(a, 16);
+    assert_eq!(advance.bindings().destinations[0], destinations);
+    let a = advance.abort();
+    assert_eq!(occupied(&store), PAGE + 2);
+    let advance = begin(a, 16);
+    assert_eq!(advance.bindings().destinations[0], destinations);
+    let OwnedAdvanceResolution::Committed(a) = advance.commit_all().ok().unwrap() else {
         panic!("full advance must commit");
     };
-    assert_eq!(occupied(&store), 32);
+    assert_eq!(a.history_ranges(TOKEN), [(0, PAGE), (2 * PAGE, 10)]);
+    assert_eq!(occupied(&store), PAGE + 18);
+    // No page is free: a fresh history is refused, and nothing changes.
     let e = store.create().unwrap();
     let Err((e, _)) = OwnedStateAdvance::begin(e, 1) else {
         panic!("exhausted arena must reject reservation");
     };
     assert_eq!(e.position(), 0);
-    assert_eq!(occupied(&store), 32);
-    drop(d);
-    assert_eq!(occupied(&store), 16);
+    assert_eq!(occupied(&store), PAGE + 18);
+    drop(a);
+    assert_eq!(occupied(&store), 8);
+    drop(b);
 }
 #[test]
-#[ignore = "requires a Metal device"]
 fn trim_preserves_checkpoint_logical_history_and_position() {
     let store = store(true, true);
     let mut parent = store.create().unwrap();
@@ -220,13 +274,15 @@ fn trim_preserves_checkpoint_logical_history_and_position() {
     let original = checkpoint.fork();
     assert_eq!(fork.history_ranges(TOKEN), [(5, 3)]);
     assert_eq!(original.history_ranges(TOKEN), [(0, 8)]);
+    // Live forks ending at the parent's row would make it relocate; the
+    // checkpoints, which keep its rows, do not.
+    drop(fork);
+    drop(original);
     parent = accept(&store, parent, 2);
     parent.trim_history(8).unwrap();
     assert_eq!(parent.history_ranges(TOKEN), [(8, 2)]);
     assert_eq!(occupied(&store), 10);
-    drop(original);
     drop(checkpoint);
-    drop(fork);
     drop(descendant);
     assert_eq!(occupied(&store), 2);
     parent.trim_history(10).unwrap();
@@ -234,7 +290,6 @@ fn trim_preserves_checkpoint_logical_history_and_position() {
     assert_eq!(parent.position(), 10);
 }
 #[test]
-#[ignore = "requires a Metal device"]
 fn adjacent_claims_merge_but_checkpoint_boundaries_do_not_grow() {
     let store = store(true, false);
     let mut a = store.create().unwrap();
@@ -261,7 +316,6 @@ fn adjacent_claims_merge_but_checkpoint_boundaries_do_not_grow() {
     assert_eq!(occupied(&store), 3);
 }
 #[test]
-#[ignore = "requires a Metal device"]
 fn idle_arena_release_and_value_only_or_history_only_sequences() {
     for (history, values) in [(true, false), (false, true), (true, true)] {
         let mut store = store(history, values);
@@ -273,10 +327,14 @@ fn idle_arena_release_and_value_only_or_history_only_sequences() {
         let old = store.history_planes().unwrap();
         let checkpoint = parent.checkpoint();
         let mut branch = checkpoint.fork();
+        // A branch ending at its live parent's row relocates it first.
+        if history {
+            branch = relocate(branch, TOKEN);
+        }
         branch = accept(&store, branch, 2);
         assert_eq!(parent.position(), 4);
         assert_eq!(branch.position(), 6);
-        assert_eq!(occupied(&store), if history { 6 } else { 0 });
+        assert_eq!(occupied(&store), if history { 10 } else { 0 });
         drop(parent);
         drop(branch);
         drop(checkpoint);
@@ -308,7 +366,6 @@ fn idle_arena_release_and_value_only_or_history_only_sequences() {
     }
 }
 #[test]
-#[ignore = "requires a Metal device"]
 fn context_and_anticipation_bounds() {
     let store = store(true, true);
     let mut state = store.create().unwrap();
@@ -330,7 +387,6 @@ fn context_and_anticipation_bounds() {
 }
 
 #[test]
-#[ignore = "requires a Metal device"]
 fn reclamation_counts_selected_handles_once_and_respects_checkpoint_pins() {
     let store = store(true, true);
     let reclaimable = |states: &[&SequenceState]| {
@@ -354,11 +410,15 @@ fn reclamation_counts_selected_handles_once_and_respects_checkpoint_pins() {
     drop(checkpoint);
     assert_eq!(reclaimable(&[&parent]), 0);
     assert_eq!(reclaimable(&[&parent, &fork, &parent]), 48);
-    // An in-flight advance from the fork pins the shared row and bank.
-    let fork = OwnedStateAdvance::begin(fork, 1).ok().unwrap();
-    assert_eq!(reclaimable(&[&parent]), 0);
-    let fork = fork.abort();
+    // An in-flight advance from the fork pins the shared row and bank. A
+    // checkpoint holds them with it here: a live parent ending at that row
+    // would make the fork relocate it rather than share it.
+    let pinned = parent.checkpoint();
     drop(parent);
+    let fork = OwnedStateAdvance::begin(fork, 1).ok().unwrap();
+    assert_eq!(store.exclusive_bytes(&[Holder::Checkpoint(&pinned)]).unwrap(), 0);
+    let fork = fork.abort();
+    drop(pinned);
     assert_eq!(reclaimable(&[&fork]), 48);
     let other = StateStore::new(
         Rc::new(device()),
@@ -378,13 +438,12 @@ fn reclamation_counts_selected_handles_once_and_respects_checkpoint_pins() {
 }
 
 #[test]
-#[ignore = "requires a Metal device"]
 fn owned_advances_reconcile_independently_after_shared_completion() {
     let mut store = store(true, true);
     let first = store.create().unwrap();
     let second = store.create().unwrap();
-    let first_advance = OwnedStateAdvance::begin(first, 2).ok().unwrap();
-    let second_advance = OwnedStateAdvance::begin(second, 1).ok().unwrap();
+    let first_advance = begin(first, 2);
+    let second_advance = begin(second, 1);
     let first_bindings = first_advance.bindings();
     let second_bindings = second_advance.bindings();
     assert!(first_bindings.history[0]

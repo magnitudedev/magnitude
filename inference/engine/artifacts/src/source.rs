@@ -81,7 +81,8 @@ impl FileSource {
     /// links, and a split GGUF finds its shards by that name.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = std::path::absolute(path.as_ref())?;
-        let file = File::open(&path)?;
+        // Its reads fill the cache with the ranges they name, no more.
+        let file = crate::reader::open_cached(&path)?;
         let metadata = file.metadata()?;
         if !metadata.is_file() {
             return Err(Error::Invalid(
@@ -101,6 +102,12 @@ impl FileSource {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The file this source has open, which its readers read
+    /// ([`crate::ArtifactReader::of`]).
+    pub(crate) fn file(&self) -> &File {
+        &self.file
     }
 
     pub fn metadata(&self) -> Result<std::fs::Metadata, Error> {
@@ -213,6 +220,50 @@ impl FileSource {
             source: self,
             offset: 0,
         }
+    }
+
+    /// A reader of the `length` bytes from `offset`, whose pages the cache
+    /// reads ahead of the reads as one range (on Linux, `POSIX_FADV_WILLNEED`
+    /// over exactly it): the file reads ahead of no range on its own
+    /// ([`FileSource::open`]), so a range read whole asks for all of it. An
+    /// empty range asks for nothing.
+    pub fn range(&self, offset: u64, length: u64) -> Result<io::Take<SourceReader<'_>>, Error> {
+        offset
+            .checked_add(length)
+            .filter(|end| *end <= self.size)
+            .ok_or_else(|| Error::Invalid("read outside artifact".into()))?;
+        if let Some(length) = std::num::NonZeroU64::new(length) {
+            self.will_need(offset, length)?;
+        }
+        Ok(SourceReader {
+            source: self,
+            offset,
+        }
+        .take(length))
+    }
+
+    /// Ask the cache to read the `length` bytes from `offset` ahead. Never
+    /// empty: advice of length zero means "to the end of the file".
+    #[cfg(target_os = "linux")]
+    fn will_need(&self, offset: u64, length: std::num::NonZeroU64) -> Result<(), Error> {
+        let (start, count) = (libc::off_t::try_from(offset), libc::off_t::try_from(length.get()));
+        let (Ok(start), Ok(count)) = (start, count) else {
+            return Err(Error::Invalid("artifact range exceeds the host file domain".into()));
+        };
+        // SAFETY: advice on a range of a descriptor this source owns.
+        let advised = unsafe {
+            libc::posix_fadvise(self.file.as_raw_fd(), start, count, libc::POSIX_FADV_WILLNEED)
+        };
+        if advised != 0 {
+            return Err(io::Error::from_raw_os_error(advised).into());
+        }
+        Ok(())
+    }
+
+    /// The platform reads ahead as reads go.
+    #[cfg(not(target_os = "linux"))]
+    fn will_need(&self, _offset: u64, _length: std::num::NonZeroU64) -> Result<(), Error> {
+        Ok(())
     }
 }
 

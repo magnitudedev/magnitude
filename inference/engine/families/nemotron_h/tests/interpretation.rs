@@ -606,11 +606,15 @@ fn text_input_takes_absolute_positions_and_rejects_media_and_foreign_tokens() {
     );
 }
 
+/// A header given as a projector that is no projector at all is unreadable as one.
 #[test]
-fn a_projector_other_than_nemotron_omni_is_rejected() {
+fn a_header_that_is_no_projector_is_rejected_as_unreadable() {
     let directory = lightning_q8();
     let error = inspect_components(&directory, Some(&directory), identity()).unwrap_err();
-    assert!(matches!(error, Error::Projector(_)));
+    assert_eq!(
+        error,
+        Error::ProjectorIdentity(magnitude_family_common::ProjectorIdentityError::NotProjector)
+    );
     assert!(matches!(
         error.reasons().as_slice(),
         [UnsupportedReason::Unreadable]

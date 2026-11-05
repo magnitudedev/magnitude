@@ -93,16 +93,22 @@ export const deriveHardwareRoles = (hardware: LocalInferenceHardware): LocalHard
   }
 }
 
-const domainLabel = (
+/** Every memory domain's name: system or unified memory, or a device's accelerators and its GPU ordinal. */
+export const memoryDomainLabels = (
   hardware: LocalInferenceHardware,
-  domain: LocalInferenceHardware["memoryDomains"][number],
-  physicalOrdinal: number,
-): string => {
-  if (domain.kind === "System") return "System memory"
-  if (domain.kind === "UnifiedMemory") return "Unified memory"
-  const accelerators = hardware.accelerators.filter((accelerator) =>
-    acceleratorMemoryDomainIds(accelerator).has(domain.memoryDomainId))
-  return `${uniqueNames(accelerators.map(({ name }) => name)).join(" + ") || "Accelerator"} · GPU ${physicalOrdinal}`
+): ReadonlyMap<LocalInferenceMemoryDomainId, string> => {
+  let physicalOrdinal = 0
+  return new Map(hardware.memoryDomains.map((domain) => {
+    if (domain.kind === "System") return [domain.memoryDomainId, "System memory"]
+    if (domain.kind === "UnifiedMemory") return [domain.memoryDomainId, "Unified memory"]
+    physicalOrdinal += 1
+    const accelerators = hardware.accelerators.filter((accelerator) =>
+      acceleratorMemoryDomainIds(accelerator).has(domain.memoryDomainId))
+    return [
+      domain.memoryDomainId,
+      `${uniqueNames(accelerators.map(({ name }) => name)).join(" + ") || "Accelerator"} · GPU ${physicalOrdinal}`,
+    ]
+  }))
 }
 
 export interface HardwareMemoryViewOptions {
@@ -132,9 +138,8 @@ export const deriveHardwareMemoryView = (
       : acceleratorDomainIds.length > 0
         ? acceleratorDomainIds
         : hardware.memoryDomains.map(({ memoryDomainId }) => memoryDomainId))
-  let physicalOrdinal = 0
+  const labels = memoryDomainLabels(hardware)
   const domains = hardware.memoryDomains.map((domain): HardwareMemoryDomainView => {
-    if (domain.kind === "PhysicalDevice") physicalOrdinal += 1
     const allocation = Option.fromNullable(allocations.get(domain.memoryDomainId))
     const participatesInModelServing = fallbackModelServingDomainIds.has(domain.memoryDomainId)
       || Option.exists(allocation, (resident) =>
@@ -157,7 +162,7 @@ export const deriveHardwareMemoryView = (
     })
     const base = {
       id: domain.memoryDomainId,
-      label: domainLabel(hardware, domain, physicalOrdinal),
+      label: labels.get(domain.memoryDomainId)!,
       kind: domain.kind,
       totalBytes: domain.totalBytes,
       participatesInModelServing,

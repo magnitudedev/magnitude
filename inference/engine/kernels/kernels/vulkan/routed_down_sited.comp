@@ -1,0 +1,20 @@
+// The CPU's join of a streamed layer's general decode combine
+// (`routed_down_sited` in routed.seismic): invocation (n, m) sums channel n
+// of row m (`lib/routed/down_sum.glsl`) over `routed_down_project`'s
+// published projections. The Vulkan form of `metal/routed_down_sited.metal`:
+// invocation 0 reads the CPU's answer when a choice is the CPU's
+// (`lib/routed/sited.glsl`).
+#include "lib/core/activation.glsl"
+#include "lib/streaming/control.glsl"
+#include "../streaming/site.hpp"
+#include "lib/routed/sited.glsl"
+#define ROUTED_PROJECTED_BASE SEISMIC_PTR(SEISMIC_BUFFER_PUBLISHED)
+#define ROUTED_PROJECTED_INDEX(m, k, n) \
+    ((m) * SEISMIC_PUBLISHED_STRIDE_0 + (k) * SEISMIC_PUBLISHED_STRIDE_1 + (n) * SEISMIC_PUBLISHED_STRIDE_2)
+#include "lib/routed/down_sum.glsl"
+
+void routed_down_sited() {
+    const uint64_t q = streaming_step(SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0);
+    const uint64_t slot = q % uint64_t(SEISMIC_DIM_FLIGHT);
+    routed_down_sum_channel(routed_site_answered(q, slot), slot);
+}

@@ -244,6 +244,25 @@ impl fmt::Display for ResolveError {
 
 impl std::error::Error for ResolveError {}
 
+/// A weight cap below what the load's weights need with its expert bank at its floor: a bound
+/// the caller set that no machine meets and no wait clears, so it is never retried, unlike a
+/// memory shortage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeightCapBelowWeights {
+    pub cap: u64,
+    pub needed: u64,
+}
+
+impl fmt::Display for WeightCapBelowWeights {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "a weight cap of {} bytes is below the {} bytes the load's weights need with its expert bank at its floor",
+            self.cap, self.needed
+        )
+    }
+}
+
 /// `ResolvedEngineConfiguration::preview`: read-only planning.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PreviewError {
@@ -251,6 +270,8 @@ pub enum PreviewError {
     Device(DeviceSelectionError),
     /// A required memory observation failed (Blind). Retryable.
     MemoryObservationUnavailable { reason: String },
+    /// The weight cap is below the load's least weights. Never retryable.
+    WeightCap(WeightCapBelowWeights),
     Internal { reason: String },
 }
 
@@ -259,6 +280,7 @@ impl fmt::Display for PreviewError {
         match self {
             Self::Unsupported(error) => error.fmt(formatter),
             Self::Device(error) => error.fmt(formatter),
+            Self::WeightCap(error) => error.fmt(formatter),
             Self::MemoryObservationUnavailable { reason } => {
                 write!(formatter, "memory observation unavailable: {reason}")
             }
@@ -295,6 +317,10 @@ pub enum LoadError {
     DeviceLost { reason: String },
     /// The worker ended, or broke the protocol, before it was ready.
     WorkerLost { reason: String },
+    /// A configuration control is malformed.
+    Configuration { reason: String },
+    /// The weight cap is below the load's least weights. Never retryable.
+    WeightCap(WeightCapBelowWeights),
     Internal { reason: String },
 }
 
@@ -330,6 +356,8 @@ impl fmt::Display for LoadError {
             }
             Self::DeviceLost { reason } => write!(formatter, "device lost: {reason}"),
             Self::WorkerLost { reason } => write!(formatter, "worker lost during load: {reason}"),
+            Self::Configuration { reason } => write!(formatter, "invalid engine configuration: {reason}"),
+            Self::WeightCap(error) => error.fmt(formatter),
             Self::Internal { reason } => write!(formatter, "internal load failure: {reason}"),
         }
     }
@@ -340,7 +368,7 @@ impl std::error::Error for LoadError {}
 impl From<ResolveError> for LoadError {
     fn from(error: ResolveError) -> Self {
         match error {
-            ResolveError::InvalidConfiguration { reason } => Self::Internal { reason },
+            ResolveError::InvalidConfiguration { reason } => Self::Configuration { reason },
             ResolveError::Artifact(error) => Self::Artifact(error),
             ResolveError::Unsupported(error) => Self::Unsupported(error),
         }
@@ -359,8 +387,8 @@ pub enum RequestError {
     InsufficientMemory(InsufficientMemory),
     /// A required memory observation failed (Blind). Retryable.
     MemoryObservationUnavailable { reason: String },
-    /// The engine is in the Reclaim band and pauses admission
-    /// (`memory_pressure`). Retryable.
+    /// The request waited while the engine gave memory back, until only the
+    /// model's unload could make room for it (`memory_pressure`). Retryable.
     MemoryReclaim,
     /// The model is no longer loaded.
     ModelUnloaded { cause: UnloadCause },
@@ -441,7 +469,6 @@ impl From<magnitude_scheduler::owner::AdmissionError> for RequestError {
             AdmissionError::MemoryObservationUnavailable(reason) => {
                 Self::MemoryObservationUnavailable { reason }
             }
-            AdmissionError::MemoryReclaim => Self::MemoryReclaim,
             AdmissionError::ModelUnloaded {
                 cause: ModelUnloadCause::MemoryPressure,
             } => Self::ModelUnloaded {
@@ -485,12 +512,13 @@ impl From<magnitude_scheduler::publication::RequestError> for RequestError {
                 reason: error.to_string(),
             },
             Scheduled::Invariant(error) => Self::internal(error.to_string()),
-            Scheduled::TableRead(error) => Self::WeightReadFailed {
+            Scheduled::WeightRead(error) => Self::WeightReadFailed {
                 reason: error.detail,
             },
             Scheduled::WorkerClosed => Self::WorkerLost {
                 reason: "the execution owner closed the request's stream".into(),
             },
+            Scheduled::MemoryReclaim => Self::MemoryReclaim,
             Scheduled::ModelUnloaded {
                 cause: ModelUnloadCause::MemoryPressure,
             } => Self::ModelUnloaded {
@@ -549,7 +577,14 @@ pub(crate) fn classify_plan(error: PlanError, backend: seismic::BackendName) -> 
         | PlanError::Topology(_)
         | PlanError::UnsupportedOperator { .. }
         | PlanError::Deferred(_)
-        | PlanError::UnportedScale(_)) => unsupported(&error),
+        | PlanError::UnportedScale(_)
+        | PlanError::Unstreamed(_)) => unsupported(&error),
+        PlanError::WeightCap { cap, needed } => PlanOutcome::WeightCap(WeightCapBelowWeights { cap, needed }),
+        PlanError::KernelDomain(violation) => PlanOutcome::Unsupported(kernel_domain(
+            violation.backend.as_str(),
+            violation.entry,
+            violation.statics,
+        )),
         error @ (PlanError::Arithmetic(_)
         | PlanError::ResourcePlanning(_)
         | PlanError::Resource(_)) => PlanOutcome::Internal(error.to_string()),
@@ -600,6 +635,9 @@ fn kernel_domain(backend: &str, entry: &str, statics: Vec<(String, u64)>) -> Uns
 
 pub(crate) enum PlanOutcome {
     Unsupported(UnsupportedModel),
+    /// The caller's weight cap is below the load's least weights: no
+    /// property of the model or the backend.
+    WeightCap(WeightCapBelowWeights),
     Internal(String),
 }
 
@@ -628,7 +666,8 @@ pub(crate) fn classify_platform(error: PlatformError) -> PlatformOutcome {
         }
         error @ (PlatformError::Memory(_)
         | PlatformError::Open(_)
-        | PlatformError::Qualification(_)) => PlatformOutcome::Internal(error.to_string()),
+        | PlatformError::Qualification(_)
+        | PlatformError::Records(_)) => PlatformOutcome::Internal(error.to_string()),
     }
 }
 
@@ -662,6 +701,7 @@ impl From<PlanOutcome> for PreviewError {
     fn from(outcome: PlanOutcome) -> Self {
         match outcome {
             PlanOutcome::Unsupported(error) => Self::Unsupported(error),
+            PlanOutcome::WeightCap(error) => Self::WeightCap(error),
             PlanOutcome::Internal(reason) => Self::Internal { reason },
         }
     }
@@ -671,6 +711,7 @@ impl From<PlanOutcome> for LoadError {
     fn from(outcome: PlanOutcome) -> Self {
         match outcome {
             PlanOutcome::Unsupported(error) => Self::Unsupported(error),
+            PlanOutcome::WeightCap(error) => Self::WeightCap(error),
             PlanOutcome::Internal(reason) => Self::Internal { reason },
         }
     }
@@ -681,6 +722,20 @@ mod tests {
     use super::*;
     use magnitude_executor::{DeviceError, InvariantError};
     use magnitude_scheduler::{owner::AdmissionError, publication::RequestError as Scheduled};
+
+    /// A weight cap below the load's least weights reaches preview and load as the typed,
+    /// never-retried refusal it is, both numbers kept, not a memory shortage or a string.
+    #[test]
+    fn a_weight_cap_below_the_least_weights_stays_typed_and_unretried() {
+        let cap = || PlanError::WeightCap { cap: 2_100_000_000, needed: 2_130_136_892 };
+        let typed = WeightCapBelowWeights { cap: 2_100_000_000, needed: 2_130_136_892 };
+        let preview = PreviewError::from(classify_plan(cap(), seismic::BackendName::Metal));
+        assert_eq!(preview, PreviewError::WeightCap(typed));
+        let load = LoadError::from(classify_plan(cap(), seismic::BackendName::Metal));
+        assert_eq!(load, LoadError::WeightCap(typed));
+        assert!(!load.retryable());
+        assert!(load.to_string().contains("2100000000") && load.to_string().contains("2130136892"));
+    }
 
     /// A failed execution owner keeps its classified failure: a device loss
     /// behind it unloads the model and refuses later admissions as device

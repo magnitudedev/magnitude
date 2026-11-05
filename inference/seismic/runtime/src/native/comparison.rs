@@ -89,6 +89,28 @@ pub enum SubjectComparison {
     Differs(Difference),
 }
 
+impl SubjectComparison {
+    /// How `candidate` differs from `default`, each the bits of elements of
+    /// the floating type `stored` (an `f32`'s, or a narrower type's in the
+    /// low bits), measured against `stored` and `activation` as a call's
+    /// subject is: for values a computation forms outside a call (the CPU
+    /// site's outputs beside the device's), admitted as any subject.
+    pub fn of_values(stored: DType, default: &[u32], candidate: &[u32], activation: Option<DType>) -> Self {
+        assert!(stored.is_float(), "values measured in rounding steps are floating");
+        if default.len() != candidate.len() {
+            return Self::Mismatched;
+        }
+        if default == candidate {
+            return Self::Identical;
+        }
+        Self::Differs(measure_floating(
+            stored,
+            default.iter().copied().zip(candidate.iter().copied()),
+            activation,
+        ))
+    }
+}
+
 /// One subject of one call, measured.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SubjectMeasurement {

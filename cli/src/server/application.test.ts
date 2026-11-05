@@ -13,6 +13,8 @@ vi.mock("@magnitudedev/daemon-management/desktop-native", () => ({
   }),
 }))
 import { updateApplication } from "./application"
+// Loaded with the file, so the routing's own import of it is cached and no test pays for loading it.
+import "./update-maintenance"
 const state = { transfer: { _tag: "Idle" }, check: { _tag: "Idle" }, preference: { _tag: "Known", autoDownload: true } }
 beforeEach(() => { vi.clearAllMocks(); calls.server.active = false; calls.update.mockReturnValue(Effect.succeed(state)) })
 describe("application update routing", () => {

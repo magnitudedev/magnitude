@@ -1,12 +1,29 @@
 //! Family-neutral model execution contracts and implementations.
 
+/// The engine build identity: the package version and a digest of the
+/// engine's sources (`build.rs`). Two processes speak the worker protocol
+/// only with equal builds, and what a build alone decides is stored under
+/// it.
+pub const ENGINE_BUILD: &str = env!("MAGNITUDE_ENGINE_BUILD");
+
 pub mod assessment;
 mod completion;
 mod device_resources;
 mod device_table;
+pub mod diagnostics;
+pub mod watched;
 mod domain;
+#[cfg(any(test, feature = "fixtures"))]
+pub use domain::fixtures;
 mod error;
 mod execution_path;
+mod experts;
+pub use experts::{
+    ExpertCosts, GroupCost as PromptGroupCost, GroupLayer as PromptGroupLayer, LayerTimeline as PromptLayerTimeline, Span as PromptSpan, StepTimeline as PromptStepTimeline, LayerCost as ExpertLayerCost, LayerExperts,
+    SITE_TERM_NAMES, SiteServed, StepCost as ExpertStepCost, STEP_TRACE as EXPERT_STEP_TRACE, LayerCurve, MissCurve, RoutedRead,
+};
+#[cfg(feature = "expert-routing")]
+pub use experts::{Recency as EvictionRecency, replay as replay_routing};
 mod host_tables;
 mod import_transforms;
 mod inventory;
@@ -16,16 +33,19 @@ pub mod memory;
 mod native;
 #[cfg(test)]
 mod ngram_steps_tests;
+#[cfg(any(test, feature = "fixtures"))]
+mod test_support;
 mod operation;
 mod operators;
 mod planning;
 pub mod programs;
 mod progressive;
 mod slot_directory;
+mod storage_thread;
 mod stored_table;
 mod streamed_table;
 pub use programs::{
-    CommitSpan, CompletedHeadWork, CompletedImportWork, CompletedStateWork, CompletedTargetWork,
+    Chain, CommitSpan, CompletedHeadWork, CompletedImportWork, CompletedStateWork, CompletedTargetWork,
     CompletedVisionWork, GraphError, HeadProgram, ImportProgram, PlannedSealedGraphs,
     PreparedDraftGraphs, PreparedDrafterGraphs, PreparedHeadGraphs, PreparedStateCopyGraphs,
     PreparedTargetGraphs, PreparedTargetReadoutGraphs, PreparedVisionGraphs, SealReport,
@@ -42,15 +62,16 @@ pub use device_resources::{
     ResourceError, WeakFeatureRef,
 };
 pub use domain::{
-    ClaimRefusal, DeviceHeap, DomainError, DomainRequirements, DomainReservation, ExecutorDomain,
-    HeadFlight, MemoryChargeReconciliation, NativeFamily, OpenRequirements,
+    MEMORY_TRACE, BankHolding, BankResize, BankResized, BankStep, ClaimRefusal, Growth, GrowthDecided, GrowthOffer, TableResidency, DeviceHeap, DomainError, Reclaimed, DomainRequirements, DomainReservation, ExecutorDomain,
+    ExpertMeasures, ExpertResidency, ExpertResizes, HeldBy, HostResidency, ThreadHeld, ShrinkCause, TierFill, MissStore, MissStoreError, ResidentStep,
+    HeadFlight, MeasurementRoom, MemoryChargeReconciliation, MemoryMoment, NativeFamily, OpenRequirements,
     PendingOperationOutcome, PhysicalDecision, PrimingCompletionFlight, ProgramFamily,
-    ReservedResources, ResumeState, StateBindings, StoreAllocation, SubmitFailure,
-    TargetContinuation, TargetFlight, TargetHostTiming, VisionFlight, require_normal,
+    ReservedResources, ResumeState, StateBindings, SlotRelease, StateShrink, StoreAllocation, SubmitFailure,
+    TargetContinuation, TargetFlight, TargetHostTiming, TrafficHold, VisionFlight, require_normal,
 };
 pub use error::{
     CapacityError, DeviceError, InvariantError, PlanError, ResourceKind, SubmitError,
-    TableReadError,
+    UnstreamedExperts, WeightReadError,
 };
 pub use execution_path::ExecutionPath;
 pub use inventory::kernel_inventory;
@@ -68,7 +89,6 @@ pub use lanes::{
 pub use magnitude_batching::{self as batching, Demand, LaunchClass};
 /// Development-only tuning pin for bit-exact measurement runs
 /// (`magnitude-harness --tuning-record`); see the module documentation.
-#[cfg(feature = "pinned-tuning")]
 pub use native::pinned_tuning;
 /// Development-only tuning survey for replaying the search
 /// (`magnitude-harness --tuning-survey`); see the module documentation.
@@ -95,17 +115,19 @@ pub use operators::short_conv::{ShortConvBinding, ShortConvShape};
 pub use operators::state_space::{StateSpaceBinding, StateSpaceScales, StateSpaceShape};
 pub use operators::vision::{VisionEntry, VisionKernel};
 pub use planning::{
+    growth_target,
     ArtifactComponent, ArtifactComponentKind, AssessmentFit, AssessmentFitVerdict,
     AssessmentGraphResourceBounds, AssessmentHeaderBounds, AssessmentMemoryBounds,
     AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding, AttentionShape, BackendPlan,
+    BankAllocation, BankBinding, BankTier, ConveyorCarrier, ExpertBankPlan, Holding, StoredStack,
     CONVERSATION_CHECKPOINTS, CPU_IMAGE_CELLS, CapabilityPlan, ComponentPlan, ComponentSelection,
     ConvolutionBinding, ConvolvedLayerBinding, CorrectorBinding, CorrectorLayerBinding,
     DenseBinding, DenseBranchBinding, DenseScales, DeviceProcessBytes, DraftBlockBinding,
     DraftProgramPlan, DraftWidths,
     EmbeddingBinding, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding,
-    FeedForwardProgramSlot, GraphSlots, HeadBinding, HeadProgramPlan, HostProcessBytes,
+    FeedForwardProgramSlot, FlightDepth, GraphSlots, HeadBinding, HeadProgramPlan, HostProcessBytes,
     HostTablePlan, ImportProgramSlot, MAX_DRAFT_PROPOSALS, MAX_IMAGE_CELLS, MarkovBinding,
-    MixerProgramSlot, ModelLoadPlan, NGramBinding, NativeGraphCharge, ParallelBinding,
+    MixerProgramSlot, ModelLoadPlan, NGramBinding, NoBank, NativeGraphCharge, ParallelBinding,
     PerLayerBinding, PerLayerEntryBinding, PlannedDevice, PlannedMethod, ProgramPlan,
     ReadoutBinding, ReadoutClassChoice, ReadoutHead, RecurrentBinding, ResolvedPolicy,
     ResourceBytes, ResourceCapacity, ResourceLimits, ResourcePlan, ResourcePlanner, RoutedBinding,
@@ -124,6 +146,7 @@ pub use residency::{
     ComponentLoader, ImportArtifactTensor, ResidentWeight, Stored, StoredTensor, WeightImportError,
 };
 pub use residency::{MappedImportReport, ResidencyStore};
+pub use storage_thread::Releases;
 pub use resident_weights::{
     ResidencyError, ResidentHead, ResidentOutput, ResidentPlanes, ResidentRoles, ResidentTarget,
     ResidentVision,
@@ -131,6 +154,6 @@ pub use resident_weights::{
 pub use resources::{
     AllocatedResources, AllocationError, GraphOutputOwner, GraphOutputTensor, ImportWorkspaceLease,
     NativeGraphOutputLease, NativeGraphPool, NativeGraphWorkspaceLease, PoolClass,
-    ResourceAllocator, TargetGraphOutputLease, TargetGraphPool, TargetGraphWorkspaceLease,
+    ResourceAllocator, SlotsReleased, TargetGraphOutputLease, TargetGraphPool, TargetGraphWorkspaceLease,
     VisionGraphPool,
 };

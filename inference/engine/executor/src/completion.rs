@@ -98,6 +98,20 @@ struct SharedOutcome {
     finished: Condvar,
 }
 
+impl SharedOutcome {
+    /// The outcome, once the waiter has published it.
+    fn published(&self) -> std::sync::MutexGuard<'_, Option<Result<(), DeviceError>>> {
+        let mut result = self.result.lock().expect("device completion outcome lock");
+        while result.is_none() {
+            result = self
+                .finished
+                .wait(result)
+                .expect("device completion outcome lock");
+        }
+        result
+    }
+}
+
 enum DeviceCompletionState {
     /// No wake is registered; the runs are still owned here.
     Held(Vec<NativeGraphCompletion>),
@@ -144,21 +158,10 @@ impl Completion for DeviceCompletion {
         let observed =
             match std::mem::replace(&mut self.state, DeviceCompletionState::Observed(Ok(()))) {
                 DeviceCompletionState::Held(runs) => wait_runs(runs),
-                DeviceCompletionState::Waiting(shared) => {
-                    let mut result = shared
-                        .result
-                        .lock()
-                        .expect("device completion outcome lock");
-                    while result.is_none() {
-                        result = shared
-                            .finished
-                            .wait(result)
-                            .expect("device completion outcome lock");
-                    }
-                    result
-                        .clone()
-                        .expect("device completion outcome was published")
-                }
+                DeviceCompletionState::Waiting(shared) => shared
+                    .published()
+                    .clone()
+                    .expect("device completion outcome was published"),
                 DeviceCompletionState::Observed(result) => result,
             };
         self.state = DeviceCompletionState::Observed(observed.clone());
@@ -209,6 +212,19 @@ impl Completion for DeviceCompletion {
     }
 }
 
+impl Drop for DeviceCompletion {
+    /// DeviceSubmission drops this first, before its workspace and output,
+    /// so the runs retire before those leases end: held runs retire as they
+    /// drop (each waits for its work to end), and runs a waiter owns once it
+    /// publishes their outcome. Nothing is observed for an owner that read
+    /// no outcome.
+    fn drop(&mut self) {
+        if let DeviceCompletionState::Waiting(shared) = &self.state {
+            drop(shared.published());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +248,35 @@ mod tests {
             completion.result(),
             Err(DeviceError::Execution("native stage failed".into()))
         );
+    }
+    #[test]
+    fn dropping_waiter_owned_completion_waits_before_output_release() {
+        let shared = Arc::new(SharedOutcome {
+            result: Mutex::new(None),
+            finished: Condvar::new(),
+        });
+        let completion = DeviceCompletion {
+            waiter: CompletionWaiter::spawn().unwrap(),
+            state: DeviceCompletionState::Waiting(shared.clone()),
+        };
+        let (started, entered) = mpsc::sync_channel(0);
+        let (finished, dropped) = mpsc::channel();
+        let owner = thread::spawn(move || {
+            started.send(()).unwrap();
+            drop(completion);
+            finished.send(()).unwrap();
+        });
+        entered.recv().unwrap();
+        // This is deliberately an unresolved completion, not a device timer.
+        assert!(matches!(
+            dropped.recv_timeout(std::time::Duration::from_millis(30)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        *shared.result.lock().unwrap() = Some(Ok(()));
+        shared.finished.notify_all();
+        dropped
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        owner.join().unwrap();
     }
 }

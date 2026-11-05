@@ -1,4 +1,5 @@
 use crate::operators::streams::{MixDownBinding, MixUpBinding, Sites, StreamsBinding};
+use crate::planning::RecordTensors;
 use crate::{
     AttentionBinding, DenseBinding, EmbeddingBinding, FeaturesBinding, GeneralRoutedBinding,
     ReadoutBinding, RecurrentBinding, RoutedBinding, ShortConvBinding, StateSpaceBinding,
@@ -41,6 +42,227 @@ pub struct TargetKernels {
     pub(super) parallel: HashMap<crate::ParallelBinding, ParallelKernels>,
     pub(super) streams: StreamsEntryKernels,
     pub(super) ngram: HashMap<crate::NGramBinding, NGramKernels>,
+    /// The bank entries of a routed layer whose experts are streamed, by
+    /// its feed-forward's binding (either routed form) and its bank's.
+    pub(super) banks: HashMap<(crate::planning::BankedFeedForward, crate::BankBinding), ExpertBankKernels>,
+}
+
+/// A streamed layer's decode routes, one by `AHEAD`: without hints (the
+/// last streamed layer), then at each count of leads up to `HINT_LEADS`
+/// (`ExpertBankPlan::ahead`: the layer before the last has one).
+pub(crate) const LEADS: usize = crate::planning::HINT_LEADS as usize + 1;
+
+/// A streamed layer's decode route and resolve by its routed form, each by
+/// `AHEAD` ([`LEADS`]): a lead's kernel where a layer of the binding
+/// launches it, none where none does (a binding without the last streamed
+/// layer has no `AHEAD` 0 launch, one of only that layer no other).
+#[derive(Clone, Debug)]
+pub enum BankRouteKernels {
+    /// The fused form's routing and shared product (`routed_route_shared`'s).
+    Fused([Option<NativeKernel<magnitude_kernels::routed_route_streamed::Entry>>; LEADS]),
+    /// The general form's selection (`routed_select`'s).
+    General([Option<NativeKernel<magnitude_kernels::routed_select_streamed::Entry>>; LEADS]),
+}
+
+/// The routed form whose decode route a bank's entries take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum BankRouteForm {
+    Fused,
+    General,
+}
+
+/// A streamed routed layer's bank entries (`operators::routed::streamed`):
+/// decode rows route, resolve and assign, then wait for the experts the
+/// host lands; larger rows set the step,
+/// request, and wait and convert a round at a time. `convert` and `seed`
+/// are per routed tensor of the record.
+#[derive(Clone, Debug)]
+pub struct ExpertBankKernels {
+    pub route: BankRouteKernels,
+    pub tier_wait: NativeKernel<magnitude_kernels::routed_tier_wait::Entry>,
+    pub step: NativeKernel<magnitude_kernels::routed_step::Entry>,
+    pub scratch_request: NativeKernel<magnitude_kernels::routed_scratch_request::Entry>,
+    pub scratch_wait: NativeKernel<magnitude_kernels::routed_scratch_wait::Entry>,
+    pub scratch_grids: NativeKernel<magnitude_kernels::routed_scratch_grids::Entry>,
+    /// A round's convert list staged into device memory, which its converts
+    /// read.
+    pub list_stage: NativeKernel<magnitude_kernels::routed_list_stage::Entry>,
+    /// A merge set's pass's map and step resolved into device memory,
+    /// which its expert entries read.
+    pub pass_map: NativeKernel<magnitude_kernels::routed_pass_map::Entry>,
+    pub convert: RecordTensors<NativeKernel<magnitude_kernels::routed_convert::Entry>>,
+    /// The device's placements into the bank, where it places
+    /// (`BankBinding::placer`): none in a program whose host places.
+    pub placement: Option<DevicePlacement>,
+    /// A shrink's moves of the bank's kept records, which the device runs in
+    /// queue order ahead of every later step, whoever places.
+    pub moves: BankMoves,
+    /// Its CPU site, where the bank has a host tier the CPU reads its
+    /// misses from, the backend serves the site's entries, and, once
+    /// qualified, the precision system admits its arithmetic
+    /// ([`BankSite::admitted`]).
+    pub site: Option<BankSite>,
+}
+
+/// A streamed layer's CPU site entries (streaming_words.seismic's request
+/// and answer): its request (`routed_site_request`), after the route or its
+/// tier wait and before gate/up, and its combine in its routed form (the
+/// GPU's projections, then the sum waiting for the CPU's answer); and the
+/// form the site's pool computes in.
+#[derive(Clone, Debug)]
+pub struct BankSite {
+    pub request: NativeKernel<magnitude_kernels::routed_site_request::Entry>,
+    pub combine: BankCombine,
+    pub form: SiteForm,
+    /// What the precision system admitted of the site, as the measurement
+    /// job stored it; none until it has (`SiteRequest`), when the site is
+    /// held but serves nothing.
+    pub admitted: Option<SiteAdmission>,
+}
+
+/// A CPU site's stored admission (`SiteRequest::verdict`): the precision
+/// system admitted the site's arithmetic against the reference, f32 math
+/// over the stored weights.
+#[derive(Clone, Copy, Debug)]
+pub struct SiteAdmission;
+
+impl BankSite {
+    /// Whether a streamed layer of feed-forward `slot` whose bank is `bank`
+    /// has a CPU site on `backend`: the bank has a host tier (across a link;
+    /// the route assigns its misses between the CPU and the link each step)
+    /// and the backend serves the site's request and the combine of the
+    /// layer's form. The one rule preparation and the graph's checked
+    /// entries share.
+    pub(crate) fn served(
+        slot: crate::planning::BankedFeedForward,
+        bank: crate::BankBinding,
+        backend: seismic::BackendName,
+    ) -> Result<bool, String> {
+        use crate::planning::BankedFeedForward;
+        use magnitude_kernels::{
+            routed_down_project, routed_down_sited, routed_output_project, routed_output_sited, routed_site_request,
+        };
+        fn declares<E: seismic::Entry>(backend: seismic::BackendName) -> Result<bool, String> {
+            seismic::generated::native_implementation_for_backend::<E>(backend)
+                .map(|native| native.is_some())
+                .map_err(|error| error.to_string())
+        }
+        let combine = match slot {
+            BankedFeedForward::Routed(_) => {
+                declares::<routed_output_project::Entry>(backend)? && declares::<routed_output_sited::Entry>(backend)?
+            }
+            BankedFeedForward::GeneralRouted(_) | BankedFeedForward::Parallel(_) => {
+                declares::<routed_down_project::Entry>(backend)? && declares::<routed_down_sited::Entry>(backend)?
+            }
+        };
+        // The CPU computes a miss from its host tier record; unified memory
+        // has no tier and no CPU site.
+        Ok(bank.tier > 0 && combine && declares::<routed_site_request::Entry>(backend)?)
+    }
+}
+
+/// A streamed layer's combine with the CPU's answer, by its routed form:
+/// the GPU's projections (`project`, which run while the CPU computes its
+/// misses), then their sum waiting for the CPU's answer (`sited`): the fused form's output (`routed_output_project`,
+/// `routed_output_sited`) or the general form's down (`routed_down_project`,
+/// `routed_down_sited`).
+#[derive(Clone, Debug)]
+pub enum BankCombine {
+    Fused {
+        project: NativeKernel<magnitude_kernels::routed_output_project::Entry>,
+        sited: NativeKernel<magnitude_kernels::routed_output_sited::Entry>,
+    },
+    General {
+        project: NativeKernel<magnitude_kernels::routed_down_project::Entry>,
+        sited: NativeKernel<magnitude_kernels::routed_down_sited::Entry>,
+    },
+}
+
+/// What the CPU site's pool computes a layer's choices in: the element its
+/// gate/up products are published in (`A`) and its expansion's function
+/// (the decode entries' `activation`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SiteForm {
+    pub activation: seismic::Element,
+    pub function: i32,
+}
+
+impl SiteForm {
+    /// The form a layer of feed-forward `slot` computes in.
+    pub(crate) fn of(slot: crate::planning::BankedFeedForward) -> Self {
+        use crate::planning::BankedFeedForward;
+        match slot {
+            BankedFeedForward::Routed(binding) => Self { activation: binding.activation, function: crate::operators::routed::FUSED_ACTIVATION },
+            BankedFeedForward::GeneralRouted(binding)
+            | BankedFeedForward::Parallel(crate::ParallelBinding { routed: binding, .. }) => {
+                Self { activation: binding.activation, function: binding.shape.experts_expansion.activation }
+            }
+        }
+    }
+}
+
+/// The device's copies into a bank's records: a prompt group's seeding
+/// (each routed tensor's copy from the scratch tier into the bank's records
+/// on the seed list's grid, then the commit of each seeded record, which
+/// the host then maps).
+#[derive(Clone, Debug)]
+pub struct DevicePlacement {
+    pub seed: RecordTensors<NativeKernel<magnitude_kernels::routed_copy::Entry>>,
+    pub seed_commit: NativeKernel<magnitude_kernels::routed_seed_commit::Entry>,
+    /// The launch grid of the seed list's entries, which the seed copy
+    /// launches on.
+    pub list_grid: NativeKernel<magnitude_kernels::routed_list_grid::Entry>,
+}
+
+/// A shrink's record moves (`routed_move`).
+#[derive(Clone, Debug)]
+pub struct BankMoves {
+    /// Each routed tensor's records.
+    pub records: RecordTensors<NativeKernel<magnitude_kernels::routed_move::Entry>>,
+}
+
+impl ExpertBankKernels {
+    /// Whether `backend` declares every entry a bank of `form` prepares
+    /// (`Preparation::bank`, one field of this struct each).
+    pub(crate) fn declared(
+        backend: seismic::BackendName,
+        form: BankRouteForm,
+    ) -> Result<bool, seismic::CheckedBundleError> {
+        use magnitude_kernels::{
+            routed_convert, routed_copy, routed_list_grid, routed_list_stage, routed_move, routed_pass_map, routed_route_streamed,
+            routed_scratch_grids, routed_scratch_request, routed_scratch_wait, routed_seed_commit,
+            routed_select_streamed, routed_step, routed_tier_wait,
+        };
+        type Declares = fn(seismic::BackendName) -> Result<bool, seismic::CheckedBundleError>;
+        fn declares<E: seismic::Entry>(backend: seismic::BackendName) -> Result<bool, seismic::CheckedBundleError> {
+            seismic::generated::native_implementation_for_backend::<E>(backend).map(|native| native.is_some())
+        }
+        let route: Declares = match form {
+            BankRouteForm::Fused => declares::<routed_route_streamed::Entry>,
+            BankRouteForm::General => declares::<routed_select_streamed::Entry>,
+        };
+        let bank: [Declares; 13] = [
+            route,
+            declares::<routed_tier_wait::Entry>,
+            declares::<routed_step::Entry>,
+            declares::<routed_scratch_request::Entry>,
+            declares::<routed_scratch_wait::Entry>,
+            declares::<routed_scratch_grids::Entry>,
+            declares::<routed_convert::Entry>,
+            declares::<routed_copy::Entry>,
+            declares::<routed_seed_commit::Entry>,
+            declares::<routed_move::Entry>,
+            declares::<routed_list_grid::Entry>,
+            declares::<routed_list_stage::Entry>,
+            declares::<routed_pass_map::Entry>,
+        ];
+        for declares in bank.iter() {
+            if !declares(backend)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }
 
 /// An n-gram input sublayer (`operators::ngram`): the table rows of each

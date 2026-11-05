@@ -162,7 +162,7 @@ fn state_space_step[M, B, S, NH, P, G, N, C, T](
 # and x is staged at once. `ROWS` never changes result bits.
 native state_space_step for metal from "metal/state_space_step.metal":
     static (NH, P, G, N, C)
-    params (ROWS in [32, 16, 64])
+    params (ROWS in [32, 16, 64] default 32)
     where N % 32 == 0 and N <= 256 and P % ROWS == 0 and G <= NH and 2048 / N * (2 * N + ROWS + 2) <= 8192
     launch state_space_step:
         threadgroups (NH, P / ROWS, B + 1)
@@ -173,7 +173,7 @@ native state_space_step for metal from "metal/state_space_step.metal":
 # (the input projection), so the state streams under the projection's tail.
 native state_space_step for cuda from "cuda/state_space_step.cu":
     static (NH, P, G, N, C)
-    params (code ROWS in [32, 16, 64])
+    params (ROWS in [32, 16, 64] default 32)
     where N % 32 == 0 and N <= 256 and P % ROWS == 0 and G <= NH and 2048 / N * (2 * N + ROWS + 2) <= 8192
     launch state_space_step:
         reads (ROWS)
@@ -183,7 +183,7 @@ native state_space_step for cuda from "cuda/state_space_step.cu":
 # Vulkan: the CUDA step over four logical subgroups; shared: the staged span.
 native state_space_step for vulkan from "vulkan/state_space_step.comp":
     static (NH, P, G, N, C)
-    params (ROWS in [32, 16, 64])
+    params (ROWS in [32, 16, 64] default 32)
     where N % 32 == 0 and N <= 256 and P % ROWS == 0 and G <= NH and 2048 / N * (2 * N + ROWS + 2) <= 8192
     launch state_space_step:
         threadgroups (NH, P / ROWS, B + 1)
@@ -195,7 +195,7 @@ native state_space_step for vulkan from "vulkan/state_space_step.comp":
 # z = B zeroes the mixed rows no slot covers. ROWS never changes result bits.
 # Private bytes: the state rows, the group's B and C, the rows' x.
 native state_space_step for cpu from "cpu/state_space_step.rs":
-    params (ROWS in [64, 32, 16])
+    params (ROWS in [64, 32, 16] default 64)
     launch state_space_step:
         threadgroups (NH, ceil_div(P, ROWS), B + 1)
         threads_per_threadgroup (1, 1, 1)
@@ -235,7 +235,7 @@ fn state_space_chunk[M, B, S, NH, P, G, N, C, T](
 # dual form.
 native state_space_chunk for metal from "metal/state_space_chunk.metal":
     static (NH, P, G, N, C)
-    params (ROWS in [32, 16, 64])
+    params (ROWS in [32, 16, 64] default 32)
     where N % 32 == 0 and N <= 256 and P % ROWS == 0 and G <= NH and 2048 / N * (2 * N + ROWS + 2) <= 8192
     scratch inputs bytes (M * (2 * G * N + 2 * NH) * 4)
     scratch products bytes ((ceil_div(M, 32) + B) * G * 32 * 32 * 4)
@@ -251,7 +251,7 @@ native state_space_chunk for metal from "metal/state_space_chunk.metal":
 
 native state_space_chunk for cuda from "cuda/state_space_chunk.cu":
     static (NH, P, G, N, C)
-    params (code ROWS in [32, 16, 64])
+    params (ROWS in [32, 16, 64] default 32)
     where N % 32 == 0 and N <= 256 and P % ROWS == 0 and G <= NH and 2048 / N * (2 * N + ROWS + 2) <= 8192
     scratch inputs bytes (M * (2 * G * N + 2 * NH) * 4)
     scratch products bytes ((ceil_div(M, 32) + B) * G * 32 * 32 * 4)
@@ -268,7 +268,7 @@ native state_space_chunk for cuda from "cuda/state_space_chunk.cu":
 
 native state_space_chunk for vulkan from "vulkan/state_space_chunk.comp":
     static (NH, P, G, N, C)
-    params (ROWS in [32, 16, 64])
+    params (ROWS in [32, 16, 64] default 32)
     where N % 32 == 0 and N <= 256 and P % ROWS == 0 and G <= NH and 2048 / N * (2 * N + ROWS + 2) <= 8192
     scratch inputs bytes (M * (2 * G * N + 2 * NH) * 4)
     scratch products bytes ((ceil_div(M, 32) + B) * G * 32 * 32 * 4)
@@ -291,7 +291,7 @@ native state_space_chunk for vulkan from "vulkan/state_space_chunk.comp":
 # rule is the cheapest schedule; there is no dual form). Grid z = B zeroes
 # the mixed rows no slot covers.
 native state_space_chunk for cpu from "cpu/state_space_chunk.rs":
-    params (ROWS in [64, 32, 16])
+    params (ROWS in [64, 32, 16] default 64)
     scratch inputs bytes (M * (NH * P + 2 * G * N + 2 * NH) * 4)
     launch state_space_chunk_inputs:
         threadgroups (M, 1, 1)

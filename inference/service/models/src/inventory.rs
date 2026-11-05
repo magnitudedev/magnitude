@@ -747,7 +747,7 @@ impl ManagedModelStore {
             return;
         }
         let store = self.clone();
-        tokio::spawn(async move {
+        magnitude_service_utils::owner::spawn("the Ollama hub's resolution", async move {
             let _lease = ReconciliationLease(Arc::clone(&store.ollama_hub_resolution));
             let roots = store.resolve_ollama_hub_files().await;
             if !roots.is_empty()
@@ -767,7 +767,7 @@ impl ManagedModelStore {
             return;
         }
         let reconciliation = self.clone();
-        tokio::spawn(async move {
+        magnitude_service_utils::owner::spawn("the inventory's reconciliation", async move {
             let _lease = ReconciliationLease(Arc::clone(&reconciliation.reconciliation_running));
             while !reconciliation
                 .reconciliation_complete
@@ -893,7 +893,7 @@ impl ManagedModelStore {
                 } else {
                     ScanScope::All
                 };
-                let scan_result = tokio::task::spawn_blocking(move || {
+                let scan_result = magnitude_service_utils::blocking::run(move || {
                     scan(
                         &config,
                         &local,
@@ -905,8 +905,7 @@ impl ManagedModelStore {
                         },
                     )
                 })
-                .await
-                .map_err(|error| InventoryError::Internal(error.to_string()))??;
+                .await?;
                 *self.root_scans.lock().map_err(|_| {
                     InventoryError::Internal("root scan lock poisoned".to_owned())
                 })? = scan_result.root_scans.clone();
@@ -947,12 +946,11 @@ impl ManagedModelStore {
                 let package_manager = self.clone();
                 let package_models = discovered.clone();
                 let unreadable_directories = scan_result.unreadable_directories;
-                let installed_packages = tokio::task::spawn_blocking(move || {
+                let installed_packages = magnitude_service_utils::blocking::run(move || {
                     package_manager
                         .build_installed_package_snapshot(&package_models, unreadable_directories)
                 })
-                .await
-                .map_err(|error| InventoryError::Internal(error.to_string()))??;
+                .await?;
 
                 if inventory_snapshot_is_current(
                     &self.config.root,

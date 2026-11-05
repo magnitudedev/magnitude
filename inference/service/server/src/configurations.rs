@@ -12,7 +12,7 @@ use magnitude_engine::composition::EngineConfiguration;
 use magnitude_engine::error::ResolveError;
 use magnitude_engine::host::HostArtifacts;
 use magnitude_engine::options::{
-    ExecutionManifest, ModelPolicy, PackageOptions, ProjectorSelection, standard_service_limits,
+    ExecutionManifest, ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, standard_service_limits,
 };
 use magnitude_executor::ExecutionPath;
 use magnitude_executor::platform::MemoryReserves;
@@ -35,6 +35,19 @@ use crate::assessment::environment::{ServingDevice, serving_policy};
 /// model's, is found again without being kept here.
 const RETAINED_CONFIGURATIONS: usize = 1;
 
+/// What an evaluation service bounds every load by, so that a machine serves a cell it would
+/// otherwise hold resident or refuse. The product bounds nothing: its loads are what assessment
+/// admits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoadBounds {
+    /// The ceiling on every load's weights (`ModelPolicy::weight_cap`).
+    pub weight_cap: Option<u64>,
+    /// The context every load serves, in place of its model's declared one.
+    pub context_tokens: Option<usize>,
+    /// Every load decodes plainly, its drafter left out.
+    pub plain: bool,
+}
+
 /// One model's device-free engine configuration.
 pub struct ResolvedConfiguration {
     /// Chat semantics: tokenizer, templates, properties.
@@ -54,6 +67,7 @@ pub struct ResolvedConfigurations {
     kernel_directory: PathBuf,
     reserves: MemoryReserves,
     serving: ServingDevice,
+    bounds: LoadBounds,
     cache: ResolutionCache<ResolvedConfiguration>,
 }
 
@@ -63,12 +77,14 @@ impl ResolvedConfigurations {
         kernel_directory: PathBuf,
         reserves: MemoryReserves,
         serving: ServingDevice,
+        bounds: LoadBounds,
     ) -> Self {
         Self {
             models,
             kernel_directory,
             reserves,
             serving,
+            bounds,
             cache: ResolutionCache::new(RETAINED_CONFIGURATIONS),
         }
     }
@@ -118,12 +134,10 @@ impl ResolvedConfigurations {
             self.kernel_directory.clone(),
             self.reserves,
             self.serving,
+            self.bounds,
         );
-        let resolved = crate::spawn_blocking_traced(move || configuration.resolve())
+        let resolved = magnitude_service_utils::blocking::run(move || configuration.resolve())
             .await
-            .map_err(|error| {
-                InventoryError::Internal(format!("model resolution task failed: {error}"))
-            })?
             .map_err(resolve_failure)?;
         Ok(Arc::new(ResolvedConfiguration {
             host: Arc::new(resolved.host),
@@ -142,6 +156,7 @@ fn engine_configuration(
     kernel_directory: PathBuf,
     reserves: MemoryReserves,
     serving: ServingDevice,
+    bounds: LoadBounds,
 ) -> EngineConfiguration {
     EngineConfiguration {
         package: PackageOptions {
@@ -150,13 +165,14 @@ fn engine_configuration(
                 Some(projector) => ProjectorSelection::Explicit(projector),
                 None => ProjectorSelection::Disabled,
             },
-            draft: package.draft,
+            draft: package.draft.filter(|_| !bounds.plain),
         },
         model: ModelPolicy {
-            method: package.method,
+            method: if bounds.plain { ModelMethod::Plain } else { package.method },
+            weight_cap: bounds.weight_cap,
             ..serving_policy()
         },
-        context_tokens: None,
+        context_tokens: bounds.context_tokens,
         service: standard_service_limits(),
         path: ExecutionPath::Native,
         device: serving.request(),
@@ -361,6 +377,7 @@ mod tests {
             kernels.clone(),
             MemoryReserves::standard(),
             serving,
+            LoadBounds::default(),
         )
         .resolve()
         .unwrap();
@@ -382,6 +399,7 @@ mod tests {
                 kernels.clone(),
                 MemoryReserves::standard(),
                 serving,
+                LoadBounds::default(),
             )
             .resolve() else {
                 panic!("{method:?} resolved over a DSpark draft")
@@ -409,6 +427,7 @@ mod tests {
             std::env::temp_dir(),
             MemoryReserves::standard(),
             serving,
+            LoadBounds::default(),
         );
         assert_eq!(configuration.device, serving.request());
     }

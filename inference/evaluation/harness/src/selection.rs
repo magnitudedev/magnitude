@@ -249,11 +249,19 @@ mod tests {
         };
         let scratch = Scratch::new();
         let path = scratch.0.join("tuning.jsonl");
+        struct Cores;
+        impl seismic::device::cpu::Queries for Cores {
+            fn worker_cores(&self) -> Option<u64> {
+                Some(8)
+            }
+        }
+        let device = seismic::device::DeviceProperties::Cpu(seismic::device::cpu::describe(&Cores, &Default::default()).unwrap());
         let trace = TuningTrace::begin(
             &path,
             magnitude_executor::TracedWork::Search,
             TuningSettings::STANDARD,
             ResolvedNumericalProfile::standard(),
+            &device,
         )
         .unwrap();
         let configuration = Configuration {
@@ -273,7 +281,6 @@ mod tests {
                 alpha: 4.0,
                 activation: Some(seismic::DType::BF16),
             },
-            measurement_identity: "witness".into(),
             // The chosen configuration's one measurement: its bf16 result
             // two rounding steps from the default's.
             observations: vec![seismic::NumericalObservation {
@@ -305,6 +312,7 @@ mod tests {
             implementation_identity: "native-source".into(),
             parameters: Vec::new(),
             configurations: vec![seismic::ConfigurationRecord {
+                launches: Vec::new(),
                 formation: None,
                 configuration: configuration.clone(),
                 artifact: Some("retained-artifact".into()),
@@ -318,6 +326,7 @@ mod tests {
             method: seismic::TuningMethod::Census,
             time: seismic::TuningTime::default(),
             coverage: None,
+            default_launches: Vec::new(),
         });
         let mut tuned = TunedEntry {
             receipt: magnitude_executor::Receipt::Held(receipt),
@@ -388,7 +397,6 @@ mod tests {
         assert_eq!(candidate["error_ratio"], 2.0);
         assert_eq!(candidate["admitted"], true);
         assert!(candidate["violation"].is_null());
-        assert_eq!(records[1]["measurement_identity"], "witness");
         assert_eq!(records[1]["observations"][0]["point"], "m1");
         assert_eq!(records[1]["observations"][0]["key"]["values"]["SIMDS"], 8);
         assert_eq!(

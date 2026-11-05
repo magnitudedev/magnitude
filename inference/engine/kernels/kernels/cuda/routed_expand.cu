@@ -1,4 +1,4 @@
-// Decode expansion (M <= 8); the CUDA form of `metal/routed_expand.metal`.
+// Decode expansion (M <= DECODE_ROWS); the CUDA form of `metal/routed_expand.metal`.
 // Block row y < M * K is choice (m, k); row y = M * K is the shared expert
 // over all M rows.
 // - `routed_expand` (one row): choice k is the K1 paired GEMV over expert
@@ -114,10 +114,10 @@ __global__ void routed_expand_gathered(SEISMIC_KERNEL_PARAMS) {
         const unsigned choice = blockIdx.y, slots = (unsigned)SEISMIC_DIM_K;
         if (!routed::first_choice(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, slots, choice))
             return;
-        __shared__ projection::u64 rows_at[8], products_at[8];
+        __shared__ projection::u64 rows_at[SEISMIC_CONST_DECODE_ROWS], products_at[SEISMIC_CONST_DECODE_ROWS];
         __shared__ unsigned count;
         if (threadIdx.x == 0) {
-            projection::u32 chosen[8];
+            projection::u32 chosen[SEISMIC_CONST_DECODE_ROWS];
             count = routed::expert_choices(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
                                            (unsigned)SEISMIC_DIM_M, slots, choice, chosen);
             for (unsigned r = 0; r < count; ++r) {

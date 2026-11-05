@@ -1,9 +1,11 @@
 //! Minimal dynamically loaded NVML: one device's memory accounting
 //! (`nvmlDeviceGetMemoryInfo_v2`), which separates the driver's reserve from
-//! what processes use. Like the CUDA driver it needs no headers or libraries
-//! to build; a host without NVML or without the v2 entry point yields `None`.
-//! The device is found by its CUDA UUID, so CUDA and NVML enumeration order
-//! and `CUDA_VISIBLE_DEVICES` do not matter.
+//! what processes use, and what it holds for one process
+//! (`nvmlDeviceGetComputeRunningProcesses_v3`). Like the CUDA driver it
+//! needs no headers or libraries to build; a host without NVML or without an
+//! entry point yields `None` for what it would read. The device is found by
+//! its CUDA UUID, so CUDA and NVML enumeration order and
+//! `CUDA_VISIBLE_DEVICES` do not matter.
 
 use libloading::Library;
 use std::ffi::{c_char, c_int, c_uint, c_void, CString};
@@ -34,10 +36,30 @@ pub(crate) struct MemorySample {
     pub free: u64,
 }
 
+/// `nvmlProcessInfo_t`, as `nvmlDeviceGetComputeRunningProcesses_v3` fills
+/// it.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ProcessInfo {
+    pid: c_uint,
+    used_gpu_memory: u64,
+    gpu_instance_id: c_uint,
+    compute_instance_id: c_uint,
+}
+
+/// `NVML_ERROR_INSUFFICIENT_SIZE`: more processes than the buffer holds;
+/// the count says how many.
+const INSUFFICIENT_SIZE: Return = 7;
+/// `NVML_VALUE_NOT_AVAILABLE`, as a process's used memory.
+const NOT_AVAILABLE: u64 = u64::MAX;
+
+type RunningProcesses = unsafe extern "C" fn(DeviceHandle, *mut c_uint, *mut ProcessInfo) -> Return;
+
 /// An initialized NVML session bound to one device; shut down on drop.
 pub(crate) struct NvmlDevice {
     shutdown: unsafe extern "C" fn() -> Return,
     memory_info: unsafe extern "C" fn(DeviceHandle, *mut MemoryV2) -> Return,
+    running_processes: Option<RunningProcesses>,
     handle: DeviceHandle,
     _library: Library,
 }
@@ -66,6 +88,10 @@ impl NvmlDevice {
                     b"nvmlDeviceGetMemoryInfo_v2\0",
                 )
                 .ok()?;
+            let running_processes = library
+                .get::<RunningProcesses>(b"nvmlDeviceGetComputeRunningProcesses_v3\0")
+                .ok()
+                .map(|symbol| *symbol);
             if init() != 0 {
                 return None;
             }
@@ -81,10 +107,32 @@ impl NvmlDevice {
             Some(Self {
                 shutdown,
                 memory_info,
+                running_processes,
                 handle,
                 _library: library,
             })
         }
+    }
+
+    /// What the device's driver holds for process `pid` (its context and
+    /// allocations), as NVML counts it.
+    pub fn process_bytes(&self, pid: u32) -> Result<u64, ProcessMemoryError> {
+        let query = self.running_processes.ok_or(ProcessMemoryError::Unsupported)?;
+        // A count of zero asks how many processes there are; a process may
+        // start between two queries, so the room asked for is the last count.
+        let mut processes = Vec::new();
+        loop {
+            let mut count = c_uint::try_from(processes.len()).expect("a process count NVML gave");
+            match unsafe { query(self.handle, &mut count, processes.as_mut_ptr()) } {
+                0 => {
+                    processes.truncate(count as usize);
+                    break;
+                }
+                INSUFFICIENT_SIZE => processes.resize(count as usize, ProcessInfo::default()),
+                code => return Err(ProcessMemoryError::Query(code)),
+            }
+        }
+        own_bytes(&processes, pid)
     }
 
     pub fn sample(&self) -> Option<MemorySample> {
@@ -101,6 +149,59 @@ impl NvmlDevice {
             free: memory.free,
         })
     }
+}
+
+/// Why NVML gave no count of a process's memory on a device.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProcessMemoryError {
+    /// NVML is not loaded, or has no device of this UUID.
+    Unavailable,
+    /// NVML lacks `nvmlDeviceGetComputeRunningProcesses_v3`.
+    Unsupported,
+    /// The query failed with this NVML return code.
+    Query(Return),
+    /// NVML lists no process `pid` on the device, though it holds a context
+    /// there: the process knows itself by a PID NVML does not use (another
+    /// PID namespace).
+    Unlisted { pid: u32 },
+    /// NVML lists the process without its memory.
+    Unreported { pid: u32 },
+}
+
+impl std::fmt::Display for ProcessMemoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => write!(f, "NVML is unavailable for the device"),
+            Self::Unsupported => write!(f, "NVML lacks nvmlDeviceGetComputeRunningProcesses_v3"),
+            Self::Query(code) => write!(f, "NVML's process query failed ({code})"),
+            Self::Unlisted { pid } => write!(
+                f,
+                "NVML lists no process {pid} on a device it holds a context on: its PID namespace is not NVML's"
+            ),
+            Self::Unreported { pid } => write!(f, "NVML does not report process {pid}'s memory"),
+        }
+    }
+}
+
+/// What NVML's `processes` say process `pid` holds.
+fn own_bytes(processes: &[ProcessInfo], pid: u32) -> Result<u64, ProcessMemoryError> {
+    let process = processes
+        .iter()
+        .find(|process| process.pid == pid)
+        .ok_or(ProcessMemoryError::Unlisted { pid })?;
+    match process.used_gpu_memory {
+        NOT_AVAILABLE => Err(ProcessMemoryError::Unreported { pid }),
+        bytes => Ok(bytes),
+    }
+}
+
+/// What this process's context holds on the device `uuid`, as NVML counts
+/// the process there: read once, while the process holds the context and no
+/// allocation on the device (`seismic_native_target::process::DriverMemory`).
+pub(crate) fn context_bytes(uuid: [u8; 16]) -> Result<u64, ProcessMemoryError> {
+    NvmlDevice::open(uuid)
+        .ok_or(ProcessMemoryError::Unavailable)?
+        .process_bytes(std::process::id())
 }
 
 impl Drop for NvmlDevice {
@@ -137,6 +238,26 @@ mod tests {
     fn memory_v2_version_matches_the_nvml_header() {
         assert_eq!(std::mem::size_of::<MemoryV2>(), 40);
         assert_eq!(MEMORY_V2_VERSION, 0x0200_0028);
+    }
+
+    #[test]
+    fn a_process_reads_its_own_count_or_why_it_has_none() {
+        let process = |pid, used_gpu_memory| ProcessInfo {
+            pid,
+            used_gpu_memory,
+            ..ProcessInfo::default()
+        };
+        let listed = [process(7, 100), process(9, NOT_AVAILABLE), process(11, 5)];
+        assert_eq!(own_bytes(&listed, 11), Ok(5));
+        assert_eq!(own_bytes(&listed, 9), Err(ProcessMemoryError::Unreported { pid: 9 }));
+        assert_eq!(own_bytes(&listed, 8), Err(ProcessMemoryError::Unlisted { pid: 8 }));
+        assert_eq!(own_bytes(&[], 8), Err(ProcessMemoryError::Unlisted { pid: 8 }));
+    }
+
+    #[test]
+    fn process_info_matches_the_nvml_header() {
+        assert_eq!(std::mem::size_of::<ProcessInfo>(), 24);
+        assert_eq!(std::mem::offset_of!(ProcessInfo, used_gpu_memory), 8);
     }
 
     #[test]

@@ -446,6 +446,7 @@ mod tests {
         };
         let mut observations = Vec::new();
         let mut record = |rows: u64, ratios: &[f64], outcome: Outcome| ConfigurationRecord {
+            launches: Vec::new(),
             formation: None,
             configuration: configuration(rows),
             artifact: Some(format!("artifact-{rows}")),
@@ -511,7 +512,6 @@ mod tests {
                 })
                 .into(),
             requirement: steps(8.),
-            measurement_identity: "measurements".into(),
             observations,
             served: [1, 2, 4].map(configuration).into(),
             reselection: None,
@@ -522,6 +522,7 @@ mod tests {
             method: TuningMethod::Census,
             time: TuningTime::default(),
             coverage: None,
+            default_launches: Vec::new(),
         }
     }
 

@@ -447,7 +447,7 @@ impl ManagedModelStore {
         {
             let companion_bytes = admitted_bytes.saturating_sub(own);
             let manager = self.clone();
-            tokio::spawn(async move {
+            magnitude_service_utils::owner::spawn("a download", async move {
                 manager
                     .run_download(key, operation_id, package, operation, companion_bytes)
                     .await;
@@ -660,7 +660,7 @@ impl ManagedModelStore {
         }
         if result.is_err() {
             let pruned = repo_root.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            magnitude_service_utils::blocking::run(move || {
                 crate::store_fs::prune_empty_repository(&pruned);
             })
             .await;
@@ -1232,9 +1232,7 @@ async fn copy_local_component(
         let source = tokio::fs::canonicalize(source).await.map_err(download_io)?;
         let cloned = {
             let (source, partial) = (source.clone(), paths.partial.clone());
-            tokio::task::spawn_blocking(move || clone_file(&source, &partial))
-                .await
-                .map_err(download_io)?
+            magnitude_service_utils::blocking::run(move || clone_file(&source, &partial)).await
         };
         let integrity = if cloned {
             verified_integrity(&paths.partial, component, progress, control).await?
@@ -1581,7 +1579,7 @@ async fn publish_snapshot_link(
         });
     }
     let destination_clone = destination.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), DownloadError> {
+    magnitude_service_utils::blocking::run(move || -> Result<(), DownloadError> {
         match destination_clone.symlink_metadata() {
             Ok(_) => {
                 let matching = same_file::is_same_file(&destination_clone, &blob).unwrap_or(false);
@@ -1605,13 +1603,6 @@ async fn publish_snapshot_link(
         Ok(())
     })
     .await
-    .map_err(|error| DownloadError {
-        kind: DownloadErrorKind::FileSystem,
-        message: error.to_string(),
-        retryable: true,
-        resumable: true,
-    })??;
-    Ok(())
 }
 
 fn pathdiff(path: &Path, base: &Path) -> PathBuf {
@@ -1730,16 +1721,10 @@ async fn quarantine(path: &Path) -> Result<(), DownloadError> {
 }
 
 async fn acquire_lock(path: PathBuf) -> Result<File, DownloadError> {
-    tokio::task::spawn_blocking(move || {
+    magnitude_service_utils::blocking::run(move || {
         acquire_exclusive_lock(&path).map_err(inventory_download_error)
     })
     .await
-    .map_err(|error| DownloadError {
-        kind: DownloadErrorKind::FileSystem,
-        message: error.to_string(),
-        retryable: true,
-        resumable: true,
-    })?
 }
 
 fn open_partial(path: &Path) -> Result<File, DownloadError> {

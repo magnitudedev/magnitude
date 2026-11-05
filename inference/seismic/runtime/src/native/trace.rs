@@ -6,6 +6,7 @@
 //! entries; that changes the device work and is for attribution runs only.
 
 use super::RouteSubmission;
+use crate::completion::Committed;
 use crate::api::device::DeviceInner;
 use crate::backends::OpenedKind;
 use seismic_compiler::errors::ExecutionError;
@@ -25,6 +26,8 @@ pub enum TraceError {
     /// Another trace is already active on the device.
     AlreadyActive,
     Execution(ExecutionError),
+    /// The traced work's issue failed after it committed a prefix.
+    Issue(crate::api::CallError),
 }
 
 impl std::fmt::Display for TraceError {
@@ -32,6 +35,7 @@ impl std::fmt::Display for TraceError {
         match self {
             Self::AlreadyActive => formatter.write_str("a submission trace is already active"),
             Self::Execution(error) => write!(formatter, "{error}"),
+            Self::Issue(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -47,12 +51,21 @@ pub fn host_seconds() -> f64 {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-        ORIGIN
-            .get_or_init(std::time::Instant::now)
-            .elapsed()
-            .as_secs_f64()
+        origin().elapsed().as_secs_f64()
     }
+}
+
+/// The instant [`host_seconds`] counts from.
+#[cfg(not(target_os = "macos"))]
+fn origin() -> std::time::Instant {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *ORIGIN.get_or_init(std::time::Instant::now)
+}
+
+/// `instant` on the [`host_seconds`] clock.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn host_seconds_at(instant: std::time::Instant) -> f64 {
+    instant.saturating_duration_since(origin()).as_secs_f64()
 }
 
 /// Evaluated physical geometry of a traced launch.
@@ -91,7 +104,31 @@ pub struct TracedSubmission {
     pub device: (f64, f64),
     /// Launches in order. Device intervals are present at launch detail.
     pub launches: Vec<TracedLaunch>,
+    /// The queue submissions the work was divided into, in order, on a
+    /// backend that divides it at its timeline boundaries (Vulkan, whose
+    /// parks and publications end queue submissions); empty on one that
+    /// submits it whole (CPU, CUDA, Metal).
+    pub queue: Vec<TracedQueueSubmission>,
 }
+
+/// One queue submission of a traced submission. Times are [`host_seconds`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TracedQueueSubmission {
+    /// When it was handed to the queue (the instant before the submission
+    /// call that took it): at its commit, or, where it was held behind a
+    /// host gate (a park), when the gate's raising released it.
+    pub handed: f64,
+    /// When that submission call returned.
+    pub taken: f64,
+    /// Where it was handed to the queue waiting on a gate the host had not
+    /// raised, when the host raised the last of them and why; `None` where
+    /// its gates were raised (or it had none) as it was handed over.
+    pub opened: Option<(f64, GateOpening)>,
+    /// Device execution interval.
+    pub device: (f64, f64),
+}
+
+pub use seismic_native_target::GateOpening;
 
 struct Pending {
     route: Arc<RouteSubmission>,
@@ -104,9 +141,9 @@ enum Timeline {
     /// Device intervals are already host times (CPU, and Metal at
     /// submission detail).
     Host,
-    /// Metal at launch detail: the trace's shared timestamp samples.
+    /// Metal at launch detail: the process's timestamp page pool.
     #[cfg(target_os = "macos")]
-    Metal(Arc<seismic_metal::LaunchTimestamps>),
+    Metal(&'static seismic_metal::LaunchTimestamps),
     Cuda(seismic_cuda::direct::TimelineAnchor),
     #[cfg(not(target_os = "macos"))]
     Vulkan(seismic_vulkan::direct::TimelineAnchor),
@@ -123,12 +160,12 @@ impl TraceSink {
         self.detail
     }
 
-    /// The timestamp samples of a Metal launch-detail trace.
+    /// The timestamp pages of a Metal launch-detail trace.
     #[cfg(target_os = "macos")]
-    pub(super) fn metal_timestamps(&self) -> &Arc<seismic_metal::LaunchTimestamps> {
-        match &self.timeline {
+    pub(super) fn metal_timestamps(&self) -> &'static seismic_metal::LaunchTimestamps {
+        match self.timeline {
             Timeline::Metal(timestamps) => timestamps,
-            _ => unreachable!("a Metal launch-detail trace always holds timestamp samples"),
+            _ => unreachable!("a Metal launch-detail trace always holds timestamp pages"),
         }
     }
 
@@ -171,10 +208,10 @@ impl SubmissionTrace {
             ),
             #[cfg(target_os = "macos")]
             OpenedKind::Metal(opened) if detail == TraceDetail::Launches => {
-                Timeline::Metal(Arc::new(
-                    seismic_metal::LaunchTimestamps::new(opened.service())
+                Timeline::Metal(
+                    seismic_metal::LaunchTimestamps::shared(opened.service())
                         .map_err(TraceError::Execution)?,
-                ))
+                )
             }
             _ => Timeline::Host,
         };
@@ -198,9 +235,7 @@ impl SubmissionTrace {
     }
 
     /// Wait for every submission recorded so far and return them in
-    /// submission order, leaving the trace active and empty. Launch-detail
-    /// traces reuse their timestamp samples afterwards, so no submission on
-    /// the device may be in flight outside the trace (single-submitter use).
+    /// submission order, leaving the trace active and empty.
     pub fn collect(&self) -> Result<Vec<TracedSubmission>, TraceError> {
         let pending = std::mem::take(
             &mut *self
@@ -209,52 +244,54 @@ impl SubmissionTrace {
                 .lock()
                 .expect("trace sink lock is never poisoned"),
         );
-        let resolved = pending
+        pending
             .into_iter()
             .map(|pending| self.resolve(pending))
-            .collect();
-        #[cfg(target_os = "macos")]
-        if let Timeline::Metal(timestamps) = &self.sink.timeline {
-            timestamps.reset();
-        }
-        resolved
+            .collect()
     }
 
     fn resolve(&self, pending: Pending) -> Result<TracedSubmission, TraceError> {
         let execution = TraceError::Execution;
-        let (device, intervals) = match (&*pending.route, &self.sink.timeline) {
-            (RouteSubmission::Cpu { outcome, interval }, _) => {
+        let committed = match &*pending.route {
+            RouteSubmission::Committed(committed) => committed,
+            RouteSubmission::Failed(failure) => return Err(TraceError::Issue(failure.outcome())),
+        };
+        let (device, intervals, queue) = match (committed, &self.sink.timeline) {
+            (Committed::Cpu { outcome, interval }, _) => {
                 outcome.clone().map_err(execution)?;
-                (*interval, None)
+                (*interval, None, Vec::new())
             }
             #[cfg(target_os = "macos")]
-            (RouteSubmission::Metal(submission), _) => {
+            (Committed::Metal(submission), _) => {
                 submission.finish().map_err(execution)?;
                 (
-                    submission.device_interval(),
+                    submission.device_interval().map_err(execution)?,
                     submission.launch_intervals().map_err(execution)?,
+                    Vec::new(),
                 )
             }
-            (RouteSubmission::Cuda(submission), Timeline::Cuda(anchor)) => {
+            (Committed::Cuda(submission), Timeline::Cuda(anchor)) => {
                 submission.finish().map_err(execution)?;
                 (
                     submission.device_interval(anchor).map_err(execution)?,
                     submission.launch_intervals(anchor).map_err(execution)?,
+                    Vec::new(),
                 )
             }
-            (RouteSubmission::Cuda(_), _) => {
+            (Committed::Cuda(_), _) => {
                 unreachable!("a CUDA device trace always holds a CUDA timeline")
             }
             #[cfg(not(target_os = "macos"))]
-            (RouteSubmission::Vulkan(submission), Timeline::Vulkan(anchor)) => {
+            (Committed::Vulkan(submission), Timeline::Vulkan(anchor)) => {
                 submission.finish().map_err(execution)?;
                 (
                     submission.device_interval(anchor).map_err(execution)?,
                     submission.launch_intervals(anchor).map_err(execution)?,
+                    submission.queue_submissions(anchor).map_err(execution)?,
                 )
             }
             #[cfg(not(target_os = "macos"))]
-            (RouteSubmission::Vulkan(_), _) => {
+            (Committed::Vulkan(_), _) => {
                 unreachable!("a Vulkan device trace always holds a Vulkan timeline")
             }
         };
@@ -280,6 +317,7 @@ impl SubmissionTrace {
             committed: pending.committed,
             device,
             launches,
+            queue,
         })
     }
 }

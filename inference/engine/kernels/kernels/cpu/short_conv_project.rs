@@ -58,9 +58,9 @@ fn short_conv_project_rows<L: Isa, E: Elements>(
     if group[0] < segment {
         let rows = projection::item_rows(group[0], cx.param_rows(), ch);
         projection::project_pair_staged_arithmetic(
-            &cx.arg_b_weight(),
-            &cx.arg_x_weight(),
-            rows.clone(),
+            (&cx.arg_b_weight(), rows.start),
+            (&cx.arg_x_weight(), rows.start),
+            rows.len(),
             normalized,
             quantized,
             |row, b, x| {

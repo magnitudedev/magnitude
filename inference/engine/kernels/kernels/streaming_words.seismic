@@ -1,0 +1,343 @@
+# Expert streaming's host-shared words (routed.seismic's streaming section):
+# the one statement of every index and extent the host and the device agree
+# on. routed.seismic names them, natives read them as `SEISMIC_CONST_<NAME>`,
+# and the executor as `magnitude_kernels::constants::<NAME>`.
+
+# Placement: the host is the one writer of every map entry, on every
+# backend. Across a link it copies a record's bytes into the bank on the
+# copy engine, off every step's path, then maps it (MAP_* below); a file
+# miss lands into its tier (`tier[e]`). On unified memory it lands a file
+# miss straight into a bank record and maps it; there is no tier.
+
+# ---------------------------------------------------------------------------
+# The streaming contract: the one statement of the
+# words the device, the CPU pool and the host share for a streamed decode
+# layer. Every word is an i32 word of a host-shared tensor (`Tensor::shared`).
+#
+# Steps. A step's sequence q is a u64. Every step the host and the device
+# share across them (a map entry's MAP_FROM and MAP_UNTIL, an exchange
+# slot's SLOT_REQUEST and SLOT_ANSWER) is one u64 at an even word (8-byte
+# aligned, little-endian: the low word first), written as one 64-bit
+# release store and read as one 64-bit acquire load (the device's
+# `streaming_load_u64_acquire`, `streaming_store_u64_release`; the host's
+# `Tensor::load_acquire_u64`, `store_release_u64`), never as two 32-bit
+# accesses.
+#
+# The step word `step[STEP_WORDS]`: the step's sequence (`routed_step`, from
+# the host's `sequence[STEP_WORDS]`, written before the step is submitted),
+# its low word (STEP_LOW) then its high word (STEP_HIGH). The device writes
+# and reads it in order within its queue; the words that tell steps apart
+# only within a flight and that nothing waits on (routing records, hint
+# rings, lists) carry its low word.
+const STEP_LOW = 0
+const STEP_HIGH = 1
+const STEP_WORDS = 2
+
+# The map. A layer's map is `map[E, MAP_WORDS]`, the layer's rows of its
+# group's map `map[GM, MAP_WORDS]` from its home (`policy[POLICY_HOME]`):
+# for each expert e, the first step it is valid for (MAP_FROM) and the
+# first step it is invalid for (MAP_UNTIL, all ones while mapped), each one
+# u64 (above; MAP_WORDS is even, so every row's steps are aligned), then the
+# bank record holding it (MAP_RECORD, its own i32 word, -1 for none). The
+# host is the only writer, and maps only records, so a mapped entry's record
+# is a record; the device treats `record` as held for step q iff FROM <= q
+# < UNTIL, and otherwise as not held.
+# - Map: the host writes RECORD, then FROM (the first step not yet queued,
+#   once the record's copy has completed), then UNTIL all ones, each with
+#   release.
+# - Unmap: the host writes UNTIL (the first step not yet queued) with
+#   release; RECORD and FROM stay.
+# - Reuse: the host writes a record's bytes, or maps it for another entry,
+#   only once every step below the UNTIL of each entry naming it has ended,
+#   by whichever exit, so the device runs none of them (the host's frontier,
+#   `Steps::frontier`: the least step not yet ended).
+# The device reads UNTIL with acquire, then FROM, then RECORD
+# (`streaming_held`), so an UNTIL it reads new carries the FROM and RECORD
+# before it.
+const MAP_FROM = 0
+const MAP_UNTIL = 2
+const MAP_RECORD = 4
+const MAP_WORDS = 6
+
+# The tier map `tier[e]`: the host tier record holding expert e whole, or -1
+# (host: set with release only while the record's bytes are whole, which the
+# device reads with acquire; a record unmapped reused only once every step
+# that could have resolved it has completed).
+
+# A layer's policy `policy[POLICY_WORDS]` (host, between flights, the
+# watcher's `publish_policy`): whether the layer's group is whole
+# (POLICY_WHOLE, nonzero: every layer of it holds every expert at its home
+# record, so nothing misses there and no route reads the map), the layer's home in its group's map (POLICY_HOME), then the
+# lines the route's assignment reads, each in whole nanoseconds, the cost
+# function's own (`assessment::cost`, `Policy::of`):
+# - the CPU's, for a layer with a CPU site, from its site's lines: an
+#   expert of r rows from RAM, POLICY_CPU_NS + (r − 1) POLICY_CPU_ROW_NS,
+#   and the handshake a request adds (POLICY_HANDSHAKE_NS);
+# - the GPU's: an expert of r rows read in place from the host tier,
+#   max(POLICY_LINK_NS, r POLICY_LINK_ROW_NS), and from the bank,
+#   max(POLICY_HIT_NS, r POLICY_HIT_ROW_NS).
+# POLICY_PRICED is set once every line the assignment reads is measured;
+# until then no line is written nor read, and a layer without a site never
+# reads the CPU's. Last, whether no expert of the layer can be absent
+# (POLICY_RESOLVED, nonzero: its group is whole, or its group's host tier
+# keeps every expert), so no step's route can request the file and the
+# tier wait is not encoded, nor its park where parks are submission
+# boundaries.
+#
+# The assignment (`assign` in routed.seismic), per step on the device, is
+# the cost function's (`ExpertLines::serve` at one step's choices, nothing
+# copied, every record whole at the router), stated once here: each
+# distinct expert's rows r are the choices naming it. The GPU's queue
+# starts at its hits, the sum over the distinct hit experts of their
+# resident lines; the CPU's at zero. The distinct missed experts (those the
+# tier holds; across a link also those it lacks, which land in it first)
+# are taken by rows, most first, ties in choice order; each goes to the CPU
+# when it ends there no later than in place (its line, plus the handshake
+# for the CPU's first), else to the GPU in place. Until POLICY_PRICED is set
+# (every line it reads measured, a site's CPU lines among them) no miss is
+# assigned: every one is the GPU's in place, the CPU site off. Every choice
+# of an expert goes to its expert's side.
+const POLICY_WHOLE = 0
+const POLICY_HOME = 1
+const POLICY_PRICED = 2
+const POLICY_CPU_NS = 3
+const POLICY_CPU_ROW_NS = 4
+const POLICY_HANDSHAKE_NS = 5
+const POLICY_LINK_NS = 6
+const POLICY_LINK_ROW_NS = 7
+const POLICY_HIT_NS = 8
+const POLICY_HIT_ROW_NS = 9
+const POLICY_RESOLVED = 10
+const POLICY_WORDS = 11
+
+# The exchange: the one protocol by which the device
+# asks the host for anything and waits for its answer. Every request is a
+# slot of a table of its kind; step q's slot of a table of S slots is slot
+# q mod S. The host queues step q + S only once step q has ended, so a slot
+# is the step's alone from its request until its answer is read, and
+# answers never cross. A slot's words:
+# - SLOT_REQUEST, a u64: the step the slot is requested for, stored by the
+#   requester last, after the request's payload, with release;
+# - SLOT_ANSWER, a u64: the step, or the step with SLOT_FAILED set, stored
+#   by the answerer last, after the answer's payload, with release; it only
+#   moves forward (an answer for a step no later than the one it holds
+#   leaves it), so a late answer never overwrites a later step's;
+# - SLOT_PULSE, an i32 the host's pulse advances every PULSE_MS while the
+#   host lives (below), in every slot of every table;
+# - SLOT_EXPIRED, a u64: the step whose wait on the slot ended on its still
+#   pulse before its answer, stored by that waiting kernel alone (below);
+# - from SLOT_PAYLOAD, the kind's payload (each kind below).
+# The one wait rule, every wait's on every backend (`slot_answered` in
+# routed.seismic, which the device's `streaming_await_slot` and the host's
+# `exchange::ExchangeTable::answered` compute): step q's wait on its slot is over
+# once the slot's request is not q (nothing was asked, so nothing is
+# awaited), or its answer is q or q | SLOT_FAILED. A wait reads an answer's
+# payload only after the answer, and only on the step's answer, never on
+# its failure. Every request is answered, by its step or by its failure,
+# while the host lives; a stuck host is the host watchdog's to abort.
+#
+# A host that is gone answers nothing, and a spinning wait is the one
+# kernel with no end of its own. Metal does not end a dead process's
+# running kernel: the process ends, but its GPU stays busy and its memory
+# held until a reboot (a streamed step stopped in decode on an M4 Pro,
+# 2026-11-02; NVIDIA's driver ends it within a second). So the host proves
+# it lives: its load's pulse (`exchange::Pulse`), which every table joins
+# as it is made, advances every slot's SLOT_PULSE every PULSE_MS, and a
+# spinning wait ends, as on its step's failure, once that word has not
+# moved for PULSE_SPINS of its spins, at the device's own cost of a spin:
+# at least 100 ms at the fastest spin measured (70 ns, an idle M4 Pro),
+# under a second on a Mac (535 ns, its slowest), and longer across a
+# discrete device's bus, whose spins read host memory over it (a 3090's and
+# a 4070's waits outlasted 1.2 s of still pulse).
+# A live host meets that end only if its pulse starves for that long (a
+# loaded machine): the wait then stores its step as the slot's SLOT_EXPIRED,
+# and the host interrupts that step, its outputs unused and its seeds never
+# mapped, and re-runs it from its accepted state (the scheduler's round
+# driver); a late beat no wait outlasted, or a shorter stall, touches
+# nothing. How long a live host's answer may take is the
+# watchdog's alone (its bound from the load's lines).
+#
+# How a backend waits is the backend's one fact (`SEISMIC_PARKS_IN_KERNELS`,
+# from `BackendName::parks_in_kernels`): Metal and CUDA spin in the waiting
+# kernel; Vulkan, whose running work sees no host write, waits at a park
+# before the waiting call, a submission boundary the host opens once the
+# rule holds (the executor's `watcher::parks`). A wait whose request is its
+# own arrival (a scratch round's) stores its request as it begins: in its
+# kernel, or on Vulkan by the host as the device reaches its park, where
+# every write the device made before it is the host's to read.
+const SLOT_REQUEST = 0
+const SLOT_ANSWER = 2
+const SLOT_PULSE = 4
+const SLOT_EXPIRED = 6
+const SLOT_PAYLOAD = 8
+# The failure bit of an answer, bit 63: bit 31 of its high word.
+const SLOT_FAILED = 2147483648
+# The host's pulse period, and the spins a wait sees its pulse still before
+# it ends (above).
+const PULSE_MS = 10
+const PULSE_SPINS = 1500000
+
+# The site kind: a sited layer's misses the route gave the CPU
+# (`routed_site_request`, then the combine's wait), each a tensor of the
+# layer:
+# - `site[FLIGHT, R]` (R >= SITE_ENTRIES + SITE_ENTRY_WORDS M K, even), the
+#   slots. The request's payload: the count of entries (SITE_COUNT), then
+#   each entry from SITE_ENTRIES: the decode row it serves (SITE_ROW), the
+#   host tier record the CPU computes it from (SITE_TIER_RECORD), the expert
+#   it routed to, whose per-expert scales the CPU applies (SITE_EXPERT), and
+#   its routing weight's f32 bits as the combine applies it
+#   (SITE_WEIGHT_BITS). An expert two rows chose is two entries. The CPU
+#   pool answers it.
+# - `site_rows[FLIGHT, DECODE_ROWS, H]` f32, the request's payload too: the
+#   layer's expert input rows, widened to f32 exactly.
+# - `site_output[FLIGHT, DECODE_ROWS, H]` f32, the answer's payload: for
+#   each row, the weighted sum over its entries of the CPU's expert outputs.
+# A step with no CPU entry requests nothing and waits for nothing. The
+# combine adds the output on the step's answer, and nothing on its failure
+# (the host fails exactly the rows that named a failed expert).
+const SITE_COUNT = 8
+const SITE_ENTRIES = 9
+const SITE_ROW = 0
+const SITE_TIER_RECORD = 1
+const SITE_EXPERT = 2
+const SITE_WEIGHT_BITS = 3
+const SITE_ENTRY_WORDS = 4
+
+# A decode step's sources at a layer, the route's snapshot
+# `sources[SOURCE_ROWS, M, K]` every later entry of the layer reads: each
+# choice's record the GPU reads (SOURCE_RECORD: a bank record >= 0, a tier
+# record t read in place as -2 - t, or -1: the GPU computes nothing for the
+# choice), and the host tier record the CPU computes it from (SOURCE_SITE,
+# or -1). A choice is the GPU's whole or the CPU's whole.
+const SOURCE_RECORD = 0
+const SOURCE_SITE = 1
+const SOURCE_ROWS = 2
+
+# The file kind: a decode layer's experts neither its bank nor its tier
+# holds (file misses, which land first), its table `file[FLIGHT, FW]` (FW >=
+# FILE_ENTRIES + FILE_ENTRY_WORDS P, even; P the decode form's widest
+# choices), the slots. The payload: the count of choices (FILE_COUNT), then
+# each choice's entry from FILE_ENTRIES, FILE_ENTRY_WORDS words: the
+# request's word (FILE_CHOICE, `routed_route_streamed`'s), an absent
+# expert as itself, any other as -1 - expert; and for an absent choice the
+# answer's (FILE_RECORD, the host's, which `routed_tier_wait` reads), the
+# record its expert landed in and was mapped at (a bank record r on unified
+# memory, where the host lands into the bank; a tier record t as -2 - t
+# across a link; -1 for a failed read). A step with no absent choice
+# requests nothing.
+const FILE_COUNT = 8
+const FILE_ENTRIES = 9
+const FILE_CHOICE = 0
+const FILE_RECORD = 1
+const FILE_ENTRY_WORDS = 2
+
+# A streamed decode route's written grids `grids[DECODE_GRIDS, 3]`, written
+# by every route, whole or not: the tier wait's (WAIT_GRID,
+# `routed_tier_wait`'s `grid`): one threadgroup, or none when no choice is
+# absent.
+const WAIT_GRID = 0
+const DECODE_GRIDS = 1
+
+# The scratch kind: a scratch-served step's request at a layer and its
+# rounds, the layer's table `scratch[FLIGHT, SCRATCH_SLOT LANES]` (LANES =
+# SCRATCH_ROUND + R), step q's slot q mod FLIGHT of lanes of SCRATCH_SLOT words
+# each:
+# - lane SCRATCH_ASK, the request (`routed_scratch_request`, its experts in
+#   its chain place's flags). The answer's payload, the count of records its
+#   rounds convert (SCRATCH_STAGED), is the host's before it answers round
+#   0; its answer is the step once that count is final.
+# - lane SCRATCH_ROUND + r, round r's (`routed_scratch_wait`): its request
+#   is the device's arrival at the round, which its wait stores as it
+#   begins; its answer, the round's records ready to convert. The host
+#   answers every round of a request, the rounds without records too, and
+#   a failure fails every round not yet answered, the last always among
+#   them. The device arrives at every round the host awaits its arrival
+#   at: each with records, and every round where round 0's wait ended on
+#   its still pulse before the request's answer (`routed_scratch_grids`),
+#   so a host serving a step's rounds in order never waits on an arrival
+#   that an expired wait skipped.
+const SCRATCH_ASK = 0
+const SCRATCH_ROUND = 1
+const SCRATCH_STAGED = 8
+const SCRATCH_SLOT = 10
+
+# ---------------------------------------------------------------------------
+# The rest of expert streaming's words.
+
+# A scratch request's round grids `grids[R, ROUND_GRIDS, 3]`
+# (`routed_scratch_grids`): each round's park's, and its converts' over
+# records of F rows and of H rows.
+const ROUND_GRIDS = 3
+const PARK_GRID = 0
+const ROWS_GRID = 1
+const COLUMNS_GRID = 2
+
+# A ring `ring[RING]`, a hint ring's or a routing record's: the sequence
+# (the step's low word) and the count, then its entries from RING_EXPERTS. A
+# routing record's are its choices' experts, RING >= RING_EXPERTS + M K (each
+# choice's source after them, `routing` below); a hint ring's are pairs,
+# RING >= RING_EXPERTS + HINT_ENTRY_WORDS M K: each hinted expert
+# (HINT_EXPERT) and the rank of the choice it was hinted as (HINT_RANK, 0 a
+# row's best), by which the host keeps each hint's precision, whatever the
+# rows.
+const RING_SEQUENCE = 0
+const RING_COUNT = 1
+const RING_EXPERTS = 2
+const HINT_ENTRY_WORDS = 2
+const HINT_EXPERT = 0
+const HINT_RANK = 1
+
+# A layer's routing records `routing[FLIGHT, ROUTING]`, ROUTING >=
+# RING_EXPERTS + 2 P, one for each step in flight (the host's bound on steps
+# begun and not ended), the one of a step's sequence mod FLIGHT: a ring's
+# words, then from RING_EXPERTS + P each choice's source as the route
+# resolved it (SOURCE_RECORD's word, a CPU choice's -1). Sequences are
+# consecutive, so no step's record is rewritten before the host has read it.
+
+# A list `list[LIST_ENTRIES + LIST_ENTRY_WORDS L]` (`routed_copy`,
+# `routed_convert`, `routed_seed_commit`): the sequence it was written
+# for and the count, then each entry's from and to words.
+const LIST_SEQUENCE = 0
+const LIST_COUNT = 1
+const LIST_ENTRIES = 2
+const LIST_ENTRY_WORDS = 2
+const LIST_FROM = 0
+const LIST_TO = 1
+
+# A group's words of a list it reads (streaming/list.hpp): the pair of the
+# entry it visits (LIST_GROUP_PAIR, its from and to words), the first entry
+# of the chunk it staged (LIST_GROUP_FIRST) and the chunk's count
+# (LIST_GROUP_STAGED), then from LIST_GROUP_CHUNK the chunk's entries, at
+# most LIST_CHUNK.
+const LIST_GROUP_PAIR = 0
+const LIST_GROUP_FIRST = 2
+const LIST_GROUP_STAGED = 3
+const LIST_GROUP_CHUNK = 4
+const LIST_CHUNK = 32
+
+# A list's launch grid `grid[3]` (`routed_list_grid`), on which `routed_copy`
+# copies its entries: a row of `grid[0]` threadgroups, the copy's blocks,
+# which its host writes once (a copy within device memory LIST_GROUPS by
+# LIST_ROWS; a copy over the link the fewest that reach the link's rate,
+# `assessment::TierCopyCosts`), while the step's list has entries; none for
+# a list another step wrote or one of no entries, so a copy of nothing
+# launches nothing. Each threadgroup copies
+# its own LIST_PART-byte parts of the listed records in turn, apart from
+# every other, so a copy over the link keeps every group's reads in flight
+# (an RTX 3090, PCIe 3.0 x16, 2026-11-02, the list staged in device memory:
+# 576 KiB records from host memory at 9.6 GB/s for 4 records to 12.6 GB/s
+# for 192, against the copy engine's 9.9 and 12.2 and the link's ~13).
+const LIST_GROUPS = 64
+const LIST_ROWS = 8
+const LIST_PART = 16384
+
+# The threads of the protocol entries' one-group launches, every backend's
+# (unmeasured: each launch moves a few words, so no backend's choice is a
+# measured one): a launch whose work is one thread's (a step word, a wait,
+# a round's grids; SERIAL_THREADS), a group reading or staging a list or a
+# map, or copying listed records (LIST_THREADS, also `routed_copy`'s and
+# `routed_move`'s groups), and the scratch request's group, a thread a
+# choice of the widest decode (REQUEST_THREADS).
+const SERIAL_THREADS = 32
+const LIST_THREADS = 256
+const REQUEST_THREADS = 1024

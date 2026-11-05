@@ -19,7 +19,7 @@ use magnitude_executor::{
     CatalogError, CatalogFailure, ResourcePlan, ResourcePlanner, SEARCH_VERSION, StateBindings,
     TokenId, TracedWork, TunedEntry, TuningCacheKey, TuningContext, TuningEvent, TuningObserver,
     TuningOrigin, TuningSettings, TuningTrace, UnpreparedUnits, WeightImportError, WorkKind,
-    memory::{ClaimId, HoldingClass},
+    memory::{ClaimDemand, ClaimId, HoldingClass},
     platform::{self, DeviceRequest, OpenedPlatform, PlatformConfig, PlatformError},
     require_normal,
 };
@@ -40,6 +40,8 @@ pub(crate) struct NativeDomain {
     pub bindings: StateBindings,
     pub plan: ResourcePlan,
     pub device: ExecutorSelector,
+    /// What prices a streamed load's experts again; none without a bank.
+    pub pricing: Option<ExpertPricing>,
 }
 
 fn internal(reason: impl Into<String>) -> LoadError {
@@ -94,8 +96,13 @@ pub fn build_native_domain(
 pub(crate) struct PreparedPrograms {
     startup: StartupClaims,
     pub draft: ExecutionPlanDraft,
+    /// `draft` before the weight cap: every expert resident.
+    pub resident: ExecutionPlanDraft,
     pub opened: OpenedPlatform,
     pub programs: AttestedPrograms,
+    /// Each streamed layer's request of its CPU site's verdict
+    /// (`ExecutionPlanDraft::site_requests`).
+    site_requests: Vec<Option<magnitude_executor::assessment::SiteRequest>>,
     pub backend: BackendName,
     pub capacity: ResourceCapacity,
     /// The load's one set of worker threads: everything its preparation
@@ -110,11 +117,56 @@ pub(crate) struct PreparedPrograms {
 struct PlannedModel {
     startup: StartupClaims,
     draft: ExecutionPlanDraft,
+    /// `draft` before the weight cap: every expert resident.
+    resident: ExecutionPlanDraft,
     opened: OpenedPlatform,
     backend: BackendName,
     capacity: ResourceCapacity,
     kernel_cache: Option<Arc<KernelCache>>,
     numerical_profile: magnitude_executor::ResolvedNumericalProfile,
+}
+
+/// The numerical profile `manifest`'s load is held to.
+fn numerical_profile(manifest: &ExecutionManifest) -> Result<magnitude_executor::ResolvedNumericalProfile, LoadError> {
+    manifest
+        .model
+        .numerical_profile
+        .clone()
+        .unwrap_or_else(magnitude_executor::NumericalProfile::standard)
+        .resolve()
+        .map_err(internal)
+}
+
+/// What a load of a manifest plans before it opens a device.
+struct LoadPlans {
+    /// The plan before the weight cap: every expert resident, what a streamed
+    /// load's growth is priced on.
+    resident: ExecutionPlanDraft,
+    /// The plan the load runs.
+    draft: ExecutionPlanDraft,
+    kernel_cache: Option<Arc<KernelCache>>,
+}
+
+/// Plan `manifest`'s load on `selected`: the same derivation metadata-only
+/// assessment and preview plan through (`planning::plan_execution`), its
+/// resident plan kept.
+fn plan_load(manifest: &ExecutionManifest, selected: &platform::SelectedDevice) -> Result<LoadPlans, LoadError> {
+    let backend = selected.info.backend();
+    let planned = |error: crate::planning::ExecutionPlanningError| -> LoadError {
+        match error {
+            crate::planning::ExecutionPlanningError::Plan(error) => classify_plan(error, backend).into(),
+            error => internal(error.to_string()),
+        }
+    };
+    let resident = crate::planning::plan_resident(manifest, selected).map_err(planned)?;
+    let kernel_cache = manifest
+        .kernel_cache
+        .clone()
+        .map(|root| KernelCache::open(root, DEFAULT_KERNEL_CACHE_BYTES).map(Arc::new))
+        .transpose()
+        .map_err(|error| internal(error.to_string()))?;
+    let draft = crate::planning::plan_banked(manifest, resident.clone(), kernel_cache.as_deref()).map_err(planned)?;
+    Ok(LoadPlans { resident, draft, kernel_cache })
 }
 
 /// Select and open the manifest's device and plan the model on it.
@@ -136,8 +188,10 @@ fn plan_on_device(
     // exact selector from the host is re-resolved here; a missing or
     // ambiguous match is refused, never substituted.
     let reserves = manifest.reserves;
-    let selected = platform::select_device(&catalog, manifest.path, manifest.device, &reserves)
-        .map_err(platform_error)?;
+    let selected = crate::planning::select_load_device(&catalog, manifest).map_err(platform_error)?;
+    if let (Some(root), platform::GraphPricing::Bound(_)) = (&manifest.kernel_cache, selected.graph_cost) {
+        touch(root, &selected.identity, &[magnitude_executor::assessment::PointRequest::GraphCost]);
+    }
     let backend = selected.info.backend();
     let capacity = ResourceCapacity {
         domain_bytes: selected.assessment_capacity_bytes,
@@ -145,20 +199,22 @@ fn plan_on_device(
             selected.info.forms_tensor_operations(),
         ),
     };
-    // The same derivation metadata-only assessment and preview plan through.
-    let draft =
-        crate::planning::plan_execution(manifest, &selected).map_err(|error| match error {
-            crate::planning::ExecutionPlanningError::Plan(error) => {
-                classify_plan(error, backend).into()
-            }
-            error => internal(error.to_string()),
-        })?;
-    let kernel_cache = manifest
-        .kernel_cache
-        .clone()
-        .map(|root| KernelCache::open(root, DEFAULT_KERNEL_CACHE_BYTES).map(Arc::new))
-        .transpose()
-        .map_err(|error| internal(error.to_string()))?;
+    let LoadPlans { resident, draft, kernel_cache } = plan_load(manifest, &selected)?;
+    if let Some(bank) = draft.load().expert_bank() {
+        let weights = draft.load().weight_bytes().map_err(internal)?;
+        let slot = bank.slot_bytes().map_err(internal)?;
+        tracing::info!(
+            "expert bank: {} of the widest routed layer's {} experts in {} groups; \
+             weights {weights} bytes, {slot} more a slot",
+            bank.slots,
+            bank.widest(),
+            bank.groups.len(),
+        );
+    }
+    tracing::info!(
+        "prompt groups chain up to {} places",
+        draft.policy().limits().chain_capacity,
+    );
     report_load_phase("device selection and planning", &mut phase_started);
     let opened = platform::open_selected(
         &catalog,
@@ -168,21 +224,16 @@ fn plan_on_device(
             artifacts: kernel_cache
                 .clone()
                 .map(|cache| cache as Arc<dyn seismic::ArtifactStore>),
+            graph_cost: Some(draft.device().graph_cost()),
             reserves,
         },
     )
     .map_err(platform_error)?;
     report_load_phase("device open", &mut phase_started);
-    report_load_memory("device opened", opened.device());
-    let numerical_profile = manifest
-        .model
-        .numerical_profile
-        .clone()
-        .unwrap_or_else(magnitude_executor::NumericalProfile::standard)
-        .resolve()
-        .map_err(internal)?;
+    report_load_memory("device opened", &catalog, opened.device());
+    let numerical_profile = numerical_profile(manifest)?;
     let mut startup = StartupClaims {
-        heap: DeviceHeap::open(catalog, reserves, Rc::new(opened.device().clone()))
+        heap: DeviceHeap::open(catalog.clone(), reserves, Rc::new(opened.device().clone()))
             .map_err(|error| platform_error(PlatformError::Memory(error)))?,
         held: None,
     };
@@ -197,6 +248,7 @@ fn plan_on_device(
     Ok(PlannedModel {
         startup,
         draft,
+        resident,
         opened,
         backend,
         capacity,
@@ -211,6 +263,7 @@ fn tuning_report(
     manifest: &ExecutionManifest,
     work: TracedWork,
     numerical_profile: &magnitude_executor::ResolvedNumericalProfile,
+    device: &seismic::Device,
     progress: Rc<dyn Fn(LoadProgress)>,
 ) -> Result<TuningReport, LoadError> {
     Ok(TuningReport {
@@ -219,7 +272,7 @@ fn tuning_report(
         trace: manifest
             .tuning_trace
             .as_deref()
-            .map(|path| TuningTrace::begin(path, work, manifest.tuning, numerical_profile))
+            .map(|path| TuningTrace::begin(path, work, manifest.tuning, numerical_profile, device.properties()))
             .transpose()
             .map_err(internal)?,
     })
@@ -243,9 +296,9 @@ pub(crate) fn search(
         kernel_cache,
         numerical_profile,
         ..
-    } = plan_on_device(catalog, manifest, package, progress.as_ref())?;
+    } = plan_on_device(catalog.clone(), manifest, package, progress.as_ref())?;
     let searching = Instant::now();
-    let report = tuning_report(manifest, TracedWork::Search, &numerical_profile, progress)?;
+    let report = tuning_report(manifest, TracedWork::Search, &numerical_profile, opened.device(), progress)?;
     let tuned = AttestedPrograms::search_draft(
         &draft,
         opened.device(),
@@ -264,8 +317,8 @@ pub(crate) fn search(
         trace.conclude(&tuned).map_err(internal)?;
     }
     let sum = |part: fn(&TunedEntry) -> f64| tuned.iter().map(part).sum::<f64>();
-    eprintln!(
-        "magnitude-engine: searched in {:.2} s, {:.2} s of it tuning {} entries \
+    tracing::info!(
+        "searched in {:.2} s, {:.2} s of it tuning {} entries \
          ({} searched, {} stored; building inputs {:.2} s, forming {:.2} s, measuring {:.2} s, \
          validating {:.2} s)",
         searching.elapsed().as_secs_f64(),
@@ -284,7 +337,7 @@ pub(crate) fn search(
         sum(|tuned| tuned.time.measuring_seconds),
         sum(|tuned| tuned.time.validating_seconds),
     );
-    report_load_memory("searched", opened.device());
+    report_load_memory("searched", &catalog, opened.device());
     if let Some(cache) = &kernel_cache {
         cache.store_prepared(&prepared_key(manifest)?);
     }
@@ -377,16 +430,17 @@ fn prepare(
     let PlannedModel {
         startup,
         draft,
+        resident,
         opened,
         backend,
         capacity,
         kernel_cache,
         numerical_profile,
-    } = plan_on_device(catalog, manifest, package, progress.as_ref())?;
+    } = plan_on_device(catalog.clone(), manifest, package, progress.as_ref())?;
     let preparing = Instant::now();
     let workers = Arc::new(seismic::Workers::of_the_host());
     opened.device().staff(Some(workers.clone()));
-    let report = tuning_report(manifest, TracedWork::Load, &numerical_profile, progress)?;
+    let report = tuning_report(manifest, TracedWork::Load, &numerical_profile, opened.device(), progress)?;
     let mut programs = match AttestedPrograms::prepare_draft(
         &draft,
         opened.device(),
@@ -405,8 +459,8 @@ fn prepare(
             failure: CatalogFailure::Unprepared { entry, bindings },
             ..
         }) => {
-            eprintln!(
-                "magnitude-engine: no stored tuning record for {entry} [{bindings}]: the load \
+            tracing::info!(
+                "no stored tuning record for {entry} [{bindings}]: the load \
                  stops unprepared, before placing anything"
             );
             // The load that follows the Prepare writes the load's trace.
@@ -418,30 +472,39 @@ fn prepare(
         Err(error) => return Err(LoadError::from(classify_catalog(error))),
     };
     let draft = draft
-        .finalize_readout(&manifest.definition, programs.readout_choices())
+        .finalize_readout(&manifest.definition, programs.readout_choices(), kernel_cache.as_deref())
+        .and_then(|draft| draft.finalize_sites(|bank| programs.sited_layers(bank)))
         .map_err(|error| LoadError::from(classify_plan(error, backend)))?;
     if draft.load().readout_choices() != programs.readout_choices() {
         programs
             .discard_readout_choices()
             .map_err(|error| LoadError::from(classify_plan(error, backend)))?;
     }
+    let site_requests = draft.site_requests(&numerical_profile).map_err(internal)?;
     let tuned = programs.tuned();
     if let Some(trace) = &report.trace {
         trace.conclude(tuned).map_err(internal)?;
     }
-    eprintln!(
-        "magnitude-engine: prepared programs in {:.2} s: {} tuned entries from stored records, \
-         {} at canonical defaults for want of one",
+    let formed = opened.device().programs_formed();
+    tracing::info!(
+        "prepared programs in {:.2} s: {} tuned entries from stored records, \
+         {} at canonical defaults for want of one; this process compiled {} programs and loaded \
+         {} through the platform's cache in {:.2} s",
         preparing.elapsed().as_secs_f64(),
         tuned.len(),
         programs.unprepared(),
+        formed.compiles,
+        formed.platform_loads,
+        formed.platform_load_seconds,
     );
-    report_load_memory("programs prepared", opened.device());
+    report_load_memory("programs prepared", &catalog, opened.device());
     Ok(LoadAttempt::Loaded(PreparedPrograms {
         startup,
         draft,
+        resident,
         opened,
         programs,
+        site_requests,
         backend,
         capacity,
         workers,
@@ -462,8 +525,10 @@ pub(crate) fn build(
     let PreparedPrograms {
         mut startup,
         draft,
+        resident,
         opened,
         mut programs,
+        site_requests,
         backend,
         capacity,
         workers,
@@ -527,9 +592,40 @@ pub(crate) fn build(
     )
     .map_err(internal)?;
     let seal = target_graphs.seal_report();
-    eprintln!(
-        "magnitude-engine: sealed {} target graph classes ({} graphs) in {:.2} s",
-        seal.classes, seal.sealed_graphs, seal.seconds
+    tracing::info!(
+        "sealed {} target graph classes ({} graphs) in {:.2} s; a group's pass covers at most {} rows; workspace arena {} bytes",
+        seal.classes,
+        seal.sealed_graphs,
+        seal.seconds,
+        target_graphs.pass_rows(),
+        resources.arena_bytes()
+    );
+    // What the target's graphs are made of, beside what they cost on this
+    // device: what its decode launch's runs replay, as the family is
+    // charged for it (`LaunchGraphs::decode`), and its largest launch
+    // class's, which the family's live slots hold of its device's graph
+    // budget.
+    let family = target_graphs.family();
+    let census = family.census();
+    let graph_cost = opened.device().graph_cost();
+    // The family was charged at this cost, so its every census prices.
+    let cost = |graphs: seismic::GraphCensus| {
+        let bytes = graph_cost.bytes(graphs).expect("a charged family's graphs price at its device's cost");
+        bytes.device + bytes.upload
+    };
+    let decode = family.graphs().decode;
+    // Every plan of a family runs in one of its launches, so it has one.
+    let largest = census.launches.iter().copied().max_by_key(|graphs| cost(*graphs)).expect("a target family has a launch class");
+    tracing::info!(
+        "target graph census: {} layouts; of {} launch classes, the decode class replays {} graphs of {} launches ({} bytes charged), the largest {} of {} ({} bytes charged)",
+        census.layouts,
+        census.launches.len(),
+        decode.graphs,
+        decode.launches,
+        cost(decode),
+        largest.graphs,
+        largest.launches,
+        cost(largest),
     );
     // What the sealed graphs hold on the host against what the plan held
     // them to before any was sealed, from both sides: one line of JSON,
@@ -558,8 +654,8 @@ pub(crate) fn build(
             .and_then(|graphs| graphs.plus(constants))
             .map(heap)
     };
-    eprintln!(
-        "magnitude-engine: sealed graph host heap {}",
+    tracing::info!(
+        "sealed graph host heap {}",
         serde_json::json!({
             "planned_exact": seal.planned.exact(),
             "planned_at_most": graphs(&seal.planned.at_most),
@@ -570,12 +666,11 @@ pub(crate) fn build(
             "held": graphs(&held),
             "held_constants": heap(seal.constants),
             "held_total": total(&held, seal.constants),
-            "mismatched_graphs": seal.mismatched_graphs,
         })
     );
     if let Some(state_graphs) = programs.state_graphs() {
-        eprintln!(
-            "magnitude-engine: state copy graph host heap {}",
+        tracing::info!(
+            "state copy graph host heap {}",
             serde_json::json!({
                 "planned": heap(state_graphs.planned_host_heap()),
                 "held": heap(state_graphs.host_heap()),
@@ -596,13 +691,11 @@ pub(crate) fn build(
     // checked entries evaluated for them, class by class, serve nothing
     // further and are released. The moments on either side say what they
     // held.
-    report_load_memory("graphs sealed", opened.device());
-    eprintln!(
-        "magnitude-engine: released {} evaluated entry shapes",
-        seismic::forget_evaluated_entry_shapes()
-    );
+    report_load_memory("graphs sealed", &catalog, opened.device());
+    let released = seismic::forget_evaluated_entry_shapes();
+    tracing::info!("released {released} evaluated entry shapes");
     report_load_phase("graph and resource planning", &mut phase_started);
-    report_load_memory("graphs planned", opened.device());
+    report_load_memory("graphs planned", &catalog, opened.device());
     if opened.selector() != execution_plan.device().selector() {
         return Err(internal(
             "opened device differs from the selected execution plan",
@@ -639,48 +732,52 @@ pub(crate) fn build(
         state_graphs.as_ref(),
     )
     .map_err(|error| internal(error.to_string()))?;
+    // The load's release thread, which the pools' slots and the expert
+    // bank's storage release on.
+    let releases = resources.releases();
     report_load_phase("resource allocation", &mut phase_started);
-    report_load_memory("resources allocated", &device);
+    report_load_memory("resources allocated", &catalog, &device);
+    // The served file's volume as the job probed it; with no record it reads
+    // at its bounds until a later load's.
+    if let Some(root) = &manifest.kernel_cache {
+        adopt_volumes(root, &device, package.target(), execution_plan.load().expert_bank()).map_err(internal)?;
+    }
     let mut residency = ResidencyStore::new(
         device.clone(),
         programs.clone(),
         execution_plan.clone(),
         resource_identity.clone(),
+        releases.clone(),
     )
     .map_err(|error| internal(error.to_string()))?;
     // The rows steps name of a streamed table are kept beside the kernels,
     // for the next load of the model.
     if let Some(cache) = &manifest.kernel_cache {
         residency.keep_table_rows(cache.join("table-rows"));
+        residency.keep_cpu_site(stored_cpu_site(cache, &device, &site_requests).map_err(internal)?);
     }
     let target_upload = execution_plan
         .load()
         .target_upload_peak_bytes()
         .map_err(|error| internal(error.to_string()))?;
-    let target_peak = plan
-        .bytes()
-        .target_weights
-        .checked_add(target_upload)
-        .ok_or_else(|| internal("target import peak byte count overflow"))?;
     startup.hold_host_tables(
         execution_plan
             .load()
             .host_table_bytes()
             .map_err(|error| internal(error.to_string()))?,
     )?;
-    // Stored-table slots and directories are upload storage; imported
-    // tensors are device storage, of which the upload window is staged.
-    let shared_bytes = execution_plan.load().shared_table_bytes().map_err(internal)?;
+    // Each weight allocation in the storage it lies in, and the upload
+    // window, device storage staged through host RAM.
+    let target_demand = execution_plan.load().weight_demands().map_err(internal)?[0];
     startup.claim_storage(
         "target import",
-        target_peak
-            .checked_sub(shared_bytes)
-            .ok_or_else(|| internal("stored tables exceed the target import peak"))?,
-        shared_bytes,
-        target_upload,
+        target_demand
+            .checked_plus(ClaimDemand { device: target_upload, staged: target_upload, ..ClaimDemand::default() })
+            .ok_or_else(|| internal("target import demand overflows"))?,
     )?;
     let import_progress = progress.clone();
     let import_device = device.clone();
+    let import_catalog = catalog.clone();
     let mut band_observed = Instant::now();
     let target = residency
         .load_target(
@@ -693,7 +790,7 @@ pub(crate) fn build(
                 });
                 if band_observed.elapsed() >= IMPORT_OBSERVATION_INTERVAL {
                     band_observed = Instant::now();
-                    require_normal(&catalog, &import_device, &reserves)?;
+                    require_normal(&import_catalog, &import_device, &reserves)?;
                 }
                 Ok(())
             }),
@@ -704,15 +801,15 @@ pub(crate) fn build(
             }
             error => internal(error.to_string()),
         })?;
-    eprintln!(
-        "magnitude-engine: resident target imported in {:.2} s ({} distinct weights)",
+    tracing::info!(
+        "resident target imported in {:.2} s ({} distinct weights)",
         phase_started.elapsed().as_secs_f64(),
         residency.len(),
     );
     let import = residency.mapped_import_report();
     if import.windows != 0 {
-        eprintln!(
-            "magnitude-engine: mapped import {} weights in {} windows: map {:.3} s, \
+        tracing::info!(
+            "mapped import {} weights in {} windows: map {:.3} s, \
              prepare {:.3} s, submit {:.3} s, wait {:.3} s, publish {:.3} s",
             import.weights,
             import.windows,
@@ -723,7 +820,7 @@ pub(crate) fn build(
             import.publishing.as_secs_f64(),
         );
     }
-    report_load_memory("target imported", &device);
+    report_load_memory("target imported", &catalog, &device);
     phase_started = Instant::now();
     progress(LoadProgress::Finalizing);
     let definition = Rc::new(manifest.definition.clone());
@@ -740,6 +837,7 @@ pub(crate) fn build(
                 programs.clone(),
                 execution_plan.clone(),
                 resource_identity.clone(),
+                releases.clone(),
             )?;
             ComponentLoader::vision(store, definition.clone(), package.clone())
         })
@@ -766,6 +864,8 @@ pub(crate) fn build(
         None
     };
     startup.claim("target binding constants", target_binding_constants, 0)?;
+    // The bank's groups, whose host tier lines the load takes.
+    let bank = execution_plan.load().expert_bank().cloned();
     let (mut domain, bindings) = ExecutorDomain::new(
         Rc::new(execution_plan),
         definition,
@@ -783,7 +883,7 @@ pub(crate) fn build(
         .register_allocated_holdings()
         .map_err(|error| internal(format!("register allocated memory holdings: {error}")))?;
     report_load_phase("state and domain allocation", &mut phase_started);
-    report_load_memory("domain allocated", &device);
+    report_load_memory("domain allocated", &catalog, &device);
     // A drafter that keeps its own history is primed by the warm-up; a draft
     // head reading the target's history keeps none to prime.
     let primes_drafter = head_enabled
@@ -794,19 +894,453 @@ pub(crate) fn build(
                 ..
             }
         );
-    let bindings = warm_up(&mut domain, bindings, primes_drafter)?;
-    report_load_memory("loaded", &device);
+    // What the load is doing from its warm-up until it serves, in the
+    // process's report on demand (`magnitude_executor::diagnostics`).
+    let phase = magnitude_executor::diagnostics::Phase::new("load", "warm-up forward");
+    let mut bindings = warm_up(&mut domain, bindings, primes_drafter)?;
+    phase.enter("loaded memory report");
+    report_loaded_memory(&domain, &catalog, &device).map_err(internal)?;
+    phase.enter("pricing the experts: shrink moves and host storage's routes");
+    let pricing = bank
+        .map(|bank| -> Result<ExpertPricing, LoadError> {
+            let lines = domain.expert_bank_lines().ok_or_else(|| internal("a streamed load opened no expert bank"))?;
+            let pricing = ExpertPricing::new(manifest, &package, resident, (*device).clone(), bank, lines, site_requests)?;
+            domain
+                .measure_experts(expert_measures(&pricing), &mut bindings)
+                .map_err(|error| internal(error.to_string()))?;
+            Ok(pricing)
+        })
+        .transpose()?;
+    phase.enter("serving");
+    domain
+        .serve()
+        .map_err(|error| internal(format!("the loaded model's memory reading: {error}")))?;
     Ok(LoadAttempt::Loaded(NativeDomain {
         domain,
         bindings,
         plan,
         device: device_selector,
+        pricing,
     }))
 }
 
+/// What a streamed load unpriced without a kernel cache lacks: where the
+/// measurement job's records are.
+const UNPRICED: &str = "the load keeps no kernel cache, where the executor's costs are";
+
+/// What prices a streamed load's experts ([`expert_measures`]):
+/// held by the load's worker, which prices them once its warm-up ends and
+/// again each time the service's measurement job stores new records. No
+/// load measures: what is not stored yet it requests of the job
+/// ([`Self::new`]).
+pub(crate) struct ExpertPricing {
+    kernel_cache: Option<std::path::PathBuf>,
+    definition: magnitude_family_contracts::ModelDefinition,
+    /// The model's fingerprint, its miss records' key, and the most misses
+    /// a record of it holds; none where the model has no key, reported once
+    /// as the pricing is made, and its records live for the load alone.
+    keyed: Option<(crate::fingerprint::ModelFingerprint, u64)>,
+    /// The plan before the weight cap: every expert resident.
+    resident: ExecutionPlanDraft,
+    /// The load's executor's identity, its miss records' other key.
+    executor: seismic::Identity,
+    device: seismic::Device,
+    bank: magnitude_executor::ExpertBankPlan,
+    /// The miss record the load stored last, which every store of the
+    /// load's records replaces within what every load stored, across
+    /// pricings (`MissRecord::restored`).
+    previous: Rc<RefCell<Option<magnitude_executor::assessment::MissRecord>>>,
+    /// Each layer's lines the bank holds.
+    lines: Arc<[magnitude_executor::assessment::BankLines]>,
+    /// Each layer's request of its CPU site's verdict, where it holds a
+    /// site: its CPU lines wait on it.
+    sites: Vec<Option<magnitude_executor::assessment::SiteRequest>>,
+    /// The threads that read host memory at once beside the load (its
+    /// process's CPUs), which its memory line is keyed by.
+    readers: u64,
+    /// The points the load's decisions wait on, which it requests of the
+    /// measurement job as it loads and touches each time it prices again
+    /// while their inputs are pending ([`expert_measures`]), so the job
+    /// measures them first.
+    requests: Vec<magnitude_executor::assessment::PointRequest>,
+}
+
+impl ExpertPricing {
+    /// What prices the load's experts, measuring nothing: each layer's lines
+    /// the bank holds (`lines`, `ExpertBank::lines`), beside what the
+    /// measurement job stores, read at each pricing ([`expert_measures`]):
+    /// the executor's costs, a host tier's link line and host memory line,
+    /// and each group's shrink move line. Those the load waits on it
+    /// requests of the job as it loads, so the job measures them first.
+    fn new(
+        manifest: &ExecutionManifest,
+        package: &Package,
+        resident: ExecutionPlanDraft,
+        device: seismic::Device,
+        bank: magnitude_executor::ExpertBankPlan,
+        lines: Arc<[magnitude_executor::assessment::BankLines]>,
+        sites: Vec<Option<magnitude_executor::assessment::SiteRequest>>,
+    ) -> Result<Self, LoadError> {
+        let executor = device
+            .topology()
+            .executor_identity(device.info().id())
+            .ok_or_else(|| internal("the load's executor is not of its topology's revision"))?;
+        let (requests, readers) = expert_requests(&bank, &sites)?;
+        let keyed = crate::fingerprint::ModelFingerprint::from_directory(package.target().directory())
+            .map_err(|error| error.to_string())
+            .and_then(|model| {
+                let largest = crate::assessment::largest_misses(&executor, &model)?.expect("a streamed load's model streams experts");
+                Ok((model, largest))
+            });
+        let keyed = match keyed {
+            Ok(keyed) => Some(keyed),
+            Err(reason) => {
+                tracing::warn!("the load's miss records are not stored and live for the load alone: {reason}");
+                None
+            }
+        };
+        // Requested as the load loads, before its model is resident: the
+        // service's job reads them once it is ([`expert_measures`] touches
+        // those still pending with every pricing).
+        if let Some(root) = &manifest.kernel_cache {
+            touch(root, &executor, &requests);
+        }
+        tracing::info!(
+            "the expert host lines of {} layers, {} with CPU lines",
+            lines.len(),
+            lines.iter().filter(|line| line.cpu.is_some()).count(),
+        );
+        Ok(Self {
+            kernel_cache: manifest.kernel_cache.clone(),
+            definition: manifest.definition.clone(),
+            keyed,
+            resident,
+            executor,
+            device,
+            bank,
+            previous: Rc::default(),
+            lines,
+            sites,
+            readers,
+            requests,
+        })
+    }
+
+    /// A pricing of `bank` on `device`, planned as `resident` of
+    /// `definition`, its executor's costs and miss records kept in
+    /// `kernel_cache`, measured nothing of its own: its layers take no
+    /// lines, its shrink no move line, and its model has no key, so
+    /// no record is stored. What a test prices a live load by as costs are
+    /// stored.
+    #[cfg(test)]
+    pub(crate) fn unmeasured(
+        kernel_cache: std::path::PathBuf,
+        definition: magnitude_family_contracts::ModelDefinition,
+        resident: ExecutionPlanDraft,
+        device: seismic::Device,
+        bank: magnitude_executor::ExpertBankPlan,
+    ) -> Self {
+        let executor = device
+            .topology()
+            .executor_identity(device.info().id())
+            .expect("a device is of its topology's revision");
+        Self {
+            kernel_cache: Some(kernel_cache),
+            definition,
+            keyed: None,
+            resident,
+            executor,
+            device,
+            bank,
+            previous: Rc::default(),
+            lines: Arc::from([]),
+            sites: Vec::new(),
+            readers: 1,
+            requests: Vec::new(),
+        }
+    }
+}
+
+/// What a streamed load's experts are priced on now, by `pricing`,
+/// measuring nothing, each input in its state (`assessment::Priced`): the
+/// bank's lines beside the host memory line, the link line and the move
+/// lines the job stored; the records stored where assessment reads them, under the model's
+/// fingerprint, where the cache is; and, on the executor's stored costs,
+/// the resident step the growth is priced on, `resident` the plan before
+/// the weight cap, and the routed pass each streamed layer's prompt groups
+/// and GPU lines are priced on (`ExpertLines::priced`, beside the load's
+/// host lines). Each call reads what is stored then, so a
+/// pricing after the measurement job stored more is priced on it.
+pub(crate) fn expert_measures(pricing: &ExpertPricing) -> magnitude_executor::ExpertMeasures {
+    use magnitude_executor::assessment::{
+        BankLines, CeilingError, ConvertCosts, ExpertLines, ExpertPass, HostLines, MemoryCosts, MemoryError, MoveCosts, MoveError, PointRequest, PricingError,
+        Priced, StoredMisses, TierCopyCosts, TierCopyError,
+    };
+    use magnitude_executor::MissStoreError;
+    let (device, bank) = (&pricing.device, &pricing.bank);
+    let Some(root) = &pricing.kernel_cache else {
+        return magnitude_executor::ExpertMeasures {
+            lines: Priced::Unavailable(UNPRICED.into()),
+            store: None,
+            resident: Priced::Unavailable(UNPRICED.into()),
+            pass: Priced::Unavailable(UNPRICED.into()),
+            moves: Priced::Unavailable(UNPRICED.into()),
+            tier_copy: Priced::Unavailable(UNPRICED.into()),
+            convert: Priced::Unavailable(UNPRICED.into()),
+        };
+    };
+    let (topology, info) = (device.topology(), device.info());
+    let records = KernelCache::measurement_records(root);
+    let executor = pricing.executor.clone();
+    // Each record the load stores replaces what it stored last in the
+    // stored record, under the store's lock, so concurrent loads of the
+    // model each keep their steps (`MissRecord::restored`).
+    let store = pricing.keyed.clone().map(|(model, largest)| {
+        let store = KernelCache::miss_records(root);
+        let previous = pricing.previous.clone();
+        Box::new(move |record: &magnitude_executor::assessment::MissRecord| {
+            let key = StoredMisses::key(&executor, &model);
+            let updated = store.update(&key, largest, |stored: Option<StoredMisses<_>>| {
+                let restored = magnitude_executor::assessment::MissRecord::restored(
+                    stored.as_ref().map(|stored| &stored.record),
+                    previous.borrow().as_ref(),
+                    record,
+                )?;
+                Ok(StoredMisses { executor: executor.clone(), model: model.clone(), record: restored })
+            });
+            updated.map_err(MissStoreError::Store)?.map_err(MissStoreError::Merge)?;
+            *previous.borrow_mut() = Some(record.clone());
+            Ok(())
+        }) as Box<magnitude_executor::MissStore>
+    });
+    // The executor's costs walked once: what the load prices on, and
+    // whether the job has points of them left, which its request asks.
+    let walked = magnitude_executor::assessment::ExecutorCosts::stored(topology, info, &records);
+    let costs_outstanding = walked.as_ref().is_ok_and(|walked| walked.outstanding());
+    let costs = crate::assessment::priced_costs(walked);
+    let pass = costs.clone().derive(|costs| ExpertPass::of_bank(bank, costs));
+    // A host tier's record read from host memory, at its memory line.
+    let memory = match bank.tier_reservation() {
+        None => Priced::Measured(None),
+        Some(_) => match MemoryCosts::stored(topology, info, pricing.readers, &records) {
+            Ok(memory) => Priced::Measured(Some(memory.byte_seconds)),
+            Err(error @ MemoryError::Unrecorded { .. }) => Priced::Pending(error.to_string()),
+            Err(error) => Priced::Unavailable(error.to_string()),
+        },
+    };
+    // A CPU site's lines as the job stored them, and whose verdict admits it:
+    // with either missing the site serves nothing, and a pricing reads them
+    // once they are here.
+    let bank_lines = pricing
+        .lines
+        .iter()
+        .zip(&pricing.sites)
+        .map(|(lines, site)| {
+            let Some(site) = site else { return Ok(*lines) };
+            let costs = site.costs(topology, info, &records).map_err(|error| error.to_string())?;
+            let admitted = site.verdict(topology, info, &records).measured().is_some();
+            Ok(BankLines { cpu: costs.filter(|_| admitted).map(|costs| costs.lines), ..*lines })
+        })
+        .collect::<Result<Vec<_>, String>>();
+    let host = match bank_lines {
+        Ok(bank_lines) => memory.derive(|byte_seconds| HostLines::of_bank(bank, &bank_lines, byte_seconds)),
+        Err(reason) => Priced::Unavailable(reason),
+    };
+    // A host tier's link line is host storage's routes of the costs, which
+    // the load requested: pending until the job reads them.
+    let lines = host.and_then(|host| {
+        pass.as_ref().and_then(|pass| match ExpertLines::priced(&host, pass) {
+            Ok(lines) => Priced::Measured(lines),
+            Err(PricingError::UnreadLink) => Priced::Pending(PricingError::UnreadLink.to_string()),
+            Err(error) => Priced::Unavailable(error.to_string()),
+        })
+    });
+    let moves = match MoveCosts::of_bank(topology, info, bank, &records) {
+        Ok(moves) => Priced::Measured(moves),
+        Err(error @ MoveError::Unrecorded { .. }) => Priced::Pending(error.to_string()),
+        Err(error) => Priced::Unavailable(error.to_string()),
+    };
+    // A host tier's copy on the blocks the job measured: until then a list's
+    // whole grid, as the bank opened.
+    let tier_copy = match bank.tier_reservation() {
+        None => Priced::Measured(None),
+        Some(_) => match TierCopyCosts::stored(topology, info, &records) {
+            Ok(costs) => Priced::Measured(Some(costs)),
+            Err(error @ TierCopyError::Unrecorded { .. }) => Priced::Pending(error.to_string()),
+            Err(error) => Priced::Unavailable(error.to_string()),
+        },
+    };
+    // The device's convert on unified memory on the line the job measured:
+    // until then the host lands every miss.
+    let convert = match bank.tier_reservation() {
+        Some(_) => Priced::Measured(None),
+        None => match ConvertCosts::lines(topology, info, bank, &records) {
+            Ok(lines) => Priced::Measured(Some(lines.into())),
+            Err(error @ CeilingError::Unrecorded { .. }) => Priced::Pending(error.to_string()),
+            Err(error) => Priced::Unavailable(error.to_string()),
+        },
+    };
+    // The load waits now on its requests the job has points of left to
+    // measure: the job measures them first.
+    let waiting = pricing
+        .requests
+        .iter()
+        .filter(|request| match request {
+            PointRequest::Costs => costs_outstanding,
+            request => request.outstanding(topology, info, &records),
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    touch(root, &pricing.executor, &waiting);
+    magnitude_executor::ExpertMeasures {
+        lines,
+        store,
+        resident: costs.derive(|costs| crate::assessment::resident_step(&pricing.definition, &pricing.resident, costs)),
+        pass,
+        moves,
+        tier_copy,
+        convert,
+    }
+}
+
+/// What `bank` waits on of the measurement job, in the order the job
+/// measures it ([`touch`]), and the host memory readers its pricing asks
+/// for: a host tier's link line is host storage's routes of the executor's
+/// costs (first, as its share of the walk), its record read from host
+/// memory the host memory's line, and its copies' blocks the tier copy's
+/// points; then the executor's costs, which every line, pass and resident
+/// step of it reads; each moving group's shrink is paced by its move line;
+/// each of its `sites` (by streamed layer) serves once admitted with its
+/// lines stored. A load serves without them until the job has measured
+/// them.
+fn expert_requests(
+    bank: &magnitude_executor::ExpertBankPlan,
+    sites: &[Option<magnitude_executor::assessment::SiteRequest>],
+) -> Result<(Vec<magnitude_executor::assessment::PointRequest>, u64), LoadError> {
+    use magnitude_executor::assessment::{ConvertCosts, MoveCosts, PointRequest};
+    let readers = std::thread::available_parallelism().map_err(|error| internal(error.to_string()))?.get() as u64;
+    let tier = bank
+        .tier_reservation()
+        .map(|_| [PointRequest::HostRoutes, PointRequest::HostMemory { readers }, PointRequest::TierCopy])
+        .into_iter()
+        .flatten();
+    let moves = MoveCosts::forms(bank).map(|(_, form)| PointRequest::Moves(form));
+    let sites = sites.iter().flatten().cloned().map(PointRequest::Site);
+    let converts = bank.tier_reservation().is_none().then(|| ConvertCosts::forms(bank).map(PointRequest::Convert)).into_iter().flatten();
+    Ok((tier.chain([PointRequest::Costs]).chain(moves).chain(sites).chain(converts).collect(), readers))
+}
+
+/// The volumes a load of `artifact` reads for: each source for a reader no
+/// step waits on and for `bank`'s urgent request.
+fn volumes(
+    artifact: &magnitude_artifacts::gguf::GgufArtifact,
+    bank: Option<&magnitude_executor::ExpertBankPlan>,
+) -> Result<Vec<(Arc<magnitude_artifacts::FileSource>, Option<magnitude_artifacts::Urgent>)>, String> {
+    let urgent = bank.map(magnitude_executor::ExpertBankPlan::urgent).transpose()?;
+    Ok(artifact
+        .sources()
+        .flat_map(|source| std::iter::once(None).chain(urgent.clone().map(Some)).map(|urgent| (source.clone(), urgent)))
+        .collect())
+}
+
+/// The request of `source`'s volume for `urgent`.
+fn volume_request(
+    source: &magnitude_artifacts::FileSource,
+    urgent: Option<&magnitude_artifacts::Urgent>,
+) -> magnitude_executor::assessment::PointRequest {
+    magnitude_executor::assessment::PointRequest::Volume {
+        file: source.path().to_owned(),
+        urgent: urgent.map(|urgent| (urgent.parts.clone(), urgent.records)),
+    }
+}
+
+/// Request every point a load of `manifest` waits on of the measurement job,
+/// loading nothing: what a load requests as it loads, for a tool that runs
+/// the job before it times a load, so the load finds what a served load
+/// finds once its job has run. Nothing to do without a kernel cache.
+pub fn request_load_points(catalog: &Devices, manifest: &ExecutionManifest, package: &Package) -> Result<(), LoadError> {
+    let Some(root) = &manifest.kernel_cache else {
+        return Ok(());
+    };
+    let selected = crate::planning::select_load_device(catalog, manifest).map_err(platform_error)?;
+    let LoadPlans { draft, .. } = plan_load(manifest, &selected)?;
+    let bank = draft.load().expert_bank();
+    let sites = draft.site_requests(&numerical_profile(manifest)?).map_err(internal)?;
+    let mut requests = vec![magnitude_executor::assessment::PointRequest::GraphCost];
+    if let Some(bank) = bank {
+        requests.extend(expert_requests(bank, &sites)?.0);
+    }
+    let volumes = volumes(package.target(), bank).map_err(internal)?;
+    requests.extend(volumes.iter().map(|(source, urgent)| volume_request(source, urgent.as_ref())));
+    touch(root, &selected.identity, &requests);
+    Ok(())
+}
+
+/// What the job stored of the load's CPU sites (`sites`, by streamed layer):
+/// their pool's workers, where one is stored, and each layer's lines.
+fn stored_cpu_site(
+    root: &std::path::Path,
+    device: &seismic::Device,
+    sites: &[Option<magnitude_executor::assessment::SiteRequest>],
+) -> Result<magnitude_executor::assessment::StoredCpuSite, String> {
+    use magnitude_executor::assessment::StoredCpuSite;
+    let records = KernelCache::measurement_records(root);
+    let mut stored = StoredCpuSite::default();
+    for (layer, site) in sites.iter().enumerate() {
+        let Some(site) = site else { continue };
+        if let Some(costs) = site.costs(device.topology(), device.info(), &records).map_err(|error| error.to_string())? {
+            stored.workers = stored.workers.max(Some(costs.workers));
+            stored.lines.insert(layer, costs.lines);
+        }
+    }
+    Ok(stored)
+}
+
+/// Read `artifact`'s volumes as the job's records say, for a reader no step
+/// waits on and for `bank`'s urgent request; request what they lack.
+fn adopt_volumes(
+    root: &std::path::Path,
+    device: &seismic::Device,
+    artifact: &magnitude_artifacts::gguf::GgufArtifact,
+    bank: Option<&magnitude_executor::ExpertBankPlan>,
+) -> Result<(), String> {
+    use magnitude_executor::assessment::VolumeCosts;
+    let records = KernelCache::measurement_records(root);
+    let mut requests = Vec::new();
+    for (source, urgent) in volumes(artifact, bank)? {
+        let urgent = urgent.as_ref();
+        match VolumeCosts::stored(device.topology(), device.info(), source.path(), urgent, &records).map_err(|error| error.to_string())? {
+            Some(choice) => magnitude_artifacts::adopt_volume(&source, urgent, choice).map_err(|error| error.to_string())?,
+            None => requests.push(volume_request(&source, urgent)),
+        }
+    }
+    let executor = device
+        .topology()
+        .executor_identity(device.info().id())
+        .ok_or("the load's executor is not of its topology's revision")?;
+    touch(root, &executor, &requests);
+    Ok(())
+}
+
+/// Request `requests` of the measurement job in the kernel cache at `root`, on `executor`, a
+/// load waiting on them now (`assessment::PointRequests`), in the order the job measures them:
+/// each at its place in `requests`, which orders a touch's requests (`Waiter::rank`).
+/// One that cannot be stored is reported: the load serves without it as it does until the job
+/// measures it.
+fn touch(root: &std::path::Path, executor: &seismic::Identity, requests: &[magnitude_executor::assessment::PointRequest]) {
+    use magnitude_executor::assessment::Waiter;
+    let requested = magnitude_executor::assessment::PointRequests::new(root);
+    let now = Waiter::now(0);
+    for (rank, request) in (0u64..).zip(requests) {
+        if let Err(error) = requested.request(executor, request.clone(), Waiter { rank, ..now }) {
+            tracing::warn!("the load's request of {request:?} could not be stored: {error}");
+        }
+    }
+}
+
 fn report_load_phase(name: &str, started: &mut Instant) {
-    eprintln!(
-        "magnitude-engine: {name} in {:.2} s",
+    tracing::info!(
+        "{name} in {:.2} s",
         started.elapsed().as_secs_f64()
     );
     *started = Instant::now();
@@ -814,30 +1348,96 @@ fn report_load_phase(name: &str, started: &mut Instant) {
 
 /// Report what the process holds at one moment of a load, by what holds it
 /// ([`seismic::ProcessMemory`]), with Seismic's charges on the opened device
-/// and the most the footprint has been so far: one line of JSON on the
-/// engine's diagnostic stream. Every load reports the same moments, so two
-/// loads compare line by line, part by part; a search reports the device's
-/// opening and its own end (`searched`), whose peak is its process's.
-fn report_load_memory(moment: &str, device: &seismic::Device) {
+/// and the most the footprint has been so far: one event (`load memory`)
+/// whose `record` is a JSON object. Every load reports the same moments, so
+/// two loads compare line by line, part by part; a search reports the
+/// device's opening and its own end (`searched`), whose peak is its
+/// process's.
+fn report_load_memory(moment: &str, catalog: &Devices, device: &seismic::Device) {
+    tracing::info!(record = %load_memory_record(moment, catalog, device), "load memory");
+}
+
+/// The load's end (`loaded`): its memory record with Seismic's charge
+/// split by the domain's holders (`MemoryChargeReconciliation`), each in
+/// the plan's term that charges it, so the plan's terms read beside what
+/// the load holds of each.
+fn report_loaded_memory(
+    domain: &ExecutorDomain,
+    catalog: &Devices,
+    device: &seismic::Device,
+) -> Result<(), String> {
+    let charge = domain.reconcile_memory_charge(&[])?;
+    let sum = |terms: &[u64]| {
+        terms
+            .iter()
+            .try_fold(0u64, |sum, &term| sum.checked_add(term))
+            .ok_or_else(|| format!("the load's charge terms {terms:?} overflow"))
+    };
+    let state = sum(&[
+        charge.target_state.total(),
+        charge.head_state.map_or(0, |state| state.total()),
+    ])?;
+    // What the device's backend holds beside every charge (its blocks' free
+    // space and its recorded graphs' driver memory), which the plan bounds
+    // as its bytes beyond allocations.
+    let beyond = device.backend_held(seismic::Contract::DeviceOnly).beyond;
+    let mut record = load_memory_record("loaded", catalog, device);
+    record["charge"] = serde_json::json!({
+        "charged": charge.charged,
+        "weights": sum(&[charge.target_weights, charge.optional_weights])?,
+        "state": state,
+        "graphs": sum(&[charge.graph_pools, charge.bound_constants])?,
+        "programs": charge.prepared_programs,
+        "owned_features": charge.owned_features,
+        "external_pins": charge.external_pins,
+        "unattributed": charge.unattributed,
+        "beyond_allocations": beyond,
+    });
+    tracing::info!(%record, "load memory");
+    Ok(())
+}
+
+fn load_memory_record(moment: &str, catalog: &Devices, device: &seismic::Device) -> serde_json::Value {
     let memory = seismic::ProcessMemory::read();
-    let usage = device.storage_usage(seismic::StorageKind::Device);
-    eprintln!(
-        "magnitude-engine: memory {}",
-        serde_json::json!({
-            "moment": moment,
-            "footprint_bytes": memory.footprint_bytes,
-            "malloc_live_bytes": memory.malloc_live_bytes,
-            "graphics_bytes": memory.graphics_bytes,
-            "mapped_bytes": memory.mapped_bytes,
-            "rest_bytes": memory.rest_bytes(),
-            "device_charged_bytes": usage.charged,
-            "device_held_bytes": usage.held,
-            "device_unallocated_bytes": usage.unallocated,
-            "device_limit_bytes": usage.limit,
-            "device_refused_demand_bytes": usage.refused_demand,
-            "peak_footprint_bytes": seismic::ProcessMemory::peak_footprint(),
-        })
-    );
+    let ledger = device.device_ledger();
+    let held = device.backend_held(seismic::Contract::DeviceOnly);
+    let large = seismic::large_page_backing();
+    // The host the load runs beside: what the memory bands judge, and what
+    // the OS holds outside it.
+    let host = match catalog.inventory().host_status() {
+        Ok(host) => serde_json::json!({
+            "allocatable_bytes": host.allocatable.value,
+            "obtainable_bytes": host.obtainable.value,
+            "wired_bytes": host.held.map(|held| held.wired_bytes),
+            "compressed_bytes": host.held.map(|held| held.compressed_bytes),
+        }),
+        Err(error) => serde_json::json!({ "unobserved": error.to_string() }),
+    };
+    serde_json::json!({
+        "host": host,
+        "moment": moment,
+        "footprint_bytes": memory.footprint_bytes,
+        "malloc_live_bytes": memory.malloc_live_bytes,
+        "graphics_bytes": memory.graphics_bytes,
+        "mapped_bytes": memory.mapped_bytes,
+        "rest_bytes": memory.rest_bytes(),
+        // The device's own ledger on its device store: on a device whose
+        // memory is the host's, every charge it makes in that memory.
+        "device_charged_bytes": ledger.charged,
+        "device_held_bytes": ledger.charged + held.beyond,
+        "device_unallocated_bytes": held.unallocated,
+        "device_bound_bytes": ledger.bound,
+        "device_refused_demand_bytes": ledger.refused,
+        // Host pages devices read over their link (CUDA's registered and
+        // Vulkan's imported host storage, `seismic_reservation`'s
+        // `PageSize::Large`) where the host has large pages, by what backs
+        // them: through a translating IOMMU small-page granules read at a
+        // fraction of the line, which the transfer line (measured over
+        // small-page mapped memory) prices, never the large pages' rate.
+        "host_large_page_bytes": large.large_bytes,
+        "host_small_page_bytes": large.small_bytes,
+        "peak_footprint_bytes": seismic::ProcessMemory::peak_footprint(),
+    })
 }
 
 /// Startup allocations claimed from the device's heap, the same heap the
@@ -856,24 +1456,18 @@ impl StartupClaims {
     /// device's placement (`Fit::host_staging`). Releases the previous
     /// startup claim, whose allocation Seismic now charges.
     fn claim(&mut self, purpose: &str, allocation: u64, staged: u64) -> Result<(), LoadError> {
-        self.claim_storage(purpose, allocation, 0, staged)
+        self.claim_storage(purpose, ClaimDemand { device: allocation, staged, ..ClaimDemand::default() })
     }
 
     /// [`Self::claim`] with `upload` bytes of upload storage beside the
     /// `allocation` device bytes.
-    fn claim_storage(
-        &mut self,
-        purpose: &str,
-        allocation: u64,
-        upload: u64,
-        staged: u64,
-    ) -> Result<(), LoadError> {
+    fn claim_storage(&mut self, purpose: &str, demand: ClaimDemand) -> Result<(), LoadError> {
         if let Some(held) = self.held.take() {
             self.heap.release(held);
         }
         let claim = self
             .heap
-            .claim_storage(allocation, upload, staged, HoldingClass::Model)
+            .claim_storage(demand, HoldingClass::Model)
             .map_err(|refusal| self.refusal(purpose, refusal))?;
         self.held = Some(claim);
         Ok(())
@@ -899,12 +1493,9 @@ impl StartupClaims {
         };
         match refusal {
             ClaimRefusal::Blind(error) => platform_error(PlatformError::Memory(error)),
-            ClaimRefusal::Reclaim { store, distress, .. } => LoadError::MemoryPressure {
-                purpose: match distress {
-                    Some(distress) => format!("{purpose} ({distress})"),
-                    None => format!("{purpose} (memory at or below the planning reserve)"),
-                },
-                store: identity(store),
+            ClaimRefusal::Reclaim(reading) => LoadError::MemoryPressure {
+                purpose: format!("{purpose} ({})", magnitude_executor::Reclaimed(&reading)),
+                store: reading.identity,
             },
             ClaimRefusal::Deficit {
                 store,
@@ -1003,14 +1594,27 @@ fn warm_up(
     let (pending, bindings) = domain
         .finish_target(flight)
         .map_err(|error| failed(error.to_string()))?;
+    // A forward whose experts or table rows the step could not obtain (a
+    // read that failed, or a park the device gave up) fails the load with
+    // why, as it would fail a request.
+    let unread = pending.iter().find_map(|pending| match pending.outcome() {
+        magnitude_executor::Outcome::WeightReadFailed(error) => Some(error.to_string()),
+        // Interrupted at the load: nothing is served yet, so nothing re-runs
+        // it; the load fails with why.
+        magnitude_executor::Outcome::Interrupted { reason, .. } => Some(reason.clone()),
+        _ => None,
+    });
     for pending in pending {
         domain
             .abort(pending)
             .map_err(|error| failed(error.to_string()))?;
     }
+    if let Some(unread) = unread {
+        return Err(failed(unread));
+    }
     domain.close(request).map_err(failed)?;
-    eprintln!(
-        "magnitude-engine: warm-up forward in {:.0} ms",
+    tracing::info!(
+        "warm-up forward in {:.0} ms",
         began.elapsed().as_secs_f64() * 1000.0
     );
     Ok(bindings)
@@ -1098,7 +1702,7 @@ impl TuningObserver for TuningReport {
                 entry,
                 bindings,
                 points,
-            } => eprintln!("magnitude-engine: tuning {entry} [{bindings}] at {points} points"),
+            } => tracing::info!("tuning {entry} [{bindings}] at {points} points"),
             // Each unit's mandatory work, each piece of optional work and
             // each record published when the optional work stops are in
             // the tuning trace, the latter two with their forecasts.
@@ -1107,31 +1711,45 @@ impl TuningObserver for TuningReport {
             TuningEvent::Untuned {
                 programs,
                 forming_seconds,
-            } => eprintln!(
-                "magnitude-engine: formed {programs} untuned programs for the load in \
+            } => tracing::info!(
+                "formed {programs} untuned programs for the load in \
                  {forming_seconds:.2} s"
             ),
             TuningEvent::Budget(budget) => {
                 let mut live = self.live.borrow_mut();
                 live.work = None;
                 self.report_live(&live);
-                eprintln!(
-                    "magnitude-engine: tuning budget {:.2} s: {} pieces of work used {:.2} s, \
-                     {:.2} s unused, {:.2} s over; {} offered pieces did not fit",
+                // Each refused piece by its unit, so a void load says which
+                // units it left unfinished.
+                let refused = budget
+                    .refused
+                    .iter()
+                    .map(|refused| {
+                        format!(
+                            "{} ({:?} piece, {:.2} s priced, refused for its {})",
+                            refused.unit, refused.stage, refused.priced_seconds, refused.reason
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                tracing::info!(
+                    "tuning budget {:.2} s: {} pieces of work used {:.2} s, \
+                     {:.2} s unused, {:.2} s over; {} offered pieces did not fit{}{}",
                     budget.budget_seconds,
                     budget.stages,
                     budget.used_seconds,
                     budget.unused_seconds,
                     budget.overrun_seconds,
-                    budget.refused.len()
+                    budget.refused.len(),
+                    if refused.is_empty() { "" } else { ": " },
+                    refused.join("; ")
                 );
             }
             TuningEvent::Unprepared {
                 entry,
                 bindings,
                 statics,
-            } => eprintln!(
-                "magnitude-engine: no stored tuning record for {entry} [{bindings}] {statics:?}: \
+            } => tracing::info!(
+                "no stored tuning record for {entry} [{bindings}] {statics:?}: \
                  canonical default"
             ),
             TuningEvent::Pinned {
@@ -1140,8 +1758,8 @@ impl TuningObserver for TuningReport {
                 statics,
                 choice,
                 ..
-            } => eprintln!(
-                "magnitude-engine: pinned {entry} [{bindings}] {statics:?}: {choice:?} (not tuned)"
+            } => tracing::info!(
+                "pinned {entry} [{bindings}] {statics:?}: {choice:?} (not tuned)"
             ),
             TuningEvent::Finished(tuned) => {
                 let origin = match (tuned.origin, tuned.stop) {
@@ -1155,8 +1773,8 @@ impl TuningObserver for TuningReport {
                 // How far the unit's search got: reported here, not stored.
                 if let Some(progress) = &tuned.progress {
                     let standing = progress.standing;
-                    eprintln!(
-                        "magnitude-engine: searched {} [{}]: share {:.1}% of step time; {} \
+                    tracing::info!(
+                        "searched {} [{}]: share {:.1}% of step time; {} \
                          pieces of work: {} of the {} configurations asked for measured, {} \
                          programs formed, serving {:.3} of the defaults; building {:.2} s, \
                          references {:.2} s, forming {:.2} s, measuring {:.2} s, validating \
@@ -1176,8 +1794,8 @@ impl TuningObserver for TuningReport {
                         tuned.time.validating_seconds
                     );
                 }
-                eprintln!(
-                    "magnitude-engine: tuned {} [{}] in {:.2} s ({origin}, {}): {:?} ({} \
+                tracing::info!(
+                    "tuned {} [{}] in {:.2} s ({origin}, {}): {:?} ({} \
                      measured, {} excluded, {} qualification rejections)",
                     tuned.entry,
                     tuned.bindings,
@@ -1193,8 +1811,8 @@ impl TuningObserver for TuningReport {
                     tuned.rejections
                 );
                 if let Some(rejection) = &tuned.first_rejection {
-                    eprintln!(
-                        "magnitude-engine:   first qualification rejection of {}: {rejection}",
+                    tracing::info!(
+                        "first qualification rejection of {}: {rejection}",
                         tuned.entry
                     );
                 }
@@ -1233,5 +1851,20 @@ mod tests {
             prepared_key(&prepared).unwrap(),
             prepared_key(&other).unwrap()
         );
+    }
+
+    /// The job measures a load's requests in the order the load lists
+    /// them: host storage's routes ahead of the executor's whole costs.
+    #[test]
+    fn a_load_s_requests_are_measured_in_its_order() {
+        use magnitude_executor::assessment::{PointRequest, PointRequests};
+        let root = tempfile::tempdir().unwrap();
+        let topology = Devices::discover(&[]).unwrap().topology();
+        let executor = topology.executors().iter().find(|executor| executor.backend() == BackendName::Cpu).unwrap().clone();
+        let identity = topology.executor_identity(executor.id()).unwrap();
+        let requests = [PointRequest::HostRoutes, PointRequest::Costs];
+        touch(root.path(), &identity, &requests);
+        let records = seismic::measure::HeldStore::default();
+        assert_eq!(PointRequests::new(root.path()).outstanding(&topology, &executor, &records).unwrap(), requests);
     }
 }

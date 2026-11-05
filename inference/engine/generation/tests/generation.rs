@@ -218,6 +218,38 @@ fn prefill_chunks_and_decode_share_the_round_protocol() {
     assert_eq!(generation.generated(), [TokenId(10), TokenId(11)]);
 }
 
+/// A prompt chunk plans the chunks after it, each following the one before:
+/// at most the number asked, none past the stop, and none after the chunk
+/// that selects the first token.
+#[test]
+fn a_prompt_chunk_plans_the_chunks_after_it() {
+    let prompt = (1..=10).map(TokenId).collect::<Vec<_>>();
+    let generation = resident(
+        Generation::new(prompt, InputLayout::new(10, vec![]).unwrap(), options(), None).unwrap(),
+    );
+    let first = start(generation, 2);
+    let spans = |planned: Vec<Operation>| {
+        planned
+            .into_iter()
+            .map(|operation| match operation {
+                Operation::Forward {
+                    position,
+                    tokens,
+                    select,
+                    ..
+                } => (position, tokens.len(), select.len()),
+                other => panic!("a planned chunk is a forward: {other:?}"),
+            })
+            .collect::<Vec<_>>()
+    };
+    let plan = |stop, chunks| spans(first.planned_prefill(RequestId(1), 3, stop, chunks).unwrap());
+    assert_eq!(plan(None, 2), [(2, 3, 0), (5, 3, 0)]);
+    // The last chunk selects the first token; nothing is planned past it.
+    assert_eq!(plan(None, 8), [(2, 3, 0), (5, 3, 0), (8, 2, 1)]);
+    assert_eq!(plan(Some(6), 8), [(2, 3, 0), (5, 1, 0)]);
+    assert!(plan(None, 0).is_empty());
+}
+
 #[test]
 fn forced_prefill_and_decode_are_committed_rounds_without_selection() {
     let generation = generation(Some(Box::new(Grammar {
@@ -1321,7 +1353,8 @@ fn reusable_draft_prefixes_keep_each_intermediate_history_complete() {
     let generation = resident(dflash_fresh(&prompt, 2));
     let first = start(generation, 4);
     assert_eq!(first.round_forward().prime.as_ref().unwrap().draft_from, 4);
-    let planned = first.planned_prefill(RequestId(1), 4).unwrap().unwrap();
+    let [planned] = <[_; 1]>::try_from(first.planned_prefill(RequestId(1), 4, None, 1).unwrap())
+        .unwrap();
     let Operation::Forward { prime: Some(prime), .. } = planned else {
         panic!("planned prompt chunk primes the drafter")
     };
@@ -1347,7 +1380,8 @@ fn transient_draft_priming_preserves_its_final_prompt_horizon() {
     assert!(generation.method_checkpoint().is_err());
     let first = start(generation, 4);
     assert_eq!(first.round_forward().prime.as_ref().unwrap().draft_from, 16);
-    let planned = first.planned_prefill(RequestId(1), 4).unwrap().unwrap();
+    let [planned] = <[_; 1]>::try_from(first.planned_prefill(RequestId(1), 4, None, 1).unwrap())
+        .unwrap();
     let Operation::Forward { prime: Some(prime), .. } = planned else {
         panic!("planned prompt chunk primes the drafter")
     };
@@ -1380,7 +1414,8 @@ fn mtp_cached_prefix_leaves_successor_for_the_resumed_request() {
 fn mtp_single_token_chunks_capture_without_entering_a_future_token() {
     let first = start(mtp_generation(&[1, 2, 3], 2), 1);
     assert_eq!(primed(&first), Some((vec![], 0, 1)));
-    let planned = first.planned_prefill(RequestId(1), 1).unwrap().unwrap();
+    let [planned] = <[_; 1]>::try_from(first.planned_prefill(RequestId(1), 1, None, 1).unwrap())
+        .unwrap();
     let Operation::Forward { prime: Some(prime), .. } = planned else { panic!("planned chunk") };
     assert_eq!((prime.tokens, prime.position, prime.boundary), (vec![TokenId(2)], 0, true));
     let (generation, effects) = resolve(first, &[], Some(feature(10)));

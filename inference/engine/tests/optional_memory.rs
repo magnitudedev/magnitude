@@ -1,6 +1,7 @@
 //! Real-device memory qualification: optional-component residency, demand
-//! and Reclaim release under a process limit, idle slab release and retained
-//! release with replay. Run only on a host with an MTP GGUF:
+//! and Reclaim release under a process limit, requests that wait in Reclaim,
+//! idle slab release and retained release with replay. Run only on a host
+//! with an MTP GGUF:
 //! `MAGNITUDE_TEST_MTP_GGUF=/path/model.gguf cargo test --release
 //! -p magnitude-engine --test optional_memory -- --ignored --nocapture`.
 
@@ -55,6 +56,7 @@ fn plain_owner(
             lookahead: false,
             exported_logits_rows: 0,
             numerical_profile: None,
+            weight_cap: None,
         },
         context_tokens: Some(1024),
         service: limits.clone(),
@@ -161,6 +163,58 @@ fn admit(
     host.admit(generation, input, retention, output_capacity)
 }
 
+/// The process's address-space limit before a test lowered it, restored
+/// when dropped.
+#[cfg(target_os = "linux")]
+struct AddressSpaceLimit(libc::rlimit);
+
+#[cfg(target_os = "linux")]
+impl Drop for AddressSpaceLimit {
+    fn drop(&mut self) {
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &self.0) }, 0);
+    }
+}
+
+/// Leave the process half the planning reserve of address space, which puts
+/// `host`'s device in the Reclaim band until the returned limit is dropped.
+#[cfg(target_os = "linux")]
+fn press_to_reclaim(host: &Host) -> AddressSpaceLimit {
+    use magnitude_executor::platform::{self, MemoryBand};
+    let catalog = seismic::Devices::discover(&[]).unwrap();
+    let reserves = MemoryReserves::standard();
+    let band = || {
+        host.owner()
+            .inspect_domain(|domain| {
+                platform::observe_domains(&catalog, domain.resources().device(), &reserves, platform::HostRoom::Allocatable)
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap()[0]
+            .clone()
+    };
+    let planning = band().thresholds.planning_bytes;
+    let vm_bytes = std::fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("VmSize:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|kib| kib.parse::<u64>().ok())
+        .unwrap()
+        * 1024;
+    let mut previous = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut previous) }, 0);
+    let restricted = libc::rlimit {
+        rlim_cur: vm_bytes + planning / 2,
+        rlim_max: previous.rlim_max,
+    };
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &restricted) }, 0);
+    let limit = AddressSpaceLimit(previous);
+    assert_eq!(band().band, MemoryBand::Reclaim);
+    limit
+}
+
 /// Whether the owner holds `stream`'s request resident and blocked on its
 /// host's output credit: live, with decoded output, and not finished.
 fn output_blocked(host: &Host, stream: &Stream) -> bool {
@@ -225,6 +279,7 @@ fn concurrent_cohort_memory_growth_and_idle_release() {
         decode_tokens: 32,
         decode_share: 0.5,
         locality_seconds: 1.0,
+        conversations: std::num::NonZeroUsize::MIN,
     };
     let (mut host, vocabulary, tokenizer) = plain_owner(limits, 0);
     let baseline = host.owner().reconcile_memory_charge().unwrap();
@@ -313,6 +368,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
             lookahead: false,
             exported_logits_rows: 0,
             numerical_profile: None,
+            weight_cap: None,
         },
         context_tokens: Some(1024),
         service: ServiceLimits {
@@ -320,6 +376,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
             decode_tokens: 16,
             decode_share: 0.5,
             locality_seconds: 1.0,
+            conversations: std::num::NonZeroUsize::MIN,
         },
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
@@ -332,7 +389,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
     let package = resolved.host.shared_package();
     let (mut domain, mut bindings, _) = build_native_domain(&resolved.manifest, package).unwrap();
     let charge = |domain: &magnitude_executor::ExecutorDomain| {
-        domain.resources().device().storage_usage(seismic::StorageKind::Device).charged
+        domain.resources().device().device_ledger().charged
     };
     // Startup warms the optional head. Measure the unloaded baseline so both
     // cycles exercise the same lazy rebind and release lifecycle.
@@ -444,6 +501,7 @@ fn concurrent_mtp_first_head_bind_reconciles_memory() {
             lookahead: false,
             exported_logits_rows: 0,
             numerical_profile: None,
+            weight_cap: None,
         },
         context_tokens: Some(1024),
         service: limits.clone(),
@@ -503,17 +561,10 @@ fn concurrent_mtp_first_head_bind_reconciles_memory() {
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires Sparky's unified CUDA device and MAGNITUDE_TEST_MTP_GGUF"]
+#[ignore = "requires a unified CUDA device and MAGNITUDE_TEST_MTP_GGUF"]
 fn admission_reclaims_under_a_real_process_limit() {
     use magnitude_executor::platform::{self, DomainReading, MemoryBand, MemoryConstraint};
     use seismic::Devices;
-
-    struct AddressSpaceLimit(libc::rlimit);
-    impl Drop for AddressSpaceLimit {
-        fn drop(&mut self) {
-            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &self.0) }, 0);
-        }
-    }
 
     let model = PathBuf::from(
         std::env::var_os("MAGNITUDE_TEST_MTP_GGUF").expect("set MAGNITUDE_TEST_MTP_GGUF"),
@@ -523,6 +574,7 @@ fn admission_reclaims_under_a_real_process_limit() {
         decode_tokens: 16,
         decode_share: 0.5,
         locality_seconds: 1.0,
+        conversations: std::num::NonZeroUsize::MIN,
     };
     let resolved = EngineConfiguration {
         package: PackageOptions {
@@ -538,6 +590,7 @@ fn admission_reclaims_under_a_real_process_limit() {
             lookahead: false,
             exported_logits_rows: 0,
             numerical_profile: None,
+            weight_cap: None,
         },
         context_tokens: Some(1024),
         service: limits.clone(),
@@ -554,7 +607,7 @@ fn admission_reclaims_under_a_real_process_limit() {
     let catalog = Devices::discover(&[]).unwrap();
     let reserves = MemoryReserves::standard();
     let allocation = |device: &seismic::Device| -> Result<DomainReading, String> {
-        let readings = platform::observe_domains(&catalog, device, &reserves)
+        let readings = platform::observe_domains(&catalog, device, &reserves, platform::HostRoom::Allocatable)
             .map_err(|error| error.to_string())?;
         Ok(readings[0].clone())
     };
@@ -679,7 +732,7 @@ fn admission_reclaims_under_a_real_process_limit() {
         host.owner()
             .inspect_domain(|domain| {
                 let device = domain.resources().device();
-                Ok(device.storage_usage(seismic::StorageKind::Device).charged)
+                Ok(device.device_ledger().charged)
             })
             .unwrap()
     };
@@ -749,24 +802,17 @@ fn admission_reclaims_under_a_real_process_limit() {
 }
 
 /// A process limit that leaves headroom below the planning reserve puts the
-/// engine in the Reclaim band: admission is refused, releases run, and when
-/// they cannot restore headroom the owner decides to unload with the
-/// memory-pressure cause within the escalation interval, finishing open
-/// requests with it.
+/// engine in the Reclaim band: a request arriving waits while releases run,
+/// and when they cannot restore headroom it is refused for memory and the
+/// owner decides to unload with the memory-pressure cause within the
+/// escalation interval, finishing open requests with it.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires Sparky's unified CUDA device and MAGNITUDE_TEST_MTP_GGUF"]
+#[ignore = "requires a unified CUDA device and MAGNITUDE_TEST_MTP_GGUF"]
 fn reclaim_band_releases_then_unloads_under_a_real_process_limit() {
     use magnitude_executor::platform::{self, MemoryBand};
     use magnitude_scheduler::publication::{ModelUnloadCause, RequestError};
     use seismic::Devices;
-
-    struct AddressSpaceLimit(libc::rlimit);
-    impl Drop for AddressSpaceLimit {
-        fn drop(&mut self) {
-            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &self.0) }, 0);
-        }
-    }
 
     let model = PathBuf::from(
         std::env::var_os("MAGNITUDE_TEST_MTP_GGUF").expect("set MAGNITUDE_TEST_MTP_GGUF"),
@@ -776,6 +822,7 @@ fn reclaim_band_releases_then_unloads_under_a_real_process_limit() {
         decode_tokens: 16,
         decode_share: 0.5,
         locality_seconds: 1.0,
+        conversations: std::num::NonZeroUsize::MIN,
     };
     let resolved = EngineConfiguration {
         package: PackageOptions {
@@ -791,6 +838,7 @@ fn reclaim_band_releases_then_unloads_under_a_real_process_limit() {
             lookahead: false,
             exported_logits_rows: 0,
             numerical_profile: None,
+            weight_cap: None,
         },
         context_tokens: Some(1024),
         service: limits.clone(),
@@ -806,7 +854,7 @@ fn reclaim_band_releases_then_unloads_under_a_real_process_limit() {
     let (domain, bindings, _) = build_native_domain(&resolved.manifest, package).unwrap();
     let catalog = Devices::discover(&[]).unwrap();
     let reserves = MemoryReserves::standard();
-    let planning = platform::observe_domains(&catalog, domain.resources().device(), &reserves)
+    let planning = platform::observe_domains(&catalog, domain.resources().device(), &reserves, platform::HostRoom::Allocatable)
         .unwrap()[0]
         .thresholds
         .planning_bytes;
@@ -881,21 +929,18 @@ fn reclaim_band_releases_then_unloads_under_a_real_process_limit() {
     let band = host
         .owner()
         .inspect_domain(|domain| {
-            platform::observe_domains(&catalog, domain.resources().device(), &reserves)
+            platform::observe_domains(&catalog, domain.resources().device(), &reserves, platform::HostRoom::Allocatable)
                 .map_err(|error| error.to_string())
         })
         .unwrap()[0]
         .band;
     assert_eq!(band, MemoryBand::Reclaim);
 
-    // The observation at `start` enters Reclaim; admission is refused while
-    // it lasts.
+    // The observation at `start` enters Reclaim; a request arriving while it
+    // lasts waits while the ladder gives memory back.
     let start = 64 * 1_000_000_000;
     assert!(!host.run_at(start).unload);
-    assert!(matches!(
-        admit(&mut host, generation(), false, 16),
-        Err(AdmissionError::MemoryReclaim)
-    ));
+    let mut waiting = admit(&mut host, generation(), false, 16).unwrap();
     // Releases cannot restore half a planning reserve, so the owner decides
     // to unload once Reclaim outlasts the escalation interval after releases.
     let mut unloaded_at = None;
@@ -909,12 +954,16 @@ fn reclaim_band_releases_then_unloads_under_a_real_process_limit() {
     }
     drop(guard);
     open.iter_mut().for_each(Stream::drain);
+    waiting.drain();
     eprintln!(
         "reclaim band: planning={planning} vm={vm_bytes} limit={limit} unloaded_after_ns={unloaded_at:?} terminals={:?}",
         open.iter().map(|stream| &stream.terminal).collect::<Vec<_>>()
     );
     let unloaded_after = unloaded_at.expect("persistent Reclaim unloads the model");
     assert!(unloaded_after >= 1_000_000_000);
+    // Only the unload could have made room for it: it was refused, never
+    // resident.
+    assert!(matches!(waiting.failure(), Some(RequestError::MemoryReclaim)));
     assert!(open.iter().all(|stream| matches!(
         stream.failure(),
         Some(RequestError::ModelUnloaded {
@@ -936,6 +985,7 @@ fn idle_shrink_preserves_a_retained_session() {
         decode_tokens: 16,
         decode_share: 0.5,
         locality_seconds: 1.0,
+        conversations: std::num::NonZeroUsize::MIN,
     };
     let (mut host, vocabulary, tokenizer) = plain_owner(limits, 4);
     let session = prompt(&tokenizer, 0, 96);
@@ -1026,23 +1076,17 @@ fn idle_shrink_preserves_a_retained_session() {
 /// to resume from, is replayed in full, and produces the cold output.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires Sparky's unified CUDA device and MAGNITUDE_TEST_MTP_GGUF"]
+#[ignore = "requires a unified CUDA device and MAGNITUDE_TEST_MTP_GGUF"]
 fn reclaim_releases_retained_sessions_and_replays_them() {
     use magnitude_executor::platform::{self, MemoryBand};
     use seismic::Devices;
-
-    struct AddressSpaceLimit(libc::rlimit);
-    impl Drop for AddressSpaceLimit {
-        fn drop(&mut self) {
-            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &self.0) }, 0);
-        }
-    }
 
     let limits = ServiceLimits {
         prefill_tokens: 64,
         decode_tokens: 16,
         decode_share: 0.5,
         locality_seconds: 1.0,
+        conversations: std::num::NonZeroUsize::MIN,
     };
     let (mut host, vocabulary, tokenizer) = plain_owner(limits, 8);
     let session = prompt(&tokenizer, 0, 96);
@@ -1072,7 +1116,7 @@ fn reclaim_releases_retained_sessions_and_replays_them() {
     let band = |host: &Host| {
         host.owner()
             .inspect_domain(|domain| {
-                platform::observe_domains(&catalog, domain.resources().device(), &reserves)
+                platform::observe_domains(&catalog, domain.resources().device(), &reserves, platform::HostRoom::Allocatable)
                     .map_err(|error| error.to_string())
             })
             .unwrap()[0]
@@ -1138,4 +1182,120 @@ fn reclaim_releases_retained_sessions_and_replays_them() {
         host.owner().reconcile_memory_charge().unwrap().unattributed,
         0
     );
+}
+
+/// A request arriving in Reclaim waits, never ran and is not refused, while
+/// memory may yet come back; once it does, the same request is served, its
+/// output the output it has with memory to spare.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a unified CUDA device and MAGNITUDE_TEST_MTP_GGUF"]
+fn a_request_waiting_in_reclaim_is_served_once_memory_returns() {
+    let limits = ServiceLimits {
+        prefill_tokens: 64,
+        decode_tokens: 16,
+        decode_share: 0.5,
+        locality_seconds: 1.0,
+        conversations: std::num::NonZeroUsize::MIN,
+    };
+    let (mut host, vocabulary, tokenizer) = plain_owner(limits, 0);
+    let tokens = prompt(&tokenizer, 1, 48);
+    let mut spare = admit(&mut host, greedy(&tokens, vocabulary, 8), false, 8).unwrap();
+    host.drive(&mut [&mut spare], Duration::from_secs(60));
+    host.settle();
+
+    let limit = press_to_reclaim(&host);
+    assert!(!host.observe().unload);
+    let mut waiting = admit(&mut host, greedy(&tokens, vocabulary, 8), false, 8).unwrap();
+    assert_eq!(host.snapshot(waiting.id).unwrap().status, Status::MemoryBlocked);
+    // Memory comes back before the ladder runs out: the next observation is
+    // Normal, and the request runs.
+    drop(limit);
+    host.observe();
+    assert_ne!(host.snapshot(waiting.id).unwrap().status, Status::MemoryBlocked);
+    host.drive(&mut [&mut waiting], Duration::from_secs(60));
+    assert_eq!(waiting.output, spare.output);
+}
+
+/// The Surplus rung releases only surplus: a decode running when Reclaim
+/// begins keeps stepping through the releases, its next steps never refused
+/// for memory, and its output is the output it has with memory to spare.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a unified CUDA device and MAGNITUDE_TEST_MTP_GGUF"]
+fn a_running_decode_keeps_stepping_through_reclaim() {
+    let limits = ServiceLimits {
+        prefill_tokens: 64,
+        decode_tokens: 16,
+        decode_share: 0.5,
+        locality_seconds: 1.0,
+        conversations: std::num::NonZeroUsize::MIN,
+    };
+    let (mut host, vocabulary, tokenizer) = plain_owner(limits, 0);
+    let tokens = prompt(&tokenizer, 3, 48);
+    let mut spare = admit(&mut host, greedy(&tokens, vocabulary, 64), false, 64).unwrap();
+    host.drive(&mut [&mut spare], Duration::from_secs(60));
+    let mut running = admit(&mut host, greedy(&tokens, vocabulary, 64), false, 64).unwrap();
+    host.step_until(&mut [&mut running], Duration::from_secs(60), |_, streams| streams[0].output.len() >= 8);
+    let limit = press_to_reclaim(&host);
+    let decoded = running.output.len();
+    // Reclaim begins and the ladder's releases run; the decode steps on.
+    assert!(!host.observe().unload);
+    // Within the escalation interval, before persistent Reclaim unloads the
+    // model.
+    let (since, began) = (host.now(), std::time::Instant::now());
+    host.step_until(&mut [&mut running], Duration::from_secs(30), |host, streams| {
+        let status = host.snapshot(streams[0].id).map(|snapshot| snapshot.status);
+        assert_ne!(status, Some(Status::Preempted), "the decode waited on memory");
+        assert!(
+            !streams[0].finished(),
+            "{:?} after {} tokens, {} ms on the owner's clock, {} ms real",
+            streams[0].terminal,
+            streams[0].output.len() - decoded,
+            (host.now() - since) / 1_000_000,
+            began.elapsed().as_millis()
+        );
+        streams[0].output.len() >= decoded + 2
+    });
+    drop(limit);
+    host.drive(&mut [&mut running], Duration::from_secs(60));
+    assert_eq!(running.output, spare.output);
+}
+
+/// A request waiting in Reclaim that its host abandons is retired without
+/// a refusal, and the owner serves the next request once memory returns.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a unified CUDA device and MAGNITUDE_TEST_MTP_GGUF"]
+fn a_waiting_request_abandoned_in_reclaim_is_retired() {
+    let limits = ServiceLimits {
+        prefill_tokens: 64,
+        decode_tokens: 16,
+        decode_share: 0.5,
+        locality_seconds: 1.0,
+        conversations: std::num::NonZeroUsize::MIN,
+    };
+    let (mut host, vocabulary, tokenizer) = plain_owner(limits, 0);
+    let tokens = prompt(&tokenizer, 2, 48);
+    let limit = press_to_reclaim(&host);
+    assert!(!host.observe().unload);
+    let mut waiting = admit(&mut host, greedy(&tokens, vocabulary, 8), false, 8).unwrap();
+    assert_eq!(host.snapshot(waiting.id).unwrap().status, Status::MemoryBlocked);
+    // Up to its abandonment no refusal reached its stream, nor anything
+    // else: it never began.
+    host.run();
+    waiting.drain();
+    assert_eq!(waiting.terminal, None, "refused before it was abandoned");
+    // Abandoned as a dropped stream is (`Owner::publication_wake`), its
+    // stream kept to read what reaches it until it is retired.
+    let id = waiting.id;
+    host.owner_mut().cancel(id);
+    host.step_until(&mut [&mut waiting], Duration::from_secs(10), |host, _| host.snapshot(id).is_none());
+    waiting.drain();
+    assert_eq!(waiting.terminal, None, "refused once abandoned");
+    drop(limit);
+    host.observe();
+    let mut next = admit(&mut host, greedy(&tokens, vocabulary, 8), false, 8).unwrap();
+    assert_ne!(host.snapshot(next.id).unwrap().status, Status::MemoryBlocked);
+    host.drive(&mut [&mut next], Duration::from_secs(60));
 }

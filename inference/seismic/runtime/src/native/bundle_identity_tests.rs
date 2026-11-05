@@ -17,7 +17,6 @@ use seismic_lang::checked::{
 use seismic_lang::entry::ElementBindings;
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry::{self, BackendName, Layout};
-use std::path::PathBuf;
 
 const VULKAN: VulkanFeatures = VulkanFeatures {
     subgroup_lanes: 32,
@@ -97,7 +96,7 @@ fn specialization(native: &NativeImplementation) -> NativeSpecialization {
                     .wrapping_add(1442695040888963407);
                 statics.with_static(name.as_str(), VALUES[(state >> 33) as usize % VALUES.len()])
             });
-        if let Ok(specialization) = native.default_specialization(&statics) {
+        if let Ok(specialization) = native.device_independent().unwrap().default_specialization(&statics) {
             return specialization;
         }
     }
@@ -112,11 +111,12 @@ fn specialization(native: &NativeImplementation) -> NativeSpecialization {
 #[test]
 #[ignore]
 fn decoded_kernel_bundle_forms_identical_native_sources() {
-    let kernels = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../engine/kernels/kernels");
+    let kernels = super::engine_kernels();
     let checked = seismic_lang::source::load(&[kernels], seismic_std::sources())
         .expect("the engine kernel library checks")
         .module;
-    let decoded = decode_checked_bundle(&encode_checked_bundle(&checked))
+    // Held for the process, as a build embeds a bundle.
+    let decoded = decode_checked_bundle(encode_checked_bundle(&checked).leak())
         .expect("the engine kernel bundle decodes");
     let representations = qwen_representations();
     let dialects = [
@@ -180,19 +180,20 @@ fn decoded_kernel_bundle_forms_identical_native_sources() {
                     .native_implementation_at(decoded_entry, *backend, bound)
                     .expect("the decoded module has the native implementation");
                 let specialization = specialization(native);
-                let asset = |module: &CheckedModule, entry| {
-                    module
-                        .native_asset(entry, *backend)
-                        .expect("the asset is captured")
-                        .to_owned()
-                };
+                fn asset(
+                    module: &CheckedModule,
+                    entry: seismic_lang::ids::EntryId,
+                    backend: BackendName,
+                ) -> seismic_lang::checked::NativeAsset<'_> {
+                    module.native_asset(entry, backend).expect("the asset is captured")
+                }
                 let expected = render_source(
                     *dialect,
                     &from_source,
                     bound,
                     native,
                     &specialization,
-                    &asset(&checked, info.id),
+                    asset(&checked, info.id, *backend),
                 );
                 let actual = render_source(
                     *dialect,
@@ -200,7 +201,7 @@ fn decoded_kernel_bundle_forms_identical_native_sources() {
                     bound,
                     decoded_native,
                     &specialization,
-                    &asset(&decoded, decoded_entry),
+                    asset(&decoded, decoded_entry, *backend),
                 );
                 assert!(
                     expected == actual,

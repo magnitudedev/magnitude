@@ -1,6 +1,6 @@
 # Rust/CMake outputs, including standalone validation crates.
-/target/
-**/target/
+/target*/
+**/target*/
 
 # Local compiler/runtime cache.
 .seismic-cache/

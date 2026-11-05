@@ -3,10 +3,10 @@
 use super::{
     append_ranges, install_commit, ranges_from, BankHandle, Claims, Codec, ComponentDescriptor,
     Error, HistoryDomainId, KvCodec, LayerRef, PlaneBuffer, SequenceState, StateStore, StoreCopy,
-    Transaction, VectorKind,
+    Tail, Transaction, VectorKind,
 };
 use seismic::Tensor;
-use std::rc::Rc;
+use std::{cell::Cell, rc::Rc};
 
 /// A read-only view whose tensors and row claims are owned by the transaction.
 /// `recurrent` holds one arena per recurrent component; the advance reads
@@ -131,7 +131,8 @@ impl OwnedCodecAdvance {
         match Self::prepare(&source, &destination) {
             Ok((source_codec, destination_codec, from)) => {
                 let counts = from.iter().map(Vec::len).collect::<Vec<_>>();
-                let claims = match destination.store.reserve_rows(None, &counts) {
+                let claims = match destination.store.reserve_rows(&vec![Tail::NEW; counts.len()], &counts)
+                {
                     Ok(claims) => claims,
                     Err(error) => return Err((source, destination, error)),
                 };
@@ -527,7 +528,7 @@ impl OwnedStateAdvance {
                 Error::from("committed rows must be a nonempty prefix of the advance"),
             ));
         }
-        let claims = match state.store.reserve(Some(&state.claims), state.position, count) {
+        let claims = match state.store.reserve(&state.tails(), state.position, count) {
             Ok(claims) => claims,
             Err(error) => return Err((state, error)),
         };
@@ -623,7 +624,7 @@ impl OwnedStateAdvance {
             mut state,
             count,
             committed,
-            claims,
+            mut claims,
             mut following,
             ..
         } = self;
@@ -647,14 +648,37 @@ impl OwnedStateAdvance {
         } else {
             0
         };
-        // Each domain keeps the rows of the accepted prefix: a Block domain
-        // the blocks it completes.
-        let mut kept = claims;
-        for (claims, domain) in kept.iter_mut().zip(&state.store.domains) {
-            drop(claims.split_off(domain.kind.advance_rows(state.position, accepted)));
-        }
-        install_commit(&mut state, kept, &mut following, tape, accepted);
+        keep_accepted(&state.store, &mut claims, state.position, accepted);
+        install_commit(&mut state, claims, &mut following, tape, accepted);
         Ok(OwnedAdvanceResolution::Committed(state))
+    }
+
+    /// The first chunk of a prompt group's chain behind it: `count` rows
+    /// following this advance, which publishes its every row (a chain
+    /// carries no speculation).
+    pub fn chained(&self, count: usize) -> Result<OwnedChainedAdvance, Error> {
+        chain_one(self.link(count)?)
+    }
+
+    fn link(&self, count: usize) -> Result<Link<'_>, Error> {
+        if self.committed != self.count {
+            return Err(Error::from("a chain follows an advance whose rows all commit"));
+        }
+        Ok(Link {
+            predecessor: self.predecessor(),
+            count,
+            reads: self.following.clone(),
+            writes: None,
+        })
+    }
+}
+
+/// Keep, in each domain's `claims` of an advance of `accepted` rows from
+/// `position`, the rows of that prefix: a Block domain the blocks it
+/// completes.
+fn keep_accepted(store: &StateStore, claims: &mut [Claims], position: usize, accepted: usize) {
+    for (claims, domain) in claims.iter_mut().zip(&store.domains) {
+        drop(claims.split_off(domain.kind.advance_rows(position, accepted)));
     }
 }
 
@@ -672,6 +696,10 @@ impl OwnedStateAdvance {
     /// Tentative rows following this advance's rows, formed before this
     /// advance is reconciled; see [`OwnedSuccessorAdvance`].
     pub fn successor(&self, count: usize) -> Result<OwnedSuccessorAdvance, Error> {
+        follow_one(self.predecessor(), count, None)
+    }
+
+    fn predecessor(&self) -> Predecessor<'_> {
         let end = self.state.position + self.count;
         let (starts, ranges) = following_history(
             &self.state.store,
@@ -681,21 +709,18 @@ impl OwnedStateAdvance {
             &self.claims,
             end,
         );
-        OwnedSuccessorAdvance::reserve(
-            &self.state.store,
-            Predecessor {
-                end,
-                bank: self.following.index(),
-                tape: published_tape(&self.state.store, self.count, self.committed),
-                claims: &self.claims,
-                floor: self.state.history_start,
-                starts,
-                ranges,
-                history: &self.history,
-                recurrent: &self.recurrent,
-            },
-            count,
-        )
+        Predecessor {
+            store: &self.state.store,
+            end,
+            bank: self.following.index(),
+            tape: published_tape(&self.state.store, self.count, self.committed),
+            floor: self.state.history_start,
+            starts,
+            ranges,
+            history: &self.history,
+            recurrent: &self.recurrent,
+            live: self.state.claims.iter().map(|claims| claims.id).collect(),
+        }
     }
 }
 
@@ -727,12 +752,12 @@ fn following_history(
 
 /// What a successor needs of the tentative rows it follows.
 struct Predecessor<'a> {
+    store: &'a Rc<StateStore>,
     /// The position after the predecessor's rows.
     end: usize,
     /// The version the predecessor publishes when all its rows commit.
     bank: usize,
     tape: usize,
-    claims: &'a [Claims],
     /// The trim floor, and per domain the first position and the rows of
     /// the history once the predecessor commits.
     floor: usize,
@@ -740,6 +765,93 @@ struct Predecessor<'a> {
     ranges: Vec<Vec<(usize, usize)>>,
     history: &'a [PlaneBuffer],
     recurrent: &'a Rc<[Tensor]>,
+    /// Per domain, the live history (its arena entry) the rows extend.
+    live: Vec<u64>,
+}
+
+impl Predecessor<'_> {
+    /// Per domain, where its successor grows once the predecessor commits,
+    /// as the committed state would: after the history's last row,
+    /// extending the live history.
+    fn tails(&self) -> Vec<Tail> {
+        self.ranges
+            .iter()
+            .zip(&self.live)
+            .map(|(ranges, &history)| Tail {
+                end: ranges.last().map(|(start, count)| start + count),
+                history: Some(history),
+            })
+            .collect()
+    }
+}
+
+/// The successors of one queued step, each of `count` rows following its
+/// slot's predecessor and writing `writes`, or a fresh successor bank. The
+/// step's demands are admitted together before any row is reserved, as
+/// provisioning admits a step's ([`StateStore::admit`]), so each successor
+/// takes exactly the pages its step takes provisioned alone once its
+/// predecessors commit.
+fn follow(
+    slots: Vec<(Predecessor<'_>, usize, Option<BankHandle>)>,
+) -> Result<Vec<OwnedSuccessorAdvance>, Error> {
+    let Some((first, ..)) = slots.first() else {
+        return Ok(Vec::new());
+    };
+    let store = first.store.clone();
+    if slots
+        .iter()
+        .any(|(predecessor, ..)| !Rc::ptr_eq(predecessor.store, &store))
+    {
+        return Err(Error::from("one step's successors follow advances of one store"));
+    }
+    let demands = slots
+        .iter()
+        .flat_map(|(predecessor, count, _)| {
+            store.demands(&predecessor.tails(), predecessor.end, *count)
+        })
+        .collect::<Vec<_>>();
+    let admission = Rc::new(Admission {
+        slabs: store.admit(&demands)?,
+        store: store.clone(),
+        kept: Cell::new(false),
+    });
+    slots
+        .into_iter()
+        .map(|(predecessor, count, writes)| {
+            OwnedSuccessorAdvance::reserve(predecessor, count, writes, &admission)
+        })
+        .collect()
+}
+
+/// The one successor of a step of one slot, writing `writes` or a fresh
+/// successor bank.
+fn follow_one(
+    predecessor: Predecessor<'_>,
+    count: usize,
+    writes: Option<BankHandle>,
+) -> Result<OwnedSuccessorAdvance, Error> {
+    Ok(follow(vec![(predecessor, count, writes)])?
+        .pop()
+        .expect("one successor follows each predecessor"))
+}
+
+/// The slabs one queued step admitted to placement, shared by its
+/// successors. Until one of them joins its predecessor's committed state the
+/// step has not run: when the last drops, after its rows are released, the
+/// slabs still empty return to reserve, as if the step had never been
+/// provisioned. Once one attaches they stay, as a provisioned step's do.
+struct Admission {
+    store: Rc<StateStore>,
+    slabs: Vec<(HistoryDomainId, usize)>,
+    kept: Cell<bool>,
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        if !self.kept.get() {
+            self.store.withdraw(&self.slabs);
+        }
+    }
 }
 
 /// Tentative rows that follow an in-flight advance (or successor) before it
@@ -764,19 +876,28 @@ pub struct OwnedSuccessorAdvance {
     recurrent: Rc<[Tensor]>,
     destinations: Vec<Vec<usize>>,
     transaction: Transaction,
+    /// Per domain, the live history (its arena entry) its rows extend.
+    live: Vec<u64>,
+    /// Dropped last, after the rows it may return to reserve.
+    admission: Rc<Admission>,
 }
 
 impl OwnedSuccessorAdvance {
     fn reserve(
-        store: &Rc<StateStore>,
         predecessor: Predecessor<'_>,
         count: usize,
+        writes: Option<BankHandle>,
+        admission: &Rc<Admission>,
     ) -> Result<Self, Error> {
+        let store = predecessor.store;
         if count == 0 || count > store.context_capacity.saturating_sub(predecessor.end) {
             return Err(Error::from("successor advance exceeds context capacity"));
         }
-        let claims = store.reserve(Some(predecessor.claims), predecessor.end, count)?;
-        let following = store.successor_bank()?;
+        let claims = store.reserve(&predecessor.tails(), predecessor.end, count)?;
+        let following = match writes {
+            Some(bank) => bank,
+            None => store.successor_bank()?,
+        };
         let destinations = destinations(&claims);
         let mut transaction = store.begin_transaction();
         transaction.track(&claims, &following);
@@ -795,11 +916,17 @@ impl OwnedSuccessorAdvance {
             recurrent: predecessor.recurrent.clone(),
             destinations,
             transaction,
+            live: predecessor.live,
+            admission: admission.clone(),
         })
     }
 
     /// Tentative rows following this successor's rows.
     pub fn successor(&self, count: usize) -> Result<OwnedSuccessorAdvance, Error> {
+        follow_one(self.predecessor(), count, None)
+    }
+
+    fn predecessor(&self) -> Predecessor<'_> {
         let end = self.position + self.count;
         let (starts, ranges) = following_history(
             &self.store,
@@ -809,21 +936,18 @@ impl OwnedSuccessorAdvance {
             &self.claims,
             end,
         );
-        Self::reserve(
-            &self.store,
-            Predecessor {
-                end,
-                bank: self.following.index(),
-                tape: 0,
-                claims: &self.claims,
-                floor: self.floor,
-                starts,
-                ranges,
-                history: &self.history,
-                recurrent: &self.recurrent,
-            },
-            count,
-        )
+        Predecessor {
+            store: &self.store,
+            end,
+            bank: self.following.index(),
+            tape: 0,
+            floor: self.floor,
+            starts,
+            ranges,
+            history: &self.history,
+            recurrent: &self.recurrent,
+            live: self.live.clone(),
+        }
     }
 
     pub fn position(&self) -> usize {
@@ -884,6 +1008,8 @@ impl OwnedSuccessorAdvance {
                 Error::from("successor advance does not follow the committed state"),
             ));
         }
+        // Its step runs: what it admitted stays admitted.
+        self.admission.kept.set(true);
         let Self {
             count,
             claims,
@@ -909,11 +1035,166 @@ impl OwnedSuccessorAdvance {
     }
 }
 
-/// The tentative rows of one launch slot: an advance of accepted state, or a
-/// successor of an advance still in flight.
+/// A chunk of a prompt group queued behind the chunk before it in one chain
+/// ([`OwnedStateAdvance::chained`]). Its rows are its own, as a successor's;
+/// its recurrent state alternates between two banks. Behind the group's
+/// first chunk it writes a fresh bank, as the first chunk's source is
+/// accepted state; behind a chained chunk it writes the bank that chunk
+/// read, at each layer after that chunk read it (each chunk reads what the
+/// chunk before it wrote there). So the state a chunk publishes is
+/// overwritten two chunks later, before its own flight returns: no chunk
+/// joins an accepted state of its own, and the chain commits whole
+/// ([`OwnedChainAdvance`]).
+pub struct OwnedChainedAdvance {
+    advance: OwnedSuccessorAdvance,
+    /// The bank it reads, which the chunk after it writes.
+    reads: BankHandle,
+}
+
+impl OwnedChainedAdvance {
+    /// The chunk chained behind this one: `count` rows writing the bank
+    /// this one reads.
+    pub fn chained(&self, count: usize) -> Result<OwnedChainedAdvance, Error> {
+        chain_one(self.link(count))
+    }
+
+    fn link(&self, count: usize) -> Link<'_> {
+        Link {
+            predecessor: self.advance.predecessor(),
+            count,
+            reads: self.advance.following.clone(),
+            writes: Some(self.reads.clone()),
+        }
+    }
+}
+
+/// One chunk to chain: `count` rows following `predecessor`, whose
+/// published bank is `reads`, writing `writes` or a fresh bank.
+struct Link<'a> {
+    predecessor: Predecessor<'a>,
+    count: usize,
+    reads: BankHandle,
+    writes: Option<BankHandle>,
+}
+
+/// The chunks of one queued step, one per link, their demands admitted
+/// together as [`follow`] admits a step's successors.
+fn chain(links: Vec<Link<'_>>) -> Result<Vec<OwnedChainedAdvance>, Error> {
+    let (slots, reads): (Vec<_>, Vec<_>) = links
+        .into_iter()
+        .map(|link| ((link.predecessor, link.count, link.writes), link.reads))
+        .unzip();
+    Ok(follow(slots)?
+        .into_iter()
+        .zip(reads)
+        .map(|(advance, reads)| OwnedChainedAdvance { advance, reads })
+        .collect())
+}
+
+/// The one chunk of a step of one slot.
+fn chain_one(link: Link<'_>) -> Result<OwnedChainedAdvance, Error> {
+    Ok(chain(vec![link])?
+        .pop()
+        .expect("one chunk follows each link"))
+}
+
+/// A prompt group's chain, its chunks joined in order as each finishes: the
+/// group's first advance and the chunks chained behind it. It publishes
+/// nothing until it commits whole: the rows of every chunk and the last
+/// chunk's bank; the other bank is released then.
+pub struct OwnedChainAdvance {
+    first: OwnedStateAdvance,
+    chunks: Vec<OwnedChainedAdvance>,
+}
+
+impl OwnedChainAdvance {
+    /// The chain opened by `first`, whose rows all commit.
+    pub fn begin(first: OwnedStateAdvance) -> Result<Self, (OwnedStateAdvance, Error)> {
+        if first.committed != first.count {
+            return Err((first, Error::from("a chain opens on an advance whose rows all commit")));
+        }
+        Ok(Self {
+            first,
+            chunks: Vec::new(),
+        })
+    }
+
+    /// The position after the last joined chunk.
+    pub fn end(&self) -> usize {
+        self.chunks.last().map_or(self.first.state.position + self.first.count, |chunk| {
+            chunk.advance.position + chunk.advance.count
+        })
+    }
+
+    /// Join the chunk chained behind the last one joined; any other is
+    /// returned.
+    pub fn join(
+        &mut self,
+        chunk: OwnedChainedAdvance,
+    ) -> Result<(), (OwnedChainedAdvance, Error)> {
+        let bank = self
+            .chunks
+            .last()
+            .map_or(&self.first.following, |last| &last.advance.following);
+        if !Rc::ptr_eq(&chunk.advance.store, &self.first.state.store)
+            || chunk.advance.position != self.end()
+            || chunk.advance.previous_bank != bank.index()
+        {
+            return Err((chunk, Error::from("a joined chunk does not follow its chain")));
+        }
+        self.chunks.push(chunk);
+        Ok(())
+    }
+
+    /// Publish every chunk's rows, the recurrent state the last one wrote.
+    pub fn commit(self) -> SequenceState {
+        let Self { first, chunks } = self;
+        let OwnedStateAdvance {
+            mut state,
+            count,
+            mut claims,
+            mut following,
+            ..
+        } = first;
+        let store = state.store.clone();
+        keep_accepted(&store, &mut claims, state.position, count);
+        let mut rows = count;
+        for chunk in chunks {
+            // Its step ran: what it admitted stays admitted.
+            chunk.advance.admission.kept.set(true);
+            let OwnedSuccessorAdvance {
+                position,
+                count,
+                claims: mut chunk_claims,
+                following: written,
+                ..
+            } = chunk.advance;
+            keep_accepted(&store, &mut chunk_claims, position, count);
+            for (history, chunk_claims) in claims.iter_mut().zip(chunk_claims) {
+                history.append(chunk_claims);
+            }
+            rows += count;
+            following = written;
+        }
+        install_commit(&mut state, claims, &mut following, 0, rows);
+        state
+    }
+
+    /// Recover the first advance's source state; every chunk's rows and
+    /// banks are released.
+    pub fn abort(self) -> SequenceState {
+        let Self { first, chunks } = self;
+        drop(chunks);
+        first.abort()
+    }
+}
+
+/// The tentative rows of one launch slot: an advance of accepted state, a
+/// successor of an advance still in flight, or a chunk chained behind one.
 pub enum TentativeAdvance {
     Accepted(OwnedStateAdvance),
     Successor(OwnedSuccessorAdvance),
+    Chained(OwnedChainedAdvance),
 }
 
 impl TentativeAdvance {
@@ -921,6 +1202,7 @@ impl TentativeAdvance {
         match self {
             Self::Accepted(advance) => advance.position(),
             Self::Successor(advance) => advance.position(),
+            Self::Chained(chunk) => chunk.advance.position(),
         }
     }
 
@@ -928,6 +1210,7 @@ impl TentativeAdvance {
         match self {
             Self::Accepted(advance) => advance.rows(),
             Self::Successor(advance) => advance.rows(),
+            Self::Chained(chunk) => chunk.advance.rows(),
         }
     }
 
@@ -935,6 +1218,7 @@ impl TentativeAdvance {
         match self {
             Self::Accepted(advance) => advance.belongs_to(store),
             Self::Successor(advance) => advance.belongs_to(store),
+            Self::Chained(chunk) => chunk.advance.belongs_to(store),
         }
     }
 
@@ -942,6 +1226,7 @@ impl TentativeAdvance {
         match self {
             Self::Accepted(advance) => advance.history_ranges(domain),
             Self::Successor(advance) => advance.history_ranges(domain),
+            Self::Chained(chunk) => chunk.advance.history_ranges(domain),
         }
     }
 
@@ -949,6 +1234,7 @@ impl TentativeAdvance {
         match self {
             Self::Accepted(advance) => advance.domain_ranges(),
             Self::Successor(advance) => advance.domain_ranges(),
+            Self::Chained(chunk) => chunk.advance.domain_ranges(),
         }
     }
 
@@ -956,6 +1242,7 @@ impl TentativeAdvance {
         match self {
             Self::Accepted(advance) => advance.history_start(domain),
             Self::Successor(advance) => advance.history_start(domain),
+            Self::Chained(chunk) => chunk.advance.history_start(domain),
         }
     }
 
@@ -963,6 +1250,7 @@ impl TentativeAdvance {
         match self {
             Self::Accepted(advance) => advance.visible_ranges(domain, from),
             Self::Successor(advance) => advance.visible_ranges(domain, from),
+            Self::Chained(chunk) => chunk.advance.visible_ranges(domain, from),
         }
     }
 
@@ -971,6 +1259,7 @@ impl TentativeAdvance {
         match self {
             Self::Accepted(advance) => advance.span_count(),
             Self::Successor(advance) => advance.span_count(),
+            Self::Chained(chunk) => chunk.advance.span_count(),
         }
     }
 
@@ -978,13 +1267,55 @@ impl TentativeAdvance {
         match self {
             Self::Accepted(advance) => advance.bindings(),
             Self::Successor(advance) => advance.bindings(),
+            Self::Chained(chunk) => chunk.advance.bindings(),
         }
     }
 
     pub fn successor(&self, count: usize) -> Result<OwnedSuccessorAdvance, Error> {
+        follow_one(self.predecessor()?, count, None)
+    }
+
+    /// The successors of one queued step: per slot, `count` rows following
+    /// its advance, admitted and placed as the step would be provisioned
+    /// and placed alone once these advances commit.
+    pub fn successors<'a>(
+        slots: impl IntoIterator<Item = (&'a TentativeAdvance, usize)>,
+    ) -> Result<Vec<OwnedSuccessorAdvance>, Error> {
+        follow(
+            slots
+                .into_iter()
+                .map(|(advance, count)| Ok((advance.predecessor()?, count, None)))
+                .collect::<Result<_, Error>>()?,
+        )
+    }
+
+    /// The chunks of one queued step chained behind its slots: per slot,
+    /// `count` rows chained behind its advance (the first chunk of a chain
+    /// or a chained one), admitted together and placed as the step would be
+    /// provisioned and placed alone, as [`Self::successors`] are. A
+    /// successor opens no chain: a chain opens where a step launches.
+    pub fn chained<'a>(
+        slots: impl IntoIterator<Item = (&'a TentativeAdvance, usize)>,
+    ) -> Result<Vec<OwnedChainedAdvance>, Error> {
+        chain(
+            slots
+                .into_iter()
+                .map(|(advance, count)| match advance {
+                    Self::Accepted(advance) => advance.link(count),
+                    Self::Chained(advance) => Ok(advance.link(count)),
+                    Self::Successor(_) => Err(Error::from("a chain opens where a step launches")),
+                })
+                .collect::<Result<_, Error>>()?,
+        )
+    }
+
+    /// What a successor follows. A chained chunk's published state is
+    /// overwritten while its chain runs: only its chain follows it.
+    fn predecessor(&self) -> Result<Predecessor<'_>, Error> {
         match self {
-            Self::Accepted(advance) => advance.successor(count),
-            Self::Successor(advance) => advance.successor(count),
+            Self::Accepted(advance) => Ok(advance.predecessor()),
+            Self::Successor(advance) => Ok(advance.predecessor()),
+            Self::Chained(_) => Err(Error::from("only its chain follows a chained chunk")),
         }
     }
 }
@@ -1030,12 +1361,7 @@ mod tests {
 
     #[test]
     fn abort_recovers_source_and_releases_tentative_capacity() {
-        let Some(device) = seismic::Devices::discover(&[])
-            .ok()
-            .and_then(|catalog| catalog.open_backend(BackendName::Cpu).ok())
-        else {
-            return;
-        };
+        let device = cpu_device();
         let store = token_store(
             Rc::new(device),
             4,
@@ -1100,12 +1426,7 @@ mod tests {
 
     #[test]
     fn successors_follow_in_flight_advances_and_attach_to_their_commits() {
-        let Some(device) = seismic::Devices::discover(&[])
-            .ok()
-            .and_then(|catalog| catalog.open_backend(BackendName::Cpu).ok())
-        else {
-            return;
-        };
+        let device = cpu_device();
         let store = token_store(
             Rc::new(device),
             8,
@@ -1185,12 +1506,7 @@ mod tests {
 
     #[test]
     fn codec_conversion_reserves_and_publishes_only_after_completion() {
-        let Some(device) = seismic::Devices::discover(&[])
-            .ok()
-            .and_then(|catalog| catalog.open_backend(BackendName::Cpu).ok())
-        else {
-            return;
-        };
+        let device = cpu_device();
         let device = Rc::new(device);
         let source_store = token_store(
             device.clone(),
@@ -1276,33 +1592,35 @@ mod tests {
         assert_eq!(destination_store.occupied_rows(TOKEN), 2);
     }
 
-    fn recurrent_store(context: usize, in_flight: usize) -> Option<StoreBindings> {
-        let device = seismic::Devices::discover(&[])
-            .ok()
-            .and_then(|catalog| catalog.open_backend(BackendName::Cpu).ok())?;
-        Some(
-            token_store(
-                Rc::new(device),
-                context,
-                context,
-                vec![ComponentDescriptor::new(
-                    LayerRef::Target(0),
-                    CodecSpec::dense(DType::F32, 1, 1),
-                    1,
-                )
-                .unwrap()],
-                vec![ComponentSpec {
-                    shape: vec![1],
-                    dtype: DType::F32,
-                }],
-                BankCapacity {
-                    active: 2,
-                    in_flight,
-                    retained: 0,
-                },
+    fn cpu_device() -> Device {
+        seismic::Devices::discover(&[])
+            .expect("devices are discovered")
+            .open_backend(BackendName::Cpu)
+            .expect("the CPU backend opens")
+    }
+
+    fn recurrent_store(context: usize, in_flight: usize) -> StoreBindings {
+        token_store(
+            Rc::new(cpu_device()),
+            context,
+            context,
+            vec![ComponentDescriptor::new(
+                LayerRef::Target(0),
+                CodecSpec::dense(DType::F32, 1, 1),
+                1,
             )
-            .unwrap(),
+            .unwrap()],
+            vec![ComponentSpec {
+                shape: vec![1],
+                dtype: DType::F32,
+            }],
+            BankCapacity {
+                active: 2,
+                in_flight,
+                retained: 0,
+            },
         )
+        .unwrap()
     }
 
     /// A verification publishes its recurrent state after its committed rows
@@ -1311,9 +1629,7 @@ mod tests {
     /// advance, with no second pass.
     #[test]
     fn speculative_prefixes_commit_as_tape_versions() {
-        let Some(store) = recurrent_store(8, 2) else {
-            return;
-        };
+        let store = recurrent_store(8, 2);
         let state = store.create().unwrap();
         let advance = OwnedStateAdvance::begin_speculative(state, 4, 1)
             .ok()
@@ -1381,13 +1697,72 @@ mod tests {
         assert!(OwnedStateAdvance::begin_speculative(state, 2, 0).is_err());
     }
 
+    /// A chain of four chunks runs on two successor banks, alternating
+    /// behind its first chunk's fresh one and never writing its source;
+    /// it publishes nothing until it commits whole, the last chunk's bank
+    /// then, or returns its source when aborted.
+    #[test]
+    fn a_chain_alternates_two_banks_and_commits_whole() {
+        let mut store = recurrent_store(8, 2);
+        store.provision(&[], 2).unwrap();
+        let free = store.available_banks();
+        let source = store.create().unwrap();
+        let source_bank = source.bank_index();
+        let first = OwnedStateAdvance::begin(source, 1).ok().unwrap();
+        let second = first.chained(1).unwrap();
+        let third = second.chained(1).unwrap();
+        let fourth = third.chained(1).unwrap();
+        let banks = |chunk: &OwnedChainedAdvance| {
+            let bindings = chunk.advance.bindings();
+            (bindings.previous_bank, bindings.following_bank)
+        };
+        let written = first.bindings().following_bank;
+        let (read, other) = banks(&second);
+        assert_eq!(read, written);
+        assert!(other != written && other != source_bank && written != source_bank);
+        assert_eq!(banks(&third), (other, written));
+        assert_eq!(banks(&fourth), (written, other));
+        // Two successor banks in flight, whatever the chain's length.
+        assert_eq!(store.available_banks(), free - 2);
+        assert_eq!(store.occupied_rows(TOKEN), 4);
+        // Only its chain follows a chunk.
+        let fourth = TentativeAdvance::Chained(fourth);
+        assert!(fourth.successor(1).is_err());
+        let TentativeAdvance::Chained(fourth) = fourth else {
+            unreachable!()
+        };
+
+        let mut chain = OwnedChainAdvance::begin(first).ok().unwrap();
+        let (third, _) = chain.join(third).err().expect("a chunk out of order");
+        chain.join(second).ok().unwrap();
+        chain.join(third).ok().unwrap();
+        chain.join(fourth).ok().unwrap();
+        assert_eq!(chain.end(), 4);
+        let state = chain.commit();
+        assert_eq!((state.position(), state.bank_index(), state.tape_rows()), (4, other, 0));
+        assert_eq!(store.occupied_rows(TOKEN), 4);
+        assert_eq!(state.history_ranges(TOKEN).len(), 1);
+        // The other bank was released.
+        assert_eq!(store.available_banks(), free - 1);
+
+        store.provision(&state.demands(3), 2).unwrap();
+        let first = OwnedStateAdvance::begin(state, 2).ok().unwrap();
+        let second = first.chained(1).unwrap();
+        let mut chain = OwnedChainAdvance::begin(first).ok().unwrap();
+        chain.join(second).ok().unwrap();
+        let state = chain.abort();
+        assert_eq!((state.position(), state.bank_index()), (4, other));
+        assert_eq!(store.occupied_rows(TOKEN), 4);
+        let speculative = OwnedStateAdvance::begin_speculative(state, 2, 1).ok().unwrap();
+        assert!(speculative.chained(1).is_err(), "a chain carries no speculation");
+        assert!(OwnedChainAdvance::begin(speculative).is_err());
+    }
+
     /// A successor of a verification follows the version the verification
     /// publishes when every row is accepted, and attaches only to it.
     #[test]
     fn successors_follow_the_tape_version_of_a_speculative_advance() {
-        let Some(mut store) = recurrent_store(8, 3) else {
-            return;
-        };
+        let mut store = recurrent_store(8, 3);
         let first = OwnedStateAdvance::begin_speculative(store.create().unwrap(), 3, 1)
             .ok()
             .unwrap();

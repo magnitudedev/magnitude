@@ -38,7 +38,8 @@ def parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="reference logits and sanity gate for rendered fixtures")
     run.add_argument("--rendered", type=Path, required=True, help="harness `render` output (JSON Lines)")
     run.add_argument("--artifacts", type=Path, required=True, help="catalog acquisition object (JSON)")
-    run.add_argument("--output", type=Path, help="run directory (default: evaluation/results/<stamp>-reference-<id>)")
+    run.add_argument("--output", type=Path, help="run directory (default: <stamp>-reference-<id> in the repository's results store, "
+                     "the main checkout's inference/evaluation/results)")
     run.add_argument("--perplexity-max", type=float, default=PERPLEXITY_MAX)
     run.add_argument("--top1-min", type=float, default=TOP1_MIN)
     run.add_argument("--batch-tokens", type=int, default=BATCH_TOKENS, help="padded tokens per streamed forward")
@@ -56,7 +57,6 @@ def parser() -> argparse.ArgumentParser:
     kl.add_argument("--build-identity", type=Path, required=True, help="identity of the reference tools' tree")
     kl.add_argument("--cache", type=Path, required=True, help="the host's reference cache")
     kl.add_argument("--output", type=Path, required=True, help="the summary (JSON)")
-    kl.add_argument("--keep-logits", action="store_true")
     return root
 
 
@@ -66,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
     if options.command == "kl":
         from magnitude_references import kl
         summary = kl.run(options.logits, options.artifacts, options.build_identity, options.cache,
-                         options.output, options.base, options.own_rendering, options.keep_logits)
+                         options.output, options.base, options.own_rendering)
         print(json.dumps({key: value for key, value in summary.items() if key != "reference"}, indent=1))
         return 0
     output = options.output or default_output(sha256_file(options.rendered))

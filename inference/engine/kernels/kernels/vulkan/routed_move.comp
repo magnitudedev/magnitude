@@ -1,0 +1,31 @@
+// Expert streaming, a bank shrink's record moves (`routed_move` in
+// routed.seismic); the Vulkan form of `metal/routed_move.metal`: the listed
+// records of a group's per-record tensor into its other records, byte for
+// byte (streaming/list_copy.hpp), each record reached through the tensor's
+// record table. Workgroup rows stride over the list's entries; the
+// invocations of a row over each record. No entry's destination is
+// another's source, so the entries are independent.
+#include <seismic/slab.glsl>
+#include "lib/streaming/control.glsl"
+#include "../streaming/list.hpp"
+
+#define STREAMING_COPY_FROM(table, record) slab_region(table, uint64_t(record))
+#define STREAMING_COPY_TO(table, record) slab_region(table, uint64_t(record))
+#include "../streaming/list_copy.hpp"
+
+// The bytes of one unit of the records' strides: a row layout's stored row,
+// any other's packet (a dense element's packet is one element).
+#if defined(SEISMIC_RECORDS_KIND_PACKED) && !defined(SEISMIC_RECORDS_LAYOUT_PACKET)
+#define MOVE_STRIDE_BYTES uint64_t(SEISMIC_RECORDS_ROW_STRIDE_BYTES)
+#else
+#define MOVE_STRIDE_BYTES uint64_t(SEISMIC_RECORDS_PACKET_SIZE)
+#endif
+
+void routed_move() {
+    const uint tid = gl_LocalInvocationIndex;
+    // One record: the bytes between the matrices of the [D, N, K] records.
+    streaming_list_move(SEISMIC_PTR(SEISMIC_BUFFER_RECORDS), SEISMIC_PTR(SEISMIC_BUFFER_LIST),
+        uint64_t(SEISMIC_RECORDS_STRIDE_0) * MOVE_STRIDE_BYTES, gl_WorkGroupID.y, gl_NumWorkGroups.y,
+        uint64_t(gl_WorkGroupID.x) * gl_WorkGroupSize.x + tid, uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x, 0u,
+        tid, gl_WorkGroupSize.x);
+}

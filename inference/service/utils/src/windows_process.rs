@@ -375,18 +375,13 @@ impl OwnedWindowsChild {
         Ok(())
     }
 
-    pub fn retire(&self, timeout: Duration) -> io::Result<ExitStatus> {
+    /// Kill the job and return once every process of it is gone, however long that takes, as a
+    /// Unix child is waited for: an error is a kill or an observation the system refused.
+    pub fn retire(&self) -> io::Result<ExitStatus> {
         self.start_kill()?;
-        let started = Instant::now();
         loop {
             if let Some(status) = self.try_retirement()? {
                 return Ok(status);
-            }
-            if started.elapsed() >= timeout {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "Windows child job retirement remains unproven",
-                ));
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -565,7 +560,7 @@ mod tests {
         if drop_owner {
             drop(child);
         } else {
-            child.retire(Duration::from_secs(2)).unwrap();
+            child.retire().unwrap();
         }
         assert_eq!(
             unsafe { WaitForSingleObject(observed.as_raw_handle(), 2000) },

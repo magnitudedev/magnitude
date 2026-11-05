@@ -1,234 +1,18 @@
 //! Controlled completion tests for the production execution domain.
 
+use super::fixtures::*;
 use super::*;
 use crate::{
-    AttestedPrograms, ComponentSelection, ExecutionPath, ExecutionPlanner, PlannedMethod,
-    ResourceAllocator, ResourceCapacity, ResourceLimits, ResourcePlanner, TargetLaunchCore,
+    ResourceLimits,
     completion::CompletionWake,
     platform,
-    programs::{
-        CompletedHeadWork, CompletedVisionWork, CompletedWork, ProgramSubmission, ReadySubmission,
-    },
+    programs::{CompletedHeadWork, CompletedVisionWork},
 };
-use magnitude_artifacts::PackageManifest;
-use magnitude_family_contracts::FamilyId;
-use magnitude_state::{KvCodec, ShrinkPolicy};
-use std::marker::PhantomData;
+use magnitude_state::ShrinkPolicy;
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
-
-/// The planning fixture's model (the smallest geometry every native kernel
-/// admits) with an 8-token context.
-fn tiny_definition() -> ModelDefinition {
-    let mut definition = crate::planning::tests::fixture_definition();
-    definition.family = FamilyId("controlled-target-domain".into());
-    definition.decoder.context_limit = 8;
-    definition
-}
-
-fn tiny_manifest(definition: &ModelDefinition) -> PackageManifest {
-    crate::planning::tests::fixture_manifest(definition)
-}
-
-type Fixture = (ExecutorDomain<TestFamily>, StateBindings<TestFamily>);
-
-thread_local! {
-    /// The stored-table reads the next target submission's output carries:
-    /// a test sets them to inject a step's table reads.
-    static STORED_READS: std::cell::RefCell<Vec<crate::programs::StoredRead>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-fn fixture(control: Option<PendingControl>) -> Option<Fixture> {
-    fixture_with(control, false, false)
-}
-
-/// A spare head store of 4096-wide F32 rows: 2048 rows per slab, 8192 rows,
-/// one slab backed. It grows independently of the target model.
-fn spare_head_store(device: Rc<seismic::Device>) -> StoreBindings {
-    use magnitude_state::{
-        BankCapacity, CodecSpec, ComponentDescriptor, HistoryDomainLayout, HistoryDomainPlan,
-        LayerRef,
-    };
-    StateStore::new(
-        device,
-        8192,
-        8192,
-        vec![HistoryDomainPlan {
-            layout: HistoryDomainLayout::Token {
-                components: vec![
-                    ComponentDescriptor::new(
-                        LayerRef::Target(0),
-                        CodecSpec::dense(seismic::DType::F32, 4096, 4096),
-                        1,
-                    )
-                    .unwrap(),
-                ],
-            },
-            logical_rows: 8192,
-        }],
-        vec![],
-        BankCapacity {
-            active: 4,
-            in_flight: 4,
-            retained: 0,
-        },
-    )
-    .unwrap()
-    .1
-}
-
-fn fixture_with(control: Option<PendingControl>, lookahead: bool, head: bool) -> Option<Fixture> {
-    fixture_on(control, lookahead, head, platform::DeviceRequest::Automatic)
-}
-
-fn fixture_on(
-    control: Option<PendingControl>,
-    lookahead: bool,
-    head: bool,
-    device_request: platform::DeviceRequest,
-) -> Option<Fixture> {
-    fixture_of(tiny_definition(), 2, control, lookahead, head, device_request)
-}
-
-/// A domain over `definition` launching up to `rows` rows.
-fn fixture_of(
-    definition: ModelDefinition,
-    rows: usize,
-    control: Option<PendingControl>,
-    lookahead: bool,
-    head: bool,
-    device_request: platform::DeviceRequest,
-) -> Option<Fixture> {
-    let catalog = seismic::Devices::discover(&[]).ok()?;
-    let reserves = platform::MemoryReserves::standard();
-    let selected =
-        platform::select_device(&catalog, ExecutionPath::Native, device_request, &reserves).ok()?;
-    let device = Rc::new(
-        catalog
-            .open(catalog.resolve(selected.info.selector()).unwrap())
-            .unwrap(),
-    );
-    let definition = Rc::new(definition);
-    let manifest = tiny_manifest(&definition);
-    let limits = ResourceLimits {
-        max_launch_rows: rows,
-        max_launch_slots: 2,
-        max_selected_rows: 2,
-        max_drafting_slots: 2,
-        exported_logits_rows: 0,
-        max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
-        max_image_cells: 0,
-        lookahead,
-    };
-    let capacity_bytes = ResourceCapacity {
-        domain_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
-        tensor_operations: crate::TensorOperations::of(selected.info.forms_tensor_operations()),
-    };
-    let draft = ExecutionPlanner::prepare(
-        &selected,
-        &manifest,
-        &definition,
-        ComponentSelection {
-            head: false,
-            vision: false,
-        },
-        ExecutionPath::Native,
-        PlannedMethod::Plain,
-        KvCodec::Dense,
-        limits,
-    )
-    .unwrap();
-    let state = ResourcePlanner::state_plan(
-        &definition,
-        draft.load(),
-        draft.policy().method(),
-        KvCodec::Dense,
-        limits,
-        capacity_bytes,
-    )
-    .unwrap();
-    let mut programs = AttestedPrograms::prepare_draft(
-        &draft,
-        &device,
-        crate::TuningContext {
-            definition: &definition,
-            weights: &crate::ZeroTuningWeights,
-            observer: &crate::UnreportedTuning,
-            cache: None,
-            numerical_profile: crate::ResolvedNumericalProfile::standard(),
-            settings: crate::TuningSettings::STANDARD,
-        },
-        crate::UnpreparedUnits::ServeDefaults,
-    )
-    .unwrap();
-    let target_graphs = programs
-        .prepare_target_graphs(
-            &device,
-            draft.load(),
-            &definition.decoder,
-            &state,
-            draft.programs().target(),
-            limits,
-            &seismic::Workers::new(1),
-        )
-        .unwrap();
-    let target_readout_graphs = programs
-        .prepare_target_readout_graphs(&device, draft.load(), &definition.decoder, limits)
-        .unwrap();
-    programs
-        .prepare_auxiliary_graphs(
-            &device,
-            draft.load(),
-            &definition,
-            draft.programs(),
-            &state,
-            limits,
-            PlannedMethod::Plain,
-        )
-        .unwrap();
-    let resources_plan = ResourcePlanner::plan_with_state(
-        state,
-        &target_graphs,
-        &target_readout_graphs,
-        None,
-        None,
-        programs.state_graphs().unwrap(),
-    )
-    .unwrap();
-    let execution = Rc::new(draft.admit(resources_plan).unwrap());
-    let id = ResourceDomainId::new("controlled-target-domain").unwrap();
-    let resources = ResourceAllocator::allocate(
-        &execution,
-        &device,
-        id,
-        &target_graphs,
-        &target_readout_graphs,
-        None,
-        None,
-        programs.state_graphs().unwrap(),
-    )
-    .unwrap();
-    let store = execution
-        .resources()
-        .target_state()
-        .allocate(device.clone())
-        .unwrap();
-    let head = head.then(|| spare_head_store(device.clone()));
-    Some(ExecutorDomain::with_family(
-        execution,
-        definition,
-        resources,
-        DeviceHeap::open(Rc::new(catalog), reserves, device).unwrap(),
-        store,
-        head,
-        None,
-        None,
-        TestFamily { control, programs },
-    ))
-}
 
 fn forward(request: RequestId, position: usize) -> Operation {
     Operation::Forward {
@@ -247,7 +31,7 @@ fn forward(request: RequestId, position: usize) -> Operation {
 /// Make `request` resident on fresh state with no prompt rows.
 fn open<F: ProgramFamily>(
     domain: &mut ExecutorDomain<F>,
-    bindings: &mut StateBindings<F>,
+    bindings: &mut StateBindings,
     request: RequestId,
 ) {
     domain
@@ -261,276 +45,10 @@ fn open<F: ProgramFamily>(
     );
 }
 
-#[derive(Default)]
-struct PendingState {
-    result: Option<Result<(), crate::DeviceError>>,
-    wake: Option<CompletionWake>,
-}
-#[derive(Clone, Default)]
-struct PendingControl(Arc<Mutex<PendingState>>);
-impl PendingControl {
-    fn resolve(&self, result: Result<(), crate::DeviceError>) {
-        let wake = {
-            let mut state = self.0.lock().unwrap();
-            assert!(state.result.replace(result).is_none());
-            state.wake.take()
-        };
-        if let Some(wake) = wake {
-            wake.complete();
-        }
-    }
-}
-struct PendingCompletion(PendingControl);
-impl Completion for PendingCompletion {
-    fn is_complete(&self) -> bool {
-        self.0.0.lock().unwrap().result.is_some()
-    }
-    fn result(&mut self) -> Result<(), crate::DeviceError> {
-        self.0
-            .0
-            .lock()
-            .unwrap()
-            .result
-            .clone()
-            .expect("completion is pending")
-    }
-    fn notify(&mut self, wake: CompletionWake) {
-        let wake = {
-            let mut state = self.0.0.lock().unwrap();
-            if state.result.is_some() {
-                Some(wake)
-            } else {
-                assert!(state.wake.replace(wake).is_none());
-                None
-            }
-        };
-        if let Some(wake) = wake {
-            wake.complete();
-        }
-    }
-}
-struct PendingSubmission<L, W, O> {
-    completion: PendingCompletion,
-    core: L,
-    workspace: W,
-    output: O,
-}
-
-/// A controlled pending submission for lane-level device-failure tests. It has
-/// no completed payload because the error resolves before `finish` exposes work.
-struct PendingFailureSubmission<W> {
-    completion: PendingCompletion,
-    _completed: PhantomData<fn() -> W>,
-}
-
-impl<W> PendingFailureSubmission<W> {
-    fn new(control: PendingControl) -> Self {
-        Self {
-            completion: PendingCompletion(control),
-            _completed: PhantomData,
-        }
-    }
-}
-
-impl<W> ProgramSubmission for PendingFailureSubmission<W> {
-    type CompletedWork = W;
-
-    fn completion(&mut self) -> &mut dyn Completion {
-        &mut self.completion
-    }
-
-    fn finish(mut self) -> Result<Self::CompletedWork, crate::DeviceError> {
-        match self.completion.result() {
-            Err(error) => Err(error),
-            Ok(()) => panic!("failure-only controlled submission resolved successfully"),
-        }
-    }
-}
-impl<L, W, O> ProgramSubmission for PendingSubmission<L, W, O> {
-    type CompletedWork = CompletedWork<L, O>;
-    fn completion(&mut self) -> &mut dyn Completion {
-        &mut self.completion
-    }
-    fn finish(mut self) -> Result<Self::CompletedWork, crate::DeviceError> {
-        self.completion.result()?;
-        drop(self.workspace);
-        Ok(CompletedWork::new(self.core, self.output))
-    }
-}
-
-type HeadTestWork = PendingSubmission<
-    crate::HeadLaunchCore,
-    (NativeGraphWorkspaceLease, Option<NativeGraphOutputLease>),
-    crate::programs::HeadOutput,
->;
-
-enum ControlledHeadSubmission {
-    Failure(PendingFailureSubmission<CompletedHeadWork>),
-    Work(HeadTestWork),
-}
-
-impl From<PendingFailureSubmission<CompletedHeadWork>> for ControlledHeadSubmission {
-    fn from(value: PendingFailureSubmission<CompletedHeadWork>) -> Self {
-        Self::Failure(value)
-    }
-}
-
-impl ProgramSubmission for ControlledHeadSubmission {
-    type CompletedWork = CompletedHeadWork;
-
-    fn completion(&mut self) -> &mut dyn Completion {
-        match self {
-            Self::Failure(work) => work.completion(),
-            Self::Work(work) => work.completion(),
-        }
-    }
-
-    fn finish(self) -> Result<Self::CompletedWork, crate::DeviceError> {
-        match self {
-            Self::Failure(work) => work.finish(),
-            Self::Work(work) => work.finish(),
-        }
-    }
-}
-
-impl crate::programs::SubmittedHead for ControlledHeadSubmission {
-    fn launch(&self) -> &crate::HeadLaunchCore {
-        match self {
-            Self::Failure(_) => panic!("failure-only head has no launch"),
-            Self::Work(work) => &work.core,
-        }
-    }
-}
-
-enum TestSubmission<L, W, O> {
-    Ready(ReadySubmission<L, W, O>),
-    Pending(PendingSubmission<L, W, O>),
-}
-impl<W> crate::programs::SubmittedTarget
-    for TestSubmission<TargetLaunchCore, W, crate::TargetOutput>
-{
-    fn launch(&self) -> &TargetLaunchCore {
-        match self {
-            Self::Ready(value) => value.launch(),
-            Self::Pending(value) => &value.core,
-        }
-    }
-    fn output(&self) -> &crate::TargetOutput {
-        match self {
-            Self::Ready(value) => value.output(),
-            Self::Pending(value) => &value.output,
-        }
-    }
-}
-impl<L, W, O> ProgramSubmission for TestSubmission<L, W, O> {
-    type CompletedWork = CompletedWork<L, O>;
-    fn completion(&mut self) -> &mut dyn Completion {
-        match self {
-            Self::Ready(value) => value.completion(),
-            Self::Pending(value) => value.completion(),
-        }
-    }
-    fn finish(self) -> Result<Self::CompletedWork, crate::DeviceError> {
-        match self {
-            Self::Ready(value) => value.finish(),
-            Self::Pending(value) => value.finish(),
-        }
-    }
-}
-struct TestFamily {
-    control: Option<PendingControl>,
-    programs: AttestedPrograms,
-}
-impl TestFamily {
-    fn submit<L, W, O>(&self, core: L, workspace: W, output: O) -> TestSubmission<L, W, O> {
-        match &self.control {
-            Some(control) => TestSubmission::Pending(PendingSubmission {
-                completion: PendingCompletion(control.clone()),
-                core,
-                workspace,
-                output,
-            }),
-            None => TestSubmission::Ready(ReadySubmission::new(core, workspace, output)),
-        }
-    }
-}
-impl ProgramFamily for TestFamily {
-    type TargetSubmission = TestSubmission<TargetLaunchCore, (), crate::TargetOutput>;
-    type HeadSubmission = ControlledHeadSubmission;
-    type VisionSubmission = PendingFailureSubmission<CompletedVisionWork>;
-    type StateSubmission =
-        ReadySubmission<crate::StateLaunchCore, crate::NativeGraphWorkspaceLease, ()>;
-    fn bind_head(&mut self, _: crate::ResidentHead, _: &ModelDefinition) -> Result<(), String> {
-        Ok(())
-    }
-    fn bind_vision(&mut self, _: crate::ResidentVision, _: &ModelDefinition) -> Result<(), String> {
-        Ok(())
-    }
-    fn head_is_bound(&self) -> bool {
-        false
-    }
-    fn recorded_graphs(&self) -> u64 {
-        0
-    }
-    fn vision_is_bound(&self) -> bool {
-        false
-    }
-    fn state_is_bound(&self) -> bool {
-        true
-    }
-    fn unbind_optional(&mut self) {}
-
-    fn prepared_program_bytes(&self) -> u64 {
-        self.programs.device_storage_bytes()
-    }
-    fn submit_target(
-        &mut self,
-        launch: ValidatedTargetLaunch,
-    ) -> Result<Self::TargetSubmission, (crate::SubmitError, ValidatedTargetLaunch)> {
-        let (core, _) = launch.into_submission_parts();
-        let now = std::time::Instant::now();
-        Ok(self.submit(
-            core,
-            (),
-            crate::TargetOutput {
-                boundary: None,
-                readout: None,
-                commits: crate::CommitSpan {
-                    first: now,
-                    last: now,
-                },
-                landed_reads: Vec::new(),
-                stored_reads: STORED_READS.with(|reads| std::mem::take(&mut *reads.borrow_mut())),
-            },
-        ))
-    }
-    fn submit_head(
-        &mut self,
-        _: ValidatedHeadLaunch,
-    ) -> Result<Self::HeadSubmission, (crate::SubmitError, ValidatedHeadLaunch)> {
-        panic!("controlled fixture does not submit head work")
-    }
-    fn submit_vision(
-        &mut self,
-        _: ValidatedVisionLaunch,
-    ) -> Result<Self::VisionSubmission, (crate::SubmitError, ValidatedVisionLaunch)> {
-        panic!("controlled fixture does not submit vision work")
-    }
-    fn submit_state(
-        &mut self,
-        launch: ValidatedStateLaunch,
-    ) -> Result<Self::StateSubmission, (crate::SubmitError, ValidatedStateLaunch)> {
-        // Like target work, this fixture models ownership and completion only.
-        // Numerical copy correctness is qualified by native state tests.
-        let (core, workspace) = launch.into_submission_parts();
-        Ok(ReadySubmission::new(core, workspace, ()))
-    }
-}
-
 /// Reserve and submit one target group; the flight takes the bindings.
 fn submit_reserved_target<F: ProgramFamily>(
     domain: &mut ExecutorDomain<F>,
-    mut bindings: StateBindings<F>,
+    mut bindings: StateBindings,
     operations: Vec<Operation>,
 ) -> TargetFlight<F> {
     let resources = domain
@@ -549,7 +67,7 @@ fn submit_reserved_target<F: ProgramFamily>(
 fn finish_one<F: ProgramFamily>(
     domain: &mut ExecutorDomain<F>,
     flight: TargetFlight<F>,
-) -> (PendingOperationOutcome, StateBindings<F>) {
+) -> (PendingOperationOutcome, StateBindings) {
     let (mut pending, bindings) = domain.finish_target(flight).unwrap();
     (pending.pop().unwrap(), bindings)
 }
@@ -572,24 +90,22 @@ fn prefill(request: RequestId, position: usize) -> Operation {
 /// queued behind it: the returned bindings hold that lookahead.
 fn queue_lookahead(
     domain: &mut ExecutorDomain<TestFamily>,
-    bindings: StateBindings<TestFamily>,
+    bindings: StateBindings,
     request: RequestId,
-) -> StateBindings<TestFamily> {
+) -> StateBindings {
     domain.plan_successors(vec![prefill(request, 1)]);
     let flight = submit_reserved_target(domain, bindings, vec![prefill(request, 0)]);
     let (pending, bindings) = finish_one(domain, flight);
     domain
         .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
         .unwrap();
-    assert!(bindings.lookahead.is_some(), "the next chunk is queued");
+    assert_eq!(domain.queue.len(), 1, "the next chunk is queued");
     bindings
 }
 
 #[test]
 fn ready_target_can_abort_then_reconcile() {
-    let Some((mut domain, mut bindings)) = fixture(None) else {
-        return;
-    };
+    let (mut domain, mut bindings) = fixture(None);
     let request = RequestId(1);
     open(&mut domain, &mut bindings, request);
     let mut flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 0)]);
@@ -611,39 +127,45 @@ fn ready_target_can_abort_then_reconcile() {
 /// A launch is charged the host work since the flight before it finished
 /// when that flight carried its request: a round's host time is part of its
 /// cost. Time the owner spent idle, or a flight of other requests, is
-/// charged to no launch.
+/// charged to no launch. Where the service starts is an order, so each
+/// charge is bounded by instants the test takes around it, whatever the
+/// machine's load: one charged from the turn before it spans the gap the
+/// test slept there, and one charged from its submission fits within its
+/// own step, which excludes that gap.
 #[test]
 fn a_launch_is_charged_its_requests_host_turn_but_not_idle_time() {
-    let Some((mut domain, mut bindings)) = fixture(None) else {
-        return;
-    };
-    let gap = std::time::Duration::from_millis(60);
+    let (mut domain, mut bindings) = fixture(None);
+    let gap = std::time::Duration::from_millis(20);
     let (first, second) = (RequestId(70), RequestId(71));
     open(&mut domain, &mut bindings, first);
     open(&mut domain, &mut bindings, second);
+    // A step's charge, and the time from just before its submission to
+    // just after its finish.
     let step = |domain: &mut ExecutorDomain<TestFamily>,
-                bindings: StateBindings<TestFamily>,
+                bindings: StateBindings,
                 request: RequestId,
                 position: usize| {
+        let before = std::time::Instant::now();
         let flight = submit_reserved_target(domain, bindings, vec![forward(request, position)]);
         let (pending, bindings) = finish_one(domain, flight);
+        let within = before.elapsed();
         let duration = pending.physical_duration();
         domain
             .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
             .unwrap();
-        (duration, bindings)
+        (duration, within, bindings)
     };
-    let (_, bindings) = step(&mut domain, bindings, first, 0);
+    let (_, _, bindings) = step(&mut domain, bindings, first, 0);
     std::thread::sleep(gap);
-    let (charged, bindings) = step(&mut domain, bindings, first, 1);
+    let (charged, _, bindings) = step(&mut domain, bindings, first, 1);
     assert!(charged >= gap, "the host turn of its own request: {charged:?}");
     std::thread::sleep(gap);
-    let (other, bindings) = step(&mut domain, bindings, second, 0);
-    assert!(other < gap, "another request's turn: {other:?}");
+    let (other, within, bindings) = step(&mut domain, bindings, second, 0);
+    assert!(other <= within, "another request's turn: {other:?}, its step {within:?}");
     std::thread::sleep(gap);
     domain.host_idle();
-    let (idle, _) = step(&mut domain, bindings, second, 1);
-    assert!(idle < gap, "after the owner idled: {idle:?}");
+    let (idle, within, _) = step(&mut domain, bindings, second, 1);
+    assert!(idle <= within, "after the owner idled: {idle:?}, its step {within:?}");
 }
 
 /// A request that stops continuing its queued step discards it, and waiting
@@ -651,9 +173,7 @@ fn a_launch_is_charged_its_requests_host_turn_but_not_idle_time() {
 /// decoding costs the round that makes it.
 #[test]
 fn a_launch_that_discards_its_requests_lookahead_is_charged_the_wait() {
-    let Some((mut domain, mut bindings)) = fixture_with(None, true, true) else {
-        return;
-    };
+    let (mut domain, mut bindings) = fixture_with(None, true, true);
     let gap = std::time::Duration::from_millis(60);
     let request = RequestId(72);
     open(&mut domain, &mut bindings, request);
@@ -662,8 +182,8 @@ fn a_launch_that_discards_its_requests_lookahead_is_charged_the_wait() {
     // A replay row is not the queued prefill step: submitting it discards
     // that step first.
     let flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 1)]);
-    let (pending, bindings) = finish_one(&mut domain, flight);
-    assert!(bindings.lookahead.is_none(), "the queued step was discarded");
+    let (pending, _) = finish_one(&mut domain, flight);
+    assert!(domain.queue.is_empty(), "the queued step was discarded");
     assert!(
         pending.physical_duration() >= gap,
         "the wait and the host turn before it: {:?}",
@@ -676,9 +196,7 @@ fn a_launch_that_discards_its_requests_lookahead_is_charged_the_wait() {
 /// overlap once, so a chain's durations add up to no more than its span.
 #[test]
 fn a_queued_step_is_charged_from_where_its_predecessor_ends() {
-    let Some((mut domain, mut bindings)) = fixture_with(None, true, true) else {
-        return;
-    };
+    let (mut domain, mut bindings) = fixture_with(None, true, true);
     let request = RequestId(73);
     open(&mut domain, &mut bindings, request);
     domain.plan_successors(vec![prefill(request, 1)]);
@@ -686,7 +204,7 @@ fn a_queued_step_is_charged_from_where_its_predecessor_ends() {
     let began = flight.work.runnable;
     let (first, bindings) = finish_one(&mut domain, flight);
     let first_duration = first.physical_duration();
-    assert!(bindings.lookahead.is_some(), "the next chunk is queued");
+    assert_eq!(domain.queue.len(), 1, "the next chunk is queued");
     domain
         .reconcile(first, PhysicalDecision { accepted_rows: 1 })
         .unwrap();
@@ -709,9 +227,7 @@ fn a_queued_step_is_charged_from_where_its_predecessor_ends() {
 /// lookahead first, then commits the slab.
 #[test]
 fn growth_orphans_a_queued_lookahead_then_grows() {
-    let Some((mut domain, mut bindings)) = fixture_with(None, true, true) else {
-        return;
-    };
+    let (mut domain, mut bindings) = fixture_with(None, true, true);
     let request = RequestId(60);
     open(&mut domain, &mut bindings, request);
     let mut bindings = queue_lookahead(&mut domain, bindings, request);
@@ -724,11 +240,11 @@ fn growth_orphans_a_queued_lookahead_then_grows() {
     }];
     domain.provision_open(&mut bindings).unwrap();
     assert!(
-        bindings.lookahead.is_none(),
+        domain.queue.is_empty(),
         "the growing entry orphaned the lookahead"
     );
     domain
-        .grant_state_growth(&mut bindings, true, &demand, 0)
+        .grant_state_growth(&mut bindings, true, &demand, &[], 0)
         .unwrap();
     assert!(head.committed_rows(history) > committed);
     // The orphaned step changed no accepted state.
@@ -743,9 +259,7 @@ fn growth_orphans_a_queued_lookahead_then_grows() {
 /// orphaned it and failed with "only a blocked last page is relocated".)
 #[test]
 fn drafter_work_resolves_its_requests_lookahead_before_provisioning() {
-    let Some((mut domain, mut bindings)) = fixture_with(None, true, true) else {
-        return;
-    };
+    let (mut domain, mut bindings) = fixture_with(None, true, true);
     let request = RequestId(61);
     open(&mut domain, &mut bindings, request);
     let mut bindings = queue_lookahead(&mut domain, bindings, request);
@@ -770,23 +284,297 @@ fn drafter_work_resolves_its_requests_lookahead_before_provisioning() {
         Err(error) => panic!("provisioning drafter work failed: {error}"),
     }
     assert!(
-        bindings.lookahead.is_none(),
+        domain.queue.is_empty(),
         "drafter work resolved the lookahead"
     );
     assert!(domain.target[&request].blocked_tails().is_empty());
+}
+
+/// A domain launching one-row prompt chunks in chains of up to three.
+fn chain_fixture() -> Fixture {
+    fixture_of(
+        tiny_definition(),
+        limits(2, 3, false),
+        None,
+        false,
+        platform::DeviceRequest::Automatic,
+    )
+}
+
+/// Reserve and submit a group that must claim the front queued step.
+fn submit_claimed(
+    domain: &mut ExecutorDomain<TestFamily>,
+    mut bindings: StateBindings,
+    operations: Vec<Operation>,
+) -> TargetFlight<TestFamily> {
+    let reservation = domain.reserve(&mut bindings, &operations).unwrap();
+    let ReservedResources::Target(reservation @ TargetGraphReservation::Claim(_)) =
+        reservation.into_resources()
+    else {
+        panic!("the group does not claim the queued step")
+    };
+    domain
+        .submit_target(bindings, &operations, reservation)
+        .unwrap_or_else(|failure| panic!("claim failed: {}", failure.error()))
+}
+
+/// A group of no operations opens no chain and provisions nothing, whatever
+/// chain capacity the load has.
+#[test]
+fn an_empty_group_provisions_nothing_on_a_chaining_load() {
+    let (mut domain, mut bindings) = chain_fixture();
+    domain.provision(&mut bindings, &[], None).unwrap();
+    assert!(domain.queue.is_empty());
+}
+
+/// A lone prompt chunk opens a chain of the planned chunks continuing it,
+/// within the capacity; its holder claims each queued chunk in turn. The
+/// chain holds its holder's state until its last chunk publishes it whole.
+#[test]
+fn a_prompt_chunk_opens_a_chain_its_holder_claims() {
+    let (mut domain, mut bindings) = chain_fixture();
+    let request = RequestId(80);
+    open(&mut domain, &mut bindings, request);
+    // Four chunks are planned: the chain takes the capacity's three.
+    domain.plan_successors((1..4).map(|position| prefill(request, position)).collect());
+    let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 0)]);
+    assert_eq!(domain.queue.len(), 2, "the chain queues two chunks");
+    let (pending, mut bindings) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    for position in 1..3 {
+        assert_eq!(domain.chain_holder(), Some(request));
+        assert!(domain.resume_state(request).is_err(), "the chain holds the state");
+        let flight = submit_claimed(&mut domain, bindings, vec![prefill(request, position)]);
+        let (pending, returned) = finish_one(&mut domain, flight);
+        bindings = returned;
+        domain
+            .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+            .unwrap();
+    }
+    assert!(domain.queue.is_empty());
+    assert_eq!(domain.chain_holder(), None);
+    let state = domain.resume_state(request).unwrap().target;
+    let token = magnitude_state::HistoryDomainId(0);
+    assert_eq!((state.position(), state.history_ranges(token).len()), (3, 1));
+    // The group's class is kept while memory is Normal, and released to the
+    // floor of one place at Reclaim's surplus rung.
+    assert_eq!(domain.group_places().get(), 3);
+    super::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Idle);
+    assert_eq!(domain.group_places().get(), 3);
+    super::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Reclaim);
+    assert_eq!(domain.group_places().get(), 1);
+}
+
+/// A bank short of its ceiling keeps the room it can grow into: a prompt's
+/// group grows its places only beyond it, so with the device's gigabyte of
+/// room all the bank's to grow into the group stays at its floor of one
+/// place, and with a bank at its ceiling the same group takes its chunks'
+/// places, whether the ceiling is every expert or a weight cap's short of
+/// them.
+#[test]
+fn places_grow_only_beyond_what_the_bank_can_grow_into() {
+    for backend in bank_backends() {
+        let places = |shortfall: u64, whole: bool| {
+            let (mut domain, mut bindings) = banked_chain(backend, 4, 3);
+            let bank = domain.family.bank.as_mut().expect("the fixture holds a bank");
+            (bank.shortfall, bank.whole) = (shortfall, whole);
+            // A reading of the device's store with a gigabyte of room.
+            let store = domain.domain.device().device_store();
+            let room = 1 << 30;
+            domain.pace.borrow_mut().domains.insert(store, DomainPace {
+                role: DomainRole::Allocation,
+                headroom: room,
+                planning: 0,
+                emergency: 0,
+                ceiling: room,
+                charged: 0,
+                band: MemoryBand::Normal,
+                unseen: 0,
+                witness: None,
+                available: 0,
+                base: (std::time::Instant::now(), 0),
+                rate: 0.0,
+                fastest: 0.0,
+                fluctuation: Fluctuation::default(),
+            });
+            let request = RequestId(80);
+            open(&mut domain, &mut bindings, request);
+            domain.plan_successors((1..4).map(|position| prefill(request, position)).collect());
+            let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 0)]);
+            let places = domain.group_places().get();
+            let _ = finish_one(&mut domain, flight);
+            places
+        };
+        assert_eq!(places(0, true), 3, "{backend:?}: a whole bank leaves the group its chunks' places");
+        assert_eq!(places(0, false), 3, "{backend:?}: a bank at a weight cap's ceiling leaves the group its chunks' places");
+        assert_eq!(places(u64::MAX / 4, false), 1, "{backend:?}: a bank that can grow into the room keeps it");
+    }
+}
+
+/// A prompt chunk's readout exports at most its final row, so the places a
+/// group's class holds beyond the floor's are charged what that exports,
+/// whatever the load's widest export; the launch pool's floor holds the
+/// widest.
+#[test]
+fn a_groups_places_hold_what_a_prompt_chunk_exports() {
+    let load = |exported| {
+        let limits = ResourceLimits {
+            exported_logits_rows: exported,
+            ..limits(2, 3, false)
+        };
+        let (mut domain, _) =
+            fixture_of(tiny_definition(), limits, None, false, platform::DeviceRequest::Automatic);
+        let floor = domain.resources.target_readout_graph(usize::MAX).committed_bytes().unwrap();
+        let places = domain.resources.class_bytes(limits.class_slots(3));
+        (floor, places)
+    };
+    let ((narrow_floor, narrow_places), (wide_floor, wide_places)) = (load(1), load(2));
+    assert!(wide_floor > narrow_floor, "the floor's readout holds the widest export");
+    assert_eq!(wide_places, narrow_places);
+}
+
+/// A prompt chunk plans the rest of its group behind it, or without chains
+/// the one chunk a pipelined successor runs.
+#[test]
+fn a_prompt_chunk_plans_the_rest_of_its_group() {
+    for (fixture, planned) in [(chain_fixture(), 2), (fixture_with(None, true, false), 1)] {
+        let (mut domain, _) = fixture;
+        let mut counted = None;
+        domain
+            .plan_prompt(None, true, true, |chunks| {
+                counted = Some(chunks);
+                Ok::<_, ()>(Vec::new())
+            })
+            .unwrap();
+        assert_eq!(counted, Some(planned));
+    }
+}
+
+/// A pipelined successor, which other work orphans, is planned only for a
+/// request the device serves alone; a chain behind its round's last group,
+/// whose holder the scheduler selects first, regardless.
+#[test]
+fn only_a_chain_is_planned_beside_other_work() {
+    for (fixture, planned) in [(chain_fixture(), 2), (fixture_with(None, true, false), 0)] {
+        let (mut domain, _) = fixture;
+        let mut counted = None;
+        domain
+            .plan_prompt(None, false, true, |chunks| {
+                counted = Some(chunks);
+                Ok::<_, ()>(Vec::new())
+            })
+            .unwrap();
+        assert_eq!(counted, Some(planned));
+    }
+}
+
+/// A group with another of its round submitted after it opens no chain, which
+/// that group would orphan: it plans no chunk behind it.
+#[test]
+fn no_chain_opens_behind_a_group_its_round_follows() {
+    let (mut domain, _) = chain_fixture();
+    let mut counted = None;
+    domain
+        .plan_prompt(None, false, false, |chunks| {
+            counted = Some(chunks);
+            Ok::<_, ()>(Vec::new())
+        })
+        .unwrap();
+    assert_eq!(counted, Some(0));
+}
+
+/// While decode waits, a load that chains plans the rest of a group of the
+/// size rule's chunks: a rule of one plans none behind the chunk, so decode
+/// waits behind that one chunk alone.
+#[test]
+fn a_waiting_group_of_one_plans_no_chunk_behind() {
+    let (mut domain, _) = chain_fixture();
+    for (waiting, planned) in [(1, 0), (2, 1), (3, 2)] {
+        domain.family.waiting = waiting;
+        let mut counted = None;
+        domain
+            .plan_prompt(Some(0.5), true, true, |chunks| {
+                counted = Some(chunks);
+                Ok::<_, ()>(Vec::new())
+            })
+            .unwrap();
+        assert_eq!(counted, Some(planned), "a rule of {waiting}");
+    }
+}
+
+/// A chain under way is never orphaned: other work is refused while it is.
+/// A holder that ended releases it, its queued launches waited for and
+/// dropped and its state evicted with it; one that closes drops it, its
+/// launches resolved with the queue.
+#[test]
+fn a_chain_is_released_by_its_holder_never_orphaned() {
+    let (mut domain, mut bindings) = chain_fixture();
+    let request = RequestId(81);
+    open(&mut domain, &mut bindings, request);
+    let held = |domain: &mut ExecutorDomain<TestFamily>, bindings: StateBindings| {
+        domain.plan_successors(vec![prefill(request, 1), prefill(request, 2)]);
+        let flight = submit_reserved_target(domain, bindings, vec![prefill(request, 0)]);
+        let (pending, bindings) = finish_one(domain, flight);
+        domain
+            .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+            .unwrap();
+        assert_eq!((domain.queue.len(), domain.chain_holder()), (2, Some(request)));
+        bindings
+    };
+    let mut bindings = held(&mut domain, bindings);
+    // A replay row is not the queued prompt chunk.
+    assert!(matches!(
+        domain.provision(&mut bindings, &[forward(request, 1)], None),
+        Err(DomainError::Invariant(_))
+    ));
+    domain.release_chain().unwrap();
+    assert!(domain.queue.is_empty());
+    assert_eq!(domain.chain_holder(), None);
+    assert!(domain.resume_state(request).is_err(), "the holder was evicted");
+
+    domain.open_state(&mut bindings, request, None).unwrap();
+    let mut bindings = held(&mut domain, bindings);
+    domain.close(request).unwrap();
+    assert_eq!(domain.chain_holder(), None);
+    super::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Idle);
+    assert!(domain.queue.is_empty());
+}
+
+/// A rejected chain returns every launch: the domain restores the first's
+/// accepted state, and the launches behind it return their rows as they
+/// drop.
+#[test]
+fn a_rejected_chain_returns_every_launch() {
+    let (mut domain, mut bindings) = chain_fixture();
+    let request = RequestId(82);
+    open(&mut domain, &mut bindings, request);
+    domain.plan_successors(vec![prefill(request, 1), prefill(request, 2)]);
+    let operations = vec![prefill(request, 0)];
+    let ReservedResources::Target(reservation) = domain
+        .reserve(&mut bindings, &operations)
+        .unwrap()
+        .into_resources()
+    else {
+        panic!("a forward reserves the target lane")
+    };
+    REJECTED.with(|rejected| rejected.set(Some(0)));
+    let failure = domain.submit_target(bindings, &operations, reservation);
+    assert!(matches!(failure, Err(SubmitFailure::Failed(_))));
+    assert_eq!(REJECTED.with(|rejected| rejected.take()), Some(3));
+    assert_eq!(domain.resume_state(request).unwrap().target.position(), 0);
 }
 
 /// A history's next rows in its partly used last page need no free page: a
 /// store whose every page is referenced still reserves them.
 #[test]
 fn in_place_rows_reserve_without_a_free_page() {
-    let Some((mut domain, mut bindings)) = fixture(None) else {
-        return;
-    };
+    let (mut domain, mut bindings) = fixture(None);
     let request = RequestId(10);
     open(&mut domain, &mut bindings, request);
     let accept =
-        |domain: &mut ExecutorDomain<TestFamily>, bindings: StateBindings<TestFamily>, position| {
+        |domain: &mut ExecutorDomain<TestFamily>, bindings: StateBindings, position| {
             let flight = submit_reserved_target(domain, bindings, vec![forward(request, position)]);
             let (pending, bindings) = finish_one(domain, flight);
             domain
@@ -825,9 +613,7 @@ fn in_place_rows_reserve_without_a_free_page() {
 /// reservation must describe the new layout rather than demand a second page.
 #[test]
 fn reservation_recomputes_row_demand_after_shared_tail_relocation() {
-    let Some((mut domain, mut bindings)) = fixture(None) else {
-        return;
-    };
+    let (mut domain, mut bindings) = fixture(None);
     let source = RequestId(71);
     open(&mut domain, &mut bindings, source);
     let flight = submit_reserved_target(&mut domain, bindings, vec![forward(source, 0)]);
@@ -851,7 +637,7 @@ fn reservation_recomputes_row_demand_after_shared_tail_relocation() {
         .unwrap();
     assert!(!domain.target[&copy].blocked_tails().is_empty());
     let operations = [forward(copy, 1)];
-    let before = domain.requirements(&bindings, &operations).unwrap();
+    let before = domain.requirements(&operations).unwrap();
     assert!(before.state_demand.iter().any(|demand| demand.rows > 0));
     let reservation = domain.reserve(&mut bindings, &operations).unwrap();
     assert!(
@@ -870,9 +656,7 @@ fn reservation_recomputes_row_demand_after_shared_tail_relocation() {
 /// with "target state capacity changed after availability check".)
 #[test]
 fn one_launch_advances_two_continuations_of_a_shared_tail() {
-    let Some((mut domain, mut bindings)) = fixture(None) else {
-        return;
-    };
+    let (mut domain, mut bindings) = fixture(None);
     let source = RequestId(81);
     open(&mut domain, &mut bindings, source);
     let flight = submit_reserved_target(&mut domain, bindings, vec![forward(source, 0)]);
@@ -915,9 +699,7 @@ fn one_launch_advances_two_continuations_of_a_shared_tail() {
 #[test]
 fn pending_target_request_cancellation_aborts_then_device_failure_consumes_the_bindings() {
     let control = PendingControl::default();
-    let Some((mut domain, mut bindings)) = fixture(Some(control.clone())) else {
-        return;
-    };
+    let (mut domain, mut bindings) = fixture(Some(control.clone()));
     let request = RequestId(2);
     open(&mut domain, &mut bindings, request);
     let mut flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 0)]);
@@ -935,9 +717,7 @@ fn pending_target_request_cancellation_aborts_then_device_failure_consumes_the_b
     domain.abort(pending).unwrap();
     assert_eq!(domain.resume_state(request).unwrap().target.position(), 0);
     let failed = PendingControl::default();
-    let Some((mut failed_domain, mut bindings)) = fixture(Some(failed.clone())) else {
-        return;
-    };
+    let (mut failed_domain, mut bindings) = fixture(Some(failed.clone()));
     let failed_request = RequestId(3);
     open(&mut failed_domain, &mut bindings, failed_request);
     let flight = submit_reserved_target(
@@ -958,9 +738,7 @@ fn pending_target_request_cancellation_aborts_then_device_failure_consumes_the_b
 #[test]
 fn pending_target_state_is_classified_as_in_flight() {
     let control = PendingControl::default();
-    let Some((mut domain, mut bindings)) = fixture(Some(control.clone())) else {
-        return;
-    };
+    let (mut domain, mut bindings) = fixture(Some(control.clone()));
     let request = RequestId(9);
     open(&mut domain, &mut bindings, request);
     let before = domain.reconcile_memory_charge(&[]).unwrap();
@@ -977,9 +755,7 @@ fn pending_target_state_is_classified_as_in_flight() {
 
 #[test]
 fn fresh_memory_observation_reconciles_released_state_backing() {
-    let Some((mut domain, mut bindings)) = fixture(None) else {
-        return;
-    };
+    let (mut domain, mut bindings) = fixture(None);
     let static_bytes = domain.static_holding_bytes().unwrap();
     domain.static_holding = Some(
         domain
@@ -992,14 +768,866 @@ fn fresh_memory_observation_reconciles_released_state_backing() {
     domain.refresh_memory().unwrap();
     let before = domain.memory().standing().unwrap();
     assert_eq!(before.unattributed_bytes, 0);
-    let released = domain
-        .shrink_state(&mut bindings, ShrinkPolicy::Reclaim)
-        .unwrap();
+    let released = super::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Reclaim);
     assert!(released > 0);
     domain.refresh_memory().unwrap();
     let after = domain.memory().standing().unwrap();
     assert!(before.classified_bytes - after.classified_bytes >= released);
     assert_eq!(after.unattributed_bytes, 0);
+}
+
+/// A tier copy whose grid the device refuses is the caller's error and
+/// changes nothing: the bank keeps the copy costs it took before, grid and
+/// price, and the domain the measures it priced by.
+#[test]
+fn a_refused_tier_copy_changes_neither_its_grid_nor_its_price() {
+    let backend = bank_backends()[0];
+    let (mut domain, mut bindings) = banked(backend, 4, 4);
+    let measures = |blocks| crate::ExpertMeasures {
+        lines: crate::assessment::Priced::Measured(std::sync::Arc::from([])),
+        store: None,
+        resident: crate::assessment::Priced::Measured(Box::new(|_, _| Ok(0.015))),
+        pass: crate::assessment::Priced::Pending("unpriced".into()),
+        moves: crate::assessment::Priced::Pending("unmeasured".into()),
+        tier_copy: crate::assessment::Priced::Measured(Some(crate::assessment::TierCopyCosts {
+            blocks,
+            whole_seconds: 0.001,
+            stall_share: 0.1,
+        })),
+        convert: crate::assessment::Priced::Measured(None),
+    };
+    domain.measure_experts(measures(8), &mut bindings).unwrap();
+    domain.family.bank.as_mut().unwrap().refuse_tier_copy = true;
+    let refused = domain.measure_experts(measures(16), &mut bindings).unwrap_err();
+    assert!(matches!(refused, DomainError::Invariant(_)), "{refused}");
+    let bank = domain.family.bank.as_ref().unwrap();
+    assert_eq!(bank.tier_copy.lock().unwrap().as_ref().map(|costs| costs.blocks), Some(8));
+    let kept = domain.experts.as_ref().unwrap().tier_copy.measured().cloned().flatten().map(|costs| costs.blocks);
+    assert_eq!(kept, Some(8));
+}
+
+/// The storage kinds whose bank growth step pays (`expert_bank_growths`),
+/// in turn.
+fn paying(domain: &ExecutorDomain<TestFamily>) -> Vec<crate::planning::BankTier> {
+    let offers = domain.expert_bank_growths().unwrap();
+    offers.into_iter().filter(|offer| offer.pays).map(|offer| offer.growth.kind).collect()
+}
+
+/// Whether the bank's device step pays.
+fn device_pays(domain: &ExecutorDomain<TestFamily>) -> bool {
+    paying(domain).contains(&crate::planning::BankTier::Bank)
+}
+
+/// A growth step's target is the largest commitment whose bytes are within
+/// its store's room, up to where the record's misses stop falling: one step
+/// reaches the lesser of the two, never past either, and a holding at
+/// either has none. Bytes by reservation granules, as a record tensor's
+/// charge rises, find the same target an exhaustive search finds.
+#[test]
+fn a_growth_step_reaches_the_room_or_the_saturation_and_never_past_either() {
+    let target = |saturation, room, bytes: &dyn Fn(u64) -> u64| {
+        crate::planning::growth_target(2, saturation, room, |to| Ok::<_, ()>(bytes(to))).unwrap()
+    };
+    // Ten bytes a slot beyond 2 slots.
+    let slots = |to: u64| (to - 2) * 10;
+    assert_eq!(target(40, 1_000, &slots), Some(40), "the saturation binds");
+    assert_eq!(target(40, 109, &slots), Some(12), "the room binds");
+    assert_eq!(target(40, 110, &slots), Some(13), "a step takes all of its room");
+    assert_eq!(target(2, 1_000, &slots), None, "saturated");
+    assert_eq!(target(40, 9, &slots), None, "not one slot fits");
+    let granules = |to: u64| ((to - 2) * 10).div_ceil(32) * 32;
+    for bytes in [&slots as &dyn Fn(u64) -> u64, &granules] {
+        for saturation in 0..48 {
+            for room in 0..400 {
+                let largest = (3..=saturation).filter(|&to| bytes(to) <= room).max();
+                assert_eq!(target(saturation, room, bytes), largest, "saturation {saturation}, room {room}");
+            }
+        }
+    }
+}
+
+/// A growth step is sized within what the heap's claim of it admits
+/// (`DeviceHeap::reserved_room`), which admits exactly its room: that many
+/// bytes and not one more. With a claim the heap holds leaving room for two
+/// of the three slots the record's misses would use, the step takes the two
+/// and lands; sized past the heap's room, as by a room the claim does not
+/// test, it was refused at every decision.
+#[test]
+fn a_growth_step_is_sized_within_what_the_heap_admits() {
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 1);
+        let row = bank_row(&domain);
+        // Misses stop falling past the bank's 4 rows.
+        price_growth(&mut domain, &mut bindings, misses_at(4, 100, 4));
+        let device = crate::planning::BankTier::Bank;
+        let available = match domain.memory.borrow_mut().claim(u64::MAX / 2, 0, HoldingClass::Live) {
+            Err(ClaimRefusal::Deficit { available, .. }) => available,
+            refused => panic!("the heap granted every byte: {refused:?}"),
+        };
+        let held = domain.memory.borrow_mut().claim_reserved(device, available - 5 * row / 2, 0, HoldingClass::Live).unwrap();
+        let room = domain.memory.borrow_mut().reserved_room(device, 0).unwrap();
+        assert!(
+            matches!(
+                domain.memory.borrow_mut().claim_reserved(device, room + 1, 0, HoldingClass::Live),
+                Err(ClaimRefusal::Deficit { .. })
+            ),
+            "one byte past the room is refused"
+        );
+        let claim = domain.memory.borrow_mut().claim_reserved(device, room, 0, HoldingClass::Live).unwrap();
+        domain.memory.borrow_mut().release(claim);
+        assert!(device_pays(&domain));
+        assert_eq!(domain.grow_expert_bank(device, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank), "within the room");
+        assert!(matches!(finish(&mut domain), crate::BankResized::Grown { from: 1, to: 3, .. }), "two slots of the room");
+        domain.memory.borrow_mut().release(held);
+    }
+}
+
+/// Device memory and host memory grow each their own step in turn: where
+/// both pay, the store after the last to grow comes first, so a host tier
+/// fills while the device bank still grows. The tier's step holds what the
+/// bank's slots miss up to where the record's misses stop falling.
+#[test]
+fn both_stores_grow_in_turn_where_both_pay() {
+    use crate::planning::BankTier::{Bank as Device, Host};
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 1);
+        domain.family.bank.as_mut().unwrap().host_ceiling = 4;
+        // Misses stop falling at 5 slots: the bank's 4 rows and a host slot.
+        price_growth(&mut domain, &mut bindings, misses_at(4, 100, 4));
+        assert_eq!(paying(&domain), [Device, Host]);
+        assert_eq!(domain.grow_expert_bank(Host, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Host));
+        assert!(matches!(finish(&mut domain), crate::BankResized::Grown { holding: crate::BankHolding::Host, to: 4, .. }));
+        assert_eq!(paying(&domain), [Device], "the device's turn; the tier holds the rest");
+        assert_eq!(domain.grow_expert_bank(Device, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        assert!(matches!(finish(&mut domain), crate::BankResized::Grown { holding: crate::BankHolding::Experts, to: 4, .. }));
+        assert!(domain.expert_bank_growths().unwrap().is_empty(), "both saturated");
+    }
+}
+
+/// The host tier is the inclusive copy of every expert: its step to every
+/// expert pays wherever its store has room, before any miss record or
+/// resident step prices the device's, and while a prompt's places want
+/// device memory, which holds the device's step alone.
+#[test]
+fn the_host_tier_grows_to_every_expert_unpriced_and_beside_a_places_want() {
+    use crate::planning::BankTier::{Bank as Device, Host};
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 1);
+        domain.family.bank.as_mut().unwrap().host_ceiling = 6;
+        assert_eq!(paying(&domain), [Host], "no record, no resident step: the tier alone");
+        domain.places_want = Some(super::state::PlacesWant { request: RequestId(80), places: 3, slots: 2 });
+        price_growth(&mut domain, &mut bindings, misses_at(4, 100, 4));
+        assert_eq!(paying(&domain), [Host], "a want holds the device's step, not the tier's");
+        assert_eq!(domain.grow_expert_bank(Host, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Host));
+        assert!(matches!(finish(&mut domain), crate::BankResized::Grown { holding: crate::BankHolding::Host, to: 6, .. }));
+        domain.places_want = None;
+        assert_eq!(paying(&domain), [Device], "the tier holds every expert");
+    }
+}
+
+/// Each store's room is its own: a device store with no room left leaves
+/// a host store's whole room to a host step, where the one least room of
+/// every store held both back.
+#[test]
+fn a_full_device_leaves_the_host_stores_room() {
+    const GB: u64 = 1_000_000_000;
+    let [device, host] = [(); 2].map(|()| seismic::Devices::discover(&[]).unwrap().topology().host_ram().id());
+    let domain = |role, ceiling| DomainPace {
+        role,
+        headroom: ceiling,
+        planning: 0,
+        emergency: 0,
+        ceiling,
+        charged: 0,
+        band: MemoryBand::Normal,
+        unseen: 0,
+        witness: None,
+        available: 0,
+        base: (Instant::now(), 0),
+        rate: 0.0,
+        fastest: 0.0,
+        fluctuation: Fluctuation::default(),
+    };
+    let mut pace = MemoryPace::new();
+    pace.domains.insert(device, domain(DomainRole::Allocation, 0));
+    pace.domains.insert(host, domain(DomainRole::Staging, 20 * GB));
+    assert_eq!(pace.growth_room(device), Some((0, 0)));
+    assert_eq!(pace.growth_room(host), Some((20 * GB, 0)));
+}
+
+/// A wake no one waits on.
+fn unwatched() -> CompletionWake {
+    CompletionWake::new(|| {})
+}
+
+/// The flight boundaries of a running resize, until it finishes.
+fn finish(domain: &mut ExecutorDomain<TestFamily>) -> crate::BankResized {
+    loop {
+        if let Some((finished, _)) = domain.advance_expert_bank(unwatched()).unwrap() {
+            return finished;
+        }
+    }
+}
+
+/// A head's own weights are what the residency cache it inherits holds
+/// beyond the target's imports: a streamed target's bank, charged to the
+/// target but never an import of the cache, does not count against them
+/// (counted, a head beside a streamed target refused the load).
+#[test]
+fn a_heads_own_weights_leave_out_the_targets_bank() {
+    for backend in bank_backends() {
+        let (domain, _) = banked(backend, 4, 2);
+        let charged = domain.family.target_weight_bytes().unwrap();
+        let imports = domain.family.target_cached_bytes().unwrap();
+        assert!(charged > 0, "the bank is charged to the target");
+        assert_eq!(imports, 0, "the bank is no import of the cache");
+        // A cache of the target's imports and a head of half what the bank
+        // charges, which counting the bank would take for inherited.
+        let head = charged / 2;
+        assert_eq!(super::beyond_inherited(imports + head, imports), Ok(head));
+        assert!(super::beyond_inherited(imports + head, charged + imports).is_err());
+    }
+}
+
+/// A holding no resize has measured takes its first growth step, to its
+/// sized target: the most slots within the store's room up to where the
+/// record's misses stop falling, never the bank's every row past them. The
+/// step measures what a resize holds the submitting thread. After that a
+/// step grows only where its decode time saved over the record's decode
+/// exceeds what the holding's last resize held the thread; one that does
+/// not pay grows nothing, and a saturated holding has no step.
+#[test]
+fn a_holding_grows_once_unmeasured_then_only_where_its_saving_exceeds_its_resize() {
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 1);
+        // 100 steps of 4 misses a step at 2 slots, none at 3: the misses stop
+        // falling at 3 slots, of the bank's 4 rows.
+        price_growth(&mut domain, &mut bindings, misses_at(2, 100, 4));
+        assert_eq!(domain.resize_held.last.get(&crate::BankHolding::Experts), None);
+        assert!(device_pays(&domain), "an unmeasured holding takes its first step");
+        assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        assert!(matches!(finish(&mut domain), crate::BankResized::Grown { from: 1, to: 3, .. }), "the sized target");
+        assert!(domain.resize_held.last.get(&crate::BankHolding::Experts).is_some_and(|&held| held < 0.4));
+        assert!(!device_pays(&domain), "saturated: a fourth slot saves nothing");
+        // Misses at 3 slots, none at 4: the fourth slot saves about 0.4 s, which
+        // outweighs the resize; a resize held longer than that is not paid.
+        price_growth(&mut domain, &mut bindings, misses_at(3, 100, 4));
+        assert!(device_pays(&domain), "0.4 s saved outweighs the resize");
+        domain.resize_held.last.insert(crate::BankHolding::Experts, 1.);
+        assert!(!device_pays(&domain), "a step that does not pay grows nothing");
+    }
+}
+
+/// A load priced before the executor's costs were stored grows nothing;
+/// priced again once they are, on the same live domain, its bank grows by
+/// the rule as a load priced at its start would.
+#[test]
+fn a_live_load_priced_again_on_newly_stored_costs_grows() {
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 2);
+        domain.family.bank.as_mut().unwrap().record = Some(misses_at(3, 100, 4));
+        let unpriced = crate::ExpertMeasures {
+            lines: crate::assessment::Priced::Measured(std::sync::Arc::from([])),
+            store: None,
+            resident: crate::assessment::Priced::Pending("the executor's costs are not measured yet".into()),
+            pass: crate::assessment::Priced::Pending("unpriced".into()),
+            moves: crate::assessment::Priced::Pending("unmeasured".into()),
+            tier_copy: crate::assessment::Priced::Measured(None),
+            convert: crate::assessment::Priced::Measured(None),
+        };
+        domain.measure_experts(unpriced, &mut bindings).unwrap();
+        assert!(!device_pays(&domain), "an unpriced load grows nothing");
+        price_growth(&mut domain, &mut bindings, misses_at(3, 100, 4));
+        assert!(device_pays(&domain));
+        assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        assert!(matches!(finish(&mut domain), crate::BankResized::Grown { to: 4, .. }));
+    }
+}
+
+/// The measurement job's room is made by the bank's shrink: a claim
+/// beyond what opportunistic growth may take is short by the rest, which a
+/// shrink of that many bytes frees, unless the rest is more than the bank
+/// holds above its floor, which no shrink frees; while the claim holds, it is held out
+/// of what opportunistic growth may take, so the step the record says pays
+/// finds no room, and once released the bank grows again.
+#[test]
+fn a_measurement_claim_shrinks_the_bank_and_holds_its_growth() {
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 4);
+        let row = bank_row(&domain);
+        price_growth(&mut domain, &mut bindings, misses_at(3, 100, 4));
+        // A probe in the Reclaim band reads memory as any does.
+        match domain.probe_memory(std::time::Duration::from_millis(100)) {
+            Ok(()) | Err(DomainError::Reclaim(_)) => {}
+            Err(error) => panic!("{error}"),
+        }
+        // What opportunistic growth may take now, read through a claim no
+        // device holds.
+        let beyond = u64::MAX / 4;
+        domain.claim_measurement_room(beyond);
+        let Some(crate::MeasurementRoom::Beyond { short, releasable }) = domain.measurement_room().unwrap() else {
+            panic!("a claim beyond the device is beyond the bank's floor")
+        };
+        // Three of its four slots are above its floor of one: three quarters of
+        // its records' charge.
+        let residency = domain.expert_residency().unwrap().unwrap();
+        let charged = residency.stores.iter().map(|(_, bytes)| bytes).sum::<u64>();
+        assert!(charged >= 4 * row);
+        assert_eq!(releasable, charged * 3 / 4, "the bank holds its slots above its floor");
+        let room = beyond - short;
+        domain.claim_measurement_room(room);
+        assert_eq!(domain.measurement_room().unwrap(), Some(crate::MeasurementRoom::Made));
+        domain.claim_measurement_room(room + releasable + 1);
+        assert_eq!(
+            domain.measurement_room().unwrap(),
+            Some(crate::MeasurementRoom::Beyond { short: releasable + 1, releasable })
+        );
+        domain.claim_measurement_room(room + row);
+        assert_eq!(domain.measurement_room().unwrap(), Some(crate::MeasurementRoom::Short(row)));
+        assert_eq!(domain.shrink_expert_bank_by(&mut bindings, row, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        assert!(matches!(finish(&mut domain), crate::BankResized::Shrunk { from: 4, to: 3, released, .. } if released == row));
+        // A fourth slot would save the decode about 0.4 s, but the claim holds
+        // the room the shrink made: no step fits the room left.
+        assert!(!device_pays(&domain), "the claimed room is not the bank's");
+        assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::AtLimit);
+        domain.release_measurement_room();
+        assert_eq!(domain.measurement_room().unwrap(), None);
+        assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank), "released, the bank grows again");
+    }
+}
+
+/// A measurement's claim ends the bank's running growth at its next slot,
+/// none joined, and no growth is offered while it stands: held, the
+/// growth's slots would wait for the claim's release, and the claim is
+/// decided only once no resize runs. Released, the bank grows again.
+#[test]
+fn a_measurement_claim_stops_the_banks_growth() {
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 2);
+        price_growth(&mut domain, &mut bindings, misses_at(3, 100, 4));
+        assert_eq!(
+            domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(),
+            BankStep::Begun(crate::planning::BankTier::Bank)
+        );
+        domain.claim_measurement_room(0);
+        assert!(matches!(finish(&mut domain), crate::BankResized::Stopped { at: 2, .. }), "stopped before its first slot");
+        assert!(domain.expert_bank_growths().unwrap().is_empty(), "nothing grows beside the claim");
+        domain.release_measurement_room();
+        assert!(device_pays(&domain), "released, the step pays again");
+        assert_eq!(
+            domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(),
+            BankStep::Begun(crate::planning::BankTier::Bank)
+        );
+        assert!(matches!(finish(&mut domain), crate::BankResized::Grown { from: 2, to: 4, .. }));
+    }
+}
+
+/// A prompt's places want holds the bank's growth while its prompt has
+/// chunks in hand, and is retired once the request's group holds none (it
+/// decodes): another request's group leaves it, its own decode ends it.
+#[test]
+fn a_places_want_ends_with_its_prompt() {
+    // Three slots of four: a fourth saves the decode its misses.
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 3);
+        price_growth(&mut domain, &mut bindings, misses_at(3, 100, 4));
+        assert!(device_pays(&domain));
+        let (prompt, other) = (RequestId(80), RequestId(81));
+        domain.places_want = Some(super::state::PlacesWant { request: prompt, places: 3, slots: 2 });
+        assert!(domain.expert_bank_growths().unwrap().is_empty(), "a want holds the bank's growth");
+        domain.grant_group(&[forward(other, 0)]).unwrap();
+        assert!(domain.places_want.is_some(), "another request's group leaves the want");
+        domain.grant_group(&[forward(prompt, 4)]).unwrap();
+        assert!(domain.places_want.is_none(), "the prompt's own group past its chunks ends it");
+        assert!(device_pays(&domain));
+    }
+}
+
+/// A launch's duration prices the draft width only where no expert bank
+/// resize ran across it: one with none is timed as before; one a growth
+/// began across, or submitted while that growth runs, is not, so a resize
+/// changes no drafting policy.
+#[test]
+fn a_launch_a_bank_resize_ran_across_is_not_timed() {
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 2);
+        price_growth(&mut domain, &mut bindings, misses_at(3, 100, 4));
+        let request = RequestId(90);
+        open(&mut domain, &mut bindings, request);
+        let step = |domain: &mut ExecutorDomain<TestFamily>, bindings, position, during: &dyn Fn(&mut ExecutorDomain<TestFamily>)| {
+            let flight = submit_reserved_target(domain, bindings, vec![forward(request, position)]);
+            during(domain);
+            let (pending, bindings) = finish_one(domain, flight);
+            let timed = pending.launch_duration().is_some();
+            domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+            (timed, bindings)
+        };
+        let quiet = |_: &mut ExecutorDomain<TestFamily>| {};
+        // The first launch records its graphs.
+        let (_, bindings) = step(&mut domain, bindings, 0, &quiet);
+        let (timed, bindings) = step(&mut domain, bindings, 1, &quiet);
+        assert!(timed, "a launch nothing ran across is timed");
+        let grow = |domain: &mut ExecutorDomain<TestFamily>| {
+            assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        };
+        let (timed, bindings) = step(&mut domain, bindings, 2, &grow);
+        assert!(!timed, "a growth began across it");
+        let (timed, bindings) = step(&mut domain, bindings, 3, &quiet);
+        assert!(!timed, "submitted while the growth runs");
+        assert!(matches!(finish(&mut domain), crate::BankResized::Grown { to: 4, .. }));
+        let (timed, _) = step(&mut domain, bindings, 4, &quiet);
+        assert!(timed, "timed again once the growth finished");
+    }
+}
+
+/// A growth decided while a step runs waits for no gap: its slots join at a
+/// boundary steps still run at, and it finishes there.
+#[test]
+fn a_growth_decided_mid_flight_joins_beside_the_running_steps() {
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 2);
+        price_growth(&mut domain, &mut bindings, misses_at(3, 100, 4));
+        domain.family.bank.as_ref().unwrap().running_steps(1);
+        assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        assert!(domain.advance_expert_bank(unwatched()).unwrap().is_none(), "joined while a step runs");
+        assert_eq!(domain.expert_bank_slots(), Some(4));
+        assert!(matches!(finish(&mut domain), crate::BankResized::Grown { to: 4, .. }));
+    }
+}
+
+/// A shrink whose queue drained with a step still running is deferred, not
+/// refused: nothing begins, and the next boundary in a gap begins it.
+#[test]
+fn a_shrink_with_a_step_still_running_is_deferred_to_the_gap() {
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 4);
+        let row = bank_row(&domain);
+        domain.family.bank.as_ref().unwrap().running_steps(1);
+        assert_eq!(domain.shrink_expert_bank_by(&mut bindings, row, unwatched()).unwrap(), BankStep::Deferred);
+        assert_eq!(domain.expert_bank_slots(), Some(4));
+        domain.family.bank.as_ref().unwrap().running_steps(0);
+        assert_eq!(domain.shrink_expert_bank_by(&mut bindings, row, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        assert!(matches!(finish(&mut domain), crate::BankResized::Shrunk { to: 3, .. }));
+    }
+}
+
+/// Under pipelined decode a growth breaks no lookahead: it waits for no gap,
+/// so a successor queues behind each flight while it runs, as without one.
+#[test]
+fn a_growth_keeps_the_pipelined_lookahead() {
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked_with(backend, 4, 2, true);
+        let request = RequestId(80);
+        open(&mut domain, &mut bindings, request);
+        domain.plan_successors(vec![prefill(request, 1)]);
+        let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 0)]);
+        let (pending, mut bindings) = finish_one(&mut domain, flight);
+        domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+        assert_eq!(domain.queue.len(), 1, "with no growth, the next chunk queues");
+        // A growth begun while that chunk runs.
+        price_growth(&mut domain, &mut bindings, misses_at(3, 100, 4));
+        domain.family.bank.as_ref().unwrap().running_steps(1);
+        assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        domain.plan_successors(vec![prefill(request, 2)]);
+        let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 1)]);
+        let (pending, _) = finish_one(&mut domain, flight);
+        domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+        assert_eq!(domain.queue.len(), 1, "a successor queues beside a running growth");
+        assert!(matches!(finish(&mut domain), crate::BankResized::Grown { to: 4, .. }));
+        assert_eq!(domain.resume_state(request).unwrap().target.position(), 2, "the request ran on unaffected");
+    }
+}
+
+/// A growth that pays stops at the planning line: with less than its
+/// step's bytes left above the line, the heap admits no step and the bank
+/// keeps its slots; with more, it grows. The host's memory is held
+/// still (`StillHost`), so the line is where the heap's reading puts it.
+#[test]
+fn a_paying_growth_stops_at_the_line() {
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 2, 2);
+        price_growth(&mut domain, &mut bindings, misses_at(1, 100, 4));
+        assert_eq!(domain.shrink_expert_bank(&mut bindings, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        finish(&mut domain);
+        assert!(device_pays(&domain));
+        let resident = &**domain.experts.as_ref().unwrap().resident.measured().unwrap();
+        let crate::Growth { kind, bytes: step, .. } =
+            domain.family.expert_bank().unwrap().growth(Some(resident), &|_| true, crate::planning::BankTier::Bank, u64::MAX).unwrap().unwrap();
+        // What the heap grants now, by whichever constraint binds: its refusal
+        // of more than any domain holds says.
+        let available = match domain.memory.borrow_mut().claim(u64::MAX / 2, 0, HoldingClass::Live) {
+            Err(ClaimRefusal::Deficit { available, .. }) => available,
+            refused => panic!("the heap granted every byte: {refused:?}"),
+        };
+        // Claimed as a reservation's, the bytes take the store's room itself,
+        // which `available` reads: the free space of the device's blocks serves
+        // none of them.
+        let leaving = |domain: &ExecutorDomain<TestFamily>, left: u64| {
+            domain.memory.borrow_mut().claim_reserved(kind, available - left, 0, HoldingClass::Live).unwrap()
+        };
+        let held = leaving(&domain, step / 2);
+        assert!(matches!(
+            domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()),
+            Ok(BankStep::AtLimit) | Err(DomainError::Reclaim(_))
+        ));
+        assert_eq!(domain.expert_bank_slots(), Some(1));
+        domain.memory.borrow_mut().release(held);
+        let held = leaving(&domain, 2 * step);
+        assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        assert!(matches!(finish(&mut domain), crate::BankResized::Grown { to: 2, .. }));
+        domain.memory.borrow_mut().release(held);
+    }
+}
+
+/// A holding updated while a bank shrink releases: the release falls off
+/// the owner's thread, once the device work before it completes, and an
+/// observation a claim takes meanwhile reads the lower charge before any
+/// advance reports it. The update still classifies within the charge (the
+/// static holding read after it), so no request fails because the bank
+/// resized; every byte stays classified.
+#[test]
+fn a_holding_update_beside_a_shrinks_release_classifies_within_the_charge() {
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 4);
+        let row = bank_row(&domain);
+        let optional = seismic::Tensor::zeros(domain.domain.device(), seismic::Element::bool(), &[row]).unwrap();
+        domain.family.optional = Some(optional);
+        domain.sync_optional_holding().unwrap();
+        assert_eq!(domain.shrink_expert_bank(&mut bindings, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        // The first advance installs; the release is the bank's own thread's.
+        assert!(domain.advance_expert_bank(unwatched()).unwrap().is_none());
+        domain.family.bank.as_ref().unwrap().release_now();
+        // A claim's observation, which no holding follows.
+        domain.memory.borrow_mut().refresh().unwrap();
+        domain.sync_optional_holding().unwrap();
+        assert_eq!(domain.memory().standing().unwrap().unattributed_bytes, 0);
+        assert!(matches!(finish(&mut domain), crate::BankResized::Shrunk { from: 4, to: 3, released, .. } if released == row));
+    }
+}
+
+/// The ladder's bank rung reaches the family's bank: each step begins at
+/// one boundary, installs at the next and is credited exactly what Seismic
+/// stopped charging once released, the static holding following; a step
+/// its storage refuses breaks an invariant (a shrink needs no memory), and at
+/// the floor a step begins none. A growth step backs what it claimed, the claim then returned.
+#[test]
+fn an_expert_bank_shrink_credits_what_seismic_releases() {
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 4);
+        let row = bank_row(&domain);
+        // A region pinning every row refuses a shrink beneath it.
+        let tensor = domain.family.bank.as_ref().unwrap().tensor.clone();
+        let pin = tensor.region(seismic::Element::bool(), &[4, row], 0).unwrap();
+        assert_eq!(domain.shrink_expert_bank(&mut bindings, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        let refused = loop {
+            match domain.advance_expert_bank(unwatched()) {
+                Ok(None) => {}
+                Ok(Some((finished, _))) => panic!("{backend:?}: a pinned shrink finished: {finished:?}"),
+                Err(error) => break error,
+            }
+        };
+        assert!(matches!(refused, DomainError::Invariant(_)), "{backend:?}: {refused}");
+        drop((pin, tensor, domain, bindings));
+        let (mut domain, mut bindings) = banked(backend, 4, 4);
+        let before = domain.memory().standing().unwrap();
+        for slots in [3, 2, 1] {
+            assert_eq!(domain.shrink_expert_bank(&mut bindings, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+            assert!(domain.advance_expert_bank(unwatched()).unwrap().is_none(), "installed, not yet released");
+            assert_eq!(
+                domain.shrink_expert_bank(&mut bindings, unwatched()).unwrap(),
+                BankStep::Running,
+                "one resize at a time"
+            );
+            assert!(matches!(
+                domain.advance_expert_bank(unwatched()).unwrap(),
+                Some((crate::BankResized::Shrunk { from, to: at, released, .. }, _)) if at == slots && from == slots + 1 && released == row
+            ));
+            let residency = domain.expert_residency().unwrap().unwrap();
+            assert_eq!((residency.slots, residency.disk_bytes), (slots, 4 - slots));
+        }
+        assert_eq!(domain.shrink_expert_bank(&mut bindings, unwatched()).unwrap(), BankStep::AtLimit);
+        domain.refresh_memory().unwrap();
+        let after = domain.memory().standing().unwrap();
+        assert_eq!(before.classified_bytes - after.classified_bytes, 3 * row);
+        assert_eq!(after.unattributed_bytes, 0);
+        // Without a miss record there are no grounds to grow: the rule grows
+        // nothing.
+        assert!(!device_pays(&domain));
+        // A growth step, priced on the measured resident step, backs exactly
+        // what it claimed, the holding following: one step to every row, where
+        // the record's misses never stop falling short of them.
+        price_growth(&mut domain, &mut bindings, misses_at(4, 100, 4));
+        assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        assert!(matches!(finish(&mut domain), crate::BankResized::Grown { from: 1, to: 4, grown, .. } if grown == 3 * row));
+        assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::AtLimit);
+        domain.refresh_memory().unwrap();
+        let regrown = domain.memory().standing().unwrap();
+        assert_eq!(regrown.classified_bytes, before.classified_bytes);
+        assert_eq!(regrown.unattributed_bytes, 0);
+    }
+}
+
+const PACE_GB: u64 = 1_000_000_000;
+
+/// One reading of `store` with `headroom` bytes against a 10 GB planning
+/// line, the process charging `charged` and its releases' witness reading
+/// `witness`.
+fn read_pace(pace: &mut MemoryPace, store: seismic::StoreId, headroom: u64, charged: u64, witness: u64, interval: Duration) {
+    let topology = seismic::Devices::discover(&[]).unwrap().topology();
+    let thresholds = crate::platform::DomainThresholds { planning_bytes: 10 * PACE_GB, emergency_bytes: 2 * PACE_GB };
+    let reading = DomainReading {
+        role: DomainRole::Allocation,
+        domain: store,
+        headroom_bytes: headroom,
+        identity: topology.store_identity(topology.host_ram().id()).unwrap(),
+        constraint: crate::platform::MemoryConstraint::HostRam,
+        thresholds,
+        ceiling_bytes: thresholds.ceiling(headroom),
+        distress: None,
+        held: None,
+        displacement: None,
+        band: if headroom <= thresholds.planning_bytes { MemoryBand::Reclaim } else { MemoryBand::Normal },
+    };
+    pace.observe(&[reading], &[(store, charged)], Some(witness), true, interval);
+}
+
+/// The host shows each release `lag` readings late, whatever `lag`, its
+/// witness falling as it does: the bank
+/// releases what the pressure needs rounded up to one rung and waits for the
+/// rest, and pressure that comes after the release shows is answered in turn.
+#[test]
+fn a_release_the_host_shows_late_is_not_released_again() {
+    const RUNG: u64 = 2 * PACE_GB;
+    let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
+    // No span reaches the interval: the rate plays no part.
+    let interval = Duration::from_secs(3600);
+    for lag in 0..8 {
+        let mut pace = MemoryPace::new();
+        let (mut charged, mut releases) = (20 * PACE_GB, Vec::<(usize, u64)>::new());
+        for at in 0..40 {
+            let taken = if at < 20 { 3 } else { 6 } * PACE_GB;
+            let shown: u64 = releases.iter().filter(|(when, _)| when + lag <= at).map(|(_, bytes)| bytes).sum();
+            let unshown = releases.iter().map(|(_, bytes)| bytes).sum::<u64>() - shown;
+            read_pace(&mut pace, store, (10 * PACE_GB + shown).saturating_sub(taken), charged, charged + unshown, interval);
+            if let Shortfall::Short(bytes) = pace.shortfall(store, charged) {
+                let released = bytes.div_ceil(RUNG) * RUNG;
+                charged -= released;
+                releases.push((at, released));
+            }
+            let total: u64 = releases.iter().map(|(_, bytes)| bytes).sum();
+            assert!(total >= taken && total <= taken.div_ceil(RUNG) * RUNG, "lag {lag}, reading {at}: {total} released for {taken}");
+        }
+    }
+}
+
+/// A release in small rungs the host shows at once is never credited, so each
+/// next rung sees the whole of what is still short; one the witness has yet
+/// to drop is, until it does.
+#[test]
+fn only_what_the_witness_has_yet_to_drop_is_credited() {
+    let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
+    let interval = Duration::from_secs(3600);
+    let mut pace = MemoryPace::new();
+    read_pace(&mut pace, store, 7 * PACE_GB, 20 * PACE_GB, 20 * PACE_GB, interval);
+    read_pace(&mut pace, store, 8 * PACE_GB, 19 * PACE_GB, 19 * PACE_GB, interval);
+    assert_eq!(pace.shortfall(store, 19 * PACE_GB), Shortfall::Short(2 * PACE_GB), "shown at once");
+    read_pace(&mut pace, store, 8 * PACE_GB, 18 * PACE_GB, 19 * PACE_GB, interval);
+    assert_eq!(pace.shortfall(store, 18 * PACE_GB), Shortfall::Short(PACE_GB), "a GB unseen");
+    read_pace(&mut pace, store, 9 * PACE_GB, 18 * PACE_GB, 18 * PACE_GB, interval);
+    assert_eq!(pace.shortfall(store, 18 * PACE_GB), Shortfall::Short(PACE_GB), "shown now");
+    // The host takes a GB with none unseen: all of it is short.
+    read_pace(&mut pace, store, 8 * PACE_GB, 18 * PACE_GB, 18 * PACE_GB, interval);
+    assert_eq!(pace.shortfall(store, 18 * PACE_GB), Shortfall::Short(2 * PACE_GB));
+}
+
+/// A release after the reading a decision uses is credited too; a reading
+/// above the line ends what is owed, so pressure after it stands alone; and a
+/// lapsed credit leaves the reading alone.
+#[test]
+fn the_credit_counts_releases_after_the_reading_until_memory_is_above_the_line() {
+    let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
+    let interval = Duration::from_secs(3600);
+    let mut pace = MemoryPace::new();
+    read_pace(&mut pace, store, 7 * PACE_GB, 20 * PACE_GB, 20 * PACE_GB, interval);
+    assert_eq!(pace.shortfall(store, 20 * PACE_GB), Shortfall::Short(3 * PACE_GB));
+    assert_eq!(pace.shortfall(store, 19 * PACE_GB), Shortfall::Short(2 * PACE_GB), "released after the reading");
+    assert_eq!(pace.shortfall(store, 17 * PACE_GB), Shortfall::Covered);
+    read_pace(&mut pace, store, 7 * PACE_GB, 17 * PACE_GB, 20 * PACE_GB, interval);
+    assert_eq!(pace.shortfall(store, 17 * PACE_GB), Shortfall::Covered, "unseen at this reading");
+    read_pace(&mut pace, store, 11 * PACE_GB, 17 * PACE_GB, 17 * PACE_GB, interval);
+    assert_eq!(pace.shortfall(store, 17 * PACE_GB), Shortfall::Above);
+    read_pace(&mut pace, store, 9 * PACE_GB, 17 * PACE_GB, 17 * PACE_GB, interval);
+    assert_eq!(pace.shortfall(store, 17 * PACE_GB), Shortfall::Short(PACE_GB), "the old release is not credited again");
+    read_pace(&mut pace, store, 9 * PACE_GB, 16 * PACE_GB, 17 * PACE_GB, interval);
+    assert_eq!(pace.shortfall(store, 16 * PACE_GB), Shortfall::Covered);
+    pace.lapse_credit();
+    assert_eq!(pace.shortfall(store, 16 * PACE_GB), Shortfall::Short(PACE_GB));
+}
+
+/// The process's own release, unseen, is no taking by the host, and the
+/// taking measured before it is not projected past it: the host that took
+/// memory may have stopped. The next span measures it again.
+#[test]
+fn a_release_ends_the_measured_taking_until_a_span_after_it() {
+    let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
+    let mut pace = MemoryPace::new();
+    for charged in [20, 17, 17] {
+        read_pace(&mut pace, store, 7 * PACE_GB, charged * PACE_GB, charged * PACE_GB, Duration::ZERO);
+        assert_eq!(pace.domains[&store].fastest, 0.0, "at a charge of {charged} GB");
+    }
+    read_pace(&mut pace, store, 6 * PACE_GB, 17 * PACE_GB, 17 * PACE_GB, Duration::ZERO);
+    assert!(pace.domains[&store].rate > 0.0, "the host took a GB");
+    read_pace(&mut pace, store, 6 * PACE_GB, 15 * PACE_GB, 15 * PACE_GB, Duration::ZERO);
+    assert_eq!(pace.domains[&store].rate, 0.0, "released across this span");
+}
+
+/// A release that lands in a span in which the host takes as much is seen by
+/// its witness's fall, not credited: the readings after it, flat below the
+/// line, are short by the whole deficit, not covered until the credit lapses.
+/// (On a GB10 under a press, a 0.97 GB release landed as the press fell; the
+/// load then read itself 0.65 GB below the line for 0.9 s and released
+/// nothing.)
+#[test]
+fn a_release_the_host_takes_as_it_lands_is_not_credited() {
+    let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
+    let interval = Duration::from_secs(3600);
+    let mut pace = MemoryPace::new();
+    read_pace(&mut pace, store, 7 * PACE_GB, 20 * PACE_GB, 20 * PACE_GB, interval);
+    assert_eq!(pace.shortfall(store, 20 * PACE_GB), Shortfall::Short(3 * PACE_GB));
+    // 3 GB released, and the host takes 3 GB in the same span.
+    for reading in 0..3 {
+        read_pace(&mut pace, store, 7 * PACE_GB, 17 * PACE_GB, 17 * PACE_GB, interval);
+        assert_eq!(pace.shortfall(store, 17 * PACE_GB), Shortfall::Short(3 * PACE_GB), "reading {reading} after the release");
+    }
+}
+
+/// Each domain's deficit is its own: a shrink of what is charged in a
+/// domain 3 GB below its planning line covers 3 GB, one of what is charged
+/// in a domain above its line nothing, and one in a domain no probe
+/// observed nothing.
+#[test]
+fn each_domains_deficit_is_the_shrink_of_what_it_charges() {
+    const GB: u64 = 1_000_000_000;
+    // Three distinct stores: host RAM of three discoveries, each a revision
+    // of its own.
+    let [short, ample, unobserved] =
+        [(); 3].map(|()| seismic::Devices::discover(&[]).unwrap().topology().host_ram().id());
+    assert!(short != ample && ample != unobserved && short != unobserved);
+    let domain = |headroom| DomainPace {
+        role: DomainRole::Allocation,
+        headroom,
+        planning: 10 * GB,
+        emergency: 2 * GB,
+        ceiling: 0,
+        charged: 0,
+        band: MemoryBand::Normal,
+        unseen: 0,
+        witness: None,
+        available: 0,
+        base: (Instant::now(), 0),
+        rate: 0.0,
+        fastest: 0.0,
+        fluctuation: Fluctuation::default(),
+    };
+    let mut pace = MemoryPace::new();
+    pace.domains.insert(short, domain(7 * GB));
+    pace.domains.insert(ample, domain(12 * GB));
+    assert_eq!(pace.shortfall(short, 0), Shortfall::Short(3 * GB));
+    assert_eq!(pace.shortfall(ample, 0), Shortfall::Above);
+    assert_eq!(pace.shortfall(unobserved, 0), Shortfall::Above);
+    // A host in distress above the line: nothing is short, so nothing is
+    // released for it a slot at a time.
+    pace.domains.get_mut(&ample).unwrap().band = MemoryBand::Reclaim;
+    assert_eq!(pace.shortfall(ample, 0), Shortfall::Covered);
+}
+
+/// A shrink covers its deficit now and what the host takes at its rate
+/// until the next shrink takes effect: 3 GB/s carried 0.25 s is 750 MB.
+#[test]
+fn a_shrink_covers_what_is_taken_until_the_next_takes_effect() {
+    let horizon = std::time::Duration::from_millis(250);
+    assert_eq!(projected(40, 3e9, horizon), 750_000_040);
+    assert_eq!(projected(40, 0.0, horizon), 40, "a host taking nothing: the deficit now");
+}
+
+/// The time to the next shrink's effect: the reading interval, and twice
+/// the last finished release's latency (this shrink's, then the next one's
+/// after the reading that decides it); the interval alone before any.
+#[test]
+fn the_shrink_horizon_runs_from_a_decision_to_the_next_effect() {
+    let start = Instant::now();
+    let at = |ms| start + std::time::Duration::from_millis(ms);
+    let times = |decided, released| crate::domain::ResizeTimes {
+        decided: at(decided),
+        queued: Default::default(),
+        planned: Default::default(),
+        trips: Default::default(),
+        moves: Default::default(),
+        prepared: at(released),
+        installed: at(released),
+        released: at(released),
+    };
+    let ms = std::time::Duration::from_millis;
+    let mut pace = MemoryPace::new();
+    pace.reading_interval = ms(100);
+    assert_eq!(pace.horizon(), ms(100));
+    pace.released(&times(0, 120));
+    assert_eq!(pace.horizon(), ms(340));
+    pace.released(&times(130, 280));
+    assert_eq!(pace.horizon(), ms(400));
+}
+
+/// The wait bound is what the host may take from the planning line to the
+/// emergency reserve at the fastest rate it was measured taking: 8 GB at
+/// 1 GB/s is 8 s. None in a domain seen taking nothing, nor in one that
+/// grows nothing; none of a pace before any probe.
+#[test]
+fn the_wait_bound_is_the_reserve_between_the_lines_at_the_fastest_taking() {
+    const GB: u64 = 1_000_000_000;
+    let domain = |role, fastest| DomainPace {
+        role,
+        headroom: 0,
+        planning: 10 * GB,
+        emergency: 2 * GB,
+        ceiling: 0,
+        charged: 0,
+        band: MemoryBand::Normal,
+        unseen: 0,
+        witness: None,
+        available: 0,
+        base: (Instant::now(), 0),
+        rate: 0.0,
+        fastest,
+        fluctuation: Fluctuation::default(),
+    };
+    assert_eq!(domain(DomainRole::Allocation, 1e9).wait_bound(), Some(8.0));
+    assert_eq!(domain(DomainRole::Allocation, 0.0).wait_bound(), None);
+    assert_eq!(domain(DomainRole::Staging, 1e9).wait_bound(), None);
+    assert_eq!(MemoryPace::new().wait_bound(), None);
+}
+
+/// The fluctuation is the largest fall between consecutive readings while
+/// the process's demand is unchanged: a rise, a pair across a change of
+/// the charge and a reading while a resize runs measure nothing.
+#[test]
+fn the_fluctuation_is_the_largest_steady_fall_between_readings() {
+    let mut fluctuation = Fluctuation::default();
+    let read = |fluctuation: &mut Fluctuation, readings: &[(u64, u64, bool)]| {
+        readings
+            .iter()
+            .map(|&(available, charged, settled)| {
+                fluctuation.read(available, charged, settled);
+                fluctuation.largest
+            })
+            .collect::<Vec<_>>()
+    };
+    // Falls of 2 and 1, a rise of 20: the largest fall stays.
+    assert_eq!(read(&mut fluctuation, &[(30, 5, true), (28, 5, true), (48, 5, true), (47, 5, true)]), [0, 2, 2, 2]);
+    // A fall of 9 across a change of the charge, then falls of 7 and 6 to
+    // readings while a resize ran: none is steady.
+    assert_eq!(read(&mut fluctuation, &[(38, 6, true), (31, 6, false), (25, 6, false)]), [2, 2, 2]);
+    // Settled again, a fall of 3 counts.
+    assert_eq!(read(&mut fluctuation, &[(25, 6, true), (22, 6, true)]), [2, 3]);
 }
 
 /// A failed head or vision flight returns its device error, and its
@@ -1010,16 +1638,14 @@ fn pending_head_and_vision_device_failures_consume_the_bindings() {
         crate::DeviceError::Execution(format!("failed pending {lane} submission"))
     };
 
-    let Some((mut head_domain, bindings)) = fixture(None) else {
-        return;
-    };
+    let (mut head_domain, bindings) = fixture(None);
     let head_control = PendingControl::default();
     let mut head = HeadFlight {
         requests: Vec::new(),
         steps: 0,
         submission: PendingFailureSubmission::<CompletedHeadWork>::new(head_control.clone()).into(),
         started: Instant::now(),
-        recorded_graphs: 0,
+        epoch: None,
         launch_trace: None,
         bindings,
     };
@@ -1030,16 +1656,14 @@ fn pending_head_and_vision_device_failures_consume_the_bindings() {
         Err(DomainError::Device(_))
     ));
 
-    let Some((mut vision_domain, bindings)) = fixture(None) else {
-        return;
-    };
+    let (mut vision_domain, bindings) = fixture(None);
     let vision_control = PendingControl::default();
     let mut vision = VisionFlight {
         request: RequestId(41),
         image: ImageRef::new(vision_domain.resource_identity().clone(), 1).unwrap(),
         submission: PendingFailureSubmission::<CompletedVisionWork>::new(vision_control.clone()),
         started: Instant::now(),
-        recorded_graphs: 0,
+        epoch: None,
         bindings,
     };
     assert!(!vision.completion().is_complete());
@@ -1052,9 +1676,7 @@ fn pending_head_and_vision_device_failures_consume_the_bindings() {
 
 #[test]
 fn completed_head_and_vision_request_cancellation_restores_or_drops() {
-    let Some((mut domain, mut bindings)) = fixture(None) else {
-        return;
-    };
+    let (mut domain, mut bindings) = fixture(None);
     let request = RequestId(50);
     open(&mut domain, &mut bindings, request);
 
@@ -1068,13 +1690,13 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops() {
             outcome: Outcome::Head {
                 proposals: Vec::new(),
             },
-            advance: Some(head_advance),
+            advance: Some(Advance::Step(head_advance)),
             primed: None,
             rows: 1,
             committed_rows: 0,
             kind: WorkKind::Decode,
             physical_duration: Duration::ZERO,
-            replayed: true,
+            timed: true,
             image: None,
         })
         .unwrap();
@@ -1102,7 +1724,7 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops() {
             committed_rows: 0,
             kind: WorkKind::Prefill,
             physical_duration: Duration::ZERO,
-            replayed: true,
+            timed: true,
             image: Some(image),
         })
         .unwrap();
@@ -1322,7 +1944,7 @@ fn reconcile_encode<F: ProgramFamily>(
                 committed_rows: 0,
                 kind: WorkKind::Prefill,
                 physical_duration: Duration::ZERO,
-                replayed: true,
+                timed: true,
                 image: Some(image),
             },
             PhysicalDecision { accepted_rows: 0 },
@@ -1358,9 +1980,7 @@ fn placements<F: ProgramFamily>(
 /// between them keeps its own encode.
 #[test]
 fn a_repeated_image_is_encoded_once_and_placed_at_every_occurrence() {
-    let Some((mut domain, mut bindings)) = fixture(None) else {
-        return;
-    };
+    let (mut domain, mut bindings) = fixture(None);
     let request = RequestId(60);
     domain
         .install_input(
@@ -1400,9 +2020,7 @@ fn a_repeated_image_is_encoded_once_and_placed_at_every_occurrence() {
 /// placement encodes the image once more for the remaining placement only.
 #[test]
 fn an_image_repeated_across_turns_resumes_and_encodes_its_remaining_placement() {
-    let Some((mut domain, mut bindings)) = fixture(None) else {
-        return;
-    };
+    let (mut domain, mut bindings) = fixture(None);
 
     // Turn one: prefill the whole prompt, then take its resume state.
     let first = RequestId(61);
@@ -1467,9 +2085,7 @@ fn an_image_repeated_across_turns_resumes_and_encodes_its_remaining_placement() 
 /// Its second flight keeps the completion wake and preserves device failures.
 #[test]
 fn deferred_priming_keeps_pending_completion_and_reports_device_failure() {
-    let Some((domain, bindings)) = fixture(None) else {
-        return;
-    };
+    let (domain, bindings) = fixture(None);
     let control = PendingControl::default();
     let mut flight = PrimingCompletionFlight {
         work: PrimingFlight {
@@ -1517,8 +2133,7 @@ fn target_with_pending_priming(
         false,
         true,
         platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
-    )
-    .expect("deferred priming ownership tests require the CPU fixture");
+    );
     open(&mut domain, &mut bindings, request);
     let mut operation = prefill(request, 0);
     if let Operation::Forward {
@@ -1547,7 +2162,8 @@ fn target_with_pending_priming(
     .unwrap();
     let row_bytes = domain.head_conditioning_bytes();
     let conditioning = FeatureRows::new(vec![0u8; row_bytes].into(), 1).unwrap();
-    let pool = domain.resources.target_readout_graph();
+    // The launch pool: only it holds any launch's projected rows.
+    let pool = domain.resources.target_readout_graph(usize::MAX);
     let inputs = crate::HeadLaunchInputs::new(
         batch,
         vec![advance],
@@ -1602,7 +2218,7 @@ fn publish_before_priming(
 fn deferred_priming_commits_after_target_publication_and_releases_leases() {
     let request = RequestId(93);
     let (mut domain, flight, control) = target_with_pending_priming(request);
-    let held_outputs = domain.resources.target_readout_graph().available_output();
+    let held_outputs = domain.resources.target_readout_graph(usize::MAX).available_output();
     let (pending, mut priming) = publish_before_priming(&mut domain, flight);
     domain
         .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
@@ -1618,7 +2234,7 @@ fn deferred_priming_commits_after_target_publication_and_releases_leases() {
         "no eviction before head completion"
     );
     assert_eq!(
-        domain.resources.target_readout_graph().available_output(),
+        domain.resources.target_readout_graph(usize::MAX).available_output(),
         held_outputs
     );
     let woke = Arc::new(AtomicBool::new(false));
@@ -1634,7 +2250,7 @@ fn deferred_priming_commits_after_target_publication_and_releases_leases() {
     assert_eq!(checkpoint.target.position(), 2);
     assert_eq!(checkpoint.head.as_ref().unwrap().position(), 1);
     assert_eq!(
-        domain.resources.target_readout_graph().available_output(),
+        domain.resources.target_readout_graph(usize::MAX).available_output(),
         held_outputs + 1
     );
     // The returned binding right is usable only after the second flight ends.
@@ -1697,9 +2313,7 @@ fn deferred_priming_prevents_cancelled_request_retirement_until_completion() {
 
 #[test]
 fn boundary_features_commit_fork_and_abort_with_numerical_state() {
-    let Some((mut domain, mut bindings)) = fixture(None) else {
-        return;
-    };
+    let (mut domain, mut bindings) = fixture(None);
     let request = RequestId(91);
     open(&mut domain, &mut bindings, request);
     let first = domain.allocate_boundary().unwrap();
@@ -1814,9 +2428,7 @@ fn token_values(tokens: &[crate::TokenId]) -> Vec<u32> {
 /// on from them, leaving its source's unchanged.
 #[test]
 fn token_history_follows_rollback_and_fork() {
-    let Some((mut domain, mut bindings)) = fixture(None) else {
-        return;
-    };
+    let (mut domain, mut bindings) = fixture(None);
     let source = RequestId(81);
     open(&mut domain, &mut bindings, source);
     // The fixture launches at most two rows.
@@ -1915,7 +2527,12 @@ fn host_rows_from_the_token_history_equal_the_device_rows() {
     let catalog = seismic::Devices::discover(&[]).unwrap();
     let devices = [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan, BackendName::Cpu]
         .into_iter()
-        .filter_map(|backend| catalog.open_backend(backend).ok())
+        .filter(|&backend| crate::test_support::available(&catalog, backend))
+        .map(|backend| {
+            catalog
+                .open_backend(backend)
+                .unwrap_or_else(|error| panic!("an available {backend:?} executor opens: {error}"))
+        })
         .collect::<Vec<_>>();
     let ints = |device: &seismic::Device, shape: &[u64], values: &[i32]| {
         Tensor::from_host(
@@ -2053,9 +2670,13 @@ fn failed_table_read(name: &str) -> (std::path::PathBuf, crate::programs::Stored
             seismic::Element::named("iq4g32s@rows16").unwrap(),
             ROWS,
             160,
-            64,
+            crate::stored_table::StoredSlots::Whole { records: 1, record_rows: 64 },
             crate::planning::DirectoryForm::Hashed,
-            magnitude_artifacts::UncachedSource::open(&path).unwrap(),
+            magnitude_artifacts::ArtifactReader::open(
+                &path,
+                magnitude_artifacts::CachePolicy::Uncached,
+            )
+            .unwrap(),
             0,
             None,
         )
@@ -2070,7 +2691,7 @@ fn failed_table_read(name: &str) -> (std::path::PathBuf, crate::programs::Stored
     let step = table
         .queue(StepRows::Known(vec![vec![1], vec![3500]]))
         .unwrap();
-    assert!(step.gate.wait(step.value, std::time::Duration::from_secs(10)));
+    assert!(step.gate.wait(step.value, std::time::Duration::from_secs(10)).unwrap());
     // The device read the step's rows.
     step.read.signal(step.value).unwrap();
     (path, crate::programs::StoredRead::new(table, step.value))
@@ -2084,9 +2705,7 @@ fn failed_table_read(name: &str) -> (std::path::PathBuf, crate::programs::Stored
 /// steps.
 #[test]
 fn a_table_read_failure_fails_only_the_sequence_that_named_the_rows() {
-    let Some((mut domain, mut bindings)) = fixture(None) else {
-        return;
-    };
+    let (mut domain, mut bindings) = fixture(None);
     let (kept, failed) = (RequestId(91), RequestId(92));
     open(&mut domain, &mut bindings, kept);
     open(&mut domain, &mut bindings, failed);
@@ -2109,13 +2728,13 @@ fn a_table_read_failure_fails_only_the_sequence_that_named_the_rows() {
                     .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
                     .unwrap();
             } else {
-                let Outcome::TableReadFailed(error) = pending.outcome() else {
+                let Outcome::WeightReadFailed(error) = pending.outcome() else {
                     panic!("step {step}: the failed sequence's outcome is not its failure");
                 };
                 assert!(error.detail.contains("3500"), "{error}");
                 assert!(matches!(
                     domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }),
-                    Err(DomainError::TableRead(_))
+                    Err(DomainError::WeightRead(_))
                 ));
             }
         }
@@ -2132,6 +2751,48 @@ fn a_table_read_failure_fails_only_the_sequence_that_named_the_rows() {
         .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
         .unwrap();
     std::fs::remove_file(path).unwrap();
+}
+
+/// A step whose expert reads failed fails the sequences of that step
+/// alone, with the one read-failure error, and the next request succeeds:
+/// its sequences commit nothing of the failed step, and a sequence opened
+/// after it runs.
+#[test]
+fn an_expert_read_failure_fails_only_its_steps_sequences() {
+    let (mut domain, mut bindings) = fixture(None);
+    let (first, second, later) = (RequestId(81), RequestId(82), RequestId(83));
+    open(&mut domain, &mut bindings, first);
+    open(&mut domain, &mut bindings, second);
+    EXPERT_STEPS.with(|steps| {
+        *steps.borrow_mut() = Some(crate::experts::ExpertStep::failed(
+            "expert record at 4096 of 1572864 bytes in model file 0: failed to fill whole buffer",
+        ))
+    });
+    let flight = submit_reserved_target(
+        &mut domain,
+        bindings,
+        vec![feed(first, 0, &[10]), feed(second, 0, &[20])],
+    );
+    let (pending, mut bindings) = domain.finish_target(flight).unwrap();
+    assert_eq!(pending.len(), 2);
+    for pending in pending {
+        let Outcome::WeightReadFailed(error) = pending.outcome() else {
+            panic!("a sequence of the failed step did not fail");
+        };
+        assert!(error.detail.contains("failed to fill"), "{error}");
+        assert!(matches!(
+            domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }),
+            Err(DomainError::WeightRead(_))
+        ));
+    }
+    assert_eq!(domain.resume_state(first).unwrap().position(), 0);
+    open(&mut domain, &mut bindings, later);
+    let flight = submit_reserved_target(&mut domain, bindings, vec![feed(later, 0, &[30])]);
+    let (pending, _) = finish_one(&mut domain, flight);
+    assert!(matches!(pending.outcome(), Outcome::Forward { .. }));
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
 }
 
 /// The planning fixture with its attention selecting one block of four rows
@@ -2178,16 +2839,13 @@ fn selected_histories_follow_blocks_across_rollback() {
     use magnitude_state::HistoryDomainId;
     const RAW: HistoryDomainId = HistoryDomainId(1);
     const BLOCKS: HistoryDomainId = HistoryDomainId(2);
-    let Some((mut domain, mut bindings)) = fixture_of(
+    let (mut domain, mut bindings) = fixture_of(
         selected_definition(),
-        16,
+        limits(16, 1, false),
         None,
         false,
-        false,
         platform::DeviceRequest::Automatic,
-    ) else {
-        return;
-    };
+    );
     let blocks = |domain: &ExecutorDomain<TestFamily>, request| {
         domain
             .resume_state(request)

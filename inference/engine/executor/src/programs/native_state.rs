@@ -274,9 +274,9 @@ impl PreparedStateCopyGraphs {
             planned,
         };
         // Graphs that hold another heap than the plan counted are a defect
-        // of the plan's accounting: an error in a debug build.
+        // of the plan's accounting, which refuses the load.
         let held = graphs.host_heap();
-        if cfg!(debug_assertions) && held != planned {
+        if held != planned {
             return Err(invalid(format!(
                 "the state copy graphs hold {held:?}; the plan counted {planned:?}"
             )));
@@ -532,9 +532,7 @@ mod tests {
     #[test]
     fn prepared_graph_copies_within_held_slabs() {
         let catalog = seismic::Devices::discover(&[]).unwrap();
-        let Ok(device) = catalog.open_backend(BackendName::Cpu) else {
-            return;
-        };
+        let device = catalog.open_backend(BackendName::Cpu).expect("the CPU backend opens");
         let element = Element::f32();
         let kernel = copy_rows::native_for_device_with(
             &device,
@@ -594,7 +592,7 @@ mod tests {
         let reshaped = view.reshape(&[4, 1, 4]).unwrap();
         let bindings = graphs.bindings(&class, &reshaped).unwrap();
         let outputs = graphs.plan(&class).unwrap().new_outputs().unwrap();
-        let mut slot = graphs.family().new_slot(1).unwrap();
+        let mut slot = graphs.family().new_slot(&[graphs.family().upload_bytes()]).unwrap();
         graphs
             .run(
                 &class,

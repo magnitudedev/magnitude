@@ -2,6 +2,23 @@
 
 use crate::span::Span;
 
+/// `value`'s structure: its derived `Debug` rendering with every source
+/// position (`Span { .. }`) removed, so two parses are equal in it exactly
+/// when they are equal but for where their text sat. Every field of the
+/// syntax tree is in it by construction. Free text that could hold `Span {`
+/// is only a native declaration's asset path; identifiers cannot.
+pub(crate) fn structure(value: &impl std::fmt::Debug) -> String {
+    let text = format!("{value:?}");
+    let mut out = String::new();
+    let mut rest = text.as_str();
+    while let Some(i) = rest.find("Span {") {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        rest = &rest[rest.find('}').map_or(rest.len(), |j| j + 1)..];
+    }
+    out + rest
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AssignOp {
     Assign,
@@ -119,6 +136,17 @@ pub struct Ident {
 #[derive(Clone, Debug, PartialEq)]
 pub struct File {
     pub decls: Vec<Decl>,
+    pub constants: Vec<ConstDecl>,
+}
+
+/// `const NAME = INTEGER`: a module constant. Every file of a source set
+/// sees it, and an expression naming it is that integer literal; natives
+/// read it as `SEISMIC_CONST_NAME`, and the generated Rust API exports it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConstDecl {
+    pub name: Ident,
+    pub value: u64,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -151,14 +179,17 @@ impl Decl {
 /// ```text
 /// native NAME for TARGET from "SOURCE":
 ///     static (DIM, ..)
-///     params ([code] [arithmetic] NAME in [V, ..], ..)
+///     params ([arithmetic] [form] NAME in [V, ..] default DEFAULT, ..)
 ///     elements (ELEMENT in [DTYPE, ..], ..)
 ///     let NAME = EXPR
 ///     where CONDITION
 ///     scratch NAME bytes (EXPR) [sync] [when CONDITION]
 ///     launch KERNEL [when CONDITION]:
-///         params ([code] [arithmetic] NAME in [V, ..], ..)
+///         params ([arithmetic] [form] NAME in [V, ..] default DEFAULT, ..)
+///         where CONDITION
+///         reads (PARAMETER, ..)
 ///         threadgroups (X, Y, Z)
+///         grid (PARAMETER)
 ///         threads_per_threadgroup (X, Y, Z)
 ///         shared_bytes (EXPR)
 ///     repeat (EXPR):
@@ -166,7 +197,11 @@ impl Decl {
 /// ```
 ///
 /// A `CONDITION` is comparisons of natural-number expressions joined by
-/// `and` and `or`, grouped with parentheses.
+/// `and` and `or`, grouped with parentheses; a capability `device.NAME`
+/// stands as a condition. Every expression may read `device.NAME`, a
+/// property the target backend provides. A `DEFAULT` is `EXPR`, `least
+/// where CONDITION` or `greatest where CONDITION`, over the device, the
+/// static dimensions and the bound elements.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeDecl {
     pub function: Ident,
@@ -178,6 +213,10 @@ pub struct NativeDecl {
     /// The dense representations a build-time compiled (CPU) form covers,
     /// per element parameter it monomorphizes.
     pub elements: Vec<NativeElementsDecl>,
+    /// `records (PORT, ..)`: tensor ports the native reaches a record (a
+    /// leading-axis row) at a time, each bound through a table of its
+    /// records' device addresses.
+    pub records: Vec<NativeRecordDecl>,
     /// Named natural-number expressions, in declaration order.
     pub terms: Vec<NativeTermDecl>,
     /// The `where` condition restricting admissible configurations.
@@ -211,19 +250,32 @@ pub struct NativeRepeatDecl {
     pub span: Span,
 }
 
-/// One tuning parameter and its finite domain. The first value is the default.
+/// One tuning parameter, its finite domain and its default:
+/// `[arithmetic] [form] NAME in [V, ..] default DEFAULT`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeParamDecl {
     pub name: Ident,
-    /// The parameter changes generated kernel code rather than only launch
-    /// geometry or runtime arguments.
-    pub code: bool,
     /// The parameter changes the arithmetic order of a row's result.
     pub arithmetic: bool,
     /// The parameter's values select structurally different algorithms.
     pub form: bool,
     pub values: Vec<u64>,
+    pub default: NativeDefaultDecl,
     pub span: Span,
+}
+
+/// A parameter's default, over the device (`device.NAME`) and the static
+/// dimensions: an expression whose value is one of the listed values, or
+/// the least or greatest listed value at which a condition over the
+/// parameter itself holds.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NativeDefaultDecl {
+    /// `default EXPR`
+    Value(Expr),
+    /// `default least where CONDITION`
+    Least(Expr),
+    /// `default greatest where CONDITION`
+    Greatest(Expr),
 }
 
 /// `NAME in [DTYPE, ..]`: the dense element types one element parameter of a
@@ -233,6 +285,14 @@ pub struct NativeElementsDecl {
     pub name: Ident,
     pub dtypes: Vec<Ident>,
     pub span: Span,
+}
+
+/// A record port of a native declaration: a parameter by name, or `result N`
+/// (the entry's result leaf `N`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum NativeRecordDecl {
+    Parameter(Ident),
+    Result { ordinal: u64, span: Span },
 }
 
 /// Call-private device memory shared by the launches of one native call.
@@ -249,6 +309,18 @@ pub struct NativeScratchDecl {
 }
 
 /// One ordered dispatch of a kernel function from the native source.
+/// A launch condition's word: `PARAMETER` (word 0 of a `&tensor[1] i32`)
+/// or `PARAMETER[INDEX]` (word INDEX of a `&tensor[N] i32`, INDEX a constant
+/// below N).
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeConditionDecl {
+    pub encoded: crate::checked::Encoded,
+    pub word: Ident,
+    /// The word's index, as written (a constant, which checking requires):
+    /// none for the plain form.
+    pub index: Option<Expr>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeLaunchDecl {
     pub kernel: Ident,
@@ -256,9 +328,23 @@ pub struct NativeLaunchDecl {
     pub when: Option<Expr>,
     /// Parameters local to this launch; names may be reused by other launches.
     pub params: Vec<NativeParamDecl>,
+    /// The launch's `where`: restricts the admissible configurations of the
+    /// parameters it reads, the launch's own and the entry's.
+    pub constraint: Option<Expr>,
     /// Entry parameters read by the kernel but absent from launch expressions.
     pub reads: Vec<Ident>,
+    /// The most groups the launch dispatches on each axis; with `grid`, the
+    /// bound of the grid it reads.
     pub threadgroups: [Expr; 3],
+    /// `grid (PARAMETER)`: the launch dispatches the grid an earlier launch
+    /// wrote into this entry parameter (three `i32` group counts, each at
+    /// most `threadgroups`'), read when the launch runs (indirect dispatch).
+    pub grid: Option<Ident>,
+    /// `if (WORD)` or `unless (WORD)` lines, a conjunction: the launch is
+    /// encoded only while each such word of a host-shared `&tensor[N] i32`
+    /// entry parameter the host writes between submissions is nonzero, or
+    /// zero, read when the run is encoded.
+    pub conditions: Vec<NativeConditionDecl>,
     pub threads_per_threadgroup: [Expr; 3],
     pub shared_bytes: Option<Expr>,
     pub span: Span,
@@ -347,6 +433,18 @@ pub enum ShapedHead {
     SharedTensor,
     /// Exclusive mutable logical tensor borrow (`&mut tensor`).
     MutTensor,
+    /// A host port (`&host tensor`, `&host mut tensor`): a tensor the host
+    /// reads (`write` false) or rewrites once it sees the launch, which the
+    /// kernel never accesses.
+    HostTensor { write: bool },
+    /// An awaited port (`&await tensor`, `&await mut tensor`): a shared or
+    /// (`write`) mutable borrow holding words the host writes while the
+    /// launch waits for them. The launch parks: it reads them only once its
+    /// host has answered, which each backend realizes its own way (a
+    /// backend whose devices see host writes while work runs spins in the
+    /// kernel; one whose devices do not ends the submission before the
+    /// launch and resumes it on the host's signal).
+    AwaitTensor { write: bool },
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -9,6 +9,7 @@
 // order, and agree bit for bit. A chunked prefill and a committed tape
 // version reproduce one run's bits on each backend.
 
+mod common;
 mod versions_common;
 
 use magnitude_kernels::{ngram_gate, ngram_inject, ngram_rows};
@@ -81,7 +82,7 @@ fn interpret(
     mutable: Option<usize>,
 ) -> (Vec<f32>, Option<Vec<f32>>) {
     use seismic_lang::{
-        checked::{SourceFile, check_source},
+        checked::{SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue},
@@ -93,7 +94,7 @@ fn interpret(
         path: "ngram.seismic".into(),
         text: source.into(),
     });
-    let module = check_source(sources).unwrap();
+    let module = crate::common::check(sources);
     let elements = ElementBindings::new().bind("NW", registry::dense(DType::F32));
     let logical = module
         .entry(module.entry_named(entry).unwrap(), &elements)
@@ -766,7 +767,7 @@ impl RowsCase {
 
     fn oracle(&self) -> RowsOutcome {
         use seismic_lang::{
-            checked::{SourceFile, check_source},
+            checked::{SourceFile},
             entry::ElementBindings,
             failure::SourceTermination,
             interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -778,7 +779,7 @@ impl RowsCase {
             path: "ngram.seismic".into(),
             text: include_str!("../kernels/ngram.seismic").into(),
         });
-        let module = check_source(sources).unwrap();
+        let module = crate::common::check(sources);
         let logical = module
             .entry(module.entry_named("ngram_rows").unwrap(), &ElementBindings::new())
             .unwrap();

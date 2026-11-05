@@ -2,7 +2,7 @@
 //! backend contracts (spec §2.3, §12, §24.1 R9). No planning lives here.
 //!
 //! The public surface is [`devices`] (opened execution resources over
-//! seismic-topology's inventory) and [`api`] (the opened device, the
+//! seismic-discovery's inventory) and [`api`] (the opened device, the
 //! tensor, and the call driver) which the public `seismic` crate composes.
 //! Everything else is private:
 //!
@@ -30,15 +30,22 @@
 //! interprets the portable body.
 
 pub mod api;
+pub use backends::unmeasured_graph_cost;
+/// What the process's large-page host backing came to (the host pages of
+/// reservations whose granules are whole large pages, backed in them or not),
+/// and the time its reservations' backing took by phase.
+pub use seismic_reservation::{backing_times, large_page_backing, BackingTimes, LargePageBacking};
 pub mod artifacts;
 pub mod devices;
 
 mod backends;
+mod completion;
 mod driver;
 mod execution;
 pub mod formation;
 mod layout;
 mod memory;
 pub mod native;
+pub mod probes;
 mod resources;
 mod telemetry;

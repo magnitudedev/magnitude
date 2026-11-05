@@ -1,17 +1,17 @@
 //! The weight elements a CPU weight operand can be bound to and their
 //! components, from the registry: every floating dense element, and every
-//! packed element of a CPU row layout (`rows16`, `rows8`) that is its own
-//! storage, decoded by the components its decode axes name
-//! (`registry::decode_axes`, `packed`). Elements
-//! of one decode share one component, whatever their layout. Writes
-//! `$OUT_DIR/elements.rs`: `COMPONENT_OF`,
+//! packed element of a row layout that is its own storage (the CPU's
+//! `rows16` and `rows8`, the devices' `rows32` and `mma16`, each read where
+//! it lies: `weights::Placement`), decoded by the components its decode axes
+//! name (`registry::decode_axes`, `packed`). Elements of one decode share one
+//! component, whatever their layout. Writes `$OUT_DIR/elements.rs`: `COMPONENT_OF`,
 //! per registered element (in `registry::representations()` order) the index
 //! of its component, and `with_components!`, which passes the component types
 //! in index order to a macro.
 
 use seismic_lang::registry::{
-    self, CodeInterpretation, CodingAxes, GridSigns, Layout, LocalCodes, MinimumSign,
-    RepresentationKind, ScaleEncoding, ValueCodes,
+    self, CodeInterpretation, CodingAxes, GridSigns, LocalCodes, MinimumSign, RepresentationKind,
+    ScaleEncoding, ValueCodes,
 };
 use seismic_lang::types::DType;
 use std::fmt::Write as _;
@@ -142,10 +142,7 @@ fn main() {
             RepresentationKind::Dense(DType::F32) => "DenseRows<crate::element::F32>".to_owned(),
             RepresentationKind::Dense(DType::BF16) => "DenseRows<crate::element::Bf16>".to_owned(),
             RepresentationKind::Dense(DType::F16) => "DenseRows<crate::element::F16>".to_owned(),
-            RepresentationKind::PackedRows(rows)
-                if matches!(info.layout, Layout::Rows16 | Layout::Rows8)
-                    && registry::storage_of(info.id) == info.id =>
-            {
+            RepresentationKind::PackedRows(rows) if registry::storage_of(info.id) == info.id => {
                 packed(info.id, rows.group())
             }
             _ => {

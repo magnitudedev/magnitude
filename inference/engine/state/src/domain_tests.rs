@@ -8,11 +8,9 @@ use seismic::BackendName;
 const TOKEN: HistoryDomainId = HistoryDomainId(0);
 const WINDOW: HistoryDomainId = HistoryDomainId(1);
 
-fn cpu_device() -> Option<Rc<Device>> {
-    seismic::Devices::discover(&[])
-        .ok()
-        .and_then(|catalog| catalog.open_backend(BackendName::Cpu).ok())
-        .map(Rc::new)
+fn cpu_device() -> Rc<Device> {
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    Rc::new(catalog.open_backend(BackendName::Cpu).expect("the CPU backend opens"))
 }
 
 fn component(layer: u32, width: usize) -> ComponentDescriptor {
@@ -105,7 +103,7 @@ fn span_within_slab(ranges: &[(usize, usize)], slab_rows: usize) -> bool {
 
 #[test]
 fn window_histories_keep_their_last_rows() {
-    let Some(device) = cpu_device() else { return };
+    let device = cpu_device();
     let store = windowed_store(device, 64, 4, 8, 64, 1);
     let state = commit(store.create().unwrap(), 3);
     assert_eq!(state.history_start(WINDOW), 0);
@@ -141,7 +139,7 @@ fn window_histories_keep_their_last_rows() {
 
 #[test]
 fn windows_smaller_than_an_advance_write_every_row_then_trim() {
-    let Some(device) = cpu_device() else { return };
+    let device = cpu_device();
     let store = windowed_store(device, 64, 2, 8, 16, 1);
     let advance = OwnedStateAdvance::begin(store.create().unwrap(), 5)
         .ok()
@@ -173,7 +171,7 @@ fn windows_smaller_than_an_advance_write_every_row_then_trim() {
 
 #[test]
 fn tentative_window_rows_roll_back() {
-    let Some(device) = cpu_device() else { return };
+    let device = cpu_device();
     let store = windowed_store(device, 64, 3, 8, 16, 1);
     let state = commit(store.create().unwrap(), 5);
     let before = (state.domain_ranges(), store.occupied_rows(WINDOW));
@@ -190,7 +188,7 @@ fn tentative_window_rows_roll_back() {
 
 #[test]
 fn checkpoints_share_the_window_rows_without_copying() {
-    let Some(device) = cpu_device() else { return };
+    let device = cpu_device();
     let store = windowed_store(device, 64, 4, 8, 32, 1);
     let state = commit(store.create().unwrap(), 6);
     // A checkpoint at 6 references rows [2, 6).
@@ -238,7 +236,7 @@ fn checkpoints_share_the_window_rows_without_copying() {
 
 #[test]
 fn successors_follow_the_trimmed_window() {
-    let Some(device) = cpu_device() else { return };
+    let device = cpu_device();
     let store = windowed_store(device, 64, 2, 8, 32, 1);
     let first = OwnedStateAdvance::begin(store.create().unwrap(), 3)
         .ok()
@@ -274,7 +272,7 @@ fn successors_follow_the_trimmed_window() {
 /// freed by the release rule and its index reused.
 #[test]
 fn window_rows_cross_slab_edges_and_reuse_freed_slabs() {
-    let Some(device) = cpu_device() else { return };
+    let device = cpu_device();
     const WINDOW_ROWS: usize = 8;
     // 2 planes of 32768 F32 values: 256 KiB rows, 256 rows per slab.
     let width = 32768;
@@ -365,7 +363,7 @@ fn window_rows_cross_slab_edges_and_reuse_freed_slabs() {
 
     // Reclaim frees whichever slab the window does not occupy; the next
     // growth adds the lowest unbacked index again.
-    let before = device.storage_usage(seismic::StorageKind::Device).charged;
+    let before = device.device_ledger().charged;
     let released = bindings.shrink(ShrinkPolicy::Reclaim).unwrap();
     let occupied_slabs = state
         .history_ranges(WINDOW)
@@ -376,7 +374,7 @@ fn window_rows_cross_slab_edges_and_reuse_freed_slabs() {
     assert!(backed.len() <= 2);
     assert!(occupied_slabs.is_subset(&backed));
     if released > 0 {
-        assert!(device.storage_usage(seismic::StorageKind::Device).charged < before);
+        assert!(device.device_ledger().charged < before);
     }
     check(&state);
     for _ in 0..600 {
@@ -389,7 +387,7 @@ fn window_rows_cross_slab_edges_and_reuse_freed_slabs() {
 
 #[test]
 fn freed_window_slab_index_is_reused_by_growth() {
-    let Some(device) = cpu_device() else { return };
+    let device = cpu_device();
     let width = 32768;
     let mut store = windowed_store(device.clone(), 4096, 8, 4, 1024, width);
     let slab_rows = store.history_slab_rows(WINDOW);
@@ -411,9 +409,9 @@ fn freed_window_slab_index_is_reused_by_growth() {
     // Trimming released every row of slab 0, so it holds no referenced row
     // and the release rule frees it.
     assert_eq!(store.occupied_rows(WINDOW), 8);
-    let charged = device.storage_usage(seismic::StorageKind::Device).charged;
+    let charged = device.device_ledger().charged;
     assert!(store.shrink(ShrinkPolicy::Reclaim).unwrap() > 0);
-    assert!(device.storage_usage(seismic::StorageKind::Device).charged < charged);
+    assert!(device.device_ledger().charged < charged);
     assert_eq!(arena.borrow().backed, BTreeSet::from([1]));
     assert_eq!(store.compactions(), Compactions::default());
     // Growth backs the lowest unbacked index, the freed slab 0, again.
@@ -436,7 +434,7 @@ fn freed_window_slab_index_is_reused_by_growth() {
 /// only its slab regions are copied, and the other domain keeps its rows.
 #[test]
 fn relocation_moves_one_domain() {
-    let Some(device) = cpu_device() else { return };
+    let device = cpu_device();
     let mut store = windowed_store(device, 1024, 64, 1, 1024, 1);
     store
         .provision(
@@ -483,7 +481,7 @@ fn relocation_moves_one_domain() {
 /// other grows in place. (Regression #237.)
 #[test]
 fn sibling_forks_ending_together_relocate_all_but_one() {
-    let Some(device) = cpu_device() else { return };
+    let device = cpu_device();
     let mut store = windowed_store(device, 1024, 64, 1, 1024, 1);
     store
         .provision(
@@ -528,7 +526,7 @@ fn sibling_forks_ending_together_relocate_all_but_one() {
 }
 #[test]
 fn shrink_and_census_cover_every_domain() {
-    let Some(device) = cpu_device() else { return };
+    let device = cpu_device();
     let mut store = windowed_store(device.clone(), 8192, 16, 4, 8192, 4096);
     let window_slab = store.history_slab_rows(WINDOW);
     // Three window slabs: the growth claim is the two added.
@@ -538,7 +536,7 @@ fn shrink_and_census_cover_every_domain() {
     }];
     let slab_bytes = store.backing.borrow().history[WINDOW.0].slabs.slab_bytes();
     assert_eq!(
-        store.growth_claim(&demand, 0).unwrap().minimum_bytes,
+        store.growth_claim(&demand, &[], 0).unwrap().minimum_bytes,
         2 * slab_bytes
     );
     store.provision(&demand, 0).unwrap();
@@ -547,15 +545,15 @@ fn shrink_and_census_cover_every_domain() {
         .holding_census(&[Holder::State(&state)], &[], &[])
         .unwrap();
     assert_eq!(census.total(), store.committed_bytes());
-    assert_eq!(census.total(), device.storage_usage(seismic::StorageKind::Device).charged);
+    assert_eq!(census.total(), device.device_ledger().charged);
     assert_eq!(
         census.live,
         40 * store.history_row_bytes(TOKEN) + 16 * store.history_row_bytes(WINDOW)
     );
-    let charged = device.storage_usage(seismic::StorageKind::Device).charged;
+    let charged = device.device_ledger().charged;
     // Idle keeps each domain's occupied slabs and one spare.
     assert_eq!(store.shrink(ShrinkPolicy::Idle).unwrap(), slab_bytes);
-    assert!(device.storage_usage(seismic::StorageKind::Device).charged < charged);
+    assert!(device.device_ledger().charged < charged);
     assert_eq!(store.domains[TOKEN.0].arena.borrow().backed.len(), 1);
     assert_eq!(store.domains[WINDOW.0].arena.borrow().backed.len(), 2);
     assert_eq!(
@@ -633,7 +631,7 @@ fn span_limits_follow_each_domain_row_limit() {
 
 #[test]
 fn shared_layers_bind_their_source_regions() {
-    let Some(device) = cpu_device() else { return };
+    let device = cpu_device();
     let store = StateStore::new(
         device,
         16,
@@ -683,7 +681,7 @@ fn shared_layers_bind_their_source_regions() {
 /// same rows per slab, span bound, plane numbering, first slab and bytes.
 #[test]
 fn a_single_token_domain_is_the_one_domain_store() {
-    let Some(device) = cpu_device() else { return };
+    let device = cpu_device();
     let components = vec![component(0, 4096), component(3, 4096)];
     let row_bytes = 2 * 2 * 4096 * 4;
     let store = StateStore::new(
@@ -745,7 +743,7 @@ fn a_single_token_domain_is_the_one_domain_store() {
     let first = commit(first, 3);
     assert_eq!(first.history_ranges(TOKEN), [(0, 13)]);
     assert_eq!(first.history_start(TOKEN), 0);
-    assert_eq!(store.committed_bytes(), device.storage_usage(seismic::StorageKind::Device).charged);
+    assert_eq!(store.committed_bytes(), device.device_ledger().charged);
 }
 
 /// A Token domain and one selected-attention indexer of blocks of four: its
@@ -792,11 +790,11 @@ fn indexed_store(device: Rc<Device>, context: usize, max_advance: usize) -> Stor
 
 #[test]
 fn block_histories_hold_the_complete_blocks() {
-    let Some(device) = cpu_device() else { return };
+    let device = cpu_device();
     let store = indexed_store(device, 64, 16);
     // The indexer's domains follow the one attention reads; a launch row
     // reads each.
-    assert_eq!(store.history_reads(), 3);
+    assert_eq!(store.history_reads().len(), 3);
     assert_eq!(store.indexer_domains(0), Some((RAW, BLOCKS)));
     // Raw keys carry their coordinates; block keys do not.
     assert_eq!(store.history_components(RAW)[0].planes().len(), 2);
@@ -824,7 +822,7 @@ fn block_histories_hold_the_complete_blocks() {
 
 #[test]
 fn rollback_keeps_the_blocks_of_the_accepted_prefix() {
-    let Some(device) = cpu_device() else { return };
+    let device = cpu_device();
     let store = indexed_store(device, 64, 16);
     let state = commit(store.create().unwrap(), 6);
     let before = state.history_ranges(BLOCKS);
@@ -856,7 +854,7 @@ fn rollback_keeps_the_blocks_of_the_accepted_prefix() {
 
 #[test]
 fn checkpoints_and_successors_share_the_block_rows() {
-    let Some(device) = cpu_device() else { return };
+    let device = cpu_device();
     let store = indexed_store(device, 64, 16);
     let state = commit(store.create().unwrap(), 9);
     // A checkpoint at 9 references blocks [0, 2).
@@ -892,7 +890,7 @@ fn checkpoints_and_successors_share_the_block_rows() {
 
 #[test]
 fn indexer_domains_follow_the_attended_ones() {
-    let Some(device) = cpu_device() else { return };
+    let device = cpu_device();
     let keys = ComponentDescriptor::indexer(LayerRef::Indexer(0), DType::F32, 4, false).unwrap();
     let plans = vec![
         HistoryDomainPlan {

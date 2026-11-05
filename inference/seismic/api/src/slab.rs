@@ -1,4 +1,5 @@
 use crate::{Device, Element, Tensor, TensorError, TensorStorageObserver};
+use seismic_runtime::api::tensor::Ordinary;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -91,9 +92,11 @@ fn layout_regions(
 
 /// One physical allocation, with typed component views over disjoint regions.
 /// Cloned views and submitted work retain the allocation after its slot is freed.
+/// Its storage is ordinary, so its address, which the store's table holds, is
+/// fixed for its life.
 pub struct Slab {
-    storage: Tensor,
-    regions: Vec<Tensor>,
+    storage: Ordinary,
+    regions: Vec<Ordinary>,
 }
 
 impl Slab {
@@ -101,19 +104,18 @@ impl Slab {
         self.storage.device_address()
     }
 
-    pub fn region(&self, index: usize) -> Option<&Tensor> {
-        self.regions.get(index)
+    pub fn region(&self, index: usize) -> Option<Tensor> {
+        self.regions.get(index).map(Tensor::of_ordinary)
     }
 
     pub fn observe_storage(&self) -> TensorStorageObserver {
-        self.storage.observe_storage()
+        Tensor::of_ordinary(&self.storage).observe_storage()
     }
 }
 
 /// Fixed-size allocations backing a common logical row domain. Indices are
 /// stable while allocated, and the lowest freed index is reused first.
 pub struct SlabTensor {
-    device: Device,
     rows_per_slab: u64,
     logical_rows: u64,
     capacity: usize,
@@ -122,9 +124,8 @@ pub struct SlabTensor {
     offsets: Vec<u64>,
     slab_bytes: u64,
     slabs: Vec<Option<Slab>>,
-    addresses: Tensor,
-    region_tables: Vec<Tensor>,
-    address_words: Vec<u8>,
+    addresses: Ordinary,
+    region_tables: Vec<Ordinary>,
     lease: Arc<AtomicUsize>,
 }
 
@@ -135,11 +136,35 @@ impl SlabTensor {
         logical_rows: u64,
         regions: Vec<SlabRegion>,
     ) -> Result<Self, TensorError> {
+        Self::new_in(device, rows_per_slab, logical_rows, regions, None)
+    }
+
+    fn new_in(
+        device: &Device,
+        rows_per_slab: u64,
+        logical_rows: u64,
+        regions: Vec<SlabRegion>,
+        backing: Option<&[Ordinary]>,
+    ) -> Result<Self, TensorError> {
         let (bytes, offsets, capacity, _) = layout_regions(rows_per_slab, logical_rows, &regions)?;
+        if let Some(slabs) = backing {
+            if slabs.len() != capacity || slabs.iter().any(|slab| {
+                slab.byte_len() != bytes || !Arc::ptr_eq(slab.device(), device.inner())
+                    || !slab.shares_allocation(&slabs[0])
+            }) {
+                return Err(TensorError::SlabLayout(
+                    "a store over storage takes one slab of its slab bytes per slot, all views of one allocation on its device".into(),
+                ));
+            }
+        }
         let capacity_u64 = capacity as u64;
         let region_count = u64::try_from(regions.len())
             .map_err(|_| TensorError::SlabLayout("region count exceeds u64".into()))?;
-        let table = Tensor::zeros(device, Element::u32(), &[region_count, capacity_u64, 2])?;
+        let extents = [region_count, capacity_u64, 2];
+        let table = match backing.and_then(|slabs| slabs.first()) {
+            Some(storage) => Ordinary::zeros_sharing_access(storage, Element::u32().id(), &extents)?,
+            None => Ordinary::zeros(device.inner(), Element::u32().id(), &extents)?,
+        };
         let region_tables = (0..region_count)
             .map(|region| {
                 table
@@ -147,10 +172,7 @@ impl SlabTensor {
                     .reshape(&[capacity_u64, 2])
             })
             .collect::<Result<Vec<_>, TensorError>>()?;
-        let table_bytes = usize::try_from(table.byte_len())
-            .map_err(|_| TensorError::SlabLayout("address table exceeds host domain".into()))?;
         Ok(Self {
-            device: device.clone(),
             rows_per_slab,
             logical_rows,
             capacity,
@@ -163,16 +185,16 @@ impl SlabTensor {
             slabs: Vec::new(),
             addresses: table,
             region_tables,
-            address_words: vec![0; table_bytes],
             lease: Arc::new(AtomicUsize::new(0)),
         })
     }
 
     /// A store whose every slot is backed, in slot order, by one of `slabs`:
-    /// tensors of [`Self::slab_bytes`] bytes each, all views of one
-    /// allocation the caller made (its contents are the slabs'), on
-    /// `device`. The store's address table joins that allocation's hazard
-    /// domain, so one fence orders every access to either.
+    /// tensors of [`Self::slab_bytes`] bytes each, all views of one ordinary
+    /// allocation (never a reservation) the caller made (its contents are
+    /// the slabs'), on `device`. The store's address table joins that
+    /// allocation's hazard domain, so one fence orders every access to
+    /// either.
     pub fn over(
         device: &Device,
         rows_per_slab: u64,
@@ -180,22 +202,17 @@ impl SlabTensor {
         regions: Vec<SlabRegion>,
         slabs: Vec<Tensor>,
     ) -> Result<Self, TensorError> {
-        let mut store = Self::new(device, rows_per_slab, logical_rows, regions)?;
-        if slabs.len() != store.capacity
-            || slabs.iter().any(|slab| {
-                slab.byte_len() != store.slab_bytes
-                    || !slab.belongs_to(device)
-                    || !slab.shares_allocation(&slabs[0])
-            })
-        {
-            return Err(TensorError::SlabLayout(
-                "a store over storage takes one slab of its slab bytes per slot, all views of one \
-                 allocation on its device"
-                    .into(),
-            ));
-        }
-        store.addresses.share_slab_access_with(&slabs[0]);
-        store.slabs = slabs
+        let ordinary = slabs
+            .iter()
+            .map(Tensor::ordinary)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                TensorError::SlabLayout(
+                    "a store over storage takes ordinary storage, never a reservation".into(),
+                )
+            })?;
+        let mut store = Self::new_in(device, rows_per_slab, logical_rows, regions, Some(&ordinary))?;
+        store.slabs = ordinary
             .into_iter()
             .map(|storage| store.backed(storage).map(Some))
             .collect::<Result<_, _>>()?;
@@ -230,8 +247,8 @@ impl SlabTensor {
 
     /// Two little-endian u32 words per slab address, already offset to this
     /// component's region. All region tables share one fixed allocation.
-    pub(crate) fn address_table(&self, region: usize) -> Option<&Tensor> {
-        self.region_tables.get(region)
+    pub(crate) fn address_table(&self, region: usize) -> Option<Tensor> {
+        self.region_tables.get(region).map(Tensor::of_ordinary)
     }
 
     pub fn region_offset(&self, index: usize) -> Option<u64> {
@@ -298,7 +315,7 @@ impl SlabTensor {
         let views = (0..self.capacity)
             .map(|index| {
                 self.slab(index)
-                    .and_then(|slab| slab.region(region))
+                    .and_then(|slab| slab.regions.get(region))
                     .cloned()
             })
             .collect();
@@ -331,8 +348,8 @@ impl SlabTensor {
         if index >= self.capacity {
             return Err(TensorError::SlabLayout("all slab slots are backed".into()));
         }
-        let storage = Tensor::zeros(&self.device, Element::bool(), &[self.slab_bytes])?;
-        storage.share_slab_access_with(&self.addresses);
+        let storage =
+            Ordinary::zeros_sharing_access(&self.addresses, Element::bool().id(), &[self.slab_bytes])?;
         let slab = self.backed(storage)?;
         if index == self.slabs.len() {
             self.slabs.push(None);
@@ -346,7 +363,7 @@ impl SlabTensor {
     }
 
     /// A slab over `storage`: each region a typed view of its bytes.
-    fn backed(&self, storage: Tensor) -> Result<Slab, TensorError> {
+    fn backed(&self, storage: Ordinary) -> Result<Slab, TensorError> {
         let regions = self
             .regions
             .iter()
@@ -355,7 +372,7 @@ impl SlabTensor {
                 let extents = std::iter::once(self.rows_per_slab)
                     .chain(region.row_shape.iter().copied())
                     .collect::<Vec<_>>();
-                storage.region(region.element, &extents, offset)
+                storage.region(region.element.id(), &extents, offset)
             })
             .collect::<Result<_, _>>()?;
         Ok(Slab { storage, regions })
@@ -363,6 +380,14 @@ impl SlabTensor {
 
     /// Remove one slab. The observer reports when all device uses and views
     /// actually release its charge; removing a slot alone grants no credit.
+    ///
+    /// Blocks until submitted work that uses the slab store completes:
+    /// republishing the address table is a host write, which waits for
+    /// every device use of the table and the slabs (one hazard group), and
+    /// where nothing else still owns the freed slab its storage is released
+    /// here once that work completes. It refuses (`SlabLayout`) while a
+    /// slab view lives: a caller's, or one a submission holds until it
+    /// records its fences.
     pub fn free_slab(
         &mut self,
         index: usize,
@@ -386,7 +411,11 @@ impl SlabTensor {
     /// history rows to read.
     fn publish_addresses(&mut self) -> Result<(), TensorError> {
         let stand_in = self.slabs().next().map(|(_, slab)| slab.device_address());
-        let mut next = vec![0; self.address_words.len()];
+        // Built once per publish and written whole: the host keeps no copy
+        // of the table beside the device's.
+        let table_bytes = usize::try_from(self.addresses.byte_len())
+            .map_err(|_| TensorError::SlabLayout("address table exceeds host domain".into()))?;
+        let mut next = vec![0; table_bytes];
         for index in 0..self.capacity {
             let Some(base) = self
                 .slab(index)
@@ -403,11 +432,7 @@ impl SlabTensor {
                 next[position..position + 8].copy_from_slice(&address.to_le_bytes());
             }
         }
-        if next != self.address_words {
-            self.addresses.write_from_host(&next)?;
-            self.address_words = next;
-        }
-        Ok(())
+        self.addresses.write_from_host(&next)
     }
 
     fn ensure_unbound(&self) -> Result<(), TensorError> {
@@ -485,6 +510,12 @@ mod tests {
             logical.descriptor().allocation,
             sibling.descriptor().allocation
         );
+        // Each region's view describes its own logical tensor from 0, however
+        // far into the address table its entries lie.
+        for view in [&logical, &sibling] {
+            let descriptor = view.descriptor();
+            assert_eq!((descriptor.byte_offset, descriptor.byte_len), (0, view.byte_len()));
+        }
         assert_eq!(logical.slice_leading(255, 256).unwrap().extents(), &[1, 2]);
         assert!(logical.slice_leading(255, 257).is_err());
         assert_eq!(logical.read_to_host().unwrap().len(), 768 * 2 * 4);
@@ -492,7 +523,7 @@ mod tests {
         assert!(slab
             .region(0)
             .unwrap()
-            .shares_allocation(slab.region(1).unwrap()));
+            .shares_allocation(&slab.region(1).unwrap()));
         assert_eq!(
             slab.region(1).unwrap().device_address(),
             slab.device_address() + tensor.region_offset(1).unwrap()
@@ -530,7 +561,7 @@ mod tests {
         tensor.free_slab(second).unwrap();
         assert_eq!(entry(&tensor, 0, 0), [0; 8]);
         tensor.add_slab().unwrap();
-        assert!(!view.shares_allocation(tensor.slab(first).unwrap().region(0).unwrap()));
+        assert!(!view.shares_allocation(&tensor.slab(first).unwrap().region(0).unwrap()));
         drop(view);
         assert_eq!(observer.charged_bytes(), None);
     }
@@ -562,6 +593,46 @@ mod tests {
             drop(row);
             assert_eq!(observer.charged_bytes(), None);
             assert_eq!(tensor.add_slab().unwrap(), 0);
+        }
+    }
+
+    /// Zeroed storage and a slab added in place of a freed one read zero on
+    /// every backend, whatever the storage they may reuse held: fresh
+    /// allocations are not written a second time where the backend clears
+    /// them.
+    #[test]
+    fn fresh_storage_reads_zero_on_every_available_backend() {
+        let catalog = Devices::discover(&[]).unwrap();
+        for info in catalog.topology().executors() {
+            if !matches!(info.availability(), Availability::Available) {
+                continue;
+            }
+            let device = catalog.open(info.id()).unwrap();
+            for bytes in [64u64, 16 << 10, 4 << 20] {
+                for _ in 0..4 {
+                    let mut tensor = Tensor::zeros(&device, Element::bool(), &[bytes]).unwrap();
+                    assert!(tensor.read_to_host().unwrap().iter().all(|byte| *byte == 0));
+                    tensor.write_from_host(&vec![0xa5; bytes as usize]).unwrap();
+                }
+            }
+            let mut store = SlabTensor::new(
+                &device,
+                256,
+                256,
+                vec![SlabRegion {
+                    element: Element::f32(),
+                    row_shape: vec![1024],
+                }],
+            )
+            .unwrap();
+            for _ in 0..4 {
+                let index = store.add_slab().unwrap();
+                let mut rows = store.region_rows(0, 0, 256).unwrap();
+                assert!(rows.read_to_host().unwrap().iter().all(|byte| *byte == 0));
+                rows.write_from_host(&vec![0xa5; 256 * 1024 * 4]).unwrap();
+                drop(rows);
+                store.free_slab(index).unwrap();
+            }
         }
     }
 

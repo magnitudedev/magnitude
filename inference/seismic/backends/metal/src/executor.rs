@@ -66,7 +66,7 @@ struct WordTableRead {
 
 impl WordTableRead {
     fn overlaps(&self, other: &Self) -> bool {
-        std::ptr::eq(self.buffer.raw(), other.buffer.raw())
+        std::ptr::eq(&*self.buffer.raw(), &*other.buffer.raw())
             && self.bytes.start < other.bytes.end
             && other.bytes.start < self.bytes.end
     }
@@ -211,7 +211,8 @@ impl MetalSubmission {
         self.pending
             .retain(|pending| !pending.words.overlaps(&words));
         completed?;
-        words.buffer.write_bytes(words.bytes.start, &bytes);
+        // The schedule plans the word table as this submission's own input.
+        unsafe { words.buffer.write_device_bytes(words.bytes.start, &bytes) };
         Ok(words)
     }
 
@@ -314,18 +315,18 @@ impl MetalSubmission {
             encoder.setComputePipelineState(&kernel.state);
             for (index, (buffer, offset)) in resolved.iter().enumerate() {
                 unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(buffer.raw()), *offset as usize, index)
+                    encoder.setBuffer_offset_atIndex(Some(&buffer.raw()), *offset as usize, index)
                 }
             }
             let first_aux = bindings.len();
             unsafe {
                 encoder.setBuffer_offset_atIndex(
-                    Some(word_table.buffer.raw()),
+                    Some(&word_table.buffer.raw()),
                     word_table.bytes.start as usize,
                     first_aux,
                 );
                 encoder.setBuffer_offset_atIndex(
-                    Some(results.buffer.raw()),
+                    Some(&results.buffer.raw()),
                     results.base_offset as usize,
                     first_aux + 1,
                 );
@@ -376,8 +377,9 @@ impl MetalSubmission {
         let mut data = vec![0u8; bytes as usize];
         self.device
             .read(source.buffer, source.byte_offset, &mut data)?;
-        self.device
-            .write(destination.buffer, destination.byte_offset, &data)
+        // The schedule plans the destination as written by this command.
+        unsafe { destination.buffer.write_device_bytes(destination.byte_offset, &data) };
+        Ok(())
     }
     fn fill(
         &self,
@@ -392,8 +394,9 @@ impl MetalSubmission {
         for (index, byte) in data.iter_mut().enumerate() {
             *byte = pattern[index % pattern.len()];
         }
-        self.device
-            .write(destination.buffer, destination.byte_offset, &data)
+        // The schedule plans the destination as written by this command.
+        unsafe { destination.buffer.write_device_bytes(destination.byte_offset, &data) };
+        Ok(())
     }
     fn scalar_read(
         &self,
@@ -501,11 +504,11 @@ mod completion_tests {
         encoder.setComputePipelineState(pipeline);
         unsafe {
             encoder.setBuffer_offset_atIndex(
-                Some(words.buffer.raw()),
+                Some(&words.buffer.raw()),
                 words.bytes.start as usize,
                 0,
             );
-            encoder.setBuffer_offset_atIndex(Some(output.raw()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&output.raw()), 0, 1);
         }
         let one = MTLSize {
             width: 1,
@@ -534,7 +537,7 @@ mod completion_tests {
         device.write(&output, 0, &vec![0xff; 64 * 8]).unwrap();
         let table = RuntimeBuffer {
             tensor: None,
-            buffer: device.allocate_bytes(32).unwrap(),
+            buffer: MetalBuffer::clone(&device.allocate_bytes(32).unwrap()),
             base_offset: 8,
             accessible_bytes: 16,
         };
@@ -580,7 +583,7 @@ mod completion_tests {
                 &pipeline,
                 &RuntimeBuffer {
                     tensor: None,
-                    buffer: buffer.clone(),
+                    buffer: MetalBuffer::clone(buffer),
                     base_offset: offset,
                     accessible_bytes: 16,
                 },
@@ -595,7 +598,7 @@ mod completion_tests {
         );
         let middle = RuntimeBuffer {
             tensor: None,
-            buffer: shared,
+            buffer: MetalBuffer::clone(&shared),
             base_offset: 8,
             accessible_bytes: 16,
         };
@@ -608,8 +611,8 @@ mod completion_tests {
             "only the two overlapping readers are completed"
         );
         assert!(std::ptr::eq(
-            submission.pending[0].words.buffer.raw(),
-            separate.raw()
+            &*submission.pending[0].words.buffer.raw(),
+            &*separate.raw()
         ));
         submission.submit().complete().unwrap();
         assert_eq!(captured_words(&device, &output), vec![11, 12, 13]);
@@ -640,7 +643,7 @@ unsafe fn set_optional_buffer(
 ) {
     match buffer {
         Some(buffer) => encoder.setBuffer_offset_atIndex(
-            Some(buffer.buffer.raw()),
+            Some(&buffer.buffer.raw()),
             buffer.base_offset as usize,
             index,
         ),

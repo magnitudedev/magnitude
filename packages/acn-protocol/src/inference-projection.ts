@@ -6,7 +6,46 @@ import type {
   ModelLoadPlan,
   ModelResidency,
 } from "@magnitudedev/acn-protocol"
-import { LocalInferenceDeviceIdSchema } from "./schemas/model-state"
+import {
+  LocalInferenceDeviceIdSchema,
+  LocalInferenceMemoryDomainIdSchema,
+  type ModelStreamingStatus,
+  type StreamingResize,
+} from "./schemas/model-state"
+
+const projectInferenceResize = (resize: InferenceSchema.StreamingResize): StreamingResize =>
+  resize._tag === "Shrank"
+    ? { _tag: "Shrank", cause: resize.cause, to: resize.to, by: resize.by, atUnixMs: resize.atUnixMs }
+    : { _tag: "Grew", from: resize.from, by: resize.by, atUnixMs: resize.atUnixMs }
+
+const projectInferenceStreaming = (
+  streaming: InferenceSchema.ModelStreamingStatus,
+): ModelStreamingStatus => ({
+  experts: streaming.experts,
+  slots: streaming.slots,
+  floorSlots: streaming.floorSlots,
+  ceilingSlots: streaming.ceilingSlots,
+  tiers: streaming.tiers.map((tier) => ({
+    memoryDomainId: LocalInferenceMemoryDomainIdSchema.make(tier.memoryDomainId),
+    bytes: tier.bytes,
+  })),
+  host: Option.map(streaming.host, (host) => ({
+    memoryDomainId: LocalInferenceMemoryDomainIdSchema.make(host.memoryDomainId),
+    slots: host.slots,
+    ceilingSlots: host.ceilingSlots,
+    bytes: host.bytes,
+    lastResize: Option.map(host.lastResize, projectInferenceResize),
+  })),
+  diskBytes: streaming.diskBytes,
+  tables: streaming.tables.map((table) => ({
+    records: table.records,
+    floorRecords: table.floorRecords,
+    ceilingRecords: table.ceilingRecords,
+    bytes: table.bytes,
+    lastResize: Option.map(table.lastResize, projectInferenceResize),
+  })),
+  lastResize: Option.map(streaming.lastResize, projectInferenceResize),
+})
 
 export const projectInferenceAllocation = (
   allocation: InferenceSchema.ModelInstanceAllocation,
@@ -19,6 +58,8 @@ export const projectInferenceAllocation = (
     computeBytes: domain.computeBytes,
     auxiliaryBytes: domain.auxiliaryBytes,
   })),
+  promptGroupPlaces: allocation.promptGroupPlaces,
+  streaming: Option.map(allocation.streaming, projectInferenceStreaming),
 })
 
 export const projectInferenceLoadDevice = (

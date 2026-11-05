@@ -38,7 +38,7 @@
 
 native dense_expand for cuda from "cuda/dense_expand.cu":
     static (H, F, GS, US)
-    params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1])
+    params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0)
     where H % 64 == 0 and GS <= 1 and US <= 1 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or (form(GW, INT8) == 1 and form(UW, INT8) == 1))
     scratch staged bytes (O * H * 2) when O > 1
     scratch groups bytes (O * H / 4) when INT8 == 1 and O > 16
@@ -47,12 +47,12 @@ native dense_expand for cuda from "cuda/dense_expand.cu":
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch dense_expand_gemv when O <= 8:
-        params (code arithmetic KSPLIT in [4, 2, 8])
+        params (arithmetic KSPLIT in [4, 2, 8] default 4)
         threadgroups (ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes ((1 - min(1, O - 1)) * H * 2)
     launch dense_expand_gemv16 when O > 8 and O <= 16:
-        params (code arithmetic KSPLIT in [4, 2, 8])
+        params (arithmetic KSPLIT in [4, 2, 8] default 4)
         threadgroups (ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch dense_expand_gemm_small when O > 16 and O <= 64:
@@ -61,7 +61,7 @@ native dense_expand for cuda from "cuda/dense_expand.cu":
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (64 * 144 + 2 * 10240) + 2 * 2048)
     launch dense_expand_gemm when O > 64:
-        params (code ROTATE in [2, 1, 4])
+        params (ROTATE in [2, 1, 4] default 2)
         reads (INT8, OPERAND)
         threadgroups (ceil_div(ceil_div(F, 16), 8), ceil_div(O, 128), 1)
         threads_per_threadgroup (256, 1, 1)
@@ -70,7 +70,7 @@ native dense_expand for cuda from "cuda/dense_expand.cu":
 # `dense_expand`'s bands with one weight stream.
 native dense_up for cuda from "cuda/dense_up.cu":
     static (H, F, US)
-    params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1], code arithmetic KSPLIT in [4, 2, 8])
+    params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0, arithmetic KSPLIT in [4, 2, 8] default 4)
     where H % 64 == 0 and US <= 1 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or form(UW, INT8) == 1) and (RESIDENCY == 1 or form(UW, GEMV_RECORDS) == 0)
     scratch staged bytes (O * H * 2) when O > 1
     scratch groups bytes (O * H / 4) when INT8 == 1 and O > 16
@@ -79,7 +79,7 @@ native dense_up for cuda from "cuda/dense_up.cu":
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch dense_up_gemv when O <= 8:
-        params (code RESIDENCY in [1, 2])
+        params (RESIDENCY in [1, 2] default 1)
         reads (KSPLIT)
         threadgroups (ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -94,7 +94,7 @@ native dense_up for cuda from "cuda/dense_up.cu":
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (64 * 144 + 10240) + 2048)
     launch dense_up_gemm when O > 64:
-        params (code ROTATE in [2, 1, 4])
+        params (ROTATE in [2, 1, 4] default 2)
         reads (INT8, OPERAND)
         threadgroups (ceil_div(ceil_div(F, 16), 8), ceil_div(O, 128), 1)
         threads_per_threadgroup (256, 1, 1)
@@ -104,7 +104,7 @@ native dense_up for cuda from "cuda/dense_up.cu":
 # paired) then C (one stream).
 native short_conv_project for cuda from "cuda/short_conv_project.cu":
     static (H, CH, BS, CS, XS)
-    params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1])
+    params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0)
     where H > 0 and H % 64 == 0 and BS <= 1 and CS <= 1 and XS <= 1 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or (form(BW, INT8) == 1 and form(XW, INT8) == 1 and form(CW, INT8) == 1))
     scratch staged bytes (M * H * 2) when M > 1
     scratch groups bytes (M * H / 4) when INT8 == 1 and M > 16
@@ -113,12 +113,12 @@ native short_conv_project for cuda from "cuda/short_conv_project.cu":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch short_conv_project_gemv when M <= 8:
-        params (code arithmetic KSPLIT in [4, 2, 8])
+        params (arithmetic KSPLIT in [4, 2, 8] default 4)
         threadgroups (ceil_div(2 * ceil_div(CH, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes ((1 - min(1, M - 1)) * H * 2)
     launch short_conv_project_gemv16 when M > 8 and M <= 16:
-        params (code arithmetic KSPLIT in [4, 2, 8])
+        params (arithmetic KSPLIT in [4, 2, 8] default 4)
         threadgroups (ceil_div(2 * ceil_div(CH, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch short_conv_project_gemm_small when M > 16 and M <= 64:
@@ -127,7 +127,7 @@ native short_conv_project for cuda from "cuda/short_conv_project.cu":
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (64 * 144 + 2 * 10240) + 2 * 2048)
     launch short_conv_project_gemm when M > 64:
-        params (code ROTATE in [2, 1, 4])
+        params (ROTATE in [2, 1, 4] default 2)
         reads (INT8, OPERAND)
         threadgroups (2 * ceil_div(ceil_div(CH, 16), 8), ceil_div(M, 128), 1)
         threads_per_threadgroup (256, 1, 1)
@@ -137,7 +137,7 @@ native short_conv_project for cuda from "cuda/short_conv_project.cu":
 # matrix operands; `project_rows`' row bands share that operand policy.
 native per_layer_gate for cuda from "cuda/per_layer_gate.cu":
     static (D, L, P, GS)
-    params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1])
+    params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0)
     where D % 64 == 0 and GS <= 1 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or form(GW, INT8) == 1)
     scratch staged bytes (M * D * 2)
     scratch groups bytes (M * D / 4) when INT8 == 1 and M > 16
@@ -146,11 +146,11 @@ native per_layer_gate for cuda from "cuda/per_layer_gate.cu":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch per_layer_gate_gemv when M <= 8:
-        params (code arithmetic KSPLIT in [4, 2, 8])
+        params (arithmetic KSPLIT in [4, 2, 8] default 4)
         threadgroups (ceil_div(ceil_div(P, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch per_layer_gate_gemv16 when M > 8 and M <= 16:
-        params (code arithmetic KSPLIT in [4, 2, 8])
+        params (arithmetic KSPLIT in [4, 2, 8] default 4)
         threadgroups (ceil_div(ceil_div(P, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch per_layer_gate_gemm_small when M > 16 and M <= 64:
@@ -159,7 +159,7 @@ native per_layer_gate for cuda from "cuda/per_layer_gate.cu":
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (64 * 144 + 10240) + 2048)
     launch per_layer_gate_gemm when M > 64:
-        params (code ROTATE in [2, 1, 4])
+        params (ROTATE in [2, 1, 4] default 2)
         reads (INT8, OPERAND)
         threadgroups (ceil_div(ceil_div(P, 16), 8), ceil_div(M, 128), 1)
         threads_per_threadgroup (256, 1, 1)
@@ -170,7 +170,7 @@ native per_layer_gate for cuda from "cuda/per_layer_gate.cu":
 # epilogue in Y.
 native project_rows for cuda from "cuda/project_rows.cu":
     static (K, N, WS)
-    params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1])
+    params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0)
     where K % 64 == 0 and WS <= 1 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or form(W, INT8) == 1)
     scratch staged bytes (M * K * max(1 + OPERAND, 2 * operands(W))) when (M > 1 and operands(W) == 1) or (M > 16 and (INT8 == 1 or OPERAND == 1))
     scratch groups bytes (M * K / 4) when INT8 == 1 and M > 16
@@ -180,12 +180,12 @@ native project_rows for cuda from "cuda/project_rows.cu":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch project_rows_gemv when M <= 8:
-        params (code arithmetic KSPLIT in [4, 2, 8])
+        params (arithmetic KSPLIT in [4, 2, 8] default 4)
         threadgroups (ceil_div(ceil_div(N, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (operands(W) * (1 - min(1, M - 1)) * K * 2)
     launch project_rows_gemv16 when M > 8 and M <= 16:
-        params (code arithmetic KSPLIT in [4, 2, 8])
+        params (arithmetic KSPLIT in [4, 2, 8] default 4)
         threadgroups (ceil_div(ceil_div(N, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch project_rows_gemm_small when M > 16 and M <= 64:
@@ -194,7 +194,7 @@ native project_rows for cuda from "cuda/project_rows.cu":
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (64 * 144 + 10240) + 2048)
     launch project_rows_gemm when M > 64:
-        params (code ROTATE in [2, 1, 4])
+        params (ROTATE in [2, 1, 4] default 2)
         reads (INT8, OPERAND)
         threadgroups (ceil_div(ceil_div(N, 16), 8), ceil_div(M, 128), 1 + min(1, 128 / M))
         threads_per_threadgroup (256, 1, 1)
@@ -205,7 +205,7 @@ native project_rows for cuda from "cuda/project_rows.cu":
 
 native dense_output for cuda from "cuda/dense_output.cu":
     static (H, F, DS)
-    params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1], code arithmetic KSPLIT in [4, 2, 8])
+    params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0, arithmetic KSPLIT in [4, 2, 8] default 4)
     where F % 64 == 0 and DS <= 1 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or form(DW, INT8) == 1) and (RESIDENCY == 1 or form(DW, GEMV_RECORDS) == 0)
     scratch staged bytes (O * F * max(1 + OPERAND, 2 * operands(DW))) when (O > 1 and operands(DW) == 1) or (O > 16 and (INT8 == 1 or OPERAND == 1))
     scratch groups bytes (O * F / 4) when INT8 == 1 and O > 16
@@ -215,7 +215,7 @@ native dense_output for cuda from "cuda/dense_output.cu":
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch dense_output_gemv when O <= 8:
-        params (code RESIDENCY in [1, 2])
+        params (RESIDENCY in [1, 2] default 1)
         reads (KSPLIT)
         threadgroups (ceil_div(ceil_div(H, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -230,7 +230,7 @@ native dense_output for cuda from "cuda/dense_output.cu":
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (64 * 144 + 10240) + 2048)
     launch dense_output_gemm when O > 64:
-        params (code ROTATE in [2, 1, 4])
+        params (ROTATE in [2, 1, 4] default 2)
         reads (INT8, OPERAND)
         threadgroups (ceil_div(ceil_div(H, 16), 8), ceil_div(O, 128), 1 + min(1, 128 / O))
         threads_per_threadgroup (256, 1, 1)

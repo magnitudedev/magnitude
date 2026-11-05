@@ -5,6 +5,8 @@
 // geometries and 512-column heads, long contexts).
 #![allow(dead_code)]
 
+mod common;
+
 use magnitude_kernels::{attention_append_k8v4, attention_decode_k8v4, attention_prefill_k8v4};
 use seismic::{
     BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor,
@@ -459,31 +461,11 @@ macro_rules! prefill_args {
 }
 
 /// The devices with k8v4 natives: every accelerator present (Metal, CUDA,
-/// Vulkan) and the CPU. A selected backend must open so qualification cannot
-/// pass by silently running on another device.
+/// Vulkan) and the CPU, or the requested backend alone
+/// ([`seismic_native_tests::devices`]).
 fn k8v4_devices() -> Vec<Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    if let Ok(selected) = std::env::var("SEISMIC_TEST_BACKEND") {
-        let backend = match selected.as_str() {
-            "metal" => BackendName::Metal,
-            "cuda" => BackendName::Cuda,
-            "vulkan" => BackendName::Vulkan,
-            "cpu" => BackendName::Cpu,
-            other => panic!("unsupported SEISMIC_TEST_BACKEND={other}"),
-        };
-        return vec![
-            catalog
-                .open_backend(backend)
-                .expect("selected backend opens"),
-        ];
-    }
-    [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]
-        .into_iter()
-        .filter_map(|backend| catalog.open_backend(backend).ok())
-        .chain(std::iter::once(
-            catalog.open_backend(BackendName::Cpu).unwrap(),
-        ))
-        .collect()
+    use BackendName::{Cpu, Cuda, Metal, Vulkan};
+    seismic_native_tests::devices(&[Metal, Cuda, Vulkan, Cpu])
 }
 
 /// Whether Vulkan's vector decode form (SIMDS, SLICES, KEYWISE) is within the
@@ -1858,7 +1840,7 @@ fn check(
 /// tolerance.
 fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
     use seismic_lang::{
-        checked::{SourceFile, check_source},
+        checked::{SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -1876,7 +1858,7 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
         path: "functions.seismic".into(),
         text: include_str!("../kernels/functions.seismic").into(),
     });
-    let module = check_source(sources).unwrap();
+    let module = crate::common::check(sources);
     let logical = module
         .entry(
             module.entry_named(entry).unwrap(),

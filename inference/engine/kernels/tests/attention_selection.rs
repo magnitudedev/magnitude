@@ -4,6 +4,8 @@
 // host opens against both, over rows of two sequences sharing query tiles,
 // with split and unsplit key partitions.
 
+mod common;
+
 use magnitude_kernels::attention_prefill;
 use seismic::{BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor, Tensor};
 
@@ -29,7 +31,7 @@ fn reads(bits: &[u32], words: usize) -> impl Fn(usize, usize) -> bool + '_ {
 
 fn portable(case: &Case, bits: &[u32], words: usize) -> Vec<f32> {
     use seismic_lang::{
-        checked::{SourceFile, check_source},
+        checked::{SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -44,7 +46,7 @@ fn portable(case: &Case, bits: &[u32], words: usize) -> Vec<f32> {
     ] {
         sources.push(SourceFile { path: path.into(), text: text.into() });
     }
-    let module = check_source(sources).unwrap();
+    let module = crate::common::check(sources);
     let logical = module
         .entry(
             module.entry_named("attention_prefill").unwrap(),

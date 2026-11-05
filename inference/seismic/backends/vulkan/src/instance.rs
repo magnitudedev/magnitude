@@ -2,6 +2,7 @@
 
 use ash::vk;
 use std::fmt;
+use std::sync::{Arc, Mutex, Weak};
 
 /// Why the Vulkan loader or instance is unusable on this host.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,21 +34,34 @@ impl fmt::Display for LoaderError {
 
 impl std::error::Error for LoaderError {}
 
-/// The process's Vulkan 1.3 instance, created on first use and kept for the
-/// process, as its logical devices are (see `Device::open`).
+/// The process's Vulkan 1.3 instance while anything holds it: discovery's
+/// device handles and every logical device created from it. Its last
+/// holder's drop destroys it; a logical device holds it, so it outlives
+/// every device created from it, and nothing can use it once destroyed.
 pub struct Instance {
     entry: ash::Entry,
     instance: ash::Instance,
 }
 
-/// The process's instance, or why the loader is unusable.
-pub(crate) fn instance() -> Result<&'static Instance, LoaderError> {
-    static INSTANCE: std::sync::OnceLock<Result<Instance, LoaderError>> =
-        std::sync::OnceLock::new();
-    INSTANCE
-        .get_or_init(Instance::create)
-        .as_ref()
-        .map_err(Clone::clone)
+/// The process's instance, created when none is held, or why the loader is
+/// unusable.
+pub(crate) fn instance() -> Result<Arc<Instance>, LoaderError> {
+    static CURRENT: Mutex<Weak<Instance>> = Mutex::new(Weak::new());
+    let mut current = CURRENT.lock().expect("the instance lock is never poisoned");
+    if let Some(instance) = current.upgrade() {
+        return Ok(instance);
+    }
+    let instance = Arc::new(Instance::create()?);
+    *current = Arc::downgrade(&instance);
+    Ok(instance)
+}
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        // SAFETY: every object created from the instance holds it, so none
+        // is left.
+        unsafe { self.instance.destroy_instance(None) };
+    }
 }
 
 impl Instance {

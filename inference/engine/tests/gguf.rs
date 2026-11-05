@@ -308,7 +308,10 @@ fn artifact_pins_validated_source_and_codec_descriptions() {
 /// growing the prefix by the estimate follows to the whole header.
 #[test]
 fn every_prefix_of_a_real_header_walks_as_the_whole_header_cut_short() {
-    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/assessment/headers");
+    let fixtures = std::path::Path::new(
+        &std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    )
+    .join("fixtures/assessment/headers");
     let mut fixtures = std::fs::read_dir(fixtures)
         .unwrap()
         .map(|entry| entry.unwrap().path())

@@ -56,6 +56,33 @@ priority order within its aggregate token allowance; requests left over are
 eligible again on the next round. State and retained outputs grow under device
 heap claims as requests enter, and released requests return those resources.
 
+A prompt group (a prompt's consecutive chunks run layer-major as one chain) holds
+the places of the class it is granted when it opens (`ExecutorDomain::grant_group`),
+up to every chunk of a whole-context prompt. The places its planned chunks are worth
+are weighed against the expert bank's slots by what each saves per byte
+(`GroupReads::grant`): a place saves the re-reads of the group's cold experts across
+its chunks, a slot the re-reads of decode steps and of this prompt's groups that
+miss it. Places that win memory from slots leave a want the bank's next shrink
+serves (`PlacesWant`); until then the group holds the most places that fit what a
+growth may take now (`Places::admitted`) and the heap grants. No group runs longer
+than the wait bound `W = (P − E) / r`: nothing is released while a chain runs, so
+from the planning line `P` the host may take what lies above the emergency reserve
+`E` at the fastest rate `r` the memory probes measured it taking
+(`MemoryPace::wait_bound`). Before a load has measured its groups' reads, and on a
+load without a bank, no measure prices a group's places or its time: it groups
+every planned chunk that fits.
+
+A class's slots are each launch's activation with its upload regions, its output in
+the chain's rotation of `n + 1` slots, and its readout and drafter slots
+(`ResourceLimits::class_slots`); its group buffers are held with them, both or
+neither. A load plans and holds the floor of one place; a larger class is kept
+while memory is Normal and released to the floor at the ladder's surplus rung,
+after any chain under way ends. Nothing grows in Reclaim, where groups run at what
+is held. A request's successor banks are not a class's: a chain's launches
+alternate two whatever its length (`ResourceLimits::target_successor_banks`), and
+they are granted when the request opens. While a chain is under way only its holder
+claims work (`ExecutorDomain::claims`).
+
 Input-preparation rows publish conditioning independently of generation proposals.
 Their completion cannot consume tokens, select a token, or change generation usage.
 Preparation and decoder consumption form separate batches at the same prefill
@@ -68,12 +95,30 @@ decoder token allowance cannot change an encoder preparation unit.
 
 Apply these steps in order when preparation cannot fit:
 
-1. Reclaim idle resources and unclaimed temporary capacity.
-2. Drop trailing batch members.
-3. Reduce the actual legal token allowance.
-4. Evict victims priced by exclusive releasable bytes and replay cost.
-5. Wait for a service epoch change when a peer event can improve feasibility.
-6. Fail with required and available capacity when no such event remains.
+1. Within the workload state the plan charges, give a group the rows and banks of
+   the least recently used retained prefixes outside the latest conversation's
+   checkpoints and any submitted use, before the stores grow past it
+   (`DomainError::StateCeiling`, `PrefixCache::release_unspared`). This runs before
+   the ladder.
+2. Release down the owner's one ladder (`scheduler/src/release.rs`), cheapest loss
+   first and short of preemption: surplus state backing, idle state, the expert bank
+   toward its floor, retained prefixes (least recently used first), then the
+   optional components once no request is resident. Each release goes to the
+   cheapest rung with anything left, so what a costlier release frees for a cheaper
+   rung is released before the next costly one. A release that a later flight
+   boundary finishes (idle graph slots, released off the submitting thread; an
+   expert bank resize) holds the ladder: nothing costlier runs until each such
+   release has finished. The bank's memory stores resize independently, so a
+   shrink waits only for a resize of its own store and a store's growth gives way
+   only to a shrink its own memory needs. A shrink needs no memory: one its
+   storage refuses is a broken invariant, never a rung to pass. The reclaim band
+   and a new request's residency release down the same ladder.
+3. Drop trailing batch members.
+4. Reduce the actual legal token allowance.
+5. Evict victims, the ladder's last rung, priced by exclusive releasable bytes and
+   replay cost. Unloading the model follows only once every rung is exhausted.
+6. Wait for a service epoch change when a peer event can improve feasibility.
+7. Fail with required and available capacity when no such event remains.
 
 Do not retry an already failed physical shape merely because its soft allowance
 changed. Indivisible input spans retain their [boundary semantics](inputs.md).
@@ -81,10 +126,14 @@ changed. Indivisible input spans retain their [boundary semantics](inputs.md).
 Numerical storage for fresh requests is allocated during negotiated preparation,
 not unconditionally during logical admission. Capacity facts come from the shared
 runtime resource domain, including retained model weights, state, and scratch.
-Allocation denial keeps its typed required/available byte facts through model
+The memory stores are read fresh only by the owner's memory probes, a deficit's
+retry and claims; between them the heap follows the process's own charge in
+Seismic's ledgers, so a step reads nothing of the OS. Allocation denial keeps its typed required/available byte facts through model
 preparation; native failures without capacity evidence are not reclassified by
 matching diagnostic text. Reclamation and eviction report the observed decrease
-in charged bytes, including aliases and retained checkpoints.
+in charged bytes, including aliases and retained checkpoints, and beside it the
+device store's claim (its allocations, or what its backend holds where that is
+more).
 
 Victim ordering favors output-blocked requests, then lower preemption debt, then
 more exclusive bytes per replayed input, then lower accumulated service. Protected

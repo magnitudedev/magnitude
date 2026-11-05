@@ -1,4 +1,4 @@
-// Router logits of the decode rows (M <= 8), for `routed_route` and
+// Router logits of the decode rows (M <= DECODE_ROWS), for `routed_route` and
 // `routed_select`: every threadgroup reduces its rows' RMS inverses in the
 // stage launch's order, then forms logit columns from the router input
 // x[m, k] = round_A(r[m, k] * inverse(m) * norm[k]). A logit is a lane's
@@ -139,7 +139,7 @@ template <typename W, typename In>
 inline void column(thread const In &in, thread const projection::Weights<W> &w, uint index,
     thread const Logits &out, uint rows, uint lane) {
     const uint k = in.columns;
-    float sums[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float sums[SEISMIC_CONST_DECODE_ROWS] = {};
     for (uint p = lane; p < k / 32; p += 32) {
         float4 we[4], wo[4];
         const typename W::packet packet = w.packet(index, p);
@@ -147,7 +147,7 @@ inline void column(thread const In &in, thread const projection::Weights<W> &w, 
         for (uint step = 0; step < 4; ++step)
             W::values(packet, step, we[step], wo[step]);
         PROJECTION_UNROLL
-        for (uint m = 0; m < 8; ++m) {
+        for (uint m = 0; m < SEISMIC_CONST_DECODE_ROWS; ++m) {
             if (m < rows) {
                 PROJECTION_UNROLL
                 for (uint step = 0; step < 4; ++step) {
@@ -159,7 +159,7 @@ inline void column(thread const In &in, thread const projection::Weights<W> &w, 
         }
     }
     PROJECTION_UNROLL
-    for (uint m = 0; m < 8; ++m) {
+    for (uint m = 0; m < SEISMIC_CONST_DECODE_ROWS; ++m) {
         if (m < rows) {
             const float sum = simd_sum(sums[m]);
             if (lane == 0)

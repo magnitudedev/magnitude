@@ -70,7 +70,7 @@ use std::fmt;
 /// The device facts one formation reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Configuration {
-    Vulkan(seismic_vulkan::FormationFacts),
+    Vulkan(seismic_vulkan::FormationTarget),
     Cuda { architecture: u32 },
     Metal { tensor_ops: bool },
 }
@@ -219,6 +219,9 @@ pub enum CoverageError {
     /// A skeleton could not be preprocessed: the coverage machinery, not a
     /// kernel, is at fault.
     Skeleton(String),
+    /// Entry `0`'s declaration reads a device property, so it has no
+    /// defaults offline: coverage forms on no device.
+    DeviceDependent(String),
 }
 
 impl fmt::Display for CoverageError {
@@ -226,6 +229,10 @@ impl fmt::Display for CoverageError {
         match self {
             Self::ToolchainUnavailable(reason) => write!(f, "toolchain unavailable: {reason}"),
             Self::Skeleton(reason) => write!(f, "skeleton preprocessing failed: {reason}"),
+            Self::DeviceDependent(entry) => write!(
+                f,
+                "`{entry}` reads a device property, so offline coverage, on no device, cannot form it"
+            ),
         }
     }
 }
@@ -277,7 +284,7 @@ enum Former {
 
 /// The preparation baseline of the Vulkan floor: a 32-lane fp16 device
 /// without cooperative matrix, declaring every seal mode.
-const VULKAN_BASE: seismic_vulkan::FormationFacts = seismic_vulkan::FormationFacts {
+const VULKAN_BASE: seismic_vulkan::FormationTarget = seismic_vulkan::FormationTarget {
     subgroup_lanes: seismic_vulkan::SUBGROUP_WIDTH,
     float16: true,
     matrix: false,
@@ -831,6 +838,11 @@ fn representations() -> Vec<RepresentationId> {
     found.into_iter().map(|info| info.id).collect()
 }
 
+/// Why a subject's implementations bind as every device offers them:
+/// [`Subject::new`] admits only declarations that read no device property,
+/// and substituting element reads reads none.
+const INDEPENDENT: &str = "a subject's declaration reads no device property (Subject::new)";
+
 /// The checked inputs of one entry's implementation on one backend.
 ///
 /// Which configurations are admissible is the implementation's at a row's
@@ -842,7 +854,7 @@ struct Subject<'m> {
     info: &'m EntryInfo,
     backend: BackendName,
     declaration: &'m NativeImplementation,
-    asset: &'m str,
+    asset: seismic_lang::checked::NativeAsset<'m>,
     label: String,
     /// Each element parameter's candidate representations.
     candidates: Vec<(String, Vec<RepresentationId>)>,
@@ -866,8 +878,15 @@ impl<'m> Subject<'m> {
         info: &'m EntryInfo,
         backend: BackendName,
         candidates: Vec<(String, Vec<RepresentationId>)>,
-    ) -> Option<Self> {
-        let declaration = module.native_implementation(info.id, backend)?;
+    ) -> Result<Option<Self>, CoverageError> {
+        let Some(declaration) = module.native_implementation(info.id, backend) else {
+            return Ok(None);
+        };
+        // Coverage forms offline, on no device: a declaration whose
+        // defaults read the device has none here.
+        if declaration.device_independent().is_none() {
+            return Err(CoverageError::DeviceDependent(info.name.clone()));
+        }
         let asset = module
             .native_asset(info.id, backend)
             .expect("a checked module captures every native asset");
@@ -876,7 +895,7 @@ impl<'m> Subject<'m> {
             .expect("a native asset path names a file")
             .to_string_lossy()
             .into_owned();
-        Some(Self {
+        Ok(Some(Self {
             module,
             info,
             backend,
@@ -888,7 +907,7 @@ impl<'m> Subject<'m> {
             searched: Default::default(),
             specializations: Default::default(),
             variant_programs: backend != BackendName::Vulkan,
-        })
+        }))
     }
 
     /// The implementation at `bindings`, every element read substituted
@@ -955,6 +974,8 @@ impl<'m> Subject<'m> {
         let statics = self.statics(implementation, &[])?;
         Some(Row {
             specialization: implementation
+                .device_independent()
+                .expect(INDEPENDENT)
                 .default_specialization(&statics)
                 .expect("searched statics admit a configuration"),
             bindings,
@@ -970,7 +991,11 @@ impl<'m> Subject<'m> {
         let specialization = match implementation.validate(&row.specialization) {
             Ok(()) => row.specialization.clone(),
             Err(seismic_lang::checked::NativeSpecializationError::Inadmissible) => {
-                match implementation.default_specialization(&statics_of(&row.specialization)) {
+                match implementation
+                    .device_independent()
+                    .expect(INDEPENDENT)
+                    .default_specialization(&statics_of(&row.specialization))
+                {
                     Ok(specialization) => specialization,
                     Err(seismic_lang::checked::NativeSpecializationError::Inadmissible) => {
                         return None;
@@ -1121,7 +1146,7 @@ impl<'m> Subject<'m> {
         let dialect = row.configuration.dialect();
         self.programs(row)
             .iter()
-            .map(|program| skeleton(&program.text, self.asset, &self.label, dialect, &preamble))
+            .map(|program| skeleton(&program.text, self.asset.text, &self.label, dialect, &preamble))
             .collect()
     }
 
@@ -1239,6 +1264,8 @@ impl<'m> Admissible<'m> {
     ) -> Self {
         let mut admissible = Self::new(implementation, statics);
         admissible.first = implementation
+            .device_independent()
+            .expect(INDEPENDENT)
             .default_specialization(statics)
             .expect("a row's statics admit its specialization");
         if variant_programs {
@@ -2009,7 +2036,7 @@ pub fn untaken(
     toolchain: &Toolchain,
 ) -> Result<Vec<Untaken>, CoverageError> {
     let former = &toolchain.former;
-    let subjects = subjects(module, former.backend());
+    let subjects = subjects(module, former.backend())?;
     let found = in_parallel(&subjects, |subject| {
         let base = base_row(
             subject,
@@ -2265,7 +2292,7 @@ pub fn cover(
         former: &toolchain.former,
         forming,
     };
-    let subjects = subjects(module, toolchain.backend());
+    let subjects = subjects(module, toolchain.backend())?;
     progress.begin(subjects.len());
     let searches = in_parallel(&subjects, |subject| {
         let searched = search(subject, forms);
@@ -2304,7 +2331,10 @@ pub fn cover(
 
 /// Every entry of `module` with a native implementation on `backend`, each
 /// element parameter's candidates every registry representation.
-fn subjects(module: &CheckedModule, backend: BackendName) -> Vec<Subject<'_>> {
+fn subjects(
+    module: &CheckedModule,
+    backend: BackendName,
+) -> Result<Vec<Subject<'_>>, CoverageError> {
     module
         .entries()
         .iter()
@@ -2314,7 +2344,7 @@ fn subjects(module: &CheckedModule, backend: BackendName) -> Vec<Subject<'_>> {
                 .iter()
                 .map(|parameter| (parameter.clone(), representations()))
                 .collect();
-            Subject::new(module, info, backend, candidates)
+            Subject::new(module, info, backend, candidates).transpose()
         })
         .collect()
 }
@@ -2446,9 +2476,12 @@ fn form_request(
         .find(|info| info.id == request.entry)
         .expect("a request names an entry of the module");
     let subject = Subject::new(module, info, forms.former.backend(), Vec::new())
+        .map_err(|error| RequestFailure::Formation(error.to_string()))?
         .expect("a request names an entry with a native implementation");
     let specialization = subject
         .implementation(&request.bindings)
+        .device_independent()
+        .expect(INDEPENDENT)
         .default_specialization(&request.statics)
         .map_err(|error| RequestFailure::Inadmissible(error.to_string()))?;
     let row = Row {

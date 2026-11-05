@@ -14,7 +14,7 @@ fn gated_sum[N](x: &tensor[N] f32) -> tensor[1] f32:
     return result
 
 native gated_sum for metal from "metal/gated_sum.metal":
-    params (SMALL in [64, 1048576])
+    params (SMALL in [64, 1048576] default 64)
     scratch mirror bytes ((N - SMALL) * 0 + N * 4) when N > SMALL
     launch gated_staged when N <= SMALL:
         threadgroups (1, 1, 1)
@@ -25,7 +25,7 @@ native gated_sum for metal from "metal/gated_sum.metal":
         threads_per_threadgroup (1, 1, 1)
 
 native gated_sum for cuda from "cuda/gated_sum.cu":
-    params (SMALL in [64, 1048576])
+    params (SMALL in [64, 1048576] default 64)
     scratch mirror bytes ((N - SMALL) * 0 + N * 4) when N > SMALL
     launch gated_staged when N <= SMALL:
         threadgroups (1, 1, 1)
@@ -39,7 +39,7 @@ native gated_sum for cuda from "cuda/gated_sum.cu":
 # the staged launch's pipeline (formed even where it is inactive) is refused
 # at preparation when it exceeds the device.
 native gated_sum for vulkan from "vulkan/gated_sum.comp":
-    params (SMALL in [64, 1048576])
+    params (SMALL in [64, 1048576] default 64)
     scratch mirror bytes ((N - SMALL) * 0 + N * 4) when N > SMALL
     launch gated_staged when N <= SMALL:
         threadgroups (1, 1, 1)
@@ -49,8 +49,87 @@ native gated_sum for vulkan from "vulkan/gated_sum.comp":
         threadgroups (ceil_div(N - SMALL, N - SMALL), 1, 1)
         threads_per_threadgroup (1, 1, 1)
 
+# Marks each group a grid an earlier writer (here the host) holds
+# dispatches: groups 0..grid[0] of at most N, read when the launch runs.
+fn marked_groups[N](grid: &tensor[3] i32, marks: &mut tensor[N] i32):
+    for group in 0..N:
+        marks[group] = 0
+        if i32(group) < grid[0]:
+            marks[group] = 1
+
+# Marks each group of a grid the call's own first launch writes into its
+# scratch: (count[0], 2, 1) groups, of at most (N, 2), group (x, y) marking
+# marks[y, x].
+fn written_marks[N](count: &tensor[1] i32, marks: &mut tensor[2, N] i32):
+    for y in 0..2:
+        for x in 0..N:
+            marks[y, x] = 0
+            if i32(x) < count[0]:
+                marks[y, x] = 1
+
+native written_marks for metal from "metal/written_marks.metal":
+    scratch grid bytes (12)
+    launch written_marks_grid:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch written_marks_clear:
+        threadgroups (ceil_div(N * 2, 32), 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+    launch written_marks:
+        threadgroups (N, 2, 1)
+        grid (grid)
+        threads_per_threadgroup (32, 1, 1)
+
+native written_marks for cuda from "cuda/written_marks.cu":
+    scratch grid bytes (12)
+    launch written_marks_grid:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch written_marks_clear:
+        threadgroups (ceil_div(N * 2, 32), 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+    launch written_marks:
+        threadgroups (N, 2, 1)
+        grid (grid)
+        threads_per_threadgroup (32, 1, 1)
+
+native written_marks for vulkan from "vulkan/written_marks.comp":
+    scratch grid bytes (12)
+    launch written_marks_grid:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch written_marks_clear:
+        threadgroups (ceil_div(N * 2, 32), 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+    launch written_marks:
+        threadgroups (N, 2, 1)
+        grid (grid)
+        threads_per_threadgroup (32, 1, 1)
+
+native written_marks for cpu from "cpu/written_marks.rs":
+    scratch grid bytes (12)
+    launch written_marks_grid:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch written_marks_clear:
+        threadgroups (N * 2, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch written_marks:
+        threadgroups (N, 2, 1)
+        grid (grid)
+        threads_per_threadgroup (1, 1, 1)
+
+native marked_groups for metal from "metal/marked_groups.metal":
+    launch marked_groups_clear:
+        threadgroups (ceil_div(N, 32), 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+    launch marked_groups:
+        threadgroups (N, 1, 1)
+        grid (grid)
+        threads_per_threadgroup (1, 1, 1)
+
 native gated_sum for cpu from "cpu/gated_sum.rs":
-    params (SMALL in [64, 1048576])
+    params (SMALL in [64, 1048576] default 64)
     scratch mirror bytes ((N - SMALL) * 0 + N * 4) when N > SMALL
     launch gated_staged when N <= SMALL:
         threadgroups (1, 1, 1)

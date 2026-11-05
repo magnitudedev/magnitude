@@ -138,34 +138,15 @@ pub fn code_values(
     specialization: &NativeSpecialization,
     launch: usize,
 ) -> Vec<u64> {
-    let reads = implementation.launches[launch].parameters();
     implementation
-        .params
-        .iter()
-        .filter(|parameter| {
-            parameter.code
-                && (reads.contains(&parameter.name)
-                    || !implementation
-                        .launches
-                        .iter()
-                        .any(|candidate| candidate.parameters().contains(&parameter.name)))
+        .code_parameters(launch)
+        .into_iter()
+        .map(|(local, name)| match local {
+            false => specialization.param(name).expect("validated entry code parameter"),
+            true => specialization
+                .launch_param(launch, name)
+                .expect("validated launch code parameter"),
         })
-        .map(|parameter| {
-            specialization
-                .param(&parameter.name)
-                .expect("validated entry code parameter")
-        })
-        .chain(
-            implementation.launches[launch]
-                .params
-                .iter()
-                .filter(|parameter| parameter.code)
-                .map(|parameter| {
-                    specialization
-                        .launch_param(launch, &parameter.name)
-                        .expect("validated launch code parameter")
-                }),
-        )
         .collect()
 }
 
@@ -862,7 +843,7 @@ pub fn partition(
 ) -> Result<TuningPartition, PlanError> {
     // The declaration is admissible somewhere, and its statics complete.
     implementation
-        .default_specialization(statics)
+        .admits(statics)
         .map_err(PlanError::Declaration)?;
     let mut geometry_reads = Vec::with_capacity(implementation.launches.len());
     let mut condition_reads = Vec::with_capacity(implementation.launches.len());
@@ -1124,12 +1105,12 @@ pub fn partition(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seismic_lang::checked::{SourceFile, SourceSet, check_source};
+    use seismic_lang::checked::{SourceFile, SourceSet};
     use seismic_lang::registry::BackendName;
 
     fn implementation(last_when: &str) -> NativeImplementation {
         checked(format!(
-            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (BATCH_FROM in [5, 3])\n    launch gemv when N < BATCH_FROM:\n        params (SIMDGROUPS in [16, 8], code ROWS in [1, 2])\n        threadgroups (ceil_div(N, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch batch when N >= BATCH_FROM and N <= 16:\n        params (SIMDGROUPS in [8, 4], code ROWS in [2, 1])\n        threadgroups (ceil_div(N, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch gemm when {last_when}:\n        params (code TILE in [64, 128])\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n"
+            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (BATCH_FROM in [5, 3] default 5)\n    launch gemv when N < BATCH_FROM:\n        params (SIMDGROUPS in [16, 8] default 16, ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch batch when N >= BATCH_FROM and N <= 16:\n        params (SIMDGROUPS in [8, 4] default 8, ROWS in [2, 1] default 2)\n        threadgroups (ceil_div(N, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch gemm when {last_when}:\n        params (TILE in [64, 128] default 64)\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n"
         ))
     }
 
@@ -1143,11 +1124,16 @@ mod tests {
             .collect()
     }
 
+    /// The fixture's implementation, checked with a source whose kernels
+    /// take `ROWS`, `TILE` and `TOKENS` as template parameters.
     fn checked(text: String) -> NativeImplementation {
-        let module = check_source(SourceSet::new(vec![SourceFile {
-            path: "scale.seismic".into(),
-            text,
-        }]))
+        let module = seismic_lang::native_source::check_fixture(
+            SourceSet::new(vec![SourceFile {
+                path: "scale.seismic".into(),
+                text,
+            }]),
+            &["ROWS", "TILE", "TOKENS"],
+        )
         .unwrap();
         module
             .native_implementation(module.entries()[0].id, BackendName::Metal)
@@ -1159,13 +1145,13 @@ mod tests {
     /// defaults outside the form, as the projection entries declare them.
     fn forms() -> NativeImplementation {
         checked(
-            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (BATCH_FROM in [5, 3], form TALL in [1, 0], form PACK in [0, 1])\n    where (PACK == 0 or TALL == 1) and (TALL == 1 or TILE == 64) and (PACK == 1 or (TOKENS == 4 and AHEAD == 0))\n    scratch staged bytes (N * 4 + TALL * 64) when N > 16\n    launch gemv when N < BATCH_FROM:\n        params (SIMDGROUPS in [16, 8, 4], code ROWS in [1, 2, 4])\n        threadgroups (ceil_div(N, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch batch when N >= BATCH_FROM and N <= 16:\n        params (SIMDGROUPS in [8, 4], code ROWS in [2, 1])\n        threadgroups (ceil_div(N, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch gemm when N > 16 and PACK == 0:\n        params (code TILE in [64, 128, 32])\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n    launch packed when N > 16 and PACK == 1 and TALL == 1:\n        params (code TOKENS in [4, 2], AHEAD in [0, 1])\n        threadgroups (ceil_div(N, TOKENS), 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n"
+            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (BATCH_FROM in [5, 3] default 5, form TALL in [1, 0] default 1, form PACK in [0, 1] default 0)\n    where (PACK == 0 or TALL == 1) and (TALL == 1 or TILE == 64) and (PACK == 1 or (TOKENS == 4 and AHEAD == 0))\n    scratch staged bytes (N * 4 + TALL * 64) when N > 16\n    launch gemv when N < BATCH_FROM:\n        params (SIMDGROUPS in [16, 8, 4] default 16, ROWS in [1, 2, 4] default 1)\n        threadgroups (ceil_div(N, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch batch when N >= BATCH_FROM and N <= 16:\n        params (SIMDGROUPS in [8, 4] default 8, ROWS in [2, 1] default 2)\n        threadgroups (ceil_div(N, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch gemm when N > 16 and PACK == 0:\n        params (TILE in [64, 128, 32] default 64)\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n    launch packed when N > 16 and PACK == 1 and TALL == 1:\n        params (TOKENS in [4, 2] default 4, AHEAD in [0, 1] default 0)\n        threadgroups (ceil_div(N, TOKENS), 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n"
                 .into(),
         )
     }
 
     fn constrained() -> NativeImplementation {
-        checked("fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (BATCH_FROM in [5, 3])\n    where BATCH_FROM >= 3\n    launch gemv when N < BATCH_FROM:\n        params (code ROWS in [1, 2])\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch batch when N >= BATCH_FROM:\n        params (code ROWS in [1, 2])\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n".into())
+        checked("fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (BATCH_FROM in [5, 3] default 5)\n    where BATCH_FROM >= 3\n    launch gemv when N < BATCH_FROM:\n        params (ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch batch when N >= BATCH_FROM:\n        params (ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n".into())
     }
 
     /// The defaults with each group and the boundary as given, when the
@@ -1177,7 +1163,7 @@ mod tests {
         boundary: &[u64],
     ) -> Option<NativeSpecialization> {
         let default = implementation
-            .default_specialization(&NativeSpecialization::new())
+            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
             .unwrap();
         let (parameters, values) = plan.assembled(groups, boundary);
         TuningPartition::place(implementation, &default, &parameters, &values).unwrap()
@@ -1310,7 +1296,7 @@ mod tests {
         assert_eq!(plan.points[1].active, [0, 1]);
         assert_eq!(plan.points[4].active, [2]);
         let defaults = implementation
-            .default_specialization(&NativeSpecialization::new())
+            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
             .unwrap();
         assert_eq!(code_values(&implementation, &defaults, 0), [1]);
         assert_eq!(code_values(&implementation, &defaults, 1), [2]);
@@ -1348,7 +1334,7 @@ mod tests {
             )),
         ));
         let statics = NativeSpecialization::new();
-        let default = implementation.default_specialization(&statics).unwrap();
+        let default = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
         let pack = [ParameterAddress::Entry("PACK".into())];
         // The defaults with the boundary moved are not admissible: the
         // packed form needs the other tile.
@@ -1394,11 +1380,11 @@ mod tests {
     #[test]
     fn the_nearest_completion_is_defined_by_what_it_changes() {
         let implementation = checked(
-            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (form WIDE in [0, 1], A in [1, 2, 4, 8], B in [1, 2, 4, 8], C in [1, 2])\n    where WIDE == 0 or A >= 4 or B >= 2\n    launch gemv:\n        threadgroups (ceil_div(N, A * B * C + WIDE), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
+            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (form WIDE in [0, 1] default 0, A in [1, 2, 4, 8] default 1, B in [1, 2, 4, 8] default 1, C in [1, 2] default 1)\n    where WIDE == 0 or A >= 4 or B >= 2\n    launch gemv:\n        threadgroups (ceil_div(N, A * B * C + WIDE), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
                 .into(),
         );
         let default = implementation
-            .default_specialization(&NativeSpecialization::new())
+            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
             .unwrap();
         let wide = [ParameterAddress::Entry("WIDE".into())];
         let values = |specialization: &NativeSpecialization| {
@@ -1419,11 +1405,11 @@ mod tests {
         assert_eq!(values(&nearest), [1, 4, 1, 2]);
         // Equally near completions: the earlier declared parameter moves.
         let tied = checked(
-            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (form WIDE in [0, 1], A in [1, 2], B in [1, 2])\n    where WIDE == 0 or A == 2 or B == 2\n    launch gemv:\n        threadgroups (ceil_div(N, A * B + WIDE), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
+            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (form WIDE in [0, 1] default 0, A in [1, 2] default 1, B in [1, 2] default 1)\n    where WIDE == 0 or A == 2 or B == 2\n    launch gemv:\n        threadgroups (ceil_div(N, A * B + WIDE), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
                 .into(),
         );
         let default = tied
-            .default_specialization(&NativeSpecialization::new())
+            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
             .unwrap();
         let nearest = TuningPartition::nearest(&tied, &default, &wide, &[1])
             .unwrap()
@@ -1450,7 +1436,7 @@ mod tests {
             forms(),
         ] {
             let statics = NativeSpecialization::new();
-            let default = implementation.default_specialization(&statics).unwrap();
+            let default = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
             let materialised = Materialised::of(&implementation);
             // Every served range, and ranges that leave launches unserved.
             for served in [&points()[..], &points()[..2], &points()[3..]] {
@@ -1544,7 +1530,7 @@ mod tests {
         let launches = (0..12)
             .map(|launch| {
                 format!(
-                    "    launch band{launch} when N == {}:\n        params (WIDTH in [1, 2, 4, 8], code ROWS in [1, 2, 4, 8])\n        threadgroups (ceil_div(N, WIDTH * ROWS), 1, 1)\n        threads_per_threadgroup (WIDTH * 32, 1, 1)\n",
+                    "    launch band{launch} when N == {}:\n        params (WIDTH in [1, 2, 4, 8] default 1, ROWS in [1, 2, 4, 8] default 1)\n        threadgroups (ceil_div(N, WIDTH * ROWS), 1, 1)\n        threads_per_threadgroup (WIDTH * 32, 1, 1)\n",
                     launch + 1
                 )
             })
@@ -1576,7 +1562,7 @@ mod tests {
     fn a_group_of_a_million_assignments_is_its_parameters_and_their_values() {
         let coupled = |parameters: usize| {
             let declared = (0..parameters)
-                .map(|parameter| format!("P{parameter} in [1, 2]"))
+                .map(|parameter| format!("P{parameter} in [1, 2] default 1"))
                 .collect::<Vec<_>>()
                 .join(", ");
             let product = (0..parameters)
@@ -1638,7 +1624,7 @@ mod tests {
 
     #[test]
     fn conditional_scratch_preserves_independent_row_bands() {
-        let implementation = checked("fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (BATCH_FROM in [5, 3])\n    scratch staged bytes (N * 4) when N >= BATCH_FROM\n    launch gemv when N < BATCH_FROM:\n        params (code ROWS in [1, 2])\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch batch when N >= BATCH_FROM:\n        params (code ROWS in [1, 2])\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n".into());
+        let implementation = checked("fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (BATCH_FROM in [5, 3] default 5)\n    scratch staged bytes (N * 4) when N >= BATCH_FROM\n    launch gemv when N < BATCH_FROM:\n        params (ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch batch when N >= BATCH_FROM:\n        params (ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n".into());
         let plan = partition(&implementation, &NativeSpecialization::new(), &points()).unwrap();
         assert_eq!(
             plan.boundary,
@@ -1655,7 +1641,7 @@ mod tests {
         // constrains it: an inadmissible boundary value is never assembled,
         // no launch is taken to run where only that value would run it, and
         // the launches keep independent groups.
-        let text = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (BATCH_FROM in [5, 3])\n    where BATCH_FROM >= 4\n    launch gemv when N < BATCH_FROM:\n        params (code ROWS in [1, 2])\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch batch when N >= BATCH_FROM:\n        params (code ROWS in [1, 2])\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n";
+        let text = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (BATCH_FROM in [5, 3] default 5)\n    where BATCH_FROM >= 4\n    launch gemv when N < BATCH_FROM:\n        params (ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch batch when N >= BATCH_FROM:\n        params (ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n";
         let implementation = checked(text.into());
         let statics = NativeSpecialization::new();
         let plan = partition(&implementation, &statics, &points()).unwrap();
@@ -1680,7 +1666,7 @@ mod tests {
             Some(5)
         );
         assert_eq!(assemble(&plan, &implementation, &first, &[3]), None);
-        let default = implementation.default_specialization(&statics).unwrap();
+        let default = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
         assert_eq!(
             TuningPartition::nearest(&implementation, &default, &plan.boundary, &[3]),
             Ok(None)

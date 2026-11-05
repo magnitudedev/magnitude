@@ -953,14 +953,7 @@ pub(crate) fn verify_draft_family_certificates(
         if charged != layouts[&class].storage_bytes() {
             return Err(format!("draft class {class:?} charged a different layout").into());
         }
-        exact.include(
-            seismic::NativeGraphStorageBytes {
-                workspace: 0,
-                output: 0,
-                upload: 0,
-            },
-            parts.constants,
-        );
+        exact.include(seismic::NativeGraphStorageBytes::default(), parts.constants);
     }
     let exact = exact.finish()?;
     if exact.binding_constant_bytes != resources.binding_constant_bytes {
@@ -1150,6 +1143,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             inject_only,
             causal_cache: false,
             selection: None,
+            controls: crate::programs::graph::draft::ControlSource::Uploaded,
         }
     }
 
@@ -1302,7 +1296,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     // the identity row map of the block rows.
     let convolved = match (&draft.convolutions, &entries.convolved) {
         (Some(convolutions), Some(stages)) => {
-            let identity = GraphConstant::identity(&mut graph, rows)?;
+            let identity = GraphConstant::row_identity(&mut graph, rows, None)?;
             let rows_map = identity.port().tensor().clone();
             constants.push(identity);
             Some((stages, convolutions.kernel, convolutions.group, rows_map))
@@ -2040,6 +2034,7 @@ fn convolved_layer<'a, G: GraphDraft + 'a>(
             inject_only: false,
             causal_cache: false,
             selection: None,
+            controls: crate::programs::graph::draft::ControlSource::Uploaded,
         },
         None,
         None,
@@ -3473,7 +3468,8 @@ impl NativeDraftProgram {
             let block_rows = slots * draft.block_rows(steps as u64) as usize;
             let segments = self.graphs.prepared.segments as usize;
             // The block's tokens gather by table row: of a streamed table,
-            // by the slots their rows are brought to.
+            // by the slots their rows are brought to. Padding rows past the
+            // block's name no row (-1) and read zeros.
             let tokens = (0..block_rows)
                 .map(|row| {
                     block
@@ -3481,7 +3477,7 @@ impl NativeDraftProgram {
                         .get(row)
                         .copied()
                         .filter(|_| row < block.actual_rows)
-                        .unwrap_or(0)
+                        .unwrap_or(-1)
                 })
                 .collect::<Vec<_>>();
             let rows = self.graphs.embedding.indices(&tokens).map_err(invalid)?;
@@ -3574,7 +3570,7 @@ impl NativeDraftProgram {
                             .get(row)
                             .copied()
                             .filter(|_| slot < actual_slots)
-                            .unwrap_or(0),
+                            .unwrap_or(-1),
                         0,
                     ]
                 });

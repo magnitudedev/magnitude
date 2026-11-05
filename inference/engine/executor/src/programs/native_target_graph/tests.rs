@@ -1,0 +1,771 @@
+use super::{
+    GroupExtents,
+    block::{BlockGraphInputs, checked_block_graph_draft, checked_block_graph_resources},
+    bound::{TokenRow, TokenRows},
+    certify::certify_target_family,
+    classes::{
+        BlockOutputScales, FamilyOutline, LaunchControl, LaunchControlLayout, Passes, StagedClass,
+        UnreadScales, block_classes, block_listings, block_routed, block_served, block_stages,
+        block_upload_regions, class_topology, enumerate_block_graphs, once_class, once_graphs,
+        slot_scores,
+    },
+    entry::{
+        EntryTokens, TARGET_TABLE, embedding_weight, entry_graph_topology, keeps_token_rows,
+        notifies_selection,
+    },
+    prepared::{block_graph_shapes, block_scopes, block_taps, chain_rows, trailing_run},
+    weights::{CheckedLandingEntries, activation},
+};
+use crate::{
+    ModelLoadPlan, ResourceLimits,
+    operators::{
+        MixerKind, paired_block,
+        routed::split::{OnceStage, RunStage, Stage},
+    },
+    programs::native_constants::{CheckedGraphFamilyResources, FamilyConstants},
+};
+use magnitude_state::LayerRef;
+use seismic::{
+    BackendName, HostHeap, NativeGraphLayout, NativeGraphMetadata, NativeGraphStorageBytes,
+};
+
+#[cfg(test)]
+mod token_rows_tests {
+    use super::{TokenRow, TokenRows};
+
+    #[test]
+    fn a_token_row_is_held_from_the_step_that_writes_it_until_overwritten() {
+        assert!(matches!(
+            TokenRows::new(8, 0).find(3).unwrap(),
+            TokenRow::None
+        ));
+        assert!(TokenRows::new(8, 2).find(8).is_err());
+
+        let rows = TokenRows::new(8, 2);
+        let TokenRow::Free(first) = rows.find(3).unwrap() else {
+            panic!("a token no step wrote has a free slot")
+        };
+        // The slot is the token's only once the writing step is queued.
+        assert!(matches!(rows.find(3).unwrap(), TokenRow::Free(_)));
+        rows.hold(3, first);
+        assert!(matches!(rows.find(3).unwrap(), TokenRow::Held(slot) if slot == first));
+        let TokenRow::Free(second) = rows.find(4).unwrap() else {
+            panic!("the other slot is free")
+        };
+        assert_ne!(second, first);
+        rows.hold(4, second);
+        assert!(matches!(rows.find(4).unwrap(), TokenRow::Held(slot) if slot == second));
+        // A third token takes a slot from one of the two.
+        let TokenRow::Free(third) = rows.find(5).unwrap() else {
+            panic!("a full directory frees a slot")
+        };
+        rows.hold(5, third);
+        assert!(matches!(rows.find(5).unwrap(), TokenRow::Held(slot) if slot == third));
+        rows.overwrite(0..2);
+        assert!(matches!(rows.find(5).unwrap(), TokenRow::Free(_)));
+    }
+}
+
+#[cfg(test)]
+mod upload_region_tests {
+    use super::{RunStage, block_upload_regions};
+
+    /// A decode class runs the block whole; a prompt class its front, which
+    /// writes the mixer's controls, and a back that writes a word. Each
+    /// region holds the most any class's run in its place writes, so every
+    /// class's runs fit regions of their own.
+    #[test]
+    fn a_block_takes_a_region_per_run_holding_the_most_any_class_writes() {
+        let stages = |rows: u64| -> &'static [RunStage] {
+            match rows {
+                1 => &[RunStage::Whole],
+                _ => &[RunStage::Front, RunStage::Combine],
+            }
+        };
+        let upload = |rows: u64, stage: RunStage| match stage {
+            RunStage::Whole => 40,
+            RunStage::Front => 100 * rows,
+            RunStage::Combine => 4,
+        };
+        assert_eq!(block_upload_regions([1, 16, 512], stages, upload), vec![51_200, 4]);
+        // A stage that writes nothing takes no region.
+        assert_eq!(block_upload_regions([1], stages, |_, _| 0), Vec::<u64>::new());
+    }
+
+    /// A launch uploads each control once, in order; a read whose listing
+    /// blocks are sealed for the most segments alone has its spans padded
+    /// only while a prefill launch has fewer, and the region holds the
+    /// largest segment class's upload, each control on a buffer boundary.
+    #[test]
+    fn launch_controls_pad_a_read_only_below_the_most_segments() {
+        use super::{LaunchControl, LaunchControlLayout};
+        let reads = magnitude_state::HistoryReads::of(&[], 1, 1).unwrap();
+        let layout = LaunchControlLayout {
+            padded: vec![false, true],
+            max_segments: 4,
+            region_bytes: 0,
+        };
+        let controls = layout.controls(16, 2, 1);
+        let at = |control| {
+            controls
+                .iter()
+                .find(|(of, _)| *of == control)
+                .map(|(_, extents)| extents.clone())
+        };
+        assert_eq!(at(LaunchControl::Coordinates), Some(vec![16, 4]));
+        assert_eq!(at(LaunchControl::Visible { read: 0 }), Some(vec![16, 2, 2]));
+        assert_eq!(at(LaunchControl::Padded { read: 0 }), None);
+        assert_eq!(at(LaunchControl::Padded { read: 1 }), Some(vec![16, 4, 2]));
+        assert_eq!(at(LaunchControl::Segments), Some(vec![2, 2]));
+        // Each control once: coordinates, two reads' three and one padded,
+        // five slot controls.
+        assert_eq!(controls.len(), 1 + 3 * 2 + 1 + 5);
+        for (control, _) in &controls {
+            assert_eq!(controls.iter().filter(|(of, _)| of == control).count(), 1);
+        }
+        // At the most segments, or in a decode launch, nothing pads.
+        for (rows, segments) in [(16, 4), (8, 2)] {
+            assert!(
+                layout
+                    .controls(rows, segments, 1)
+                    .iter()
+                    .all(|(of, _)| !matches!(of, LaunchControl::Padded { .. }))
+            );
+        }
+        // Without history reads: coordinates and the slot controls, each
+        // at a 256-byte boundary; the last, one slot's word.
+        let plain = LaunchControlLayout::of(&reads, &[], 16, 4, 1).unwrap();
+        assert_eq!(plain.region_bytes(), 5 * 256 + 4);
+    }
+}
+
+#[cfg(test)]
+mod stateless_tail_tests {
+    use super::trailing_run;
+
+    #[test]
+    fn the_tail_is_the_trailing_run_of_stateless_blocks() {
+        // Gemma 4 E2B: 35 blocks, the last 20 read shared history.
+        assert_eq!(trailing_run(35, |index| index >= 15), 15);
+        // A stateful block inside the run ends it.
+        assert_eq!(trailing_run(35, |index| index >= 15 && index != 30), 31);
+        // A stateful last block leaves no tail; nor do stateless leading blocks.
+        assert_eq!(trailing_run(35, |index| index < 34), 35);
+        assert_eq!(trailing_run(4, |_| false), 4);
+        assert_eq!(trailing_run(4, |_| true), 0);
+    }
+}
+
+#[cfg(test)]
+mod shared_graph_tests {
+    use super::*;
+
+    /// Streamed layers at different homes of one group share a sealed
+    /// graph when their blocks are of one shape, as the attention blocks of
+    /// `qwen4exp_fixture_definition_of(4, 32)` are: so that graph reads each
+    /// layer's home through its own ports (`policy[POLICY_HOME]`), which
+    /// `ngram_steps_tests::a_whole_banks_shared_graphs_read_each_layers_own_experts`
+    /// runs on the device.
+    #[test]
+    fn streamed_layers_at_different_homes_share_a_graph() {
+        use crate::planning::fixtures::{qwen4exp_fixture_definition_of, streamed_experts_manifest};
+        let backend = BackendName::Metal;
+        let definition = qwen4exp_fixture_definition_of(4, 32);
+        let manifest = streamed_experts_manifest(&definition);
+        let selection = crate::ComponentSelection { head: false, vision: false };
+        let limits = ResourceLimits {
+            max_launch_rows: 64,
+            max_launch_slots: 64,
+            max_selected_rows: 64,
+            max_drafting_slots: 64,
+            exported_logits_rows: 0,
+            max_images_per_request: 1,
+            max_image_cells: 0,
+            lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
+        };
+        let load = ModelLoadPlan::derive(&manifest, &definition, selection, crate::resident_layout(crate::ExecutionPath::Native, backend), crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS)
+            .unwrap()
+            .with_expert_bank_at_floor(&definition, seismic::Reservation { granule: 2 << 20, host_addressed: true, chunks: None }, crate::planning::HostTier::Unified)
+            .unwrap();
+        let codec = magnitude_state::KvCodec::Dense;
+        let state = crate::ResourcePlanner::state_plan(
+            &definition,
+            &load,
+            crate::PlannedMethod::Plain,
+            codec,
+            limits,
+            crate::ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent },
+        )
+        .unwrap();
+        let plan = load.program_plan(&definition, codec).unwrap();
+        let (_, tapped) = block_taps(plan.target(), &definition.decoder).unwrap();
+        let shapes = block_graph_shapes(&load, &definition.decoder, &state, &tapped).unwrap();
+        let bank = load.expert_bank().unwrap();
+        let home = |index: usize| bank.feed_forward(block_scopes(index).unwrap()[1]).map(|(layer, _)| bank.home(layer));
+        assert_eq!(shapes[1], shapes[2], "the first two attention blocks share a graph");
+        assert_ne!(home(1), home(2), "at different homes of one group");
+        assert!(home(1).is_some());
+    }
+}
+
+#[cfg(test)]
+mod resource_template_tests {
+    use super::*;
+    use crate::{
+        ComponentSelection, ExecutionPath, PlannedMethod, ResourceCapacity, ResourcePlanner,
+        assessment::fixtures::{DeclaredFeedForward, QWEN35_CONFIGURATIONS, declared_model},
+        resident_layout,
+    };
+    use magnitude_state::KvCodec;
+
+    /// Identical sublayers may share an interior graph, but neither the
+    /// widening entry nor the exit mix may disappear through that sharing.
+    #[test]
+    fn stream_boundaries_keep_their_own_block_graphs() {
+        use crate::planning::fixtures::{fixture_manifest, hyper_connection_fixture_definition};
+        let mut definition = hyper_connection_fixture_definition();
+        let manifest = fixture_manifest(&definition);
+        // Tied weights make the four sublayers identical in every respect.
+        definition.decoder.blocks = vec![definition.decoder.blocks[0].clone(); 4];
+        let backend = BackendName::Cuda;
+        let codec = KvCodec::Dense;
+        let limits = ResourceLimits {
+            max_launch_rows: 64,
+            max_launch_slots: 64,
+            max_selected_rows: 64,
+            max_drafting_slots: 64,
+            exported_logits_rows: 0,
+            max_images_per_request: 1,
+            max_image_cells: 0,
+            lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
+        };
+        let load = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            ComponentSelection {
+                head: false,
+                vision: false,
+            },
+            resident_layout(ExecutionPath::Native, backend),
+            PlannedMethod::Plain,
+            limits,
+        )
+        .unwrap();
+        let state = ResourcePlanner::state_plan(
+            &definition,
+            &load,
+            PlannedMethod::Plain,
+            codec,
+            limits,
+            ResourceCapacity {
+                domain_bytes: 1 << 30,
+                tensor_operations: crate::TensorOperations::Absent,
+            },
+        )
+        .unwrap();
+        let geometry = &definition.decoder;
+        let plan = load.program_plan(&definition, codec).unwrap();
+        let (_, tapped) = block_taps(plan.target(), geometry).unwrap();
+        let shapes = block_graph_shapes(&load, geometry, &state, &tapped).unwrap();
+        assert_ne!(shapes[0], shapes[1], "stream widening cannot be shared");
+        assert_eq!(shapes[1], shapes[2], "interior graphs still share");
+        assert_ne!(shapes[2], shapes[3], "the exit mix cannot be omitted");
+        let passes = Passes { region: 64, launches: 1 };
+        let outline = FamilyOutline {
+            row_classes: vec![1, 64],
+            largest_rows: 64,
+            ..FamilyOutline::of(backend, &load, geometry, &state, plan.target(), limits).unwrap()
+        };
+        let enumeration = enumerate_block_graphs(
+            &outline,
+            &block_served(&load, geometry, limits, 64, passes).unwrap(),
+            passes,
+            &state,
+            plan.target(),
+            BlockOutputScales::Planned(UnreadScales::Equal),
+        )
+        .unwrap();
+        assert!(!enumeration.sharing.is_empty());
+        assert!(
+            enumeration
+                .sharing
+                .iter()
+                .all(|&(index, _, first)| index == 2 && first == 1)
+        );
+        for boundary in [0, 3] {
+            assert!(
+                enumeration
+                    .sealing
+                    .iter()
+                    .any(|&(index, _)| index == boundary)
+            );
+        }
+    }
+
+    /// The 512-row attention class workspaces of one model on Metal over
+    /// K8/V4 history: the family's, each listing class's and that of the class
+    /// that lists none, with the store's reservation of history rows.
+    struct Charged {
+        reservation: u64,
+        family: u64,
+        listed: Vec<u64>,
+        unlisted: u64,
+    }
+
+    fn charged(
+        (kv_heads, head_width): (u64, u64),
+        context: u64,
+        domain_bytes: u64,
+        tensor_operations: bool,
+    ) -> Charged {
+        let limits = ResourceLimits {
+            max_launch_rows: 512,
+            max_launch_slots: 512,
+            max_selected_rows: 64,
+            max_drafting_slots: 64,
+            exported_logits_rows: 0,
+            max_images_per_request: 1,
+            max_image_cells: 0,
+            lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
+        };
+        let mut configuration = QWEN35_CONFIGURATIONS[0];
+        configuration.blocks = configuration.attention_interval;
+        configuration.kv_heads = kv_heads;
+        configuration.head_width = head_width;
+        let (mut definition, manifest) = declared_model(&configuration);
+        definition.decoder.context_limit = context;
+        let backend = BackendName::Metal;
+        let codec = KvCodec::AffineK8V4;
+        let load = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            ComponentSelection {
+                head: false,
+                vision: false,
+            },
+            resident_layout(ExecutionPath::Native, backend),
+            PlannedMethod::Plain,
+            limits,
+        )
+        .unwrap();
+        let plan = load.program_plan(&definition, codec).unwrap();
+        let index = plan
+            .target()
+            .blocks()
+            .iter()
+            .position(|slot| matches!(slot.mixer(), crate::MixerProgramSlot::Attention(_)))
+            .unwrap();
+        let state = ResourcePlanner::state_plan(
+            &definition,
+            &load,
+            PlannedMethod::Plain,
+            codec,
+            limits,
+            ResourceCapacity {
+                domain_bytes,
+                tensor_operations: crate::TensorOperations::of(tensor_operations),
+            },
+        )
+        .unwrap();
+        let certificate = certify_target_family(
+            backend,
+            &load,
+            &definition.decoder,
+            &state,
+            plan.target(),
+            limits,
+        )
+        .unwrap();
+        let family = certificate.resources.storage.workspace;
+        // The load's assessment charges the family's workspace, and every
+        // exact 512-row class of the block seals into the layout the family
+        // certified for it and is charged that layout.
+        let assessed = crate::AssessmentGraphResourceBounds::derive(
+            &definition,
+            &load,
+            &state,
+            PlannedMethod::Plain,
+            codec,
+            limits,
+            backend,
+        )
+        .unwrap();
+        assert_eq!(assessed.target.workspace_bytes, family);
+        let max_segments = state.target_state().span_limit().next_power_of_two() as u64;
+        let listings =
+            block_listings(&state, backend, plan.target().blocks()[index], index, 512).unwrap();
+        // Tensor operations read every head's history decoded; without
+        // them the co-issue form reads 128-, 256- and 512-column heads'.
+        assert_eq!(
+            listings.tiles.is_empty(),
+            !(tensor_operations || matches!(head_width, 128 | 256 | 512))
+        );
+        for class in block_classes(MixerKind::Attention, 512, 512, max_segments, &listings, false)
+        {
+            let (graph, _, _) = checked_block_graph_draft(
+                NativeGraphMetadata::new(backend),
+                plan.target().blocks()[index],
+                None,
+                BlockGraphInputs::of_class(
+                    &load,
+                    &definition.decoder,
+                    &state,
+                    index,
+                    (class, Stage::Run(RunStage::Whole)),
+                    class.0,
+                ),
+            )
+            .unwrap();
+            let layout = &certificate.blocks[index][&class_topology((class, Stage::Run(RunStage::Whole)))].layout;
+            assert_eq!(
+                graph.seal_with_layout(layout).unwrap(),
+                layout.storage_bytes()
+            );
+            assert!(layout.storage_bytes().workspace <= family);
+        }
+        let class = |listed| {
+            checked_block_graph_resources(
+                backend,
+                &load,
+                &definition.decoder,
+                &state,
+                plan.target().blocks()[index],
+                index,
+                (512, 1, 1, listed, 0),
+            )
+            .unwrap()
+            .0
+            .workspace
+        };
+        // One request's worth of tiles is the largest listing: its context
+        // and the rows appended within one advance (a causal reader of
+        // compressed history reads them through their reserved
+        // destinations), each in at most two partial pages.
+        let history = state
+            .target_state()
+            .layer_history(LayerRef::Target(index as u32))
+            .unwrap()
+            .store;
+        if let Some(&most) = listings.tiles.last() {
+            assert!(
+                most * 256
+                    <= context + limits.max_launch_rows as u64 + 4 * u64::from(history.page_rows)
+            );
+        }
+        Charged {
+            reservation: history.rows as u64,
+            family,
+            listed: listings.tiles.iter().map(|&tiles| class(tiles)).collect(),
+            unlisted: class(0),
+        }
+    }
+
+    /// An attention block's graph scratch follows neither the store's
+    /// reservation of history rows (an address-space ceiling from the
+    /// device's bytes) nor the context limit, and listing a launch's history
+    /// row tiles adds nothing to it: on Metal over K8/V4 history every
+    /// 512-row class that lists tiles is charged what the class that lists
+    /// none is (the DIRECT and COISSUE forms decode into the rows of the
+    /// partial outputs their key partitions leave), so the family holds the
+    /// same bytes with and without tensor operations.
+    #[test]
+    fn attention_graph_scratch_follows_neither_the_reservation_nor_the_context() {
+        for heads in [(4, 256), (1, 128), (2, 128), (1, 256), (2, 512), (4, 512)] {
+            for context in [65_536, 262_144] {
+                let plain = charged(heads, context, 8 << 30, false);
+                let small = charged(heads, context, 8 << 30, true);
+                let large = charged(heads, context, 256 << 30, true);
+                assert!(large.reservation > small.reservation);
+                assert!(!small.listed.is_empty());
+                for &listed in small
+                    .listed
+                    .iter()
+                    .chain(&large.listed)
+                    .chain(&plain.listed)
+                {
+                    assert_eq!(listed, small.unlisted, "{heads:?} at {context}");
+                }
+                assert_eq!(
+                    (small.family, small.unlisted),
+                    (large.family, large.unlisted),
+                    "{heads:?} at {context}: graph scratch follows the history reservation"
+                );
+                assert_eq!(
+                    (plain.family, plain.unlisted),
+                    (small.family, small.unlisted)
+                );
+                assert_eq!(
+                    charged(heads, context, 256 << 30, false).family,
+                    plain.family
+                );
+                eprintln!(
+                    "kv heads and width {heads:?}, context {context}, reservation {} / {} rows: family {} bytes, 512-row attention class {} bytes in {} listing classes and the one listing none",
+                    small.reservation,
+                    large.reservation,
+                    small.family,
+                    small.unlisted,
+                    small.listed.len()
+                );
+            }
+        }
+    }
+
+    /// Every exact entry and block class seals into the layout certified for
+    /// its structural regime and is charged that layout, and the family
+    /// charges exactly the binding constants the exact classes bind.
+    #[test]
+    fn every_exact_target_class_seals_into_its_certified_layout() {
+        let limits = ResourceLimits {
+            max_launch_rows: 64,
+            max_launch_slots: 64,
+            max_selected_rows: 64,
+            max_drafting_slots: 64,
+            exported_logits_rows: 0,
+            max_images_per_request: 1,
+            max_image_cells: 0,
+            lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
+        };
+        // Qwen3.6 with its odd blocks' experts pruned to half: routed layers
+        // of two shapes, which every routed layer's views of one buffer of
+        // each value serve.
+        let mut pruned = QWEN35_CONFIGURATIONS[3];
+        if let DeclaredFeedForward::Routed { odd_experts, .. } = &mut pruned.feed_forward {
+            *odd_experts = 128;
+        }
+        for mut configuration in [QWEN35_CONFIGURATIONS[0], QWEN35_CONFIGURATIONS[3], pruned] {
+            // One recurrent and one attention block shape.
+            configuration.blocks = configuration.attention_interval;
+            let (definition, manifest) = declared_model(&configuration);
+            for (backend, codec, chain) in [
+                BackendName::Cpu,
+                BackendName::Metal,
+                BackendName::Cuda,
+                BackendName::Vulkan,
+            ]
+            .into_iter()
+            .flat_map(|backend| [KvCodec::Dense, KvCodec::AffineK8V4].map(|codec| (backend, codec)))
+            .flat_map(|(backend, codec)| [1, 2].map(|chain| (backend, codec, chain)))
+            {
+                let limits = ResourceLimits {
+                    chain_capacity: std::num::NonZeroUsize::new(chain).unwrap(),
+                    ..limits
+                };
+                let load = ModelLoadPlan::derive(
+                    &manifest,
+                    &definition,
+                    ComponentSelection {
+                        head: false,
+                        vision: false,
+                    },
+                    resident_layout(ExecutionPath::Native, backend),
+                    PlannedMethod::Plain,
+                    limits,
+                )
+                .unwrap();
+                let state = ResourcePlanner::state_plan(
+                    &definition,
+                    &load,
+                    PlannedMethod::Plain,
+                    codec,
+                    limits,
+                    ResourceCapacity {
+                        domain_bytes: 64 * 1024 * 1024 * 1024,
+                        tensor_operations: crate::TensorOperations::Absent,
+                    },
+                )
+                .unwrap();
+                let plan = load.program_plan(&definition, codec).unwrap();
+                let certificate = certify_target_family(
+                    backend,
+                    &load,
+                    &definition.decoder,
+                    &state,
+                    plan.target(),
+                    limits,
+                )
+                .unwrap();
+                let geometry = &definition.decoder;
+                let max_segments = state.target_state().span_limit().next_power_of_two() as u64;
+                let weight = embedding_weight(&load).unwrap();
+                let elements = [("EW", weight.resident), ("A", activation(geometry))];
+                // The graphs a load seals and their plans' host heap, from
+                // each exact class's own topology: blocks of one shape seal
+                // one plan per class (no block here reads a layer scale).
+                let (_, tapped) = block_taps(plan.target(), geometry).unwrap();
+                let shapes = block_graph_shapes(&load, geometry, &state, &tapped).unwrap();
+                let sealed = std::cell::Cell::new((0usize, HostHeap::default()));
+                let seals = |heap: HostHeap| {
+                    let (graphs, held) = sealed.get();
+                    sealed.set((graphs + 1, held.plus(heap).unwrap()));
+                };
+                let owned = std::cell::Cell::new(HostHeap::default());
+                let shared = FamilyConstants::default();
+                let fits =
+                    |graph: NativeGraphMetadata, layout: &NativeGraphLayout, class: String| {
+                        // Every class of a regime seals a plan of the heap
+                        // its layout plans.
+                        assert_eq!(
+                            graph.plan_heap(),
+                            layout.plan_heap(),
+                            "{} {backend:?} {class} plan heap",
+                            configuration.model
+                        );
+                        let charged = graph.seal_with_layout(layout).unwrap_or_else(|error| {
+                            panic!(
+                            "{} {backend:?} {class} cannot seal into its certified layout: {error}",
+                            configuration.model
+                        )
+                        });
+                        assert_eq!(charged, layout.storage_bytes(), "{backend:?} {class}");
+                    };
+                let constants = std::cell::RefCell::new(CheckedGraphFamilyResources::new());
+                let chain_rows = chain_rows(64, limits).unwrap();
+                let passes = certificate.passes;
+                let pass_rows = passes.rows();
+                assert!(pass_rows <= chain_rows && passes.region == 64, "{passes:?}");
+                let served = block_served(&load, geometry, limits, chain_rows, passes).unwrap();
+                // Resident experts split only to merge a chain's launches.
+                for (index, block) in served.iter().enumerate() {
+                    let routed = block_routed(geometry, index).unwrap().is_some();
+                    assert_eq!(block.split.is_some(), routed && chain > 1);
+                }
+                // Each merged experts buffer is as long as the longest layer's.
+                let lengths = served
+                    .iter()
+                    .filter_map(|block| block.split.as_ref())
+                    .map(|split| split.merged.experts.1.iter().product::<u64>())
+                    .collect::<Vec<_>>();
+                if let Some(split) = GroupExtents::of(None, None, None, &served, chain_rows).split {
+                    assert_eq!(split.merged.experts.1, [*lengths.iter().max().unwrap()]);
+                }
+                // Each staged class's graph, drafted alone, fits its
+                // certified layout and owns what it plans.
+                let check = |index: usize, staged: StagedClass| {
+                    let ((rows, ..), stage) = staged;
+                    let (graph, mut block_constants, block_owned) = checked_block_graph_draft(
+                        NativeGraphMetadata::new(backend),
+                        plan.target().blocks()[index],
+                        None,
+                        BlockGraphInputs::of_class(
+                            &load,
+                            geometry,
+                            &state,
+                            index,
+                            staged,
+                            if stage == Stage::Once(OnceStage::Pass) { rows } else { pass_rows },
+                        ),
+                    )
+                    .unwrap();
+                    let certified = &certificate.blocks[index][&class_topology(staged)];
+                    assert_eq!(
+                        block_owned, certified.owned,
+                        "{} {backend:?} block {index} {staged:?} owned vectors",
+                        configuration.model
+                    );
+                    if !(0..index).any(|first| shapes[first] == shapes[index]) {
+                        seals(graph.plan_heap());
+                        owned.set(owned.get().plus(block_owned).unwrap());
+                    }
+                    for constant in &mut block_constants {
+                        shared.share(constant);
+                    }
+                    fits(graph, &certified.layout, format!("block {index} {staged:?}"));
+                    constants.borrow_mut().include(NativeGraphStorageBytes::default(), block_constants);
+                };
+                for rows in magnitude_batching::row_classes(limits.max_launch_rows)
+                    .into_iter()
+                    .map(|rows| rows as u64)
+                {
+                    for source in [EntryTokens::Uploaded, EntryTokens::Selected] {
+                        let landing = CheckedLandingEntries::of(&load, TARGET_TABLE).unwrap();
+                        let graph = entry_graph_topology(
+                            NativeGraphMetadata::new(backend),
+                            &elements,
+                            notifies_selection(&load).then_some(&[][..]),
+                            landing.as_ref().map(CheckedLandingEntries::entries),
+                            keeps_token_rows(&load),
+                            weight,
+                            geometry,
+                            rows,
+                            source,
+                        )
+                        .unwrap()
+                        .graph;
+                        seals(graph.plan_heap());
+                        fits(
+                            graph,
+                            &certificate.entries[&source],
+                            format!("entry rows={rows}"),
+                        );
+                    }
+                    for (index, block) in geometry.blocks.iter().enumerate() {
+                        for class in block_classes(
+                            paired_block(block).unwrap().mixer.kind(),
+                            rows,
+                            limits.max_launch_slots as u64,
+                            max_segments,
+                            &block_listings(
+                                &state,
+                                backend,
+                                plan.target().blocks()[index],
+                                index,
+                                rows,
+                            )
+                            .unwrap(),
+                            slot_scores(plan.target().blocks()[index]),
+                        ) {
+                            for &stage in block_stages(&served, index, class.0) {
+                                check(index, (class, Stage::Run(stage)));
+                            }
+                        }
+                    }
+                }
+                for (index, block) in served.iter().enumerate() {
+                    for (stage, rows) in once_graphs(block.streams, block.split.is_some(), passes) {
+                        check(index, once_class(rows, stage));
+                    }
+                }
+                let floor = GroupExtents::of(None, None, None, &served, 64);
+                assert_eq!(
+                    certificate.resources.binding_constant_bytes,
+                    constants.into_inner().finish().unwrap().binding_constant_bytes
+                        + floor.bytes().unwrap()
+                        + floor.pass_bytes().unwrap(),
+                    "{} {backend:?} {codec:?} constants",
+                    configuration.model
+                );
+                assert!(certificate.sealed.exact());
+                let planned = certificate.sealed.at_most;
+                assert!(planned.plans.bytes > 0 && planned.owned.bytes > 0);
+                assert_eq!(
+                    (planned.graphs, planned.plans),
+                    sealed.get(),
+                    "{} {backend:?} {codec:?} sealed graphs",
+                    configuration.model
+                );
+                assert_eq!(
+                    planned.owned,
+                    owned.get(),
+                    "{} {backend:?} {codec:?} owned vectors",
+                    configuration.model
+                );
+                // The values the exact classes bind, each held once, are
+                // the ones the plan counted.
+                assert_eq!(
+                    certificate.sealed.constants,
+                    shared.host_heap().unwrap(),
+                    "{} {backend:?} {codec:?} constant values",
+                    configuration.model
+                );
+            }
+        }
+    }
+}

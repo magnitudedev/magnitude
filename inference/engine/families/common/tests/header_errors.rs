@@ -5,7 +5,9 @@ use magnitude_artifacts::{
     gguf::{ByteOrder, Directory, Encoding, Metadata as Entry, Scalar, TensorDescriptor, Value},
     UnsupportedReason,
 };
-use magnitude_family_common::{architecture_keys, HeaderError, Metadata, Tensors};
+use magnitude_family_common::{
+    architecture_keys, projector_type, HeaderError, Metadata, ProjectorIdentityError, Tensors,
+};
 use magnitude_family_contracts::FamilyError;
 
 fn directory(keys: &[&str], tensors: &[&str]) -> Directory {
@@ -110,6 +112,21 @@ fn every_unbound_tensor_is_named() {
                 name: "rope_freqs.weight".into()
             },
         ]
+    );
+}
+
+/// A projector that declares no type is unreadable, not another model's.
+#[test]
+fn a_projector_of_no_declared_type_is_unreadable() {
+    let mut projector = magnitude_family_common::headers::projector("lfm3-vl-2b:gguf:q4-qat");
+    projector
+        .metadata
+        .retain(|entry| entry.name != "clip.vision.projector_type");
+    let error = projector_type(&projector, &[("lfm3vl", ())], 2048).unwrap_err();
+    assert_eq!(error, ProjectorIdentityError::Untyped);
+    assert_eq!(
+        FamilyError::from(error).reasons,
+        [UnsupportedReason::Unreadable]
     );
 }
 

@@ -62,6 +62,7 @@ fn resolved(projector: bool) -> ResolvedEngineConfiguration {
             lookahead: false,
             exported_logits_rows: 512,
             numerical_profile: None,
+            weight_cap: None,
         },
         context_tokens: Some(CONTEXT),
         service: limits(),
@@ -80,6 +81,7 @@ fn limits() -> ServiceLimits {
         decode_tokens: 32,
         decode_share: 0.5,
         locality_seconds: 1.0,
+        conversations: std::num::NonZeroUsize::MIN,
     }
 }
 
@@ -676,7 +678,7 @@ fn vision_claims_its_slots_on_an_image_and_releases_them_at_idle() {
         build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
     let charged = |domain: &ExecutorDomain| {
         let device = domain.resources().device();
-        device.storage_usage(seismic::StorageKind::Device).charged
+        device.device_ledger().charged
     };
     let mut cycles = Vec::new();
     for request in [RequestId(1), RequestId(2)] {
@@ -688,9 +690,10 @@ fn vision_claims_its_slots_on_an_image_and_releases_them_at_idle() {
         let encoded = charged(&domain);
         assert!(encoded > opened, "the image claimed no vision storage");
         domain.close(request).unwrap();
-        let released = domain
-            .shrink_state(&mut bindings, ShrinkPolicy::Idle)
-            .unwrap();
+        // Vision's free slots release on the load's release thread: the
+        // charge falls by what it released once the boundary that finds it
+        // ended records it.
+        let released = magnitude_executor::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Idle);
         let idle = charged(&domain);
         assert_eq!(encoded - idle, released);
         assert!(released > 0, "idle released no vision storage");

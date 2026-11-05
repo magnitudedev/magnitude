@@ -27,6 +27,7 @@ use seismic_lang::expr::compiled::{
 use seismic_lang::expr::LoopBinderId;
 use seismic_lang::expr::SymbolValue;
 use std::fmt;
+use std::ptr::NonNull;
 
 /// Structured control over commands `C`, predicates `P`, ranges `R`.
 #[derive(Debug)]
@@ -1563,15 +1564,52 @@ impl<T: Send + Sync> MemoryHold for T {}
 pub trait MemoryAccount: Send + Sync {
     fn available(&self) -> u64;
     fn reserve(&self, bytes: u64) -> Result<Box<dyn MemoryHold>, ExecutionError>;
+    /// Reserve what `decide` chooses within one admission: it runs inside
+    /// the account's admission decision, after every admission its stores
+    /// run first, with what the account has available, and returns the
+    /// bytes to charge (or refuses); those are charged in that same
+    /// decision. Returns the charge and its bytes.
+    fn reserve_decided(
+        &self,
+        decide: &mut dyn FnMut(u64) -> Result<u64, ExecutionError>,
+    ) -> Result<(Box<dyn MemoryHold>, u64), ExecutionError>;
     /// Record driver-owned memory whose size is observable only after the
     /// native operation. It consumes subsequent admission headroom.
     fn record(&self, bytes: u64) -> Box<dyn MemoryHold>;
 }
 
+/// An account that bounds nothing and charges nothing: what a backend's own
+/// tests, and a backend's probe process, open a device with, outside any
+/// runtime's ledgers.
+pub struct Unbounded;
+
+impl MemoryAccount for Unbounded {
+    fn available(&self) -> u64 {
+        u64::MAX
+    }
+    fn reserve(&self, _bytes: u64) -> Result<Box<dyn MemoryHold>, ExecutionError> {
+        Ok(Box::new(()))
+    }
+    fn reserve_decided(
+        &self,
+        decide: &mut dyn FnMut(u64) -> Result<u64, ExecutionError>,
+    ) -> Result<(Box<dyn MemoryHold>, u64), ExecutionError> {
+        Ok((Box::new(()), decide(u64::MAX)?))
+    }
+    fn record(&self, _bytes: u64) -> Box<dyn MemoryHold> {
+        Box::new(())
+    }
+}
+
 /// Device services a backend provides to the generic runtime.
 pub trait DeviceService<T: seismic_native_target::TargetFamily>: Send + Sync + 'static {
+    /// Memory device work binds and the host reads.
     type Buffer: Clone + Send + Sync + 'static;
-    fn allocate(&self, bytes: u64, alignment: u64) -> Result<Self::Buffer, ExecutionError>;
+    /// A [`Self::Buffer`] the service allocated, which the host also writes.
+    /// Read-only memory a backend maps is a `Buffer` only, so it has no host
+    /// write path.
+    type Writable: std::borrow::Borrow<Self::Buffer> + Send + Sync + 'static;
+    fn allocate(&self, bytes: u64, alignment: u64) -> Result<Self::Writable, ExecutionError>;
     /// Allocate where the device may add at most `room` bytes of device
     /// memory beyond what it already holds, when given. A service that takes
     /// device memory exactly per allocation ignores it.
@@ -1580,7 +1618,7 @@ pub trait DeviceService<T: seismic_native_target::TargetFamily>: Send + Sync + '
         bytes: u64,
         alignment: u64,
         _room: Option<u64>,
-    ) -> Result<Self::Buffer, ExecutionError> {
+    ) -> Result<Self::Writable, ExecutionError> {
         self.allocate(bytes, alignment)
     }
     /// Device memory the service holds beyond its live allocations (free
@@ -1594,7 +1632,7 @@ pub trait DeviceService<T: seismic_native_target::TargetFamily>: Send + Sync + '
     fn unallocated(&self) -> u64 {
         0
     }
-    fn write(&self, buffer: &Self::Buffer, offset: u64, bytes: &[u8])
+    fn write(&self, buffer: &Self::Writable, offset: u64, bytes: &[u8])
         -> Result<(), ExecutionError>;
     fn read(
         &self,
@@ -1603,6 +1641,10 @@ pub trait DeviceService<T: seismic_native_target::TargetFamily>: Send + Sync + '
         into: &mut [u8],
     ) -> Result<(), ExecutionError>;
     fn buffer_len(&self, buffer: &Self::Buffer) -> u64;
+    /// The host address of `buffer`'s first byte where the host reads and
+    /// writes its memory in place, valid while the buffer lives; `None` for
+    /// memory only the device or a driver copy reaches.
+    fn host_address(&self, buffer: &Self::Writable) -> Option<NonNull<u8>>;
 }
 
 /// One invocation-bound physical allocation. `base_offset` is the caller's
@@ -2682,6 +2724,7 @@ mod allocation_size_tests {
     struct NoDevice;
     impl DeviceService<FakeTarget> for NoDevice {
         type Buffer = ();
+        type Writable = ();
         fn allocate(&self, _: u64, _: u64) -> Result<(), ExecutionError> {
             unreachable!()
         }
@@ -2693,6 +2736,9 @@ mod allocation_size_tests {
         }
         fn buffer_len(&self, _: &()) -> u64 {
             u64::MAX
+        }
+        fn host_address(&self, _: &()) -> Option<NonNull<u8>> {
+            unreachable!()
         }
     }
     struct NoExecution;

@@ -536,7 +536,7 @@ impl HostDevice {
 
 struct ActiveAssessment {
     id: u64,
-    abort: Option<tokio::task::AbortHandle>,
+    abort: Option<magnitude_service_utils::owner::Owner>,
 }
 
 struct ActiveAssessments {
@@ -567,13 +567,13 @@ impl ActiveAssessments {
         &mut self,
         key: &AssessmentWorkKey,
         id: u64,
-        abort: tokio::task::AbortHandle,
-    ) -> bool {
+        abort: magnitude_service_utils::owner::Owner,
+    ) -> Result<(), magnitude_service_utils::owner::Owner> {
         let Some(entry) = self.entries.get_mut(key).filter(|entry| entry.id == id) else {
-            return false;
+            return Err(abort);
         };
         entry.abort = Some(abort);
-        true
+        Ok(())
     }
 
     fn finish(&mut self, key: &AssessmentWorkKey, id: u64) {
@@ -632,7 +632,7 @@ impl ManagedModelAssessments {
             host,
         });
         let owner = Arc::clone(&service);
-        tokio::spawn(async move { owner.run(measurement).await });
+        magnitude_service_utils::owner::spawn("the assessment pool", async move { owner.run(measurement).await });
         service
     }
 
@@ -800,7 +800,7 @@ impl ManagedModelAssessments {
             let service = Arc::clone(self);
             let task_key = item.key.clone();
             let runner_key = task_key.clone();
-            let handle = tokio::spawn(async move {
+            let abort = magnitude_service_utils::owner::spawn("an assessment attempt", async move {
                 if let Some(outcome) = service.attempt(item).await {
                     service.publish_outcome(outcome);
                 }
@@ -810,10 +810,9 @@ impl ManagedModelAssessments {
                     .expect("assessment owner lock poisoned");
                 active.finish(&runner_key, active_id);
             });
-            let abort = handle.abort_handle();
             let mut active = self.active.lock().expect("assessment owner lock poisoned");
-            if !active.attach(&task_key, active_id, abort) {
-                handle.abort();
+            if let Err(abort) = active.attach(&task_key, active_id, abort) {
+                abort.abort();
             }
         }
     }
@@ -842,7 +841,8 @@ impl ManagedModelAssessments {
     }
 
     /// Adopt what the measurement job reports (`measurement`'s current status): its state, and
-    /// a new environment when its measurements change the current one.
+    /// a new environment when its measurements change the current one; otherwise every
+    /// assessed model whose own miss record a load has stored since is finished again.
     fn adopt_measurement(
         self: &Arc<Self>,
         measurement: &mut tokio::sync::watch::Receiver<MeasurementStatus>,
@@ -856,15 +856,50 @@ impl ManagedModelAssessments {
                     current.snapshot.measurement = status.state;
                     changed
                 });
+                self.refinish_stale(measurement.clone());
             }
         }
     }
 
+    /// Finish again, in the current environment, every assessed model whose cached assessment
+    /// is no longer the environment's: a streamed fit whose own model's miss record changed
+    /// ([`ModelAssessor::cached`]). Every other model's assessment stands. The cache is read on
+    /// the blocking pool, with no lock held.
+    fn refinish_stale(
+        self: &Arc<Self>,
+        measurement: tokio::sync::watch::Receiver<MeasurementStatus>,
+    ) {
+        let environment = self.assessor.environment();
+        let assessed = {
+            let current = self.current.read().expect("assessment state lock poisoned");
+            let assessed = current.assessed_keys();
+            current
+                .works
+                .iter()
+                .filter(|(key, _)| assessed.contains(*key))
+                .map(|(key, work)| (key.clone(), work.clone()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let service = Arc::clone(self);
+        magnitude_service_utils::owner::spawn("an assessment refinish", async move {
+            let stale = magnitude_service_utils::blocking::run({
+                let (service, environment) = (Arc::clone(&service), Arc::clone(&environment));
+                move || {
+                    assessed
+                        .into_iter()
+                        .filter(|(key, _)| service.assessor.cached(&environment, &key.0).is_none())
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                }
+            })
+            .await;
+            if !stale.is_empty() {
+                service.refinish(environment, stale, measurement);
+            }
+        });
+    }
+
     /// Move the pool to `environment`: work not yet assessed moves at once, and every assessed
-    /// model is finished again in it (arithmetic over its prepared demand) on a task of its own,
-    /// off the run loop. Its results are published together with `measurement`'s state then in
-    /// one revision, never passing back through `Assessing`, unless the environment has moved
-    /// on by then: the next one finishes them again.
+    /// model is finished again in it (arithmetic over its prepared demand, [`Self::refinish`]).
     fn adopt_environment(
         self: &Arc<Self>,
         environment: Arc<AssessmentEnvironment>,
@@ -903,8 +938,21 @@ impl ManagedModelAssessments {
             .into_iter()
             .filter(|(old, _)| assessed.contains(old))
             .collect::<std::collections::BTreeMap<_, _>>();
+        self.refinish(environment, refinished, measurement);
+    }
+
+    /// Finish each assessed model's work in `environment` again (`refinished`, by the key its
+    /// entry has now) on a task of its own, off the run loop. Its results are published together
+    /// with `measurement`'s state then in one revision, never passing back through `Assessing`,
+    /// unless the environment has moved on by then: the next one finishes them again.
+    fn refinish(
+        self: &Arc<Self>,
+        environment: Arc<AssessmentEnvironment>,
+        refinished: std::collections::BTreeMap<AssessmentWorkKey, AssessmentWork>,
+        measurement: tokio::sync::watch::Receiver<MeasurementStatus>,
+    ) {
         let service = Arc::clone(self);
-        tokio::spawn(async move {
+        magnitude_service_utils::owner::spawn("an assessment refinish", async move {
             let outcomes = futures_util::future::join_all(
                 refinished
                     .values()
@@ -1232,10 +1280,13 @@ mod tests {
                     "assessment".to_owned(),
                 ),
                 memory: Vec::new(),
-                performance,
+                residency: magnitude_service_contracts::models::ModelResidency::Resident {
+                    performance,
+                },
                 projector: magnitude_service_contracts::models::ProjectorVerdict::None,
                 drafter: magnitude_service_contracts::models::DrafterVerdict::None,
             },
+            misses: None,
         }
     }
 
@@ -1244,7 +1295,9 @@ mod tests {
     /// carries its estimate.
     #[test]
     fn arriving_measurements_republish_every_assessed_model_at_once() {
-        use magnitude_service_contracts::models::{ModelPerformance, PerformanceEvidence};
+        use magnitude_service_contracts::models::{
+            ModelPerformance, ModelResidency, PerformanceEvidence,
+        };
         let subjects = ["first", "second"]
             .map(|base| assessment_subject(base, CatalogModelSelection::Desired));
         let mut current = assessment_pool_current();
@@ -1299,8 +1352,10 @@ mod tests {
             assert!(matches!(
                 &entry.state,
                 ModelAssessmentEntryState::Assessed { profiles, .. }
-                    if matches!(profiles.as_slice(), [ModelAssessment::Fits { performance, .. }]
-                        if *performance == estimated)
+                    if matches!(profiles.as_slice(), [ModelAssessment::Fits {
+                        residency: ModelResidency::Resident { performance },
+                        ..
+                    }] if *performance == estimated)
             ));
         }
         assert!(
@@ -1333,6 +1388,7 @@ mod tests {
         let structure = magnitude_engine::assessment::AssessmentStructure::discover(
             &catalog,
             magnitude_executor::platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
+            None,
             magnitude_executor::platform::MemoryReserves::standard(),
             environment::serving_policy(),
             magnitude_engine::options::standard_service_limits(),
@@ -1394,8 +1450,10 @@ mod tests {
             ModelAssessmentDomainSnapshot::Available { entries, .. }
                 if matches!(entries.as_slice(), [ModelAssessmentEntry {
                     state: ModelAssessmentEntryState::Assessed { profiles, .. }, ..
-                }] if matches!(profiles.as_slice(), [ModelAssessment::Fits { performance, .. }]
-                    if *performance == estimated))
+                }] if matches!(profiles.as_slice(), [ModelAssessment::Fits {
+                    residency: magnitude_service_contracts::models::ModelResidency::Resident { performance },
+                    ..
+                }] if *performance == estimated))
         ));
     }
 
@@ -1433,7 +1491,12 @@ mod tests {
         assert!(matches!(
             entry_state(&current),
             ModelAssessmentEntryState::Assessed { profiles, .. }
-                if matches!(profiles.as_slice(), [ModelAssessment::Fits { performance: ModelPerformance::Pending, .. }])
+                if matches!(profiles.as_slice(), [ModelAssessment::Fits {
+                    residency: magnitude_service_contracts::models::ModelResidency::Resident {
+                        performance: ModelPerformance::Pending,
+                    },
+                    ..
+                }])
         ));
         assert!(
             current.references_assessing(&plain),
@@ -1460,7 +1523,10 @@ mod tests {
         assert!(matches!(
             entry_state(&current),
             ModelAssessmentEntryState::Assessed { profiles, .. }
-                if matches!(profiles.as_slice(), [ModelAssessment::Fits { performance, .. }] if *performance == estimated)
+                if matches!(profiles.as_slice(), [ModelAssessment::Fits {
+                    residency: magnitude_service_contracts::models::ModelResidency::Resident { performance },
+                    ..
+                }] if *performance == estimated)
         ));
         assert!(!current.references_assessing(&plain));
         assert_eq!(
@@ -1632,6 +1698,7 @@ mod tests {
                     reasons: Vec::new(),
                     detail: failure.message.clone(),
                 },
+                misses: None,
             }),
         });
         assert_eq!(

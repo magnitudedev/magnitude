@@ -11,10 +11,11 @@ reported as below what the instrument resolved, never as a difference.
 
 import argparse
 import statistics
+from collections.abc import Callable
 
 from . import engine, selectors, sources
 from .instruments import REGISTRY, Answer, Instrument, JobResult, Measure
-from .results import perform
+from .results import answer_fetched, perform
 
 SIDES = ("base", "candidate")
 SHOWN = 12
@@ -49,38 +50,50 @@ def _jobs(instrument: Instrument, arguments, plans: dict) -> tuple[engine.Job, .
 
 
 def run(instrument: Instrument, arguments) -> int:
+    if instrument.pairing is not None:
+        answer = lambda results: instrument.pairing.answer(arguments, results)
+    else:
+        answer = lambda results: compare(instrument, arguments, results)
+    if arguments.answering is not None:  # a collected run: from its fetched results, no source
+        return answer_fetched(arguments, answer, arguments.answering)
     if arguments.base == arguments.candidate:
         raise SystemExit("ab: the base and the candidate are the same source")
     with sources.opened(arguments.base) as base, sources.opened(arguments.candidate) as candidate:
-        return _run(instrument, arguments, {"base": base, "candidate": candidate})
+        return _run(instrument, arguments, {"base": base, "candidate": candidate}, answer)
 
 
-def _run(instrument: Instrument, arguments, resolved: dict[str, sources.Source]) -> int:
-    plans = {side: instrument.plan(arguments, resolved[side]) for side in SIDES}
-    first = plans["base"]
+def _run(instrument: Instrument, arguments, resolved: dict[str, sources.Source],
+         answer: Callable[[dict[str, JobResult]], Answer]) -> int:
+    def work(host: str) -> engine.Work:
+        plans = {side: instrument.plan(arguments, resolved[side], host) for side in SIDES}
+        first = plans["base"]
+        return engine.Work(
+            sides=tuple(engine.Side(side, resolved[side], plans[side].builds) for side in SIDES),
+            jobs=_jobs(instrument, arguments, plans),
+            device=first.device,
+            acquires=first.acquires,
+            files=first.files,
+        )
+
     request = engine.Request(
         instrument=f"ab-{instrument.name}",
         purpose=arguments.purpose,
         estimate=arguments.estimate,
         backend=arguments.backend,
-        sides=tuple(engine.Side(side, resolved[side], plans[side].builds) for side in SIDES),
-        jobs=_jobs(instrument, arguments, plans),
-        device=first.device,
+        work=work,
         host=arguments.host,
-        acquires=first.acquires,
-        files=first.files,
     )
-    if instrument.pairing is not None:
-        return perform(arguments, request, lambda results: instrument.pairing.answer(arguments, results))
-    return perform(arguments, request, lambda results: compare(instrument, arguments, results, first.jobs))
+    return perform(arguments, request, answer)
 
 
-def compare(instrument: Instrument, arguments, results: dict[str, JobResult], jobs) -> Answer:
+def compare(instrument: Instrument, arguments, results: dict[str, JobResult]) -> Answer:
     rounds: dict[str, list[dict[str, Measure]]] = {side: [] for side in SIDES}
     for index in range(arguments.rounds):
         for side in SIDES:
+            prefix = f"{side}-r{index}-"  # `_jobs`'s names
             answer = instrument.answer(
-                arguments, {name: results[f"{side}-r{index}-{name}"] for name, _ in jobs}
+                arguments, {name.removeprefix(prefix): result for name, result in results.items()
+                            if name.startswith(prefix)}
             )
             if not answer.ok:
                 return Answer((f"{side} round {index}:", *answer.lines), False)

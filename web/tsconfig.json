@@ -12,5 +12,6 @@
       "@magnitudedev/generate-id": ["../packages/generate-id/src"]
     }
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"]
 }

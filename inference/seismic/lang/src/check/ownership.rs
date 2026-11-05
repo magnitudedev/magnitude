@@ -309,12 +309,15 @@ impl Checker<'_> {
                 (ValueType::Tensor(_), ir::Ownership::Owned) => {
                     ValueOwnership::Tensor(TensorOwnership::Owned { moved: false })
                 }
-                (ValueType::Tensor(_), ir::Ownership::Shared | ir::Ownership::Exclusive) => {
-                    ValueOwnership::Tensor(TensorOwnership::Borrowed {
-                        owner: place.clone(),
-                        exclusive: *access == ir::Ownership::Exclusive,
-                    })
-                }
+                // A host port's local is never in scope: it is borrowed and
+                // never used.
+                (
+                    ValueType::Tensor(_),
+                    ir::Ownership::Shared | ir::Ownership::Exclusive | ir::Ownership::Host { .. },
+                ) => ValueOwnership::Tensor(TensorOwnership::Borrowed {
+                    owner: place.clone(),
+                    exclusive: *access == ir::Ownership::Exclusive,
+                }),
                 (ValueType::Tensor(_), _) => panic!("tensor parameter lost ownership"),
                 _ => ValueOwnership::Scalar,
             }

@@ -53,9 +53,11 @@ use std::time::Instant;
 /// session's samples in the unit's `finished` record) and the clock's
 /// establishment (`established`, with no bound), which no reader of
 /// version 3 is asked to know; nor the `abandoned` pieces of a `budget`
-/// and its ending's `draining_seconds`. A `published` no longer includes a
-/// serving artifact: a promoting `stage` forms it, within its
-/// `publishing_seconds`.
+/// and its ending's `draining_seconds`. A promoted choice's program is the
+/// artifact its search compiled and stored: nothing more is formed for it.
+/// `began` states the `device`'s properties (`seismic::device`), and a
+/// unit's `finished` its `default_launches`: each launch of its defaults,
+/// its workgroup's `threads` and its compiler's `statistics`.
 pub const TRACE_SCHEMA: &str = "tuning-trace/3";
 
 pub struct TuningTrace {
@@ -144,12 +146,14 @@ fn render(record: &impl Serialize) -> Vec<u8> {
 }
 
 impl TuningTrace {
-    /// Open `path` for appending and record that `work` begins.
+    /// Open `path` for appending and record that `work` begins on a device
+    /// of `device`'s properties.
     pub fn begin(
         path: &Path,
         work: TracedWork,
         settings: TuningSettings,
         profile: &super::ResolvedNumericalProfile,
+        device: &seismic::device::DeviceProperties,
     ) -> Result<Self, String> {
         let file = OpenOptions::new()
             .create(true)
@@ -201,6 +205,8 @@ impl TuningTrace {
             "admission": "rounding_steps",
             "governing_step": seismic::GOVERNING_STEP,
             "comparison_version": seismic::COMPARISON_VERSION,
+            // A probed property not yet measured is null.
+            "device": device,
         }));
         Ok(trace)
     }
@@ -645,9 +651,9 @@ impl Serialize for Finished<'_> {
         record.serialize_entry("points", &receipt.points)?;
         record.serialize_entry("requirement", &receipt.requirement)?;
         record.serialize_entry("reselection", &receipt.reselection)?;
-        record.serialize_entry("measurement_identity", &receipt.measurement_identity)?;
         record.serialize_entry("observations", &receipt.observations)?;
         record.serialize_entry("served", &receipt.served)?;
+        record.serialize_entry("default_launches", &receipt.default_launches)?;
         record.serialize_entry("candidates", &Candidates(receipt))?;
         record.serialize_entry("disposition", &receipt.disposition)?;
         record.serialize_entry("method", &receipt.method)?;
@@ -778,6 +784,8 @@ impl Serialize for Candidate<'_> {
         // The formation calls made for it: their seconds, the programs they
         // formed together, and whether none compiled.
         candidate.serialize_entry("formation", &record.formation)?;
+        // What its launches' programs use, as the compiler reports it.
+        candidate.serialize_entry("launches", &record.launches)?;
         candidate.serialize_entry("observations", &record.observations)?;
         candidate.serialize_entry("error_ratio", &ratio.is_finite().then_some(ratio))?;
         candidate.serialize_entry("admitted", &violation.is_none())?;
@@ -803,11 +811,19 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
+        struct Cores;
+        impl seismic::device::cpu::Queries for Cores {
+            fn worker_cores(&self) -> Option<u64> {
+                Some(8)
+            }
+        }
+        let device = seismic::device::DeviceProperties::Cpu(seismic::device::cpu::describe(&Cores, &Default::default()).unwrap());
         let trace = TuningTrace::begin(
             &path,
             TracedWork::Search,
             TuningSettings::STANDARD,
             crate::ResolvedNumericalProfile::standard(),
+            &device,
         )
         .unwrap();
         let configuration = seismic::Configuration {

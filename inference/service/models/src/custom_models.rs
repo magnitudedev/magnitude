@@ -1807,7 +1807,7 @@ impl ManagedLocalModels {
         let this = self.this.clone();
         *watcher = RootWatcher::start(targets, move |affected| {
             if let Some(models) = this.upgrade() {
-                tokio::spawn(async move { models.rescan_after_change(affected).await });
+                magnitude_service_utils::owner::spawn("a custom model rescan", async move { models.rescan_after_change(affected).await });
             }
         });
         let unwatched = match watcher.as_ref() {

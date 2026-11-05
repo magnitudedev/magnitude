@@ -80,12 +80,21 @@ extern "C" __global__ void embedding_rows(SEISMIC_KERNEL_PARAMS) {
     const u64 width = SEISMIC_DIM_D;
     const float scale = __uint_as_float((unsigned)SEISMIC_PARAM_SCALE);
     const bool normalize = SEISMIC_PARAM_NORMALIZE != 0;
-    const u64 token = gathered::row(reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY)),
-                                    SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R, SEISMIC_DIM_F,
-                                    tokens[row * SEISMIC_TOKENS_STRIDE_0]);
+    const long long held = gathered::row(reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY)),
+                                         SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R, SEISMIC_DIM_F,
+                                         tokens[row * SEISMIC_TOKENS_STRIDE_0]);
     const u64 out0 = row * SEISMIC_RESULT_0_STRIDE_0;
     const u64 out1 = row * SEISMIC_RESULT_1_STRIDE_0;
     const u64 stride1 = SEISMIC_RESULT_0_STRIDE_1, wide1 = SEISMIC_RESULT_1_STRIDE_1;
+    // A row that names no table row reads zeros (the whole block's).
+    if (held < 0) {
+        for (u64 column = threadIdx.x; column < width; column += blockDim.x) {
+            element::put<Act>(embedded, out0 + column * stride1, 0.0f);
+            wide[out1 + column * wide1] = 0.0f;
+        }
+        return;
+    }
+    const u64 token = (u64)held;
 #if defined(ROWS16_T)
     const auto table = ROWS16_T_AT(SEISMIC_PTR(SEISMIC_BUFFER_TABLE));
 #define EMBEDDING_ROW(visit) embedding_row(table, token, width, scale, visit)

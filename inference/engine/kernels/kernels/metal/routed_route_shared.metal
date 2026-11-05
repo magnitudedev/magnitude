@@ -1,4 +1,4 @@
-// Decode routing (M <= 8) with the shared expert's gate/up in one launch.
+// Decode routing (M <= DECODE_ROWS) with the shared expert's gate/up in one launch.
 // Threadgroups [0, route_groups) are `routed_route`'s router threadgroups
 // (`lib/routed/route.h`), whose selection counts only them. The shared
 // threadgroups after them each form the normalized rows as a router
@@ -11,14 +11,7 @@
 #define KERNEL_W1 SEISMIC_SHARED_GATE
 #define KERNEL_W2 SEISMIC_SHARED_UP
 #include "lib/routed/route.h"
-
-// The shared rows run `routed_expand`'s paired GEMV, which packs 16-bit
-// activations (`lib/routed/routed.h`); F32 activations take `routed_route`.
-static_assert(element::Act::bytes == 2, "routed_route_shared requires a bf16 or f16 activation element");
-// The rows the shared gate/up weights take (the normalized rows, or NVFP4
-// operands), formed while the shared GEMV stages them.
-constant constexpr bool SHARED_NVFP4 =
-    projection::OperandRecipe<packets::W1_OPERANDS_NVFP4, packets::W2_OPERANDS_NVFP4>::NVFP4;
+#include "lib/routed/shared.h"
 
 kernel void routed_route_shared(
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],
@@ -41,8 +34,8 @@ kernel void routed_route_shared(
     uint tid [[thread_index_in_threadgroup]],
     uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float parts[8 * route_simdgroups];
-    threadgroup float inverses[8];
+    threadgroup float parts[SEISMIC_CONST_DECODE_ROWS * route_simdgroups];
+    threadgroup float inverses[SEISMIC_CONST_DECODE_ROWS];
     threadgroup uint last;
     const RouteRows in = decode_rows(residual, norm, parts, inverses, seismic_words, simd, lane, tid);
     if (group < route_groups) {
@@ -50,15 +43,6 @@ kernel void routed_route_shared(
             arrivals, seismic_words, shared, &last, group, tid, simd, lane);
         return;
     }
-    const uint k = uint(SEISMIC_DIM_H);
-    const projection::Weights<packets::W1> gate{shared_gate, KERNEL_W1_LAYOUT(k), k, nullptr};
-    const projection::Weights<packets::W2> up{shared_up, KERNEL_W2_LAYOUT(k), k, nullptr};
-    const projection::SiluMul<Act> out{shared_product, SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1};
-    const uint rows = uint(SEISMIC_DIM_M);
-    PROJECTION_OPERANDS_SHARED(globals, SHARED_NVFP4);
-    const auto x = projection::operands<SHARED_NVFP4>::rows(in, rows, k, globals, SEISMIC_TUNE_SIMDGROUPS, simd, lane);
-    PROJECTION_FOR_ROWS(rows,
-        (projection::gemv_paired_runtime<packets::W1, packets::W2, SEISMIC_TUNE_ROWS, MAXM, SEISMIC_TUNE_LANES>(x,
-            out, gate, up, rows, SEISMIC_DIM_S, k, group - route_groups, shared, SEISMIC_TUNE_SIMDGROUPS, simd,
-            lane)));
+    PROJECTION_OPERANDS_SHARED(globals, shared_nvfp4);
+    shared_group(in, shared_gate, shared_up, shared_product, seismic_words, group - route_groups, globals, shared, simd, lane);
 }

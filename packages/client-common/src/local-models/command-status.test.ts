@@ -27,7 +27,7 @@ describe("model-specific command feedback", () => {
   })
   it("retires load feedback when the model is observed ready without erasing other commands", () => {
     const base = makeSetupModel(true)
-    const model = { ...base, modelId: first, acquisitionState: { ...base.acquisitionState, residencyState: { _tag: "Ready" as const, allocation: { contextWindowTokens: 4096, memoryDomains: [] }, device: { deviceId: LocalInferenceDeviceIdSchema.make("cuda:0"), backend: "cuda" as const } } } }
+    const model = { ...base, modelId: first, acquisitionState: { ...base.acquisitionState, residencyState: { _tag: "Ready" as const, allocation: { contextWindowTokens: 4096, memoryDomains: [], promptGroupPlaces: { held: 1, capacity: 1 }, streaming: Option.none() }, device: { deviceId: LocalInferenceDeviceIdSchema.make("cuda:0"), backend: "cuda" as const } } } }
     expect(localModelCommandStatus(first, [[observation("load")], [observation("remove")]], Option.some(model)).failures).toEqual([failure("remove")])
   })
   it("shows removal failure once while retaining a separate load rejection", () => {

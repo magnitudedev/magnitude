@@ -722,33 +722,37 @@ impl Generation {
         &self,
         forward: &RoundForward,
         request: RequestId,
-        allowance: usize,
-    ) -> Result<Option<Operation>, String> {
+        chunk_rows: usize,
+        stop: Option<usize>,
+        chunks: usize,
+    ) -> Result<Vec<Operation>, String> {
         if forward.kind != WorkKind::Prefill
             || !forward.selects.is_empty()
             || forward.committed != forward.tokens.len()
             || !self.layout.spans().is_empty()
             || self.finish.is_some()
-            || allowance == 0
         {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let position = self.resident_position + forward.tokens.len();
-        if position < self.reconciliation_target || position >= self.prompt.len() {
-            return Ok(None);
+        if position < self.reconciliation_target {
+            return Ok(Vec::new());
         }
-        let drafter = forward
+        let mut drafter = forward
             .prime
             .as_ref()
             .map(|prime| prime.position + prime.tokens.len());
-        let end = self
-            .layout
-            .chunk_end(position, self.prompt.len(), allowance)?;
-        self.prefill_round(position, end, drafter)?
-            .forward()
-            .clone()
-            .into_operation(request, position, None)
-            .map(Some)
+        // The last chunk ends the prompt, the one that selects.
+        let mut planned = Vec::new();
+        for chunk in self.layout.group_chunks(position, chunk_rows, stop, chunks)? {
+            let next = self.prefill_round(chunk.start, chunk.end, drafter)?.forward().clone();
+            drafter = next
+                .prime
+                .as_ref()
+                .map(|prime| prime.position + prime.tokens.len());
+            planned.push(next.into_operation(request, chunk.start, None)?);
+        }
+        Ok(planned)
     }
 
     /// One selection per proposal, keyed like the target's selection of the
@@ -1243,17 +1247,22 @@ impl StartedRound {
         self.round.publication_bound()
     }
 
-    /// The prompt chunk of at most `allowance` rows that follows this round
-    /// once it commits, when that is known now: the round is a prompt chunk
-    /// that selects nothing, and the prompt is plain text (a conditioned
-    /// span's rows need its encoding).
+    /// The prompt chunks that follow this round once it commits, when they
+    /// are known now: the round is a prompt chunk that selects nothing, and
+    /// the prompt is plain text (a conditioned span's rows need its
+    /// encoding). At most `chunks` of them, each of at most `chunk_rows` rows
+    /// and none past `stop`: the chunks a lookahead or a chain queues behind
+    /// it. Each chunk's drafter entry follows the one before it; planning
+    /// ends with the chunk that selects the first token.
     pub fn planned_prefill(
         &self,
         request: RequestId,
-        allowance: usize,
-    ) -> Result<Option<Operation>, String> {
+        chunk_rows: usize,
+        stop: Option<usize>,
+        chunks: usize,
+    ) -> Result<Vec<Operation>, String> {
         self.generation
-            .planned_prefill(self.round.forward(), request, allowance)
+            .planned_prefill(self.round.forward(), request, chunk_rows, stop, chunks)
     }
 
     /// Prepare acceptance, grammar, method effects, counters, and publication
@@ -1288,6 +1297,16 @@ impl StartedRound {
         let mut generation = self.generation;
         generation.evicted()?;
         Ok(generation)
+    }
+
+    /// Discard the round, its physical outcome aborted (its sequence's
+    /// accepted state returned), to run it again: the generation is as it
+    /// was before the round, unfinished, and starts it anew. Starting a
+    /// round changes the generation only by its method's proposal, which a
+    /// re-run proposes again; its sampling is seeded by position, so the
+    /// round's output is the same.
+    pub fn abandon(self) -> Generation {
+        self.generation
     }
 
     /// Discard the round without committing or publishing it.

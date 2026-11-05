@@ -20,6 +20,7 @@ use magnitude_executor::UnpreparedUnits;
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{DetailedUsage, FinishReason, Options, OutputToken};
 use magnitude_scheduler::prefix_cache::PrefixRetention;
+pub use magnitude_scheduler::protocol::{RoomAnswer, RoomRefusal};
 use seismic::measure::Record;
 use seismic::{PointKey, StoreIdentity};
 use serde::{Deserialize, Serialize};
@@ -33,7 +34,7 @@ pub struct EngineBuild(pub String);
 
 impl EngineBuild {
     pub fn current() -> Self {
-        Self(env!("MAGNITUDE_ENGINE_BUILD").to_owned())
+        Self(magnitude_executor::ENGINE_BUILD.to_owned())
     }
 }
 
@@ -42,6 +43,13 @@ impl fmt::Display for EngineBuild {
         formatter.write_str(&self.0)
     }
 }
+
+/// Host-assigned identity of a measurement room claim, unique for one
+/// worker connection: its answer names it, so the answer to a claim
+/// released before it arrived answers no later claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RoomClaimId(pub u64);
 
 /// Host-assigned request identity, unique for one worker connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -111,6 +119,17 @@ pub enum HostMessage {
         request_id: HostRequestId,
     },
     Observe,
+    /// Make `bytes` of device memory free beside the loaded model for the
+    /// service's measurement job, in place of any claim before: the expert
+    /// bank shrinks toward its floor until it is, answered by
+    /// `MeasurementRoom` naming `claim`, and grows nothing until
+    /// `ReleaseMeasurementRoom`.
+    ClaimMeasurementRoom { claim: RoomClaimId, bytes: u64 },
+    /// The measurement job ended: the bank may grow into its room again.
+    ReleaseMeasurementRoom,
+    /// The measurement job stored new records: price the experts again
+    /// from what is stored.
+    Reprice,
     Shutdown,
 }
 
@@ -158,6 +177,9 @@ pub enum RequestState {
     AwaitingCompletion,
     OutputBlocked,
     Preempted,
+    /// It never ran, and waits for memory to be reclaimed; it may yet be
+    /// refused for memory.
+    MemoryBlocked,
     CapacityBlocked { required: u64, available: u64 },
     Finished(FinishReason),
 }
@@ -236,6 +258,8 @@ pub enum WorkerMessage {
     LoadFailed {
         error: LoadError,
     },
+    /// The request began: it became resident, or published before it did.
+    /// One refused before it began is answered `AdmissionRefused` instead.
     Admitted {
         request_id: HostRequestId,
     },
@@ -263,6 +287,10 @@ pub enum WorkerMessage {
     Observed {
         observation: Result<MemoryObservation, RequestError>,
     },
+    /// The answer to `ClaimMeasurementRoom` `claim`, or why the worker
+    /// cannot answer it. A claim the host released is answered by no
+    /// message, as is one the model's end released (`Unloaded` follows).
+    MeasurementRoom { claim: RoomClaimId, room: Result<RoomAnswer, RequestError> },
     /// The model stopped serving. Every open request has already received
     /// its terminal outcome; the worker exits after this message.
     Unloaded { cause: UnloadCause },
@@ -274,6 +302,7 @@ mod tests {
     use crate::error::InsufficientMemory;
     use crate::options::InputModalities;
     use magnitude_executor::StoreAllocation;
+    use crate::census::{BankResize, ExpertResidency, ServingCensus, ShrinkCause};
 
     fn round_trip<T: Serialize + serde::de::DeserializeOwned>(value: &T) -> T {
         postcard::from_bytes(&postcard::to_allocvec(value).unwrap()).unwrap()
@@ -284,6 +313,7 @@ mod tests {
     #[test]
     fn memory_values_round_trip_through_the_worker_encoding() {
         let device = StoreIdentity::DeviceMemory(seismic::PhysicalIdentity::Uuid([7; 16]));
+        let positive = |value| std::num::NonZeroU64::new(value).unwrap();
         let observation = MemoryObservation {
             census: AllocationCensus {
                 stores: vec![StoreAllocation {
@@ -293,6 +323,38 @@ mod tests {
                     compute_bytes: 3,
                     auxiliary_bytes: 4,
                 }],
+                serving: ServingCensus {
+                    group_places: std::num::NonZeroUsize::new(3).unwrap(),
+                    group_capacity: std::num::NonZeroUsize::new(8).unwrap(),
+                    experts: Some(ExpertResidency {
+                        experts: positive(256),
+                        slots: 64,
+                        floor: 26,
+                        ceiling: 256,
+                        stores: vec![(device.clone(), 10)],
+                        host: Some(magnitude_executor::HostResidency {
+                            slots: 12,
+                            ceiling: positive(256),
+                            bytes: 14,
+                            fill: magnitude_executor::TierFill::Filled,
+                            last_resize: None,
+                        }),
+                        disk_bytes: 11,
+                        tables: vec![magnitude_executor::TableResidency {
+                            records: 40,
+                            floor: 1,
+                            ceiling: positive(42),
+                            bytes: 13,
+                            last_resize: Some(BankResize::Shrank {
+                                cause: ShrinkCause::LiveClaim,
+                                to: 40,
+                                by: positive(1),
+                                at_unix_ms: 12,
+                            }),
+                        }],
+                        last_resize: None,
+                    }),
+                },
             },
             stores: vec![
                 StoreHeadroom {

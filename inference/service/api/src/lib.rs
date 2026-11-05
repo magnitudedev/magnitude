@@ -2680,6 +2680,13 @@ mod tests {
                             allocation: ModelInstanceAllocation {
                                 context_window_tokens: 1,
                                 memory_domains: Vec::new(),
+                                prompt_group_places: magnitude_service_contracts::models::PromptGroupPlacesParts {
+                                    held: std::num::NonZeroU64::MIN,
+                                    capacity: std::num::NonZeroU64::MIN,
+                                }
+                                .try_into()
+                                .unwrap(),
+                                streaming: None,
                             },
                             device: ModelLoadDevice {
                                 id: magnitude_service_contracts::HardwareDeviceId::new(
@@ -3090,7 +3097,9 @@ mod tests {
                 "assessment".to_owned(),
             ),
             memory: Vec::new(),
-            performance: magnitude_service_contracts::models::ModelPerformance::Pending,
+            residency: magnitude_service_contracts::models::ModelResidency::Resident {
+                performance: magnitude_service_contracts::models::ModelPerformance::Pending,
+            },
             projector: magnitude_service_contracts::models::ProjectorVerdict::None,
             drafter: DrafterVerdict::Bound {
                 method: SpeculativeMethod::DFlash,

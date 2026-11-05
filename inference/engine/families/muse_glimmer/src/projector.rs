@@ -5,7 +5,7 @@
 
 use crate::{invalid, product, Error};
 use magnitude_artifacts::gguf::{Directory, Element, PROJECTOR_ARCHITECTURE, Scalar, Value};
-use magnitude_family_common::{architecture_keys, rotary, Tensors};
+use magnitude_family_common::{architecture_keys, projector_type, rotary, Tensors};
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, ImportTransform, MergerStage, PositionSampling,
     VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock,
@@ -81,23 +81,14 @@ pub fn describe_projector(
     output_hidden: u64,
     feature_epsilon: f64,
 ) -> Result<VisionDescription, Error> {
-    if directory.value("general.architecture").and_then(Value::string) != Some(PROJECTOR_ARCHITECTURE)
-        || directory.value("general.type").and_then(Value::string) != Some("mmproj")
-        || directory.value("clip.has_vision_encoder")
-            != Some(&Value::Scalar(Scalar::Bool(true)))
-        || directory.value("clip.projector_type").and_then(Value::string)
-            != Some("muse-glimmer")
-    {
-        return Err(invalid("unsupported Muse Glimmer projector identity"));
-    }
+    projector_type(directory, &[("muse-glimmer", ())], output_hidden)?;
     if let Some((_, entry)) = architecture_keys(directory, PROJECTOR_ARCHITECTURE)
         .find(|(_, entry)| !KEYS.contains(&entry.name.as_str()))
     {
         return Err(invalid(format!("unknown metadata {:?}", entry.name)));
     }
-    if unsigned(directory, "clip.vision.projection_dim")? != output_hidden {
-        return Err(invalid("projector width differs from the decoder width"));
-    }
+    // Declared, and the target's (`projector_type`).
+    unsigned(directory, "clip.vision.projection_dim")?;
     let hidden = unsigned(directory, "clip.vision.embedding_length")?;
     let intermediate = unsigned(directory, "clip.vision.feed_forward_length")?;
     let depth = unsigned(directory, "clip.vision.block_count")?;

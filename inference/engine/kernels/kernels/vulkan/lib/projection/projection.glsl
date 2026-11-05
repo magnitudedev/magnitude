@@ -111,6 +111,8 @@ struct projection_epilogue {
     uint64_t inject0;
     uint streams;       // Scatter, Mix*: hyper-connection streams of `width` columns
     uint width;
+    uint64_t outputs;   // the rows' outputs: 0, row m's at m y0; else row m's at the element offset
+                        // outputs[m] (I32, `projection_gathered`)
 };
 
 // A weight's second-level scale (NVFP4 `.scale`, per tensor or per expert)
@@ -133,13 +135,13 @@ float projection_scale_factor(uint64_t scale, uint64_t extent, uint64_t stride, 
 
 projection_epilogue projection_store(const int element, uint64_t y, uint64_t stride0, uint64_t stride1, uint64_t column) {
     return projection_epilogue(PROJECTION_STORE, element, y, stride0, stride1, column, 0ul, 0ul, 0ul, 0ul, 0, 0.0, 1.0,
-        1.0, 0ul, 0ul, 1u, 0u);
+        1.0, 0ul, 0ul, 1u, 0u, 0ul);
 }
 
 projection_epilogue projection_residual(const int act, uint64_t y, uint64_t stride0, uint64_t stride1,
     uint64_t residual, uint64_t residual0, uint64_t residual1, uint64_t rows) {
     return projection_epilogue(PROJECTION_RESIDUAL, act, y, stride0, stride1, 0ul, residual, residual0, residual1, rows,
-        0, 0.0, 1.0, 1.0, 0ul, 0ul, 1u, 0u);
+        0, 0.0, 1.0, 1.0, 0ul, 0ul, 1u, 0u, 0ul);
 }
 
 // `scatter`: `streams` hyper-connection streams of `width` columns, each the
@@ -149,7 +151,7 @@ projection_epilogue projection_scatter(const int act, uint64_t y, uint64_t strid
     uint64_t residual, uint64_t residual0, uint64_t residual1, uint64_t rows, uint64_t inject, uint64_t inject0,
     uint streams, uint width) {
     return projection_epilogue(PROJECTION_SCATTER, act, y, stride0, stride1, 0ul, residual, residual0, residual1, rows,
-        0, 0.0, 1.0, 1.0, inject, inject0, streams, width);
+        0, 0.0, 1.0, 1.0, inject, inject0, streams, width, 0ul);
 }
 
 // An output entry's epilogue by its inject extent `inject_extent`: the
@@ -166,13 +168,13 @@ projection_epilogue projection_output(const int act, uint64_t y, uint64_t stride
 // A mix site's low-rank rows (`stream_mix_down`): round_A(silu(v / streams)).
 projection_epilogue projection_mix_low(const int act, uint64_t y, uint64_t stride0, uint64_t stride1, uint streams) {
     return projection_epilogue(PROJECTION_MIX_LOW, act, y, stride0, stride1, 0ul, 0ul, 0ul, 0ul, 0ul, 0, 0.0, 1.0,
-        1.0, 0ul, 0ul, streams, 0u);
+        1.0, 0ul, 0ul, streams, 0u, 0ul);
 }
 
 // A mix site's inject values (`stream_mix_down`): 2 sigmoid(v / streams), F32.
 projection_epilogue projection_mix_inject(uint64_t y, uint64_t stride0, uint64_t stride1, uint streams) {
     return projection_epilogue(PROJECTION_MIX_INJECT, ELEMENT_F32, y, stride0, stride1, 0ul, 0ul, 0ul, 0ul, 0ul, 0,
-        0.0, 1.0, 1.0, 0ul, 0ul, streams, 0u);
+        0.0, 1.0, 1.0, 0ul, 0ul, streams, 0u, 0ul);
 }
 
 // A mix site's per-stream partials (`stream_mix_up`): column n of stream
@@ -181,38 +183,38 @@ projection_epilogue projection_mix_inject(uint64_t y, uint64_t stride0, uint64_t
 projection_epilogue projection_mix(uint64_t y, uint64_t stride0, uint64_t stride1, uint64_t x, uint64_t x0,
     uint64_t x1, uint64_t inverse, uint64_t inverse0, uint64_t norm, const int norm_kind, uint streams, uint width) {
     return projection_epilogue(PROJECTION_MIX, ELEMENT_F32, y, stride0, stride1, norm, x, x0, x1, 0ul, norm_kind,
-        0.0, 1.0, 1.0, inverse, inverse0, streams, width);
+        0.0, 1.0, 1.0, inverse, inverse0, streams, width, 0ul);
 }
 
 projection_epilogue projection_silu_mul(const int act, uint64_t y, uint64_t stride0, uint64_t stride1) {
     return projection_epilogue(PROJECTION_SILU_MUL, act, y, stride0, stride1, 0ul, 0ul, 0ul, 0ul, 0ul, 0, 0.0, 1.0,
-        1.0, 0ul, 0ul, 1u, 0u);
+        1.0, 0ul, 0ul, 1u, 0u, 0ul);
 }
 
 projection_epilogue projection_glu(const int act, uint64_t y, uint64_t stride0, uint64_t stride1, int function) {
     return projection_epilogue(PROJECTION_GLU, act, y, stride0, stride1, 0ul, 0ul, 0ul, 0ul, 0ul, function, 0.0, 1.0,
-        1.0, 0ul, 0ul, 1u, 0u);
+        1.0, 0ul, 0ul, 1u, 0u, 0ul);
 }
 
 projection_epilogue projection_activated(const int act, uint64_t y, uint64_t stride0, uint64_t stride1, int function) {
     return projection_epilogue(PROJECTION_ACTIVATED, act, y, stride0, stride1, 0ul, 0ul, 0ul, 0ul, 0ul, function, 0.0,
-        1.0, 1.0, 0ul, 0ul, 1u, 0u);
+        1.0, 1.0, 0ul, 0ul, 1u, 0u, 0ul);
 }
 
 projection_epilogue projection_mul(uint64_t y, uint64_t stride0, uint64_t stride1) {
     return projection_epilogue(PROJECTION_MUL, ELEMENT_F32, y, stride0, stride1, 0ul, 0ul, 0ul, 0ul, 0ul, 0, 0.0, 1.0,
-        1.0, 0ul, 0ul, 1u, 0u);
+        1.0, 0ul, 0ul, 1u, 0u, 0ul);
 }
 
 projection_epilogue projection_activated_mul(const int act, uint64_t y, uint64_t stride0, uint64_t stride1,
     uint64_t multiplier, uint64_t multiplier0, uint64_t multiplier1, int function) {
     return projection_epilogue(PROJECTION_ACTIVATED_MUL, act, y, stride0, stride1, 0ul, multiplier, multiplier0,
-        multiplier1, 0ul, function, 0.0, 1.0, 1.0, 0ul, 0ul, 1u, 0u);
+        multiplier1, 0ul, function, 0.0, 1.0, 1.0, 0ul, 0ul, 1u, 0u, 0ul);
 }
 
 projection_epilogue projection_logits(uint64_t y, uint64_t stride0, uint64_t stride1, float cap) {
     return projection_epilogue(PROJECTION_LOGITS, ELEMENT_F32, y, stride0, stride1, 0ul, 0ul, 0ul, 0ul, 0ul, 0, cap, 1.0,
-        1.0, 0ul, 0ul, 1u, 0u);
+        1.0, 0ul, 0ul, 1u, 0u, 0ul);
 }
 
 // A routed sublayer's column n of row m joining the residual (`routed_output`,
@@ -236,14 +238,28 @@ void projection_routed_join(uint64_t y, uint64_t y0, uint64_t y1, uint64_t resid
     }
 }
 
+// Where row m's outputs start (element offset): m y0, or where the
+// epilogue's outputs are gathered (`projection_gathered`), outputs[m].
+uint64_t projection_out_row(projection_epilogue out_, uint m) {
+    return out_.outputs == 0ul ? uint64_t(m) * out_.y0 : uint64_t(element_i32_at(out_.outputs + uint64_t(m) * 4ul));
+}
+
+// `out_` with GEMV row m's outputs at element offset `outputs[m]` (I32 a
+// row) instead of m y0: a gathered GEMV's rows publish into the choices they
+// were gathered for.
+projection_epilogue projection_gathered(projection_epilogue out_, uint64_t outputs) {
+    out_.outputs = outputs;
+    return out_;
+}
+
 // Publishes one output of an unpaired epilogue.
 void projection_put(projection_epilogue out_, uint m, uint n, float value) {
 #if defined(PROJECTION_SCALED)
     value *= out_.scale;
 #endif
-    const uint64_t at = uint64_t(m) * out_.y0 + uint64_t(n) * out_.y1;
+    const uint64_t at = projection_out_row(out_, m) + uint64_t(n) * out_.y1;
     if (out_.kind == PROJECTION_STORE) {
-        element_put(out_.act, out_.y, uint64_t(m) * out_.y0 + (out_.column + uint64_t(n)) * out_.y1, value);
+        element_put(out_.act, out_.y, projection_out_row(out_, m) + (out_.column + uint64_t(n)) * out_.y1, value);
     } else if (out_.kind == PROJECTION_ACTIVATED) {
         element_put(out_.act, out_.y, at, functions_activate(out_.function, element_round(out_.act, value)));
     } else if (out_.kind == PROJECTION_ACTIVATED_MUL) {
@@ -258,7 +274,7 @@ void projection_put(projection_epilogue out_, uint m, uint n, float value) {
         const uint64_t row = uint64_t(projection_row(out_.rows, m)) * out_.r0;
         for (uint s = 0u; s < out_.streams; ++s) {
             const uint64_t column = uint64_t(s * out_.width + n);
-            element_f32_put(out_.y + (uint64_t(m) * out_.y0 + column * out_.y1) * 4ul,
+            element_f32_put(out_.y + (projection_out_row(out_, m) + column * out_.y1) * 4ul,
                 element_f32_at(out_.residual + (row + column * out_.r1) * 4ul)
                     + rounded * element_f32_at(out_.inject + (uint64_t(m) * out_.inject0 + s) * 4ul));
         }
@@ -286,7 +302,7 @@ void projection_put_pair(projection_epilogue out_, uint m, uint n, float gate_su
     gate_sum *= out_.scale;
     up_sum *= out_.scale2;
 #endif
-    const uint64_t at = uint64_t(m) * out_.y0 + uint64_t(n) * out_.y1;
+    const uint64_t at = projection_out_row(out_, m) + uint64_t(n) * out_.y1;
     if (out_.kind == PROJECTION_MUL) {
         element_f32_put(out_.y + at * 4ul, gate_sum * up_sum);
         return;
@@ -760,6 +776,15 @@ void projection_gemv(const int wk, const int uk, const bool paired, const uint r
 //
 // A GEMM launch declares TM * TN * 32 / (WM * WN) invocations and (TM + TN) *
 // 80 shared bytes; TM in {32, 64, 128}, TN in {64, 128}, WM <= TM, WN <= TN.
+// The declarations default to 64 x 128 tiles of 32 x 32 sub-tiles (256
+// invocations). On an RTX 3090 (NVIDIA 595.91.07, attention_project at
+// Qwen3.6 35B prefill shapes) its pipelines' statistics separate the slow
+// shapes: every 64 x 64 sub-tile reaches the 255-register ceiling and spills
+// (6.2-7.1x the best), and 128 x 128 tiles of 32 x 32 sub-tiles take 128
+// registers in each of 512 invocations, the whole register file (6.6x).
+// 64 x 128 / 32 x 32 (128 registers, 256 invocations) is the best there, and
+// on GB10 its recorded time is 1.12x the best of each GEMM entry (geometric
+// mean), where 128 x 128 / 32 x 32 was 1.15x.
 
 #define PROJECTION_GEMM_K 32u
 #define PROJECTION_GEMM_LDA 40u

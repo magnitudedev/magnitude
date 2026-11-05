@@ -12,13 +12,15 @@
 //! moves a published intermediate by one A ulp. The bounds are relative to
 //! the result's RMS.
 
+mod common;
+
 use magnitude_kernels::{
     vision_attention, vision_clamp, vision_gated_convolution, vision_linear, vision_norm,
     vision_patch_stem, vision_pool, vision_position,
 };
 use seismic::{Device, Element, NativeSpecialization, Tensor};
 use seismic_lang::{
-    checked::{CheckedModule, SourceFile, check_source},
+    checked::{CheckedModule, SourceFile},
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OracleOutcome, OutcomeValue, TensorData},
@@ -189,7 +191,7 @@ fn module() -> CheckedModule {
             text: text.into(),
         });
     }
-    check_source(sources).unwrap()
+    crate::common::check(sources)
 }
 
 enum Input<'a> {
@@ -260,26 +262,13 @@ fn relative_error(label: &str, actual: &[f32], expected: &[f32], maximum: f32, m
     );
 }
 
-/// The host's accelerator (Metal on macOS, else CUDA;
-/// `SEISMIC_TEST_BACKEND=vulkan` selects Vulkan; `cpu` runs the CPU only).
-fn accelerator(catalog: &seismic::Devices) -> Option<Device> {
-    let backend = match std::env::var("SEISMIC_TEST_BACKEND").ok().as_deref() {
-        Some("vulkan") => seismic::BackendName::Vulkan,
-        Some("cpu") => return None,
-        Some(other) => panic!("SEISMIC_TEST_BACKEND={other}: only vulkan or cpu is selectable"),
-        None if cfg!(target_os = "macos") => seismic::BackendName::Metal,
-        None => seismic::BackendName::Cuda,
-    };
-    Some(catalog.open_backend(backend).unwrap())
-}
-
-/// The accelerator and the CPU.
+/// The host's accelerator (Metal on macOS, else CUDA) and the CPU; a
+/// requested backend (Vulkan or the CPU among them) alone
+/// ([`seismic_native_tests::first_and_cpu`]).
 fn devices() -> Vec<Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    accelerator(&catalog)
-        .into_iter()
-        .chain([catalog.open_backend(seismic::BackendName::Cpu).unwrap()])
-        .collect()
+    use seismic::BackendName::{Cpu, Cuda, Metal, Vulkan};
+    let accelerator = if cfg!(target_os = "macos") { Metal } else { Cuda };
+    seismic_native_tests::first_and_cpu(&[accelerator], &[Metal, Cuda, Vulkan, Cpu])
 }
 
 fn is_cpu(device: &Device) -> bool {

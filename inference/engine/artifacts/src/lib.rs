@@ -14,8 +14,8 @@ mod package;
 mod payload;
 mod preprocessing;
 mod source;
+mod reader;
 pub mod support;
-mod uncached;
 
 pub use error::Error;
 pub use identity::{ArtifactIdentity, PackageIdentity};
@@ -29,7 +29,10 @@ pub use preprocessing::{
 pub use source::MappedWindow;
 pub use source::{FileSource, SourceReader};
 pub use support::{UnsupportedReason, WeightTypeCount};
-pub use uncached::UncachedSource;
+pub use reader::{
+    adopt_volume, cached_pages, engine_work, probe_volume, read_cores, ArtifactReader, Delivery, EngineWork, Flight, RangeReader, CachePolicy, Ended, Job, Panic,
+    Outstanding, Priority, Range, Urgent, ALIGNMENT, VolumeChoice,
+};
 pub use token::TokenId;
 
 mod token;

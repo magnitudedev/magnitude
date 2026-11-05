@@ -1,14 +1,16 @@
 //! The progressive head readout (`readout.seismic`) on Metal (macOS) and CUDA
 //! (elsewhere): the natives against their portable bodies (the Seismic
 //! interpreter), and certified selections against the full planes readout.
-//! Tests return early without a Metal or CUDA device.
+//! Tests return early when no device of either backend is available.
+
+mod common;
 
 use magnitude_kernels::{
     readout_exact_rows, readout_planes_rows, readout_refine_rows, readout_top_rows,
 };
 use seismic::{BackendName, Device, Element, NativeSpecialization, Tensor};
 use seismic_lang::{
-    checked::{CheckedModule, SourceFile, check_source},
+    checked::{CheckedModule, SourceFile},
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OracleOutcome, OutcomeValue, TensorData},
@@ -19,13 +21,10 @@ use seismic_lang::{
 
 const EPSILON: f32 = 1e-6;
 
+/// The device under test: the first available of Metal and CUDA, or the
+/// backend `SEISMIC_TEST_BACKEND` selects (`seismic_native_tests::devices`).
 fn device() -> Option<Device> {
-    let backend = if cfg!(target_os = "macos") {
-        BackendName::Metal
-    } else {
-        BackendName::Cuda
-    };
-    seismic::Devices::discover(&[]).ok()?.open_backend(backend).ok()
+    seismic_native_tests::devices(&[BackendName::Metal, BackendName::Cuda]).into_iter().next()
 }
 
 /// The launch of the top level's and the full pass's vocabulary projection
@@ -825,7 +824,7 @@ fn module() -> CheckedModule {
             text: text.into(),
         });
     }
-    check_source(sources).unwrap()
+    crate::common::check(sources)
 }
 
 enum Input {

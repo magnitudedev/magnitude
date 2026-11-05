@@ -268,7 +268,7 @@ impl<'a> QualificationView<'a> {
         }
 
         // Every head reads slot 0 of a one-slot table held in slots.
-        let slots = zeros(binding.table, &[1, binding.width])?;
+        let slots = zeros(binding.table, &[1, 1, binding.width])?;
         let decoded = kernels
             .stored
             .call(stored_rows::Args {

@@ -1,7 +1,9 @@
 // Dense weight import over the [B, N, K] view; one invocation per element in
 // row-major order, over a grid-stride loop (the grid is capped below the
-// 65535-group floor). The Vulkan form of `metal/import_dense.metal`.
-#include <seismic/element.glsl>
+// 65535-group floor). The Vulkan form of `metal/import_dense.metal`. The
+// result is a record port (bank records, chunked, import through it): matrix
+// b is written from its own record's base.
+#include <seismic/slab.glsl>
 
 #if defined(SEISMIC_ELEMENT_E_REPRESENTATION_F32)
 #define IMPORT_SOURCE_KIND ELEMENT_F32
@@ -32,8 +34,8 @@ void import_dense() {
         const uint64_t k = index % SEISMIC_DIM_K;
         const uint64_t n = index / SEISMIC_DIM_K % SEISMIC_DIM_N;
         const uint64_t b = index / SEISMIC_DIM_K / SEISMIC_DIM_N;
-        element_put(IMPORT_DESTINATION_KIND, destination,
-            b * SEISMIC_RESULT_0_STRIDE_0 + n * SEISMIC_RESULT_0_STRIDE_1 + k * SEISMIC_RESULT_0_STRIDE_2,
+        element_put(IMPORT_DESTINATION_KIND, slab_region(destination, b),
+            n * SEISMIC_RESULT_0_STRIDE_1 + k * SEISMIC_RESULT_0_STRIDE_2,
             element_at(IMPORT_SOURCE_KIND, source,
                 b * SEISMIC_SOURCE_STRIDE_0 + n * SEISMIC_SOURCE_STRIDE_1 + k * SEISMIC_SOURCE_STRIDE_2));
     }

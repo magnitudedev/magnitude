@@ -1,0 +1,91 @@
+#define ROUTE_DECODE_ONLY
+#define ROUTE_PROJECTION
+#define KERNEL_W1 SEISMIC_SHARED_GATE
+#define KERNEL_W2 SEISMIC_SHARED_UP
+#include "lib/routed/route.glsl"
+#include "lib/routed/streamed.glsl"
+
+#define ROUTE_FINISH_SELECTION(whole) routed_resolve(whole)
+#include "lib/routed/route_shared.glsl"
+
+void routed_route_gemv() { route_gemv(); }
+void routed_route_streamed1() { routed_route_shared_dispatch(1u, false); }
+void routed_route_streamed2() { routed_route_shared_dispatch(2u, false); }
+void routed_route_streamed4() { routed_route_shared_dispatch(4u, false); }
+void routed_route_streamed8() { routed_route_shared_dispatch(8u, false); }
+void routed_route_whole1() { routed_route_shared_dispatch(1u, true); }
+void routed_route_whole2() { routed_route_shared_dispatch(2u, true); }
+void routed_route_whole4() { routed_route_shared_dispatch(4u, true); }
+void routed_route_whole8() { routed_route_shared_dispatch(8u, true); }
+
+// Instantiate only the next router's numerical recipe: it publishes no
+// normalized row, coefficient, score or route in this layer's outputs.
+#undef ROUTE_FN
+#define ROUTE_FN(name) hint_ ## name
+#undef ROUTE_E
+#define ROUTE_E uint(SEISMIC_DIM_EN)
+#undef ROUTE_NORM_BUFFER
+#define ROUTE_NORM_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_NEXT_NORM)
+#undef ROUTE_NORM_STRIDE
+#define ROUTE_NORM_STRIDE SEISMIC_NEXT_NORM_STRIDE_0
+#undef ROUTE_ROUTER_BUFFER
+#define ROUTE_ROUTER_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_NEXT_ROUTER)
+#undef ROUTE_ROUTER_STRIDE_0
+#define ROUTE_ROUTER_STRIDE_0 SEISMIC_NEXT_ROUTER_STRIDE_0
+#undef ROUTE_ROUTER_STRIDE_1
+#define ROUTE_ROUTER_STRIDE_1 SEISMIC_NEXT_ROUTER_STRIDE_1
+#undef ROUTE_ROUTER_ROWS
+#define ROUTE_ROUTER_ROWS PACKETS_ROWS_PACKED(SEISMIC_NEXT_ROUTER)
+#undef ROUTE_LOGITS
+#define ROUTE_LOGITS (SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS) + SEISMIC_DIM_M * (SEISMIC_DIM_E + 1ul) * 4ul)
+#undef ROUTE_PUBLISH
+#define ROUTE_PUBLISH false
+ROUTE_NUMERICAL
+// And the router's two layers ahead (`after_*`), into the logits after the
+// next router's [M, EN + 1].
+#undef ROUTE_FN
+#define ROUTE_FN(name) after_ ## name
+#undef ROUTE_E
+#define ROUTE_E uint(SEISMIC_DIM_EN)
+#undef ROUTE_NORM_BUFFER
+#define ROUTE_NORM_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_AFTER_NORM)
+#undef ROUTE_NORM_STRIDE
+#define ROUTE_NORM_STRIDE SEISMIC_AFTER_NORM_STRIDE_0
+#undef ROUTE_ROUTER_BUFFER
+#define ROUTE_ROUTER_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_AFTER_ROUTER)
+#undef ROUTE_ROUTER_STRIDE_0
+#define ROUTE_ROUTER_STRIDE_0 SEISMIC_AFTER_ROUTER_STRIDE_0
+#undef ROUTE_ROUTER_STRIDE_1
+#define ROUTE_ROUTER_STRIDE_1 SEISMIC_AFTER_ROUTER_STRIDE_1
+#undef ROUTE_ROUTER_ROWS
+#define ROUTE_ROUTER_ROWS PACKETS_ROWS_PACKED(SEISMIC_AFTER_ROUTER)
+#undef ROUTE_LOGITS
+#define ROUTE_LOGITS (SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS) + SEISMIC_DIM_M * (SEISMIC_DIM_E + 1ul) * 4ul + SEISMIC_DIM_M * (SEISMIC_DIM_EN + 1ul) * 4ul)
+#undef ROUTE_PUBLISH
+#define ROUTE_PUBLISH false
+ROUTE_NUMERICAL
+// Each lead's router GEMV (workgroup row y: 0 one layer ahead, 1 two).
+void hint_routed_route_gemv() {
+    if (gl_WorkGroupID.y == 0u)
+        hint_route_gemv();
+    else
+        after_route_gemv();
+}
+
+// Each lead's ranking and hints (workgroup row y), into the lead's ring row.
+void routed_route_hint() {
+    const uint lead = gl_WorkGroupID.y;
+    const uint64_t row = SEISMIC_SUBGROUP;
+    if (row < SEISMIC_DIM_M) {
+        float chosen[ROUTE_K];
+        int winners[ROUTE_K];
+        if (lead == 0u)
+            hint_route_rank(row, chosen, winners);
+        else
+            after_route_rank(row, chosen, winners);
+        if (SEISMIC_LANE == 0u)
+            for (uint rank = 0u; rank < ROUTE_K; ++rank)
+                seismic_shared_i32[uint(row) * ROUTE_K + rank] = winners[rank];
+    }
+    routed_hint_publish(lead);
+}

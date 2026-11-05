@@ -17,8 +17,8 @@ use std::ops::Range;
 /// (2026-01-01T00:00:00Z), so a rendering is a function of the fixture.
 const RENDER_TIME: i64 = 1_767_225_600;
 
-/// Stands in for a scored message's content to locate it in the prompt: the
-/// content is where the two prompts differ.
+/// Stands in for what a scored message generated (its reasoning, its content)
+/// to locate it in the prompt: it is where the two prompts differ.
 const CONTENT_PROBE: &str = "\u{E000}";
 
 /// Chat-completions request fields besides `messages` and `tools` that every
@@ -531,9 +531,14 @@ impl<'a> Renderer<'a> {
         Ok(offsets)
     }
 
-    /// The prompt bytes a scored message renders as: where the prompt differs
-    /// from the prompt with that message's content replaced by a probe and
-    /// its tool calls removed. Its reasoning is not scored.
+    /// The prompt bytes a scored message renders as, the text its model
+    /// generated for it: where the prompt differs from the prompt with its
+    /// reasoning (where it has any) and its content (where it has any, or
+    /// tool calls, which are removed) each replaced by a probe. Reasoning
+    /// is scored as content is: a model whose template keeps reasoning on
+    /// generates it first, and an answer cut short may hold nothing else;
+    /// a reply that reasoned is scored from the end of the prompt it
+    /// answered, so the block's opener the model generated is in it.
     fn scored_bytes(
         &self,
         conversation: &Conversation,
@@ -543,13 +548,13 @@ impl<'a> Renderer<'a> {
     ) -> Result<Range<usize>, String> {
         // The chat adapter drops assistant turns without content, reasoning
         // or tool calls, and nothing else between assistant turns.
+        let nonempty = |message: &Map<String, Value>, key: &str| match message.get(key) {
+            Some(Value::String(text)) => !text.is_empty(),
+            Some(Value::Array(items)) => !items.is_empty(),
+            _ => false,
+        };
         let carries = |message: &Map<String, Value>| {
-            let nonempty = |key: &str| match message.get(key) {
-                Some(Value::String(text)) => !text.is_empty(),
-                Some(Value::Array(items)) => !items.is_empty(),
-                _ => false,
-            };
-            nonempty("content") || nonempty("reasoning_content") || nonempty("tool_calls")
+            nonempty(message, "content") || nonempty(message, "reasoning_content") || nonempty(message, "tool_calls")
         };
         if !carries(&conversation.messages[scored]) {
             return Err("a scored assistant message has no content".into());
@@ -572,7 +577,17 @@ impl<'a> Renderer<'a> {
         let message = probe.messages[position]
             .as_object_mut()
             .ok_or("a rendered message is not an object")?;
-        message.insert("content".into(), CONTENT_PROBE.into());
+        let reasoned = nonempty(&*message, "reasoning_content");
+        if reasoned {
+            message.insert("reasoning_content".into(), CONTENT_PROBE.into());
+        }
+        // Content left empty stays empty, so the span of an answer that only
+        // reasoned ends where its reasoning does, not past the template's
+        // close of the block, which the model never generated.
+        let said = nonempty(&*message, "content") || nonempty(&*message, "tool_calls") || !reasoned;
+        if said {
+            message.insert("content".into(), CONTENT_PROBE.into());
+        }
         message.remove("tool_calls");
         let probed = self
             .prepare(&probe)
@@ -595,6 +610,21 @@ impl<'a> Renderer<'a> {
         if end <= start {
             return Err("a scored message renders no text".into());
         }
+        // A reply that reasoned is scored from where the prompt it answered
+        // ended: a template that leaves the reasoning block to the model has
+        // it generate the block's opener, which the reply's rendering shows
+        // before its reasoning.
+        let start = match reasoned {
+            false => start,
+            true => {
+                let asked = self.prepare(&self.request(&conversation.messages[..scored], &conversation.tools)?)?;
+                let asked = asked.text.as_bytes();
+                if asked.len() > start || !prompt.starts_with(asked) {
+                    return Err("a reasoned reply's rendering does not continue the prompt it answered".into());
+                }
+                asked.len()
+            }
+        };
         Ok(start..end)
     }
 }

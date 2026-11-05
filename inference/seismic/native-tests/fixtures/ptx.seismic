@@ -50,7 +50,7 @@ fn ptx_ldmatrix(x: &tensor[4, 8, 8] E) -> tensor[4, 8, 8] E:
     return result
 
 native ptx_ldmatrix for cuda from "cuda/ptx_ldmatrix.cu":
-    params (COUNT in [1, 2, 4])
+    params (COUNT in [1, 2, 4] default 1)
     launch ptx_ldmatrix:
         threadgroups (1, 1, 1)
         threads_per_threadgroup (32, 1, 1)
@@ -65,7 +65,7 @@ fn ptx_ldmatrix_trans(x: &tensor[4, 8, 8] E) -> tensor[4, 8, 8] E:
     return result
 
 native ptx_ldmatrix_trans for cuda from "cuda/ptx_ldmatrix.cu":
-    params (COUNT in [1, 2, 4])
+    params (COUNT in [1, 2, 4] default 1)
     launch ptx_ldmatrix_trans:
         threadgroups (1, 1, 1)
         threads_per_threadgroup (32, 1, 1)
@@ -79,7 +79,7 @@ fn ptx_cp_async[N](x: &tensor[N] f32) -> tensor[N] f32:
     return result
 
 native ptx_cp_async for cuda from "cuda/ptx_cp_async.cu":
-    params (STAGES in [1, 2, 3])
+    params (STAGES in [1, 2, 3] default 1)
     launch ptx_cp_async:
         threadgroups (1, 1, 1)
         threads_per_threadgroup (128, 1, 1)
@@ -93,7 +93,7 @@ fn ptx_load_nc[N](x: &tensor[N] f32) -> tensor[N] f32:
     return result
 
 native ptx_load_nc for cuda from "cuda/ptx_load_nc.cu":
-    params (NO_ALLOCATE in [0, 1])
+    params (NO_ALLOCATE in [0, 1] default 0)
     launch ptx_load_nc:
         threadgroups (ceil_div(N, 512), 1, 1)
         threads_per_threadgroup (128, 1, 1)

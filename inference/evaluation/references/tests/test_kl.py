@@ -27,7 +27,7 @@ def test_a_pair_is_judged_against_the_reference_and_each_other(tmp_path, rendere
     _logits(tmp_path / "base", rendered, lambda r: logits_fake.truth(r) + noisy)
     _logits(tmp_path / "candidate", rendered, lambda r: logits_fake.truth(r) + noisy)
     summary = kl.run(tmp_path / "candidate", tmp_path / "artifacts.json", tmp_path / "build.json",
-                     tmp_path / "cache", tmp_path / "out" / "kl.json", tmp_path / "base", None, False)
+                     tmp_path / "cache", tmp_path / "out" / "kl.json", tmp_path / "base", None)
     assert summary["reference"]["cached"] is True
     assert summary["builds_identical"] is True
     assert {change["verdict"] for change in summary["changes"]} == {"within noise"}

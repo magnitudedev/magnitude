@@ -73,7 +73,13 @@ class NemotronHReference(Reference):
         self.kv_heads = kv
         self.head_count = package.key("attention.head_count")
         self.head_dim = package.key("attention.key_length")
-        self.eps = package.key("attention.layer_norm_rms_epsilon")
+        # Converters since Nemotron 3.5 write only `layer_norm_epsilon`, earlier ones only
+        # `layer_norm_rms_epsilon`: exactly one is stated.
+        stated = [suffix for suffix in ("attention.layer_norm_rms_epsilon", "attention.layer_norm_epsilon")
+                  if f"{package.architecture}.{suffix}" in package.metadata]
+        if len(stated) != 1:
+            raise ValueError(f"the header states {stated or 'neither'} of the layer-norm epsilons, not one")
+        self.eps = package.key(stated[0])
         self.inner = package.key("ssm.inner_size")
         self.state_size = package.key("ssm.state_size")
         self.ssm_heads = package.key("ssm.time_step_rank")
@@ -81,7 +87,7 @@ class NemotronHReference(Reference):
         self.conv_width = package.key("ssm.conv_kernel")
         self.head_width = self.inner // self.ssm_heads
         self.experts = package.key("expert_count")
-        self.experts_used = package.key("expert_used_count")
+        self.experts_used = per_layer(package.key("expert_used_count"), main)
         if package.key("expert_group_count", 1) != 1:
             raise ValueError("group-limited routing is outside the in-scope Nemotron models")
         if not package.key("expert_weights_norm"):
@@ -120,7 +126,7 @@ class NemotronHReference(Reference):
         w, p = self.weights, f"blk.{layer}."
         rows = u.reshape(-1, self.hidden_size)
         scores = torch.sigmoid(linear(rows, w(p + "ffn_gate_inp.weight")))
-        selected = route_top_k(scores + w(p + "exp_probs_b.bias"), self.experts_used)
+        selected = route_top_k(scores + w(p + "exp_probs_b.bias"), self.experts_used[layer])
         weights = torch.gather(scores, 1, selected)
         weights = weights / (weights.sum(-1, keepdim=True) + 1e-20) * self.routed_scale
         latent = linear(rows, w(p + "ffn_latent_down.weight")) if self.latent else rows
@@ -165,7 +171,7 @@ class NemotronHReference(Reference):
             "tie_word_embeddings": self.tied, "mamba_num_heads": self.ssm_heads, "mamba_head_dim": self.head_width,
             "ssm_state_size": self.state_size, "n_groups": self.groups, "conv_kernel": self.conv_width,
             "use_conv_bias": True, "mamba_hidden_act": "silu", "mlp_hidden_act": "relu2", "use_bias": False,
-            "mlp_bias": False, "n_routed_experts": self.experts, "num_experts_per_tok": self.experts_used,
+            "mlp_bias": False, "n_routed_experts": self.experts, "num_experts_per_tok": max(self.experts_used),
             "moe_intermediate_size": self.expert_size, "moe_shared_expert_intermediate_size": self.shared_size,
             "moe_latent_size": self.latent or None, "routed_scaling_factor": self.routed_scale,
             "n_group": 1, "topk_group": 1, "norm_topk_prob": True, "num_nextn_predict_layers": 0,

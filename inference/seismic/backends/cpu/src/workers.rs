@@ -1,8 +1,8 @@
 //! The worker pool of one CPU device: its participants, job publication,
 //! work-item claiming, and the barriers participants meet at.
 //!
-//! The pool has one participant per physical performance core
-//! ([`Workers::host`]). The submitting thread is participant 0 and works
+//! The pool has one participant per performance core the process may run
+//! on ([`Workers::host`]). The submitting thread is participant 0 and works
 //! alongside the pool's threads (participants 1..): a job runs on every
 //! participant and the submitter returns once every participant has left
 //! it, so the frame, buffer table, words and scratch the job borrows stay
@@ -28,7 +28,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::Thread;
 
-use crate::buffer::{AllocationFailure, Buffer};
+use crate::buffer::WritableBuffer;
+use seismic_reservation::AllocationFailure;
 use crate::profile::SCRATCH_ALIGNMENT;
 
 /// Chunks each active participant's share of a native step's items is split
@@ -194,6 +195,21 @@ impl TeamBarrier {
         }
         !self.cancelled.load(Ordering::Acquire)
     }
+}
+
+/// Discards the instructions this core fetched before it observed the
+/// launch it is about to run. The launch's kernel may be code compiled at
+/// an address this core ran other code at: compilation invalidated the
+/// instruction caches (`CoherentCode`), but on aarch64 a core only stops
+/// executing what it already fetched at a context synchronization, which a
+/// participant that spun rather than parked has not passed. x86 instruction
+/// fetch is coherent with data writes.
+fn synchronize_instructions() {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: an instruction synchronization barrier has no operands.
+    unsafe {
+        core::arch::asm!("isb")
+    };
 }
 
 /// The host entry a workgroup barrier compiles to.
@@ -393,18 +409,18 @@ fn work(shared: &Shared, ordinal: usize) {
     }
 }
 
-fn grow(scratch: &mut Option<Buffer>, bytes: u64) -> Result<(), AllocationFailure> {
+fn grow(scratch: &mut Option<WritableBuffer>, bytes: u64) -> Result<(), AllocationFailure> {
     if scratch
         .as_ref()
         .is_some_and(|scratch| scratch.len() >= bytes)
     {
         return Ok(());
     }
-    *scratch = Some(Buffer::new(bytes, SCRATCH_ALIGNMENT)?);
+    *scratch = Some(WritableBuffer::new(bytes, SCRATCH_ALIGNMENT)?);
     Ok(())
 }
 
-fn scratch_pointer(scratch: &Option<Buffer>) -> *mut u8 {
+fn scratch_pointer(scratch: &Option<WritableBuffer>) -> *mut u8 {
     scratch
         .as_ref()
         .map(|scratch| scratch.data_pointer())
@@ -413,7 +429,7 @@ fn scratch_pointer(scratch: &Option<Buffer>) -> *mut u8 {
 
 /// One participant's scratch of each class, with its current base address.
 struct Scratch {
-    buffer: Option<Buffer>,
+    buffer: Option<WritableBuffer>,
     base: *mut u8,
 }
 
@@ -457,7 +473,14 @@ impl NativeStep {
 /// before it.
 pub trait NativeSteps: Sync {
     fn count(&self) -> usize;
+    /// Step `index`; its `items` the most it runs, which fixes its
+    /// participants before any step runs.
     fn step(&self, index: usize) -> NativeStep;
+    /// The items step `index` runs, at most its `items`: read once every
+    /// earlier step completed, so an earlier step may have written them.
+    fn items(&self, index: usize) -> u64 {
+        self.step(index).items
+    }
     /// Runs work item `item` of step `index` with its private bytes.
     fn run(&self, index: usize, item: u64, shared: &mut [u8]);
 }
@@ -526,12 +549,13 @@ impl Job for NativeJob<'_> {
                 // `ordinal` owns chunk `ordinal`; the chunks past the first
                 // `active` are claimed. A step with no more chunks than
                 // participants touches no shared counter.
-                let chunk = (step.items / (active as u64 * CLAIMS_PER_PARTICIPANT)).max(1);
-                let chunks = step.items.div_ceil(chunk);
+                let items = self.steps.items(index);
+                let chunk = (items / (active as u64 * CLAIMS_PER_PARTICIPANT)).max(1);
+                let chunks = items.div_ceil(chunk);
                 let mut claim = ordinal as u64;
                 while claim < chunks && !shared.cancelled() {
                     let first = claim * chunk;
-                    for item in first..(first + chunk).min(step.items) {
+                    for item in first..(first + chunk).min(items) {
                         self.steps.run(index, item, bytes);
                     }
                     claim =
@@ -569,6 +593,7 @@ impl Job for LaunchJob {
         if team >= self.teams {
             return;
         }
+        synchronize_instructions();
         let team_state = &shared.teams[team];
         let (team_scratch, my_scratch, my_registers) = unsafe {
             (
@@ -714,9 +739,13 @@ impl Workers {
         })
     }
 
-    /// One participant per physical performance core of the host.
-    pub fn host() -> Result<Self, std::io::Error> {
-        Self::new(performance_cores()?)
+    /// One participant per performance core of `cores`, those the host's
+    /// processors let the process run on (`seismic_discovery::Processors`),
+    /// under the process's quota (`available_parallelism`, which follows a
+    /// cgroup's `cpu.max`): a second hardware thread on a saturated core, or
+    /// a slower core, delays every barrier.
+    pub fn host(cores: std::num::NonZeroUsize) -> Result<Self, std::io::Error> {
+        Self::new(cores.min(std::thread::available_parallelism()?).get())
     }
 
     /// Participants, the submitting thread included.
@@ -912,65 +941,6 @@ impl Drop for Workers {
     }
 }
 
-/// Physical performance cores available to this process: SMT siblings count
-/// once and efficiency cores are excluded, since a second hardware thread on
-/// a saturated core or a slower core delays every barrier.
-fn performance_cores() -> Result<usize, std::io::Error> {
-    let available = std::thread::available_parallelism()?.get();
-    Ok(physical_performance_cores().map_or(available, |cores| cores.min(available)))
-}
-
-#[cfg(target_os = "macos")]
-fn physical_performance_cores() -> Option<usize> {
-    fn sysctl(name: &std::ffi::CStr) -> Option<usize> {
-        let mut value: i32 = 0;
-        let mut size = std::mem::size_of::<i32>();
-        // SAFETY: `value` and `size` describe a writable i32 as the named
-        // integer sysctls require.
-        let status = unsafe {
-            libc::sysctlbyname(
-                name.as_ptr(),
-                (&mut value as *mut i32).cast(),
-                &mut size,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        (status == 0 && value > 0).then_some(value as usize)
-    }
-    // `perflevel0` is the performance cluster on hybrid parts; Intel Macs
-    // have no performance levels.
-    sysctl(c"hw.perflevel0.physicalcpu").or_else(|| sysctl(c"hw.physicalcpu"))
-}
-
-#[cfg(target_os = "linux")]
-fn physical_performance_cores() -> Option<usize> {
-    use std::collections::BTreeSet;
-    let read = |path: &str| std::fs::read_to_string(path).ok();
-    // Hybrid Intel parts list their performance cores here.
-    let performance = read("/sys/devices/cpu_core/cpus").map(|list| parse_cpu_list(list.trim()));
-    let online = parse_cpu_list(read("/sys/devices/system/cpu/online")?.trim());
-    let mut cores = BTreeSet::new();
-    for cpu in online {
-        if performance
-            .as_ref()
-            .is_some_and(|performance| !performance.contains(&cpu))
-        {
-            continue;
-        }
-        let siblings = read(&format!(
-            "/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
-        ))?;
-        cores.insert(siblings.trim().to_owned());
-    }
-    (!cores.is_empty()).then_some(cores.len())
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn physical_performance_cores() -> Option<usize> {
-    None
-}
-
 /// Asks the scheduler to keep the calling pool thread on performance cores.
 /// On macOS a thread of default quality of service may run on an efficiency
 /// core, and every barrier would wait for it.
@@ -1024,21 +994,6 @@ impl Drop for SubmitterClass {
             unsafe { libc::pthread_set_qos_class_self_np(saved, 0) };
         }
     }
-}
-
-/// CPU numbers of a sysfs list such as `0-3,8,10-11`.
-#[cfg(target_os = "linux")]
-fn parse_cpu_list(list: &str) -> Vec<usize> {
-    list.split(',')
-        .filter(|range| !range.is_empty())
-        .flat_map(|range| {
-            let (first, last) = range.split_once('-').unwrap_or((range, range));
-            match (first.parse::<usize>(), last.parse::<usize>()) {
-                (Ok(first), Ok(last)) => first..=last,
-                _ => 1..=0,
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -1212,7 +1167,8 @@ mod tests {
                 std::hint::black_box(item);
             }
         }
-        let mut workers = Workers::host().expect("pool");
+        let quota = std::thread::available_parallelism().expect("host parallelism");
+        let mut workers = Workers::host(quota).expect("pool");
         let count = workers.count();
         for items in [2, 3, 4, 6, 8, 12] {
             // Samples of about 5 ms, as the tuner takes them.
@@ -1269,14 +1225,10 @@ mod tests {
     }
 
     #[test]
-    fn the_host_pool_counts_physical_performance_cores() {
-        let cores = performance_cores().expect("host parallelism");
-        assert!(cores >= 1);
-        assert!(
-            cores
-                <= std::thread::available_parallelism()
-                    .expect("host parallelism")
-                    .get()
-        );
+    fn the_host_pool_is_its_performance_cores_under_the_quota() {
+        let quota = std::thread::available_parallelism().expect("host parallelism");
+        let workers = Workers::host(quota.saturating_add(1)).expect("pool");
+        assert_eq!(workers.count(), quota.get());
+        assert_eq!(Workers::host(std::num::NonZeroUsize::MIN).expect("pool").count(), 1);
     }
 }

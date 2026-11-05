@@ -4,7 +4,7 @@ import { Option } from "effect"
 import { CircleNotchIcon, XIcon } from "@phosphor-icons/react"
 import {
   activeLocalModel, formatLocalModelDisplayName, formatModelLoadPercentage,
-  isMeasuredModelLoadStage, useLocalModels, useLocalModelMutations, useLocalModelStopStatus,
+  isMeasuredModelLoadStage, residentModelAllocation, useLocalInferenceHardware, useLocalModels, useLocalModelMutations, useLocalModelStopStatus,
 } from "@magnitudedev/client-common"
 import type { ModelInstanceAllocation, ModelLoadStage } from "@magnitudedev/sdk"
 import { useSession } from "../session"
@@ -26,6 +26,7 @@ const loadLabels: Record<ModelLoadStage, string> = {
 export function SettingsStatus({ observation }: { observation: ServiceObservation }) {
   const session = useSession()
   const models = useLocalModels()
+  const hardware = useLocalInferenceHardware()
   const { stop } = useLocalModelMutations()
   const stopping = useLocalModelStopStatus()
   const retry = useAtomSet(session.retryService)
@@ -53,10 +54,9 @@ export function SettingsStatus({ observation }: { observation: ServiceObservatio
     : !ready ? "Starting Magnitude"
     : Result.isFailure(models) ? "Model status unavailable"
     : "No model loaded"
+  const resident = residency === undefined ? Option.none() : residentModelAllocation(residency)
   const allocation: Option.Option<ModelInstanceAllocation> | null = !ready || !Result.isSuccess(models) ? null
-    : residency?._tag === "Ready" ? Option.some(residency.allocation)
-    : residency?._tag === "Stopping" && residency.allocation._tag === "Resident" ? Option.some(residency.allocation.allocation)
-    : residency ? null : Option.none()
+    : Option.isSome(resident) || residency === undefined ? resident : null
   const pendingLabel = unavailable || Result.isFailure(models) ? "Unavailable" : loading ? "Available once loaded"
     : residency?._tag === "Stopping" ? "Releasing memory" : "Waiting for service"
   return <section aria-label="Status" className="mt-7">
@@ -78,7 +78,7 @@ export function SettingsStatus({ observation }: { observation: ServiceObservatio
           {(service?._tag === "Unreachable" || service?._tag === "Reconnecting") && <Button size="sm" variant="outline" disabled={reconnecting.waiting} onClick={() => reconnect()}>Reconnect</Button>}
         </div>
       </div>
-      <MemoryFigures allocation={allocation} reading={reading} pendingLabel={pendingLabel} />
+      <MemoryFigures allocation={allocation} hardware={Result.value(hardware)} reading={reading} pendingLabel={pendingLabel} />
       <div className="empty:hidden space-y-2 px-4 pb-3">
         {service && "message" in service && <ErrorNotice title={service._tag === "CleanupFailed" ? "Couldn’t confirm the service has stopped" : "The service couldn’t start"} description={service._tag === "CleanupFailed" ? "Some background work may still be running. Quit Magnitude to retry cleanup." : service.message} />}
         {Result.isFailure(observation.service) && <ErrorNotice title="Couldn’t read service status" description="Magnitude can’t confirm the service’s current state." />}

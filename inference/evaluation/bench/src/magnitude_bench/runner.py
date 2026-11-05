@@ -146,7 +146,6 @@ async def execute(
             extensions=adapter.extensions,
             cancelled=lambda obs: save(warmup, obs, "warmup"),
         )
-        obs = adapter.verify_observation(obs)
         save(warmup, obs, "warmup")
         if obs.outcome != "valid":
             raise RuntimeError(f"engine qualification request failed: {obs.outcome}: {obs.error}")
@@ -189,7 +188,6 @@ async def execute(
                         "error": "engine reported cached tokens under the cache-disabled policy",
                     }
                 )
-            obs = adapter.verify_observation(obs)
             save(request, obs)
             settled[request.id] = obs.outcome
 
@@ -255,6 +253,7 @@ async def run(
     planned = 0
     fixture_set: dict | None = None
     status, error = "failed", None
+    adapters = {}  # by target id, as each is prepared
     try:
         with machine_lock():
             progress(f"Building {mode} fixtures ({LANES} lanes and a qualification lane)")
@@ -264,7 +263,6 @@ async def run(
                 options.magnitude.harness, artifacts, store.path / BUILD, fixtures[0],
                 store.path / "logs",
             )
-            adapters = {}
             limits = []
             for target in targets:
                 progress(f"Preparing {target.engine}: {target.reference}")
@@ -349,6 +347,12 @@ async def run(
         summary["process_footprints"] = [
             json.loads(line) for line in footprint_path.read_text().splitlines()
         ]
+    allocation_path = store.path / "allocations.jsonl"
+    if allocation_path.exists():
+        summary["expert_banks"] = report.expert_banks(
+            [json.loads(line) for line in allocation_path.read_text().splitlines()],
+            {target: adapter.expert_bank for target, adapter in adapters.items()},
+        )
     summary["mode"] = mode
     summary["path"] = str(store.path)
     host = store.path / "host.json"
@@ -381,8 +385,8 @@ async def measure_block(
             await execution
             allocation = await adapter.memory_observation(engine)
             if allocation is not None:
-                store.append(
-                    "allocations.jsonl",
+                store.append(  # once the pass ended; the samples while it served are `allocations.jsonl`
+                    "pass-allocations.jsonl",
                     {"target": adapter.target.id, "block": block, "observation": allocation},
                 )
         finally:

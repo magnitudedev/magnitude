@@ -63,11 +63,49 @@ pub enum FeedForwardProgramSlot {
     Parallel(ParallelBinding),
 }
 
+/// A feed-forward whose routed experts an expert bank can hold: either
+/// routed form, or a parallel block's routed branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BankedFeedForward {
+    Routed(RoutedBinding),
+    GeneralRouted(GeneralRoutedBinding),
+    Parallel(ParallelBinding),
+}
+
+impl BankedFeedForward {
+    pub fn slot(self) -> FeedForwardProgramSlot {
+        match self {
+            Self::Routed(binding) => FeedForwardProgramSlot::Routed(binding),
+            Self::GeneralRouted(binding) => FeedForwardProgramSlot::GeneralRouted(binding),
+            Self::Parallel(binding) => FeedForwardProgramSlot::Parallel(binding),
+        }
+    }
+}
+
+impl FeedForwardProgramSlot {
+    /// The feed-forward as a bank can hold its experts; none of a dense one.
+    pub fn banked(self) -> Option<BankedFeedForward> {
+        match self {
+            Self::Routed(binding) => Some(BankedFeedForward::Routed(binding)),
+            Self::GeneralRouted(binding) => Some(BankedFeedForward::GeneralRouted(binding)),
+            Self::Parallel(binding) => Some(BankedFeedForward::Parallel(binding)),
+            Self::Dense(_) => None,
+        }
+    }
+}
+
+/// A block's feed-forward: held whole, or its experts in a bank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum BlockFeedForward {
+    Whole(FeedForwardProgramSlot),
+    Banked(BankedFeedForward, super::BankBinding),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TargetBlockProgramSlot {
     mixer: MixerProgramSlot,
     /// Absent for a lone mixer block.
-    feed_forward: Option<FeedForwardProgramSlot>,
+    feed_forward: Option<BlockFeedForward>,
     /// The per-layer input sublayer after the feed-forward.
     per_layer: Option<PerLayerBinding>,
     /// The decoder's hyper-connection streams, which the block reads and
@@ -82,10 +120,31 @@ impl TargetBlockProgramSlot {
     pub fn new(mixer: MixerProgramSlot, feed_forward: Option<FeedForwardProgramSlot>) -> Self {
         Self {
             mixer,
-            feed_forward,
+            feed_forward: feed_forward.map(BlockFeedForward::Whole),
             per_layer: None,
             streams: None,
             ngram: None,
+        }
+    }
+
+    /// The block with its feed-forward's experts in `bank`; refused of a
+    /// block without a feed-forward a bank can hold.
+    pub fn with_bank(self, bank: super::BankBinding) -> Result<Self, PlanError> {
+        let banked = self
+            .feed_forward()
+            .and_then(FeedForwardProgramSlot::banked)
+            .ok_or(PlanError::Topology("an expert bank beside a block without routed experts"))?;
+        Ok(Self {
+            feed_forward: Some(BlockFeedForward::Banked(banked, bank)),
+            ..self
+        })
+    }
+
+    /// The feed-forward whose experts the load streams, and its bank.
+    pub fn bank(&self) -> Option<(BankedFeedForward, super::BankBinding)> {
+        match self.feed_forward? {
+            BlockFeedForward::Banked(banked, bank) => Some((banked, bank)),
+            BlockFeedForward::Whole(_) => None,
         }
     }
 
@@ -118,7 +177,10 @@ impl TargetBlockProgramSlot {
     }
 
     pub fn feed_forward(&self) -> Option<FeedForwardProgramSlot> {
-        self.feed_forward
+        self.feed_forward.map(|feed_forward| match feed_forward {
+            BlockFeedForward::Whole(slot) => slot,
+            BlockFeedForward::Banked(banked, _) => banked.slot(),
+        })
     }
 }
 
@@ -587,6 +649,7 @@ pub(super) fn derive_program_plan(
     vision: Option<&[WeightPlan]>,
     host_tables: &[HostTablePlan],
     readout_choices: &[super::ReadoutClassChoice],
+    bank: Option<&super::ExpertBankPlan>,
     history: KvCodec,
 ) -> Result<ProgramPlan, PlanError> {
     operators::admit(definition, head.is_some())?;
@@ -626,8 +689,7 @@ pub(super) fn derive_program_plan(
             .map_err(|_| PlanError::Arithmetic("target block index exceeds u32"))?;
         let paired = paired_block(block)?;
         let [mixer, feed_forward] = paired_scopes(index, WeightScope::TargetSublayer);
-        blocks.push(
-            TargetBlockProgramSlot::new(
+        let slot = TargetBlockProgramSlot::new(
                 mixer_slot(
                     &paired,
                     decoder.hidden,
@@ -707,9 +769,9 @@ pub(super) fn derive_program_plan(
                                         kind: WeightKind::NGramTable,
                                     }
                             })
-                            .and_then(|table| match table.streamed?.fill {
+                            .and_then(|table| match table.streamed()?.fill {
                                 TableFill::Stored => Some(table.resident),
-                                TableFill::Imported => None,
+                                TableFill::Imported(_) => None,
                             })
                             .ok_or(PlanError::Topology(
                                 "an n-gram input without its stored table",
@@ -723,7 +785,12 @@ pub(super) fn derive_program_plan(
                         )
                     })
                     .transpose()?,
-            ),
+            );
+        blocks.push(
+            match bank.and_then(|bank| bank.feed_forward(feed_forward).map(|(layer, _)| bank.binding(layer))) {
+                Some(bank) => slot.with_bank(bank.map_err(PlanError::ResourcePlanning)?)?,
+                None => slot,
+            },
         );
     }
     let per_layer_entry = decoder

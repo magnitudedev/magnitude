@@ -282,10 +282,10 @@ impl HostArtifacts {
             projector_unavailable,
         } = admitted;
         if let Some(reason) = &draft_unavailable {
-            eprintln!("magnitude-engine: separate drafter disabled: {reason}");
+            tracing::warn!("separate drafter disabled: {reason}");
         }
         if let Some(reason) = &projector_unavailable {
-            eprintln!("magnitude-engine: image input disabled: {}", reason.detail);
+            tracing::warn!("image input disabled: {}", reason.detail);
         }
         let mut definition = declared.clone();
         definition.decoder.context_limit =

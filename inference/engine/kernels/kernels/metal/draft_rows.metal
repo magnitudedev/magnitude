@@ -43,10 +43,14 @@ inline void draft_join(
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     // The embedding row in A, packet by packet, and its sum of squares.
     projection::Weights<packets::W0> rows{table, KERNEL_W0_LAYOUT(width), width, nullptr};
-    const uint token = uint(gathered::row(directory, SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R,
-        SEISMIC_DIM_F, tokens[(row / SEISMIC_DIM_S) * SEISMIC_TOKENS_STRIDE_0]));
+    const long held = gathered::row(directory, SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R,
+        SEISMIC_DIM_F, tokens[(row / SEISMIC_DIM_S) * SEISMIC_TOKENS_STRIDE_0]);
+    const uint token = uint(held);
     float embedding_squares = 0.0f;
-    for (uint p = thread_index; p * 32u < width; p += draft_threads) {
+    // A row that names no table row embeds zeros.
+    for (uint column = thread_index; held < 0 && column < width; column += draft_threads)
+        joined[column] = activation::store(0.0f);
+    for (uint p = thread_index; held >= 0 && p * 32u < width; p += draft_threads) {
         typename packets::W0::packet packet = rows.packet(token, p);
         for (uint step = 0; step < 4; ++step) {
             float4 even, odd;

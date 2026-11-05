@@ -11,6 +11,9 @@
 //   2  ReLU²      max(x, 0)²
 // The softcap c * tanh(z / c) is written c * (2 / (1 + exp(-2z / c)) - 1).
 
+use super::activation;
+use seismic::cpu::Dense;
+
 pub const SILU: i32 = 0;
 pub const GELU_TANH: i32 = 1;
 pub const RELU_SQUARED: i32 = 2;
@@ -29,6 +32,22 @@ pub fn activate(function: i32, x: f32) -> f32 {
         }
         _ => x / (1.0 + (-x).exp()),
     }
+}
+
+/// The up-only expansion of the scaled F32 accumulator `x`, A(act(A(x))), as
+/// stored in A (`function` an [`activate`] code): widened, its published
+/// F32.
+#[inline(always)]
+pub fn activated<A: Dense>(function: i32, x: f32) -> A::Storage {
+    A::narrow(activate(function, activation::publish::<A>(x)))
+}
+
+/// The gated expansion `glu` (functions.seismic) of the scaled F32
+/// accumulators `gate` and `up`, as published F32 (`function` an
+/// [`activate`] code).
+#[inline(always)]
+pub fn glu<A: Dense>(function: i32, gate: f32, up: f32) -> f32 {
+    activation::publish::<A>(A::widen(activated::<A>(function, gate)) * activation::publish::<A>(up))
 }
 
 /// A gated delta net's output gate on `z`, by the code the entries take

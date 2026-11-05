@@ -7,7 +7,8 @@
 // `entries` rows of `fields` I32 (`stride` elements apart, fields adjacent),
 // is dense (`fields` 1: every table row's slot or -1) or hashed (`fields` 2:
 // `entries` linearly probed (row, slot) buckets, a power of two; row -1 is
-// empty and ends a probe, -2 a tombstone a probe passes). A failed selection (-1) and a row without a slot read row 0.
+// empty and ends a probe, -2 a tombstone a probe passes). A selection that
+// names no row (-1) and a row without a slot give -1: the reader reads zeros.
 //
 // This file is independent of any entry ABI.
 
@@ -24,24 +25,24 @@ inline uint bucket(int row, uint buckets) {
     return h & (buckets - 1u);
 }
 
-inline ulong row(device const int *directory, ulong stride, ulong entries, ulong fields,
-                 int selected) {
+inline long row(device const int *directory, ulong stride, ulong entries, ulong fields,
+                int selected) {
     if (selected < 0)
-        return 0ul;
+        return -1l;
     if (entries == 0)
-        return ulong(selected);
+        return long(selected);
     if (fields == 1)
-        return ulong(metal::max(directory[ulong(selected) * stride], 0));
+        return long(directory[ulong(selected) * stride]);
     const uint mask = uint(entries) - 1u;
     uint probe = bucket(selected, uint(entries));
     for (ulong visited = 0; visited < entries; ++visited, probe = (probe + 1u) & mask) {
         const int key = directory[ulong(probe) * stride];
         if (key == selected)
-            return ulong(metal::max(directory[ulong(probe) * stride + 1], 0));
+            return long(directory[ulong(probe) * stride + 1]);
         if (key == -1)
             break;
     }
-    return 0ul;
+    return -1l;
 }
 
 } // namespace gathered

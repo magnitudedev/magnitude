@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 seismic-topology.workspace = true
+seismic-discovery.workspace = true
 seismic-measure.workspace = true
 seismic-ir.workspace = true
 seismic-lang.workspace = true
@@ -13,6 +14,7 @@ seismic-compiler.workspace = true
 seismic-native-target.workspace = true
 seismic-metal.workspace = true
 seismic-cpu.workspace = true
+seismic-reservation.workspace = true
 seismic-native-cpu.workspace = true
 seismic-cuda.workspace = true
 # Offline formation coverage forms Vulkan sources on every host.
@@ -27,6 +29,8 @@ sha2 = "=0.11.0"
 coverage = ["dep:seismic-vulkan"]
 
 [dev-dependencies]
+# Fixture native sources (`seismic_lang::native_source::check_fixture`).
+seismic-lang = { workspace = true, features = ["fixtures"] }
 seismic-std.workspace = true
 seismic-topology = { workspace = true, features = ["fixtures"] }
 # The Vulkan prefix's formation tests run on every host.
@@ -45,3 +49,9 @@ windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_System_Memory",
 ] }
+
+# Serves the probe processes it starts, as every executable that runs the
+# measurement job does.
+[[test]]
+name = "probes"
+harness = false

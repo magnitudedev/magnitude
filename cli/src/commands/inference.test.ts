@@ -690,7 +690,7 @@ describe("model status", () => {
     const list = renderModelsStatus(statusView({ models: [lacking] }))
     expect(list).not.toContain("Update available")
     expect(list).toContain(`Image input for Qwen Test (Q4) isn't downloaded (1.03 GB): ${command}`)
-    const detail = renderModelDetail({ model: lacking, models: [lacking], drafters: { _tag: "NotApplicable" }, hidden: false })
+    const detail = renderModelDetail({ model: lacking, models: [lacking], hardware: Option.none(), drafters: { _tag:"NotApplicable" }, hidden: false })
     expect(detail).toMatch(new RegExp(`Image input\\s+Not downloaded \\(1\\.03 GB\\) - ${command}`))
     expect(detail).toMatch(/Installation\s+Installed/)
     expect(detail).not.toMatch(/Update\s+Available/)
@@ -698,7 +698,7 @@ describe("model status", () => {
       missingComponents: lacking.missingComponents,
       acquisitionState: { ...lacking.acquisitionState, _tag: "Optimizing", progress: { stage: "preparing", completed: 0, total: 0, device: Option.none() } } as never,
     })
-    expect(renderModelDetail({ model: downloading, models: [], drafters: { _tag: "NotApplicable" }, hidden: false })).not.toContain("Image input")
+    expect(renderModelDetail({ model: downloading, models: [], hardware: Option.none(), drafters: { _tag:"NotApplicable" }, hidden: false })).not.toContain("Image input")
   })
 
   it("lists unsupported models with reasons and hidden models under --all", () => {
@@ -733,7 +733,7 @@ describe("model status", () => {
     const output = renderModelDetail({
       model,
       models: [makeCatalogModel(), model],
-      drafters: { _tag: "Listed", candidates: makeDrafterCandidates() }, hidden: false,
+      hardware: Option.none(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false,
     })
     expect(output).toContain(`Source        Hugging Face · ${TEST_REPOSITORY}`)
     expect(output).toContain("Variant of    Qwen Test (qwen-test:gguf:q4)")
@@ -761,7 +761,7 @@ describe("model status", () => {
         lineage: "None", verdict, onThisComputer: true, method: Option.some({ _tag: "DSpark" }),
       }),
     ]
-    const output = renderModelDetail({ model, models: [model], drafters: { _tag: "Listed", candidates }, hidden: false })
+    const output = renderModelDetail({ model, models: [model], hardware: Option.none(), drafters: { _tag:"Listed", candidates }, hidden: false })
     expect(output).toMatch(/^\* hand-dspark\.gguf\s+5 MB, no download\s+Works · DSpark\s+.*\/drafters\/hand-dspark\.gguf$/m)
     expect(output).toMatch(/^ {2}Magnitude DFlash for Qwen Test\s/m)
   })
@@ -770,7 +770,7 @@ describe("model status", () => {
     const output = renderModelDetail({
       model: makeFoundModel(),
       models: [],
-      drafters: { _tag: "Unavailable", message: "Hugging Face is unreachable" }, hidden: false,
+      hardware: Option.none(), drafters: { _tag:"Unavailable", message: "Hugging Face is unreachable" }, hidden: false,
     })
     expect(output).toContain("Drafter     None · Faster with a drafter · Add (900 MB)")
     expect(output).toContain("Drafter choices are unavailable: Hugging Face is unreachable")
@@ -787,7 +787,7 @@ describe("model status", () => {
         assessment: unsupportedAssessment("IQ1_M"),
       },
     })
-    const output = renderModelDetail({ model: unsupported, models: [], drafters: { _tag: "NotApplicable" }, hidden: false })
+    const output = renderModelDetail({ model: unsupported, models: [], hardware: Option.none(), drafters: { _tag:"NotApplicable" }, hidden: false })
     expect(output).toContain("Can't run     Uses IQ1_M weights, which Magnitude doesn't support yet")
     expect(renderModelsStatus(statusView({ models: [unsupported] }))).toContain("Can't run - Uses IQ1_M weights")
   })
@@ -796,6 +796,7 @@ describe("model status", () => {
     const model = makeFoundModel()
     const { client, models } = fakeClient({
       getCatalog: () => Effect.succeed(catalogState([model], [makeUnsupportedLocalModel()])),
+      getLocalEnvironment: () => Effect.succeed(makeHardware()),
       listDrafterCandidates: () => Effect.succeed({ candidates: makeDrafterCandidates(), entered: Option.none() }),
     })
     const detail = await run(readModelsStatus(client, Option.some(model.modelId), false))
@@ -807,7 +808,10 @@ describe("model status", () => {
 
   it("does not list drafter candidates for catalog models and reports unknown IDs", async () => {
     const catalog = makeInstalledCatalogModel()
-    const { client, models } = fakeClient({ getCatalog: () => Effect.succeed(catalogState([catalog])) })
+    const { client, models } = fakeClient({
+      getCatalog: () => Effect.succeed(catalogState([catalog])),
+      getLocalEnvironment: () => Effect.succeed(makeHardware()),
+    })
     const detail = await run(readModelsStatus(client, Option.some(catalog.modelId), false))
     expect(models.listDrafterCandidates).toBeUndefined()
     expect(detail._tag === "Right" && renderModelsStatusResult(detail.right)).toContain("Source        Catalog")
@@ -933,7 +937,7 @@ describe("--json output", () => {
     expect((status.models as Record<string, unknown>[]).map(({ modelId }) => modelId)).toEqual([FOUND_MODEL_ID])
     expect((status.unsupported as Record<string, unknown>[])[0]).toMatchObject({ reasons: [{ _tag: "Architecture", architecture: "deepseek4" }] })
 
-    const detail = encode(modelDetailJson, { model: makeAddedModel(), models: [], drafters: { _tag: "Listed", candidates: makeDrafterCandidates() }, hidden: false })
+    const detail = encode(modelDetailJson, { model: makeAddedModel(), models: [], hardware: Option.none(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false })
     expect(detail.drafterCandidates).toHaveLength(3)
     expect(detail).not.toHaveProperty("drafterCandidatesUnavailable")
 
@@ -974,7 +978,7 @@ describe("--json output", () => {
     expect(encode(modelsStatusResultJson, { _tag: "Initializing" })).toEqual({ initializing: true, models: [], unsupported: [], hidden: [] })
     expect(encode(modelsStatusResultJson, { _tag: "List", view: statusView({ models: [makeFoundModel()] }) }))
       .toMatchObject({ initializing: false, models: [{ _tag: "Custom", modelId: FOUND_MODEL_ID }] })
-    expect(encode(modelsStatusResultJson, { _tag: "Detail", view: { model: makeFoundModel(), models: [], drafters: { _tag: "Unavailable", message: "offline" }, hidden: false } }))
+    expect(encode(modelsStatusResultJson, { _tag: "Detail", view: { model: makeFoundModel(), models: [], hardware: Option.none(), drafters: { _tag:"Unavailable", message: "offline" }, hidden: false } }))
       .toMatchObject({ model: { modelId: FOUND_MODEL_ID }, drafterCandidatesUnavailable: "offline" })
   })
 
@@ -1027,8 +1031,8 @@ describe("custom model license", () => {
   it("shows a custom model's license in its details when it is known", () => {
     const base = makeFoundModel()
     const licensed = makeFoundModel({ presentation: { ...base.presentation, license: Option.some("apache-2.0") } })
-    expect(renderModelDetail({ model: licensed, models: [], drafters: { _tag: "NotApplicable" }, hidden: false })).toMatch(/License\s+apache-2\.0/)
-    expect(renderModelDetail({ model: makeFoundModel({ presentation: { ...base.presentation, license: Option.none() } }), models: [], drafters: { _tag: "NotApplicable" }, hidden: false }))
+    expect(renderModelDetail({ model: licensed, models: [], hardware: Option.none(), drafters: { _tag:"NotApplicable" }, hidden: false })).toMatch(/License\s+apache-2\.0/)
+    expect(renderModelDetail({ model: makeFoundModel({ presentation: { ...base.presentation, license: Option.none() } }), models: [], hardware: Option.none(), drafters: { _tag:"NotApplicable" }, hidden: false }))
       .not.toContain("License")
   })
 })
@@ -1054,7 +1058,7 @@ describe("drafter updates", () => {
     const drafter = Option.getOrThrow(base.drafter)
     const found = makeFoundModel({ recommendedDrafter: Option.none(), drafter: Option.some({ ...drafter, updateAvailable: true }) })
     expect(renderModelsStatus(statusView({ models: [found] }))).toContain("Update available")
-    expect(renderModelDetail({ model: found, models: [], drafters: { _tag: "NotApplicable" }, hidden: false }))
+    expect(renderModelDetail({ model: found, models: [], hardware: Option.none(), drafters: { _tag:"NotApplicable" }, hidden: false }))
       .toContain(`Update      A newer drafter is available - magnitude catalog pull ${FOUND_MODEL_ID}`)
     const downloading = makeFoundModel({ drafter: Option.some({ ...drafter, updateAvailable: true, availability: { _tag: "Downloading", progress: { stage: "downloading", completedBytes: 1, totalBytes: 4, bytesPerSecond: Option.none() } } }) })
     expect(renderModelsStatus(statusView({ models: [downloading] }))).not.toContain("Update available")
@@ -1096,8 +1100,8 @@ describe("--json internal identities", () => {
       encode(catalogDetailJson, { model: makeCatalogModel(), models: [] }),
       encode(recommendationsJson, { catalog, models: [makeCatalogModel()], hardware: makeHardware(), preference: { label: "Balanced" }, ranked: [makeCatalogModel()] }),
       encode(modelsStatusJson, statusView({ models: [makeCatalogModel(), makeFoundModel(), makeAddedModel(), unrunnable], hidden: [makeFoundModel({ modelId: CustomFormModelIdSchema.make("hf:a/b/c.gguf") })] })),
-      encode(modelDetailJson, { model: makeAddedModel(), models: [], drafters: { _tag: "Listed", candidates: makeDrafterCandidates() }, hidden: false }),
-      encode(modelDetailJson, { model: makeInstalledCatalogModel(), models: [], drafters: { _tag: "NotApplicable" }, hidden: false }),
+      encode(modelDetailJson, { model: makeAddedModel(), models: [], hardware: Option.none(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false }),
+      encode(modelDetailJson, { model: makeInstalledCatalogModel(), models: [], hardware: Option.none(), drafters: { _tag:"NotApplicable" }, hidden: false }),
       encode(inspectionJson, { inspection: makeInspection(), drafters: makeDrafterCandidates(), models: [] }),
       encode(hardwareJson, { hardware: makeHardware(), models: [loading(makeFoundModel())] }),
     ]

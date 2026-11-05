@@ -2,9 +2,11 @@
 //! contract; native implementations are checked against them on the host's
 //! GPU backend and on the CPU, at the catalog's real row widths.
 
+mod common;
+
 use magnitude_kernels::{moe_tail, per_layer_inputs, post_norm_residual};
 use seismic_lang::{
-    checked::{check_source, CheckedModule, SourceFile},
+    checked::{CheckedModule, SourceFile},
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OracleOutcome, OutcomeValue, TensorData},
@@ -19,7 +21,7 @@ fn module() -> CheckedModule {
         path: "residual.seismic".into(),
         text: include_str!("../kernels/residual.seismic").into(),
     });
-    check_source(sources).unwrap()
+    crate::common::check(sources)
 }
 
 enum Input {
@@ -116,20 +118,11 @@ fn read_f32(tensor: &seismic::Tensor) -> Vec<f32> {
         .collect()
 }
 
-/// CUDA, else Metal; `SEISMIC_TEST_BACKEND=vulkan` selects Vulkan (a CUDA
-/// host also has a Vulkan device). Then the CPU.
+/// CUDA, else Metal, then the CPU; a requested backend (Vulkan among them)
+/// alone ([`seismic_native_tests::first_and_cpu`]).
 fn devices() -> Vec<seismic::Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    let gpu = match std::env::var("SEISMIC_TEST_BACKEND").ok().as_deref() {
-        Some("vulkan") => Some(catalog.open_backend(seismic::BackendName::Vulkan).expect("the Vulkan device opens")),
-        Some(other) => panic!("SEISMIC_TEST_BACKEND={other}: only vulkan is selectable"),
-        None => [seismic::BackendName::Cuda, seismic::BackendName::Metal]
-            .into_iter()
-            .find_map(|backend| catalog.open_backend(backend).ok()),
-    };
-    gpu.into_iter()
-        .chain(std::iter::once(catalog.open_backend(seismic::BackendName::Cpu).unwrap()))
-        .collect()
+    use seismic::BackendName::{Cpu, Cuda, Metal, Vulkan};
+    seismic_native_tests::first_and_cpu(&[Cuda, Metal], &[Cuda, Metal, Vulkan, Cpu])
 }
 
 fn is_cpu(device: &seismic::Device) -> bool {

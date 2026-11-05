@@ -62,12 +62,113 @@ cost. A fast result at one shape cannot absorb the demand of an unmeasured shape
 remains unknown; it is neither zero nor an invitation to invent a forecast. Numerical eligibility
 is a hard constraint, never a term that faster execution can compensate for.
 
+## Native declarations
+
+A native declaration attaches an authored source to a checked entry for one backend and states its
+tuning settings, its launches and their geometry.
+
+**Defaults.** Each setting lists its legal values and states its default in one of three forms:
+`default EXPR`, a value, which must be listed; `default least where CONDITION`, the least listed
+value at which the condition holds, the setting reading as that value; and
+`default greatest where CONDITION`, the greatest such value. A default reads only the device, the
+static dimensions and the bound elements. The default configuration is every setting at its
+default when `where` admits it; otherwise it is the first admissible configuration of a walk in
+which each setting tries its default before its other values, in declaration order. No value is
+the default for coming first.
+
+A default that reads no dimension and no element is checked when the module is checked, on every
+device of its backend: at both values of each capability it reads and at every whole number of
+each count. Reading capabilities alone, it is evaluated at each combination of them, as a device
+evaluates it. Counts are bounded rather than enumerated: a value default holds when every value
+within its bounds is listed, and a `least` or `greatest` default when some listed value satisfies
+its condition on every device and each value it tries before that one evaluates on every device.
+A default these bounds refuse is restated so that they show its value, as a `least where` whose
+last value always holds. A default that reads a dimension or an element is evaluated when it is
+prepared, and one with no value there fails the preparation.
+
+**Device reads.** Every native expression (defaults, `let`, `where`, launch geometry) can read
+`device.NAME`, a property its backend declares. A capability reads as 0 or 1 and stands as a
+condition. A measured property cannot be read: it has no value until its probe has run. A
+declaration that reads the device has defaults only on a device, so preparation and tuning take it
+as the device they run on offers it, and an assessment, a kernel identity or offline coverage,
+which name only a backend, refuse it.
+
+**Launch scope.** `params` and `where` may follow a launch's header. A launch's settings are its
+own, and another launch may reuse a name; a setting more than one launch reads is declared at the
+top. A launch's `where` is one more conjunct of the declaration's, held to the same checks.
+
+**Code settings.** Whether a setting changes generated code is derived from the source, never
+declared. In a launch-scoped CUDA or Metal source, a launch's code settings are its kernel's
+template parameters, which must name them in declaration order.
+A setting that neither the source nor the declaration reads is refused. `arithmetic` and `form`
+stay declared: a source cannot show whether a setting changes rounding or the algorithm, and
+precision admission and the search depend on knowing.
+
+### Device properties and probes
+
+Each backend declares its devices' properties once: each property's type and the sources that
+establish it. A property is a capability (it holds or not), a count, or a measured count. Nothing
+can make one but its sources, so no device name, driver identity or constant sets a property. A
+`query` asks the API one thing and runs no kernel. A `probe` is the stored result of a probe kernel
+the backend owns, written beside the result expected of it: it establishes what no query reports,
+or checks that a reported feature works where a driver has been seen to get it wrong. `a & b`
+holds only when both hold; `a | b` is the first the device answers. A property states what the
+device does, never what is faster on it.
+
+Probes run in the measurement job, never on a load and never when a device is opened. Each probe
+not yet run runs in a process of its own, once per device and driver version; its result is
+stored under the device, its backend and driver version, the probe revision and the declared
+probes, so a driver update runs them again. Opening a device reads the stored results and runs
+nothing. Until its probe has run, a property takes its safe value: a probed capability does not
+hold, and a measured count is not measured, where its reader takes the alternative it states
+rather than a number standing in for the device's. A probe whose process crashes after opening
+the device (a fault, trap, abort, illegal instruction or bus error, as a driver's compiler crashing
+on it ends) is stored as unanswerable and keeps the safe value until the driver changes. Every
+other end stores nothing and is reported, so the next job runs that probe again: a failure before
+opening, a failure the probe reports, a kill or termination (the system's out of memory among
+them), and a probe still running after 60 s, which is stopped so that a hung driver costs a job
+that long rather than its whole deadline.
+
+Graph memory is priced by the same rule: a load and an assessment open and measure nothing. A
+device's graphs are charged at the cost the measurement job stored for it, which a load requests
+and later loads read, and until then at its backend's bound, set above every device measured so
+far so that what is planned still fits once the device's own cost is known: on CUDA 256 KiB a
+graph and 16 KiB a node (an RTX 3090 measured about 100 KB and 8 KB), on Vulkan 1 KiB a launch.
+The cost graphs are priced at is part of the assessment's identity.
+
+## Native programs
+
+Every native program is had through one owner per device, the program former. It keys an
+artifact by its source, its entry and the toolchain's identity (compiler, target, options, device
+and driver). A program whose artifact the store keeps is loaded; one it lacks is compiled once,
+its artifact stored, and the program the compile formed used. CUDA's artifact is its cubin and
+Vulkan's its SPIR-V with the pipeline data of creating its pipelines: loading either compiles
+nothing, and a Vulkan load that would have to compile fails, so every Vulkan compile also creates
+its pipelines again from that data and fails rather than store an artifact no load serves.
+Metal's artifact is its source, which the OS shader cache serves the compiled forms of. Loading a
+Metal artifact forms exactly the library its compile formed, whichever of its entries are asked
+for, so the cache serves it: measured at 0.5 s to re-form a 35B model's programs in a later
+process. Each process counts its compiles, and counts and times its re-formations through a
+platform cache, whose time shows whether the platform still serves them.
+
+Tuning records what each launch's program uses as its backend's compiler reports it, read from
+the driver of every program formed, compiled or loaded, so no artifact carries it: CUDA's function
+attributes of the loaded module, and Vulkan's pipeline executable statistics where the device
+offers them. On such a device every Vulkan pipeline, a load's as a compile's, is created capturing
+statistics besides what its operation adds (a load's `FAIL_ON_PIPELINE_COMPILE_REQUIRED`): a
+driver may key pipeline data by the capture, and the toolchain identity names it. Each backend's
+toolchain states what it reports of a program it formed: Metal's reports nothing, and the CPU
+backend forms no programs.
+
 ## One first-load clock
 
 The serving allowance is 60 seconds for the load's tuning work. Evaluation may select an explicit
-budget. It covers required canonical formation, input construction, default observations,
-yardsticks, search planning, candidate formation, execution, comparisons, confirmation, final
-coverage and result publication. No work moves before the clock or after finalization to make
+budget (`mrig step --tuning-budget SECONDS`, for each load's first tuning); a budget is part of
+every stored result's key. The allowance covers required canonical formation, input construction,
+default observations, yardsticks, search planning, candidate formation, execution, comparisons,
+confirmation, final coverage and result publication. A load whose budget event refused work for
+want of budget did not tune to completion, and a measurement of it measures an unfinished tuning,
+so `mrig step` voids its cell. No work moves before the clock or after finalization to make
 the total appear smaller. Loading and readiness are reported separately from this tuning total.
 
 Counting units and recognizing stored choices is metadata-only. Required canonical artifacts
@@ -117,11 +218,10 @@ Independent compilation can overlap device measurement, with resources and pendi
 to the same load. Elapsed wall time is the budget authority; overlapping phase times do not sum
 to a second budget. A compile that outruns its forecast does not consume the conclusion reserve:
 when the reserve is reached its piece is abandoned unmeasured, choices publish while it finishes,
-and the abandoned work is reported. A promoted choice's serving artifact is formed as the choice
-is promoted, inside that work's own admission, so the conclusion holds no artifact compiles,
-whose cost a system shader cache makes unpredictable. A compile cannot be interrupted, so it
-starts only if it would end within the deadline at the longest compile the load has observed,
-including one deliberately compiled with nothing to serve it. A slower device explores less, not longer. No later request, changed traffic
+and the abandoned work is reported. A promoted choice's program is the artifact its search
+already compiled and stored, which a load reads, so a promotion compiles nothing. A compile cannot
+be interrupted, so it starts only if it would end within the deadline at the longest compile the
+load has observed. A slower device explores less, not longer. No later request, changed traffic
 mix or cached incomplete search acquires another tuning allowance.
 
 ## Search and finalization
@@ -206,6 +306,8 @@ compiled artifacts; it must record that condition when making comparisons.
 The tuning trace explains each decision in one self-contained unit record: its scope and demand,
 measured candidates, numerical yardsticks and their derivation, chosen configuration, reason,
 coverage and stop condition. It also accounts for the whole load's elapsed time and phases.
+Every unit record carries what its formed defaults' launches use, whether or not they were
+measured, and each candidate what its own launches use.
 Unmeasured quantities remain unavailable, never zero or fabricated evidence. Precision surveys
 and pinned-selection probes consume this same evidence through the evaluation system.
 

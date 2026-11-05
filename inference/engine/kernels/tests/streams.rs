@@ -4,9 +4,11 @@
 //! launches, at a small geometry and at Qwen3.8 Flash Next's (H 2560, four
 //! streams, rank 320).
 
+mod common;
+
 use magnitude_kernels::{repeat_rows, stream_mix_down, stream_mix_up};
 use seismic_lang::{
-    checked::{CheckedModule, SourceFile, check_source},
+    checked::{CheckedModule, SourceFile},
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OracleOutcome, OutcomeValue, TensorData},
@@ -21,7 +23,7 @@ fn module() -> CheckedModule {
         path: "streams.seismic".into(),
         text: include_str!("../kernels/streams.seismic").into(),
     });
-    check_source(sources).unwrap()
+    crate::common::check(sources)
 }
 
 enum Input {
@@ -135,26 +137,11 @@ fn read(tensor: &seismic::Tensor, dtype: DType) -> Vec<f32> {
     }
 }
 
-/// CUDA, else Metal; `SEISMIC_TEST_BACKEND=vulkan` selects Vulkan (a CUDA
-/// host also has a Vulkan device). Then the CPU.
+/// CUDA, else Metal, then the CPU; a requested backend (Vulkan among them)
+/// alone ([`seismic_native_tests::first_and_cpu`]).
 fn devices() -> Vec<seismic::Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    let gpu = match std::env::var("SEISMIC_TEST_BACKEND").ok().as_deref() {
-        Some("vulkan") => Some(
-            catalog
-                .open_backend(seismic::BackendName::Vulkan)
-                .expect("the Vulkan device opens"),
-        ),
-        Some("cuda") | None => [seismic::BackendName::Cuda, seismic::BackendName::Metal]
-            .into_iter()
-            .find_map(|backend| catalog.open_backend(backend).ok()),
-        Some(other) => panic!("SEISMIC_TEST_BACKEND={other}: only cuda and vulkan are selectable"),
-    };
-    gpu.into_iter()
-        .chain(std::iter::once(
-            catalog.open_backend(seismic::BackendName::Cpu).unwrap(),
-        ))
-        .collect()
+    use seismic::BackendName::{Cpu, Cuda, Metal, Vulkan};
+    seismic_native_tests::first_and_cpu(&[Cuda, Metal], &[Cuda, Metal, Vulkan, Cpu])
 }
 
 /// The declared defaults of `E` at `statics` (none on the CPU).

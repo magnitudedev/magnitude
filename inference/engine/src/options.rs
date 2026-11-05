@@ -28,6 +28,7 @@ pub fn standard_service_limits() -> ServiceLimits {
         decode_tokens: 32,
         decode_share: 0.5,
         locality_seconds: 1.0,
+        conversations: std::num::NonZeroUsize::MIN,
     }
 }
 
@@ -94,6 +95,34 @@ impl ModelMethod {
             Self::Auto | Self::Plain | Self::Mtp => None,
         }
     }
+
+    const ALL: [Self; 7] = [
+        Self::Auto,
+        Self::Plain,
+        Self::Mtp,
+        Self::DFlash,
+        Self::DSpark,
+        Self::DFlash2,
+        Self::LiLiCorr,
+    ];
+
+    /// The method's name, as a host takes it and reports what it serves.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Plain => "plain",
+            Self::Mtp => "mtp",
+            Self::DFlash => "dflash",
+            Self::DSpark => "dspark",
+            Self::DFlash2 => "dflash2",
+            Self::LiLiCorr => "lilicorr",
+        }
+    }
+
+    /// The method of `name` (`name`'s inverse).
+    pub fn named(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|method| method.name() == name)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,6 +146,10 @@ pub struct ModelPolicy {
     /// The caller's numerical requirement (α and the allowed deviation
     /// classes); the engine's standard profile when absent.
     pub numerical_profile: Option<magnitude_executor::NumericalProfile>,
+    /// An optional ceiling on every weight byte the load holds beside its
+    /// host tier (which the host's room bounds): its expert bank grows no
+    /// further than the cap holds (`ExecutionPlanDraft::with_bank`).
+    pub weight_cap: Option<u64>,
 }
 
 impl Default for ModelPolicy {
@@ -129,6 +162,7 @@ impl Default for ModelPolicy {
             lookahead: true,
             exported_logits_rows: 0,
             numerical_profile: None,
+            weight_cap: None,
         }
     }
 }
@@ -216,9 +250,35 @@ pub struct ResolvedModelPolicy {
     pub exported_logits_rows: usize,
     /// The caller's profile, checked before device opening.
     pub numerical_profile: Option<magnitude_executor::NumericalProfile>,
+    /// The caller's ceiling on the load's weights (`ModelPolicy::weight_cap`).
+    pub weight_cap: Option<u64>,
 }
 
 impl ResolvedModelPolicy {
+    /// The method a load of this policy serves its decode with, of the
+    /// definition it resolved against: plain, the head's MTP, or a separate
+    /// draft's own variant. A drafter that could not be admitted resolves as
+    /// plain (`ModelPolicy::resolve_admitted`), so a host reporting this
+    /// reports a load that drafts with nothing.
+    pub fn served_method(&self, definition: &ModelDefinition) -> Result<ModelMethod, String> {
+        match self.method {
+            ResolvedMethod::Plain => Ok(ModelMethod::Plain),
+            ResolvedMethod::Mtp { .. } => Ok(ModelMethod::Mtp),
+            ResolvedMethod::DFlash { .. } => {
+                let variant = definition
+                    .draft
+                    .as_ref()
+                    .ok_or("a separate-draft method resolved without the package's draft")?
+                    .method
+                    .variant();
+                ModelMethod::ALL
+                    .into_iter()
+                    .find(|method| method.draft_variant() == Some(variant))
+                    .ok_or_else(|| format!("no method names the {variant} draft"))
+            }
+        }
+    }
+
     pub fn factory(&self, artifact_identity: &str) -> Result<Arc<dyn Method>, String> {
         match (self.method, self.draft_policy) {
             (ResolvedMethod::Mtp { history, .. }, Some(policy)) => {
@@ -304,6 +364,7 @@ impl ModelPolicy {
             lookahead: self.lookahead && definition.decoder.entry.per_layer.is_none(),
             exported_logits_rows: self.exported_logits_rows,
             numerical_profile: self.numerical_profile.clone(),
+            weight_cap: self.weight_cap,
         })
     }
 }
@@ -425,6 +486,7 @@ struct ServiceLimitsEncoding {
     decode_tokens: usize,
     decode_share: f64,
     locality_seconds: f64,
+    conversations: std::num::NonZeroUsize,
 }
 
 /// The serialized form of [`KvCodec`] (a state value).
@@ -906,6 +968,31 @@ pub(crate) mod tests {
             }),
             ..definition(true)
         }
+    }
+
+    /// Every method is named once, and the method a load serves is a
+    /// separate draft's own variant's, the head's MTP, or plain.
+    #[test]
+    fn a_load_serves_the_method_its_definition_resolves_to() {
+        use magnitude_family_contracts::DraftMethod;
+        for method in ModelMethod::ALL {
+            assert_eq!(ModelMethod::named(method.name()), Some(method));
+        }
+        assert_eq!(ModelMethod::named("speculative"), None);
+        let draft = with_draft(DraftMethod::DFlash);
+        let served = |method, definition: &ModelDefinition| {
+            ModelPolicy {
+                method,
+                ..ModelPolicy::default()
+            }
+            .resolve(definition)
+            .unwrap()
+            .served_method(definition)
+            .unwrap()
+        };
+        assert_eq!(served(ModelMethod::Auto, &draft), ModelMethod::DFlash);
+        assert_eq!(served(ModelMethod::Plain, &draft), ModelMethod::Plain);
+        assert_eq!(served(ModelMethod::Mtp, &definition(true)), ModelMethod::Mtp);
     }
 
     /// A separate-draft method names the draft's variant; the package's

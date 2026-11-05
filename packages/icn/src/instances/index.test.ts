@@ -7,11 +7,12 @@ import {
   Option,
   PubSub,
   Ref,
+  Schema,
   Stream,
 } from "effect"
 import { IcnClient, type IcnClientService } from "../client.js"
-import type {
-  InferenceResourceInvalidation,
+import {
+  type InferenceResourceInvalidation,
   ModelInstancesSnapshot,
 } from "@magnitudedev/icn-protocol/schemas"
 import { IcnInstances, makeIcnInstances } from "./index.js"
@@ -21,7 +22,7 @@ class TestFailure extends Data.TaggedError("TestFailure")<{
   readonly message: string
 }> {}
 
-const instances = (revision: number): ModelInstancesSnapshot => ({
+const instances = (revision: number): ModelInstancesSnapshot => Schema.decodeUnknownSync(ModelInstancesSnapshot)({
   revision,
   instances: [{
     id: "instance-test",
@@ -31,6 +32,7 @@ const instances = (revision: number): ModelInstancesSnapshot => ({
       allocation: {
         contextWindowTokens: 8_192,
         memoryDomains: [],
+        promptGroupPlaces: { held: 1, capacity: 1 },
       },
       device: { id: "cuda:0", backend: "cuda" },
     },

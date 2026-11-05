@@ -1,6 +1,6 @@
 //! Direct typed-kernel to native compilation.
 
-use crate::command::{CompiledKernel, JitMemory};
+use crate::command::{CoherentCode, CompiledKernel, JitMemory};
 use crate::emit;
 use crate::{numeric, Cpu};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -29,6 +29,7 @@ pub(crate) fn compile_kernel(
     let started = Instant::now();
     let isa = target.facts().codegen.isa()?;
     let mut builder = JITBuilder::with_isa(isa, default_libcall_names());
+    builder.memory_provider(Box::new(CoherentCode::new()));
     for (name, address) in numeric::host_symbols() {
         builder.symbol(name, address);
     }

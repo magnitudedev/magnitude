@@ -162,3 +162,87 @@ fn repeated_allocation_definition_does_not_inherit_a_prior_instances_writes() {
     let source="fn probe() -> f32:\n    let mut carry = tensor[2] f32\n    carry[:] = zeros_like(carry)\n    for i in 0..3:\n        let previous = carry[1]\n        let mut next = tensor[2] f32\n        next[0] = previous\n        if i == 0:\n            next[1] = 2.0\n        carry = next\n    return 0.0\n";
     assert!(check(source).unwrap_err().contains("initialization"));
 }
+
+/// A host port is part of the entry's signature only: its access is the
+/// host's, the body never names it, and it may be a stored form the device
+/// cannot write.
+#[test]
+fn host_ports_carry_the_hosts_access_and_no_body_names_them() {
+    use crate::checked::{SignatureType, TensorAccess};
+    let source = "fn request(served: &host tensor[4] i32, staged: &host mut tensor[2, 32] gguf_q8_0, out: &mut tensor[1] i32):\n    out[0] = 1\n";
+    let module = check_source(SourceSet::new(vec![SourceFile {
+        path: "host-ports.seismic".into(),
+        text: source.into(),
+    }]))
+    .unwrap();
+    let info = module.entries().iter().find(|entry| entry.name == "request").unwrap();
+    let access = |index: usize| match &info.parameter_types[index].1 {
+        SignatureType::Tensor { access, .. } => *access,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(access(0), TensorAccess::Host { write: false });
+    assert_eq!(access(1), TensorAccess::Host { write: true });
+    assert!(check("fn request(staged: &mut tensor[2, 32] gguf_q8_0):\n    return\n")
+        .unwrap_err()
+        .contains("decode-only"));
+    for body in ["    out[0] = served[0]\n", "    served[0] = 1\n"] {
+        let source = format!(
+            "fn request(served: &host mut tensor[4] i32, out: &mut tensor[1] i32):\n{body}"
+        );
+        assert!(check(&source).unwrap_err().contains("host port"), "{body}");
+    }
+    assert!(check("fn request(pair: (&host tensor[4] i32, &tensor[4] i32)):\n    return\n")
+        .unwrap_err()
+        .contains("host port"));
+    assert!(check("fn request(served: &host tensor[4] i32):\n    return\n\nfn caller(served: &tensor[4] i32):\n    request(served)\n")
+        .unwrap_err()
+        .contains("host ports"));
+}
+
+/// An awaited port is a device borrow (shared, or mutable with `mut`) the
+/// body reads like any other; it is a parameter of its own.
+#[test]
+fn awaited_ports_are_borrows_of_their_own() {
+    use crate::checked::{SignatureType, TensorAccess};
+    let source = "fn parked(answer: &await tensor[1] i32, words: &await mut tensor[2] i32, out: &mut tensor[1] i32):\n    words[1] = answer[0]\n    out[0] = words[0]\n";
+    let module = check_source(SourceSet::new(vec![SourceFile {
+        path: "awaited-ports.seismic".into(),
+        text: source.into(),
+    }]))
+    .unwrap();
+    let info = module.entries().iter().find(|entry| entry.name == "parked").unwrap();
+    let access = |index: usize| match &info.parameter_types[index].1 {
+        SignatureType::Tensor { access, .. } => *access,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(access(0), TensorAccess::Shared);
+    assert_eq!(access(1), TensorAccess::Mutable);
+    assert!(check("fn parked(pair: (&await tensor[4] i32, &tensor[4] i32)):\n    return\n")
+        .unwrap_err()
+        .contains("awaited port"));
+}
+
+#[test]
+fn awaited_entries_cannot_be_called_by_definitions() {
+    for mutable in ["", "mut "] {
+        let helper = format!("fn inner(words: &await {mutable}tensor[1] i32):\n    return\n\n");
+        let caller = format!("fn outer(words: &{mutable}tensor[1] i32):\n    inner(words)\n");
+        let error = check(&(helper.clone() + &caller)).unwrap_err();
+        assert!(error.contains("awaited ports") && error.contains("no definition calls"), "{error}");
+        // The same ordinary borrow remains a callable helper.
+        check(&(helper.replace("&await ", "&") + &caller)).unwrap();
+    }
+}
+
+#[test]
+fn overlapping_definitions_agree_on_awaited_ports() {
+    for mutable in ["", "mut "] {
+        let awaited = format!("fn same(words: &await {mutable}tensor[1] i32):\n    return\n\n");
+        let ordinary = awaited.replace("&await ", "&");
+        for source in [awaited.clone() + &ordinary, ordinary + &awaited] {
+            let error = check(&source).unwrap_err();
+            assert!(error.contains("different awaited state"), "{error}");
+        }
+        check(&(awaited.clone() + &awaited)).unwrap();
+    }
+}

@@ -94,14 +94,6 @@ fn blind_admission_crosses_the_worker_as_a_typed_refusal() {
     worker.close();
 }
 
-#[test]
-fn reclaim_is_a_typed_admission_refusal() {
-    assert_eq!(
-        AdmissionError::from(DomainError::Reclaim),
-        AdmissionError::MemoryReclaim
-    );
-}
-
 /// Completion and publication wakes are reserved: they reach the owner while
 /// every command slot holds an unconsumed call.
 #[test]

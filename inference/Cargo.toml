@@ -50,9 +50,11 @@ members = [
   "seismic/backends/vulkan",
   "seismic/cli",
   "seismic/compiler",
+  "seismic/reservation",
   "seismic/runtime",
   "seismic/measure",
   "seismic/topology",
+  "seismic/discovery",
   "seismic/api",
   "seismic/build",
   "seismic/corpus",
@@ -84,9 +86,11 @@ default-members = [
   "seismic/backends/cuda",
   "seismic/cli",
   "seismic/compiler",
+  "seismic/reservation",
   "seismic/runtime",
   "seismic/measure",
   "seismic/topology",
+  "seismic/discovery",
   "seismic/api",
   "seismic/build",
   "seismic/corpus",
@@ -99,11 +103,13 @@ license = "UNLICENSED"
 
 [workspace.dependencies]
 seismic-topology = { path = "seismic/topology" }
+seismic-discovery = { path = "seismic/discovery" }
 seismic-measure = { path = "seismic/measure" }
 seismic-estimator-metal = { path = "seismic/estimator/metal" }
 seismic-ir = { path = "seismic/ir" }
 seismic-native-target = { path = "seismic/native-target" }
 seismic-native-cpu = { path = "seismic/native-cpu" }
+seismic-native-tests = { path = "seismic/native-tests" }
 seismic-estimator = { path = "seismic/estimator/core" }
 serde = { version = "=1.0.229", features = ["derive"] }
 postcard = { version = "=1.1.3", default-features = false, features = ["use-std"] }
@@ -115,6 +121,7 @@ seismic-cpu = { path = "seismic/backends/cpu" }
 seismic-cuda = { path = "seismic/backends/cuda" }
 seismic-vulkan = { path = "seismic/backends/vulkan" }
 seismic-compiler = { path = "seismic/compiler" }
+seismic-reservation = { path = "seismic/reservation" }
 seismic-runtime = { path = "seismic/runtime" }
 seismic = { path = "seismic/api" }
 seismic-build = { path = "seismic/build" }

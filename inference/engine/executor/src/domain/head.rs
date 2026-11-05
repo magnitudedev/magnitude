@@ -24,12 +24,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// The flight holds `bindings` until `finish_head` returns them.
     pub fn submit_head(
         &mut self,
-        bindings: StateBindings<F>,
+        bindings: StateBindings,
         operations: &[Operation],
         graph_workspace: NativeGraphWorkspaceLease,
         graph_output: NativeGraphOutputLease,
         reservation: HeadReservation,
-    ) -> Result<HeadFlight<F>, SubmitFailure<F>> {
+    ) -> Result<HeadFlight<F>, SubmitFailure> {
         let advances = match reservation {
             HeadReservation::Advances(advances) => advances,
             HeadReservation::TargetReads(states) => {
@@ -253,7 +253,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             None
         };
         let started = Instant::now();
-        let recorded_graphs = self.family.recorded_graphs();
+        let epoch = self.launch_epoch();
         let submission = match self.family.submit_head(launch) {
             Ok(submission) => submission,
             Err((error, launch)) => {
@@ -266,7 +266,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let requests = metadata.iter().map(|(request, ..)| *request).collect::<Vec<_>>();
         Ok(HeadFlight {
             started: self.service_start(&requests, started),
-            recorded_graphs,
+            epoch,
             requests: metadata,
             steps,
             submission,
@@ -283,12 +283,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// change can touch the rows it reads.
     fn submit_target_reading_head(
         &mut self,
-        bindings: StateBindings<F>,
+        bindings: StateBindings,
         operations: &[Operation],
         graph_workspace: NativeGraphWorkspaceLease,
         graph_output: NativeGraphOutputLease,
         states: Vec<SequenceState>,
-    ) -> Result<HeadFlight<F>, SubmitFailure<F>> {
+    ) -> Result<HeadFlight<F>, SubmitFailure> {
         let launch = self.target_reading_launch(operations, &states);
         let (batch, history, metadata, steps) = match launch {
             Ok(launch) => launch,
@@ -328,7 +328,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         };
         let started = Instant::now();
-        let recorded_graphs = self.family.recorded_graphs();
+        let epoch = self.launch_epoch();
         let submission = match self.family.submit_head(launch) {
             Ok(submission) => submission,
             Err((error, launch)) => {
@@ -342,7 +342,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let requests = metadata.iter().map(|(request, ..)| *request).collect::<Vec<_>>();
         Ok(HeadFlight {
             started: self.service_start(&requests, started),
-            recorded_graphs,
+            epoch,
             requests: metadata,
             steps,
             submission,
@@ -690,13 +690,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn finish_head(
         &mut self,
         flight: HeadFlight<F>,
-    ) -> Result<(Vec<PendingOperationOutcome>, StateBindings<F>), DomainError> {
+    ) -> Result<(Vec<PendingOperationOutcome>, StateBindings), DomainError> {
         let HeadFlight {
             requests,
             steps,
             submission,
             started,
-            recorded_graphs,
+            epoch,
             launch_trace,
             bindings,
         } = flight;
@@ -813,9 +813,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .into_iter()
                 .map(|advance| match advance {
                     TentativeAdvance::Accepted(advance) => Ok(Some(advance)),
-                    TentativeAdvance::Successor(_) => Err(DomainError::invariant(
-                        "a head transaction follows an in-flight advance",
-                    )),
+                    TentativeAdvance::Successor(_) | TentativeAdvance::Chained(_) => Err(
+                        DomainError::invariant("a head transaction follows an in-flight advance"),
+                    ),
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
@@ -831,13 +831,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                             .map(|step| selected[step * slot_class + slot])
                             .collect(),
                     },
-                    advance,
+                    advance: advance.map(Advance::Step),
                     primed: None,
                     rows: advance_rows(passes, rows, proposals),
                     committed_rows: rows,
                     kind: WorkKind::Decode,
                     physical_duration: Duration::ZERO,
-                    replayed: false,
+                    timed: false,
                     image: None,
                 },
             )
@@ -845,10 +845,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // Include the existing selection read and host materialization in
         // completed service; request timing must not omit width-dependent work.
         let duration = started.elapsed();
-        let replayed = self.family.recorded_graphs() == recorded_graphs;
+        let timed = self.timed(epoch);
         for item in &mut pending {
             item.physical_duration = duration;
-            item.replayed = replayed;
+            item.timed = timed;
         }
         self.begin_host_turn(pending.iter().map(|item| item.request));
         Ok((pending, bindings))

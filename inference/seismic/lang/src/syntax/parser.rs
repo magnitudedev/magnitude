@@ -2,12 +2,16 @@
 use super::ast::*;
 use super::lexer::lex;
 use super::token::{Kw, Op, Tok, Token};
-use crate::checked::DiagnosticRule;
+use crate::checked::{DiagnosticRule, Encoded};
 use crate::span::{Diagnostic, Span};
+use std::collections::BTreeMap;
 
-pub(crate) fn parse(text: &str) -> Result<File, Diagnostic> {
+/// Parse one file of a source set whose module constants are `constants`
+/// (every file's `const` declarations): a name of one in an expression is
+/// its integer literal, and a binding may not take one's name.
+pub(crate) fn parse(text: &str, constants: &BTreeMap<String, u64>) -> Result<File, Diagnostic> {
     let tokens = lex(text)?;
-    Parser { tokens, pos: 0 }.file()
+    Parser { tokens, pos: 0, constants: constants.clone() }.file()
 }
 
 /// Binding powers, shared with the printer. Binary operators use twice their `precedence()`
@@ -22,6 +26,7 @@ pub(super) const UNARY_BP: u8 = UNARY_PRECEDENCE * 2;
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    constants: BTreeMap<String, u64>,
 }
 
 type PResult<T> = Result<T, Diagnostic>;
@@ -200,12 +205,14 @@ impl Parser {
 
     fn file(&mut self) -> PResult<File> {
         let mut decls = Vec::new();
+        let mut constants = Vec::new();
         loop {
             while matches!(self.peek(), Tok::Newline) {
                 self.bump();
             }
             match self.peek() {
                 Tok::Eof => break,
+                Tok::Kw(Kw::Const) => constants.push(self.const_decl()?),
                 Tok::Kw(Kw::Fn) => decls.push(Decl::Fn(self.fn_decl()?)),
                 Tok::Kw(Kw::Lower) => decls.push(Decl::Lower(self.lower_decl()?)),
                 Tok::Kw(Kw::Native) => decls.push(Decl::Native(self.native_decl()?)),
@@ -216,13 +223,50 @@ impl Parser {
                 }
                 other => {
                     return Err(self.error(format!(
-                        "expected `fn`, `lower`, or `native`, found {}",
+                        "expected `const`, `fn`, `lower`, or `native`, found {}",
                         other.describe()
                     )));
                 }
             }
         }
-        Ok(File { decls })
+        Ok(File { decls, constants })
+    }
+
+    /// `const NAME = INTEGER`.
+    fn const_decl(&mut self) -> PResult<ConstDecl> {
+        let start = self.expect_kw(Kw::Const)?;
+        let name = self.expect_name()?;
+        self.expect_op(Op::Assign)?;
+        let value = match self.peek().clone() {
+            Tok::Int(value) => {
+                self.bump();
+                value
+            }
+            other => {
+                return Err(self.error(format!(
+                    "a module constant is an integer literal, found {}",
+                    other.describe()
+                )));
+            }
+        };
+        let span = start.to(self.prev_span());
+        self.expect_newline()?;
+        Ok(ConstDecl { name, value, span })
+    }
+
+    /// A name a declaration binds (a parameter, a dimension, a `let` or
+    /// `for` target, a native term, parameter or scratch buffer): never a
+    /// module constant's.
+    fn binding_name(&mut self) -> PResult<Ident> {
+        let name = self.expect_name()?;
+        if self.constants.contains_key(&name.name) {
+            return Err(Diagnostic::with_rule(
+                DiagnosticRule::Resolution,
+                name.span,
+                format!("`{}` is a module constant and cannot be bound", name.name),
+            ));
+        }
+        Ok(name)
     }
 
     fn fn_decl(&mut self) -> PResult<FnDecl> {
@@ -330,10 +374,18 @@ impl Parser {
             self.expect_op(Op::RParen)?;
             self.expect_newline()?;
         }
+        let mut records = Vec::new();
+        if self.at_word("records") {
+            self.bump();
+            self.expect_op(Op::LParen)?;
+            records = self.comma_list(Self::native_record)?;
+            self.expect_op(Op::RParen)?;
+            self.expect_newline()?;
+        }
         let mut terms = Vec::new();
         while matches!(self.peek(), Tok::Kw(Kw::Let)) {
             let begin = self.bump().span;
-            let name = self.expect_name()?;
+            let name = self.binding_name()?;
             self.expect_op(Op::Assign)?;
             let value = self.expr()?;
             self.expect_newline()?;
@@ -351,7 +403,7 @@ impl Parser {
         let mut scratch = Vec::new();
         while self.at_word("scratch") {
             let begin = self.bump().span;
-            let name = self.expect_name()?;
+            let name = self.binding_name()?;
             if !self.at_word("bytes") {
                 return Err(self.error(format!(
                     "expected `bytes (<size>)` after the scratch name, found {}",
@@ -423,6 +475,7 @@ impl Parser {
             statics,
             params,
             elements,
+            records,
             terms,
             constraint,
             scratch,
@@ -452,17 +505,14 @@ impl Parser {
         }
     }
 
-    /// `[code] [arithmetic] [form] NAME in [V, ..]`
+    /// `[arithmetic] [form] NAME in [V, ..] default DEFAULT`, the default
+    /// `EXPR`, `least where CONDITION` or `greatest where CONDITION`.
     fn native_param(&mut self) -> PResult<NativeParamDecl> {
         let begin = self.span();
-        let mut code = false;
         let mut arithmetic = false;
         let mut form = false;
         loop {
-            if self.at_word("code") && !code {
-                self.bump();
-                code = true;
-            } else if self.at_word("arithmetic") && !arithmetic {
+            if self.at_word("arithmetic") && !arithmetic {
                 self.bump();
                 arithmetic = true;
             } else if self.at_word("form") && !form {
@@ -472,7 +522,7 @@ impl Parser {
                 break;
             }
         }
-        let name = self.expect_name()?;
+        let name = self.binding_name()?;
         self.expect_kw(Kw::In)?;
         self.expect_op(Op::LBracket)?;
         let values = self.comma_list(|parser| match parser.peek().clone() {
@@ -486,12 +536,33 @@ impl Parser {
             ))),
         })?;
         self.expect_op(Op::RBracket)?;
+        if !self.at_word("default") {
+            return Err(self.error(format!(
+                "expected `default` after the values of `{}`: every native parameter states its default (`default EXPR`, `default least where CONDITION` or `default greatest where CONDITION`), found {}",
+                name.name,
+                self.peek().describe()
+            )));
+        }
+        self.bump();
+        let default = if self.at_word("least") || self.at_word("greatest") {
+            let least = self.at_word("least");
+            self.bump();
+            self.expect_kw(Kw::Where)?;
+            let condition = self.expr()?;
+            if least {
+                NativeDefaultDecl::Least(condition)
+            } else {
+                NativeDefaultDecl::Greatest(condition)
+            }
+        } else {
+            NativeDefaultDecl::Value(self.expr()?)
+        };
         Ok(NativeParamDecl {
             name,
-            code,
             arithmetic,
             form,
             values,
+            default,
             span: begin.to(self.prev_span()),
         })
     }
@@ -509,6 +580,21 @@ impl Parser {
             dtypes,
             span: begin.to(self.prev_span()),
         })
+    }
+
+    /// A record port: `NAME` (a parameter) or `result N`.
+    fn native_record(&mut self) -> PResult<NativeRecordDecl> {
+        let name = self.expect_name()?;
+        match (name.name.as_str(), self.peek().clone()) {
+            ("result", Tok::Int(ordinal)) => {
+                self.bump();
+                Ok(NativeRecordDecl::Result {
+                    ordinal,
+                    span: name.span.to(self.prev_span()),
+                })
+            }
+            _ => Ok(NativeRecordDecl::Parameter(name)),
+        }
     }
 
     /// An optional `when CONDITION` (`when` is a contextual word).
@@ -535,6 +621,11 @@ impl Parser {
             self.expect_op(Op::RParen)?;
             self.expect_newline()?;
         }
+        let mut constraint = None;
+        if self.eat_kw(Kw::Where) {
+            constraint = Some(self.expr()?);
+            self.expect_newline()?;
+        }
         let reads = if self.at_word("reads") {
             self.bump();
             self.expect_op(Op::LParen)?;
@@ -547,6 +638,39 @@ impl Parser {
         };
         let threadgroups = self.native_launch_property("threadgroups")?;
         self.expect_newline()?;
+        let grid = if self.at_word("grid") {
+            self.bump();
+            self.expect_op(Op::LParen)?;
+            let grid = self.expect_name()?;
+            self.expect_op(Op::RParen)?;
+            self.expect_newline()?;
+            Some(grid)
+        } else {
+            None
+        };
+        let mut conditions = Vec::new();
+        loop {
+            let encoded = if self.at_kw(Kw::If) {
+                Encoded::WhileSet
+            } else if self.at_word("unless") {
+                Encoded::WhileClear
+            } else {
+                break;
+            };
+            self.bump();
+            self.expect_op(Op::LParen)?;
+            let word = self.expect_name()?;
+            let index = if self.eat_op(Op::LBracket) {
+                let index = self.expr()?;
+                self.expect_op(Op::RBracket)?;
+                Some(index)
+            } else {
+                None
+            };
+            self.expect_op(Op::RParen)?;
+            self.expect_newline()?;
+            conditions.push(NativeConditionDecl { encoded, word, index });
+        }
         let threads_per_threadgroup = self.native_launch_property("threads_per_threadgroup")?;
         self.expect_newline()?;
         let shared_bytes = if self.at_word("shared_bytes") {
@@ -564,8 +688,11 @@ impl Parser {
             kernel,
             when,
             params,
+            constraint,
             reads,
             threadgroups,
+            grid,
+            conditions,
             threads_per_threadgroup,
             shared_bytes,
             span: begin.to(self.prev_span()),
@@ -619,7 +746,7 @@ impl Parser {
     fn signature(&mut self, continued: &mut bool, lower: bool) -> PResult<Signature> {
         let mut shape = Vec::new();
         if self.eat_op(Op::LBracket) {
-            shape = self.comma_list(Self::expect_name)?;
+            shape = self.comma_list(Self::binding_name)?;
             self.expect_op(Op::RBracket)?;
         }
         self.expect_op(Op::LParen)?;
@@ -676,7 +803,7 @@ impl Parser {
     }
 
     fn param(&mut self) -> PResult<Param> {
-        let name = self.expect_name()?;
+        let name = self.binding_name()?;
         self.expect_op(Op::Colon)?;
         let ty = self.type_expr()?;
         Ok(Param { name, ty })
@@ -687,19 +814,27 @@ impl Parser {
         let kind = match self.peek().clone() {
             Tok::Op(Op::Amp) => {
                 self.bump();
+                // `host` and `await` are contextual: after `&`, only `mut` or
+                // `tensor` could follow otherwise.
+                let host = self.at_word("host");
+                let awaited = !host && self.at_word("await");
+                if host || awaited {
+                    self.bump();
+                }
                 let mutable = self.eat_kw(Kw::Mut);
                 let tensor = self.expect_name()?;
                 if tensor.name != "tensor" || !self.at_op(Op::LBracket) {
                     return Err(Diagnostic::with_rule(
                         DiagnosticRule::Syntax,
                         tensor.span,
-                        "a borrow type is `&tensor[...] T` or `&mut tensor[...] T`",
+                        "a borrow type is `&tensor[...] T`, `&mut tensor[...] T`, `&host tensor[...] T`, `&host mut tensor[...] T`, `&await tensor[...] T` or `&await mut tensor[...] T`",
                     ));
                 }
-                self.shaped(if mutable {
-                    ShapedHead::MutTensor
-                } else {
-                    ShapedHead::SharedTensor
+                self.shaped(match (host, awaited, mutable) {
+                    (true, _, write) => ShapedHead::HostTensor { write },
+                    (false, true, write) => ShapedHead::AwaitTensor { write },
+                    (false, false, true) => ShapedHead::MutTensor,
+                    (false, false, false) => ShapedHead::SharedTensor,
                 })?
             }
             Tok::Kw(Kw::Void) => {
@@ -855,7 +990,7 @@ impl Parser {
 
     /// Parse the common tail of ordered `for` and independent `parallel for`.
     fn logical_for(&mut self, parallel: bool) -> PResult<StmtKind> {
-        let targets = self.comma_list(Self::expect_name)?;
+        let targets = self.comma_list(Self::binding_name)?;
         self.expect_kw(Kw::In)?;
         let iter = self.expr()?;
         self.expect_op(Op::Colon)?;
@@ -907,7 +1042,7 @@ impl Parser {
             self.expect_op(Op::RParen)?;
             return Ok(inner);
         }
-        Ok(Pattern::Name(self.expect_name()?))
+        Ok(Pattern::Name(self.binding_name()?))
     }
 
     /// `simple (";" simple)* NEWLINE`. A statement whose value is a region ends its own line.
@@ -1180,7 +1315,11 @@ impl Parser {
                     span: span.to(self.prev_span()),
                 });
             }
-            Tok::Name(name) => ExprKind::Name(Ident { name, span }),
+            // A module constant is its integer literal.
+            Tok::Name(name) => match self.constants.get(&name) {
+                Some(value) => ExprKind::Int(*value),
+                None => ExprKind::Name(Ident { name, span }),
+            },
             Tok::Op(Op::LParen) => {
                 self.bump();
                 if self.at_op(Op::RParen) {
@@ -1219,27 +1358,52 @@ impl Parser {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ast::structure;
     use super::super::printer::print;
     use super::*;
 
-    /// Debug rendering with every `Span { .. }` removed, for span-insensitive comparison.
-    fn shape(file: &File) -> String {
-        let text = format!("{file:?}");
-        let mut out = String::new();
-        let mut rest = text.as_str();
-        while let Some(i) = rest.find("Span {") {
-            out.push_str(&rest[..i]);
-            rest = &rest[i..];
-            rest = &rest[rest.find('}').map_or(rest.len(), |j| j + 1)..];
-        }
-        out + rest
+    /// A file parsed with its own constants, as the first of `check_closed`'s two passes
+    /// gives them.
+    fn parse(text: &str) -> Result<File, Diagnostic> {
+        let constants = super::parse(text, &BTreeMap::new())?
+            .constants
+            .iter()
+            .map(|constant| (constant.name.name.clone(), constant.value))
+            .collect();
+        super::parse(text, &constants)
     }
+
+    /// A module constant is the integer it names wherever an expression names it, a
+    /// `where` clause's included, and no binding may take its name.
+    #[test]
+    fn module_constants_are_their_integers() {
+        let text = "const CHOICES = 4\n\nfn f[C](control: &tensor[C] i32) -> i32 where C >= CHOICES + 1:\n    return control[CHOICES]\n";
+        let file = round_trip(text);
+        assert_eq!(file.constants.len(), 1);
+        assert_eq!((file.constants[0].name.name.as_str(), file.constants[0].value), ("CHOICES", 4));
+        let f = only_fn(&file);
+        assert!(format!("{:?}", f.signature.predicates).contains("Int(4)"));
+        assert!(format!("{:?}", f.body).contains("Int(4)") && !format!("{:?}", f.body).contains("CHOICES"));
+        for bound in [
+            "const N = 1\n\nfn f[N](x: &tensor[N] i32):\n    return\n",
+            "const N = 1\n\nfn f(N: i32):\n    return\n",
+            "const N = 1\n\nfn f():\n    let N = 2\n",
+            "const N = 1\n\nfn f():\n    for N in 0..2:\n        return\n",
+            "const BLOCK = 64\n\nnative f for metal from \"f.metal\":\n    params (BLOCK in [32, 64] default 32)\n    launch f:\n        threadgroups (ceil_div(N, BLOCK), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+            "const BLOCK = 64\n\nnative f for metal from \"f.metal\":\n    launch f:\n        params (BLOCK in [32, 64] default 32)\n        threadgroups (ceil_div(N, BLOCK), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+            "const BLOCK = 64\n\nnative f for metal from \"f.metal\":\n    scratch BLOCK bytes (4)\n    launch f:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+        ] {
+            assert!(parse(bound).unwrap_err().message.contains("module constant"), "{bound}");
+        }
+        assert!(parse("const N = M\n").is_err());
+    }
+
 
     fn round_trip(text: &str) -> File {
         let file = parse(text).unwrap_or_else(|d| panic!("{d:?}\n{text}"));
         let printed = print(&file);
         let again = parse(&printed).unwrap_or_else(|d| panic!("{d:?}\n{printed}"));
-        assert_eq!(shape(&file), shape(&again), "printed:\n{printed}");
+        assert_eq!(structure(&file), structure(&again), "printed:\n{printed}");
         assert_eq!(print(&again), printed);
         file
     }
@@ -1292,7 +1456,7 @@ mod tests {
     #[test]
     fn cpu_element_coverage_round_trips() {
         let file = round_trip(
-            "native copy for cpu from \"copy.rs\":\n    params (ROWS in [4, 1])\n    elements (A in [f32, u32], B in [bf16])\n    launch copy:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n",
+            "native copy for cpu from \"copy.rs\":\n    params (ROWS in [4, 1] default 4)\n    elements (A in [f32, u32], B in [bf16])\n    launch copy:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n",
         );
         let [Decl::Native(native)] = file.decls.as_slice() else {
             panic!("expected one native implementation")
@@ -1312,7 +1476,7 @@ mod tests {
     #[test]
     fn specialized_native_declarations_round_trip() {
         let file = round_trip(
-            "native scale for cuda from \"scale.cu\":\n    static (N)\n    params (arithmetic form PARTS in [1, 2, 4], WIDTH in [64, 128])\n    where PARTS * WIDTH <= N and WIDTH >= 64\n    scratch partials bytes (PARTS * N * 4)\n    launch scale_partial:\n        threadgroups (ceil_div(N, WIDTH), PARTS, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n        shared_bytes (max(WIDTH * 4, 256))\n    launch scale_merge:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (min(N, 256), 1, 1)\n",
+            "native scale for cuda from \"scale.cu\":\n    static (N)\n    params (arithmetic form PARTS in [1, 2, 4] default 1, WIDTH in [64, 128] default 64)\n    where PARTS * WIDTH <= N and WIDTH >= 64\n    scratch partials bytes (PARTS * N * 4)\n    launch scale_partial:\n        threadgroups (ceil_div(N, WIDTH), PARTS, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n        shared_bytes (max(WIDTH * 4, 256))\n    launch scale_merge:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (min(N, 256), 1, 1)\n",
         );
         let [Decl::Native(native)] = file.decls.as_slice() else {
             panic!("expected one native implementation")
@@ -1339,22 +1503,121 @@ mod tests {
     #[test]
     fn launch_parameters_round_trip_with_reused_names() {
         let file = round_trip(
-            "native project for metal from \"project.metal\":\n    params (BATCH_FROM in [5, 3])\n    launch gemv when O < BATCH_FROM:\n        params (SIMDGROUPS in [16, 8], code arithmetic form ROWS in [1, 2])\n        threadgroups (ceil_div(H, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch batch when O >= BATCH_FROM:\n        params (SIMDGROUPS in [8, 4])\n        threadgroups (ceil_div(H, SIMDGROUPS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n",
+            "native project for metal from \"project.metal\":\n    params (BATCH_FROM in [5, 3] default 5)\n    launch gemv when O < BATCH_FROM:\n        params (SIMDGROUPS in [16, 8] default 16, arithmetic form ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(H, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch batch when O >= BATCH_FROM:\n        params (SIMDGROUPS in [8, 4] default 8)\n        threadgroups (ceil_div(H, SIMDGROUPS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n",
         );
         let [Decl::Native(native)] = file.decls.as_slice() else {
             panic!("expected one native implementation")
         };
         assert_eq!(native.launches[0].params[0].name.name, "SIMDGROUPS");
-        assert!(native.launches[0].params[1].code);
+        assert!(matches!(
+            native.launches[0].params[1].default,
+            NativeDefaultDecl::Value(Expr { kind: ExprKind::Int(1), .. })
+        ));
         assert!(native.launches[0].params[1].arithmetic);
         assert!(native.launches[0].params[1].form);
         assert_eq!(native.launches[1].params[0].name.name, "SIMDGROUPS");
     }
 
     #[test]
+    fn device_defaults_and_launch_conditions_round_trip() {
+        let file = round_trip(
+            "native project for cuda from \"project.cu\":\n    static (KV)\n    params (PARTS in [12, 24, 48] default least where KV * PARTS >= device.units)\n    launch gemv:\n        params (WARPS in [1, 2, 4] default greatest where WARPS * 32 <= device.subgroup_width, MATRIX in [0, 1] default device.matrix)\n        where MATRIX == 0 or device.matrix\n        threadgroups (KV, PARTS, 1)\n        threads_per_threadgroup (WARPS * 32, 1, 1)\n",
+        );
+        let [Decl::Native(native)] = file.decls.as_slice() else {
+            panic!("expected one native implementation")
+        };
+        assert!(matches!(native.params[0].default, NativeDefaultDecl::Least(_)));
+        assert!(matches!(native.launches[0].params[0].default, NativeDefaultDecl::Greatest(_)));
+        assert!(matches!(
+            native.launches[0].params[1].default,
+            NativeDefaultDecl::Value(Expr { kind: ExprKind::Attr { .. }, .. })
+        ));
+        assert!(native.launches[0].constraint.is_some());
+    }
+
+    #[test]
+    fn a_launch_grid_round_trips() {
+        let file = round_trip(
+            "native fill for metal from \"fill.metal\":\n    launch fill:\n        threadgroups (32, M, 1)\n        grid (groups)\n        threads_per_threadgroup (256, 1, 1)\n",
+        );
+        let [Decl::Native(native)] = file.decls.as_slice() else {
+            panic!("expected one native implementation")
+        };
+        assert_eq!(native.launches[0].grid.as_ref().map(|grid| grid.name.as_str()), Some("groups"));
+    }
+
+    #[test]
+    fn a_launch_condition_round_trips() {
+        for (clause, encoded) in [("unless", Encoded::WhileClear), ("if", Encoded::WhileSet)] {
+            let file = round_trip(&format!(
+                "native fill for metal from \"fill.metal\":\n    launch fill:\n        threadgroups (32, M, 1)\n        grid (groups)\n        {clause} (whole)\n        threads_per_threadgroup (256, 1, 1)\n",
+            ));
+            let [Decl::Native(native)] = file.decls.as_slice() else {
+                panic!("expected one native implementation")
+            };
+            let conditions = native.launches[0]
+                .conditions
+                .iter()
+                .map(|condition| {
+                let index = condition.index.as_ref().map(|index| match index.kind {
+                    ExprKind::Int(index) => index,
+                    _ => panic!("a constant index"),
+                });
+                (condition.encoded, condition.word.name.as_str(), index)
+            })
+                .collect::<Vec<_>>();
+            assert_eq!(conditions, [(encoded, "whole", None)], "{clause}");
+        }
+    }
+
+    #[test]
+    fn a_launch_condition_conjunction_round_trips() {
+        let file = round_trip(
+            "native fill for metal from \"fill.metal\":\n    launch fill:\n        threadgroups (32, M, 1)\n        unless (whole)\n        if (next)\n        threads_per_threadgroup (256, 1, 1)\n",
+        );
+        let [Decl::Native(native)] = file.decls.as_slice() else {
+            panic!("expected one native implementation")
+        };
+        let conditions = native.launches[0]
+            .conditions
+            .iter()
+            .map(|condition| {
+                let index = condition.index.as_ref().map(|index| match index.kind {
+                    ExprKind::Int(index) => index,
+                    _ => panic!("a constant index"),
+                });
+                (condition.encoded, condition.word.name.as_str(), index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(conditions, [(Encoded::WhileClear, "whole", None), (Encoded::WhileSet, "next", None)]);
+    }
+
+    #[test]
+    fn an_indexed_launch_condition_round_trips() {
+        let file = round_trip(
+            "const WHOLE = 2\n\nnative fill for metal from \"fill.metal\":\n    launch fill:\n        threadgroups (32, M, 1)\n        unless (policy[WHOLE])\n        if (next[0])\n        threads_per_threadgroup (256, 1, 1)\n",
+        );
+        let [Decl::Native(native)] = file.decls.as_slice() else {
+            panic!("expected one native implementation")
+        };
+        let conditions = native.launches[0]
+            .conditions
+            .iter()
+            .map(|condition| {
+                let index = condition.index.as_ref().map(|index| match index.kind {
+                    ExprKind::Int(index) => index,
+                    _ => panic!("a constant index"),
+                });
+                (condition.encoded, condition.word.name.as_str(), index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(conditions, [(Encoded::WhileClear, "policy", Some(2)), (Encoded::WhileSet, "next", Some(0))]);
+    }
+
+    #[test]
     fn launch_kernel_reads_round_trip() {
         let file = round_trip(
-            "native project for cuda from \"project.cu\":\n    params (code arithmetic INT8 in [0, 1])\n    launch project:\n        reads (INT8)\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n",
+            "native project for cuda from \"project.cu\":\n    params (arithmetic INT8 in [0, 1] default 0)\n    launch project:\n        reads (INT8)\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n",
         );
         let [Decl::Native(native)] = file.decls.as_slice() else {
             panic!("expected one native implementation")
@@ -1365,7 +1628,7 @@ mod tests {
     #[test]
     fn conditional_native_launches_and_scratch_round_trip() {
         let file = round_trip(
-            "native rows for metal from \"rows.metal\":\n    params (SPLIT in [1, 2])\n    where SPLIT == 1 or (SPLIT > 1 and SPLIT < 4)\n    scratch normalized bytes (O * H * 2) when O > 8\n    scratch partials bytes (SPLIT * O * 4) when (SPLIT > 1 or O >= 9) and O != 0\n    launch rows_normalize when O > 8:\n        threadgroups (O, 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n    launch rows_gemv when O <= 2 or (INT8 == 1 and O <= 8):\n        threadgroups (ceil_div(F, 8), 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n        shared_bytes (O * 72)\n    launch rows_merge:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n",
+            "native rows for metal from \"rows.metal\":\n    params (SPLIT in [1, 2] default 1)\n    where SPLIT == 1 or (SPLIT > 1 and SPLIT < 4)\n    scratch normalized bytes (O * H * 2) when O > 8\n    scratch partials bytes (SPLIT * O * 4) when (SPLIT > 1 or O >= 9) and O != 0\n    launch rows_normalize when O > 8:\n        threadgroups (O, 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n    launch rows_gemv when O <= 2 or (INT8 == 1 and O <= 8):\n        threadgroups (ceil_div(F, 8), 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n        shared_bytes (O * 72)\n    launch rows_merge:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n",
         );
         let [Decl::Native(native)] = file.decls.as_slice() else {
             panic!("expected one native implementation")
@@ -1411,7 +1674,7 @@ mod tests {
     #[test]
     fn native_terms_round_trip() {
         let file = round_trip(
-            "native rows for metal from \"rows.metal\":\n    params (SPLIT in [1, 2])\n    let PARTS = max(1, SPLIT * O)\n    let SPARE = (8 - PARTS) * O\n    where PARTS <= 8\n    scratch partials bytes (PARTS * 4)\n    launch rows:\n        threadgroups (ceil_div(SPARE, 4), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+            "native rows for metal from \"rows.metal\":\n    params (SPLIT in [1, 2] default 1)\n    let PARTS = max(1, SPLIT * O)\n    let SPARE = (8 - PARTS) * O\n    where PARTS <= 8\n    scratch partials bytes (PARTS * 4)\n    launch rows:\n        threadgroups (ceil_div(SPARE, 4), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         );
         let [Decl::Native(native)] = file.decls.as_slice() else {
             panic!("expected one native implementation")
@@ -1513,6 +1776,23 @@ mod tests {
             }
         ));
         assert_eq!(f.signature.params[3].name.name, "to");
+    }
+
+    #[test]
+    fn host_ports_round_trip() {
+        let file = round_trip(
+            "fn request[N](read: &host tensor[N] i32, written: &host mut tensor[N] i32, out: &mut tensor[N] i32):\n    out[0] = 1\n",
+        );
+        let function = only_fn(&file);
+        for (index, write) in [(0, false), (1, true)] {
+            assert!(matches!(
+                function.signature.params[index].ty.kind,
+                TypeKind::Shaped {
+                    head: ShapedHead::HostTensor { write: w },
+                    ..
+                } if w == write
+            ));
+        }
     }
 
     #[test]

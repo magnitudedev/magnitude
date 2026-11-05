@@ -34,7 +34,7 @@ describe("a gated repository refused by Hugging Face", () => {
     const list = renderModelsStatus({ models: [model], unsupported: [], hidden: [], all: false })
     expect(list).toContain(`Failed - ${ACCEPT_TERMS}`)
     expect(list).toContain(ADDED_MODEL_ID)
-    const detail = renderModelDetail({ model, models: [model], drafters: { _tag: "NotApplicable" }, hidden: false })
+    const detail = renderModelDetail({ model, models: [model], hardware: Option.none(), drafters: { _tag:"NotApplicable" }, hidden: false })
     expect(detail).toMatch(new RegExp(`Reason\\s+${ACCEPT_TERMS.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`))
   })
 

@@ -15,10 +15,10 @@ use magnitude_engine::chat::SessionLimits;
 use magnitude_engine::composition::{EngineConfiguration, start_in_process};
 use magnitude_engine::invocation::{InvocationSource, SingleEngine};
 use magnitude_engine::options::{
-    DraftPolicy, ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection,
+    DraftPolicy, ExecutionManifest, ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection,
     standard_service_limits,
 };
-use magnitude_engine::telemetry::{DEFAULT_TRACES_ENDPOINT, Telemetry};
+use magnitude_engine::telemetry::{DEFAULT_TRACES_ENDPOINT, Telemetry, log_to_stderr};
 use magnitude_engine::worker::transport::stdio_worker_transport;
 use magnitude_engine::worker::{EngineClient, WorkerExit, serve_worker};
 use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
@@ -49,6 +49,7 @@ struct Options {
     kv_codec: KvCodec,
     numerical_profile: Option<magnitude_executor::NumericalProfile>,
     lookahead: bool,
+    weight_cap: Option<u64>,
     telemetry_endpoint: String,
     device: DeviceRequest,
     kernel_cache: Option<PathBuf>,
@@ -59,7 +60,7 @@ struct Options {
 const USAGE: &str = "magnitude-engine --model TARGET.gguf [--projector PROJECTOR.gguf | --no-projector] \
 [--draft DRAFT.gguf] [--host ADDR] [--port N] [--served-model NAME] [--context-tokens N] \
 [--output-capacity N] [--prefill-tokens N] [--method auto|plain|mtp|dflash|dspark|dflash2|lilicorr] [--mtp-proposals N] [--draft-budget JSON|adaptive] \
-[--kv-codec dense|affine-k8v4] [--numerical-profile JSON_FILE] [--lookahead on|off] [--telemetry URL] \
+[--kv-codec dense|affine-k8v4] [--numerical-profile JSON_FILE] [--lookahead on|off] [--weight-cap BYTES] [--telemetry URL] \
 [--device auto|metal|cuda|vulkan|cpu|SELECTOR] [--cache-dir DIR] \
 [--tuning-budget SECONDS] [--fresh-tuning] [--tuning-trace FILE]";
 
@@ -106,6 +107,7 @@ fn parse() -> Result<Options, String> {
     let mut kv_codec = defaults.kv_codec;
     let mut numerical_profile = defaults.numerical_profile;
     let mut lookahead = defaults.lookahead;
+    let mut weight_cap = defaults.weight_cap;
     let mut telemetry_endpoint = DEFAULT_TRACES_ENDPOINT.to_owned();
     let mut device = DeviceRequest::Automatic;
     let mut kernel_cache = None;
@@ -127,16 +129,9 @@ fn parse() -> Result<Options, String> {
             "--output-capacity" => output_capacity = number(&flag, &mut args)?,
             "--prefill-tokens" => prefill_tokens = number(&flag, &mut args)?,
             "--method" => {
-                method = match value(&flag, &mut args)?.as_str() {
-                    "auto" => ModelMethod::Auto,
-                    "plain" => ModelMethod::Plain,
-                    "mtp" => ModelMethod::Mtp,
-                    "dflash" => ModelMethod::DFlash,
-                    "dspark" => ModelMethod::DSpark,
-                    "dflash2" => ModelMethod::DFlash2,
-                    "lilicorr" => ModelMethod::LiLiCorr,
-                    other => return Err(format!("unknown generation method: {other}")),
-                }
+                let name = value(&flag, &mut args)?;
+                method = ModelMethod::named(&name)
+                    .ok_or_else(|| format!("unknown generation method: {name}"))?;
             }
             "--mtp-proposals" => mtp_proposals = Some(number(&flag, &mut args)?),
             "--draft-budget" => {
@@ -161,6 +156,7 @@ fn parse() -> Result<Options, String> {
                 );
             }
             "--lookahead" => lookahead = switch(&flag, &value(&flag, &mut args)?)?,
+            "--weight-cap" => weight_cap = Some(number(&flag, &mut args)?),
             "--telemetry" => telemetry_endpoint = value(&flag, &mut args)?,
             "--device" => {
                 device = value(&flag, &mut args)?
@@ -211,6 +207,7 @@ fn parse() -> Result<Options, String> {
         kv_codec,
         numerical_profile,
         lookahead,
+        weight_cap,
         telemetry_endpoint,
         device,
         kernel_cache,
@@ -254,7 +251,24 @@ struct Identity {
     model: String,
     context_tokens: u64,
     vocabulary: u64,
+    /// What the load decodes with (`drafting`).
+    drafting: serde_json::Value,
     engine: EngineClient,
+}
+
+/// What a load decodes with, as its resolved policy states it
+/// (`ModelPolicy::resolve`): the method it serves (`plain` for a load that
+/// drafts nothing, a drafter it could not admit included), the widest draft a
+/// round may propose, and how rounds take their budget: `Adaptive` (each
+/// round chooses), `{"Fixed": {"generated", "verified"}}`, or null for a
+/// plain load or a fixed width alone (every round proposes `proposals`).
+fn drafting(manifest: &ExecutionManifest) -> Result<serde_json::Value, String> {
+    let model = &manifest.model;
+    Ok(json!({
+        "method": model.served_method(&manifest.definition)?.name(),
+        "proposals": model.method.proposals(),
+        "policy": model.draft_policy,
+    }))
 }
 
 async fn health(State(identity): State<Identity>) -> Response {
@@ -263,6 +277,7 @@ async fn health(State(identity): State<Identity>) -> Response {
             "model": identity.model,
             "context_tokens": identity.context_tokens,
             "vocabulary": identity.vocabulary,
+            "drafting": identity.drafting,
             "ready": true,
         }))
         .into_response(),
@@ -297,8 +312,13 @@ async fn memory(State(identity): State<Identity>) -> Response {
 const WORKER_ARGUMENT: &str = "--worker";
 
 fn main() {
+    magnitude_executor::diagnostics::install();
     magnitude_executor::platform::relax_gpu_watchdog();
     if std::env::args().nth(1).as_deref() == Some(WORKER_ARGUMENT) {
+        if let Err(error) = log_to_stderr() {
+            eprintln!("magnitude-engine: {error}");
+            std::process::exit(1);
+        }
         let exit = serve_worker(stdio_worker_transport());
         std::process::exit(match exit {
             WorkerExit::Prepared | WorkerExit::Shutdown => 0,
@@ -318,14 +338,7 @@ fn run() -> Result<(), String> {
     let load_started = Instant::now();
     let options = parse()?;
     let _telemetry = Telemetry::open(&options.telemetry_endpoint);
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    log_to_stderr()?;
     let mut service = standard_service_limits();
     service.prefill_tokens = options.prefill_tokens;
     let mut resolved = EngineConfiguration {
@@ -342,6 +355,7 @@ fn run() -> Result<(), String> {
             lookahead: options.lookahead,
             exported_logits_rows: 0,
             numerical_profile: options.numerical_profile,
+            weight_cap: options.weight_cap,
         },
         context_tokens: options.context_tokens,
         service,
@@ -360,6 +374,7 @@ fn run() -> Result<(), String> {
     );
     let geometry = &resolved.host.definition().decoder;
     let (context_tokens, vocabulary) = (geometry.context_limit, geometry.vocabulary);
+    let drafting = drafting(&resolved.manifest)?;
     let worker_started = Instant::now();
     let mut reported = None;
     let mut worker = std::process::Command::new(
@@ -385,6 +400,7 @@ fn run() -> Result<(), String> {
         model: options.served_model.clone(),
         context_tokens,
         vocabulary,
+        drafting,
         engine: engine.clone(),
     };
     let serving = Serving::new(Arc::new(Standalone {

@@ -7,8 +7,9 @@
 //! prefix of [`abi`]; CPU implementations are Rust compiled into the binary
 //! and reached through [`cpu`].
 //!
-//! Submission is asynchronous. Launches of one submission share one serial
-//! encoder (Metal), one stream (CUDA), one command buffer on the device's
+//! Submission is asynchronous. Launches of one submission share one command
+//! buffer of concurrent encoders, each beginning where [`hazard`] finds a
+//! dependency (Metal), one stream (CUDA), one command buffer on the device's
 //! queue (Vulkan) or the worker pool (CPU); the device queue orders
 //! submissions, and allocation fences order host access after them.
 
@@ -20,12 +21,24 @@ mod comparison;
 #[cfg(feature = "coverage")]
 pub mod coverage;
 pub(crate) use batch::{NativeTensorBatch, NativeTensorBatchCompletion};
+
+/// The engine's kernel sources, for the tests that check them: the tree
+/// beside this crate's directory, as cargo names it to the running test.
+#[cfg(test)]
+pub(crate) fn engine_kernels() -> std::path::PathBuf {
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
+    std::path::Path::new(&manifest).join("../../engine/kernels/kernels")
+}
+
 #[cfg(test)]
 mod bundle_identity_tests;
 pub mod cpu;
 mod cuda;
 pub mod graph;
 mod graph_replays;
+// The order a submission's launches need: Metal encodes them concurrently
+// by level.
+pub(crate) mod hazard;
 #[cfg(test)]
 mod handoff_tests;
 mod observation;
@@ -34,44 +47,40 @@ pub(crate) mod point;
 pub mod replay;
 pub mod sampling;
 pub mod search;
+pub mod spans;
 pub mod timeline;
 mod timing;
 pub mod trace;
+pub mod transfer;
 pub mod tune;
 mod validation;
 #[cfg(not(target_os = "macos"))]
-mod vulkan;
-
-/// The most device memory a device's recorded native graphs hold beyond
-/// every allocation: a fixed term of every load's footprint on `backend`.
-pub fn recorded_graph_device_bytes(backend: seismic_lang::registry::BackendName) -> u64 {
-    match backend {
-        seismic_lang::registry::BackendName::Cuda | seismic_lang::registry::BackendName::Vulkan => {
-            graph_replays::GRAPH_DEVICE_BYTES
-        }
-        _ => 0,
-    }
-}
+pub(crate) mod vulkan;
 
 use crate::api::device::DeviceInner;
 use crate::api::kernel::{DecodedResults, DecodedValue, EncodedArgs, EncodedOutputs, PrepareError};
+use crate::api::tensor::Records;
 use crate::api::tensor::TensorInner;
 use crate::api::{CallError, OutputError};
 use crate::artifacts::ArtifactKey;
 use crate::backends::{CpuOpened, CudaOpened, OpenedKind};
-use crate::driver::{
-    collect_native_access, typed_buffer, write_zeros, Allocation, DeviceCompletion,
-};
+use crate::completion::{Committed, DeviceCompletion, IssuedFailure};
+pub(crate) use crate::completion::RouteSubmission;
+use crate::driver::{collect_native_access, typed_buffer, write_zeros, Allocation};
 pub(crate) use crate::formation::FormationClass;
 use crate::formation::{Compile, Keyed, ProgramFormer};
 pub use budget::{Footprint, Linear, Observed, Quote};
+pub use graph_replays::GraphReplays;
 pub use point::{GraphPending, GraphPoint, GraphTiming, KernelPoint, Point, PointPending};
+pub use spans::NativeSpans;
 use seismic_compiler::errors::{ExecutionError, InvocationError, PreparationError};
+use seismic_compiler::graph_cost::{GraphCensus, LaunchGraphs};
 use seismic_compiler::prepared::{
     validate_invocation, ArgumentValue, DeviceIdentity, InvocationContract,
 };
 use seismic_lang::checked::{
     CheckedModule, NativeCondition, NativeImplementation, NativeNatExpr, NativeSpecialization,
+    OnDevice,
 };
 use seismic_lang::entry::{
     CallSchema, CheckedProgramSubject, ElementBindings, LogicalEntry, ParameterKind, ResultClass,
@@ -84,6 +93,7 @@ use seismic_lang::registry::BackendName;
 use seismic_native_target::{ProgramEntry, ProgramSource, Toolchain};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 pub use cpu::{CpuInvocation, CpuKernelFn, CpuLaunchVariants, CpuNativeKernels, CpuVariant};
@@ -124,9 +134,22 @@ pub(crate) struct NativeTensorSpec {
 /// Evaluated geometry of one launch of one call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LaunchGeometry {
+    /// The groups on each axis; of a launch with `grid`, the most it reads
+    /// (on CUDA, the blocks of its grid-stride loop).
     pub(crate) groups: [u64; 3],
+    /// The ABI buffer holding the grid the launch dispatches, written by an
+    /// earlier launch (`NativeLaunch::grid`).
+    pub(crate) grid: Option<usize>,
     pub(crate) threads: [u64; 3],
     pub(crate) shared_bytes: u64,
+}
+
+impl LaunchGeometry {
+    /// Whether the grid is empty: the launch does no device work. A grid
+    /// read at dispatch is empty when its bound is.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.groups.contains(&0) || self.threads.contains(&0)
+    }
 }
 
 /// The launches of one call.
@@ -147,9 +170,9 @@ pub(crate) struct CallLaunches {
 /// placed buffer, as they do for a standalone call's.
 pub(crate) const BUFFER_ALIGNMENT: u64 = seismic_native_cpu::tensor::BUFFER_ALIGNMENT as u64;
 
-/// Per-device state of native submission.
+/// Per-device state of native submission, on every native queue.
 #[derive(Default)]
-pub(crate) struct NativeQueue {
+pub(crate) struct NativeState {
     /// Held from encoding a submission to recording its allocation fences.
     order: Mutex<()>,
     /// CUDA graphs of sealed-plan submissions (CUDA devices only).
@@ -158,16 +181,349 @@ pub(crate) struct NativeQueue {
     /// only).
     #[cfg(not(target_os = "macos"))]
     vulkan_replays: vulkan::VulkanReplays,
+    /// Schedules of sealed-plan submissions (Metal devices only).
+    #[cfg(target_os = "macos")]
+    metal_schedules: graph_replays::Replays<hazard::Schedule>,
+    /// What the graphs the device keeps may be made of.
+    graph_budget: Mutex<GraphBudget>,
 }
 
-impl NativeQueue {
-    /// Graphs the device has recorded for submissions so far: a submission
-    /// during which it grew paid a recording, not only its launches.
-    pub(crate) fn recorded_graphs(&self) -> u64 {
-        let recorded = self.cuda_replays.recorded();
+/// The device's graph budget: the sum of every live [`GraphHold`]'s census,
+/// how many are live, and the ledger's charge of what that census costs on
+/// the device (`DeviceInner::graph_cost`), in device and upload storage:
+/// one charge each, resized as holds come and go, so it is always the cost
+/// of the whole census, which a sum of the holds' own costs would not be (a
+/// driver's pool grows in granules, argument blocks fill chunks).
+#[derive(Default)]
+struct GraphBudget {
+    census: GraphCensus,
+    holds: usize,
+    device: Option<crate::memory::MemoryCharge>,
+    upload: Option<crate::memory::MemoryCharge>,
+}
+
+impl GraphBudget {
+    /// Charge what `census` costs on `device`, the budget's census becoming
+    /// it: the growth reserved whole, or refused with nothing changed. The
+    /// bytes the device is no longer charged, none for a growth.
+    fn charge(&mut self, device: &DeviceInner, census: GraphCensus) -> Result<u64, ExecutionError> {
+        let charged = |budget: &Self| {
+            [&budget.device, &budget.upload].into_iter().flatten().map(crate::memory::MemoryCharge::bytes).sum::<u64>()
+        };
+        let before = charged(self);
+        let bytes = device.graph_cost.bytes(census).expect("a device's graph budget's memory fits u64");
+        let memory = &device.memory;
+        let growth = |charge: &Option<crate::memory::MemoryCharge>, bytes: u64| {
+            bytes.saturating_sub(charge.as_ref().map_or(0, crate::memory::MemoryCharge::bytes))
+        };
+        let reserve = |placement: &Arc<crate::memory::Placement>, bytes: u64| {
+            (bytes != 0).then(|| crate::driver::reserve(placement, bytes)).transpose()
+        };
+        let device_growth = reserve(memory.device(), growth(&self.device, bytes.device))?;
+        let upload_growth = reserve(memory.upload(), growth(&self.upload, bytes.upload))?;
+        for (charge, growth, bytes) in [
+            (&mut self.device, device_growth, bytes.device),
+            (&mut self.upload, upload_growth, bytes.upload),
+        ] {
+            match (charge.as_mut(), growth) {
+                (Some(held), Some(mut growth)) => {
+                    let extra = growth.remaining();
+                    growth.extend(held, extra);
+                }
+                (None, Some(mut growth)) => *charge = Some(growth.take(bytes)),
+                (Some(held), None) => held.shrink(bytes),
+                (None, None) => {}
+            }
+        }
+        self.census = census;
+        Ok(before.saturating_sub(charged(self)))
+    }
+}
+
+impl NativeState {
+    /// What the device's graphs cost its submissions so far: graphs
+    /// recorded (a submission during which one was paid its recording, not
+    /// only its launches) and replays that updated their graph's parameters.
+    /// A Metal schedule is host data no device holds, derived without a
+    /// recording, and is not counted.
+    pub(crate) fn graph_replays(&self) -> graph_replays::GraphReplays {
+        let counts = self.cuda_replays.counts();
         #[cfg(not(target_os = "macos"))]
-        let recorded = recorded + self.vulkan_replays.recorded();
-        recorded
+        let counts = counts.plus(self.vulkan_replays.counts());
+        counts
+    }
+
+    /// What the graphs of plan `plan`'s runs cost so far
+    /// ([`Self::graph_replays`]).
+    pub(crate) fn plan_graph_replays(&self, plan: u64) -> graph_replays::GraphReplays {
+        let counts = self.cuda_replays.plan_counts(plan);
+        #[cfg(not(target_os = "macos"))]
+        let counts = counts.plus(self.vulkan_replays.plan_counts(plan));
+        counts
+    }
+
+    /// What the graphs the device keeps may be made of: what every live
+    /// slot's runs may record.
+    pub(crate) fn graph_budget(&self) -> GraphCensus {
+        self.graph_budget.lock().expect("graph budget lock is never poisoned").census
+    }
+
+    /// Release graphs of every kind beyond `budget`, the device's graph
+    /// budget as a hold of it shrank ([`graph_replays::Replays::fit_to`]).
+    fn fit_graphs(&self, budget: GraphCensus) {
+        self.cuda_replays.fit_to(budget);
+        #[cfg(not(target_os = "macos"))]
+        self.vulkan_replays.fit_to(budget);
+        #[cfg(target_os = "macos")]
+        self.metal_schedules.fit_to(budget);
+    }
+
+    /// Drop every recorded graph, of every kind, while no hold of the graph
+    /// budget is live, checked under each kind's lock.
+    fn clear_unheld_graphs(&self) {
+        let unheld = || self.graph_budget.lock().expect("graph budget lock is never poisoned").holds == 0;
+        self.cuda_replays.clear_unheld(unheld);
+        #[cfg(not(target_os = "macos"))]
+        self.vulkan_replays.clear_unheld(unheld);
+        #[cfg(target_os = "macos")]
+        self.metal_schedules.clear_unheld(unheld);
+    }
+}
+
+/// A share of a device's graph budget: graphs of `census` the device may
+/// keep recorded, held until dropped ([`SlotGraphs`]). The device keeps no
+/// more graphs than its holds' census bounds.
+pub struct GraphHold {
+    device: Arc<DeviceInner>,
+    census: GraphCensus,
+}
+
+impl GraphHold {
+    /// A hold of `census`, its memory charged to the device's ledger with
+    /// the rest of the budget's; refused, holding nothing, where the ledger
+    /// has no room for it.
+    fn new(device: &Arc<DeviceInner>, census: GraphCensus) -> Result<Self, ExecutionError> {
+        let mut budget = device.native.graph_budget.lock().expect("graph budget lock is never poisoned");
+        let grown = budget.census.plus(census).expect("a device's graph budget fits u64");
+        budget.charge(device, grown)?;
+        budget.holds += 1;
+        Ok(Self { device: device.clone(), census })
+    }
+}
+
+impl GraphHold {
+    /// Hold `census` instead: a growth reserved whole, or refused with
+    /// nothing changed; a shrink releases the graphs beyond the smaller
+    /// budget, the least recently replayed first, so the graphs never hold
+    /// more than their owners do. The bytes the device is no longer
+    /// charged, none for a growth.
+    fn resize(&mut self, census: GraphCensus) -> Result<u64, ExecutionError> {
+        let shrinks = census.within(self.census);
+        let (budget, freed) = {
+            let mut budget = self.device.native.graph_budget.lock().expect("graph budget lock is never poisoned");
+            let resized = budget
+                .census
+                .minus(self.census)
+                .and_then(|rest| rest.plus(census))
+                .expect("a hold's census is part of its device's budget");
+            let freed = budget.charge(&self.device, resized)?;
+            (budget.census, freed)
+        };
+        self.census = census;
+        if shrinks {
+            self.device.native.fit_graphs(budget);
+        }
+        Ok(freed)
+    }
+
+    /// Release the hold as its drop does: the bytes the device is no longer
+    /// charged.
+    fn release(self) -> u64 {
+        let hold = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `hold` is never used or dropped again; its device is read
+        // out of it once, and dropped once `unhold` returns.
+        let device = unsafe { std::ptr::read(&hold.device) };
+        Self::unhold(&device, hold.census)
+    }
+
+    /// The budget shrinks by `census`, a hold's. Once no hold is live the
+    /// device keeps no graph: only a live hold's runs replay one, and each
+    /// graph keeps its plans, which hold the device (a device whose last
+    /// hold dropped would otherwise never be freed). A submission that
+    /// records or fits graphs holds its runs' holds throughout, so this
+    /// never runs beneath one. The bytes the device is no longer charged.
+    fn unhold(device: &Arc<DeviceInner>, census: GraphCensus) -> u64 {
+        let (unheld, shrunk, freed) = {
+            let mut budget = device.native.graph_budget.lock().expect("graph budget lock is never poisoned");
+            let shrunk = budget.census.minus(census).expect("a hold's census is part of its device's budget");
+            let freed = budget
+                .charge(device, shrunk)
+                .expect("a smaller census reserves nothing, so its charge is never refused");
+            budget.holds -= 1;
+            (budget.holds == 0, shrunk, freed)
+        };
+        match unheld {
+            true => device.native.clear_unheld_graphs(),
+            // The graphs never hold more than the holds left do.
+            false => device.native.fit_graphs(shrunk),
+        }
+        freed
+    }
+}
+
+/// The CUDA graph of one layout a family runs: a word per call of its
+/// plans, a bit set for each launch of the call any plan of the layout
+/// makes (`cuda::launch_structure`'s words, or'ed), each a node of the
+/// layout's graph, and those plans, over which a run that finds no graph
+/// of its shape records one (`graph::record_layout`). One graph serves
+/// every class, block, place and encoding sealed into the layout, each run
+/// enabling the nodes of the launches it makes (`cuda::issue`), so a family
+/// holds graphs by layout, never by class. Empty words on every other
+/// backend, whose graphs are their plans'.
+pub(crate) struct LayoutGraph {
+    pub(crate) form: Arc<[u64]>,
+    pub(crate) plans: Vec<Arc<graph::NativeGraphPlan>>,
+}
+
+/// A family's [`LayoutGraph`]s, by layout.
+pub(crate) struct LayoutForms {
+    forms: std::collections::HashMap<u64, Arc<LayoutGraph>>,
+}
+
+impl LayoutForms {
+    pub(crate) fn new(forms: impl IntoIterator<Item = (u64, LayoutGraph)>) -> Self {
+        Self { forms: forms.into_iter().map(|(layout, graph)| (layout, Arc::new(graph))).collect() }
+    }
+
+    /// `layout`'s graph.
+    pub(crate) fn of(&self, layout: u64) -> Arc<LayoutGraph> {
+        self.forms
+            .get(&layout)
+            .cloned()
+            .expect("a family runs only plans of layouts its graphs were made for")
+    }
+}
+
+/// A family's share of its device's graph budget and the layouts its runs
+/// replay ([`LayoutForms`]): what its live slots' launches in flight can
+/// need at once ([`Self::census`]), held from its first live slot to its
+/// last. Graphs are recorded as a run first needs one, never as a slot is
+/// made (`cuda::issue`).
+pub struct FamilyGraphs {
+    device: Arc<DeviceInner>,
+    layouts: LayoutForms,
+    /// What its decode launch replays, which each launch in flight beside
+    /// another may hold, and the union of every launch's, which any one may
+    /// (`LaunchGraphs::held`).
+    launches: LaunchGraphs,
+    /// Its live slots, and the hold of their census, none while no slot
+    /// lives.
+    held: Mutex<(u64, Option<GraphHold>)>,
+    /// Its live slots, as the hold counts them: no more than its census
+    /// holds, read without the hold's lock by a release of graphs
+    /// (`graph_replays::Pinned`), which runs beneath it.
+    flights: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FamilyGraphs {
+    /// `layout`'s graph ([`LayoutForms::of`]).
+    pub(crate) fn layout(&self, layout: u64) -> Arc<LayoutGraph> {
+        self.layouts.of(layout)
+    }
+
+    pub(crate) fn new(device: &Arc<DeviceInner>, layouts: LayoutForms, launches: LaunchGraphs) -> Arc<Self> {
+        Arc::new(Self { device: device.clone(), layouts, launches, held: Mutex::new((0, None)), flights: Arc::default() })
+    }
+
+    /// What its decode launch and the union of its launches replay.
+    pub(crate) fn launches(&self) -> LaunchGraphs {
+        self.launches
+    }
+
+    /// Its live slots, each a launch in flight, as its hold counts them.
+    pub(crate) fn flights(&self) -> &Arc<std::sync::atomic::AtomicUsize> {
+        &self.flights
+    }
+
+    /// What the family's graphs hold at most with `slots` live slots, each
+    /// a launch in flight ([`LaunchGraphs::held`]).
+    fn census(&self, slots: u64) -> GraphCensus {
+        self.launches.held(slots).expect("a family's graph census fits u64")
+    }
+
+    /// A live slot's share: the family's hold grown to one more slot's
+    /// census, or refused, holding nothing more, where the ledger has no
+    /// room for it.
+    pub(crate) fn slot(self: &Arc<Self>) -> Result<Arc<SlotGraphs>, ExecutionError> {
+        let mut held = self.held.lock().expect("family graph hold lock is never poisoned");
+        let census = self.census(held.0 + 1);
+        match &mut held.1 {
+            Some(hold) => drop(hold.resize(census)?),
+            None => held.1 = Some(GraphHold::new(&self.device, census)?),
+        }
+        held.0 += 1;
+        // Counted once the hold covers it.
+        self.flights.store(held.0 as usize, std::sync::atomic::Ordering::Release);
+        Ok(Arc::new(SlotGraphs { family: self.clone() }))
+    }
+}
+
+/// A live slot of a family ([`FamilyGraphs::slot`]), held by every run
+/// queued from it until replayed, so a submission of its runs always fits
+/// ([`graph_replays::Replays::record`]).
+pub struct SlotGraphs {
+    family: Arc<FamilyGraphs>,
+}
+
+impl SlotGraphs {
+    /// `layout`'s graph ([`LayoutForms::of`]).
+    pub(crate) fn layout(&self, layout: u64) -> Arc<LayoutGraph> {
+        self.family.layouts.of(layout)
+    }
+}
+
+impl SlotGraphs {
+    /// Release `graphs` where the slot alone held them, as their drop
+    /// does: the bytes the device is no longer charged; none where a queued
+    /// run shares them, which releases them with its own.
+    pub(crate) fn release(graphs: Arc<Self>) -> u64 {
+        Arc::try_unwrap(graphs).map_or(0, |graphs| {
+            let graphs = std::mem::ManuallyDrop::new(graphs);
+            // SAFETY: `graphs` is never used or dropped again; its family is
+            // read out of it once, and dropped once `unhold` returns.
+            let family = unsafe { std::ptr::read(&graphs.family) };
+            Self::unhold(&family)
+        })
+    }
+
+    /// `family`'s hold shrinks to one slot fewer, and goes with its last:
+    /// the bytes the device is no longer charged.
+    fn unhold(family: &FamilyGraphs) -> u64 {
+        let mut held = family.held.lock().expect("family graph hold lock is never poisoned");
+        held.0 -= 1;
+        // Uncounted before the hold shrinks and releases graphs beyond it.
+        family.flights.store(held.0 as usize, std::sync::atomic::Ordering::Release);
+        let census = family.census(held.0);
+        let hold = held.1.take().expect("a family holds its graphs while a slot lives");
+        match held.0 {
+            0 => hold.release(),
+            _ => {
+                let hold = held.1.insert(hold);
+                hold.resize(census).expect("a smaller census reserves nothing, so its charge is never refused")
+            }
+        }
+    }
+}
+
+impl Drop for SlotGraphs {
+    fn drop(&mut self) {
+        Self::unhold(&self.family);
+    }
+}
+
+impl Drop for GraphHold {
+    fn drop(&mut self) {
+        Self::unhold(&self.device, self.census);
     }
 }
 
@@ -275,10 +631,31 @@ impl<P> Launches<P> {
     /// ([`NativePrepared::launches`] refuses any other), and every launch
     /// such a call can activate is formed.
     fn launch(&self, ordinal: usize) -> (&P, usize) {
-        let (compile, entry, _) = self.launches[ordinal]
-            .as_ref()
+        let (program, entry, _) = self
+            .formed(ordinal)
             .expect("an active launch is formed: its call is within the specialization's ranges");
-        (compile.program(), *entry)
+        (program, entry)
+    }
+
+    /// The program, entry ordinal and entry of launch `ordinal`, where it
+    /// is formed.
+    fn formed(&self, ordinal: usize) -> Option<(&P, usize, &ProgramEntry)> {
+        self.launches[ordinal]
+            .as_ref()
+            .map(|(compile, entry, _)| (compile.program(), *entry, &compile.entries()[*entry]))
+    }
+
+    /// What each launch's program uses, in ordinal order, as `T`, the
+    /// toolchain that formed it, reports it; none for a launch not formed.
+    fn programs<T: Toolchain<Program = P>>(&self) -> Vec<Option<seismic_native_target::LaunchProgram>> {
+        (0..self.launches.len())
+            .map(|ordinal| {
+                self.formed(ordinal).map(|(program, entry, at)| seismic_native_target::LaunchProgram {
+                    threads: at.group_size.map(|size| size.iter().map(|extent| u64::from(*extent)).product()),
+                    statistics: T::statistics(program, entry).to_vec(),
+                })
+            })
+            .collect()
     }
 
     /// Each launch's program text address and entry, which with the
@@ -347,7 +724,10 @@ pub struct NativePrepared {
     name: String,
     device: DeviceIdentity,
     public_device: Arc<DeviceInner>,
-    logical: Arc<LogicalEntry>,
+    /// The entry's call schema and parameter shapes: all a formed
+    /// implementation reads of its logical entry once formed, so the
+    /// entry's lowered semantics (its arena and program) are not kept.
+    parameters: seismic_lang::entry::ParameterShapes,
     handoff: NativeHandoffKey,
     invocation: InvocationContract,
     implementation: NativeImplementation,
@@ -357,6 +737,23 @@ pub struct NativePrepared {
     /// Tensor parameters (by schema ordinal) whose static extents render
     /// constant canonical strides (S10), with those strides.
     canonical_parameters: Vec<(usize, Vec<u64>)>,
+    /// Whether a launch writes each buffer and whether its host rewrites it
+    /// once it sees the launch, in ABI order ([`abi::buffer_writes`],
+    /// [`abi::host_writes`]), which Metal's encoding orders by ([`hazard`]).
+    buffer_writes: Vec<bool>,
+    host_writes: Vec<bool>,
+    /// Whether each buffer, in ABI order, is bound in the kernel's argument
+    /// table ([`abi::bound`]): a host port is ordered by, never bound.
+    bound: Vec<bool>,
+    /// Whether each buffer, in ABI order, is a record port, bound as the
+    /// table of its view's records ([`abi::records`]).
+    records: Vec<bool>,
+    /// Per launch, in ordinal order, the launch conditions the host writes
+    /// the words of (`NativeLaunch::conditions`): each ABI
+    /// buffer, the word of it and the value the launch is encoded under, a
+    /// conjunction. The call or graph that binds the buffers resolves each
+    /// to its host-written word ([`condition_holds`]).
+    conditions: Vec<Vec<(usize, u64, seismic_lang::checked::Encoded)>>,
     results: Vec<NativeResult>,
     /// Scalar-result slots, of an entry with scalar results. Graph nodes
     /// publish no scalars, so only standalone calls write them.
@@ -433,7 +830,7 @@ impl NativeHandoffKey {
                 .position(|candidate| candidate.id == entry)
                 .expect("entry belongs to its module"),
             specialization: specialization.clone(),
-            asset: module.native_asset(entry, backend).map(Arc::from),
+            asset: module.native_asset(entry, backend).map(|asset| Arc::from(asset.text)),
             cpu_digest: if backend == BackendName::Cpu {
                 cpu.map(|kernels| kernels.digest)
             } else {
@@ -455,6 +852,7 @@ fn vulkan_geometry(
     specialization: &NativeSpecialization,
 ) -> Result<Vec<([u32; 3], Vec<u32>)>, PrepareError> {
     let limits = opened.service().facts().limits;
+    let properties = *opened.service().properties();
     let narrow = |value: u64, what: &str| {
         u32::try_from(value)
             .map_err(|_| preparation(format!("`{name}`: {what} {value} exceeds the Vulkan ABI")))
@@ -479,20 +877,20 @@ fn vulkan_geometry(
             ];
             let invocations = threads.iter().try_fold(1u64, |product, value| product.checked_mul(*value));
             if threads.contains(&0)
-                || invocations.is_none_or(|invocations| invocations > limits.max_invocations)
+                || invocations.is_none_or(|invocations| invocations > properties.max_group_threads.get())
                 || threads.iter().zip(limits.max_group_size).any(|(threads, limit)| *threads > limit)
             {
                 return Err(preparation(format!(
                     "launch `{kernel}` requests {threads:?} threads per workgroup; the device allows {:?} and {} in total",
-                    limits.max_group_size, limits.max_invocations
+                    limits.max_group_size, properties.max_group_threads.get()
                 )));
             }
             let shared_bytes = evaluate(&launch.shared_bytes)?;
             let footprint = abi::vulkan::shared_footprint(shared_bytes);
-            if footprint > limits.max_shared_bytes {
+            if footprint > properties.shared_bytes_per_group.get() {
                 return Err(preparation(format!(
                     "launch `{kernel}` needs {footprint} shared bytes; the device allows {}",
-                    limits.max_shared_bytes
+                    properties.shared_bytes_per_group.get()
                 )));
             }
             Ok((
@@ -510,59 +908,58 @@ fn vulkan_geometry(
         .collect()
 }
 
-/// `implementation` as `device` offers it: on a CPU device, with the
-/// Seismic-owned participant count of each launch and the tier appended, their
-/// domains exact for the device (its pool size, the tiers below its detected
-/// one). Appending is idempotent.
-pub(crate) fn on_device(
+/// `implementation` as `device` offers it, bound on it: on a CPU device
+/// with the Seismic-owned participant count of each launch and the tier
+/// appended, their domains exact for the device (its pool size, the tiers
+/// below its detected one), and every `device.NAME` it reads at the
+/// device's value ([`NativeImplementation::at_device`]). Idempotent. The
+/// one binder of an implementation on a device: every other path binds
+/// through it ([`offered`]).
+pub fn on_device(
     device: &DeviceInner,
     mut implementation: NativeImplementation,
-) -> NativeImplementation {
+) -> OnDevice {
     use seismic_lang::checked::{NativeParameter, NativeParameterRole};
-    let OpenedKind::Cpu(opened) = &device.kind else {
-        return implementation;
-    };
-    if implementation
-        .params
-        .iter()
-        .any(|parameter| parameter.role != NativeParameterRole::Declared)
-    {
-        return implementation;
+    if let OpenedKind::Cpu(opened) = &device.kind {
+        if implementation
+            .params
+            .iter()
+            .all(|parameter| parameter.role == NativeParameterRole::Declared)
+        {
+            let lower = seismic_native_cpu::Tier::detected()
+                .map(|detected| {
+                    detected
+                        .at_or_below()
+                        .filter(|tier| *tier != detected)
+                        .map(|tier| tier.name())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            implementation.params.extend(NativeParameter::cpu_parameters(
+                implementation.launches.len(),
+                opened.executor().workers(),
+                &lower,
+            ));
+        }
     }
-    let lower = seismic_native_cpu::Tier::detected()
-        .map(|detected| {
-            detected
-                .at_or_below()
-                .filter(|tier| *tier != detected)
-                .map(|tier| tier.name())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    implementation
-        .params
-        .extend(NativeParameter::cpu_parameters(
-            implementation.launches.len(),
-            opened.executor().workers(),
-            &lower,
-        ));
-    implementation
+    implementation.at_device(device.properties())
 }
 
 /// `implementation`'s declared defaults as `device` offers them at
 /// `bindings`. On a CPU whose tier forms quantized dots from vector integer
 /// products (AVX2, AVX-512 or VNNI, `Tier::quantized_dots`, a fact of the
 /// device), a projection over a packed weight the quantized dot takes
-/// (`form(W, INT8)`) prefers its `INT8` form: it quantizes the staged rows
-/// to Q8 blocks and runs the representation's integer dot, and the F32 form
-/// is the challenger. The default is the first configuration the
-/// declaration admits in that order. Elsewhere (x86-64-v2, NEON, dense
-/// weights, GPUs) the declaration's defaults stand.
+/// (`form(W, INT8)`) defaults to its `INT8` form: it quantizes the staged
+/// rows to Q8 blocks and runs the representation's integer dot, and the F32
+/// form is the challenger; where `where` refuses it, the walk from the
+/// defaults takes the F32 form. Elsewhere (x86-64-v2, NEON, dense weights,
+/// GPUs) the declaration's defaults stand.
 pub(crate) fn device_defaults(
     device: &DeviceInner,
     mut implementation: NativeImplementation,
     bindings: &ElementBindings,
 ) -> NativeImplementation {
-    use seismic_lang::checked::NativeParameterRole;
+    use seismic_lang::checked::{NativeDefault, NativeNatExpr, NativeParameterRole};
     let OpenedKind::Cpu(_) = &device.kind else {
         return implementation;
     };
@@ -582,27 +979,28 @@ pub(crate) fn device_defaults(
         if parameter.role == NativeParameterRole::Declared
             && parameter.form
             && parameter.name == "INT8"
+            && parameter.values.contains(&1)
         {
-            parameter.values.sort_by_key(|value| *value != 1);
+            parameter.default = NativeDefault::Value(NativeNatExpr::Constant(1));
         }
     }
     implementation
 }
 
 /// `entry`'s implementation at `bindings` ([`CheckedModule::native_implementation_at`])
-/// as `device` offers it ([`on_device`], [`device_defaults`]): the
-/// declaration whose configurations preparation forms at these bindings.
-/// `None` when the backend has no implementation.
-pub(crate) fn offered(
+/// as `device` offers it ([`device_defaults`], [`on_device`]): the
+/// declaration whose configurations preparation forms at these bindings,
+/// bound on the device. `None` when the backend has no implementation.
+pub fn offered(
     device: &DeviceInner,
     module: &CheckedModule,
     entry: EntryId,
     bindings: &ElementBindings,
-) -> Option<NativeImplementation> {
+) -> Option<OnDevice> {
     module
         .native_implementation_at(entry, backend_name(&device.kind), bindings)
         .cloned()
-        .map(|implementation| device_defaults(device, on_device(device, implementation), bindings))
+        .map(|implementation| on_device(device, device_defaults(device, implementation, bindings)))
 }
 
 /// Check a choice against the implementation as it exists on this device
@@ -648,6 +1046,7 @@ fn cpu_route(
     implementation: &NativeImplementation,
     specialization: &NativeSpecialization,
     bindings: &ElementBindings,
+    domain: &seismic_lang::checked::ElementDomain,
 ) -> Result<cpu::CpuRoute, PrepareError> {
     use seismic_lang::checked::NativeParameterRole;
     use seismic_native_cpu::Tier;
@@ -674,6 +1073,20 @@ fn cpu_route(
                     .find(|tier| tier.name() == named)
                     .expect("the device offers only its own tiers");
             }
+        }
+    }
+    // Every weight is bound in a form the tier's components read where it
+    // lies (a CPU row layout, or a device's).
+    for (element, representation) in bindings.iter() {
+        if !domain.read_as_weight(element) {
+            continue;
+        }
+        if seismic_native_cpu::WeightOperand::of(tier, representation).is_none() {
+            let bound = seismic_lang::registry::representation_info(representation).name;
+            return Err(preparation(format!(
+                "`{name}`: weight `{element}` is bound to `{bound}`, which no `{}` component reads",
+                tier.name()
+            )));
         }
     }
     let elements = kernels
@@ -767,7 +1180,7 @@ fn template_instance(kernel: &str, values: &[u64]) -> ProgramEntry {
 #[cfg(target_os = "macos")]
 pub(crate) fn metal_dialect(opened: &crate::backends::MetalOpened) -> abi::Dialect {
     abi::Dialect::Metal(abi::MetalFeatures {
-        tensor_ops: opened.device_description().facts().tensor_ops(),
+        tensor_ops: opened.device_description().facts().properties().tensor_ops.holds(),
     })
 }
 
@@ -775,7 +1188,7 @@ pub(crate) fn metal_dialect(opened: &crate::backends::MetalOpened) -> abi::Diale
 /// fact macros.
 pub(crate) fn cuda_dialect(opened: &crate::backends::CudaOpened) -> abi::Dialect {
     abi::Dialect::Cuda(abi::CudaFeatures {
-        multiprocessors: opened.device_description().facts().multiprocessors,
+        multiprocessors: opened.device_description().facts().properties.units.get(),
     })
 }
 
@@ -789,7 +1202,7 @@ fn launch_program(
     bindings: &ElementBindings,
     implementation: &NativeImplementation,
     specialization: &NativeSpecialization,
-    asset: &str,
+    asset: seismic_lang::checked::NativeAsset<'_>,
     ordinal: usize,
     variants: &[plan::LaunchVariant],
 ) -> ProgramSource {
@@ -828,7 +1241,7 @@ pub(crate) fn implementation_programs(
     bindings: &ElementBindings,
     implementation: &NativeImplementation,
     specialization: &NativeSpecialization,
-    asset: &str,
+    asset: seismic_lang::checked::NativeAsset<'_>,
     variants: &[Vec<plan::LaunchVariant>],
 ) -> Vec<ProgramSource> {
     if implementation.launch_scoped() {
@@ -924,7 +1337,7 @@ fn rendered_programs(
             }]
         })
         .collect::<Vec<_>>();
-    let programs = |dialect: abi::Dialect, asset: &str| {
+    let programs = |dialect: abi::Dialect, asset: seismic_lang::checked::NativeAsset<'_>| {
         let sources = implementation_programs(
             dialect,
             logical,
@@ -998,7 +1411,7 @@ fn rendered_programs(
     }
 }
 
-/// The programs a formation or a publication forms, rendered: what its
+/// The programs a formation forms, rendered: what its
 /// class is read from ([`ProgramFormer::class`]). Rendering depends only on
 /// what is formed, so it is kept; the class is read again whenever it is
 /// asked, because what is live on the device and kept by the store changes
@@ -1024,17 +1437,6 @@ impl Rendered {
         }
     }
 
-    /// What publishing the programs on `device` does now, and how many of
-    /// them it compiles ([`ProgramFormer::publication`]).
-    pub(crate) fn publication(&self, device: &DeviceInner) -> ((FormationClass, usize), usize) {
-        match self {
-            Self::Sources(sources) => (
-                device.programs.publication(sources),
-                device.programs.publishing_sources(sources),
-            ),
-            Self::Unrendered(entries) => ((FormationClass::Compiled, *entries), *entries),
-        }
-    }
 }
 
 /// The programs `sources` of a launch-scoped implementation are formed
@@ -1117,6 +1519,22 @@ pub(crate) fn backend_name(kind: &OpenedKind) -> BackendName {
 }
 
 impl NativePrepared {
+    /// What each launch's program uses, in ordinal order: its workgroup's
+    /// threads and what its backend's compiler reports
+    /// ([`Toolchain::statistics`]: CUDA's function attributes, Vulkan's
+    /// pipeline executable statistics); none for a launch not formed, and
+    /// nothing of the CPU backend, which forms no programs.
+    pub fn launch_programs(&self) -> Vec<Option<seismic_native_target::LaunchProgram>> {
+        match &self.route {
+            NativeRoute::Cpu(_) => Vec::new(),
+            #[cfg(target_os = "macos")]
+            NativeRoute::Metal { launches, .. } => launches.programs::<seismic_metal::toolchain::MetalToolchain>(),
+            NativeRoute::Cuda { launches, .. } => launches.programs::<seismic_cuda::toolchain::CudaToolchain>(),
+            #[cfg(not(target_os = "macos"))]
+            NativeRoute::Vulkan { launches, .. } => launches.programs::<seismic_vulkan::toolchain::VulkanToolchain>(),
+        }
+    }
+
     /// Hand this kernel's formed programs, chosen by tuning, to the serving
     /// preparation of its specialization on its device: serving gets its own
     /// kernel over the same programs, with fresh call state, and forms
@@ -1259,88 +1677,6 @@ impl NativePrepared {
             Ok((sources, _)) => Rendered::Sources(device.programs.keyed(sources)),
             Err(_) => Rendered::Unrendered(implementation.launches.len()),
         }
-    }
-
-    /// The programs a load forms `implementation` at `specialization`
-    /// from on `device`: what serving requests of its toolchain. None on
-    /// the CPU backend, which compiles nothing at run time.
-    fn serving_programs(
-        device: &Arc<DeviceInner>,
-        module: &CheckedModule,
-        entry: EntryId,
-        logical: &LogicalEntry,
-        bindings: &ElementBindings,
-        specialization: &NativeSpecialization,
-        implementation: &NativeImplementation,
-    ) -> Result<Vec<ProgramSource>, PrepareError> {
-        if matches!(device.kind, OpenedKind::Cpu(_)) {
-            return Ok(Vec::new());
-        }
-        let implementation = on_device(device, implementation.clone());
-        let specialization = implementation.with_owned_defaults(specialization.clone());
-        rendered_programs(
-            device,
-            module,
-            entry,
-            logical,
-            bindings,
-            &implementation,
-            &specialization,
-        )
-        .map(|(sources, _)| sources)
-    }
-
-    /// The programs [`NativePrepared::publish`] of `specialization` forms,
-    /// what its class is read from ([`Rendered::publication`]). A choice
-    /// that cannot be rendered names every launch.
-    pub(crate) fn publication_rendered(
-        device: &Arc<DeviceInner>,
-        module: &CheckedModule,
-        entry: EntryId,
-        logical: &LogicalEntry,
-        bindings: &ElementBindings,
-        specialization: &NativeSpecialization,
-        implementation: &NativeImplementation,
-    ) -> Rendered {
-        match Self::serving_programs(
-            device,
-            module,
-            entry,
-            logical,
-            bindings,
-            specialization,
-            implementation,
-        ) {
-            Ok(sources) => Rendered::Sources(device.programs.keyed(sources)),
-            Err(_) => Rendered::Unrendered(implementation.launches.len()),
-        }
-    }
-
-    /// Publish the serving artifact of `specialization`: form its programs
-    /// exactly as a load requests them (each launch's single variant), so
-    /// the device's store keeps them as that request finds them, and hold
-    /// nothing of what was formed. The choice a search publishes is formed
-    /// this way once, when it is final; the process that loads it then
-    /// forms it as it forms a canonical default.
-    pub(crate) fn publish(
-        device: &Arc<DeviceInner>,
-        module: &CheckedModule,
-        entry: EntryId,
-        logical: &LogicalEntry,
-        bindings: &ElementBindings,
-        specialization: &NativeSpecialization,
-        implementation: &NativeImplementation,
-    ) -> Result<(), PrepareError> {
-        let sources = Self::serving_programs(
-            device,
-            module,
-            entry,
-            logical,
-            bindings,
-            specialization,
-            implementation,
-        )?;
-        device.programs.publish(&sources).map_err(compilation)
     }
 
     /// Form the entry's native implementation for `device`'s backend.
@@ -1497,6 +1833,7 @@ impl NativePrepared {
                         &implementation,
                         &specialization,
                         &bindings,
+                        &entry_info(module, entry).element_domain,
                     )?;
                     digest.update(kernels.digest.as_bytes());
                     let toolchain = format!(
@@ -1611,17 +1948,41 @@ impl NativePrepared {
             })?;
             (route, artifact, scalars)
         };
+        let buffer_writes = abi::buffer_writes(logical.schema(), &implementation);
+        let host_writes = abi::host_writes(logical.schema(), &implementation);
+        let bound = abi::bound(logical.schema(), &implementation);
+        let records = abi::records(logical.schema(), &implementation);
+        let conditions = implementation
+            .launches
+            .iter()
+            .map(|launch| {
+                launch
+                    .conditions
+                    .iter()
+                    .map(|condition| {
+                        let word = abi::tensor_buffer(logical.schema(), &condition.word)
+                            .expect("a checked launch condition is a tensor parameter");
+                        (word, condition.index, condition.encoded)
+                    })
+                    .collect()
+            })
+            .collect();
         Ok(Arc::new(Self {
             name,
             device: device.kind.identity(),
             public_device: device.clone(),
-            logical: logical.clone(),
+            parameters: logical.parameter_shapes(),
             handoff,
             invocation,
-            implementation,
+            implementation: implementation.into_implementation(),
             specialization,
             statics,
             canonical_parameters,
+            buffer_writes,
+            host_writes,
+            bound,
+            records,
+            conditions,
             results,
             scalars,
             artifact,
@@ -1632,6 +1993,50 @@ impl NativePrepared {
     pub(crate) fn implementation(&self) -> &NativeImplementation {
         &self.implementation
     }
+
+    /// Whether a launch reads its grid from tensor parameter `ordinal`
+    /// (`NativeLaunch::grid`): one binding no slab view may take.
+    pub(crate) fn reads_grid(&self, ordinal: usize) -> bool {
+        let name = &self.schema().parameters()[ordinal].name;
+        self.implementation.launches.iter().any(|launch| {
+            matches!(&launch.grid, Some(seismic_lang::checked::LaunchGrid::Parameter(grid)) if grid == name)
+        })
+    }
+
+    /// The buffers the kernel's argument table binds: every one but its
+    /// host ports.
+    pub(crate) fn bound_buffers(&self) -> usize {
+        self.bound.iter().filter(|&&bound| bound).count()
+    }
+
+    /// `buffers`, one per buffer in ABI order, as the kernel's argument
+    /// table binds them (without its host ports), appended to `into`.
+    pub(crate) fn bind<T>(&self, buffers: impl IntoIterator<Item = T>, into: &mut Vec<T>) {
+        into.extend(
+            buffers
+                .into_iter()
+                .zip(&self.bound)
+                .filter_map(|(buffer, bound)| bound.then_some(buffer)),
+        );
+    }
+
+    /// The host-written launch conditions launch `ordinal` declares
+    /// (`NativeLaunch::conditions`): each ABI buffer, its
+    /// word and the value the launch is encoded under.
+    pub(crate) fn conditions(&self, ordinal: usize) -> &[(usize, u64, seismic_lang::checked::Encoded)] {
+        &self.conditions[ordinal]
+    }
+
+    /// The ABI buffers a launch condition reads a word of.
+    pub(crate) fn conditioned(&self) -> impl Iterator<Item = usize> + '_ {
+        self.conditions.iter().flatten().map(|&(buffer, _, _)| buffer)
+    }
+
+    /// The position in the kernel's argument table of ABI buffer `buffer`,
+    /// a bound one.
+    fn argument(&self, buffer: usize) -> usize {
+        self.bound[..buffer].iter().filter(|bound| **bound).count()
+    }
     pub(crate) fn specialization(&self) -> &NativeSpecialization {
         &self.specialization
     }
@@ -1639,7 +2044,7 @@ impl NativePrepared {
         &self.artifact
     }
     pub(crate) fn schema(&self) -> &CallSchema {
-        self.logical.schema()
+        self.parameters.schema()
     }
     /// Device storage this prepared implementation holds for its calls: its
     /// scalar-result slots, none without scalar results. A standalone call's
@@ -1825,7 +2230,7 @@ impl NativePrepared {
                     self.evaluate_at(&expressions[2], dimension, Some(ordinal))?,
                 ])
             };
-            let groups = axes(&launch.groups)?;
+            let mut groups = axes(&launch.groups)?;
             let threads = axes(&launch.group_extent)?;
             let shared_bytes = self.evaluate_at(&launch.shared_bytes, dimension, Some(ordinal))?;
             let limit =
@@ -1874,6 +2279,23 @@ impl NativePrepared {
                             shared_bytes + module.static_shared_bytes(function)
                         )));
                     }
+                    // A written grid's blocks run as a grid-stride loop
+                    // (`abi`): as many blocks as the device holds at once,
+                    // never more than the grid's bound.
+                    if launch.grid.is_some() {
+                        let resident = module
+                            .active_blocks(opened.service(), function, participants, shared_bytes)
+                            .map_err(CallError::Execution)?
+                            * opened.device_description().facts().properties.units.get();
+                        if resident == 0 {
+                            return Err(limit(format!(
+                                "launch `{}`: no multiprocessor holds one of its blocks",
+                                launch.kernel
+                            )));
+                        }
+                        let bound = groups.iter().product::<u64>();
+                        groups = [bound.min(resident), 1, 1];
+                    }
                 }
                 // The workgroup size and group memory are the pipeline's,
                 // checked at preparation; only the grid varies per call.
@@ -1888,8 +2310,13 @@ impl NativePrepared {
                     }
                 }
             }
+            let grid = launch
+                .grid
+                .as_ref()
+                .map(|grid| abi::grid_buffer(self.schema(), &self.implementation, grid));
             geometry.push(Some(LaunchGeometry {
                 groups,
+                grid,
                 threads,
                 shared_bytes,
             }));
@@ -1995,7 +2422,7 @@ impl NativePrepared {
         let failure =
             |message: String| CallError::Execution(ExecutionError::SubmissionFailed(message));
         let shape = self
-            .logical
+            .parameters
             .tensor_parameter_shape(name, dimensions)
             .map_err(|error| failure(error.to_string()))?;
         let layout = crate::layout::canonical(shape.representation, &shape.extents)
@@ -2029,7 +2456,15 @@ impl NativePrepared {
     }
 
     pub(crate) fn call(self: &Arc<Self>, args: EncodedArgs) -> Result<DecodedResults, CallError> {
-        self.call_with(args, None, || {})
+        self.call_with(args, None, Parking::Unanswered, || {})
+    }
+
+    /// A standalone call whose every awaited word already holds its answer
+    /// (the host wrote it before the call), as a graph's park bound
+    /// answered is (`NativeGraphBindings::set_answered`): it waits for
+    /// nothing, so every backend runs it, wherever its parks are realized.
+    pub(crate) fn call_answered(self: &Arc<Self>, args: EncodedArgs) -> Result<DecodedResults, CallError> {
+        self.call_with(args, None, Parking::Answered, || {})
     }
 
     pub(crate) fn call_into(
@@ -2037,7 +2472,7 @@ impl NativePrepared {
         args: EncodedArgs,
         outputs: EncodedOutputs,
     ) -> Result<DecodedResults, CallError> {
-        self.call_with(args, Some(outputs), || {})
+        self.call_with(args, Some(outputs), Parking::Unanswered, || {})
     }
 
     pub(crate) fn call_with_commit(
@@ -2045,7 +2480,7 @@ impl NativePrepared {
         args: EncodedArgs,
         commit: impl FnOnce(),
     ) -> Result<DecodedResults, CallError> {
-        self.call_with(args, None, commit)
+        self.call_with(args, None, Parking::Unanswered, commit)
     }
 
     /// Validate a standalone call, place its results and its scratch (in
@@ -2056,7 +2491,9 @@ impl NativePrepared {
         arena: &mut ScratchArena,
         args: EncodedArgs,
         outputs: Option<EncodedOutputs>,
+        parking: Parking,
     ) -> Result<NativeBoundCall, CallError> {
+        validate_standalone_parking(self.schema(), self.public_device.info().backend(), parking)?;
         for (parameter, tensor) in self.schema().parameters().iter().zip(args.tensors()) {
             if let (ParameterKind::Tensor { access, .. }, Some(tensor)) = (&parameter.kind, tensor)
             {
@@ -2115,42 +2552,92 @@ impl NativePrepared {
 
         let schema = self.schema();
         let mut buffers = Vec::new();
+        let mut slabs = Vec::new();
+        let mut records = Vec::new();
         let mut representations = Vec::new();
         let mut access = collect_native_access(schema, &args);
-        for (ordinal, parameter) in schema.parameters().iter().enumerate() {
-            if matches!(parameter.kind, ParameterKind::Tensor { .. }) {
+        // Tensor parameters by schema ordinal, then results by ordinal.
+        let parameters = schema
+            .parameters()
+            .iter()
+            .enumerate()
+            .filter(|(_, parameter)| matches!(parameter.kind, ParameterKind::Tensor { .. }))
+            .map(|(ordinal, _)| {
                 let tensor = args
                     .tensor(ordinal)
                     .expect("validated native tensor argument disappeared");
-                buffers.push((tensor.allocation().clone(), tensor.byte_offset()));
-                representations.push(representation_name(tensor.representation()));
+                (Ok(ordinal), tensor)
+            });
+        let produced = results.iter().enumerate().map(|(ordinal, tensor)| (Err(ordinal), tensor));
+        for (port, tensor) in parameters.chain(produced) {
+            let name = || match port {
+                Ok(ordinal) => schema.parameters()[ordinal].name.clone(),
+                Err(ordinal) => format!("result {ordinal}"),
+            };
+            if port.is_ok_and(|ordinal| self.reads_grid(ordinal)) && tensor.is_slab_view() {
+                return Err(CallError::Invocation(InvocationError::SlabGrid { parameter: name() }));
             }
+            let buffer = buffers.len();
+            if self.records[buffer] {
+                let bound = tensor.records().map_err(tensor_error)?;
+                buffers.push((
+                    bound.table.clone(),
+                    bound.table_offset,
+                    seismic_lang::registry::record_table_entry(bound.count),
+                ));
+                records.push((buffer, bound));
+            } else if tensor.chunked() && self.bound[buffer] {
+                // Chunked storage has no one buffer: device work binds it
+                // only through a record port. A host port, never bound,
+                // takes it, ordered by its packed span.
+                return Err(CallError::Workflow(crate::api::WorkflowError::ChunkedBinding {
+                    parameter: name(),
+                }));
+            } else {
+                if let Some(slab) = tensor.slab_reach() {
+                    slabs.push((buffer, slab));
+                }
+                buffers.push((
+                    tensor.allocation().clone(),
+                    tensor.byte_offset(),
+                    tensor.reached_bytes(),
+                ));
+            }
+            representations.push(representation_name(tensor.representation()));
+        }
+        // Each launch condition's word is one the host reads as the call is
+        // encoded: refused here unless the host addresses its storage.
+        if let Some(buffer) = self.conditioned().find(|&buffer| buffers[buffer].0.storage().host_address().is_none()) {
+            let parameter = abi::tensor_buffer_name(schema, buffer).to_owned();
+            return Err(CallError::Workflow(crate::api::WorkflowError::UnaddressedCondition { parameter }));
         }
         for tensor in &results {
-            buffers.push((tensor.allocation().clone(), tensor.byte_offset()));
-            representations.push(representation_name(tensor.representation()));
             access.push((tensor.allocation().clone(), true));
         }
         if let Some(arena) = arena {
-            for offset in scratch {
-                buffers.push((arena.clone(), offset));
+            for (offset, need) in scratch.into_iter().zip(&shape.scratch) {
+                buffers.push((arena.clone(), offset, need.bytes));
                 representations.push("bytes");
             }
             access.push((arena, true));
         }
         access.extend(self.scalar_slots().map(|slots| (slots.clone(), true)));
+        // The kernel's arguments: its bound buffers'.
+        let mut bound = Vec::with_capacity(representations.len());
+        self.bind(representations, &mut bound);
         Ok(NativeBoundCall {
             results,
             buffers,
-            representations,
-            word_bytes: word_bytes(&shape.words),
+            slabs,
+            records,
+            representations: bound,
             words: shape.words,
             launches: shape.launches,
             access,
-            _slab_bindings: args
+            binding_leases: args
                 .tensors()
                 .flatten()
-                .filter(|tensor| tensor.is_slabbed())
+                .filter(|tensor| tensor.holds_binding_lease())
                 .cloned()
                 .collect(),
         })
@@ -2160,6 +2647,7 @@ impl NativePrepared {
         self: &Arc<Self>,
         args: EncodedArgs,
         outputs: Option<EncodedOutputs>,
+        parking: Parking,
         commit: impl FnOnce(),
     ) -> Result<DecodedResults, CallError> {
         let _slots = self.scalars.as_ref().map(|scalars| {
@@ -2168,7 +2656,12 @@ impl NativePrepared {
                 .lock()
                 .expect("native scalar-result slots lock poisoned")
         });
-        let call = self.prepare_call(&mut ScratchArena::default(), args, outputs)?;
+        // A standalone call's scratch is its own, allocated and zeroed per
+        // call, deliberately: an arena kept on the kernel between calls held
+        // 17.1 MB per Qwen3.6 35B load that no plan term counted
+        // (`standalone_scratch_is_the_calls_own`), and no hot path makes
+        // standalone calls. Batches and tuning points share one arena.
+        let call = self.prepare_call(&mut ScratchArena::default(), args, outputs, parking)?;
         self.reset_scalar_results()?;
         commit();
         let calls = [call];
@@ -2176,14 +2669,14 @@ impl NativePrepared {
             kernel: self,
             calls: &calls,
         }
-        .submit(1)?
+        .submit(1, false)?
         .wait()?;
         self.read_call_results(&calls[0])
     }
 
     fn reset_scalar_results(&self) -> Result<(), CallError> {
         if let Some(scalars) = &self.scalars {
-            let _host = scalars.slots.acquire(true);
+            let _host = scalars.slots.acquire(true).map_err(CallError::Execution)?;
             write_zeros(scalars.slots.storage(), scalars.bytes()).map_err(CallError::Execution)?;
         }
         Ok(())
@@ -2196,6 +2689,7 @@ impl NativePrepared {
             scalars
                 .slots
                 .acquire(false)
+                .map_err(CallError::Execution)?
                 .read(&scalars.slots, 0, &mut scalar_bytes)
                 .map_err(CallError::Execution)?;
         }
@@ -2250,9 +2744,8 @@ impl ScratchArena {
             return Ok(Some(arena.clone()));
         }
         let arena = device
-            .allocate(bytes, BUFFER_ALIGNMENT)
+            .allocate_zeroed(bytes, BUFFER_ALIGNMENT)
             .map_err(CallError::Execution)?;
-        write_zeros(arena.storage(), bytes).map_err(CallError::Execution)?;
         self.scratch = Some(arena.clone());
         Ok(Some(arena))
     }
@@ -2269,12 +2762,35 @@ pub(crate) struct CallShape {
     pub(crate) launches: CallLaunches,
 }
 
-pub(crate) fn word_bytes(words: &[u64]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(std::mem::size_of_val(words));
-    for word in words {
-        bytes.extend_from_slice(&word.to_le_bytes());
+/// Argument words as device argument ABIs read them: each word's
+/// little-endian bytes, which on the little-endian hosts the runtime builds
+/// for are the words' own memory. One owner serves CPU (native words) and
+/// device (bytes) encoders alike.
+pub(crate) fn word_bytes(words: &[u64]) -> &[u8] {
+    const _: () = assert!(cfg!(target_endian = "little"), "argument words are little-endian in memory");
+    // SAFETY: `u64` has no padding and every byte is initialized; `u8` has
+    // alignment 1; the length covers exactly the words' bytes.
+    unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), std::mem::size_of_val(words)) }
+}
+
+/// Whether a standalone call's awaited words may still be waiting for their
+/// answers (`Unanswered`), or already hold them (`Answered`,
+/// [`NativePrepared::call_answered`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Parking {
+    Unanswered,
+    Answered,
+}
+
+/// Standalone calls and points have no timeline binding that can answer a
+/// park: an awaited entry whose answers may still come is called standalone
+/// only where the device's kernels park themselves; one already answered
+/// waits for nothing, on every backend. A graph binds its parks explicitly.
+fn validate_standalone_parking(schema: &CallSchema, backend: BackendName, parking: Parking) -> Result<(), CallError> {
+    if schema.parks() && parking == Parking::Unanswered && !backend.parks_in_kernels() {
+        return Err(CallError::Workflow(crate::api::WorkflowError::ParkRequiresGraph));
     }
-    bytes
+    Ok(())
 }
 
 fn representation_name(representation: RepresentationId) -> &'static str {
@@ -2284,17 +2800,75 @@ fn representation_name(representation: RepresentationId) -> &'static str {
 /// One validated standalone call ready for submission: its arguments,
 /// results, buffers, argument words and launch geometry are fixed.
 struct NativeBoundCall {
+    /// The result views, read back by a standalone call once it completes.
+    /// Their storage is also in `buffers`.
     results: Vec<Arc<TensorInner>>,
-    /// Buffers in ABI order with their byte offsets.
-    buffers: Vec<(Arc<Allocation>, u64)>,
+    /// Buffers in ABI order with their byte offsets and the bytes the call
+    /// reaches there.
+    buffers: Vec<(Arc<Allocation>, u64, u64)>,
+    /// Each buffer bound to a slab view, by ABI ordinal, with what it
+    /// reaches (the encodings order by it).
+    slabs: Vec<(usize, hazard::SlabReach)>,
+    /// Each buffer bound to a record port, by ABI ordinal, with the records
+    /// its table reaches.
+    records: Vec<(usize, Arc<Records>)>,
+    /// The bound buffers' representations, in argument order.
     representations: Vec<&'static str>,
     words: Vec<u64>,
-    word_bytes: Vec<u8>,
     launches: CallLaunches,
     /// Every allocation the call touches, with whether it writes it.
     access: Vec<(Arc<Allocation>, bool)>,
-    /// Keep slab placement fixed until the submission records its fence.
-    _slab_bindings: Vec<Arc<TensorInner>>,
+    /// Keep slab placements and pinned reserved regions fixed while the
+    /// call holds them: a standalone call until it is dropped, past its
+    /// completion; a batch's call only until its submission records its
+    /// fences ([`Self::release_views`]), which order any release after the
+    /// work.
+    binding_leases: Vec<Arc<TensorInner>>,
+}
+
+impl NativeBoundCall {
+    /// Whether launch `ordinal` of `kernel`, this call's, is encoded: each
+    /// of its launch conditions' words, of the buffers the call binds, holds
+    /// ([`condition_holds`]).
+    fn encodes(&self, kernel: &NativePrepared, ordinal: usize) -> bool {
+        kernel.conditions(ordinal).iter().all(|&(buffer, index, encoded)| {
+            let (allocation, offset, _) = &self.buffers[buffer];
+            condition_holds(allocation, offset + 4 * index, encoded)
+        })
+    }
+
+    /// The submission has recorded its fences: the call's argument and
+    /// result views end, and with them any slab or region lease they hold,
+    /// so placement may change from now on. The call keeps its storage
+    /// (`buffers`, `access`), whose fences defer any physical release to
+    /// completion. For a call whose results nobody reads back (a batch's:
+    /// its caller owns the output tensors).
+    fn release_views(&mut self) {
+        self.binding_leases = Vec::new();
+        self.results = Vec::new();
+    }
+}
+
+impl NativeBoundCall {
+    /// What the call's launches reach, into `reaches`.
+    fn reaches<'s>(&'s self, reaches: &mut Vec<hazard::Reach<'s>>) {
+        for (buffer, (allocation, offset, bytes)) in self.buffers.iter().enumerate() {
+            if let Some((_, records)) = self.records.iter().find(|(bound, _)| *bound == buffer) {
+                records.extend(buffer, 0, records.count, reaches);
+                continue;
+            }
+            match self.slabs.iter().find(|(slabbed, _)| *slabbed == buffer) {
+                Some((_, slab)) => slab.extend(buffer, allocation, *offset, reaches),
+                None => reaches.push(hazard::Reach {
+                    buffer,
+                    allocation,
+                    offset: *offset,
+                    bytes: *bytes,
+                    through: hazard::Through::Binding,
+                }),
+            }
+        }
+    }
 }
 
 /// Standalone calls of one prepared implementation, in submission order.
@@ -2304,13 +2878,13 @@ struct StandaloneCalls<'k> {
 }
 
 impl StandaloneCalls<'_> {
-    fn submit(&self, repetitions: usize) -> Result<NativeSubmission, CallError> {
+    fn submit(&self, repetitions: usize, observed: bool) -> Result<NativeSubmission, CallError> {
         let access = merge_access(
             self.calls
                 .iter()
                 .flat_map(|call| call.access.iter().cloned()),
         );
-        submit(self, &access, self.kernel.clone(), repetitions)
+        submit(self, &access, self.kernel.clone(), repetitions, observed, NativeQueue::Compute)
     }
 }
 
@@ -2325,22 +2899,30 @@ impl DispatchList for StandaloneCalls<'_> {
         buffers: &mut Vec<(&'s Allocation, u64)>,
     ) -> Dispatch<'s> {
         let call = &self.calls[index];
-        buffers.extend(
+        self.kernel.bind(
             call.buffers
                 .iter()
-                .map(|(allocation, offset)| (&**allocation, *offset)),
+                .map(|(allocation, offset, _)| (&**allocation, *offset)),
+            buffers,
         );
         Dispatch {
             kernel: self.kernel,
             words: &call.words,
-            word_bytes: &call.word_bytes,
             launches: &call.launches.geometry,
             rounds: call.launches.rounds,
             representations: &call.representations,
         }
     }
 
-    fn plans(&self) -> Option<Vec<u64>> {
+    fn reaches<'s>(&'s self, index: usize, reaches: &mut Vec<hazard::Reach<'s>>) {
+        self.calls[index].reaches(reaches);
+    }
+
+    fn encodes(&self, index: usize, ordinal: usize) -> bool {
+        self.calls[index].encodes(self.kernel, ordinal)
+    }
+
+    fn runs(&self) -> Option<Vec<PlanRun>> {
         None
     }
 }
@@ -2350,30 +2932,67 @@ impl DispatchList for StandaloneCalls<'_> {
 pub(crate) struct Dispatch<'a> {
     pub(crate) kernel: &'a NativePrepared,
     pub(crate) words: &'a [u64],
-    pub(crate) word_bytes: &'a [u8],
     /// By declaration ordinal; `None` for an inactive launch.
     pub(crate) launches: &'a [Option<LaunchGeometry>],
     /// How often the kernel's repeat block is dispatched.
     pub(crate) rounds: u64,
-    /// Registry name of each buffer's representation, in ABI order.
+    /// Registry name of each bound buffer's representation, in argument
+    /// order.
     pub(crate) representations: &'a [&'static str],
+}
+
+/// Whether a launch condition holds now: the `i32` word at byte `offset` of
+/// `allocation`, which the host writes between submissions, at the value
+/// the launch is encoded under. The call or graph that binds the word
+/// refused storage the host cannot address as it formed.
+pub(crate) fn condition_holds(allocation: &Allocation, offset: u64, encoded: seismic_lang::checked::Encoded) -> bool {
+    let base = allocation
+        .storage()
+        .host_address()
+        .expect("a launch condition's word is host-addressed: its call or graph checked it as it formed");
+    // SAFETY: a live, aligned i32 of the bound view (the check bounds the
+    // word by the view's extent); the host touches shared words only
+    // through atomics.
+    let word = unsafe { std::sync::atomic::AtomicU32::from_ptr(base.as_ptr().add(offset as usize).cast()) };
+    encoded.encodes(word.load(std::sync::atomic::Ordering::Acquire))
 }
 
 /// The calls of one submission, in order. Every call belongs to one device.
 pub(crate) trait DispatchList {
     fn count(&self) -> usize;
-    /// Call `index`; its buffers, in ABI order with byte offsets, are
-    /// appended to `buffers`.
+    /// Call `index`; the buffers its kernel binds (every buffer but a host
+    /// port, [`abi::bound`]), in ABI order with byte offsets, are appended to
+    /// `buffers`.
     fn dispatch<'s>(
         &'s self,
         index: usize,
         buffers: &mut Vec<(&'s Allocation, u64)>,
     ) -> Dispatch<'s>;
-    /// Identities of the sealed plans whose runs make up the list, in
-    /// order: with the buffer addresses the list binds they fix every launch
-    /// argument, so CUDA replays the list as one graph. `None` for lists
-    /// launched call by call.
-    fn plans(&self) -> Option<Vec<u64>>;
+    /// What call `index`'s launches reach through all its buffers, host
+    /// ports included (each by its ABI ordinal), appended to `reaches`.
+    /// Metal's concurrent encoding orders by them ([`hazard`]).
+    fn reaches<'s>(&'s self, index: usize, reaches: &mut Vec<hazard::Reach<'s>>);
+    /// The sealed plans' runs that make up the list, in order, each with
+    /// its calls: a run's segments between timeline boundaries are replayed
+    /// as graphs of their shape ([`ReplayKeys`]). `None` for lists launched
+    /// call by call.
+    fn runs(&self) -> Option<Vec<PlanRun>>;
+    /// Whether launch `ordinal` of call `index` is encoded in this
+    /// submission: every launch condition it carries holds
+    /// ([`condition_holds`]).
+    fn encodes(&self, index: usize, ordinal: usize) -> bool;
+    /// Per call, whether each of its launches, by ordinal, is encoded in
+    /// this submission ([`Self::encodes`]).
+    fn encoded(&self) -> Vec<Vec<bool>> {
+        let mut buffers = Vec::new();
+        (0..self.count())
+            .map(|index| {
+                buffers.clear();
+                let launches = self.dispatch(index, &mut buffers).launches.len();
+                (0..launches).map(|ordinal| self.encodes(index, ordinal)).collect()
+            })
+            .collect()
+    }
     /// The timeline operations at `boundary`, before call `boundary`
     /// (`count()` after the last), in order.
     fn timelines(&self, _boundary: usize) -> &[timeline::TimelineOperation] {
@@ -2382,6 +3001,10 @@ pub(crate) trait DispatchList {
     /// Whether any boundary has timeline operations.
     fn has_timelines(&self) -> bool {
         false
+    }
+    /// The stamps of sampled runs' marks at `boundary` (`spans`), in order.
+    fn stamps(&self, _boundary: usize) -> &[spans::Stamp] {
+        &[]
     }
 }
 
@@ -2401,100 +3024,109 @@ pub(crate) fn merge_access(
     merged.into_values().collect()
 }
 
-enum RouteSubmission {
-    Cpu {
-        outcome: Result<(), ExecutionError>,
-        /// Execution interval on the [`trace::host_seconds`] clock.
-        interval: (f64, f64),
-    },
-    #[cfg(target_os = "macos")]
-    Metal(seismic_metal::DirectSubmission),
-    Cuda(seismic_cuda::direct::DirectSubmission),
-    #[cfg(not(target_os = "macos"))]
-    Vulkan(vulkan::VulkanSubmission),
-}
-
-impl DeviceCompletion for RouteSubmission {
-    fn is_complete(&self) -> bool {
-        match self {
-            Self::Cpu { .. } => true,
-            #[cfg(target_os = "macos")]
-            Self::Metal(submission) => submission.is_complete(),
-            Self::Cuda(submission) => submission.is_complete(),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(submission) => submission.is_complete(),
-        }
-    }
-    fn wait_complete(&self) {
-        match self {
-            Self::Cpu { .. } => {}
-            #[cfg(target_os = "macos")]
-            Self::Metal(submission) => submission.wait_complete(),
-            Self::Cuda(submission) => submission.wait_complete(),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(submission) => submission.wait_complete(),
-        }
-    }
-}
-
 /// Submitted native work. It retains the formed functions it executes;
 /// allocation fences keep every touched storage alive and order host access
 /// until the work completes. Opaque outside the runtime: its seconds are
 /// read through [`seismic_measure::Pending`].
 pub struct NativeSubmission {
     route: Arc<RouteSubmission>,
+    /// Each host gate the work waits at: its timeline and value.
+    gates: Vec<(Arc<timeline::TimelineInner>, u64)>,
     _retained: Arc<dyn std::any::Any + Send + Sync>,
 }
 
+impl Drop for NativeSubmission {
+    /// A binding lease can be the last lease without being the allocation's
+    /// last owner: the work retires before its leases and formed functions
+    /// are released, measured runs included.
+    fn drop(&mut self) {
+        self.route.retire();
+    }
+}
+
 impl NativeSubmission {
+    /// Whether the work ended, so [`Self::wait`] reports its outcome
+    /// without blocking: it completed, or faulted.
     pub(crate) fn is_complete(&self) -> bool {
-        self.route.is_complete()
+        match self.route.completed() {
+            Ok(complete) => complete,
+            Err(_fault) => true,
+        }
     }
 
     /// Wait for completion and report the work's outcome.
     pub(crate) fn wait(&self) -> Result<(), CallError> {
-        match &*self.route {
-            RouteSubmission::Cpu { outcome, .. } => outcome.clone(),
-            #[cfg(target_os = "macos")]
-            RouteSubmission::Metal(submission) => submission.finish(),
-            RouteSubmission::Cuda(submission) => submission.finish(),
-            #[cfg(not(target_os = "macos"))]
-            RouteSubmission::Vulkan(submission) => submission.finish(),
+        self.route.finish()?;
+        // Work behind a gate its timeline's release opened read what the
+        // host never put in place (`timeline`).
+        match self
+            .gates
+            .iter()
+            .find_map(|(timeline, value)| timeline.released_unsignalled(*value))
+        {
+            Some(error) => Err(CallError::Execution(error)),
+            None => Ok(()),
         }
-        .map_err(CallError::Execution)
     }
 
     /// Device execution time of the completed submission.
     pub(crate) fn device_seconds(&self) -> Result<f64, CallError> {
         self.wait()?;
         match &*self.route {
-            RouteSubmission::Cpu { interval, .. } => Ok(interval.1 - interval.0),
-            #[cfg(target_os = "macos")]
-            RouteSubmission::Metal(submission) => Ok(submission.device_seconds()),
-            RouteSubmission::Cuda(submission) => {
-                submission.device_seconds().map_err(CallError::Execution)
-            }
-            #[cfg(not(target_os = "macos"))]
-            RouteSubmission::Vulkan(submission) => {
-                submission.device_seconds().map_err(CallError::Execution)
-            }
+            RouteSubmission::Committed(committed) => committed.device_seconds().map_err(CallError::Execution),
+            RouteSubmission::Failed(failure) => Err(failure.outcome()),
         }
     }
 }
 
-/// Encode `list` `repetitions` times as one unit of device work and commit
-/// it. `access` names every allocation the work touches exactly once
-/// ([`merge_access`]); `retained` keeps the formed functions alive with the
-/// submission.
+/// The device queue a native submission runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeQueue {
+    /// The device's compute queue.
+    Compute,
+    /// Fill work: moves into device memory and their waits, which overlap
+    /// compute where the backend runs a fill queue beside it
+    /// ([`BackendName::fills_beside_compute`]), and are compute work
+    /// elsewhere.
+    ///
+    /// [`BackendName::fills_beside_compute`]: seismic_lang::registry::BackendName::fills_beside_compute
+    Fill,
+}
+
+impl NativeQueue {
+    pub(crate) const ALL: [Self; 2] = [Self::Compute, Self::Fill];
+
+    /// The queue `backend` runs this queue's work on.
+    fn on(self, backend: seismic_lang::registry::BackendName) -> Self {
+        match self {
+            Self::Fill if backend.fills_beside_compute() => Self::Fill,
+            Self::Compute | Self::Fill => Self::Compute,
+        }
+    }
+}
+
+/// Encode `list` `repetitions` times as one unit of device work on `queue`
+/// and commit it. `access` names every allocation the work touches exactly
+/// once ([`merge_access`]); `retained` keeps the formed functions alive with
+/// the submission. Before any of it runs, the device waits for the work of
+/// the other native queue it must follow by what it touches
+/// ([`Allocation::queue_order`]): order across queues follows from the
+/// allocations alone, as within one.
 pub(crate) fn submit(
     list: &impl DispatchList,
     access: &[(Arc<Allocation>, bool)],
     retained: Arc<dyn std::any::Any + Send + Sync>,
     repetitions: usize,
+    observed: bool,
+    queue: NativeQueue,
 ) -> Result<NativeSubmission, CallError> {
     if list.count() == 0 {
         return Err(CallError::Workflow(crate::api::WorkflowError::Empty));
     }
+    // Owns retirement until the submission takes it. Declared before the
+    // submission's permits and order lock so that unwinding releases them
+    // before it waits.
+    let mut issued = IssuedWork(None);
     // Host access is excluded while the work is encoded.
     let permits = access
         .iter()
@@ -2509,6 +3141,17 @@ pub(crate) fn submit(
         .order
         .lock()
         .expect("native submission order lock is never poisoned");
+    let queue = queue.on(first.public_device.info().backend());
+    // Each fence once: work touching several allocations another queue's
+    // submission used waits for it once.
+    let mut after: Vec<Arc<dyn DeviceCompletion>> = Vec::new();
+    for (allocation, write) in access {
+        for fence in allocation.queue_order(queue, *write).map_err(CallError::Execution)? {
+            if !after.iter().any(|known| Arc::ptr_eq(known, &fence)) {
+                after.push(fence);
+            }
+        }
+    }
     let trace = first.public_device.active_trace();
     let encode_start = trace::host_seconds();
     let labels = trace.as_ref().map(|_| launch_labels(list, repetitions));
@@ -2516,19 +3159,72 @@ pub(crate) fn submit(
         .as_deref()
         .filter(|sink| sink.detail() == trace::TraceDetail::Launches)
         .map(|sink| (sink, labels.as_ref().map_or(0, Vec::len)));
-    let route = Arc::new(encode(first, list, repetitions, timed, &retained)?);
+    // Work committed before an issue failure runs on as this submission:
+    // its caller receives it, and can answer a park it reached, before the
+    // failure is reported by its outcome.
+    let work = Encoding {
+        list,
+        repetitions,
+        timed,
+        observed: observed || trace.is_some(),
+        retained: &retained,
+        queue,
+        after: &after,
+    };
+    let route = Arc::new(
+        encode(first, &work)
+            .map(RouteSubmission::Committed)
+            .or_else(EncodeFailure::completion)?,
+    );
+    let route = issued.0.insert(route);
+    // Fences are published before any trace allocation that could unwind:
+    // later host access and the storage's release order after the work.
+    let completion: Arc<dyn DeviceCompletion> = route.clone();
+    for (allocation, write) in access {
+        allocation.record_device_use(crate::driver::DeviceQueue::Native(queue), completion.clone(), *write);
+    }
+    #[cfg(test)]
+    if FAIL_AFTER_PUBLICATION.replace(false) {
+        panic!("injected failure after fence publication");
+    }
     if let (Some(sink), Some(labels)) = (trace, labels) {
         sink.record(route.clone(), labels, encode_start, trace::host_seconds());
     }
-    let completion: Arc<dyn DeviceCompletion> = route.clone();
-    for (allocation, write) in access {
-        allocation.record_device_use(completion.clone(), *write);
-    }
     drop(permits);
+    let gates = (0..=list.count())
+        .flat_map(|boundary| list.timelines(boundary))
+        .filter(|operation| operation.action == timeline::TimelineAction::Wait)
+        .map(|operation| (operation.timeline.clone(), operation.value))
+        .collect();
     Ok(NativeSubmission {
-        route,
+        route: issued.take(),
+        gates,
         _retained: retained,
     })
+}
+
+/// Issued work's retirement, until its [`NativeSubmission`] takes it: on
+/// unwind it waits for the work, so nothing the work uses is released
+/// while it runs.
+struct IssuedWork(Option<Arc<RouteSubmission>>);
+
+impl IssuedWork {
+    fn take(mut self) -> Arc<RouteSubmission> {
+        self.0.take().expect("issued work has a route")
+    }
+}
+
+impl Drop for IssuedWork {
+    fn drop(&mut self) {
+        if let Some(route) = &self.0 {
+            route.retire();
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_AFTER_PUBLICATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Evaluated physical work of every launch, in encode order. Recording it
@@ -2564,113 +3260,219 @@ fn launch_labels(list: &impl DispatchList, repetitions: usize) -> Vec<trace::Tra
     labels
 }
 
-/// Encode and commit the calls. `timed` (a launch-detail trace and the
-/// launch count) encodes every launch in its own timed unit.
-fn encode(
-    first: &NativePrepared,
-    list: &impl DispatchList,
+/// One submission's work as its backend encodes it: `list` `repetitions`
+/// times on `queue`, after the work of the other native queue `after` names,
+/// which only a backend with a fill queue beside compute has. `timed` (a
+/// launch-detail trace and the launch count) encodes every launch in its own
+/// timed unit; `observed` says whether its device time is read; `retained`
+/// keeps the formed functions alive with the submission.
+struct Encoding<'a, L> {
+    list: &'a L,
     repetitions: usize,
-    timed: Option<(&trace::TraceSink, usize)>,
-    retained: &Arc<dyn std::any::Any + Send + Sync>,
-) -> Result<RouteSubmission, CallError> {
+    timed: Option<(&'a trace::TraceSink, usize)>,
+    observed: bool,
+    retained: &'a Arc<dyn std::any::Any + Send + Sync>,
+    queue: NativeQueue,
+    after: &'a [Arc<dyn DeviceCompletion>],
+}
+
+/// Encode and commit `work`.
+fn encode(first: &NativePrepared, work: &Encoding<'_, impl DispatchList>) -> Result<Committed, EncodeFailure> {
+    let Encoding { list, repetitions, timed, observed, retained, queue, after } = *work;
     #[cfg(target_os = "macos")]
     let mut buffers = Vec::new();
+    assert!(
+        matches!(first.route, NativeRoute::Cuda { .. }) || (queue == NativeQueue::Compute && after.is_empty()),
+        "only a backend with a fill queue beside compute runs native work on another queue"
+    );
     match &first.route {
         NativeRoute::Cpu(route) => {
             let (outcome, interval) = cpu::run(&route.opened, list, repetitions);
-            Ok(RouteSubmission::Cpu { outcome, interval })
+            Ok(Committed::Cpu { outcome, interval })
         }
         #[cfg(target_os = "macos")]
         NativeRoute::Metal { opened, .. } => {
             type Metal = seismic_metal::Metal;
             type Executor = seismic_metal::MetalExecutor;
             let mut batch = match timed {
-                Some((sink, launches)) => seismic_metal::DirectBatch::timed(
-                    opened.service(),
-                    sink.metal_timestamps(),
-                    launches,
-                ),
+                Some((sink, _)) => {
+                    seismic_metal::DirectBatch::timed(opened.service(), sink.metal_timestamps())
+                }
+                None if observed => seismic_metal::DirectBatch::observed(opened.service()),
                 None => seismic_metal::DirectBatch::new(opened.service()),
             }
-            .map_err(CallError::Execution)?;
+            .map_err(CallError::Execution)
+            .map_err(EncodeFailure::uncommitted)?;
             let mut typed = Vec::new();
             let timelines = |batch: &mut seismic_metal::DirectBatch, boundary: usize| {
                 for operation in list.timelines(boundary) {
-                    let timeline::TimelineKind::Metal(event) = operation.timeline.kind() else {
+                    let timeline::TimelineKind::Metal(timeline) = operation.timeline.kind() else {
                         unreachable!("a run binds timelines of its own device");
                     };
-                    match operation.node {
-                        timeline::TimelineNode::Wait => batch.wait_event(event, operation.value),
-                        timeline::TimelineNode::Signal => {
-                            batch.signal_event(event, operation.value)
+                    match operation.action {
+                        timeline::TimelineAction::Wait => batch
+                            .wait_event(&timeline.gate, operation.value)
+                            .map_err(CallError::Execution)?,
+                        timeline::TimelineAction::Signal => {
+                            batch.signal_event(&timeline.reached, operation.value)
                         }
                     }
                 }
+                Ok::<(), CallError>(())
             };
-            for _ in 0..repetitions {
-                for index in 0..list.count() {
-                    timelines(&mut batch, index);
-                    buffers.clear();
-                    let dispatch = list.dispatch(index, &mut buffers);
-                    let NativeRoute::Metal {
-                        launches: pipelines,
-                        ..
-                    } = &dispatch.kernel.route
-                    else {
-                        unreachable!("one device has one native route");
+            // Encode launch `ordinal` of dispatch `index`.
+            let mut launch = |batch: &mut seismic_metal::DirectBatch, index: usize, ordinal: usize| {
+                buffers.clear();
+                let dispatch = list.dispatch(index, &mut buffers);
+                let NativeRoute::Metal {
+                    launches: pipelines,
+                    ..
+                } = &dispatch.kernel.route
+                else {
+                    unreachable!("one device has one native route");
+                };
+                let Some(launch) = &dispatch.launches[ordinal] else {
+                    batch.skip();
+                    return Ok(());
+                };
+                // A launch its conditions leave out of this run: the cached
+                // order of the others stands.
+                if !list.encodes(index, ordinal) {
+                    batch.skip();
+                    return Ok(());
+                }
+                typed.clear();
+                typed.extend(buffers.iter().map(|(allocation, offset)| {
+                    (typed_buffer::<Metal, Executor>(allocation), *offset)
+                }));
+                // A grid's binding is its three words: a `&tensor[3] i32`
+                // binds with canonical strides and never as a slab
+                // view (`NativePrepared::reads_grid`).
+                let grid = launch
+                    .grid
+                    .map(|buffer| typed[dispatch.kernel.argument(buffer)]);
+                batch
+                    .encode(&seismic_metal::DirectLaunch {
+                        pipeline: pipelines.pipeline(ordinal),
+                        buffers: &typed,
+                        words: word_bytes(dispatch.words),
+                        scalar_results: dispatch
+                            .kernel
+                            .scalar_slots()
+                            .map(|slots| (typed_buffer::<Metal, Executor>(slots), 0)),
+                        threadgroups: launch.groups,
+                        grid,
+                        threads_per_threadgroup: launch.threads,
+                        threadgroup_bytes: launch.shared_bytes,
+                    })
+                    .map_err(CallError::Execution)
+            };
+            let mut encode_all = |batch: &mut seismic_metal::DirectBatch| {
+                if timed.is_some() {
+                    // A timed batch times each launch in its own encoder, in
+                    // submission order: its labels are in that order.
+                    for _ in 0..repetitions {
+                        for index in 0..list.count() {
+                            timelines(batch, index)?;
+                            let dispatch = list.dispatch(index, &mut Vec::new());
+                            for ordinal in dispatch
+                                .kernel
+                                .implementation
+                                .dispatch_order(dispatch.rounds)
+                            {
+                                launch(batch, index, ordinal)?;
+                            }
+                        }
+                        timelines(batch, list.count())?;
+                    }
+                } else {
+                    let mut scheduled = |schedule: &hazard::Schedule| {
+                        for step in &schedule.0 {
+                            match *step {
+                                hazard::Scheduled::Timelines(boundary) => {
+                                    timelines(batch, boundary)?
+                                }
+                                hazard::Scheduled::Level(launches) => batch.group(launches),
+                                hazard::Scheduled::Launch { index, ordinal } => {
+                                    launch(batch, index, ordinal)?
+                                }
+                            }
+                        }
+                        Ok(())
                     };
-                    typed.clear();
-                    typed.extend(buffers.iter().map(|(allocation, offset)| {
-                        (typed_buffer::<Metal, Executor>(allocation), *offset)
-                    }));
-                    let scalars = dispatch
-                        .kernel
-                        .scalar_slots()
-                        .map(|slots| (typed_buffer::<Metal, Executor>(slots), 0));
-                    for ordinal in dispatch
-                        .kernel
-                        .implementation
-                        .dispatch_order(dispatch.rounds)
-                    {
-                        let Some(launch) = &dispatch.launches[ordinal] else {
-                            batch.skip();
-                            continue;
-                        };
-                        let pipeline = pipelines.pipeline(ordinal);
-                        batch
-                            .encode(&seismic_metal::DirectLaunch {
-                                pipeline,
-                                buffers: &typed,
-                                words: dispatch.word_bytes,
-                                scalar_results: scalars,
-                                threadgroups: launch.groups,
-                                threads_per_threadgroup: launch.threads,
-                                threadgroup_bytes: launch.shared_bytes,
-                            })
-                            .map_err(CallError::Execution)?;
+                    let derive = || hazard::Schedule(hazard::schedule(list, repetitions));
+                    match list.runs() {
+                        Some(runs) => {
+                            // A schedule holds no parameter: its shape is
+                            // its plans, its repetitions and how their
+                            // reaches meet, and it binds nothing.
+                            let mut key = runs.iter().map(|run| run.plan).collect::<Vec<_>>();
+                            key.push(repetitions as u64);
+                            key.extend(hazard::relative_placement(list, 0..list.count()));
+                            let shaped = graph_replays::Shaped { key, bound: Vec::new() };
+                            let schedules = &first.public_device.native.metal_schedules;
+                            // Deriving a schedule is host work alone: it
+                            // waits for nothing.
+                            let budget = first.public_device.native.graph_budget();
+                            let taken = schedules.record(std::slice::from_ref(&shaped), budget, retained, || Ok(()), |_| Ok(derive()))?;
+                            schedules.replay(&shaped, taken[0], |_, _| unreachable!("a schedule binds no parameter"), |schedule| scheduled(schedule))?
+                        }
+                        None => scheduled(&derive())?,
                     }
                 }
-                timelines(&mut batch, list.count());
+                Ok::<(), CallError>(())
+            };
+            match encode_all(&mut batch) {
+                Ok(()) => Ok(Committed::Metal(batch.commit())),
+                Err(error) => Err(EncodeFailure {
+                    error,
+                    committed: batch.abandon().map(Committed::Metal),
+                }),
             }
-            Ok(RouteSubmission::Metal(batch.commit()))
         }
         NativeRoute::Cuda { opened, .. } => cuda::encode(
             opened.service(),
             &first.public_device.native.cuda_replays,
-            list,
-            repetitions,
-            timed.is_some(),
-            retained,
+            first.public_device.native.graph_budget(),
+            work,
         ),
         #[cfg(not(target_os = "macos"))]
         NativeRoute::Vulkan { opened, .. } => vulkan::encode(
             opened.service(),
             &first.public_device.native.vulkan_replays,
-            list,
-            repetitions,
-            timed.map(|(_, launches)| launches),
-            retained,
+            first.public_device.native.graph_budget(),
+            work,
         ),
+    }
+}
+
+/// Encoding failed: the error, and the device work committed before it,
+/// which runs on the storage the work touches ([`Self::completion`]).
+pub(super) struct EncodeFailure {
+    pub(super) error: CallError,
+    pub(super) committed: Option<Committed>,
+}
+
+impl EncodeFailure {
+    /// The submission's outcome: work committed before the failure is
+    /// issued work whose completion reports the failure; only entirely
+    /// unissued work is refused at once.
+    fn completion(self) -> Result<RouteSubmission, CallError> {
+        match self.committed {
+            Some(submitted) => Ok(RouteSubmission::Failed(Box::new(IssuedFailure {
+                submitted,
+                issue: self.error,
+            }))),
+            None => Err(self.error),
+        }
+    }
+
+    /// A failure before any device work was committed.
+    fn uncommitted(error: CallError) -> Self {
+        Self {
+            error,
+            committed: None,
+        }
     }
 }
 
@@ -2833,7 +3635,7 @@ fn read_word(bytes: &[u8], word: usize) -> u64 {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
-    use seismic_lang::checked::{check_source, SourceFile, SourceSet};
+    use seismic_lang::checked::{check_source_with, SourceFile, SourceSet};
 
     /// A module built without seismic-build (which rejects this at build
     /// time) reaches preparation, which rejects it before compiling.
@@ -2844,15 +3646,17 @@ mod tests {
             .map(|index| format!("x{index}: &tensor[N] f32"))
             .collect::<Vec<_>>()
             .join(", ");
-        let mut module = check_source(SourceSet::new(vec![SourceFile {
-            path: "wide.seismic".into(),
-            text: format!("fn wide[N]({parameters}) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x0[i]\n    return output\n\nnative wide for metal from \"wide.metal\":\n    launch wide:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n"),
-        }]))
+        let module = check_source_with(
+            SourceSet::new(vec![SourceFile {
+                path: "wide.seismic".into(),
+                text: format!("fn wide[N]({parameters}) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x0[i]\n    return output\n\nnative wide for metal from \"wide.metal\":\n    launch wide:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n"),
+            }]),
+            &mut |_entry: &str, _native: &NativeImplementation| {
+                Ok::<_, std::convert::Infallible>(Some("kernel void wide() {}\n".into()))
+            },
+        )
         .expect("wide source checks");
         let entry = module.entry_named("wide").expect("wide entry");
-        module
-            .capture_native_asset(entry, BackendName::Metal, "kernel void wide() {}\n".into())
-            .expect("asset capture");
         let device = crate::devices::Devices::discover(&[])
             .expect("device discovery")
             .open_backend(BackendName::Metal)
@@ -2876,6 +3680,350 @@ mod tests {
             }
             Err(other) => panic!("unexpected preparation error: {other:?}"),
             Ok(_) => panic!("32 Metal buffer slots were prepared"),
+        }
+    }
+
+    /// A launch condition reads its own word of its parameter: of a launch
+    /// under `unless (policy[2])` and `if (policy[0])`, word 2 and word 0
+    /// of the bound view decide alone, at the view's offset (one rule,
+    /// `condition_holds`, every run-encoding backend reads).
+    #[test]
+    #[ignore = "requires Metal device"]
+    fn an_indexed_launch_condition_reads_its_word() {
+        let module = check_source_with(
+            SourceSet::new(vec![SourceFile {
+                path: "policy.seismic".into(),
+                text: "const WHOLE = 2\n\nfn fill[N](policy: &tensor[3] i32, x: &mut tensor[N] f32):\n    for i in 0..N:\n        x[i] = 0.0\n\nnative fill for metal from \"fill.metal\":\n    launch fill:\n        threadgroups (1, 1, 1)\n        unless (policy[WHOLE])\n        if (policy[0])\n        threads_per_threadgroup (1, 1, 1)\n".into(),
+            }]),
+            &mut |_entry: &str, _native: &NativeImplementation| {
+                Ok::<_, std::convert::Infallible>(Some("kernel void fill() {}\n".into()))
+            },
+        )
+        .expect("policy source checks");
+        let entry = module.entry_named("fill").expect("fill entry");
+        let device = crate::devices::Devices::discover(&[])
+            .expect("device discovery")
+            .open_backend(BackendName::Metal)
+            .expect("Metal device");
+        let prepared = NativePrepared::prepare(
+            &device,
+            &module,
+            entry,
+            ElementBindings::default(),
+            NativeSpecialization::new(),
+            None,
+        )
+        .expect("fill prepares");
+        // A view of three words past a leading word, so the offset counts.
+        let allocation = device.allocate_mapped_zeroed(seismic_topology::Contract::Words, 16, 16).expect("shared words");
+        let base = allocation.storage().host_address().expect("host-addressed words");
+        let store = |word: usize, value: u32| unsafe {
+            std::sync::atomic::AtomicU32::from_ptr(base.as_ptr().add(4 + 4 * word).cast())
+                .store(value, std::sync::atomic::Ordering::Release)
+        };
+        // The launch's conditions read `policy`, buffer 0, bound at byte 4.
+        let encodes = || {
+            prepared.conditions(0).iter().all(|&(buffer, index, encoded)| {
+                assert_eq!(buffer, 0, "the conditions read policy");
+                condition_holds(&allocation, 4 + 4 * index, encoded)
+            })
+        };
+        for (set, cleared, encoded) in [(1, 0, true), (1, 1, false), (0, 0, false), (0, 1, false)] {
+            store(0, set);
+            store(2, cleared);
+            // The other word never decides.
+            store(1, 7);
+            assert_eq!(encodes(), encoded, "policy[0] {set}, policy[2] {cleared}");
+        }
+    }
+}
+
+/// One sealed plan's run in a submission ([`DispatchList::runs`]): the
+/// plan, what its graphs are keyed by (`graph::PlanShape`), the run's calls,
+/// its timeline nodes, each where it sits from the run's first call (where
+/// graphs hold none, each ends a graph whether or not the run binds it,
+/// [`graph_segments`]), where the span marks its graphs hold sit, whether
+/// its plan is launched (`NativeGraphDraft::seal_launched`), and whether
+/// its graph holds its timeline nodes.
+#[derive(Clone)]
+pub(crate) struct PlanRun {
+    pub(crate) plan: u64,
+    pub(crate) layout: u64,
+    pub(crate) calls: Range<usize>,
+    pub(crate) timelines: Vec<(usize, timeline::TimelineNode)>,
+    /// The span marks inside its graphs, each the call it precedes, in
+    /// order (`NativeGraphPlan::held_marks`).
+    pub(crate) marks: Vec<usize>,
+    pub(crate) launched: bool,
+    /// Whether its graph holds the timeline nodes inside it, as nodes of
+    /// its own (`NativeGraphPlan::holds_timelines`).
+    pub(crate) holds_timelines: bool,
+    /// Its layout's graph ([`LayoutGraph`]): its words, a word per call of
+    /// the run, and the plans it is recorded from.
+    pub(crate) graph: Arc<LayoutGraph>,
+}
+
+/// The calls of `list` a graph each, every range with the boundary that
+/// ends it: those between timeline operations and, where the list is made
+/// of `runs`, between runs and at each run's timeline nodes its graphs do
+/// not hold (a graph is one run's, divided where its plan may bind a
+/// timeline, so a run binding none there divides alike), from a leading
+/// empty range for the operations before the first call to the range
+/// ending at the list's end. A boundary that divides only runs or unbound
+/// nodes has no timeline operations. A run whose graph holds the timeline
+/// nodes inside it ([`PlanRun::holds_timelines`]) is not divided at them.
+/// A stamp divides only where no graph holds
+/// its mark ([`PlanRun::marks`]): at a run's edges and in lists launched one
+/// by one, where it falls between launches on the stream and a graph is not
+/// cut.
+pub(super) fn graph_segments(list: &impl DispatchList, runs: Option<&[PlanRun]>) -> Vec<(Range<usize>, usize)> {
+    let runs = runs.unwrap_or_default();
+    let starts = runs
+        .iter()
+        .flat_map(|run| {
+            let bounds = run.timelines.iter().filter(|_| !run.holds_timelines);
+            std::iter::once(run.calls.start).chain(bounds.map(|&(position, _)| run.calls.start + position))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut segments = Vec::new();
+    let mut first = 0;
+    for boundary in 0..=list.count() {
+        let divides = boundary > first && starts.contains(&boundary);
+        let inside = || runs.iter().find(|run| run.inside(boundary));
+        let held = || inside().is_some_and(|run| run.holds(boundary));
+        let stamped = !list.stamps(boundary).is_empty() && !held();
+        let timelines = !list.timelines(boundary).is_empty()
+            && !inside().is_some_and(|run| run.holds_timelines);
+        if boundary == list.count() || timelines || stamped || divides {
+            segments.push((first..boundary, boundary));
+            first = boundary;
+        }
+    }
+    segments
+}
+
+impl PlanRun {
+    /// Whether `boundary` of the list lies inside the run, between two of
+    /// its calls.
+    fn inside(&self, boundary: usize) -> bool {
+        self.calls.start < boundary && boundary < self.calls.end
+    }
+
+    /// Whether a graph of the run holds its marks at `boundary` of the list.
+    fn holds(&self, boundary: usize) -> bool {
+        self.inside(boundary) && self.marks.binary_search(&(boundary - self.calls.start)).is_ok()
+    }
+
+    /// The run's timeline nodes its graph of `calls` holds, each the call of
+    /// the list it precedes, with what it does, in order: those strictly
+    /// inside the graph, of a run whose graph holds them.
+    pub(super) fn held_timelines<'a>(&'a self, calls: &Range<usize>) -> impl Iterator<Item = (usize, timeline::TimelineNode)> + 'a {
+        let inside = calls.start + 1..calls.end;
+        let start = self.calls.start;
+        self.timelines
+            .iter()
+            .filter(move |_| self.holds_timelines)
+            .map(move |&(position, node)| (start + position, node))
+            .filter(move |(at, _)| inside.contains(at))
+    }
+}
+
+/// The shapes a sealed-plan submission's graphs are recorded and replayed
+/// under ([`graph_replays::Replays`]): a graph is one run's calls between
+/// timeline nodes ([`graph_segments`]), and its key is what fixes its form
+/// wherever it runs (`graph::PlanShape`): on CUDA the run's layout, the
+/// calls' place in the run and the words the backend adds (`form`: the
+/// launches its layout's graph holds of each call, [`LayoutForms`]),
+/// every class, block, place and encoding of the layout replaying the
+/// graph; elsewhere the run's plan with the launches the calls encode. No
+/// key holds an address: a run on any place or slot replays its shape's
+/// graph, updated to what it binds.
+pub(super) struct ReplayKeys<'a> {
+    pub(super) runs: Vec<PlanRun>,
+    /// The launches each call encodes, where they are part of the shape
+    /// (none on CUDA, which enables a graph's launches by parameter).
+    pub(super) encoded: Option<&'a [Vec<bool>]>,
+}
+
+impl ReplayKeys<'_> {
+    /// The graph of the segment of `calls`, which lies in one run, with the
+    /// backend's words `form` and the storage it binds, `bound`.
+    pub(super) fn shaped(&self, calls: &Range<usize>, form: impl IntoIterator<Item = u64>, bound: Vec<u64>) -> graph_replays::Shaped {
+        graph_replays::Shaped { key: self.key(calls, form), bound }
+    }
+
+    /// The plan of the run `calls` lie in.
+    pub(super) fn plan(&self, calls: &Range<usize>) -> u64 {
+        self.run(calls).plan
+    }
+
+    /// Whether the run `calls` lie in is of a launched plan
+    /// (`NativeGraphDraft::seal_launched`).
+    pub(super) fn launched(&self, calls: &Range<usize>) -> bool {
+        self.run(calls).launched
+    }
+
+    /// The words of the graph of `calls`, which lie in one run, a word per
+    /// call ([`LayoutForms`]).
+    pub(super) fn form(&self, calls: &Range<usize>) -> &[u64] {
+        let run = self.run(calls);
+        &run.graph.form[calls.start - run.calls.start..calls.end - run.calls.start]
+    }
+
+    /// The marks the graph of `calls` holds, each the call of the list it
+    /// precedes, in order: those strictly inside it.
+    pub(super) fn marks(&self, calls: &Range<usize>) -> impl Iterator<Item = usize> + '_ {
+        let run = self.run(calls);
+        let inside = calls.start + 1..calls.end;
+        run.marks.iter().map(|mark| run.calls.start + mark).filter(move |mark| inside.contains(mark))
+    }
+
+    /// The stamps of a sampled run at the marks the graph of `calls` holds,
+    /// in order; none where the run isn't sampled.
+    pub(super) fn stamps<'l>(&self, list: &'l impl DispatchList, calls: &Range<usize>) -> Vec<&'l spans::Stamp> {
+        let mut marks = self.marks(calls).collect::<Vec<_>>();
+        marks.dedup();
+        marks.into_iter().flat_map(|mark| list.stamps(mark)).collect()
+    }
+
+    /// The run `calls` lie in.
+    fn run(&self, calls: &Range<usize>) -> &PlanRun {
+        let at = self.runs.partition_point(|run| run.calls.end <= calls.start);
+        &self.runs[at]
+    }
+
+    /// The key of the segment of `calls`, which lies in one run, with the
+    /// backend's words `form`.
+    fn key(&self, calls: &Range<usize>, form: impl IntoIterator<Item = u64>) -> Vec<u64> {
+        let run = self.run(calls);
+        assert!(
+            run.calls.start <= calls.start && calls.end <= run.calls.end,
+            "a graph's calls lie in one run"
+        );
+        let shape = match self.encoded {
+            None => run.layout,
+            Some(_) => run.plan,
+        };
+        let mut key = vec![shape, (calls.start - run.calls.start) as u64, (calls.end - run.calls.start) as u64];
+        if let Some(encoded) = self.encoded {
+            key.extend(encoded_words(encoded, calls.clone()));
+        }
+        key.extend(form);
+        key
+    }
+}
+
+/// The encoded launches of `calls` as words of a replay key, one bit a
+/// launch: two submissions of one plan encoding different launches replay
+/// different graphs.
+pub(super) fn encoded_words(encoded: &[Vec<bool>], calls: Range<usize>) -> Vec<u64> {
+    let mut words = Vec::new();
+    for (bit, launch) in encoded[calls].iter().flatten().enumerate() {
+        if bit % 64 == 0 {
+            words.push(0);
+        }
+        if *launch {
+            *words.last_mut().expect("a word per 64 launches") |= 1 << (bit % 64);
+        }
+    }
+    words
+}
+
+#[cfg(test)]
+mod issue_lifecycle_tests {
+    use super::*;
+    use seismic_lang::checked::{check_source, SourceFile, SourceSet};
+
+    fn cpu_noop() -> Arc<NativePrepared> {
+        use seismic_native_cpu::Tier;
+        unsafe fn unused(_: &CpuInvocation<'_>, _: [u64; 3], _: &mut [u8]) {}
+        const fn variant(tier: Tier) -> CpuVariant {
+            CpuVariant { tier, elements: &[], function: unused }
+        }
+        static KERNELS: CpuNativeKernels = CpuNativeKernels {
+            digest: "issue-lifecycle-unwind",
+            elements: &[],
+            launches: &[CpuLaunchVariants {
+                kernel: "entry",
+                variants: &[
+                    variant(Tier::X86V2), variant(Tier::X86V3), variant(Tier::X86V4),
+                    variant(Tier::X86V4Vnni), variant(Tier::Neon),
+                ],
+            }],
+        };
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "unwind.seismic".into(),
+            text: "fn entry(x: &mut tensor[1] f32):\n    return\n\nnative entry for cpu from \"entry.rs\":\n    launch entry:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".into(),
+        }])).unwrap();
+        let device = crate::devices::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+        NativePrepared::prepare(&device, &module, module.entry_named("entry").unwrap(),
+            ElementBindings::new(), NativeSpecialization::new(), Some(&KERNELS)).unwrap()
+    }
+
+    #[test]
+    fn issued_failure_returns_its_completion_and_reports_issue_and_retirement() {
+        let issue = CallError::Workflow(crate::api::WorkflowError::Empty);
+        assert!(matches!(EncodeFailure::uncommitted(issue.clone()).completion(), Err(error) if error == issue));
+        for outcome in [Ok(()), Err(ExecutionError::SubmissionFailed("retire failed".into()))] {
+            let route = EncodeFailure {
+                error: issue.clone(),
+                committed: Some(Committed::Cpu { outcome: outcome.clone(), interval: (1., 2.) }),
+            }
+            .completion()
+            .ok()
+            .expect("issued work returns its completion");
+            assert_eq!(route.completed(), outcome.clone().map(|()| true));
+            let expected = match outcome {
+                Ok(()) => issue.clone(),
+                Err(fence) => CallError::Unfenced { issue: Box::new(issue.clone()), fence },
+            };
+            assert_eq!(route.finish(), Err(expected));
+        }
+    }
+
+    /// A failure after the work is issued and fenced unwinds through its
+    /// retirement, releasing the submission's permits and order lock: the
+    /// storage it touched stays ordered after the work and usable.
+    #[test]
+    fn unwinding_after_issue_retires_the_work_and_releases_submission_locks() {
+        let kernel = cpu_noop();
+        let device = kernel.public_device.clone();
+        let tensor = Arc::new(TensorInner::zeros(&device, seismic_lang::registry::dense(
+            seismic_lang::types::DType::F32), &[1]).unwrap());
+        let mut args = EncodedArgs::new();
+        args.push_tensor(tensor.clone());
+        let call = kernel.prepare_call(&mut ScratchArena::default(), args, None, Parking::Unanswered).unwrap();
+        let calls = [call];
+        FAIL_AFTER_PUBLICATION.set(true);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            StandaloneCalls { kernel: &kernel, calls: &calls }.submit(1, false).map(drop)
+        }));
+        assert!(outcome.is_err(), "the injected failure unwinds");
+        assert!(!FAIL_AFTER_PUBLICATION.get());
+        assert!(!matches!(device.native.order.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+            "the order lock is released");
+        assert!(tensor.allocation().try_acquire(true).is_some(), "the device permit is released");
+    }
+
+    #[test]
+    fn standalone_awaited_calls_require_kernel_parking() {
+        for borrow in ["&", "&await ", "&await mut "] {
+            let module = check_source(SourceSet::new(vec![SourceFile {
+                path: "standalone-park.seismic".into(),
+                text: format!("fn entry(words: {borrow}tensor[1] i32):\n    return\n"),
+            }])).unwrap();
+            let entry = module.entry(module.entry_named("entry").unwrap(),
+                &seismic_lang::entry::ElementBindings::default()).unwrap();
+            for backend in [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
+                let result = validate_standalone_parking(entry.schema(), backend, Parking::Unanswered);
+                if borrow.contains("await") && !backend.parks_in_kernels() {
+                    assert_eq!(result, Err(CallError::Workflow(crate::api::WorkflowError::ParkRequiresGraph)));
+                } else {
+                    result.unwrap();
+                }
+                // Answered, it waits for nothing: every backend calls it.
+                validate_standalone_parking(entry.schema(), backend, Parking::Answered).unwrap();
+            }
         }
     }
 }

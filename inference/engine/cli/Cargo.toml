@@ -19,4 +19,3 @@ magnitude-serving = { path = "../serving" }
 magnitude-state = { path = "../state" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal"] }
-tracing-subscriber.workspace = true

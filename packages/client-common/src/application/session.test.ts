@@ -42,7 +42,7 @@ describe("tray model line", () => {
   it("shows the memory a loaded model holds", () => {
     const loaded = modelTrayPresentation(observed({ _tag: "Ready", allocation: { contextWindowTokens: 4096, memoryDomains: [
       { memoryDomainId: LocalInferenceMemoryDomainIdSchema.make("unified"), modelBytes: 16 * 1024 ** 3, contextBytes: 2 * 1024 ** 3, computeBytes: 0, auxiliaryBytes: 0 },
-    ] }, device: { deviceId: LocalInferenceDeviceIdSchema.make("metal:0"), backend: "metal" } }))
+    ], promptGroupPlaces: { held: 1, capacity: 1 }, streaming: Option.none() }, device: { deviceId: LocalInferenceDeviceIdSchema.make("metal:0"), backend: "metal" } }))
     expect(Option.map(loaded.status, ({ detail }) => detail)).toEqual(Option.some({ _tag: "Memory", text: "19.3 GB" }))
     expect(loaded.label).toMatch(/ · Loaded · 19\.3 GB$/)
   })

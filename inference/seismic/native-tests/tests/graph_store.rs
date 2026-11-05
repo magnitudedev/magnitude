@@ -4,32 +4,18 @@
 //! available device.
 
 use seismic::{
-    Availability, BackendName, Device, Devices, Element, NativeGraphFamily, NativeSpecialization,
-    Tensor,
+    BackendName, Device, Devices, Element, NativeGraphClassSlice, NativeGraphFamily,
+    NativeGraphMetadata, NativeSpecialization, Tensor,
 };
 use seismic_native_tests::scale_rows;
 
 fn devices() -> Vec<Device> {
-    let devices = Devices::discover(&[]).expect("device discovery");
-    let topology = devices.topology();
-    [
+    seismic_native_tests::devices(&[
         BackendName::Cpu,
         BackendName::Metal,
         BackendName::Cuda,
         BackendName::Vulkan,
-    ]
-    .into_iter()
-    .filter(|backend| {
-        topology.executors().iter().any(|device| {
-            device.backend() == *backend && matches!(device.availability(), Availability::Available)
-        })
-    })
-    .map(|backend| {
-        devices
-            .open_backend(backend)
-            .expect("available device opens")
-    })
-    .collect()
+    ])
 }
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
@@ -85,7 +71,7 @@ fn a_stored_result_is_written_into_the_bound_tensor() {
         // Only the exported result has storage of its own.
         assert_eq!(plan.output_bytes(), m * n * 4, "{backend:?}");
         let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
-        let mut slot = family.new_slot(1).unwrap();
+        let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
 
         let values = (0..m * n).map(|value| value as f32).collect::<Vec<_>>();
         let source = Tensor::from_host(&device, Element::f32(), &[m, n], &f32_bytes(&values))
@@ -119,6 +105,82 @@ fn a_stored_result_is_written_into_the_bound_tensor() {
             doubled.iter().map(|value| 3.0 * value).collect::<Vec<_>>(),
             "{backend:?}: read after the store"
         );
+    }
+}
+
+/// Every class of one template seals into its layout with the template's
+/// store: each class is a draft of its own, and the store is the same edge
+/// in each.
+#[test]
+fn a_templates_classes_seal_their_store_into_its_layout() {
+    let n = 8u64;
+    for device in devices() {
+        let backend = device.backend();
+        let mut template = NativeGraphMetadata::new_template(backend);
+        let input = template
+            .port_with_class_extent(Element::f32(), &[4, n], 0, "M")
+            .unwrap();
+        let landing = template
+            .port_with_class_extent(Element::f32(), &[4, n], 0, "M")
+            .unwrap();
+        let scaled = template
+            .enqueue::<scale_rows::Entry>(
+                &[],
+                &[("M", 4), ("N", n)],
+                scale_rows::WorkflowArgs {
+                    x: input.tensor().into(),
+                    factor: 2.0,
+                },
+            )
+            .unwrap()
+            .value;
+        template.store(&scaled, &landing).unwrap();
+        let layout = template
+            .seal_template()
+            .unwrap()
+            .certify(&[NativeGraphClassSlice::new().dimension("M", [2, 4])])
+            .unwrap();
+        let kernel =
+            scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
+                .unwrap();
+        for m in [2u64, 4] {
+            let mut graph = device.native_graph_with_layout(&layout);
+            let input = graph.port(Element::f32(), &[m, n]).unwrap();
+            let landing = graph.port(Element::f32(), &[m, n]).unwrap();
+            let scaled = graph
+                .enqueue(
+                    &kernel,
+                    scale_rows::WorkflowArgs {
+                        x: input.tensor().into(),
+                        factor: 2.0,
+                    },
+                )
+                .unwrap()
+                .value;
+            graph.store(&scaled, &landing).unwrap();
+            let plan = graph
+                .seal()
+                .unwrap_or_else(|error| panic!("{backend:?} M = {m}: {error:?}"));
+            let values = (0..m * n).map(|value| value as f32).collect::<Vec<_>>();
+            let source =
+                Tensor::from_host(&device, Element::f32(), &[m, n], &f32_bytes(&values)).unwrap();
+            let stored = Tensor::zeros(&device, Element::f32(), &[m, n]).unwrap();
+            let mut bindings = plan.bindings();
+            bindings.set(&input, &source).unwrap();
+            bindings.set(&landing, &stored).unwrap();
+            let mut slot = plan.new_slot().unwrap();
+            let (_, completion) = slot
+                .attach(bindings, plan.new_outputs().unwrap())
+                .unwrap()
+                .submit()
+                .unwrap();
+            completion.wait().unwrap();
+            assert_eq!(
+                read_f32(&stored),
+                values.iter().map(|value| 2.0 * value).collect::<Vec<_>>(),
+                "{backend:?} M = {m}"
+            );
+        }
     }
 }
 

@@ -156,6 +156,11 @@ impl<'a> TargetBatchSlot<'a> {
         self.following_bank
     }
 
+    /// The batch rows the slot's segment holds.
+    pub fn span(&self) -> std::ops::Range<usize> {
+        self.start..self.end
+    }
+
     pub fn rows(&self) -> usize {
         self.end - self.start
     }

@@ -1,7 +1,7 @@
 // ngram_rows on CPU (contract and portable body in ngram.seismic): the n-gram
 // table rows of each launch row from its token and its predecessors, the ones
 // before the slot read from the slot's token window. Work item r < M forms
-// row r's C * P rows ((0, 0) past the slots); work item M + b publishes slot
+// row r's C * P rows ((-1, 0) past the slots); work item M + b publishes slot
 // b's successor window. The hash is the body's u64 words, so every backend
 // names the same rows. The successor window is no slot's source, so the
 // publishing work items run beside the row work items.
@@ -51,7 +51,7 @@ fn ngram_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], 
     };
     let Some(slot) = slots.slot_of_row(item) else {
         for head in 0..heads {
-            put(head, 0, 0);
+            put(head, -1, 0);
         }
         return;
     };

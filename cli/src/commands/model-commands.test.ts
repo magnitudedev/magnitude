@@ -10,6 +10,7 @@ import {
   type CustomLocalModel,
   type ModelCatalogState,
 } from "@magnitudedev/sdk"
+import { servingAllocation, streamingStatus } from "@magnitudedev/client-common/fixtures/model"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   ADDED_MODEL_ID,
@@ -408,6 +409,7 @@ describe("hidden models are addressable", () => {
   it("shows a hidden model's status, saying it is hidden", async () => {
     const { text, json, models } = await runBoth({
       getCatalog: succeed(catalogState([makeAddedModel()], [], [hidden])),
+      getLocalEnvironment: succeed(makeHardware()),
       listDrafterCandidates: succeed({ candidates: makeDrafterCandidates(), entered: Option.none() }),
     }, (options) => showModelsStatus(hidden.modelId, options))
     expect(models.listDrafterCandidates).toHaveBeenCalledWith({ target: { _tag: "Model", modelId: hidden.modelId }, other: Option.none() })
@@ -419,6 +421,7 @@ describe("hidden models are addressable", () => {
   it("reports a visible model as not hidden", async () => {
     const { json } = await runBoth({
       getCatalog: succeed(catalogState([makeAddedModel()], [], [hidden])),
+      getLocalEnvironment: succeed(makeHardware()),
       listDrafterCandidates: succeed({ candidates: [], entered: Option.none() }),
     }, (options) => showModelsStatus(ADDED_MODEL_ID, options))
     expect(json).toMatchObject({ model: { modelId: ADDED_MODEL_ID }, hidden: false })
@@ -475,7 +478,7 @@ describe("models status variant and drafter columns", () => {
   it("shows an automatic drafter that isn't worked out yet as being found, never as none", () => {
     const pending = makeFoundModel({ drafterPending: true, recommendedDrafter: Option.none() })
     expect(rowOf(renderModelsStatus(statusView({ models: [pending] })), FOUND_MODEL_ID)).toMatch(/qwen-test:gguf:q4\s+Finding drafter…\s/)
-    const output = renderModelDetail({ model: pending, models: [], drafters: { _tag: "Listed", candidates: [] }, hidden: false })
+    const output = renderModelDetail({ model: pending, models: [], hardware: Option.none(), drafters: { _tag:"Listed", candidates: [] }, hidden: false })
     expect(output).toMatch(/^ {2}Drafter\s+Finding drafter…$/m)
     expect(output).not.toMatch(/^ {2}Drafter\s+None/m)
   })
@@ -486,7 +489,7 @@ describe("models status variant and drafter columns", () => {
   })
 
   it("shows a turned-off drafter in details and marks none as the current choice", () => {
-    const output = renderModelDetail({ model: turnedOff, models: [], drafters: { _tag: "Listed", candidates: makeDrafterCandidates() }, hidden: false })
+    const output = renderModelDetail({ model: turnedOff, models: [], hardware: Option.none(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false })
     expect(output).toMatch(/^ {2}Drafter\s+Turned off$/m)
     expect(output).not.toContain("Faster with a drafter")
     expect(output).toMatch(/^\* None\s+—/m)
@@ -494,7 +497,7 @@ describe("models status variant and drafter columns", () => {
   })
 
   it("marks the preselected drafter as current for an automatic choice with nothing attached yet", () => {
-    const output = renderModelDetail({ model: makeFoundModel(), models: [], drafters: { _tag: "Listed", candidates: makeDrafterCandidates() }, hidden: false })
+    const output = renderModelDetail({ model: makeFoundModel(), models: [], hardware: Option.none(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false })
     expect(output).toMatch(/^\* Magnitude DFlash for Qwen Test/m)
     expect(output).toMatch(/^ {2}None\s+—/m)
   })
@@ -504,12 +507,12 @@ describe("models status variant and drafter columns", () => {
       acquisitionState: { _tag: "Installing", progress: { stage: "downloading", completedBytes: 1, totalBytes: 4, bytesPerSecond: Option.none() } },
       servingState: { _tag: "Assessing", profile: { contextLength: 100_000 } },
     })
-    const detail = renderModelDetail({ model: downloading, models: [], drafters: { _tag: "Listed", candidates: makeDrafterCandidates() }, hidden: false })
+    const detail = renderModelDetail({ model: downloading, models: [], hardware: Option.none(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false })
     expect(detail).not.toMatch(/^ {2}Context/m)
     expect(detail).not.toContain("100K")
     expect(rowOf(renderModelsStatus(statusView({ models: [downloading] })), ADDED_MODEL_ID)).not.toContain("100K")
 
-    expect(renderModelDetail({ model: makeAddedModel(), models: [], drafters: { _tag: "Listed", candidates: makeDrafterCandidates() }, hidden: false }))
+    expect(renderModelDetail({ model: makeAddedModel(), models: [], hardware: Option.none(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false }))
       .toMatch(/^ {2}Context\s+32K$/m)
   })
 
@@ -541,7 +544,12 @@ const encode = <A>(document: { readonly encode: (value: A) => Effect.Effect<unkn
 
 const domain = LocalInferenceMemoryDomainIdSchema.make("cuda0")
 const memoryEvidence = { memoryDomainId: domain, capacityBytes: 100, requiredBytes: 10, compatibilityReserveBytes: 1, remainingBytes: 89 }
-const allocation = { contextWindowTokens: 4096, memoryDomains: [{ memoryDomainId: domain, modelBytes: 8, contextBytes: 1, computeBytes: 1, auxiliaryBytes: 0 }] }
+const allocation = {
+  contextWindowTokens: 4096,
+  memoryDomains: [{ memoryDomainId: domain, modelBytes: 8, contextBytes: 1, computeBytes: 1, auxiliaryBytes: 0 }],
+  ...servingAllocation,
+  streaming: Option.some(streamingStatus([domain])),
+}
 const plan = { contextWindowTokens: 4096, requiredMemoryBytes: 10, device: { deviceId: LocalInferenceDeviceIdSchema.make("cuda:0"), backend: "cuda" as const } }
 
 const withEvidence = <M extends CatalogLocalModel | CustomLocalModel>(model: M): M => {
@@ -592,7 +600,7 @@ describe("--json never leaks internals", () => {
       encode(catalogDetailJson, { model: catalog, models: all }),
       encode(recommendationsJson, { catalog: state, models: [catalog], hardware: makeHardware(), preference: { label: "Balanced" }, ranked: [catalog, ...catalogs] }),
       encode(modelsStatusJson, statusView({ models: all, hidden: [withEvidence(makeFoundModel({ modelId: CustomFormModelIdSchema.make("hf:a/b/c.gguf") }))] })),
-      ...all.map((model) => encode(modelDetailJson, { model, models: all, drafters: { _tag: "Listed", candidates: makeDrafterCandidates() }, hidden: false })),
+      ...all.map((model) => encode(modelDetailJson, { model, models: all, hardware: Option.none(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false })),
       encode(hardwareJson, { hardware: makeHardware(), models: [loadingFound] }),
       encode(hardwareJson, { hardware: makeHardware(), models: [catalogs[1]!] }),
       encode(searchJson, { query: "q", all: true, response: makeSearchResponse(), models: all }),
@@ -630,9 +638,9 @@ describe("--json never leaks internals", () => {
         residencyState: { _tag: "Ready", allocation: { contextWindowTokens: 4096, memoryDomains: [{ modelBytes: 8, contextBytes: 1 }] } },
       },
     })
-    const loading = encode(modelDetailJson, { model: catalogs[0]!, models: [], drafters: { _tag: "NotApplicable" }, hidden: false })
+    const loading = encode(modelDetailJson, { model: catalogs[0]!, models: [], hardware: Option.none(), drafters: { _tag:"NotApplicable" }, hidden: false })
     expect(loading.model).toMatchObject({ acquisitionState: { residencyState: { plannedAllocation: { device: { backend: "cuda" } } } } })
-    const detail = encode(modelDetailJson, { model: tooLarge, models: [], drafters: { _tag: "NotApplicable" }, hidden: false })
+    const detail = encode(modelDetailJson, { model: tooLarge, models: [], hardware: Option.none(), drafters: { _tag:"NotApplicable" }, hidden: false })
     expect(detail.model).toMatchObject({ servingState: { assessment: { _tag: "DoesNotFit", totalRequiredBytes: 10, deficitBytes: 4 } } })
     const shown = encode(catalogDetailJson, { model: catalog, models: [] })
     expect(shown.model).toMatchObject({

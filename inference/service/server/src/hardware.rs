@@ -11,7 +11,7 @@ use std::time::UNIX_EPOCH;
 
 use futures_util::future::BoxFuture;
 use magnitude_engine::worker::protocol::MemoryObservation;
-use magnitude_executor::platform::{Fit, MemoryReserves};
+use magnitude_executor::platform::{Fit, HostRoom, MemoryReserves};
 use magnitude_service_contracts::{
     ExecutionBackend, HardwareAccessPath, HardwareBackendDiagnostic, HardwareDeviceId,
     HardwareDeviceKind, HardwareDeviceMemory, HardwareDiagnosticSource, HardwareExecutor,
@@ -21,7 +21,7 @@ use magnitude_service_contracts::{
 };
 use seismic::{
     Availability, BackendName, DeviceMemory, DeviceTopology, DiagnosticSource, Inventory,
-    PhysicalIdentity, ReportedBy, RuntimeStatus, Status, StorageKind, StoreKind,
+    Contract, Placing, PhysicalIdentity, ReportedBy, RuntimeStatus, Status, StoreKind,
 };
 use sha2::{Digest, Sha256};
 
@@ -155,6 +155,7 @@ pub fn reported_by(by: ReportedBy) -> HardwareReportedBy {
         ReportedBy::WindowsTotalPhys => HardwareReportedBy::WindowsTotalPhys,
         ReportedBy::LinuxMemAvailable => HardwareReportedBy::LinuxMemAvailable,
         ReportedBy::MachMovablePages => HardwareReportedBy::MachMovablePages,
+        ReportedBy::MachAllocatablePages => HardwareReportedBy::MachAllocatablePages,
         ReportedBy::WindowsPhysicalAndCommit => HardwareReportedBy::WindowsPhysicalAndCommit,
         ReportedBy::CpuAddressSpace => HardwareReportedBy::CpuAddressSpace,
         ReportedBy::MetalMaxBufferLength => HardwareReportedBy::MetalMaxBufferLength,
@@ -190,13 +191,10 @@ impl HardwareProvider for HardwareInventory {
         let machine = Arc::clone(&self.machine);
         Box::pin(async move {
             let resident = self.resident.observe().await;
-            crate::spawn_blocking_traced(move || {
+            magnitude_service_utils::blocking::run(move || {
                 Self::snapshot_with(&inventory, &reserves, serving, &machine, resident.as_ref())
             })
             .await
-            .map_err(|error| {
-                InventoryError::Internal(format!("hardware snapshot task failed: {error}"))
-            })?
         })
     }
 }
@@ -216,7 +214,7 @@ fn snapshot(
     serving: ServingDevice,
     machine: &MachineDescription,
 ) -> Result<HardwareSnapshot, InventoryError> {
-    let fit = Fit::new(topology, status, reserves);
+    let fit = Fit::new(topology, status, reserves, HostRoom::Allocatable);
     let path_index = |id| {
         let index = topology
             .access_paths()
@@ -233,7 +231,7 @@ fn snapshot(
     };
     let placement = |executor: &seismic::Executor, kind| -> Vec<u32> {
         executor
-            .placement(kind)
+            .paths(Placing::Fixed(kind))
             .iter()
             .copied()
             .map(path_index)
@@ -243,7 +241,7 @@ fn snapshot(
         let availability = match executor.availability() {
             Availability::Available => HardwareExecutorAvailability::Available {
                 stable_capacity_bytes: fit
-                    .placement(executor, StorageKind::Device)
+                    .placement(executor, Contract::DeviceOnly)
                     .map_err(observation_error)?
                     .stable_bytes,
             },
@@ -256,8 +254,8 @@ fn snapshot(
             backend: execution_backend(executor.backend()),
             name: executor.name().to_owned(),
             description: format!("{} ({})", executor.name(), executor.backend().as_str()),
-            device_placement: placement(executor, StorageKind::Device),
-            upload_placement: placement(executor, StorageKind::Upload),
+            device_placement: placement(executor, Contract::DeviceOnly),
+            upload_placement: placement(executor, Contract::Upload),
             availability,
         })
     };
@@ -307,7 +305,7 @@ fn snapshot(
         let host = status.sample.host_ram.as_ref().map_err(observation_error)?;
         HardwareHostRam {
             store,
-            available_bytes: host.headroom.value,
+            available_bytes: host.allocatable.value,
             current_free_bytes,
         }
     };
@@ -533,7 +531,7 @@ mod tests {
 
     #[test]
     fn resident_readings_update_only_their_physical_store() {
-        use magnitude_engine::census::AllocationCensus;
+        use magnitude_engine::census::{AllocationCensus, ServingCensus};
         use magnitude_engine::worker::protocol::StoreHeadroom;
         use seismic::StoreIdentity;
         let gpu = StoreIdentity::DeviceMemory(PhysicalIdentity::Uuid([1; 16]));
@@ -553,7 +551,14 @@ mod tests {
         };
         let mut device_memory = vec![memory(&gpu), memory(&other)];
         let observation = MemoryObservation {
-            census: AllocationCensus { stores: Vec::new() },
+            census: AllocationCensus {
+                stores: Vec::new(),
+                serving: ServingCensus {
+                    group_places: std::num::NonZeroUsize::MIN,
+                    group_capacity: std::num::NonZeroUsize::MIN,
+                    experts: None,
+                },
+            },
             stores: vec![
                 StoreHeadroom {
                     store: StoreIdentity::HostRam,

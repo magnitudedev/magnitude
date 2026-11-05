@@ -12,18 +12,18 @@ use magnitude_serving::source::{ModelLoadDetails, KernelTuningWork, KernelTuning
 use magnitude_engine::worker::protocol::TuningOperation;
 use std::cell::RefCell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use futures_util::{FutureExt as _, StreamExt as _};
 use magnitude_engine::composition::{ReadinessMismatch, ReadyEngine};
-use magnitude_engine::error::{LoadError, PreviewError};
+use magnitude_engine::error::{LoadError, PreviewError, RequestError};
 use magnitude_engine::host::HostArtifacts;
 use magnitude_engine::preview::LoadPreview;
 use magnitude_engine::worker::{EngineClient, Preparation, load_prepared};
-use magnitude_engine::worker::protocol::{LoadProgress, MemoryObservation};
-use magnitude_executor::platform::{Fit, MemoryReserves};
+use magnitude_engine::worker::protocol::{LoadProgress, MemoryObservation, RoomAnswer};
+use magnitude_executor::platform::{Fit, HostRoom, MemoryReserves};
 use magnitude_service_contracts::models::{
     CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover,
     InstalledModelPackages as _, MemoryShortage, ModelAssessment, ModelAssessmentDomainSnapshot,
@@ -43,12 +43,12 @@ use super::optimization::{self, PreparationJobs};
 use super::supervisor::{HostMemoryObserver, MemorySupervisor};
 use super::worker::{EngineWorker, SpawnedWorker};
 use super::{
-    LoadingObserver, ModelOperationFailure, ModelResidency, ModelResidencyDriver,
+    LoadSequence, LoadingObserver, ModelOperationFailure, ModelResidency, ModelResidencyDriver,
     PreparedResidency, ReleaseControl, ResidencyAcquisition, ResidencyClient, ResidencyGrant,
     ResidencyLease, ResidencyNotification, ResidencyWorker, ResolvedResidencyTarget,
 };
 use crate::configurations::{ResolvedConfiguration, ResolvedConfigurations};
-use crate::device_lock::{DeviceHold, DeviceLock, DeviceShare};
+use crate::device_lock::{DeviceHold, DeviceLock, DeviceShare, IdleResident, ResidentRoom};
 use crate::hardware::execution_backend;
 use crate::memory_domains::instance_allocation;
 use crate::worker_process::WorkerLauncher;
@@ -98,6 +98,10 @@ struct EngineResidency {
     supervisor: MemorySupervisor,
     preparations: PreparationJobs,
     next_instance_id: Arc<AtomicU64>,
+    /// Residency's share of the device while it has demand
+    /// ([`ModelResidencyDriver::demand_ended`]): taken by the first load, held across each release
+    /// and the next queued load, so the device is never free between them.
+    demand: Arc<std::sync::Mutex<Option<Arc<DeviceShare>>>>,
 }
 
 /// The model instances this service holds: residency, load plans and host-only resolution.
@@ -121,7 +125,7 @@ impl ModelInstances {
         // limit, not the whole host's RAM. Without a reading, the whole host's, the larger.
         let topology = environment.catalog.topology();
         let thresholds = match environment.catalog.inventory().host_status() {
-            Ok(host) => Fit::host_ram(&topology, &host, &environment.reserves).thresholds,
+            Ok(host) => Fit::host_ram(&topology, &host, &environment.reserves, HostRoom::Allocatable).thresholds,
             Err(_) => environment
                 .reserves
                 .for_domain(&seismic::StoreKind::HostRam, topology.host_ram().capacity().value),
@@ -130,6 +134,7 @@ impl ModelInstances {
             Arc::clone(&environment.host_memory),
             thresholds,
             client.notifier(),
+            environment.device.clone(),
         );
         let preparations = PreparationJobs::default();
         let driver = EngineResidency {
@@ -138,8 +143,9 @@ impl ModelInstances {
             supervisor: supervisor.clone(),
             preparations: preparations.clone(),
             next_instance_id: Arc::new(AtomicU64::new(1)),
+            demand: Arc::default(),
         };
-        tokio::spawn(ModelResidency::new(driver).run(inbox));
+        magnitude_service_utils::owner::spawn("model residency", ModelResidency::new(driver).run(inbox));
         Self {
             environment,
             residency: client,
@@ -228,7 +234,7 @@ impl ModelInstances {
             )
             .await?
         {
-            ResidencyGrant::Lease(lease) => Ok(lease),
+            ResidencyGrant::Lease(lease) => Ok(self.admitted(lease).await),
             ResidencyGrant::Ready(_) => {
                 unreachable!("an inference acquisition is granted with a lease")
             }
@@ -240,7 +246,15 @@ impl ModelInstances {
         &self,
         instance_id: ModelInstanceId,
     ) -> Result<ResidencyLease<ResidentEngine>, InventoryError> {
-        self.residency.lease(instance_id).await
+        let lease = self.residency.lease(instance_id).await?;
+        Ok(self.admitted(lease).await)
+    }
+
+    /// `lease` once the measurement it preempted beside its idle model is gone
+    /// ([`DeviceLock::admit_request`]): no request is served while one is timed.
+    async fn admitted(&self, lease: ResidencyLease<ResidentEngine>) -> ResidencyLease<ResidentEngine> {
+        self.environment.device.admit_request().await;
+        lease
     }
 
     pub async fn stop_instance(&self, instance_id: ModelInstanceId) -> Result<(), InventoryError> {
@@ -434,15 +448,8 @@ pub(super) async fn preview(
 ) -> Result<LoadPreview, ModelOperationFailure> {
     let catalog = Arc::clone(catalog);
     let resolved = Arc::clone(resolved);
-    crate::spawn_blocking_traced(move || resolved.manifest.preview(&catalog))
+    magnitude_service_utils::blocking::run(move || resolved.manifest.preview(&catalog))
         .await
-        .map_err(|error| {
-            ModelOperationFailure::new(
-                "load_preview_failed",
-                format!("load preview task failed: {error}"),
-                true,
-            )
-        })?
         .map_err(preview_failure)
 }
 
@@ -477,18 +484,10 @@ fn preview_failure(error: PreviewError) -> ModelOperationFailure {
         PreviewError::Unsupported(_) => ("unsupported_model", false),
         PreviewError::Device(_) => ("device_unavailable", true),
         PreviewError::MemoryObservationUnavailable { .. } => ("memory_observation_unavailable", true),
+        PreviewError::WeightCap(cap) => return ModelOperationFailure::WeightCap(*cap),
         PreviewError::Internal { .. } => ("load_preview_failed", false),
     };
     ModelOperationFailure::new(code, error.to_string(), retryable)
-}
-
-/// Sets its flag when dropped: with the task that holds it.
-struct SetOnDrop(Arc<AtomicBool>);
-
-impl Drop for SetOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
-    }
 }
 
 /// A worker's load failure. A memory refusal is a shortage: blocked by the bytes the engine's
@@ -505,12 +504,14 @@ fn load_failure(error: LoadError, worker: &EngineWorker) -> ModelOperationFailur
         LoadError::MemoryPressure { .. } => {
             return ModelOperationFailure::MemoryShortage(MemoryShortage::UnderPressure {});
         }
+        LoadError::WeightCap(cap) => return ModelOperationFailure::WeightCap(*cap),
         LoadError::Artifact(_) => "invalid_model_package",
         LoadError::Unsupported(_) => "unsupported_model",
         LoadError::Device(_) => "device_unavailable",
         LoadError::MemoryObservationUnavailable { .. } => "memory_observation_unavailable",
         LoadError::DeviceLost { .. } => "device_lost",
         LoadError::WorkerLost { .. } => "worker_exited",
+        LoadError::Configuration { .. } => "invalid_model_configuration",
         LoadError::Internal { .. } => "model_load_failed",
     };
     let message = match &error {
@@ -663,23 +664,38 @@ impl EngineResidency {
         &self,
         instance_id: &ModelInstanceId,
         configuration: ModelServingConfiguration,
+        sequence: LoadSequence,
     ) -> Result<PreparedResidency<ResidentEngine>, ModelOperationFailure> {
         let environment = &self.environment;
         let resolved = environment.configurations.resolve(&configuration).await?;
-        // The load shares the device for its lifetime: its workers hold the share until each is
-        // proven retired. A job holding it (the measurement job or a catalog optimization, of
-        // this bundle or any other) is preempted: the load waits only for its bounded kill, and
-        // the records an optimization published stand.
-        let device = Arc::new(match environment.device.try_share() {
-            Some(device) => device,
-            None => {
-                self.progress(instance_id, ModelLoadStage::Queued, None);
-                tracing::info!("load preempts the job holding the device and waits for its kill");
-                let device = environment.device.share().await;
-                self.progress(instance_id, ModelLoadStage::Preparing, None);
+        // The load shares the device through residency's demand: its workers hold the share
+        // until each is proven retired, and residency until its demand ends. A load after a
+        // release takes the share residency kept, so no job starts between them; the measurement
+        // job beside the released model, preempted by its release, is gone first. The first load
+        // takes the share: a job holding the device (the measurement job or a catalog
+        // optimization, of this bundle or any other) is preempted, the load waits for its process
+        // to be gone, and the records an optimization published stand.
+        let held = self.demand.lock().expect("device demand").clone();
+        let device = match held {
+            Some(device) => {
+                environment.device.admit_request().await;
                 device
             }
-        });
+            None => {
+                let device = Arc::new(match environment.device.try_share() {
+                    Some(device) => device,
+                    None => {
+                        self.progress(instance_id, ModelLoadStage::Queued, None);
+                        tracing::info!("load preempts the job holding the device and waits for its kill");
+                        let device = environment.device.share().await;
+                        self.progress(instance_id, ModelLoadStage::Preparing, None);
+                        device
+                    }
+                });
+                *self.demand.lock().expect("device demand") = Some(Arc::clone(&device));
+                device
+            }
+        };
         if !self.supervisor.admission_open() {
             self.progress(instance_id, ModelLoadStage::Queued, None);
             tracing::info!("load waits for system memory to recover from pressure");
@@ -696,9 +712,8 @@ impl EngineResidency {
         // serves what is stored (the engine's one sequence, `load_prepared`).
         let manifest = resolved.manifest.clone();
         // The sequence runs on a blocking thread, which outlives this task when the load is
-        // stopped: it starts no further worker once the task is gone.
-        let abandoned = Arc::new(AtomicBool::new(false));
-        let _abandon = SetOnDrop(Arc::clone(&abandoned));
+        // stopped: it starts each worker through `sequence`, which a stop closes, and holds it
+        // until it is done with every worker, which the stop waits for.
         let driver = self.clone();
         let load_instance = instance_id.clone();
         let load_plan = plan.clone();
@@ -708,7 +723,7 @@ impl EngineResidency {
             servable_model_bundle_key_for_bundle(&configuration.bundle),
             plan.device.clone(),
         );
-        let loaded = crate::spawn_blocking_traced(move || {
+        let loaded = magnitude_service_utils::blocking::run(move || {
             // One progression across the workers: a Prepare fills `optimizing`, the Load the
             // rest.
             let progression = RefCell::new(LoadProgression::default());
@@ -729,10 +744,10 @@ impl EngineResidency {
             let spawn_failure = RefCell::new(None);
             let spawn = || {
                 let stopped = |reason: String| LoadError::WorkerLost { reason };
-                if abandoned.load(Ordering::Acquire) {
+                let Some(spawned) = sequence.start(|| driver.spawn_load_worker(&load_instance, &device)) else {
                     return Err(stopped("the load was stopped".into()));
-                }
-                match driver.spawn_load_worker(&load_instance, &device) {
+                };
+                match spawned {
                     Ok(spawned) => {
                         *last_worker.borrow_mut() = Some(Arc::clone(&spawned.worker));
                         Ok(spawned)
@@ -783,14 +798,7 @@ impl EngineResidency {
                 }),
             }
         })
-        .await
-        .map_err(|error| {
-            ModelOperationFailure::new(
-                "worker_exited",
-                format!("worker connection task failed: {error}"),
-                true,
-            )
-        })?;
+        .await;
         let (worker, connection) = loaded?;
 
         // The worker read its own package: it must agree with the host's resolution on the
@@ -807,7 +815,8 @@ impl EngineResidency {
         })?;
         let context_window_tokens = plan.context_window_tokens;
         let ready_info = ready.ready_info();
-        let allocation = instance_allocation(context_window_tokens, &ready_info.census);
+        let allocation = instance_allocation(context_window_tokens, &ready_info.census)
+            .map_err(|error| ModelOperationFailure::new("worker_census_invalid", error.to_string(), false))?;
         let device = load_device(ready_info.device, ready_info.backend);
         let (host, client, _) = ready.into_parts();
         tracing::info!(device = %device.id, "model ready");
@@ -845,10 +854,11 @@ impl ModelResidencyDriver for EngineResidency {
         &self,
         instance_id: ModelInstanceId,
         target: ResolvedResidencyTarget,
+        sequence: LoadSequence,
     ) -> Result<tokio::task::JoinHandle<()>, InventoryError> {
         let driver = self.clone();
         Ok(tokio::spawn(async move {
-            let result = std::panic::AssertUnwindSafe(driver.load(&instance_id, target.configuration))
+            let result = std::panic::AssertUnwindSafe(driver.load(&instance_id, target.configuration, sequence))
                 .catch_unwind()
                 .await
                 .unwrap_or_else(|_| {
@@ -871,17 +881,20 @@ impl ModelResidencyDriver for EngineResidency {
         let (interrupt, mut interruption) = tokio::sync::watch::channel(interrupt_immediately);
         let control = ReleaseControl::new(interrupt, Arc::clone(&worker));
         let notifier = self.client.notifier();
-        tokio::spawn(async move {
+        magnitude_service_utils::owner::spawn("a worker's release", async move {
             // Shutdown first in every case: the worker ends its open requests with
             // `ModelUnloaded { Shutdown }` (`model_instance_stopped`) before it exits. An
             // interrupted release then kills it after a short bound instead of the graceful one.
             worker.shutdown();
             let mut deadline = tokio::time::Instant::now()
                 + if interrupt_immediately { INTERRUPTED_EXIT } else { GRACEFUL_EXIT };
+            // Once killed, the worker is polled until the kernel reaps it, however long that
+            // takes: the release ends only with its retirement shown, and nothing waits on it.
+            let mut killed = false;
             let result = loop {
                 match worker.try_wait() {
                     Ok(Some(_)) => break Ok(()),
-                    Ok(None) if tokio::time::Instant::now() < deadline => {
+                    Ok(None) if killed || tokio::time::Instant::now() < deadline => {
                         tokio::select! {
                             biased;
                             changed = interruption.changed() => {
@@ -892,18 +905,26 @@ impl ModelResidencyDriver for EngineResidency {
                             () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
                         }
                     }
-                    Ok(None) => {
-                        worker.terminate(
-                            "worker_unresponsive",
-                            "inference worker did not exit after shutdown",
-                        );
-                        break Ok(());
-                    }
+                    Ok(None) => match worker.terminate(
+                        "worker_unresponsive",
+                        "inference worker did not exit after shutdown",
+                    ) {
+                        Ok(()) => killed = true,
+                        Err(error) => {
+                            break Err(ModelOperationFailure::new(
+                                "worker_retirement_failed",
+                                format!("the inference worker could not be killed: {error}"),
+                                true,
+                            ));
+                        }
+                    },
                     Err(error) => {
-                        worker.terminate(
+                        if let Err(kill) = worker.terminate(
                             "worker_monitor_failed",
                             "failed to observe inference worker during shutdown",
-                        );
+                        ) {
+                            tracing::error!(error = %kill, "the inference worker could not be killed");
+                        }
                         break Err(ModelOperationFailure::new(
                             "worker_monitor_failed",
                             format!("failed to observe inference worker during shutdown: {error}"),
@@ -937,6 +958,39 @@ impl ModelResidencyDriver for EngineResidency {
     fn idle_timeout(&self) -> std::time::Duration {
         self.environment.idle_timeout
     }
+
+    fn demand_ended(&self) {
+        self.demand.lock().expect("device demand").take();
+    }
+
+    fn resident_idle(&self, resident: Option<(&ModelInstanceId, &ResidentEngine)>) {
+        self.environment.device.resident_idle(resident.map(|(instance, resident)| IdleResident {
+            instance: instance.clone(),
+            room: Arc::new(resident.client.clone()),
+        }));
+    }
+}
+
+/// A measurement beside the resident model reaches its worker through its client.
+impl ResidentRoom for EngineClient {
+    fn claim(&self, bytes: u64) -> futures_util::future::BoxFuture<'static, Result<RoomAnswer, RequestError>> {
+        let client = self.clone();
+        Box::pin(async move { client.claim_measurement_room(bytes).await })
+    }
+
+    fn release(&self) {
+        // A worker that is gone holds no room.
+        if let Err(error) = self.release_measurement_room() {
+            tracing::debug!(%error, "the measurement room's release reached no worker");
+        }
+    }
+
+    fn reprice(&self) {
+        // A worker that is gone prices nothing.
+        if let Err(error) = EngineClient::reprice(self) {
+            tracing::debug!(%error, "the reprice reached no worker");
+        }
+    }
 }
 
 impl From<ModelOperationFailure> for InventoryError {
@@ -954,6 +1008,18 @@ mod tests {
     use super::*;
 
     const MODEL: &str = "qwen3.5-4b:gguf:q4";
+
+    /// A weight cap below the load's least weights is the service's own failure, with its own
+    /// code and both numbers, never retried: not a memory shortage, which clears with memory.
+    #[test]
+    fn a_weight_cap_below_the_least_weights_is_never_retried() {
+        let cap = magnitude_engine::error::WeightCapBelowWeights { cap: 2_100_000_000, needed: 2_130_136_892 };
+        let failure = preview_failure(PreviewError::WeightCap(cap));
+        assert!(matches!(&failure, ModelOperationFailure::WeightCap(found) if *found == cap));
+        assert_eq!(failure.code(), magnitude_serving::error::WEIGHT_CAP_BELOW_WEIGHTS);
+        assert!(!failure.retryable());
+        assert!(failure.message().contains("2100000000") && failure.message().contains("2130136892"));
+    }
 
     fn snapshot(model: &str, assessment: serde_json::Value) -> ModelAssessmentsSnapshot {
         serde_json::from_value(serde_json::json!({
@@ -1022,7 +1088,7 @@ mod tests {
             "profile": { "contextLength": 262_144 },
             "assessmentId": "assessment",
             "memory": [],
-            "performance": { "_tag": "Pending" },
+            "residency": { "_tag": "Resident", "performance": { "_tag": "Pending" } },
             "projector": { "_tag": "None" },
             "drafter": { "_tag": "None" },
         });

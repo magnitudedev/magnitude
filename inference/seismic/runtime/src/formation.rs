@@ -13,16 +13,27 @@
 //! A compile lives while a caller holds it. What a caller holds of a formed
 //! source is only the compiles its entries are in ([`Formed::entry`]).
 //!
-//! The store keeps what a toolchain kept of each compile under the text and
-//! the entry list compiled, and for each text the entry lists kept, so that
-//! a later request is served from a kept compile that holds its entries,
-//! whichever call formed it.
+//! The former is its toolchain's one caller outside tests for the programs
+//! a process serves ([`Toolchain`]). The store keeps each compile's artifact under
+//! the text and the entry list compiled, and names the artifact that holds
+//! each entry: a later request in any process is loaded from the artifacts
+//! that hold its entries, whichever calls formed them. Only what no
+//! artifact holds is compiled, once, and stored. Loading compiles nothing
+//! on a [`Load::Complete`] toolchain, and is counted and timed on a
+//! [`Load::PlatformCached`] one.
+//!
+//! The store is a cache and may drop any key: an entry no pointer names,
+//! or whose named artifact is gone, is classed as compiled and compiled
+//! again. Bytes it returns were written here under a key that covers their
+//! encoding ([`Artifact::ENCODING`]), so a pointer that does not parse or
+//! an artifact that does not decode is damaged: each is reported, missed,
+//! and rewritten by the compile it causes.
 
 use crate::artifacts::{ArtifactKey, ArtifactStore};
 use crate::native::Linear;
 use seismic_native_target::workers::Workers;
 use seismic_native_target::{
-    NativeCompilationError, ProgramCache, ProgramEntry, ProgramSource, Toolchain,
+    Artifact, Load, NativeCompilationError, ProgramEntry, ProgramSource, Toolchain,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -76,12 +87,30 @@ impl<P> Formed<P> {
     }
 }
 
+/// The programs a device's toolchain has formed (compiled, or loaded from
+/// its artifact store) and the seconds its calls took, summed over the
+/// threads that formed them.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FormedPrograms {
+    pub programs: usize,
+    pub seconds: f64,
+    /// Of them, the ones the toolchain compiled: nothing live held them
+    /// and no stored artifact served them.
+    pub compiles: u64,
+    /// The stored artifacts loaded by forming them again through the
+    /// platform's cache ([`Load::PlatformCached`]), and the seconds those
+    /// loads took: a few milliseconds each while the platform serves them,
+    /// a compile's time where it does not.
+    pub platform_loads: u64,
+    pub platform_load_seconds: f64,
+}
+
 /// What forming a program does, known before it is formed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum FormationClass {
     /// No compiler of the toolchain's runs: compiles live on the device
-    /// hold every requested entry, or the store keeps what the toolchain
-    /// says serves those they lack ([`Toolchain::keeps`]).
+    /// hold every requested entry, or the store keeps an artifact that
+    /// serves those they lack.
     Kept,
     /// The toolchain compiles the entries no live compile holds.
     Compiled,
@@ -94,18 +123,23 @@ pub(crate) struct ProgramFormer<T: Toolchain> {
     /// compile lives as long as some caller holds it.
     live: Mutex<HashMap<ArtifactKey, Vec<Weak<Compile<T::Program>>>>>,
     /// Compiles formed by the toolchain (compiled, or loaded from the
-    /// store) rather than found live.
+    /// store) rather than found live, and the nanoseconds its calls took.
     formed: std::sync::atomic::AtomicUsize,
-    /// What the store was read to keep, by the key of a text and the entry
-    /// list asked: the compile that serves them ([`ProgramFormer::kept`]),
-    /// and whether it keeps a compile of exactly that list
-    /// ([`ProgramFormer::publishing`]). A class is read whenever a price
-    /// is asked, and these reads would otherwise load a compile's bytes
-    /// each time. Only this former writes the store while it lives, and
-    /// every write forgets them.
+    forming_nanos: std::sync::atomic::AtomicU64,
+    /// What the store was read to keep, by the key of an entry: the
+    /// artifact that holds it ([`ProgramFormer::kept`]). A class is read
+    /// whenever a price is asked, and these reads would otherwise read the
+    /// store each time. Only this former writes the store while it lives,
+    /// and it records here every entry it stores.
     stored: Mutex<Stored>,
-    /// Held while a text's kept entry lists are read and rewritten.
-    listing: Mutex<()>,
+    /// The compiles the toolchain ran: entries no live compile held and no
+    /// stored artifact served.
+    compiles: std::sync::atomic::AtomicU64,
+    /// The stored artifacts a [`Load::PlatformCached`] toolchain loaded by
+    /// forming them again through the platform's cache, and the
+    /// nanoseconds those loads took.
+    platform_loads: std::sync::atomic::AtomicU64,
+    platform_load_nanos: std::sync::atomic::AtomicU64,
     /// What this toolchain's compiles have taken in this process, each with
     /// the entries it formed: what a compile of a source not yet compiled
     /// here is priced by.
@@ -117,16 +151,12 @@ pub(crate) struct ProgramFormer<T: Toolchain> {
 }
 
 /// What a former read the store to keep ([`ProgramFormer::stored`]), by the
-/// key of a text and the entry list asked.
-#[derive(Default)]
-struct Stored {
-    kept: HashMap<ArtifactKey, HashMap<String, Option<ArtifactKey>>>,
-    exact: HashMap<ArtifactKey, HashMap<String, bool>>,
-}
+/// key of an entry ([`ProgramFormer::entry_key`]).
+type Stored = HashMap<ArtifactKey, Option<ArtifactKey>>;
 
-/// A source as the former reads it: with the key of its text and the
-/// listing of its entries. Keying hashes the whole text, and a source
-/// tuning prices is asked about again at every price, so it is keyed once
+/// A source as the former reads it: with the key of its text. Keying
+/// hashes the whole text, and a source tuning prices is asked about again
+/// at every price, so it is keyed once
 /// ([`ProgramFormer::keyed`]); a hash of every rendered source at every
 /// price took 0.17 s of each of the allocator's passes (a GB10 load,
 /// 2026-10-12).
@@ -134,24 +164,6 @@ struct Stored {
 pub(crate) struct Keyed {
     source: ProgramSource,
     key: ArtifactKey,
-    list: String,
-}
-
-/// The store's bytes for one key in one toolchain's namespace.
-struct StoreCache<'a> {
-    store: &'a dyn ArtifactStore,
-    namespace: &'a str,
-    key: &'a ArtifactKey,
-}
-
-impl ProgramCache for StoreCache<'_> {
-    fn get(&self) -> Option<Vec<u8>> {
-        self.store.get(self.namespace, self.key)
-    }
-
-    fn put(&self, bytes: &[u8]) {
-        self.store.put(self.namespace, self.key, bytes);
-    }
 }
 
 /// One line naming an entry list: its entries, tab-separated, each with
@@ -171,8 +183,11 @@ impl<T: Toolchain> ProgramFormer<T> {
             store,
             live: Mutex::new(HashMap::new()),
             formed: std::sync::atomic::AtomicUsize::new(0),
+            forming_nanos: std::sync::atomic::AtomicU64::new(0),
             stored: Mutex::default(),
-            listing: Mutex::new(()),
+            compiles: std::sync::atomic::AtomicU64::new(0),
+            platform_loads: std::sync::atomic::AtomicU64::new(0),
+            platform_load_nanos: std::sync::atomic::AtomicU64::new(0),
             compiled: Mutex::new(Linear::default()),
             workers: Mutex::new(None),
         }
@@ -194,6 +209,12 @@ impl<T: Toolchain> ProgramFormer<T> {
     }
 
     /// What this toolchain's compiles have taken, by the entries formed.
+    /// Whether its toolchain loads a stored program through a platform
+    /// cache ([`Load::PlatformCached`]).
+    pub(crate) fn platform_cached(&self) -> bool {
+        T::LOAD == Load::PlatformCached
+    }
+
     pub(crate) fn compiled(&self) -> Linear {
         *self
             .compiled
@@ -201,35 +222,53 @@ impl<T: Toolchain> ProgramFormer<T> {
             .expect("compile observation lock is never poisoned")
     }
 
-    /// How many compiles the toolchain has formed for this device.
-    pub(crate) fn formed(&self) -> usize {
-        self.formed.load(std::sync::atomic::Ordering::Relaxed)
+    /// The compiles the toolchain has formed for this device, and the time
+    /// its calls took.
+    pub(crate) fn programs_formed(&self) -> FormedPrograms {
+        FormedPrograms {
+            programs: self.formed.load(std::sync::atomic::Ordering::Relaxed),
+            seconds: std::time::Duration::from_nanos(self.forming_nanos.load(std::sync::atomic::Ordering::Relaxed))
+                .as_secs_f64(),
+            compiles: self.compiles.load(std::sync::atomic::Ordering::Relaxed),
+            platform_loads: self.platform_loads.load(std::sync::atomic::Ordering::Relaxed),
+            platform_load_seconds: std::time::Duration::from_nanos(
+                self.platform_load_nanos.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .as_secs_f64(),
+        }
     }
 
     pub(crate) fn toolchain(&self) -> &T {
         &self.toolchain
     }
 
-    /// The content address of `source`'s text under this toolchain.
+    /// The content address of `source`'s text under this toolchain and the
+    /// encoding of its artifacts.
     fn key(&self, source: &ProgramSource) -> ArtifactKey {
         let identity = self.toolchain.identity();
         ArtifactKey::of(&[
             identity.namespace.as_bytes(),
             identity.material.as_bytes(),
+            &T::Artifact::ENCODING.to_le_bytes(),
             source.text.as_bytes(),
         ])
     }
 
-    /// Where the store keeps a compile of the text keyed `key` with the
-    /// entry list `list`.
-    fn kept_key(key: &ArtifactKey, list: &str) -> ArtifactKey {
-        ArtifactKey::of(&[b"compile", key.as_str().as_bytes(), list.as_bytes()])
+    /// Where the store keeps the artifact of a compile of the text keyed
+    /// `key` with the entry list `list`.
+    fn artifact_key(key: &ArtifactKey, list: &str) -> ArtifactKey {
+        ArtifactKey::of(&[b"artifact", key.as_str().as_bytes(), list.as_bytes()])
     }
 
-    /// Where the store keeps the entry lists kept of the text keyed `key`,
-    /// a line each.
-    fn lists_key(key: &ArtifactKey) -> ArtifactKey {
-        ArtifactKey::of(&[b"entry lists", key.as_str().as_bytes()])
+    /// Where the store keeps which artifact holds `entry` of the text keyed
+    /// `key`: each entry is kept apart, so any set of entries a request
+    /// names is served from the artifacts that hold them.
+    fn entry_key(key: &ArtifactKey, entry: &ProgramEntry) -> ArtifactKey {
+        ArtifactKey::of(&[
+            b"entry",
+            key.as_str().as_bytes(),
+            listed(std::slice::from_ref(entry)).as_bytes(),
+        ])
     }
 
     /// The live compiles of the text keyed `key` that hold entries of
@@ -261,27 +300,27 @@ impl<T: Toolchain> ProgramFormer<T> {
         (holding, missing)
     }
 
-    /// Where the store keeps a compile that serves `source`, the entries of
-    /// a text keyed `key` that no live compile holds: the compile of
-    /// exactly that entry list, or one of a list that holds them all, as
-    /// the toolchain says of the bytes kept ([`Toolchain::keeps`]).
-    /// `list` is the listing of the source's entries, and `source` makes
-    /// the source when the store must be read.
-    fn kept(
-        &self,
-        key: &ArtifactKey,
-        list: &str,
-        source: impl FnOnce() -> ProgramSource,
-    ) -> Option<ArtifactKey> {
-        if let Some(kept) = self.stored().kept.get(key).and_then(|lists| lists.get(list)) {
+    /// The stored artifact that holds `entry` of the text keyed `key`, if
+    /// the store keeps a pointer to one and the artifact it names; a miss
+    /// when the store dropped either, or keeps a pointer that does not
+    /// parse (damaged), which is reported and which the compile rewrites:
+    /// the store is a cache.
+    fn kept(&self, key: &ArtifactKey, entry: &ProgramEntry) -> Option<ArtifactKey> {
+        let entry_key = Self::entry_key(key, entry);
+        if let Some(kept) = self.stored().get(&entry_key) {
             return kept.clone();
         }
-        let kept = self.read_kept(key, &source());
-        self.stored()
-            .kept
-            .entry(key.clone())
-            .or_default()
-            .insert(list.to_owned(), kept.clone());
+        let kept = self.store.as_deref().and_then(|store| {
+            let namespace = self.toolchain.identity().namespace;
+            let named = store.get(namespace, &entry_key)?;
+            let Some(kept) = std::str::from_utf8(&named).ok().and_then(ArtifactKey::parse) else {
+                let pointer = entry_key.as_str();
+                eprintln!("seismic: the stored pointer {namespace}/{pointer} does not parse; it is compiled again");
+                return None;
+            };
+            store.contains(namespace, &kept).then_some(kept)
+        });
+        self.stored().insert(entry_key, kept.clone());
         kept
     }
 
@@ -291,68 +330,10 @@ impl<T: Toolchain> ProgramFormer<T> {
             .expect("store reading lock is never poisoned")
     }
 
-    /// [`ProgramFormer::kept`], read from the store.
-    fn read_kept(&self, key: &ArtifactKey, source: &ProgramSource) -> Option<ArtifactKey> {
-        let store = self.store.as_deref()?;
-        let namespace = self.toolchain.identity().namespace;
-        let keeps = |kept_key: &ArtifactKey| {
-            store
-                .get(namespace, kept_key)
-                .is_some_and(|kept| self.toolchain.keeps(source, &kept))
-        };
-        let exact = Self::kept_key(key, &listed(&source.entries));
-        if keeps(&exact) {
-            return Some(exact);
-        }
-        let lists = store.get(namespace, &Self::lists_key(key))?;
-        let wanted = source
-            .entries
-            .iter()
-            .map(|entry| listed(std::slice::from_ref(entry)))
-            .collect::<Vec<_>>();
-        std::str::from_utf8(&lists)
-            .ok()?
-            .lines()
-            .filter(|list| {
-                wanted
-                    .iter()
-                    .all(|entry| list.split('\t').any(|kept| kept == entry))
-            })
-            .map(|list| Self::kept_key(key, list))
-            .find(keeps)
-    }
-
-    /// What compiling `source` takes this toolchain when nothing it has
-    /// formed or kept serves it: `source` is compiled with a comment no
-    /// compile has carried, so neither the store, nor a live compile, nor a
-    /// cache of the system's (Metal's shader cache) answers it, and the
-    /// program is dropped. Where a system cache serves most compiles, the
-    /// compiles a load observes are its hits; this is what one of its
-    /// misses takes.
-    pub(crate) fn cold(&self, source: &ProgramSource) -> Result<std::time::Duration, NativeCompilationError> {
-        static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let salt = format!(
-            "\n// cold compile {} {} {}\n",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |since| since.as_nanos()),
-            PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        );
-        let salted = ProgramSource {
-            text: format!("{}{salt}", source.text),
-            entries: source.entries.clone(),
-        };
-        let began = std::time::Instant::now();
-        drop(self.toolchain.compile(&salted, None)?);
-        Ok(began.elapsed())
-    }
-
     /// `source` as the former reads it ([`Keyed`]).
     pub(crate) fn keyed(&self, source: ProgramSource) -> Keyed {
         Keyed {
             key: self.key(&source),
-            list: listed(&source.entries),
             source,
         }
     }
@@ -375,26 +356,13 @@ impl<T: Toolchain> ProgramFormer<T> {
     }
 
     /// How many entries of `source` the toolchain compiles: those no live
-    /// compile holds, unless the store keeps what serves them.
+    /// compile holds and no stored artifact holds.
     fn compiling(&self, keyed: &Keyed) -> usize {
         let (_, missing) = self.held(&keyed.key, &keyed.source.entries);
-        if missing.is_empty() {
-            return 0;
-        }
-        let list = if missing.len() == keyed.source.entries.len() {
-            std::borrow::Cow::Borrowed(keyed.list.as_str())
-        } else {
-            std::borrow::Cow::Owned(listed(&missing))
-        };
-        let count = missing.len();
-        let kept = self.kept(&keyed.key, &list, || ProgramSource {
-            text: keyed.source.text.clone(),
-            entries: missing,
-        });
-        match kept {
-            Some(_) => 0,
-            None => count,
-        }
+        missing
+            .iter()
+            .filter(|entry| self.kept(&keyed.key, entry).is_none())
+            .count()
     }
 
     /// Form every source, at once on the threads lent to the former
@@ -417,6 +385,10 @@ impl<T: Toolchain> ProgramFormer<T> {
         }
     }
 
+    /// The one way a program is had on this device. The entries no live
+    /// compile holds are loaded from the stored artifacts that hold them;
+    /// those none holds are compiled once, together, their artifact stored
+    /// with each of its entries named and its program used.
     fn form_one(
         &self,
         source: &ProgramSource,
@@ -426,41 +398,50 @@ impl<T: Toolchain> ProgramFormer<T> {
         if missing.is_empty() {
             return Ok(Formed { key, compiles });
         }
-        // One call of the toolchain for everything missing, and nothing
-        // that is held.
-        let missing = ProgramSource {
-            text: source.text.clone(),
-            entries: missing,
-        };
-        let list = listed(&missing.entries);
-        let kept = self.kept(&key, &list, || missing.clone());
-        let new = kept.is_none();
-        let kept_key = kept.unwrap_or_else(|| Self::kept_key(&key, &list));
-        let cache = self.store.as_deref().map(|store| StoreCache {
-            store,
-            namespace: self.toolchain.identity().namespace,
-            key: &kept_key,
-        });
         self.formed
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let began = std::time::Instant::now();
-        let program = self.toolchain.compile(
-            &missing,
-            cache.as_ref().map(|cache| cache as &dyn ProgramCache),
-        )?;
-        if new {
-            self.compiled
-                .lock()
-                .expect("compile observation lock is never poisoned")
-                .observe(missing.entries.len(), began.elapsed().as_secs_f64());
-            if let Some(store) = self.store.as_deref() {
-                self.list(store, &key, &list);
+        // The missing entries by the stored artifact that holds them, in
+        // the order first asked, and those no artifact holds.
+        let mut loads: Vec<(ArtifactKey, Vec<ProgramEntry>)> = Vec::new();
+        let mut compiling = Vec::new();
+        for entry in missing {
+            match self.kept(&key, &entry) {
+                Some(kept) => match loads.iter_mut().find(|(group, _)| *group == kept) {
+                    Some((_, entries)) => entries.push(entry),
+                    None => loads.push((kept, vec![entry])),
+                },
+                None => compiling.push(entry),
             }
         }
-        let compile = Arc::new(Compile {
-            entries: missing.entries,
-            program,
-        });
+        let mut formed = Vec::new();
+        for (kept, entries) in loads {
+            match self.artifact(&kept) {
+                Some(artifact) => {
+                    let loading = std::time::Instant::now();
+                    let program = self.toolchain.load(&artifact, &entries)?;
+                    if T::LOAD == Load::PlatformCached {
+                        let took = u64::try_from(loading.elapsed().as_nanos())
+                            .expect("a load's nanoseconds fit 64 bits");
+                        self.platform_loads
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.platform_load_nanos
+                            .fetch_add(took, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    formed.push(Compile { entries, program });
+                }
+                // The store dropped the artifact: its entries are compiled
+                // with the rest.
+                None => compiling.extend(entries),
+            }
+        }
+        if !compiling.is_empty() {
+            let program = self.compile_stored(&key, source, &compiling)?;
+            formed.push(Compile {
+                entries: compiling,
+                program,
+            });
+        }
         let mut live = self
             .live
             .lock()
@@ -469,145 +450,72 @@ impl<T: Toolchain> ProgramFormer<T> {
             compiles.retain(|compile| compile.strong_count() > 0);
             !compiles.is_empty()
         });
-        live.entry(key.clone())
-            .or_default()
-            .push(Arc::downgrade(&compile));
+        let held = live.entry(key.clone()).or_default();
+        for compile in formed {
+            let compile = Arc::new(compile);
+            held.push(Arc::downgrade(&compile));
+            compiles.push(compile);
+        }
         drop(live);
-        compiles.push(compile);
+        let took = u64::try_from(began.elapsed().as_nanos())
+            .expect("a formation's nanoseconds fit 64 bits");
+        self.forming_nanos
+            .fetch_add(took, std::sync::atomic::Ordering::Relaxed);
         Ok(Formed { key, compiles })
     }
 
-    /// How many entries of `source` publishing it compiles
-    /// ([`ProgramFormer::publish`]): all of them, unless the store keeps a
-    /// compile of exactly its entry list; none without a store, which
-    /// keeps nothing for a later process to find.
-    fn publishing(&self, keyed: &Keyed) -> usize {
-        let Some(store) = self.store.as_deref() else {
-            return 0;
-        };
-        let read = self
-            .stored()
-            .exact
-            .get(&keyed.key)
-            .and_then(|lists| lists.get(&keyed.list))
-            .copied();
-        let kept = read.unwrap_or_else(|| {
-            let exact = Self::kept_key(&keyed.key, &keyed.list);
-            let kept = store
-                .get(self.toolchain.identity().namespace, &exact)
-                .is_some_and(|kept| self.toolchain.keeps(&keyed.source, &kept));
-            self.stored()
-                .exact
-                .entry(keyed.key.clone())
-                .or_default()
-                .insert(keyed.list.clone(), kept);
-            kept
-        });
-        if kept { 0 } else { keyed.source.entries.len() }
-    }
-
-    /// What publishing `sources` together does ([`ProgramFormer::publish`]),
-    /// known before it runs: compiled when the store lacks a compile of
-    /// exactly one of their entry lists, and then the most entries one
-    /// source's compile forms (the sources compile at once). A choice whose
-    /// programs the store keeps as a load requests them is published by
-    /// reading that, and no compiler runs.
-    pub(crate) fn publication(&self, sources: &[Keyed]) -> (FormationClass, usize) {
-        let entries = sources
-            .iter()
-            .map(|source| self.publishing(source))
-            .max()
-            .unwrap_or(0);
-        match entries {
-            0 => (FormationClass::Kept, 0),
-            entries => (FormationClass::Compiled, entries),
+    /// The artifact the store keeps under `kept`, which a stored pointer
+    /// names; none when the store has dropped it, or keeps bytes that do
+    /// not decode (damaged), which are reported and compiled again: the
+    /// store is a cache, and the compile rewrites them.
+    fn artifact(&self, kept: &ArtifactKey) -> Option<T::Artifact> {
+        let store = self
+            .store
+            .as_deref()
+            .expect("an artifact is named only by a store");
+        let namespace = self.toolchain.identity().namespace;
+        let bytes = store.get(namespace, kept)?;
+        let artifact = T::Artifact::decode(&bytes);
+        if artifact.is_none() {
+            let kept = kept.as_str();
+            eprintln!("seismic: the stored artifact {namespace}/{kept} does not decode; it is compiled again");
         }
+        artifact
     }
 
-    /// How many of `sources` publishing them compiles
-    /// ([`ProgramFormer::publish`]): each takes a thread of the former's
-    /// while it does, so with what [`ProgramFormer::publication`] says of
-    /// their size this is what a publication's time is observed against.
-    pub(crate) fn publishing_sources(&self, sources: &[Keyed]) -> usize {
-        sources
-            .iter()
-            .filter(|source| self.publishing(source) > 0)
-            .count()
-    }
-
-    /// Publish each source as a later process will request it: the store
-    /// keeps a compile of exactly the source's entry list, whatever
-    /// compiles live on the device hold of its entries, and nothing formed
-    /// here is held. A choice tuning formed among many variants of its
-    /// text is served to this process out of that compile; the process
-    /// that loads the choice asks for its entries alone, and what it asks
-    /// for is what was published. The sources are compiled at once on the
-    /// threads lent to the former and in turn without them.
-    pub(crate) fn publish(&self, sources: &[ProgramSource]) -> Result<(), NativeCompilationError>
-    where
-        T: Sync,
-    {
-        match self.workers() {
-            Some(workers) => workers
-                .each(sources, |source| self.publish_one(source))
-                .into_iter()
-                .collect(),
-            None => sources
-                .iter()
-                .try_for_each(|source| self.publish_one(source)),
-        }
-    }
-
-    fn publish_one(&self, source: &ProgramSource) -> Result<(), NativeCompilationError> {
-        let keyed = self.keyed(source.clone());
-        if self.publishing(&keyed) == 0 {
-            return Ok(());
-        }
-        let Some(store) = self.store.as_deref() else {
-            return Ok(());
+    /// Compile `entries` of `source`'s text, store the artifact with each
+    /// entry named, and return the program the compile formed.
+    fn compile_stored(
+        &self,
+        key: &ArtifactKey,
+        source: &ProgramSource,
+        entries: &[ProgramEntry],
+    ) -> Result<T::Program, NativeCompilationError> {
+        let compiling = ProgramSource {
+            text: source.text.clone(),
+            entries: entries.to_vec(),
         };
-        let Keyed { key, list, .. } = keyed;
-        let kept_key = Self::kept_key(&key, &list);
-        let cache = StoreCache {
-            store,
-            namespace: self.toolchain.identity().namespace,
-            key: &kept_key,
-        };
-        self.formed
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let began = std::time::Instant::now();
-        // The program is released as soon as it is formed: what is
-        // published is what the toolchain kept of it.
-        drop(self.toolchain.compile(source, Some(&cache))?);
+        let (artifact, program) = self.toolchain.compile(&compiling)?;
+        let took = began.elapsed();
+        self.compiles
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.compiled
             .lock()
             .expect("compile observation lock is never poisoned")
-            .observe(source.entries.len(), began.elapsed().as_secs_f64());
-        self.list(store, &key, &list);
-        Ok(())
-    }
-
-    /// Record that the store keeps a compile of the text keyed `key` with
-    /// the entry list `list`.
-    fn list(&self, store: &dyn ArtifactStore, key: &ArtifactKey, list: &str) {
-        let _listing = self
-            .listing
-            .lock()
-            .expect("entry list lock is never poisoned");
-        let namespace = self.toolchain.identity().namespace;
-        let lists_key = Self::lists_key(key);
-        let mut lists = store
-            .get(namespace, &lists_key)
-            .and_then(|lists| String::from_utf8(lists).ok())
-            .unwrap_or_default();
-        if !lists.lines().any(|kept| kept == list) {
-            lists.push_str(list);
-            lists.push('\n');
-            store.put(namespace, &lists_key, lists.as_bytes());
+            .observe(entries.len(), took.as_secs_f64());
+        if let Some(store) = self.store.as_deref() {
+            let namespace = self.toolchain.identity().namespace;
+            let kept = Self::artifact_key(key, &listed(entries));
+            store.put(namespace, &kept, &artifact.encode());
+            let mut stored = self.stored();
+            for entry in entries {
+                let entry_key = Self::entry_key(key, entry);
+                store.put(namespace, &entry_key, kept.as_str().as_bytes());
+                stored.insert(entry_key, Some(kept.clone()));
+            }
         }
-        // The store keeps the compile listed here: what it was read to
-        // keep is read again.
-        *self.stored.lock().expect("store reading lock is never poisoned") = Stored::default();
+        Ok(program)
     }
 }
 
@@ -616,49 +524,67 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Compiles a source to its entries' symbols, keeping them in the cache
-    /// and answering from it when it holds every requested symbol. It
-    /// counts the calls that compiled and the entries they formed.
+    /// Compiles a source to its entries' symbols, its artifact their names
+    /// joined, and loads the requested ones from an artifact that names
+    /// them. It counts the calls that compiled and the entries they formed.
     struct Echo {
         identity: seismic_native_target::ToolchainIdentity,
         compiles: AtomicUsize,
         entries: AtomicUsize,
     }
 
+    /// An artifact of entry names, joined.
+    struct Names(Vec<String>);
+
+    impl Artifact for Names {
+        const ENCODING: u32 = 1;
+        fn encode(&self) -> Vec<u8> {
+            self.0.join(",").into_bytes()
+        }
+        fn decode(bytes: &[u8]) -> Option<Self> {
+            Some(Self(
+                std::str::from_utf8(bytes).ok()?.split(',').map(str::to_owned).collect(),
+            ))
+        }
+    }
+
     impl Toolchain for Echo {
+        type Artifact = Names;
         type Program = Vec<String>;
+        const LOAD: Load = Load::Complete;
         fn identity(&self) -> &seismic_native_target::ToolchainIdentity {
             &self.identity
-        }
-        fn keeps(&self, source: &ProgramSource, kept: &[u8]) -> bool {
-            let kept = std::str::from_utf8(kept).unwrap();
-            source
-                .entries
-                .iter()
-                .all(|entry| kept.split(',').any(|held| held == entry.symbol))
         }
         fn compile(
             &self,
             source: &ProgramSource,
-            cache: Option<&dyn ProgramCache>,
-        ) -> Result<Vec<String>, NativeCompilationError> {
-            let symbols = source
-                .entries
-                .iter()
-                .map(|entry| entry.symbol.clone())
-                .collect::<Vec<_>>();
-            if cache
-                .and_then(|cache| cache.get())
-                .is_some_and(|kept| self.keeps(source, &kept))
-            {
-                return Ok(symbols);
-            }
+        ) -> Result<(Names, Vec<String>), NativeCompilationError> {
             self.compiles.fetch_add(1, Ordering::SeqCst);
-            self.entries.fetch_add(symbols.len(), Ordering::SeqCst);
-            if let Some(cache) = cache {
-                cache.put(symbols.join(",").as_bytes());
-            }
-            Ok(symbols)
+            self.entries.fetch_add(source.entries.len(), Ordering::SeqCst);
+            let names = source.entries.iter().map(|entry| entry.symbol.clone()).collect::<Vec<_>>();
+            Ok((Names(names.clone()), names))
+        }
+        fn load(
+            &self,
+            artifact: &Names,
+            entries: &[ProgramEntry],
+        ) -> Result<Vec<String>, NativeCompilationError> {
+            entries
+                .iter()
+                .map(|entry| {
+                    artifact
+                        .0
+                        .iter()
+                        .find(|held| **held == entry.symbol)
+                        .cloned()
+                        .ok_or_else(|| {
+                            NativeCompilationError::MalformedToolchainOutput(entry.symbol.clone())
+                        })
+                })
+                .collect()
+        }
+        fn statistics(_: &Vec<String>, _: usize) -> &[seismic_native_target::ProgramStatistic] {
+            &[]
         }
     }
 
@@ -719,13 +645,6 @@ mod tests {
 
     fn class(former: &ProgramFormer<Echo>, sources: &[ProgramSource]) -> (FormationClass, usize) {
         former.class(&keyed(former, sources))
-    }
-
-    fn publication(
-        former: &ProgramFormer<Echo>,
-        sources: &[ProgramSource],
-    ) -> (FormationClass, usize) {
-        former.publication(&keyed(former, sources))
     }
 
     #[test]
@@ -801,16 +720,15 @@ mod tests {
         let former = self::former(Some(Arc::new(Memory::default())));
         let other = source("other", &["k"]);
         assert_eq!(class(&former, &[other.clone()]), (Compiled, 1));
-        assert_eq!(publication(&former, &[other.clone()]), (Compiled, 1));
-        former.publish(&[other.clone()]).unwrap();
-        assert_eq!(class(&former, &[other.clone()]), (Kept, 0));
-        assert_eq!(publication(&former, &[other]), (Kept, 0));
+        drop(former.form(&[other.clone()]).unwrap());
+        assert_eq!(class(&former, &[other]), (Kept, 0));
     }
 
-    /// Another process is served from whichever kept compile of the same
-    /// text holds what it asks for.
+    /// Another process is loaded from whichever stored artifact of the same
+    /// text holds what it asks for, a wider one included, and compiles
+    /// nothing the first compiled.
     #[test]
-    fn the_toolchain_is_given_the_stores_bytes_of_a_compile_that_holds_the_entries() {
+    fn another_process_loads_every_entry_from_the_store_and_compiles_none() {
         let store = Arc::new(Memory::default());
         let first = former(Some(store.clone()));
         let _narrow = first.form(&[source("launch", &["k<8>"])]).unwrap();
@@ -829,85 +747,61 @@ mod tests {
         assert_eq!(compiles(&fresh), 1);
     }
 
-    /// A choice formed among many variants of its text is published as a
-    /// later process requests it: a compile of its entry list alone, kept
-    /// under exactly that list, formed once and held by no one. The later
-    /// process finds it as it finds any compile of exactly its request.
+    /// Only what the store does not return is a miss: an artifact it
+    /// dropped is classed as compiled though a pointer names it, and is
+    /// compiled again, with the entries no artifact holds, in one call; one
+    /// it returns that does not decode is damaged, a miss too, and the
+    /// compile rewrites it.
     #[test]
-    fn a_published_source_is_kept_as_a_later_process_requests_it() {
+    fn only_a_dropped_artifact_is_a_miss() {
         let store = Arc::new(Memory::default());
         let first = former(Some(store.clone()));
-        // Tuning's compile of many variants is live and holds the choice.
-        let many = first
-            .form(&[source("launch", &["k<8>", "k<16>", "k<32>"])])
-            .unwrap();
-        let chosen = source("launch", &["k<16>"]);
-        use FormationClass::Kept;
-        assert_eq!(class(&first, &[chosen.clone()]), (Kept, 0));
-        assert_eq!(first.publishing(&first.keyed(chosen.clone())), 1);
-        first.publish(&[chosen.clone()]).unwrap();
-        // One more call of the toolchain, for the one entry, though a live
-        // compile holds it; nothing more of it is live.
-        assert_eq!((compiles(&first), entries(&first)), (2, 4));
-        assert_eq!(first.publishing(&first.keyed(chosen.clone())), 0);
-        first.publish(&[chosen.clone()]).unwrap();
-        assert_eq!(compiles(&first), 2);
-        drop(many);
-        // The store keeps the chosen entry's own compile: what the
-        // toolchain kept under exactly that list holds it and no other.
-        let namespace = "echo";
-        let key = first.key(&chosen);
-        let exact = ProgramFormer::<Echo>::kept_key(&key, &listed(&chosen.entries));
-        assert_eq!(store.get(namespace, &exact).unwrap(), b"k<16>");
-        // A later process asking for the choice is given that compile.
-        let later = former(Some(store));
-        assert_eq!(class(&later, &[chosen.clone()]), (Kept, 0));
-        later.form(&[chosen]).unwrap();
-        assert_eq!(compiles(&later), 0);
-        // Without a store there is nothing to publish to.
-        let alone = former(None);
-        let source = source("launch", &["k<16>"]);
-        assert_eq!(alone.publishing(&alone.keyed(source.clone())), 0);
-        alone.publish(&[source]).unwrap();
-        assert_eq!(compiles(&alone), 0);
+        let narrow = source("launch", &["k<8>"]);
+        drop(first.form(&[narrow.clone()]).unwrap());
+        let key = first.key(&narrow);
+        let stored = |entries: &[ProgramEntry]| {
+            (
+                String::from("echo"),
+                ProgramFormer::<Echo>::artifact_key(&key, &listed(entries)),
+            )
+        };
+        store.0.lock().unwrap().remove(&stored(&narrow.entries)).expect("the artifact was stored");
+        let wide = source("launch", &["k<8>", "k<16>"]);
+        let fresh = former(Some(store.clone()));
+        assert_eq!(class(&fresh, &[narrow.clone()]), (FormationClass::Compiled, 1));
+        drop(fresh.form(&[wide.clone()]).unwrap());
+        assert_eq!((compiles(&fresh), entries(&fresh)), (1, 2));
+        let (namespace, artifact) = stored(&wide.entries);
+        store.0.lock().unwrap().insert((namespace, artifact), vec![0xff]);
+        let damaged = former(Some(store.clone()));
+        drop(damaged.form(&[narrow.clone()]).unwrap());
+        assert_eq!(compiles(&damaged), 1, "an undecodable artifact is compiled again");
+        let after = former(Some(store));
+        assert_eq!(class(&after, &[narrow]), (FormationClass::Kept, 0), "and its entry's pointer rewritten");
     }
 
-    /// What publishing a choice does is known before it runs, and is what
-    /// publishing it then does: a choice the store keeps as a load requests
-    /// it (the canonical default the load formed alone, a choice already
-    /// published) runs no compiler, and only one the store lacks under
-    /// exactly its entry list is a compile, of that list. What a unit owes
-    /// for its served choice's artifact is priced by this.
+    /// A damaged entry pointer is a miss: the entry compiles again, and
+    /// the compile rewrites the pointer, which a later former then follows.
     #[test]
-    fn a_publication_is_classed_by_the_store_before_it_runs() {
-        use FormationClass::{Compiled, Kept};
+    fn a_damaged_pointer_is_a_miss_and_is_rewritten() {
         let store = Arc::new(Memory::default());
-        let former = former(Some(store));
-        // The canonical default, formed as a load requests it.
-        let default = source("launch", &["k<8>"]);
-        let _canonical = former.form(&[default.clone()]).unwrap();
-        assert_eq!(publication(&former, &[default.clone()]), (Kept, 0));
-        let before = compiles(&former);
-        former.publish(&[default.clone()]).unwrap();
-        assert_eq!(compiles(&former), before);
-        // A choice formed among many variants is live, and the store lacks
-        // it as a load requests it: its publication compiles its one entry.
-        let _many = former
-            .form(&[source("launch", &["k<8>", "k<16>", "k<32>"])])
-            .unwrap();
-        let chosen = source("launch", &["k<16>"]);
-        assert_eq!(class(&former, &[chosen.clone()]), (Kept, 0));
-        assert_eq!(publication(&former, &[chosen.clone()]), (Compiled, 1));
-        // Sources are published at once: the call is its largest compile.
-        let other = source("other", &["a", "b"]);
-        assert_eq!(
-            publication(&former, &[default, chosen.clone(), other]),
-            (Compiled, 2)
+        let first = former(Some(store.clone()));
+        let narrow = source("launch", &["k<8>"]);
+        drop(first.form(&[narrow.clone()]).unwrap());
+        let pointer = (
+            String::from("echo"),
+            ProgramFormer::<Echo>::entry_key(&first.key(&narrow), &narrow.entries[0]),
         );
-        let before = compiles(&former);
-        former.publish(&[chosen.clone()]).unwrap();
-        assert_eq!(compiles(&former), before + 1);
-        assert_eq!(publication(&former, &[chosen]), (Kept, 0));
+        store.0.lock().unwrap().insert(pointer.clone(), b"not a key".to_vec());
+        let damaged = former(Some(store.clone()));
+        assert_eq!(class(&damaged, &[narrow.clone()]), (FormationClass::Compiled, 1));
+        drop(damaged.form(&[narrow.clone()]).unwrap());
+        assert_eq!(compiles(&damaged), 1);
+        let rewritten = store.0.lock().unwrap()[&pointer].clone();
+        let parsed = std::str::from_utf8(&rewritten).ok().and_then(ArtifactKey::parse);
+        assert!(parsed.is_some(), "the compile rewrote the pointer");
+        let after = former(Some(store));
+        assert_eq!(class(&after, &[narrow]), (FormationClass::Kept, 0));
     }
 
     /// What forming a source does is known before it is formed, and is

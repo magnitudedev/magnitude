@@ -1,0 +1,13 @@
+// Expert streaming, the step's sequence (`routed_step` in routed.seismic);
+// the Vulkan form of `metal/routed_step.metal`: one invocation copies the
+// step pair the host wrote before submitting the step. Every later entry of
+// the step reads it in order on the same queue.
+#include <seismic/element.glsl>
+
+void routed_step() {
+    if (gl_LocalInvocationIndex != 0u)
+        return;
+    for (uint64_t word = 0ul; word < SEISMIC_CONST_STEP_WORDS; ++word)
+        element_i32_put(SEISMIC_PTR(SEISMIC_BUFFER_STEP) + word * SEISMIC_STEP_STRIDE_0 * 4ul,
+            element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_SEQUENCE) + word * SEISMIC_SEQUENCE_STRIDE_0 * 4ul));
+}

@@ -25,11 +25,27 @@
 // `KERNEL_W0_LAYOUT(k)` (its `Rows16` geometry for rows of `k` logical
 // values). Slots W0..W3 exist. A bound weight is dense (f32, bf16, f16) or
 // packed in the rows16 or rows32 layout.
+//
+// The bound weights are read in one address space (<seismic/slab.h>): a
+// host-written port's where any slot is bound to one, so a record the host
+// landed is read as the host last wrote it. `weight_bytes` addresses a
+// weight's bytes; `slab::as` reads them as another type.
 
 #include <seismic/element.h>
+#include <seismic/slab.h>
 #include <seismic/tables.h>
 
 namespace packets {
+
+// A launch that runs only while nothing lands in its records defines
+// PACKETS_PLAIN_RECORDS before this file: plain loads read them.
+#ifdef PACKETS_PLAIN_RECORDS
+typedef slab::space<false> space;
+#else
+typedef slab::space<ELEMENT_HAS(KERNEL_W0, _HOST_WRITTEN) || ELEMENT_HAS(KERNEL_W1, _HOST_WRITTEN)
+    || ELEMENT_HAS(KERNEL_W2, _HOST_WRITTEN) || ELEMENT_HAS(KERNEL_W3, _HOST_WRITTEN)> space;
+#endif
+typedef space::pointer<const uchar> weight_bytes;
 
 // ---------------------------------------------------------------------------
 // Weight row geometry. `stride` is the byte distance between rows; plane
@@ -56,7 +72,7 @@ struct Rows16 {
     ulong supers_row;
 
     // Row `n`'s base (its tile's first row) from the tensor's `base`.
-    device const uchar *base_of(device const uchar *base, ulong n) const {
+    weight_bytes base_of(weight_bytes base, ulong n) const {
         return base + (n - n % tile) * stride;
     }
     // This geometry for row `n`.
@@ -70,15 +86,15 @@ struct Rows16 {
     // arithmetic, and the row's share (everything but the unit's step) is
     // one loop-invariant address: 64-bit index arithmetic on every load
     // costs a decode lane several instructions a packet.
-    device const uchar *at(device const uchar *row, ulong plane, ulong bytes, ulong unit) const {
+    weight_bytes at(weight_bytes row, ulong plane, ulong bytes, ulong unit) const {
         return (row + plane * tile + ulong(r * uint(bytes))) + ulong(uint(unit) * (tile * uint(bytes)));
     }
     // Byte `offset` of this row's share of the scales and of the supers
     // plane.
-    device const uchar *scale_at(device const uchar *row, ulong offset) const {
+    weight_bytes scale_at(weight_bytes row, ulong offset) const {
         return (row + scales * tile + ulong(r * uint(scales_row))) + ulong(uint(offset));
     }
-    device const uchar *super_at(device const uchar *row, ulong offset) const {
+    weight_bytes super_at(weight_bytes row, ulong offset) const {
         return (row + supers * tile + ulong(r * uint(supers_row))) + ulong(uint(offset));
     }
 };
@@ -146,8 +162,8 @@ template <uint WIDTH>
 struct Fields {
     static_assert(WIDTH == 1u || WIDTH == 2u, "a packet's codes fill one or two words");
     typedef metal::conditional_t<WIDTH == 1u, uint, uint2> words;
-    static words load(device const uchar *row, Rows16 layout, ulong plane, uint p) {
-        return *reinterpret_cast<device const words *>(layout.at(row, plane, 4ul * WIDTH, p));
+    static words load(weight_bytes row, Rows16 layout, ulong plane, uint p) {
+        return *slab::as<words>(layout.at(row, plane, 4ul * WIDTH, p));
     }
     static uint step(words w, uint s) {
         if constexpr (WIDTH == 1u)
@@ -192,7 +208,7 @@ struct Planes {
     typedef Fields<LOW> low_plane;
     typedef Fields<HIGH> high_plane;
     typedef FieldWords<LOW, HIGH> words;
-    static words load(device const uchar *row, Rows16 layout, uint p) {
+    static words load(weight_bytes row, Rows16 layout, uint p) {
         words w;
         w.low = low_plane::load(row, layout, layout.codes, p);
         if constexpr (HIGH != 0u)
@@ -231,9 +247,9 @@ struct Planes<4, 0> {
     struct words {
         uint4 low;
     };
-    static words load(device const uchar *row, Rows16 layout, uint p) {
+    static words load(weight_bytes row, Rows16 layout, uint p) {
         words w;
-        w.low = *reinterpret_cast<device const uint4 *>(layout.at(row, layout.codes, 16ul, p));
+        w.low = *slab::as<uint4>(layout.at(row, layout.codes, 16ul, p));
         return w;
     }
     template <uint MASK>
@@ -261,9 +277,9 @@ struct Planes<4, HIGH> {
         uint4 low;
         typename high_plane::words high;
     };
-    static words load(device const uchar *row, Rows16 layout, uint p) {
+    static words load(weight_bytes row, Rows16 layout, uint p) {
         words w;
-        w.low = *reinterpret_cast<device const uint4 *>(layout.at(row, layout.codes, 16ul, p));
+        w.low = *slab::as<uint4>(layout.at(row, layout.codes, 16ul, p));
         w.high = high_plane::load(row, layout, layout.high, p);
         return w;
     }
@@ -290,9 +306,9 @@ struct Planes<8, 0> {
         uint4 first;
         uint4 second;
     };
-    static words load(device const uchar *row, Rows16 layout, uint p) {
+    static words load(weight_bytes row, Rows16 layout, uint p) {
         words w;
-        device const uint4 *codes = reinterpret_cast<device const uint4 *>(layout.at(row, layout.codes, 32ul, p));
+        const auto codes = slab::as<uint4>(layout.at(row, layout.codes, 32ul, p));
         w.first = codes[0];
         w.second = codes[1];
         return w;
@@ -337,15 +353,15 @@ inline uint word_bits(V w, uint bit) {
 // decode lane its address arithmetic and loads on every packet, so it is
 // addressed from `bit` directly.
 template <uint WIDTH>
-inline uint plane_bits(device const uchar *plane, uint bit) {
+inline uint plane_bits(weight_bytes plane, uint bit) {
     constexpr uint lowest = WIDTH & (0u - WIDTH), step = lowest < 8u ? lowest : 8u;
     static_assert(8u - step + WIDTH <= 32u, "a field read alone spans at most four bytes");
     constexpr uint bytes = (8u - step + WIDTH + 7u) / 8u;
-    device const uchar *at = plane + (bit >> 3);
+    weight_bytes at = plane + (bit >> 3);
     if constexpr (WIDTH == 8u)
         return at[0];
     else if constexpr (WIDTH == 16u)
-        return *reinterpret_cast<device const ushort *>(at);
+        return *slab::as<ushort>(at);
     else {
         uint word = 0u;
         for (uint i = 0; i < bytes; ++i)
@@ -377,10 +393,10 @@ struct Entries {
         typename low_plane::words low;
         uint high;
     };
-    static words load(device const uchar *row, Rows16 layout, uint p) {
+    static words load(weight_bytes row, Rows16 layout, uint p) {
         words w;
         w.low = low_plane::load(row, layout, p);
-        w.high = *reinterpret_cast<device const high_bits *>(layout.at(row, layout.high, HIGH / 2u, p));
+        w.high = *slab::as<high_bits>(layout.at(row, layout.high, HIGH / 2u, p));
         return w;
     }
     static uint entry(thread const words &w, uint step) {
@@ -396,9 +412,9 @@ struct Entries {
         chunk.high_shift = HIGH * e;
         return chunk;
     }
-    static uint chunk_entry(device const uchar *low, device const uchar *high, EntryChunk chunk) {
+    static uint chunk_entry(weight_bytes low, weight_bytes high, EntryChunk chunk) {
         return low_plane::chunk_entry(low, high, chunk)
-            | ((uint(*reinterpret_cast<device const high_bits *>(high)) >> chunk.high_shift) & ((1u << HIGH) - 1u))
+            | ((uint(*slab::as<high_bits>(high)) >> chunk.high_shift) & ((1u << HIGH) - 1u))
             << (8u * BYTES);
     }
 };
@@ -406,36 +422,36 @@ struct Entries {
 template <>
 struct Entries<1> {
     typedef uint words;
-    static words load(device const uchar *row, Rows16 layout, uint p) {
-        return *reinterpret_cast<device const uint *>(layout.at(row, layout.codes, 4ul, p));
+    static words load(weight_bytes row, Rows16 layout, uint p) {
+        return *slab::as<uint>(layout.at(row, layout.codes, 4ul, p));
     }
     static uint entry(words e, uint step) { return (e >> (8u * step)) & 0xffu; }
     static constexpr uint unit_bytes() { return 4u; }
     static constexpr uint high_bytes() { return 0u; }
     static EntryChunk chunk_of(uint e) { return EntryChunk{e, 0u, 0u}; }
-    static uint chunk_entry(device const uchar *low, device const uchar *, EntryChunk) { return low[0]; }
+    static uint chunk_entry(weight_bytes low, weight_bytes,EntryChunk) { return low[0]; }
 };
 
 template <>
 struct Entries<2> {
     typedef uint2 words;
-    static words load(device const uchar *row, Rows16 layout, uint p) {
-        return *reinterpret_cast<device const uint2 *>(layout.at(row, layout.codes, 8ul, p));
+    static words load(weight_bytes row, Rows16 layout, uint p) {
+        return *slab::as<uint2>(layout.at(row, layout.codes, 8ul, p));
     }
     static uint entry(words e, uint step) { return (e[step >> 1] >> (16u * (step & 1u))) & 0xffffu; }
     static constexpr uint unit_bytes() { return 8u; }
     static constexpr uint high_bytes() { return 0u; }
     static EntryChunk chunk_of(uint e) { return EntryChunk{2u * e, 0u, 0u}; }
-    static uint chunk_entry(device const uchar *low, device const uchar *, EntryChunk) {
-        return *reinterpret_cast<device const ushort *>(low);
+    static uint chunk_entry(weight_bytes low, weight_bytes,EntryChunk) {
+        return *slab::as<ushort>(low);
     }
 };
 
 template <>
 struct Entries<3> {
     typedef uint3 words;
-    static words load(device const uchar *row, Rows16 layout, uint p) {
-        return uint3(*reinterpret_cast<device const packed_uint3 *>(layout.at(row, layout.codes, 12ul, p)));
+    static words load(weight_bytes row, Rows16 layout, uint p) {
+        return uint3(*slab::as<packed_uint3>(layout.at(row, layout.codes, 12ul, p)));
     }
     // Entry `step` at bit 24 * step of the packet's three words.
     static uint entry(words e, uint step) { return word_bits<24>(e, 24u * step); }
@@ -447,8 +463,8 @@ struct Entries<3> {
         const uint word = min(3u * e / 4u, 1u);
         return EntryChunk{4u * word, 24u * e - 32u * word, 0u};
     }
-    static uint chunk_entry(device const uchar *low, device const uchar *, EntryChunk chunk) {
-        const ulong words = as_type<ulong>(uint2(*reinterpret_cast<device const packed_uint2 *>(low)));
+    static uint chunk_entry(weight_bytes low, weight_bytes,EntryChunk chunk) {
+        const ulong words = as_type<ulong>(uint2(*slab::as<packed_uint2>(low)));
         return uint(words >> chunk.shift) & 0xffffffu;
     }
 };
@@ -635,31 +651,31 @@ struct Grid {
 // consecutive ones.
 struct F16Scale {
     static constant constexpr uint bytes = 2;
-    static float read(device const uchar *at) { return float(*reinterpret_cast<device const half *>(at)); }
-    static float2 read2(device const uchar *at) { return float2(*reinterpret_cast<device const half2 *>(at)); }
+    static float read(weight_bytes at) { return float(*slab::as<half>(at)); }
+    static float2 read2(weight_bytes at) { return float2(*slab::as<half2>(at)); }
 };
 struct BF16Scale {
     static constant constexpr uint bytes = 2;
-    static float read(device const uchar *at) {
-        return as_type<float>(uint(*reinterpret_cast<device const ushort *>(at)) << 16);
+    static float read(weight_bytes at) {
+        return as_type<float>(uint(*slab::as<ushort>(at)) << 16);
     }
-    static float2 read2(device const uchar *at) {
-        uint two = *reinterpret_cast<device const uint *>(at);
+    static float2 read2(weight_bytes at) {
+        uint two = *slab::as<uint>(at);
         return float2(as_type<float>(two << 16), as_type<float>(two & 0xffff0000u));
     }
 };
 struct F32Scale {
     static constant constexpr uint bytes = 4;
-    static float read(device const uchar *at) { return *reinterpret_cast<device const float *>(at); }
-    static float2 read2(device const uchar *at) { return *reinterpret_cast<device const float2 *>(at); }
+    static float read(weight_bytes at) { return *slab::as<float>(at); }
+    static float2 read2(weight_bytes at) { return *slab::as<float2>(at); }
 };
 // E8M0: 2^(e - 127) (e = 0 is the F32 subnormal 2^-127); 0xff is NaN.
 struct E8M0Scale {
     static constant constexpr uint bytes = 1;
     static float value(uint e) { return as_type<float>(e == 0u ? 0x00400000u : e == 255u ? 0x7fc00000u : e << 23); }
-    static float read(device const uchar *at) { return value(at[0]); }
-    static float2 read2(device const uchar *at) {
-        uint two = *reinterpret_cast<device const ushort *>(at);
+    static float read(weight_bytes at) { return value(at[0]); }
+    static float2 read2(weight_bytes at) {
+        uint two = *slab::as<ushort>(at);
         return float2(value(two & 0xffu), value(two >> 8));
     }
 };
@@ -677,10 +693,10 @@ struct UE4M3Scale {
         return raw == 0x7fu ? as_type<float>(0x7fc00000u) : e == 0u ? float(m) * power2<X - 9>() : normal;
     }
     template <int X = 0>
-    static float read(device const uchar *at) { return value<X>(at[0]); }
+    static float read(weight_bytes at) { return value<X>(at[0]); }
     template <int X = 0>
-    static float2 read2(device const uchar *at) {
-        uint two = *reinterpret_cast<device const ushort *>(at);
+    static float2 read2(weight_bytes at) {
+        uint two = *slab::as<ushort>(at);
         return float2(value<X>(two & 0xffu), value<X>(two >> 8));
     }
 };
@@ -689,13 +705,13 @@ struct UE4M3Scale {
 // multiply, or none where S builds a value's bits (`UE4M3Scale`).
 template <typename S, int X>
 struct ScalesTimes {
-    static float read(device const uchar *at) { return X == 0 ? S::read(at) : S::read(at) * power2<X>(); }
-    static float2 read2(device const uchar *at) { return X == 0 ? S::read2(at) : S::read2(at) * power2<X>(); }
+    static float read(weight_bytes at) { return X == 0 ? S::read(at) : S::read(at) * power2<X>(); }
+    static float2 read2(weight_bytes at) { return X == 0 ? S::read2(at) : S::read2(at) * power2<X>(); }
 };
 template <int X>
 struct ScalesTimes<UE4M3Scale, X> {
-    static float read(device const uchar *at) { return UE4M3Scale::read<X>(at); }
-    static float2 read2(device const uchar *at) { return UE4M3Scale::read2<X>(at); }
+    static float read(weight_bytes at) { return UE4M3Scale::read<X>(at); }
+    static float2 read2(weight_bytes at) { return UE4M3Scale::read2<X>(at); }
 };
 
 // The BITS-bit codes at bits 0 and BITS of `field` as a code pair: the
@@ -824,12 +840,12 @@ struct Direct {
     // plane; its bias follows it.
     static uint scale_offset(uint g) { return g * ((BIAS ? 2u : 1u) * S::bytes); }
     template <typename P>
-    static coefficients load(device const uchar *row, Rows16 layout, uint p, thread const typename P::words &) {
+    static coefficients load(weight_bytes row, Rows16 layout, uint p, thread const typename P::words &) {
         return at(layout.super_at(row, 0ul), p);
     }
     // Packet p's coefficients, of the row whose share of the supers plane
     // is at `supers` (`Rows16::super_at(row, 0)`).
-    static coefficients at(device const uchar *supers, uint p) {
+    static coefficients at(weight_bytes supers, uint p) {
         // Packet p's first group, without a product that could wrap (which
         // keeps a compiler from folding it).
         const uint first = GROUP < 32u ? p * (32u / GROUP) : p / (GROUP / 32u);
@@ -861,7 +877,7 @@ struct Run<0> {
 template <>
 struct Run<1> {
     typedef uint words;
-    static words load(device const uchar *at) { return *reinterpret_cast<device const uint *>(at); }
+    static words load(weight_bytes at) { return *slab::as<uint>(at); }
     template <uint BITS>
     static words shift(words w) { return w >> BITS; }
     static uint low(words w) { return w; }
@@ -871,7 +887,7 @@ struct Run<1> {
 template <>
 struct Run<2> {
     typedef uint2 words;
-    static words load(device const uchar *at) { return uint2(*reinterpret_cast<device const packed_uint2 *>(at)); }
+    static words load(weight_bytes at) { return uint2(*slab::as<packed_uint2>(at)); }
     template <uint BITS>
     static words shift(words w) { return uint2((w.x >> BITS) | (w.y << (32u - BITS)), w.y >> BITS); }
     static uint low(words w) { return w.x; }
@@ -883,7 +899,7 @@ struct Run<2> {
 template <>
 struct Run<3> {
     typedef uint3 words;
-    static words load(device const uchar *at) { return uint3(*reinterpret_cast<device const packed_uint3 *>(at)); }
+    static words load(weight_bytes at) { return uint3(*slab::as<packed_uint3>(at)); }
     template <uint BITS>
     static words shift(words w) {
         return uint3((w.x >> BITS) | (w.y << (32u - BITS)), (w.y >> BITS) | (w.z << (32u - BITS)), w.z >> BITS);
@@ -897,7 +913,7 @@ struct Run<3> {
 template <>
 struct Run<4> {
     typedef uint4 words;
-    static words load(device const uchar *at) { return uint4(*reinterpret_cast<device const packed_uint4 *>(at)); }
+    static words load(weight_bytes at) { return uint4(*slab::as<packed_uint4>(at)); }
     template <uint BITS>
     static words shift(words w) {
         return uint4((w.x >> BITS) | (w.y << (32u - BITS)), (w.y >> BITS) | (w.z << (32u - BITS)),
@@ -914,13 +930,13 @@ struct Run<4> {
 // in the widest loads their alignment keeps (a factor group's fields of
 // whole bytes start at a multiple of BYTES), the bytes past them zero.
 template <uint WORDS, uint BYTES>
-inline typename Run<WORDS>::words byte_run(device const uchar *at) {
+inline typename Run<WORDS>::words byte_run(weight_bytes at) {
     static_assert(WORDS >= 1u && WORDS <= 4u && (BYTES + 3u) / 4u == WORDS, "a run of bytes is its words");
     constexpr uint unit = BYTES % 4u == 0u ? 4u : BYTES % 2u == 0u ? 2u : 1u;
     uint w[4] = {0u, 0u, 0u, 0u};
     for (uint i = 0; i < BYTES; i += unit) {
-        const uint value = unit == 4u   ? *reinterpret_cast<device const uint *>(at + i)
-                           : unit == 2u ? uint(*reinterpret_cast<device const ushort *>(at + i))
+        const uint value = unit == 4u   ? *slab::as<uint>(at + i)
+                           : unit == 2u ? uint(*slab::as<ushort>(at + i))
                                         : uint(at[i]);
         w[i / 4u] |= value << (8u * (i % 4u));
     }
@@ -970,8 +986,8 @@ struct Hier {
     // minimum factor 2^EXPONENT (`bias(0)`).
     typedef Coefficients<1, MIN> group_factors;
     // Factor group f's.
-    static group_factors factors(device const uchar *row, Rows16 layout, uint f) {
-        device const uchar *at = layout.super_at(row, ulong(f) * ((MIN ? 2u : 1u) * FS::bytes));
+    static group_factors factors(weight_bytes row, Rows16 layout, uint f) {
+        weight_bytes at =layout.super_at(row, ulong(f) * ((MIN ? 2u : 1u) * FS::bytes));
         float2 factor = MIN ? FS::read2(at) : float2(FS::read(at), 0.0f);
         if (EXPONENT + CODE_EXPONENT != 0)
             factor.x *= power2<EXPONENT + CODE_EXPONENT>();
@@ -1024,14 +1040,14 @@ struct Hier {
     // plane, where factor groups' fields fill whole words one after
     // another, so packet p's is at bit `field_bits` p of the row's share.
     template <typename P>
-    static uint field(device const uchar *row, Rows16 layout, uint p, thread const typename P::words &w) {
+    static uint field(weight_bytes row, Rows16 layout, uint p, thread const typename P::words &w) {
         if constexpr (carries)
             return carried<P>(w);
         else
             return plane_bits<field_bits>(layout.scale_at(row, 0ul), p * field_bits);
     }
     template <typename P>
-    static coefficients load(device const uchar *row, Rows16 layout, uint p, thread const typename P::words &w) {
+    static coefficients load(weight_bytes row, Rows16 layout, uint p, thread const typename P::words &w) {
         return form(field<P>(row, layout, p, w), factors(row, layout, p / packets));
     }
 
@@ -1040,7 +1056,7 @@ struct Hier {
     // the next packet's field. `group_fields` are factor group f's fields
     // whole, packet b's `field_of` them.
     typedef Run<words> fields;
-    static typename fields::words group_fields(device const uchar *row, Rows16 layout, uint f) {
+    static typename fields::words group_fields(weight_bytes row, Rows16 layout, uint f) {
         if constexpr (packets * field_bits % 32u == 0u)
             return fields::load(layout.scale_at(row, ulong(f) * (4u * words)));
         else
@@ -1051,7 +1067,7 @@ struct Hier {
         typename fields::words remaining;
         group_factors factor;
     };
-    static run start(device const uchar *row, Rows16 layout, uint p) {
+    static run start(weight_bytes row, Rows16 layout, uint p) {
         run state;
         if constexpr (!carries) {
             state.remaining = group_fields(row, layout, p / packets);
@@ -1103,7 +1119,7 @@ struct Packet {
         typename P::words codes;
         typename K::coefficients coefficients;
     };
-    static packet load(device const uchar *row, Rows16 layout, uint p) {
+    static packet load(weight_bytes row, Rows16 layout, uint p) {
         packet k;
         k.codes = P::load(row, layout, p);
         k.coefficients = K::template load<P>(row, layout, p, k.codes);
@@ -1162,10 +1178,10 @@ template <typename E>
 struct Dense {
     static constant constexpr uint groups = 1;
     struct packet {
-        device const uchar *values;
+        weight_bytes values;
         uint valid;   // elements of this packet inside the row
     };
-    static packet load(device const uchar *row, Rows16 layout, uint p, uint k) {
+    static packet load(weight_bytes row, Rows16 layout, uint p, uint k) {
         packet out;
         out.values = row + layout.codes + ulong(p) * 32ul * E::bytes;
         out.valid = min(32u, k - 32u * p);
@@ -1173,14 +1189,13 @@ struct Dense {
     }
     static float element(thread const packet &k, uint i) {
         return i < k.valid
-            ? E::load(reinterpret_cast<device const typename E::storage *>(k.values)[i])
+            ? E::load(slab::as<typename E::storage>(k.values)[i])
             : 0.0f;
     }
     static void values(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
         uint first = 8u * step;
         if (first + 8u <= k.valid) {
-            device const typename E::storage *v =
-                reinterpret_cast<device const typename E::storage *>(k.values) + first;
+            const auto v = slab::as<typename E::storage>(k.values) + first;
             even = float4(E::load(v[0]), E::load(v[2]), E::load(v[4]), E::load(v[6]));
             odd = float4(E::load(v[1]), E::load(v[3]), E::load(v[5]), E::load(v[7]));
         } else {
@@ -1201,13 +1216,13 @@ struct Dense {
 // Uniform packet loading: quantized packets ignore the row length.
 template <typename W>
 struct Loader {
-    static typename W::packet load(device const uchar *row, Rows16 layout, uint p, uint) {
+    static typename W::packet load(weight_bytes row, Rows16 layout, uint p, uint) {
         return W::load(row, layout, p);
     }
 };
 template <typename E>
 struct Loader<Dense<E>> {
-    static typename Dense<E>::packet load(device const uchar *row, Rows16 layout, uint p, uint k) {
+    static typename Dense<E>::packet load(weight_bytes row, Rows16 layout, uint p, uint k) {
         return Dense<E>::load(row, layout, p, k);
     }
 };
@@ -1226,8 +1241,8 @@ template <typename W>
 struct Block {
     static constant constexpr uint packets = 1;
     struct state {};
-    static state load(device const uchar *, Rows16, uint) { return state{}; }
-    static typename W::packet packet(device const uchar *row, Rows16 layout, uint p, uint k,
+    static state load(weight_bytes, Rows16, uint) { return state{}; }
+    static typename W::packet packet(weight_bytes row, Rows16 layout, uint p, uint k,
         thread state &) {
         return Loader<W>::load(row, layout, p, k);
     }
@@ -1242,8 +1257,8 @@ struct Block<Packet<P, C,
     typedef Packet<P, C, K, F> W;
     static constant constexpr uint packets = K::packets;
     typedef typename K::run state;
-    static state load(device const uchar *row, Rows16 layout, uint p) { return K::start(row, layout, p); }
-    static typename W::packet packet(device const uchar *row, Rows16 layout, uint p, uint,
+    static state load(weight_bytes row, Rows16 layout, uint p) { return K::start(row, layout, p); }
+    static typename W::packet packet(weight_bytes row, Rows16 layout, uint p, uint,
         thread state &run) {
         typename W::packet k;
         k.codes = P::load(row, layout, p);

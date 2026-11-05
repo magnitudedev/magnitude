@@ -1,0 +1,28 @@
+// Expert streaming, a prompt group's seeds (`routed_copy` in
+// routed.seismic); the Vulkan form of `metal/routed_copy.metal`: the listed
+// records of the source into the destination, byte for byte
+// (streaming/list_copy.hpp), each record reached through its tensor's record
+// table.
+#include <seismic/slab.glsl>
+#include "lib/streaming/control.glsl"
+#include "../streaming/list.hpp"
+
+#define STREAMING_COPY_FROM(table, record) slab_region(table, uint64_t(record))
+#define STREAMING_COPY_TO(table, record) slab_region(table, uint64_t(record))
+#include "../streaming/list_copy.hpp"
+
+// The bytes of one unit of the source's strides: a row layout's stored row,
+// any other's packet (a dense element's packet is one element).
+#if defined(SEISMIC_SOURCE_KIND_PACKED) && !defined(SEISMIC_SOURCE_LAYOUT_PACKET)
+#define COPY_STRIDE_BYTES uint64_t(SEISMIC_SOURCE_ROW_STRIDE_BYTES)
+#else
+#define COPY_STRIDE_BYTES uint64_t(SEISMIC_SOURCE_PACKET_SIZE)
+#endif
+
+void routed_copy() {
+    streaming_list_copy(SEISMIC_PTR(SEISMIC_BUFFER_SOURCE), SEISMIC_PTR(SEISMIC_BUFFER_LIST),
+        element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_STEP)), SEISMIC_PTR(SEISMIC_BUFFER_DESTINATION),
+        uint64_t(SEISMIC_SOURCE_STRIDE_0) * COPY_STRIDE_BYTES,
+        gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.y, gl_NumWorkGroups.x * gl_NumWorkGroups.y, 0u,
+        gl_LocalInvocationIndex, gl_WorkGroupSize.x);
+}

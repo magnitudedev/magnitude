@@ -5,17 +5,7 @@
 include!("recurrent_stages.rs");
 
 fn cuda() -> Option<Device> {
-    let selected = std::env::var("SEISMIC_TEST_BACKEND").ok().as_deref() == Some("cuda");
-    let catalog = match seismic::Devices::discover(&[]) {
-        Ok(catalog) => catalog,
-        Err(error) if selected => panic!("selected CUDA backend discovery failed: {error}"),
-        Err(_) => return None,
-    };
-    match catalog.open_backend(BackendName::Cuda) {
-        Ok(device) => Some(device),
-        Err(error) if selected => panic!("selected CUDA backend did not open: {error}"),
-        Err(_) => None,
-    }
+    seismic_native_tests::devices(&[BackendName::Cuda]).into_iter().next()
 }
 
 #[test]

@@ -16,21 +16,32 @@ serde.workspace = true
 # Persisted precision policies and objective weights retain their exact f64 identity.
 serde_json = { version = "=1.0.151", features = ["float_roundtrip"] }
 sha2 = "=0.11.0"
+tracing.workspace = true
 
 [features]
-# Development-only tuning pin for bit-exact measurement runs
-# (`native::tuning::pinned`). Enabled only through `magnitude-engine`'s
-# `pinned-tuning` feature by `magnitude-harness`; never by a served engine.
-pinned-tuning = []
 # Development-only tuning survey (`native::tuning::survey`): every admissible
 # configuration of every tuned entry is measured and recorded for replaying
 # the search. Enabled only through `magnitude-engine`'s `tuning-survey`
 # feature by `magnitude-harness`; never by a served engine.
 tuning-survey = []
+# Development-only routing replay (`experts::directory::replay`): eviction
+# over a run's recorded routing. Enabled only through `magnitude-engine`'s
+# `expert-routing` feature by `magnitude-harness`; never by a served engine.
+expert-routing = []
+# Test-only: the controlled execution domain (`fixtures`), its family and its
+# fake expert bank, for the tests of the owners above the domain, and the
+# expert watchers' stall (`starve`). Enabled only as a
+# dev-dependency; never by a served engine.
+fixtures = []
 
+# The report's stacks on x86-64 Linux, unwound through the images' tables
+# without allocating (`diagnostics::stacks::cfi`).
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+gimli = { version = "0.32", default-features = false, features = ["read-core"] }
+
+[dev-dependencies]
 # The catalog's families and headers, for the assessment terms of every
 # catalog target (`assessment::catalog`).
-[dev-dependencies]
 magnitude-family-common = { path = "../families/common", features = ["catalog-headers"] }
 magnitude-family-dflash = { path = "../families/dflash" }
 magnitude-family-gemma4 = { path = "../families/gemma4" }
@@ -43,3 +54,10 @@ magnitude-family-qwen4exp = { path = "../families/qwen4exp" }
 # The recorded machines' topologies, for fit and assessment over the spec's
 # situations (`platform::policy`, `planning::assessment`).
 seismic = { workspace = true, features = ["fixtures"] }
+# The kernels' reference bodies, which the cost function's host test runs
+# (`assessment::cost`).
+seismic-lang.workspace = true
+seismic-std.workspace = true
+
+[build-dependencies]
+sha2 = "=0.11.0"

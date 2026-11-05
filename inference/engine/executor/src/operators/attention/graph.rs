@@ -15,7 +15,10 @@
 
 use crate::operators::output::{CheckedPostNormEntries, PostNormShape, TailEntries, post_norm};
 use crate::operators::{self, InputForm, Join, SublayerInput};
-use crate::programs::graph::{GraphError, draft::GraphDraft};
+use crate::programs::graph::{
+    GraphError,
+    draft::{ControlSource, GraphDraft},
+};
 use crate::programs::native_target_graph::{PackedWeight, WeightOperands, WeightPort};
 use crate::{AttentionBinding, AttentionShape, SelectionShape, SublayerTail};
 use crate::{
@@ -442,6 +445,8 @@ pub(crate) struct AttentionBlock<'a> {
     pub causal_cache: bool,
     /// A selected read's indexer and its history domains.
     pub selection: Option<SelectionBlock>,
+    /// How the graph takes its launch's controls.
+    pub controls: ControlSource,
 }
 
 /// A selected read's indexer at one graph class: its static axes and its
@@ -563,7 +568,8 @@ fn select<'a, G: GraphDraft + 'a>(
         ("C", segments),
         ("B", words),
     ];
-    let mut input = |name: &str| graph.input_for(selection.select, name, &dimensions);
+    let mut input =
+        |name: &str| graph.control_for(block.controls, selection.select, name, &dimensions);
     let tables = IndexerControlPorts {
         window_visible: input("window_visible")?,
         window_destinations: input("window_destinations")?,
@@ -933,7 +939,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                 .value
         }
         (TailEntries::PostNorm(entries), Some(norm)) => {
-            let out_rows = GraphConstant::identity_for_class(graph, rows, Some("M"))?;
+            let out_rows = GraphConstant::row_identity(graph, rows, Some("M"))?;
             let mixed = post_norm(
                 graph,
                 entries,
@@ -1028,10 +1034,10 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     };
     let input = |graph: &mut G, name: &str| match &history {
         AttentionHistoryEntries::Dense { decode, .. } => {
-            graph.input_for(*decode, name, &dimensions)
+            graph.control_for(block.controls, *decode, name, &dimensions)
         }
         AttentionHistoryEntries::AffineK8V4 { decode, .. } => {
-            graph.input_for(*decode, name, &dimensions)
+            graph.control_for(block.controls, *decode, name, &dimensions)
         }
     };
     let decode = decodes(rows);
@@ -1301,7 +1307,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
             AttentionHistoryEntries::Dense { .. } => false,
         };
         if published {
-            let disabled = GraphConstant::i32(graph, &vec![-1; rows as usize])?;
+            let disabled = GraphConstant::row_filled(graph, rows, -1)?;
             destinations = disabled.port().tensor().clone();
             constants.push(disabled);
         }
@@ -1452,17 +1458,14 @@ fn prefill_dimensions(
 }
 
 /// A Visible prefill's absent WorkList bitmap: `[rows, 0]`, its rows the
-/// class's (a row-class constant, `block::class_constants_of`).
+/// class's.
 fn no_selection<G: GraphDraft>(
     graph: &mut G,
     rows: u64,
     row_class: Option<&'static str>,
     constants: &mut Vec<GraphConstant>,
 ) -> Result<WorkflowTensor, GraphError> {
-    let selection = match row_class {
-        Some(class) => GraphConstant::u32_zeros_for_class(graph, rows, 0, class)?,
-        None => GraphConstant::u32_zeros(graph, rows, 0)?,
-    };
+    let selection = GraphConstant::row_zeros(graph, Element::u32(), rows, 0, row_class)?;
     let tensor = selection.port().tensor().clone();
     constants.push(selection);
     Ok(tensor)

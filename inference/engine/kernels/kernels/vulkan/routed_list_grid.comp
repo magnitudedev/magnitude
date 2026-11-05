@@ -1,0 +1,14 @@
+// The workgroup stages the host-written list into device memory and one
+// invocation publishes its dispatch grid.
+#include "lib/streaming/control.glsl"
+#include "../streaming/list.hpp"
+
+void routed_list_grid() {
+    streaming_list_stage(SEISMIC_PTR(SEISMIC_BUFFER_LIST), SEISMIC_LIST_STRIDE_0,
+        element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_STEP)), SEISMIC_PTR(SEISMIC_BUFFER_STAGED), SEISMIC_STAGED_STRIDE_0,
+        gl_LocalInvocationIndex, gl_WorkGroupSize.x);
+    if (gl_LocalInvocationIndex != 0u)
+        return;
+    streaming_list_grid(SEISMIC_PTR(SEISMIC_BUFFER_LIST), SEISMIC_LIST_STRIDE_0,
+        element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_STEP)), SEISMIC_PTR(SEISMIC_BUFFER_GRID), SEISMIC_GRID_STRIDE_0);
+}

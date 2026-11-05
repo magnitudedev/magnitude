@@ -1,5 +1,4 @@
-//! Seismic's Vulkan backend: the direct native route only
-//! (`specs/26-09-24/vulkan-native-backend.md`). Authored GLSL compute
+//! Seismic's Vulkan backend: the direct native route only. Authored GLSL compute
 //! kernels are formed to SPIR-V with the statically linked glslang, sealed
 //! for Seismic's numerical environment, validated with SPIRV-Tools and run on
 //! one queue of the opened device through ash.
@@ -10,18 +9,25 @@ mod device;
 pub mod direct;
 mod facts;
 pub mod formation;
+mod graph_cost;
 mod instance;
 mod memory;
+pub mod probe;
+pub mod reservation;
 pub mod seal;
 pub mod toolchain;
+pub mod topology;
+pub mod transfer;
 
 pub use device::{Device, DeviceHandle, HeapBudget, MemoryBudget, OpenError};
 pub use facts::{
-    Allocation, Calibration, Description, DeviceType, Facts, FormationFacts, Limits, MemoryHeap,
-    MemoryLayout, MemoryType, SubgroupWidth, SUBGROUP_WIDTH,
+    Allocation, Calibration, Description, DeviceType, Facts, FormationTarget, Limits, MemoryHeap,
+    MemoryLayout, MemoryType, Probed, Properties, ReservationForm, Reserving, SUBGROUP_WIDTH,
 };
+pub use graph_cost::{graph_cost, UNMEASURED as UNMEASURED_GRAPH_COST};
+pub use reservation::{ReservedBuffer, VulkanResizer};
 pub use instance::LoaderError;
-pub use memory::{AllocationAccount, Buffer, PlacedStorage};
+pub use memory::{AllocationAccount, Buffer, MemoryAccounts};
 
 /// Enumerate the physical devices against the floor, from their reported
 /// properties alone: discovery opens no logical device. GPUs come first, so
@@ -31,10 +37,48 @@ pub fn discover() -> Result<Vec<Description>, LoaderError> {
     let mut descriptions = instance
         .physical_devices()?
         .into_iter()
-        .map(|physical| facts::describe(instance, physical))
+        .map(|physical| facts::describe(&instance, physical))
         .collect::<Vec<_>>();
     descriptions.sort_by_key(|description| !description.facts.is_gpu());
     Ok(descriptions)
+}
+
+/// Accounts that bound and charge nothing for every kind of a device of
+/// `facts`: a test's, and the probe process's, which allocates only its
+/// probes' few buffers.
+pub(crate) fn unbounded_accounts(facts: &Facts) -> MemoryAccounts {
+    let unbounded = || -> std::sync::Arc<dyn seismic_compiler::executable::MemoryAccount> {
+        std::sync::Arc::new(seismic_compiler::executable::Unbounded)
+    };
+    let kinds = (0..facts.memory.types.len() as u32)
+        .chain([topology::IMPORTED_KIND])
+        .map(|kind| AllocationAccount { kind, account: unbounded() })
+        .collect();
+    MemoryAccounts { host: unbounded(), kinds, driver: unbounded() }
+}
+
+/// The devices meeting the floor a test exercises; none without a loader,
+/// or where the runner requests another backend
+/// (`seismic_lang::registry::requested_test_backend`). A run that requests
+/// Vulkan refuses a failed discovery or finding no such device.
+#[cfg(test)]
+pub(crate) fn test_devices() -> Vec<Description> {
+    let requested = seismic_lang::registry::requested_test_backend();
+    if requested.is_some_and(|backend| backend != seismic_lang::registry::BackendName::Vulkan) {
+        return Vec::new();
+    }
+    let selected = requested.is_some();
+    let devices = match discover() {
+        Ok(devices) => devices,
+        Err(error) => {
+            assert!(!selected, "requested Vulkan discovery failed: {error}");
+            eprintln!("no Vulkan loader: {error}");
+            return Vec::new();
+        }
+    };
+    let devices = devices.into_iter().filter(|description| description.floor.is_ok()).collect::<Vec<_>>();
+    assert!(!selected || !devices.is_empty(), "no eligible requested Vulkan device");
+    devices
 }
 
 #[cfg(test)]
@@ -55,21 +99,18 @@ mod tests {
         };
         for description in devices {
             eprintln!(
-                "{} ({}, {}): floor {:?}, subgroup {:?}, f16 {}, matrix {}, denorm-preserve {}, rte32 {}, shader fma {:?}, uuid {}",
+                "{} ({}, {}): unprobed properties {:?}, subgroup size required {:?}, matrix path {}, shader fma {:?}, uuid {}",
                 description.facts.name,
                 description.facts.driver_name,
                 description.facts.driver_info,
-                description.floor,
-                description.facts.subgroup_width,
-                description.facts.float16,
-                description.facts.matrix,
-                description.facts.denorm_preserve_32,
-                description.facts.rounding_rte_32,
-                description.facts.shader_fma,
+                description.properties(&Probed::default()).as_ref().map(Properties::identity),
+                description.floor.is_ok().then(|| description.facts.requires_subgroup_size()),
+                description.facts.matrix_path,
+                description.facts.shader_fma(),
                 facts::hex(&description.facts.uuid)
             );
             if let Err(reason) = &description.floor {
-                let error = Device::open(description.facts.uuid)
+                let error = Device::open(description.facts.uuid, crate::unbounded_accounts(&description.facts), &Default::default())
                     .err()
                     .expect("a device discovery reports unavailable does not open");
                 eprintln!("  {error}");
@@ -78,7 +119,7 @@ mod tests {
                 }
                 continue;
             }
-            let device = Device::open(description.facts.uuid).unwrap_or_else(|error| {
+            let device = Device::open(description.facts.uuid, crate::unbounded_accounts(&description.facts), &Default::default()).unwrap_or_else(|error| {
                 panic!("a device discovery reports available opens: {error}")
             });
             let buffer = device.allocate(1 << 20, 256, None).expect("allocation");

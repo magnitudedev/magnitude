@@ -1,0 +1,782 @@
+//! What the backend crates and the OS report of the machine, and the rules
+//! that turn those reports into a topology revision.
+//!
+//! [`build`] applies the placement and grant rules to the reports
+//! (`seismic-discovery` gathers them). The rules branch only on what the
+//! reports state (whether a device's memory is the host's, its heaps, the
+//! dedicated memory the OS reports for its adapter, the capabilities its
+//! backend requires), never on a vendor, driver or model.
+//!
+//! Whose memory a device's is, `build` decides once per physical device from
+//! every backend's report of it ([`device_memory`]); every executor of the
+//! device then places by that one decision.
+
+use crate::kind::{KindMemory, KindReport};
+use crate::model::{
+    Availability, Builder, DeviceMemory, DeviceTopology, Diagnostic, ExecutorBuilder, ExecutorKind,
+    ExecutorReport, GrantSource, Limits, OwnKind, OwnPath, PhysicalDeviceId, PhysicalIdentity,
+    Reported, ReportedBy, Revision, StoreId, StoreKind, VolumeId,
+};
+use crate::placement::{place, reserving, Contract, Placing};
+use crate::selector::ExecutorSelector;
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+/// Everything discovery reads, before the rules apply.
+#[derive(Debug)]
+pub struct Reports {
+    /// Host RAM capacity.
+    pub host: Reported<u64>,
+    /// The OS build: the CPU's and Metal's driver.
+    pub os_build: String,
+    pub cpu: CpuReport,
+    pub metal: Vec<MetalReport>,
+    pub cuda: Vec<CudaReport>,
+    pub vulkan: Vec<VulkanReport>,
+    /// The OS's display adapters (DXGI); empty where the OS has no adapter
+    /// interface.
+    pub adapters: Vec<AdapterReport>,
+    pub volumes: Vec<VolumeReport>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug)]
+pub struct CpuReport {
+    pub name: String,
+    /// The CPU as the OS reports it: model, instruction set and caches.
+    pub identity: String,
+    /// Its last-level caches, summed over their instances
+    /// (`seismic-discovery` reads them from the OS).
+    pub cache: Option<Reported<u64>>,
+    pub availability: Availability,
+    pub max_allocation: u64,
+    /// Its one kind, which every contract is allocated in.
+    pub kind: KindReport,
+}
+
+#[derive(Debug)]
+pub struct MetalReport {
+    pub registry_id: u64,
+    pub name: String,
+    /// `MTLDevice.hasUnifiedMemory`: its memory is the host's.
+    pub unified: bool,
+    /// What the backend's kernels require: a compiler accepting one of the
+    /// language versions it emits (`seismic_metal::profile::language`).
+    pub admission: Result<(), String>,
+    /// `seismic_metal::profile::forms_tensor_operations`, for a device the
+    /// backend admits.
+    pub tensor_operations: bool,
+    pub working_set: u64,
+    pub max_allocation: u64,
+    /// Its one kind, which every contract is allocated in.
+    pub kind: KindReport,
+}
+
+#[derive(Debug)]
+pub struct CudaReport {
+    pub uuid: [u8; 16],
+    /// `cuDeviceGetLuid`, where the driver reports one (WDDM): what matches
+    /// the device to the dedicated memory the OS reports for its adapter.
+    pub luid: Option<[u8; 8]>,
+    pub name: String,
+    /// `cuDriverGetVersion`.
+    pub driver: String,
+    /// The compute-capability and driver floors of the backend's kernels.
+    pub admission: Result<(), String>,
+    /// `cuDeviceTotalMem`.
+    pub total: u64,
+    pub max_allocation: u64,
+    /// `CU_DEVICE_ATTRIBUTE_INTEGRATED`, which describes the device.
+    pub integrated: bool,
+    /// `CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE`; none where it reads zero.
+    pub l2: Option<u64>,
+    pub memory: CudaMemory,
+    /// The CUDA devices whose memory it reads and writes directly
+    /// (`cuDeviceCanAccessPeer`).
+    pub peers: Vec<[u8; 16]>,
+    /// The kinds it allocates, each with how it reserves.
+    pub kinds: Vec<KindReport>,
+}
+
+/// Whose memory a CUDA device reports its memory is.
+#[derive(Debug)]
+pub enum CudaMemory {
+    /// The host's: an integrated device (`CU_DEVICE_ATTRIBUTE_INTEGRATED`),
+    /// or one whose memory is an OS NUMA node
+    /// (`CU_DEVICE_ATTRIBUTE_NUMA_CONFIG`).
+    Host,
+    /// Its own, of which the device lets this process use `usable`.
+    Own { usable: Result<u64, String> },
+}
+
+#[derive(Debug)]
+pub struct VulkanReport {
+    pub uuid: [u8; 16],
+    /// Its device type, which describes it.
+    pub kind: ExecutorKind,
+    /// Whether its memory is the host's, as its device type states it
+    /// (`seismic_vulkan::DeviceType::memory_is_host`); none for a type that
+    /// states neither.
+    pub memory_is_host: Option<bool>,
+    pub name: String,
+    /// The device floor: `Err` names the first missing item.
+    pub floor: Result<(), String>,
+    /// `VkDriverId` and the driver version.
+    pub driver: String,
+    pub max_allocation: u64,
+    pub memory: VulkanMemory,
+    /// The kinds it allocates: its memory types, each on its heap, and
+    /// imported host pages where it imports them, each with how it reserves.
+    pub kinds: Vec<KindReport>,
+}
+
+/// A Vulkan device's memory as the backend reports it.
+#[derive(Debug)]
+pub struct VulkanMemory {
+    /// `VkPhysicalDeviceIDProperties::deviceLUID`, when valid: what matches
+    /// the device to the dedicated memory the OS reports for its adapter.
+    pub luid: Option<[u8; 8]>,
+    pub heaps: Vec<VulkanHeap>,
+}
+
+#[derive(Debug)]
+pub struct VulkanHeap {
+    pub bytes: u64,
+    /// `VK_MEMORY_HEAP_DEVICE_LOCAL_BIT`.
+    pub device_local: bool,
+}
+
+/// One display adapter as the OS reports it.
+#[derive(Debug)]
+pub struct AdapterReport {
+    /// The adapter's LUID, in `LUID` memory layout.
+    pub luid: [u8; 8],
+    /// Memory the OS reports as dedicated to the adapter, which it does not
+    /// manage.
+    pub dedicated: u64,
+}
+
+#[derive(Debug)]
+pub struct VolumeReport {
+    pub path: PathBuf,
+    pub id: VolumeId,
+    pub size: Reported<u64>,
+}
+
+fn availability(admission: Result<(), String>) -> Availability {
+    match admission {
+        Ok(()) => Availability::Available,
+        Err(reason) => Availability::Unavailable { reason },
+    }
+}
+
+/// Whether the memory of the GPU of `uuid` is the host's, as each of its
+/// views that states it reports it.
+fn stated_memory(reports: &Reports, uuid: [u8; 16]) -> Vec<bool> {
+    reports
+        .cuda
+        .iter()
+        .filter(|cuda| cuda.uuid == uuid)
+        .map(|cuda| matches!(cuda.memory, CudaMemory::Host))
+        .chain(
+            reports
+                .vulkan
+                .iter()
+                .filter(|vulkan| vulkan.uuid == uuid)
+                .filter_map(|vulkan| vulkan.memory_is_host),
+        )
+        .collect()
+}
+
+/// Whose memory the GPU of `uuid` is, from every report that states it: the
+/// host's or its own when they all agree, undecided when they disagree or
+/// none states it.
+fn device_memory(reports: &Reports, uuid: [u8; 16]) -> DeviceMemory {
+    let stated = stated_memory(reports, uuid);
+    match stated.first() {
+        Some(&host) if stated.iter().all(|&each| each == host) => {
+            if host {
+                DeviceMemory::Host
+            } else {
+                DeviceMemory::Own
+            }
+        }
+        _ => DeviceMemory::Undecided,
+    }
+}
+
+/// The last-level cache of the GPU of `uuid`, as its CUDA view reports it:
+/// Vulkan reports no cache size, so a device without a CUDA view has none.
+fn device_cache(reports: &Reports, uuid: [u8; 16]) -> Option<Reported<u64>> {
+    reports
+        .cuda
+        .iter()
+        .filter(|cuda| cuda.uuid == uuid)
+        .find_map(|cuda| cuda.l2)
+        .map(|bytes| Reported::new(bytes, ReportedBy::CudaL2Cache))
+}
+
+/// The OS adapter LUID of the GPU of `uuid`, as any of its views reports it.
+fn adapter_luid(reports: &Reports, uuid: [u8; 16]) -> Option<[u8; 8]> {
+    reports
+        .vulkan
+        .iter()
+        .filter(|vulkan| vulkan.uuid == uuid)
+        .find_map(|vulkan| vulkan.memory.luid)
+        .or_else(|| {
+            reports
+                .cuda
+                .iter()
+                .filter(|cuda| cuda.uuid == uuid)
+                .find_map(|cuda| cuda.luid)
+        })
+}
+
+/// Why an executor of the GPU of `uuid`, whose memory is undecided, cannot
+/// run: its views state its memory differently, or none states it.
+fn undecided(reports: &Reports, uuid: [u8; 16]) -> String {
+    if stated_memory(reports, uuid).is_empty() {
+        "no backend reports whether its memory is the host's or its own".to_owned()
+    } else {
+        "its backends report its memory differently: as the host's and as its own".to_owned()
+    }
+}
+
+/// The revision `revision` of the machine `reports` describe.
+pub fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
+    let machine = format!("{};ram={}", reports.cpu.identity, reports.host.value);
+    let mut builder = Builder::new(
+        revision,
+        PhysicalIdentity::Host { machine },
+        reports.cpu.cache,
+        reports.host,
+    );
+    let host = builder.host();
+    let host_ram = builder.host_ram();
+
+    // Physical devices, by the identity their drivers share (a GPU's device
+    // UUID, which its CUDA and Vulkan views report alike), each with whose
+    // memory it is. A software Vulkan device (lavapipe) is no device of its
+    // own: it runs on the host's CPU, and is an executor of the host.
+    for metal in &reports.metal {
+        let memory = if metal.unified {
+            DeviceMemory::Host
+        } else {
+            DeviceMemory::Own
+        };
+        builder.physical(PhysicalIdentity::Registry(metal.registry_id), memory, None);
+    }
+    for uuid in reports.cuda.iter().map(|cuda| cuda.uuid).chain(
+        reports
+            .vulkan
+            .iter()
+            .filter(|vulkan| vulkan.kind != ExecutorKind::Cpu)
+            .map(|vulkan| vulkan.uuid),
+    ) {
+        builder.physical(
+            PhysicalIdentity::Uuid(uuid),
+            device_memory(reports, uuid),
+            device_cache(reports, uuid),
+        );
+    }
+
+    // Each GPU's own memory. A device whose memory is its own has its
+    // device-local memory, as each report states it, of which the smallest
+    // report is the store's capacity; a device whose memory is the host's
+    // has the dedicated memory the OS reports for its adapter.
+    let mut own: Vec<(PhysicalIdentity, Reported<u64>)> = Vec::new();
+    for cuda in &reports.cuda {
+        if device_memory(reports, cuda.uuid) == DeviceMemory::Own {
+            own.push((
+                PhysicalIdentity::Uuid(cuda.uuid),
+                Reported::new(cuda.total, ReportedBy::CudaTotalMemory),
+            ));
+        }
+    }
+    for vulkan in &reports.vulkan {
+        if device_memory(reports, vulkan.uuid) != DeviceMemory::Own {
+            continue;
+        }
+        let mut heaps = Vec::new();
+        for id in place(&vulkan.kinds, false, Placing::Fixed(Contract::DeviceOnly)) {
+            if let KindMemory::Heap { index, device_local: true, bytes } = reported_kind(&vulkan.kinds, id).memory {
+                if !heaps.contains(&(index, bytes)) {
+                    heaps.push((index, bytes));
+                }
+            }
+        }
+        let local = heaps.iter().map(|&(_, bytes)| bytes).reduce(|total, bytes| total + bytes);
+        if let Some(bytes) = local {
+            own.push((
+                PhysicalIdentity::Uuid(vulkan.uuid),
+                Reported::new(bytes, ReportedBy::VulkanHeap),
+            ));
+        }
+    }
+    let devices = builder.topology().physical_devices().to_vec();
+    for device in devices {
+        let capacity = match (device.memory(), device.identity()) {
+            (DeviceMemory::Host, PhysicalIdentity::Uuid(uuid)) => {
+                dedicated(&reports.adapters, adapter_luid(reports, *uuid))
+                    .map(|bytes| Reported::new(bytes, ReportedBy::DxgiDedicatedMemory))
+            }
+            (DeviceMemory::Own, identity) => own
+                .iter()
+                .filter(|(of, _)| of == identity)
+                .map(|(_, reported)| *reported)
+                .min_by_key(|reported| reported.value),
+            _ => None,
+        };
+        if let Some(capacity) = capacity {
+            builder.store(StoreKind::DeviceMemory(device.id()), capacity);
+        }
+    }
+
+    for volume in &reports.volumes {
+        let kind = StoreKind::Volume(volume.id.clone());
+        let store = match builder.find_store(&kind) {
+            Some(store) => store,
+            None => builder.store(kind, volume.size),
+        };
+        builder.serve(volume.path.clone(), store);
+    }
+
+    // CPU: both kinds on host RAM, ungranted.
+    let cpu = {
+        let mut executor = builder.executor(ExecutorReport {
+            physical: host,
+            selector: ExecutorSelector::HostCpu,
+            kind: ExecutorKind::Cpu,
+            name: reports.cpu.name.clone(),
+            availability: reports.cpu.availability.clone(),
+            driver: reports.os_build.clone(),
+            limits: Limits {
+                max_allocation: Reported::new(
+                    reports.cpu.max_allocation,
+                    ReportedBy::CpuAddressSpace,
+                ),
+            },
+            tensor_operations: false,
+        });
+        if reports.cpu.availability == Availability::Available {
+            let path = executor.ungranted(host_ram);
+            place_kinds(
+                &mut executor,
+                std::slice::from_ref(&reports.cpu.kind),
+                true,
+                |executor, kind| executor.kind(kind, &[path]),
+            );
+        }
+        executor.id()
+    };
+
+    // Metal: a device whose memory is the host's places as every such
+    // device does, under its recommended working set.
+    for metal in &reports.metal {
+        let physical = builder.device(&PhysicalIdentity::Registry(metal.registry_id));
+        let own = own_memory(&builder, physical);
+        let admission = metal.admission.clone().and_then(|()| {
+            if metal.unified {
+                Ok(())
+            } else {
+                Err("its memory is not the host's, and Metal reports no size for it".into())
+            }
+        });
+        let available = admission.is_ok();
+        let mut executor = builder.executor(ExecutorReport {
+            physical,
+            selector: ExecutorSelector::Metal {
+                registry_id: metal.registry_id,
+            },
+            kind: if metal.unified {
+                ExecutorKind::IntegratedGpu
+            } else {
+                ExecutorKind::DiscreteGpu
+            },
+            name: metal.name.clone(),
+            availability: availability(admission),
+            driver: reports.os_build.clone(),
+            limits: Limits {
+                max_allocation: Reported::new(
+                    metal.max_allocation,
+                    ReportedBy::MetalMaxBufferLength,
+                ),
+            },
+            tensor_operations: metal.tensor_operations,
+        });
+        if available {
+            let paths = host_class_paths(
+                &mut executor,
+                own,
+                host_ram,
+                Reported::new(metal.working_set, ReportedBy::MetalRecommendedWorkingSet),
+                ReportedBy::MetalWorkingSetBeyondDedicated,
+                |before| {
+                    Some(GrantSource::MetalWorkingSet {
+                        registry_id: metal.registry_id,
+                        before,
+                    })
+                },
+            );
+            place_kinds(
+                &mut executor,
+                std::slice::from_ref(&metal.kind),
+                true,
+                |executor, kind| executor.kind(kind, &paths),
+            );
+        }
+    }
+
+    // CUDA: a device whose memory is its own places device storage on it
+    // under its usable memory and upload storage on host RAM (pinned),
+    // ungranted; one whose memory is the host's places as every such device
+    // does, under its total.
+    for cuda in &reports.cuda {
+        let memory = device_memory(reports, cuda.uuid);
+        let physical = builder.device(&PhysicalIdentity::Uuid(cuda.uuid));
+        let own = own_memory(&builder, physical);
+        // CUDA's own report is one of those the device's memory is decided
+        // from, so a decided device's memory is the one CUDA reports.
+        let placement = cuda.admission.clone().and_then(|()| {
+            if memory == DeviceMemory::Undecided {
+                return Err(undecided(reports, cuda.uuid));
+            }
+            match &cuda.memory {
+                CudaMemory::Host => Ok(None),
+                CudaMemory::Own { usable: Ok(usable) } => Ok(Some(*usable)),
+                CudaMemory::Own { usable: Err(error) } => {
+                    Err(format!("its CUDA context could not be created: {error}"))
+                }
+            }
+        });
+        let mut executor = builder.executor(ExecutorReport {
+            physical,
+            selector: ExecutorSelector::Cuda { uuid: cuda.uuid },
+            kind: if cuda.integrated {
+                ExecutorKind::IntegratedGpu
+            } else {
+                ExecutorKind::DiscreteGpu
+            },
+            name: cuda.name.clone(),
+            availability: availability(placement.clone().map(|_| ())),
+            driver: cuda.driver.clone(),
+            limits: Limits {
+                max_allocation: Reported::new(cuda.max_allocation, ReportedBy::CudaTotalMemory),
+            },
+            tensor_operations: false,
+        });
+        // Each kind's paths: on a device whose memory is the host's every
+        // kind is charged alike, along the host-class paths; on one whose
+        // memory is its own, along the path of the memory it lies in.
+        let (alike, own_paths) = match placement {
+            Ok(None) => {
+                let paths = host_class_paths(
+                    &mut executor,
+                    own,
+                    host_ram,
+                    Reported::new(cuda.total, ReportedBy::CudaTotalMemory),
+                    ReportedBy::CudaTotalBeyondDedicated,
+                    // What is left of these grants only the opened executor
+                    // knows (`RuntimeStatus`).
+                    |_| None,
+                );
+                (Some(paths), None)
+            }
+            Ok(Some(usable)) => {
+                let device = executor.granted(
+                    own.expect("a CUDA device whose memory is its own has a store")
+                        .0,
+                    Reported::new(usable, ReportedBy::CudaUsableMemory),
+                    // What is left of it only the opened executor knows.
+                    None,
+                );
+                (None, Some((device, executor.ungranted(host_ram))))
+            }
+            Err(_) => continue,
+        };
+        place_kinds(
+            &mut executor,
+            &cuda.kinds,
+            memory == DeviceMemory::Host,
+            |executor, kind| {
+                let along = match (&alike, own_paths, kind.memory) {
+                    (Some(paths), _, _) => paths.clone(),
+                    (None, Some((device, _)), KindMemory::DeviceMemory) => vec![device],
+                    (None, Some((_, host)), KindMemory::HostRam) => vec![host],
+                    (None, _, memory) => unreachable!(
+                        "a CUDA kind lies in its device's memory or host RAM, not {memory:?}"
+                    ),
+                };
+                executor.kind(kind, &along)
+            },
+        );
+    }
+
+    for vulkan in &reports.vulkan {
+        let memory = device_memory(reports, vulkan.uuid);
+        let physical = if vulkan.kind == ExecutorKind::Cpu {
+            host
+        } else {
+            builder.device(&PhysicalIdentity::Uuid(vulkan.uuid))
+        };
+        let own = own_memory(&builder, physical);
+        let heaps = &vulkan.memory;
+        let placement = vulkan.floor.clone().and_then(|()| match memory {
+            DeviceMemory::Host => Ok(Decided::Host),
+            DeviceMemory::Own => Ok(Decided::Own),
+            DeviceMemory::Undecided => Err(undecided(reports, vulkan.uuid)),
+        });
+        let mut executor = builder.executor(ExecutorReport {
+            physical,
+            selector: ExecutorSelector::Vulkan { uuid: vulkan.uuid },
+            kind: vulkan.kind,
+            name: vulkan.name.clone(),
+            availability: availability(placement.clone().map(|_| ())),
+            driver: vulkan.driver.clone(),
+            limits: Limits {
+                max_allocation: Reported::new(
+                    vulkan.max_allocation,
+                    ReportedBy::VulkanMaxAllocation,
+                ),
+            },
+            tensor_operations: false,
+        });
+        // A device whose memory is the host's: its heaps together state one
+        // total, split across heaps only as a presentation; the heaps'
+        // live budget is attributed along the placement, which every kind is
+        // charged along. A device whose memory is its own: one access path
+        // per device-local heap its kinds lie on, to its own memory, granted
+        // the heap's size; one to host RAM, ungranted, for every kind on
+        // another heap and for imported host pages.
+        let alike = match placement {
+            Ok(Decided::Host) => {
+                let total = heaps.heaps.iter().map(|heap| heap.bytes).sum::<u64>();
+                let all = (0..heaps.heaps.len()).collect::<Vec<_>>();
+                Some(host_class_paths(
+                    &mut executor,
+                    own,
+                    host_ram,
+                    Reported::new(total, ReportedBy::VulkanHeaps),
+                    ReportedBy::VulkanHeapsBeyondDedicated,
+                    |before| {
+                        Some(GrantSource::VulkanHeaps {
+                            uuid: vulkan.uuid,
+                            heaps: all.clone(),
+                            before,
+                        })
+                    },
+                ))
+            }
+            Ok(Decided::Own) => None,
+            Err(_) => continue,
+        };
+        let mut local: HashMap<usize, OwnPath> = HashMap::new();
+        place_kinds(
+            &mut executor,
+            &vulkan.kinds,
+            memory == DeviceMemory::Host,
+            |executor, kind| {
+                let along = match (&alike, kind.memory) {
+                    (Some(paths), _) => paths.clone(),
+                    (None, KindMemory::Heap { index, device_local: true, bytes }) => {
+                        vec![*local.entry(index).or_insert_with(|| {
+                            executor.granted(
+                                own.expect("a device-local heap is its own memory").0,
+                                Reported::new(bytes, ReportedBy::VulkanHeap),
+                                Some(GrantSource::VulkanHeaps {
+                                    uuid: vulkan.uuid,
+                                    heaps: vec![index],
+                                    before: 0,
+                                }),
+                            )
+                        })]
+                    }
+                    (None, KindMemory::Heap { device_local: false, .. } | KindMemory::HostRam) => {
+                        vec![executor.ungranted(host_ram)]
+                    }
+                    (None, KindMemory::DeviceMemory) => {
+                        unreachable!("a Vulkan kind lies on a heap or in host RAM")
+                    }
+                };
+                executor.kind(kind, &along)
+            },
+        );
+    }
+
+    // Transfer paths: each executor's copies between host RAM and the other
+    // stores it reaches, the CPU's file reads from each volume, and a GPU's
+    // copies to another whose memory it reports peer access to.
+    let mut transfers = Vec::new();
+    let topology = builder.topology();
+    for executor in topology.executors() {
+        let mut reached: Vec<StoreId> = Vec::new();
+        for path in topology.access_paths() {
+            if path.executor() == executor.id()
+                && path.store() != host_ram
+                && !reached.contains(&path.store())
+            {
+                reached.push(path.store());
+            }
+        }
+        for store in reached {
+            transfers.push((host_ram, store, executor.id()));
+            transfers.push((store, host_ram, executor.id()));
+        }
+    }
+    if reports.cpu.availability == Availability::Available {
+        for store in topology.stores() {
+            if let StoreKind::Volume(_) = store.kind() {
+                transfers.push((store.id(), host_ram, cpu));
+            }
+        }
+    }
+    let own_store = |uuid: [u8; 16]| {
+        let device = topology
+            .physical_devices()
+            .iter()
+            .find(|device| *device.identity() == PhysicalIdentity::Uuid(uuid))?;
+        topology
+            .stores()
+            .iter()
+            .find(|store| *store.kind() == StoreKind::DeviceMemory(device.id()))
+            .map(|store| store.id())
+    };
+    for cuda in &reports.cuda {
+        let executor = topology.executors().iter().find(|executor| {
+            executor.selector() == ExecutorSelector::Cuda { uuid: cuda.uuid }
+                && *executor.availability() == Availability::Available
+        });
+        let (Some(executor), Some(from)) = (executor, own_store(cuda.uuid)) else {
+            continue;
+        };
+        for &peer in &cuda.peers {
+            if let Some(to) = own_store(peer) {
+                transfers.push((from, to, executor.id()));
+                transfers.push((to, from, executor.id()));
+            }
+        }
+    }
+    for (from, to, by) in transfers {
+        builder.transfer(from, to, by);
+    }
+
+    for diagnostic in &reports.diagnostics {
+        builder.diagnostic(diagnostic.clone());
+    }
+    builder.finish()
+}
+
+/// Whose memory a device's is, once decided.
+#[derive(Clone, Copy)]
+enum Decided {
+    Host,
+    Own,
+}
+
+/// The store of `physical`'s own memory and its capacity, when it has one.
+fn own_memory(builder: &Builder, physical: PhysicalDeviceId) -> Option<(StoreId, Reported<u64>)> {
+    let store = builder.find_store(&StoreKind::DeviceMemory(physical))?;
+    let capacity = builder
+        .topology()
+        .store(store)
+        .expect("a found store is of the revision")
+        .capacity();
+    Some((store, capacity))
+}
+
+/// The kind of `id` among a backend's `kinds`.
+fn reported_kind(kinds: &[KindReport], id: u32) -> &KindReport {
+    kinds
+        .iter()
+        .find(|kind| kind.id == id)
+        .expect("the rule places only kinds a backend reports")
+}
+
+/// Apply the placement rule to a backend's `kinds`: every contract and shape
+/// is placed, and every kind placed anywhere joins the executor by `add`, in
+/// the order the placements name them, which is the order their paths are
+/// made in.
+fn place_kinds(
+    executor: &mut ExecutorBuilder<'_>,
+    kinds: &[KindReport],
+    memory_is_host: bool,
+    mut add: impl FnMut(&mut ExecutorBuilder<'_>, &KindReport) -> OwnKind,
+) {
+    let mut added: Vec<(u32, OwnKind)> = Vec::new();
+    for placing in Placing::ALL {
+        let mut placed = Vec::new();
+        for id in place(kinds, memory_is_host, placing) {
+            let own = match added.iter().find(|(kind, _)| *kind == id) {
+                Some((_, own)) => *own,
+                None => {
+                    let own = add(executor, reported_kind(kinds, id));
+                    added.push((id, own));
+                    own
+                }
+            };
+            placed.push(own);
+        }
+        executor.place(placing, &placed);
+        if let Placing::Reserved(contract) = placing {
+            executor.reserves(contract, reserving(kinds, memory_is_host, contract));
+        }
+    }
+}
+
+/// The access paths of an executor of a device whose memory is the host's,
+/// which every kind of it is charged along: its own memory `own` (the store
+/// of the dedicated memory the OS reports for its adapter, and that
+/// memory's size), where it has some, under the lesser of it and the
+/// executor's `total`, then host RAM under what `total` leaves beyond it
+/// (`beyond`). `status` names each path's live grant source from the bytes
+/// placed ahead of it.
+fn host_class_paths(
+    executor: &mut ExecutorBuilder<'_>,
+    own: Option<(StoreId, Reported<u64>)>,
+    host_ram: StoreId,
+    total: Reported<u64>,
+    beyond: ReportedBy,
+    status: impl Fn(u64) -> Option<GrantSource>,
+) -> Vec<OwnPath> {
+    let mut paths = Vec::new();
+    let mut before = 0;
+    let mut grant =
+        |executor: &mut ExecutorBuilder<'_>, store: StoreId, reported: Reported<u64>| {
+            let path = executor.granted(store, reported, status(before));
+            before += reported.value;
+            paths.push(path);
+        };
+    match own {
+        Some((store, dedicated)) => {
+            grant(
+                executor,
+                store,
+                if dedicated.value <= total.value {
+                    dedicated
+                } else {
+                    total
+                },
+            );
+            if total.value > dedicated.value {
+                grant(
+                    executor,
+                    host_ram,
+                    Reported::new(total.value - dedicated.value, beyond),
+                );
+            }
+        }
+        None => grant(executor, host_ram, total),
+    }
+    paths
+}
+
+/// The dedicated memory the OS reports for the adapter of `luid`, when it
+/// reports some.
+fn dedicated(adapters: &[AdapterReport], luid: Option<[u8; 8]>) -> Option<u64> {
+    let luid = luid?;
+    adapters
+        .iter()
+        .find(|adapter| adapter.luid == luid)
+        .map(|adapter| adapter.dedicated)
+        .filter(|bytes| *bytes > 0)
+}

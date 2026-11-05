@@ -5,7 +5,7 @@
   "private": true,
   "scripts": {
     "dev": "bun run ../packages/version/scripts/generate-version.ts --dev && bun run src/index.ts",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
     "test": "bunx --bun vitest run"
   },
   "dependencies": {

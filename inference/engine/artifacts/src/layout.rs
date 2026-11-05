@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BoundaryRule {
@@ -98,6 +99,31 @@ impl InputLayout {
         }
         Ok(end)
     }
+    /// The prompt group's chunks after the chunk that ends at `start`: at
+    /// most `count`, each of at most `rows` rows and ending on a legal
+    /// boundary ([`Self::chunk_end`]), none past `stop`, the last at the
+    /// input's end. The one grouping of a prompt's chunks, for the service
+    /// (`Generation`'s planned prefill) and the evaluation harness alike.
+    pub fn group_chunks(
+        &self,
+        start: usize,
+        rows: usize,
+        stop: Option<usize>,
+        count: usize,
+    ) -> Result<Vec<Range<usize>>, String> {
+        let mut chunks = Vec::new();
+        let mut position = start;
+        while chunks.len() < count && position < self.count {
+            let allowance = rows.min(stop.map_or(usize::MAX, |stop| stop.saturating_sub(position)));
+            if allowance == 0 {
+                break;
+            }
+            let end = self.chunk_end(position, self.count, allowance)?;
+            chunks.push(position..end);
+            position = end;
+        }
+        Ok(chunks)
+    }
     pub fn language(&self, position: usize) -> Result<bool, String> {
         if position > i32::MAX as usize {
             return Err("invalid language history position".into());
@@ -107,5 +133,22 @@ impl InputLayout {
             .iter()
             .filter(|s| s.start <= position && position < s.end)
             .all(|s| s.language_history))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InputLayout;
+
+    /// A group's chunks follow the chunk before them, at most `count`, cut
+    /// at the stop and ending at the prompt's end.
+    #[test]
+    fn group_chunks_follow_the_chunk_before_them() {
+        let layout = InputLayout::new(1300, Vec::new()).unwrap();
+        assert_eq!(layout.group_chunks(512, 512, None, 8).unwrap(), vec![512..1024, 1024..1300]);
+        assert_eq!(layout.group_chunks(512, 512, None, 1).unwrap(), vec![512..1024]);
+        assert_eq!(layout.group_chunks(512, 512, Some(700), 8).unwrap(), vec![512..700]);
+        assert_eq!(layout.group_chunks(512, 512, Some(512), 8).unwrap(), Vec::new());
+        assert_eq!(layout.group_chunks(1300, 512, None, 8).unwrap(), Vec::new());
     }
 }

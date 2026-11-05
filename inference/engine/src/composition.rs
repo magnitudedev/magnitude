@@ -226,23 +226,23 @@ pub fn load_in_process<L>(
         |unprepared| {
             if let Some(began) = preparing.take() {
                 let began: std::time::Instant = began;
-                eprintln!(
-                    "magnitude-engine: kernel preparation ended in {:.3} s",
+                tracing::info!(
+                    "kernel preparation ended in {:.3} s",
                     began.elapsed().as_secs_f64()
                 );
             }
             load(unprepared)
         },
         || {
-            eprintln!("magnitude-engine: kernel preparation began");
+            tracing::info!("kernel preparation began");
             preparing.set(Some(std::time::Instant::now()));
             start_worker_process(worker)
         },
         prepare_progress,
     )?;
     if let Preparation::Incomplete(error) = preparation {
-        eprintln!(
-            "magnitude-engine: kernel preparation did not finish ({error}); the load serves \
+        tracing::warn!(
+            "kernel preparation did not finish ({error}); the load serves \
              canonical defaults for the units without a stored tuning record"
         );
     }
@@ -270,7 +270,7 @@ pub fn start_in_process(
             .name("magnitude-worker".into())
             .spawn(move || {
                 let exit = run_worker(worker_manifest, unprepared, worker_end);
-                eprintln!("magnitude-engine: in-process worker exited: {exit:?}");
+                tracing::info!("in-process worker exited: {exit:?}");
             })
             .map_err(|error| LoadError::Internal {
                 reason: error.to_string(),

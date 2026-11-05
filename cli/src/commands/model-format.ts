@@ -13,7 +13,13 @@ import {
   localModelServingProfile,
   localModelServingState,
 } from "@magnitudedev/client-common"
-import { findLocalModelById, type CatalogLocalModel, type LocalModel, type ModelCatalogState, type ModelId } from "@magnitudedev/sdk"
+import {
+  findLocalModelById,
+  type CatalogLocalModel,
+  type LocalModel,
+  type ModelCatalogState,
+  type ModelId,
+} from "@magnitudedev/sdk"
 import { Effect, Option, Schema } from "effect"
 import { addressableModels } from "./inference-client"
 import { formatContext } from "./inference-format"

@@ -103,10 +103,10 @@ fn canonical_formation_alone_serves_a_legal_choice_without_building_observations
             NumericalRequirement::BitExact,
         )
         .unwrap();
-        let formed = device.programs_formed();
+        let formed = device.programs_formed().programs;
         assert!(unprepared.terminal().is_err());
         assert_eq!(
-            device.programs_formed(),
+            device.programs_formed().programs,
             formed,
             "a record cannot compile a missing default"
         );
@@ -117,7 +117,7 @@ fn canonical_formation_alone_serves_a_legal_choice_without_building_observations
         )
         .unwrap();
         search.prepare_defaults(&mut points).unwrap();
-        let formed = device.programs_formed();
+        let formed = device.programs_formed().programs;
         // From its mandatory work on the unit holds a legal served choice:
         // the canonical default, with its unmeasured scope explicit.
         let result = search.terminal().unwrap();
@@ -136,18 +136,21 @@ fn canonical_formation_alone_serves_a_legal_choice_without_building_observations
         ));
         assert_eq!(result, search.terminal().unwrap());
         assert_eq!(
-            device.programs_formed(),
+            device.programs_formed().programs,
             formed,
             "the record reuses the prepared default"
         );
     }
 }
 
-/// A launch-detail trace times every launch of a batch however many it
-/// holds: more launches than one Metal sample buffer has pairs for take
-/// further pages of samples.
-#[test]
-fn a_launch_trace_times_more_launches_than_one_sample_buffer_holds() {
+/// Launch pairs Metal lets one process sample at once: 32 sample buffers
+/// of 2048 pairs (`seismic-metal` `tests/sample_buffers.rs`).
+const SAMPLED_PAIRS: usize = 32 * 2_048;
+
+/// Times `batches` batches of `launches` launches each under one
+/// launch-detail trace, submitted back to back and collected once: every
+/// launch is timed, each after the one before, and the results are right.
+fn time_batches(batches: usize, launches: usize) {
     let devices = Devices::discover(&[]).unwrap();
     let Ok(device) = devices.open_backend(BackendName::Metal) else {
         return;
@@ -160,30 +163,53 @@ fn a_launch_trace_times_more_launches_than_one_sample_buffer_holds() {
     let input = Tensor::from_host(&device, Element::f32(), &[2, 2], &bytes).unwrap();
     // SAFETY: the authored entry writes every f32 result element.
     let mut result = unsafe { Tensor::uninitialized(&device, Element::f32(), &[2, 2]) }.unwrap();
-    // Two pages of launch pairs (Metal's largest sample buffer holds 2048
-    // pairs) and part of a third.
-    let launches = 2 * 2_048 + 52;
     let trace = device.trace_submissions(seismic::TraceDetail::Launches).unwrap();
-    let mut batch = NativeTensorBatch::new(&device);
-    for _ in 0..launches {
-        batch
-            .push(
-                &rows,
-                scale_rows::Args { x: &input, factor: 3.0 },
-                scale_rows::OutputArgs { value: &mut result },
-            )
-            .unwrap();
+    let mut completions = Vec::new();
+    for _ in 0..batches {
+        let mut batch = NativeTensorBatch::new(&device);
+        for _ in 0..launches {
+            batch
+                .push(
+                    &rows,
+                    scale_rows::Args { x: &input, factor: 3.0 },
+                    scale_rows::OutputArgs { value: &mut result },
+                )
+                .unwrap();
+        }
+        completions.push(batch.submit().unwrap());
     }
-    batch.submit().unwrap().wait().unwrap();
     let submissions = trace.collect().unwrap();
-    let timed = submissions
+    for completion in completions {
+        completion.wait().unwrap();
+    }
+    let intervals = submissions
         .iter()
         .flat_map(|submission| &submission.launches)
-        .filter(|launch| launch.device.is_some_and(|(start, end)| end >= start))
-        .count();
-    assert_eq!(timed, launches);
+        .map(|launch| launch.device.expect("every launch is timed"))
+        .collect::<Vec<_>>();
+    assert_eq!(intervals.len(), batches * launches);
+    assert!(intervals.iter().all(|(start, end)| end >= start));
+    assert!(
+        intervals.windows(2).all(|pair| pair[1].0 >= pair[0].1),
+        "each launch runs after the one before"
+    );
     assert_eq!(
         result.read_to_host().unwrap(),
         values.map(|value| value * 3.0).iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>()
     );
+}
+
+/// One batch with more launches than the process can sample at once
+/// commits its command buffers page by page and reuses the pages.
+#[test]
+fn a_launch_trace_times_a_batch_longer_than_every_sample_buffer() {
+    time_batches(1, SAMPLED_PAIRS + 2_048 + 52);
+}
+
+/// Batches that together take more pages than the process can hold, never
+/// collected in between, reuse the pages of the completed ones.
+#[test]
+fn a_launch_trace_times_batches_past_every_sample_buffer() {
+    // Two pages each, 80 in all.
+    time_batches(40, 2_049);
 }

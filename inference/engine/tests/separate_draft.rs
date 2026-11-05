@@ -369,6 +369,7 @@ fn header_only_assessment_charges_what_a_load_commits() {
     let structure = AssessmentStructure::discover(
         &catalog,
         DeviceRequest::Automatic,
+        None,
         MemoryReserves::standard(),
         policy(),
         standard_service_limits(),

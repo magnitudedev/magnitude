@@ -1,3 +1,5 @@
+mod common;
+
 use magnitude_kernels::{sample_rows, shape_rows};
 
 const ROWS: usize = 3;
@@ -129,15 +131,14 @@ fn philox_score(value: f32, token: u32, draw: [u32; 6]) -> f32 {
 #[ignore = "Seismic reference math lacks the IDX-to-I32 cast required by Hn=64 history matching"]
 fn portable_shaping_matches_the_ordered_host_reference() {
     use seismic_lang::{
-        checked::{check_source, SourceFile, SourceSet},
+        checked::{SourceFile, SourceSet},
         interp::{Arg, Interpreter, TensorData},
         types::DType,
     };
-    let module = check_source(SourceSet::new(vec![SourceFile {
+    let module = crate::common::check(SourceSet::new(vec![SourceFile {
         path: "sampling.seismic".into(),
         text: include_str!("../kernels/sampling.seismic").into(),
-    }]))
-    .expect("shape_rows source must check independently");
+    }]));
     let logical = module
         .entry(
             module.entry_named("shape_rows").unwrap(),

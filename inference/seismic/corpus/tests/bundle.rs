@@ -57,8 +57,9 @@ fn checked_scenarios_round_trip_through_bundles() {
         let Ok(checked) = check_source(sources) else {
             continue;
         };
-        let encoded = encode_checked_bundle(&checked);
-        match decode_checked_bundle(&encoded) {
+        // Held for the process, as a build embeds a bundle.
+        let encoded: &'static [u8] = encode_checked_bundle(&checked).leak();
+        match decode_checked_bundle(encoded) {
             Ok(decoded) if encode_checked_bundle(&decoded) == encoded => round_tripped += 1,
             Ok(_) => failures.push(format!("{name}: re-encoding differs")),
             Err(error) => failures.push(format!("{name}: {error}")),

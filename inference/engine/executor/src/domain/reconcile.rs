@@ -13,10 +13,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     ) -> Result<(), DomainError> {
         // A poisoned sequence's outputs are discarded like an orphan's: its
         // accepted state returns, and its sequence fails.
-        if let Outcome::TableReadFailed(error) = &pending.outcome {
+        if let Outcome::WeightReadFailed(error) = &pending.outcome {
             let error = error.clone();
             self.abort(pending)?;
-            return Err(DomainError::TableRead(error));
+            return Err(DomainError::WeightRead(error));
+        }
+        // An interrupted outcome is aborted and re-run, never reconciled.
+        if matches!(pending.outcome, Outcome::Interrupted { .. }) {
+            self.abort(pending)?;
+            return Err(DomainError::invariant("an interrupted outcome is reconciled"));
         }
         if matches!(pending.outcome, Outcome::Head { .. }) {
             // A head commits exactly its entry rows; its chained proposal
@@ -30,10 +35,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             if pending.advance.is_none() && self.head_reads_target() {
                 return Ok(());
             }
-            let advance = pending
-                .advance
-                .take()
-                .ok_or_else(|| DomainError::invariant("head outcome has no owned advance"))?;
+            let Some(Advance::Step(advance)) = pending.advance.take() else {
+                return Err(DomainError::invariant("head outcome has no owned advance"));
+            };
             let (OwnedAdvanceResolution::Aborted(state) | OwnedAdvanceResolution::Committed(state)) =
                 advance
                     .commit(decision.accepted_rows)
@@ -109,35 +113,44 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 }
                 Err((state, error)) => {
                     self.head.insert(request, state);
-                    self.target.insert(request, advance.abort());
+                    if let Some(state) = advance.abort() {
+                        self.target.insert(request, state);
+                    }
                     return Err(error.into());
                 }
             }
         }
-        match advance.commit(decision.accepted_rows) {
-            Ok(
-                OwnedAdvanceResolution::Aborted(state) | OwnedAdvanceResolution::Committed(state),
-            ) => {
-                self.target.insert(request, state);
-                let boundary = match &pending.outcome {
-                    Outcome::Forward { rows } => rows
-                        .last()
-                        .and_then(|row| row.features.as_ref())
-                        .and_then(FeatureRef::boundary)
-                        .cloned(),
-                    _ => None,
-                };
-                self.input
-                    .get_mut(&request)
-                    .expect("resident request has input")
-                    .boundary = boundary;
-                Ok(())
-            }
-            Err((state, error)) => {
-                self.target.insert(request, state);
-                Err(error.into())
-            }
+        let published = match advance {
+            Advance::Step(advance) => match advance.commit(decision.accepted_rows) {
+                Ok(
+                    OwnedAdvanceResolution::Aborted(state)
+                    | OwnedAdvanceResolution::Committed(state),
+                ) => Some(state),
+                Err((state, error)) => {
+                    self.target.insert(request, state);
+                    return Err(error.into());
+                }
+            },
+            // Its chain holds its rows (`ExecutorDomain::chain`).
+            Advance::Chained => None,
+            Advance::Chain(chain) => Some(chain.commit()),
+        };
+        if let Some(state) = published {
+            self.target.insert(request, state);
         }
+        let boundary = match &pending.outcome {
+            Outcome::Forward { rows } => rows
+                .last()
+                .and_then(|row| row.features.as_ref())
+                .and_then(FeatureRef::boundary)
+                .cloned(),
+            _ => None,
+        };
+        self.input
+            .get_mut(&request)
+            .expect("resident request has input")
+            .boundary = boundary;
+        Ok(())
     }
 
     /// Cancellation while completion is already available makes no physical
@@ -145,7 +158,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn abort(&mut self, pending: PendingOperationOutcome) -> Result<(), DomainError> {
         let conflicting_owner = match &pending.outcome {
             Outcome::Head { .. } => self.head.contains_key(&pending.request),
-            Outcome::Forward { .. } | Outcome::TableReadFailed(_) => {
+            Outcome::Forward { .. } | Outcome::WeightReadFailed(_) | Outcome::Interrupted { .. } => {
                 self.target.contains_key(&pending.request)
                     || (pending.primed.is_some() && self.head.contains_key(&pending.request))
             }
@@ -160,20 +173,32 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.head.insert(pending.request, primed.abort());
         }
         if let Some(advance) = pending.advance {
-            match pending.outcome {
-                Outcome::Head { .. } => {
-                    self.head.insert(pending.request, advance.abort());
-                }
-                Outcome::Forward { .. } | Outcome::TableReadFailed(_) => {
-                    self.target.insert(pending.request, advance.abort());
-                }
+            let lane = match pending.outcome {
+                Outcome::Head { .. } => &mut self.head,
+                Outcome::Forward { .. } | Outcome::WeightReadFailed(_) | Outcome::Interrupted { .. } => &mut self.target,
                 Outcome::Encode { .. } => {
                     return Err(DomainError::invariant(
                         "stateless outcome unexpectedly owns sequence state",
                     ));
                 }
+            };
+            // A chain's earlier chunk returns nothing: its chain holds the
+            // state, released when its holder is (`release_chain`, `close`).
+            if let Some(state) = advance.abort() {
+                lane.insert(pending.request, state);
             }
         }
         Ok(())
+    }
+}
+
+impl Advance {
+    /// The accepted state an aborted outcome returns, when it holds one.
+    fn abort(self) -> Option<SequenceState> {
+        match self {
+            Self::Step(advance) => Some(advance.abort()),
+            Self::Chained => None,
+            Self::Chain(chain) => Some(chain.abort()),
+        }
     }
 }

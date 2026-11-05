@@ -695,6 +695,7 @@ mod tests {
                     rotation_bytes: 0,
                 };
                 configurations.push(ConfigurationRecord {
+                    launches: Vec::new(),
                     formation: None,
                     configuration: Configuration {
                         statics: Default::default(),
@@ -727,7 +728,6 @@ mod tests {
                 })
                 .collect(),
             requirement: crate::native::tune::NumericalRequirement::BitExact,
-            measurement_identity: String::new(),
             observations: Vec::new(),
             served: Vec::new(),
             reselection: None,
@@ -757,6 +757,7 @@ mod tests {
             method: TuningMethod::Survey { samples: 15 },
             time: TuningTime::default(),
             coverage: None,
+            default_launches: Vec::new(),
         };
         Recording::new(&result).unwrap()
     }

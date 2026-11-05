@@ -3,10 +3,11 @@
 // work item per row. `routed_expand_rows`: work item (x, y) owns feature
 // block x of ROWS features; y < M * K is choice (m, k), whose expert gate/up
 // rows it expands against row m, and y = M * K is the shared expert, whose
-// rows it expands against every row. Each product is
-// A(silu(gs * gate) * (us * up)): a choice's scales its expert's, 1 where a
-// port is absent and for the shared expert.
+// rows it expands against every row. Each product is the SiLU `glu` of
+// gs * gate and us * up: a choice's scales its expert's, 1 where a port is
+// absent and for the shared expert.
 
+use lib::core::functions;
 use lib::projection::projection;
 use lib::routed::routed;
 use seismic::cpu::Weights;
@@ -101,6 +102,7 @@ fn routed_expand_rows<L: Isa, E: Elements>(
             first,
             x,
             q8,
+            functions::SILU,
             (
                 routed::scale_factor(cx.dim_gs(), |e| gate_scale.get([e]), expert),
                 routed::scale_factor(cx.dim_us(), |e| up_scale.get([e]), expert),
@@ -125,6 +127,7 @@ fn routed_expand_rows<L: Isa, E: Elements>(
             rows.start,
             &staged[row * h..(row + 1) * h],
             q8,
+            functions::SILU,
             // The shared expert binds no per-expert scale.
             (1.0, 1.0),
             out,

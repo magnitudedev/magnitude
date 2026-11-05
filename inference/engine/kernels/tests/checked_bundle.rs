@@ -58,7 +58,8 @@ fn embedded_kernel_bundle_matches_its_checked_sources() {
 #[test]
 fn standard_library_round_trips_byte_identically() {
     let checked = check_source(seismic_std::sources()).expect("the standard library checks");
-    let encoded = encode_checked_bundle(&checked);
-    let decoded = decode_checked_bundle(&encoded).expect("the standard library bundle decodes");
+    // Held for the process, as a build embeds a bundle.
+    let encoded: &'static [u8] = encode_checked_bundle(&checked).leak();
+    let decoded = decode_checked_bundle(encoded).expect("the standard library bundle decodes");
     assert!(encode_checked_bundle(&decoded) == encoded);
 }

@@ -22,10 +22,7 @@ use std::sync::OnceLock;
 pub const ROOT: &str = "MAGNITUDE_CATALOG_HEADERS";
 
 /// The catalog lock, of which the export must be.
-const LOCK: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../../catalog/models.lock.json"
-);
+const LOCK: &[u8] = include_bytes!("../../../../catalog/models.lock.json");
 
 /// The catalog header export.
 pub fn root() -> PathBuf {
@@ -54,7 +51,7 @@ fn export() -> &'static HeaderIndex {
             &std::fs::read(&path).unwrap_or_else(|error| panic!("{path:?}: {error}")),
         )
         .unwrap_or_else(|error| panic!("{path:?}: {error}"));
-        let lock = lock_digest(&std::fs::read(LOCK).unwrap());
+        let lock = lock_digest(LOCK);
         assert_eq!(
             index.lock, lock,
             "{path:?} is an export of another catalog lock; export this tree's"

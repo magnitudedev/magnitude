@@ -11,6 +11,8 @@ import pytest
 from bench_support import character_lengths
 from magnitude_bench import report, runner
 from magnitude_bench.adapters.base import Adapter
+from magnitude_bench.adapters.llama_cpp import LlamaCpp
+from magnitude_bench.adapters.native import Native
 from magnitude_bench.client import Observation
 from magnitude_bench.models import Target
 from magnitude_bench.options import EngineOptions, Watchdog
@@ -232,6 +234,58 @@ def test_reports_exclude_truncation_but_keep_context_semantic_invalidity():
     summary = report.summarize(rows, "failed", "command", "id", 6)
     assert [r["eligible"] for r in summary["rows"]] == [2, 1]
     assert summary["outcomes"]["truncated"] == 2
+
+
+def test_the_expert_bank_is_followed_over_each_pass():
+    def sample(at, slots, experts=None, tables=None, host=None, label="block-0", target="magnitude"):
+        """An observation as the engine's census serializes it: each holding's own last resize."""
+        def wire(resize):  # a BankResize: Shrank by `by` to `to` for its cause, or Grew by `by` from `from`
+            if resize is None:
+                return None
+            if resize["cause"] == "Growth":
+                return {"Grew": {"from": resize["from"], "by": resize["to"] - resize["from"],
+                                 "at_unix_ms": resize["at_unix_ms"]}}
+            return {"Shrank": {"cause": resize["cause"], "to": resize["to"], "by": resize["from"] - resize["to"],
+                               "at_unix_ms": resize["at_unix_ms"]}}
+
+        bank = None if slots is None else {
+            "experts": 256, "slots": slots, "floor": 26, "ceiling": 256, "stores": [], "disk_bytes": 0,
+            "host": {"slots": 1, "ceiling": 256, "bytes": 1, "fill": "Filled", "last_resize": wire(host)},
+            "tables": [{"records": 3, "floor": 1, "ceiling": 4, "bytes": 3, "last_resize": wire(resize)}
+                       for resize in (tables or [None])],
+            "last_resize": wire(experts),
+        }
+        return {"target": target, "label": label, "at": at,
+                "observation": {"census": {"serving": {"group_places": 1, "group_capacity": 8, "experts": bank}}}}
+
+    def resize(at, before, after, cause):
+        """A resize as the summary reads it: its cause, its size before and after, and when."""
+        return {"cause": cause, "from": before, "to": after, "at_unix_ms": at}
+
+    grown, hosted = resize(1, 64, 96, "Growth"), resize(2, 0, 1, "Growth")
+    reclaimed = resize(4, 96, 80, "Reclaim")
+    table = resize(5, 2, 3, "Growth")
+    samples = [
+        sample(2.0, 96, grown, host=hosted), sample(1.0, 64), sample(3.0, 96, grown, host=hosted),
+        sample(4.0, 80, reclaimed, host=hosted),
+        sample(5.0, 80, reclaimed, tables=[table], host=hosted),  # a table's, latest of all
+        sample(6.0, None, label="block-1"),  # a load without a bank
+        # The adapter's own observation, as it reads its log: it states no bank.
+        {"target": "llama.cpp", "label": "block-0", "at": 1.0,
+         "observation": {"state": {"kv_bytes": 1 << 20, "recurrent_bytes": 0}}},
+    ]
+    banks_of = {"magnitude": lambda observation: Native.expert_bank(None, observation),
+                "llama.cpp": lambda observation: LlamaCpp.expert_bank(None, observation)}
+    (bank,) = report.expert_banks(samples, banks_of)
+    assert bank == {"target": "magnitude", "label": "block-0", "first_slots": 64, "last_slots": 80,
+                    "min_slots": 64, "max_slots": 96, "floor": 26, "ceiling": 256,
+                    "resizes": {"experts": {"Growth": 1, "Reclaim": 1}, "host": {"Growth": 1},
+                                "table 0": {"Growth": 1}},
+                    "latest_resize": {"holding": "table 0", **table}}
+    shown = report.markdown({**report.summarize([], "completed", "c", "id", 0), "mode": "tools",
+                             "expert_banks": [bank]})
+    assert ("| magnitude | block-0 | 64 → 80 | 64–96 | 26 | 256 | experts Growth 1, Reclaim 1; host Growth 1; "
+            "table 0 Growth 1 | table 0 Growth 2 → 3 |") in shown
 
 
 async def test_sigterm_reaches_managed_cleanup(monkeypatch):

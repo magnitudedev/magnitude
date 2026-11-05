@@ -232,7 +232,7 @@ fn matrix_operand_preserves_pre_and_post_plane_views() {
     .enumerate()
     {
         unsafe {
-            encoder.setBuffer_offset_atIndex(Some(buffer.raw()), 0, slot);
+            encoder.setBuffer_offset_atIndex(Some(&buffer.raw()), 0, slot);
         }
     }
     unsafe {

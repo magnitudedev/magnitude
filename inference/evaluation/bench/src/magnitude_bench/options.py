@@ -34,11 +34,9 @@ class MagnitudeOptions(Record):
     build: SourceBuild | None = None
     harness: Path = INFERENCE / "target" / "release" / "magnitude-harness"
     device: str = "auto"
-    #: The engine's kernel cache (compiled kernels and stored tuning) exactly as given.
+    #: The engine's kernel cache (compiled kernels, stored tuning and the machine's cost
+    #: measurements) exactly as given; the engine's own default when unset.
     cache_dir: Path | None = None
-    #: A persistent root under which each model and engine binary keeps its own kernel cache
-    #: (``<root>/<model>/<binary sha256 prefix>``), as a user's installation keeps one.
-    kernel_cache_root: Path | None = None
     prefill_tokens: int | None = Field(default=None, gt=0)
     #: Proposals per draft for the catalog drafter; the engine's own when unset.
     mtp_proposals: int | None = Field(default=None, gt=0)
@@ -62,8 +60,6 @@ class MagnitudeOptions(Record):
     def _tuning_requests_need_the_trace(self):
         if not self.tuning_trace and (self.tuning_seconds is not None or self.fresh_tuning):
             raise ValueError("a tuning budget or fresh tuning needs the tuning trace to record it")
-        if self.cache_dir is not None and self.kernel_cache_root is not None:
-            raise ValueError("give either a kernel cache directory or a kernel cache root")
         return self
 
 

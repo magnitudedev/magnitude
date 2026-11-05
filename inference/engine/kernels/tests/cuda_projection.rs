@@ -4,6 +4,8 @@
 //! portable body by the reference interpreter. Tests return early without a
 //! CUDA device.
 
+mod common;
+
 use magnitude_kernels::{
     dense_expand, dense_output, embedding_rows, readout_features_rows, readout_head_rows,
     readout_project_rows, readout_selected_rows, sample_rows, shape_rows,
@@ -996,7 +998,7 @@ fn features_and_selected_rows_match_host_model(format: Format) {
 /// interpreter over the same mma16 bytes agrees with it.
 fn dense_expand_host_model_matches_portable_body(format: Format) {
     use seismic_lang::{
-        checked::{check_source, SourceFile},
+        checked::{SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -1016,7 +1018,7 @@ fn dense_expand_host_model_matches_portable_body(format: Format) {
         path: "functions.seismic".into(),
         text: include_str!("../kernels/functions.seismic").into(),
     });
-    let module = check_source(sources).unwrap();
+    let module = crate::common::check(sources);
     let gate = weight(&device, format, f, h, &mut rng);
     let up = weight(&device, format, f, h, &mut rng);
     let case = DenseCase::new(o, h, f, &mut rng);
@@ -1193,9 +1195,10 @@ fn embedding_rows_of_rows16_slots_equal_the_mma16_table(format: Format) {
     }
 }
 
-/// A read through a directory reads each selected row's slot (row 0 for a
-/// row without one and for a failed selection), exactly as a direct read of
-/// that slot does (`projection.rs` covers the rows16 backends).
+/// A read through a directory reads each selected row's slot (zeros for a
+/// row without one and for a failed selection, as a direct read of no row),
+/// exactly as a direct read of that slot does (`projection.rs` covers the
+/// rows16 backends).
 fn embedding_rows_read_the_slots_their_directory_names(format: Format) {
     let Some(device) = cuda() else { return };
     let mut rng = Rng(6);
@@ -1233,7 +1236,7 @@ fn embedding_rows_read_the_slots_their_directory_names(format: Format) {
         let slots = selected
             .chunks_exact(2)
             .flat_map(|pair| {
-                let slot = usize::try_from(pair[0]).map_or(0, |row| directory_values[row].max(0));
+                let slot = usize::try_from(pair[0]).map_or(-1, |row| directory_values[row]);
                 [slot, pair[1]]
             })
             .collect::<Vec<_>>();

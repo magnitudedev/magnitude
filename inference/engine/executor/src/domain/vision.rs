@@ -8,11 +8,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// The flight holds `bindings` until `finish_vision` returns them.
     pub fn submit_vision(
         &mut self,
-        bindings: StateBindings<F>,
+        bindings: StateBindings,
         operation: &Operation,
         workspace: NativeGraphWorkspaceLease,
         output: NativeGraphOutputLease,
-    ) -> Result<VisionFlight<F>, SubmitFailure<F>> {
+    ) -> Result<VisionFlight<F>, SubmitFailure> {
         let (request, image, batch) = match self.vision_batch(operation) {
             Ok(checked) => checked,
             Err(error) => return Err(SubmitFailure::Refused(error, bindings)),
@@ -23,7 +23,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         )
         .map_err(|(_, error)| SubmitFailure::Failed(DomainError::Invariant(error)))?;
         let started = Instant::now();
-        let recorded_graphs = self.family.recorded_graphs();
+        let epoch = self.launch_epoch();
         // An encoder launch is no round's: the host turn before it ends.
         self.host_turn = None;
         let submission = self
@@ -35,7 +35,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             image,
             submission,
             started,
-            recorded_graphs,
+            epoch,
             bindings,
         })
     }
@@ -94,18 +94,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn finish_vision(
         &mut self,
         flight: VisionFlight<F>,
-    ) -> Result<(PendingOperationOutcome, StateBindings<F>), DomainError> {
+    ) -> Result<(PendingOperationOutcome, StateBindings), DomainError> {
         let VisionFlight {
             request,
             image,
             submission,
             started,
-            recorded_graphs,
+            epoch,
             bindings,
         } = flight;
         let completed = submission.finish().map_err(DomainError::Device)?;
         let duration = started.elapsed();
-        let replayed = self.family.recorded_graphs() == recorded_graphs;
+        let timed = self.timed(epoch);
         let (core, output) = completed.into_parts();
         let patch_rows = core.batch().patch_rows();
         let merge = usize::try_from(
@@ -138,7 +138,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             committed_rows: 0,
             kind: WorkKind::Prefill,
             physical_duration: duration,
-            replayed,
+            timed,
             image: Some(image),
         };
         Ok((pending, bindings))

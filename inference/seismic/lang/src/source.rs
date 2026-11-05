@@ -15,10 +15,19 @@
 //! because Seismic owns representation and storage binding semantics. Library
 //! files are embedded in this crate, inlined
 //! once like any include, and may include only other library files.
-use crate::checked::{CheckedModule, SourceError, SourceFile, SourceSet, check_source};
+use crate::checked::{
+    CheckFailure, CheckedModule, NativeImplementation, SourceError, SourceFile, SourceSet,
+    check_source_with,
+};
+use std::borrow::Cow;
 use crate::ids::EntryId;
 use crate::registry::BackendName;
 use std::path::{Path, PathBuf};
+
+/// The extension of a relative include that every GPU backend's assets admit:
+/// a header written in the language MSL, CUDA C++ and GLSL have in common,
+/// over definitions each backend's including files provide.
+const SHARED_EXTENSION: &str = "hpp";
 
 /// Seismic's native library: `(name, text)`, included as `<seismic/<name>>`. A
 /// name's extension selects its backend (`.h` Metal, `.cuh` CUDA, `.glsl`
@@ -139,7 +148,7 @@ impl std::fmt::Display for NativeIncludeError {
             }
             NativeIncludeReason::Absolute => "include paths are relative to the including file",
             NativeIncludeReason::Extension => {
-                "only `.h` (Metal), `.cuh` (CUDA) or `.glsl` (Vulkan) files of the asset's backend may be included"
+                "only `.h` (Metal), `.cuh` (CUDA) or `.glsl` (Vulkan) files of the asset's backend, or `.hpp` files the GPU backends share (relative includes), may be included"
             }
             NativeIncludeReason::OutsideSourceRoots => {
                 "the included file lies outside the build's source roots"
@@ -255,9 +264,8 @@ pub fn load(paths: &[PathBuf], mut prelude: SourceSet) -> Result<Loaded, LoadErr
             text: std::fs::read_to_string(path)?,
         });
     }
-    let mut module = check_source(prelude).map_err(LoadError::Source)?;
     let roots = source_roots(paths)?;
-    let assets = capture_assets(&mut module, None, &roots)?;
+    let (module, assets) = check_with_assets(prelude, None, &roots)?;
     Ok(Loaded {
         module,
         sources: files,
@@ -285,71 +293,91 @@ pub fn source_roots(paths: &[PathBuf]) -> Result<Vec<PathBuf>, LoadError> {
     Ok(roots)
 }
 
-/// `base` is required for native assets in an inline source snapshot.
-/// `roots` bound where native includes may resolve (see [`source_roots`]).
-pub fn capture_assets(
-    module: &mut CheckedModule,
+/// Check `sources`, reading each native implementation's asset from the
+/// file it declares, includes inlined: the module, and the files each asset
+/// was built from. `base` is required for native assets in an inline source
+/// snapshot. `roots` bound where native includes may resolve (see
+/// [`source_roots`]).
+pub fn check_with_assets(
+    sources: SourceSet,
     base: Option<&Path>,
     roots: &[PathBuf],
-) -> Result<Vec<CapturedAsset>, LoadError> {
-    let definitions: Vec<_> = module
-        .entries()
-        .iter()
-        .flat_map(|entry| {
-            BackendName::ALL.into_iter().filter_map(|backend| {
-                module
-                    .native_implementation(entry.id, backend)
-                    .map(|native| {
-                        (
-                            native.entry,
-                            native.backend,
-                            native.declared_in.clone(),
-                            native.source_path.clone(),
-                        )
-                    })
-            })
-        })
-        .collect();
+) -> Result<(CheckedModule, Vec<CapturedAsset>), LoadError> {
     let mut captured = Vec::new();
-    for (entry, backend, declared_in, source_path) in definitions {
-        let declaring = Path::new(&declared_in);
-        let root = match base {
-            Some(base) => base,
-            None if declaring.is_absolute() => declaring.parent().expect("absolute source parent"),
-            None => {
-                return Err(LoadError::Invalid(
-                    "inline native assets require base_dir".into(),
-                ));
-            }
-        };
-        let path = root.join(source_path).canonicalize()?;
-        let asset = NativeAssetFile {
-            text: std::fs::read_to_string(&path)?,
-            path,
-        };
-        // CPU assets are Rust and have no include set.
-        let expansion = match backend {
-            BackendName::Cpu => Expanded {
-                source: asset.text.clone(),
-                includes: Vec::new(),
-                library: Vec::new(),
-            },
-            BackendName::Metal => expand_includes(&asset, "h", roots)?,
-            BackendName::Cuda => expand_includes(&asset, "cuh", roots)?,
-            BackendName::Vulkan => expand_includes(&asset, "glsl", roots)?,
-        };
-        module
-            .capture_native_asset(entry, backend, expansion.source)
-            .map_err(LoadError::Invalid)?;
-        captured.push(CapturedAsset {
-            entry,
-            backend,
+    let module = check_source_with(
+        sources,
+        &mut |_entry: &str, native: &NativeImplementation| -> Result<_, LoadError> {
+            let ReadAsset { source, files } = read_asset(native, base, roots)?;
+            captured.push(files);
+            Ok(Some(Cow::Owned(source)))
+        },
+    )
+    .map_err(|failure| match failure {
+        CheckFailure::Source(error) => LoadError::Source(error),
+        CheckFailure::Read(error) => error,
+    })?;
+    Ok((module, captured))
+}
+
+/// `sources` checked with each native implementation's source read from
+/// `directory`, where the declarations' relative paths name them and their
+/// includes resolve: what a test of sources it holds in memory checks.
+pub fn check_beside(sources: SourceSet, directory: &Path) -> Result<CheckedModule, LoadError> {
+    let directory = directory.canonicalize()?;
+    check_with_assets(sources, Some(&directory), std::slice::from_ref(&directory))
+        .map(|(module, _)| module)
+}
+
+/// A native asset read from its file: its source with every include
+/// inlined, and the files it was built from.
+struct ReadAsset {
+    source: String,
+    files: CapturedAsset,
+}
+
+/// Read `native`'s asset: its declaring file's directory (or `base`, for an
+/// inline source snapshot) joined with its source path.
+fn read_asset(
+    native: &NativeImplementation,
+    base: Option<&Path>,
+    roots: &[PathBuf],
+) -> Result<ReadAsset, LoadError> {
+    let declaring = Path::new(&native.declared_in);
+    let root = match base {
+        Some(base) => base,
+        None if declaring.is_absolute() => declaring.parent().expect("absolute source parent"),
+        None => {
+            return Err(LoadError::Invalid(
+                "inline native assets require base_dir".into(),
+            ));
+        }
+    };
+    let path = root.join(&native.source_path).canonicalize()?;
+    let asset = NativeAssetFile {
+        text: std::fs::read_to_string(&path)?,
+        path,
+    };
+    // CPU assets are Rust and have no include set.
+    let expansion = match native.backend {
+        BackendName::Cpu => Expanded {
+            source: asset.text.clone(),
+            includes: Vec::new(),
+            library: Vec::new(),
+        },
+        BackendName::Metal => expand_includes(&asset, "h", roots)?,
+        BackendName::Cuda => expand_includes(&asset, "cuh", roots)?,
+        BackendName::Vulkan => expand_includes(&asset, "glsl", roots)?,
+    };
+    Ok(ReadAsset {
+        source: expansion.source,
+        files: CapturedAsset {
+            entry: native.entry,
+            backend: native.backend,
             asset,
             includes: expansion.includes,
             library: expansion.library,
-        });
-    }
-    Ok(captured)
+        },
+    })
 }
 
 /// An asset's source with every include inlined, and the files inlined.
@@ -542,17 +570,17 @@ impl Expansion<'_> {
         if target.is_empty() {
             return Err(NativeIncludeReason::Malformed);
         }
-        let extension_matches = |name: &str| {
+        let extension_of = |name: &str| {
             Path::new(name)
                 .extension()
                 .and_then(|extension| extension.to_str())
-                == Some(self.extension)
+                .map(str::to_owned)
         };
         if angled {
             let Some(name) = target.strip_prefix("seismic/") else {
                 return Err(NativeIncludeReason::System);
             };
-            if !extension_matches(name) {
+            if extension_of(name).as_deref() != Some(self.extension) {
                 return Err(NativeIncludeReason::Extension);
             }
             return NATIVE_LIBRARY
@@ -564,7 +592,11 @@ impl Expansion<'_> {
         if Path::new(target).is_absolute() {
             return Err(NativeIncludeReason::Absolute);
         }
-        if !extension_matches(target) {
+        // The asset's backend's own files, and the headers written in the
+        // language the GPU backends share.
+        let extension = extension_of(target);
+        let shared = matches!(self.extension, "h" | "cuh" | "glsl") && extension.as_deref() == Some(SHARED_EXTENSION);
+        if extension.as_deref() != Some(self.extension) && !shared {
             return Err(NativeIncludeReason::Extension);
         }
         Ok(Include::Relative(target.to_owned()))
@@ -627,6 +659,29 @@ mod tests {
             .map(|file| file.path.file_name().unwrap().to_str().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(names, ["a.h", "b.h"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gpu_backends_share_hpp_headers() {
+        let root = fixture("shared");
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        std::fs::write(root.join("shared/protocol.hpp"), "PROTOCOL\n").unwrap();
+        let shared = asset(&root, "#include \"../shared/protocol.hpp\"\nBODY\n");
+        for extension in ["h", "cuh", "glsl"] {
+            let Expanded { source, .. } = expand_includes(&shared, extension, &[root.clone()]).unwrap();
+            assert_eq!(
+                source,
+                "#line 1 \"../shared/protocol.hpp\"\nPROTOCOL\n#line 2 \"kernel.metal\"\nBODY\n",
+                "{extension}"
+            );
+        }
+        // Seismic's library stays per backend.
+        let library = asset(&root, "#include <seismic/element.hpp>\n");
+        match expand_includes(&library, "h", &[root.clone()]) {
+            Err(LoadError::NativeInclude(error)) => assert_eq!(error.reason, NativeIncludeReason::Extension),
+            other => panic!("unexpected {other:?}"),
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -708,8 +763,8 @@ mod tests {
             "#include <seismic/element.h>\nLIB\n",
         )
         .unwrap();
-        // packets.h includes element.h and tables.h itself; each library file
-        // is inlined once.
+        // packets.h includes element.h, slab.h and tables.h itself; each
+        // library file is inlined once.
         let asset = asset(
             &root,
             "#include <seismic/packets.h>\n#include \"common/lib.h\"\n#include <seismic/element.h>\nBODY\n",
@@ -719,7 +774,7 @@ mod tests {
             includes,
             library,
         } = expand_includes(&asset, "h", &[root.clone()]).unwrap();
-        assert_eq!(library, ["packets.h", "element.h", "tables.h"]);
+        assert_eq!(library, ["packets.h", "element.h", "slab.h", "tables.h"]);
         assert_eq!(
             includes.len(),
             1,

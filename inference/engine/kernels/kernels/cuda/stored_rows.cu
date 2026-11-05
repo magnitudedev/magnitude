@@ -19,8 +19,14 @@ extern "C" __global__ void stored_rows(SEISMIC_KERNEL_PARAMS) {
     if (column >= SEISMIC_DIM_W)
         return;
     for (u64 row = blockIdx.x; row < SEISMIC_DIM_M; row += gridDim.x) {
-        const u64 slot = gathered::row(directory, SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R, SEISMIC_DIM_F,
-                                       tokens[row * SEISMIC_TOKENS_STRIDE_0]);
+        const long long held = gathered::row(directory, SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R, SEISMIC_DIM_F,
+                                             tokens[row * SEISMIC_TOKENS_STRIDE_0]);
+        // A row without a slot reads zeros.
+        if (held < 0) {
+            element::put<Act>(rows, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, 0.0f);
+            continue;
+        }
+        const u64 slot = (u64)held;
         element::put<Act>(rows, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
                           table.value(slot, column));
     }

@@ -9,7 +9,10 @@
 //! bank it publishes to.
 
 use crate::operators::{Join, SublayerInput};
-use crate::programs::graph::{GraphError, draft::GraphDraft};
+use crate::programs::graph::{
+    GraphError,
+    draft::{ControlSource, GraphDraft},
+};
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::{PackingBound, WeightPort, packed_weight, weight};
 use crate::{
@@ -183,6 +186,8 @@ pub(crate) struct RecurrentBlock {
     /// Index of this layer's window component in the store's recurrent
     /// components; its delta and tape components follow it.
     pub component_index: usize,
+    /// How the graph takes its launch's slot tables.
+    pub controls: ControlSource,
 }
 
 /// Ports over a recurrent layer's three bank components (window, delta or
@@ -349,7 +354,9 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
     ];
     // Every entry that binds the slot tables gives them the chunk's geometry,
     // whichever advances this class.
-    let table = |graph: &mut G, name: &str| graph.input_for(kernels.chunk, name, &dimensions);
+    let table = |graph: &mut G, name: &str| {
+        graph.control_for(block.controls, kernels.chunk, name, &dimensions)
+    };
     let controls = RecurrentControlPorts {
         segments: table(graph, "segments")?,
         stop: table(graph, "stop")?,

@@ -8,7 +8,7 @@ use magnitude_family_contracts::{
     ModelFamily, Operator, OutputForm, Rotary, VisionActivation, VisionNorm, VisionOperator,
     VisionResize, VisionStem,
 };
-use magnitude_family_lfm2::{inspect_components, Lfm2Family};
+use magnitude_family_lfm2::{describe_projector, inspect_components, Lfm2Family};
 
 const VARIANTS: [&str; 3] = ["q4-qat", "q6", "q8"];
 
@@ -155,6 +155,29 @@ fn released_projector_binds_the_lfm3_vl_tower() {
             Some("<|vision_start|><|image|><|vision_end|>")
         );
     }
+}
+
+/// Another model's projector, or one of another width, disagrees with the target; a header that
+/// is no projector is unreadable.
+#[test]
+fn another_models_projector_is_a_mismatch() {
+    let reasons = |directory: &magnitude_artifacts::gguf::Directory, width| {
+        describe_projector(directory, width).unwrap_err().reasons
+    };
+    let projector = headers::projector("lfm3-vl-2b:gguf:q4-qat");
+    for (projector, width) in [
+        (&headers::projector("muse-glimmer-30b:gguf:q4"), 2048),
+        (&projector, 2049),
+    ] {
+        assert!(matches!(
+            reasons(projector, width)[..],
+            [magnitude_artifacts::UnsupportedReason::TargetMismatch { .. }]
+        ));
+    }
+    assert_eq!(
+        reasons(&headers::target("lfm3-vl-2b:gguf:q4-qat"), 2048),
+        [magnitude_artifacts::UnsupportedReason::Unreadable]
+    );
 }
 
 #[test]

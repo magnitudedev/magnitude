@@ -104,3 +104,85 @@ fn exact_program_subject_distinguishes_element_instantiations() {
     assert_eq!(f32_entry.program().sources(), i32_entry.program().sources());
     assert_ne!(f32_entry.program().subject(), i32_entry.program().subject());
 }
+
+/// The content of entry `name` in a module of `files` (path, text).
+fn content(files: &[(&str, &str)], name: &str) -> crate::ids::EntryContent {
+    let module = check_source(SourceSet::new(
+        files
+            .iter()
+            .map(|(path, text)| SourceFile {
+                path: (*path).into(),
+                text: (*text).into(),
+            })
+            .collect(),
+    ))
+    .unwrap();
+    module
+        .entries()
+        .iter()
+        .find(|entry| entry.name == name)
+        .unwrap_or_else(|| panic!("no entry `{name}`"))
+        .content
+}
+
+#[test]
+fn entry_content_covers_the_helpers_it_calls() {
+    fn module(helper: &str) -> [(&str, &str); 2] {
+        [
+            ("main.seismic", "fn probe(x: f32) -> f32:\n    return helper(x)\n"),
+            ("helper.seismic", helper),
+        ]
+    }
+    let one = module("fn helper(x: f32) -> f32:\n    return x + 1.0\n");
+    let two = module("fn helper(x: f32) -> f32:\n    return x + 2.0\n");
+    assert_ne!(content(&one, "probe"), content(&two, "probe"));
+    assert_ne!(content(&one, "helper"), content(&two, "helper"));
+}
+
+#[test]
+fn entry_content_excludes_what_it_cannot_reach() {
+    let probe = "fn probe(x: f32) -> f32:\n    return x * 2.0\n";
+    let base = content(
+        &[("a.seismic", &format!("fn other(x: f32) -> f32:\n    return x + 1.0\n\n{probe}"))],
+        "probe",
+    );
+    // Another entry's body edited (moving this one's text), another
+    // definition added, a source renamed, a comment written: none is in it.
+    for files in [
+        vec![("a.seismic", format!("fn other(x: f32) -> f32:\n    let y = x * 3.0\n    return y + 1.0\n\n{probe}"))],
+        vec![(
+            "a.seismic",
+            format!("fn added() -> f32:\n    return 0.0\n\nfn other(x: f32) -> f32:\n    return x + 1.0\n\n{probe}"),
+        )],
+        vec![("b/elsewhere.seismic", format!("# a comment\nfn other(x: f32) -> f32:\n    return x + 1.0\n\n{probe}"))],
+    ] {
+        let files = files.iter().map(|(path, text)| (*path, text.as_str())).collect::<Vec<_>>();
+        assert_eq!(content(&files, "probe"), base, "{files:?}");
+    }
+    // Its own body is in it.
+    assert_ne!(
+        content(&[("a.seismic", "fn probe(x: f32) -> f32:\n    return x * 3.0\n")], "probe"),
+        base
+    );
+}
+
+#[test]
+fn entry_content_covers_a_constant_two_calls_deep() {
+    let module = |value: u64| {
+        format!(
+            "const SCALE = {value}\n\nfn inner(x: f32) -> f32:\n    return x * f32(SCALE)\n\n\
+             fn middle(x: f32) -> f32:\n    return inner(x)\n\n\
+             fn probe(x: f32) -> f32:\n    return middle(x)\n\n\
+             fn unrelated(x: f32) -> f32:\n    return x\n"
+        )
+    };
+    let (two, three) = (module(2), module(3));
+    assert_ne!(
+        content(&[("k.seismic", &two)], "probe"),
+        content(&[("k.seismic", &three)], "probe")
+    );
+    assert_eq!(
+        content(&[("k.seismic", &two)], "unrelated"),
+        content(&[("k.seismic", &three)], "unrelated")
+    );
+}

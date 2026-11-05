@@ -3,7 +3,7 @@
 //! `profile.rs` is the only code owner of the rows and records each row's
 //! basis; A8 §2.2.2's CPU row (which contract §2.12.2 cites) is transcribed
 //! here and compared with the stated table row for row.
-use crate::open::open_host;
+use crate::open::open_quota;
 use seismic_ir::kernel::ops::SubgroupCombine;
 use seismic_ir::physical_target::{NativeFloatBehavior, NativeFloatOp};
 use seismic_lang::types::DType;
@@ -88,7 +88,7 @@ fn stated_rows_equal_the_design_table() {
             "the transcription states {key:?} twice"
         );
     }
-    let opened = open_host().expect("CPU host");
+    let opened = open_quota().expect("CPU host");
     let table = opened.device.native_float();
     let mismatches: Vec<String> = every_key()
         .into_iter()
@@ -114,7 +114,7 @@ fn stated_rows_equal_the_design_table() {
 /// fragment format can exist without one.
 #[test]
 fn the_cpu_target_has_no_subgroup() {
-    let opened = open_host().expect("CPU host");
+    let opened = open_quota().expect("CPU host");
     assert_eq!(opened.device.limits().subgroup_width, None);
     assert!(opened.device.fragment_formats().is_empty());
 }

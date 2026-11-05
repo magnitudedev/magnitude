@@ -18,7 +18,7 @@
 
 use crate::Error;
 use magnitude_artifacts::gguf::{Directory, Element, Scalar, Value};
-use magnitude_family_common::Tensors;
+use magnitude_family_common::{Tensors, projector_type};
 use magnitude_family_contracts::{
     checked_product, ActivationDType, CellReduction, ImportTransform, MergerStage,
     PositionSampling, RowRange, VisionActivation, VisionAttention, VisionAttentionScale,
@@ -165,21 +165,14 @@ impl Reader<'_> {
     }
 }
 
-/// Interpret a Nemotron Omni projector inventory without importing it.
-pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Error> {
-    if directory
-        .value("general.architecture")
-        .and_then(Value::string)
-        != Some("clip")
-        || directory.value("general.type").and_then(Value::string) != Some("mmproj")
-        || directory
-            .value("clip.projector_type")
-            .and_then(Value::string)
-            != Some("nemotron_omni")
-        || directory.value("clip.has_vision_encoder") != Some(&Value::Scalar(Scalar::Bool(true)))
-    {
-        return Err(invalid("unsupported Nemotron projector identity"));
-    }
+/// Interpret a Nemotron Omni projector inventory for a target of
+/// `target_width` without importing it.
+pub fn describe_projector(
+    directory: &Directory,
+    target_width: u64,
+) -> Result<VisionDescription, Error> {
+    projector_type(directory, &[("nemotron_omni", ())], target_width)
+        .map_err(Error::ProjectorIdentity)?;
     if let Some(entry) = directory
         .metadata
         .iter()

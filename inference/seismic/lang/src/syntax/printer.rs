@@ -10,8 +10,11 @@ pub(crate) fn print(file: &File) -> String {
         out: String::new(),
         level: 0,
     };
+    for constant in &file.constants {
+        let _ = writeln!(p.out, "const {} = {}", constant.name.name, constant.value);
+    }
     for (i, decl) in file.decls.iter().enumerate() {
-        if i > 0 {
+        if i > 0 || !file.constants.is_empty() {
             p.out.push('\n');
         }
         p.decl(decl);
@@ -93,6 +96,17 @@ impl Printer {
                     });
                     self.out.push_str(")\n");
                 }
+                if !n.records.is_empty() {
+                    self.indent();
+                    self.out.push_str("records (");
+                    self.list(&n.records, |p, record| match record {
+                        NativeRecordDecl::Parameter(name) => p.out.push_str(&name.name),
+                        NativeRecordDecl::Result { ordinal, .. } => {
+                            let _ = write!(p.out, "result {ordinal}");
+                        }
+                    });
+                    self.out.push_str(")\n");
+                }
                 for term in &n.terms {
                     self.indent();
                     let _ = write!(self.out, "let {} = ", term.name.name);
@@ -140,6 +154,12 @@ impl Printer {
                         self.indent();
                         self.native_params(&launch.params);
                     }
+                    if let Some(constraint) = &launch.constraint {
+                        self.indent();
+                        self.out.push_str("where ");
+                        self.expr(constraint, 0);
+                        self.out.push('\n');
+                    }
                     if !launch.reads.is_empty() {
                         self.indent();
                         self.out.push_str("reads (");
@@ -150,6 +170,24 @@ impl Printer {
                     self.out.push_str("threadgroups (");
                     self.list(&launch.threadgroups, |p, expr| p.expr(expr, 0));
                     self.out.push_str(")\n");
+                    if let Some(grid) = &launch.grid {
+                        self.indent();
+                        self.out.push_str("grid (");
+                        self.out.push_str(&grid.name);
+                        self.out.push_str(")\n");
+                    }
+                    for condition in &launch.conditions {
+                        self.indent();
+                        self.out.push_str(condition.encoded.keyword());
+                        self.out.push_str(" (");
+                        self.out.push_str(&condition.word.name);
+                        if let Some(index) = &condition.index {
+                            self.out.push('[');
+                            self.expr(index, 0);
+                            self.out.push(']');
+                        }
+                        self.out.push_str(")\n");
+                    }
                     self.indent();
                     self.out.push_str("threads_per_threadgroup (");
                     self.list(&launch.threads_per_threadgroup, |p, expr| p.expr(expr, 0));
@@ -173,9 +211,6 @@ impl Printer {
     fn native_params(&mut self, params: &[NativeParamDecl]) {
         self.out.push_str("params (");
         self.list(params, |p, param| {
-            if param.code {
-                p.out.push_str("code ");
-            }
             if param.arithmetic {
                 p.out.push_str("arithmetic ");
             }
@@ -188,7 +223,18 @@ impl Printer {
                 .map(u64::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
-            let _ = write!(p.out, "{} in [{values}]", param.name.name);
+            let _ = write!(p.out, "{} in [{values}] default ", param.name.name);
+            match &param.default {
+                NativeDefaultDecl::Value(value) => p.expr(value, 0),
+                NativeDefaultDecl::Least(condition) => {
+                    p.out.push_str("least where ");
+                    p.expr(condition, 0);
+                }
+                NativeDefaultDecl::Greatest(condition) => {
+                    p.out.push_str("greatest where ");
+                    p.expr(condition, 0);
+                }
+            }
         });
         self.out.push_str(")\n");
     }
@@ -250,6 +296,10 @@ impl Printer {
                     ShapedHead::Tensor => "tensor",
                     ShapedHead::SharedTensor => "&tensor",
                     ShapedHead::MutTensor => "&mut tensor",
+                    ShapedHead::HostTensor { write: false } => "&host tensor",
+                    ShapedHead::HostTensor { write: true } => "&host mut tensor",
+                    ShapedHead::AwaitTensor { write: false } => "&await tensor",
+                    ShapedHead::AwaitTensor { write: true } => "&await mut tensor",
                 });
                 self.shape_and_elem(shape, elem);
             }

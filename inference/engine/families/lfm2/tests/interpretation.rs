@@ -57,8 +57,7 @@ fn variant(model: &str) -> Directory {
         .directory
 }
 
-/// Geometry the catalog models are documented to have
-/// (`specs/26-09-26/model-family-support/briefs/lfm2.md` §2).
+/// Geometry the catalog models are documented to have.
 struct Expected {
     architecture: Architecture,
     layers: usize,

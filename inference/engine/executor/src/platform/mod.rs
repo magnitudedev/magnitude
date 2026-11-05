@@ -11,12 +11,13 @@ mod selection;
 
 pub(crate) use policy::refresh_device_ceiling;
 pub use policy::{
-    DemandFit, DomainReading, DomainRole, DomainThresholds, Fit, FitMode, FitRefusal, HostDistress,
-    MemoryBand, MemoryConstraint, MemoryPolicyError, MemoryReserves, PlacementFit, StorageDemand,
-    StoreFit, observe_domains,
+    DemandFit, DomainReading, DomainRole, DomainThresholds, Fit, FitMode, FitRefusal, HostDistress, HostEmergency, HostRoom,
+    MemoryBand, MemoryConstraint, MemoryPolicyError, MemoryReserves, PlacementFit, RECOVERY_STABLE_TIME,
+    Recovery, StorageDemand, StoreFit, observe_domains,
 };
 pub use qualification::{
-    OpenedPlatform, PlatformConfig, PlatformError, SelectedDevice, open_selected, select_device,
+    FitReading, GraphPricing, OpenedPlatform, PlatformConfig, PlatformError, SelectedDevice, host_tier, open_selected, select_device, select_recorded,
+    selected,
 };
 pub use selection::{
     AUTOMATIC_BACKEND_ORDER, DeviceRequest, DeviceRequestParseError, SelectionError, select,

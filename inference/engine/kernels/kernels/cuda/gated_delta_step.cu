@@ -14,6 +14,7 @@
 // change result bits, and `gated_delta_chunk` gives its short slots the same
 // bits.
 
+#include "lib/core/arrive.cuh"
 #include "lib/recurrent/recurrent.cuh"
 
 #ifdef SEISMIC_FORMING_GATED_DELTA_STEP
@@ -50,21 +51,9 @@ __global__ void gated_delta_step(SEISMIC_KERNEL_PARAMS) {
                                                   shared);
     }
 
-    // Arrive (sync scratch: zero when the launch starts, restored by the last).
     __shared__ unsigned last;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        __threadfence();
-        unsigned *counter = reinterpret_cast<unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ARRIVALS)) + head;
-        const bool is_last = atomicAdd(counter, 1u) == gridDim.y * gridDim.z - 1;
-        if (is_last) {
-            __threadfence();
-            atomicExch(counter, 0u);
-        }
-        last = is_last;
-    }
-    __syncthreads();
-    if (!last)
+    if (!arrive::last(reinterpret_cast<unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ARRIVALS)) + head,
+                      gridDim.y * gridDim.z, &last))
         return;
     recurrent::gate_head<ELEMENT_OF(SEISMIC_RECURRENT_NORM)>(
         in, mixed, SEISMIC_PTR(SEISMIC_BUFFER_RECURRENT_NORM), element::word_f32(SEISMIC_PARAM_EPSILON),

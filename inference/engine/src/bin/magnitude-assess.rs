@@ -11,14 +11,14 @@
 //! assessment result, with the model's capabilities and template
 //! fingerprint alongside. `--topology` prints the topology, its discovery
 //! diagnostics and the executor's costs (each with its samples and interval)
-//! instead; `--breakdown` prints each model's step call by call. `mrig assess`
-//! runs it per model, `mrig device` for the topology.
+//! instead; `--breakdown` prints each model's step call by call. The
+//! evaluation rig runs it per model, and for the topology.
 
 use magnitude_engine::{
     assessment::{
         finish_model_assessment, prepare_model_assessment, AssessmentSetup, AssessmentStructure,
         DrafterVerdict, Measurements, ModelAssessment, ModelExecution, ModelPackagePaths,
-        Performance, PreparedModelAssessment,
+        ModelResidency, Performance, PreparedModelAssessment, StreamedPerformance,
     },
     error::UnsupportedModel,
     options::{standard_service_limits, ModelMethod, ModelPolicy, PROFILE_SEQUENCES},
@@ -26,9 +26,8 @@ use magnitude_engine::{
 };
 use magnitude_executor::{
     assessment::{
-        decode_pricing, step_seconds, Derived, DomainFit, ExecutionFit, ExecutionShortfall,
-        ExecutorCosts, FormatRates, HistoryCosts, MatrixCosts, MeasuredCost, WeightRate,
-        MEASUREMENT_SECONDS,
+        decode_pricing, step_seconds, Derived, DomainFit, ExecutionShortfall, ExecutorCosts,
+        FormatRates, HistoryCosts, MatrixCosts, MeasuredCost, WeightRate, MEASUREMENT_SECONDS,
     },
     platform::{DeviceRequest, MemoryReserves},
 };
@@ -51,11 +50,17 @@ struct Options {
     breakdown: bool,
     /// The measurement job's time, its service's by default.
     time: Duration,
+    /// This process is the measurement job of the process that started it
+    /// ([`bounded_job`]): measure, and assess nothing.
+    job_only: bool,
     /// Print the topology, its discovery diagnostics, its measurements and
     /// the executor costs rather than assess models.
     topology: bool,
     models: Vec<ModelPackagePaths>,
 }
+
+/// The flag a job's own process is started with ([`bounded_job`]).
+const JOB_ONLY: &str = "--measurement-job-only";
 
 const USAGE: &str = "magnitude-assess --device auto|metal|cuda|vulkan|cpu --kernels DIR \
      [--seconds 10] [--depths 25000,50000,75000] [--sequences 1] [--breakdown] \
@@ -77,6 +82,7 @@ fn parse() -> Result<Options, String> {
     let mut seconds = MEASUREMENT_SECONDS;
     let mut method = ModelMethod::Auto;
     let mut topology = false;
+    let mut job_only = false;
     let mut models = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -118,6 +124,7 @@ fn parse() -> Result<Options, String> {
                 }
             }
             "--topology" => topology = true,
+            JOB_ONLY => job_only = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -156,13 +163,72 @@ fn parse() -> Result<Options, String> {
         breakdown,
         time: Duration::try_from_secs_f64(seconds)
             .map_err(|error| format!("--seconds: {error}"))?,
+        job_only,
         topology,
         models,
     })
 }
 
+/// How many times its own time the measurement job is waited for: it ends by
+/// its own deadline, counted from inside its process, so its kill comes well
+/// after that deadline and a job that ends by it is never killed.
+const JOB_KILLED_AT: u32 = 2;
+
+/// Run the measurement job in a process of its own and wait for it at most
+/// [`JOB_KILLED_AT`] times its time: a native submission, a driver call or a
+/// compile cannot be cancelled, so only the kill bounds it, whatever the
+/// kernel cache holds. What it stored stands; a point it was attempting
+/// counts as ended this job, and one that ends two is recorded unobtainable,
+/// so a point that hangs does not hang every job. The seconds it took, and
+/// whether it ended on its own with nothing unmeasured.
+fn bounded_job(time: Duration) -> Result<(f64, bool), String> {
+    let limit = time * JOB_KILLED_AT;
+    eprintln!(
+        "magnitude-assess: measuring this machine, {:.0} s, killed at {:.0} s",
+        time.as_secs_f64(),
+        limit.as_secs_f64()
+    );
+    let started = Instant::now();
+    let measured;
+    let mut job = std::process::Command::new(std::env::current_exe().map_err(|error| error.to_string())?)
+        .args(std::env::args_os().skip(1))
+        .arg(JOB_ONLY)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| format!("the measurement job: {error}"))?;
+    loop {
+        match job.try_wait().map_err(|error| format!("the measurement job: {error}"))? {
+            Some(status) => {
+                if !status.success() {
+                    eprintln!("magnitude-assess: the measurement job ended {status}");
+                }
+                measured = status.success();
+                break;
+            }
+            None if started.elapsed() >= limit => {
+                job.kill().map_err(|error| format!("the measurement job: {error}"))?;
+                job.wait().map_err(|error| format!("the measurement job: {error}"))?;
+                eprintln!("magnitude-assess: the measurement job was killed at its limit; what it stored stands");
+                measured = false;
+                break;
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    let seconds = started.elapsed().as_secs_f64();
+    eprintln!("magnitude-assess: measured in {seconds:.3} s");
+    Ok((seconds, measured))
+}
+
 fn main() {
+    // The measurement job's device probes run in processes of this executable.
+    seismic::serve_probe_if_asked();
+    magnitude_executor::diagnostics::install();
     magnitude_executor::platform::relax_gpu_watchdog();
+    if let Err(error) = magnitude_engine::telemetry::log_to_stderr() {
+        eprintln!("magnitude-assess: {error}");
+        std::process::exit(1);
+    }
     match run() {
         Ok(true) => {}
         Ok(false) => std::process::exit(1),
@@ -194,6 +260,7 @@ fn run() -> Result<bool, String> {
     let structure = AssessmentStructure::discover(
         &catalog,
         options.device,
+        Some(options.kernels.as_path()),
         MemoryReserves::standard(),
         ModelPolicy::default(),
         standard_service_limits(),
@@ -206,6 +273,34 @@ fn run() -> Result<bool, String> {
         executor.backend().as_str()
     );
 
+    if options.job_only {
+        // Measured as the job measures: what is stored is kept, and each
+        // record stored now is printed.
+        let started = Instant::now();
+        let MeasureEnd { failures, held } = measure_machine(
+            &MeasureRequest {
+                paths: served,
+                kernels: options.kernels.clone(),
+                executor: executor.selector(),
+                // Nothing preempts the tool's job; its process names it.
+                job: MeasureJob(u64::from(std::process::id())),
+                time: options.time,
+            },
+            &mut |event| {
+                if let MeasureEvent::Recorded(key, record) = event {
+                    eprintln!(
+                        "magnitude-assess: {:.3} s: {key:?}: {record:?}",
+                        started.elapsed().as_secs_f64()
+                    )
+                }
+            },
+        );
+        drop(held);
+        for failure in &failures {
+            eprintln!("magnitude-assess: not measured: {failure}");
+        }
+        return Ok(failures.is_empty());
+    }
     // The models are prepared from their headers; the measurements are
     // the executor's own, whatever the models read.
     let prepared = options
@@ -219,33 +314,7 @@ fn run() -> Result<bool, String> {
             )
         })
         .collect::<Vec<_>>();
-    // Measured as the job measures: what is stored is kept, and each record
-    // stored now is printed.
-    let started = Instant::now();
-    let MeasureEnd { failures, held } = measure_machine(
-        &MeasureRequest {
-            paths: served,
-            kernels: options.kernels.clone(),
-            executor: executor.selector(),
-            // Nothing preempts the tool's job; its process names it.
-            job: MeasureJob(u64::from(std::process::id())),
-            time: options.time,
-        },
-        &mut |event| {
-            if let MeasureEvent::Recorded(key, record) = event {
-                eprintln!(
-                    "magnitude-assess: {:.3} s: {key:?}: {record:?}",
-                    started.elapsed().as_secs_f64()
-                )
-            }
-        },
-    );
-    let measure_seconds = started.elapsed().as_secs_f64();
-    eprintln!("magnitude-assess: measured in {measure_seconds:.3} s");
-    drop(held);
-    for failure in &failures {
-        eprintln!("magnitude-assess: not measured: {failure}");
-    }
+    let (measure_seconds, measured) = bounded_job(options.time)?;
     let measurements = structure.stored_measurements(&options.kernels);
 
     if options.topology {
@@ -281,11 +350,11 @@ fn run() -> Result<bool, String> {
                 "diagnostics": diagnostics,
                 "executor": executor.selector().to_string(),
                 "executorCosts": costs,
-                "failures": failures.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "measured": measured,
                 "measureSeconds": measure_seconds,
             })
         );
-        return Ok(failures.is_empty());
+        return Ok(measured);
     }
 
     let setup = AssessmentSetup {
@@ -347,7 +416,7 @@ fn costs(costs: &ExecutorCosts, backend: seismic::BackendName, pending: bool) ->
             "features": matrix.features,
         })
     };
-    let route = |route: seismic::AccessRoute,
+    let route = |route: seismic::NativeKind,
                  activation: Option<&WeightRate>,
                  formats: &[(Element, FormatRates)]| {
         json!({
@@ -392,10 +461,13 @@ fn costs(costs: &ExecutorCosts, backend: seismic::BackendName, pending: bool) ->
             .chain(costs.matrices.iter().map(|(format, measured)| matrix(*format, measured)))
             .collect::<Vec<_>>(),
         "history": [history(&costs.dense), history(&costs.affine)],
-        "composition": costs.composition.as_ref().map(cost),
-        "launchSeconds": costs.launch_seconds.as_ref().map(cost),
-        "stepPipelinedSeconds": costs.step_pipelined_seconds.as_ref().map(cost),
-        "stepRoundTripSeconds": costs.step_round_trip_seconds.as_ref().map(cost),
+        "composition": match costs.composition() {
+            Ok(composition) => cost(&composition),
+            Err(error) => json!({ "unavailable": error.to_string() }),
+        },
+        "launchSeconds": cost(&costs.launch_seconds),
+        "stepPipelinedSeconds": cost(&costs.step_pipelined_seconds),
+        "stepRoundTripSeconds": cost(&costs.step_round_trip_seconds),
         // Priced from the figures read until measured.
         "derived": costs.derived(backend).iter().map(|derived| match derived {
             Derived::ActivationRate(route) => json!({ "activationRate": route }),
@@ -407,9 +479,6 @@ fn costs(costs: &ExecutorCosts, backend: seismic::BackendName, pending: bool) ->
                 json!({ "matrixThroughput": format.name() })
             }
             Derived::History(layout) => json!({ "history": layout.identity() }),
-            Derived::Composition => json!("composition"),
-            Derived::Launch => json!("launch"),
-            Derived::Step => json!("step"),
         }).collect::<Vec<_>>(),
         "pending": pending,
     })
@@ -447,7 +516,9 @@ fn print_breakdown(
             "exact_resident_bytes": charge.exact_resident_bytes,
             "state_bytes": charge.state_bytes,
             "startup_state_bytes": charge.startup_state_bytes,
-            "prepared_resource_bytes": bounds.prepared_resource_bytes,
+            "loaded_state_bytes": charge.loaded_state_bytes,
+            "graph_bytes": bounds.graph_bytes,
+            "recorded_graph_bytes": bounds.recorded_graph_bytes,
             "startup_additional_bytes": bounds.startup_additional_bytes,
             "component_upload_bytes": bounds.component_upload_bytes,
             "serving_bytes": charge.serving_bytes,
@@ -477,8 +548,8 @@ fn print_breakdown(
         model.target.display(),
         demand.calls.len(),
         pricing.lookahead,
-        pricing.activations(seismic::StorageKind::Device) / 1e9,
-        pricing.activations(seismic::StorageKind::Upload) / 1e9,
+        pricing.activations(magnitude_executor::assessment::OperandStorage::Device) / 1e9,
+        pricing.activations(magnitude_executor::assessment::OperandStorage::Upload) / 1e9,
     );
     for &depth in &options.depths {
         let step = step_seconds(demand, &pricing, sequences, depth).map_err(failed)?;
@@ -543,24 +614,52 @@ fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
             })
             .collect::<Vec<_>>()
     };
+    let performance = |performance: &Performance| match performance {
+        Performance::Pending => json!({ "_tag": "Pending" }),
+        Performance::Unavailable { reason } => {
+            json!({ "_tag": "Unavailable", "reason": reason })
+        }
+        Performance::Estimated(estimates) => json!({
+            "_tag": "Estimated",
+            "decode": estimates.iter().map(|estimate| json!({
+                "contextTokens": estimate.context_tokens,
+                "estimatedTokensPerSecond": estimate.tokens_per_second,
+            })).collect::<Vec<_>>(),
+        }),
+    };
+    let cold = |cold: &magnitude_executor::assessment::ColdSource| {
+        use magnitude_executor::assessment::{ColdSource, FileOnly};
+        match cold {
+            ColdSource::HostTier { slots } => json!({ "hostRam": { "slots": slots } }),
+            ColdSource::File(FileOnly::Unified) => json!({ "file": "unified memory" }),
+            ColdSource::File(FileOnly::NoHostRoom) => json!({ "file": "host memory admits no tier slot" }),
+        }
+    };
+    let streamed = |streamed: &StreamedPerformance| match streamed {
+        StreamedPerformance::Unmeasured => json!({ "_tag": "Unmeasured" }),
+        StreamedPerformance::Assessed(assessed) => performance(assessed),
+    };
     let mut object = match execution {
-        ModelExecution::Fits {
-            fit: ExecutionFit { domains, .. },
-            performance,
-        } => json!({
+        ModelExecution::Fits { domains, residency } => json!({
             "_tag": "Fits",
             "memory": memory(domains),
-            "performance": match performance {
-                Performance::Pending => json!({ "_tag": "Pending" }),
-                Performance::Unavailable { reason } => {
-                    json!({ "_tag": "Unavailable", "reason": reason })
-                }
-                Performance::Estimated(estimates) => json!({
-                    "_tag": "Estimated",
-                    "decode": estimates.iter().map(|estimate| json!({
-                        "contextTokens": estimate.context_tokens,
-                        "estimatedTokensPerSecond": estimate.tokens_per_second,
-                    })).collect::<Vec<_>>(),
+            "residency": match residency {
+                ModelResidency::Resident { performance: resident } => json!({
+                    "_tag": "Resident",
+                    "performance": performance(resident),
+                }),
+                ModelResidency::Streamed {
+                    shares,
+                    performance: at_share,
+                    floor_performance,
+                    ..
+                } => json!({
+                    "_tag": "Streamed",
+                    "expertFloorShare": shares.floor_share(),
+                    "expertShare": shares.share(),
+                    "coldExperts": cold(shares.cold()),
+                    "performance": streamed(at_share),
+                    "floorPerformance": streamed(floor_performance),
                 }),
             },
         }),

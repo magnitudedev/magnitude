@@ -10,15 +10,19 @@ chose, and the fastest, each the median of its samples with its deviation; then 
 search replayed against the survey: how often it lands within 1/2/5% of the true best at the
 evaluations this load allows it, and the per-point gap of one configuration for all points.
 
-The survey publishes into a kernel cache of its own, so the token budget it gives the rest of
-the model never reaches the checkout's tuning.
+The survey publishes into the host's kernel cache: every record's key names the budget it was
+searched within, so the token budget it gives the rest of the model never reaches any other
+load's tuning.
 """
 
 import argparse
 import json
 
 from ..engine import Headers, Step
-from . import Answer, Instrument, JobResult, Measure, Plan, harness
+from . import Answer, Instrument, JobResult, Measure, Plan, harness, lacking
+
+# What a survey answer reads, which every build's survey must hold (`lacking`).
+SURVEYED = ("entry", "bindings", "result.configurations", "result.served", "result.overall", "result.points")
 
 OTHERS_TUNING_SECONDS = "1"  # the rest of the model is not what this measures
 
@@ -27,12 +31,12 @@ def configure(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--samples", type=int, default=15, help="samples per point of every configuration (default 15)")
 
 
-def plan(arguments, source) -> Plan:
+def plan(arguments, source, host) -> Plan:
     job = Step("kernel", (
         harness.EXECUTABLE, "prepare",
         "--artifacts", "{artifacts}", "--fixtures", f"{{inputs}}/{arguments.fixture.name}",
         "--output", "{run_dir}", "--build-identity", "{build_file}",
-        "--cache-dir", "{checkout}/kernels-survey", "--device", arguments.backend,
+        "--cache-dir", "{engine_cache}/kernels", "--device", arguments.backend,
         "--context", str(arguments.context),
         "--fresh-tuning", "--tuning-budget", OTHERS_TUNING_SECONDS,
         "--tuning-survey", "{run_dir}/survey", "--tuning-survey-entries", arguments.entry,
@@ -109,6 +113,9 @@ def answer(arguments, results: dict[str, JobResult]) -> Answer:
     lines, measures = [], {}
     for path in surveys:
         survey = json.loads(path.read_text())
+        if missing := lacking(survey, *SURVEYED):
+            lines.append(f"{path.stem}: this build's harness records no {', '.join(missing)}")
+            continue
         record = survey["result"]
         times = _times(record)
         default = _parameters(record["served"][0])

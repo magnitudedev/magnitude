@@ -4,12 +4,13 @@
 //! class and mapping) against the host reference at the catalog's real
 //! widths (Gemma 4 E2B/E4B/26B, LFM2, Nemotron-H Lightning and Super).
 
+mod common;
 mod mapped;
 
 use magnitude_kernels::{dense_up, per_layer_gate, project_rows, short_conv_project};
 use mapped::Mapped;
 use seismic_lang::{
-    checked::{check_source, CheckedModule, SourceFile},
+    checked::{CheckedModule, SourceFile},
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -35,7 +36,7 @@ fn module() -> CheckedModule {
             text: text.into(),
         });
     }
-    check_source(sources).unwrap()
+    crate::common::check(sources)
 }
 
 enum Input {
@@ -169,26 +170,11 @@ fn read(tensor: &seismic::Tensor, dtype: DType) -> Vec<f32> {
     }
 }
 
-/// CUDA, else Metal; `SEISMIC_TEST_BACKEND=vulkan` selects Vulkan. Then the
-/// CPU.
+/// CUDA, else Metal, then the CPU; a requested backend (Vulkan among them)
+/// alone ([`seismic_native_tests::first_and_cpu`]).
 fn devices() -> Vec<seismic::Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    let gpu = match std::env::var("SEISMIC_TEST_BACKEND").ok().as_deref() {
-        Some("vulkan") => Some(
-            catalog
-                .open_backend(seismic::BackendName::Vulkan)
-                .expect("the Vulkan device opens"),
-        ),
-        Some(other) => panic!("SEISMIC_TEST_BACKEND={other}: only vulkan is selectable"),
-        None => [seismic::BackendName::Cuda, seismic::BackendName::Metal]
-            .into_iter()
-            .find_map(|backend| catalog.open_backend(backend).ok()),
-    };
-    gpu.into_iter()
-        .chain(std::iter::once(
-            catalog.open_backend(seismic::BackendName::Cpu).unwrap(),
-        ))
-        .collect()
+    use seismic::BackendName::{Cpu, Cuda, Metal, Vulkan};
+    seismic_native_tests::first_and_cpu(&[Cuda, Metal], &[Cuda, Metal, Vulkan, Cpu])
 }
 
 fn is_cpu(device: &seismic::Device) -> bool {
@@ -347,12 +333,13 @@ fn mappings(
 /// The statics the device's implementation declares: backends fix different
 /// subsets of the entry dimensions (the CPU forms read most of them at run time).
 fn declared(
-    implementation: Result<Option<seismic::NativeImplementation>, seismic::CheckedBundleError>,
+    implementation: Result<Option<seismic::OnDevice>, seismic::CheckedBundleError>,
 ) -> Vec<String> {
     implementation
         .unwrap()
         .expect("every test device has a native implementation")
         .statics
+        .clone()
 }
 
 /// `mapping`'s specialization with those of `statics` that `declared` names.

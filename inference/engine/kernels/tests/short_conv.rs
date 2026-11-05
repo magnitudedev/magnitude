@@ -9,6 +9,7 @@
 // Every case checks the outputs, the published windows (copies), and that
 // no bank other than each slot's successor changes.
 
+mod common;
 mod versions_common;
 
 use magnitude_kernels::short_conv_rows;
@@ -132,7 +133,7 @@ impl Case {
     /// The portable body executed by the Seismic interpreter.
     fn oracle(&self, activation: Element) -> Outcome {
         use seismic_lang::{
-            checked::{check_source, SourceFile},
+            checked::{SourceFile},
             entry::ElementBindings,
             failure::SourceTermination,
             interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -145,7 +146,7 @@ impl Case {
             path: "short_conv.seismic".into(),
             text: include_str!("../kernels/short_conv.seismic").into(),
         });
-        let module = check_source(sources).unwrap();
+        let module = crate::common::check(sources);
         let dtype = if activation == Element::bf16() { DType::BF16 } else { DType::F32 };
         let elements = ElementBindings::new().bind("A", registry::dense(dtype));
         let logical = module

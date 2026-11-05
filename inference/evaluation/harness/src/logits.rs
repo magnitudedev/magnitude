@@ -25,6 +25,8 @@ pub struct LogitsOptions {
     /// Scored rows per teacher-forced forward; above one they run as one
     /// verification forward.
     pub verify_width: usize,
+    /// Passes over the fixtures on the one load.
+    pub passes: usize,
 }
 
 /// One fixture's walk through its tokens: its sequence, its tokens, its
@@ -90,6 +92,9 @@ pub fn run(
             drafter: false,
             proposals: None,
             context_tokens: longest + logits.verify_width,
+            // Every fixture of a batch holds its sequence until it is scored.
+            sequences: std::num::NonZeroUsize::new(batch)
+                .expect("a positive batch of a nonempty fixture set"),
             decode_rows: rows_per_step,
             exported_logits_rows: rows_per_step.max(PREFILL_ROWS),
             lookahead: false,
@@ -114,45 +119,62 @@ pub fn run(
             );
         }
     }
-    let data = stem.with_extension("f32");
-    let mut file = File::create(&data).map_err(|error| format!("{}: {error}", data.display()))?;
-    file.set_len((rows.len() * vocabulary * 4) as u64)
-        .map_err(|error| format!("{}: {error}", data.display()))?;
     let indices = (0..rendered.len()).collect::<Vec<_>>();
-    for (group, chunk) in indices.chunks(batch).enumerate() {
-        let mut walks = Vec::with_capacity(chunk.len());
-        for &index in chunk {
-            walks.push(Walk {
-                sequence: engine.open_sequence()?,
-                rendered: &rendered[index],
-                tokens: engine::tokens(&rendered[index].tokens),
-                base: bases[index],
-            });
+    // Each pass over the fixtures runs on the one load, in the state the last left its bank.
+    for pass in 0..logits.passes {
+        let data = match pass {
+            0 => stem.with_extension("f32"),
+            pass => stem.with_file_name(format!("{}-{pass}.f32", stem.file_name().expect("a logits stem names a file").to_string_lossy())),
+        };
+        let mut file = File::create(&data).map_err(|error| format!("{}: {error}", data.display()))?;
+        file.set_len((rows.len() * vocabulary * 4) as u64)
+            .map_err(|error| format!("{}: {error}", data.display()))?;
+        for (group, chunk) in indices.chunks(batch).enumerate() {
+            let mut walks = Vec::with_capacity(chunk.len());
+            for &index in chunk {
+                walks.push(Walk {
+                    sequence: engine.open_sequence()?,
+                    rendered: &rendered[index],
+                    tokens: engine::tokens(&rendered[index].tokens),
+                    base: bases[index],
+                });
+            }
+            score(
+                &mut engine,
+                &mut walks,
+                logits.verify_width,
+                vocabulary,
+                &mut file,
+            )?;
+            for walk in walks {
+                engine.close(walk.sequence)?;
+            }
+            eprintln!(
+                "magnitude-harness: scored {} of {} fixtures (batch {group})",
+                (group * batch + chunk.len()).min(rendered.len()),
+                rendered.len()
+            );
         }
-        score(
-            &mut engine,
-            &mut walks,
-            logits.verify_width,
-            vocabulary,
-            &mut file,
-        )?;
-        for walk in walks {
-            engine.close(walk.sequence)?;
-        }
-        eprintln!(
-            "magnitude-harness: scored {} of {} fixtures (batch {group})",
-            (group * batch + chunk.len()).min(rendered.len()),
-            rendered.len()
-        );
+        file.flush()
+            .map_err(|error| format!("{}: {error}", data.display()))?;
     }
-    file.flush()
-        .map_err(|error| format!("{}: {error}", data.display()))?;
+    // A streamed load's decode misses: the fewest any streamed layer took
+    // (none means some layer never read past its bank), all of them, and
+    // those its CPU site served.
+    let experts = engine.domain.expert_costs().map(|costs| {
+        json!({
+            "least_layer_misses": costs.layers.iter().map(|layer| layer.misses).min(),
+            "misses": costs.layers.iter().map(|layer| layer.misses).sum::<u64>(),
+            "sited": costs.layers.iter().map(|layer| layer.sited).sum::<u64>(),
+        })
+    });
     let metadata = json!({
         "producer": "harness",
         "model": artifacts.model,
         "rendered_digest": rendered_digest,
         "vocabulary": vocabulary,
         "rows": rows,
+        "experts": experts,
     });
     let path = stem.with_extension("json");
     std::fs::write(
@@ -187,7 +209,7 @@ fn score(
                     continue;
                 };
                 let rows = (scored.start - walk.sequence.position).min(PREFILL_ROWS);
-                if rows == 0 || rows > budget {
+                if rows == 0 || rows > budget || !engine.domain.claims(walk.sequence.request) {
                     continue;
                 }
                 budget -= rows;
@@ -217,6 +239,12 @@ fn score(
         }
         if operations.is_empty() {
             return Ok(());
+        }
+        // A lone prompt chunk runs with the chunks after it as one prompt
+        // group, as the service runs a prompt.
+        if let (true, [walk]) = (prefilling, &advancing[..]) {
+            let scored = walk.next_rows().expect("a prefilling walk scores rows next");
+            engine.plan_prompt(&walk.sequence, &walk.tokens[walk.sequence.position..scored.start], false)?;
         }
         let starts = advancing
             .iter()

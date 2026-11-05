@@ -17,7 +17,7 @@ struct Block {
     allocation: Allocation,
     dedicated: bool,
     free: Mutex<FreeRanges>,
-    _charge: Option<Box<dyn seismic_compiler::executable::MemoryHold>>,
+    _charge: Box<dyn seismic_compiler::executable::MemoryHold>,
 }
 
 impl Block {
@@ -31,17 +31,23 @@ impl Block {
 /// One device's blocks.
 pub(crate) struct Blocks {
     context: Arc<Context>,
+    /// What every block is charged to: the device account.
+    account: Arc<dyn seismic_compiler::executable::MemoryAccount>,
     granularity: u64,
     blocks: Mutex<Vec<Arc<Block>>>,
 }
 
 impl Blocks {
-    pub(crate) fn new(context: Arc<Context>) -> Self {
-        Self {
-            granularity: driver::allocation_granularity(&context),
+    pub(crate) fn new(
+        context: Arc<Context>,
+        account: Arc<dyn seismic_compiler::executable::MemoryAccount>,
+    ) -> Result<Self, DriverError> {
+        Ok(Self {
+            granularity: driver::allocation_granularity(&context)?,
             context,
+            account,
             blocks: Mutex::new(Vec::new()),
-        }
+        })
     }
 
     fn blocks(&self) -> MutexGuard<'_, Vec<Arc<Block>>> {
@@ -88,13 +94,10 @@ impl Blocks {
                     .filter(|block| !block.dedicated)
                     .map(|block| block.allocation.bytes as u64)
                     .max();
-                let account = self.context.device_account.get();
-                let room = account.map_or(room, |account| {
-                    let available = account.available();
-                    Some(room.map_or(available, |room| room.min(available)))
-                });
+                let available = self.account.available();
+                let room = Some(room.map_or(available, |room| room.min(available)));
                 let size = block_bytes(largest, BLOCK_CAP_BYTES, bytes, room, self.granularity)?;
-                let charge = account.map(|account| account.reserve(size)).transpose()?;
+                let charge = self.account.reserve(size)?;
                 let allocation = Allocation::new(
                     &self.context,
                     usize::try_from(size).map_err(|_| {

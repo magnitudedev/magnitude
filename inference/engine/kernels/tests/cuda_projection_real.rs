@@ -657,13 +657,28 @@ fn real_26b_grouped_physical_f16_operands() {
     };
     // The GGUF's experts are unscaled: the scale ports are absent.
     let unscaled = Tensor::zeros(&device, Element::f32(), &[0]).unwrap();
+    // Every block used, over every row; no map.
+    let (rows, used) = (i32_tensor(&device, &[1], &[m as i32]), i32_tensor(&device, &[1], &[e as i32]));
+    let (map, step) = (
+        Tensor::zeros(&device, Element::i32(), &[0, magnitude_kernels::constants::MAP_WORDS]).unwrap(),
+        Tensor::zeros(&device, Element::i32(), &[0]).unwrap(),
+    );
+    let first = Tensor::zeros(&device, Element::i32(), &[1]).unwrap();
     let args = || magnitude_kernels::routed_experts::Args {
+        first: &first,
+        rows: &rows,
         normalized: &input,
         order: &order,
         blocks: &blocks,
+        used: &used,
         expert_gate: &gate,
         expert_up: &up,
         expert_down: &down,
+        map: &map,
+        step: &step,
+        records_gate: &gate,
+        records_up: &up,
+        records_down: &down,
         activation: 1,
         gate_scale: &unscaled,
         up_scale: &unscaled,

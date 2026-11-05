@@ -1,0 +1,13 @@
+// Expert streaming, a scratch-served layer's request (`routed_scratch_request`
+// in routed.seismic); the Vulkan form of
+// `metal/routed_scratch_request.metal`: one workgroup's request
+// (streaming/scratch_request.hpp), its group words a word an expert.
+#include "lib/streaming/control.glsl"
+#include "../streaming/round.hpp"
+#include "../streaming/scratch_request.hpp"
+
+void routed_scratch_request() {
+    streaming_scratch_request(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES), SEISMIC_PTR(SEISMIC_BUFFER_STEP),
+        SEISMIC_PTR(SEISMIC_BUFFER_FLAGS), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH), 0u, gl_LocalInvocationIndex,
+        gl_WorkGroupSize.x);
+}

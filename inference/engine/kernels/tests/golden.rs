@@ -11,9 +11,9 @@
 //! nondeterministic outputs); `compare` requires identical hashes for the
 //! same key set.
 //!
-//! Sources are read from `kernels/` (or `GOLDEN_KERNELS`) at run time through
-//! the dynamic API, so a record, an edit of the kernel sources and a compare
-//! run use one test binary.
+//! Sources are read from `kernels/` under the run-time `CARGO_MANIFEST_DIR`
+//! through the dynamic API, so a record, an edit of the kernel sources and a
+//! compare run use one test binary.
 //!
 //! ```text
 //! GOLDEN_MODE=record|compare GOLDEN_DIR=<dir> GOLDEN_FAMILIES=projection,readout \
@@ -1487,6 +1487,8 @@ fn routed_output(ctx: &Ctx) -> Vec<Variant> {
                                 &[m as u64, ROUTED_HIDDEN as u64],
                                 &activations(&mut rng, m, ROUTED_HIDDEN, 1.0),
                             ),
+                            // No inject: the single residual stream (`IN` 0).
+                            ctx.dense(f32e(), &[m as u64, 0], &[]),
                             ctx.dense(
                                 a,
                                 &[m as u64, k as u64, ROUTED_FFN as u64],
@@ -1501,6 +1503,8 @@ fn routed_output(ctx: &Ctx) -> Vec<Variant> {
                                 &[m as u64, k as u64],
                                 &routes(m, ROUTED_EXPERTS_SMALL, 70 + m as u64),
                             ),
+                            // No sources (`XS` 0): each choice reads its expert's stack row.
+                            ctx.ints(&[0, m as u64, k as u64], &[]),
                             ctx.dense(
                                 f32e(),
                                 &[m as u64, k as u64],
@@ -1508,6 +1512,8 @@ fn routed_output(ctx: &Ctx) -> Vec<Variant> {
                             ),
                             ctx.dense(f32e(), &[m as u64], &uniform(&mut rng, m, 0.1, 0.9)),
                             Arg::Shared(weights.tensors[2].clone()),
+                            // No host tier (`TR` 0): a view of none of the down records.
+                            Arg::Shared(ctx.tensor(weights.elements[2], &[0, ROUTED_HIDDEN as u64, ROUTED_FFN as u64], &[])),
                             Arg::Shared(weights.tensors[5].clone()),
                         ],
                     }
@@ -1522,6 +1528,7 @@ fn routed_output(ctx: &Ctx) -> Vec<Variant> {
                     ("K", ROUTED_CHOICES as u64),
                     ("F", ROUTED_FFN as u64),
                     ("S", ROUTED_SHARED as u64),
+                    ("TR", 0),
                 ],
                 every_configuration: every,
                 cases,
@@ -1539,6 +1546,8 @@ fn routed_group(ctx: &Ctx) -> Vec<Variant> {
             Case {
                 label: format!("m{m}e{e}"),
                 args: vec![
+                    ctx.ints(&[1], &[0]),
+                    ctx.ints(&[1], &[m as i32]),
                     ctx.ints(&[m as u64, k as u64], &routes(m, e, 80 + m as u64)),
                     Arg::Mutable {
                         element: Element::i32(),
@@ -1559,6 +1568,11 @@ fn routed_group(ctx: &Ctx) -> Vec<Variant> {
                         element: Element::i32(),
                         shape: vec![b as u64],
                         bytes: i32_bytes(&vec![-5; b]),
+                    },
+                    Arg::Mutable {
+                        element: Element::i32(),
+                        shape: vec![1],
+                        bytes: i32_bytes(&[-5]),
                     },
                 ],
             }
@@ -1595,9 +1609,12 @@ fn routed_experts(ctx: &Ctx) -> Vec<Variant> {
                     let b = group_blocks(m, e);
                     let routes = routes(m, e, 90 + m as u64);
                     let (order, _, blocks) = host_group(&routes, e, b);
+                    let used = blocks.iter().filter(|expert| **expert >= 0).count() as i32;
                     Case {
                         label: format!("m{m}"),
                         args: vec![
+                            ctx.ints(&[1], &[0]),
+                            ctx.ints(&[1], &[m as i32]),
                             ctx.dense(
                                 a,
                                 &[m as u64, ROUTED_HIDDEN as u64],
@@ -1605,6 +1622,13 @@ fn routed_experts(ctx: &Ctx) -> Vec<Variant> {
                             ),
                             ctx.ints(&[b as u64, ROUTED_TILE as u64], &order),
                             ctx.ints(&[b as u64], &blocks),
+                            ctx.ints(&[1], &[used]),
+                            Arg::Shared(weights.tensors[0].clone()),
+                            Arg::Shared(weights.tensors[1].clone()),
+                            Arg::Shared(weights.tensors[2].clone()),
+                            // No slot map: the stacks also bind as the
+                            // records, never read.
+                            ctx.ints(&[0], &[]),
                             Arg::Shared(weights.tensors[0].clone()),
                             Arg::Shared(weights.tensors[1].clone()),
                             Arg::Shared(weights.tensors[2].clone()),
@@ -2459,7 +2483,18 @@ fn configurations(
 ) -> Vec<Vec<(String, u64)>> {
     let params = &parameters(native);
     let total = params.iter().map(|p| p.values.len()).product::<usize>();
-    let default = params.iter().map(|p| p.values[0]).collect::<Vec<_>>();
+    // Each parameter's declared default at the statics, in `parameters`' order.
+    let dimension = |name: &str| {
+        statics
+            .iter()
+            .find(|(static_name, _)| *static_name == name)
+            .map(|(_, value)| *value)
+    };
+    let default = native
+        .device_independent()
+        .expect("a golden declaration's defaults read no device property")
+        .parameter_defaults(&dimension)
+        .expect("a declared default has a listed value at the case's statics");
     let mut chosen: Vec<Vec<u64>> = Vec::new();
     let push = |config: Vec<u64>, chosen: &mut Vec<Vec<u64>>| {
         if !chosen.contains(&config) {
@@ -2496,7 +2531,7 @@ fn configurations(
     } else {
         push(default.clone(), &mut chosen);
         for (i, parameter) in params.iter().enumerate() {
-            for value in &parameter.values[1..] {
+            for value in parameter.values.iter().filter(|value| **value != default[i]) {
                 let mut config = default.clone();
                 config[i] = *value;
                 push(config, &mut chosen);
@@ -2871,10 +2906,10 @@ fn golden() {
         gguf,
         weights: Default::default(),
     };
-    // A harness built from a snapshot of the tree may check the live sources.
-    let kernels = std::env::var_os("GOLDEN_KERNELS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernels"));
+    let kernels = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    )
+    .join("kernels");
     // `GOLDEN_SOURCES` names the declaration files to load (so another
     // family's in-progress declarations cannot block a run); default: all.
     let sources = match std::env::var("GOLDEN_SOURCES")

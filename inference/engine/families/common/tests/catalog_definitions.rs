@@ -35,7 +35,8 @@ const FAMILIES: [&dyn ModelFamily; 7] = [
 ];
 
 fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/catalog-definitions.json")
+    PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/catalog-definitions.json")
 }
 
 fn identity() -> PackageIdentity {

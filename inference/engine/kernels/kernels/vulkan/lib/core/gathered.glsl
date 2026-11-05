@@ -7,7 +7,8 @@
 // `entries` rows of `fields` I32 (`stride` elements apart, fields adjacent),
 // is dense (`fields` 1: every table row's slot or -1) or hashed (`fields` 2:
 // `entries` linearly probed (row, slot) buckets, a power of two; row -1 is
-// empty and ends a probe, -2 a tombstone a probe passes). A failed selection (-1) and a row without a slot read row 0.
+// empty and ends a probe, -2 a tombstone a probe passes). A selection that
+// names no row (-1) and a row without a slot give -1: the reader reads zeros.
 //
 // Reads through <seismic/element.glsl>, which the including entry provides.
 
@@ -22,22 +23,22 @@ uint gathered_bucket(int row, uint buckets) {
     return h & (buckets - 1u);
 }
 
-uint64_t gathered_row(uint64_t directory, uint64_t stride, uint64_t entries, uint64_t fields,
+int64_t gathered_row(uint64_t directory, uint64_t stride, uint64_t entries, uint64_t fields,
     int selected) {
     if (selected < 0)
-        return 0ul;
+        return -1l;
     if (entries == 0ul)
-        return uint64_t(selected);
+        return int64_t(selected);
     if (fields == 1ul)
-        return uint64_t(max(element_i32_index(directory, uint64_t(selected) * stride), 0));
+        return int64_t(element_i32_index(directory, uint64_t(selected) * stride));
     const uint mask = uint(entries) - 1u;
     uint probe = gathered_bucket(selected, uint(entries));
     for (uint64_t visited = 0ul; visited < entries; ++visited, probe = (probe + 1u) & mask) {
         const int key = element_i32_index(directory, uint64_t(probe) * stride);
         if (key == selected)
-            return uint64_t(max(element_i32_index(directory, uint64_t(probe) * stride + 1ul), 0));
+            return int64_t(element_i32_index(directory, uint64_t(probe) * stride + 1ul));
         if (key == -1)
             break;
     }
-    return 0ul;
+    return -1l;
 }

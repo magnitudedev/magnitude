@@ -49,6 +49,27 @@ pub const BLOCK: usize = 16;
 /// into `rows16`, whose moves are nearly all copies, by up to a quarter.
 pub const EXECUTION_BYTES: usize = 4096;
 
+/// Source bytes each thread converts at least. Measured (whole tensors of 64
+/// KiB to 16 MiB of `q8_0`, `q4_k`, `iq4_xs` and `q3_k` packets into their
+/// packet forms, M4 Max): a quarter or half of it speeds tensors of 1 MiB
+/// (`q3_k` 730 to 270 µs at a quarter) but slows the fastest of 4 MiB
+/// (`q8_0` 215 to 300 µs at a quarter, 245 µs at half); four times it slows
+/// every tensor of 4 MiB or more (`q3_k` 1.0 to 3.0 ms at 4 MiB). A
+/// scaled-codes placement of a progressive head runs every core at any of
+/// these: a `q8_0` head of 32768 × 4096 (136 MiB), all its planes with the
+/// radii mapped, takes 19.0 ms at it, 19.3 ms at half and 19.2 ms at four
+/// times (best of 5, alternating, M4 Max).
+const BYTES_PER_THREAD: usize = 1 << 20;
+
+/// Threads converting `bytes` source bytes: every available one, but none
+/// for fewer than [`BYTES_PER_THREAD`] bytes of its own.
+pub fn threads(bytes: usize) -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(bytes.div_ceil(BYTES_PER_THREAD))
+        .max(1)
+}
+
 /// `bytes` (at least [`BLOCK`]) bytes of input segment `input_segment` from
 /// byte `input` copied to output segment `output_segment` from byte
 /// `output`.
@@ -1279,12 +1300,6 @@ impl RepackProgram {
         self.packets as usize
     }
 
-    /// Where each output segment starts in the output of a staged
-    /// execution, the segments one after another.
-    pub fn output_starts(&self) -> &[u32] {
-        &self.output_starts
-    }
-
     fn output_bytes(&self) -> usize {
         self.output_bytes as usize
     }
@@ -1446,22 +1461,7 @@ impl StreamProgram {
         };
         let mut output = vec![0u8; source.len() / unit * per_unit];
         let executions = source.len().div_ceil(execution);
-        /// Source bytes each thread converts at least. Measured (whole
-        /// tensors of 64 KiB to 16 MiB of `q8_0`, `q4_k`, `iq4_xs` and
-        /// `q3_k` packets into their packet forms, M4 Max): a quarter or
-        /// half of it speeds tensors of 1 MiB (`q3_k` 730 to 270 µs at a
-        /// quarter) but slows the fastest of 4 MiB (`q8_0` 215 to 300 µs at
-        /// a quarter, 245 µs at half); four times it slows every tensor of
-        /// 4 MiB or more (`q3_k` 1.0 to 3.0 ms at 4 MiB). A scaled-codes
-        /// placement of a progressive head runs every core at any of these:
-        /// a `q8_0` head of 32768 × 4096 (136 MiB), all its planes with the
-        /// radii mapped, takes 19.0 ms at it, 19.3 ms at half and 19.2 ms
-        /// at four times (best of 5, alternating, M4 Max).
-        const BYTES_PER_THREAD: usize = 1 << 20;
-        let threads = std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .min(source.len().div_ceil(BYTES_PER_THREAD))
-            .max(1);
+        let threads = threads(source.len());
         let chunk = executions.div_ceil(threads).max(1);
         // Executions `first..` writing `output` from its first: reading the
         // source in place when it holds every byte an execution may read,
@@ -1838,7 +1838,7 @@ impl RepackExecutor<'_> {
     ///
     /// # Safety
     /// As [`run_into`](Self::run_into)'s for the sources.
-    unsafe fn run_from(&mut self, sources: &[*const u8]) -> &[u8] {
+    pub unsafe fn run_from(&mut self, sources: &[*const u8]) -> &[u8] {
         let mut outputs = std::mem::take(&mut self.staged_outputs);
         // The bases derive from the buffer's own pointer (`Vec::as_mut_ptr`),
         // for this run alone, as `run`'s sources do.
@@ -2338,8 +2338,10 @@ mod tests {
     /// (`engine/kernels/tests/support/gguf_vectors`).
     #[test]
     fn programs_repack_reference_blocks_as_the_interpreter() {
-        let vectors = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../engine/kernels/tests/support/gguf_vectors");
+        let vectors = std::path::Path::new(
+            &std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+        )
+        .join("../../engine/kernels/tests/support/gguf_vectors");
         for conversion in registry::representation_conversions() {
             let layout = conversion.source_layout;
             let group = u64::from(layout.logical_group);

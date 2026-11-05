@@ -53,7 +53,9 @@ import type {
   MeasurementState,
   ModelInstance,
   ModelPerformance,
+  ModelResidency as NativeModelResidency,
   ReadyModel,
+  StreamedModelPerformance,
   UnsupportedLocalModel as NativeUnsupportedLocalModel,
 } from "@magnitudedev/icn-protocol/schemas"
 import type { CustomModelsConfig } from "@magnitudedev/storage"
@@ -160,10 +162,24 @@ const projectMeasurement = (measurement: MeasurementState): MachineMeasurement =
     : { _tag: measurement._tag }
 
 /** A pending speed carries the machine's measurement progress, which is what it waits on. */
-const projectPerformance = (performance: ModelPerformance, measurement: MeasurementState) =>
+const projectPerformance = <Performance extends ModelPerformance | StreamedModelPerformance>(
+  performance: Performance,
+  measurement: MeasurementState,
+) =>
   performance._tag === "Pending"
     ? { _tag: "Pending" as const, measurement: projectMeasurement(measurement) }
-    : performance
+    : performance as Exclude<Performance, { readonly _tag: "Pending" }>
+
+/** Every speed a fit carries waits on the same machine measurements. */
+const projectFitResidency = (residency: NativeModelResidency, measurement: MeasurementState) =>
+  residency._tag === "Streamed"
+    ? {
+        _tag: "Streamed" as const,
+        bank: residency.bank,
+        performance: projectPerformance(residency.performance, measurement),
+        floorPerformance: projectPerformance(residency.floorPerformance, measurement),
+      }
+    : { _tag: "Resident" as const, performance: projectPerformance(residency.performance, measurement) }
 
 export const projectAssessment = (
   snapshot: ModelAssessmentsSnapshot,
@@ -180,7 +196,7 @@ export const projectAssessment = (
       memory: {
         domains: assessment.memory, totalRequiredBytes, requiredSystemMemoryBytes,
       },
-      performance: projectPerformance(assessment.performance, snapshot.measurement),
+      residency: projectFitResidency(assessment.residency, snapshot.measurement),
     })
   }
   if (assessment._tag === "DoesNotFit") {
@@ -317,7 +333,7 @@ export const catalogModelServingState = (
         rankingScores: modelRankingScores({
           ...catalogScores,
           profile: assessment.assessment.profile,
-          performance: assessment.assessment.performance,
+          performance: assessment.assessment.residency.performance,
         }),
       }
     // The service never reports a catalog model as Unsupported; validation rejects that contract violation.

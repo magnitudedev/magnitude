@@ -24,8 +24,9 @@
 //!   for this decode (`crate::wire`). It neither parses nor checks: the
 //!   build's checker already did, in the same build as this decoder.
 //! - [`check_bundle_sources`] reads a bundle that arrives from outside the
-//!   binary (a `.seismicbundle` file). It checks the source section with
-//!   [`check_source`] and ignores the checked section.
+//!   binary (a `.seismicbundle` file). It checks the source section, with
+//!   its native assets, as [`check_source_with`] does, and ignores the
+//!   checked section.
 //!
 //! A corrupt or incompatible bundle is a typed error on both paths; after
 //! decoding, an out-of-range private arena id is a compiler panic (§13.3.2).
@@ -35,19 +36,20 @@
 use crate::check::ir::{Definition, Family};
 use crate::checked::internals::Module;
 use crate::checked::{
-    CheckedModule, EntryInfo, NativeImplementation, SourceFile, SourceSet, check_source,
+    CheckedModule, EntryInfo, NativeImplementation, SourceFile, SourceSet, check_source_with,
 };
 use crate::registry::BackendName;
 use crate::wire::{self, Scope};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 
 /// Format version of the bundle wire schema. Bumped on any wire change.
-pub const BUNDLE_FORMAT_VERSION: u32 = 7;
+pub const BUNDLE_FORMAT_VERSION: u32 = 11;
 
 /// Semantic version of the checker whose output this crate can decode.
 /// Bundles produced under a different semantic version are incompatible.
-pub const COMPILER_SEMANTIC_VERSION: &str = "seismic-semantics-v9";
+pub const COMPILER_SEMANTIC_VERSION: &str = "seismic-semantics-v10";
 
 const MAGIC: &[u8; 8] = b"SEISBND6";
 
@@ -107,8 +109,8 @@ pub fn encode_checked_bundle(module: &CheckedModule) -> Vec<u8> {
 
 /// The bundle-side constructor of a [`CheckedModule`], for a bundle the
 /// build embedded: validates and decodes the checked section. No parsing or
-/// checking happens.
-pub fn decode_checked_bundle(bytes: &[u8]) -> Result<CheckedModule, CheckedBundleError> {
+/// checking happens. The module borrows its native assets from `bytes`.
+pub fn decode_checked_bundle(bytes: &'static [u8]) -> Result<CheckedModule, CheckedBundleError> {
     let frame = Frame::read(verified(bytes)?)?;
     let (parts, decoded) = wire::decode(|| {
         postcard::from_bytes::<CheckedParts>(frame.checked)
@@ -127,12 +129,19 @@ pub fn decode_checked_bundle(bytes: &[u8]) -> Result<CheckedModule, CheckedBundl
             SourceSet::new(files),
         )
         .ok_or(CheckedBundleError::Corrupt)?;
-    with_assets(CheckedModule::decoded(module), frame.assets)
+    with_assets(
+        CheckedModule::decoded(module),
+        frame
+            .assets
+            .into_iter()
+            .map(|(entry, backend, source)| (entry, backend, Cow::Borrowed(source))),
+    )
 }
 
 /// Checks the source section of a bundle that arrives from outside the
-/// binary, exactly as [`check_source`] checks source text, and ignores its
-/// checked section. A source section that fails to check is `Corrupt`.
+/// binary, with its native assets, exactly as [`check_source_with`] checks
+/// source text, and ignores its checked section. A source section that
+/// fails to check is `Corrupt`.
 pub fn check_bundle_sources(bytes: &[u8]) -> Result<CheckedModule, CheckedBundleError> {
     let frame = Frame::read(verified(bytes)?)?;
     let files = frame
@@ -151,11 +160,32 @@ pub fn check_bundle_sources(bytes: &[u8]) -> Result<CheckedModule, CheckedBundle
     if source_hash(&canonical) != frame.source_hash {
         return Err(CheckedBundleError::HashMismatch);
     }
-    let checked = check_source(canonical).map_err(|_| CheckedBundleError::Corrupt)?;
+    // Each implementation's source is the bundle's asset of its entry and
+    // backend, which checking reads once; an implementation without its
+    // asset, or an asset no implementation reads, is corrupt.
+    let mut assets = std::collections::BTreeMap::new();
+    for (entry, backend, source) in frame.assets {
+        if assets.insert((entry.to_owned(), backend), source).is_some() {
+            return Err(CheckedBundleError::Corrupt);
+        }
+    }
+    let checked = check_source_with(
+        canonical,
+        &mut |entry: &str, native: &NativeImplementation| {
+            assets
+                .remove(&(entry.to_owned(), native.backend))
+                .map(|source| Some(Cow::Owned(source.to_owned())))
+                .ok_or(CheckedBundleError::Corrupt)
+        },
+    )
+    .map_err(|_| CheckedBundleError::Corrupt)?;
+    if !assets.is_empty() {
+        return Err(CheckedBundleError::Corrupt);
+    }
     if checked.semantic_hash().digest() != &frame.semantic_hash {
         return Err(CheckedBundleError::HashMismatch);
     }
-    with_assets(checked, frame.assets)
+    Ok(checked)
 }
 
 /// The payload of a bundle whose checksum trailer matches.
@@ -171,13 +201,13 @@ fn verified(bytes: &[u8]) -> Result<&[u8], CheckedBundleError> {
     Ok(payload)
 }
 
-fn with_assets(
+fn with_assets<'a>(
     mut module: CheckedModule,
-    assets: Vec<(String, BackendName, String)>,
+    assets: impl IntoIterator<Item = (&'a str, BackendName, Cow<'static, str>)>,
 ) -> Result<CheckedModule, CheckedBundleError> {
     for (name, backend, source) in assets {
         let entry = module
-            .entry_named(&name)
+            .entry_named(name)
             .ok_or(CheckedBundleError::Corrupt)?;
         if module.native_asset(entry, backend).is_some() {
             return Err(CheckedBundleError::Corrupt);
@@ -198,6 +228,7 @@ struct CheckedFields<'a> {
     entry_families: &'a [usize],
     definitions: &'a [Definition],
     families: &'a [Family],
+    constants: &'a [(String, u64)],
 }
 
 impl<'a> CheckedFields<'a> {
@@ -214,6 +245,7 @@ impl<'a> CheckedFields<'a> {
             entry_families,
             definitions,
             families,
+            constants,
         } = module;
         Self {
             entries,
@@ -221,6 +253,7 @@ impl<'a> CheckedFields<'a> {
             entry_families,
             definitions,
             families,
+            constants,
         }
     }
 }
@@ -236,6 +269,7 @@ struct CheckedParts {
     definitions: Vec<(Definition, Scope)>,
     #[serde(deserialize_with = "wire::deserialize_scoped")]
     families: Vec<(Family, Scope)>,
+    constants: Vec<(String, u64)>,
 }
 
 impl CheckedParts {
@@ -253,6 +287,7 @@ impl CheckedParts {
             entry_families,
             definitions,
             families,
+            constants,
         } = self;
         let within = |reached: u32, length: usize| reached as usize <= length;
         let valid = within(decoded.entries, entries.len())
@@ -264,6 +299,7 @@ impl CheckedParts {
                 .all(|(ordinal, entry)| entry.id.index() == ordinal)
             && unique(entries.iter().map(|entry| entry.name.as_str()))
             && unique(entries.iter().map(|entry| entry.stable))
+            && unique(constants.iter().map(|(name, _)| name.as_str()))
             && entry_families.len() == entries.len()
             && entry_families.iter().all(|family| *family < families.len())
             && entries
@@ -312,7 +348,7 @@ impl CheckedParts {
             id: decoded.module,
             program: decoded.program,
             semantic_hash,
-            sources,
+            sources: std::sync::Arc::new(sources),
             entries,
             native_implementations,
             entry_families,
@@ -321,6 +357,7 @@ impl CheckedParts {
                 .map(|(definition, _)| definition)
                 .collect(),
             families: families.into_iter().map(|(family, _)| family).collect(),
+            constants,
         })
     }
 }
@@ -335,7 +372,7 @@ struct Frame<'a> {
     source_hash: [u8; 32],
     semantic_hash: [u8; 32],
     files: Vec<(String, String)>,
-    assets: Vec<(String, BackendName, String)>,
+    assets: Vec<(&'a str, BackendName, &'a str)>,
     checked: &'a [u8],
 }
 
@@ -361,10 +398,10 @@ impl<'a> Frame<'a> {
         let files = reader
             .counted(|reader| Ok((reader.string()?.to_owned(), reader.string()?.to_owned())))?;
         let assets = reader.counted(|reader| {
-            let entry = reader.string()?.to_owned();
+            let entry = reader.string()?;
             let backend =
                 BackendName::parse(reader.string()?).ok_or(CheckedBundleError::Corrupt)?;
-            Ok((entry, backend, reader.string()?.to_owned()))
+            Ok((entry, backend, reader.string()?))
         })?;
         let length = usize::try_from(reader.u64()?).map_err(|_| CheckedBundleError::Corrupt)?;
         let checked = reader.take(length)?;
@@ -463,6 +500,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checked::check_source;
     use crate::entry::ElementBindings;
 
     const SOURCE: &str = "fn twice(x: f32) -> f32:\n    return x + x\n\nfn scale[N](x: &tensor[N] f32, factor: f32, output: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        output[i] = twice(x[i]) * factor\n\nfn prefix[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    let mut total = 0.0\n    for i in 0..N:\n        if x[i] > 0.0:\n            total = total + x[i]\n        output[i] = total\n    return output\n\nnative twice for metal from \"twice.metal\":\n    launch twice:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
@@ -488,18 +526,46 @@ mod tests {
         bytes
     }
 
+    /// `bytes` held for the process, as a build embeds a bundle.
+    fn embedded(bytes: Vec<u8>) -> &'static [u8] {
+        bytes.leak()
+    }
+
+    /// A module constant declared in one file is the integer it names in
+    /// every file, the checked module exports it, and its bundle carries it;
+    /// two of one name, or one named like a function, are refused.
+    #[test]
+    fn module_constants_are_shared_by_the_source_set_and_carried_by_the_bundle() {
+        let file = |path: &str, text: &str| SourceFile { path: path.into(), text: text.into() };
+        let words = file("words.seismic", "const FIRST = 2\nconst STRIDE = 3\n");
+        let user = file(
+            "user.seismic",
+            "fn pick[C](control: &tensor[C] i32) -> i32 where C >= FIRST + STRIDE:\n    return control[FIRST + STRIDE - 1]\n",
+        );
+        let module = check_source(SourceSet::new(vec![words.clone(), user])).unwrap();
+        let expected = [("FIRST".to_owned(), 2), ("STRIDE".to_owned(), 3)];
+        assert_eq!(module.constants(), expected);
+        let decoded = decode_checked_bundle(embedded(encode_checked_bundle(&module))).unwrap();
+        assert_eq!(decoded.constants(), expected);
+        let twice = file("twice.seismic", "const FIRST = 5\n");
+        assert!(check_source(SourceSet::new(vec![words.clone(), twice])).is_err());
+        let clash = file("clash.seismic", "fn FIRST() -> i32:\n    return 1\n");
+        assert!(check_source(SourceSet::new(vec![words, clash])).is_err());
+    }
+
     #[test]
     fn decoding_rebuilds_the_checked_module_under_fresh_owners() {
         let module = checked();
-        let encoded = encode_checked_bundle(&module);
-        let first = decode_checked_bundle(&encoded).unwrap();
-        let second = decode_checked_bundle(&encoded).unwrap();
+        let encoded = embedded(encode_checked_bundle(&module));
+        let first = decode_checked_bundle(encoded).unwrap();
+        let second = decode_checked_bundle(encoded).unwrap();
         assert_eq!(encode_checked_bundle(&first), encoded);
         assert_eq!(first.semantic_hash(), module.semantic_hash());
         assert_eq!(first.sources(), module.sources());
         assert_eq!(first.entries().len(), module.entries().len());
         for (decoded, original) in first.entries().iter().zip(module.entries()) {
             assert_eq!(decoded.stable, original.stable);
+            assert_eq!(decoded.content, original.content);
             assert_eq!(decoded.parameter_types, original.parameter_types);
             assert_eq!(decoded.element_domain, original.element_domain);
         }
@@ -507,7 +573,7 @@ mod tests {
         assert_ne!(first.entries()[0].id, second.entries()[0].id);
         let twice = first.entry_named("twice").unwrap();
         assert_eq!(
-            first.native_asset(twice, BackendName::Metal),
+            first.native_asset(twice, BackendName::Metal).map(|asset| asset.text),
             Some("kernel version one")
         );
         for info in first.entries() {
@@ -548,10 +614,10 @@ mod tests {
             text: broken,
         }]);
         bytes[hash_at..hash_at + 32].copy_from_slice(&source_hash(&broken_sources));
-        let bytes = resealed(bytes);
-        assert!(decode_checked_bundle(&bytes).is_ok());
+        let bytes = embedded(resealed(bytes));
+        assert!(decode_checked_bundle(bytes).is_ok());
         assert_eq!(
-            check_bundle_sources(&bytes).err(),
+            check_bundle_sources(bytes).err(),
             Some(CheckedBundleError::Corrupt)
         );
     }
@@ -569,7 +635,7 @@ mod tests {
 
     #[test]
     fn corruption_and_incompatible_wire_fail_closed() {
-        let encoded = encode_checked_bundle(&checked());
+        let encoded = embedded(encode_checked_bundle(&checked()));
         assert_eq!(
             decode_checked_bundle(&[]).err(),
             Some(CheckedBundleError::Corrupt)
@@ -580,19 +646,19 @@ mod tests {
         );
         let truncated = resealed(encoded[..encoded.len() - 40].to_vec());
         assert_eq!(
-            decode_checked_bundle(&truncated).err(),
+            decode_checked_bundle(embedded(truncated)).err(),
             Some(CheckedBundleError::Corrupt)
         );
-        let mut flipped = encoded.clone();
+        let mut flipped = encoded.to_vec();
         flipped[encoded.len() / 2] ^= 1;
         assert_eq!(
-            decode_checked_bundle(&flipped).err(),
+            decode_checked_bundle(embedded(flipped)).err(),
             Some(CheckedBundleError::HashMismatch)
         );
-        let mut version = encoded.clone();
+        let mut version = encoded.to_vec();
         version[8..12].copy_from_slice(&3u32.to_le_bytes());
         assert_eq!(
-            decode_checked_bundle(&resealed(version)).err(),
+            decode_checked_bundle(embedded(resealed(version))).err(),
             Some(CheckedBundleError::IncompatibleVersion)
         );
     }
@@ -602,10 +668,10 @@ mod tests {
         let mut encoded = encode_checked_bundle(&checked());
         let version_start = 8 + 4 + 4;
         let version_end = version_start + COMPILER_SEMANTIC_VERSION.len();
-        encoded[version_start..version_end].copy_from_slice(b"seismic-semantics-v7");
-        let encoded = resealed(encoded);
+        encoded[version_start..version_end].copy_from_slice(b"seismic-semantics-v09");
+        let encoded = embedded(resealed(encoded));
         assert_eq!(
-            decode_checked_bundle(&encoded).err(),
+            decode_checked_bundle(encoded).err(),
             Some(CheckedBundleError::IncompatibleVersion)
         );
     }
@@ -624,8 +690,8 @@ mod tests {
             for change in [0x01, 0x80, 0xff] {
                 let mut bytes = encoded.clone();
                 bytes[position] ^= change;
-                let bytes = resealed(bytes);
-                let outcome = std::panic::catch_unwind(|| decode_checked_bundle(&bytes));
+                let bytes = embedded(resealed(bytes));
+                let outcome = std::panic::catch_unwind(|| decode_checked_bundle(bytes));
                 match outcome.unwrap_or_else(|_| panic!("byte {position} ^ {change:#x} panics")) {
                     Ok(_) => {}
                     Err(error) => {

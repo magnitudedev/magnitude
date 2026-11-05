@@ -78,10 +78,18 @@
 //! not take the time held back for the ending, nor run past the budget.
 //! A piece that compiles is started only if its compile ends within the
 //! budget at the most a compile has taken as far as the load has seen:
-//! the longest that has ended, and one that nothing served
-//! ([`Unit::cold_compile`]). Where a system cache serves most compiles, the
-//! compiles a load observes are its hits, and a miss's cost is seen only
-//! in the compile that nothing served. The ending begins at the
+//! the longest that has ended. A compile runs only where no stored
+//! artifact serves the program. On a toolchain whose artifact is the whole
+//! program (CUDA, Vulkan), every compile a load observes is one that
+//! compiled and a load from the store compiles nothing. On one whose loads
+//! form the program again through the platform's cache (Metal), neither
+//! holds: a compile of a program whose artifact the store dropped may be
+//! served by that cache, and a load it no longer serves takes a compile's
+//! time. So there, until a unit has observed a load, a load is priced as
+//! the longest compile the process has observed and every operation is held
+//! to that compile at least; after, to the longest load observed
+//! (`UnitSearch::longest_operation`). The former counts and times those
+//! loads. The ending begins at the
 //! cutoff of the pieces in flight, whatever their compiles are doing: the
 //! allocator waits for a compile no later than that, and from it nothing
 //! more is admitted or measured. A piece whose measurement has not run by
@@ -375,16 +383,6 @@ pub(crate) trait Unit {
     /// no other such piece in flight.
     fn host_footprint(&self, _context: &Self::Context) -> Option<u64> {
         Some(0)
-    }
-    /// What a compile took that nothing served, once the load has run one
-    /// ([`Workers`] compiles may be served by a cache the load cannot see):
-    /// with the longest compile the load has run, what a compile is held
-    /// to end within ([`allocate`]); nothing before it has run.
-    fn cold_compile(_context: &Self::Context) -> Duration
-    where
-        Self: Sized,
-    {
-        Duration::ZERO
     }
     /// The host bytes one thread of a compile holds while it runs, as this
     /// load observed its compiles; nothing where the host is not a domain
@@ -949,9 +947,8 @@ pub(crate) fn allocate<U: Unit>(
         };
         // A compile cannot be interrupted, and abandoned at the ending it is
         // waited for. So beside its forecast it is held to end within the
-        // budget at the most a compile can take as far as the load has
-        // seen: the longest that has ended, and one that nothing served.
-        let cold = compiled.max(U::cold_compile(context));
+        // budget at the most a compile has taken as far as the load has
+        // seen: the longest that has ended.
         // The one admission rule over the whole queue: everything admitted,
         // the new piece in its place among it, and what is owed after end
         // within the budget; and a piece's compile, at the most a compile
@@ -961,7 +958,7 @@ pub(crate) fn allocate<U: Unit>(
             jobs.push(job(work));
             device_ends(now, jobs).saturating_add(owed[unit]) <= total
                 && (!ahead(work)
-                    || now.saturating_add(forecast(&work.forming, longest).max(cold)) <= total)
+                    || now.saturating_add(forecast(&work.forming, longest).max(compiled)) <= total)
         };
         let objective_ready = U::objective_ready(units);
         let discovering = offers.iter().any(|(unit, work)| {
@@ -1681,12 +1678,6 @@ mod tests {
         publication: Duration,
         changed: bool,
         published: usize,
-        /// What publishing a promoted choice's serving artifact takes, and
-        /// whether the served choice was promoted since its artifact was
-        /// published: owed by a unit that promoted, and after a piece only
-        /// if that piece is a conversion.
-        artifact: Duration,
-        unformed: bool,
         /// How many challengers a piece measures after its one compile, and
         /// how many the next piece is offered with ([`Unit::narrow`]).
         batch: usize,
@@ -1726,9 +1717,6 @@ mod tests {
     }
 
     thread_local! {
-        /// What a compile that nothing served took ([`Unit::cold_compile`]):
-        /// nothing unless a test sets it.
-        static COLD: Cell<Duration> = const { Cell::new(Duration::ZERO) };
         static MEMORY: Cell<Memory> = const {
             Cell::new(Memory {
                 held: 0,
@@ -1786,8 +1774,6 @@ mod tests {
                 publication: Duration::ZERO,
                 changed: false,
                 published: 0,
-                artifact: Duration::ZERO,
-                unformed: false,
                 batch: 1,
                 size: 1,
                 residue: 0,
@@ -1973,16 +1959,8 @@ mod tests {
             MEMORY.with(Cell::get).ceiling
         }
 
-        fn cold_compile(_: &Log) -> Duration {
-            COLD.with(Cell::get)
-        }
-
         fn owed(&self, worked: bool) -> Quote {
             let mut owed = Duration::ZERO;
-            // Only a conversion changes the served choice.
-            if self.unformed || (worked && self.lead.is_some()) {
-                owed += self.artifact;
-            }
             if self.changed || worked {
                 owed += self.publication;
             }
@@ -1990,9 +1968,6 @@ mod tests {
         }
 
         fn settle(&mut self, _: &mut Log) -> Result<(), String> {
-            if std::mem::take(&mut self.unformed) {
-                self.clock.pass(self.artifact);
-            }
             if std::mem::take(&mut self.changed) {
                 self.clock.pass(self.publication);
                 self.published += 1;
@@ -2083,7 +2058,6 @@ mod tests {
                     let lead = self.lead.take().expect("a promotion converts a lead");
                     if self.covers {
                         self.served = lead;
-                        self.unformed = true;
                     }
                 }
             }
@@ -2568,48 +2542,6 @@ mod tests {
         assert_eq!(report.ended, SECOND * 16);
         assert_eq!(report.overrun(), Duration::ZERO);
         assert_eq!(report.refused.len(), 1);
-    }
-
-    /// Compiles a system cache serves take a tenth of what one it does not
-    /// serve takes, and every compile the load runs is served: the load
-    /// sees only quick compiles. A compile that nothing served
-    /// ([`Unit::cold_compile`]) took 5 s, and no compile starts that would
-    /// run past the budget were it to take that long.
-    #[test]
-    fn a_compile_is_held_to_one_no_cache_served() {
-        COLD.with(|cold| cold.set(SECOND * 5));
-        let clock = Fake::default();
-        let mut units = [Synthetic {
-            compile: SECOND / 2,
-            measurement: SECOND / 2,
-            ..Synthetic::new(0, &clock, 1., &[1.; 100])
-        }];
-        let (_, report) = run(&mut units, &clock, 20);
-        COLD.with(|cold| cold.set(Duration::ZERO));
-        assert!(
-            report
-                .admitted
-                .iter()
-                .filter(|admitted| admitted.formed.is_some())
-                .all(|admitted| admitted.began + SECOND * 5 <= SECOND * 20),
-            "{report:?}"
-        );
-        assert!(report.abandoned.is_empty());
-        assert_eq!(report.overrun(), Duration::ZERO);
-        // Without it, the same load compiles until its last second.
-        let clock = Fake::default();
-        let mut units = [Synthetic {
-            compile: SECOND / 2,
-            measurement: SECOND / 2,
-            ..Synthetic::new(0, &clock, 1., &[1.; 100])
-        }];
-        let (_, report) = run(&mut units, &clock, 20);
-        assert!(
-            report
-                .admitted
-                .iter()
-                .any(|admitted| admitted.formed.is_some() && admitted.began > SECOND * 15)
-        );
     }
 
     fn stages(log: &[(usize, Stage, Duration)]) -> Vec<(usize, Stage)> {
@@ -3117,36 +3049,6 @@ mod tests {
         assert_eq!(units[0].measured.len(), 5);
         assert!(report.refused.is_empty());
         assert!(report.unused() > SECOND * 100);
-        // Units that promoted beside one still measuring: each owes its
-        // choice's serving artifact, a compile call, when the work stops,
-        // and nothing else is held back for it. The measuring unit's pieces
-        // promote nothing and add no artifact to what is owed, so the
-        // budget is still used to the smallest piece: what is unused is
-        // less than one call and one challenger, and what was owed is
-        // settled inside the budget.
-        for budget in [20u64, 60, 120] {
-            let clock = Fake::default();
-            let promoting = |name: usize| Synthetic {
-                artifact: call,
-                promotion: challenger,
-                ..Synthetic::new(name, &clock, 0.1, &[0.5])
-            };
-            let mut units = [
-                Synthetic {
-                    artifact: call,
-                    ..unit(&clock, 1000)
-                },
-                promoting(1),
-                promoting(2),
-            ];
-            let (_, report) = run(&mut units, &clock, budget);
-            assert!(units[1..].iter().all(|unit| unit.served == 0.5));
-            assert!(units.iter().all(|unit| !unit.unformed));
-            let unused = report.unused();
-            assert!(unused < call + challenger, "{budget} s: {unused:?} unused");
-            assert_eq!(report.overrun(), Duration::ZERO);
-            assert_eq!(report.settling, call * 2);
-        }
     }
 
     /// Formed programs are held by need, not by role. While everything

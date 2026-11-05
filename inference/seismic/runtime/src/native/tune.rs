@@ -41,7 +41,9 @@ use crate::api::kernel::{EncodedArgs, PrepareError};
 use crate::api::{CallError, TensorError};
 use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::prepared::{validate_invocation, InvocationContract};
-use seismic_lang::checked::{CheckedModule, NativeImplementation, NativeSpecialization};
+use seismic_lang::checked::{
+    CheckedModule, NativeDefault, NativeImplementation, NativeNatExpr, NativeSpecialization,
+};
 use seismic_lang::entry::{ElementBindings, LogicalEntry, ParameterKind, TensorAccess};
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::EntryId;
@@ -493,6 +495,10 @@ pub struct ConfigurationRecord {
     /// configurations.
     #[serde(default)]
     pub formation: Option<FormationRecord>,
+    /// What each of its launches' programs uses, in ordinal order
+    /// ([`NativePrepared::launch_programs`]); empty when nothing was
+    /// formed.
+    pub launches: Vec<Option<seismic_native_target::LaunchProgram>>,
 }
 
 /// How a search formed a configuration before it first measured it.
@@ -594,10 +600,6 @@ pub struct TuningResult {
     pub points: Vec<PointRecord>,
     /// What `overall` was chosen under.
     pub requirement: NumericalRequirement,
-    /// What every observation is a measurement of besides its point and
-    /// key: the comparison's version, the default's artifact, the entry and
-    /// the device. No requirement's α is part of it.
-    pub measurement_identity: String,
     /// Every observation made of the unit's candidates, each made once, in
     /// the order made. A candidate's record names its own.
     pub observations: Vec<NumericalObservation>,
@@ -622,6 +624,10 @@ pub struct TuningResult {
     /// points; `None` when no leader reached one.
     #[serde(default)]
     pub coverage: Option<CoverageCheck>,
+    /// What the formed defaults' launches use, in ordinal order
+    /// ([`NativePrepared::launch_programs`]), whether or not they were
+    /// measured.
+    pub default_launches: Vec<Option<seismic_native_target::LaunchProgram>>,
 }
 
 /// How the coverage checks of a unit's leaders stand.
@@ -694,7 +700,7 @@ pub enum TuneError {
         detail: String,
     },
     /// The chosen artifact could not be retained for serving without forming it again.
-    Publication(String),
+    Handoff(String),
 }
 
 impl std::fmt::Display for TuneError {
@@ -703,7 +709,7 @@ impl std::fmt::Display for TuneError {
             Self::Declaration(message)
             | Self::Domain(message)
             | Self::Reference(message)
-            | Self::Publication(message) => {
+            | Self::Handoff(message) => {
                 write!(f, "{message}")
             }
             Self::NoValidatedCandidate(failures) => write!(
@@ -762,7 +768,7 @@ pub struct SurveyPlan {
     pub samples: usize,
     pub min_sample_seconds: f64,
     /// Replacement value lists for some parameters, widening the declared
-    /// space. Each keeps its declared default first.
+    /// space. Each keeps every declared value.
     pub domains: BTreeMap<String, Vec<u64>>,
 }
 
@@ -860,7 +866,7 @@ fn held_bytes(device: &DeviceInner, charged: u64, retained: u64, footprint: Opti
 /// admitted on a footprint below what the build demands, which an unbuilt
 /// point's price only forecasts. The point's price (`resident`) is raised to
 /// what the build demanded: what it took of what the device's storage could
-/// take before it ([`DeviceInner::storage_available`]) until the refusal
+/// take before it ([`DeviceInner::room`]) until the refusal
 /// left `available`, and the `required` bytes refused. `None` ends the
 /// piece. Offered again at that price, it is admitted as any priced piece:
 /// once enough is free, so the same allocation is not refused again, or
@@ -874,7 +880,7 @@ fn build_point<'a>(
     index: usize,
     resident: &mut Observed,
 ) -> Result<Option<TuningPoint<'a>>, TuneError> {
-    let before = device.storage_available(seismic_topology::StorageKind::Device);
+    let before = device.room(seismic_topology::Contract::DeviceOnly);
     let built = match source.build(index) {
         Ok(inputs) => TuningPoint::new(spec, inputs)?.timed(device),
         Err(error) => Err(error),
@@ -1211,33 +1217,21 @@ struct FormationPrice {
     /// anything forms, rendered: its class is read from them whenever it
     /// is asked ([`Rendered`]).
     rendered: BTreeMap<Formable, Rendered>,
-    /// The programs publishing the serving artifact of each choice asked
-    /// about since the unit last formed anything forms, rendered
-    /// ([`UnitSearch::publication`]).
-    serving: BTreeMap<NativeSpecialization, Rendered>,
-}
-
-/// What publishing a choice's serving artifact does, known before it runs
-/// ([`UnitSearch::artifact_publication`]): what a load's publications are
-/// observed against.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Publication {
-    /// The programs of the choice the toolchain compiles; none when the
-    /// store keeps each as a load requests it.
-    pub sources: usize,
-    /// What forming the unit's canonical program took in this process:
-    /// the same source text, compiled once already, with each launch's
-    /// single variant as a publication compiles it.
-    pub canonical: Duration,
 }
 
 impl FormationPrice {
     /// The price of one challenger formation call that does `formative`;
     /// none while nothing it can be priced by was observed. `toolchain`:
-    /// what the device's toolchain's compiles took in this load.
-    fn of(&self, (class, entries): Formative, toolchain: &Linear) -> Option<f64> {
+    /// what the device's toolchain's compiles took in this process. Where
+    /// the toolchain loads through a platform cache (`platform`), a load
+    /// may take a compile's time, so until one is observed it is priced as
+    /// the longest compile observed.
+    fn of(&self, (class, entries): Formative, toolchain: &Linear, platform: bool) -> Option<f64> {
         match class {
-            FormationClass::Kept => self.kept.price(),
+            FormationClass::Kept => self
+                .kept
+                .price()
+                .or_else(|| (platform && toolchain.longest() > 0.).then(|| toolchain.longest())),
             FormationClass::Compiled => match (self.compiled.each(), self.compiled.mean()) {
                 (Some(_), _) => self.compiled.price(entries),
                 (None, Some((seconds, size))) => {
@@ -1261,7 +1255,6 @@ impl FormationPrice {
             FormationClass::Compiled => self.compiled.observe(entries, seconds.as_secs_f64()),
         }
         self.rendered.clear();
-        self.serving.clear();
     }
 
     /// The longest formation observed.
@@ -1316,7 +1309,7 @@ impl Forming<'_> {
         let held = |device: &DeviceInner| {
             held_bytes(
                 device,
-                device.storage_usage(seismic_topology::StorageKind::Device).charged,
+                device.device_ledger().charged,
                 0,
                 ProcessMemory::footprint_now(),
             )
@@ -1373,34 +1366,6 @@ impl Forming<'_> {
     }
 }
 
-/// What compiling one of a unit's programs takes when nothing the toolchain
-/// formed or kept serves it, the system's caches included
-/// ([`UnitSearch::cold_compile`]): it reads nothing of the unit, so it
-/// runs on any thread. A compile cannot be interrupted, and where a system
-/// cache serves most of a load's compiles the load observes only its hits:
-/// an M6 load (2026-10-12) whose compiles had all taken under 0.17 s
-/// started one at 59.75 s, priced at 0.044 s, that missed the cache and
-/// took 0.39 s past its budget. This is what such a miss takes.
-pub struct ColdCompile {
-    device: Arc<DeviceInner>,
-    source: seismic_native_target::ProgramSource,
-}
-
-impl ColdCompile {
-    /// The length of the program's text: what of a load's units is the
-    /// largest compile.
-    pub fn size(&self) -> usize {
-        self.source.text.len()
-    }
-
-    /// Compile the program cold, and drop it. Returns what it took; none
-    /// if the compile failed, which says nothing of what one takes. The
-    /// program is the canonical default's, which the load has formed.
-    pub fn run(self) -> Option<Duration> {
-        self.device.programs.cold(&self.source).ok()
-    }
-}
-
 /// A compile that ran ([`Forming::run`]), for its unit to hold
 /// ([`UnitSearch::formed`]).
 pub struct Formed {
@@ -1420,118 +1385,7 @@ struct FormedCall {
     elapsed: Duration,
 }
 
-/// Publication of the served choice's serving artifact: what a later
-/// process requests when it loads the unit's published choice.
 impl UnitSearch<'_, '_> {
-    /// The unit's served choice as it stands: the canonical default until
-    /// a challenger is promoted.
-    fn served_choice(&self) -> &NativeSpecialization {
-        match &self.progress {
-            Progress::Searching(searching) => &searching.ledger.incumbent().specialization,
-            Progress::Discovering(_) => &self.default,
-        }
-    }
-
-    /// The choice the unit's next piece serves if it promotes: the leader
-    /// of a conversion. None when the next piece is no conversion.
-    fn converting(&self) -> Option<&NativeSpecialization> {
-        let Progress::Searching(searching) = &self.progress else {
-            return None;
-        };
-        let ledger = &searching.ledger;
-        let leader = match self.next()?.stage {
-            Stage::Promote => ledger.leader()?,
-            Stage::Confirm => ledger.nominal()?.0,
-            Stage::Discovery | Stage::Form | Stage::Measure => return None,
-        };
-        Some(&ledger.contenders[leader].specialization)
-    }
-
-    /// What publishing the serving artifact of `choice` does, read from
-    /// the store before it runs ([`Rendered::publication`]).
-    fn publication(&self, choice: &NativeSpecialization) -> (Formative, usize) {
-        let mut price = self.formation_price.lock().expect("formation price lock");
-        price
-            .serving
-            .entry(choice.clone())
-            .or_insert_with(|| {
-                NativePrepared::publication_rendered(
-                    &self.device,
-                    self.module,
-                    self.entry,
-                    &self.logical,
-                    &self.bindings,
-                    choice,
-                    &self.implementation,
-                )
-            })
-            .publication(&self.device)
-    }
-
-    /// The price of [`UnitSearch::publish_artifact`]: of the served choice
-    /// as it stands, or, `worked`, as it
-    /// stands once the unit's next piece has run, which changes it only if
-    /// that piece is a conversion and promotes its leader. A choice whose
-    /// programs the store keeps as a load requests them (the canonical
-    /// default's, and any the search formed alone) owes nothing: its
-    /// publication runs no compiler. One that the store lacks owes one call
-    /// of the toolchain.
-    ///
-    /// This is the price before the load has published an artifact that
-    /// compiled: a load's publications are a class of their own, priced by
-    /// its consumer from the ones it has run
-    /// ([`UnitSearch::artifact_publication`]). Until one has, nothing the
-    /// unit observed is a publication, and two things stand in for one:
-    /// a challenger formation call of that size ([`FormationPrice::of`]),
-    /// and the unit's canonical program's formation, the same programs at
-    /// the default choice. Neither is it: one load's publications took
-    /// eight times the first (its challenger compiles had found the
-    /// system's shader cache warm, 64 to 73 ms against 3 to 8 ms) and
-    /// another's a third of the second. The price is the larger of the
-    /// two: holding back too little runs past the budget, and holding back
-    /// too much delays a piece until the first publication is observed.
-    ///
-    /// Every promoted unit was owed a compile whatever the store kept: a
-    /// load of twenty units held back 5.6 s of its last 5.6 s for
-    /// publications that then took 0.29 s, thirteen of sixteen compiling
-    /// nothing.
-    pub fn artifact_owed(&self, worked: bool) -> Quote {
-        let choice = worked
-            .then(|| self.converting())
-            .flatten()
-            .unwrap_or_else(|| self.served_choice());
-        let (formative, _) = self.publication(choice);
-        let mut owed = Quote::default();
-        if formative.0 == FormationClass::Compiled {
-            let toolchain = self.device.programs.compiled();
-            let price = self.formation_price.lock().expect("formation price lock");
-            let canonical = price.canonical.as_secs_f64();
-            let formed = price.of(formative, &toolchain);
-            owed.add(
-                Some(formed.map_or(canonical, |formed| formed.max(canonical))),
-                1,
-            );
-        }
-        owed
-    }
-
-    /// What [`UnitSearch::publish_artifact`] does, known before it runs:
-    /// of the served choice as it stands, or,
-    /// `worked`, as it stands once the unit's next piece has run.
-    pub fn artifact_publication(&self, worked: bool) -> Publication {
-        let choice = worked
-            .then(|| self.converting())
-            .flatten()
-            .unwrap_or_else(|| self.served_choice());
-        let (_, sources) = self.publication(choice);
-        let canonical = self
-            .formation_price
-            .lock()
-            .expect("formation price lock")
-            .canonical;
-        Publication { sources, canonical }
-    }
-
     /// What building the inputs the unit holds took, each point's at its
     /// class's price: what giving them up is held to before the load has
     /// observed inputs given up. It frees what building them allocated and
@@ -1562,51 +1416,6 @@ impl UnitSearch<'_, '_> {
         built
     }
 
-    /// A cold compile of the largest program of the unit's canonical
-    /// default ([`ColdCompile`]); none where that renders nothing, as on
-    /// the CPU backend.
-    pub fn cold_compile(&self) -> Option<ColdCompile> {
-        let sources = NativePrepared::serving_programs(
-            &self.device,
-            self.module,
-            self.entry,
-            &self.logical,
-            &self.bindings,
-            &self.default,
-            &self.implementation,
-        )
-        .ok()?;
-        let source = sources.into_iter().max_by_key(|source| source.text.len())?;
-        Some(ColdCompile {
-            device: self.device.clone(),
-            source,
-        })
-    }
-
-    /// Publish the serving artifact of the unit's served choice: form its
-    /// programs exactly as a load requests them, each launch's single
-    /// variant, and release them ([`NativePrepared::publish`]). A choice
-    /// the search formed among many variants of a launch is served to this
-    /// process out of that compile; the artifact a later load requests is
-    /// formed here, as the choice is promoted. The canonical default
-    /// was formed that way by the mandatory work, and a choice already
-    /// published forms nothing. Returns what it took.
-    pub fn publish_artifact(&mut self) -> Result<Duration, TuneError> {
-        let began = Instant::now();
-        NativePrepared::publish(
-            &self.device,
-            self.module,
-            self.entry,
-            &self.logical,
-            &self.bindings,
-            self.served_choice(),
-            &self.implementation,
-        )
-        .map_err(|error| TuneError::Publication(prepare_message(error)))?;
-        let elapsed = began.elapsed();
-        self.time.forming_seconds += elapsed.as_secs_f64();
-        Ok(elapsed)
-    }
 }
 
 /// The compile of a unit's canonical program ([`UnitSearch::grounding`]).
@@ -1726,6 +1535,7 @@ impl<'m> Formation<'_, 'm> {
         let mut quote = Quote::default();
         let threads = formation_threads(formables.len());
         let toolchain = self.device.programs.compiled();
+        let platform = self.device.programs.platform_cached();
         let formatives = formables
             .iter()
             .map(|formable| self.class(formable))
@@ -1742,7 +1552,7 @@ impl<'m> Formation<'_, 'm> {
             let in_turn = calls.len().div_ceil(threads) as f64 / calls.len() as f64;
             let seconds = calls
                 .iter()
-                .map(|formative| price.of(**formative, &toolchain))
+                .map(|formative| price.of(**formative, &toolchain, platform))
                 .sum::<Option<f64>>();
             quote.add(seconds.map(|seconds| seconds * in_turn), 1);
         }
@@ -2911,6 +2721,8 @@ struct Contender {
     kernel: Option<Arc<NativePrepared>>,
     /// The identity of its formed artifact.
     artifact: String,
+    /// What its launches' programs use ([`NativePrepared::launch_programs`]).
+    launches: Vec<Option<seismic_native_target::LaunchProgram>>,
     /// Its time at every timed point in the unit's canonical units
     /// ([`Matched`]), as last measured: in the session that first measured
     /// it, then in each session of its conversion.
@@ -3005,6 +2817,7 @@ impl Ledger {
                 Contender {
                     specialization: default.clone(),
                     artifact: kernel.artifact().0.clone(),
+                    launches: kernel.launch_programs(),
                     kernel: Some(kernel),
                     points: canonical,
                     confirmed: Vec::new(),
@@ -3078,6 +2891,7 @@ impl Ledger {
             Contender {
                 specialization,
                 artifact,
+                launches: kernel.as_deref().map(NativePrepared::launch_programs).unwrap_or_default(),
                 kernel,
                 points,
                 confirmed: Vec::new(),
@@ -3219,6 +3033,11 @@ impl Ledger {
         self.order
             .iter()
             .map(|configuration| {
+                let launches = self
+                    .contenders
+                    .get(configuration)
+                    .map(|contender| contender.launches.clone())
+                    .unwrap_or_default();
                 let (artifact, outcome) = match (
                     self.contenders.get(configuration),
                     self.excluded.get(configuration),
@@ -3242,6 +3061,7 @@ impl Ledger {
                 };
                 ConfigurationRecord {
                     formation: self.formations.get(configuration).copied(),
+                    launches,
                     configuration: configuration.clone(),
                     observations: artifact
                         .as_deref()
@@ -3630,15 +3450,19 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         } = request;
         let backend = super::backend_name(&device.kind);
         let entry_name = super::entry_name(module, entry);
-        let mut implementation =
-            super::offered(device, module, entry, &bindings).ok_or_else(|| {
+        let implementation = super::offered(device, module, entry, &bindings)
+            .ok_or_else(|| {
                 TuneError::Declaration(format!(
                     "`{entry_name}` has no native implementation for `{}`",
                     backend.as_str()
                 ))
+            })?
+            .with_defaults_at(&statics)
+            .map_err(|error| TuneError::Declaration(error.to_string()))?
+            .adjusted(|implementation| {
+                fix(implementation, statics.params())?;
+                widen(implementation, domains)
             })?;
-        fix(&mut implementation, statics.params())?;
-        widen(&mut implementation, domains)?;
         // Every configuration formed is this one entry at these bindings.
         let logical = Arc::new(
             module
@@ -3669,7 +3493,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             cpu,
             backend,
             surveyor: Some(PointSurveyor::new(&implementation, true)),
-            implementation,
+            implementation: implementation.into_implementation(),
             logical,
             mutable,
             default,
@@ -3748,7 +3572,6 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     pub fn grounded(&mut self, grounded: Grounded) -> Result<(), TuneError> {
         let kernel = grounded.kernel?;
         let validator = Validator::new(
-            &self.device,
             &self.logical,
             &self.mutable,
             &self.unit.requirement,
@@ -3756,7 +3579,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         );
         kernel
             .hand_off()
-            .map_err(|error| TuneError::Publication(error.to_string()))?;
+            .map_err(|error| TuneError::Handoff(error.to_string()))?;
         self.ground = Some(Ground { kernel, validator });
         self.time.forming_seconds += grounded.elapsed.as_secs_f64();
         // Every launch of the canonical program, or the one program.
@@ -4065,7 +3888,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     fn held(&self) -> u64 {
         held_bytes(
             &self.device,
-            self.device.storage_usage(seismic_topology::StorageKind::Device).charged,
+            self.device.device_ledger().charged,
             self.ground
                 .as_ref()
                 .map_or(0, |ground| ground.validator.retained_bytes()),
@@ -4109,7 +3932,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         let held = || {
             held_bytes(
                 device,
-                device.storage_usage(seismic_topology::StorageKind::Device).charged,
+                device.device_ledger().charged,
                 validator.retained_bytes(),
                 ProcessMemory::footprint_now(),
             )
@@ -4166,12 +3989,16 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 Progress::Discovering(_) => None,
             })
             .fold(self.longest, f64::max);
-        Duration::from_secs_f64(observed).max(
-            self.formation_price
-                .lock()
-                .expect("formation price lock")
-                .longest(),
-        )
+        let price = self.formation_price.lock().expect("formation price lock");
+        // A platform-cached toolchain's load may take a compile's time: until
+        // the unit has observed a load, it is held to the longest compile
+        // this process observed; after, to the longest load observed, which
+        // the formation price holds.
+        let compiles = match self.device.programs.platform_cached() && price.kept.price().is_none() {
+            true => self.device.programs.compiled().longest(),
+            false => 0.,
+        };
+        Duration::from_secs_f64(observed.max(compiles)).max(price.longest())
     }
 
     /// The next discovery point: the first whose defaults are unmeasured.
@@ -4577,7 +4404,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // What the piece holds is read from the ledgers' high-water marks,
         // started again here: what it took and gave back within itself is
         // seen.
-        self.device.restart_memory_high_water();
+        self.device.restart_high_water();
         if let Some(ground) = &self.ground {
             ground.validator.restart_retained_high_water();
         }
@@ -4587,7 +4414,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // within it is over this.
         let ledgers = |unit: &Self| {
             (
-                unit.device.storage_usage(seismic_topology::StorageKind::Device),
+                unit.device.device_ledger(),
                 unit.ground.as_ref().map_or((0, 0), |ground| {
                     (
                         ground.validator.retained_bytes(),
@@ -4666,7 +4493,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             began_bytes,
             peak_bytes: held_bytes(
                 &self.device,
-                self.device.storage_usage(seismic_topology::StorageKind::Device).high_water,
+                self.device.device_ledger().high_water,
                 self.ground
                     .as_ref()
                     .map_or(0, |ground| ground.validator.retained_high_water()),
@@ -4674,7 +4501,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             ),
             ended_bytes: held_bytes(
                 &self.device,
-                self.device.storage_usage(seismic_topology::StorageKind::Device).charged,
+                self.device.device_ledger().charged,
                 self.ground
                     .as_ref()
                     .map_or(0, |ground| ground.validator.retained_bytes()),
@@ -4682,7 +4509,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             ),
             ledger_peak_bytes: self
                 .device
-                .storage_usage(seismic_topology::StorageKind::Device)
+                .device_ledger()
                 .high_water
                 + self
                     .ground
@@ -4734,7 +4561,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // within it is priced from what the piece took of it.
         let before = self
             .device
-            .storage_available(seismic_topology::StorageKind::Device);
+            .room(seismic_topology::Contract::DeviceOnly);
         let building = Instant::now();
         let Some(point) = build_point(
             &self.device,
@@ -4763,7 +4590,8 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         }
         let mut point = ground.validator.point(point)?;
         let shape =
-            point_shapes(&self.device, &self.logical, std::slice::from_ref(&point))?.remove(0);
+            point_shapes(&self.device, &self.logical, std::slice::from_ref(&point))?
+                .remove(0);
         // The defaults' time here is the unit of every time the unit
         // records and the point's weight in what it optimises: the median
         // of three samples, the fewest whose median one sample cannot
@@ -5204,7 +5032,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         deadline.check(Duration::ZERO)?;
         kernel
             .hand_off_replacing(ledger.incumbent().kernel.as_deref())
-            .map_err(|error| TuneError::Publication(error.to_string()))?;
+            .map_err(|error| TuneError::Handoff(error.to_string()))?;
         ledger
             .contenders
             .get_mut(&leader)
@@ -5269,11 +5097,12 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 points: point_records(&self.specs),
                 records: ledger.records(&ground.validator),
                 served: ledger.served.clone(),
-                evidence: Evidence::of(&ground.validator),
+                observations: ground.validator.observations(),
             },
             &incumbent.specialization,
             method,
             time,
+            ground.kernel.launch_programs(),
         );
         // The native default is the reference: serving it qualifies nothing.
         let default = &ground.kernel.artifact().0;
@@ -5505,7 +5334,8 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             ground: &ground,
         };
         let (configurations, overall, method, time) = tuned.survey(&points, plan)?;
-        let mut result = self.unit.result(configurations, &overall, method, time);
+        let mut result =
+            self.unit.result(configurations, &overall, method, time, ground.kernel.launch_programs());
         result.points = records;
         result.time.building_seconds += self.time.building_seconds;
         result.time.forming_seconds += self.time.forming_seconds;
@@ -5525,12 +5355,16 @@ struct Unit {
 }
 
 impl Unit {
+    /// The unit's record of `configurations`, choosing `overall`, its
+    /// formed defaults' launches `default_launches`
+    /// ([`NativePrepared::launch_programs`]).
     fn result(
         &self,
         configurations: Records,
         overall: &NativeSpecialization,
         method: TuningMethod,
         time: TuningTime,
+        default_launches: Vec<Option<seismic_native_target::LaunchProgram>>,
     ) -> TuningResult {
         TuningResult {
             disposition: TuningDisposition::QualifiedCandidate,
@@ -5539,8 +5373,7 @@ impl Unit {
             backend: self.backend.clone(),
             points: configurations.points,
             requirement: self.requirement.clone(),
-            measurement_identity: configurations.evidence.identity,
-            observations: configurations.evidence.observations,
+            observations: configurations.observations,
             served: configurations.served,
             reselection: None,
             implementation_identity: self.implementation_identity.clone(),
@@ -5550,6 +5383,7 @@ impl Unit {
             method,
             time,
             coverage: None,
+            default_launches,
         }
     }
 
@@ -5566,6 +5400,7 @@ impl Unit {
         time: TuningTime,
     ) -> TuningResult {
         let kernel = &ground.kernel;
+        let launches = kernel.launch_programs();
         // The canonical default is the reference itself: measuring it
         // qualifies nothing.
         let configurations = if defaults.is_empty() {
@@ -5573,6 +5408,7 @@ impl Unit {
         } else {
             vec![ConfigurationRecord {
                 formation: None,
+                launches: launches.clone(),
                 configuration: Configuration::of(default),
                 artifact: Some(kernel.artifact().0.clone()),
                 observations: Vec::new(),
@@ -5587,11 +5423,12 @@ impl Unit {
                 points: records,
                 records: configurations,
                 served: vec![Configuration::of(default)],
-                evidence: Evidence::of(&ground.validator),
+                observations: ground.validator.observations(),
             },
             default,
             TuningMethod::Census,
             time,
+            launches,
         );
         result.disposition = TuningDisposition::CanonicalFallback {
             artifact: kernel.artifact().0.clone(),
@@ -7253,10 +7090,10 @@ pub fn implementation_digest(
 /// (`SEISMIC_NVRTC_DIRECTORY`) and changes without a driver change, so its
 /// release and this build's compile options are digested; NVRTC that
 /// cannot be loaded is an error. Vulkan's shader compiler is built into
-/// this binary, which the rendered source and the CPU digest do not name
-/// but the engine build's identity does. Metal's compiler is the operating
-/// system's, named by the OS build in the executor's identity. CPU kernels
-/// are compiled into the binary, named by their digest.
+/// this binary, so its release, SPIR-V target and seal passes are digested
+/// (`seismic_vulkan::formation::compiler`). Metal's compiler is the
+/// operating system's, named by the OS build in the executor's identity.
+/// CPU kernels are compiled into the binary, named by their digest.
 pub fn kernel_digest(
     backend: BackendName,
     module: &CheckedModule,
@@ -7279,7 +7116,15 @@ pub fn kernel_digest(
                 backend.as_str()
             ))
         })?;
+    // A kernel's identity names a backend, not a device: a declaration
+    // whose defaults read the device has no device-free default to name.
     let default = implementation
+        .device_independent()
+        .ok_or_else(|| {
+            declaration(format!(
+                "`{entry_name}`'s defaults read the device's properties; a kernel identity names no device"
+            ))
+        })?
         .default_specialization(statics)
         .map_err(|error| declaration(error.to_string()))?;
     let mut digest = Sha256::new();
@@ -7315,17 +7160,20 @@ pub fn kernel_digest(
         // The lane count is a value the prefix states, not a feature: any
         // one renders the same source otherwise.
         #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-        BackendName::Vulkan => Some(super::abi::Dialect::Vulkan(
-            super::abi::vulkan::VulkanFeatures {
-                subgroup_lanes: 32,
-                float16: false,
-                matrix: false,
-                wide_accumulators: false,
-                mixed_dot: false,
-                f32_atomic_add: false,
-                shared_int64_atomics: false,
-            },
-        )),
+        BackendName::Vulkan => {
+            digest.update(seismic_vulkan::formation::compiler().as_bytes());
+            Some(super::abi::Dialect::Vulkan(
+                super::abi::vulkan::VulkanFeatures {
+                    subgroup_lanes: 32,
+                    float16: false,
+                    matrix: false,
+                    wide_accumulators: false,
+                    mixed_dot: false,
+                    f32_atomic_add: false,
+                    shared_int64_atomics: false,
+                },
+            ))
+        }
         #[cfg(not(any(not(target_os = "macos"), test, feature = "coverage")))]
         BackendName::Vulkan => {
             return Err(declaration(
@@ -7351,46 +7199,54 @@ pub fn kernel_digest(
 }
 
 /// Checked entry IDs carry a process-local owner. A tuning result names the
-/// declaration's values and stable source identity, never that owner. Where
-/// the declaring file was read from is not the implementation either: a build
-/// canonicalizes its sources to absolute paths, so the same sources built in
-/// another directory must keep their stored results. The native source the
-/// declaration names is digested by content, rendered for the entry.
+/// declaration's values and the entry's content, never that owner. The
+/// content is what the entry's meaning depends on and nothing else of its
+/// module ([`seismic_lang::ids::EntryContent`]): an edit to another entry
+/// keeps this one's stored results, and an edit to anything it may call
+/// does not. Where the declaring file was read from is not the
+/// implementation either: a build canonicalizes its sources to absolute
+/// paths, so the same sources built in another directory must keep their
+/// stored results. The native source the declaration names is digested by
+/// content, rendered for the entry.
 fn update_declaration_digest(
     digest: &mut Sha256,
     module: &CheckedModule,
     entry_name: &str,
     implementation: &NativeImplementation,
 ) {
-    digest.update(b"native-declaration-v2");
+    // Every field of the declaration but its process-local entry and the
+    // label of the file it sits in: a field added to it is in the digest
+    // or named here.
+    let NativeImplementation {
+        entry,
+        backend,
+        declared_in: _,
+        source_path,
+        statics,
+        params,
+        elements,
+        records,
+        constraint,
+        scratch,
+        launches,
+        repeat,
+    } = implementation;
+    digest.update(b"native-declaration-v3");
     digest.update(format!("{entry_name:?}").as_bytes());
     digest.update(
         format!(
             "{:?}",
             (
-                implementation.backend,
-                &implementation.source_path,
-                &implementation.statics,
-                &implementation.params,
-                &implementation.elements,
-                &implementation.constraint,
-                &implementation.scratch,
-                &implementation.launches,
+                backend, source_path, statics, params, elements, records, constraint,
+                scratch, launches, repeat,
             )
         )
         .as_bytes(),
     );
-    // The declaration is named by entry within the module's source text. A
-    // stable entry identity also hashes the paths the sources were built
-    // from, which never identify an implementation.
-    digest.update(b"checked-native-source-v4");
-    for file in module.sources().files() {
-        digest.update((file.text.len() as u64).to_le_bytes());
-        digest.update(file.text.as_bytes());
-    }
-    let name = super::entry_name(module, implementation.entry);
-    digest.update((name.len() as u64).to_le_bytes());
-    digest.update(name.as_bytes());
+    // A stable entry identity names the whole module, with the paths its
+    // sources were built from; the content names the entry's closure alone.
+    digest.update(b"checked-entry-content-v1");
+    digest.update(super::entry_info(module, *entry).content.digest());
 }
 
 /// Fix the parameters a unit's statics value (a parameter its bindings
@@ -7413,11 +7269,15 @@ fn fix(
             )));
         }
         parameter.values = vec![*value];
+        // Its one value is its default.
+        parameter.default = NativeDefault::Value(NativeNatExpr::Constant(*value));
     }
     Ok(())
 }
 
-/// Replace parameter domains for a survey. Each keeps its default first.
+/// Replace parameter domains for a survey, each a widening of the
+/// declared values, so each default, resolved before
+/// ([`seismic_lang::checked::OnDevice::with_defaults_at`]), stays listed.
 fn widen(
     implementation: &mut NativeImplementation,
     domains: &BTreeMap<String, Vec<u64>>,
@@ -7428,10 +7288,9 @@ fn widen(
             .iter_mut()
             .find(|parameter| parameter.name == *name)
             .ok_or_else(|| TuneError::Domain(format!("no parameter `{name}` is declared")))?;
-        if values.first() != parameter.values.first() {
+        if let Some(dropped) = parameter.values.iter().find(|value| !values.contains(value)) {
             return Err(TuneError::Domain(format!(
-                "widened values of `{name}` must keep its default {:?} first",
-                parameter.values.first()
+                "widened values of `{name}` must keep every declared value; {dropped} is missing"
             )));
         }
         parameter.values = values.clone();
@@ -7446,22 +7305,8 @@ struct Records {
     records: Vec<ConfigurationRecord>,
     /// The choices served in turn ([`TuningResult::served`]).
     served: Vec<Configuration>,
-    evidence: Evidence,
-}
-
-/// What a unit observed of its candidates against its default.
-struct Evidence {
-    identity: String,
+    /// What the unit observed of its candidates against its default.
     observations: Vec<NumericalObservation>,
-}
-
-impl Evidence {
-    fn of(validator: &Validator) -> Self {
-        Self {
-            identity: validator.identity().to_owned(),
-            observations: validator.observations(),
-        }
-    }
 }
 
 /// One entry's survey.
@@ -7508,6 +7353,7 @@ impl Tuned<'_> {
             time.forming_seconds += began.elapsed().as_secs_f64();
             for (specialization, kernel) in batch.into_iter().zip(kernels) {
                 let began = Instant::now();
+                let launches = kernel.as_ref().map(|kernel| kernel.launch_programs()).unwrap_or_default();
                 let (artifact, outcome) = match kernel {
                     Err(exclusion) => (None, Outcome::Excluded(exclusion)),
                     Ok(kernel) => (
@@ -7533,6 +7379,7 @@ impl Tuned<'_> {
                 time.measuring_seconds += began.elapsed().as_secs_f64();
                 records.push(ConfigurationRecord {
                     formation: None,
+                    launches,
                     configuration: Configuration::of(&specialization),
                     observations: artifact
                         .as_deref()
@@ -7610,7 +7457,7 @@ impl Tuned<'_> {
                 points: labels(points),
                 records,
                 served,
-                evidence: Evidence::of(validator),
+                observations: validator.observations(),
             },
             chosen,
             TuningMethod::Survey {
@@ -8054,13 +7901,18 @@ mod tests {
 
     /// The Metal implementation of a one-entry module whose native
     /// declaration body is `body`.
+    /// `body` declared for Metal, checked with a source whose kernels take
+    /// no template parameters.
     fn declared(body: &str) -> NativeImplementation {
-        let module = check_source(SourceSet::new(vec![SourceFile {
-            path: "scale.seismic".into(),
-            text: format!(
-                "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n{body}"
-            ),
-        }]))
+        let module = seismic_lang::native_source::check_fixture(
+            SourceSet::new(vec![SourceFile {
+                path: "scale.seismic".into(),
+                text: format!(
+                    "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n{body}"
+                ),
+            }]),
+            &[],
+        )
         .unwrap();
         module
             .native_implementation(module.entries()[0].id, BackendName::Metal)
@@ -8088,13 +7940,13 @@ mod tests {
         let bands = (1..=3)
             .map(|rows| {
                 format!(
-                    "    launch band{rows} when N == {rows}:\n        params (WIDTH in [8, 4, 16], ROWS in [1, 2])\n        threadgroups (ceil_div(N, WIDTH * ROWS), 1, 1)\n        threads_per_threadgroup (WIDTH * 32, 1, 1)\n"
+                    "    launch band{rows} when N == {rows}:\n        params (WIDTH in [8, 4, 16] default 8, ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, WIDTH * ROWS), 1, 1)\n        threads_per_threadgroup (WIDTH * 32, 1, 1)\n"
                 )
             })
             .collect::<String>();
         let implementation = declared(&bands);
         let statics = NativeSpecialization::new();
-        let default = implementation.default_specialization(&statics).unwrap();
+        let default = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[1, 2, 3])).unwrap();
         let keying = launches(&partition);
         let domain = Declared {
@@ -8169,11 +8021,11 @@ mod tests {
     #[test]
     fn a_change_that_cannot_change_served_work_is_not_formed_under_either_keying() {
         let implementation = declared(
-            "    params (NEAR in [1, 2], FAR in [1, 2])\n    launch small when N < 8:\n        threadgroups (ceil_div(N, NEAR), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when N >= 8:\n        threadgroups (ceil_div(N, FAR), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+            "    params (NEAR in [1, 2] default 1, FAR in [1, 2] default 1)\n    launch small when N < 8:\n        threadgroups (ceil_div(N, NEAR), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when N >= 8:\n        threadgroups (ceil_div(N, FAR), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         );
         assert!(!implementation.launch_scoped());
         let statics = NativeSpecialization::new();
-        let default = implementation.default_specialization(&statics).unwrap();
+        let default = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
         let shapes = shapes(&[4, 16]);
         let (unserved, points) = unserved_parameters(&implementation, &statics, &shapes).unwrap();
         assert!(unserved.is_empty());
@@ -8239,10 +8091,10 @@ mod tests {
         // Only diagonal assignments are admissible: neither coordinate can
         // change alone. A coupled start covers both coordinates once.
         let implementation = declared(
-            "    params (LEFT in [2, 1, 4], RIGHT in [2, 1, 4])\n    where LEFT == RIGHT\n    launch gemv:\n        threadgroups (ceil_div(N, LEFT * RIGHT), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+            "    params (LEFT in [2, 1, 4] default 2, RIGHT in [2, 1, 4] default 2)\n    where LEFT == RIGHT\n    launch gemv:\n        threadgroups (ceil_div(N, LEFT * RIGHT), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         );
         let statics = NativeSpecialization::new();
-        let default = implementation.default_specialization(&statics).unwrap();
+        let default = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[4])).unwrap();
         let keying = launches(&partition);
         let domain = Declared {
@@ -8295,10 +8147,10 @@ mod tests {
     #[test]
     fn a_search_ends_when_its_domain_is_exhausted_and_finds_what_no_neighbourhood_holds() {
         let implementation = declared(
-            "    launch gemv:\n        params (A in [1, 2, 3], B in [1, 2, 3])\n        threadgroups (ceil_div(N, A * B), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+            "    launch gemv:\n        params (A in [1, 2, 3] default 1, B in [1, 2, 3] default 1)\n        threadgroups (ceil_div(N, A * B), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         );
         let statics = NativeSpecialization::new();
-        let seed = implementation.default_specialization(&statics).unwrap();
+        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[4])).unwrap();
         let keying = launches(&partition);
         let group = partition.groups[0].clone();
@@ -8360,10 +8212,10 @@ mod tests {
     #[test]
     fn a_boundary_that_moves_off_the_default_still_sweeps_its_groups_to_exhaustion() {
         let implementation = declared(
-            "    params (FROM in [3, 2, 5])\n    launch small when N < FROM:\n        params (A in [1, 2, 3], T in [0, 1, 2])\n        threadgroups (ceil_div(N, A + T), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when N >= FROM:\n        params (B in [1, 2, 3])\n        threadgroups (ceil_div(N, B), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+            "    params (FROM in [3, 2, 5] default 3)\n    launch small when N < FROM:\n        params (A in [1, 2, 3] default 1, T in [0, 1, 2] default 0)\n        threadgroups (ceil_div(N, A + T), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when N >= FROM:\n        params (B in [1, 2, 3] default 1)\n        threadgroups (ceil_div(N, B), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         );
         let statics = NativeSpecialization::new();
-        let seed = implementation.default_specialization(&statics).unwrap();
+        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
         let rows = [1u64, 2, 4];
         let partition = plan::partition(&implementation, &statics, &shapes(&rows)).unwrap();
         assert_eq!(
@@ -8453,7 +8305,7 @@ mod tests {
     #[test]
     fn unobserved_group_keeps_seed_on_equal_cost() {
         let implementation = declared(
-            "    launch gemv:\n        params (P in [2, 0, 1, 3])\n        threadgroups (ceil_div(N, P + 1), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+            "    launch gemv:\n        params (P in [2, 0, 1, 3] default 2)\n        threadgroups (ceil_div(N, P + 1), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         );
         let statics = NativeSpecialization::new();
         let partition = plan::partition(&implementation, &statics, &shapes(&[4])).unwrap();
@@ -8504,7 +8356,7 @@ mod tests {
                 .enumerate()
                 .map(|(parameter, name)| {
                     format!(
-                        "{}{name} in [1, 2]",
+                        "{}{name} in [1, 2] default 1",
                         if parameter < forms { "form " } else { "" }
                     )
                 })
@@ -8524,7 +8376,7 @@ mod tests {
         });
         assert_eq!(implementation.launch_scoped(), whole.is_none());
         let statics = NativeSpecialization::new();
-        let seed = implementation.default_specialization(&statics).unwrap();
+        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
         let (partition, keying) = match whole {
             Some(_) => {
                 let (unserved, points) =
@@ -8625,8 +8477,7 @@ mod tests {
     #[test]
     fn the_dense_output_search_reaches_the_packing_form_first() {
         // The engine's kernel sources as its build loads them.
-        let kernels =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../engine/kernels/kernels");
+        let kernels = crate::native::engine_kernels();
         let module = seismic_lang::source::load(&[kernels], seismic_std::sources())
             .unwrap_or_else(|_| panic!("the engine's kernel sources load"))
             .module;
@@ -8653,7 +8504,7 @@ mod tests {
             .with_static("F", 4096)
             .with_static("DS", 0)
             .with_static("DB", 0);
-        let seed = implementation.default_specialization(&statics).unwrap();
+        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
         let rows = [1u64, 8, 128];
         let shapes = rows
             .iter()
@@ -8959,11 +8810,12 @@ mod tests {
                     points: Vec::new(),
                     records: self.ledger.records(&self.validator),
                     served: self.ledger.served.clone(),
-                    evidence: Evidence::of(&self.validator),
+                    observations: self.validator.observations(),
                 },
                 &self.ledger.incumbent().specialization,
                 TuningMethod::Census,
                 TuningTime::default(),
+                Vec::new(),
             )
         }
     }
@@ -9017,7 +8869,7 @@ mod tests {
         .unwrap();
         let logical = Arc::new(module.entry(entry, &ElementBindings::new()).unwrap());
         let requirement = NumericalRequirement::BitExact;
-        let validator = Validator::new(&device, &logical, &[], &requirement, &kernel);
+        let validator = Validator::new(&logical, &[], &requirement, &kernel);
         let canonical = timed(points, |_| 0, |_| 1.);
         let cost = Weighing {
             weights: vec![1.; points],
@@ -9184,7 +9036,7 @@ mod tests {
             "    launch gemv:\n        params ({})\n        threadgroups (ceil_div(N, {}), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
             names
                 .iter()
-                .map(|name| format!("{name} in [{domain}]"))
+                .map(|name| format!("{name} in [{domain}] default 1"))
                 .collect::<Vec<_>>()
                 .join(", "),
             names.join(" * "),
@@ -9201,7 +9053,7 @@ mod tests {
             }
         };
         let statics = NativeSpecialization::new();
-        let seed = implementation.default_specialization(&statics).unwrap();
+        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[4])).unwrap();
         let reference = vec![measurement(&implementation, &seed)];
         let run = GroupSearch::new(partition, seed, reference, vec![1.], Vec::new());
@@ -9398,17 +9250,20 @@ mod tests {
     }
 
     #[test]
-    fn declaration_digest_uses_stable_entry_identity() {
+    fn declaration_digest_uses_the_entry_content() {
         let source = |domain: &str| {
             format!(
-                "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    launch scale:\n        params (code ROWS in {domain})\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
+                "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    launch scale:\n        params (ROWS in {domain} default 1)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
             )
         };
         let check = |path: &str, text: String| {
-            check_source(SourceSet::new(vec![SourceFile {
-                path: path.into(),
-                text,
-            }]))
+            seismic_lang::native_source::check_fixture(
+                SourceSet::new(vec![SourceFile {
+                    path: path.into(),
+                    text,
+                }]),
+                &["ROWS"],
+            )
             .unwrap()
         };
         // The same sources built in two directories are one implementation.
@@ -9446,11 +9301,28 @@ mod tests {
             digest(&first, first_entry),
             digest(&changed, changed.entry_named("scale").unwrap())
         );
+        // Another entry of the module, ahead of this one in its file, is
+        // not this implementation; a change to its own body is.
+        let other = |body: &str| {
+            check(
+                "/build/one/kernels/scale.seismic",
+                format!("fn other(x: f32) -> f32:\n    return {body}\n\n{}", source("[1, 2]")),
+            )
+        };
+        let (one, two) = (other("x + 1.0"), other("x * 2.0 + 1.0"));
+        let at = |module: &CheckedModule| digest(module, module.entry_named("scale").unwrap());
+        assert_eq!(at(&one), at(&two));
+        assert_eq!(at(&one), digest(&first, first_entry));
+        let copied = check(
+            "/build/one/kernels/scale.seismic",
+            source("[1, 2]").replace("return to_owned(x)", "let y = to_owned(x)\n    return y"),
+        );
+        assert_ne!(at(&copied), digest(&first, first_entry));
     }
 
     #[test]
     fn launch_keys_ignore_parameters_of_inactive_launches() {
-        let text = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (SPLIT in [1, 2])\n    launch gemv when N < 16:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch gemm when N >= 16:\n        threadgroups (N, 1, SPLIT)\n        threads_per_threadgroup (32, 1, 1)\n";
+        let text = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (SPLIT in [1, 2] default 1)\n    launch gemv when N < 16:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch gemm when N >= 16:\n        threadgroups (N, 1, SPLIT)\n        threads_per_threadgroup (32, 1, 1)\n";
         let module = check_source(SourceSet::new(vec![SourceFile {
             path: "scale.seismic".into(),
             text: text.into(),
@@ -9460,7 +9332,7 @@ mod tests {
             .native_implementation(module.entry_named("scale").unwrap(), BackendName::Metal)
             .unwrap();
         let default = implementation
-            .default_specialization(&NativeSpecialization::new())
+            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
             .unwrap();
         let split = default.clone().with_param("SPLIT", 2);
         assert_eq!(
@@ -9480,10 +9352,10 @@ mod tests {
     #[test]
     fn a_formed_variant_is_held_until_given_up_and_never_asked_for_twice() {
         let implementation = declared(
-            "    params (ROWS in [16, 32, 64])\n    launch gemv when N < 16:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (ROWS, 1, 1)\n    launch gemm when N >= 16:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (ROWS, 1, 1)\n",
+            "    params (ROWS in [16, 32, 64] default 16)\n    launch gemv when N < 16:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (ROWS, 1, 1)\n    launch gemm when N >= 16:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (ROWS, 1, 1)\n",
         );
         let default = implementation
-            .default_specialization(&NativeSpecialization::new())
+            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
             .unwrap();
         let rows = |rows| default.clone().with_param("ROWS", rows);
         let mut programs = Programs::Launches(LaunchPrograms::default());
@@ -9593,7 +9465,7 @@ mod tests {
 
     #[test]
     fn launch_keys_ignore_boundary_values_when_the_active_launch_is_unchanged() {
-        let text = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (arithmetic BATCH_FROM in [5, 9])\n    launch gemv when N < BATCH_FROM:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch batch when N >= BATCH_FROM:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n";
+        let text = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (arithmetic BATCH_FROM in [5, 9] default 5)\n    launch gemv when N < BATCH_FROM:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch batch when N >= BATCH_FROM:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n";
         let module = check_source(SourceSet::new(vec![SourceFile {
             path: "scale.seismic".into(),
             text: text.into(),
@@ -9603,7 +9475,7 @@ mod tests {
             .native_implementation(module.entry_named("scale").unwrap(), BackendName::Metal)
             .unwrap();
         let default = implementation
-            .default_specialization(&NativeSpecialization::new())
+            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
             .unwrap();
         let changed = default.clone().with_param("BATCH_FROM", 9);
         let boundary = [plan::ParameterAddress::Entry("BATCH_FROM".into())];
@@ -9621,7 +9493,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn no_formation_starts_that_cannot_end_before_the_deadline() {
-        use seismic_lang::checked::{SourceFile, SourceSet, check_source};
+        use seismic_lang::checked::{NativeImplementation, SourceFile, SourceSet, check_source_with};
         use seismic_lang::registry::BackendName;
         let Ok(device) = crate::devices::Devices::discover(&[])
             .expect("device discovery")
@@ -9629,15 +9501,17 @@ mod tests {
         else {
             return;
         };
-        let mut module = check_source(SourceSet::new(vec![SourceFile {
-            path: "copy.seismic".into(),
-            text: "fn copy[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative copy for metal from \"copy.metal\":\n    launch copy:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".into(),
-        }]))
+        let module = check_source_with(
+            SourceSet::new(vec![SourceFile {
+                path: "copy.seismic".into(),
+                text: "fn copy[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative copy for metal from \"copy.metal\":\n    launch copy:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".into(),
+            }]),
+            &mut |_entry: &str, _native: &NativeImplementation| {
+                Ok::<_, std::convert::Infallible>(Some("kernel void copy() {}\n".into()))
+            },
+        )
         .expect("copy source checks");
         let entry = module.entry_named("copy").expect("copy entry");
-        module
-            .capture_native_asset(entry, BackendName::Metal, "kernel void copy() {}\n".into())
-            .expect("asset capture");
         let bindings = ElementBindings::default();
         let logical = Arc::new(module.entry(entry, &bindings).expect("copy entry binds"));
         let implementation = super::super::on_device(
@@ -9717,7 +9591,7 @@ mod tests {
         let compiled = price
             .lock()
             .unwrap()
-            .of((FormationClass::Compiled, 1), &Linear::default());
+            .of((FormationClass::Compiled, 1), &Linear::default(), false);
         assert!(compiled.is_some_and(|mean| mean < 5.), "{compiled:?}");
         assert!(
             programs
@@ -9748,7 +9622,7 @@ mod tests {
                 price
                     .lock()
                     .unwrap()
-                    .of((FormationClass::Kept, 0), &Linear::default())
+                    .of((FormationClass::Kept, 0), &Linear::default(), false)
                     .unwrap()
             )
         );
@@ -9772,7 +9646,7 @@ mod tests {
         let mut price = FormationPrice::default();
         price.canonical = Duration::from_millis(180);
         assert_eq!(
-            price.of((Compiled, 4), &none),
+            price.of((Compiled, 4), &none, false),
             None,
             "a class never observed has no price"
         );
@@ -9780,18 +9654,38 @@ mod tests {
         price.observe((Compiled, 4), Duration::from_secs(1));
         price.observe((Compiled, 4), Duration::from_secs(3));
         assert_eq!(
-            price.of((Kept, 0), &none),
+            price.of((Kept, 0), &none, false),
             None,
             "a compile says nothing of a kept formation"
         );
         price.observe((Kept, 0), Duration::ZERO);
         price.observe((Kept, 0), Duration::ZERO);
         // Calls of one size: their mean, whatever is asked.
-        assert_eq!(price.of((Compiled, 4), &none), Some(2.));
-        assert_eq!(price.of((Compiled, 1), &none), Some(2.));
-        assert_eq!(price.of((Kept, 0), &none), Some(0.));
+        assert_eq!(price.of((Compiled, 4), &none, false), Some(2.));
+        assert_eq!(price.of((Compiled, 1), &none, false), Some(2.));
+        assert_eq!(price.of((Kept, 0), &none, false), Some(0.));
         assert_eq!(price.longest(), Duration::from_secs(3));
         assert_eq!(price.total(), 4.18);
+    }
+
+    /// On a toolchain that loads through a platform cache, a load the
+    /// platform no longer serves takes a compile's time: until a load is
+    /// observed it is priced as the longest compile the process observed,
+    /// and unpriced while there is none.
+    #[test]
+    fn a_platform_load_is_priced_as_a_compile_until_one_is_observed() {
+        use FormationClass::Kept;
+        let price = FormationPrice::default();
+        assert_eq!(price.of((Kept, 0), &Linear::default(), true), None);
+        let mut toolchain = Linear::default();
+        toolchain.observe(2, 1.5);
+        toolchain.observe(4, 3.);
+        assert_eq!(price.of((Kept, 0), &toolchain, true), Some(3.));
+        let complete = price.of((Kept, 0), &toolchain, false);
+        assert_eq!(complete, None, "a complete load prices nothing it did not see");
+        let mut observed = FormationPrice::default();
+        observed.observe((Kept, 0), Duration::from_millis(5));
+        assert_eq!(observed.of((Kept, 0), &toolchain, true), Some(0.005));
     }
 
     /// A class nothing prices is one unknown in a piece, however many of
@@ -9912,19 +9806,19 @@ mod tests {
         // A unit that has compiled nothing is priced by the toolchain's
         // compiles: its first piece is not unpriced.
         let mut unit = FormationPrice::default();
-        close(unit.of((Compiled, 4), &toolchain), 1.2);
-        assert_eq!(unit.of((Compiled, 4), &Linear::default()), None);
+        close(unit.of((Compiled, 4), &toolchain, false), 1.2);
+        assert_eq!(unit.of((Compiled, 4), &Linear::default(), false), None);
         // One call of its own, twice what the toolchain's line says of its
         // size: the unit's level, the toolchain's shape.
         unit.observe((Compiled, 20), Duration::from_secs_f64(4.0));
-        close(unit.of((Compiled, 20), &toolchain), 4.0);
-        close(unit.of((Compiled, 4), &toolchain), 2.4);
+        close(unit.of((Compiled, 20), &toolchain, false), 4.0);
+        close(unit.of((Compiled, 4), &toolchain, false), 2.4);
         // A mean over its calls would price the small call at 4 s.
         // Calls of two sizes: the unit's own line, 3 s a call and 0.05 s
         // an entry.
         unit.observe((Compiled, 40), Duration::from_secs_f64(5.0));
-        close(unit.of((Compiled, 4), &toolchain), 3.2);
-        close(unit.of((Compiled, 60), &toolchain), 6.0);
+        close(unit.of((Compiled, 4), &toolchain, false), 3.2);
+        close(unit.of((Compiled, 60), &toolchain, false), 6.0);
         // Neither term is negative: sizes whose times fall as they grow
         // are priced at their mean.
         let mut falling = Linear::default();
@@ -9980,7 +9874,7 @@ mod tests {
         let ended = run(
             &sequence,
             budget,
-            |class| classed.borrow().of((class, 1), &Linear::default()),
+            |class| classed.borrow().of((class, 1), &Linear::default(), false),
             |class, took| {
                 classed
                     .borrow_mut()

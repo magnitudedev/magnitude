@@ -173,7 +173,8 @@ impl<'a> QualificationView<'a> {
                         .value
                 }
                 (FeedForwardProgramSlot::Routed(binding), AttestedFeedForward::Routed(kernels)) => {
-                    super::target::qualify_routed(device, binding, kernels, form)?;
+                    let reads = super::target::ExpertReads::routed(device, binding)?;
+                    super::target::qualify_routed(device, binding, kernels, form, &reads)?;
                     attended
                 }
                 _ => {

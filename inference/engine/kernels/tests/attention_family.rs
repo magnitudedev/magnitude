@@ -13,6 +13,8 @@
 // vulkan and cpu; default: every backend the host opens).
 #![allow(dead_code)]
 
+mod common;
+
 use magnitude_kernels::{attention_decode, attention_prefill};
 use seismic::{
     BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor,
@@ -403,7 +405,7 @@ impl Case {
 /// Checks the host model against the portable body of `entry`.
 fn check_host_model(entry: &str, case: &Case) {
     use seismic_lang::{
-        checked::{SourceFile, check_source},
+        checked::{SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -420,7 +422,7 @@ fn check_host_model(entry: &str, case: &Case) {
         path: "functions.seismic".into(),
         text: include_str!("../kernels/functions.seismic").into(),
     });
-    let module = check_source(sources).unwrap();
+    let module = crate::common::check(sources);
     let logical = module
         .entry(
             module.entry_named(entry).unwrap(),

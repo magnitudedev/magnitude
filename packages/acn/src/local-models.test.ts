@@ -36,7 +36,7 @@ describe("local model serving projection", () => {
       assessment: {
         _tag: "Fits",
         profile: { contextLength: 32_768 },
-        performance: { _tag: "Pending", measurement: { _tag: "Measuring" } },
+        residency: { _tag: "Resident", performance: { _tag: "Pending", measurement: { _tag: "Measuring" } } },
       },
       capabilities: {
         vision: false,
@@ -88,7 +88,10 @@ describe("local model serving projection", () => {
               assessmentId: "assessment",
               profile: { contextLength: 4096 },
               memory: [],
-              performance: { _tag: "Estimated", samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }] },
+              residency: {
+                _tag: "Resident",
+                performance: { _tag: "Estimated", samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }] },
+              },
               drafter: { _tag: "None" },
             }],
           },
@@ -183,7 +186,10 @@ describe("automatic assessment projection", () => {
           assessmentId: "assessment",
           profile: { contextLength: 4096 },
           memory: [],
-          performance: { _tag: "Estimated", samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }] },
+          residency: {
+            _tag: "Resident",
+            performance: { _tag: "Estimated", samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }] },
+          },
           drafter: { _tag: "None" },
         }],
       },
@@ -230,7 +236,12 @@ describe("automatic assessment projection", () => {
               profile: { contextLength: 32_768 },
               assessmentId: "assessment",
               memory: [],
-              performance: { _tag: "Pending" },
+              residency: {
+                _tag: "Streamed",
+                bank: { experts: 100, slots: 60, floorSlots: 10, coldExperts: "disk" },
+                performance: { _tag: "Pending" },
+                floorPerformance: { _tag: "Unmeasured" },
+              },
               drafter: { _tag: "None" },
             }],
           },
@@ -239,10 +250,14 @@ describe("automatic assessment projection", () => {
       custom: { _tag: "Pending", sourceRevision: 1 },
     } as unknown as ModelAssessmentsSnapshot
     const coordinated = coordinatedAssessment(snapshot, "catalog", modelId)
-    expect(coordinated?._tag === "Assessed" && coordinated.assessment._tag === "Fits"
-      && coordinated.assessment.performance).toEqual({
-      _tag: "Pending",
-      measurement: { _tag: "Failed", retryAt: 1_000 },
+    const fits = coordinated?._tag === "Assessed" && coordinated.assessment._tag === "Fits"
+      ? coordinated.assessment
+      : undefined
+    expect(fits?.residency).toEqual({
+      _tag: "Streamed",
+      bank: { experts: 100, slots: 60, floorSlots: 10, coldExperts: "disk" },
+      performance: { _tag: "Pending", measurement: { _tag: "Failed", retryAt: 1_000 } },
+      floorPerformance: { _tag: "Unmeasured" },
     })
   })
 })

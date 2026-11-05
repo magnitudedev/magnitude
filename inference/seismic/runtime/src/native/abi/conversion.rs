@@ -15,7 +15,9 @@
 //!
 //! `source` is a source packet in memory (Metal and Vulkan: read in aligned
 //! words of up to its packet alignment, each within the packet wherever a
-//! unit moves it), or (CUDA) the kernel's stage of a warp's rows: the code
+//! unit moves it; Metal's functions are templates over the packet's pointer,
+//! device memory or a kernel's threadgroup copy of the source, read in its
+//! own address space), or (CUDA) the kernel's stage of a warp's rows: the code
 //! stages each segment of its tile plan (`TilePlans`), unit by unit, by the
 //! stage's `load(first, length, unit, moved, index)` and `store(value,
 //! length, position, unit, index)`, a batch's loads before its stores
@@ -107,7 +109,8 @@ impl Spelling {
         match self {
             #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
             Self::Glsl => "uint64_t packet",
-            Self::Msl => "device const uchar *packet",
+            // Metal: any address space's packet (`{name}_view`).
+            Self::Msl => "P packet",
             Self::Cuda => "const S &stage",
         }
     }
@@ -369,7 +372,7 @@ pub(super) fn render_conversion_code(
                 }
             }
         }
-        Source::Packet(PacketDialect::Msl) => {}
+        Source::Packet(PacketDialect::Msl) => render_views(out, &name),
         Source::Stage(plans) => {
             out.push_str(&format!(
                 "#define {prefix}_STAGE_WORDS {}\n#define {prefix}_TILE_ROWS {TILE_ROWS}\n#define {prefix}_LANES {LANES}\n",
@@ -381,7 +384,9 @@ pub(super) fn render_conversion_code(
     let lookups = render_lookups(out, &name, words, spelling);
     let template = match spelling {
         Spelling::Cuda => "template <typename S> ",
-        _ => "",
+        Spelling::Msl => "template <typename P> ",
+        #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+        Spelling::Glsl => "",
     };
     let function = spelling.function();
     let new = |reads| Code::new(words, &name, reads, &lookups, alignment, packet_size);
@@ -450,6 +455,17 @@ pub(super) fn render_conversion_code(
         out.push_str(&format!("    {line}\n"));
     }
     out.push_str("}\n\n");
+}
+
+/// The views a packet's code reads its words through (Metal):
+/// `{name}_view<W>(bytes)`, the bytes as `W`s in the bytes' own address
+/// space (device memory, or a kernel's threadgroup copy of the source).
+fn render_views(out: &mut String, name: &str) {
+    for space in ["device", "threadgroup"] {
+        out.push_str(&format!(
+            "template <typename W> __attribute__((always_inline)) inline {space} const W *{name}_view({space} const uchar *bytes) {{ return ({space} const W *)(bytes); }}\n"
+        ));
+    }
 }
 
 /// The functions a stage's code reads its runs by (CUDA): `length` bits
@@ -1075,7 +1091,7 @@ impl<'a> Code<'a> {
             (_, moved) => {
                 let base = moved.map_or_else(|| String::from("packet"), |moved| format!("packet + d{}b", moved.slot));
                 let word = ["uchar", "ushort", "", "uint"][size as usize - 1];
-                format!("device const {word} *{view} = (device const {word} *)({base});")
+                format!("const auto {view} = {name}_view<{word}>({base});", name = self.name)
             }
         };
         self.declare(view.clone(), declaration);
@@ -1554,8 +1570,9 @@ impl<'a> Code<'a> {
         let words = (0..count)
             .map(|index| {
                 let load = format!(
-                    "((device const {word} *)({base}))[({local} >> {}u) + {index}u]",
-                    unit.trailing_zeros()
+                    "{name}_view<{word}>({base})[({local} >> {}u) + {index}u]",
+                    unit.trailing_zeros(),
+                    name = self.name
                 );
                 let load = if wide { self.spelling().wide(&load) } else { self.spelling().word(&load) };
                 match index as u32 * unit {

@@ -43,10 +43,11 @@ pub use isa::Neon;
 pub use isa::{X86V4Vnni, X86V2, X86V3, X86V4};
 
 /// The version of this library, part of every CPU implementation digest.
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+cpu-library-5");
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+cpu-library-6");
 
 /// A weight buffer's element as a call reads it: its storage element, that
-/// element's resolved components, whether products over it take their
+/// element's resolved components (which read it in its own layout, a
+/// device's too: `weights::Placement`), whether products over it take their
 /// activation rows as NVFP4 operands (the registry's operand recipe,
 /// `operands(W)`), and whether they take quantized activation rows under a
 /// declaration's `INT8 = 1` (the quantized dot's admission,
@@ -61,7 +62,7 @@ pub struct WeightOperand {
 
 impl WeightOperand {
     /// The weight operand of element `element` on `tier`, or `None` when
-    /// `element` is no weight element.
+    /// `element` is no weight element the components read.
     pub fn of(tier: Tier, element: RepresentationId) -> Option<Self> {
         let storage = registry::representation_info(registry::storage_of(element));
         Some(Self {
@@ -99,6 +100,8 @@ pub struct Weights<'a> {
     kernels: &'static WeightKernels,
     nvfp4_operands: bool,
     quantized: bool,
+    /// The storage the components read.
+    storage: &'static registry::RepresentationInfo,
     life: std::marker::PhantomData<&'a u8>,
 }
 
@@ -110,8 +113,8 @@ impl<'a> Weights<'a> {
     /// `dense_stride` is the tensor's row stride in bytes (dense rows only).
     ///
     /// # Safety
-    /// `base` addresses `rows` rows of the resolved representation, valid
-    /// for `'a`.
+    /// `base` addresses `rows` rows of the resolved representation (in a
+    /// tiled layout, its matrices whole tiles), valid for `'a`.
     pub unsafe fn from_raw(
         base: *const u8,
         rows: usize,
@@ -128,7 +131,42 @@ impl<'a> Weights<'a> {
             kernels: operand.kernels,
             nvfp4_operands: operand.nvfp4_operands,
             quantized: operand.quantized,
+            storage: operand.storage,
             life: std::marker::PhantomData,
+        }
+    }
+
+    /// The operand's columns `columns` widened to whole storage groups (a
+    /// dense operand's exactly), and the first of them: their own operand of
+    /// the same rows, read where they lie, whose reads touch no byte of any
+    /// other column's storage group.
+    pub fn columns(&self, columns: std::ops::Range<usize>) -> (usize, Weights<'a>) {
+        assert!(
+            columns.start < columns.end && columns.end <= self.k,
+            "columns {columns:?} of {}",
+            self.k
+        );
+        match &self.storage.kind {
+            registry::RepresentationKind::PackedRows(layout) => {
+                let group = layout.group() as usize;
+                let first = columns.start / group * group;
+                let end = columns.end.next_multiple_of(group).min(self.k);
+                let mut geometry = self.geometry;
+                geometry.first_group += first / group;
+                (first, Weights { k: end - first, geometry, ..*self })
+            }
+            registry::RepresentationKind::Dense(dtype) => {
+                // SAFETY: the columns lie in every row (`from_raw`).
+                let base = unsafe { self.base.add(columns.start * dtype.bytes() as usize) };
+                let view = Weights {
+                    base,
+                    k: columns.len(),
+                    geometry: self.geometry.with_base(base, self.geometry.matrix_rows),
+                    ..*self
+                };
+                (columns.start, view)
+            }
+            _ => panic!("`{}` is no weight operand", self.storage.name),
         }
     }
 
@@ -199,6 +237,13 @@ impl<'a> Weights<'a> {
         self.quantized
     }
 
+    /// Rows of the dot block a projection takes at a time
+    /// (`weights::Placement::row_block`): an `mma16` tile, whose row pairs
+    /// share their code bytes; eight rows of every other layout.
+    pub fn row_block(&self) -> usize {
+        self.geometry.placement.row_block()
+    }
+
     /// The `k` values of row `row`.
     #[inline(always)]
     pub fn decode_row(&self, row: usize, out: &mut [f32]) {
@@ -214,8 +259,9 @@ impl<'a> Weights<'a> {
         }
     }
 
-    /// `out[r] = (row first + r) · x` for a block of `out.len()` rows (1, 2,
-    /// 4 or 8): one component call across the whole row.
+    /// `out[r] = (row first + r) · x` for a block of `out.len()` rows (an
+    /// entry of `components::ROW_BLOCKS`): one component call across the
+    /// whole row.
     #[inline(always)]
     pub fn dot(&self, first: usize, x: &[f32], out: &mut [f32]) {
         assert!(
@@ -236,30 +282,42 @@ impl<'a> Weights<'a> {
         }
     }
 
-    /// Four quantized activation rows by eight weight rows.
+    /// `out[r] = (row first + r) · x` for `out.len()` rows, each 16 a tile
+    /// of an `mma16` operand (`Weights::row_block` 16), against an
+    /// activation row quantized into `x`: the sums [`Weights::dot_q8`]
+    /// gives a tile at a time, in one component call where the element has
+    /// a whole-tile form (the activations permuted once for every tile).
+    /// `x` is one activation row.
     #[inline(always)]
-    pub fn gemm_q8(&self, first: usize, x: &[quant::Q8Block], out: &mut [f32; 32]) {
-        assert!(first + 8 <= self.rows);
-        // SAFETY: the eight rows lie inside the operand.
-        unsafe {
-            self.kernels.gemm_q8(
-                self.base.add(first * self.geometry.stride),
-                &self.geometry,
-                x,
-                self.k,
-                out,
-            )
+    pub fn dot_q8_tiles(&self, first: usize, x: &[quant::Q8Block], out: &mut [f32]) {
+        assert!(
+            first + out.len() <= self.rows && out.len() % 16 == 0 && self.row_block() == 16,
+            "tiles of rows {first}..{} of {}",
+            first + out.len(),
+            self.rows
+        );
+        // SAFETY: the rows lie inside the operand (`from_raw`).
+        let whole = unsafe { self.kernels.dot_q8_tiles(self.base.add(first * self.geometry.stride), &self.geometry, x, self.k, out) };
+        if !whole {
+            for (tile, out) in out.chunks_exact_mut(16).enumerate() {
+                self.dot_q8(first + 16 * tile, x, out);
+            }
         }
     }
 
-    /// As [`Weights::dot`], against an activation row quantized into `x`
-    /// (`quant::blocks(k)` blocks, see [`quant`]).
+    /// As [`Weights::dot`] of a block of `R` rows from `first`, against each
+    /// of the `m` activation rows quantized into `x` (`quant::blocks(k)`
+    /// blocks each, row after row, see [`quant`]), activation-major:
+    /// `out[a R + r] = (row first + r) · activation a` (`out.len() = m R`).
+    /// Each weight block is decoded once for every group of up to four
+    /// activation rows, and every activation row's sums are the ones it has
+    /// alone.
     #[inline(always)]
     pub fn dot_q8(&self, first: usize, x: &[quant::Q8Block], out: &mut [f32]) {
+        let activations = x.len() / quant::blocks(self.k);
         assert!(
-            first + out.len() <= self.rows,
-            "rows {first}..{} of {}",
-            first + out.len(),
+            activations > 0 && first + out.len() / activations <= self.rows,
+            "rows from {first} of {} against {activations} activation rows",
             self.rows
         );
         // SAFETY: the block lies inside the operand (`from_raw`).

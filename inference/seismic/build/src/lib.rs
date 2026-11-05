@@ -20,6 +20,7 @@
 //! static __MODULE: seismic::generated::OnceLock<Result<seismic::generated::Module, seismic::CheckedBundleError>> = ...;
 //! pub fn module() -> Result<&'static seismic::generated::Module, seismic::CheckedBundleError>;
 //! pub const IDENTITY: &str = "<hex digest of sources + compiler semantic version>";
+//! pub mod constants { pub const <NAME>: u64 = <value>; .. }   // every `const NAME = INTEGER`
 //!
 //! pub mod <entry> {                       // one per exported entry (every portable family)
 //!     pub struct Args<'a> {               // source parameter order, source names
@@ -75,13 +76,15 @@ pub enum BuildError {
         column: usize,
         symbol: String,
     },
-    /// A launch-scoped GPU kernel does not match its declared forming guard
-    /// and code-parameter template.
-    NativeTemplate {
+    /// Two declarations of the entry would define the same native ABI
+    /// symbol (a parameter named `words` and the words buffer, a tensor named
+    /// `param_1` and parameter 1), so no asset could address both: the
+    /// rendered source's later definition replaces the earlier.
+    NativeAbiCollision {
         entry: String,
-        path: PathBuf,
-        kernel: String,
-        detail: String,
+        symbol: String,
+        first: String,
+        second: String,
     },
     /// A native asset (or an included file) includes something other than a
     /// library file of its backend inside the build's source roots.
@@ -135,15 +138,14 @@ impl std::fmt::Display for BuildError {
                 "native ABI for `{entry}`: {}:{line}:{column}: `{symbol}` is not generated for this entry",
                 path.display()
             ),
-            Self::NativeTemplate {
+            Self::NativeAbiCollision {
                 entry,
-                path,
-                kernel,
-                detail,
+                symbol,
+                first,
+                second,
             } => write!(
                 f,
-                "native template for `{entry}` kernel `{kernel}` in {}: {detail}",
-                path.display()
+                "native ABI for `{entry}`: `{symbol}` would name both {first} and {second}; rename one"
             ),
             Self::NativeInclude(e) => write!(f, "{e}"),
             Self::MetalBufferSlots {
@@ -259,7 +261,10 @@ mod internals {
     use seismic_lang::checked::{ElementSummary, ElementTarget, NativeElementCoverage};
     use seismic_lang::entry::ResultClass;
     use seismic_lang::registry::{self, RepresentationInfo, SourceDialect};
-    use std::collections::HashSet;
+    use seismic_lang::native_parameter::native_parameter_names;
+    use std::collections::hash_map::Entry;
+    use std::collections::{HashMap, HashSet};
+    use std::fmt;
     use std::fs;
 
     /// The native implementations of one entry. Metal and CUDA sources
@@ -401,7 +406,8 @@ mod internals {
                 any = true;
                 let source = module
                     .native_asset(entry.id, backend)
-                    .expect("shared loader captures native assets");
+                    .expect("shared loader captures native assets")
+                    .text;
                 // CPU assets are Rust, compiled into the embedding crate from
                 // their authored path, so compiler diagnostics and tools point
                 // at the authored file.
@@ -431,23 +437,12 @@ mod internals {
                 // Included files are validated against the including entry's
                 // ABI, exactly like the asset itself. The ABI is independent
                 // of the file, so build its symbol set once for this entry.
-                let allowed = native_abi_symbols(entry, definition, dialect);
+                let allowed = native_abi_symbols(entry, definition, dialect, module.constants())?;
                 for file in std::iter::once(&files.asset).chain(&files.includes) {
                     validate_native_abi(entry, &allowed, &file.path, &file.text)?;
                     if dialect == SourceDialect::Vulkan {
                         validate_vulkan_reserved(entry, &file.path, &file.text)?;
                     }
-                }
-                if definition.launch_scoped()
-                    && matches!(dialect, SourceDialect::Metal | SourceDialect::Cuda)
-                {
-                    validate_launch_templates(
-                        entry,
-                        definition,
-                        dialect,
-                        &files.asset.path,
-                        source,
-                    )?;
                 }
                 match dialect {
                     SourceDialect::Metal => validate_metal_buffer_slots(entry, definition)?,
@@ -489,135 +484,11 @@ mod internals {
         Ok(())
     }
 
-    fn validate_launch_templates(
-        entry: &EntryInfo,
-        definition: &NativeImplementation,
-        dialect: SourceDialect,
-        path: &std::path::Path,
-        source: &str,
-    ) -> Result<(), BuildError> {
-        let tokens = identifiers(source);
-        for launch in &definition.launches {
-            let fail = |detail: String| BuildError::NativeTemplate {
-                entry: entry.name.clone(),
-                path: path.to_path_buf(),
-                kernel: launch.kernel.clone(),
-                detail,
-            };
-            let definitions = tokens
-                .windows(3)
-                .filter_map(|triple| {
-                    let [(qualifier, offset), (void, _), (name, _)] = triple else {
-                        unreachable!()
-                    };
-                    let matches = match dialect {
-                        SourceDialect::Metal => *qualifier == "kernel" && *void == "void",
-                        SourceDialect::Cuda => *qualifier == "__global__" && *void == "void",
-                        SourceDialect::Vulkan => false,
-                    };
-                    (matches && *name == launch.kernel).then_some(*offset)
-                })
-                .collect::<Vec<_>>();
-            let [kernel_at] = definitions.as_slice() else {
-                return Err(fail(format!(
-                    "expected one GPU kernel definition for `{}`",
-                    launch.kernel
-                )));
-            };
-            let guard = format!("SEISMIC_FORMING_{}", native_macro(&launch.kernel));
-            let mut guards = Vec::<(Option<&str>, usize)>::new();
-            let mut offset = 0;
-            for line in source.split_inclusive('\n') {
-                if offset >= *kernel_at {
-                    break;
-                }
-                let directive = line.trim_start();
-                if let Some(name) = directive.strip_prefix("#ifdef ") {
-                    guards.push((Some(name.trim()), offset));
-                } else if directive.starts_with("#if ") || directive.starts_with("#ifndef ") {
-                    guards.push((None, offset));
-                } else if directive.starts_with("#else") || directive.starts_with("#elif") {
-                    if let Some(top) = guards.last_mut() {
-                        top.0 = None;
-                    }
-                } else if directive.starts_with("#endif") {
-                    guards.pop();
-                }
-                offset += line.len();
-            }
-            let Some((_, guarded_at)) = guards
-                .iter()
-                .rev()
-                .find(|(name, _)| *name == Some(guard.as_str()))
-            else {
-                return Err(fail(format!("definition must be inside `#ifdef {guard}`")));
-            };
-            let template = tokens
-                .iter()
-                .rev()
-                .find(|(name, at)| *name == "template" && *at > *guarded_at && *at < *kernel_at)
-                .map(|(_, at)| *at);
-            let reads = launch.parameters();
-            let expected = definition
-                .params
-                .iter()
-                .filter(|param| {
-                    param.code
-                        && (reads.contains(&param.name)
-                            || !definition
-                                .launches
-                                .iter()
-                                .any(|other| other.parameters().contains(&param.name)))
-                })
-                .map(|param| param.name.as_str())
-                .chain(
-                    launch
-                        .params
-                        .iter()
-                        .filter(|param| param.code)
-                        .map(|param| param.name.as_str()),
-                )
-                .collect::<Vec<_>>();
-            let actual = template.and_then(|at| {
-                let header = source[at + "template".len()..*kernel_at].trim();
-                // A CUDA kernel may declare its launch bounds between its
-                // template header and `__global__`.
-                let header = match (dialect, header.rfind("__launch_bounds__")) {
-                    (SourceDialect::Cuda, Some(bounds)) if header.ends_with(')') => {
-                        header[..bounds].trim_end()
-                    }
-                    _ => header,
-                };
-                let body = header.strip_prefix('<')?.strip_suffix('>')?;
-                if body.trim().is_empty() {
-                    return Some(Vec::new());
-                }
-                body.split(',')
-                    .map(|field| {
-                        let mut words = field.split_whitespace();
-                        match (words.next(), words.next(), words.next()) {
-                            (Some("int" | "uint" | "unsigned"), Some(name), None) => Some(name),
-                            _ => None,
-                        }
-                    })
-                    .collect::<Option<Vec<_>>>()
-            });
-            if actual.as_deref() != Some(expected.as_slice())
-                && !(expected.is_empty() && actual.is_none())
-            {
-                return Err(fail(format!(
-                    "template parameters must be `{:?}` in declaration order; found {actual:?}",
-                    expected
-                )));
-            }
-        }
-        Ok(())
-    }
-
     /// Metal's argument table holds 31 buffers. The native ABI binds every
-    /// tensor parameter, every tensor result, every scratch buffer, the
-    /// argument words and the scalar-result slots; all of them are known from
-    /// the declaration, so the limit is checked here rather than at encode.
+    /// tensor parameter but a host port (which the kernel never accesses),
+    /// every tensor result, every scratch buffer, the argument words and the
+    /// scalar-result slots; all of them are known from the declaration, so
+    /// the limit is checked here rather than at encode.
     fn validate_metal_buffer_slots(
         entry: &EntryInfo,
         definition: &NativeImplementation,
@@ -625,7 +496,10 @@ mod internals {
         let tensors = entry
             .parameters
             .iter()
-            .filter(|parameter| matches!(parameter.kind, ParameterSummaryKind::Tensor { .. }))
+            .filter(|parameter| match &parameter.kind {
+                ParameterSummaryKind::Tensor { access, .. } => !matches!(access, TensorAccess::Host { .. }),
+                _ => false,
+            })
             .count()
             + entry
                 .results
@@ -772,30 +646,59 @@ mod internals {
         entry: &EntryInfo,
         definition: &NativeImplementation,
         dialect: SourceDialect,
-    ) -> HashSet<String> {
-        let mut symbols = HashSet::new();
-        symbols.insert("SEISMIC_BUFFER_SCALAR_RESULTS".to_owned());
+        constants: &[(String, u64)],
+    ) -> Result<HashSet<String>, BuildError> {
+        let mut abi = AbiSymbols {
+            entry: &entry.name,
+            symbols: HashMap::new(),
+        };
+        // Every module constant, which the rendered source defines when named.
+        for (name, _) in constants {
+            abi.define(
+                AbiMeaning::Constant(name.clone()),
+                [format!("SEISMIC_CONST_{}", native_macro(name))],
+            )?;
+        }
         if !definition.launch_scoped() {
             for parameter in &definition.params {
-                symbols.insert(format!("SEISMIC_TUNE_{}", native_macro(&parameter.name)));
+                abi.define(
+                    AbiMeaning::Tune(parameter.name.clone()),
+                    [format!("SEISMIC_TUNE_{}", native_macro(&parameter.name))],
+                )?;
             }
         } else {
-            for parameter in definition.params.iter().filter(|parameter| !parameter.code) {
-                symbols.insert(format!("SEISMIC_RUNTIME_{}", native_macro(&parameter.name)));
+            // A runtime parameter's macro is defined in the source of each
+            // launch that reads it, once: the same name in several launches
+            // is one meaning.
+            let runtime = definition
+                .params
+                .iter()
+                .chain(definition.launches.iter().flat_map(|launch| &launch.params))
+                .filter(|parameter| !parameter.code);
+            for parameter in runtime {
+                abi.define(
+                    AbiMeaning::Runtime(parameter.name.clone()),
+                    [format!("SEISMIC_RUNTIME_{}", native_macro(&parameter.name))],
+                )?;
             }
             for launch in &definition.launches {
-                symbols.insert(format!("SEISMIC_FORMING_{}", native_macro(&launch.kernel)));
-                for parameter in launch.params.iter().filter(|parameter| !parameter.code) {
-                    symbols.insert(format!("SEISMIC_RUNTIME_{}", native_macro(&parameter.name)));
-                }
+                abi.define(
+                    AbiMeaning::Forming(launch.kernel.clone()),
+                    [format!("SEISMIC_FORMING_{}", native_macro(&launch.kernel))],
+                )?;
             }
         }
         for scratch in &definition.scratch {
-            symbols.insert(format!(
-                "SEISMIC_BUFFER_SCRATCH_{}",
-                native_macro(&scratch.name)
-            ));
+            abi.define(
+                AbiMeaning::Scratch(scratch.name.clone()),
+                [format!("SEISMIC_BUFFER_SCRATCH_{}", native_macro(&scratch.name))],
+            )?;
         }
+        // The ABI's own names, fixed by the dialect; and the backend's
+        // fact every dialect's prefix states.
+        let mut symbols = HashSet::new();
+        symbols.insert("SEISMIC_BUFFER_SCALAR_RESULTS".to_owned());
+        symbols.insert("SEISMIC_PARKS_IN_KERNELS".to_owned());
         match dialect {
             SourceDialect::Cuda => {
                 symbols.insert("SEISMIC_BUFFER_WORDS".to_owned());
@@ -837,25 +740,36 @@ mod internals {
                 for view in VULKAN_SHARED_VIEWS {
                     symbols.insert(format!("SEISMIC_SHARED_{view}"));
                 }
-                // A static extent as a plain integer, for `#if` guards.
-                for dimension in &definition.statics {
-                    symbols.insert(format!("SEISMIC_STATIC_{}", native_macro(dimension)));
-                }
             }
             SourceDialect::Metal => {
                 symbols.insert("SEISMIC_BUFFER_WORDS".to_owned());
                 symbols.insert("SEISMIC_HAS_TENSOR_OPS".to_owned());
             }
         }
+        abi.define(AbiMeaning::Abi, symbols)?;
         for dimension in &entry.dimensions {
-            symbols.insert(format!("SEISMIC_DIM_{}", native_macro(dimension)));
+            abi.define(
+                AbiMeaning::Dimension(dimension.clone()),
+                [format!("SEISMIC_DIM_{}", native_macro(dimension))],
+            )?;
+        }
+        // A static extent as a plain integer, for Vulkan's `#if` guards.
+        if dialect == SourceDialect::Vulkan {
+            for dimension in &definition.statics {
+                abi.define(
+                    AbiMeaning::Dimension(dimension.clone()),
+                    [format!("SEISMIC_STATIC_{}", native_macro(dimension))],
+                )?;
+            }
         }
         for element in &entry.element_parameters {
+            let mut symbols = HashSet::new();
             add_representation_symbols(
                 &mut symbols,
                 &format!("SEISMIC_ELEMENT_{}", native_macro(element)),
                 registry::representations().iter(),
             );
+            abi.define(AbiMeaning::Element(element.clone()), symbols)?;
         }
         // A registered conversion between two bound elements, as its word
         // form as code (the runtime ABI's `render_conversion`): its units and
@@ -863,6 +777,7 @@ mod internals {
         // CUDA's stage (its row, tile and lanes) and fixed words' loads.
         for from in &entry.element_parameters {
             for to in &entry.element_parameters {
+                let mut symbols = HashSet::new();
                 let prefix = format!(
                     "SEISMIC_CONVERSION_{}_{}",
                     native_macro(from),
@@ -875,6 +790,9 @@ mod internals {
                     "FIXED",
                     "LEADING_ALIGNMENT",
                     "TRAILING_ALIGNMENT",
+                    "CHUNK_COLUMNS",
+                    "KBLOCK_BYTES",
+                    "KBLOCK_ALIGNMENT",
                 ] {
                     symbols.insert(format!("{prefix}_{suffix}"));
                 }
@@ -895,61 +813,62 @@ mod internals {
                     symbols.insert(format!("{prefix}_{role}_FIRST"));
                     symbols.insert(format!("{prefix}_{role}_UNIT_WORDS"));
                     symbols.insert(format!("{prefix}_{role}_REST_ALIGNMENT"));
+                    symbols.insert(format!("{prefix}_{role}_CHUNK_BYTES"));
+                    symbols.insert(format!("{prefix}_{role}_CHUNK_ALIGNMENT"));
+                    symbols.insert(format!("{prefix}_{role}_FRAGMENT_ALIGNMENT"));
                 }
                 symbols.insert(prefix);
+                abi.define(AbiMeaning::Conversion(from.clone(), to.clone()), symbols)?;
             }
         }
 
-        for (ordinal, parameter) in entry.parameters.iter().enumerate() {
-            let unique = entry
+        let names = native_parameter_names(
+            &entry
                 .parameters
                 .iter()
-                .filter(|candidate| candidate.name == parameter.name)
-                .count()
-                == 1;
-            let name = native_macro(&parameter.name);
+                .map(|parameter| parameter.name.as_str())
+                .collect::<Vec<_>>(),
+        );
+        for ((ordinal, parameter), names) in entry.parameters.iter().enumerate().zip(&names) {
+            let mut symbols = HashSet::new();
             match &parameter.kind {
+                // A host port defines nothing: the kernel never accesses it.
+                ParameterSummaryKind::Tensor {
+                    access: seismic_lang::checked::TensorAccess::Host { .. },
+                    ..
+                } => {}
                 ParameterSummaryKind::Tensor { rank, element, .. } => {
-                    let ordinal_prefix = format!("SEISMIC_PARAM_{ordinal}");
-                    symbols.insert(format!("{ordinal_prefix}_BUFFER"));
-                    if unique {
-                        symbols.insert(format!("SEISMIC_BUFFER_{name}"));
-                    }
-                    for axis in 0..*rank {
-                        symbols.insert(format!("{ordinal_prefix}_EXTENT_{axis}"));
-                        symbols.insert(format!("{ordinal_prefix}_STRIDE_{axis}"));
-                        if unique {
-                            symbols.insert(format!("SEISMIC_{name}_EXTENT_{axis}"));
-                            symbols.insert(format!("SEISMIC_{name}_STRIDE_{axis}"));
+                    symbols.extend(names.tensor_buffers());
+                    for prefix in names.tensor_prefixes() {
+                        for axis in 0..*rank {
+                            symbols.insert(format!("{prefix}_EXTENT_{axis}"));
+                            symbols.insert(format!("{prefix}_STRIDE_{axis}"));
                         }
-                    }
-                    add_element_representation_symbols(&mut symbols, &ordinal_prefix, element);
-                    if unique {
-                        add_element_representation_symbols(
-                            &mut symbols,
-                            &format!("SEISMIC_{name}"),
-                            element,
-                        );
+                        add_element_representation_symbols(&mut symbols, &prefix, element);
                     }
                 }
                 ParameterSummaryKind::Scalar(_) | ParameterSummaryKind::Index => {
-                    symbols.insert(format!("SEISMIC_PARAM_{ordinal}"));
-                    if unique {
-                        symbols.insert(format!("SEISMIC_PARAM_{name}"));
-                    }
+                    let (symbol, alias) = names.word();
+                    symbols.insert(symbol);
+                    symbols.extend(alias);
                 }
                 ParameterSummaryKind::Range => {
-                    symbols.insert(format!("SEISMIC_PARAM_{ordinal}_START"));
-                    symbols.insert(format!("SEISMIC_PARAM_{ordinal}_END"));
-                    if unique {
-                        symbols.insert(format!("SEISMIC_PARAM_{name}_START"));
-                        symbols.insert(format!("SEISMIC_PARAM_{name}_END"));
-                    }
+                    let (pair, aliases) = names.range();
+                    symbols.extend(pair);
+                    symbols.extend(aliases.into_iter().flatten());
                 }
             }
+            abi.define(
+                AbiMeaning::Parameter {
+                    ordinal,
+                    name: parameter.name.clone(),
+                },
+                symbols,
+            )?;
         }
 
         for (ordinal, result) in entry.results.iter().enumerate() {
+            let mut symbols = HashSet::new();
             match &result.kind {
                 ResultSummaryKind::Tensor { rank, element } => {
                     let prefix = format!("SEISMIC_RESULT_{ordinal}");
@@ -966,8 +885,81 @@ mod internals {
                     symbols.insert(format!("SEISMIC_RESULT_{ordinal}_WORD"));
                 }
             }
+            abi.define(AbiMeaning::Result(ordinal), symbols)?;
         }
-        symbols
+        Ok(abi.symbols.into_keys().collect())
+    }
+
+    /// The declaration a generated ABI symbol stands for.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum AbiMeaning {
+        /// A name the ABI itself fixes: its words and scalar-result
+        /// buffers, and the dialect's helpers and device facts.
+        Abi,
+        Constant(String),
+        Tune(String),
+        Runtime(String),
+        Forming(String),
+        Scratch(String),
+        Dimension(String),
+        Element(String),
+        Conversion(String, String),
+        Parameter { ordinal: usize, name: String },
+        Result(usize),
+    }
+
+    impl fmt::Display for AbiMeaning {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Abi => write!(f, "the ABI's own buffers and helpers"),
+                Self::Constant(name) => write!(f, "module constant `{name}`"),
+                Self::Tune(name) => write!(f, "tuning parameter `{name}`"),
+                Self::Runtime(name) => write!(f, "runtime parameter `{name}`"),
+                Self::Forming(kernel) => write!(f, "launch `{kernel}`"),
+                Self::Scratch(name) => write!(f, "scratch buffer `{name}`"),
+                Self::Dimension(name) => write!(f, "dimension `{name}`"),
+                Self::Element(name) => write!(f, "element `{name}`"),
+                Self::Conversion(from, to) => write!(f, "conversion `{from}` to `{to}`"),
+                Self::Parameter { ordinal, name } => write!(f, "parameter {ordinal} `{name}`"),
+                Self::Result(ordinal) => write!(f, "result {ordinal}"),
+            }
+        }
+    }
+
+    /// Every symbol an entry's native ABI defines, with its meaning. Every
+    /// generated symbol enters through [`AbiSymbols::define`].
+    struct AbiSymbols<'a> {
+        entry: &'a str,
+        symbols: HashMap<String, AbiMeaning>,
+    }
+
+    impl AbiSymbols<'_> {
+        /// Defines `symbols` as `meaning`. A symbol already defined with
+        /// another meaning is a collision: the rendered source's later
+        /// definition replaces the earlier, so no asset could address both.
+        fn define(
+            &mut self,
+            meaning: AbiMeaning,
+            symbols: impl IntoIterator<Item = String>,
+        ) -> Result<(), BuildError> {
+            for symbol in symbols {
+                match self.symbols.entry(symbol) {
+                    Entry::Vacant(vacant) => {
+                        vacant.insert(meaning.clone());
+                    }
+                    Entry::Occupied(occupied) if *occupied.get() == meaning => {}
+                    Entry::Occupied(occupied) => {
+                        return Err(BuildError::NativeAbiCollision {
+                            entry: self.entry.to_owned(),
+                            symbol: occupied.key().clone(),
+                            first: occupied.get().to_string(),
+                            second: meaning.to_string(),
+                        });
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 
     fn add_element_representation_symbols(
@@ -1046,6 +1038,13 @@ mod internals {
                         "TILE_ROWS",
                         "MMA_KBLOCK",
                         "MMA_LANES",
+                        "MMA_STEP",
+                        "MMA_STEP_SLOTS",
+                        "MMA_FRAGMENT_ROW",
+                        "MMA_FRAGMENT_COLUMN",
+                        "MMA_FRAGMENT_BYTE",
+                        "RECORD_ENTRY",
+                        "RECORD_FACTOR",
                     ] {
                         symbols.insert(format!("{prefix}_{suffix}"));
                     }
@@ -1061,6 +1060,7 @@ mod internals {
                             "ENTRY_BYTES",
                             "FACTORS_OFFSET",
                             "ENTRY_BITS",
+                            "KBLOCK_ENTRIES",
                         ] {
                             symbols.insert(format!("{plane_prefix}_{suffix}"));
                         }
@@ -1099,57 +1099,7 @@ mod internals {
             .collect()
     }
 
-    /// Every identifier outside comments and literals, with its offset.
-    fn identifiers(source: &str) -> Vec<(&str, usize)> {
-        let bytes = source.as_bytes();
-        let mut identifiers = Vec::new();
-        let mut index = 0;
-        while index < bytes.len() {
-            match bytes[index] {
-                b'/' if bytes.get(index + 1) == Some(&b'/') => {
-                    index += 2;
-                    while index < bytes.len() && bytes[index] != b'\n' {
-                        index += 1;
-                    }
-                }
-                b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                    index += 2;
-                    while index + 1 < bytes.len()
-                        && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
-                    {
-                        index += 1;
-                    }
-                    index = (index + 2).min(bytes.len());
-                }
-                b'"' | b'\'' => {
-                    let quote = bytes[index];
-                    index += 1;
-                    while index < bytes.len() {
-                        if bytes[index] == b'\\' {
-                            index = (index + 2).min(bytes.len());
-                        } else if bytes[index] == quote {
-                            index += 1;
-                            break;
-                        } else {
-                            index += 1;
-                        }
-                    }
-                }
-                byte if byte == b'_' || byte.is_ascii_alphabetic() => {
-                    let start = index;
-                    index += 1;
-                    while index < bytes.len()
-                        && (bytes[index] == b'_' || bytes[index].is_ascii_alphanumeric())
-                    {
-                        index += 1;
-                    }
-                    identifiers.push((&source[start..index], start));
-                }
-                _ => index += 1,
-            }
-        }
-        identifiers
-    }
+    use seismic_lang::native_source::identifiers;
 
     use seismic_lang::native_name::native_macro;
 
@@ -1172,6 +1122,11 @@ mod internals {
         );
         out.push_str("pub fn module() -> Result<&'static seismic::generated::Module, seismic::CheckedBundleError> { seismic::generated::module_from_bundle(&__MODULE, __BUNDLE) }\n");
         out.push_str(&format!("pub const IDENTITY: &str = {:?};\n", identity));
+        out.push_str("/// The module constants (`const NAME = INTEGER`), which natives read as `SEISMIC_CONST_NAME`.\npub mod constants {\n");
+        for (name, value) in module.constants() {
+            out.push_str(&format!("  pub const {name}: u64 = {value};\n"));
+        }
+        out.push_str("}\n");
         if let Some(library) = cpu_library {
             render_cpu_library(&mut out, library);
         }
@@ -1194,7 +1149,7 @@ mod internals {
             matches!(
                 parameter.kind,
                 ParameterSummaryKind::Tensor {
-                    access: TensorAccess::Shared | TensorAccess::Mutable,
+                    access: TensorAccess::Shared | TensorAccess::Mutable | TensorAccess::Host { .. },
                     ..
                 }
             )
@@ -1334,7 +1289,7 @@ mod internals {
                         TensorAccess::Owned => {
                             out.push_str(&format!("      encoder.tensor(&{expression});\n"));
                         }
-                        TensorAccess::Shared | TensorAccess::Mutable => {
+                        TensorAccess::Shared | TensorAccess::Mutable | TensorAccess::Host { .. } => {
                             out.push_str(&format!("      encoder.tensor({expression});\n"));
                         }
                     },
@@ -1405,7 +1360,8 @@ mod internals {
                     ParameterSummaryKind::Tensor { access, .. } => {
                         let method = match access {
                             TensorAccess::Owned => "owned_tensor",
-                            TensorAccess::Shared => "shared_tensor",
+                            // A host port binds as the device sees it.
+                            TensorAccess::Shared | TensorAccess::Host { .. } => "shared_tensor",
                             TensorAccess::Mutable => "mutable_tensor",
                         };
                         out.push_str(&format!("      encoder.{method}({expression});\n"));
@@ -1558,7 +1514,7 @@ mod internals {
             out.push_str(&format!("  pub fn native_digest(device: &seismic::Device, statics: &seismic::NativeSpecialization) -> Result<String, seismic::TuneError> {{ seismic::generated::digest_native::<Entry>(device, statics, &[], {cpu}) }}\n"));
         }
         out.push_str("  /// The checked native implementation for the device's backend.\n");
-        out.push_str("  pub fn native_implementation(device: &seismic::Device) -> Result<Option<seismic::NativeImplementation>, seismic::CheckedBundleError> { seismic::generated::native_implementation::<Entry>(device) }\n");
+        out.push_str("  pub fn native_implementation(device: &seismic::Device) -> Result<Option<seismic::OnDevice>, seismic::CheckedBundleError> { seismic::generated::native_implementation::<Entry>(device) }\n");
         if let Some(cpu) = &native.cpu {
             let library =
                 cpu_library.expect("a build with a CPU implementation scans its CPU library");
@@ -2131,7 +2087,7 @@ mod internals {
         match kind {
             ParameterSummaryKind::Tensor { access, .. } => match access {
                 TensorAccess::Owned => "seismic::Tensor".to_owned(),
-                TensorAccess::Shared => "&'a seismic::Tensor".to_owned(),
+                TensorAccess::Shared | TensorAccess::Host { .. } => "&'a seismic::Tensor".to_owned(),
                 TensorAccess::Mutable => "&'a mut seismic::Tensor".to_owned(),
             },
             ParameterSummaryKind::Scalar(dtype) => scalar_type(*dtype).to_owned(),
@@ -2144,7 +2100,9 @@ mod internals {
         match kind {
             ParameterSummaryKind::Tensor { access, .. } => match access {
                 TensorAccess::Owned => "seismic::WorkflowTensorOwned<'a>".to_owned(),
-                TensorAccess::Shared => "seismic::WorkflowTensorRef<'a>".to_owned(),
+                TensorAccess::Shared | TensorAccess::Host { .. } => {
+                    "seismic::WorkflowTensorRef<'a>".to_owned()
+                }
                 TensorAccess::Mutable => "seismic::WorkflowTensorMut<'a>".to_owned(),
             },
             ParameterSummaryKind::Scalar(dtype) => scalar_type(*dtype).to_owned(),
@@ -2545,7 +2503,7 @@ mod native_tests {
         let source = root.join("ops.seismic");
         fs::write(
             &source,
-            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for vulkan from \"vulkan/scale.comp\":\n    params (WIDTH in [64])\n    launch scale:\n        threadgroups (ceil_div(N, WIDTH), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n        shared_bytes (WIDTH * 4)\n",
+            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for vulkan from \"vulkan/scale.comp\":\n    params (WIDTH in [64] default 64)\n    launch scale:\n        threadgroups (ceil_div(N, WIDTH), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n        shared_bytes (WIDTH * 4)\n",
         )
         .expect("Seismic fixture");
         fs::write(root.join("vulkan/scale.comp"), asset).expect("Vulkan fixture");
@@ -2680,6 +2638,88 @@ mod native_tests {
         fs::remove_dir_all(&root).expect("remove fixture directory");
     }
 
+    /// Builds entry `request`, `signature` with one Metal launch, against
+    /// the Metal asset `asset`.
+    fn build_request(name: &str, signature: &str, asset: &str) -> Result<Artifacts, BuildError> {
+        let root = fixture(name);
+        let source = root.join("ops.seismic");
+        fs::write(
+            &source,
+            format!("fn request{signature}:\n    out[0] = 1\n\nnative request for metal from \"native/request.metal\":\n    launch request:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"),
+        )
+        .expect("Seismic fixture");
+        fs::write(root.join("native/request.metal"), asset).expect("Metal fixture");
+        let result = Build::new("fixture")
+            .source(&source)
+            .std(false)
+            .out_dir(root.join("out"))
+            .run();
+        fs::remove_dir_all(&root).expect("remove fixture directory");
+        result
+    }
+
+    /// A tensor parameter named `words` would be `SEISMIC_BUFFER_WORDS`,
+    /// which the ABI defines for its words buffer: the build rejects it.
+    #[test]
+    fn a_parameter_named_as_an_abi_buffer_is_rejected() {
+        match build_request(
+            "abi-collision-words",
+            "[N](words: &tensor[N] f32, out: &mut tensor[1] i32)",
+            "kernel void request() {}\n",
+        ) {
+            Err(BuildError::NativeAbiCollision { symbol, second, .. }) => {
+                assert_eq!(symbol, "SEISMIC_BUFFER_WORDS");
+                assert_eq!(second, "parameter 0 `words`");
+            }
+            other => panic!("unexpected result: {:?}", other.err()),
+        }
+    }
+
+    /// A tensor named `param_1` names its extents `SEISMIC_PARAM_1_EXTENT_0`,
+    /// which parameter 1's ordinal macros define for another tensor.
+    #[test]
+    fn a_named_alias_equal_to_an_ordinal_macro_is_rejected() {
+        match build_request(
+            "abi-collision-ordinal",
+            "[N, M](param_1: &tensor[N] f32, x: &tensor[M] f32, out: &mut tensor[1] i32)",
+            "kernel void request() {}\n",
+        ) {
+            Err(BuildError::NativeAbiCollision {
+                symbol,
+                first,
+                second,
+                ..
+            }) => {
+                assert!(symbol.starts_with("SEISMIC_PARAM_1"), "{symbol}");
+                assert_eq!(first, "parameter 0 `param_1`");
+                assert_eq!(second, "parameter 1 `x`");
+            }
+            other => panic!("unexpected result: {:?}", other.err()),
+        }
+    }
+
+    /// A host port defines no ABI symbol (the kernel never accesses it), so
+    /// an asset naming one is refused, and its name collides with nothing.
+    #[test]
+    fn host_ports_define_no_abi_symbols() {
+        match build_request(
+            "abi-host-staged",
+            "[N](staged: &host mut tensor[N] i32, out: &mut tensor[1] i32)",
+            "kernel void request() { ulong b = SEISMIC_BUFFER_STAGED; }\n",
+        ) {
+            Err(BuildError::NativeAbi { symbol, .. }) => {
+                assert_eq!(symbol, "SEISMIC_BUFFER_STAGED");
+            }
+            other => panic!("unexpected result: {:?}", other.err()),
+        }
+        build_request(
+            "abi-host-words",
+            "[N](words: &host tensor[N] i32, out: &mut tensor[1] i32)",
+            "kernel void request(device int *out [[buffer(SEISMIC_BUFFER_OUT)]]) { out[0] = 1; }\n",
+        )
+        .expect("a host port named `words` collides with no ABI symbol");
+    }
+
     #[test]
     fn native_asset_accepts_exact_generated_tensor_and_result_symbols() {
         let unique = SystemTime::now()
@@ -2714,6 +2754,37 @@ mod native_tests {
         fs::remove_dir_all(&root).expect("remove fixture directory");
     }
 
+    #[test]
+    fn module_constants_are_generated_and_admitted_by_name() {
+        let root = fixture("constants");
+        let source = root.join("ops.seismic");
+        fs::write(&source, "const WIDTH = 256\n\nfn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"native/scale.metal\":\n    launch scale:\n        threadgroups (ceil_div(N, WIDTH), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n").unwrap();
+        let asset = root.join("native/scale.metal");
+        let build = |text: &str, name: &str| {
+            fs::write(&asset, text).unwrap();
+            Build::new("fixture")
+                .source(&source)
+                .std(false)
+                .out_dir(root.join(name))
+                .run()
+        };
+        let built = build(
+            "kernel void scale(uint index [[thread_position_in_grid]]) { if (index < SEISMIC_CONST_WIDTH) {} }\n",
+            "named",
+        )
+        .expect("a declared module constant is part of the ABI");
+        let generated = fs::read_to_string(&built.bindings).unwrap();
+        assert!(generated.contains("pub mod constants {\n  pub const WIDTH: u64 = 256;\n}"));
+        match build(
+            "kernel void scale(uint index [[thread_position_in_grid]]) { if (index < SEISMIC_CONST_HEIGHT) {} }\n",
+            "unknown",
+        ) {
+            Err(BuildError::NativeAbi { symbol, .. }) => assert_eq!(symbol, "SEISMIC_CONST_HEIGHT"),
+            other => panic!("expected an unknown constant, got {other:?}"),
+        }
+        fs::remove_dir_all(&root).expect("remove fixture directory");
+    }
+
     fn fixture(name: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2727,7 +2798,7 @@ mod native_tests {
         root
     }
 
-    const SPECIALIZED: &str = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for cuda from \"native/scale.cu\":\n    static (N)\n    params (TILE in [32, 64])\n    scratch staging bytes (N * 4)\n    launch scale:\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (TILE, 1, 1)\n\nnative scale for cpu from \"native/scale.rs\":\n    params (TILE in [32, 64], UNROLL in [1, 2, 4])\n    launch scale:\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
+    const SPECIALIZED: &str = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for cuda from \"native/scale.cu\":\n    static (N)\n    params (TILE in [32, 64] default 32)\n    scratch staging bytes (N * 4)\n    launch scale:\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (TILE, 1, 1)\n\nnative scale for cpu from \"native/scale.rs\":\n    params (TILE in [32, 64] default 32, UNROLL in [1, 2, 4] default 1)\n    launch scale:\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
 
     const CPU_SCALE: &str = "fn scale<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {\n    let (x, output, tile) = (cx.arg_x(), cx.result_0(), cx.param_tile());\n    for i in group[0] * tile..((group[0] + 1) * tile).min(cx.dim_n()) {\n        unsafe { output.set([i as usize], x.get([i as usize])) };\n    }\n    let _ = cx.param_unroll();\n}\n";
 
@@ -2735,7 +2806,7 @@ mod native_tests {
     fn launch_scoped_assets_use_forming_guards_without_tuning_macros() {
         let root = fixture("scoped-abi");
         let source = root.join("ops.seismic");
-        fs::write(&source, "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for cuda from \"native/scale.cu\":\n    launch scale_a when N <= 8:\n        params (code TILE in [4, 8])\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch scale_b when N > 8:\n        params (code TILE in [16, 32])\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n").unwrap();
+        fs::write(&source, "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for cuda from \"native/scale.cu\":\n    launch scale_a when N <= 8:\n        params (TILE in [4, 8] default 4)\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch scale_b when N > 8:\n        params (TILE in [16, 32] default 16)\n        threadgroups (ceil_div(N, TILE), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n").unwrap();
         let asset = root.join("native/scale.cu");
         fs::write(&asset, "#ifdef SEISMIC_FORMING_SCALE_A\ntemplate <unsigned TILE>\n__global__ void scale_a() {}\n#endif\n#ifdef SEISMIC_FORMING_SCALE_B\ntemplate <unsigned TILE>\n__global__ void scale_b() {}\n#endif\n").unwrap();
         let build = |name: &str| {
@@ -2758,7 +2829,7 @@ mod native_tests {
     fn metal_scoped_templates_match_the_launch_declaration() {
         let root = fixture("metal-scoped-template");
         let source = root.join("ops.seismic");
-        fs::write(&source, "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"native/scale.metal\":\n    params (SPLIT in [1, 2])\n    launch small when N <= 8:\n        params (code ROWS in [1, 2])\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when N > 8:\n        params (code WIDTH in [4, 8], code ROWS in [1, 2])\n        threadgroups (ceil_div(N, WIDTH * ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n").unwrap();
+        fs::write(&source, "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"native/scale.metal\":\n    params (SPLIT in [1, 2] default 1)\n    launch small when N <= 8:\n        params (ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when N > 8:\n        params (WIDTH in [4, 8] default 4, ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, WIDTH * ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n").unwrap();
         let asset = root.join("native/scale.metal");
         let small = "#ifdef SEISMIC_FORMING_SMALL\ntemplate <uint ROWS>\nkernel void small() { (void)SEISMIC_RUNTIME_SPLIT; }\n#endif\n";
         let large = "#ifdef SEISMIC_FORMING_LARGE\ntemplate <uint WIDTH, uint ROWS>\nkernel void large() {}\n#endif\n";
@@ -2794,7 +2865,9 @@ mod native_tests {
         )
         .unwrap();
         match build("reordered").expect_err("code parameters are positional") {
-            BuildError::NativeTemplate { kernel, .. } => assert_eq!(kernel, "large"),
+            BuildError::Source(error) => {
+                assert!(error.to_string().contains("launch `large`"), "{error}")
+            }
             other => panic!("unexpected error: {other}"),
         }
         fs::write(
@@ -2809,7 +2882,9 @@ mod native_tests {
         )
         .unwrap();
         match build("unguarded").expect_err("every kernel needs its own forming guard") {
-            BuildError::NativeTemplate { kernel, .. } => assert_eq!(kernel, "large"),
+            BuildError::Source(error) => {
+                assert!(error.to_string().contains("launch `large`"), "{error}")
+            }
             other => panic!("unexpected error: {other}"),
         }
         fs::remove_dir_all(root).unwrap();
@@ -2819,7 +2894,7 @@ mod native_tests {
     fn cuda_scoped_templates_match_the_launch_declaration() {
         let root = fixture("cuda-scoped-template");
         let source = root.join("ops.seismic");
-        fs::write(&source, "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for cuda from \"native/scale.cu\":\n    params (code arithmetic INT8 in [0, 1])\n    launch small when N <= 8:\n        params (code KSPLIT in [2, 4])\n        threadgroups (ceil_div(N, KSPLIT), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when N > 8:\n        reads (INT8)\n        threadgroups (ceil_div(N, 32), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n").unwrap();
+        fs::write(&source, "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for cuda from \"native/scale.cu\":\n    params (arithmetic INT8 in [0, 1] default 0)\n    launch small when N <= 8:\n        params (KSPLIT in [2, 4] default 2)\n        threadgroups (ceil_div(N, KSPLIT), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when N > 8:\n        reads (INT8)\n        threadgroups (ceil_div(N, 32), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n").unwrap();
         let asset = root.join("native/scale.cu");
         let small = "#ifdef SEISMIC_FORMING_SMALL\ntemplate <int KSPLIT>\n__global__ void small() {}\n#endif\n";
         let large = "#ifdef SEISMIC_FORMING_LARGE\ntemplate <unsigned INT8>\n__global__ void large() {}\n#endif\n";
@@ -2841,7 +2916,9 @@ mod native_tests {
         )
         .unwrap();
         match build("wrong-parameter").expect_err("CUDA code parameters are positional") {
-            BuildError::NativeTemplate { kernel, .. } => assert_eq!(kernel, "large"),
+            BuildError::Source(error) => {
+                assert!(error.to_string().contains("launch `large`"), "{error}")
+            }
             other => panic!("unexpected error: {other}"),
         }
         fs::remove_dir_all(root).unwrap();

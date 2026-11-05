@@ -1,7 +1,6 @@
 //! The evaluation result record (contract "Result record") and the run
 //! directory it is written into.
 
-use crate::digest::sha256_hex;
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -31,30 +30,16 @@ pub struct RunRecord {
 }
 
 impl Run {
-    /// Create the run directory: `output`, or a new directory under the
-    /// evaluation results.
-    pub fn create(output: Option<PathBuf>, tool: &'static str) -> Result<Self, String> {
+    /// Create the run directory, `directory`.
+    pub fn create(directory: PathBuf, tool: &'static str) -> Result<Self, String> {
         let now = SystemTime::now();
-        let directory = match output {
-            Some(directory) => directory,
-            None => {
-                let nanos = now
-                    .duration_since(UNIX_EPOCH)
-                    .expect("the clock is after the epoch")
-                    .as_nanos();
-                let short = &sha256_hex(format!("{nanos}/{}", std::process::id()).as_bytes())[..8];
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../results")
-                    .join(format!("{}-{tool}-{short}", utc(now).1))
-            }
-        };
         std::fs::create_dir_all(&directory)
             .map_err(|error| format!("run directory {}: {error}", directory.display()))?;
         eprintln!("magnitude-harness: run directory {}", directory.display());
         Ok(Self {
             directory,
             tool,
-            started_at: utc(now).0,
+            started_at: utc(now),
             command: std::env::args().collect(),
         })
     }
@@ -69,7 +54,7 @@ impl Run {
             "schema": SCHEMA,
             "tool": self.tool,
             "started_at": self.started_at,
-            "finished_at": utc(SystemTime::now()).0,
+            "finished_at": utc(SystemTime::now()),
             "build": record.build,
             "model": record.model,
             "artifacts": record.artifacts,
@@ -107,8 +92,8 @@ impl Run {
     }
 }
 
-/// `(RFC 3339, compact)` UTC renderings of `time`, to the second.
-fn utc(time: SystemTime) -> (String, String) {
+/// The RFC 3339 UTC rendering of `time`, to the second.
+fn utc(time: SystemTime) -> String {
     let seconds = time
         .duration_since(UNIX_EPOCH)
         .expect("the clock is after the epoch")
@@ -130,10 +115,7 @@ fn utc(time: SystemTime) -> (String, String) {
     };
     let year = year_of_era + era * 400 + i64::from(month <= 2);
     let (hour, minute, second) = (of_day / 3600, of_day / 60 % 60, of_day % 60);
-    (
-        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"),
-        format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z"),
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 /// The build this harness runs, as the caller identified it: `identity` is a

@@ -1,8 +1,8 @@
 // routed_down on CPU (contract and portable body in routed.seismic).
 // `routed_down_stage` stages each row's choice products as F32 in scratch,
 // one work item per row. `routed_down_rows`: work item (x, m) owns ROWS
-// output channels of row m. It projects each choice's expert down rows,
-// weighting each published (A-rounded) projection in slot order, and
+// output channels of row m. It projects each choice's expert down rows
+// (none for a choice its sources name none for), weighting each published (A-rounded) projection in slot order, and
 // publishes base + selected.
 
 use lib::core::activation;
@@ -44,14 +44,25 @@ fn routed_down_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64
     let quantized = (cx.param_int8() == 1)
         .then(|| unsafe { cx.scratch_quantized().slice::<seismic::cpu::quant::Q8Block>(0, m * k * blocks) });
     let (routes, weights, down) = (cx.arg_routes(), cx.arg_weights(), cx.arg_expert_down());
+    let tier = cx.arg_tier_down();
+    let sources = cx.arg_sources();
+    let record = |slot: usize| routed::decode_source(cx.dim_xs(), || sources.get([0, row, slot]), routes.get([row, slot]));
     let mut selected = [0.0f32; projection::MAX_ROWS];
     let mut projected = [0.0f32; projection::MAX_ROWS];
     let (selected, projected) = (&mut selected[..columns.len()], &mut projected[..columns.len()]);
     for slot in 0..k {
         let choice = row * k + slot;
-        let first = routed::expert_row(routes.get([row, slot]), h) + columns.start;
-        let q8 = quantized.map(|q8| &q8[choice * blocks..(choice + 1) * blocks]);
-        projection::project_arithmetic(&down, first, &staged[choice * f..(choice + 1) * f], q8, projected);
+        // A choice its slot map names no record for reads none: a zero
+        // projection.
+        match record(slot) {
+            Some(place) => {
+                let (down, record) = place.of(&down, &tier);
+                let first = routed::expert_row(record, h) + columns.start;
+                let q8 = quantized.map(|q8| &q8[choice * blocks..(choice + 1) * blocks]);
+                projection::project_arithmetic(down, first, &staged[choice * f..(choice + 1) * f], q8, projected);
+            }
+            None => projected.fill(0.0),
+        }
         let weight = weights.get([row, slot]);
         for (selected, projected) in selected.iter_mut().zip(projected.iter()) {
             *selected = weight.mul_add(activation::publish::<E::A>(*projected), *selected);

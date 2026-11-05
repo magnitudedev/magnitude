@@ -308,10 +308,16 @@ fn request_class(error: &RequestError) -> Class {
     }
 }
 
+/// The failure code of a load whose weight cap is below its least weights: the caller's bound,
+/// which no wait clears.
+pub const WEIGHT_CAP_BELOW_WEIGHTS: &str = "weight_cap_below_weights";
+
 /// Load failures surfaced to a request that triggered the load.
 fn load_class(error: &LoadError) -> Class {
     match error {
         LoadError::Unsupported(_) => (StatusCode::CONFLICT, MODEL, "unsupported_model", false),
+        LoadError::Configuration { .. } => (StatusCode::CONFLICT, MODEL, "invalid_model_configuration", false),
+        LoadError::WeightCap(_) => (StatusCode::CONFLICT, MODEL, WEIGHT_CAP_BELOW_WEIGHTS, false),
         LoadError::Artifact(_) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             INVALID,

@@ -5,7 +5,7 @@
 
 use crate::{invalid, product, Error};
 use magnitude_artifacts::gguf::{Directory, Element, PROJECTOR_ARCHITECTURE, Scalar, Value};
-use magnitude_family_common::{architecture_keys, HeaderError, Tensors};
+use magnitude_family_common::{architecture_keys, projector_type, HeaderError, Tensors};
 use magnitude_family_contracts::{
     CellReduction, ImportTransform, LinearClamp, MergerStage, PositionSampling, RmsNorm,
     Standardize, UnweightedRms, VisionActivation, VisionAttention, VisionAttentionScale,
@@ -136,13 +136,18 @@ pub fn describe_projector(
     directory: &Directory,
     output_hidden: u64,
 ) -> Result<VisionDescription, Error> {
-    if directory.value("general.architecture").and_then(Value::string) != Some(PROJECTOR_ARCHITECTURE)
-        || directory.value("general.type").and_then(Value::string) != Some("mmproj")
-        || directory.value("clip.has_vision_encoder")
-            != Some(&Value::Scalar(Scalar::Bool(true)))
-    {
-        return Err(invalid("unsupported Gemma projector identity"));
+    #[derive(Clone, Copy)]
+    enum Form {
+        /// `gemma4v`.
+        Encoder,
+        /// `gemma4uv`.
+        Unified,
     }
+    let form = projector_type(
+        directory,
+        &[("gemma4v", Form::Encoder), ("gemma4uv", Form::Unified)],
+        output_hidden,
+    )?;
     for (_, entry) in architecture_keys(directory, PROJECTOR_ARCHITECTURE) {
         let known = IGNORED_PREFIXES
             .iter()
@@ -173,17 +178,11 @@ pub fn describe_projector(
         directory,
         tensors: Tensors::new(directory),
     };
-    if reader.unsigned("clip.vision.projection_dim")? != output_hidden {
-        return Err(invalid("projector width differs from the decoder width"));
-    }
-    let kind = directory
-        .value("clip.vision.projector_type")
-        .and_then(Value::string)
-        .ok_or_else(|| invalid("Gemma projector declares no projector type"))?;
-    let description = match kind {
-        "gemma4v" => encoder(&mut reader, output_hidden)?,
-        "gemma4uv" => unified(&mut reader, output_hidden)?,
-        kind => return Err(invalid(format!("unsupported Gemma projector type {kind:?}"))),
+    // Declared, and the target's (`projector_type`).
+    reader.unsigned("clip.vision.projection_dim")?;
+    let description = match form {
+        Form::Encoder => encoder(&mut reader, output_hidden)?,
+        Form::Unified => unified(&mut reader, output_hidden)?,
     };
     reader.finish()?;
     description

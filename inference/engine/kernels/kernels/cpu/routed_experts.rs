@@ -1,18 +1,32 @@
 // routed_experts on CPU (contract and portable body in routed.seismic).
-// `routed_experts_stage` stages each normalized row as F32 in scratch, one
-// work item per row. `routed_experts_expand`: work item (x, b) owns ROWS
+// `routed_experts_stage` stages each grouped normalized row (from row
+// first[0]) as F32 in scratch, one work item per row. `routed_experts_expand`: work item (x, b) owns ROWS
 // features of block b and expands its expert's gate/up rows against every
 // live row of the block (the source rows `order` names) into the `product`
-// scratch [B * T, F], each A(act(gs * gate) * (us * up)) as F32 (`activation`;
-// the scales the block's expert's, 1 where a port is absent).
+// scratch [B * T, F], each the `glu` of gs * gate and us * up as F32
+// (`activation`; the scales the block's expert's, 1 where a port is absent).
 // `routed_experts_down`: work item (x, b) owns ROWS output channels of block
 // b and projects its expert's down rows against every live row's product,
-// published in A. Blocks of expert -1 and padding rows carry no contract and
-// are left unwritten.
+// published in A. Blocks past `used` and padding rows carry no contract and
+// are left unwritten. `routed_experts_grids` writes the other launches' grids
+// from the grouped rows and used blocks; an expert's weights are read where
+// the slot map places them (`routed::expert_weights`).
 
 use lib::core::activation;
 use lib::projection::projection;
 use lib::routed::routed;
+
+fn routed_experts_grids<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, _group: [u64; 3], _shared: &mut [u8]) {
+    let items = |extent: u64| extent.div_ceil(cx.param_rows()) as usize;
+    routed::expert_grids(
+        [cx.scratch_stage_grid(), cx.scratch_expand_grid(), cx.scratch_quantize_grid(), cx.scratch_down_grid()],
+        cx.arg_rows().get([0]),
+        cx.arg_used().get([0]),
+        cx.dim_t() as usize,
+        items(cx.dim_f()),
+        items(cx.dim_h()),
+    );
+}
 
 fn routed_experts_stage<L: Isa, E: Elements>(
     _l: L,
@@ -20,7 +34,7 @@ fn routed_experts_stage<L: Isa, E: Elements>(
     group: [u64; 3],
     _shared: &mut [u8],
 ) {
-    let row = group[0] as usize;
+    let row = usize::try_from(cx.arg_first().get([0])).expect("a first row is not negative") + group[0] as usize;
     let h = cx.dim_h() as usize;
     // SAFETY: each work item writes its own row of the scratch.
     let staged = unsafe { cx.scratch_staged().slice_mut::<f32>(4 * row * h, h) };
@@ -54,12 +68,12 @@ fn routed_experts_expand<L: Isa, E: Elements>(
     );
     let block = group[1] as usize;
     let expert = cx.arg_blocks().get([block]);
-    if expert < 0 {
-        return;
-    }
     let rows = projection::item_rows(group[0], cx.param_rows(), f);
-    let first = routed::expert_row(expert, f) + rows.start;
-    let (gate, up) = (cx.arg_expert_gate(), cx.arg_expert_up());
+    let (map, step) = (cx.arg_map(), cx.arg_step());
+    let (experts, records) = ([cx.arg_expert_gate(), cx.arg_expert_up()], [cx.arg_records_gate(), cx.arg_records_up()]);
+    let place = |weight: usize| routed::expert_weights(&experts[weight], &records[weight], cx.dim_x(), |e| routed::held(|w| map.get([e, w]), |w| step.get([w])), expert);
+    let ((gate, index), (up, _)) = (place(0), place(1));
+    let first = routed::expert_row(index, f) + rows.start;
     let (gate_scale, up_scale) = (cx.arg_gate_scale(), cx.arg_up_scale());
     let scales = (
         routed::scale_factor(cx.dim_gs(), |e| gate_scale.get([e]), expert),
@@ -82,8 +96,8 @@ fn routed_experts_expand<L: Isa, E: Elements>(
         };
         let q8 = quantized.map(|q8| &q8[source * blocks..(source + 1) * blocks]);
         routed::expand::<E::A>(
-            &gate,
-            &up,
+            gate,
+            up,
             first,
             &staged[source * h..(source + 1) * h],
             q8,
@@ -102,9 +116,7 @@ fn routed_experts_quantize<L: Isa, E: Elements>(
 ) {
     let (f, t) = (cx.dim_f() as usize, cx.dim_t() as usize);
     let (block, lane) = (group[0] as usize / t, group[0] as usize % t);
-    if cx.arg_blocks().get([block]) < 0
-        || lane >= routed::block_rows(cx.arg_order().row([block, 0]))
-    {
+    if lane >= routed::block_rows(cx.arg_order().row([block, 0])) {
         return;
     }
     let row = block * t + lane;
@@ -139,12 +151,11 @@ fn routed_experts_down<L: Isa, E: Elements>(
     );
     let block = group[1] as usize;
     let expert = cx.arg_blocks().get([block]);
-    if expert < 0 {
-        return;
-    }
     let columns = projection::item_rows(group[0], cx.param_rows(), h);
-    let first = routed::expert_row(expert, h) + columns.start;
-    let (down, output) = (cx.arg_expert_down(), cx.result_0());
+    let ((map, step), experts, records) = ((cx.arg_map(), cx.arg_step()), cx.arg_expert_down(), cx.arg_records_down());
+    let (down, index) = routed::expert_weights(&experts, &records, cx.dim_x(), |e| routed::held(|w| map.get([e, w]), |w| step.get([w])), expert);
+    let first = routed::expert_row(index, h) + columns.start;
+    let output = cx.result_0();
     let order = cx.arg_order().row([block, 0]);
     // SAFETY: the expand launch wrote every live row before this launch.
     let product = unsafe { cx.scratch_product().slice::<f32>(0, b * t * f) };
@@ -159,7 +170,7 @@ fn routed_experts_down<L: Isa, E: Elements>(
         let at = (block * t + lane) * f;
         let row = block * t + lane;
         let q8 = quantized.map(|q8| &q8[row * blocks..(row + 1) * blocks]);
-        projection::project_arithmetic(&down, first, &product[at..at + f], q8, projected);
+        projection::project_arithmetic(down, first, &product[at..at + f], q8, projected);
         // SAFETY: each work item writes its own channels of its own block's rows.
         let out = unsafe { output.span_mut([block, lane, columns.start], columns.len()) };
         activation::store::<E::A>(projected, out);

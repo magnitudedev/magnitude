@@ -2242,6 +2242,7 @@ dependencies = [
  "libc",
  "magnitude-ggml",
  "serde",
+ "serde_json",
  "sha2 0.11.0",
 ]
 
@@ -2292,6 +2293,7 @@ dependencies = [
  "magnitude-generation",
  "magnitude-grammar",
  "magnitude-scheduler",
+ "magnitude-service-utils",
  "magnitude-state",
  "magnitude-templates",
  "opentelemetry 0.33.0",
@@ -2304,6 +2306,8 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2318,13 +2322,13 @@ dependencies = [
  "magnitude-state",
  "serde_json",
  "tokio",
- "tracing-subscriber",
 ]
 
 [[package]]
 name = "magnitude-executor"
 version = "0.1.0"
 dependencies = [
+ "gimli",
  "libc",
  "magnitude-artifacts",
  "magnitude-batching",
@@ -2341,9 +2345,12 @@ dependencies = [
  "magnitude-kernels",
  "magnitude-state",
  "seismic",
+ "seismic-lang",
+ "seismic-std",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tracing",
 ]
 
 [[package]]
@@ -2497,10 +2504,13 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "libc",
+ "magnitude-artifacts",
  "magnitude-chat",
  "magnitude-engine",
  "magnitude-executor",
  "magnitude-family-contracts",
+ "magnitude-generation",
+ "magnitude-kernels",
  "magnitude-scheduler",
  "magnitude-serving",
  "magnitude-state",
@@ -2508,6 +2518,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2531,6 +2543,7 @@ dependencies = [
  "seismic",
  "seismic-build",
  "seismic-lang",
+ "seismic-native-tests",
  "seismic-std",
 ]
 
@@ -2543,6 +2556,7 @@ dependencies = [
  "magnitude-generation",
  "magnitude-state",
  "serde",
+ "serde_json",
  "tracing",
 ]
 
@@ -2677,6 +2691,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -2690,6 +2706,7 @@ dependencies = [
  "http-body-util",
  "magnitude-chat",
  "magnitude-engine",
+ "magnitude-service-utils",
  "serde",
  "serde_json",
  "thiserror",
@@ -4120,6 +4137,7 @@ version = "0.1.0"
 dependencies = [
  "magnitude-ggml",
  "seismic-compiler",
+ "seismic-discovery",
  "seismic-lang",
  "seismic-measure",
  "seismic-native-cpu",
@@ -4158,6 +4176,7 @@ dependencies = [
  "seismic-ir",
  "seismic-lang",
  "seismic-native-target",
+ "serde",
  "sha2 0.11.0",
 ]
 
@@ -4185,6 +4204,8 @@ dependencies = [
  "seismic-ir",
  "seismic-lang",
  "seismic-native-target",
+ "seismic-reservation",
+ "seismic-topology",
  "sha2 0.11.0",
 ]
 
@@ -4192,13 +4213,32 @@ dependencies = [
 name = "seismic-cuda"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "libloading",
  "seismic-compiler",
  "seismic-estimator",
  "seismic-ir",
  "seismic-lang",
  "seismic-native-target",
+ "seismic-reservation",
+ "seismic-topology",
  "sha2 0.11.0",
+]
+
+[[package]]
+name = "seismic-discovery"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "seismic-cpu",
+ "seismic-cuda",
+ "seismic-metal",
+ "seismic-native-cpu",
+ "seismic-topology",
+ "seismic-vulkan",
+ "serde_json",
+ "windows",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4254,6 +4294,7 @@ dependencies = [
 name = "seismic-metal"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "libc",
  "objc2",
  "objc2-foundation",
@@ -4264,6 +4305,8 @@ dependencies = [
  "seismic-ir",
  "seismic-lang",
  "seismic-native-target",
+ "seismic-reservation",
+ "seismic-topology",
  "sha2 0.11.0",
 ]
 
@@ -4281,6 +4324,7 @@ version = "0.1.0"
 dependencies = [
  "seismic-ir",
  "seismic-lang",
+ "serde",
 ]
 
 [[package]]
@@ -4302,6 +4346,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "seismic-reservation"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "seismic-runtime"
 version = "0.1.0"
 dependencies = [
@@ -4311,12 +4362,14 @@ dependencies = [
  "seismic-compiler",
  "seismic-cpu",
  "seismic-cuda",
+ "seismic-discovery",
  "seismic-ir",
  "seismic-lang",
  "seismic-measure",
  "seismic-metal",
  "seismic-native-cpu",
  "seismic-native-target",
+ "seismic-reservation",
  "seismic-std",
  "seismic-topology",
  "seismic-vulkan",
@@ -4337,17 +4390,9 @@ dependencies = [
 name = "seismic-topology"
 version = "0.1.0"
 dependencies = [
- "libc",
- "seismic-cpu",
- "seismic-cuda",
  "seismic-lang",
- "seismic-metal",
- "seismic-native-cpu",
- "seismic-vulkan",
  "serde",
  "serde_json",
- "windows",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4357,7 +4402,10 @@ dependencies = [
  "ash",
  "glslang",
  "seismic-compiler",
+ "seismic-lang",
  "seismic-native-target",
+ "seismic-reservation",
+ "seismic-topology",
  "spirv-tools",
 ]
 

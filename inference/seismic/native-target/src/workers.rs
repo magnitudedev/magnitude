@@ -461,41 +461,81 @@ mod tests {
         assert_eq!((text.as_str(), number, flag), ("formed", 7, true));
     }
 
-    /// A narrowed set works a batch on no more threads than it was allowed,
-    /// the caller among them, and on its whole width again afterwards.
+    /// A rendezvous of items formed at once: each item holds its thread
+    /// until `parties` items have been formed at once or its patience runs
+    /// out, so items that may overlap do, and the most formed at once is
+    /// what the threads allowed, not their timing, decides.
+    struct AtOnce {
+        parties: usize,
+        patience: std::time::Duration,
+        /// Items being formed now, and the most ever formed at once.
+        state: Mutex<(usize, usize)>,
+        met: Condvar,
+    }
+
+    impl AtOnce {
+        fn new(parties: usize, patience: std::time::Duration) -> Self {
+            Self { parties, patience, state: Mutex::new((0, 0)), met: Condvar::new() }
+        }
+
+        fn form(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.0 += 1;
+            state.1 = state.1.max(state.0);
+            self.met.notify_all();
+            let (mut state, _) = self
+                .met
+                .wait_timeout_while(state, self.patience, |state| state.1 < self.parties)
+                .unwrap();
+            state.0 -= 1;
+        }
+
+        fn most(self) -> usize {
+            self.state.into_inner().unwrap().1
+        }
+    }
+
+    /// A narrowed set works a batch on no more threads at once than it was
+    /// allowed, the caller among them, and on its whole width at once again
+    /// afterwards. Each item holds its thread until one more item than
+    /// allowed is formed beside it, or a few milliseconds pass, so a bound
+    /// fails whenever more threads are let in; the whole width is a
+    /// rendezvous only that many threads at once complete, with a deadline,
+    /// so a regression fails instead of hanging.
     #[test]
     fn a_narrowed_set_works_a_batch_on_the_threads_allowed() {
+        const HOLD: std::time::Duration = std::time::Duration::from_millis(10);
         let workers = Arc::new(Workers::new(6));
         let work = (0..48usize).collect::<Vec<_>>();
-        let distinct = |workers: &Workers| {
+        {
+            let _narrowed = workers.narrowed(2);
+            let flat = AtOnce::new(3, HOLD);
+            workers.each(&work, |_| flat.form());
+            assert!(flat.most() <= 2);
+            // Batches handed out from inside a batch share the allowance:
+            // it is the set's, not each batch's.
+            let nested = AtOnce::new(3, HOLD);
+            workers.each(&work[..6], |_| {
+                workers.each(&work[..6], |_| nested.form());
+            });
+            assert!(nested.most() <= 2);
+            let _alone = workers.narrowed(0);
             let threads = Mutex::new(HashSet::new());
             workers.each(&work, |_| {
                 threads.lock().unwrap().insert(std::thread::current().id());
-                std::thread::sleep(std::time::Duration::from_millis(2));
             });
-            threads.into_inner().unwrap()
-        };
-        {
-            let _narrowed = workers.narrowed(2);
-            assert!(distinct(&workers).len() <= 2);
-            // Batches handed out from inside a batch share the allowance:
-            // it is the set's, not each batch's.
-            let nested = Mutex::new(HashSet::new());
-            workers.each(&work[..6], |_| {
-                workers.each(&work[..6], |_| {
-                    nested.lock().unwrap().insert(std::thread::current().id());
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                });
-            });
-            assert!(nested.into_inner().unwrap().len() <= 2);
-            let _alone = workers.narrowed(0);
             assert_eq!(
-                distinct(&workers),
+                threads.into_inner().unwrap(),
                 HashSet::from([std::thread::current().id()]),
                 "a batch always has its caller"
             );
         }
-        assert!(distinct(&workers).len() > 2, "the set is whole again");
+        // The set is whole again: its width and the caller form one item
+        // each at once.
+        let whole = workers.width() + 1;
+        let together = AtOnce::new(whole, std::time::Duration::from_secs(2));
+        workers.each(&work[..whole], |_| together.form());
+        assert_eq!(together.most(), whole);
     }
 
     /// What a job allocated and freed on a worker thread is the system's

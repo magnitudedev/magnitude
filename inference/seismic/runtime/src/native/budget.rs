@@ -53,45 +53,30 @@ impl Observed {
 /// constant, and the price is the mean; neither term is ever negative.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Linear {
-    count: f64,
-    units: f64,
-    seconds: f64,
-    units_squared: f64,
-    units_seconds: f64,
+    /// The calls' points: a cost of the call, and one of each unit.
+    sums: seismic_measure::Sums<2>,
     longest: f64,
 }
 
 impl Linear {
     /// One more call, which did `units` units of work in `seconds`.
     pub fn observe(&mut self, units: usize, seconds: f64) {
-        let units = units as f64;
-        self.count += 1.;
-        self.units += units;
-        self.seconds += seconds;
-        self.units_squared += units * units;
-        self.units_seconds += units * seconds;
+        self.sums.add([1., units as f64], seconds, 1.);
         self.longest = self.longest.max(seconds);
     }
 
-    /// The cost of a call and of each unit; none before an observation.
+    /// The cost of a call and of each unit (`seismic_measure::Sums::fit`),
+    /// the mean of calls of one size; none before an observation.
     fn terms(&self) -> Option<(f64, f64)> {
-        if self.count == 0. {
+        if self.sums.weight == 0. {
             return None;
         }
-        let mean = self.seconds / self.count;
-        let spread = self.count * self.units_squared - self.units * self.units;
-        // Sizes that differ by less than rounding are one size.
-        if spread <= self.units_squared * f64::EPSILON * self.count {
-            return Some((mean, 0.));
-        }
-        let each = (self.count * self.units_seconds - self.units * self.seconds) / spread;
-        let call = (self.seconds - each * self.units) / self.count;
-        Some(if each < 0. {
-            (mean, 0.)
-        } else if call < 0. {
-            (0., self.units_seconds / self.units_squared)
-        } else {
-            (call, each)
+        Some(match self.sums.fit() {
+            None => (self.sums.xt[0] / self.sums.weight, 0.),
+            Some(fit) => {
+                let terms = fit.expect("a call's observed seconds are finite and not negative");
+                (terms.fixed(), terms.slope())
+            }
         })
     }
 
@@ -107,7 +92,7 @@ impl Linear {
 
     /// The mean call, and the mean of its units.
     pub fn mean(&self) -> Option<(f64, f64)> {
-        (self.count > 0.).then(|| (self.seconds / self.count, self.units / self.count))
+        (self.sums.weight > 0.).then(|| (self.sums.xt[0] / self.sums.weight, self.sums.xx[0][1] / self.sums.weight))
     }
 
     /// The longest single call.
@@ -117,7 +102,7 @@ impl Linear {
 
     /// Everything the calls have taken.
     pub fn total(&self) -> f64 {
-        self.seconds
+        self.sums.xt[0]
     }
 }
 

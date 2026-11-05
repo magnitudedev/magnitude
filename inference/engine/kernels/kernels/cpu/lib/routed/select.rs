@@ -3,11 +3,10 @@
 // weights. The counterpart of `metal/lib/routed/select.h`,
 // `cuda/lib/routed/select.cuh` and `vulkan/lib/routed/select.glsl`.
 //
-// Top-K is one stable sort of the row's (ranked, expert) pairs by descending
-// ranked value, ties to the higher expert index: its first K entries are the
-// portable body's K argmax rounds in order.
+// Top-K is one sort of the row's experts by `ranked::rank`: its first K
+// entries are the portable body's K argmax rounds in order.
 
-use std::cmp::Ordering;
+use super::ranked;
 
 pub const SOFTMAX: i32 = 0;
 pub const SIGMOID: i32 = 1;
@@ -57,34 +56,13 @@ pub fn normalized(normalization: i32, weight: f32, denominator: f32, epsilon: f3
     }
 }
 
-/// The first `count` `u32` values of a work item's private bytes (which the
-/// pool aligns for any scalar): the selection's expert order.
-#[inline(always)]
-pub fn indices(bytes: &mut [u8], count: usize) -> &mut [u32] {
-    assert!(bytes.len() >= 4 * count, "{count} indices need {} private bytes", 4 * count);
-    // SAFETY: every bit pattern is a `u32`; `align_to_mut` places only aligned
-    // whole values in the middle part.
-    let (head, middle, _) = unsafe { bytes.align_to_mut::<u32>() };
-    assert!(head.is_empty(), "private bytes are aligned for u32");
-    &mut middle[..count]
-}
-
 /// Selects K = `routes.len()` experts of one row from its `scores` and the
-/// selection `bias`: ranked on score + bias (ties to the higher expert), rank
-/// r stored at slot K - 1 - r with its unbiased score in `weights`.
-/// `order` is E scratch indices.
+/// selection `bias`: ranked on score + bias (`ranked::rank`), rank r stored
+/// at slot K - 1 - r with its unbiased score in `weights`. `order` is E
+/// scratch indices.
 #[inline(always)]
 pub fn top_k(scores: &[f32], bias: impl Fn(usize) -> f32, order: &mut [u32], routes: &mut [i32], weights: &mut [f32]) {
-    for (index, slot) in order.iter_mut().enumerate() {
-        *slot = index as u32;
-    }
-    let ranked = |expert: u32| scores[expert as usize] + bias(expert as usize);
-    order.sort_by(|a, b| {
-        ranked(*b)
-            .partial_cmp(&ranked(*a))
-            .unwrap_or(Ordering::Equal)
-            .then(b.cmp(a))
-    });
+    ranked::rank(order, |expert| scores[expert] + bias(expert));
     let k = routes.len();
     for (rank, expert) in order[..k].iter().enumerate() {
         routes[k - 1 - rank] = *expert as i32;

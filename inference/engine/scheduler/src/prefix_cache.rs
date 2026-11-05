@@ -17,7 +17,7 @@
 //! (least recently used, never an entry in submitted use). What an eviction
 //! releases is Seismic's charge, observed by the memory heap after the
 //! entry's state drops.
-use magnitude_executor::{CONVERSATION_CHECKPOINTS, ResourcePlan};
+use magnitude_executor::ResourcePlan;
 use magnitude_family_contracts::{InputLayout, TokenId};
 use magnitude_generation::{Generation, MethodCheckpoint, MethodChoice};
 use serde::{Deserialize, Serialize};
@@ -47,7 +47,8 @@ pub enum PrefixRetention {
 /// The most entries the cache holds, and the state the memory plan charges
 /// its workload (one conversation at the fit depth with the checkpoints it
 /// retains): entries beyond the latest conversation's
-/// [`CONVERSATION_CHECKPOINTS`] are held only while the state every holder
+/// [`CONVERSATION_CHECKPOINTS`](magnitude_executor::CONVERSATION_CHECKPOINTS)
+/// are held only while the state every holder
 /// occupies stays within it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrefixCacheCapacity {
@@ -459,7 +460,9 @@ impl<S> PrefixCache<S> {
     /// Hold cached prefixes within the state the memory plan charges: while
     /// `occupied` (the state every holder occupies, these entries included)
     /// exceeds it, drop the least-recently-used entry without submitted uses,
-    /// sparing the [`CONVERSATION_CHECKPOINTS`] the plan charges the latest
+    /// sparing the
+    /// [`CONVERSATION_CHECKPOINTS`](magnitude_executor::CONVERSATION_CHECKPOINTS)
+    /// the plan charges the latest
     /// conversation (see [`Self::conversation_checkpoints`]). Returns how
     /// many entries were dropped.
     pub fn release_beyond_workload<E>(
@@ -570,6 +573,7 @@ impl<S> PrefixCache<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magnitude_executor::CONVERSATION_CHECKPOINTS;
     use magnitude_family_contracts::{BoundaryRule, InputSpan};
     use std::collections::{BTreeMap, BTreeSet};
 

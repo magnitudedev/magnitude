@@ -35,6 +35,7 @@ use super::{
 use crate::api::device::DeviceInner;
 use crate::api::kernel::{EncodedArgs, EncodedOutputs};
 use crate::api::tensor::TensorInner;
+use crate::driver::Allocation;
 use seismic_lang::registry::BackendName;
 use seismic_measure::{Gauge, Pending, Work};
 use seismic_topology::PhysicalIdentity;
@@ -143,9 +144,19 @@ pub struct KernelPoint {
     rotation: usize,
     arguments: Vec<EncodedArgs>,
     rotation_bytes: u64,
+    /// What runs beside the calls while the point is timed (work another
+    /// thread does on the device), held as long as the point or a gauge of
+    /// it is.
+    beside: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl KernelPoint {
+    /// The point timed with `beside` running for as long as it is held.
+    pub(crate) fn beside(mut self, beside: Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        self.beside = Some(beside);
+        self
+    }
+
     /// Validate and place every call of `rotation`, then of its cold
     /// `copies`. Results of each argument set are allocated once and reused
     /// by every pass, a copy's being its source's, or taken from `outputs`
@@ -181,7 +192,7 @@ impl KernelPoint {
             } else {
                 Some(encoded(&calls[index % own].results))
             };
-            let call = kernel.prepare_call(&mut scratch, args, supplied)?;
+            let call = kernel.prepare_call(&mut scratch, args, supplied, super::Parking::Unanswered)?;
             if let Some(pool) = outputs.as_mut() {
                 if index < own && index == pool.len() {
                     pool.push(call.results.clone());
@@ -201,6 +212,7 @@ impl KernelPoint {
             rotation: own,
             arguments,
             rotation_bytes: distinct.into_iter().map(|(_, bytes)| bytes).sum(),
+            beside: None,
         })
     }
 
@@ -254,7 +266,7 @@ impl Work for KernelPoint {
             kernel: &self.kernel,
             calls: self.calls(),
         }
-        .submit(passes)
+        .submit(passes, true)
     }
 
     fn calls_per_pass(&self) -> usize {
@@ -267,7 +279,7 @@ impl Work for KernelPoint {
             kernel: &self.kernel,
             calls: &self.calls,
         }
-        .submit(passes)
+        .submit(passes, true)
     }
 
     fn cold_calls_per_pass(&self) -> usize {
@@ -281,12 +293,9 @@ impl Work for KernelPoint {
     /// The rotation's calls placed again, with results of their own: a
     /// gauge submits passes alone.
     fn gauge(&self) -> Result<Box<dyn Gauge<CallError>>, CallError> {
-        Ok(Box::new(Self::place(
-            &self.kernel,
-            self.arguments.clone(),
-            Vec::new(),
-            None,
-        )?))
+        let mut gauge = Self::place(&self.kernel, self.arguments.clone(), Vec::new(), None)?;
+        gauge.beside = self.beside.clone();
+        Ok(Box::new(gauge))
     }
 }
 
@@ -323,10 +332,21 @@ pub enum GraphTiming {
 /// runs complete inside their submission ([`Work::submit`]), so the
 /// session's lead before a sample has completed when the sample's first
 /// run starts: at an idle device, with the run's first-use costs paid.
+///
+/// Every run binds the same storage: the point's bindings, its slot's
+/// workspace and upload region, and its one output arena. A graph bound to
+/// a run's storage serves every run of it, in flight or not
+/// (`graph_replays::Replays::record`), so the graphs its slot holds, made
+/// as the point is placed, serve every run of every submission: a
+/// session's sample queued behind the one before it, or behind a lead,
+/// makes no graph and takes no other share of the device's graph budget.
 pub struct GraphPoint {
     plan: Arc<NativeGraphPlan>,
     bindings: NativeGraphBindings,
     slot: RefCell<NativeGraphSlot>,
+    /// The arena every run's outputs are views of; none for a plan that
+    /// exports nothing.
+    exports: Option<Arc<Allocation>>,
     timing: GraphTiming,
 }
 
@@ -335,20 +355,22 @@ pub struct GraphPoint {
 pub struct GraphPending(Sampled);
 
 enum Sampled {
+    /// The submission of its runs.
     Device(NativeSubmission),
     Host(f64),
 }
 
 impl GraphPoint {
     /// Runs of `plan` with `bindings`, timed as `timing` says. A plan with
-    /// timeline nodes is refused: its runs wait on or signal a timeline and
-    /// are not the same work twice.
+    /// timeline nodes is refused, unless every one is a park bound answered
+    /// (`NativeGraphBindings::set_answered`): its runs wait on or signal a
+    /// timeline and are not the same work twice.
     pub(crate) fn new(
         plan: &Arc<NativeGraphPlan>,
         bindings: NativeGraphBindings,
         timing: GraphTiming,
     ) -> Result<Self, CallError> {
-        if plan.has_timelines() {
+        if plan.has_timelines() && !bindings.answered_only() {
             return Err(CallError::Workflow(
                 crate::api::WorkflowError::NativeGraphTimelineMeasured,
             ));
@@ -357,14 +379,16 @@ impl GraphPoint {
             plan: plan.clone(),
             bindings,
             slot: RefCell::new(plan.new_slot().map_err(super::tensor_error)?),
+            exports: plan.output_arena().map_err(super::tensor_error)?,
             timing,
         })
     }
 
-    /// The outputs of `runs` runs, allocated before any is timed.
-    fn outputs(&self, runs: usize) -> Result<Vec<NativeGraphOutputs>, CallError> {
+    /// The outputs of `runs` runs, each over the point's one output arena,
+    /// formed before any is timed.
+    fn outputs(&self, runs: usize) -> Vec<NativeGraphOutputs> {
         (0..runs)
-            .map(|_| self.plan.new_outputs().map_err(super::tensor_error))
+            .map(|_| self.plan.outputs_from_arena(self.exports.clone(), None))
             .collect()
     }
 
@@ -396,7 +420,7 @@ impl GraphPoint {
     /// for.
     fn host_seconds(&self, passes: usize, queued: bool) -> Result<f64, CallError> {
         let mut slot = self.slot.borrow_mut();
-        let outputs = self.outputs(passes)?;
+        let outputs = self.outputs(passes);
         let began = Instant::now();
         if queued {
             let completions = outputs
@@ -417,11 +441,11 @@ impl GraphPoint {
     /// `passes` runs queued as one submission, timed by its trace.
     fn device_submission(&self, passes: usize) -> Result<NativeSubmission, CallError> {
         let mut slot = self.slot.borrow_mut();
-        let mut sequence = NativeGraphSequence::new(self.plan.device());
-        for outputs in self.outputs(passes)? {
+        let mut sequence = NativeGraphSequence::new(self.plan.device(), super::NativeQueue::Compute);
+        for outputs in self.outputs(passes) {
             self.queue(&mut slot, outputs, &mut sequence)?;
         }
-        Ok(sequence.submit()?.into_submission())
+        Ok(sequence.submit_observed(true)?.into_submission())
     }
 }
 

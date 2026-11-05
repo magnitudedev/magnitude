@@ -84,6 +84,13 @@ impl ResidentRoles {
     ) -> Result<Self, ResidencyError> {
         let mut roles = HashMap::with_capacity(weights.len());
         for (role, descriptor) in weights {
+            // A banked expert stack is its bank's (`ResidentTarget::bank`).
+            if residency
+                .planned(role)
+                .is_some_and(|plan| plan.banked().is_some())
+            {
+                continue;
+            }
             let weight = residency.import_gguf(
                 artifact,
                 descriptor,
@@ -155,6 +162,13 @@ pub struct ResidentTarget {
     pub fusion: Option<ResidentFusion>,
     /// The per-layer entry, when the model has per-layer inputs.
     pub per_layer: Option<ResidentPerLayer>,
+    /// The expert bank of a load that streams its routed experts: it holds
+    /// the banked expert stacks, which `sublayers` does not.
+    pub(crate) bank: Option<std::sync::Arc<crate::experts::ExpertBank>>,
+    /// The resident imports' bytes, each allocation once
+    /// ([`Self::cached_bytes`]): counted once the imports are made, which
+    /// nothing changes after.
+    imported: u64,
 }
 
 /// The target's vocabulary projection, as its plan places it.
@@ -228,7 +242,22 @@ impl ResidentTarget {
         }
     }
 
+    /// Every allocation the target holds: its expert bank's and its
+    /// resident imports' ([`Self::cached_bytes`]).
     pub(crate) fn storage_bytes(&self) -> Result<u64, &'static str> {
+        let bank = self.bank.as_ref().map_or(Ok(0), |bank| bank.storage_bytes())?;
+        bank.checked_add(self.cached_bytes()?).ok_or("resident target charge overflows")
+    }
+
+    /// The target's resident imports, each allocation once: what the
+    /// residency cache holds of it, which a head loader inheriting the
+    /// cache shares (its expert bank is no import of the cache).
+    pub(crate) fn cached_bytes(&self) -> Result<u64, &'static str> {
+        Ok(self.imported)
+    }
+
+    /// [`Self::cached_bytes`] counted from the imports.
+    fn import_bytes(&self) -> Result<u64, &'static str> {
         let mut seen = Vec::<&seismic::Tensor>::new();
         let mut total = Some(0u64);
         self.visit_weights(|weight| {
@@ -240,6 +269,42 @@ impl ResidentTarget {
             seen.push(tensor);
         });
         total.ok_or("resident target charge overflows")
+    }
+
+    /// Visit every allocation the target holds: its weights' and its
+    /// expert bank's.
+    pub(crate) fn visit_storage(&self, visit: &mut dyn FnMut(&seismic::Tensor)) {
+        self.visit_weights(|weight| weight.visit_storage(visit));
+        if let Some(bank) = &self.bank {
+            bank.visit_storage(visit);
+        }
+    }
+
+    /// The tensor a graph's bank port binds (`BankPort`): the bank's.
+    pub(crate) fn bank_part(
+        &self,
+        port: crate::programs::native_target_graph::BankPort,
+    ) -> Result<&seismic::Tensor, String> {
+        self.bank
+            .as_ref()
+            .ok_or_else(|| format!("bank port {port:?} of a load whose experts are held whole"))?
+            .part(port.scope, port.part)
+    }
+
+    /// The tensor a graph's weight port of `role`'s `part` binds: a banked
+    /// expert stack's values and scale from the bank, any other from its
+    /// resident weight.
+    pub(crate) fn bound(
+        &self,
+        role: WeightRole,
+        part: crate::programs::native_target_graph::WeightPart,
+    ) -> Result<&seismic::Tensor, String> {
+        use crate::programs::native_target_graph::WeightPart;
+        match (&self.bank, part) {
+            (Some(bank), WeightPart::Values) if bank.holds(role) => bank.records(role),
+            (Some(bank), WeightPart::Scale) if bank.holds(role) => bank.expert_scale(role),
+            (_, part) => part.of(self.sublayers.get(role)?),
+        }
     }
 }
 
@@ -318,7 +383,7 @@ pub(crate) fn import_target(
             })
         })
         .transpose()?;
-    Ok(ResidentTarget {
+    let mut resident = ResidentTarget {
         embedding,
         blocks: decoder.blocks.len(),
         sublayers,
@@ -326,7 +391,11 @@ pub(crate) fn import_target(
         output,
         fusion,
         per_layer,
-    })
+        bank: residency.open_expert_bank(target)?,
+        imported: 0,
+    };
+    resident.imported = resident.import_bytes().map_err(invalid)?;
+    Ok(resident)
 }
 
 /// Import `scope`'s projection in the one form the finalized plan stores it

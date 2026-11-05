@@ -9,7 +9,7 @@
 
 use lib::core::{activation, reduce};
 use lib::projection::projection;
-use lib::routed::routed;
+use lib::routed::{ranked, routed};
 
 fn routed_route_normalize<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
@@ -52,9 +52,11 @@ fn routed_route_select<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [
     // SAFETY: each work item writes its own row of the routes and scores.
     let (routes, scores) = unsafe { (cx.arg_routes().row_mut([row, 0]), cx.arg_scores().row_mut([row, 0])) };
     let expert_scale = cx.arg_expert_scale();
+    let (probabilities, order) = shared.split_at_mut(4 * e);
     routed::select(
         logits,
-        seismic::cpu::tensor::floats(shared, e),
+        seismic::cpu::tensor::floats(probabilities, e),
+        ranked::indices(order, e),
         cx.arg_normalize() != 0,
         (cx.dim_es(), |expert| expert_scale.get([expert])),
         routes,

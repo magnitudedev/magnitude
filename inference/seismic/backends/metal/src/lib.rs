@@ -25,11 +25,13 @@ pub mod facts;
 pub mod intrinsic;
 pub mod profile;
 pub mod toolchain;
+pub mod topology;
 
 mod command;
 mod compile;
 mod render;
 mod services;
+mod timing;
 
 #[cfg(test)]
 mod test_support;
@@ -47,7 +49,9 @@ use std::time::Instant;
 
 pub use command::Pipeline;
 pub use compile::NativeCandidate;
-pub use device::{DeviceHandle, MetalBuffer, MetalDevice};
+pub use device::{
+    DeviceHandle, Granules, MetalBuffer, MetalDevice, MetalResizer, ReservedBuffer, WritableMetalBuffer,
+};
 pub use direct::{
     host_seconds, DirectBatch, DirectLaunch, DirectPipeline, DirectSubmission, LaunchTimestamps,
     SharedEvent, DIRECT_BUFFER_SLOTS, DIRECT_WORD_BYTES_LIMIT,

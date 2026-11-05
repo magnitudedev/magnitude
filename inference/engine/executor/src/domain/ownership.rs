@@ -51,15 +51,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// `from`'s state at its position. Features `from` holds for an image
     /// with a span straddling that position are adopted; every image placed
     /// after it that still lacks features is returned as an encode. Opening
-    /// into free banks changes no bindings; growing one orphans a queued
-    /// lookahead first.
+    /// into free banks changes no bindings; growing one orphans the queued
+    /// steps first.
     pub fn open_state(
         &mut self,
-        bindings: &mut StateBindings<F>,
+        bindings: &mut StateBindings,
         request: RequestId,
         from: Option<&ResumeState>,
     ) -> Result<Vec<Operation>, DomainError> {
-        self.orphan_lookahead(bindings)?;
+        self.orphan_queue(bindings)?;
         let installed = self
             .input
             .get(&request)
@@ -115,7 +115,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     fn fresh_state(
         &mut self,
-        bindings: &mut StateBindings<F>,
+        bindings: &mut StateBindings,
     ) -> Result<(SequenceState, Option<SequenceState>), DomainError> {
         self.provision_open(bindings)?;
         let requirements = self.open_requirements();
@@ -207,19 +207,26 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Drop a request's input and any numerical state. A resident request's
-    /// state must not be in flight.
+    /// state must not be in flight; a chain holder's is its chain's, dropped
+    /// with it once its queued chunks, which still read the chain's rows,
+    /// are waited for.
     pub fn close(&mut self, request: RequestId) -> Result<(), String> {
         let installed = self.input.get(&request).ok_or("request is not open")?;
+        let holds_chain = self.chain_holder() == Some(request);
         if installed.resident
-            && (!self.target.contains_key(&request)
+            && ((!holds_chain && !self.target.contains_key(&request))
                 || (self.head_store.is_some() && !self.head.contains_key(&request)))
         {
             return Err("request has unresolved work".into());
+        }
+        if holds_chain {
+            self.drain_queue().map_err(|error| error.to_string())?;
         }
         self.head.remove(&request);
         self.input.remove(&request);
         self.target.remove(&request);
         self.poisoned.remove(&request);
+        self.places_want = self.places_want.filter(|want| want.request != request);
         Ok(())
     }
 
@@ -293,13 +300,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.target.remove(request);
             self.head.remove(request);
         }
+        self.places_want = self.places_want.filter(|want| !requests.contains(&want.request));
         Ok(bytes)
     }
 
     /// Release every slab of a store no sequence or checkpoint owns. That
-    /// changes bindings, so a queued lookahead is orphaned first.
-    pub fn reclaim_idle(&mut self, bindings: &mut StateBindings<F>) -> Result<u64, String> {
-        self.orphan_lookahead(bindings)
+    /// changes bindings, so the queued steps are orphaned first.
+    pub fn reclaim_idle(&mut self, bindings: &mut StateBindings) -> Result<u64, String> {
+        self.orphan_queue(bindings)
             .map_err(|error| error.to_string())?;
         let mut bytes = u64::try_from(
             bindings

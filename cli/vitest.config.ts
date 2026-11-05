@@ -1,5 +1,5 @@
 import { defineConfig } from 'vitest/config'
-import type { Plugin } from 'vite'
+import { defaultServerConditions, type Plugin } from 'vite'
 
 const rawMarkdownPlugin = (): Plugin => ({
   name: 'raw-markdown',
@@ -12,6 +12,12 @@ const rawMarkdownPlugin = (): Plugin => ({
 
 export default defineConfig({
   plugins: [rawMarkdownPlugin()],
+  ssr: {
+    resolve: {
+      // Test fixtures, which client-common exports only under this condition.
+      conditions: [...defaultServerConditions, 'magnitude-test'],
+    },
+  },
   test: {
     name: 'cli',
     root: import.meta.dirname,

@@ -18,7 +18,6 @@ from pathlib import Path
 import httpx
 import psutil
 
-from ..client import Observation
 from ..models import Acquisition, Artifact, Target
 from ..options import EngineOptions, Watchdog
 from ..policy import BENCH, STARTUP_TIMEOUT_SECONDS
@@ -226,26 +225,6 @@ class Adapter:
     def verify_ready(self, data: dict, context: int, parallel: int) -> None:
         raise NotImplementedError
 
-    def verify_observation(self, observation: Observation) -> Observation:
-        """A run that serves with a drafter must not silently measure target-only decoding:
-        every valid response with room to draft must report proposed draft tokens."""
-        if (
-            self.drafting is None
-            or observation.outcome != "valid"
-            or observation.terminal["usage"]["completion_tokens"] < 2
-        ):
-            return observation
-        proposed = observation.terminal["timings"].get("draft_n")
-        if proposed is not None and proposed > 0:
-            return observation
-        return observation.model_copy(
-            update={
-                "outcome": "invalid",
-                "error": f"{self.target.engine} serves with the catalog's {self.drafting} "
-                f"drafter but reported {proposed} proposed draft tokens",
-            }
-        )
-
     @contextlib.asynccontextmanager
     async def launch(self, context: int, parallel: int, label: str) -> AsyncIterator[Running]:
         self.verify()
@@ -410,4 +389,9 @@ class Adapter:
 
     async def memory_observation(self, engine: Running) -> dict | None:
         """Optional allocation census after the measured requests finish."""
+        return None
+
+    def expert_bank(self, observation: dict) -> dict | None:
+        """The elastic expert bank one of this engine's memory observations states; None for an
+        engine whose observations state none."""
         return None

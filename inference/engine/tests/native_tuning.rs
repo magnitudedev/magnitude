@@ -69,6 +69,8 @@ fn prepare_every_entry(
         max_images_per_request: 1,
         max_image_cells: 0,
         lookahead: false,
+        chain_capacity: std::num::NonZeroUsize::MIN,
+        conversations: std::num::NonZeroUsize::MIN,
     };
     let draft = ExecutionPlanner::prepare(
         &selected,
@@ -88,6 +90,7 @@ fn prepare_every_entry(
         &catalog,
         draft.device().selector(),
         PlatformConfig {
+            graph_cost: None,
             path: ExecutionPath::Native,
             artifacts: cache
                 .clone()

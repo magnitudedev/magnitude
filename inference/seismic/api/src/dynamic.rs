@@ -36,7 +36,7 @@ impl From<CallError> for Error {
         let kind = match &e {
             CallError::Invocation(_) => "InvocationError",
             CallError::Output(_) => "OutputError",
-            CallError::Execution(_) => "ExecutionError",
+            CallError::Execution(_) | CallError::Unfenced { .. } => "ExecutionError",
             CallError::Workflow(_) => "WorkflowError",
         };
         Self::new(kind, e)
@@ -123,27 +123,13 @@ impl Module {
             path: name.into(),
             text: text.into(),
         });
-        let mut checked = seismic_lang::checked::check_source(sources)
-            .map_err(|e| Error::new("SourceError", e))?;
-        // Labels never implicitly grant filesystem access for inline native assets.
-        if base.is_none()
-            && checked.entries().iter().any(|e| {
-                checked
-                    .native_implementation(e.id, BackendName::Metal)
-                    .is_some()
-            })
-        {
-            return Err(Error::new(
-                "ValueError",
-                "inline native assets require base_dir",
-            ));
-        }
-        // Native includes of inline assets may resolve only inside `base`.
+        // Native includes of inline assets may resolve only inside `base`;
+        // labels never implicitly grant filesystem access for them.
         let roots = match base {
             Some(base) => seismic_lang::source::source_roots(&[base.to_path_buf()])?,
             None => Vec::new(),
         };
-        seismic_lang::source::capture_assets(&mut checked, base, &roots)?;
+        let (checked, _) = seismic_lang::source::check_with_assets(sources, base, &roots)?;
         Ok(Self {
             checked: Arc::new(checked),
         })

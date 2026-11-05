@@ -32,7 +32,7 @@ const FORMATS: [Encoding; 16] = [
 /// route; 20 TFLOP/s over every format's representation on every backend
 /// (with the dense f32 and bf16); every history layout at 10 µs per call
 /// plus 200 GB/s; 5 µs launches; a 1.2 composition ratio; a 50 µs
-/// pipelined and a 150 µs round-trip step.
+/// pipelined and a 150 µs round-trip step; a 1.1 release step ratio.
 pub(crate) fn costs() -> super::ExecutorCosts {
     use super::executor_costs::{
         FormatRates, HistoryCosts, MatrixCosts, MeasuredCost, Placement, Placements, RouteCosts,
@@ -83,11 +83,12 @@ pub(crate) fn costs() -> super::ExecutorCosts {
     };
     super::ExecutorCosts {
         placements: Placements {
-            device: Placement::along(seismic::AccessRoute::Device),
-            upload: Placement::along(seismic::AccessRoute::Device),
+            device: Placement::along(kind(0)),
+            upload: Placement::along(kind(0)),
+            host: Placement::along(kind(0)),
         },
         first: RouteCosts {
-            route: seismic::AccessRoute::Device,
+            route: kind(0),
             activation: rate(),
             formats: formats
                 .iter()
@@ -108,15 +109,38 @@ pub(crate) fn costs() -> super::ExecutorCosts {
             .collect(),
         dense: history(magnitude_state::KvCodec::Dense),
         affine: history(magnitude_state::KvCodec::AffineK8V4),
-        composition: Some(cost(1.2)),
-        launch_seconds: Some(cost(5e-6)),
-        step_pipelined_seconds: Some(cost(50e-6)),
-        step_round_trip_seconds: Some(cost(150e-6)),
+        // A chain of one launch-only call a layer, read at 1.2 times its
+        // price: a composition of 1.2.
+        chain: super::executor_costs::ChainCost {
+            timing: seismic::measure::Timing { median: 1.2 * 8. * 5e-6, interval: None, samples: 8 },
+            layers: 8,
+            calls: vec![super::demand::Work::default()],
+        },
+        launch_seconds: cost(5e-6),
+        step_pipelined_seconds: cost(50e-6),
+        step_round_trip_seconds: cost(150e-6),
+        release_step_ratio: Some(cost(1.1)),
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeclaredFeedForward {
+    Dense {
+        intermediate: u64,
+    },
+    /// Routed experts, `experts` in even blocks and `odd_experts` in odd
+    /// ones (a pruned decoder's layers differ in count).
+    Routed {
+        experts: u64,
+        odd_experts: u64,
+        selected: u64,
+        intermediate: u64,
+        shared_intermediate: u64,
+    },
+}
+
+/// One block's feed-forward of a `DeclaredFeedForward` (`at`).
+enum BlockFeedForward {
     Dense {
         intermediate: u64,
     },
@@ -126,6 +150,27 @@ pub(crate) enum DeclaredFeedForward {
         intermediate: u64,
         shared_intermediate: u64,
     },
+}
+
+impl DeclaredFeedForward {
+    /// Block `index`'s: a routed one's experts by the block's parity.
+    fn at(self, index: u64) -> BlockFeedForward {
+        match self {
+            Self::Dense { intermediate } => BlockFeedForward::Dense { intermediate },
+            Self::Routed {
+                experts,
+                odd_experts,
+                selected,
+                intermediate,
+                shared_intermediate,
+            } => BlockFeedForward::Routed {
+                experts: if index % 2 == 0 { experts } else { odd_experts },
+                selected,
+                intermediate,
+                shared_intermediate,
+            },
+        }
+    }
 }
 
 /// Header geometry of a Qwen3.5-family model, the fixture the plan and
@@ -219,6 +264,7 @@ pub(crate) const QWEN35_CONFIGURATIONS: [DeclaredConfiguration; 5] = [
         32,
         DeclaredFeedForward::Routed {
             experts: 256,
+            odd_experts: 256,
             selected: 8,
             intermediate: 512,
             shared_intermediate: 512,
@@ -233,6 +279,7 @@ pub(crate) const QWEN35_CONFIGURATIONS: [DeclaredConfiguration; 5] = [
         64,
         DeclaredFeedForward::Routed {
             experts: 256,
+            odd_experts: 256,
             selected: 8,
             intermediate: 1024,
             shared_intermediate: 1024,
@@ -384,8 +431,8 @@ pub(crate) fn declared_model(
             }))
         };
         let feedforward_norm = tensor(name("post_attention_norm"), vec![c.hidden], false);
-        let feedforward = match c.feed_forward {
-            DeclaredFeedForward::Dense { intermediate } => Operator::DenseFfn(Box::new(DenseFfn {
+        let feedforward = match c.feed_forward.at(index) {
+            BlockFeedForward::Dense { intermediate } => Operator::DenseFfn(Box::new(DenseFfn {
                 intermediate,
                 up: silu(
                     tensor(name("ffn_gate"), vec![intermediate, c.hidden], true),
@@ -393,7 +440,7 @@ pub(crate) fn declared_model(
                 ),
                 down: tensor(name("ffn_down"), vec![c.hidden, intermediate], true),
             })),
-            DeclaredFeedForward::Routed {
+            BlockFeedForward::Routed {
                 experts,
                 selected,
                 intermediate,
@@ -520,4 +567,10 @@ pub(crate) fn declared_model(
         draft: None,
     };
     (definition, manifest)
+}
+
+/// The synthetic costs' storage kind `id`: one of a CPU's, standing for any
+/// executor's.
+pub(crate) fn kind(id: u32) -> seismic::NativeKind {
+    seismic::NativeKind { backend: seismic::BackendName::Cpu, id }
 }

@@ -12,6 +12,11 @@ pub struct ServiceLimits {
     pub decode_tokens: usize,
     pub decode_share: f64,
     pub locality_seconds: f64,
+    /// Conversations the load plans state for at once, each at its fit
+    /// depth (`ResourceLimits::conversations`): one for the service, whose
+    /// further requests wait for memory; a client that holds several
+    /// sequences at once and cannot wait declares them.
+    pub conversations: std::num::NonZeroUsize,
 }
 impl ServiceLimits {
     /// The most rows one launch selects a token for, and the most requests
@@ -24,6 +29,12 @@ impl ServiceLimits {
     /// The most rows one launch carries: the larger step token allowance.
     pub fn launch_rows(&self) -> usize {
         self.prefill_tokens.max(self.decode_tokens)
+    }
+
+    /// The decode time owed each unit of time prefill runs while decode
+    /// waits: decode's share of the device over prefill's.
+    pub fn decode_owed(&self) -> f64 {
+        self.decode_share / (1.0 - self.decode_share)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -51,6 +62,9 @@ pub struct Operation {
     pub waiting_since_ns: u64,
     pub service_ns: u64,
     pub preemption_debt: u32,
+    /// Whether this candidate holds a chain: work already queued on the
+    /// device that its next round continues, ahead of every other candidate.
+    pub holds_chain: bool,
 }
 /// A selection is consumed when its preparation-through-completion cost is charged.
 #[derive(Debug)]
@@ -125,6 +139,16 @@ impl Scheduler {
             self.decode_debt_ns = 0.0;
         }
         self.contended = contended;
+        // A chain runs on the device as one: its holder alone continues it,
+        // charged under this round's contention, so the time it takes is
+        // owed to a decode waiting behind it as any prefill round's.
+        if let Some(holder) = candidates.iter().find(|c| c.holds_chain) {
+            return Ok(Some(Selection {
+                phase: holder.phase,
+                requests: vec![holder.identity],
+                contended,
+            }));
+        }
         let phase = if decoding && (!prefill || first || self.decode_debt_ns > 0.0) {
             Phase::Decode
         } else {
@@ -154,6 +178,7 @@ impl Scheduler {
             contended,
         }))
     }
+
     pub fn completed(&mut self, selection: Selection, elapsed_ns: u64) {
         self.completed_service_ns += u128::from(elapsed_ns);
         if selection.contended {
@@ -162,8 +187,7 @@ impl Scheduler {
                     self.decode_debt_ns = (self.decode_debt_ns - elapsed_ns as f64).max(0.0)
                 }
                 Phase::Prefill => {
-                    self.decode_debt_ns += elapsed_ns as f64 * self.limits.decode_share
-                        / (1.0 - self.limits.decode_share)
+                    self.decode_debt_ns += elapsed_ns as f64 * self.limits.decode_owed()
                 }
             }
         }

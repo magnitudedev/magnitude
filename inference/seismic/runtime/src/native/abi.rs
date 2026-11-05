@@ -9,13 +9,16 @@
 //! the words; the single push constant is the block's address.
 
 use super::plan::ParameterAddress;
-use seismic_lang::checked::{NativeImplementation, NativeSpecialization};
+use seismic_lang::checked::{
+    LaunchGrid, NativeAsset, NativeImplementation, NativeSpecialization, RecordPort,
+};
 use seismic_lang::entry::{
     CallSchema, ElementBindings, LogicalEntry, ParameterKind, ResultKind, TensorAccess,
 };
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::ids::RepresentationId;
+use seismic_lang::native_parameter::native_parameter_names;
 use seismic_lang::registry;
 use seismic_lang::repack::WordTable;
 
@@ -81,7 +84,7 @@ fn metal_header(features: MetalFeatures) -> String {
 pub(crate) struct CudaFeatures {
     /// Streaming multiprocessors (`SEISMIC_MULTIPROCESSORS`): a kernel that
     /// states its grid sizes its blocks' residency to the waves they fill.
-    pub(crate) multiprocessors: u32,
+    pub(crate) multiprocessors: u64,
 }
 
 impl CudaFeatures {
@@ -175,20 +178,136 @@ pub(crate) fn native_word_count(
     word_count(schema) + runtime_parameters(implementation).len()
 }
 
-/// Argument slots an implementation binds: its buffers (tensor parameters,
-/// tensor results, scratch), the argument words and the scalar-result slots.
+/// Argument slots an implementation binds: its bound buffers ([`bound`]),
+/// the argument words and the scalar-result slots.
 pub(crate) fn buffer_slots(schema: &CallSchema, implementation: &NativeImplementation) -> usize {
-    let tensors = schema
+    bound(schema, implementation).iter().filter(|bound| **bound).count() + 2
+}
+
+/// Whether each of the entry's buffers, in ABI order ([`buffer_writes`]),
+/// is bound in the kernel's argument table: every one but a host port,
+/// which the kernel never accesses. A host port is still one of the call's
+/// buffers, which its hazards order by ([`host_writes`]).
+pub(crate) fn bound(schema: &CallSchema, implementation: &NativeImplementation) -> Vec<bool> {
+    let parameters = schema.parameters().iter().filter_map(|parameter| match &parameter.kind {
+        ParameterKind::Tensor { access, .. } => Some(!matches!(access, TensorAccess::Host { .. })),
+        _ => None,
+    });
+    let rest = buffer_writes(schema, implementation).len() - parameters.clone().count();
+    parameters.chain(std::iter::repeat_n(true, rest)).collect()
+}
+
+/// Whether each of the entry's buffers, in ABI order ([`buffer_writes`]),
+/// is a record port (`NativeImplementation::records`), bound as the table
+/// of its view's records' device addresses: a tensor parameter, or a tensor
+/// result, which follow the tensor parameters.
+pub(crate) fn records(schema: &CallSchema, implementation: &NativeImplementation) -> Vec<bool> {
+    let mut records = vec![false; buffer_writes(schema, implementation).len()];
+    let tensor = |kind: &ResultKind| matches!(kind, ResultKind::Tensor { .. });
+    for port in &implementation.records {
+        let buffer = match port {
+            RecordPort::Parameter(name) => {
+                tensor_buffer(schema, name).expect("a checked record port is a tensor parameter")
+            }
+            RecordPort::Result(ordinal) => {
+                tensor_buffer_count(schema)
+                    + schema.results()[..*ordinal as usize]
+                        .iter()
+                        .filter(|result| tensor(&result.kind))
+                        .count()
+            }
+        };
+        records[buffer] = true;
+    }
+    records
+}
+
+/// Tensor parameters: the leading buffers.
+fn tensor_buffer_count(schema: &CallSchema) -> usize {
+    schema
         .parameters()
         .iter()
         .filter(|parameter| matches!(parameter.kind, ParameterKind::Tensor { .. }))
         .count()
-        + schema
-            .results()
-            .iter()
-            .filter(|result| matches!(result.kind, ResultKind::Tensor { .. }))
-            .count();
-    tensors + implementation.scratch.len() + 2
+}
+
+/// The ABI buffer of tensor parameter `name`: tensor parameters lead the
+/// buffers, in schema order.
+pub(crate) fn tensor_buffer(schema: &CallSchema, name: &str) -> Option<usize> {
+    schema
+        .parameters()
+        .iter()
+        .filter(|parameter| matches!(parameter.kind, ParameterKind::Tensor { .. }))
+        .position(|parameter| parameter.name == name)
+}
+
+/// The name of the tensor parameter ABI buffer `buffer` is, one leading the
+/// buffers ([`tensor_buffer`]).
+pub(crate) fn tensor_buffer_name(schema: &CallSchema, buffer: usize) -> &str {
+    &schema
+        .parameters()
+        .iter()
+        .filter(|parameter| matches!(parameter.kind, ParameterKind::Tensor { .. }))
+        .nth(buffer)
+        .expect("a tensor parameter's buffer leads the buffers")
+        .name
+}
+
+/// The ABI buffer holding launch grid `grid`: a tensor parameter, or a
+/// scratch buffer, which follow every tensor parameter and result.
+pub(crate) fn grid_buffer(
+    schema: &CallSchema,
+    implementation: &NativeImplementation,
+    grid: &LaunchGrid,
+) -> usize {
+    match grid {
+        LaunchGrid::Parameter(name) => {
+            tensor_buffer(schema, name).expect("a checked launch grid is a tensor parameter")
+        }
+        LaunchGrid::Scratch(name) => {
+            let scratch = implementation.scratch.len();
+            buffer_writes(schema, implementation).len() - scratch
+                + implementation
+                    .scratch
+                    .iter()
+                    .position(|buffer| &buffer.name == name)
+                    .expect("a checked launch grid is a scratch buffer")
+        }
+    }
+}
+
+/// Whether the entry writes each of its buffers, in ABI order: a tensor
+/// parameter as its access declares, then every tensor result and every
+/// scratch buffer.
+pub(crate) fn buffer_writes(schema: &CallSchema, implementation: &NativeImplementation) -> Vec<bool> {
+    let parameters = schema.parameters().iter().filter_map(|parameter| match &parameter.kind {
+        ParameterKind::Tensor { access, .. } => {
+            Some(matches!(access, TensorAccess::Owned | TensorAccess::Mutable))
+        }
+        _ => None,
+    });
+    let results = schema
+        .results()
+        .iter()
+        .filter(|result| matches!(result.kind, ResultKind::Tensor { .. }))
+        .map(|_| true);
+    let scratch = implementation.scratch.iter().map(|_| true);
+    parameters.chain(results).chain(scratch).collect()
+}
+
+/// Whether the host rewrites each of the entry's buffers once it sees the
+/// launch (`&host mut`), in ABI order as [`buffer_writes`]. The device never
+/// writes such a buffer; a launch is ordered as though it did. (A `&host`
+/// port the host only reads is ordered as the read every bound buffer is.)
+pub(crate) fn host_writes(schema: &CallSchema, implementation: &NativeImplementation) -> Vec<bool> {
+    let parameters = schema.parameters().iter().filter_map(|parameter| match &parameter.kind {
+        ParameterKind::Tensor { access, .. } => {
+            Some(matches!(access, TensorAccess::Host { write: true }))
+        }
+        _ => None,
+    });
+    let rest = buffer_writes(schema, implementation).len() - parameters.clone().count();
+    parameters.chain(std::iter::repeat_n(false, rest)).collect()
 }
 
 /// Number of 64-bit scalar-result slots.
@@ -287,7 +406,7 @@ pub(crate) fn render_source(
     bindings: &ElementBindings,
     implementation: &NativeImplementation,
     specialization: &NativeSpecialization,
-    asset: &str,
+    asset: NativeAsset<'_>,
 ) -> String {
     render_source_with(
         dialect,
@@ -311,7 +430,7 @@ pub(crate) fn render_launch_source(
     bindings: &ElementBindings,
     implementation: &NativeImplementation,
     specialization: &NativeSpecialization,
-    asset: &str,
+    asset: NativeAsset<'_>,
     ordinal: usize,
 ) -> String {
     render_source_with(
@@ -331,7 +450,7 @@ fn render_source_with(
     bindings: &ElementBindings,
     implementation: &NativeImplementation,
     specialization: &NativeSpecialization,
-    asset: &str,
+    asset: NativeAsset<'_>,
     forming: Option<&str>,
 ) -> String {
     let schema = logical.schema();
@@ -342,6 +461,13 @@ fn render_source_with(
         #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
         Dialect::Vulkan(features) => vulkan::header(features),
     };
+    // Whether a call that parks waits inside its kernel, spinning on its
+    // awaited words, or at a submission boundary before it: the backend's
+    // fact (`BackendName::parks_in_kernels`), stated there alone.
+    prefix.push_str(&format!(
+        "#define SEISMIC_PARKS_IN_KERNELS {}\n",
+        u8::from(dialect.backend().parks_in_kernels())
+    ));
     render_axis_constants(&mut prefix, dialect);
     for (name, representation) in bindings.iter() {
         render_representation(
@@ -403,26 +529,30 @@ fn render_source_with(
         }
         word += 1;
     }
-    for (ordinal, parameter) in schema.parameters().iter().enumerate() {
-        let name = native_macro(&parameter.name);
-        let named = schema
+    let names = native_parameter_names(
+        &schema
             .parameters()
             .iter()
-            .filter(|candidate| candidate.name == parameter.name)
-            .count()
-            == 1;
+            .map(|parameter| parameter.name.as_str())
+            .collect::<Vec<_>>(),
+    );
+    for ((ordinal, parameter), names) in schema.parameters().iter().enumerate().zip(&names) {
         match &parameter.kind {
+            // A host port takes no argument slot: the kernel never
+            // accesses it. Its words keep their places.
+            ParameterKind::Tensor {
+                axes,
+                access: TensorAccess::Host { .. },
+                ..
+            } => word += axes.len() * 2,
             ParameterKind::Tensor {
                 axes,
                 representation,
                 ..
             } => {
-                if named {
-                    prefix.push_str(&format!("#define SEISMIC_BUFFER_{name} {buffer}\n"));
+                for symbol in names.tensor_buffers() {
+                    prefix.push_str(&format!("#define {symbol} {buffer}\n"));
                 }
-                prefix.push_str(&format!(
-                    "#define SEISMIC_PARAM_{ordinal}_BUFFER {buffer}\n"
-                ));
                 let tensor = TensorAbi {
                     representation: *representation,
                     rank: axes.len(),
@@ -432,35 +562,38 @@ fn render_source_with(
                         .expect("a tensor parameter has static geometry"),
                     dialect,
                 };
-                tensor.render(&mut prefix, &format!("SEISMIC_PARAM_{ordinal}"));
-                if named {
-                    tensor.render(&mut prefix, &format!("SEISMIC_{name}"));
+                // A record parameter's records are the host's to land while
+                // the work that reads them runs: host-written, where the
+                // backend's plain loads would not read them
+                // (`BackendName::plain_loads_read_host_writes`).
+                let host_written = !dialect.backend().plain_loads_read_host_writes()
+                    && implementation
+                        .records
+                        .contains(&RecordPort::Parameter(parameter.name.clone()));
+                for symbol in names.tensor_prefixes() {
+                    tensor.render(&mut prefix, &symbol);
+                    if host_written {
+                        prefix.push_str(&format!("#define {symbol}_HOST_WRITTEN 1\n"));
+                    }
                 }
                 buffer += 1;
                 word += axes.len() * 2;
             }
             ParameterKind::Scalar { .. } | ParameterKind::Index { .. } => {
-                prefix.push_str(&format!(
-                    "#define SEISMIC_PARAM_{ordinal} (seismic_words[{word}])\n"
-                ));
-                if named {
-                    prefix.push_str(&format!(
-                        "#define SEISMIC_PARAM_{name} SEISMIC_PARAM_{ordinal}\n"
-                    ));
+                let (symbol, alias) = names.word();
+                prefix.push_str(&format!("#define {symbol} (seismic_words[{word}])\n"));
+                if let Some(alias) = alias {
+                    prefix.push_str(&format!("#define {alias} {symbol}\n"));
                 }
                 word += 1;
             }
             ParameterKind::Range { .. } => {
-                prefix.push_str(&format!(
-                    "#define SEISMIC_PARAM_{ordinal}_START (seismic_words[{word}])\n"
-                ));
-                prefix.push_str(&format!(
-                    "#define SEISMIC_PARAM_{ordinal}_END (seismic_words[{}])\n",
-                    word + 1
-                ));
-                if named {
+                let ([start, end], aliases) = names.range();
+                prefix.push_str(&format!("#define {start} (seismic_words[{word}])\n"));
+                prefix.push_str(&format!("#define {end} (seismic_words[{}])\n", word + 1));
+                if let Some([start_alias, end_alias]) = aliases {
                     prefix.push_str(&format!(
-                        "#define SEISMIC_PARAM_{name}_START SEISMIC_PARAM_{ordinal}_START\n#define SEISMIC_PARAM_{name}_END SEISMIC_PARAM_{ordinal}_END\n"
+                        "#define {start_alias} {start}\n#define {end_alias} {end}\n"
                     ));
                 }
                 word += 2;
@@ -531,13 +664,17 @@ fn render_source_with(
         ));
         buffer += 1;
     }
-    // Tensor parameters lead the buffer order; a shared (`&`) parameter is
+    // Bound tensor parameters lead the buffer order; a shared (`&`) one is
     // read-only. Results and scratch follow.
     let read_only = schema
         .parameters()
         .iter()
         .filter_map(|parameter| match &parameter.kind {
-            ParameterKind::Tensor { access, .. } => Some(*access == TensorAccess::Shared),
+            ParameterKind::Tensor {
+                access: TensorAccess::Host { .. },
+                ..
+            } => None,
+            ParameterKind::Tensor { access, .. } => Some(matches!(access, TensorAccess::Shared)),
             ParameterKind::Scalar { .. }
             | ParameterKind::Index { .. }
             | ParameterKind::Range { .. } => None,
@@ -548,7 +685,8 @@ fn render_source_with(
     if let Dialect::Vulkan(_) = dialect {
         prefix.push_str(&vulkan::tail(buffer, read_only));
         debug_assert_eq!(word, word_count(schema) + runtime_parameters.len());
-        prefix.push_str(asset);
+        constant_macros(&mut prefix, asset);
+        prefix.push_str(asset.text);
         prefix.push_str(vulkan::SUFFIX);
         return prefix;
     }
@@ -577,7 +715,18 @@ fn render_source_with(
         prefix.push_str("#define SEISMIC_PTR_(index) seismic_buffer_##index\n#define SEISMIC_PTR(index) SEISMIC_PTR_(index)\n");
         prefix.push_str("#define SEISMIC_SCALAR_RESULTS seismic_scalar_results\n");
     }
+    // The launch being formed, when it dispatches a written grid authored
+    // as a block.
+    let written = forming
+        .and_then(|kernel| implementation.launches.iter().position(|launch| launch.kernel == kernel))
+        .filter(|ordinal| {
+            implementation.backend.authors_written_grid_blocks() && implementation.launches[*ordinal].grid.is_some()
+        });
+    if let (Dialect::Cuda(_), Some(_)) = (dialect, written) {
+        prefix.push_str(WRITTEN_GRID_BLOCK);
+    }
     debug_assert_eq!(word, word_count(schema) + runtime_parameters.len());
+    constant_macros(&mut prefix, asset);
     if matches!(dialect, Dialect::Cuda(_)) {
         let tensors = schema.parameters().iter().filter_map(|parameter| match &parameter.kind {
             ParameterKind::Tensor { representation, .. } => Some(*representation),
@@ -585,8 +734,77 @@ fn render_source_with(
         });
         render_tables_read(&mut prefix, bindings.iter().map(|(_, representation)| representation).chain(tensors));
     }
-    prefix.push_str(asset);
+    prefix.push_str(asset.text);
+    if let (Dialect::Cuda(_), Some(ordinal)) = (dialect, written) {
+        written_grid_loop(&mut prefix, schema, implementation, ordinal, buffer);
+    }
     prefix
+}
+
+/// CUDA has no indirect launch, so a launch with a written grid
+/// (`NativeLaunch::grid`) is authored as `__device__ void` the block
+/// function `registry::written_grid_block` names
+/// (`BackendName::authors_written_grid_blocks`), taking
+/// `SEISMIC_KERNEL_PARAMS`: the body of one block. It runs as the kernel
+/// [`written_grid_loop`] appends: a grid-stride loop of the device's
+/// resident blocks (the runtime sizes its grid,
+/// `NativePrepared::launches_at`) over the written grid's blocks, x fastest.
+/// Within the body, and every library function it calls, `blockIdx` and
+/// `gridDim` are the block's place in the written grid and that grid.
+const WRITTEN_GRID_BLOCK: &str = "static __shared__ uint3 seismic_written_block, seismic_written_grid;\n#define blockIdx seismic_written_block\n#define gridDim seismic_written_grid\n";
+
+/// The kernel of written-grid launch `ordinal` ([`WRITTEN_GRID_BLOCK`]). It
+/// reads the grid once its predecessor completed (a programmatic one too).
+/// Each block's body starts after its place is published and ends at a
+/// barrier, as a block's exit would, before the next reuses its shared
+/// memory.
+fn written_grid_loop(
+    out: &mut String,
+    schema: &CallSchema,
+    implementation: &NativeImplementation,
+    ordinal: usize,
+    buffers: usize,
+) {
+    let launch = &implementation.launches[ordinal];
+    let grid = launch.grid.as_ref().expect("a written-grid launch");
+    // The grid's argument: its buffer among the bound ones.
+    let argument = bound(schema, implementation)[..grid_buffer(schema, implementation, grid)]
+        .iter()
+        .filter(|bound| **bound)
+        .count();
+    let (header, instance) = match implementation.code_parameters(ordinal).is_empty() {
+        true => ("", ""),
+        false => ("template <auto... SEISMIC_CODE>\n", "<SEISMIC_CODE...>"),
+    };
+    let arguments = (0..buffers)
+        .map(|index| format!("seismic_buffer_{index}, "))
+        .collect::<String>();
+    out.push_str(&format!(
+        "\n#undef blockIdx\n#undef gridDim\n{header}__global__ void {kernel}(SEISMIC_KERNEL_PARAMS) {{\n    seismic_dependency_wait();\n    const int *grid = reinterpret_cast<const int *>(seismic_buffer_{argument});\n    const unsigned x = unsigned(grid[0]), y = unsigned(grid[1]), z = unsigned(grid[2]);\n    const unsigned long long blocks = (unsigned long long)x * y * z;\n    for (unsigned long long block = blockIdx.x; block < blocks; block += gridDim.x) {{\n        if (threadIdx.x + threadIdx.y + threadIdx.z == 0) {{\n            seismic_written_block.x = unsigned(block % x);\n            seismic_written_block.y = unsigned(block / x % y);\n            seismic_written_block.z = unsigned(block / x / y);\n            seismic_written_grid.x = x;\n            seismic_written_grid.y = y;\n            seismic_written_grid.z = z;\n        }}\n        __syncthreads();\n        {block}{instance}({arguments}seismic_words_value, seismic_scalar_results);\n        __syncthreads();\n    }}\n}}\n",
+        kernel = launch.kernel,
+        block = registry::written_grid_block(&launch.kernel),
+    ));
+}
+
+/// `#define SEISMIC_CONST_<NAME> <value>` for each module constant the asset
+/// names. A source that names none renders as before the module declared
+/// any, so the kernel digests tuning results are stored under keep.
+fn constant_macros(prefix: &mut String, asset: NativeAsset<'_>) {
+    for (name, value) in asset.constants {
+        let symbol = format!("SEISMIC_CONST_{}", native_macro(name));
+        if names_symbol(asset.text, &symbol) {
+            prefix.push_str(&format!("#define {symbol} {value}\n"));
+        }
+    }
+}
+
+/// Whether `text` has `symbol` as a whole identifier.
+fn names_symbol(text: &str, symbol: &str) -> bool {
+    let identifier = |character: char| character.is_ascii_alphanumeric() || character == '_';
+    text.match_indices(symbol).any(|(at, _)| {
+        !text[..at].chars().next_back().is_some_and(identifier)
+            && !text[at + symbol.len()..].chars().next().is_some_and(identifier)
+    })
 }
 
 /// The tables a CUDA source's tensors read that its tables header declares
@@ -818,7 +1036,14 @@ fn render_conversion(
 /// (`RowPlaneRole::ALL`, from a row plane's 16-byte-aligned start)
 /// `{prefix}_{ROLE}_ALIGNMENT`: a code role's unit's words, a group role's
 /// share; and per code role `{prefix}_{ROLE}_REST_ALIGNMENT`: its share's
-/// bytes past its units' words (an mma16 record's factors). For the packet
+/// bytes past its units' words (an mma16 record's factors); per code role
+/// `{prefix}_{ROLE}_CHUNK_BYTES` and `_CHUNK_ALIGNMENT`, a unit's 32-column
+/// chunk placed as a unit of the plane (`{prefix}_CHUNK_COLUMNS` its columns);
+/// and in `mma16`, `{prefix}_{ROLE}_FRAGMENT_ALIGNMENT`, a lane's two `k16`
+/// steps of the role's codes, and `{prefix}_KBLOCK_BYTES` and
+/// `_KBLOCK_ALIGNMENT`, a row's k-block of grid entries, which sit at a
+/// multiple of it and need not be a power of two (iq3s's eight 3-byte
+/// entries: 24). For the packet
 /// layout (from a packet's start): `{prefix}_CODES_ALIGNMENT`, a unit's
 /// codes; `{prefix}_LEADING_ALIGNMENT` and `{prefix}_TRAILING_ALIGNMENT`,
 /// the record's bytes before and after the codes (to the packet's end).
@@ -852,7 +1077,20 @@ fn render_record_alignments(
                     .min(alignment(stored.checked_sub(end).expect("the codes are within the packet"))),
             ));
         }
-        registry::ConversionLayout::Rows(_) => {
+        registry::ConversionLayout::Rows(rows) => {
+            let mma16 = rows.layout == registry::Layout::Mma16;
+            out.push_str(&format!(
+                "#define {prefix}_CHUNK_COLUMNS {}\n",
+                registry::ROWS32_CHUNK
+            ));
+            if mma16 {
+                let (_, unit_words) = segment(registry::RowPlaneRole::Codes);
+                let kblock = 4 * unit_words * registry::MMA_KBLOCK as u32 / span.columns;
+                out.push_str(&format!(
+                    "#define {prefix}_KBLOCK_BYTES {kblock}\n#define {prefix}_KBLOCK_ALIGNMENT {}\n",
+                    alignment(kblock)
+                ));
+            }
             for role in registry::RowPlaneRole::ALL {
                 let bytes = words
                     .roles()
@@ -871,6 +1109,17 @@ fn render_record_alignments(
                                 .expect("a code role's share holds its units' words")
                         ),
                     ));
+                    let chunk = 4 * unit_words * registry::ROWS32_CHUNK as u32 / span.columns;
+                    out.push_str(&format!(
+                        "#define {prefix}_{name}_CHUNK_BYTES {chunk}\n#define {prefix}_{name}_CHUNK_ALIGNMENT {}\n",
+                        alignment(chunk)
+                    ));
+                    if mma16 {
+                        out.push_str(&format!(
+                            "#define {prefix}_{name}_FRAGMENT_ALIGNMENT {}\n",
+                            alignment(2 * unit_words)
+                        ));
+                    }
                 } else {
                     out.push_str(&format!("#define {prefix}_{name}_ALIGNMENT {}\n", alignment(bytes)));
                 }
@@ -938,10 +1187,23 @@ fn render_representation(
             ));
             if info.layout == registry::Layout::Mma16 {
                 out.push_str(&format!(
-                    "#define {prefix}_MMA_KBLOCK {}\n#define {prefix}_MMA_LANES {}\n",
+                    "#define {prefix}_MMA_KBLOCK {}\n#define {prefix}_MMA_LANES {}\n#define {prefix}_MMA_STEP {}\n#define {prefix}_MMA_STEP_SLOTS {}\n",
                     registry::MMA_KBLOCK,
-                    registry::MMA_LANES
+                    registry::MMA_LANES,
+                    registry::MMA_STEP,
+                    registry::MMA_STEP_SLOTS,
                 ));
+                use registry::PackedRowLayout as Rows;
+                for (name, rule) in [
+                    ("MMA_FRAGMENT_ROW", Rows::MMA_FRAGMENT_ROW_RULE),
+                    ("MMA_FRAGMENT_COLUMN", Rows::MMA_FRAGMENT_COLUMN_RULE),
+                    ("MMA_FRAGMENT_BYTE", Rows::MMA_FRAGMENT_BYTE_RULE),
+                    ("RECORD_ENTRY", Rows::RECORD_ENTRY_RULE),
+                    ("RECORD_FACTOR", Rows::RECORD_FACTOR_RULE),
+                ] {
+                    // A long rule's text may hold line breaks; a macro's can't.
+                    out.push_str(&format!("#define {prefix}_{name}{}\n", rule.replace('\n', " ")));
+                }
             }
             for plane in &rows.planes {
                 let plane_prefix = format!("{prefix}_PLANE_{}", native_macro(plane.name));
@@ -960,9 +1222,11 @@ fn render_representation(
                         // entries (`PackedRowLayout::record_byte`).
                         if matches!(plane.content, registry::RowPlaneContent::Records { .. }) {
                             out.push_str(&format!(
-                                "#define {plane_prefix}_ENTRY_BYTES {}\n#define {plane_prefix}_FACTORS_OFFSET ({prefix}_ROW_GROUPS * {})\n",
+                                "#define {plane_prefix}_ENTRY_BYTES {}\n#define {plane_prefix}_FACTORS_OFFSET ({prefix}_ROW_GROUPS * {})\n#define {plane_prefix}_ENTRY_BITS {}\n#define {plane_prefix}_KBLOCK_ENTRIES {}\n",
                                 rows.record_entry_bytes(),
-                                rows.record_entry_bytes()
+                                rows.record_entry_bytes(),
+                                registry::GRID_VALUES * bits,
+                                registry::MMA_KBLOCK / u64::from(registry::GRID_VALUES),
                             ));
                         }
                         // The entry bit carrying the coefficient codes.
@@ -1422,7 +1686,7 @@ mod tests {
     use seismic_lang::checked::{SourceFile, SourceSet, check_source};
     use seismic_lang::registry::BackendName;
 
-    const PROBE: &str = "fn probe[N, K](x: &tensor[N, K] E) -> tensor[1] f32:\n    let mut output = tensor[1] f32\n    for i in 0..1:\n        output[i] = f32(x[0, 0])\n    return output\n\nnative probe for cuda from \"probe.cu\":\n    static (K)\n    params (TILE in [4, 8])\n    scratch partials bytes (N * 4)\n    launch probe:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (TILE, 1, 1)\n";
+    const PROBE: &str = "fn probe[N, K](x: &tensor[N, K] E) -> tensor[1] f32:\n    let mut output = tensor[1] f32\n    for i in 0..1:\n        output[i] = f32(x[0, 0])\n    return output\n\nnative probe for cuda from \"probe.cu\":\n    static (K)\n    params (TILE in [4, 8] default 4)\n    scratch partials bytes (N * 4)\n    launch probe:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (TILE, 1, 1)\n";
 
     fn render(dialect: Dialect, representation: &str) -> String {
         render_with(
@@ -1432,10 +1696,41 @@ mod tests {
         )
     }
 
+    /// An asset of a module that declares no constant.
+    fn bare(text: &str) -> NativeAsset<'_> {
+        NativeAsset { text, constants: &[] }
+    }
+
     fn render_with(
         dialect: Dialect,
         representation: &str,
         specialization: NativeSpecialization,
+    ) -> String {
+        render_asset(dialect, representation, specialization, bare("\n// asset\n"))
+    }
+
+    /// A rendered source defines each module constant its asset names as a
+    /// whole identifier, and no other: a source naming none renders as it
+    /// would in a module without constants.
+    #[test]
+    fn a_source_defines_the_module_constants_it_names() {
+        let constants = [("FIRST".to_owned(), 2), ("SECOND".to_owned(), 3)];
+        let at = |text| {
+            let asset = NativeAsset { text, constants: &constants };
+            render_asset(CUDA, "f32", NativeSpecialization::new().with_static("K", 64), asset)
+        };
+        let source = at("\nint x = SEISMIC_CONST_FIRST;\n");
+        assert!(source.contains("#define SEISMIC_CONST_FIRST 2\n"));
+        assert!(!source.contains("SEISMIC_CONST_SECOND"));
+        assert!(!at("\nint x = SEISMIC_CONST_FIRSTLY;\n").contains("#define SEISMIC_CONST_FIRST "));
+        assert_eq!(at("\n// asset\n"), render(CUDA, "f32"));
+    }
+
+    fn render_asset(
+        dialect: Dialect,
+        representation: &str,
+        specialization: NativeSpecialization,
+        asset: NativeAsset<'_>,
     ) -> String {
         let module = check_source(SourceSet::new(vec![SourceFile {
             path: "probe.seismic".to_owned(),
@@ -1458,7 +1753,7 @@ mod tests {
             &bindings,
             implementation,
             &specialization,
-            "\n// asset\n",
+            asset,
         )
     }
 
@@ -1484,7 +1779,7 @@ mod tests {
             &bindings,
             implementation,
             &specialization,
-            "\n#ifdef SEISMIC_FORMING_PROBE\ntemplate <uint TILE> kernel void probe() {}\n#endif\n",
+            bare("\n#ifdef SEISMIC_FORMING_PROBE\ntemplate <uint TILE> kernel void probe() {}\n#endif\n"),
             0,
         );
         assert!(source.contains("#define SEISMIC_FORMING_PROBE 1\n"));
@@ -1492,13 +1787,62 @@ mod tests {
         assert!(!source.contains("host_name"));
     }
 
+    /// A host port is never the device's write, and is the host's write
+    /// where it is `&host mut`; an entry's results and scratch are the
+    /// device's writes.
+    /// A host port is one of the call's buffers, which hazards order by (a
+    /// `&host mut` one as its writer), but no argument of the kernel: the
+    /// buffers after it bind one slot lower, and it has no buffer macro.
     #[test]
-    fn scoped_runtime_words_have_stable_entry_then_launch_offsets() {
-        let text = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (SPLIT in [1, 2])\n    launch small when N < 16:\n        params (WIDTH in [32, 64], code ROWS in [1, 2])\n        reads (SPLIT)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n    launch large when N >= 16:\n        params (WIDTH in [64, 128])\n        threadgroups (ceil_div(N, WIDTH), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n";
+    fn host_ports_are_the_hosts_writes_and_take_no_argument() {
+        let text = "fn request[N](served: &host tensor[N] i32, staged: &host mut tensor[N] i32, out: &mut tensor[1] i32):\n    out[0] = 1\n\nnative request for metal from \"request.metal\":\n    scratch counts bytes (4)\n    launch request:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n";
         let module = check_source(SourceSet::new(vec![SourceFile {
-            path: "scale.seismic".into(),
+            path: "request.seismic".into(),
             text: text.into(),
         }]))
+        .unwrap();
+        let entry = module.entry_named("request").unwrap();
+        let bindings = ElementBindings::default();
+        let logical = module.entry(entry, &bindings).unwrap();
+        let implementation = module
+            .native_implementation(entry, BackendName::Metal)
+            .unwrap();
+        assert_eq!(
+            buffer_writes(logical.schema(), implementation),
+            [false, false, true, true]
+        );
+        assert_eq!(
+            host_writes(logical.schema(), implementation),
+            [false, true, false, false]
+        );
+        assert_eq!(bound(logical.schema(), implementation), [false, false, true, true]);
+        assert_eq!(buffer_slots(logical.schema(), implementation), 4);
+        let source = render_source(
+            METAL,
+            &logical,
+            &bindings,
+            implementation,
+            &NativeSpecialization::new(),
+            bare(""),
+        );
+        assert!(!source.contains("SEISMIC_BUFFER_SERVED"));
+        assert!(!source.contains("SEISMIC_BUFFER_STAGED"));
+        assert!(source.contains("#define SEISMIC_BUFFER_OUT 0\n"));
+        assert!(source.contains("#define SEISMIC_BUFFER_SCRATCH_COUNTS 1\n"));
+        assert!(source.contains("#define SEISMIC_BUFFER_WORDS 2\n"));
+    }
+
+    #[test]
+    fn scoped_runtime_words_have_stable_entry_then_launch_offsets() {
+        let text = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (SPLIT in [1, 2] default 1)\n    launch small when N < 16:\n        params (WIDTH in [32, 64] default 32, ROWS in [1, 2] default 1)\n        reads (SPLIT)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n    launch large when N >= 16:\n        params (WIDTH in [64, 128] default 64)\n        threadgroups (ceil_div(N, WIDTH), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n";
+        // Its source's `small` takes `ROWS` as a template parameter.
+        let module = seismic_lang::native_source::check_fixture(
+            SourceSet::new(vec![SourceFile {
+                path: "scale.seismic".into(),
+                text: text.into(),
+            }]),
+            &["ROWS"],
+        )
         .unwrap();
         let entry = module.entry_named("scale").unwrap();
         let bindings = ElementBindings::default();
@@ -1507,7 +1851,7 @@ mod tests {
             .native_implementation(entry, BackendName::Metal)
             .unwrap();
         let defaults = implementation
-            .default_specialization(&NativeSpecialization::new())
+            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
             .unwrap();
         let base = word_count(logical.schema());
         assert_eq!(
@@ -1520,7 +1864,7 @@ mod tests {
             &bindings,
             implementation,
             &defaults,
-            "\n#ifdef SEISMIC_FORMING_SMALL\ntemplate <uint ROWS> kernel void small() {}\n#endif\n",
+            bare("\n#ifdef SEISMIC_FORMING_SMALL\ntemplate <uint ROWS> kernel void small() {}\n#endif\n"),
             0,
         );
         assert!(source.contains(&format!(
@@ -1566,6 +1910,7 @@ mod tests {
         assert!(mma.contains("#define SEISMIC_X_LAYOUT_MMA16 1\n"));
         assert!(mma.contains("#define SEISMIC_X_TILE_ROWS 16\n"));
         assert!(mma.contains("#define SEISMIC_X_MMA_KBLOCK 64\n"));
+        assert!(mma.contains("#define SEISMIC_X_MMA_FRAGMENT_ROW(lane, slot) ((lane) / 4 + 8 * ((slot) % 2))\n"));
         let packet = render(METAL, "q5k");
         assert!(packet.contains("#define SEISMIC_X_LAYOUT_PACKET 1\n"));
         assert!(!packet.contains("ROW_STRIDE_BYTES"));
@@ -1828,6 +2173,36 @@ mod tests {
     }
 
     const METAL: Dialect = Dialect::Metal(MetalFeatures { tensor_ops: false });
+
+    /// A record parameter is host-written where the backend's plain loads
+    /// would not read the host's writes (Metal), under each of its prefixes;
+    /// a record result and a port bound whole are not, and where plain loads
+    /// read them (Vulkan) no port is.
+    #[test]
+    fn a_record_parameter_is_host_written_where_plain_loads_miss_host_writes() {
+        let source = |dialect: Dialect| {
+            let backend = dialect.backend();
+            let module = check_source(SourceSet::new(vec![SourceFile {
+                path: "scale.seismic".to_owned(),
+                text: format!(
+                    "fn scale[M, N](x: &tensor[M, N] f32, y: &tensor[M, N] f32) -> tensor[M, N] f32:\n    let mut result = zeros_like(x)\n    parallel for row in 0..M:\n        parallel for column in 0..N:\n            result[row, column] = x[row, column] * y[row, column]\n    return result\n\nnative scale for {} from \"scale.src\":\n    records (x, result 0)\n    launch scale:\n        threadgroups (M, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n",
+                    backend.as_str()
+                ),
+            }]))
+            .expect("record ports check");
+            let entry = module.entries()[0].id;
+            let bindings = ElementBindings::new();
+            let logical = module.entry(entry, &bindings).expect("entry monomorphizes");
+            let implementation = module.native_implementation(entry, backend).expect("native implementation");
+            render_source(dialect, &logical, &bindings, implementation, &NativeSpecialization::new(), bare("\n"))
+        };
+        let metal = source(METAL);
+        for line in ["#define SEISMIC_PARAM_0_HOST_WRITTEN 1\n", "#define SEISMIC_X_HOST_WRITTEN 1\n"] {
+            assert!(metal.contains(line), "missing {line:?}");
+        }
+        assert_eq!(metal.matches("_HOST_WRITTEN").count(), 2);
+        assert!(!source(Dialect::Vulkan(VULKAN_FEATURES)).contains("_HOST_WRITTEN"));
+    }
 
     #[test]
     fn metal_prefix_includes_tensor_operations_only_when_the_device_has_them() {

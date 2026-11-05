@@ -371,8 +371,15 @@ pub mod stable {
     pub enum Function {}
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub enum Entry {}
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub enum Content {}
 }
 
 pub type ModuleHash = StableId<stable::Module>;
 pub type StableFunctionId = StableId<stable::Function>;
 pub type StableEntryId = StableId<stable::Entry>;
+/// What an entry's meaning depends on: its family's declarations and the
+/// transitive closure of what they may call, with module constants as
+/// their values, under this compiler and registry. Unlike its
+/// [`StableEntryId`], nothing else in its module is part of it.
+pub type EntryContent = StableId<stable::Content>;

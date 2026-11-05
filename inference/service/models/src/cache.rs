@@ -14,8 +14,9 @@ use sha2::{Digest, Sha256};
 
 use crate::header_cache::{HEADER_CAPACITY_BYTES, HEADER_EVICTION_GRACE, HeaderCache};
 
-/// One completed profile assessment. Its evidence key carries the complete assessment identity
-/// (environment, bundle, profile and depths), so a read never revalidates it.
+/// One completed profile assessment. Its evidence key carries the assessment's identity
+/// (environment, bundle, profile and depths) but for a streamed fit's one other input, its own
+/// model's miss record, which `misses` names.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CachedModelAssessment {
@@ -24,6 +25,11 @@ pub struct CachedModelAssessment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<magnitude_service_contracts::models::ModelFingerprint>,
     pub profile: ModelAssessment,
+    /// A streamed fit's: the digest of its model's miss record as its estimates read it (the
+    /// engine's `MissesDigest`), so the assessment is current while that record is. None for
+    /// every assessment that reads no record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub misses: Option<String>,
 }
 
 /// Presentation already established by candidate inspection, before the weights are installed.
@@ -309,7 +315,7 @@ mod tests {
     use magnitude_service_contracts::MemoryDomainId;
     use magnitude_service_contracts::models::{
         MemoryAssessment, ModelAssessmentId, ModelCapabilities, ModelPerformance,
-        ModelReasoningCapabilities, PerformanceEvidence, ServingProfile,
+        ModelReasoningCapabilities, ModelResidency, PerformanceEvidence, ServingProfile,
     };
 
     fn profile(context_length: u32) -> ServingProfile {
@@ -399,11 +405,13 @@ mod tests {
                 compatibility_reserve_bytes: 0,
                 remaining_bytes: 50,
             }],
-            performance: ModelPerformance::Estimated {
-                samples: vec![PerformanceEvidence {
-                    context_tokens: 50_000,
-                    estimated_tokens_per_second: 2.0,
-                }],
+            residency: ModelResidency::Resident {
+                performance: ModelPerformance::Estimated {
+                    samples: vec![PerformanceEvidence {
+                        context_tokens: 50_000,
+                        estimated_tokens_per_second: 2.0,
+                    }],
+                },
             },
             projector: magnitude_service_contracts::models::ProjectorVerdict::None,
             drafter: magnitude_service_contracts::models::DrafterVerdict::None,
@@ -440,12 +448,14 @@ mod tests {
             template_fingerprint: "template".to_owned(),
             fingerprint: None,
             profile: fits,
+            misses: None,
         };
         let does_not_fit = CachedModelAssessment {
             capabilities,
             template_fingerprint: fits.template_fingerprint.clone(),
             fingerprint: None,
             profile: does_not_fit,
+            misses: None,
         };
         initial.write_model_assessment("fits evidence", &fits);
         initial.write_model_assessment("non-fit evidence", &does_not_fit);

@@ -1,7 +1,7 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
-import { ModelVariantLabelSchema, type CustomLocalModel } from "@magnitudedev/sdk"
-import { makeFoundModel, makeSetupModel } from "../application/fixtures/model"
+import { ModelVariantLabelSchema, type CustomLocalModel, type SpeculativeMethod } from "@magnitudedev/sdk"
+import { makeFoundModel, makeSetupModel, streamedFitResidency } from "../application/fixtures/model"
 import { localModelRadarAxes, localModelSpeedTooltip, normalizeLocalModelRadarSpeed } from "./local-model-radar"
 
 const axis = (model: Parameters<typeof localModelRadarAxes>[0], label: string) =>
@@ -14,6 +14,12 @@ const withQuantization = (quantization: string, quantizationName: string, varian
     presentation: { ...model.presentation, variantLabel: ModelVariantLabelSchema.make(variantLabel) },
     servingState: { ...model.servingState, metadata: { ...model.servingState.metadata, quantization, quantizationName } },
   })
+}
+
+const speculating = (speculativeMethod: Option.Option<SpeculativeMethod>): CustomLocalModel => {
+  const model = makeFoundModel()
+  if (model.servingState._tag !== "Assessed") throw new Error("fixture is assessed")
+  return makeFoundModel({ servingState: { ...model.servingState, speculativeMethod } })
 }
 
 describe("local model radar", () => {
@@ -40,9 +46,25 @@ describe("local model radar", () => {
     expect(axis(custom, "SPEED").value).toEqual(Option.some(normalizeLocalModelRadarSpeed(40)))
     expect(axis(custom, "FIT").detail).toMatch(/^Spacious/)
     expect(axis(custom, "SPECULATION").detail).toBe("None")
-    if (custom.servingState._tag !== "Assessed") throw new Error("fixture is assessed")
-    const drafted = makeFoundModel({ servingState: { ...custom.servingState, speculativeMethod: Option.some({ _tag: "DFlash" }) } })
-    expect(axis(drafted, "SPECULATION").value).toEqual(Option.some(0.5))
+    expect(axis(speculating(Option.some({ _tag: "DFlash" })), "SPECULATION").value).toEqual(Option.some(0.4))
+  })
+
+  it("rates a streamed fit's speed at its allowed share, and no speed while it is unmeasured", () => {
+    const serving = makeFoundModel().servingState
+    if (serving._tag !== "Assessed" || serving.assessment._tag !== "Fits") throw new Error("fixture fits")
+    const fits = serving.assessment
+    const streamed = (unmeasured: boolean) => makeFoundModel({
+      servingState: { ...serving, assessment: { ...fits, residency: streamedFitResidency(unmeasured) } },
+    })
+    expect(axis(streamed(false), "SPEED")).toMatchObject({ value: Option.some(normalizeLocalModelRadarSpeed(20.4)), detail: "~20 tok/s" })
+    expect(axis(streamed(true), "SPEED")).toMatchObject({ value: Option.none(), detail: "Measured on its first streamed load" })
+  })
+
+  it("spaces speculative methods evenly from none to the strongest", () => {
+    const ladder = [Option.none(), ...(["Mtp", "DFlash", "DSpark", "DFlash2", "LiLiCorr"] as const)
+      .map((_tag) => Option.some({ _tag }))]
+      .map((method) => axis(speculating(method), "SPECULATION").value)
+    expect(ladder).toEqual([0, 0.2, 0.4, 0.6, 0.8, 1].map(Option.some))
   })
 
   it("keeps a catalog model's intelligence and catalog fidelity rank", () => {

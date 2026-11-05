@@ -4,20 +4,36 @@ host's facts, its holds and a probe reading, and ends when the dashboard closes 
 import threading
 import time
 
-from magnitude_rig.connection import AgentSession, connect
+from waiting import until_exists
+
+from magnitude_rig.connection import HostRun, connect
 from magnitude_rig.dashboard import Watch
 
 
 def test_watch_reports_a_hosts_holds_and_readings_until_closed(rig):
-    hosts, _, _ = rig
+    hosts, _, tmp_path = rig
     config = hosts.host("alpha")
-    busy = AgentSession(connect(config), who="other", run="busy", purpose="p", estimate=3600)
+    release = tmp_path / "release"
+    plan = {
+        "info": {"who": "other", "purpose": "p", "estimate": 3600},
+        "ops": [
+            {"op": "hold", "kind": "device"},
+            {"op": "run", "argv": until_exists(release),
+             "cwd": str(tmp_path), "env": {}},
+        ],
+    }
+    with HostRun.staging(connect(config), "busy") as start:
+        busy = start(plan)
     stopping = threading.Event()
     try:
-        busy.hold("device", lambda blocking: None)
         watch = Watch(config, 0.2, stopping)
         deadline = time.monotonic() + 30
-        while (view := watch.view(history=True))["state"] != "live":
+
+        def held(view: dict) -> bool:
+            entries = view["state"] == "live" and view["sample"]["status"]["entries"]
+            return bool(entries) and entries[0]["state"] == "held"
+
+        while not held(view := watch.view(history=True)):
             assert view["state"] != "unreachable", view["error"]
             assert time.monotonic() < deadline, view
             time.sleep(0.1)
@@ -31,4 +47,5 @@ def test_watch_reports_a_hosts_holds_and_readings_until_closed(rig):
         watch.join()
         assert watch.view(history=True)["state"] == "live"  # closing is not a failure to report
     finally:
-        busy.close()
+        release.write_text("")
+        assert [event["event"] for event in busy.follow(0)][-1] == "ended"

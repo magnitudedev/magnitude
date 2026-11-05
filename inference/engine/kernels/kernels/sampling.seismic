@@ -187,7 +187,7 @@ fn shape_rows[Sx, V, Hn](logits: &mut tensor[Sx, V] f32,
 # depend on PARTS); ties counts the cutoff key's survivors per partition for
 # the ascending-index tie rule; apply writes -inf over removed tokens.
 native shape_rows for metal from "metal/shape_rows.metal":
-    params (PARTS in [64, 32, 128])
+    params (PARTS in [64, 32, 128] default 64)
     scratch state bytes (Sx * 64)
     scratch partials bytes (Sx * PARTS * 12)
     scratch histogram bytes (Sx * 2048 * 12)
@@ -246,7 +246,7 @@ native shape_rows for metal from "metal/shape_rows.metal":
 # plus a ties launch, 5 stages); both follow the same contract bit for bit.
 native shape_rows for cuda from "cuda/shape_rows.cu":
     static (V, Hn)
-    params (PARTS in [64, 128, 32], WIDTH in [256, 512])
+    params (PARTS in [64, 128, 32] default 64, WIDTH in [256, 512] default 256)
     scratch state bytes (Sx * (PARTS + 8) * 4)
     launch shape_rows_prepare:
         threadgroups (PARTS, Sx, 1)
@@ -266,7 +266,7 @@ native shape_rows for cuda from "cuda/shape_rows.cu":
 # tie counts, digit and base).
 native shape_rows for vulkan from "vulkan/shape_rows.comp":
     static (V, Hn)
-    params (PARTS in [64, 128, 32], WIDTH in [256, 512])
+    params (PARTS in [64, 128, 32] default 64, WIDTH in [256, 512] default 256)
     scratch state bytes (Sx * (PARTS + 8) * 4)
     launch shape_rows_prepare:
         threadgroups (PARTS, Sx, 1)
@@ -288,7 +288,7 @@ native shape_rows for vulkan from "vulkan/shape_rows.comp":
 # exact ceil(top_p * total) target, so every decision is theirs bit for bit
 # and independent of PARTS.
 native shape_rows for cpu from "cpu/shape_rows.rs":
-    params (PARTS in [32, 8, 64, 1])
+    params (PARTS in [32, 8, 64, 1] default 32)
     scratch partials bytes (Sx * PARTS * 8)
     scratch order bytes (Sx * V * 8)
     launch shape_rows_prepare:
@@ -305,7 +305,7 @@ native shape_rows for cpu from "cpu/shape_rows.rs":
 # wins, ties go to the lowest token, and the winning bits are carried
 # unchanged, so the result does not depend on PARTS.
 native sample_rows for metal from "metal/sample_rows.metal":
-    params (PARTS in [64, 32, 128])
+    params (PARTS in [64, 32, 128] default 64)
     scratch partials bytes (M * PARTS * 12)
     launch sample_rows_partition:
         threadgroups (PARTS, M, 1)
@@ -319,7 +319,7 @@ native sample_rows for metal from "metal/sample_rows.metal":
 # result is independent of PARTS and WIDTH.
 native sample_rows for cuda from "cuda/sample_rows.cu":
     static (V)
-    params (PARTS in [32, 64, 128, 16], WIDTH in [256, 512])
+    params (PARTS in [32, 64, 128, 16] default 32, WIDTH in [256, 512] default 256)
     scratch partials bytes (M * PARTS * 12)
     launch sample_rows_partition:
         threadgroups (PARTS, M, 1)
@@ -331,7 +331,7 @@ native sample_rows for cuda from "cuda/sample_rows.cu":
 # Native Vulkan: the CUDA two stages, with the same merge order.
 native sample_rows for vulkan from "vulkan/sample_rows.comp":
     static (V)
-    params (PARTS in [32, 64, 128, 16], WIDTH in [256, 512])
+    params (PARTS in [32, 64, 128, 16] default 32, WIDTH in [256, 512] default 256)
     scratch partials bytes (M * PARTS * 12)
     launch sample_rows_partition:
         threadgroups (PARTS, M, 1)
@@ -345,7 +345,7 @@ native sample_rows for vulkan from "vulkan/sample_rows.comp":
 # row merging the slice winners in slice order, so the result is independent
 # of PARTS.
 native sample_rows for cpu from "cpu/sample_rows.rs":
-    params (PARTS in [32, 8, 64, 1])
+    params (PARTS in [32, 8, 64, 1] default 32)
     scratch partials bytes (M * PARTS * 12)
     launch sample_rows_partition:
         threadgroups (PARTS, M, 1)

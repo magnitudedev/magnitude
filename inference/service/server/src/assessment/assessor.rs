@@ -11,26 +11,24 @@ use std::sync::{Arc, Weak};
 use magnitude_engine::assessment::{
     DrafterVerdict as EngineDrafterVerdict, HeaderExtent as EngineHeaderExtent, Measurements,
     ModelAssessment as EngineAssessment, ModelAssessmentError,
-    ModelCapabilities as EngineCapabilities, ModelExecution, ModelPackagePaths, Performance,
-    PreparedModelAssessment, ProjectorVerdict as EngineProjectorVerdict,
-    SpeculativeMethod as EngineSpeculativeMethod, finish_model_assessment, header_refusal,
-    prepare_model_assessment,
+    ModelCapabilities as EngineCapabilities, ModelExecution, ModelPackagePaths,
+    ModelResidency as EngineResidency, Performance, PreparedModelAssessment,
+    ProjectorVerdict as EngineProjectorVerdict, SpeculativeMethod as EngineSpeculativeMethod,
+    StreamedPerformance, finish_model_assessment, header_refusal, prepare_model_assessment,
 };
 use magnitude_artifacts::gguf::Directory;
 use magnitude_engine::error::{UnsupportedModel, UnsupportedReason as EngineUnsupportedReason};
 use magnitude_engine::fingerprint::ModelFingerprint as EngineModelFingerprint;
 use magnitude_engine::options::{ModelMethod, PROFILE_SEQUENCES};
-use magnitude_executor::assessment::{
-    DomainFit, ExecutionFit, ExecutionShortfall, PerformanceEstimate,
-};
+use magnitude_executor::assessment::{DomainFit, ExecutionShortfall, PerformanceEstimate};
 use magnitude_service_contracts::models::{
     AssessmentEnvironmentId, DrafterVerdict, InstalledModelPackages as _, KernelStatic,
     KnownUnsupportedReason, MemoryAssessment, ModelAssessment, ModelAssessmentId,
     ModelAssessmentProfile, ModelBundleInput, ModelCapabilities, ModelFailure, ModelFingerprint,
-    ModelPackageOperand, ModelPerformance, ModelReasoningCapabilities, ModelServingConfiguration,
-    PerformanceEvidence, ProjectorVerdict, ResolvedServableModelBundle, ServableModelBundle,
-    SpeculativeDraftSource, SpeculativeDraftSourceInput, SpeculativeMethod, UnsupportedReason,
-    WeightTypeCount,
+    ModelPackageOperand, ModelPerformance, ModelReasoningCapabilities, ModelResidency,
+    ModelServingConfiguration, PerformanceEvidence, ProjectorVerdict, ResolvedServableModelBundle, ServableModelBundle,
+    SpeculativeDraftSource, SpeculativeDraftSourceInput, SpeculativeMethod, StreamedModelPerformance,
+    ColdExperts, StreamedBank, StreamedBankParts, UnsupportedReason, WeightTypeCount,
 };
 use magnitude_service_contracts::{ComponentRole, InventoryError, MemoryDomainId, ResolvedModel};
 use magnitude_service_models::{
@@ -63,12 +61,6 @@ pub struct AssessmentWork {
 }
 
 pub type PreparationResult = Result<Arc<PreparedModelAssessment>, ModelFailure>;
-
-fn preparation_task_failure(error: impl std::fmt::Display) -> ModelFailure {
-    inventory_model_failure(InventoryError::Internal(format!(
-        "model preparation task failed: {error}"
-    )))
-}
 
 fn preparation_failure(error: ModelAssessmentError) -> ModelFailure {
     inventory_model_failure(preparation_error(error))
@@ -149,18 +141,19 @@ impl ModelAssessor {
     }
 
     /// Assess new work under `measurements` of the same structure. The new environment when its
-    /// identity differs from the current one's; `None` when the measurements change nothing.
+    /// identity differs from the current one's; `None` when the measurements change nothing of
+    /// it, which then still read the models' miss records as they are stored now.
     pub fn adopt(&self, measurements: Measurements) -> Option<Arc<AssessmentEnvironment>> {
         let mut current = self
             .environment
             .write()
             .expect("assessment environment lock poisoned");
         let next = current.measured(measurements);
-        if next.id == current.id {
-            return None;
-        }
+        let moved = next.id != current.id;
+        // Of the same identity, the new measurements still read the miss records as they are
+        // stored now (`Measurements::misses`).
         *current = Arc::new(next);
-        Some(Arc::clone(&current))
+        moved.then(|| Arc::clone(&current))
     }
 
     pub fn models(&self) -> &Arc<ManagedModelStore> {
@@ -222,14 +215,13 @@ impl ModelAssessor {
             .await
             .map_err(assessment_drop_failure)?;
         let package = engine_material(&resolved).map_err(assessment_drop_failure)?;
-        let prepared = crate::spawn_blocking_traced(move || {
+        let prepared = magnitude_service_utils::blocking::run(move || {
             // The resolved material (a catalog bundle's materialized headers) lives until
             // preparation has read it.
             let _material = resolved;
             prepare_model_assessment(&package, &structure)
         })
         .await
-        .map_err(preparation_task_failure)?
         .map_err(preparation_failure)?;
         Ok(Arc::new(prepared))
     }
@@ -245,9 +237,10 @@ impl ModelAssessor {
             preparation,
         } = work;
         let bundle_key = servable_model_bundle_key_for_bundle(&configuration.bundle);
-        // The exact work identity is the whole assessment identity, so it keys the cache.
+        // The exact work identity is the assessment's identity but for a streamed fit's own miss
+        // record, so it keys the cache.
         let evidence = key.0.clone();
-        if let Some(cached) = self.models.read_model_assessment(&evidence) {
+        if let Some(cached) = self.cached(&environment, &evidence) {
             return Ok(AssessmentOutcome {
                 key,
                 result: Ok(cached),
@@ -258,7 +251,7 @@ impl ModelAssessor {
         let gate_key = serde_json::to_string(&(&bundle_key.0, &environment.id.0))
             .expect("assessment gate identity is serializable");
         let _gate = self.work_gate(&gate_key).await.lock_owned().await;
-        if let Some(cached) = self.models.read_model_assessment(&evidence) {
+        if let Some(cached) = self.cached(&environment, &evidence) {
             return Ok(AssessmentOutcome {
                 key,
                 result: Ok(cached),
@@ -284,6 +277,18 @@ impl ModelAssessor {
         })
     }
 
+    /// The assessment cached under `evidence`, a key of `environment`, while it is the
+    /// environment's assessment now ([`current`]).
+    pub(crate) fn cached(
+        &self,
+        environment: &AssessmentEnvironment,
+        evidence: &str,
+    ) -> Option<CachedModelAssessment> {
+        self.models
+            .read_model_assessment(evidence)
+            .filter(|cached| current(environment, cached))
+    }
+
     async fn work_gate(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut gates = self.work_gates.lock().await;
         gates.retain(|_, gate| gate.strong_count() > 0);
@@ -305,14 +310,8 @@ impl ModelAssessor {
         let release_catalog = Arc::clone(&self.release_catalog);
         let release_key = bundle_key.clone();
         let release =
-            crate::spawn_blocking_traced(move || release_catalog.resolve_bundle(&release_key))
-                .await
-                .map_err(|error| {
-                    InventoryError::Internal(format!(
-                        "release model material task failed for {}: {error}",
-                        bundle_key.0
-                    ))
-                })??;
+            magnitude_service_utils::blocking::run(move || release_catalog.resolve_bundle(&release_key))
+                .await?;
         match release {
             Some(resolved) => Ok(resolved),
             None => self.models.resolve_bundle(bundle_input(bundle)).await,
@@ -429,12 +428,11 @@ async fn assess_prepared(
     let depths = profile.performance_context_tokens.clone();
     let engine_environment = Arc::clone(&environment);
     let started = std::time::Instant::now();
-    let assessed = crate::spawn_blocking_traced(move || {
+    let assessed = magnitude_service_utils::blocking::run(move || {
         let setup = &engine_environment.setup;
         finish_model_assessment(&prepared, setup, &depths, PROFILE_SEQUENCES)
     })
-    .await
-    .map_err(|error| InventoryError::Internal(format!("model assessment task failed: {error}")))?;
+    .await;
     tracing::info!(
         target.id = %bundle_key.0,
         assessment_microseconds = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
@@ -471,7 +469,7 @@ pub(crate) fn model_assessment(
             return Ok(unsupported_model(
                 requested,
                 unsupported,
-                fingerprint.map(model_fingerprint),
+                fingerprint.as_ref().map(model_fingerprint),
             ));
         }
         EngineAssessment::Assessed { facts, execution } => (facts, execution),
@@ -488,20 +486,24 @@ pub(crate) fn model_assessment(
     }
     let projector = projector_verdict(facts.projector);
     let drafter = drafter_verdict(facts.drafter);
-    let assessment_id = assessment_id(bundle_key, &requested, &environment.id);
+    let misses = match &execution {
+        ModelExecution::Fits {
+            residency: EngineResidency::Streamed { misses, .. },
+            ..
+        } => Some(misses.0.clone()),
+        _ => None,
+    };
+    let assessment_id = assessment_id(bundle_key, &requested, &environment.id, misses.as_deref());
     let ModelAssessmentProfile {
         profile,
         performance_context_tokens,
     } = requested;
     let assessment = match execution {
-        ModelExecution::Fits {
-            fit: ExecutionFit { domains, .. },
-            performance,
-        } => ModelAssessment::Fits {
+        ModelExecution::Fits { domains, residency } => ModelAssessment::Fits {
             profile,
             assessment_id,
             memory: memory_assessments(&domains, environment),
-            performance: model_performance(performance, &performance_context_tokens)?,
+            residency: model_residency(residency, &performance_context_tokens)?,
             projector,
             drafter,
         },
@@ -515,7 +517,7 @@ pub(crate) fn model_assessment(
             assessment_id,
             memory: memory_assessments(&domains, environment),
             limiting_resource: domain_id(limiting, environment).as_str().to_owned(),
-            deficit_bytes,
+            deficit_bytes: deficit_bytes.get(),
             projector,
             drafter,
         },
@@ -523,8 +525,9 @@ pub(crate) fn model_assessment(
     Ok(CachedModelAssessment {
         capabilities: capabilities(facts.capabilities),
         template_fingerprint: facts.template_fingerprint,
-        fingerprint: facts.fingerprint.map(model_fingerprint),
+        fingerprint: facts.fingerprint.as_ref().map(model_fingerprint),
         profile: assessment,
+        misses,
     })
 }
 
@@ -648,18 +651,47 @@ fn drafter_verdict(verdict: EngineDrafterVerdict) -> DrafterVerdict {
     }
 }
 
-pub(crate) fn model_fingerprint(fingerprint: EngineModelFingerprint) -> ModelFingerprint {
-    ModelFingerprint {
-        architecture: fingerprint.architecture,
-        block_count: fingerprint.block_count,
-        embedding_length: fingerprint.embedding_length,
-        head_count: fingerprint.head_count,
-        head_count_kv: fingerprint.head_count_kv,
-        key_length: fingerprint.key_length,
-        vocab_size: fingerprint.vocab_size,
-        expert_count: fingerprint.expert_count,
-        tokenizer_digest: fingerprint.tokenizer_digest,
-    }
+/// The two forms of a fingerprint, which share every field: each direction's conversion, made
+/// from the one list of their fields. Neither form's crate sees the other, so the conversions are
+/// here; each destructures its source and builds its target whole, so a field either form gains
+/// or loses fails to compile until the list follows.
+macro_rules! fingerprint_conversions {
+    ($($field:ident),* $(,)?) => {
+        /// The contract's form of the engine's fingerprint.
+        pub(crate) fn model_fingerprint(fingerprint: &EngineModelFingerprint) -> ModelFingerprint {
+            let EngineModelFingerprint { $($field),* } = fingerprint;
+            ModelFingerprint { $($field: $field.clone()),* }
+        }
+
+        /// The engine's form of a fingerprint on the contract: what the engine finds the
+        /// model's miss record by.
+        fn engine_fingerprint(fingerprint: &ModelFingerprint) -> EngineModelFingerprint {
+            let ModelFingerprint { $($field),* } = fingerprint;
+            EngineModelFingerprint { $($field: $field.clone()),* }
+        }
+    };
+}
+
+fingerprint_conversions!(
+    architecture,
+    block_count,
+    embedding_length,
+    head_count,
+    head_count_kv,
+    key_length,
+    vocab_size,
+    expert_count,
+    tokenizer_digest,
+);
+
+/// Whether `cached` is `environment`'s assessment now, read under a key of it: one that reads
+/// no miss record, or a streamed fit whose estimates read its own model's record as it is stored
+/// now. No other model's record enters it.
+fn current(environment: &AssessmentEnvironment, cached: &CachedModelAssessment) -> bool {
+    cached.misses.as_ref().is_none_or(|misses| {
+        let fingerprint = cached.fingerprint.as_ref().map(engine_fingerprint);
+        environment.setup.measurements.misses(fingerprint.as_ref()).1.0 == *misses
+    })
 }
 
 fn unsupported_model(
@@ -709,6 +741,7 @@ fn unsupported_assessment(
             reasons,
             detail,
         },
+        misses: None,
     }
 }
 
@@ -727,6 +760,54 @@ fn capabilities(capabilities: EngineCapabilities) -> ModelCapabilities {
 
 fn domain_id(domain: seismic::StoreId, environment: &AssessmentEnvironment) -> MemoryDomainId {
     crate::memory_domains::store_domain_id(&environment.setup.structure.topology, domain)
+}
+
+/// How a fitting model holds its weights on the contract, with its speed held so.
+fn model_residency(
+    residency: EngineResidency,
+    depths: &[u32],
+) -> Result<ModelResidency, InventoryError> {
+    Ok(match residency {
+        EngineResidency::Resident { performance } => ModelResidency::Resident {
+            performance: model_performance(performance, depths)?,
+        },
+        EngineResidency::Streamed {
+            shares,
+            performance,
+            floor_performance,
+            ..
+        } => ModelResidency::Streamed {
+            bank: streamed_bank(shares),
+            performance: streamed_performance(performance, depths)?,
+            floor_performance: streamed_performance(floor_performance, depths)?,
+        },
+    })
+}
+
+/// A streamed fit's bank on the contract, whose bounds its shares uphold.
+fn streamed_bank(shares: magnitude_executor::assessment::ExpertShares) -> StreamedBank {
+    StreamedBankParts {
+        experts: shares.experts(),
+        slots: shares.slots(),
+        floor_slots: shares.floor(),
+        cold_experts: match shares.cold() {
+            magnitude_executor::assessment::ColdSource::HostTier { .. } => ColdExperts::HostRam,
+            magnitude_executor::assessment::ColdSource::File(_) => ColdExperts::Disk,
+        },
+    }
+    .try_into()
+    .expect("expert shares uphold a streamed bank's bounds")
+}
+
+/// A streamed fit's speed on the contract: unmeasured, or as [`model_performance`] gives it.
+fn streamed_performance(
+    performance: StreamedPerformance,
+    depths: &[u32],
+) -> Result<StreamedModelPerformance, InventoryError> {
+    Ok(match performance {
+        StreamedPerformance::Unmeasured => StreamedModelPerformance::Unmeasured,
+        StreamedPerformance::Assessed(performance) => model_performance(performance, depths)?.into(),
+    })
 }
 
 /// A fitting model's speed on the contract: estimated at exactly the requested depths, pending,
@@ -792,6 +873,7 @@ fn assessment_id(
     bundle_key: &ServableModelBundleKey,
     profile: &ModelAssessmentProfile,
     environment: &AssessmentEnvironmentId,
+    misses: Option<&str>,
 ) -> ModelAssessmentId {
     let mut digest = Sha256::new();
     digest.update(bundle_key.0.as_bytes());
@@ -799,6 +881,10 @@ fn assessment_id(
     digest.update(environment.0.as_bytes());
     for context_tokens in &profile.performance_context_tokens {
         digest.update(context_tokens.to_le_bytes());
+    }
+    // A streamed fit's own miss record, which its estimates are from.
+    if let Some(misses) = misses {
+        digest.update(misses.as_bytes());
     }
     ModelAssessmentId(format!("assessment_{:x}", digest.finalize()))
 }
@@ -881,6 +967,7 @@ pub fn inventory_model_failure(error: InventoryError) -> ModelFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magnitude_engine::assessment::MissesDigest;
 
     /// An unsupported file whose context is unknown has no serving profile, never a zero-token one;
     /// one with a context keeps it.
@@ -1079,6 +1166,146 @@ mod tests {
                 Err(InventoryError::InvalidRequest(_))
             ));
         }
+    }
+
+    /// A streamed fit reaches the contract with its bank's shares of each routed layer's experts
+    /// and its speed unmeasured; a resident fit keeps its speed.
+    #[test]
+    fn a_streamed_fit_reaches_the_contract_with_its_shares() {
+        let shares = magnitude_executor::assessment::ExpertShares::new(
+            64,
+            192,
+            std::num::NonZeroU64::new(256).unwrap(),
+            magnitude_executor::assessment::ColdSource::HostTier { slots: 256 },
+        );
+        assert_eq!(
+            model_residency(
+                EngineResidency::Streamed {
+                    shares,
+                    performance: StreamedPerformance::Unmeasured,
+                    floor_performance: StreamedPerformance::Assessed(Performance::Pending),
+                    misses: MissesDigest::of(&Ok(None)),
+                },
+                &[25_000],
+            )
+            .unwrap(),
+            ModelResidency::Streamed {
+                bank: StreamedBankParts {
+                    experts: std::num::NonZeroU64::new(256).unwrap(),
+                    slots: 192,
+                    floor_slots: 64,
+                    cold_experts: ColdExperts::HostRam,
+                }
+                .try_into()
+                .unwrap(),
+                performance: StreamedModelPerformance::Unmeasured,
+                floor_performance: StreamedModelPerformance::Pending,
+            }
+        );
+        assert_eq!(
+            model_residency(
+                EngineResidency::Resident {
+                    performance: Performance::Pending,
+                },
+                &[25_000],
+            )
+            .unwrap(),
+            ModelResidency::Resident {
+                performance: ModelPerformance::Pending,
+            }
+        );
+    }
+
+    /// A streamed load's new miss record renews only its own model's assessment: the
+    /// environment's identity holds no record, and another model's cached streamed fit stays
+    /// current.
+    #[test]
+    fn one_models_new_miss_record_leaves_every_other_assessment_cached() {
+        use magnitude_executor::KernelCache;
+        use magnitude_executor::assessment::{
+            ExecutorCosts, MissRecord, RequestReads, Residuals, StoredCosts, StoredMisses,
+        };
+        let kernels = tempfile::tempdir().unwrap();
+        let structure = Arc::new(
+            super::super::environment::assessment_structure(
+                &seismic::Devices::discover(&[]).expect("device catalog"),
+                super::super::environment::ServingDevice::of(seismic::ExecutorSelector::HostCpu),
+                None,
+            )
+            .expect("the host CPU is usable"),
+        );
+        // A record of each cost point the walk reads until the costs derive: the probe's first.
+        let records = KernelCache::measurement_records(kernels.path());
+        while let StoredCosts::Missing(key) =
+            ExecutorCosts::stored(&structure.topology, &structure.selected.info, &records).unwrap()
+        {
+            let timing = seismic::measure::Timing {
+                median: 1e-3,
+                interval: None,
+                samples: 8,
+            };
+            seismic::measure::RecordStore::store(&records, &key, &seismic::measure::Record::Measured(timing))
+                .unwrap();
+        }
+        let environment = AssessmentEnvironment::new(
+            Arc::clone(&structure),
+            structure.stored_measurements(kernels.path()),
+        )
+        .unwrap();
+        assert!(matches!(
+            environment.setup.measurements,
+            Measurements::Measured { .. }
+        ));
+        let fingerprint = |architecture: &str| EngineModelFingerprint {
+            architecture: architecture.into(),
+            block_count: 2,
+            embedding_length: 64,
+            head_count: 4,
+            head_count_kv: 2,
+            key_length: 16,
+            vocab_size: 100,
+            expert_count: Some(4),
+            tokenizer_digest: "digest".into(),
+        };
+        let (own, other) = (fingerprint("own"), fingerprint("other"));
+        // Whether an assessment is current reads only its fingerprint and its record's digest.
+        let streamed = |fingerprint: &EngineModelFingerprint| CachedModelAssessment {
+            misses: Some(
+                environment.setup.measurements.misses(Some(fingerprint)).1.0,
+            ),
+            ..unsupported_assessment(
+                None,
+                Vec::new(),
+                String::new(),
+                Some(model_fingerprint(fingerprint)),
+            )
+        };
+        let (own_cached, other_cached) = (streamed(&own), streamed(&other));
+        assert!(current(&environment, &own_cached));
+        assert!(current(&environment, &other_cached));
+
+        // A streamed load of `own` stores its record.
+        let executor = structure.selected.identity.clone();
+        let model = serde_json::to_value(&own).unwrap();
+        let stored = StoredMisses {
+            executor: executor.clone(),
+            model: model.clone(),
+            record: MissRecord {
+                steps: 1,
+                rows: 1,
+                layers: Vec::new(),
+                reads: RequestReads::default(),
+                residuals: Residuals::default(),
+                hints: Default::default(),
+            },
+        };
+        KernelCache::miss_records(kernels.path())
+            .store(&StoredMisses::key(&executor, &model), &stored, u64::MAX)
+            .unwrap();
+        let measured = environment.measured(structure.stored_measurements(kernels.path()));
+        assert_eq!(measured.id, environment.id, "no record enters the environment's identity");
+        assert!(!current(&measured, &own_cached), "its own record renews the model's assessment");
+        assert!(current(&measured, &other_cached), "another model's assessment stays cached");
     }
 
     #[test]
