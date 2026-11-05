@@ -18,9 +18,10 @@
 // than after it. While the next layer's group is whole the launch encoded is
 // the `_alone` kernel, the same body compiled without the hint blocks or
 // their code.
-// Every block forms the RMS inverses as `routed_route_shared` does, so the
-// routing and the shared product carry its bits. The three groups count
-// their arrivals apart and none waits for another.
+// Every block forms the RMS inverses and stages its rows as
+// `routed_route_shared` does, so the routing and the shared product carry
+// its bits. The three groups count their arrivals apart and none waits for
+// another.
 //
 // The selecting block then resolves and assigns (`streaming/resolve.hpp`):
 // a layer of a group that is not whole (`routed_route_streamed`) its
@@ -94,14 +95,17 @@ struct Ports {
 // into the lead's [M, EN + 1] logits plane after this layer's [M, E + 1],
 // then, in the last of the lead's blocks to arrive (arrival counter 1 +
 // lead), its rows ranked (`route::rank_row`) and the hints published into
-// the lead's ring row. Every thread calls it.
+// the lead's ring row. The rows are staged in `memory` (the launch's dynamic
+// shared memory). Every thread calls it.
 __device__ __forceinline__ void hint_block(const Ports &ports, unsigned lead, unsigned group,
                                            float (*parts)[route::WARPS], float *inverses, unsigned *last,
-                                           const seismic_words_t &seismic_words_value) {
+                                           projection::u8 *memory, const seismic_words_t &seismic_words_value) {
     constexpr unsigned K = SEISMIC_DIM_K;
     __shared__ int words[STREAMING_HINT_WORDS(SEISMIC_CONST_DECODE_ROWS)];
-    const route::Input &next = ports.ahead[lead];
-    const route::Columns &next_columns = ports.ahead_columns[lead];
+    // The lead's ports, selected rather than indexed: an index the compiler
+    // cannot resolve would place the whole `Ports` in local memory.
+    const route::Input next = lead == 0 ? ports.ahead[0] : ports.ahead[1];
+    const route::Columns next_columns = lead == 0 ? ports.ahead_columns[0] : ports.ahead_columns[1];
     float *predicted = ports.logits + SEISMIC_DIM_M * (SEISMIC_DIM_E + 1) + lead * SEISMIC_DIM_M * (SEISMIC_DIM_EN + 1);
     const unsigned lane = threadIdx.x % 32;
     const unsigned long long expert = static_cast<unsigned long long>(group) * (blockDim.x / 32) + threadIdx.x / 32;
@@ -109,9 +113,9 @@ __device__ __forceinline__ void hint_block(const Ports &ports, unsigned lead, un
         route::prefetch<NEXT_EXPERTS>(next_columns, expert, lane, seismic_words_value);
     seismic_dependency_start();
     route::decode_inverses(next.residual, parts, inverses, seismic_words_value);
+    const route::Staged input = route::stage_rows(next, inverses, memory, seismic_words_value);
     if (expert < NEXT_EXPERTS)
-        route::column<NEXT_EXPERTS>(next, inverses, next_columns, expert, predicted, lane,
-            seismic_words_value);
+        route::column<NEXT_EXPERTS>(input, next_columns, expert, predicted, lane, seismic_words_value);
     if (!arrive::last(ports.arrivals + 1 + lead, PREDICT_BLOCKS, last))
         return;
     const unsigned rows = static_cast<unsigned>(SEISMIC_DIM_M);
@@ -141,7 +145,7 @@ __device__ __forceinline__ void route_streamed(const Ports &ports, projection::u
     const unsigned group = blockIdx.x;
     if (HINTS && group >= route::BLOCKS && group < route::BLOCKS + predicting) {
         hint_block(ports, (group - route::BLOCKS) / PREDICT_BLOCKS, (group - route::BLOCKS) % PREDICT_BLOCKS, parts,
-            inverses, &last, seismic_words_value);
+            inverses, &last, memory, seismic_words_value);
         return;
     }
     if (group >= route::BLOCKS) {
@@ -150,8 +154,9 @@ __device__ __forceinline__ void route_streamed(const Ports &ports, projection::u
         return;
     }
     __shared__ int resolved[STREAMING_RESOLVE_WORDS(SEISMIC_CONST_DECODE_ROWS * SEISMIC_DIM_K)];
-    if (!route::route_block(ports.in, ports.columns, ports.selection, ports.normalized, SEISMIC_RESULT_0_STRIDE_0,
-            SEISMIC_RESULT_0_STRIDE_1, ports.logits, ports.arrivals, group, parts, inverses, &last, seismic_words_value))
+    if (!route::route_block(ports.in, route::StageRows{memory}, ports.columns, ports.selection, ports.normalized,
+            SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, ports.logits, ports.arrivals, group, parts,
+            inverses, &last, seismic_words_value))
         return;
     // Resolve: the selection's routes are this block's own stores.
     routed_resolve(ports.bank, WHOLE, resolved, seismic_words_value);

@@ -214,13 +214,13 @@ native routed_route_shared for metal from "metal/routed_route_shared.metal":
 # CUDA: the `routed_route` GEMV blocks (`cuda/lib/routed/route.cuh`: a warp a
 # logit column, the shared-expert gate column in the last block, the
 # selection in the last of them to arrive), followed by the shared expert's
-# blocks. A shared block forms the decode rows in its shared memory as a
-# router block forms them (the published `normalized` bits, or their NVFP4
-# operands as `routed_expand`'s stage launch forms them), then runs
-# `routed_expand`'s shared row (`cuda/lib/routed/shared.cuh`): the swap-AB
-# GEMV, TPW tiles per warp group, KSPLIT splitting K across a group's warps
-# (KSPLIT sets the reduction order, so it is arithmetic), SIMDGROUPS / KSPLIT
-# groups a block. For equal KSPLIT, `shared_product` carries
+# blocks. Every block stages the decode rows in its shared memory (the
+# published `normalized` bits), which a router block's columns read; a
+# shared block (with their NVFP4 operands as `routed_expand`'s stage launch
+# forms them) then runs `routed_expand`'s shared row
+# (`cuda/lib/routed/shared.cuh`): the swap-AB GEMV, TPW tiles per warp
+# group, KSPLIT splitting K across a group's warps (KSPLIT sets the
+# reduction order, so it is arithmetic), SIMDGROUPS / KSPLIT groups a block. For equal KSPLIT, `shared_product` carries
 # `routed_expand`'s bits. The first configuration is `routed_route`'s and
 # `routed_expand`'s, so the decode form keeps their bits at their defaults.
 native routed_route_shared for cuda from "cuda/routed_route_shared.cu":

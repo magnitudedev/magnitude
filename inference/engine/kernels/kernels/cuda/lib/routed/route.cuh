@@ -10,10 +10,14 @@
 //     value rounded to A.
 //   decode_inverses: a GEMV block's RMS inverses of the decode rows
 //     (M <= DECODE_ROWS), in the stage launch's sum order.
+//   Formed, Staged, stage_rows: the decode rows a block's columns read:
+//     formed from the input as each element is read, or once into the
+//     block's shared memory (a launch that gives every block M x H A
+//     elements of it). Both read the same values.
 //   Columns, weight: a router's logit columns, column E the shared-expert
 //     gate (`shared_router`), formed like an expert's logit.
-//   column: one warp's logit column over the decode rows, normalizing each
-//     element as it reads it, into a [M, E + 1] logits plane.
+//   column: one warp's logit column over the decode rows into a [M, E + 1]
+//     logits plane.
 //   rank_row: one row's K winners by one warp (`rank_experts`).
 //   select_row: a row's routes, scores and coefficient from its ranking;
 //     lane 0 then hands `bind` the row's routes.
@@ -116,6 +120,63 @@ __device__ __forceinline__ void decode_inverses(const float *residual, float (*p
     __syncthreads();
 }
 
+// The decode rows `in` (their RMS `inverses`) formed as each element is
+// read: a launch that has no shared memory for them (`routed_route`'s GEMV).
+struct Formed {
+    Input in;
+    const float *inverses;
+    static constexpr bool STAGED = false;
+
+    __device__ __forceinline__ float value(unsigned long long row, unsigned long long source,
+                                           const seismic_words_t &seismic_words_value) const {
+        return in.value(row, source, inverses[row], seismic_words_value);
+    }
+};
+
+// The decode rows as M x H A elements in a block's shared memory
+// (`stage_rows`): each holds `Input::value`'s A-rounded bits, so a column
+// reads the values `Formed` forms. A column then keeps no residual, norm or
+// inverse of its rows in registers, nor normalizes each element once a warp.
+struct Staged {
+    const unsigned char *rows;
+    static constexpr bool STAGED = true;
+
+    __device__ __forceinline__ float value(unsigned long long row, unsigned long long source,
+                                           const seismic_words_t &seismic_words_value) const {
+        return element::at<Act>(rows, row * SEISMIC_DIM_H + source);
+    }
+};
+
+// The decode rows `in` (their RMS `inverses`) into `out` (M x H A elements
+// of the block's shared memory). Every thread of the block calls it; the
+// rows are the block's when it returns.
+__device__ __forceinline__ Staged stage_rows(const Input &in, const float *inverses, unsigned char *out,
+                                             const seismic_words_t &seismic_words_value) {
+    const unsigned count = static_cast<unsigned>(SEISMIC_DIM_M);
+    const unsigned long long hidden = SEISMIC_DIM_H;
+    for (unsigned long long item = threadIdx.x; item < count * hidden; item += blockDim.x)
+        element::put<Act>(out, item,
+            in.value(item / hidden, item % hidden, inverses[item / hidden], seismic_words_value));
+    __syncthreads();
+    return Staged{out};
+}
+
+// How a router block reads its decode rows (`route_block`): formed as read
+// (`FormRows`), or staged into the block's shared memory (`StageRows`).
+struct FormRows {
+    __device__ __forceinline__ Formed of(const Input &in, const float *inverses,
+                                         const seismic_words_t &seismic_words_value) const {
+        return Formed{in, inverses};
+    }
+};
+struct StageRows {
+    unsigned char *memory;
+    __device__ __forceinline__ Staged of(const Input &in, const float *inverses,
+                                         const seismic_words_t &seismic_words_value) const {
+        return stage_rows(in, inverses, memory, seismic_words_value);
+    }
+};
+
 // The logit columns of a router (the layer's, or a layer ahead's: the same
 // element), then the shared-expert gate row as column E.
 struct Columns {
@@ -174,13 +235,12 @@ __device__ __forceinline__ unsigned long long logit_index(unsigned long long row
     return row * (EXPERTS + 1) + expert;
 }
 
-// Logit column `expert` (<= EXPERTS) of the decode rows `in` (their RMS
-// `inverses`) through `w`, by one warp, into `logits` (a [M, EXPERTS + 1]
+// Logit column `expert` (<= EXPERTS) of the decode rows `input` (`Formed`
+// or `Staged`) through `w`, by one warp, into `logits` (a [M, EXPERTS + 1]
 // plane).
-template <unsigned EXPERTS = static_cast<unsigned>(SEISMIC_DIM_E)>
-__device__ __forceinline__ void column(const Input &in, const float *inverses, const Columns &w,
-                                       unsigned long long expert, float *logits, unsigned lane,
-                                       const seismic_words_t &seismic_words_value) {
+template <unsigned EXPERTS = static_cast<unsigned>(SEISMIC_DIM_E), class Rows>
+__device__ __forceinline__ void column(const Rows &input, const Columns &w, unsigned long long expert,
+                                       float *logits, unsigned lane, const seismic_words_t &seismic_words_value) {
     const unsigned rows = static_cast<unsigned>(SEISMIC_DIM_M);
     float sums[SEISMIC_CONST_DECODE_ROWS] = {};
 #if defined(SEISMIC_ROUTER_KIND_PACKED)
@@ -203,8 +263,8 @@ __device__ __forceinline__ void column(const Input &in, const float *inverses, c
 #pragma unroll
                 for (unsigned row = 0; row < SEISMIC_CONST_DECODE_ROWS; ++row)
                     if (row < rows)
-                        sums[row] = seismic_fma_rn(in.value(row, source, inverses[row], seismic_words_value),
-                            weight, sums[row]);
+                        sums[row] = seismic_fma_rn(input.value(row, source, seismic_words_value), weight,
+                            sums[row]);
             }
     }
 #else
@@ -213,7 +273,35 @@ __device__ __forceinline__ void column(const Input &in, const float *inverses, c
     // memory once per batch rather than once per i; each row still
     // accumulates its sources in i order, then j order.
     constexpr unsigned BATCH = 4;
-    if constexpr (!NORMED) {
+    if constexpr (Rows::STAGED) {
+        // Staged rows: each product reads its value from shared memory.
+        for (unsigned first = 4 * lane; first < SEISMIC_DIM_H; first += 128 * BATCH) {
+            float weight[BATCH][4];
+#pragma unroll
+            for (unsigned b = 0; b < BATCH; ++b) {
+                const unsigned base = first + 128 * b;
+#pragma unroll
+                for (unsigned j = 0; j < 4; ++j)
+                    weight[b][j] = base < SEISMIC_DIM_H
+                        ? route::weight<EXPERTS>(w, expert, base + j, seismic_words_value) : 0.0f;
+            }
+#pragma unroll
+            for (unsigned row = 0; row < SEISMIC_CONST_DECODE_ROWS; ++row) {
+                if (row < rows) {
+#pragma unroll
+                    for (unsigned b = 0; b < BATCH; ++b) {
+                        const unsigned base = first + 128 * b;
+                        if (base >= SEISMIC_DIM_H)
+                            break;
+#pragma unroll
+                        for (unsigned j = 0; j < 4; ++j)
+                            sums[row] = seismic_fma_rn(input.value(row, base + j, seismic_words_value), weight[b][j],
+                                sums[row]);
+                    }
+                }
+            }
+        }
+    } else if constexpr (!NORMED) {
         // The mix site's partials: each source's input sums PT reads.
         for (unsigned first = 4 * lane; first < SEISMIC_DIM_H; first += 128) {
 #pragma unroll
@@ -223,11 +311,14 @@ __device__ __forceinline__ void column(const Input &in, const float *inverses, c
 #pragma unroll
                 for (unsigned row = 0; row < SEISMIC_CONST_DECODE_ROWS; ++row)
                     if (row < rows && first + j < SEISMIC_DIM_H)
-                        sums[row] = seismic_fma_rn(in.value(row, first + j, 0.0f, seismic_words_value), weight,
+                        sums[row] = seismic_fma_rn(input.value(row, first + j, seismic_words_value), weight,
                             sums[row]);
             }
         }
     } else {
+        // Formed normalized rows: each batch's norm values serve every row.
+        const Input &in = input.in;
+        const float *inverses = input.inverses;
         for (unsigned first = 4 * lane; first < SEISMIC_DIM_H; first += 128 * BATCH) {
             float weight[BATCH][4], scale[BATCH][4];
 #pragma unroll
@@ -400,11 +491,13 @@ constexpr unsigned BLOCKS = (static_cast<unsigned>(SEISMIC_DIM_E) + SEISMIC_TUNE
 // decode rows `in`: warp w's logit column group SIMDGROUPS + w (<= E)
 // streams into L2 while the launch before finishes; then the block forms
 // the rows' RMS inverses (`decode_inverses`, through its `parts` and
-// `inverses`), block 0 publishes the normalized rows, each warp forms its
+// `inverses`) and reads the rows as `form` makes them (`FormRows`,
+// `StageRows`), block 0 publishes the normalized rows, each warp forms its
 // column into `logits` ([M, E + 1]), and the last block to arrive selects
 // every row, one warp per row. Every thread calls it; true in the selecting
 // block.
-__device__ __forceinline__ bool route_block(const Input &in, const Columns &w, const Selection &out,
+template <class Form>
+__device__ __forceinline__ bool route_block(const Input &in, const Form &form, const Columns &w, const Selection &out,
                                             unsigned char *normalized, unsigned long long normalized0,
                                             unsigned long long normalized1, float *logits, unsigned *arrivals,
                                             unsigned group, float (*parts)[WARPS],
@@ -416,15 +509,16 @@ __device__ __forceinline__ bool route_block(const Input &in, const Columns &w, c
     prefetch(w, expert, lane, seismic_words_value);
     seismic_dependency_start();
     decode_inverses(in.residual, parts, inverses, seismic_words_value);
+    const auto input = form.of(in, inverses, seismic_words_value);
     if (group == 0) {
         for (unsigned item = thread; item < rows * static_cast<unsigned>(SEISMIC_DIM_H); item += blockDim.x) {
             const unsigned long long row = item / SEISMIC_DIM_H, source = item % SEISMIC_DIM_H;
             element::put<Act>(normalized, row * normalized0 + source * normalized1,
-                in.value(row, source, inverses[row], seismic_words_value));
+                input.value(row, source, seismic_words_value));
         }
     }
     if (expert <= SEISMIC_DIM_E)
-        column(in, inverses, w, expert, logits, lane, seismic_words_value);
+        column(input, w, expert, logits, lane, seismic_words_value);
     if (!arrive::last(arrivals, BLOCKS, last))
         return false;
     for (unsigned row = warp; row < rows; row += warps) {

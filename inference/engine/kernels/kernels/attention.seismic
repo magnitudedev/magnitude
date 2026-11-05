@@ -1375,11 +1375,16 @@ native attention_decode_k8v4 for metal from "metal/attention_decode_k8v4.metal":
 # Metal. Over 33 tuned units on GB10 (2026-10-11), lanes of 8 to 64 elements
 # were each the best somewhere; 128 was never the best and at its closest
 # 4.65x the best (15 units), 256 17.6x (3). So a lane holds more than 64
-# elements only where the group cannot be split further.
+# elements only where the group cannot be split further. SLICES defaults to
+# the fewest slices that hold a lane to 32 elements, or the most the group
+# splits into: at 64 (Qwen3.6 35B's G = 8, W = 256 at SLICES 1, WARPS 4) the
+# history batch's scores and values beside them take the RTX 3090's 255
+# registers a thread and spill 104 bytes (LOCAL_SIZE_BYTES).
 native attention_decode_k8v4 for cuda from "cuda/attention_decode_k8v4.cu":
     static (KV, G, P, S, I, U, F, N, NV, KC, KP, VC, VP, SK)
     params (arithmetic PARTS in [12, 24, 48, 96] default 12, arithmetic WARPS in [4, 8, 1, 2] default 4,
-        arithmetic SLICES in [1, 2, 4, 8] default 1, arithmetic form MATRIX in [0, 1] default 0,
+        arithmetic SLICES in [1, 2, 4, 8] default least where G % SLICES == 0 and ((G / SLICES) * ((2 * P + S) / 32) <= 32 or SLICES == 8 or G % (2 * SLICES) != 0),
+        arithmetic form MATRIX in [0, 1] default 0,
         arithmetic STAGES in [2, 3, 4] default 2, arithmetic COLUMNS in [1, 2, 4] default 1, arithmetic QREG in [0, 1] default 0)
     where SK <= 1 and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and G % SLICES == 0 and WARPS % SLICES == 0 and (1 + MATRIX) * COLUMNS * WARPS * 32 <= 1024 and (MATRIX == 1 or (WARPS >= 4 and STAGES == 2 and COLUMNS == 1 and QREG == 0)) and (MATRIX == 1 or (G / SLICES) * ((2 * P + S) / 32) <= 64 or SLICES == 8 or G % (2 * SLICES) != 0) and (MATRIX == 1 or (G + WARPS) * (2 * P + S) * 4 + WARPS * (G / SLICES) * 8 <= 98304) and (MATRIX == 0 or (SLICES == 1 and (QREG == 0 or 2 * P + S <= 256) and G <= WARPS * 16 and min((2 * P + S), 256 * COLUMNS) % (16 * COLUMNS) == 0 and ((2 * P + S) <= 256 or (2 * P + S) % 256 == 0) and ((1 - QREG) * (WARPS * 16 * (2 * P + S) + STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min((2 * P + S), 256) + min((2 * P + S), 256 * COLUMNS))) + QREG * max(WARPS * 16 * (2 * P + S), STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min((2 * P + S), 256) + min((2 * P + S), 256 * COLUMNS)))) * 2 + WARPS * COLUMNS * (2 * P + S) * 4 <= 98304))
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)

@@ -8,9 +8,9 @@
 // from `route.cuh`, which `routed_route` also includes and which so names no
 // symbol of these ports.
 //
-// A shared block forms the decode rows in its shared memory as a router
-// block forms them (`route::decode_inverses`, `route::Input`: the published
-// `normalized` bits; where the shared weights take NVFP4 operands, those
+// A shared block stages the decode rows in its shared memory as a router
+// block stages them (`route::decode_inverses`, `route::stage_rows`: the
+// published `normalized` bits; where the shared weights take NVFP4 operands, those
 // rows' operands as `routed_expand`'s stage launch forms them), then runs
 // `routed_expand`'s shared row: the swap-AB paired GEMV over the shared
 // expert's gate and up rows with the SiLU . mul epilogue, SIMDGROUPS /
@@ -43,10 +43,7 @@ __device__ __forceinline__ void rows(const route::Input &in, const float *invers
                                      const seismic_words_t &seismic_words_value) {
     const unsigned count = static_cast<unsigned>(SEISMIC_DIM_M);
     const projection::u64 hidden = SEISMIC_DIM_H;
-    for (projection::u64 item = threadIdx.x; item < count * hidden; item += blockDim.x)
-        element::put<projection::Act>(out, item,
-            in.value(item / hidden, item % hidden, inverses[item / hidden], seismic_words_value));
-    __syncthreads();
+    route::stage_rows(in, inverses, out, seismic_words_value);
     if constexpr (NVFP4) {
         const projection::Nvfp4Rows<Rows> operands{Rows{out, hidden, projection::AllRows{}}};
         for (unsigned row = 0; row < count; ++row) {

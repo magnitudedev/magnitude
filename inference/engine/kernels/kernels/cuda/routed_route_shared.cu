@@ -1,9 +1,10 @@
 // Decode routing (M <= DECODE_ROWS) with the shared expert's gate/up in one launch;
 // the CUDA form of `metal/routed_route_shared.metal`. Blocks [0,
 // route::BLOCKS) are `routed_route`'s GEMV blocks (`lib/routed/route.cuh`),
-// whose selection counts only them. The shared blocks after them each form
-// the decode rows in their dynamic shared memory as a router block forms
-// them, then run `routed_expand`'s shared row (`lib/routed/shared.cuh`).
+// whose selection counts only them. Every block stages the decode rows in
+// its dynamic shared memory (`route::stage_rows`): a router block's columns
+// read them there, and the shared blocks after the router blocks run
+// `routed_expand`'s shared row over them (`lib/routed/shared.cuh`).
 
 #define KERNEL_W0 SEISMIC_ROUTER
 #define KERNEL_W1 SEISMIC_SHARED_GATE
@@ -25,8 +26,8 @@ extern "C" __global__ void routed_route_shared(SEISMIC_KERNEL_PARAMS) {
             blockIdx.x - route::BLOCKS, seismic_words_value);
         return;
     }
-    route::route_block(ROUTE_INPUT, ROUTE_COLUMNS, ROUTE_SELECTION, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
-        SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
+    route::route_block(ROUTE_INPUT, route::StageRows{reinterpret_cast<unsigned char *>(memory)}, ROUTE_COLUMNS,
+        ROUTE_SELECTION, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
         reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS)),
         reinterpret_cast<unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ARRIVALS)), blockIdx.x, parts, inverses,
         &last, seismic_words_value);

@@ -59,8 +59,8 @@ extern "C" __global__ void routed_route_gemv(SEISMIC_KERNEL_PARAMS) {
     __shared__ float parts[SEISMIC_CONST_DECODE_ROWS][route::WARPS];
     __shared__ float inverses[SEISMIC_CONST_DECODE_ROWS];
     __shared__ unsigned last;
-    route::route_block(ROUTE_INPUT, ROUTE_COLUMNS, ROUTE_SELECTION, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
-        SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
+    route::route_block(ROUTE_INPUT, route::FormRows{}, ROUTE_COLUMNS, ROUTE_SELECTION,
+        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
         reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS)),
         reinterpret_cast<unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ARRIVALS)), blockIdx.x, parts, inverses,
         &last, seismic_words_value);
