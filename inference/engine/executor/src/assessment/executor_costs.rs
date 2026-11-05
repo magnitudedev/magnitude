@@ -1100,8 +1100,9 @@ impl ProgramSet {
     /// the cache holds loaded, not compiled. They form on a thread of their
     /// own, the walk's early reads first, while the walk goes on:
     /// a point waits only for its own kernels, and a compile is host work
-    /// while most points are timed on the device ([`Programs::settled`]),
-    /// no point waiting past `deadline`, nor any program beginning to form
+    /// while most points are timed on the device; a point that touches the
+    /// host holds the formation between programs ([`Programs::quiet`]), no
+    /// point waiting past `deadline`, nor any program beginning to form
     /// past it: no point could read it.
     fn form(&self, device: &Device, deadline: std::time::Instant) -> Formed {
         let host = matches!(
@@ -1124,7 +1125,7 @@ impl ProgramSet {
             affine: Pending::new(),
             copy: Pending::new(),
             moves: Pending::new(),
-            finished: Pending::new(),
+            formation: Arc::default(),
         };
         let (set, device, forming) = (self.clone(), device.clone(), programs.clone());
         let thread = std::thread::Builder::new()
@@ -1167,31 +1168,43 @@ impl ProgramSet {
                 jobs.extend(decodes.chain(matrices));
                 let formed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     seismic::Workers::of_the_host().each(&jobs, |job| match *job {
-                        _ if std::time::Instant::now() >= deadline => {}
-                        Job::Expand(index, rows) => {
-                            let (_, decode, matrix) = &forming.expands[index];
-                            let formed = set.expands[index]
-                                .2
-                                .form(&device, Some(rows.count(set.sizes)));
-                            match rows {
-                                Rows::Decode => decode.set(formed),
-                                Rows::Matrix => matrix.set(formed),
-                            }
+                        _ if !forming.formation.begin(deadline) => {}
+                        job => {
+                            forming.form(&set, &device, job);
+                            forming.formation.end();
                         }
-                        Job::Copy => forming.copy.set(set.copy.form(&device, None)),
-                        Job::Dense => forming.dense.set(set.dense.form(&device, None)),
-                        Job::Affine => forming.affine.set(set.affine.form(&device, None)),
-                        Job::Output => forming.output.set(set.output.form(&device, Some(1))),
-                        Job::Moves => forming.moves.set(set.moves.form(&device, None)),
                     })
                 }));
                 match formed {
-                    Ok(_) => forming.end(),
+                    Ok(_) => {}
                     Err(_) => forming.abandon(),
                 }
             })
             .expect("the host starts the formation thread");
         Formed { programs, thread: Some(thread) }
+    }
+}
+
+impl Programs {
+    /// Form `job`'s program of `set` on `device` and set it.
+    fn form(&self, set: &ProgramSet, device: &Device, job: Job) {
+        match job {
+            Job::Expand(index, rows) => {
+                let (_, decode, matrix) = &self.expands[index];
+                let formed = set.expands[index]
+                    .2
+                    .form(device, Some(rows.count(set.sizes)));
+                match rows {
+                    Rows::Decode => decode.set(formed),
+                    Rows::Matrix => matrix.set(formed),
+                }
+            }
+            Job::Copy => self.copy.set(set.copy.form(device, None)),
+            Job::Dense => self.dense.set(set.dense.form(device, None)),
+            Job::Affine => self.affine.set(set.affine.form(device, None)),
+            Job::Output => self.output.set(set.output.form(device, Some(1))),
+            Job::Moves => self.moves.set(set.moves.form(device, None)),
+        }
     }
 }
 
@@ -1250,10 +1263,9 @@ struct Programs {
     affine: Forming<attention_decode_k8v4::Entry>,
     copy: Forming<conditioning_overlay::Entry>,
     moves: Forming<routed_move::Entry>,
-    /// Set as the formation thread ends, every program it forms formed
-    /// ([`Self::end`]): what a point that touches the host waits for, so no
-    /// compile shares the host it is timed on ([`Self::settled`]).
-    finished: Arc<Pending<()>>,
+    /// The compiles running and the points that touch the host holding the
+    /// formation between its programs ([`Self::quiet`]).
+    formation: Arc<Compiles>,
     /// When the job's [`MEASUREMENT_SECONDS`] end: a point waits for its
     /// kernels no longer.
     deadline: std::time::Instant,
@@ -1321,6 +1333,97 @@ impl<T> Pending<T> {
     }
 }
 
+/// The formation's compiles and the holds that keep it between programs
+/// ([`Programs::quiet`]).
+#[derive(Default)]
+struct Compiles {
+    state: std::sync::Mutex<CompilesState>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct CompilesState {
+    compiling: usize,
+    held: usize,
+    /// The thread forming panicked.
+    abandoned: bool,
+}
+
+impl Compiles {
+    fn state(&self) -> std::sync::MutexGuard<'_, CompilesState> {
+        self.state.lock().expect("formation lock poisoned")
+    }
+
+    /// Wait on `held` until `done` or `deadline`; whether `done` before
+    /// `deadline`.
+    fn wait_until<'s>(
+        &self,
+        mut held: std::sync::MutexGuard<'s, CompilesState>,
+        deadline: std::time::Instant,
+        done: impl Fn(&CompilesState) -> bool,
+    ) -> (std::sync::MutexGuard<'s, CompilesState>, bool) {
+        loop {
+            if held.abandoned {
+                panic!("the formation thread panicked");
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return (held, false);
+            }
+            if done(&held) {
+                return (held, true);
+            }
+            held = self.changed.wait_timeout(held, left).expect("formation lock poisoned").0;
+        }
+    }
+
+    /// A program begins to form once nothing holds the formation; false
+    /// where `deadline` passes first: no point could read it.
+    fn begin(&self, deadline: std::time::Instant) -> bool {
+        let (mut state, begun) = self.wait_until(self.state(), deadline, |state| state.held == 0);
+        if begun {
+            state.compiling += 1;
+        }
+        begun
+    }
+
+    /// A program [`Self::begin`] began has formed.
+    fn end(&self) {
+        self.state().compiling -= 1;
+        self.changed.notify_all();
+    }
+
+    /// Hold the formation once no compile runs, or none by `deadline`.
+    fn hold(self: &Arc<Self>, deadline: std::time::Instant) -> Option<Quiet> {
+        let mut state = self.state();
+        state.held += 1;
+        let (mut state, quiet) = self.wait_until(state, deadline, |state| state.compiling == 0);
+        if !quiet {
+            state.held -= 1;
+            drop(state);
+            self.changed.notify_all();
+            return None;
+        }
+        Some(Quiet(self.clone()))
+    }
+
+    fn abandon(&self) {
+        self.state().abandoned = true;
+        self.changed.notify_all();
+    }
+}
+
+/// A hold on the formation between its programs ([`Programs::quiet`]),
+/// released as it drops.
+struct Quiet(Arc<Compiles>);
+
+impl Drop for Quiet {
+    fn drop(&mut self) {
+        self.0.state().held -= 1;
+        self.0.changed.notify_all();
+    }
+}
+
 impl Programs {
     /// `format`'s program formed for `rows`.
     fn expand(
@@ -1341,15 +1444,12 @@ impl Programs {
 
     /// A formed kernel for a point, or why it was not: it failed to form
     /// ([`Unformed::Never`]), or the job's deadline passed first
-    /// ([`Unformed::Expired`]). A point on the host's CPU waits for every
-    /// program, so no compile shares the cores it is timed on.
+    /// ([`Unformed::Expired`]). A point that touches the host, or any on the
+    /// host's CPU, is then timed with no compile beside it ([`Self::quiet`]).
     fn kernel<'p, E: Entry>(
         &'p self,
         forming: &'p Forming<E>,
     ) -> Result<&'p NativeKernel<E>, Unformed<ExecutorCostsError>> {
-        if self.host {
-            self.settled()?;
-        }
         forming
             .wait(self.deadline)
             .ok_or(Unformed::Expired)?
@@ -1357,17 +1457,16 @@ impl Programs {
             .map_err(|error| Unformed::Never(error.clone()))
     }
 
-    /// The formation thread ended, or the job's deadline passed first: no
-    /// compile runs beside a point that touches the host.
-    fn settled(&self) -> Result<(), Unformed<ExecutorCostsError>> {
-        self.finished.wait(self.deadline).map(drop).ok_or(Unformed::Expired)
-    }
-
-    /// The formation thread ended: the formation is finished, every
-    /// program it skipped past the deadline expiring for its waiters
-    /// (`Pending::wait`).
-    fn end(&self) {
-        self.finished.set(());
+    /// Hold the formation between its programs for a point that touches
+    /// the host (`host`), or any on the host's own device: once no compile
+    /// runs, none starts until the hold is dropped, so the point is timed
+    /// with none beside it; the job's deadline passing first expires it.
+    /// No hold for any other point.
+    fn quiet(&self, host: bool) -> Result<Option<Quiet>, Unformed<ExecutorCostsError>> {
+        if !(host || self.host) {
+            return Ok(None);
+        }
+        self.formation.hold(self.deadline).map(Some).ok_or(Unformed::Expired)
     }
 
     /// Every program not formed yet is never formed: the formation thread
@@ -1382,7 +1481,7 @@ impl Programs {
         self.affine.abandon();
         self.copy.abandon();
         self.moves.abandon();
-        self.finished.abandon();
+        self.formation.abandon();
     }
 }
 
@@ -1433,6 +1532,10 @@ trait Times {
 #[derive(Clone, Copy, Debug)]
 struct Share {
     forecast: Option<Forecast>,
+    /// Whether the point is timed on the host's clock or reads host
+    /// memory, so a compile running beside it would be timed too: it is
+    /// timed only while no program forms ([`Programs::quiet`]).
+    host: bool,
 }
 
 /// What reading a point is forecast to take: the seconds of one pass of its
@@ -1445,14 +1548,17 @@ struct Forecast {
 
 impl Share {
     /// No forecast.
-    const UNFORECAST: Self = Self { forecast: None };
+    const UNFORECAST: Self = Self { forecast: None, host: false };
 
     /// This share where a pass of its point's calls is forecast to take
     /// `pass` seconds and its making to lay out `bytes`.
     fn forecast(self, pass: f64, bytes: u64) -> Self {
-        Self {
-            forecast: Some(Forecast { pass, bytes }),
-        }
+        Self { forecast: Some(Forecast { pass, bytes }), ..self }
+    }
+
+    /// This share of a point that touches the host ([`Self::host`]).
+    fn on_host(self) -> Self {
+        Self { host: true, ..self }
     }
 }
 
@@ -1651,13 +1757,16 @@ impl Times for Measured<'_, '_> {
         let formed = &self.programs;
         let backings = &mut self.backings;
         let host = &mut *self.attempting;
+        // A point that touches the host, or any on the host's own device, is
+        // timed while no program forms beside it: held once its own kernels
+        // are formed, as it is made, until it is timed.
+        let mut quiet = None;
         let mut outcomes = self.measurer.measure_all(
             vec![(key, || {
-                build(
-                    device,
-                    &formed.get_or_init(|| programs.form(device, deadline)).programs,
-                    backings,
-                )
+                let formed = &formed.get_or_init(|| programs.form(device, deadline)).programs;
+                let point = build(device, formed, backings)?;
+                quiet = formed.quiet(share.host)?;
+                Ok(point)
             })],
             &how,
             seismic::measure::Deadline::new(Some(deadline)),
@@ -1667,6 +1776,7 @@ impl Times for Measured<'_, '_> {
                 host(key)
             },
         );
+        drop(quiet);
         let (key, outcome) = outcomes.pop().expect("one point is measured");
         let result = timed(&outcome);
         (self.visit)(key, told(outcome));
@@ -3208,9 +3318,8 @@ fn calls<'f, E: Entry, C: 'f>(
     }
 }
 
-/// One timing of the launch graph. A host timing is made only once every
-/// program is formed ([`Programs::settled`]), so no compile shares the host
-/// with it.
+/// One timing of the launch graph. A host timing is made with no program
+/// forming beside it ([`Programs::quiet`]).
 fn launch_graph_point<T: Times>(
     times: &mut T,
     programs: &ProgramSet,
@@ -3224,13 +3333,14 @@ fn launch_graph_point<T: Times>(
         &[("timing", timing_ordinal(timing))],
     );
     let mut build = |device: &Device, formed: &Programs, _: &mut Backings| {
-        if timing != GraphTiming::Device {
-            formed.settled()?;
-        }
         let copy = formed.kernel(&formed.copy)?;
         launch_graph(device, copy)
             .and_then(|graph| graph.point(timing))
             .map_err(Unformed::Now)
+    };
+    let share = match timing {
+        GraphTiming::Device => share,
+        GraphTiming::Waited | GraphTiming::Queued => share.on_host(),
     };
     times.time(point, programs, &mut build, share)
 }
@@ -4049,19 +4159,17 @@ fn weight_rate<T: Times>(
         ),
         programs,
         &mut calls::<dense_expand::Entry, _>(
-            move |formed: &Programs| {
-                // Host memory is timed with no compile sharing the host.
-                if route.storage != OperandStorage::Device {
-                    formed.settled()?;
-                }
-                formed.expand(format, Rows::Decode)
-            },
+            move |formed: &Programs| formed.expand(format, Rows::Decode),
             move |device, backings| {
                 ExpandCase::new(device, backings, format, route, 1, features, sets)
             },
             ExpandCase::args,
         ),
-        share,
+        // Host memory is timed with no compile sharing the host.
+        match route.storage {
+            OperandStorage::Device => share,
+            _ => share.on_host(),
+        },
     )?;
     Ok(WeightRate {
         bytes_per_second: MeasuredCost::rate(bytes as f64, &timing),
@@ -4353,27 +4461,43 @@ impl<'a, 'd> Walks<'a, 'd> {
 
     /// Time the device point `build` makes under `key`, as the job times a
     /// walk's: its record loaded, or attempted and measured for its part of
-    /// the time left, and stored.
-    pub(super) fn time<F>(&mut self, key: PointKey, build: F)
+    /// the time left, and stored. A point that touches the host (`host`:
+    /// it reads host memory) is timed with no program of the walks forming
+    /// beside it ([`Programs::quiet`]).
+    pub(super) fn time<F>(&mut self, key: PointKey, host: bool, build: F)
     where
         F: FnOnce() -> Result<Point, Unformed<ExecutorCostsError>>,
     {
         let how = self.measured.within();
         self.measured.left = self.measured.left.saturating_sub(1);
         let measured = &mut self.measured;
+        let programs = &measured.programs;
+        let mut quiet = None;
         let mut outcomes = measured.measurer.measure_all(
-            vec![(key, build)],
+            vec![(key, || {
+                let point = build()?;
+                quiet = Self::quiet(programs, host)?;
+                Ok(point)
+            })],
             &how,
             seismic::measure::Deadline::new(Some(measured.deadline)),
             measured.records.store,
             &mut *measured.attempting,
         );
+        drop(quiet);
         let (key, outcome) = outcomes.pop().expect("one point is measured");
         (measured.visit)(key, told(outcome));
     }
 
+    /// A hold on the walks' formation, where one is forming, for a point
+    /// ([`Programs::quiet`]).
+    fn quiet(programs: &std::cell::OnceCell<Formed>, host: bool) -> Result<Option<Quiet>, Unformed<ExecutorCostsError>> {
+        programs.get().map_or(Ok(None), |formed| formed.programs.quiet(host))
+    }
+
     /// Time the host point `build` makes under `key` (work on the host's
-    /// CPUs, which holds no clock), as [`Self::time`] times a device's.
+    /// CPUs, which holds no clock), as [`Self::time`] times a device's,
+    /// with no program of the walks forming beside it.
     pub(super) fn time_host<W, F>(&mut self, key: PointKey, build: F)
     where
         W: seismic::measure::Work<Error = String, Clock = ()>,
@@ -4382,15 +4506,21 @@ impl<'a, 'd> Walks<'a, 'd> {
         let how = self.measured.within();
         self.measured.left = self.measured.left.saturating_sub(1);
         let measured = &mut self.measured;
+        let programs = &measured.programs;
+        let mut quiet = None;
         let mut clocks = seismic::measure::HeldClocks::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
         let mut outcomes = seismic::measure::measure_all(
-            vec![(key, build)],
+            vec![(key, || {
+                quiet = Self::quiet(programs, true)?;
+                build()
+            })],
             &how,
             seismic::measure::Deadline::new(Some(measured.deadline)),
             &mut clocks,
             measured.records.store,
             &mut *measured.attempting,
         );
+        drop(quiet);
         let (key, outcome) = outcomes.pop().expect("one point is measured");
         (measured.visit)(key, told(outcome));
     }
@@ -4512,11 +4642,12 @@ impl ExecutorCosts {
 mod tests {
     use super::*;
 
-    /// A formation that ends settles at once: a point that touches the host
-    /// waits for the formation to end, and a program it skipped past the
-    /// deadline expires for its waiter rather than failing.
+    /// A point that touches the host holds the formation between its
+    /// programs: none begins while it is held, and the hold waits for the
+    /// one forming; a hold or a program past the deadline is refused, and a
+    /// program skipped expires for its waiter rather than failing.
     #[test]
-    fn a_formation_settles_once_it_ends() {
+    fn a_hold_keeps_the_formation_between_programs() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
         let programs = Programs {
             expands: vec![(Element::bf16(), Pending::new(), Pending::new())],
@@ -4525,12 +4656,23 @@ mod tests {
             affine: Pending::new(),
             copy: Pending::new(),
             moves: Pending::new(),
-            finished: Pending::new(),
+            formation: Arc::default(),
             deadline,
             host: false,
         };
-        programs.end();
-        assert!(programs.settled().is_ok(), "a finished formation settles");
+        assert!(programs.formation.begin(deadline), "nothing holds the formation");
+        let held = std::thread::scope(|scope| {
+            let hold = scope.spawn(|| programs.quiet(true).is_ok());
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(!hold.is_finished(), "a hold waits for the program forming");
+            programs.formation.end();
+            hold.join().unwrap()
+        });
+        assert!(held, "the program formed, the hold is taken");
+        let quiet = programs.quiet(true).unwrap();
+        assert!(!programs.formation.begin(deadline), "no program begins while held, past the deadline");
+        drop(quiet);
+        assert!(!programs.formation.begin(deadline), "no program begins past the deadline, held or not");
         assert!(matches!(programs.kernel(&programs.moves), Err(Unformed::Expired)), "a skipped program expires");
     }
 

@@ -560,7 +560,7 @@ impl MoveForm {
         for moved in self.points() {
             let key = self.key(&walks.identity(), device.backend(), moved)?;
             let formed = &formed;
-            walks.time(key, move || {
+            walks.time(key, false, move || {
                 let kernels = formed
                     .get_or_init(|| self.moves().try_map(|_, formation| formation.form(device, None)))
                     .as_ref()
@@ -811,7 +811,7 @@ impl ConvertForm {
         for converted in [1, CONVERTED_RECORDS] {
             let key = self.key(&walks.identity(), device.backend(), converted)?;
             let formed = &formed;
-            walks.time(key, move || {
+            walks.time(key, false, move || {
                 let kernels = formed
                     .get_or_init(|| self.converts().try_map(|_, formation| formation.form(device, None)))
                     .as_ref()
@@ -939,7 +939,7 @@ impl TierCopyCosts {
         for blocks in [1, magnitude_kernels::LIST_BLOCKS] {
             let key = Self::key(&walks.identity(), device.backend(), blocks)?;
             let formed = &formed;
-            walks.time(key, move || {
+            walks.time(key, true, move || {
                 let kernel = formed
                     .get_or_init(|| Self::formation().form(device, None))
                     .as_ref()
