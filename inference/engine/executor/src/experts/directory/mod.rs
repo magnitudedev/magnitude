@@ -253,12 +253,14 @@ struct Earning {
 
 /// An expert's rank, least first, which every choice of what the bank
 /// keeps compares: its reuse ([`Reuse::rank`], beside the step that last
-/// read it), then that read (recency, the tie-break), then the (layer,
-/// expert) (never where it lies).
+/// read it), then that read (recency, the tie-break), then its place in
+/// the ranking's order of logging ([`Reuse::order`]), then the (layer,
+/// expert) (which decides only between experts the log never read).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Ranked {
     reuse: Score,
     read: Step,
+    order: u64,
     layer: usize,
     expert: usize,
 }
@@ -703,10 +705,18 @@ impl Directory {
         self.reuse_now().half_life()
     }
 
+    /// The rank of `layer`'s `expert` as of its last read, the log's or the
+    /// running prompt group's.
+    fn ranked_now(&self, layer: usize, expert: usize) -> Ranked {
+        let read = self.reuse_now().last(layer, expert).unwrap_or(0);
+        self.ranked(layer, expert, read)
+    }
+
     /// The rank of `layer`'s `expert`, last read at step `read`.
     fn ranked(&self, layer: usize, expert: usize, read: Step) -> Ranked {
         let read = self.prompt_reads.get(&(layer, expert)).map_or(read, |&pending| read.max(pending));
-        Ranked { reuse: self.reuse(layer, expert, Some(read)), read, layer, expert }
+        let reuse = self.reuse_now();
+        Ranked { reuse: reuse.rank(layer, expert, Some(read)), read, order: reuse.order(layer, expert), layer, expert }
     }
 
     /// Each record of group `group`, the step that last read the expert it
@@ -834,10 +844,7 @@ impl Directory {
         let mut victims = members
             .iter()
             .flat_map(|&layer| self.unwanted[layer].iter().map(move |&expert| (layer, expert)))
-            .map(|(layer, expert)| {
-                let read = Reuse::of(&self.ranking).last(layer, expert).unwrap_or(0);
-                (self.ranked(layer, expert, read), self.bank.held(layer, expert).expect("an unwanted expert is held"))
-            })
+            .map(|(layer, expert)| (self.ranked_now(layer, expert), self.bank.held(layer, expert).expect("an unwanted expert is held")))
             .filter(|&(_, record)| self.bank.usable(group, record, lending))
             .collect::<Vec<_>>();
         if victims.len() > most {
@@ -853,25 +860,26 @@ impl Directory {
     /// first, each against what it would displace, a usable free record
     /// past the reserve nothing, then each of `victims` in the order
     /// releases take them (`Self::victims`), all read over the stay
-    /// (`Reuse::weighed`). What a copy costs and a hit saves are the cost
-    /// function's (`ExpertLines::copy_hits`).
+    /// (`Reuse::weighed`) by the reuse they rank by (`Self::ranked`), so a
+    /// victim ranked below another never weighs more. What a copy costs and
+    /// a hit saves are the cost function's (`ExpertLines::copy_hits`).
     fn earning(&self, group: usize, wanted: Vec<Staged>, victims: &[(Ranked, usize)], lending: &Lending, now: Step) -> Earning {
-        let reuse = Reuse::of(&self.ranking);
-        let stay = self.stay(group, now);
-        let weigh = |layer: usize, expert: usize| reuse.weighed(layer, expert, now, stay);
         // A layer whose hit saves nothing earns no promotion at any read:
         // its wants wait for no read, so none is withheld; its lines'
         // repricing asks them again (`Self::price_copies`).
-        let mut ranked = wanted
+        let wanted = wanted
             .into_iter()
-            .filter_map(|(layer, expert)| self.copy_hits[layer].map(|hits| (weigh(layer, expert) - hits, (layer, expert))))
+            .filter_map(|(layer, expert)| self.copy_hits[layer].map(|hits| (self.ranked_now(layer, expert).reuse, hits, (layer, expert))))
             .collect::<Vec<_>>();
+        let reuse = Reuse::of(&self.ranking);
+        let stay = self.stay(group, now);
+        let mut ranked = wanted.into_iter().map(|(score, hits, staged)| (reuse.weighed(score, stay) - hits, staged)).collect::<Vec<_>>();
         ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
         // The records past the reserve displace nothing; a promotion into
         // the reserve is paid for by the release that refills it.
         let free = self.bank.free(group).filter(|&record| self.bank.usable(group, record, lending)).count();
         let displaced = std::iter::repeat_n(0., free.saturating_sub(self.reserve[group]))
-            .chain(victims.iter().map(|&(Ranked { layer, expert, .. }, _)| weigh(layer, expert)))
+            .chain(victims.iter().map(|&(Ranked { reuse: score, .. }, _)| reuse.weighed(score, stay)))
             .chain(std::iter::repeat(f64::INFINITY));
         let count = ranked.len();
         let earning = ranked
@@ -1361,7 +1369,8 @@ impl Directory {
             .filter_map(|(record, content)| match *content {
                 Record::Held((layer, expert)) => {
                     let read = last_read(layer, expert);
-                    Some(((self.reuse(layer, expert, read), read), layer, expert, record))
+                    let reuse = self.reuse_now();
+                    Some(((reuse.rank(layer, expert, read), read, reuse.order(layer, expert)), layer, expert, record))
                 }
                 Record::Free => None,
                 Record::Filling(..) => unreachable!("between flights no fill is pending"),

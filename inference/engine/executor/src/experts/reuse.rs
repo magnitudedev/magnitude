@@ -16,15 +16,33 @@
 //! `h · log2 Σ 2^(t/h)`, which ranks without being rescaled. At a half-life
 //! of zero it is the last read: recency, the measure's degenerate case.
 //!
+//! Where the reads leave experts tied, their order is the one the reads
+//! gave them before ([`Rank`]): each read hands its experts the next places
+//! in one order of logging, among themselves as they ranked before it. No
+//! choice of the bank's reads the experts' indices (the host tier's still
+//! tie by them), so a prompt group's union read of
+//! every expert once leaves a layer's decode share above the experts only
+//! the group read, at recency as at every half-life. A read's experts enter
+//! the stack and the pool least ranked first ([`Measure::entering`]), so the
+//! most ranked end on top, and stay where a share or a pool cannot take
+//! them all.
+//!
+//! The same score prices a promotion ([`Reuse::weighed`]): the reads it
+//! expects over the bank's stay are its intensity at the live candidate's
+//! half-life, decaying at that half-life through the stay, so what earns a
+//! copy and what the ranking holds are judged by one value, and a want is
+//! never weighed against a victim by a measure other than the one that
+//! chose both. A short half-life vouches for few steps: a just-read expert
+//! is worth the reads the measure counts, never its latest rate held over
+//! a whole stay.
+//!
 //! Each half-life of [`HALF_LIVES`] keeps its scores and, per layer, its
 //! priority stack (Mattson's): a read moves its expert to the top, and each
 //! expert it passes over settles below the more reused of those above it,
 //! so a layer's share of `s` records under the ranking holds the stack's top
-//! `s`, and one pass gives the misses at every size. (It is each miss
-//! promoted into its least reused record, as long as one read's experts do
-//! not pass each other: at long half-lives on recorded routes the stack
-//! misses slightly fewer, and the bank holds the stack's top.) Since the scores of experts not read
-//! keep their order, the stack property holds.
+//! `s`, and one pass gives the misses at every size: each miss, as the
+//! read's experts enter, promoted into its least reused record. Since the
+//! scores of experts not read keep their order, the stack property holds.
 //!
 //! Each half-life also keeps, per bank group, the group's records as one
 //! pool: every miss of a member layer promoted into the group's least
@@ -83,6 +101,22 @@ impl Score {
         }
         Self(high + half_life * (1. + ((low - high) / half_life).exp2()).log2())
     }
+
+    /// The reads the score at half-life `half_life` expects over the
+    /// `stay` steps from step `latest`: its count decayed to `latest`,
+    /// `n = 2^((s − latest)/h)`, is a read intensity of `n · (1 − 2^(−1/h))`
+    /// a step that goes on decaying at the half-life, which over the stay
+    /// sums to `n · (1 − 2^(−stay/h))`. Never more than the reads the
+    /// score counts, nor than the intensity held over the whole stay. At a
+    /// half-life of zero (the limit) a read at `latest` expects one read,
+    /// an earlier one none.
+    fn expected(self, latest: Step, half_life: f64, stay: f64) -> f64 {
+        let since = Self::at(latest).0 - self.0;
+        if half_life == 0. {
+            return if since <= 0. { 1. } else { 0. };
+        }
+        (-since / half_life).exp2() * (1. - (-stay / half_life).exp2())
+    }
 }
 
 // A score is never NaN: each is a step, a sum of steps, or none's negative
@@ -101,29 +135,32 @@ impl Ord for Score {
     }
 }
 
-/// One expert's logged reads: their score, the step of the last, and the
-/// choices that read routed to it.
+/// One expert's logged reads: their score, the step of the last, the
+/// choices that read routed to it, and its place in the order of logging
+/// (0 for none).
 #[derive(Clone, Copy, Debug)]
 struct Logged {
     score: Score,
     last: Option<Step>,
     routed: u32,
+    order: u64,
 }
 
 impl Logged {
-    const NONE: Self = Self { score: Score::NEVER, last: None, routed: 0 };
+    const NONE: Self = Self { score: Score::NEVER, last: None, routed: 0, order: 0 };
 }
 
-/// An expert's rank, least first: its score, its last read, then the
-/// choices that read routed to it (of a prompt group's union, how much of
-/// the prompt used it), and only then the expert, between experts no read
-/// tells apart (a total order).
-type Rank = (Score, Option<Step>, u32, usize);
+/// An expert's rank, least first: its score, its last read, the choices
+/// that read routed to it (of a prompt group's union, how much of the
+/// prompt used it), then its place in the order of logging, which no two
+/// experts read share: a total order over the experts read, which ranks
+/// experts the reads tie as the reads before ranked them.
+type Rank = (Score, Option<Step>, u32, u64);
 
 /// A held expert's place in its group's pool, least reused first: its
-/// score, last read and choices ([`Rank`]), then (layer, expert), which
-/// makes each place its own.
-type Pooled = (Score, Option<Step>, u32, usize, usize);
+/// [`Rank`] (its own, as every expert held was read), then the (layer,
+/// expert) it holds.
+type Pooled = (Score, Option<Step>, u32, u64, usize, usize);
 
 /// One bank group's records as a pool at one half-life: the experts it
 /// holds, by their rank, and how many it holds at most.
@@ -139,6 +176,8 @@ struct Pool {
 struct Measure {
     half_life: f64,
     layers: Vec<Vec<Logged>>,
+    /// The places in the order of logging handed out ([`Logged::order`]).
+    logged: u64,
     stacks: Vec<Vec<usize>>,
     misses: u64,
     /// Each layer's group.
@@ -153,6 +192,7 @@ impl Measure {
         Self {
             half_life,
             layers: experts.iter().map(|&experts| vec![Logged::NONE; experts]).collect(),
+            logged: 0,
             stacks: experts.iter().map(|&experts| Vec::with_capacity(experts)).collect(),
             misses: 0,
             groups: groups.to_vec(),
@@ -164,8 +204,8 @@ impl Measure {
 
     /// `layer`'s `expert`'s place in its group's pool.
     fn pooled_rank(&self, layer: usize, expert: usize) -> Pooled {
-        let (score, last, routed, _) = self.rank(layer, expert);
-        (score, last, routed, layer, expert)
+        let (score, last, routed, order) = self.rank(layer, expert);
+        (score, last, routed, order, layer, expert)
     }
 
     /// Group `group`'s pool holds `records` records from now: its least
@@ -189,20 +229,31 @@ impl Measure {
     /// `layer`'s `expert`'s rank ([`Rank`]).
     fn rank(&self, layer: usize, expert: usize) -> Rank {
         let logged = self.layers[layer][expert];
-        (logged.score, logged.last, logged.routed, expert)
+        (logged.score, logged.last, logged.routed, logged.order)
+    }
+
+    /// `layer`'s `experts` in the order a read of them enters the stack and
+    /// the pool, and takes its places in the order of logging: least ranked
+    /// first. Experts nothing read before tie on every key; they keep the
+    /// read's order, the only one there is.
+    fn entering(&self, layer: usize, experts: &[usize]) -> Vec<usize> {
+        let mut entering = experts.to_vec();
+        entering.sort_by_key(|&expert| self.rank(layer, expert));
+        entering
     }
 
     /// Log `read`: each expert's depth before any of them moves, counted a
     /// miss where at least `slots` deep, and whether its group's pool holds
-    /// it, counted a pool miss where not; then its scores, then each expert
-    /// to its stack's top, and each the pool lacked into the pool's least
-    /// reused record (the read's own experts among them, as the stack
+    /// it, counted a pool miss where not; then its places in the order of
+    /// logging, as its experts ranked before it, and its scores; then each
+    /// expert to its stack's top, and each the pool lacked into the pool's
+    /// least reused record (the read's own experts among them, as the stack
     /// ranks). `routed` is each expert's choices in the read. The read's
-    /// experts move to the top, and into the pool, in its order, its least
-    /// chosen first: the most chosen of a prompt group's union end above
-    /// the rest, as their ranks order them ([`Rank`]) where their scores
-    /// tie; a read choosing each expert alike moves them in its order. The
-    /// depths, and the layers whose experts left the pool.
+    /// experts move to the top, and into the pool, as they enter
+    /// ([`Self::entering`], by their ranks after it): the most chosen of a
+    /// prompt group's union end above the rest where their scores tie, and
+    /// experts it leaves tied keep the order the reads before it gave them.
+    /// The depths, and the layers whose experts left the pool.
     fn read(&mut self, read: &RoutedRead, routed: &[u32], slots: usize) -> (Vec<usize>, BTreeSet<usize>) {
         assert_eq!(routed.len(), read.experts.len(), "each expert read has its choices");
         let layer = read.layer;
@@ -216,6 +267,10 @@ impl Measure {
             let place = self.pooled_rank(layer, expert);
             self.pools[group].held.remove(&place);
         }
+        for expert in self.entering(layer, &read.experts) {
+            self.logged += 1;
+            self.layers[layer][expert].order = self.logged;
+        }
         let now = Score::at(read.sequence);
         for (&expert, &choices) in read.experts.iter().zip(routed) {
             let logged = &mut self.layers[layer][expert];
@@ -227,15 +282,12 @@ impl Measure {
             let place = self.pooled_rank(layer, expert);
             self.pools[group].held.insert(place);
         }
-        let mut ascending = read.experts.clone();
-        ascending.sort_by_key(|&expert| self.layers[layer][expert].routed);
-        for &expert in &ascending {
+        let entering = self.entering(layer, &read.experts);
+        for &expert in &entering {
             self.promote(layer, expert);
         }
         let mut left = BTreeSet::new();
-        let mut lacked = lacked;
-        lacked.sort_by_key(|&expert| self.layers[layer][expert].routed);
-        for &expert in &lacked {
+        for expert in entering.into_iter().filter(|expert| lacked.contains(expert)) {
             let pool = &mut self.pools[group];
             if pool.held.len() >= pool.records {
                 let Some((.., of, victim)) = pool.held.pop_first() else {
@@ -299,8 +351,9 @@ pub struct Reuse {
     /// The (layer, expert)s whose membership of their layer's top changed
     /// since they were last taken ([`Self::take_changes`]).
     changed: BTreeSet<(usize, usize)>,
-    /// The reads logged ([`Self::reads`]).
+    /// The reads logged ([`Self::reads`]), and the latest step among them.
     reads: u64,
+    latest: Option<Step>,
 }
 
 /// The one ranking, shared by its feed (`Stack`, which reads it in the
@@ -330,6 +383,7 @@ impl Reuse {
             tops: experts.iter().map(|&experts| vec![false; experts]).collect(),
             changed: BTreeSet::new(),
             reads: 0,
+            latest: None,
         }
     }
 
@@ -367,6 +421,7 @@ impl Reuse {
     /// read (its layer's experts where never read).
     pub fn read(&mut self, read: &RoutedRead, routed: &[u32]) -> Vec<usize> {
         self.reads += 1;
+        self.latest = self.latest.max(Some(read.sequence));
         let slots = self.slots[read.layer];
         let at = self.live % HALF_LIVES.len();
         let mut reads = self.measures.iter_mut().map(|measure| measure.read(read, routed, slots)).collect::<Vec<_>>();
@@ -452,26 +507,30 @@ impl Reuse {
         self.measure().depth(layer, expert)
     }
 
+    /// `layer`'s `expert`'s place in the ranking's order of logging, 0 for
+    /// none: which of experts the reads tie ranks above
+    /// ([`Rank`]).
+    pub fn order(&self, layer: usize, expert: usize) -> u64 {
+        self.measure().layers[layer][expert].order
+    }
+
     /// The step that last read `layer`'s `expert`, if one has.
     pub fn last(&self, layer: usize, expert: usize) -> Option<Step> {
         self.measure().layers[layer][expert].last
     }
 
-    /// `layer`'s `expert`'s reads as they weigh at step `now` over a stay
-    /// in the bank of `stay` steps, whichever half-life ranks: its count
-    /// decayed at the measured half-life nearest the stay, what it is
-    /// expected to be read over it. A stay not yet measured (no promotion
-    /// has left one) is longer than any: the longest half-life.
-    pub fn weighed(&self, layer: usize, expert: usize, now: Step, stay: Option<f64>) -> f64 {
-        // A half-life of zero counts only the last read: no count to decay.
-        let nearest = |stay: f64| {
-            let distance = |half_life: f64| (half_life / stay.max(1.)).log2().abs();
-            (1..HALF_LIVES.len()).min_by(|&a, &b| distance(HALF_LIVES[a]).total_cmp(&distance(HALF_LIVES[b]))).expect("measured half-lives")
+    /// The reads an expert of score `score` ([`Self::rank`]) is expected to
+    /// have over a stay in the bank of `stay` steps, as the half-life the
+    /// ranking ranks by expects them from the latest step logged
+    /// ([`Score::expected`]). One value, the ranking's, so it orders experts
+    /// as their ranks do. A stay not yet measured (no promotion has left
+    /// one) is the longest half-life; before any read nothing is expected.
+    pub fn weighed(&self, score: Score, stay: Option<f64>) -> f64 {
+        let Some(latest) = self.latest else {
+            return 0.;
         };
-        let at = stay.map_or(HALF_LIVES.len() - 1, nearest);
-        let half_life = HALF_LIVES[at];
-        let score = self.measures[at].layers[layer][expert].score;
-        ((score.0 - Score::at(now).0) / half_life).exp2()
+        let stay = stay.unwrap_or(HALF_LIVES[HALF_LIVES.len() - 1]);
+        score.expected(latest, self.measure().half_life, stay)
     }
 
     /// `layer`'s `expert`'s score, beside a read at step `read` the log may
@@ -515,24 +574,59 @@ pub(super) mod tests {
         }
     }
 
-    /// A recorded decode's routing (`fixtures/reuse`)
-    /// misses at each read, by what the live candidate holds before it,
-    /// exactly what the offline replay of every half-life's per-layer shares
-    /// and one pool of every layer's, adopting the least missed, misses:
-    /// read for read.
+    /// Promote each of `layer`'s `experts` a read of `measure` lacked, as
+    /// they enter ([`Measure::entering`]), into `held`'s least ranked
+    /// record of `records` (by `rank`): a share that takes every miss.
+    fn take_misses(measure: &Measure, layer: usize, experts: &[usize], held: &mut Vec<usize>, records: usize, rank: impl Fn(usize) -> Rank) {
+        for expert in measure.entering(layer, experts) {
+            if held.contains(&expert) {
+                continue;
+            }
+            if held.len() < records {
+                held.push(expert);
+                continue;
+            }
+            let victim = (0..held.len()).min_by_key(|&at| rank(held[at])).expect("a share of records");
+            held[victim] = expert;
+        }
+    }
+
+    /// A recorded decode's routing (`fixtures/reuse`) misses at each read,
+    /// by what the live candidate holds before it, exactly what the offline
+    /// replay misses: every half-life's per-layer shares, each a cache
+    /// taking every miss into its least ranked record, and its one pool of
+    /// every layer's (a cache already), the least missed so far (the first
+    /// on a tie) holding: read for read.
     fn replays_as_offline(fixture: &[u8]) {
         let word = |at: usize| u16::from_le_bytes([fixture[2 * at], fixture[2 * at + 1]]) as usize;
         let (layers, experts, width, steps, slots) = (word(0), word(1), word(2), word(3), word(4));
-        let (routes, misses) = fixture[10..].split_at(layers * steps * width);
-        assert_eq!(misses.len(), layers * steps, "a miss count a read");
+        let routes = &fixture[10..];
+        assert_eq!(routes.len(), layers * steps * width, "a route a read");
         let mut reuse = Reuse::new(&vec![experts; layers], &vec![0; layers], vec![slots; layers]);
+        let mut scored = HALF_LIVES.map(|half_life| Measure::new(half_life, &vec![experts; layers], &vec![0; layers], &[slots * layers]));
+        let mut shares = vec![vec![Vec::<usize>::new(); layers]; HALF_LIVES.len()];
+        let mut missed = [0u64; HALF_LIVES.len()];
         for (position, route) in routes.chunks(width).enumerate() {
             let mut chosen = route.iter().map(|&expert| expert as usize).collect::<Vec<_>>();
             chosen.sort_unstable();
             let layer = position % layers;
-            let missed = chosen.iter().filter(|&&expert| !reuse.in_top(layer, expert)).count();
-            assert_eq!(missed, misses[position] as usize, "read {position} (step {}, layer {layer})", position / layers);
-            let read = RoutedRead { sequence: (position / layers) as Step, layer, experts: chosen, choices: width as u64 };
+            let lacked = |held: &dyn Fn(usize) -> bool| chosen.iter().filter(|&&expert| !held(expert)).count();
+            let candidate = |candidate: usize| match candidate < HALF_LIVES.len() {
+                true => missed[candidate],
+                false => scored[candidate - HALF_LIVES.len()].pooled_misses,
+            };
+            let live = (0..2 * HALF_LIVES.len()).min_by_key(|&at| candidate(at)).expect("candidates");
+            let offline = match live < HALF_LIVES.len() {
+                true => lacked(&|expert| shares[live][layer].contains(&expert)),
+                false => lacked(&|expert| scored[live - HALF_LIVES.len()].pooled[layer][expert]),
+            };
+            assert_eq!(lacked(&|expert| reuse.in_top(layer, expert)), offline, "read {position} (step {}, layer {layer})", position / layers);
+            let read = RoutedRead { sequence: (position / layers) as Step, layer, experts: chosen.clone(), choices: width as u64 };
+            for (at, measure) in scored.iter_mut().enumerate() {
+                missed[at] += lacked(&|expert| shares[at][layer].contains(&expert)) as u64;
+                measure.read(&read, &once(&read), 0);
+                take_misses(measure, layer, &read.experts, &mut shares[at][layer], slots, |expert| measure.rank(layer, expert));
+            }
             reuse.read(&read, &once(&read));
         }
     }
@@ -560,18 +654,47 @@ pub(super) mod tests {
         assert_eq!(reuse.last(0, 1), Some(5));
     }
 
-    /// An expert's reads weigh over a stay at the measured half-life
-    /// nearest it, the longest before a stay is measured: one read at step
-    /// 6 weighs 2^(−4/4) at step 10 over a stay of 3 (half-life 4), and
-    /// 2^(−4/256) with no stay measured.
+    /// A score expects the reads its intensity gives as it decays over the
+    /// stay: for an expert read every step, one over a stay of one step and
+    /// `1 + 2^(−1/h) + …` over longer ones, all it counts (`1/(1 − 2^(−1/h))`)
+    /// over a stay far past the half-life; `2^(−4/4) · (1 − 2^(−4/4))` over
+    /// a stay of 4, four steps after one read at half-life 4; and at
+    /// recency one read for an expert read at the latest step, none for
+    /// one read before it, whatever the stay.
     #[test]
-    fn reads_weigh_over_the_stay_at_its_nearest_half_life() {
+    fn a_score_expects_its_decaying_reads_over_the_stay() {
+        let close = |got: f64, want: f64| assert!((got - want).abs() < 1e-9, "{got} against {want}");
+        for half_life in [1., 4., 32.] {
+            let mut measure = Measure::new(half_life, &[2], &[0], &[2]);
+            for step in 1..=2000 {
+                measure.read(&read(step, &[0]), &[1], 2);
+            }
+            let score = measure.rank(0, 0).0;
+            close(score.expected(2000, half_life, 1.), 1.);
+            close(score.expected(2000, half_life, 3.), (0..3).map(|k| (-k as f64 / half_life).exp2()).sum());
+            close(score.expected(2000, half_life, 1e6), 1. / (1. - (-1. / half_life).exp2()));
+        }
+        close(Score::at(6).expected(10, 4., 4.), 0.25);
+        close(Score::at(10).expected(10, 0., 100.), 1.);
+        close(Score::at(9).expected(10, 0., 100.), 0.);
+        close(Score::NEVER.expected(10, 4., 4.), 0.);
+    }
+
+    /// An expert's reads weigh over a stay what the live half-life expects
+    /// of them from the latest read, the longest half-life before a stay
+    /// is measured: at recency, an expert read at the latest step weighs
+    /// one read over any stay, one read before it nothing.
+    #[test]
+    fn reads_weigh_what_the_live_half_life_expects_over_the_stay() {
         let mut reuse = Reuse::new(&[3], &[0], vec![2]);
+        assert_eq!(reuse.weighed(Score::at(6), Some(3.)), 0., "nothing read, nothing expected");
         log(&mut reuse, read(6, &[0]));
-        let close = |got: f64, want: f64| assert!((got - want).abs() < 1e-12, "{got} against {want}");
-        close(reuse.weighed(0, 0, 10, Some(3.)), 0.5);
-        close(reuse.weighed(0, 0, 10, None), (-4f64 / 256.).exp2());
-        close(reuse.weighed(0, 1, 10, Some(3.)), 0.);
+        log(&mut reuse, read(7, &[1]));
+        assert_eq!(reuse.half_life(), 0.);
+        assert_eq!(reuse.weighed(reuse.rank(0, 1, None), Some(3.)), 1.);
+        assert_eq!(reuse.weighed(reuse.rank(0, 1, None), None), 1.);
+        assert_eq!(reuse.weighed(reuse.rank(0, 0, None), Some(3.)), 0.);
+        assert_eq!(reuse.weighed(reuse.rank(0, 2, None), Some(3.)), 0.);
     }
 
     /// Over a half-life an expert read often outranks one read once more
@@ -611,25 +734,15 @@ pub(super) mod tests {
             let mut stacked = Measure::new(half_life, &[16], &[0], &[0]);
             let depths = reads.iter().map(|read| stacked.read(read, &once(read), 0).0).collect::<Vec<_>>();
             for share in [3, 5, 8, 13] {
-                // Each size replayed alone: every miss, in the read's order,
-                // promoted into the least reused record.
+                // Each size replayed alone: every miss, as the read's
+                // experts enter, promoted into the least reused record.
                 let mut scored = Measure::new(half_life, &[16], &[0], &[0]);
                 let mut held = Vec::<usize>::new();
                 let mut missed = 0;
                 for read in &reads {
                     missed += read.experts.iter().filter(|expert| !held.contains(expert)).count();
                     scored.read(read, &once(read), share);
-                    for &expert in &read.experts {
-                        if held.contains(&expert) {
-                            continue;
-                        }
-                        if held.len() < share {
-                            held.push(expert);
-                            continue;
-                        }
-                        let victim = (0..held.len()).min_by_key(|&place| scored.rank(0, held[place])).expect("a share");
-                        held[victim] = expert;
-                    }
+                    take_misses(&scored, 0, &read.experts, &mut held, share, |expert| scored.rank(0, expert));
                 }
                 let counted = depths.iter().flatten().filter(|&&depth| depth >= share).count();
                 assert_eq!(counted, missed, "half-life {half_life}, {share} records");
@@ -668,7 +781,8 @@ pub(super) mod tests {
 
     /// A share of 2 records, an expert read every third step and a fresh
     /// one each step: recency evicts the hot expert for the fresh ones, a
-    /// half-life keeps it, so the reads move the ranking off recency.
+    /// half-life keeps it, so the reads move the ranking off recency. A
+    /// step reading both enters them as they rank, the hot one on top.
     #[test]
     fn the_half_life_ranked_by_is_the_one_that_missed_least() {
         let mut reuse = Reuse::new(&[128], &[0], vec![2]);
@@ -678,6 +792,6 @@ pub(super) mod tests {
         assert!(reuse.half_life() > 0., "a half-life kept the hot expert");
         let (recency, live) = (&reuse.measures[0], &reuse.measures[reuse.live % HALF_LIVES.len()]);
         assert!(live.misses < recency.misses, "{} of {}", live.misses, recency.misses);
-        assert_eq!(reuse.depth(0, 0), 1, "the hot expert below the step's fresh one");
+        assert_eq!(reuse.depth(0, 0), 0, "the hot expert above the step's fresh one");
     }
 }
