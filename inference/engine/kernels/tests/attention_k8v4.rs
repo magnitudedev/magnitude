@@ -468,6 +468,11 @@ fn k8v4_devices() -> Vec<Device> {
     seismic_native_tests::devices(&[Metal, Cuda, Vulkan, Cpu])
 }
 
+/// The Metal device, where one is present: the Metal-only tests' device.
+fn metal_device() -> Option<Device> {
+    k8v4_devices().into_iter().find(|device| device.backend() == BackendName::Metal)
+}
+
 /// Whether Vulkan's vector decode form (SIMDS, SLICES, KEYWISE) is within the
 /// declaration's `where`: the per-key walk needs four subgroups, and the
 /// walk's shared bytes (the keywise walk's staging tiles among them) fit.
@@ -1078,10 +1083,7 @@ fn metal_coissue_prefill_agrees_with_the_default() {
 /// exhausted that reserve at 1024 rows before any device submission.
 #[test]
 fn metal_direct_prefill_retains_state_at_1024_rows() {
-    let Some(device) = k8v4_devices()
-        .into_iter()
-        .find(|device| device.backend() == BackendName::Metal)
-    else {
+    let Some(device) = metal_device() else {
         return;
     };
     for geometry in [GEMMA26_SLIDING, GEMMA26_FULL] {
@@ -1149,10 +1151,7 @@ fn metal_direct_prefill_retains_state_at_1024_rows() {
 /// four pairs (QT 16, HEADS 2) need 33,328 bytes there, so it takes two.
 #[test]
 fn metal_coissue_prefill_admits_only_launches_that_fit_every_segment_class() {
-    let Some(device) = k8v4_devices()
-        .into_iter()
-        .find(|device| device.backend() == BackendName::Metal)
-    else {
+    let Some(device) = metal_device() else {
         return;
     };
     for geometry in [MINICPM5, QWEN, GEMMA_E4B_FULL] {
@@ -1305,10 +1304,7 @@ fn metal_form_agrees_with_the_default(
     cases: &[(usize, i32, usize, Option<usize>)],
     configs: fn(Geometry) -> Vec<Vec<(&'static str, u64)>>,
 ) {
-    let Some(device) = k8v4_devices()
-        .into_iter()
-        .find(|device| device.backend() == BackendName::Metal)
-    else {
+    let Some(device) = metal_device() else {
         return;
     };
     for (geometry, rows, history, total, slab_rows) in geometries.iter().flat_map(|&geometry| {
@@ -1398,10 +1394,7 @@ fn metal_form_agrees_with_the_default(
 /// from a call's dimensions alone.
 #[test]
 fn metal_coissue_prefill_admits_the_span_classes_its_threadgroup_holds() {
-    let Some(device) = k8v4_devices()
-        .into_iter()
-        .find(|device| device.backend() == BackendName::Metal)
-    else {
+    let Some(device) = metal_device() else {
         return;
     };
     let kernel = prefill_kernel(
@@ -1523,10 +1516,7 @@ fn scattered_history(geometry: Geometry) -> (Encoded, Encoded, usize) {
 /// partitions).
 #[test]
 fn metal_prefill_reads_scattered_history_tiles() {
-    let Some(device) = k8v4_devices()
-        .into_iter()
-        .find(|device| device.backend() == BackendName::Metal)
-    else {
+    let Some(device) = metal_device() else {
         return;
     };
     for geometry in [MINICPM5, QWEN] {
@@ -1615,10 +1605,7 @@ fn metal_prefill_reads_scattered_history_tiles() {
 /// between rows, match the host model like every configuration.
 #[test]
 fn metal_direct_prefill_resumes_across_rounds() {
-    let Some(device) = k8v4_devices()
-        .into_iter()
-        .find(|device| device.backend() == BackendName::Metal)
-    else {
+    let Some(device) = metal_device() else {
         return;
     };
     let geometry = QWEN;
@@ -2528,10 +2515,7 @@ const MINICPM5: Geometry = Geometry {
 
 #[test]
 fn metal_packed_four_minicpm5_matches_host_model() {
-    let Some(device) = k8v4_devices()
-        .into_iter()
-        .find(|device| device.backend() == BackendName::Metal)
-    else {
+    let Some(device) = metal_device() else {
         return;
     };
     let geometry = MINICPM5;
@@ -2572,10 +2556,7 @@ fn metal_packed_four_minicpm5_matches_host_model() {
 
 #[test]
 fn metal_packed_four_qwen35b_matches_host_model() {
-    let Some(device) = k8v4_devices()
-        .into_iter()
-        .find(|device| device.backend() == BackendName::Metal)
-    else {
+    let Some(device) = metal_device() else {
         return;
     };
     let geometry = QWEN35B;
@@ -2623,10 +2604,7 @@ fn metal_packed_four_qwen35b_matches_host_model() {
 
 #[test]
 fn metal_qwen35b_single_row_matrix_slices_match_host_model() {
-    let Some(device) = k8v4_devices()
-        .into_iter()
-        .find(|device| device.backend() == BackendName::Metal)
-    else {
+    let Some(device) = metal_device() else {
         return;
     };
     let geometry = QWEN35B;
@@ -2664,10 +2642,7 @@ fn metal_qwen35b_single_row_matrix_slices_match_host_model() {
 
 #[test]
 fn metal_packed_four_qwen35b_long_context_matches_host_model() {
-    let Some(device) = k8v4_devices()
-        .into_iter()
-        .find(|device| device.backend() == BackendName::Metal)
-    else {
+    let Some(device) = metal_device() else {
         return;
     };
     let geometry = QWEN35B;
@@ -2783,10 +2758,9 @@ const GEMMA_E4B_FULL: Geometry = Geometry {
 /// reproduce or explain the historical Gemma output corruption.
 #[test]
 fn gemma_head_geometry_matches_synthetic_reference() {
-    let device = seismic::Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Metal)
-        .unwrap();
+    let Some(device) = metal_device() else {
+        return;
+    };
     let geometry = Geometry {
         kv: 2,
         g: 8,
@@ -2830,10 +2804,9 @@ fn gemma_head_geometry_matches_synthetic_reference() {
 #[test]
 #[ignore = "manual reference-preparation diagnostic: currently takes minutes in initialization-region construction"]
 fn gemma_g8_tuning_uses_portable_reference() {
-    let device = seismic::Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Metal)
-        .unwrap();
+    let Some(device) = metal_device() else {
+        return;
+    };
     let geometry = Geometry {
         kv: 2,
         g: 8,
@@ -2903,10 +2876,9 @@ fn gemma_g8_tuning_uses_portable_reference() {
 #[test]
 #[ignore = "manual diagnostic: the historical Metal configuration is numerically defective without shader instrumentation"]
 fn gemma_form_decode_configurations_agree() {
-    let device = seismic::Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Metal)
-        .unwrap();
+    let Some(device) = metal_device() else {
+        return;
+    };
     let geometry = Geometry {
         kv: 2,
         g: 8,
@@ -3022,10 +2994,9 @@ fn gemma_tuner_rejects_corrupted_fresh_only_attention() {
 }
 
 fn gemma_fresh_only_with_scale(scale: f64) {
-    let device = seismic::Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Metal)
-        .unwrap();
+    let Some(device) = metal_device() else {
+        return;
+    };
     let geometry = Geometry {
         kv: 2,
         g: 8,
@@ -3296,10 +3267,7 @@ fn ordered_append_matches_fused_codec() {
 /// bits (1.0 became 0.0078125), hidden by comparison to the native default.
 #[test]
 fn metal_gemma_fresh_scalar_preserves_bf16_values() {
-    let Some(device) = k8v4_devices()
-        .into_iter()
-        .find(|device| device.backend() == BackendName::Metal)
-    else {
+    let Some(device) = metal_device() else {
         return;
     };
     let geometry = Geometry {
