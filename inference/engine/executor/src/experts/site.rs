@@ -755,6 +755,13 @@ struct Cell {
     layer: usize,
     /// The latest step taken from the slot (by the noticing worker alone).
     taken: AtomicU64,
+    /// The latest step taken whose request is out of the cell, as its
+    /// answer is written: the cell takes the slot's next request only once
+    /// this is `taken`. The device requests a slot again only after its answer,
+    /// but a wait that ended on its pulse (`exchange::Pulse`) let its step
+    /// run on, and a later step may request the slot while the pool still
+    /// serves the earlier one; that request waits here for the cell.
+    answered: AtomicU64,
     /// The issue its request is and its stages finished ([`progress`]; all
     /// of them: answered or being answered), as a sequence lock over `units`
     /// and `work`: zero while they are rewritten.
@@ -791,6 +798,7 @@ impl Cell {
         Self {
             layer,
             taken: AtomicU64::new(0),
+            answered: AtomicU64::new(0),
             progress: AtomicU64::new(0),
             units: std::array::from_fn(|_| AtomicUsize::new(0)),
             step: AtomicU64::new(0),
@@ -1431,8 +1439,10 @@ impl Site {
             let work = layer.work(slot, step, self.workers);
             if work.experts.is_empty() {
                 layer.clear(slot);
+                self.cells[cell].answered.store(step, Ordering::Release);
                 self.answer(layer, step, false);
             } else if self.closed.load(Ordering::Acquire) {
+                self.cells[cell].answered.store(step, Ordering::Release);
                 self.fail(index, step, work.rows_named(), "the executor stopped serving".into());
             } else {
                 self.issue(cell, work);
@@ -1448,13 +1458,18 @@ impl Site {
     }
 
     /// The step slot `slot` of site layer `index` (cell `cell`) requests,
-    /// where it is newer than its last taken and the host's to read
+    /// where it is newer than its last taken, the cell has answered that
+    /// one ([`Cell::answered`]), and it is the host's to read
     /// (`SiteGate::published`).
     fn requested(&self, cell: usize, index: usize, slot: usize) -> Option<u64> {
         let layer = &self.layers[index];
         let step = layer.sequence(slot);
-        (step > self.cells[cell].taken.load(Ordering::Relaxed) && self.gate.get().is_none_or(|gate| gate.published(layer.layer, step)))
-            .then_some(step)
+        let cell = &self.cells[cell];
+        let taken = cell.taken.load(Ordering::Relaxed);
+        (step > taken
+            && cell.answered.load(Ordering::Acquire) == taken
+            && self.gate.get().is_none_or(|gate| gate.published(layer.layer, step)))
+        .then_some(step)
     }
 
     /// Issue `work` into cell `index`, whose last request was answered (its
@@ -1470,9 +1485,10 @@ impl Site {
             units.store(count, Ordering::Relaxed);
         }
         cell.step.store(work.step, Ordering::Relaxed);
-        // SAFETY: the cell's last request was answered (its publisher took
-        // it out), so no worker holds a unit of it, and none reads the
-        // request before it claims a unit of this issue, published below.
+        // SAFETY: the cell's last request was answered (`Cell::answered`,
+        // which taking this one waited for: its publisher took it out), so
+        // no worker holds a unit of it, and none reads the request before it
+        // claims a unit of this issue, published below.
         unsafe { *cell.work.get() = Some(work) };
         cell.progress.store(progress(issue, 0), Ordering::Release);
         self.mark(cell, ISSUED);
@@ -1574,6 +1590,9 @@ impl Site {
         // Nothing of the request is read once it is answered: the device may
         // then request the slot again, which rewrites the cell.
         let failed = why.is_some();
+        // Out of the cell, the request frees it for the slot's next, which
+        // the device makes only after the answer below.
+        cell.answered.store(work.step, Ordering::Release);
         match why {
             None => self.answer(layer, work.step, false),
             Some(why) => self.fail(cell.layer, work.step, work.rows_named(), why),
