@@ -77,11 +77,18 @@ enum ProcessState {
         /// unretired ([`DeviceHold::unretired`]).
         device: DeviceHold,
     },
+    /// Its one retirer ([`EngineWorker::retire`]) holds the process and its device while it
+    /// stops it, outside this state's lock, so nothing that reads or ends the worker waits on a
+    /// reap. The retirer sends the kill: a terminate meanwhile has none to send.
+    Retiring { pid: u32 },
     Retired(ExitStatus),
 }
 
 /// The worker's process state stands from its spawn until its drop takes it.
 const STANDS: &str = "a worker's process state stands until its drop";
+
+/// A worker is retired by the one owner of its [`SpawnedWorker`], which holds it until then.
+const ONE_RETIRER: &str = "a worker has one retirer, which holds it while it retires it";
 
 /// The bounded tail of a worker's standard error.
 #[derive(Default)]
@@ -192,19 +199,39 @@ impl EngineWorker {
         }
     }
 
+    /// Stop the worker and return once it is reaped, the process lock held only to take the
+    /// process and to put back what became of it: a reap that hangs in the driver's teardown
+    /// blocks this retirer alone. An error puts the exact owner back, its device marked
+    /// unretired. Only proof of retirement replaces it.
     fn retire(&self) -> std::io::Result<ExitStatus> {
+        let (pid, mut process, device) = {
+            let mut state = self.process.lock().expect("worker process lock");
+            let state = state.as_mut().expect(STANDS);
+            let pid = match &*state {
+                ProcessState::Retired(status) => return Ok(*status),
+                ProcessState::Retiring { .. } => unreachable!("{ONE_RETIRER}"),
+                ProcessState::Owned { process, .. } => process_id(process),
+            };
+            let ProcessState::Owned { process, device } = std::mem::replace(state, ProcessState::Retiring { pid }) else {
+                unreachable!("the state was read as owned under the same lock")
+            };
+            (pid, process, device)
+        };
+        let stopped = stop(&mut process);
         let mut state = self.process.lock().expect("worker process lock");
         let state = state.as_mut().expect(STANDS);
-        match &mut *state {
-            ProcessState::Retired(status) => Ok(*status),
-            ProcessState::Owned { process, device } => {
-                // An error leaves the exact owner in place, its device marked unretired. Only proof
-                // of retirement replaces it.
-                let pid = process_id(process);
-                let status = stop(process).inspect_err(|_| device.unretired())?;
+        match stopped {
+            Ok(status) => {
                 log_exit(pid, status);
                 *state = ProcessState::Retired(status);
+                // The device is released once the retirement is shown.
+                drop(device);
                 Ok(status)
+            }
+            Err(error) => {
+                device.unretired();
+                *state = ProcessState::Owned { process, device };
+                Err(error)
             }
         }
     }
@@ -331,6 +358,7 @@ impl ResidencyWorker for EngineWorker {
     fn pid(&self) -> Option<u32> {
         match self.process.lock().expect("worker process lock").as_ref().expect(STANDS) {
             ProcessState::Owned { process, .. } => Some(process_id(process)),
+            ProcessState::Retiring { pid } => Some(*pid),
             ProcessState::Retired(_) => None,
         }
     }
@@ -340,6 +368,7 @@ impl ResidencyWorker for EngineWorker {
         let state = state.as_mut().expect(STANDS);
         match &mut *state {
             ProcessState::Retired(status) => Ok(Some(*status)),
+            ProcessState::Retiring { .. } => Ok(None),
             ProcessState::Owned { process, .. } => {
                 let pid = process_id(process);
                 let status = observe_exit(process)?;
@@ -357,7 +386,7 @@ impl ResidencyWorker for EngineWorker {
         let mut state = self.process.lock().expect("worker process lock");
         let state = state.as_mut().expect(STANDS);
         match &mut *state {
-            ProcessState::Retired(_) => Ok(()),
+            ProcessState::Retired(_) | ProcessState::Retiring { .. } => Ok(()),
             ProcessState::Owned { process, .. } => {
                 let pid = process_id(process);
                 match observe_exit(process)? {
@@ -394,8 +423,10 @@ impl Drop for EngineWorker {
     fn drop(&mut self) {
         // The dropped worker's state is read no more: what it held moves to its reaper.
         let state = self.process.get_mut().expect("worker process lock").take().expect(STANDS);
-        let ProcessState::Owned { mut process, device } = state else {
-            return;
+        let (mut process, device) = match state {
+            ProcessState::Owned { process, device } => (process, device),
+            ProcessState::Retired(_) => return,
+            ProcessState::Retiring { .. } => unreachable!("{ONE_RETIRER}"),
         };
         let pid = process_id(&process);
         std::thread::Builder::new()
