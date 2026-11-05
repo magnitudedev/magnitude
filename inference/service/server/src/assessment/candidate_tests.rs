@@ -852,8 +852,11 @@ fn repository(seed: char, files: Vec<StubFile>, base_models: &[&str]) -> StubRep
 fn hub() -> StubHub {
     let q8 = llama(7, Encoding::Q8_0);
     let q4 = llama(15, Encoding::Q4K);
-    let mut q2 = llama(10, Encoding::Q8_0);
-    q2.encode_all(Encoding::Q8_0, Encoding::Q2K);
+    // Weights the engine has no import for. Q8_1 is no file type, so its version is labelled by
+    // its name.
+    let mut q8_1 = llama(7, Encoding::Q8_0);
+    q8_1.encode_all(Encoding::Q8_0, Encoding::Q8_1);
+    q8_1.metadata.retain(|(key, _)| key != "general.file_type");
     let mut deepseek = llama(7, Encoding::Q8_0);
     deepseek.set("general.architecture", Meta::Str("deepseek4".into()));
     let mut repositories = BTreeMap::new();
@@ -880,7 +883,7 @@ fn hub() -> StubHub {
             vec![
                 StubFile::new("llama-Q8_0.gguf", &q8),
                 StubFile::new("llama-Q4_K_M.gguf", &q4),
-                StubFile::new("llama-Q2_K.gguf", &q2),
+                StubFile::new("llama-Q8_1.gguf", &q8_1),
                 StubFile::new("llama-MTP-Q8_0.gguf", &q8),
                 StubFile::new("dflash-draft.gguf", &dflash(HIDDEN)),
                 StubFile::new("dflash-narrow.gguf", &dflash(HIDDEN / 2)),
@@ -1364,13 +1367,13 @@ async fn inspection_groups_versions_and_preserves_presentation_and_engine_verdic
         Some(ModelAssessment::Fits { .. })
     ));
     let Some(ModelAssessment::Unsupported { reasons, .. }) =
-        &version(&inspection, "llama-Q2_K.gguf").assessment
+        &version(&inspection, "llama-Q8_1.gguf").assessment
     else {
-        panic!("Q2_K weights are unsupported");
+        panic!("Q8_1 weights are unsupported");
     };
     assert!(matches!(
         reasons.as_slice(),
-        [UnsupportedReason::Known(KnownUnsupportedReason::WeightTypes { types })] if types[0].ggml_type == "Q2_K"
+        [UnsupportedReason::Known(KnownUnsupportedReason::WeightTypes { types })] if types[0].ggml_type == "Q8_1"
     ));
     let recommended = inspection
         .versions
