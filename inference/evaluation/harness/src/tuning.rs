@@ -27,6 +27,60 @@ pub fn measurement(trace: &Path, budget_seconds: f64, fresh: bool) -> Result<Val
         .map_err(|error| format!("tuning trace {}: {error}", trace.display()))
 }
 
+/// The units of `trace` whose default configuration spills, one line
+/// each: a launch whose formed program the backend's compiler reports
+/// spilling. CUDA reports a thread's local memory ("local bytes", spills
+/// and stack); NVIDIA's Vulkan driver reports no usable spill size ("Local
+/// Memory Size" is a 2^36 sentinel), so a program at its 255-register
+/// ceiling ("Register Count") is taken to spill. A unit's defaults are
+/// recorded whether or not they were measured (`default_launches`; none
+/// for a launch not formed). A trace in which no unit's defaults carry
+/// statistics is an error, not a pass: nothing was checked.
+pub fn default_spills(trace: &Path) -> Result<Vec<String>, String> {
+    let text = std::fs::read_to_string(trace)
+        .map_err(|error| format!("tuning trace {}: {error}", trace.display()))?;
+    let mut spills = Vec::new();
+    let mut reported = 0;
+    for (index, line) in text.lines().enumerate() {
+        let event: Value = serde_json::from_str(line)
+            .map_err(|error| format!("tuning trace line {}: {error}", index + 1))?;
+        if event["event"] != "finished" {
+            continue;
+        }
+        let default = &event["served"][0];
+        // Each launch's formed program, in ordinal order: none where the
+        // launch was not formed.
+        let formed = event["default_launches"].as_array().into_iter().flatten().enumerate().filter(|(_, launch)| !launch.is_null()).collect::<Vec<_>>();
+        if formed.iter().any(|(_, launch)| launch["statistics"].as_array().is_some_and(|statistics| !statistics.is_empty())) {
+            reported += 1;
+        }
+        for (launch, program) in formed {
+            let value = |name: &str| {
+                program["statistics"].as_array().into_iter().flatten().find(|statistic| statistic["name"] == name).and_then(
+                    |statistic| statistic["value"].as_object()?.values().next()?.as_u64(),
+                )
+            };
+            let reason = match (value("local bytes"), value("Register Count")) {
+                (Some(bytes), _) if bytes > 0 => Some(format!("{bytes} local bytes per thread")),
+                (_, Some(registers)) if registers >= 255 => Some(format!("{registers} registers, the ceiling")),
+                _ => None,
+            };
+            if let Some(reason) = reason {
+                spills.push(format!(
+                    "{} [{}] {} launch {launch}: {reason}",
+                    event["entry"].as_str().unwrap_or("?"),
+                    event["bindings"].as_str().unwrap_or("?"),
+                    default["params"],
+                ));
+            }
+        }
+    }
+    if reported == 0 {
+        return Err("no unit's defaults carry compiler statistics: the device reports none, so nothing was checked".into());
+    }
+    Ok(spills)
+}
+
 fn measurement_of(text: &str, budget_seconds: f64, fresh: bool) -> Result<Value, String> {
     let mut loads: Vec<Value> = Vec::new();
     for (index, line) in text.lines().enumerate() {

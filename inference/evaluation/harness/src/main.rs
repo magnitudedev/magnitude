@@ -246,6 +246,10 @@ enum Command {
         /// Context length the load would serve: the tuning points' histories.
         #[arg(long)]
         context: usize,
+        /// Fail when a unit's default configuration spills on this device,
+        /// listing each spilling launch.
+        #[arg(long)]
+        check_default_spills: bool,
     },
     /// The catalog drafter's proposals at anchors in the scored spans.
     Draft {
@@ -605,6 +609,7 @@ fn run(command: Command) -> Result<(), String> {
             run,
             engine,
             context,
+            check_default_spills,
         } => {
             let inputs = Inputs::read(&run, "harness.prepare")?;
             let rendered = inputs.render(Some(context))?;
@@ -625,7 +630,14 @@ fn run(command: Command) -> Result<(), String> {
             )?;
             development.finish()?;
             let (measurements, traces) = tuned(&engine, &options)?;
-            inputs.finish(digest, None, measurements, traces)
+            inputs.finish(digest, None, measurements, traces)?;
+            if check_default_spills {
+                let spills = tuning::default_spills(&options.tuning_trace)?;
+                if !spills.is_empty() {
+                    return Err(format!("default configurations spill:\n{}", spills.join("\n")));
+                }
+            }
+            Ok(())
         }
         Command::Logits {
             run,
