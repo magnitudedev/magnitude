@@ -152,6 +152,16 @@ pub(super) struct Shared {
     steps: Arc<Steps>,
     telemetry: Telemetry,
     resizing: ResizeHandoff,
+    /// The holds of the load's own traffic standing (`Shared::hold_traffic`,
+    /// each a [`TrafficHold`]): while any stands no promotion or read ahead
+    /// begins.
+    traffic_held: std::sync::atomic::AtomicUsize,
+    /// Whether, as residency last saw, no promotion's copy nor read ahead
+    /// of its runs ([`Shared::traffic_quiet`]).
+    traffic_quiet: std::sync::atomic::AtomicBool,
+    /// Whether a growth's slot is being backed ([`Shared::backing_slot`]):
+    /// traffic of the load's own, as its copies and reads are.
+    backing: std::sync::atomic::AtomicBool,
     /// A running growth's slots, each joined as it is backed.
     joins: Joins,
     life: Life,
@@ -184,7 +194,105 @@ pub(super) struct Shared {
     passes: Mutex<Option<Arc<crate::assessment::ExpertPass>>>,
 }
 
+/// A growth's slot being backed ([`Shared::backing_slot`]), until it drops:
+/// then the load is told, as a hold waits on it.
+pub(in crate::experts) struct BackingSlot<'s>(&'s Shared);
+
+impl Drop for BackingSlot<'_> {
+    fn drop(&mut self) {
+        self.0.backing.store(false, std::sync::atomic::Ordering::Release);
+        self.0.events().notify();
+    }
+}
+
 impl Shared {
+    /// Hold the load's own traffic until the returned hold drops: while any
+    /// hold stands, and while no step runs, no promotion is asked nor any
+    /// read ahead begun, so a measurement beside the idle load reads none
+    /// of its copies, reads or landings once those running end
+    /// ([`Self::traffic_quiet`]). A step beginning ends the hold's effect
+    /// at once: serving never waits on a measurement. Holds are counted, so
+    /// each holder (the measurement job's claim, a tool beside the load)
+    /// releases only its own, by whichever exit. Each change is an event:
+    /// residency looks again.
+    pub fn hold_traffic(self: &Arc<Self>) -> crate::domain::TrafficHold {
+        // Quiet is read again under this hold: no turn before it reads it so.
+        self.traffic_quiet.store(false, std::sync::atomic::Ordering::Release);
+        self.traffic_held.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.events().notify();
+        let shared = self.clone();
+        crate::domain::TrafficHold::new(move || {
+            shared.traffic_held.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            shared.events().notify();
+        })
+    }
+
+    /// Whether the load's traffic is held, no step runs and none of its
+    /// traffic runs: the copies and reads begun before the hold have ended,
+    /// as residency last saw, and no growth's slot is being backed.
+    pub fn traffic_quiet(&self) -> bool {
+        let ordering = std::sync::atomic::Ordering::Acquire;
+        self.traffic_held()
+            && self.traffic_quiet.load(ordering)
+            && !self.backing.load(ordering)
+            && self.steps.idle()
+    }
+
+    /// Wait until the load's traffic, held, is quiet
+    /// ([`Self::traffic_quiet`]): each of its turns quiet, and each slot
+    /// backed, is an event; why serving ended, if it ends first, or that
+    /// the load stops.
+    pub fn wait_traffic_quiet(&self) -> Result<(), String> {
+        let events = self.events();
+        loop {
+            let seen = events.seen();
+            if self.traffic_quiet() {
+                return Ok(());
+            }
+            if let Some(reason) = self.life.ended() {
+                return Err(format!("the load's traffic drain: serving ended: {reason}"));
+            }
+            if self.life.stopping() {
+                return Err("the load's traffic drain: the load stops".into());
+            }
+            events.wait(seen);
+        }
+    }
+
+    /// Begin backing a growth's slot, once the hold allows it: while the
+    /// load's traffic is held and no step runs, the growth waits between
+    /// its slots, until the hold ends, a step begins (serving never waits
+    /// on a measurement) or `stop` ends the growth (a shrink's, or the
+    /// measurement's claim, `ExpertBank::stop_growth`); none where it
+    /// stopped. The slot is marked backing first, so no hold reads it
+    /// quiet while it begins.
+    pub(in crate::experts) fn backing_slot(&self, stop: &std::sync::atomic::AtomicBool) -> Option<BackingSlot<'_>> {
+        let holds = || self.traffic_held() && self.steps.idle();
+        loop {
+            self.backing.store(true, std::sync::atomic::Ordering::Release);
+            let slot = BackingSlot(self);
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                return None;
+            }
+            if !holds() {
+                return Some(slot);
+            }
+            // Unmarked (an event), then waited past what is seen once
+            // unmarked, the hold and `stop` looked at again first: no change
+            // after is missed, and a stop landing before is never waited past.
+            drop(slot);
+            let seen = self.events().seen();
+            if holds() && !stop.load(std::sync::atomic::Ordering::Acquire) {
+                self.events().wait(seen);
+            }
+        }
+    }
+
+    /// Whether any hold of the load's traffic stands ([`Self::hold_traffic`]).
+    pub(super) fn traffic_held(&self) -> bool {
+        self.traffic_held.load(std::sync::atomic::Ordering::Acquire) > 0
+    }
+
     /// Each streamed layer's lines and its pass's price from now on, the
     /// GPU's priced, or none where they are not: the route's policy words
     /// follow at the next gap (`Residency::publish_policy`), this an event.
@@ -523,6 +631,9 @@ impl Watcher {
             steps,
             telemetry,
             resizing: ResizeHandoff::new(),
+            traffic_held: Default::default(),
+            traffic_quiet: Default::default(),
+            backing: Default::default(),
             joins: Joins::new(),
             life: Life::new(),
             compute: compute.handle(),

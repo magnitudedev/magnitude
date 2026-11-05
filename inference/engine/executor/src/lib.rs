@@ -66,7 +66,7 @@ pub use domain::{
     HeadFlight, MeasurementRoom, MemoryChargeReconciliation, MemoryMoment, NativeFamily, OpenRequirements,
     PendingOperationOutcome, PhysicalDecision, PrimingCompletionFlight, ProgramFamily,
     ReservedResources, ResumeState, StateBindings, StoreAllocation, SubmitFailure,
-    TargetContinuation, TargetFlight, TargetHostTiming, VisionFlight, require_normal,
+    TargetContinuation, TargetFlight, TargetHostTiming, TrafficHold, VisionFlight, require_normal,
 };
 pub use error::{
     CapacityError, DeviceError, InvariantError, PlanError, ResourceKind, SubmitError,

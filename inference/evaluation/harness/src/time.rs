@@ -145,7 +145,10 @@ pub fn run(
     let peak = (!streams && !time.untimed).then(|| crate::machine::PeakStream::search(&artifacts.target));
     // A streamed bank's device ceilings, which its bars price moving its
     // experts by, before any step.
-    let ceilings = engine.domain.expert_bank_plan().filter(|_| streams).map(|plan| Ceilings::measure(engine.device(), plan, options.cache_dir.as_deref()));
+    let ceilings = match engine.domain.expert_bank_plan().filter(|_| streams) {
+        Some(plan) => Some(Ceilings::beside(&engine.domain, plan, engine.device(), options.cache_dir.as_deref())?),
+        None => None,
+    };
     let devices = vec![engine.device().info().name().to_owned()];
     let mut speed = Vec::new();
     for (context, rendered) in &by_context {
@@ -378,6 +381,26 @@ struct Ceilings {
 }
 
 impl Ceilings {
+    /// [`Self::measure`] beside the load in `domain`, its own traffic held
+    /// and drained first (`ExecutorDomain::hold_expert_traffic`), as the
+    /// measurement job's room beside a model holds it: no point reads the
+    /// load's copies, reads or landings. Why the drain ended short: serving
+    /// ended, or the load stops (a read or copy that never ends trips the
+    /// load's watchdog, which reports it and ends the process).
+    fn beside(
+        domain: &magnitude_executor::ExecutorDomain,
+        plan: &magnitude_executor::ExpertBankPlan,
+        device: &seismic::Device,
+        cache: Option<&std::path::Path>,
+    ) -> Result<Self, String> {
+        // Held until this returns, by whichever exit.
+        let _traffic = domain.hold_expert_traffic();
+        domain
+            .wait_expert_traffic_quiet()
+            .map(|()| Self::measure(device, plan, cache))
+            .map_err(engine::text)
+    }
+
     fn measure(
         device: &seismic::Device,
         plan: &magnitude_executor::ExpertBankPlan,

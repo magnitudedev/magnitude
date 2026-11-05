@@ -12,6 +12,28 @@ use crate::{
 use magnitude_family_contracts::{Decoder, ModelDefinition};
 use std::rc::Rc;
 
+/// A hold of an expert bank's own traffic (`ElasticBank::hold_traffic`):
+/// it stands while it lives and releases as it drops, by whichever exit,
+/// so a holder that panics leaves no hold behind. Holds are counted: each
+/// holder releases only its own.
+#[must_use = "a hold stands only while it lives"]
+pub struct TrafficHold(Option<Box<dyn FnOnce() + Send>>);
+
+impl TrafficHold {
+    /// A hold `release` ends.
+    pub(crate) fn new(release: impl FnOnce() + Send + 'static) -> Self {
+        Self(Some(Box::new(release)))
+    }
+}
+
+impl Drop for TrafficHold {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            release();
+        }
+    }
+}
+
 /// A load's elastic expert bank: the one owner of the memory its
 /// experts and the stored tables it holds take, each priced by what it saves
 /// a decode step per byte (on `resident`, the load's one-row resident step,
@@ -52,6 +74,20 @@ pub trait ElasticBank {
     fn price(&self, lines: Option<std::sync::Arc<[crate::assessment::ExpertLines]>>, pass: Option<crate::assessment::ExpertPass>);
     /// A tier copy takes `blocks` from now on.
     fn tier_copy_blocks(&self, blocks: u32) -> Result<(), super::DomainError>;
+    /// End its growths (the experts', the host tier's and its backing at
+    /// open) at their next slot: a measurement's claim beside the load
+    /// stops them, as its hold would leave their slots waiting on the
+    /// resize thread, and every shrink the claim asks behind them.
+    fn stop_growths(&self);
+    /// Hold the bank's own traffic (its promotions' copies, its reads
+    /// ahead and their landings) until the returned hold drops: what a
+    /// measurement beside the load holds.
+    fn hold_traffic(&self) -> TrafficHold;
+    /// Whether its traffic is held and none of it still runs.
+    fn traffic_quiet(&self) -> bool;
+    /// Wait until its traffic, held, is quiet; why serving ended, if it
+    /// ends first, or that the load stops.
+    fn wait_traffic_quiet(&self) -> Result<(), super::DomainError>;
     /// Each bank group's convert in a decode barrier takes its `lines` from
     /// now on.
     fn device_convert(&self, lines: &[crate::assessment::RecordLine]);

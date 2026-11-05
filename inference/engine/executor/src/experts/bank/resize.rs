@@ -152,8 +152,10 @@ type RecordsAt = fn(&ExpertBankPlan, usize, u64) -> u64;
 /// `join` forms the slot's join, `post` hands it to the watcher
 /// (`Shared::join`, taken at its next pass), and `slots` holds it. A
 /// refusal ends it at the slots joined before. The installs, where the
-/// tensors' charges rise, hold `rises` ([`ExpertBank::hold_rises`]).
-pub(super) fn grow_by_slots(
+/// tensors' charges rise, hold `rises` ([`ExpertBank::hold_rises`]). Each
+/// slot begins by `begin`, held until it is joined, none where it gives
+/// none (the load's traffic is held, `watcher::Shared::backing_slot`).
+pub(super) fn grow_by_slots<S>(
     mut resizers: Vec<Resizer>,
     (from, to): (u64, u64),
     rows: impl Fn(u64) -> Vec<u64>,
@@ -161,13 +163,16 @@ pub(super) fn grow_by_slots(
     post: impl Fn(Join),
     (slots, rises): (&AtomicU64, &Mutex<()>),
     stop: &AtomicBool,
+    begin: impl Fn() -> Option<S>,
 ) -> Grown {
     let mut joined: Option<(Instant, Instant)> = None;
     let mut spent = Spent::default();
     for at in from + 1..=to {
-        if stop.load(Ordering::Acquire) {
+        // Each slot is backed only as the load's traffic may run
+        // (`watcher::Shared::backing_slot`), until it is joined.
+        let Some(_slot) = begin().filter(|_| !stop.load(Ordering::Acquire)) else {
             break;
-        }
+        };
         spent.slots += 1;
         let (preparing, backed) = (Instant::now(), seismic::backing_times());
         let prepared = prepare(resizers, rows(at));
@@ -593,7 +598,7 @@ impl ExpertBank {
             // The growth ends however its slots end, a panic among them too
             // (re-raised to the thread's catch): no slot joins after.
             let grown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                grow_by_slots(resizers, (from, to), rows, join, |join| shared.join(join), (&slots, &rises), &stopping)
+                grow_by_slots(resizers, (from, to), rows, join, |join| shared.join(join), (&slots, &rises), &stopping, || shared.backing_slot(&stopping))
             }));
             if lands {
                 shared.join(Join::Grown);
@@ -605,7 +610,9 @@ impl ExpertBank {
 
     /// End a running growth at its next slot ([`Growing::stop`]): a shrink
     /// waits for it no longer than that slot's backing. The host tier's
-    /// growth or backing ends only where `host`: host memory needs it.
+    /// growth or backing ends only where `host`: host memory needs it, or
+    /// a measurement's claim beside the load, whose hold would leave its
+    /// slots waiting with the resize thread, and every shrink behind them.
     pub(super) fn stop_growth(&self, host: bool) {
         if let Resize::Growing(growing) = &self.commitment().resize {
             growing.stop.store(true, Ordering::Release);
@@ -615,6 +622,8 @@ impl ExpertBank {
                 growing.stop.store(true, Ordering::Release);
             }
         }
+        // A growth waiting between its slots on a hold looks again.
+        self.watcher.shared().events().notify();
     }
 
     /// Finish a host tier's growth once its resize thread ended it: its

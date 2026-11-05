@@ -476,6 +476,22 @@ impl ElasticBank for ServedBank {
         self.bank.watcher.shared().price(lines, pass);
     }
 
+    fn stop_growths(&self) {
+        self.bank.stop_growth(true);
+    }
+
+    fn hold_traffic(&self) -> crate::domain::TrafficHold {
+        self.bank.watcher.shared().hold_traffic()
+    }
+
+    fn traffic_quiet(&self) -> bool {
+        self.bank.watcher.shared().traffic_quiet()
+    }
+
+    fn wait_traffic_quiet(&self) -> Result<(), DomainError> {
+        self.bank.watcher.shared().wait_traffic_quiet().map_err(DomainError::invariant)
+    }
+
     fn tier_copy_blocks(&self, blocks: u32) -> Result<(), DomainError> {
         self.bank.tier_copy_blocks(blocks).map_err(DomainError::invariant)
     }

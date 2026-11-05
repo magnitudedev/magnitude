@@ -550,6 +550,11 @@ impl Steps {
         (state.running == 0).then(write)
     }
 
+    /// Whether no step runs, as of now.
+    pub(super) fn idle(&self) -> bool {
+        self.lock().running == 0
+    }
+
     /// Whether a running group is scratch-served: its requests may come
     /// whatever its layers hold.
     pub(super) fn scratch_running(&self) -> bool {
@@ -1004,6 +1009,9 @@ impl ExpertStep {
             lent: super::lent::LentRecords::new(),
             filled: std::sync::atomic::AtomicBool::new(false),
             resizing: ResizeHandoff::new(),
+            traffic_held: Default::default(),
+            traffic_quiet: Default::default(),
+            backing: Default::default(),
             joins: super::Joins::new(),
             life: Life::new(),
             // An executor of no thread and no site layer.
@@ -1036,6 +1044,25 @@ mod slot_tests {
         for &label in &labels[1..] { chain.push(label); }
         shared.begin(chain, |_| StepRoute::Decode, || Ok(false))
             .map_err(|(error, _)| error).unwrap().0.into_iter().map(|(_, step)| step).collect()
+    }
+
+    /// The load's traffic is held while any hold stands: each holder
+    /// releases only its own, and one that panics releases its own as it
+    /// unwinds.
+    #[test]
+    fn each_traffic_hold_releases_only_its_own() {
+        let shared = ExpertStep::unbanked(FlightDepth::SERIAL, 2);
+        let (claim, tool) = (shared.hold_traffic(), shared.hold_traffic());
+        drop(claim);
+        assert!(shared.traffic_held(), "a second holder's hold stands");
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _panicking = shared.hold_traffic();
+            panic!("a holder panics");
+        }));
+        assert!(unwound.is_err());
+        assert!(shared.traffic_held(), "the panicking holder released only its own");
+        drop(tool);
+        assert!(!shared.traffic_held(), "every hold released");
     }
 
     /// A request that failed names its rows within the window its layer is

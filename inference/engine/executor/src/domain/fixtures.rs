@@ -652,13 +652,17 @@ pub struct FakeBank {
 
 enum FakeResize {
     Idle(seismic::Resizer),
-    /// With the charge and the slots before the resize.
-    Prepared(seismic::PreparedRecommit, (u64, u64)),
+    /// With the charge and the slots before the resize, and whether it
+    /// grows.
+    Prepared(seismic::PreparedRecommit, (u64, u64), bool),
     Releasing(seismic::RecommitRelease, (u64, u64)),
     /// Released, as the bank's resize thread releases, before an advance
     /// reports it.
     Released(seismic::Resizer, (u64, u64)),
     Refused(seismic::Resizer, seismic::TensorError),
+    /// A growth stopped before its first slot, at these slots, before an
+    /// advance reports it.
+    Stopped(seismic::Resizer, u64),
 }
 
 impl FakeBank {
@@ -718,7 +722,7 @@ impl FakeBank {
         };
         let before = (self.charged(), self.slots());
         *resize = Some(match resizer.prepare(to) {
-            Ok(prepared) => FakeResize::Prepared(prepared, before),
+            Ok(prepared) => FakeResize::Prepared(prepared, before, to > before.1),
             Err(refusal) => FakeResize::Refused(refusal.resizer, refusal.error),
         });
         wake.complete();
@@ -754,6 +758,29 @@ impl ElasticBank for FakeBank {
     #[cfg(test)]
     fn device_landed(&self) -> u64 {
         0
+    }
+
+    /// A growth prepared and not yet installed ends before its first slot,
+    /// as the served bank's does; the host tier's grows at once.
+    fn stop_growths(&self) {
+        let mut resize = self.resize.lock().unwrap();
+        *resize = Some(match resize.take().unwrap() {
+            FakeResize::Prepared(prepared, (_, at), true) => FakeResize::Stopped(prepared.abandon(), at),
+            other => other,
+        });
+    }
+
+    /// A fake bank moves nothing of its own.
+    fn hold_traffic(&self) -> super::TrafficHold {
+        super::TrafficHold::new(|| ())
+    }
+
+    fn traffic_quiet(&self) -> bool {
+        true
+    }
+
+    fn wait_traffic_quiet(&self) -> Result<(), DomainError> {
+        Ok(())
     }
 
     fn tier_copy_blocks(&self, _blocks: u32) -> Result<(), DomainError> {
@@ -886,7 +913,7 @@ impl ElasticBank for FakeBank {
         }
         let mut resize = self.resize.lock().unwrap();
         let (next, finished) = match resize.take().unwrap() {
-            FakeResize::Prepared(prepared, before) => match prepared.install() {
+            FakeResize::Prepared(prepared, before, _) => match prepared.install() {
                 Ok(release) => (FakeResize::Releasing(release, before), None),
                 Err(refused) => (FakeResize::Refused(refused.resizer, refused.error), None),
             },
@@ -928,6 +955,10 @@ impl ElasticBank for FakeBank {
                     },
                 };
                 (FakeResize::Idle(resizer), Some(finished))
+            }
+            FakeResize::Stopped(resizer, at) => {
+                let stopped = BankResized::Stopped { holding: crate::BankHolding::Experts, at };
+                (FakeResize::Idle(resizer), Some(stopped))
             }
             FakeResize::Refused(resizer, refusal) => {
                 let at = self.slots();

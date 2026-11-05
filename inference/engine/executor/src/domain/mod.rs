@@ -58,7 +58,7 @@ fn beyond_inherited(cached: u64, inherited: u64) -> Result<u64, &'static str> {
 pub use family::{
     BankHolding, BankResize, BankResized, BankStep, ElasticBank, ExpertResidency, Growth, GrowthDecided, GrowthOffer, HostResidency,
     NativeFamily,
-    ProgramFamily, ResizeTimes, TableResidency, ShrinkCause, TierFill, Trip,
+    ProgramFamily, ResizeTimes, TableResidency, ShrinkCause, TierFill, TrafficHold, Trip,
 };
 pub use heap::{ClaimRefusal, DeviceHeap, Reclaimed, StatusReading, require_normal};
 pub use in_flight::{
@@ -598,10 +598,9 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// The places a prompt's chunks are worth beyond what memory gave its
     /// group, and the slots the bank shrinks to for them (`grant_group`).
     places_want: Option<state::PlacesWant>,
-    /// The device bytes the service's measurement job claims beside the
-    /// model, which the bank's shrink makes room for
-    /// (`ExecutorDomain::measurement_room`).
-    measurement_claim: Option<u64>,
+    /// The service's measurement job's claim beside the model, which the
+    /// bank's shrink makes room for (`ExecutorDomain::measurement_room`).
+    measurement_claim: Option<state::MeasurementClaim>,
     /// The storage kind of the expert bank's last growth step: the other's
     /// step comes first next (`ExecutorDomain::expert_bank_growths`).
     grown_last: Option<crate::planning::BankTier>,

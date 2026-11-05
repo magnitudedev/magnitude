@@ -654,7 +654,9 @@ impl ConvertForm {
     }
 
     fn key(&self, executor: &seismic::Identity, backend: seismic::BackendName, converted: u64) -> Result<PointKey, ExecutorCostsError> {
-        let mut configuration = named(&[("convert", CONVERTED_RECORDS)]);
+        // Measured with any load beside it holding its own traffic
+        // (`SCHEMA`).
+        let mut configuration = named(&[("convert", CONVERTED_RECORDS), SCHEMA]);
         for (index, (_, tensor)) in self.record.iter().enumerate() {
             configuration.extend(named(&[(&format!("{index}.n"), tensor.matrix[0]), (&format!("{index}.k"), tensor.matrix[1])]));
         }
@@ -840,6 +842,14 @@ pub struct TierCopyCosts {
     pub whole_seconds: f64,
 }
 
+/// The schema of the points a tool may measure in a load's own process,
+/// the tier copy's and the convert's, a term of their keys: 2, each taken
+/// with the load's traffic held and drained
+/// (`ExecutorDomain::hold_expert_traffic`); a record of an earlier schema
+/// may have been taken beside the load's copies and reads, so none is read
+/// and each is measured again.
+const SCHEMA: (&str, u64) = ("schema", 2);
+
 /// The probe a tier copy's blocks are measured over: records of a MiB,
 /// enough of them that a launch's fixed cost (about 10 µs) is under 1% of
 /// the link's time to copy them (2.8 ms at 12 GB/s).
@@ -894,7 +904,7 @@ impl TierCopyCosts {
         Ok(PointKey {
             executor: identity.clone(),
             kernels: vec![Self::formation().identity(backend)?],
-            configuration: named(&[("tier_copy", 1), ("records", records), ("bytes", bytes)]),
+            configuration: named(&[("tier_copy", 1), ("records", records), ("bytes", bytes), SCHEMA]),
             point: named(&[("blocks", u64::from(blocks))]),
         })
     }

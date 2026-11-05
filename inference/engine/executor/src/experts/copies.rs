@@ -123,6 +123,12 @@ impl Copies {
         Ok(Some((formed, self.post(runs))))
     }
 
+    /// Whether no batch is posted and not complete.
+    pub fn idle(&self) -> bool {
+        let state = self.state();
+        state.waiting.is_empty() && state.running.is_empty() && state.issuing.is_none()
+    }
+
     /// The batches posted so far.
     #[cfg(test)]
     pub fn posted(&self) -> u64 {

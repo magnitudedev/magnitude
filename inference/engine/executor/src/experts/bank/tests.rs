@@ -145,13 +145,17 @@ fn a_growth_joins_each_slot_as_every_tensor_backs_it() {
         },
         (&slots, &rises),
         &stop,
+        || Some(()),
     );
     assert_eq!(*posted.lock().unwrap(), [2, 3]);
     assert_eq!(slots.load(Ordering::Acquire), 3);
     assert!(matches!(grown.cut, Cut::None) && grown.joined.is_some() && grown.resizers.len() == 2);
     assert!(tensors.iter().all(|tensor| tensor.committed_rows() == 3));
     // Stopped before its first slot, it joins none: its end says so.
-    let again = grow_by_slots(grown.resizers, (3, 6), |at| vec![at; 2], |_| unreachable!("no slot joins"), |_| {}, (&slots, &rises), &stop);
+    let again = grow_by_slots(grown.resizers, (3, 6), |at| vec![at; 2], |_| unreachable!("no slot joins"), |_| {}, (&slots, &rises), &stop, || Some(()));
     assert!(again.joined.is_none() && matches!(again.cut, Cut::None));
+    // A slot the load's traffic does not let begin ends the growth there.
+    let held = grow_by_slots(again.resizers, (3, 6), |at| vec![at; 2], |_| unreachable!("no slot joins"), |_| {}, (&slots, &rises), &AtomicBool::new(false), || None::<()>);
+    assert!(held.joined.is_none() && matches!(held.cut, Cut::None));
     assert!(tensors.iter().all(|tensor| tensor.committed_rows() == 3));
 }

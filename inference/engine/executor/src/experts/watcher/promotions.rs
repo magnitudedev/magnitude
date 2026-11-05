@@ -156,12 +156,13 @@ impl Promotions {
     /// proportional to what changed), then carry every promotion and release
     /// in flight as far as it goes ([`carry`]), those just asked among
     /// them: no event follows an ask, so what it lets move moves now.
-    /// Whether any moved.
-    pub(super) fn advance(&mut self, core: &mut Core, shared: &Shared, copier: &Copier, decoded: Option<&MissCurve>) -> bool {
+    /// Whether any moved. Where the load's traffic is `held` nothing is
+    /// asked: only what is in flight is carried.
+    pub(super) fn advance(&mut self, core: &mut Core, shared: &Shared, copier: &Copier, decoded: Option<&MissCurve>, held: bool) -> bool {
         if let Some(decoded) = decoded {
             self.size(core, decoded);
         }
-        let asked = self.ask(core, shared);
+        let asked = !held && self.ask(core, shared);
         asked | carry(core, shared, copier)
     }
 

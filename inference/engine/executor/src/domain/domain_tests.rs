@@ -1021,6 +1021,26 @@ fn a_measurement_claim_shrinks_the_bank_and_holds_its_growth() {
     }
 }
 
+/// A measurement's claim ends the bank's running growth at its next slot,
+/// none joined, and no growth is offered while it stands: held, the
+/// growth's slots would wait for the claim's release, and the claim is
+/// decided only once no resize runs. Released, the bank grows again.
+#[test]
+fn a_measurement_claim_stops_the_banks_growth() {
+    for backend in bank_backends() {
+        let (mut domain, _) = banked(backend, 4, 2);
+        price_growth(&mut domain, misses_at(3, 100, 4));
+        assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::Begun);
+        domain.claim_measurement_room(0);
+        assert!(matches!(finish(&mut domain), crate::BankResized::Stopped { at: 2, .. }), "stopped before its first slot");
+        assert!(domain.expert_bank_growths().unwrap().is_empty(), "nothing grows beside the claim");
+        domain.release_measurement_room();
+        assert!(device_pays(&domain), "released, the step pays again");
+        assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::Begun);
+        assert!(matches!(finish(&mut domain), crate::BankResized::Grown { from: 2, to: 4, .. }));
+    }
+}
+
 /// A prompt's places want holds the bank's growth while its prompt has
 /// chunks in hand, and is retired once the request's group holds none (it
 /// decodes): another request's group leaves it, its own decode ends it.

@@ -74,6 +74,9 @@ pub enum MeasurementRoom {
     Beyond { short: u64, releasable: u64 },
     /// No probe has read memory yet.
     Unread,
+    /// The room is made, and the bank's own copies and reads begun before
+    /// the claim are still running: the job would measure beside them.
+    Draining,
 }
 
 /// What the process holds at one moment: Seismic's device charge and the
@@ -1204,26 +1207,63 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// what opportunistic growth may take ([`Self::opportunistic_room`],
     /// [`Self::growth_room`]), so neither the bank's slots nor a group's
     /// places take it, and the
-    /// bank's shrink makes it ([`Self::measurement_room`]).
+    /// bank's shrink makes it ([`Self::measurement_room`]); and the bank's
+    /// own traffic is held (`ElasticBank::hold_traffic`), so the job
+    /// measures beside none of the load's copies or reads. A growth or the
+    /// host tier's backing running ends at its next slot
+    /// (`ElasticBank::stop_growths`), and none is
+    /// offered while the claim stands ([`Self::expert_bank_growths`]): held,
+    /// its slots would wait for the claim's release, which waits for its
+    /// end.
     pub fn claim_measurement_room(&mut self, bytes: u64) {
-        self.measurement_claim = Some(bytes);
+        if let Some(bank) = self.family.expert_bank() {
+            bank.stop_growths();
+        }
+        let traffic = self.hold_expert_traffic();
+        self.measurement_claim = Some(MeasurementClaim { bytes, _traffic: traffic });
     }
 
-    /// The measurement job ended: the bank may grow into its room again.
+    /// Hold the expert bank's own traffic until the returned hold drops
+    /// (`ElasticBank::hold_traffic`): what a measurement beside the load,
+    /// the job's or a tool's in its own process, holds while it runs. None
+    /// without a bank, which has no traffic.
+    pub fn hold_expert_traffic(&self) -> Option<TrafficHold> {
+        self.family.expert_bank().map(|bank| bank.hold_traffic())
+    }
+
+    /// Whether the expert bank's traffic is held and none of it runs; a
+    /// load without a bank has none.
+    pub fn expert_traffic_quiet(&self) -> bool {
+        self.family.expert_bank().is_none_or(|bank| bank.traffic_quiet())
+    }
+
+    /// Wait until the expert bank's traffic, held, is quiet
+    /// (`ElasticBank::wait_traffic_quiet`); at once without a bank.
+    pub fn wait_expert_traffic_quiet(&self) -> Result<(), DomainError> {
+        self.family.expert_bank().map_or(Ok(()), |bank| bank.wait_traffic_quiet())
+    }
+
+    /// The measurement job ended: the bank may grow into its room again,
+    /// and its traffic runs again.
     pub fn release_measurement_room(&mut self) {
+        // Its hold of the bank's traffic drops with it.
         self.measurement_claim = None;
     }
 
     /// Where the measurement job's claim stands at the latest probe: made
     /// once the room beside the workload ([`Self::workload_room`]) holds
     /// it, else short by the rest, within or beyond what the bank holds
-    /// above its floor ([`Self::bank_above_floor`]); none without a claim.
+    /// above its floor ([`Self::bank_above_floor`]), and once made, still
+    /// draining while the bank's traffic begun before the claim runs
+    /// (`ElasticBank::traffic_quiet`); none without a claim.
     pub fn measurement_room(&self) -> Result<Option<MeasurementRoom>, DomainError> {
-        let Some(bytes) = self.measurement_claim else {
+        let Some(bytes) = self.measurement_claim.as_ref().map(|claim| claim.bytes) else {
             return Ok(None);
         };
+        let quiet = self.expert_traffic_quiet();
         Ok(Some(match self.workload_room(seismic::Contract::DeviceOnly).0 {
             None => MeasurementRoom::Unread,
+            Some((room, _)) if room >= bytes && !quiet => MeasurementRoom::Draining,
             Some((room, _)) if room >= bytes => MeasurementRoom::Made,
             Some((room, _)) => match (bytes - room, self.bank_above_floor()?) {
                 (short, releasable) if short <= releasable => MeasurementRoom::Short(short),
@@ -1259,7 +1299,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// device storage's.
     fn measurement_beside(&self, kind: seismic::Contract) -> u64 {
         match self.beside_device(kind) {
-            true => self.measurement_claim.unwrap_or(0),
+            true => self.measurement_claim.as_ref().map_or(0, |claim| claim.bytes),
             false => 0,
         }
     }
@@ -1471,10 +1511,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// nothing grows in device memory, nor while a prompt's places want
     /// device memory from the bank (`PlacesWant`); the host tier grows
     /// regardless, its step always paying; nothing grows in a store the heap
-    /// reads in Reclaim or blind.
+    /// reads in Reclaim or blind, nor at all beside the measurement job's
+    /// claim ([`Self::claim_measurement_room`]).
     pub fn expert_bank_growths(&self) -> Result<Vec<super::GrowthOffer>, DomainError> {
         let resident = self.experts.as_ref().and_then(|measures| measures.resident.measured().map(|resident| &**resident));
-        let Some(bank) = self.family.expert_bank() else {
+        let Some(bank) = self.family.expert_bank().filter(|_| self.measurement_claim.is_none()) else {
             return Ok(Vec::new());
         };
         let held = &self.resize_held.last;
@@ -1711,6 +1752,14 @@ fn growth_failure(error: seismic::TensorError, bytes: u64, growth: &str) -> Doma
     }
 }
 
+/// The measurement job's claim beside the model: the device bytes it
+/// claims, and its hold of the bank's own traffic, which stands while the
+/// claim does and drops with it.
+pub(super) struct MeasurementClaim {
+    pub(super) bytes: u64,
+    pub(super) _traffic: Option<TrafficHold>,
+}
+
 #[cfg(test)]
 mod group_demand_tests {
     use super::*;
@@ -1748,4 +1797,12 @@ mod group_demand_tests {
         let demand = graph_demand(seismic::GraphCost::None, budget, launches(1000)).unwrap();
         assert_eq!(demand, crate::memory::ClaimDemand::default());
     }
+}
+
+/// The measurement job's claim beside the model: the device bytes it
+/// claims, and its hold of the bank's own traffic, which stands while the
+/// claim does and drops with it.
+pub(super) struct MeasurementClaim {
+    pub(super) bytes: u64,
+    pub(super) _traffic: Option<TrafficHold>,
 }

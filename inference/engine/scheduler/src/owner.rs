@@ -791,7 +791,9 @@ impl RoomClaim {
     ) -> Result<Option<Self>, E> {
         let answer = match standing {
             MeasurementRoom::Made => Ok(()),
-            MeasurementRoom::Unread => return Ok(Some(self)),
+            // Unread, or made with the bank's own traffic still running:
+            // the claim waits for the next observation.
+            MeasurementRoom::Unread | MeasurementRoom::Draining => return Ok(Some(self)),
             MeasurementRoom::Beyond { short, releasable } => Err(RoomRefusal::BeyondFloor { short, releasable }),
             MeasurementRoom::Short(short) if refused => Err(RoomRefusal::ShrinkRefused { short }),
             MeasurementRoom::Short(short) => match shrink(short)? {
@@ -4509,6 +4511,11 @@ mod measurement_room_tests {
             .decide::<()>(MeasurementRoom::Unread, false, |_| panic!("an unread room shrinks nothing"))
             .unwrap()
             .expect("an unread room waits");
+        assert_eq!(answer(&mut grant), None);
+        let claim = claim
+            .decide::<()>(MeasurementRoom::Draining, false, |_| panic!("a draining room shrinks nothing"))
+            .unwrap()
+            .expect("a room whose bank's traffic still runs waits");
         assert_eq!(answer(&mut grant), None);
         assert!(claim
             .decide::<()>(MeasurementRoom::Short(4096), false, |_| Ok(BankStep::AtLimit))

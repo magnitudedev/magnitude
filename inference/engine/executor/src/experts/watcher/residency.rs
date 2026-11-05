@@ -133,13 +133,28 @@ impl Residency {
         }
         // A shrink planned and not yet committed holds its records: nothing
         // is promoted or released until it commits or is dropped.
+        // Held for a measurement beside the idle load, the copies running
+        // end and none is asked; a step running ends the hold at once, so
+        // no request waits on a measurement (the service preempts the
+        // measurement as a request arrives, and serving outranks it here
+        // until it has).
+        let idle = self.shared.steps.idle();
+        let held = self.shared.traffic_held() && idle;
         let promoted = !self.core.directory.shrink_pending()
-            && copier.is_some_and(|copier| self.promotions.advance(&mut self.core, &self.shared, copier, decoded));
+            && copier.is_some_and(|copier| self.promotions.advance(&mut self.core, &self.shared, copier, decoded, held));
         let cleared = self.scratch.clear_past(&mut self.core, &mut self.prefetch);
         if retired || landed || promoted {
             self.publish_held();
         }
-        self.read_ahead();
+        if !held {
+            self.read_ahead();
+        }
+        let copying = copier.is_some_and(|copier| !copier.copies.idle());
+        // Its turning quiet is an event: a hold waits on it.
+        let quiet = held && !copying && !self.prefetch.outstanding();
+        if self.shared.traffic_quiet.swap(quiet, std::sync::atomic::Ordering::AcqRel) != quiet {
+            self.shared.events().notify();
+        }
         let steps = self.shared.steps.clone();
         steps.while_idle(|| self.publish_policy());
         if joined || retired || landed || promoted || cleared {
