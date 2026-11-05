@@ -19,7 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 RESULTS = "served.json"
-SCENARIOS = ("lifecycle", "stop", "failure", "repeat")
+SCENARIOS = ("lifecycle", "stop", "stop-prepare", "failure", "repeat")
 # Characters of a fixture's opening a prompt keeps: within any context an evaluated load serves.
 PROMPT_CHARACTERS = 9000
 ANSWER_TOKENS = 64
@@ -442,6 +442,72 @@ def parted(answer: dict, reference: dict) -> int | None:
     return at
 
 
+class Workers:
+    """The service's inference workers, sampled until stopped: the most that ran at once."""
+
+    def __init__(self, service: Service) -> None:
+        self.pid, self.most, self.running = service.process.pid, 0, True
+        self.thread = threading.Thread(target=self.sample, daemon=True)
+        self.thread.start()
+
+    def count(self) -> int:
+        table = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+        rows = [line.split(None, 2) for line in table.splitlines() if line.strip()]
+        children: dict[int, list[tuple[int, str]]] = {}
+        for row in rows:
+            if len(row) == 3:
+                children.setdefault(int(row[1]), []).append((int(row[0]), row[2]))
+        found, pending = 0, [self.pid]
+        while pending:
+            for pid, command in children.get(pending.pop(), []):
+                found += "inference-worker" in command
+                pending.append(pid)
+        return found
+
+    def sample(self) -> None:
+        while self.running:
+            self.most = max(self.most, self.count())
+            time.sleep(0.05)
+
+    def stop(self) -> int:
+        self.running = False
+        self.thread.join()
+        return self.most
+
+
+def stop_prepare(run: Run) -> None:
+    """A stop during a cold load's Prepare with a second load queued behind it: the stopped load
+    starts no worker past the stop, the queued load loads and answers, and at no moment do two
+    inference workers run."""
+    service = Service(run, "stop-prepare", run.capped)
+    model = service.model(run.arguments.model)
+    workers = Workers(service)
+    first, cold = in_thread(lambda: service.load(model))
+    end = time.monotonic() + LOAD_SECONDS
+    while '"optimizing"' not in (state := json.dumps(service.instances())):
+        if time.monotonic() > end or "result" in cold or "error" in cold:
+            raise Failed(f"the cold load never prepared: {state[:400]}")
+        time.sleep(0.05)
+    (instance,) = [item for item in service.instances()["instances"] if "loading" in json.dumps(item).lower()]
+    run.note("cold load preparing, stopping it", instance=instance["id"])
+    stopped, stop_result = in_thread(lambda: service.stop(instance))
+    while '"stopping"' not in json.dumps(service.instances()).lower() and "result" not in stop_result:
+        time.sleep(0.01)
+    queued, next_load = in_thread(lambda: service.load(model))
+    stopped()
+    first()
+    queued()
+    run.note("stopped load ended", ended=cold.get("error", "loaded")[:200], stop=stop_result.get("error", "stopped")[:200])
+    if "error" in next_load:
+        raise Failed(f"the load queued behind the stop: {next_load['error']}")
+    answer = service.chat(model, run.messages)
+    most = workers.stop()
+    run.note("queued load's answer", seconds=answer["seconds"], text=answer["text"][:60], most_workers=most)
+    run.note("service ended", code=service.end())
+    if most > 1:
+        raise Failed(f"{most} inference workers ran at once")
+
+
 def stop(run: Run) -> None:
     wanted = run.arguments.model
     service = Service(run, "stop", run.capped)
@@ -528,7 +594,8 @@ def main() -> int:
     run = Run(parser.parse_args())
     code = 0
     try:
-        {"lifecycle": lifecycle, "stop": stop, "failure": failure, "repeat": repeat}[run.arguments.scenario](run)
+        {"lifecycle": lifecycle, "stop": stop, "stop-prepare": stop_prepare, "failure": failure,
+         "repeat": repeat}[run.arguments.scenario](run)
     except Failed as why:
         run.note("FAILED", why=str(why))
         code = 1

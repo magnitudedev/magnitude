@@ -14,6 +14,8 @@ Scenarios, each from an empty kernel cache of the run's own:
   the job runs beside the idle load, a request preempts it, `Reprice` reaches the live load, a
   new service's load starts priced; and where each answer parts from a resident load's.
 - `stop`: a load stopped while the job runs beside it, then a load in the same service.
+- `stop-prepare`: a cold load stopped during its Prepare with a second load queued behind the
+  stop: the queued load loads and answers, and no two inference workers ever run at once.
 - `repeat`: two prompts answered in turn on one load, where each parts from its first answer.
 - `failure`: a stretch of the model file read as EIO under two answers: those that named it
   fail, the load serves on, and where its answer parts from the one before.
