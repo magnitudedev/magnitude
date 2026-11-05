@@ -1,4 +1,4 @@
-use super::{ExpertBank, PoolConveyor, allocate_placed, host_views, landed_records, landed_tensors, placed_words, slot_maps, write_blocks};
+use super::{ExpertBank, PoolConveyor, allocate_placed, host_views, landed_tensors, placed_words, slot_maps, write_blocks};
 use crate::experts::conveyor::{Carrier, LentPool, Lending};
 use crate::experts::source::{ExpertSource, Records};
 use crate::experts::watcher::{Copier, CopyTensor, Extents, Group, Layer, ListRecords, LoadWords, PlacedWords, Pool, Steps, StoredTensor, Watcher, WatcherParts};
@@ -158,12 +158,16 @@ impl ExpertBank {
             })
             .collect::<Result<Vec<_>, String>>()?;
         let slot_maps = slot_maps(plan, &layout)?;
+        // Derived once here, so no resize derives them on the step's thread.
+        let deriving = std::time::Instant::now();
+        let counts = Arc::new(plan.counts()?);
+        tracing::info!("derived the bank's counts up to {} slots in {:.1} ms", plan.ceiling, deriving.elapsed().as_secs_f64() * 1e3);
         let floor = allocate_placed(device, plan, std::num::NonZeroU64::MIN)
             .map_err(|error| format!("expert bank allocation failed: {error}"))?;
         // The slots the bank commits, which its watcher's telemetry reads.
         let slots = Arc::new(AtomicU64::new(plan.slots));
         let (watcher, lines) =
-            watch(plan, artifact, &layout, &slot_maps, &floor, &pool_of, &conveyors, sites, lines, cpu, slots.clone())?;
+            watch(plan, &counts, artifact, &layout, &slot_maps, &floor, &pool_of, &conveyors, sites, lines, cpu, slots.clone())?;
         let move_lists = layout
             .groups
             .iter()
@@ -195,6 +199,7 @@ impl ExpertBank {
             rises: Arc::new(Mutex::new(())),
             landed,
             plan: plan.clone(),
+            counts,
         };
         if plan.host_slots > 0 {
             bank.back_host().map_err(|error| format!("the host tier's backing: {error}"))?;
@@ -214,6 +219,7 @@ impl ExpertBank {
 #[allow(clippy::too_many_arguments)]
 fn watch(
     plan: &ExpertBankPlan,
+    counts: &crate::planning::BankCounts,
     artifact: &GgufArtifact,
     layout: &BankLayout<Tensor>,
     slot_maps: &[Tensor],
@@ -242,7 +248,7 @@ fn watch(
         Placer::Bank => plan.slots,
     };
     let tiers = landed_tensors(plan, layout)
-        .map(|tensors| host_views(plan, &tensors, |group| landed_records(plan, group, start)))
+        .map(|tensors| host_views(plan, &tensors, |group| counts.landed_records(group, start)))
         .transpose()?
         .map(|views| {
             plan.groups

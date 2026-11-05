@@ -128,20 +128,19 @@ impl ServedBank {
     /// What `holding` is charged holding `at` (slots, host slots or
     /// records), as Seismic charges its reservations.
     fn holding_charge(&self, holding: BankHolding, at: u64) -> Result<u64, DomainError> {
-        let plan = &self.bank.plan;
+        let counts = &self.bank.counts;
         match holding {
-            BankHolding::Experts => plan.resident_charge(at),
-            BankHolding::Host => plan.host_charge(at),
-            BankHolding::Table { table } => self.tables[table].plan.charge(plan.reservation, at),
+            BankHolding::Experts => Ok(counts.resident_charge(at)),
+            BankHolding::Host => Ok(counts.host_charge(at)),
+            BankHolding::Table { table } => self.tables[table].plan.charge(self.bank.plan.reservation, at).map_err(DomainError::invariant),
         }
-        .map_err(DomainError::invariant)
     }
 
     /// The shallowest shrink of `holding` from `from` releasing `bytes`
     /// ([`crate::planning::releasing`]), down to its floor.
     fn releasing(&self, holding: BankHolding, from: u64, bytes: u64) -> Result<Option<u64>, DomainError> {
         let floor = match holding {
-            BankHolding::Experts => self.bank.plan.floor(),
+            BankHolding::Experts => self.bank.counts.floor(),
             BankHolding::Host => 0,
             BankHolding::Table { table } => self.tables[table].plan.floor,
         };
@@ -236,15 +235,14 @@ impl ServedBank {
         // already on its way.
         let tiered = plan.holding_storage(BankHolding::Host) == Some(kind);
         if let (true, Some((host, ceiling)), false) = (tiered, self.bank.host_tier(), self.bank.host_backing()) {
-            let grown = plan.host_growth(host, self.bank.slots(), room).map_err(DomainError::invariant)?;
-            if let Some(to) = grown {
-                let charge = |slots| plan.host_charge(slots).map_err(DomainError::invariant);
+            let counts = &self.bank.counts;
+            if let Some(to) = counts.host_growth(host, self.bank.slots(), room) {
                 let step = Step {
                     holding: BankHolding::Host,
                     kind,
                     from: host,
                     to,
-                    bytes: charge(to)? - charge(host)?,
+                    bytes: counts.host_charge(to) - counts.host_charge(host),
                     saves: None,
                 };
                 steps.push((step, ceiling.get()));
@@ -259,7 +257,7 @@ impl ServedBank {
         };
         if kind == crate::planning::BankTier::Bank {
             let slots = self.bank.slots();
-            let bytes = |to| self.bank.growth_bytes(to);
+            let bytes = |to| Ok(self.bank.growth_bytes(to));
             let bound = saturation.map(|saturation| plan.ceiling.min(saturation));
             if let Some((bound, Some(to))) = bound.map(|bound| Ok::<_, DomainError>((bound, target(slots, bound, &bytes)?))).transpose()? {
                 let above = crate::assessment::HeldSlots { slots: count(to)?, ..held };
@@ -268,7 +266,7 @@ impl ServedBank {
                     kind,
                     from: slots,
                     to,
-                    bytes: bytes(to).map_err(DomainError::invariant)?,
+                    bytes: self.bank.growth_bytes(to),
                     saves: Some(priced(&record, held, above, resident)?),
                 };
                 steps.push((step, bound));
@@ -364,8 +362,8 @@ impl ServedBank {
         let Some(budget) = budget else {
             return shallowest;
         };
-        let plan = &self.bank.plan;
-        let released = |to: u64| move |group: usize| plan.records_at(group, from) - plan.records_at(group, to);
+        let counts = &self.bank.counts;
+        let released = |to: u64| move |group: usize| counts.records_at(group, from) - counts.records_at(group, to);
         (deepest..shallowest).rev().take_while(|&to| budget.fits(&released(to))).last().unwrap_or(shallowest)
     }
 
@@ -491,7 +489,7 @@ impl ElasticBank for ServedBank {
     }
 
     fn growth_shortfall(&self) -> Result<u64, DomainError> {
-        self.bank.growth_bytes(self.bank.plan.ceiling.max(self.bank.slots())).map_err(DomainError::invariant)
+        Ok(self.bank.growth_bytes(self.bank.plan.ceiling.max(self.bank.slots())))
     }
 
     fn whole(&self) -> bool {
@@ -671,7 +669,7 @@ impl ElasticBank for ServedBank {
         let plan = &self.bank.plan;
         let bytes = plan.slot_bytes().map_err(DomainError::invariant)?;
         let host = self.bank.host_slots();
-        Ok(Some((reads, BankSlots { now: self.bank.slots(), floor: plan.floor(), bytes, host })))
+        Ok(Some((reads, BankSlots { now: self.bank.slots(), floor: self.bank.counts.floor(), bytes, host })))
     }
 
     fn latest_record(&self) -> Option<Arc<MissRecord>> {

@@ -20,7 +20,7 @@ pub use assessment::{
     DeviceProcessBytes, HostProcessBytes, SealedGraphHostBytes, measurement_process_bytes,
 };
 pub use bank::{
-    BankAllocation, BankBinding, BankTable, BankLayout, BankPart, ConveyorCarrier,
+    BankAllocation, BankBinding, BankCounts, BankTable, BankLayout, BankPart, ConveyorCarrier,
     Lender,
     HintWeight, HINT_LEADS, PlacedAllocations, RegionWords,
     ExpertBankPlan, RecordTensor, RecordTensors, RoutedTensor, StagingPool, StoredStack,

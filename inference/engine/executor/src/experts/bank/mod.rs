@@ -117,9 +117,13 @@ pub(crate) struct ExpertBank {
     /// Held across every rise of the bank's charge off the domain's thread
     /// ([`Self::hold_rises`]).
     rises: Arc<Mutex<()>>,
-    /// The plan the bank opened with: its floor, its ceiling, its granule
-    /// and each group's records at any slots (`ExpertBankPlan::records_at`).
+    /// The plan the bank opened with: its ceiling, its granule and its
+    /// layout.
     plan: ExpertBankPlan,
+    /// What the plan derives of each count the bank may hold, derived as it
+    /// opened (`ExpertBankPlan::counts`): its floor, and each group's
+    /// records and their charge at any slots or host slots.
+    counts: Arc<crate::planning::BankCounts>,
     /// The record tensors the host lands file misses into, group by group
     /// ([`landed_tensors`]); none where it lands into none.
     landed: Option<Arc<[RecordTensors<Tensor>]>>,
@@ -268,7 +272,7 @@ impl ExpertBank {
         Ok(ExpertResidency {
             experts: self.plan.widest(),
             slots,
-            floor: self.plan.floor(),
+            floor: self.counts.floor(),
             ceiling: self.plan.ceiling,
             stores: stores.into_iter().map(|((_, store), bytes)| (store, bytes)).collect(),
             disk_bytes,
@@ -601,16 +605,6 @@ fn landed_tensors(plan: &ExpertBankPlan, layout: &BankLayout<Tensor>) -> Option<
     match plan.placer() {
         Placer::Tier => layout.host.clone(),
         Placer::Bank => Some(layout.groups.iter().map(|group| group.records.clone()).collect()),
-    }
-}
-
-/// The records the host lands into of group `group` at `slots` slots: a
-/// host tier's host slots where the device places, the one store's slots
-/// where the host does.
-fn landed_records(plan: &ExpertBankPlan, group: usize, slots: u64) -> u64 {
-    match plan.placer() {
-        Placer::Tier => plan.host_records(group, slots),
-        Placer::Bank => plan.records_at(group, slots),
     }
 }
 

@@ -306,27 +306,64 @@ fn a_chunked_lender_packs_conveyor_records_into_its_chunks() {
 }
 
 /// A host tier grows in one step from `from` toward every expert, its
-/// ceiling, within its room ([`growth_target`] on its charge); a bank
+/// ceiling, within its room ([`growth_target`] on its charge, `BankCounts::host_growth`); a bank
 /// without a tier grows none, nor a whole one or one out of room.
 #[test]
 fn a_host_tier_grows_toward_every_expert_within_its_room() {
     let without = ExpertBankPlan { host: HostTier::Unified, ..bank(&[3, 1], 26) };
     let plan = ExpertBankPlan { host: HostTier::Linked(BYTES), ..without.clone() };
     let all = u64::MAX;
-    assert_eq!(plan.host_growth(0, 26, all).unwrap(), Some(256), "every expert");
-    assert_eq!(plan.host_growth(256, 26, all).unwrap(), None, "whole");
-    assert_eq!(without.host_growth(0, 26, all).unwrap(), None, "no tier");
+    let counts = plan.counts().unwrap();
+    assert_eq!(counts.host_growth(0, 26, all), Some(256), "every expert");
+    assert_eq!(counts.host_growth(256, 26, all), None, "whole");
+    assert_eq!(without.counts().unwrap().host_growth(0, 26, all), None, "no tier");
     let room = plan.host_charge(40).unwrap() - plan.host_charge(0).unwrap();
-    assert_eq!(plan.host_growth(0, 26, room).unwrap(), Some(40), "within its room");
+    assert_eq!(counts.host_growth(0, 26, room), Some(40), "within its room");
     // Up to 26 slots the tier holds its floor, the landing reserve.
-    assert_eq!(plan.host_growth(0, 10, 0).unwrap(), Some(26), "slots within the reserve cost nothing");
-    assert_eq!(plan.host_growth(26, 10, 0).unwrap(), None, "no room for one past it");
+    assert_eq!(counts.host_growth(0, 10, 0), Some(26), "slots within the reserve cost nothing");
+    assert_eq!(counts.host_growth(26, 10, 0), None, "no room for one past it");
     // Its first slots, up to the bank's, hold the bank's copies: a growth
     // reaches past them, or none fits.
-    assert_eq!(plan.host_growth(0, 26, 0).unwrap(), None, "no room past the bank's 26 slots");
-    assert_eq!(plan.host_growth(0, 50, room).unwrap(), None, "a room of 40 slots holds none past the bank's 50");
+    assert_eq!(counts.host_growth(0, 26, 0), None, "no room past the bank's 26 slots");
+    assert_eq!(counts.host_growth(0, 50, room), None, "a room of 40 slots holds none past the bank's 50");
     let past = plan.host_charge(60).unwrap() - plan.host_charge(0).unwrap();
-    assert_eq!(plan.host_growth(0, 50, past).unwrap(), Some(60), "one step past the bank's 50");
+    assert_eq!(counts.host_growth(0, 50, past), Some(60), "one step past the bank's 50");
+}
+
+/// A bank's counts are the plan's derivations at every count it may hold:
+/// each group's records and their charge at every slot count up to the
+/// ceiling, the host tier's at every host slot count, the records the host
+/// lands into, and the floor.
+#[test]
+fn a_banks_counts_are_its_plans_derivations_at_every_count() {
+    let unified = ExpertBankPlan { host: HostTier::Unified, ..bank(&[37, 3], 1) };
+    let linked = ExpertBankPlan { host: HostTier::Linked(BYTES), ..bank(&[37, 3], 0) };
+    for plan in [unified, linked] {
+        // Growth reaches every expert.
+        let plan = ExpertBankPlan { ceiling: plan.widest().get(), ..plan };
+        let counts = plan.counts().unwrap();
+        assert_eq!(counts.floor(), plan.floor());
+        for slots in 0..=plan.ceiling {
+            assert_eq!(counts.resident_charge(slots), plan.resident_charge(slots).unwrap(), "{slots} slots");
+            for group in 0..plan.groups.len() {
+                assert_eq!(counts.records_at(group, slots), plan.records_at(group, slots), "group {group} at {slots} slots");
+                if plan.placer() == Placer::Bank {
+                    assert_eq!(counts.landed_records(group, slots), plan.records_at(group, slots), "the host lands in the one store's slots");
+                }
+            }
+        }
+        let Some(ceiling) = plan.host_ceiling() else {
+            assert_eq!(counts.host_charge(0), 0, "no host tier is charged");
+            continue;
+        };
+        for host in 0..=ceiling.get() {
+            assert_eq!(counts.host_charge(host), plan.host_charge(host).unwrap(), "{host} host slots");
+            for group in 0..plan.groups.len() {
+                assert_eq!(counts.host_records(group, host), plan.host_records(group, host), "group {group} at {host} host slots");
+                assert_eq!(counts.landed_records(group, host), plan.host_records(group, host), "a host tier lands at its host slots");
+            }
+        }
+    }
 }
 
 /// A tiered record prices the misses its host tier holds as served by

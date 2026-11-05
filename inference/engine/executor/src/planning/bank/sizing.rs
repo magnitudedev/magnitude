@@ -150,26 +150,6 @@ impl ExpertBankPlan {
         self.choices().min(self.widest_member(group))
     }
 
-    /// The host slots a host tier at `from` grows to in one step
-    /// ([`growth_target`]) beside a bank of `slots` slots: toward every
-    /// expert, its ceiling (it is inclusive of the bank: it holds the bank's
-    /// experts too), past the bank's slots, its charge beyond `from`'s
-    /// ([`Self::host_charge`]) within `room`; none without a tier, whole, or
-    /// with no room for one past the bank. What a live load's growth step
-    /// takes where the memory's budget grows; the tier's load-time size is
-    /// the plan's ([`Self::host_slots`]).
-    pub fn host_growth(&self, from: u64, slots: u64, room: u64) -> Result<Option<u64>, String> {
-        let Some(bound) = self.host_ceiling().map(NonZeroU64::get) else {
-            return Ok(None);
-        };
-        let held = self.host_charge(from)?;
-        // An inclusive tier's first slots, up to the bank's, hold copies of
-        // the bank's experts and save nothing: a growth reaches past them in
-        // one step, or none fits.
-        let least = from.max(slots);
-        growth_target(least, bound, room, |to| Ok(self.host_charge(to)? - held))
-    }
-
     /// The most host slots a host tier holds: the widest layer's experts, a
     /// host slot a record of each layer of every group, as a bank slot is,
     /// so the tier's records hold every expert (the bank's among them);

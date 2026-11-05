@@ -1,4 +1,4 @@
-use super::{ExpertBank, host_views, landed_records};
+use super::{ExpertBank, host_views};
 use crate::planning::{BankTier, ExpertBankPlan, Placer};
 use crate::experts::watcher::{Candidates, MoveBudget};
 use crate::domain::{BankHolding, BankResized, BankStep, DomainError, ResizeTimes, Trip};
@@ -381,7 +381,7 @@ impl ExpertBank {
     /// The host tier's record tensors' rows at `slots` host slots, in
     /// tensor order.
     fn host_rows(&self, slots: u64) -> Vec<u64> {
-        self.host_groups().into_iter().map(|group| self.plan.host_records(group, slots)).collect()
+        self.host_groups().into_iter().map(|group| self.counts.host_records(group, slots)).collect()
     }
 
     /// The host tier's resizers, taken while no resize of it runs (none
@@ -608,16 +608,14 @@ impl ExpertBank {
         assert!(deepest <= shallowest, "a shrink's deepest cut {deepest} lies below its shallowest {shallowest}");
         let slots = |slots: u64| usize::try_from(slots).map_err(|_| DomainError::invariant("bank slots exceed the host"));
         for group in 0..self.plan.groups.len() {
-            u32::try_from(landed_records(&self.plan, group, shallowest))
+            u32::try_from(self.counts.landed_records(group, shallowest))
                 .map_err(|_| DomainError::invariant("the records the host lands into exceed u32"))?;
         }
-        let plan = Arc::new(self.plan.clone());
+        let (counts, groups) = (self.counts.clone(), self.plan.groups.len());
         Ok(Candidates {
             shallowest: slots(shallowest)?,
             deepest: slots(deepest)?,
-            records: Box::new(move |slots| {
-                (0..plan.groups.len()).map(|group| landed_records(&plan, group, slots as u64) as usize).collect()
-            }),
+            records: Box::new(move |slots| (0..groups).map(|group| counts.landed_records(group, slots as u64) as usize).collect()),
         })
     }
 
@@ -723,7 +721,7 @@ impl ExpertBank {
     fn committed_records(&self, slots: u64) -> Result<Vec<usize>, DomainError> {
         (0..self.plan.groups.len())
             .map(|group| {
-                usize::try_from(self.plan.records_at(group, slots))
+                usize::try_from(self.counts.records_at(group, slots))
                     .map_err(|_| DomainError::invariant("bank records exceed the host"))
             })
             .collect()
@@ -732,7 +730,7 @@ impl ExpertBank {
     /// The rows each record tensor commits at `slots` slots, in resizer
     /// order.
     fn rows_at(&self, slots: u64) -> Vec<u64> {
-        self.record_groups().into_iter().map(|group| self.plan.records_at(group, slots)).collect()
+        self.record_groups().into_iter().map(|group| self.counts.records_at(group, slots)).collect()
     }
 
     /// Each record tensor's group, in resizer order.
@@ -835,11 +833,11 @@ impl ExpertBank {
 
     /// The device bytes a growth to `to` slots backs, what it claims before
     /// it: each record tensor's charge at `to` slots past its charge at the
-    /// slots now (`ExpertBankPlan::resident_charge`), what its reservation backs anew
+    /// slots now (`BankCounts::resident_charge`), what its reservation backs anew
     /// (the record tables formed over it are held already); no fewer at
     /// more slots.
-    pub fn growth_bytes(&self, to: u64) -> Result<u64, String> {
-        Ok(self.plan.resident_charge(to)? - self.plan.resident_charge(self.slots())?)
+    pub fn growth_bytes(&self, to: u64) -> u64 {
+        self.counts.resident_charge(to) - self.counts.resident_charge(self.slots())
     }
 
     /// [`ElasticBank::shrink`] from the nearest slots that release storage,
@@ -870,7 +868,7 @@ impl ExpertBank {
             return Ok(BankStep::Running);
         };
         let from = commitment.slots.load(Ordering::Acquire);
-        if from <= self.plan.floor() {
+        if from <= self.counts.floor() {
             commitment.resize = Resize::Idle(resizers);
             return Ok(BankStep::AtLimit);
         }
@@ -885,13 +883,11 @@ impl ExpertBank {
             // grow with the slots, so the shallowest candidate's fitting the
             // host fits them all.
             self.committed_records(shallowest)?;
-            let plan = Arc::new(self.plan.clone());
+            let (counts, groups) = (self.counts.clone(), self.plan.groups.len());
             let candidates = Candidates {
                 shallowest: count(shallowest)?,
                 deepest: count(deepest)?,
-                records: Box::new(move |slots| {
-                    (0..plan.groups.len()).map(|group| plan.records_at(group, slots as u64) as usize).collect()
-                }),
+                records: Box::new(move |slots| (0..groups).map(|group| counts.records_at(group, slots as u64) as usize).collect()),
             };
             let plan = shared.plan_shrink(candidates, budget).map_err(DomainError::invariant)?;
             let to = plan.slots() as u64;

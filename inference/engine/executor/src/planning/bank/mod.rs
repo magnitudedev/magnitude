@@ -15,6 +15,7 @@
 
 mod build;
 mod conveyor;
+mod counts;
 mod layout;
 mod records;
 mod sizing;
@@ -30,6 +31,7 @@ use std::num::NonZeroU64;
 use records::{record_bytes, reserved_record};
 use table::stored_rows;
 pub use conveyor::{ConveyorCarrier, Lender, StagingPool};
+pub use counts::BankCounts;
 pub use layout::{BankAllocation, BankLayout, BankPart, BankTier, HostTier, PlacedAllocations, Placer};
 pub use records::{RecordForm, RecordTensor, RecordTensors, RoutedTensor, routed_experts};
 pub(crate) use records::{decode_choices, layer_homes};
