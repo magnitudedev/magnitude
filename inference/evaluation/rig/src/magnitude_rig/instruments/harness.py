@@ -15,3 +15,8 @@ BUILD = Step("harness", ("cargo", "build", "--release", "-p", "magnitude-harness
 PINS = "{runs}/tuning-pins.json"
 RECORD = ("--tuning-record", PINS)
 REPLAY = ("--tuning-replay", PINS)
+
+
+def streamed(cap: int) -> str:
+    """The job (and its results' directory) of a harness run streamed under weight cap `cap`."""
+    return f"streamed-{cap}"

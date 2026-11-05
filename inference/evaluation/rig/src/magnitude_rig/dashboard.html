@@ -222,7 +222,7 @@ function dur(s) {
 }
 const clock = (t, seconds) => new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", ...(seconds ? {second: "2-digit"} : {})});
 const tidy = s => String(s || "").replace(/\((R|TM)\)/g, "").replace(/\s*@.*$/, "").replace(/\s+CPU\b/, "").replace(/\s+/g, " ").trim();
-// "session:6aee… es-s2-hw anders@m6-mini" -> "es-s2-hw on m6-mini"
+// "session:6aee… topic user@laptop" -> "topic on laptop"
 function origin(who) {
   const w = String(who || "").split(" "), last = w[w.length - 1] || "";
   return last.includes("@") ? `${w[w.length - 2] || ""} on ${last.split("@")[1]}` : String(who || "");
@@ -281,12 +281,18 @@ function plan(h, t) {
   const s = h.sample, at = Date.parse(s.at) / 1000, runs = new Map();
   for (const e of s.status.entries) {
     const r = runs.get(e.run) || {key: h.alias + "/" + e.run, id: e.run, host: h.alias, who: e.who, purpose: e.purpose,
-      estimate: e.estimate, start: h.received - (at - e.started), held: [], waiting: []};
+      estimate: e.estimate, start: h.received - (at - e.started), heldAt: e.held, queuedAt: e.queued, held: [], waiting: []};
     (e.state === "held" ? r.held : r.waiting).push(e.kind.split(":")[0]);
     runs.set(e.run, r);
   }
   const all = [...runs.values()].sort((a, b) => a.start - b.start);
-  for (const r of all) { r.end = r.start + r.estimate; r.over = t - r.end; }
+  // Held and queued time as the host accounts them (`account`), carried on from the reading: a
+  // run waiting for a hold queues, any other works. Its estimate is of its held time alone.
+  for (const r of all) {
+    const since = t - h.received, waiting = r.waiting.length > 0;
+    r.held_s = r.heldAt + (waiting ? 0 : since); r.queued = r.queuedAt + (waiting ? since : 0);
+    r.over = r.held_s - r.estimate; r.end = t + Math.max(0, -r.over);
+  }
   const onDevice = r => r.held.some(k => DEVICE.has(k)), forDevice = r => r.waiting.some(k => DEVICE.has(k));
   const device = all.filter(onDevice), queue = all.filter(r => !onDevice(r) && forDevice(r)),
         other = all.filter(r => !onDevice(r) && !forDevice(r));
@@ -434,7 +440,7 @@ function card(v, t) {
   // the runs on it, one chip each, and a word on where it stands
   if (p) {
     const chips = p.runs.slice(0, CHIPS).map(j => {
-      const fill = j.phase === "queued" ? 0 : Math.min(100, (t - j.start) / j.estimate * 100);
+      const fill = j.phase === "queued" ? 0 : Math.min(100, j.held_s / j.estimate * 100);
       return `<span class="chip ${j.phase}${overdue(j) ? " over" : ""}" data-run="${esc(j.key)}" data-host="${esc(j.host)}" title="${esc(j.purpose)}"><i style="width:${fill.toFixed(1)}%"></i></span>`;
     });
     if (p.runs.length > CHIPS) chips.push(`<span class="more">+${p.runs.length - CHIPS}</span>`);
@@ -457,7 +463,7 @@ function summary({h, st, p, state}, t) {
   if (st === "connecting") return ["connecting", "quiet"];
   const queued = p.queue.length ? ` · ${p.queue.length} queued` : "";
   const r = p.device[0];
-  if (r) return r.over > 0 ? [`${dur(r.over)} over${queued}`, "late"] : [`${dur(t - r.start)} / ${dur(r.estimate)}${queued}`];
+  if (r) return r.over > 0 ? [`${dur(r.over)} over${queued}`, "late"] : [`${dur(r.held_s)} / ${dur(r.estimate)}${queued}`];
   if (p.lock) return ["held outside mrig" + queued];
   if (p.other.length) return [p.other[0].what + queued];
   return [state === "unready" ? "not set up" : "idle", "quiet"];
@@ -480,9 +486,9 @@ function job(r, t) {
   setText(e.tag, r.phase === "queued" ? "#" + r.pos : r.what);
   setText(e.host, r.host);
   setText(e.from, origin(r.who));
-  const elapsed = t - r.start, over = overdue(r);
+  const elapsed = r.held_s, over = overdue(r);
   setText(e.when, r.phase === "queued" ? `${dur(r.estimate)} · ${r.at <= t + 1 ? "next" : "in " + dur(r.at - t)}`
-    : (over ? `${dur(r.over)} over · ` : "") + `${dur(elapsed)} / ${dur(r.estimate)}`);
+    : (r.queued >= 1 ? `queued ${dur(r.queued)}, ` : "") + (over ? `${dur(r.over)} over · ` : "") + `${dur(elapsed)} / ${dur(r.estimate)}`);
   e.when.classList.toggle("late", over);
   e.bar.classList.toggle("late", over);
   e.bar.firstChild.style.width = Math.min(100, elapsed / r.estimate * 100).toFixed(1) + "%";

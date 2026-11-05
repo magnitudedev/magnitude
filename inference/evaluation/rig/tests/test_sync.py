@@ -1,5 +1,5 @@
-"""Mirror semantics, against a local directory standing in for a host: a mirrored file's time
-is when its content last changed there, whatever the controller's file times say."""
+"""Staging and installing, against local directories standing in for a host: an installed
+file's time is when its content last changed there, whatever the controller's file times say."""
 
 import os
 import shutil
@@ -26,14 +26,14 @@ def write_tree(directory: Path, files: dict[str, str]) -> Path:
 
 
 def mirror(tree: Path, host: Path) -> None:
-    """The flow's mirror step: content push, then the agent's prune of unlisted files."""
+    """The flow: the caller stages into a fresh run's stage beside the checkout (`host`), then
+    the runner installs the stage into it."""
     paths = sorted(p.relative_to(tree).as_posix() for p in tree.rglob("*") if p.is_file())
-    host.mkdir(exist_ok=True)
-    sync.mirror(paths, tree, str(host))
-    subprocess.run(
-        [sys.executable, str(AGENT), "prune", "--dir", str(host)],
-        input="\n".join(paths) + "\n", text=True, check=True, capture_output=True,
-    )
+    stage = host.with_name(f"stage-{len(list(host.parent.glob('stage-*')))}")
+    stage.mkdir()
+    sync.copy(paths, tree, str(stage), alike=str(host))
+    subprocess.run([sys.executable, str(AGENT), "install", "--from", str(stage), "--to", str(host)],
+                   text=True, check=True, capture_output=True)
 
 
 def settle(host: Path) -> None:
@@ -131,3 +131,36 @@ def test_cargo_rebuilds_alternating_trees_in_one_target_directory(tmp_path):
     assert build_and_run(y) == ("Y", True)
     assert build_and_run(x) == ("X", True)
     assert build_and_run(x) == ("X", False)  # incremental: unchanged content is not rebuilt
+
+
+def test_staging_from_a_checkout_far_from_the_source_needs_no_more_descriptors_than_it_has(tmp_path):
+    """openrsync keeps a descriptor per `--copy-dest` file with other bytes: staging 400 files
+    against a checkout where every one differs, from a process allowed 256, still succeeds."""
+    import resource
+    files = {f"f{index}.rs": f"new {index}" for index in range(400)}
+    tree = write_tree(tmp_path / "tree", files)
+    alike = write_tree(tmp_path / "alike", {path: "old" for path in files})
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (256, limit[1]))
+    try:
+        sync.copy(sorted(files), tree, str(stage), alike=str(alike))
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, limit)
+    assert {p.name: p.read_text() for p in stage.iterdir()} == files
+
+
+def test_a_posix_hosts_receiver_is_allowed_a_descriptor_per_file(monkeypatch, tmp_path):
+    from magnitude_rig.connection import Remote
+    calls = []
+    monkeypatch.setattr(sync, "_rsync", lambda mode, arguments, remote, descriptors: calls.append((mode, descriptors)))
+    paths = [f"f{index}" for index in range(1000)]
+    for local, windows in ((False, False), (True, False), (False, True)):
+        remote = Remote("h", local, windows, "Darwin", "arm64", "python3", "/r", "/m", "/r/agent/x.zip",
+                        {}, ("metal",), True)
+        sync.push(remote, paths, tmp_path, "/r/runs/x/stage-a/src", alike="/r/checkouts/c/src")
+    needed = 1000 + sync.RSYNC_DESCRIPTORS
+    assert [descriptors for _, descriptors in calls] == [needed] * 3  # where a local receiver runs
+    shells = [[o for o in mode if o.startswith("--rsync-path=")] for mode, _ in calls]
+    assert shells == [[f"--rsync-path=ulimit -Sn {needed} 2>/dev/null; exec rsync"], [], []]

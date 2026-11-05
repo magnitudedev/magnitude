@@ -15,8 +15,11 @@ import argparse
 import json
 
 from ..engine import Step, Weights
-from . import Answer, Instrument, JobResult, Measure, Plan, harness
+from . import Answer, Instrument, JobResult, Measure, Plan, harness, lacking, unrecorded
 from .resolution import median_interval
+
+# What a draft answer measures, which every build's record must hold (`lacking`).
+MEASURED = ("proposed", "accepted", "anchors", "tokens_per_verify")
 
 
 def configure(parser: argparse.ArgumentParser) -> None:
@@ -26,11 +29,11 @@ def configure(parser: argparse.ArgumentParser) -> None:
                         help="time each anchor's draft, verification and a plain decode step on the device")
 
 
-def plan(arguments, source) -> Plan:
+def plan(arguments, source, host) -> Plan:
     job = Step("draft", (
         harness.EXECUTABLE, "draft", "--artifacts", "{artifacts}",
         "--fixtures", f"{{inputs}}/{arguments.fixture.name}", "--output", "{run_dir}",
-        "--build-identity", "{build_file}", "--cache-dir", "{checkout}/kernels",
+        "--build-identity", "{build_file}", "--cache-dir", "{engine_cache}/kernels",
         "--device", arguments.backend, "--context", str(arguments.context),
         "--anchors", str(arguments.anchors),
         *(("--proposals", str(arguments.proposals)) if arguments.proposals else ()),
@@ -46,17 +49,24 @@ def answer(arguments, results: dict[str, JobResult]) -> Answer:
     if result.code != 0:
         return Answer((f"harness draft exited {result.code}", *result.output()[-15:]), False)
     record = json.loads((result.directory / "result.json").read_text())
+    if missing := lacking(record, *(f"measurements.drafting.{name}" for name in MEASURED)):
+        return Answer((f"this build's harness records no {', '.join(missing)}",), False)
     drafting = record["measurements"]["drafting"]
     proposed, accepted, anchors = drafting["proposed"], drafting["accepted"], drafting["anchors"]
+    matched = ("" if lacking(drafting, "matched_fixture") else
+               f" · matched the fixture {100 * drafting['matched_fixture'] / max(proposed, 1):.1f}%")
     lines = [
         f"{arguments.model} · {arguments.fixture.stem} @{arguments.context} · {anchors} anchors",
         (f"{drafting['tokens_per_verify']:.3f} tokens per verification · accepted {accepted} of {proposed} "
-         f"proposals ({100 * accepted / max(proposed, 1):.1f}%) · matched the fixture "
-         f"{100 * drafting['matched_fixture'] / max(proposed, 1):.1f}%"),
+         f"proposals ({100 * accepted / max(proposed, 1):.1f}%){matched}"),
     ]
     if arguments.attribute:
         rows = [json.loads(line) for line in (result.directory / "draft.jsonl").read_text().splitlines()]
-        for phase in ("draft", "verify", "plain"):
+        phases = ("draft", "verify", "plain")
+        missing = sorted({path for row in rows for path in lacking(row, *(f"attribution.{p}.device_ms" for p in phases))})
+        if missing:
+            lines.append(unrecorded("attribution", missing))
+        for phase in phases if not missing else ():
             median, half = median_interval([row["attribution"][phase]["device_ms"] for row in rows])
             lines.append(f"  {phase:<7} {median:.3f} ms device (±{half:.3f})")
     measures = {

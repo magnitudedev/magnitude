@@ -19,6 +19,12 @@ unit was reused), and `unverified` when a unit compiling synchronized sources ha
 (it was not built through the rig). Units with no record whose sources all lie outside the
 synchronized roots are registry dependencies, pinned by `Cargo.lock`.
 
+No job runs an executable of the checkout's target that the proof does not tie to the sources:
+`verify` refuses the run when one its texts name is not verified, and withdraws every other
+executable of the target's profile directories that is not (its file, and the outputs of the
+unit that produced it, which cargo then rebuilds when asked), so a job that reaches one only at
+run time (a script, an executable another starts) finds none rather than a stale one.
+
 Outside the proof: what a build script produced without rustc reading it (native objects
 it compiled and linked); whether cargo re-ran a build script still rests on file times.
 
@@ -165,12 +171,14 @@ def _within(path: str, roots: list) -> bool:
     return any(path == root or path.startswith(root + os.sep) for root in roots)
 
 
-def _records(directory: str):
+def _records(directory: str) -> list:
+    found = []
     for name in sorted(os.listdir(directory)):
         if name.endswith(RECORD_SUFFIX):
             path = os.path.join(directory, name)
             with open(path) as stream:
-                yield path, json.load(stream)
+                found.append((path, json.load(stream)))
+    return found
 
 
 def _extern_record(extern: str):
@@ -196,28 +204,48 @@ def _words(text: str) -> list:
         return []
 
 
+def _built(path: str) -> bool:
+    """Whether `path` is a cargo-built executable: an executable file of a profile directory
+    (one with `deps/` beside it)."""
+    return (os.path.isfile(path) and os.access(path, os.X_OK)
+            and os.path.isdir(os.path.join(os.path.dirname(path), "deps")))
+
+
 def built_executables(texts: list) -> list:
-    """The cargo-built executables `texts` name: files of a profile directory (one with
-    `deps/` beside them), given as a whole text, as a word of a shell command line, or
-    after the last `=` of either."""
+    """The cargo-built executables `texts` name, given as a whole text, as a word of a shell
+    command line, or after the last `=` of either."""
     found = {}
     for text in texts:
         for candidate in {part.rsplit("=", 1)[-1] for part in (text, *_words(text))}:
-            if not os.path.isabs(candidate) or not os.path.isfile(candidate):
-                continue
-            path = os.path.realpath(candidate)
-            if os.access(path, os.X_OK) and os.path.isdir(os.path.join(os.path.dirname(path), "deps")):
-                found[path] = None
+            if os.path.isabs(candidate) and _built(os.path.realpath(candidate)):
+                found[os.path.realpath(candidate)] = None
     return list(found)
 
 
-def verify_executable(path: str, roots: list, digest=digest) -> dict:
+def target_executables(target: str) -> list:
+    """Every cargo-built executable of `target`'s profile directories: `<target>/<profile>/`
+    and, for a named target triple, `<target>/<triple>/<profile>/`."""
+    found = []
+    for top in sorted(_subdirectories(target)):
+        for directory in (top, *sorted(_subdirectories(top))):
+            if os.path.isdir(os.path.join(directory, "deps")):
+                found += [path for path in (os.path.realpath(os.path.join(directory, name))
+                                            for name in sorted(os.listdir(directory))) if _built(path)]
+    return found
+
+
+def _subdirectories(directory: str) -> list:
+    names = os.listdir(directory) if os.path.isdir(directory) else []
+    return [os.path.join(directory, name) for name in names if os.path.isdir(os.path.join(directory, name))]
+
+
+def verify_executable(path: str, roots: list, digest=digest, records=_records) -> dict:
     sha256 = digest(path)
     deps = os.path.join(os.path.dirname(path), "deps")
     root_unit = next(
-        (record for record, unit in _records(deps) if sha256 in unit["outputs"].values()), None
+        (record for record, unit in records(deps) if sha256 in unit["outputs"].values()), None
     )
-    result = {"path": path, "sha256": sha256, "units": 0, "sources": 0, "external_units": 0}
+    result = {"path": path, "sha256": sha256, "unit": root_unit, "units": 0, "sources": 0, "external_units": 0}
     if root_unit is None:
         reason = "no compilation record has this executable's bytes: it was not built by the rig"
         return {**result, "status": "unverified", "reasons": [reason]}
@@ -265,25 +293,51 @@ def verify_executable(path: str, roots: list, digest=digest) -> dict:
     return {**result, "status": status, "reasons": sorted(set(contradicted + unverified))}
 
 
-def verify(texts: list, roots: list) -> dict:
-    """The provenance of every cargo-built executable `texts` name. `status` is `verified`,
-    `no-built-executable` (the job names none), or `refused`."""
+def verify(texts: list, roots: list, target: str) -> dict:
+    """The provenance of every cargo-built executable `texts` name, and of every other one of
+    `target` (`target_executables`), each of those not verified withdrawn. `status` is
+    `verified`, `no-built-executable` (the texts name none), or `refused`."""
     roots = [os.path.realpath(root) for root in roots]
-    known = {}
+    known, listed = {}, {}
 
-    def once(path: str):  # units share dependencies; nothing changes during verification
+    def once(path: str):  # units share dependencies; nothing changes until the withdrawal
         if path not in known:
             known[path] = digest(path)
         return known[path]
 
-    executables = [verify_executable(path, roots, once) for path in built_executables(texts)]
+    def records(deps: str) -> list:
+        if deps not in listed:
+            listed[deps] = _records(deps)
+        return listed[deps]
+
+    named = built_executables(texts)
+    executables = [verify_executable(path, roots, once, records) for path in named]
+    others = [verify_executable(path, roots, once, records) for path in target_executables(target) if path not in named]
+    withdrawn = [other for other in others if other["status"] != "verified"]
+    for executable in withdrawn:
+        _withdraw(executable)
     if not executables:
         status = "no-built-executable"
     elif all(e["status"] == "verified" for e in executables):
         status = "verified"
     else:
         status = "refused"
-    return {"schema": SCHEMA, "status": status, "roots": roots, "executables": executables}
+    return {"schema": SCHEMA, "status": status, "roots": roots, "executables": executables,
+            "withdrawn": withdrawn}
+
+
+def _withdraw(executable: dict) -> None:
+    """Remove an executable no job may run: its file, and the outputs and record of the unit
+    that produced it, so cargo builds that unit again when asked."""
+    paths = [executable["path"]]
+    if executable["unit"] is not None:
+        with open(executable["unit"]) as stream:
+            paths += [*json.load(stream)["outputs"], executable["unit"]]
+    for path in paths:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
 
 
 def main(argv: list) -> int:

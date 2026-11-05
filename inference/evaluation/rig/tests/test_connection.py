@@ -7,7 +7,7 @@ import subprocess
 import sys
 import unittest
 
-from magnitude_rig.connection import Remote, windows_command
+from magnitude_rig.connection import CommandFailed, HostRun, Remote, windows_command
 
 
 class RemoteCommandTests(unittest.TestCase):
@@ -42,6 +42,25 @@ class RemoteCommandTests(unittest.TestCase):
         command = windows_command([sys.executable, "-c", "raise SystemExit(23)"])
         result = subprocess.run(command, capture_output=True, text=True)
         self.assertEqual(result.returncode, 23)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX shell")
+    def test_following_skips_shell_output_that_parses_as_json_and_names_a_failed_agent(self):
+        """A login shell's bare number or list is no event; an agent that ends without the run's
+        end failed as a command, not as a connection."""
+        printed = "print(5); print('[1]'); print(json.dumps({'event': 'output', 'seq': 1})); "
+
+        def follow(end: str) -> list:
+            script = f"import json, sys; {printed}{end}"
+            remote = Remote("local", True, False, "Linux", "x86_64", sys.executable, "/tmp", "/tmp",
+                            "/tmp/agent/package.zip", {}, ("cpu",), True)
+            run = HostRun(remote, "run", ["/tmp/agent/package.zip", "magnitude_rig.host.agent"])
+            run._argv = lambda *arguments: [sys.executable, "-c", script]
+            return list(run.follow(0))
+
+        events = follow("print(json.dumps({'event': 'ended', 'seq': 2}))")
+        self.assertEqual([event["event"] for event in events], ["output", "ended"])
+        with self.assertRaises(CommandFailed):
+            follow("sys.exit(3)")
 
 
 if __name__ == "__main__":

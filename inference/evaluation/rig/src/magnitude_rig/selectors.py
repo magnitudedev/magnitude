@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from magnitude_bench.models import catalog_reference
-from magnitude_fixtures import FAMILIES, encode_set
+from magnitude_fixtures import FAMILIES, encode_set, read_set
 from magnitude_fixtures import build as build_set
 
 from .sources import WORKTREE, SourceUnavailable, commit
@@ -44,12 +44,25 @@ def model(text: str) -> str:
 
 def fixture(text: str) -> Path:
     """The family's fixture set as this checkout's fixtures build it (deterministically, from
-    pinned sources), stored by its content digest: equal sets are one file, and the hosts'
+    pinned sources), or a fixture set file (one an earlier run measured on, to measure on
+    exactly its fixtures), stored by its content digest: equal sets are one file, and the hosts'
     cached references, keyed by what the set renders to, are shared by every run of it."""
-    if text not in FAMILIES:
-        raise argparse.ArgumentTypeError(f"{text!r} is not a fixture family: {', '.join(FAMILIES)}")
-    content = encode_set(build_set(text))
-    path = FIXTURES / hashlib.sha256(content).hexdigest()[:16] / f"{text}.jsonl"
+    if text in FAMILIES:
+        fixtures, family = build_set(text), text
+    elif Path(text).is_file():
+        try:
+            fixtures, _ = read_set(Path(text))
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(f"{text}: not a fixture set: {error}") from None
+        families = {fixture.family for fixture in fixtures}
+        if len(families) != 1:
+            raise argparse.ArgumentTypeError(f"{text}: a fixture set is of one family, not {sorted(families)}")
+        (family,) = families
+    else:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is neither a fixture family ({', '.join(FAMILIES)}) nor a fixture set file")
+    content = encode_set(fixtures)
+    path = FIXTURES / hashlib.sha256(content).hexdigest()[:16] / f"{family}.jsonl"
     if not path.is_file():
         path.parent.mkdir(parents=True, exist_ok=True)
         staged = path.with_suffix(f".{os.getpid()}.tmp")
@@ -79,7 +92,8 @@ SELECTORS = {
                                          "help": "what the run needs; places it on a host that has it"}),
     "host": Selector(("--host",), {"help": "a host or pool, only when the question is about it"}),
     "build": Selector(("--build",), {"type": build, "default": WORKTREE,
-                                     "help": "`worktree` (default) or a git ref"}),
+                                     "help": "`worktree` (default: the git worktree containing the current "
+                                             "directory, never mrig's own) or a git ref"}),
     "model": Selector(("--model",), {"type": model, "required": True,
                                      "help": "catalog model <id>:<variant>"}),
     "model-or-catalog": Selector(("--model",), {"type": model,
@@ -87,8 +101,8 @@ SELECTORS = {
     "context": Selector(("--context",), {"type": int, "required": True,
                                          "help": "context length in tokens"}),
     "fixture": Selector(("--fixture",), {"type": fixture, "default": "prose-repeat",
-                                         "help": f"fixture family ({', '.join(FAMILIES)}); "
-                                                 "default prose-repeat"}),
+                                         "help": f"fixture family ({', '.join(FAMILIES)}) or a fixture "
+                                                 "set file; default prose-repeat"}),
     "entry": Selector(("--entry",), {"required": True, "help": "kernel entry name, e.g. attention_decode_k8v4"}),
     "purpose": Selector(("--purpose",), {"required": True,
                                          "help": "what this run settles, in a sentence"}),

@@ -10,20 +10,23 @@ it running for you to stop, or to wait on with a new estimate and the reason it 
 """
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import shlex
 import signal
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import ab, dashboard, engine, selectors, sources, state
-from .connection import HostUnavailable, connect, host_status, read, setup
+from . import ab, dashboard, engine, gate, selectors, sources, state, store
+from .connection import HostError, HostRun, connect, host_status, read, setup
 from .hosts import Hosts
 from .instruments import KINDS, REGISTRY, Instrument
-from .results import follow, perform
+from .results import CHILD, answer_fetched, follow, perform, record_answer
 
 
 def _epilog() -> str:
@@ -31,6 +34,8 @@ def _epilog() -> str:
     for kind, meaning in KINDS.items():
         rows.append(f"  {kind}: {meaning}")
         rows += [f"    {name:<9}{instrument.question}" for name, instrument in REGISTRY.items() if instrument.kind == kind]
+        if gate.KIND == kind:
+            rows.append(f"    {'gate':<9}{gate.QUESTION} (every topology at once)")
     rows.append(f"  {'ab':<11}Is B better or worse than A, by any instrument that measures? "
                 "(mrig ab INSTRUMENT --base A --candidate B ...)")
     tools = [
@@ -40,6 +45,7 @@ def _epilog() -> str:
         "  logs RUN   Where a run's logs are, and the end of its current phase's",
         "  wait RUN   Follow a run past its estimate, with a new --estimate and its --justification",
         "  stop RUN   Stop a run (its host work is killed and its holds released)",
+        "  fetch      Answer the ended runs whose caller is gone (every command does this first) and fetch them whole",
         "  setup HOST Prepare and verify a host or pool; runs go only to verified hosts",
     ]
     return "\n".join([
@@ -51,25 +57,30 @@ def _epilog() -> str:
 
 
 def run_instrument(instrument: Instrument, arguments) -> int:
+    if arguments.answering is not None:  # a collected run: from its fetched results, no source
+        return answer_fetched(arguments, lambda results: instrument.answer(arguments, results), arguments.answering)
     with sources.opened(arguments.build) as source:
         return _run(instrument, arguments, source)
 
 
 def _run(instrument: Instrument, arguments, source: sources.Source) -> int:
-    plan = instrument.plan(arguments, source)
-    side = engine.Side("source", source, plan.builds)
-    jobs = tuple(engine.Job("source", name, step) for name, step in plan.jobs)
+    def work(host: str) -> engine.Work:
+        plan = instrument.plan(arguments, source, host)
+        return engine.Work(
+            sides=(engine.Side("source", source, plan.builds),),
+            jobs=tuple(engine.Job("source", name, step) for name, step in plan.jobs),
+            device=plan.device,
+            acquires=plan.acquires,
+            files=plan.files,
+        )
+
     request = engine.Request(
         instrument=instrument.name,
         purpose=arguments.purpose,
         estimate=arguments.estimate,
         backend=arguments.backend,
-        sides=(side,),
-        jobs=jobs,
-        device=plan.device,
+        work=work,
         host=arguments.host,
-        acquires=plan.acquires,
-        files=plan.files,
     )
     return perform(arguments, request, lambda results: instrument.answer(arguments, results))
 
@@ -94,8 +105,8 @@ def _inspect(arguments) -> int:
         try:
             remote = connect(config)
             return remote, host_status(remote), None
-        except HostUnavailable as error:
-            return None, None, f"{config.alias}: unreachable ({error})"
+        except HostError as error:
+            return None, None, str(error)
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         for remote, status, error in pool.map(one, names):
@@ -111,8 +122,7 @@ def _inspect(arguments) -> int:
             for entry in status["entries"]:
                 print(
                     f"  {entry['state']:<7} {entry['kind']:<10} {entry['run']}  \"{entry.get('purpose', '')}\"  "
-                    f"{engine.duration(entry['remaining'])} left of {engine.duration(entry['estimate'])}"
-                    f"  ({entry['who']})"
+                    f"{engine.against_estimate(entry)}  ({entry['who']})"
                 )
     return 0
 
@@ -122,11 +132,11 @@ def _runs(arguments) -> int:
     if not live:
         print("no runs in flight on this machine")
     for run in live:
-        elapsed = time.time() - run["started"]
+        queued, held = state.account(run, time.time())
         waiting = f", waiting behind {run['waiting_behind']}" if run.get("waiting_behind") else ""
         print(
-            f"{run['run']}  {run['host']}  {run['phase']}{waiting}  "
-            f"{engine.duration(elapsed)} of {engine.duration(run['estimate'])}  \"{run['purpose']}\""
+            f"{run['run']}  {run['host']}  {run['phase']}{waiting}  queued {engine.duration(queued)}, "
+            f"{engine.duration(held)} of {engine.duration(run['estimate'])}  \"{run['purpose']}\""
         )
     return 0
 
@@ -136,9 +146,9 @@ def _results(run: str) -> Path:
     live = state.run_state(run)
     if live is not None:
         return Path(live["results"])
-    matches = sorted(engine.RESULTS.glob(f"*{run}"))
+    matches = sorted(store.results().glob(f"*{run}"))
     if not matches:
-        raise SystemExit(f"no run {run} in flight or in {engine.RESULTS}")
+        raise SystemExit(f"no run {run} in flight or in {store.results()}")
     return matches[-1]
 
 
@@ -170,11 +180,66 @@ def _wait(arguments) -> int:
 
 
 def _stop(arguments) -> int:
+    """Stop the run through the process following it, which delivers the stop and fetches the
+    run; with none, stop its runner directly (the next command fetches it)."""
     run = state.run_state(arguments.run)
-    if run is None:
+    if run is not None:
+        os.kill(run["pid"], signal.SIGTERM)
+        print(f"stopping {run['run']} on {run['host']}")
+        return 0
+    launched = next((value for value in state.Launched.gone() if value["run"].endswith(arguments.run)), None)
+    if launched is None:
         raise SystemExit(f"no run {arguments.run} in flight on this machine")
-    os.kill(run["pid"], signal.SIGTERM)
-    print(f"stopping {run['run']} on {run['host']}")
+    remote = connect(Hosts.load().host(launched["host"]))
+    stopped = HostRun(remote, launched["run"], launched["agent"]).stop()
+    print(f"stopping {launched['run']} on {launched['host']}: {stopped}")
+    return 0
+
+
+def _collect(out, *, rest: bool) -> int:
+    """Answer the ended runs whose caller is gone; how many. A run is answered by its own
+    command again, answering from its fetched results alone (`results.answer_fetched`: no source
+    is opened), or by its record where this checkout cannot read the command. With `rest`, fetch
+    the rest of every answered run here; without, in a `mrig fetch` of its own, which this
+    command does not wait for."""
+    def answer(launched: dict) -> None:
+        printed = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(io.StringIO()) as refused:
+                arguments = parser().parse_args(launched["command"])
+        except SystemExit:
+            # Launched records are this machine's, any checkout's: one whose command this
+            # checkout's mrig cannot read is answered by its record, never left owed forever.
+            record = json.loads((Path(launched["results"]) / "rig.json").read_text())
+            printed.write(f"mrig: this checkout's mrig cannot read {launched['run']}'s command "
+                          f"({refused.getvalue().strip().splitlines()[-1]}); its record: failed "
+                          f"{record['failed']}, job codes {record['codes']}; results in {launched['results']}\n")
+            code = 1
+        else:
+            arguments.argv, arguments.answering = launched["command"], launched["run"]
+            with contextlib.redirect_stdout(printed):
+                code = arguments.handler(arguments)
+        record_answer(Path(launched["results"]), printed.getvalue(), code)
+        print(f"mrig: {launched['run']} ended without its caller; fetched, and its answer:", file=out)
+        print(printed.getvalue().rstrip(), file=out, flush=True)
+
+    answered, unfetched = engine.collect(Hosts.load(), answer, rest=rest)
+    if unfetched:
+        _fetch_detached()
+    return len(answered)
+
+
+def _fetch_detached() -> None:
+    """`mrig fetch` in a session of its own, its output in the rig's `fetch.log`."""
+    state.HOME.mkdir(parents=True, exist_ok=True)
+    with open(state.HOME / "fetch.log", "a") as log:
+        subprocess.Popen([sys.executable, "-m", "magnitude_rig.cli", "fetch"], stdin=subprocess.DEVNULL,
+                         stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+
+
+def _fetch(arguments) -> int:
+    if not _collect(sys.stdout, rest=True):
+        print("nothing to answer")
     return 0
 
 
@@ -184,7 +249,7 @@ def _setup(arguments) -> int:
     for config in (c for name in arguments.names for c in hosts.resolve(name)):
         try:
             print(f"{config.alias}:\n{setup(config).rstrip()}")
-        except HostUnavailable as error:
+        except HostError as error:
             print(f"mrig: {error}", file=sys.stderr)
             failed = 1
     return failed
@@ -205,6 +270,7 @@ def parser() -> argparse.ArgumentParser:
         instrument.configure(command)
         command.set_defaults(handler=lambda arguments, i=instrument: run_instrument(i, arguments))
     ab.configure(commands.add_parser("ab", help="compare two builds by any measuring instrument"))
+    gate.configure(commands.add_parser("gate", help=gate.QUESTION))
 
     command = commands.add_parser("inspect", help="host holds and queues, or a read-only command")
     command.add_argument("--host")
@@ -226,6 +292,7 @@ def parser() -> argparse.ArgumentParser:
     command = commands.add_parser("stop", help="stop a run")
     command.add_argument("run")
     command.set_defaults(handler=_stop)
+    commands.add_parser("fetch", help="answer the ended runs whose caller is gone and fetch them whole").set_defaults(handler=_fetch)
     command = commands.add_parser("setup", help="prepare and verify hosts")
     command.add_argument("names", nargs="+", help="hosts or pools")
     command.set_defaults(handler=_setup)
@@ -236,7 +303,13 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     arguments = parser().parse_args(argv)
     arguments.argv = argv  # a run's own process is this command again (`results.perform`)
-    return arguments.handler(arguments)
+    arguments.answering = None  # set only to answer a collected run (`_collect`)
+    if CHILD not in os.environ and arguments.handler is not _fetch:
+        _collect(sys.stderr, rest=False)  # runs whose caller is gone, now ended
+    try:
+        return arguments.handler(arguments)
+    except sources.SourceUnavailable as error:  # outside a git worktree, or a ref it cannot build
+        raise SystemExit(f"mrig: {error}") from None
 
 
 if __name__ == "__main__":

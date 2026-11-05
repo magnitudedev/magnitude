@@ -1,8 +1,15 @@
 """`bench`: how does an engine serve this model over HTTP, against other engines? The serving
-benchmark (`magnitude-bench job`), with its measurement options as this instrument's own, our
-engine and the harness built from the checkout as the measured engines need them, and our
-engine's persistent kernel caches unless the run names a cache. Engineering questions about one
-engine's speed go to `step` and `kernel`; this is serving as users see it.
+benchmark (`magnitude-bench job`), with its measurement options as this instrument's own, and
+our engine and the harness built from the checkout as the measured engines need them.
+Engineering questions about one engine's speed go to `step` and `kernel`; this is serving as
+users see it.
+
+Our engine serves from a kernel cache fresh per run (`{runs}/kernels`, which stays on the host
+and goes with the run's directory), or the one the run names (`--magnitude-cache-dir`). Before
+it serves, the product's measurer prices the machine into that cache: `magnitude-assess`, which
+runs the function the service's measurement job runs (`worker::measure::measure_machine`),
+times every executor cost point the cache has no record of. The bench's report shows the
+engine's elastic expert bank over each pass (`magnitude_bench.report.expert_banks`).
 
 Our engine and the harness are built by separate cargo invocations (`binaries`): the harness
 enables the engine's development tuning tools, which one invocation would unify into the served
@@ -11,13 +18,13 @@ binary.
 
 import argparse
 
+from .. import sync
 from ..engine import Step, Weights
 from . import Answer, Instrument, JobResult, Plan, harness
-from .binaries import ENGINE, ENGINE_BUILD
+from .binaries import ASSESS, ASSESS_BUILD, ENGINE, ENGINE_BUILD
 
 BENCH = "{venv}/bin/magnitude-bench"
-# A user's installation keeps compiled kernels and tuning across launches.
-KERNEL_CACHE_ROOT = "{root}/kernel-cache"
+KERNELS = f"{{runs}}/{sync.RUN_KERNELS}"  # the run's own kernel cache
 REPORT_LINES = 60
 
 
@@ -27,7 +34,7 @@ def configure(parser: argparse.ArgumentParser) -> None:
     bench.measurement_options(parser)
 
 
-def plan(arguments, source) -> Plan:
+def plan(arguments, source, host) -> Plan:
     from magnitude_bench import cli as bench
 
     if arguments.magnitude_device == "auto":
@@ -38,23 +45,34 @@ def plan(arguments, source) -> Plan:
         raise SystemExit(f"bench: {error}") from None
     engines = arguments.engine or ["magnitude"]
     builds = [Step("bench", ("uv", "sync", "--frozen", "--project", "{src}/evaluation", "--package", "magnitude-bench"))]
-    ours = []
-    if "magnitude" in engines and arguments.magnitude_binary is None:
-        builds.append(ENGINE_BUILD)
-        ours += ["--magnitude-binary", ENGINE]
+    jobs, ours = [], []
+    if "magnitude" in engines:
+        if arguments.magnitude_binary is None:
+            builds.append(ENGINE_BUILD)
+            ours += ["--magnitude-binary", ENGINE]
+        if arguments.magnitude_cache_dir is None:  # a named cache is passed with the bench's options
+            cache = KERNELS
+            ours += ["--magnitude-cache-dir", cache]
+        else:
+            cache = str(arguments.magnitude_cache_dir)
+        builds.append(ASSESS_BUILD)
+        jobs.append(("measure", Step("measure", (
+            ASSESS, "--device", arguments.magnitude_device, "--kernels", cache, "--topology"))))
     if any(engine in bench.HOST_RENDERED for engine in engines) and arguments.harness is None:
         builds.append(harness.BUILD)
         ours += ["--harness", harness.EXECUTABLE]
-    if "magnitude" in engines and arguments.magnitude_cache_dir is None and arguments.magnitude_kernel_cache_root is None:
-        ours += ["--magnitude-kernel-cache-root", KERNEL_CACHE_ROOT]
-    job = Step("bench", (
+    jobs.append(("bench", Step("bench", (
         BENCH, "job", "--model", arguments.model, *bench.arguments(arguments), *ours,
         "--artifacts", "{artifacts}", "--output", "{run_dir}", "--build-identity", "{build_file}",
-    ))  # fmt: skip
-    return Plan(builds=tuple(builds), jobs=(("bench", job),), device="timed", acquires=Weights(arguments.model))
+    ))))  # fmt: skip
+    return Plan(builds=tuple(builds), jobs=tuple(jobs), device="timed", acquires=Weights(arguments.model))
 
 
 def answer(arguments, results: dict[str, JobResult]) -> Answer:
+    priced = results.get("measure")  # only when our engine serves
+    if priced is not None and priced.code != 0:
+        return Answer((f"the machine's measurement exited {priced.code}: our engine served unpriced",
+                       *priced.output()[-15:]), False)
     result = results["bench"]
     report = result.directory / "report.md"
     if result.code != 0 or not report.exists():

@@ -16,7 +16,7 @@ def _arguments(arguments) -> list[str]:
     return given or ["--workspace", "--all-targets"]
 
 
-def plan(arguments, source) -> Plan:
+def plan(arguments, source, host) -> Plan:
     argv = ("cargo", "check", "--message-format=short", *_arguments(arguments))
     return Plan(builds=(Step("check", argv),), jobs=(), device=None)
 

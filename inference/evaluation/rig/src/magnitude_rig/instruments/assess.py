@@ -1,5 +1,5 @@
 """`assess`: what do the planner, assessment and estimator decide for this model on this
-device? `magnitude-assess` on the model's acquired files, with the checkout's kernel cache
+device? `magnitude-assess` on the model's acquired files, with the host's kernel cache
 holding the machine's cost measurements (only points without a record are timed). Prints the
 assessment's own JSON per model: whether it fits, how it would run, the estimated decode speed.
 With `--breakdown`, the planned step at each depth by entry, from the plan: each entry's
@@ -41,18 +41,18 @@ def configure(parser: argparse.ArgumentParser) -> None:
                         help="the planned step at each depth by entry: launches and estimated time")
 
 
-def plan(arguments, source) -> Plan:
+def plan(arguments, source, host) -> Plan:
     if (arguments.model is None) == (not arguments.catalog):
         raise SystemExit("assess: give --model or --catalog")
     if arguments.catalog:
         if arguments.depths or arguments.breakdown:
             raise SystemExit("assess: --depths and --breakdown are per model, not with --catalog")
-        # The checkout's kernel cache is the service cache root's `kernels`: the measurement
+        # The host's kernel cache is the service cache root's `kernels`: the measurement
         # the first job stores there is the one the service's assessment reads.
         jobs = (
-            ("measure", Step("measure", (ASSESS, "--device", arguments.backend, "--kernels", "{checkout}/kernels", "--topology"))),
+            ("measure", Step("measure", (ASSESS, "--device", arguments.backend, "--kernels", "{engine_cache}/kernels", "--topology"))),
             ("catalog", Step("catalog", (
-                CATALOG, "--bundle", "{catalog}/model-planner-inputs.bundle", "--cache-root", "{checkout}",
+                CATALOG, "--bundle", "{catalog}/model-planner-inputs.bundle", "--cache-root", "{engine_cache}",
                 "--model-store", "{models}", "--snapshot", "{run_dir}/snapshot.json",
             ))),
         )  # fmt: skip
@@ -60,7 +60,7 @@ def plan(arguments, source) -> Plan:
     extra = (*(("--depths", arguments.depths) if arguments.depths else ()),
              *(("--breakdown",) if arguments.breakdown else ()))
     job = Step("assess", (
-        "{python}", "-c", RUNNER, "{artifacts}", ASSESS, arguments.backend, "{checkout}/kernels", *extra,
+        "{python}", "-c", RUNNER, "{artifacts}", ASSESS, arguments.backend, "{engine_cache}/kernels", *extra,
     ))  # fmt: skip
     return Plan(
         builds=BUILDS,

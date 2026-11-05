@@ -1,4 +1,4 @@
-"""The evaluation contract formats a reference reads and writes (`specs/26-10-08/evaluation-contracts.md`):
+"""The evaluation contract formats a reference reads and writes:
 rendered fixtures (harness `render` output), the catalog acquisition object, and logits outputs."""
 from __future__ import annotations
 

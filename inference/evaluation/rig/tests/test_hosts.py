@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from magnitude_rig import sync
+from magnitude_rig import sources, sync
 from magnitude_rig.connection import Remote
 from magnitude_rig.hosts import HostConfig, Hosts
 
@@ -43,7 +43,7 @@ def test_pool_and_host_names_must_not_collide(tmp_path):
 
 
 def test_manifest_excludes_native_submodule_and_build_outputs():
-    paths = sync.manifest()
+    paths = sync.manifest(sources.checkout())
     assert "Cargo.toml" in paths
     assert "evaluation/rig/hosts.example.json" in paths
     assert any(p.startswith("engine/templates/native/") for p in paths)

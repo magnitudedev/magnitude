@@ -1,20 +1,18 @@
-"""Connecting to a host: OS probe, host package deployment, and the agent session holding a
-run's holds."""
+"""Connecting to a host: OS probe, host package deployment, and a run's runner on the host."""
 
 import base64
+import contextlib
 import io
 import json
-import queue
 import shlex
 import subprocess
-import threading
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+from .host.agent import MODULE as AGENT
 from .hosts import HostConfig
-
 
 
 def _host_package() -> bytes:
@@ -34,8 +32,6 @@ def _host_package() -> bytes:
 
 
 HOST_PACKAGE = _host_package()
-AGENT = "magnitude_rig.host.agent"
-HEARTBEAT_SECONDS = 10.0
 # An unreachable host must not hold up placement among the reachable ones: a reachable host
 # connects in well under a second, so a few seconds bounds the cost of one that does not.
 SSH_OPTIONS = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
@@ -92,8 +88,17 @@ def windows_command(argv: list[str], cwd: str | None = None) -> str:
     return f"powershell.exe -NoProfile -NonInteractive -EncodedCommand {encoded}"
 
 
-class HostUnavailable(Exception):
-    """The host cannot be reached, or its agent session ended."""
+class HostError(Exception):
+    """A host did not do what was asked: it could not be reached, or a command on it failed."""
+
+
+class HostUnavailable(HostError):
+    """The host cannot be reached: ssh's own exit 255 or a timeout, which a later attempt may
+    pass."""
+
+
+class CommandFailed(HostError):
+    """A command on a reachable host failed, which no later attempt changes."""
 
 
 @dataclass(frozen=True)
@@ -136,6 +141,12 @@ class Remote:
         return "/".join((self.root, *parts))
 
 
+def unreachable(host, returncode: int) -> bool:
+    """Whether a command run on `host` (a HostConfig or Remote) through ssh exited with ssh's own
+    255, which means the host was not reached, rather than the command's code."""
+    return returncode == 255 and not host.local
+
+
 def _attempt(host, line: str, stdin: bytes | None, timeout: float):
     """Run `line` on `host` (a HostConfig or Remote); an unreachable host (ssh's own 255 or a
     timeout) raises."""
@@ -145,10 +156,19 @@ def _attempt(host, line: str, stdin: bytes | None, timeout: float):
             shell(alias, host.local, line), input=stdin, capture_output=True, timeout=timeout
         )
     except subprocess.TimeoutExpired as error:
-        raise HostUnavailable(f"{alias}: ssh timed out after {timeout} s") from error
-    if result.returncode == 255 and not host.local:
-        raise HostUnavailable(f"{alias}: {result.stderr.decode(errors='replace').strip()}")
+        raise HostUnavailable(f"{alias}: unreachable (ssh timed out after {timeout} s)") from error
+    if unreachable(host, result.returncode):
+        raise HostUnavailable(f"{alias}: unreachable ({result.stderr.decode(errors='replace').strip()})")
     return result
+
+
+def reachable(host) -> bool:
+    """Whether `host` (a HostConfig or Remote) answers now."""
+    try:
+        _attempt(host, "true", None, 30)
+    except HostUnavailable:
+        return False
+    return True
 
 
 def read(host, line: str, *, timeout: float = 120) -> tuple[int, str, str]:
@@ -160,7 +180,7 @@ def read(host, line: str, *, timeout: float = 120) -> tuple[int, str, str]:
 def _ssh(host, line: str, *, stdin: bytes | None = None, timeout: float = 60) -> str:
     result = _attempt(host, line, stdin, timeout)
     if result.returncode != 0:
-        raise HostUnavailable(
+        raise CommandFailed(
             f"{host.alias}: `{line[:80]}` exited {result.returncode}: "
             f"{result.stderr.decode(errors='replace').strip()}"
         )
@@ -216,135 +236,113 @@ def setup(config: HostConfig) -> str:
     return _ssh(config, f"sh -c {shlex.quote(script)}")
 
 
-def host_status(remote: Remote, checkout: str | None = None) -> dict:
-    """The host agent's `status`: live holds and requests, queue estimates, free disk, and
-    whether `checkout` is present."""
+def host_status(remote: Remote, sides: list[tuple[str, str]] = ()) -> dict:
+    """The host agent's `status`: live holds and requests, queue estimates, free disk, and, for
+    a run whose sides are `sides` (each its source's key and its build's, `engine.build_key`),
+    the checkout each would claim now, what its build would need and the room it would find."""
     argv = remote.host(AGENT, "status", "--root", remote.root)
-    if checkout:
-        argv += ["--checkout", checkout]
+    for source, build in sides:
+        argv += ["--source", source, "--build", build]
     return json.loads(_ssh(remote, remote.command(argv)[-1]).strip().splitlines()[-1])
 
 
-class AgentSession:
-    """One long-lived ssh session to the host agent for one run, kept alive by a heartbeat."""
+def run_state(remote: Remote, run: str) -> str:
+    """How run `run` stands on the host (the agent's `state`): `running`, `ended`, `vanished` or
+    `absent`. Read through this command's agent, whichever agent the runner runs under."""
+    argv = remote.host(AGENT, "state", "--root", remote.root, "--run", run)
+    return _json_line(_ssh(remote, remote.command(argv)[-1]))["state"]
 
-    def __init__(self, remote: Remote, *, who: str, run: str, purpose: str, estimate: float):
-        self.remote = remote
-        argv = remote.host(
-            AGENT, "session", "--root", remote.root, "--who", who,
-            "--run", run, "--purpose", purpose, "--estimate", str(estimate),
-        )
-        self._process = subprocess.Popen(
-            remote.command(argv, login=True),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-        self._events: queue.Queue = queue.Queue()
-        self._write_lock = threading.Lock()
-        self._closed = threading.Event()
-        self._stderr: list[str] = []
-        threading.Thread(target=self._read, daemon=True).start()
-        threading.Thread(target=self._read_stderr, daemon=True).start()
-        threading.Thread(target=self._heartbeat, daemon=True).start()
 
-    def _read(self) -> None:
-        for line in self._process.stdout:
-            try:
-                event = json.loads(line)
-            except ValueError:
-                continue  # login-shell noise
-            if isinstance(event, dict) and "event" in event:
-                self._events.put(event)
-        self._events.put(None)
+class HostRun:
+    """One run's runner on a host, through the agent it runs under (`host/agent.py`, its
+    `invocation`): each call is its own ssh command, so none outlives a lost connection."""
 
-    def _read_stderr(self) -> None:
-        for line in self._process.stderr:
-            self._stderr.append(line)
+    def __init__(self, remote: Remote, run: str, agent: list[str]):
+        self.remote, self.run, self.agent = remote, run, agent
 
-    def _send(self, request: dict) -> None:
-        with self._write_lock:
-            try:
-                self._process.stdin.write(json.dumps(request) + "\n")
-                self._process.stdin.flush()
-            except (BrokenPipeError, OSError, ValueError):
-                pass
+    @classmethod
+    @contextlib.contextmanager
+    def staging(cls, remote: Remote, run: str) -> Iterator["Callable[[dict], HostRun] | HostRun"]:
+        """The host's hold on the run's directory while the caller stages it (the agent's
+        `start`), for the block: it yields `start(plan)`, which starts the run's runner with
+        `plan` (it owns the run once that returns). Leaving the block without starting
+        withdraws, as does a lost connection: the directory is then a gone run's. For a run an
+        earlier attempt started (its reply lost), it yields that run's runner instead: nothing
+        is staged over it."""
+        argv = remote.host(AGENT, "start", "--root", remote.root, "--run", run)
+        process = subprocess.Popen(remote.command(argv, login=True), stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-    def _heartbeat(self) -> None:
-        while not self._closed.wait(HEARTBEAT_SECONDS):
-            self._send({"op": "heartbeat"})
+        def failed(what: str) -> HostError:
+            process.wait()
+            failure = HostUnavailable if unreachable(remote, process.returncode) else CommandFailed
+            return failure(f"{remote.alias}: {what} run {run} exited {process.returncode}: "
+                           f"{process.stderr.read().strip()}")
 
-    def _ended(self) -> HostUnavailable:
-        self._process.wait()
-        detail = "".join(self._stderr).strip()
-        return HostUnavailable(f"{self.remote.alias}: agent session ended. {detail}".strip())
+        def start(plan: dict) -> "HostRun":
+            stdout, stderr = process.communicate(json.dumps(plan))
+            if process.returncode != 0:
+                failure = HostUnavailable if unreachable(remote, process.returncode) else CommandFailed
+                raise failure(f"{remote.alias}: starting run {run} exited {process.returncode}: {stderr.strip()}")
+            return cls(remote, run, _json_line(stdout)["agent"])
 
-    def _next(self) -> dict:
-        event = self._events.get()
-        if event is None:
-            self._events.put(None)
-            raise self._ended()
-        if event["event"] == "stopped":
-            raise HostUnavailable(f"{self.remote.alias}: agent stopped: {event['reason']}")
-        if event["event"] == "error":
-            raise RuntimeError(f"{self.remote.alias} agent: {event['message']}")
-        return event
-
-    def hold(self, kind: str, on_wait: Callable[[list[dict]], None]) -> None:
-        """Return once the agent holds `kind`, reporting each change of what blocks it."""
-        self._send({"op": "hold", "kind": kind})
-        while True:
-            event = self._next()
-            if event["event"] == "held" and event["kind"] == kind:
-                return
-            if event["event"] == "waiting":
-                on_wait(event["blocking"])
-
-    def release(self, kind: str) -> None:
-        self._send({"op": "release", "kind": kind})
-        while self._next()["event"] != "released":
-            pass
-
-    def kill(self) -> None:
-        """End the running command, if any (its output and exit are drained)."""
-        self._send({"op": "kill"})
-        while self._next()["event"] != "killed":
-            pass
-
-    def evict(self, keep: str) -> dict:
-        self._send({"op": "evict", "keep": keep})
-        while (event := self._next())["event"] != "evicted":
-            pass
-        return event
-
-    def run(
-        self,
-        argv: list[str],
-        *,
-        cwd: str,
-        env: dict[str, str],
-        input: str | None,
-        on_output: Callable[[str, str], None],
-    ) -> int:
-        self._send({"op": "run", "argv": argv, "cwd": cwd, "env": env, "input": input})
-        while True:
-            event = self._next()
-            if event["event"] == "output":
-                on_output(event["stream"], event["text"])
-            elif event["event"] == "exited":
-                return event["code"]
-
-    def close(self) -> None:
-        self._send({"op": "end"})
-        self._closed.set()
         try:
-            self._process.stdin.close()
-        except OSError:
-            pass
+            for line in process.stdout:  # past login-shell noise to the hold
+                try:
+                    held = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(held, dict) and ("staging" in held or "started" in held):
+                    break
+            else:
+                raise failed("holding")
+            yield cls(remote, run, held["started"]["agent"]) if "started" in held else start
+        finally:
+            if process.poll() is None:
+                process.stdin.close()  # withdraw: no plan
+                process.wait()
+
+    def _argv(self, command: str, *extra: str) -> list[str]:
+        return [self.remote.python, *self.agent, command, "--root", self.remote.root, "--run", self.run, *extra]
+
+    def follow(self, after: int) -> Iterator[dict]:
+        """The run's events after sequence `after`, as the runner writes them, through `ended`
+        (or `vanished`); a lost connection raises `HostUnavailable`, the agent's own failure
+        `CommandFailed`."""
+        process = subprocess.Popen(
+            self.remote.command(self._argv("follow", "--after", str(after))),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
         try:
-            self._process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            self._process.kill()
-            self._process.wait()
+            for line in process.stdout:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue  # login-shell noise
+                if not isinstance(event, dict) or "event" not in event:
+                    continue  # login-shell noise that parses as JSON (a bare number)
+                yield event
+                if event["event"] in ("ended", "vanished"):
+                    return
+            process.wait()
+            failure = HostUnavailable if unreachable(self.remote, process.returncode) else CommandFailed
+            raise failure(f"{self.remote.alias}: following run {self.run} ended: "
+                          f"{process.stderr.read().strip()}")
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+
+    def stop(self) -> dict:
+        """Stop the runner if it still runs (the agent's `stop`): whether it was stopped, and
+        why not; the agent's own failure raises `CommandFailed`."""
+        return _json_line(_ssh(self.remote, self.remote.command(self._argv("stop"))[-1]))
+
+    def fetched(self) -> None:
+        """The run's directory is fetched: the runner's agent removes it."""
+        _ssh(self.remote, self.remote.command(self._argv("fetched"))[-1])
+
+
+def _json_line(output: str) -> dict:
+    return json.loads(output.strip().splitlines()[-1])
+

@@ -101,7 +101,7 @@ def test_built_executables_are_named_files_of_a_cargo_profile_directory(tmp_path
     assert provenance.built_executables(texts) == [os.path.realpath(binary)]
     assert provenance.built_executables([f"ls -l {binary} && '{binary}' run"]) == [os.path.realpath(binary)]
     assert provenance.built_executables(["it's not a command line"]) == []
-    assert provenance.verify([str(script)], [])["status"] == "no-built-executable"
+    assert provenance.verify([str(script)], [], str(tmp_path / "target"))["status"] == "no-built-executable"
 
 
 @needs_cargo
@@ -110,7 +110,7 @@ def test_executable_built_through_the_wrapper_is_verified(tmp_path):
     wrapper = provenance.install(str(tmp_path / "root"))
     cargo_build(source, target, wrapper)
     binary = str(target / "release" / "my-app")
-    record = provenance.verify([binary], [str(source)])
+    record = provenance.verify([binary], [str(source)], str(target))
     assert record["status"] == "verified"
     (executable,) = record["executables"]
     assert executable["units"] == 2 and executable["reasons"] == []
@@ -118,7 +118,7 @@ def test_executable_built_through_the_wrapper_is_verified(tmp_path):
     # A real change is rebuilt and verified again; its record follows the new bytes.
     (source / "lib/src/part.rs").write_text(SECOND)
     assert "Compiling my-lib" in cargo_build(source, target, wrapper)
-    again = provenance.verify([binary], [str(source)])
+    again = provenance.verify([binary], [str(source)], str(target))
     assert again["status"] == "verified"
     assert again["executables"][0]["sources_digest"] != executable["sources_digest"]
 
@@ -130,7 +130,7 @@ def test_reused_unit_of_other_content_is_contradicted(tmp_path):
     cargo_build(source, target, wrapper)
     replace_keeping_cargo_fresh(source / "lib/src/part.rs", SECOND)
     assert "Compiling" not in cargo_build(source, target, wrapper)  # cargo's freshness is fooled
-    record = provenance.verify([str(target / "release" / "my-app")], [str(source)])
+    record = provenance.verify([str(target / "release" / "my-app")], [str(source)], str(target))
     assert record["status"] == "refused"
     (executable,) = record["executables"]
     assert executable["status"] == "contradicted"
@@ -143,7 +143,7 @@ def test_reused_unit_of_other_content_is_contradicted(tmp_path):
 def test_executable_not_built_through_the_wrapper_is_unverified(tmp_path):
     source, target = workspace(tmp_path / "ws"), tmp_path / "target"
     cargo_build(source, target, None)
-    record = provenance.verify([str(target / "release" / "my-app")], [str(source)])
+    record = provenance.verify([str(target / "release" / "my-app")], [str(source)], str(target))
     assert record["status"] == "refused"
     assert record["executables"][0]["status"] == "unverified"
 
@@ -155,7 +155,7 @@ def test_relinking_against_an_unrecorded_workspace_unit_is_unverified(tmp_path):
     cargo_build(source, target, wrapper)
     for record in (target / "release" / "deps").glob("my_lib-*.provenance.json"):
         record.unlink()
-    record = provenance.verify([str(target / "release" / "my-app")], [str(source)])
+    record = provenance.verify([str(target / "release" / "my-app")], [str(source)], str(target))
     assert record["executables"][0]["status"] == "unverified"
     assert "compiles synchronized sources but has no compilation record" in "".join(
         record["executables"][0]["reasons"]
@@ -175,11 +175,10 @@ def test_a_run_refuses_a_binary_it_cannot_tie_to_the_sources(rig):
     source = _with_workspace(source)
     build = engine.Step("cargo", ("cargo", "build", "--release", "--offline"))
     job = engine.Step("app", ("{target}/release/my-app",))
-    request = engine.Request(
-        instrument="t", purpose="p", estimate=600, backend="cpu", host="alpha",
-        sides=(engine.Side("source", source, (build,)),), jobs=(engine.Job("source", "app", job),),
-        device="device",
-    )
+    work = engine.Work(sides=(engine.Side("source", source, (build,)),), jobs=(engine.Job("source", "app", job),),
+                       device="device")
+    request = engine.Request(instrument="t", purpose="p", estimate=600, backend="cpu", host="alpha",
+                             work=lambda alias: work)
     outcome = engine.execute(request, engine.new_run_id("test"), hosts=hosts, announce=lambda line: None)
     assert outcome.codes == {"app": 0}
     assert "first generated" in (outcome.results / "logs" / "job-app.log").read_text()
@@ -188,7 +187,7 @@ def test_a_run_refuses_a_binary_it_cannot_tie_to_the_sources(rig):
 
     # The same new bytes here and on the host, with a time older than the build outputs: the
     # mirror transfers nothing and cargo rebuilds nothing, so the old unit would be reused.
-    host_copy = tmp_path / "alpha" / "checkouts" / source.key / "src" / "lib/src/part.rs"
+    host_copy = tmp_path / "alpha" / "checkouts" / "slot-0" / "src" / "lib/src/part.rs"
     for path in (source.directory / "lib/src/part.rs", host_copy):
         replace_keeping_cargo_fresh(path, SECOND)
     with pytest.raises(engine.RunFailed) as failed:
@@ -197,14 +196,44 @@ def test_a_run_refuses_a_binary_it_cannot_tie_to_the_sources(rig):
     assert not (failed.value.outcome.results / "logs" / "job-app.log").exists()
 
 
+@needs_cargo
+def test_a_job_finds_only_executables_built_from_its_source(rig):
+    """A job that reaches an executable only at run time (a script, through `$MRIG_TARGET`),
+    after its source changed: with a build it runs the rebuilt executable; without one the old
+    executable is withdrawn before the job, which finds none. It never runs the old one."""
+    hosts, source, tmp_path = rig
+    source = _with_workspace(source)
+    build = engine.Step("cargo", ("cargo", "build", "--release", "--offline"))
+    job = engine.Step("app", ("sh", "-c", '"$APP_TARGET/release/my-app"'), (("APP_TARGET", "{target}"),))
+
+    def run(builds: tuple) -> engine.Outcome:
+        work = engine.Work(sides=(engine.Side("source", source, builds),), jobs=(engine.Job("source", "app", job),),
+                           device="device")
+        request = engine.Request(instrument="t", purpose="p", estimate=600, backend="cpu", host="alpha",
+                                 work=lambda alias: work)
+        return engine.execute(request, engine.new_run_id("test"), hosts=hosts, announce=lambda line: None)
+
+    def output(outcome: engine.Outcome) -> str:
+        return (outcome.results / "logs" / "job-app.log").read_text()
+
+    first = run((build,))
+    assert first.codes == {"app": 0} and "first generated" in output(first)
+    (source.directory / "lib/src/part.rs").write_text(SECOND)
+    stale = run(())
+    assert stale.codes["app"] != 0 and "first" not in output(stale)
+    proof = json.loads((stale.results / "provenance-source.json").read_text())
+    assert [Path(e["path"]).name for e in proof["withdrawn"]] == ["my-app"]
+    rebuilt = run((build,))
+    assert rebuilt.codes == {"app": 0} and "second generated" in output(rebuilt)
+
+
 def test_every_build_step_compiles_through_the_checkouts_recording_wrapper(rig):
     hosts, source, tmp_path = rig
     show = engine.Step("show", (sys.executable, "-c", f"import os; print(os.environ['{engine.COMPILER}'])"))
-    request = engine.Request(
-        instrument="t", purpose="p", estimate=600, backend="cpu", host="alpha",
-        sides=(engine.Side("source", source, (show,)),),
-    )
+    work = engine.Work(sides=(engine.Side("source", source, (show,)),))
+    request = engine.Request(instrument="t", purpose="p", estimate=600, backend="cpu", host="alpha",
+                             work=lambda alias: work)
     outcome = engine.execute(request, engine.new_run_id("test"), hosts=hosts, announce=lambda line: None)
-    wrapper = tmp_path / "alpha" / "checkouts" / source.key / "provenance" / "rustc"
+    wrapper = tmp_path / "alpha" / "checkouts" / "slot-0" / "provenance" / "rustc"
     assert f"{wrapper}\n" in (outcome.results / "logs" / "build-source.log").read_text()
     assert os.access(wrapper, os.X_OK)

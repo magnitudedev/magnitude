@@ -5,6 +5,9 @@ answers a second time becomes an instrument, or a case or option of one.
 The file runs by its `#!` line (`sh` without one), from the checkout's source root, with
 `MRIG_SRC`, `MRIG_TARGET`, `MRIG_VENV`, `MRIG_RUN` (its run directory, fetched back),
 `MRIG_MODELS`, `MRIG_ROOT` and, with `--model`, `MRIG_ARTIFACTS` (the acquired model's paths).
+Only executables built from the staged source are left in `MRIG_TARGET`: one a `--prepare`
+did not build and that an earlier source produced is withdrawn before the script runs
+(`host/provenance.py`), so a script finds it missing, never stale.
 """
 
 import argparse
@@ -39,7 +42,7 @@ def configure(parser: argparse.ArgumentParser) -> None:
                              "e.g. 'cargo build --release -p magnitude-harness'")
 
 
-def plan(arguments, source) -> Plan:
+def plan(arguments, source, host) -> Plan:
     if not arguments.file.is_file():
         raise SystemExit(f"script: {arguments.file} is not a file")
     builds = tuple(Step("prepare", tuple(argv)) for argv in arguments.prepare)

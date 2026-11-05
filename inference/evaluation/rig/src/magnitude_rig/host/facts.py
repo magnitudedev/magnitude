@@ -38,12 +38,68 @@ class HostFacts:
     chip: Optional[str]
     cpu_cores_physical: Optional[int]
     cpu_cores_logical: Optional[int]
+    # The logical CPUs this host's runs may use (`cpus_allowed`), of `cpu_cores_logical`.
+    cpus_allowed: Optional[float]
     memory_bytes: Optional[int]
     gpus: Optional[List[Gpu]]
     errors: List[str]
 
     def to_json(self) -> dict:
         return asdict(self)
+
+
+def cpus_allowed() -> float:
+    """The logical CPUs this process may run on: on Linux its affinity (the container's cpuset),
+    bounded by its cgroup's CPU quota on the way to the root; elsewhere the machine's. Fewer than
+    the machine's (`os.cpu_count()`, every logical CPU, a container's too) means the machine's
+    CPUs, and so its CPU temperatures and load, are shared with work that is not this host's."""
+    if not sys.platform.startswith("linux"):
+        return float(os.cpu_count())
+    allowed = float(len(os.sched_getaffinity(0)))
+    quotas = [quota for quota in _cgroup_quotas() if quota is not None]
+    return min([allowed, *quotas])
+
+
+def _cgroup_quotas(membership: Path = Path("/proc/self/cgroup"),
+                   mount: Path = Path("/sys/fs/cgroup")) -> List[Optional[float]]:
+    """Each CPU quota (CPUs) of this process's cgroup and its ancestors, None where unlimited.
+    A container without its own cgroup namespace names its host's path, which its own mount
+    lacks: the walk up still reaches the mount's root, the container's own cgroup."""
+    quotas: List[Optional[float]] = []
+    for line in membership.read_text().splitlines():
+        _, controllers, path = line.split(":", 2)
+        if controllers == "":  # v2: `cpu.max` is "<quota> <period>" or "max <period>"
+            root, quota_of = mount, _v2_quota
+        elif "cpu" in controllers.split(","):  # v1: cfs quota and period, -1 unlimited
+            root = next((mount / name for name in ("cpu,cpuacct", "cpu") if (mount / name).is_dir()), None)
+            if root is None:
+                continue
+            quota_of = _v1_quota
+        else:
+            continue
+        directory = root / path.lstrip("/")
+        while True:
+            quotas.append(quota_of(directory))
+            if directory == root:
+                break
+            directory = directory.parent
+    return quotas
+
+
+def _v2_quota(directory: Path) -> Optional[float]:
+    limit = directory / "cpu.max"
+    if not limit.exists():  # the root, or the cpu controller not enabled there: no limit
+        return None
+    quota, period = limit.read_text().split()
+    return None if quota == "max" else int(quota) / int(period)
+
+
+def _v1_quota(directory: Path) -> Optional[float]:
+    limit = directory / "cpu.cfs_quota_us"
+    if not limit.exists():
+        return None
+    quota = int(limit.read_text())
+    return None if quota < 0 else quota / int((directory / "cpu.cfs_period_us").read_text())
 
 
 def _run(argv: List[str]) -> str:
@@ -174,6 +230,7 @@ def capture(alias: Optional[str]) -> HostFacts:
         chip=chip,
         cpu_cores_physical=physical,
         cpu_cores_logical=os.cpu_count(),
+        cpus_allowed=attempt("cpus_allowed", cpus_allowed),
         memory_bytes=memory,
         gpus=gpus,
         errors=errors,

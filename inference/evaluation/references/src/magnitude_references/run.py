@@ -21,6 +21,7 @@ import sys
 import torch
 
 from magnitude_references import digest, record
+from magnitude_rig import store
 from magnitude_references.contract import (LogitsWriter, RenderedFixture, check_match, read_artifacts,
                                            read_rendered)
 from magnitude_references.families import family_of, open_reference
@@ -30,7 +31,6 @@ from magnitude_references.performance import BATCH_TOKENS, HEAD_ROWS
 from magnitude_references.sanity import Bounds, Gate
 
 LOGITS = "logits"
-RESULTS = Path(__file__).resolve().parents[3] / "results"  # inference/evaluation/results
 
 
 @dataclass(frozen=True)
@@ -112,4 +112,5 @@ def build_reference(rendered_path: Path, artifacts_path: Path, output: Path, opt
 
 
 def default_output(rendered_digest: str) -> Path:
-    return RESULTS / f"{record.utc_stamp()}-reference-{rendered_digest[:8]}"
+    """A new run directory in the repository's results store (`magnitude_rig.store`)."""
+    return store.results() / f"{record.utc_stamp()}-reference-{rendered_digest[:8]}"
