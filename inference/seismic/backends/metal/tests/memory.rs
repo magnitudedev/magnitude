@@ -55,18 +55,14 @@ fn a_long_run_of_submissions_leaves_no_live_heap() {
     /// What a submission left on a thread with no pool.
     const UNPOOLED_BYTES: i64 = 180;
     let (device, toolchain) = opened();
-    let pipelines = toolchain
-        .compile(
-            &ProgramSource {
-                text: "#include <metal_stdlib>\nusing namespace metal;\n\
-                       kernel void bump(device float* x [[buffer(0)]], \
-                       uint i [[thread_position_in_grid]]) { x[i] += 1; }\n"
-                    .into(),
-                entries: vec![ProgramEntry::named("bump")],
-            },
-            None,
-        )
-        .unwrap();
+    let source = ProgramSource {
+        text: "#include <metal_stdlib>\nusing namespace metal;\n\
+               kernel void bump(device float* x [[buffer(0)]], \
+               uint i [[thread_position_in_grid]]) { x[i] += 1; }\n"
+            .into(),
+        entries: vec![ProgramEntry::named("bump")],
+    };
+    let pipelines = toolchain.compile(&source).unwrap().1;
     let values = device.allocate(4096, 16).unwrap();
     let scalars = device.allocate(64, 16).unwrap();
     let submit = || {
@@ -134,7 +130,7 @@ fn programs_formed_and_released_leave_only_what_metal_keeps_a_pipeline() {
     // lets some of that go over the compiles that follow: what a program
     // leaves is read over the whole ladder, past that.
     for index in 0..16 {
-        drop(toolchain.compile(&program(index), None).unwrap());
+        drop(toolchain.compile(&program(index)).unwrap());
     }
     return_freed_pages();
     let before = ProcessMemory::read();
@@ -142,11 +138,7 @@ fn programs_formed_and_released_leave_only_what_metal_keeps_a_pipeline() {
     const LADDER: [usize; 3] = [32, 64, 128];
     for rung in LADDER {
         for index in 0..rung {
-            drop(
-                toolchain
-                    .compile(&program(1000 * rung + index), None)
-                    .unwrap(),
-            );
+            drop(toolchain.compile(&program(1000 * rung + index)).unwrap());
         }
         formed += rung;
         let held = ProcessMemory::read();

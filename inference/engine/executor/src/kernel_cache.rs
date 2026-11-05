@@ -5,10 +5,11 @@
 //! one, nothing is cached. Layout:
 //!
 //! ```text
-//! <root>/artifacts/<namespace>/<key>   what each toolchain keeps of the programs
-//!                                      Seismic formed (compiled bytes on CUDA and
-//!                                      Vulkan, a record of what was compiled on
-//!                                      Metal), one namespace per toolchain (its
+//! <root>/artifacts/<namespace>/<key>   the artifacts of the programs Seismic
+//!                                      compiled (CUDA's cubin, Vulkan's SPIR-V with
+//!                                      its pipeline cache data, Metal's source and
+//!                                      entries) and which artifact holds each entry,
+//!                                      one namespace per toolchain (its
 //!                                      ArtifactStore)
 //! <root>/tuning/<key>.json             one unit's choice per tuning key: what a load
 //!                                      serves and what it holds that choice to,
@@ -62,13 +63,18 @@
 //!   entry, of their summed size and their latest use.
 //!
 //! So evidence that a choice names and that cannot be read is a broken
-//! store, reported as that, not a miss.
+//! store, reported as that, not a miss. Program artifacts and entry
+//! pointers are Seismic's cache: one that does not decode or parse is
+//! reported, compiled again and rewritten.
 //!
-//! Every key is a content address, so nothing is ever invalidated: a changed
-//! input gives a new key. Writes go to a temporary file in the same
+//! Every key of a record or a program artifact is a content address, so
+//! neither is ever invalidated: a changed input gives a new key. An entry
+//! pointer's key names the entry, and the artifact it names may be replaced.
+//! Eviction may take an artifact and leave its pointers; a pointer whose
+//! artifact is gone is a miss. Writes go to a temporary file in the same
 //! directory and are renamed into place, so concurrent processes never see a
-//! partial entry. A file that cannot be read or parsed is a miss (it is
-//! rewritten), never an error. Reading an entry refreshes its modification
+//! partial entry. Any other file that cannot be read or parsed is a miss (it
+//! is rewritten), never an error. Reading an entry refreshes its modification
 //! time, and opening the cache evicts the least recently used entries above
 //! its capacity.
 
@@ -492,6 +498,10 @@ impl KernelCache {
 impl ArtifactStore for KernelCache {
     fn get(&self, namespace: &str, key: &ArtifactKey) -> Option<Vec<u8>> {
         self.read(&self.artifact(namespace, key))
+    }
+
+    fn contains(&self, namespace: &str, key: &ArtifactKey) -> bool {
+        self.artifact(namespace, key).is_file()
     }
 
     fn put(&self, namespace: &str, key: &ArtifactKey, bytes: &[u8]) {

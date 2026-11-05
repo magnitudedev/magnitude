@@ -481,12 +481,17 @@ fn prepare(
     if let Some(trace) = &report.trace {
         trace.conclude(tuned).map_err(internal)?;
     }
+    let formed = opened.device().programs_formed();
     tracing::info!(
         "prepared programs in {:.2} s: {} tuned entries from stored records, \
-         {} at canonical defaults for want of one",
+         {} at canonical defaults for want of one; this process compiled {} programs and loaded \
+         {} through the platform's cache in {:.2} s",
         preparing.elapsed().as_secs_f64(),
         tuned.len(),
         programs.unprepared(),
+        formed.compiles,
+        formed.platform_loads,
+        formed.platform_load_seconds,
     );
     report_load_memory("programs prepared", &catalog, opened.device());
     Ok(LoadAttempt::Loaded(PreparedPrograms {

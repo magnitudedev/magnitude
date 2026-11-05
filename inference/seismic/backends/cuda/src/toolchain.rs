@@ -11,7 +11,8 @@ use crate::direct::{formation_error, DirectModule};
 use crate::executor::Device;
 use crate::nvrtc;
 use seismic_native_target::{
-    NativeCompilationError, ProgramCache, ProgramSource, Toolchain, ToolchainIdentity,
+    Artifact, Load, NativeCompilationError, ProgramEntry, ProgramSource, Toolchain,
+    ToolchainIdentity,
 };
 
 pub struct CudaToolchain {
@@ -41,21 +42,6 @@ impl CudaToolchain {
         }
     }
 
-    /// Load `source`'s entries from a kept image, if it holds them all.
-    fn load(&self, source: &ProgramSource, kept: &[u8]) -> Option<DirectModule> {
-        let (names, cubin) = unpack(kept)?;
-        let kernels = source
-            .entries
-            .iter()
-            .map(|entry| {
-                names
-                    .iter()
-                    .find(|(expression, _)| *expression == entry.symbol)
-                    .map(|(_, lowered)| lowered.as_str())
-            })
-            .collect::<Option<Vec<_>>>()?;
-        DirectModule::load(&self.device, cubin, &kernels).ok()
-    }
 }
 
 /// Everything besides the source that determines a CUBIN: the release,
@@ -64,52 +50,83 @@ pub fn material(formation: &nvrtc::Formation) -> String {
     format!("cuda;{formation}")
 }
 
+/// A CUDA program's artifact: its CUBIN, the architecture's final code,
+/// with each entry's name expression and lowered name.
+pub struct Cubin {
+    names: Vec<(String, String)>,
+    image: Vec<u8>,
+}
+
+impl Artifact for Cubin {
+    const ENCODING: u32 = 1;
+
+    fn encode(&self) -> Vec<u8> {
+        let expressions = self.names.iter().map(|(expression, _)| expression.as_str()).collect::<Vec<_>>();
+        let lowered = self.names.iter().map(|(_, lowered)| lowered.clone()).collect::<Vec<_>>();
+        pack(&expressions, &lowered, &self.image)
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let (names, image) = unpack(bytes)?;
+        Some(Self {
+            names,
+            image: image.to_vec(),
+        })
+    }
+}
+
 impl Toolchain for CudaToolchain {
+    type Artifact = Cubin;
     type Program = DirectModule;
+    /// Loading a CUBIN compiles nothing.
+    const LOAD: Load = Load::Complete;
 
     fn identity(&self) -> &ToolchainIdentity {
         &self.identity
     }
 
-    /// A kept image naming every requested entry is loaded by the driver:
-    /// no compiler runs.
-    fn keeps(&self, source: &ProgramSource, kept: &[u8]) -> bool {
-        unpack(kept).is_some_and(|(names, _)| {
-            source.entries.iter().all(|entry| {
-                names
-                    .iter()
-                    .any(|(expression, _)| *expression == entry.symbol)
-            })
-        })
-    }
-
     fn compile(
         &self,
         source: &ProgramSource,
-        cache: Option<&dyn ProgramCache>,
-    ) -> Result<DirectModule, NativeCompilationError> {
+    ) -> Result<(Cubin, DirectModule), NativeCompilationError> {
         self.formation.as_ref().map_err(Clone::clone)?;
-        if let Some(module) = cache
-            .and_then(|cache| cache.get())
-            .and_then(|kept| self.load(source, &kept))
-        {
-            return Ok(module);
-        }
-        let expressions = source
-            .entries
-            .iter()
-            .map(|entry| entry.symbol.as_str())
-            .collect::<Vec<_>>();
         let cubin = form_cubin(source, self.architecture)?;
-        if let Some(cache) = cache {
-            cache.put(&pack(&expressions, &cubin.lowered_names, &cubin.image));
-        }
-        let kernels = cubin
-            .lowered_names
+        let kernels = cubin.lowered_names.iter().map(String::as_str).collect::<Vec<_>>();
+        let program = DirectModule::load(&self.device, &cubin.image, &kernels)?;
+        let artifact = Cubin {
+            names: source
+                .entries
+                .iter()
+                .map(|entry| entry.symbol.clone())
+                .zip(cubin.lowered_names)
+                .collect(),
+            image: cubin.image,
+        };
+        Ok((artifact, program))
+    }
+
+    fn load(
+        &self,
+        artifact: &Cubin,
+        entries: &[ProgramEntry],
+    ) -> Result<DirectModule, NativeCompilationError> {
+        let kernels = entries
             .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        DirectModule::load(&self.device, &cubin.image, &kernels)
+            .map(|entry| {
+                artifact
+                    .names
+                    .iter()
+                    .find(|(expression, _)| *expression == entry.symbol)
+                    .map(|(_, lowered)| lowered.as_str())
+                    .ok_or_else(|| {
+                        NativeCompilationError::MalformedToolchainOutput(format!(
+                            "the CUBIN holds no `{}`",
+                            entry.symbol
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        DirectModule::load(&self.device, &artifact.image, &kernels)
     }
 }
 

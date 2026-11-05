@@ -111,7 +111,8 @@ fn formed(target: Target, program: &ProgramSource) -> Result<(), NativeCompilati
         Target::Metal { language } => {
             let device = seismic_metal::DeviceHandle::system_default()
                 .map_err(|error| NativeCompilationError::ToolchainFailure(format!("{error:?}")))?;
-            seismic_metal::toolchain::form_functions(&device, program, language).map(|_| ())
+            seismic_metal::toolchain::form_functions(&device, program, &program.entries, language)
+                .map(|_| ())
         }
     }
 }

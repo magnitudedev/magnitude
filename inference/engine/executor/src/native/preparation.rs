@@ -291,12 +291,16 @@ impl NativePreparationCache {
         let formed = device.programs_formed();
         tracing::info!(
             "programs walked in {:.2} s: imports and launch demand {:.2} s, serving walk {:.2} s, \
-             forming {} programs in {:.2} s of its threads",
+             forming {} programs in {:.2} s of its threads: {} compiled, {} loaded through the \
+             platform's cache in {:.2} s",
             began.elapsed().as_secs_f64(),
             demanded.as_secs_f64(),
             (began.elapsed() - demanded).as_secs_f64(),
             formed.programs - forming.programs,
             formed.seconds - forming.seconds,
+            formed.compiles - forming.compiles,
+            formed.platform_loads - forming.platform_loads,
+            formed.platform_load_seconds - forming.platform_load_seconds,
         );
         Ok(Self {
             readout_choices,

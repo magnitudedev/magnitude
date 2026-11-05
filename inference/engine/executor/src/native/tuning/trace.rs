@@ -53,9 +53,8 @@ use std::time::Instant;
 /// session's samples in the unit's `finished` record) and the clock's
 /// establishment (`established`, with no bound), which no reader of
 /// version 3 is asked to know; nor the `abandoned` pieces of a `budget`
-/// and its ending's `draining_seconds`. A `published` no longer includes a
-/// serving artifact: a promoting `stage` forms it, within its
-/// `publishing_seconds`.
+/// and its ending's `draining_seconds`. A promoted choice's program is the
+/// artifact its search compiled and stored: nothing more is formed for it.
 pub const TRACE_SCHEMA: &str = "tuning-trace/3";
 
 pub struct TuningTrace {

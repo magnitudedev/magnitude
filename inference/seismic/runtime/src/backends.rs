@@ -432,23 +432,6 @@ impl DevicePrograms {
         }
     }
 
-    /// What compiling `source` takes this device's toolchain when nothing
-    /// serves it ([`ProgramFormer::cold`]); nothing on the CPU backend,
-    /// which compiles nothing at run time.
-    pub(crate) fn cold(
-        &self,
-        source: &seismic_native_target::ProgramSource,
-    ) -> Result<std::time::Duration, seismic_native_target::NativeCompilationError> {
-        match self {
-            Self::Cpu => Ok(std::time::Duration::ZERO),
-            #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.cold(source),
-            Self::Cuda(former) => former.cold(source),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.cold(source),
-        }
-    }
-
     /// `sources` as this device's former reads them
     /// ([`ProgramFormer::keyed`]). The CPU backend forms no programs.
     pub(crate) fn keyed(
@@ -484,48 +467,17 @@ impl DevicePrograms {
         }
     }
 
-    /// What publishing `sources` on this device does, known before it runs
-    /// ([`ProgramFormer::publication`]).
-    pub(crate) fn publication(
-        &self,
-        sources: &[crate::formation::Keyed],
-    ) -> (crate::formation::FormationClass, usize) {
+    /// Whether this device's toolchain loads a stored program through a
+    /// platform cache ([`seismic_native_target::Load::PlatformCached`]):
+    /// a load the platform no longer serves takes a compile's time.
+    pub(crate) fn platform_cached(&self) -> bool {
         match self {
-            Self::Cpu => (crate::formation::FormationClass::Kept, 0),
+            Self::Cpu => false,
             #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.publication(sources),
-            Self::Cuda(former) => former.publication(sources),
+            Self::Metal(former) => former.platform_cached(),
+            Self::Cuda(former) => former.platform_cached(),
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.publication(sources),
-        }
-    }
-
-    /// How many of `sources` publishing them on this device compiles
-    /// ([`ProgramFormer::publishing_sources`]).
-    pub(crate) fn publishing_sources(&self, sources: &[crate::formation::Keyed]) -> usize {
-        match self {
-            Self::Cpu => 0,
-            #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.publishing_sources(sources),
-            Self::Cuda(former) => former.publishing_sources(sources),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.publishing_sources(sources),
-        }
-    }
-
-    /// Publish `sources` as a later process will request them
-    /// ([`ProgramFormer::publish`]).
-    pub(crate) fn publish(
-        &self,
-        sources: &[seismic_native_target::ProgramSource],
-    ) -> Result<(), seismic_native_target::NativeCompilationError> {
-        match self {
-            Self::Cpu => Ok(()),
-            #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.publish(sources),
-            Self::Cuda(former) => former.publish(sources),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.publish(sources),
+            Self::Vulkan(former) => former.platform_cached(),
         }
     }
 

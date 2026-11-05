@@ -4,7 +4,7 @@
 //! `VK_KHR_shader_fma` (§16.1) and one compute pipeline per entry with its
 //! workgroup size and group-memory views as specialization constants, a
 //! required subgroup size of 32 where the device takes one, and a pipeline
-//! cache of the program's own, kept with it ([`DirectModule::new`]).
+//! cache of its own, whose data is the program's artifact ([`DirectModule::compile`]).
 
 use crate::device::Device;
 use crate::facts::{SubgroupWidth, SUBGROUP_WIDTH};
@@ -153,20 +153,45 @@ pub struct DirectModule {
 }
 
 impl DirectModule {
-    /// The pipelines of `entries`, each from its sealed SPIR-V, with its
-    /// constants: the workgroup size (ids 0..3), then the rest (ids 3..). A
+    /// The pipelines of `entries`, each from its sealed SPIR-V with its
+    /// constants (the workgroup size, ids 0..3, then the rest), as the
+    /// driver compiled them, and their pipeline cache data, which
+    /// [`DirectModule::load`] creates them from without compiling. That
+    /// the data serves such a load is not proven here: the toolchain proves
+    /// it for every compile, before its artifact is stored. A
     /// pipeline-creation failure is a toolchain failure.
-    ///
-    /// `kept` is what creating them left before, [`vk::PipelineCache`] data,
-    /// empty when there is none; what creating them leaves now is returned
-    /// beside the module. A driver compiles a pipeline nothing serves, which
-    /// is most of a Vulkan load: 130 s of every load of Qwen3.6 35B Q4 on an
-    /// RTX 3090, one pipeline after another, its SPIR-V already kept. Data a
-    /// driver does not recognize it ignores, and the pipelines are compiled.
-    pub(crate) fn new(
+    pub(crate) fn compile(
+        device: &Device,
+        entries: &[(&[u32], &ProgramEntry)],
+    ) -> Result<(Self, Vec<u8>), NativeCompilationError> {
+        Self::created(device, entries, &[], vk::PipelineCreateFlags::empty())
+    }
+
+    /// The pipelines of `entries` from `pipelines`, the data
+    /// [`DirectModule::compile`] made of them on this device and driver.
+    /// Nothing is compiled: a pipeline the data does not hold fails
+    /// (`FAIL_ON_PIPELINE_COMPILE_REQUIRED`).
+    pub(crate) fn load(
+        device: &Device,
+        entries: &[(&[u32], &ProgramEntry)],
+        pipelines: &[u8],
+    ) -> Result<Self, NativeCompilationError> {
+        Self::created(
+            device,
+            entries,
+            pipelines,
+            vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED,
+        )
+        .map(|(module, _)| module)
+    }
+
+    /// The pipelines of `entries`, created in a cache that starts as
+    /// `kept`, and what the cache then holds.
+    fn created(
         device: &Device,
         entries: &[(&[u32], &ProgramEntry)],
         kept: &[u8],
+        flags: vk::PipelineCreateFlags,
     ) -> Result<(Self, Vec<u8>), NativeCompilationError> {
         let mut module = Self {
             device: device.clone(),
@@ -180,7 +205,7 @@ impl DirectModule {
             )
         }
         .map_err(|error| toolchain(format!("vkCreatePipelineCache failed: {error}")))?;
-        let created = module.create(cache, entries);
+        let created = module.create(cache, entries, flags);
         let data = created.and_then(|()| {
             unsafe { vulkan.get_pipeline_cache_data(cache) }
                 .map_err(|error| toolchain(format!("vkGetPipelineCacheData failed: {error}")))
@@ -193,6 +218,7 @@ impl DirectModule {
         &mut self,
         cache: vk::PipelineCache,
         entries: &[(&[u32], &ProgramEntry)],
+        flags: vk::PipelineCreateFlags,
     ) -> Result<(), NativeCompilationError> {
         let device = self.device.clone();
         for (words, entry) in entries {
@@ -201,9 +227,9 @@ impl DirectModule {
             let pipeline = if device.facts().shader_fma.float32 {
                 let bound = seal::fma_khr(words)
                     .map_err(|error| NativeCompilationError::MalformedToolchainOutput(error.0))?;
-                self.pipeline(cache, &bound, entry)?
+                self.pipeline(cache, &bound, entry, flags)?
             } else {
-                self.pipeline(cache, words, entry)?
+                self.pipeline(cache, words, entry, flags)?
             };
             self.pipelines.push(pipeline);
         }
@@ -215,6 +241,7 @@ impl DirectModule {
         cache: vk::PipelineCache,
         words: &[u32],
         entry: &ProgramEntry,
+        flags: vk::PipelineCreateFlags,
     ) -> Result<vk::Pipeline, NativeCompilationError> {
         let threads = entry.group_size.ok_or_else(|| {
             NativeCompilationError::MalformedToolchainOutput(format!(
@@ -254,13 +281,13 @@ impl DirectModule {
         // Full subgroups are required whenever the X extent allows it (a
         // multiple of the hardware subgroup); smaller groups run one partial
         // subgroup, as a partial CUDA warp does.
-        let flags = if threads[0] % width.lanes() == 0 {
+        let subgroups = if threads[0] % width.lanes() == 0 {
             vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS
         } else {
             vk::PipelineShaderStageCreateFlags::empty()
         };
         let stage = vk::PipelineShaderStageCreateInfo::default()
-            .flags(flags)
+            .flags(subgroups)
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader)
             .name(c"main")
@@ -271,6 +298,7 @@ impl DirectModule {
             stage
         };
         let info = vk::ComputePipelineCreateInfo::default()
+            .flags(flags)
             .stage(stage)
             .layout(inner.layout);
         let created = {
@@ -278,12 +306,19 @@ impl DirectModule {
             unsafe { device.create_compute_pipelines(cache, &[info], None) }
         };
         unsafe { device.destroy_shader_module(shader, None) };
-        created.map(|pipelines| pipelines[0]).map_err(|(_, error)| {
-            toolchain(format!(
+        // `PIPELINE_COMPILE_REQUIRED` is a success code: the pipeline
+        // returned with it is null, and nothing was compiled.
+        match created {
+            Ok(pipelines) if pipelines[0] != vk::Pipeline::null() => Ok(pipelines[0]),
+            Ok(_) | Err((_, vk::Result::PIPELINE_COMPILE_REQUIRED)) => Err(toolchain(format!(
+                "the kept pipeline of `{}` does not serve it without compiling",
+                entry.symbol
+            ))),
+            Err((_, error)) => Err(toolchain(format!(
                 "vkCreateComputePipelines of `{}` failed: {error}",
                 entry.symbol
-            ))
-        })
+            ))),
+        }
     }
 
     pub(crate) fn pipeline_handle(&self, launch: usize) -> vk::Pipeline {

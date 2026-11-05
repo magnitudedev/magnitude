@@ -1252,7 +1252,7 @@ fn rendered_programs(
     }
 }
 
-/// The programs a formation or a publication forms, rendered: what its
+/// The programs a formation forms, rendered: what its
 /// class is read from ([`ProgramFormer::class`]). Rendering depends only on
 /// what is formed, so it is kept; the class is read again whenever it is
 /// asked, because what is live on the device and kept by the store changes
@@ -1278,17 +1278,6 @@ impl Rendered {
         }
     }
 
-    /// What publishing the programs on `device` does now, and how many of
-    /// them it compiles ([`ProgramFormer::publication`]).
-    pub(crate) fn publication(&self, device: &DeviceInner) -> ((FormationClass, usize), usize) {
-        match self {
-            Self::Sources(sources) => (
-                device.programs.publication(sources),
-                device.programs.publishing_sources(sources),
-            ),
-            Self::Unrendered(entries) => ((FormationClass::Compiled, *entries), *entries),
-        }
-    }
 }
 
 /// The programs `sources` of a launch-scoped implementation are formed
@@ -1513,88 +1502,6 @@ impl NativePrepared {
             Ok((sources, _)) => Rendered::Sources(device.programs.keyed(sources)),
             Err(_) => Rendered::Unrendered(implementation.launches.len()),
         }
-    }
-
-    /// The programs a load forms `implementation` at `specialization`
-    /// from on `device`: what serving requests of its toolchain. None on
-    /// the CPU backend, which compiles nothing at run time.
-    fn serving_programs(
-        device: &Arc<DeviceInner>,
-        module: &CheckedModule,
-        entry: EntryId,
-        logical: &LogicalEntry,
-        bindings: &ElementBindings,
-        specialization: &NativeSpecialization,
-        implementation: &NativeImplementation,
-    ) -> Result<Vec<ProgramSource>, PrepareError> {
-        if matches!(device.kind, OpenedKind::Cpu(_)) {
-            return Ok(Vec::new());
-        }
-        let implementation = on_device(device, implementation.clone());
-        let specialization = implementation.with_owned_defaults(specialization.clone());
-        rendered_programs(
-            device,
-            module,
-            entry,
-            logical,
-            bindings,
-            &implementation,
-            &specialization,
-        )
-        .map(|(sources, _)| sources)
-    }
-
-    /// The programs [`NativePrepared::publish`] of `specialization` forms,
-    /// what its class is read from ([`Rendered::publication`]). A choice
-    /// that cannot be rendered names every launch.
-    pub(crate) fn publication_rendered(
-        device: &Arc<DeviceInner>,
-        module: &CheckedModule,
-        entry: EntryId,
-        logical: &LogicalEntry,
-        bindings: &ElementBindings,
-        specialization: &NativeSpecialization,
-        implementation: &NativeImplementation,
-    ) -> Rendered {
-        match Self::serving_programs(
-            device,
-            module,
-            entry,
-            logical,
-            bindings,
-            specialization,
-            implementation,
-        ) {
-            Ok(sources) => Rendered::Sources(device.programs.keyed(sources)),
-            Err(_) => Rendered::Unrendered(implementation.launches.len()),
-        }
-    }
-
-    /// Publish the serving artifact of `specialization`: form its programs
-    /// exactly as a load requests them (each launch's single variant), so
-    /// the device's store keeps them as that request finds them, and hold
-    /// nothing of what was formed. The choice a search publishes is formed
-    /// this way once, when it is final; the process that loads it then
-    /// forms it as it forms a canonical default.
-    pub(crate) fn publish(
-        device: &Arc<DeviceInner>,
-        module: &CheckedModule,
-        entry: EntryId,
-        logical: &LogicalEntry,
-        bindings: &ElementBindings,
-        specialization: &NativeSpecialization,
-        implementation: &NativeImplementation,
-    ) -> Result<(), PrepareError> {
-        let sources = Self::serving_programs(
-            device,
-            module,
-            entry,
-            logical,
-            bindings,
-            specialization,
-            implementation,
-        )?;
-        device.programs.publish(&sources).map_err(compilation)
     }
 
     /// Form the entry's native implementation for `device`'s backend.

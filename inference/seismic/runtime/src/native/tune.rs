@@ -690,7 +690,7 @@ pub enum TuneError {
         detail: String,
     },
     /// The chosen artifact could not be retained for serving without forming it again.
-    Publication(String),
+    Handoff(String),
 }
 
 impl std::fmt::Display for TuneError {
@@ -699,7 +699,7 @@ impl std::fmt::Display for TuneError {
             Self::Declaration(message)
             | Self::Domain(message)
             | Self::Reference(message)
-            | Self::Publication(message) => {
+            | Self::Handoff(message) => {
                 write!(f, "{message}")
             }
             Self::NoValidatedCandidate(failures) => write!(
@@ -1207,33 +1207,21 @@ struct FormationPrice {
     /// anything forms, rendered: its class is read from them whenever it
     /// is asked ([`Rendered`]).
     rendered: BTreeMap<Formable, Rendered>,
-    /// The programs publishing the serving artifact of each choice asked
-    /// about since the unit last formed anything forms, rendered
-    /// ([`UnitSearch::publication`]).
-    serving: BTreeMap<NativeSpecialization, Rendered>,
-}
-
-/// What publishing a choice's serving artifact does, known before it runs
-/// ([`UnitSearch::artifact_publication`]): what a load's publications are
-/// observed against.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Publication {
-    /// The programs of the choice the toolchain compiles; none when the
-    /// store keeps each as a load requests it.
-    pub sources: usize,
-    /// What forming the unit's canonical program took in this process:
-    /// the same source text, compiled once already, with each launch's
-    /// single variant as a publication compiles it.
-    pub canonical: Duration,
 }
 
 impl FormationPrice {
     /// The price of one challenger formation call that does `formative`;
     /// none while nothing it can be priced by was observed. `toolchain`:
-    /// what the device's toolchain's compiles took in this load.
-    fn of(&self, (class, entries): Formative, toolchain: &Linear) -> Option<f64> {
+    /// what the device's toolchain's compiles took in this process. Where
+    /// the toolchain loads through a platform cache (`platform`), a load
+    /// may take a compile's time, so until one is observed it is priced as
+    /// the longest compile observed.
+    fn of(&self, (class, entries): Formative, toolchain: &Linear, platform: bool) -> Option<f64> {
         match class {
-            FormationClass::Kept => self.kept.price(),
+            FormationClass::Kept => self
+                .kept
+                .price()
+                .or_else(|| (platform && toolchain.longest() > 0.).then(|| toolchain.longest())),
             FormationClass::Compiled => match (self.compiled.each(), self.compiled.mean()) {
                 (Some(_), _) => self.compiled.price(entries),
                 (None, Some((seconds, size))) => {
@@ -1257,7 +1245,6 @@ impl FormationPrice {
             FormationClass::Compiled => self.compiled.observe(entries, seconds.as_secs_f64()),
         }
         self.rendered.clear();
-        self.serving.clear();
     }
 
     /// The longest formation observed.
@@ -1369,34 +1356,6 @@ impl Forming<'_> {
     }
 }
 
-/// What compiling one of a unit's programs takes when nothing the toolchain
-/// formed or kept serves it, the system's caches included
-/// ([`UnitSearch::cold_compile`]): it reads nothing of the unit, so it
-/// runs on any thread. A compile cannot be interrupted, and where a system
-/// cache serves most of a load's compiles the load observes only its hits:
-/// an M6 load (2026-10-12) whose compiles had all taken under 0.17 s
-/// started one at 59.75 s, priced at 0.044 s, that missed the cache and
-/// took 0.39 s past its budget. This is what such a miss takes.
-pub struct ColdCompile {
-    device: Arc<DeviceInner>,
-    source: seismic_native_target::ProgramSource,
-}
-
-impl ColdCompile {
-    /// The length of the program's text: what of a load's units is the
-    /// largest compile.
-    pub fn size(&self) -> usize {
-        self.source.text.len()
-    }
-
-    /// Compile the program cold, and drop it. Returns what it took; none
-    /// if the compile failed, which says nothing of what one takes. The
-    /// program is the canonical default's, which the load has formed.
-    pub fn run(self) -> Option<Duration> {
-        self.device.programs.cold(&self.source).ok()
-    }
-}
-
 /// A compile that ran ([`Forming::run`]), for its unit to hold
 /// ([`UnitSearch::formed`]).
 pub struct Formed {
@@ -1416,118 +1375,7 @@ struct FormedCall {
     elapsed: Duration,
 }
 
-/// Publication of the served choice's serving artifact: what a later
-/// process requests when it loads the unit's published choice.
 impl UnitSearch<'_, '_> {
-    /// The unit's served choice as it stands: the canonical default until
-    /// a challenger is promoted.
-    fn served_choice(&self) -> &NativeSpecialization {
-        match &self.progress {
-            Progress::Searching(searching) => &searching.ledger.incumbent().specialization,
-            Progress::Discovering(_) => &self.default,
-        }
-    }
-
-    /// The choice the unit's next piece serves if it promotes: the leader
-    /// of a conversion. None when the next piece is no conversion.
-    fn converting(&self) -> Option<&NativeSpecialization> {
-        let Progress::Searching(searching) = &self.progress else {
-            return None;
-        };
-        let ledger = &searching.ledger;
-        let leader = match self.next()?.stage {
-            Stage::Promote => ledger.leader()?,
-            Stage::Confirm => ledger.nominal()?.0,
-            Stage::Discovery | Stage::Form | Stage::Measure => return None,
-        };
-        Some(&ledger.contenders[leader].specialization)
-    }
-
-    /// What publishing the serving artifact of `choice` does, read from
-    /// the store before it runs ([`Rendered::publication`]).
-    fn publication(&self, choice: &NativeSpecialization) -> (Formative, usize) {
-        let mut price = self.formation_price.lock().expect("formation price lock");
-        price
-            .serving
-            .entry(choice.clone())
-            .or_insert_with(|| {
-                NativePrepared::publication_rendered(
-                    &self.device,
-                    self.module,
-                    self.entry,
-                    &self.logical,
-                    &self.bindings,
-                    choice,
-                    &self.implementation,
-                )
-            })
-            .publication(&self.device)
-    }
-
-    /// The price of [`UnitSearch::publish_artifact`]: of the served choice
-    /// as it stands, or, `worked`, as it
-    /// stands once the unit's next piece has run, which changes it only if
-    /// that piece is a conversion and promotes its leader. A choice whose
-    /// programs the store keeps as a load requests them (the canonical
-    /// default's, and any the search formed alone) owes nothing: its
-    /// publication runs no compiler. One that the store lacks owes one call
-    /// of the toolchain.
-    ///
-    /// This is the price before the load has published an artifact that
-    /// compiled: a load's publications are a class of their own, priced by
-    /// its consumer from the ones it has run
-    /// ([`UnitSearch::artifact_publication`]). Until one has, nothing the
-    /// unit observed is a publication, and two things stand in for one:
-    /// a challenger formation call of that size ([`FormationPrice::of`]),
-    /// and the unit's canonical program's formation, the same programs at
-    /// the default choice. Neither is it: one load's publications took
-    /// eight times the first (its challenger compiles had found the
-    /// system's shader cache warm, 64 to 73 ms against 3 to 8 ms) and
-    /// another's a third of the second. The price is the larger of the
-    /// two: holding back too little runs past the budget, and holding back
-    /// too much delays a piece until the first publication is observed.
-    ///
-    /// Every promoted unit was owed a compile whatever the store kept: a
-    /// load of twenty units held back 5.6 s of its last 5.6 s for
-    /// publications that then took 0.29 s, thirteen of sixteen compiling
-    /// nothing.
-    pub fn artifact_owed(&self, worked: bool) -> Quote {
-        let choice = worked
-            .then(|| self.converting())
-            .flatten()
-            .unwrap_or_else(|| self.served_choice());
-        let (formative, _) = self.publication(choice);
-        let mut owed = Quote::default();
-        if formative.0 == FormationClass::Compiled {
-            let toolchain = self.device.programs.compiled();
-            let price = self.formation_price.lock().expect("formation price lock");
-            let canonical = price.canonical.as_secs_f64();
-            let formed = price.of(formative, &toolchain);
-            owed.add(
-                Some(formed.map_or(canonical, |formed| formed.max(canonical))),
-                1,
-            );
-        }
-        owed
-    }
-
-    /// What [`UnitSearch::publish_artifact`] does, known before it runs:
-    /// of the served choice as it stands, or,
-    /// `worked`, as it stands once the unit's next piece has run.
-    pub fn artifact_publication(&self, worked: bool) -> Publication {
-        let choice = worked
-            .then(|| self.converting())
-            .flatten()
-            .unwrap_or_else(|| self.served_choice());
-        let (_, sources) = self.publication(choice);
-        let canonical = self
-            .formation_price
-            .lock()
-            .expect("formation price lock")
-            .canonical;
-        Publication { sources, canonical }
-    }
-
     /// What building the inputs the unit holds took, each point's at its
     /// class's price: what giving them up is held to before the load has
     /// observed inputs given up. It frees what building them allocated and
@@ -1558,51 +1406,6 @@ impl UnitSearch<'_, '_> {
         built
     }
 
-    /// A cold compile of the largest program of the unit's canonical
-    /// default ([`ColdCompile`]); none where that renders nothing, as on
-    /// the CPU backend.
-    pub fn cold_compile(&self) -> Option<ColdCompile> {
-        let sources = NativePrepared::serving_programs(
-            &self.device,
-            self.module,
-            self.entry,
-            &self.logical,
-            &self.bindings,
-            &self.default,
-            &self.implementation,
-        )
-        .ok()?;
-        let source = sources.into_iter().max_by_key(|source| source.text.len())?;
-        Some(ColdCompile {
-            device: self.device.clone(),
-            source,
-        })
-    }
-
-    /// Publish the serving artifact of the unit's served choice: form its
-    /// programs exactly as a load requests them, each launch's single
-    /// variant, and release them ([`NativePrepared::publish`]). A choice
-    /// the search formed among many variants of a launch is served to this
-    /// process out of that compile; the artifact a later load requests is
-    /// formed here, as the choice is promoted. The canonical default
-    /// was formed that way by the mandatory work, and a choice already
-    /// published forms nothing. Returns what it took.
-    pub fn publish_artifact(&mut self) -> Result<Duration, TuneError> {
-        let began = Instant::now();
-        NativePrepared::publish(
-            &self.device,
-            self.module,
-            self.entry,
-            &self.logical,
-            &self.bindings,
-            self.served_choice(),
-            &self.implementation,
-        )
-        .map_err(|error| TuneError::Publication(prepare_message(error)))?;
-        let elapsed = began.elapsed();
-        self.time.forming_seconds += elapsed.as_secs_f64();
-        Ok(elapsed)
-    }
 }
 
 /// The compile of a unit's canonical program ([`UnitSearch::grounding`]).
@@ -1722,6 +1525,7 @@ impl<'m> Formation<'_, 'm> {
         let mut quote = Quote::default();
         let threads = formation_threads(formables.len());
         let toolchain = self.device.programs.compiled();
+        let platform = self.device.programs.platform_cached();
         let formatives = formables
             .iter()
             .map(|formable| self.class(formable))
@@ -1738,7 +1542,7 @@ impl<'m> Formation<'_, 'm> {
             let in_turn = calls.len().div_ceil(threads) as f64 / calls.len() as f64;
             let seconds = calls
                 .iter()
-                .map(|formative| price.of(**formative, &toolchain))
+                .map(|formative| price.of(**formative, &toolchain, platform))
                 .sum::<Option<f64>>();
             quote.add(seconds.map(|seconds| seconds * in_turn), 1);
         }
@@ -3751,7 +3555,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         );
         kernel
             .hand_off()
-            .map_err(|error| TuneError::Publication(error.to_string()))?;
+            .map_err(|error| TuneError::Handoff(error.to_string()))?;
         self.ground = Some(Ground { kernel, validator });
         self.time.forming_seconds += grounded.elapsed.as_secs_f64();
         // Every launch of the canonical program, or the one program.
@@ -4161,12 +3965,16 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 Progress::Discovering(_) => None,
             })
             .fold(self.longest, f64::max);
-        Duration::from_secs_f64(observed).max(
-            self.formation_price
-                .lock()
-                .expect("formation price lock")
-                .longest(),
-        )
+        let price = self.formation_price.lock().expect("formation price lock");
+        // A platform-cached toolchain's load may take a compile's time: until
+        // the unit has observed a load, it is held to the longest compile
+        // this process observed; after, to the longest load observed, which
+        // the formation price holds.
+        let compiles = match self.device.programs.platform_cached() && price.kept.price().is_none() {
+            true => self.device.programs.compiled().longest(),
+            false => 0.,
+        };
+        Duration::from_secs_f64(observed.max(compiles)).max(price.longest())
     }
 
     /// The next discovery point: the first whose defaults are unmeasured.
@@ -5200,7 +5008,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         deadline.check(Duration::ZERO)?;
         kernel
             .hand_off_replacing(ledger.incumbent().kernel.as_deref())
-            .map_err(|error| TuneError::Publication(error.to_string()))?;
+            .map_err(|error| TuneError::Handoff(error.to_string()))?;
         ledger
             .contenders
             .get_mut(&leader)
@@ -9725,7 +9533,7 @@ mod tests {
         let compiled = price
             .lock()
             .unwrap()
-            .of((FormationClass::Compiled, 1), &Linear::default());
+            .of((FormationClass::Compiled, 1), &Linear::default(), false);
         assert!(compiled.is_some_and(|mean| mean < 5.), "{compiled:?}");
         assert!(
             programs
@@ -9756,7 +9564,7 @@ mod tests {
                 price
                     .lock()
                     .unwrap()
-                    .of((FormationClass::Kept, 0), &Linear::default())
+                    .of((FormationClass::Kept, 0), &Linear::default(), false)
                     .unwrap()
             )
         );
@@ -9780,7 +9588,7 @@ mod tests {
         let mut price = FormationPrice::default();
         price.canonical = Duration::from_millis(180);
         assert_eq!(
-            price.of((Compiled, 4), &none),
+            price.of((Compiled, 4), &none, false),
             None,
             "a class never observed has no price"
         );
@@ -9788,18 +9596,38 @@ mod tests {
         price.observe((Compiled, 4), Duration::from_secs(1));
         price.observe((Compiled, 4), Duration::from_secs(3));
         assert_eq!(
-            price.of((Kept, 0), &none),
+            price.of((Kept, 0), &none, false),
             None,
             "a compile says nothing of a kept formation"
         );
         price.observe((Kept, 0), Duration::ZERO);
         price.observe((Kept, 0), Duration::ZERO);
         // Calls of one size: their mean, whatever is asked.
-        assert_eq!(price.of((Compiled, 4), &none), Some(2.));
-        assert_eq!(price.of((Compiled, 1), &none), Some(2.));
-        assert_eq!(price.of((Kept, 0), &none), Some(0.));
+        assert_eq!(price.of((Compiled, 4), &none, false), Some(2.));
+        assert_eq!(price.of((Compiled, 1), &none, false), Some(2.));
+        assert_eq!(price.of((Kept, 0), &none, false), Some(0.));
         assert_eq!(price.longest(), Duration::from_secs(3));
         assert_eq!(price.total(), 4.18);
+    }
+
+    /// On a toolchain that loads through a platform cache, a load the
+    /// platform no longer serves takes a compile's time: until a load is
+    /// observed it is priced as the longest compile the process observed,
+    /// and unpriced while there is none.
+    #[test]
+    fn a_platform_load_is_priced_as_a_compile_until_one_is_observed() {
+        use FormationClass::Kept;
+        let price = FormationPrice::default();
+        assert_eq!(price.of((Kept, 0), &Linear::default(), true), None);
+        let mut toolchain = Linear::default();
+        toolchain.observe(2, 1.5);
+        toolchain.observe(4, 3.);
+        assert_eq!(price.of((Kept, 0), &toolchain, true), Some(3.));
+        let complete = price.of((Kept, 0), &toolchain, false);
+        assert_eq!(complete, None, "a complete load prices nothing it did not see");
+        let mut observed = FormationPrice::default();
+        observed.observe((Kept, 0), Duration::from_millis(5));
+        assert_eq!(observed.of((Kept, 0), &toolchain, true), Some(0.005));
     }
 
     /// A class nothing prices is one unknown in a piece, however many of
@@ -9920,19 +9748,19 @@ mod tests {
         // A unit that has compiled nothing is priced by the toolchain's
         // compiles: its first piece is not unpriced.
         let mut unit = FormationPrice::default();
-        close(unit.of((Compiled, 4), &toolchain), 1.2);
-        assert_eq!(unit.of((Compiled, 4), &Linear::default()), None);
+        close(unit.of((Compiled, 4), &toolchain, false), 1.2);
+        assert_eq!(unit.of((Compiled, 4), &Linear::default(), false), None);
         // One call of its own, twice what the toolchain's line says of its
         // size: the unit's level, the toolchain's shape.
         unit.observe((Compiled, 20), Duration::from_secs_f64(4.0));
-        close(unit.of((Compiled, 20), &toolchain), 4.0);
-        close(unit.of((Compiled, 4), &toolchain), 2.4);
+        close(unit.of((Compiled, 20), &toolchain, false), 4.0);
+        close(unit.of((Compiled, 4), &toolchain, false), 2.4);
         // A mean over its calls would price the small call at 4 s.
         // Calls of two sizes: the unit's own line, 3 s a call and 0.05 s
         // an entry.
         unit.observe((Compiled, 40), Duration::from_secs_f64(5.0));
-        close(unit.of((Compiled, 4), &toolchain), 3.2);
-        close(unit.of((Compiled, 60), &toolchain), 6.0);
+        close(unit.of((Compiled, 4), &toolchain, false), 3.2);
+        close(unit.of((Compiled, 60), &toolchain, false), 6.0);
         // Neither term is negative: sizes whose times fall as they grow
         // are priced at their mean.
         let mut falling = Linear::default();
@@ -9988,7 +9816,7 @@ mod tests {
         let ended = run(
             &sequence,
             budget,
-            |class| classed.borrow().of((class, 1), &Linear::default()),
+            |class| classed.borrow().of((class, 1), &Linear::default(), false),
             |class, took| {
                 classed
                     .borrow_mut()

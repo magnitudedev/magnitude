@@ -123,7 +123,7 @@ pub use seismic_runtime::native::tune::{
     ConfigurationRecord, Constraint, CoverageCheck, CoverageOutcome, DeclaredParameter, Difference,
     Exclusion, FormationRecord, Formed, GoverningStep, Grounded, Narrowed, NumericalObservation,
     NumericalRequirement, Outcome, Performed, PieceMemory, PointInputs, PointMeasurement,
-    PointRecord, PointSpec, ProcessMemory, Publication, Reselection, SearchPlan, Spent, Stage,
+    PointRecord, PointSpec, ProcessMemory, Reselection, SearchPlan, Spent, Stage,
     Standing, StepPower, Strategy, SubjectComparison, SubjectMeasurement, SurveyPlan, TuneError,
     TuningDisposition, TuningInitializer, TuningMethod, TuningResult, TuningTime, UnitPlan,
     Violation, Work, Workers, WorkloadRotation, WrittenRows, COMPARISON_VERSION, GOVERNING_STEP,
@@ -2040,9 +2040,6 @@ pub struct NativeSearch<'a, E: Entry> {
 pub type Forming = seismic_runtime::native::tune::Forming<'static>;
 /// The compile of a unit's canonical program ([`NativeSearch::grounding`]).
 pub type Grounding = seismic_runtime::native::tune::Grounding<'static>;
-/// A cold compile of one of a unit's programs ([`NativeSearch::cold_compile`]).
-pub use seismic_runtime::native::tune::ColdCompile;
-
 impl<'a, E: Entry> NativeSearch<'a, E> {
     /// The unit's mandatory work: form the declared canonical program and
     /// hand it to serving, without building point inputs or observations.
@@ -2072,12 +2069,6 @@ impl<'a, E: Entry> NativeSearch<'a, E> {
     /// ahead.
     pub fn forming(&self) -> Option<Forming> {
         self.inner.forming()
-    }
-
-    /// A cold compile of the largest program of the unit's canonical
-    /// default: what compiling one takes when nothing serves it.
-    pub fn cold_compile(&self) -> Option<ColdCompile> {
-        self.inner.cold_compile()
     }
 
     /// Give up what only running work needs: every point's inputs
@@ -2166,32 +2157,10 @@ impl<'a, E: Entry> NativeSearch<'a, E> {
         self.inner.longest_operation()
     }
 
-    /// The price of [`NativeSearch::publish_artifact`]: of the served
-    /// choice as it stands, or, `worked`, as it
-    /// stands once the unit's next piece has run. Nothing where the store
-    /// keeps the choice's programs as a load requests them.
-    pub fn artifact_owed(&self, worked: bool) -> Quote {
-        self.inner.artifact_owed(worked)
-    }
-
-    /// What [`NativeSearch::publish_artifact`] does, known before it runs:
-    /// what a load's publications are
-    /// observed against.
-    pub fn artifact_publication(&self, worked: bool) -> Publication {
-        self.inner.artifact_publication(worked)
-    }
-
     /// What building the inputs the unit holds took: what giving them up
     /// is held to before the load has observed inputs given up.
     pub fn inputs_built(&self) -> Quote {
         self.inner.inputs_built()
-    }
-
-    /// Publish the serving artifact of the unit's served choice: form its
-    /// programs exactly as a load requests them and release them. Returns
-    /// what it took.
-    pub fn publish_artifact(&mut self) -> Result<std::time::Duration, TuneError> {
-        self.inner.publish_artifact()
     }
 
     /// The defaults' measurements at the points discovered so far.

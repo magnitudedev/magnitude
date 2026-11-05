@@ -254,19 +254,16 @@ void main() {
             shared_int64_atomics: false,
         };
         let source = format!("{}{KERNEL}", header(features));
-        let module = VulkanToolchain::new(device.clone())
-            .compile(
-                &ProgramSource {
-                    text: source,
-                    entries: vec![ProgramEntry {
-                        symbol: "numerics".into(),
-                        group_size: Some([64, 1, 1]),
-                        constants: Vec::new(),
-                    }],
-                },
-                None,
-            )
-            .expect("the numerics kernel forms");
+        let toolchain = VulkanToolchain::new(device.clone());
+        let source = ProgramSource {
+            text: source,
+            entries: vec![ProgramEntry {
+                symbol: "numerics".into(),
+                group_size: Some([64, 1, 1]),
+                constants: Vec::new(),
+            }],
+        };
+        let (_, module) = toolchain.compile(&source).expect("the numerics kernel forms");
 
         let specials = [
             0.0f32,
@@ -455,19 +452,16 @@ void main() {
             shared_int64_atomics: false,
         };
         let source = format!("{}{HALVES}", header(features));
-        let module = VulkanToolchain::new(device.clone())
-            .compile(
-                &ProgramSource {
-                    text: source,
-                    entries: vec![ProgramEntry {
-                        symbol: "halves".into(),
-                        group_size: Some([64, 1, 1]),
-                        constants: Vec::new(),
-                    }],
-                },
-                None,
-            )
-            .expect("the conversion kernel forms");
+        let toolchain = VulkanToolchain::new(device.clone());
+        let source = ProgramSource {
+            text: source,
+            entries: vec![ProgramEntry {
+                symbol: "halves".into(),
+                group_size: Some([64, 1, 1]),
+                constants: Vec::new(),
+            }],
+        };
+        let (_, module) = toolchain.compile(&source).expect("the conversion kernel forms");
 
         let mut inputs = Vec::new();
         for half in 0..=u16::MAX {

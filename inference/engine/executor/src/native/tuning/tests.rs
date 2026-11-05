@@ -823,8 +823,6 @@ struct FakeCase {
     seen: Rc<RefCell<Vec<(String, f64, usize)>>>,
     /// Every piece of optional work performed, in order.
     stages: Rc<RefCell<Vec<seismic::Stage>>>,
-    /// Serving artifacts published: a final promoted choice's, once.
-    artifacts: Rc<Cell<usize>>,
     /// The implementation digest the case reports.
     digest: String,
     bindings: String,
@@ -885,7 +883,6 @@ impl FakeCase {
             formations: Rc::new(Cell::new(0)),
             seen: Rc::new(RefCell::new(Vec::new())),
             stages: Rc::new(RefCell::new(Vec::new())),
-            artifacts: Rc::new(Cell::new(0)),
             digest: digest.into(),
             bindings: "fake".into(),
             launches: 1,
@@ -1284,25 +1281,8 @@ impl EntrySearch<dense_output::Entry> for FakeSearch {
         self.piece()
     }
 
-    fn artifact_owed(&self, _worked: bool) -> seismic::Quote {
-        seismic::Quote::default()
-    }
-
-    fn artifact_publication(&self, _worked: bool) -> seismic::Publication {
-        seismic::Publication::default()
-    }
-
     fn inputs_built(&self) -> seismic::Quote {
         seismic::Quote::default()
-    }
-
-    fn publish_artifact(&mut self) -> Result<Duration, TuneError> {
-        assert!(
-            self.promoted,
-            "only a promoted choice's artifact is published"
-        );
-        self.case.artifacts.set(self.case.artifacts.get() + 1);
-        Ok(Duration::ZERO)
     }
 
     fn service_measurements(&self) -> Vec<seismic::PointMeasurement> {
@@ -1603,7 +1583,7 @@ fn profile_what_compiles_on_workers_add_to_the_process_footprint() {
 }
 
 /// A unit's record is stored provisional when its served choice changes,
-/// with that choice's serving artifact formed, and settled once when the
+/// and settled once when the
 /// optional work stops, not with every piece: a unit that measured without
 /// promoting publishes its measurements once, at the stop.
 #[test]
@@ -1714,16 +1694,13 @@ fn a_record_is_published_with_a_promotion_and_once_when_the_work_stops() {
             // when the work stops.
             expected.push(("published", 2));
         } else {
-            // The promotion forms the promoted choice's serving artifact
-            // and publishes the record with everything measured,
-            // provisional; the record is settled when the work stops.
+            // The promotion publishes the record with everything
+            // measured, provisional; the record is settled when the work
+            // stops.
             expected.push(("promoted", 2));
             expected.push(("published", 2));
         }
         assert_eq!(*stored.seen.borrow(), expected);
-        // Only a promoted choice has an artifact to publish: the canonical
-        // default's is the mandatory phase's own.
-        assert_eq!(case.artifacts.get(), usize::from(!unqualified));
         let tuned = tuner.conclude();
         assert_eq!(tuned[0].measured, 2);
         assert_eq!(stored.measured(), 2);

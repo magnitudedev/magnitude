@@ -334,7 +334,12 @@ pub const STREAMING_ROWS: u64 = 8;
 /// (a result of 40 stored the mandatory phase's canonical default as the
 /// unit's final choice, so a Prepare preempted mid-search left its units
 /// untuned for good).
-pub const SEARCH_VERSION: u32 = 41;
+/// 42: a search admits a configuration whose program the store does not
+/// keep without an artifact price or a cold-compile bound, since every
+/// program has one owner that loads it or compiles it once (a result of 41
+/// priced promoting and confirming a choice by the artifact it would
+/// publish).
+pub const SEARCH_VERSION: u32 = 42;
 /// The tuning budget of a served load: the time one first-load preparation
 /// spends tuning, on any device.
 pub const STANDARD_TUNING_BUDGET: Duration = Duration::from_secs(60);
@@ -911,11 +916,6 @@ pub(crate) trait EntrySearch<E: seismic::Entry> {
     /// The compile of the next piece, to run on any thread ahead of it;
     /// none when the piece compiles nothing ahead.
     fn forming(&self) -> Option<seismic::Forming>;
-    /// A cold compile of the largest program of the unit's canonical
-    /// default ([`seismic::ColdCompile`]); none where that renders nothing.
-    fn cold_compile(&self) -> Option<seismic::ColdCompile> {
-        None
-    }
     /// Hold what the next piece's compile formed. Returns what the compile
     /// took.
     fn formed(&mut self, formed: seismic::Formed) -> Result<Duration, TuneError>;
@@ -942,17 +942,8 @@ pub(crate) trait EntrySearch<E: seismic::Entry> {
     fn largest_footprint(&self) -> u64;
     /// The longest single operation the unit has completed.
     fn longest_operation(&self) -> Duration;
-    /// The price of publishing the serving artifact of the unit's served
-    /// choice as it stands, or, `worked`, as it stands once its next piece
-    /// has run: nothing where the store keeps it as a load requests it.
-    fn artifact_owed(&self, worked: bool) -> seismic::Quote;
-    /// What that publication does, known before it runs.
-    fn artifact_publication(&self, worked: bool) -> seismic::Publication;
     /// What building the inputs the unit holds took.
     fn inputs_built(&self) -> seismic::Quote;
-    /// Publish the serving artifact of the unit's served choice: form its
-    /// programs exactly as a load requests them and release them.
-    fn publish_artifact(&mut self) -> Result<Duration, TuneError>;
     fn service_measurements(&self) -> Vec<seismic::PointMeasurement>;
     /// Weigh the points by `weights` before anything of the search is
     /// measured against its first weights; false once it has.
@@ -986,9 +977,6 @@ impl<E: seismic::Entry> EntrySearch<E> for seismic::NativeSearch<'static, E> {
     }
     fn forming(&self) -> Option<seismic::Forming> {
         seismic::NativeSearch::forming(self)
-    }
-    fn cold_compile(&self) -> Option<seismic::ColdCompile> {
-        seismic::NativeSearch::cold_compile(self)
     }
     fn formed(&mut self, formed: seismic::Formed) -> Result<Duration, TuneError> {
         seismic::NativeSearch::formed(self, formed)
@@ -1026,17 +1014,8 @@ impl<E: seismic::Entry> EntrySearch<E> for seismic::NativeSearch<'static, E> {
     fn longest_operation(&self) -> Duration {
         seismic::NativeSearch::longest_operation(self)
     }
-    fn artifact_owed(&self, worked: bool) -> seismic::Quote {
-        seismic::NativeSearch::artifact_owed(self, worked)
-    }
-    fn artifact_publication(&self, worked: bool) -> seismic::Publication {
-        seismic::NativeSearch::artifact_publication(self, worked)
-    }
     fn inputs_built(&self) -> seismic::Quote {
         seismic::NativeSearch::inputs_built(self)
-    }
-    fn publish_artifact(&mut self) -> Result<Duration, TuneError> {
-        seismic::NativeSearch::publish_artifact(self)
     }
     fn service_measurements(&self) -> Vec<seismic::PointMeasurement> {
         seismic::NativeSearch::service_measurements(self)
@@ -2885,12 +2864,6 @@ trait SearchedUnit<'a> {
     fn next(&self) -> Option<seismic::Work>;
     /// The compile of that piece, to run on a worker ahead of it.
     fn forming(&self) -> Option<seismic::Forming>;
-    /// A cold compile of the largest program of the unit's canonical
-    /// default ([`seismic::ColdCompile`]); none where the unit compiles
-    /// nothing.
-    fn cold_compile(&self) -> Option<seismic::ColdCompile> {
-        None
-    }
     /// Hold what that compile formed, which took `took`.
     fn formed(
         &mut self,
@@ -3124,10 +3097,6 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
         tuner.memory.compile_host_bytes
     }
 
-    fn cold_compile(tuner: &Tuner<'a>) -> Duration {
-        tuner.cold.observed()
-    }
-
     fn capacity(tuner: &Tuner<'a>) -> Option<u64> {
         tuner.memory.capacity()
     }
@@ -3136,102 +3105,6 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
 /// A unit as the memory report names it.
 fn unit_name(key: &TuningKey) -> String {
     format!("{} [{}]", key.0, key.1)
-}
-
-/// What publishing a serving artifact has taken in this load: a class of
-/// its own, observed against what the publication does
-/// ([`seismic::Publication`]) and the threads its compiles had. A
-/// publication that compiles nothing is one class, priced by its mean. One
-/// that compiles is priced by its unit's canonical formation, in turn
-/// ([`ArtifactPrice::work`]), as the load's compiled publications have
-/// followed it ([`Followed`]). Before the load has run one of a class, the
-/// unit's own stand-in prices it ([`seismic::NativeSearch::artifact_owed`]).
-#[derive(Clone, Copy, Default)]
-struct ArtifactPrice {
-    kept: seismic::Observed,
-    compiled: Followed,
-    /// The threads a publication's compiles had when one last ran: what
-    /// the host's room afforded of the preparation's
-    /// ([`Tuner::narrow_publication`]).
-    threads: Option<usize>,
-}
-
-/// What one kind of work has taken against a measure of each instance
-/// known before it runs, both in seconds: how the work follows the
-/// measure. One instance, or instances of one measure, give the ratio of
-/// what they took to it. Instances of different measures give the line
-/// through them where that has a cost besides the measure and a cost of
-/// the measure, neither below nothing; otherwise the ratio that fits them
-/// all best.
-#[derive(Clone, Copy, Default)]
-struct Followed {
-    count: f64,
-    measure: f64,
-    seconds: f64,
-    measure_squared: f64,
-    measure_seconds: f64,
-}
-
-impl Followed {
-    fn observe(&mut self, measure: f64, seconds: f64) {
-        self.count += 1.;
-        self.measure += measure;
-        self.seconds += seconds;
-        self.measure_squared += measure * measure;
-        self.measure_seconds += measure * seconds;
-    }
-
-    /// The price of an instance of `measure`; none before an observation.
-    fn price(&self, measure: f64) -> Option<f64> {
-        if self.count == 0. {
-            return None;
-        }
-        // Instances whose measure was nothing say only what they took.
-        if self.measure_squared == 0. {
-            return Some(self.seconds / self.count);
-        }
-        let ratio = self.measure_seconds / self.measure_squared;
-        let spread = self.count * self.measure_squared - self.measure * self.measure;
-        if spread <= self.measure_squared * f64::EPSILON * self.count {
-            return Some(ratio * measure);
-        }
-        let each = (self.count * self.measure_seconds - self.measure * self.seconds) / spread;
-        let fixed = (self.seconds - each * self.measure) / self.count;
-        Some(if each < 0. || fixed < 0. {
-            ratio * measure
-        } else {
-            fixed + each * measure
-        })
-    }
-}
-
-impl ArtifactPrice {
-    /// The measure of a publication that compiles: its unit's canonical
-    /// formation, the same source compiled once already in this process,
-    /// for each turn its programs take on the threads they have (they
-    /// compile at once, so one turn where the threads cover them).
-    fn work(publication: seismic::Publication, threads: Option<usize>) -> f64 {
-        let turns = threads.map_or(1, |threads| publication.sources.div_ceil(threads.max(1)));
-        publication.canonical.as_secs_f64() * turns as f64
-    }
-
-    /// The class's price; none before the load has published one of it.
-    fn price(&self, publication: seismic::Publication) -> Option<f64> {
-        if publication.sources == 0 {
-            self.kept.price()
-        } else {
-            self.compiled.price(Self::work(publication, self.threads))
-        }
-    }
-
-    fn observe(&mut self, publication: seismic::Publication, seconds: f64) {
-        if publication.sources == 0 {
-            self.kept.observe(seconds);
-        } else {
-            self.compiled
-                .observe(Self::work(publication, self.threads), seconds);
-        }
-    }
 }
 
 /// The tuning time since `0` began.
@@ -3271,8 +3144,6 @@ struct CaseUnit<'a, T: EntryTuning> {
     /// the price of a conversion's publication and of the one the unit
     /// owes when the optional work stops.
     publishing: Rc<Cell<seismic::Observed>>,
-    /// What publishing a serving artifact has taken in this load.
-    artifacts: Rc<Cell<ArtifactPrice>>,
     /// The unit's settled record is still owed: everything it published
     /// before the optional work stopped is provisional.
     unpublished: bool,
@@ -3287,44 +3158,6 @@ fn unit_failure(key: &TuningKey, error: impl ToString) -> CatalogFailure {
         entry: key.0,
         bindings: key.1.clone(),
         outcome: error.to_string(),
-    }
-}
-
-impl<'a, T: EntryTuning> CaseUnit<'a, T> {
-    /// Form the serving artifact of the unit's served choice, as a load
-    /// will request it, and release it: a conversion promoted the choice.
-    /// A later promotion may supersede it, and the artifact formed here
-    /// then stays in the store as the formed program it is until the store
-    /// evicts it. It is formed as the choice is promoted rather than once
-    /// the optional work stops, when it was held back for at its price:
-    /// that price is a forecast of uninterruptible work, and an M6 load
-    /// (2026-10-12) whose two last artifacts missed the system's shader
-    /// cache, 0.27 s and 0.14 s against about 0.01 s, ended 0.41 s past
-    /// its budget, its choices promoted 15 s before.
-    fn form_artifact(&mut self, tuner: &mut Tuner<'a>) -> Result<(), CatalogFailure> {
-        // The artifact's programs compile at once on the preparation's
-        // threads, on as many as the host's room affords.
-        let publication = self.search.artifact_publication(false);
-        let mut artifacts = self.artifacts.get();
-        let _narrowed = tuner.narrow_publication();
-        // The threads the publication runs on: read after the narrowing,
-        // which returns freed pages before it counts when the room affords
-        // none, and held as it holds them, to the caller at the least and
-        // the set with the caller at the most.
-        let width = tuner.workers().width() + 1;
-        artifacts.threads = Some(
-            tuner
-                .memory
-                .compile_threads(tuner.device)
-                .map_or(width, |threads| threads.clamp(1, width)),
-        );
-        let took = self
-            .search
-            .publish_artifact()
-            .map_err(|error| unit_failure(&self.key, error))?;
-        artifacts.observe(publication, took.as_secs_f64());
-        self.artifacts.set(artifacts);
-        Ok(())
     }
 }
 
@@ -3375,37 +3208,25 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
         self.share = share;
     }
 
-    /// The runtime prices the piece. A conversion that promotes forms its
-    /// new choice's serving artifact and publishes the unit's record with
-    /// the choice ([`CaseUnit::form_artifact`]): the adapter's two more
-    /// operations. The artifact's is priced by the publications of its
-    /// class this load has run, and by the unit's stand-in for one until it
-    /// has run any; the record's is of a class this load observed when it
-    /// published the unit's canonical default.
+    /// The runtime prices the piece. A conversion that promotes publishes
+    /// the unit's record with the choice: the adapter's one more operation,
+    /// of a class this load observed when it published the unit's
+    /// canonical default. The choice's program is the artifact the search
+    /// compiled and stored, which any later load reads: nothing more is
+    /// formed for it.
     fn next(&self) -> Option<seismic::Work> {
         let mut work = self.search.next()?;
         if matches!(
             work.stage,
             seismic::Stage::Promote | seismic::Stage::Confirm
         ) {
-            let publication = self.search.artifact_publication(true);
-            work.quote = match self.artifacts.get().price(publication) {
-                Some(seconds) => {
-                    let mut artifact = seismic::Quote::default();
-                    artifact.add(Some(seconds), 1);
-                    work.quote.and(artifact)
-                }
-                None => work.quote.and(self.search.artifact_owed(true)),
-            };
             work.quote.add(self.publishing.get().price(), 1);
         }
         Some(work)
     }
 
     /// A unit owes its settled record when the optional work stops, until
-    /// it has published it. Its served choice's
-    /// serving artifact it never owes: a conversion forms it as it
-    /// promotes.
+    /// it has published it.
     fn owed(&self, worked: bool) -> seismic::Quote {
         let mut owed = seismic::Quote::default();
         if self.unpublished || worked {
@@ -3437,10 +3258,6 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
             actual_seconds: began.elapsed().as_secs_f64(),
         });
         Ok(())
-    }
-
-    fn cold_compile(&self) -> Option<seismic::ColdCompile> {
-        self.search.cold_compile()
     }
 
     fn forming(&self) -> Option<seismic::Forming> {
@@ -3518,16 +3335,14 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
         tuner
             .memory
             .observe(tuner.device, performed.memory.ledger_peak_bytes);
-        // A promotion forms the new choice's serving artifact and is
-        // published with the unit's record as it stands, served from that
-        // instant ([`CaseUnit::form_artifact`]). What a piece measures or
+        // A promotion is published with the unit's record as it stands,
+        // served from that instant. What a piece measures or
         // judges besides is the unit's in memory and published once, when
         // the optional work stops ([`SearchedUnit::settle`]): a search
         // abandoned before then leaves only provisional records, and the
         // next search of the unit searches it again.
         let publishing = Instant::now();
         if performed.promoted {
-            self.form_artifact(tuner)?;
             tuner
                 .publish(&self.key, false, || self.search.terminal())
                 .map_err(|error| unit_failure(&self.key, error))?;
@@ -3795,9 +3610,6 @@ pub(crate) struct Tuner<'a> {
     /// taken in this load: the class a promotion's publication and each
     /// publication owed when the optional work stops are priced by.
     publishing: Rc<Cell<seismic::Observed>>,
-    /// What publishing a unit's serving artifact has taken in this load:
-    /// the class each artifact owed is priced by once one was published.
-    artifacts: Rc<Cell<ArtifactPrice>>,
     /// The longest single operation the load has completed: what an
     /// unpriced operation is held to ([`seismic::Quote::fits`]).
     longest: Duration,
@@ -3818,48 +3630,6 @@ pub(crate) struct Tuner<'a> {
     /// None once the search has ended: the walk that follows it compiles
     /// nothing a stored record does not serve, and holds no thread.
     staff: Option<Staff<'a>>,
-    /// What compiling the load's largest program takes with nothing to
-    /// serve it ([`ColdCompiles`]).
-    cold: ColdCompiles,
-}
-
-/// A load's cold compile ([`seismic::ColdCompile`]), run on a worker while
-/// the optional work begins. Optional work holds a compile it admits to end
-/// within the budget at the most a compile can take as far as the load has
-/// seen ([`allocation::Unit::cold_compile`]), and this is what one takes
-/// that no cache serves.
-#[derive(Default)]
-struct ColdCompiles {
-    /// When it began on the tuning clock, and what it took once it ended
-    /// (none if it failed).
-    began: Duration,
-    ended: Option<std::sync::mpsc::Receiver<Option<Duration>>>,
-    took: Cell<Option<Option<Duration>>>,
-}
-
-impl ColdCompiles {
-    /// What the cold compile took, once it has ended; nothing before or if
-    /// it failed.
-    fn observed(&self) -> Duration {
-        if self.took.get().is_none() {
-            if let Some(took) = self.ended.as_ref().and_then(|ended| ended.try_recv().ok()) {
-                self.took.set(Some(took));
-            }
-        }
-        self.took.get().flatten().unwrap_or_default()
-    }
-
-    /// Wait for the cold compile to end: it is the load's tuning work.
-    /// Returns when it ended on the tuning clock, if it was still running
-    /// past `now`.
-    fn finish(&mut self, now: Duration) -> Option<Duration> {
-        if self.took.get().is_some() {
-            return None;
-        }
-        let took = self.ended.take()?.recv().ok()?;
-        self.took.set(Some(took));
-        Some(now.max(self.began + took.unwrap_or_default()))
-    }
 }
 
 /// One preparation's worker threads, lent to its device for as long as the
@@ -3984,7 +3754,6 @@ impl<'a> Tuner<'a> {
         };
         self.provisional.clear();
         self.staff = Some(Staff::of(self.device));
-        self.cold = ColdCompiles::default();
         self
     }
     pub(super) fn cache(&self) -> Option<&'a KernelCache> {
@@ -3999,22 +3768,6 @@ impl<'a> Tuner<'a> {
     fn budget(&self) -> Duration {
         self.context.settings.budget
     }
-    /// Hold what the preparation compiles at once to the host's room, for
-    /// as long as what is returned lives: a unit's serving artifact is
-    /// owed work whose programs compile together, outside the pieces the
-    /// allocator admits, and each compile holds host memory while it runs.
-    /// When the room affords no thread, what is held for nothing is
-    /// returned first; owed work then runs in turn if it must. Nothing
-    /// where the host is not a domain apart.
-    fn narrow_publication(&mut self) -> Option<seismic::Narrowed> {
-        let mut threads = self.memory.compile_threads(self.device)?;
-        if threads == 0 {
-            self.memory.return_freed_pages();
-            threads = self.memory.compile_threads(self.device)?;
-        }
-        Some(self.workers().narrowed(threads))
-    }
-
     /// The stop of the optional work as a stop for bytes: none unless a
     /// piece still offered when the allocator stopped was refused for its
     /// bytes. The allocator refuses for bytes only with nothing in flight,
@@ -4189,7 +3942,6 @@ impl<'a> Tuner<'a> {
             composed_censused: std::collections::HashSet::new(),
             composed_choices: HashMap::new(),
             publishing: Rc::new(Cell::new(seismic::Observed::default())),
-            artifacts: Rc::new(Cell::new(ArtifactPrice::default())),
             longest: Duration::ZERO,
             // What a search's process holds is counted from here, where
             // its tuner is made, not from its mandatory phase: counting
@@ -4223,7 +3975,6 @@ impl<'a> Tuner<'a> {
                 }
             },
             phase,
-            cold: ColdCompiles::default(),
         }
     }
 
@@ -4551,23 +4302,6 @@ impl<'a> Tuner<'a> {
             ));
         }
         let longest = self.longest;
-        // The load's largest program compiles cold on a worker while the
-        // optional work begins ([`ColdCompiles`]).
-        if let Some(cold) = units
-            .iter()
-            .filter_map(|unit| unit.cold_compile())
-            .max_by_key(seismic::ColdCompile::size)
-        {
-            let (sender, ended) = std::sync::mpsc::channel();
-            self.cold = ColdCompiles {
-                began: allocation::Clock::now(&clock),
-                ended: Some(ended),
-                took: Cell::new(None),
-            };
-            self.workers().spawn(move || {
-                let _ = sender.send(cold.run());
-            });
-        }
         // The pieces' compiles run on the load's worker threads while the
         // device measures; each started runs to its end.
         let mut threads = allocation::Threads::new(
@@ -4576,12 +4310,8 @@ impl<'a> Tuner<'a> {
             seismic::Forming::threads,
             self.memory.compile_host_bytes,
         );
-        let (mut report, outcome) =
+        let (report, outcome) =
             allocation::allocate(&mut units, &mut self, &clock, &mut threads, budget, longest);
-        // A cold compile still running is the load's work: it is waited for.
-        if let Some(ended) = self.cold.finish(allocation::Clock::now(&clock)) {
-            report.ended = report.ended.max(ended);
-        }
         self.memory.compile_host_bytes = self
             .memory
             .compile_host_bytes
@@ -5034,7 +4764,6 @@ impl<'a> Tuner<'a> {
             formed: None,
             forming_quote: Cell::new(None),
             publishing: self.publishing.clone(),
-            artifacts: self.artifacts.clone(),
             unpublished: true,
             settled: None,
             marker: std::marker::PhantomData,

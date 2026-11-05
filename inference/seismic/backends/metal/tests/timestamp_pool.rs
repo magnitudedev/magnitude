@@ -14,18 +14,14 @@ fn a_timed_batch_behind_its_own_shut_gate_fails_when_the_pool_is_exhausted() {
     let device = MetalDevice::open(DeviceHandle::system_default().unwrap()).unwrap();
     let description = seismic_metal::profile::open_device(&device).unwrap();
     let toolchain = MetalToolchain::new(device.clone(), description.facts());
-    let pipelines = toolchain
-        .compile(
-            &ProgramSource {
-                text: "#include <metal_stdlib>\nusing namespace metal;\n\
-                       kernel void bump(device float* x [[buffer(0)]], \
-                       uint i [[thread_position_in_grid]]) { x[i] += 1; }\n"
-                    .into(),
-                entries: vec![ProgramEntry::named("bump")],
-            },
-            None,
-        )
-        .unwrap();
+    let source = ProgramSource {
+        text: "#include <metal_stdlib>\nusing namespace metal;\n\
+               kernel void bump(device float* x [[buffer(0)]], \
+               uint i [[thread_position_in_grid]]) { x[i] += 1; }\n"
+            .into(),
+        entries: vec![ProgramEntry::named("bump")],
+    };
+    let pipelines = toolchain.compile(&source).unwrap().1;
     let values = device.allocate(256, 16).unwrap();
     let launch = DirectLaunch {
         pipeline: &pipelines[0],

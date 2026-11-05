@@ -62,6 +62,21 @@ cost. A fast result at one shape cannot absorb the demand of an unmeasured shape
 remains unknown; it is neither zero nor an invitation to invent a forecast. Numerical eligibility
 is a hard constraint, never a term that faster execution can compensate for.
 
+## Native programs
+
+Every native program is had through one owner per device, the program former. It keys an
+artifact by its source, its entry and the toolchain's identity (compiler, target, options, device
+and driver). A program whose artifact the store keeps is loaded; one it lacks is compiled once,
+its artifact stored, and the program the compile formed used. CUDA's artifact is its cubin and
+Vulkan's its SPIR-V with the pipeline data of creating its pipelines: loading either compiles
+nothing, and a Vulkan load that would have to compile fails, so every Vulkan compile also creates
+its pipelines again from that data and fails rather than store an artifact no load serves.
+Metal's artifact is its source, which the OS shader cache serves the compiled forms of. Loading a
+Metal artifact forms exactly the library its compile formed, whichever of its entries are asked
+for, so the cache serves it: measured at 0.5 s to re-form a 35B model's programs in a later
+process. Each process counts its compiles, and counts and times its re-formations through a
+platform cache, whose time shows whether the platform still serves them.
+
 ## One first-load clock
 
 The serving allowance is 60 seconds for the load's tuning work. Evaluation may select an explicit
@@ -120,11 +135,10 @@ Independent compilation can overlap device measurement, with resources and pendi
 to the same load. Elapsed wall time is the budget authority; overlapping phase times do not sum
 to a second budget. A compile that outruns its forecast does not consume the conclusion reserve:
 when the reserve is reached its piece is abandoned unmeasured, choices publish while it finishes,
-and the abandoned work is reported. A promoted choice's serving artifact is formed as the choice
-is promoted, inside that work's own admission, so the conclusion holds no artifact compiles,
-whose cost a system shader cache makes unpredictable. A compile cannot be interrupted, so it
-starts only if it would end within the deadline at the longest compile the load has observed,
-including one deliberately compiled with nothing to serve it. A slower device explores less, not longer. No later request, changed traffic
+and the abandoned work is reported. A promoted choice's program is the artifact its search
+already compiled and stored, which a load reads, so a promotion compiles nothing. A compile cannot
+be interrupted, so it starts only if it would end within the deadline at the longest compile the
+load has observed. A slower device explores less, not longer. No later request, changed traffic
 mix or cached incomplete search acquires another tuning allowance.
 
 ## Search and finalization

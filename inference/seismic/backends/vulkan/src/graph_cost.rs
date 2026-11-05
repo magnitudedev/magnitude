@@ -65,7 +65,8 @@ fn measure(device: &Device) -> Result<GraphCost, ExecutionError> {
         group_size: Some([1, 1, 1]),
         constants: Vec::new(),
     };
-    let (module, _) = DirectModule::new(device, &[(&EMPTY[..], &entry)], &[]).map_err(|error| {
+    let entries = [(&EMPTY[..], &entry)];
+    let (module, _) = DirectModule::compile(device, &entries).map_err(|error| {
         ExecutionError::SubmissionFailed(format!("measuring the graphs' command memory: {error}"))
     })?;
     let launch = DirectLaunch {
