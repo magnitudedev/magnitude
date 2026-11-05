@@ -1272,22 +1272,28 @@ fn a_holding_update_beside_a_shrinks_release_classifies_within_the_charge() {
 /// The ladder's bank rung reaches the family's bank: each step begins at
 /// one boundary, installs at the next and is credited exactly what Seismic
 /// stopped charging once released, the static holding following; a step
-/// refused by its storage releases nothing, and at the floor a step begins
-/// none. A growth step backs what it claimed, the claim then returned.
+/// its storage refuses breaks an invariant (a shrink needs no memory), and at
+/// the floor a step begins none. A growth step backs what it claimed, the claim then returned.
 #[test]
 fn an_expert_bank_shrink_credits_what_seismic_releases() {
     for backend in bank_backends() {
         let (mut domain, mut bindings) = banked(backend, 4, 4);
         let row = bank_row(&domain);
-        let before = domain.memory().standing().unwrap();
         // A region pinning every row refuses a shrink beneath it.
         let tensor = domain.family.bank.as_ref().unwrap().tensor.clone();
         let pin = tensor.region(seismic::Element::bool(), &[4, row], 0).unwrap();
         assert_eq!(domain.shrink_expert_bank(&mut bindings, unwatched()).unwrap(), BankStep::Begun);
-        assert!(matches!(finish(&mut domain), crate::BankResized::Refused { at: 4, .. }));
-        drop(pin);
-        domain.refresh_memory().unwrap();
-        assert_eq!(domain.memory().standing().unwrap().classified_bytes, before.classified_bytes);
+        let refused = loop {
+            match domain.advance_expert_bank(unwatched()) {
+                Ok(None) => {}
+                Ok(Some((finished, _))) => panic!("{backend:?}: a pinned shrink finished: {finished:?}"),
+                Err(error) => break error,
+            }
+        };
+        assert!(matches!(refused, DomainError::Invariant(_)), "{backend:?}: {refused}");
+        drop((pin, tensor, domain, bindings));
+        let (mut domain, mut bindings) = banked(backend, 4, 4);
+        let before = domain.memory().standing().unwrap();
         for slots in [3, 2, 1] {
             assert_eq!(domain.shrink_expert_bank(&mut bindings, unwatched()).unwrap(), BankStep::Begun);
             assert!(domain.advance_expert_bank(unwatched()).unwrap().is_none(), "installed, not yet released");

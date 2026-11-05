@@ -312,7 +312,7 @@ impl ServedBank {
             BankHolding::Host => self.bank.shrink_host(to)?,
             _ => self.bank.shrink_store(to)?,
         };
-        let Some(LandedShrink { from, to: at, before, after, refusal }) = shrunk else {
+        let Some(LandedShrink { from, to: at, before, after }) = shrunk else {
             return Ok(BankStep::Running);
         };
         let done = Instant::now();
@@ -326,16 +326,11 @@ impl ServedBank {
             installed: done,
             released: done,
         };
-        let resized = match refusal {
-            Some(refusal) => BankResized::Refused { holding, at, refusal },
-            None => {
-                let released = before
-                    .checked_sub(after)
-                    .ok_or_else(|| DomainError::invariant("a shrink raised its records' charge"))?;
-                *self.landed_rate.lock().expect("landed rate") = Some(released as f64 / times.planned.as_secs_f64());
-                BankResized::Shrunk { holding, from, to: at, released, times }
-            }
-        };
+        let released = before
+            .checked_sub(after)
+            .ok_or_else(|| DomainError::invariant("a shrink raised its records' charge"))?;
+        *self.landed_rate.lock().expect("landed rate") = Some(released as f64 / times.planned.as_secs_f64());
+        let resized = BankResized::Shrunk { holding, from, to: at, released, times };
         *self.finished.lock().expect("table resize outcome") = Some(resized);
         wake.complete();
         Ok(BankStep::Begun)
@@ -442,6 +437,10 @@ impl ServedBank {
         };
         let holding = BankHolding::Table { table: index };
         let resized = match outcome {
+            // A shrink needs no memory: its refusal breaks an invariant, as the bank's does.
+            Err(refusal) if records < from => {
+                return Err(DomainError::invariant(format!("a held table's storage refused a shrink: {refusal}")));
+            }
             Err(refusal) => BankResized::Refused { holding, at: to, refusal },
             Ok(()) if after < before => BankResized::Shrunk { holding, from, to, released: before - after, times },
             Ok(()) => BankResized::Grown { holding, from, to, grown: after - before, refused: None, times },

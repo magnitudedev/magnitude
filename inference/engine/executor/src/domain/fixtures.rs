@@ -678,7 +678,8 @@ enum FakeResize {
     /// Released, as the bank's resize thread releases, before an advance
     /// reports it.
     Released(seismic::Resizer, (u64, u64)),
-    Refused(seismic::Resizer, seismic::TensorError),
+    /// Refused, a shrink's (`true`) breaking an invariant as the bank's does.
+    Refused(seismic::Resizer, seismic::TensorError, bool),
     /// A growth stopped before its first slot, at these slots, before an
     /// advance reports it.
     Stopped(seismic::Resizer, u64),
@@ -744,7 +745,7 @@ impl FakeBank {
         let before = (self.charged(), self.slots());
         *resize = Some(match resizer.prepare(to) {
             Ok(prepared) => FakeResize::Prepared(prepared, before, to > before.1),
-            Err(refusal) => FakeResize::Refused(refusal.resizer, refusal.error),
+            Err(refusal) => FakeResize::Refused(refusal.resizer, refusal.error, to < before.1),
         });
         wake.complete();
         Ok(BankStep::Begun)
@@ -946,7 +947,7 @@ impl ElasticBank for FakeBank {
         let (next, finished) = match resize.take().unwrap() {
             FakeResize::Prepared(prepared, before, _) => match prepared.install() {
                 Ok(release) => (FakeResize::Releasing(release, before), None),
-                Err(refused) => (FakeResize::Refused(refused.resizer, refused.error), None),
+                Err(refused) => (FakeResize::Refused(refused.resizer, refused.error, true), None),
             },
             // The release taken now, or already by the bank's own thread.
             FakeResize::Releasing(release, before) => {
@@ -991,7 +992,11 @@ impl ElasticBank for FakeBank {
                 let stopped = BankResized::Stopped { holding: crate::BankHolding::Experts, at };
                 (FakeResize::Idle(resizer), Some(stopped))
             }
-            FakeResize::Refused(resizer, refusal) => {
+            FakeResize::Refused(resizer, refusal, true) => {
+                *resize = Some(FakeResize::Idle(resizer));
+                return Err(DomainError::invariant(format!("the expert bank's storage refused a shrink: {refusal}")));
+            }
+            FakeResize::Refused(resizer, refusal, false) => {
                 let at = self.slots();
                 let refused = BankResized::Refused { holding: crate::BankHolding::Experts, at, refusal };
                 (FakeResize::Idle(resizer), Some(refused))

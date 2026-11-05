@@ -65,8 +65,6 @@ pub enum RoomRefusal {
     BeyondFloor { short: u64, releasable: u64 },
     /// The expert bank is at its floor.
     AtFloor { short: u64 },
-    /// The expert bank's storage refused a shrink.
-    ShrinkRefused { short: u64 },
 }
 
 impl fmt::Display for RoomRefusal {
@@ -79,7 +77,6 @@ impl fmt::Display for RoomRefusal {
                 );
             }
             Self::AtFloor { short } => ("the expert bank is at its floor", short),
-            Self::ShrinkRefused { short } => ("the expert bank's storage refused a shrink", short),
         };
         write!(f, "{why}, {short} bytes short of the measurement's room")
     }

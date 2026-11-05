@@ -279,8 +279,9 @@ pub(super) enum Resize {
         done: Done<Result<Vec<PreparedRecommit>, (Vec<Resizer>, TensorError)>>,
     },
     /// A shrink installed (`refusal` where a tensor refused its install,
-    /// keeping its storage), its surplus released off the submitting thread
-    /// once the device work before its install completes.
+    /// keeping its storage, which breaks the records once the others'
+    /// releases end), its surplus released off the submitting thread once the
+    /// device work before its install completes.
     Releasing {
         from: u64,
         charged: u64,
@@ -673,9 +674,8 @@ impl ExpertBank {
     /// watcher keeps each group's most valuable records below its new
     /// records (their bytes copied there), then each tensor releases the
     /// rest. Its size before and after, and Seismic's charge of it before
-    /// and after, or the refusal of a tensor's storage (which keeps more
-    /// backed than the directory uses, which it never reads); none while a
-    /// growth of it runs.
+    /// and after (a tensor's storage refusing breaks it, [`shrink_refused`]);
+    /// none while a growth of it runs.
     pub(super) fn shrink_host(&self, to: u64) -> Result<Option<LandedShrink>, DomainError> {
         let host = self.host.as_ref().ok_or_else(|| DomainError::invariant("a host tier resize without one"))?;
         let mut tier = host.lock().expect("host tier");
@@ -696,9 +696,15 @@ impl ExpertBank {
             return Err(DomainError::invariant(reason));
         }
         tier.slots.store(to, Ordering::Release);
-        let (resizers, refusal) = recommit(resizers, self.host_rows(to));
-        tier.resize = HostResize::Idle(resizers);
-        Ok(Some(LandedShrink { from, to, before, after: self.host_charged()?, refusal }))
+        match recommit(resizers, self.host_rows(to)) {
+            Ok(resizers) => tier.resize = HostResize::Idle(resizers),
+            Err(refusal) => {
+                let reason = shrink_refused(refusal);
+                tier.resize = HostResize::Broken(reason.clone());
+                return Err(DomainError::invariant(reason));
+            }
+        }
+        Ok(Some(LandedShrink { from, to, before, after: self.host_charged()? }))
     }
 
     /// Shrink the one store (where the host places) to `to` slots now,
@@ -706,10 +712,9 @@ impl ExpertBank {
     /// records below its new records (their bytes copied by the host within
     /// the views it holds), then addresses the records at `to` by their
     /// views, and each record tensor releases the rest. The device moves
-    /// nothing. Its slots before and after, Seismic's charge of the records
-    /// before and after, or the refusal of a tensor's storage (which keeps
-    /// what it holds, more backed than the directory uses); none while its
-    /// records resize.
+    /// nothing. Its slots before and after, and Seismic's charge of the
+    /// records before and after (a tensor's storage refusing breaks them,
+    /// [`shrink_refused`]); none while its records resize.
     pub(super) fn shrink_store(&self, to: u64) -> Result<Option<LandedShrink>, DomainError> {
         let mut commitment = self.commitment();
         // Everything that can fail before the resizers are taken; an ask
@@ -730,10 +735,16 @@ impl ExpertBank {
             return Err(DomainError::invariant(reason));
         }
         commitment.slots.store(to, Ordering::Release);
-        let (resizers, refusal) = recommit(resizers, self.rows_at(to));
-        commitment.resize = Resize::Idle(resizers);
+        match recommit(resizers, self.rows_at(to)) {
+            Ok(resizers) => commitment.resize = Resize::Idle(resizers),
+            Err(refusal) => {
+                let reason = shrink_refused(refusal);
+                commitment.resize = Resize::Broken(reason.clone());
+                return Err(DomainError::invariant(reason));
+            }
+        }
         drop(commitment);
-        Ok(Some(LandedShrink { from, to, before, after: self.charged()?, refusal }))
+        Ok(Some(LandedShrink { from, to, before, after: self.charged()? }))
     }
 
     /// Each group's records at `slots` slots.
@@ -974,10 +985,7 @@ impl ExpertBank {
             Resize::Preparing { from, charged, begun, done } => match take(&done) {
                 None => (Resize::Preparing { from, charged, begun, done }, None),
                 Some((Err(panicked), _)) => return broken(&mut commitment, panicked),
-                Some((Ok(Err((resizers, refusal))), _)) => {
-                    let refused = BankResized::Refused { holding: BankHolding::Experts, at: slots, refusal };
-                    (Resize::Idle(resizers), Some(refused))
-                }
+                Some((Ok(Err((_, refusal))), _)) => return broken(&mut commitment, shrink_refused(refusal)),
                 Some((Ok(Ok(prepared)), at)) => (self.install(prepared, (from, charged), (begun, at), wake), None),
             },
             Resize::Releasing { from, charged, refusal, begun, prepared, installed, done } => match take(&done) {
@@ -987,19 +995,18 @@ impl ExpertBank {
                 }
                 Some((Err(panicked), _)) => return broken(&mut commitment, panicked),
                 Some((Ok(resizers), released)) => {
+                    if let Some(refusal) = refusal {
+                        return broken(&mut commitment, shrink_refused(refusal));
+                    }
                     commitment.resize = Resize::Idle(resizers);
-                    let holding = BankHolding::Experts;
-                    return Ok(Some(match refusal {
-                        Some(refusal) => BankResized::Refused { holding, at: slots, refusal },
-                        None => BankResized::Shrunk {
-                            holding,
-                            from,
-                            to: slots,
-                            released: charged
-                                .checked_sub(self.charged()?)
-                                .ok_or_else(|| DomainError::invariant("an expert bank shrink raised its charge"))?,
-                            times: begun.times(prepared, installed, released),
-                        },
+                    return Ok(Some(BankResized::Shrunk {
+                        holding: BankHolding::Experts,
+                        from,
+                        to: slots,
+                        released: charged
+                            .checked_sub(self.charged()?)
+                            .ok_or_else(|| DomainError::invariant("an expert bank shrink raised its charge"))?,
+                        times: begun.times(prepared, installed, released),
                     }));
                 }
             },
@@ -1048,29 +1055,29 @@ impl ExpertBank {
 }
 
 /// A shrink of the records the host lands into, done: the slots it took them
-/// from and to, Seismic's charge of them before and after, and the refusal
-/// of a tensor's storage, which keeps what it holds.
+/// from and to, and Seismic's charge of them before and after.
 pub(super) struct LandedShrink {
     pub(super) from: u64,
     pub(super) to: u64,
     pub(super) before: u64,
     pub(super) after: u64,
-    pub(super) refusal: Option<TensorError>,
 }
 
-/// Commit each of `resizers` at its `rows` now: every resizer back, and the
-/// first refusal of a tensor's storage, which keeps what it holds.
-fn recommit(resizers: Vec<Resizer>, rows: Vec<u64>) -> (Vec<Resizer>, Option<TensorError>) {
-    let mut refusal = None;
-    let kept = resizers
+/// Commit each of `resizers` at its `rows` now, a shrink's: every resizer
+/// back, or the first refusal of a tensor's storage ([`shrink_refused`]).
+fn recommit(resizers: Vec<Resizer>, rows: Vec<u64>) -> Result<Vec<Resizer>, TensorError> {
+    resizers
         .into_iter()
         .zip(rows)
-        .map(|(resizer, rows)| {
-            resizer.recommit(rows).unwrap_or_else(|refused| {
-                refusal.get_or_insert(refused.error);
-                refused.resizer
-            })
-        })
-        .collect();
-    (kept, refusal)
+        .map(|(resizer, rows)| resizer.recommit(rows).map_err(|refused| refused.error))
+        .collect()
+}
+
+/// Why records whose storage refused a shrink are broken. A shrink needs no
+/// memory, and the views the watcher addresses records by are handed over
+/// before any shrink releases them, so nothing pins what it releases: a
+/// refusal is a broken invariant or a failed device, and the records keep
+/// storage the directory no longer uses.
+fn shrink_refused(refusal: TensorError) -> String {
+    format!("the expert bank's storage refused a shrink: {refusal}")
 }

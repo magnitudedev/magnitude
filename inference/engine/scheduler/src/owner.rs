@@ -781,12 +781,11 @@ impl RoomClaim {
     /// above its floor, it is answered with why before anything shrinks;
     /// short within it, the bank shrinks by the rest through `shrink`, and
     /// the claim waits for a later probe to read what that freed, unless the
-    /// shrink finds the bank at its floor, or the bank's storage `refused` a
-    /// shrink before, which answers it with why. The claim, while it waits.
+    /// shrink finds the bank at its floor, which answers it with why. The
+    /// claim, while it waits.
     fn decide<E>(
         self,
         standing: MeasurementRoom,
-        refused: bool,
         shrink: impl FnOnce(u64) -> Result<BankStep, E>,
     ) -> Result<Option<Self>, E> {
         let answer = match standing {
@@ -795,7 +794,6 @@ impl RoomClaim {
             // the claim waits for the next observation.
             MeasurementRoom::Unread | MeasurementRoom::Draining => return Ok(Some(self)),
             MeasurementRoom::Beyond { short, releasable } => Err(RoomRefusal::BeyondFloor { short, releasable }),
-            MeasurementRoom::Short(short) if refused => Err(RoomRefusal::ShrinkRefused { short }),
             MeasurementRoom::Short(short) => match shrink(short)? {
                 BankStep::Begun | BankStep::Running | BankStep::Deferred => return Ok(Some(self)),
                 BankStep::AtLimit => Err(RoomRefusal::AtFloor { short }),
@@ -913,10 +911,6 @@ pub struct BetweenFlights {
     recovery: magnitude_executor::platform::Recovery<u64>,
     /// The running expert bank resize.
     bank_began: Option<BankBegun>,
-    /// The bank's storage refused a shrink: no shrink begins again, and the
-    /// ladder's bank rung releases nothing, until memory changes (its
-    /// condition, or a finished resize).
-    shrink_refused: bool,
     /// The measurement job's room claimed of the domain and not yet
     /// answered ([`Owner::claim_measurement_room`]).
     measurement_room: Option<RoomClaim>,
@@ -939,7 +933,6 @@ impl BetweenFlights {
             room_owed: RoomOwed::default(),
             recovery: magnitude_executor::platform::Recovery::new(),
             bank_began: None,
-            shrink_refused: false,
             measurement_room: None,
             measures: None,
             next_observation: 0,
@@ -1751,8 +1744,7 @@ trait MemoryStep: MemoryHost + Sized {
         // A prompt's places that won memory from the bank's slots take it
         // through the bank's shrink (`ExecutorDomain::places_shrink`), as a
         // release waits, for no chain under way.
-        let refused = self.memory().shrink_refused;
-        if let (None, Some(bindings), false) = (self.domain().chain_holder(), bindings.as_deref_mut(), refused) {
+        if let (None, Some(bindings)) = (self.domain().chain_holder(), bindings.as_deref_mut()) {
             if let Some(bytes) = self.domain().places_shrink().map_err(classify_domain_error)? {
                 let before = self.domain().memory_moment();
                 let wake = self.completion();
@@ -1765,8 +1757,7 @@ trait MemoryStep: MemoryHost + Sized {
         // The measurement job's claim takes its room through the bank's
         // shrink toward its floor, read at a probe no resize ran across
         // (`room_owed`), so each shrink is seen before the next is decided:
-        // answered once the room is made, or once the floor, or the bank's
-        // storage refusing, leaves it short.
+        // answered once the room is made, or once the floor leaves it short.
         let ready = self.memory().bank_began.is_none() && self.domain().chain_holder().is_none() && bindings.is_some();
         let deciding = match self.memory().room_owed.take(ready) {
             true => self.domain().measurement_room().map_err(classify_domain_error)?,
@@ -1775,10 +1766,10 @@ trait MemoryStep: MemoryHost + Sized {
         if let (Some(standing), Some(bindings), Some(claim)) =
             (deciding, bindings.as_deref_mut(), deciding.and_then(|_| self.memory().measurement_room.take()))
         {
-            let (refused, mut began) = (self.memory().shrink_refused, None);
+            let mut began = None;
             let wake = self.completion();
             let domain = self.domain();
-            let waiting = claim.decide(standing, refused, |bytes| {
+            let waiting = claim.decide(standing, |bytes| {
                 let before = domain.memory_moment();
                 let step = domain.shrink_expert_bank_by(bindings, bytes, wake);
                 let step = step.map_err(classify_domain_error)?;
@@ -1854,7 +1845,6 @@ trait MemoryStep: MemoryHost + Sized {
         let recovered = memory.condition != MemoryCondition::Normal && next == MemoryCondition::Normal;
         if std::mem::discriminant(&memory.condition) != std::mem::discriminant(&next) {
             tracing::warn!(from = ?memory.condition, to = ?next, "memory condition changed");
-            memory.shrink_refused = false;
         }
         memory.condition = next;
         if recovered {
@@ -1989,9 +1979,6 @@ trait MemoryStep: MemoryHost + Sized {
         // it is placed on the decode's timeline.
         let now = std::time::Instant::now();
         let before_now = |at: std::time::Instant| now.duration_since(at).as_micros() as u64;
-        if matches!(finished, BankResized::Shrunk { .. } | BankResized::Grown { .. }) {
-            self.memory().shrink_refused = false;
-        }
         match finished {
             BankResized::Shrunk { holding, from, to, released, times } => {
                 self.domain().record_expert_resize(holding, resized(from, to)?);
@@ -2051,9 +2038,13 @@ trait MemoryStep: MemoryHost + Sized {
             BankResized::Stopped { holding, at } => {
                 tracing::info!(?holding, at, "the expert bank's growth stopped before its first slot")
             }
+            // Only a growth needs memory: a shrink's refusal broke the bank,
+            // which reports it as an invariant violation instead.
             BankResized::Refused { holding, at, refusal } => {
-                self.memory().shrink_refused |= cause != BankBegunFor::Growth;
-                tracing::warn!(?holding, at, ?cause, %refusal, "the expert bank's storage refused a resize")
+                if cause != BankBegunFor::Growth {
+                    return Err(invariant("expert bank")(format!("a shrink of {holding:?} reported a refusal: {refusal}")));
+                }
+                tracing::warn!(?holding, at, %refusal, "the expert bank's storage refused a growth")
             }
         }
         if matches!(self.memory().condition, MemoryCondition::Reclaim { .. }) {
@@ -3849,8 +3840,6 @@ impl<H: MemoryHost> Releasing<'_, H> {
                     .map_err(release_invariant("idle state release"))?
                     != 0,
             ),
-            // A refused shrink is not begun again before memory changes.
-            Rung::Bank if self.host.memory().shrink_refused => Release::Nothing,
             Rung::Bank if self.host.domain().expert_reclaim_covered() => Release::Covered,
             // A step begun, or a resize running, releases at a later flight
             // boundary; the bank's floor releases nothing.
@@ -4493,7 +4482,7 @@ mod measurement_room_tests {
         let (claim, mut grant) = claimed();
         let mut asked = None;
         let claim = claim
-            .decide::<()>(MeasurementRoom::Short(4096), false, |bytes| {
+            .decide::<()>(MeasurementRoom::Short(4096), |bytes| {
                 asked = Some(bytes);
                 Ok(BankStep::Begun)
             })
@@ -4502,41 +4491,35 @@ mod measurement_room_tests {
         assert_eq!(asked, Some(4096), "the bank shrinks by what the room is short");
         assert_eq!(answer(&mut grant), None, "not answered before the shrink is read");
         let unshrunk = |_| -> Result<BankStep, ()> { panic!("a made room shrinks nothing") };
-        assert!(claim.decide(MeasurementRoom::Made, false, unshrunk).unwrap().is_none());
+        assert!(claim.decide(MeasurementRoom::Made, unshrunk).unwrap().is_none());
         assert_eq!(answer(&mut grant), Some(RoomAnswer::Made));
     }
 
     /// A shrink that cannot run yet (no gap, or another resize) leaves the
     /// claim waiting for the next probe, which shrinks again; one at the
-    /// bank's floor refuses it, as does a storage that refused a shrink.
+    /// bank's floor refuses it.
     #[test]
     fn a_claim_at_the_floor_is_refused_and_one_without_a_gap_waits() {
         let (claim, mut grant) = claimed();
         let claim = claim
-            .decide::<()>(MeasurementRoom::Short(4096), false, |_| Ok(BankStep::Deferred))
+            .decide::<()>(MeasurementRoom::Short(4096), |_| Ok(BankStep::Deferred))
             .unwrap()
             .expect("a deferred shrink waits");
         let claim = claim
-            .decide::<()>(MeasurementRoom::Unread, false, |_| panic!("an unread room shrinks nothing"))
+            .decide::<()>(MeasurementRoom::Unread, |_| panic!("an unread room shrinks nothing"))
             .unwrap()
             .expect("an unread room waits");
         assert_eq!(answer(&mut grant), None);
         let claim = claim
-            .decide::<()>(MeasurementRoom::Draining, false, |_| panic!("a draining room shrinks nothing"))
+            .decide::<()>(MeasurementRoom::Draining, |_| panic!("a draining room shrinks nothing"))
             .unwrap()
             .expect("a room whose bank's traffic still runs waits");
         assert_eq!(answer(&mut grant), None);
         assert!(claim
-            .decide::<()>(MeasurementRoom::Short(4096), false, |_| Ok(BankStep::AtLimit))
+            .decide::<()>(MeasurementRoom::Short(4096), |_| Ok(BankStep::AtLimit))
             .unwrap()
             .is_none());
         assert_eq!(answer(&mut grant), Some(RoomAnswer::Refused(RoomRefusal::AtFloor { short: 4096 })));
-        let (claim, mut grant) = claimed();
-        assert!(claim
-            .decide::<()>(MeasurementRoom::Short(1), true, |_| panic!("no shrink after a refusal"))
-            .unwrap()
-            .is_none());
-        assert_eq!(answer(&mut grant), Some(RoomAnswer::Refused(RoomRefusal::ShrinkRefused { short: 1 })));
     }
 
     /// A claim short by more than the bank holds above its floor is refused
@@ -4546,7 +4529,7 @@ mod measurement_room_tests {
         let (claim, mut grant) = claimed();
         let beyond = MeasurementRoom::Beyond { short: 8192, releasable: 4096 };
         assert!(claim
-            .decide::<()>(beyond, false, |_| panic!("a claim no shrink can meet shrinks nothing"))
+            .decide::<()>(beyond, |_| panic!("a claim no shrink can meet shrinks nothing"))
             .unwrap()
             .is_none());
         let refused = RoomRefusal::BeyondFloor { short: 8192, releasable: 4096 };
