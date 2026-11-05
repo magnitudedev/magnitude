@@ -785,8 +785,8 @@ pub(super) enum CompletedStep {
     Decode(Decoded),
 }
 
-/// A decode launch: its rows, and the tokens its first row's history
-/// reads.
+/// A decode launch: its rows, and the mean tokens its rows' histories
+/// read.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct DecodeLaunch {
     pub(super) rows: usize,
@@ -823,9 +823,14 @@ impl ExpertStep {
         self.reads
     }
 
-    /// The step's decode launch runs `rows` rows, its first at `position`.
-    pub fn decoding(mut self, rows: usize, position: u64) -> Self {
-        self.launch = Some(DecodeLaunch { rows, tokens: position + 1 });
+    /// The step's decode launch: its rows, at `positions`. `σ` prices a
+    /// launch at its rows' mean depth (`MissRecord::overhead`), so rows of
+    /// several sequences at their own depths take theirs, not the first
+    /// row's.
+    pub fn decoding(mut self, positions: impl ExactSizeIterator<Item = u64>) -> Self {
+        let rows = positions.len();
+        assert!(rows > 0, "a decode launch runs a row");
+        self.launch = Some(DecodeLaunch { rows, tokens: positions.map(|position| position + 1).sum::<u64>() / rows as u64 });
         self
     }
 

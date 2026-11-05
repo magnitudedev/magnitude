@@ -36,7 +36,7 @@ fn a_decode_of_multi_row_launches_is_recorded_at_their_rows() {
         let first = (2 * position as usize) % EXPERTS;
         let step = harness
             .step()
-            .decoding(4, 1000 + position)
+            .decoding([1000 + position; 4].into_iter())
             .recorded(Recording { lines: Some(lines.clone()) });
         harness.request_at(&step, 0, &[first, first + 1]);
         if let Some(due) = step.complete().unwrap() {
@@ -69,7 +69,7 @@ fn a_replay_of_the_recorded_steps_assembles_the_live_record() {
         // Launches of one to four rows, so σ is sampled at each.
         let step = harness
             .step()
-            .decoding(1 + position as usize % 4, 1000 + position)
+            .decoding(std::iter::repeat_n(1000 + position, 1 + position as usize % 4))
             .recorded(Recording { lines: Some(lines.clone()) });
         harness.request_at(&step, 0, &[first, first + 1]);
         let due = step.complete().unwrap();

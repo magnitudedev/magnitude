@@ -1268,7 +1268,7 @@ impl NativeTargetProgram {
         let mut sets = vec![chain.len(); self.geometry.blocks.len()];
         let mut scratch = false;
         // Each launch with its expert step, of a streamed load: a decode
-        // launch's first row is at its position (validated nonnegative).
+        // launch's rows are at their positions (validated nonnegative).
         let steps = match &self.graphs.bank {
             Some(bank) => {
                 let begun = bank.begin(chain, |launch| route(launch), || {
@@ -1280,7 +1280,9 @@ impl NativeTargetProgram {
                 let steps = steps.map(|(launch, step)| {
                     let upload = launch.batch().upload();
                     let step = match route(&launch) {
-                        StepRoute::Decode => step.decoding(upload.actual_rows, upload.coordinates[0][0] as u64),
+                        StepRoute::Decode => {
+                            step.decoding(upload.coordinates[..upload.actual_rows].iter().map(|row| row[0] as u64))
+                        }
                         StepRoute::Prompt => step,
                     };
                     (launch, Some((bank.clone(), step)))
