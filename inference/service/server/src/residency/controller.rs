@@ -12,7 +12,7 @@ use magnitude_serving::source::{ModelLoadDetails, KernelTuningWork, KernelTuning
 use magnitude_engine::worker::protocol::TuningOperation;
 use std::cell::RefCell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
@@ -43,7 +43,7 @@ use super::optimization::{self, PreparationJobs};
 use super::supervisor::{HostMemoryObserver, MemorySupervisor};
 use super::worker::{EngineWorker, SpawnedWorker};
 use super::{
-    LoadingObserver, ModelOperationFailure, ModelResidency, ModelResidencyDriver,
+    LoadSequence, LoadingObserver, ModelOperationFailure, ModelResidency, ModelResidencyDriver,
     PreparedResidency, ReleaseControl, ResidencyAcquisition, ResidencyClient, ResidencyGrant,
     ResidencyLease, ResidencyNotification, ResidencyWorker, ResolvedResidencyTarget,
 };
@@ -484,15 +484,6 @@ fn preview_failure(error: PreviewError) -> ModelOperationFailure {
     ModelOperationFailure::new(code, error.to_string(), retryable)
 }
 
-/// Sets its flag when dropped: with the task that holds it.
-struct SetOnDrop(Arc<AtomicBool>);
-
-impl Drop for SetOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
-    }
-}
-
 /// A worker's load failure. A memory refusal is a shortage: blocked by the bytes the engine's
 /// claim found available above the domain's reserve, or under pressure with no byte count.
 fn load_failure(error: LoadError, worker: &EngineWorker) -> ModelOperationFailure {
@@ -666,6 +657,7 @@ impl EngineResidency {
         &self,
         instance_id: &ModelInstanceId,
         configuration: ModelServingConfiguration,
+        sequence: LoadSequence,
     ) -> Result<PreparedResidency<ResidentEngine>, ModelOperationFailure> {
         let environment = &self.environment;
         let resolved = environment.configurations.resolve(&configuration).await?;
@@ -699,9 +691,8 @@ impl EngineResidency {
         // serves what is stored (the engine's one sequence, `load_prepared`).
         let manifest = resolved.manifest.clone();
         // The sequence runs on a blocking thread, which outlives this task when the load is
-        // stopped: it starts no further worker once the task is gone.
-        let abandoned = Arc::new(AtomicBool::new(false));
-        let _abandon = SetOnDrop(Arc::clone(&abandoned));
+        // stopped: it starts each worker through `sequence`, which a stop closes, and holds it
+        // until it is done with every worker, which the stop waits for.
         let driver = self.clone();
         let load_instance = instance_id.clone();
         let load_plan = plan.clone();
@@ -732,10 +723,10 @@ impl EngineResidency {
             let spawn_failure = RefCell::new(None);
             let spawn = || {
                 let stopped = |reason: String| LoadError::WorkerLost { reason };
-                if abandoned.load(Ordering::Acquire) {
+                let Some(spawned) = sequence.start(|| driver.spawn_load_worker(&load_instance, &device)) else {
                     return Err(stopped("the load was stopped".into()));
-                }
-                match driver.spawn_load_worker(&load_instance, &device) {
+                };
+                match spawned {
                     Ok(spawned) => {
                         *last_worker.borrow_mut() = Some(Arc::clone(&spawned.worker));
                         Ok(spawned)
@@ -842,10 +833,11 @@ impl ModelResidencyDriver for EngineResidency {
         &self,
         instance_id: ModelInstanceId,
         target: ResolvedResidencyTarget,
+        sequence: LoadSequence,
     ) -> Result<tokio::task::JoinHandle<()>, InventoryError> {
         let driver = self.clone();
         Ok(tokio::spawn(async move {
-            let result = std::panic::AssertUnwindSafe(driver.load(&instance_id, target.configuration))
+            let result = std::panic::AssertUnwindSafe(driver.load(&instance_id, target.configuration, sequence))
                 .catch_unwind()
                 .await
                 .unwrap_or_else(|_| {

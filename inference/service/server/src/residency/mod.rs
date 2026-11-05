@@ -130,6 +130,7 @@ struct LoadingResidency<R> {
     configuration: ModelServingConfiguration,
     configuration_key: String,
     operation: tokio::task::JoinHandle<()>,
+    gate: LoadGate,
     worker: Option<Arc<dyn ResidencyWorker>>,
     waiters: Vec<AcquisitionWaiter<R>>,
 }
@@ -169,7 +170,7 @@ impl ReleaseControl {
 
 enum ReleaseOperation<R> {
     StoppingLoad {
-        operation: tokio::task::JoinHandle<()>,
+        operation: magnitude_service_utils::owner::Owner,
         worker: Option<Arc<dyn ResidencyWorker>>,
     },
     Draining {
@@ -543,16 +544,76 @@ impl From<InventoryError> for ModelOperationFailure {
     }
 }
 
+/// A load's sequence of workers, which the driver's load runs: it starts each worker through
+/// [`Self::start`] and holds the sequence until its last worker is done with. Its pair
+/// ([`LoadGate`]) is the actor's.
+pub struct LoadSequence {
+    abandoned: Arc<std::sync::atomic::AtomicBool>,
+    ended: tokio::sync::watch::Sender<bool>,
+}
+
+/// The actor's end of a load's sequence: abandoning it closes the sequence to new workers at
+/// once, and its end is when the sequence, dropped by its load, is done with every worker.
+pub struct LoadGate {
+    abandoned: Arc<std::sync::atomic::AtomicBool>,
+    ended: tokio::sync::watch::Receiver<bool>,
+}
+
+/// A load's sequence and the actor's gate on it.
+fn load_sequence() -> (LoadSequence, LoadGate) {
+    let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (ended, receiver) = tokio::sync::watch::channel(false);
+    (
+        LoadSequence { abandoned: Arc::clone(&abandoned), ended },
+        LoadGate { abandoned, ended: receiver },
+    )
+}
+
+impl LoadSequence {
+    /// Start a worker by `start` (its spawn and the announcement that hands it to the actor),
+    /// unless the load is abandoned. A start begun before the abandonment announces its worker to
+    /// the stopping load, which ends it; the stop completes only once the sequence is done
+    /// ([`LoadGate::ended`]), so no worker is announced after.
+    pub fn start<T>(&self, start: impl FnOnce() -> T) -> Option<T> {
+        (!self.abandoned.load(std::sync::atomic::Ordering::Acquire)).then(start)
+    }
+}
+
+impl Drop for LoadSequence {
+    fn drop(&mut self) {
+        self.ended.send_replace(true);
+    }
+}
+
+impl LoadGate {
+    /// Start no further worker of the load.
+    fn abandon(&self) {
+        self.abandoned.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Once the sequence is done with every worker it started.
+    fn ended(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut ended = self.ended.clone();
+        async move {
+            // A dropped sequence sent its end as it dropped.
+            let _ = ended.wait_for(|ended| *ended).await;
+        }
+    }
+}
+
 /// Loads, supervises and releases workers for the actor.
 pub trait ModelResidencyDriver: Clone + Send + Sync + 'static {
     /// What a lease on a ready instance hands out.
     type Resident: Clone + Send + Sync + 'static;
     fn client(&self) -> &ResidencyClient<Self::Resident>;
     fn next_instance_id(&self) -> ModelInstanceId;
+    /// Start loading `target` as `instance_id`, its workers started through `sequence`, which
+    /// the load holds until it is done with every worker.
     fn start_model_load(
         &self,
         instance_id: ModelInstanceId,
         target: ResolvedResidencyTarget,
+        sequence: LoadSequence,
     ) -> Result<tokio::task::JoinHandle<()>, InventoryError>;
     fn start_worker_release(
         &self,
@@ -690,10 +751,11 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                     worker.terminate("model_instance_stopped", "model instance was stopped");
                     *retained = Some(worker);
                 } else {
-                    // The load ended before its sequence announced this worker: a stopped load's
-                    // sequence outlives its task and may have started its next worker (the Load
-                    // after its Prepare) just before it saw the stop. Nothing owns it but here.
-                    worker.terminate("model_instance_stopped", "model instance was stopped");
+                    // Every worker a sequence starts is announced before its load's end or its
+                    // stop's completion ([`LoadSequence::start`]); only a shutdown, which ends
+                    // the load with no completion, leaves one announced after. Nothing owns it but
+                    // here.
+                    worker.terminate("service_shutdown", "the inference service stopped");
                 }
             }
             ResidencyNotification::LoadProgress {
@@ -857,9 +919,10 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
 
     fn start_loading(&mut self, first: AcquisitionWaiter<D::Resident>) {
         let instance_id = self.controller.next_instance_id();
+        let (sequence, gate) = load_sequence();
         let operation = match self
             .controller
-            .start_model_load(instance_id.clone(), first.target.clone())
+            .start_model_load(instance_id.clone(), first.target.clone(), sequence)
         {
             Ok(operation) => operation,
             Err(error) => {
@@ -884,6 +947,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             configuration: first.target.configuration.clone(),
             configuration_key: first.target.configuration_key.clone(),
             operation,
+            gate,
             worker: None,
             waiters: vec![first],
         });
@@ -1016,8 +1080,11 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 &ModelReleaseReason::UserStop,
             )));
         }
-        // The load's sequence learns of the stop before its worker ends: it reacts to that end by
-        // starting its next worker unless it sees the load abandoned.
+        // The load's sequence is closed before its worker ends: it reacts to that end by starting
+        // its next worker, which the closed sequence refuses. A worker it started before is
+        // announced before the stop completes, which waits for the sequence to be done with every
+        // worker, so the next load never starts beside one.
+        loading.gate.abandon();
         loading.operation.abort();
         let worker = loading.worker.take();
         if let Some(worker) = &worker {
@@ -1026,8 +1093,10 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         let notifier = self.controller.client().notifier();
         let instance_id = loading.instance.id.clone();
         let operation = loading.operation;
-        let completion = tokio::spawn(async move {
+        let ended = loading.gate.ended();
+        let completion = magnitude_service_utils::owner::spawn("a stopped load's completion", async move {
             let _ = operation.await;
+            ended.await;
             notifier.send(ResidencyNotification::LoadingStopCompleted { instance_id });
         });
         let stopping = ModelInstance {
@@ -1657,6 +1726,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
     fn shutdown(&mut self) {
         match std::mem::replace(&mut self.state, ResidencyState::Vacant) {
             ResidencyState::Loading(loading) => {
+                loading.gate.abandon();
                 loading.operation.abort();
                 if let Some(worker) = loading.worker {
                     worker.terminate("service_shutdown", "the inference service stopped");
@@ -1801,6 +1871,8 @@ mod tests {
         idle_timeout: std::time::Duration,
         /// Every idleness published, in order.
         idles: Arc<Mutex<Vec<Option<TestResident>>>>,
+        /// Each load's sequence, held by its load's task until the task ends or is aborted.
+        sequences: Arc<Mutex<Vec<std::sync::Weak<LoadSequence>>>>,
     }
 
     #[derive(Default)]
@@ -1862,8 +1934,11 @@ mod tests {
             &self,
             instance_id: ModelInstanceId,
             target: ResolvedResidencyTarget,
+            sequence: LoadSequence,
         ) -> Result<tokio::task::JoinHandle<()>, InventoryError> {
             let model_id = target.model_id;
+            let sequence = Arc::new(sequence);
+            self.sequences.lock().expect("test sequences lock").push(Arc::downgrade(&sequence));
             self.loads
                 .send((instance_id.clone(), model_id.to_string()))
                 .expect("test load observer remains alive");
@@ -1876,6 +1951,7 @@ mod tests {
                 let notifier = self.client.notifier();
                 let completion = self.client.load_completion();
                 return Ok(tokio::spawn(async move {
+                    let _sequence = sequence;
                     tokio::task::yield_now().await;
                     let worker: Arc<dyn ResidencyWorker> = worker;
                     notifier.send(ResidencyNotification::LoadWorkerStarted {
@@ -1894,7 +1970,10 @@ mod tests {
                     );
                 }));
             }
-            Ok(tokio::spawn(std::future::pending()))
+            Ok(tokio::spawn(async move {
+                let _sequence = sequence;
+                std::future::pending::<()>().await
+            }))
         }
 
         fn start_worker_release(
@@ -1968,6 +2047,7 @@ mod tests {
             workers: Arc::clone(&workers),
             idle_timeout,
             idles: Arc::default(),
+            sequences: Arc::default(),
         };
         let actor = tokio::spawn(ModelResidency::new(driver).run(inbox));
         (client, load_events, workers, actor)
@@ -1988,6 +2068,7 @@ mod tests {
             workers: Arc::default(),
             idle_timeout: std::time::Duration::from_secs(600),
             idles: Arc::clone(&idles),
+            sequences: Arc::default(),
         };
         let _actor = tokio::spawn(ModelResidency::new(driver).run(inbox));
         let published = || idles.lock().unwrap().clone();
@@ -2469,51 +2550,61 @@ mod tests {
         }).await.expect("cancellation lost worker ownership or a reply");
     }
 
-    /// QA retest2 30-stop: a stop during a load's Prepare ends the load. Its sequence, which
-    /// outlives the load's task, saw its Prepare worker end and announced the next (the Load)
-    /// only after the residency went vacant. That worker is ended at once, no other load starts,
-    /// and the optimization job waiting for the device takes it as the sequence lets it go.
+    /// A stop during a load's Prepare ends the load. Its sequence outlives
+    /// the load's task, so the stop closes it: the next worker (the Load after the Prepare) never
+    /// starts, and the stop completes, and the next load may start, only once the sequence is
+    /// done with every worker it started.
     #[tokio::test]
-    async fn a_stop_during_a_loads_prepare_starts_no_further_load_and_frees_the_device() {
+    async fn a_stop_during_a_loads_prepare_starts_no_further_worker_and_waits_for_the_sequence() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let device = crate::device_lock::DeviceLock::default();
-            let (client, mut loads, _, actor) = test_residency(false);
+            let (client, inbox) = ResidencyClient::channel();
+            let (loads, mut load_events) = tokio::sync::mpsc::unbounded_channel();
+            let sequences = Arc::new(Mutex::new(Vec::new()));
+            let driver = TestResidencyDriver {
+                client: client.clone(),
+                next_instance_id: Arc::new(AtomicU64::new(1)),
+                loads,
+                auto_ready: false,
+                workers: Arc::default(),
+                idle_timeout: std::time::Duration::from_secs(600),
+                idles: Arc::default(),
+                sequences: Arc::clone(&sequences),
+            };
+            let actor = tokio::spawn(ModelResidency::new(driver).run(inbox));
             let loading = tokio::spawn({ let client = client.clone(); async move {
                 client.acquire(test_target("model-a"), ResidencyAcquisition::Warm).await
             }});
-            let (instance_id, _) = loads.recv().await.unwrap();
-            let share = device.try_share().expect("the load shares the device");
-            let job = tokio::spawn({ let device = device.clone(); async move { device.job().await } });
+            let (instance_id, _) = load_events.recv().await.unwrap();
+            // The sequence as its blocking thread holds it, past its task's abort.
+            let sequence = sequences.lock().unwrap()[0].upgrade().expect("the load holds its sequence");
             let prepare = Arc::new(TestResidencyWorker::default());
-            let load = Arc::new(TestResidencyWorker::default());
-            let (announce, announced) = tokio::sync::oneshot::channel::<()>();
-            let sequence = tokio::spawn({
-                let notifier = client.notifier();
-                let instance_id = instance_id.clone();
-                let (prepare, load) = (Arc::clone(&prepare), Arc::clone(&load));
-                async move {
-                    notifier.send(ResidencyNotification::LoadWorkerStarted { instance_id: instance_id.clone(), worker: prepare });
-                    announced.await.unwrap();
-                    notifier.send(ResidencyNotification::LoadWorkerStarted { instance_id, worker: load.clone() });
-                    while load.try_wait().unwrap().is_none() {
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    }
-                    drop(share);
-                }
-            });
+            sequence
+                .start(|| client.notifier().send(ResidencyNotification::LoadWorkerStarted {
+                    instance_id: instance_id.clone(),
+                    worker: prepare.clone(),
+                }))
+                .expect("an open sequence starts its worker");
             client.snapshot().await.unwrap();
-            client.stop(instance_id.clone()).await.expect("stop during the Prepare");
+            let stop = tokio::spawn({ let client = client.clone(); let instance_id = instance_id.clone(); async move {
+                client.stop(instance_id).await
+            }});
+            // The stop closes the sequence: its next worker is never started.
+            while sequence.start(|| ()).is_some() {
+                tokio::task::yield_now().await;
+            }
             assert_explicit_stop(loading.await.unwrap());
             assert!(prepare.interrupted.load(Ordering::Acquire) > 0, "the Prepare worker is ended");
-            announce.send(()).unwrap();
-            job.await.expect("the waiting job takes the device");
-            sequence.await.unwrap();
-            assert!(load.interrupted.load(Ordering::Acquire) > 0, "the stopped load's next worker is ended");
-            assert!(loads.try_recv().is_err(), "no further load starts");
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!stop.is_finished(), "the stop completes only once the sequence ends");
+            drop(sequence);
+            stop.await.unwrap().expect("the stop completes as the sequence ends");
+            assert!(load_events.try_recv().is_err(), "no further load starts");
             let snapshot = client.snapshot().await.unwrap();
             assert!(snapshot.instances.iter().all(|instance| !matches!(instance.lifecycle, ModelInstanceLifecycle::Loading { .. })));
             actor.abort();
-        }).await.expect("a stopped load's worker outlived the stop or held the device");
+        }).await.expect("a stopped load's sequence started a worker or the stop outran it");
     }
 
     #[tokio::test]
