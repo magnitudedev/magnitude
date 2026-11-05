@@ -264,7 +264,7 @@ impl Drop for PreparationGuard {
             .remove(&self.key)
             .and_then(|job| job.worker);
         if let Some(worker) = worker {
-            worker.terminate("preparation_ended", "the installation's optimization ended");
+            worker.end("preparation_ended", "the installation's optimization ended");
         }
     }
 }
@@ -349,7 +349,7 @@ async fn prepare(
         let (prepared, preempted) = tokio::select! {
             prepared = &mut preparing => (prepared, false),
             () = preemption.preempted() => {
-                worker.terminate("preparation_preempted", "a load takes the device");
+                worker.end("preparation_preempted", "a load takes the device");
                 (preparing.as_mut().await, true)
             }
         };

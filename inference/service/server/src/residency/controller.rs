@@ -886,10 +886,13 @@ impl ModelResidencyDriver for EngineResidency {
             worker.shutdown();
             let mut deadline = tokio::time::Instant::now()
                 + if interrupt_immediately { INTERRUPTED_EXIT } else { GRACEFUL_EXIT };
+            // Once killed, the worker is polled until the kernel reaps it, however long that
+            // takes: the release ends only with its retirement shown, and nothing waits on it.
+            let mut killed = false;
             let result = loop {
                 match worker.try_wait() {
                     Ok(Some(_)) => break Ok(()),
-                    Ok(None) if tokio::time::Instant::now() < deadline => {
+                    Ok(None) if killed || tokio::time::Instant::now() < deadline => {
                         tokio::select! {
                             biased;
                             changed = interruption.changed() => {
@@ -900,18 +903,26 @@ impl ModelResidencyDriver for EngineResidency {
                             () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
                         }
                     }
-                    Ok(None) => {
-                        worker.terminate(
-                            "worker_unresponsive",
-                            "inference worker did not exit after shutdown",
-                        );
-                        break Ok(());
-                    }
+                    Ok(None) => match worker.terminate(
+                        "worker_unresponsive",
+                        "inference worker did not exit after shutdown",
+                    ) {
+                        Ok(()) => killed = true,
+                        Err(error) => {
+                            break Err(ModelOperationFailure::new(
+                                "worker_retirement_failed",
+                                format!("the inference worker could not be killed: {error}"),
+                                true,
+                            ));
+                        }
+                    },
                     Err(error) => {
-                        worker.terminate(
+                        if let Err(kill) = worker.terminate(
                             "worker_monitor_failed",
                             "failed to observe inference worker during shutdown",
-                        );
+                        ) {
+                            tracing::error!(error = %kill, "the inference worker could not be killed");
+                        }
                         break Err(ModelOperationFailure::new(
                             "worker_monitor_failed",
                             format!("failed to observe inference worker during shutdown: {error}"),

@@ -93,8 +93,17 @@ pub struct ResolvedResidencyTarget {
 pub trait ResidencyWorker: Send + Sync {
     fn pid(&self) -> Option<u32>;
     fn try_wait(&self) -> std::io::Result<Option<std::process::ExitStatus>>;
-    /// End the worker now; attached requests fail.
-    fn terminate(&self, code: &str, reason: &str);
+    /// End the worker now, attached requests failing: the kill is sent, never waited for (a
+    /// driver can delay the kernel's reap without bound), and its retirement is shown by
+    /// [`Self::try_wait`]. An error is a kill that could not be sent.
+    fn terminate(&self, code: &str, reason: &str) -> std::io::Result<()>;
+    /// [`Self::terminate`] where what follows shows the worker's retirement or reports it
+    /// unproven (its owner polls [`Self::try_wait`]): a kill that could not be sent is logged.
+    fn end(&self, code: &str, reason: &str) {
+        if let Err(error) = self.terminate(code, reason) {
+            tracing::error!(%error, code, "the inference worker's kill could not be sent");
+        }
+    }
     /// Ask the worker to unload and exit; attached requests end with the unload.
     fn shutdown(&self);
 }
@@ -768,14 +777,14 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                     } = &mut releasing.operation
                 {
                     // The start notification may already be queued when cancellation is admitted.
-                    worker.terminate("model_instance_stopped", "model instance was stopped");
+                    worker.end("model_instance_stopped", "model instance was stopped");
                     *retained = Some(worker);
                 } else {
                     // Every worker a sequence starts is announced before its load's end or its
                     // stop's completion ([`LoadSequence::start`]); only a shutdown, which ends
                     // the load with no completion, leaves one announced after. Nothing owns it but
                     // here.
-                    worker.terminate("service_shutdown", "the inference service stopped");
+                    worker.end("service_shutdown", "the inference service stopped");
                 }
             }
             ResidencyNotification::LoadProgress {
@@ -1108,7 +1117,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         loading.operation.abort();
         let worker = loading.worker.take();
         if let Some(worker) = &worker {
-            worker.terminate("model_instance_stopped", "model instance was stopped");
+            worker.end("model_instance_stopped", "model instance was stopped");
         }
         let notifier = self.controller.client().notifier();
         let instance_id = loading.instance.id.clone();
@@ -1749,13 +1758,13 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 loading.gate.abandon();
                 loading.operation.abort();
                 if let Some(worker) = loading.worker {
-                    worker.terminate("service_shutdown", "the inference service stopped");
+                    worker.end("service_shutdown", "the inference service stopped");
                 }
             }
             ResidencyState::Ready(ready) => ready
                 .resources
                 .worker
-                .terminate("service_shutdown", "the inference service stopped"),
+                .end("service_shutdown", "the inference service stopped"),
             ResidencyState::Releasing(ReleasingResidency {
                 operation:
                     ReleaseOperation::Draining {
@@ -1764,7 +1773,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 ..
             }) => resources
                 .worker
-                .terminate("service_shutdown", "the inference service stopped"),
+                .end("service_shutdown", "the inference service stopped"),
             ResidencyState::Releasing(ReleasingResidency {
                 operation: ReleaseOperation::Draining { resources: None },
                 ..
@@ -1779,13 +1788,13 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             }) => {
                 operation.abort();
                 if let Some(worker) = worker {
-                    worker.terminate("service_shutdown", "the inference service stopped");
+                    worker.end("service_shutdown", "the inference service stopped");
                 }
             }
             ResidencyState::Releasing(ReleasingResidency {
                 operation: ReleaseOperation::RetirementFailed { worker, .. },
                 ..
-            }) => worker.terminate("service_shutdown", "the inference service stopped"),
+            }) => worker.end("service_shutdown", "the inference service stopped"),
             ResidencyState::Vacant => {}
         }
     }
@@ -1921,12 +1930,14 @@ mod tests {
                 .then(|| std::process::ExitStatus::from_raw(0)))
         }
 
-        fn terminate(&self, _code: &str, _reason: &str) {
+        fn terminate(&self, _code: &str, _reason: &str) -> std::io::Result<()> {
             self.interrupted.fetch_add(1, Ordering::AcqRel);
-            self.retired.store(
-                !self.fail_retirement.load(Ordering::Acquire),
-                Ordering::Release,
-            );
+            let fails = self.fail_retirement.load(Ordering::Acquire);
+            self.retired.store(!fails, Ordering::Release);
+            match fails {
+                true => Err(std::io::Error::other("the test worker refuses its kill")),
+                false => Ok(()),
+            }
         }
 
         fn shutdown(&self) {
@@ -2006,7 +2017,7 @@ mod tests {
         ) -> ReleaseControl {
             let (interrupt, _) = tokio::sync::watch::channel(interrupt_immediately);
             if interrupt_immediately {
-                worker.terminate("model_instance_stopped", "model instance was stopped");
+                worker.end("model_instance_stopped", "model instance was stopped");
             } else {
                 worker.shutdown();
             }

@@ -254,7 +254,7 @@ impl Inner {
                     );
                     supervised
                         .worker
-                        .terminate(MEMORY_PRESSURE_FAILURE_CODE, &emergency.to_string());
+                        .end(MEMORY_PRESSURE_FAILURE_CODE, &emergency.to_string());
                     self.notifier.send(ResidencyNotification::ReleaseRequested {
                         instance_id: supervised.instance_id,
                         reason: ModelReleaseReason::MemoryPressure,
@@ -494,8 +494,9 @@ mod tests {
                 .load(Ordering::Acquire)
                 .then(|| std::process::ExitStatus::from_raw(9)))
         }
-        fn terminate(&self, _code: &str, _reason: &str) {
+        fn terminate(&self, _code: &str, _reason: &str) -> std::io::Result<()> {
             self.terminated.store(true, Ordering::Release);
+            Ok(())
         }
         fn shutdown(&self) {}
     }

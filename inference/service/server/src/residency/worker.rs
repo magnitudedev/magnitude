@@ -79,6 +79,9 @@ enum ProcessState {
     Retired(ExitStatus),
 }
 
+/// The worker's process state stands from its spawn until its drop takes it.
+const STANDS: &str = "a worker's process state stands until its drop";
+
 /// The bounded tail of a worker's standard error.
 #[derive(Default)]
 struct DiagnosticTail(VecDeque<u8>);
@@ -102,7 +105,8 @@ impl DiagnosticTail {
 /// One engine worker process. It owns the process until retirement is proven, and the engine
 /// client once the worker is ready.
 pub struct EngineWorker {
-    process: Mutex<ProcessState>,
+    /// Taken only by the worker's drop, which hands an unretired process to its reaper.
+    process: Mutex<Option<ProcessState>>,
     client: OnceLock<EngineClient>,
     diagnostics: Arc<Mutex<DiagnosticTail>>,
 }
@@ -136,10 +140,10 @@ impl EngineWorker {
         } = launcher.spawn_blocking_io(command)?;
         let pid = process_id(&process);
         let worker = Arc::new(Self {
-            process: Mutex::new(ProcessState::Owned {
+            process: Mutex::new(Some(ProcessState::Owned {
                 process,
                 _device: device,
-            }),
+            })),
             client: OnceLock::new(),
             diagnostics: Arc::new(Mutex::new(DiagnosticTail::default())),
         });
@@ -189,6 +193,7 @@ impl EngineWorker {
 
     fn retire(&self) -> std::io::Result<ExitStatus> {
         let mut state = self.process.lock().expect("worker process lock");
+        let state = state.as_mut().expect(STANDS);
         match &mut *state {
             ProcessState::Retired(status) => Ok(*status),
             ProcessState::Owned { process, .. } => {
@@ -282,7 +287,7 @@ impl JobWorker {
             diagnostics: Arc::new(Mutex::new(DiagnosticTail::default())),
         };
         if let Err(error) = drain_diagnostics(stderr, Arc::clone(&worker.diagnostics), pid) {
-            worker.retire(false)?;
+            worker.retire(false).map_err(|(_, error)| error)?;
             return Err(error.into());
         }
         let transport = FramedTransport::new(std::io::BufReader::new(stdout), stdin);
@@ -303,17 +308,17 @@ impl JobWorker {
 
     /// Return once the process is proven gone. One that `reported` its outcome is left to exit
     /// on its own ([`reported_exit`]); any other, or one that has not exited by then, is
-    /// stopped. Blocking.
-    pub fn retire(mut self, reported: bool) -> std::io::Result<ExitStatus> {
+    /// stopped. Blocking. One whose end the system will not show comes back with why, still
+    /// holding all it holds ([`RETIREMENT_RETRY`]).
+    pub fn retire(mut self, reported: bool) -> Result<ExitStatus, (Self, std::io::Error)> {
         let pid = process_id(&self.process);
-        let exited = if reported {
-            reported_exit(|| observe_exit(&mut self.process))?
-        } else {
-            None
+        let exited = match reported {
+            true => reported_exit(|| observe_exit(&mut self.process)),
+            false => Ok(None),
         };
-        let status = match exited {
-            Some(status) => status,
-            None => stop(&mut self.process)?,
+        let status = match exited.and_then(|exited| exited.map_or_else(|| stop(&mut self.process), Ok)) {
+            Ok(status) => status,
+            Err(error) => return Err((self, error)),
         };
         log_exit(pid, status);
         Ok(status)
@@ -322,7 +327,7 @@ impl JobWorker {
 
 impl ResidencyWorker for EngineWorker {
     fn pid(&self) -> Option<u32> {
-        match &*self.process.lock().expect("worker process lock") {
+        match self.process.lock().expect("worker process lock").as_ref().expect(STANDS) {
             ProcessState::Owned { process, .. } => Some(process_id(process)),
             ProcessState::Retired(_) => None,
         }
@@ -330,6 +335,7 @@ impl ResidencyWorker for EngineWorker {
 
     fn try_wait(&self) -> std::io::Result<Option<ExitStatus>> {
         let mut state = self.process.lock().expect("worker process lock");
+        let state = state.as_mut().expect(STANDS);
         match &mut *state {
             ProcessState::Retired(status) => Ok(Some(*status)),
             ProcessState::Owned { process, .. } => {
@@ -344,10 +350,23 @@ impl ResidencyWorker for EngineWorker {
         }
     }
 
-    fn terminate(&self, code: &str, reason: &str) {
+    fn terminate(&self, code: &str, reason: &str) -> std::io::Result<()> {
         tracing::info!(worker.pid = self.pid(), code, reason, "terminating inference worker");
-        if let Err(error) = self.retire() {
-            tracing::error!(%error, "inference worker retirement failed; retaining its owner");
+        let mut state = self.process.lock().expect("worker process lock");
+        let state = state.as_mut().expect(STANDS);
+        match &mut *state {
+            ProcessState::Retired(_) => Ok(()),
+            ProcessState::Owned { process, .. } => {
+                let pid = process_id(process);
+                match observe_exit(process)? {
+                    Some(status) => {
+                        log_exit(pid, status);
+                        *state = ProcessState::Retired(status);
+                        Ok(())
+                    }
+                    None => start_kill(process),
+                }
+            }
         }
     }
 
@@ -360,16 +379,39 @@ impl ResidencyWorker for EngineWorker {
                     tracing::warn!(%error, "inference worker did not accept shutdown");
                 }
             }
-            None => self.terminate("worker_shutdown", "the worker was not ready"),
+            None => self.end("worker_shutdown", "the worker was not ready"),
         }
     }
 }
 
 impl Drop for EngineWorker {
+    /// A worker dropped before its retirement was shown has no owner left to poll it: it is
+    /// stopped on a thread of its own, which holds its device until the kernel has reaped it, so
+    /// no drop waits on the reap and no device is released before it. A stop the system refuses
+    /// is tried again ([`RETIREMENT_RETRY`]).
     fn drop(&mut self) {
-        if let Err(error) = self.retire() {
-            tracing::error!(%error, "inference worker cleanup could not prove retirement");
-        }
+        // The dropped worker's state is read no more: what it held moves to its reaper.
+        let state = self.process.get_mut().expect("worker process lock").take().expect(STANDS);
+        let ProcessState::Owned { mut process, _device: device } = state else {
+            return;
+        };
+        let pid = process_id(&process);
+        std::thread::Builder::new()
+            .name(format!("inference-worker-reap-{pid}"))
+            .spawn(move || {
+                let status = loop {
+                    match stop(&mut process) {
+                        Ok(status) => break status,
+                        Err(error) => {
+                            tracing::error!(worker.pid = pid, %error, "an ownerless inference worker could not be shown to have ended; trying again");
+                            std::thread::sleep(RETIREMENT_RETRY);
+                        }
+                    }
+                };
+                log_exit(pid, status);
+                drop(device);
+            })
+            .expect("a thread to reap an ownerless inference worker");
     }
 }
 
@@ -458,11 +500,13 @@ fn reported_exit(
     Ok(None)
 }
 
-/// How long a stopped worker is waited for once killed, on Windows: the bound [`stop`] gives its
-/// job object's processes to be proven gone. On Unix a killed process is reaped once the kernel
-/// releases it, which a driver can delay without bound, and its owner waits for that.
-#[cfg(windows)]
-const KILL_REAP: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a worker whose end cannot be shown waits before it is tried again: the one policy
+/// for a kill the system refused to send, or an exit it refused to report. Such a worker keeps
+/// everything it holds, its device among it, is reported, and is tried again until its end is
+/// shown, by its owner: a stop retries a resident's ([`super::ReleaseOperation`]'s retirement
+/// failure), the measurement job's owner retries its job's before any other job, and a dropped
+/// worker's own thread retries it.
+pub(crate) const RETIREMENT_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[cfg(unix)]
 fn observe_exit(process: &mut BlockingProcess) -> std::io::Result<Option<ExitStatus>> {
@@ -472,6 +516,17 @@ fn observe_exit(process: &mut BlockingProcess) -> std::io::Result<Option<ExitSta
 #[cfg(windows)]
 fn observe_exit(process: &mut BlockingProcess) -> std::io::Result<Option<ExitStatus>> {
     process.try_retirement()
+}
+
+/// Send `process` the kill, waiting for nothing.
+#[cfg(unix)]
+fn start_kill(process: &mut BlockingProcess) -> std::io::Result<()> {
+    process.kill()
+}
+
+#[cfg(windows)]
+fn start_kill(process: &mut BlockingProcess) -> std::io::Result<()> {
+    process.start_kill()
 }
 
 #[cfg(unix)]
@@ -484,7 +539,7 @@ fn stop(process: &mut BlockingProcess) -> std::io::Result<ExitStatus> {
 
 #[cfg(windows)]
 fn stop(process: &mut BlockingProcess) -> std::io::Result<ExitStatus> {
-    process.retire(KILL_REAP)
+    process.retire()
 }
 
 #[cfg(test)]
@@ -537,10 +592,10 @@ mod tests {
         let pid = process.id();
         let device = crate::device_lock::DeviceLock::default();
         let worker = EngineWorker {
-            process: Mutex::new(ProcessState::Owned {
+            process: Mutex::new(Some(ProcessState::Owned {
                 process,
                 _device: DeviceHold::Share(Arc::new(device.try_share().unwrap())),
-            }),
+            })),
             client: OnceLock::new(),
             diagnostics: Arc::new(Mutex::new(DiagnosticTail::default())),
         };
@@ -548,11 +603,16 @@ mod tests {
         assert!(worker.try_wait().unwrap().is_none());
         // The device is shared while the worker runs and released once it is proven retired.
         assert!(device.try_job().is_none());
+        // An unready worker's shutdown sends the kill; its retirement is shown once reaped.
         worker.shutdown();
-        let status = worker
-            .try_wait()
-            .unwrap()
-            .expect("unready shutdown terminates");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = worker.try_wait().unwrap() {
+                break status;
+            }
+            assert!(std::time::Instant::now() < deadline, "the killed worker was never reaped");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
         assert_eq!(worker.pid(), None);
         assert!(device.try_job().is_some());
         assert_eq!(worker.retire().unwrap(), status);
