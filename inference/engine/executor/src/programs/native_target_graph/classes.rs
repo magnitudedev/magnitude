@@ -50,7 +50,9 @@ pub(super) fn block_routed(geometry: &Decoder, index: usize) -> Result<Option<&R
 /// The routed feed-forward block `index`'s prompt rows split at: a layer
 /// whose experts stream, or any routed layer of a chain, whose launches
 /// merge their experts in a pass. A lone launch of resident experts has
-/// nothing to merge, so its block stays whole.
+/// nothing to merge, so its block stays whole; so does every block of a
+/// load whose launches all decode, which run blocks whole
+/// (`RunStage::served`).
 pub(super) fn block_split<'g>(
     load: &ModelLoadPlan,
     geometry: &'g Decoder,
@@ -58,7 +60,10 @@ pub(super) fn block_split<'g>(
     limits: ResourceLimits,
 ) -> Result<Option<&'g RoutedFfn>, String> {
     let merges = limits.chain_capacity.get() > 1 || streamed::streams(load, block_scopes(index)?[1]);
-    Ok(block_routed(geometry, index)?.filter(|_| merges))
+    let prompts = magnitude_batching::row_classes(limits.max_launch_rows)
+        .last()
+        .is_some_and(|&rows| !crate::operators::routed::fused_graph::decodes(rows as u64));
+    Ok(block_routed(geometry, index)?.filter(|_| merges && prompts))
 }
 
 /// How a block is served, which decides its stages (`RunStage::served`):
@@ -95,6 +100,26 @@ pub(super) fn block_served(
 /// `served` (`block_served`).
 pub(super) fn block_stages(served: &[BlockServed], index: usize, rows: u64) -> &'static [RunStage] {
     RunStage::served(served[index].split.is_some(), rows)
+}
+
+/// Whether a launch of `rows` rows splits at block `index`
+/// (`RunStage::Front`): only such a launch runs the block's graphs sealed
+/// once (`once_graphs`), its fill and its passes.
+fn block_splits(served: &[BlockServed], index: usize, rows: u64) -> bool {
+    block_stages(served, index, rows).contains(&RunStage::Front)
+}
+
+/// Whether a launch of `class` runs block `index`'s graph of `staged`: a
+/// run (`Stage::Run`) only where its class is the launch's, and a graph the
+/// block runs once a group (`Stage::Once`, its fill and its passes) only
+/// where the launch splits at the block: a class served whole, as decode
+/// is, runs none. The plan's census (`certify_target_family`) and the
+/// sealed family (`PreparedTargetGraphs`) both count a launch's graphs by it.
+pub(super) fn launch_runs(served: &[BlockServed], index: usize, class: BlockClass, (sealed, stage): StagedClass) -> bool {
+    match stage {
+        Stage::Run(_) => sealed == class,
+        Stage::Once(_) => block_splits(served, index, class.0),
+    }
 }
 
 /// The graphs sealed once of a block whose prompt rows `split` and whose

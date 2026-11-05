@@ -4,7 +4,7 @@ use super::{
     classes::{
         BlockOutputScales, BlockServed, FamilyOutline, Passes, StagedClass, Topology, UnreadScales,
         block_class_slice, block_listings, block_routed, block_served, block_split, block_stages,
-        block_upload_regions, class_topology, enumerate_block_graphs, once_class, once_graphs,
+        block_upload_regions, class_topology, enumerate_block_graphs, launch_runs, once_class, once_graphs,
         slot_scores,
     },
     entry::{
@@ -452,9 +452,11 @@ pub(super) fn certify_target_family(
     // layout's recording bounds), so a slot holds, of each layout, a graph
     // for each run of it the launch making most of them makes: both
     // entries' and the per-layer entry's of its rows, each block's runs of
-    // its class (each sharing an earlier block's plans its own run), and
-    // every graph a block runs once a group (`Stage::Once`). A block's
-    // layouts are its shape's first block's.
+    // its class (each sharing an earlier block's plans its own run), and,
+    // where the class splits at a block (`RunStage::Front`), every graph the
+    // block runs once a group (`Stage::Once`, its fill and its passes): a
+    // class served whole, as decode is, runs none. A block's layouts are its
+    // shape's first block's.
     let overflow = || GraphError::from("a target family's graph census overflows");
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     enum Graphed {
@@ -478,7 +480,7 @@ pub(super) fn certify_target_family(
             *runs.entry(Graphed::PerLayer).or_default() += 1;
         }
         for &(index, staged) in &staged {
-            if matches!(staged.1, Stage::Run(_)) && staged.0 != class {
+            if !launch_runs(&served, index, class, staged) {
                 continue;
             }
             *runs.entry(Graphed::Block(outline.first_of_shape(index), class_topology(staged))).or_default() += 1;
