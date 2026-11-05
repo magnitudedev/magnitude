@@ -68,7 +68,12 @@ layout(buffer_reference, scalar, buffer_reference_align = 16) buffer seismic_uve
 // canonical 0x7fff, as CUDA's cvt.rn.bf16.f32). fp16 conversions round by the
 // module's RTE mode where the device has fp16 arithmetic, and otherwise in
 // integer code to nearest even with subnormals preserved (the CPU library's
-// `f32_to_f16` and `f16_to_f32`).
+// `f32_to_f16` and `f16_to_f32`). `seismic_f16_decode` is the exact integer
+// decode on every device: an in-register round trip
+// (`seismic_f16_decode(seismic_f32_to_f16(x))`) uses it, because a hardware
+// encode-decode pair is a pair of conversions the driver may fold, leaving
+// `x` unrounded (an f16 subnormal on the NVIDIA proprietary driver and
+// llvmpipe).
 float seismic_bf16_to_f32(uint16_t value) {
     return uintBitsToFloat(uint(value) << 16);
 }
@@ -78,15 +83,7 @@ uint16_t seismic_f32_to_bf16(float value) {
         return uint16_t(0x7fffu);
     return uint16_t((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
 }
-#if SEISMIC_HAS_FLOAT16
-float seismic_f16_to_f32(uint16_t value) {
-    return float(uint16BitsToFloat16(value));
-}
-uint16_t seismic_f32_to_f16(float value) {
-    return float16BitsToUint16(float16_t(value));
-}
-#else
-float seismic_f16_to_f32(uint16_t value) {
+float seismic_f16_decode(uint16_t value) {
     const uint bits = uint(value);
     const uint sign = (bits & 0x8000u) << 16;
     const uint exponent = (bits >> 10) & 0x1fu;
@@ -101,6 +98,17 @@ float seismic_f16_to_f32(uint16_t value) {
     // implicit bit.
     const uint shift = uint(10 - findMSB(mantissa));
     return uintBitsToFloat(sign | ((113u - shift) << 23) | (((mantissa << shift) & 0x3ffu) << 13));
+}
+#if SEISMIC_HAS_FLOAT16
+float seismic_f16_to_f32(uint16_t value) {
+    return float(uint16BitsToFloat16(value));
+}
+uint16_t seismic_f32_to_f16(float value) {
+    return float16BitsToUint16(float16_t(value));
+}
+#else
+float seismic_f16_to_f32(uint16_t value) {
+    return seismic_f16_decode(value);
 }
 uint16_t seismic_f32_to_f16(float value) {
     const uint bits = floatBitsToUint(value);

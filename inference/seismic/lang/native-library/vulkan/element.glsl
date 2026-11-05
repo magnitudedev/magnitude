@@ -7,7 +7,8 @@
 // operation. Kinds are compile-time constants, so the driver folds every kind
 // switch away. Every kind converts one stored element to F32
 // (`element_load`) and rounds F32 to the element (`element_store`,
-// `element_round`, round to nearest even; bf16 in integer code).
+// `element_round`, round to nearest even; bf16, and `element_round`'s f16
+// decode, in integer code).
 //
 // glslang's preprocessor has no variadic macros and does not evaluate token
 // pasting inside `#if`, so the Metal/CUDA `ELEMENT_HAS` probe cannot exist
@@ -90,8 +91,15 @@ uint element_store(const int kind, float value) {
     return uint(seismic_f32_to_f16(value));
 }
 
+// `value` rounded to the element, as F32. The f16 rounding decodes its bits
+// in exact integer code (`seismic_f16_decode`): a hardware decode of a
+// hardware encode is a conversion pair the driver may fold away.
 float element_round(const int kind, float value) {
-    return kind == ELEMENT_F32 ? value : element_load(kind, element_store(kind, value));
+    if (kind == ELEMENT_F32)
+        return value;
+    if (kind == ELEMENT_BF16)
+        return seismic_bf16_to_f32(seismic_f32_to_bf16(value));
+    return seismic_f16_decode(seismic_f32_to_f16(value));
 }
 
 // Two 16-bit elements in 32 bits, the first in the low half.
