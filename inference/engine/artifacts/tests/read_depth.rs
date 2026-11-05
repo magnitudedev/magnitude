@@ -290,6 +290,133 @@ fn the_engine_reads_at_the_devices_rate() {
     );
 }
 
+/// A prompt's cold experts: every layer's `experts` distinct random
+/// experts, each its stored ranges.
+fn prompt_experts(model: &Model, rng: &mut Rng, experts: usize) -> Vec<Vec<Vec<(u64, usize)>>> {
+    model
+        .layers
+        .iter()
+        .map(|layer| {
+            let mut order = (0..model.experts).collect::<Vec<_>>();
+            for at in (1..order.len()).rev() {
+                order.swap(at, (rng.next() % (at as u64 + 1)) as usize);
+            }
+            order[..experts].iter().map(|&expert| layer.iter().map(|&(offset, per)| (offset + expert * per, per as usize)).collect()).collect()
+        })
+        .collect()
+}
+
+/// The engine reading a prompt's experts as a prompt's conveyor does: one
+/// demand job per expert, two layers in flight. Bytes a second.
+fn engine_prompt(reader: &ArtifactReader, layers: &[Vec<Vec<(u64, usize)>>], record: usize) -> f64 {
+    let experts = layers[0].len();
+    let sinks = [Sinks::new(experts, record), Sinks::new(experts, record)];
+    let bytes: usize = layers.iter().flatten().flatten().map(|&(_, length)| length).sum();
+    let began = Instant::now();
+    let mut behind: Vec<magnitude_artifacts::Job> = Vec::new();
+    for (index, layer) in layers.iter().enumerate() {
+        let jobs = layer
+            .iter()
+            .enumerate()
+            .map(|(expert, ranges)| {
+                let mut at = 0;
+                let ranges = ranges
+                    .iter()
+                    .map(|&(offset, length)| {
+                        let sink = unsafe { sinks[index % 2].sink(expert).add(at) };
+                        at += length;
+                        Range { offset, length, sink }
+                    })
+                    .collect();
+                unsafe { reader.submit(ranges, Priority::Demand) }.unwrap()
+            })
+            .collect::<Vec<_>>();
+        for job in std::mem::replace(&mut behind, jobs) {
+            assert!(matches!(job.wait(), magnitude_artifacts::Ended::Read { failed } if failed.is_empty()));
+        }
+    }
+    for job in behind {
+        assert!(matches!(job.wait(), magnitude_artifacts::Ended::Read { failed } if failed.is_empty()));
+    }
+    bytes as f64 / began.elapsed().as_secs_f64()
+}
+
+/// The experts' ranges aligned and cut at `piece`, as the engine cuts them.
+fn prompt_pieces(layers: &[Vec<Vec<(u64, usize)>>], piece: u64) -> Vec<(u64, usize)> {
+    layers
+        .iter()
+        .flatten()
+        .flatten()
+        .flat_map(|&(offset, length)| {
+            let (start, end) = (offset / ALIGN * ALIGN, (offset + length as u64).next_multiple_of(ALIGN));
+            (start..end).step_by(piece as usize).map(move |at| (at, (end - at).min(piece) as usize))
+        })
+        .collect()
+}
+
+/// Raw threads reading the same experts' pieces ([`prompt_pieces`]),
+/// `depth` threads each taking the next. Bytes a second.
+fn raw_prompt(model: &Model, layers: &[Vec<Vec<(u64, usize)>>], piece: u64, depth: usize) -> f64 {
+    let pieces = prompt_pieces(layers, piece);
+    let bytes: usize = layers.iter().flatten().flatten().map(|&(_, length)| length).sum();
+    let (pieces, next) = (Arc::new(pieces), Arc::new(AtomicU64::new(0)));
+    let began = Instant::now();
+    let threads = (0..depth)
+        .map(|_| {
+            let (pieces, next, path) = (pieces.clone(), next.clone(), model.path.clone());
+            std::thread::spawn(move || {
+                let file = uncached(&path);
+                let mut buffer = vec![0u8; (piece + ALIGN) as usize];
+                let at = buffer.as_ptr().align_offset(ALIGN as usize);
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed) as usize;
+                    let Some(&(offset, length)) = pieces.get(index) else { break };
+                    file.read_exact_at(&mut buffer[at..at + length], offset).unwrap();
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    bytes as f64 / began.elapsed().as_secs_f64()
+}
+
+/// A prompt's reads, the engine against raw threads over the same experts
+/// and against the bar's pattern (whole records at a depth): whether the
+/// engine's shape of a prompt's reads or the window it holds them in is
+/// what keeps it below the volume's sustained rate.
+#[test]
+#[ignore = "times a prompt's reads against the device on a real model file (`MAGNITUDE_ARTIFACTS`)"]
+fn a_prompt_reads_at_the_volumes_rate() {
+    let model = Model::acquired();
+    let urgent = model.urgent();
+    let source = magnitude_artifacts::FileSource::open(&model.path).unwrap();
+    let probed = magnitude_artifacts::probe_volume(&source, Some(&urgent)).unwrap();
+    eprintln!(
+        "choice: window {} KiB, demand {} KiB, read {} KiB, demand read {} KiB",
+        probed.window >> 10,
+        probed.demand >> 10,
+        probed.read >> 10,
+        probed.demand_read >> 10
+    );
+    // Layers store their experts in unequal quantizations: each sink holds the widest.
+    let record = model.layers.iter().map(|layer| layer.iter().map(|&(_, per)| per as usize).sum::<usize>()).max().unwrap();
+    let experts = (model.experts as usize * 3 / 4).min(190);
+    let mut rng = Rng(0x9a0b);
+    let gb = |rate: f64| rate / 1e9;
+    let reader = ArtifactReader::of_urgent(&source, CachePolicy::Uncached, &urgent).unwrap();
+    let pieces = prompt_pieces(&prompt_experts(&model, &mut rng, experts), probed.demand_read);
+    let mean = pieces.iter().map(|&(_, length)| length as f64).sum::<f64>() / pieces.len() as f64;
+    let depth = ((probed.demand as f64 / mean).round() as usize).max(1);
+    reader.evict_cached().unwrap();
+    let layers = prompt_experts(&model, &mut rng, experts);
+    eprintln!("engine: {:.2} GB/s", gb(engine_prompt(&reader, &layers, record)));
+    reader.evict_cached().unwrap();
+    let layers = prompt_experts(&model, &mut rng, experts);
+    eprintln!("raw, the same pieces (mean {:.0} KiB) at depth {depth}: {:.2} GB/s", mean / 1024., gb(raw_prompt(&model, &layers, probed.demand_read, depth)));
+}
+
 /// A pool of threads reading a lone request's reads, each read taken by
 /// the next free thread, which either spins for the next request or sleeps
 /// on a condition variable until it comes.
