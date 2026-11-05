@@ -5,6 +5,8 @@
 // geometries and 512-column heads, long contexts).
 #![allow(dead_code)]
 
+mod common;
+
 use magnitude_kernels::{attention_append_k8v4, attention_decode_k8v4, attention_prefill_k8v4};
 use seismic::{
     BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor,
@@ -1858,7 +1860,7 @@ fn check(
 /// tolerance.
 fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
     use seismic_lang::{
-        checked::{SourceFile, check_source},
+        checked::{SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -1876,7 +1878,7 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
         path: "functions.seismic".into(),
         text: include_str!("../kernels/functions.seismic").into(),
     });
-    let module = check_source(sources).unwrap();
+    let module = crate::common::check(sources);
     let logical = module
         .entry(
             module.entry_named(entry).unwrap(),

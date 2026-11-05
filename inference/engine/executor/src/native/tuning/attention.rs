@@ -53,7 +53,7 @@ const DECODE_GRID: u64 = 128;
 fn decode_starts(
     mix: &AttentionMix,
     backend: seismic::BackendName,
-    implementation: &seismic::NativeImplementation,
+    implementation: &seismic::OnDevice,
     statics: &seismic::NativeSpecialization,
     limits: TuningLimits,
 ) -> Vec<seismic::ParameterValues> {
@@ -1466,7 +1466,7 @@ macro_rules! mix_entry {
             $(fn search_starts(
                 &self,
                 device: &Device,
-                implementation: &seismic::NativeImplementation,
+                implementation: &seismic::OnDevice,
                 statics: &seismic::NativeSpecialization,
                 limits: TuningLimits,
             ) -> Vec<seismic::ParameterValues> {
@@ -1622,12 +1622,18 @@ mod tests {
                 seismic::BackendName::Metal,
             )
             .unwrap()
-            .unwrap(),
+            .unwrap()
+            .device_independent()
+            .expect("the declaration reads no device property")
+            .owned(),
             seismic::generated::native_implementation_for_backend::<attention_decode_k8v4::Entry>(
                 seismic::BackendName::Metal,
             )
             .unwrap()
-            .unwrap(),
+            .unwrap()
+            .device_independent()
+            .expect("the declaration reads no device property")
+            .owned(),
         ] {
             for group in [1, 2, 3, 4, 8] {
                 let mut mix = AttentionMix {
@@ -1719,7 +1725,10 @@ mod tests {
             attention_decode_k8v4::Entry,
         >(seismic::BackendName::Metal)
         .unwrap()
-        .unwrap();
+        .unwrap()
+            .device_independent()
+            .expect("the declaration reads no device property")
+            .owned();
         // Gemma 4 E2B and 12B full layers (one kv head, 512 columns), Gemma
         // 4 31B full layers (four), Qwen 3.8 27B (four kv heads of six).
         for (kv_heads, group, width, rows, expected) in [
@@ -1798,12 +1807,18 @@ mod tests {
                 BackendName::Cuda,
             )
             .unwrap()
-            .unwrap(),
+            .unwrap()
+            .device_independent()
+            .expect("the declaration reads no device property")
+            .owned(),
             seismic::generated::native_implementation_for_backend::<attention_decode_k8v4::Entry>(
                 BackendName::Cuda,
             )
             .unwrap()
-            .unwrap(),
+            .unwrap()
+            .device_independent()
+            .expect("the declaration reads no device property")
+            .owned(),
         ];
         for implementation in implementations {
             for (group, width, max_rows, expected_warps) in [

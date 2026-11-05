@@ -1,14 +1,24 @@
 use super::*;
-use seismic_lang::checked::{SourceFile, SourceSet, check_source};
+use seismic_lang::checked::{NativeImplementation, SourceFile, SourceSet, check_source, check_source_with};
 use seismic_lang::registry::{self, Layout};
 use std::collections::HashMap;
 
-fn module() -> CheckedModule {
-    check_source(SourceSet::new(vec![SourceFile {
-        path: "handoff.seismic".into(),
-        text: "fn project[N](weight: &tensor[N] W) -> tensor[N] f32:\n    let mut result = tensor[N] f32\n    for i in 0..N:\n        result[i] = f32(weight[i])\n    return result\n\nnative project for metal from \"project.metal\":\n    static (N)\n    launch project:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".into(),
-    }]))
+/// The `project` module, its Metal source `asset`.
+fn module_with(asset: &'static str) -> CheckedModule {
+    check_source_with(
+        SourceSet::new(vec![SourceFile {
+            path: "handoff.seismic".into(),
+            text: "fn project[N](weight: &tensor[N] W) -> tensor[N] f32:\n    let mut result = tensor[N] f32\n    for i in 0..N:\n        result[i] = f32(weight[i])\n    return result\n\nnative project for metal from \"project.metal\":\n    static (N)\n    launch project:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".into(),
+        }]),
+        &mut |_entry: &str, _native: &NativeImplementation| {
+            Ok::<_, std::convert::Infallible>(Some(asset.into()))
+        },
+    )
     .expect("test source checks")
+}
+
+fn module() -> CheckedModule {
+    module_with("kernel void project() {}")
 }
 
 fn key(module: &CheckedModule, representation: RepresentationId, rows: u64) -> NativeHandoffKey {
@@ -49,28 +59,13 @@ fn native_handoff_keeps_different_weight_representations_separate() {
 
 #[test]
 fn native_handoff_reuses_exact_subjects_but_not_changed_assets_or_statics() {
-    let mut original = module();
-    let mut rebuilt = module();
+    let original = module();
+    let rebuilt = module();
     let q4 = registry::storage("q4k", Layout::Rows32).unwrap();
-    for module in [&mut original, &mut rebuilt] {
-        module
-            .capture_native_asset(
-                module.entry_named("project").unwrap(),
-                BackendName::Metal,
-                "kernel void project() {}".into(),
-            )
-            .unwrap();
-    }
     assert_eq!(key(&original, q4, 256), key(&rebuilt, q4, 256));
     assert_ne!(key(&original, q4, 256), key(&rebuilt, q4, 512));
-    rebuilt
-        .capture_native_asset(
-            rebuilt.entry_named("project").unwrap(),
-            BackendName::Metal,
-            "kernel void project() { /* changed */ }".into(),
-        )
-        .unwrap();
-    assert_ne!(key(&original, q4, 256), key(&rebuilt, q4, 256));
+    let changed = module_with("kernel void project() { /* changed */ }");
+    assert_ne!(key(&original, q4, 256), key(&changed, q4, 256));
 }
 
 #[test]

@@ -41,7 +41,9 @@ use crate::api::kernel::{EncodedArgs, PrepareError};
 use crate::api::{CallError, TensorError};
 use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::prepared::{validate_invocation, InvocationContract};
-use seismic_lang::checked::{CheckedModule, NativeImplementation, NativeSpecialization};
+use seismic_lang::checked::{
+    CheckedModule, NativeDefault, NativeImplementation, NativeNatExpr, NativeSpecialization,
+};
 use seismic_lang::entry::{ElementBindings, LogicalEntry, ParameterKind, TensorAccess};
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::EntryId;
@@ -766,7 +768,7 @@ pub struct SurveyPlan {
     pub samples: usize,
     pub min_sample_seconds: f64,
     /// Replacement value lists for some parameters, widening the declared
-    /// space. Each keeps its declared default first.
+    /// space. Each keeps every declared value.
     pub domains: BTreeMap<String, Vec<u64>>,
 }
 
@@ -3448,15 +3450,19 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         } = request;
         let backend = super::backend_name(&device.kind);
         let entry_name = super::entry_name(module, entry);
-        let mut implementation =
-            super::offered(device, module, entry, &bindings).ok_or_else(|| {
+        let implementation = super::offered(device, module, entry, &bindings)
+            .ok_or_else(|| {
                 TuneError::Declaration(format!(
                     "`{entry_name}` has no native implementation for `{}`",
                     backend.as_str()
                 ))
+            })?
+            .with_defaults_at(&statics)
+            .map_err(|error| TuneError::Declaration(error.to_string()))?
+            .adjusted(|implementation| {
+                fix(implementation, statics.params())?;
+                widen(implementation, domains)
             })?;
-        fix(&mut implementation, statics.params())?;
-        widen(&mut implementation, domains)?;
         // Every configuration formed is this one entry at these bindings.
         let logical = Arc::new(
             module
@@ -3487,7 +3493,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             cpu,
             backend,
             surveyor: Some(PointSurveyor::new(&implementation, true)),
-            implementation,
+            implementation: implementation.into_implementation(),
             logical,
             mutable,
             default,
@@ -7110,7 +7116,15 @@ pub fn kernel_digest(
                 backend.as_str()
             ))
         })?;
+    // A kernel's identity names a backend, not a device: a declaration
+    // whose defaults read the device has no device-free default to name.
     let default = implementation
+        .device_independent()
+        .ok_or_else(|| {
+            declaration(format!(
+                "`{entry_name}`'s defaults read the device's properties; a kernel identity names no device"
+            ))
+        })?
         .default_specialization(statics)
         .map_err(|error| declaration(error.to_string()))?;
     let mut digest = Sha256::new();
@@ -7255,11 +7269,15 @@ fn fix(
             )));
         }
         parameter.values = vec![*value];
+        // Its one value is its default.
+        parameter.default = NativeDefault::Value(NativeNatExpr::Constant(*value));
     }
     Ok(())
 }
 
-/// Replace parameter domains for a survey. Each keeps its default first.
+/// Replace parameter domains for a survey, each a widening of the
+/// declared values, so each default, resolved before
+/// ([`seismic_lang::checked::OnDevice::with_defaults_at`]), stays listed.
 fn widen(
     implementation: &mut NativeImplementation,
     domains: &BTreeMap<String, Vec<u64>>,
@@ -7270,10 +7288,9 @@ fn widen(
             .iter_mut()
             .find(|parameter| parameter.name == *name)
             .ok_or_else(|| TuneError::Domain(format!("no parameter `{name}` is declared")))?;
-        if values.first() != parameter.values.first() {
+        if let Some(dropped) = parameter.values.iter().find(|value| !values.contains(value)) {
             return Err(TuneError::Domain(format!(
-                "widened values of `{name}` must keep its default {:?} first",
-                parameter.values.first()
+                "widened values of `{name}` must keep every declared value; {dropped} is missing"
             )));
         }
         parameter.values = values.clone();
@@ -7884,13 +7901,18 @@ mod tests {
 
     /// The Metal implementation of a one-entry module whose native
     /// declaration body is `body`.
+    /// `body` declared for Metal, checked with a source whose kernels take
+    /// no template parameters.
     fn declared(body: &str) -> NativeImplementation {
-        let module = check_source(SourceSet::new(vec![SourceFile {
-            path: "scale.seismic".into(),
-            text: format!(
-                "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n{body}"
-            ),
-        }]))
+        let module = seismic_lang::native_source::check_fixture(
+            SourceSet::new(vec![SourceFile {
+                path: "scale.seismic".into(),
+                text: format!(
+                    "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n{body}"
+                ),
+            }]),
+            &[],
+        )
         .unwrap();
         module
             .native_implementation(module.entries()[0].id, BackendName::Metal)
@@ -7918,13 +7940,13 @@ mod tests {
         let bands = (1..=3)
             .map(|rows| {
                 format!(
-                    "    launch band{rows} when N == {rows}:\n        params (WIDTH in [8, 4, 16], ROWS in [1, 2])\n        threadgroups (ceil_div(N, WIDTH * ROWS), 1, 1)\n        threads_per_threadgroup (WIDTH * 32, 1, 1)\n"
+                    "    launch band{rows} when N == {rows}:\n        params (WIDTH in [8, 4, 16] default 8, ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, WIDTH * ROWS), 1, 1)\n        threads_per_threadgroup (WIDTH * 32, 1, 1)\n"
                 )
             })
             .collect::<String>();
         let implementation = declared(&bands);
         let statics = NativeSpecialization::new();
-        let default = implementation.default_specialization(&statics).unwrap();
+        let default = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[1, 2, 3])).unwrap();
         let keying = launches(&partition);
         let domain = Declared {
@@ -7999,11 +8021,11 @@ mod tests {
     #[test]
     fn a_change_that_cannot_change_served_work_is_not_formed_under_either_keying() {
         let implementation = declared(
-            "    params (NEAR in [1, 2], FAR in [1, 2])\n    launch small when N < 8:\n        threadgroups (ceil_div(N, NEAR), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when N >= 8:\n        threadgroups (ceil_div(N, FAR), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+            "    params (NEAR in [1, 2] default 1, FAR in [1, 2] default 1)\n    launch small when N < 8:\n        threadgroups (ceil_div(N, NEAR), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when N >= 8:\n        threadgroups (ceil_div(N, FAR), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         );
         assert!(!implementation.launch_scoped());
         let statics = NativeSpecialization::new();
-        let default = implementation.default_specialization(&statics).unwrap();
+        let default = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
         let shapes = shapes(&[4, 16]);
         let (unserved, points) = unserved_parameters(&implementation, &statics, &shapes).unwrap();
         assert!(unserved.is_empty());
@@ -8069,10 +8091,10 @@ mod tests {
         // Only diagonal assignments are admissible: neither coordinate can
         // change alone. A coupled start covers both coordinates once.
         let implementation = declared(
-            "    params (LEFT in [2, 1, 4], RIGHT in [2, 1, 4])\n    where LEFT == RIGHT\n    launch gemv:\n        threadgroups (ceil_div(N, LEFT * RIGHT), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+            "    params (LEFT in [2, 1, 4] default 2, RIGHT in [2, 1, 4] default 2)\n    where LEFT == RIGHT\n    launch gemv:\n        threadgroups (ceil_div(N, LEFT * RIGHT), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         );
         let statics = NativeSpecialization::new();
-        let default = implementation.default_specialization(&statics).unwrap();
+        let default = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[4])).unwrap();
         let keying = launches(&partition);
         let domain = Declared {
@@ -8125,10 +8147,10 @@ mod tests {
     #[test]
     fn a_search_ends_when_its_domain_is_exhausted_and_finds_what_no_neighbourhood_holds() {
         let implementation = declared(
-            "    launch gemv:\n        params (A in [1, 2, 3], B in [1, 2, 3])\n        threadgroups (ceil_div(N, A * B), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+            "    launch gemv:\n        params (A in [1, 2, 3] default 1, B in [1, 2, 3] default 1)\n        threadgroups (ceil_div(N, A * B), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         );
         let statics = NativeSpecialization::new();
-        let seed = implementation.default_specialization(&statics).unwrap();
+        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[4])).unwrap();
         let keying = launches(&partition);
         let group = partition.groups[0].clone();
@@ -8190,10 +8212,10 @@ mod tests {
     #[test]
     fn a_boundary_that_moves_off_the_default_still_sweeps_its_groups_to_exhaustion() {
         let implementation = declared(
-            "    params (FROM in [3, 2, 5])\n    launch small when N < FROM:\n        params (A in [1, 2, 3], T in [0, 1, 2])\n        threadgroups (ceil_div(N, A + T), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when N >= FROM:\n        params (B in [1, 2, 3])\n        threadgroups (ceil_div(N, B), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+            "    params (FROM in [3, 2, 5] default 3)\n    launch small when N < FROM:\n        params (A in [1, 2, 3] default 1, T in [0, 1, 2] default 0)\n        threadgroups (ceil_div(N, A + T), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when N >= FROM:\n        params (B in [1, 2, 3] default 1)\n        threadgroups (ceil_div(N, B), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         );
         let statics = NativeSpecialization::new();
-        let seed = implementation.default_specialization(&statics).unwrap();
+        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
         let rows = [1u64, 2, 4];
         let partition = plan::partition(&implementation, &statics, &shapes(&rows)).unwrap();
         assert_eq!(
@@ -8283,7 +8305,7 @@ mod tests {
     #[test]
     fn unobserved_group_keeps_seed_on_equal_cost() {
         let implementation = declared(
-            "    launch gemv:\n        params (P in [2, 0, 1, 3])\n        threadgroups (ceil_div(N, P + 1), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+            "    launch gemv:\n        params (P in [2, 0, 1, 3] default 2)\n        threadgroups (ceil_div(N, P + 1), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         );
         let statics = NativeSpecialization::new();
         let partition = plan::partition(&implementation, &statics, &shapes(&[4])).unwrap();
@@ -8334,7 +8356,7 @@ mod tests {
                 .enumerate()
                 .map(|(parameter, name)| {
                     format!(
-                        "{}{name} in [1, 2]",
+                        "{}{name} in [1, 2] default 1",
                         if parameter < forms { "form " } else { "" }
                     )
                 })
@@ -8354,7 +8376,7 @@ mod tests {
         });
         assert_eq!(implementation.launch_scoped(), whole.is_none());
         let statics = NativeSpecialization::new();
-        let seed = implementation.default_specialization(&statics).unwrap();
+        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
         let (partition, keying) = match whole {
             Some(_) => {
                 let (unserved, points) =
@@ -8482,7 +8504,7 @@ mod tests {
             .with_static("F", 4096)
             .with_static("DS", 0)
             .with_static("DB", 0);
-        let seed = implementation.default_specialization(&statics).unwrap();
+        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
         let rows = [1u64, 8, 128];
         let shapes = rows
             .iter()
@@ -9014,7 +9036,7 @@ mod tests {
             "    launch gemv:\n        params ({})\n        threadgroups (ceil_div(N, {}), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
             names
                 .iter()
-                .map(|name| format!("{name} in [{domain}]"))
+                .map(|name| format!("{name} in [{domain}] default 1"))
                 .collect::<Vec<_>>()
                 .join(", "),
             names.join(" * "),
@@ -9031,7 +9053,7 @@ mod tests {
             }
         };
         let statics = NativeSpecialization::new();
-        let seed = implementation.default_specialization(&statics).unwrap();
+        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[4])).unwrap();
         let reference = vec![measurement(&implementation, &seed)];
         let run = GroupSearch::new(partition, seed, reference, vec![1.], Vec::new());
@@ -9231,14 +9253,17 @@ mod tests {
     fn declaration_digest_uses_the_entry_content() {
         let source = |domain: &str| {
             format!(
-                "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    launch scale:\n        params (code ROWS in {domain})\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
+                "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    launch scale:\n        params (ROWS in {domain} default 1)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
             )
         };
         let check = |path: &str, text: String| {
-            check_source(SourceSet::new(vec![SourceFile {
-                path: path.into(),
-                text,
-            }]))
+            seismic_lang::native_source::check_fixture(
+                SourceSet::new(vec![SourceFile {
+                    path: path.into(),
+                    text,
+                }]),
+                &["ROWS"],
+            )
             .unwrap()
         };
         // The same sources built in two directories are one implementation.
@@ -9297,7 +9322,7 @@ mod tests {
 
     #[test]
     fn launch_keys_ignore_parameters_of_inactive_launches() {
-        let text = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (SPLIT in [1, 2])\n    launch gemv when N < 16:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch gemm when N >= 16:\n        threadgroups (N, 1, SPLIT)\n        threads_per_threadgroup (32, 1, 1)\n";
+        let text = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (SPLIT in [1, 2] default 1)\n    launch gemv when N < 16:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch gemm when N >= 16:\n        threadgroups (N, 1, SPLIT)\n        threads_per_threadgroup (32, 1, 1)\n";
         let module = check_source(SourceSet::new(vec![SourceFile {
             path: "scale.seismic".into(),
             text: text.into(),
@@ -9307,7 +9332,7 @@ mod tests {
             .native_implementation(module.entry_named("scale").unwrap(), BackendName::Metal)
             .unwrap();
         let default = implementation
-            .default_specialization(&NativeSpecialization::new())
+            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
             .unwrap();
         let split = default.clone().with_param("SPLIT", 2);
         assert_eq!(
@@ -9327,10 +9352,10 @@ mod tests {
     #[test]
     fn a_formed_variant_is_held_until_given_up_and_never_asked_for_twice() {
         let implementation = declared(
-            "    params (ROWS in [16, 32, 64])\n    launch gemv when N < 16:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (ROWS, 1, 1)\n    launch gemm when N >= 16:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (ROWS, 1, 1)\n",
+            "    params (ROWS in [16, 32, 64] default 16)\n    launch gemv when N < 16:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (ROWS, 1, 1)\n    launch gemm when N >= 16:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (ROWS, 1, 1)\n",
         );
         let default = implementation
-            .default_specialization(&NativeSpecialization::new())
+            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
             .unwrap();
         let rows = |rows| default.clone().with_param("ROWS", rows);
         let mut programs = Programs::Launches(LaunchPrograms::default());
@@ -9440,7 +9465,7 @@ mod tests {
 
     #[test]
     fn launch_keys_ignore_boundary_values_when_the_active_launch_is_unchanged() {
-        let text = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (arithmetic BATCH_FROM in [5, 9])\n    launch gemv when N < BATCH_FROM:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch batch when N >= BATCH_FROM:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n";
+        let text = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (arithmetic BATCH_FROM in [5, 9] default 5)\n    launch gemv when N < BATCH_FROM:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch batch when N >= BATCH_FROM:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n";
         let module = check_source(SourceSet::new(vec![SourceFile {
             path: "scale.seismic".into(),
             text: text.into(),
@@ -9450,7 +9475,7 @@ mod tests {
             .native_implementation(module.entry_named("scale").unwrap(), BackendName::Metal)
             .unwrap();
         let default = implementation
-            .default_specialization(&NativeSpecialization::new())
+            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
             .unwrap();
         let changed = default.clone().with_param("BATCH_FROM", 9);
         let boundary = [plan::ParameterAddress::Entry("BATCH_FROM".into())];
@@ -9468,7 +9493,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn no_formation_starts_that_cannot_end_before_the_deadline() {
-        use seismic_lang::checked::{SourceFile, SourceSet, check_source};
+        use seismic_lang::checked::{NativeImplementation, SourceFile, SourceSet, check_source_with};
         use seismic_lang::registry::BackendName;
         let Ok(device) = crate::devices::Devices::discover(&[])
             .expect("device discovery")
@@ -9476,15 +9501,17 @@ mod tests {
         else {
             return;
         };
-        let mut module = check_source(SourceSet::new(vec![SourceFile {
-            path: "copy.seismic".into(),
-            text: "fn copy[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative copy for metal from \"copy.metal\":\n    launch copy:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".into(),
-        }]))
+        let module = check_source_with(
+            SourceSet::new(vec![SourceFile {
+                path: "copy.seismic".into(),
+                text: "fn copy[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative copy for metal from \"copy.metal\":\n    launch copy:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".into(),
+            }]),
+            &mut |_entry: &str, _native: &NativeImplementation| {
+                Ok::<_, std::convert::Infallible>(Some("kernel void copy() {}\n".into()))
+            },
+        )
         .expect("copy source checks");
         let entry = module.entry_named("copy").expect("copy entry");
-        module
-            .capture_native_asset(entry, BackendName::Metal, "kernel void copy() {}\n".into())
-            .expect("asset capture");
         let bindings = ElementBindings::default();
         let logical = Arc::new(module.entry(entry, &bindings).expect("copy entry binds"));
         let implementation = super::super::on_device(

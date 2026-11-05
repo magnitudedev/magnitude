@@ -15,7 +15,11 @@
 //! because Seismic owns representation and storage binding semantics. Library
 //! files are embedded in this crate, inlined
 //! once like any include, and may include only other library files.
-use crate::checked::{CheckedModule, SourceError, SourceFile, SourceSet, check_source};
+use crate::checked::{
+    CheckFailure, CheckedModule, NativeImplementation, SourceError, SourceFile, SourceSet,
+    check_source_with,
+};
+use std::borrow::Cow;
 use crate::ids::EntryId;
 use crate::registry::BackendName;
 use std::path::{Path, PathBuf};
@@ -260,9 +264,8 @@ pub fn load(paths: &[PathBuf], mut prelude: SourceSet) -> Result<Loaded, LoadErr
             text: std::fs::read_to_string(path)?,
         });
     }
-    let mut module = check_source(prelude).map_err(LoadError::Source)?;
     let roots = source_roots(paths)?;
-    let assets = capture_assets(&mut module, None, &roots)?;
+    let (module, assets) = check_with_assets(prelude, None, &roots)?;
     Ok(Loaded {
         module,
         sources: files,
@@ -290,71 +293,91 @@ pub fn source_roots(paths: &[PathBuf]) -> Result<Vec<PathBuf>, LoadError> {
     Ok(roots)
 }
 
-/// `base` is required for native assets in an inline source snapshot.
-/// `roots` bound where native includes may resolve (see [`source_roots`]).
-pub fn capture_assets(
-    module: &mut CheckedModule,
+/// Check `sources`, reading each native implementation's asset from the
+/// file it declares, includes inlined: the module, and the files each asset
+/// was built from. `base` is required for native assets in an inline source
+/// snapshot. `roots` bound where native includes may resolve (see
+/// [`source_roots`]).
+pub fn check_with_assets(
+    sources: SourceSet,
     base: Option<&Path>,
     roots: &[PathBuf],
-) -> Result<Vec<CapturedAsset>, LoadError> {
-    let definitions: Vec<_> = module
-        .entries()
-        .iter()
-        .flat_map(|entry| {
-            BackendName::ALL.into_iter().filter_map(|backend| {
-                module
-                    .native_implementation(entry.id, backend)
-                    .map(|native| {
-                        (
-                            native.entry,
-                            native.backend,
-                            native.declared_in.clone(),
-                            native.source_path.clone(),
-                        )
-                    })
-            })
-        })
-        .collect();
+) -> Result<(CheckedModule, Vec<CapturedAsset>), LoadError> {
     let mut captured = Vec::new();
-    for (entry, backend, declared_in, source_path) in definitions {
-        let declaring = Path::new(&declared_in);
-        let root = match base {
-            Some(base) => base,
-            None if declaring.is_absolute() => declaring.parent().expect("absolute source parent"),
-            None => {
-                return Err(LoadError::Invalid(
-                    "inline native assets require base_dir".into(),
-                ));
-            }
-        };
-        let path = root.join(source_path).canonicalize()?;
-        let asset = NativeAssetFile {
-            text: std::fs::read_to_string(&path)?,
-            path,
-        };
-        // CPU assets are Rust and have no include set.
-        let expansion = match backend {
-            BackendName::Cpu => Expanded {
-                source: asset.text.clone(),
-                includes: Vec::new(),
-                library: Vec::new(),
-            },
-            BackendName::Metal => expand_includes(&asset, "h", roots)?,
-            BackendName::Cuda => expand_includes(&asset, "cuh", roots)?,
-            BackendName::Vulkan => expand_includes(&asset, "glsl", roots)?,
-        };
-        module
-            .capture_native_asset(entry, backend, expansion.source.into())
-            .map_err(LoadError::Invalid)?;
-        captured.push(CapturedAsset {
-            entry,
-            backend,
+    let module = check_source_with(
+        sources,
+        &mut |_entry: &str, native: &NativeImplementation| -> Result<_, LoadError> {
+            let ReadAsset { source, files } = read_asset(native, base, roots)?;
+            captured.push(files);
+            Ok(Some(Cow::Owned(source)))
+        },
+    )
+    .map_err(|failure| match failure {
+        CheckFailure::Source(error) => LoadError::Source(error),
+        CheckFailure::Read(error) => error,
+    })?;
+    Ok((module, captured))
+}
+
+/// `sources` checked with each native implementation's source read from
+/// `directory`, where the declarations' relative paths name them and their
+/// includes resolve: what a test of sources it holds in memory checks.
+pub fn check_beside(sources: SourceSet, directory: &Path) -> Result<CheckedModule, LoadError> {
+    let directory = directory.canonicalize()?;
+    check_with_assets(sources, Some(&directory), std::slice::from_ref(&directory))
+        .map(|(module, _)| module)
+}
+
+/// A native asset read from its file: its source with every include
+/// inlined, and the files it was built from.
+struct ReadAsset {
+    source: String,
+    files: CapturedAsset,
+}
+
+/// Read `native`'s asset: its declaring file's directory (or `base`, for an
+/// inline source snapshot) joined with its source path.
+fn read_asset(
+    native: &NativeImplementation,
+    base: Option<&Path>,
+    roots: &[PathBuf],
+) -> Result<ReadAsset, LoadError> {
+    let declaring = Path::new(&native.declared_in);
+    let root = match base {
+        Some(base) => base,
+        None if declaring.is_absolute() => declaring.parent().expect("absolute source parent"),
+        None => {
+            return Err(LoadError::Invalid(
+                "inline native assets require base_dir".into(),
+            ));
+        }
+    };
+    let path = root.join(&native.source_path).canonicalize()?;
+    let asset = NativeAssetFile {
+        text: std::fs::read_to_string(&path)?,
+        path,
+    };
+    // CPU assets are Rust and have no include set.
+    let expansion = match native.backend {
+        BackendName::Cpu => Expanded {
+            source: asset.text.clone(),
+            includes: Vec::new(),
+            library: Vec::new(),
+        },
+        BackendName::Metal => expand_includes(&asset, "h", roots)?,
+        BackendName::Cuda => expand_includes(&asset, "cuh", roots)?,
+        BackendName::Vulkan => expand_includes(&asset, "glsl", roots)?,
+    };
+    Ok(ReadAsset {
+        source: expansion.source,
+        files: CapturedAsset {
+            entry: native.entry,
+            backend: native.backend,
             asset,
             includes: expansion.includes,
             library: expansion.library,
-        });
-    }
-    Ok(captured)
+        },
+    })
 }
 
 /// An asset's source with every include inlined, and the files inlined.

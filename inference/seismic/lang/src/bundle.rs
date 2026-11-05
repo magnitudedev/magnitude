@@ -24,8 +24,9 @@
 //!   for this decode (`crate::wire`). It neither parses nor checks: the
 //!   build's checker already did, in the same build as this decoder.
 //! - [`check_bundle_sources`] reads a bundle that arrives from outside the
-//!   binary (a `.seismicbundle` file). It checks the source section with
-//!   [`check_source`] and ignores the checked section.
+//!   binary (a `.seismicbundle` file). It checks the source section, with
+//!   its native assets, as [`check_source_with`] does, and ignores the
+//!   checked section.
 //!
 //! A corrupt or incompatible bundle is a typed error on both paths; after
 //! decoding, an out-of-range private arena id is a compiler panic (§13.3.2).
@@ -35,7 +36,7 @@
 use crate::check::ir::{Definition, Family};
 use crate::checked::internals::Module;
 use crate::checked::{
-    CheckedModule, EntryInfo, NativeImplementation, SourceFile, SourceSet, check_source,
+    CheckedModule, EntryInfo, NativeImplementation, SourceFile, SourceSet, check_source_with,
 };
 use crate::registry::BackendName;
 use crate::wire::{self, Scope};
@@ -44,11 +45,11 @@ use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 
 /// Format version of the bundle wire schema. Bumped on any wire change.
-pub const BUNDLE_FORMAT_VERSION: u32 = 10;
+pub const BUNDLE_FORMAT_VERSION: u32 = 11;
 
 /// Semantic version of the checker whose output this crate can decode.
 /// Bundles produced under a different semantic version are incompatible.
-pub const COMPILER_SEMANTIC_VERSION: &str = "seismic-semantics-v9";
+pub const COMPILER_SEMANTIC_VERSION: &str = "seismic-semantics-v10";
 
 const MAGIC: &[u8; 8] = b"SEISBND6";
 
@@ -138,8 +139,9 @@ pub fn decode_checked_bundle(bytes: &'static [u8]) -> Result<CheckedModule, Chec
 }
 
 /// Checks the source section of a bundle that arrives from outside the
-/// binary, exactly as [`check_source`] checks source text, and ignores its
-/// checked section. A source section that fails to check is `Corrupt`.
+/// binary, with its native assets, exactly as [`check_source_with`] checks
+/// source text, and ignores its checked section. A source section that
+/// fails to check is `Corrupt`.
 pub fn check_bundle_sources(bytes: &[u8]) -> Result<CheckedModule, CheckedBundleError> {
     let frame = Frame::read(verified(bytes)?)?;
     let files = frame
@@ -158,17 +160,32 @@ pub fn check_bundle_sources(bytes: &[u8]) -> Result<CheckedModule, CheckedBundle
     if source_hash(&canonical) != frame.source_hash {
         return Err(CheckedBundleError::HashMismatch);
     }
-    let checked = check_source(canonical).map_err(|_| CheckedBundleError::Corrupt)?;
+    // Each implementation's source is the bundle's asset of its entry and
+    // backend, which checking reads once; an implementation without its
+    // asset, or an asset no implementation reads, is corrupt.
+    let mut assets = std::collections::BTreeMap::new();
+    for (entry, backend, source) in frame.assets {
+        if assets.insert((entry.to_owned(), backend), source).is_some() {
+            return Err(CheckedBundleError::Corrupt);
+        }
+    }
+    let checked = check_source_with(
+        canonical,
+        &mut |entry: &str, native: &NativeImplementation| {
+            assets
+                .remove(&(entry.to_owned(), native.backend))
+                .map(|source| Some(Cow::Owned(source.to_owned())))
+                .ok_or(CheckedBundleError::Corrupt)
+        },
+    )
+    .map_err(|_| CheckedBundleError::Corrupt)?;
+    if !assets.is_empty() {
+        return Err(CheckedBundleError::Corrupt);
+    }
     if checked.semantic_hash().digest() != &frame.semantic_hash {
         return Err(CheckedBundleError::HashMismatch);
     }
-    with_assets(
-        checked,
-        frame
-            .assets
-            .into_iter()
-            .map(|(entry, backend, source)| (entry, backend, Cow::Owned(source.to_owned()))),
-    )
+    Ok(checked)
 }
 
 /// The payload of a bundle whose checksum trailer matches.
@@ -483,6 +500,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checked::check_source;
     use crate::entry::ElementBindings;
 
     const SOURCE: &str = "fn twice(x: f32) -> f32:\n    return x + x\n\nfn scale[N](x: &tensor[N] f32, factor: f32, output: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        output[i] = twice(x[i]) * factor\n\nfn prefix[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    let mut total = 0.0\n    for i in 0..N:\n        if x[i] > 0.0:\n            total = total + x[i]\n        output[i] = total\n    return output\n\nnative twice for metal from \"twice.metal\":\n    launch twice:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
@@ -650,7 +668,7 @@ mod tests {
         let mut encoded = encode_checked_bundle(&checked());
         let version_start = 8 + 4 + 4;
         let version_end = version_start + COMPILER_SEMANTIC_VERSION.len();
-        encoded[version_start..version_end].copy_from_slice(b"seismic-semantics-v7");
+        encoded[version_start..version_end].copy_from_slice(b"seismic-semantics-v09");
         let encoded = embedded(resealed(encoded));
         assert_eq!(
             decode_checked_bundle(encoded).err(),

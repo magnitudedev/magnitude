@@ -147,7 +147,7 @@ mod tests {
     //! in the interpreter over every state a lane can hold.
     use super::*;
     use seismic::{BackendName, Devices, Element, Tensor};
-    use seismic_lang::checked::{CheckedModule, SourceFile, check_source};
+    use seismic_lang::checked::{CheckedModule, SourceFile};
     use seismic_lang::entry::ElementBindings;
     use seismic_lang::interp::{Arg, Interpreter, OutcomeValue, TensorData};
     use seismic_lang::reference_math::ReferenceScalar;
@@ -162,7 +162,7 @@ mod tests {
         ] {
             sources.push(SourceFile { path: path.into(), text: text.into() });
         }
-        check_source(sources).unwrap()
+        crate::test_support::check_kernels(sources)
     }
 
     /// `slot_answered` of slot 0 of a one-slot table holding `request` and

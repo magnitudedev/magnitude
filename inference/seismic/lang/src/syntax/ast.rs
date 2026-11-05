@@ -179,13 +179,15 @@ impl Decl {
 /// ```text
 /// native NAME for TARGET from "SOURCE":
 ///     static (DIM, ..)
-///     params ([code] [arithmetic] NAME in [V, ..], ..)
+///     params ([arithmetic] [form] NAME in [V, ..] default DEFAULT, ..)
 ///     elements (ELEMENT in [DTYPE, ..], ..)
 ///     let NAME = EXPR
 ///     where CONDITION
 ///     scratch NAME bytes (EXPR) [sync] [when CONDITION]
 ///     launch KERNEL [when CONDITION]:
-///         params ([code] [arithmetic] NAME in [V, ..], ..)
+///         params ([arithmetic] [form] NAME in [V, ..] default DEFAULT, ..)
+///         where CONDITION
+///         reads (PARAMETER, ..)
 ///         threadgroups (X, Y, Z)
 ///         grid (PARAMETER)
 ///         threads_per_threadgroup (X, Y, Z)
@@ -195,7 +197,11 @@ impl Decl {
 /// ```
 ///
 /// A `CONDITION` is comparisons of natural-number expressions joined by
-/// `and` and `or`, grouped with parentheses.
+/// `and` and `or`, grouped with parentheses; a capability `device.NAME`
+/// stands as a condition. Every expression may read `device.NAME`, a
+/// property the target backend provides. A `DEFAULT` is `EXPR`, `least
+/// where CONDITION` or `greatest where CONDITION`, over the device, the
+/// static dimensions and the bound elements.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeDecl {
     pub function: Ident,
@@ -244,19 +250,32 @@ pub struct NativeRepeatDecl {
     pub span: Span,
 }
 
-/// One tuning parameter and its finite domain. The first value is the default.
+/// One tuning parameter, its finite domain and its default:
+/// `[arithmetic] [form] NAME in [V, ..] default DEFAULT`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeParamDecl {
     pub name: Ident,
-    /// The parameter changes generated kernel code rather than only launch
-    /// geometry or runtime arguments.
-    pub code: bool,
     /// The parameter changes the arithmetic order of a row's result.
     pub arithmetic: bool,
     /// The parameter's values select structurally different algorithms.
     pub form: bool,
     pub values: Vec<u64>,
+    pub default: NativeDefaultDecl,
     pub span: Span,
+}
+
+/// A parameter's default, over the device (`device.NAME`) and the static
+/// dimensions: an expression whose value is one of the listed values, or
+/// the least or greatest listed value at which a condition over the
+/// parameter itself holds.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NativeDefaultDecl {
+    /// `default EXPR`
+    Value(Expr),
+    /// `default least where CONDITION`
+    Least(Expr),
+    /// `default greatest where CONDITION`
+    Greatest(Expr),
 }
 
 /// `NAME in [DTYPE, ..]`: the dense element types one element parameter of a
@@ -309,6 +328,9 @@ pub struct NativeLaunchDecl {
     pub when: Option<Expr>,
     /// Parameters local to this launch; names may be reused by other launches.
     pub params: Vec<NativeParamDecl>,
+    /// The launch's `where`: restricts the admissible configurations of the
+    /// parameters it reads, the launch's own and the entry's.
+    pub constraint: Option<Expr>,
     /// Entry parameters read by the kernel but absent from launch expressions.
     pub reads: Vec<Ident>,
     /// The most groups the launch dispatches on each axis; with `grid`, the

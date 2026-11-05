@@ -1076,6 +1076,8 @@ mod tests {
             seismic::generated::native_implementation_at::<E>(backend, entry.elements())
                 .unwrap_or_else(|error| panic!("{} {form}: {error:?}", E::NAME))
                 .unwrap_or_else(|| panic!("{} {form}: no implementation", E::NAME))
+                .device_independent()
+                .unwrap_or_else(|| panic!("{} {form}: the declaration reads the device", E::NAME))
                 .default_specialization(&statics)
                 .unwrap_or_else(|error| panic!("{} {form}: {error:?}", E::NAME));
         }

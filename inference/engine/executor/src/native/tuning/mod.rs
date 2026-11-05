@@ -471,6 +471,16 @@ impl TuningLimits {
     }
 }
 
+/// `case`'s implementation as `device` offers it at the case's elements
+/// (`seismic::BoundEntry::offered`): the declaration preparation forms, its
+/// defaults the ones a pinned unit holds to.
+fn offered<T: EntryTuning>(case: &T, device: &Device) -> Result<seismic::OnDevice, String> {
+    case.entry()
+        .offered(device)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the device offers no native implementation".to_owned())
+}
+
 /// Discover each unit at the points the load's objective weighs, and at an
 /// empty history beside each weighted history point, the cheapest point of
 /// its rows, which prices the longer ones before they are built. Complete
@@ -1081,7 +1091,7 @@ pub(crate) trait EntryTuning: Clone + 'static {
     fn search_starts(
         &self,
         _device: &Device,
-        _implementation: &NativeImplementation,
+        _implementation: &seismic::OnDevice,
         _statics: &NativeSpecialization,
         _limits: TuningLimits,
     ) -> Vec<ParameterValues> {
@@ -1135,18 +1145,6 @@ pub(crate) trait EntryTuning: Clone + 'static {
         self.entry()
             .specialization_valid(device, specialization)
             .unwrap_or(false)
-    }
-    /// The default at `statics` of the same device-augmented declaration
-    /// that native preparation uses: what a stored canonical fallback holds.
-    fn device_default(
-        &self,
-        device: &Device,
-        statics: &NativeSpecialization,
-    ) -> Option<NativeSpecialization> {
-        self.entry()
-            .default_specialization(device, statics)
-            .ok()
-            .flatten()
     }
     /// The entry bound to the case's elements (its generated
     /// `native_entry[_with]`).
@@ -3120,7 +3118,8 @@ impl allocation::Clock for Elapsed {
 struct CaseUnit<'a, T: EntryTuning> {
     case: T,
     key: TuningKey,
-    implementation: NativeImplementation,
+    /// Its implementation as the device offers it ([`offered`]).
+    implementation: seismic::OnDevice,
     statics: NativeSpecialization,
     /// The unit's points, ascending in cost.
     shapes: Vec<PointShape>,
@@ -3309,12 +3308,7 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
         self.search.plan(seismic::UnitPlan {
             settings: SEARCH_SETTINGS,
             min_sample_seconds: MIN_SAMPLE_SECONDS,
-            start: self.case.search_starts(
-                tuner.device,
-                &self.implementation,
-                &self.statics,
-                tuner.limits,
-            ),
+            start: self.case.search_starts(tuner.device, &self.implementation, &self.statics, tuner.limits),
         });
         let cutoff = tuner.started + before;
         let performed = self
@@ -4569,38 +4563,42 @@ impl<'a> Tuner<'a> {
             bindings: bindings.clone(),
             outcome,
         };
+        // The statics lie inside the declaration's domain.
         implementation
-            .default_specialization(statics)
+            .admits(statics)
             .map_err(|error| failure(error.to_string()))?;
-        // The canonical default as the device offers it, as a stored
-        // fallback holds it.
-        let defaults = case
-            .device_default(self.device, statics)
-            .ok_or_else(|| failure("the device offers no default at these statics".into()))?;
+        // The implementation as the device offers it, bound once for the
+        // unit, and its canonical default, as a stored fallback holds it.
+        let offered = offered(case, self.device).map_err(failure)?;
+        let defaults = offered
+            .default_specialization(statics)
+            .map_err(|error| failure(format!("the device offers no default at these statics: {error}")))?;
         let shapes = self.shapes(case, &key, statics)?;
         if shapes.is_empty() {
             return Err(failure("the engine's bounds admit no tuning point".into()));
         }
         match self.phase {
             Phase::Count { .. } => {
-                self.count_unit(case, implementation, statics, key, &shapes, &defaults)
+                self.count_unit(case, &offered, statics, key, &shapes, &defaults)
             }
-            Phase::Census { .. } => self.census_unit(case, implementation, statics, key, shapes),
+            Phase::Census { .. } => self.census_unit(case, offered, statics, key, shapes),
             // The search is over: the unit's published choice is read, and
             // nothing is prepared.
             Phase::Searched => self.searched_unit(case, statics, key, shapes).map(Some),
             Phase::Serve(_) => self
-                .served_unit(case, implementation, statics, key, shapes, &defaults)
+                .served_unit(case, &offered, statics, key, shapes, &defaults)
                 .map(Some),
         }
         .map(|chosen| chosen.unwrap_or(defaults))
     }
 
     /// Count one unit: its launches per step, and whether it will search.
+    /// `offered` is its implementation as the device offers it
+    /// ([`offered`]), `defaults` that implementation's default.
     fn count_unit<T: EntryTuning>(
         &mut self,
         case: &T,
-        implementation: &NativeImplementation,
+        offered: &seismic::OnDevice,
         statics: &NativeSpecialization,
         key: TuningKey,
         shapes: &[PointShape],
@@ -4627,7 +4625,7 @@ impl<'a> Tuner<'a> {
         // the unit's choice from the count on, so whatever depends on the
         // unit (a composed recipe's qualification) finds it in every phase.
         if let pinned::Pinned::Chosen(chosen, choice) =
-            pinned::lookup(&key, implementation).map_err(failure)?
+            pinned::lookup(&key, offered).map_err(failure)?
         {
             self.context.observer.event(&TuningEvent::Pinned {
                 entry: key.0,
@@ -4651,9 +4649,7 @@ impl<'a> Tuner<'a> {
             if matches!(
                 choice.disposition,
                 seismic::TuningDisposition::CanonicalFallback { .. }
-            ) && case
-                .device_default(self.device, statics)
-                .map_or(true, |defaults| choice.overall.specialization() != defaults)
+            ) && choice.overall.specialization() != *defaults
             {
                 return Err(failure(
                     "terminal fallback: choice is not the declared canonical default; search cannot reopen"
@@ -4717,7 +4713,7 @@ impl<'a> Tuner<'a> {
     fn census_unit<T: EntryTuning>(
         &mut self,
         case: &T,
-        implementation: &NativeImplementation,
+        offered: seismic::OnDevice,
         statics: &NativeSpecialization,
         key: TuningKey,
         shapes: Vec<PointShape>,
@@ -4752,7 +4748,7 @@ impl<'a> Tuner<'a> {
         let mut unit = CaseUnit {
             case: case.clone(),
             key: key.clone(),
-            implementation: implementation.clone(),
+            implementation: offered,
             statics: statics.clone(),
             shapes,
             reweighed: false,
@@ -4866,7 +4862,7 @@ impl<'a> Tuner<'a> {
     fn served_unit<T: EntryTuning>(
         &mut self,
         case: &T,
-        implementation: &NativeImplementation,
+        offered: &seismic::OnDevice,
         statics: &NativeSpecialization,
         key: TuningKey,
         shapes: Vec<PointShape>,
@@ -4883,7 +4879,7 @@ impl<'a> Tuner<'a> {
             return Ok(chosen.clone());
         }
         if let pinned::Pinned::Chosen(chosen, choice) =
-            pinned::lookup(&key, implementation).map_err(failure)?
+            pinned::lookup(&key, offered).map_err(failure)?
         {
             self.context.observer.event(&TuningEvent::Pinned {
                 entry,

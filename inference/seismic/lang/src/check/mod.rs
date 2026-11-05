@@ -926,12 +926,22 @@ fn family_contents(resolved: &Resolved<'_>, order: &[usize]) -> Vec<[u8; 32]> {
         .collect()
 }
 
-pub(crate) fn check_closed(
+/// Check `sources`, reading each native implementation's source with
+/// `read` (its entry's name and its declaration): the module, and the
+/// sources read, by entry and backend. Which of an implementation's
+/// parameters change generated code is derived here, from the source read
+/// ([`crate::native_source::derive_codes`]), so no checked implementation
+/// holds a code parameter its source does not state.
+pub(crate) fn check_closed<E>(
     sources: crate::checked::SourceSet,
     module_id: ModuleId,
     program: ProgramId,
-) -> Result<crate::checked::internals::Module, crate::checked::SourceError> {
-    use crate::checked::{Diagnostics, SourceDiagnostic, SourceError};
+    read: &mut crate::checked::NativeReader<'_, E>,
+) -> Result<
+    (crate::checked::internals::Module, crate::checked::NativeSources),
+    crate::checked::CheckFailure<E>,
+> {
+    use crate::checked::{CheckFailure, Diagnostics, SourceDiagnostic, SourceError};
     // Two passes: the first finds every file's module constants, which the
     // second reads as the integers they name.
     let mut constants = std::collections::BTreeMap::new();
@@ -962,7 +972,7 @@ pub(crate) fn check_closed(
         }
     }
     if let Some(diagnostics) = Diagnostics::new(std::mem::take(&mut parse_diagnostics)) {
-        return Err(SourceError::new(diagnostics));
+        return Err(CheckFailure::Source(SourceError::new(diagnostics)));
     }
     let mut parsed = Vec::new();
     for (file, source) in sources.files().iter().enumerate() {
@@ -988,7 +998,7 @@ pub(crate) fn check_closed(
         }
     }
     if let Some(diagnostics) = Diagnostics::new(parse_diagnostics) {
-        return Err(SourceError::new(diagnostics));
+        return Err(CheckFailure::Source(SourceError::new(diagnostics)));
     }
 
     use sha2::Digest as _;
@@ -1015,7 +1025,7 @@ pub(crate) fn check_closed(
         .map(|item| SourceDiagnostic::located(&sources.files()[item.file], item.diagnostic))
         .collect();
     if let Some(diagnostics) = Diagnostics::new(diagnostics) {
-        return Err(SourceError::new(diagnostics));
+        return Err(CheckFailure::Source(SourceError::new(diagnostics)));
     }
     let (definitions, families, contents) =
         checked.expect("a program without diagnostics is checked");
@@ -1042,6 +1052,7 @@ pub(crate) fn check_closed(
         entry_families.push(family_ordinal);
     }
     let mut native_implementations = Vec::new();
+    let mut native_sources = crate::checked::NativeSources::new();
     let mut native_diagnostics = Vec::new();
     for (file, parsed_file) in &parsed {
         for declaration in &parsed_file.decls {
@@ -1117,7 +1128,23 @@ pub(crate) fn check_closed(
                 backend,
                 &sources.files()[*file].path,
             ) {
-                Ok(implementation) => native_implementations.push(implementation),
+                Ok(mut implementation) => {
+                    let source = read(&entry.name, &implementation).map_err(CheckFailure::Read)?;
+                    match crate::native_source::derive_codes(&mut implementation, source.as_deref()) {
+                        Ok(()) => {
+                            if let Some(source) = source {
+                                native_sources.insert((entry.id, backend), source);
+                            }
+                            native_implementations.push(implementation);
+                        }
+                        Err(error) => native_diagnostics.push(SourceDiagnostic::new(
+                            &sources.files()[*file],
+                            native.span,
+                            DiagnosticRule::NativeDeclaration,
+                            format!("native source `{}`: {error}", implementation.source_path),
+                        )),
+                    }
+                }
                 Err(errors) => {
                     for (span, message) in errors {
                         native_diagnostics.push(SourceDiagnostic::new(
@@ -1132,20 +1159,23 @@ pub(crate) fn check_closed(
         }
     }
     if let Some(diagnostics) = Diagnostics::new(native_diagnostics) {
-        return Err(SourceError::new(diagnostics));
+        return Err(CheckFailure::Source(SourceError::new(diagnostics)));
     }
-    Ok(crate::checked::internals::Module {
-        id: module_id,
-        program,
-        semantic_hash,
-        sources: std::sync::Arc::new(sources),
-        entries,
-        native_implementations,
-        entry_families,
-        definitions,
-        families,
-        constants: declared,
-    })
+    Ok((
+        crate::checked::internals::Module {
+            id: module_id,
+            program,
+            semantic_hash,
+            sources: std::sync::Arc::new(sources),
+            entries,
+            native_implementations,
+            entry_families,
+            definitions,
+            families,
+            constants: declared,
+        },
+        native_sources,
+    ))
 }
 
 /// Check one native declaration against its entry. Every problem is reported.
@@ -1193,16 +1223,11 @@ fn check_native(
         }
     }
 
-    let mut params: Vec<NativeParameter> = Vec::new();
+    // Each parameter with its values; its default is lowered once the terms
+    // are known.
+    let mut declared: Vec<(String, Vec<u64>)> = Vec::new();
     for param in &native.params {
         let name = &param.name.name;
-        if backend == crate::registry::BackendName::Cpu && param.code {
-            errors.push((
-                param.span,
-                "CPU native parameters are runtime values; `code` is for compiled GPU kernels"
-                    .to_owned(),
-            ));
-        }
         if entry.dimensions.contains(name) {
             errors.push((
                 param.name.span,
@@ -1213,7 +1238,7 @@ fn check_native(
             ));
             continue;
         }
-        if params.iter().any(|existing| &existing.name == name) {
+        if declared.iter().any(|(existing, _)| existing == name) {
             errors.push((
                 param.name.span,
                 format!("native parameter `{name}` is declared twice"),
@@ -1231,18 +1256,11 @@ fn check_native(
                 values.push(*value);
             }
         }
-        params.push(NativeParameter {
-            name: name.clone(),
-            code: param.code,
-            arithmetic: param.arithmetic,
-            form: param.form,
-            values,
-            role: crate::checked::NativeParameterRole::Declared,
-        });
+        declared.push((name.clone(), values));
     }
-    let parameter_names = params
+    let parameter_names = declared
         .iter()
-        .map(|parameter| parameter.name.clone())
+        .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
 
     // Named terms are substitution: every later expression of the
@@ -1280,12 +1298,24 @@ fn check_native(
         };
         let mut declaration = native.clone();
         declaration.constraint.iter_mut().for_each(expand);
+        for param in declaration
+            .params
+            .iter_mut()
+            .chain(declaration.launches.iter_mut().flat_map(|launch| &mut launch.params))
+        {
+            match &mut param.default {
+                ast::NativeDefaultDecl::Value(expr)
+                | ast::NativeDefaultDecl::Least(expr)
+                | ast::NativeDefaultDecl::Greatest(expr) => expand(expr),
+            }
+        }
         for scratch in &mut declaration.scratch {
             expand(&mut scratch.bytes);
             scratch.when.iter_mut().for_each(expand);
         }
         for launch in &mut declaration.launches {
             launch.when.iter_mut().for_each(expand);
+            launch.constraint.iter_mut().for_each(expand);
             launch
                 .threadgroups
                 .iter_mut()
@@ -1299,6 +1329,115 @@ fn check_native(
         expanded = declaration;
         &expanded
     };
+
+    // A launch's `where` restricts the configurations of the parameters it
+    // reads, as one more conjunct of the declaration's: the checks below
+    // hold it to what they hold every conjunct to.
+    let folded;
+    let native = if native.launches.iter().all(|launch| launch.constraint.is_none()) {
+        native
+    } else {
+        let mut declaration = native.clone();
+        for launch in &native.launches {
+            if let Some(condition) = &launch.constraint {
+                declaration.constraint = Some(match declaration.constraint.take() {
+                    None => condition.clone(),
+                    Some(constraint) => crate::syntax::ast::Expr {
+                        span: constraint.span.to(condition.span),
+                        kind: crate::syntax::ast::ExprKind::Binary {
+                            op: crate::syntax::ast::BinaryOp::And,
+                            lhs: Box::new(constraint),
+                            rhs: Box::new(condition.clone()),
+                        },
+                    },
+                });
+            }
+        }
+        folded = declaration;
+        &folded
+    };
+
+    // Every default reads only the device, the static dimensions and the
+    // bound elements, and `least`/`greatest` the parameter itself; a default
+    // that reads no dimension and no element is checked here on every
+    // device of the backend.
+    let lowered_default = |param: &ast::NativeParamDecl,
+                           values: &[u64],
+                           errors: &mut Vec<(Span, String)>|
+     -> Option<crate::checked::NativeDefault> {
+        let name = &param.name.name;
+        let (expr, lowered) = match &param.default {
+            ast::NativeDefaultDecl::Value(expr) => (
+                expr,
+                native_nat_expr(expr, &entry.dimensions, &[], element_reads)
+                    .map(crate::checked::NativeDefault::Value)
+                    .map_err(|message| (expr.span, message)),
+            ),
+            ast::NativeDefaultDecl::Least(expr) | ast::NativeDefaultDecl::Greatest(expr) => {
+                let least = matches!(param.default, ast::NativeDefaultDecl::Least(_));
+                (
+                    expr,
+                    native_condition(
+                        "default",
+                        expr,
+                        &entry.dimensions,
+                        std::slice::from_ref(name),
+                        element_reads,
+                    )
+                    .map(|condition| match least {
+                        true => crate::checked::NativeDefault::Least(condition),
+                        false => crate::checked::NativeDefault::Greatest(condition),
+                    }),
+                )
+            }
+        };
+        let default = lowered.map_err(|error| errors.push(error)).ok()?;
+        let mut dimensions = Vec::new();
+        let element = match &default {
+            crate::checked::NativeDefault::Value(value) => {
+                value.dimensions(&mut dimensions);
+                value.element_read().is_some()
+            }
+            crate::checked::NativeDefault::Least(condition)
+            | crate::checked::NativeDefault::Greatest(condition) => {
+                condition.dimensions(&mut dimensions);
+                condition.element_read().is_some()
+            }
+        };
+        if let Some(dynamic) = dimensions.iter().find(|dimension| !statics.contains(dimension)) {
+            errors.push((expr.span, format!("the default of `{name}` reads dimension `{dynamic}`, which is not static; a default reads only the device, the static dimensions and the bound elements")));
+            return None;
+        }
+        if dimensions.is_empty() && !element {
+            if let Err(error) = default.on_every_device(name, values, backend) {
+                errors.push((expr.span, error.to_string()));
+                return None;
+            }
+        }
+        Some(default)
+    };
+    let params = declared
+        .into_iter()
+        .filter_map(|(name, values)| {
+            let param = native
+                .params
+                .iter()
+                .find(|param| param.name.name == name)
+                .expect("every checked parameter is declared");
+            let default = lowered_default(param, &values, &mut errors)?;
+            Some(NativeParameter {
+                name,
+                // Derived from the source in `check_closed`, before the
+                // implementation is kept.
+                code: false,
+                arithmetic: param.arithmetic,
+                form: param.form,
+                values,
+                default,
+                role: crate::checked::NativeParameterRole::Declared,
+            })
+        })
+        .collect::<Vec<_>>();
 
     let mut records = Vec::new();
     let results = result_leaves(&contract.result);
@@ -1555,13 +1694,6 @@ fn check_native(
         let mut launch_params: Vec<NativeParameter> = Vec::new();
         for param in &launch.params {
             let name = &param.name.name;
-            if backend == crate::registry::BackendName::Cpu && param.code {
-                errors.push((
-                    param.span,
-                    "CPU native parameters are runtime values; `code` is for compiled GPU kernels"
-                        .to_owned(),
-                ));
-            }
             if entry.dimensions.contains(name) || parameter_names.contains(name) {
                 errors.push((
                     param.name.span,
@@ -1587,12 +1719,18 @@ fn check_native(
                     values.push(*value);
                 }
             }
+            let Some(default) = lowered_default(param, &values, &mut errors) else {
+                continue;
+            };
             launch_params.push(NativeParameter {
                 name: name.clone(),
-                code: param.code,
+                // Derived from the source in `check_closed`, before the
+                // implementation is kept.
+                code: false,
                 arithmetic: param.arithmetic,
                 form: param.form,
                 values,
+                default,
                 role: crate::checked::NativeParameterRole::Declared,
             });
         }
@@ -1927,6 +2065,19 @@ fn native_condition(
             ),
         )
     };
+    // A capability the backend provides stands as a condition: it holds.
+    if let ExprKind::Attr { base, name } = &expression.kind {
+        if matches!(&base.kind, ExprKind::Name(device) if device.name == "device")
+            && crate::device::provided(elements.backend, &name.name)
+                == Some(crate::device::PropertyKind::Support)
+        {
+            return Ok(NativeCondition::Compare {
+                comparison: NativeComparison::Ne,
+                left: crate::checked::NativeNatExpr::Device(name.name.clone()),
+                right: crate::checked::NativeNatExpr::Constant(0),
+            });
+        }
+    }
     let ExprKind::Binary { op, lhs, rhs } = &expression.kind else {
         return Err(not_a_condition());
     };
@@ -2116,6 +2267,26 @@ fn native_nat_expr(
                 }
             };
             binary(&args[0].value, &args[1].value, make)
+        }
+        ExprKind::Attr { base, name }
+            if matches!(&base.kind, ExprKind::Name(device) if device.name == "device") =>
+        {
+            match crate::device::provided(elements.backend, &name.name) {
+                Some(crate::device::PropertyKind::Support | crate::device::PropertyKind::Count) => {
+                    Ok(N::Device(name.name.clone()))
+                }
+                // A measured property has no value until its probe has run,
+                // and a declaration states no alternative to read instead.
+                Some(crate::device::PropertyKind::Measured) => Err(format!(
+                    "`device.{}` is measured, and a native declaration cannot read it: it has no value until its probe has run",
+                    name.name
+                )),
+                None => Err(format!(
+                    "`device.{}` is not a property `{}` provides",
+                    name.name,
+                    elements.backend.as_str()
+                )),
+            }
         }
         _ => Err("unsupported native expression".to_owned()),
     }

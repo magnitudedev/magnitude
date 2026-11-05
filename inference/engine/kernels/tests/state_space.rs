@@ -9,6 +9,7 @@
 // successor changes: accepted banks, the zero seed, and unrelated banks keep
 // their exact bytes.
 
+mod common;
 mod versions_common;
 
 use magnitude_kernels::{state_space_chunk, state_space_gate, state_space_step};
@@ -307,7 +308,7 @@ impl Case {
     /// activations).
     fn oracle(&self) -> Outcome {
         use seismic_lang::{
-            checked::{check_source, SourceFile},
+            checked::{SourceFile},
             entry::ElementBindings,
             failure::SourceTermination,
             interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -321,7 +322,7 @@ impl Case {
             path: "state_space.seismic".into(),
             text: include_str!("../kernels/state_space.seismic").into(),
         });
-        let module = check_source(sources).unwrap();
+        let module = crate::common::check(sources);
         let elements = ElementBindings::new().bind("A", registry::dense(DType::F32));
         let logical = module
             .entry(module.entry_named("state_space_step").unwrap(), &elements)
@@ -922,7 +923,7 @@ impl GateCase {
     /// activations).
     fn oracle(&self) -> Vec<f32> {
         use seismic_lang::{
-            checked::{check_source, SourceFile},
+            checked::{SourceFile},
             entry::ElementBindings,
             interp::{Arg, Interpreter, OutcomeValue, TensorData},
             reference_math::ReferenceScalar,
@@ -934,7 +935,7 @@ impl GateCase {
             path: "state_space.seismic".into(),
             text: include_str!("../kernels/state_space.seismic").into(),
         });
-        let module = check_source(sources).unwrap();
+        let module = crate::common::check(sources);
         let elements = ElementBindings::new().bind("A", registry::dense(DType::BF16));
         let logical = module
             .entry(module.entry_named("state_space_gate").unwrap(), &elements)

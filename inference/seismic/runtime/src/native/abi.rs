@@ -772,7 +772,7 @@ fn written_grid_loop(
         .iter()
         .filter(|bound| **bound)
         .count();
-    let (header, instance) = match super::plan::code_parameters(implementation, ordinal).is_empty() {
+    let (header, instance) = match implementation.code_parameters(ordinal).is_empty() {
         true => ("", ""),
         false => ("template <auto... SEISMIC_CODE>\n", "<SEISMIC_CODE...>"),
     };
@@ -1686,7 +1686,7 @@ mod tests {
     use seismic_lang::checked::{SourceFile, SourceSet, check_source};
     use seismic_lang::registry::BackendName;
 
-    const PROBE: &str = "fn probe[N, K](x: &tensor[N, K] E) -> tensor[1] f32:\n    let mut output = tensor[1] f32\n    for i in 0..1:\n        output[i] = f32(x[0, 0])\n    return output\n\nnative probe for cuda from \"probe.cu\":\n    static (K)\n    params (TILE in [4, 8])\n    scratch partials bytes (N * 4)\n    launch probe:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (TILE, 1, 1)\n";
+    const PROBE: &str = "fn probe[N, K](x: &tensor[N, K] E) -> tensor[1] f32:\n    let mut output = tensor[1] f32\n    for i in 0..1:\n        output[i] = f32(x[0, 0])\n    return output\n\nnative probe for cuda from \"probe.cu\":\n    static (K)\n    params (TILE in [4, 8] default 4)\n    scratch partials bytes (N * 4)\n    launch probe:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (TILE, 1, 1)\n";
 
     fn render(dialect: Dialect, representation: &str) -> String {
         render_with(
@@ -1834,11 +1834,15 @@ mod tests {
 
     #[test]
     fn scoped_runtime_words_have_stable_entry_then_launch_offsets() {
-        let text = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (SPLIT in [1, 2])\n    launch small when N < 16:\n        params (WIDTH in [32, 64], code ROWS in [1, 2])\n        reads (SPLIT)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n    launch large when N >= 16:\n        params (WIDTH in [64, 128])\n        threadgroups (ceil_div(N, WIDTH), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n";
-        let module = check_source(SourceSet::new(vec![SourceFile {
-            path: "scale.seismic".into(),
-            text: text.into(),
-        }]))
+        let text = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (SPLIT in [1, 2] default 1)\n    launch small when N < 16:\n        params (WIDTH in [32, 64] default 32, ROWS in [1, 2] default 1)\n        reads (SPLIT)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n    launch large when N >= 16:\n        params (WIDTH in [64, 128] default 64)\n        threadgroups (ceil_div(N, WIDTH), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n";
+        // Its source's `small` takes `ROWS` as a template parameter.
+        let module = seismic_lang::native_source::check_fixture(
+            SourceSet::new(vec![SourceFile {
+                path: "scale.seismic".into(),
+                text: text.into(),
+            }]),
+            &["ROWS"],
+        )
         .unwrap();
         let entry = module.entry_named("scale").unwrap();
         let bindings = ElementBindings::default();
@@ -1847,7 +1851,7 @@ mod tests {
             .native_implementation(entry, BackendName::Metal)
             .unwrap();
         let defaults = implementation
-            .default_specialization(&NativeSpecialization::new())
+            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
             .unwrap();
         let base = word_count(logical.schema());
         assert_eq!(

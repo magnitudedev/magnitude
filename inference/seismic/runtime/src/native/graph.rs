@@ -4754,20 +4754,22 @@ mod upload_region_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod condition_tests {
     use super::*;
-    use seismic_lang::checked::{Encoded, SourceFile, SourceSet, check_source};
+    use seismic_lang::checked::{Encoded, NativeImplementation, SourceFile, SourceSet, check_source_with};
     use seismic_lang::registry::BackendName;
 
     /// `fill`, whose one launch its kernel conditions on `policy[2]`.
     fn fill(device: &Arc<DeviceInner>) -> Arc<NativePreparedAny> {
-        let mut module = check_source(SourceSet::new(vec![SourceFile {
-            path: "policy.seismic".into(),
-            text: "fn fill[N](policy: &tensor[3] i32, x: &mut tensor[N] f32):\n    for i in 0..N:\n        x[i] = 0.0\n\nnative fill for metal from \"fill.metal\":\n    launch fill:\n        threadgroups (1, 1, 1)\n        unless (policy[2])\n        threads_per_threadgroup (1, 1, 1)\n".into(),
-        }]))
+        let module = check_source_with(
+            SourceSet::new(vec![SourceFile {
+                path: "policy.seismic".into(),
+                text: "fn fill[N](policy: &tensor[3] i32, x: &mut tensor[N] f32):\n    for i in 0..N:\n        x[i] = 0.0\n\nnative fill for metal from \"fill.metal\":\n    launch fill:\n        threadgroups (1, 1, 1)\n        unless (policy[2])\n        threads_per_threadgroup (1, 1, 1)\n".into(),
+            }]),
+            &mut |_entry: &str, _native: &NativeImplementation| {
+                Ok::<_, std::convert::Infallible>(Some("kernel void fill() {}\n".into()))
+            },
+        )
         .expect("policy source checks");
         let entry = module.entry_named("fill").expect("fill entry");
-        module
-            .capture_native_asset(entry, BackendName::Metal, "kernel void fill() {}\n".into())
-            .expect("asset capture");
         let inner = NativePrepared::prepare(
             device,
             &module,

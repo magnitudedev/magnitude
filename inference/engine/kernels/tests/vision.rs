@@ -12,13 +12,15 @@
 //! moves a published intermediate by one A ulp. The bounds are relative to
 //! the result's RMS.
 
+mod common;
+
 use magnitude_kernels::{
     vision_attention, vision_clamp, vision_gated_convolution, vision_linear, vision_norm,
     vision_patch_stem, vision_pool, vision_position,
 };
 use seismic::{Device, Element, NativeSpecialization, Tensor};
 use seismic_lang::{
-    checked::{CheckedModule, SourceFile, check_source},
+    checked::{CheckedModule, SourceFile},
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OracleOutcome, OutcomeValue, TensorData},
@@ -189,7 +191,7 @@ fn module() -> CheckedModule {
             text: text.into(),
         });
     }
-    check_source(sources).unwrap()
+    crate::common::check(sources)
 }
 
 enum Input<'a> {

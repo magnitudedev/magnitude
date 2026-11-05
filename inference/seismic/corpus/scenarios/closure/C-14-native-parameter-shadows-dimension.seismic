@@ -7,7 +7,7 @@ fn probe[N](x: &tensor[N] f32, factor: f32, out: &mut tensor[N] f32):
         out[i] = x[i] * factor
 
 native probe for cpu from "probe.rs":
-    params (N in [1, 2])
+    params (N in [1, 2] default 1)
     launch probe:
         threadgroups (N, 1, 1)
         threads_per_threadgroup (1, 1, 1)

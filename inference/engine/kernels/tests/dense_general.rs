@@ -4,12 +4,13 @@
 //! class and mapping) against the host reference at the catalog's real
 //! widths (Gemma 4 E2B/E4B/26B, LFM2, Nemotron-H Lightning and Super).
 
+mod common;
 mod mapped;
 
 use magnitude_kernels::{dense_up, per_layer_gate, project_rows, short_conv_project};
 use mapped::Mapped;
 use seismic_lang::{
-    checked::{check_source, CheckedModule, SourceFile},
+    checked::{CheckedModule, SourceFile},
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -35,7 +36,7 @@ fn module() -> CheckedModule {
             text: text.into(),
         });
     }
-    check_source(sources).unwrap()
+    crate::common::check(sources)
 }
 
 enum Input {
@@ -347,12 +348,13 @@ fn mappings(
 /// The statics the device's implementation declares: backends fix different
 /// subsets of the entry dimensions (the CPU forms read most of them at run time).
 fn declared(
-    implementation: Result<Option<seismic::NativeImplementation>, seismic::CheckedBundleError>,
+    implementation: Result<Option<seismic::OnDevice>, seismic::CheckedBundleError>,
 ) -> Vec<String> {
     implementation
         .unwrap()
         .expect("every test device has a native implementation")
         .statics
+        .clone()
 }
 
 /// `mapping`'s specialization with those of `statics` that `declared` names.

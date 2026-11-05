@@ -67,6 +67,43 @@ is a hard constraint, never a term that faster execution can compensate for.
 A native declaration attaches an authored source to a checked entry for one backend and states its
 tuning settings, its launches and their geometry.
 
+**Defaults.** Each setting lists its legal values and states its default in one of three forms:
+`default EXPR`, a value, which must be listed; `default least where CONDITION`, the least listed
+value at which the condition holds, the setting reading as that value; and
+`default greatest where CONDITION`, the greatest such value. A default reads only the device, the
+static dimensions and the bound elements. The default configuration is every setting at its
+default when `where` admits it; otherwise it is the first admissible configuration of a walk in
+which each setting tries its default before its other values, in declaration order. No value is
+the default for coming first.
+
+A default that reads no dimension and no element is checked when the module is checked, on every
+device of its backend: at both values of each capability it reads and at every whole number of
+each count. Reading capabilities alone, it is evaluated at each combination of them, as a device
+evaluates it. Counts are bounded rather than enumerated: a value default holds when every value
+within its bounds is listed, and a `least` or `greatest` default when some listed value satisfies
+its condition on every device and each value it tries before that one evaluates on every device.
+A default these bounds refuse is restated so that they show its value, as a `least where` whose
+last value always holds. A default that reads a dimension or an element is evaluated when it is
+prepared, and one with no value there fails the preparation.
+
+**Device reads.** Every native expression (defaults, `let`, `where`, launch geometry) can read
+`device.NAME`, a property its backend declares. A capability reads as 0 or 1 and stands as a
+condition. A measured property cannot be read: it has no value until its probe has run. A
+declaration that reads the device has defaults only on a device, so preparation and tuning take it
+as the device they run on offers it, and an assessment, a kernel identity or offline coverage,
+which name only a backend, refuse it.
+
+**Launch scope.** `params` and `where` may follow a launch's header. A launch's settings are its
+own, and another launch may reuse a name; a setting more than one launch reads is declared at the
+top. A launch's `where` is one more conjunct of the declaration's, held to the same checks.
+
+**Code settings.** Whether a setting changes generated code is derived from the source, never
+declared. In a launch-scoped CUDA or Metal source, a launch's code settings are its kernel's
+template parameters, which must name them in declaration order.
+A setting that neither the source nor the declaration reads is refused. `arithmetic` and `form`
+stay declared: a source cannot show whether a setting changes rounding or the algorithm, and
+precision admission and the search depend on knowing.
+
 ### Device properties and probes
 
 Each backend declares its devices' properties once: each property's type and the sources that

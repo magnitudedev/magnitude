@@ -5,12 +5,14 @@
 //! real routing shapes (LFM2-MoE, Laguna, Gemma 4 26B, Nemotron Lightning and
 //! Super).
 
+mod common;
+
 use magnitude_kernels::{
     constants, routed_down, routed_experts, routed_experts_up, routed_gate_up, routed_group,
     routed_scatter, routed_select, routed_up,
 };
 use seismic_lang::{
-    checked::{check_source, CheckedModule, SourceFile},
+    checked::{CheckedModule, SourceFile},
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OracleOutcome, OutcomeValue, TensorData},
@@ -41,7 +43,7 @@ fn module() -> CheckedModule {
             text: text.into(),
         });
     }
-    check_source(sources).unwrap()
+    crate::common::check(sources)
 }
 
 enum Input {

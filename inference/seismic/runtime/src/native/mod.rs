@@ -80,6 +80,7 @@ use seismic_compiler::prepared::{
 };
 use seismic_lang::checked::{
     CheckedModule, NativeCondition, NativeImplementation, NativeNatExpr, NativeSpecialization,
+    OnDevice,
 };
 use seismic_lang::entry::{
     CallSchema, CheckedProgramSubject, ElementBindings, LogicalEntry, ParameterKind, ResultClass,
@@ -771,59 +772,58 @@ fn vulkan_geometry(
         .collect()
 }
 
-/// `implementation` as `device` offers it: on a CPU device, with the
-/// Seismic-owned participant count of each launch and the tier appended, their
-/// domains exact for the device (its pool size, the tiers below its detected
-/// one). Appending is idempotent.
-pub(crate) fn on_device(
+/// `implementation` as `device` offers it, bound on it: on a CPU device
+/// with the Seismic-owned participant count of each launch and the tier
+/// appended, their domains exact for the device (its pool size, the tiers
+/// below its detected one), and every `device.NAME` it reads at the
+/// device's value ([`NativeImplementation::at_device`]). Idempotent. The
+/// one binder of an implementation on a device: every other path binds
+/// through it ([`offered`]).
+pub fn on_device(
     device: &DeviceInner,
     mut implementation: NativeImplementation,
-) -> NativeImplementation {
+) -> OnDevice {
     use seismic_lang::checked::{NativeParameter, NativeParameterRole};
-    let OpenedKind::Cpu(opened) = &device.kind else {
-        return implementation;
-    };
-    if implementation
-        .params
-        .iter()
-        .any(|parameter| parameter.role != NativeParameterRole::Declared)
-    {
-        return implementation;
+    if let OpenedKind::Cpu(opened) = &device.kind {
+        if implementation
+            .params
+            .iter()
+            .all(|parameter| parameter.role == NativeParameterRole::Declared)
+        {
+            let lower = seismic_native_cpu::Tier::detected()
+                .map(|detected| {
+                    detected
+                        .at_or_below()
+                        .filter(|tier| *tier != detected)
+                        .map(|tier| tier.name())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            implementation.params.extend(NativeParameter::cpu_parameters(
+                implementation.launches.len(),
+                opened.executor().workers(),
+                &lower,
+            ));
+        }
     }
-    let lower = seismic_native_cpu::Tier::detected()
-        .map(|detected| {
-            detected
-                .at_or_below()
-                .filter(|tier| *tier != detected)
-                .map(|tier| tier.name())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    implementation
-        .params
-        .extend(NativeParameter::cpu_parameters(
-            implementation.launches.len(),
-            opened.executor().workers(),
-            &lower,
-        ));
-    implementation
+    implementation.at_device(device.properties())
 }
 
 /// `implementation`'s declared defaults as `device` offers them at
 /// `bindings`. On a CPU whose tier forms quantized dots from vector integer
 /// products (AVX2, AVX-512 or VNNI, `Tier::quantized_dots`, a fact of the
 /// device), a projection over a packed weight the quantized dot takes
-/// (`form(W, INT8)`) prefers its `INT8` form: it quantizes the staged rows
-/// to Q8 blocks and runs the representation's integer dot, and the F32 form
-/// is the challenger. The default is the first configuration the
-/// declaration admits in that order. Elsewhere (x86-64-v2, NEON, dense
-/// weights, GPUs) the declaration's defaults stand.
+/// (`form(W, INT8)`) defaults to its `INT8` form: it quantizes the staged
+/// rows to Q8 blocks and runs the representation's integer dot, and the F32
+/// form is the challenger; where `where` refuses it, the walk from the
+/// defaults takes the F32 form. Elsewhere (x86-64-v2, NEON, dense weights,
+/// GPUs) the declaration's defaults stand.
 pub(crate) fn device_defaults(
     device: &DeviceInner,
     mut implementation: NativeImplementation,
     bindings: &ElementBindings,
 ) -> NativeImplementation {
-    use seismic_lang::checked::NativeParameterRole;
+    use seismic_lang::checked::{NativeDefault, NativeNatExpr, NativeParameterRole};
     let OpenedKind::Cpu(_) = &device.kind else {
         return implementation;
     };
@@ -843,27 +843,28 @@ pub(crate) fn device_defaults(
         if parameter.role == NativeParameterRole::Declared
             && parameter.form
             && parameter.name == "INT8"
+            && parameter.values.contains(&1)
         {
-            parameter.values.sort_by_key(|value| *value != 1);
+            parameter.default = NativeDefault::Value(NativeNatExpr::Constant(1));
         }
     }
     implementation
 }
 
 /// `entry`'s implementation at `bindings` ([`CheckedModule::native_implementation_at`])
-/// as `device` offers it ([`on_device`], [`device_defaults`]): the
-/// declaration whose configurations preparation forms at these bindings.
-/// `None` when the backend has no implementation.
-pub(crate) fn offered(
+/// as `device` offers it ([`device_defaults`], [`on_device`]): the
+/// declaration whose configurations preparation forms at these bindings,
+/// bound on the device. `None` when the backend has no implementation.
+pub fn offered(
     device: &DeviceInner,
     module: &CheckedModule,
     entry: EntryId,
     bindings: &ElementBindings,
-) -> Option<NativeImplementation> {
+) -> Option<OnDevice> {
     module
         .native_implementation_at(entry, backend_name(&device.kind), bindings)
         .cloned()
-        .map(|implementation| device_defaults(device, on_device(device, implementation), bindings))
+        .map(|implementation| on_device(device, device_defaults(device, implementation, bindings)))
 }
 
 /// Check a choice against the implementation as it exists on this device
@@ -1837,7 +1838,7 @@ impl NativePrepared {
             parameters: logical.parameter_shapes(),
             handoff,
             invocation,
-            implementation,
+            implementation: implementation.into_implementation(),
             specialization,
             statics,
             canonical_parameters,
@@ -3498,7 +3499,7 @@ fn read_word(bytes: &[u8], word: usize) -> u64 {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
-    use seismic_lang::checked::{check_source, SourceFile, SourceSet};
+    use seismic_lang::checked::{check_source_with, SourceFile, SourceSet};
 
     /// A module built without seismic-build (which rejects this at build
     /// time) reaches preparation, which rejects it before compiling.
@@ -3509,15 +3510,17 @@ mod tests {
             .map(|index| format!("x{index}: &tensor[N] f32"))
             .collect::<Vec<_>>()
             .join(", ");
-        let mut module = check_source(SourceSet::new(vec![SourceFile {
-            path: "wide.seismic".into(),
-            text: format!("fn wide[N]({parameters}) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x0[i]\n    return output\n\nnative wide for metal from \"wide.metal\":\n    launch wide:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n"),
-        }]))
+        let module = check_source_with(
+            SourceSet::new(vec![SourceFile {
+                path: "wide.seismic".into(),
+                text: format!("fn wide[N]({parameters}) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x0[i]\n    return output\n\nnative wide for metal from \"wide.metal\":\n    launch wide:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n"),
+            }]),
+            &mut |_entry: &str, _native: &NativeImplementation| {
+                Ok::<_, std::convert::Infallible>(Some("kernel void wide() {}\n".into()))
+            },
+        )
         .expect("wide source checks");
         let entry = module.entry_named("wide").expect("wide entry");
-        module
-            .capture_native_asset(entry, BackendName::Metal, "kernel void wide() {}\n".into())
-            .expect("asset capture");
         let device = crate::devices::Devices::discover(&[])
             .expect("device discovery")
             .open_backend(BackendName::Metal)
@@ -3551,15 +3554,17 @@ mod tests {
     #[test]
     #[ignore = "requires Metal device"]
     fn an_indexed_launch_condition_reads_its_word() {
-        let mut module = check_source(SourceSet::new(vec![SourceFile {
-            path: "policy.seismic".into(),
-            text: "const WHOLE = 2\n\nfn fill[N](policy: &tensor[3] i32, x: &mut tensor[N] f32):\n    for i in 0..N:\n        x[i] = 0.0\n\nnative fill for metal from \"fill.metal\":\n    launch fill:\n        threadgroups (1, 1, 1)\n        unless (policy[WHOLE])\n        if (policy[0])\n        threads_per_threadgroup (1, 1, 1)\n".into(),
-        }]))
+        let module = check_source_with(
+            SourceSet::new(vec![SourceFile {
+                path: "policy.seismic".into(),
+                text: "const WHOLE = 2\n\nfn fill[N](policy: &tensor[3] i32, x: &mut tensor[N] f32):\n    for i in 0..N:\n        x[i] = 0.0\n\nnative fill for metal from \"fill.metal\":\n    launch fill:\n        threadgroups (1, 1, 1)\n        unless (policy[WHOLE])\n        if (policy[0])\n        threads_per_threadgroup (1, 1, 1)\n".into(),
+            }]),
+            &mut |_entry: &str, _native: &NativeImplementation| {
+                Ok::<_, std::convert::Infallible>(Some("kernel void fill() {}\n".into()))
+            },
+        )
         .expect("policy source checks");
         let entry = module.entry_named("fill").expect("fill entry");
-        module
-            .capture_native_asset(entry, BackendName::Metal, "kernel void fill() {}\n".into())
-            .expect("asset capture");
         let device = crate::devices::Devices::discover(&[])
             .expect("device discovery")
             .open_backend(BackendName::Metal)

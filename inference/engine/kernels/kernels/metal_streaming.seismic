@@ -25,7 +25,7 @@
 #     from their registers.
 native routed_route_streamed for metal from "metal/routed_route_streamed.metal":
     static (H, PT, NM, E, K, S, ES, AHEAD, EN, TM)
-    params (SIMDGROUPS in [8, 16, 4, 2], ROWS in [1, 2, 4], arithmetic LANES in [32, 16])
+    params (SIMDGROUPS in [8, 16, 4, 2] default 8, ROWS in [1, 2, 4] default 1, arithmetic LANES in [32, 16] default 32)
     where H % 32 == 0 and E <= 1024 and EN <= 1024 and K <= 32
     scratch logits bytes ((M * (E + 1) + AHEAD * M * (EN + 1)) * 4)
     scratch arrivals bytes (4 * (1 + AHEAD)) sync
@@ -66,7 +66,7 @@ native routed_route_streamed for metal from "metal/routed_route_streamed.metal":
 # (`next_policy[POLICY_RESOLVED]`) the launches encoded are the ones without them.
 native routed_select_streamed for metal from "metal/routed_select_streamed.metal":
     static (H, E, K, ES, AHEAD, EN, TM)
-    params (SIMDGROUPS in [8, 16, 4, 2])
+    params (SIMDGROUPS in [8, 16, 4, 2] default 8)
     where H % 32 == 0 and E <= 1024 and K <= E and EN <= 1024 and K <= EN
     scratch logits bytes ((M * E + AHEAD * M * EN) * 4)
     launch routed_select_streamed_gemv:
@@ -117,7 +117,7 @@ native routed_down_project for metal from "metal/routed_down_project.metal":
     records (expert_down, tier_down)
     where K <= 32 and ceil_div(F, 32 * LANES) * ROWS <= 8
     launch routed_down_project:
-        params (code ROWS in [2, 1, 4, 8], code arithmetic LANES in [16, 32])
+        params (ROWS in [2, 1, 4, 8] default 2, arithmetic LANES in [16, 32] default 16)
         threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
         threads_per_threadgroup (32 * K, 1, 1)
 
@@ -137,7 +137,7 @@ native routed_output_project for metal from "metal/routed_output_project.metal":
     records (expert_down, tier_down)
     where K < 32 and ceil_div(max(F, S), 32 * LANES) * ROWS <= 8
     launch routed_output_project:
-        params (code ROWS in [2, 1, 4, 8], code arithmetic LANES in [16, 32])
+        params (ROWS in [2, 1, 4, 8] default 2, arithmetic LANES in [16, 32] default 16)
         threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
         threads_per_threadgroup (32 * (K + 1), 1, 1)
 

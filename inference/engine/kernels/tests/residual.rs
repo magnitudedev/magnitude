@@ -2,9 +2,11 @@
 //! contract; native implementations are checked against them on the host's
 //! GPU backend and on the CPU, at the catalog's real row widths.
 
+mod common;
+
 use magnitude_kernels::{moe_tail, per_layer_inputs, post_norm_residual};
 use seismic_lang::{
-    checked::{check_source, CheckedModule, SourceFile},
+    checked::{CheckedModule, SourceFile},
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OracleOutcome, OutcomeValue, TensorData},
@@ -19,7 +21,7 @@ fn module() -> CheckedModule {
         path: "residual.seismic".into(),
         text: include_str!("../kernels/residual.seismic").into(),
     });
-    check_source(sources).unwrap()
+    crate::common::check(sources)
 }
 
 enum Input {

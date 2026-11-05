@@ -28,3 +28,15 @@ pub(crate) fn available(devices: &seismic::Devices, backend: seismic::BackendNam
         executor.backend() == backend && matches!(executor.availability(), seismic::Availability::Available)
     })
 }
+
+/// `sources`, held in memory, checked with each native implementation's
+/// source read from the engine's kernel tree, where the declarations name
+/// them ([`seismic_lang::source::check_beside`]).
+#[cfg(test)]
+pub(crate) fn check_kernels(
+    sources: seismic_lang::checked::SourceSet,
+) -> seismic_lang::checked::CheckedModule {
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
+    let kernels = std::path::Path::new(&manifest).join("../kernels/kernels");
+    seismic_lang::source::check_beside(sources, &kernels).expect("the kernel sources check")
+}

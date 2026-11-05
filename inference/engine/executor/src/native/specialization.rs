@@ -333,8 +333,8 @@ fn domain_statics(
             specialization = specialization.with_param(*name, *value);
         }
     }
-    match implementation.default_specialization(&specialization) {
-        Ok(_) => Ok(specialization),
+    match implementation.admits(&specialization) {
+        Ok(()) => Ok(specialization),
         Err(NativeSpecializationError::Inadmissible) => Err(CatalogFailure::KernelDomain {
             entry,
             statics: specialization

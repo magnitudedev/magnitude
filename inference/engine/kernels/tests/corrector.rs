@@ -7,6 +7,8 @@
 //! portable bodies at small shapes; the CPU test runs everywhere, the
 //! accelerator test on every other device the host has.
 
+mod common;
+
 use magnitude_kernels::{
     corrector_attention, corrector_factors, corrector_features, corrector_nodes, corrector_path,
     corrector_rows,
@@ -313,7 +315,7 @@ fn path_model(
 
 mod portable {
     use seismic_lang::{
-        checked::{check_source, CheckedModule, SourceFile},
+        checked::{CheckedModule, SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -350,7 +352,7 @@ mod portable {
             path: "corrector.seismic".into(),
             text: include_str!("../kernels/corrector.seismic").into(),
         });
-        check_source(sources).unwrap()
+        crate::common::check(sources)
     }
 
     /// The first result of `name`, or with `mutated` the values of its input

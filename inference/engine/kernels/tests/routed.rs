@@ -1,6 +1,8 @@
 //! Routed (mixture-of-experts) entries: the portable bodies define the
 //! contract; native implementations are checked against them.
 
+mod common;
+
 use magnitude_kernels::{
     SlotTable, constants, list_extent, routed_combine, routed_convert, routed_copy, routed_down, routed_expand,
     routed_experts, routed_gate_up, routed_group, routed_list_grid, routed_move, routed_output, routed_pass_map, routed_route,
@@ -9,7 +11,7 @@ use magnitude_kernels::{
     routed_tier_wait, routed_up,
 };
 use seismic_lang::{
-    checked::{CheckedModule, SourceFile, check_source},
+    checked::{CheckedModule, SourceFile},
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OracleOutcome, OutcomeValue, TensorData},
@@ -41,7 +43,7 @@ fn module() -> CheckedModule {
         path: "functions.seismic".into(),
         text: include_str!("../kernels/functions.seismic").into(),
     });
-    check_source(sources).unwrap()
+    crate::common::check(sources)
 }
 
 enum Input {
@@ -6098,7 +6100,7 @@ fn the_tier_wait_is_encoded_only_while_an_expert_can_be_absent() {
     ] {
         sources.push(SourceFile { path: path.into(), text: text.into() });
     }
-    let module = check_source(sources).unwrap();
+    let module = crate::common::check(sources);
     let entry = module.entry_named("routed_tier_wait").unwrap();
     let resolved = seismic_lang::checked::LaunchCondition {
         word: "policy".into(),

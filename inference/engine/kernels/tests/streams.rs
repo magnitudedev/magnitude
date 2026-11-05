@@ -4,9 +4,11 @@
 //! launches, at a small geometry and at Qwen3.8 Flash Next's (H 2560, four
 //! streams, rank 320).
 
+mod common;
+
 use magnitude_kernels::{repeat_rows, stream_mix_down, stream_mix_up};
 use seismic_lang::{
-    checked::{CheckedModule, SourceFile, check_source},
+    checked::{CheckedModule, SourceFile},
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OracleOutcome, OutcomeValue, TensorData},
@@ -21,7 +23,7 @@ fn module() -> CheckedModule {
         path: "streams.seismic".into(),
         text: include_str!("../kernels/streams.seismic").into(),
     });
-    check_source(sources).unwrap()
+    crate::common::check(sources)
 }
 
 enum Input {

@@ -22,7 +22,7 @@ pub use seismic_compiler::feedback::{
 pub use seismic_lang::checked::{
     Encoded as LaunchEncoding, NativeComparison, NativeCondition, NativeImplementation,
     NativeLaunch, NativeNatExpr, NativeParameter, NativeScratch, NativeSpecialization,
-    NativeSpecializationError,
+    NativeSpecializationError, DeviceBound, OnDevice,
 };
 pub use seismic_lang::precision::{Limit, PrecisionPolicy, SpecialPolicy, Tolerance};
 pub use seismic_native_cpu::repack::ScaledCodeRows;
@@ -2815,6 +2815,7 @@ mod metadata_scratch_tests {
             arithmetic: false,
             form: false,
             values: vec![1, 4],
+            default: seismic_lang::checked::NativeDefault::Value(NativeNatExpr::Constant(1)),
             role: NativeParameterRole::Declared,
         };
         let scratch = NativeScratch {
@@ -2934,6 +2935,12 @@ impl<E: Entry> BoundEntry<E> {
         statics: &NativeSpecialization,
     ) -> Result<Option<NativeSpecialization>, CheckedBundleError> {
         generated::native_default_specialization::<E>(device, statics, &self.elements)
+    }
+
+    /// The entry's native implementation as `device` offers it at this
+    /// entry's elements ([`generated::native_offered`]).
+    pub fn offered(&self, device: &Device) -> Result<Option<OnDevice>, CheckedBundleError> {
+        generated::native_offered::<E>(device, &self.elements)
     }
 
     /// Validate a stored choice for this entry's actual element bindings.
@@ -3310,8 +3317,8 @@ impl NativeGraphMetadata {
                 })?;
             statics = statics.with_static(name.clone(), value);
         }
-        match implementation.default_specialization(&statics) {
-            Ok(_) => {}
+        match implementation.admits(&statics) {
+            Ok(()) => {}
             Err(NativeSpecializationError::Inadmissible) => {
                 return Err(NativeGraphMetadataError::Inadmissible(
                     KernelDomainViolation {
@@ -5102,11 +5109,34 @@ pub mod generated {
         Ok(NativeTensorResultsCheck::Checked(parameters))
     }
 
-    /// The checked native implementation of an entry for a device's backend.
+    /// The checked native implementation of an entry for a device's
+    /// backend, bound on the device as preparation binds it
+    /// (`seismic_runtime::native::on_device`): every `device.NAME` it reads
+    /// is the device's value, and on a CPU it holds Seismic's worker and
+    /// tier parameters.
     pub fn native_implementation<E: Entry>(
         device: &Device,
-    ) -> Result<Option<NativeImplementation>, CheckedBundleError> {
-        native_implementation_for_backend::<E>(device.backend())
+    ) -> Result<Option<OnDevice>, CheckedBundleError> {
+        Ok(native_implementation_for_backend::<E>(device.backend())?
+            .map(|implementation| seismic_runtime::native::on_device(device.inner(), implementation)))
+    }
+
+    /// The entry's native implementation at element bindings `elements` as
+    /// the opened device offers it (`seismic_runtime::native::offered`): the
+    /// declaration whose configurations preparation forms, its defaults the
+    /// ones preparation takes.
+    pub fn native_offered<E: Entry>(
+        device: &Device,
+        elements: &[(&str, Element)],
+    ) -> Result<Option<OnDevice>, CheckedBundleError> {
+        let module = E::module()?;
+        let entry = E::resolve(module)?;
+        Ok(seismic_runtime::native::offered(
+            device.inner(),
+            module.checked(),
+            entry.id(),
+            &element_bindings(elements),
+        ))
     }
 
     /// The entry's default specialization at `statics` as the opened device

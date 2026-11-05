@@ -13,7 +13,7 @@
 # paired projection. Streaming adds selection resolution and next-layer hints.
 native routed_route_shared for vulkan from "vulkan/routed_route_shared.comp":
     static (H, PT, NM, E, K, S, ES)
-    params (SIMDGROUPS in [8, 4, 2], ROWS in [1, 2, 4])
+    params (SIMDGROUPS in [8, 4, 2] default 8, ROWS in [1, 2, 4] default 1)
     where H % 32 == 0 and E <= 1024
     scratch logits bytes (M * (E + 1) * 4)
     launch routed_route_gemv:
@@ -39,7 +39,7 @@ native routed_route_shared for vulkan from "vulkan/routed_route_shared.comp":
 
 native routed_route_streamed for vulkan from "vulkan/routed_route_streamed.comp":
     static (H, PT, NM, E, K, S, ES, AHEAD, EN, TM)
-    params (SIMDGROUPS in [8, 4, 2], ROWS in [1, 2, 4])
+    params (SIMDGROUPS in [8, 4, 2] default 8, ROWS in [1, 2, 4] default 1)
     where H % 32 == 0 and E <= 1024 and EN <= 1024 and K <= E and (AHEAD == 0 or K <= EN)
     scratch logits bytes ((M * (E + 1) + AHEAD * M * (EN + 1)) * 4)
     launch routed_route_gemv:
@@ -99,7 +99,7 @@ native routed_route_streamed for vulkan from "vulkan/routed_route_streamed.comp"
 
 native routed_select_streamed for vulkan from "vulkan/routed_select_streamed.comp":
     static (H, E, K, ES, AHEAD, EN, TM)
-    params (SIMDGROUPS in [8, 4, 2])
+    params (SIMDGROUPS in [8, 4, 2] default 8)
     where H % 32 == 0 and E <= 1024 and EN <= 1024 and K <= E and (AHEAD == 0 or K <= EN)
     scratch logits bytes ((M * E + AHEAD * M * EN) * 4)
     launch routed_select_gemv:
@@ -234,7 +234,7 @@ native routed_site_request for vulkan from "vulkan/routed_site_request.comp":
 # (`lib/routed/down.glsl`), publishing each choice's projection.
 native routed_down_project for vulkan from "vulkan/routed_down_project.comp":
     static (H, K, F)
-    params (SIMDGROUPS in [2, 4, 8], ROWS in [1, 2, 4])
+    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1)
     records (expert_down, tier_down)
     launch routed_down_project:
         threadgroups (ceil_div(H, SIMDGROUPS * ROWS), M, 1)
@@ -254,7 +254,7 @@ native routed_down_sited for vulkan from "vulkan/routed_down_sited.comp":
 # publishing into the result.
 native routed_output_project for vulkan from "vulkan/routed_output_project.comp":
     static (H, K, F, S)
-    params (SIMDGROUPS in [2, 4, 8], ROWS in [1, 2, 4])
+    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1)
     records (expert_down, tier_down)
     launch routed_output_project:
         threadgroups (ceil_div(H, SIMDGROUPS * ROWS), M * (K + 1), 1)

@@ -3,12 +3,14 @@
 //! interpreter), and certified selections against the full planes readout.
 //! Tests return early when no device of either backend is available.
 
+mod common;
+
 use magnitude_kernels::{
     readout_exact_rows, readout_planes_rows, readout_refine_rows, readout_top_rows,
 };
 use seismic::{BackendName, Device, Element, NativeSpecialization, Tensor};
 use seismic_lang::{
-    checked::{CheckedModule, SourceFile, check_source},
+    checked::{CheckedModule, SourceFile},
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OracleOutcome, OutcomeValue, TensorData},
@@ -822,7 +824,7 @@ fn module() -> CheckedModule {
             text: text.into(),
         });
     }
-    check_source(sources).unwrap()
+    crate::common::check(sources)
 }
 
 enum Input {

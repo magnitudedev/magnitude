@@ -81,7 +81,7 @@ fn routed_route[M, H, PT, NM, E, K, ES](residual: &tensor[M, PT * H] f32, norm: 
 # threads; a separate selection launch.)
 native routed_route for metal from "metal/routed_route.metal":
     static (H, PT, NM, E, K, ES)
-    params (SIMDGROUPS in [8, 16, 4, 2])
+    params (SIMDGROUPS in [8, 16, 4, 2] default 8)
     where H % 32 == 0 and E <= 1024
     scratch logits bytes (M * (E + 1) * 4)
     scratch arrivals bytes (4) sync
@@ -107,7 +107,7 @@ native routed_route for metal from "metal/routed_route.metal":
 # matrices, unsplit.)
 native routed_route for cuda from "cuda/routed_route.cu":
     static (H, PT, NM, E, K, ES)
-    params (SIMDGROUPS in [8, 4, 2], arithmetic SPLIT in [8, 4, 16])
+    params (SIMDGROUPS in [8, 4, 2] default 8, arithmetic SPLIT in [8, 4, 16] default 8)
     where H % 32 == 0 and E <= 1024
     scratch logits bytes (SPLIT * M * (E + 1) * 4)
     scratch arrivals bytes (4) sync
@@ -131,7 +131,7 @@ native routed_route for cuda from "cuda/routed_route.cu":
 # GEMM; selection with one subgroup per row. SIMDGROUPS never changes bits.
 native routed_route for vulkan from "vulkan/routed_route.comp":
     static (H, PT, NM, E, K, ES)
-    params (SIMDGROUPS in [8, 4, 2])
+    params (SIMDGROUPS in [8, 4, 2] default 8)
     where H % 32 == 0 and E <= 1024
     scratch logits bytes (M * (E + 1) * 4)
     launch routed_route_stage when M > DECODE_ROWS:
@@ -155,7 +155,7 @@ native routed_route for vulkan from "vulkan/routed_route.comp":
 # probabilities, then a sort of its E experts). ROWS never changes result
 # bits.
 native routed_route for cpu from "cpu/routed_route.rs":
-    params (ROWS in [8, 4, 2, 1])
+    params (ROWS in [8, 4, 2, 1] default 8)
     scratch normalized bytes (M * H * 4)
     scratch logits bytes (M * E * 4)
     launch routed_route_normalize:
@@ -202,7 +202,7 @@ fn routed_route_shared[M, H, PT, NM, E, K, S, ES](residual: &tensor[M, PT * H] f
 # `shared_product` carries `routed_expand`'s bits.
 native routed_route_shared for metal from "metal/routed_route_shared.metal":
     static (H, PT, NM, E, K, S, ES)
-    params (SIMDGROUPS in [8, 16, 4, 2], ROWS in [1, 2, 4], arithmetic LANES in [32, 16])
+    params (SIMDGROUPS in [8, 16, 4, 2] default 8, ROWS in [1, 2, 4] default 1, arithmetic LANES in [32, 16] default 32)
     where H % 32 == 0 and E <= 1024
     scratch logits bytes (M * (E + 1) * 4)
     scratch arrivals bytes (4) sync
@@ -225,7 +225,7 @@ native routed_route_shared for metal from "metal/routed_route_shared.metal":
 # `routed_expand`'s, so the decode form keeps their bits at their defaults.
 native routed_route_shared for cuda from "cuda/routed_route_shared.cu":
     static (H, PT, NM, E, K, S, ES)
-    params (SIMDGROUPS in [8, 4, 2], TPW in [1, 2], arithmetic KSPLIT in [1, 2, 4])
+    params (SIMDGROUPS in [8, 4, 2] default 8, TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1)
     where H % 64 == 0 and E <= 1024 and SIMDGROUPS % KSPLIT == 0
     scratch logits bytes (M * (E + 1) * 4)
     scratch arrivals bytes (4) sync
@@ -298,7 +298,7 @@ native routed_expand for metal from "metal/routed_expand.metal":
     static (H, K, F, S, GS, US)
     records (expert_gate, expert_up)
     launch routed_expand:
-        params (SIMDGROUPS in [2, 4, 8, 16], code ROWS in [1, 2, 4], code arithmetic LANES in [32, 16])
+        params (SIMDGROUPS in [2, 4, 8, 16] default 2, ROWS in [1, 2, 4] default 1, arithmetic LANES in [32, 16] default 32)
         threadgroups (ceil_div(max(F, S), SIMDGROUPS * ROWS * 32 / LANES), M * K + 1, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
@@ -312,7 +312,7 @@ native routed_expand for metal from "metal/routed_expand.metal":
 # in either. (Metal: the rows16 GEMV.)
 native routed_expand for cuda from "cuda/routed_expand.cu":
     static (H, K, F, S, GS, US)
-    params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
+    params (TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1)
     scratch operands bytes (M * H * 2) when operands(EGW) + operands(SGW) > 0
     launch routed_expand_stage when operands(EGW) + operands(SGW) > 0:
         threadgroups (M, 1, 1)
@@ -330,7 +330,7 @@ native routed_expand for cuda from "cuda/routed_expand.cu":
 # per activation-row bound of the shared expert's GEMV (see `dense_expand`).
 native routed_expand for vulkan from "vulkan/routed_expand.comp":
     static (H, K, F, S, GS, US)
-    params (SIMDGROUPS in [2, 4, 8], ROWS in [1, 2, 4])
+    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1)
     records (expert_gate, expert_up)
     let GEMV_GROUPS = ceil_div(max(F, S), SIMDGROUPS * ROWS)
     let GEMV_GROUPS_Y = M * K + 1
@@ -357,7 +357,7 @@ native routed_expand for vulkan from "vulkan/routed_expand.comp":
 # features of choice y < M * K, or of the shared expert (y = M * K) for
 # every row.
 native routed_expand for cpu from "cpu/routed_expand.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where (INT8 == 0 or form(EGW, INT8) == 1 or form(EUW, INT8) == 1 or form(SGW, INT8) == 1 or form(SUW, INT8) == 1)
     scratch quantized bytes (M * ceil_div(H, Q8_VALUES) * Q8_BYTES)
     scratch staged bytes (M * H * 4)
@@ -439,7 +439,7 @@ native routed_output for metal from "metal/routed_output.metal":
     records (expert_down, tier_down)
     where K < 32 and ceil_div(max(F, S), 32 * LANES) * ROWS <= 8
     launch routed_output:
-        params (code ROWS in [2, 1, 4, 8], code arithmetic LANES in [16, 32])
+        params (ROWS in [2, 1, 4, 8] default 2, arithmetic LANES in [16, 32] default 16)
         threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
         threads_per_threadgroup (32 * (K + 1), 1, 1)
 
@@ -453,7 +453,7 @@ native routed_output for metal from "metal/routed_output.metal":
 # in place, over the link.
 native routed_output for cuda from "cuda/routed_output.cu":
     static (H, SN, IN, K, F, S)
-    params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
+    params (TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1)
     scratch published bytes (M * (K + 1) * H * 2)
     scratch arrivals bytes (ceil_div(H, 16) * 4) sync
     scratch expert_operands bytes (M * K * F * 2) when operands(EDW) == 1
@@ -476,7 +476,7 @@ native routed_output for cuda from "cuda/routed_output.cu":
 # in place, over the link.
 native routed_output for vulkan from "vulkan/routed_output.comp":
     static (H, SN, IN, K, F, S)
-    params (SIMDGROUPS in [2, 4, 8], ROWS in [1, 2, 4])
+    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1)
     records (expert_down, tier_down)
     scratch projected bytes (M * (K + 1) * H * 2)
     launch routed_output_project:
@@ -490,7 +490,7 @@ native routed_output for vulkan from "vulkan/routed_output.comp":
 # CPU: the products staged once as F32; work item (x, m) owns ROWS output
 # channels of row m and carries their running sum across the choices.
 native routed_output for cpu from "cpu/routed_output.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where (INT8 == 0 or form(EDW, INT8) == 1 or form(SDW, INT8) == 1)
     scratch expert_q8 bytes (M * K * ceil_div(F, Q8_VALUES) * Q8_BYTES)
     scratch shared_q8 bytes (M * ceil_div(S, Q8_VALUES) * Q8_BYTES)
@@ -588,7 +588,7 @@ native routed_group for cuda from "cuda/routed_group.cu":
 # chunk's choices in global memory, PARTS slices per expert.
 native routed_group for vulkan from "vulkan/routed_group.comp":
     static (E, K)
-    params (PARTS in [1, 2, 4])
+    params (PARTS in [1, 2, 4] default 1)
     where E * PARTS <= 1024
     scratch partials bytes (ceil_div(M * K, GROUP_CHOICES) * E * 4)
     launch routed_group_count:
@@ -684,7 +684,7 @@ fn routed_experts[M, H, E, F, B, T, GS, US, X, QS, R](first: &tensor[1] i32, row
 # mma.sync tiles, 3 cp.async stages.)
 native routed_experts for metal from "metal/routed_experts.metal":
     static (H, F, GS, US)
-    params (TILE_M in [32, 64], TILE_N in [128, 64])
+    params (TILE_M in [32, 64] default 32, TILE_N in [128, 64] default 128)
     records (expert_gate, expert_up, expert_down, records_gate, records_up, records_down)
     scratch staged bytes (M * H * 2) when operands(EGW) + operands(EUW) > 0
     scratch product bytes (B * T * F * 2)
@@ -716,7 +716,7 @@ native routed_experts for metal from "metal/routed_experts.metal":
 # simdgroup-matrix tiles.)
 native routed_experts for cuda from "cuda/routed_experts.cu":
     static (H, F, GS, US)
-    params (code arithmetic OPERAND in [0, 1])
+    params (arithmetic OPERAND in [0, 1] default 0)
     scratch staged bytes (M * H * 2) when OPERAND == 1 or operands(EGW) + operands(EUW) > 0
     scratch product bytes (B * T * F * 2)
     scratch stage_grid bytes (12)
@@ -754,7 +754,7 @@ native routed_experts for cuda from "cuda/routed_experts.cu":
 # normalized rows' operands, the quantize launch the products' in place).
 native routed_experts for vulkan from "vulkan/routed_experts.comp":
     static (H, F, GS, US)
-    params (TILE_M in [32, 64], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
+    params (TILE_M in [32, 64] default 32, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
     records (expert_gate, expert_up, expert_down, records_gate, records_up, records_down)
     where SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch staged bytes (M * H * 2) when operands(EGW) + operands(EUW) > 0
@@ -791,7 +791,7 @@ native routed_experts for vulkan from "vulkan/routed_experts.comp":
 # features (then ROWS output channels) of block b across its live rows, with
 # the products as F32 in scratch.
 native routed_experts for cpu from "cpu/routed_experts.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where (INT8 == 0 or form(EGW, INT8) == 1 or form(EUW, INT8) == 1 or form(EDW, INT8) == 1)
     scratch quantized bytes (M * ceil_div(H, Q8_VALUES) * Q8_BYTES)
     scratch product_q8 bytes (B * T * ceil_div(F, Q8_VALUES) * Q8_BYTES)
@@ -872,7 +872,7 @@ fn routed_combine[M, H, SN, IN, K, B, T, S](residual: &tensor[M, SN * H] f32,
 # GEMM's epilogue unpermutes, 2 launches.)
 native routed_combine for metal from "metal/routed_combine.metal":
     static (H, SN, IN, K, S)
-    params (TILE_M in [64, 128, 32], TILE_N in [64, 128])
+    params (TILE_M in [64, 128, 32] default 64, TILE_N in [64, 128] default 64)
     scratch shared_product bytes (M * S * 2)
     scratch shared_output bytes (M * H * 2)
     launch routed_combine_shared:
@@ -889,7 +889,7 @@ native routed_combine for metal from "metal/routed_combine.metal":
 # unpermutes the grouped expert outputs (2 launches). (Metal: 3 launches.)
 native routed_combine for cuda from "cuda/routed_combine.cu":
     static (H, SN, IN, K, S)
-    params (code arithmetic OPERAND in [0, 1])
+    params (arithmetic OPERAND in [0, 1] default 0)
     scratch staged bytes (M * H * 2) when OPERAND == 1
     scratch shared_product bytes (M * S * 2)
     launch routed_combine_stage when OPERAND == 1:
@@ -911,7 +911,7 @@ native routed_combine for cuda from "cuda/routed_combine.cu":
 # down GEMM, then the unpermuting combine.
 native routed_combine for vulkan from "vulkan/routed_combine.comp":
     static (H, SN, IN, K, S)
-    params (TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
+    params (TILE_M in [128, 64, 32] default 128, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
     where SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch shared_product bytes (M * S * 2)
     scratch shared_output bytes (M * H * 2)
@@ -931,7 +931,7 @@ native routed_combine for vulkan from "vulkan/routed_combine.comp":
 # item against every row (F32 products in scratch); then ROWS output channels
 # per work item: the shared down projection and the unpermuting combine.
 native routed_combine for cpu from "cpu/routed_combine.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where (INT8 == 0 or form(SGW, INT8) == 1 or form(SUW, INT8) == 1 or form(SDW, INT8) == 1)
     scratch quantized bytes (M * ceil_div(H, Q8_VALUES) * Q8_BYTES)
     scratch shared_q8 bytes (M * ceil_div(S, Q8_VALUES) * Q8_BYTES)
@@ -1025,7 +1025,7 @@ fn routed_select[M, H, E, K, ES](residual: &tensor[M, H] f32, norm: &tensor[H] N
 # `routed_route`'s tiles (`metal/lib/routed/logits.h`).
 native routed_select for metal from "metal/routed_select.metal":
     static (H, E, K, ES)
-    params (SIMDGROUPS in [8, 16, 4, 2])
+    params (SIMDGROUPS in [8, 16, 4, 2] default 8)
     where H % 32 == 0 and E <= 1024 and K <= E
     scratch logits bytes (M * E * 4)
     scratch router_rows bytes (M * H * 4) when M > DECODE_ROWS
@@ -1049,7 +1049,7 @@ native routed_select for metal from "metal/routed_select.metal":
 # (SPLIT is arithmetic).
 native routed_select for cuda from "cuda/routed_select.cu":
     static (H, E, K, ES)
-    params (SIMDGROUPS in [8, 4, 2], arithmetic SPLIT in [8, 4, 16])
+    params (SIMDGROUPS in [8, 4, 2] default 8, arithmetic SPLIT in [8, 4, 16] default 8)
     where H % 32 == 0 and E <= 1024 and K <= E
     scratch logits bytes (SPLIT * M * E * 4)
     scratch router_rows bytes (M * H * 4) when M > DECODE_ROWS
@@ -1068,7 +1068,7 @@ native routed_select for cuda from "cuda/routed_select.cu":
 
 native routed_select for vulkan from "vulkan/routed_select.comp":
     static (H, E, K, ES)
-    params (SIMDGROUPS in [8, 4, 2])
+    params (SIMDGROUPS in [8, 4, 2] default 8)
     where H % 32 == 0 and E <= 1024 and K <= E
     scratch logits bytes (M * E * 4)
     scratch router_rows bytes (M * H * 4) when M > DECODE_ROWS
@@ -1092,7 +1092,7 @@ native routed_select for vulkan from "vulkan/routed_select.comp":
 # router rows per work item against every row; one row's selection per work
 # item (a sort of its E experts).
 native routed_select for cpu from "cpu/routed_select.rs":
-    params (ROWS in [8, 4, 2, 1])
+    params (ROWS in [8, 4, 2, 1] default 8)
     scratch router_rows bytes (M * H * 4)
     scratch logits bytes (M * E * 4)
     launch routed_select_normalize:
@@ -1368,14 +1368,14 @@ native routed_gate_up for metal from "metal/routed_gate_up.metal":
     static (H, K, F, GS, US)
     records (expert_gate, expert_up, tier_gate, tier_up)
     launch routed_gate_up:
-        params (SIMDGROUPS in [2, 4, 8, 16], code ROWS in [1, 2, 4], code arithmetic LANES in [32, 16])
+        params (SIMDGROUPS in [2, 4, 8, 16] default 2, ROWS in [1, 2, 4] default 1, arithmetic LANES in [32, 16] default 32)
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), M * K, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (min(ceil_div(H, 32), 448) * 64)
 
 native routed_gate_up for cuda from "cuda/routed_gate_up.cu":
     static (H, K, F, GS, US)
-    params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4], form GATHERED in [0, 1])
+    params (TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1, form GATHERED in [0, 1] default 0)
     where H % 64 == 0
     scratch operands bytes (M * H * 2) when GATHERED == 1 and operands(EGW) == 1
     launch routed_gate_up when GATHERED == 0:
@@ -1393,7 +1393,7 @@ native routed_gate_up for cuda from "cuda/routed_gate_up.cu":
 
 native routed_gate_up for vulkan from "vulkan/routed_gate_up.comp":
     static (H, K, F, GS, US)
-    params (SIMDGROUPS in [2, 4, 8], ROWS in [1, 2, 4], form GATHERED in [0, 1])
+    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1, form GATHERED in [0, 1] default 0)
     records (expert_gate, expert_up, tier_gate, tier_up)
     scratch gathered bytes (M * K * (1 + 2 * DECODE_ROWS) * 4) when GATHERED == 1
     launch routed_gate_up when GATHERED == 0:
@@ -1421,7 +1421,7 @@ native routed_gate_up for vulkan from "vulkan/routed_gate_up.comp":
         shared_bytes (256 + 32 * operands(EGW) + min(8 * ceil_div(H, 32), 288) * 72)
 
 native routed_gate_up for cpu from "cpu/routed_gate_up.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where (INT8 == 0 or form(EGW, INT8) == 1 or form(EUW, INT8) == 1)
     scratch quantized bytes (M * ceil_div(H, Q8_VALUES) * Q8_BYTES)
     scratch staged bytes (M * H * 4)
@@ -1436,14 +1436,14 @@ native routed_up for metal from "metal/routed_up.metal":
     static (H, K, F, US)
     records (expert_up, tier_up)
     launch routed_up:
-        params (SIMDGROUPS in [2, 4, 8, 16], code ROWS in [1, 2, 4], code arithmetic LANES in [32, 16])
+        params (SIMDGROUPS in [2, 4, 8, 16] default 2, ROWS in [1, 2, 4] default 1, arithmetic LANES in [32, 16] default 32)
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), M * K, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (min(ceil_div(H, 32), 448) * 64)
 
 native routed_up for cuda from "cuda/routed_up.cu":
     static (H, K, F, US)
-    params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4], form GATHERED in [0, 1])
+    params (TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1, form GATHERED in [0, 1] default 0)
     where H % 64 == 0
     scratch operands bytes (M * H * 2) when GATHERED == 1 and operands(EUW) == 1
     launch routed_up when GATHERED == 0:
@@ -1461,7 +1461,7 @@ native routed_up for cuda from "cuda/routed_up.cu":
 
 native routed_up for vulkan from "vulkan/routed_up.comp":
     static (H, K, F, US)
-    params (SIMDGROUPS in [2, 4, 8], ROWS in [1, 2, 4], form GATHERED in [0, 1])
+    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1, form GATHERED in [0, 1] default 0)
     records (expert_up, tier_up)
     scratch gathered bytes (M * K * (1 + 2 * DECODE_ROWS) * 4) when GATHERED == 1
     launch routed_up when GATHERED == 0:
@@ -1489,7 +1489,7 @@ native routed_up for vulkan from "vulkan/routed_up.comp":
         shared_bytes (256 + 32 * operands(EUW) + min(8 * ceil_div(H, 32), 288) * 72)
 
 native routed_up for cpu from "cpu/routed_up.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where (INT8 == 0 or form(EUW, INT8) == 1)
     scratch quantized bytes (M * ceil_div(H, Q8_VALUES) * Q8_BYTES)
     scratch staged bytes (M * H * 4)
@@ -1508,7 +1508,7 @@ native routed_up for cpu from "cpu/routed_up.rs":
 # registers.)
 native routed_down for metal from "metal/routed_down.metal":
     static (H, K, F)
-    params (code ROWS in [2, 1, 4, 8], code arithmetic LANES in [16, 32])
+    params (ROWS in [2, 1, 4, 8] default 2, arithmetic LANES in [16, 32] default 16)
     records (expert_down, tier_down)
     where K <= 32 and ceil_div(F, 32 * LANES) * ROWS <= 8
     launch routed_down when XS > 0:
@@ -1518,12 +1518,12 @@ native routed_down for metal from "metal/routed_down.metal":
     # PLAIN, of one value, scopes the launches' parameters, so each launch
     # forms its own source: the whole one with plain record loads.
     launch routed_down_whole when XS > 0:
-        params (code PLAIN in [1])
+        params (PLAIN in [1] default 1)
         threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
         if (policy[POLICY_WHOLE])
         threads_per_threadgroup (32 * K, 1, 1)
     launch routed_down_whole when XS == 0:
-        params (code PLAIN in [1])
+        params (PLAIN in [1] default 1)
         threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
         threads_per_threadgroup (32 * K, 1, 1)
 
@@ -1531,7 +1531,7 @@ native routed_down for metal from "metal/routed_down.metal":
 # `projected`, then the slot-order combine, which adds the sum to the base.
 native routed_down for cuda from "cuda/routed_down.cu":
     static (H, K, F)
-    params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
+    params (TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1)
     where F % 64 == 0
     scratch projected bytes (M * K * H * 2)
     scratch operands bytes (M * K * F * 2) when M > 1 and operands(EDW) == 1
@@ -1556,7 +1556,7 @@ native routed_down for cuda from "cuda/routed_down.cu":
 # tier record in place, over the link.
 native routed_down for vulkan from "vulkan/routed_down.comp":
     static (H, K, F)
-    params (SIMDGROUPS in [2, 4, 8], ROWS in [1, 2, 4])
+    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1)
     records (expert_down, tier_down)
     launch routed_down:
         threadgroups (ceil_div(H, SIMDGROUPS * ROWS), M, 1)
@@ -1566,7 +1566,7 @@ native routed_down for vulkan from "vulkan/routed_down.comp":
 # CPU: work item (x, m) owns ROWS output channels of row m: the choices'
 # weighted projections in slot order.
 native routed_down for cpu from "cpu/routed_down.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where (INT8 == 0 or form(EDW, INT8) == 1)
     scratch quantized bytes (M * K * ceil_div(F, Q8_VALUES) * Q8_BYTES)
     scratch staged bytes (M * K * F * 4)
@@ -1582,7 +1582,7 @@ native routed_down for cpu from "cpu/routed_down.rs":
 # mma.sync tiles; Vulkan the Metal form; CPU ROWS features per work item).
 native routed_experts_up for metal from "metal/routed_experts_up.metal":
     static (H, F, US)
-    params (TILE_M in [32, 64], TILE_N in [128, 64])
+    params (TILE_M in [32, 64] default 32, TILE_N in [128, 64] default 128)
     records (expert_up, expert_down, records_up, records_down)
     scratch staged bytes (M * H * 2) when operands(EUW) == 1
     scratch product bytes (B * T * F * 2)
@@ -1612,7 +1612,7 @@ native routed_experts_up for metal from "metal/routed_experts_up.metal":
 
 native routed_experts_up for cuda from "cuda/routed_experts_up.cu":
     static (H, F, US)
-    params (code arithmetic OPERAND in [0, 1])
+    params (arithmetic OPERAND in [0, 1] default 0)
     where H % 64 == 0 and F % 64 == 0
     scratch staged bytes (M * H * 2) when OPERAND == 1 or operands(EUW) == 1
     scratch product bytes (B * T * F * 2)
@@ -1648,7 +1648,7 @@ native routed_experts_up for cuda from "cuda/routed_experts_up.cu":
 
 native routed_experts_up for vulkan from "vulkan/routed_experts_up.comp":
     static (H, F, US)
-    params (TILE_M in [32, 64], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
+    params (TILE_M in [32, 64] default 32, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
     records (expert_up, expert_down, records_up, records_down)
     where SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch staged bytes (M * H * 2) when operands(EUW) == 1
@@ -1682,7 +1682,7 @@ native routed_experts_up for vulkan from "vulkan/routed_experts_up.comp":
         shared_bytes ((TILE_M + TILE_N) * 80)
 
 native routed_experts_up for cpu from "cpu/routed_experts_up.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1] default 8, arithmetic form INT8 in [0, 1] default 0)
     where (INT8 == 0 or form(EUW, INT8) == 1 or form(EDW, INT8) == 1)
     scratch quantized bytes (M * ceil_div(H, Q8_VALUES) * Q8_BYTES)
     scratch product_q8 bytes (B * T * ceil_div(F, Q8_VALUES) * Q8_BYTES)

@@ -9,6 +9,7 @@
 // indexer rounding to the activation would order differently selects the
 // F32 reference's blocks.
 
+mod common;
 mod versions_common;
 
 use magnitude_kernels::indexer_select;
@@ -385,7 +386,7 @@ struct Outcome {
 
 fn portable(case: &Case) -> Outcome {
     use seismic_lang::{
-        checked::{SourceFile, check_source},
+        checked::{SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -402,7 +403,7 @@ fn portable(case: &Case) -> Outcome {
     ] {
         sources.push(SourceFile { path: path.into(), text: text.into() });
     }
-    let module = check_source(sources).unwrap();
+    let module = crate::common::check(sources);
     let logical = module
         .entry(
             module.entry_named("indexer_select").unwrap(),

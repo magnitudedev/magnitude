@@ -4,6 +4,8 @@
 //! shapes, and against a host reference over the row classes M in {1, 2, 3,
 //! 8, 16, 64, 128}, across weight representations and mapping parameters.
 
+mod common;
+
 use magnitude_kernels::{
     attention_output, attention_project, dense_expand, dense_output, dense_up, embedding_rows,
     gated_delta_project, packing_bound, project_rows, readout_features_rows, readout_head_rows,
@@ -11,7 +13,7 @@ use magnitude_kernels::{
 };
 use seismic::{BackendName, Device, Element, NativeSpecialization, Tensor};
 use seismic_lang::{
-    checked::{CheckedModule, SourceFile, check_source},
+    checked::{CheckedModule, SourceFile},
     entry::ElementBindings,
     failure::SourceTermination,
     ids::RepresentationId,
@@ -1399,7 +1401,7 @@ fn module() -> CheckedModule {
             text: text.into(),
         });
     }
-    check_source(sources).unwrap()
+    crate::common::check(sources)
 }
 
 enum Input {
@@ -3439,8 +3441,8 @@ fn dense_up_gguf_formats_match_their_portable_body() {
             for device in devices() {
                 // The declaration at the weight's binding, whose `where`
                 // reads its forms.
-                let implementation = seismic::generated::native_implementation_at::<dense_up::Entry>(
-                    device.backend(),
+                let implementation = seismic::generated::native_offered::<dense_up::Entry>(
+                    &device,
                     &[("NW", Element::bf16()), ("UW", repr.resident(&device)), ("A", act.element())],
                 )
                 .unwrap()

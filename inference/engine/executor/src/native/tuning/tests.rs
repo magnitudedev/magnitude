@@ -840,21 +840,20 @@ struct FakeCase {
 
 /// `dense_output`'s implementation on `device` over dense BF16 rows: its
 /// CPU `where` reads the weight's form (`form(DW, INT8)`).
-fn dense_output_implementation(device: &seismic::Device) -> NativeImplementation {
-    seismic::generated::native_implementation_at::<dense_output::Entry>(
-        device.backend(),
+fn dense_output_implementation(device: &seismic::Device) -> seismic::OnDevice {
+    seismic::generated::native_offered::<dense_output::Entry>(
+        device,
         &[("A", Element::bf16()), ("DW", Element::bf16())],
     )
     .unwrap()
     .unwrap()
-    .clone()
 }
 
 impl FakeCase {
     /// A case choosing the defaults with `ROWS` 2 (admissible, not the
     /// default).
     fn new(
-        implementation: &NativeImplementation,
+        implementation: &seismic::OnDevice,
         statics: &NativeSpecialization,
         digest: &str,
     ) -> Self {
@@ -3635,8 +3634,11 @@ fn stored_cpu_fallback_matches_the_device_default() {
     assert_ne!(stored, declared);
     let case = super::readout::ShapeRowsTuning { vocabulary: 1024 };
     assert_eq!(
-        case.device_default(&device, &NativeSpecialization::new()),
-        Some(stored)
+        offered(&case, &device)
+            .unwrap()
+            .default_specialization(&NativeSpecialization::new())
+            .unwrap(),
+        stored
     );
 }
 
@@ -3670,7 +3672,9 @@ fn cpu_projection_default_form_follows_the_tier_integer_dots() {
         )],
     };
     let int8 = |case: &DenseOutputTuning| {
-        case.device_default(&device, &statics)
+        offered(case, &device)
+            .unwrap()
+            .default_specialization(&statics)
             .unwrap()
             .param("INT8")
             .unwrap()

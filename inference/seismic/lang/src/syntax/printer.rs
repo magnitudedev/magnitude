@@ -154,6 +154,12 @@ impl Printer {
                         self.indent();
                         self.native_params(&launch.params);
                     }
+                    if let Some(constraint) = &launch.constraint {
+                        self.indent();
+                        self.out.push_str("where ");
+                        self.expr(constraint, 0);
+                        self.out.push('\n');
+                    }
                     if !launch.reads.is_empty() {
                         self.indent();
                         self.out.push_str("reads (");
@@ -205,9 +211,6 @@ impl Printer {
     fn native_params(&mut self, params: &[NativeParamDecl]) {
         self.out.push_str("params (");
         self.list(params, |p, param| {
-            if param.code {
-                p.out.push_str("code ");
-            }
             if param.arithmetic {
                 p.out.push_str("arithmetic ");
             }
@@ -220,7 +223,18 @@ impl Printer {
                 .map(u64::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
-            let _ = write!(p.out, "{} in [{values}]", param.name.name);
+            let _ = write!(p.out, "{} in [{values}] default ", param.name.name);
+            match &param.default {
+                NativeDefaultDecl::Value(value) => p.expr(value, 0),
+                NativeDefaultDecl::Least(condition) => {
+                    p.out.push_str("least where ");
+                    p.expr(condition, 0);
+                }
+                NativeDefaultDecl::Greatest(condition) => {
+                    p.out.push_str("greatest where ");
+                    p.expr(condition, 0);
+                }
+            }
         });
         self.out.push_str(")\n");
     }

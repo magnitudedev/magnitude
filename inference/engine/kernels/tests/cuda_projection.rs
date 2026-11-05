@@ -4,6 +4,8 @@
 //! portable body by the reference interpreter. Tests return early without a
 //! CUDA device.
 
+mod common;
+
 use magnitude_kernels::{
     dense_expand, dense_output, embedding_rows, readout_features_rows, readout_head_rows,
     readout_project_rows, readout_selected_rows, sample_rows, shape_rows,
@@ -996,7 +998,7 @@ fn features_and_selected_rows_match_host_model(format: Format) {
 /// interpreter over the same mma16 bytes agrees with it.
 fn dense_expand_host_model_matches_portable_body(format: Format) {
     use seismic_lang::{
-        checked::{check_source, SourceFile},
+        checked::{SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -1016,7 +1018,7 @@ fn dense_expand_host_model_matches_portable_body(format: Format) {
         path: "functions.seismic".into(),
         text: include_str!("../kernels/functions.seismic").into(),
     });
-    let module = check_source(sources).unwrap();
+    let module = crate::common::check(sources);
     let gate = weight(&device, format, f, h, &mut rng);
     let up = weight(&device, format, f, h, &mut rng);
     let case = DenseCase::new(o, h, f, &mut rng);

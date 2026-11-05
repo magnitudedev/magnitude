@@ -27,7 +27,7 @@
 //! installed.
 
 use super::{PinnedChoice, TuningKey};
-use seismic::{NativeImplementation, NativeSpecialization};
+use seismic::{NativeSpecialization, OnDevice};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -116,7 +116,7 @@ pub(super) enum Pinned {
 
 pub(super) fn lookup(
     key: &TuningKey,
-    implementation: &NativeImplementation,
+    implementation: &OnDevice,
 ) -> Result<Pinned, String> {
     #[cfg(test)]
     if THREAD_DEFAULTS.get() {
@@ -154,7 +154,7 @@ pub(super) fn defaults_on_this_thread() -> impl Drop {
 fn decide(
     installed: &Installed,
     key: &TuningKey,
-    implementation: &NativeImplementation,
+    implementation: &OnDevice,
 ) -> Result<Pinned, String> {
     let (entry, bindings, fixed) = key;
     // The unit's statics and the parameters its call site fixes, which
@@ -322,7 +322,7 @@ pub(super) fn record(key: &TuningKey, chosen: &NativeSpecialization) {
 mod tests {
     use super::super::FixedValues;
     use super::*;
-    use seismic::BackendName;
+    use seismic::{BackendName, NativeImplementation};
 
     /// A unit's key of `statics` and the parameters its call site fixes.
     fn key(entry: &'static str, statics: &[(&str, u64)], params: &[(&str, u64)]) -> TuningKey {
@@ -372,6 +372,10 @@ mod tests {
             Ok(Pinned::Chosen(_, choice)) => format!("{choice:?}"),
         };
         let check = |implementation: NativeImplementation, key: TuningKey, (name, value): (&str, u64), other: u64| {
+            let implementation = implementation
+                .device_independent()
+                .expect("the declaration reads no device property")
+                .owned();
             let defaults = Installed::of(TuningPin::Defaults);
             let decided = decide(&defaults, &key, &implementation);
             let Ok(Pinned::Chosen(chosen, PinnedChoice::Defaults)) = decided else {

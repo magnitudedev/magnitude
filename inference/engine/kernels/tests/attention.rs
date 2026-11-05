@@ -3,6 +3,8 @@
 // model of that body (Qwen3.5-4B geometry, long contexts), on the local GPU
 // (Metal, or Vulkan elsewhere) and the CPU.
 
+mod common;
+
 use magnitude_kernels::{attention_append_dense, attention_decode, attention_prefill};
 use seismic::{
     BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor,
@@ -512,7 +514,7 @@ fn check(
 /// reach.
 fn check_host_model_against_portable_body(entry: &str, case: &Case) {
     use seismic_lang::{
-        checked::{SourceFile, check_source},
+        checked::{SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -529,7 +531,7 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
         path: "functions.seismic".into(),
         text: include_str!("../kernels/functions.seismic").into(),
     });
-    let module = check_source(sources).unwrap();
+    let module = crate::common::check(sources);
     let logical = module
         .entry(
             module.entry_named(entry).unwrap(),

@@ -12,6 +12,7 @@
 // - a selection that names no row and a row without a slot read zeros,
 //   whatever the slots hold, and a row beside one reads its own values.
 
+mod common;
 mod versions_common;
 
 use magnitude_kernels::{embedding_rows, stored_rows};
@@ -153,7 +154,7 @@ fn stored_rows_portable(
     resident: &str,
 ) -> Vec<f32> {
     use seismic_lang::{
-        checked::{SourceFile, check_source},
+        checked::{SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -165,7 +166,7 @@ fn stored_rows_portable(
         path: "target.seismic".into(),
         text: include_str!("../kernels/target.seismic").into(),
     });
-    let module = check_source(sources).unwrap();
+    let module = crate::common::check(sources);
     let elements = ElementBindings::new()
         .bind("E", registry::representation(resident).unwrap())
         .bind("A", registry::dense(DType::BF16));

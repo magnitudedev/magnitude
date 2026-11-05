@@ -1044,7 +1044,7 @@ mod tests {
         //! whole at the router, the policy words of the lines), the CPU's
         //! experts are exactly the function's.
         use super::super::*;
-        use seismic_lang::checked::{CheckedModule, SourceFile, check_source};
+        use seismic_lang::checked::{CheckedModule, SourceFile};
         use seismic_lang::entry::ElementBindings;
         use seismic_lang::failure::SourceTermination;
         use seismic_lang::interp::{Arg, Interpreter, TensorData};
@@ -1059,7 +1059,7 @@ mod tests {
             ] {
                 sources.push(SourceFile { path: path.into(), text: text.into() });
             }
-            check_source(sources).unwrap()
+            crate::test_support::check_kernels(sources)
         }
 
         /// The sources `assign` leaves of `routes` (`M` rows of `K`)

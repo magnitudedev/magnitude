@@ -7,25 +7,25 @@ fn accumulate[N](state: &mut tensor[N] f32, x: &tensor[N] f32):
         state[i] = state[i] + x[i]
 
 native accumulate for metal from "metal/accumulate.metal":
-    params (BIAS in [0, 1], WIDTH in [32, 64])
+    params (BIAS in [0, 1] default 0, WIDTH in [32, 64] default 32)
     launch accumulate:
         threadgroups (ceil_div(N, WIDTH), 1, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
 
 native accumulate for cuda from "cuda/accumulate.cu":
-    params (BIAS in [0, 1], WIDTH in [32, 64])
+    params (BIAS in [0, 1] default 0, WIDTH in [32, 64] default 32)
     launch accumulate:
         threadgroups (ceil_div(N, WIDTH), 1, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
 
 native accumulate for vulkan from "vulkan/accumulate.comp":
-    params (BIAS in [0, 1], WIDTH in [32, 64])
+    params (BIAS in [0, 1] default 0, WIDTH in [32, 64] default 32)
     launch accumulate:
         threadgroups (ceil_div(N, WIDTH), 1, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
 
 native accumulate for cpu from "cpu/accumulate.rs":
-    params (BIAS in [0, 1], WIDTH in [32, 64])
+    params (BIAS in [0, 1] default 0, WIDTH in [32, 64] default 32)
     launch accumulate:
         threadgroups (1, 1, 1)
         threads_per_threadgroup (1, 1, 1)
@@ -38,25 +38,25 @@ fn classed_accumulate[N](state: &mut tensor[N] f32, x: &tensor[N] f32):
         state[i] = state[i] + x[i]
 
 native classed_accumulate for metal from "metal/accumulate.metal":
-    params (BIAS in [0, 1], WIDTH in [32, 64])
+    params (BIAS in [0, 1] default 0, WIDTH in [32, 64] default 32)
     launch accumulate:
         threadgroups (ceil_div(N, WIDTH), 1, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
 
 native classed_accumulate for cuda from "cuda/accumulate.cu":
-    params (BIAS in [0, 1], WIDTH in [32, 64])
+    params (BIAS in [0, 1] default 0, WIDTH in [32, 64] default 32)
     launch accumulate:
         threadgroups (ceil_div(N, WIDTH), 1, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
 
 native classed_accumulate for vulkan from "vulkan/accumulate.comp":
-    params (BIAS in [0, 1], WIDTH in [32, 64])
+    params (BIAS in [0, 1] default 0, WIDTH in [32, 64] default 32)
     launch accumulate:
         threadgroups (ceil_div(N, WIDTH), 1, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
 
 native classed_accumulate for cpu from "cpu/accumulate.rs":
-    params (BIAS in [0, 1], WIDTH in [32, 64])
+    params (BIAS in [0, 1] default 0, WIDTH in [32, 64] default 32)
     launch accumulate:
         threadgroups (1, 1, 1)
         threads_per_threadgroup (1, 1, 1)
@@ -71,11 +71,11 @@ fn scoped_scale[N](x: &tensor[N] f32) -> tensor[N] f32:
 
 native scoped_scale for metal from "metal/scoped_scale.metal":
     launch scoped_scale_small when N <= 16:
-        params (WIDTH in [32, 64], code ROWS in [1, 2])
+        params (WIDTH in [32, 64] default 32, ROWS in [1, 2] default 1)
         threadgroups (ceil_div(N, WIDTH * ROWS), 1, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
     launch scoped_scale_large when N > 16:
-        params (WIDTH in [64, 128], code ROWS in [4, 8])
+        params (WIDTH in [64, 128] default 64, ROWS in [4, 8] default 4)
         threadgroups (ceil_div(N, WIDTH * ROWS), 1, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
 
@@ -85,25 +85,25 @@ fn wrong_default[N](state: &mut tensor[N] f32, x: &tensor[N] f32):
         state[i] = state[i] + x[i]
 
 native wrong_default for metal from "metal/accumulate.metal":
-    params (BIAS in [1, 2, 0], WIDTH in [32])
+    params (BIAS in [1, 2, 0] default 1, WIDTH in [32] default 32)
     launch accumulate:
         threadgroups (ceil_div(N, WIDTH), 1, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
 
 native wrong_default for cuda from "cuda/accumulate.cu":
-    params (BIAS in [1, 2, 0], WIDTH in [32])
+    params (BIAS in [1, 2, 0] default 1, WIDTH in [32] default 32)
     launch accumulate:
         threadgroups (ceil_div(N, WIDTH), 1, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
 
 native wrong_default for vulkan from "vulkan/accumulate.comp":
-    params (BIAS in [1, 2, 0], WIDTH in [32])
+    params (BIAS in [1, 2, 0] default 1, WIDTH in [32] default 32)
     launch accumulate:
         threadgroups (ceil_div(N, WIDTH), 1, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
 
 native wrong_default for cpu from "cpu/accumulate.rs":
-    params (BIAS in [1, 2, 0], WIDTH in [32])
+    params (BIAS in [1, 2, 0] default 1, WIDTH in [32] default 32)
     launch accumulate:
         threadgroups (1, 1, 1)
         threads_per_threadgroup (1, 1, 1)
@@ -119,25 +119,25 @@ fn paced_wrong_default[N](state: &mut tensor[N] f32, x: &tensor[N] f32):
         state[i] = state[i] + x[i]
 
 native paced_wrong_default for metal from "metal/paced.metal":
-    params (PACE in [1, 2, 3, 4, 5, 0, 6])
+    params (PACE in [1, 2, 3, 4, 5, 0, 6] default 1)
     launch paced:
         threadgroups (ceil_div(N, 32), 1, 1)
         threads_per_threadgroup (32, 1, 1)
 
 native paced_wrong_default for cuda from "cuda/paced.cu":
-    params (PACE in [1, 2, 3, 4, 5, 0, 6])
+    params (PACE in [1, 2, 3, 4, 5, 0, 6] default 1)
     launch paced:
         threadgroups (ceil_div(N, 32), 1, 1)
         threads_per_threadgroup (32, 1, 1)
 
 native paced_wrong_default for vulkan from "vulkan/paced.comp":
-    params (PACE in [1, 2, 3, 4, 5, 0, 6])
+    params (PACE in [1, 2, 3, 4, 5, 0, 6] default 1)
     launch paced:
         threadgroups (ceil_div(N, 32), 1, 1)
         threads_per_threadgroup (32, 1, 1)
 
 native paced_wrong_default for cpu from "cpu/paced.rs":
-    params (PACE in [1, 2, 3, 4, 5, 0, 6])
+    params (PACE in [1, 2, 3, 4, 5, 0, 6] default 1)
     launch paced:
         threadgroups (1, 1, 1)
         threads_per_threadgroup (1, 1, 1)
@@ -150,11 +150,11 @@ fn scoped_wrong_default[N](x: &tensor[N] f32) -> tensor[N] f32:
 
 native scoped_wrong_default for metal from "metal/scoped_faulty.metal":
     launch scoped_scale_small when N <= 16:
-        params (WIDTH in [32, 64], code ROWS in [1, 2])
+        params (WIDTH in [32, 64] default 32, ROWS in [1, 2] default 1)
         threadgroups (ceil_div(N, WIDTH * ROWS), 1, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
     launch scoped_scale_large when N > 16:
-        params (WIDTH in [64, 128], code ROWS in [4, 8])
+        params (WIDTH in [64, 128] default 64, ROWS in [4, 8] default 4)
         threadgroups (ceil_div(N, WIDTH * ROWS), 1, 1)
         threads_per_threadgroup (WIDTH, 1, 1)
 
@@ -164,25 +164,25 @@ fn omitted_write[N](x: &tensor[N] f32) -> tensor[N] f32:
     return to_owned(x)
 
 native omitted_write for metal from "metal/omitted_write.metal":
-    params (WRITE in [1, 0])
+    params (WRITE in [1, 0] default 1)
     launch omitted_write:
         threadgroups (ceil_div(N, 32), 1, 1)
         threads_per_threadgroup (32, 1, 1)
 
 native omitted_write for cuda from "cuda/omitted_write.cu":
-    params (WRITE in [1, 0])
+    params (WRITE in [1, 0] default 1)
     launch omitted_write:
         threadgroups (ceil_div(N, 32), 1, 1)
         threads_per_threadgroup (32, 1, 1)
 
 native omitted_write for vulkan from "vulkan/omitted_write.comp":
-    params (WRITE in [1, 0])
+    params (WRITE in [1, 0] default 1)
     launch omitted_write:
         threadgroups (ceil_div(N, 32), 1, 1)
         threads_per_threadgroup (32, 1, 1)
 
 native omitted_write for cpu from "cpu/omitted_write.rs":
-    params (WRITE in [1, 0])
+    params (WRITE in [1, 0] default 1)
     launch omitted_write:
         threadgroups (1, 1, 1)
         threads_per_threadgroup (1, 1, 1)
@@ -195,25 +195,25 @@ fn stray_write[N](state: &mut tensor[N] f32, x: &tensor[N] f32):
         state[i] = x[i]
 
 native stray_write for metal from "metal/stray_write.metal":
-    params (STRAY in [0, 1])
+    params (STRAY in [0, 1] default 0)
     launch stray_write:
         threadgroups (ceil_div(N, 32), 1, 1)
         threads_per_threadgroup (32, 1, 1)
 
 native stray_write for cuda from "cuda/stray_write.cu":
-    params (STRAY in [0, 1])
+    params (STRAY in [0, 1] default 0)
     launch stray_write:
         threadgroups (ceil_div(N, 32), 1, 1)
         threads_per_threadgroup (32, 1, 1)
 
 native stray_write for vulkan from "vulkan/stray_write.comp":
-    params (STRAY in [0, 1])
+    params (STRAY in [0, 1] default 0)
     launch stray_write:
         threadgroups (ceil_div(N, 32), 1, 1)
         threads_per_threadgroup (32, 1, 1)
 
 native stray_write for cpu from "cpu/stray_write.rs":
-    params (STRAY in [0, 1])
+    params (STRAY in [0, 1] default 0)
     launch stray_write:
         threadgroups (1, 1, 1)
         threads_per_threadgroup (1, 1, 1)

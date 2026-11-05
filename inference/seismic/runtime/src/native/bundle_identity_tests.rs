@@ -96,7 +96,7 @@ fn specialization(native: &NativeImplementation) -> NativeSpecialization {
                     .wrapping_add(1442695040888963407);
                 statics.with_static(name.as_str(), VALUES[(state >> 33) as usize % VALUES.len()])
             });
-        if let Ok(specialization) = native.default_specialization(&statics) {
+        if let Ok(specialization) = native.device_independent().unwrap().default_specialization(&statics) {
             return specialization;
         }
     }

@@ -38,8 +38,8 @@ pub struct TuningSurvey {
     /// Entries to survey; every tuned entry when empty. The others are
     /// searched as usual.
     pub entries: Vec<String>,
-    /// Widened parameter domains by entry (each list keeps the declared
-    /// default first), to test the search on larger spaces.
+    /// Widened parameter domains by entry (each list keeps every declared
+    /// value), to test the search on larger spaces.
     pub domains: BTreeMap<String, BTreeMap<String, Vec<u64>>>,
 }
 

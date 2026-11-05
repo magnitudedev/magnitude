@@ -505,17 +505,14 @@ impl Parser {
         }
     }
 
-    /// `[code] [arithmetic] [form] NAME in [V, ..]`
+    /// `[arithmetic] [form] NAME in [V, ..] default DEFAULT`, the default
+    /// `EXPR`, `least where CONDITION` or `greatest where CONDITION`.
     fn native_param(&mut self) -> PResult<NativeParamDecl> {
         let begin = self.span();
-        let mut code = false;
         let mut arithmetic = false;
         let mut form = false;
         loop {
-            if self.at_word("code") && !code {
-                self.bump();
-                code = true;
-            } else if self.at_word("arithmetic") && !arithmetic {
+            if self.at_word("arithmetic") && !arithmetic {
                 self.bump();
                 arithmetic = true;
             } else if self.at_word("form") && !form {
@@ -539,12 +536,33 @@ impl Parser {
             ))),
         })?;
         self.expect_op(Op::RBracket)?;
+        if !self.at_word("default") {
+            return Err(self.error(format!(
+                "expected `default` after the values of `{}`: every native parameter states its default (`default EXPR`, `default least where CONDITION` or `default greatest where CONDITION`), found {}",
+                name.name,
+                self.peek().describe()
+            )));
+        }
+        self.bump();
+        let default = if self.at_word("least") || self.at_word("greatest") {
+            let least = self.at_word("least");
+            self.bump();
+            self.expect_kw(Kw::Where)?;
+            let condition = self.expr()?;
+            if least {
+                NativeDefaultDecl::Least(condition)
+            } else {
+                NativeDefaultDecl::Greatest(condition)
+            }
+        } else {
+            NativeDefaultDecl::Value(self.expr()?)
+        };
         Ok(NativeParamDecl {
             name,
-            code,
             arithmetic,
             form,
             values,
+            default,
             span: begin.to(self.prev_span()),
         })
     }
@@ -601,6 +619,11 @@ impl Parser {
             self.expect_op(Op::LParen)?;
             params = self.comma_list(Self::native_param)?;
             self.expect_op(Op::RParen)?;
+            self.expect_newline()?;
+        }
+        let mut constraint = None;
+        if self.eat_kw(Kw::Where) {
+            constraint = Some(self.expr()?);
             self.expect_newline()?;
         }
         let reads = if self.at_word("reads") {
@@ -665,6 +688,7 @@ impl Parser {
             kernel,
             when,
             params,
+            constraint,
             reads,
             threadgroups,
             grid,
@@ -1365,8 +1389,8 @@ mod tests {
             "const N = 1\n\nfn f(N: i32):\n    return\n",
             "const N = 1\n\nfn f():\n    let N = 2\n",
             "const N = 1\n\nfn f():\n    for N in 0..2:\n        return\n",
-            "const BLOCK = 64\n\nnative f for metal from \"f.metal\":\n    params (BLOCK in [32, 64])\n    launch f:\n        threadgroups (ceil_div(N, BLOCK), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
-            "const BLOCK = 64\n\nnative f for metal from \"f.metal\":\n    launch f:\n        params (BLOCK in [32, 64])\n        threadgroups (ceil_div(N, BLOCK), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+            "const BLOCK = 64\n\nnative f for metal from \"f.metal\":\n    params (BLOCK in [32, 64] default 32)\n    launch f:\n        threadgroups (ceil_div(N, BLOCK), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+            "const BLOCK = 64\n\nnative f for metal from \"f.metal\":\n    launch f:\n        params (BLOCK in [32, 64] default 32)\n        threadgroups (ceil_div(N, BLOCK), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
             "const BLOCK = 64\n\nnative f for metal from \"f.metal\":\n    scratch BLOCK bytes (4)\n    launch f:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         ] {
             assert!(parse(bound).unwrap_err().message.contains("module constant"), "{bound}");
@@ -1432,7 +1456,7 @@ mod tests {
     #[test]
     fn cpu_element_coverage_round_trips() {
         let file = round_trip(
-            "native copy for cpu from \"copy.rs\":\n    params (ROWS in [4, 1])\n    elements (A in [f32, u32], B in [bf16])\n    launch copy:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n",
+            "native copy for cpu from \"copy.rs\":\n    params (ROWS in [4, 1] default 4)\n    elements (A in [f32, u32], B in [bf16])\n    launch copy:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n",
         );
         let [Decl::Native(native)] = file.decls.as_slice() else {
             panic!("expected one native implementation")
@@ -1452,7 +1476,7 @@ mod tests {
     #[test]
     fn specialized_native_declarations_round_trip() {
         let file = round_trip(
-            "native scale for cuda from \"scale.cu\":\n    static (N)\n    params (arithmetic form PARTS in [1, 2, 4], WIDTH in [64, 128])\n    where PARTS * WIDTH <= N and WIDTH >= 64\n    scratch partials bytes (PARTS * N * 4)\n    launch scale_partial:\n        threadgroups (ceil_div(N, WIDTH), PARTS, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n        shared_bytes (max(WIDTH * 4, 256))\n    launch scale_merge:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (min(N, 256), 1, 1)\n",
+            "native scale for cuda from \"scale.cu\":\n    static (N)\n    params (arithmetic form PARTS in [1, 2, 4] default 1, WIDTH in [64, 128] default 64)\n    where PARTS * WIDTH <= N and WIDTH >= 64\n    scratch partials bytes (PARTS * N * 4)\n    launch scale_partial:\n        threadgroups (ceil_div(N, WIDTH), PARTS, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n        shared_bytes (max(WIDTH * 4, 256))\n    launch scale_merge:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (min(N, 256), 1, 1)\n",
         );
         let [Decl::Native(native)] = file.decls.as_slice() else {
             panic!("expected one native implementation")
@@ -1479,16 +1503,36 @@ mod tests {
     #[test]
     fn launch_parameters_round_trip_with_reused_names() {
         let file = round_trip(
-            "native project for metal from \"project.metal\":\n    params (BATCH_FROM in [5, 3])\n    launch gemv when O < BATCH_FROM:\n        params (SIMDGROUPS in [16, 8], code arithmetic form ROWS in [1, 2])\n        threadgroups (ceil_div(H, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch batch when O >= BATCH_FROM:\n        params (SIMDGROUPS in [8, 4])\n        threadgroups (ceil_div(H, SIMDGROUPS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n",
+            "native project for metal from \"project.metal\":\n    params (BATCH_FROM in [5, 3] default 5)\n    launch gemv when O < BATCH_FROM:\n        params (SIMDGROUPS in [16, 8] default 16, arithmetic form ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(H, SIMDGROUPS * ROWS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n    launch batch when O >= BATCH_FROM:\n        params (SIMDGROUPS in [8, 4] default 8)\n        threadgroups (ceil_div(H, SIMDGROUPS), 1, 1)\n        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)\n",
         );
         let [Decl::Native(native)] = file.decls.as_slice() else {
             panic!("expected one native implementation")
         };
         assert_eq!(native.launches[0].params[0].name.name, "SIMDGROUPS");
-        assert!(native.launches[0].params[1].code);
+        assert!(matches!(
+            native.launches[0].params[1].default,
+            NativeDefaultDecl::Value(Expr { kind: ExprKind::Int(1), .. })
+        ));
         assert!(native.launches[0].params[1].arithmetic);
         assert!(native.launches[0].params[1].form);
         assert_eq!(native.launches[1].params[0].name.name, "SIMDGROUPS");
+    }
+
+    #[test]
+    fn device_defaults_and_launch_conditions_round_trip() {
+        let file = round_trip(
+            "native project for cuda from \"project.cu\":\n    static (KV)\n    params (PARTS in [12, 24, 48] default least where KV * PARTS >= device.units)\n    launch gemv:\n        params (WARPS in [1, 2, 4] default greatest where WARPS * 32 <= device.subgroup_width, MATRIX in [0, 1] default device.matrix)\n        where MATRIX == 0 or device.matrix\n        threadgroups (KV, PARTS, 1)\n        threads_per_threadgroup (WARPS * 32, 1, 1)\n",
+        );
+        let [Decl::Native(native)] = file.decls.as_slice() else {
+            panic!("expected one native implementation")
+        };
+        assert!(matches!(native.params[0].default, NativeDefaultDecl::Least(_)));
+        assert!(matches!(native.launches[0].params[0].default, NativeDefaultDecl::Greatest(_)));
+        assert!(matches!(
+            native.launches[0].params[1].default,
+            NativeDefaultDecl::Value(Expr { kind: ExprKind::Attr { .. }, .. })
+        ));
+        assert!(native.launches[0].constraint.is_some());
     }
 
     #[test]
@@ -1573,7 +1617,7 @@ mod tests {
     #[test]
     fn launch_kernel_reads_round_trip() {
         let file = round_trip(
-            "native project for cuda from \"project.cu\":\n    params (code arithmetic INT8 in [0, 1])\n    launch project:\n        reads (INT8)\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n",
+            "native project for cuda from \"project.cu\":\n    params (arithmetic INT8 in [0, 1] default 0)\n    launch project:\n        reads (INT8)\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n",
         );
         let [Decl::Native(native)] = file.decls.as_slice() else {
             panic!("expected one native implementation")
@@ -1584,7 +1628,7 @@ mod tests {
     #[test]
     fn conditional_native_launches_and_scratch_round_trip() {
         let file = round_trip(
-            "native rows for metal from \"rows.metal\":\n    params (SPLIT in [1, 2])\n    where SPLIT == 1 or (SPLIT > 1 and SPLIT < 4)\n    scratch normalized bytes (O * H * 2) when O > 8\n    scratch partials bytes (SPLIT * O * 4) when (SPLIT > 1 or O >= 9) and O != 0\n    launch rows_normalize when O > 8:\n        threadgroups (O, 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n    launch rows_gemv when O <= 2 or (INT8 == 1 and O <= 8):\n        threadgroups (ceil_div(F, 8), 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n        shared_bytes (O * 72)\n    launch rows_merge:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n",
+            "native rows for metal from \"rows.metal\":\n    params (SPLIT in [1, 2] default 1)\n    where SPLIT == 1 or (SPLIT > 1 and SPLIT < 4)\n    scratch normalized bytes (O * H * 2) when O > 8\n    scratch partials bytes (SPLIT * O * 4) when (SPLIT > 1 or O >= 9) and O != 0\n    launch rows_normalize when O > 8:\n        threadgroups (O, 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n    launch rows_gemv when O <= 2 or (INT8 == 1 and O <= 8):\n        threadgroups (ceil_div(F, 8), 1, 1)\n        threads_per_threadgroup (128, 1, 1)\n        shared_bytes (O * 72)\n    launch rows_merge:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n",
         );
         let [Decl::Native(native)] = file.decls.as_slice() else {
             panic!("expected one native implementation")
@@ -1630,7 +1674,7 @@ mod tests {
     #[test]
     fn native_terms_round_trip() {
         let file = round_trip(
-            "native rows for metal from \"rows.metal\":\n    params (SPLIT in [1, 2])\n    let PARTS = max(1, SPLIT * O)\n    let SPARE = (8 - PARTS) * O\n    where PARTS <= 8\n    scratch partials bytes (PARTS * 4)\n    launch rows:\n        threadgroups (ceil_div(SPARE, 4), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+            "native rows for metal from \"rows.metal\":\n    params (SPLIT in [1, 2] default 1)\n    let PARTS = max(1, SPLIT * O)\n    let SPARE = (8 - PARTS) * O\n    where PARTS <= 8\n    scratch partials bytes (PARTS * 4)\n    launch rows:\n        threadgroups (ceil_div(SPARE, 4), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         );
         let [Decl::Native(native)] = file.decls.as_slice() else {
             panic!("expected one native implementation")

@@ -2483,7 +2483,18 @@ fn configurations(
 ) -> Vec<Vec<(String, u64)>> {
     let params = &parameters(native);
     let total = params.iter().map(|p| p.values.len()).product::<usize>();
-    let default = params.iter().map(|p| p.values[0]).collect::<Vec<_>>();
+    // Each parameter's declared default at the statics, in `parameters`' order.
+    let dimension = |name: &str| {
+        statics
+            .iter()
+            .find(|(static_name, _)| *static_name == name)
+            .map(|(_, value)| *value)
+    };
+    let default = native
+        .device_independent()
+        .expect("a golden declaration's defaults read no device property")
+        .parameter_defaults(&dimension)
+        .expect("a declared default has a listed value at the case's statics");
     let mut chosen: Vec<Vec<u64>> = Vec::new();
     let push = |config: Vec<u64>, chosen: &mut Vec<Vec<u64>>| {
         if !chosen.contains(&config) {
@@ -2520,7 +2531,7 @@ fn configurations(
     } else {
         push(default.clone(), &mut chosen);
         for (i, parameter) in params.iter().enumerate() {
-            for value in &parameter.values[1..] {
+            for value in parameter.values.iter().filter(|value| **value != default[i]) {
                 let mut config = default.clone();
                 config[i] = *value;
                 push(config, &mut chosen);

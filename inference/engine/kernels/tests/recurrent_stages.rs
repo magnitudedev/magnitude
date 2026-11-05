@@ -9,6 +9,8 @@
 // slot's successor changes: accepted banks, the zero seed, and unrelated
 // banks keep their exact bytes.
 
+mod common;
+
 use magnitude_kernels::{gated_delta_chunk, gated_delta_step};
 use seismic::{
     BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor,
@@ -534,7 +536,7 @@ impl Case {
     /// The portable body executed by the Seismic interpreter.
     fn oracle(&self) -> Outcome {
         use seismic_lang::{
-            checked::{SourceFile, check_source},
+            checked::{SourceFile},
             entry::ElementBindings,
             failure::SourceTermination,
             interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -551,7 +553,7 @@ impl Case {
             path: "functions.seismic".into(),
             text: include_str!("../kernels/functions.seismic").into(),
         });
-        let module = check_source(sources).unwrap();
+        let module = crate::common::check(sources);
         let elements = ElementBindings::new()
             .bind("A", registry::dense(DType::F32))
             .bind("RN", registry::dense(DType::F32));
