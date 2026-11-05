@@ -264,7 +264,9 @@ impl PartialOrd for Waiter {
 }
 
 /// A request as it is stored: its executor, what it asks for and who waits
-/// on it.
+/// on it. Its form is its build's own: a load asks its own build's job, so
+/// the schema is the engine build, and a request another build stored in a
+/// shared kernel cache lies apart, never read here.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Stored {
     executor: Identity,
@@ -273,7 +275,7 @@ struct Stored {
 }
 
 impl seismic::measure::Stored for Stored {
-    const SCHEMA: &'static str = "point-request.2";
+    const SCHEMA: &'static str = concat!("point-request.", env!("MAGNITUDE_ENGINE_BUILD"));
 }
 
 /// The most bytes a stored request is written as: an executor's identity

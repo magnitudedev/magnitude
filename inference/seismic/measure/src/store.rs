@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 /// any value, is a broken store. A change to how the type serializes takes a
 /// new schema.
 pub trait Stored: Serialize + DeserializeOwned {
-    /// The schema's name, which names a directory: letters, digits, `-`
-    /// and `.` only.
+    /// The schema's name, which names a directory: letters, digits, `-`,
+    /// `.` and `+` only.
     const SCHEMA: &'static str;
 }
 
@@ -52,7 +52,7 @@ impl JsonFileStore {
     /// The directory values of `V` lie in.
     fn schema<V: Stored>(&self) -> PathBuf {
         assert!(
-            V::SCHEMA.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.')
+            V::SCHEMA.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'+'))
                 && !V::SCHEMA.starts_with('.'),
             "a stored schema names a directory: {:?}",
             V::SCHEMA
