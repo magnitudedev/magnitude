@@ -6,7 +6,7 @@
 //! as a waiting writer would: it tries to take the device and waits for a release to try again,
 //! so a job deferred by a resident model runs once the device is free. A share wanted while a job
 //! holds the device preempts the job: its owner kills it at once, so a load waits only for that
-//! bounded kill.
+//! kill's process to be shown gone.
 //!
 //! The measurement job alone may also run beside a resident model while that model is idle (no
 //! request holds it), in the model's idle time: residency publishes the idle model
@@ -270,7 +270,7 @@ impl DeviceLock {
     }
 
     /// Share the device, preempting a job that holds it: the job's owner kills it and releases
-    /// the device after its bounded exit wait, so this waits no longer than that.
+    /// the device once its process is shown gone, so this waits for that.
     pub async fn share(&self) -> DeviceShare {
         if let Some(share) = self.try_share() {
             return share;
@@ -324,8 +324,7 @@ impl DeviceLock {
 
     /// Return once no measurement runs beside the resident model: a request holding a lease on
     /// it, which ended its idleness and so preempted such a measurement, is served only then,
-    /// once the measurement's process is gone, which its owner waits for no longer than its
-    /// bounded exit wait.
+    /// once the measurement's process is shown gone, which its owner waits for.
     pub async fn admit_request(&self) {
         // The sender lives as long as this lock.
         let _ = self.sharing.subscribe().wait_for(|sharing| sharing.job.is_none()).await;

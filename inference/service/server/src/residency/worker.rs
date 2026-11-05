@@ -73,8 +73,8 @@ fn log_exit(pid: u32, status: ExitStatus) {
 enum ProcessState {
     Owned {
         process: BlockingProcess,
-        /// Held, never read: dropping it with the owner releases the device.
-        _device: DeviceHold,
+        /// Dropping it with the owner releases the device; a stop marks it unretired ([`stop`]).
+        device: DeviceHold,
     },
     Retired(ExitStatus),
 }
@@ -142,7 +142,7 @@ impl EngineWorker {
         let worker = Arc::new(Self {
             process: Mutex::new(Some(ProcessState::Owned {
                 process,
-                _device: device,
+                device,
             })),
             client: OnceLock::new(),
             diagnostics: Arc::new(Mutex::new(DiagnosticTail::default())),
@@ -196,10 +196,10 @@ impl EngineWorker {
         let state = state.as_mut().expect(STANDS);
         match &mut *state {
             ProcessState::Retired(status) => Ok(*status),
-            ProcessState::Owned { process, .. } => {
+            ProcessState::Owned { process, device } => {
                 // An error leaves the exact owner in place. Only proof of retirement replaces it.
                 let pid = process_id(process);
-                let status = stop(process)?;
+                let status = stop(process, || device.unretired())?;
                 log_exit(pid, status);
                 *state = ProcessState::Retired(status);
                 Ok(status)
@@ -287,7 +287,7 @@ impl JobWorker {
             diagnostics: Arc::new(Mutex::new(DiagnosticTail::default())),
         };
         if let Err(error) = drain_diagnostics(stderr, Arc::clone(&worker.diagnostics), pid) {
-            worker.retire(false).map_err(|(_, error)| error)?;
+            worker.retire(false, || {}).map_err(|(_, error)| error)?;
             return Err(error.into());
         }
         let transport = FramedTransport::new(std::io::BufReader::new(stdout), stdin);
@@ -308,15 +308,16 @@ impl JobWorker {
 
     /// Return once the process is proven gone. One that `reported` its outcome is left to exit
     /// on its own ([`reported_exit`]); any other, or one that has not exited by then, is
-    /// stopped. Blocking. One whose end the system will not show comes back with why, still
-    /// holding all it holds ([`RETIREMENT_RETRY`]).
-    pub fn retire(mut self, reported: bool) -> Result<ExitStatus, (Self, std::io::Error)> {
+    /// stopped, calling `unretired` once its kill is delivered and the system does not yet show
+    /// it gone ([`stop`]). Blocking. One whose end the system will not show comes back with why,
+    /// still holding all it holds ([`RETIREMENT_RETRY`]).
+    pub fn retire(mut self, reported: bool, unretired: impl FnOnce()) -> Result<ExitStatus, (Self, std::io::Error)> {
         let pid = process_id(&self.process);
         let exited = match reported {
             true => reported_exit(|| observe_exit(&mut self.process)),
             false => Ok(None),
         };
-        let status = match exited.and_then(|exited| exited.map_or_else(|| stop(&mut self.process), Ok)) {
+        let status = match exited.and_then(|exited| exited.map_or_else(|| stop(&mut self.process, unretired), Ok)) {
             Ok(status) => status,
             Err(error) => return Err((self, error)),
         };
@@ -392,7 +393,7 @@ impl Drop for EngineWorker {
     fn drop(&mut self) {
         // The dropped worker's state is read no more: what it held moves to its reaper.
         let state = self.process.get_mut().expect("worker process lock").take().expect(STANDS);
-        let ProcessState::Owned { mut process, _device: device } = state else {
+        let ProcessState::Owned { mut process, device } = state else {
             return;
         };
         let pid = process_id(&process);
@@ -400,7 +401,7 @@ impl Drop for EngineWorker {
             .name(format!("inference-worker-reap-{pid}"))
             .spawn(move || {
                 let status = loop {
-                    match stop(&mut process) {
+                    match stop(&mut process, || device.unretired()) {
                         Ok(status) => break status,
                         Err(error) => {
                             tracing::error!(worker.pid = pid, %error, "an ownerless inference worker could not be shown to have ended; trying again");
@@ -505,7 +506,7 @@ fn reported_exit(
 /// for a kill the system refused to send, or an exit it refused to report. Such a worker keeps
 /// everything it holds, its device among it, is reported, and is tried again until its end is
 /// shown, by its owner: a stop retries a resident's ([`super::ReleaseOperation`]'s retirement
-/// failure), the measurement job's owner retries its job's before any other job, and a dropped
+/// failure), the measurement job's owner retries its job's before taking its end, and a dropped
 /// worker's own thread retries it.
 pub(crate) const RETIREMENT_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -530,16 +531,30 @@ fn start_kill(process: &mut BlockingProcess) -> std::io::Result<()> {
     process.start_kill()
 }
 
+/// Stop `process` and return once it is reaped, however long that takes. Once its kill is
+/// delivered, one look that does not show it gone calls `unretired`: its owner gives way no
+/// longer (`DeviceJob::unretired`), so a reap that hangs without an error spares nothing
+/// beyond that look.
 #[cfg(unix)]
-fn stop(process: &mut BlockingProcess) -> std::io::Result<ExitStatus> {
-    if process.try_wait()?.is_none() {
-        process.kill()?;
+fn stop(process: &mut BlockingProcess, unretired: impl FnOnce()) -> std::io::Result<ExitStatus> {
+    if let Some(status) = process.try_wait()? {
+        return Ok(status);
     }
+    process.kill()?;
+    if let Some(status) = process.try_wait()? {
+        return Ok(status);
+    }
+    unretired();
     process.wait()
 }
 
 #[cfg(windows)]
-fn stop(process: &mut BlockingProcess) -> std::io::Result<ExitStatus> {
+fn stop(process: &mut BlockingProcess, unretired: impl FnOnce()) -> std::io::Result<ExitStatus> {
+    process.start_kill()?;
+    if let Some(status) = process.try_retirement()? {
+        return Ok(status);
+    }
+    unretired();
     process.retire()
 }
 
@@ -595,7 +610,7 @@ mod tests {
         let worker = EngineWorker {
             process: Mutex::new(Some(ProcessState::Owned {
                 process,
-                _device: DeviceHold::Share(Arc::new(device.try_share().unwrap())),
+                device: DeviceHold::Share(Arc::new(device.try_share().unwrap())),
             })),
             client: OnceLock::new(),
             diagnostics: Arc::new(Mutex::new(DiagnosticTail::default())),
