@@ -812,6 +812,14 @@ pub enum StoredCosts {
     Missing(PointKey),
 }
 
+impl StoredCosts {
+    /// Whether the walk has a point no record holds: the job has points of
+    /// it left to measure.
+    pub fn outstanding(&self) -> bool {
+        matches!(self, Self::Missing(_) | Self::Complete { pending: true, .. })
+    }
+}
+
 /// What a measurement job did ([`super::requests::measure`]).
 #[derive(Debug)]
 pub struct Measurement {

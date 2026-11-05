@@ -649,16 +649,15 @@ pub fn streamed_estimate(
     Ok(Performance::Estimated(estimates))
 }
 
-/// `executor`'s costs as the kernel cache at `kernels` stores them, which a
-/// streamed load's measures price on: pending until the job stores the
-/// probe, unavailable where they cannot be derived.
-pub fn stored_costs(
-    topology: &DeviceTopology,
-    executor: &seismic::Executor,
-    kernels: &Path,
+/// The executor's costs as a walk of the stored records found them
+/// (`ExecutorCosts::stored`), which a streamed load's measures price on:
+/// pending until the job stores the probe, unavailable where they cannot
+/// be derived.
+pub fn priced_costs(
+    walked: Result<StoredCosts, magnitude_executor::assessment::ExecutorCostsError>,
 ) -> magnitude_executor::assessment::Priced<ExecutorCosts> {
     use magnitude_executor::assessment::Priced;
-    match ExecutorCosts::stored(topology, executor, &KernelCache::measurement_records(kernels)) {
+    match walked {
         Ok(StoredCosts::Complete { costs, .. }) => Priced::Measured(costs),
         Ok(StoredCosts::Missing(point)) => Priced::Pending(format!("the executor's costs are not measured yet ({point:?})")),
         Err(error) => Priced::Unavailable(error.to_string()),
@@ -667,7 +666,7 @@ pub fn stored_costs(
 
 /// The resident decode launch of a number of rows (a row a sequence) at a
 /// depth of `definition` planned as `resident` (its plan before any weight
-/// cap), on the executor's `costs` ([`stored_costs`]): what a streamed
+/// cap), on the executor's `costs` ([`priced_costs`]): what a streamed
 /// load's bank growth is priced on, as [`streamed_estimate`] prices `σ`.
 /// Why there is none: the decode's demand cannot be derived.
 pub fn resident_step(

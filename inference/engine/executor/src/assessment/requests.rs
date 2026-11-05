@@ -9,10 +9,11 @@
 //!   as it is next read ([`PointRequests::outstanding`]).
 //! - **Who waits** ([`Waiter`]): a load serving with a decision pending on a
 //!   request touches it when it loads and each time it prices again, so the
-//!   load that touched last (the resident one) is measured for first; then
-//!   assessment's standing request for the executor's costs
-//!   ([`PointRequest::Costs`]), which is never absent: every estimate waits
-//!   on it.
+//!   load that touched last (the resident one) is measured for first, its
+//!   requests in the order it lists them; then assessment's standing
+//!   request for the executor's costs ([`PointRequest::Costs`]) where no
+//!   load requested them, which is never absent: every estimate waits on
+//!   it.
 //! - **The job** ([`measure`]) measures the outstanding requests in that
 //!   order within its time, each point sampling for an equal part of what
 //!   is left, and stops where its time ends: the next job resumes from the
@@ -38,7 +39,9 @@ pub enum PointRequest {
     /// are stored the site serves nothing.
     Site(SiteRequest),
     /// The executor's whole cost walk (`ExecutorCosts`): assessment's
-    /// standing request, every estimate's input.
+    /// standing request, every estimate's input, and a streamed load's
+    /// request after host storage's routes, as its lines, pass and resident
+    /// step read it.
     Costs,
     /// The probe and host storage's routes of the walk: a host tier's link
     /// line (`ExpertPass::lines`).
@@ -68,7 +71,7 @@ impl PointRequest {
     /// probe recorded unobtainable, a point recorded so, a store that cannot
     /// be read) has none: the job's measuring ends there as the derivation
     /// does.
-    fn outstanding(&self, topology: &DeviceTopology, executor: &Executor, store: &dyn RecordStore<PointKey>) -> bool {
+    pub fn outstanding(&self, topology: &DeviceTopology, executor: &Executor, store: &dyn RecordStore<PointKey>) -> bool {
         match self {
             Self::Costs => walk_outstanding(topology, executor, store, Scope::Whole),
             Self::HostRoutes => walk_outstanding(topology, executor, store, Scope::HostRoutes),
@@ -192,7 +195,7 @@ impl SiteRequest {
     /// Whether the job has anything of the site left to run: its verdict,
     /// or an admitted site's lines. A refused site, or a store that cannot
     /// be read, has none.
-    pub fn outstanding(&self, topology: &DeviceTopology, executor: &Executor, store: &dyn RecordStore<PointKey>) -> bool {
+    fn outstanding(&self, topology: &DeviceTopology, executor: &Executor, store: &dyn RecordStore<PointKey>) -> bool {
         match self.verdict(topology, executor, store) {
             Priced::Pending(_) => true,
             Priced::Measured(()) => matches!(self.costs(topology, executor, store), Ok(None)),
@@ -224,24 +227,38 @@ impl SiteRequest {
 
 /// Whether the walk of `scope` has a point no record holds.
 fn walk_outstanding(topology: &DeviceTopology, executor: &Executor, store: &dyn RecordStore<PointKey>, scope: Scope) -> bool {
-    matches!(
-        retraced(topology, executor, store, scope),
-        Ok(StoredCosts::Missing(_) | StoredCosts::Complete { pending: true, .. })
-    )
+    retraced(topology, executor, store, scope).is_ok_and(|stored| stored.outstanding())
 }
 
 /// Who waits on a stored request: a load, as of the latest time it touched
-/// the request, in nanoseconds since the Unix epoch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// the request (nanoseconds since the Unix epoch), and the request's place
+/// among those it touched together (`rank`, 0 first): the job measures the
+/// latest waiter first, and of one touch, in its order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Waiter {
     pub touched: u64,
+    pub rank: u64,
 }
 
 impl Waiter {
-    /// A load waiting now.
-    pub fn now() -> Self {
+    /// A load waiting now, on its request of place `rank` in its touch.
+    pub fn now(rank: u64) -> Self {
         let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("the clock is past the Unix epoch");
-        Self { touched: u64::try_from(since.as_nanos()).expect("nanoseconds since the Unix epoch fit in u64") }
+        Self { touched: u64::try_from(since.as_nanos()).expect("nanoseconds since the Unix epoch fit in u64"), rank }
+    }
+}
+
+/// A waiter is ahead of (greater than) another touched earlier, or touched
+/// at once at a later place.
+impl Ord for Waiter {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.touched.cmp(&other.touched).then(other.rank.cmp(&self.rank))
+    }
+}
+
+impl PartialOrd for Waiter {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -255,7 +272,7 @@ struct Stored {
 }
 
 impl seismic::measure::Stored for Stored {
-    const SCHEMA: &'static str = "point-request.1";
+    const SCHEMA: &'static str = "point-request.2";
 }
 
 /// The most bytes a stored request is written as: an executor's identity
@@ -383,16 +400,16 @@ mod tests {
         let recorded = seismic::fixtures::recorded::rtx3090();
         let other = recorded.executors().iter().find(|executor| executor.backend() == seismic::BackendName::Cuda).unwrap();
         let other_identity = recorded.executor_identity(other.id()).unwrap();
-        requests.request(&identity, PointRequest::HostRoutes, Waiter { touched: 5 }).unwrap();
-        requests.request(&identity, PointRequest::Costs, Waiter { touched: 7 }).unwrap();
-        requests.request(&other_identity, PointRequest::HostRoutes, Waiter { touched: 9 }).unwrap();
+        requests.request(&identity, PointRequest::HostRoutes, Waiter { touched: 5, rank: 0 }).unwrap();
+        requests.request(&identity, PointRequest::Costs, Waiter { touched: 7, rank: 0 }).unwrap();
+        requests.request(&other_identity, PointRequest::HostRoutes, Waiter { touched: 9, rank: 0 }).unwrap();
         let records = seismic::measure::HeldStore::default();
         let order = |requests: &PointRequests| requests.outstanding(&topology, &executor, &records).unwrap();
         assert_eq!(order(&requests), [PointRequest::Costs, PointRequest::HostRoutes]);
         // A later touch moves the host routes ahead; an earlier does not
         // move them back. Another reader sees the same.
-        requests.request(&identity, PointRequest::HostRoutes, Waiter { touched: 8 }).unwrap();
-        requests.request(&identity, PointRequest::HostRoutes, Waiter { touched: 1 }).unwrap();
+        requests.request(&identity, PointRequest::HostRoutes, Waiter { touched: 8, rank: 0 }).unwrap();
+        requests.request(&identity, PointRequest::HostRoutes, Waiter { touched: 1, rank: 0 }).unwrap();
         assert_eq!(order(&PointRequests::new(&root)), [PointRequest::HostRoutes, PointRequest::Costs]);
         std::fs::remove_dir_all(&root).unwrap();
     }

@@ -1030,8 +1030,8 @@ impl ExpertPricing {
 /// pricing after the measurement job stored more is priced on it.
 pub(crate) fn expert_measures(pricing: &ExpertPricing) -> magnitude_executor::ExpertMeasures {
     use magnitude_executor::assessment::{
-        BankLines, CeilingError, ConvertCosts, ExpertLines, ExpertPass, HostLines, MemoryCosts, MemoryError, MoveCosts, MoveError, PointRequest, PricingError, Priced,
-        StoredMisses, TierCopyCosts, TierCopyError,
+        BankLines, CeilingError, ConvertCosts, ExpertLines, ExpertPass, HostLines, MemoryCosts, MemoryError, MoveCosts, MoveError, PointRequest, PricingError,
+        Priced, StoredMisses, TierCopyCosts, TierCopyError,
     };
     use magnitude_executor::MissStoreError;
     let (device, bank) = (&pricing.device, &pricing.bank);
@@ -1070,7 +1070,11 @@ pub(crate) fn expert_measures(pricing: &ExpertPricing) -> magnitude_executor::Ex
             Ok(())
         }) as Box<magnitude_executor::MissStore>
     });
-    let costs = crate::assessment::stored_costs(topology, info, root);
+    // The executor's costs walked once: what the load prices on, and
+    // whether the job has points of them left, which its request asks.
+    let walked = magnitude_executor::assessment::ExecutorCosts::stored(topology, info, &records);
+    let costs_outstanding = walked.as_ref().is_ok_and(|walked| walked.outstanding());
+    let costs = crate::assessment::priced_costs(walked);
     let pass = costs.clone().derive(|costs| ExpertPass::of_bank(bank, costs));
     // A host tier's record read from host memory, at its memory line.
     let memory = match bank.tier_reservation() {
@@ -1133,18 +1137,14 @@ pub(crate) fn expert_measures(pricing: &ExpertPricing) -> magnitude_executor::Ex
             Err(error) => Priced::Unavailable(error.to_string()),
         },
     };
-    // The load waits now on the requests of its inputs still pending: the
-    // job measures them first.
+    // The load waits now on its requests the job has points of left to
+    // measure: the job measures them first.
     let waiting = pricing
         .requests
         .iter()
         .filter(|request| match request {
-            PointRequest::Moves(_) => matches!(moves, Priced::Pending(_)),
-            PointRequest::TierCopy => matches!(tier_copy, Priced::Pending(_)),
-            PointRequest::Site(site) => site.outstanding(topology, info, &records),
-            PointRequest::Convert(_) => matches!(convert, Priced::Pending(_)),
-            PointRequest::HostRoutes | PointRequest::HostMemory { .. } => matches!(lines, Priced::Pending(_)),
-            other => unreachable!("a load's pricing requests no {other:?}"),
+            PointRequest::Costs => costs_outstanding,
+            request => request.outstanding(topology, info, &records),
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -1160,13 +1160,16 @@ pub(crate) fn expert_measures(pricing: &ExpertPricing) -> magnitude_executor::Ex
     }
 }
 
-/// What `bank` waits on of the measurement job, and the host memory readers
-/// its pricing asks for: a host tier's link line is host storage's routes of
-/// the executor's costs, its record read from host memory the host memory's
-/// line, and its copies' blocks the tier copy's points; each moving group's
-/// shrink is paced by its move line; each of its `sites` (by streamed layer)
-/// serves once admitted with its lines stored. A load serves without them
-/// until the job has measured them.
+/// What `bank` waits on of the measurement job, in the order the job
+/// measures it ([`touch`]), and the host memory readers its pricing asks
+/// for: a host tier's link line is host storage's routes of the executor's
+/// costs (first, as its share of the walk), its record read from host
+/// memory the host memory's line, and its copies' blocks the tier copy's
+/// points; then the executor's costs, which every line, pass and resident
+/// step of it reads; each moving group's shrink is paced by its move line;
+/// each of its `sites` (by streamed layer) serves once admitted with its
+/// lines stored. A load serves without them until the job has measured
+/// them.
 fn expert_requests(
     bank: &magnitude_executor::ExpertBankPlan,
     sites: &[Option<magnitude_executor::assessment::SiteRequest>],
@@ -1181,7 +1184,7 @@ fn expert_requests(
     let moves = MoveCosts::forms(bank).map(|(_, form)| PointRequest::Moves(form));
     let sites = sites.iter().flatten().cloned().map(PointRequest::Site);
     let converts = bank.tier_reservation().is_none().then(|| ConvertCosts::forms(bank).map(PointRequest::Convert)).into_iter().flatten();
-    Ok((tier.chain(moves).chain(sites).chain(converts).collect(), readers))
+    Ok((tier.chain([PointRequest::Costs]).chain(moves).chain(sites).chain(converts).collect(), readers))
 }
 
 /// The volumes a load of `artifact` reads for: each source for a reader no
@@ -1277,12 +1280,16 @@ fn adopt_volumes(
 }
 
 /// Request `requests` of the measurement job in the kernel cache at `root`, on `executor`, a
-/// load waiting on them now (`assessment::PointRequests`). One that cannot be stored is reported:
-/// the load serves without it as it does until the job measures it.
+/// load waiting on them now (`assessment::PointRequests`), in the order the job measures them:
+/// each at its place in `requests`, which orders a touch's requests (`Waiter::rank`).
+/// One that cannot be stored is reported: the load serves without it as it does until the job
+/// measures it.
 fn touch(root: &std::path::Path, executor: &seismic::Identity, requests: &[magnitude_executor::assessment::PointRequest]) {
+    use magnitude_executor::assessment::Waiter;
     let requested = magnitude_executor::assessment::PointRequests::new(root);
-    for request in requests {
-        if let Err(error) = requested.request(executor, request.clone(), magnitude_executor::assessment::Waiter::now()) {
+    let now = Waiter::now(0);
+    for (rank, request) in (0u64..).zip(requests) {
+        if let Err(error) = requested.request(executor, request.clone(), Waiter { rank, ..now }) {
             tracing::warn!("the load's request of {request:?} could not be stored: {error}");
         }
     }
@@ -1801,5 +1808,20 @@ mod tests {
             prepared_key(&prepared).unwrap(),
             prepared_key(&other).unwrap()
         );
+    }
+
+    /// The job measures a load's requests in the order the load lists
+    /// them: host storage's routes ahead of the executor's whole costs.
+    #[test]
+    fn a_load_s_requests_are_measured_in_its_order() {
+        use magnitude_executor::assessment::{PointRequest, PointRequests};
+        let root = tempfile::tempdir().unwrap();
+        let topology = Devices::discover(&[]).unwrap().topology();
+        let executor = topology.executors().iter().find(|executor| executor.backend() == BackendName::Cpu).unwrap().clone();
+        let identity = topology.executor_identity(executor.id()).unwrap();
+        let requests = [PointRequest::HostRoutes, PointRequest::Costs];
+        touch(root.path(), &identity, &requests);
+        let records = seismic::measure::HeldStore::default();
+        assert_eq!(PointRequests::new(root.path()).outstanding(&topology, &executor, &records).unwrap(), requests);
     }
 }
