@@ -605,27 +605,29 @@ pub(super) mod tests {
 
     /// Promote each of `layer`'s `experts` a read of `measure` lacked, as
     /// they enter ([`Measure::entering`]), into `held`'s least ranked
-    /// record of `records` (by `rank`): a share that takes every miss.
-    fn take_misses(measure: &Measure, layer: usize, experts: &[usize], held: &mut Vec<usize>, records: usize, rank: impl Fn(usize) -> Rank) {
+    /// record of `records`, by the measure's ranks, then (layer, expert): a
+    /// cache that takes every miss, a layer's share or a group's pool.
+    fn take_misses(measure: &Measure, layer: usize, experts: &[usize], held: &mut Vec<(usize, usize)>, records: usize) {
         for expert in measure.entering(layer, experts) {
-            if held.contains(&expert) {
+            if held.contains(&(layer, expert)) {
                 continue;
             }
             if held.len() < records {
-                held.push(expert);
+                held.push((layer, expert));
                 continue;
             }
-            let victim = (0..held.len()).min_by_key(|&at| rank(held[at])).expect("a share of records");
-            held[victim] = expert;
+            let victim = (0..held.len()).min_by_key(|&at| (measure.rank(held[at].0, held[at].1), held[at])).expect("a cache of records");
+            held[victim] = (layer, expert);
         }
     }
 
     /// A recorded decode's routing (`fixtures/reuse`) misses at each read,
     /// by what the live candidate holds before it, exactly what the offline
-    /// replay misses: every half-life's per-layer shares, each a cache
-    /// taking every miss into its least ranked record, and its one pool of
-    /// every layer's (a cache already), the least missed so far (the first
-    /// on a tie) holding: read for read.
+    /// replay misses: every half-life's per-layer shares and its one pool
+    /// of every layer's, each a cache built here taking every miss into its
+    /// least ranked record (by the half-life's scores, never by the
+    /// ranking's own stacks or pools), the least missed so far (the first on
+    /// a tie) holding: read for read.
     fn replays_as_offline(fixture: &[u8]) {
         let word = |at: usize| u16::from_le_bytes([fixture[2 * at], fixture[2 * at + 1]]) as usize;
         let (layers, experts, width, steps, slots) = (word(0), word(1), word(2), word(3), word(4));
@@ -633,28 +635,29 @@ pub(super) mod tests {
         assert_eq!(routes.len(), layers * steps * width, "a route a read");
         let mut reuse = Reuse::new(&vec![experts; layers], &vec![0; layers], vec![slots; layers]);
         let mut scored = HALF_LIVES.map(|half_life| Measure::new(half_life, &vec![experts; layers], &vec![0; layers], &[slots * layers]));
-        let mut shares = vec![vec![Vec::<usize>::new(); layers]; HALF_LIVES.len()];
-        let mut missed = [0u64; HALF_LIVES.len()];
+        let mut shares = vec![vec![Vec::new(); layers]; HALF_LIVES.len()];
+        let mut pools = vec![Vec::new(); HALF_LIVES.len()];
+        let mut missed = [0u64; 2 * HALF_LIVES.len()];
         for (position, route) in routes.chunks(width).enumerate() {
             let mut chosen = route.iter().map(|&expert| expert as usize).collect::<Vec<_>>();
             chosen.sort_unstable();
             let layer = position % layers;
             let lacked = |held: &dyn Fn(usize) -> bool| chosen.iter().filter(|&&expert| !held(expert)).count();
-            let candidate = |candidate: usize| match candidate < HALF_LIVES.len() {
-                true => missed[candidate],
-                false => scored[candidate - HALF_LIVES.len()].pooled_misses,
+            let holds = |candidate: usize, expert: usize| match candidate < HALF_LIVES.len() {
+                true => shares[candidate][layer].contains(&(layer, expert)),
+                false => pools[candidate - HALF_LIVES.len()].contains(&(layer, expert)),
             };
-            let live = (0..2 * HALF_LIVES.len()).min_by_key(|&at| candidate(at)).expect("candidates");
-            let offline = match live < HALF_LIVES.len() {
-                true => lacked(&|expert| shares[live][layer].contains(&expert)),
-                false => lacked(&|expert| scored[live - HALF_LIVES.len()].pooled[layer][expert]),
-            };
+            let live = (0..2 * HALF_LIVES.len()).min_by_key(|&at| missed[at]).expect("candidates");
+            let offline = lacked(&|expert| holds(live, expert));
             assert_eq!(lacked(&|expert| reuse.in_top(layer, expert)), offline, "read {position} (step {}, layer {layer})", position / layers);
             let read = RoutedRead { sequence: (position / layers) as Step, layer, experts: chosen.clone(), choices: width as u64 };
+            for at in 0..2 * HALF_LIVES.len() {
+                missed[at] += lacked(&|expert| holds(at, expert)) as u64;
+            }
             for (at, measure) in scored.iter_mut().enumerate() {
-                missed[at] += lacked(&|expert| shares[at][layer].contains(&expert)) as u64;
                 measure.read(&read, &once(&read), 0);
-                take_misses(measure, layer, &read.experts, &mut shares[at][layer], slots, |expert| measure.rank(layer, expert));
+                take_misses(measure, layer, &read.experts, &mut shares[at][layer], slots);
+                take_misses(measure, layer, &read.experts, &mut pools[at], slots * layers);
             }
             reuse.read(&read, &once(&read));
         }
@@ -766,12 +769,12 @@ pub(super) mod tests {
                 // Each size replayed alone: every miss, as the read's
                 // experts enter, promoted into the least reused record.
                 let mut scored = Measure::new(half_life, &[16], &[0], &[0]);
-                let mut held = Vec::<usize>::new();
+                let mut held = Vec::new();
                 let mut missed = 0;
                 for read in &reads {
-                    missed += read.experts.iter().filter(|expert| !held.contains(expert)).count();
+                    missed += read.experts.iter().filter(|&&expert| !held.contains(&(0, expert))).count();
                     scored.read(read, &once(read), share);
-                    take_misses(&scored, 0, &read.experts, &mut held, share, |expert| scored.rank(0, expert));
+                    take_misses(&scored, 0, &read.experts, &mut held, share);
                 }
                 let counted = depths.iter().flatten().filter(|&&depth| depth >= share).count();
                 assert_eq!(counted, missed, "half-life {half_life}, {share} records");

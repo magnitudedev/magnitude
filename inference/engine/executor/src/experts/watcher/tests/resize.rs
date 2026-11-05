@@ -142,10 +142,18 @@ fn a_host_shrink_answers_beside_a_past_prompt_group_still_clearing() {
     harness.publish(&step, 0, &[4, 5]);
     std::thread::sleep(Duration::from_millis(50));
     drop(step);
+    let claimed = || {
+        let state = residency::lock(&harness.watcher.state);
+        let directory = &state.core.directory;
+        (0..directory.host(0).records()).filter(|&record| directory.lent_claimed(0, crate::experts::directory::HostRecord(record))).collect::<Vec<_>>()
+    };
+    let held = claimed();
+    assert!(!held.is_empty(), "the group holds its lender's records claimed");
     let shared = harness.watcher.shared().clone();
     let shrink = std::thread::spawn(move || shared.shrink_tier(Candidates::one(12, vec![12])));
-    eventually("the shrink waited for the group to clear", || shrink.is_finished());
+    eventually("the shrink never answered while the group cleared", || shrink.is_finished());
     shrink.join().unwrap().expect("the shrink is served");
+    assert_eq!(claimed(), held, "the claimed records stayed in place");
     ahead.finish();
     assert_eq!(harness.watcher.shared().life.ended(), None, "the watcher serves on");
 }
@@ -177,7 +185,7 @@ fn a_host_shrink_asked_with_a_landing_in_flight_answers_at_once() {
     let shared = harness.watcher.shared().clone();
     let candidates = Candidates { shallowest: 6, deepest: 1, records: Box::new(|slots| vec![slots]) };
     let shrink = std::thread::spawn(move || shared.shrink_tier(candidates));
-    eventually("the shrink waited for the landing", || shrink.is_finished());
+    eventually("the shrink never answered beside the landing", || shrink.is_finished());
     let cut = shrink.join().unwrap().expect("the shrink is served").expect("a cut keeps the landing");
     assert_eq!(cut.slots, floor as usize, "the deepest cut above the landing");
     assert_eq!(residency::lock(&harness.watcher.state).core.directory.host(0).records(), floor);
@@ -221,7 +229,7 @@ fn a_host_shrink_right_after_a_growth_answers_beside_its_landings() {
     assert_eq!(floor(), 4, "the landing took the lowest ready record, below the growth");
     let candidates = Candidates { shallowest: 7, deepest: 7, records: Box::new(|slots| vec![slots]) };
     let shrink = std::thread::spawn(move || shared.shrink_tier(candidates));
-    eventually("the shrink waited for the landing", || shrink.is_finished());
+    eventually("the shrink never answered beside the landing", || shrink.is_finished());
     let cut = shrink.join().unwrap().expect("the shrink is served").expect("the cut answers, not deferred");
     assert_eq!(cut.slots, 7, "back to the size it grew from");
     assert_eq!(residency::lock(&harness.watcher.state).core.directory.host(0).records(), 7);
