@@ -43,8 +43,8 @@ use magnitude_executor::{
     ExecutionPath, UnpreparedUnits,
     assessment::prepare_execution_assessment,
     platform::{
-        DeviceRequest, HostRoom, MemoryReserves, OpenedPlatform, PlatformConfig, observe_domains, open_selected,
-        select_device,
+        DeviceRequest, HostRoom, MemoryReserves, OpenedPlatform, PlatformConfig, RECOVERY_STABLE_TIME, observe_domains,
+        open_selected, select_device,
     },
 };
 use magnitude_generation::{EndOfGeneration, MethodChoice, Options, Sampling, Shaping, TokenId};
@@ -675,7 +675,7 @@ enum Pressed {
     Released,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 enum Stage {
     Before,
     Pressing,
@@ -683,8 +683,12 @@ enum Stage {
     Held { from: usize, held: usize },
     /// The window closed at `to` and the press is given back.
     Freeing { from: usize, to: usize },
-    /// The press is back from output `back` on.
-    Freed { from: usize, to: usize, back: usize },
+    /// The press is back from output `back` on, given back `at` (Unix
+    /// seconds).
+    Freed { from: usize, to: usize, back: usize, at: f64 },
+    /// Memory stayed free as long as the engine waits before it grows the
+    /// bank again, from output `recovered` on.
+    Recovered { from: usize, to: usize, recovered: usize },
 }
 
 /// The window a pressured decode is measured in. Pressing is signalled once
@@ -692,7 +696,10 @@ enum Stage {
 /// pressure starts landing, as the engine answers it, and closes `span`
 /// tokens after the first output that finds it held; the press is then
 /// given back, and the decode stops `after` tokens after the first output
-/// that finds it back. However long the
+/// that finds memory free for as long as the engine waits before it grows
+/// the bank again ([`RECOVERY_STABLE_TIME`], by the clock: the step the
+/// decode is sized by is timed before the load settles, so tokens counted
+/// from it need not last that long). However long the
 /// pressure takes to land, the window waits for it, so a decode that ends
 /// before it is held tested nothing ([`Window::ended`]).
 #[derive(Debug)]
@@ -717,25 +724,18 @@ impl Window {
         }
     }
 
-    /// Decode on after the press is back for as long as memory must
-    /// stay free before the engine grows the bank again
-    /// (`RECOVERY_STABLE_TIME`), at `step` seconds a token, beside the
-    /// window's own tokens after it: the regrowth lands within the decode,
-    /// whenever the pressure left the Reclaim band.
-    fn recover(&mut self, step: f64) {
-        self.after += (magnitude_executor::platform::RECOVERY_STABLE_TIME.as_secs_f64() / step).ceil() as usize;
-    }
-
     /// The tokens a decode needs for the window, the pressure taking
     /// `landing` seconds to be held and a step `step` seconds: before
-    /// pressing, the steps the pressure takes, the window and after it.
+    /// pressing, the steps the pressure takes, the window, the steps
+    /// [`RECOVERY_STABLE_TIME`] takes and after it.
     fn room(&self, landing: f64, step: f64) -> usize {
-        self.press_at + (landing / step).ceil() as usize + self.span + self.after
+        let steps = |seconds: f64| (seconds / step).ceil() as usize;
+        self.press_at + steps(landing) + self.span + steps(RECOVERY_STABLE_TIME.as_secs_f64()) + self.after
     }
 
-    /// `decoded` tokens are out, the pressure where `pressed` says: what to
-    /// do.
-    fn next(&mut self, decoded: usize, pressed: Pressed) -> Next {
+    /// `decoded` tokens are out at `now` (Unix seconds), the pressure where
+    /// `pressed` says: what to do.
+    fn next(&mut self, decoded: usize, pressed: Pressed, now: f64) -> Next {
         let (stage, next) = match (self.stage, pressed) {
             (Stage::Before, _) if decoded >= self.press_at => (Stage::Pressing, Next::Press),
             (Stage::Pressing, Pressed::Landing) => (Stage::Landing { from: decoded }, Next::Decode),
@@ -744,8 +744,13 @@ impl Window {
             (Stage::Held { from, held }, _) if decoded >= held + self.span => {
                 (Stage::Freeing { from, to: decoded }, Next::Free)
             }
-            (Stage::Freeing { from, to }, Pressed::Released) => (Stage::Freed { from, to, back: decoded }, Next::Decode),
-            (Stage::Freed { back, .. }, _) if decoded >= back + self.after => (self.stage, Next::Stop),
+            (Stage::Freeing { from, to }, Pressed::Released) => {
+                (Stage::Freed { from, to, back: decoded, at: now }, Next::Decode)
+            }
+            (Stage::Freed { from, to, at, .. }, _) if now - at >= RECOVERY_STABLE_TIME.as_secs_f64() => {
+                (Stage::Recovered { from, to, recovered: decoded }, Next::Decode)
+            }
+            (Stage::Recovered { recovered, .. }, _) if decoded >= recovered + self.after => (self.stage, Next::Stop),
             (stage, _) => (stage, Next::Decode),
         };
         self.stage = stage;
@@ -756,14 +761,16 @@ impl Window {
     fn tokens(&self) -> (Option<usize>, Option<usize>) {
         match self.stage {
             Stage::Landing { from } | Stage::Held { from, .. } => (Some(from), None),
-            Stage::Freeing { from, to } | Stage::Freed { from, to, .. } => (Some(from), Some(to)),
+            Stage::Freeing { from, to } | Stage::Freed { from, to, .. } | Stage::Recovered { from, to, .. } => {
+                (Some(from), Some(to))
+            }
             Stage::Before | Stage::Pressing => (None, None),
         }
     }
 
-    /// The decode completed at `decoded` tokens before the rule stopped it:
-    /// why the window is not whole.
-    fn ended(&self, decoded: usize) -> String {
+    /// The decode completed at `decoded` tokens at `now` (Unix seconds)
+    /// before the rule stopped it: why the window is not whole.
+    fn ended(&self, decoded: usize, now: f64) -> String {
         match self.stage {
             Stage::Before | Stage::Pressing | Stage::Landing { .. } => {
                 format!("pressure missed: the decode ended at token {decoded}, before the pressure was held")
@@ -776,9 +783,15 @@ impl Window {
             Stage::Freeing { to, .. } => {
                 format!("the decode ended at token {decoded}, {} tokens after its window, before the press was back", decoded - to)
             }
-            Stage::Freed { back, .. } => format!(
-                "the decode ended at token {decoded}, {} of the {} tokens after the press was back",
+            Stage::Freed { back, at, .. } => format!(
+                "the decode ended at token {decoded}, {} tokens and {:.2} s after the press was back, before the {} s memory must stay free for the bank to grow again",
                 decoded - back,
+                now - at,
+                RECOVERY_STABLE_TIME.as_secs_f64()
+            ),
+            Stage::Recovered { recovered, .. } => format!(
+                "the decode ended at token {decoded}, {} of the {} tokens after memory stayed free for the bank to grow again",
+                decoded - recovered,
                 self.after
             ),
         }
@@ -845,7 +858,6 @@ impl Pressure {
             _ => return Err(Failure::Cell("the step's timing decode gave fewer than two outputs".into())),
         };
         let rate = self.approach()?;
-        window.recover(step);
         // The press is at most twice the deficit: what the engine could
         // still claim, at most the deficit the approach left it, and the
         // deficit. It lands, and is given back, at the rate the approach
@@ -871,7 +883,7 @@ impl Pressure {
                     (decoded, self.pressed()?)
                 }
             };
-            match window.next(decoded, pressed) {
+            match window.next(decoded, pressed, unix_seconds()) {
                 Next::Decode => Ok(false),
                 Next::Press => self.press(decoded).map(|()| false),
                 Next::Free => {
@@ -886,7 +898,7 @@ impl Pressure {
         self.record.insert("window".into(), json!({ "from": from, "to": to }));
         match stopped {
             true => Ok((length, decoded)),
-            false => Err(Failure::Cell(window.ended(decoded.len()))),
+            false => Err(Failure::Cell(window.ended(decoded.len(), unix_seconds()))),
         }
     }
 
@@ -1124,10 +1136,10 @@ impl tracing::field::Visit for Fields {
 mod tests {
     use super::*;
 
-    /// Drive `window` over outputs of one token each, the pressure landing
-    /// from output `landing`, held from output `held` and its press back
-    /// from output `back` on: each output's action but decoding, until it
-    /// stops or `outputs` are out.
+    /// Drive `window` over outputs of one token each, half a second apart,
+    /// the pressure landing from output `landing`, held from output `held`
+    /// and its press back from output `back` on: each output's action but
+    /// decoding, until it stops or `outputs` are out.
     fn drive(window: &mut Window, (landing, held, back): (usize, usize, usize), outputs: usize) -> Vec<(usize, Next)> {
         let pressed = |decoded| match decoded {
             decoded if decoded >= back => Pressed::Released,
@@ -1137,7 +1149,7 @@ mod tests {
         };
         let mut actions = Vec::new();
         for decoded in 1..=outputs {
-            match window.next(decoded, pressed(decoded)) {
+            match window.next(decoded, pressed(decoded), decoded as f64 * 0.5) {
                 Next::Decode => {}
                 Next::Stop => {
                     actions.push((decoded, Next::Stop));
@@ -1150,44 +1162,60 @@ mod tests {
     }
 
     /// The window opens as the pressure starts landing, however late, and
-    /// closes its span after the pressure is held; a decode that ends before
-    /// the pressure is held tested nothing.
+    /// closes its span after the pressure is held; the decode stops its
+    /// tokens after memory stayed free for the recovery's time, by the
+    /// clock; a decode that ends before the pressure is held tested nothing.
     #[test]
     fn the_window_spans_the_landing_and_its_tokens_under_the_held_pressure() {
-        // 128 tokens: pressed at 32, landing from 250, held at 300, back at 370.
+        // 128 tokens: pressed at 32, landing from 250, held at 300, back at
+        // 370, free 5 s later at 380.
         let mut window = Window::of(128, false);
         assert_eq!(
             drive(&mut window, (250, 300, 370), 1000),
-            [(32, Next::Press), (364, Next::Free), (402, Next::Stop)]
+            [(32, Next::Press), (364, Next::Free), (412, Next::Stop)]
         );
         assert_eq!(window.tokens(), (Some(250), Some(364)));
 
         // From the prompt: pressed at admission, held at the first output.
         let mut prompt = Window::of(128, true);
-        assert_eq!(prompt.next(0, Pressed::Unlanded), Next::Press);
-        assert_eq!(prompt.next(1, Pressed::Held), Next::Decode);
-        assert_eq!(prompt.next(65, Pressed::Held), Next::Free);
+        assert_eq!(prompt.next(0, Pressed::Unlanded, 0.0), Next::Press);
+        assert_eq!(prompt.next(1, Pressed::Held, 0.0), Next::Decode);
+        assert_eq!(prompt.next(65, Pressed::Held, 0.0), Next::Free);
         assert_eq!(prompt.tokens(), (Some(1), Some(65)));
 
         // Ended while the pressure landed: missed, never passed.
         let mut missed = Window::of(128, true);
-        missed.next(0, Pressed::Unlanded);
-        missed.next(90, Pressed::Landing);
-        assert!(missed.ended(91).starts_with("pressure missed"));
+        missed.next(0, Pressed::Unlanded, 0.0);
+        missed.next(90, Pressed::Landing, 0.0);
+        assert!(missed.ended(91, 0.0).starts_with("pressure missed"));
         assert_eq!(missed.tokens(), (Some(90), None));
 
         // Ended under the held pressure, short of its span.
         let mut short = Window::of(128, true);
-        short.next(0, Pressed::Unlanded);
-        short.next(10, Pressed::Held);
+        short.next(0, Pressed::Unlanded, 0.0);
+        short.next(10, Pressed::Held, 0.0);
         assert_eq!(
-            short.ended(40),
+            short.ended(40, 0.0),
             "the decode ended at token 40, 30 of the 64 tokens its window holds under the held pressure"
         );
-        // Ended after the window, short of its tokens after the press is back.
-        assert_eq!(short.next(74, Pressed::Held), Next::Free);
-        assert_eq!(short.next(78, Pressed::Released), Next::Decode);
-        assert_eq!(short.ended(80), "the decode ended at token 80, 2 of the 32 tokens after the press was back");
+        // Ended after the press is back, before memory stayed free for the
+        // recovery's time: however many tokens are out, its tokens after the
+        // window have not started.
+        assert_eq!(short.next(74, Pressed::Held, 1.0), Next::Free);
+        assert_eq!(short.next(78, Pressed::Released, 1.0), Next::Decode);
+        assert_eq!(short.next(500, Pressed::Released, 5.5), Next::Decode);
+        assert_eq!(
+            short.ended(501, 5.5),
+            "the decode ended at token 501, 423 tokens and 4.50 s after the press was back, before the 5 s memory must stay free for the bank to grow again"
+        );
+        // Ended short of its tokens after memory stayed free.
+        assert_eq!(short.next(502, Pressed::Released, 6.0), Next::Decode);
+        assert_eq!(
+            short.ended(510, 6.25),
+            "the decode ended at token 510, 8 of the 32 tokens after memory stayed free for the bank to grow again"
+        );
+        assert_eq!(short.next(533, Pressed::Released, 6.25), Next::Decode);
+        assert_eq!(short.next(534, Pressed::Released, 6.25), Next::Stop);
     }
 
     /// A pressure lands once the occupying process has approached and
@@ -1241,12 +1269,13 @@ mod tests {
     }
 
     /// The decode holds the window after the pressure lands: the steps the
-    /// occupation's measured time takes, rounded up, beside the window.
+    /// occupation's measured time and the recovery's take, rounded up,
+    /// beside the window.
     #[test]
     fn the_decode_is_sized_by_the_occupation_and_the_step() {
         let window = Window::of(128, false);
-        assert_eq!(window.room(6.0, 0.025), 32 + 240 + 64 + 32);
-        assert_eq!(window.room(6.01, 0.025), 32 + 241 + 64 + 32);
-        assert_eq!(Window::of(128, true).room(0.0, 0.025), 64 + 32);
+        assert_eq!(window.room(6.0, 0.025), 32 + 240 + 64 + 200 + 32);
+        assert_eq!(window.room(6.01, 0.025), 32 + 241 + 64 + 200 + 32);
+        assert_eq!(Window::of(128, true).room(0.0, 0.025), 64 + 200 + 32);
     }
 }
