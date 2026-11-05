@@ -28,6 +28,8 @@ REPEATS = 16
 LOAD_SECONDS = 1500.0
 JOB_SECONDS = 180.0
 START_SECONDS = 120.0
+# How long a stop takes to show its load stopping.
+STOPPING_SECONDS = 60.0
 # The read a `failure` run fails: this much of the model file, from its middle, with EIO once the
 # trigger file exists. Small enough that a request can route around it and large enough that one
 # of a pair of answers names an expert in it.
@@ -314,7 +316,9 @@ def priced(line: str) -> dict[str, str]:
 
 def in_thread(work) -> tuple[Callable[[], None], dict]:
     """`work` on its own thread, and what joins it: its result, or the service's refusal or a
-    lost connection, in the returned dict; anything else it raises is raised again by the join."""
+    lost connection, in the returned dict; anything else it raises is raised again by the join.
+    A stage that fails leaves its threads behind: they end with the run, whose end ends the
+    service they wait on."""
     out: dict = {}
     defect: list[BaseException] = []
 
@@ -328,7 +332,7 @@ def in_thread(work) -> tuple[Callable[[], None], dict]:
             defect.append(error)
         out["seconds"] = round(time.monotonic() - started, 2)
 
-    thread = threading.Thread(target=body)
+    thread = threading.Thread(target=body, daemon=True)
     thread.start()
 
     def join() -> None:
@@ -491,7 +495,11 @@ def stop_prepare(run: Run) -> None:
     (instance,) = [item for item in service.instances()["instances"] if "loading" in json.dumps(item).lower()]
     run.note("cold load preparing, stopping it", instance=instance["id"])
     stopped, stop_result = in_thread(lambda: service.stop(instance))
-    while '"stopping"' not in json.dumps(service.instances()).lower() and "result" not in stop_result:
+    end = time.monotonic() + STOPPING_SECONDS
+    while '"stopping"' not in (state := json.dumps(service.instances()).lower()) and "result" not in stop_result:
+        if time.monotonic() > end or "error" in stop_result:
+            raise Failed(f"the stopped load never showed stopping in {STOPPING_SECONDS:.0f} s: "
+                         f"{stop_result.get('error', state[:400])}")
         time.sleep(0.01)
     queued, next_load = in_thread(lambda: service.load(model))
     stopped()
