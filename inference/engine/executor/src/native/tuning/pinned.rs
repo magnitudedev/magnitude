@@ -12,7 +12,7 @@
 //! shape the recording run never prepared) runs its declared default
 //! configuration, untuned, and is reported as not replayed, and so does one
 //! whose recorded configuration names parameters this build does not declare
-//! there ([`TuningEvent::Pinned`](super::TuningEvent::Pinned) with
+//! ([`TuningEvent::Pinned`](super::TuningEvent::Pinned) with
 //! [`PinnedChoice::NotReplayed`]), so its timing is never mistaken for the
 //! recorded choice's.
 //!
@@ -183,35 +183,14 @@ fn decide(
     // A parameter the pin does not name (one the implementation gained after
     // the pin was recorded) takes its value in the default configuration at
     // these values, so another build's configurations replay unchanged; one
-    // the call site fixes keeps its fixed value.
+    // the call site fixes keeps its fixed value. A value applies wherever
+    // this build declares its parameter: one recorded on the native, on
+    // every launch that declares it, and one recorded on launches, on the
+    // native, so a parameter moved between the native and its launches
+    // replays its recorded value.
     let defaults = implementation
         .default_specialization(&at)
         .map_err(|error| format!("default configuration of {entry}: {error}"))?;
-    let mut specialization = fixed.statics.iter().fold(NativeSpecialization::new(), |spec, (name, value)| {
-        spec.with_static(name.clone(), *value)
-    });
-    for parameter in &implementation.params {
-        let value = fixed
-            .params
-            .get(&parameter.name)
-            .or_else(|| pinned.params.get(&parameter.name))
-            .copied()
-            .or_else(|| defaults.param(&parameter.name))
-            .expect("the default configuration values every parameter");
-        specialization = specialization.with_param(parameter.name.clone(), value);
-    }
-    for (launch, declaration) in implementation.launches.iter().enumerate() {
-        for parameter in &declaration.params {
-            let value = pinned
-                .launch_params
-                .get(&(launch, parameter.name.clone()))
-                .copied()
-                .or_else(|| defaults.launch_param(launch, &parameter.name))
-                .expect("the default configuration values every launch parameter");
-            specialization =
-                specialization.with_launch_param(launch, parameter.name.clone(), value);
-        }
-    }
     let declared = |name: &String| {
         implementation
             .params
@@ -229,14 +208,60 @@ fn decide(
                     .any(|parameter| &parameter.name == name)
             })
     };
+    let declared_on_launches = |name: &String| {
+        (0..implementation.launches.len()).any(|launch| declared_in(launch, name))
+    };
+    // The one value the pin's launches recorded for `name`, if they agree.
+    let on_launches = |name: &str| {
+        let mut values = pinned
+            .launch_params
+            .iter()
+            .filter(|((_, recorded), _)| recorded == name)
+            .map(|(_, &value)| value);
+        let first = values.next()?;
+        values.all(|value| value == first).then_some(first)
+    };
     // A configuration of another build's parameters (one the pin names that
-    // this implementation does not declare where it was recorded) is a unit
-    // the recording never prepared: it runs its default, reported as not
-    // replayed.
-    let foreign = pinned.params.keys().any(|name| !declared(name))
-        || pinned.launch_params.keys().any(|(launch, name)| !declared_in(*launch, name));
+    // this implementation declares nowhere, a launch's this one declares on
+    // other launches only, or launches' values that disagree where this one
+    // takes one) is a unit the recording never prepared: it runs its
+    // default, reported as not replayed.
+    let foreign = pinned
+        .params
+        .keys()
+        .any(|name| !declared(name) && !declared_on_launches(name))
+        || pinned.launch_params.keys().any(|(launch, name)| {
+            !declared_in(*launch, name) && !(declared(name) && on_launches(name).is_some())
+        });
     if foreign {
         return Ok(Pinned::Chosen(defaults, PinnedChoice::NotReplayed));
+    }
+    let mut specialization = fixed.statics.iter().fold(NativeSpecialization::new(), |spec, (name, value)| {
+        spec.with_static(name.clone(), *value)
+    });
+    for parameter in &implementation.params {
+        let value = fixed
+            .params
+            .get(&parameter.name)
+            .or_else(|| pinned.params.get(&parameter.name))
+            .copied()
+            .or_else(|| on_launches(&parameter.name))
+            .or_else(|| defaults.param(&parameter.name))
+            .expect("the default configuration values every parameter");
+        specialization = specialization.with_param(parameter.name.clone(), value);
+    }
+    for (launch, declaration) in implementation.launches.iter().enumerate() {
+        for parameter in &declaration.params {
+            let value = pinned
+                .launch_params
+                .get(&(launch, parameter.name.clone()))
+                .or_else(|| pinned.params.get(&parameter.name))
+                .copied()
+                .or_else(|| defaults.launch_param(launch, &parameter.name))
+                .expect("the default configuration values every launch parameter");
+            specialization =
+                specialization.with_launch_param(launch, parameter.name.clone(), value);
+        }
     }
     implementation
         .validate(&specialization)
@@ -438,5 +463,84 @@ mod tests {
         ));
         let key_of = at("routed_route_streamed", &route, ("LANES", 16));
         check(route, key_of, ("LANES", 16), 32);
+    }
+
+    /// A configuration recorded before a parameter moved between a native
+    /// and its launches replays its values where this build declares them:
+    /// Metal `routed_gate_up`'s parameters, on its native, from a recording
+    /// on its first launch, and `routed_expand`'s, on its launch, from one
+    /// on its native. Launches that recorded different values for what is
+    /// now one native parameter are another build's configuration.
+    #[test]
+    fn a_parameter_moved_between_native_and_launches_replays_its_value() {
+        let bf16 = seismic::Element::bf16();
+        let device_independent = |implementation: Result<Option<&NativeImplementation>, _>| {
+            implementation
+                .unwrap()
+                .unwrap()
+                .clone()
+                .device_independent()
+                .expect("the declaration reads no device property")
+                .owned()
+        };
+        let unit = |entry: &'static str, implementation: &OnDevice| {
+            let statics = implementation.search_statics(&[]).unwrap().expect("the implementation admits some statics");
+            let statics = statics.statics().iter().map(|(name, &value)| (name.as_str(), value)).collect::<Vec<_>>();
+            key(entry, &statics, &[])
+        };
+        let recorded = |key: &TuningKey, params: &[(&str, u64)], launch_params: &[(usize, &str, u64)]| PinnedConfiguration {
+            entry: key.0.to_owned(),
+            bindings: key.1.clone(),
+            statics: key.2.statics.clone(),
+            params: params.iter().map(|(name, value)| ((*name).to_owned(), *value)).collect(),
+            launch_params: launch_params.iter().map(|(launch, name, value)| ((*launch, (*name).to_owned()), *value)).collect(),
+        };
+        let replayed = |key: &TuningKey, implementation: &OnDevice, configuration: PinnedConfiguration| {
+            match decide(&Installed::of(TuningPin::Replay(vec![configuration])), key, implementation) {
+                Ok(Pinned::Chosen(chosen, choice)) => (chosen, choice),
+                Ok(Pinned::Tune) => panic!("{} replays, never tunes", key.0),
+                Err(error) => panic!("{} resolves: {error}", key.0),
+            }
+        };
+
+        let gate_up = device_independent(seismic::generated::native_implementation_at::<magnitude_kernels::routed_gate_up::Entry>(
+            BackendName::Metal,
+            &[("A", bf16), ("EGW", bf16), ("EUW", bf16)],
+        ));
+        assert!(gate_up.launches.iter().all(|launch| launch.params.is_empty()), "routed_gate_up's parameters are its native's");
+        let key_of = unit("routed_gate_up", &gate_up);
+        let (chosen, choice) = replayed(
+            &key_of,
+            &gate_up,
+            recorded(&key_of, &[], &[(0, "SIMDGROUPS", 4), (0, "ROWS", 2), (0, "LANES", 32)]),
+        );
+        assert_eq!(choice, PinnedChoice::Replayed);
+        assert_eq!(
+            [chosen.param("SIMDGROUPS"), chosen.param("ROWS"), chosen.param("LANES")],
+            [Some(4), Some(2), Some(32)]
+        );
+        let (_, choice) = replayed(
+            &key_of,
+            &gate_up,
+            recorded(&key_of, &[], &[(0, "SIMDGROUPS", 4), (1, "SIMDGROUPS", 8)]),
+        );
+        assert_eq!(choice, PinnedChoice::NotReplayed, "launches' values that disagree name no one native value");
+
+        let expand = device_independent(seismic::generated::native_implementation_at::<magnitude_kernels::routed_expand::Entry>(
+            BackendName::Metal,
+            &[("A", bf16), ("EGW", bf16), ("EUW", bf16), ("SGW", bf16), ("SUW", bf16)],
+        ));
+        assert!(expand.params.is_empty(), "routed_expand's parameters are its launch's");
+        let key_of = unit("routed_expand", &expand);
+        let (chosen, choice) = replayed(
+            &key_of,
+            &expand,
+            recorded(&key_of, &[("SIMDGROUPS", 4), ("ROWS", 2), ("LANES", 16)], &[]),
+        );
+        assert_eq!(choice, PinnedChoice::Replayed);
+        assert_eq!(
+            [chosen.launch_param(0, "SIMDGROUPS"), chosen.launch_param(0, "ROWS"), chosen.launch_param(0, "LANES")],
+            [Some(4), Some(2), Some(16)]
+        );
     }
 }
