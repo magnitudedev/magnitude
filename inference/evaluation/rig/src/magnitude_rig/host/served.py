@@ -19,6 +19,12 @@ from collections.abc import Callable
 from pathlib import Path
 
 RESULTS = "served.json"
+# Every complete answer, as a fixture whose scored assistant message is that answer: what the
+# harness teacher-forces through the model to judge it (`instruments/served.py`).
+ANSWERS = "answers.jsonl"
+# The request options evaluation renders with (the harness's standard ones): every answer is
+# asked with them, so the harness renders its judged fixture's prompt as the service did.
+OPTIONS = {"chat_template_kwargs": {"enable_thinking": False}}
 SCENARIOS = ("lifecycle", "stop", "stop-prepare", "failure", "repeat")
 # Characters of a fixture's opening a prompt keeps: within any context an evaluated load serves.
 PROMPT_CHARACTERS = 9000
@@ -117,6 +123,7 @@ class Service:
     """One `serve` process, ended by closing its owner's stdin."""
 
     def __init__(self, run: "Run", name: str, bounds: tuple[str, ...], environment: dict[str, str] | None = None) -> None:
+        self.run, self.name = run, name
         self.log_path = run.directory / f"service-{name}.log"
         self.output = self.log_path.open("w")
         self.process = subprocess.Popen(
@@ -167,9 +174,9 @@ class Service:
         started = time.monotonic()
         request = urllib.request.Request(self.origin + "/v1/chat/completions", method="POST", headers={"content-type": "application/json"}, data=json.dumps({
             "model": model, "messages": messages, "max_tokens": ANSWER_TOKENS, "temperature": 0, "seed": 1,
-            "stream": True, "stream_options": {"include_usage": True},
+            "stream": True, "stream_options": {"include_usage": True}, **OPTIONS,
         }).encode())
-        pieces, times, finish, usage = [], [], None, None
+        pieces, content, reasoning, times, finish, usage = [], [], [], [], None, None
         try:
             with urllib.request.urlopen(request, timeout=300) as reply:
                 for line in reply:
@@ -180,20 +187,25 @@ class Service:
                     for choice in chunk.get("choices", ()):
                         finish = choice.get("finish_reason") or finish
                         delta = choice.get("delta", {})
-                        if content := delta.get("content") or delta.get("reasoning_content"):
-                            pieces.append(content)
+                        content.append(delta.get("content") or "")
+                        reasoning.append(delta.get("reasoning_content") or "")
+                        if piece := delta.get("content") or delta.get("reasoning_content"):
+                            pieces.append(piece)
                             times.append(time.monotonic())
         except urllib.error.HTTPError as error:
             raise Failed(f"chat: {error.code} {error.read()[:600]!r}") from None
         tokens = (usage or {}).get("completion_tokens") or len(pieces)
-        return {"seconds": round(time.monotonic() - started, 3), "first_seconds": round(times[0] - started, 3) if times else None,
-                "decode_ms": round((times[-1] - times[0]) * 1000 / max(tokens - 1, 1), 2) if len(times) > 1 else None,
-                "text": "".join(pieces), "pieces": pieces, "finish": finish, "usage": usage}
+        answer = {"seconds": round(time.monotonic() - started, 3), "first_seconds": round(times[0] - started, 3) if times else None,
+                  "decode_ms": round((times[-1] - times[0]) * 1000 / max(tokens - 1, 1), 2) if len(times) > 1 else None,
+                  "text": "".join(pieces), "pieces": pieces, "finish": finish, "usage": usage}
+        self.run.answered(f"{self.name}-{len(self.run.answers)}", messages, answer, "".join(content), "".join(reasoning))
+        return answer
 
     def stream(self, model: str, messages: list[dict], started: threading.Event) -> dict:
         """An answer token by token, `started` set at its first; how far it got and how it ended."""
         request = urllib.request.Request(self.origin + "/v1/chat/completions", method="POST", headers={"content-type": "application/json"}, data=json.dumps({
             "model": model, "messages": messages, "max_tokens": ANSWER_TOKENS * 4, "temperature": 0, "seed": 1, "stream": True,
+            **OPTIONS,
         }).encode())
         pieces, ended = [], None
         try:
@@ -250,6 +262,7 @@ class Run:
         self.cache = self.scratch / "cache"
         self.cache.mkdir(parents=True)
         self.report: list[str] = []
+        self.answers: list[dict] = []
         self.record: dict = {"stages": []}
         self.started = time.monotonic()
         self.capped = (*(("--context-tokens", str(arguments.context)) if arguments.context else ()),
@@ -282,7 +295,23 @@ class Run:
         print(line, flush=True)
         self.report.append(line[:400])
 
+    def answered(self, name: str, messages: list[dict], answer: dict, content: str, reasoning: str) -> None:
+        """Keep `answer` to `messages` for judgement, as a fixture whose scored assistant message
+        is what it said, beside how many tokens the service generated for it and how it ended."""
+        reply = {"role": "assistant", "content": content, "scored": True, **({"reasoning_content": reasoning} if reasoning else {})}
+        self.answers.append({"id": name, "sizing": {"unit": "fixed"}, "messages": [*messages, reply],
+                             "served": {"tokens": (answer["usage"] or {}).get("completion_tokens"), "finish": answer["finish"]}})
+
     def finish(self) -> None:
+        # An answer that generated nothing, in its content or its reasoning, has nothing to
+        # teacher-force: it is named, never judged.
+        said = [bool(fixture["messages"][-1]["content"] or fixture["messages"][-1].get("reasoning_content"))
+                for fixture in self.answers]
+        with (self.directory / ANSWERS).open("w") as file:
+            for fixture, judged in zip(self.answers, said):
+                if judged:
+                    file.write(json.dumps(fixture) + "\n")
+        self.record["unjudged"] = [fixture["id"] for fixture, judged in zip(self.answers, said) if not judged]
         self.record["report"] = self.report
         (self.directory / RESULTS).write_text(json.dumps(self.record, indent=1))
         shutil.rmtree(self.scratch, ignore_errors=True)
@@ -427,9 +456,9 @@ def lifecycle(run: Run) -> None:
     reference_other = resident_other
     run.record["answers"] = {"no_cost": first, "during": during, "priced": third, "second": answer, "resident": reference,
                              "repeated": fourth, "other": other, "second_other": second_other, "resident_other": reference_other}
-    # Whether the output is admitted is the precision system's (`mrig kl` of the same cap):
-    # paths that compute the same features in other arithmetic part from the resident answer
-    # within it. Each answer is reported with where it parts, never failed for it.
+    # Paths that compute the same features in other arithmetic may part from the resident answer
+    # at a near tie, so a parting is reported, never failed: each answer is judged token by token
+    # against the model's own distributions (`instruments/served.py`).
     for name, answer, against in (("no-cost", first, reference), ("during the job", during, reference),
                                   ("priced", third, reference), ("repeated", fourth, reference),
                                   ("second load", answer, reference), ("other", other, reference_other),
@@ -563,7 +592,7 @@ def failure(run: Run) -> None:
 
 def repeat(run: Run) -> None:
     """One load answering two prompts in turn: where each answer to a prompt parts from its
-    first, reported; whether the output is admitted is the precision system's (`mrig kl`)."""
+    first, reported; each is judged as every answer is (`instruments/served.py`)."""
     service = Service(run, "repeat", run.capped)
     model = service.model(run.arguments.model)
     service.load(model)

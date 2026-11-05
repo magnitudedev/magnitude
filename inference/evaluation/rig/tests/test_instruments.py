@@ -1125,8 +1125,15 @@ def test_a_served_run_installs_the_catalog_beside_the_model_and_bounds_only_what
     plan = REGISTRY["served"].plan(arguments, None, "host")
     assert plan.acquires == engine.Weights("m:gguf:q4", headers=True)
     assert plan.device == "device"
-    ((name, job),) = plan.jobs
+    (name, job), (_, answers), (_, decoded), (_, judge) = plan.jobs
     assert name == "served" and job.fresh
+    # Its answers are teacher-forced through the whole model, computed again as the service
+    # computes them on the same tokens, then judged.
+    assert answers.argv[answers.argv.index("--fixtures") + 1] == "{runs}/served/answers.jsonl"
+    assert "--weight-cap" not in answers.argv and "--tuning-defaults" in answers.argv
+    assert decoded.argv[decoded.argv.index("--rendered") + 1] == "{runs}/answers/rendered.jsonl"
+    assert "--tuning-defaults" not in decoded.argv and decoded.argv[decoded.argv.index("--batch") + 1] == "1"
+    assert judge.argv[-3:] == ("{runs}/answers", "{runs}/decoded", "{run_dir}/judged.json")
     assert job.argv[job.argv.index("--context") + 1] == "4096"
     assert "--weight-cap" not in job.argv and "--plain" in job.argv
     assert "CUDA_VISIBLE_DEVICES" not in dict(job.env)
@@ -1135,13 +1142,118 @@ def test_a_served_run_installs_the_catalog_beside_the_model_and_bounds_only_what
 def test_a_served_run_on_vulkan_hides_cuda_and_fails_when_the_service_selects_another_backend(tmp_path):
     arguments = argparse.Namespace(scenario="stop", context=None, weight_cap=None, plain=False, model="m:gguf:q4",
                                    fixture=Path("set.jsonl"), backend="vulkan")
-    ((_, job),) = REGISTRY["served"].plan(arguments, None, "host").jobs
+    (_, job), *_ = REGISTRY["served"].plan(arguments, None, "host").jobs
     assert dict(job.env)["CUDA_VISIBLE_DEVICES"] == ""
     (tmp_path / "served.json").write_text(json.dumps({"report": ["ready"]}))
     (tmp_path / "service-capped.log").write_text('\x1b[2mserving device selected\x1b[0m backend="cuda"\n')
     result = JobResult(tmp_path, tmp_path / "job.log", 0)
     answer = REGISTRY["served"].answer(arguments, {"served": result})
     assert not answer.ok and "did not select vulkan" in answer.lines[0]
+
+
+def _judged_answers(tmp_path, rows: list[list[float]], targets: list[int], served: dict,
+                    deltas: dict[tuple[int, int], float] | None = None) -> Path:
+    """A served run's one answer `a`, its reference logits `rows` predicting `targets`, and the
+    service-shaped computation's, off the reference by `deltas` at (row, token), by default 0.1
+    at the first row's top."""
+    from magnitude_rig.host import served as host
+    from magnitude_rig.instruments import served as instrument
+    for directory in ("served", "answers", "decoded", "judge"):
+        (tmp_path / directory).mkdir(parents=True)
+    fixture = {"id": "a", "sizing": {"unit": "fixed"}, "messages": [], "served": served}
+    (tmp_path / "served" / host.ANSWERS).write_text(json.dumps(fixture) + "\n")
+    (tmp_path / "served" / host.RESULTS).write_text(json.dumps({"report": [], "unjudged": []}))
+    prompt = 3
+    (tmp_path / "answers" / "rendered.jsonl").write_text(json.dumps({"fixture_id": "a", "tokens": [0] * prompt + targets}) + "\n")
+    header = {"vocabulary": len(rows[0]), "rows": [{"fixture_id": "a", "position": prompt - 1 + index} for index in range(len(rows))]}
+    decoded = numpy.asarray(rows, dtype="<f4")
+    for (row, token), delta in (deltas if deltas is not None else {(0, int(decoded[0].argmax())): 0.1}).items():
+        decoded[row, token] += delta
+    for directory, logits in (("answers", numpy.asarray(rows, dtype="<f4")), ("decoded", decoded)):
+        (tmp_path / directory / "logits.json").write_text(json.dumps(header))
+        logits.tofile(tmp_path / directory / "logits.f32")
+    subprocess.run([sys.executable, "-c", instrument.JUDGE, *(str(tmp_path / name) for name in ("answers", "decoded")),
+                    str(tmp_path / "judge" / "judged.json")], check=True)
+    assert not (tmp_path / "answers" / "logits.f32").exists(), "the judge leaves the logits on the host"
+    return tmp_path
+
+
+def test_a_served_answer_may_part_only_within_the_measured_move_of_a_competing_margin(tmp_path):
+    """Each answered token is held to its row's top within B, the largest move of a margin below a
+    row's top measured between the reference and the service-shaped computation among the tokens
+    competing with it: with the first row's top 0.1 off and a token 0.05 below it, B = 0.1, so a
+    flip 0.087 nats below the top and the answer past it pass, one 0.12 below fails, and so does a
+    token far below its row's top and a non-finite row."""
+    from magnitude_rig.instruments.served import judged
+    top = lambda token: [0.0 if index == token else -9.0 for index in range(4)]
+    near = lambda margin: [-margin, 0.0, -9.0, -9.0]  # token 0, `margin` below the top
+    run = _judged_answers(tmp_path / "flip", [near(0.05), near(0.087), top(2)], [1, 0, 2], {"tokens": 3, "finish": "length"})
+    lines, passed = judged(run / "served", run / "judge")
+    assert passed and lines[1:] == ["a: 2/3 tokens their row's top, worst 0.087 nats at token 1"]
+    assert lines[0].startswith("largest move between the reference and the service-shaped computation of a margin below "
+                               "a row's top, among the tokens competing with it, 0.1000 (at a position 2, token 0: 0.0500")
+    run = _judged_answers(tmp_path / "wide", [near(0.05), near(0.12), top(2)], [1, 0, 2], {"tokens": 3, "finish": "length"})
+    lines, passed = judged(run / "served", run / "judge")
+    assert not passed and lines[1] == "a: 2/3 tokens their row's top, worst 0.120 nats at token 1, 1 past 0.1000 FAILED"
+    run = _judged_answers(tmp_path / "garbage", [near(0.05), top(1), top(1)], [1, 3, 2], {"tokens": 3, "finish": "length"})
+    lines, passed = judged(run / "served", run / "judge")
+    assert not passed and lines[1] == "a: 1/3 tokens their row's top, worst 9.000 nats at token 1, 2 past 0.1000 FAILED"
+    run = _judged_answers(tmp_path / "nan", [near(0.05), [float("nan")] * 4], [1, 2], {"tokens": 3, "finish": "stop"})
+    lines, passed = judged(run / "served", run / "judge")
+    assert not passed and lines[1] == "a: 1/2 tokens their row's top, worst 0.000 nats, 1 non-finite FAILED"
+
+
+def test_a_served_corruption_nats_below_the_top_fails_whatever_the_tail_differs_by(tmp_path):
+    """The bound is measured over the tokens competing with each row's top, not the tail: a tail
+    logit 20 nats below its top that differs by 3.0 (as LFM2.5's do) leaves the bound at the 0.1 a
+    competing token's margin moved, so an answer corrupted 1.5 nats below its row's top fails. Over
+    the whole vocabulary the bound would be twice 3.0, which that corruption sits within: such a
+    bar cannot fail it."""
+    from magnitude_rig.instruments.served import judged
+    rows = [[0.0, -20.0, -0.05, -9.0], [-1.5, 0.0, -9.0, -9.0], [-9.0, -9.0, 0.0, -9.0]]
+    run = _judged_answers(tmp_path, rows, [0, 0, 2], {"tokens": 3, "finish": "length"}, {(0, 2): 0.1, (0, 1): 3.0})
+    lines, passed = judged(run / "served", run / "judge")
+    assert lines[0].startswith("largest move between the reference and the service-shaped computation of a margin below "
+                               "a row's top, among the tokens competing with it, 0.1000 (at a position 2, token 2")
+    assert not passed and lines[1] == "a: 2/3 tokens their row's top, worst 1.500 nats at token 1, 1 past 0.1000 FAILED"
+
+
+def test_a_served_judgement_without_a_measured_difference_bounds_nothing(tmp_path):
+    """A service-shaped computation equal to the reference bit for bit moves no margin: the bound
+    would fail every honest near tie, so the judgement fails as unsound."""
+    from magnitude_rig.instruments.served import judged
+    run = _judged_answers(tmp_path, [[0.0, -9.0]], [0], {"tokens": 1, "finish": "length"}, deltas={})
+    lines, passed = judged(run / "served", run / "judge")
+    assert not passed and lines[0].startswith("the service-shaped computation moved no margin of a token competing with its row's top")
+
+
+def test_a_served_answer_the_harness_tokenized_otherwise_is_unjudged(tmp_path):
+    """An answer whose rows are not the service's tokens is not judged, and fails; a stopped answer
+    may count its end of turn among them."""
+    from magnitude_rig.instruments.served import judged
+    rows = [[0.0, -0.05], [0.0, -9.0]]
+    run = _judged_answers(tmp_path / "length", rows, [0, 0], {"tokens": 3, "finish": "length"})
+    lines, passed = judged(run / "served", run / "judge")
+    assert not passed and lines[1].startswith("a: unjudged, the harness's tokens of it are not the service's (2 rows, 3")
+    run = _judged_answers(tmp_path / "stop", rows, [0, 0], {"tokens": 3, "finish": "stop"})
+    assert judged(run / "served", run / "judge")[1]
+
+
+def test_a_served_answer_that_only_reasoned_is_kept_for_judgement(tmp_path):
+    """A model whose reasoning cannot be turned off answers in its reasoning: that answer is
+    judged as any other, and only one that generated nothing is unjudged."""
+    from magnitude_rig.host.served import ANSWERS, RESULTS, Run
+    run = Run.__new__(Run)
+    run.directory, run.scratch, run.report, run.record, run.answers = tmp_path, tmp_path / "scratch", [], {}, []
+    asked = [{"role": "user", "content": "q"}]
+    served = {"usage": {"completion_tokens": 2}, "finish": "length"}
+    run.answered("thought", asked, served, "", "so")
+    run.answered("silent", asked, served, "", "")
+    run.finish()
+    kept = [json.loads(line) for line in (tmp_path / ANSWERS).read_text().splitlines()]
+    assert [fixture["id"] for fixture in kept] == ["thought"]
+    assert kept[0]["messages"][-1] == {"role": "assistant", "content": "", "scored": True, "reasoning_content": "so"}
+    assert json.loads((tmp_path / RESULTS).read_text())["unjudged"] == ["silent"]
 
 
 def test_a_served_run_counts_overlapping_workers_from_the_services_own_records():
