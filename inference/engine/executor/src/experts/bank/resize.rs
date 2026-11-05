@@ -1,7 +1,7 @@
 use super::{ExpertBank, host_views, landed_records};
 use crate::experts::source::Records;
 use crate::planning::{BankTier, ExpertBankPlan, Placer};
-use crate::experts::watcher::{Candidates, MoveBudget, ShrinkPlan};
+use crate::experts::watcher::{Candidates, Keeping, MoveBudget};
 use crate::domain::{BankHolding, BankResized, BankStep, DomainError, ResizeTimes, Trip};
 use crate::CompletionWake;
 use std::time::{Duration, Instant};
@@ -725,7 +725,7 @@ impl ExpertBank {
             return Ok(None);
         };
         let from = tier.slots.load(Ordering::Acquire);
-        if let Err(reason) = self.watcher.shared().shrink_host(records, views) {
+        if let Err(reason) = self.watcher.shared().shrink_host(records, views, Keeping::Host) {
             tier.resize = HostResize::Idle(resizers);
             return Err(DomainError::invariant(reason));
         }
@@ -741,15 +741,19 @@ impl ExpertBank {
         Ok(Some(LandedShrink { from, to, before, after: self.host_charged()? }))
     }
 
-    /// Shrink the one store (where the host places) to `to` slots now,
-    /// between flights: the watcher keeps each group's most valuable
-    /// records below its new records (their bytes copied by the host within
-    /// the views it holds), then addresses the records at `to` by their
-    /// views, and each record tensor releases the rest. The device moves
-    /// nothing. Its slots before and after, and Seismic's charge of the
-    /// records before and after (a tensor's storage refusing breaks them,
-    /// [`shrink_refused`]); none while its records resize.
-    pub(super) fn shrink_store(&self, to: u64) -> Result<Option<LandedShrink>, DomainError> {
+    /// Shrink the one store (where the host places) to `to` slots, decided
+    /// at `decided` and queued `queued` behind the flights before it: now,
+    /// between flights, the watcher keeps each group's most valuable
+    /// records below its new records and addresses the records at `to` by
+    /// their views, so no step reads the rest, and the device moves the
+    /// kept records' bytes there by `kernels` ([`Self::carry_moves`]) ahead
+    /// of every later step, in queue order, so this thread only queues
+    /// them (`Keeping::Device`); each record tensor's storage then releases
+    /// the rest off this thread once the device work before its install
+    /// completes, the moves among it, and a later boundary finishes the
+    /// shrink ([`Self::advance`]). Whether it began: not while its records
+    /// resize.
+    pub(super) fn shrink_store(&self, kernels: &[BankMoves], to: u64, decided: Instant, queued: Duration, wake: CompletionWake) -> Result<bool, DomainError> {
         let mut commitment = self.commitment();
         // Everything that can fail before the resizers are taken; an ask
         // the watcher fails returns them, the storage as it was.
@@ -761,24 +765,37 @@ impl ExpertBank {
             .collect::<Result<Vec<_>, _>>()?;
         let views = self.host_views(to).map_err(DomainError::invariant)?;
         let Some(resizers) = Self::idle(&mut commitment)? else {
-            return Ok(None);
+            return Ok(false);
         };
         let from = commitment.slots.load(Ordering::Acquire);
-        if let Err(reason) = self.watcher.shared().shrink_host(records, views) {
-            commitment.resize = Resize::Idle(resizers);
-            return Err(DomainError::invariant(reason));
-        }
-        commitment.slots.store(to, Ordering::Release);
-        match recommit(resizers, self.rows_at(to)) {
-            Ok(resizers) => commitment.resize = Resize::Idle(resizers),
-            Err(refusal) => {
-                let reason = shrink_refused(refusal);
-                commitment.resize = Resize::Broken(reason.clone());
-                return Err(DomainError::invariant(reason));
+        let answered = Self::observe_moves(&mut commitment).and_then(|()| {
+            self.watcher.shared().shrink_host(records, views, Keeping::Device).map_err(DomainError::invariant)
+        });
+        let (trip, kept) = match answered {
+            Ok(answered) => answered,
+            Err(error) => {
+                commitment.resize = Resize::Idle(resizers);
+                return Err(error);
             }
-        }
-        drop(commitment);
-        Ok(Some(LandedShrink { from, to, before, after: self.charged()? }))
+        };
+        let planned = decided.elapsed() - queued;
+        let moving = Instant::now();
+        let moves = kept.into_iter().map(|moves| moves.into_iter().map(|(from, to)| (from as usize, to as usize)).collect());
+        // The watcher has mapped the kept experts to their new records: a
+        // refused submission leaves them reading records no move wrote, a
+        // bank no step may read.
+        commitment.moves = match self.carry_moves(moves, kernels) {
+            Ok(moves) => moves,
+            Err(error) => {
+                commitment.resize = Resize::Broken(format!("a shrink's moves were refused after the watcher committed it: {error}"));
+                return Err(error);
+            }
+        };
+        let moves = moving.elapsed();
+        commitment.slots.store(to, Ordering::Release);
+        let begun = Begun { decided, queued, planned, trips: [trip, Trip::default()], moves };
+        commitment.resize = self.prepare_off_thread(resizers, (from, to), before, begun, wake);
+        Ok(true)
     }
 
     /// Each group's records at `slots` slots.
@@ -845,18 +862,20 @@ impl ExpertBank {
         Resize::Preparing { from, charged, begun, done }
     }
 
-    /// Submit `plan`'s moves to the device in a submission of their own: each
-    /// group's records, by its move list. The device runs
-    /// every later flight after them, in queue order, so no wait is needed
-    /// before the plan commits; a submission refused leaves it uncommitted.
+    /// Submit a shrink's `moves`, each group's (from, to), to the device in a
+    /// submission of their own: each group's records, by its move list. The
+    /// device runs every later flight after them, in queue order, so no wait
+    /// is needed before what they move is mapped. A submission refused
+    /// leaves a shrink the watcher has not committed uncommitted; one it has
+    /// committed, broken.
     fn carry_moves(
         &self,
-        plan: &ShrinkPlan,
+        moves: impl Iterator<Item = Vec<(usize, usize)>>,
         kernels: &[BankMoves],
     ) -> Result<Option<NativeTensorBatchCompletion>, DomainError> {
         let failed = |error: &dyn std::fmt::Display| DomainError::invariant(format!("expert bank moves: {error}"));
         let mut batch = None;
-        let groups = self.layout.groups.iter().zip(plan.moves()).zip(&self.move_lists).zip(kernels);
+        let groups = self.layout.groups.iter().zip(moves).zip(&self.move_lists).zip(kernels);
         for (((group, moves), list), kernels) in groups {
             if moves.is_empty() {
                 continue;
@@ -956,7 +975,7 @@ impl ExpertBank {
             let plan = shared.plan_shrink(candidates, budget).map_err(DomainError::invariant)?;
             let to = plan.slots() as u64;
             let moving = Instant::now();
-            commitment.moves = self.carry_moves(&plan, kernels)?;
+            commitment.moves = self.carry_moves(plan.moves(), kernels)?;
             let moves = moving.elapsed();
             let trips = [plan.trip(), shared.commit_shrink(plan).map_err(DomainError::invariant)?];
             let planned = decided.elapsed() - queued - moves;

@@ -145,7 +145,7 @@ fn a_host_shrink_waits_for_a_past_prompt_group_to_clear() {
     drop(step);
     let shared = harness.watcher.shared().clone();
     let views = harness.host.views(12);
-    let shrink = std::thread::spawn(move || shared.shrink_host(vec![12], vec![views]));
+    let shrink = std::thread::spawn(move || shared.shrink_host(vec![12], vec![views], super::Keeping::Host));
     ahead.finish();
     shrink.join().unwrap().expect("the shrink ends once the group cleared");
     assert_eq!(harness.watcher.shared().life.ended(), None, "the watcher serves on");

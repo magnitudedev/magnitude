@@ -79,6 +79,7 @@ pub(super) fn qualify_bank(
         pass_map,
         convert,
         placement,
+        moves,
         site,
     } = kernels;
     let served = Served::of(banked, route, feed_forward, label)?;
@@ -248,11 +249,12 @@ pub(super) fn qualify_bank(
     }
 
     // Expert 0 into record 1: where the device copies into the bank, the
-    // prompt group's seed and its commit, then a shrink's move of record 1 into record 0
-    // over bytes no entry wrote; where the host lands, its landing's bytes.
-    // Then the host maps it, held from the step on.
+    // prompt group's seed and its commit; where the host lands, its
+    // landing's bytes. Then, whoever places, a shrink's move of record 1
+    // into record 0 over bytes no entry wrote, and the host maps it, held
+    // from the step on.
     match placement {
-        Some(crate::native::DevicePlacement { seed, seed_commit, list_grid, moves }) => {
+        Some(crate::native::DevicePlacement { seed, seed_commit, list_grid }) => {
             // A list's launch grid for its one entry: one row of a copy
             // within device memory's blocks, which the host writes and the
             // kernel keeps; and the list staged beside it.
@@ -294,22 +296,6 @@ pub(super) fn qualify_bank(
                 .call(routed_seed_commit::Args { list: &seeds, step: &step, scratch: &scratch_table, commits: &mut commits })
                 .map_err(|error| qualification_dynamic(entry, label, error))?;
             require_words(&commits, &[(0, 0), (1, SEQUENCE)], entry, label)?;
-            // A shrink's move of record 1 into record 0, over bytes no entry wrote.
-            let entry = "routed_move";
-            let move_list = words(&[list_extent(1)], &list(1, 0), entry)?;
-            for (kernel, fixture) in moves.records.as_ref().zip(records.as_mut()) {
-                fixture
-                    .records
-                    .write_from_host(&[&fixture.marker[..], &fixture.converted[..]].concat())
-                    .map_err(|error| qualification_dynamic(entry, label, error))?;
-                kernel
-                    .call(routed_move::Args {
-                        records: &mut fixture.records,
-                        list: &move_list,
-                    })
-                    .map_err(|error| qualification_dynamic(entry, label, error))?;
-                require_bytes(&fixture.records, &fixture.converted.repeat(2), entry, label)?;
-            }
         }
         None => {
             let failed = |error: &dyn fmt::Display| qualification_dynamic("host placement", label, error);
@@ -320,6 +306,22 @@ pub(super) fn qualify_bank(
                     .map_err(|error| failed(&error))?;
             }
         }
+    }
+    // A shrink's move of record 1 into record 0, over bytes no entry wrote.
+    let entry = "routed_move";
+    let move_list = words(&[list_extent(1)], &list(1, 0), entry)?;
+    for (kernel, fixture) in moves.records.as_ref().zip(records.as_mut()) {
+        fixture
+            .records
+            .write_from_host(&[&fixture.marker[..], &fixture.converted[..]].concat())
+            .map_err(|error| qualification_dynamic(entry, label, error))?;
+        kernel
+            .call(routed_move::Args {
+                records: &mut fixture.records,
+                list: &move_list,
+            })
+            .map_err(|error| qualification_dynamic(entry, label, error))?;
+        require_bytes(&fixture.records, &fixture.converted.repeat(2), entry, label)?;
     }
     set_words(&map, &held(0, 1), "host placement", label)?;
 
@@ -948,17 +950,17 @@ mod tests {
                 .unwrap(),
                 list_grid: routed_list_grid::native_for_device(device, &specialization::<routed_list_grid::Entry>(device, &[]))
                     .unwrap(),
-                moves: BankMoves {
-                    records: bank.record.map(|_, tensor| {
-                        routed_move::native_for_device_with(
-                            device,
-                            routed_move::Elements { U: tensor.resident },
-                            &specialization::<routed_move::Entry>(device, &record_statics(tensor, bank.moves)),
-                        )
-                        .unwrap()
-                    }),
-                },
             }),
+            moves: BankMoves {
+                records: bank.record.map(|_, tensor| {
+                    routed_move::native_for_device_with(
+                        device,
+                        routed_move::Elements { U: tensor.resident },
+                        &specialization::<routed_move::Entry>(device, &record_statics(tensor, bank.moves)),
+                    )
+                    .unwrap()
+                }),
+            },
             site: None,
         }
     }

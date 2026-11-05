@@ -117,10 +117,10 @@ pub(super) enum Ask {
     /// Take a planned shrink's moves, which the device carries.
     Commit(ShrinkPlan),
     /// Shrink each group's host tier to `records`, its kept experts moved
-    /// below them first within the records its tier tensors address, which
-    /// then address `views` (each group's record tensors' records
-    /// committed after it).
-    ShrinkHost { records: Vec<u32>, views: Vec<Vec<Records>> },
+    /// below them first within the records its tier tensors address, by
+    /// `keeping`, which then address `views` (each group's record tensors'
+    /// records committed after it).
+    ShrinkHost { records: Vec<u32>, views: Vec<Vec<Records>>, keeping: Keeping },
     /// Serve the places the bank holds from now by their words.
     Place(PlacedWords),
 }
@@ -203,7 +203,31 @@ impl Joins {
 enum Answer {
     Planned(ShrinkPlan),
     Done(Trip),
+    /// A shrink of the records the host lands into, whose kept records the
+    /// device moves (`Keeping::Device`).
+    Kept(Trip, KeptMoves),
 }
+
+/// Who moves the kept experts of a shrink of the records the host lands
+/// into ([`Shared::shrink_host`]) below its new records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Keeping {
+    /// The host copies them before it answers: a host tier, in host RAM,
+    /// which no device work reaches.
+    Host,
+    /// The device moves them, in queue order ahead of every later step,
+    /// as the answer names them: the one store, where the host places, so
+    /// the owner's thread only queues them. Every host write of a record
+    /// the moves write follows the device past them: the records then
+    /// ready are none of theirs, a record unmapped later frees only as the
+    /// device's frontier passes a step queued after them or it parks in
+    /// one, and a landing a step asks for follows the step.
+    Device,
+}
+
+/// Each group's moves of a shrink's kept records, (from, to), for the device
+/// to carry ([`Keeping::Device`]).
+pub(crate) type KeptMoves = Vec<Vec<(u32, u32)>>;
 
 enum Resize {
     None,
@@ -272,7 +296,7 @@ impl Shared {
     pub fn plan_shrink(&self, candidates: Candidates, budget: Option<MoveBudget>) -> Result<ShrinkPlan, String> {
         match self.ask(Ask::Shrink { candidates, budget })? {
             Answer::Planned(plan) => Ok(plan),
-            Answer::Done(_) => unreachable!("a shrink is answered with its plan"),
+            Answer::Done(_) | Answer::Kept(..) => unreachable!("a shrink is answered with its plan"),
         }
     }
 
@@ -282,7 +306,7 @@ impl Shared {
     pub fn commit_shrink(&self, plan: ShrinkPlan) -> Result<Trip, String> {
         match self.ask(Ask::Commit(plan))? {
             Answer::Done(trip) => Ok(trip),
-            Answer::Planned(_) => unreachable!("a commit is answered done"),
+            Answer::Planned(_) | Answer::Kept(..) => unreachable!("a commit is answered done"),
         }
     }
 
@@ -298,23 +322,21 @@ impl Shared {
         self.events().notify();
     }
 
-    /// Each group's host tier holds `records` records from now, at most as
-    /// many as before, between flights; the rest are released once this
-    /// returns. It retires every step and waits for the reads in flight to
-    /// land, so every record is free (no step reads one and no landing
-    /// writes one), and
-    /// keeps each group's most valuable records (`HostRecords::shrink`),
-    /// their bytes copied below its new records within those its tier
-    /// tensors address, which address `views` from then on: the watcher
-    /// holds no view of a released record once it answers.
-    pub(in crate::experts) fn shrink_host(&self, records: Vec<u32>, views: Vec<Vec<Records>>) -> Result<Trip, String> {
-        self.host_done(Ask::ShrinkHost { records, views })
-    }
-
-    fn host_done(&self, ask: Ask) -> Result<Trip, String> {
-        match self.ask(ask)? {
-            Answer::Done(trip) => Ok(trip),
-            Answer::Planned(_) => unreachable!("a host tier's resize is answered done"),
+    /// Each group's records, a host tier's or the one store's, number
+    /// `records` from now, at most as many as before, between flights. It
+    /// retires every step and waits for the reads in flight to land, so
+    /// every record is free (no step reads one and no landing writes one),
+    /// and keeps each group's most valuable records (`HostRecords::shrink`)
+    /// below its new records, which address `views` from then on: the
+    /// watcher holds no view of a released record once it answers. Kept
+    /// on the host (`Keeping::Host`), their bytes are copied before it
+    /// answers; on the device (`Keeping::Device`), it answers the moves the
+    /// caller queues before the rest are released.
+    pub(in crate::experts) fn shrink_host(&self, records: Vec<u32>, views: Vec<Vec<Records>>, keeping: Keeping) -> Result<(Trip, KeptMoves), String> {
+        match self.ask(Ask::ShrinkHost { records, views, keeping })? {
+            Answer::Done(trip) => Ok((trip, KeptMoves::new())),
+            Answer::Kept(trip, moves) => Ok((trip, moves)),
+            Answer::Planned(_) => unreachable!("a shrink of kept records is answered done or with its moves"),
         }
     }
 
@@ -500,23 +522,33 @@ impl Residency {
                 self.publish_held();
                 Answer::Done(trip())
             }
-            Ask::ShrinkHost { records, views } => {
+            Ask::ShrinkHost { records, views, keeping } => {
+                let mut moved = KeptMoves::new();
                 for (group, records) in records.into_iter().enumerate() {
-                    let tensors = self.core.groups[group].tier.as_ref().expect("a host tier shrinks only beside its tensors");
-                    for (from, to) in self.core.directory.shrink_host(group, records) {
-                        for tensor in tensors.iter().map(|tensor| &tensor.records) {
-                            // SAFETY: both are committed records of the
-                            // tensor, nothing reads or writes them meanwhile
-                            // (every step retired, between flights), and
-                            // distinct records never overlap.
-                            unsafe { tensor.copy_record(u64::from(to.0), tensor, u64::from(from.0), tensor.bytes()) };
+                    let moves = self.core.directory.shrink_host(group, records);
+                    match keeping {
+                        Keeping::Host => {
+                            let tensors = self.core.groups[group].tier.as_ref().expect("a host tier shrinks only beside its tensors");
+                            for &(from, to) in &moves {
+                                for tensor in tensors.iter().map(|tensor| &tensor.records) {
+                                    // SAFETY: both are committed records of the
+                                    // tensor, nothing reads or writes them meanwhile
+                                    // (every step retired, between flights), and
+                                    // distinct records never overlap.
+                                    unsafe { tensor.copy_record(u64::from(to.0), tensor, u64::from(from.0), tensor.bytes()) };
+                                }
+                            }
                         }
+                        Keeping::Device => moved.push(moves.into_iter().map(|(from, to)| (from.0, to.0)).collect()),
                     }
                 }
                 self.address_tier(views);
                 self.shared.telemetry.resized(self.core.bank_records());
                 self.publish_held();
-                Answer::Done(trip())
+                match keeping {
+                    Keeping::Host => Answer::Done(trip()),
+                    Keeping::Device => Answer::Kept(trip(), moved),
+                }
             }
             Ask::Place(PlacedWords { flags, layers }) => {
                 let places = flags.len();

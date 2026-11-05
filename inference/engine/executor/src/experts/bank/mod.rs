@@ -24,14 +24,14 @@ use super::{copies, watcher, HostCompute, Machine};
 use resize::{Commitment, HostTier, ResizeThread};
 pub(crate) use served::ServedBank;
 
-/// The bytes a shrink of the records the host lands into releases, so that it
-/// holds the submitting thread no longer than a decode `step`, in seconds, at
-/// the `rate` the last such shrink released them. Unmeasured, the least,
-/// whose release measures it. None, the whole deficit, without a step to hold
-/// it to.
-fn landed_bytes(step: Option<f64>, rate: Option<f64>) -> Option<u64> {
-    let step = step?;
-    Some(rate.map_or(0, |rate| (rate * step) as u64))
+/// The bytes a shrink of the host tier releases, so that it holds the
+/// submitting thread no longer than a decode `step`, in seconds, at the
+/// `rate` the last such shrink released them. Without either (a rate no
+/// release measured yet, or a step no miss record prices), the least that
+/// releases storage, which measures the rate; the ladder takes the rest a
+/// shrink at a time, at the boundaries after it.
+fn landed_bytes(step: Option<f64>, rate: Option<f64>) -> u64 {
+    step.zip(rate).map_or(0, |(step, rate)| (rate * step) as u64)
 }
 
 /// The holdings the bank itself resizes (`BankHolding`): its experts'

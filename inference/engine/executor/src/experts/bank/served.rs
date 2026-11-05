@@ -16,13 +16,13 @@ pub(crate) struct ServedBank {
     bank: Arc<ExpertBank>,
     moves: Vec<BankMoves>,
     tables: Vec<HeldTable>,
-    /// The resizes done when asked (a table's, a landed shrink), each until
-    /// an advance reports it, in the order they were done.
+    /// The resizes done when asked (a table's, a host tier's shrink), each
+    /// until an advance reports it, in the order they were done.
     finished: Mutex<std::collections::VecDeque<BankResized>>,
-    /// The rate the last shrink of the records the host lands into released
-    /// them, in bytes a second, while holding the submitting thread (the
-    /// watcher's copies of the records it keeps, then the storage's release);
-    /// none before one finished.
+    /// The rate the last shrink of the host tier released it, in bytes a
+    /// second, while holding the submitting thread (the watcher's copies of
+    /// the records it keeps, then the storage's release); none before one
+    /// finished.
     landed_rate: Mutex<Option<f64>>,
 }
 
@@ -303,16 +303,12 @@ impl ServedBank {
         Ok(shrunk(self.shrink_steps(resident)?, deficit))
     }
 
-    /// Shrink the records the host lands into to `to` now, between flights,
-    /// decided at `decided` and queued `queued`: `holding`'s, the host
-    /// tier's host slots, or where the host places the one store's slots;
-    /// the shrink the next advance reports, `wake` completed at once.
-    fn shrink_landed(&self, holding: BankHolding, to: u64, decided: Instant, queued: Duration, wake: CompletionWake) -> Result<BankStep, DomainError> {
-        let shrunk = match holding {
-            BankHolding::Host => self.bank.shrink_host(to)?,
-            _ => self.bank.shrink_store(to)?,
-        };
-        let Some(LandedShrink { from, to: at, before, after }) = shrunk else {
+    /// Shrink the host tier to `to` host slots now, between flights, decided
+    /// at `decided` and queued `queued`: the shrink the next advance reports,
+    /// `wake` completed at once.
+    fn shrink_host(&self, to: u64, decided: Instant, queued: Duration, wake: CompletionWake) -> Result<BankStep, DomainError> {
+        let holding = BankHolding::Host;
+        let Some(LandedShrink { from, to: at, before, after }) = self.bank.shrink_host(to)? else {
             return Ok(BankStep::Running);
         };
         let done = Instant::now();
@@ -336,23 +332,31 @@ impl ServedBank {
         Ok(BankStep::Begun(self.storage(holding)?))
     }
 
-    /// The target of a shrink of the records the host lands into, of
-    /// `holding` from `from`, toward `deepest`: within what one decode step
-    /// may hold the submitting thread ([`landed_bytes`]). The owner's ladder
-    /// resumes as each finishes, so a deficit is covered a step at a time.
-    fn landed_target(
-        &self,
-        holding: BankHolding,
-        from: u64,
-        deepest: u64,
-        resident: Option<&crate::ResidentStep>,
-    ) -> Result<u64, DomainError> {
+    /// The target of a shrink of the host tier from `from` host slots,
+    /// toward `deepest`: within what one decode step may hold the submitting
+    /// thread ([`landed_bytes`]). The owner's ladder resumes as each
+    /// finishes, so a deficit is covered a step at a time.
+    fn host_target(&self, from: u64, deepest: u64, resident: Option<&crate::ResidentStep>) -> Result<u64, DomainError> {
         let rate = *self.landed_rate.lock().expect("landed rate");
-        let Some(bytes) = landed_bytes(self.step_seconds(resident)?, rate) else {
-            return Ok(deepest);
-        };
-        let paced = self.releasing(holding, from, bytes)?.expect("a selected shrink releases physical storage");
+        let bytes = landed_bytes(self.step_seconds(resident)?, rate);
+        let paced = self.releasing(BankHolding::Host, from, bytes)?.expect("a selected shrink releases physical storage");
         Ok(paced.max(deepest))
+    }
+
+    /// The target of a shrink of the one store from `from` slots, between
+    /// `shallowest`, the nearest that releases storage, and `deepest`: the
+    /// deepest whose moves fit `budget` (one decode step's device time), at
+    /// least `shallowest`; `shallowest` without a budget. A shrink moves at
+    /// most every record it releases (a record moves only from past the new
+    /// records), so the moves of the target fit by construction, whichever
+    /// records the watcher keeps.
+    fn store_target(&self, from: u64, (shallowest, deepest): (u64, u64), budget: Option<MoveBudget>) -> u64 {
+        let Some(budget) = budget else {
+            return shallowest;
+        };
+        let plan = &self.bank.plan;
+        let released = |to: u64| move |group: usize| plan.records_at(group, from) - plan.records_at(group, to);
+        (deepest..shallowest).rev().take_while(|&to| budget.fits(&released(to))).last().unwrap_or(shallowest)
     }
 
     /// The next growth step of the holdings in `kind` storage within `room`
@@ -596,9 +600,16 @@ impl ElasticBank for ServedBank {
                 let budget = self.move_budget(resident, moves)?;
                 self.bank.shrink(&self.moves, (shallowest, deepest), budget, decided, wake)
             }
-            (BankHolding::Experts, Placer::Bank) | (BankHolding::Host, _) => {
-                let target = self.landed_target(holding, from, deepest, resident)?;
-                self.shrink_landed(holding, target, decided, queued, wake)
+            (BankHolding::Experts, Placer::Bank) => {
+                let target = self.store_target(from, (shallowest, deepest), self.move_budget(resident, moves)?);
+                match self.bank.shrink_store(&self.moves, target, decided, queued, wake)? {
+                    true => Ok(BankStep::Begun(kind)),
+                    false => Ok(BankStep::Running),
+                }
+            }
+            (BankHolding::Host, _) => {
+                let target = self.host_target(from, deepest, resident)?;
+                self.shrink_host(target, decided, queued, wake)
             }
             (BankHolding::Table { table: index }, _) => self.resize_table(index, deepest, decided, queued, wake),
         }

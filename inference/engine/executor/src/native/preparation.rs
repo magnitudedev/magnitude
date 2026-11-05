@@ -2696,19 +2696,16 @@ impl<'a> Preparation<'a> {
             })
             .transpose()?;
         let list_grid = places.then(|| spec.fixed(&bindings, &[], routed_list_grid::native_entry())).transpose()?;
-        // Each routed tensor's records.
-        let moves = places
-            .then(|| {
-                bank.record.try_map(|_, tensor| {
-                    let [n, k] = tensor.matrix;
-                    spec.fixed(
-                        &bindings,
-                        &[("D", bank.records), ("L", bank.moves), ("N", n), ("K", k)],
-                        routed_move::native_entry_with(routed_move::Elements { U: tensor.resident }),
-                    )
-                })
-            })
-            .transpose()?;
+        // Each routed tensor's records, whoever places: a shrink's moves run
+        // on the device in queue order.
+        let moves = bank.record.try_map(|_, tensor| {
+            let [n, k] = tensor.matrix;
+            spec.fixed(
+                &bindings,
+                &[("D", bank.records), ("L", bank.moves), ("N", n), ("K", k)],
+                routed_move::native_entry_with(routed_move::Elements { U: tensor.resident }),
+            )
+        })?;
         let site = self.bank_site(slot, bank, layers, &bindings)?;
         /// Every tensor's kernel, or none where one is a count or a listing.
         fn formed<T>(kernels: crate::planning::RecordTensors<Option<T>>) -> Option<crate::planning::RecordTensors<T>> {
@@ -2728,17 +2725,15 @@ impl<'a> Preparation<'a> {
         else {
             return Ok(None);
         };
-        let Some(convert) = formed(convert) else {
+        let (Some(convert), Some(moves)) = (formed(convert), formed(moves)) else {
             return Ok(None);
         };
-        let placement = match (seed, seed_commit, list_grid, moves) {
-            (Some(seed), Some(seed_commit), Some(list_grid), Some(moves)) => {
-                let (Some(seed), Some(seed_commit), Some(list_grid), Some(moves)) =
-                    (formed(seed), seed_commit, list_grid, formed(moves))
-                else {
+        let placement = match (seed, seed_commit, list_grid) {
+            (Some(seed), Some(seed_commit), Some(list_grid)) => {
+                let (Some(seed), Some(seed_commit), Some(list_grid)) = (formed(seed), seed_commit, list_grid) else {
                     return Ok(None);
                 };
-                Some(super::DevicePlacement { seed, seed_commit, list_grid, moves: super::BankMoves { records: moves } })
+                Some(super::DevicePlacement { seed, seed_commit, list_grid })
             }
             _ => None,
         };
@@ -2757,6 +2752,7 @@ impl<'a> Preparation<'a> {
             pass_map,
             convert,
             placement,
+            moves: super::BankMoves { records: moves },
             site,
         }))
     }

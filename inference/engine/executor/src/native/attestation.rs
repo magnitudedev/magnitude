@@ -591,14 +591,10 @@ impl AttestedPrograms {
         self.target_graphs.as_deref()
     }
 
-    /// Each bank group's record moves (`DevicePlacement::moves`), its
+    /// Each bank group's record moves (`ExpertBankKernels::moves`), its
     /// first layer's bank entries': every layer of a group shares its
-    /// binding. None where the host places: its shrinks move nothing on the
-    /// device.
+    /// binding.
     pub(crate) fn expert_bank_moves(&self, plan: &crate::ExpertBankPlan) -> Result<Vec<super::BankMoves>, String> {
-        if plan.placer() == crate::planning::Placer::Bank {
-            return Ok(Vec::new());
-        }
         plan.groups
             .iter()
             .map(|group| {
@@ -608,8 +604,7 @@ impl AttestedPrograms {
                     .blocks
                     .get(index.block as usize)
                     .and_then(|block| block.bank.as_ref())
-                    .and_then(|bank| bank.placement.as_ref())
-                    .map(|placement| placement.moves.clone())
+                    .map(|bank| bank.moves.clone())
                     .ok_or_else(|| format!("{scope:?} has no bank entries"))
             })
             .collect()

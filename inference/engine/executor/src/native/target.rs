@@ -94,6 +94,9 @@ pub struct ExpertBankKernels {
     /// The device's placements into the bank, where it places
     /// (`BankBinding::placer`): none in a program whose host places.
     pub placement: Option<DevicePlacement>,
+    /// A shrink's moves of the bank's kept records, which the device runs in
+    /// queue order ahead of every later step, whoever places.
+    pub moves: BankMoves,
     /// Its CPU site, where the bank has a host tier the CPU reads its
     /// misses from, the backend serves the site's entries, and, once
     /// qualified, the precision system admits its arithmetic
@@ -201,7 +204,7 @@ impl SiteForm {
 /// The device's copies into a bank's records: a prompt group's seeding
 /// (each routed tensor's copy from the scratch tier into the bank's records
 /// on the seed list's grid, then the commit of each seeded record, which
-/// the host then maps) and a shrink's moves.
+/// the host then maps).
 #[derive(Clone, Debug)]
 pub struct DevicePlacement {
     pub seed: RecordTensors<NativeKernel<magnitude_kernels::routed_copy::Entry>>,
@@ -209,7 +212,6 @@ pub struct DevicePlacement {
     /// The launch grid of the seed list's entries, which the seed copy
     /// launches on.
     pub list_grid: NativeKernel<magnitude_kernels::routed_list_grid::Entry>,
-    pub moves: BankMoves,
 }
 
 /// A shrink's record moves (`routed_move`).

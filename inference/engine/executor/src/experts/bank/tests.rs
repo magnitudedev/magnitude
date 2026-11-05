@@ -7,14 +7,13 @@ use super::served::{Step, grown, shrunk};
 use super::resize::{Cut, Done, grow_by_slots};
 
 /// A landed shrink holds the thread at most a step at its latest
-/// measured rate: 10 GB/s over a 35 ms step is 350 MB; unmeasured, the
-/// least, which measures it; with no step to hold it to, the whole
-/// deficit.
+/// measured rate: 10 GB/s over a 35 ms step is 350 MB; unmeasured, or
+/// with no step to hold it to, the least, which measures the rate.
 #[test]
 fn a_landed_shrink_releases_what_one_step_may_hold() {
-    assert_eq!(super::landed_bytes(Some(0.035), Some(1e10)), Some(350_000_000));
-    assert_eq!(super::landed_bytes(Some(0.035), None), Some(0));
-    assert_eq!(super::landed_bytes(None, Some(1e10)), None);
+    assert_eq!(super::landed_bytes(Some(0.035), Some(1e10)), 350_000_000);
+    assert_eq!(super::landed_bytes(Some(0.035), None), 0);
+    assert_eq!(super::landed_bytes(None, Some(1e10)), 0);
 }
 
 use super::*;
