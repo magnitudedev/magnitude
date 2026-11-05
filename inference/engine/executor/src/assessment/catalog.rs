@@ -3,9 +3,10 @@
 //! memory terms, and every graph a load prepares, so no call lies outside
 //! its kernel's domain; where its experts stream on a backend, the same of
 //! its load with them in an expert bank at its floor. A form the executor
-//! does not run, or does not stream, is refused with a typed reason before
-//! any term is derived; a target past admission whose terms or graphs fail
-//! is a failure.
+//! does not run is refused with a typed reason before any term is derived;
+//! a target past admission whose terms or graphs fail, or a served target
+//! whose experts a backend that streams experts refuses to stream, is a
+//! failure.
 
 use super::demand::DecodeDemand;
 use super::launches::Declarations;
@@ -13,7 +14,7 @@ use super::AssessmentError;
 use crate::{
     resident_layout, AssessmentGraphResourceBounds, AssessmentMemoryTerms, ComponentSelection,
     ExecutionPath, ModelLoadPlan, PlanError, PlannedMethod, ResourceCapacity, ResourceLimits,
-    ResourcePlanner,
+    ResourcePlanner, UnstreamedExperts,
 };
 use magnitude_artifacts::catalog_headers::{CatalogComponent, ComponentRole};
 use magnitude_artifacts::{
@@ -46,13 +47,6 @@ const FAMILIES: [&dyn ModelFamily; 7] = [
 /// Catalog models whose target's load must derive whatever their catalog
 /// support level.
 const REQUIRED: [&str; 1] = ["qwen3.8-flash-next:gguf:q4"];
-
-/// Catalog models whose experts must stream on every backend whose recorded
-/// device streams experts at all (whose refusal is no fact of the device or
-/// its backend, [`refused_by_the_device`]), by catalog model ID:
-/// each variant of the headline model, split across files, NVFP4 scales and
-/// an n-gram table beside the bank.
-const STREAMED: [&str; 2] = ["qwen3.8-flash-next:gguf:q4", "qwen3.8-flash-next:gguf:nvfp4"];
 
 /// Each catalog model's support level (`catalog/models.json`), by catalog
 /// model ID.
@@ -106,8 +100,6 @@ fn every_admitted_catalog_target_derives_complete_terms() {
     let mut failures = Vec::new();
     let levels = support_levels();
     let mut required_seen = Vec::new();
-    // Each target's refusal to stream on a backend, and why.
-    let mut unstreamed = Vec::new();
     for component in headers::index() {
         if component.role != ComponentRole::Target {
             continue;
@@ -170,9 +162,15 @@ fn every_admitted_catalog_target_derives_complete_terms() {
                 Ok((reservation, host)) => Some(load.bank_floor(&definition, 1, LIMITS.flights(), reservation, host).and_then(|floor| {
                     load.clone().with_expert_bank(&definition, floor, 1, LIMITS.flights(), reservation, host)
                 })),
+                // A served target that routes experts streams them on every
+                // backend whose recorded device streams experts at all: only
+                // a fact of the device or its backend refuses it.
                 Err(PlanError::Unstreamed(reason)) => {
-                    refused.push(format!("{name} {} banked: {reason}", backend.as_str()));
-                    unstreamed.push((name.to_string(), backend, reason));
+                    let line = format!("{name} {} banked: {reason}", backend.as_str());
+                    match served && !matches!(reason, UnstreamedExperts::Unrouted) && !refused_by_the_device(&reason) {
+                        true => failures.push(line),
+                        false => refused.push(line),
+                    }
                     None
                 }
                 Err(error) => {
@@ -216,25 +214,12 @@ fn every_admitted_catalog_target_derives_complete_terms() {
             );
         }
     }
-    // The targets that must stream derive their banked terms on every
-    // backend, unless the recorded device or its backend streams no experts.
-    for backend in BackendName::ALL {
-        for name in STREAMED {
-            let prefix = format!("{name} {} banked:", backend.as_str());
-            let refusal = unstreamed.iter().find(|(target, at, _)| target == name && *at == backend).map(|(_, _, reason)| reason);
-            assert!(
-                admitted.iter().any(|line| line.starts_with(&prefix)) || refusal.is_some_and(refused_by_the_device),
-                "{name} does not stream on {}: {refusal:?}",
-                backend.as_str()
-            );
-        }
-    }
 }
 
 /// Whether `reason` is a fact of the device or its backend, which refuses
 /// every model alike, rather than of the model.
-fn refused_by_the_device(reason: &crate::UnstreamedExperts) -> bool {
-    use crate::UnstreamedExperts::*;
+fn refused_by_the_device(reason: &UnstreamedExperts) -> bool {
+    use UnstreamedExperts::*;
     matches!(reason, Backend(_) | Unreserved(_) | Unreservable { .. } | Untiered { .. })
 }
 
@@ -296,24 +281,24 @@ fn bank_reservations(
     Ok(substrate)
 }
 
-/// Every expert record form a served catalog target streams on CUDA (each
-/// routed tensor's stored and resident elements and matrix, as its bank
-/// plans it) is resident as stored, or converts on the host, piece by piece
+/// Every expert record form a served catalog target streams on each backend
+/// whose recorded device streams experts (each routed tensor's stored and
+/// resident elements and matrix, as its bank on that backend plans it) is
+/// resident as stored, or converts on the host, piece by piece
 /// as a landing converts it (`RowConversion::piece`), into exactly the
 /// registry's reference bytes:
 /// one record of every form, in its conversion's domain, as pieces of one
 /// tile and as pieces of the most whole tiles of 128 KiB of its source (a
 /// landing's read unit).
 #[test]
-fn every_streamed_cuda_record_converts_on_the_host_as_its_reference() {
+fn every_streamed_record_converts_on_the_host_as_its_reference() {
     let identity = PackageIdentity {
         target: ArtifactIdentity([7; 32]),
         projector: None,
     };
     let levels = support_levels();
-    let backend = BackendName::Cuda;
-    // Each form, and the targets that stream it.
-    let mut forms = BTreeMap::<(String, String, [u64; 2]), Vec<String>>::new();
+    // Each form on each backend, and the targets that stream it.
+    let mut forms = BTreeMap::<(BackendName, String, String, [u64; 2]), Vec<String>>::new();
     for component in headers::index() {
         if component.role != ComponentRole::Target {
             continue;
@@ -345,36 +330,42 @@ fn every_streamed_cuda_record_converts_on_the_host_as_its_reference() {
             continue;
         }
         let manifest = target_manifest(component, &target, identity);
-        let load = plain_load(&manifest, &definition, backend)
-            .unwrap_or_else(|error| panic!("{name}: its plain load plans on CUDA: {error}"));
-        let banked = bank_reservations(&definition, backend)
-            .and_then(|(reservation, host)| {
-                let floor = load.bank_floor(&definition, 1, LIMITS.flights(), reservation, host)?;
-                load.with_expert_bank(&definition, floor, 1, LIMITS.flights(), reservation, host)
-            })
-            .unwrap_or_else(|error| panic!("{name}: its bank plans on CUDA: {error}"));
-        let bank = banked.expert_bank().expect("a banked load has a bank");
-        for group in &bank.groups {
-            for (_, tensor) in group.record.iter() {
-                let form = (
-                    tensor.source.name().to_owned(),
-                    tensor.resident.name().to_owned(),
-                    tensor.matrix,
-                );
-                forms.entry(form).or_default().push(name.to_owned());
+        for backend in BackendName::ALL {
+            let (reservation, host) = match bank_reservations(&definition, backend) {
+                Ok(substrate) => substrate,
+                Err(PlanError::Unstreamed(reason)) if refused_by_the_device(&reason) => continue,
+                Err(error) => panic!("{name}: its bank's substrate on {}: {error}", backend.as_str()),
+            };
+            let load = plain_load(&manifest, &definition, backend)
+                .unwrap_or_else(|error| panic!("{name}: its plain load plans on {}: {error}", backend.as_str()));
+            let banked = load
+                .bank_floor(&definition, 1, LIMITS.flights(), reservation, host)
+                .and_then(|floor| load.with_expert_bank(&definition, floor, 1, LIMITS.flights(), reservation, host))
+                .unwrap_or_else(|error| panic!("{name}: its bank plans on {}: {error}", backend.as_str()));
+            let bank = banked.expert_bank().expect("a banked load has a bank");
+            for group in &bank.groups {
+                for (_, tensor) in group.record.iter() {
+                    let form = (
+                        backend,
+                        tensor.source.name().to_owned(),
+                        tensor.resident.name().to_owned(),
+                        tensor.matrix,
+                    );
+                    forms.entry(form).or_default().push(name.to_owned());
+                }
             }
         }
     }
     assert!(
-        forms.keys().any(|(_, resident, _)| resident.ends_with("@mma16")),
+        forms.keys().any(|(backend, _, resident, _)| *backend == BackendName::Cuda && resident.ends_with("@mma16")),
         "some catalog target streams mma16 records on CUDA: {forms:?}"
     );
-    for ((source, resident, [n, k]), targets) in &forms {
+    for ((backend, source, resident, [n, k]), targets) in &forms {
         let (source, resident) = (
             seismic::Element::named(source).unwrap(),
             seismic::Element::named(resident).unwrap(),
         );
-        let context = format!("{} -> {} [{n}, {k}] of {targets:?}", source.name(), resident.name());
+        let context = format!("{} {} -> {} [{n}, {k}] of {targets:?}", backend.as_str(), source.name(), resident.name());
         // A record resident as stored lands as its bytes.
         if source == resident {
             println!("{context}: resident as stored");
