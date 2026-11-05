@@ -105,8 +105,14 @@ Apply these steps in order when preparation cannot fit:
    toward its floor, retained prefixes (least recently used first), then the
    optional components once no request is resident. Each release goes to the
    cheapest rung with anything left, so what a costlier release frees for a cheaper
-   rung is released before the next costly one. The reclaim band and a new
-   request's residency release down the same ladder.
+   rung is released before the next costly one. A release that a later flight
+   boundary finishes (idle graph slots, released off the submitting thread; an
+   expert bank resize) holds the ladder: nothing costlier runs until each such
+   release has finished. The bank's memory stores resize independently, so a
+   shrink waits only for a resize of its own store and a store's growth gives way
+   only to a shrink its own memory needs. A shrink needs no memory: one its
+   storage refuses is a broken invariant, never a rung to pass. The reclaim band
+   and a new request's residency release down the same ladder.
 3. Drop trailing batch members.
 4. Reduce the actual legal token allowance.
 5. Evict victims, the ladder's last rung, priced by exclusive releasable bytes and
@@ -120,10 +126,14 @@ changed. Indivisible input spans retain their [boundary semantics](inputs.md).
 Numerical storage for fresh requests is allocated during negotiated preparation,
 not unconditionally during logical admission. Capacity facts come from the shared
 runtime resource domain, including retained model weights, state, and scratch.
-Allocation denial keeps its typed required/available byte facts through model
+The memory stores are read fresh only by the owner's memory probes, a deficit's
+retry and claims; between them the heap follows the process's own charge in
+Seismic's ledgers, so a step reads nothing of the OS. Allocation denial keeps its typed required/available byte facts through model
 preparation; native failures without capacity evidence are not reclassified by
 matching diagnostic text. Reclamation and eviction report the observed decrease
-in charged bytes, including aliases and retained checkpoints.
+in charged bytes, including aliases and retained checkpoints, and beside it the
+device store's claim (its allocations, or what its backend holds where that is
+more).
 
 Victim ordering favors output-blocked requests, then lower preemption debt, then
 more exclusive bytes per replayed input, then lower accumulated service. Protected
