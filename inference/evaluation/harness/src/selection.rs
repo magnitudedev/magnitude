@@ -249,11 +249,19 @@ mod tests {
         };
         let scratch = Scratch::new();
         let path = scratch.0.join("tuning.jsonl");
+        struct Cores;
+        impl seismic::device::cpu::Queries for Cores {
+            fn worker_cores(&self) -> Option<u64> {
+                Some(8)
+            }
+        }
+        let device = seismic::device::DeviceProperties::Cpu(seismic::device::cpu::describe(&Cores, &Default::default()).unwrap());
         let trace = TuningTrace::begin(
             &path,
             magnitude_executor::TracedWork::Search,
             TuningSettings::STANDARD,
             ResolvedNumericalProfile::standard(),
+            &device,
         )
         .unwrap();
         let configuration = Configuration {

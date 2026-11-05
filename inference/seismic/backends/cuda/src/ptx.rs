@@ -4017,6 +4017,12 @@ mod tests {
         fn cooperative_launch(&self) -> Option<bool> {
             Some(self.cooperative_launch)
         }
+        fn max_registers_per_thread(&self) -> Option<u64> {
+            Some(255)
+        }
+        fn max_registers_per_block(&self) -> Option<u64> {
+            Some(65536)
+        }
     }
 
     fn properties(cooperative_launch: bool) -> crate::profile::Properties {
@@ -4032,7 +4038,6 @@ mod tests {
             ptx: PtxTarget::BASELINE,
             tensor_memory: TensorMemory::Unavailable,
             properties: properties(true),
-            max_registers_per_thread: 255,
             codegen_registers_per_thread: 64,
             global_memory_bytes: 1048576,
             kernel_parameter_bytes: 4096,

@@ -32,6 +32,9 @@ pub mod testing {
 }
 pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactStore, DeviceOptions};
 pub use seismic_runtime::probes::{serve_probe_if_asked, KeptProbe, ProbeFailure, ProbeRun, NAMESPACE as PROBE_NAMESPACE};
+/// What a native declaration reads of the device it runs on, `device.NAME`,
+/// and how each backend establishes it.
+pub use seismic_lang::device;
 pub use seismic_runtime::formation::FormedPrograms;
 pub use seismic_runtime::{backing_times, large_page_backing, BackingTimes, LargePageBacking};
 /// Offline formation coverage of a generated module's native
@@ -354,6 +357,11 @@ impl Device {
     }
     pub fn info(&self) -> &Executor {
         self.inner.info()
+    }
+    /// The device's properties (`seismic::device`), its probes as the
+    /// measurement job stored them when it opened.
+    pub fn properties(&self) -> &device::DeviceProperties {
+        self.inner.properties()
     }
     /// What this device's graphs cost its submissions so far: graphs
     /// recorded (a submission during which that count grew recorded one on

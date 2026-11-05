@@ -55,6 +55,9 @@ use std::time::Instant;
 /// version 3 is asked to know; nor the `abandoned` pieces of a `budget`
 /// and its ending's `draining_seconds`. A promoted choice's program is the
 /// artifact its search compiled and stored: nothing more is formed for it.
+/// `began` states the `device`'s properties (`seismic::device`), and a
+/// unit's `finished` its `default_launches`: each launch of its defaults,
+/// its workgroup's `threads` and its compiler's `statistics`.
 pub const TRACE_SCHEMA: &str = "tuning-trace/3";
 
 pub struct TuningTrace {
@@ -143,12 +146,14 @@ fn render(record: &impl Serialize) -> Vec<u8> {
 }
 
 impl TuningTrace {
-    /// Open `path` for appending and record that `work` begins.
+    /// Open `path` for appending and record that `work` begins on a device
+    /// of `device`'s properties.
     pub fn begin(
         path: &Path,
         work: TracedWork,
         settings: TuningSettings,
         profile: &super::ResolvedNumericalProfile,
+        device: &seismic::device::DeviceProperties,
     ) -> Result<Self, String> {
         let file = OpenOptions::new()
             .create(true)
@@ -200,6 +205,8 @@ impl TuningTrace {
             "admission": "rounding_steps",
             "governing_step": seismic::GOVERNING_STEP,
             "comparison_version": seismic::COMPARISON_VERSION,
+            // A probed property not yet measured is null.
+            "device": device,
         }));
         Ok(trace)
     }
@@ -804,11 +811,19 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
+        struct Cores;
+        impl seismic::device::cpu::Queries for Cores {
+            fn worker_cores(&self) -> Option<u64> {
+                Some(8)
+            }
+        }
+        let device = seismic::device::DeviceProperties::Cpu(seismic::device::cpu::describe(&Cores, &Default::default()).unwrap());
         let trace = TuningTrace::begin(
             &path,
             TracedWork::Search,
             TuningSettings::STANDARD,
             crate::ResolvedNumericalProfile::standard(),
+            &device,
         )
         .unwrap();
         let configuration = seismic::Configuration {

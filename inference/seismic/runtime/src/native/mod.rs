@@ -494,15 +494,18 @@ impl<P> Launches<P> {
     /// ([`NativePrepared::launches`] refuses any other), and every launch
     /// such a call can activate is formed.
     fn launch(&self, ordinal: usize) -> (&P, usize) {
-        self.formed(ordinal)
-            .expect("an active launch is formed: its call is within the specialization's ranges")
+        let (program, entry, _) = self
+            .formed(ordinal)
+            .expect("an active launch is formed: its call is within the specialization's ranges");
+        (program, entry)
     }
 
-    /// The program and entry of launch `ordinal`, where it is formed.
-    fn formed(&self, ordinal: usize) -> Option<(&P, usize)> {
+    /// The program, entry ordinal and entry of launch `ordinal`, where it
+    /// is formed.
+    fn formed(&self, ordinal: usize) -> Option<(&P, usize, &ProgramEntry)> {
         self.launches[ordinal]
             .as_ref()
-            .map(|(compile, entry, _)| (compile.program(), *entry))
+            .map(|(compile, entry, _)| (compile.program(), *entry, &compile.entries()[*entry]))
     }
 
     /// What each launch's program uses, in ordinal order, as `T`, the
@@ -510,7 +513,8 @@ impl<P> Launches<P> {
     fn programs<T: Toolchain<Program = P>>(&self) -> Vec<Option<seismic_native_target::LaunchProgram>> {
         (0..self.launches.len())
             .map(|ordinal| {
-                self.formed(ordinal).map(|(program, entry)| seismic_native_target::LaunchProgram {
+                self.formed(ordinal).map(|(program, entry, at)| seismic_native_target::LaunchProgram {
+                    threads: at.group_size.map(|size| size.iter().map(|extent| u64::from(*extent)).product()),
                     statistics: T::statistics(program, entry).to_vec(),
                 })
             })
@@ -1378,11 +1382,11 @@ pub(crate) fn backend_name(kind: &OpenedKind) -> BackendName {
 }
 
 impl NativePrepared {
-    /// What each launch's program uses, in ordinal order, as its backend's
-    /// compiler reports it ([`Toolchain::statistics`]: CUDA's function
-    /// attributes, Vulkan's pipeline executable statistics): none for a
-    /// launch not formed, and nothing of the CPU backend, which forms no
-    /// programs.
+    /// What each launch's program uses, in ordinal order: its workgroup's
+    /// threads and what its backend's compiler reports
+    /// ([`Toolchain::statistics`]: CUDA's function attributes, Vulkan's
+    /// pipeline executable statistics); none for a launch not formed, and
+    /// nothing of the CPU backend, which forms no programs.
     pub fn launch_programs(&self) -> Vec<Option<seismic_native_target::LaunchProgram>> {
         match &self.route {
             NativeRoute::Cpu(_) => Vec::new(),

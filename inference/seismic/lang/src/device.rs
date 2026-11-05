@@ -510,6 +510,8 @@ properties! {
         max_shared_memory_per_block_optin: Count,
         l2_cache_size: Count,
         cooperative_launch: Support,
+        max_registers_per_thread: Count,
+        max_registers_per_block: Count,
     }
     probes {}
     properties {
@@ -520,6 +522,11 @@ properties! {
         shared_bytes_per_group: Count = query(max_shared_memory_per_block_optin);
         l2_bytes: Count = query(l2_cache_size);
         cooperative_launch: Support = query(cooperative_launch);
+        // Registers one thread may use: the documented ceiling of every
+        // compute capability the backend serves, which no attribute reports.
+        registers_per_thread: Count = query(max_registers_per_thread);
+        // Registers one block may use (`MAX_REGISTERS_PER_BLOCK`).
+        registers_per_group: Count = query(max_registers_per_block);
     }
 }
 

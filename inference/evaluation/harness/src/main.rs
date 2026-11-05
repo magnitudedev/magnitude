@@ -503,23 +503,18 @@ impl Development {
     }
 }
 
-/// The measurements every engine run records: its tuning.
+/// The measurements every engine run records: its tuning, and the trace
+/// it is read from, for any further reading of it.
 fn tuned(
     engine: &EngineArgs,
     options: &EngineOptions,
-) -> Result<(Map<String, Value>, Map<String, Value>), String> {
+) -> Result<(Map<String, Value>, Map<String, Value>, tuning::Trace), String> {
+    let trace = tuning::Trace::read(&options.tuning_trace)?;
     let mut measurements = Map::new();
-    measurements.insert(
-        "tuning".into(),
-        tuning::measurement(
-            &options.tuning_trace,
-            options.budget.as_secs_f64(),
-            engine.fresh_tuning,
-        )?,
-    );
+    measurements.insert("tuning".into(), trace.measurement(options.budget.as_secs_f64(), engine.fresh_tuning)?);
     let mut traces = Map::new();
     traces.insert("tuning".into(), json!(tuning::TRACE));
-    Ok((measurements, traces))
+    Ok((measurements, traces, trace))
 }
 
 fn run(command: Command) -> Result<(), String> {
@@ -602,7 +597,7 @@ fn run(command: Command) -> Result<(), String> {
             )?;
             development.finish()?;
             let digest = inputs.write_rendered(&timed.rendered)?;
-            let (mut measurements, traces) = tuned(&engine, &options)?;
+            let (mut measurements, traces, _) = tuned(&engine, &options)?;
             measurements.insert("speed".into(), Value::from(timed.speed));
             measurements.insert("load".into(), timed.load);
             inputs.finish(digest, Some(timed.devices), measurements, traces)
@@ -617,24 +612,26 @@ fn run(command: Command) -> Result<(), String> {
             let rendered = inputs.render(Some(context))?;
             let digest = inputs.write_rendered(&rendered)?;
             let (options, development) = engine_options(&engine, &inputs)?;
-            engine::prepare(
-                &inputs.artifacts.artifacts,
-                &options,
-                &engine::Load {
-                    drafter: false,
-                    proposals: None,
-                    context_tokens: context,
-                    sequences: std::num::NonZeroUsize::MIN,
-                    decode_rows: 1,
-                    exported_logits_rows: 0,
-                    lookahead: true,
-                },
-            )?;
+            let load = engine::Load {
+                drafter: false,
+                proposals: None,
+                context_tokens: context,
+                sequences: std::num::NonZeroUsize::MIN,
+                decode_rows: 1,
+                exported_logits_rows: 0,
+                lookahead: true,
+            };
+            // The check reads the device's register limits, which Vulkan's
+            // probes establish.
+            if check_default_spills {
+                engine::probe(&inputs.artifacts.artifacts, &options, &load)?;
+            }
+            engine::prepare(&inputs.artifacts.artifacts, &options, &load)?;
             development.finish()?;
-            let (measurements, traces) = tuned(&engine, &options)?;
+            let (measurements, traces, trace) = tuned(&engine, &options)?;
             inputs.finish(digest, None, measurements, traces)?;
             if check_default_spills {
-                let spills = tuning::default_spills(&options.tuning_trace)?;
+                let spills = trace.default_spills()?;
                 if !spills.is_empty() {
                     return Err(format!("default configurations spill:\n{}", spills.join("\n")));
                 }
@@ -688,7 +685,7 @@ fn run(command: Command) -> Result<(), String> {
                 &inputs.run.path("logits"),
             )?;
             development.finish()?;
-            let (measurements, traces) = tuned(&engine, &options)?;
+            let (measurements, traces, _) = tuned(&engine, &options)?;
             inputs.finish(digest, Some(vec![device]), measurements, traces)
         }
         Command::Memory {
@@ -760,7 +757,7 @@ fn run(command: Command) -> Result<(), String> {
                 &inputs.run.path("draft.jsonl"),
             )?;
             development.finish()?;
-            let (mut measurements, traces) = tuned(&engine, &options)?;
+            let (mut measurements, traces, _) = tuned(&engine, &options)?;
             measurements.insert("drafting".into(), drafting);
             inputs.finish(digest, Some(vec![device]), measurements, traces)
         }

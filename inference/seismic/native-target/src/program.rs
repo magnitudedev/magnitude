@@ -131,10 +131,12 @@ pub trait Toolchain: Send + Sync {
     fn statistics(program: &Self::Program, entry: usize) -> &[ProgramStatistic];
 }
 
-/// What one launch's formed program uses: the statistics its backend's
-/// compiler reports of it.
+/// What one launch's formed program uses: the threads of its workgroup,
+/// where formation fixes them, and the statistics its backend's compiler
+/// reports of it.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LaunchProgram {
+    pub threads: Option<u64>,
     pub statistics: Vec<ProgramStatistic>,
 }
 

@@ -146,6 +146,56 @@ pub fn worker(arguments: &[std::ffi::OsString]) -> Result<std::process::Command,
     Ok(worker)
 }
 
+/// The paths a load of `artifacts` serves: the target's directory.
+fn served_paths(artifacts: &Artifacts) -> Result<Vec<PathBuf>, String> {
+    let directory = std::path::absolute(&artifacts.target)
+        .map_err(|error| error.to_string())?
+        .parent()
+        .ok_or_else(|| format!("{} has no directory", artifacts.target.display()))?
+        .to_path_buf();
+    Ok(vec![directory])
+}
+
+/// The machine a load of `resolved` serves on, discovered with the paths
+/// of `artifacts`, and the executor the load selects, by the records of the
+/// kernel cache at `root`.
+fn selected_machine(
+    artifacts: &Artifacts,
+    resolved: &magnitude_engine::composition::ResolvedEngineConfiguration,
+    root: &std::path::Path,
+) -> Result<(Vec<PathBuf>, seismic::Devices, magnitude_executor::platform::SelectedDevice), String> {
+    let manifest = &resolved.manifest;
+    let paths = served_paths(artifacts)?;
+    let catalog = seismic::Devices::discover(&paths).map_err(|error| error.to_string())?;
+    let selected = magnitude_executor::platform::select_recorded(&catalog, manifest.path, manifest.device, &manifest.reserves, root)
+        .map_err(|error| error.to_string())?;
+    Ok((paths, catalog, selected))
+}
+
+/// Run the measurement job's probes of the device a load of `load` selects
+/// (`worker::measure::probe_machine`), each in a probe process of this
+/// executable, so the device's probed properties are measured before a
+/// check reads them; reports each result and each probe that kept none.
+/// Needs a kernel cache, where the results are kept.
+pub fn probe(artifacts: &Artifacts, options: &EngineOptions, load: &Load) -> Result<(), String> {
+    let resolved = configuration(artifacts, options, load)?;
+    let root = resolved.manifest.kernel_cache.as_ref().ok_or("probing needs a kernel cache (--cache-dir)")?;
+    let (paths, _, selected) = selected_machine(artifacts, &resolved, root)?;
+    let run = magnitude_engine::worker::measure::probe_machine(
+        &paths,
+        root,
+        selected.info.selector(),
+        std::time::Duration::from_secs_f64(magnitude_executor::assessment::MEASUREMENT_SECONDS),
+    )?;
+    for kept in &run.kept {
+        eprintln!("magnitude-harness: probe {}: {}\n{}", kept.probe, kept.result.line(), kept.report);
+    }
+    for failure in &run.failures {
+        eprintln!("magnitude-harness: {failure}");
+    }
+    Ok(())
+}
+
 /// The model's Prepare alone, as a load that found tuning records missing
 /// runs it: its search, in a worker process of this executable, publishing
 /// records to the kernel cache, with nothing imported or loaded here.
@@ -175,16 +225,8 @@ fn settle_measurements(artifacts: &Artifacts, resolved: &magnitude_engine::compo
     let Some(root) = &manifest.kernel_cache else {
         return Ok(());
     };
-    let directory = std::path::absolute(&artifacts.target)
-        .map_err(|error| error.to_string())?
-        .parent()
-        .ok_or_else(|| format!("{} has no directory", artifacts.target.display()))?
-        .to_path_buf();
-    let paths = vec![directory];
-    let catalog = seismic::Devices::discover(&paths).map_err(|error| error.to_string())?;
+    let (paths, catalog, selected) = selected_machine(artifacts, resolved, root)?;
     magnitude_engine::request_load_points(&catalog, manifest, resolved.host.package()).map_err(|error| error.to_string())?;
-    let selected = magnitude_executor::platform::select_recorded(&catalog, manifest.path, manifest.device, &manifest.reserves, root)
-        .map_err(|error| error.to_string())?;
     let topology = catalog.topology();
     let records = magnitude_executor::KernelCache::measurement_records(root);
     let requests = PointRequests::new(root);

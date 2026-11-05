@@ -272,6 +272,25 @@ pub struct MeasureEnd {
     pub held: Option<magnitude_executor::assessment::Held>,
 }
 
+/// The measurement job's probing of the device alone, as a job probes before
+/// it measures ([`measure_machine`]): executor `executor` of the machine
+/// discovered with `paths` runs each of its probes the kernel cache at
+/// `kernels` holds no result of, in a process of its own, within `time`. A
+/// tool whose check reads probed properties runs it before the load it
+/// checks; a load never does.
+pub fn probe_machine(
+    paths: &[PathBuf],
+    kernels: &Path,
+    executor: seismic::ExecutorSelector,
+    time: std::time::Duration,
+) -> Result<seismic::ProbeRun, String> {
+    let deadline = std::time::Instant::now() + time;
+    let catalog = Devices::discover(paths).map_err(|error| error.to_string())?;
+    let cache = KernelCache::open(kernels.to_path_buf(), DEFAULT_KERNEL_CACHE_BYTES).map_err(|error| error.to_string())?;
+    let executor = catalog.resolve(executor).map_err(|error| error.to_string())?;
+    catalog.probe(executor, &cache, deadline).map_err(|error| error.to_string())
+}
+
 /// Measure the outstanding point requests of the request's executor, in
 /// the order of who waits on them ([`PointRequests::outstanding`]), within
 /// the request's time: what it does not reach is left for the next

@@ -121,8 +121,8 @@ const KERNEL_PARAMETER_BYTES_CLASSIC: u64 = 4_096;
 const LOCAL_BYTES_PER_THREAD: u64 = 512 * 1024;
 
 /// Documented per-thread register ceiling of every supported compute
-/// capability.
-const MAX_REGISTERS_PER_THREAD: u32 = 255;
+/// capability: the device's `registers_per_thread`.
+const MAX_REGISTERS_PER_THREAD: u64 = 255;
 /// Backend emission contract (`ptx::.maxnreg`), used by cooperative-grid
 /// residency constraints. This is not driver reflection.
 pub const CODEGEN_REGISTERS_PER_THREAD: u32 = 64;
@@ -302,12 +302,10 @@ pub struct CudaFacts {
     pub ptx: PtxTarget,
     pub tensor_memory: TensorMemory,
     /// The device's properties (`seismic_lang::device::cuda`): its
-    /// multiprocessors, warp, block and shared-memory limits, L2 and
-    /// cooperative launch.
+    /// multiprocessors, warp, block, register and shared-memory limits, L2
+    /// and cooperative launch. No reliable pre-JIT register pressure model
+    /// exists for PTX, so its register limits are facts, not constraints.
     pub properties: Properties,
-    /// Documented per-thread register ceiling. No reliable pre-JIT register
-    /// pressure model exists for PTX, so this is a fact, not a constraint.
-    pub max_registers_per_thread: u32,
     /// Fixed physical-register ceiling emitted on every entry.
     pub codegen_registers_per_thread: u32,
     /// `cuDeviceTotalMem`.
@@ -328,6 +326,7 @@ struct Attributes {
     max_shared_memory_per_block_optin: u64,
     l2_cache_size: u64,
     cooperative_launch: bool,
+    max_registers_per_block: u64,
 }
 
 impl seismic_lang::device::cuda::Queries for Attributes {
@@ -352,6 +351,12 @@ impl seismic_lang::device::cuda::Queries for Attributes {
     fn cooperative_launch(&self) -> Option<bool> {
         Some(self.cooperative_launch)
     }
+    fn max_registers_per_thread(&self) -> Option<u64> {
+        Some(MAX_REGISTERS_PER_THREAD)
+    }
+    fn max_registers_per_block(&self) -> Option<u64> {
+        Some(self.max_registers_per_block)
+    }
 }
 
 /// Device attribute keys (`CUdevice_attribute`).
@@ -367,6 +372,7 @@ mod attr {
     pub const MAX_GRID_DIM_Y: i32 = 6;
     pub const MAX_GRID_DIM_Z: i32 = 7;
     pub const WARP_SIZE: i32 = 10;
+    pub const MAX_REGISTERS_PER_BLOCK: i32 = 12;
     pub const MULTIPROCESSOR_COUNT: i32 = 16;
     pub const L2_CACHE_SIZE: i32 = 38;
     pub const MAX_THREADS_PER_MULTIPROCESSOR: i32 = 39;
@@ -672,6 +678,7 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
         max_shared_memory_per_block_optin: u64::from(unsigned(attr::MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?),
         l2_cache_size: u64::from(unsigned(attr::L2_CACHE_SIZE)?),
         cooperative_launch: unsigned(attr::COOPERATIVE_LAUNCH)? == 1,
+        max_registers_per_block: u64::from(unsigned(attr::MAX_REGISTERS_PER_BLOCK)?),
     }, &Default::default())
     .expect("every CUDA property's source is an attribute the driver reports");
     let kernel_parameter_bytes = if driver_api >= DriverApiVersion::LARGE_PARAMETERS_MINIMUM {
@@ -687,7 +694,6 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
         ptx,
         tensor_memory,
         properties,
-        max_registers_per_thread: MAX_REGISTERS_PER_THREAD,
         codegen_registers_per_thread: CODEGEN_REGISTERS_PER_THREAD,
         global_memory_bytes,
         kernel_parameter_bytes,
@@ -2096,12 +2102,7 @@ fn fingerprint(
         }
     }
     digest.update(facts.properties.identity().as_bytes());
-    for value in [
-        facts.max_registers_per_thread,
-        facts.codegen_registers_per_thread,
-    ] {
-        digest.update(value.to_le_bytes());
-    }
+    digest.update(facts.codegen_registers_per_thread.to_le_bytes());
     for value in [facts.global_memory_bytes, facts.kernel_parameter_bytes] {
         digest.update(value.to_le_bytes());
     }

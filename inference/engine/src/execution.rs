@@ -260,6 +260,7 @@ fn tuning_report(
     manifest: &ExecutionManifest,
     work: TracedWork,
     numerical_profile: &magnitude_executor::ResolvedNumericalProfile,
+    device: &seismic::Device,
     progress: Rc<dyn Fn(LoadProgress)>,
 ) -> Result<TuningReport, LoadError> {
     Ok(TuningReport {
@@ -268,7 +269,7 @@ fn tuning_report(
         trace: manifest
             .tuning_trace
             .as_deref()
-            .map(|path| TuningTrace::begin(path, work, manifest.tuning, numerical_profile))
+            .map(|path| TuningTrace::begin(path, work, manifest.tuning, numerical_profile, device.properties()))
             .transpose()
             .map_err(internal)?,
     })
@@ -294,7 +295,7 @@ pub(crate) fn search(
         ..
     } = plan_on_device(catalog.clone(), manifest, package, progress.as_ref())?;
     let searching = Instant::now();
-    let report = tuning_report(manifest, TracedWork::Search, &numerical_profile, progress)?;
+    let report = tuning_report(manifest, TracedWork::Search, &numerical_profile, opened.device(), progress)?;
     let tuned = AttestedPrograms::search_draft(
         &draft,
         opened.device(),
@@ -436,7 +437,7 @@ fn prepare(
     let preparing = Instant::now();
     let workers = Arc::new(seismic::Workers::of_the_host());
     opened.device().staff(Some(workers.clone()));
-    let report = tuning_report(manifest, TracedWork::Load, &numerical_profile, progress)?;
+    let report = tuning_report(manifest, TracedWork::Load, &numerical_profile, opened.device(), progress)?;
     let mut programs = match AttestedPrograms::prepare_draft(
         &draft,
         opened.device(),
