@@ -1,0 +1,659 @@
+use super::{ExpertBank, HeldTable, count, landed_bytes};
+use crate::assessment::{BankSlots, GroupReads, MissRecord};
+use crate::planning::Placer;
+use crate::experts::watcher::MoveBudget;
+use crate::domain::{BankHolding, BankResize, BankResized, BankStep, DomainError, ElasticBank, ExpertResidency, Growth, ResizeTimes, TableResidency};
+use crate::CompletionWake;
+use std::time::{Duration, Instant};
+use crate::native::BankMoves;
+use std::sync::{Arc, Mutex};
+use super::resize::LandedShrink;
+
+/// A load's expert bank as the domain resizes it (`ElasticBank`): the bank,
+/// each group's record moves' kernels, and the stored tables it holds
+/// (`ExpertBankPlan::tables`), the one owner of the memory of all of them.
+pub(crate) struct ServedBank {
+    bank: Arc<ExpertBank>,
+    moves: Vec<BankMoves>,
+    tables: Vec<HeldTable>,
+    /// A table's or a store's shrink, done when asked, until the next
+    /// advance reports it.
+    finished: Mutex<Option<BankResized>>,
+    /// The rate the last shrink of the records the host lands into released
+    /// them, in bytes a second, while holding the submitting thread (the
+    /// watcher's copies of the records it keeps, then the storage's release);
+    /// none before one finished.
+    landed_rate: Mutex<Option<f64>>,
+}
+
+/// A holding's next step (a growth's, or a shrink's last): the slots, host
+/// slots or records it takes the holding from and leaves it at, the storage
+/// kind and bytes it charges and what it saves a decode step, in seconds;
+/// none before the load's record (and a table's curve) prices it.
+pub(super) struct Step {
+    pub(super) holding: BankHolding,
+    pub(super) kind: crate::planning::BankTier,
+    pub(super) from: u64,
+    pub(super) to: u64,
+    pub(super) bytes: u64,
+    pub(super) saves: Option<f64>,
+}
+
+/// What holding `to` rather than `from` saves a step of the decode `record`
+/// counted, on `resident`: the one pricer of the bank's and the host tier's
+/// slots (`MissRecord::saving`). A record is due only once a decode launch
+/// measured its residuals, so one that prices none breaks an invariant; so
+/// does a resident launch the load's own decode demand cannot price at the
+/// rows and depth it decoded.
+fn priced(
+    record: &MissRecord,
+    from: crate::assessment::HeldSlots,
+    to: crate::assessment::HeldSlots,
+    resident: &crate::ResidentStep,
+) -> Result<f64, DomainError> {
+    record
+        .saving(from, to, resident)
+        .map_err(|error| DomainError::invariant(format!("the resident step: {error}")))?
+        .map_err(|reason| DomainError::invariant(format!("the miss record prices no step: {reason}")))
+}
+
+/// The step a shrink takes, of `steps` (in holding order, the experts
+/// first), toward each store's `deficit`: where any store is short, only a
+/// step in a short store, none once those are at their floors (memory
+/// another store gives back relieves none of it); else any. Of those, the
+/// one that saves the decode least per byte. A holding not yet priced has
+/// shown no saving and gives way first, the earlier on a tie (the experts
+/// before a table, as a bank without tables shrinks).
+pub(super) fn shrunk(steps: Vec<Step>, deficit: &dyn Fn(crate::planning::BankTier) -> u64) -> Option<Step> {
+    let short = crate::planning::BankTier::ALL.into_iter().any(|kind| deficit(kind) > 0);
+    let per_byte = |step: &Step| step.saves.map_or(0., |saves| saves / step.bytes as f64);
+    steps
+        .into_iter()
+        .filter(|step| !short || deficit(step.kind) > 0)
+        .min_by(|a, b| per_byte(a).total_cmp(&per_byte(b)))
+}
+
+/// The step a growth takes, of `steps`: the host tier's, which no price
+/// decides (`ServedBank::growth_steps`); else of the holdings no resize has
+/// measured what it holds the submitting thread (`measured` false), the
+/// smallest step, which runs to measure it, priced or not; else the priced
+/// one that saves the decode most per byte.
+pub(super) fn grown(mut steps: Vec<(Step, u64)>, measured: &dyn Fn(BankHolding) -> bool) -> Option<(Step, u64)> {
+    if let Some(tier) = steps.iter().position(|(step, _)| step.holding == BankHolding::Host) {
+        return Some(steps.swap_remove(tier));
+    }
+    let (unmeasured, measured): (Vec<_>, Vec<_>) = steps.into_iter().partition(|(step, _)| !measured(step.holding));
+    if let Some(step) = unmeasured.into_iter().min_by_key(|(step, _)| step.bytes) {
+        return Some(step);
+    }
+    let per_byte = |step: &Step| step.saves.map(|saves| saves / step.bytes as f64);
+    measured
+        .into_iter()
+        .filter_map(|step| per_byte(&step.0).map(|value| (value, step)))
+        .max_by(|(a, _), (b, _)| a.total_cmp(b))
+        .map(|(_, step)| step)
+}
+
+impl ServedBank {
+    pub fn new(
+        bank: Arc<ExpertBank>,
+        programs: &crate::AttestedPrograms,
+        tables: Vec<HeldTable>,
+    ) -> Result<Self, String> {
+        let moves = programs.expert_bank_moves(&bank.plan)?;
+        Ok(Self { bank, moves, tables, finished: Mutex::new(None), landed_rate: Mutex::new(None) })
+    }
+
+    /// The slots the bank and its host tier hold now, as the record prices
+    /// them.
+    fn held(&self) -> Result<crate::assessment::HeldSlots, DomainError> {
+        Ok(crate::assessment::HeldSlots {
+            slots: count(self.bank.slots())?,
+            host: count(self.bank.host_slots())?,
+        })
+    }
+
+    /// The reserved storage `holding` lies in (`ExpertBankPlan::holding_storage`).
+    fn storage(&self, holding: BankHolding) -> Result<crate::planning::BankTier, DomainError> {
+        self.bank.plan.holding_storage(holding).ok_or_else(|| DomainError::invariant(format!("{holding:?} of a bank without it")))
+    }
+
+    /// What `holding` is charged holding `at` (slots, host slots or
+    /// records), as Seismic charges its reservations.
+    fn holding_charge(&self, holding: BankHolding, at: u64) -> Result<u64, DomainError> {
+        let plan = &self.bank.plan;
+        match holding {
+            BankHolding::Experts => plan.resident_charge(at),
+            BankHolding::Host => plan.host_charge(at),
+            BankHolding::Table { table } => self.tables[table].plan.charge(plan.reservation, at),
+        }
+        .map_err(DomainError::invariant)
+    }
+
+    /// The shallowest shrink of `holding` from `from` releasing `bytes`
+    /// ([`crate::planning::releasing`]), down to its floor.
+    fn releasing(&self, holding: BankHolding, from: u64, bytes: u64) -> Result<Option<u64>, DomainError> {
+        let floor = match holding {
+            BankHolding::Experts => self.bank.plan.floor(),
+            BankHolding::Host => 0,
+            BankHolding::Table { table } => self.tables[table].plan.floor,
+        };
+        crate::planning::releasing(from, floor, bytes, |at| self.holding_charge(holding, at))
+    }
+
+    /// Each holding's nearest step that releases physical storage, down to
+    /// its floor.
+    fn shrink_steps(&self, resident: Option<&crate::ResidentStep>) -> Result<Vec<Step>, DomainError> {
+        let record = self.bank.watcher.shared().latest_record();
+        let mut steps = Vec::new();
+        let held = self.held()?;
+        let saving = |from, to| -> Result<Option<f64>, DomainError> {
+            match (&record, resident) {
+                (Some(record), Some(resident)) => priced(record, from, to, resident).map(Some),
+                _ => Ok(None),
+            }
+        };
+        let slots = self.bank.slots();
+        if let Some(to) = self.releasing(BankHolding::Experts, slots, 0)? {
+            let below = crate::assessment::HeldSlots { slots: count(to)?, ..held };
+            steps.push(Step {
+                holding: BankHolding::Experts,
+                kind: self.storage(BankHolding::Experts)?,
+                from: slots,
+                to,
+                bytes: self.holding_charge(BankHolding::Experts, slots)? - self.holding_charge(BankHolding::Experts, to)?,
+                saves: saving(below, held)?,
+            });
+        }
+        let host = self.bank.host_slots();
+        if host > 0 {
+            if let Some(to) = self.releasing(BankHolding::Host, host, 0)? {
+                let below = crate::assessment::HeldSlots { host: count(to)?, ..held };
+                steps.push(Step {
+                    holding: BankHolding::Host,
+                    kind: self.storage(BankHolding::Host)?,
+                    from: host,
+                    to,
+                    bytes: self.holding_charge(BankHolding::Host, host)? - self.holding_charge(BankHolding::Host, to)?,
+                    saves: saving(below, held)?,
+                });
+            }
+        }
+        // Requests of fewer than two sizes make no line yet.
+        let line = match &record {
+            Some(record) => record.reads.measured().map_err(|error| DomainError::invariant(format!("the read line: {error}")))?,
+            None => None,
+        };
+        for (index, held) in self.tables.iter().enumerate() {
+            let holding = BankHolding::Table { table: index };
+            let records = held.table.records();
+            let Some(to) = self.releasing(holding, records, 0)? else {
+                continue;
+            };
+            let curve = held.table.curve();
+            let saves = line.as_ref().and_then(|line| {
+                Some(curve.step_seconds(to, line)? - curve.step_seconds(records, line)?)
+            });
+            steps.push(Step {
+                holding,
+                kind: self.storage(holding)?,
+                from: records,
+                to,
+                bytes: self.holding_charge(holding, records)? - self.holding_charge(holding, to)?,
+                saves,
+            });
+        }
+        Ok(steps)
+    }
+
+    /// Each holding in `kind` storage's growth step, to its target within
+    /// `room` bytes, the most the store's claim admits (`growth_target`),
+    /// with the bound a step with room enough reaches: the host tier's host
+    /// slots up to every expert; the bank's slots up to where the record's
+    /// misses stop falling (`MissRecord::saturation`), a table's records up
+    /// to where its curve's do (`TableCurve::saturation`), each at most its
+    /// ceiling, and none of these before the load's record and a `resident`
+    /// step price them.
+    fn growth_steps(
+        &self,
+        resident: Option<&crate::ResidentStep>,
+        kind: crate::planning::BankTier,
+        room: u64,
+    ) -> Result<Vec<(Step, u64)>, DomainError> {
+        let (plan, held) = (&self.bank.plan, self.held()?);
+        let mut steps = Vec::new();
+        // The host tier is the inclusive copy of every expert, which every
+        // miss reaches first: it grows to every expert wherever its store
+        // has room, priced by no record (a prompt group's cold experts are
+        // read from it as much as decode's misses), beside no backing of it
+        // already on its way.
+        let tiered = plan.holding_storage(BankHolding::Host) == Some(kind);
+        if let (true, Some((host, ceiling)), false) = (tiered, self.bank.host_tier(), self.bank.host_backing()) {
+            let grown = plan.host_growth(host, self.bank.slots(), room).map_err(DomainError::invariant)?;
+            if let Some(to) = grown {
+                let charge = |slots| plan.host_charge(slots).map_err(DomainError::invariant);
+                let step = Step {
+                    holding: BankHolding::Host,
+                    kind,
+                    from: host,
+                    to,
+                    bytes: charge(to)? - charge(host)?,
+                    saves: None,
+                };
+                steps.push((step, ceiling.get()));
+            }
+        }
+        let (Some(record), Some(resident)) = (self.bank.watcher.shared().latest_record(), resident) else {
+            return Ok(steps);
+        };
+        let saturation = record.saturation().map(|slots| slots as u64);
+        let target = |from, saturation, bytes: &dyn Fn(u64) -> Result<u64, String>| {
+            crate::planning::growth_target(from, saturation, room, bytes).map_err(DomainError::invariant)
+        };
+        if kind == crate::planning::BankTier::Bank {
+            let slots = self.bank.slots();
+            let bytes = |to| self.bank.growth_bytes(to);
+            let bound = saturation.map(|saturation| plan.ceiling.min(saturation));
+            if let Some((bound, Some(to))) = bound.map(|bound| Ok::<_, DomainError>((bound, target(slots, bound, &bytes)?))).transpose()? {
+                let above = crate::assessment::HeldSlots { slots: count(to)?, ..held };
+                let step = Step {
+                    holding: BankHolding::Experts,
+                    kind,
+                    from: slots,
+                    to,
+                    bytes: bytes(to).map_err(DomainError::invariant)?,
+                    saves: Some(priced(&record, held, above, resident)?),
+                };
+                steps.push((step, bound));
+            }
+            // Requests of fewer than two sizes make no line yet.
+            let line = record.reads.measured().map_err(|error| DomainError::invariant(format!("the read line: {error}")))?;
+            for (index, table) in self.tables.iter().enumerate() {
+                let (records, curve) = (table.table.records(), table.table.curve());
+                let charge = |records| table.plan.charge(plan.reservation, records);
+                let bytes = |to| Ok(charge(to)? - charge(records)?);
+                let bound = table.plan.records.get().min(curve.saturation());
+                let Some(to) = target(records, bound, &bytes)? else {
+                    continue;
+                };
+                let step = Step {
+                    holding: BankHolding::Table { table: index },
+                    kind,
+                    from: records,
+                    to,
+                    bytes: bytes(to).map_err(DomainError::invariant)?,
+                    saves: line.as_ref().and_then(|line| {
+                        Some(curve.step_seconds(records, line)? - curve.step_seconds(to, line)?)
+                    }),
+                };
+                steps.push((step, bound));
+            }
+        }
+        Ok(steps)
+    }
+
+    /// The step a shrink takes: of the holdings in storage short of memory
+    /// by `deficit`, or of every holding where no storage is measured short
+    /// (a release asked for its own sake), the one saving least per byte.
+    fn shrinking(
+        &self,
+        resident: Option<&crate::ResidentStep>,
+        deficit: &dyn Fn(crate::planning::BankTier) -> u64,
+    ) -> Result<Option<Step>, DomainError> {
+        Ok(shrunk(self.shrink_steps(resident)?, deficit))
+    }
+
+    /// Shrink the records the host lands into to `to` now, between flights,
+    /// decided at `decided` and queued `queued`: `holding`'s, the host
+    /// tier's host slots, or where the host places the one store's slots;
+    /// the shrink the next advance reports, `wake` completed at once.
+    fn shrink_landed(&self, holding: BankHolding, to: u64, decided: Instant, queued: Duration, wake: CompletionWake) -> Result<BankStep, DomainError> {
+        let shrunk = match holding {
+            BankHolding::Host => self.bank.shrink_host(to)?,
+            _ => self.bank.shrink_store(to)?,
+        };
+        let Some(LandedShrink { from, to: at, before, after, refusal }) = shrunk else {
+            return Ok(BankStep::Running);
+        };
+        let done = Instant::now();
+        let times = ResizeTimes {
+            decided,
+            queued,
+            planned: done - decided - queued,
+            trips: Default::default(),
+            moves: Duration::ZERO,
+            prepared: done,
+            installed: done,
+            released: done,
+        };
+        let resized = match refusal {
+            Some(refusal) => BankResized::Refused { holding, at, refusal },
+            None => {
+                let released = before
+                    .checked_sub(after)
+                    .ok_or_else(|| DomainError::invariant("a shrink raised its records' charge"))?;
+                *self.landed_rate.lock().expect("landed rate") = Some(released as f64 / times.planned.as_secs_f64());
+                BankResized::Shrunk { holding, from, to: at, released, times }
+            }
+        };
+        *self.finished.lock().expect("table resize outcome") = Some(resized);
+        wake.complete();
+        Ok(BankStep::Begun)
+    }
+
+    /// The target of a shrink of the records the host lands into, of
+    /// `holding` from `from`, toward `deepest`: within what one decode step
+    /// may hold the submitting thread ([`landed_bytes`]). The owner's ladder
+    /// resumes as each finishes, so a deficit is covered a step at a time.
+    fn landed_target(
+        &self,
+        holding: BankHolding,
+        from: u64,
+        deepest: u64,
+        resident: Option<&crate::ResidentStep>,
+    ) -> Result<u64, DomainError> {
+        let rate = *self.landed_rate.lock().expect("landed rate");
+        let Some(bytes) = landed_bytes(self.step_seconds(resident)?, rate) else {
+            return Ok(deepest);
+        };
+        let paced = self.releasing(holding, from, bytes)?.expect("a selected shrink releases physical storage");
+        Ok(paced.max(deepest))
+    }
+
+    /// The next growth step of the holdings in `kind` storage within `room`
+    /// ([`ElasticBank::growth`]).
+    fn growing(
+        &self,
+        resident: Option<&crate::ResidentStep>,
+        measured: &dyn Fn(BankHolding) -> bool,
+        kind: crate::planning::BankTier,
+        room: u64,
+    ) -> Result<Option<(Step, u64)>, DomainError> {
+        Ok(grown(self.growth_steps(resident, kind, room)?, measured))
+    }
+
+    /// What one shrink's moves may take: the decode step the load's latest
+    /// miss record prices at the slots held now, on `resident`, each moving
+    /// group's launches priced on its `moves` line. None without measured
+    /// lines, a record or a resident step: one resize then takes the whole
+    /// deficit.
+    fn move_budget(
+        &self,
+        resident: Option<&crate::ResidentStep>,
+        moves: Option<&crate::assessment::MoveLines>,
+    ) -> Result<Option<MoveBudget>, DomainError> {
+        Ok(moves.zip(self.step_seconds(resident)?).map(|(lines, seconds)| MoveBudget { seconds, lines: lines.clone() }))
+    }
+
+    /// The decode step at the slots held now, as the load's latest record
+    /// prices it on `resident`, in seconds; none before either.
+    fn step_seconds(&self, resident: Option<&crate::ResidentStep>) -> Result<Option<f64>, DomainError> {
+        let (Some(resident), Some(record)) = (resident, self.bank.watcher.shared().latest_record()) else {
+            return Ok(None);
+        };
+        let unpriced = |error: crate::assessment::AssessmentError| DomainError::invariant(format!("the resident step: {error}"));
+        let priced = |error: crate::assessment::MissRecordError| {
+            DomainError::invariant(format!("the miss record prices no step: {error}"))
+        };
+        let held = self.held()?;
+        let compute = record.compute(resident).map_err(unpriced)?.map_err(priced)?;
+        let step = record.step_seconds(held, record.rows().map_err(priced)?, compute).map_err(priced)?;
+        Ok(Some(step.total_seconds))
+    }
+
+    /// Whether a resize runs: the experts' (until its advance finishes it),
+    /// a table's (until an advance reports it) or the host tier's growth.
+    /// The tier's backing to its planned slots is no resize: it runs beside
+    /// them ([`ExpertBank::back_host`]).
+    fn running(&self) -> bool {
+        self.bank.resizing()
+            || self.finished.lock().expect("table resize outcome").is_some()
+            || self.bank.host_growing()
+    }
+
+    /// Resize table `index` to `records` records, now: the resize the next
+    /// advance reports, `wake` completed at once.
+    fn resize_table(
+        &self,
+        index: usize,
+        records: u64,
+        decided: Instant,
+        queued: Duration,
+        wake: CompletionWake,
+    ) -> Result<BankStep, DomainError> {
+        let held = &self.tables[index];
+        let charged = || {
+            held.table
+                .charged_bytes()
+                .ok_or_else(|| DomainError::invariant("a held table's slots are charged"))
+        };
+        let (before, from) = (charged()?, held.table.records());
+        let outcome = held.table.resize(records).map_err(DomainError::invariant)?;
+        let (after, to, done) = (charged()?, held.table.records(), Instant::now());
+        let times = ResizeTimes {
+            decided,
+            queued,
+            planned: done - decided - queued,
+            trips: Default::default(),
+            moves: Duration::ZERO,
+            prepared: done,
+            installed: done,
+            released: done,
+        };
+        let holding = BankHolding::Table { table: index };
+        let resized = match outcome {
+            Err(refusal) => BankResized::Refused { holding, at: to, refusal },
+            Ok(()) if after < before => BankResized::Shrunk { holding, from, to, released: before - after, times },
+            Ok(()) => BankResized::Grown { holding, from, to, grown: after - before, refused: None, times },
+        };
+        *self.finished.lock().expect("table resize outcome") = Some(resized);
+        wake.complete();
+        Ok(BankStep::Begun)
+    }
+}
+
+impl ElasticBank for ServedBank {
+    fn slots(&self) -> u64 {
+        self.bank.slots()
+    }
+
+    #[cfg(test)]
+    fn starve(&self, duration: std::time::Duration) {
+        self.bank.starve(duration);
+    }
+
+    /// Its tables resize on the domain's thread: only the bank's records
+    /// rise off it.
+    fn hold_rises(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.bank.hold_rises()
+    }
+
+    fn lines(&self) -> std::sync::Arc<[crate::assessment::BankLines]> {
+        self.bank.lines()
+    }
+
+    fn price(&self, lines: Option<std::sync::Arc<[crate::assessment::ExpertLines]>>, pass: Option<crate::assessment::ExpertPass>) {
+        self.bank.watcher.shared().price(lines, pass);
+    }
+
+    fn tier_copy_blocks(&self, blocks: u32) -> Result<(), DomainError> {
+        self.bank.tier_copy_blocks(blocks).map_err(DomainError::invariant)
+    }
+
+    fn device_convert(&self, lines: &[crate::assessment::RecordLine]) {
+        self.bank.device_convert(lines);
+    }
+
+    #[cfg(test)]
+    fn prefer_device_landing(&self) {
+        self.bank.watcher.shared().prefer_device_landing(self.bank.plan.groups.len());
+    }
+
+    #[cfg(test)]
+    fn device_landed(&self) -> u64 {
+        self.bank.watcher.shared().device_landed()
+    }
+
+    fn shrink(
+        &self,
+        resident: Option<&crate::ResidentStep>,
+        moves: Option<&crate::assessment::MoveLines>,
+        deficit: &dyn Fn(crate::planning::BankTier) -> u64,
+        between_flights: &mut dyn FnMut() -> Result<(), DomainError>,
+        wake: CompletionWake,
+    ) -> Result<BankStep, DomainError> {
+        // The host tier gives way only to a shrink host memory needs: one
+        // that measures host storage short, or a release asked for its own
+        // sake, where no store is short.
+        let host_short = deficit(crate::planning::BankTier::Host) > 0 || deficit(crate::planning::BankTier::Bank) == 0;
+        if host_short && (self.bank.host_backing() || self.bank.host_growing()) {
+            let [device, host] = [crate::planning::BankTier::Bank, crate::planning::BankTier::Host].map(|kind| deficit(kind));
+            tracing::info!(
+                "the host tier's growth stops at {} host slots for a shrink: host short {host} bytes, device short {device} bytes",
+                self.bank.host_slots()
+            );
+        }
+        if self.running() || (host_short && self.bank.host_backing()) {
+            // A growth gives way at its next slot; the shrink is decided
+            // again at a later boundary.
+            self.bank.stop_growth(host_short);
+            return Ok(BankStep::Running);
+        }
+        let Some(Step { holding, kind, from, to: shallowest, .. }) = self.shrinking(resident, deficit)? else {
+            return Ok(BankStep::AtLimit);
+        };
+        // The shallowest target releasing the store's deficit, or the floor.
+        let deepest = self.releasing(holding, from, deficit(kind))?
+            .expect("a selected shrink releases physical storage");
+        let decided = Instant::now();
+        // No step reads the records the shrink releases, nor runs while the
+        // watcher plans it: the queue drained, a step still running defers it.
+        between_flights()?;
+        if !self.in_gap() {
+            return Ok(BankStep::Deferred);
+        }
+        let queued = decided.elapsed();
+        match (holding, self.bank.plan.placer()) {
+            (BankHolding::Experts, Placer::Tier) => {
+                let budget = self.move_budget(resident, moves)?;
+                self.bank.shrink(&self.moves, (shallowest, deepest), budget, decided, wake)
+            }
+            (BankHolding::Experts, Placer::Bank) | (BankHolding::Host, _) => {
+                let target = self.landed_target(holding, from, deepest, resident)?;
+                self.shrink_landed(holding, target, decided, queued, wake)
+            }
+            (BankHolding::Table { table: index }, _) => self.resize_table(index, deepest, decided, queued, wake),
+        }
+    }
+
+    fn carried(&self) -> Result<(), DomainError> {
+        self.bank.carried()
+    }
+
+    fn growth(
+        &self,
+        resident: Option<&crate::ResidentStep>,
+        measured: &dyn Fn(BankHolding) -> bool,
+        kind: crate::planning::BankTier,
+        room: u64,
+    ) -> Result<Option<Growth>, DomainError> {
+        // A step is priced only on a record (`Self::growth_steps`).
+        let steps = self.bank.watcher.shared().latest_record().map(|record| record.steps as f64);
+        Ok(self.growing(resident, measured, kind, room)?.map(|(step, justified)| Growth {
+            holding: step.holding,
+            kind: step.kind,
+            from: step.from,
+            to: step.to,
+            bytes: step.bytes,
+            saving: step.saves.zip(steps).map(|(saves, steps)| saves * steps),
+            justified,
+        }))
+    }
+
+    fn group_reads(&self) -> Result<Option<(GroupReads, BankSlots)>, DomainError> {
+        let Some(reads) = self.bank.watcher.shared().group_reads() else {
+            return Ok(None);
+        };
+        let plan = &self.bank.plan;
+        let bytes = plan.slot_bytes().map_err(DomainError::invariant)?;
+        let host = self.bank.host_slots();
+        Ok(Some((reads, BankSlots { now: self.bank.slots(), floor: plan.floor(), bytes, host })))
+    }
+
+    fn latest_record(&self) -> Option<Arc<MissRecord>> {
+        self.bank.watcher.shared().latest_record()
+    }
+
+    fn grow(
+        &self,
+        resident: Option<&crate::ResidentStep>,
+        measured: &dyn Fn(BankHolding) -> bool,
+        kind: crate::planning::BankTier,
+        room: u64,
+        wake: CompletionWake,
+    ) -> Result<BankStep, DomainError> {
+        if self.running() {
+            return Ok(BankStep::Running);
+        }
+        match self.growing(resident, measured, kind, room)?.map(|(step, _)| step) {
+            None => Ok(BankStep::AtLimit),
+            Some(Step { holding: BankHolding::Experts, to, .. }) => self.bank.grow(to, wake),
+            Some(Step { holding: BankHolding::Table { table: index }, to, .. }) => {
+                self.resize_table(index, to, Instant::now(), Duration::ZERO, wake)
+            }
+            Some(Step { holding: BankHolding::Host, to, .. }) => self.bank.grow_host(to, wake),
+        }
+    }
+
+    fn advance(&self, wake: CompletionWake) -> Result<Option<BankResized>, DomainError> {
+        if let Some(finished) = self.bank.advance_host()? {
+            return Ok(Some(finished));
+        }
+        if let Some(finished) = self.finished.lock().expect("table resize outcome").take() {
+            return Ok(Some(finished));
+        }
+        self.bank.advance(wake)
+    }
+
+    fn in_gap(&self) -> bool {
+        self.bank.watcher.shared().in_gap()
+    }
+
+    fn wait_tier_filled(&self) -> Result<(), DomainError> {
+        match self.bank.host_tier() {
+            Some(_) => self.bank.watcher.shared().wait_filled().map_err(DomainError::invariant),
+            None => Ok(()),
+        }
+    }
+
+    fn residency(&self) -> Result<ExpertResidency, DomainError> {
+        let tables = self
+            .tables
+            .iter()
+            .map(|held| {
+                Ok(TableResidency {
+                    records: held.table.records(),
+                    floor: held.plan.floor,
+                    ceiling: held.plan.records,
+                    bytes: held
+                        .table
+                        .charged_bytes()
+                        .ok_or_else(|| DomainError::invariant("a held table's slots are charged"))?,
+                    last_resize: *held.last_resize.lock().expect("a table's last resize"),
+                })
+            })
+            .collect::<Result<Vec<_>, DomainError>>()?;
+        Ok(ExpertResidency { tables, ..self.bank.residency()? })
+    }
+
+    fn record_resize(&self, holding: BankHolding, resize: BankResize) {
+        match holding {
+            BankHolding::Table { table } => {
+                let held = self.tables.get(table).expect("a resized table is one the bank holds");
+                *held.last_resize.lock().expect("a table's last resize") = Some(resize);
+            }
+            BankHolding::Experts => self.bank.record_resize(super::BankSlots::Experts, resize),
+            BankHolding::Host => self.bank.record_resize(super::BankSlots::Host, resize),
+        }
+    }
+}
