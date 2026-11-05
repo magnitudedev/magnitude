@@ -905,24 +905,22 @@ impl ResourceBytes {
 /// relevant projection of this value rather than recomputing capacity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResourcePlan {
-    pub(super) domain_capacity_bytes: u64,
+    domain_capacity_bytes: u64,
     capacity: StateCapacityPlan,
     target_state: StateStorePlan,
     head_state: Option<StateStorePlan>,
     retained_entry_bytes: u64,
     bytes: ResourceBytes,
-    pub(super) qualification_peak_bytes: u64,
     target_graph: NativeGraphCharge,
     target_readout_graph: NativeGraphCharge,
     target_readout_chunk_graph: NativeGraphCharge,
     head_graph: Option<NativeGraphCharge>,
     vision_graph: Option<NativeGraphCharge>,
     state_graph: NativeGraphCharge,
-    steady_committed_bytes: u64,
-    startup_peak_bytes: u64,
 }
 
 impl ResourcePlan {
+    /// The device domain's capacity the plan was made for, as its summary reports it.
     pub fn domain_capacity_bytes(&self) -> u64 {
         self.domain_capacity_bytes
     }
@@ -962,22 +960,15 @@ impl ResourcePlan {
         arena_bytes(&self.graph_charges())
     }
 
-    pub(super) fn validate(mut self) -> Result<Self, String> {
+    /// The plan, its pooled charge checked against Seismic's footprints. Whether the load fits
+    /// is decided once, by assessment before the load, and each allocation is then claimed as it
+    /// is made (the engine's startup claims), whose refusal is the typed memory shortage: the plan
+    /// decides neither.
+    pub(super) fn validate(self) -> Result<Self, String> {
         if self.bytes.scratch != graph_scratch_bytes(&self.graph_charges())? {
             return Err(
                 "resource plan pooled byte charge differs from admitted Seismic footprints".into(),
             );
-        }
-        self.steady_committed_bytes = self.bytes.total()?;
-        self.startup_peak_bytes = self
-            .steady_committed_bytes
-            .checked_add(self.qualification_peak_bytes)
-            .ok_or("startup peak byte count overflow")?;
-        if self.startup_peak_bytes > self.domain_capacity_bytes {
-            return Err(format!(
-                "resource plan startup peak {} exceeds {} bytes",
-                self.startup_peak_bytes, self.domain_capacity_bytes
-            ));
         }
         Ok(self)
     }
@@ -1000,12 +991,6 @@ impl ResourcePlan {
     }
     pub fn state_graph(&self) -> &NativeGraphCharge {
         &self.state_graph
-    }
-    pub fn steady_committed_bytes(&self) -> u64 {
-        self.steady_committed_bytes
-    }
-    pub fn startup_peak_bytes(&self) -> u64 {
-        self.startup_peak_bytes
     }
 
     pub fn allocate_target_state(&self, device: Rc<Device>) -> Result<StoreBindings, String> {
@@ -1353,10 +1338,6 @@ impl ResourcePlanner {
     ) -> Result<ResourcePlan, String> {
         let load = &state.load;
         let limits = state.limits;
-        let capacity_bytes = state.capacity_bytes;
-        let qualification_peak = crate::AttestedPrograms::qualification_peak_bytes(load)?;
-        let source_import_peak = load.imports().peak_bytes()?;
-        let qualification_peak_bytes = qualification_peak.max(source_import_peak);
         let slots = limits.startup_slots();
         let target_graph = NativeGraphCharge::from_prepared(target_graphs, slots.target)?;
         let target_readout_graph = NativeGraphCharge::from_footprint(
@@ -1414,8 +1395,11 @@ impl ResourcePlanner {
             prepared_programs: crate::AttestedPrograms::DEVICE_BYTES,
             scratch,
         };
-        let required = bytes.total()?;
         if std::env::var_os("MAGNITUDE_TRACE_RESOURCES").is_some() {
+            let capacity_bytes = state.capacity_bytes;
+            let required = bytes.total()?;
+            let qualification_peak_bytes = crate::AttestedPrograms::qualification_peak_bytes(load)?
+                .max(load.imports().peak_bytes()?);
             eprintln!(
                 "resource plan domain_capacity={} required={} qualification_peak={} weights=[{},{},{}] history={} recurrent_banks={} prepared_programs={} scratch={} graph=[target:{},readout:{},head:{},vision:{},state:{}]",
                 capacity_bytes.domain_bytes,
@@ -1453,28 +1437,19 @@ impl ResourcePlanner {
                 workspace(state_graphs.family()),
             );
         }
-        if required > capacity_bytes.domain_bytes {
-            return Err(format!(
-                "resource plan requires {required} bytes but the device domain has {}",
-                capacity_bytes.domain_bytes
-            ));
-        }
         ResourcePlan {
-            domain_capacity_bytes: capacity_bytes.domain_bytes,
+            domain_capacity_bytes: state.capacity_bytes.domain_bytes,
             capacity: state.capacity,
             target_state: state.target_state,
             head_state: state.head_state,
             retained_entry_bytes: state.retained_entry_bytes,
             bytes,
-            qualification_peak_bytes,
             target_graph,
             target_readout_graph,
             target_readout_chunk_graph,
             head_graph,
             vision_graph,
             state_graph,
-            steady_committed_bytes: 0,
-            startup_peak_bytes: 0,
         }
         .validate()
     }

@@ -584,26 +584,6 @@ pub(crate) mod tests {
             plan.bytes().scratch,
             arena + target.committed_bytes + readout.committed_bytes + state.committed_bytes,
         );
-        assert_eq!(plan.steady_committed_bytes(), plan.bytes().total().unwrap());
-        assert_eq!(
-            plan.startup_peak_bytes(),
-            plan.steady_committed_bytes() + plan.qualification_peak_bytes,
-        );
-    }
-
-    #[test]
-    fn sealed_graph_charge_is_admitted_only_when_startup_peak_fits() {
-        let plan = prepared_resource_plan();
-        let mut below = plan.clone();
-        below.domain_capacity_bytes = plan.startup_peak_bytes() - 1;
-        assert!(below.validate().unwrap_err().contains("startup peak"));
-        let mut exact = plan;
-        exact.domain_capacity_bytes = exact.startup_peak_bytes();
-        let admitted_bytes = exact.domain_capacity_bytes;
-        assert_eq!(
-            exact.validate().unwrap().startup_peak_bytes(),
-            admitted_bytes
-        );
     }
 
     /// The qwen4exp fixture without its n-gram input, its tensors encoded
