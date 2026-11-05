@@ -46,7 +46,9 @@ const BLOCKED: usize = 4;
 
 /// The child: threads blocked on a lock the main thread holds, one thread
 /// holding the allocator, and the report installed; it says when it is
-/// ready, then waits to be killed.
+/// ready, then waits to be killed, or for its stdin to close as its parent
+/// ends by any path, when it exits at once: with the allocator held, no
+/// return through the test harness could end the process.
 #[test]
 fn child() {
     if std::env::var_os(CHILD).is_none() {
@@ -54,7 +56,7 @@ fn child() {
     }
     magnitude_executor::diagnostics::install();
     let held = std::sync::Arc::new(Mutex::new(()));
-    let guard = held.lock().unwrap();
+    let _guard = held.lock().unwrap();
     for index in 0..BLOCKED {
         let held = held.clone();
         std::thread::Builder::new().name(format!("blocked-{index}")).spawn(move || drop(held.lock())).unwrap();
@@ -81,9 +83,24 @@ fn child() {
     // SAFETY: writes a static line to stdout.
     unsafe { libc::write(1, b"ready\n".as_ptr().cast(), 6) };
     let mut byte = 0u8;
-    // SAFETY: blocks reading stdin, which the parent never writes.
-    unsafe { libc::read(0, (&mut byte as *mut u8).cast(), 1) };
-    drop(guard);
+    // SAFETY: blocks reading stdin, which the parent never writes, until it
+    // closes; then ends the process without allocating.
+    unsafe {
+        libc::read(0, (&mut byte as *mut u8).cast(), 1);
+        libc::_exit(0)
+    }
+}
+
+/// The running child, killed and reaped however the test ends, its failure
+/// paths included.
+struct Reaped(std::process::Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        // A child that has exited and is not yet reaped is killed as Ok.
+        self.0.kill().expect("the child is killed");
+        self.0.wait().expect("the child is reaped");
+    }
 }
 
 #[test]
@@ -91,14 +108,15 @@ fn every_thread_is_reported_while_threads_block_and_one_holds_the_allocator() {
     if std::env::var_os(CHILD).is_some() {
         return;
     }
-    let mut child = Command::new(std::env::current_exe().unwrap())
+    let mut child = Reaped(Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "child", "--nocapture", "--test-threads=1"])
         .env(CHILD, "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap();
+        .unwrap());
+    let child = &mut child.0;
     let mut ready = String::new();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     while !ready.ends_with("ready\n") {
@@ -129,8 +147,6 @@ fn every_thread_is_reported_while_threads_block_and_one_holds_the_allocator() {
             Err(_) => panic!("the stacks did not end within 30 s:\n{}", report.join("\n")),
         }
     }
-    child.kill().unwrap();
-    child.wait().unwrap();
     let text = report.join("\n");
     let stacks = report.iter().filter(|line| line.starts_with("  thread ")).collect::<Vec<_>>();
     let header = report.iter().find(|line| line.starts_with("magnitude-engine: the stacks of ")).expect("a header");
