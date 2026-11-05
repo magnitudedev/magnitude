@@ -296,15 +296,8 @@ async fn run<M: MeasuredMachine>(
     // next job starts at the same point: each job that stores nothing gives the next twice its
     // time, up to [`LONGEST_JOB`] of them, so that point ends and the points past it are reached.
     let mut given = time;
-    // A killed job's attempts not yet released: no job starts while they stand, as the next
-    // would count them against their points.
-    let mut unreleased: Option<(MeasureJob, Vec<PointKey>)> = None;
     loop {
-        while status.borrow().measurements.stage() != Stage::Settled || unreleased.is_some() {
-            if !release_killed_attempts(&machine, &mut unreleased).await {
-                retry(&status, &mut backoff, Duration::ZERO).await;
-                continue;
-            }
+        while status.borrow().measurements.stage() != Stage::Settled {
             // A pool that is gone has no work left on the device.
             let _ = settled.wait_for(|settled| *settled).await;
             let mut held = device.measurement().await;
@@ -339,12 +332,15 @@ async fn run<M: MeasuredMachine>(
             }
             let started = tokio::time::Instant::now();
             let (end, killed) = run_job(&machine, held, given).await;
-            // Released before what is stored is read: a counted attempt would read as the
-            // point's failure. One that cannot be is taken up again at the loop's head before
-            // anything is read.
-            unreleased = killed;
-            if !release_killed_attempts(&machine, &mut unreleased).await {
-                continue;
+            // A killed job's attempts are released before what is stored is read, and before
+            // the next job starts: a counted attempt would read as its point's failure. A
+            // release that fails is retried on the failure's backoff until it succeeds, and the
+            // job's end is then taken as any other's.
+            if let Some((job, keys)) = killed {
+                while let Err(error) = release_killed_attempts(&machine, job, &keys).await {
+                    tracing::error!(error = %format!("{error:#}"), "a killed measurement job's attempts could not be released");
+                    retry(&status, &mut backoff, Duration::ZERO).await;
+                }
             }
             given = match (&end, end.recorded()) {
                 // A preempted job says nothing of its points.
@@ -517,27 +513,14 @@ enum Killed {
     Preempted,
 }
 
-/// Release `unreleased`, a killed job's attempts, if any: whether none stands. One that cannot
-/// be released stands, and is released again before any job starts.
+/// Release the attempts killed job `job` reported, `keys`, on the blocking pool.
 async fn release_killed_attempts<M: MeasuredMachine>(
     machine: &Arc<M>,
-    unreleased: &mut Option<(MeasureJob, Vec<PointKey>)>,
-) -> bool {
-    let Some((job, keys)) = unreleased.take() else {
-        return true;
-    };
-    let released = {
-        let (machine, keys) = (Arc::clone(machine), keys.clone());
-        magnitude_service_utils::blocking::run(move || machine.release_killed(job, &keys)).await
-    };
-    match released {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::error!(error = %format!("{error:#}"), "a killed measurement job's attempts could not be released");
-            *unreleased = Some((job, keys));
-            false
-        }
-    }
+    job: MeasureJob,
+    keys: &[PointKey],
+) -> anyhow::Result<()> {
+    let (machine, keys) = (Arc::clone(machine), keys.to_vec());
+    magnitude_service_utils::blocking::run(move || machine.release_killed(job, &keys)).await
 }
 
 /// One job on `exclusive`, for `time` from its start: the worker is given what is left of it as
