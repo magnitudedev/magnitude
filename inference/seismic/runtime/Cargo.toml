@@ -47,3 +47,9 @@ windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_System_Memory",
 ] }
+
+# Serves the probe processes it starts, as every executable that runs the
+# measurement job does.
+[[test]]
+name = "probes"
+harness = false

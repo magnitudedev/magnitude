@@ -330,7 +330,7 @@ struct Attributes {
     cooperative_launch: bool,
 }
 
-impl seismic_lang::device::cuda::Sources for Attributes {
+impl seismic_lang::device::cuda::Queries for Attributes {
     fn multiprocessor_count(&self) -> Option<u64> {
         Some(self.multiprocessor_count)
     }
@@ -672,7 +672,7 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
         max_shared_memory_per_block_optin: u64::from(unsigned(attr::MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?),
         l2_cache_size: u64::from(unsigned(attr::L2_CACHE_SIZE)?),
         cooperative_launch: unsigned(attr::COOPERATIVE_LAUNCH)? == 1,
-    })
+    }, &Default::default())
     .expect("every CUDA property's source is an attribute the driver reports");
     let kernel_parameter_bytes = if driver_api >= DriverApiVersion::LARGE_PARAMETERS_MINIMUM {
         KERNEL_PARAMETER_BYTES_LARGE

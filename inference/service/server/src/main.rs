@@ -102,6 +102,8 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    // The measurement job's device probes run in processes of this executable.
+    seismic::serve_probe_if_asked();
     // SAFETY: no other thread has started yet.
     unsafe { magnitude_service_server::isolate_hub_credentials() };
     magnitude_executor::diagnostics::install();

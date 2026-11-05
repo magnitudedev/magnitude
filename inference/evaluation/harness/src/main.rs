@@ -360,6 +360,8 @@ fn on_off(value: &str) -> Result<bool, String> {
 }
 
 fn main() {
+    // The measurement job's device probes run in processes of this executable.
+    seismic::serve_probe_if_asked();
     magnitude_executor::diagnostics::install();
     magnitude_executor::platform::relax_gpu_watchdog();
     if let Err(error) = run(Cli::parse().command) {

@@ -396,7 +396,7 @@ mod tests {
     fn a_reservation_grows_chunk_by_chunk_through_its_table() {
         let mut exercised = 0;
         for description in crate::test_devices() {
-            let device = Device::open(description.facts.uuid, crate::test_accounts(&description.facts)).expect("a device meeting the floor opens");
+            let device = Device::open(description.facts.uuid, crate::unbounded_accounts(&description.facts), &Default::default()).expect("a device meeting the floor opens");
             let facts = device.facts();
             let kinds = crate::topology::kinds(facts);
             let placed = ReservedContract::ALL

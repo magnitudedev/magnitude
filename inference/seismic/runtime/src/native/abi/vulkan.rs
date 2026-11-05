@@ -243,7 +243,7 @@ void main() {
             eprintln!("no Vulkan GPU meets the floor");
             return;
         };
-        let device = seismic_vulkan::Device::open(description.facts.uuid, crate::backends::vulkan::test_accounts(&description.facts)).expect("device opens");
+        let device = seismic_vulkan::Device::open(description.facts.uuid, crate::backends::vulkan::test_accounts(&description.facts), &Default::default()).expect("device opens");
         let features = VulkanFeatures {
             subgroup_lanes: device.formation().subgroup_lanes,
             float16: device.formation().float16,
@@ -441,7 +441,7 @@ void main() {
             eprintln!("no Vulkan GPU meets the floor");
             return;
         };
-        let device = seismic_vulkan::Device::open(description.facts.uuid, crate::backends::vulkan::test_accounts(&description.facts)).expect("device opens");
+        let device = seismic_vulkan::Device::open(description.facts.uuid, crate::backends::vulkan::test_accounts(&description.facts), &Default::default()).expect("device opens");
         let features = VulkanFeatures {
             subgroup_lanes: device.formation().subgroup_lanes,
             float16: false,

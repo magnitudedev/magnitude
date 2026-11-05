@@ -29,6 +29,7 @@ impl VulkanOpened {
         uuid: [u8; 16],
         info: &Executor,
         memory: Arc<DeviceLedgers>,
+        probed: &seismic_vulkan::Probed,
     ) -> Result<Self, OpenError> {
         let account =
             |placement: Arc<Placement>| -> Arc<dyn seismic_compiler::executable::MemoryAccount> {
@@ -44,7 +45,7 @@ impl VulkanOpened {
                 .collect(),
             driver: account(memory.device().physical()),
         };
-        let service = seismic_vulkan::Device::open(uuid, accounts).map_err(|error| match error {
+        let service = seismic_vulkan::Device::open(uuid, accounts, probed).map_err(|error| match error {
             seismic_vulkan::OpenError::Missing => OpenError::IdentityChanged(info.selector()),
             other => OpenError::Backend(TargetError::DeviceUnavailable(other.to_string())),
         })?;

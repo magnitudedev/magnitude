@@ -185,7 +185,7 @@ mod tests {
     fn a_program_loads_from_its_artifact_without_compiling() {
         for description in crate::test_devices() {
             let open = || {
-                Device::open(description.facts.uuid, crate::test_accounts(&description.facts))
+                Device::open(description.facts.uuid, crate::unbounded_accounts(&description.facts), &Default::default())
                     .expect("a device meeting the floor opens")
             };
             let source = ProgramSource {

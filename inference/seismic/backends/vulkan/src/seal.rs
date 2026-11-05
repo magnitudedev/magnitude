@@ -2,9 +2,11 @@
 //! arithmetic result is decorated `NoContraction`, and the entry point runs
 //! with RTE rounding and signed-zero/Inf/NaN preservation for fp32, and for
 //! fp16 on devices with fp16 arithmetic, plus `DenormPreserve 32` where the
-//! device supports it. `RoundingModeRTE 32` is left out where the driver
-//! cannot compile it (NVIDIA proprietary); there fp32 rounds by the device's
-//! default.
+//! device supports it. `RoundingModeRTE 32` is left out where the device's
+//! `rounding_rte_32` property does not hold (its `rte_32_division` probe has
+//! not shown the mode forming and rounding as declared; the NVIDIA 580
+//! driver's compiler traps on fp32 `OpFDiv` under it); there fp32 rounds by
+//! the device's default.
 //!
 //! glslang has no global switch for this, and `precise` is per object.
 

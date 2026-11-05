@@ -3995,7 +3995,7 @@ mod tests {
         cooperative_launch: bool,
     }
 
-    impl seismic_lang::device::cuda::Sources for Attributes {
+    impl seismic_lang::device::cuda::Queries for Attributes {
         fn multiprocessor_count(&self) -> Option<u64> {
             Some(1)
         }
@@ -4020,7 +4020,7 @@ mod tests {
     }
 
     fn properties(cooperative_launch: bool) -> crate::profile::Properties {
-        seismic_lang::device::cuda::describe(&Attributes { cooperative_launch }).unwrap()
+        seismic_lang::device::cuda::describe(&Attributes { cooperative_launch }, &Default::default()).unwrap()
     }
 
     fn facts() -> CudaFacts {

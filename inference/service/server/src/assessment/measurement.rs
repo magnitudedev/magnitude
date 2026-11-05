@@ -361,7 +361,7 @@ async fn run<M: MeasuredMachine>(
                     }
                     failures
                         .iter()
-                        .any(|failure| !matches!(failure, MeasureFailure::Figure { .. }))
+                        .any(|failure| !matches!(failure, MeasureFailure::Figure { .. } | MeasureFailure::Probe { .. }))
                 }
                 Some(Err(error)) => {
                     tracing::warn!(%error, "the measurement job was lost");

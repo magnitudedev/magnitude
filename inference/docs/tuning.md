@@ -62,6 +62,36 @@ cost. A fast result at one shape cannot absorb the demand of an unmeasured shape
 remains unknown; it is neither zero nor an invitation to invent a forecast. Numerical eligibility
 is a hard constraint, never a term that faster execution can compensate for.
 
+## Native declarations
+
+A native declaration attaches an authored source to a checked entry for one backend and states its
+tuning settings, its launches and their geometry.
+
+### Device properties and probes
+
+Each backend declares its devices' properties once: each property's type and the sources that
+establish it. A property is a capability (it holds or not), a count, or a measured count. Nothing
+can make one but its sources, so no device name, driver identity or constant sets a property. A
+`query` asks the API one thing and runs no kernel. A `probe` is the stored result of a probe kernel
+the backend owns, written beside the result expected of it: it establishes what no query reports,
+or checks that a reported feature works where a driver has been seen to get it wrong. `a & b`
+holds only when both hold; `a | b` is the first the device answers. A property states what the
+device does, never what is faster on it.
+
+Probes run in the measurement job, never on a load and never when a device is opened. Each probe
+not yet run runs in a process of its own, once per device and driver version; its result is
+stored under the device, its backend and driver version, the probe revision and the declared
+probes, so a driver update runs them again. Opening a device reads the stored results and runs
+nothing. Until its probe has run, a property takes its safe value: a probed capability does not
+hold, and a measured count is not measured, where its reader takes the alternative it states
+rather than a number standing in for the device's. A probe whose process crashes after opening
+the device (a fault, trap, abort, illegal instruction or bus error, as a driver's compiler crashing
+on it ends) is stored as unanswerable and keeps the safe value until the driver changes. Every
+other end stores nothing and is reported, so the next job runs that probe again: a failure before
+opening, a failure the probe reports, a kill or termination (the system's out of memory among
+them), and a probe still running after 60 s, which is stopped so that a hung driver costs a job
+that long rather than its whole deadline.
+
 ## Native programs
 
 Every native program is had through one owner per device, the program former. It keys an

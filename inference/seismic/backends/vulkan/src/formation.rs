@@ -7,7 +7,7 @@
 //! cache of its own, whose data is the program's artifact ([`DirectModule::compile`]).
 
 use crate::device::Device;
-use crate::facts::{SubgroupWidth, SUBGROUP_WIDTH};
+use crate::facts::SUBGROUP_WIDTH;
 use crate::seal::{self, SEAL_VERSION};
 use ash::vk;
 use seismic_native_target::{NativeCompilationError, ProgramEntry, ProgramStatistic, StatisticValue};
@@ -327,7 +327,6 @@ impl DirectModule {
         let specialization = vk::SpecializationInfo::default()
             .map_entries(&entries)
             .data(&data);
-        let width = self.device.facts().subgroup_width();
         let mut subgroup = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
             .required_subgroup_size(SUBGROUP_WIDTH);
         // Full subgroups are required whenever the X extent allows it (a
@@ -345,7 +344,7 @@ impl DirectModule {
             .module(shader)
             .name(c"main")
             .specialization_info(&specialization);
-        let stage = if width == SubgroupWidth::Required32 {
+        let stage = if self.device.facts().requires_subgroup_size() {
             stage.push_next(&mut subgroup)
         } else {
             stage

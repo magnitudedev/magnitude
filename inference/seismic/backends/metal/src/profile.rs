@@ -667,14 +667,14 @@ fn probe_matrix_combinations(
     combinations
 }
 
-/// The sources of a device's properties (`seismic_lang::device::metal`)
-/// at `language`; the tensor probe forms its pipeline when asked.
-struct Sources<'d> {
+/// The queries of a device's properties (`seismic_lang::device::metal`)
+/// at `language`; the tensor query forms its pipeline when asked.
+struct Queries<'d> {
     device: &'d ProtocolObject<dyn MTLDevice>,
     language: LanguageVersion,
 }
 
-impl seismic_lang::device::metal::Sources for Sources<'_> {
+impl seismic_lang::device::metal::Queries for Queries<'_> {
     fn max_threadgroup_memory_length(&self) -> Option<u64> {
         Some(self.device.maxThreadgroupMemoryLength() as u64)
     }
@@ -686,16 +686,17 @@ impl seismic_lang::device::metal::Sources for Sources<'_> {
     }
 }
 
-/// The device's properties at `language`.
+/// The device's properties at `language` (Metal declares no probes).
 fn properties_at(device: &ProtocolObject<dyn MTLDevice>, language: LanguageVersion) -> Properties {
-    seismic_lang::device::metal::describe(&Sources { device, language })
-        .expect("every Metal property's source answers")
+    seismic_lang::device::metal::describe(&Queries { device, language }, &Default::default())
+        .expect("every Metal property's query answers")
 }
 
 /// Whether an unopened device forms tensor operations: the property its
-/// opened description holds, from the same sources at the same language
+/// opened description holds, from the same queries at the same language
 /// version, so planning before a device is opened and the opened device
-/// agree. It compiles the probes; callers ask once per decision, not per
+/// agree. It compiles the tensor query's pipeline; callers ask once per
+/// decision, not per
 /// enumeration.
 pub fn forms_tensor_operations(device: &crate::DeviceHandle) -> bool {
     probe_language_version(device)

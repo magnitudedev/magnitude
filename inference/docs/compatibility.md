@@ -103,8 +103,10 @@ The CPU backend is always available as the fallback.
   - `VK_KHR_workgroup_memory_explicit_layout`, with 8-bit, 16-bit, and scalar layouts
   - `VK_EXT_memory_budget`
 - **Numerics:**
-  - fp32 round-to-nearest-even, declared as `RoundingModeRTE 32` wherever the driver compiles
-    it (the NVIDIA proprietary driver does not; there fp32 rounds by the device's default)
+  - fp32 round-to-nearest-even, declared as `RoundingModeRTE 32` only once the measurement job's
+    `rte_32_division` probe has shown the driver forming and rounding it as declared (the NVIDIA
+    580 driver's compiler traps on it); until then, and where it does not hold, fp32 rounds by
+    the device's default
   - fp32 signed zero, Inf, and NaN preservation
   - discovery reads device properties only; it opens no device and runs no probe
 - **Limits:**

@@ -334,7 +334,12 @@ pub(crate) fn open(
         }
         #[cfg(not(target_os = "macos"))]
         ExecutorSelector::Vulkan { uuid } => {
-            let opened = VulkanOpened::open(uuid, &info, memory.clone())?;
+            // What the measurement job stored of its probes, keyed by the
+            // executor's identity.
+            let identity = topology.executor_identity(info.id()).expect("the executor is of its topology");
+            let probed = crate::probes::stored(options.artifacts.as_deref(), &identity, seismic_vulkan::probe::REVISION)
+                .map_err(|reason| OpenError::Unavailable { selector, reason })?;
+            let opened = VulkanOpened::open(uuid, &info, memory.clone(), &probed)?;
             graph_cost = given.map_or_else(|| seismic_vulkan::graph_cost(opened.service()).map_err(open_error), Ok)?;
             programs = DevicePrograms::Vulkan(ProgramFormer::new(
                 seismic_vulkan::toolchain::VulkanToolchain::new(opened.service().clone()),

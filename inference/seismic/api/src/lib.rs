@@ -31,6 +31,7 @@ pub mod testing {
     pub use seismic_compiler::numerics::{compare_element, ElementComparison};
 }
 pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactStore, DeviceOptions};
+pub use seismic_runtime::probes::{serve_probe_if_asked, KeptProbe, ProbeFailure, ProbeRun, NAMESPACE as PROBE_NAMESPACE};
 pub use seismic_runtime::formation::FormedPrograms;
 pub use seismic_runtime::{backing_times, large_page_backing, BackingTimes, LargePageBacking};
 /// Offline formation coverage of a generated module's native
@@ -286,6 +287,20 @@ impl Devices {
         self.inner
             .open_with(id, options)
             .map(|inner| Device { inner })
+    }
+
+    /// The measurement job's running of executor `id`'s probes, each in a
+    /// probe process of the running executable, which serves it first thing
+    /// in `main` ([`serve_probe_if_asked`]), keeping each result in `store`,
+    /// before `deadline`; opening the executor with `store` afterwards reads
+    /// them. A load never calls this.
+    pub fn probe(
+        &self,
+        id: ExecutorId,
+        store: &dyn ArtifactStore,
+        deadline: std::time::Instant,
+    ) -> Result<ProbeRun, OpenError> {
+        self.inner.probe(id, store, deadline)
     }
 
     /// Low-level control: opens the first discovered executor of a backend.

@@ -1579,11 +1579,10 @@ pub trait MemoryAccount: Send + Sync {
 }
 
 /// An account that bounds nothing and charges nothing: what a backend's own
-/// tests open a device with, outside any runtime's ledgers.
-#[cfg(feature = "fixtures")]
+/// tests, and a backend's probe process, open a device with, outside any
+/// runtime's ledgers.
 pub struct Unbounded;
 
-#[cfg(feature = "fixtures")]
 impl MemoryAccount for Unbounded {
     fn available(&self) -> u64 {
         u64::MAX

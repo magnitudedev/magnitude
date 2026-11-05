@@ -71,7 +71,7 @@ struct Pool {
     participants: usize,
 }
 
-impl seismic_lang::device::cpu::Sources for Pool {
+impl seismic_lang::device::cpu::Queries for Pool {
     fn worker_cores(&self) -> Option<u64> {
         Some(self.participants as u64)
     }
@@ -122,7 +122,7 @@ impl Executor {
             .count();
         Self {
             workers,
-            properties: seismic_lang::device::cpu::describe(&Pool { participants })
+            properties: seismic_lang::device::cpu::describe(&Pool { participants }, &Default::default())
                 .expect("a worker pool answers its participants"),
         }
     }

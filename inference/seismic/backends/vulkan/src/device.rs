@@ -5,7 +5,7 @@
 //! numbers every submission, the block allocator, and host access to
 //! storage.
 
-use crate::facts::{self, Description, Facts, FormationTarget, Properties};
+use crate::facts::{self, Description, Facts, FormationTarget, Probed, Properties};
 use crate::instance::{Instance, LoaderError};
 use crate::memory::{Buffer, Memory, Pool, Range};
 use ash::vk;
@@ -490,7 +490,11 @@ impl Device {
     /// `accounts`, and the driver's memory its creation and admissions find
     /// to their driver account: an open sharing a held logical device
     /// charges its own to its own, and what others allocated keeps theirs.
-    pub fn open(uuid: [u8; 16], accounts: crate::memory::MemoryAccounts) -> Result<Self, OpenError> {
+    ///
+    /// The device's properties take its probes as `probed` holds them, what
+    /// the measurement job stored for the device and driver version; each
+    /// probe not run takes its safe value. Opening runs no probe.
+    pub fn open(uuid: [u8; 16], accounts: crate::memory::MemoryAccounts, probed: &Probed) -> Result<Self, OpenError> {
         let accounts = Arc::new(accounts);
         let mut registry = loop {
             let mut registry = registry();
@@ -509,18 +513,15 @@ impl Device {
             destroyed.wait();
         };
         let instance = crate::instance::instance().map_err(OpenError::Loader)?;
-        let Description {
-            handle,
-            facts,
-            floor,
-        } = instance
+        let description = instance
             .physical_devices()
             .map_err(OpenError::Loader)?
             .into_iter()
             .map(|physical| facts::describe(&instance, physical))
             .find(|description| description.facts.uuid == uuid)
             .ok_or(OpenError::Missing)?;
-        let properties = floor.map_err(OpenError::Floor)?;
+        let properties = description.properties(probed).map_err(OpenError::Floor)?;
+        let Description { handle, facts, .. } = description;
         let inner = Arc::new(Inner::create(instance, handle.physical, facts, properties, &*accounts.driver)?);
         registry.opened.push((uuid, Arc::downgrade(&inner), inner.destroyed.0.clone()));
         Ok(Self { inner, accounts })
@@ -1137,7 +1138,10 @@ impl Inner {
         .heap_usage_bytes;
         let raw = instance.raw();
         let mut extensions: Vec<&CStr> = facts::FLOOR_EXTENSIONS.to_vec();
-        if target.matrix {
+        // Enabled wherever the device supports it, whether or not formation
+        // takes the path, so the measurement job's probes reach it.
+        let matrix = properties.matrix.holds();
+        if matrix {
             extensions.push(ash::khr::cooperative_matrix::NAME);
         }
         if target.f32_atomic_add {
@@ -1161,9 +1165,9 @@ impl Inner {
             .map(|name| name.as_ptr())
             .collect::<Vec<_>>();
         let mut shader_fma = facts::ShaderFmaFeatures::default();
-        shader_fma.float16 = facts.shader_fma.float16.into();
+        shader_fma.float16 = facts.shader_fma().float16.into();
         shader_fma.float32 = properties.fma_32.holds().into();
-        shader_fma.float64 = facts.shader_fma.float64.into();
+        shader_fma.float64 = facts.shader_fma().float64.into();
 
         let mut explicit = vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR::default()
             .workgroup_memory_explicit_layout(true)
@@ -1205,7 +1209,7 @@ impl Inner {
             .push_next(&mut f12)
             .push_next(&mut f13)
             .push_next(&mut explicit);
-        if target.matrix {
+        if matrix {
             features = features.push_next(&mut cooperative);
         }
         if target.f32_atomic_add {
@@ -1603,7 +1607,7 @@ mod reconcile_tests {
         devices
             .into_iter()
             .filter(|description| description.floor.is_ok())
-            .map(|description| Device::open(description.facts.uuid, crate::test_accounts(&description.facts)).expect("a device meeting the floor opens"))
+            .map(|description| Device::open(description.facts.uuid, crate::unbounded_accounts(&description.facts), &Default::default()).expect("a device meeting the floor opens"))
             .collect()
     }
 

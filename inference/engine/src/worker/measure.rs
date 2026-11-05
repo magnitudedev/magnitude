@@ -86,6 +86,10 @@ pub enum MeasureFailure {
     /// A figure after the probe could not be read outside its points'
     /// timings: the costs keep pricing it from those read.
     Figure { reason: String },
+    /// A device-property probe kept no result (`seismic::ProbeFailure`):
+    /// the device keeps that probe's safe value, and the next job runs it
+    /// again. What was measured stands.
+    Probe { reason: String },
 }
 
 impl fmt::Display for MeasureFailure {
@@ -105,6 +109,7 @@ impl fmt::Display for MeasureFailure {
             }
             Self::Attempt { reason } => write!(formatter, "recording an attempt: {reason}"),
             Self::Figure { reason } => write!(formatter, "a priced figure: {reason}"),
+            Self::Probe { reason } => write!(formatter, "a device probe: {reason}"),
         }
     }
 }
@@ -294,13 +299,22 @@ pub fn measure_machine(
     // The device forms through the kernel cache's artifact store, as a load's
     // does: a program this job or a load compiled is loaded, not compiled
     // again. It holds no limit: the walk passes over its paths by holding
-    // them.
+    // them. Its property probes run first, each in a process of its own,
+    // and keep their results in the same store, so the device opens with
+    // them, as every later load does; a probe that keeps nothing is
+    // reported, its property at its safe value.
+    let mut probing = Vec::new();
     let device = match KernelCache::open(request.kernels.clone(), DEFAULT_KERNEL_CACHE_BYTES)
         .map_err(|error| error.to_string())
         .and_then(|cache| {
             let executor = catalog
                 .resolve(request.executor)
                 .map_err(|error| error.to_string())?;
+            let probes = catalog.probe(executor, &cache, deadline).map_err(|error| error.to_string())?;
+            for kept in &probes.kept {
+                tracing::info!(probe = kept.probe, result = %kept.result.line(), report = %kept.report, "probed the device");
+            }
+            probing.extend(probes.failures.iter().map(|failure| MeasureFailure::Probe { reason: failure.to_string() }));
             catalog
                 .open_with(
                     executor,
@@ -330,7 +344,7 @@ pub fn measure_machine(
     // Reports attempts and records as the walk goes; a RefCell as both the
     // attempting and the visiting closures report.
     let report = RefCell::new(report);
-    let mut failures = Vec::new();
+    let mut failures = probing;
     let measured = requests::measure(
         &mut measurer,
         &device,

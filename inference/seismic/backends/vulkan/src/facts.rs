@@ -12,7 +12,7 @@ use std::ffi::CStr;
 use seismic_topology::Unreservable;
 use std::sync::Arc;
 
-pub use seismic_lang::device::vulkan::Properties;
+pub use seismic_lang::device::vulkan::{Probed, Properties};
 
 /// Minimum group memory, invocations, grid and group extents and push
 /// constants of the floor.
@@ -48,24 +48,20 @@ pub struct FormationTarget {
 
 impl FormationTarget {
     /// The target a device with `properties` forms in. The cooperative-
-    /// matrix path needs fp16 arithmetic and 32-lane hardware subgroups.
-    /// `driver` holds the three choices that still follow the driver's
-    /// identity until probes establish them.
-    pub fn of(properties: &Properties, driver: DriverRules) -> Self {
+    /// matrix path needs fp16 arithmetic and 32-lane hardware subgroups, and
+    /// is formed only where `matrix_path` ([`Facts::matrix_path`]).
+    pub fn of(properties: &Properties, matrix_path: bool) -> Self {
         let subgroup_lanes = u32::try_from(properties.subgroup_width.get()).expect("a subgroup's lanes fit u32");
         let float16 = properties.float16.holds();
         Self {
             subgroup_lanes,
             float16,
-            matrix: properties.matrix.holds()
-                && float16
-                && subgroup_lanes == SUBGROUP_WIDTH
-                && driver.matrix_path,
-            wide_accumulators: driver.wide_accumulators,
+            matrix: properties.matrix.holds() && float16 && subgroup_lanes == SUBGROUP_WIDTH && matrix_path,
+            wide_accumulators: properties.wide_accumulators.holds(),
             mixed_dot: properties.mixed_dot.holds(),
             f32_atomic_add: properties.f32_atomic_add.holds(),
             shared_int64_atomics: properties.shared_int64_atomics.holds(),
-            rounding_rte_32: driver.rounding_rte_32,
+            rounding_rte_32: properties.rounding_rte_32.holds(),
             denorm_preserve_32: properties.denorm_preserve_32.holds(),
         }
     }
@@ -172,9 +168,11 @@ impl FormationTarget {
     }
 }
 
-/// How a device runs the 32-lane logical subgroup.
+/// How a device runs the 32-lane logical subgroup: the query layer's
+/// answer, of which the `subgroup_width` property holds the lanes and
+/// [`Facts::requires_subgroup_size`] whether pipelines require them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SubgroupWidth {
+enum SubgroupWidth {
     /// Pipelines require a subgroup size of 32.
     Required32,
     /// Every subgroup has 32 lanes; pipelines request no size (NVK).
@@ -272,36 +270,26 @@ pub struct Limits {
 }
 
 /// The widths `OpFmaKHR` supports (`VK_KHR_shader_fma`); all false without
-/// the extension.
+/// the extension. The query layer's answer: the `fma_32` property holds
+/// whether fp32 is among them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ShaderFma {
-    pub float16: bool,
-    pub float32: bool,
-    pub float64: bool,
+pub(crate) struct ShaderFma {
+    pub(crate) float16: bool,
+    pub(crate) float32: bool,
+    pub(crate) float64: bool,
 }
 
-/// The formation choices that still follow the driver's identity, until
-/// the probes that establish them as facts land (the device's properties
-/// never read these).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct DriverRules {
-    /// The cooperative-matrix path is formed: never on RDNA2 (no WMMA units
-    /// whatever its driver reports; accelerated mixed-signedness packed dot
-    /// identifies RDNA3+) or on the NVIDIA proprietary driver, whose
-    /// compiler (580.159.03, GB10) runs the projection GEMM's
-    /// cooperative-matrix path 1.3x (paired) to over 30x (single weight)
-    /// slower than its FMA path.
-    pub matrix_path: bool,
-    /// The compiler handles a subgroup's cooperative-matrix accumulator
-    /// arrays beyond 4 fragments in the flash-attention body
-    /// (`SEISMIC_HAS_WIDE_ACCUMULATORS`). False on the NVIDIA proprietary
-    /// driver: 580.159.03 returns wrong outputs for 8- and 16-fragment
-    /// output accumulators there, while 4 are reliable.
-    pub wide_accumulators: bool,
-    /// `RoundingModeRTE 32` is emitted. False on the NVIDIA proprietary
-    /// driver, whose compiler traps on fp32 `OpFDiv` under it (580.159.03);
-    /// there fp32 rounds by the device's default.
-    pub rounding_rte_32: bool,
+/// TEMPORARY, and the one place a driver's identity decides anything:
+/// whether the cooperative-matrix path is formed. It is a performance
+/// choice, not a fact (`matrix` reports the device's support), and moves to
+/// a `form MATRIX` default the kernels declare, when this function is
+/// deleted. Not formed on RDNA2 (no WMMA units whatever its
+/// driver reports; accelerated mixed-signedness packed dot identifies
+/// RDNA3+), nor on the NVIDIA proprietary driver, whose compiler (580.159.03,
+/// GB10) runs the projection GEMM's cooperative-matrix path 1.3x (paired) to
+/// over 30x (single weight) slower than its FMA path.
+fn matrix_path(driver_id: vk::DriverId, vendor_id: u32, mixed_dot: bool) -> bool {
+    driver_id != vk::DriverId::NVIDIA_PROPRIETARY && (vendor_id != AMD_VENDOR || mixed_dot)
 }
 
 /// How a device pairs its timestamps with the host clock.
@@ -346,18 +334,13 @@ pub struct Facts {
     /// (`VK_EXT_map_memory_placed`'s `memoryMapPlaced` and
     /// `memoryUnmapReserve`, over `VK_KHR_map_memory2`).
     pub placed_map_alignment: Option<u64>,
-    /// How the device runs the logical subgroup; `None` fails the floor.
-    pub subgroup_width: Option<SubgroupWidth>,
-    /// The `VK_KHR_shader_fma` widths the device reports, which opening it
-    /// enables. Where fp32 is among them (the `fma_32` property),
-    /// `seismic_fma_rn` is bound to `OpFmaKHR`, so it is fused; otherwise it
-    /// is GLSL `fma`, which the driver may fuse or round twice.
-    pub shader_fma: ShaderFma,
     /// `VK_KHR_pipeline_executable_properties` with `pipelineExecutableInfo`:
     /// a formed pipeline reports its executables' statistics (registers,
     /// spills, memory and others, as the driver names them).
     pub pipeline_statistics: bool,
-    pub driver_rules: DriverRules,
+    /// Whether the cooperative-matrix path is formed ([`matrix_path`], the
+    /// temporary performance rule).
+    pub matrix_path: bool,
     pub calibration: Option<Calibration>,
     /// `VkPhysicalDeviceIDProperties::deviceLUID`, when `deviceLUIDValid`:
     /// the OS adapter's identity, in `LUID` memory layout.
@@ -366,6 +349,10 @@ pub struct Facts {
     pub memory: MemoryLayout,
     /// The memory types the backend allocates each storage kind from.
     pub allocation: Allocation,
+    /// The API's answers to the property queries, which establish the
+    /// device's properties ([`Description::properties`]) and hold what the
+    /// properties take of them: how the subgroup is run and the FMA widths.
+    queried: Queried,
 }
 
 /// `VkPhysicalDeviceMemoryProperties`: the heaps and the memory types, in
@@ -460,29 +447,41 @@ impl Facts {
     }
 
     /// The formation-identity part the device determines: its driver and
-    /// pipeline cache, and the target it forms in, which includes the
-    /// sealed environment and how `seismic_fma_rn` is bound.
+    /// pipeline cache, whether its pipelines require their subgroup size,
+    /// and the target it forms in, which includes the sealed environment
+    /// and how `seismic_fma_rn` is bound.
     pub fn formation_identity(&self, properties: &Properties) -> String {
         format!(
-            "driver {} {};cache {};subgroup {:?};{};fma {}",
+            "driver {} {};cache {};subgroup {};{};fma {}",
             self.driver_id,
             self.driver_version,
             hex(&self.pipeline_cache_uuid),
-            self.subgroup_width(),
+            if self.requires_subgroup_size() { "required" } else { "fixed" },
             self.formation(properties).identity(),
             if properties.fma_32.holds() { "khr" } else { "glsl" }
         )
     }
 
-    /// How a device meeting the floor runs the logical subgroup.
-    pub fn subgroup_width(&self) -> SubgroupWidth {
-        self.subgroup_width
-            .expect("a device meeting the floor has a logical subgroup width")
+    /// Whether pipelines require the 32-lane subgroup size; otherwise every
+    /// subgroup has the fixed width the `subgroup_width` property holds, and
+    /// pipelines request none. Only a device meeting the floor, which
+    /// requires a known width, is asked.
+    pub(crate) fn requires_subgroup_size(&self) -> bool {
+        let width = self.queried.subgroup_width.expect("a device meeting the floor has a known subgroup width");
+        width == SubgroupWidth::Required32
+    }
+
+    /// The `VK_KHR_shader_fma` widths the device reports, which opening it
+    /// enables where fp32 is among them (the `fma_32` property): then
+    /// `seismic_fma_rn` is bound to `OpFmaKHR`, so it is fused; otherwise it
+    /// is GLSL `fma`, which the driver may fuse or round twice.
+    pub(crate) fn shader_fma(&self) -> ShaderFma {
+        self.queried.shader_fma
     }
 
     /// The target this device, of `properties`, forms in.
     pub fn formation(&self, properties: &Properties) -> FormationTarget {
-        let target = FormationTarget::of(properties, self.driver_rules);
+        let target = FormationTarget::of(properties, self.matrix_path);
         assert!(
             target.consistent(),
             "device properties produced an inconsistent formation target: {target:?}"
@@ -678,77 +677,100 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// One enumerated physical device: its handle, its facts, and, where it
-/// meets the floor, its properties (`Err` names the first missing item).
+/// One enumerated physical device: its handle, its facts and whether it
+/// meets the floor (`Err` names the first missing item). Its facts hold
+/// its API's answers to the property queries, which establish its
+/// properties with what the measurement job stored of its probes
+/// ([`Description::properties`]).
 #[derive(Clone, Debug)]
 pub struct Description {
     pub handle: DeviceHandle,
     pub facts: Facts,
-    pub floor: Result<Properties, String>,
+    pub floor: Result<(), String>,
 }
 
-/// The API answers a device's properties are established from
-/// (`seismic_lang::device::vulkan`): each method reads the one field it
-/// names.
-struct Queried<'a> {
+impl Description {
+    /// The device's properties, its probes as `probed` holds them (each
+    /// probe not run at its safe value); `Err` where it does not meet the
+    /// floor.
+    pub fn properties(&self, probed: &Probed) -> Result<Properties, String> {
+        self.floor.clone()?;
+        Ok(seismic_lang::device::vulkan::describe(&self.facts.queried, probed)
+            .expect("a device meeting the floor answers every property query"))
+    }
+}
+
+/// The API's answers to the property queries
+/// (`seismic_lang::device::vulkan`): each the one field its query names.
+#[derive(Clone, Debug)]
+struct Queried {
     subgroup_width: Option<SubgroupWidth>,
-    limits: &'a vk::PhysicalDeviceLimits,
-    v12: &'a vk::PhysicalDeviceVulkan12Properties<'a>,
-    v13: &'a vk::PhysicalDeviceVulkan13Properties<'a>,
-    f12: &'a vk::PhysicalDeviceVulkan12Features<'a>,
-    cooperative: &'a vk::PhysicalDeviceCooperativeMatrixFeaturesKHR<'a>,
+    min_subgroup_size: u32,
+    max_compute_work_group_invocations: u32,
+    max_compute_shared_memory_size: u32,
+    shader_float16: bool,
+    shader_rounding_mode_rte_float16: bool,
+    shader_signed_zero_inf_nan_preserve_float16: bool,
+    shader_rounding_mode_rte_float32: bool,
+    cooperative_matrix: bool,
     /// Whether the device offers the f16 x f16 -> f32 16x16x16 subgroup
     /// shape (`matrix_shapes`).
-    matrix_shape: bool,
-    atomic_float: &'a vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT<'a>,
+    cooperative_matrix_f16_16x16x16: bool,
+    integer_dot_product_4x8_mixed_signedness_accelerated: bool,
+    shader_buffer_float32_atomic_add: bool,
+    shader_shared_int64_atomics: bool,
+    shader_denorm_preserve_float32: bool,
     shader_fma: ShaderFma,
 }
 
-impl seismic_lang::device::vulkan::Sources for Queried<'_> {
+impl seismic_lang::device::vulkan::Queries for Queried {
     fn required_subgroup_32(&self) -> Option<u64> {
         (self.subgroup_width? == SubgroupWidth::Required32).then_some(u64::from(SUBGROUP_WIDTH))
     }
     fn fixed_subgroup_size(&self) -> Option<u64> {
         match self.subgroup_width? {
             SubgroupWidth::Required32 => None,
-            SubgroupWidth::Fixed32 | SubgroupWidth::Fixed64 => Some(u64::from(self.v13.min_subgroup_size)),
+            SubgroupWidth::Fixed32 | SubgroupWidth::Fixed64 => Some(u64::from(self.min_subgroup_size)),
         }
     }
     fn max_compute_work_group_invocations(&self) -> Option<u64> {
-        Some(self.limits.max_compute_work_group_invocations.into())
+        Some(self.max_compute_work_group_invocations.into())
     }
     fn max_compute_shared_memory_size(&self) -> Option<u64> {
-        Some(self.limits.max_compute_shared_memory_size.into())
+        Some(self.max_compute_shared_memory_size.into())
     }
     fn shader_float16(&self) -> Option<bool> {
-        Some(self.f12.shader_float16 == vk::TRUE)
+        Some(self.shader_float16)
     }
     fn shader_rounding_mode_rte_float16(&self) -> Option<bool> {
-        Some(self.v12.shader_rounding_mode_rte_float16 == vk::TRUE)
+        Some(self.shader_rounding_mode_rte_float16)
     }
     fn shader_signed_zero_inf_nan_preserve_float16(&self) -> Option<bool> {
-        Some(self.v12.shader_signed_zero_inf_nan_preserve_float16 == vk::TRUE)
+        Some(self.shader_signed_zero_inf_nan_preserve_float16)
     }
     fn cooperative_matrix(&self) -> Option<bool> {
-        Some(self.cooperative.cooperative_matrix == vk::TRUE)
+        Some(self.cooperative_matrix)
     }
     fn cooperative_matrix_f16_16x16x16(&self) -> Option<bool> {
-        Some(self.matrix_shape)
+        Some(self.cooperative_matrix_f16_16x16x16)
     }
     fn integer_dot_product_4x8_mixed_signedness_accelerated(&self) -> Option<bool> {
-        Some(self.v13.integer_dot_product4x8_bit_packed_mixed_signedness_accelerated == vk::TRUE)
+        Some(self.integer_dot_product_4x8_mixed_signedness_accelerated)
     }
     fn shader_buffer_float32_atomic_add(&self) -> Option<bool> {
-        Some(self.atomic_float.shader_buffer_float32_atomic_add == vk::TRUE)
+        Some(self.shader_buffer_float32_atomic_add)
     }
     fn shader_shared_int64_atomics(&self) -> Option<bool> {
-        Some(self.f12.shader_shared_int64_atomics == vk::TRUE)
+        Some(self.shader_shared_int64_atomics)
     }
     fn shader_denorm_preserve_float32(&self) -> Option<bool> {
-        Some(self.v12.shader_denorm_preserve_float32 == vk::TRUE)
+        Some(self.shader_denorm_preserve_float32)
     }
     fn shader_fma_float32(&self) -> Option<bool> {
         Some(self.shader_fma.float32)
+    }
+    fn shader_rounding_mode_rte_float32(&self) -> Option<bool> {
+        Some(self.shader_rounding_mode_rte_float32)
     }
 }
 
@@ -868,30 +890,32 @@ pub(crate) fn describe(instance: &Arc<Instance>, physical: vk::PhysicalDevice) -
         v13.required_subgroup_size_stages
             .contains(vk::ShaderStageFlags::COMPUTE),
     );
-    let reported_fma = ShaderFma {
-        float16: shader_fma.float16 == vk::TRUE,
-        float32: shader_fma.float32 == vk::TRUE,
-        float64: shader_fma.float64 == vk::TRUE,
-    };
-    let nvidia_proprietary = v12.driver_id == vk::DriverId::NVIDIA_PROPRIETARY;
-    let driver_rules = DriverRules {
-        matrix_path: !nvidia_proprietary
-            && (base.vendor_id != AMD_VENDOR
-                || v13.integer_dot_product4x8_bit_packed_mixed_signedness_accelerated == vk::TRUE),
-        wide_accumulators: !nvidia_proprietary,
-        rounding_rte_32: !nvidia_proprietary,
-    };
-    let properties = seismic_lang::device::vulkan::describe(&Queried {
+    let on = |value: vk::Bool32| value == vk::TRUE;
+    let mixed_dot = on(v13.integer_dot_product4x8_bit_packed_mixed_signedness_accelerated);
+    let queried = Queried {
         subgroup_width,
-        limits: &base.limits,
-        v12: &v12,
-        v13: &v13,
-        f12: &f12,
-        cooperative: &cooperative,
-        matrix_shape: cooperative.cooperative_matrix == vk::TRUE && matrix_shapes(instance, physical),
-        atomic_float: &atomic_float,
-        shader_fma: reported_fma,
-    });
+        min_subgroup_size: v13.min_subgroup_size,
+        max_compute_work_group_invocations: base.limits.max_compute_work_group_invocations,
+        max_compute_shared_memory_size: base.limits.max_compute_shared_memory_size,
+        shader_float16: on(f12.shader_float16),
+        shader_rounding_mode_rte_float16: on(v12.shader_rounding_mode_rte_float16),
+        shader_signed_zero_inf_nan_preserve_float16: on(v12.shader_signed_zero_inf_nan_preserve_float16),
+        shader_rounding_mode_rte_float32: on(v12.shader_rounding_mode_rte_float32),
+        cooperative_matrix: on(cooperative.cooperative_matrix),
+        cooperative_matrix_f16_16x16x16: on(cooperative.cooperative_matrix) && matrix_shapes(instance, physical),
+        integer_dot_product_4x8_mixed_signedness_accelerated: mixed_dot,
+        shader_buffer_float32_atomic_add: on(atomic_float.shader_buffer_float32_atomic_add),
+        shader_shared_int64_atomics: on(f12.shader_shared_int64_atomics),
+        shader_denorm_preserve_float32: on(v12.shader_denorm_preserve_float32),
+        shader_fma: ShaderFma {
+            float16: on(shader_fma.float16),
+            float32: on(shader_fma.float32),
+            float64: on(shader_fma.float64),
+        },
+    };
+    // The floor reads properties only queries establish, so no probe
+    // decides whether a device meets it.
+    let queries_answer = seismic_lang::device::vulkan::describe(&queried, &Probed::default());
     let calibration = if has(ash::khr::calibrated_timestamps::NAME) {
         Some(Calibration::Khr)
     } else if has(ash::ext::calibrated_timestamps::NAME) {
@@ -927,17 +951,15 @@ pub(crate) fn describe(instance: &Arc<Instance>, physical: vk::PhysicalDevice) -
         side_family,
         host_import_alignment: imports_host.then_some(host_import.min_imported_host_pointer_alignment),
         placed_map_alignment,
-        subgroup_width,
-        shader_fma: reported_fma,
         pipeline_statistics: executables.pipeline_executable_info == vk::TRUE,
-        driver_rules,
+        matrix_path: matrix_path(v12.driver_id, base.vendor_id, mixed_dot),
         calibration,
         luid: (v11.device_luid_valid == vk::TRUE).then_some(v11.device_luid),
         memory,
         allocation,
+        queried,
     };
 
-    let on = |value: vk::Bool32| value == vk::TRUE;
     let subgroup_operations = vk::SubgroupFeatureFlags::BASIC
         | vk::SubgroupFeatureFlags::VOTE
         | vk::SubgroupFeatureFlags::ARITHMETIC
@@ -975,8 +997,8 @@ pub(crate) fn describe(instance: &Arc<Instance>, physical: vk::PhysicalDevice) -
         ("VK_EXT_memory_budget", has(FLOOR_EXTENSIONS[1])),
         ("RTE rounding for fp32", on(v12.shader_rounding_mode_rte_float32)),
         ("SignedZeroInfNanPreserve for fp32", on(v12.shader_signed_zero_inf_nan_preserve_float32)),
-        ("32 KiB of shared memory", properties.as_ref().is_ok_and(|properties| properties.shared_bytes_per_group.get() >= FLOOR_SHARED_BYTES)),
-        ("1024 invocations per workgroup", properties.as_ref().is_ok_and(|properties| properties.max_group_threads.get() >= FLOOR_INVOCATIONS)),
+        ("32 KiB of shared memory", queries_answer.as_ref().is_ok_and(|properties| properties.shared_bytes_per_group.get() >= FLOOR_SHARED_BYTES)),
+        ("1024 invocations per workgroup", queries_answer.as_ref().is_ok_and(|properties| properties.max_group_threads.get() >= FLOOR_INVOCATIONS)),
         ("65535 workgroups on every axis", limits.max_compute_work_group_count.iter().all(|count| *count >= FLOOR_GROUP_COUNT)),
         ("workgroup size (1024, 1024, 64)", limits.max_compute_work_group_size.iter().zip(FLOOR_GROUP_SIZE).all(|(size, floor)| *size >= floor)),
         ("128 bytes of push constants", limits.max_push_constants_size >= FLOOR_PUSH_CONSTANT_BYTES),
@@ -992,7 +1014,7 @@ pub(crate) fn describe(instance: &Arc<Instance>, physical: vk::PhysicalDevice) -
     ];
     let floor = match requirements.iter().find(|(_, met)| !met) {
         Some((missing, _)) => Err(format!("missing {missing}")),
-        None => properties.map_err(|unanswered| unanswered.to_string()),
+        None => queries_answer.map(|_| ()).map_err(|unanswered| unanswered.to_string()),
     };
     Description {
         handle: DeviceHandle { instance: instance.clone(), physical },

@@ -45,5 +45,6 @@ pub mod formation;
 mod layout;
 mod memory;
 pub mod native;
+pub mod probes;
 mod resources;
 mod telemetry;

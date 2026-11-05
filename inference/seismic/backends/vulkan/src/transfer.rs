@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn a_batch_lands_its_runs_across_a_reservations_chunks() {
         for description in crate::test_devices() {
-            let device = Device::open(description.facts.uuid, crate::test_accounts(&description.facts)).expect("a device meeting the floor opens");
+            let device = Device::open(description.facts.uuid, crate::unbounded_accounts(&description.facts), &Default::default()).expect("a device meeting the floor opens");
             let queue = TransferQueue::new(&device);
             assert_eq!(queue.is_ok(), device.has_side_queue(), "{}: a transfer queue exactly where a side queue is", description.facts.name);
             // A device whose memory is the host's reserves without a second

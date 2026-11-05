@@ -88,8 +88,10 @@ pub trait Artifact: Sized + Send + Sync {
 /// it, so whenever no live compile holds a program, in this process or a
 /// later one, it is loaded ([`Load`] says what that takes). What compiles
 /// outside it serves nothing: the device probes that toolchain identity is
-/// made of, which precede any toolchain; the analytical-service probes,
-/// whose measurements feed the estimator; offline coverage of whether a
+/// made of, which precede any toolchain; the device-property probes, which
+/// the measurement job runs in probe processes of their own; the
+/// analytical-service probes, whose measurements feed the estimator;
+/// offline coverage of whether a
 /// program forms; and Seismic's compiler of entries without a native
 /// implementation, which no load runs.
 ///

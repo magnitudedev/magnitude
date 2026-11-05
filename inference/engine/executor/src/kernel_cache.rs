@@ -11,6 +11,8 @@
 //!                                      entries) and which artifact holds each entry,
 //!                                      one namespace per toolchain (its
 //!                                      ArtifactStore)
+//! <root>/artifacts/probes/<key>        the measurement job's probe results for one
+//!                                      device and driver (`seismic::PROBE_NAMESPACE`)
 //! <root>/tuning/<key>.json             one unit's choice per tuning key: what a load
 //!                                      serves and what it holds that choice to,
 //!                                      replaced whole when the unit's search changes
@@ -37,7 +39,9 @@
 //!                                      ([`KernelCache::measurement_attempts`])
 //! ```
 //!
-//! The measurement records and their attempts are not the cache's entries.
+//! The measurement records, their attempts and the probe results are not the
+//! cache's entries; a probe result lost would leave loads on its safe value
+//! until a job probed again.
 //! A record is valid while its key (the executor's hardware and driver, the
 //! kernel's source, its configuration and point) matches, and is taken
 //! again when it does not; losing one costs a measurement job. An attempt is
@@ -435,7 +439,8 @@ impl KernelCache {
     /// the measurement records and their attempts belongs to an entry
     /// ([`Self::eviction_entry`]); an entry is as large as its files
     /// together, was used when the latest of them was, and is removed whole.
-    /// The directories of [`KEPT`] are never walked.
+    /// The directories of [`KEPT`] and the stored probe results
+    /// (`seismic::PROBE_NAMESPACE`) are never walked.
     fn evict(&self, capacity: u64) {
         let now = SystemTime::now();
         let mut files = Vec::new();
@@ -450,9 +455,10 @@ impl KernelCache {
                 };
                 let path = item.path();
                 if metadata.is_dir() {
-                    // Measurement records and the job's attempts are valid by
-                    // their key, not their use time.
-                    if !KEPT.iter().any(|kept| path == self.root.join(kept)) {
+                    // Measurement records, the job's attempts and its probes'
+                    // results are valid by their key, not their use time.
+                    let probes = self.root.join(ARTIFACTS).join(seismic::PROBE_NAMESPACE);
+                    if path != probes && !KEPT.iter().any(|kept| path == self.root.join(kept)) {
                         directories.push(path);
                     }
                     continue;

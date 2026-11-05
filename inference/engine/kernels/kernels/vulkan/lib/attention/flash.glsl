@@ -31,8 +31,9 @@
 #define FLASH_FACTORS 256u
 #define FLASH_INF uintBitsToFloat(0x7f800000u)
 // The widest output window a device takes in one pass: the whole head, or 4
-// accumulator fragments where the compiler mishandles wider cooperative-matrix
-// accumulator arrays (NVIDIA 580, `SEISMIC_HAS_WIDE_ACCUMULATORS` 0). The FMA
+// accumulator fragments where the device's `wide_accumulators` probe has not
+// shown wider cooperative-matrix accumulator arrays correct
+// (`SEISMIC_HAS_WIDE_ACCUMULATORS` 0). The FMA
 // path's accumulators are plain floats, so it always takes the whole head.
 #if SEISMIC_HAS_WIDE_ACCUMULATORS || !SEISMIC_HAS_MATRIX
 #define FLASH_WINDOW FLASH_MAX_W
