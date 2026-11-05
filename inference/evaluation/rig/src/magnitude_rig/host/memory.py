@@ -302,8 +302,7 @@ def report_stalls(pressure, released, start, release_step_ratio, served):
     A step slower than the step there by more than a step, which no resize's thread or release
     touches, or slower than the thread time of the resize decided in it explains, is a slow step
     of its own, reported as one with what the streamed steps that completed in it read (`served`,
-    the worker's `expert step completed` events). The instrument's own pause, giving its memory back from inside the
-    decode's output, is no step's. Returns the gate's failures: a window that tested nothing, and
+    the worker's `expert step completed` events). Returns the gate's failures: a window that tested nothing, and
     each resize in it not within one step."""
     resizes = [event for event in released if event["rung"] in ("Bank", "Growth")]
     steps = pressure.get("steps", [])
@@ -316,17 +315,13 @@ def report_stalls(pressure, released, start, release_step_ratio, served):
     # Each output's wait for a token since the one before.
     waits = [((at - before_at) / (count - before_count), before_at, at)
              for (before_count, before_at), (count, at) in zip(steps, steps[1:]) if count > before_count]
-    if "freeing" in pressure:
-        pause = (pressure["freeing"]["at"], pressure["freed"]["at"])
-        waits = [wait for wait in waits if wait[2] <= pause[0] or wait[1] >= pause[1]]
     inside = [event for event in resizes if opened <= event["decided"] <= closed]
     print(f"window: tokens {window['from']}–{window['to']} ({opened - start:.2f}–{closed - start:.2f} s) under the "
           f"held pressure; {len(inside)} of {len(resizes)} resizes in it")
     if not inside:
         print("NO RESIZE IN THE WINDOW: the cell tested no resize under pressure")
         return ["no resize in the pressure's window: nothing tested"]
-    # Only the window's waits: before it the decode is unpressed, after it the instrument drains the
-    # outputs it queued while giving its memory back.
+    # Only the window's waits: before it the decode is unpressed, after it the memory comes back.
     waits = [wait for wait in waits if opened <= wait[1] and wait[2] <= closed]
     if len(waits) < 2:
         print("the window holds fewer than two steps: NOTHING TESTED")
@@ -456,8 +451,7 @@ def pressure_transitions(charge, events, samples):
                if event.get("refusal", {}).get("holding") in selected and event["refusal"].get("cause") != "Growth"]
     if refused:
         return [f"physical backing unverified after resize refusal: {event}" for event in refused]
-    # The child records physical release; parent `freed` includes shutdown/join
-    # and remains the stall instrument's exclusion boundary only.
+    # The child records physical release; the parent's `freed` is when it joined the child.
     start = max(pressure["started"]["at"], pressure["approached"]["at"])
     freed = pressure["released"]["at"]
     resizes = [event for event in events if event.get("holding") in selected]
@@ -510,12 +504,18 @@ def report_pressure(charge, lines, resident_tokens, scratch):
     samples = memory_samples(lines, pressure.get("approached", {}).get("before", {}).get("name"))
     failures = pressure_transitions(charge, events, samples)
     # A shrink needs no new memory: charge and footprint fall at every step. The charge read is
-    # the device's, so a discrete bank's host tier leaves it where it was.
+    # the device's, so a discrete bank's host tier leaves it where it was. The footprint is what
+    # the holding's store holds of the process: its host memory for a holding in host RAM, and for
+    # a discrete device's holding what the device store reports it holds (its claim), as the
+    # process's host footprint moves with its other allocations beside the step.
+    stores = {name: value["stores"] for name, value in charge["bank"]["holdings"].items()}
+    footprint = lambda event: (("footprint_before", "footprint_after") if "HostRam" in stores[event["holding"]]
+                               else ("claimed_before", "claimed_after"))
     bank = [event for event in events if event.get("rung") == "Bank"]
     grew = [event for event in bank
             if (event["charged_after"] > event["charged_before"] if event["holding"] == "Host"
                 else event["charged_after"] >= event["charged_before"])
-            or (event["footprint_before"] is not None and event["footprint_after"] > event["footprint_before"])]
+            or (event[footprint(event)[0]] is not None and event[footprint(event)[1]] > event[footprint(event)[0]])]
     if grew:
         failures.append(f"{len(grew)} of {len(bank)} bank steps grew their charge or footprint")
     if tokens is None or resident_tokens is None:
@@ -688,7 +688,14 @@ def host_costs(options, models, scratch):
                 failed.append(name)
                 continue
             decode = ("--decode", str(scratch / f"{index}-render" / "rendered.jsonl"), "--decode-tokens", tokens)
-        pressure = (("--pressure", str(options.pressure), "--pressure-store", options.pressure_store, *(("--pressure-prompt",) if options.pressure_prompt else ()))
+        # The pressured decode is held to the resident one's tokens, so it approves no CPU site: a
+        # site's admitted arithmetic differs from the device's within the precision system, and a
+        # shrink moves misses to it. The site's arithmetic is judged by its own instrument (kl).
+        unsited = scratch / "unsited.json"
+        if options.pressure:
+            unsited.write_text(json.dumps({"cpu_sites": False}))
+        pressure = (("--pressure", str(options.pressure), "--pressure-store", options.pressure_store,
+                     *(("--pressure-prompt",) if options.pressure_prompt else ()), "--numerical-profile", str(unsited))
                     if options.pressure else ())
         kernels = ("--cache-dir", options.kernels) if options.kernels else ()
         load = subprocess.run([exe(options.bin, "magnitude-harness"), "memory", "--device", options.backend,

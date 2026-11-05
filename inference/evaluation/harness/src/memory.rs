@@ -69,6 +69,8 @@ pub struct Load {
     pub target: PathBuf,
     /// The kernel cache the load prepares from, as a served load's.
     pub kernel_cache: Option<PathBuf>,
+    /// The computations the load approves beyond the defaults.
+    pub numerical_profile: Option<magnitude_executor::NumericalProfile>,
     pub context_tokens: Option<usize>,
     pub weight_cap: Option<u64>,
     /// The rendered fixture decoded once loaded, and its tokens.
@@ -105,14 +107,15 @@ pub fn load(load: Load) -> Result<(), String> {
         backend,
         target,
         kernel_cache,
+        numerical_profile,
         context_tokens,
         weight_cap,
         decode,
         pressure,
         hold,
     } = load;
-    let mut pressure = pressure.map(|pressing| Pressure::new(backend, pressing)).transpose()?;
-    let Planned { host, manifest, devices, structure, draft } = plan(backend, &target, kernel_cache.clone(), context_tokens, weight_cap)?;
+    let mut pressure = pressure.map(|pressing| Pressure::new(backend, pressing));
+    let Planned { host, manifest, devices, structure, draft } = plan(backend, &target, kernel_cache.clone(), numerical_profile, context_tokens, weight_cap)?;
     let definition = &manifest.definition;
     let context = u32::try_from(definition.decoder.context_limit)
         .map_err(|_| "the context exceeds the assessment domain")?;
@@ -300,12 +303,14 @@ fn plan(
     backend: BackendName,
     target: &std::path::Path,
     kernel_cache: Option<PathBuf>,
+    numerical_profile: Option<magnitude_executor::NumericalProfile>,
     context_tokens: Option<usize>,
     weight_cap: Option<u64>,
 ) -> Result<Planned, String> {
     let device = DeviceRequest::Backend(backend);
     let policy = ModelPolicy {
         method: ModelMethod::Plain,
+        numerical_profile,
         weight_cap,
         ..ModelPolicy::default()
     };
@@ -420,12 +425,17 @@ fn open_platform(backend: BackendName) -> Result<OpenedPlatform, String> {
 
 /// Another process's memory, pressing the loaded process `deficit` bytes
 /// below its planning line in the selected physical store, read through
-/// the engine's observation owner, and `deficit` more. It takes them in two moves, so the time
+/// the engine's observation owner. It takes them in two moves, so the time
 /// the pressure takes to land is the deficit's, whatever the host's size:
 /// first it comes to `deficit` above the line, where the engine still has
-/// room, and prints `approached`; at the first line on standard input it
-/// takes the rest, `deficit` below the line, and prints `occupied`; it holds
-/// everything until standard input closes. The bytes are pseudo-random
+/// room, and prints `approached` with the seconds it took; at the first line
+/// on standard input it takes what the engine could still claim then and
+/// `deficit` more, which leaves it `deficit` below the line whatever it
+/// claimed meanwhile, and prints `occupied`; at the next it gives that press
+/// back, which leaves the engine the room it had before it (`deficit` above
+/// the line), and prints `released`; it holds the approach until standard
+/// input closes, so giving the memory back takes the press's time, not
+/// the host's (freeing 107 GB on a GB10 took 14 s). The bytes are pseudo-random
 /// words, as an application's data is: zeroed pages the OS compresses to
 /// nothing would press nothing. They are written on every core the host
 /// has, as fast as its memory takes them.
@@ -443,29 +453,23 @@ pub fn occupy(backend: BackendName, selected: PressureStore, deficit: u64) -> Re
     }
     let ceiling = reading.ceiling_bytes;
     let approach = ceiling.saturating_sub(deficit);
+    let approaching = Instant::now();
     let approached = target.take(approach, 0)?;
-    println!("{}", json!({ "approached": approach, "ceiling": ceiling, "at": unix_seconds(),
-        "before": before, "observation": target.snapshot()? }));
+    println!("{}", json!({ "approached": approach, "ceiling": ceiling, "seconds": approaching.elapsed().as_secs_f64(),
+        "at": unix_seconds(), "before": before, "observation": target.snapshot()? }));
     let mut line = String::new();
     if std::io::stdin().read_line(&mut line).map_err(|error| error.to_string())? == 0 { return Ok(()); }
-    let bytes = ceiling.checked_add(deficit).ok_or("pressure allocation size overflows")?;
-    let pressed = target.take(bytes - approach, 1)?;
-    println!("{}", json!({ "occupied": bytes, "ceiling": ceiling, "at": unix_seconds(), "observation": target.snapshot()? }));
-    std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).map_err(|error| error.to_string())?;
-    drop((approached, pressed));
-    println!("{}", json!({ "released": true, "at": unix_seconds(), "observation": target.snapshot()? }));
-    Ok(())
-}
-
-/// Time the same selected physical allocation owner before loading the model.
-pub fn time_occupying(backend: BackendName, selected: PressureStore) -> Result<(), String> {
-    let target = store::Target::open(backend, selected)?;
-    let bytes = target.reading()?.ceiling_bytes;
-    let started = Instant::now();
-    let taken = target.take(bytes, 0)?;
-    let seconds = started.elapsed().as_secs_f64();
-    drop(taken);
-    println!("{}", json!({ "bytes": bytes, "seconds": seconds, "observation": target.snapshot()? }));
+    let ceiling = target.reading()?.ceiling_bytes;
+    let press = ceiling.checked_add(deficit).ok_or("pressure allocation size overflows")?;
+    let pressed = target.take(press, 1)?;
+    println!("{}", json!({ "occupied": approach + press, "ceiling": ceiling, "at": unix_seconds(), "observation": target.snapshot()? }));
+    let released = std::io::stdin().read_line(&mut line).map_err(|error| error.to_string())?;
+    drop(pressed);
+    println!("{}", json!({ "released": press, "at": unix_seconds(), "observation": target.snapshot()? }));
+    if released != 0 {
+        std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).map_err(|error| error.to_string())?;
+    }
+    drop(approached);
     Ok(())
 }
 
@@ -667,6 +671,8 @@ enum Pressed {
     Unlanded,
     Landing,
     Held,
+    /// Its press given back.
+    Released,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -675,14 +681,18 @@ enum Stage {
     Pressing,
     Landing { from: usize },
     Held { from: usize, held: usize },
-    Freed { from: usize, to: usize },
+    /// The window closed at `to` and the press is given back.
+    Freeing { from: usize, to: usize },
+    /// The press is back from output `back` on.
+    Freed { from: usize, to: usize, back: usize },
 }
 
 /// The window a pressured decode is measured in. Pressing is signalled once
 /// `press_at` tokens are out; the window opens at the first output after the
 /// pressure starts landing, as the engine answers it, and closes `span`
-/// tokens after the first output that finds it held; the memory is then
-/// given back, and the decode stops `after` tokens later. However long the
+/// tokens after the first output that finds it held; the press is then
+/// given back, and the decode stops `after` tokens after the first output
+/// that finds it back. However long the
 /// pressure takes to land, the window waits for it, so a decode that ends
 /// before it is held tested nothing ([`Window::ended`]).
 #[derive(Debug)]
@@ -707,11 +717,20 @@ impl Window {
         }
     }
 
+    /// Decode on after the press is back for as long as memory must
+    /// stay free before the engine grows the bank again
+    /// (`RECOVERY_STABLE_TIME`), at `step` seconds a token, beside the
+    /// window's own tokens after it: the regrowth lands within the decode,
+    /// whenever the pressure left the Reclaim band.
+    fn recover(&mut self, step: f64) {
+        self.after += (magnitude_executor::platform::RECOVERY_STABLE_TIME.as_secs_f64() / step).ceil() as usize;
+    }
+
     /// The tokens a decode needs for the window, the pressure taking
-    /// `occupying` seconds to be held and a step `step` seconds: before
+    /// `landing` seconds to be held and a step `step` seconds: before
     /// pressing, the steps the pressure takes, the window and after it.
-    fn room(&self, occupying: f64, step: f64) -> usize {
-        self.press_at + (occupying / step).ceil() as usize + self.span + self.after
+    fn room(&self, landing: f64, step: f64) -> usize {
+        self.press_at + (landing / step).ceil() as usize + self.span + self.after
     }
 
     /// `decoded` tokens are out, the pressure where `pressed` says: what to
@@ -723,9 +742,10 @@ impl Window {
             (Stage::Pressing, Pressed::Held) => (Stage::Held { from: decoded, held: decoded }, Next::Decode),
             (Stage::Landing { from }, Pressed::Held) => (Stage::Held { from, held: decoded }, Next::Decode),
             (Stage::Held { from, held }, _) if decoded >= held + self.span => {
-                (Stage::Freed { from, to: decoded }, Next::Free)
+                (Stage::Freeing { from, to: decoded }, Next::Free)
             }
-            (Stage::Freed { to, .. }, _) if decoded >= to + self.after => (self.stage, Next::Stop),
+            (Stage::Freeing { from, to }, Pressed::Released) => (Stage::Freed { from, to, back: decoded }, Next::Decode),
+            (Stage::Freed { back, .. }, _) if decoded >= back + self.after => (self.stage, Next::Stop),
             (stage, _) => (stage, Next::Decode),
         };
         self.stage = stage;
@@ -736,7 +756,7 @@ impl Window {
     fn tokens(&self) -> (Option<usize>, Option<usize>) {
         match self.stage {
             Stage::Landing { from } | Stage::Held { from, .. } => (Some(from), None),
-            Stage::Freed { from, to } => (Some(from), Some(to)),
+            Stage::Freeing { from, to } | Stage::Freed { from, to, .. } => (Some(from), Some(to)),
             Stage::Before | Stage::Pressing => (None, None),
         }
     }
@@ -753,9 +773,12 @@ impl Window {
                 decoded - held,
                 self.span
             ),
-            Stage::Freed { to, .. } => format!(
-                "the decode ended at token {decoded}, {} of the {} tokens after its window",
-                decoded - to,
+            Stage::Freeing { to, .. } => {
+                format!("the decode ended at token {decoded}, {} tokens after its window, before the press was back", decoded - to)
+            }
+            Stage::Freed { back, .. } => format!(
+                "the decode ended at token {decoded}, {} of the {} tokens after the press was back",
+                decoded - back,
                 self.after
             ),
         }
@@ -768,19 +791,17 @@ impl Window {
 struct Pressure {
     backend: BackendName,
     pressing: Pressing,
-    /// How long occupying took here before the load ([`time_occupying`]):
-    /// its bytes and seconds.
-    occupying: (u64, f64),
-    /// The occupying process, from the request's admission until it gives
-    /// its memory back.
+    /// The occupying process, from its approach before the pressured
+    /// request until the decode under it ends.
     sibling: Option<Sibling>,
     record: serde_json::Map<String, Value>,
     /// Each output's token count and time.
     steps: Vec<(usize, f64)>,
 }
 
-/// The occupying process: a line on `input` starts the pressure, closing it
-/// gives the memory back; a thread passes on each report it prints.
+/// The occupying process: a line on `input` starts the pressure, the next
+/// gives its press back, closing it gives every byte back; a thread passes
+/// on each report it prints.
 struct Sibling {
     child: std::process::Child,
     input: std::process::ChildStdin,
@@ -789,42 +810,25 @@ struct Sibling {
 }
 
 impl Pressure {
-    /// Before the load: how long occupying takes here is timed in a sibling
-    /// process ([`time_occupying`]), the measurement the decode is sized by.
-    fn new(backend: BackendName, pressing: Pressing) -> Result<Self, String> {
-        let text = |error: std::io::Error| error.to_string();
-        let timed = std::process::Command::new(std::env::current_exe().map_err(text)?)
-            .args(["occupy-time", "--device", backend.as_str(), "--pressure-store", pressing.store.name()])
-            .output()
-            .map_err(text)?;
-        if !timed.status.success() {
-            return Err(format!("timing the occupation failed: {}", String::from_utf8_lossy(&timed.stderr)));
-        }
-        let timed: Value = serde_json::from_slice(&timed.stdout).map_err(|error| error.to_string())?;
-        let bytes = timed["bytes"].as_u64().ok_or("the occupation's timing has no bytes")?;
-        let seconds = timed["seconds"].as_f64().ok_or("the occupation's timing has no seconds")?;
-        if bytes == 0 {
-            return Err("the host leaves an engine nothing to claim: no pressure can be sized".into());
-        }
-        Ok(Self {
+    fn new(backend: BackendName, pressing: Pressing) -> Self {
+        Self {
             backend,
-            record: serde_json::Map::from_iter([
-                ("deficit".to_owned(), json!(pressing.deficit)),
-                ("occupying".to_owned(), timed),
-            ]),
+            record: serde_json::Map::from_iter([("deficit".to_owned(), json!(pressing.deficit))]),
             pressing,
-            occupying: (bytes, seconds),
             sibling: None,
             steps: Vec::new(),
-        })
+        }
     }
 
     /// Decode `prompt` under the pressure, as its [`Window`] needs: first
     /// `span` tokens from the whole prompt, unpressed, for the step's time;
-    /// then the decode sized to hold the window after the pressure lands, from
-    /// that and how long occupying took here (more bytes than the pressure
-    /// takes, with no load beside them), its prompt cut to leave the room.
-    /// The prompt's tokens decoded from, and the tokens.
+    /// then, the occupying process approached, the decode sized to hold the
+    /// window, its prompt cut to leave the room. Approached, pressing takes
+    /// only what the engine could still claim and the deficit, which lands
+    /// in a fraction of a second; the approach takes everything else the
+    /// host has (over 100 GB on a GB10, 8 s beside the load), which no
+    /// decode's room need hold. The prompt's tokens decoded from, and the
+    /// tokens.
     fn decode(&mut self, engine: &ReadyEngine, prompt: &[TokenId], tokens: usize) -> Result<(usize, Vec<u32>), Failure> {
         let mut window = Window::of(tokens, self.pressing.from_prompt);
         let mut times = Vec::new();
@@ -840,9 +844,14 @@ impl Pressure {
             }
             _ => return Err(Failure::Cell("the step's timing decode gave fewer than two outputs".into())),
         };
-        let (bytes, seconds) = self.occupying;
-        let occupying = seconds * (bytes + self.pressing.deficit) as f64 / bytes as f64;
-        let room = window.room(occupying, step);
+        let rate = self.approach()?;
+        window.recover(step);
+        // The press is at most twice the deficit: what the engine could
+        // still claim, at most the deficit the approach left it, and the
+        // deficit. It lands, and is given back, at the rate the approach
+        // took memory beside the load.
+        let landing = 2.0 * self.pressing.deficit as f64 / rate;
+        let room = window.room(2.0 * landing, step);
         let context = context_limit(engine)?;
         let length = context
             .checked_sub(room)
@@ -851,15 +860,12 @@ impl Pressure {
             .min(prompt.len());
         self.record.insert(
             "sizing".into(),
-            json!({ "step_seconds": step, "occupying_seconds": occupying, "room": room, "prompt_tokens": length }),
+            json!({ "step_seconds": step, "landing_seconds": landing, "room": room, "prompt_tokens": length }),
         );
         let prompt = &prompt[..length];
         let (decoded, stopped) = decoded(engine, prompt, context - length, |moment| {
             let (decoded, pressed) = match moment {
-                Moment::Admitted => {
-                    self.admitted()?;
-                    (0, Pressed::Unlanded)
-                }
+                Moment::Admitted => (0, Pressed::Unlanded),
                 Moment::Out(decoded) => {
                     self.steps.push((decoded, unix_seconds()));
                     (decoded, self.pressed()?)
@@ -870,11 +876,12 @@ impl Pressure {
                 Next::Press => self.press(decoded).map(|()| false),
                 Next::Free => {
                     self.record.insert("freeing".into(), json!({ "at": unix_seconds(), "token": decoded }));
-                    self.free().map(|()| false)
+                    self.give_back().map(|()| false)
                 }
                 Next::Stop => Ok(true),
             }
         })?;
+        self.free()?;
         let (from, to) = window.tokens();
         self.record.insert("window".into(), json!({ "from": from, "to": to }));
         match stopped {
@@ -883,12 +890,12 @@ impl Pressure {
         }
     }
 
-    /// The request was admitted against the host as it is: the occupying
-    /// process starts taking everything but `deficit` of what the engine
-    /// could still claim, beside the request, so pressing later takes only
-    /// twice the deficit, however much memory the host has. A thread passes
-    /// on its reports, so the request's outputs are read meanwhile.
-    fn admitted(&mut self) -> Result<(), String> {
+    /// Start the occupying process, between requests, and wait while it
+    /// takes everything but `deficit` of what the engine could still claim,
+    /// so pressing later takes only twice the deficit, however much memory
+    /// the host has: the bytes a second it took them at. A thread passes on
+    /// its reports, so the pressured request's outputs are read meanwhile.
+    fn approach(&mut self) -> Result<f64, String> {
         let text = |error: std::io::Error| error.to_string();
         let mut child = std::process::Command::new(std::env::current_exe().map_err(text)?)
             .args([
@@ -917,19 +924,23 @@ impl Pressure {
                 }
             }
         });
-        self.sibling = Some(Sibling {
-            input: child.stdin.take().expect("piped"),
-            child,
-            reports,
-            reader,
-        });
-        Ok(())
+        let approached = match reports.recv() {
+            Ok(report) => report?,
+            Err(_) => return Err(format!("the occupying process ended before it approached: {}", child.wait().map_err(text)?)),
+        };
+        self.sibling = Some(Sibling { input: child.stdin.take().expect("piped"), child, reports, reader });
+        self.recorded(vec![Ok(approached)])?;
+        let approach = &self.record["approached"];
+        match (approach["approached"].as_u64(), approach["seconds"].as_f64()) {
+            (Some(bytes), Some(seconds)) if bytes > 0 && seconds > 0.0 => Ok(bytes as f64 / seconds),
+            _ => Err(format!("the occupying process approached by nothing to time: {approach}")),
+        }
     }
 
     /// Signal pressing, `decoded` tokens out: the occupying process takes the
     /// rest once it has approached.
     fn press(&mut self, decoded: usize) -> Result<(), String> {
-        let sibling = self.sibling.as_mut().ok_or("pressing starts once the request is admitted")?;
+        let sibling = self.sibling.as_mut().ok_or("pressing starts once approached")?;
         std::io::Write::write_all(&mut sibling.input, b"\n").map_err(|error| error.to_string())?;
         self.record.insert("started".into(), json!({ "at": unix_seconds(), "token": decoded }));
         Ok(())
@@ -954,6 +965,7 @@ impl Pressure {
     fn landed(&self) -> Pressed {
         let has = |moment: &str| self.record.contains_key(moment);
         match (has("occupied"), has("approached") && has("started")) {
+            _ if has("released") => Pressed::Released,
             (true, _) => Pressed::Held,
             (false, true) => Pressed::Landing,
             (false, false) => Pressed::Unlanded,
@@ -988,8 +1000,15 @@ impl Pressure {
         self.free()
     }
 
-    /// Give the memory back, recording the reports the occupying process
-    /// made and when the memory is back.
+    /// Signal the occupying process to give its press back, which it does
+    /// as the decode goes on, reporting `released`.
+    fn give_back(&mut self) -> Result<(), String> {
+        let sibling = self.sibling.as_mut().ok_or("the press is given back once approached")?;
+        std::io::Write::write_all(&mut sibling.input, b"\n").map_err(|error| error.to_string())
+    }
+
+    /// Give every byte back and wait until it is, recording the reports the
+    /// occupying process made and when it ended.
     fn free(&mut self) -> Result<(), String> {
         if let Some(Sibling { mut child, input, reports, reader }) = self.sibling.take() {
             drop(input);
@@ -1106,10 +1125,12 @@ mod tests {
     use super::*;
 
     /// Drive `window` over outputs of one token each, the pressure landing
-    /// from output `landing` and held from output `held` on: each output's
-    /// action but decoding, until it stops or `outputs` are out.
-    fn drive(window: &mut Window, landing: usize, held: usize, outputs: usize) -> Vec<(usize, Next)> {
+    /// from output `landing`, held from output `held` and its press back
+    /// from output `back` on: each output's action but decoding, until it
+    /// stops or `outputs` are out.
+    fn drive(window: &mut Window, (landing, held, back): (usize, usize, usize), outputs: usize) -> Vec<(usize, Next)> {
         let pressed = |decoded| match decoded {
+            decoded if decoded >= back => Pressed::Released,
             decoded if decoded >= held => Pressed::Held,
             decoded if decoded >= landing => Pressed::Landing,
             _ => Pressed::Unlanded,
@@ -1133,11 +1154,11 @@ mod tests {
     /// the pressure is held tested nothing.
     #[test]
     fn the_window_spans_the_landing_and_its_tokens_under_the_held_pressure() {
-        // 128 tokens: pressed at 32, landing from 250, held at 300.
+        // 128 tokens: pressed at 32, landing from 250, held at 300, back at 370.
         let mut window = Window::of(128, false);
         assert_eq!(
-            drive(&mut window, 250, 300, 1000),
-            [(32, Next::Press), (364, Next::Free), (396, Next::Stop)]
+            drive(&mut window, (250, 300, 370), 1000),
+            [(32, Next::Press), (364, Next::Free), (402, Next::Stop)]
         );
         assert_eq!(window.tokens(), (Some(250), Some(364)));
 
@@ -1163,18 +1184,21 @@ mod tests {
             short.ended(40),
             "the decode ended at token 40, 30 of the 64 tokens its window holds under the held pressure"
         );
+        // Ended after the window, short of its tokens after the press is back.
+        assert_eq!(short.next(74, Pressed::Held), Next::Free);
+        assert_eq!(short.next(78, Pressed::Released), Next::Decode);
+        assert_eq!(short.ended(80), "the decode ended at token 80, 2 of the 32 tokens after the press was back");
     }
 
     /// A pressure lands once the occupying process has approached and
     /// pressing was signalled, in either order, and is held once it has
-    /// occupied; a report of no moment fails. Freed or ended with no
+    /// occupied, until its press is back; a report of no moment fails. Freed or ended with no
     /// occupying process, it records no freeing, and an ending records why.
     #[test]
     fn the_pressure_lands_on_its_signal_and_approach_and_is_held_once_occupied() {
         let mut pressure = Pressure {
             backend: BackendName::Cpu,
             pressing: Pressing { store: PressureStore::Host, deficit: 1, from_prompt: false },
-            occupying: (1, 1.0),
             sibling: None,
             record: serde_json::Map::new(),
             steps: Vec::new(),
@@ -1186,6 +1210,8 @@ mod tests {
         assert_eq!(pressure.landed(), Pressed::Landing);
         pressure.recorded(vec![Ok(json!({ "occupied": 3, "ceiling": 2, "at": 1.0 }))]).unwrap();
         assert_eq!(pressure.landed(), Pressed::Held);
+        pressure.recorded(vec![Ok(json!({ "released": 3, "at": 2.0 }))]).unwrap();
+        assert_eq!(pressure.landed(), Pressed::Released);
         assert!(pressure.recorded(vec![Ok(json!({ "other": 1 }))]).is_err());
         assert!(pressure.recorded(vec![Err("unreadable".into())]).is_err());
 

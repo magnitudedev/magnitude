@@ -177,6 +177,9 @@ enum Command {
         /// the expert bank's growth.
         #[arg(long)]
         cache_dir: Option<PathBuf>,
+        /// Explicitly approved complete numerical computations (JSON).
+        #[arg(long, value_name = "FILE")]
+        numerical_profile: Option<PathBuf>,
         /// The target model file.
         target: PathBuf,
     },
@@ -199,15 +202,6 @@ enum Command {
         /// Bytes below the planning line.
         #[arg(long)]
         deficit: u64,
-        #[arg(long)]
-        pressure_store: memory::PressureStore,
-    },
-    /// How long occupying takes here: everything down to the planning line
-    /// taken, with no load beside it, timed and given back.
-    #[command(hide = true)]
-    OccupyTime {
-        #[arg(long)]
-        device: String,
         #[arg(long)]
         pressure_store: memory::PressureStore,
     },
@@ -451,16 +445,7 @@ fn engine_options(
         .ok()
         .filter(|budget| !budget.is_zero())
         .ok_or("--tuning-budget takes a positive number of seconds")?;
-    let numerical_profile = engine
-        .numerical_profile
-        .as_ref()
-        .map(|path| {
-            let bytes = std::fs::read(path)
-                .map_err(|error| format!("numerical profile {}: {error}", path.display()))?;
-            serde_json::from_slice(&bytes)
-                .map_err(|error| format!("numerical profile {}: {error}", path.display()))
-        })
-        .transpose()?;
+    let numerical_profile = engine.numerical_profile.as_deref().map(read_numerical_profile).transpose()?;
     // A survey measures: it is installed in the worker process that runs a
     // model's Prepare, never here, where the model is loaded.
     let worker_arguments = engine.survey.worker_arguments();
@@ -700,11 +685,13 @@ fn run(command: Command) -> Result<(), String> {
             pressure_store,
             hold,
             cache_dir,
+            numerical_profile,
             target,
         } => memory::load(memory::Load {
             backend: memory::backend(&device)?,
             target,
             kernel_cache: cache_dir,
+            numerical_profile: numerical_profile.as_deref().map(read_numerical_profile).transpose()?,
             context_tokens: context,
             weight_cap,
             decode: decode.zip(decode_tokens).map(|(rendered, tokens)| memory::Decode {
@@ -732,7 +719,6 @@ fn run(command: Command) -> Result<(), String> {
             memory::recommit(memory::backend(&device)?, &commitments)
         }
         Command::Occupy { device, deficit, pressure_store } => memory::occupy(memory::backend(&device)?, pressure_store, deficit),
-        Command::OccupyTime { device, pressure_store } => memory::time_occupying(memory::backend(&device)?, pressure_store),
         Command::Draft {
             run,
             engine,
@@ -762,4 +748,10 @@ fn run(command: Command) -> Result<(), String> {
             inputs.finish(digest, Some(vec![device]), measurements, traces)
         }
     }
+}
+
+/// The numerical profile at `path` (`--numerical-profile`).
+fn read_numerical_profile(path: &std::path::Path) -> Result<magnitude_executor::NumericalProfile, String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("numerical profile {}: {error}", path.display()))?;
+    serde_json::from_slice(&bytes).map_err(|error| format!("numerical profile {}: {error}", path.display()))
 }

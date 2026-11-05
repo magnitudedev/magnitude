@@ -91,10 +91,11 @@ def test_a_window_that_never_closed_tested_nothing(capsys):
     assert "NOTHING TESTED" in capsys.readouterr().out
 
 
-def _shrink(at, charged, footprint=(None, None)):
+def _shrink(at, charged, footprint=(None, None), holding="Host", claimed=(None, None)):
     fields = {"message": "memory released", "at": at, "rung": "Bank", "micros": 1000, "bank_slots": 4,
-              "holding": "Host", "from": 8, "to": 0, "released": 80,
+              "holding": holding, "from": 8, "to": 0, "released": 80,
               "charged_before": charged[0], "charged_after": charged[1],
+              "claimed_before": claimed[0], "claimed_after": claimed[1],
               "footprint_before": footprint[0], "footprint_after": footprint[1]}
     fields.update({f"{key}_micros": 100 for key in memory.SHRINK_STEPS},
                   **{f"{key}_before": 0 for key in ("decided", "prepared", "installed", "released")})
@@ -122,6 +123,11 @@ def test_the_pressure_gate_fails_a_bank_step_that_needs_new_memory(tmp_path, cap
     assert any("1 of 1 bank steps grew" in failure for failure in footprint)
     fell = memory.report_pressure(charge, [_shrink(3, (2e9, 1e9), (6e9, 5e9))], [1, 2, 3], tmp_path)
     assert not any("bank steps grew" in failure for failure in fell)
+    # A discrete device's holding is judged by its store's claim, not the process's host footprint.
+    device = lambda claimed: memory.report_pressure(
+        charge, [_shrink(3, (2e9, 1e9), (5e9, 6e9), "Experts", claimed)], [1, 2, 3], tmp_path)
+    assert any("1 of 1 bank steps grew" in failure for failure in device((3e9, 4e9)))
+    assert not any("bank steps grew" in failure for failure in device((3e9, 2e9)))
     capsys.readouterr()
 
 
