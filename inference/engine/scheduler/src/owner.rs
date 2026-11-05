@@ -2052,8 +2052,13 @@ trait MemoryStep: MemoryHost + Sized {
             .map_err(|error| invariant("expert bank")(format!("the clock is before the Unix epoch: {error}")))?
             .as_millis() as u64;
         let resized = |from, to| cause.finished(from, to, at_unix_ms).map_err(invariant("expert bank"));
-        // A finished resize has held this thread for a measured time.
-        let micros = (held * 1e6) as u64;
+        // A finished resize has held this thread for a measured time, by
+        // source: the call that began it, the boundaries' advances while it
+        // ran, and the decisions that began nothing meanwhile.
+        let micros = (held.total() * 1e6) as u64;
+        let begun_micros = (held.begun * 1e6) as u64;
+        let (advances, advance_micros) = (held.advances.count, (held.advances.seconds * 1e6) as u64);
+        let (decisions, decision_micros) = (held.decisions.count, (held.decisions.seconds * 1e6) as u64);
         // Each step of the resize, in microseconds: those on this thread, and
         // how long before now the others happened, so a decode stall around
         // it is placed on the decode's timeline.
@@ -2065,6 +2070,11 @@ trait MemoryStep: MemoryHost + Sized {
                 tracing::info!(
                     rung = ?Rung::Bank,
                     micros,
+                    begun_micros,
+                    advances,
+                    advance_micros,
+                    decisions,
+                    decision_micros,
                     bank_slots = self.domain().expert_bank_slots(),
                     ?holding,
                     from,
@@ -2076,6 +2086,7 @@ trait MemoryStep: MemoryHost + Sized {
                     claimed_after = after.claimed,
                     footprint_before = before.footprint,
                     footprint_after = after.footprint,
+                    deciding_micros = times.decided.duration_since(held.started).as_micros() as u64,
                     queued_micros = times.queued.as_micros() as u64,
                     planned_micros = times.planned.as_micros() as u64,
                     plan_picked_micros = times.trips[0].picked.as_micros() as u64,
@@ -2099,6 +2110,11 @@ trait MemoryStep: MemoryHost + Sized {
                 self.domain().record_expert_resize(holding, resized(from, to)?);
                 tracing::info!(
                     micros,
+                    begun_micros,
+                    advances,
+                    advance_micros,
+                    decisions,
+                    decision_micros,
                     bank_slots = self.domain().expert_bank_slots(),
                     ?holding,
                     from,

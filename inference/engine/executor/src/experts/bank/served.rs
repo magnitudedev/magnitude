@@ -582,19 +582,30 @@ impl ElasticBank for ServedBank {
         for tier in BankTier::ALL.into_iter().filter(|&tier| pressed(tier)) {
             self.bank.stop_growth(tier);
         }
+        // Which stores resize, read once for the decision: one that ends
+        // while it prices is decided again at the next boundary.
+        let mut running = [false; BankTier::ALL.len()];
+        for tier in BankTier::ALL {
+            running[tier.index()] = self.running_in(tier)?;
+        }
+        let mut pressed_tiers = BankTier::ALL.into_iter().filter(|&tier| pressed(tier));
+        // A shrink takes a pressed store's holding, or none: where every
+        // pressed store resizes, it is decided again at a later boundary
+        // whatever the steps price, so none is priced.
+        if pressed_tiers.clone().all(|tier| running[tier.index()]) {
+            return Ok(BankStep::Running);
+        }
         let Some(Step { holding, kind, from, to: shallowest, .. }) = self.shrinking(resident, deficit)? else {
             // Every pressed holding is at its floor: a growth that gives way
             // there releases what it backed once its advance reports it.
-            for tier in BankTier::ALL.into_iter().filter(|&tier| pressed(tier)) {
-                if self.running_in(tier)? {
-                    return Ok(BankStep::Running);
-                }
-            }
-            return Ok(BankStep::AtLimit);
+            return Ok(match pressed_tiers.any(|tier| running[tier.index()]) {
+                true => BankStep::Running,
+                false => BankStep::AtLimit,
+            });
         };
         // A resize of the shrink's own store runs: it is decided again at a
         // later boundary. One of the other store's is no reason to wait.
-        if self.running_in(kind)? {
+        if running[kind.index()] {
             return Ok(BankStep::Running);
         }
         // The shallowest target releasing the store's deficit, or the floor.

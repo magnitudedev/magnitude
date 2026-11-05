@@ -883,38 +883,91 @@ struct GrowthClaim {
 
 /// The time expert bank resizes held the submitting thread at flight
 /// boundaries: each store's running resize's so far (none while none of it
-/// runs), and each holding's last finished one's, which is what its growth
-/// step costs the decode (none before one of it finished).
+/// runs), and each holding's last finished one's in all, which is what its
+/// growth step costs the decode (none before one of it finished).
 #[derive(Default)]
 struct ResizeHeld {
-    running: [Option<f64>; crate::planning::BankTier::COUNT],
+    running: [Option<ThreadHeld>; crate::planning::BankTier::COUNT],
     last: std::collections::HashMap<BankHolding, f64>,
     /// The resizes begun.
     begun: u64,
 }
 
+/// What one resize held the submitting thread, by source: the call that
+/// began it, each flight boundary's advance of the bank while it ran, and
+/// each decision taken while it ran that began nothing (a shrink found its
+/// store resizing, deferred or at its floor), each with its count.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThreadHeld {
+    /// When the call that began it started: `ResizeTimes::decided` less
+    /// this is what deciding it held the thread, before the bank was asked.
+    pub started: Instant,
+    /// Seconds the call that began it held the thread.
+    pub begun: f64,
+    /// Seconds and count of the boundaries' advances while it ran, the one
+    /// that finished it among them.
+    pub advances: HeldBy,
+    /// Seconds and count of the decisions that began nothing while it ran.
+    pub decisions: HeldBy,
+}
+
+/// Seconds a source held the thread over `count` calls.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HeldBy {
+    /// The calls.
+    pub count: u64,
+    /// The seconds they held the thread in all.
+    pub seconds: f64,
+}
+
+impl HeldBy {
+    fn add(&mut self, seconds: f64) {
+        self.count += 1;
+        self.seconds += seconds;
+    }
+}
+
+impl ThreadHeld {
+    /// The seconds it held the thread in all.
+    pub fn total(&self) -> f64 {
+        self.begun + self.advances.seconds + self.decisions.seconds
+    }
+}
+
+/// What held the thread beside a running resize ([`ResizeHeld::hold`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeldSource {
+    Advance,
+    Decision,
+}
+
 impl ResizeHeld {
     /// A resize of `tier` storage began, holding the thread since `started`.
     fn begin(&mut self, tier: crate::planning::BankTier, started: Instant) {
-        self.running[tier.index()] = Some(started.elapsed().as_secs_f64());
+        let begun = started.elapsed().as_secs_f64();
+        let (advances, decisions) = Default::default();
+        self.running[tier.index()] = Some(ThreadHeld { started, begun, advances, decisions });
         self.begun += 1;
     }
 
-    /// Each running resize held the thread since `started`: the boundary's
-    /// work is every running one's.
-    fn hold(&mut self, started: Instant) {
+    /// Each running resize held the thread since `started` by `source`: the
+    /// boundary's work is every running one's.
+    fn hold(&mut self, started: Instant, source: HeldSource) {
         let held = started.elapsed().as_secs_f64();
         for running in self.running.iter_mut().flatten() {
-            *running += held;
+            match source {
+                HeldSource::Advance => running.advances.add(held),
+                HeldSource::Decision => running.decisions.add(held),
+            }
         }
     }
 
-    /// The running resize of `tier` storage, of `holding`, finished, holding
-    /// the thread since `started`: the seconds it held the thread in all.
-    fn finish(&mut self, started: Instant, tier: crate::planning::BankTier, holding: BankHolding) -> f64 {
-        self.hold(started);
+    /// The running resize of `tier` storage, of `holding`, finished at an
+    /// advance holding the thread since `started`: what it held the thread.
+    fn finish(&mut self, started: Instant, tier: crate::planning::BankTier, holding: BankHolding) -> ThreadHeld {
+        self.hold(started, HeldSource::Advance);
         let held = self.running[tier.index()].take().expect("a finished resize began");
-        self.last.insert(holding, held);
+        self.last.insert(holding, held.total());
         held
     }
 

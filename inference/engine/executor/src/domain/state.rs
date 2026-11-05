@@ -1558,7 +1558,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 self.resize_held.begin(tier, started);
                 self.shrink_step = true;
             }
-            _ => self.resize_held.hold(started),
+            _ => self.resize_held.hold(started, super::HeldSource::Decision),
         }
         Ok(step)
     }
@@ -1674,19 +1674,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// At a flight boundary: advance the expert bank's running resize
     /// (`ElasticBank::advance`), `wake` completed as it progresses. A
     /// finished one is returned, its credit Seismic's measured change of the
-    /// bank's charge, with the seconds its boundaries held the submitting
-    /// thread in all; a growth's heap claim is released and the static
+    /// bank's charge, with what it held the submitting thread by source; a
+    /// growth's heap claim is released and the static
     /// holding, which charges the bank, follows either.
     pub fn advance_expert_bank(
         &mut self,
         wake: crate::CompletionWake,
-    ) -> Result<Option<(super::BankResized, f64)>, DomainError> {
+    ) -> Result<Option<(super::BankResized, super::ThreadHeld)>, DomainError> {
         let started = std::time::Instant::now();
         let Some(bank) = self.family.expert_bank() else {
             return Ok(None);
         };
         let Some(finished) = bank.advance(wake)? else {
-            self.resize_held.hold(started);
+            self.resize_held.hold(started, super::HeldSource::Advance);
             return Ok(None);
         };
         let holding = finished.holding();

@@ -63,7 +63,7 @@ pub use device_resources::{
 };
 pub use domain::{
     MEMORY_TRACE, BankHolding, BankResize, BankResized, BankStep, ClaimRefusal, Growth, GrowthDecided, GrowthOffer, TableResidency, DeviceHeap, DomainError, Reclaimed, DomainRequirements, DomainReservation, ExecutorDomain,
-    ExpertMeasures, ExpertResidency, ExpertResizes, HostResidency, ShrinkCause, TierFill, MissStore, MissStoreError, ResidentStep,
+    ExpertMeasures, ExpertResidency, ExpertResizes, HeldBy, HostResidency, ThreadHeld, ShrinkCause, TierFill, MissStore, MissStoreError, ResidentStep,
     HeadFlight, MeasurementRoom, MemoryChargeReconciliation, MemoryMoment, NativeFamily, OpenRequirements,
     PendingOperationOutcome, PhysicalDecision, PrimingCompletionFlight, ProgramFamily,
     ReservedResources, ResumeState, StateBindings, SlotRelease, StateShrink, StoreAllocation, SubmitFailure,
