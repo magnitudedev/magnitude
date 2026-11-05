@@ -463,17 +463,18 @@ fn a_promotion_waits_until_its_reads_earn_its_copy() {
     assert_eq!(directory.promote(false).promotions.len(), 1, "the price fell, and the want is asked again");
 }
 
-/// A want is weighed against its victim at the half-life that ranked
-/// both, however the live candidate changes while promotions are asked.
+/// A want is weighed against its victim by one measure, the stay's,
+/// however the live candidate changes while promotions are asked.
 /// Layer 0's victim, expert 1, was read at each of steps 1 to 40, and its
-/// want, expert 2, at each of 100 to 163: at a half-life of 256 the want
-/// expects about 29 reads over the stay, the victim 14, and at one the
-/// want two, the victim none, so it earns its copy either way (at a price
-/// of one read). Mixed, it never does: the victim's score at 256 lies over
-/// a thousand steps past the latest, which a half-life of one weighs as
-/// unbounded, and the want's at one, weighed at 256, expects half a read.
-/// Each layer's share is the one record its top expert takes at both, so
-/// only the half-life changes, switched back and forth throughout.
+/// want, expert 2, at each of 100 to 163: with no stay measured, at the
+/// longest half-life (256), the want weighs about 59 reads, the victim
+/// about 27, so it earns its copy (at a price of one read) whichever
+/// half-life ranks. Each layer's share is the one record its top expert
+/// takes at a half-life of one and of 256, so only the half-life that
+/// ranks changes, switched back and forth throughout. Weighed by the live
+/// half-life, scores taken at one and weighed at another never earn: the
+/// victim's at 256 lies over a thousand steps past the latest, which a
+/// half-life of one weighs as unbounded.
 #[test]
 fn a_want_and_its_victim_weigh_at_one_half_life_while_the_live_one_switches() {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};

@@ -24,25 +24,30 @@ fn a_promotion_is_carried_while_a_scratch_request_awaits_its_arrival() {
 /// A group's hit stays a hit for the group's steps when a promotion evicts
 /// it meanwhile: the promotion unmaps it only from the first step not yet
 /// begun, so the group's pass reads it where the bank held it and nothing
-/// fills its scratch slot. The group's last step therefore never seeds it,
-/// though the bank no longer holds it: its seed copy would copy the slot,
-/// which holds no byte of it, and map that record as the expert.
+/// fills its scratch slot. The hit weighs its landing read and the group's
+/// (one read, at the latest step logged), the want two reads, the later at
+/// that step and the earlier after the hit's landing: the want outweighs
+/// the hit at every half-life. The group's last step therefore never seeds
+/// it, though the bank no longer holds it: its seed copy would copy the
+/// slot, which holds no byte of it, and map that record as the expert.
 #[test]
 fn a_hit_a_promotion_evicts_during_its_group_is_never_seeded() {
     let harness = promoting("seed-hit", 2, TIER);
     let map = &harness.layer.0;
     harness.promoted(0, &[5, 6]);
     let five = map.held(5).expect("5 is banked");
-    // A decode step reading 7, begun before the group: its read is ranked
-    // once it ends, which every step before it has.
-    let seven = harness.request(&[7]);
+    // Two decode steps reading 7, begun before the group: their reads are
+    // ranked once they end, which every step before them has.
+    let sevens = [harness.request(&[7]), harness.request(&[7])];
     let steps = harness.group(&[StepRoute::Grouped; 2]);
     // Step 0 routes 5, a hit: read where the bank holds it.
     harness.publish(&steps[0], 0, &[5]);
     harness.rounds(&steps[0], 0);
-    // 7 is promoted over 5, the least recently read, while the group's
-    // steps may still read 5's record.
-    seven.complete().unwrap();
+    // 7 is promoted over 5, which it outweighs, while the group's steps may
+    // still read 5's record.
+    for seven in sevens {
+        seven.complete().unwrap();
+    }
     eventually("5 was never evicted", || map.held(5).is_none());
     assert_eq!(map.resolve(5, steps[1].sequence()), Some(five), "the group's steps still hold 5");
     // Step 1, the group's last, routes nothing new and seeds: 5, which the
@@ -165,11 +170,14 @@ fn decode_keeps_the_rankings_top_share(harness: &Harness) {
 /// that read an expert from the tier completes, and the expert is copied
 /// into a free bank record and mapped from the first step not yet begun;
 /// the next step's route finds it in the bank. Once the bank is full, an
-/// expert read more recently evicts the least recently read one, read by
-/// a step that ends while a later one runs: the evicted entry is unmapped from the first step not yet begun, while a step begun before
+/// expert read after the others earns a copy over the least weighed of
+/// them, and the release takes the least ranked: one read least and
+/// longest ago, the least at every half-life, so it is both whichever
+/// measure ranks. That read is by a step that ends while a later one runs:
+/// the evicted entry is unmapped from the first step not yet begun, while a step begun before
 /// still reads it and its record keeps its bytes until that step has
 /// completed; then the copy takes the record and its expert is mapped.
-/// Then a reserve pays, as the reserve's model prices it: 5 and 7 were
+/// Then a reserve pays, as the reserve's model prices it: 6 and 7 were
 /// each read again from the top of the stack, and the second record never
 /// hit, so holding it free costs no hit and saves the drain a promotion
 /// would wait; once the decode steps reading 7 have sized it, the bank
@@ -188,15 +196,16 @@ fn a_promotion_reuses_its_record_only_once_every_step_that_could_read_it_complet
     let five = map.held(5).unwrap();
     assert_eq!(map.resolve(5, landed), None, "mapped from the first step not yet begun");
     assert_eq!([0, 1, 2].map(|kind| harness.banked(kind, five)), [5, 105, 205]);
-    let next = harness.step();
-    assert_eq!(harness.route_at(&next, 0, &[5]), [-1 - 5], "the bank holds 5");
-    next.complete().unwrap();
     harness.request(&[6]).complete().unwrap();
     eventually("6 was never promoted", || map.held(6).is_some());
-    // 7, read after both, is worth more over a stay than 5, read least
-    // recently (the copy is priced at nothing), and evicts it, while a step
-    // begun before the eviction still runs and reads 5's record: begun
-    // before 7's read ends, so before the ranking learns it.
+    let next = harness.step();
+    assert_eq!(harness.route_at(&next, 0, &[6]), [-1 - 6], "the bank holds 6");
+    next.complete().unwrap();
+    // 7, read after both, outweighs 5 over any stay (one read each, 5's
+    // older; the copy is priced at nothing), and 5, read once before 6's
+    // two reads, is the least ranked at every half-life: 7 evicts it, while
+    // a step begun before the eviction still runs and reads 5's record:
+    // begun before 7's read ends, so before the ranking learns it.
     let seven = harness.step();
     let running = harness.step();
     harness.request_at(&seven, 0, &[7]);

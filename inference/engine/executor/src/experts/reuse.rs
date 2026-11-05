@@ -27,20 +27,20 @@
 //! most ranked end on top, and stay where a share or a pool cannot take
 //! them all.
 //!
-//! The same score prices a promotion ([`Reuse::weighed`]): the reads it
-//! expects over the bank's stay are its intensity at the live candidate's
-//! half-life, decaying at that half-life through the stay, so what earns a
-//! copy and what the ranking holds are judged by one value, and a want is
-//! never weighed against a victim by a measure other than the one that
-//! chose both. An expert is weighed by its own score at the live
-//! half-life, never a score taken before: a score is in one half-life's
-//! units, and weighed at another it would mean nothing (a long half-life's
-//! score of a much-read expert lies far past the latest step, which a short
-//! one weighs as unbounded). A choice that ranks or weighs several experts
-//! reads them all from one hold of the ranking ([`Reuse::of`]), so the live
-//! candidate never changes within it. A short half-life vouches for few steps: a just-read expert
-//! is worth the reads the measure counts, never its latest rate held over
-//! a whole stay.
+//! A promotion is priced by a rate over its horizon ([`Reuse::weighed`]):
+//! the reads an expert is expected to have over the bank's stay are its
+//! count decayed at the measured half-life nearest the stay, the reads
+//! that measure counts over about that many steps. The live candidate's
+//! half-life cannot price them: it is chosen for the order it keeps, and a
+//! short one (recency at its limit) carries no rate over a long stay, so a
+//! want would never earn more than a read or two. A want and the unwanted
+//! holdings it would displace are weighed by that one measure: a copy
+//! holds its record over the stay, and what it displaces there is the
+//! least any of them is worth over it. Which record leaves first is the
+//! ranking's order, the live candidate's, chosen for the hits it keeps
+//! from step to step. A choice that ranks or weighs several experts reads
+//! them all from one hold of the ranking ([`Reuse::of`]), so no read lands
+//! within it.
 //!
 //! Each half-life of [`HALF_LIVES`] keeps its scores and, per layer, its
 //! priority stack (Mattson's): a read moves its expert to the top, and each
@@ -106,22 +106,6 @@ impl Score {
             return Self(high);
         }
         Self(high + half_life * (1. + ((low - high) / half_life).exp2()).log2())
-    }
-
-    /// The reads the score at half-life `half_life` expects over the
-    /// `stay` steps from step `latest`: its count decayed to `latest`,
-    /// `n = 2^((s − latest)/h)`, is a read intensity of `n · (1 − 2^(−1/h))`
-    /// a step that goes on decaying at the half-life, which over the stay
-    /// sums to `n · (1 − 2^(−stay/h))`. Never more than the reads the
-    /// score counts, nor than the intensity held over the whole stay. At a
-    /// half-life of zero (the limit) a read at `latest` expects one read,
-    /// an earlier one none.
-    fn expected(self, latest: Step, half_life: f64, stay: f64) -> f64 {
-        let since = Self::at(latest).0 - self.0;
-        if half_life == 0. {
-            return if since <= 0. { 1. } else { 0. };
-        }
-        (-since / half_life).exp2() * (1. - (-stay / half_life).exp2())
     }
 }
 
@@ -537,20 +521,29 @@ impl Reuse {
         self.measure().layers[layer][expert].last
     }
 
-    /// The reads `layer`'s `expert`, ranked beside a read at step `read`
-    /// ([`Self::rank`]), is expected to have over a stay in the bank of
-    /// `stay` steps, as the half-life the ranking ranks by expects them
-    /// from the latest step logged ([`Score::expected`]). One value, the
-    /// ranking's, so it orders experts as their ranks do; and it weighs the
-    /// expert's score at the half-life that scored it. A stay not yet
-    /// measured (no promotion has left one) is the longest half-life;
-    /// before any read nothing is expected.
+    /// The reads `layer`'s `expert`, beside a read at step `read` the log
+    /// may not have brought yet, is expected to have over a stay in the
+    /// bank of `stay` steps: its count decayed to the latest step logged at
+    /// the measured half-life nearest the stay, whichever half-life ranks.
+    /// A read not yet logged is one read past the last logged one, never
+    /// more: one at the latest step where it lies past it (a prompt group's
+    /// step runs ahead of the log). A stay not yet measured (no promotion
+    /// has left one) is longer than any: the longest half-life. Before any
+    /// read nothing is expected.
     pub fn weighed(&self, layer: usize, expert: usize, read: Option<Step>, stay: Option<f64>) -> f64 {
         let Some(latest) = self.latest else {
             return 0.;
         };
-        let stay = stay.unwrap_or(HALF_LIVES[HALF_LIVES.len() - 1]);
-        self.rank(layer, expert, read).score.expected(latest, self.measure().half_life, stay)
+        // A half-life of zero counts only the last read: no rate.
+        let nearest = |stay: f64| {
+            let distance = |half_life: f64| (half_life / stay.max(1.)).log2().abs();
+            (1..HALF_LIVES.len()).min_by(|&a, &b| distance(HALF_LIVES[a]).total_cmp(&distance(HALF_LIVES[b]))).expect("measured half-lives")
+        };
+        let measure = &self.measures[stay.map_or(HALF_LIVES.len() - 1, nearest)];
+        let logged = measure.rank(layer, expert);
+        let decayed = |score: Score| ((score.0 - Score::at(latest).0) / measure.half_life).exp2();
+        let pending = read.filter(|&read| Some(read) > logged.last).map_or(0., |read| decayed(Score::at(read.min(latest))));
+        decayed(logged.score) + pending
     }
 
     /// `layer`'s `expert`'s rank ([`Rank`]), beside a read at step `read`
@@ -686,47 +679,26 @@ pub(super) mod tests {
         assert_eq!(reuse.last(0, 1), Some(5));
     }
 
-    /// A score expects the reads its intensity gives as it decays over the
-    /// stay: for an expert read every step, one over a stay of one step and
-    /// `1 + 2^(−1/h) + …` over longer ones, all it counts (`1/(1 − 2^(−1/h))`)
-    /// over a stay far past the half-life; `2^(−4/4) · (1 − 2^(−4/4))` over
-    /// a stay of 4, four steps after one read at half-life 4; and at
-    /// recency one read for an expert read at the latest step, none for
-    /// one read before it, whatever the stay.
+    /// An expert's reads weigh over a stay at the measured half-life
+    /// nearest it, the longest before a stay is measured, decayed to the
+    /// latest step logged: one read at step 6 weighs 2^(−4/4) at step 10
+    /// over a stay of 3 (half-life 4), and 2^(−4/256) with no stay
+    /// measured; a read the log has yet to bring counts beside it, one
+    /// read at most however far past the latest step it lies; before any
+    /// read nothing weighs.
     #[test]
-    fn a_score_expects_its_decaying_reads_over_the_stay() {
-        let close = |got: f64, want: f64| assert!((got - want).abs() < 1e-9, "{got} against {want}");
-        for half_life in [1., 4., 32.] {
-            let mut measure = Measure::new(half_life, &[2], &[0], &[2]);
-            for step in 1..=2000 {
-                measure.read(&read(step, &[0]), &[1], 2);
-            }
-            let score = measure.rank(0, 0).score;
-            close(score.expected(2000, half_life, 1.), 1.);
-            close(score.expected(2000, half_life, 3.), (0..3).map(|k| (-k as f64 / half_life).exp2()).sum());
-            close(score.expected(2000, half_life, 1e6), 1. / (1. - (-1. / half_life).exp2()));
-        }
-        close(Score::at(6).expected(10, 4., 4.), 0.25);
-        close(Score::at(10).expected(10, 0., 100.), 1.);
-        close(Score::at(9).expected(10, 0., 100.), 0.);
-        close(Score::NEVER.expected(10, 4., 4.), 0.);
-    }
-
-    /// An expert's reads weigh over a stay what the live half-life expects
-    /// of them from the latest read, the longest half-life before a stay
-    /// is measured: at recency, an expert read at the latest step weighs
-    /// one read over any stay, one read before it nothing.
-    #[test]
-    fn reads_weigh_what_the_live_half_life_expects_over_the_stay() {
+    fn reads_weigh_over_the_stay_at_its_nearest_half_life() {
         let mut reuse = Reuse::new(&[3], &[0], vec![2]);
         assert_eq!(reuse.weighed(0, 0, Some(6), Some(3.)), 0., "nothing read, nothing expected");
         log(&mut reuse, read(6, &[0]));
-        log(&mut reuse, read(7, &[1]));
-        assert_eq!(reuse.half_life(), 0.);
-        assert_eq!(reuse.weighed(0, 1, None, Some(3.)), 1.);
-        assert_eq!(reuse.weighed(0, 1, None, None), 1.);
-        assert_eq!(reuse.weighed(0, 0, None, Some(3.)), 0.);
-        assert_eq!(reuse.weighed(0, 2, None, Some(3.)), 0.);
+        log(&mut reuse, read(10, &[1]));
+        let close = |got: f64, want: f64| assert!((got - want).abs() < 1e-12, "{got} against {want}");
+        close(reuse.weighed(0, 0, None, Some(3.)), 0.5);
+        close(reuse.weighed(0, 0, None, None), (-4f64 / 256.).exp2());
+        close(reuse.weighed(0, 2, None, Some(3.)), 0.);
+        close(reuse.weighed(0, 2, Some(10), Some(3.)), 1.);
+        close(reuse.weighed(0, 2, Some(40), Some(3.)), 1.);
+        close(reuse.weighed(0, 0, Some(8), Some(3.)), 0.5 + (-2f64 / 4.).exp2());
     }
 
     /// Over a half-life an expert read often outranks one read once more
