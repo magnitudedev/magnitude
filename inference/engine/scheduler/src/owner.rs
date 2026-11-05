@@ -2067,7 +2067,7 @@ trait MemoryStep: MemoryHost + Sized {
             }
             // Only a growth needs memory: a shrink's refusal broke the bank,
             // which reports it as an invariant violation instead.
-            BankResized::Refused { holding, at, refusal } => {
+            BankResized::GrowthRefused { holding, at, refusal } => {
                 if cause != BankBegunFor::Growth {
                     return Err(invariant("expert bank")(format!("a shrink of {holding:?} reported a refusal: {refusal}")));
                 }

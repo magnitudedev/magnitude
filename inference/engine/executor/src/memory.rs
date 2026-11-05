@@ -171,6 +171,8 @@ pub enum MemoryError {
     HoldingOverflow,
     ChargeMismatch { classified: u64, charged: u64 },
     NotReleasable(HoldingClass),
+    /// A claim reduced to more than it demanded ([`MemoryHeap::reduce_claim`]).
+    ClaimGrew { claimed: u64, reduced: u64 },
 }
 
 /// Engine-level ownership state: the classified holdings and the one ledger
@@ -309,6 +311,17 @@ impl MemoryHeap {
         let claim = MemoryClaim { id, demand, class };
         self.claims.insert(id, claim);
         Ok(claim)
+    }
+
+    /// `id`'s claim now demands `demand`, no more than it did: what its operation has brought
+    /// under Seismic's charge so far is the charge's, no longer the claim's.
+    pub fn reduce_claim(&mut self, id: ClaimId, demand: ClaimDemand) -> Result<(), MemoryError> {
+        let claim = self.claims.get_mut(&id).ok_or(MemoryError::UnknownClaim(id))?;
+        if demand.bytes() > claim.demand.bytes() {
+            return Err(MemoryError::ClaimGrew { claimed: claim.demand.bytes(), reduced: demand.bytes() });
+        }
+        claim.demand = demand;
+        Ok(())
     }
 
     pub fn cancel_claim(&mut self, id: ClaimId) -> Result<MemoryClaim, MemoryError> {

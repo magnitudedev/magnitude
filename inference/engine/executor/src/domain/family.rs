@@ -183,6 +183,10 @@ pub trait ElasticBank {
         wake: crate::CompletionWake,
     ) -> Result<BankStep, super::DomainError>;
 
+    /// What the running growth the domain began has backed so far, which Seismic charges
+    /// already: its claim holds only the rest (`ExecutorDomain::refresh_memory`).
+    fn growth_backed(&self, tier: crate::planning::BankTier) -> Result<u64, super::DomainError>;
+
     /// The storage `holding` lies in, which its resizes are of: each store
     /// resizes on its own ([`BankStep::Begun`]).
     fn holding_storage(&self, holding: BankHolding) -> Result<crate::planning::BankTier, super::DomainError>;
@@ -327,9 +331,11 @@ pub enum BankResized {
     /// A growth stopped before its first slot joined (a shrink wanted its
     /// memory, or the bank dropped): the holding serves `at`, as before it.
     Stopped { holding: BankHolding, at: u64 },
-    /// Seismic refused the resize's storage (the device's memory, a pinned
-    /// region): the holding keeps its storage and serves `at`.
-    Refused { holding: BankHolding, at: u64, refusal: seismic::TensorError },
+    /// Seismic refused a growth's storage before its first slot (the
+    /// device's memory): the holding keeps its storage and serves `at`. Only
+    /// a growth is refused: a shrink needs no memory, and its storage's
+    /// refusal breaks the bank instead.
+    GrowthRefused { holding: BankHolding, at: u64, refusal: seismic::TensorError },
 }
 
 impl BankResized {
@@ -339,7 +345,7 @@ impl BankResized {
             Self::Shrunk { holding, .. }
             | Self::Grown { holding, .. }
             | Self::Stopped { holding, .. }
-            | Self::Refused { holding, .. } => holding,
+            | Self::GrowthRefused { holding, .. } => holding,
         }
     }
 }

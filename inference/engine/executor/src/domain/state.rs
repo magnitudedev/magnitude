@@ -1609,7 +1609,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let grown = bank.grow(resident, &measured, kind, room, wake);
         match grown {
             Ok(super::BankStep::Begun(tier)) => {
-                self.bank_claim = Some(claim);
+                self.bank_claim = Some(super::GrowthClaim { id: claim, kind, bytes });
                 self.grown_last = Some(kind);
                 self.resize_held.begin(tier, started);
                 Ok(super::BankStep::Begun(tier))
@@ -1655,9 +1655,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             super::BankResized::Shrunk { times, .. } => self.pace.borrow_mut().released(times),
             // A growth's claim was the heap's hold on what it backs, which
             // Seismic now charges; a shrink beside it leaves it held.
-            super::BankResized::Grown { .. } | super::BankResized::Stopped { .. } | super::BankResized::Refused { .. } => {
+            super::BankResized::Grown { .. } | super::BankResized::Stopped { .. } | super::BankResized::GrowthRefused { .. } => {
                 if let Some(claim) = self.bank_claim.take() {
-                    self.release_claim(claim);
+                    self.release_claim(claim.id);
                 }
             }
         }

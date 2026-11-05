@@ -468,6 +468,12 @@ impl DeviceHeap {
             .map_err(ClaimRefusal::Accounting)
     }
 
+    /// `claim`, of `kind` storage, now demands `bytes`: the rest of what it claimed is Seismic's
+    /// charge already ([`MemoryHeap::reduce_claim`]).
+    pub fn reduce_reserved(&mut self, claim: ClaimId, kind: BankTier, bytes: u64) -> Result<(), MemoryError> {
+        self.heap.reduce_claim(claim, reserved(kind, bytes))
+    }
+
     /// Release `claim`: its physical operation's charge is now Seismic's.
     pub fn release(&mut self, claim: ClaimId) {
         self.heap

@@ -461,7 +461,7 @@ impl ServedBank {
             Err(refusal) if records < from => {
                 return Err(DomainError::invariant(format!("a held table's storage refused a shrink: {refusal}")));
             }
-            Err(refusal) => BankResized::Refused { holding, at: to, refusal },
+            Err(refusal) => BankResized::GrowthRefused { holding, at: to, refusal },
             Ok(()) if after < before => BankResized::Shrunk { holding, from, to, released: before - after, times },
             Ok(()) => BankResized::Grown { holding, from, to, grown: after - before, refused: None, times },
         };
@@ -664,6 +664,11 @@ impl ElasticBank for ServedBank {
 
     fn holding_storage(&self, holding: BankHolding) -> Result<crate::planning::BankTier, DomainError> {
         self.storage(holding)
+    }
+
+    /// A table grows on the domain's thread at once: only the records' growth runs on.
+    fn growth_backed(&self, tier: crate::planning::BankTier) -> Result<u64, DomainError> {
+        self.bank.growth_backed(tier)
     }
 
     /// The records' resize advances at every boundary (a shrink's install

@@ -938,6 +938,11 @@ impl ElasticBank for FakeBank {
         self.begin(to, wake)
     }
 
+    /// The fake's growth backs its storage only as its advance installs it.
+    fn growth_backed(&self, _: crate::planning::BankTier) -> Result<u64, DomainError> {
+        Ok(0)
+    }
+
     fn holding_storage(&self, holding: crate::BankHolding) -> Result<crate::planning::BankTier, DomainError> {
         Ok(match holding {
             crate::BankHolding::Host => crate::planning::BankTier::Host,
@@ -1005,7 +1010,7 @@ impl ElasticBank for FakeBank {
             }
             FakeResize::Refused(resizer, refusal, false) => {
                 let at = self.slots();
-                let refused = BankResized::Refused { holding: crate::BankHolding::Experts, at, refusal };
+                let refused = BankResized::GrowthRefused { holding: crate::BankHolding::Experts, at, refusal };
                 (FakeResize::Idle(resizer), Some(refused))
             }
             idle => (idle, None),

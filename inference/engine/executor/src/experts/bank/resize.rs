@@ -246,7 +246,7 @@ impl Growing {
         // No slot joined: refused at its first, or stopped before it.
         let Some((first, last)) = joined else {
             return Some(Ok(match refused {
-                Some(refusal) => (resizers, BankResized::Refused { holding, at: slots, refusal }, spent),
+                Some(refusal) => (resizers, BankResized::GrowthRefused { holding, at: slots, refusal }, spent),
                 None => (resizers, BankResized::Stopped { holding, at: slots }, spent),
             }));
         };
@@ -667,6 +667,29 @@ impl ExpertBank {
                 tier.resize = HostResize::Broken(reason.clone());
                 Err(DomainError::invariant(reason))
             }
+        }
+    }
+
+    /// What the growth the domain began of the holdings in `tier` storage has backed so far:
+    /// their records' charge now beyond theirs at its start; none while no growth of that store
+    /// runs. The domain's claim of the growth holds only the rest. Its charge rises only under
+    /// [`ExpertBank::hold_rises`], which its reader holds.
+    pub(super) fn growth_backed(&self, tier: BankTier) -> Result<u64, DomainError> {
+        let backed = |now: u64, from: u64| {
+            now.checked_sub(from).ok_or_else(|| DomainError::invariant("a growth lowered its records' charge"))
+        };
+        match tier {
+            BankTier::Bank => match &self.commitment().resize {
+                Resize::Growing(growing) => backed(self.charged()?, growing.charged),
+                _ => Ok(0),
+            },
+            BankTier::Host => match self.host.as_ref().map(|host| host.lock().expect("host tier")) {
+                Some(tier) => match &tier.resize {
+                    HostResize::Growing(growing) => backed(self.host_charged()?, growing.charged),
+                    _ => Ok(0),
+                },
+                None => Ok(0),
+            },
         }
     }
 

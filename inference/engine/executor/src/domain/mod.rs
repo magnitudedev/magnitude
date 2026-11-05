@@ -618,7 +618,7 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// not counted.
     experts: Option<ExpertMeasures>,
     /// The heap claim of the expert bank's running growth.
-    bank_claim: Option<ClaimId>,
+    bank_claim: Option<GrowthClaim>,
     /// What expert bank resizes held the submitting thread.
     resize_held: ResizeHeld,
     /// A bank shrink began and its step, the next decode launch, has not
@@ -869,6 +869,15 @@ fn publish_misses(experts: Option<&ExpertMeasures>, record: Option<std::sync::Ar
 pub struct ExpertResizes {
     pub begun: u64,
     pub running: bool,
+}
+
+/// The heap's claim of a running expert bank growth: the bytes it claimed of `kind` storage,
+/// of which the claim holds what the growth has not backed yet (`refresh_memory`).
+#[derive(Clone, Copy, Debug)]
+struct GrowthClaim {
+    id: ClaimId,
+    kind: crate::planning::BankTier,
+    bytes: u64,
 }
 
 /// The time expert bank resizes held the submitting thread at flight
@@ -1476,6 +1485,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .borrow_mut()
             .refresh()
             .map_err(|error| DomainError::Blind(error.to_string()))?;
+        // A running growth's bytes are counted once: what it backed is in the charge just read,
+        // so its claim holds only the rest, read under the same hold of the bank's rises.
+        if let (Some(claim), Some(bank)) = (&self.bank_claim, self.family.expert_bank()) {
+            let rest = claim.bytes.saturating_sub(bank.growth_backed(claim.kind)?);
+            self.memory
+                .borrow_mut()
+                .reduce_reserved(claim.id, claim.kind, rest)
+                .map_err(|error| DomainError::invariant(format!("a growth's claim: {error:?}")))?;
+        }
         if let Some(holding) = self.static_holding {
             let bytes = self.static_holding_bytes().map_err(DomainError::Input)?;
             self.memory
