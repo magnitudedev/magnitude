@@ -1176,9 +1176,8 @@ pub async fn anthropic_count_tokens(
             .await
             .map_err(ApiError::from)?;
         let input = adapted.input;
-        let count = tokio::task::spawn_blocking(move || host.count(&input))
+        let count = magnitude_service_utils::blocking::run(move || host.count(&input))
             .await
-            .map_err(|error| ApiError::server(format!("token-count task failed: {error}")))?
             .map_err(ApiError::from)?;
         Ok::<_, ApiError>(
             Json(CountTokensResponse {

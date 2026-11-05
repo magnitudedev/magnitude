@@ -44,6 +44,7 @@ fn open_domain() -> Option<(ExecutorDomain, StateBindings, usize)> {
             lookahead: false,
             exported_logits_rows: 64,
             numerical_profile: None,
+            weight_cap: None,
         },
         context_tokens: Some(1024),
         service: ServiceLimits {
@@ -51,6 +52,7 @@ fn open_domain() -> Option<(ExecutorDomain, StateBindings, usize)> {
             decode_tokens: 16,
             decode_share: 0.5,
             locality_seconds: 1.0,
+            conversations: std::num::NonZeroUsize::MIN,
         },
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,

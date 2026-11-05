@@ -22,7 +22,7 @@ use magnitude_service_server::assessment::environment::{
 use magnitude_service_server::assessment::measurement::{self, ServiceMachine};
 use magnitude_service_server::assessment::{HostDevice, ManagedModelAssessments};
 use magnitude_service_server::build_identity;
-use magnitude_service_server::configurations::ResolvedConfigurations;
+use magnitude_service_server::configurations::{LoadBounds, ResolvedConfigurations};
 use magnitude_service_server::device_lock::DeviceLock;
 use magnitude_service_server::hardware::HardwareInventory;
 use magnitude_service_server::model_store::{ServedStore, open_served_store};
@@ -81,6 +81,15 @@ enum Command {
         /// Verified release or prepared development installation.
         #[arg(long)]
         installation: PathBuf,
+        /// Evaluation: the ceiling on every load's weights.
+        #[arg(long, hide = true)]
+        weight_cap: Option<u64>,
+        /// Evaluation: the context every load serves, in place of its model's declared one.
+        #[arg(long, hide = true)]
+        context_tokens: Option<usize>,
+        /// Evaluation: every load decodes plainly, its drafter left out.
+        #[arg(long, hide = true)]
+        plain: bool,
     },
     Doctor,
     Version {
@@ -95,6 +104,7 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     // SAFETY: no other thread has started yet.
     unsafe { magnitude_service_server::isolate_hub_credentials() };
+    magnitude_executor::diagnostics::install();
     magnitude_executor::platform::relax_gpu_watchdog();
     let cli = Cli::parse();
     match cli.command {
@@ -103,7 +113,7 @@ fn main() -> anyhow::Result<()> {
         // service records in its log, at the level the launcher sets (`RUST_LOG`).
         Command::InferenceWorker => {
             worker_process::install_parent_watchdog()?;
-            telemetry::init_worker();
+            telemetry::init_worker()?;
             std::process::exit(run_inference_worker());
         }
         command => {
@@ -142,8 +152,12 @@ async fn run(command: Command) -> anyhow::Result<()> {
             cache_root,
             local_models_config,
             installation,
+            weight_cap,
+            context_tokens,
+            plain,
         } => {
             tokio::spawn(allocator::release_free_memory());
+            let bounds = LoadBounds { weight_cap, context_tokens, plain };
             let installation = installation::Installation::load(&installation)
                 .context("invalid ICN installation")?;
             let release_catalog = Arc::new(open_installation_catalog(&installation)?);
@@ -181,14 +195,13 @@ async fn run(command: Command) -> anyhow::Result<()> {
             let (serving, structure, stored) = {
                 let catalog = Arc::clone(&catalog);
                 let kernels = kernels.clone();
-                tokio::task::spawn_blocking(move || {
+                magnitude_service_utils::blocking::run(move || {
                     let serving = ServingDevice::select(&catalog)?;
                     let structure = assessment_structure(&catalog, serving)?;
                     let stored = structure.stored_measurements(&kernels);
                     anyhow::Ok((serving, Arc::new(structure), stored))
                 })
                 .await
-                .context("assessment structure task failed")?
                 .context("failed to establish the assessment structure")?
             };
             let assessment_environment = Arc::new(
@@ -233,6 +246,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                     kernels,
                     reserves,
                     serving,
+                    bounds,
                 )),
                 host_memory: Arc::new(SeismicHostMemory::new(catalog.clone(), reserves)),
                 catalog: catalog.clone(),
@@ -274,7 +288,10 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 measurement,
                 host,
             );
-            instances.attach_assessments(assessments.clone());
+            // Assessment judges a model unbounded: its verdict does not speak to a bounded load.
+            if bounds == LoadBounds::default() {
+                instances.attach_assessments(assessments.clone());
+            }
             let mut state = AppState::new()
                 .with_model_downloads(model_downloads)
                 .with_hugging_face_catalog(Arc::new(HuggingFaceDiscovery::new(

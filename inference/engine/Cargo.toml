@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+magnitude-service-utils.workspace = true
 magnitude-artifacts = { path = "artifacts" }
 magnitude-chat = { path = "chat" }
 magnitude-generation = { path = "generation" }
@@ -32,6 +33,8 @@ seismic.workspace = true
 opentelemetry = "0.33.0"
 opentelemetry_sdk = "0.33.0"
 opentelemetry-otlp = { version = "0.33.0", features = ["http-json", "reqwest"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 # Re-executes itself as a worker process whose stdout carries the protocol,
 # so it runs without the libtest harness (which prints to stdout).
@@ -45,22 +48,21 @@ harness = false
 
 [dev-dependencies]
 magnitude-family-common = { path = "families/common", features = ["catalog-headers"] }
+# The controlled execution domain and its fake expert bank, to drive the
+# service owner and the worker session over (`magnitude_executor::fixtures`).
+magnitude-executor = { path = "executor", features = ["fixtures"] }
 flate2.workspace = true
 # The recorded machines (`seismic::fixtures::recorded`), to assess on.
 seismic = { workspace = true, features = ["fixtures"] }
 tempfile = "3.24.0"
 
-[build-dependencies]
-sha2 = "=0.11.0"
-
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "=0.2.189"
 
 [features]
-# Development-only: lets `magnitude-harness` record tuned configurations and
-# replay them in a later run (bit-exact comparisons). The served
-# `magnitude-engine` binary (engine/cli) never installs a pin.
-pinned-tuning = ["magnitude-executor/pinned-tuning"]
 # Development-only: lets `magnitude-harness` survey every admissible tuning
 # configuration (`--tuning-survey DIR`) for replaying the search.
 tuning-survey = ["magnitude-executor/tuning-survey"]
+# Development-only: the expert directory's routing replay, which
+# `magnitude-harness` prices its bars by.
+expert-routing = ["magnitude-executor/expert-routing"]

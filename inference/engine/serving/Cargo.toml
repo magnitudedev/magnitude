@@ -8,6 +8,7 @@ license.workspace = true
 # Responses, Anthropic Messages). Engine core only: no Seismic, no service
 # types. The service and the standalone engine mount its router.
 [dependencies]
+magnitude-service-utils.workspace = true
 axum = { version = "0.8.9", features = ["ws"] }
 base64.workspace = true
 futures-util.workspace = true

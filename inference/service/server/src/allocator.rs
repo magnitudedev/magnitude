@@ -29,7 +29,7 @@ mod glibc {
         loop {
             interval.tick().await;
             // SAFETY: malloc_trim only returns free pages to the system.
-            let _ = tokio::task::spawn_blocking(|| unsafe { libc::malloc_trim(0) }).await;
+            magnitude_service_utils::blocking::run(|| unsafe { libc::malloc_trim(0) }).await;
         }
     }
 }

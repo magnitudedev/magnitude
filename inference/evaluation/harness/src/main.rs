@@ -2,7 +2,7 @@
 //! evaluation. Every engine subcommand takes a catalog model (its acquired
 //! paths, `--artifacts`) and a fixture set, renders the fixtures through the
 //! engine's own serving chat path, and writes an evaluation result record
-//! (`result.json`, `specs/26-10-08/evaluation-contracts.md`) with its traces
+//! (`result.json`) with its traces
 //! into a run directory. `mrig` runs it; each subcommand serves instruments:
 //!
 //! - `render`: the exact tokens of each fixture (`rendered.jsonl`), or with
@@ -18,6 +18,8 @@
 //!   configuration of the surveyed entries at the model's points, from the
 //!   model's headers alone (a catalog header export opens as the model with
 //!   zero weights) (`kernel`).
+//! - `memory`, `recommit`: one load's host memory against its charge, and
+//!   what a reserved tensor's recommit costs, loading nothing (`memory`).
 //!
 //! Every engine subcommand takes the development tuning tools
 //! ([`development`]): pins and the survey.
@@ -31,14 +33,18 @@
 //! to `tuning.jsonl`.
 
 mod artifacts;
+mod bar;
 mod development;
 mod digest;
 mod draft;
 mod engine;
 mod fixture;
 mod logits;
+mod machine;
+mod memory;
 mod record;
 mod render;
+mod rest;
 mod selection;
 mod steps;
 mod time;
@@ -123,6 +129,93 @@ enum Command {
         /// Queue each decode step's successor before it completes, as served.
         #[arg(long, default_value = "on", value_parser = on_off, action = clap::ArgAction::Set)]
         lookahead: bool,
+        /// A resident load's `time` result on this host, whose decode at each
+        /// context and concurrency is the resident step a streamed load's
+        /// decode is priced on (`assessment::cost`).
+        #[arg(long)]
+        resident_decode: Option<PathBuf>,
+        /// The run counts rather than times (a routing trace): no overlap
+        /// efficiency is measured, the one timing a resident load adds.
+        #[arg(long)]
+        untimed: bool,
+    },
+    /// One load's host memory against its charge, in a worker process
+    /// (`memory`).
+    Memory {
+        /// A unified-memory backend: metal or cpu.
+        #[arg(long)]
+        device: String,
+        /// Load at this context; the model's declared one by default.
+        #[arg(long)]
+        context: Option<usize>,
+        /// A ceiling on every weight byte the load holds.
+        #[arg(long, value_name = "BYTES")]
+        weight_cap: Option<u64>,
+        /// Decode the first fixture of this rendered set once loaded.
+        #[arg(long, value_name = "RENDERED", requires = "decode_tokens")]
+        decode: Option<PathBuf>,
+        /// Tokens the decode generates; under --pressure, the tokens before
+        /// pressing (a quarter), under the held pressure (half) and after
+        /// it (a quarter), the decode sized to fit them.
+        #[arg(long, requires = "decode")]
+        decode_tokens: Option<usize>,
+        /// Decode from the fixture's first N tokens: a pressured decode's
+        /// prompt, as it printed it (`decode_prompt_tokens`), for the same
+        /// decode resident.
+        #[arg(long, value_name = "N", requires = "decode", conflicts_with = "pressure")]
+        decode_prompt_tokens: Option<usize>,
+        /// Another process presses the load BYTES below its planning line
+        /// over a window of the decode.
+        #[arg(long, value_name = "BYTES", requires_all = ["decode", "pressure_store"])]
+        pressure: Option<u64>,
+        /// The pressure starts once the request is admitted, so its prompt's
+        /// groups run under it.
+        #[arg(long, requires = "pressure")]
+        pressure_prompt: bool,
+        /// Physical store to press; device resolves every allocation placement.
+        #[arg(long, requires = "pressure")]
+        pressure_store: Option<memory::PressureStore>,
+        /// Keep the loaded worker until standard input closes.
+        #[arg(long)]
+        hold: bool,
+        /// The kernel cache the load prepares from and keeps its
+        /// measurements in, as a served load's: its executor's costs price
+        /// the expert bank's growth.
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+        /// The target model file.
+        target: PathBuf,
+    },
+    /// What an in-place recommit of a reserved tensor (an elastic expert
+    /// bank's resize) costs at each commitment, loading nothing.
+    Recommit {
+        /// A unified-memory backend: metal or cpu.
+        #[arg(long)]
+        device: String,
+        /// Commitments, in gigabytes.
+        #[arg(long, value_delimiter = ',', required = true)]
+        gigabytes: Vec<u64>,
+    },
+    /// Another process's memory: what `memory --pressure` starts beside a
+    /// load to press it below its planning line.
+    #[command(hide = true)]
+    Occupy {
+        #[arg(long)]
+        device: String,
+        /// Bytes below the planning line.
+        #[arg(long)]
+        deficit: u64,
+        #[arg(long)]
+        pressure_store: memory::PressureStore,
+    },
+    /// How long occupying takes here: everything down to the planning line
+    /// taken, with no load beside it, timed and given back.
+    #[command(hide = true)]
+    OccupyTime {
+        #[arg(long)]
+        device: String,
+        #[arg(long)]
+        pressure_store: memory::PressureStore,
     },
     /// Next-token distributions at every scored position.
     Logits {
@@ -145,6 +238,10 @@ enum Command {
         /// verification forward.
         #[arg(long, default_value_t = 1)]
         verify_width: usize,
+        /// Passes over the fixtures on the one load, each past the first
+        /// written beside the first's logits as `logits-<pass>.f32`.
+        #[arg(long, default_value_t = 1)]
+        passes: usize,
     },
     /// The model's Prepare alone: its tuning search, nothing imported.
     Prepare {
@@ -285,6 +382,10 @@ struct EngineArgs {
     /// Tune the run's first load afresh, ignoring stored tuning results.
     #[arg(long)]
     fresh_tuning: bool,
+    /// A ceiling on every weight byte a load holds: past it, the routed
+    /// experts stream through an expert bank.
+    #[arg(long, value_name = "BYTES")]
+    weight_cap: Option<u64>,
     #[command(flatten)]
     pin: development::PinArgs,
     #[command(flatten)]
@@ -300,6 +401,7 @@ fn on_off(value: &str) -> Result<bool, String> {
 }
 
 fn main() {
+    magnitude_executor::diagnostics::install();
     magnitude_executor::platform::relax_gpu_watchdog();
     if let Err(error) = run(Cli::parse().command) {
         eprintln!("magnitude-harness: {error}");
@@ -417,6 +519,7 @@ fn engine_options(
                 .parse()
                 .map_err(|error| format!("--kv-codec: {error}"))?,
             numerical_profile,
+            weight_cap: engine.weight_cap,
             budget,
             fresh: Cell::new(engine.fresh_tuning),
             tuning_trace: inputs.run.path(tuning::TRACE),
@@ -459,6 +562,13 @@ fn tuned(
 }
 
 fn run(command: Command) -> Result<(), String> {
+    // The memory step's decisions (each growth step offered, each resize
+    // finished) print as a run takes them. The memory instrument reads each streamed
+    // step's reads from the worker; elsewhere a step's reads are its result's.
+    memory::print_events(match command {
+        Command::Worker { .. } => memory::Scope::Steps,
+        _ => memory::Scope::Decisions,
+    })?;
     match command {
         Command::Worker { survey } => {
             use magnitude_engine::worker::{
@@ -494,6 +604,8 @@ fn run(command: Command) -> Result<(), String> {
             prefill_attribution,
             prefill_samples,
             lookahead,
+            resident_decode,
+            untimed,
         } => {
             if contexts.is_empty()
                 || concurrency.is_empty()
@@ -530,6 +642,8 @@ fn run(command: Command) -> Result<(), String> {
                     prefill_attribution,
                     prefill_samples,
                     lookahead,
+                    resident_decode,
+                            untimed,
                 },
             )?;
             development.finish()?;
@@ -555,6 +669,7 @@ fn run(command: Command) -> Result<(), String> {
                     drafter: false,
                     proposals: None,
                     context_tokens: context,
+                    sequences: std::num::NonZeroUsize::MIN,
                     decode_rows: 1,
                     exported_logits_rows: 0,
                     lookahead: true,
@@ -571,9 +686,10 @@ fn run(command: Command) -> Result<(), String> {
             rendered,
             batch,
             verify_width,
+            passes,
         } => {
-            if batch == 0 || verify_width == 0 {
-                return Err("--batch and --verify-width must be positive".into());
+            if batch == 0 || verify_width == 0 || passes == 0 {
+                return Err("--batch, --verify-width and --passes must be positive".into());
             }
             let inputs = Inputs::read(&common, "harness.logits")?;
             let (rendered, digest) = match rendered {
@@ -603,6 +719,7 @@ fn run(command: Command) -> Result<(), String> {
                 &logits::LogitsOptions {
                     batch,
                     verify_width,
+                    passes,
                 },
                 &rendered,
                 &digest,
@@ -612,6 +729,51 @@ fn run(command: Command) -> Result<(), String> {
             let (measurements, traces) = tuned(&engine, &options)?;
             inputs.finish(digest, Some(vec![device]), measurements, traces)
         }
+        Command::Memory {
+            device,
+            context,
+            weight_cap,
+            decode,
+            decode_tokens,
+            decode_prompt_tokens,
+            pressure,
+            pressure_prompt,
+            pressure_store,
+            hold,
+            cache_dir,
+            target,
+        } => memory::load(memory::Load {
+            backend: memory::backend(&device)?,
+            target,
+            kernel_cache: cache_dir,
+            context_tokens: context,
+            weight_cap,
+            decode: decode.zip(decode_tokens).map(|(rendered, tokens)| memory::Decode {
+                rendered,
+                tokens,
+                prompt_tokens: decode_prompt_tokens,
+            }),
+            // Clap requires each of `--pressure` and `--pressure-store` with the other.
+            pressure: pressure.zip(pressure_store).map(|(deficit, store)| memory::Pressing {
+                store,
+                deficit,
+                from_prompt: pressure_prompt,
+            }),
+            hold,
+        }),
+        Command::Recommit { device, gigabytes } => {
+            let commitments = gigabytes
+                .iter()
+                .map(|gigabytes| {
+                    gigabytes
+                        .checked_mul(1_000_000_000)
+                        .ok_or_else(|| format!("--gigabytes {gigabytes} overflows"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            memory::recommit(memory::backend(&device)?, &commitments)
+        }
+        Command::Occupy { device, deficit, pressure_store } => memory::occupy(memory::backend(&device)?, pressure_store, deficit),
+        Command::OccupyTime { device, pressure_store } => memory::time_occupying(memory::backend(&device)?, pressure_store),
         Command::Draft {
             common,
             engine,

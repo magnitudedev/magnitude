@@ -3,8 +3,10 @@
 //! host process opens an executor or waits on a native submission.
 //!
 //! The job discovers the machine, opens the selected executor and measures
-//! its cost points through `seismic-measure` ([`ExecutorCosts::measure`]),
-//! each record stored in the kernel cache as it is taken, and ends with the
+//! the point requests outstanding on it in the order of who waits on them
+//! ([`magnitude_executor::assessment::requests`]: the load that waited
+//! latest first, then assessment's costs), through `seismic-measure`, each
+//! record stored in the kernel cache as it is taken, and ends with the
 //! points it could not measure. Before each point it records the key it is
 //! attempting ([`AttemptMarkers`]): a point that ends two jobs (the second
 //! confirms the first was no transient) is recorded unobtainable with its
@@ -20,7 +22,7 @@ use super::client::{handshake, receive};
 use super::protocol::{EngineBuild, HostMessage, WorkerMessage};
 use super::transport::{HostTransport, MessageSender};
 use super::WorkerExit;
-use magnitude_executor::assessment::ExecutorCosts;
+use magnitude_executor::assessment::{requests, PointRequests};
 use magnitude_executor::{KernelCache, DEFAULT_KERNEL_CACHE_BYTES};
 use seismic::measure::{Attempt, JsonFileStore, Outcome, Reason, Record, StoreError};
 use seismic::{Devices, KernelIdentity, Measurer, PointKey};
@@ -49,7 +51,9 @@ pub struct MeasureRequest {
     /// its host kills is released rather than counted ([`release_killed`]).
     pub job: MeasureJob,
     /// The time the job has from its start: what its host's time for it
-    /// ([`magnitude_executor::assessment::MEASUREMENT_SECONDS`]) has left.
+    /// ([`magnitude_executor::assessment::MEASUREMENT_SECONDS`]) has left,
+    /// the bound however many points are requested: the order, not a
+    /// larger budget, measures what loads wait on first.
     pub time: std::time::Duration,
 }
 
@@ -125,6 +129,10 @@ struct AttemptRecord {
     job: Option<MeasureJob>,
 }
 
+impl seismic::measure::Stored for AttemptRecord {
+    const SCHEMA: &'static str = "attempt.1";
+}
+
 /// The most bytes an [`AttemptRecord`] is written as: `{"ended_jobs":`,
 /// the ten digits of `u32::MAX`, `,"job":`, the twenty of `u64::MAX` and
 /// `}`.
@@ -152,6 +160,10 @@ impl AttemptMarkers {
         Ok(self.files.load(key, LARGEST_RECORD)?.unwrap_or_default())
     }
 
+    fn store(&self, key: &impl Serialize, record: &AttemptRecord) -> Result<(), StoreError> {
+        self.files.store(key, record, LARGEST_RECORD)
+    }
+
     /// Why `key` cannot be measured on this machine: it ended two jobs.
     /// `None` while it may be attempted.
     fn unobtainable(&self, key: &impl Serialize) -> Result<Option<String>, StoreError> {
@@ -164,7 +176,7 @@ impl AttemptMarkers {
     /// Record that `job` is about to time `key`.
     fn attempting(&self, key: &impl Serialize, job: MeasureJob) -> Result<(), StoreError> {
         let record = self.record(key)?;
-        self.files.store(
+        self.store(
             key,
             &AttemptRecord {
                 ended_jobs: record.ended_jobs.saturating_add(1),
@@ -181,7 +193,7 @@ impl AttemptMarkers {
         if record.job != Some(job) {
             return Ok(());
         }
-        self.files.store(
+        self.store(
             key,
             &AttemptRecord {
                 ended_jobs: record.ended_jobs.saturating_sub(1),
@@ -196,7 +208,7 @@ impl AttemptMarkers {
         if self.record(key)?.ended_jobs == 0 {
             return Ok(());
         }
-        self.files.store(key, &AttemptRecord::default())
+        self.store(key, &AttemptRecord::default())
     }
 }
 
@@ -255,8 +267,9 @@ pub struct MeasureEnd {
     pub held: Option<magnitude_executor::assessment::Held>,
 }
 
-/// Measure the cost points of the request's executor that have no record,
-/// within the request's time: what it does not reach is left for the next
+/// Measure the outstanding point requests of the request's executor, in
+/// the order of who waits on them ([`PointRequests::outstanding`]), within
+/// the request's time: what it does not reach is left for the next
 /// job, its attempts released. A point that ended two jobs is not timed: it
 /// is recorded unobtainable, so the executor's costs complete without it. Each attempt reaches `report`
 /// before it is recorded, and each record as soon as the job stores it.
@@ -293,6 +306,8 @@ pub fn measure_machine(
                     executor,
                     seismic::DeviceOptions {
                         artifacts: Some(Arc::new(cache)),
+                        // The job's point of it (`PointRequest::GraphCost`).
+                        graph_cost: None,
                     },
                 )
                 .map_err(|error| error.to_string())
@@ -301,6 +316,11 @@ pub fn measure_machine(
         Err(reason) => return machine(reason),
     };
     let records = KernelCache::measurement_records(&request.kernels);
+    let outstanding = PointRequests::new(&request.kernels).outstanding(device.topology(), device.info(), &records);
+    let outstanding = match outstanding {
+        Ok(outstanding) => outstanding,
+        Err(reason) => return machine(format!("the point requests: {reason}")),
+    };
     let markers = AttemptMarkers::new(&request.kernels);
     let unrecorded = RefCell::new(Vec::new());
     let mut measurer = Measurer::new(
@@ -311,10 +331,11 @@ pub fn measure_machine(
     // attempting and the visiting closures report.
     let report = RefCell::new(report);
     let mut failures = Vec::new();
-    let measured = ExecutorCosts::measure(
+    let measured = requests::measure(
         &mut measurer,
         &device,
         &records,
+        &outstanding,
         deadline,
         &mut |key| {
             // A point that ended two jobs is not timed again; the measurer
@@ -396,11 +417,9 @@ pub fn measure_machine(
         Ok(measurement) => measurement,
         Err(error) => return machine(error.to_string()),
     };
-    if let Some(error) = measurement.ended {
-        failures.push(MeasureFailure::Machine {
-            reason: error.to_string(),
-        });
-    }
+    failures.extend(measurement.ended.into_iter().map(|error| MeasureFailure::Machine {
+        reason: error.to_string(),
+    }));
     failures.extend(
         measurement
             .failures

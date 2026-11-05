@@ -29,9 +29,8 @@ pub async fn open_served_store(
             .context("failed to initialize model inventory")?,
     );
     let served = store.served_paths();
-    let devices = crate::spawn_blocking_traced(move || Devices::discover(&served))
+    let devices = magnitude_service_utils::blocking::run(move || Devices::discover(&served))
         .await
-        .context("device discovery task failed")?
         .context("device discovery failed")?;
     Ok(ServedStore {
         store,

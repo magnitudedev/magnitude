@@ -804,13 +804,13 @@ impl ManagedModelCandidates {
             &target.identity,
             drafter.map(|drafter| drafter.identity.as_str()),
             &method,
-        )?;
-        if let Some(cached) = self.models().read_model_assessment(&evidence) {
+        );
+        if let Some(cached) = self.assessor.cached(&environment, &evidence) {
             return Ok(cached);
         }
         let gate = self.gate(&evidence).await;
         let _admitted = gate.lock().await;
-        if let Some(cached) = self.models().read_model_assessment(&evidence) {
+        if let Some(cached) = self.assessor.cached(&environment, &evidence) {
             return Ok(cached);
         }
         let _share = self.host.share().await;
@@ -830,7 +830,7 @@ impl ManagedModelCandidates {
                 .collect(),
         };
         let setup_environment = Arc::clone(&environment);
-        let (prepared, fallback_context) = crate::spawn_blocking_traced(move || {
+        let (prepared, fallback_context) = magnitude_service_utils::blocking::run(move || {
             let prepared =
                 prepare_model_assessment_from(&paths, &headers, &setup_environment.setup.structure);
             // An unsupported file is profiled at its training context when its header names one;
@@ -847,10 +847,7 @@ impl ManagedModelCandidates {
             };
             (prepared, fallback_context)
         })
-        .await
-        .map_err(|error| {
-            InventoryError::Internal(format!("candidate preparation failed: {error}"))
-        })?;
+        .await;
         let prepared = prepared.map_err(preparation_error)?;
         let context = match &prepared {
             PreparedModelAssessment::Planned { facts, .. } => facts.context_limit,
@@ -864,11 +861,10 @@ impl ManagedModelCandidates {
         };
         let depths = profile.performance_context_tokens.clone();
         let finish_environment = Arc::clone(&environment);
-        let assessed = crate::spawn_blocking_traced(move || {
+        let assessed = magnitude_service_utils::blocking::run(move || {
             finish_model_assessment(&prepared, &finish_environment.setup, &depths, PROFILE_SEQUENCES)
         })
         .await
-        .map_err(|error| InventoryError::Internal(format!("candidate assessment failed: {error}")))?
         .map_err(preparation_error)?;
         let key = ServableModelBundleKey(format!(
             "candidate_{:x}",
@@ -879,14 +875,16 @@ impl ManagedModelCandidates {
         Ok(cached)
     }
 
-    /// The cache key of an assessment in this service's environment.
-    fn assessment_evidence(
+    /// The assessment cached in this service's environment, while it is current there.
+    fn cached_assessment(
         &self,
         target: &str,
         drafter: Option<&str>,
         method: &ModelMethod,
-    ) -> Result<String, InventoryError> {
-        assessment_evidence(&self.assessor.environment().id, target, drafter, method)
+    ) -> Option<CachedModelAssessment> {
+        let environment = self.assessor.environment();
+        let evidence = assessment_evidence(&environment.id, target, drafter, method);
+        self.assessor.cached(&environment, &evidence)
     }
 
     /// The identity `hugging_face_target` would give a version's material, from cached header
@@ -1274,11 +1272,7 @@ impl ManagedModelCandidates {
         // recognize included, so its reasons are the engine's own. Its drafter (built-in heads
         // among them) is composed only for the recommended version; see `compose_recommended`.
         if let Some(cached) = identity
-            .and_then(|identity| {
-                self.assessment_evidence(&identity, None, &ModelMethod::Plain)
-                    .ok()
-            })
-            .and_then(|evidence| self.models().read_model_assessment(&evidence))
+            .and_then(|identity| self.cached_assessment(&identity, None, &ModelMethod::Plain))
         {
             return Some(cached);
         }
@@ -1401,13 +1395,12 @@ impl ManagedModelCandidates {
         let root = root.to_path_buf();
         let architectures = self.architectures.clone();
         let store = Arc::clone(self.models());
-        crate::spawn_blocking_traced(move || {
+        magnitude_service_utils::blocking::run(move || {
             let files = scan_ggufs(&root, depth);
             let classified = classify_local(&store, &root, &files, &architectures);
             (files, classified)
         })
         .await
-        .unwrap_or_default()
     }
 
     // Inspection -----------------------------------------------------------------------------
@@ -1743,16 +1736,15 @@ impl ManagedModelCandidates {
                         .map_err(|error| tracing::warn!(%error, model.id = %candidate.model_id.as_str(), "catalog fingerprint material is unavailable"))
                         .ok()?;
                     let model_id = candidate.model_id;
-                    crate::spawn_blocking_traced(move || {
+                    magnitude_service_utils::blocking::run(move || {
                         let target = resolved_paths(&resolved.target_model).ok()?.0;
                         let fingerprint = EngineModelFingerprint::from_path(&target)
                             .ok()
+                            .as_ref()
                             .map(super::assessor::model_fingerprint);
                         Some((model_id, fingerprint))
                     })
                     .await
-                    .ok()
-                    .flatten()
                 }))
                 .buffered(assessment_concurrency())
                 .filter_map(std::future::ready)
@@ -1929,9 +1921,8 @@ impl ManagedModelCandidates {
                 }
                 let models = Arc::clone(self.models());
                 let path = path.clone();
-                let sample = crate::spawn_blocking_traced(move || models.local_weight_sample(&path))
+                let sample = magnitude_service_utils::blocking::run(move || models.local_weight_sample(&path))
                     .await
-                    .ok()?
                     .map_err(|error| tracing::warn!(%error, "weight sample unavailable"))
                     .ok()?;
                 if let Ok(mut samples) = self.weight_samples.write() {
@@ -3674,15 +3665,16 @@ fn assessment_evidence(
     target: &str,
     drafter: Option<&str>,
     method: &ModelMethod,
-) -> Result<String, InventoryError> {
-    serde_json::to_string(&(
-        "candidate-assessment-v3",
-        &environment.0,
-        target,
-        drafter,
-        format!("{method:?}"),
-    ))
-    .map_err(|error| InventoryError::Internal(error.to_string()))
+) -> String {
+    use serde_json::Value;
+    Value::Array(vec![
+        Value::from("candidate-assessment-v3"),
+        Value::from(environment.0.as_str()),
+        Value::from(target),
+        drafter.map_or(Value::Null, Value::from),
+        Value::from(format!("{method:?}")),
+    ])
+    .to_string()
 }
 
 /// The custom model already on this computer with the same bytes: the same `local:` identity,
@@ -4048,7 +4040,7 @@ mod tests {
         let here = AssessmentEnvironmentId("environment_metal_m3".to_owned());
         let elsewhere = AssessmentEnvironmentId("environment_cuda_4090".to_owned());
         let key = |environment: &AssessmentEnvironmentId, path: &Path| {
-            assessment_evidence(environment, &identity(path), None, &ModelMethod::Auto).unwrap()
+            assessment_evidence(environment, &identity(path), None, &ModelMethod::Auto)
         };
         assert_eq!(
             key(&here, &first),
@@ -4062,7 +4054,7 @@ mod tests {
         );
         assert_ne!(
             key(&here, &first),
-            assessment_evidence(&here, &identity(&first), None, &ModelMethod::Plain).unwrap(),
+            assessment_evidence(&here, &identity(&first), None, &ModelMethod::Plain),
             "the method is part of the key"
         );
     }

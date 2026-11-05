@@ -251,6 +251,9 @@ pub enum PreviewError {
     Device(DeviceSelectionError),
     /// A required memory observation failed (Blind). Retryable.
     MemoryObservationUnavailable { reason: String },
+    /// A configuration control cannot be met by the plan (a weight cap
+    /// below the load's least weights).
+    Configuration { reason: String },
     Internal { reason: String },
 }
 
@@ -259,6 +262,7 @@ impl fmt::Display for PreviewError {
         match self {
             Self::Unsupported(error) => error.fmt(formatter),
             Self::Device(error) => error.fmt(formatter),
+            Self::Configuration { reason } => write!(formatter, "invalid engine configuration: {reason}"),
             Self::MemoryObservationUnavailable { reason } => {
                 write!(formatter, "memory observation unavailable: {reason}")
             }
@@ -295,6 +299,9 @@ pub enum LoadError {
     DeviceLost { reason: String },
     /// The worker ended, or broke the protocol, before it was ready.
     WorkerLost { reason: String },
+    /// A configuration control is malformed, or cannot be met by the plan
+    /// (a weight cap below the load's least weights).
+    Configuration { reason: String },
     Internal { reason: String },
 }
 
@@ -330,6 +337,7 @@ impl fmt::Display for LoadError {
             }
             Self::DeviceLost { reason } => write!(formatter, "device lost: {reason}"),
             Self::WorkerLost { reason } => write!(formatter, "worker lost during load: {reason}"),
+            Self::Configuration { reason } => write!(formatter, "invalid engine configuration: {reason}"),
             Self::Internal { reason } => write!(formatter, "internal load failure: {reason}"),
         }
     }
@@ -340,7 +348,7 @@ impl std::error::Error for LoadError {}
 impl From<ResolveError> for LoadError {
     fn from(error: ResolveError) -> Self {
         match error {
-            ResolveError::InvalidConfiguration { reason } => Self::Internal { reason },
+            ResolveError::InvalidConfiguration { reason } => Self::Configuration { reason },
             ResolveError::Artifact(error) => Self::Artifact(error),
             ResolveError::Unsupported(error) => Self::Unsupported(error),
         }
@@ -359,8 +367,8 @@ pub enum RequestError {
     InsufficientMemory(InsufficientMemory),
     /// A required memory observation failed (Blind). Retryable.
     MemoryObservationUnavailable { reason: String },
-    /// The engine is in the Reclaim band and pauses admission
-    /// (`memory_pressure`). Retryable.
+    /// The request waited while the engine gave memory back, until only the
+    /// model's unload could make room for it (`memory_pressure`). Retryable.
     MemoryReclaim,
     /// The model is no longer loaded.
     ModelUnloaded { cause: UnloadCause },
@@ -441,7 +449,6 @@ impl From<magnitude_scheduler::owner::AdmissionError> for RequestError {
             AdmissionError::MemoryObservationUnavailable(reason) => {
                 Self::MemoryObservationUnavailable { reason }
             }
-            AdmissionError::MemoryReclaim => Self::MemoryReclaim,
             AdmissionError::ModelUnloaded {
                 cause: ModelUnloadCause::MemoryPressure,
             } => Self::ModelUnloaded {
@@ -485,12 +492,13 @@ impl From<magnitude_scheduler::publication::RequestError> for RequestError {
                 reason: error.to_string(),
             },
             Scheduled::Invariant(error) => Self::internal(error.to_string()),
-            Scheduled::TableRead(error) => Self::WeightReadFailed {
+            Scheduled::WeightRead(error) => Self::WeightReadFailed {
                 reason: error.detail,
             },
             Scheduled::WorkerClosed => Self::WorkerLost {
                 reason: "the execution owner closed the request's stream".into(),
             },
+            Scheduled::MemoryReclaim => Self::MemoryReclaim,
             Scheduled::ModelUnloaded {
                 cause: ModelUnloadCause::MemoryPressure,
             } => Self::ModelUnloaded {
@@ -549,7 +557,9 @@ pub(crate) fn classify_plan(error: PlanError, backend: seismic::BackendName) -> 
         | PlanError::Topology(_)
         | PlanError::UnsupportedOperator { .. }
         | PlanError::Deferred(_)
-        | PlanError::UnportedScale(_)) => unsupported(&error),
+        | PlanError::UnportedScale(_)
+        | PlanError::Unstreamed(_)) => unsupported(&error),
+        error @ PlanError::WeightCap { .. } => PlanOutcome::Configuration(error.to_string()),
         error @ (PlanError::Arithmetic(_)
         | PlanError::ResourcePlanning(_)
         | PlanError::Resource(_)) => PlanOutcome::Internal(error.to_string()),
@@ -600,6 +610,9 @@ fn kernel_domain(backend: &str, entry: &str, statics: Vec<(String, u64)>) -> Uns
 
 pub(crate) enum PlanOutcome {
     Unsupported(UnsupportedModel),
+    /// The caller's own control cannot be met (a weight cap below the
+    /// load's least weights): no property of the model or the backend.
+    Configuration(String),
     Internal(String),
 }
 
@@ -628,7 +641,8 @@ pub(crate) fn classify_platform(error: PlatformError) -> PlatformOutcome {
         }
         error @ (PlatformError::Memory(_)
         | PlatformError::Open(_)
-        | PlatformError::Qualification(_)) => PlatformOutcome::Internal(error.to_string()),
+        | PlatformError::Qualification(_)
+        | PlatformError::Records(_)) => PlatformOutcome::Internal(error.to_string()),
     }
 }
 
@@ -662,6 +676,7 @@ impl From<PlanOutcome> for PreviewError {
     fn from(outcome: PlanOutcome) -> Self {
         match outcome {
             PlanOutcome::Unsupported(error) => Self::Unsupported(error),
+            PlanOutcome::Configuration(reason) => Self::Configuration { reason },
             PlanOutcome::Internal(reason) => Self::Internal { reason },
         }
     }
@@ -671,6 +686,7 @@ impl From<PlanOutcome> for LoadError {
     fn from(outcome: PlanOutcome) -> Self {
         match outcome {
             PlanOutcome::Unsupported(error) => Self::Unsupported(error),
+            PlanOutcome::Configuration(reason) => Self::Configuration { reason },
             PlanOutcome::Internal(reason) => Self::Internal { reason },
         }
     }

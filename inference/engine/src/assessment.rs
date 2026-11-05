@@ -33,9 +33,11 @@ use magnitude_chat::{
 };
 use magnitude_executor::{
     assessment::{
-        assess_execution_fit, estimate_execution, prepare_execution_assessment, AssessmentError,
-        AssessmentRequest, ExecutionAssessment, ExecutionFit, ExecutionShortfall, ExecutorCosts,
-        PerformanceEstimate, PreparedExecutionAssessment, StoredCosts,
+        assess_execution_fit, decode_demand, decode_pricing, estimate_execution, performance_depths,
+        prepare_execution_assessment, step_seconds, AssessmentError, AssessmentRequest, Pricing,
+        DomainFit, ExecutionAssessment, ExecutionFit, ExecutionShortfall,
+        ExecutorCosts, ExpertShares, MissRecord, PerformanceEstimate, PreparedExecutionAssessment,
+        PointRequests, Residency as FitResidency, StoredCosts, StoredMisses,
     },
     platform::{self, DeviceRequest, MemoryReserves, PlatformError, SelectedDevice},
     resident_element, resident_layout, source_element, ExecutionPath, ExecutionPlanDraft,
@@ -105,28 +107,50 @@ impl AssessmentStructure {
     /// What this machine's stored records give assessment now: the selected
     /// executor's costs, derived from the records of its cost points in the
     /// kernel cache at `kernels`, opening no device and measuring nothing.
-    /// The costs are `Measured` once the probe is stored, pending while a
-    /// later point has no record yet (its figure priced from those read
-    /// until the job takes it); before then they are `Pending`. Costs that
+    /// The costs are `Measured` once the probe and the figures no other
+    /// prices are stored (`Required`), pending while a
+    /// point request is outstanding (`PointRequests`: a load's, or a later
+    /// point of the costs with no record yet, whose figure is priced from
+    /// those read until the job takes it); before then they are `Pending`. Costs that
     /// cannot be derived from what is stored (a record store that cannot be
-    /// read, or the probe recorded unobtainable) are `Unavailable`.
+    /// read, or a required figure recorded unobtainable) are `Unavailable`.
     pub fn stored_measurements(&self, kernels: &Path) -> Measurements {
         let records = KernelCache::measurement_records(kernels);
         match ExecutorCosts::stored(&self.topology, &self.selected.info, &records) {
             Ok(StoredCosts::Complete {
                 costs,
-                records,
+                records: cost_records,
                 pending,
-            }) => Measurements::Measured {
-                costs: Arc::new(costs),
-                records: Arc::new(records),
-                pending,
-            },
+            }) => {
+                // A request a load left outstanding is as pending as a point of the costs.
+                let pending = pending
+                    || match PointRequests::new(kernels).outstanding(&self.topology, &self.selected.info, &records) {
+                        Ok(outstanding) => !outstanding.is_empty(),
+                        Err(error) => {
+                            return Measurements::Unavailable {
+                                reason: format!("the point requests: {error}"),
+                            };
+                        }
+                    };
+                Measurements::Measured {
+                    costs: Arc::new(costs),
+                    records: Arc::new(cost_records),
+                    pending,
+                    streaming: Arc::new(Streaming::new(kernels, self.selected.identity.clone())),
+                }
+            }
             Ok(StoredCosts::Missing(_)) => Measurements::Pending,
             Err(error) => Measurements::Unavailable {
                 reason: error.to_string(),
             },
         }
+    }
+
+    /// The device bytes a measurement job on the selected executor lays
+    /// out at most (`ExecutorCosts::scratch`): what a job beside a resident
+    /// model claims of it first.
+    pub fn measurement_scratch(&self) -> Result<u64, String> {
+        ExecutorCosts::scratch(&self.topology, &self.selected.info).map_err(|error| error.to_string())
     }
 }
 
@@ -135,8 +159,8 @@ impl AssessmentStructure {
 /// stored.
 #[derive(Clone)]
 pub enum Measurements {
-    /// The job has not stored the probe yet: fit is assessed and speed is
-    /// pending.
+    /// The job has not stored the probe or a figure no other prices yet:
+    /// fit is assessed and speed is pending.
     Pending,
     /// The stored records give no costs, and why: the probe is recorded
     /// unobtainable (the executor cannot stream its own weights), or the
@@ -151,8 +175,28 @@ pub enum Measurements {
         costs: Arc<ExecutorCosts>,
         records: Arc<Vec<(seismic::PointKey, seismic::measure::Record)>>,
         pending: bool,
+        streaming: Arc<Streaming>,
     },
 }
+
+/// What streamed estimates are computed from beside the executor's costs:
+/// the miss records streamed loads wrote in the kernel cache at `kernels`,
+/// each read under its own model's key on the selected `executor`
+/// ([`Measurements::misses`]), so one model's unreadable record makes no other
+/// model's estimate unavailable. Its records are read when an estimate is
+/// first made of them, so none enters what identifies the measurements: each
+/// keys only its own model's estimates ([`MissesDigest`]). Each model's
+/// record is read once for these measurements, which are read again as
+/// what is stored changes (after each hold of the device ends), and its
+/// digest taken once.
+pub struct Streaming {
+    kernels: PathBuf,
+    executor: seismic::Identity,
+    reads: std::sync::Mutex<std::collections::HashMap<ModelFingerprint, (MissRead, MissesDigest)>>,
+}
+
+/// One read of a model's miss record ([`Measurements::misses`]).
+pub type MissRead = Result<Option<MissRecord>, String>;
 
 /// The configuration every model is assessed on: its structure, and what
 /// is measured of this machine. New measurements keep the structure.
@@ -254,17 +298,36 @@ pub enum ModelAssessment {
 }
 
 /// How a package executes on the setup's selected device: a fitting one
-/// with its decode speed, or why it does not fit.
+/// with how it holds its weights and its decode speed held so, or why it
+/// does not fit.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ModelExecution {
     Fits {
-        fit: ExecutionFit,
-        performance: Performance,
+        domains: Vec<DomainFit>,
+        residency: ModelResidency,
     },
     DoesNotFit(ExecutionShortfall),
 }
 
-/// A fitting model's decode speed, as this machine's measurements give it.
+/// How a fitting package holds its weights, and its decode speed held so.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModelResidency {
+    /// Every weight in memory.
+    Resident { performance: Performance },
+    /// The routed experts streamed through an expert bank of `shares`:
+    /// `performance` at its share, `floor_performance` at its floor, both
+    /// from the model's miss record as one read gave it, which `misses`
+    /// identifies.
+    Streamed {
+        shares: ExpertShares,
+        performance: StreamedPerformance,
+        floor_performance: StreamedPerformance,
+        misses: MissesDigest,
+    },
+}
+
+/// A fitting model's decode speed, resident or streamed, as this machine's
+/// measurements give it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Performance {
     /// The measurements it is estimated from are not stored yet.
@@ -273,6 +336,32 @@ pub enum Performance {
     Unavailable { reason: String },
     /// One estimate per requested depth, ascending.
     Estimated(Vec<PerformanceEstimate>),
+}
+
+/// A streamed fit's decode speed: unmeasured while this machine's
+/// measurements are stored but no streamed load of the model on this
+/// executor has written the record of which experts its routing misses,
+/// which the estimate is also computed from; otherwise its [`Performance`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum StreamedPerformance {
+    Unmeasured,
+    Assessed(Performance),
+}
+
+/// The identity of a model's miss record as one read gave it ([`Measurements::misses`]):
+/// the digest of the record, of its absence, or of why it cannot be read.
+/// A streamed fit's estimates are a function of it, so it keys them; no other
+/// model's record enters it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MissesDigest(pub String);
+
+impl MissesDigest {
+    /// The digest of `read`, one read of a model's record.
+    pub fn of(read: &Result<Option<MissRecord>, String>) -> Self {
+        use sha2::{Digest, Sha256};
+        let bytes = serde_json::to_vec(read).expect("a miss record serializes");
+        Self(Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect())
+    }
 }
 
 /// An operational failure: no result is produced for the package. A
@@ -316,6 +405,8 @@ pub enum PreparedModelAssessment {
     },
     Planned {
         facts: ModelFacts,
+        /// The definition `draft` plans.
+        definition: ModelDefinition,
         draft: ExecutionPlanDraft,
         execution: PreparedExecutionAssessment,
     },
@@ -330,7 +421,7 @@ pub fn finish_model_assessment(
     performance_depths: &[u32],
     sequences: u32,
 ) -> Result<ModelAssessment, ModelAssessmentError> {
-    let (facts, draft, preparation) = match prepared {
+    let (facts, definition, draft, preparation) = match prepared {
         PreparedModelAssessment::Unsupported {
             unsupported,
             fingerprint,
@@ -342,9 +433,10 @@ pub fn finish_model_assessment(
         }
         PreparedModelAssessment::Planned {
             facts,
+            definition,
             draft,
             execution,
-        } => (facts, draft, execution),
+        } => (facts, definition, draft, execution),
     };
     let structure = &setup.structure;
     let request = AssessmentRequest {
@@ -354,6 +446,7 @@ pub fn finish_model_assessment(
         sequences,
     };
     let fit = assess_execution_fit(
+        definition,
         preparation,
         draft,
         &structure.topology,
@@ -363,24 +456,230 @@ pub fn finish_model_assessment(
     .map_err(ModelAssessmentError::Assessment)?;
     let execution = match fit {
         ExecutionAssessment::DoesNotFit(shortfall) => ModelExecution::DoesNotFit(shortfall),
-        ExecutionAssessment::Fits(fit) => ModelExecution::Fits {
-            fit,
-            performance: match &setup.measurements {
-                Measurements::Pending => Performance::Pending,
-                Measurements::Unavailable { reason } => Performance::Unavailable {
-                    reason: reason.clone(),
+        ExecutionAssessment::Fits(ExecutionFit {
+            domains, residency, ..
+        }) => ModelExecution::Fits {
+            residency: match residency {
+                FitResidency::Streamed(shares) => {
+                    // One read for these measurements: both estimates and
+                    // their key are of the same record.
+                    let (read, misses) = setup.measurements.misses(facts.fingerprint.as_ref());
+                    let at = |held| streamed_performance(&setup.measurements, &read, preparation, draft, &request, held);
+                    ModelResidency::Streamed {
+                        performance: at(shares.held(shares.slots()))?,
+                        floor_performance: at(shares.held(shares.floor()))?,
+                        shares,
+                        misses,
+                    }
+                }
+                FitResidency::Resident => ModelResidency::Resident {
+                    performance: resident_performance(
+                        &setup.measurements,
+                        preparation,
+                        draft,
+                        &request,
+                    )?,
                 },
-                Measurements::Measured { costs, .. } => Performance::Estimated(
-                    estimate_execution(preparation, draft, costs, &request)
-                        .map_err(ModelAssessmentError::Assessment)?,
-                ),
             },
+            domains,
         },
     };
     Ok(ModelAssessment::Assessed {
         facts: facts.clone(),
         execution,
     })
+}
+
+/// A resident fit's decode speed from the setup's measurements.
+fn resident_performance(
+    measurements: &Measurements,
+    preparation: &PreparedExecutionAssessment,
+    draft: &ExecutionPlanDraft,
+    request: &AssessmentRequest,
+) -> Result<Performance, ModelAssessmentError> {
+    Ok(match measurements {
+        Measurements::Pending => Performance::Pending,
+        Measurements::Unavailable { reason } => Performance::Unavailable {
+            reason: reason.clone(),
+        },
+        Measurements::Measured { costs, .. } => Performance::Estimated(
+            estimate_execution(preparation, draft, costs, request)
+                .map_err(ModelAssessmentError::Assessment)?,
+        ),
+    })
+}
+
+/// A streamed fit's decode speed holding `held` of each routed layer's experts:
+/// pending or unavailable as the setup's measurements are, as a resident
+/// fit's is; once they are measured, from `read`, the model's miss record as
+/// read: unmeasured before a streamed load of the model on this executor
+/// wrote one, [`streamed_estimate`] from it once one did.
+fn streamed_performance(
+    measurements: &Measurements,
+    read: &Result<Option<MissRecord>, String>,
+    preparation: &PreparedExecutionAssessment,
+    draft: &ExecutionPlanDraft,
+    request: &AssessmentRequest,
+    held: magnitude_executor::assessment::HeldSlots,
+) -> Result<StreamedPerformance, ModelAssessmentError> {
+    let assessed = |performance| Ok(StreamedPerformance::Assessed(performance));
+    let costs = match measurements {
+        Measurements::Pending => return assessed(Performance::Pending),
+        Measurements::Unavailable { reason } => return assessed(Performance::Unavailable { reason: reason.clone() }),
+        Measurements::Measured { costs, .. } => costs,
+    };
+    match read {
+        Ok(None) => Ok(StreamedPerformance::Unmeasured),
+        Ok(Some(record)) => assessed(streamed_estimate(costs, record, preparation, draft, request, held)?),
+        Err(reason) => assessed(Performance::Unavailable { reason: reason.clone() }),
+    }
+}
+
+impl Measurements {
+    /// The miss record the streamed loads of the model of `fingerprint`
+    /// stored on the setup's executor, read under the model's own key in
+    /// [`MissRecord::form`], with its digest, one read per these
+    /// measurements; none before one did, or of a dense model or one
+    /// without a fingerprint, or while the machine's costs are pending or
+    /// unavailable, when no estimate reads one. Why the model's record
+    /// cannot be read.
+    pub fn misses(&self, fingerprint: Option<&ModelFingerprint>) -> (MissRead, MissesDigest) {
+        match (self, fingerprint) {
+            (Self::Measured { streaming, .. }, Some(fingerprint)) => streaming.read(fingerprint),
+            _ => {
+                let read = Ok(None);
+                let digest = MissesDigest::of(&read);
+                (read, digest)
+            }
+        }
+    }
+}
+
+impl Streaming {
+    fn new(kernels: &Path, executor: seismic::Identity) -> Self {
+        Self { kernels: kernels.to_owned(), executor, reads: Default::default() }
+    }
+
+    /// The miss record stored under the key of the model of `fingerprint`
+    /// on the executor, none before a load stored one or of a dense model;
+    /// why it cannot be read: with its digest, as these measurements first
+    /// read it. Only that key's file is read.
+    fn read(&self, fingerprint: &ModelFingerprint) -> (MissRead, MissesDigest) {
+        let mut reads = self.reads.lock().expect("miss record reads lock poisoned");
+        reads
+            .entry(fingerprint.clone())
+            .or_insert_with(|| {
+                let read = stored_misses(&self.kernels, &self.executor, fingerprint);
+                let digest = MissesDigest::of(&read);
+                (read, digest)
+            })
+            .clone()
+    }
+}
+
+/// The miss record the streamed loads of the model of `fingerprint` stored
+/// on `executor` in the kernel cache at `kernels`, every load's merged; none
+/// before one did, or of a dense model. Why it cannot be read. Only that
+/// key's file is read.
+pub(crate) fn stored_misses(
+    kernels: &std::path::Path,
+    executor: &seismic::Identity,
+    fingerprint: &ModelFingerprint,
+) -> Result<Option<MissRecord>, String> {
+    let Some(largest) = largest_misses(executor, fingerprint)? else {
+        return Ok(None);
+    };
+    let stored = KernelCache::miss_records(kernels)
+        .load::<StoredMisses<ModelFingerprint>>(&StoredMisses::key(executor, fingerprint), largest)
+        .map_err(|error| format!("the model's miss record: {error}"))?;
+    Ok(stored.map(|stored| stored.record))
+}
+
+/// The most bytes the miss record of the model of `fingerprint` on
+/// `executor` is stored as; none for a dense model, which streams no expert,
+/// so none of its loads records one.
+pub(crate) fn largest_misses(executor: &seismic::Identity, fingerprint: &ModelFingerprint) -> Result<Option<u64>, String> {
+    let Some(experts) = fingerprint.expert_count else {
+        return Ok(None);
+    };
+    // Its streamed layers are routed blocks: at most its blocks.
+    StoredMisses::largest(executor, fingerprint, fingerprint.block_count as usize, experts as usize)
+        .map(Some)
+        .map_err(|error| format!("the model's miss record: {error}"))
+}
+
+/// A streamed decode's speed holding `held` of each routed layer's experts
+/// (its bank's slots and its host tier's), at each depth `request` names:
+/// `record`'s `T` there, each layer's misses priced by the one cost function
+/// along the record's lines ([`MissRecord::step_seconds`]) at the request's rows (a row a sequence),
+/// on `C` the resident step's estimate there (`preparation` is the resident plan's): structure and
+/// machine lines alone.
+pub fn streamed_estimate(
+    costs: &ExecutorCosts,
+    record: &MissRecord,
+    preparation: &PreparedExecutionAssessment,
+    draft: &ExecutionPlanDraft,
+    request: &AssessmentRequest,
+    held: magnitude_executor::assessment::HeldSlots,
+) -> Result<Performance, ModelAssessmentError> {
+    let unavailable = |reason: String| Ok(Performance::Unavailable { reason });
+    let pricing = decode_pricing(draft, costs);
+    let resident = |sequences: u32, depth: u32| {
+        step_seconds(preparation.demand(), &pricing, u64::from(sequences), depth)
+            .map(|step| step.total())
+            .map_err(ModelAssessmentError::Assessment)
+    };
+    // What the record's launches measured past the step's terms, which a
+    // streamed step carries and a resident one does not.
+    let overhead = match record.overhead(&resident)? {
+        Ok(overhead) => overhead,
+        Err(reason) => return unavailable(format!("the miss record: {reason}")),
+    };
+    let mut estimates = Vec::new();
+    for depth in performance_depths(request.context_limit, &request.performance_depths) {
+        let compute = resident(request.sequences, depth)?;
+        match record.step_seconds(held, f64::from(request.sequences), compute) {
+            Ok(step) => estimates.push(PerformanceEstimate {
+                context_tokens: depth,
+                tokens_per_second: 1. / (step.total_seconds + overhead),
+            }),
+            Err(reason) => return unavailable(format!("the miss record: {reason}")),
+        }
+    }
+    Ok(Performance::Estimated(estimates))
+}
+
+/// `executor`'s costs as the kernel cache at `kernels` stores them, which a
+/// streamed load's measures price on: pending until the job stores the
+/// probe, unavailable where they cannot be derived.
+pub fn stored_costs(
+    topology: &DeviceTopology,
+    executor: &seismic::Executor,
+    kernels: &Path,
+) -> magnitude_executor::assessment::Priced<ExecutorCosts> {
+    use magnitude_executor::assessment::Priced;
+    match ExecutorCosts::stored(topology, executor, &KernelCache::measurement_records(kernels)) {
+        Ok(StoredCosts::Complete { costs, .. }) => Priced::Measured(costs),
+        Ok(StoredCosts::Missing(point)) => Priced::Pending(format!("the executor's costs are not measured yet ({point:?})")),
+        Err(error) => Priced::Unavailable(error.to_string()),
+    }
+}
+
+/// The resident decode launch of a number of rows (a row a sequence) at a
+/// depth of `definition` planned as `resident` (its plan before any weight
+/// cap), on the executor's `costs` ([`stored_costs`]): what a streamed
+/// load's bank growth is priced on, as [`streamed_estimate`] prices `σ`.
+/// Why there is none: the decode's demand cannot be derived.
+pub fn resident_step(
+    definition: &ModelDefinition,
+    resident: &ExecutionPlanDraft,
+    costs: ExecutorCosts,
+) -> Result<Box<magnitude_executor::ResidentStep>, String> {
+    let demand = decode_demand(definition, resident).map_err(|error| error.to_string())?;
+    let lookahead = decode_pricing(resident, &costs).lookahead;
+    Ok(Box::new(move |rows, depth| {
+        step_seconds(&demand, &Pricing { costs: &costs, lookahead }, u64::from(rows), depth).map(|step| step.total())
+    }))
 }
 
 /// Assess one package on the setup's selected device.
@@ -441,8 +740,8 @@ pub fn prepare_model_assessment_from(
     let plain = environment
         .plain(&admitted)
         .map_err(ModelAssessmentError::Configuration)?;
-    let (plain_draft, plain_execution) =
-        match prepare_plan(&plain, &structure.selected, admitted.context_limit) {
+    let (plain_definition, plain_draft, plain_execution) =
+        match prepare_plan(plain, &structure.selected, admitted.context_limit) {
             Ok(planned) => planned,
             Err(Refusal::Unsupported(unsupported)) => {
                 return Ok(PreparedModelAssessment::Unsupported {
@@ -460,8 +759,8 @@ pub fn prepare_model_assessment_from(
         DrafterAdmission::Candidate { definition, method } => environment
             .drafted(&admitted, definition, *method)
             .and_then(|(manifest, method)| {
-                match prepare_plan(&manifest, &structure.selected, admitted.context_limit) {
-                    Ok((draft, execution)) => Ok((method, draft, execution)),
+                match prepare_plan(manifest, &structure.selected, admitted.context_limit) {
+                    Ok(planned) => Ok((method, planned)),
                     Err(Refusal::Unsupported(unsupported)) => Err(unsupported),
                     Err(Refusal::Failed(error)) => {
                         Err(UnsupportedModel::mismatch(error.to_string()))
@@ -470,8 +769,8 @@ pub fn prepare_model_assessment_from(
             })
             .map_err(DrafterVerdict::Rejected),
     };
-    let (drafter, draft, execution) = match drafted {
-        Ok((method, draft, execution)) => {
+    let (drafter, definition, draft, execution) = match drafted {
+        Ok((method, (definition, draft, execution))) => {
             let held = |charge: &magnitude_executor::AssessmentMemoryCharge| {
                 charge
                     .host_bytes()
@@ -485,14 +784,16 @@ pub fn prepare_model_assessment_from(
                     method,
                     memory_bytes,
                 },
+                definition,
                 draft,
                 execution,
             )
         }
-        Err(verdict) => (verdict, plain_draft, plain_execution),
+        Err(verdict) => (verdict, plain_definition, plain_draft, plain_execution),
     };
     Ok(PreparedModelAssessment::Planned {
         facts: admitted.facts(drafter),
+        definition,
         draft,
         execution,
     })
@@ -559,6 +860,7 @@ fn inventory(
 ) -> Result<Result<Vec<seismic::KernelRequest>, UnsupportedModel>, ModelAssessmentError> {
     let refused = |outcome: PlanOutcome| match outcome {
         PlanOutcome::Unsupported(unsupported) => Ok(Err(unsupported)),
+        PlanOutcome::Configuration(reason) => Err(ModelAssessmentError::Configuration(reason)),
         PlanOutcome::Internal(reason) => Err(ModelAssessmentError::Planning(reason)),
     };
     let plan = match plan_backend(manifest, backend) {
@@ -591,15 +893,16 @@ enum Refusal {
 /// checked memory charge, which builds every graph a load prepares. Planner
 /// refusals and kernel domains classify exactly as a load's do.
 fn prepare_plan(
-    manifest: &ExecutionManifest,
+    manifest: ExecutionManifest,
     selected: &SelectedDevice,
     context_limit: u32,
-) -> Result<(ExecutionPlanDraft, PreparedExecutionAssessment), Refusal> {
+) -> Result<(ModelDefinition, ExecutionPlanDraft, PreparedExecutionAssessment), Refusal> {
     let refused = |outcome: PlanOutcome| match outcome {
         PlanOutcome::Unsupported(unsupported) => Refusal::Unsupported(unsupported),
+        PlanOutcome::Configuration(reason) => Refusal::Failed(ModelAssessmentError::Configuration(reason)),
         PlanOutcome::Internal(reason) => Refusal::Failed(ModelAssessmentError::Planning(reason)),
     };
-    let draft = match plan_execution(manifest, selected) {
+    let draft = match plan_execution(&manifest, selected) {
         Ok(draft) => draft,
         Err(ExecutionPlanningError::Plan(error)) => {
             return Err(refused(classify_plan(error, selected.info.backend())));
@@ -611,7 +914,7 @@ fn prepare_plan(
         }
     };
     match prepare_execution_assessment(&manifest.definition, &draft, context_limit) {
-        Ok(execution) => Ok((draft, execution)),
+        Ok(execution) => Ok((manifest.definition, draft, execution)),
         Err(AssessmentError::Graph(error)) => Err(refused(classify_graph(error))),
         Err(error) => Err(Refusal::Failed(ModelAssessmentError::Assessment(error))),
     }
@@ -1074,4 +1377,86 @@ fn unsupported_weights<'a>(
         layout.as_str()
     );
     Some(UnsupportedModel::reason(reason, detail))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magnitude_executor::assessment::{ExpertLines, RequestReads, Residuals, MeasuredLayer};
+
+    fn fingerprint(architecture: &str) -> ModelFingerprint {
+        ModelFingerprint {
+            architecture: architecture.into(),
+            block_count: 2,
+            embedding_length: 64,
+            head_count: 4,
+            head_count_kv: 2,
+            key_length: 16,
+            vocab_size: 100,
+            expert_count: Some(4),
+            tokenizer_digest: "digest".into(),
+        }
+    }
+
+    /// A model's record is read under its own key in this format alone: a
+    /// record under a key of the model that names no format is not this
+    /// format's and is not read, and another model's unreadable record fails
+    /// nothing and leaves the model's [`MissesDigest`], which its own record
+    /// renews once the store is read again; one read of the store reads
+    /// each model's record once.
+    #[test]
+    fn a_models_record_is_read_from_its_own_key_in_its_format() {
+        let kernels = tempfile::tempdir().unwrap();
+        let executor = seismic::Identity {
+            physical: seismic::PhysicalIdentity::Uuid([3; 16]),
+            backend: seismic::BackendName::Metal,
+            driver: "1".into(),
+        };
+        // A read of the store, as the measurements are read again.
+        let read_store = || Streaming::new(kernels.path(), executor.clone());
+        let (own, other) = (fingerprint("own"), fingerprint("other"));
+        let model = serde_json::to_value(&own).unwrap();
+        let store = KernelCache::miss_records(kernels.path());
+        let digest = |streaming: &Streaming| streaming.read(&own).1;
+        let first = read_store();
+        let unmeasured = digest(&first);
+        assert_eq!(unmeasured, MissesDigest::of(&Ok(None)));
+        let record = MissRecord {
+            steps: 2,
+            layers: vec![
+                MeasuredLayer {
+                    lines: ExpertLines::reference(10),
+                    curve: magnitude_executor::LayerCurve {
+                        misses: vec![0; 5],
+                        requests: vec![0; 5],
+                        choices: 0,
+                    },
+                    anticipated: Default::default(),
+                };
+                2
+            ],
+            reads: RequestReads::default(),
+            residuals: Residuals::default(),
+            hints: Default::default(),
+        };
+        let stored = StoredMisses {
+            executor: executor.clone(),
+            model: model.clone(),
+            record: record.clone(),
+        };
+        // Written unbounded: what is checked is the reader's own bound.
+        let formatless = serde_json::json!({ "misses": { "executor": &executor, "model": &model } });
+        store.store(&formatless, &stored, u64::MAX).unwrap();
+        let other_model = serde_json::to_value(&other).unwrap();
+        let of_other = StoredMisses { model: other_model.clone(), ..stored.clone() };
+        store.store(&StoredMisses::key(&executor, &other_model), &of_other, u64::MAX).unwrap();
+        let streaming = read_store();
+        assert_eq!(streaming.read(&own).0, Ok(None), "a record of another form lies under another key");
+        assert_eq!(digest(&streaming), unmeasured, "another model's record leaves the model's key");
+        store.store(&StoredMisses::key(&executor, &model), &stored, u64::MAX).unwrap();
+        assert_eq!(streaming.read(&own).0, Ok(None), "a read of the store reads a record once");
+        let again = read_store();
+        assert_eq!(again.read(&own).0, Ok(Some(record)));
+        assert_ne!(digest(&again), unmeasured, "the model's own record renews its key");
+    }
 }

@@ -2,14 +2,20 @@
 //! each store's charge by class, as the device's store census classified
 //! it, with the model's host-resident tables, which the runtime does not
 //! allocate, added to host RAM. Because memory is elastic these are the
-//! standing at the observation, not a fixed reservation.
+//! standing at the observation, not a fixed reservation. Beside it, how the
+//! owner serves at the observation (`ServingCensus`): its prompt groups'
+//! places and where its routed experts are.
 
 use magnitude_executor::{MemoryChargeReconciliation, StoreAllocation};
+pub use magnitude_executor::{BankHolding, ExpertResidency, HostResidency, TableResidency, TierFill};
+pub use magnitude_executor::{BankResize, ShrinkCause};
+pub use magnitude_scheduler::serving::ServingCensus;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AllocationCensus {
     pub stores: Vec<StoreAllocation>,
+    pub serving: ServingCensus,
 }
 
 impl AllocationCensus {
@@ -19,6 +25,7 @@ impl AllocationCensus {
     pub(crate) fn classify(
         charge: &MemoryChargeReconciliation,
         host_table_bytes: u64,
+        serving: ServingCensus,
     ) -> Result<Self, String> {
         let mut stores = charge.stores.clone();
         if host_table_bytes != 0 {
@@ -41,7 +48,7 @@ impl AllocationCensus {
                 }),
             }
         }
-        Ok(Self { stores })
+        Ok(Self { stores, serving })
     }
 }
 
@@ -57,6 +64,14 @@ mod tests {
             context_bytes: 0,
             compute_bytes: 0,
             auxiliary_bytes: 0,
+        }
+    }
+
+    fn serving() -> ServingCensus {
+        ServingCensus {
+            group_places: std::num::NonZeroUsize::MIN,
+            group_capacity: std::num::NonZeroUsize::MIN,
+            experts: None,
         }
     }
 
@@ -88,17 +103,17 @@ mod tests {
         let host = seismic::StoreIdentity::HostRam;
         // 700 device bytes, and 300 bytes of stored tables in pinned host RAM.
         let pinned = charge(vec![store(device.clone(), 700), store(host.clone(), 300)]);
-        let census = AllocationCensus::classify(&pinned, 10).unwrap();
+        let census = AllocationCensus::classify(&pinned, 10, serving()).unwrap();
         assert_eq!(
             census.stores,
             [store(device.clone(), 700), store(host.clone(), 310)]
         );
         // Nothing charged to host RAM: the host tables are its entry.
         let local = charge(vec![store(device.clone(), 1_000)]);
-        let census = AllocationCensus::classify(&local, 10).unwrap();
+        let census = AllocationCensus::classify(&local, 10, serving()).unwrap();
         assert_eq!(census.stores, [store(device.clone(), 1_000), store(host, 10)]);
         // No host tables: the ledger's stores alone.
-        let census = AllocationCensus::classify(&local, 0).unwrap();
+        let census = AllocationCensus::classify(&local, 0, serving()).unwrap();
         assert_eq!(census.stores, [store(device, 1_000)]);
     }
 }

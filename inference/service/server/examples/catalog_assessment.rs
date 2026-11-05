@@ -1,8 +1,8 @@
 //! Assess the complete release catalog through the service's production assessment path (the
 //! environment and its identity, the automatic pool and the per-target assessor) and report the
 //! snapshot with its timings. Speeds are estimated from the measurements a service's
-//! measurement job stored in the cache root; without them they are pending. `mrig assess
-//! --catalog` runs it after measuring the machine into that cache root.
+//! measurement job stored in the cache root; without them they are pending. The evaluation
+//! rig runs it after measuring the machine into that cache root.
 //!
 //! ```text
 //! catalog_assessment --bundle model-planner-inputs.bundle --cache-root DIR --model-store DIR \
@@ -19,7 +19,7 @@ use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
     CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover, ModelAssessment,
     ModelAssessmentDomainSnapshot, ModelAssessmentEntryState, ModelAssessments, ModelId,
-    ModelPackageId, ModelPerformance,
+    ModelPackageId, ModelResidency, StreamedModelPerformance,
 };
 use magnitude_service_models::{
     InventoryConfig, ManagedModelDownloads, ModelDomainResolver, load_release_catalog,
@@ -62,6 +62,22 @@ impl CatalogPackageRemover for NoCatalogEffects {
     }
 }
 
+/// A fit's speed as the report prints it: each depth's estimate, or why there is none.
+fn tokens_per_second(performance: &StreamedModelPerformance) -> serde_json::Value {
+    match performance {
+        StreamedModelPerformance::Estimated { samples } => json!(samples
+            .iter()
+            .map(|sample| (
+                sample.context_tokens,
+                (sample.estimated_tokens_per_second * 10.0).round() / 10.0,
+            ))
+            .collect::<Vec<_>>()),
+        StreamedModelPerformance::Pending => json!("pending"),
+        StreamedModelPerformance::Unavailable { failure } => json!(failure.message),
+        StreamedModelPerformance::Unmeasured => json!("unmeasured"),
+    }
+}
+
 fn flag(arguments: &[String], name: &str) -> Option<String> {
     arguments
         .iter()
@@ -76,13 +92,7 @@ fn required(arguments: &[String], name: &str) -> PathBuf {
 
 fn main() -> anyhow::Result<()> {
     let process_started = Instant::now();
-    if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(std::io::stderr)
-            .try_init()
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-    }
+    magnitude_engine::telemetry::log_to_stderr().map_err(anyhow::Error::msg)?;
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -162,23 +172,16 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
                     ModelAssessment::Fits {
                         profile,
                         memory,
-                        performance,
+                        residency,
                         ..
                     },
                 ] => json!({
                     "result": "Fits",
                     "context": profile.context_length,
                     "requiredBytes": memory.iter().map(|domain| domain.required_bytes).collect::<Vec<_>>(),
-                    "tokensPerSecond": match performance {
-                        ModelPerformance::Estimated { samples } => json!(samples
-                            .iter()
-                            .map(|sample| (
-                                sample.context_tokens,
-                                (sample.estimated_tokens_per_second * 10.0).round() / 10.0,
-                            ))
-                            .collect::<Vec<_>>()),
-                        ModelPerformance::Pending => json!("pending"),
-                        ModelPerformance::Unavailable { failure } => json!(failure.message),
+                    "tokensPerSecond": match residency {
+                        ModelResidency::Resident { performance } => tokens_per_second(&performance.clone().into()),
+                        ModelResidency::Streamed { performance, .. } => tokens_per_second(performance),
                     },
                 }),
                 [

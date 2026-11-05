@@ -43,6 +43,7 @@ fn resolved() -> ResolvedEngineConfiguration {
             lookahead: false,
             exported_logits_rows: 512,
             numerical_profile: None,
+            weight_cap: None,
         },
         context_tokens: Some(4096),
         service: ServiceLimits {
@@ -50,6 +51,7 @@ fn resolved() -> ResolvedEngineConfiguration {
             decode_tokens: 32,
             decode_share: 0.5,
             locality_seconds: 1.0,
+            conversations: std::num::NonZeroUsize::MIN,
         },
         path: ExecutionPath::Native,
         device: std::env::var("MAGNITUDE_TEST_DEVICE")

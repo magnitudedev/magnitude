@@ -961,9 +961,8 @@ impl ManagedModelStore {
             }
         };
         let store = self.clone();
-        tokio::task::spawn_blocking(move || store.materialize_preview(artifact))
+        magnitude_service_utils::blocking::run(move || store.materialize_preview(artifact))
             .await
-            .map_err(|error| InventoryError::Internal(error.to_string()))?
     }
 
     async fn acquire_preview_artifact(
@@ -1776,7 +1775,7 @@ async fn fetch_header(
 
 /// A complete header and whether the engine's parser accepts it, or why not.
 async fn header_verdict(header: Vec<u8>) -> Result<(Vec<u8>, Result<(), String>), InventoryError> {
-    tokio::task::spawn_blocking(move || {
+    magnitude_service_utils::blocking::run(move || {
         let verdict = match header_prefix(&header) {
             Ok(HeaderPrefix::Complete(length)) if length >= header.len() => Ok(()),
             Ok(_) => Err("the GGUF header's layout is inconsistent".to_owned()),
@@ -1786,7 +1785,6 @@ async fn header_verdict(header: Vec<u8>) -> Result<(Vec<u8>, Result<(), String>)
         Ok((header, verdict))
     })
     .await
-    .map_err(|error| InventoryError::Internal(error.to_string()))?
 }
 
 /// What a GGUF prefix says about its header.
@@ -1928,11 +1926,10 @@ impl ManagedModelStore {
         let roots = configuration.roots;
         let cache = self.cache.clone();
         let scanned = roots.clone();
-        let unresolved = tokio::task::spawn_blocking(move || {
+        let unresolved = magnitude_service_utils::blocking::run(move || {
             crate::local_roots::unresolved_ollama_hub_pulls(&scanned, &cache)
         })
-        .await
-        .unwrap_or_default();
+        .await;
         let store = Arc::new(self.clone());
         let mut resolved_any = false;
         for (repository, sha256) in unresolved {
@@ -2099,13 +2096,12 @@ impl ManagedModelStore {
             }
             Some(CachedRemoteHeader::Read { digest }) => {
                 let cache = self.cache.clone();
-                let cached = tokio::task::spawn_blocking(move || {
+                let cached = magnitude_service_utils::blocking::run(move || {
                     cache
                         .read_header(&digest)
                         .map(|bytes| RemoteGgufHeader { digest, bytes })
                 })
-                .await
-                .map_err(|error| InventoryError::Internal(error.to_string()))?;
+                .await;
                 if let Some(cached) = cached {
                     return Ok(cached);
                 }
@@ -2130,7 +2126,7 @@ impl ManagedModelStore {
             };
         let store = self.clone();
         let content = file.content.clone();
-        tokio::task::spawn_blocking(move || {
+        magnitude_service_utils::blocking::run(move || {
             let digest = (!bytes.is_empty()).then(|| store.write_header(&bytes));
             let header = match (&verdict, digest.clone()) {
                 (Ok(()), Some(digest)) => CachedRemoteHeader::Read { digest },
@@ -2157,7 +2153,6 @@ impl ManagedModelStore {
             }
         })
         .await
-        .map_err(|error| InventoryError::Internal(error.to_string()))?
     }
 
     /// Exactly the bytes `range` of the file `path` of `snapshot`, by one range request.
@@ -2321,11 +2316,10 @@ impl ManagedModelStore {
             .hugging_face_gguf_header(repository, commit, file, references)
             .await?;
         let classifier = architectures.clone();
-        let classification = tokio::task::spawn_blocking(move || {
+        let classification = magnitude_service_utils::blocking::run(move || {
             crate::candidate_files::classify_header(&header.bytes, &classifier)
         })
-        .await
-        .map_err(|error| InventoryError::Internal(error.to_string()))??;
+        .await?;
         self.cache.write_index(
             ModelIndexKind::CandidateClassification,
             &classification_evidence(&header.digest, architectures),

@@ -343,7 +343,7 @@ fn load(
         .map_err(internal)?;
         let census = owner
             .reconcile_memory_charge()
-            .and_then(|charge| AllocationCensus::classify(&charge, host_table_bytes))
+            .and_then(|charge| AllocationCensus::classify(&charge, host_table_bytes, owner.serving_census()?))
             .map_err(internal)?;
         let ready = ExecutionReady {
             resources,
@@ -352,7 +352,7 @@ fn load(
             census,
         };
         Ok((
-            Box::new(ExecutionOwner::new(owner, method)) as Box<dyn Driven<Stopped = UnloadCause>>,
+            Box::new(ExecutionOwner::new(owner, method, built.pricing)) as Box<dyn Driven<Stopped = UnloadCause>>,
             (ready, host_table_bytes),
         ))
     };

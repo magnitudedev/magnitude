@@ -1,6 +1,7 @@
 //! Transport-neutral local-model package, assessment, download, and residency contracts.
 
 use std::fmt;
+use std::num::NonZeroU64;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
@@ -734,6 +735,361 @@ pub struct ModelInstanceAllocation {
     /// The engine heap's observed standing per memory domain at the last observation. Memory is
     /// elastic, so this is not a fixed reservation.
     pub memory_domains: Vec<ModelInstanceMemoryDomain>,
+    /// The places granted to the load's prompt groups at the last observation.
+    pub prompt_group_places: PromptGroupPlaces,
+    /// Where an elastic expert bank's experts are; absent for a load without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub streaming: Option<ModelStreamingStatus>,
+}
+
+/// A contract bound a value breaks: the rule, in words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutOfBounds(pub &'static str);
+
+impl fmt::Display for OutOfBounds {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "out of the contract's bounds: {}", self.0)
+    }
+}
+
+impl std::error::Error for OutOfBounds {}
+
+impl OutOfBounds {
+    /// `rule` holds, or the bound `statement` states is broken.
+    pub fn check(rule: bool, statement: &'static str) -> Result<(), Self> {
+        rule.then_some(()).ok_or(Self(statement))
+    }
+}
+
+/// The places a prompt group holds now, of the most it may take: each place runs one chunk of
+/// a prompt in the group's pass. It holds at most its capacity.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, try_from = "PromptGroupPlacesParts")]
+pub struct PromptGroupPlaces {
+    #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
+    held: NonZeroU64,
+    #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
+    capacity: NonZeroU64,
+}
+
+/// [`PromptGroupPlaces`]' fields, before their bound is checked.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PromptGroupPlacesParts {
+    pub held: NonZeroU64,
+    pub capacity: NonZeroU64,
+}
+
+impl TryFrom<PromptGroupPlacesParts> for PromptGroupPlaces {
+    type Error = OutOfBounds;
+
+    fn try_from(parts: PromptGroupPlacesParts) -> Result<Self, OutOfBounds> {
+        let PromptGroupPlacesParts { held, capacity } = parts;
+        OutOfBounds::check(held <= capacity, "a prompt group holds at most its capacity")?;
+        Ok(Self { held, capacity })
+    }
+}
+
+/// Where an elastic expert bank's routed experts are at the last observation: the experts of
+/// each routed layer it holds (its slots), between the floor it never shrinks below and the
+/// ceiling it never grows past, at most every expert; its bytes in each memory domain; the
+/// host-RAM tier holding cold experts beside it; the bytes of the experts in neither, read
+/// from the model file on demand; the stored tables it holds; and its experts' last resize.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, try_from = "ModelStreamingStatusParts")]
+pub struct ModelStreamingStatus {
+    /// Each routed layer's experts.
+    #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
+    experts: NonZeroU64,
+    slots: u64,
+    floor_slots: u64,
+    ceiling_slots: u64,
+    /// The memory domains holding the bank, device memory first.
+    tiers: Vec<StreamingTierStatus>,
+    /// The host-RAM tier a discrete device's bank keeps its cold experts in,
+    /// exclusive of the bank; absent on unified memory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    host: Option<StreamingHostStatus>,
+    /// The experts in neither the bank nor the host tier, as the model file
+    /// stores them.
+    disk_bytes: u64,
+    /// The stored tables (n-gram tables) the bank holds beside its experts.
+    tables: Vec<StreamingTableStatus>,
+    /// The experts' last resize; absent before their first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    last_resize: Option<StreamingResize>,
+}
+
+/// [`ModelStreamingStatus`]' fields, before their bounds are checked.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelStreamingStatusParts {
+    pub experts: NonZeroU64,
+    pub slots: u64,
+    pub floor_slots: u64,
+    pub ceiling_slots: u64,
+    pub tiers: Vec<StreamingTierStatus>,
+    #[serde(default)]
+    pub host: Option<StreamingHostStatus>,
+    pub disk_bytes: u64,
+    pub tables: Vec<StreamingTableStatus>,
+    #[serde(default)]
+    pub last_resize: Option<StreamingResize>,
+}
+
+impl TryFrom<ModelStreamingStatusParts> for ModelStreamingStatus {
+    type Error = OutOfBounds;
+
+    fn try_from(parts: ModelStreamingStatusParts) -> Result<Self, OutOfBounds> {
+        let ModelStreamingStatusParts {
+            experts,
+            slots,
+            floor_slots,
+            ceiling_slots,
+            tiers,
+            host,
+            disk_bytes,
+            tables,
+            last_resize,
+        } = parts;
+        OutOfBounds::check(
+            floor_slots <= slots && slots <= ceiling_slots && ceiling_slots <= experts.get(),
+            "an expert bank holds between its floor and its ceiling, at most every expert",
+        )?;
+        Ok(Self { experts, slots, floor_slots, ceiling_slots, tiers, host, disk_bytes, tables, last_resize })
+    }
+}
+
+/// A stored table an expert bank holds: the records its slots use now, between the floor and
+/// ceiling it resizes within; the bytes they hold; and its last resize.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, try_from = "StreamingTableStatusParts")]
+pub struct StreamingTableStatus {
+    records: u64,
+    floor_records: u64,
+    #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
+    ceiling_records: NonZeroU64,
+    bytes: u64,
+    /// Absent before the table's first resize.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    last_resize: Option<StreamingResize>,
+}
+
+/// [`StreamingTableStatus`]' fields, before their bounds are checked.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StreamingTableStatusParts {
+    pub records: u64,
+    pub floor_records: u64,
+    pub ceiling_records: NonZeroU64,
+    pub bytes: u64,
+    #[serde(default)]
+    pub last_resize: Option<StreamingResize>,
+}
+
+impl TryFrom<StreamingTableStatusParts> for StreamingTableStatus {
+    type Error = OutOfBounds;
+
+    fn try_from(parts: StreamingTableStatusParts) -> Result<Self, OutOfBounds> {
+        let StreamingTableStatusParts { records, floor_records, ceiling_records, bytes, last_resize } = parts;
+        OutOfBounds::check(
+            floor_records <= records && records <= ceiling_records.get(),
+            "a table holds between its floor and its ceiling",
+        )?;
+        Ok(Self { records, floor_records, ceiling_records, bytes, last_resize })
+    }
+}
+
+/// A discrete device's host-RAM tier, in its memory domain: its host slots now (each an expert
+/// of every streamed layer) up to its ceiling, the host memory its records take, and its last
+/// resize.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, try_from = "StreamingHostStatusParts")]
+pub struct StreamingHostStatus {
+    memory_domain_id: crate::MemoryDomainId,
+    slots: u64,
+    #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
+    ceiling_slots: NonZeroU64,
+    bytes: u64,
+    /// Absent before the tier's first resize.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    last_resize: Option<StreamingResize>,
+}
+
+/// [`StreamingHostStatus`]' fields, before their bound is checked.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StreamingHostStatusParts {
+    pub memory_domain_id: crate::MemoryDomainId,
+    pub slots: u64,
+    pub ceiling_slots: NonZeroU64,
+    pub bytes: u64,
+    #[serde(default)]
+    pub last_resize: Option<StreamingResize>,
+}
+
+impl TryFrom<StreamingHostStatusParts> for StreamingHostStatus {
+    type Error = OutOfBounds;
+
+    fn try_from(parts: StreamingHostStatusParts) -> Result<Self, OutOfBounds> {
+        let StreamingHostStatusParts { memory_domain_id, slots, ceiling_slots, bytes, last_resize } = parts;
+        OutOfBounds::check(slots <= ceiling_slots.get(), "a host tier holds at most its ceiling")?;
+        Ok(Self { memory_domain_id, slots, ceiling_slots, bytes, last_resize })
+    }
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StreamingTierStatus {
+    pub memory_domain_id: crate::MemoryDomainId,
+    pub bytes: u64,
+}
+
+/// Why the engine shrank an expert bank's holding.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamingShrinkCause {
+    /// Memory fell under pressure.
+    Reclaim,
+    /// A live request's claim needed the memory.
+    LiveClaim,
+    /// The service's measurement of this machine needed room beside the
+    /// model while it was idle.
+    Measurement,
+}
+
+/// A holding's finished resize, in its units (slots, records or host slots), at `atUnixMs`
+/// (milliseconds since the Unix epoch): shrunk by `by` to `to`, for its cause, or grown by `by`
+/// from `from` into free memory. Each changes its size by at least one.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum StreamingResize {
+    #[serde(rename_all = "camelCase")]
+    Shrank {
+        cause: StreamingShrinkCause,
+        to: u64,
+        #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
+        by: NonZeroU64,
+        at_unix_ms: u64,
+    },
+    #[serde(rename_all = "camelCase")]
+    Grew {
+        from: u64,
+        #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
+        by: NonZeroU64,
+        at_unix_ms: u64,
+    },
+}
+
+#[cfg(test)]
+mod model_streaming_status_tests {
+    use super::*;
+
+    fn allocation(streaming: Option<ModelStreamingStatus>) -> ModelInstanceAllocation {
+        ModelInstanceAllocation {
+            context_window_tokens: 4_096,
+            memory_domains: Vec::new(),
+            prompt_group_places: PromptGroupPlacesParts {
+                held: NonZeroU64::MIN,
+                capacity: NonZeroU64::new(8).unwrap(),
+            }
+            .try_into()
+            .unwrap(),
+            streaming,
+        }
+    }
+
+    #[test]
+    fn an_allocation_without_a_bank_omits_streaming() {
+        let json = serde_json::to_value(allocation(None)).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "contextWindowTokens": 4096,
+                "memoryDomains": [],
+                "promptGroupPlaces": { "held": 1, "capacity": 8 }
+            })
+        );
+        let decoded: ModelInstanceAllocation =
+            serde_json::from_value(json).expect("deserialize resident allocation");
+        assert_eq!(decoded, allocation(None));
+    }
+
+    #[test]
+    fn a_streamed_allocation_round_trips_in_its_wire_shape() {
+        let json = serde_json::json!({
+            "contextWindowTokens": 4096,
+            "memoryDomains": [],
+            "promptGroupPlaces": { "held": 3, "capacity": 8 },
+            "streaming": {
+                "experts": 256,
+                "slots": 64,
+                "floorSlots": 26,
+                "ceilingSlots": 256,
+                "tiers": [{ "memoryDomainId": "cuda-0", "bytes": 300 }, { "memoryDomainId": "system", "bytes": 400 }],
+                "host": {
+                    "memoryDomainId": "system",
+                    "slots": 20,
+                    "ceilingSlots": 256,
+                    "bytes": 650,
+                    "lastResize": { "_tag": "Grew", "from": 19, "by": 1, "atUnixMs": 1200 }
+                },
+                "diskBytes": 300,
+                "tables": [{
+                    "records": 40, "floorRecords": 1, "ceilingRecords": 42, "bytes": 500,
+                    "lastResize": { "_tag": "Shrank", "cause": "live_claim", "to": 40, "by": 1, "atUnixMs": 1234 }
+                }],
+                "lastResize": { "_tag": "Shrank", "cause": "measurement", "to": 64, "by": 8, "atUnixMs": 1100 }
+            }
+        });
+        let decoded: ModelInstanceAllocation =
+            serde_json::from_value(json.clone()).expect("deserialize streamed allocation");
+        assert_eq!(serde_json::to_value(&decoded).expect("serialize"), json);
+    }
+
+    /// No value outside a bound decodes: each bounded quantity is refused out of order, a
+    /// resize that changes nothing is refused, and growth has no cause to name.
+    #[test]
+    fn values_outside_the_bounds_never_decode() {
+        let status = |slots: u64, ceiling: u64| {
+            serde_json::json!({
+                "experts": 256, "slots": slots, "floorSlots": 26, "ceilingSlots": ceiling,
+                "tiers": [], "diskBytes": 0, "tables": []
+            })
+        };
+        assert!(serde_json::from_value::<ModelStreamingStatus>(status(64, 200)).is_ok());
+        for (slots, ceiling) in [(20, 200), (201, 200), (64, 257)] {
+            assert!(serde_json::from_value::<ModelStreamingStatus>(status(slots, ceiling)).is_err());
+        }
+        assert!(serde_json::from_value::<PromptGroupPlaces>(serde_json::json!({ "held": 9, "capacity": 8 })).is_err());
+        assert!(serde_json::from_value::<StreamingTableStatus>(serde_json::json!({
+            "records": 43, "floorRecords": 1, "ceilingRecords": 42, "bytes": 0
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<StreamingHostStatus>(serde_json::json!({
+            "memoryDomainId": "system", "slots": 3, "ceilingSlots": 2, "bytes": 0
+        }))
+        .is_err());
+        for resize in [
+            serde_json::json!({ "_tag": "Grew", "from": 4, "by": 0, "atUnixMs": 1 }),
+            serde_json::json!({ "_tag": "Grew", "from": 4, "by": 1, "cause": "reclaim", "atUnixMs": 1 }),
+            serde_json::json!({ "_tag": "Shrank", "cause": "growth", "to": 4, "by": 1, "atUnixMs": 1 }),
+        ] {
+            assert!(serde_json::from_value::<StreamingResize>(resize).is_err());
+        }
+    }
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -2354,7 +2710,7 @@ pub struct PerformanceEvidence {
     pub estimated_tokens_per_second: f64,
 }
 
-/// A fitting model's speed estimates.
+/// A fitting model's speed estimates from this machine's measurements.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
@@ -2367,11 +2723,188 @@ pub enum ModelPerformance {
     Estimated { samples: Vec<PerformanceEvidence> },
 }
 
+/// A streamed fit's speed estimates: a [`ModelPerformance`], or unmeasured before the model's
+/// first streamed load, while the record of which experts its routing misses on this machine,
+/// which the estimate is computed from, does not exist yet.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum StreamedModelPerformance {
+    Pending,
+    Unavailable { failure: ModelFailure },
+    Unmeasured,
+    Estimated { samples: Vec<PerformanceEvidence> },
+}
+
+impl From<ModelPerformance> for StreamedModelPerformance {
+    fn from(performance: ModelPerformance) -> Self {
+        match performance {
+            ModelPerformance::Pending => Self::Pending,
+            ModelPerformance::Unavailable { failure } => Self::Unavailable { failure },
+            ModelPerformance::Estimated { samples } => Self::Estimated { samples },
+        }
+    }
+}
+
+/// How a fitting model holds its weights, and its decode speed held that way.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum ModelResidency {
+    /// Every weight in memory.
+    Resident { performance: ModelPerformance },
+    /// The routed experts streamed through an expert bank (`bank`). `performance` is at the
+    /// bank's slots; `floor_performance` is at its floor.
+    #[serde(rename_all = "camelCase")]
+    Streamed {
+        bank: StreamedBank,
+        performance: StreamedModelPerformance,
+        floor_performance: StreamedModelPerformance,
+    },
+}
+
+/// A streamed fit's expert bank: of each routed layer's `experts`, at least `floorSlots` in
+/// memory, growing to `slots` where this machine's memory allows, fewer than every expert; and
+/// where the experts it lacks are kept (`coldExperts`).
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields, try_from = "StreamedBankParts")]
+pub struct StreamedBank {
+    #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
+    experts: NonZeroU64,
+    slots: u64,
+    floor_slots: u64,
+    cold_experts: ColdExperts,
+}
+
+/// [`StreamedBank`]'s fields, before their bounds are checked.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StreamedBankParts {
+    pub experts: NonZeroU64,
+    pub slots: u64,
+    pub floor_slots: u64,
+    pub cold_experts: ColdExperts,
+}
+
+impl TryFrom<StreamedBankParts> for StreamedBank {
+    type Error = OutOfBounds;
+
+    fn try_from(parts: StreamedBankParts) -> Result<Self, OutOfBounds> {
+        let StreamedBankParts { experts, slots, floor_slots, cold_experts } = parts;
+        OutOfBounds::check(
+            floor_slots <= slots && slots < experts.get(),
+            "a streamed bank holds at least its floor and fewer than every expert",
+        )?;
+        Ok(Self { experts, slots, floor_slots, cold_experts })
+    }
+}
+
+/// Where a streamed fit keeps the experts its bank lacks.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColdExperts {
+    /// Read from the model file on demand (unified memory).
+    Disk,
+    /// In a host-RAM tier as host memory lets it grow, the rest read from the model file (a
+    /// discrete device).
+    HostRam,
+}
+
+#[cfg(test)]
+mod model_residency_tests {
+    use super::*;
+
+    #[test]
+    fn residencies_round_trip_in_their_wire_shape() {
+        let estimated = |tokens_per_second: f64| ModelPerformance::Estimated {
+            samples: vec![PerformanceEvidence {
+                context_tokens: 4_096,
+                estimated_tokens_per_second: tokens_per_second,
+            }],
+        };
+        let wire = |tokens_per_second: f64| {
+            serde_json::json!({
+                "_tag": "Estimated",
+                "samples": [{ "contextTokens": 4096, "estimatedTokensPerSecond": tokens_per_second }]
+            })
+        };
+        let unmeasured = StreamedModelPerformance::Unmeasured;
+        let bank = |cold_experts| {
+            StreamedBank::try_from(StreamedBankParts {
+                experts: NonZeroU64::new(256).unwrap(),
+                slots: 154,
+                floor_slots: 26,
+                cold_experts,
+            })
+            .unwrap()
+        };
+        let wire_bank = |cold: &str| {
+            serde_json::json!({ "experts": 256, "slots": 154, "floorSlots": 26, "coldExperts": cold })
+        };
+        for (residency, json) in [
+            (
+                ModelResidency::Resident {
+                    performance: ModelPerformance::Pending,
+                },
+                serde_json::json!({ "_tag": "Resident", "performance": { "_tag": "Pending" } }),
+            ),
+            (
+                ModelResidency::Streamed {
+                    bank: bank(ColdExperts::HostRam),
+                    performance: estimated(20.0).into(),
+                    floor_performance: estimated(5.5).into(),
+                },
+                serde_json::json!({
+                    "_tag": "Streamed",
+                    "bank": wire_bank("host_ram"),
+                    "performance": wire(20.0),
+                    "floorPerformance": wire(5.5)
+                }),
+            ),
+            (
+                ModelResidency::Streamed {
+                    bank: bank(ColdExperts::Disk),
+                    performance: unmeasured.clone(),
+                    floor_performance: unmeasured,
+                },
+                serde_json::json!({
+                    "_tag": "Streamed",
+                    "bank": wire_bank("disk"),
+                    "performance": { "_tag": "Unmeasured" },
+                    "floorPerformance": { "_tag": "Unmeasured" }
+                }),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&residency).expect("serialize"), json);
+            assert_eq!(
+                serde_json::from_value::<ModelResidency>(json).expect("deserialize"),
+                residency
+            );
+        }
+        // Only a streamed fit reads a miss record, so only its speed is ever unmeasured.
+        assert!(serde_json::from_value::<ModelResidency>(serde_json::json!({
+            "_tag": "Resident",
+            "performance": { "_tag": "Unmeasured" }
+        }))
+        .is_err());
+        // A streamed bank holds at least its floor, and fewer than every expert.
+        for (slots, floor_slots) in [(20, 26), (256, 26)] {
+            assert!(serde_json::from_value::<StreamedBank>(serde_json::json!({
+                "experts": 256, "slots": slots, "floorSlots": floor_slots, "coldExperts": "disk"
+            }))
+            .is_err());
+        }
+    }
+}
+
 /// The state of the measurement job, which measures this machine's selected executor in a
-/// worker process of its own, only while no model is loaded, loading or being optimized, so that
-/// speed estimates can be made. It moves from `Unmeasured` to `Measuring`, then to `Measured`, or
-/// to `Failed` and back to `Measuring` at its retry, or back to `Unmeasured` when a load
-/// preempts the job.
+/// worker process of its own, so that speed estimates can be made. It runs while no model is
+/// loading or being optimized, and while no request holds a loaded model, beside which it runs
+/// once that model has made room for it. It moves from `Unmeasured` to `Measuring`, then to
+/// `Measured`, or to `Failed` and back to `Measuring` at its retry, or back to `Unmeasured` when
+/// a load or a request preempts the job.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
@@ -2393,13 +2926,13 @@ pub enum MeasurementState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase")]
 pub enum ModelAssessment {
-    /// A fitting model, with its decode-speed estimates.
+    /// A fitting model, how it holds its weights, and its decode-speed estimates held that way.
     #[serde(rename_all = "camelCase")]
     Fits {
         profile: ServingProfile,
         assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
-        performance: ModelPerformance,
+        residency: ModelResidency,
         projector: ProjectorVerdict,
         drafter: DrafterVerdict,
     },

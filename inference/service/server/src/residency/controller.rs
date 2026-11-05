@@ -18,12 +18,12 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use futures_util::{FutureExt as _, StreamExt as _};
 use magnitude_engine::composition::{ReadinessMismatch, ReadyEngine};
-use magnitude_engine::error::{LoadError, PreviewError};
+use magnitude_engine::error::{LoadError, PreviewError, RequestError};
 use magnitude_engine::host::HostArtifacts;
 use magnitude_engine::preview::LoadPreview;
 use magnitude_engine::worker::{EngineClient, Preparation, load_prepared};
-use magnitude_engine::worker::protocol::{LoadProgress, MemoryObservation};
-use magnitude_executor::platform::{Fit, MemoryReserves};
+use magnitude_engine::worker::protocol::{LoadProgress, MemoryObservation, RoomAnswer};
+use magnitude_executor::platform::{Fit, HostRoom, MemoryReserves};
 use magnitude_service_contracts::models::{
     CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover,
     InstalledModelPackages as _, MemoryShortage, ModelAssessment, ModelAssessmentDomainSnapshot,
@@ -48,7 +48,7 @@ use super::{
     ResidencyLease, ResidencyNotification, ResidencyWorker, ResolvedResidencyTarget,
 };
 use crate::configurations::{ResolvedConfiguration, ResolvedConfigurations};
-use crate::device_lock::{DeviceHold, DeviceLock, DeviceShare};
+use crate::device_lock::{DeviceHold, DeviceLock, DeviceShare, IdleResident, ResidentRoom};
 use crate::hardware::execution_backend;
 use crate::memory_domains::instance_allocation;
 use crate::worker_process::WorkerLauncher;
@@ -121,7 +121,7 @@ impl ModelInstances {
         // limit, not the whole host's RAM. Without a reading, the whole host's, the larger.
         let topology = environment.catalog.topology();
         let thresholds = match environment.catalog.inventory().host_status() {
-            Ok(host) => Fit::host_ram(&topology, &host, &environment.reserves).thresholds,
+            Ok(host) => Fit::host_ram(&topology, &host, &environment.reserves, HostRoom::Allocatable).thresholds,
             Err(_) => environment
                 .reserves
                 .for_domain(&seismic::StoreKind::HostRam, topology.host_ram().capacity().value),
@@ -228,7 +228,7 @@ impl ModelInstances {
             )
             .await?
         {
-            ResidencyGrant::Lease(lease) => Ok(lease),
+            ResidencyGrant::Lease(lease) => Ok(self.admitted(lease).await),
             ResidencyGrant::Ready(_) => {
                 unreachable!("an inference acquisition is granted with a lease")
             }
@@ -240,7 +240,15 @@ impl ModelInstances {
         &self,
         instance_id: ModelInstanceId,
     ) -> Result<ResidencyLease<ResidentEngine>, InventoryError> {
-        self.residency.lease(instance_id).await
+        let lease = self.residency.lease(instance_id).await?;
+        Ok(self.admitted(lease).await)
+    }
+
+    /// `lease` once the measurement it preempted beside its idle model is gone
+    /// ([`DeviceLock::admit_request`]): no request is served while one is timed.
+    async fn admitted(&self, lease: ResidencyLease<ResidentEngine>) -> ResidencyLease<ResidentEngine> {
+        self.environment.device.admit_request().await;
+        lease
     }
 
     pub async fn stop_instance(&self, instance_id: ModelInstanceId) -> Result<(), InventoryError> {
@@ -434,15 +442,8 @@ pub(super) async fn preview(
 ) -> Result<LoadPreview, ModelOperationFailure> {
     let catalog = Arc::clone(catalog);
     let resolved = Arc::clone(resolved);
-    crate::spawn_blocking_traced(move || resolved.manifest.preview(&catalog))
+    magnitude_service_utils::blocking::run(move || resolved.manifest.preview(&catalog))
         .await
-        .map_err(|error| {
-            ModelOperationFailure::new(
-                "load_preview_failed",
-                format!("load preview task failed: {error}"),
-                true,
-            )
-        })?
         .map_err(preview_failure)
 }
 
@@ -477,6 +478,7 @@ fn preview_failure(error: PreviewError) -> ModelOperationFailure {
         PreviewError::Unsupported(_) => ("unsupported_model", false),
         PreviewError::Device(_) => ("device_unavailable", true),
         PreviewError::MemoryObservationUnavailable { .. } => ("memory_observation_unavailable", true),
+        PreviewError::Configuration { .. } => ("invalid_model_configuration", false),
         PreviewError::Internal { .. } => ("load_preview_failed", false),
     };
     ModelOperationFailure::new(code, error.to_string(), retryable)
@@ -511,6 +513,7 @@ fn load_failure(error: LoadError, worker: &EngineWorker) -> ModelOperationFailur
         LoadError::MemoryObservationUnavailable { .. } => "memory_observation_unavailable",
         LoadError::DeviceLost { .. } => "device_lost",
         LoadError::WorkerLost { .. } => "worker_exited",
+        LoadError::Configuration { .. } => "invalid_model_configuration",
         LoadError::Internal { .. } => "model_load_failed",
     };
     let message = match &error {
@@ -708,7 +711,7 @@ impl EngineResidency {
             servable_model_bundle_key_for_bundle(&configuration.bundle),
             plan.device.clone(),
         );
-        let loaded = crate::spawn_blocking_traced(move || {
+        let loaded = magnitude_service_utils::blocking::run(move || {
             // One progression across the workers: a Prepare fills `optimizing`, the Load the
             // rest.
             let progression = RefCell::new(LoadProgression::default());
@@ -783,14 +786,7 @@ impl EngineResidency {
                 }),
             }
         })
-        .await
-        .map_err(|error| {
-            ModelOperationFailure::new(
-                "worker_exited",
-                format!("worker connection task failed: {error}"),
-                true,
-            )
-        })?;
+        .await;
         let (worker, connection) = loaded?;
 
         // The worker read its own package: it must agree with the host's resolution on the
@@ -807,7 +803,8 @@ impl EngineResidency {
         })?;
         let context_window_tokens = plan.context_window_tokens;
         let ready_info = ready.ready_info();
-        let allocation = instance_allocation(context_window_tokens, &ready_info.census);
+        let allocation = instance_allocation(context_window_tokens, &ready_info.census)
+            .map_err(|error| ModelOperationFailure::new("worker_census_invalid", error.to_string(), false))?;
         let device = load_device(ready_info.device, ready_info.backend);
         let (host, client, _) = ready.into_parts();
         tracing::info!(device = %device.id, "model ready");
@@ -937,6 +934,35 @@ impl ModelResidencyDriver for EngineResidency {
     fn idle_timeout(&self) -> std::time::Duration {
         self.environment.idle_timeout
     }
+
+    fn resident_idle(&self, resident: Option<(&ModelInstanceId, &ResidentEngine)>) {
+        self.environment.device.resident_idle(resident.map(|(instance, resident)| IdleResident {
+            instance: instance.clone(),
+            room: Arc::new(resident.client.clone()),
+        }));
+    }
+}
+
+/// A measurement beside the resident model reaches its worker through its client.
+impl ResidentRoom for EngineClient {
+    fn claim(&self, bytes: u64) -> futures_util::future::BoxFuture<'static, Result<RoomAnswer, RequestError>> {
+        let client = self.clone();
+        Box::pin(async move { client.claim_measurement_room(bytes).await })
+    }
+
+    fn release(&self) {
+        // A worker that is gone holds no room.
+        if let Err(error) = self.release_measurement_room() {
+            tracing::debug!(%error, "the measurement room's release reached no worker");
+        }
+    }
+
+    fn reprice(&self) {
+        // A worker that is gone prices nothing.
+        if let Err(error) = EngineClient::reprice(self) {
+            tracing::debug!(%error, "the reprice reached no worker");
+        }
+    }
 }
 
 impl From<ModelOperationFailure> for InventoryError {
@@ -1022,7 +1048,7 @@ mod tests {
             "profile": { "contextLength": 262_144 },
             "assessmentId": "assessment",
             "memory": [],
-            "performance": { "_tag": "Pending" },
+            "residency": { "_tag": "Resident", "performance": { "_tag": "Pending" } },
             "projector": { "_tag": "None" },
             "drafter": { "_tag": "None" },
         });

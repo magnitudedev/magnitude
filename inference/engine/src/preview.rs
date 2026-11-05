@@ -8,7 +8,6 @@ use crate::error::{classify_graph, classify_plan, classify_platform, PlanOutcome
 use crate::options::ExecutionManifest;
 use crate::planning::{plan_execution, ExecutionPlanningError};
 use magnitude_executor::{
-    platform,
     AssessmentGraphResourceBounds, AssessmentHeaderBounds, AssessmentMemoryTerms,
     DeviceProcessBytes, HostProcessBytes, ResourceCapacity, ResourcePlanner,
 };
@@ -40,13 +39,8 @@ impl ExecutionManifest {
     /// shares its host artifacts elsewhere can still preview.
     pub fn preview(&self, catalog: &Devices) -> Result<LoadPreview, PreviewError> {
         let manifest = self;
-        let selected = platform::select_device(
-            catalog,
-            manifest.path,
-            manifest.device,
-            &manifest.reserves,
-        )
-        .map_err(|error| PreviewError::from(classify_platform(error)))?;
+        let selected = crate::planning::select_load_device(catalog, manifest)
+            .map_err(|error| PreviewError::from(classify_platform(error)))?;
         let backend = selected.info.backend();
         let draft = plan_execution(manifest, &selected).map_err(|error| match error {
             ExecutionPlanningError::Plan(error) => classify_plan(error, backend).into(),
@@ -98,7 +92,9 @@ impl ExecutionManifest {
         let device_process =
             DeviceProcessBytes::derive(backend, host_process.kernels).map_err(internal)?;
         let bounds = AssessmentHeaderBounds::derive(draft.load())
-            .and_then(|header| header.with_graph_resource_bound(&graph, host_process, device_process))
+            .and_then(|header| {
+                header.with_graph_resource_bound(&graph, selected.graph_cost, host_process, device_process)
+            })
             .map_err(internal)?;
         let initial_state = state
             .target_state()
@@ -119,7 +115,7 @@ impl ExecutionManifest {
             terms.head_weights,
             terms.vision_weights,
             initial_state,
-            bounds.prepared_resource_bytes,
+            bounds.prepared_resource_bytes().map_err(internal)?,
             bounds.startup_additional_bytes,
         ]
         .into_iter()

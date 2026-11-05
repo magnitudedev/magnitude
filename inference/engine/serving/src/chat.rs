@@ -1740,9 +1740,8 @@ pub async fn count_chat_tokens(
         .await
         .map_err(ApiError::from)?;
     let input = adapted.request.input;
-    let prompt_tokens = tokio::task::spawn_blocking(move || host.count(&input))
+    let prompt_tokens = magnitude_service_utils::blocking::run(move || host.count(&input))
         .await
-        .map_err(|error| ApiError::server(format!("token-count task failed: {error}")))?
         .map_err(ApiError::from)?;
     Ok(Json(CountResponse { prompt_tokens }))
 }
@@ -1777,9 +1776,8 @@ pub async fn apply_template(
     tracing::Span::current().record("model.id", model.as_str());
     let input = validate_apply_template_request(request)?;
     let host = state.models.host(&model).await.map_err(ApiError::from)?;
-    let applied = tokio::task::spawn_blocking(move || host.apply_template(&input))
+    let applied = magnitude_service_utils::blocking::run(move || host.apply_template(&input))
         .await
-        .map_err(|error| ApiError::server(format!("template task failed: {error}")))?
         .map_err(ApiError::from)?;
     Ok(Json(apply_template_response(applied)))
 }

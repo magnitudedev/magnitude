@@ -7,7 +7,7 @@
 
 use super::protocol::{
     Admission, EngineBuild, ExecutionTimings, HostMessage, HostRequestId,
-    LoadProgress, MemoryObservation, RequestProgress, WorkerMessage,
+    LoadProgress, MemoryObservation, RequestProgress, RoomClaimId, WorkerMessage,
 };
 use super::transport::{HostTransport, MessageReceiver, MessageSender};
 use crate::error::{LoadError, RequestError};
@@ -18,6 +18,7 @@ use magnitude_chat::ConstraintPlan;
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{DetailedUsage, FinishReason, Options, OutputToken};
 use magnitude_scheduler::prefix_cache::PrefixRetention;
+use magnitude_scheduler::protocol::RoomAnswer;
 use std::{
     collections::{HashMap, VecDeque},
     future::poll_fn,
@@ -58,7 +59,8 @@ impl RequestEvent {
 
 #[derive(Default)]
 struct RequestSlot {
-    /// `None` while admission is pending.
+    /// `None` while admission is pending: until the request began, or was
+    /// refused.
     admission: Option<Result<(), RequestError>>,
     events: VecDeque<RequestEvent>,
     terminal_received: bool,
@@ -97,6 +99,10 @@ struct State {
     next_id: u64,
     requests: HashMap<HostRequestId, RequestSlot>,
     observation: Option<Shared<MemoryObservation>>,
+    /// The measurement room's pending claim, and the identity the next
+    /// claim takes.
+    room: Option<(RoomClaimId, Shared<RoomAnswer>)>,
+    next_claim: u64,
     /// Why the connection ended; every later operation fails with it.
     closed: Option<RequestError>,
 }
@@ -119,7 +125,32 @@ impl State {
         if let Some(reply) = self.observation.take() {
             reply.lock().unwrap().fulfill(Err(error.clone()));
         }
+        if let Some((_, reply)) = self.room.take() {
+            reply.lock().unwrap().fulfill(Err(error.clone()));
+        }
         self.closed = Some(error);
+    }
+
+    /// The pending measurement room claim's reply, which a claim while one
+    /// is pending joins; with the identity of a new claim, which its host
+    /// sends.
+    fn claim_room(&mut self) -> (Shared<RoomAnswer>, Option<RoomClaimId>) {
+        if let Some((_, reply)) = &self.room {
+            return (reply.clone(), None);
+        }
+        let claim = RoomClaimId(self.next_claim);
+        self.next_claim += 1;
+        let reply = Arc::new(Mutex::new(SharedReply { value: None, wakers: Vec::new() }));
+        self.room = Some((claim, reply.clone()));
+        (reply, Some(claim))
+    }
+
+    /// Withdraw the pending measurement room claim: it is answered as
+    /// released.
+    fn release_room(&mut self) {
+        if let Some((_, reply)) = self.room.take() {
+            reply.lock().unwrap().fulfill(Ok(RoomAnswer::Released));
+        }
     }
 
     fn deliver(&mut self, message: WorkerMessage) -> Result<(), String> {
@@ -172,6 +203,14 @@ impl State {
                     .take()
                     .ok_or("observation reply without a query")?;
                 reply.lock().unwrap().fulfill(observation);
+            }
+            WorkerMessage::MeasurementRoom { claim, room } => {
+                // A claim released before its answer has no one waiting, and
+                // its answer answers no later claim.
+                if self.room.as_ref().is_some_and(|(pending, _)| *pending == claim) {
+                    let (_, reply) = self.room.take().expect("the pending claim");
+                    reply.lock().unwrap().fulfill(room);
+                }
             }
             WorkerMessage::Unloaded { cause } => {
                 self.close(RequestError::ModelUnloaded { cause });
@@ -390,6 +429,10 @@ impl EngineClient {
         }
     }
 
+    /// Admit `request`: answered once it began (became resident), or
+    /// published before it did, or with why it was refused, which a request
+    /// that cannot begin (memory reclaimed until only the model's unload
+    /// could make its room) is, before anything of it is answered.
     pub async fn admit(&self, request: RequestOptions) -> Result<EngineRequest, RequestError> {
         if request.output_capacity == 0 {
             return Err(RequestError::InvalidRequest {
@@ -451,6 +494,43 @@ impl EngineClient {
             HostMessage::Observe,
         )?;
         Self::wait(reply).await
+    }
+
+    /// Make `bytes` of device memory free beside the model for the service's
+    /// measurement job: answered once the worker's expert bank has shrunk
+    /// to make it, with why it cannot, or released by
+    /// [`Self::release_measurement_room`] first. The bank grows nothing
+    /// until that release. One job claims at a time; a claim while one is
+    /// pending joins it.
+    pub async fn claim_measurement_room(&self, bytes: u64) -> Result<RoomAnswer, RequestError> {
+        let reply = {
+            let mut state = self.connection.state.lock().unwrap();
+            if let Some(error) = &state.closed {
+                return Err(error.clone());
+            }
+            let (reply, claim) = state.claim_room();
+            if let Some(claim) = claim {
+                // Sent under the state lock so the reply cannot arrive first.
+                self.connection.send(HostMessage::ClaimMeasurementRoom { claim, bytes })?;
+            }
+            reply
+        };
+        Self::wait(reply).await
+    }
+
+    /// The measurement job ended: the bank may grow into its room again. A
+    /// claim still pending is withdrawn.
+    pub fn release_measurement_room(&self) -> Result<(), RequestError> {
+        let mut state = self.connection.state.lock().unwrap();
+        state.release_room();
+        // Sent under the state lock, so a later claim follows it.
+        self.connection.send(HostMessage::ReleaseMeasurementRoom)
+    }
+
+    /// The measurement job stored new records: the worker prices its
+    /// experts again from what is stored.
+    pub fn reprice(&self) -> Result<(), RequestError> {
+        self.connection.send(HostMessage::Reprice)
     }
 
     /// Ask the worker to unload and exit. Open requests fail with
@@ -621,5 +701,30 @@ impl Drop for EngineRequest {
                 request_id: self.id,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magnitude_scheduler::protocol::RoomRefusal;
+
+    /// The answer to a claim released before it arrived answers no later
+    /// claim: only the answer naming the pending claim fulfils it.
+    #[test]
+    fn a_released_claims_answer_does_not_answer_a_later_claim() {
+        let mut state = State::default();
+        let (first, Some(released)) = state.claim_room() else { panic!("a new claim") };
+        state.release_room();
+        assert_eq!(first.lock().unwrap().value, Some(Ok(RoomAnswer::Released)));
+        let (second, Some(claim)) = state.claim_room() else { panic!("a new claim") };
+        assert_ne!(claim, released);
+        state.deliver(WorkerMessage::MeasurementRoom { claim: released, room: Ok(RoomAnswer::Made) }).unwrap();
+        assert_eq!(second.lock().unwrap().value, None, "the released claim's answer");
+        let (joined, None) = state.claim_room() else { panic!("a claim while one is pending joins it") };
+        let short = Ok(RoomAnswer::Refused(RoomRefusal::AtFloor { short: 1 }));
+        state.deliver(WorkerMessage::MeasurementRoom { claim, room: short.clone() }).unwrap();
+        assert_eq!(second.lock().unwrap().value, Some(short.clone()));
+        assert_eq!(joined.lock().unwrap().value, Some(short));
     }
 }

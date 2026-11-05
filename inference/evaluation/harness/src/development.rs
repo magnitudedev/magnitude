@@ -1,9 +1,10 @@
-//! The harness's development tuning tools (the engine's `pinned-tuning` and
-//! `tuning-survey` features, which only the harness enables; a served engine
-//! never carries them).
+//! The harness's development tuning tools (the executor's tuning pin, which
+//! only the harness installs, and the engine's `tuning-survey` feature,
+//! which only the harness enables; a served engine uses neither).
 //!
 //! - Pins: `--tuning-record FILE` records the configuration tuned per entry;
-//!   `--tuning-replay FILE` runs exactly those and tunes nothing;
+//!   an existing FILE is added to; `--tuning-replay FILE` runs exactly those
+//!   and tunes nothing, and its load asks for no search;
 //!   `--tuning-defaults` runs every entry's default configuration;
 //!   `--tuning-select TRACE` runs the configurations one load of a tuning
 //!   trace chose (`--tuning-select-load`, `--tuning-select-unit`) and writes
@@ -94,8 +95,10 @@ mod pin {
                     path.display()
                 );
                 pinned_tuning::install(TuningPin::Replay(configurations));
-            } else if args.tuning_record.is_some() {
-                pinned_tuning::install(TuningPin::Record);
+            } else if let Some(path) = &args.tuning_record {
+                // A later load of another shape adds to what is recorded.
+                let recorded = if path.exists() { read(path)? } else { Vec::new() };
+                pinned_tuning::install(TuningPin::Record(recorded));
             }
             Ok(Self {
                 record: args.tuning_record.clone(),

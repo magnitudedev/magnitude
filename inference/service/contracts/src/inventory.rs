@@ -623,6 +623,7 @@ pub enum HardwareReportedBy {
     WindowsTotalPhys,
     LinuxMemAvailable,
     MachMovablePages,
+    MachAllocatablePages,
     WindowsPhysicalAndCommit,
     CpuAddressSpace,
     MetalMaxBufferLength,

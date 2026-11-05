@@ -13,7 +13,9 @@
 //! such a unit places nothing and ends; the model's Prepare then runs to its
 //! end and its process is shown gone; and the load is started again, now
 //! total: a unit still without a record, because the Prepare was stopped,
-//! failed or could not run, is served at its canonical default.
+//! failed or could not run, is served at its canonical default. A load
+//! under a development pin that tunes nothing is total from the start: no
+//! Prepare runs for it.
 
 use super::client::prepare_worker;
 use super::protocol::{HostMessage, LoadProgress, WorkerMessage};
@@ -21,7 +23,7 @@ use super::transport::{FramedTransport, HostTransport};
 use crate::error::LoadError;
 use crate::execution::LoadAttempt;
 use crate::options::ExecutionManifest;
-use magnitude_executor::UnpreparedUnits;
+use magnitude_executor::{UnpreparedUnits, pinned_tuning};
 use std::io::BufReader;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 
@@ -51,8 +53,8 @@ pub enum WorkerReport {
 /// the load.
 #[derive(Debug)]
 pub enum Preparation {
-    /// The load found every tuning unit decided: nothing was started
-    /// besides it.
+    /// The load found every tuning unit decided, or a development pin
+    /// decides them: nothing was started besides it.
     Unneeded,
     /// The load met a unit without a record, the Prepare ran to its end,
     /// and the load that followed read its records.
@@ -91,6 +93,9 @@ where
     // Without a kernel cache a Prepare's records reach no load.
     if manifest.kernel_cache.is_none() {
         return Ok((serve_defaults(&mut load)?, Preparation::Unshared));
+    }
+    if pinned_tuning::tunes_nothing() {
+        return Ok((serve_defaults(&mut load)?, Preparation::Unneeded));
     }
     if let LoadAttempt::Loaded(loaded) = load(UnpreparedUnits::Report)? {
         return Ok((loaded, Preparation::Unneeded));

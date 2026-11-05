@@ -3,15 +3,15 @@
 
 use flate2::read::GzDecoder;
 use magnitude_engine::{
-    assessment::{AssessmentSetup, AssessmentStructure, Measurements, ModelPackagePaths, assess_model},
+    assessment::{ModelPackagePaths, assess_model},
     options::{ModelMethod, ModelPolicy, PROFILE_SEQUENCES, standard_service_limits},
 };
-use magnitude_executor::platform::{DeviceRequest, Fit, MemoryReserves, SelectedDevice};
-use seismic::BackendName;
+use magnitude_executor::platform::MemoryReserves;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+
+mod recorded;
 
 /// The system allocator, counting the bytes live through it.
 struct Counting;
@@ -107,54 +107,6 @@ fn packages(directory: &Path) -> Vec<(String, ModelPackagePaths)> {
         .collect()
 }
 
-/// The recorded M4 Pro (48 GB), its Metal executor selected, before any
-/// measurement.
-fn m4_pro_setup() -> AssessmentSetup {
-    let topology = Arc::new(seismic::fixtures::recorded::m4_pro());
-    let info = topology
-        .executors()
-        .iter()
-        .find(|executor| executor.backend() == BackendName::Metal)
-        .unwrap()
-        .clone();
-    let status = seismic::Status {
-        sample: seismic::Sample {
-            taken: std::time::SystemTime::now(),
-            host_ram: Ok(seismic::HostStatus {
-                headroom: seismic::Reported::new(0, seismic::ReportedBy::MachMovablePages),
-                limits: Vec::new(),
-                limit_visibility: seismic::LimitVisibility::Complete,
-                displacement: None,
-                kernel_pressure: None,
-            }),
-            volumes: Vec::new(),
-            executors: vec![info.id()],
-            grants: Vec::new(),
-        },
-        runtime: Default::default(),
-    };
-    let reserves = MemoryReserves::standard();
-    let assessment_capacity_bytes = Fit::new(&topology, &status, &reserves)
-        .placement(&info, seismic::StorageKind::Device)
-        .unwrap()
-        .stable_bytes;
-    AssessmentSetup {
-        structure: Arc::new(AssessmentStructure {
-            topology,
-            status,
-            device: DeviceRequest::Backend(BackendName::Metal),
-            selected: SelectedDevice {
-                info,
-                assessment_capacity_bytes,
-            },
-            reserves,
-            policy: ModelPolicy::default(),
-            service: standard_service_limits(),
-        }),
-        measurements: Measurements::Pending,
-    }
-}
-
 /// What an assessment keeps is the checked module and what it forms once
 /// per entry binding and geometry: assessing every fixture again keeps
 /// nothing more.
@@ -162,7 +114,8 @@ fn m4_pro_setup() -> AssessmentSetup {
 fn a_repeated_assessment_keeps_nothing() {
     let directory = tempfile::tempdir().unwrap();
     let packages = packages(directory.path());
-    let setup = m4_pro_setup();
+    let setup =
+        recorded::m4_pro_setup(MemoryReserves::standard(), ModelPolicy::default(), standard_service_limits());
     let mut passes = Vec::new();
     for pass in 0..2 {
         let started = std::time::Instant::now();

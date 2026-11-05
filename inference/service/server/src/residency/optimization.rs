@@ -327,7 +327,7 @@ async fn prepare(
         )?;
         let worker = Arc::clone(&spawned.worker);
         job.attach(Arc::clone(&worker));
-        let mut preparing = crate::spawn_blocking_traced({
+        let preparing = magnitude_service_utils::blocking::run({
             let manifest = manifest.clone();
             let progress = Arc::clone(&progress);
             let mut progression = OptimizationProgression::new(device.clone());
@@ -343,22 +343,16 @@ async fn prepare(
                 )
             }
         });
+        tokio::pin!(preparing);
         // A load wanting the device preempts the job: its worker is killed, and the load proceeds
         // once it is proven retired.
         let (prepared, preempted) = tokio::select! {
             prepared = &mut preparing => (prepared, false),
             () = preemption.preempted() => {
                 worker.terminate("preparation_preempted", "a load takes the device");
-                (preparing.await, true)
+                (preparing.as_mut().await, true)
             }
         };
-        let prepared = prepared.map_err(|error| {
-            ModelOperationFailure::new(
-                "worker_exited",
-                format!("worker preparation task failed: {error}"),
-                true,
-            )
-        })?;
         match prepared {
             Ok(WorkerPreparation::Prepared | WorkerPreparation::Unneeded) => {
                 return Ok(Preparation::Prepared);

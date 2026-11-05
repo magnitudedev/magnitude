@@ -567,6 +567,8 @@ pub trait ModelResidencyDriver: Clone + Send + Sync + 'static {
         resident: Self::Resident,
     );
     fn idle_timeout(&self) -> std::time::Duration;
+    /// The ready instance holding `resident` is idle (no lease holds it), or none is.
+    fn resident_idle(&self, resident: Option<(&ModelInstanceId, &Self::Resident)>);
 }
 
 pub struct ModelResidency<D: ModelResidencyDriver> {
@@ -581,6 +583,8 @@ pub struct ModelResidency<D: ModelResidencyDriver> {
         Vec<ModelPackageId>,
         tokio::sync::oneshot::Sender<Result<PackageRemovalPermit, InventoryError>>,
     )>,
+    /// The ready instance last published idle ([`ModelResidencyDriver::resident_idle`]).
+    idle: Option<ModelInstanceId>,
 }
 
 impl<D: ModelResidencyDriver> ModelResidency<D> {
@@ -594,6 +598,20 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             next_lease_token: 1,
             package_removal_active: false,
             package_removals: std::collections::VecDeque::new(),
+            idle: None,
+        }
+    }
+
+    /// Publish the ready instance's idleness once it changes: idle while no lease holds it.
+    fn publish_idle(&mut self) {
+        let idle = match &self.state {
+            ResidencyState::Ready(ready) if ready.resources.leases.is_empty() => Some(ready),
+            _ => None,
+        };
+        let instance = idle.map(|ready| ready.instance.id.clone());
+        if instance != self.idle {
+            self.controller.resident_idle(idle.map(|ready| (&ready.instance.id, &ready.resources.resident)));
+            self.idle = instance;
         }
     }
 
@@ -619,8 +637,10 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 () = idle => {}
             }
             self.idle_expired();
+            self.publish_idle();
         }
         self.shutdown();
+        self.publish_idle();
     }
 
     fn handle(&mut self, command: ResidencyCommand<D::Resident>) {
@@ -918,6 +938,11 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
     ) -> ResidencyLease<D::Resident> {
         let token = self.next_lease_token;
         self.next_lease_token = self.next_lease_token.saturating_add(1);
+        // The instance stops being idle before the lease is handed out, so nothing measured
+        // beside it starts once its holder could be served.
+        if self.idle.take().is_some() {
+            self.controller.resident_idle(None);
+        }
         ready.resources.leases.insert(token);
         ready.idle_deadline = None;
         ResidencyLease {
@@ -1684,6 +1709,21 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// A load's allocation holding nothing, without an expert bank.
+    fn allocation(context_window_tokens: u32) -> ModelInstanceAllocation {
+        ModelInstanceAllocation {
+            context_window_tokens,
+            memory_domains: Vec::new(),
+            prompt_group_places: magnitude_service_contracts::models::PromptGroupPlacesParts {
+                held: std::num::NonZeroU64::MIN,
+                capacity: std::num::NonZeroU64::MIN,
+            }
+            .try_into()
+            .unwrap(),
+            streaming: None,
+        }
+    }
+
     fn test_configuration(model_id: &str) -> ModelServingConfiguration {
         ModelServingConfiguration {
             bundle: ServableModelBundle::Standalone {
@@ -1759,6 +1799,8 @@ mod tests {
         auto_ready: bool,
         workers: Arc<Mutex<Vec<Arc<TestResidencyWorker>>>>,
         idle_timeout: std::time::Duration,
+        /// Every idleness published, in order.
+        idles: Arc<Mutex<Vec<Option<TestResident>>>>,
     }
 
     #[derive(Default)]
@@ -1844,10 +1886,7 @@ mod tests {
                         instance_id,
                         Ok(PreparedResidency {
                             package_ids: Vec::new(),
-                            allocation: ModelInstanceAllocation {
-                                context_window_tokens: 1,
-                                memory_domains: Vec::new(),
-                            },
+                            allocation: allocation(1),
                             device: test_device(),
                             worker,
                             resident: model_id.to_string(),
@@ -1892,6 +1931,10 @@ mod tests {
         fn idle_timeout(&self) -> std::time::Duration {
             self.idle_timeout
         }
+
+        fn resident_idle(&self, resident: Option<(&ModelInstanceId, &TestResident)>) {
+            self.idles.lock().unwrap().push(resident.map(|(_, resident)| resident.clone()));
+        }
     }
 
     fn test_residency(
@@ -1924,9 +1967,53 @@ mod tests {
             auto_ready,
             workers: Arc::clone(&workers),
             idle_timeout,
+            idles: Arc::default(),
         };
         let actor = tokio::spawn(ModelResidency::new(driver).run(inbox));
         (client, load_events, workers, actor)
+    }
+
+    /// The ready instance is published idle while no lease holds it, and no longer once one does
+    /// or it stops: what a measurement beside it runs in, and is preempted by.
+    #[tokio::test]
+    async fn the_ready_instance_is_published_idle_while_no_lease_holds_it() {
+        let (client, inbox) = ResidencyClient::channel();
+        let (loads, _loads) = tokio::sync::mpsc::unbounded_channel();
+        let idles = Arc::new(Mutex::new(Vec::new()));
+        let driver = TestResidencyDriver {
+            client: client.clone(),
+            next_instance_id: Arc::new(AtomicU64::new(1)),
+            loads,
+            auto_ready: true,
+            workers: Arc::default(),
+            idle_timeout: std::time::Duration::from_secs(600),
+            idles: Arc::clone(&idles),
+        };
+        let _actor = tokio::spawn(ModelResidency::new(driver).run(inbox));
+        let published = || idles.lock().unwrap().clone();
+        let ResidencyGrant::Lease(lease) = client
+            .acquire(test_target("model-a"), ResidencyAcquisition::Inference { progress: None })
+            .await
+            .expect("inference acquisition")
+        else {
+            panic!("an inference acquisition is leased")
+        };
+        let instance = lease.instance_id().clone();
+        let resident = lease.resident().clone();
+        client.snapshot().await.unwrap();
+        assert!(published().is_empty(), "a leased instance is not idle");
+        drop(lease);
+        client.snapshot().await.unwrap();
+        assert_eq!(published(), [Some(resident.clone())]);
+        let lease = client.lease(instance.clone()).await.unwrap();
+        assert_eq!(
+            published(),
+            [Some(resident), None],
+            "a request ends its idleness before it holds the lease"
+        );
+        drop(lease);
+        client.stop(instance).await.unwrap();
+        assert_eq!(published().last(), Some(&None), "a stopped instance is not idle");
     }
 
     fn assert_explicit_stop(result: Result<ResidencyGrant<TestResident>, InventoryError>) {
@@ -1972,10 +2059,7 @@ mod tests {
         };
         assert_eq!(*device, test_device());
 
-        let observed = ModelInstanceAllocation {
-            context_window_tokens: 2,
-            memory_domains: Vec::new(),
-        };
+        let observed = allocation(2);
         client
             .notifier()
             .send(ResidencyNotification::AllocationObserved {

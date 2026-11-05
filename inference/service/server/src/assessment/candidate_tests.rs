@@ -3308,7 +3308,7 @@ fn search_shapes_agree_with_engine_fingerprints() {
         ) else {
             continue;
         };
-        let fingerprint = crate::assessment::assessor::model_fingerprint(fingerprint);
+        let fingerprint = crate::assessment::assessor::model_fingerprint(&fingerprint);
         let shape = ModelShape::from_header_prefix(&header)
             .unwrap_or_else(|| panic!("{} has a shape", fixture.name));
         assert!(shape.matches(&fingerprint), "{}: {shape:?} {fingerprint:?}", fixture.name);
@@ -3981,6 +3981,7 @@ async fn live_fixture_reaching(
         directory.path().join("kernels"),
         magnitude_executor::platform::MemoryReserves::standard(),
         crate::assessment::environment::ServingDevice::of(seismic::ExecutorSelector::HostCpu),
+        Default::default(),
     );
     LiveFixture {
         _directory: directory,

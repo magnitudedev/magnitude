@@ -149,9 +149,8 @@ pub async fn props(
     Path(model_id): Path<String>,
 ) -> Result<Json<PropsResponse>, ApiError> {
     let host = state.models.host(&model_id).await.map_err(ApiError::from)?;
-    let properties = tokio::task::spawn_blocking(move || host.properties())
+    let properties = magnitude_service_utils::blocking::run(move || host.properties())
         .await
-        .map_err(|error| ApiError::server(format!("properties task failed: {error}")))?
         .map_err(ApiError::from)?;
     Ok(Json(props_response(properties).map_err(ApiError::from)?))
 }

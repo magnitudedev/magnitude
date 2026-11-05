@@ -135,7 +135,8 @@ impl WorkerLauncher {
         command
             .arg(role.subcommand())
             .env("MAGNITUDE_OTEL", "0")
-            .env("RUST_LOG", "error")
+            // The engine's own reports stay on the stream the service keeps.
+            .env("RUST_LOG", "error,magnitude_engine=info,magnitude_executor=info,magnitude_scheduler=info")
             .env_remove("MAGNITUDE_OTEL_ENDPOINT")
             .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
             .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")

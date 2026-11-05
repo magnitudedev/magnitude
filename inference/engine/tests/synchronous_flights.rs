@@ -38,6 +38,7 @@ fn each_run_reconciles_at_most_one_cpu_flight() {
         decode_tokens: 16,
         decode_share: 0.5,
         locality_seconds: 1.0,
+        conversations: std::num::NonZeroUsize::MIN,
     };
     let resolved = EngineConfiguration {
         package: PackageOptions {
@@ -53,6 +54,7 @@ fn each_run_reconciles_at_most_one_cpu_flight() {
             lookahead: false,
             exported_logits_rows: 0,
             numerical_profile: None,
+            weight_cap: None,
         },
         context_tokens: Some(1024),
         service: limits.clone(),

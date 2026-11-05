@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::Context as _;
 use axum::extract::MatchedPath;
 use axum::http::{HeaderMap, Request};
+use magnitude_engine::telemetry::log_filter;
 use opentelemetry::global;
 use opentelemetry::logs::LogRecord as _;
 use opentelemetry::propagation::Extractor;
@@ -61,7 +62,7 @@ pub fn init(export: bool) -> anyhow::Result<TelemetryGuard> {
 
     let Some(endpoints) = export.then(otlp_endpoints).flatten() else {
         tracing_subscriber::registry()
-            .with(stderr_layer())
+            .with(stderr_layer()?)
             .try_init()
             .context("failed to install ICN tracing subscriber")?;
         return Ok(TelemetryGuard {
@@ -120,11 +121,11 @@ pub fn init(export: bool) -> anyhow::Result<TelemetryGuard> {
 
     let trace_layer = tracing_opentelemetry::layer()
         .with_tracer(tracer)
-        .with_filter(otel_filter());
-    let log_layer = OpenTelemetryTracingBridge::new(&logger_provider).with_filter(otel_filter());
+        .with_filter(otel_filter()?);
+    let log_layer = OpenTelemetryTracingBridge::new(&logger_provider).with_filter(otel_filter()?);
 
     tracing_subscriber::registry()
-        .with(stderr_layer())
+        .with(stderr_layer()?)
         .with(trace_layer)
         .with(log_layer)
         .try_init()
@@ -186,33 +187,30 @@ pub fn http_request_span<B>(request: &Request<B>) -> Span {
 
 /// The engine worker's subscriber: events to standard error only, without colour, since
 /// the service records each line in its own log.
-pub fn init_worker() {
-    let _ = tracing_subscriber::fmt()
+pub fn init_worker() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
         .with_writer(Redacted(std::io::stderr))
         .with_ansi(false)
-        .with_env_filter(runtime_filter())
-        .try_init();
+        .with_env_filter(log_filter().map_err(anyhow::Error::msg)?)
+        .try_init()
+        .map_err(|error| anyhow::anyhow!("failed to install the worker's tracing subscriber: {error}"))
 }
 
-fn stderr_layer<S>() -> impl tracing_subscriber::Layer<S>
+fn stderr_layer<S>() -> anyhow::Result<impl tracing_subscriber::Layer<S>>
 where
     S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
 {
-    tracing_subscriber::fmt::layer()
+    Ok(tracing_subscriber::fmt::layer()
         .with_writer(Redacted(std::io::stderr))
         .with_thread_names(true)
-        .with_filter(runtime_filter())
+        .with_filter(log_filter().map_err(anyhow::Error::msg)?))
 }
 
-fn runtime_filter() -> EnvFilter {
-    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
-}
-
-fn otel_filter() -> EnvFilter {
-    runtime_filter()
+fn otel_filter() -> anyhow::Result<EnvFilter> {
+    Ok(log_filter().map_err(anyhow::Error::msg)?
         .add_directive("opentelemetry=off".parse().expect("valid directive"))
         .add_directive("reqwest=off".parse().expect("valid directive"))
-        .add_directive("hyper=off".parse().expect("valid directive"))
+        .add_directive("hyper=off".parse().expect("valid directive")))
 }
 
 fn otlp_endpoints() -> Option<OtlpEndpoints> {
