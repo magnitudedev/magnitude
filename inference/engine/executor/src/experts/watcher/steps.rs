@@ -47,10 +47,11 @@ pub(crate) enum StepFailure {
     /// demand read left the served file with no read line): it serves no
     /// request again, so the load completes no step.
     Watcher(String),
-    /// The step spanned a late beat of its load's pulse (`exchange::Pulse`):
-    /// a wait of its may have ended before its answer, so its outputs are
-    /// not to be used and its seeds are never mapped, but its inputs are
-    /// whole: it is to be re-run from its accepted state. The load goes on.
+    /// A wait of the step ended on its still pulse before its answer
+    /// (`exchange::Pulse`, which its kernel recorded: `Parks::expired`), so
+    /// its outputs are not to be used and its seeds are never mapped, but
+    /// its inputs are whole: it is to be re-run from its accepted state.
+    /// The load goes on.
     Interrupted(String),
 }
 
@@ -170,10 +171,9 @@ struct State {
     /// tail's, `Shared::window`): (layer, first). A request of such a layer
     /// names its rows within the window.
     windows: BTreeMap<Step, (usize, usize)>,
-    /// Steps that spanned a late beat of the load's pulse
-    /// (`Pulse::late_beats`): a wait of theirs may have ended before its
-    /// answer, so their seeds are never mapped (`Core::advance`). Kept until
-    /// residency is past their group.
+    /// Steps a wait of which ended on its still pulse before its answer
+    /// (`Parks::expired`), so their seeds are never mapped
+    /// (`Core::advance`). Kept until residency is past their group.
     tainted: BTreeSet<Step>,
 }
 
@@ -264,7 +264,7 @@ impl Steps {
     /// its pulse came late: the load's report of its starved host.
     pub(in crate::experts) fn interruptions(&self) -> String {
         format!(
-            "steps interrupted by a late pulse and re-run: {} ({} late beats)",
+            "steps interrupted by a wait ending on a still pulse and re-run: {} ({} late beats)",
             self.interrupted.load(Ordering::Acquire),
             self.pulse.late_beats()
         )
@@ -755,7 +755,6 @@ impl Shared {
                 shared: self.clone(),
                 launch: None,
                 recorded: None,
-                late: self.steps.pulse().late_beats(),
             };
             admission.remaining -= 1;
             admission.next += 1;
@@ -788,8 +787,6 @@ pub(crate) struct ExpertStep {
     /// (`Telemetry::samples`), decided as it begins; none of a step not
     /// sampled.
     sampled: Option<Arc<[ExpertLines]>>,
-    /// Its load's pulse's late beats as it began (`Pulse::late_beats`).
-    late: u64,
 }
 
 /// How a step's load records its misses: its decode counted, and, where the
@@ -923,12 +920,12 @@ impl ExpertStep {
                 ),
             )
         });
-        // A step that spanned a late beat of its load's pulse may have had a
-        // wait end before its answer: it is interrupted, to be re-run.
-        if self.spanned_a_late_beat() {
+        // A step a wait of which ended on its still pulse ran on without
+        // that answer: it is interrupted, to be re-run.
+        if self.expired() {
             shared.steps.interrupted.fetch_add(1, Ordering::AcqRel);
             return Err(StepFailure::Interrupted(format!(
-                "the host's pulse beat late during step {}: a wait of its may have ended before its answer",
+                "a wait of step {} ended on its still pulse before its answer (the host's pulse beat late)",
                 self.sequence
             )));
         }
@@ -958,11 +955,12 @@ impl ExpertStep {
 
 impl Drop for ExpertStep {
     /// The step has ended: it is no longer in flight, and a failure of it
-    /// no consumer took is forgotten. One that spanned a late beat of the
-    /// host's pulse is tainted first, so its seeds are never mapped,
-    /// whether or not anything took its outputs.
+    /// no consumer took is forgotten. One a wait of which ended on its still
+    /// pulse is tainted first, so its seeds are never mapped, whether or not
+    /// anything took its outputs: the device is past it, as every exit
+    /// drains its issued work first ([`Self::expired`]).
     fn drop(&mut self) {
-        if self.spanned_a_late_beat() {
+        if self.expired() {
             self.shared.steps.lock().tainted.insert(self.sequence);
         }
         self.shared.end_step(self.sequence);
@@ -970,11 +968,15 @@ impl Drop for ExpertStep {
 }
 
 impl ExpertStep {
-    /// Whether a beat of its load's pulse may have come late since the step
-    /// began (`Pulse::late_since`): a wait of its may have ended before its
-    /// answer.
-    fn spanned_a_late_beat(&self) -> bool {
-        self.shared.steps.pulse().late_since(self.late)
+    /// Whether a wait of the step ended on its still pulse before its
+    /// answer (`Parks::expired`), read once the device is past the step: as
+    /// it completes, or as it drops, by whichever exit; the device runs
+    /// nothing of a step once it has ended, since its submission's owner
+    /// drains the work it issued before releasing the step (this module's
+    /// rule), and a step never queued requested nothing, so none of its
+    /// waits stored an expiry.
+    fn expired(&self) -> bool {
+        self.shared.parks.expired(self.sequence)
     }
 }
 

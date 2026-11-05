@@ -118,6 +118,21 @@ impl ExchangeTable {
         self.words.update_u64(self.at(step, lane, constants::SLOT_ANSWER), |held| (held & !FAILED < step).then_some(value))
     }
 
+    /// Whether `step`'s wait on lane `lane` ended on its still pulse, before
+    /// its answer: the waiting kernel stored the step as the lane's
+    /// SLOT_EXPIRED as it gave up (`streaming_await_slot`), which nothing
+    /// else writes. Read once the device is past the step.
+    pub(crate) fn expired(&self, step: u64, lane: u64) -> bool {
+        self.words.load_u64(self.at(step, lane, constants::SLOT_EXPIRED)) == step
+    }
+
+    /// End `step`'s wait on lane `lane` on its still pulse, as its kernel
+    /// does (`streaming_await_slot`): for a test that plays the device.
+    #[cfg(test)]
+    pub(crate) fn expire(&self, step: u64, lane: u64) {
+        self.words.store_u64(self.at(step, lane, constants::SLOT_EXPIRED), step);
+    }
+
     /// Slot `slot`'s lane `lane` as it holds them, its request's step and
     /// its answer: what a reader with no step at hand reads (a pool watching
     /// its slots, a watchdog).

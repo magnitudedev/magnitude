@@ -1120,6 +1120,13 @@ impl Harness {
         self.hint_at(step, layer, 0, experts);
     }
 
+    /// Play `step`'s tier wait at layer `layer` ending on its still pulse,
+    /// as its kernel does when the host's pulse stood still past its
+    /// patience.
+    pub(super) fn expire(&self, step: &ExpertStep, layer: usize) {
+        self.layers[layer].1.expire(step.sequence(), 0);
+    }
+
     /// Play layer `layer`'s ring row of lead `lead` hinting `experts` of
     /// the layer `lead + 1` ahead in `step`: a row each, its one choice
     /// (rank 0) at the harness's one choice a row.

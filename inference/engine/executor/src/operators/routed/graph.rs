@@ -1038,7 +1038,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
         _ => None,
     };
     let routed = match combine {
-        Some((layer, site, (BankCombineEntry::General { project, sited }, site_dimensions), ports)) => {
+        Some((layer, mut site, (BankCombineEntry::General { project, sited }, site_dimensions), ports)) => {
             let (policy, whole) = (ports.policy, magnitude_kernels::constants::POLICY_WHOLE);
             let resident = graph
                 .enqueue_under(down, &down_dimensions, resident_args(), &policy, whole, LaunchEncoding::WhileSet)?
@@ -1070,7 +1070,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                         sources: (&reads.sources).into(),
                         weights: route_weights.tensor().into(),
                         step: ports.step.tensor().into(),
-                        site: site.table.tensor().into(),
+                        site: site.table.tensor_mut().into(),
                         site_output: site.output.tensor().into(),
                     },
                     &policy,

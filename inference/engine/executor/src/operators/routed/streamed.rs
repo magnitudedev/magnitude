@@ -594,7 +594,7 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
             &dimensions,
             routed_tier_wait::WorkflowArgs {
                 step: step.tensor().into(),
-                file: file.tensor().into(),
+                file: file.tensor_mut().into(),
                 sources: (&mut *sources).into(),
                 grid: grid.into(),
                 policy: policy.tensor().into(),

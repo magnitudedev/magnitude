@@ -19,11 +19,11 @@
 // Thread `tid` of `threads`' wait and its choices' sources: `file` the
 // layer's file table (strides `file0`, `file1`), `sources0`..`sources2` the
 // route's sources' strides; `step` the step pair.
-STREAMING_FN void streaming_tier_wait(STREAMING_DEVICE_READ step, u64 step0, STREAMING_SYSTEM_READ file, u64 file0,
+STREAMING_FN void streaming_tier_wait(STREAMING_DEVICE_READ step, u64 step0, STREAMING_SYSTEM_WORDS file, u64 file0,
     u64 file1, STREAMING_DEVICE_WORDS sources, u64 sources0, u64 sources1, u64 sources2, u32 tid,
     u32 threads STREAMING_WORDS_PARAM) {
     const u64 q = streaming_step(step, step0);
-    STREAMING_SYSTEM_READ slot = STREAMING_AT(file, (q % u64(SEISMIC_DIM_FLIGHT)) * file0);
+    STREAMING_SYSTEM_WORDS slot = STREAMING_AT(file, (q % u64(SEISMIC_DIM_FLIGHT)) * file0);
     const bool answered = streaming_await_slot(slot, file1, q);
     const u32 K = u32(SEISMIC_DIM_K);
     const u32 count = u32(streaming_load(STREAMING_AT(slot, SEISMIC_CONST_FILE_COUNT * file1)));

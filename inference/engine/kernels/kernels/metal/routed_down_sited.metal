@@ -18,7 +18,7 @@ kernel void routed_down_sited(
     device const int *sources [[buffer(SEISMIC_BUFFER_SOURCES)]],
     device const float *weights [[buffer(SEISMIC_BUFFER_WEIGHTS)]],
     device const int *step [[buffer(SEISMIC_BUFFER_STEP)]],
-    SYSTEM const int *site [[buffer(SEISMIC_BUFFER_SITE)]],
+    SYSTEM int *site [[buffer(SEISMIC_BUFFER_SITE)]],
     SYSTEM const float *site_output [[buffer(SEISMIC_BUFFER_SITE_OUTPUT)]],
     device uchar *value [[buffer(SEISMIC_RESULT_0_BUFFER)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],

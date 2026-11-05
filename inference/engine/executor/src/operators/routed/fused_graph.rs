@@ -766,7 +766,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
             _ => None,
         };
         let output = match combine {
-            Some((layer, site, (BankCombineEntry::Fused { project, sited }, site_dimensions), ports)) => {
+            Some((layer, mut site, (BankCombineEntry::Fused { project, sited }, site_dimensions), ports)) => {
                 let (policy, whole) = (ports.policy, magnitude_kernels::constants::POLICY_WHOLE);
                 let resident = graph
                     .enqueue_under(handle.output, &dimensions, resident_args(), &policy, whole, LaunchEncoding::WhileSet)?
@@ -802,7 +802,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                             scores: scores.tensor().into(),
                             coefficient: (&coefficient).into(),
                             step: ports.step.tensor().into(),
-                            site: site.table.tensor().into(),
+                            site: site.table.tensor_mut().into(),
                             site_output: site.output.tensor().into(),
                         },
                         &policy,

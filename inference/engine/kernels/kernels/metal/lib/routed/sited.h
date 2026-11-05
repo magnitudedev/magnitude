@@ -22,7 +22,7 @@ struct PublishedProjections {
 
 // Whether the CPU answered step `q`'s request at `slot`, the step's slot of
 // the site table, `ready` the group's word. Every thread calls it.
-inline bool site_answered(device const int *sources, SYSTEM const int *slot, ulong q, threadgroup int *ready, uint tid,
+inline bool site_answered(device const int *sources, SYSTEM int *slot, ulong q, threadgroup int *ready, uint tid,
     constant ulong *seismic_words) {
     if (tid == 0) {
         const uint choices = uint(SEISMIC_DIM_M) * uint(SEISMIC_DIM_K);

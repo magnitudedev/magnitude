@@ -48,15 +48,15 @@ fn a_watcher_panic_fails_every_request_and_step() {
 }
 
 /// A beat of the load's pulse that comes later than any wait's patience
-/// (its host starved) may have let a live host's wait end before its
-/// answer, which the host cannot see: every step that spans one is
-/// interrupted (to be re-run), a prompt step's seeds are never mapped (its
-/// seed copy may have read what its wait never had answered), and the load
-/// goes on: the next step completes, and the next prompt step seeds the
-/// same experts afresh. A shorter stall, which no wait outlasts, interrupts
-/// nothing.
+/// (its host starved) lets a live host's spinning wait end before its
+/// answer, which its kernel records (SLOT_EXPIRED): the step of a wait that
+/// ended so is interrupted (to be re-run), a prompt step's seeds are never
+/// mapped (its seed copy may have read what its wait never had answered),
+/// and the load goes on: the next step completes, and the next prompt step
+/// seeds the same experts afresh. A shorter stall, which no wait outlasts,
+/// interrupts nothing, nor does a late beat no wait of the step outlasted.
 #[test]
-fn a_step_spanning_a_late_pulse_is_interrupted_and_the_load_goes_on() {
+fn a_step_whose_wait_outlasted_a_still_pulse_is_interrupted_and_the_load_goes_on() {
     let harness = prompted("late pulse", EXPERTS, 4);
     let shared = harness.watcher.shared();
     let pulse = shared.steps.pulse();
@@ -70,16 +70,18 @@ fn a_step_spanning_a_late_pulse_is_interrupted_and_the_load_goes_on() {
     let before = pulse.late_beats();
     pulse.beat_after(Duration::from_millis(4 * constants::PULSE_SPINS as u64 * 70 / 1_000_000));
     assert_eq!(pulse.late_beats(), before + 1, "the late beat was never counted");
+    // Its wait at layer 0 outlasted the still pulse, as its kernel records.
+    harness.expire(&step, 0);
     let sequence = step.sequence();
     match step.complete() {
         Err(StepFailure::Interrupted(reason)) => assert!(reason.contains("pulse"), "{reason}"),
-        outcome => panic!("a step spanning a late beat completed {:?}", outcome.map(|_| ())),
+        outcome => panic!("a step whose wait expired completed {:?}", outcome.map(|_| ())),
     }
     // The load goes on: a step begun after the beat completes, and the
     // starved step's seeds were never mapped, so a prompt step seeds the
     // same experts afresh.
     assert_eq!(shared.steps.ending(sequence), crate::experts::directory::Ending::Tainted, "the starved step is tainted");
-    let counted = |steps: u64| format!("steps interrupted by a late pulse and re-run: {steps} (");
+    let counted = |steps: u64| format!("steps interrupted by a wait ending on a still pulse and re-run: {steps} (");
     assert!(shared.steps.interruptions().starts_with(&counted(1)), "{}", shared.steps.interruptions());
     assert!(harness.request(&[1]).complete().is_ok(), "the next step completes");
     eventually("residency never passed the starved step", || shared.steps.ending(sequence) != crate::experts::directory::Ending::Tainted);
@@ -93,6 +95,10 @@ fn a_step_spanning_a_late_pulse_is_interrupted_and_the_load_goes_on() {
     pulse.beat_after(Duration::from_millis(constants::PULSE_SPINS as u64 * 70 / 2_000_000));
     assert_eq!(pulse.late_beats(), before, "a short stall counted as late");
     assert!(step.complete().is_ok(), "a step spanning a short stall is interrupted");
+    // A late beat no wait of the step outlasted interrupts nothing either.
+    let step = harness.request(&[2]);
+    pulse.beat_after(Duration::from_millis(4 * constants::PULSE_SPINS as u64 * 70 / 1_000_000));
+    assert!(step.complete().is_ok(), "a step no wait of which expired is interrupted");
     assert!(shared.steps.interruptions().starts_with(&counted(1)), "{}", shared.steps.interruptions());
 }
 

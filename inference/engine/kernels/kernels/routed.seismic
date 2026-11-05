@@ -2273,7 +2273,7 @@ fn routed_down_project[M, H, E, K, F, TR](product: &tensor[M, K, F] A, routes: &
 
 fn routed_down_sited[M, H, K, FLIGHT, SW](base: &tensor[M, H] f32,
     published: &tensor[M, K, H] A, sources: &tensor[SOURCE_ROWS, M, K] i32, weights: &tensor[M, K] f32,
-    step: &tensor[STEP_WORDS] i32, site: &await tensor[FLIGHT, SW] i32,
+    step: &tensor[STEP_WORDS] i32, site: &await mut tensor[FLIGHT, SW] i32,
     site_output: &await tensor[FLIGHT, DECODE_ROWS, H] f32) -> tensor[M, H] R
     where FLIGHT > 0 and M <= DECODE_ROWS and SW % 2 == 0 and SW >= SLOT_PAYLOAD:
     let mut value = tensor[M, H] R
@@ -2300,7 +2300,7 @@ fn routed_output_project[M, H, E, K, F, S, TR](expert_product: &tensor[M, K, F] 
 fn routed_output_sited[M, H, SN, IN, K, FLIGHT, SW](residual: &tensor[M, SN * H] f32,
     inject: &tensor[M, IN] f32, published: &tensor[M, K + 1, H] A, sources: &tensor[SOURCE_ROWS, M, K] i32,
     scores: &tensor[M, K] f32, coefficient: &tensor[M] f32,
-    step: &tensor[STEP_WORDS] i32, site: &await tensor[FLIGHT, SW] i32,
+    step: &tensor[STEP_WORDS] i32, site: &await mut tensor[FLIGHT, SW] i32,
     site_output: &await tensor[FLIGHT, DECODE_ROWS, H] f32) -> tensor[M, SN * H] f32
     where IN >= 0 and ((IN == 0 and SN == 1) or (IN == SN and SN >= 1)) and FLIGHT > 0 and M <= DECODE_ROWS and SW % 2 == 0 and SW >= SLOT_PAYLOAD:
     let mut value = tensor[M, SN * H] f32
@@ -2349,7 +2349,7 @@ const CONVERT_TILE_ROWS = 16
 # (`routed_convert`), which the host writes before it answers: the park is
 # its writer, so those converts run after the wait on every backend, not only
 # where launches keep submission order.
-fn routed_tier_wait[M, K, FW, FLIGHT, LW](step: &tensor[STEP_WORDS] i32, file: &await tensor[FLIGHT, FW] i32,
+fn routed_tier_wait[M, K, FW, FLIGHT, LW](step: &tensor[STEP_WORDS] i32, file: &await mut tensor[FLIGHT, FW] i32,
     sources: &mut tensor[SOURCE_ROWS, M, K] i32, grid: &tensor[3] i32,
     policy: &tensor[POLICY_WORDS] i32, landing: &host mut tensor[LW] i32)
     where FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * M * K and FW % 2 == 0 and FLIGHT > 0:

@@ -127,6 +127,14 @@ impl ParkLayer {
             ParkKind::Site => self.site.as_ref().map(|site| (site, 0, false)),
         }
     }
+
+    /// Whether a wait of `step`'s at this layer ended on its still pulse,
+    /// before its answer ([`ExchangeTable::expired`]): its tier wait's,
+    /// any round's, or its sited combine's.
+    fn expired(&self, step: u64) -> bool {
+        let lanes = |table: &ExchangeTable| (0..table.table().lanes()).any(|lane| table.expired(step, lane));
+        lanes(&self.file) || lanes(&self.scratch) || self.site.as_ref().is_some_and(lanes)
+    }
 }
 
 /// A registered park: its value, its step and its site.
@@ -195,6 +203,14 @@ pub(crate) struct Parks {
 }
 
 impl Parks {
+    /// Whether a wait of `step`'s, at any streamed layer, ended on its still
+    /// pulse before its answer: the one way a live host's step can run on
+    /// without an answer (`exchange::Pulse`), which the waiting kernel
+    /// records. Read once the device is past the step.
+    pub(super) fn expired(&self, step: u64) -> bool {
+        self.layers.iter().any(|layer| layer.expired(step))
+    }
+
     pub(in crate::experts) fn new(timeline: seismic::Timeline, layers: Vec<ParkLayer>, events: Arc<Events>) -> Self {
         Self {
             events,

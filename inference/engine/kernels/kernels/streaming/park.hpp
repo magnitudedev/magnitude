@@ -15,12 +15,14 @@
 // watchdog's to abort). A wait that spins also ends, as on its failure,
 // once its slot's SLOT_PULSE, which the host advances while it lives, has
 // stood still for PULSE_SPINS spins (streaming_words.seismic): a host that
-// is gone leaves no kernel spinning. A wait answered at its first look
-// reads no pulse; one that spins reads it once every STREAMING_PULSE_READ
-// spins, by the acquire load its answer takes, and counts the spins
-// between in full. A live host's late pulse (the host's loaded) can end a
-// wait too: the host then interrupts the step, which is re-run from its
-// accepted state (`exchange::Pulse`).
+// is gone leaves no kernel spinning. A wait that ends so stores its step as
+// the slot's SLOT_EXPIRED, the one word the device writes for the host to
+// learn it, and the host interrupts exactly that step. A wait answered at
+// its first look reads no pulse; one that spins reads it once every
+// STREAMING_PULSE_READ spins, by the acquire load its answer takes, and
+// counts the spins between in full. A live host's late pulse (the host's
+// loaded) can end a wait too: the host then interrupts the step, which is
+// re-run from its accepted state (`exchange::Pulse`).
 
 #define STREAMING_PULSE_READ 64
 
@@ -29,7 +31,7 @@
 // or a spinning wait's host is gone. True when the slot holds q's answer:
 // neither its failure nor no request, nor a wait whose host is gone. One
 // thread calls it.
-STREAMING_FN bool streaming_await_slot(STREAMING_SYSTEM_READ slot, u64 stride, u64 q) {
+STREAMING_FN bool streaming_await_slot(STREAMING_SYSTEM_WORDS slot, u64 stride, u64 q) {
     const u64 failed = q | (u64(u32(SEISMIC_CONST_SLOT_FAILED)) << 32);
 #if SEISMIC_PARKS_IN_KERNELS
     int pulse = 0;
@@ -46,8 +48,10 @@ STREAMING_FN bool streaming_await_slot(STREAMING_SYSTEM_READ slot, u64 stride, u
             if (spins == 0 || now != pulse) {
                 pulse = now;
                 still = 0;
-            } else if ((still += STREAMING_PULSE_READ) >= u32(SEISMIC_CONST_PULSE_SPINS))
+            } else if ((still += STREAMING_PULSE_READ) >= u32(SEISMIC_CONST_PULSE_SPINS)) {
+                streaming_store_u64_release(STREAMING_AT(slot, SEISMIC_CONST_SLOT_EXPIRED * stride), q);
                 return false;
+            }
         }
 #else
         return false;

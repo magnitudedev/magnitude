@@ -21,7 +21,7 @@
         const u64 site_step = ROUTED_SITE_STEP;                                                            \
         site_answered = streaming_site_any(sources, SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1,    \
                             SEISMIC_SOURCES_STRIDE_2, (unsigned)(SEISMIC_DIM_M * SEISMIC_DIM_K)) &&        \
-            streaming_await_slot(reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_SITE)) +         \
+            streaming_await_slot(reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_SITE)) +               \
                                      (site_step % (u64)SEISMIC_DIM_FLIGHT) * SEISMIC_SITE_STRIDE_0,        \
                 SEISMIC_SITE_STRIDE_1, site_step);                                                         \
     }                                                                                                      \

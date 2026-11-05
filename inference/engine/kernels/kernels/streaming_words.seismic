@@ -124,6 +124,8 @@ const POLICY_WORDS = 11
 #   leaves it), so a late answer never overwrites a later step's;
 # - SLOT_PULSE, an i32 the host's pulse advances every PULSE_MS while the
 #   host lives (below), in every slot of every table;
+# - SLOT_EXPIRED, a u64: the step whose wait on the slot ended on its still
+#   pulse before its answer, stored by that waiting kernel alone (below);
 # - from SLOT_PAYLOAD, the kind's payload (each kind below).
 # The one wait rule, every wait's on every backend (`slot_answered` in
 # routed.seismic, which the device's `streaming_await_slot` and the host's
@@ -145,10 +147,11 @@ const POLICY_WORDS = 11
 # moved for PULSE_SPINS of its spins: at least 100 ms at the fastest spin
 # measured (70 ns, an idle M4 Pro), under a second at the slowest (535 ns).
 # A live host meets that end only if its pulse starves for that long (a
-# loaded machine): every step that spans such a late beat is then
-# interrupted, its outputs unused and its seeds never mapped, and re-run
-# from its accepted state (the scheduler's round driver); a shorter stall
-# touches nothing. How long a live host's answer may take is the
+# loaded machine): the wait then stores its step as the slot's SLOT_EXPIRED,
+# and the host interrupts that step, its outputs unused and its seeds never
+# mapped, and re-runs it from its accepted state (the scheduler's round
+# driver); a late beat no wait outlasted, or a shorter stall, touches
+# nothing. How long a live host's answer may take is the
 # watchdog's alone (its bound from the load's lines).
 #
 # How a backend waits is the backend's one fact (`SEISMIC_PARKS_IN_KERNELS`,
@@ -162,7 +165,8 @@ const POLICY_WORDS = 11
 const SLOT_REQUEST = 0
 const SLOT_ANSWER = 2
 const SLOT_PULSE = 4
-const SLOT_PAYLOAD = 5
+const SLOT_EXPIRED = 6
+const SLOT_PAYLOAD = 8
 # The failure bit of an answer, bit 63: bit 31 of its high word.
 const SLOT_FAILED = 2147483648
 # The host's pulse period, and the spins a wait sees its pulse still before
@@ -188,8 +192,8 @@ const PULSE_SPINS = 1500000
 # A step with no CPU entry requests nothing and waits for nothing. The
 # combine adds the output on the step's answer, and nothing on its failure
 # (the host fails exactly the rows that named a failed expert).
-const SITE_COUNT = 5
-const SITE_ENTRIES = 6
+const SITE_COUNT = 8
+const SITE_ENTRIES = 9
 const SITE_ROW = 0
 const SITE_TIER_RECORD = 1
 const SITE_EXPERT = 2
@@ -218,8 +222,8 @@ const SOURCE_ROWS = 2
 # memory, where the host lands into the bank; a tier record t as -2 - t
 # across a link; -1 for a failed read). A step with no absent choice
 # requests nothing.
-const FILE_COUNT = 5
-const FILE_ENTRIES = 6
+const FILE_COUNT = 8
+const FILE_ENTRIES = 9
 const FILE_CHOICE = 0
 const FILE_RECORD = 1
 const FILE_ENTRY_WORDS = 2
@@ -247,8 +251,8 @@ const DECODE_GRIDS = 1
 #   them.
 const SCRATCH_ASK = 0
 const SCRATCH_ROUND = 1
-const SCRATCH_STAGED = 5
-const SCRATCH_SLOT = 6
+const SCRATCH_STAGED = 8
+const SCRATCH_SLOT = 10
 
 # ---------------------------------------------------------------------------
 # The rest of expert streaming's words.

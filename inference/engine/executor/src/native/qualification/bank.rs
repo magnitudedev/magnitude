@@ -128,7 +128,7 @@ pub(super) fn qualify_bank(
     .into_iter()
     .chain(others)
     .collect::<Vec<_>>();
-    let file = words(&table.extents(), &request, entry)?;
+    let mut file = words(&table.extents(), &request, entry)?;
     let count = binding.selected;
     // Its sources: none for the GPU, none the CPU's, so the landed choice
     // is the GPU's, served in place.
@@ -140,7 +140,7 @@ pub(super) fn qualify_bank(
     tier_wait
         .call_answered(routed_tier_wait::Args {
             step: &step,
-            file: &file,
+            file: &mut file,
             sources: &mut sources,
             grid: &wait_grid,
             policy: &policy,

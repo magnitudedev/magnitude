@@ -509,6 +509,8 @@ fn a_running_steps_seeds_wait_for_its_end_and_a_tainted_ones_are_never_mapped() 
     harness.scratch(&step, 1, &[]);
     let map = &harness.layers[0].0;
     assert!(map.held(3).is_none() && map.held(4).is_none(), "a running step's seeds were mapped");
+    // A wait of the step outlasted the still pulse, as its kernel records.
+    harness.expire(&step, 1);
     assert!(matches!(step.complete(), Err(StepFailure::Interrupted(_))));
     let next = harness.step();
     harness.request_at(&next, 0, &[1]);

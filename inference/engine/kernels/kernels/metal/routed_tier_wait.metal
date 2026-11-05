@@ -8,7 +8,7 @@
 
 kernel void routed_tier_wait(
     device const int *step [[buffer(SEISMIC_BUFFER_STEP)]],
-    SYSTEM const int *file [[buffer(SEISMIC_BUFFER_FILE)]],
+    SYSTEM int *file [[buffer(SEISMIC_BUFFER_FILE)]],
     device int *sources [[buffer(SEISMIC_BUFFER_SOURCES)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint tid [[thread_index_in_threadgroup]],

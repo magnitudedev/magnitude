@@ -17,7 +17,7 @@ kernel void routed_output_sited(
     device const float *scores [[buffer(SEISMIC_BUFFER_SCORES)]],
     device const float *coefficient [[buffer(SEISMIC_BUFFER_COEFFICIENT)]],
     device const int *step [[buffer(SEISMIC_BUFFER_STEP)]],
-    SYSTEM const int *site [[buffer(SEISMIC_BUFFER_SITE)]],
+    SYSTEM int *site [[buffer(SEISMIC_BUFFER_SITE)]],
     SYSTEM const float *site_output [[buffer(SEISMIC_BUFFER_SITE_OUTPUT)]],
     device float *value [[buffer(SEISMIC_RESULT_0_BUFFER)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],

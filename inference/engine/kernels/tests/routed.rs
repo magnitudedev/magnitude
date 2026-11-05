@@ -6465,6 +6465,7 @@ const DEAD_HOST: &str = "MAGNITUDE_TEST_DEAD_HOST";
 /// wait returned.
 const WAITING: &str = "dead host: waiting";
 const RETURNED: &str = "dead host: its wait returned";
+const EXPIRED: &str = "dead host: its wait stored its expiry";
 
 /// A live host's long wait is answered, not given up: its pulse beats
 /// throughout (the acquire load the wait reads it by sees each beat), so a
@@ -6483,7 +6484,7 @@ fn a_live_hosts_long_wait_is_answered() {
     let (table, words) = file_words(1, q, &[0], &[], None);
     let wait = routed_tier_wait::native_for_device(&device, &one_choice_tier_wait(&device)).unwrap();
     let step = i32_tensor(&device, &[constants::STEP_WORDS], &step_words(q));
-    let file = shared_i32(&device, &table.extents(), &words);
+    let mut file = shared_i32(&device, &table.extents(), &words);
     let mut sources = i32_tensor(&device, &[constants::SOURCE_ROWS, 1, 1], &[-1; constants::SOURCE_ROWS as usize]);
     let grid = i32_tensor(&device, &[3], &[1, 1, 1]);
     let policy = shared_i32(&device, &[constants::POLICY_WORDS], &[0; constants::POLICY_WORDS as usize]);
@@ -6498,7 +6499,7 @@ fn a_live_hosts_long_wait_is_answered() {
             answerer.store_release(4 * (slot + SlotTable::file_entry(0) + constants::FILE_RECORD), 5).unwrap();
             answerer.store_release(4 * (slot + constants::SLOT_ANSWER), q as u32).unwrap();
         });
-        wait.call(routed_tier_wait::Args { step: &step, file: &file, sources: &mut sources, grid: &grid, policy: &policy, landing: &mut shared_i32(&device, &[1], &[0]) }).unwrap();
+        wait.call(routed_tier_wait::Args { step: &step, file: &mut file, sources: &mut sources, grid: &grid, policy: &policy, landing: &mut shared_i32(&device, &[1], &[0]) }).unwrap();
     });
     assert!(answered.elapsed() >= std::time::Duration::from_secs(2), "the wait returned before its answer");
     assert_eq!(read_i32(&sources), magnitude_kernels::source_words(&[5], &[-1]), "the wait returned the answer");
@@ -6597,8 +6598,10 @@ fn dead_hosts_wait_ends(death: &str) {
         "kill" => host.kill().unwrap(),
         "stall" => {
             let returned = await_line(RETURNED, std::time::Duration::from_secs(5));
+            let expired = returned && await_line(EXPIRED, std::time::Duration::from_secs(1));
             host.kill().unwrap();
             assert!(returned, "the host's wait did not return within 5 s of its pulse stopping");
+            assert!(expired, "the host's wait returned without storing its expiry");
         }
         _ => {}
     }
@@ -6666,7 +6669,7 @@ fn dead_host(death: &str) -> ! {
     let (table, words) = file_words(1, q, &[0], &[], None);
     let wait = routed_tier_wait::native_for_device(&device, &one_choice_tier_wait(&device)).unwrap();
     let step = i32_tensor(&device, &[constants::STEP_WORDS], &step_words(q));
-    let file = shared_i32(&device, &table.extents(), &words);
+    let mut file = shared_i32(&device, &table.extents(), &words);
     let mut sources = i32_tensor(&device, &[constants::SOURCE_ROWS, 1, 1], &[-1; constants::SOURCE_ROWS as usize]);
     let grid = i32_tensor(&device, &[3], &[1, 1, 1]);
     let policy = shared_i32(&device, &[constants::POLICY_WORDS], &[0; constants::POLICY_WORDS as usize]);
@@ -6689,8 +6692,13 @@ fn dead_host(death: &str) -> ! {
         });
     }
     println!("{WAITING}");
-    let returned = wait.call(routed_tier_wait::Args { step: &step, file: &file, sources: &mut sources, grid: &grid, policy: &policy, landing: &mut shared_i32(&device, &[1], &[0]) });
+    let returned = wait.call(routed_tier_wait::Args { step: &step, file: &mut file, sources: &mut sources, grid: &grid, policy: &policy, landing: &mut shared_i32(&device, &[1], &[0]) });
     println!("{RETURNED} {:?}", returned.map(|_| ()));
+    // A wait that ended on its still pulse stores its step as its slot's
+    // SLOT_EXPIRED, by which the live host interrupts exactly that step.
+    if file.load_acquire_u64(4 * (table.lane(q, 0) + constants::SLOT_EXPIRED)).unwrap() == q {
+        println!("{EXPIRED}");
+    }
     loop {
         std::thread::park();
     }

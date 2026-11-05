@@ -11,11 +11,13 @@
 //! least patience (PULSE_SPINS spins at the fastest spin measured, 105 ms),
 //! so a beat that comes later than that less one period ([`late`]: the
 //! host starved, a loaded machine) is the only way a live host's wait can
-//! end before its answer: it is counted ([`Pulse::late_beats`]), and every
-//! step of the load that spans one is interrupted, its seeds never mapped
-//! (`ExpertStep`, `Core::advance`), and re-run from its accepted state
-//! (the scheduler's round driver). A stall shorter than that touches
-//! nothing, and so does any while no table lives: no wait reads the pulse.
+//! end before its answer: it is counted ([`Pulse::late_beats`]), and a wait
+//! that does end so stores its step as its slot's SLOT_EXPIRED, by which
+//! the host interrupts exactly that step, its seeds never mapped
+//! (`ExpertStep`, `Core::advance`), and re-runs it from its accepted state
+//! (the scheduler's round driver). A late beat no wait was spinning
+//! through interrupts nothing, nor does a shorter stall, nor any while no
+//! table lives: no wait reads the pulse.
 //! A test that plays the device itself drives its pulse
 //! ([`Pulse::driven`]), so a late beat is its input, never its host's load.
 //! Where parks are submission boundaries (Vulkan,
@@ -139,7 +141,7 @@ impl Beating {
             late_beats.fetch_add(1, Ordering::AcqRel);
             tracing::warn!(
                 "the exchange's pulse beat {gap:?} after its last beat, past {:?}, within a beat of the device's least patience; \
-                 every step in flight is interrupted and re-run.",
+                 a step whose wait ended meanwhile is interrupted and re-run.",
                 late()
             );
         }
@@ -192,22 +194,9 @@ impl Pulse {
         Self { inner: Arc::new(Inner { beating: Mutex::new(beating), changed: Condvar::new(), late: AtomicU64::new(0) }) }
     }
 
-    /// How many beats have come late ([`late`]), as a step begins.
+    /// How many beats have come late ([`late`]) since the pulse was made.
     pub(crate) fn late_beats(&self) -> u64 {
         self.inner.late.load(Ordering::Acquire)
-    }
-
-    /// Whether a beat may have come late since `late_beats` (a step's
-    /// begin's [`Self::late_beats`]): one came late since, or its thread
-    /// has not beaten a live table for longer than [`late`] now (starved,
-    /// its late beat not yet counted). No wait ends before its pulse stood
-    /// still that long, and none reads a pulse no thread beats (no table
-    /// lives), so a step for which this is false had no wait end before
-    /// its answer.
-    pub(crate) fn late_since(&self, late_beats: u64) -> bool {
-        let beating = self.inner.beating.lock().expect("a pulse never panics");
-        let starved = matches!(beating.beater, Beater::Running) && beating.beaten.elapsed() > late();
-        self.late_beats() != late_beats || starved
     }
 
     /// `words` (laid out as `table`) joined to the pulse, beaten at once and
