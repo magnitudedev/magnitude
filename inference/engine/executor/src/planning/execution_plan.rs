@@ -230,7 +230,8 @@ impl ExecutionPlanDraft {
     /// on, and what a tool asks the job for before a load. The one
     /// derivation of the plan's sites: the kernels of the load's backend
     /// that serve one (`BankSite::served`), its form, and `profile`'s
-    /// requirement of it. By layer of the bank; none without one.
+    /// requirement of it (`site_requirement`: none where it approves no CPU
+    /// site). By layer of the bank; none without one.
     pub fn site_requests(
         &self,
         profile: &crate::ResolvedNumericalProfile,
@@ -253,8 +254,9 @@ impl ExecutionPlanDraft {
                     return Ok(None);
                 }
                 let form = crate::native::SiteForm::of(slot);
-                let requirement = profile.requirement_of(form.activation.dtype());
-                Ok(Some(crate::assessment::SiteRequest::of(&binding, form, requirement)))
+                Ok(profile
+                    .site_requirement(form.activation.dtype())
+                    .map(|requirement| crate::assessment::SiteRequest::of(&binding, form, requirement)))
             })
             .collect()
     }

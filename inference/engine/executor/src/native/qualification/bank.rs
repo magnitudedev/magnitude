@@ -52,7 +52,9 @@ const RECORDS: u64 = 2;
 ///
 /// Where the layer is sited (`ExpertBankKernels::site`), its site's verdict
 /// under `requirement` as the measurement job stored it in `cache`
-/// (`site::site_verdict`), which runs nothing; else none.
+/// (`site::site_verdict`), which runs nothing, or its refusal where the
+/// profile approves no CPU site (no `requirement`), which reads no verdict;
+/// else none.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn qualify_bank(
     device: &Device,
@@ -61,7 +63,7 @@ pub(super) fn qualify_bank(
     kernels: &ExpertBankKernels,
     feed_forward: &AttestedFeedForward,
     rows: SublayerRows,
-    requirement: &seismic::NumericalRequirement,
+    requirement: Option<&seismic::NumericalRequirement>,
     cache: Option<&crate::kernel_cache::KernelCache>,
 ) -> Result<Option<crate::assessment::Priced<()>>, CatalogFailure> {
     let label = format!("{banked:?} {binding:?}");
@@ -372,7 +374,10 @@ pub(super) fn qualify_bank(
         Served::General { binding, kernels, .. } => qualify_general_routed(device, *binding, kernels, &reads)?,
     }
 
-    Ok(site.as_ref().map(|site| super::site::site_verdict(device, &binding, site.form, requirement, cache)))
+    Ok(site.as_ref().map(|site| match requirement {
+        Some(requirement) => super::site::site_verdict(device, &binding, site.form, requirement, cache),
+        None => crate::assessment::Priced::Unavailable("the numerical profile approves no CPU site".into()),
+    }))
 }
 
 /// A streamed layer's routed form: its binding, its resident entries and its
@@ -1093,7 +1098,7 @@ mod tests {
             &kernels,
             &AttestedFeedForward::Routed(resident),
             SublayerRows::SINGLE,
-            &ResolvedNumericalProfile::standard().requirement_of(None),
+            Some(&ResolvedNumericalProfile::standard().requirement_of(None)),
             None,
         )
         .unwrap();
@@ -1257,7 +1262,7 @@ mod tests {
             &kernels,
             &AttestedFeedForward::GeneralRouted(resident),
             SublayerRows::SINGLE,
-            requirement.unwrap_or(&ResolvedNumericalProfile::standard().requirement_of(None)),
+            Some(requirement.unwrap_or(&ResolvedNumericalProfile::standard().requirement_of(None))),
             None,
         )
         .unwrap();

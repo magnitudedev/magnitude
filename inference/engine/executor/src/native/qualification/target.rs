@@ -572,8 +572,8 @@ impl<'a> QualificationView<'a> {
             let admission = match qualified.entry((banked, binding, rows)) {
                 std::collections::hash_map::Entry::Occupied(admission) => admission.get().clone(),
                 std::collections::hash_map::Entry::Vacant(vacant) => {
-                    let requirement = self.profile.requirement_of(bank.site.as_ref().and_then(|site| site.form.activation.dtype()));
-                    let admission = super::bank::qualify_bank(device, banked, binding, bank, feed_forward, rows, &requirement, self.cache)?;
+                    let requirement = self.profile.site_requirement(bank.site.as_ref().and_then(|site| site.form.activation.dtype()));
+                    let admission = super::bank::qualify_bank(device, banked, binding, bank, feed_forward, rows, requirement.as_ref(), self.cache)?;
                     vacant.insert(admission).clone()
                 }
             };

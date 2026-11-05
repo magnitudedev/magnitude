@@ -237,8 +237,9 @@ pub enum LayerSite {
     Pending,
     /// The layer's entries serve a site, but its qualification refused it
     /// (why: the precision system refused its CPU arithmetic against the
-    /// reference, or the pool failed its request): the layer has no site
-    /// and reads every miss over the link.
+    /// reference, the pool failed its request, or the numerical profile
+    /// approves no CPU site): the layer has no site and reads every miss
+    /// over the link.
     Refused(String),
     /// The layer can hold no site (no host tier across a link, or a backend
     /// without the site's entries).

@@ -1388,10 +1388,11 @@ impl AttestedPrograms {
             tuning.cache,
         )
         .qualify(device)?;
-        // A layer whose site's arithmetic the precision system refuses
-        // has no CPU site: nothing of it is served, encoded or charged, and
-        // its refusal is kept (`LayerSite::Refused`). One whose verdict the
-        // job has not stored keeps its site unadmitted.
+        // A layer whose site's arithmetic the precision system refuses, or
+        // whose profile approves no CPU site, has no CPU site: nothing of it
+        // is served, encoded or charged, and its refusal is kept
+        // (`LayerSite::Refused`). One whose verdict the job has not stored
+        // keeps its site unadmitted.
         for (block, admission) in admitted {
             let block = &mut attested.target.blocks[block];
             if let Some(bank) = block.bank.as_mut() {

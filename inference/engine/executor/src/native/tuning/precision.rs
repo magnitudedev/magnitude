@@ -1,19 +1,36 @@
 //! The caller's numerical requirement for a load: α, how many rounding steps
 //! of floating storage a configuration may move a kernel's output from its
-//! default's. There are no per-operation tolerances and no precision
-//! declarations.
+//! default's, and whether a streamed load's misses may be computed on the
+//! CPU, in its own arithmetic. There are no per-operation tolerances and no
+//! precision declarations.
 use seismic::{BoundEntry, Entry, Limit, NumericalRequirement};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NumericalProfile {
+    /// The standard α ([`STANDARD_ALPHA`]) unless the profile states one.
+    #[serde(default = "standard_alpha")]
     pub alpha: Limit,
+    /// Whether a streamed layer's CPU site may compute its misses: its
+    /// arithmetic is admitted against α by its own qualification. Without,
+    /// no site verdict is requested or used and every miss is the device's.
+    #[serde(default = "approved")]
+    pub cpu_sites: bool,
+}
+
+fn standard_alpha() -> Limit {
+    STANDARD_ALPHA
+}
+
+fn approved() -> bool {
+    true
 }
 
 /// A checked profile.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedNumericalProfile {
     alpha: f64,
+    cpu_sites: bool,
 }
 
 /// The standard α: set to admit every technique with a measured effect on
@@ -57,6 +74,15 @@ impl ResolvedNumericalProfile {
     pub(crate) fn requirement_of(&self, activation: Option<seismic::DType>) -> NumericalRequirement {
         NumericalRequirement::RoundingSteps { alpha: self.alpha, activation: activation.filter(|dtype| dtype.is_float()) }
     }
+
+    /// What a streamed layer's CPU site, whose pool computes in
+    /// `activation`, is held to under this profile ([`Self::requirement_of`]);
+    /// none where the profile approves no CPU site
+    /// ([`NumericalProfile::cpu_sites`]), so no verdict is requested or read
+    /// and every miss is the device's.
+    pub(crate) fn site_requirement(&self, activation: Option<seismic::DType>) -> Option<NumericalRequirement> {
+        self.cpu_sites.then(|| self.requirement_of(activation))
+    }
 }
 
 impl NumericalProfile {
@@ -64,6 +90,7 @@ impl NumericalProfile {
     pub fn standard() -> Self {
         Self {
             alpha: STANDARD_ALPHA,
+            cpu_sites: true,
         }
     }
 
@@ -73,6 +100,7 @@ impl NumericalProfile {
         }
         Ok(ResolvedNumericalProfile {
             alpha: self.alpha.get(),
+            cpu_sites: self.cpu_sites,
         })
     }
 }
@@ -85,11 +113,16 @@ mod tests {
     fn profiles_resolve_to_their_alpha_and_refuse_a_nonpositive_one() {
         let looser = NumericalProfile {
             alpha: Limit::from_finite(16.5),
+            cpu_sites: true,
         };
         assert_eq!(looser.resolve().unwrap().alpha(), 16.5);
-        assert!(NumericalProfile { alpha: Limit::ZERO }.resolve().is_err());
+        assert!(NumericalProfile { alpha: Limit::ZERO, cpu_sites: true }.resolve().is_err());
         let parsed: NumericalProfile = serde_json::from_str(r#"{"alpha":0.5}"#).unwrap();
         assert_eq!(parsed.resolve().unwrap().alpha(), 0.5);
+        assert!(parsed.resolve().unwrap().site_requirement(None).is_some(), "a profile approves CPU sites unless it says otherwise");
+        let unsited: NumericalProfile = serde_json::from_str(r#"{"cpu_sites":false}"#).unwrap();
+        assert_eq!(unsited, NumericalProfile { cpu_sites: false, ..NumericalProfile::standard() });
+        assert_eq!(unsited.resolve().unwrap().site_requirement(None), None);
         assert_eq!(
             ResolvedNumericalProfile::standard(),
             &NumericalProfile::standard().resolve().unwrap()

@@ -2503,6 +2503,7 @@ fn a_stored_record_is_served_under_another_alpha_without_forming_or_measuring() 
         let case = FakeCase::new(&implementation, &statics, "implementation a");
         let profile = super::precision::NumericalProfile {
             alpha: seismic::Limit::new(alpha).unwrap(),
+            cpu_sites: true,
         }
         .resolve()
         .unwrap();

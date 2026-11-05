@@ -53,6 +53,11 @@ none is enforced by admission.
 If measurement shows a value of α costs more quality than is acceptable, the remedy is a different
 α or a different generic yardstick, not per-model allowances or a correction inside admission.
 
+Beside α, the profile states whether a streamed load's CPU site may compute its misses. The site's
+arithmetic is admitted against α by its own qualification, never against a device's output; a
+profile that approves no site requests and uses no verdict, so every miss is the device's, which
+is how evaluation shows that nothing but the site's arithmetic differs on a discrete device.
+
 ## Why magnitude, structure and dependence matter
 
 For one fixed rendered input, let δᵢ be the error introduced at operation i, including any state
