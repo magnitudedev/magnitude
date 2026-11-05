@@ -616,8 +616,9 @@ mod tests {
     }
 
     /// In an emergency a job on the device gives way first: its start preempts the job once,
-    /// and the model is spared while the job is ending, then killed once the system refuses to
-    /// show the job gone. Jobs stay held off until memory recovers.
+    /// and the model is spared while the job is ending, however many ticks its reap takes, then
+    /// killed once the system refuses the job's kill or reap. Jobs stay held off until memory
+    /// recovers.
     #[test]
     fn an_emergency_preempts_the_devices_job_before_the_model() {
         let mut fixture = fixture();
@@ -632,10 +633,12 @@ mod tests {
         assert!(!worker.terminated.load(Ordering::Acquire), "the model is kept while the job gives way");
         assert!(fixture.notifications.try_recv().is_err());
         assert!(futures_util::FutureExt::now_or_never(preemption.preempted()).is_some(), "the job is preempted");
-        // The job is still ending: the emergency's next tick spares the model again, and
-        // preempts the job no more.
-        fixture.inner.tick(start);
-        assert!(!worker.terminated.load(Ordering::Acquire), "a job still ending spares the model");
+        // The job is still being reaped: every tick of the emergency spares the model again,
+        // and preempts the job no more.
+        for tick in 1..=3 {
+            fixture.inner.tick(start + RESIDENT_SAMPLE_INTERVAL * tick);
+            assert!(!worker.terminated.load(Ordering::Acquire), "a job still being reaped spares the model");
+        }
         assert!(futures_util::FutureExt::now_or_never(preemption.preempted()).is_none(), "the job is preempted once");
         // The system will not show the job gone: it frees nothing, and the model is killed.
         job.unretired();

@@ -74,10 +74,11 @@ struct Sharing {
 /// A job holding the device, as far as host memory pressure reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HeldJob {
-    /// Running, or giving way: its process is being shown gone.
+    /// Running, or giving way: its process is being killed and reaped, freeing what it holds
+    /// until the reap returns, however long that takes.
     Live,
-    /// The system would not show its process gone ([`DeviceJob::unretired`]): it keeps the
-    /// device until it does, and gives no memory back meanwhile.
+    /// The system refused its kill or its reap ([`DeviceJob::unretired`]): it keeps the device
+    /// until a retry shows it gone, and gives no memory back meanwhile.
     Unretired,
 }
 
@@ -167,9 +168,9 @@ impl DeviceJob {
         }
     }
 
-    /// The system would not show the job's process gone: it keeps the device until it does,
-    /// and a host memory emergency spares the resident model for it no longer
-    /// ([`DeviceLock::job_giving_way`]).
+    /// The system refused the job's process its kill or its reap: it keeps the device until a
+    /// retry shows it gone, and a host memory emergency spares the resident model for it no
+    /// longer ([`DeviceLock::job_giving_way`]).
     pub fn unretired(&self) {
         self.sharing.send_if_modified(|sharing| {
             let marked = sharing.job == Some(HeldJob::Live);
@@ -253,7 +254,7 @@ pub enum DeviceHold {
 }
 
 impl DeviceHold {
-    /// The system would not show the worker's process gone: a job's hold says so
+    /// The system refused the worker's process its kill or its reap: a job's hold says so
     /// ([`DeviceJob::unretired`]); a load's share is no job's.
     pub fn unretired(&self) {
         if let Self::Job(job) = self {
@@ -349,9 +350,9 @@ impl DeviceLock {
         preempted
     }
 
-    /// Whether a job holds the device that is still giving way, its process not yet refused
-    /// gone by the system ([`DeviceJob::unretired`]): while one does, host memory pressure
-    /// waits for what it frees before taking a model.
+    /// Whether a job holds the device that is still giving way, running or being killed and
+    /// reaped, its kill or reap not refused by the system ([`DeviceJob::unretired`]): while one
+    /// does, host memory pressure waits for what it frees before taking a model.
     pub fn job_giving_way(&self) -> bool {
         self.sharing.borrow().job == Some(HeldJob::Live)
     }

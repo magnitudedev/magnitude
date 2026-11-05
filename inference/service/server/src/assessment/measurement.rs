@@ -107,10 +107,9 @@ pub trait JobProcess: Send + 'static {
     /// Return once the process is gone. One that `reported` its outcome is given
     /// [`GRACEFUL_EXIT`](crate::residency::controller::GRACEFUL_EXIT) to exit on its own, as a
     /// reported Prepare is; any other is killed. Blocking. A process whose end the system will
-    /// not show comes back with why ([`crate::residency::worker::RETIREMENT_RETRY`]). Once a kill
-    /// is delivered and the process is not yet shown gone, `unretired` is called: its hold gives
-    /// way to host memory pressure no longer, however long the reap takes.
-    fn retire(self: Box<Self>, reported: bool, unretired: &dyn Fn()) -> Result<(), (Box<dyn JobProcess>, std::io::Error)>;
+    /// not show comes back with why ([`crate::residency::worker::RETIREMENT_RETRY`]); until
+    /// then, a killed process is still freeing what it holds, however long its reap takes.
+    fn retire(self: Box<Self>, reported: bool) -> Result<(), (Box<dyn JobProcess>, std::io::Error)>;
     /// The process's recent standard error, for a lost job's report.
     fn diagnostics(&self) -> String;
 }
@@ -209,7 +208,7 @@ impl MeasuredMachine for ServiceMachine {
                 let _ = frames.blocking_send(JobFrame::Finished(outcome));
             });
         if let Err(error) = reader {
-            worker.retire(false, || {}).map_err(|(_, error)| error)?;
+            worker.retire(false).map_err(|(_, error)| error)?;
             return Err(error.into());
         }
         Ok(StartedJob {
@@ -232,8 +231,8 @@ impl MeasuredMachine for ServiceMachine {
 }
 
 impl JobProcess for JobWorker {
-    fn retire(self: Box<Self>, reported: bool, unretired: &dyn Fn()) -> Result<(), (Box<dyn JobProcess>, std::io::Error)> {
-        JobWorker::retire(*self, reported, unretired)
+    fn retire(self: Box<Self>, reported: bool) -> Result<(), (Box<dyn JobProcess>, std::io::Error)> {
+        JobWorker::retire(*self, reported)
             .map(drop)
             .map_err(|(worker, error)| (Box::new(worker) as Box<dyn JobProcess>, error))
     }
@@ -604,7 +603,7 @@ async fn run_job<M: MeasuredMachine>(
     // The device is released only once the process is proven gone, however long the kernel takes
     // to reap it, so no load or request starts beside a job still holding memory. The hold moves
     // with the retirement: a dropped wait detaches it, and the device stays held until it ends.
-    // A process the system will not show gone keeps the device, gives way to host memory
+    // A process whose kill or reap the system refused keeps the device, gives way to host memory
     // pressure no longer (`DeviceJob::unretired`), and is tried again every
     // [`RETIREMENT_RETRY`], or at once when the device is wanted meanwhile, its outcome
     // standing until it is shown gone. Its failure to end is no failure of the job.
@@ -613,8 +612,8 @@ async fn run_job<M: MeasuredMachine>(
     loop {
         let (process, exclusive) = retiring;
         let retired = magnitude_service_utils::blocking::run(move || {
-            // Its kill delivered and the process not yet shown gone, the job gives way no longer.
-            let retired = process.retire(reported, &|| exclusive.unretired());
+            // Until the system refuses to show the process gone, the job is giving way.
+            let retired = process.retire(reported);
             match retired {
                 Ok(()) => {
                     // The device is released: a waiting share proceeds.
@@ -809,7 +808,7 @@ mod tests {
     }
 
     impl JobProcess for RecordedProcess {
-        fn retire(self: Box<Self>, reported: bool, _: &dyn Fn()) -> Result<(), (Box<dyn JobProcess>, std::io::Error)> {
+        fn retire(self: Box<Self>, reported: bool) -> Result<(), (Box<dyn JobProcess>, std::io::Error)> {
             *self.retired.lock().unwrap() = Some(reported);
             Ok(())
         }
@@ -865,7 +864,7 @@ mod tests {
     }
 
     impl JobProcess for RefusingProcess {
-        fn retire(self: Box<Self>, reported: bool, _: &dyn Fn()) -> Result<(), (Box<dyn JobProcess>, std::io::Error)> {
+        fn retire(self: Box<Self>, reported: bool) -> Result<(), (Box<dyn JobProcess>, std::io::Error)> {
             *self.retired.lock().unwrap() = Some(reported);
             match self.refusals.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1)) {
                 Ok(_) => Err((self, std::io::Error::other("the system will not show the process gone"))),

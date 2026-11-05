@@ -73,7 +73,8 @@ fn log_exit(pid: u32, status: ExitStatus) {
 enum ProcessState {
     Owned {
         process: BlockingProcess,
-        /// Dropping it with the owner releases the device; a stop marks it unretired ([`stop`]).
+        /// Dropping it with the owner releases the device; a stop the system refuses marks it
+        /// unretired ([`DeviceHold::unretired`]).
         device: DeviceHold,
     },
     Retired(ExitStatus),
@@ -197,9 +198,10 @@ impl EngineWorker {
         match &mut *state {
             ProcessState::Retired(status) => Ok(*status),
             ProcessState::Owned { process, device } => {
-                // An error leaves the exact owner in place. Only proof of retirement replaces it.
+                // An error leaves the exact owner in place, its device marked unretired. Only proof
+                // of retirement replaces it.
                 let pid = process_id(process);
-                let status = stop(process, || device.unretired())?;
+                let status = stop(process).inspect_err(|_| device.unretired())?;
                 log_exit(pid, status);
                 *state = ProcessState::Retired(status);
                 Ok(status)
@@ -287,7 +289,7 @@ impl JobWorker {
             diagnostics: Arc::new(Mutex::new(DiagnosticTail::default())),
         };
         if let Err(error) = drain_diagnostics(stderr, Arc::clone(&worker.diagnostics), pid) {
-            worker.retire(false, || {}).map_err(|(_, error)| error)?;
+            worker.retire(false).map_err(|(_, error)| error)?;
             return Err(error.into());
         }
         let transport = FramedTransport::new(std::io::BufReader::new(stdout), stdin);
@@ -308,16 +310,15 @@ impl JobWorker {
 
     /// Return once the process is proven gone. One that `reported` its outcome is left to exit
     /// on its own ([`reported_exit`]); any other, or one that has not exited by then, is
-    /// stopped, calling `unretired` once its kill is delivered and the system does not yet show
-    /// it gone ([`stop`]). Blocking. One whose end the system will not show comes back with why,
+    /// stopped ([`stop`]). Blocking. One whose end the system will not show comes back with why,
     /// still holding all it holds ([`RETIREMENT_RETRY`]).
-    pub fn retire(mut self, reported: bool, unretired: impl FnOnce()) -> Result<ExitStatus, (Self, std::io::Error)> {
+    pub fn retire(mut self, reported: bool) -> Result<ExitStatus, (Self, std::io::Error)> {
         let pid = process_id(&self.process);
         let exited = match reported {
             true => reported_exit(|| observe_exit(&mut self.process)),
             false => Ok(None),
         };
-        let status = match exited.and_then(|exited| exited.map_or_else(|| stop(&mut self.process, unretired), Ok)) {
+        let status = match exited.and_then(|exited| exited.map_or_else(|| stop(&mut self.process), Ok)) {
             Ok(status) => status,
             Err(error) => return Err((self, error)),
         };
@@ -401,7 +402,7 @@ impl Drop for EngineWorker {
             .name(format!("inference-worker-reap-{pid}"))
             .spawn(move || {
                 let status = loop {
-                    match stop(&mut process, || device.unretired()) {
+                    match stop(&mut process) {
                         Ok(status) => break status,
                         Err(error) => {
                             tracing::error!(worker.pid = pid, %error, "an ownerless inference worker could not be shown to have ended; trying again");
@@ -531,30 +532,21 @@ fn start_kill(process: &mut BlockingProcess) -> std::io::Result<()> {
     process.start_kill()
 }
 
-/// Stop `process` and return once it is reaped, however long that takes. Once its kill is
-/// delivered, one look that does not show it gone calls `unretired`: its owner gives way no
-/// longer (`DeviceJob::unretired`), so a reap that hangs without an error spares nothing
-/// beyond that look.
+/// Stop `process` and return once it is reaped, however long that takes: a killed process is
+/// still freeing what it holds until then, so its owner gives way meanwhile. Only an error, a
+/// kill or a reap the system refused, is a process the system will not show gone, which its
+/// owner marks unretired (`DeviceJob::unretired`).
 #[cfg(unix)]
-fn stop(process: &mut BlockingProcess, unretired: impl FnOnce()) -> std::io::Result<ExitStatus> {
+fn stop(process: &mut BlockingProcess) -> std::io::Result<ExitStatus> {
     if let Some(status) = process.try_wait()? {
         return Ok(status);
     }
     process.kill()?;
-    if let Some(status) = process.try_wait()? {
-        return Ok(status);
-    }
-    unretired();
     process.wait()
 }
 
 #[cfg(windows)]
-fn stop(process: &mut BlockingProcess, unretired: impl FnOnce()) -> std::io::Result<ExitStatus> {
-    process.start_kill()?;
-    if let Some(status) = process.try_retirement()? {
-        return Ok(status);
-    }
-    unretired();
+fn stop(process: &mut BlockingProcess) -> std::io::Result<ExitStatus> {
     process.retire()
 }
 
