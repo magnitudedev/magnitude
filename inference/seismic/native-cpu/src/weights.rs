@@ -616,7 +616,8 @@ pub trait Format: Copy + Send + Sync + 'static {
     /// [`dot_q8_rows`] of `out.len()` rows from `first` against one
     /// activation row, every 16 a tile,
     /// written into `out` where the format has a whole-tile form for them on
-    /// tier `V` (an `mma16` tile of nibble-lane codes): the same sums bit for
+    /// tier `V` (`mma16` tiles of nibble-lane codes, `rows16` rows of
+    /// unsigned byte values): the same sums bit for
     /// bit. False, with `out` untouched, where it has none.
     ///
     /// # Safety
@@ -3508,12 +3509,8 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
     /// activations are permuted into that order (`activations`, once a call,
     /// `permuted_activations`), and every pair's bytes are multiplied where
     /// they lie, both rows at once, into each row's exact sum of every step
-    /// of 16 columns. Each row's coefficient codes are decoded as vectors
-    /// (`Locals::x86_groups`) and applied to its sixteen step sums, its
-    /// minimum and offset terms to the block's group sums (`groups`), all in
-    /// i32, then eight rows' factors read and combined at once, each lane's
-    /// arithmetic `Self::combine`'s: the result is [`Hier::dot_rows`]'s bit
-    /// for bit.
+    /// of 16 columns, which [`Hier::combine_tile16`] turns into
+    /// [`Hier::dot_rows`]'s result bit for bit.
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn dot_tile16<C: Codes>(
@@ -3595,6 +3592,32 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                 }
             }
         }
+        unsafe { Self::combine_tile16(row, stride, b, x, &steps, groups, offset) }
+    }
+
+    /// The 16 rows' block `b` sums of a tile from each row's exact code
+    /// step sums `steps` (row `r`'s k-block `block` four steps of 16
+    /// columns, in column order, at `steps[r][block]`): row `r` at `row`
+    /// plus `r` strides, its raw codes the values less `offset`, `groups`
+    /// the block's activation code sum of each coefficient group. Each
+    /// row's coefficient codes are decoded as vectors (`Locals::x86_groups`)
+    /// and applied to its sixteen step sums, its minimum and offset terms to
+    /// the group sums, all in i32 (the exact integers [`Hier::dot_rows`]
+    /// sums), then eight rows' factors read and combined at once, each
+    /// lane's arithmetic `Self::combine`'s: [`Hier::dot_rows`]'s result bit
+    /// for bit.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn combine_tile16(
+        row: &Row,
+        stride: usize,
+        b: usize,
+        x: &Q8Block,
+        steps: &[[std::arch::x86_64::__m128i; 4]; 16],
+        groups: &[std::arch::x86_64::__m256i; 2],
+        offset: i32,
+    ) -> [f32; 16] {
+        use std::arch::x86_64::*;
         // Each row's coefficient terms in i32, then eight rows' factors and
         // combine at once, each lane as `Self::combine` computes it.
         let group = At::group(row, b);
@@ -3681,15 +3704,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                 for kblock in 0..4 {
                     activations[4 * index + kblock] = unsafe { permuted_activations(block.codes.as_ptr().add(64 * kblock)) };
                 }
-                // The block's activation code sum of each coefficient group.
-                groups[index] = unsafe {
-                    let sums = _mm256_loadu_si256(block.sums.as_ptr().cast());
-                    if GROUP == 16 {
-                        [_mm256_cvtepi16_epi32(_mm256_castsi256_si128(sums)), _mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(sums))]
-                    } else {
-                        [_mm256_madd_epi16(sums, _mm256_set1_epi16(1)), _mm256_setzero_si256()]
-                    }
-                };
+                groups[index] = unsafe { Self::group_sums(block) };
             }
             for (tile, out) in out.chunks_exact_mut(16).enumerate() {
                 let first = row.shifted(16 * tile * stride);
@@ -3701,6 +3716,69 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                         *sum += value;
                     }
                 }
+            }
+        }
+    }
+
+    /// [`Coefficients::dot_q8_tiles`] on x86 of rows each whole in its own
+    /// bytes (`Placement::Rows`: `rows16`), from `first`, whose values are
+    /// unsigned bytes (`unsigned`): every 16 rows of `out` a tile, each
+    /// row's exact step sums of every k-block formed from its values in
+    /// column order (`Codes::x86_pair`) against the activations where they
+    /// lie, then [`Hier::combine_tile16`]; each tile's blocks summed in block
+    /// order as [`dot_q8_rows`].
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn tiles_rows<C: Codes>(first: *const u8, geometry: &RowGeometry, x: &[Q8Block], k: usize, out: &mut [f32]) {
+        use std::arch::x86_64::*;
+        out.fill(0.0);
+        for (tile, out) in out.chunks_exact_mut(16).enumerate() {
+            let rows = geometry.rows::<16>(first.wrapping_add(16 * tile * geometry.stride));
+            for (b, block) in x.iter().enumerate() {
+                let kblocks = block_packets(b, k).len() / 2;
+                let activations: [__m256i; Q8_BLOCK / PACKET] =
+                    std::array::from_fn(|p| unsafe { packed_x86::load(block.codes.as_ptr().add(PACKET * p)) });
+                let mut steps = [[unsafe { _mm_setzero_si128() }; 4]; 16];
+                for (steps, row) in steps.iter_mut().zip(&rows) {
+                    let group = At::group(row, b);
+                    for (kblock, steps) in steps.iter_mut().enumerate().take(kblocks) {
+                        unsafe {
+                            let ones = _mm256_set1_epi16(1);
+                            // Per 32-bit lane, four columns' products: lanes
+                            // 0..4 a packet's step 0, lanes 4..8 its step 1.
+                            let [first, second] = C::x86_pair(group.packet(2 * kblock));
+                            let quads = |values, packet: usize| {
+                                _mm256_madd_epi16(_mm256_maddubs_epi16(values, activations[2 * kblock + packet]), ones)
+                            };
+                            // Each 128-bit half summed within: low
+                            // `[s0, s2, ..]`, high `[s1, s3, ..]`.
+                            let pairs = _mm256_hadd_epi32(quads(first, 0), quads(second, 1));
+                            let sums = _mm256_hadd_epi32(pairs, pairs);
+                            *steps = _mm_unpacklo_epi32(_mm256_castsi256_si128(sums), _mm256_extracti128_si256::<1>(sums));
+                        }
+                    }
+                }
+                let values =
+                    unsafe { Self::combine_tile16(&rows[0], geometry.stride, b, block, &steps, &Self::group_sums(block), 0) };
+                for (sum, value) in out.iter_mut().zip(values) {
+                    *sum += value;
+                }
+            }
+        }
+    }
+
+    /// The activation code sum of each coefficient group of `block`, as
+    /// [`Hier::combine_tile16`] takes them.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn group_sums(block: &Q8Block) -> [std::arch::x86_64::__m256i; 2] {
+        use std::arch::x86_64::*;
+        unsafe {
+            let sums = _mm256_loadu_si256(block.sums.as_ptr().cast());
+            if GROUP == 16 {
+                [_mm256_cvtepi16_epi32(_mm256_castsi256_si128(sums)), _mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(sums))]
+            } else {
+                [_mm256_madd_epi16(sums, _mm256_set1_epi16(1)), _mm256_setzero_si256()]
             }
         }
     }
@@ -3793,25 +3871,28 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
 {
     const BIASED: bool = L::BIAS.is_some();
 
-    /// On x86 with quantized dots, `mma16` tiles of nibble-lane codes
-    /// (`Codes::NIBBLE_LANES`) whose coefficient codes decode as vectors
-    /// (`Locals::X86_GROUPS`), from a tile's first row, in matrices of whole
-    /// tiles, over whole k-blocks ([`Hier::tiles16`]).
+    /// On x86 with quantized dots, rows whose coefficient codes decode as
+    /// vectors (`Locals::X86_GROUPS`), over whole k-blocks: `mma16` tiles of
+    /// nibble-lane codes (`Codes::NIBBLE_LANES`), from a tile's first row,
+    /// in matrices of whole tiles ([`Hier::tiles16`]); `rows16` rows of
+    /// unsigned byte values, from any row ([`Hier::tiles_rows`]).
     #[inline(always)]
     unsafe fn dot_q8_tiles<C: Codes, V: Vectors>(first: *const u8, geometry: &RowGeometry, x: &[Q8Block], k: usize, out: &mut [f32]) -> bool {
         #[cfg(target_arch = "x86_64")]
-        if V::QUANTIZED_DOTS >= 1
-            && C::NIBBLE_LANES.is_some()
-            && L::X86_GROUPS
-            && (GROUP == 16 || GROUP == 32)
-            && k % 64 == 0
-            && geometry.matrix_rows % 16 == 0
-            && out.len() % 16 == 0
-        {
-            let row = geometry.row(first);
-            if row.lanes_whole() && row.mma16.as_ref().is_some_and(|mma16| mma16.row == 0) {
-                unsafe { Self::tiles16::<C>(&row, geometry.stride, x, k, out) };
-                return true;
+        if V::QUANTIZED_DOTS >= 1 && L::X86_GROUPS && (GROUP == 16 || GROUP == 32) && k % 64 == 0 && out.len() % 16 == 0 {
+            match geometry.placement {
+                Placement::Mma16 if C::NIBBLE_LANES.is_some() && geometry.matrix_rows % 16 == 0 => {
+                    let row = geometry.row(first);
+                    if row.lanes_whole() && row.mma16.as_ref().is_some_and(|mma16| mma16.row == 0) {
+                        unsafe { Self::tiles16::<C>(&row, geometry.stride, x, k, out) };
+                        return true;
+                    }
+                }
+                Placement::Rows if unsigned::<C>(128) => {
+                    unsafe { Self::tiles_rows::<C>(first, geometry, x, k, out) };
+                    return true;
+                }
+                _ => {}
             }
         }
         let _ = (first, geometry, x, k, out);

@@ -62,7 +62,8 @@ pub const MAX_ACTIVATIONS: usize = crate::constants::DECODE_ROWS as usize;
 /// their code bytes); with quantized rows one component call takes up to
 /// [`MAX_ACTIVATIONS`] of them, decoding each weight block once for every
 /// group of up to four (`Weights::dot_q8`), each row's sums the ones it has
-/// alone.
+/// alone; one quantized row's whole 16-row tiles go in one call
+/// (`Weights::dot_q8_tiles`), the same sums.
 #[inline(always)]
 pub fn project_arithmetic(
     weights: &Weights<'_>,
@@ -81,9 +82,8 @@ pub fn project_arithmetic(
     }
     let most = weights.row_block();
     let mut done = 0;
-    // One row's whole tiles of a 16-row block layout in one call
-    // (`Weights::dot_q8_tiles`).
-    if let Some(q8) = q8.filter(|_| m == 1 && most == MAX_BLOCK && n >= MAX_BLOCK) {
+    // One row's whole 16-row tiles in one call (`Weights::dot_q8_tiles`).
+    if let Some(q8) = q8.filter(|_| m == 1 && n >= MAX_BLOCK) {
         done = n / MAX_BLOCK * MAX_BLOCK;
         weights.dot_q8_tiles(first, q8, &mut out[..done]);
     }

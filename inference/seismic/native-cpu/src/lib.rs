@@ -282,16 +282,15 @@ impl<'a> Weights<'a> {
         }
     }
 
-    /// `out[r] = (row first + r) · x` for `out.len()` rows, each 16 a tile
-    /// of an `mma16` operand (`Weights::row_block` 16), against an
-    /// activation row quantized into `x`: the sums [`Weights::dot_q8`]
-    /// gives a tile at a time, in one component call where the element has
-    /// a whole-tile form (the activations permuted once for every tile).
-    /// `x` is one activation row.
+    /// `out[r] = (row first + r) · x` for `out.len()` rows, every 16 a tile,
+    /// against an activation row quantized into `x`: the sums
+    /// [`Weights::dot_q8`] gives a row block (`Weights::row_block`) at a
+    /// time, in one component call where the element has a whole-tile form
+    /// (`mma16` tiles, `rows16` rows). `x` is one activation row.
     #[inline(always)]
     pub fn dot_q8_tiles(&self, first: usize, x: &[quant::Q8Block], out: &mut [f32]) {
         assert!(
-            first + out.len() <= self.rows && out.len() % 16 == 0 && self.row_block() == 16,
+            first + out.len() <= self.rows && out.len() % 16 == 0,
             "tiles of rows {first}..{} of {}",
             first + out.len(),
             self.rows
@@ -299,8 +298,9 @@ impl<'a> Weights<'a> {
         // SAFETY: the rows lie inside the operand (`from_raw`).
         let whole = unsafe { self.kernels.dot_q8_tiles(self.base.add(first * self.geometry.stride), &self.geometry, x, self.k, out) };
         if !whole {
-            for (tile, out) in out.chunks_exact_mut(16).enumerate() {
-                self.dot_q8(first + 16 * tile, x, out);
+            let block = self.row_block();
+            for (index, out) in out.chunks_exact_mut(block).enumerate() {
+                self.dot_q8(first + block * index, x, out);
             }
         }
     }

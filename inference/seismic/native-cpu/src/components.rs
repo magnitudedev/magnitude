@@ -1163,41 +1163,46 @@ mod tests {
         }
     }
 
-    /// Whole 16-row tiles in one call (`dot_q8_tiles`) give each tile's
-    /// quantized dots of the lowest tier bit for bit, on every tier where an
-    /// element has a whole-tile form, and some element has one on x86 with
-    /// quantized dots.
+    /// Whole 16-row tiles in one call (`dot_q8_tiles`) give the sums the
+    /// same tier's quantized dots give eight rows at a time (the rows16
+    /// projection's block), bit for bit, at the expert
+    /// shapes of a mixture layer (k 2048 and 512) and with a partial block,
+    /// on every tier where an element has a whole-tile form; on x86 with
+    /// quantized dots `q4k` and `q5k` have one in `mma16` and `rows16`.
     #[test]
-    fn whole_tiles_match_the_lowest_tiers_tile_dots() {
+    fn whole_tiles_match_the_row_block_dots() {
         use crate::quant::{blocks, quantize, Q8Block};
-        let (k, tiles) = (2 * 256 + 128, 3);
-        let x = bytes(5, k).iter().map(|byte| (*byte as f32 - 128.0) / 90.0).collect::<Vec<_>>();
-        let mut xq = vec![Q8Block::ZERO; blocks(k)];
-        quantize(&x, &mut xq);
-        let (lowest, detected) = (Tier::all()[0], Tier::detected().unwrap());
-        let mut whole = 0;
-        for representation in elements() {
-            let (data, geometry) = rows(representation, 16 * tiles, k, 13);
-            if geometry.placement.row_block() != 16 {
-                continue;
-            }
-            let reference = kernels_of(lowest, representation);
-            let mut expected = vec![0.0f32; 16 * tiles];
-            for (tile, expected) in expected.chunks_exact_mut(16).enumerate() {
-                unsafe { reference.dot_q8(data.as_ptr().add(16 * tile * geometry.stride), &geometry, &xq, k, expected) };
-            }
-            for tier in detected.at_or_below() {
-                let mut out = vec![0.0f32; 16 * tiles];
-                if unsafe { kernels_of(tier, representation).dot_q8_tiles(data.as_ptr(), &geometry, &xq, k, &mut out) } {
-                    whole += 1;
+        let detected = Tier::detected().unwrap();
+        let mut whole = std::collections::BTreeSet::new();
+        for (k, tiles) in [(2048, 4), (512, 4), (2 * 256 + 128, 3)] {
+            let x = bytes(5, k).iter().map(|byte| (*byte as f32 - 128.0) / 90.0).collect::<Vec<_>>();
+            let mut xq = vec![Q8Block::ZERO; blocks(k)];
+            quantize(&x, &mut xq);
+            for representation in elements() {
+                let (data, geometry) = rows(representation, 16 * tiles, k, 13);
+                // Eight rows a call: never a whole tile.
+                let block = 8;
+                for tier in detected.at_or_below() {
+                    let kernels = kernels_of(tier, representation);
+                    let mut out = vec![0.0f32; 16 * tiles];
+                    if !unsafe { kernels.dot_q8_tiles(data.as_ptr(), &geometry, &xq, k, &mut out) } {
+                        continue;
+                    }
+                    whole.insert(representation);
+                    let mut expected = vec![0.0f32; 16 * tiles];
+                    for (index, expected) in expected.chunks_exact_mut(block).enumerate() {
+                        unsafe { kernels.dot_q8(data.as_ptr().add(block * index * geometry.stride), &geometry, &xq, k, expected) };
+                    }
                     for (row, (value, expected)) in out.iter().zip(&expected).enumerate() {
-                        assert_eq!(value.to_bits(), expected.to_bits(), "{representation} {tier:?} row {row}");
+                        assert_eq!(value.to_bits(), expected.to_bits(), "{representation} {tier:?} k {k} row {row}");
                     }
                 }
             }
         }
         if cfg!(target_arch = "x86_64") && detected.quantized_dots() >= 1 {
-            assert!(whole > 0, "no element has a whole-tile form");
+            for representation in ["q4k@mma16", "q5k@mma16", "q4k@rows16", "q5k@rows16"] {
+                assert!(whole.contains(representation), "{representation} has no whole-tile form");
+            }
         }
     }
 
