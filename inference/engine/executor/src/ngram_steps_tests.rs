@@ -555,7 +555,7 @@ fn scores(
         }
         if site || device_landed {
             domain
-                .measure_experts(test_measures(&domain, site, device_landed))
+                .measure_experts(test_measures(&domain, site, device_landed), &mut bindings)
                 .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
         }
         let request = RequestId(1);

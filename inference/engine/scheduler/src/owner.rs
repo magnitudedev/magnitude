@@ -920,6 +920,9 @@ pub struct BetweenFlights {
     /// The measurement job's room claimed of the domain and not yet
     /// answered ([`Owner::claim_measurement_room`]).
     measurement_room: Option<RoomClaim>,
+    /// Costs the executor stored since the load priced its experts, which
+    /// price them from the next flight boundary on ([`Owner::measure_experts`]).
+    measures: Option<ExpertMeasures>,
     next_observation: u64,
 }
 
@@ -938,6 +941,7 @@ impl BetweenFlights {
             bank_began: None,
             shrink_refused: false,
             measurement_room: None,
+            measures: None,
             next_observation: 0,
         }
     }
@@ -1166,11 +1170,12 @@ impl<F: ProgramFamily> Owner<F> {
         self.service.memory.measurement_room = None;
     }
 
-    /// Measure the experts by `measures` from now on
-    /// (`ExecutorDomain::measure_experts`): the bank's growth is priced on
-    /// them at the next observation.
-    pub fn measure_experts(&mut self, measures: ExpertMeasures) -> Result<(), String> {
-        self.service.domain.measure_experts(measures).map_err(|error| error.to_string())
+    /// Price the load's experts by `measures` from the next flight boundary
+    /// on ([`between_flights`]), a later call's replacing an earlier one's
+    /// not yet applied: no step in flight is recorded or priced by measures
+    /// it did not run under.
+    pub fn measure_experts(&mut self, measures: ExpertMeasures) {
+        self.service.memory.measures = Some(measures);
     }
 
     pub fn inspect_domain<R>(
@@ -1726,9 +1731,13 @@ trait MemoryStep: MemoryHost + Sized {
             }
         }
         let mut bindings = bindings;
-        // A flight boundary: the expert bank's resize advances first, and a
-        // finished one frees what waited on it.
-        if bindings.is_some() {
+        // A flight boundary: newly stored costs price the experts first, so
+        // every decision past it is made on them; the expert bank's resize
+        // advances, and a finished one frees what waited on it.
+        if let Some(bindings) = bindings.as_deref_mut() {
+            if let Some(measures) = self.memory().measures.take() {
+                self.domain().measure_experts(measures, bindings).map_err(classify_domain_error)?;
+            }
             self.advance_expert_bank()?;
             // A release deferred for want of a gap is tried again at this
             // boundary: what waited on it retries, and a Reclaim release is

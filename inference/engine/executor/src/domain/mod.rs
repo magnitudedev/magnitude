@@ -744,8 +744,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// From now on, measure what the load's decode does of its experts by
     /// `measures`, in place of what it measured by before: its warm-up has
-    /// ended, or the executor's stored costs have changed since.
-    pub fn measure_experts(&mut self, measures: ExpertMeasures) -> Result<(), DomainError> {
+    /// ended, or the executor's stored costs have changed since. Between
+    /// flights (the bindings prove none is on the device), so every step is
+    /// recorded and priced by the measures it ran under, and the bank's
+    /// device-side pricing changes under no step in flight. Its one fallible
+    /// part runs first: a refusal changes nothing.
+    pub fn measure_experts(
+        &mut self,
+        measures: ExpertMeasures,
+        _between_flights: &mut StateBindings,
+    ) -> Result<(), DomainError> {
         tracing::info!(
             records = match measures.store {
                 None => "kept for the load alone",
@@ -760,10 +768,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             "the experts are priced"
         );
         if let Some(bank) = self.family.expert_bank() {
-            bank.price(measures.lines.measured().cloned(), measures.pass.measured().cloned());
             if let Some(Some(costs)) = measures.tier_copy.measured() {
                 bank.tier_copy(costs)?;
             }
+            bank.price(measures.lines.measured().cloned(), measures.pass.measured().cloned());
             if let Some(Some(lines)) = measures.convert.measured() {
                 bank.device_convert(lines);
             }

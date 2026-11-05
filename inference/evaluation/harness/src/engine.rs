@@ -765,7 +765,7 @@ mod tests {
                 moves: magnitude_executor::assessment::Priced::Pending("unmeasured".into()),
                 tier_copy: magnitude_executor::assessment::Priced::Measured(None),
                 convert: magnitude_executor::assessment::Priced::Measured(None),
-            }).unwrap();
+            }, &mut bindings).unwrap();
             let host_slots = |domain: &magnitude_executor::ExecutorDomain<_>| {
                 domain.expert_residency().unwrap().unwrap().host.unwrap().slots
             };

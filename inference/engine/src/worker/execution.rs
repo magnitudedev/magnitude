@@ -117,16 +117,15 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                 }
                 Ok(WorkerReply::Acknowledged)
             }
-            WorkerCommand::Reprice => match (&mut self.execution, &mut self.pricing) {
-                (Execution::Serving(owner), Some(pricing)) => {
-                    owner.measure_experts(expert_measures(pricing)).map(|()| WorkerReply::Acknowledged)
+            WorkerCommand::Reprice => {
+                match (&mut self.execution, &mut self.pricing) {
+                    (Execution::Serving(owner), Some(pricing)) => owner.measure_experts(expert_measures(pricing)),
+                    // A model without a bank prices nothing of its experts, and an ending one
+                    // has nothing left to price.
+                    (Execution::Serving(_), None) | (Execution::Draining(..) | Execution::Stopped(_), _) => {}
                 }
-                // A model without a bank prices nothing of its experts.
-                (Execution::Serving(_), None) => Ok(WorkerReply::Acknowledged),
-                (Execution::Draining(_, cause) | Execution::Stopped(cause), _) => {
-                    Err(format!("execution stopped: {cause}"))
-                }
-            },
+                Ok(WorkerReply::Acknowledged)
+            }
         }
     }
 
@@ -276,7 +275,7 @@ mod tests {
         };
         let mut owner = Owner::new(domain, bindings, limits, Arc::new(Unwoken)).unwrap();
         // Priced as the load is once its warm-up ends: nothing is stored.
-        owner.measure_experts(expert_measures(&pricing)).unwrap();
+        owner.measure_experts(expert_measures(&pricing));
         let mut execution = ExecutionOwner::new(owner, Arc::new(Plain), Some(pricing));
         // Memory stays free well past the growth's recovery wait: an
         // unpriced bank grows nothing.

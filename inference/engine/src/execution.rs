@@ -892,7 +892,7 @@ pub(crate) fn build(
     // What the load is doing from its warm-up until it serves, in the
     // process's report on demand (`magnitude_executor::diagnostics`).
     let phase = magnitude_executor::diagnostics::Phase::new("load", "warm-up forward");
-    let bindings = warm_up(&mut domain, bindings, primes_drafter)?;
+    let mut bindings = warm_up(&mut domain, bindings, primes_drafter)?;
     phase.enter("loaded memory report");
     report_loaded_memory(&domain, &catalog, &device).map_err(internal)?;
     phase.enter("pricing the experts: shrink moves and host storage's routes");
@@ -900,7 +900,9 @@ pub(crate) fn build(
         .map(|bank| -> Result<ExpertPricing, LoadError> {
             let lines = domain.expert_bank_lines().ok_or_else(|| internal("a streamed load opened no expert bank"))?;
             let pricing = ExpertPricing::new(manifest, &package, resident, (*device).clone(), bank, lines, site_requests)?;
-            domain.measure_experts(expert_measures(&pricing)).map_err(|error| internal(error.to_string()))?;
+            domain
+                .measure_experts(expert_measures(&pricing), &mut bindings)
+                .map_err(|error| internal(error.to_string()))?;
             Ok(pricing)
         })
         .transpose()?;
