@@ -5,19 +5,30 @@ consults either. The rig sets `RUSTC_WORKSPACE_WRAPPER` to a shim that runs `rus
 `wrap`, so every compilation of a workspace crate leaves a record beside its outputs:
 
     <out-dir>/<crate><extra-filename>.provenance.json
-    {"schema": "build-provenance-unit/1", "crate": ..., "sources": {path: sha256},
-     "outputs": {path: sha256}, "externs": {path: sha256}}
+    {"schema": "build-provenance-unit/2", "crate": ..., "sources": {path: sha256},
+     "outputs": {path: sha256}, "externs": {path: sha256}, "env": {name: value}}
 
 `sources` are the files rustc itself reports reading (its dep-info: modules, `include!`d and
 generated files) and `externs` the dependency artifacts it was given, all hashed when the
-compilation finished. `verify` then starts from an executable, finds the record whose
-output has the executable's bytes, and walks `externs`: the executable is `verified` when
-every unit it was linked from still has the outputs its record names, was compiled against
-the dependency bytes present now, and was compiled from sources with the same bytes as the
-files on the host now. It is `contradicted` when a source or dependency differs (a stale
-unit was reused), and `unverified` when a unit compiling synchronized sources has no record
-(it was not built through the rig). Units with no record whose sources all lie outside the
-synchronized roots are registry dependencies, pinned by `Cargo.lock`.
+compilation finished, and `env` the environment variables it read at compile time (`env!`,
+`option_env!`), each with its value or null when unset. `verify` then starts from an
+executable, finds the record whose output has the executable's bytes, and walks `externs`: the
+executable is `verified` when every unit it was linked from still has the outputs its record
+names, was compiled against the dependency bytes present now, and was compiled from sources
+with the same bytes as the files on the host now. It is `contradicted` when a source or
+dependency differs (a stale unit was reused), and `unverified` when a unit compiling
+synchronized sources has no record of this schema (it was not built through this rig). The
+wrapper's path names the schema (`WRAPPER`) and cargo keys workspace artifacts by that path, so
+a schema change compiles every workspace unit again rather than reusing one recorded under
+another schema. It `reads-source-tree` when a unit it was linked from read an environment
+variable at compile time whose value is a path in the synchronized roots (`CARGO_MANIFEST_DIR`,
+or one a build script or the cargo configuration sets). The record shows only that the unit read
+the path, not what it did with it, and such a path into the checkout's source tree, kept in
+the executable, reads whatever tree the checkout holds when it runs, while a shipped executable
+has no source tree at all. So the unit embeds what it needs at compile time (`include_bytes!`,
+`include_str!`, naming their files relative to the source) or takes a path its caller gives
+at run time. Units with no record whose sources all lie outside the synchronized roots are
+registry dependencies, pinned by `Cargo.lock`.
 
 No job runs an executable of the checkout's target that the proof does not tie to the sources:
 `verify` refuses the run when one its texts name is not verified, and withdraws every other
@@ -44,10 +55,14 @@ import shlex
 import subprocess
 import sys
 
-UNIT_SCHEMA = "build-provenance-unit/1"
+UNIT_SCHEMA = "build-provenance-unit/2"
+WRAPPER = f"provenance/{UNIT_SCHEMA}/rustc"  # under a checkout; `.cmd` added on Windows
 SCHEMA = "build-provenance/1"
 RECORD_SUFFIX = ".provenance.json"
 _UNESCAPED_SPACE = re.compile(r"(?<!\\) ")
+ENV_DEP = "# env-dep:"
+_ENV_ESCAPE = re.compile(r"\\(.)")
+_ENV_UNESCAPED = {"n": "\n", "r": "\r"}
 
 
 def digest(path: str):
@@ -70,12 +85,19 @@ def _write(path: str, value: dict) -> None:
 
 
 def dep_info(path: str):
-    """A rustc dep-info file as (outputs, sources): the rule targets that have prerequisites,
-    and the union of those prerequisites, in file order."""
-    outputs, sources = [], {}
+    """A rustc dep-info file as (outputs, sources, env): the rule targets that have
+    prerequisites, the union of those prerequisites, in file order, and the environment
+    variables read at compile time with their values (None when unset), with rustc's escapes
+    of backslash, newline and carriage return undone."""
+    outputs, sources, env = [], {}, {}
     with open(path) as stream:
         for line in stream:
             line = line.rstrip("\n")
+            if line.startswith(ENV_DEP):
+                name, assigned, value = line[len(ENV_DEP):].partition("=")
+                unescaped = _ENV_ESCAPE.sub(lambda match: _ENV_UNESCAPED.get(match[1], match[1]), value)
+                env[name] = unescaped if assigned else None
+                continue
             target, separator, listed = line.partition(": ")
             if not separator or line.startswith("#"):
                 continue
@@ -83,7 +105,14 @@ def dep_info(path: str):
             for source in _UNESCAPED_SPACE.split(listed):
                 if source:
                     sources[source.replace("\\ ", " ")] = None
-    return outputs, list(sources)
+    return outputs, list(sources), env
+
+
+def source_tree_reads(env: dict, roots: list) -> list:
+    """The variables of a unit's compile-time `env` whose values are paths in `roots`: what
+    names its source tree in its outputs."""
+    return [name for name, value in env.items()
+            if value is not None and os.path.isabs(value) and _within(os.path.realpath(value), roots)]
 
 
 class Unit:
@@ -118,7 +147,7 @@ class Unit:
         return cls(crate, os.path.abspath(out_dir), extra, externs)
 
     def write_record(self) -> None:
-        outputs, sources = dep_info(self.dep_info)
+        outputs, sources, env = dep_info(self.dep_info)
         own = os.path.abspath(self.dep_info)
         _write(
             self.record,
@@ -128,6 +157,7 @@ class Unit:
                 "sources": {p: digest(p) for p in map(os.path.abspath, sources)},
                 "outputs": {p: digest(p) for p in map(os.path.abspath, outputs) if p != own},
                 "externs": {path: digest(path) for path in self.externs},
+                "env": env,
             },
         )
 
@@ -147,17 +177,16 @@ def wrap(argv: list) -> int:
 
 
 def install(root: str) -> str:
-    """Write the wrapper shim at a fixed path under `root` (a checkout's directory on the host)
-    and return that path. The path is constant per checkout because cargo keys workspace
-    artifacts by it."""
-    directory = os.path.join(root, "provenance")
-    os.makedirs(directory, exist_ok=True)
+    """Write the wrapper shim at `WRAPPER` under `root` (a checkout's directory on the host) and
+    return its path. Cargo keys workspace artifacts by that path, so it is constant per checkout
+    and schema."""
+    path = os.path.join(root, *WRAPPER.split("/"))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     script = os.path.abspath(__file__)
     if os.name == "nt":
-        path = os.path.join(directory, "rustc.cmd")
+        path += ".cmd"
         text = '@"%s" "%s" rustc %%*\r\n' % (sys.executable, script)
     else:
-        path = os.path.join(directory, "rustc")
         text = '#!/bin/sh\nexec %s %s rustc "$@"\n' % (shlex.quote(sys.executable), shlex.quote(script))
     temporary = "%s.%d.tmp" % (path, os.getpid())
     with open(temporary, "w") as stream:
@@ -249,7 +278,7 @@ def verify_executable(path: str, roots: list, digest=digest, records=_records) -
     if root_unit is None:
         reason = "no compilation record has this executable's bytes: it was not built by the rig"
         return {**result, "status": "unverified", "reasons": [reason]}
-    contradicted, unverified = [], []
+    contradicted, unverified, reads = [], [], []
     compiled = {}
     pending, seen = [root_unit], {root_unit}
     while pending:
@@ -257,6 +286,12 @@ def verify_executable(path: str, roots: list, digest=digest, records=_records) -
         with open(record) as stream:
             unit = json.load(stream)
         result["units"] += 1
+        if unit["schema"] != UNIT_SCHEMA:
+            unverified.append(f"{unit['crate']}: its record is of {unit['schema']}, not {UNIT_SCHEMA}")
+            continue
+        for name in source_tree_reads(unit["env"], roots):
+            reads.append(f"{unit['crate']}: names its source tree through {name}: embed what it reads "
+                         "(include_bytes!, include_str!) or take its path at run time")
         for output, recorded in unit["outputs"].items():
             if digest(output) != recorded:
                 unverified.append(f"{unit['crate']}: {output} is not the output its record names")
@@ -289,8 +324,9 @@ def verify_executable(path: str, roots: list, digest=digest, records=_records) -
     for source in sorted(compiled):
         material.update(f"{source}\0{compiled[source]}\n".encode())
     result.update(sources=len(compiled), sources_digest=material.hexdigest())
-    status = "contradicted" if contradicted else "unverified" if unverified else "verified"
-    return {**result, "status": status, "reasons": sorted(set(contradicted + unverified))}
+    status = ("contradicted" if contradicted else "reads-source-tree" if reads
+              else "unverified" if unverified else "verified")
+    return {**result, "status": status, "reasons": sorted(set(contradicted + reads + unverified))}
 
 
 def verify(texts: list, roots: list, target: str) -> dict:

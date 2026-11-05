@@ -68,10 +68,12 @@ def test_dep_info_lists_outputs_and_sources_with_escaped_spaces(tmp_path):
         "/t/deps/unit.d: src/lib.rs src/a\\ b.rs\n\n"
         "/t/deps/libunit.rlib: src/lib.rs src/a\\ b.rs /t/build/out/gen.rs\n\n"
         "src/lib.rs:\nsrc/a\\ b.rs:\n/t/build/out/gen.rs:\n\n# env-dep:OUT_DIR=/t/build/out\n"
+        "# env-dep:WINDOWS=C:\\\\t\\\\out\n# env-dep:LINES=a\\nb\n# env-dep:UNSET\n"
     )
     assert provenance.dep_info(str(path)) == (
         ["/t/deps/unit.d", "/t/deps/libunit.rlib"],
         ["src/lib.rs", "src/a b.rs", "/t/build/out/gen.rs"],
+        {"OUT_DIR": "/t/build/out", "WINDOWS": "C:\\t\\out", "LINES": "a\nb", "UNSET": None},
     )
 
 
@@ -121,6 +123,59 @@ def test_executable_built_through_the_wrapper_is_verified(tmp_path):
     again = provenance.verify([binary], [str(source)], str(target))
     assert again["status"] == "verified"
     assert again["executables"][0]["sources_digest"] != executable["sources_digest"]
+
+
+def test_a_unit_names_its_source_tree_when_it_reads_a_path_in_the_synchronized_roots(tmp_path, monkeypatch):
+    """Any variable counts whose value is a path in the synchronized roots: the manifest
+    directory or one a build script sets. A registry crate's own manifest directory, the
+    build's output directory beside the source, and values that are no path do not."""
+    tmp_path = Path(os.path.realpath(tmp_path))
+    monkeypatch.chdir(tmp_path)  # where a relative value would resolve
+    source, target = tmp_path / "src", tmp_path / "target"
+    env = {"CARGO_MANIFEST_DIR": str(source / "lib"), "ASSETS": str(source / "assets"),
+           "REGISTRY": str(tmp_path / "registry" / "dep"), "OUT_DIR": str(target / "release" / "build"),
+           "VERSION": "src", "UNSET": None}  # fmt: skip
+    assert provenance.source_tree_reads(env, [str(source)]) == ["CARGO_MANIFEST_DIR", "ASSETS"]
+    assert provenance.source_tree_reads(env, [str(tmp_path / "elsewhere")]) == []
+
+
+@needs_cargo
+def test_a_dependency_recorded_under_another_schema_is_unverified_until_the_new_wrapper_rebuilds_it(
+        tmp_path, monkeypatch):
+    """A checkout built by a rig of another schema: its wrapper had another path, so the
+    wrapper of this schema compiles every workspace unit again."""
+    source, target = workspace(tmp_path / "ws"), tmp_path / "target"
+    binary = str(target / "release" / "my-app")
+    with monkeypatch.context() as earlier:
+        earlier.setattr(provenance, "WRAPPER", "provenance/build-provenance-unit/1/rustc")
+        cargo_build(source, target, provenance.install(str(tmp_path / "root")))
+    (record,) = (target / "release" / "deps").glob(f"my_lib-*{provenance.RECORD_SUFFIX}")
+    record.write_text(json.dumps({**json.loads(record.read_text()), "schema": "build-provenance-unit/1"}))
+    (executable,) = provenance.verify([binary], [str(source)], str(target))["executables"]
+    assert executable["status"] == "unverified"
+    assert executable["reasons"] == [f"my_lib: its record is of build-provenance-unit/1, not {provenance.UNIT_SCHEMA}"]
+    assert "Compiling my-lib" in cargo_build(source, target, provenance.install(str(tmp_path / "root")))
+    assert provenance.verify([binary], [str(source)], str(target))["status"] == "verified"
+
+
+@needs_cargo
+def test_an_executable_that_names_its_source_tree_is_refused_and_one_that_embeds_it_verified(tmp_path):
+    source, target = workspace(tmp_path / "ws"), tmp_path / "target"
+    wrapper = provenance.install(str(tmp_path / "root"))
+    (source / "lib/data.txt").write_text("data")
+    (source / "lib/src/part.rs").write_text(
+        'pub fn who() -> String { std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/data.txt")).unwrap() }\n')
+    cargo_build(source, target, wrapper)
+    binary = str(target / "release" / "my-app")
+    record = provenance.verify([binary], [str(source)], str(target))
+    assert record["status"] == "refused"
+    (executable,) = record["executables"]
+    assert executable["status"] == "reads-source-tree"
+    assert executable["reasons"] == ["my_lib: names its source tree through CARGO_MANIFEST_DIR: embed what it "
+                                     "reads (include_bytes!, include_str!) or take its path at run time"]
+    (source / "lib/src/part.rs").write_text('pub fn who() -> String { include_str!("../data.txt").to_owned() }\n')
+    cargo_build(source, target, wrapper)
+    assert provenance.verify([binary], [str(source)], str(target))["status"] == "verified"
 
 
 @needs_cargo
@@ -234,6 +289,6 @@ def test_every_build_step_compiles_through_the_checkouts_recording_wrapper(rig):
     request = engine.Request(instrument="t", purpose="p", estimate=600, backend="cpu", host="alpha",
                              work=lambda alias: work)
     outcome = engine.execute(request, engine.new_run_id("test"), hosts=hosts, announce=lambda line: None)
-    wrapper = tmp_path / "alpha" / "checkouts" / "slot-0" / "provenance" / "rustc"
+    wrapper = tmp_path / "alpha" / "checkouts" / "slot-0" / provenance.WRAPPER
     assert f"{wrapper}\n" in (outcome.results / "logs" / "build-source.log").read_text()
     assert os.access(wrapper, os.X_OK)

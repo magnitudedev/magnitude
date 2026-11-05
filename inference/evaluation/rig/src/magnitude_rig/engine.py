@@ -88,6 +88,7 @@ from .connection import (
 )
 from .host.agent import ENDED, NOTE, SAME
 from .host.gate import GateSettings
+from .host.provenance import WRAPPER
 from .hosts import Hosts
 from .sources import Source
 
@@ -548,7 +549,7 @@ class Plan:
             "UV_PROJECT_ENVIRONMENT": tokens["venv"],
             "PIP_CACHE_DIR": f"{self.remote.root}/cache/pip",
             "HF_HUB_CACHE": f"{self.remote.root}/cache/huggingface/hub",
-            COMPILER: f"{tokens['checkout']}/provenance/rustc",
+            COMPILER: f"{tokens['checkout']}/{WRAPPER}",
             **self.remote.env,
             **{name: _fill(value, tokens) for name, value in step.env},
         }
