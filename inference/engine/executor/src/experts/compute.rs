@@ -414,11 +414,17 @@ impl Drop for HostCompute {
             self.inner.stop.store(true, Ordering::Release);
             self.inner.wake.notify_all();
         }
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
-        }
+        // Every worker is joined before a worker's panic is raised again.
+        let panicked = self
+            .workers
+            .drain(..)
+            .filter_map(|worker| worker.join().err())
+            .reduce(|first, _| first);
         self.inner.jobs.lock().expect("compute jobs").clear();
         self.inner.queued.store(0, Ordering::Release);
+        if let Some(panic) = panicked.filter(|_| !std::thread::panicking()) {
+            std::panic::resume_unwind(panic);
+        }
         // The placement drops after this, the workers joined: the process's
         // threads go back on every CPU.
     }

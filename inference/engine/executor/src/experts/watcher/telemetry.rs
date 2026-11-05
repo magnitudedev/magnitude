@@ -667,9 +667,14 @@ impl GroupFacts {
     /// the host tier at `layer` ([`Self::terms`]), which need no measured
     /// compute.
     fn cold(&self, layer: usize) -> (u64, u64) {
-        let lacked = self.experts[layer] - self.held[layer];
+        let lacked = self.experts[layer]
+            .checked_sub(self.held[layer])
+            .expect("a layer's bank holds no more experts than the layer has");
         let alone = self.resident.as_ref().map_or(0, |_| self.alone[layer]);
-        (self.read[layer].unwrap_or((lacked - alone) as u64), self.pulled[layer].unwrap_or(alone as u64))
+        let filed = lacked
+            .checked_sub(alone)
+            .expect("the host tier holds alone no more experts than the bank lacks");
+        (self.read[layer].unwrap_or(filed as u64), self.pulled[layer].unwrap_or(alone as u64))
     }
 
     /// [`Telemetry::group_size`] along each layer's `lines` and the read
