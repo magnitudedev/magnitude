@@ -1584,27 +1584,43 @@ fn arithmetic_variants(device: &seismic::Device) -> Vec<bool> {
     }
 }
 
-/// Metal and CUDA decode projections own their parameters on their sole
-/// launch; the CPU also takes its arithmetic variant.
-fn expert_specialization(
+/// `entry`'s specialization on `device` at `statics` and `mapping`: the
+/// default configuration of its native at its elements, with each mapping
+/// parameter where the native declares it, on the native or on every launch
+/// that declares it; the CPU also takes its arithmetic variant.
+fn expert_specialization<E: seismic::Entry>(
     device: &seismic::Device,
+    entry: &seismic::BoundEntry<E>,
     statics: &[(&str, usize)],
     mapping: &[(&'static str, u64)],
-    launch_scoped: bool,
     int8: bool,
 ) -> seismic::NativeSpecialization {
-    let specialization = if launch_scoped
-        && matches!(
+    let implementation = entry.offered(device).unwrap().unwrap();
+    let defaults = entry
+        .default_specialization(device, &specialization(device, statics, &[]))
+        .unwrap()
+        .unwrap();
+    let specialization = mapping.iter().fold(defaults, |spec, &(name, value)| {
+        if implementation.params.iter().any(|parameter| parameter.name == name) {
+            return spec.with_param(name, value);
+        }
+        let launches = implementation
+            .launches
+            .iter()
+            .enumerate()
+            .filter(|(_, launch)| launch.params.iter().any(|parameter| parameter.name == name))
+            .map(|(ordinal, _)| ordinal)
+            .collect::<Vec<_>>();
+        assert!(
+            !launches.is_empty(),
+            "{:?} native of {} declares no parameter `{name}`",
             device.backend(),
-            seismic::BackendName::Metal | seismic::BackendName::Cuda
-        ) {
-        mapping.iter().fold(
-            specialization(device, statics, &[]),
-            |spec, (name, value)| spec.with_launch_param(0, *name, *value),
-        )
-    } else {
-        specialization(device, statics, mapping)
-    };
+            E::NAME
+        );
+        launches
+            .into_iter()
+            .fold(spec, |spec, launch| spec.with_launch_param(launch, name, value))
+    });
     if is_cpu(device) {
         specialization.with_param("INT8", u64::from(int8))
     } else {
@@ -1612,19 +1628,40 @@ fn expert_specialization(
     }
 }
 
-/// `specialization` of decode expansion `E` (`routed_gate_up`, `routed_up`)
-/// at mapping `index`: where its native declares a gathered form, the form
-/// alternates, per-choice (`GATHERED` 0) then gathered, so the mappings
-/// cover both forms; a native of one form is as it is.
-fn expansion_form<E: seismic::Entry>(
+/// `expert_specialization` of decode expansion `entry` (`routed_gate_up`,
+/// `routed_up`) at mapping `index`: where its native declares a gathered
+/// form, the form alternates, per-choice (`GATHERED` 0) then gathered, so
+/// the mappings cover both forms; a native of one form is as it is.
+fn expansion_specialization<E: seismic::Entry>(
     device: &seismic::Device,
+    entry: &seismic::BoundEntry<E>,
     index: usize,
-    specialization: seismic::NativeSpecialization,
+    statics: &[(&str, usize)],
+    mapping: &[(&'static str, u64)],
+    int8: bool,
 ) -> seismic::NativeSpecialization {
-    let implementation = seismic::generated::native_implementation::<E>(device).unwrap().unwrap();
+    let specialization = expert_specialization(device, entry, statics, mapping, int8);
+    let implementation = entry.offered(device).unwrap().unwrap();
     match implementation.params.iter().any(|parameter| parameter.name == "GATHERED") {
         true => specialization.with_param("GATHERED", (index % 2) as u64),
         false => specialization,
+    }
+}
+
+/// `expert_specialization` of grouped `entry` (`routed_experts`,
+/// `routed_experts_up`); CUDA's also takes its activation operand.
+fn grouped_specialization<E: seismic::Entry>(
+    device: &seismic::Device,
+    entry: &seismic::BoundEntry<E>,
+    statics: &[(&str, usize)],
+    mapping: &[(&'static str, u64)],
+    int8: bool,
+) -> seismic::NativeSpecialization {
+    let specialization = expert_specialization(device, entry, statics, mapping, int8);
+    if device.backend() == seismic::BackendName::Cuda {
+        specialization.with_param("OPERAND", 0)
+    } else {
+        specialization
     }
 }
 
@@ -1890,61 +1927,24 @@ fn native_decode_experts_match_host_reference_at_catalog_shapes() {
                             device.backend(),
                             shape.name
                         );
-                        // CUDA's per-choice and gathered launches read one
-                        // entry-wide configuration.
-                        let specialization = expansion_form::<routed_gate_up::Entry>(
-                            device,
-                            index,
-                            expert_specialization(
-                                device,
-                                &[statics.as_slice(), &block.scale_statics()].concat(),
-                                &mapping,
-                                device.backend() != seismic::BackendName::Cuda,
-                                int8,
-                            ),
-                        );
-                        // CUDA's one-row and gathered down launches read one
-                        // entry-wide configuration.
-                        let down_specialization = expert_specialization(
-                            device,
-                            &statics,
-                            &down,
-                            device.backend() != seismic::BackendName::Cuda,
-                            int8,
-                        );
+                        let expansion_statics = [statics.as_slice(), &block.scale_statics()].concat();
                         let expansion = match &experts.gate {
-                            Some(_) => DecodeExpansion::Gated(
-                                routed_gate_up::native_for_device_with(
-                                    device,
-                                    routed_gate_up::Elements {
-                                        A: bf16,
-                                        EGW: bf16,
-                                        EUW: bf16,
-                                    },
-                                    &specialization,
-                                )
-                                .unwrap(),
-                            ),
-                            None => DecodeExpansion::Up(
-                                routed_up::native_for_device_with(
-                                    device,
-                                    routed_up::Elements { A: bf16, EUW: bf16 },
-                                    // CUDA's one-row and gathered launches
-                                    // read one entry-wide configuration.
-                                    &expansion_form::<routed_up::Entry>(
-                                        device,
-                                        index,
-                                        expert_specialization(
-                                            device,
-                                            &[statics.as_slice(), &block.scale_statics()].concat(),
-                                            &mapping,
-                                            device.backend() != seismic::BackendName::Cuda,
-                                            int8,
-                                        ),
-                                    ),
-                                )
-                                .unwrap(),
-                            ),
+                            Some(_) => {
+                                let entry = routed_gate_up::native_entry_with(routed_gate_up::Elements {
+                                    A: bf16,
+                                    EGW: bf16,
+                                    EUW: bf16,
+                                });
+                                let specialization =
+                                    expansion_specialization(device, &entry, index, &expansion_statics, &mapping, int8);
+                                DecodeExpansion::Gated(entry.prepare(device, &specialization).unwrap())
+                            }
+                            None => {
+                                let entry = routed_up::native_entry_with(routed_up::Elements { A: bf16, EUW: bf16 });
+                                let specialization =
+                                    expansion_specialization(device, &entry, index, &expansion_statics, &mapping, int8);
+                                DecodeExpansion::Up(entry.prepare(device, &specialization).unwrap())
+                            }
                         };
                         let expand = |reads: DecodeReads<'_>| {
                             read_activation(
@@ -1968,16 +1968,14 @@ fn native_decode_experts_match_host_reference_at_catalog_shapes() {
                             2e-3,
                         );
                         let down_native = |published: DType| {
-                            routed_down::native_for_device_with(
-                                device,
-                                routed_down::Elements {
-                                    A: bf16,
-                                    EDW: bf16,
-                                    R: element(published),
-                                },
-                                &down_specialization,
-                            )
-                            .unwrap()
+                            let entry = routed_down::native_entry_with(routed_down::Elements {
+                                A: bf16,
+                                EDW: bf16,
+                                R: element(published),
+                            });
+                            entry
+                                .prepare(device, &expert_specialization(device, &entry, &statics, &down, int8))
+                                .unwrap()
                         };
                         let project = |native: &seismic::NativeKernel<routed_down::Entry>,
                                        base: &[f32],
@@ -2157,82 +2155,70 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
             for mapping in grouped_mappings(device) {
                 for int8 in arithmetic_variants(device) {
                     let label = format!("{label} {mapping:?} INT8 {int8}");
-                    let specialization = expert_specialization(
-                        device,
-                        &[[("H", h), ("F", f)].as_slice(), &block.scale_statics()].concat(),
-                        &mapping,
-                        false,
-                        int8,
-                    );
-                    // CUDA's grouped experts also take their activation operand.
-                    let specialization = if device.backend() == seismic::BackendName::Cuda {
-                        specialization.with_param("OPERAND", 0)
-                    } else {
-                        specialization
-                    };
+                    let grouped_statics = [[("H", h), ("F", f)].as_slice(), &block.scale_statics()].concat();
                     // The grouped pass with its experts placed by `map` at
                     // `step` in `records` (gate, up, down), else read in place.
                     let pass = |map: &seismic::Tensor, step: &seismic::Tensor, records: [Option<&seismic::Tensor>; 3]| match &experts.gate {
-                        Some(gate) => routed_experts::native_for_device_with(
-                            device,
-                            routed_experts::Elements {
+                        Some(gate) => {
+                            let entry = routed_experts::native_entry_with(routed_experts::Elements {
                                 A: bf16,
                                 EGW: bf16,
                                 EUW: bf16,
                                 EDW: bf16,
-                            },
-                            &specialization,
-                        )
-                        .unwrap()
-                        .call(routed_experts::Args {
-                            first: &first,
-                            rows: &grouped_rows,
-                            normalized: &normalized,
-                            order: &native_order,
-                            blocks: &native_table,
-                            used: &used,
-                            expert_gate: gate,
-                            expert_up: &experts.up,
-                            expert_down: &experts.down,
-                            map,
-                            step,
-                            records_gate: records[0].unwrap_or(gate),
-                            records_up: records[1].unwrap_or(&experts.up),
-                            records_down: records[2].unwrap_or(&experts.down),
-                            activation: shape.activation,
-                            gate_scale: &experts.gate_scale,
-                            up_scale: &experts.up_scale,
-                        })
-                        .unwrap()
-                        .value,
-                        None => routed_experts_up::native_for_device_with(
-                            device,
-                            routed_experts_up::Elements {
+                            });
+                            entry
+                                .prepare(device, &grouped_specialization(device, &entry, &grouped_statics, &mapping, int8))
+                                .unwrap()
+                                .call(routed_experts::Args {
+                                    first: &first,
+                                    rows: &grouped_rows,
+                                    normalized: &normalized,
+                                    order: &native_order,
+                                    blocks: &native_table,
+                                    used: &used,
+                                    expert_gate: gate,
+                                    expert_up: &experts.up,
+                                    expert_down: &experts.down,
+                                    map,
+                                    step,
+                                    records_gate: records[0].unwrap_or(gate),
+                                    records_up: records[1].unwrap_or(&experts.up),
+                                    records_down: records[2].unwrap_or(&experts.down),
+                                    activation: shape.activation,
+                                    gate_scale: &experts.gate_scale,
+                                    up_scale: &experts.up_scale,
+                                })
+                                .unwrap()
+                                .value
+                        }
+                        None => {
+                            let entry = routed_experts_up::native_entry_with(routed_experts_up::Elements {
                                 A: bf16,
                                 EUW: bf16,
                                 EDW: bf16,
-                            },
-                            &specialization,
-                        )
-                        .unwrap()
-                        .call(routed_experts_up::Args {
-                            first: &first,
-                            rows: &grouped_rows,
-                            normalized: &normalized,
-                            order: &native_order,
-                            blocks: &native_table,
-                            used: &used,
-                            expert_up: &experts.up,
-                            expert_down: &experts.down,
-                            map,
-                            step,
-                            records_up: records[1].unwrap_or(&experts.up),
-                            records_down: records[2].unwrap_or(&experts.down),
-                            up_scale: &experts.up_scale,
-                            activation: shape.activation,
-                        })
-                        .unwrap()
-                        .value,
+                            });
+                            entry
+                                .prepare(device, &grouped_specialization(device, &entry, &grouped_statics, &mapping, int8))
+                                .unwrap()
+                                .call(routed_experts_up::Args {
+                                    first: &first,
+                                    rows: &grouped_rows,
+                                    normalized: &normalized,
+                                    order: &native_order,
+                                    blocks: &native_table,
+                                    used: &used,
+                                    expert_up: &experts.up,
+                                    expert_down: &experts.down,
+                                    map,
+                                    step,
+                                    records_up: records[1].unwrap_or(&experts.up),
+                                    records_down: records[2].unwrap_or(&experts.down),
+                                    up_scale: &experts.up_scale,
+                                    activation: shape.activation,
+                                })
+                                .unwrap()
+                                .value
+                        }
                     };
                     let grouped = pass(&no_map, &no_step, [None; 3]);
                     // A row whose expert a slot map places in a bank's record
