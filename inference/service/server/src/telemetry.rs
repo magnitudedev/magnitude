@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::Context as _;
 use axum::extract::MatchedPath;
 use axum::http::{HeaderMap, Request};
-use magnitude_engine::telemetry::log_filter;
+use magnitude_engine::telemetry::{log_filter, stderr_ansi};
 use opentelemetry::global;
 use opentelemetry::logs::LogRecord as _;
 use opentelemetry::propagation::Extractor;
@@ -202,6 +202,7 @@ where
 {
     Ok(tracing_subscriber::fmt::layer()
         .with_writer(Redacted(std::io::stderr))
+        .with_ansi(stderr_ansi())
         .with_thread_names(true)
         .with_filter(log_filter().map_err(anyhow::Error::msg)?))
 }

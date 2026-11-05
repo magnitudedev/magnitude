@@ -24,13 +24,19 @@ pub fn log_filter() -> Result<tracing_subscriber::EnvFilter, String> {
         .map_err(|error| format!("RUST_LOG is not a log filter: {error}"))
 }
 
+/// Whether log lines written to standard error carry ANSI colour: only when
+/// it is a terminal, so a redirected log holds plain text.
+pub fn stderr_ansi() -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stderr())
+}
+
 /// Write this process's events to standard error, at [`log_filter`]'s level:
 /// the subscriber of a process that has no owner of its own for them.
 pub fn log_to_stderr() -> Result<(), String> {
     let filter = log_filter()?;
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .with_ansi(stderr_ansi())
         .with_env_filter(filter)
         .init();
     Ok(())
