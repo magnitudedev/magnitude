@@ -6477,12 +6477,42 @@ const DEAD_HOST: &str = "MAGNITUDE_TEST_DEAD_HOST";
 const WAITING: &str = "dead host: waiting";
 const RETURNED: &str = "dead host: its wait returned";
 const EXPIRED: &str = "dead host: its wait stored its expiry";
+/// What the host prints once it measured its device's patience
+/// ([`patience`]), then the milliseconds.
+const PATIENCE: &str = "dead host: patience ms";
+
+/// This device's patience, as its own wait records it: a tier wait on a
+/// requested slot never answered nor pulsed, from its call until it ends on
+/// its still pulse, having stored its expiry (PULSE_SPINS spins at the
+/// device's own cost of a spin, which is longer across a discrete device's
+/// bus than on unified memory). What a test of a wait outlasting its
+/// patience times itself by.
+fn patience(device: &seismic::Device) -> std::time::Duration {
+    let q = STREAMING_SEQUENCE as u64;
+    let (table, words) = file_words(1, q, &[0], &[], None);
+    let wait = routed_tier_wait::native_for_device(device, &one_choice_tier_wait(device)).unwrap();
+    let step = i32_tensor(device, &[constants::STEP_WORDS], &step_words(q));
+    let mut file = shared_i32(device, &table.extents(), &words);
+    let mut sources = i32_tensor(device, &[constants::SOURCE_ROWS, 1, 1], &[-1; constants::SOURCE_ROWS as usize]);
+    let grid = i32_tensor(device, &[3], &[1, 1, 1]);
+    let policy = shared_i32(device, &[constants::POLICY_WORDS], &[0; constants::POLICY_WORDS as usize]);
+    let began = std::time::Instant::now();
+    wait.call(routed_tier_wait::Args { step: &step, file: &mut file, sources: &mut sources, grid: &grid, policy: &policy, landing: &mut shared_i32(device, &[1], &[0]) }).unwrap();
+    let patience = began.elapsed();
+    assert_eq!(
+        file.load_acquire_u64(4 * (table.lane(q, 0) + constants::SLOT_EXPIRED)).unwrap(),
+        q,
+        "an unpulsed wait returned without storing its expiry"
+    );
+    patience
+}
 
 /// A live host's long wait is answered, not given up: its pulse beats
 /// throughout (the acquire load the wait reads it by sees each beat), so a
-/// tier wait the host answers two seconds on (past a Mac's patience, under
-/// a second; a discrete device's, its spins across the bus, may be longer)
-/// returns the answer: its choice sourced from the record the answer names.
+/// tier wait the host answers at twice the device's patience, as a still
+/// pulse's wait on this device recorded it ([`patience`]), returns the
+/// answer, its choice sourced from the record the answer names, and stores
+/// no expiry.
 #[test]
 fn a_live_hosts_long_wait_is_answered() {
     let Some(device) = streaming_device() else {
@@ -6499,20 +6529,22 @@ fn a_live_hosts_long_wait_is_answered() {
     let mut sources = i32_tensor(&device, &[constants::SOURCE_ROWS, 1, 1], &[-1; constants::SOURCE_ROWS as usize]);
     let grid = i32_tensor(&device, &[3], &[1, 1, 1]);
     let policy = shared_i32(&device, &[constants::POLICY_WORDS], &[0; constants::POLICY_WORDS as usize]);
+    let late = 2 * patience(&device);
     let _pulse = pulse(&file, table);
     let slot = table.lane(q, 0);
     let answered = std::time::Instant::now();
     std::thread::scope(|scope| {
         let answerer = file.clone();
         scope.spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(2));
+            std::thread::sleep(late);
             // Bank record 5 for choice 0, then the answer.
             answerer.store_release(4 * (slot + SlotTable::file_entry(0) + constants::FILE_RECORD), 5).unwrap();
             answerer.store_release(4 * (slot + constants::SLOT_ANSWER), q as u32).unwrap();
         });
         wait.call(routed_tier_wait::Args { step: &step, file: &mut file, sources: &mut sources, grid: &grid, policy: &policy, landing: &mut shared_i32(&device, &[1], &[0]) }).unwrap();
     });
-    assert!(answered.elapsed() >= std::time::Duration::from_secs(2), "the wait returned before its answer");
+    assert!(answered.elapsed() >= late, "the wait returned before its answer");
+    assert_ne!(file.load_acquire_u64(4 * (slot + constants::SLOT_EXPIRED)).unwrap(), q, "a pulsed wait stored an expiry");
     assert_eq!(read_i32(&sources), magnitude_kernels::source_words(&[5], &[-1]), "the wait returned the answer");
 }
 
@@ -6545,11 +6577,13 @@ fn an_aborted_hosts_wait_ends() {
 /// end a dead process's running kernel (its GPU stayed busy, its memory
 /// held, until a reboot; NVIDIA's driver ends it within a second), so the
 /// wait ends once its slot's pulse, which a live host advances every
-/// PULSE_MS, has stood still for PULSE_SPINS spins at the device's own
-/// cost of a spin (under a second on a Mac; longer across a discrete
-/// device's bus). The test runs itself as that host (one tier
-/// wait on a requested slot, pulsed), ends it by `death`, and requires its
-/// GPU idle again within five seconds; it needs the GPU to itself.
+/// PULSE_MS, has stood still for its patience, PULSE_SPINS spins at the
+/// device's own cost of a spin, which the host measures first
+/// ([`patience`]) and the test times itself by. The test runs itself as
+/// that host (one tier wait on a requested slot, pulsed), ends it by
+/// `death` at twice that patience, and requires its GPU idle again within
+/// twice its patience and the five seconds its settling is read over; it
+/// needs the GPU to itself.
 fn dead_hosts_wait_ends(death: &str) {
     use std::io::BufRead;
     // One host at a time: each test reads the whole GPU's business.
@@ -6596,29 +6630,46 @@ fn dead_hosts_wait_ends(death: &str) {
         }
         false
     };
+    // The host's patience, then its wait.
+    let patience = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut measured = None;
+        while let (None, Some(left)) = (measured, deadline.checked_duration_since(std::time::Instant::now())) {
+            match ready.recv_timeout(left) {
+                Ok(line) => {
+                    measured = line.find(PATIENCE).and_then(|at| line[at + PATIENCE.len()..].split_whitespace().next()?.parse::<u64>().ok())
+                }
+                Err(_) => break,
+            }
+        }
+        std::time::Duration::from_millis(measured.unwrap_or_else(|| {
+            let _ = host.kill();
+            panic!("the host never measured its patience: {:?}", host.wait())
+        }))
+    };
     if !await_line(WAITING, std::time::Duration::from_secs(60)) {
         let _ = host.kill();
         panic!("the host never began its wait: {:?}", host.wait());
     }
-    // Its launch spins within a second of its call, and while the host
-    // pulses it spins on past a Mac's patience (under a second); an
-    // aborting host aborts, a stalling one stops its pulse, two seconds
-    // after its call.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // While the host pulses, its wait spins on past its patience; an
+    // aborting host aborts, a stalling one stops its pulse, at twice its
+    // patience after its call.
+    std::thread::sleep(patience * 3 / 2);
     assert_eq!(gpu_busy(), Some(true), "the live host's wait spins on");
     match death {
         "kill" => host.kill().unwrap(),
         "stall" => {
-            let returned = await_line(RETURNED, std::time::Duration::from_secs(5));
+            let within = 3 * patience;
+            let returned = await_line(RETURNED, within);
             let expired = returned && await_line(EXPIRED, std::time::Duration::from_secs(1));
             host.kill().unwrap();
-            assert!(returned, "the host's wait did not return within 5 s of its pulse stopping");
+            assert!(returned, "the host's wait did not return within {within:?} of the point its pulse stops at");
             assert!(expired, "the host's wait returned without storing its expiry");
         }
         _ => {}
     }
     let status = host.wait().unwrap();
-    let bound = std::time::Duration::from_secs(5);
+    let bound = 2 * patience + std::time::Duration::from_secs(5);
     let busy = gpu_settles(bound).unwrap_or_else(|| panic!("the dead host's GPU is still busy {bound:?} after it ended ({status})"));
     eprintln!("{death}: the dead host ({status}) left its GPU busy {busy:?}");
 }
@@ -6673,10 +6724,14 @@ fn one_choice_tier_wait(device: &seismic::Device) -> seismic::NativeSpecializati
 /// The host a dead-host test ends: one tier wait on step q's
 /// requested, unanswered slot of a one-choice file table, its pulse
 /// advanced every PULSE_MS as a live host's watchdog does, then nothing but
-/// its `death`: the kill, its own abort two seconds after its call, or its
-/// pulse stopped then (a stall).
+/// its `death`: the kill, its own abort at twice its device's patience
+/// ([`patience`], measured first) after its call, or its pulse stopped then
+/// (a stall).
 fn dead_host(death: &str) -> ! {
     let device = streaming_device().unwrap();
+    let measured = patience(&device);
+    println!("{PATIENCE} {}", measured.as_millis());
+    let late = 2 * measured;
     let q = STREAMING_SEQUENCE as u64;
     let (table, words) = file_words(1, q, &[0], &[], None);
     let wait = routed_tier_wait::native_for_device(&device, &one_choice_tier_wait(&device)).unwrap();
@@ -6685,12 +6740,12 @@ fn dead_host(death: &str) -> ! {
     let mut sources = i32_tensor(&device, &[constants::SOURCE_ROWS, 1, 1], &[-1; constants::SOURCE_ROWS as usize]);
     let grid = i32_tensor(&device, &[3], &[1, 1, 1]);
     let policy = shared_i32(&device, &[constants::POLICY_WORDS], &[0; constants::POLICY_WORDS as usize]);
-    // A stalling host stops its pulse two seconds after its call; any other
-    // beats until it dies.
+    // A stalling host stops its pulse at twice its patience after its call;
+    // any other beats until it dies.
     let beating = pulse(&file, table);
     let _beating = if death == "stall" {
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(2));
+            std::thread::sleep(late);
             drop(beating);
         });
         None
@@ -6698,8 +6753,8 @@ fn dead_host(death: &str) -> ! {
         Some(beating)
     };
     if death == "abort" {
-        std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::spawn(move || {
+            std::thread::sleep(late);
             std::process::abort();
         });
     }

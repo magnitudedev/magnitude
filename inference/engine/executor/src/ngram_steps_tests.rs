@@ -1448,9 +1448,7 @@ fn a_starved_step_is_interrupted_and_its_rerun_scores_as_unstarved() {
         }
         let operation = |request| scored(forward(request, WorkKind::Prefill, &prompt, 0, true));
         let (reference, returned) = run(&mut domain, bindings, operation(unstarved), false, backend);
-        // Past the slowest wait's patience (under a second).
-        let (pending, returned) =
-            starved_step(&mut domain, returned, operation(starved), std::time::Duration::from_millis(1200), backend);
+        let (pending, returned) = starved_step(&mut domain, returned, operation(starved), PATIENCE_BOUND, backend);
         assert!(
             matches!(pending.outcome(), Outcome::Interrupted { resident: true, .. }),
             "{backend:?}: a starved step is interrupted: {:?}",
@@ -1468,6 +1466,15 @@ fn a_starved_step_is_interrupted_and_its_rerun_scores_as_unstarved() {
     }
     std::fs::remove_dir_all(&directory).ok();
 }
+
+/// The longest a starved test host waits for a wait of the device to
+/// outlast its still pulse: its patience is PULSE_SPINS spins, a spin's
+/// time the device's own (70 ns on an idle M4 Pro; across a discrete
+/// device's bus no 3090's or 4070's wait expired within 1.2 s), so the
+/// starvation lasts until the device records the expiry (`Pulse::starve`),
+/// and a device none of whose waits expires within this fails the test
+/// instead of passing it uninterrupted.
+const PATIENCE_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// `operation` submitted alone, its host starved for `starve` from before
 /// its submission (`ExecutorDomain::starve_expert_host`), so whatever
@@ -1536,7 +1543,7 @@ fn a_starved_chunk_of_a_chain_releases_it_and_the_rerun_scores_as_unstarved() {
         // and is starved.
         domain.plan_successors((1..chunks).map(|next| prompt_chunk(request, next, chunks, rows)).collect());
         let (pending, returned) =
-            starved_step(&mut domain, bindings, prompt_chunk(request, 0, chunks, rows), std::time::Duration::from_millis(1200), backend);
+            starved_step(&mut domain, bindings, prompt_chunk(request, 0, chunks, rows), PATIENCE_BOUND, backend);
         assert!(
             matches!(pending.outcome(), Outcome::Interrupted { resident: false, .. }),
             "{backend:?}: a starved chunk of a chain is interrupted, its state released: {:?}",

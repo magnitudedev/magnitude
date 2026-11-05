@@ -76,6 +76,14 @@ impl Beaten {
             words[pulse].store(beat as u32, Ordering::Relaxed);
         }
     }
+
+    /// Every lane's SLOT_EXPIRED, in lane order: what the device's waits
+    /// stored as they ended on their still pulse.
+    #[cfg(test)]
+    fn expiries(&self) -> Vec<u64> {
+        let expired = constants::SLOT_EXPIRED as usize - constants::SLOT_PULSE as usize;
+        self.pulses.iter().map(|&pulse| self.words.load_u64(pulse + expired)).collect()
+    }
 }
 
 impl Drop for Pulsed {
@@ -110,9 +118,9 @@ impl Pulsed {
     /// ([`Pulse::starve`]), as a starved host's threads stall: an answer
     /// to the place's table waits out the starvation before it is written.
     pub(super) fn starved(&self) {
-        let until = self.inner.beating.lock().expect("a pulse never panics").starved_until;
-        if let Some(wait) = until.and_then(|until| until.checked_duration_since(Instant::now())) {
-            std::thread::sleep(wait);
+        let mut beating = self.inner.beating.lock().expect("a pulse never panics");
+        while let Some(wait) = beating.starved.as_ref().and_then(|starved| starved.until.checked_duration_since(Instant::now())) {
+            beating = self.inner.changed.wait_timeout(beating, wait).expect("a pulse never panics").0;
         }
     }
 }
@@ -147,9 +155,37 @@ struct Beating {
     generation: u64,
     beat: i32,
     beaten: Instant,
-    /// Until when a test starves the host ([`Pulse::starve`]).
+    /// A test's starvation of the host ([`Pulse::starve`]).
     #[cfg(test)]
-    starved_until: Option<Instant>,
+    starved: Option<Starved>,
+}
+
+/// A host starved by a test ([`Pulse::starve`]): until a wait of the device
+/// records its expiry, the live tables' expiries as it began, or at most
+/// `until`.
+#[cfg(test)]
+struct Starved {
+    until: Instant,
+    expiries: Vec<Vec<u64>>,
+}
+
+#[cfg(test)]
+impl Beating {
+    /// Whether the host is starved still: before its bound, and no wait has
+    /// stored an expiry since it began. Ended, it is cleared and its stalled
+    /// answers woken.
+    fn starving(&mut self, changed: &Condvar) -> bool {
+        let Some(starved) = &self.starved else {
+            return false;
+        };
+        let expired = || self.tables.iter().zip(&starved.expiries).any(|(table, before)| table.expiries() != *before);
+        if Instant::now() < starved.until && !expired() {
+            return true;
+        }
+        self.starved = None;
+        changed.notify_all();
+        false
+    }
 }
 
 impl Beating {
@@ -218,7 +254,7 @@ impl Pulse {
             beat: 1,
             beaten: Instant::now(),
             #[cfg(test)]
-            starved_until: None,
+            starved: None,
         };
         Self { inner: Arc::new(Inner { beating: Mutex::new(beating), changed: Condvar::new(), late: AtomicU64::new(0) }) }
     }
@@ -264,14 +300,18 @@ impl Pulse {
         Ok(Pulsed { inner: self.inner.clone(), id })
     }
 
-    /// Starve the host for `duration` from now: its pulse does not beat,
-    /// and a host thread about to answer any of its tables stalls until the
-    /// starvation ends, so every wait that spins meanwhile ends on its still
-    /// pulse. Begun before a step is submitted, it holds whatever answers
-    /// the step's waits, however soon the host has them (a test's).
+    /// Starve the host from now until a wait of the device ends on its
+    /// still pulse, storing its expiry, or for at most `duration`: its pulse
+    /// does not beat, and a host thread about to answer any of its tables
+    /// stalls until the starvation ends, so the first wait that spins past
+    /// its patience, however long a spin of this device takes, ends on it.
+    /// Begun before a step is submitted, it holds whatever answers the
+    /// step's waits, however soon the host has them (a test's).
     #[cfg(test)]
     pub(crate) fn starve(&self, duration: Duration) {
-        self.inner.beating.lock().expect("a pulse never panics").starved_until = Some(Instant::now() + duration);
+        let mut beating = self.inner.beating.lock().expect("a pulse never panics");
+        let expiries = beating.tables.iter().map(Beaten::expiries).collect();
+        beating.starved = Some(Starved { until: Instant::now() + duration, expiries });
     }
 
     /// Beat a driven pulse's live tables `gap` after its last beat, as its
@@ -302,7 +342,7 @@ fn beat(inner: &Inner, generation: u64) {
         }
         // A starved host's pulse stands still; its next beat comes late.
         #[cfg(test)]
-        if beating.starved_until.is_some_and(|until| Instant::now() < until) {
+        if beating.starving(&inner.changed) {
             continue;
         }
         let now = Instant::now();
