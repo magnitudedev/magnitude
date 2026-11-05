@@ -736,6 +736,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.execution.load().expert_bank()
     }
 
+    /// The storage `holding` of the load's expert bank lies in, which its
+    /// resizes are of (`ElasticBank::holding_storage`).
+    pub fn expert_holding_storage(&self, holding: BankHolding) -> Result<crate::planning::BankTier, DomainError> {
+        self.family
+            .expert_bank()
+            .ok_or_else(|| DomainError::invariant(format!("{holding:?} of a load without an expert bank")))?
+            .holding_storage(holding)
+    }
+
     /// What the load's weight cap bounds, by the owner of each byte
     /// (`ModelLoadPlan::weight_owners`).
     pub fn weight_owners(&self) -> Result<Vec<(&'static str, u64)>, String> {
@@ -863,43 +872,45 @@ pub struct ExpertResizes {
 }
 
 /// The time expert bank resizes held the submitting thread at flight
-/// boundaries: the running resize's so far (none while none runs), and each
-/// holding's last finished one's, which is what its growth step costs the
-/// decode (none before one of it finished).
+/// boundaries: each store's running resize's so far (none while none of it
+/// runs), and each holding's last finished one's, which is what its growth
+/// step costs the decode (none before one of it finished).
 #[derive(Default)]
 struct ResizeHeld {
-    running: Option<f64>,
+    running: [Option<f64>; crate::planning::BankTier::COUNT],
     last: std::collections::HashMap<BankHolding, f64>,
     /// The resizes begun.
     begun: u64,
 }
 
 impl ResizeHeld {
-    /// A resize began, holding the thread since `started`.
-    fn begin(&mut self, started: Instant) {
-        self.running = Some(started.elapsed().as_secs_f64());
+    /// A resize of `tier` storage began, holding the thread since `started`.
+    fn begin(&mut self, tier: crate::planning::BankTier, started: Instant) {
+        self.running[tier.index()] = Some(started.elapsed().as_secs_f64());
         self.begun += 1;
     }
 
-    /// The running resize, if one runs, held the thread since `started`.
+    /// Each running resize held the thread since `started`: the boundary's
+    /// work is every running one's.
     fn hold(&mut self, started: Instant) {
-        if let Some(running) = &mut self.running {
-            *running += started.elapsed().as_secs_f64();
+        let held = started.elapsed().as_secs_f64();
+        for running in self.running.iter_mut().flatten() {
+            *running += held;
         }
     }
 
-    /// The running resize, of `holding`, finished, holding the thread since
-    /// `started`: the seconds it held the thread in all.
-    fn finish(&mut self, started: Instant, holding: BankHolding) -> f64 {
+    /// The running resize of `tier` storage, of `holding`, finished, holding
+    /// the thread since `started`: the seconds it held the thread in all.
+    fn finish(&mut self, started: Instant, tier: crate::planning::BankTier, holding: BankHolding) -> f64 {
         self.hold(started);
-        let held = self.running.take().expect("a finished resize began");
+        let held = self.running[tier.index()].take().expect("a finished resize began");
         self.last.insert(holding, held);
         held
     }
 
     /// Whether a resize runs.
     fn runs(&self) -> bool {
-        self.running.is_some()
+        self.running.iter().any(Option::is_some)
     }
 }
 

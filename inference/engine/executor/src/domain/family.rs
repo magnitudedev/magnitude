@@ -183,6 +183,10 @@ pub trait ElasticBank {
         wake: crate::CompletionWake,
     ) -> Result<BankStep, super::DomainError>;
 
+    /// The storage `holding` lies in, which its resizes are of: each store
+    /// resizes on its own ([`BankStep::Begun`]).
+    fn holding_storage(&self, holding: BankHolding) -> Result<crate::planning::BankTier, super::DomainError>;
+
     /// At a flight boundary: install a running shrink's prepared storage and
     /// begin its release off this thread, `wake` completed once that ends;
     /// or take back the released shrink; or take a growth its resize thread
@@ -296,9 +300,11 @@ pub enum TierFill {
 /// What asking an elastic bank for a resize came to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BankStep {
-    /// The resize runs; [`ElasticBank::advance`] finishes it.
-    Begun,
-    /// Another resize runs: this one waits for it.
+    /// The resize runs in the holdings of this storage; [`ElasticBank::advance`]
+    /// finishes it. Each store resizes on its own, so a resize of one never
+    /// waits on the other's.
+    Begun(crate::planning::BankTier),
+    /// Another resize of the store this one is of runs: this one waits for it.
     Running,
     /// A step still runs once the queue is drained, so there is no gap to
     /// ask the watcher in: nothing began, and the next boundary decides

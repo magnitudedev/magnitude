@@ -107,7 +107,8 @@ pub(crate) struct ExpertBank {
     /// Its experts' slots' last finished resize
     /// ([`ElasticBank::record_resize`]).
     last_resize: Mutex<Option<BankResize>>,
-    /// The thread the resize's storage work runs on.
+    /// The thread the storage work of its records' resizes runs on (a host
+    /// tier's runs on its own, `HostTier::thread`).
     resize_thread: ResizeThread,
     /// Held across every rise of the bank's charge off the domain's thread
     /// ([`Self::hold_rises`]).
@@ -120,7 +121,9 @@ pub(crate) struct ExpertBank {
     landed: Option<Arc<[RecordTensors<Tensor>]>>,
 }
 
-/// The threads a bank's resizes keep busy beside decode: [`ResizeThread`]'s one.
+/// The threads a bank's resizes keep busy beside decode: the host tier's
+/// [`ResizeThread`], which backs the tier beside early decode; its records'
+/// own runs only a resize's storage work, never for a decode's length.
 pub(in crate::experts) const RESIZE_THREADS: usize = 1;
 
 impl Drop for ExpertBank {
@@ -128,7 +131,9 @@ impl Drop for ExpertBank {
     /// the bank's fields join as they drop, backs nothing more for a bank
     /// that is gone.
     fn drop(&mut self) {
-        self.stop_growth(true);
+        for tier in crate::planning::BankTier::ALL {
+            self.stop_growth(tier);
+        }
     }
 }
 

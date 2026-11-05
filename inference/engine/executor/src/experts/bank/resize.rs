@@ -1,6 +1,6 @@
 use super::{ExpertBank, host_views, landed_records};
 use crate::experts::source::Records;
-use crate::planning::{ExpertBankPlan, Placer};
+use crate::planning::{BankTier, ExpertBankPlan, Placer};
 use crate::experts::watcher::{Candidates, MoveBudget, ShrinkPlan};
 use crate::domain::{BankHolding, BankResized, BankStep, DomainError, ResizeTimes, Trip};
 use crate::CompletionWake;
@@ -32,6 +32,10 @@ pub(super) struct HostTier {
     pub(super) slots: Arc<AtomicU64>,
     pub(super) ceiling: std::num::NonZeroU64,
     pub(super) resize: HostResize,
+    /// The thread the tier's storage work runs on: host RAM is a store of
+    /// its own, so its backing and growth never queue a resize of the
+    /// device's records behind them, nor wait on one.
+    pub(super) thread: ResizeThread,
     /// Its host slots' last finished resize
     /// ([`crate::domain::ElasticBank::record_resize`]).
     pub(super) last_resize: Option<crate::domain::BankResize>,
@@ -330,8 +334,9 @@ impl Installed {
     }
 }
 
-/// The thread a bank's resizes do their storage work on, started with the
-/// bank and joined when it drops. A resize only hands it work: the kernel
+/// The thread a store's resizes of the bank do their storage work on (the
+/// bank's records' store, and a host tier's own), started with the bank and
+/// joined when it drops. A resize only hands it work: the kernel
 /// creates a thread from memory it may wait for, and memory is short exactly
 /// when a shrink is due. A 72-slot shrink of Qwen3.6-35B-A3B under 8 GB of
 /// pressure held the submitting thread 483.9 ms, all but its 3.5 ms plan
@@ -340,8 +345,8 @@ impl Installed {
 /// decision), M4 Pro, 2026-10-27.
 pub(super) struct ResizeThread {
     work: Option<std::sync::mpsc::Sender<Work>>,
-    /// Its one thread, busy beside decode while a resize or the host tier's
-    /// backing ([`HostResize::Backing`]) runs ([`RESIZE_THREADS`]).
+    /// Its one thread, busy while a resize of its store runs, beside decode
+    /// for the host tier's backing ([`HostResize::Backing`], [`RESIZE_THREADS`]).
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -505,7 +510,7 @@ impl ExpertBank {
     /// it ([`Self::growing`]); while a resize of it runs, none begins.
     pub(super) fn grow_host(&self, to: u64, wake: CompletionWake) -> Result<BankStep, DomainError> {
         Ok(match self.host_growth(to, wake, HostResize::Growing)? {
-            true => BankStep::Begun,
+            true => BankStep::Begun(BankTier::Host),
             false => BankStep::Running,
         })
     }
@@ -533,7 +538,7 @@ impl ExpertBank {
         };
         let records: RecordsAt = ExpertBankPlan::host_records;
         let tensors = (self.host_groups(), records);
-        match self.growing(resizers, (&tier.slots, to), tensors, Joining::Landed, charged, wake) {
+        match self.growing(resizers, (&tier.slots, to), tensors, Joining::Landed, charged, &tier.thread, wake) {
             Ok(growing) => tier.resize = resize(growing),
             Err((resizers, error)) => {
                 tier.resize = HostResize::Idle(resizers);
@@ -544,8 +549,8 @@ impl ExpertBank {
     }
 
     /// Begin growing a holding's record tensors (`resizers`, each of group
-    /// `groups[i]`, at `records`) from its `slots` now to `to` on the resize
-    /// thread ([`grow_by_slots`]), its records charged `charged` now, each
+    /// `groups[i]`, at `records`) from its `slots` now to `to` on its store's
+    /// resize `thread` ([`grow_by_slots`]), its records charged `charged` now, each
     /// slot joining the watcher as `joining` says as soon as every tensor
     /// backs it; `wake` completed once it ends. Refused, the resizers
     /// come back.
@@ -556,6 +561,7 @@ impl ExpertBank {
         (groups, records): (Vec<usize>, RecordsAt),
         joining: Joining,
         charged: u64,
+        thread: &ResizeThread,
         wake: CompletionWake,
     ) -> Result<Growing, (Vec<Resizer>, DomainError)> {
         let landed = match (joining, &self.landed) {
@@ -594,7 +600,7 @@ impl ExpertBank {
                 }
             }
         };
-        let done = self.resize_thread.run(wake, move || {
+        let done = thread.run(wake, move || {
             let rows = |at| groups.iter().map(|&group| records(&plan, group, at)).collect();
             // The growth ends however its slots end, a panic among them too
             // (re-raised to the thread's catch): no slot joins after.
@@ -609,18 +615,23 @@ impl ExpertBank {
         Ok(Growing { from, charged, decided, stop, done })
     }
 
-    /// End a running growth at its next slot ([`Growing::stop`]): a shrink
-    /// waits for it no longer than that slot's backing. The host tier's
-    /// growth or backing ends only where `host`: host memory needs it, or
-    /// a measurement's claim beside the load, whose hold would leave its
-    /// slots waiting with the resize thread, and every shrink behind them.
-    pub(super) fn stop_growth(&self, host: bool) {
-        if let Resize::Growing(growing) = &self.commitment().resize {
-            growing.stop.store(true, Ordering::Release);
-        }
-        if let Some(host) = self.host.as_ref().filter(|_| host) {
-            if let HostResize::Growing(growing) | HostResize::Backing(growing) = &host.lock().expect("host tier").resize {
-                growing.stop.store(true, Ordering::Release);
+    /// End a running growth of the holdings in `tier` storage at its next
+    /// slot ([`Growing::stop`]): a shrink of that store waits for it no
+    /// longer than that slot's backing. The host tier's backing is its
+    /// growth.
+    pub(super) fn stop_growth(&self, tier: BankTier) {
+        match tier {
+            BankTier::Bank => {
+                if let Resize::Growing(growing) = &self.commitment().resize {
+                    growing.stop.store(true, Ordering::Release);
+                }
+            }
+            BankTier::Host => {
+                if let Some(host) = self.host.as_ref() {
+                    if let HostResize::Growing(growing) | HostResize::Backing(growing) = &host.lock().expect("host tier").resize {
+                        growing.stop.store(true, Ordering::Release);
+                    }
+                }
             }
         }
         // A growth waiting between its slots on a hold looks again.
@@ -937,7 +948,7 @@ impl ExpertBank {
         };
         commitment.slots.store(to, Ordering::Release);
         commitment.resize = self.prepare_off_thread(resizers, (from, to), charged, begun, wake);
-        Ok(BankStep::Begun)
+        Ok(BankStep::Begun(BankTier::Bank))
     }
 
     /// [`ElasticBank::grow`] to `to` slots, its growth target, on the resize
@@ -956,14 +967,14 @@ impl ExpertBank {
         };
         let records: RecordsAt = ExpertBankPlan::records_at;
         let tensors = (self.record_groups(), records);
-        match self.growing(resizers, (&commitment.slots, to), tensors, joining, charged, wake) {
+        match self.growing(resizers, (&commitment.slots, to), tensors, joining, charged, &self.resize_thread, wake) {
             Ok(growing) => commitment.resize = Resize::Growing(growing),
             Err((resizers, error)) => {
                 commitment.resize = Resize::Idle(resizers);
                 return Err(error);
             }
         }
-        Ok(BankStep::Begun)
+        Ok(BankStep::Begun(BankTier::Bank))
     }
 
     /// [`ElasticBank::advance`]: a shrink's prepared storage installs at

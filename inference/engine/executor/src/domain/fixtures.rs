@@ -748,7 +748,7 @@ impl FakeBank {
             Err(refusal) => FakeResize::Refused(refusal.resizer, refusal.error, to < before.1),
         });
         wake.complete();
-        Ok(BankStep::Begun)
+        Ok(BankStep::Begun(crate::planning::BankTier::Bank))
     }
 }
 
@@ -933,9 +933,16 @@ impl ElasticBank for FakeBank {
             let holding = crate::BankHolding::Host;
             *self.host_grown.lock().unwrap() = Some(BankResized::Grown { holding, from, to, grown: to - from, refused: None, times });
             wake.complete();
-            return Ok(BankStep::Begun);
+            return Ok(BankStep::Begun(crate::planning::BankTier::Host));
         }
         self.begin(to, wake)
+    }
+
+    fn holding_storage(&self, holding: crate::BankHolding) -> Result<crate::planning::BankTier, DomainError> {
+        Ok(match holding {
+            crate::BankHolding::Host => crate::planning::BankTier::Host,
+            crate::BankHolding::Experts | crate::BankHolding::Table { .. } => crate::planning::BankTier::Bank,
+        })
     }
 
     fn advance(&self, wake: crate::CompletionWake) -> Result<Option<BankResized>, DomainError> {

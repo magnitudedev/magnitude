@@ -31,7 +31,7 @@ use super::{
     worker::Wakes,
 };
 use magnitude_executor::{
-    BankResize, BankResized, BankStep, DomainError, ExpertMeasures, InvariantError, MeasurementRoom,
+    BankResize, BankResized, BankStep, BankTier, DomainError, ExpertMeasures, InvariantError, MeasurementRoom,
     MemoryChargeReconciliation, MemoryMoment, NativeFamily,
     OpenRequirements, Operation, Outcome, PendingOperationOutcome, PhysicalDecision,
     ProgramFamily, RequestId, ResourceKind, ResourcePlan, ShrinkCause, StateBindings, SubmitError,
@@ -795,7 +795,7 @@ impl RoomClaim {
             MeasurementRoom::Unread | MeasurementRoom::Draining => return Ok(Some(self)),
             MeasurementRoom::Beyond { short, releasable } => Err(RoomRefusal::BeyondFloor { short, releasable }),
             MeasurementRoom::Short(short) => match shrink(short)? {
-                BankStep::Begun | BankStep::Running | BankStep::Deferred => return Ok(Some(self)),
+                BankStep::Begun(_) | BankStep::Running | BankStep::Deferred => return Ok(Some(self)),
                 BankStep::AtLimit => Err(RoomRefusal::AtFloor { short }),
             },
         };
@@ -909,8 +909,9 @@ pub struct BetweenFlights {
     /// Whether memory has stayed free (`platform::Recovery`), on the
     /// service clock: what the bank's growth waits on.
     recovery: magnitude_executor::platform::Recovery<u64>,
-    /// The running expert bank resize.
-    bank_began: Option<BankBegun>,
+    /// Each store's running expert bank resize this owner began: the stores
+    /// resize on their own (`BankStep::Begun`).
+    bank_began: [Option<BankBegun>; BankTier::COUNT],
     /// The measurement job's room claimed of the domain and not yet
     /// answered ([`Owner::claim_measurement_room`]).
     measurement_room: Option<RoomClaim>,
@@ -921,6 +922,23 @@ pub struct BetweenFlights {
 }
 
 impl BetweenFlights {
+    /// Whether an expert bank resize this owner began runs in any store.
+    fn resizing(&self) -> bool {
+        self.bank_began.iter().any(Option::is_some)
+    }
+
+    /// A resize of `tier` storage began, as `begun`: the bank begins none of
+    /// a store while one of it runs.
+    fn bank_begun(&mut self, tier: BankTier, begun: BankBegun) -> Result<(), String> {
+        match &mut self.bank_began[tier.index()] {
+            Some(running) => Err(format!("a {tier:?} resize began beside one running since {:?}", running.cause)),
+            slot => {
+                *slot = Some(begun);
+                Ok(())
+            }
+        }
+    }
+
     /// A load's memory as it opens: Normal, nothing in motion, observed at
     /// its first boundary.
     pub fn new() -> Self {
@@ -932,7 +950,7 @@ impl BetweenFlights {
             declined: None,
             room_owed: RoomOwed::default(),
             recovery: magnitude_executor::platform::Recovery::new(),
-            bank_began: None,
+            bank_began: [None; BankTier::COUNT],
             measurement_room: None,
             measures: None,
             next_observation: 0,
@@ -1697,7 +1715,7 @@ trait MemoryStep: MemoryHost + Sized {
         let memory = |error: String| invariant("memory observation")(error);
         let now = self.now();
         if now >= self.memory().next_observation {
-            let resizing = self.memory().bank_began.is_some();
+            let resizing = self.memory().resizing();
             self.memory().room_owed.probed(resizing);
             self.memory().next_observation = now.saturating_add(OBSERVATION_INTERVAL_NS);
             let observation = memory_observation(self.domain().probe_memory(OBSERVATION_INTERVAL)).map_err(memory)?;
@@ -1728,8 +1746,13 @@ trait MemoryStep: MemoryHost + Sized {
         // every decision past it is made on them; the expert bank's resize
         // advances, and a finished one frees what waited on it.
         if let Some(bindings) = bindings.as_deref_mut() {
+            // A refusal (the tier copy's grid could not be written) changes nothing: the
+            // experts stay priced by the measures before, and these, which the device would
+            // not take, are not tried again; the next stored costs reprice.
             if let Some(measures) = self.memory().measures.take() {
-                self.domain().measure_experts(measures, bindings).map_err(classify_domain_error)?;
+                if let Err(error) = self.domain().measure_experts(measures, bindings) {
+                    tracing::warn!(%error, "the newly stored costs were refused; the experts stay priced as before");
+                }
             }
             self.advance_expert_bank()?;
             // A release deferred for want of a gap is tried again at this
@@ -1749,8 +1772,9 @@ trait MemoryStep: MemoryHost + Sized {
                 let before = self.domain().memory_moment();
                 let wake = self.completion();
                 let step = self.domain().shrink_expert_bank_by(bindings, bytes, wake);
-                if step.map_err(classify_domain_error)? == BankStep::Begun {
-                    self.memory().bank_began = Some(BankBegun { held: before, cause: BankBegunFor::Shrink(ShrinkCause::LiveClaim) });
+                if let BankStep::Begun(tier) = step.map_err(classify_domain_error)? {
+                    let begun = BankBegun { held: before, cause: BankBegunFor::Shrink(ShrinkCause::LiveClaim) };
+                    self.memory().bank_begun(tier, begun).map_err(invariant("expert bank"))?;
                 }
             }
         }
@@ -1758,7 +1782,7 @@ trait MemoryStep: MemoryHost + Sized {
         // shrink toward its floor, read at a probe no resize ran across
         // (`room_owed`), so each shrink is seen before the next is decided:
         // answered once the room is made, or once the floor leaves it short.
-        let ready = self.memory().bank_began.is_none() && self.domain().chain_holder().is_none() && bindings.is_some();
+        let ready = !self.memory().resizing() && self.domain().chain_holder().is_none() && bindings.is_some();
         let deciding = match self.memory().room_owed.take(ready) {
             true => self.domain().measurement_room().map_err(classify_domain_error)?,
             false => None,
@@ -1773,12 +1797,15 @@ trait MemoryStep: MemoryHost + Sized {
                 let before = domain.memory_moment();
                 let step = domain.shrink_expert_bank_by(bindings, bytes, wake);
                 let step = step.map_err(classify_domain_error)?;
-                began = (step == BankStep::Begun).then_some(before);
+                if let BankStep::Begun(tier) = step {
+                    began = Some((tier, before));
+                }
                 Ok(step)
             })?;
             self.memory().measurement_room = waiting;
-            if let Some(held) = began {
-                self.memory().bank_began = Some(BankBegun { held, cause: BankBegunFor::Shrink(ShrinkCause::Measurement) });
+            if let Some((tier, held)) = began {
+                let begun = BankBegun { held, cause: BankBegunFor::Shrink(ShrinkCause::Measurement) };
+                self.memory().bank_begun(tier, begun).map_err(invariant("expert bank"))?;
             }
         }
         // Every release changes bindings, so it waits for a chain under way
@@ -1891,7 +1918,7 @@ trait MemoryStep: MemoryHost + Sized {
         // made beside it.
         if self.memory().condition != MemoryCondition::Normal
             || !self.memory().deficits.is_empty()
-            || self.memory().bank_began.is_some()
+            || self.memory().resizing()
         {
             return Ok(());
         }
@@ -1915,9 +1942,10 @@ trait MemoryStep: MemoryHost + Sized {
             let before = self.domain().memory_moment();
             let wake = self.completion();
             match self.domain().grow_expert_bank(kind, wake) {
-                Ok(BankStep::Begun) => {
+                Ok(BankStep::Begun(tier)) => {
                     decided(&"begun");
-                    self.memory().bank_began = Some(BankBegun { held: before, cause: BankBegunFor::Growth });
+                    let begun = BankBegun { held: before, cause: BankBegunFor::Growth };
+                    self.memory().bank_begun(tier, begun).map_err(invariant("expert bank"))?;
                     self.memory().declined = None;
                     return Ok(());
                 }
@@ -1962,11 +1990,10 @@ trait MemoryStep: MemoryHost + Sized {
         self.memory().ladder.pending = false;
         self.memory().room_owed.resized();
         let after = self.domain().memory_moment();
-        let BankBegun { held: before, cause } = self
-            .memory()
-            .bank_began
+        let tier = self.domain().expert_holding_storage(finished.holding()).map_err(classify_domain_error)?;
+        let BankBegun { held: before, cause } = self.memory().bank_began[tier.index()]
             .take()
-            .ok_or_else(|| invariant("expert bank")("a resize finished that never began".into()))?;
+            .ok_or_else(|| invariant("expert bank")(format!("a {tier:?} resize finished that never began")))?;
         let at_unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|error| invariant("expert bank")(format!("the clock is before the Unix epoch: {error}")))?
@@ -2084,6 +2111,7 @@ trait MemoryStep: MemoryHost + Sized {
                 held,
                 spared,
                 resident_slot,
+                began: None,
             },
             through,
         )?;
@@ -3757,6 +3785,8 @@ struct Releasing<'a, H: MemoryHost> {
     held: &'a BTreeSet<u64>,
     spared: &'a [RequestId],
     resident_slot: bool,
+    /// The store a bank shrink this release began is of.
+    began: Option<BankTier>,
 }
 
 /// Why the owner releases memory.
@@ -3799,8 +3829,9 @@ impl<H: MemoryHost> Releases for Releasing<'_, H> {
         let host_deficit = deficit(magnitude_executor::BankHolding::Host);
         let started = std::time::Instant::now();
         let released = self.release_at(rung)?;
-        if released == Release::Pending && self.host.memory().bank_began.is_none() {
-            self.host.memory().bank_began = Some(BankBegun { held: before, cause: self.cause.shrink() });
+        if let Some(tier) = self.began.take() {
+            let begun = BankBegun { held: before, cause: self.cause.shrink() };
+            self.host.memory().bank_begun(tier, begun).map_err(release_invariant("expert bank"))?;
         }
         if released == Release::Released {
             let domain = self.host.domain();
@@ -3846,7 +3877,11 @@ impl<H: MemoryHost> Releasing<'_, H> {
             Rung::Bank => {
                 let wake = self.host.completion();
                 match self.host.domain().shrink_expert_bank(self.bindings, wake)? {
-                    BankStep::Begun | BankStep::Running => Release::Pending,
+                    BankStep::Begun(tier) => {
+                        self.began = Some(tier);
+                        Release::Pending
+                    }
+                    BankStep::Running => Release::Pending,
                     BankStep::Deferred => Release::Deferred,
                     BankStep::AtLimit => Release::Nothing,
                 }
@@ -4484,7 +4519,7 @@ mod measurement_room_tests {
         let claim = claim
             .decide::<()>(MeasurementRoom::Short(4096), |bytes| {
                 asked = Some(bytes);
-                Ok(BankStep::Begun)
+                Ok(BankStep::Begun(magnitude_executor::BankTier::Bank))
             })
             .unwrap()
             .expect("the claim waits for its shrink");

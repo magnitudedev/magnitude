@@ -764,7 +764,7 @@ fn a_whole_banks_shrink_step_records_no_graph() {
         device.bound(seismic::Ledger::Own(*store), Some(view.charged)).unwrap();
     }
     let step = domain.shrink_expert_bank_by(&mut bindings, u64::MAX / 4, crate::CompletionWake::new(|| {})).unwrap();
-    assert_eq!(step, crate::BankStep::Begun, "a whole bank shrinks");
+    assert!(matches!(step, crate::BankStep::Begun(_)), "a whole bank shrinks: {step:?}");
     while domain.advance_expert_bank(crate::CompletionWake::new(|| {})).unwrap().is_none() {}
     assert!(domain.expert_bank_slots() < whole, "the bank shrank from {whole:?}");
     for (store, view) in &own {
@@ -823,7 +823,7 @@ fn shrunk_bank_scores_as_resident(
                 // A step still running (a queued successor) defers it to a
                 // later boundary.
                 match domain.shrink_expert_bank_by(&mut bindings, deficit, wake).unwrap() {
-                    crate::BankStep::Begun => {
+                    crate::BankStep::Begun(_) => {
                         shrinks += 1;
                         while domain.advance_expert_bank(crate::CompletionWake::new(|| {})).unwrap().is_none() {}
                         let priced = domain.expert_costs().map(|costs| costs.slots as u64);

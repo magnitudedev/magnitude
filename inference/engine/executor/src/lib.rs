@@ -118,7 +118,7 @@ pub use planning::{
     ArtifactComponent, ArtifactComponentKind, AssessmentFit, AssessmentFitVerdict,
     AssessmentGraphResourceBounds, AssessmentHeaderBounds, AssessmentMemoryBounds,
     AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding, AttentionShape, BackendPlan,
-    BankAllocation, BankBinding, ConveyorCarrier, ExpertBankPlan, Holding, StoredStack,
+    BankAllocation, BankBinding, BankTier, ConveyorCarrier, ExpertBankPlan, Holding, StoredStack,
     CONVERSATION_CHECKPOINTS, CPU_IMAGE_CELLS, CapabilityPlan, ComponentPlan, ComponentSelection,
     ConvolutionBinding, ConvolvedLayerBinding, CorrectorBinding, CorrectorLayerBinding,
     DenseBinding, DenseBranchBinding, DenseScales, DeviceProcessBytes, DraftBlockBinding,

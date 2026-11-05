@@ -213,6 +213,11 @@ impl BankTier {
     pub const COUNT: usize = 2;
     pub const ALL: [Self; Self::COUNT] = [Self::Bank, Self::Host];
 
+    /// The tier's place in [`Self::ALL`], for what is kept per tier.
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
     /// A contract whose store the tier lies in, which claims against it are
     /// placed under: `DeviceOnly`'s, which on a unified device is `Shared`'s
     /// too, or `Shared`'s.

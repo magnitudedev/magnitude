@@ -1513,8 +1513,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let moves = self.experts.as_ref().and_then(|measures| measures.moves.measured());
         let step = bank.shrink(resident, moves, deficit, &mut || self.queue.orphan(self.experts.as_ref(), bindings), wake)?;
         match step {
-            super::BankStep::Begun => {
-                self.resize_held.begin(started);
+            super::BankStep::Begun(tier) => {
+                self.resize_held.begin(tier, started);
                 self.shrink_step = true;
             }
             _ => self.resize_held.hold(started),
@@ -1608,11 +1608,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .claim_reserved(kind, bytes, unborn, HoldingClass::Model)?;
         let grown = bank.grow(resident, &measured, kind, room, wake);
         match grown {
-            Ok(super::BankStep::Begun) => {
+            Ok(super::BankStep::Begun(tier)) => {
                 self.bank_claim = Some(claim);
                 self.grown_last = Some(kind);
-                self.resize_held.begin(started);
-                Ok(super::BankStep::Begun)
+                self.resize_held.begin(tier, started);
+                Ok(super::BankStep::Begun(tier))
             }
             other => {
                 self.release_claim(claim);
@@ -1648,12 +1648,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.resize_held.hold(started);
             return Ok(None);
         };
-        let held = self.resize_held.finish(started, finished.holding());
-        if let super::BankResized::Shrunk { times, .. } = &finished {
-            self.pace.borrow_mut().released(times);
-        }
-        if let Some(claim) = self.bank_claim.take() {
-            self.release_claim(claim);
+        let holding = finished.holding();
+        let tier = bank.holding_storage(holding)?;
+        let held = self.resize_held.finish(started, tier, holding);
+        match &finished {
+            super::BankResized::Shrunk { times, .. } => self.pace.borrow_mut().released(times),
+            // A growth's claim was the heap's hold on what it backs, which
+            // Seismic now charges; a shrink beside it leaves it held.
+            super::BankResized::Grown { .. } | super::BankResized::Stopped { .. } | super::BankResized::Refused { .. } => {
+                if let Some(claim) = self.bank_claim.take() {
+                    self.release_claim(claim);
+                }
+            }
         }
         // The heap classifies against the charge it last read.
         self.refresh_memory()?;

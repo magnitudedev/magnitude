@@ -16,9 +16,9 @@ pub(crate) struct ServedBank {
     bank: Arc<ExpertBank>,
     moves: Vec<BankMoves>,
     tables: Vec<HeldTable>,
-    /// A table's or a store's shrink, done when asked, until the next
-    /// advance reports it.
-    finished: Mutex<Option<BankResized>>,
+    /// The resizes done when asked (a table's, a landed shrink), each until
+    /// an advance reports it, in the order they were done.
+    finished: Mutex<std::collections::VecDeque<BankResized>>,
     /// The rate the last shrink of the records the host lands into released
     /// them, in bytes a second, while holding the submitting thread (the
     /// watcher's copies of the records it keeps, then the storage's release);
@@ -101,7 +101,7 @@ impl ServedBank {
         tables: Vec<HeldTable>,
     ) -> Result<Self, String> {
         let moves = programs.expert_bank_moves(&bank.plan)?;
-        Ok(Self { bank, moves, tables, finished: Mutex::new(None), landed_rate: Mutex::new(None) })
+        Ok(Self { bank, moves, tables, finished: Mutex::default(), landed_rate: Mutex::new(None) })
     }
 
     /// The slots the bank and its host tier hold now, as the record prices
@@ -331,9 +331,9 @@ impl ServedBank {
             .ok_or_else(|| DomainError::invariant("a shrink raised its records' charge"))?;
         *self.landed_rate.lock().expect("landed rate") = Some(released as f64 / times.planned.as_secs_f64());
         let resized = BankResized::Shrunk { holding, from, to: at, released, times };
-        *self.finished.lock().expect("table resize outcome") = Some(resized);
+        self.finished.lock().expect("table resize outcome").push_back(resized);
         wake.complete();
-        Ok(BankStep::Begun)
+        Ok(BankStep::Begun(self.storage(holding)?))
     }
 
     /// The target of a shrink of the records the host lands into, of
@@ -396,14 +396,34 @@ impl ServedBank {
         Ok(Some(step.total_seconds))
     }
 
-    /// Whether a resize runs: the experts' (until its advance finishes it),
-    /// a table's (until an advance reports it) or the host tier's growth.
-    /// The tier's backing to its planned slots is no resize: it runs beside
-    /// them ([`ExpertBank::back_host`]).
-    fn running(&self) -> bool {
-        self.bank.resizing()
-            || self.finished.lock().expect("table resize outcome").is_some()
+    /// Whether a resize of the holdings in `tier` storage runs: of the
+    /// bank's store, the experts' (until its advance finishes it) or a
+    /// table's or landed shrink's (until an advance reports it); of host RAM,
+    /// the host tier's growth or its backing to its planned slots
+    /// ([`ExpertBank::back_host`]), or its landed shrink. Each store resizes
+    /// on its own.
+    fn running_in(&self, tier: crate::planning::BankTier) -> Result<bool, DomainError> {
+        let finished = self
+            .finished
+            .lock()
+            .expect("table resize outcome")
+            .iter()
+            .map(|resized| self.storage(resized.holding()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(finished.contains(&tier)
+            || match tier {
+                crate::planning::BankTier::Bank => self.bank.resizing(),
+                crate::planning::BankTier::Host => self.bank.host_growing() || self.bank.host_backing(),
+            })
+    }
+
+    /// Whether a growth may begin: no resize the owner began runs in any
+    /// store. The host tier's backing is the open's, which a growth runs
+    /// beside (the tier's own growth waits for it, `Self::growth_steps`).
+    fn growth_waits(&self) -> Result<bool, DomainError> {
+        Ok(self.bank.resizing()
             || self.bank.host_growing()
+            || !self.finished.lock().expect("table resize outcome").is_empty())
     }
 
     /// Resize table `index` to `records` records, now: the resize the next
@@ -445,9 +465,9 @@ impl ServedBank {
             Ok(()) if after < before => BankResized::Shrunk { holding, from, to, released: before - after, times },
             Ok(()) => BankResized::Grown { holding, from, to, grown: after - before, refused: None, times },
         };
-        *self.finished.lock().expect("table resize outcome") = Some(resized);
+        self.finished.lock().expect("table resize outcome").push_back(resized);
         wake.complete();
-        Ok(BankStep::Begun)
+        Ok(BankStep::Begun(self.storage(holding)?))
     }
 }
 
@@ -484,7 +504,9 @@ impl ElasticBank for ServedBank {
     }
 
     fn stop_growths(&self) {
-        self.bank.stop_growth(true);
+        // Both stores: a claim's hold would leave either one's slots waiting.
+        self.bank.stop_growth(crate::planning::BankTier::Bank);
+        self.bank.stop_growth(crate::planning::BankTier::Host);
     }
 
     fn hold_traffic(&self) -> crate::domain::TrafficHold {
@@ -526,26 +548,37 @@ impl ElasticBank for ServedBank {
         between_flights: &mut dyn FnMut() -> Result<(), DomainError>,
         wake: CompletionWake,
     ) -> Result<BankStep, DomainError> {
-        // The host tier gives way only to a shrink host memory needs: one
-        // that measures host storage short, or a release asked for its own
-        // sake, where no store is short.
-        let host_short = deficit(crate::planning::BankTier::Host) > 0 || deficit(crate::planning::BankTier::Bank) == 0;
-        if host_short && (self.bank.host_backing() || self.bank.host_growing()) {
-            let [device, host] = [crate::planning::BankTier::Bank, crate::planning::BankTier::Host].map(|kind| deficit(kind));
+        use crate::planning::BankTier;
+        // A store's growth gives way only to a shrink its own memory needs:
+        // one that measures it short, or a release asked for its own sake,
+        // where no store is short. Each gives way at its next slot.
+        let unshort = BankTier::ALL.into_iter().all(|tier| deficit(tier) == 0);
+        let pressed = |tier: BankTier| unshort || deficit(tier) > 0;
+        if pressed(BankTier::Host) && (self.bank.host_backing() || self.bank.host_growing()) {
+            let [device, host] = BankTier::ALL.map(|tier| deficit(tier));
             tracing::info!(
                 "the host tier's growth stops at {} host slots for a shrink: host short {host} bytes, device short {device} bytes",
                 self.bank.host_slots()
             );
         }
-        if self.running() || (host_short && self.bank.host_backing()) {
-            // A growth gives way at its next slot; the shrink is decided
-            // again at a later boundary.
-            self.bank.stop_growth(host_short);
-            return Ok(BankStep::Running);
+        for tier in BankTier::ALL.into_iter().filter(|&tier| pressed(tier)) {
+            self.bank.stop_growth(tier);
         }
         let Some(Step { holding, kind, from, to: shallowest, .. }) = self.shrinking(resident, deficit)? else {
+            // Every pressed holding is at its floor: a growth that gives way
+            // there releases what it backed once its advance reports it.
+            for tier in BankTier::ALL.into_iter().filter(|&tier| pressed(tier)) {
+                if self.running_in(tier)? {
+                    return Ok(BankStep::Running);
+                }
+            }
             return Ok(BankStep::AtLimit);
         };
+        // A resize of the shrink's own store runs: it is decided again at a
+        // later boundary. One of the other store's is no reason to wait.
+        if self.running_in(kind)? {
+            return Ok(BankStep::Running);
+        }
         // The shallowest target releasing the store's deficit, or the floor.
         let deepest = self.releasing(holding, from, deficit(kind))?
             .expect("a selected shrink releases physical storage");
@@ -616,7 +649,7 @@ impl ElasticBank for ServedBank {
         room: u64,
         wake: CompletionWake,
     ) -> Result<BankStep, DomainError> {
-        if self.running() {
+        if self.growth_waits()? {
             return Ok(BankStep::Running);
         }
         match self.growing(resident, measured, kind, room)?.map(|(step, _)| step) {
@@ -629,14 +662,21 @@ impl ElasticBank for ServedBank {
         }
     }
 
+    fn holding_storage(&self, holding: BankHolding) -> Result<crate::planning::BankTier, DomainError> {
+        self.storage(holding)
+    }
+
+    /// The records' resize advances at every boundary (a shrink's install
+    /// is due at one), whatever else finished: one finished resize is
+    /// reported a boundary, the others at the next.
     fn advance(&self, wake: CompletionWake) -> Result<Option<BankResized>, DomainError> {
+        if let Some(finished) = self.bank.advance(wake)? {
+            return Ok(Some(finished));
+        }
         if let Some(finished) = self.bank.advance_host()? {
             return Ok(Some(finished));
         }
-        if let Some(finished) = self.finished.lock().expect("table resize outcome").take() {
-            return Ok(Some(finished));
-        }
-        self.bank.advance(wake)
+        Ok(self.finished.lock().expect("table resize outcome").pop_front())
     }
 
     fn in_gap(&self) -> bool {

@@ -91,6 +91,7 @@ impl ExpertBank {
                     ceiling,
                     resize: HostResize::Idle(resizers),
                     last_resize: None,
+                    thread: ResizeThread::start()?,
                 }))
             })
             .transpose()?;
