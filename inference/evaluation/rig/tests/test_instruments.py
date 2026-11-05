@@ -936,13 +936,13 @@ def test_draft_answers_the_drafters_acceptance_exactly(tmp_path):
 
 
 def test_draft_compares_each_streamed_load_with_the_uncapped_anchor_by_anchor(tmp_path):
-    def run(name: str, rows: list[dict]) -> JobResult:
+    def run(name: str, rows: list[dict], code: int = 0) -> JobResult:
         directory = tmp_path / name
         directory.mkdir()
         (directory / "result.json").write_text(json.dumps({"measurements": {"drafting": {
             "proposed": 4, "accepted": 2, "tokens_per_verify": 2.0, "anchors": 2}}}))
         (directory / "draft.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
-        return JobResult(directory, directory / "log", 0)
+        return JobResult(directory, directory / "log", code)
 
     def row(anchor: int, target: list[int]) -> dict:
         return {"fixture_id": "f", "anchor": anchor, "proposals": [1, 2], "target": target}
@@ -952,6 +952,7 @@ def test_draft_compares_each_streamed_load_with_the_uncapped_anchor_by_anchor(tm
                                    weight_cap=[10, 20])
     answer = REGISTRY["draft"].answer(arguments, {
         "draft": run("draft", uncapped),
+        "measure": run("measure", []),
         harness.streamed(10): run("same", uncapped),
         harness.streamed(20): run("other", [row(3, [1, 2, 9]), row(7, [1, 6, 9])]),
     })
@@ -959,7 +960,19 @@ def test_draft_compares_each_streamed_load_with_the_uncapped_anchor_by_anchor(tm
     assert any(line.startswith("streamed 20: 1 of 2 anchors differ, first f @7") for line in answer.lines)
     assert not answer.ok, "a cap that differs fails the answer"
     alone = argparse.Namespace(**{**vars(arguments), "weight_cap": [10]})
-    assert REGISTRY["draft"].answer(alone, {"draft": run("draft-again", uncapped), harness.streamed(10): run("same-again", uncapped)}).ok
+
+    def alone_answer(name: str, streamed: JobResult, measured: int = 0):
+        return REGISTRY["draft"].answer(alone, {"draft": run(f"{name}-draft", uncapped),
+                                                "measure": run(f"{name}-measure", [], measured),
+                                                harness.streamed(10): streamed})
+
+    assert alone_answer("same", run("same-again", uncapped)).ok
+    assert not alone_answer("failed", run("failed", uncapped, 1)).ok, "a streamed job that failed fails it"
+    assert not alone_answer("unmeasured", run("unmeasured", uncapped), 1).ok, "a failed measurement job fails it"
+    assert not alone_answer("moved", run("moved", [row(3, [1, 2, 9]), row(8, [1, 5, 9])])).ok, "other anchors fail it"
+    nothing = REGISTRY["draft"].answer(alone, {"draft": run("empty-draft", []), "measure": run("empty-measure", []),
+                                               harness.streamed(10): run("empty", [])})
+    assert not nothing.ok, "no anchor compared is no pass"
     plan = REGISTRY["draft"].plan(parse("draft", *COMMON, "--model", MODEL, "--context", "4096", "--weight-cap", "10"), None, "alpha")
     assert [name for name, _ in plan.jobs] == ["draft", "measure", harness.streamed(10)]
 

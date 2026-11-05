@@ -18,6 +18,7 @@ concurrency) is `bench`'s.
 
 import argparse
 import json
+from dataclasses import dataclass
 
 from ..engine import Step, Weights
 from . import Answer, Instrument, JobResult, Measure, Plan, harness, lacking, unrecorded
@@ -100,34 +101,56 @@ def _rows(result: JobResult) -> list[tuple]:
     return [(row["fixture_id"], row["anchor"], row["proposals"], row["target"]) for row in rows]
 
 
+@dataclass(frozen=True)
+class _Reproduced:
+    """A streamed load drafted the uncapped load's proposals and target tokens at every one of
+    its anchors, of which there were some."""
+
+    anchors: int
+
+
+@dataclass(frozen=True)
+class _Parted:
+    """Why a streamed load's drafting is not shown to reproduce the uncapped load's."""
+
+    lines: tuple[str, ...]
+
+
+def _compare(cap: int, result: JobResult, reference: list[tuple]) -> _Reproduced | _Parted:
+    """One streamed load's drafting against the uncapped load's `reference`, anchor by anchor:
+    reproduced only where its job ended well and it drafted the same tokens at the same anchors,
+    and at least one."""
+    if result.code != 0:
+        return _Parted((f"streamed {cap}: harness draft exited {result.code}", *result.output()[-15:]))
+    rows = _rows(result)
+    if [row[:2] for row in rows] != [row[:2] for row in reference]:
+        return _Parted((f"streamed {cap}: drafted at other anchors than the uncapped load",))
+    if not rows:
+        return _Parted((f"streamed {cap}: no anchor drafted, so nothing compared",))
+    differing = [(mine, theirs) for mine, theirs in zip(rows, reference) if mine != theirs]
+    if not differing:
+        return _Reproduced(len(rows))
+    (fixture, anchor, proposals, target), (_, _, base_proposals, base_target) = differing[0]
+    return _Parted((f"streamed {cap}: {len(differing)} of {len(rows)} anchors differ, first {fixture} @{anchor}: "
+                    f"proposals {proposals} vs {base_proposals}, target {target} vs {base_target}",))
+
+
 def _streamed(arguments, results: dict[str, JobResult], uncapped: JobResult) -> tuple[list[str], bool]:
-    """Each streamed load's drafting against the uncapped load's, anchor by anchor, and whether
-    every one reproduced it: a cap whose job failed, or that drafted other anchors or other tokens,
-    does not."""
+    """Each streamed load's drafting against the uncapped load's, and whether every one
+    reproduced it. The streamed loads are priced by the product's measurement job: where that
+    job failed, none is the load it is named, and the answer fails with it."""
     if not arguments.weight_cap:
         return [], True
-    reference = _rows(uncapped)
-    lines, reproduced = [], True
-    for cap in arguments.weight_cap:
-        result = results[harness.streamed(cap)]
-        if result.code != 0:
-            lines.extend((f"streamed {cap}: harness draft exited {result.code}", *result.output()[-15:]))
-            reproduced = False
-            continue
-        rows = _rows(result)
-        if [row[:2] for row in rows] != [row[:2] for row in reference]:
-            lines.append(f"streamed {cap}: drafted at other anchors than the uncapped load")
-            reproduced = False
-            continue
-        differing = [(mine, theirs) for mine, theirs in zip(rows, reference) if mine != theirs]
-        if not differing:
-            lines.append(f"streamed {cap}: same proposals and target tokens at all {len(rows)} anchors")
-            continue
-        reproduced = False
-        (fixture, anchor, proposals, target), (_, _, base_proposals, base_target) = differing[0]
-        lines.append(f"streamed {cap}: {len(differing)} of {len(rows)} anchors differ, first {fixture} @{anchor}: "
-                     f"proposals {proposals} vs {base_proposals}, target {target} vs {base_target}")
-    return lines, reproduced
+    measured = results["measure"]
+    verdicts = [_compare(cap, results[harness.streamed(cap)], _rows(uncapped)) for cap in arguments.weight_cap]
+    lines = [] if measured.code == 0 else [f"measurement job exited {measured.code}", *measured.output()[-15:]]
+    for cap, verdict in zip(arguments.weight_cap, verdicts):
+        match verdict:
+            case _Reproduced(anchors):
+                lines.append(f"streamed {cap}: same proposals and target tokens at all {anchors} anchors")
+            case _Parted(parted):
+                lines.extend(parted)
+    return lines, measured.code == 0 and all(isinstance(verdict, _Reproduced) for verdict in verdicts)
 
 
 INSTRUMENT = Instrument(
