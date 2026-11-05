@@ -185,7 +185,7 @@ fn press_to_reclaim(host: &Host) -> AddressSpaceLimit {
     let band = || {
         host.owner()
             .inspect_domain(|domain| {
-                platform::observe_domains(&catalog, domain.resources().device(), &reserves)
+                platform::observe_domains(&catalog, domain.resources().device(), &reserves, platform::HostRoom::Allocatable)
                     .map_err(|error| error.to_string())
             })
             .unwrap()[0]
@@ -607,7 +607,7 @@ fn admission_reclaims_under_a_real_process_limit() {
     let catalog = Devices::discover(&[]).unwrap();
     let reserves = MemoryReserves::standard();
     let allocation = |device: &seismic::Device| -> Result<DomainReading, String> {
-        let readings = platform::observe_domains(&catalog, device, &reserves)
+        let readings = platform::observe_domains(&catalog, device, &reserves, platform::HostRoom::Allocatable)
             .map_err(|error| error.to_string())?;
         Ok(readings[0].clone())
     };
@@ -854,7 +854,7 @@ fn reclaim_band_releases_then_unloads_under_a_real_process_limit() {
     let (domain, bindings, _) = build_native_domain(&resolved.manifest, package).unwrap();
     let catalog = Devices::discover(&[]).unwrap();
     let reserves = MemoryReserves::standard();
-    let planning = platform::observe_domains(&catalog, domain.resources().device(), &reserves)
+    let planning = platform::observe_domains(&catalog, domain.resources().device(), &reserves, platform::HostRoom::Allocatable)
         .unwrap()[0]
         .thresholds
         .planning_bytes;
@@ -929,7 +929,7 @@ fn reclaim_band_releases_then_unloads_under_a_real_process_limit() {
     let band = host
         .owner()
         .inspect_domain(|domain| {
-            platform::observe_domains(&catalog, domain.resources().device(), &reserves)
+            platform::observe_domains(&catalog, domain.resources().device(), &reserves, platform::HostRoom::Allocatable)
                 .map_err(|error| error.to_string())
         })
         .unwrap()[0]
@@ -1116,7 +1116,7 @@ fn reclaim_releases_retained_sessions_and_replays_them() {
     let band = |host: &Host| {
         host.owner()
             .inspect_domain(|domain| {
-                platform::observe_domains(&catalog, domain.resources().device(), &reserves)
+                platform::observe_domains(&catalog, domain.resources().device(), &reserves, platform::HostRoom::Allocatable)
                     .map_err(|error| error.to_string())
             })
             .unwrap()[0]

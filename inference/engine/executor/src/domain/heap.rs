@@ -95,7 +95,7 @@ pub fn require_normal(
     reserves: &MemoryReserves,
 ) -> Result<(), ClaimRefusal> {
     let readings =
-        crate::platform::observe_domains(catalog, device, reserves).map_err(ClaimRefusal::Blind)?;
+        crate::platform::observe_domains(catalog, device, reserves, crate::platform::HostRoom::Allocatable).map_err(ClaimRefusal::Blind)?;
     reclaiming(&readings).map_or(Ok(()), Err)
 }
 

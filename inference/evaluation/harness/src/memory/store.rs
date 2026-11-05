@@ -25,6 +25,14 @@ pub struct Target {
     devices: Devices,
     device: Device,
     store: StoreId,
+    /// Host RAM's room as the pressed load reads it while it serves
+    /// (`HostRoom::Served`): what the host can give without displacing more
+    /// of other programs' data than it held displaced as this target
+    /// opened, before the approach, the load serving already. Read as
+    /// allocatable alone, RAM the host freed by swapping under the approach
+    /// is room the load does not count, and a press sized from it lands
+    /// deeper below the load's line than its deficit.
+    room: HostRoom,
 }
 
 impl Target {
@@ -40,11 +48,14 @@ impl Target {
             PressureStore::Device => unique_store(device.info().paths(seismic::Placing::Fixed(seismic::Contract::DeviceOnly)).iter().map(|path|
                 topology.access_path(*path).expect("placement belongs to topology").store()))?,
         };
-        Ok(Self { devices, device, store })
+        let host = devices.status(topology, device.info().id()).sample.host_ram.map_err(|error| error.to_string())?;
+        // A platform that counts no displaced RAM displaces none.
+        let room = HostRoom::Served { displaced: host.displaced_bytes.unwrap_or(0) };
+        Ok(Self { devices, device, store, room })
     }
 
     pub fn reading(&self) -> Result<magnitude_executor::platform::DomainReading, String> {
-        observe_domains(&self.devices, &self.device, &MemoryReserves::standard())
+        observe_domains(&self.devices, &self.device, &MemoryReserves::standard(), self.room)
             .map_err(|error| error.to_string())?.into_iter().find(|reading| reading.domain == self.store)
             .ok_or_else(|| "selected pressure store has no admission observation".into())
     }

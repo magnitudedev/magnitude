@@ -43,7 +43,7 @@ use magnitude_executor::{
     ExecutionPath, UnpreparedUnits,
     assessment::prepare_execution_assessment,
     platform::{
-        DeviceRequest, MemoryReserves, OpenedPlatform, PlatformConfig, observe_domains, open_selected,
+        DeviceRequest, HostRoom, MemoryReserves, OpenedPlatform, PlatformConfig, observe_domains, open_selected,
         select_device,
     },
 };

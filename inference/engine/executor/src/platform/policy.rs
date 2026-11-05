@@ -914,16 +914,18 @@ impl fmt::Display for DomainReading {
     }
 }
 
-/// Fresh store readings for the executor's placements and host-side work.
-/// Allocation roles identify stores reached by device storage, not a
-/// promise that device storage occupies only one store.
+/// Fresh store readings for the executor's placements and host-side work,
+/// host RAM's room `room`. Allocation roles identify stores reached by
+/// device storage, not a promise that device storage occupies only one
+/// store.
 pub fn observe_domains(
     devices: &seismic::Devices,
     device: &seismic::Device,
     reserves: &MemoryReserves,
+    room: HostRoom,
 ) -> Result<Vec<DomainReading>, MemoryPolicyError> {
     let status = devices.status(device.topology(), device.info().id());
-    domain_readings(device, &status, reserves, HostRoom::Allocatable)
+    domain_readings(device, &status, reserves, room)
 }
 
 /// The readings of every store `device` places storage on, and host RAM,
