@@ -819,7 +819,7 @@ impl ExecutionPlanner {
                 host: device.host_tier.clone(),
                 executor: device.info.clone(),
                 reading: device.reading.clone(),
-                graph_cost: device.graph_cost,
+                graph_cost: device.graph_cost.cost(),
             },
             components,
             load,

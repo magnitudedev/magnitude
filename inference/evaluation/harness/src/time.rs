@@ -2017,7 +2017,7 @@ fn assessment(artifacts: &Artifacts, options: &EngineOptions) -> Result<Assessme
         ..ModelPolicy::default()
     };
     let reserves = magnitude_executor::platform::MemoryReserves::standard();
-    let structure = AssessmentStructure::discover(&catalog, options.device, reserves, policy, standard_service_limits())
+    let structure = AssessmentStructure::discover(&catalog, options.device, Some(cache.as_path()), reserves, policy, standard_service_limits())
         .map_err(|error| error.to_string())?;
     let measurements = structure.stored_measurements(cache);
     let package = ModelPackagePaths {

@@ -1389,6 +1389,7 @@ mod tests {
         let structure = magnitude_engine::assessment::AssessmentStructure::discover(
             &catalog,
             magnitude_executor::platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
+            None,
             magnitude_executor::platform::MemoryReserves::standard(),
             environment::serving_policy(),
             magnitude_engine::options::standard_service_limits(),

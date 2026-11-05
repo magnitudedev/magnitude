@@ -77,7 +77,7 @@ fn recorded_setup(
         .find(|executor| executor.backend() == backend)
         .expect("the recorded machine has the backend's executor")
         .clone();
-    let selected = magnitude_executor::platform::selected(&topology, &status, &reserves, info, graph_cost).unwrap();
+    let selected = magnitude_executor::platform::selected(&topology, &status, &reserves, info, magnitude_executor::platform::GraphPricing::Measured(graph_cost)).unwrap();
     AssessmentSetup {
         structure: Arc::new(AssessmentStructure {
             topology,

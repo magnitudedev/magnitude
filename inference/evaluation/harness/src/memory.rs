@@ -331,6 +331,7 @@ fn plan(
     let structure = AssessmentStructure::discover(
         &devices,
         device,
+        manifest.kernel_cache.as_deref(),
         MemoryReserves::standard(),
         policy,
         standard_service_limits(),

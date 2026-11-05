@@ -129,6 +129,13 @@ opening, a failure the probe reports, a kill or termination (the system's out of
 them), and a probe still running after 60 s, which is stopped so that a hung driver costs a job
 that long rather than its whole deadline.
 
+Graph memory is priced by the same rule: a load and an assessment open and measure nothing. A
+device's graphs are charged at the cost the measurement job stored for it, which a load requests
+and later loads read, and until then at its backend's bound, set above every device measured so
+far so that what is planned still fits once the device's own cost is known: on CUDA 256 KiB a
+graph and 16 KiB a node (an RTX 3090 measured about 100 KB and 8 KB), on Vulkan 1 KiB a launch.
+The cost graphs are priced at is part of the assessment's identity.
+
 ## Native programs
 
 Every native program is had through one owner per device, the program former. It keys an

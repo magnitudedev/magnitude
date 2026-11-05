@@ -57,7 +57,8 @@ pub enum PointRequest {
     /// The blocks a host tier's copy takes over the link (`TierCopyCosts`).
     TierCopy,
     /// What the executor's recorded graphs hold (`GraphMemory`): a load
-    /// runs without graphs until it is recorded.
+    /// prices its graphs at its backend's bound
+    /// (`seismic::unmeasured_graph_cost`) until it is recorded.
     GraphCost,
     /// How the volume `file` lies on is read, for the urgent request of
     /// `records` records of `parts` where a step waits on it (`VolumeCosts`).

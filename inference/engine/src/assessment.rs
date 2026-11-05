@@ -81,16 +81,19 @@ pub struct AssessmentStructure {
 }
 
 impl AssessmentStructure {
-    /// Select the device a native load would select and take one status
-    /// sample. Opens no device and measures nothing.
+    /// Select the device a native load would select, its graphs priced as
+    /// a load prices them from the kernel cache at `kernels`
+    /// (`platform::select_recorded`), and take one status sample. Opens no
+    /// device and measures nothing.
     pub fn discover(
         catalog: &Devices,
         device: DeviceRequest,
+        kernels: Option<&Path>,
         reserves: MemoryReserves,
         policy: ModelPolicy,
         service: ServiceLimits,
     ) -> Result<Self, ModelAssessmentError> {
-        let selected = platform::select_device(catalog, ExecutionPath::Native, device, &reserves)
+        let selected = platform::select_recorded(catalog, ExecutionPath::Native, device, &reserves, kernels)
             .map_err(ModelAssessmentError::Platform)?;
         let topology = catalog.topology();
         Ok(Self {

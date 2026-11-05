@@ -66,7 +66,7 @@ pub use command::{CompiledKernel, OccupancyRelation};
 pub use compile::NativeCandidate;
 pub use driver::{reservation_granule, RangeMemory, ReservedMemory, RESERVATION_CHUNKS};
 pub use executor::{CudaResizer, Device, Executor, MemoryAccounts, MemoryInfo, NativeStream};
-pub use graph_cost::graph_cost;
+pub use graph_cost::{graph_cost, UNMEASURED as UNMEASURED_GRAPH_COST};
 pub use open::{open, open_analytical, usable_memory_bytes, OpenedCuda};
 pub use profile::{
     can_access_peer, describe, device_count, max_allocation_bytes, ComputeCapability, CudaFacts,

@@ -685,6 +685,7 @@ fn cpu_structure() -> AssessmentStructure {
     AssessmentStructure::discover(
         &catalog,
         DeviceRequest::Backend(BackendName::Cpu),
+        None,
         MemoryReserves::standard(),
         ModelPolicy::default(),
         standard_service_limits(),
@@ -865,6 +866,7 @@ fn cpu_refusal(package: &ModelPackagePaths, policy: ModelPolicy) -> UnsupportedM
     let structure = AssessmentStructure::discover(
         &catalog,
         DeviceRequest::Backend(BackendName::Cpu),
+        None,
         MemoryReserves::standard(),
         policy,
         standard_service_limits(),

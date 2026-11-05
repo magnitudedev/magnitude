@@ -189,6 +189,9 @@ fn plan_on_device(
     // ambiguous match is refused, never substituted.
     let reserves = manifest.reserves;
     let selected = crate::planning::select_load_device(&catalog, manifest).map_err(platform_error)?;
+    if let (Some(root), platform::GraphPricing::Bound(_)) = (&manifest.kernel_cache, selected.graph_cost) {
+        touch(root, &selected.identity, &[magnitude_executor::assessment::PointRequest::GraphCost]);
+    }
     let backend = selected.info.backend();
     let capacity = ResourceCapacity {
         domain_bytes: selected.assessment_capacity_bytes,

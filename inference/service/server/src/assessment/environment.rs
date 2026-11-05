@@ -57,15 +57,17 @@ impl ServingDevice {
     }
 }
 
-/// The structure every model is assessed on: the [`ServingDevice`]. Opens no device and
-/// measures nothing.
+/// The structure every model is assessed on: the [`ServingDevice`], its graphs priced as a load
+/// prices them from the kernel cache at `kernels`. Opens no device and measures nothing.
 pub fn assessment_structure(
     devices: &Devices,
     serving: ServingDevice,
+    kernels: Option<&std::path::Path>,
 ) -> anyhow::Result<AssessmentStructure> {
     let structure = AssessmentStructure::discover(
         devices,
         serving.request(),
+        kernels,
         MemoryReserves::standard(),
         serving_policy(),
         standard_service_limits(),
@@ -145,9 +147,9 @@ impl AssessmentEnvironment {
     }
 }
 
-/// What of `structure` enters identity: the engine build, the selected device, the topology's
-/// normalized structure, the process limits and their visibility, the reserves and the
-/// configuration models are assessed with.
+/// What of `structure` enters identity: the engine build, the selected device and what its graphs
+/// are priced at, the topology's normalized structure, the process limits and their visibility,
+/// the reserves and the configuration models are assessed with.
 fn structure_identity(structure: &AssessmentStructure) -> anyhow::Result<serde_json::Value> {
     let host = structure
         .status
@@ -163,6 +165,7 @@ fn structure_identity(structure: &AssessmentStructure) -> anyhow::Result<serde_j
     Ok(json!({
         "engine_build": EngineBuild::current().0,
         "device": structure.selected.info.selector().to_string(),
+        "graph_cost": structure.selected.graph_cost,
         "topology": structure.topology.normalized(),
         "process_limits": process_limits,
         "limit_visibility": format!("{:?}", host.limit_visibility),
@@ -181,6 +184,7 @@ mod tests {
         assessment_structure(
             &seismic::Devices::discover(&[]).expect("device catalog"),
             ServingDevice::of(ExecutorSelector::HostCpu),
+            None,
         )
         .expect("the host CPU is usable")
     }
@@ -201,7 +205,7 @@ mod tests {
             .filter(|executor| magnitude_executor::platform::unusable_reason(executor).is_none())
         {
             let serving = ServingDevice::of(executor.selector());
-            let structure = assessment_structure(&devices, serving).unwrap();
+            let structure = assessment_structure(&devices, serving, None).unwrap();
             assert_eq!(structure.selected.info.selector(), serving.selector());
             assert_eq!(structure.device, serving.request());
         }

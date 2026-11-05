@@ -30,6 +30,7 @@
 //! interprets the portable body.
 
 pub mod api;
+pub use backends::unmeasured_graph_cost;
 /// What the process's large-page host backing came to (the host pages of
 /// reservations whose granules are whole large pages, backed in them or not),
 /// and the time its reservations' backing took by phase.

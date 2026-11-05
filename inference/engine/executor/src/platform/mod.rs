@@ -16,7 +16,7 @@ pub use policy::{
     Recovery, StorageDemand, StoreFit, observe_domains,
 };
 pub use qualification::{
-    FitReading, OpenedPlatform, PlatformConfig, PlatformError, SelectedDevice, host_tier, open_selected, select_device, select_recorded,
+    FitReading, GraphPricing, OpenedPlatform, PlatformConfig, PlatformError, SelectedDevice, host_tier, open_selected, select_device, select_recorded,
     selected,
 };
 pub use selection::{

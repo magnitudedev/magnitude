@@ -24,7 +24,7 @@ pub use facts::{
     Allocation, Calibration, Description, DeviceType, Facts, FormationTarget, Limits, MemoryHeap,
     MemoryLayout, MemoryType, Probed, Properties, ReservationForm, Reserving, SUBGROUP_WIDTH,
 };
-pub use graph_cost::graph_cost;
+pub use graph_cost::{graph_cost, UNMEASURED as UNMEASURED_GRAPH_COST};
 pub use reservation::{ReservedBuffer, VulkanResizer};
 pub use instance::LoaderError;
 pub use memory::{AllocationAccount, Buffer, MemoryAccounts};

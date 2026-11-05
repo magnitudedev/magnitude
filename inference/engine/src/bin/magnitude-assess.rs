@@ -260,6 +260,7 @@ fn run() -> Result<bool, String> {
     let structure = AssessmentStructure::discover(
         &catalog,
         options.device,
+        Some(options.kernels.as_path()),
         MemoryReserves::standard(),
         ModelPolicy::default(),
         standard_service_limits(),

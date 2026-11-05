@@ -189,6 +189,7 @@ fn cpu_structure() -> AssessmentStructure {
     AssessmentStructure::discover(
         &catalog,
         DeviceRequest::Backend(BackendName::Cpu),
+        None,
         MemoryReserves::standard(),
         ModelPolicy::default(),
         standard_service_limits(),

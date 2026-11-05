@@ -134,8 +134,10 @@ impl GraphBytes {
     }
 }
 
-/// What one device's recorded graphs hold for their census.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What one device's recorded graphs hold for their census. It serializes
+/// as its kind and its terms, which is how it enters an identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GraphCost {
     /// Recording holds no device memory: the CPU records nothing, and a
     /// Metal schedule is host data.

@@ -42,6 +42,12 @@ const KERNEL: (&str, &str) = (
     "seismic_graph",
 );
 
+/// What a device's instantiated graphs are charged at before [`graph_cost`]
+/// measured it there: a bound above every device measured so far (an RTX
+/// 3090 took 100,146 bytes a graph and 8,094 a node, in 2 MiB granules),
+/// so what is planned at it still fits once the device's own cost is read.
+pub const UNMEASURED: GraphCost = GraphCost::Pooled { graph: 256 << 10, launch: 16 << 10, granule: 2 << 20 };
+
 /// What graphs instantiated on `device` hold, measured on its first call
 /// in the process and kept for the device's ordinal after.
 pub fn graph_cost(device: &Device) -> Result<GraphCost, ExecutionError> {

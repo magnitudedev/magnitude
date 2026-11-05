@@ -1063,6 +1063,7 @@ fn cpu_environment() -> Arc<AssessmentEnvironment> {
     let structure = magnitude_engine::assessment::AssessmentStructure::discover(
         &catalog,
         magnitude_executor::platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
+        None,
         magnitude_executor::platform::MemoryReserves::standard(),
         crate::assessment::environment::serving_policy(),
         magnitude_engine::options::standard_service_limits(),
@@ -4969,6 +4970,7 @@ impl Requirements {
         let structure = magnitude_engine::assessment::AssessmentStructure::discover(
             &catalog,
             magnitude_executor::platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
+            None,
             reserves,
             crate::assessment::environment::serving_policy(),
             magnitude_engine::options::standard_service_limits(),

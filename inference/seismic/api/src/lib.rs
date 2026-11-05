@@ -36,7 +36,7 @@ pub use seismic_runtime::probes::{serve_probe_if_asked, KeptProbe, ProbeFailure,
 /// and how each backend establishes it.
 pub use seismic_lang::device;
 pub use seismic_runtime::formation::FormedPrograms;
-pub use seismic_runtime::{backing_times, large_page_backing, BackingTimes, LargePageBacking};
+pub use seismic_runtime::{backing_times, large_page_backing, unmeasured_graph_cost, BackingTimes, LargePageBacking};
 /// Offline formation coverage of a generated module's native
 /// implementations, and offline formation of the kernels a program requests.
 #[cfg(feature = "coverage")]

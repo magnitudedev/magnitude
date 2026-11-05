@@ -48,17 +48,15 @@ impl fmt::Display for ExecutionPlanningError {
 
 impl std::error::Error for ExecutionPlanningError {}
 
-/// Select the manifest's device as a load and its preview do: from its kernel
-/// cache's records where it keeps one, what its graphs hold being the
-/// measurement job's point; without one it runs without graphs.
+/// Select the manifest's device as a load and its preview do, measuring
+/// nothing: what its graphs hold is the measurement job's point, read from
+/// its kernel cache's records, its backend's bound until stored there
+/// (`platform::select_recorded`).
 pub(crate) fn select_load_device(
     catalog: &Devices,
     manifest: &ExecutionManifest,
 ) -> Result<SelectedDevice, PlatformError> {
-    match &manifest.kernel_cache {
-        Some(root) => platform::select_recorded(catalog, manifest.path, manifest.device, &manifest.reserves, root),
-        None => platform::select_device(catalog, manifest.path, manifest.device, &manifest.reserves),
-    }
+    platform::select_recorded(catalog, manifest.path, manifest.device, &manifest.reserves, manifest.kernel_cache.as_deref())
 }
 
 /// Plan the manifest's model on the selected device: component selection,

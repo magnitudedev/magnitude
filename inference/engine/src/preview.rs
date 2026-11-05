@@ -93,7 +93,7 @@ impl ExecutionManifest {
             DeviceProcessBytes::derive(backend, host_process.kernels).map_err(internal)?;
         let bounds = AssessmentHeaderBounds::derive(draft.load())
             .and_then(|header| {
-                header.with_graph_resource_bound(&graph, selected.graph_cost, host_process, device_process)
+                header.with_graph_resource_bound(&graph, selected.graph_cost.cost(), host_process, device_process)
             })
             .map_err(internal)?;
         let initial_state = state

@@ -127,6 +127,7 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
     let structure = Arc::new(assessment_structure(
         &catalog,
         ServingDevice::select(&catalog)?,
+        Some(kernels.as_path()),
     )?);
     let stored = structure.stored_measurements(&kernels);
     let environment = Arc::new(AssessmentEnvironment::new(

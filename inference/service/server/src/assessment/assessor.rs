@@ -1230,6 +1230,7 @@ mod tests {
             super::super::environment::assessment_structure(
                 &seismic::Devices::discover(&[]).expect("device catalog"),
                 super::super::environment::ServingDevice::of(seismic::ExecutorSelector::HostCpu),
+                None,
             )
             .expect("the host CPU is usable"),
         );

@@ -199,7 +199,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 let kernels = kernels.clone();
                 magnitude_service_utils::blocking::run(move || {
                     let serving = ServingDevice::select(&catalog)?;
-                    let structure = assessment_structure(&catalog, serving)?;
+                    let structure = assessment_structure(&catalog, serving, Some(kernels.as_path()))?;
                     let stored = structure.stored_measurements(&kernels);
                     anyhow::Ok((serving, Arc::new(structure), stored))
                 })

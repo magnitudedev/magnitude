@@ -45,6 +45,13 @@ pub(crate) const EMPTY: [u32; 35] = [
     0x0002_00F8, 4, 0x0001_00FD, 0x0001_0038,
 ];
 
+/// What a device's recorded graphs are charged at before [`graph_cost`]
+/// measured its command memory: a bound above what devices measured so far
+/// took (those measured took none a launch), beside the backend's own
+/// argument chunks, so what is planned at it still fits once the device's
+/// own cost is read.
+pub const UNMEASURED: GraphCost = GraphCost::Chunked { launch: 1 << 10, chunk: ARGUMENT_CHUNK_BYTES };
+
 /// What graphs recorded on `device` hold, measured on its first call in
 /// the process and kept for the device after.
 pub fn graph_cost(device: &Device) -> Result<GraphCost, ExecutionError> {

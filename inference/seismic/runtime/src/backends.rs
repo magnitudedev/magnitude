@@ -238,6 +238,22 @@ impl AdmittedWorkflowKind {
     }
 }
 
+/// What a device of `backend` is charged per recorded graph before its own
+/// cost is measured: its backend's bound (`seismic_cuda::UNMEASURED_GRAPH_COST`,
+/// `seismic_vulkan::UNMEASURED_GRAPH_COST`), none where recording holds no
+/// device memory. Opens nothing.
+pub fn unmeasured_graph_cost(backend: seismic_lang::registry::BackendName) -> GraphCost {
+    use seismic_lang::registry::BackendName;
+    match backend {
+        BackendName::Cuda => seismic_cuda::UNMEASURED_GRAPH_COST,
+        #[cfg(not(target_os = "macos"))]
+        BackendName::Vulkan => seismic_vulkan::UNMEASURED_GRAPH_COST,
+        #[cfg(target_os = "macos")]
+        BackendName::Vulkan => unreachable!("no Vulkan executor is discovered on macOS"),
+        BackendName::Cpu | BackendName::Metal => GraphCost::None,
+    }
+}
+
 /// Opens one executor of `topology`, revalidating its native identity, with
 /// its allocations charged to `memory`.
 pub(crate) fn open(

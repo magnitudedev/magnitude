@@ -167,7 +167,7 @@ fn selected_machine(
     let manifest = &resolved.manifest;
     let paths = served_paths(artifacts)?;
     let catalog = seismic::Devices::discover(&paths).map_err(|error| error.to_string())?;
-    let selected = magnitude_executor::platform::select_recorded(&catalog, manifest.path, manifest.device, &manifest.reserves, root)
+    let selected = magnitude_executor::platform::select_recorded(&catalog, manifest.path, manifest.device, &manifest.reserves, Some(root))
         .map_err(|error| error.to_string())?;
     Ok((paths, catalog, selected))
 }

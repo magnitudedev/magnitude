@@ -42,10 +42,35 @@ pub struct SelectedDevice {
     /// demand again: whether a linked host tier's size fits beside the
     /// load's other host RAM demand (`ExecutionPlanDraft::with_host_tier`).
     pub reading: FitReading,
-    /// What the executor's recorded graphs hold for their census, as its
-    /// backend measured it (`seismic::Devices::graph_cost`): what a plan
-    /// prices its graphs at.
-    pub graph_cost: seismic::GraphCost,
+    /// What a plan prices the executor's recorded graphs at
+    /// ([`GraphPricing`]).
+    pub graph_cost: GraphPricing,
+}
+
+/// What a selected executor's recorded graphs are priced at for their
+/// census: the device's own cost, or its backend's bound until that is
+/// measured. It serializes as which of the two it is and the cost, which is
+/// how it enters an identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "pricing", content = "cost", rename_all = "snake_case")]
+pub enum GraphPricing {
+    /// As its backend measured it (`seismic::Devices::graph_cost`), on
+    /// opening the device or by the measurement job
+    /// (`assessment::GraphMemory`).
+    Measured(seismic::GraphCost),
+    /// Its backend's bound (`seismic::unmeasured_graph_cost`), until the
+    /// measurement job stores the device's own: a load requests that of the
+    /// job (`assessment::PointRequest::GraphCost`), and later loads read it.
+    Bound(seismic::GraphCost),
+}
+
+impl GraphPricing {
+    /// The cost a plan charges its graphs at.
+    pub fn cost(self) -> seismic::GraphCost {
+        match self {
+            Self::Measured(cost) | Self::Bound(cost) => cost,
+        }
+    }
 }
 
 /// The stores, grants and reserves a fit question reads, as one reading
@@ -142,7 +167,8 @@ impl std::error::Error for PlatformError {}
 
 /// Automatic selection and stable assessment against the current topology,
 /// its graph cost measured by opening the device: what a tool selects by. A
-/// load selects by [`select_recorded`].
+/// load and an assessment select by [`select_recorded`], which measures
+/// nothing.
 pub fn select_device(
     catalog: &Devices,
     path: ExecutionPath,
@@ -156,33 +182,36 @@ pub fn select_device(
     // Read after the status, whose fit the opening the measurement takes
     // must not lower.
     let graph_cost = catalog.graph_cost(info.id()).map_err(PlatformError::Open)?;
-    selected(&topology, &status, reserves, info, graph_cost).map_err(PlatformError::Memory)
+    selected(&topology, &status, reserves, info, GraphPricing::Measured(graph_cost)).map_err(PlatformError::Memory)
 }
 
-/// [`select_device`], its graph cost as the kernel cache at `root` records
-/// it (`assessment::GraphMemory`), with no device opened; where nothing
-/// recorded it, as the backend measures it on opening the device, recorded
-/// for every later load: a load's graphs are charged and recorded at its
-/// device's cost, never left unrecorded.
+/// [`select_device`] with no device opened and nothing measured, what a
+/// load and an assessment select by: its graph cost as the kernel cache at
+/// `root` records it (`assessment::GraphMemory`), or, without a cache or
+/// until the measurement job stored it there, its backend's bound
+/// (`seismic::unmeasured_graph_cost`), so a load always plans, charges and
+/// records its graphs.
 pub fn select_recorded(
     catalog: &Devices,
     path: ExecutionPath,
     request: DeviceRequest,
     reserves: &MemoryReserves,
-    root: &std::path::Path,
+    root: Option<&std::path::Path>,
 ) -> Result<SelectedDevice, PlatformError> {
     enforce_phase_one(path)?;
     let topology = catalog.topology();
     let info = select(&topology, path, request).map_err(PlatformError::Selection)?;
     let status = catalog.status(&topology, info.id());
-    let records = crate::KernelCache::measurement_records(root);
-    let graph_cost = match crate::assessment::GraphMemory::stored(&topology, &info, &records).map_err(PlatformError::Records)? {
-        Some(recorded) => recorded,
-        None => {
-            let device = catalog.open(info.id()).map_err(PlatformError::Open)?;
-            crate::assessment::GraphMemory::record(&device, &records).map_err(PlatformError::Records)?;
-            device.graph_cost()
+    let recorded = match root {
+        Some(root) => {
+            let records = crate::KernelCache::measurement_records(root);
+            crate::assessment::GraphMemory::stored(&topology, &info, &records).map_err(PlatformError::Records)?
         }
+        None => None,
+    };
+    let graph_cost = match recorded {
+        Some(recorded) => GraphPricing::Measured(recorded),
+        None => GraphPricing::Bound(seismic::unmeasured_graph_cost(info.backend())),
     };
     selected(&topology, &status, reserves, info, graph_cost).map_err(PlatformError::Memory)
 }
@@ -195,7 +224,7 @@ pub fn selected(
     status: &seismic::Status,
     reserves: &MemoryReserves,
     info: Executor,
-    graph_cost: seismic::GraphCost,
+    graph_cost: GraphPricing,
 ) -> Result<SelectedDevice, MemoryPolicyError> {
     let fit = Fit::new(topology, status, reserves, HostRoom::Allocatable);
     let assessment_capacity_bytes = fit.placement(&info, Contract::DeviceOnly)?.stable_bytes;
