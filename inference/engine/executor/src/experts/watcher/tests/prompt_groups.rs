@@ -574,13 +574,11 @@ fn a_hit_the_layer_befores_seeding_evicts_is_read() {
         // One group of 4 records for both layers, a share of two each,
         // beside a host tier of room for every expert, so its reserve never
         // unmaps one the group read.
-        let harness = lending(name, EXPERTS, 4, 2, STAGING, conveying, 2 * EXPERTS as u32 + STAGING, Placer::Tier, false);
+        let harness = lending(name, EXPERTS, 4, 2, STAGING, conveying, 2 * EXPERTS as u32 + STAGING, Placer::Tier, true);
         harness.seeded(1, &[5]);
-        // Layer 1's decode reads of 6 and 7 take its share: 5 lies outside.
-        let decode = harness.step();
-        drop(harness.route_at(&decode, 0, &[]));
-        harness.request_at(&decode, 1, &[6, 7]);
-        decode.complete().unwrap();
+        // Layer 1's decode reads of 6 and 7 take its share, promoted beside
+        // 5, which lies outside it: one record is left free.
+        harness.promoted(1, &[6, 7]);
         let telemetry = &harness.watcher.shared().telemetry;
         eventually("the decode reads were never ranked", || telemetry.fed_all() && !telemetry.in_top()(1, 5));
         // The refill past the step, which decides what the group finds in
@@ -594,15 +592,15 @@ fn a_hit_the_layer_befores_seeding_evicts_is_read() {
         // (expert 4 read); step 1 routes layer 0's seeds after it.
         harness.publish(&steps[0], 1, &[4, 5]);
         harness.conveying(4);
-        // Step 1, the group's last at layer 0, seeds experts 0 to 3 into the
-        // group's 4 records, evicting the one outside every share: layer
-        // 1's 5.
+        // Step 1, the group's last at layer 0, seeds two of experts 0 to 3,
+        // its share: into the free record, and the one outside every share,
+        // evicting layer 1's 5.
         harness.rounds(&steps[1], 0);
-        assert_eq!(listed(&harness.load.2).len(), 4);
+        assert_eq!(listed(&harness.load.2).len(), 2);
         let first = steps[0].sequence();
         assert_eq!(harness.layers[1].0.held(5), None, "the evicted hit is unmapped");
         assert_eq!(harness.layers[1].0.resolve(5, first), None, "for every step of the group");
-        harness.publish(&steps[1], 1, &[6]);
+        harness.publish(&steps[1], 1, &[3]);
         // Expert 5's scratch slot, empty before step 0's tier there opens.
         let slot = |kind: usize| {
             let mut bytes = [0u8; RECORD as usize];
@@ -616,14 +614,14 @@ fn a_hit_the_layer_befores_seeding_evicts_is_read() {
         // is copied from it whole, and only 4 is converted.
         assert_eq!(harness.from_conveyor(&harness.rounds(&steps[0], 1).concat()), [4]);
         assert!((0..3).all(|kind| slot(kind) == [(100 * kind + 5) as u8; RECORD as usize]), "the demoted hit is copied from the tier");
-        // Step 1's 6 is read ahead as its request was taken, into the
-        // conveyor and on into the tier. Its round converts it from the
-        // conveyor, or where that landing ended and the conveyor let it go
-        // before the device arrived, its tier copy reads it: the one race
-        // here is which, and either fills its slot once.
+        // Step 1's 3, cold (6 is banked), is read ahead as its request was
+        // taken, into the conveyor and on into the tier. Its round converts
+        // it from the conveyor, or where that landing ended and the conveyor
+        // let it go before the device arrived, its tier copy reads it: the
+        // one race here is which, and either fills its slot once.
         let converted = harness.from_conveyor(&harness.rounds(&steps[1], 1).concat());
-        let tiered = listed(&harness.tiered).iter().any(|&(_, expert)| expert == 6);
-        assert!(converted == [6] || (converted.is_empty() && tiered), "converted {converted:?}, tier copied {tiered}");
+        let tiered = listed(&harness.tiered).iter().any(|&(_, expert)| expert == 3);
+        assert!(converted == [3] || (converted.is_empty() && tiered), "converted {converted:?}, tier copied {tiered}");
         for step in steps {
             step.complete().unwrap();
         }
@@ -1032,4 +1030,30 @@ fn ranked_share(placer: Placer) {
         }
         Placer::Tier => eventually("the bank never held exactly every layer's share", || (0..LAYERS).map(held).collect::<Vec<_>>() == tops()),
     }
+}
+
+/// A prompt group routing every expert of every layer into an empty bank
+/// beside a host tier leaves each layer at its share, wherever it falls in
+/// the pass: the first layer's seeds take no more free records than its
+/// share, so the last layer's seeds find theirs. With no promotion to
+/// rebalance after it, the bank holds each layer's share as decode begins.
+#[test]
+fn a_prompt_group_grows_no_layer_past_its_share() {
+    const LAYERS: usize = 4;
+    let harness = lending("share-cap", EXPERTS, 2 * LAYERS as u64, LAYERS, 8, WHOLE, (EXPERTS * LAYERS) as u32 + 8, Placer::Tier, false);
+    let step = harness.prompt_step();
+    let record = step.group_reads().unwrap();
+    let every = (0..EXPERTS).collect::<Vec<_>>();
+    let mut seeded = Vec::new();
+    for layer in 0..LAYERS {
+        harness.scratch(&step, layer, &every);
+        seeded.push(harness.commit_seeds(&step).len());
+        for expert in 0..EXPERTS {
+            harness.reads[layer].store(record * 2 * EXPERTS + expert, 1);
+        }
+    }
+    step.complete().unwrap();
+    assert_eq!(seeded, vec![2; LAYERS], "each layer seeds its share");
+    let held = |layer: usize| (0..EXPERTS).filter(|&expert| harness.layers[layer].0.held(expert).is_some()).count();
+    eventually("a layer never held its seeds", || (0..LAYERS).all(|layer| held(layer) == 2));
 }

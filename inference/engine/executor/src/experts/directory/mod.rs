@@ -491,7 +491,6 @@ impl Directory {
 
     /// Each layer's share of its group's records under the ranking: its
     /// records less its reserve, over its members.
-    #[cfg(test)]
     pub fn shares(&self) -> Vec<usize> {
         let groups = self.layer_groups();
         groups.iter().map(|&group| share(self.bank.records(group).len() - self.reserve[group], &groups, group)).collect()
@@ -1149,16 +1148,21 @@ impl Directory {
     /// a host tier (where the device places): `routed`, each expert with the
     /// step that last routed it. Each routed expert the layer lacks whose
     /// scratch slot the group filled (`filled`), the most reused first
-    /// ([`Ranked`]: reuse beside that step), takes a free record, or the
-    /// group's least reused record whose expert lies outside its own
-    /// layer's share (`Reuse::in_top`, as a release's) while
-    /// that ranks below it (beside the later of its ranking's last read and
-    /// that step, where the group routed it). No layer's share is taken: a
-    /// prompt group leaves every layer the experts the ranking holds for
-    /// it. The layer's `pinned` experts (those its merge set's pass reads in
-    /// place after the seeding) are never taken. The seeds, placed as fills
-    /// its seed copy and commit commit, with their records, and the experts
-    /// evicted, (layer, expert).
+    /// ([`Ranked`]: reuse beside that step), takes the least reused record
+    /// whose expert lies outside its own layer's share (`Reuse::in_top`, as
+    /// a release's) while that ranks below it (beside the later of its
+    /// ranking's last read and that step, where the group routed it), a
+    /// free record below every one. A record of the layer's own replaces
+    /// one of its experts; a free one or another layer's grows the layer,
+    /// which it takes only while the layer holds fewer experts than its
+    /// share ([`Self::shares`]). No layer's share is taken, and none grows
+    /// past it: a prompt group leaves every layer the experts the ranking
+    /// holds for it, and decode begins at each layer's share wherever the
+    /// layers fall in the pass, not with the first layers holding the
+    /// group's records. The layer's `pinned` experts (those its merge set's
+    /// pass reads in place after the seeding) are never taken. The seeds,
+    /// placed as fills its seed copy and commit commit, with their records,
+    /// and the experts evicted, (layer, expert).
     pub fn seed(&mut self, point: Point, layer: usize, routed: &[(usize, Step)], pinned: &[usize], filled: impl Fn(usize) -> bool) -> (Vec<(usize, BankRecord)>, Vec<(usize, usize)>) {
         let group = self.bank.group(layer);
         let (absent, mut records) = {
@@ -1176,8 +1180,18 @@ impl Directory {
                 .collect::<Vec<_>>();
             absent.sort_unstable_by(|a, b| b.cmp(a));
             let pinned = pinned.iter().filter_map(|&expert| self.bank.held(layer, expert)).collect::<Vec<_>>();
-            let shared = self.bank.records(group).iter().map(|content| matches!(*content, Record::Held((layer, expert)) if reuse.in_top(layer, expert))).collect::<Vec<_>>();
-            let records = self.least_of(&reuse, group, absent.len(), |record| reads[record], |record| pinned.contains(&record) || shared[record]);
+            let contents = self.bank.records(group);
+            let shared = contents.iter().map(|content| matches!(*content, Record::Held((layer, expert)) if reuse.in_top(layer, expert))).collect::<Vec<_>>();
+            let own = |record: usize| matches!(contents[record], Record::Held((owner, _)) if owner == layer);
+            let kept = |record: usize| pinned.contains(&record) || shared[record];
+            let read = |record: usize| reads[record];
+            // The least of the layer's own records, and of those that grow
+            // it, as many as its share has room for.
+            let room = self.shares()[layer].saturating_sub(self.held_count(layer));
+            let mut records = self.least_of(&reuse, group, absent.len(), read, |record| kept(record) || !own(record));
+            records.extend(self.least_of(&reuse, group, absent.len().min(room), read, |record| kept(record) || own(record)));
+            records.sort_unstable();
+            records.truncate(absent.len());
             (absent, records)
         };
         // The most reused seed against the least reused record, while it
