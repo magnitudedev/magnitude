@@ -34,6 +34,19 @@ impl Printer {
         }
     }
 
+    /// A `records (..)` line, at the current indent.
+    fn records(&mut self, records: &[NativeRecordDecl]) {
+        self.indent();
+        self.out.push_str("records (");
+        self.list(records, |p, record| match record {
+            NativeRecordDecl::Parameter(name) => p.out.push_str(&name.name),
+            NativeRecordDecl::Result { ordinal, .. } => {
+                let _ = write!(p.out, "result {ordinal}");
+            }
+        });
+        self.out.push_str(")\n");
+    }
+
     fn list<T>(&mut self, items: &[T], mut item: impl FnMut(&mut Self, &T)) {
         for (i, it) in items.iter().enumerate() {
             if i > 0 {
@@ -97,15 +110,7 @@ impl Printer {
                     self.out.push_str(")\n");
                 }
                 if !n.records.is_empty() {
-                    self.indent();
-                    self.out.push_str("records (");
-                    self.list(&n.records, |p, record| match record {
-                        NativeRecordDecl::Parameter(name) => p.out.push_str(&name.name),
-                        NativeRecordDecl::Result { ordinal, .. } => {
-                            let _ = write!(p.out, "result {ordinal}");
-                        }
-                    });
-                    self.out.push_str(")\n");
+                    self.records(&n.records);
                 }
                 for term in &n.terms {
                     self.indent();
@@ -165,6 +170,9 @@ impl Printer {
                         self.out.push_str("reads (");
                         self.list(&launch.reads, |p, name| p.out.push_str(&name.name));
                         self.out.push_str(")\n");
+                    }
+                    if let Some(records) = &launch.records {
+                        self.records(records);
                     }
                     self.indent();
                     self.out.push_str("threadgroups (");

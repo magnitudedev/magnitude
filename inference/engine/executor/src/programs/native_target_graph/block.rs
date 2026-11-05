@@ -18,7 +18,7 @@ use crate::{
         paired_block,
         routed::{
             split::{OnceStage, PassPorts, RunStage, SplitPorts, Stage, StagePorts},
-            streamed::{BankGraph, CheckedBankEntries},
+            streamed::{BankGraph, BankGraphEntries, CheckedBankEntries, LayerBank},
         },
         streams::{
             StreamsGeometry,
@@ -156,7 +156,7 @@ impl SealedBlockGraph {
         let feed_forward = handle.feed_forward.as_ref().map(Into::into);
         let mut banks = Vec::new();
         let mut parks = Vec::new();
-        let bank = handle.bank.as_ref().map(|kernels| BankGraph { entries: kernels.into(), ports: &mut banks, parks: &mut parks });
+        let bank = layer_bank(stage, handle.bank.as_ref().map(BankGraphEntries::from), &mut banks, &mut parks);
         let streams = handle.streams.as_ref().map(Into::into);
         let per_layer = match (&handle.per_layer, slot.per_layer()) {
             (None, None) => None,
@@ -301,12 +301,32 @@ impl<'a> BlockGraphInputs<'a> {
     }
 }
 
+/// How the routed layer of a block graph of `stage` reads its experts, of a
+/// block whose streamed layer's bank has `entries`: through the bank, its
+/// ports and parks into `ports` and `parks`; at its home records in the
+/// resident form (`RunStage::Resident`); from its stacks where the load
+/// holds them whole. Only a streamed layer has a resident form
+/// (`RunStage::sealed`), so a block of a held layer never has one.
+fn layer_bank<'p, 'a, G: GraphDraft + 'a>(
+    stage: Stage,
+    entries: Option<BankGraphEntries<'a, G>>,
+    ports: &'p mut Vec<(BankPort, NativePort)>,
+    parks: &'p mut Vec<(GraphTimeline, NativeTimelinePort)>,
+) -> LayerBank<'p, 'a, G> {
+    match (stage, entries) {
+        (Stage::Run(RunStage::Resident), Some(_)) => LayerBank::Home,
+        (Stage::Run(RunStage::Resident), None) => panic!("a resident form of a block whose experts are held whole"),
+        (_, Some(entries)) => LayerBank::Streamed(BankGraph { entries, ports, parks }),
+        (_, None) => LayerBank::Held,
+    }
+}
+
 /// The width of the rows a graph of block `block_index` of `stage` reads:
 /// its input rows, or a back's, the residual its front's mixer left. The
 /// pass reads only crossed rows.
 fn stage_input_width(geometry: &Decoder, block_index: usize, stage: Stage) -> Result<Option<u64>, String> {
     match stage {
-        Stage::Run(RunStage::Whole | RunStage::Front) => block_input_width(geometry, block_index).map(Some),
+        Stage::Run(RunStage::Whole | RunStage::Resident | RunStage::Front) => block_input_width(geometry, block_index).map(Some),
         Stage::Run(RunStage::Combine) => mixed_width(geometry).map(Some),
         Stage::Once(_) => Ok(None),
     }
@@ -433,10 +453,10 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         }
         Stage::Run(stage) => stage,
     };
-    // A whole block whose routed layer streams is marked at its ends: a
-    // mark at a graph's edge adds no node and divides nothing, and is
-    // stamped only on a sampled run (`seismic::NativeSpans`).
-    let begun = (stage == RunStage::Whole && feed_forward.bank.is_some()).then(|| graph.span_mark());
+    // A whole block whose routed layer streams, in either form, is marked
+    // at its ends: a mark at a graph's edge adds no node and divides
+    // nothing, and is stamped only on a sampled run (`seismic::NativeSpans`).
+    let begun = (stage.place() == RunStage::Whole && feed_forward.bank.banked()).then(|| graph.span_mark());
     // A front writes the taps before the feed-forward, a back the output's.
     let [entry, middle, output] = stage.taps();
     let mut taps = tap_entry
@@ -458,7 +478,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     // A back reads the residual its front's mixer left.
     let (mixed, mut mixer) = match stage {
         RunStage::Combine => (hidden.clone(), None),
-        RunStage::Whole | RunStage::Front => {
+        RunStage::Whole | RunStage::Resident | RunStage::Front => {
             if let Some(taps) = taps.as_mut().filter(|taps| taps.positions.entry) {
                 taps.ports.entry = Some(taps.tap(graph, hidden)?);
             }
@@ -624,7 +644,7 @@ pub(super) fn checked_block_graph_draft(
         .transpose()?;
     let mut banks = Vec::new();
     let mut parks = Vec::new();
-    let bank = checked_bank.as_ref().map(|checked| BankGraph { entries: checked.entries(), ports: &mut banks, parks: &mut parks });
+    let bank = layer_bank(stage, checked_bank.as_ref().map(CheckedBankEntries::entries), &mut banks, &mut parks);
     let checked_per_layer = block::checked_per_layer(slot.per_layer())?;
     let per_layer = checked_per_layer
         .as_ref()

@@ -30,6 +30,11 @@ pub(crate) enum WeightPart {
     /// A streamed gathered table's directory of every row's slot
     /// (`WeightPlan::streamed`).
     Directory,
+    /// A banked expert stack's home records, `[E, N, K]`: its layer's
+    /// experts at their home records in its group's (`ExpertBankPlan::home`),
+    /// where a whole bank holds each, which the layer's resident form reads
+    /// in place (`RunStage::Resident`).
+    Home,
 }
 
 /// A graph's park: one of `kind`, before a call of the streamed routed
@@ -102,6 +107,9 @@ impl WeightPart {
                     weight.descriptor().name
                 )
             }),
+            // Only a banked stack has home records, and the bank binds them
+            // (`ResidentTarget::bound`).
+            Self::Home => panic!("resident weight {:?} is held whole and has no home records", weight.descriptor().name),
         }
     }
 }
@@ -135,6 +143,13 @@ pub(crate) fn weight_port<G: GraphDraft>(
                     format!("planned weight {role:?} is held whole and has no directory").into(),
                 );
             }
+        },
+        // The group's records' shape at its layer's experts.
+        (WeightPart::Home, _) => match (plan.banked(), load.expert_bank().and_then(|bank| bank.layer(role.scope))) {
+            (Some(_), Some((_, layer))) => {
+                graph.port(plan.resident, &[&[layer.experts][..], &plan.shape[1..]].concat())
+            }
+            _ => return Err(format!("planned weight {role:?} is no banked stack and has no home records").into()),
         },
     }?;
     ports.push((WeightPort { role, part }, port.clone()));

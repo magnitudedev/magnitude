@@ -233,6 +233,7 @@ pub(super) fn certify_target_family(
         let slot = plan.blocks()[index];
         let paired = paired_block(&geometry.blocks[index]).map_err(|error| error.to_string())?;
         let split = block_split(load, geometry, index, limits)?.is_some();
+        let resident = streamed::resident_form(load, block_scopes(index)?[1]);
         let mut regimes: BTreeMap<RowForm, Vec<u64>> = BTreeMap::new();
         for &rows in row_classes {
             regimes.entry(RowForm::of(rows)).or_default().push(rows);
@@ -265,7 +266,7 @@ pub(super) fn certify_target_family(
                 if rows.is_empty() {
                     continue;
                 }
-                let stages = RunStage::served(split, largest).iter().filter(|&&stage| (stage == RunStage::Combine) == group);
+                let stages = RunStage::sealed(split, resident, largest).iter().filter(|&&stage| (stage == RunStage::Combine) == group);
                 for &stage in stages {
                     // The regime's class the template is drafted at.
                     let drafted = (
@@ -432,10 +433,14 @@ pub(super) fn certify_target_family(
             block_upload_regions(
                 row_classes.iter().copied(),
                 |rows| block_stages(&served, index, rows),
+                // A run's place holds each graph that takes it: a whole
+                // decode block's either form's.
                 |rows, stage| {
                     graphs
                         .iter()
-                        .filter(|(&(form, _, _, of, _), _)| form == RowForm::of(rows) && of == Stage::Run(stage))
+                        .filter(|(&(form, _, _, of, _), _)| {
+                            form == RowForm::of(rows) && matches!(of, Stage::Run(of) if of.place() == stage)
+                        })
                         .map(|(_, graph)| upload(&graph.layout))
                         .max()
                         .unwrap_or(0)

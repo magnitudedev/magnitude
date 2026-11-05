@@ -83,7 +83,7 @@ mod upload_region_tests {
             }
         };
         let upload = |rows: u64, stage: RunStage| match stage {
-            RunStage::Whole => 40,
+            RunStage::Whole | RunStage::Resident => 40,
             RunStage::Front => 100 * rows,
             RunStage::Combine => 4,
         };

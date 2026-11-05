@@ -984,7 +984,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                         experts: entries.experts,
                         combine: entries.combine,
                     },
-                    None,
+                    crate::operators::routed::streamed::LayerBank::Held,
                     load,
                     feed_forward_scope,
                     &mut weights,

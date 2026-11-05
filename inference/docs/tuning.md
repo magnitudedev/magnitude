@@ -93,9 +93,11 @@ declaration that reads the device has defaults only on a device, so preparation 
 as the device they run on offers it, and an assessment, a kernel identity or offline coverage,
 which name only a backend, refuse it.
 
-**Launch scope.** `params` and `where` may follow a launch's header. A launch's settings are its
-own, and another launch may reuse a name; a setting more than one launch reads is declared at the
-top. A launch's `where` is one more conjunct of the declaration's, held to the same checks.
+**Launch scope.** `params`, `where` and `records` may follow a launch's header. A launch's settings
+are its own, and another launch may reuse a name; a setting more than one launch reads is declared
+at the top. A launch's `where` is one more conjunct of the declaration's, held to the same checks.
+A launch's `records` lists its record ports (tensors it reaches a record at a time, through a table
+of the records' addresses) in place of the declaration's; launches of one kernel list the same.
 
 **Code settings.** Whether a setting changes generated code is derived from the source, never
 declared. In a launch-scoped CUDA or Metal source, a launch's code settings are its kernel's

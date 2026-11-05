@@ -1202,7 +1202,7 @@ mod tests {
                 seismic_topology::Reservation {
                     granule,
                     host_addressed: backing != ChunkBacking::Device,
-                    chunks: Some(seismic_topology::ReservationChunks { unit, table: seismic_topology::Contract::Upload }),
+                    chunks: Some(seismic_topology::ReservationChunks { unit, table: seismic_topology::Contract::Upload, whole: false }),
                 }
             );
             (granule, unit)

@@ -50,14 +50,18 @@ pub(crate) struct BoundTargetGraphs {
 }
 
 /// A run of a step of its load's expert bank: the bank, the step's
-/// sequence in it (`ExpertStep::sequence`), and whether the step times its
-/// blocks (`ExpertStep::samples`). Only a load with a bank holds graphs of
-/// bank parts and parks (`PreparedTargetGraphs::bind_weights`).
+/// sequence in it (`ExpertStep::sequence`), whether the step times its
+/// blocks (`ExpertStep::samples`), and whether its chain began resident
+/// (`ChainServing::resident`), so its whole decode blocks take their
+/// resident forms (`PreparedTargetGraphs::run_stage`). Only a load with a
+/// bank holds graphs of bank parts and parks
+/// (`PreparedTargetGraphs::bind_weights`).
 #[derive(Clone)]
 pub(crate) struct BankRun {
     pub(crate) bank: Arc<crate::experts::ExpertBank>,
     pub(crate) sequence: u64,
     pub(crate) sampled: bool,
+    pub(crate) resident: bool,
 }
 
 impl BankRun {

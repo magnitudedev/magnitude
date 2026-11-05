@@ -1,4 +1,4 @@
-use super::{ExpertBank, PoolConveyor, allocate_placed, host_views, landed_tensors, placed_words, slot_maps, write_blocks};
+use super::{ExpertBank, PoolConveyor, allocate_placed, homes, host_views, landed_tensors, placed_words, slot_maps, write_blocks};
 use crate::experts::conveyor::{Carrier, LentPool, Lending};
 use crate::experts::source::{ExpertSource, Records};
 use crate::experts::watcher::{Copier, CopyTensor, Extents, Group, Layer, ListRecords, LoadWords, PlacedWords, Pool, Steps, StoredTensor, Watcher, WatcherParts};
@@ -157,6 +157,7 @@ impl ExpertBank {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        let homes = plan.reaches_whole().then(|| homes(plan, &layout)).transpose()?;
         let slot_maps = slot_maps(plan, &layout)?;
         // Derived once here, so no resize derives them on the step's thread.
         let deriving = std::time::Instant::now();
@@ -183,6 +184,9 @@ impl ExpertBank {
             pool_of,
             conveyors,
             scratch,
+            homes,
+            #[cfg(test)]
+            resident_decodes: std::sync::atomic::AtomicU64::new(0),
             host,
             slot_maps,
             watcher,

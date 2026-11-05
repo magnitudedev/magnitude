@@ -7226,6 +7226,7 @@ fn update_declaration_digest(
         params,
         elements,
         records,
+        launch_records,
         constraint,
         scratch,
         launches,
@@ -7243,6 +7244,11 @@ fn update_declaration_digest(
         )
         .as_bytes(),
     );
+    // An empty list names nothing a declaration forms, so it digests as
+    // nothing: a declaration's identity changes only with what it forms.
+    if !launch_records.is_empty() {
+        digest.update(format!("{launch_records:?}").as_bytes());
+    }
     // A stable entry identity names the whole module, with the paths its
     // sources were built from; the content names the entry's closure alone.
     digest.update(b"checked-entry-content-v1");

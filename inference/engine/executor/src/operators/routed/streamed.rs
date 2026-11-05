@@ -354,6 +354,34 @@ pub(crate) struct BankGraph<'p, 'a, G: GraphDraft + 'a> {
     pub parks: &'p mut Vec<(GraphTimeline, NativeTimelinePort)>,
 }
 
+/// How a routed layer's graph reads its experts: from the stacks a load
+/// that holds them whole imported (`Held`); through the bank that streams
+/// them (`Streamed`); or, a streamed layer's resident form
+/// (`RunStage::Resident`), in place at its whole bank's home records, as a
+/// held layer reads its stacks (`Home`).
+pub(crate) enum LayerBank<'p, 'a, G: GraphDraft + 'a> {
+    Held,
+    Streamed(BankGraph<'p, 'a, G>),
+    Home,
+}
+
+impl<'a, G: GraphDraft + 'a> LayerBank<'_, 'a, G> {
+    /// The part of the planned expert stacks the layer's graph binds: the
+    /// layer's home records in its resident form, else the planned values (a
+    /// streamed layer's its group's records, `ResidentTarget::bound`).
+    pub(crate) fn stacks(&self) -> WeightPart {
+        match self {
+            Self::Home => WeightPart::Home,
+            Self::Held | Self::Streamed(_) => WeightPart::Values,
+        }
+    }
+
+    /// Whether the layer's experts are its bank's.
+    pub(crate) fn banked(&self) -> bool {
+        !matches!(self, Self::Held)
+    }
+}
+
 /// The bank that serves the routed layer of `scope`, and the layer's place
 /// among its layers; none of a layer `load` keeps resident.
 pub(crate) fn served(load: &ModelLoadPlan, scope: WeightScope) -> Option<(&ExpertBankPlan, usize)> {
@@ -372,13 +400,13 @@ pub(crate) fn source_rows(load: &ModelLoadPlan, scope: WeightScope) -> u64 {
     }
 }
 
-/// Whether the routed layer of `scope` may decode in the Expand form: a
-/// layer `load`'s bank serves ([`served`]) reads its experts through the bank
-/// in the route's own launch, which only the shared-route form does.
-pub(crate) fn expand_form(load: &ModelLoadPlan, scope: WeightScope) -> Result<(), &'static str> {
-    match served(load, scope) {
-        Some(_) => Err("a streamed layer's decode needs the shared-route form"),
-        None => Ok(()),
+/// Whether a routed layer may decode in the Expand form: one that reads its
+/// experts through its bank (`streamed`) does so in the route's own launch,
+/// which only the shared-route form does.
+pub(crate) fn expand_form(streamed: bool) -> Result<(), &'static str> {
+    match streamed {
+        true => Err("a streamed layer's decode needs the shared-route form"),
+        false => Ok(()),
     }
 }
 
@@ -402,15 +430,17 @@ pub(crate) struct DecodeShape {
 }
 
 impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
-    /// The routed layer of `scope` with its `bank`'s graph, when the load
-    /// streams it.
+    /// The routed layer of `scope` with its `bank`'s graph, when its graph
+    /// reads its experts through the bank that streams them; none of a layer
+    /// the load holds whole, nor of a streamed layer's resident form.
     pub(crate) fn of(
         load: &'p ModelLoadPlan,
         scope: WeightScope,
-        bank: Option<BankGraph<'p, 'a, G>>,
+        bank: LayerBank<'p, 'a, G>,
     ) -> Result<Option<Self>, GraphError> {
         match (served(load, scope), bank) {
-            (Some((plan, index)), Some(BankGraph { mut entries, ports, parks })) => {
+            (Some(_), LayerBank::Home) | (None, LayerBank::Held) => Ok(None),
+            (Some((plan, index)), LayerBank::Streamed(BankGraph { mut entries, ports, parks })) => {
                 // The plan alone says which layers have a CPU site
                 // (`ExpertBankPlan::sited`): a layer encodes the load's site
                 // entries exactly there, and a sited layer needs them.
@@ -429,7 +459,6 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
                     parks,
                 }))
             }
-            (None, None) => Ok(None),
             _ => Err("a routed layer's bank entries disagree with its plan".into()),
         }
     }
@@ -1061,7 +1090,7 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
 /// any form (`OnceStage::Fill`, `StreamedLayer::fill_scratch`).
 pub(crate) fn scratch_fill<'a, G: GraphDraft + 'a>(
     graph: &mut G,
-    bank: Option<BankGraph<'_, 'a, G>>,
+    bank: LayerBank<'_, 'a, G>,
     load: &ModelLoadPlan,
     scope: WeightScope,
     weights: &mut Vec<(WeightPort, NativePort)>,
@@ -1269,6 +1298,13 @@ pub(crate) struct WaitPorts<'f> {
 /// Whether `load` streams the experts of the feed-forward of `scope`.
 pub(crate) fn streams(load: &ModelLoadPlan, scope: WeightScope) -> bool {
     load.expert_bank().is_some_and(|bank| bank.feed_forward(scope).is_some())
+}
+
+/// Whether the streamed feed-forward of `scope` has a resident form
+/// (`RunStage::Resident`): its bank can hold every expert
+/// (`ExpertBankPlan::reaches_whole`), so it can be whole.
+pub(crate) fn resident_form(load: &ModelLoadPlan, scope: WeightScope) -> bool {
+    streams(load, scope) && load.expert_bank().is_some_and(ExpertBankPlan::reaches_whole)
 }
 
 impl<'a, G: GraphDraft + 'a> StreamedLayer<'_, 'a, G> {

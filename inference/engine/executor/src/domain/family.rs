@@ -109,6 +109,10 @@ pub trait ElasticBank {
     /// The landings the device has converted.
     #[cfg(test)]
     fn device_landed(&self) -> u64;
+    /// The decode steps begun while the bank was whole, which ran the
+    /// resident forms (`ExpertBank::begin`).
+    #[cfg(test)]
+    fn resident_decodes(&self) -> u64;
 
     /// Begin a shrink toward the floor, at a flight boundary, of the holding
     /// whose bytes save the decode least of those held in storage short of

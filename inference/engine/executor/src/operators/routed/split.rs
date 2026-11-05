@@ -29,10 +29,16 @@ pub(crate) enum Stage {
 }
 
 /// The part of a block a run's graph holds: the whole block, or a split
-/// block's front or back.
+/// block's front or back. A whole decode block whose streamed layer's bank
+/// can hold every expert (`ExpertBankPlan::reaches_whole`) has a second
+/// whole graph, its resident form, which reads the layer's experts in place
+/// at their home records, as a resident layer reads its stacks: a decode run
+/// takes it in place of the whole block's while its bank is whole
+/// (`ExpertBank::begin`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum RunStage {
     Whole,
+    Resident,
     Front,
     Combine,
 }
@@ -48,8 +54,8 @@ impl RunStage {
     /// Which of a block's draft taps, at its entry, before its
     /// feed-forward and at its output, a graph of this stage writes.
     pub(crate) fn taps(self) -> [bool; 3] {
-        let mixes = matches!(self, Self::Whole | Self::Front);
-        [mixes, mixes, matches!(self, Self::Whole | Self::Combine)]
+        let mixes = matches!(self, Self::Whole | Self::Resident | Self::Front);
+        [mixes, mixes, matches!(self, Self::Whole | Self::Resident | Self::Combine)]
     }
 
     /// The stages of `rows` rows of a block whose prompt rows `split`, their
@@ -59,6 +65,26 @@ impl RunStage {
             _ if super::fused_graph::decodes(rows) => &[Self::Whole],
             true => &[Self::Front, Self::Combine],
             false => &[Self::Whole],
+        }
+    }
+
+    /// The stages a block's graphs of `rows` rows are sealed in: those its
+    /// runs take ([`Self::served`]), and beside a decode block's whole graph
+    /// its resident form, where its streamed layer's bank can be whole
+    /// (`resident`).
+    pub(crate) fn sealed(split: bool, resident: bool, rows: u64) -> &'static [Self] {
+        match resident && super::fused_graph::decodes(rows) {
+            true => &[Self::Whole, Self::Resident],
+            false => Self::served(split, rows),
+        }
+    }
+
+    /// The stage whose place in a run this one's graph takes: the resident
+    /// form takes its whole block's.
+    pub(crate) fn place(self) -> Self {
+        match self {
+            Self::Resident => Self::Whole,
+            stage => stage,
         }
     }
 }
@@ -240,7 +266,7 @@ impl SplitPorts {
     ) -> Result<Option<Self>, GraphError> {
         let routed = || routed.ok_or("a split block without a routed layer");
         Ok(match stage {
-            RunStage::Whole => None,
+            RunStage::Whole | RunStage::Resident => None,
             RunStage::Front => Some(Self::Front(
                 Crossing::of(routed()?, geometry, rows).try_map(|value| crossed(graph, value))?,
             )),

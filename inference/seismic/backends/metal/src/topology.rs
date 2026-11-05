@@ -20,7 +20,7 @@ pub fn kind() -> KindReport {
         reservation: Ok(Some(Reservation {
             granule: crate::device::RESERVATION_GRANULE as u64,
             host_addressed: crate::device::RESERVATIONS_HOST_ADDRESSED,
-            chunks: crate::device::RESERVATION_CHUNKS.map(|unit| ReservationChunks { unit, table: Contract::DeviceOnly }),
+            chunks: crate::device::RESERVATION_CHUNKS.map(|unit| ReservationChunks { unit, table: Contract::DeviceOnly, whole: true }),
         })),
     }
 }

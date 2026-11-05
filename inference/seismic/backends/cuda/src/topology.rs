@@ -95,7 +95,7 @@ pub fn describe(diagnostics: &mut Vec<Diagnostic>) -> Vec<CudaReport> {
                     granule.map(|granule| Reservation {
                         granule,
                         host_addressed: memory.host_addressed(),
-                        chunks: crate::RESERVATION_CHUNKS.map(|unit| ReservationChunks { unit, table: Contract::DeviceOnly }),
+                        chunks: crate::RESERVATION_CHUNKS.map(|unit| ReservationChunks { unit, table: Contract::DeviceOnly, whole: false }),
                     })
                 })
                 .map_err(|error| Unreservable::Unread(format!("its {memory:?} reservation granule: {error}")))

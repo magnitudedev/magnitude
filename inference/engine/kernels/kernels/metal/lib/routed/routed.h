@@ -5,10 +5,11 @@
 // GEMM form. Every form gives the GEMM's bits, so a row's output depends on
 // its own row alone, never on how many rows share its block. Weights are
 // bound through the `packets.h` slots (`KERNEL_W0..3`); an expert-stacked
-// weight is a record port, bound as its records' address table, and an
-// expert's weights are rows 0.. of its record's base
-// (`slab::region<const uchar, packets::space>(table, record)`, in the bound
-// weights' space).
+// weight a launch reads per step's source is a record port, bound as its
+// records' address table, and an expert's weights are rows 0.. of its
+// record's base (`slab::region<const uchar, packets::space>(table, record)`,
+// in the bound weights' space). A resident layer's launch binds the stack
+// itself (`choice_weights`).
 
 #include <seismic/slab.h>
 #include "../projection/projection.h"
@@ -77,6 +78,44 @@ inline void expert_grids(uint rows, uint used, uint tile_rows, uint subtiles, ui
 template <typename W>
 inline projection::Weights<W> weights(packets::weight_bytes base, packets::Rows16 layout, ulong first, uint k) {
     return projection::Weights<W>{base, layout, k, nullptr, first};
+}
+
+// Choice (m, k)'s record (`decode_source`, `rows` source rows at strides
+// `row_stride`, `choice_stride`) of expert `expert`, by how its experts are
+// bound: as their records' address table (`ulong`), or as a resident
+// layer's stack as it lies (`uchar`: a held stack, or a whole bank's home
+// records, which lie so in its one buffer), whose choices read their
+// experts.
+inline int choice_record(device const ulong *, device const int *sources, ulong rows, ulong row_stride,
+    ulong choice_stride, ulong m, ulong k, int expert) {
+    return decode_source(sources, rows, row_stride, choice_stride, m, k, expert);
+}
+inline int choice_record(device const uchar *, device const int *, ulong, ulong, ulong, ulong, ulong, int expert) {
+    return expert;
+}
+
+// Expert `expert`'s weights of an expert-stacked weight bound as it lies,
+// `rows` rows an expert (expert e's from row e * rows): a resident layer's,
+// a held stack or a whole bank's home records, which lie so in its one
+// buffer. The base is the binding's, so the rows are one load away.
+template <typename W>
+inline projection::Weights<W> stack_weights(packets::weight_bytes stack, packets::Rows16 layout, int expert,
+    ulong rows, uint k) {
+    return weights<W>(stack, layout, ulong(expert) * rows, k);
+}
+
+// The weights of `record` (`choice_record`, not -1), `rows` rows an expert:
+// a bank or tier record through their tables (`source_weights`), or of a
+// resident layer's stack (`stack_weights`).
+template <typename W>
+inline projection::Weights<W> choice_weights(device const ulong *bank, device const ulong *tier, int record,
+    packets::Rows16 layout, ulong, uint k) {
+    return weights<W>(source_weights(bank, tier, record), layout, 0, k);
+}
+template <typename W>
+inline projection::Weights<W> choice_weights(device const uchar *stack, device const ulong *, int record,
+    packets::Rows16 layout, ulong rows, uint k) {
+    return stack_weights<W>(stack, layout, record, rows, k);
 }
 
 // A plain activation prologue over rows of a [rows, columns] A tensor.

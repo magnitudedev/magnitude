@@ -972,8 +972,12 @@ pub struct NativeImplementation {
     /// parameters that do not take the default (`f32`, `bf16`, `f16`).
     pub elements: Vec<NativeElementCoverage>,
     /// Tensor ports bound through a table of their records' device
-    /// addresses (`records`).
+    /// addresses (`records`) by every launch without its own.
     pub records: Vec<RecordPort>,
+    /// The launches that list their own record ports in place of
+    /// `records`, by ordinal, in order ([`Self::launch_records`]). Launches
+    /// of one kernel list the same.
+    pub launch_records: Vec<(usize, Vec<RecordPort>)>,
     /// The `where` condition restricting admissible parameter
     /// configurations. It reads only static dimensions, parameters and the
     /// elements (`operands(W)`, `form(W, NAME)`, `packed(W)`, `unit_columns(W)`), whose reads make the
@@ -2534,13 +2538,24 @@ impl NativeImplementation {
     /// A launch-local choice or an explicit kernel read needs per-launch
     /// source formation rather than entry-wide tuning macros, and so does a
     /// written grid authored as a block: its launch's whole source sees the
-    /// grid's blocks (the runtime's `abi::WRITTEN_GRID_BLOCK`).
+    /// grid's blocks (the runtime's `abi::WRITTEN_GRID_BLOCK`), and so does
+    /// a launch's own record ports: its source reads them as tables, and
+    /// every other port as its view.
     pub fn launch_scoped(&self) -> bool {
-        self.launches.iter().any(|launch| {
-            !launch.params.is_empty()
-                || !launch.reads.is_empty()
-                || (self.backend.authors_written_grid_blocks() && launch.grid.is_some())
-        })
+        !self.launch_records.is_empty()
+            || self.launches.iter().any(|launch| {
+                !launch.params.is_empty()
+                    || !launch.reads.is_empty()
+                    || (self.backend.authors_written_grid_blocks() && launch.grid.is_some())
+            })
+    }
+
+    /// The record ports of launch `launch`: its own, else the native's.
+    pub fn launch_records(&self, launch: usize) -> &[RecordPort] {
+        self.launch_records
+            .iter()
+            .find(|(ordinal, _)| *ordinal == launch)
+            .map_or(&self.records, |(_, records)| records)
     }
 }
 
@@ -4933,6 +4948,39 @@ mod native_tests {
                 "{records} {backend}: expected {expected:?}, got {error}"
             );
         }
+    }
+
+    /// A launch's own `records` replaces its native's for that launch, which
+    /// then forms its own source (`launch_scoped`); launches of one kernel
+    /// list the same record ports.
+    #[test]
+    fn a_launch_lists_its_own_record_ports() {
+        let declaration = |second: &str, kernel: &str| {
+            format!(
+                "fn scale[M, N](x: &tensor[M, N] f32, factor: f32) -> tensor[M, N] f32:\n    let mut result = zeros_like(x)\n    parallel for row in 0..M:\n        parallel for column in 0..N:\n            result[row, column] = x[row, column] * factor\n    return result\n\nnative scale for metal from \"scale.src\":\n    records (x, result 0)\n    launch scale when M > 1:\n        threadgroups (M, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n    launch {kernel} when M == 1:\n        {second}\n        threadgroups (M, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n"
+            )
+        };
+        // A launch-scoped native's launches take their code parameters from
+        // its source, which the fixture forms.
+        let check = |text: String| {
+            crate::native_source::check_fixture(
+                SourceSet::new(vec![SourceFile {
+                    path: "scale.seismic".to_owned(),
+                    text,
+                }]),
+                &[],
+            )
+        };
+        let module = check(declaration("records (result 0)", "scale_one")).expect("a launch's own record ports check");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .expect("native implementation");
+        assert_eq!(native.launch_records(0), [RecordPort::Parameter("x".to_owned()), RecordPort::Result(0)]);
+        assert_eq!(native.launch_records(1), [RecordPort::Result(0)]);
+        assert!(native.launch_scoped(), "launches of different record ports form their own sources");
+        let error = check(declaration("records (result 0)", "scale"))
+            .expect_err("launches of one kernel must list the same record ports");
+        assert!(error.to_string().contains("launches of kernel `scale` list different record ports"), "{error}");
     }
 
     /// A launch condition is one `i32` word the host writes, on a backend

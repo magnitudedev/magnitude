@@ -70,7 +70,7 @@ fn a_long_run_of_submissions_leaves_no_live_heap() {
         batch
             .encode(&DirectLaunch {
                 pipeline: &pipelines[0],
-                buffers: &[(&values, 0)],
+                buffers: &[(seismic_metal::Binding::Buffer(&values), 0)],
                 words: &[],
                 scalar_results: Some((&scalars, 0)),
                 threadgroups: [4, 1, 1],

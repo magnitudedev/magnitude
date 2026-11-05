@@ -803,6 +803,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.family.expert_bank().map_or(0, |bank| bank.device_landed())
     }
 
+    /// The decode steps begun while the bank was whole, which ran its
+    /// resident forms.
+    #[cfg(test)]
+    pub(crate) fn resident_decodes(&self) -> u64 {
+        self.family.expert_bank().map_or(0, |bank| bank.resident_decodes())
+    }
+
     /// Each streamed layer's lines in their state; none before
     /// [`Self::measure_experts`].
     pub fn expert_lines(&self) -> Option<&crate::assessment::Priced<std::sync::Arc<[crate::assessment::ExpertLines]>>> {

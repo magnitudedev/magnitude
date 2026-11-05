@@ -37,6 +37,7 @@ use seismic_lang::checked::NativeImplementation;
 use seismic_lang::entry::{AliasRule, CallSchema, ParameterKind, TensorAccess};
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry::BackendName;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -1772,14 +1773,26 @@ struct Site {
     offset: u64,
     /// The bytes the node reaches from `offset`.
     bytes: u64,
-    /// For a record port, the records it binds (whole records, checked at
-    /// seal), through a table of their addresses: its external port's
-    /// tensor's from the record at `offset`, or in the workspace the slot's
-    /// workspace record table from byte `table`; zero for any other buffer.
-    records: u64,
-    /// A workspace record site's entries in the slot's workspace record
-    /// table (`NativeGraphPlan::workspace_record_table`), in bytes.
-    table: u64,
+    /// How it binds records, if it is a record port's.
+    records: SiteRecords,
+}
+
+/// The records a site binds (whole records, checked at seal), through a
+/// table of their addresses.
+#[derive(Clone, Copy, Debug)]
+enum SiteRecords {
+    /// It binds its view: no record port's.
+    None,
+    /// An external record port's records from the record at the site's
+    /// offset, through the port's table. A site of no records is still one:
+    /// it binds its port's table, as the port's storage may be no buffer any
+    /// binding reaches (a reservation's chunks).
+    Port(u64),
+    /// In the workspace, records the slot's workspace record table
+    /// (`NativeGraphPlan::workspace_record_table`) addresses from byte
+    /// `table`. A workspace record site of no records is none: the
+    /// workspace is ordinary storage, which its view binds.
+    Workspace { records: NonZeroU64, table: u64 },
 }
 
 /// How a graph's nodes use one external port.
@@ -1894,6 +1907,7 @@ impl Executable {
         let args = &planned.args;
         let schema = kernel.schema();
         let buffers = sealed_buffers(schema, kernel.implementation());
+        let record_ports = kernel.records(&shape.launches);
         let mut sites = Vec::with_capacity(buffers);
         let mut representations = Vec::with_capacity(buffers);
         let mut external = vec![None; arguments.len()];
@@ -1943,11 +1957,10 @@ impl Executable {
                 region,
                 offset: base + descriptor.byte_offset,
                 bytes: descriptor.byte_len,
-                records: 0,
-                table: 0,
+                records: SiteRecords::None,
             };
             let (extents, strides) = (&descriptor.extents, &descriptor.strides);
-            let (record, bound) = (kernel.records[sites.len()], kernel.bound[sites.len()]);
+            let (record, bound) = (record_ports[sites.len()], kernel.bound[sites.len()]);
             if !self.use_site(&mut site, record, bound, descriptor.representation, extents, strides, ports) {
                 return Err(WorkflowError::RecordPortBinding {
                     parameter: parameter.name.clone(),
@@ -1986,10 +1999,9 @@ impl Executable {
                 region,
                 offset,
                 bytes: spec.byte_len,
-                records: 0,
-                table: 0,
+                records: SiteRecords::None,
             };
-            let record = kernel.records[sites.len()];
+            let record = record_ports[sites.len()];
             if !self.use_site(&mut site, record, true, spec.representation, &spec.extents, &spec.strides, ports) {
                 return Err(WorkflowError::RecordPortBinding {
                     parameter: format!("result {ordinal}"),
@@ -2004,8 +2016,7 @@ impl Executable {
                 region: Region::Workspace,
                 offset: *offset,
                 bytes: need.bytes,
-                records: 0,
-                table: 0,
+                records: SiteRecords::None,
             });
             representations.push("bytes");
         }
@@ -2037,7 +2048,7 @@ impl Executable {
                     .iter()
                     .map(|&(buffer, index, encoded)| {
                         let site = &sites[buffer];
-                        let (word, offset) = (site.records == 0)
+                        let (word, offset) = matches!(site.records, SiteRecords::None)
                             .then(|| host_word((site.region, site.offset)))
                             .flatten()
                             .ok_or(WorkflowError::ConditionWord { node })?;
@@ -2100,14 +2111,18 @@ impl Executable {
                     _ => false,
                 };
                 self.port_uses[port as usize].records |= whole;
-                site.records = records;
+                site.records = SiteRecords::Port(records);
                 whole
             }
             (Region::Workspace, true) => {
                 let whole = record_bytes(representation, extents).is_some() && canonical();
-                site.records = records;
-                site.table = seismic_lang::registry::record_table_entry(self.workspace_records);
-                self.workspace_records += records;
+                if let Some(records) = NonZeroU64::new(records) {
+                    site.records = SiteRecords::Workspace {
+                        records,
+                        table: seismic_lang::registry::record_table_entry(self.workspace_records),
+                    };
+                    self.workspace_records += records.get();
+                }
                 whole
             }
             // A host port is ordered by, never bound: it binds any storage.
@@ -2803,10 +2818,13 @@ impl NativeGraphPlan {
             .nodes
             .iter()
             .flat_map(|node| &node.sites)
-            .filter(|site| matches!(site.region, Region::Workspace) && site.records != 0)
-            .flat_map(|site| {
-                let record = site.bytes / site.records;
-                (0..site.records).map(move |index| site.offset + index * record)
+            .filter_map(|site| match site.records {
+                SiteRecords::Workspace { records, .. } => Some((site, records.get())),
+                SiteRecords::None | SiteRecords::Port(_) => None,
+            })
+            .flat_map(|(site, records)| {
+                let record = site.bytes / records;
+                (0..records).map(move |index| site.offset + index * record)
             });
         let table = crate::api::tensor::record_table(&self.device, workspace, offsets)?;
         workspace.hold_table(&table);
@@ -3944,7 +3962,7 @@ impl NativeGraphBindings {
         if self.uses[ordinal].grid && tensor.is_slab_view() {
             return Err(WorkflowError::NativePortSlabGrid { port: ordinal });
         }
-        if self.uses[ordinal].direct && tensor.chunked() {
+        if self.uses[ordinal].direct && !tensor.binds_directly() {
             return Err(WorkflowError::ChunkedBinding {
                 parameter: format!("port {ordinal}"),
             });
@@ -4352,8 +4370,8 @@ impl QueuedRun {
                 .as_ref()
                 .expect("a planned graph storage region is present")
         };
-        node.kernel.bind(node.sites.iter().map(|site| match site.region {
-            Region::External(port) if site.records != 0 => {
+        node.kernel.bind(node.sites.iter().map(|site| match (site.region, site.records) {
+            (Region::External(port), SiteRecords::Port(_)) => {
                 let records = run.records(port);
                 let entry = site.offset / records.placement.record();
                 (
@@ -4361,14 +4379,15 @@ impl QueuedRun {
                     records.table_offset + seismic_lang::registry::record_table_entry(entry),
                 )
             }
-            Region::Workspace if site.records != 0 => (region(&run.workspace_records), site.table),
-            Region::External(port) => {
+            (Region::Workspace, SiteRecords::Workspace { table, .. }) => (region(&run.workspace_records), table),
+            (Region::External(port), SiteRecords::None) => {
                 let external = run.external(port);
                 (&*external.allocation, external.offset + site.offset)
             }
-            Region::Workspace => (region(&run.workspace), site.offset),
-            Region::Upload => (region(&run.upload), site.offset),
-            Region::Outputs => (region(&run.outputs), site.offset),
+            (Region::Workspace, SiteRecords::None) => (region(&run.workspace), site.offset),
+            (Region::Upload, SiteRecords::None) => (region(&run.upload), site.offset),
+            (Region::Outputs, SiteRecords::None) => (region(&run.outputs), site.offset),
+            (region, records) => unreachable!("a {records:?} record site in {region:?}"),
         }), buffers);
         Dispatch {
             kernel: &node.kernel,
@@ -4536,16 +4555,16 @@ impl DispatchList for SequenceList<'_> {
                 .expect("a planned graph storage region is present")
         };
         for (buffer, site) in run.plan.executable.nodes[node].sites.iter().enumerate() {
-            let (allocation, offset, bytes) = match site.region {
-                Region::External(port) if site.records != 0 => {
+            let (allocation, offset, bytes) = match (site.region, site.records) {
+                (Region::External(port), SiteRecords::Port(count)) => {
                     let records = run.records(port);
                     let first = site.offset / records.placement.record();
-                    records.extend(buffer, first, site.records, reaches);
+                    records.extend(buffer, first, count, reaches);
                     continue;
                 }
                 // A workspace record site's records, which its table
                 // addresses; the entries order nothing (`Records::extend`).
-                Region::Workspace if site.records != 0 => {
+                (Region::Workspace, SiteRecords::Workspace { .. }) => {
                     reaches.push(Reach {
                         buffer,
                         allocation: region(&run.workspace),
@@ -4555,7 +4574,7 @@ impl DispatchList for SequenceList<'_> {
                     });
                     continue;
                 }
-                Region::External(port) => {
+                (Region::External(port), SiteRecords::None) => {
                     let External { allocation, offset: start, placement, .. } = run.external(port);
                     if let Some((_, slab)) =
                         run.slabs.iter().find(|(slabbed, _)| *slabbed == port as usize)
@@ -4571,9 +4590,10 @@ impl DispatchList for SequenceList<'_> {
                     };
                     (&**allocation, offset, bytes)
                 }
-                Region::Workspace => (region(&run.workspace), site.offset, site.bytes),
-                Region::Upload => (region(&run.upload), site.offset, site.bytes),
-                Region::Outputs => (region(&run.outputs), site.offset, site.bytes),
+                (Region::Workspace, SiteRecords::None) => (region(&run.workspace), site.offset, site.bytes),
+                (Region::Upload, SiteRecords::None) => (region(&run.upload), site.offset, site.bytes),
+                (Region::Outputs, SiteRecords::None) => (region(&run.outputs), site.offset, site.bytes),
+                (region, records) => unreachable!("a {records:?} record site in {region:?}"),
             };
             reaches.push(Reach {
                 buffer,

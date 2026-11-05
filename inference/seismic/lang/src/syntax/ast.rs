@@ -213,9 +213,9 @@ pub struct NativeDecl {
     /// The dense representations a build-time compiled (CPU) form covers,
     /// per element parameter it monomorphizes.
     pub elements: Vec<NativeElementsDecl>,
-    /// `records (PORT, ..)`: tensor ports the native reaches a record (a
-    /// leading-axis row) at a time, each bound through a table of its
-    /// records' device addresses.
+    /// `records (PORT, ..)`: tensor ports the native's launches reach a
+    /// record (a leading-axis row) at a time, each bound through a table of
+    /// its records' device addresses; a launch's own `records` replaces it.
     pub records: Vec<NativeRecordDecl>,
     /// Named natural-number expressions, in declaration order.
     pub terms: Vec<NativeTermDecl>,
@@ -333,6 +333,9 @@ pub struct NativeLaunchDecl {
     pub constraint: Option<Expr>,
     /// Entry parameters read by the kernel but absent from launch expressions.
     pub reads: Vec<Ident>,
+    /// `records (PORT, ..)`: the record ports of this launch in place of the
+    /// native's; `None` takes the native's.
+    pub records: Option<Vec<NativeRecordDecl>>,
     /// The most groups the launch dispatches on each axis; with `grid`, the
     /// bound of the grid it reads.
     pub threadgroups: [Expr; 3],

@@ -272,8 +272,8 @@ impl ResidentTarget {
     }
 
     /// The tensor a graph's weight port of `role`'s `part` binds: a banked
-    /// expert stack's values and scale from the bank, any other from its
-    /// resident weight.
+    /// expert stack's values, home records and scale from the bank, any
+    /// other from its resident weight.
     pub(crate) fn bound(
         &self,
         role: WeightRole,
@@ -282,6 +282,7 @@ impl ResidentTarget {
         use crate::programs::native_target_graph::WeightPart;
         match (&self.bank, part) {
             (Some(bank), WeightPart::Values) if bank.holds(role) => bank.records(role),
+            (Some(bank), WeightPart::Home) if bank.holds(role) => bank.home(role),
             (Some(bank), WeightPart::Scale) if bank.holds(role) => bank.expert_scale(role),
             (_, part) => part.of(self.sublayers.get(role)?),
         }

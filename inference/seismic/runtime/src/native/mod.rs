@@ -745,9 +745,10 @@ pub struct NativePrepared {
     /// Whether each buffer, in ABI order, is bound in the kernel's argument
     /// table ([`abi::bound`]): a host port is ordered by, never bound.
     bound: Vec<bool>,
-    /// Whether each buffer, in ABI order, is a record port, bound as the
-    /// table of its view's records ([`abi::records`]).
-    records: Vec<bool>,
+    /// Per launch, in ordinal order, whether each buffer, in ABI order, is
+    /// one of its record ports, bound as the table of its view's records
+    /// ([`abi::records`]); the launches a call runs agree ([`Self::records`]).
+    records: Vec<Vec<bool>>,
     /// Per launch, in ordinal order, the launch conditions the host writes
     /// the words of (`NativeLaunch::conditions`): each ABI
     /// buffer, the word of it and the value the launch is encoded under, a
@@ -1951,7 +1952,9 @@ impl NativePrepared {
         let buffer_writes = abi::buffer_writes(logical.schema(), &implementation);
         let host_writes = abi::host_writes(logical.schema(), &implementation);
         let bound = abi::bound(logical.schema(), &implementation);
-        let records = abi::records(logical.schema(), &implementation);
+        let records = (0..implementation.launches.len())
+            .map(|launch| abi::records(logical.schema(), &implementation, launch))
+            .collect();
         let conditions = implementation
             .launches
             .iter()
@@ -2157,6 +2160,28 @@ impl NativePrepared {
         launch: Option<usize>,
     ) -> Result<bool, CallError> {
         self.active_at(when, &|name| self.dimension(values, name), launch)
+    }
+
+    /// Whether each buffer, in ABI order, is a record port of a call that
+    /// runs `launches`: the record ports of its active launches, which
+    /// agree, as each buffer binds once for all of them; with none active,
+    /// the first launch's.
+    ///
+    /// # Panics
+    /// Where launches active together list different record ports: the
+    /// native's declaration is wrong.
+    pub(crate) fn records(&self, launches: &CallLaunches) -> &[bool] {
+        let mut active = launches
+            .geometry
+            .iter()
+            .zip(&self.records)
+            .filter_map(|(geometry, records)| geometry.as_ref().map(|_| records));
+        let records = active.next().unwrap_or(&self.records[0]);
+        assert!(
+            active.all(|other| other == records),
+            "launches of a native that run together list different record ports"
+        );
+        records
     }
 
     /// [`Self::active`] where `dimension` gives the entry's dimensions.
@@ -2569,6 +2594,7 @@ impl NativePrepared {
                 (Ok(ordinal), tensor)
             });
         let produced = results.iter().enumerate().map(|(ordinal, tensor)| (Err(ordinal), tensor));
+        let record_ports = self.records(&shape.launches);
         for (port, tensor) in parameters.chain(produced) {
             let name = || match port {
                 Ok(ordinal) => schema.parameters()[ordinal].name.clone(),
@@ -2578,7 +2604,7 @@ impl NativePrepared {
                 return Err(CallError::Invocation(InvocationError::SlabGrid { parameter: name() }));
             }
             let buffer = buffers.len();
-            if self.records[buffer] {
+            if record_ports[buffer] {
                 let bound = tensor.records().map_err(tensor_error)?;
                 buffers.push((
                     bound.table.clone(),
@@ -2586,8 +2612,8 @@ impl NativePrepared {
                     seismic_lang::registry::record_table_entry(bound.count),
                 ));
                 records.push((buffer, bound));
-            } else if tensor.chunked() && self.bound[buffer] {
-                // Chunked storage has no one buffer: device work binds it
+            } else if !tensor.binds_directly() && self.bound[buffer] {
+                // Chunked storage with no one buffer: device work binds it
                 // only through a record port. A host port, never bound,
                 // takes it, ordered by its packed span.
                 return Err(CallError::Workflow(crate::api::WorkflowError::ChunkedBinding {
@@ -3343,7 +3369,7 @@ fn encode(first: &NativePrepared, work: &Encoding<'_, impl DispatchList>) -> Res
                 }
                 typed.clear();
                 typed.extend(buffers.iter().map(|(allocation, offset)| {
-                    (typed_buffer::<Metal, Executor>(allocation), *offset)
+                    (crate::backends::metal_binding(allocation), *offset)
                 }));
                 // A grid's binding is its three words: a `&tensor[3] i32`
                 // binds with canonical strides and never as a slab

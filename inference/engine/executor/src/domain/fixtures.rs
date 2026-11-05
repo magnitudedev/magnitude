@@ -906,6 +906,11 @@ impl ElasticBank for FakeBank {
         0
     }
 
+    #[cfg(test)]
+    fn resident_decodes(&self) -> u64 {
+        0
+    }
+
     /// A growth prepared and not yet installed ends before its first slot,
     /// as the served bank's does; the host tier's grows at once.
     fn stop_growths(&self) {

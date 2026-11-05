@@ -473,6 +473,15 @@ impl Reservation {
         })
     }
 
+    /// Whether a range of `bytes` reserved so is bound as one buffer once
+    /// every granule is backed ([`ReservationChunks::whole`]), which is then
+    /// one native allocation of the whole range: only where it lies within
+    /// `max_allocation`.
+    pub fn binds_whole(&self, bytes: u64, max_allocation: u64) -> bool {
+        self.chunks.is_some_and(|chunks| chunks.whole)
+            && self.backing(bytes).is_some_and(|backing| backing <= max_allocation)
+    }
+
     /// The most bytes a reserved range backs with each of its native
     /// allocations within `max_allocation`.
     pub fn most_backed(&self, max_allocation: u64) -> u64 {
@@ -490,6 +499,10 @@ impl Reservation {
 pub struct ReservationChunks {
     pub unit: u64,
     pub table: Contract,
+    /// Whether the backend binds the whole range as one buffer while every
+    /// granule is backed, which device work then reaches directly (Metal),
+    /// beside the chunks and their table.
+    pub whole: bool,
 }
 
 /// The physical holdings of a reservation under `contract`

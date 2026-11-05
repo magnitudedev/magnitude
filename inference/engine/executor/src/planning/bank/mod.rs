@@ -804,6 +804,12 @@ impl ExpertBankPlan {
         self.slots == self.widest().get()
     }
 
+    /// Whether growth reaches every expert ([`Self::ceiling`]): only such a
+    /// bank is ever whole, each expert at its home record.
+    pub fn reaches_whole(&self) -> bool {
+        self.ceiling == self.widest().get()
+    }
+
     /// Group `group`'s experts: every member layer's, its map's extent
     /// (`BankPart::Map`).
     pub fn group_experts(&self, group: usize) -> u64 {

@@ -1133,7 +1133,7 @@ impl DecodeDemand {
                     let sources = sources(load, scope);
                     match DecodeForm::of(backend).map_err(demand_error)? {
                         DecodeForm::Expand => {
-                            streamed::expand_form(load, scope).map_err(demand_error)?;
+                            streamed::expand_form(streamed::streams(load, scope)).map_err(demand_error)?;
                             step.call(Kernel::of::<kernels::routed_route::Entry>(), router)?;
                             step.call(
                                 Kernel::of::<kernels::routed_expand::Entry>(),

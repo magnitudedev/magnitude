@@ -28,7 +28,7 @@ use super::routed::graph::{
     general_pass, general_routed,
 };
 use super::routed::split::{PassPorts, Split};
-use super::routed::streamed::{BankGraph, scratch_fill};
+use super::routed::streamed::{LayerBank, scratch_fill};
 use super::short_conv::graph::{
     CheckedShortConvEntries, ShortConvBlock, ShortConvGraphEntries, short_conv,
 };
@@ -135,11 +135,11 @@ impl<'a> From<&'a AttestedMixer> for MixerEntries<'a, NativeGraph> {
 }
 
 /// A block's feed-forward as its graph builds it: its entries (none of a
-/// lone mixer block), and the bank of a routed feed-forward whose experts
-/// stream.
+/// lone mixer block), and how a routed feed-forward reads its experts
+/// (`LayerBank`).
 pub(crate) struct FeedForwardGraph<'p, 'a, G: GraphDraft + 'a> {
     pub entries: Option<FeedForwardEntries<'a, G>>,
-    pub bank: Option<BankGraph<'p, 'a, G>>,
+    pub bank: LayerBank<'p, 'a, G>,
 }
 
 /// The kernel entries of a block's feed-forward.
@@ -681,10 +681,10 @@ impl BlockSublayers<'_> {
     }
 
     /// The block's feed-forward over the mixer's residual `mixed`; a lone
-    /// mixer block's output is `mixed`. A routed feed-forward whose experts
-    /// stream takes its bank (`FeedForwardGraph::bank`), and returns the
-    /// sequence input a run writes when it reads its sequence; a split one
-    /// is built as its front or its back (`split`).
+    /// mixer block's output is `mixed`. A routed feed-forward reads its
+    /// experts as `FeedForwardGraph::bank` says, and returns the sequence
+    /// input a run writes when it reads its sequence; a split one is built
+    /// as its front or its back (`split`).
     pub(crate) fn feed_forward<'e, G: GraphDraft + 'e>(
         &self,
         graph: &mut G,

@@ -891,18 +891,28 @@ pub(crate) struct ReservedRange {
 
 impl ReservedRange {
     /// The range of `rows` records of `records` under `contract`, reserved
-    /// as `span` says (its device's reservation, as discovery reports it).
+    /// as `span` says (its device's reservation, as discovery reports it),
+    /// on a device whose largest native allocation is `max_allocation`: a
+    /// range past it is never bound as one buffer
+    /// (`seismic_topology::Reservation::binds_whole`).
     pub(crate) fn new(
         contract: seismic_topology::ReservedContract,
         span: seismic_topology::Reservation,
         records: seismic_topology::ReservedRecords,
         rows: u64,
+        max_allocation: u64,
     ) -> Self {
+        let bytes = records.record.get() * rows;
+        let mut span = span.of_records(records);
+        let whole = span.binds_whole(bytes, max_allocation);
+        if let Some(chunks) = span.chunks.as_mut() {
+            chunks.whole = whole;
+        }
         Self {
-            bytes: records.record.get() * rows,
+            bytes,
             record: records.record,
             carries: records.carries,
-            span: span.of_records(records),
+            span,
             contract,
         }
     }
@@ -2257,13 +2267,14 @@ mod physical_slot_tests {
             chunks: Some(seismic_topology::ReservationChunks {
                 unit: granule,
                 table: seismic_topology::Contract::Upload,
+                whole: false,
             }),
         }
     }
 
     fn split_reservation() -> ReservedRange {
         ReservedRange::new(seismic_topology::ReservedContract::Shared, split_span(4096),
-            seismic_topology::ReservedRecords::of(std::num::NonZeroU64::new(4096).unwrap()), 8)
+            seismic_topology::ReservedRecords::of(std::num::NonZeroU64::new(4096).unwrap()), 8, u64::MAX)
     }
 
     #[test]
@@ -2317,7 +2328,7 @@ mod physical_slot_tests {
         let memory = split_memory();
         let granule = seismic_reservation::host_page().unwrap();
         let reservation = ReservedRange::new(seismic_topology::ReservedContract::Shared, split_span(granule),
-            seismic_topology::ReservedRecords::of(std::num::NonZeroU64::new(granule).unwrap()), 8);
+            seismic_topology::ReservedRecords::of(std::num::NonZeroU64::new(granule).unwrap()), 8, u64::MAX);
         let limits = AllocationLimits { max_allocation_bytes: u64::MAX, max_allocation_alignment: granule };
         let service = Arc::new(seismic_cpu::Device);
         let resizer = allocate_reservation(limits, &memory, reservation, 2 * granule, granule, || {
@@ -2494,7 +2505,7 @@ mod physical_slot_tests {
         let memory = split_memory();
         let granule = seismic_reservation::host_page().unwrap();
         let reservation = ReservedRange::new(seismic_topology::ReservedContract::Shared, split_span(granule),
-            seismic_topology::ReservedRecords::of(std::num::NonZeroU64::new(granule).unwrap()), 8);
+            seismic_topology::ReservedRecords::of(std::num::NonZeroU64::new(granule).unwrap()), 8, u64::MAX);
         let limits = AllocationLimits { max_allocation_bytes: u64::MAX, max_allocation_alignment: granule };
         let service = Arc::new(seismic_cpu::Device);
         let resizer = allocate_reservation(limits, &memory, reservation, 2 * granule, granule, || {

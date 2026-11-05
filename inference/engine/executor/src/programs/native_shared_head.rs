@@ -510,7 +510,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                 &mut graph,
                 crate::operators::block::FeedForwardGraph {
                     entries: (entries.feed_forward)(index)?,
-                    bank: None,
+                    bank: crate::operators::routed::streamed::LayerBank::Held,
                 },
                 None,
                 mixed,

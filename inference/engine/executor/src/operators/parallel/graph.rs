@@ -12,7 +12,7 @@ use crate::operators::dense_ffn::graph::dimensions as dense_dimensions;
 use crate::operators::routed::graph::{
     CheckedGeneralRoutedEntries, GeneralRoutedGraphEntries, RoutedSum, general_routed,
 };
-use crate::operators::routed::{split::Split, streamed::BankGraph};
+use crate::operators::routed::{split::Split, streamed::LayerBank};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::{WeightPort, packed_weight, weight};
@@ -86,7 +86,7 @@ impl CheckedParallelEntries {
 pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     entries: ParallelGraphEntries<'a, G>,
-    bank: Option<BankGraph<'_, 'a, G>>,
+    bank: LayerBank<'_, 'a, G>,
     load: &ModelLoadPlan,
     sublayer: SublayerIndex,
     weights: &mut Vec<(WeightPort, NativePort)>,

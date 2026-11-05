@@ -1178,6 +1178,72 @@ pub(crate) fn check_closed<E>(
     ))
 }
 
+/// The record ports `declared` lists (`records`), each a device tensor
+/// parameter or tensor result with a leading record axis, listed once, on a
+/// backend that binds record tables; what is wrong with any is in `errors`.
+fn native_records(
+    declared: &[crate::syntax::ast::NativeRecordDecl],
+    contract: &ir::Definition,
+    backend: crate::registry::BackendName,
+    errors: &mut Vec<(Span, String)>,
+) -> Vec<crate::checked::RecordPort> {
+    let mut records = Vec::new();
+    let results = result_leaves(&contract.result);
+    for record in declared {
+        let recorded = |ty: &ValueType| matches!(ty, ValueType::Tensor(tensor) if !tensor.axes.is_empty());
+        let (span, port) = match record {
+            ast::NativeRecordDecl::Parameter(name) => (
+                name.span,
+                match contract.params.iter().find(|parameter| parameter.name == name.name) {
+                    Some(ir::Param {
+                        ownership:
+                            ir::Ownership::Owned | ir::Ownership::Shared | ir::Ownership::Exclusive,
+                        ty,
+                        ..
+                    }) if recorded(ty) => Ok(crate::checked::RecordPort::Parameter(name.name.clone())),
+                    Some(_) => Err(format!(
+                        "record port `{}` must be a device tensor with a leading record axis",
+                        name.name
+                    )),
+                    None => Err(format!("record port `{}` is not an entry parameter", name.name)),
+                },
+            ),
+            ast::NativeRecordDecl::Result { ordinal, span } => (
+                *span,
+                match usize::try_from(*ordinal).ok().and_then(|ordinal| results.get(ordinal)) {
+                    Some((_, ty)) if recorded(ty) => {
+                        Ok(crate::checked::RecordPort::Result(*ordinal as u32))
+                    }
+                    Some(_) => Err(format!(
+                        "record port `result {ordinal}` must be a tensor with a leading record axis"
+                    )),
+                    None => Err(format!("record port `result {ordinal}` is not an entry result")),
+                },
+            ),
+        };
+        match port {
+            _ if !backend.binds_record_tables() => errors.push((
+                span,
+                format!("`records`: {} binds no record tables", backend.as_str()),
+            )),
+            Ok(port) if records.contains(&port) => errors.push((
+                span,
+                match record {
+                    ast::NativeRecordDecl::Parameter(name) => {
+                        format!("record port `{}` is listed twice", name.name)
+                    }
+                    ast::NativeRecordDecl::Result { ordinal, .. } => {
+                        format!("record port `result {ordinal}` is listed twice")
+                    }
+                },
+            )),
+            Ok(port) => records.push(port),
+            Err(message) => errors.push((span, message)),
+        }
+    }
+    records
+}
+
 /// Check one native declaration against its entry. Every problem is reported.
 fn check_native(
     native: &crate::syntax::ast::NativeDecl,
@@ -1439,61 +1505,7 @@ fn check_native(
         })
         .collect::<Vec<_>>();
 
-    let mut records = Vec::new();
-    let results = result_leaves(&contract.result);
-    for record in &native.records {
-        let recorded = |ty: &ValueType| matches!(ty, ValueType::Tensor(tensor) if !tensor.axes.is_empty());
-        let (span, port) = match record {
-            ast::NativeRecordDecl::Parameter(name) => (
-                name.span,
-                match contract.params.iter().find(|parameter| parameter.name == name.name) {
-                    Some(ir::Param {
-                        ownership:
-                            ir::Ownership::Owned | ir::Ownership::Shared | ir::Ownership::Exclusive,
-                        ty,
-                        ..
-                    }) if recorded(ty) => Ok(crate::checked::RecordPort::Parameter(name.name.clone())),
-                    Some(_) => Err(format!(
-                        "record port `{}` must be a device tensor with a leading record axis",
-                        name.name
-                    )),
-                    None => Err(format!("record port `{}` is not an entry parameter", name.name)),
-                },
-            ),
-            ast::NativeRecordDecl::Result { ordinal, span } => (
-                *span,
-                match usize::try_from(*ordinal).ok().and_then(|ordinal| results.get(ordinal)) {
-                    Some((_, ty)) if recorded(ty) => {
-                        Ok(crate::checked::RecordPort::Result(*ordinal as u32))
-                    }
-                    Some(_) => Err(format!(
-                        "record port `result {ordinal}` must be a tensor with a leading record axis"
-                    )),
-                    None => Err(format!("record port `result {ordinal}` is not an entry result")),
-                },
-            ),
-        };
-        match port {
-            _ if !backend.binds_record_tables() => errors.push((
-                span,
-                format!("`records`: {} binds no record tables", backend.as_str()),
-            )),
-            Ok(port) if records.contains(&port) => errors.push((
-                span,
-                match record {
-                    ast::NativeRecordDecl::Parameter(name) => {
-                        format!("record port `{}` is listed twice", name.name)
-                    }
-                    ast::NativeRecordDecl::Result { ordinal, .. } => {
-                        format!("record port `result {ordinal}` is listed twice")
-                    }
-                },
-            )),
-            Ok(port) => records.push(port),
-            Err(message) => errors.push((span, message)),
-        }
-    }
-
+    let records = native_records(&native.records, contract, backend, &mut errors);
 
     let mut elements: Vec<crate::checked::NativeElementCoverage> = Vec::new();
     for coverage in &native.elements {
@@ -1690,6 +1702,7 @@ fn check_native(
     }
 
     let mut launches = Vec::new();
+    let mut launch_records: Vec<(usize, Vec<crate::checked::RecordPort>)> = Vec::new();
     for launch in &native.launches {
         let mut launch_params: Vec<NativeParameter> = Vec::new();
         for param in &launch.params {
@@ -1951,6 +1964,9 @@ fn check_native(
                 }
             }
         }
+        if let Some(own) = &launch.records {
+            launch_records.push((launches.len(), native_records(own, contract, backend, &mut errors)));
+        }
         launches.push(NativeLaunch {
             kernel: launch.kernel.name.clone(),
             params: launch_params,
@@ -1962,6 +1978,21 @@ fn check_native(
             group_extent: [ex, ey, ez],
             shared_bytes,
         });
+    }
+
+    // Launches of one kernel share its formed source, which reads its record
+    // ports as tables and every other port as its view.
+    let records_of = |ordinal: usize| {
+        launch_records.iter().find(|(own, _)| *own == ordinal).map_or(&records, |(_, own)| own)
+    };
+    for (ordinal, launch) in launches.iter().enumerate() {
+        let first = launches.iter().position(|other: &NativeLaunch| other.kernel == launch.kernel);
+        if first.is_some_and(|first| records_of(first) != records_of(ordinal)) {
+            errors.push((
+                native.launches[ordinal].span,
+                format!("launches of kernel `{}` list different record ports", launch.kernel),
+            ));
+        }
     }
 
     let repeat = match &native.repeat {
@@ -1994,6 +2025,7 @@ fn check_native(
         params,
         elements,
         records,
+        launch_records,
         constraint,
 
         scratch,

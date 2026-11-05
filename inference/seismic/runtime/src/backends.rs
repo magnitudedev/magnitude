@@ -1068,10 +1068,21 @@ impl OpenedKind {
 }
 
 /// Metal's reserved storage: chunks the host reads and writes in place
-/// and device work reaches only through record tables. It is no
-/// `MetalBuffer`, so no binding path can bind it.
+/// and device work reaches through record tables, or, while every granule
+/// is backed, binds directly as one buffer ([`metal_binding`]). It is no
+/// `MetalBuffer`.
 #[cfg(target_os = "macos")]
 struct MetalReserved(seismic_metal::ReservedBuffer);
+
+/// What a Metal launch binds for `allocation`: its buffer, or a reservation's
+/// buffer over its whole range.
+#[cfg(target_os = "macos")]
+pub(crate) fn metal_binding(allocation: &driver::Allocation) -> seismic_metal::Binding<'_> {
+    match allocation.storage().as_any().downcast_ref::<MetalReserved>() {
+        Some(MetalReserved(reserved)) => seismic_metal::Binding::Reserved(reserved),
+        None => seismic_metal::Binding::Buffer(driver::typed_buffer::<seismic_metal::Metal, MetalExecutor>(allocation)),
+    }
+}
 
 #[cfg(target_os = "macos")]
 impl driver::Storage for MetalReserved {

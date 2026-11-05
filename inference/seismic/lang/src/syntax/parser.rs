@@ -636,6 +636,16 @@ impl Parser {
         } else {
             Vec::new()
         };
+        let records = if self.at_word("records") {
+            self.bump();
+            self.expect_op(Op::LParen)?;
+            let records = self.comma_list(Self::native_record)?;
+            self.expect_op(Op::RParen)?;
+            self.expect_newline()?;
+            Some(records)
+        } else {
+            None
+        };
         let threadgroups = self.native_launch_property("threadgroups")?;
         self.expect_newline()?;
         let grid = if self.at_word("grid") {
@@ -690,6 +700,7 @@ impl Parser {
             params,
             constraint,
             reads,
+            records,
             threadgroups,
             grid,
             conditions,

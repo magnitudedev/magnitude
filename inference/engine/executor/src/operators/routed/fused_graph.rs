@@ -17,7 +17,7 @@ use crate::programs::native_constants::GraphConstant;
 use super::grouped::{ExpertsPass, Grouped};
 use super::split::{BackCrossing, Crossing, PassPorts, SharedInput, Split};
 use super::streamed::{
-    BankCombineEntry, BankGraph, BankRoute, DecodeReads, DecodeShape, RouteLocals, StreamedLayer, WaitPorts,
+    BankCombineEntry, BankRoute, LayerBank, DecodeReads, DecodeShape, RouteLocals, StreamedLayer, WaitPorts,
 };
 use crate::planning::RecordTensors;
 use crate::programs::native_target_graph::{
@@ -376,7 +376,8 @@ impl RouteWeights {
 }
 
 /// A fused layer's routed expert weights: its expert stacks (a streamed
-/// layer's its bank group's records, which its fills write) and the experts'
+/// layer's its bank group's records, which its fills write, or in its
+/// resident form its home records among them) and the experts'
 /// gate and up per-expert scales on the expansions' accumulators (absent
 /// where they have none). Its shared expert's are `shared_weights`.
 struct ExpertWeights {
@@ -386,15 +387,18 @@ struct ExpertWeights {
 }
 
 impl ExpertWeights {
+    /// The layer's stacks, each its `part` of the planned stack
+    /// (`LayerBank::stacks`), and their scales.
     fn of<G: GraphDraft>(
         graph: &mut G,
         load: &ModelLoadPlan,
         scope: WeightScope,
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
+        part: WeightPart,
     ) -> Result<Self, GraphError> {
         let role = |kind| WeightRole { scope, kind };
-        let mut stack = |kind| weight_port(graph, load, role(kind), WeightPart::Values, weights);
+        let mut stack = |kind| weight_port(graph, load, role(kind), part, weights);
         let stacks = [
             stack(WeightKind::ExpertGate)?,
             stack(WeightKind::ExpertUp)?,
@@ -417,12 +421,13 @@ impl ExpertWeights {
 /// the sequence input a run of a streamed layer writes. A layer the load
 /// streams takes its `bank` entries (`streamed`); a scratch-served one is
 /// built as its front or its back (`split`), a front's output the residual
-/// it read.
+/// it read; its resident form (`LayerBank::Home`) decodes as a resident
+/// layer does, over its whole bank's home records.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn routed<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     handle: RoutedGraphEntries<'a, G>,
-    bank: Option<BankGraph<'_, 'a, G>>,
+    bank: LayerBank<'_, 'a, G>,
     load: &ModelLoadPlan,
     scope: WeightScope,
     weights: &mut Vec<(WeightPort, NativePort)>,
@@ -436,6 +441,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
     epsilon: f32,
     split: Option<Split<'_>>,
 ) -> Result<(WorkflowTensor, Option<NativePort>), GraphError> {
+    let part = bank.stacks();
     let mut streamed = StreamedLayer::of(load, scope, bank)?;
     let scratch = streamed.is_some() && !decodes(rows);
     match (split, &mut streamed) {
@@ -481,7 +487,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
         stacks: [mut gate_records, mut up_records, mut down_records],
         gate_scale,
         up_scale,
-    } = ExpertWeights::of(graph, load, scope, weights, constants)?;
+    } = ExpertWeights::of(graph, load, scope, weights, constants, part)?;
     let [shared_gate, shared_up, shared_down] = shared_weights(graph, load, scope, weights)?;
     let expansion_scales = [("GS", gate_scale.extent), ("US", up_scale.extent)];
     let [streams, injected] = join.dimensions();
@@ -528,7 +534,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
             .decode
         {
             RoutedDecodeEntries::Expand(expand) => {
-                super::streamed::expand_form(load, scope)?;
+                super::streamed::expand_form(streamed.is_some())?;
                 let (expert_gate, expert_up) =
                     (gate_records.tensor().clone(), up_records.tensor().clone());
                 let (normalized, coefficient) = route.route(
@@ -852,7 +858,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
 pub(crate) fn group_pass<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     handle: RoutedGraphEntries<'a, G>,
-    bank: Option<BankGraph<'_, 'a, G>>,
+    bank: LayerBank<'_, 'a, G>,
     load: &ModelLoadPlan,
     scope: WeightScope,
     weights: &mut Vec<(WeightPort, NativePort)>,
@@ -862,8 +868,9 @@ pub(crate) fn group_pass<'a, G: GraphDraft + 'a>(
     hidden: u64,
     shape: &ExpertShape,
 ) -> Result<WorkflowTensor, GraphError> {
+    let part = bank.stacks();
     let mut layer = StreamedLayer::of(load, scope, bank)?;
-    let experts = ExpertWeights::of(graph, load, scope, weights, constants)?;
+    let experts = ExpertWeights::of(graph, load, scope, weights, constants, part)?;
     super::grouped::pass(
         graph,
         handle.group,

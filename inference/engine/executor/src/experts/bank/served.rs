@@ -556,6 +556,11 @@ impl ElasticBank for ServedBank {
         self.bank.watcher.shared().device_landed()
     }
 
+    #[cfg(test)]
+    fn resident_decodes(&self) -> u64 {
+        self.bank.resident_decodes()
+    }
+
     fn shrink(
         &self,
         resident: Option<&crate::ResidentStep>,

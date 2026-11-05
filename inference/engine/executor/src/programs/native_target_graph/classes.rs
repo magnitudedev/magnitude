@@ -66,12 +66,15 @@ pub(super) fn block_split<'g>(
     Ok(block_routed(geometry, index)?.filter(|_| merges && prompts))
 }
 
-/// How a block is served, which decides its stages (`RunStage::served`):
-/// whether the load streams its routed layer's experts, and the values a
-/// split layer (`block_split`) crosses and merges over the chain's rows.
+/// How a block is served, which decides its stages (`RunStage::served`,
+/// `RunStage::sealed`): whether the load streams its routed layer's experts
+/// and whether that layer has a resident form (`streamed::resident_form`),
+/// and the values a split layer (`block_split`) crosses and merges over the
+/// chain's rows.
 #[derive(Clone, Debug)]
 pub(super) struct BlockServed {
     pub(super) streams: bool,
+    pub(super) resident: bool,
     pub(super) split: Option<SplitValues<Extents>>,
 }
 
@@ -88,6 +91,7 @@ pub(super) fn block_served(
         .map(|index| {
             Ok(BlockServed {
                 streams: streamed::streams(load, block_scopes(index)?[1]),
+                resident: streamed::resident_form(load, block_scopes(index)?[1]),
                 split: block_split(load, geometry, index, limits)?
                     .map(|routed| SplitValues::of(routed, geometry, chain_rows, passes.rows()))
                     .transpose()?,
@@ -102,6 +106,12 @@ pub(super) fn block_stages(served: &[BlockServed], index: usize, rows: u64) -> &
     RunStage::served(served[index].split.is_some(), rows)
 }
 
+/// The stages block `index`'s graphs of `rows` rows are sealed in
+/// (`RunStage::sealed`): its runs' stages and its resident form.
+pub(super) fn block_sealed_stages(served: &[BlockServed], index: usize, rows: u64) -> &'static [RunStage] {
+    RunStage::sealed(served[index].split.is_some(), served[index].resident, rows)
+}
+
 /// Whether a launch of `rows` rows splits at block `index`
 /// (`RunStage::Front`): only such a launch runs the block's graphs sealed
 /// once (`once_graphs`), its fill and its passes.
@@ -113,8 +123,14 @@ fn block_splits(served: &[BlockServed], index: usize, rows: u64) -> bool {
 /// run (`Stage::Run`) only where its class is the launch's, and a graph the
 /// block runs once a group (`Stage::Once`, its fill and its passes) only
 /// where the launch splits at the block: a class served whole, as decode
-/// is, runs none. The plan's census (`certify_target_family`) and the
-/// sealed family (`PreparedTargetGraphs`) both count a launch's graphs by it.
+/// is, runs none. A decode launch of a bank that can be whole runs either
+/// form of a streamed block, as its bank is whole or not as it begins
+/// (`RunStage::Resident`): it counts both, so what is held for it
+/// (`LaunchGraphs::held`, and on CUDA the graphs
+/// `seismic::NativeGraphFamily::record_decode` records ahead) holds either
+/// form's, and a step that switches records none. The plan's census
+/// (`certify_target_family`) and the sealed family (`PreparedTargetGraphs`)
+/// both count a launch's graphs by it.
 pub(super) fn launch_runs(served: &[BlockServed], index: usize, class: BlockClass, (sealed, stage): StagedClass) -> bool {
     match stage {
         Stage::Run(_) => sealed == class,
@@ -730,7 +746,7 @@ pub(super) fn enumerate_block_graphs(
                 slot_scores(slot),
             ) {
                 enumeration.launch_classes.insert(class);
-                for &stage in block_stages(served, index, rows) {
+                for &stage in block_sealed_stages(served, index, rows) {
                     let staged = (class, Stage::Run(stage));
                     match shared[index] {
                         Some(first) => enumeration.sharing.push((index, staged, first)),

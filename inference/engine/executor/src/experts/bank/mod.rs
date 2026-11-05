@@ -64,6 +64,24 @@ fn write_blocks(grid: &seismic::Tensor, blocks: u32) -> Result<(), String> {
     grid.clone().write_from_host(&words).map_err(|error| format!("a list grid's blocks: {error}"))
 }
 
+/// How a chain [`ExpertBank::begin`] began is served, by whether it is
+/// resident (`ExpertBank::resident`) and has a grouped step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChainServing {
+    /// Every streamed layer is whole: its decode runs take the resident
+    /// forms (`RunStage::Resident`), its prompt fronts request nothing.
+    pub resident: bool,
+    grouped: bool,
+}
+
+impl ChainServing {
+    /// Whether its grouped steps are scratch-served: a group's that is not
+    /// resident.
+    pub(crate) fn scratch(self) -> bool {
+        self.grouped && !self.resident
+    }
+}
+
 /// A staging pool's conveyor, a view of the lender's records, which reads
 /// land in, the converts read in place, and the scratch rounds' waits bind
 /// as the host's (`BankPart::Conveyor`).
@@ -90,6 +108,17 @@ pub(crate) struct ExpertBank {
     /// of the scratch the lender lends prompt groups, its leading experts
     /// (`BankPart::Scratch`).
     scratch: Vec<RecordTensors<Tensor>>,
+    /// Each layer's home records of each routed tensor, of a bank that can
+    /// be whole (`ExpertBankPlan::reaches_whole`): the leading view of its
+    /// experts from its home record in its group's records, where a whole
+    /// bank holds expert `e` at record `home + e`, which its resident form
+    /// reads in place (`WeightPart::Home`). An unpinned view of the
+    /// reservation's own records, so a shrink releases what it spans; bound,
+    /// it is read only while the bank is whole, and so backed.
+    homes: Option<Vec<RecordTensors<Tensor>>>,
+    /// The decode steps begun resident ([`Self::resident_decodes`]).
+    #[cfg(test)]
+    resident_decodes: std::sync::atomic::AtomicU64,
     /// A host tier's record tensors' resizers and the host slots they
     /// commit; none on unified memory.
     host: Option<Mutex<HostTier>>,
@@ -307,21 +336,38 @@ impl ExpertBank {
 
     /// Begin the steps of a chain of `launches`, each routed as `route`
     /// says, a group the device runs layer-major (a lone step a group of
-    /// one), `scratch` saying whether they are scratch-served, from the whole
-    /// words it reads as they hold for the group (`Shared::begin`): from now
+    /// one), served as the bank's whole words say as they hold for the group
+    /// (`Self::resident`, read where `Shared::begin` reads them): from now
     /// until each ends, the watcher serves it. Each launch comes with its
     /// step, and with them each streamed layer's scope and merge set, the
-    /// steps the group ends with whose backs run in one pass; why the group
-    /// cannot begin comes with the launches.
+    /// steps the group ends with whose backs run in one pass, and how the
+    /// chain is served; why the group cannot begin comes with the launches.
     pub fn begin<L>(
         &self,
         launches: Chain<L>,
         route: impl Fn(&L) -> StepRoute,
         work: impl Fn(&L) -> crate::operation::LaunchWork,
-        scratch: impl FnMut() -> Result<bool, String>,
-    ) -> Result<(Chain<(L, ExpertStep)>, Vec<(WeightScope, usize)>), (String, Chain<L>)> {
-        let (steps, merges) = self.watcher.shared().begin(launches, route, work, scratch)?;
-        Ok((steps, self.plan.layers.iter().map(|layer| layer.scope).zip(merges).collect()))
+    ) -> Result<(Chain<(L, ExpertStep)>, Vec<(WeightScope, usize)>, ChainServing), (String, Chain<L>)> {
+        let grouped = launches.iter().any(|launch| route(launch) == StepRoute::Grouped);
+        #[cfg(test)]
+        let decodes = launches.iter().filter(|launch| route(launch) == StepRoute::Decode).count() as u64;
+        let mut resident = false;
+        let (steps, merges) = self.watcher.shared().begin(launches, &route, work, || {
+            resident = self.resident()?;
+            Ok(ChainServing { resident, grouped }.scratch())
+        })?;
+        #[cfg(test)]
+        if resident {
+            self.resident_decodes.fetch_add(decodes, Ordering::Relaxed);
+        }
+        let merges = self.plan.layers.iter().map(|layer| layer.scope).zip(merges).collect();
+        Ok((steps, merges, ChainServing { resident, grouped }))
+    }
+
+    /// The decode steps begun resident, which ran the resident forms.
+    #[cfg(test)]
+    pub(crate) fn resident_decodes(&self) -> u64 {
+        self.resident_decodes.load(Ordering::Relaxed)
     }
 
     /// The steps a prompt group runs while decode waits, at most `capacity`
@@ -332,12 +378,15 @@ impl ExpertBank {
 
     /// Whether the group `begin` is beginning is resident, which its
     /// resident word then holds for its fronts (`BankPart::Resident`): every
-    /// streamed layer's group is whole. Residency publishes the
+    /// streamed layer's group is whole, each expert at its home record.
+    /// Residency publishes the
     /// policy words only while no step runs (`Residency::publish_policy`), under
     /// the lock `begin` reads them in, and only a shrink clears one, which
-    /// the owner asks for between flights and waits on: what this reads
-    /// holds until the group ends.
-    pub fn resident(&self) -> Result<bool, String> {
+    /// the owner asks for between flights, once every begun step has ended
+    /// and the device is past it (`Steps::between_flights`), and waits on:
+    /// what this reads holds until the group ends, so no record a resident
+    /// group's runs read is moved, evicted or released before they end.
+    fn resident(&self) -> Result<bool, String> {
         let word = |tensor: &Tensor| {
             tensor
                 .load_acquire(4 * magnitude_kernels::constants::POLICY_WHOLE)
@@ -385,6 +434,17 @@ impl ExpertBank {
         let kind = RoutedTensor::of(role.kind).ok_or_else(|| format!("{role:?} is no routed tensor of a record"))?;
         self.layout.groups[self.layer(role.scope)?.1]
             .records
+            .get(kind)
+            .ok_or_else(|| format!("{role:?} is no routed tensor of its layer's record"))
+    }
+
+    /// The home records of a banked expert stack of `role` (`Self::homes`),
+    /// of a bank that can be whole.
+    pub fn home(&self, role: WeightRole) -> Result<&Tensor, String> {
+        let kind = RoutedTensor::of(role.kind).ok_or_else(|| format!("{role:?} is no routed tensor of a record"))?;
+        self.homes
+            .as_ref()
+            .ok_or_else(|| format!("{role:?}'s bank is never whole and has no home records"))?[self.layer(role.scope)?.0]
             .get(kind)
             .ok_or_else(|| format!("{role:?} is no routed tensor of its layer's record"))
     }
@@ -709,6 +769,24 @@ fn slot_maps(plan: &ExpertBankPlan, layout: &BankLayout<Tensor>) -> Result<Vec<T
                 .map
                 .slice_leading(home, home + layer.experts)
                 .map_err(|error| format!("a layer's slot map view failed: {error}"))
+        })
+        .collect()
+}
+
+/// Each layer's home records of each routed tensor (`ExpertBank::homes`):
+/// its group's records' view of its experts from its home record
+/// (`ExpertBankPlan::home`), as its slot map is its map's.
+fn homes(plan: &ExpertBankPlan, layout: &BankLayout<Tensor>) -> Result<Vec<RecordTensors<Tensor>>, String> {
+    plan.layers
+        .iter()
+        .enumerate()
+        .map(|(index, layer)| {
+            let home = plan.home(index);
+            layout.groups[layer.group].records.as_ref().try_map(|_, records| {
+                records
+                    .slice_leading(home, home + layer.experts)
+                    .map_err(|error| format!("a layer's home records view failed: {error}"))
+            })
         })
         .collect()
 }

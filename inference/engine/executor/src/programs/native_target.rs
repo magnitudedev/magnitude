@@ -1254,30 +1254,26 @@ impl NativeTargetProgram {
         let refused = |error, chain| super::ChainRefusal { error, chain, misses: None };
         // A streamed load's steps, in chain order, one group: the watcher
         // serves each from before its first run is queued until it
-        // completes. Scratch-served where a group of grouped launches is not
-        // resident.
+        // completes.
         let route = |launch: &ValidatedTargetLaunch| {
             match crate::operators::routed::fused_graph::decodes(launch.batch().upload().class.rows() as u64) {
                 true => StepRoute::Decode,
                 false => StepRoute::Grouped,
             }
         };
-        let grouped = chain.iter().any(|launch| route(launch) == StepRoute::Grouped);
         // Per block, the steps of the merge set its group ends with
         // (`Shared::begin`): the whole group but at a streamed layer of a
-        // group that is not resident (`ExpertBank::resident`).
+        // group that is not resident (`ExpertBank::begin`).
         let mut sets = vec![chain.len(); self.geometry.blocks.len()];
-        let mut scratch = false;
         // Each launch with its expert step, of a streamed load: a decode
-        // launch's rows are at their positions (validated nonnegative).
-        let steps = match &self.graphs.bank {
+        // launch's rows are at their positions (validated nonnegative); and
+        // how its chain is served: scratch-served where a group of grouped
+        // launches is not resident, its decode in the resident forms where
+        // it is.
+        let (steps, serving) = match &self.graphs.bank {
             Some(bank) => {
-                let begun = bank.begin(chain, |launch| route(launch), |launch| launch.work(), || {
-                    let resident = bank.resident()?;
-                    scratch = grouped && !resident;
-                    Ok(scratch)
-                });
-                let (steps, merges) = begun.map_err(|(error, chain)| refused(invalid(error), chain))?;
+                let begun = bank.begin(chain, |launch| route(launch), |launch| launch.work());
+                let (steps, merges, serving) = begun.map_err(|(error, chain)| refused(invalid(error), chain))?;
                 let steps = steps.map(|(launch, step)| {
                     let upload = launch.batch().upload();
                     let step = match route(&launch) {
@@ -1298,13 +1294,13 @@ impl NativeTargetProgram {
                     };
                     sets[at.block as usize] = size;
                 }
-                steps
+                (steps, Some(serving))
             }
-            None => chain.map(|launch| (launch, None)),
+            None => (chain.map(|launch| (launch, None)), None),
         };
         let (mut submitter, queued) = steps.scoped(
             StepSubmitter::new(&self.device),
-            |steps, submitter| self.queue_runs(steps, spare, &sets, scratch, submitter),
+            |steps, submitter| self.queue_runs(steps, spare, &sets, serving, submitter),
         );
         match queued {
             Ok(runs) => {
@@ -1373,9 +1369,11 @@ impl NativeTargetProgram {
         steps: Branded<'b, &'b mut (ValidatedTargetLaunch, Option<(Arc<crate::experts::ExpertBank>, crate::experts::ExpertStep)>)>,
         spare: &mut TargetGraphOutputLease,
         sets: &[usize],
-        scratch: bool,
+        serving: Option<crate::experts::ChainServing>,
         submitter: &mut StepSubmitter,
     ) -> Result<Branded<'b, QueuedRuns>, SubmitError> {
+        let scratch = serving.is_some_and(crate::experts::ChainServing::scratch);
+        let resident = serving.is_some_and(|serving| serving.resident);
         let group = self.graphs.group(steps.len()).map_err(invalid)?;
         // Every step of the group holds its group's record.
         let reads = steps
@@ -1386,7 +1384,9 @@ impl NativeTargetProgram {
         let reads = reads.as_ref().map(|(bank, record)| (&**bank, *record));
         let (launches, outputs) = steps
             .map(|(launch, banked)| {
-                let bank = banked.as_ref().map(|(bank, step)| BankRun { bank: bank.clone(), sequence: step.sequence(), sampled: step.samples() });
+                let bank = banked
+                    .as_ref()
+                    .map(|(bank, step)| BankRun { bank: bank.clone(), sequence: step.sequence(), sampled: step.samples(), resident });
                 let (core, graph_workspace, graph_output, workspace, output) = launch.submission_parts_mut();
                 ((core, graph_workspace, (workspace, output), bank), graph_output)
             })
@@ -1714,7 +1714,11 @@ impl NativeTargetProgram {
             scored,
         };
         let stages = self.graphs.prepared.stages(index, rows);
-        self.run_stage(run, index, &class, stages[0], rotation, submitter)?;
+        // A run of a chain its bank began resident takes a whole decode
+        // block's resident form.
+        let resident = run.bank.as_ref().is_some_and(|bank| bank.resident);
+        let stage = self.graphs.prepared.run_stage(index, rows, stages[0], resident);
+        self.run_stage(run, index, &class, stage, rotation, submitter)?;
         run.back = (stages.len() > 1).then_some((index, class));
         Ok(())
     }

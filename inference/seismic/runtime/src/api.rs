@@ -103,9 +103,10 @@ pub enum WorkflowError {
     },
     /// Chunked reserved storage, which has no one buffer, bound where device
     /// work would bind it directly: a device tensor port (parameter or
-    /// result) not marked `records`, or a language kernel's argument. A
-    /// record port reaches it through a table and a host port, never bound,
-    /// orders by its packed span.
+    /// result) not marked `records`, where its backend binds no one buffer
+    /// over the range (`ReservationChunks::whole`), or a language kernel's
+    /// argument. A record port reaches it through a table and a host port,
+    /// never bound, orders by its packed span.
     ChunkedBinding {
         parameter: String,
     },
@@ -816,7 +817,7 @@ pub mod device {
                 .map_err(|why| unreservable(Some(why.clone())))?
                 .ok_or_else(|| unreservable(None))?;
             self.kind.allocate_reserved_tensor(
-                crate::driver::ReservedRange::new(contract, span, records, rows),
+                crate::driver::ReservedRange::new(contract, span, records, rows, self.info().limits().max_allocation.value),
                 committed,
                 alignment,
             )
@@ -1748,13 +1749,27 @@ pub mod tensor {
                 .map_or(self.byte_len, |placement| placement.reach(0, self.byte_len).1)
         }
 
-        /// Whether this view lies in chunked reserved storage, which device
-        /// work reaches only through native record ports (or, never bound,
-        /// host ports).
+        /// Whether this view lies in chunked reserved storage, which a
+        /// language kernel's argument never binds.
         pub(crate) fn chunked(&self) -> bool {
             self.allocation
                 .reservation()
                 .is_some_and(|reservation| reservation.span.chunked())
+        }
+
+        /// Whether a native port binds this view directly: any view but one
+        /// of chunked reserved storage whose backend binds no one buffer over
+        /// the range (`ReservationChunks::whole`), or whose records are
+        /// packed with room between them, so that its bytes are no one
+        /// canonical range of that buffer; device work reaches those only
+        /// through native record ports (or, never bound, host ports). Where
+        /// the backend binds one buffer, the binding holds only while every
+        /// granule is backed, and work bound so runs only then.
+        pub(crate) fn binds_directly(&self) -> bool {
+            self.allocation
+                .reservation()
+                .and_then(|reservation| reservation.span.chunks)
+                .is_none_or(|chunks| chunks.whole && !self.packed())
         }
 
         /// Whether this view's records are packed in chunks with room left

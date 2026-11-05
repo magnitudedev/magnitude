@@ -25,8 +25,8 @@ template <uint ROWS, uint LANES>
 kernel void routed_expand(
     device const uchar *normalized [[buffer(SEISMIC_BUFFER_NORMALIZED)]],
     device const int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
-    device const ulong *expert_gate [[buffer(SEISMIC_BUFFER_EXPERT_GATE)]],
-    device const ulong *expert_up [[buffer(SEISMIC_BUFFER_EXPERT_UP)]],
+    device const uchar *expert_gate [[buffer(SEISMIC_BUFFER_EXPERT_GATE)]],
+    device const uchar *expert_up [[buffer(SEISMIC_BUFFER_EXPERT_UP)]],
     device const uchar *shared_gate [[buffer(SEISMIC_BUFFER_SHARED_GATE)]],
     device const uchar *shared_up [[buffer(SEISMIC_BUFFER_SHARED_UP)]],
     device const float *gate_scale [[buffer(SEISMIC_BUFFER_GATE_SCALE)]],
@@ -50,19 +50,19 @@ kernel void routed_expand(
     if (group.y < choices) {
         if (ulong(tile) * TILE >= SEISMIC_DIM_F) return;
         const ulong m = group.y / SEISMIC_DIM_K, k = group.y % SEISMIC_DIM_K;
-        const ulong expert = ulong(routes[m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1]);
+        const int expert = routes[m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1];
         const auto in = routed::activation(normalized + m * SEISMIC_NORMALIZED_STRIDE_0 * A::bytes,
             SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, uint(SEISMIC_DIM_H));
-        const auto gate = routed::weights<packets::W0>(slab::region<uchar>(expert_gate, expert),
-            KERNEL_W0_LAYOUT(SEISMIC_DIM_H), 0, SEISMIC_DIM_H);
-        const auto up = routed::weights<packets::W1>(slab::region<uchar>(expert_up, expert),
-            KERNEL_W1_LAYOUT(SEISMIC_DIM_H), 0, SEISMIC_DIM_H);
+        const auto gate = routed::stack_weights<packets::W0>(expert_gate, KERNEL_W0_LAYOUT(SEISMIC_DIM_H), expert,
+            SEISMIC_DIM_F, SEISMIC_DIM_H);
+        const auto up = routed::stack_weights<packets::W1>(expert_up, KERNEL_W1_LAYOUT(SEISMIC_DIM_H), expert,
+            SEISMIC_DIM_F, SEISMIC_DIM_H);
         const auto out = projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(
             projection::SiluMul<A>{expert_product
                 + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * A::bytes,
                 0, SEISMIC_RESULT_0_STRIDE_2},
-            projection::scale_factor(gate_scale, SEISMIC_DIM_GS, SEISMIC_GATE_SCALE_STRIDE_0, expert),
-            projection::scale_factor(up_scale, SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0, expert));
+            projection::scale_factor(gate_scale, SEISMIC_DIM_GS, SEISMIC_GATE_SCALE_STRIDE_0, ulong(expert)),
+            projection::scale_factor(up_scale, SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0, ulong(expert)));
         PROJECTION_OPERANDS_SHARED(globals, EXPERT_NVFP4);
         const auto x = projection::operands<EXPERT_NVFP4>::rows(in, 1u, uint(SEISMIC_DIM_H), globals, simdgroups,
             sg, lane);

@@ -1101,7 +1101,7 @@ fn reservation_charges_preserve_table_placement_and_total() {
     let reservation = |table| Reservation {
         granule: 4096,
         host_addressed: true,
-        chunks: Some(ReservationChunks { unit: 4096, table }),
+        chunks: Some(ReservationChunks { unit: 4096, table, whole: false }),
     };
     let record = NonZeroU64::new(4096).unwrap();
     let upload = reservation(Contract::Upload);

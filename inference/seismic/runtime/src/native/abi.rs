@@ -198,13 +198,13 @@ pub(crate) fn bound(schema: &CallSchema, implementation: &NativeImplementation) 
 }
 
 /// Whether each of the entry's buffers, in ABI order ([`buffer_writes`]),
-/// is a record port (`NativeImplementation::records`), bound as the table
-/// of its view's records' device addresses: a tensor parameter, or a tensor
-/// result, which follow the tensor parameters.
-pub(crate) fn records(schema: &CallSchema, implementation: &NativeImplementation) -> Vec<bool> {
+/// is a record port of launch `launch` (`NativeImplementation::launch_records`), bound as
+/// the table of its view's records' device addresses: a tensor parameter,
+/// or a tensor result, which follow the tensor parameters.
+pub(crate) fn records(schema: &CallSchema, implementation: &NativeImplementation, launch: usize) -> Vec<bool> {
     let mut records = vec![false; buffer_writes(schema, implementation).len()];
     let tensor = |kind: &ResultKind| matches!(kind, ResultKind::Tensor { .. });
-    for port in &implementation.records {
+    for port in implementation.launch_records(launch) {
         let buffer = match port {
             RecordPort::Parameter(name) => {
                 tensor_buffer(schema, name).expect("a checked record port is a tensor parameter")
@@ -455,6 +455,17 @@ fn render_source_with(
 ) -> String {
     let schema = logical.schema();
     let geometry = static_geometry(logical, specialization);
+    // The launch being formed, by ordinal.
+    let forming_launch = forming.map(|kernel| {
+        implementation
+            .launches
+            .iter()
+            .position(|launch| launch.kernel == kernel)
+            .expect("forming guard names a declared launch")
+    });
+    // The launch whose record ports are the source's: the forming one's,
+    // else any (an entry formed whole is not launch-scoped).
+    let formed = forming_launch.unwrap_or(0);
     let mut prefix = match dialect {
         Dialect::Metal(features) => metal_header(features),
         Dialect::Cuda(features) => cuda_header(features),
@@ -565,10 +576,12 @@ fn render_source_with(
                 // A record parameter's records are the host's to land while
                 // the work that reads them runs: host-written, where the
                 // backend's plain loads would not read them
-                // (`BackendName::plain_loads_read_host_writes`).
+                // (`BackendName::plain_loads_read_host_writes`). The source's
+                // record ports are its launch's; an entry not launch-scoped
+                // lists the same at every launch.
                 let host_written = !dialect.backend().plain_loads_read_host_writes()
                     && implementation
-                        .records
+                        .launch_records(formed)
                         .contains(&RecordPort::Parameter(parameter.name.clone()));
                 for symbol in names.tensor_prefixes() {
                     tensor.render(&mut prefix, &symbol);
@@ -634,12 +647,7 @@ fn render_source_with(
     } else {
         Vec::new()
     };
-    if let Some(kernel) = forming {
-        let current = implementation
-            .launches
-            .iter()
-            .position(|launch| launch.kernel == kernel)
-            .expect("forming guard names a declared launch");
+    if let Some(current) = forming_launch {
         let reads = implementation.launches[current].parameters();
         for (offset, address) in runtime_parameters.iter().enumerate() {
             let name = match address {
@@ -717,8 +725,7 @@ fn render_source_with(
     }
     // The launch being formed, when it dispatches a written grid authored
     // as a block.
-    let written = forming
-        .and_then(|kernel| implementation.launches.iter().position(|launch| launch.kernel == kernel))
+    let written = forming_launch
         .filter(|ordinal| {
             implementation.backend.authors_written_grid_blocks() && implementation.launches[*ordinal].grid.is_some()
         });

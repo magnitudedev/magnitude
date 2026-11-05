@@ -211,19 +211,39 @@ impl ExpertBankPlan {
     /// The most slots each record tensor's committed bytes keep within the
     /// device's single-allocation limit `max_allocation`, which bounds each
     /// native allocation backing them (`seismic::Reservation::most_backed`).
+    /// A range its backend binds as one buffer once every granule is backed
+    /// is one native allocation then: past the limit
+    /// (`seismic::Reservation::binds_whole`), its slots stop short of
+    /// backing its every granule, so the bank never is whole and stays
+    /// streamed.
     pub fn most_slots(&self, max_allocation: u64) -> Result<u64, String> {
         self.record_tensors().try_fold(self.widest().get(), |most, (group, kind, tensor)| {
             let record = tensor.record_bytes()?;
             let held = self.reserved_records(group, kind, tensor, crate::planning::BankTier::Bank)?;
-            let backed = self.reservation.of_records(held).most_backed(max_allocation) / record;
-            // The most slots whose records of every member layer fit; zero
-            // slots hold no records, so always fit.
-            let fitting = (1..=most)
-                .rev()
-                .find(|&slots| {
-                    self.member_experts(group).map(|experts| Self::layer_slots(slots, experts)).sum::<u64>() <= backed
-                })
-                .unwrap_or(0);
+            let reservation = self.reservation.of_records(held);
+            let backed = reservation.most_backed(max_allocation) / record;
+            let backing = |records: u64| {
+                records
+                    .checked_mul(held.record.get())
+                    .and_then(|bytes| reservation.backing(bytes))
+                    .ok_or_else(|| "bank record bytes overflow".to_owned())
+            };
+            let range = self.records(group);
+            let full = backing(range)?;
+            let whole_unbound = reservation.chunks.is_some_and(|chunks| chunks.whole)
+                && !reservation.binds_whole(range * held.record.get(), max_allocation);
+            // The most slots whose records of every member layer fit (and,
+            // where the range binds whole past the limit, back less than all
+            // of it); zero slots hold no records, so always fit.
+            let mut fitting = 0;
+            for slots in (1..=most).rev() {
+                let fits = self.member_experts(group).map(|experts| Self::layer_slots(slots, experts)).sum::<u64>() <= backed
+                    && (!whole_unbound || backing(self.records_at(group, slots))? < full);
+                if fits {
+                    fitting = slots;
+                    break;
+                }
+            }
             Ok(fitting)
         })
     }

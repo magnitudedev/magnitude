@@ -67,6 +67,7 @@ fn vulkan_reservation(granule: u64, unit: u64, host_addressed: bool) -> Reservat
         chunks: Some(crate::ReservationChunks {
             unit,
             table: crate::Contract::Upload,
+            whole: false,
         }),
     }
 }
@@ -568,6 +569,7 @@ pub fn m4_pro() -> Reports {
             chunks: Some(crate::ReservationChunks {
                 unit: APPLE_SILICON_PAGE,
                 table: crate::Contract::DeviceOnly,
+                whole: true,
             }),
         }),
     });

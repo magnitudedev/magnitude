@@ -8,7 +8,7 @@ use super::{
     certify::{TargetFamilyCertificate, certify_target_family},
     classes::{
         BlockGraphEnumeration, BlockListings, BlockOutputScales, BlockServed, LaunchControlLayout,
-        Passes, StagedClass, block_stages, class_topology, enumerate_block_graphs, launch_runs, once_class,
+        Passes, StagedClass, block_sealed_stages, block_stages, class_topology, enumerate_block_graphs, launch_runs, once_class,
         slot_selection,
     },
     entry::{
@@ -826,6 +826,17 @@ impl PreparedTargetGraphs {
     /// (`block_stages`).
     pub(crate) fn stages(&self, index: usize, rows: u64) -> &'static [RunStage] {
         block_stages(&self.served, index, rows)
+    }
+
+    /// The stage of block `index`'s run of `rows` rows at `stage` of its
+    /// stages: a whole decode block's resident form (`RunStage::Resident`)
+    /// in a chain its bank began `resident`, where the block has one
+    /// (`block_sealed_stages`), else `stage`.
+    pub(crate) fn run_stage(&self, index: usize, rows: u64, stage: RunStage, resident: bool) -> RunStage {
+        match stage == RunStage::Whole && resident && block_sealed_stages(&self.served, index, rows).contains(&RunStage::Resident) {
+            true => RunStage::Resident,
+            false => stage,
+        }
     }
 
     /// Whether the load streams block `index`'s routed experts

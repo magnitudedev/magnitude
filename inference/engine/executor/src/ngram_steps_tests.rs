@@ -235,9 +235,11 @@ fn a_streamed_decoder_steps_twice_through_its_bank() {
 /// into the bank's records however its storage is reserved) over a decoder
 /// whose first two attention blocks share one sealed graph, their streamed
 /// layers at different homes of one group
-/// (`streamed_layers_at_different_homes_share_a_graph`): each layer reads
-/// its own experts, through the resident load's arithmetic, so a prompt
-/// chunk and its decode steps score bit for bit as the resident load does.
+/// (`streamed_layers_at_different_homes_share_a_graph`): every decode step
+/// runs the resident forms, each block's bound to its own layer's home
+/// records, and each layer reads its own experts, through the resident
+/// load's arithmetic, so a prompt chunk and its decode steps score bit for
+/// bit as the resident load does.
 #[test]
 fn a_whole_banks_shared_graphs_read_each_layers_own_experts() {
     let definition = qwen4exp_fixture_definition_of(4, 32);
@@ -574,6 +576,13 @@ fn scores(
             returned = next;
         }
         drop(returned);
+        // A whole bank's every launch of decode rows (its two-row prompt
+        // chunk's too) runs the resident forms; no partial one's does.
+        let resident = match banked {
+            Banked::Whole => 1 + DECODE_STEPS as u64,
+            _ => 0,
+        };
+        assert_eq!(domain.resident_decodes(), resident, "{backend:?}: the decode steps the resident forms ran");
         if filled == Filled::DeviceLanded && domain.expert_bank_plan().is_some_and(|plan| plan.placer() == crate::planning::Placer::Bank) {
             assert!(domain.device_landed() > 0, "{backend:?}: the device landed no miss, so its path never ran");
         }
@@ -708,8 +717,10 @@ fn a_banked_loads_prompt_groups_score_as_resident() {
 /// plateau between decode steps, then to its floor (as the release ladder
 /// shrinks it under pressure; on unified memory the kept experts' bytes
 /// move within the one store), decodes on bit for bit as the resident load
-/// does: each expert it dropped is a file miss from then on, each one it
-/// kept is read where the shrink moved it, from the first step after it.
+/// does, losing no step: every step before the first shrink runs the
+/// resident forms and none after it does, each expert it dropped is a file
+/// miss from then on, each one it kept is read where the shrink moved it,
+/// from the first step after it.
 /// With every stack of one form (one bank group) and with the last routed
 /// layer's in another (two groups, each shrinking its own records), and
 /// without and with lookahead. After each shrink the miss record counts
@@ -810,6 +821,10 @@ fn shrunk_bank_scores_as_resident(
         let (outcome, mut bindings) = run(&mut domain, bindings, scored(forward(request, WorkKind::Prefill, &[5, 1], 0, true)), false, metal);
         let mut steps = vec![step_bits(&outcome)];
         let mut shrinks = 0;
+        // The launches of decode rows run before the first shrink (its
+        // two-row prompt chunk's among them), and the resident forms' runs
+        // as it began.
+        let mut first_shrink = None;
         for position in 2..2 + DECODE_STEPS {
             // From a quarter of the decode, one slot's worth a step, as the
             // release ladder shrinks it, each shrink beside the misses the
@@ -825,6 +840,7 @@ fn shrunk_bank_scores_as_resident(
                 match domain.shrink_expert_bank_by(&mut bindings, deficit, wake).unwrap() {
                     crate::BankStep::Begun(_) => {
                         shrinks += 1;
+                        first_shrink.get_or_insert((steps.len() as u64, domain.resident_decodes()));
                         while domain.advance_expert_bank(crate::CompletionWake::new(|| {})).unwrap().is_none() {}
                         let priced = domain.expert_costs().map(|costs| costs.slots as u64);
                         assert_eq!(priced, domain.expert_bank_slots(), "{test}: the record counts misses at the bank's slots");
@@ -839,6 +855,15 @@ fn shrunk_bank_scores_as_resident(
             let (outcome, next, _) = step(&mut domain, bindings, scored(forward(request, WorkKind::Decode, &[token], position, true)), metal);
             steps.push(step_bits(&outcome));
             bindings = next;
+        }
+        // Every step before the first shrink ran the resident forms (with
+        // lookahead, a successor begun then too), and none from it on: a
+        // shrink begins only once every begun step has ended.
+        if matches!(banked, Banked::Whole) {
+            let (decoded, ran) = first_shrink.expect("the whole bank shrank");
+            assert!(ran >= decoded, "{test}, lookahead {lookahead}: {ran} resident runs before the first shrink, of {decoded} steps");
+            assert!(lookahead || ran == decoded, "{test}: {ran} resident runs before the first shrink, of {decoded} steps");
+            assert_eq!(domain.resident_decodes(), ran, "{test}, lookahead {lookahead}: a decode step after the first shrink ran the resident forms");
         }
         (steps, shrinks)
     };
