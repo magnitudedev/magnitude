@@ -1323,14 +1323,25 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// so no growth takes it: the planned workload's state the stores have
     /// not committed (`StateCapacityPlan::workload_state_bytes` less the
     /// stores' committed slabs), so the workload's conversations grow into
-    /// the room the plan charged them; none in another store (a discrete
-    /// device's host memory). The memory the device's graph budget costs is
-    /// held: its live slots' holds charge it to the ledger.
+    /// the room the plan charged them, and the planned weights of each
+    /// optional component not bound yet (the head's, the projector's, each
+    /// imported at its first use, [`Self::component_growth`]), so that use
+    /// finds the room the plan charged it. A bound component's weights are
+    /// the ledger's optional holding (`sync_optional_holding`, which holds
+    /// only completed imports), so each is charged once, here or there. None
+    /// in another store (a discrete device's host memory). The memory the
+    /// device's graph budget costs is held: its live slots' holds charge it
+    /// to the ledger.
     fn unborn(&self, kind: seismic::Contract) -> u64 {
         if !self.beside_device(kind) {
             return 0;
         }
-        self.execution.resources().capacity().workload_state_bytes.saturating_sub(self.committed_state_bytes())
+        let bytes = self.execution.resources().bytes();
+        unborn_bytes(
+            self.execution.resources().capacity().workload_state_bytes,
+            self.committed_state_bytes(),
+            [(self.family.head_is_bound(), bytes.head_weights), (self.family.vision_is_bound(), bytes.vision_weights)],
+        )
     }
 
     /// The room beside the workload in `kind` storage's store: what a growth
@@ -1760,6 +1771,15 @@ pub(super) struct MeasurementClaim {
     pub(super) _traffic: Option<TrafficHold>,
 }
 
+/// What the plan charged that is not held yet (`ExecutorDomain::unborn`):
+/// the planned workload state past what the stores committed, and each
+/// optional component's planned weights while it is unbound (once bound,
+/// its weights are the ledger's optional holding, so each is charged once).
+fn unborn_bytes(workload: u64, committed: u64, components: [(bool, u64); 2]) -> u64 {
+    let unbound = components.iter().filter(|&&(bound, _)| !bound).map(|&(_, weights)| weights).sum::<u64>();
+    workload.saturating_sub(committed) + unbound
+}
+
 #[cfg(test)]
 mod group_demand_tests {
     use super::*;
@@ -1799,10 +1819,17 @@ mod group_demand_tests {
     }
 }
 
-/// The measurement job's claim beside the model: the device bytes it
-/// claims, and its hold of the bank's own traffic, which stands while the
-/// claim does and drops with it.
-pub(super) struct MeasurementClaim {
-    pub(super) bytes: u64,
-    pub(super) _traffic: Option<TrafficHold>,
+#[cfg(test)]
+mod unborn_tests {
+    use super::unborn_bytes;
+
+    /// An unbound component's planned weights stay out of growth beside the
+    /// workload's unborn state; a bound one's are the ledger's, not held
+    /// out again.
+    #[test]
+    fn an_unbound_components_planned_weights_are_charged_once() {
+        assert_eq!(unborn_bytes(10, 4, [(false, 3), (false, 5)]), 6 + 8, "both components unbound");
+        assert_eq!(unborn_bytes(10, 4, [(true, 3), (false, 5)]), 6 + 5, "the head bound, the projector not");
+        assert_eq!(unborn_bytes(10, 12, [(true, 3), (true, 5)]), 0, "everything held");
+    }
 }
