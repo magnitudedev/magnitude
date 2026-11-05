@@ -3279,7 +3279,10 @@ struct AssessmentFixture {
 }
 
 fn fixtures_root() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../engine/fixtures/assessment")
+    std::path::Path::new(
+        &std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    )
+    .join("../../engine/fixtures/assessment")
 }
 
 /// Search reads a shape from a header's first bytes: every fixture target whose fingerprint the

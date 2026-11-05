@@ -4,7 +4,9 @@ use std::process::Command;
 
 #[test]
 fn workflow_draft_cannot_bypass_admission() {
-    let runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let runtime = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    );
     let root = std::env::temp_dir().join(format!(
         "seismic-runtime-compile-fail-{}",
         std::process::id()
@@ -20,7 +22,7 @@ fn workflow_draft_cannot_bypass_admission() {
 }
 
 fn run_fixture(root: &Path, runtime: &Path) {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let fixture = runtime
         .join("tests")
         .join("ui")
         .join("workflow_draft_submit.rs");
@@ -33,7 +35,7 @@ fn run_fixture(root: &Path, runtime: &Path) {
     );
     fs::write(directory.join("Cargo.toml"), manifest).expect("write fixture manifest");
 
-    let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+    let output = Command::new(std::env::var_os("CARGO").expect("cargo sets CARGO"))
         .args(["check", "--quiet", "--offline"])
         .current_dir(&directory)
         .env("CARGO_TARGET_DIR", root.join("target"))

@@ -21,6 +21,15 @@ mod comparison;
 #[cfg(feature = "coverage")]
 pub mod coverage;
 pub(crate) use batch::{NativeTensorBatch, NativeTensorBatchCompletion};
+
+/// The engine's kernel sources, for the tests that check them: the tree
+/// beside this crate's directory, as cargo names it to the running test.
+#[cfg(test)]
+pub(crate) fn engine_kernels() -> std::path::PathBuf {
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
+    std::path::Path::new(&manifest).join("../../engine/kernels/kernels")
+}
+
 #[cfg(test)]
 mod bundle_identity_tests;
 pub mod cpu;

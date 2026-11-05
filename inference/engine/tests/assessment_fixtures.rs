@@ -145,7 +145,8 @@ fn reasons_match(actual: &[UnsupportedReason], expected: &[UnsupportedReason]) -
 }
 
 fn fixtures() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/assessment")
+    Path::new(&std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"))
+        .join("fixtures/assessment")
 }
 
 struct Scratch(PathBuf);

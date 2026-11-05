@@ -1,12 +1,17 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// This crate's directory, as cargo names it to the running test.
+fn manifest_dir() -> PathBuf {
+    PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"))
+}
 
 /// The packages this crate depends on, dev and build included, by package
 /// name, as Cargo resolves its manifest: whatever key or rename declares
 /// them.
 fn dependencies() -> Vec<String> {
-    let output = std::process::Command::new(env!("CARGO"))
+    let output = std::process::Command::new(std::env::var_os("CARGO").expect("cargo sets CARGO"))
         .args(["metadata", "--format-version", "1", "--no-deps", "--offline", "--manifest-path"])
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+        .arg(manifest_dir().join("Cargo.toml"))
         .output()
         .expect("cargo metadata runs");
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -60,7 +65,7 @@ fn sources(directory: &Path) -> Vec<(std::path::PathBuf, String)> {
 
 #[test]
 fn service_sources_do_not_import_forbidden_implementation_layers() {
-    let sources = sources(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")));
+    let sources = sources(&manifest_dir().join("src"));
     assert!(sources.iter().any(|(path, _)| path.ends_with("owner.rs")), "the walk reads the crate's sources");
     for (path, source) in &sources {
         for forbidden in [

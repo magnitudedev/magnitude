@@ -8617,8 +8617,7 @@ mod tests {
     #[test]
     fn the_dense_output_search_reaches_the_packing_form_first() {
         // The engine's kernel sources as its build loads them.
-        let kernels =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../engine/kernels/kernels");
+        let kernels = crate::native::engine_kernels();
         let module = seismic_lang::source::load(&[kernels], seismic_std::sources())
             .unwrap_or_else(|_| panic!("the engine's kernel sources load"))
             .module;

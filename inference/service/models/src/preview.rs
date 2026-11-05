@@ -2849,7 +2849,7 @@ mod tests {
     async fn sparse_preview_headers_produce_the_same_properties_as_complete_models() {
         use std::io::Read;
 
-        let inference_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let inference_root = crate::test_gguf::manifest_dir().join("../..");
         let fixtures = [
             inference_root.join("target/parity-models/tinyllamas/stories15M-q4_0.gguf"),
             inference_root

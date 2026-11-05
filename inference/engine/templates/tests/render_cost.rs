@@ -56,7 +56,10 @@ fn looking_up_a_variable_costs_about_as_much_as_a_literal() {
 
 #[test]
 fn a_preparation_renders_the_conversation_once_with_and_once_without_the_generation_prompt() {
-    let assets = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/assets/");
+    let assets = std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    )
+    .join("tests/assets");
     let messages = vec![
         json!({"role":"system","content":"You are a helpful assistant."}),
         json!({"role":"user","content":"Weather in Paris?"}),
@@ -74,7 +77,7 @@ fn a_preparation_renders_the_conversation_once_with_and_once_without_the_generat
         // Muse Glimmer's generation prompt is fixed text, so its preparation renders once.
         ("Muse-Glimmer-30B.jinja", 1),
     ] {
-        let source = std::fs::read_to_string(format!("{assets}{asset}")).unwrap();
+        let source = std::fs::read_to_string(assets.join(asset)).unwrap();
         let special = [("bos_token", "<s>"), ("eos_token", "</s>")]
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .into();

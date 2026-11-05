@@ -941,18 +941,6 @@ mod tests {
         );
     }
 
-    fn fixture_header(name: &str) -> Vec<u8> {
-        use std::io::Read;
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../engine/fixtures/assessment/headers")
-            .join(format!("{name}.gz"));
-        let mut header = Vec::new();
-        flate2::read::GzDecoder::new(std::fs::File::open(path).expect("fixture header"))
-            .read_to_end(&mut header)
-            .expect("gzipped header");
-        header
-    }
-
     /// Arki05's `skeleton.gguf` (the real header) is a whole Qwen3.5 4B header: 426 tensors whose
     /// directory declares 8.41 GB of data after its 3 MB header, in a file of 10,968,000 bytes. It
     /// holds none of the weights it describes, so at its real size it is auxiliary, never a
@@ -960,8 +948,11 @@ mod tests {
     #[test]
     fn a_file_shorter_than_its_declared_tensor_data_holds_no_weights() {
         let architectures = RecognizedArchitectures::new(["qwen35"], ["dflash"]);
-        let classification =
-            classify_header(&fixture_header("skeleton.gguf"), &architectures).unwrap();
+        let classification = classify_header(
+            &crate::test_gguf::fixture_header("skeleton"),
+            &architectures,
+        )
+        .unwrap();
         assert_eq!(classification.declared_bytes, 3_017_952 + 8_413_425_664);
         let target = CandidateFileRole::Target {
             architecture: Some("qwen35".to_owned()),
@@ -1010,15 +1001,17 @@ mod tests {
             ["qwen35", "qwen4exp"],
             ["dflash", "gemma4-assistant", "qwen4exp"],
         );
-        let classify = |name: &str| classify_header(&fixture_header(name), &architectures).unwrap();
+        let classify = |name: &str| {
+            classify_header(&crate::test_gguf::fixture_header(name), &architectures).unwrap()
+        };
         assert_eq!(
-            classify("Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-FastMTP-32K.gguf").role,
+            classify("Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-FastMTP-32K").role,
             CandidateFileRole::Drafter {
                 architecture: "qwen35".to_owned()
             }
         );
         assert_eq!(
-            classify("Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ3_XS.gguf").role,
+            classify("Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ3_XS").role,
             CandidateFileRole::Target {
                 architecture: Some("qwen35".to_owned())
             }
@@ -1035,11 +1028,10 @@ mod tests {
             ["qwen35", "qwen4exp"],
             ["dflash", "gemma4-assistant", "qwen4exp"],
         );
-        let classify = |name: &str| classify_header(&fixture_header(name), &architectures).unwrap();
-        for head in [
-            "mtp-Qwen3.5-9B-heretic-Q8_0.gguf",
-            "mtp-Qwen3.5-9B-heretic-BF16.gguf",
-        ] {
+        let classify = |name: &str| {
+            classify_header(&crate::test_gguf::fixture_header(name), &architectures).unwrap()
+        };
+        for head in ["mtp-Qwen3.5-9B-heretic-Q8_0", "mtp-Qwen3.5-9B-heretic-BF16"] {
             assert_eq!(
                 classify(head).role,
                 CandidateFileRole::Drafter {
@@ -1049,13 +1041,13 @@ mod tests {
             );
         }
         assert_eq!(
-            classify("Qwen3.5-9B-heretic-Q4_K_M.gguf").role,
+            classify("Qwen3.5-9B-heretic-Q4_K_M").role,
             CandidateFileRole::Target {
                 architecture: Some("qwen35".to_owned())
             }
         );
         assert_eq!(
-            classify("Qwen3.5-4B-Q3_K_M.gguf").role,
+            classify("Qwen3.5-4B-Q3_K_M").role,
             CandidateFileRole::Target {
                 architecture: Some("qwen35".to_owned())
             },
@@ -1072,8 +1064,8 @@ mod tests {
             ["qwen35", "qwen4exp"],
             ["dflash", "gemma4-assistant", "qwen4exp"],
         );
-        for name in ["Qwen3.5-4B-UD-Q6_K_XL.gguf", "Qwen3.5-4B-Q6_K.gguf"] {
-            let header = fixture_header(name);
+        for name in ["Qwen3.5-4B-UD-Q6_K_XL", "Qwen3.5-4B-Q6_K"] {
+            let header = crate::test_gguf::fixture_header(name);
             assert_eq!(
                 classify_header(&header, &architectures).unwrap().role,
                 CandidateFileRole::Target {
@@ -1082,7 +1074,7 @@ mod tests {
                 "{name}"
             );
             let directory = tempfile::tempdir().unwrap();
-            let file = directory.path().join(name);
+            let file = directory.path().join(format!("{name}.gguf"));
             std::fs::write(&file, &header).unwrap();
             let inspection = crate::gguf::inspect(&file).unwrap();
             assert_eq!(inspection.nextn_predict_layers, Some(1), "{name}");

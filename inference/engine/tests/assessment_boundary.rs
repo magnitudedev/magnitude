@@ -971,9 +971,10 @@ fn widened_weights_are_charged_as_resident() {
 /// A shared real-header fixture (`fixtures/assessment/headers`),
 /// decompressed into `scratch` under its repository file name.
 fn real_header(scratch: &Scratch, name: &str) -> PathBuf {
-    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/assessment/headers")
-        .join(format!("{name}.gz"));
+    let source =
+        Path::new(&std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"))
+            .join("fixtures/assessment/headers")
+            .join(format!("{name}.gz"));
     let mut decoder = flate2::read::GzDecoder::new(
         std::fs::File::open(&source).unwrap_or_else(|error| panic!("{}: {error}", source.display())),
     );

@@ -2338,8 +2338,10 @@ mod tests {
     /// (`engine/kernels/tests/support/gguf_vectors`).
     #[test]
     fn programs_repack_reference_blocks_as_the_interpreter() {
-        let vectors = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../engine/kernels/tests/support/gguf_vectors");
+        let vectors = std::path::Path::new(
+            &std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+        )
+        .join("../../engine/kernels/tests/support/gguf_vectors");
         for conversion in registry::representation_conversions() {
             let layout = conversion.source_layout;
             let group = u64::from(layout.logical_group);

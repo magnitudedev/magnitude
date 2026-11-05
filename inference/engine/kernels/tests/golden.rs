@@ -11,9 +11,9 @@
 //! nondeterministic outputs); `compare` requires identical hashes for the
 //! same key set.
 //!
-//! Sources are read from `kernels/` (or `GOLDEN_KERNELS`) at run time through
-//! the dynamic API, so a record, an edit of the kernel sources and a compare
-//! run use one test binary.
+//! Sources are read from `kernels/` under the run-time `CARGO_MANIFEST_DIR`
+//! through the dynamic API, so a record, an edit of the kernel sources and a
+//! compare run use one test binary.
 //!
 //! ```text
 //! GOLDEN_MODE=record|compare GOLDEN_DIR=<dir> GOLDEN_FAMILIES=projection,readout \
@@ -2895,10 +2895,10 @@ fn golden() {
         gguf,
         weights: Default::default(),
     };
-    // A harness built from a snapshot of the tree may check the live sources.
-    let kernels = std::env::var_os("GOLDEN_KERNELS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernels"));
+    let kernels = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    )
+    .join("kernels");
     // `GOLDEN_SOURCES` names the declaration files to load (so another
     // family's in-progress declarations cannot block a run); default: all.
     let sources = match std::env::var("GOLDEN_SOURCES")

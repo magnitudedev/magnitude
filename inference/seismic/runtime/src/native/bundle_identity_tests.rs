@@ -17,7 +17,6 @@ use seismic_lang::checked::{
 use seismic_lang::entry::ElementBindings;
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry::{self, BackendName, Layout};
-use std::path::PathBuf;
 
 const VULKAN: VulkanFeatures = VulkanFeatures {
     subgroup_lanes: 32,
@@ -112,7 +111,7 @@ fn specialization(native: &NativeImplementation) -> NativeSpecialization {
 #[test]
 #[ignore]
 fn decoded_kernel_bundle_forms_identical_native_sources() {
-    let kernels = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../engine/kernels/kernels");
+    let kernels = super::engine_kernels();
     let checked = seismic_lang::source::load(&[kernels], seismic_std::sources())
         .expect("the engine kernel library checks")
         .module;

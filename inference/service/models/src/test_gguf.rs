@@ -1,7 +1,7 @@
 //! Test fixtures: synthetic GGUF files (real headers with small F32 tensors), and directories
 //! Magnitude can't read.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(crate) enum Meta<'a> {
     Str(&'a str),
@@ -129,11 +129,22 @@ pub(crate) fn engine_architectures() -> crate::candidate_files::RecognizedArchit
     )
 }
 
+/// The engine's assessment fixtures, found through the crate directory cargo
+/// names to the running test.
+pub(crate) fn assessment_fixtures() -> PathBuf {
+    manifest_dir().join("../../engine/fixtures/assessment")
+}
+
+/// This crate's directory, as cargo names it to the running test.
+pub(crate) fn manifest_dir() -> PathBuf {
+    PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"))
+}
+
 /// A real GGUF header from the engine's assessment fixtures, decompressed.
 pub(crate) fn fixture_header(name: &str) -> Vec<u8> {
     use std::io::Read;
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../engine/fixtures/assessment/headers")
+    let path = assessment_fixtures()
+        .join("headers")
         .join(format!("{name}.gguf.gz"));
     let mut bytes = Vec::new();
     flate2::read::GzDecoder::new(std::fs::File::open(&path).expect("fixture"))

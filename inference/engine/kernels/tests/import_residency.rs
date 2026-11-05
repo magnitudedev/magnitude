@@ -35,9 +35,11 @@ fn conversions() -> Vec<(seismic::Element, seismic::OperandRecipe)> {
 /// (`tests/support/gguf_reference.py vectors`): their bytes and gguf-py's
 /// dequantization of them.
 fn reference_vectors(encoding: magnitude_ggml::Encoding) -> (Vec<u8>, Vec<f32>) {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/support/gguf_vectors")
-        .join(format!("{}.bin", encoding.ggml_name()));
+    let path = std::path::Path::new(
+        &std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    )
+    .join("tests/support/gguf_vectors")
+    .join(format!("{}.bin", encoding.ggml_name()));
     let file = std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     let blocks = u64::from(u32::from_le_bytes(file[..4].try_into().unwrap()));
     let bytes = (blocks * encoding.block_bytes()) as usize;

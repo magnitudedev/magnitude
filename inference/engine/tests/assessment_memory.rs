@@ -54,7 +54,8 @@ fn live() -> i64 {
 }
 
 fn fixtures() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/assessment")
+    Path::new(&std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"))
+        .join("fixtures/assessment")
 }
 
 /// Every fixture's package (`fixtures/assessment/manifest.json`), its

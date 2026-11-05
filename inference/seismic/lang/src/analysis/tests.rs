@@ -20,7 +20,9 @@ pub(super) fn entry(source: &str) -> LogicalEntry {
 pub(super) fn kernels() -> &'static CheckedModule {
     static KERNELS: std::sync::OnceLock<CheckedModule> = std::sync::OnceLock::new();
     KERNELS.get_or_init(|| {
-        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let manifest = std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+        );
         let roots = [
             manifest.join("../../seismic-std/lib"),
             manifest.join("../../engine/kernels/kernels"),
