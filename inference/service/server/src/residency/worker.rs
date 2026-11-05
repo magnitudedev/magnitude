@@ -404,6 +404,7 @@ impl Drop for EngineWorker {
                         Ok(status) => break status,
                         Err(error) => {
                             tracing::error!(worker.pid = pid, %error, "an ownerless inference worker could not be shown to have ended; trying again");
+                            device.unretired();
                             std::thread::sleep(RETIREMENT_RETRY);
                         }
                     }

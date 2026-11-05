@@ -57,15 +57,28 @@ pub struct DeviceLock {
     sharing: Arc<watch::Sender<Sharing>>,
 }
 
-/// The shares held, the resident model while no request holds it, and whether a measurement
-/// runs beside it: while one does, no share is taken, as none is while a job holds the device.
+/// The shares held, the resident model while no request holds it, and the job holding the
+/// device, to itself or beside that model: while one does, no share is taken.
 #[derive(Clone, Default)]
 struct Sharing {
     shares: usize,
     idle: Option<IdleResident>,
     /// Counts the idle model's changes: each preempts a measurement beside it.
     idleness: u64,
-    beside: bool,
+    job: Option<HeldJob>,
+    /// Host memory is short ([`DeviceLock::hold_off_jobs`]): no job starts, and a running one
+    /// gives way before any model does.
+    held_off: bool,
+}
+
+/// A job holding the device, as far as host memory pressure reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeldJob {
+    /// Running, or giving way: its process is being shown gone.
+    Live,
+    /// The system would not show its process gone ([`DeviceJob::unretired`]): it keeps the
+    /// device until it does, and gives no memory back meanwhile.
+    Unretired,
 }
 
 impl Default for DeviceLock {
@@ -102,6 +115,7 @@ impl Drop for DeviceShare {
 /// beside the measurement job.
 pub struct DeviceJob {
     hold: JobHold,
+    sharing: Arc<watch::Sender<Sharing>>,
     released: Arc<watch::Sender<u64>>,
     preemption: Preemption,
 }
@@ -110,10 +124,7 @@ enum JobHold {
     /// The device to itself; `None` only inside `drop`.
     Exclusive(Option<OwnedRwLockWriteGuard<()>>),
     /// Beside the idle resident model's share.
-    Beside {
-        resident: Arc<dyn ResidentRoom>,
-        sharing: Arc<watch::Sender<Sharing>>,
-    },
+    Beside { resident: Arc<dyn ResidentRoom> },
 }
 
 impl Drop for DeviceJob {
@@ -122,10 +133,13 @@ impl Drop for DeviceJob {
     /// ([`ResidentRoom::release`]) before a request waiting on the job is admitted.
     fn drop(&mut self) {
         match &mut self.hold {
-            JobHold::Exclusive(guard) => drop(guard.take()),
-            JobHold::Beside { resident, sharing } => {
+            JobHold::Exclusive(guard) => {
+                self.sharing.send_modify(|sharing| sharing.job = None);
+                drop(guard.take());
+            }
+            JobHold::Beside { resident } => {
                 resident.release();
-                sharing.send_modify(|sharing| sharing.beside = false);
+                self.sharing.send_modify(|sharing| sharing.job = None);
             }
         }
         self.released
@@ -149,8 +163,21 @@ impl DeviceJob {
     pub fn beside(&self) -> Option<&Arc<dyn ResidentRoom>> {
         match &self.hold {
             JobHold::Exclusive(_) => None,
-            JobHold::Beside { resident, .. } => Some(resident),
+            JobHold::Beside { resident } => Some(resident),
         }
+    }
+
+    /// The system would not show the job's process gone: it keeps the device until it does,
+    /// and a host memory emergency spares the resident model for it no longer
+    /// ([`DeviceLock::job_giving_way`]).
+    pub fn unretired(&self) {
+        self.sharing.send_if_modified(|sharing| {
+            let marked = sharing.job == Some(HeldJob::Live);
+            if marked {
+                sharing.job = Some(HeldJob::Unretired);
+            }
+            marked
+        });
     }
 }
 
@@ -225,6 +252,16 @@ pub enum DeviceHold {
     Job(DeviceJob),
 }
 
+impl DeviceHold {
+    /// The system would not show the worker's process gone: a job's hold says so
+    /// ([`DeviceJob::unretired`]); a load's share is no job's.
+    pub fn unretired(&self) {
+        if let Self::Job(job) = self {
+            job.unretired();
+        }
+    }
+}
+
 impl DeviceLock {
     /// Share the device, without waiting: `None` while a job holds it.
     pub fn try_share(&self) -> Option<DeviceShare> {
@@ -252,16 +289,17 @@ impl DeviceLock {
                 return share;
             }
             // The sender lives as long as this lock.
-            let _ = sharing.wait_for(|sharing| !sharing.beside).await;
+            let _ = sharing.wait_for(|sharing| sharing.job.is_none()).await;
         }
     }
 
-    /// A share of `guard`, unless a measurement runs beside the idle resident model: decided
-    /// with the count of shares, which that measurement's start reads.
+    /// A share of `guard`, unless a measurement runs beside the idle resident model (`guard`
+    /// excludes a job with the device to itself): decided with the count of shares, which that
+    /// measurement's start reads.
     fn share_of(&self, guard: OwnedRwLockReadGuard<()>) -> Option<DeviceShare> {
         let mut shared = false;
         self.sharing.send_if_modified(|sharing| {
-            shared = !sharing.beside;
+            shared = sharing.job.is_none();
             if shared {
                 sharing.shares += 1;
             }
@@ -290,7 +328,33 @@ impl DeviceLock {
     /// bounded exit wait.
     pub async fn admit_request(&self) {
         // The sender lives as long as this lock.
-        let _ = self.sharing.subscribe().wait_for(|sharing| !sharing.beside).await;
+        let _ = self.sharing.subscribe().wait_for(|sharing| sharing.job.is_none()).await;
+    }
+
+    /// Hold jobs off while host memory is short (`held`), or no longer: the memory supervisor's
+    /// alone to say. Held off, no job starts, and one running is preempted at once: a job gives
+    /// way before any model does ([`Self::job_giving_way`]). Whether this call preempted a
+    /// job: only the hold's start preempts, so a job still ending from it is not preempted
+    /// again.
+    pub fn hold_off_jobs(&self, held: bool) -> bool {
+        let mut preempted = false;
+        self.sharing.send_if_modified(|sharing| {
+            let changed = sharing.held_off != held;
+            preempted = changed && held && sharing.job.is_some();
+            sharing.held_off = held;
+            changed
+        });
+        if preempted {
+            self.wanted.send_modify(|wanted| *wanted += 1);
+        }
+        preempted
+    }
+
+    /// Whether a job holds the device that is still giving way, its process not yet refused
+    /// gone by the system ([`DeviceJob::unretired`]): while one does, host memory pressure
+    /// waits for what it frees before taking a model.
+    pub fn job_giving_way(&self) -> bool {
+        self.sharing.borrow().job == Some(HeldJob::Live)
     }
 
     /// The device's changes from now on ([`DeviceChanges`]).
@@ -307,6 +371,10 @@ impl DeviceLock {
     /// Take the device for a job, without waiting: `None` while residency shares it or another
     /// job holds it. Only shares wanted from here on preempt the job.
     pub fn try_job(&self) -> Option<DeviceJob> {
+        // Held off, the write guard is not even tried, so no share is refused for it.
+        if self.sharing.borrow().held_off {
+            return None;
+        }
         let preemption = Preemption {
             wanted: self.wanted.subscribe(),
             idle: None,
@@ -314,11 +382,17 @@ impl DeviceLock {
         let guard = Arc::clone(&self.lock).try_write_owned().ok()?;
         // A measurement beside a resident model whose share has ended holds the device until it
         // ends; no share starts while the write guard is held, so none starts beside it.
-        if self.sharing.borrow().beside {
-            return None;
-        }
-        Some(DeviceJob {
+        let mut taken = false;
+        self.sharing.send_if_modified(|sharing| {
+            taken = sharing.job.is_none() && !sharing.held_off;
+            if taken {
+                sharing.job = Some(HeldJob::Live);
+            }
+            taken
+        });
+        taken.then(|| DeviceJob {
             hold: JobHold::Exclusive(Some(guard)),
+            sharing: Arc::clone(&self.sharing),
             released: Arc::clone(&self.released),
             preemption,
         })
@@ -331,18 +405,16 @@ impl DeviceLock {
         let wanted = self.wanted.subscribe();
         let mut taken = None;
         self.sharing.send_if_modified(|sharing| {
-            if let (Some(idle), 1, false) = (&sharing.idle, sharing.shares, sharing.beside) {
+            if let (Some(idle), 1, None, false) = (&sharing.idle, sharing.shares, sharing.job, sharing.held_off) {
                 taken = Some((Arc::clone(&idle.room), sharing.idleness));
-                sharing.beside = true;
+                sharing.job = Some(HeldJob::Live);
             }
             taken.is_some()
         });
         let (resident, idleness) = taken?;
         Some(DeviceJob {
-            hold: JobHold::Beside {
-                resident,
-                sharing: Arc::clone(&self.sharing),
-            },
+            hold: JobHold::Beside { resident },
+            sharing: Arc::clone(&self.sharing),
             released: Arc::clone(&self.released),
             preemption: Preemption {
                 wanted,
@@ -372,13 +444,17 @@ impl DeviceLock {
     /// defers this way while a model is resident or loading, or another job holds the device.
     pub async fn job(&self) -> DeviceJob {
         let mut released = self.released.subscribe();
+        let mut sharing = self.sharing.subscribe();
         loop {
             if let Some(job) = self.try_job() {
                 return job;
             }
-            // Every hold's end changes this after its release; one that ended since the
-            // subscription is not missed.
-            let _ = released.changed().await;
+            // Every hold's end changes `released` after its release, and jobs held off and let go
+            // again change `sharing`; one since the subscriptions is not missed.
+            tokio::select! {
+                () = changed(&mut released) => {}
+                () = changed(&mut sharing) => {}
+            }
         }
     }
 }

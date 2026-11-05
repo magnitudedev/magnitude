@@ -134,6 +134,7 @@ impl ModelInstances {
             Arc::clone(&environment.host_memory),
             thresholds,
             client.notifier(),
+            environment.device.clone(),
         );
         let preparations = PreparationJobs::default();
         let driver = EngineResidency {

@@ -132,6 +132,8 @@ struct Inner {
     observer: Arc<dyn HostMemoryObserver>,
     thresholds: DomainThresholds,
     notifier: ResidencyNotifier,
+    /// The device's jobs, held off while memory recovers and preempted before any model.
+    device: crate::device_lock::DeviceLock,
     state: Mutex<State>,
     admission: tokio::sync::watch::Sender<bool>,
     supervised_changed: tokio::sync::Notify,
@@ -145,11 +147,12 @@ pub struct MemorySupervisor {
 
 impl MemorySupervisor {
     /// Start guarding with `thresholds`, the system-RAM domain's reserves, reporting to the
-    /// residency actor through `notifier`.
+    /// residency actor through `notifier`, and holding `device`'s jobs off under pressure.
     pub fn start(
         observer: Arc<dyn HostMemoryObserver>,
         thresholds: DomainThresholds,
         notifier: ResidencyNotifier,
+        device: crate::device_lock::DeviceLock,
     ) -> Self {
         let (admission, _) = tokio::sync::watch::channel(true);
         let supervisor = Self {
@@ -157,6 +160,7 @@ impl MemorySupervisor {
                 observer,
                 thresholds,
                 notifier,
+                device,
                 state: Mutex::new(State {
                     supervised: None,
                     admission: Admission::Open,
@@ -243,7 +247,20 @@ impl Inner {
                 emergency,
             }) => {
                 state.observation_failed_since = None;
+                // A job on the device gives way first: the emergency's start preempts it and
+                // holds jobs off until memory recovers. The model is spared while the job gives
+                // way, and killed once none does: the job gone, or its end refused by the system,
+                // so it frees nothing.
+                if emergency.is_some() && self.device.hold_off_jobs(true) {
+                    tracing::warn!(
+                        memory.headroom_bytes = headroom,
+                        memory.emergency_bytes = self.thresholds.emergency_bytes,
+                        "preempting the device's job for host memory"
+                    );
+                    state.admission = Admission::Recovering(Recovery::new());
+                }
                 if let Some(emergency) = emergency
+                    && !self.device.job_giving_way()
                     && let Some(supervised) = state.supervised.take()
                 {
                     tracing::warn!(
@@ -291,6 +308,8 @@ impl Inner {
         }
         let open = state.admission == Admission::Open;
         drop(state);
+        // Jobs start again only once memory has recovered.
+        self.device.hold_off_jobs(!open);
         self.admission.send_if_modified(|current| {
             let changed = *current != open;
             *current = open;
@@ -525,6 +544,7 @@ mod tests {
                 emergency_bytes: GIB,
             },
             notifier,
+            device: crate::device_lock::DeviceLock::default(),
             state: Mutex::new(State {
                 supervised: None,
                 admission: Admission::Open,
@@ -593,6 +613,37 @@ mod tests {
         fixture.inner.tick(start + Duration::from_secs(21));
         assert!(*fixture.inner.admission.borrow());
         assert!(fixture.notifications.try_recv().is_err(), "nothing reloads");
+    }
+
+    /// In an emergency a job on the device gives way first: its start preempts the job once,
+    /// and the model is spared while the job is ending, then killed once the system refuses to
+    /// show the job gone. Jobs stay held off until memory recovers.
+    #[test]
+    fn an_emergency_preempts_the_devices_job_before_the_model() {
+        let mut fixture = fixture();
+        let worker = supervise(&fixture, Arc::default());
+        let device = fixture.inner.device.clone();
+        let job = device.try_job().expect("the device is free for a job");
+        let mut preemption = job.preemption();
+        let start = Instant::now();
+        fixture.memory.0.store(GIB, Ordering::Release);
+        *fixture.memory.2.lock().unwrap() = Some(HostEmergency::EmergencyReserve);
+        fixture.inner.tick(start);
+        assert!(!worker.terminated.load(Ordering::Acquire), "the model is kept while the job gives way");
+        assert!(fixture.notifications.try_recv().is_err());
+        assert!(futures_util::FutureExt::now_or_never(preemption.preempted()).is_some(), "the job is preempted");
+        // The job is still ending: the emergency's next tick spares the model again, and
+        // preempts the job no more.
+        fixture.inner.tick(start);
+        assert!(!worker.terminated.load(Ordering::Acquire), "a job still ending spares the model");
+        assert!(futures_util::FutureExt::now_or_never(preemption.preempted()).is_none(), "the job is preempted once");
+        // The system will not show the job gone: it frees nothing, and the model is killed.
+        job.unretired();
+        fixture.inner.tick(start);
+        assert!(worker.terminated.load(Ordering::Acquire), "an unretired job spares the model no more");
+        assert!(released_for_memory_pressure(fixture.notifications.try_recv().unwrap()));
+        drop(job);
+        assert!(device.try_job().is_none(), "no job starts while memory recovers");
     }
 
     #[test]
