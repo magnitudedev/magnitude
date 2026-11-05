@@ -1454,7 +1454,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// The store `kind` storage is placed in first; none where the
     /// executor places none.
-    fn store_of(&self, kind: seismic::Contract) -> Option<seismic::StoreId> {
+    pub(super) fn store_of(&self, kind: seismic::Contract) -> Option<seismic::StoreId> {
         let device = self.domain.device();
         storage_store(device.topology(), device.info(), kind)
     }

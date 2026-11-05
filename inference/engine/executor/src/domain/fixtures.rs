@@ -32,19 +32,55 @@ use std::sync::{Arc, Mutex};
 /// (each fixture opens its own device, and tests run side by side in one
 /// process, on one GPU), and a release the device makes (a bank's shrink)
 /// is room the next reading sees, as the machine's would once the host
-/// takes it back.
+/// takes it back. Another program's hold on a store ([`Press`]) takes its
+/// bytes of the room left there while it lasts.
 struct StillHost {
     device: Rc<seismic::Device>,
     topology: std::sync::Arc<seismic::DeviceTopology>,
     first: seismic::Status,
     charged: BTreeMap<seismic::StoreId, u64>,
+    pressed: Pressed,
+}
+
+/// What other programs hold of each store, as a test presses it.
+type Pressed = Rc<std::cell::RefCell<BTreeMap<seismic::StoreId, u64>>>;
+
+/// Another program's hold on the store of a fixture's device storage
+/// ([`press`]), which the fixture's heap reads as the host's: the room left
+/// there falls by what it takes, and rises back as it lets go.
+pub struct Press {
+    store: seismic::StoreId,
+    pressed: Pressed,
+}
+
+impl Press {
+    /// The store it presses.
+    pub fn store(&self) -> seismic::StoreId {
+        self.store
+    }
+
+    /// Hold `bytes` of the store from now, in place of what it held.
+    pub fn take(&self, bytes: u64) {
+        self.pressed.borrow_mut().insert(self.store, bytes);
+    }
+
+    /// Hold nothing of the store from now.
+    pub fn release(&self) {
+        self.pressed.borrow_mut().remove(&self.store);
+    }
+}
+
+/// A hold on the store of `domain`'s device storage ([`Press`]).
+pub fn press(domain: &ExecutorDomain<TestFamily>) -> Press {
+    let store = domain.store_of(seismic::Contract::DeviceOnly).expect("the device's storage lies in a store");
+    Press { store, pressed: domain.family.pressed.clone() }
 }
 
 impl StillHost {
-    fn of(catalog: seismic::Devices, device: Rc<seismic::Device>) -> Self {
+    fn of(catalog: seismic::Devices, device: Rc<seismic::Device>, pressed: Pressed) -> Self {
         let first = catalog.status(device.topology(), device.info().id());
         let charged = Self::charges(&device);
-        Self { device, topology: catalog.topology(), first, charged }
+        Self { device, topology: catalog.topology(), first, charged, pressed }
     }
 
     /// What `device`'s allocations charge each store it reaches: its own
@@ -59,8 +95,13 @@ impl StatusReading for StillHost {
         let now = Self::charges(&self.device);
         let charged = |charges: &BTreeMap<seismic::StoreId, u64>, store| charges.get(&store).copied().unwrap_or(0);
         // `left` of `store`, less what the device took of it since the first
-        // reading.
-        let moved = |left: u64, store| (left + charged(&self.charged, store)).saturating_sub(charged(&now, store));
+        // reading and what another program holds of it now.
+        let pressed = self.pressed.borrow();
+        let moved = |left: u64, store| {
+            (left + charged(&self.charged, store))
+                .saturating_sub(charged(&now, store))
+                .saturating_sub(pressed.get(&store).copied().unwrap_or(0))
+        };
         let topology = &self.topology;
         let seismic::Status { mut sample, mut runtime } = self.first.clone();
         // Each store's charge then, plus what the device charged it since.
@@ -304,11 +345,12 @@ pub fn fixture_of(
         .allocate(device.clone())
         .unwrap();
     let head = head.then(|| spare_head_store(device.clone()));
+    let pressed = Pressed::default();
     ExecutorDomain::with_family(
         execution,
         definition,
         resources,
-        DeviceHeap::open(Rc::new(StillHost::of(catalog, device.clone())), reserves, device).unwrap(),
+        DeviceHeap::open(Rc::new(StillHost::of(catalog, device.clone(), pressed.clone())), reserves, device).unwrap(),
         store,
         head,
         None,
@@ -319,6 +361,7 @@ pub fn fixture_of(
             bank: None,
             waiting: usize::MAX,
             optional: None,
+            pressed,
         },
     )
 }
@@ -442,6 +485,22 @@ pub fn shrink_settled<F: ProgramFamily>(
         super::state::SlotRelease::None | super::state::SlotRelease::Running => 0,
     };
     shrunk.released + slots
+}
+
+/// The growth rule's inputs: the load's latest miss record (with its
+/// layers' conversion), and the resident step it is priced on: 15 ms at
+/// every depth, its all-hit steps' time, so no `σ`.
+pub fn price_growth(domain: &mut ExecutorDomain<TestFamily>, bindings: &mut StateBindings, record: crate::assessment::MissRecord) {
+    domain.family.bank.as_mut().unwrap().record = Some(record);
+    domain.measure_experts(crate::ExpertMeasures {
+        lines: crate::assessment::Priced::Measured(std::sync::Arc::from([])),
+        store: None,
+        resident: crate::assessment::Priced::Measured(Box::new(|_, _| Ok(0.015))),
+        pass: crate::assessment::Priced::Pending("unpriced".into()),
+        moves: crate::assessment::Priced::Pending("unmeasured".into()),
+        tier_copy: crate::assessment::Priced::Measured(None),
+        convert: crate::assessment::Priced::Measured(None),
+    }, bindings).unwrap();
 }
 
 /// The bytes of a row of `domain`'s fake bank ([`banked`]).
@@ -651,6 +710,8 @@ pub struct TestFamily {
     /// An optional component's constants, a tensor of its own: what the
     /// optional holding classifies.
     pub(crate) optional: Option<seismic::Tensor>,
+    /// What other programs hold of each store its heap reads ([`press`]).
+    pressed: Pressed,
 }
 
 /// A fake elastic expert bank (`ElasticBank`): one reserved tensor of a row

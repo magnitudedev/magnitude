@@ -775,22 +775,6 @@ fn fresh_memory_observation_reconciles_released_state_backing() {
     assert_eq!(after.unattributed_bytes, 0);
 }
 
-/// The growth rule's inputs: the load's latest miss record (with its
-/// layers' conversion), and the resident step it is priced on: 15 ms at
-/// every depth, its all-hit steps' time, so no `σ`.
-fn price_growth(domain: &mut ExecutorDomain<TestFamily>, bindings: &mut StateBindings, record: crate::assessment::MissRecord) {
-    domain.family.bank.as_mut().unwrap().record = Some(record);
-    domain.measure_experts(crate::ExpertMeasures {
-        lines: crate::assessment::Priced::Measured(std::sync::Arc::from([])),
-        store: None,
-        resident: crate::assessment::Priced::Measured(Box::new(|_, _| Ok(0.015))),
-        pass: crate::assessment::Priced::Pending("unpriced".into()),
-        moves: crate::assessment::Priced::Pending("unmeasured".into()),
-        tier_copy: crate::assessment::Priced::Measured(None),
-        convert: crate::assessment::Priced::Measured(None),
-    }, bindings).unwrap();
-}
-
 /// A tier copy whose grid the device refuses is the caller's error and
 /// changes nothing: the bank keeps the copy costs it took before, grid and
 /// price, and the domain the measures it priced by.
