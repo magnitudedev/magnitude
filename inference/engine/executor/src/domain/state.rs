@@ -92,6 +92,28 @@ pub struct MemoryMoment {
     pub footprint: Option<u64>,
 }
 
+/// What a shrink of the state's surplus came to ([`ExecutorDomain::shrink_state`]):
+/// the physical bytes released at once, and the idle graph slots' release
+/// off the submitting thread, which a later boundary finishes
+/// (`ExecutorDomain::advance_slot_release`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateShrink {
+    pub released: u64,
+    pub slots: SlotRelease,
+}
+
+/// Where the idle graph slots' release stands after a shrink of the state's
+/// surplus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotRelease {
+    /// No slot was idle.
+    None,
+    /// This shrink began releasing them.
+    Began,
+    /// One begun before still runs: this shrink released nothing more.
+    Running,
+}
+
 /// A comparison with Seismic's logical allocation charge. `unattributed`
 /// remains explicit for storage without a classified owner. `stores` also
 /// includes physical backend holdings (block slack and native resources),
@@ -987,20 +1009,37 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Release empty state slabs at idle, keeping one spare per store. In
-    /// Reclaim, also compact sparse occupied slabs into already held space.
-    /// Returns the physical bytes released. The queued steps are orphaned
-    /// first: their launch bindings pin slab placement.
+    /// Reclaim, also compact sparse occupied slabs into already held space,
+    /// and release the held prompt-group class down to the floor. Idle
+    /// graph slots are released off this thread, `wake` completed once they
+    /// are ([`Self::release_idle_graph_slots`]). The physical bytes released
+    /// now, and where the slots' release stands, which a later boundary
+    /// finishes ([`Self::advance_slot_release`]). The queued steps
+    /// are orphaned first: their launch bindings pin slab placement.
     pub fn shrink_state(
         &mut self,
         bindings: &mut StateBindings,
         policy: ShrinkPolicy,
-    ) -> Result<u64, DomainError> {
+        wake: crate::CompletionWake,
+    ) -> Result<StateShrink, DomainError> {
         self.orphan_queue(bindings)?;
         let mut released = self.shrink_store(bindings, false, policy)?;
         if self.head_store.is_some() {
             released += self.shrink_store(bindings, true, policy)?;
         }
-        Ok(released + self.release_idle_graph_slots(policy)?)
+        let (buffers, slots) = self.release_idle_graph_slots(policy, wake)?;
+        Ok(StateShrink { released: released + buffers, slots })
+    }
+
+    /// At a flight boundary: the idle graph slots' release, once the load's
+    /// release thread has ended it (`AllocatedResources::released_slots`),
+    /// the heap then reading the charge it left; none while it runs.
+    pub fn advance_slot_release(&mut self) -> Result<Option<crate::resources::SlotsReleased>, DomainError> {
+        let Some(released) = self.resources.released_slots().map_err(DomainError::invariant)? else {
+            return Ok(None);
+        };
+        self.refresh_memory()?;
+        Ok(Some(released))
     }
 
     /// Grant the prompt group opening with `operations` its class: the
@@ -1680,34 +1719,47 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// Release graph activations and output slots grown beyond the held
     /// prompt-group class that no request or launch holds, and in Reclaim
-    /// the held class down to the floor of one place (`grant_group`),
-    /// crediting only Seismic's measured decrease.
-    fn release_idle_graph_slots(&mut self, policy: ShrinkPolicy) -> Result<u64, DomainError> {
-        let before = self
-            .domain
-            .device()
-            .device_ledger()
-            .charged;
+    /// the held class down to the floor of one place (`grant_group`): its
+    /// group buffers now, credited with the charge of the model storage the
+    /// release drops whole, as Seismic measured it before, and the slots on
+    /// the load's release thread
+    /// (`AllocatedResources::release_idle_slots`), `wake` completed once
+    /// they are released. The bytes released now, and the slots' release;
+    /// while one runs nothing more is released, the class and its slots
+    /// together, until a boundary finishes it.
+    fn release_idle_graph_slots(&mut self, policy: ShrinkPolicy, wake: crate::CompletionWake) -> Result<(u64, SlotRelease), DomainError> {
+        if self.resources.releasing_slots() {
+            return Ok((0, SlotRelease::Running));
+        }
         let reclaim = policy == ShrinkPolicy::Reclaim;
         // The class held, buffers and pools together, down to the floor.
         let buffers = reclaim && self.resources.group_places() > std::num::NonZeroUsize::MIN;
-        if buffers {
-            // A group of one holds the floor's alone, which allocates none.
-            self.family.hold_group(1).map_err(|error| DomainError::invariant(error.to_string()))?;
-        }
-        let slots = self.resources.release_idle_slots(reclaim);
-        if slots == 0 && !buffers {
-            return Ok(0);
-        }
-        self.refresh_memory()?;
-        let after = self
-            .domain
-            .device()
-            .device_ledger()
-            .charged;
-        before
-            .checked_sub(after)
-            .ok_or_else(|| DomainError::invariant("graph slot release increased Seismic's charge"))
+        let released = match buffers {
+            false => 0,
+            true => {
+                // Every model allocation and its charge now, each once. Only
+                // this thread drops a model allocation (one released off it
+                // only shrinks a reservation, or is no model storage's), so
+                // those released by the time it returns are what it freed:
+                // no concurrent release or growth moves the credit.
+                let mut held = std::collections::HashMap::new();
+                self.family.visit_model_storage(&mut |tensor| {
+                    let observer = tensor.observe_storage();
+                    if let Some(charged) = observer.charged_bytes() {
+                        held.entry(observer.identity()).or_insert((observer, charged));
+                    }
+                });
+                // A group of one holds the floor's alone, which allocates none.
+                self.family.hold_group(1).map_err(|error| DomainError::invariant(error.to_string()))?;
+                self.refresh_memory()?;
+                held.into_values().filter(|(observer, _)| observer.charged_bytes().is_none()).map(|(_, charged)| charged).sum()
+            }
+        };
+        let slots = match self.resources.release_idle_slots(reclaim, wake) {
+            true => SlotRelease::Began,
+            false => SlotRelease::None,
+        };
+        Ok((released, slots))
     }
 
     /// Free empty slabs and compact into held slabs without a growth claim.

@@ -124,7 +124,7 @@ use super::directory::{Directory, HostTier};
 use super::source::ExpertSource;
 use crate::assessment::ExpertLines;
 use liveness::Life;
-pub(in crate::experts) use liveness::panic_message;
+pub(crate) use liveness::panic_message;
 use prefetch::Prefetch;
 use promotions::Promotions;
 use requests::Requests;

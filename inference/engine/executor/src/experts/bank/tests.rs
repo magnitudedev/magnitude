@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use crate::experts::watcher::Join;
 use super::served::{Step, grown, shrunk};
-use super::resize::{Cut, Done, grow_by_slots};
+use super::resize::{Cut, grow_by_slots};
+use crate::storage_thread::{Done, StorageThread};
 
 /// A landed shrink holds the thread at most a step at its latest
 /// measured rate: 10 GB/s over a 35 ms step is 350 MB; unmeasured, or
@@ -88,7 +89,7 @@ fn a_shrink_takes_only_the_short_stores_holdings() {
 /// leaves a resize running forever nor the bank's thread gone.
 #[test]
 fn a_resize_step_that_panics_is_reported_and_the_thread_runs_on() {
-    let resize_thread = ResizeThread::start().unwrap();
+    let resize_thread = StorageThread::start("bank-test").unwrap();
     let waited = |done: &Done<u32>| loop {
         if let Some((outcome, _)) = done.lock().unwrap().take() {
             return outcome;

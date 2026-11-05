@@ -3348,12 +3348,25 @@ impl NativeExecutionArena {
     }
 }
 
+/// Release `allocation` where its holder alone held it: the bytes it was
+/// charged, its record tables included; none where another holder shares it,
+/// which releases it with its own.
+fn released(allocation: Arc<Allocation>) -> u64 {
+    Arc::try_unwrap(allocation).map_or(0, |allocation| allocation.charged_bytes())
+}
+
 pub struct NativeGraphFamilyOutputSlot {
     family: Arc<NativeGraphFamily>,
     arena: Option<Arc<Allocation>>,
 }
 
 impl NativeGraphFamilyOutputSlot {
+    /// Release the slot's arena: the bytes the device is no longer
+    /// charged, those of an arena it alone held ([`released`]).
+    pub fn release(self) -> u64 {
+        self.arena.map_or(0, released)
+    }
+
     pub fn activate(
         self,
         plan: &Arc<NativeGraphPlan>,
@@ -3387,6 +3400,17 @@ pub struct NativeGraphFamilySlot {
 }
 
 impl NativeGraphFamilySlot {
+    /// Release the slot's storage, its record tables and uploads before the
+    /// scratch they address, then its graph hold: the bytes the device is no
+    /// longer charged, those of each allocation it alone held
+    /// ([`released`]) and what its family's graph hold shrank by
+    /// ([`super::SlotGraphs::release`]).
+    pub fn release(self) -> u64 {
+        let Self { scratch, workspace_records, uploads, hold, .. } = self;
+        let charged: u64 = workspace_records.into_iter().flatten().chain(uploads).chain(scratch).map(released).sum();
+        charged + super::SlotGraphs::release(hold)
+    }
+
     pub fn activate(
         &mut self,
         plan: &Arc<NativeGraphPlan>,

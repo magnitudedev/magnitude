@@ -158,7 +158,7 @@ fn held<T>(mutex: &Mutex<T>, describe: fn(&T) -> String) -> String {
     }
 }
 
-pub(in crate::experts) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     match (payload.downcast_ref::<&str>(), payload.downcast_ref::<String>()) {
         (Some(message), _) => (*message).to_owned(),
         (_, Some(message)) => message.clone(),

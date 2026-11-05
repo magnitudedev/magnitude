@@ -427,6 +427,28 @@ pub fn misses_at(depth: usize, steps: u64, misses: u64) -> crate::assessment::Mi
     }
 }
 
+/// Shrink `domain`'s state surplus by `policy` and wait for the idle graph
+/// slots' release it began, if any, to end on the release thread, then
+/// finish it as a boundary does (`ExecutorDomain::advance_slot_release`):
+/// the bytes the shrink released at once and the slots' release released.
+pub fn shrink_settled<F: ProgramFamily>(
+    domain: &mut ExecutorDomain<F>,
+    bindings: &mut StateBindings,
+    policy: magnitude_state::ShrinkPolicy,
+) -> u64 {
+    let shrunk = domain.shrink_state(bindings, policy, crate::CompletionWake::new(|| {})).unwrap();
+    let slots = match shrunk.slots {
+        super::state::SlotRelease::Began => loop {
+            if let Some(released) = domain.advance_slot_release().unwrap() {
+                break released.bytes;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        },
+        super::state::SlotRelease::None | super::state::SlotRelease::Running => 0,
+    };
+    shrunk.released + slots
+}
+
 /// The bytes of a row of `domain`'s fake bank ([`banked`]).
 pub fn bank_row(domain: &ExecutorDomain<TestFamily>) -> u64 {
     domain.family.bank.as_ref().expect("a banked fixture").tensor.extents()[1]

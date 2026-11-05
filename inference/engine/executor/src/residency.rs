@@ -532,6 +532,8 @@ pub struct ResidencyStore {
     kept_table_rows: Option<std::path::PathBuf>,
     /// What the job stored of the bank's CPU sites.
     cpu_site: crate::assessment::StoredCpuSite,
+    /// The load's release thread, which the expert bank releases on.
+    releases: crate::Releases,
 }
 
 impl ResidencyStore {
@@ -540,6 +542,7 @@ impl ResidencyStore {
         programs: Rc<crate::native::AttestedPrograms>,
         execution: ExecutionPlan,
         domain: ResourceDomainId,
+        releases: crate::Releases,
     ) -> Result<Self, WeightImportError> {
         if !programs.belongs_to(&device)
             || execution.device().backend() != device.backend()
@@ -559,6 +562,7 @@ impl ResidencyStore {
             import_progress: None,
             kept_table_rows: None,
             cpu_site: Default::default(),
+            releases,
         })
     }
 
@@ -832,7 +836,7 @@ impl ResidencyStore {
         // CPU pool's and landings' (`ExpertBank::lines`); the load's pricing
         // adds what the measurement job stored (`HostLines::of_bank`).
         let lines = crate::assessment::BankLines::of_bank(plan).map_err(|error| invalid(error.to_string()))?;
-        let bank = crate::experts::ExpertBank::open(&self.device, plan, artifact, &sites, lines, &self.cpu_site)
+        let bank = crate::experts::ExpertBank::open(&self.device, plan, artifact, &sites, lines, &self.cpu_site, self.releases.clone())
             .map_err(invalid)?;
         // Each stack through the entry a resident load imports it with, from
         // a read around the file cache: no expert byte stays in it.

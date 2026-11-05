@@ -66,7 +66,7 @@ pub use in_flight::{
 };
 use in_flight::{PrimingFlight, TargetWork, decode_selected};
 pub use ownership::OpenRequirements;
-pub use state::{MeasurementRoom, MemoryChargeReconciliation, MemoryMoment, StoreAllocation};
+pub use state::{MeasurementRoom, MemoryChargeReconciliation, MemoryMoment, SlotRelease, StateShrink, StoreAllocation};
 pub use target::TargetHostTiming;
 pub(crate) use target::{
     AppendedRuns, accepted_history, cached_causal_domain, indexer_domain, indexer_history,

@@ -71,7 +71,7 @@ pub use site::{SITE_TERM_NAMES, SiteServed};
 #[cfg(test)]
 pub(crate) use site::{Answered, ExpertValues, reference as site_reference};
 pub(crate) use exchange::ExchangeTable;
-pub(crate) use watcher::{ParkKind, ParkSite, Parks};
+pub(crate) use watcher::{ParkKind, ParkSite, Parks, panic_message};
 pub(crate) use source::Records;
 pub use directory::{LayerCurve, MissCurve, RoutedRead};
 #[cfg(test)]

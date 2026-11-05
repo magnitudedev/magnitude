@@ -220,9 +220,7 @@ fn reclaim_relocates_live_banks_without_changing_continuation() {
     let before = domain.state_compactions().0;
     let charge_before = domain.reconcile_memory_charge(&[]).unwrap();
     assert_eq!(charge_before.unattributed, 0, "{charge_before:?}");
-    let released = domain
-        .shrink_state(&mut bindings, ShrinkPolicy::Reclaim)
-        .unwrap();
+    let released = magnitude_executor::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Reclaim);
     let after = domain.state_compactions().0;
     let charge_after = domain.reconcile_memory_charge(&[]).unwrap();
     assert!(
@@ -300,9 +298,7 @@ fn reclaim_relocates_live_history_and_banks_without_changing_continuation() {
     let before = domain.state_compactions().0;
     let charge_before = domain.reconcile_memory_charge(&[]).unwrap();
     assert_eq!(charge_before.unattributed, 0, "{charge_before:?}");
-    let released = domain
-        .shrink_state(&mut bindings, ShrinkPolicy::Reclaim)
-        .unwrap();
+    let released = magnitude_executor::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Reclaim);
     let after = domain.state_compactions().0;
     let charge_after = domain.reconcile_memory_charge(&[]).unwrap();
     eprintln!(

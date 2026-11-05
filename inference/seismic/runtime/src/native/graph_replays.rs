@@ -201,8 +201,12 @@ impl<G: RecordedGraph> Replays<G> {
     /// ago; else a graph recorded for it. Graphs no run of the submission
     /// takes are released, the least recently replayed first, while the
     /// graphs exceed `budget`; the submission's own past it break an
-    /// invariant. Returns each run's graph's identity, which
-    /// [`Self::replay`] takes.
+    /// invariant. Each graph taken is the most recently used from then, so a
+    /// hold that shrinks on another thread before the submission replays it
+    /// ([`Self::fit_to`], a slot released off the submitting thread) releases
+    /// every other graph first, and reaches it only where the submission's
+    /// own graphs exceed what their holds bound, which breaks that invariant.
+    /// Returns each run's graph's identity, which [`Self::replay`] takes.
     pub(crate) fn record(
         &self,
         graphs: &[Shaped],
@@ -241,6 +245,13 @@ impl<G: RecordedGraph> Replays<G> {
         }
         let taken = taken.into_iter().map(|taken| taken.expect("every run takes a graph")).collect::<Vec<_>>();
         Self::fit(&mut entries, &taken, budget);
+        entries.clock += 1;
+        let clock = entries.clock;
+        for (Shaped { key, .. }, identity) in graphs.iter().zip(&taken) {
+            let replay = entries.graphs.get_mut(key).expect("a taken graph is kept under its run's shape");
+            let instance = replay.graphs.iter_mut().find(|instance| instance.identity == *identity).expect("a taken graph is kept");
+            instance.used = clock;
+        }
         Ok(taken)
     }
 

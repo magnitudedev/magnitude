@@ -1,7 +1,7 @@
 //! Seismic graph slots for numerical execution and owned import sources.
 
 mod graph;
-pub(crate) use graph::{Outputs, VisionGrowth};
+pub(crate) use graph::{IdleSlots, Outputs, VisionGrowth};
 pub use graph::{
     GraphOutputOwner, GraphOutputTensor, NativeGraphOutputLease, NativeGraphPool,
     NativeGraphWorkspaceLease, TargetGraphOutputLease, TargetGraphPool, TargetGraphWorkspaceLease,
@@ -314,6 +314,8 @@ pub enum AllocationError {
     /// An artifact window the host could not map: never a capacity
     /// refusal.
     Mapping(String),
+    /// A thread the load's storage work runs on that could not start.
+    Thread(String),
     Plan(InvariantError),
 }
 
@@ -323,6 +325,7 @@ impl fmt::Display for AllocationError {
             Self::Tensor(error) => write!(formatter, "resource allocation: {error}"),
             Self::Workflow(error) => write!(formatter, "resource allocation: {error}"),
             Self::Mapping(error) => write!(formatter, "resource allocation: {error}"),
+            Self::Thread(error) => write!(formatter, "resource allocation: {error}"),
             Self::Plan(error) => error.fmt(formatter),
         }
     }
@@ -381,6 +384,31 @@ pub struct AllocatedResources {
     /// The places of the prompt-group class the pools hold: at least the
     /// floor's one.
     places: std::num::NonZeroUsize,
+    /// The load's release thread, which the pools' idle slots release on.
+    releases: crate::Releases,
+    /// The idle slots on their way there, until a boundary finds them
+    /// released ([`Self::released_slots`]).
+    releasing: Option<SlotsReleasing>,
+}
+
+/// Idle graph slots handed to the release thread at `began`: how many, and
+/// their release's outcome once it ends there, the bytes it released.
+struct SlotsReleasing {
+    slots: usize,
+    began: std::time::Instant,
+    done: crate::storage_thread::Done<u64>,
+}
+
+/// Idle graph slots released off the submitting thread
+/// ([`AllocatedResources::released_slots`]): how many, the bytes the device
+/// is no longer charged for them, and when they were handed over and
+/// released.
+#[derive(Clone, Copy, Debug)]
+pub struct SlotsReleased {
+    pub slots: usize,
+    pub bytes: u64,
+    pub began: std::time::Instant,
+    pub released: std::time::Instant,
 }
 
 impl AllocatedResources {
@@ -556,13 +584,18 @@ impl AllocatedResources {
 
     /// Release every pool's free slots beyond its held class, the held
     /// prompt-group class down to the floor of one place once `reclaim`
-    /// releases it, and vision's free storage; returns how many slots were
-    /// released.
-    pub(crate) fn release_idle_slots(&mut self, reclaim: bool) -> usize {
+    /// releases it, and vision's free storage, on the load's release thread
+    /// (`Releases`), `wake` completed once they are released: whether a
+    /// release began, which a later boundary finishes
+    /// ([`Self::released_slots`]). None begins while one runs
+    /// ([`Self::releasing_slots`]).
+    pub(crate) fn release_idle_slots(&mut self, reclaim: bool, wake: crate::CompletionWake) -> bool {
+        assert!(self.releasing.is_none(), "a graph slot release begins only once the one before it finished");
         if reclaim {
             self.places = std::num::NonZeroUsize::MIN;
         }
-        [
+        let mut idle = IdleSlots::default();
+        for pool in [
             Some(&mut self.target_graph),
             Some(&mut self.target_readout_graph),
             Some(&mut self.target_readout_chunk_graph),
@@ -571,12 +604,45 @@ impl AllocatedResources {
         ]
         .into_iter()
         .flatten()
-        .map(|pool| pool.release_idle(reclaim))
-        .sum::<usize>()
-            + self
-                .vision_graph
-                .as_mut()
-                .map_or(0, VisionGraphPool::release_idle)
+        {
+            pool.release_idle(reclaim, &mut idle);
+        }
+        if let Some(vision) = self.vision_graph.as_mut() {
+            vision.release_idle(&mut idle);
+        }
+        let slots = idle.len();
+        if slots == 0 {
+            return false;
+        }
+        let began = std::time::Instant::now();
+        let done = self.releases.run(wake, move || idle.release());
+        self.releasing = Some(SlotsReleasing { slots, began, done });
+        true
+    }
+
+    /// Whether idle slots are being released ([`Self::release_idle_slots`]).
+    pub(crate) fn releasing_slots(&self) -> bool {
+        self.releasing.is_some()
+    }
+
+    /// The idle slots' release, once the release thread has ended it; none
+    /// while it runs or where none was begun. Its panic is the device's
+    /// invariant violation, reported as one.
+    pub(crate) fn released_slots(&mut self) -> Result<Option<SlotsReleased>, String> {
+        let Some(release) = self.releasing.as_ref() else {
+            return Ok(None);
+        };
+        let Some((outcome, released)) = release.done.lock().expect("graph slot release outcome").take() else {
+            return Ok(None);
+        };
+        let SlotsReleasing { slots, began, .. } = self.releasing.take().expect("a release in hand");
+        outcome.map(|bytes| Some(SlotsReleased { slots, bytes, began, released }))
+    }
+
+    /// The load's release thread (`Releases`), which the expert bank
+    /// releases on too.
+    pub fn releases(&self) -> crate::Releases {
+        self.releases.clone()
     }
 }
 
@@ -742,6 +808,8 @@ impl ResourceAllocator {
             vision_graph,
             state_graph,
             places: std::num::NonZeroUsize::MIN,
+            releases: crate::Releases::start().map_err(AllocationError::Thread)?,
+            releasing: None,
         };
         Ok(allocated)
     }

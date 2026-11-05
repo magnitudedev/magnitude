@@ -1390,6 +1390,7 @@ fn load(
         programs.clone(),
         (*execution).clone(),
         identity,
+        resources.releases(),
     )
     .unwrap();
     let target = residency

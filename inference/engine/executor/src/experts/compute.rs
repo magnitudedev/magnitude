@@ -85,7 +85,8 @@ impl Urgency {
 /// node by node ([`Machine::sized`]), and every other thread of the process
 /// on the CPUs the workers' cores leave (`runtime`), so none shares a core
 /// with a worker. The resize thread, which backs the host tier, runs on
-/// every CPU so the tier spreads over every memory node (`ResizeThread`).
+/// every CPU so the tier spreads over every memory node
+/// (`storage_thread::StorageThread`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ComputeThreads {
     /// Each memory node's CPUs the workers run on.

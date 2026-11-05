@@ -20,8 +20,9 @@ use magnitude_family_contracts::{WeightRole, WeightScope};
 use seismic::{Device, Tensor};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use super::{copies, watcher, HostCompute, Machine};
-use resize::{Commitment, HostTier, ResizeThread};
+use super::{copies, HostCompute, Machine};
+use resize::{Commitment, HostTier};
+use crate::storage_thread::{Releases, StorageThread};
 pub(crate) use served::ServedBank;
 
 /// The bytes a shrink of the host tier releases, so that it holds the
@@ -107,9 +108,12 @@ pub(crate) struct ExpertBank {
     /// Its experts' slots' last finished resize
     /// ([`ElasticBank::record_resize`]).
     last_resize: Mutex<Option<BankResize>>,
-    /// The thread the storage work of its records' resizes runs on (a host
-    /// tier's runs on its own, `HostTier::thread`).
-    resize_thread: ResizeThread,
+    /// The thread its records' resizes prepare and back their storage on
+    /// (a host tier's runs on its own, `HostTier::thread`).
+    resize_thread: StorageThread,
+    /// The load's thread its shrinks release their device storage on
+    /// (`Releases`).
+    release_thread: Releases,
     /// Held across every rise of the bank's charge off the domain's thread
     /// ([`Self::hold_rises`]).
     rises: Arc<Mutex<()>>,
@@ -122,7 +126,7 @@ pub(crate) struct ExpertBank {
 }
 
 /// The threads a bank's resizes keep busy beside decode: the host tier's
-/// [`ResizeThread`], which backs the tier beside early decode; its records'
+/// [`StorageThread`], which backs the tier beside early decode; its records'
 /// own runs only a resize's storage work, never for a decode's length.
 pub(in crate::experts) const RESIZE_THREADS: usize = 1;
 

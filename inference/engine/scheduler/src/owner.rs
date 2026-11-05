@@ -25,7 +25,7 @@ use super::{
         PublicationReceiver, PublicationSender, PublicationWake, PublicationWakeKind, PublishError,
         RequestError, ServiceCapacityError,
     },
-    release::{self, Release, Releases, Rung},
+    release::{self, Pending, Release, Releases, Rung},
     round_driver::{RoundError, lower_round, reconcile_forward},
     serving::ServingCensus,
     worker::Wakes,
@@ -34,7 +34,7 @@ use magnitude_executor::{
     BankResize, BankResized, BankStep, BankTier, DomainError, ExpertMeasures, InvariantError, MeasurementRoom,
     MemoryChargeReconciliation, MemoryMoment, NativeFamily,
     OpenRequirements, Operation, Outcome, PendingOperationOutcome, PhysicalDecision,
-    ProgramFamily, RequestId, ResourceKind, ResourcePlan, ShrinkCause, StateBindings, SubmitError,
+    ProgramFamily, RequestId, ResourceKind, ResourcePlan, ShrinkCause, SlotRelease, StateBindings, SubmitError,
     SubmitFailure, WorkKind, platform::DomainRole,
 };
 use magnitude_family_contracts::PreparedModelInput;
@@ -714,9 +714,9 @@ struct Ladder {
     /// Reclaim was observed while a flight held the bindings; its releases
     /// run once they return.
     owed: bool,
-    /// A release runs that a later flight boundary finishes (a bank
-    /// resize): the ladder resumes once it has.
-    pending: bool,
+    /// The releases running that a later flight boundary finishes: the
+    /// ladder resumes once none is.
+    pending: Pendings,
     /// A release waits for a gap between flights (a bank shrink a step
     /// still running deferred, `BankStep::Deferred`): the next boundary
     /// tries it again.
@@ -726,17 +726,40 @@ struct Ladder {
     covered: bool,
 }
 
+/// Which releases the ladder waits for a later flight boundary to finish,
+/// each kind's apart ([`Pending`]): each finish clears its own alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Pendings {
+    slots: bool,
+    bank: bool,
+}
+
+impl Pendings {
+    fn of(&mut self, pending: Pending) -> &mut bool {
+        match pending {
+            Pending::Slots => &mut self.slots,
+            Pending::Bank => &mut self.bank,
+        }
+    }
+
+    fn any(self) -> bool {
+        self.slots || self.bank
+    }
+}
+
 impl Ladder {
     /// Take what one release at a rung came to.
     fn released(&mut self, release: Release) {
-        self.pending |= release == Release::Pending;
+        if let Release::Pending(pending) = release {
+            *self.pending.of(pending) = true;
+        }
         self.deferred |= release == Release::Deferred;
         self.covered |= release == Release::Covered;
     }
 
     /// Whether nothing of the ladder is in motion.
     fn settled(&self) -> bool {
-        !self.owed && !self.pending && !self.deferred && !self.covered
+        !self.owed && !self.pending.any() && !self.deferred && !self.covered
     }
 
     /// At a flight boundary: whether a release was deferred to it, which is
@@ -1755,6 +1778,7 @@ trait MemoryStep: MemoryHost + Sized {
                 }
             }
             self.advance_expert_bank()?;
+            self.advance_slot_release()?;
             // A release deferred for want of a gap is tried again at this
             // boundary: what waited on it retries, and a Reclaim release is
             // owed again.
@@ -1975,6 +1999,38 @@ trait MemoryStep: MemoryHost + Sized {
         Ok(())
     }
 
+    /// At a flight boundary, finish the idle graph slots' release off the
+    /// submitting thread (`ExecutorDomain::advance_slot_release`), recorded
+    /// with the slots and how long the release thread took. It freed
+    /// memory, so the reclaim clock restarts and what waited on memory may
+    /// retry. One the ladder waited for (its surplus rung began it, or found
+    /// the idle policy's running) is the surplus rung's: the ladder resumes
+    /// while memory is short. Any other is the idle policy's alone.
+    fn advance_slot_release(&mut self) -> Result<(), RequestError> {
+        let Some(released) = self.domain().advance_slot_release().map_err(classify_domain_error)? else {
+            return Ok(());
+        };
+        let laddered = std::mem::take(&mut self.memory().ladder.pending.slots);
+        let after = self.domain().memory_moment();
+        tracing::info!(
+            by = if laddered { "the surplus rung" } else { "the idle policy" },
+            slots = released.slots,
+            released = released.bytes,
+            release_micros = released.released.duration_since(released.began).as_micros() as u64,
+            charged_after = after.charged,
+            claimed_after = after.claimed,
+            footprint_after = after.footprint,
+            "graph slots released"
+        );
+        let now = self.now();
+        self.memory().condition = self.memory().condition.released(now);
+        self.advance_epoch();
+        if laddered && matches!(self.memory().condition, MemoryCondition::Reclaim { .. }) {
+            self.memory().ladder.owed = true;
+        }
+        Ok(())
+    }
+
     /// At a flight boundary, advance the expert bank's resize
     /// (`ExecutorDomain::advance_expert_bank`). A finished one is recorded as
     /// a release is (a shrink as the bank rung's, a growth as memory grown):
@@ -1987,7 +2043,7 @@ trait MemoryStep: MemoryHost + Sized {
         let Some((finished, held)) = self.domain().advance_expert_bank(wake).map_err(classify_domain_error)? else {
             return Ok(());
         };
-        self.memory().ladder.pending = false;
+        self.memory().ladder.pending.bank = false;
         self.memory().room_owed.resized();
         let after = self.domain().memory_moment();
         let tier = self.domain().expert_holding_storage(finished.holding()).map_err(classify_domain_error)?;
@@ -2116,6 +2172,7 @@ trait MemoryStep: MemoryHost + Sized {
                 spared,
                 resident_slot,
                 began: None,
+                slots_began: false,
             },
             through,
         )?;
@@ -2404,8 +2461,9 @@ impl<F: ProgramFamily> Service<F> {
                     && request.state.generation().finish_reason().is_none()
             });
             if !live {
+                let wake = self.wakes.completion();
                 self.domain
-                    .shrink_state(bindings, ShrinkPolicy::Idle)
+                    .shrink_state(bindings, ShrinkPolicy::Idle, wake)
                     .map_err(|error| (None, classify_domain_error(error)))?;
             }
             self.return_candidates(candidates);
@@ -3793,6 +3851,9 @@ struct Releasing<'a, H: MemoryHost> {
     resident_slot: bool,
     /// The store a bank shrink this release began is of.
     began: Option<BankTier>,
+    /// This release began releasing idle graph slots off the submitting
+    /// thread: it is recorded as one that released now.
+    slots_began: bool,
 }
 
 /// Why the owner releases memory.
@@ -3839,7 +3900,7 @@ impl<H: MemoryHost> Releases for Releasing<'_, H> {
             let begun = BankBegun { held: before, cause: self.cause.shrink() };
             self.host.memory().bank_begun(tier, begun).map_err(release_invariant("expert bank"))?;
         }
-        if released == Release::Released {
+        if released == Release::Released || std::mem::take(&mut self.slots_began) {
             let domain = self.host.domain();
             let after = domain.memory_moment();
             // Unread values are absent fields.
@@ -3871,7 +3932,17 @@ impl<H: MemoryHost> Releasing<'_, H> {
             false => Release::Nothing,
         };
         Ok(match rung {
-            Rung::Surplus => released(self.host.domain().shrink_state(self.bindings, ShrinkPolicy::Reclaim)? != 0),
+            // Idle graph slots release off this thread: a later boundary
+            // finishes them, and nothing costlier runs before it.
+            Rung::Surplus => {
+                let wake = self.host.completion();
+                let shrunk = self.host.domain().shrink_state(self.bindings, ShrinkPolicy::Reclaim, wake)?;
+                self.slots_began = shrunk.slots == SlotRelease::Began;
+                match shrunk.slots {
+                    SlotRelease::Began | SlotRelease::Running => Release::Pending(Pending::Slots),
+                    SlotRelease::None => released(shrunk.released != 0),
+                }
+            }
             Rung::Idle => released(
                 self.host
                     .domain()
@@ -3887,9 +3958,9 @@ impl<H: MemoryHost> Releasing<'_, H> {
                 match self.host.domain().shrink_expert_bank(self.bindings, wake)? {
                     BankStep::Begun(tier) => {
                         self.began = Some(tier);
-                        Release::Pending
+                        Release::Pending(Pending::Bank)
                     }
-                    BankStep::Running => Release::Pending,
+                    BankStep::Running => Release::Pending(Pending::Bank),
                     BankStep::Deferred => Release::Deferred,
                     BankStep::AtLimit => Release::Nothing,
                 }
@@ -4483,7 +4554,7 @@ mod ladder_tests {
         assert!(!ladder.settled(), "a deferred shrink is not an exhausted ladder");
         assert!(ladder.retry_deferred(), "the next boundary tries it again");
         assert!(ladder.settled() && !ladder.retry_deferred());
-        ladder.released(Release::Pending);
+        ladder.released(Release::Pending(crate::release::Pending::Bank));
         assert!(!ladder.settled());
         ladder.released(Release::Nothing);
         assert!(!ladder.settled(), "nothing more at a rung leaves the pending release");

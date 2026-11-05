@@ -204,8 +204,13 @@ struct GraphBudget {
 
 impl GraphBudget {
     /// Charge what `census` costs on `device`, the budget's census becoming
-    /// it: the growth reserved whole, or refused with nothing changed.
-    fn charge(&mut self, device: &DeviceInner, census: GraphCensus) -> Result<(), ExecutionError> {
+    /// it: the growth reserved whole, or refused with nothing changed. The
+    /// bytes the device is no longer charged, none for a growth.
+    fn charge(&mut self, device: &DeviceInner, census: GraphCensus) -> Result<u64, ExecutionError> {
+        let charged = |budget: &Self| {
+            [&budget.device, &budget.upload].into_iter().flatten().map(crate::memory::MemoryCharge::bytes).sum::<u64>()
+        };
+        let before = charged(self);
         let bytes = device.graph_cost.bytes(census).expect("a device's graph budget's memory fits u64");
         let memory = &device.memory;
         let growth = |charge: &Option<crate::memory::MemoryCharge>, bytes: u64| {
@@ -231,7 +236,7 @@ impl GraphBudget {
             }
         }
         self.census = census;
-        Ok(())
+        Ok(before.saturating_sub(charged(self)))
     }
 }
 
@@ -310,24 +315,59 @@ impl GraphHold {
     /// Hold `census` instead: a growth reserved whole, or refused with
     /// nothing changed; a shrink releases the graphs beyond the smaller
     /// budget, the least recently replayed first, so the graphs never hold
-    /// more than their owners do.
-    fn resize(&mut self, census: GraphCensus) -> Result<(), ExecutionError> {
+    /// more than their owners do. The bytes the device is no longer
+    /// charged, none for a growth.
+    fn resize(&mut self, census: GraphCensus) -> Result<u64, ExecutionError> {
         let shrinks = census.within(self.census);
-        let budget = {
+        let (budget, freed) = {
             let mut budget = self.device.native.graph_budget.lock().expect("graph budget lock is never poisoned");
             let resized = budget
                 .census
                 .minus(self.census)
                 .and_then(|rest| rest.plus(census))
                 .expect("a hold's census is part of its device's budget");
-            budget.charge(&self.device, resized)?;
-            budget.census
+            let freed = budget.charge(&self.device, resized)?;
+            (budget.census, freed)
         };
         self.census = census;
         if shrinks {
             self.device.native.fit_graphs(budget);
         }
-        Ok(())
+        Ok(freed)
+    }
+
+    /// Release the hold as its drop does: the bytes the device is no longer
+    /// charged.
+    fn release(self) -> u64 {
+        let hold = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `hold` is never used or dropped again; its device is read
+        // out of it once, and dropped once `unhold` returns.
+        let device = unsafe { std::ptr::read(&hold.device) };
+        Self::unhold(&device, hold.census)
+    }
+
+    /// The budget shrinks by `census`, a hold's. Once no hold is live the
+    /// device keeps no graph: only a live hold's runs replay one, and each
+    /// graph keeps its plans, which hold the device (a device whose last
+    /// hold dropped would otherwise never be freed). A submission that
+    /// records or fits graphs holds its runs' holds throughout, so this
+    /// never runs beneath one. The bytes the device is no longer charged.
+    fn unhold(device: &Arc<DeviceInner>, census: GraphCensus) -> u64 {
+        let (unheld, shrunk, freed) = {
+            let mut budget = device.native.graph_budget.lock().expect("graph budget lock is never poisoned");
+            let shrunk = budget.census.minus(census).expect("a hold's census is part of its device's budget");
+            let freed = budget
+                .charge(device, shrunk)
+                .expect("a smaller census reserves nothing, so its charge is never refused");
+            budget.holds -= 1;
+            (budget.holds == 0, shrunk, freed)
+        };
+        match unheld {
+            true => device.native.clear_unheld_graphs(),
+            // The graphs never hold more than the holds left do.
+            false => device.native.fit_graphs(shrunk),
+        }
+        freed
     }
 }
 
@@ -418,7 +458,7 @@ impl FamilyGraphs {
         let mut held = self.held.lock().expect("family graph hold lock is never poisoned");
         let census = self.census(held.0 + 1);
         match &mut held.1 {
-            Some(hold) => hold.resize(census)?,
+            Some(hold) => drop(hold.resize(census)?),
             None => held.1 = Some(GraphHold::new(&self.device, census)?),
         }
         held.0 += 1;
@@ -442,44 +482,48 @@ impl SlotGraphs {
     }
 }
 
-impl Drop for SlotGraphs {
-    /// The family's hold shrinks to one slot fewer, and goes with its last.
-    fn drop(&mut self) {
-        let mut held = self.family.held.lock().expect("family graph hold lock is never poisoned");
+impl SlotGraphs {
+    /// Release `graphs` where the slot alone held them, as their drop
+    /// does: the bytes the device is no longer charged; none where a queued
+    /// run shares them, which releases them with its own.
+    pub(crate) fn release(graphs: Arc<Self>) -> u64 {
+        Arc::try_unwrap(graphs).map_or(0, |graphs| {
+            let graphs = std::mem::ManuallyDrop::new(graphs);
+            // SAFETY: `graphs` is never used or dropped again; its family is
+            // read out of it once, and dropped once `unhold` returns.
+            let family = unsafe { std::ptr::read(&graphs.family) };
+            Self::unhold(&family)
+        })
+    }
+
+    /// `family`'s hold shrinks to one slot fewer, and goes with its last:
+    /// the bytes the device is no longer charged.
+    fn unhold(family: &FamilyGraphs) -> u64 {
+        let mut held = family.held.lock().expect("family graph hold lock is never poisoned");
         held.0 -= 1;
         // Uncounted before the hold shrinks and releases graphs beyond it.
-        self.family.flights.store(held.0 as usize, std::sync::atomic::Ordering::Release);
-        let census = self.family.census(held.0);
-        if held.0 == 0 {
-            held.1 = None;
-        } else if let Some(hold) = &mut held.1 {
-            hold.resize(census).expect("a smaller census reserves nothing, so its charge is never refused");
+        family.flights.store(held.0 as usize, std::sync::atomic::Ordering::Release);
+        let census = family.census(held.0);
+        let hold = held.1.take().expect("a family holds its graphs while a slot lives");
+        match held.0 {
+            0 => hold.release(),
+            _ => {
+                let hold = held.1.insert(hold);
+                hold.resize(census).expect("a smaller census reserves nothing, so its charge is never refused")
+            }
         }
     }
 }
 
-impl Drop for GraphHold {
-    /// The budget shrinks by the hold's census. Once no hold is live the
-    /// device keeps no graph: only a live hold's runs replay one, and each
-    /// graph keeps its plans, which hold the device (a device whose last
-    /// hold dropped would otherwise never be freed). A submission that
-    /// records or fits graphs holds its runs' holds throughout, so this
-    /// never runs beneath one.
+impl Drop for SlotGraphs {
     fn drop(&mut self) {
-        let (unheld, shrunk) = {
-            let mut budget = self.device.native.graph_budget.lock().expect("graph budget lock is never poisoned");
-            let shrunk = budget.census.minus(self.census).expect("a hold's census is part of its device's budget");
-            budget
-                .charge(&self.device, shrunk)
-                .expect("a smaller census reserves nothing, so its charge is never refused");
-            budget.holds -= 1;
-            (budget.holds == 0, shrunk)
-        };
-        match unheld {
-            true => self.device.native.clear_unheld_graphs(),
-            // The graphs never hold more than the holds left do.
-            false => self.device.native.fit_graphs(shrunk),
-        }
+        Self::unhold(&self.family);
+    }
+}
+
+impl Drop for GraphHold {
+    fn drop(&mut self) {
+        Self::unhold(&self.device, self.census);
     }
 }
 

@@ -361,9 +361,9 @@ fn a_prompt_chunk_opens_a_chain_its_holder_claims() {
     // The group's class is kept while memory is Normal, and released to the
     // floor of one place at Reclaim's surplus rung.
     assert_eq!(domain.group_places().get(), 3);
-    domain.shrink_state(&mut bindings, ShrinkPolicy::Idle).unwrap();
+    super::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Idle);
     assert_eq!(domain.group_places().get(), 3);
-    domain.shrink_state(&mut bindings, ShrinkPolicy::Reclaim).unwrap();
+    super::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Reclaim);
     assert_eq!(domain.group_places().get(), 1);
 }
 
@@ -537,7 +537,7 @@ fn a_chain_is_released_by_its_holder_never_orphaned() {
     let mut bindings = held(&mut domain, bindings);
     domain.close(request).unwrap();
     assert_eq!(domain.chain_holder(), None);
-    domain.shrink_state(&mut bindings, ShrinkPolicy::Idle).unwrap();
+    super::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Idle);
     assert!(domain.queue.is_empty());
 }
 
@@ -767,9 +767,7 @@ fn fresh_memory_observation_reconciles_released_state_backing() {
     domain.refresh_memory().unwrap();
     let before = domain.memory().standing().unwrap();
     assert_eq!(before.unattributed_bytes, 0);
-    let released = domain
-        .shrink_state(&mut bindings, ShrinkPolicy::Reclaim)
-        .unwrap();
+    let released = super::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Reclaim);
     assert!(released > 0);
     domain.refresh_memory().unwrap();
     let after = domain.memory().standing().unwrap();

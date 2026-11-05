@@ -3700,6 +3700,13 @@ pub struct NativeGraphFamilyOutputSlot {
 }
 
 impl NativeGraphFamilyOutputSlot {
+    /// Release the slot's storage: the bytes the device is no longer
+    /// charged, those of each allocation the slot alone held; one another
+    /// holder shares stays charged until it releases it.
+    pub fn release(self) -> u64 {
+        self.inner.release()
+    }
+
     pub fn activate(self, plan: &NativeGraphPlan) -> Result<NativeGraphOutputs, WorkflowError> {
         self.inner
             .activate(&plan.inner)
@@ -3852,6 +3859,13 @@ pub struct NativeGraphFamilySlot {
 }
 
 impl NativeGraphFamilySlot {
+    /// Release the slot's storage: the bytes the device is no longer
+    /// charged, those of each allocation the slot alone held; one another
+    /// holder shares stays charged until it releases it.
+    pub fn release(self) -> u64 {
+        self.inner.release()
+    }
+
     pub fn activate<'a>(
         &'a mut self,
         plan: &NativeGraphPlan,

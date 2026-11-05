@@ -41,6 +41,7 @@ mod planning;
 pub mod programs;
 mod progressive;
 mod slot_directory;
+mod storage_thread;
 mod stored_table;
 mod streamed_table;
 pub use programs::{
@@ -65,7 +66,7 @@ pub use domain::{
     ExpertMeasures, ExpertResidency, ExpertResizes, HostResidency, ShrinkCause, TierFill, MissStore, MissStoreError, ResidentStep,
     HeadFlight, MeasurementRoom, MemoryChargeReconciliation, MemoryMoment, NativeFamily, OpenRequirements,
     PendingOperationOutcome, PhysicalDecision, PrimingCompletionFlight, ProgramFamily,
-    ReservedResources, ResumeState, StateBindings, StoreAllocation, SubmitFailure,
+    ReservedResources, ResumeState, StateBindings, SlotRelease, StateShrink, StoreAllocation, SubmitFailure,
     TargetContinuation, TargetFlight, TargetHostTiming, TrafficHold, VisionFlight, require_normal,
 };
 pub use error::{
@@ -145,6 +146,7 @@ pub use residency::{
     ComponentLoader, ImportArtifactTensor, ResidentWeight, Stored, StoredTensor, WeightImportError,
 };
 pub use residency::{MappedImportReport, ResidencyStore};
+pub use storage_thread::Releases;
 pub use resident_weights::{
     ResidencyError, ResidentHead, ResidentOutput, ResidentPlanes, ResidentRoles, ResidentTarget,
     ResidentVision,
@@ -152,6 +154,6 @@ pub use resident_weights::{
 pub use resources::{
     AllocatedResources, AllocationError, GraphOutputOwner, GraphOutputTensor, ImportWorkspaceLease,
     NativeGraphOutputLease, NativeGraphPool, NativeGraphWorkspaceLease, PoolClass,
-    ResourceAllocator, TargetGraphOutputLease, TargetGraphPool, TargetGraphWorkspaceLease,
+    ResourceAllocator, SlotsReleased, TargetGraphOutputLease, TargetGraphPool, TargetGraphWorkspaceLease,
     VisionGraphPool,
 };

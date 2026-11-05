@@ -186,22 +186,21 @@ impl NativeGraphPool {
         Ok(())
     }
 
-    /// Release free activations and output slots beyond the held class's
-    /// counts, the held class being the floor's once `reclaim` releases it;
-    /// returns how many were released. Lent slots stay until their last view
-    /// drops.
-    pub(crate) fn release_idle(&mut self, reclaim: bool) -> usize {
+    /// Take the free activations and output slots beyond the held class's
+    /// counts, the held class being the floor's once `reclaim` releases it,
+    /// into `idle`, which releases them where it drops. Lent slots stay
+    /// until their last view drops.
+    pub(crate) fn release_idle(&mut self, reclaim: bool, idle: &mut IdleSlots) {
         if reclaim {
             self.held = self.floor;
         }
-        fn release<T>(free: &mut Vec<T>, allocated: &mut usize, kept: usize) -> usize {
+        fn release<T>(free: &mut Vec<T>, allocated: &mut usize, kept: usize, into: &mut Vec<T>) {
             let releasable = allocated.saturating_sub(kept).min(free.len());
-            free.truncate(free.len() - releasable);
+            into.extend(free.drain(free.len() - releasable..));
             *allocated -= releasable;
-            releasable
         }
-        release(&mut self.workspace.borrow_mut(), &mut self.allocated.activations, self.held.activations)
-            + release(&mut self.output.borrow_mut(), &mut self.allocated.output, self.held.output)
+        release(&mut self.workspace.borrow_mut(), &mut self.allocated.activations, self.held.activations, &mut idle.activations);
+        release(&mut self.output.borrow_mut(), &mut self.allocated.output, self.held.output, &mut idle.outputs);
     }
 
     pub fn acquire_workspace(&self) -> Result<NativeGraphWorkspaceLease, CapacityError> {
@@ -397,20 +396,18 @@ impl VisionGraphPool {
         })
     }
 
-    /// Release every free activation and output slot; returns how many were
-    /// released. A lent activation stays until its encode completes, a lent
-    /// output slot until its image's features are released.
-    pub(crate) fn release_idle(&mut self) -> usize {
-        self.classes
-            .iter_mut()
-            .map(|class| {
-                let activations = class.workspace.borrow_mut().drain(..).count();
-                let outputs = class.output.borrow_mut().drain(..).count();
-                class.activations -= activations;
-                class.outputs -= outputs;
-                activations + outputs
-            })
-            .sum()
+    /// Take every free activation and output slot into `idle`, which
+    /// releases them where it drops. A lent activation stays until its
+    /// encode completes, a lent output slot until its image's features are
+    /// released.
+    pub(crate) fn release_idle(&mut self, idle: &mut IdleSlots) {
+        for class in &mut self.classes {
+            let (activations, outputs) = (idle.activations.len(), idle.outputs.len());
+            idle.activations.extend(class.workspace.borrow_mut().drain(..));
+            idle.outputs.extend(class.output.borrow_mut().drain(..));
+            class.activations -= idle.activations.len() - activations;
+            class.outputs -= idle.outputs.len() - outputs;
+        }
     }
 
     /// Storage allocated now, lent or free.
@@ -429,6 +426,28 @@ impl VisionGraphPool {
 }
 
 const OVERFLOW: &str = "a graph pool's bytes overflow";
+
+/// Free graph slots the pools gave up, which release their storage (each
+/// slot's upload regions and record tables, and its family's graphs beyond
+/// the slots left) as they are released ([`Self::release`]): on the load's
+/// release thread (`AllocatedResources::release_idle_slots`).
+#[derive(Default)]
+pub(crate) struct IdleSlots {
+    activations: Vec<NativeGraphFamilySlot>,
+    outputs: Vec<NativeGraphFamilyOutputSlot>,
+}
+
+impl IdleSlots {
+    pub(crate) fn len(&self) -> usize {
+        self.activations.len() + self.outputs.len()
+    }
+
+    /// Release every slot: the bytes the device is no longer charged.
+    pub(crate) fn release(self) -> u64 {
+        let activations = self.activations.into_iter().map(NativeGraphFamilySlot::release);
+        activations.chain(self.outputs.into_iter().map(NativeGraphFamilyOutputSlot::release)).sum()
+    }
+}
 
 /// The bytes of `activations` activations of `activation_bytes` and
 /// `outputs` output slots of `output_bytes`.

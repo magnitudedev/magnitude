@@ -11,21 +11,24 @@ use magnitude_artifacts::gguf::GgufArtifact;
 use seismic::{Device, Tensor};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
-use super::resize::{Commitment, HostResize, HostTier, Resize, ResizeThread};
+use super::resize::{Commitment, HostResize, HostTier, Resize};
+use crate::storage_thread::{Releases, StorageThread};
 use crate::experts::site::site_lines;
 
 impl ExpertBank {
     /// Allocate `plan`'s bank on `device`, empty, and start its watcher over
     /// the files `artifact` stores the expert stacks in; each streamed
     /// layer's admitted CPU site (`sites`) served by its host
-    /// compute executor, its lines those the job stored (`cpu`).
-    pub fn open(
+    /// compute executor, its lines those the job stored (`cpu`); its device
+    /// storage released on the load's `releases` thread.
+    pub(crate) fn open(
         device: &Device,
         plan: &ExpertBankPlan,
         artifact: &GgufArtifact,
         sites: &[Option<crate::native::BankSite>],
         lines: std::sync::Arc<[crate::assessment::BankLines]>,
         cpu: &crate::assessment::StoredCpuSite,
+        releases: Releases,
     ) -> Result<Self, String> {
         // A layer whose CPU site its qualification refused serves every miss
         // over the link: never silently, and with why.
@@ -91,7 +94,7 @@ impl ExpertBank {
                     ceiling,
                     resize: HostResize::Idle(resizers),
                     last_resize: None,
-                    thread: ResizeThread::start()?,
+                    thread: StorageThread::start("expert-bank-host-tier")?,
                 }))
             })
             .transpose()?;
@@ -167,7 +170,7 @@ impl ExpertBank {
             .map(|group| Words::new(group.moves.clone(), group.moves.byte_len() / 4, 0))
             .collect::<Result<Vec<_>, String>>()?;
         let landed = landed_tensors(plan, &layout).map(Arc::from);
-        let resize_thread = ResizeThread::start()?;
+        let resize_thread = StorageThread::start("expert-bank-resize")?;
         let bank = Self {
             layout,
             floor,
@@ -188,6 +191,7 @@ impl ExpertBank {
             }),
             last_resize: Mutex::new(None),
             resize_thread,
+            release_thread: releases,
             rises: Arc::new(Mutex::new(())),
             landed,
             plan: plan.clone(),

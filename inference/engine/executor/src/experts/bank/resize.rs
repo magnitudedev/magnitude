@@ -11,6 +11,7 @@ use seismic::{NativeTensorBatch, NativeTensorBatchCompletion, PreparedRecommit, 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use crate::experts::watcher::Join;
+use crate::storage_thread::{Done, StorageThread};
 
 /// What the bank commits: the slots its directory serves from, between the
 /// floor and every expert, and its record tensors' resize. A record
@@ -35,7 +36,7 @@ pub(super) struct HostTier {
     /// The thread the tier's storage work runs on: host RAM is a store of
     /// its own, so its backing and growth never queue a resize of the
     /// device's records behind them, nor wait on one.
-    pub(super) thread: ResizeThread,
+    pub(super) thread: StorageThread,
     /// Its host slots' last finished resize
     /// ([`crate::domain::ElasticBank::record_resize`]).
     pub(super) last_resize: Option<crate::domain::BankResize>,
@@ -263,11 +264,6 @@ impl Growing {
     }
 }
 
-/// A resize step's outcome once it ends off the submitting thread, or why it
-/// panicked (which leaves the holding without the resizers it took), and
-/// when.
-pub(super) type Done<T> = Arc<Mutex<Option<(Result<T, String>, Instant)>>>;
-
 /// The resize of every record tensor, group by group in routed tensor
 /// order, one at a time.
 pub(super) enum Resize {
@@ -330,88 +326,6 @@ impl Installed {
         match self {
             Self::Release(release) => release.release(),
             Self::Kept(resizer) => resizer,
-        }
-    }
-}
-
-/// The thread a store's resizes of the bank do their storage work on (the
-/// bank's records' store, and a host tier's own), started with the bank and
-/// joined when it drops. A resize only hands it work: the kernel
-/// creates a thread from memory it may wait for, and memory is short exactly
-/// when a shrink is due. A 72-slot shrink of Qwen3.6-35B-A3B under 8 GB of
-/// pressure held the submitting thread 483.9 ms, all but its 3.5 ms plan
-/// and moves in the spawn of its prepare's thread (the prepare of a shrink
-/// backs, zeroes and forms nothing; it was done 483.4 ms after the
-/// decision), M4 Pro, 2026-10-27.
-pub(super) struct ResizeThread {
-    work: Option<std::sync::mpsc::Sender<Work>>,
-    /// Its one thread, busy while a resize of its store runs, beside decode
-    /// for the host tier's backing ([`HostResize::Backing`], [`RESIZE_THREADS`]).
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-/// A step of a resize, run on the resize thread, which catches its panic.
-type Work = Box<dyn FnOnce() + Send>;
-
-impl ResizeThread {
-    /// Its thread, placed on every CPU the process may run on (`seismic::pin`,
-    /// which also keeps it out of the serving executor's placement,
-    /// `HostCompute::serving`): a host tier's backing first touches its
-    /// pages on the threads it starts, which inherit that placement, so the
-    /// tier is spread over every memory node. On the runtime's CPUs alone
-    /// (nodes 2 and 3 of an EPYC 7313) the tier lay on half the memory channels
-    /// and decode measured 45% slower than unplaced (one alternated
-    /// pair); spread, 7.6%; on the workers' own nodes, 21.9 ms
-    /// against 11.9.
-    pub(super) fn start() -> Result<Self, String> {
-        let every = seismic::Processors::discover().map_err(|error| format!("the host's processors: {error}"))?.allowed().iter().copied().collect::<Vec<_>>();
-        let (work, received) = std::sync::mpsc::channel::<Work>();
-        let (placed, placement) = std::sync::mpsc::sync_channel(1);
-        let thread = std::thread::Builder::new()
-            .name("expert-bank-resize".into())
-            .spawn(move || {
-                let pinned = seismic::pin(&every);
-                let serves = pinned.is_ok();
-                placed.send(pinned).expect("the resize thread's start waits for its placement");
-                if serves {
-                    received.iter().for_each(|work| work());
-                }
-            })
-            .map_err(|error| format!("the expert bank's resize thread: {error}"))?;
-        placement.recv().map_err(|error| format!("the expert bank's resize thread: {error}"))?.map_err(|error| format!("the expert bank's resize thread's placement: {error}"))?;
-        Ok(Self {
-            work: Some(work),
-            thread: Some(thread),
-        })
-    }
-
-    /// Run `work` on the resize thread: its outcome lands in the returned
-    /// slot, or why it panicked (a panic is caught, so the thread, and every
-    /// later resize of the bank, outlives it), then `wake` completes. It
-    /// cannot fail: the thread takes work until the bank drops its sender,
-    /// so the work, and every resizer it owns, always reaches it.
-    pub(super) fn run<T: Send + 'static>(&self, wake: CompletionWake, work: impl FnOnce() -> T + Send + 'static) -> Done<T> {
-        let done = Arc::new(Mutex::new(None));
-        let slot = done.clone();
-        self.work
-            .as_ref()
-            .expect("the resize thread takes work until the bank drops")
-            .send(Box::new(move || {
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
-                    .map_err(|payload| format!("the expert bank's resize panicked: {}", super::watcher::panic_message(payload.as_ref())));
-                *slot.lock().expect("bank resize outcome") = Some((outcome, Instant::now()));
-                wake.complete();
-            }))
-            .expect("the resize thread catches every panic, so it takes work until the bank drops");
-        done
-    }
-}
-
-impl Drop for ResizeThread {
-    fn drop(&mut self) {
-        drop(self.work.take());
-        if let Some(thread) = self.thread.take() {
-            thread.join().expect("the expert bank's resize thread panicked");
         }
     }
 }
@@ -561,7 +475,7 @@ impl ExpertBank {
         (groups, records): (Vec<usize>, RecordsAt),
         joining: Joining,
         charged: u64,
-        thread: &ResizeThread,
+        thread: &StorageThread,
         wake: CompletionWake,
     ) -> Result<Growing, (Vec<Resizer>, DomainError)> {
         let landed = match (joining, &self.landed) {
@@ -1096,7 +1010,7 @@ impl ExpertBank {
                 }
             })
             .collect::<Vec<_>>();
-        let done = self.resize_thread.run(wake, move || tensors.into_iter().map(Installed::release).collect());
+        let done = self.release_thread.run(wake, move || tensors.into_iter().map(Installed::release).collect());
         Resize::Releasing { from, charged, refusal, begun, prepared, installed, done }
     }
 

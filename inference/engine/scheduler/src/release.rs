@@ -43,9 +43,9 @@ impl Rung {
 pub(crate) enum Release {
     /// Memory was released.
     Released,
-    /// A release runs that a later flight boundary finishes (a bank
-    /// resize): nothing costlier runs before it.
-    Pending,
+    /// A release runs that a later flight boundary finishes, its own
+    /// ([`Pending`]): nothing costlier runs before it.
+    Pending(Pending),
     /// A release must wait for a gap between flights (a bank resize with a
     /// step still running): nothing began, nothing costlier runs, and the
     /// next boundary releases again.
@@ -56,6 +56,17 @@ pub(crate) enum Release {
     Covered,
     /// The rung has nothing left.
     Nothing,
+}
+
+/// A release a later flight boundary finishes, by what it releases: each
+/// finishes on its own, so the ladder waits for each apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pending {
+    /// Idle graph slots, released off the submitting thread (the surplus
+    /// rung's).
+    Slots,
+    /// A resize of the expert bank (the bank rung's).
+    Bank,
 }
 
 /// Releases at one rung of the ladder at a time.
@@ -115,7 +126,7 @@ mod tests {
                 *self.left.entry(given).or_default() += 1;
             }
             Ok(match self.pending.contains(&rung) {
-                true => Release::Pending,
+                true => Release::Pending(super::Pending::Bank),
                 false => Release::Released,
             })
         }
