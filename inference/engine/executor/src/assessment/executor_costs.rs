@@ -4468,6 +4468,16 @@ impl<'a, 'd> Walks<'a, 'd> {
     where
         F: FnOnce() -> Result<Point, Unformed<ExecutorCostsError>>,
     {
+        let store = self.measured.records.store;
+        self.time_in(key, host, store, build);
+    }
+
+    /// [`Self::time`], its record kept in `store` (the job's,
+    /// [`Self::store`], or one that guards it).
+    pub(super) fn time_in<F>(&mut self, key: PointKey, host: bool, store: &dyn RecordStore<PointKey>, build: F)
+    where
+        F: FnOnce() -> Result<Point, Unformed<ExecutorCostsError>>,
+    {
         let how = self.measured.within();
         self.measured.left = self.measured.left.saturating_sub(1);
         let measured = &mut self.measured;
@@ -4481,7 +4491,7 @@ impl<'a, 'd> Walks<'a, 'd> {
             })],
             &how,
             seismic::measure::Deadline::new(Some(measured.deadline)),
-            measured.records.store,
+            store,
             &mut *measured.attempting,
         );
         drop(quiet);

@@ -4,7 +4,8 @@
 //! tier's experts enter the bank and which records they take
 //! (`Directory::promotions`: the experts its share of each layer holds and
 //! the bank lacks, into free records), as the completed steps feed it
-//! reads. Each promotion
+//! reads, and a copy competes with the step for the link and host memory,
+//! so an expert enters only once its reads pay for its copy. Each promotion
 //!
 //! 1. holds the tier record keeping its expert (`HostRecords::hold`) and
 //!    copies it into its free record on the copy engine
@@ -212,6 +213,7 @@ impl Promotions {
             }
             asked
         });
+        shared.promoted.store(directory.asked(), std::sync::atomic::Ordering::Relaxed);
         !asked.promotions.is_empty() || !asked.releases.is_empty()
     }
 }

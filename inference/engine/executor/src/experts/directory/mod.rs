@@ -178,13 +178,34 @@ pub(super) struct Directory {
     unwanted: Vec<BTreeSet<usize>>,
     /// Whether a promotion may have become possible since promotions were
     /// last taken ([`Self::promotions`]): a want or a victim gained or lost,
-    /// or a landing into the tier (a record freed or taken is the bank
-    /// records' to mark, [`BankRecords::take_changed`]).
+    /// a landing into the tier, or a copy's price changed (a record freed or
+    /// taken is the bank records' to mark, [`BankRecords::take_changed`]).
     stirred: bool,
+    /// The ranking's reads ([`Reuse::reads`]) when promotions last withheld
+    /// a want for its copy (`Self::earning`), none where they withheld
+    /// none: a read since may earn it, and asks again.
+    withheld: Option<u64>,
     /// Per group, the records it keeps free or releasing beyond its wants,
     /// so a promotion takes a record no step reads and copies at once
     /// ([`Self::reserve`]); the ranking's shares are the records less it.
     reserve: Vec<usize>,
+    /// The reads a promotion must expect beyond what it displaces to earn
+    /// its copy, each layer's (`ExpertLines::copy_hits`): none where a hit
+    /// saves nothing, so no promotion of the layer earns; zero, a copy
+    /// costing nothing, until the lines are priced.
+    copy_hits: Vec<Option<f64>>,
+    /// Per group, the promotions it asked since its first and that one's
+    /// step, none before it: what a stay in its bank lasts
+    /// ([`Self::stay`]). The one count of promotions asked.
+    asked: Vec<Option<Asked>>,
+}
+
+/// A group's promotions asked: the step after the first was asked at, and
+/// how many it has asked since, that one included.
+#[derive(Clone, Copy, Debug)]
+struct Asked {
+    first: Step,
+    count: u64,
 }
 
 /// A record of a bank group's record tensors: what its bank map names, and
@@ -218,6 +239,14 @@ fn store_rank<'a>(ranking: &'a Ranking, prompt_reads: &'a HashMap<Staged, Step>)
         let read = read.max(prompt_reads.get(&(layer, expert)).copied());
         Reuse::of(ranking).rank(layer, expert, read)
     }
+}
+
+/// A group's wanted experts as their copies price them
+/// ([`Directory::promotions`]).
+struct Earning {
+    earning: Vec<Staged>,
+    /// Whether any waits for its reads to earn its copy.
+    withheld: bool,
 }
 
 /// An expert's rank, least first, which every choice of what the bank
@@ -352,7 +381,10 @@ impl Directory {
             wanted: vec![BTreeSet::new(); layers.len()],
             unwanted: vec![BTreeSet::new(); layers.len()],
             stirred: false,
+            withheld: None,
             reserve: vec![0; records.len()],
+            copy_hits: vec![Some(0.); layers.len()],
+            asked: vec![None; records.len()],
         }
     }
 
@@ -693,7 +725,8 @@ impl Directory {
     /// Settle the ranking's changes of its shares (`Reuse::take_changes`):
     /// whether a promotion or a release may have become possible since they
     /// were last asked (a want or a victim gained or lost, [`Self::stirred`],
-    /// or a record freed or taken, [`BankRecords::take_changed`]), so
+    /// a record freed or taken, [`BankRecords::take_changed`], or a read
+    /// logged since a want was withheld, [`Self::withheld`]), so
     /// [`Self::promotions`] may ask any.
     pub fn settle_changes(&mut self) -> bool {
         let changes = {
@@ -704,7 +737,13 @@ impl Directory {
         for (layer, expert, top) in changes {
             self.settle(layer, expert, top);
         }
-        self.stirred || self.bank.changed()
+        self.stirred || self.bank.changed() || self.read_since_withheld()
+    }
+
+    /// Whether the ranking logged a read since promotions last withheld a
+    /// want ([`Self::withheld`]).
+    fn read_since_withheld(&self) -> bool {
+        self.withheld.is_some_and(|reads| self.reuse_now().reads() != reads)
     }
 
     /// What the ranking asks now, in time proportional to what changed:
@@ -731,10 +770,11 @@ impl Directory {
     pub fn promotions(&mut self, at: &Unbegun, lending: &mut Lending) -> Wants {
         self.settle_changes();
         let mut asked = Wants::default();
-        let stirred = std::mem::take(&mut self.stirred) | self.bank.take_changed() | lending.take_freed();
+        let stirred = std::mem::take(&mut self.stirred) | self.bank.take_changed() | lending.take_freed() | self.read_since_withheld();
         if !stirred {
             return asked;
         }
+        let mut withheld = false;
         for group in 0..self.homes.len() {
             let members = self.homes[group].iter().map(|&(_, layer)| layer).collect::<Vec<_>>();
             let wanted = members
@@ -742,6 +782,12 @@ impl Directory {
                 .flat_map(|&layer| self.wanted[layer].iter().map(move |&expert| (layer, expert)))
                 .filter(|&(layer, expert)| self.in_tier(layer, expert))
                 .collect::<Vec<_>>();
+            // Earning weighs a victim for each want, and releases take at most
+            // a want's each and the reserve's.
+            let victims = self.victims(group, &members, lending, wanted.len() + self.reserve[group]);
+            let priced = self.earning(group, wanted, &victims, lending, at.next());
+            withheld |= priced.withheld;
+            let wanted = priced.earning;
             let free = self
                 .bank
                 .free(group)
@@ -752,6 +798,7 @@ impl Directory {
             for ((layer, expert), record) in wanted.into_iter().zip(free) {
                 let promotion = Promotion { group, record: bank_record(record), layer, expert };
                 self.bank.promote(&promotion, lending);
+                self.asked[group].get_or_insert(Asked { first: at.next(), count: 0 }).count += 1;
                 self.resettle(layer, expert);
                 asked.promotions.push(promotion);
             }
@@ -764,20 +811,7 @@ impl Directory {
             if releases == 0 {
                 continue;
             }
-            let mut unwanted = members
-                .iter()
-                .flat_map(|&layer| self.unwanted[layer].iter().map(move |&expert| (layer, expert)))
-                .map(|(layer, expert)| {
-                    let read = Reuse::of(&self.ranking).last(layer, expert).unwrap_or(0);
-                    (self.ranked(layer, expert, read), self.bank.held(layer, expert).expect("an unwanted expert is held"))
-                })
-                .filter(|&(_, record)| self.bank.usable(group, record, lending))
-                .collect::<Vec<_>>();
-            if releases < unwanted.len() {
-                unwanted.select_nth_unstable(releases);
-                unwanted.truncate(releases);
-            }
-            for (Ranked { layer, expert, .. }, record) in unwanted {
+            for (Ranked { layer, expert, .. }, record) in victims.into_iter().take(releases) {
                 let record = bank_record(record);
                 self.bank.release(group, record, at, lending);
                 self.left_bank(layer, expert, None);
@@ -786,7 +820,90 @@ impl Directory {
         }
         // What it took is asked for: only what changes after asks again.
         self.bank.take_changed();
+        self.withheld = withheld.then(|| self.reuse_now().reads());
         asked
+    }
+
+    /// Group `group`'s records a release may take, in the order releases
+    /// take them: each held expert outside its layer's share (`unwanted`)
+    /// whose record is usable, its least ranked first: the `most` least
+    /// ranked, selected before they are sorted.
+    fn victims(&self, group: usize, members: &[usize], lending: &Lending, most: usize) -> Vec<(Ranked, usize)> {
+        let mut victims = members
+            .iter()
+            .flat_map(|&layer| self.unwanted[layer].iter().map(move |&expert| (layer, expert)))
+            .map(|(layer, expert)| {
+                let read = Reuse::of(&self.ranking).last(layer, expert).unwrap_or(0);
+                (self.ranked(layer, expert, read), self.bank.held(layer, expert).expect("an unwanted expert is held"))
+            })
+            .filter(|&(_, record)| self.bank.usable(group, record, lending))
+            .collect::<Vec<_>>();
+        if victims.len() > most {
+            victims.select_nth_unstable(most);
+            victims.truncate(most);
+        }
+        victims.sort_unstable();
+        victims
+    }
+
+    /// Of group `group`'s `wanted`, those whose copy pays by `now`
+    /// (`Self::price_copies`): the most read beyond its layer's price
+    /// first, each against what it would displace, a usable free record
+    /// past the reserve nothing, then each of `victims` in the order
+    /// releases take them (`Self::victims`), all read over the stay
+    /// (`Reuse::weighed`). What a copy costs and a hit saves are the cost
+    /// function's (`ExpertLines::copy_hits`).
+    fn earning(&self, group: usize, wanted: Vec<Staged>, victims: &[(Ranked, usize)], lending: &Lending, now: Step) -> Earning {
+        let reuse = Reuse::of(&self.ranking);
+        let stay = self.stay(group, now);
+        let weigh = |layer: usize, expert: usize| reuse.weighed(layer, expert, now, stay);
+        // A layer whose hit saves nothing earns no promotion at any read:
+        // its wants wait for no read, so none is withheld; its lines'
+        // repricing asks them again (`Self::price_copies`).
+        let mut ranked = wanted
+            .into_iter()
+            .filter_map(|(layer, expert)| self.copy_hits[layer].map(|hits| (weigh(layer, expert) - hits, (layer, expert))))
+            .collect::<Vec<_>>();
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+        // The records past the reserve displace nothing; a promotion into
+        // the reserve is paid for by the release that refills it.
+        let free = self.bank.free(group).filter(|&record| self.bank.usable(group, record, lending)).count();
+        let displaced = std::iter::repeat_n(0., free.saturating_sub(self.reserve[group]))
+            .chain(victims.iter().map(|&(Ranked { layer, expert, .. }, _)| weigh(layer, expert)))
+            .chain(std::iter::repeat(f64::INFINITY));
+        let count = ranked.len();
+        let earning = ranked
+            .into_iter()
+            .zip(displaced)
+            .take_while(|&((surplus, _), displaced)| surplus - displaced >= 0.)
+            .map(|((_, staged), _)| staged)
+            .collect::<Vec<_>>();
+        Earning { withheld: earning.len() < count, earning }
+    }
+
+    /// The steps an expert stays in group `group`'s bank once promoted, as
+    /// the load measures it at step `now`: each promotion takes the place
+    /// of one held, so a record's stay is the group's records over its
+    /// promotions a step (Little's law); none before a promotion and a step
+    /// past it.
+    fn stay(&self, group: usize, now: Step) -> Option<f64> {
+        let Asked { first, count } = self.asked[group]?;
+        let steps = now.checked_sub(first).filter(|&steps| steps > 0)? as f64;
+        Some(self.bank.records(group).len() as f64 / (count as f64 / steps))
+    }
+
+    /// The promotions every group has asked since the load.
+    pub fn asked(&self) -> u64 {
+        self.asked.iter().flatten().map(|asked| asked.count).sum()
+    }
+
+    /// Layer `layer`'s promotions earn their copies at `hits` reads from
+    /// now, none where a hit saves nothing; what they withheld are asked
+    /// again.
+    pub fn price_copies(&mut self, layer: usize, hits: Option<f64>) {
+        if std::mem::replace(&mut self.copy_hits[layer], hits) != hits {
+            self.stirred = true;
+        }
     }
 
     /// Every release whose unmapping the `frontier` reached is free

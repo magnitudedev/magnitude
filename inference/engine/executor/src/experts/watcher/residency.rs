@@ -54,6 +54,9 @@ pub(super) struct Residency {
     /// (`Directory::tier_complete`), as last published.
     pub(super) opened: Instant,
     pub(super) complete: bool,
+    /// The CPU site's answered requests' path time when residency opened
+    /// ([`Self::site_share`]).
+    pub(super) site_opened: std::time::Duration,
 }
 
 /// Residency's lock. A panic while it is held is caught inside it, and
@@ -299,6 +302,23 @@ impl Residency {
         }
     }
 
+    /// The share of the time since residency opened that the CPU site spent
+    /// serving requests: its answered requests' path time over the time
+    /// elapsed, at most all of it (requests of several layers overlap). Over
+    /// the whole load, so it settles as the load runs rather than following
+    /// each flight's requests.
+    fn site_share(&self) -> f64 {
+        let path = self.shared.compute.site_served().terms.iter().sum::<std::time::Duration>();
+        let elapsed = self.opened.elapsed().as_secs_f64();
+        match elapsed > 0. {
+            true => {
+                let served = path.checked_sub(self.site_opened).expect("the site's path time only grows since the load opened");
+                (served.as_secs_f64() / elapsed).min(1.)
+            }
+            false => 0.,
+        }
+    }
+
     /// Between flights, write each layer's policy words (`BankPart::Policy`,
     /// this the one writer): its home (`Directory::home`, the same every
     /// flight, which a graph shared by blocks reads through each block's
@@ -335,6 +355,13 @@ impl Residency {
         let every = full.iter().all(|&full| full);
         let lender = self.scratch.conveyor.lending().group;
         let priced = self.shared.priced();
+        let site_share = self.site_share();
+        let copy = self.shared.copy.lock().expect("a copy's price").clone();
+        if let (Some(lines), Some(copy)) = (&priced, copy) {
+            for (layer, lines) in lines.iter().enumerate() {
+                self.core.directory.price_copies(layer, lines.copy_hits(&copy, site_share));
+            }
+        }
         let served = self.core.layers.iter().any(|layer| layer.site.is_some() && !(full[layer.group] && (every || lender != layer.group)));
         self.shared.sites_served.store(served, std::sync::atomic::Ordering::Release);
         for (index, layer) in self.core.layers.iter().enumerate() {

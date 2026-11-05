@@ -419,6 +419,32 @@ fn the_reserve_is_graced_through_its_layer_of_the_latest_step_begun() {
     assert!(directory.land(0, 3, 0).is_some(), "the device past layer 0 of step 5");
 }
 
+/// A wanted expert enters only once its reads pay for its copy: priced
+/// past what one read weighs, it waits, and it is asked again when its
+/// price falls.
+#[test]
+fn a_promotion_waits_until_its_reads_earn_its_copy() {
+    let mut directory = Directory::new(&[3], &[0, 0], &[8, 8], HostTier::replay(vec![16]));
+    for (layer, expert) in (0..2).flat_map(|layer| (0..8).map(move |expert| (layer, expert))) {
+        let record = directory.land(layer, expert, 0).unwrap();
+        directory.landed(layer, record, expert, None);
+    }
+    (0..2).for_each(|layer| directory.price_copies(layer, Some(2.)));
+    log(&directory, 1, 0, &[4]);
+    assert_eq!(directory.promote(false), Wants::default(), "one read earns no copy priced at two");
+    assert!(!directory.settle_changes(), "nothing read or priced since, nothing asked");
+    log(&directory, 2, 0, &[4]);
+    assert!(directory.settle_changes(), "a read since the want was withheld asks again");
+    // Where a hit saves nothing, no read earns the copy.
+    directory.price_copies(0, None);
+    log(&directory, 3, 0, &[4]);
+    assert_eq!(directory.promote(false), Wants::default(), "a layer whose hit saves nothing promotes nothing");
+    log(&directory, 4, 0, &[4]);
+    assert!(!directory.settle_changes(), "no read earns such a want, so none withholds it and a read asks nothing again");
+    directory.price_copies(0, Some(0.));
+    assert_eq!(directory.promote(false).promotions.len(), 1, "the price fell, and the want is asked again");
+}
+
 /// The ranking promotes, across a group's layers, the experts its share
 /// of each layer holds (each layer's top of its stack) that the bank
 /// lacks and the tier keeps, into free records, which no step reads;
@@ -446,27 +472,27 @@ fn promotions_bring_each_layers_share_into_the_bank() {
     assert_eq!(
         directory.promote(false),
         Wants {
-            promotions: vec![Promotion { group: 0, record: BankRecord(2), layer: 0, expert: 4 }],
+            promotions: vec![Promotion { group: 0, record: BankRecord(2), layer: 1, expert: 5 }],
             releases: vec![Release { group: 0, record: BankRecord(0), layer: 0, expert: 0 }],
         },
-        "the free record taken, then a release for the want left without one"
+        "the free record taken by the want read latest, then a release for the want left without one"
     );
     assert_eq!(directory.held(0, 0), None, "the released expert left the bank");
     assert!(directory.in_tier(0, 0), "its tier copy kept");
     assert_eq!(directory.promote(false), Wants::default(), "nothing changed, nothing asked");
     assert!(directory.place(at(7, 0), 0, &[], &[6, 7], |_| 0).is_none(), "promotions' and releases' records are taken");
-    assert_eq!(directory.complete(&Promotion { group: 0, record: BankRecord(2), layer: 0, expert: 4 }), (0, 4));
-    assert_eq!(directory.held(0, 4), Some(2));
+    assert_eq!(directory.complete(&Promotion { group: 0, record: BankRecord(2), layer: 1, expert: 5 }), (1, 5));
+    assert_eq!(directory.held(1, 5), Some(2));
     directory.drain(Step::MAX);
     assert_eq!(
         directory.promote(false).promotions,
-        [Promotion { group: 0, record: BankRecord(0), layer: 1, expert: 5 }],
+        [Promotion { group: 0, record: BankRecord(0), layer: 0, expert: 4 }],
         "the released record taken"
     );
     directory.unpromoted(0, BankRecord(0), &LentRecords::new());
-    assert_eq!(directory.held(1, 5), None, "a promotion that copied nothing holds nothing");
+    assert_eq!(directory.held(0, 4), None, "a promotion that copied nothing holds nothing");
     assert_eq!(directory.place(at(7, 0), 0, &[], &[6], |_| 0).unwrap().records, [BankRecord(0)], "and frees its record");
-    // 5 is wanted again, and releases the one record outside a share (1).
+    // 4 is wanted again, and releases the one record outside a share (1).
     assert_eq!(
         directory.promote(false),
         Wants { promotions: vec![], releases: vec![Release { group: 0, record: BankRecord(1), layer: 0, expert: 1 }] }

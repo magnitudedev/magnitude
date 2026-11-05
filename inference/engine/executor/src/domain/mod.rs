@@ -663,10 +663,12 @@ pub struct ExpertMeasures {
     /// step: until measured, a shrink takes what memory is short of, its
     /// deficit, in one resize.
     pub moves: crate::assessment::Priced<crate::assessment::MoveLines>,
-    /// The blocks a host tier's copy takes over the link
-    /// (`assessment::TierCopyCosts`), none without a host tier: until
-    /// measured, a list's whole grid.
-    pub tier_copy: crate::assessment::Priced<Option<u32>>,
+    /// What a host tier's copy costs (`assessment::TierCopyCosts`): the
+    /// blocks it takes over the link, the link's rate, and the device time
+    /// it takes from work beside it; none without a host tier. Until
+    /// measured, a copy takes a list's whole grid and a promotion's copy is
+    /// priced at nothing.
+    pub tier_copy: crate::assessment::Priced<Option<crate::assessment::TierCopyCosts>>,
     /// Each bank group's convert line in a decode barrier
     /// (`assessment::ConvertCosts`), none beside a host tier: until
     /// measured, the host lands every miss.
@@ -753,8 +755,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         );
         if let Some(bank) = self.family.expert_bank() {
             bank.price(measures.lines.measured().cloned(), measures.pass.measured().cloned());
-            if let Some(Some(blocks)) = measures.tier_copy.measured() {
-                bank.tier_copy_blocks(*blocks)?;
+            if let Some(Some(costs)) = measures.tier_copy.measured() {
+                bank.tier_copy(costs)?;
             }
             if let Some(Some(lines)) = measures.convert.measured() {
                 bank.device_convert(lines);

@@ -1122,7 +1122,7 @@ pub(crate) fn expert_measures(pricing: &ExpertPricing) -> magnitude_executor::Ex
     let tier_copy = match bank.tier_reservation() {
         None => Priced::Measured(None),
         Some(_) => match TierCopyCosts::stored(topology, info, &records) {
-            Ok(costs) => Priced::Measured(Some(costs.blocks)),
+            Ok(costs) => Priced::Measured(Some(costs)),
             Err(error @ TierCopyError::Unrecorded { .. }) => Priced::Pending(error.to_string()),
             Err(error) => Priced::Unavailable(error.to_string()),
         },

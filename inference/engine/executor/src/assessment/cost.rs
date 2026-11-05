@@ -541,6 +541,36 @@ impl ExpertLines {
             .collect()
     }
 
+    /// The reads a promotion must save to earn its copy: what its copy
+    /// costs ([`Self::copy_nanoseconds`]) over what a read of it then
+    /// saves, a miss's one expert at the site it ends soonest on, less a
+    /// hit. None where a hit saves nothing (the lines the load fits can
+    /// price a miss at or below a hit): no read earns the copy.
+    pub fn copy_hits(&self, copy: &super::TierCopyCosts, site_share: f64) -> Option<f64> {
+        let cpu = self.host.cpu.map_or(f64::INFINITY, |lines| lines.expert.nanoseconds(1.));
+        let saved = cpu.min(self.gpu.link.nanoseconds(1.)) - self.gpu.resident.nanoseconds(1.);
+        (saved > 0.).then(|| self.copy_nanoseconds(copy, site_share) / saved)
+    }
+
+    /// What one record's copy on the transfer queue costs the steps beside
+    /// it: its bytes over the link (`copy`'s rate), the device's time it
+    /// takes from the work beside it meanwhile (`copy`'s stall share), and,
+    /// where a CPU site serves, the host memory's time its read takes from
+    /// the site (one record's read at the memory's rate,
+    /// [`HostLines::memory`]) for the share of the time the site reads
+    /// (`site_share`), as a memory-bound site runs no faster than the
+    /// memory the copy reads too.
+    pub fn copy_nanoseconds(&self, copy: &super::TierCopyCosts, site_share: f64) -> f64 {
+        let link = self.host.record_bytes as f64 * copy.link_byte_seconds() * 1e9;
+        assert!((0. ..=1.).contains(&site_share), "a share of the time: {site_share}");
+        let memory = match (self.host.cpu, self.host.memory) {
+            (Some(_), Some(memory)) => memory.get() * site_share,
+            (None, _) => 0.,
+            (Some(_), None) => unreachable!("a CPU site reads a host tier, whose record read a memory line prices"),
+        };
+        link + copy.stall(link) + memory
+    }
+
     /// The lines with `file`, the landing line the load observes beside
     /// the lines it was priced on, and `convert`, the device's beside it.
     pub fn landing(self, file: Option<FileLine>, convert: Option<RecordLine>) -> Self {
@@ -804,6 +834,33 @@ mod tests {
         assert!((ready - (200e-6 + 1_930_000. / 6e9)).abs() < 1e-12);
         let served = lines.serve(Pass::Decode, &hits(9.), &[Miss { rows: 1., ready_seconds: ready }]);
         assert!((served.end_seconds - (ready + 44e-6)).abs() < 1e-9, "{served:?}");
+    }
+
+    /// A copy is priced in the reads it must save: its record over the
+    /// link, the device time it stalls beside it, and, where a site serves,
+    /// the host memory's time its read takes for the share of the time the
+    /// site reads, over what a read then saves, the cheaper of the miss's
+    /// sites less a hit.
+    #[test]
+    fn a_copy_is_worth_the_hits_its_costs_buy() {
+        let lines = lines();
+        let (records, bytes) = super::super::streaming_costs::TIER_COPY_PROBE;
+        let copy = super::super::TierCopyCosts { blocks: 1, whole_seconds: (records * bytes) as f64 * 1e-10, stall_share: 0.5 };
+        let saved = lines.host.cpu.unwrap().expert.nanoseconds(1.).min(lines.gpu.link.nanoseconds(1.)) - lines.gpu.resident.nanoseconds(1.);
+        let link = lines.host.record_bytes as f64 * 1e-10 * 1e9;
+        let memory = lines.host.memory.unwrap().get();
+        let close = |got: f64, want: f64| assert!((got - want).abs() <= want * 1e-12, "{got} against {want}");
+        close(lines.copy_hits(&copy, 0.).unwrap(), link * 1.5 / saved);
+        close(lines.copy_hits(&copy, 0.25).unwrap(), (link * 1.5 + memory * 0.25) / saved);
+        let unsited = ExpertLines { host: HostLines { cpu: None, ..lines.host }, ..lines };
+        close(unsited.copy_nanoseconds(&copy, 1.), link * 1.5);
+        // A miss that costs no more than a hit saves nothing: no read
+        // earns a copy, at a link at or below the resident line.
+        let flat = ExpertLines { host: HostLines { cpu: None, ..lines.host }, gpu: GpuLines { link: lines.gpu.resident, ..lines.gpu } };
+        assert_eq!(flat.copy_hits(&copy, 0.), None);
+        let cheaper = PassLine { weights: Nanoseconds::saturating(lines.gpu.resident.nanoseconds(1.) * 1e-9 / 2.), ..lines.gpu.resident };
+        let under = ExpertLines { gpu: GpuLines { link: cheaper, ..flat.gpu }, ..flat };
+        assert_eq!(under.copy_hits(&copy, 0.), None);
     }
 
     /// The policy words are the lines' nanoseconds; the GPU's and

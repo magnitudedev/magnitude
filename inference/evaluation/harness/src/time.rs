@@ -1120,6 +1120,7 @@ fn measure(
                 })
                 .collect::<serde_json::Map<_, _>>();
             let site = json!({
+                "promotions_per_step": (end.promoted - start.promoted) as f64 / steps,
                 "requests_per_step": served.requests as f64 / steps,
                 "cpu_misses_per_step": sited as f64 / steps,
                 "link_misses_per_step": missed.checked_sub(sited).ok_or("the site served more misses than the window had")? as f64 / steps,

@@ -299,6 +299,8 @@ pub struct Reuse {
     /// The (layer, expert)s whose membership of their layer's top changed
     /// since they were last taken ([`Self::take_changes`]).
     changed: BTreeSet<(usize, usize)>,
+    /// The reads logged ([`Self::reads`]).
+    reads: u64,
 }
 
 /// The one ranking, shared by its feed (`Stack`, which reads it in the
@@ -327,6 +329,7 @@ impl Reuse {
             live: 0,
             tops: experts.iter().map(|&experts| vec![false; experts]).collect(),
             changed: BTreeSet::new(),
+            reads: 0,
         }
     }
 
@@ -363,6 +366,7 @@ impl Reuse {
     /// expert's depth in slots, by the live half-life's stack before the
     /// read (its layer's experts where never read).
     pub fn read(&mut self, read: &RoutedRead, routed: &[u32]) -> Vec<usize> {
+        self.reads += 1;
         let slots = self.slots[read.layer];
         let at = self.live % HALF_LIVES.len();
         let mut reads = self.measures.iter_mut().map(|measure| measure.read(read, routed, slots)).collect::<Vec<_>>();
@@ -400,6 +404,12 @@ impl Reuse {
     /// its layer's share's top, or its group's pool.
     pub fn in_top(&self, layer: usize, expert: usize) -> bool {
         self.tops[layer][expert]
+    }
+
+    /// The reads logged so far: a want withheld at one count may earn its
+    /// copy once it moves (`Directory::promotions`).
+    pub fn reads(&self) -> u64 {
+        self.reads
     }
 
     /// Take the (layer, expert)s whose membership of their share's experts
@@ -445,6 +455,23 @@ impl Reuse {
     /// The step that last read `layer`'s `expert`, if one has.
     pub fn last(&self, layer: usize, expert: usize) -> Option<Step> {
         self.measure().layers[layer][expert].last
+    }
+
+    /// `layer`'s `expert`'s reads as they weigh at step `now` over a stay
+    /// in the bank of `stay` steps, whichever half-life ranks: its count
+    /// decayed at the measured half-life nearest the stay, what it is
+    /// expected to be read over it. A stay not yet measured (no promotion
+    /// has left one) is longer than any: the longest half-life.
+    pub fn weighed(&self, layer: usize, expert: usize, now: Step, stay: Option<f64>) -> f64 {
+        // A half-life of zero counts only the last read: no count to decay.
+        let nearest = |stay: f64| {
+            let distance = |half_life: f64| (half_life / stay.max(1.)).log2().abs();
+            (1..HALF_LIVES.len()).min_by(|&a, &b| distance(HALF_LIVES[a]).total_cmp(&distance(HALF_LIVES[b]))).expect("measured half-lives")
+        };
+        let at = stay.map_or(HALF_LIVES.len() - 1, nearest);
+        let half_life = HALF_LIVES[at];
+        let score = self.measures[at].layers[layer][expert].score;
+        ((score.0 - Score::at(now).0) / half_life).exp2()
     }
 
     /// `layer`'s `expert`'s score, beside a read at step `read` the log may
@@ -531,6 +558,20 @@ pub(super) mod tests {
         assert_eq!(reuse.rank(0, 2, Some(7)), Score(7.), "a stamp past the log is a later read");
         assert_eq!(reuse.rank(0, 2, None), Score::NEVER);
         assert_eq!(reuse.last(0, 1), Some(5));
+    }
+
+    /// An expert's reads weigh over a stay at the measured half-life
+    /// nearest it, the longest before a stay is measured: one read at step
+    /// 6 weighs 2^(−4/4) at step 10 over a stay of 3 (half-life 4), and
+    /// 2^(−4/256) with no stay measured.
+    #[test]
+    fn reads_weigh_over_the_stay_at_its_nearest_half_life() {
+        let mut reuse = Reuse::new(&[3], &[0], vec![2]);
+        log(&mut reuse, read(6, &[0]));
+        let close = |got: f64, want: f64| assert!((got - want).abs() < 1e-12, "{got} against {want}");
+        close(reuse.weighed(0, 0, 10, Some(3.)), 0.5);
+        close(reuse.weighed(0, 0, 10, None), (-4f64 / 256.).exp2());
+        close(reuse.weighed(0, 1, 10, Some(3.)), 0.);
     }
 
     /// Over a half-life an expert read often outranks one read once more

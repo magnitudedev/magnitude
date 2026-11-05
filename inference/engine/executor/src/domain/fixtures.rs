@@ -783,7 +783,7 @@ impl ElasticBank for FakeBank {
         Ok(())
     }
 
-    fn tier_copy_blocks(&self, _blocks: u32) -> Result<(), DomainError> {
+    fn tier_copy(&self, _costs: &crate::assessment::TierCopyCosts) -> Result<(), DomainError> {
         Ok(())
     }
 

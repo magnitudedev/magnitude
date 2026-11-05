@@ -188,8 +188,10 @@ fn a_promotion_reuses_its_record_only_once_every_step_that_could_read_it_complet
     next.complete().unwrap();
     harness.request(&[6]).complete().unwrap();
     eventually("6 was never promoted", || map.held(6).is_some());
-    // 7, read after both, evicts 5, read least recently, while a step
-    // begun before the eviction still runs and reads 5's record.
+    // 7, read twice after both, is worth more over a stay than 5, read
+    // least recently, and evicts it, while a step begun before the
+    // eviction still runs and reads 5's record.
+    harness.request(&[7]).complete().unwrap();
     let seven = harness.step();
     let running = harness.step();
     harness.request_at(&seven, 0, &[7]);

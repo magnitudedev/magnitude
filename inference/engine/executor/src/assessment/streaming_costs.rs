@@ -835,16 +835,52 @@ impl ConvertForm {
 /// 2% of itself under the 35B's expert pass on an RTX 3090, on 2 blocks 78%,
 /// each at the link's 11.8–11.9 GB/s, one block's 6.40 GB/s. Both points
 /// are kept in the record store, so the count is measured once per executor.
+///
+/// A copy on the device's transfer queue also takes from the device's work
+/// beside it while it runs: on an RTX 3090 under Vulkan a submission beside
+/// a 13 GB/s host-to-device copy starts about 90 µs later and runs 2.9x
+/// longer. So the device's work, each run its own submission, is timed
+/// alone and beside such a copy ([`Self::stall_share`]), both kept in the
+/// record store.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TierCopyCosts {
     pub blocks: u32,
     /// The probe's copy on a list's whole grid.
     pub whole_seconds: f64,
+    /// The share of the device's time a copy on the transfer queue takes
+    /// from work queued beside it, for as long as the copy runs: `1 −
+    /// alone / beside` of the probe's work submitted back to back.
+    pub stall_share: f64,
+}
+
+/// Whether the stall probe's queued work runs alone or beside a copy on
+/// the transfer queue.
+#[derive(Clone, Copy)]
+enum Beside {
+    Alone,
+    Copy,
+}
+
+impl Beside {
+    fn point(self) -> u64 {
+        match self {
+            Self::Alone => 0,
+            Self::Copy => 1,
+        }
+    }
+
+    /// The [`TierCopyPoint`] of the stall probe's work run `self`.
+    fn named(self) -> TierCopyPoint {
+        match self {
+            Self::Alone => TierCopyPoint::StallAlone,
+            Self::Copy => TierCopyPoint::StallBesideCopy,
+        }
+    }
 }
 
 /// The schema of the points a tool may measure in a load's own process,
-/// the tier copy's and the convert's, a term of their keys: 2, each taken
-/// with the load's traffic held and drained
+/// the tier copy's, its stall's and the convert's, a term of their keys:
+/// 2, each taken with the load's traffic held and drained
 /// (`ExecutorDomain::hold_expert_traffic`); a record of an earlier schema
 /// may have been taken beside the load's copies and reads, so none is read
 /// and each is measured again.
@@ -855,14 +891,36 @@ const SCHEMA: (&str, u64) = ("schema", 2);
 /// the link's time to copy them (2.8 ms at 12 GB/s).
 pub const TIER_COPY_PROBE: (u64, u64) = (32, 1 << 20);
 
-/// Why a tier copy's blocks could not be had; each point is named by its
-/// blocks.
+/// A point of [`TierCopyCosts`]: the probe's copy on `blocks`, or the
+/// stall probe's work, alone or beside a copy on the transfer queue.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TierCopyPoint {
+    Copy { blocks: u32 },
+    StallAlone,
+    StallBesideCopy,
+}
+
+impl fmt::Display for TierCopyPoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Copy { blocks } => write!(formatter, "a tier copy on {blocks} blocks"),
+            Self::StallAlone => formatter.write_str("the stall probe's work alone"),
+            Self::StallBesideCopy => formatter.write_str("the stall probe's work beside a transfer-queue copy"),
+        }
+    }
+}
+
+/// Why a tier copy's costs could not be had, each point named
+/// ([`TierCopyPoint`]).
 #[derive(Clone, Debug, PartialEq)]
 pub enum TierCopyError {
     Executor(ExecutorCostsError),
     Store(StoreError),
-    Unrecorded { blocks: u32 },
-    Unobtainable { blocks: u32, reason: Reason },
+    Unrecorded { point: TierCopyPoint },
+    Unobtainable { point: TierCopyPoint, reason: Reason },
+    /// The stall probe's work ran faster beside a copy than alone, beyond
+    /// both timings' intervals: a bad measurement, never a stall of zero.
+    FasterBeside { alone: f64, beside: f64 },
 }
 
 impl fmt::Display for TierCopyError {
@@ -870,8 +928,12 @@ impl fmt::Display for TierCopyError {
         match self {
             Self::Executor(error) => write!(formatter, "{error}"),
             Self::Store(error) => write!(formatter, "a tier copy record: {error}"),
-            Self::Unrecorded { blocks } => write!(formatter, "no record of a tier copy on {blocks} blocks"),
-            Self::Unobtainable { blocks, reason } => write!(formatter, "a tier copy on {blocks} blocks is unobtainable: {reason}"),
+            Self::Unrecorded { point } => write!(formatter, "no record of {point}"),
+            Self::Unobtainable { point, reason } => write!(formatter, "{point} is unobtainable: {reason}"),
+            Self::FasterBeside { alone, beside } => write!(
+                formatter,
+                "the stall probe ran faster beside a copy ({beside:e} s) than alone ({alone:e} s), beyond both intervals: a bad measurement"
+            ),
         }
     }
 }
@@ -909,26 +971,50 @@ impl TierCopyCosts {
         })
     }
 
-    /// The blocks on `executor` that `store`'s records give, measuring and
+    /// The stall probe's key: the probe's records copied within device
+    /// memory on a list's whole grid, each run its own submission, `beside`.
+    fn stall_key(identity: &seismic::Identity, backend: seismic::BackendName, beside: Beside) -> Result<PointKey, ExecutorCostsError> {
+        let (records, bytes) = TIER_COPY_PROBE;
+        Ok(PointKey {
+            executor: identity.clone(),
+            kernels: vec![Self::formation().identity(backend)?],
+            configuration: named(&[("copy_stall", 1), ("records", records), ("bytes", bytes), SCHEMA]),
+            point: named(&[("beside_copy", beside.point())]),
+        })
+    }
+
+    /// The costs on `executor` that `store`'s records give, measuring and
     /// forming nothing; why there are none: a load copies on a list's whole
     /// grid until the job has measured them.
     pub fn stored(topology: &DeviceTopology, executor: &Executor, store: &dyn RecordStore<PointKey>) -> Result<Self, TierCopyError> {
         let (backend, identity) = (executor.backend(), executor_identity(topology, executor)?);
         let grid = magnitude_kernels::LIST_BLOCKS;
-        let [one, whole] = [1, grid].map(|blocks| {
-            let key = Self::key(&identity, backend, blocks)?;
-            let timing = match store.load(&key)? {
-                Some(Record::Measured(timing)) => timing,
-                Some(Record::Unobtainable { reason }) => return Err(TierCopyError::Unobtainable { blocks, reason }),
-                None => return Err(TierCopyError::Unrecorded { blocks }),
-            };
-            Ok(timing.median)
-        });
+        let timing = |key: PointKey, point: TierCopyPoint| match store.load(&key)? {
+            Some(Record::Measured(timing)) => Ok(timing),
+            Some(Record::Unobtainable { reason }) => Err(TierCopyError::Unobtainable { point, reason }),
+            None => Err(TierCopyError::Unrecorded { point }),
+        };
+        let median = |key: PointKey, point: TierCopyPoint| timing(key, point).map(|timing| timing.median);
+        let [one, whole] = [1, grid].map(|blocks| median(Self::key(&identity, backend, blocks)?, TierCopyPoint::Copy { blocks }));
         let [one, whole] = [one?, whole?];
         // A block's rate against the link's, `R_link / r_block`, is the one
         // block's time over the whole grid's.
         let blocks = (one / whole).ceil().clamp(1., f64::from(grid)) as u32;
-        Ok(Self { blocks, whole_seconds: whole })
+        let [alone, beside] = [Beside::Alone, Beside::Copy].map(|beside| timing(Self::stall_key(&identity, backend, beside)?, beside.named()));
+        let (alone, beside) = (alone?, beside?);
+        // The work beside a copy takes at least its time alone. Faster beside
+        // it within the timings' intervals, a copy stalls nothing the probe
+        // resolves; faster beyond them, the measurement is bad.
+        let stall_share = match beside.median >= alone.median {
+            true => 1. - alone.median / beside.median,
+            false => match (alone.interval, beside.interval) {
+                (Some((alone_low, _)), Some((_, beside_high))) if beside_high < alone_low => {
+                    return Err(TierCopyError::FasterBeside { alone: alone.median, beside: beside.median });
+                }
+                _ => 0.,
+            },
+        };
+        Ok(Self { blocks, whole_seconds: whole, stall_share })
     }
 
     /// The link's ceiling, a byte's seconds: the whole grid's copy from
@@ -942,7 +1028,9 @@ impl TierCopyCosts {
     /// Measure the copy in the measurement job (`walks`), on a device with
     /// host storage it reads in place (a linked host tier's): on one block
     /// and on a list's whole grid, the kernel formed with the first
-    /// attempted.
+    /// attempted; then the stall probe's work alone and beside a copy the
+    /// transfer queue runs throughout ([`Self::stall_share`]). Why the
+    /// device has no transfer queue fails it.
     pub(super) fn measure(walks: &mut Walks<'_, '_>) -> Result<(), ExecutorCostsError> {
         let device = walks.device();
         let formed = OnceCell::<Result<NativeKernel<routed_copy::Entry>, ExecutorCostsError>>::new();
@@ -954,17 +1042,110 @@ impl TierCopyCosts {
                     .get_or_init(|| Self::formation().form(device, None))
                     .as_ref()
                     .map_err(|error| Unformed::Never(error.clone()))?;
-                tier_copy_point(device, kernel, blocks).map_err(Unformed::Now)
+                tier_copy_point(device, kernel, blocks, Source::Host).map_err(Unformed::Now)
             });
+        }
+        // The device's work queued alone, then beside a copy the transfer
+        // queue runs throughout its timing.
+        let error = failed("the stall probe's copy");
+        let transfer = seismic::Transfer::new(device).map_err(|cause| error(&cause))?;
+        let (records, bytes) = TIER_COPY_PROBE;
+        let shape = [records, 1, bytes];
+        let copied = Tensor::shared(device, Element::bool(), &shape).map_err(|cause| error(&cause))?;
+        let into = Tensor::zeros(device, Element::bool(), &shape).map_err(|cause| error(&cause))?;
+        for beside in [Beside::Alone, Beside::Copy] {
+            let key = Self::stall_key(&walks.identity(), device.backend(), beside)?;
+            let formed = &formed;
+            let point = move || {
+                let kernel = formed
+                    .get_or_init(|| Self::formation().form(device, None))
+                    .as_ref()
+                    .map_err(|error| Unformed::Never(error.clone()))?;
+                tier_copy_point(device, kernel, magnitude_kernels::LIST_BLOCKS, Source::Device).map_err(Unformed::Now)
+            };
+            // Timed with no compile beside it; beside a copy, its record kept
+            // only where the copy ran throughout ([`Copying`]).
+            let store = walks.store();
+            match beside {
+                Beside::Alone => walks.time_in(key, true, store, point),
+                Beside::Copy => {
+                    let copying = Copying::start(&transfer, &copied, &into, store);
+                    walks.time_in(key, true, &copying, point);
+                    copying.stop().map_err(|cause| error(&cause))?;
+                }
+            }
         }
         Ok(())
     }
+
+    /// The device time a copy taking `time` on the transfer queue takes
+    /// from the work beside it ([`Self::stall_share`]), in `time`'s unit.
+    pub fn stall(&self, time: f64) -> f64 {
+        time * self.stall_share
+    }
+}
+
+/// A copy the transfer queue runs, batch after batch, from host memory into
+/// device memory until stopped: what a promotion is to the device's work
+/// beside it. As the store of a point timed beside it, it stops before the
+/// point's record is kept, and keeps none where it failed: the point was
+/// not timed beside a copy throughout.
+struct Copying<'s> {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<Result<(), String>>>>,
+    store: &'s dyn RecordStore<PointKey>,
+}
+
+impl<'s> Copying<'s> {
+    fn start(transfer: &seismic::Transfer, copied: &Tensor, into: &Tensor, store: &'s dyn RecordStore<PointKey>) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (transfer, copied, into, stopping) = (transfer.clone(), copied.clone(), into.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
+            while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                let run = seismic::TransferRun { source: &copied, source_offset: 0, destination: &into, destination_offset: 0, bytes: copied.byte_len() };
+                let value = transfer.copy(&[seismic::TransferItem::Run(run)]).map_err(|error| error.to_string())?;
+                while !transfer.wait(value, std::time::Duration::from_secs(1)).map_err(|error| error.to_string())? {}
+            }
+            Ok(())
+        });
+        Self { stop, thread: std::sync::Mutex::new(Some(thread)), store }
+    }
+
+    /// Stop after the batch running: why it failed, if it did and no stop
+    /// before told it.
+    fn stop(&self) -> Result<(), String> {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        match self.thread.lock().expect("the copier").take() {
+            Some(thread) => thread.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            None => Ok(()),
+        }
+    }
+}
+
+impl RecordStore<PointKey> for Copying<'_> {
+    fn load(&self, key: &PointKey) -> Result<Option<Record>, StoreError> {
+        self.store.load(key)
+    }
+
+    fn store(&self, key: &PointKey, record: &Record) -> Result<(), StoreError> {
+        self.stop().map_err(|cause| StoreError(format!("the copy beside the point failed: {cause}")))?;
+        self.store.store(key, record)
+    }
+}
+
+/// Where a copy point's records lie: in host memory the device reads in
+/// place over the link (a tier copy), or in device memory (the stall
+/// probe's work, which loads no link).
+#[derive(Clone, Copy)]
+enum Source {
+    Host,
+    Device,
 }
 
 /// A copy of [`TIER_COPY_PROBE`]'s records from host-shared memory, read in
 /// place over the link as a tier's records are, into device memory on
 /// `blocks` blocks, its list staged in device memory as the copy reads it.
-fn tier_copy_point(device: &Device, kernel: &NativeKernel<routed_copy::Entry>, blocks: u32) -> Result<Point, ExecutorCostsError> {
+fn tier_copy_point(device: &Device, kernel: &NativeKernel<routed_copy::Entry>, blocks: u32, source: Source) -> Result<Point, ExecutorCostsError> {
     let error = failed("tier copy point");
     let (records, bytes) = TIER_COPY_PROBE;
     let byte = Element::bool();
@@ -981,8 +1162,12 @@ fn tier_copy_point(device: &Device, kernel: &NativeKernel<routed_copy::Entry>, b
     }
     let i32_bytes = |values: &[i32]| values.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
     let tensors = [
-        // Host memory the device reads in place over the link, as a tier's.
-        Tensor::shared(device, byte, &shape).map_err(|cause| error(&cause))?,
+        match source {
+            // Host memory the device reads in place over the link, as a tier's.
+            Source::Host => Tensor::shared(device, byte, &shape),
+            Source::Device => Tensor::zeros(device, byte, &shape),
+        }
+        .map_err(|cause| error(&cause))?,
         Tensor::from_host(device, Element::i32(), &[words], &i32_bytes(&list)).map_err(|cause| error(&cause))?,
         Tensor::from_host(device, Element::i32(), &[constants::STEP_WORDS], &i32_bytes(&[sequence, 0])).map_err(|cause| error(&cause))?,
         Tensor::zeros(device, byte, &shape).map_err(|cause| error(&cause))?,
@@ -1013,7 +1198,13 @@ fn tier_copy_point(device: &Device, kernel: &NativeKernel<routed_copy::Entry>, b
     for (port, tensor) in ports.iter().zip(&tensors) {
         bindings.set(port, tensor).map_err(|cause| error(&cause))?;
     }
-    plan.point(bindings, GraphTiming::Device).map(Point::Graph).map_err(|cause| error(&cause))
+    // The stall probe's runs are submitted back to back, each its own
+    // submission, as a step's are: a copy beside them delays each.
+    let timing = match source {
+        Source::Host => GraphTiming::Device,
+        Source::Device => GraphTiming::Queued,
+    };
+    plan.point(bindings, timing).map(Point::Graph).map_err(|cause| error(&cause))
 }
 
 /// The value `store` records measured at `key`, none while unrecorded. The
@@ -1474,23 +1665,30 @@ mod tests {
     /// A tier copy's points give the link's peak, what a discrete prefill's
     /// bar prices its copies by: a copy from pinned host memory on every
     /// block, near the link's own rate, far above a route's kernel rate. A
-    /// CUDA host's measurement, run on one by name with `--ignored`.
+    /// CUDA or Vulkan host's measurement, run on one by name with `--ignored`.
     #[test]
     #[ignore]
     fn a_tier_copy_reads_the_links_ceiling() {
-        let device = seismic::Devices::discover(&[])
-            .expect("devices are discovered")
-            .open_backend(seismic::BackendName::Cuda)
-            .expect("a CUDA device opens");
-        let store = seismic::measure::HeldStore::default();
-        let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let requests = [super::super::requests::PointRequest::TierCopy];
-        super::super::requests::measure(&mut measurer, &device, &store, &requests, deadline, &mut |_| Attempt::Proceed, &mut |_, _| ()).unwrap();
-        let costs = TierCopyCosts::stored(device.topology(), device.info(), &store).unwrap();
-        let rate = 1. / costs.link_byte_seconds();
-        eprintln!("link ceiling {:.2} GB/s on {} blocks", rate / 1e9, costs.blocks);
-        assert!(rate > 5e9, "{rate} bytes a second");
+        let devices = seismic::Devices::discover(&[]).expect("devices are discovered");
+        let backends = [seismic::BackendName::Cuda, seismic::BackendName::Vulkan]
+            .into_iter()
+            .filter(|&backend| crate::test_support::available(&devices, backend))
+            .collect::<Vec<_>>();
+        assert!(!backends.is_empty(), "the host has a CUDA or Vulkan executor");
+        for backend in backends {
+            let device = devices
+                .open_backend(backend)
+                .unwrap_or_else(|error| panic!("an available {backend:?} executor opens: {error}"));
+            let store = seismic::measure::HeldStore::default();
+            let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let requests = [super::super::requests::PointRequest::TierCopy];
+            super::super::requests::measure(&mut measurer, &device, &store, &requests, deadline, &mut |_| Attempt::Proceed, &mut |_, _| ()).unwrap();
+            let costs = TierCopyCosts::stored(device.topology(), device.info(), &store).unwrap();
+            let rate = 1. / costs.link_byte_seconds();
+            eprintln!("{backend:?}: link ceiling {:.2} GB/s on {} blocks, a copy stalls {:.0}% of the work beside it", rate / 1e9, costs.blocks, costs.stall_share * 100.);
+            assert!(rate > 5e9, "{backend:?}: {rate} bytes a second");
+        }
     }
 
     /// A site's pool and lines measured at a form of no model are read as

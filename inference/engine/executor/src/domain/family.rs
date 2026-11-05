@@ -72,8 +72,9 @@ pub trait ElasticBank {
     /// where the executor's costs do not price them: what the route's
     /// policy words are written from (`ExpertLines::policy`).
     fn price(&self, lines: Option<std::sync::Arc<[crate::assessment::ExpertLines]>>, pass: Option<crate::assessment::ExpertPass>);
-    /// A tier copy takes `blocks` from now on.
-    fn tier_copy_blocks(&self, blocks: u32) -> Result<(), super::DomainError>;
+    /// A tier copy costs `costs` from now on: the blocks it takes, and
+    /// the price a promotion's copy is weighed at.
+    fn tier_copy(&self, costs: &crate::assessment::TierCopyCosts) -> Result<(), super::DomainError>;
     /// End its growths (the experts', the host tier's and its backing at
     /// open) at their next slot: a measurement's claim beside the load
     /// stops them, as its hold would leave their slots waiting on the

@@ -182,6 +182,12 @@ pub(super) struct Shared {
     /// GPU's (`Shared::price`), which the route's policy words are written
     /// from between flights; none before.
     priced: Mutex<Option<Arc<[ExpertLines]>>>,
+    /// The promotions asked since the load, the directory's count
+    /// (`Directory::asked`) as residency last published it.
+    promoted: std::sync::atomic::AtomicU64,
+    /// What a copy over the link costs, once measured
+    /// (`assessment::TierCopyCosts`): what a promotion's copy is priced at.
+    copy: Mutex<Option<crate::assessment::TierCopyCosts>>,
     /// The lender's lent bank records' reservation, beside a host tier
     /// (`lent`).
     lent: lent::LentRecords,
@@ -322,6 +328,16 @@ impl Shared {
         self.priced.lock().expect("the priced lines").clone()
     }
 
+    /// A copy over the link costs `costs` from now on.
+    pub fn price_copy(&self, costs: &crate::assessment::TierCopyCosts) {
+        tracing::info!(
+            "a promotion's copy costs its link time at {:.2} GB/s, and {:.0}% of that in device time beside it",
+            1e-9 / costs.link_byte_seconds(),
+            costs.stall_share * 100.
+        );
+        *self.copy.lock().expect("a copy's price") = Some(costs.clone());
+    }
+
     /// The host tier's fill as residency last published it: filling from
     /// the bank's open until its first turn finds it filled
     /// (`Prefetch::filling`).
@@ -409,7 +425,7 @@ impl Shared {
 
     /// What steps have cost the load, the CPU site's serving among it.
     pub fn costs(&self) -> ExpertCosts {
-        self.telemetry.costs(self.compute.site_served())
+        self.telemetry.costs(self.compute.site_served(), self.promoted.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Whether no step runs: a gap between flights, where residency may be
@@ -641,6 +657,8 @@ impl Watcher {
             parks,
             landings: Default::default(),
             priced: Mutex::new(None),
+            promoted: Default::default(),
+            copy: Mutex::new(None),
             lent: lent::LentRecords::new(),
             filled: std::sync::atomic::AtomicBool::new(false),
             passes: Mutex::new(None),
@@ -663,6 +681,7 @@ impl Watcher {
             asked: None,
             opened: Instant::now(),
             complete: false,
+            site_opened: shared.compute.site_served().terms.iter().sum(),
         };
         residency.publish_held();
         residency.publish_policy();

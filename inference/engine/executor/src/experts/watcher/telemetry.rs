@@ -127,6 +127,8 @@ pub struct ExpertCosts {
     pub completed: Option<(u64, StepCost)>,
     /// The latest prompt group served.
     pub group: Option<GroupCost>,
+    /// The promotions asked since the load.
+    pub promoted: u64,
     /// The bank's shape: the slots each layer commits, each group's records
     /// its experts are held in (`Core::bank_records`), each streamed
     /// layer's group, and a layer's experts.
@@ -943,7 +945,7 @@ impl Telemetry {
     }
 
     /// The costs so far, beside what the CPU site's requests took, `site`.
-    pub(super) fn costs(&self, site: crate::experts::site::SiteServed) -> ExpertCosts {
+    pub(super) fn costs(&self, site: crate::experts::site::SiteServed, promoted: u64) -> ExpertCosts {
         let recorded = self.lock();
         let costs = &recorded.costs;
         ExpertCosts {
@@ -954,6 +956,7 @@ impl Telemetry {
             hints: costs.hints,
             completed: costs.completed.clone(),
             group: costs.group.as_ref().map(|counted| counted.cost.clone()),
+            promoted,
             slots: self.slots(),
             records: recorded.records.clone(),
             layer_groups: self.routing.maps.iter().map(|(group, _)| *group).collect(),

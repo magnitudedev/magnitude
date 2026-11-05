@@ -492,8 +492,9 @@ impl ElasticBank for ServedBank {
         self.bank.watcher.shared().wait_traffic_quiet().map_err(DomainError::invariant)
     }
 
-    fn tier_copy_blocks(&self, blocks: u32) -> Result<(), DomainError> {
-        self.bank.tier_copy_blocks(blocks).map_err(DomainError::invariant)
+    fn tier_copy(&self, costs: &crate::assessment::TierCopyCosts) -> Result<(), DomainError> {
+        self.bank.watcher.shared().price_copy(costs);
+        self.bank.tier_copy_blocks(costs.blocks).map_err(DomainError::invariant)
     }
 
     fn device_convert(&self, lines: &[crate::assessment::RecordLine]) {
