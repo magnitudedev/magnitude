@@ -204,25 +204,24 @@ pub(super) fn sample() -> Result<HostSample, ObservationError> {
         limit_visibility,
         kernel_pressure: None,
         held: None,
-        // The swap in use, and what zswap saves of the pages it holds
-        // (`Zswapped` uncompressed, `Zswap` compressed, where the kernel
-        // has it).
         displaced_bytes: Some(displaced_bytes(&meminfo)?),
     })
 }
 
+/// The RAM programs' swapped-out data would take, less the RAM zswap holds
+/// it in: each swapped page counted once. A page swapped out holds a swap
+/// slot whether zswap keeps it compressed in RAM or it went to the device,
+/// so the swap in use already counts zswap's pages (`Zswapped`), and less
+/// the swap cache's, which are in RAM as themselves too.
 fn displaced_bytes(meminfo: &str) -> Result<u64, ObservationError> {
     let field = |name| {
         kib_field(meminfo, name)
             .ok_or_else(|| ObservationError::Failed(format!("/proc/meminfo has no {name}")))
     };
     let swapped = field("SwapTotal:")?.saturating_sub(field("SwapFree:")?);
-    let zswap_saved = kib_field(meminfo, "Zswapped:")
-        .zip(kib_field(meminfo, "Zswap:"))
-        .map_or(0, |(uncompressed, compressed)| {
-            uncompressed.saturating_sub(compressed)
-        });
-    Ok(swapped + zswap_saved)
+    // `Zswap` only where the kernel has zswap.
+    let zswap = kib_field(meminfo, "Zswap:").unwrap_or(0);
+    Ok(swapped.saturating_sub(field("SwapCached:")?).saturating_sub(zswap))
 }
 
 /// Linux counts no displacement here: `MemAvailable` is the kernel's
@@ -697,6 +696,18 @@ fn unescape(field: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each swapped page is displaced once: zswap's pages and the swap
+    /// cache's hold swap slots too, so only zswap's compressed RAM comes
+    /// off the swap in use, and the swap cache's pages, in RAM as
+    /// themselves.
+    #[test]
+    fn each_swapped_page_is_displaced_once() {
+        let meminfo = "SwapCached:      100 kB\nSwapTotal:     10000 kB\nSwapFree:       6000 kB\nZswap:           500 kB\nZswapped:       2000 kB\n";
+        assert_eq!(displaced_bytes(meminfo).unwrap(), (4000 - 100 - 500) * 1024);
+        let without_zswap = "SwapCached:        0 kB\nSwapTotal:     10000 kB\nSwapFree:       6000 kB\n";
+        assert_eq!(displaced_bytes(without_zswap).unwrap(), 4000 * 1024);
+    }
 
     /// A fixture filesystem root holding `/proc/self/{cgroup,mountinfo}` and
     /// cgroup files, removed on drop.

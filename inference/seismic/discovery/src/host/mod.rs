@@ -305,8 +305,8 @@ pub struct HostStatus {
     /// counts ([`HostHeld`]). `None` on a platform that counts none.
     pub held: Option<HostHeld>,
     /// RAM the OS made free by displacing programs' data that is displaced
-    /// still: the swap in use, and what the compressor saves of the data it
-    /// holds. `allocatable` counts this RAM as free, though it is free only
+    /// still, each displaced page counted once: what the data would take
+    /// in RAM as itself, less what it takes there compressed. `allocatable` counts this RAM as free, though it is free only
     /// while that data stays out. `None` on a platform that counts none.
     pub displaced_bytes: Option<u64>,
 }

@@ -148,16 +148,15 @@ fn kernel_pressure() -> Result<KernelPressure, ObservationError> {
     }
 }
 
-/// The swap in use (`vm.swapusage`'s `xsw_used`: a `struct xsw_usage` of
-/// total, available and used bytes, then the page size and whether it is
-/// encrypted).
-fn swap_used() -> Result<u64, ObservationError> {
-    let name = "vm.swapusage";
-    let bytes = sysctl_bytes(name).map_err(ObservationError::Failed)?;
-    let used = bytes.get(16..24).ok_or_else(|| {
-        ObservationError::Failed(format!("sysctl {name} returned {} bytes", bytes.len()))
-    })?;
-    Ok(u64::from_ne_bytes(used.try_into().expect("eight bytes")))
+/// Every page of programs' data the compressor holds, in RAM or swapped out
+/// (`vm.compressor_segment_pages_compressed`). Mach's
+/// `total_uncompressed_pages_in_compressor` is no such count: macOS 15
+/// keeps swapped segments in it, macOS 27 counts only the segments in RAM.
+fn compressed_pages() -> Result<u64, ObservationError> {
+    let name = "vm.compressor_segment_pages_compressed";
+    Ok(u64::from(u32::from_ne_bytes(
+        sysctl_exact(name).map_err(ObservationError::Failed)?,
+    )))
 }
 
 /// One Mach `HOST_VM_INFO64` reading, and the page size it counts in.
@@ -243,7 +242,7 @@ pub(super) fn sample_of(reading: &VmReading) -> Result<HostSample, ObservationEr
         .and_then(|pages| pages.checked_add(u64::from(statistics.inactive_count)))
         .and_then(|pages| pages.checked_mul(reading.page_size))
         .ok_or_else(|| ObservationError::Failed("Mach obtainable overflow".into()))?;
-    let swap = swap_used()?;
+    let compressed = compressed_pages()?;
     Ok(HostSample {
         allocatable: Reported::new(allocatable, ReportedBy::MachAllocatablePages),
         obtainable: Reported::new(obtainable, ReportedBy::MachMovablePages),
@@ -254,14 +253,16 @@ pub(super) fn sample_of(reading: &VmReading) -> Result<HostSample, ObservationEr
             wired_bytes: pages_bytes(reading, statistics.wire_count, "wired")?,
             compressed_bytes: pages_bytes(reading, statistics.compressor_page_count, "compressor")?,
         }),
-        // The pages the compressor's data would take uncompressed, less those
-        // it occupies, and the swap in use.
+        // The RAM the compressor's data would take as itself, less the RAM
+        // it occupies: what the OS freed by compressing it and swapping it
+        // out, once. macOS swaps only compressed segments, so the swap in
+        // use is already in it; added again, every byte swapped out under
+        // held pressure would read as two displaced and one freed, and the
+        // room would fall as fast as the host swaps, whatever is released.
         displaced_bytes: Some(
-            statistics
-                .total_uncompressed_pages_in_compressor
+            compressed
                 .saturating_sub(u64::from(statistics.compressor_page_count))
                 .checked_mul(reading.page_size)
-                .and_then(|saved| saved.checked_add(swap))
                 .ok_or_else(|| ObservationError::Failed("Mach displaced bytes overflow".into()))?,
         ),
     })
