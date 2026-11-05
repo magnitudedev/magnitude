@@ -692,9 +692,19 @@ impl ElasticBank for ServedBank {
         self.storage(holding)
     }
 
-    /// A table grows on the domain's thread at once: only the records' growth runs on.
+    /// The records' growth backs as it runs; a table grows on the domain's
+    /// thread at once, all it grew backed while its outcome waits for the
+    /// next advance to report it.
     fn growth_backed(&self, tier: crate::planning::BankTier) -> Result<u64, DomainError> {
-        self.bank.growth_backed(tier)
+        let mut backed = self.bank.growth_backed(tier)?;
+        for resized in self.finished.lock().expect("table resize outcome").iter() {
+            if let BankResized::Grown { holding: holding @ BankHolding::Table { .. }, grown, .. } = resized {
+                if self.storage(*holding)? == tier {
+                    backed += grown;
+                }
+            }
+        }
+        Ok(backed)
     }
 
     /// The records' resize advances at every boundary (a shrink's install
