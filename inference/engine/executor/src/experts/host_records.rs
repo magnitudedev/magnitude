@@ -254,6 +254,10 @@ pub(super) struct HostRecords {
     claimed: usize,
     /// How the steps resolving the records' map see an unmapping.
     resolution: Resolution,
+    /// The device is past every point before this ([`Self::passed`]), none
+    /// before the first retirement: an answer of a request before it is
+    /// consumed, so no record is its outstanding answer.
+    progress: Option<Point>,
     /// The bottom records the conveyor's lending reserves for it (none but
     /// of its lender, `planning::Lender`), which no other claim takes.
     lent: u32,
@@ -284,6 +288,7 @@ impl HostRecords {
             alone: vec![0; layers],
             claimed: 0,
             resolution,
+            progress: None,
             lent,
             maps,
         };
@@ -503,7 +508,23 @@ impl HostRecords {
             Host::Answering(whole, answering) => (whole, answering.max(past)),
             other => panic!("host record {record} answers a request, holding {other:?}"),
         };
-        self.set(record, Host::Answering(whole, past));
+        self.set(record, self.answering(whole, Some(past)));
+    }
+
+    /// Record content `whole`, the answer of the request at `past` if it
+    /// is one: its outstanding answer while the device may still read it,
+    /// else kept. The one place a record becomes an outstanding answer, so
+    /// none is one of a request the device is known past, whichever is
+    /// learned first: the device passing it ([`Self::passed`]) or its
+    /// landing ending ([`Self::landed`]). A step whose wait expired ends
+    /// past its request while the request's landing is in flight; on an
+    /// idle load that landing's end is the last event, so it must not
+    /// leave its record in flight, where a shrink would wait on it.
+    fn answering(&self, whole: Whole, past: Option<Point>) -> Host {
+        match past.filter(|&past| self.progress.is_none_or(|progress| past >= progress)) {
+            Some(past) => Host::Answering(whole, past),
+            None => Host::Kept(whole),
+        }
     }
 
     /// The group's experts no record keeps and no landing is taken for:
@@ -586,7 +607,7 @@ impl HostRecords {
         };
         assert_eq!(landing, staged, "{staged:?} lands into the record taken for it");
         let whole = Whole { staged, kept, read, holds: 0 };
-        self.set(record, answer.map_or(Host::Kept(whole), |past| Host::Answering(whole, past)));
+        self.set(record, self.answering(whole, answer));
     }
 
     /// Ready record `record` already holds `staged` whole (a bank imported
@@ -716,6 +737,7 @@ impl HostRecords {
     /// begun behind it, and the read ahead it is kept for finds it. True
     /// when any became ready.
     pub fn release(&mut self, (parked, steps): (Point, u64), read: impl Fn(u32) -> bool) -> bool {
+        self.passed(parked);
         let resolution = self.resolution;
         self.free(|tier, record, staged, _, answer| {
             if read(record) || answer.is_some_and(|answer| answer >= parked) {
@@ -733,16 +755,22 @@ impl HostRecords {
     /// ([`Resolution::bound`]) is before it, and every outstanding answer of
     /// a request before it consumed, kept. True when any became ready.
     pub fn retire(&mut self, progress: Point) -> bool {
+        self.passed(progress);
+        let resolution = self.resolution;
+        self.free(|_, _, _, grace, answer| resolution.bound(grace, progress) < progress && answer.is_none_or(|answer| answer < progress))
+    }
+
+    /// The device is past every point before `progress`: every outstanding
+    /// answer of a request before it is consumed, kept, and so is every
+    /// answer a landing ends with later ([`Self::answering`]).
+    fn passed(&mut self, progress: Point) {
+        self.progress = Some(self.progress.map_or(progress, |known| known.max(progress)));
         for record in self.answering.clone() {
             let Host::Answering(whole, past) = self.records[record as usize] else {
                 unreachable!("an answering record is listed answering");
             };
-            if past < progress {
-                self.set(record, Host::Kept(whole));
-            }
+            self.set(record, self.answering(whole, Some(past)));
         }
-        let resolution = self.resolution;
-        self.free(|_, _, _, grace, answer| resolution.bound(grace, progress) < progress && answer.is_none_or(|answer| answer < progress))
     }
 
     /// Every graced record `past` its grace (the records, the record, the
@@ -1388,6 +1416,20 @@ mod tests {
         assert!(!tier.retire(request), "the device at the request still reads it");
         assert!(tier.retire(at(6)), "past the request it is free");
         assert!(matches!(tier.claim_demand((0, 2), &rank, |_| false, (at(6), 1)), Claim::Taken(_)), "then a later demand takes it");
+    }
+
+    /// A demand landing that ends once the device is past its request (its
+    /// step ended with its wait expired) answers nothing: kept, not an
+    /// outstanding answer, so nothing holds it in flight for a shrink.
+    #[test]
+    fn a_landing_past_its_request_is_kept_not_answering() {
+        let mut tier = tier(2, 1, ONE, Resolution::AfterStore);
+        let Claim::Taken(grant) = tier.claim_demand((0, 1), reads(&[]), |_| false, (at(5), 1)) else { panic!("ready") };
+        assert_eq!(tier.shrink_floor(), 1, "the landing is in flight");
+        tier.retire(at(6));
+        tier.landed(grant.record(), (0, 1), Some(5), Kept::Alone);
+        assert!(matches!(tier.records[0], Host::Kept(_)), "kept: the device is past its request");
+        assert_eq!(tier.shrink_floor(), 0, "nothing in flight");
     }
 
     impl HostRecords {

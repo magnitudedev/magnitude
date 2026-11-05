@@ -230,6 +230,41 @@ fn a_host_shrink_right_after_a_growth_answers_beside_its_landings() {
     assert_eq!(harness.watcher.shared().life.ended(), None, "the watcher serves on");
 }
 
+/// A host tier's shrink on an idle load answers at once beside a demand
+/// landing whose step has ended: the step's wait gave up on the read
+/// queued behind others and the step ended, so the device is past the
+/// request, and no step follows; the read then lands, kept rather than
+/// its request's outstanding answer, so nothing is in flight and the
+/// shrink cuts at its deepest candidate.
+#[test]
+fn a_host_shrink_on_an_idle_load_answers_beside_a_landing_its_step_passed() {
+    let _alone = alone();
+    let harness = layered("shrink-idle", EXPERTS, 4, 1, 4);
+    for expert in 0..3 {
+        harness.request(&[expert]).complete().unwrap();
+    }
+    harness.tier_ready();
+    let ahead = Ahead::queue("shrink-idle-ahead", 16);
+    let floor = || residency::lock(&harness.watcher.state).core.directory.host_floor(0);
+    let served = || harness.watcher.shared().costs().layers[0].unanticipated;
+    let before = served();
+    let step = harness.step();
+    assert!(harness.ask_at(&step, 0, &[5]));
+    eventually("the demand never took a record", || floor() != 0);
+    eventually("the request was never served", || served() > before);
+    harness.layer.1.answer(step.sequence(), 0, true);
+    drop(step);
+    ahead.finish();
+    eventually("the landing never ended in its record", || harness.in_tier(0, 5) == Some(3));
+    eventually("the landing past its request was left in flight", || floor() == 0);
+    let shared = harness.watcher.shared().clone();
+    let candidates = Candidates { shallowest: 6, deepest: 1, records: Box::new(|slots| vec![slots]) };
+    let cut = shared.shrink_tier(candidates).expect("the shrink is served").expect("the cut answers, not deferred");
+    assert_eq!(cut.slots, 1, "the deepest candidate");
+    assert_eq!(residency::lock(&harness.watcher.state).core.directory.host(0).records(), 1);
+    assert_eq!(harness.watcher.shared().life.ended(), None, "the watcher serves on");
+}
+
 /// A filled tier whose growth is decided fills again from that decision,
 /// through every slot that joins and the fill of each, until the growth
 /// ends: its slots joining one by one never leave it filled between them.
