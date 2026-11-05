@@ -1672,6 +1672,52 @@ pub mod tensor {
             Ok(region)
         }
 
+        /// Records `start..end` of this view (its leading-axis rows, where
+        /// [`Self::record_placement`] lays them) as a region of their own:
+        /// the view a [`Self::region`] of its storage at the first of them
+        /// forms, which pins a reservation's backed bytes only through the
+        /// last of them, where any view derived from this one pins what this
+        /// one does. So a holder of a few records of a reserved tensor never
+        /// holds a recommit above them.
+        pub fn record_region(&self, start: u64, end: u64) -> Result<Self, TensorError> {
+            let placement = self
+                .record_placement()
+                .ok_or(TensorError::Region(RegionError::Unrecorded { offset: self.byte_offset }))?;
+            if self.slabs.is_some()
+                || layout::canonical(self.representation, &self.extents)?.strides != self.strides
+            {
+                return Err(TensorError::Region(RegionError::NotContiguous));
+            }
+            let extent = self.extents[0];
+            if start >= end || end > extent {
+                return Err(TensorError::SliceOutOfBounds { extent, start, end });
+            }
+            let extents = std::iter::once(end - start)
+                .chain(self.extents[1..].iter().copied())
+                .collect::<Vec<_>>();
+            let layout = layout::canonical(self.representation, &extents)?;
+            let pin = match self.allocation.reservation() {
+                Some(_) => Some(Arc::new(self.allocation.pin(placement.end(end)).ok_or(
+                    TensorError::Region(RegionError::Unbacked {
+                        end: placement.end(end),
+                        bytes: self.allocation.bytes(),
+                    }),
+                )?)),
+                None => None,
+            };
+            let mut region = Self::new_view(
+                self.device.clone(),
+                self.allocation.clone(),
+                placement.at(start),
+                layout.byte_len,
+                self.representation,
+                extents,
+                layout.strides,
+            );
+            region.pin = pin;
+            Ok(region)
+        }
+
         pub fn device_address(&self) -> u64 {
             self.device.allocation_address(&self.allocation, self.byte_offset)
         }

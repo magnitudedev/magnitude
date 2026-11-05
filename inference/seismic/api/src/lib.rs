@@ -1240,6 +1240,14 @@ impl Tensor {
             })
     }
 
+    /// Records `start..end` of this tensor as a region of their own, which
+    /// pins a reservation's backed bytes only through the last of them
+    /// (`TensorInner::record_region`): what a holder of a few records keeps,
+    /// so it never holds a recommit above them.
+    pub fn record_region(&self, start: u64, end: u64) -> Result<Tensor, TensorError> {
+        self.inner.record_region(start, end).map(|inner| Tensor { inner: Arc::new(inner) })
+    }
+
     /// Where this canonical tensor's records (leading-axis rows) lie:
     /// packed from its first byte on chunked reserved storage
     /// (`seismic_topology::Packing`), otherwise one after another. None for

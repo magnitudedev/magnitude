@@ -218,13 +218,28 @@ impl TierTensor {
         Ok(Self { records, conversion: Conversion::Rows { conversion, rows, k } })
     }
 
+    /// Its record `record` alone, which a landing into it writes: held as
+    /// records of their own (`Records::range`), so a landing in flight holds
+    /// the tensor's storage only through the record it lands in, which a
+    /// shrink keeps in place (`HostRecords::shrink`).
+    pub fn landed(&self, record: u32) -> LandedRecord {
+        let record = u64::from(record);
+        let records = self.records.range(record, record + 1).expect("a committed tier record is records of its own");
+        LandedRecord(Self { records, conversion: self.conversion })
+    }
+}
+
+/// The one tier record of a tensor a landing writes ([`TierTensor::landed`]).
+pub(in crate::experts) struct LandedRecord(TierTensor);
+
+impl LandedRecord {
     /// The pieces converting a stored record into a tier record: (stored
     /// bytes, tier record bytes) of each, every one disjoint from the
     /// others, together covering the record. As stored, one piece; by a
     /// row conversion, pieces of whole stored tiles of at most
     /// [`CONVERSION_PIECE`] source bytes.
     fn pieces(&self, stored: u64) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
-        match self.conversion {
+        match self.0.conversion {
             Conversion::Stored => {
                 let bytes = usize::try_from(stored).expect("a stored record the host addresses");
                 vec![(0..bytes, 0..bytes)]
@@ -238,20 +253,20 @@ impl TierTensor {
         }
     }
 
-    /// Convert piece `(from, to)` of stored record `stored` into tier
-    /// record `record`.
+    /// Convert piece `(from, to)` of stored record `stored` into the
+    /// record.
     ///
     /// # Safety
     ///
-    /// No read lands in `stored` and no device work reads or writes tier
-    /// record `record` until its landing ends, and no other piece of it
-    /// writes `to`.
-    unsafe fn convert(&self, stored: &[u8], record: u32, (from, to): (std::ops::Range<usize>, std::ops::Range<usize>)) {
+    /// No read lands in `stored` and no device work reads or writes the
+    /// record until its landing ends, and no other piece of it writes `to`.
+    unsafe fn convert(&self, stored: &[u8], (from, to): (std::ops::Range<usize>, std::ops::Range<usize>)) {
+        let LandedRecord(TierTensor { records, conversion }) = self;
         // SAFETY: the caller's; the pieces' ranges are disjoint, so this one
         // alone writes `to`.
-        assert!(to.end as u64 <= self.records.bytes(), "a piece past its tier record");
-        let into = unsafe { std::slice::from_raw_parts_mut(self.records.address(u64::from(record)).as_ptr().add(to.start), to.len()) };
-        match self.conversion {
+        assert!(to.end as u64 <= records.bytes(), "a piece past its tier record");
+        let into = unsafe { std::slice::from_raw_parts_mut(records.address(0).as_ptr().add(to.start), to.len()) };
+        match *conversion {
             Conversion::Stored => into.copy_from_slice(&stored[from]),
             Conversion::Rows { conversion, k, .. } => {
                 conversion.piece(k, &stored[from], into).expect("a tier tensor's pieces convert")
@@ -262,13 +277,14 @@ impl TierTensor {
 
 /// One expert's landing, its claim's `grant` (its expert and tier record):
 /// from each routed tensor's staging record (its records, the record and
-/// its stored bytes) into the grant's tier record of the tensor, then
+/// its stored bytes) into the grant's tier record of the tensor (that
+/// record alone, [`TierTensor::landed`]), then
 /// mapped by the grant ([`Converting`], [`Grant::map`]), from step `from`
 /// where the landing is a parked step's (the first step that has not
 /// resolved the layer, which the device cannot pass before the landing
 /// answers), else from the first step not yet begun.
 pub(in crate::experts) struct Landing {
-    pub tensors: Vec<(Records, u64, u64, TierTensor)>,
+    pub tensors: Vec<(Records, u64, u64, LandedRecord)>,
     pub grant: Grant,
     pub from: Option<Step>,
 }
@@ -471,7 +487,7 @@ impl super::compute::Job for Converting {
         // its range.
         let started = std::time::Instant::now();
         self.began.get_or_init(|| started);
-        unsafe { tier.convert(staging.record(*staged, *bytes), self.landing.record(), piece) };
+        unsafe { tier.convert(staging.record(*staged, *bytes), piece) };
         LandingAccount::add(&self.worked, started.elapsed());
     }
 

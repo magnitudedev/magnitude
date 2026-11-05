@@ -128,14 +128,13 @@ fn a_groups_places_are_served_from_the_words_handed_over_between_flights() {
     assert_eq!(read(1, 6), Some(last), "the group's reads, read from the new words");
 }
 
-/// A host tier shrinks only once every prompt group the device is past has
-/// cleared, returning the records it claimed: a group whose step ended while
-/// its conveyor's reads were still queued (behind other demand reads) holds
-/// its lender's records until those reads end, and the shrink, asked
-/// between flights meanwhile, waits for them rather than finding a claimed
-/// record.
+/// A host tier's shrink keeps the records a prompt group the device is past
+/// still holds claimed in place: a group whose step ended while its
+/// conveyor's reads were still queued (behind other demand reads) holds its
+/// lender's records until those reads end, and the shrink, asked between
+/// flights meanwhile, answers without waiting for them.
 #[test]
-fn a_host_shrink_waits_for_a_past_prompt_group_to_clear() {
+fn a_host_shrink_answers_beside_a_past_prompt_group_still_clearing() {
     let _alone = alone();
     let harness = hosted_prompted("shrink-clearing", 12, 1, 16);
     let ahead = Ahead::queue("shrink-clearing-ahead", 384);
@@ -144,10 +143,47 @@ fn a_host_shrink_waits_for_a_past_prompt_group_to_clear() {
     std::thread::sleep(Duration::from_millis(50));
     drop(step);
     let shared = harness.watcher.shared().clone();
-    let views = harness.host.views(12);
-    let shrink = std::thread::spawn(move || shared.shrink_host(vec![12], vec![views], super::Keeping::Host));
+    let shrink = std::thread::spawn(move || shared.shrink_tier(Candidates::one(12, vec![12])));
+    eventually("the shrink waited for the group to clear", || shrink.is_finished());
+    shrink.join().unwrap().expect("the shrink is served");
     ahead.finish();
-    shrink.join().unwrap().expect("the shrink ends once the group cleared");
+    assert_eq!(harness.watcher.shared().life.ended(), None, "the watcher serves on");
+}
+
+/// A host tier's shrink asked with a landing in flight answers at once,
+/// cut at the deepest of its candidates that keeps the landing's record: a
+/// demand read queued behind others has taken a record below the three
+/// earlier misses landed in, so a shrink toward one record cuts just above
+/// it, and the read ends into that record once the reads ahead do.
+#[test]
+fn a_host_shrink_asked_with_a_landing_in_flight_answers_at_once() {
+    let _alone = alone();
+    let harness = layered("shrink-landing", EXPERTS, 4, 1, 4);
+    for expert in 0..3 {
+        harness.request(&[expert]).complete().unwrap();
+    }
+    harness.tier_ready();
+    let ahead = Ahead::queue("shrink-landing-ahead", 16);
+    let served = || harness.watcher.shared().costs().layers[0].unanticipated;
+    let before = served();
+    let step = harness.step();
+    assert!(harness.ask_at(&step, 0, &[5]));
+    eventually("the request was never served", || served() > before);
+    harness.layer.1.answer(step.sequence(), 0, true);
+    drop(step);
+    let floor = residency::lock(&harness.watcher.state).core.directory.host_floor(0);
+    assert!((2..7).contains(&floor), "the landing's record, {}, lies below the tier's top", floor - 1);
+    let shared = harness.watcher.shared().clone();
+    let candidates = Candidates { shallowest: 6, deepest: 1, records: Box::new(|slots| vec![slots]) };
+    let shrink = std::thread::spawn(move || shared.shrink_tier(candidates));
+    eventually("the shrink waited for the landing", || shrink.is_finished());
+    let cut = shrink.join().unwrap().expect("the shrink is served").expect("a cut keeps the landing");
+    assert_eq!(cut.slots, floor as usize, "the deepest cut above the landing");
+    assert_eq!(residency::lock(&harness.watcher.state).core.directory.host(0).records(), floor);
+    ahead.finish();
+    eventually("the landing never ended in the record kept for it", || {
+        residency::lock(&harness.watcher.state).core.directory.host_floor(0) < floor
+    });
     assert_eq!(harness.watcher.shared().life.ended(), None, "the watcher serves on");
 }
 

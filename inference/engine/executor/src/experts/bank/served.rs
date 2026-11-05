@@ -7,7 +7,7 @@ use crate::CompletionWake;
 use std::time::{Duration, Instant};
 use crate::native::BankMoves;
 use std::sync::{Arc, Mutex};
-use super::resize::LandedShrink;
+use super::resize::{LandedShrink, Shrinking};
 
 /// A load's expert bank as the domain resizes it (`ElasticBank`): the bank,
 /// each group's record moves' kernels, and the stored tables it holds
@@ -37,6 +37,13 @@ pub(super) struct Step {
     pub(super) to: u64,
     pub(super) bytes: u64,
     pub(super) saves: Option<f64>,
+}
+
+/// A shrink of `holding` deferred to the next boundary: every cut from
+/// `shallowest` to `deepest` slots falls below a record in flight.
+fn in_flight(holding: BankHolding, (shallowest, deepest): (u64, u64)) -> BankStep {
+    tracing::info!(?holding, shallowest, deepest, "a shrink waits a boundary: each of its cuts falls below a record in flight");
+    BankStep::Deferred
 }
 
 /// What holding `to` rather than `from` saves a step of the decode `record`
@@ -303,13 +310,16 @@ impl ServedBank {
         Ok(shrunk(self.shrink_steps(resident)?, deficit))
     }
 
-    /// Shrink the host tier to `to` host slots now, between flights, decided
-    /// at `decided` and queued `queued`: the shrink the next advance reports,
-    /// `wake` completed at once.
-    fn shrink_host(&self, to: u64, decided: Instant, queued: Duration, wake: CompletionWake) -> Result<BankStep, DomainError> {
+    /// Shrink the host tier now, between flights, to the deepest of `cuts`
+    /// (its shallowest and deepest host slots) that keeps every record in
+    /// flight, decided at `decided` and queued `queued`: the shrink the next
+    /// advance reports, `wake` completed at once.
+    fn shrink_host(&self, cuts: (u64, u64), decided: Instant, queued: Duration, wake: CompletionWake) -> Result<BankStep, DomainError> {
         let holding = BankHolding::Host;
-        let Some(LandedShrink { from, to: at, before, after }) = self.bank.shrink_host(to)? else {
-            return Ok(BankStep::Running);
+        let LandedShrink { from, to: at, before, after } = match self.bank.shrink_host(cuts)? {
+            Shrinking::Begun(shrunk) => shrunk,
+            Shrinking::Running => return Ok(BankStep::Running),
+            Shrinking::Deferred => return Ok(in_flight(holding, cuts)),
         };
         let done = Instant::now();
         let times = ResizeTimes {
@@ -602,14 +612,15 @@ impl ElasticBank for ServedBank {
             }
             (BankHolding::Experts, Placer::Bank) => {
                 let target = self.store_target(from, (shallowest, deepest), self.move_budget(resident, moves)?);
-                match self.bank.shrink_store(&self.moves, target, decided, queued, wake)? {
-                    true => Ok(BankStep::Begun(kind)),
-                    false => Ok(BankStep::Running),
+                match self.bank.shrink_store(&self.moves, (shallowest, target), decided, queued, wake)? {
+                    Shrinking::Begun(()) => Ok(BankStep::Begun(kind)),
+                    Shrinking::Running => Ok(BankStep::Running),
+                    Shrinking::Deferred => Ok(in_flight(holding, (shallowest, target))),
                 }
             }
             (BankHolding::Host, _) => {
                 let target = self.host_target(from, deepest, resident)?;
-                self.shrink_host(target, decided, queued, wake)
+                self.shrink_host((shallowest, target), decided, queued, wake)
             }
             (BankHolding::Table { table: index }, _) => self.resize_table(index, deepest, decided, queued, wake),
         }

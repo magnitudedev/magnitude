@@ -823,22 +823,40 @@ impl HostRecords {
         }
     }
 
-    /// Shrink to `records` records between flights, no landing in flight
-    /// and no step running (so no graced record is read): it drops the empty
-    /// records first, then the kept first in taking order at `rank`, keeping
-    /// the most valuable, and each kept one at or past `records` moves to a
-    /// record below it that the rest leave, mapped there from the first
-    /// step not yet begun, each dropped one unmapped. The moves, (from, to),
-    /// whose bytes the caller copies before any step reads them.
+    /// Whether record `record` is in flight, which a shrink keeps where it
+    /// is, never dropping it, moving it or moving another into it
+    /// ([`Self::shrink`]): a landing writes it, a copy reads it, a request's
+    /// answer is outstanding at it, or a prompt group holds it. A shrink
+    /// may change every other record: ready, graced, or kept and unheld.
+    fn in_flight(&self, record: u32) -> bool {
+        match self.records[record as usize] {
+            Host::Ready | Host::Graced { .. } | Host::Kept(Whole { holds: 0, .. }) => false,
+            Host::Landing { .. } | Host::Kept(_) | Host::Answering(..) | Host::Claimed => true,
+        }
+    }
+
+    /// The fewest records a shrink may leave ([`Self::shrink`]): every
+    /// record in flight lies below them, and the conveyor's lent records.
+    pub fn shrink_floor(&self) -> u32 {
+        let flying = (0..self.records()).rev().find(|&record| self.in_flight(record));
+        flying.map_or(self.lent, |record| self.lent.max(record + 1))
+    }
+
+    /// Shrink to `records` records, at least [`Self::shrink_floor`], between
+    /// flights (no step runs, so no graced record is read): every record in
+    /// flight stays where it is, landing, held or claimed as it was; of the
+    /// rest it drops the empty records first, then the kept first in taking
+    /// order at `rank`, keeping the most valuable, and each kept one at or
+    /// past `records` moves to a record below it that the rest leave,
+    /// mapped there from the first step not yet begun, each dropped one
+    /// unmapped. The moves, (from, to), whose bytes the caller copies before
+    /// any step reads them.
     pub fn shrink(&mut self, records: u32, rank: impl Rank) -> Vec<(u32, u32)> {
         let count = self.records();
         assert!(records <= count, "a host tier of {count} records shrinks to {records}");
-        assert!(self.landing.is_empty(), "a host tier shrinks with no landing in flight");
-        assert!((0..count).all(|record| self.unheld(record)), "a host tier shrinks with no copy holding a record");
-        assert!(self.claimed == 0, "a host tier shrinks with no prompt group holding a record");
-        assert!(records >= self.lent, "a host tier shrinks past the conveyor's lent records");
-        assert!(self.answering.is_empty(), "a host tier shrinks with no request's answer outstanding");
-        let order = self.taking_order(&rank, false, |_| true);
+        let floor = self.shrink_floor();
+        assert!(records >= floor, "a host tier shrinks to {records} records, below its floor of {floor}");
+        let order = self.taking_order(&rank, false, |record| !self.in_flight(record));
         // Between flights no step reads a graced record: every one is empty.
         for record in self.graced.clone() {
             self.set(record, Host::Ready);
@@ -1300,6 +1318,39 @@ mod tests {
         assert_eq!(tier.alone(), [1]);
         tier.grow(3);
         assert_eq!(tier.take((0, 13), 0), Some(2), "the grown record is ready");
+    }
+
+    /// A shrink keeps every record in flight where it is, below its floor:
+    /// a landing's record and one a copy holds are never dropped, moved or
+    /// moved into. The rest shrink around them, and the landing lands where
+    /// its claim took it.
+    #[test]
+    fn a_host_tier_shrinks_around_its_records_in_flight() {
+        let rank = reads(&[((0, 9), 8), ((0, 10), 6)]);
+        let (mut tier, maps) = mapped(6, 1, ONE, Resolution::AfterStore);
+        let grants = [9, 10, 11, 12, 13].map(|expert| tier.grant_of((0, expert), 0).unwrap());
+        assert_eq!(grants.each_ref().map(Grant::record), [5, 4, 3, 2, 1]);
+        for (grant, expert) in grants.iter().zip([9, 10, 11, 12, 13]) {
+            if expert != 12 {
+                grant.map(None);
+                tier.landed(grant.record(), (0, expert), None, Kept::Alone);
+            }
+        }
+        // Expert 12 lands into record 2, in flight; a copy holds expert
+        // 11's record 3.
+        assert_eq!(tier.hold((0, 11)), Some(3));
+        assert_eq!(tier.shrink_floor(), 4, "every record in flight lies below the floor");
+        // Record 0 (empty), then record 1 (expert 13, never read) are
+        // dropped: record 4 (step 6) moves into record 0, record 5 (step 8)
+        // into record 1.
+        assert_eq!(tier.shrink(4, &rank), [(4, 0), (5, 1)]);
+        assert_eq!([9, 10, 11, 13].map(|expert| maps.held((0, expert))), [Some(1), Some(0), Some(3), None]);
+        assert!(tier.lands((0, 12)), "the landing is in flight where it was");
+        grants[3].map(None);
+        tier.landed(2, (0, 12), None, Kept::Alone);
+        tier.unhold(3);
+        assert_eq!(maps.held((0, 12)), Some(2));
+        assert_eq!(tier.shrink_floor(), 0, "nothing in flight");
     }
 
     /// The interleaving of `a_parked_requests_answered_record_is_never_taken_by_its_other_miss`

@@ -313,8 +313,9 @@ pub enum BankStep {
     /// Another resize of the store this one is of runs: this one waits for it.
     Running,
     /// A step still runs once the queue is drained, so there is no gap to
-    /// ask the watcher in: nothing began, and the next boundary decides
-    /// again.
+    /// ask the watcher in, or every cut of the records the host lands into
+    /// falls below a record in flight, which it keeps in place: nothing
+    /// began, and the next boundary decides again.
     Deferred,
     /// The bank is at its floor (a shrink) or holds every expert (a growth).
     AtLimit,

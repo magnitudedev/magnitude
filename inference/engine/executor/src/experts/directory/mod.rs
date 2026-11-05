@@ -986,8 +986,15 @@ impl Directory {
         }
     }
 
-    /// Shrink group `group`'s host tier to `records` records, between
-    /// flights with no placement pending and no landing in flight
+    /// The fewest records group `group`'s host tier may shrink to: every
+    /// record in flight lies below them ([`HostRecords::shrink_floor`]).
+    pub fn host_floor(&self, group: usize) -> u32 {
+        self.host[group].shrink_floor()
+    }
+
+    /// Shrink group `group`'s host tier to `records` records, at least its
+    /// floor ([`Self::host_floor`]), between flights with no placement
+    /// pending, every record in flight kept in place
     /// ([`HostRecords::shrink`]): the moves whose bytes the caller copies.
     /// The ranking's shares shrink too where the tier is the one store.
     pub fn shrink_host(&mut self, group: usize, records: u32) -> Vec<(HostRecord, HostRecord)> {

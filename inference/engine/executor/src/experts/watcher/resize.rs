@@ -1,6 +1,8 @@
-//! The bank's resizes. A shrink runs between flights: the owner asks,
+//! The bank's resizes. A shrink runs between flights: the owner asks, and
 //! residency answers once nothing moves a record (its turns wait on the
-//! load's events, never on a time). It is planned with its evictions published at once
+//! load's events, never on a time), or at once for a shrink of the records
+//! the host lands into, which keeps every record in flight where it is. A
+//! bank's shrink is planned with its evictions published at once
 //! (always safe: the bank only loses experts), and answered with a plan the
 //! owner commits once its moves are queued on the device ahead of every
 //! later step, or drops. A growth asks nothing: each of its slots joins as
@@ -78,10 +80,9 @@ impl MoveBudget {
     }
 }
 
-/// A shrink's candidate commitments: from `shallowest` slots (one fewer
-/// than held) down to `deepest` (the shrink's target), each group's records
-/// at a candidate's slots formed by `records` only for the candidates the
-/// pacing prices.
+/// A shrink's candidate commitments: from `shallowest` slots down to
+/// `deepest` (the shrink's target), each group's records at a candidate's
+/// slots formed by `records` only for the candidates the watcher weighs.
 pub(crate) struct Candidates {
     pub shallowest: usize,
     pub deepest: usize,
@@ -116,11 +117,11 @@ pub(super) enum Ask {
     Shrink { candidates: Candidates, budget: Option<MoveBudget> },
     /// Take a planned shrink's moves, which the device carries.
     Commit(ShrinkPlan),
-    /// Shrink each group's host tier to `records`, its kept experts moved
-    /// below them first within the records its tier tensors address, by
-    /// `keeping`, which then address `views` (each group's record tensors'
-    /// records committed after it).
-    ShrinkHost { records: Vec<u32>, views: Vec<Vec<Records>>, keeping: Keeping },
+    /// Shrink each group's records the host lands into at the deepest of
+    /// `candidates` that keeps every record in flight, its kept experts
+    /// moved below the cut by `keeping`; its tier tensors then address the
+    /// records below the cut alone.
+    ShrinkHost { candidates: Candidates, keeping: Keeping },
     /// Serve the places the bank holds from now by their words.
     Place(PlacedWords),
 }
@@ -200,18 +201,44 @@ impl Joins {
     }
 }
 
+impl Ask {
+    /// Whether it is served only once nothing moves a record: every resize
+    /// but a shrink of the records the host lands into, which keeps each
+    /// record in flight where it is (`HostRecords::shrink`), so it is served
+    /// as it is asked.
+    fn waits(&self) -> bool {
+        !matches!(self, Self::ShrinkHost { .. })
+    }
+}
+
 enum Answer {
     Planned(ShrinkPlan),
     Done(Trip),
-    /// A shrink of the records the host lands into, whose kept records the
-    /// device moves (`Keeping::Device`).
-    Kept(Trip, KeptMoves),
+    /// A shrink of the records the host lands into: cut, none where even
+    /// its shallowest candidate cuts below a record in flight, or refused.
+    Cut(Result<Option<Cut>, String>),
+}
+
+/// Where a shrink of the records the host lands into cut them: the slots it
+/// commits them to, and its trip through the watcher.
+pub(crate) struct HostCut {
+    pub slots: usize,
+    pub trip: Trip,
+}
+
+/// A shrink of the records the host lands into, cut, by its [`Keeping`].
+enum Cut {
+    /// Its kept records' bytes copied on the host.
+    Copied(HostCut),
+    /// Each group's moves of its kept records, (from, to), for the device
+    /// to carry.
+    Kept(HostCut, KeptMoves),
 }
 
 /// Who moves the kept experts of a shrink of the records the host lands
-/// into ([`Shared::shrink_host`]) below its new records.
+/// into below its cut.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Keeping {
+pub(super) enum Keeping {
     /// The host copies them before it answers: a host tier, in host RAM,
     /// which no device work reaches.
     Host,
@@ -296,7 +323,7 @@ impl Shared {
     pub fn plan_shrink(&self, candidates: Candidates, budget: Option<MoveBudget>) -> Result<ShrinkPlan, String> {
         match self.ask(Ask::Shrink { candidates, budget })? {
             Answer::Planned(plan) => Ok(plan),
-            Answer::Done(_) | Answer::Kept(..) => unreachable!("a shrink is answered with its plan"),
+            Answer::Done(_) | Answer::Cut(_) => unreachable!("a shrink is answered with its plan"),
         }
     }
 
@@ -306,7 +333,7 @@ impl Shared {
     pub fn commit_shrink(&self, plan: ShrinkPlan) -> Result<Trip, String> {
         match self.ask(Ask::Commit(plan))? {
             Answer::Done(trip) => Ok(trip),
-            Answer::Planned(_) | Answer::Kept(..) => unreachable!("a commit is answered done"),
+            Answer::Planned(_) | Answer::Cut(_) => unreachable!("a commit is answered done"),
         }
     }
 
@@ -322,21 +349,47 @@ impl Shared {
         self.events().notify();
     }
 
-    /// Each group's records, a host tier's or the one store's, number
-    /// `records` from now, at most as many as before, between flights. It
-    /// retires every step and waits for the reads in flight to land, so
-    /// every record is free (no step reads one and no landing writes one),
-    /// and keeps each group's most valuable records (`HostRecords::shrink`)
-    /// below its new records, which address `views` from then on: the
-    /// watcher holds no view of a released record once it answers. Kept
-    /// on the host (`Keeping::Host`), their bytes are copied before it
-    /// answers; on the device (`Keeping::Device`), it answers the moves the
-    /// caller queues before the rest are released.
-    pub(in crate::experts) fn shrink_host(&self, records: Vec<u32>, views: Vec<Vec<Records>>, keeping: Keeping) -> Result<(Trip, KeptMoves), String> {
-        match self.ask(Ask::ShrinkHost { records, views, keeping })? {
-            Answer::Done(trip) => Ok((trip, KeptMoves::new())),
-            Answer::Kept(trip, moves) => Ok((trip, moves)),
-            Answer::Planned(_) => unreachable!("a shrink of kept records is answered done or with its moves"),
+    /// Shrink each group's host tier, between flights, at the deepest of
+    /// `candidates` whose cut keeps every record in flight below it
+    /// ([`Self::cut_host`]), its kept records' bytes copied below the cut
+    /// before it answers. None where every candidate cuts below a record in
+    /// flight.
+    pub(in crate::experts) fn shrink_tier(&self, candidates: Candidates) -> Result<Option<HostCut>, String> {
+        match self.cut_host(candidates, Keeping::Host)? {
+            Some(Cut::Copied(cut)) => Ok(Some(cut)),
+            None => Ok(None),
+            Some(Cut::Kept(..)) => unreachable!("a host tier's shrink is copied on the host"),
+        }
+    }
+
+    /// Shrink the one store (where the host places), between flights, at
+    /// the deepest of `candidates` whose cut keeps every record in flight
+    /// below it ([`Self::cut_host`]): answered with each group's moves of
+    /// its kept records, which the device carries (`Keeping::Device`). None
+    /// where every candidate cuts below a record in flight.
+    pub(in crate::experts) fn shrink_store(&self, candidates: Candidates) -> Result<Option<(HostCut, KeptMoves)>, String> {
+        match self.cut_host(candidates, Keeping::Device)? {
+            Some(Cut::Kept(cut, moves)) => Ok(Some((cut, moves))),
+            None => Ok(None),
+            Some(Cut::Copied(_)) => unreachable!("the one store's shrink is moved on the device"),
+        }
+    }
+
+    /// Each group's records, a host tier's or the one store's, cut between
+    /// flights at the deepest of `candidates` whose cut lies at or above its
+    /// floor (`Directory::host_floor`): every step retired, it is served as
+    /// asked, with no wait for the reads, landings, copies or prompt groups
+    /// in flight, whose records the shrink keeps where they are
+    /// (`HostRecords::shrink`), each group's most valuable other records
+    /// kept below the cut. Its tier tensors then address the records below
+    /// the cut alone, and each landing in flight holds only its own record
+    /// (`TierTensor::landed`), so no view the watcher made holds a released
+    /// record once it answers. None where even the shallowest candidate
+    /// cuts below a record in flight: nothing changes.
+    fn cut_host(&self, candidates: Candidates, keeping: Keeping) -> Result<Option<Cut>, String> {
+        match self.ask(Ask::ShrinkHost { candidates, keeping })? {
+            Answer::Cut(cut) => cut,
+            Answer::Planned(_) | Answer::Done(_) => unreachable!("a shrink of the records the host lands into is answered by its cut"),
         }
     }
 
@@ -434,15 +487,16 @@ impl Residency {
         count > 0
     }
 
-    /// Serve `asked` and answer once nothing moves a record: between
-    /// flights every step has ended, so the frontier is past the last
-    /// flight; its steps retire, the promotions in flight end (each copy's
-    /// completion an event), then the reads in flight land (each landing's
-    /// end an event): no copy and no landing writes a record while a resize
-    /// moves them, and a prompt group the device is past clears, returning
-    /// the records it claimed. Meanwhile nothing new is promoted or read ahead
-    /// (`Residency::tend`). The ask, while it waits; none once answered, or
-    /// once serving ended (whose end wakes the owner).
+    /// Serve `asked`: between flights every step has ended, so the frontier
+    /// is past the last flight, and its steps retire. A resize that waits
+    /// ([`Ask::waits`]) is answered only once nothing moves a record: the
+    /// promotions in flight end (each copy's completion an event), then the
+    /// reads in flight land (each landing's end an event), so no copy and no
+    /// landing writes a record while a resize moves them, and a prompt
+    /// group the device is past clears, returning the records it claimed;
+    /// meanwhile nothing new is promoted or read ahead (`Residency::tend`).
+    /// The ask, while it waits; none once answered, or once serving ended
+    /// (whose end wakes the owner).
     pub(super) fn resize(&mut self, asked: Asked, copier: Option<&super::promotions::Copier>) -> Option<Asked> {
         // Every slot a growth joined before the ask is the directory's.
         self.join();
@@ -454,14 +508,16 @@ impl Residency {
         if self.shared.life.ended().is_some() {
             return None;
         }
-        if self.core.directory.moving() || self.prefetch.outstanding() {
-            return Some(asked);
-        }
-        // A prompt group the device is past holds its records claimed until
-        // its conveyor clears (its landings from the conveyor end, each an
-        // event): a resize moves no record a group still holds.
-        if self.scratch.clearing() && !self.scratch.clear_past(&mut self.core, &mut self.prefetch) {
-            return Some(asked);
+        if asked.ask.waits() {
+            if self.core.directory.moving() || self.prefetch.outstanding() {
+                return Some(asked);
+            }
+            // A prompt group the device is past holds its records claimed
+            // until its conveyor clears (its landings from the conveyor end,
+            // each an event): a resize moves no record a group still holds.
+            if self.scratch.clearing() && !self.scratch.clear_past(&mut self.core, &mut self.prefetch) {
+                return Some(asked);
+            }
         }
         let Asked { ask, at, taken } = asked;
         let trip = || Trip {
@@ -488,8 +544,8 @@ impl Residency {
         Published(())
     }
 
-    /// Serve `asked`, every step retired and the host tier's movements
-    /// drained.
+    /// Serve `asked`, every step retired, and the host's records' movements
+    /// drained where it waits for them ([`Ask::waits`]).
     fn serve_resize(&mut self, asked: Ask, trip: impl Fn() -> Trip) -> Answer {
         match asked {
             Ask::Shrink { candidates, budget } => {
@@ -522,34 +578,7 @@ impl Residency {
                 self.publish_held();
                 Answer::Done(trip())
             }
-            Ask::ShrinkHost { records, views, keeping } => {
-                let mut moved = KeptMoves::new();
-                for (group, records) in records.into_iter().enumerate() {
-                    let moves = self.core.directory.shrink_host(group, records);
-                    match keeping {
-                        Keeping::Host => {
-                            let tensors = self.core.groups[group].tier.as_ref().expect("a host tier shrinks only beside its tensors");
-                            for &(from, to) in &moves {
-                                for tensor in tensors.iter().map(|tensor| &tensor.records) {
-                                    // SAFETY: both are committed records of the
-                                    // tensor, nothing reads or writes them meanwhile
-                                    // (every step retired, between flights), and
-                                    // distinct records never overlap.
-                                    unsafe { tensor.copy_record(u64::from(to.0), tensor, u64::from(from.0), tensor.bytes()) };
-                                }
-                            }
-                        }
-                        Keeping::Device => moved.push(moves.into_iter().map(|(from, to)| (from.0, to.0)).collect()),
-                    }
-                }
-                self.address_tier(views);
-                self.shared.telemetry.resized(self.core.bank_records());
-                self.publish_held();
-                match keeping {
-                    Keeping::Host => Answer::Done(trip()),
-                    Keeping::Device => Answer::Kept(trip(), moved),
-                }
-            }
+            Ask::ShrinkHost { candidates, keeping } => Answer::Cut(self.serve_cut(&candidates, keeping, trip)),
             Ask::Place(PlacedWords { flags, layers }) => {
                 let places = flags.len();
                 self.scratch.place(flags);
@@ -557,6 +586,57 @@ impl Residency {
                 Answer::Done(trip())
             }
         }
+    }
+}
+
+impl Residency {
+    /// Cut each group's records the host lands into at the deepest of
+    /// `candidates` whose records lie at or above its floor
+    /// (`Directory::host_floor`), so every record in flight stays where it
+    /// is; none where none does. The views of the records below the cut
+    /// are formed first, so a refusal changes nothing.
+    fn serve_cut(&mut self, candidates: &Candidates, keeping: Keeping, trip: impl Fn() -> Trip) -> Result<Option<Cut>, String> {
+        let floors = (0..self.core.groups.len()).map(|group| self.core.directory.host_floor(group)).collect::<Vec<_>>();
+        let cut = (0..candidates.count()).rev().map(|index| candidates.slots(index)).find_map(|slots| {
+            let records = (candidates.records)(slots)
+                .into_iter()
+                .map(|records| u32::try_from(records).expect("the records the host lands into fit u32"))
+                .collect::<Vec<_>>();
+            let keeps = records.iter().zip(&floors).all(|(records, floor)| records >= floor);
+            keeps.then_some((slots, records))
+        });
+        let Some((slots, records)) = cut else {
+            return Ok(None);
+        };
+        let views = self.core.tier_views(&records)?;
+        let moves = records
+            .iter()
+            .enumerate()
+            .map(|(group, &records)| self.core.directory.shrink_host(group, records))
+            .collect::<Vec<_>>();
+        if keeping == Keeping::Host {
+            for (group, moves) in moves.iter().enumerate() {
+                let tensors = self.core.groups[group].tier.as_ref().expect("a host tier shrinks only beside its tensors");
+                for &(from, to) in moves {
+                    for tensor in tensors.iter().map(|tensor| &tensor.records) {
+                        // SAFETY: both are committed records of the tensor
+                        // that no landing, copy or step reaches meanwhile:
+                        // neither is in flight (`HostRecords::shrink`), and
+                        // every step retired, between flights. Distinct
+                        // records never overlap.
+                        unsafe { tensor.copy_record(u64::from(to.0), tensor, u64::from(from.0), tensor.bytes()) };
+                    }
+                }
+            }
+        }
+        self.address_tier(views);
+        self.shared.telemetry.resized(self.core.bank_records());
+        self.publish_held();
+        let cut = HostCut { slots, trip: trip() };
+        Ok(Some(match keeping {
+            Keeping::Host => Cut::Copied(cut),
+            Keeping::Device => Cut::Kept(cut, moves.into_iter().map(|moves| moves.into_iter().map(|(from, to)| (from.0, to.0)).collect()).collect()),
+        }))
     }
 }
 

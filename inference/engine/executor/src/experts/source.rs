@@ -48,6 +48,18 @@ impl Records {
         })
     }
 
+    /// Its records `start..end` as records of their own, which hold the
+    /// tensor's storage only through the last of them
+    /// (`Tensor::record_region`): a recommit of the tensor to `end` records
+    /// or more never meets them.
+    pub fn range(&self, start: u64, end: u64) -> Result<Self, String> {
+        let tensor = self
+            .tensor
+            .record_region(start, end)
+            .map_err(|error| format!("records {start}..{end} of {}: {error}", self.count))?;
+        Self::new(tensor, self.bytes(), end - start)
+    }
+
     /// The bytes of one record.
     pub fn bytes(&self) -> u64 {
         self.placement.record()

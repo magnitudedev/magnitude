@@ -47,8 +47,10 @@ pub(crate) enum Release {
     /// ([`Pending`]): nothing costlier runs before it.
     Pending(Pending),
     /// A release must wait for a gap between flights (a bank resize with a
-    /// step still running): nothing began, nothing costlier runs, and the
-    /// next boundary releases again.
+    /// step still running), or for the records in flight to land (a shrink
+    /// of the records the host lands into, every cut of which falls below
+    /// one): nothing began, nothing costlier runs, and the next boundary
+    /// releases again.
     Deferred,
     /// What is short is released already and the host has yet to show it:
     /// nothing began, nothing costlier runs, and a later reading decides

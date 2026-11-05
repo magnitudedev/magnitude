@@ -114,7 +114,7 @@ pub(in crate::experts) use self::core::{
 };
 pub(crate) use parks::{ParkKind, ParkSite, Parks};
 pub(in crate::experts) use promotions::{Copier, CopyTensor};
-pub(crate) use resize::{Candidates, Join, Keeping, MoveBudget};
+pub(crate) use resize::{Candidates, Join, MoveBudget};
 pub(crate) use steps::{ExpertStep, Recording, Step, StepFailure, StepRoute, low_word};
 pub use telemetry::{ExpertCosts, GroupCost, GroupLayer, LayerTimeline, Span, StepTimeline, LayerCost, LayerExperts, StepCost, STEP_TRACE};
 

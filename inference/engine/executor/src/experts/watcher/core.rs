@@ -335,6 +335,20 @@ impl Core {
         }
     }
 
+    /// Each group's tier tensors' first `records[group]` records, as views
+    /// of their own (`Records::range`): what they address once a shrink
+    /// cuts them there, holding no record past the cut.
+    pub(super) fn tier_views(&self, records: &[u32]) -> Result<Vec<Vec<Records>>, String> {
+        self.groups
+            .iter()
+            .zip(records)
+            .map(|(group, &records)| {
+                let tensors = group.tier.as_ref().expect("a host tier resizes only beside its tensors");
+                tensors.iter().map(|tensor| tensor.records.range(0, u64::from(records))).collect()
+            })
+            .collect()
+    }
+
     /// The landing `grant` allows (its expert into its tier record) from
     /// staging record `record` of each of its pools, mapped by the grant
     /// (`experts::landing`).
@@ -349,6 +363,7 @@ impl Core {
     pub(super) fn landing_from<'a>(&self, grant: Grant, from: impl Fn(usize) -> (&'a Records, u64)) -> Landing {
         let watched = &self.layers[grant.staged().0];
         let tensors = self.groups[watched.group].tier.as_ref().expect("a landing's group has a host tier");
+        let landed = grant.record();
         Landing {
             tensors: watched
                 .stored
@@ -356,7 +371,7 @@ impl Core {
                 .zip(tensors)
                 .map(|(stored, tensor)| {
                     let (records, record) = from(stored.pool);
-                    (records.clone(), record, stored.bytes, tensor.clone())
+                    (records.clone(), record, stored.bytes, tensor.landed(landed))
                 })
                 .collect(),
             grant,

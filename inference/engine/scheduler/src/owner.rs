@@ -717,9 +717,9 @@ struct Ladder {
     /// The releases running that a later flight boundary finishes: the
     /// ladder resumes once none is.
     pending: Pendings,
-    /// A release waits for a gap between flights (a bank shrink a step
-    /// still running deferred, `BankStep::Deferred`): the next boundary
-    /// tries it again.
+    /// A release waits for a gap between flights or for the records in
+    /// flight to land (a bank shrink deferred, `BankStep::Deferred`): the
+    /// next boundary tries it again.
     deferred: bool,
     /// The last release found what is short released already, the host yet
     /// to show it (`Release::Covered`): the next reading decides again.

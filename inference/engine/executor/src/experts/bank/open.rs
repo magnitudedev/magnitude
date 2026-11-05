@@ -235,8 +235,8 @@ fn watch(
     let PlacedWords { flags, layers: group_reads } = placed_words(plan, floor)?;
     // Each group's tier tensors, which landings convert its stored experts
     // into: each routed tensor's committed records at the load, pinned
-    // backed while the watcher holds them (a resize's views replace them,
-    // `watcher::Join`, `Shared::shrink_host`).
+    // backed while the watcher holds them (a growth's views replace them,
+    // `watcher::Join`; a shrink cuts them, `Shared::shrink_store`).
     let start = match plan.placer() {
         Placer::Tier => 0,
         Placer::Bank => plan.slots,
