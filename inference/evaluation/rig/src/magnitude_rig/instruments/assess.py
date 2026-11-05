@@ -26,6 +26,16 @@ RUNNER = (
     "paths = a['target'] + (',,' + a['drafter']['path'] if a.get('drafter') else ''); "
     "os.execv(sys.argv[2], [sys.argv[2], '--device', sys.argv[3], '--kernels', sys.argv[4], *sys.argv[5:], paths])"
 )
+
+
+def measurement(backend: str) -> Step:
+    """The product's measurement job, for its own time (the engine's `MEASUREMENT_SECONDS`), which
+    a capped load prices its lines from: a fresh checkout's cost points take 7.5 s on Metal, 9.1 s
+    on GB10 and 8.7 s on a 3090 (2026-10-28), later runs load what is stored, and whatever is still
+    not measured is shown with the answer."""
+    return Step("measure", ("{python}", "-c", RUNNER, "{artifacts}", ASSESS, backend, "{engine_cache}/kernels"))
+
+
 CATALOG = "{target}/release/examples/catalog_assessment"
 BUILDS = (ASSESS_BUILD,)
 CATALOG_BUILDS = BUILDS + (

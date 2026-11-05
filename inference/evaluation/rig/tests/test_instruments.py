@@ -14,7 +14,7 @@ import pytest
 from magnitude_rig import ab, cli, engine, selectors, store
 from magnitude_rig.build import BuildIdentity
 from magnitude_rig.host import memory
-from magnitude_rig.instruments import REGISTRY, WORKSPACE, JobResult, Measure, device
+from magnitude_rig.instruments import REGISTRY, WORKSPACE, JobResult, Measure, device, harness
 from magnitude_rig.instruments import step as step_instrument
 from magnitude_rig.instruments.resolution import median_interval
 
@@ -781,10 +781,40 @@ def test_kl_judges_a_selection_against_the_defaults_on_the_same_tokens(tmp_path)
 def test_draft_answers_the_drafters_acceptance_exactly(tmp_path):
     (tmp_path / "result.json").write_text(json.dumps({"measurements": {"drafting": {
         "proposed": 64, "accepted": 40, "tokens_per_verify": 2.25, "matched_fixture": 30, "anchors": 32}}}))
-    arguments = argparse.Namespace(model="m:v", fixture=Path("prose-repeat.jsonl"), context=4096, attribute=False)
+    arguments = argparse.Namespace(model="m:v", fixture=Path("prose-repeat.jsonl"), context=4096, attribute=False,
+                                   weight_cap=None)
     answer = REGISTRY["draft"].answer(arguments, {"draft": JobResult(tmp_path, tmp_path / "log", 0)})
     assert answer.lines[1].startswith("2.250 tokens per verification · accepted 40 of 64 proposals (62.5%)")
     assert answer.measures["tokens_per_verify"].resolution is None
+
+
+def test_draft_compares_each_streamed_load_with_the_uncapped_anchor_by_anchor(tmp_path):
+    def run(name: str, rows: list[dict]) -> JobResult:
+        directory = tmp_path / name
+        directory.mkdir()
+        (directory / "result.json").write_text(json.dumps({"measurements": {"drafting": {
+            "proposed": 4, "accepted": 2, "tokens_per_verify": 2.0, "anchors": 2}}}))
+        (directory / "draft.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+        return JobResult(directory, directory / "log", 0)
+
+    def row(anchor: int, target: list[int]) -> dict:
+        return {"fixture_id": "f", "anchor": anchor, "proposals": [1, 2], "target": target}
+
+    uncapped = [row(3, [1, 2, 9]), row(7, [1, 5, 9])]
+    arguments = argparse.Namespace(model="m:v", fixture=Path("prose-repeat.jsonl"), context=4096, attribute=False,
+                                   weight_cap=[10, 20])
+    answer = REGISTRY["draft"].answer(arguments, {
+        "draft": run("draft", uncapped),
+        harness.streamed(10): run("same", uncapped),
+        harness.streamed(20): run("other", [row(3, [1, 2, 9]), row(7, [1, 6, 9])]),
+    })
+    assert "streamed 10: same proposals and target tokens at all 2 anchors" in answer.lines
+    assert any(line.startswith("streamed 20: 1 of 2 anchors differ, first f @7") for line in answer.lines)
+    assert not answer.ok, "a cap that differs fails the answer"
+    alone = argparse.Namespace(**{**vars(arguments), "weight_cap": [10]})
+    assert REGISTRY["draft"].answer(alone, {"draft": run("draft-again", uncapped), harness.streamed(10): run("same-again", uncapped)}).ok
+    plan = REGISTRY["draft"].plan(parse("draft", *COMMON, "--model", MODEL, "--context", "4096", "--weight-cap", "10"), None, "alpha")
+    assert [name for name, _ in plan.jobs] == ["draft", "measure", harness.streamed(10)]
 
 
 def test_assess_takes_a_model_or_the_catalog():

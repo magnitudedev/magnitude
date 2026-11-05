@@ -61,8 +61,8 @@ from pathlib import Path
 from .. import store
 from ..engine import Refused, Step, Weights
 from . import Answer, Instrument, JobResult, Measure, Plan, harness, lacking, unrecorded
-from .assess import RUNNER
-from .binaries import ASSESS, ASSESS_BUILD
+from .assess import measurement
+from .binaries import ASSESS_BUILD
 from .resolution import median_interval
 
 SHOWN = 12
@@ -157,13 +157,7 @@ def jobs(arguments, prefix: str, *pinning: str) -> tuple[tuple[str, Step], ...]:
         resident, against = (), ("--resident-decode", f"{{inputs}}/{_recorded(arguments).name}")
     if not arguments.weight_cap:
         return resident
-    # The product's measurement job, for its own time (the engine's `MEASUREMENT_SECONDS`): a
-    # fresh checkout's cost points take 7.5 s on Metal, 9.1 s on GB10 and 8.7 s on a 3090
-    # (2026-10-28), later runs load what is stored, and whatever is still not measured is shown
-    # with the answer.
-    measure = Step("measure", (
-        "{python}", "-c", RUNNER, "{artifacts}", ASSESS, arguments.backend, "{engine_cache}/kernels",
-    ))  # fmt: skip
+    measure = measurement(arguments.backend)
     caps = tuple(
         (harness.streamed(cap), Step("time", time(
             arguments, family, *pinning, "--weight-cap", str(cap), *against,
