@@ -97,7 +97,7 @@ impl Profile {
     /// `tokenizer.ggml.pre` name. Profiles are container facts, never model
     /// family ownership.
     fn select(model: &str, pre: Option<&str>) -> Result<Self, UnsupportedReason> {
-        use SplitBehavior::{Isolated, MergedWithNext};
+        use SplitBehavior::Isolated;
         let byte_level = |splits, ignore_merges, add_bos| Self {
             normalization: Normalization::None,
             splits,

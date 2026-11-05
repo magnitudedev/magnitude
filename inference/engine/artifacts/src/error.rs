@@ -13,6 +13,11 @@ pub enum Error {
         types: Vec<(u32, u32)>,
         directory: Box<crate::gguf::Directory>,
     },
+    /// A read withdrawn before it started (`reader::Job::withdraw`): its
+    /// range was not read.
+    Withdrawn,
+    /// A reader thread the read needs could not start.
+    ThreadStart(io::Error),
 }
 
 impl fmt::Display for Error {
@@ -39,6 +44,8 @@ impl fmt::Display for Error {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Self::Withdrawn => f.write_str("withdrawn before it was read"),
+            Self::ThreadStart(error) => write!(f, "an artifact reader thread could not start: {error}"),
         }
     }
 }
@@ -50,7 +57,10 @@ impl Error {
         match self {
             Self::Invalid(_) | Self::Truncated { .. } => true,
             Self::Io(error) => error.kind() == io::ErrorKind::UnexpectedEof,
-            Self::AmbiguousProjectors(_) | Self::UnknownTensorTypes { .. } => false,
+            Self::AmbiguousProjectors(_)
+            | Self::UnknownTensorTypes { .. }
+            | Self::Withdrawn
+            | Self::ThreadStart(_) => false,
         }
     }
 
@@ -75,11 +85,12 @@ impl Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(error) => Some(error),
+            Self::Io(error) | Self::ThreadStart(error) => Some(error),
             Self::Invalid(_)
             | Self::Truncated { .. }
             | Self::AmbiguousProjectors(_)
-            | Self::UnknownTensorTypes { .. } => None,
+            | Self::UnknownTensorTypes { .. }
+            | Self::Withdrawn => None,
         }
     }
 }
