@@ -1,6 +1,6 @@
 use super::*;
 use super::engine::{Aligned, Buffers, Engine};
-use super::probe::{decide, grid, Point, LEAST_READ, WIDEST_WINDOW};
+use super::probe::{decide, full_rate, grid, Point, LEAST_READ, WIDEST_WINDOW};
 use super::queue::{Part, Piece, Queue, VolumeFlight};
 #[cfg(unix)]
 use super::platform::drop_pages;
@@ -679,6 +679,23 @@ fn a_withdrawn_prefetch_ends_with_what_it_had_in_flight_and_demand_lands() {
     assert!(matches!(demanded.wait(), Ended::Read { failed } if failed.is_empty()));
     assert!(demand.iter().all(|byte| *byte == 5));
     std::fs::remove_file(path).unwrap();
+}
+
+/// Demand reads hold the widest window at the full rate: past the knee a
+/// wider one costs a read alone nothing, and serving needs it (GB10's
+/// medians: 9.66 GB/s at 4 MiB, then flat through 32); a narrower window
+/// short of the rate, or a wider one slower past its noise, is not taken;
+/// of reads tied at the widest, the least.
+#[test]
+fn demand_reads_hold_the_widest_window_at_the_full_rate() {
+    let mib = 1024 * 1024;
+    let point = |read: u64, window: u64, rate: f64| Point { read, window, rate: rate * 1e9, spread: 0.05e9, cores: 1. };
+    let line = [point(LEAST_READ, 4 * mib, 9.66), point(LEAST_READ, 8 * mib, 10.09), point(LEAST_READ, 16 * mib, 10.12), point(LEAST_READ, 32 * mib, 10.10)];
+    assert_eq!(full_rate(&line).window, 32 * mib);
+    let falling = [point(LEAST_READ, 8 * mib, 10.09), point(LEAST_READ, 16 * mib, 10.12), point(LEAST_READ, 32 * mib, 9.2)];
+    assert_eq!(full_rate(&falling).window, 16 * mib);
+    let reads = [point(2 * LEAST_READ, 32 * mib, 10.1), point(LEAST_READ, 32 * mib, 10.1)];
+    assert_eq!(full_rate(&reads).read, LEAST_READ);
 }
 
 /// A request is served at the point of least `T`, priced from the

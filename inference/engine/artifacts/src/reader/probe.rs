@@ -38,9 +38,9 @@
 //! ```
 //!
 //! where `q` is the request's bytes and `λ(r)` its latency beyond its
-//! bytes, measured: one record alone in its stored ranges, split into
-//! reads of `r` issued at once to woken threads as the pool's workers are,
-//! less its bytes at the best rate. The read sizes probed run from
+//! bytes, measured: one record alone in its stored ranges, submitted to
+//! the read engine as a demand job in pieces of `r`, as a step's own reads
+//! are, less its bytes at the best rate. The read sizes probed run from
 //! [`LEAST_READ`] doubling to the least that holds a record's widest range,
 //! at most [`WIDEST_WINDOW`], past which no window holds a read.
 //! `T` prices both what a wider window costs an urgent read and what a
@@ -63,9 +63,16 @@
 //! ahead of the pieces queued: the window that bounds its wait is the bytes
 //! in flight, not the queue. So each volume has two windows. A demand piece
 //! joins the bytes in flight up to the full rate's window: the read size's
-//! narrowest within the noise of its line's best rate (GB10: 8 MiB in
-//! 128 KiB reads, 10.1 GB/s). A prompt's fill and a step's own reads are
-//! demand, and read at the full rate. Every other piece (hints, a tier's
+//! widest within the noise of its line's best rate (GB10: 32 MiB in
+//! 128 KiB reads). A prompt's fill and a step's own reads are demand, and
+//! read at the full rate. Past its line's knee a wider window costs a read
+//! alone nothing (GB10, a prompt's experts alone: 9.75 GB/s at 8 MiB, 9.79
+//! at 32), while serving lengthens each read's time in flight, so the knee
+//! measured alone falls short of the window a served prompt needs (GB10
+//! CUDA's prompt fill, beside the device's rounds: 7.07 GB/s at 8 MiB, 7.50
+//! at 32; capped 4k prefill 2160 to 2021 ms). A step's demand job waits
+//! behind that window only where it follows a prompt's fill; within a step
+//! its jobs run one at a time, each well inside it. Every other piece (hints, a tier's
 //! fill) joins only up to the urgent request's window, its point of least
 //! `T` (GB10: 4 MiB), whichever reader submits it (the volume's own bound,
 //! the narrowest window of its live urgent readers, held while each lives),
@@ -85,12 +92,17 @@
 //! and tier fill. That cost is unmeasured: no cell measured has a stored
 //! table (an n-gram model).
 //!
-//! A demand job reads in reads of its own size, the least within the noise
-//! of the size a lone record reads soonest at (GB10, 200 lone experts of
-//! three ranges each: 0.63–0.73 ms by threads at any size, 0.70–
-//! 0.96 through the engine, 128 KiB the slowest; a contiguous record 0.40,
-//! which no expert is): a lone request gains from a wider piece what a bulk
-//! read's priority grain loses, and only it pays neither's price.
+//! A demand job reads in reads of its own size, the one a lone request
+//! is served soonest at through the engine: what the job pays, its pieces'
+//! cut, wakes and copies included, which threads reading the same sizes do
+//! not show (GB10, 200 lone experts of three ranges each: 0.63–0.73 ms by
+//! threads at any size, 0.70–0.96 through the engine, 128 KiB the slowest).
+//! Sizes within each other's noise cost it the same, so no tie rule picks
+//! among them: one that took the least such size by threads' timing chose
+//! 128 KiB demand reads on Mac Metal, slower than 256 KiB through the
+//! engine (capped decode +3.4%). A lone request gains from a wider piece
+//! what a bulk read's priority grain loses, and only it pays neither's
+//! price.
 //!
 //! A reader no step waits on (a load's import: no [`Urgent`]) reads at the
 //! least read size, the pool's grain, at the full rate's window for every
@@ -112,9 +124,10 @@ use super::platform::thread_cpu_seconds;
 use super::volume::{Bound, Delivery, Volume, VolumeChoice, VolumeKey};
 #[cfg(doc)]
 use super::volume::{adopt_volume, probe_volume, read_cores};
-use super::ALIGNMENT;
+use super::{queue, Ended, Priority, Range, ALIGNMENT};
 use crate::Error;
 use std::collections::{BTreeMap, HashMap};
+use std::ptr::NonNull;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -214,7 +227,7 @@ impl VolumeLines {
 
     /// How its volume is read for `urgent`, probing through `file` the
     /// lines it needs that are not yet probed.
-    pub(super) fn choose(&mut self, file: &SourceFile, urgent: Option<&Urgent>) -> Result<VolumeChoice, Error> {
+    pub(super) fn choose(&mut self, key: VolumeKey, file: &Arc<SourceFile>, urgent: Option<&Urgent>) -> Result<VolumeChoice, Error> {
         let reads = urgent.map_or(vec![LEAST_READ], Urgent::reads);
         self.probe(file, &reads)?;
         let points = reads.iter().flat_map(|read| self.lines[read].1.iter().copied()).collect::<Vec<_>>();
@@ -223,7 +236,7 @@ impl VolumeLines {
             let chosen = full_rate(&points);
             return Ok(VolumeChoice { window: chosen.window, demand: chosen.window, read: chosen.read, demand_read: chosen.read, cores: chosen.cores });
         };
-        let seconds = lone(file, &urgent.parts, &reads)?;
+        let seconds = lone(self, key, file, &urgent.parts, &reads)?;
         let lone = reads.iter().zip(&seconds).map(|(&read, seconds)| (read, (median(seconds), median_error(seconds)))).collect::<HashMap<_, _>>();
         let chosen = decide(&points, &lone, urgent);
         let demand_read = soonest(&lone);
@@ -266,14 +279,15 @@ impl VolumeLines {
     }
 }
 
-/// Of `points`, the full rate's: the narrowest window within the noise of
-/// the best rate, then the least read.
-fn full_rate(points: &[Point]) -> Point {
+/// Of `points`, the full rate's: the widest window within the noise of the
+/// best rate, then the least read ("A volume's window": serving lengthens a
+/// read's time in flight, which only a wider window holds the rate through).
+pub(super) fn full_rate(points: &[Point]) -> Point {
     let top = points.iter().max_by(|a, b| a.rate.total_cmp(&b.rate)).expect("a probed point");
     *points
         .iter()
         .filter(|point| point.rate + point.spread + top.spread >= top.rate)
-        .min_by_key(|point| (point.window, point.read))
+        .max_by_key(|point| (point.window, std::cmp::Reverse(point.read)))
         .expect("the best is within its own noise")
 }
 
@@ -301,11 +315,14 @@ pub(super) fn decide(points: &[Point], lone: &HashMap<u64, (f64, f64)>, urgent: 
     chosen
 }
 
-/// The read size a lone record reads soonest at: the least size within the
-/// noise of the soonest, a finer grain of priority where nothing is gained.
+/// The read size a lone request is served soonest at through the engine:
+/// its least median ("A volume's window"). Sizes within each other's noise
+/// cost a request the same, so which of them it takes gains or loses
+/// nothing; a tie broken toward one size by rule instead chose one the
+/// engine pays more for (Mac Metal, 128 KiB against 256 KiB demand reads:
+/// capped decode +3.4%).
 fn soonest(lone: &HashMap<u64, (f64, f64)>) -> u64 {
-    let (&least, noise) = lone.values().map(|(median, error)| (median, *error)).min_by(|a, b| a.0.total_cmp(b.0)).expect("a probed read size");
-    let (&read, _) = lone.iter().filter(|(_, (median, error))| *median <= least + noise + error).min_by_key(|(&read, _)| read).expect("the least is within its own noise");
+    let (&read, _) = lone.iter().min_by(|a, b| a.1 .0.total_cmp(&b.1 .0)).expect("a probed read size");
     read
 }
 
@@ -400,95 +417,58 @@ fn rate(file: &SourceFile, read: u64, depth: usize) -> Result<(f64, f64), Error>
     })
 }
 
-/// Lone records of `file` in reads of each size of `reads`, each record
-/// its `parts` (bytes of each stored range, each at a random aligned offset
-/// of its own) split into reads of the size, all issued at once to threads
-/// woken for them, as the pool's workers are; in rounds of one record at
-/// each size, for [`LONE_SECONDS`]: their seconds, by size and round.
-fn lone(file: &SourceFile, parts: &[u64], reads: &[u64]) -> Result<Vec<Vec<f64>>, Error> {
-    let span = file.size.div_ceil(ALIGNMENT) * ALIGNMENT;
-    let parts = parts.iter().map(|part| part.div_ceil(ALIGNMENT).max(1) * ALIGNMENT).map(|part| part.min(span)).collect::<Vec<_>>();
-    // Each read size's reads of a record: its part, and its offset in it.
-    let split = |read: u64| {
-        parts
-            .iter()
-            .enumerate()
-            .flat_map(|(part, &bytes)| (0..bytes.div_ceil(read)).map(move |at| (part, at * read, read.min(bytes - at * read))))
-            .collect::<Vec<_>>()
-    };
-    let splits = reads.iter().map(|&read| split(read)).collect::<Vec<_>>();
-    let threads = splits.iter().map(Vec::len).max().expect("a read size");
-    let widest = splits.iter().flatten().map(|&(_, _, length)| length).max().expect("a read");
-    // The sample each thread is to read (its number, the reads of its size
-    // and each part's offset), none once the probe ends; and how many reads
-    // have ended.
-    type Sample = Option<(usize, Arc<Vec<u64>>)>;
-    let sample = (Mutex::new((0u64, None::<(usize, Arc<Vec<u64>>)>)), Condvar::new());
-    let ended = (Mutex::new(0usize), Condvar::new());
-    // The first read that failed: its thread serves on, so every sample's
-    // reads end.
-    let failed = Mutex::new(None::<Error>);
-    let (sample, ended, failed, splits) = (&sample, &ended, &failed, &splits);
-    let stop = || {
-        let mut held = sample.0.lock().expect("lone sample");
-        *held = (held.0 + 1, None);
-        drop(held);
-        sample.1.notify_all();
-    };
-    std::thread::scope(|scope| {
-        let reader = |index: usize| {
-            move || {
-                let mut buffer = Aligned::new(widest as usize);
-                let mut seen = 0;
-                loop {
-                    let (number, task): (u64, Sample) = {
-                        let held = sample.1.wait_while(sample.0.lock().expect("lone sample"), |(number, _)| *number == seen).expect("lone sample");
-                        (held.0, held.1.clone())
-                    };
-                    let Some((size, offsets)) = task else { return };
-                    seen = number;
-                    let Some(&(part, from, length)) = splits[size].get(index) else { continue };
-                    if let Err(error) = file.read_block(offsets[part] + from, &mut buffer.bytes_mut()[..length as usize]) {
-                        failed.lock().expect("lone failure").get_or_insert(error);
+/// Lone requests of `file`, each one record (its `parts`, each at a random
+/// offset of its own, unaligned at the 32-byte grain a model file stores
+/// tensors at, landing back to back in one record's sink as a bank's
+/// records do), each submitted alone to the read engine as a demand job of
+/// volume `key` read in pieces of each size of `reads`, as a step's own
+/// reads are; in rounds of one request at each size, for [`LONE_SECONDS`]:
+/// their seconds, by size and round. What a request pays is the engine's
+/// (its cut into pieces, the workers it wakes, the copy of a piece that
+/// does not land straight), not a read's alone.
+fn lone(lines: &VolumeLines, key: VolumeKey, file: &Arc<SourceFile>, parts: &[u64], reads: &[u64]) -> Result<Vec<Vec<f64>>, Error> {
+    const GRAIN: u64 = 32;
+    let record = parts.iter().sum::<u64>();
+    assert!(record + ALIGNMENT * parts.len() as u64 <= file.size, "a record of {record} bytes beyond a file of {}", file.size);
+    let mut sink = Aligned::new(record as usize);
+    // Every piece of a request at once: its window holds a record whole.
+    let volumes = reads
+        .iter()
+        .map(|&read| lines.volume(key, VolumeChoice { window: WIDEST_WINDOW, demand: WIDEST_WINDOW, read, demand_read: read, cores: 0. }))
+        .collect::<Vec<_>>();
+    super::engine::engine().deepen(volumes.iter().map(Volume::workers).max().expect("a read size"))?;
+    let outstanding = Arc::default();
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut seconds = vec![Vec::new(); reads.len()];
+    let began = Instant::now();
+    while began.elapsed().as_secs_f64() < LONE_SECONDS || seconds[0].is_empty() {
+        for (volume, times) in volumes.iter().zip(&mut seconds) {
+            let base = sink.bytes_mut().as_mut_ptr();
+            let mut at = 0;
+            let ranges = parts
+                .iter()
+                .map(|&part| {
+                    let offset = random_offset(file, &mut state, part + ALIGNMENT) + state % (ALIGNMENT / GRAIN) * GRAIN;
+                    // SAFETY: within the record's sink, `part` bytes from where the last part ended.
+                    let sink = NonNull::new(unsafe { base.add(at) }).expect("a sink");
+                    at += part as usize;
+                    Range { offset, length: part as usize, sink }
+                })
+                .collect();
+            let started = Instant::now();
+            // SAFETY: each range's sink is its own bytes of `sink`, which
+            // nothing else touches until the job, waited on here, ends.
+            let job = unsafe { queue(file, volume, &outstanding, ranges, Priority::Demand) }?;
+            match job.wait() {
+                Ended::Read { failed } => {
+                    if let Some((_, error)) = failed.first() {
+                        return Err(Error::Invalid(format!("a lone request's read: {error}")));
                     }
-                    *ended.0.lock().expect("lone reads") += 1;
-                    ended.1.notify_one();
                 }
+                Ended::Panicked(panic) => panic.resume(),
             }
-        };
-        let spawned = (0..threads)
-            .map(|index| std::thread::Builder::new().spawn_scoped(scope, reader(index)))
-            .collect::<Result<Vec<_>, _>>();
-        let spawned = spawned.map_err(|error| {
-            stop();
-            Error::ThreadStart(error)
-        })?;
-        let mut state = 0x2545_f491_4f6c_dd1du64;
-        let mut seconds = vec![Vec::new(); reads.len()];
-        let mut number = 0;
-        let began = Instant::now();
-        while began.elapsed().as_secs_f64() < LONE_SECONDS || seconds[0].is_empty() {
-            for (size, split) in splits.iter().enumerate() {
-                number += 1;
-                let offsets = Arc::new(parts.iter().map(|&part| random_offset(file, &mut state, part)).collect::<Vec<_>>());
-                *ended.0.lock().expect("lone reads") = 0;
-                let started = Instant::now();
-                *sample.0.lock().expect("lone sample") = (number, Some((size, offsets)));
-                sample.1.notify_all();
-                let mut done = ended.0.lock().expect("lone reads");
-                while *done < split.len() {
-                    done = ended.1.wait(done).expect("lone reads");
-                }
-                seconds[size].push(started.elapsed().as_secs_f64());
-            }
+            times.push(started.elapsed().as_secs_f64());
         }
-        stop();
-        for thread in spawned {
-            thread.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        }
-        if let Some(error) = failed.lock().expect("lone failure").take() {
-            return Err(error);
-        }
-        Ok(seconds)
-    })
+    }
+    Ok(seconds)
 }

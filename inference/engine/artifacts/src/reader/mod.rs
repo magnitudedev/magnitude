@@ -312,43 +312,54 @@ impl ArtifactReader {
     /// until the job has ended: its [`Job::wait`] returned, or it was
     /// dropped (which withdraws it and waits).
     pub unsafe fn submit(&self, ranges: Vec<Range>, priority: Priority) -> Result<Job, Error> {
-        let engine = engine();
-        let outside = Arc::new(Error::Invalid("read outside artifact".into()));
-        let mut failed = Vec::new();
-        let mut order = Vec::with_capacity(ranges.len());
-        for (index, range) in ranges.iter().enumerate() {
-            if range
-                .offset
-                .checked_add(range.length as u64)
-                .is_none_or(|end| end > self.file.size)
-            {
-                failed.push((index, outside.clone()));
-            } else {
-                order.push(index);
-            }
-        }
-        order.sort_by_key(|index| ranges[*index].offset);
-        let read = match priority {
-            Priority::Demand => self.volume.choice.demand_read,
-            _ => self.volume.choice.read,
-        };
-        let pieces = pieces(&ranges, &order, self.file.size, read);
-        self.outstanding.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        let state = JobState::new(pieces.len(), failed, self.outstanding.clone());
-        // One worker per piece the volume's window has room for: a worker
-        // woken with no piece it may take would only contend for the queue
-        // with the submitter's next job.
-        let (id, woken) = engine.queue.lock().expect("read queue").push(Queued {
-            state: state.clone(),
-            file: self.file.clone(),
-            volume: self.volume.clone(),
-            pieces: pieces.into(),
-        }, priority);
-        for _ in 0..woken {
-            engine.work.notify_one();
-        }
-        Ok(Job { id, state, engine })
+        // SAFETY: the caller's.
+        unsafe { queue(&self.file, &self.volume, &self.outstanding, ranges, priority) }
     }
+}
+
+/// Queue `ranges` of `file` for the pool at `priority`, read as `volume`
+/// says, counted in `outstanding` until the job ends: a reader's job
+/// ([`ArtifactReader::submit`]), or a probe's lone request.
+///
+/// # Safety
+/// As [`ArtifactReader::submit`].
+unsafe fn queue(file: &Arc<SourceFile>, volume: &Volume, outstanding: &Arc<std::sync::atomic::AtomicUsize>, ranges: Vec<Range>, priority: Priority) -> Result<Job, Error> {
+    let engine = engine();
+    let outside = Arc::new(Error::Invalid("read outside artifact".into()));
+    let mut failed = Vec::new();
+    let mut order = Vec::with_capacity(ranges.len());
+    for (index, range) in ranges.iter().enumerate() {
+        if range
+            .offset
+            .checked_add(range.length as u64)
+            .is_none_or(|end| end > file.size)
+        {
+            failed.push((index, outside.clone()));
+        } else {
+            order.push(index);
+        }
+    }
+    order.sort_by_key(|index| ranges[*index].offset);
+    let read = match priority {
+        Priority::Demand => volume.choice.demand_read,
+        _ => volume.choice.read,
+    };
+    let pieces = pieces(&ranges, &order, file.size, read);
+    outstanding.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let state = JobState::new(pieces.len(), failed, outstanding.clone());
+    // One worker per piece the volume's window has room for: a worker
+    // woken with no piece it may take would only contend for the queue
+    // with the submitter's next job.
+    let (id, woken) = engine.queue.lock().expect("read queue").push(Queued {
+        state: state.clone(),
+        file: file.clone(),
+        volume: volume.clone(),
+        pieces: pieces.into(),
+    }, priority);
+    for _ in 0..woken {
+        engine.work.notify_one();
+    }
+    Ok(Job { id, state, engine })
 }
 
 /// A range of an artifact file read in order ([`ArtifactReader::range`]).

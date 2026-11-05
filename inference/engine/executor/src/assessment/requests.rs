@@ -20,7 +20,7 @@
 //!   records stored. No load measures, and no load waits on the job.
 
 use super::executor_costs::{executor_identity, retraced, walk_points, ExecutorCostsError, Measurement, Scope, Visit, Walks};
-use super::streaming_costs::{CpuCosts, CpuForm, CeilingError, ConvertCosts, ConvertForm, MemoryCosts, MemoryError, MoveCosts, MoveError, MoveForm, TierCopyCosts, TierCopyError, GraphMemory, VolumeCosts};
+use super::streaming_costs::{CpuCosts, CpuForm, CeilingError, ConvertCosts, ConvertForm, MemoryCosts, MemoryError, MoveCosts, MoveError, MoveForm, TierCopyCosts, TierCopyError, GraphMemory, StoredVolume, VolumeCosts};
 use super::{Priced, StoredCosts};
 use crate::native::SiteForm;
 use crate::planning::BankBinding;
@@ -90,7 +90,7 @@ impl PointRequest {
             Self::Site(site) => site.outstanding(topology, executor, store),
             Self::Volume { file, urgent } => {
                 let urgent = VolumeCosts::urgent(urgent);
-                matches!(VolumeCosts::stored(topology, executor, file, urgent.as_ref(), store), Ok(None))
+                matches!(VolumeCosts::stored(topology, executor, file, urgent.as_ref(), store), Ok(None | Some(StoredVolume::Earlier(_))))
             }
         }
     }

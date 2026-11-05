@@ -1305,14 +1305,35 @@ fn adopt_volumes(
     artifact: &magnitude_artifacts::gguf::GgufArtifact,
     bank: Option<&magnitude_executor::ExpertBankPlan>,
 ) -> Result<(), String> {
-    use magnitude_executor::assessment::VolumeCosts;
+    use magnitude_executor::assessment::{StoredVolume, VolumeCosts};
     let records = KernelCache::measurement_records(root);
     let mut requests = Vec::new();
     for (source, urgent) in volumes(artifact, bank)? {
         let urgent = urgent.as_ref();
-        match VolumeCosts::stored(device.topology(), device.info(), source.path(), urgent, &records).map_err(|error| error.to_string())? {
-            Some(choice) => magnitude_artifacts::adopt_volume(&source, urgent, choice).map_err(|error| error.to_string())?,
-            None => requests.push(volume_request(&source, urgent)),
+        let stored = VolumeCosts::stored(device.topology(), device.info(), source.path(), urgent, &records).map_err(|error| error.to_string())?;
+        let (choice, rule) = match stored {
+            Some(StoredVolume::Current(choice)) => (Some(choice), "current"),
+            Some(StoredVolume::Earlier(choice)) => (Some(choice), "earlier"),
+            None => (None, "unprobed"),
+        };
+        let reads = if urgent.is_some() { "decode" } else { "loads" };
+        match choice {
+            Some(choice) => tracing::info!(
+                "volume of {} for {reads}: {rule} rule's choice, window {} KiB, demand {} KiB, read {} KiB, demand read {} KiB",
+                source.path().display(),
+                choice.window >> 10,
+                choice.demand >> 10,
+                choice.read >> 10,
+                choice.demand_read >> 10,
+            ),
+            None => tracing::info!("volume of {} for {reads}: unprobed, read at the probe's bounds", source.path().display()),
+        }
+        if let Some(choice) = choice {
+            magnitude_artifacts::adopt_volume(&source, urgent, choice).map_err(|error| error.to_string())?;
+        }
+        // An earlier rule's choice stands until the job probes the current one.
+        if !matches!(stored, Some(StoredVolume::Current(_))) {
+            requests.push(volume_request(&source, urgent));
         }
     }
     let executor = device

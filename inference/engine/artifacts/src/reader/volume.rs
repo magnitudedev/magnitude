@@ -49,6 +49,19 @@ pub struct VolumeChoice {
 }
 
 impl VolumeChoice {
+    /// The rule a choice is made by, a term of a stored choice's key, so a
+    /// choice made by another is probed again: 3, a demand window the widest
+    /// at the full rate and a lone request timed through the read engine
+    /// (the first rule took the narrowest window and timed lone reads by
+    /// threads).
+    pub const SCHEMA: u64 = 3;
+
+    /// The rule before [`SCHEMA`](Self::SCHEMA), whose stored choice a load
+    /// reads while the job probes the current one: none, the first rule,
+    /// whose records carry no schema term. Named beside the current rule so
+    /// a new rule names its predecessor with it.
+    pub const EARLIER_SCHEMA: Option<u64> = None;
+
     /// How a volume is read before any probe of it: at the least read size
     /// and the widest window, every piece at the most any device measured
     /// needs (the declared bounds of the search), which takes no measurement.
@@ -79,9 +92,9 @@ pub fn probe_volume(source: &crate::FileSource, urgent: Option<&Urgent>) -> Resu
     // Held across the probe: no probe shares the storage with another of
     // the volume, and other volumes' readers wait on none of it.
     let mut lines = lines.lock().expect("a volume's lines");
-    let probed = SourceFile { path: source.path().into(), size: source.size(), through: uncached(source.file())? };
+    let probed = Arc::new(SourceFile { path: source.path().into(), size: source.size(), through: uncached(source.file())? });
     evict(source.file(), source.size())?;
-    let choice = lines.choose(&probed, urgent)?;
+    let choice = lines.choose(key, &probed, urgent)?;
     let volume = lines.volume(key, choice);
     lines.chosen.insert(urgent.cloned(), volume);
     Ok(choice)

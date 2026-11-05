@@ -1286,6 +1286,18 @@ impl GraphMemory {
     }
 }
 
+/// A volume's stored choice, by the rule that made it: the current
+/// ([`VolumeChoice::SCHEMA`](magnitude_artifacts::VolumeChoice::SCHEMA)),
+/// or the one before it, which a load reads as it was while the job probes
+/// the current one, so no load waits on the probe or reads meanwhile at the
+/// pre-probe bounds (a 32 MiB window for hints, where the earlier choice held
+/// GB10's to 1 MiB).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StoredVolume {
+    Current(magnitude_artifacts::VolumeChoice),
+    Earlier(magnitude_artifacts::VolumeChoice),
+}
+
 /// How a volume is read (`magnitude_artifacts::VolumeChoice`), a requested
 /// point (`PointRequest::Volume`) keyed by the volume and its urgent request:
 /// the job probes it, and a load adopts what the records hold, so no load
@@ -1298,10 +1310,15 @@ impl VolumeCosts {
         urgent.as_ref().map(|(parts, records)| magnitude_artifacts::Urgent { parts: parts.clone(), records: *records })
     }
 
-    fn key(identity: &seismic::Identity, file: &Path, urgent: Option<&magnitude_artifacts::Urgent>, term: &str) -> Result<PointKey, ExecutorCostsError> {
+    /// A term's key under `schema`: the choice's rule ([`VolumeChoice::SCHEMA`](magnitude_artifacts::VolumeChoice::SCHEMA)),
+    /// or none for the first rule, whose records have no such term.
+    fn key(identity: &seismic::Identity, file: &Path, urgent: Option<&magnitude_artifacts::Urgent>, schema: Option<u64>, term: &str) -> Result<PointKey, ExecutorCostsError> {
         let volume = seismic::volume_identity(file).map_err(|cause| failed("volume identity")(&cause))?;
         let mut configuration = named(&[("volume_device", volume.device)]);
         configuration.insert(format!("volume_{}", volume.uuid.as_deref().unwrap_or("unnamed")), 1);
+        if let Some(schema) = schema {
+            configuration.insert("schema".into(), schema);
+        }
         if let Some(urgent) = urgent {
             configuration.insert("records".into(), urgent.records);
             configuration.extend(urgent.parts.iter().enumerate().map(|(part, &bytes)| (format!("part_{part}"), bytes)));
@@ -1309,7 +1326,8 @@ impl VolumeCosts {
         Ok(PointKey { executor: identity.clone(), kernels: Vec::new(), configuration, point: named(&[(term, 1)]) })
     }
 
-    /// The choice `store` records of `file`'s volume, none until the job
+    /// The choice `store` records of `file`'s volume: by the current rule,
+    /// else by the rule before it ([`StoredVolume`]), none until the job
     /// probed it.
     pub fn stored(
         topology: &DeviceTopology,
@@ -1317,14 +1335,20 @@ impl VolumeCosts {
         file: &Path,
         urgent: Option<&magnitude_artifacts::Urgent>,
         store: &dyn RecordStore<PointKey>,
-    ) -> Result<Option<magnitude_artifacts::VolumeChoice>, ExecutorCostsError> {
+    ) -> Result<Option<StoredVolume>, ExecutorCostsError> {
         let identity = executor_identity(topology, executor)?;
-        let term = |term: &str| measured(store, &Self::key(&identity, file, urgent, term)?, "volume record");
-        let (window, demand, read, demand_read, cores) = (term("window")?, term("demand")?, term("read")?, term("demand_read")?, term("cores")?);
-        let (Some(window), Some(demand), Some(read), Some(demand_read), Some(cores)) = (window, demand, read, demand_read, cores) else {
-            return Ok(None);
+        let choice = |schema: Option<u64>| -> Result<Option<magnitude_artifacts::VolumeChoice>, ExecutorCostsError> {
+            let term = |term: &str| measured(store, &Self::key(&identity, file, urgent, schema, term)?, "volume record");
+            let (window, demand, read, demand_read, cores) = (term("window")?, term("demand")?, term("read")?, term("demand_read")?, term("cores")?);
+            let (Some(window), Some(demand), Some(read), Some(demand_read), Some(cores)) = (window, demand, read, demand_read, cores) else {
+                return Ok(None);
+            };
+            Ok(Some(magnitude_artifacts::VolumeChoice { window: window as u64, demand: demand as u64, read: read as u64, demand_read: demand_read as u64, cores }))
         };
-        Ok(Some(magnitude_artifacts::VolumeChoice { window: window as u64, demand: demand as u64, read: read as u64, demand_read: demand_read as u64, cores }))
+        if let Some(current) = choice(Some(magnitude_artifacts::VolumeChoice::SCHEMA))? {
+            return Ok(Some(StoredVolume::Current(current)));
+        }
+        Ok(choice(magnitude_artifacts::VolumeChoice::EARLIER_SCHEMA)?.map(StoredVolume::Earlier))
     }
 
     /// Probe `file`'s volume in the job, its choice stored.
@@ -1341,7 +1365,7 @@ impl VolumeCosts {
         let terms = [("window", choice.window as f64), ("demand", choice.demand as f64), ("read", choice.read as f64), ("demand_read", choice.demand_read as f64), ("cores", choice.cores)];
         for (term, value) in terms {
             let timing = Timing { median: value, interval: None, samples: 1 };
-            store.store(&Self::key(&identity, file, urgent, term)?, &Record::Measured(timing)).map_err(|cause| error(&cause))?;
+            store.store(&Self::key(&identity, file, urgent, Some(magnitude_artifacts::VolumeChoice::SCHEMA), term)?, &Record::Measured(timing)).map_err(|cause| error(&cause))?;
         }
         Ok(())
     }

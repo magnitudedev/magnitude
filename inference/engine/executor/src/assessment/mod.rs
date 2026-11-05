@@ -63,7 +63,7 @@ pub use streaming::{
 pub use streaming_costs::{
     CeilingError, ConvertCosts, ConvertForm, FileLine, MemoryCosts, MemoryError, MoveCosts, MoveError, MoveForm, RecordLine,
     CONVERTED_RECORDS,
-    CpuCosts, GraphMemory, MoveLines, ReadLine, ReadLineError, RequestReads, TierCopyCosts, TierCopyError, TierCopyPoint, VolumeCosts,
+    CpuCosts, GraphMemory, MoveLines, ReadLine, ReadLineError, RequestReads, TierCopyCosts, TierCopyError, TierCopyPoint, StoredVolume, VolumeCosts,
 };
 
 use crate::GraphError;
