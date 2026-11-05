@@ -89,6 +89,8 @@ pub(super) struct RoutingRecord<'a> {
     base: usize,
     sources: usize,
     count: usize,
+    /// Whether its route wrote it: a whole layer's writes none.
+    written: bool,
 }
 
 impl<'a> RoutingRecord<'a> {
@@ -106,12 +108,17 @@ impl<'a> RoutingRecord<'a> {
             .ok()
             .filter(|&count| count <= sources)
             .unwrap_or_else(|| panic!("step {sequence}'s routing record at layer {layer} counts {count} of {sources} choices"));
-        Self { words, base, sources, count }
+        Self { words, base, sources, count, written: true }
     }
 
     /// A whole layer's: its route writes none, so it holds no choice.
     pub(super) fn unwritten(words: &'a Words) -> Self {
-        Self { words, base: 0, sources: 0, count: 0 }
+        Self { words, base: 0, sources: 0, count: 0, written: false }
+    }
+
+    /// Whether its route wrote it ([`Self::unwritten`] is a whole layer's).
+    pub(super) fn written(&self) -> bool {
+        self.written
     }
 
     /// The choices it holds.

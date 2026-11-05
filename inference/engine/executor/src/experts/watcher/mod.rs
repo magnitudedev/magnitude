@@ -295,6 +295,11 @@ impl Shared {
         }
     }
 
+    /// Step `sequence`'s run of layer `layer`'s block was sampled.
+    pub(crate) fn block_sampled(&self, sequence: Step, layer: usize, spans: seismic::NativeSpans, marks: (usize, usize)) {
+        self.telemetry.block_sampled(sequence, layer, spans, marks);
+    }
+
     /// Whether any hold of the load's traffic stands ([`Self::hold_traffic`]).
     pub(super) fn traffic_held(&self) -> bool {
         self.traffic_held.load(std::sync::atomic::Ordering::Acquire) > 0
@@ -503,11 +508,14 @@ pub(super) struct WatcherParts {
     pub compute: crate::experts::HostCompute,
     pub copier: Option<Copier>,
     pub steps: Arc<Steps>,
+    /// Whether the device's backend times spans of a graph run, where
+    /// sampled decode steps time their blocks (`Telemetry::samples`).
+    pub spans: bool,
 }
 
 impl Watcher {
     pub fn start(parts: WatcherParts) -> Result<Self, String> {
-        let WatcherParts { layers, group_reads, groups, load, pools, extents, slots, whole, staging, host, carrier, source, compute, copier, steps } = parts;
+        let WatcherParts { layers, group_reads, groups, load, pools, extents, slots, whole, staging, host, carrier, source, compute, copier, steps, spans } = parts;
         // The geometry every read lands by, checked once: each pool's
         // staging holds the staging records, and the conveyor lies in each
         // pool, at most a record of every expert of the widest layer.
@@ -617,6 +625,7 @@ impl Watcher {
             resident,
             core.directory.ranking(),
             core.source.deliveries(),
+            spans,
         );
         // The load's parks, on one timeline of its device, which each answer
         // of a slot of the exchange settles.

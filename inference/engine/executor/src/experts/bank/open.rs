@@ -519,6 +519,7 @@ fn watch(
         compute,
         copier,
         steps,
+        spans: device.backend().times_spans() && device.backend().parks_in_kernels(),
     })
     .map(|watcher| (watcher, lines))
 }

@@ -555,6 +555,7 @@ pub(super) fn lending_bank(
         compute: crate::experts::HostCompute::start(Vec::new(), &crate::experts::ComputeThreads::unplaced(vec![vec![0, 1]])).unwrap(),
         copier,
         steps,
+        spans: false,
     })
     .unwrap();
     Harness {

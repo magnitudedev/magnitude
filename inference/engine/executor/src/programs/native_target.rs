@@ -212,7 +212,21 @@ impl StepSubmitter {
         ready: seismic::ReadyNativeGraphRun<'_>,
         register: impl FnOnce(&NativeGraphOutputs),
     ) -> Result<NativeGraphOutputs, SubmitError> {
-        let outputs = ready.queue(&mut self.sequence).map_err(device)?;
+        self.queue_as(ready, false, register).map(|(outputs, _)| outputs)
+    }
+
+    /// [`Self::queue`], the run `sampled` for its span marks' device time
+    /// where so (`seismic::ReadyNativeGraphRun::queue_sampled`): its spans.
+    fn queue_as(
+        &mut self,
+        ready: seismic::ReadyNativeGraphRun<'_>,
+        sampled: bool,
+        register: impl FnOnce(&NativeGraphOutputs),
+    ) -> Result<(NativeGraphOutputs, Option<seismic::NativeSpans>), SubmitError> {
+        let (outputs, spans) = match sampled {
+            true => ready.queue_sampled(&mut self.sequence).map(|(outputs, spans)| (outputs, Some(spans))).map_err(device)?,
+            false => (ready.queue(&mut self.sequence).map_err(device)?, None),
+        };
         register(&outputs);
         (self.queued_reads, self.queued_landed) = (self.pending_reads.len(), self.pending_landed.len());
         self.queued += 1;
@@ -220,7 +234,7 @@ impl StepSubmitter {
             self.flush()?;
             self.limit *= 2;
         }
-        Ok(outputs)
+        Ok((outputs, spans))
     }
 
     /// Queue `ready`, a fill, `register` given its outputs before anything
@@ -1369,7 +1383,7 @@ impl NativeTargetProgram {
         let reads = reads.as_ref().map(|(bank, record)| (&**bank, *record));
         let (launches, outputs) = steps
             .map(|(launch, banked)| {
-                let bank = banked.as_ref().map(|(bank, step)| BankRun { bank: bank.clone(), sequence: step.sequence() });
+                let bank = banked.as_ref().map(|(bank, step)| BankRun { bank: bank.clone(), sequence: step.sequence(), sampled: step.samples() });
                 let (core, graph_workspace, graph_output, workspace, output) = launch.submission_parts_mut();
                 ((core, graph_workspace, (workspace, output), bank), graph_output)
             })
@@ -1634,7 +1648,7 @@ impl NativeTargetProgram {
                 Some(tail) if tail.rows < rows => {
                     // The streamed layers from here name their requests'
                     // rows within the window.
-                    if let Some(BankRun { bank, sequence }) = &run.bank {
+                    if let Some(BankRun { bank, sequence, .. }) = &run.bank {
                         bank.window(*sequence, index, run.window.first + tail.first).map_err(invalid)?;
                     }
                     run.hidden = tail.slice(&run.hidden)?;
@@ -2137,10 +2151,15 @@ impl NativeTargetProgram {
             let (next, outputs) = rotation.activate(&graph.plan)?;
             let ready = active.attach(bindings, outputs).map_err(device)?;
             let mut registered = Ok(());
-            let outputs = submitter.queue(ready, |outputs| {
+            // A sampled step times each block whose routed layer streams.
+            let sampled = bank.is_some_and(|bank| bank.samples(graph));
+            let (outputs, spans) = submitter.queue_as(ready, sampled, |outputs| {
                 registered = bank.map_or(Ok(()), |bank| bank.register_parks(graph, index, outputs));
             })?;
             registered.map_err(invalid)?;
+            if let (Some(bank), Some(spans)) = (bank, spans) {
+                bank.block_sampled(graph, index, spans).map_err(invalid)?;
+            }
             if let Some((BlockStatePorts::Recurrent(ports), _)) = &graph.mixer {
                 run.recurrent_component += ports.len();
             }

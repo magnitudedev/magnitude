@@ -49,13 +49,15 @@ pub(crate) struct BoundTargetGraphs {
     pub bank: Option<Arc<crate::experts::ExpertBank>>,
 }
 
-/// A run of a step of its load's expert bank: the bank, and the step's
-/// sequence in it (`ExpertStep::sequence`). Only a load with a bank holds
-/// graphs of bank parts and parks (`PreparedTargetGraphs::bind_weights`).
+/// A run of a step of its load's expert bank: the bank, the step's
+/// sequence in it (`ExpertStep::sequence`), and whether the step times its
+/// blocks (`ExpertStep::samples`). Only a load with a bank holds graphs of
+/// bank parts and parks (`PreparedTargetGraphs::bind_weights`).
 #[derive(Clone)]
 pub(crate) struct BankRun {
     pub(crate) bank: Arc<crate::experts::ExpertBank>,
     pub(crate) sequence: u64,
+    pub(crate) sampled: bool,
 }
 
 impl BankRun {
@@ -76,6 +78,32 @@ impl BankRun {
         for &(_, port) in &graph.parks {
             bindings.set_park(port, self.bank.parks().timeline()).map_err(|error| error.to_string())?;
         }
+        Ok(())
+    }
+
+    /// Whether `graph`'s run in this step is sampled for its block's
+    /// device time: a graph whose ends are marked
+    /// (`PreparedTargetBlockGraph::span`), of a sampled step.
+    pub(crate) fn samples<P>(&self, graph: &PreparedTargetBlockGraph<P>) -> bool {
+        self.sampled && graph.span.is_some()
+    }
+
+    /// `graph`'s run as block `index` of this step was sampled (`spans`):
+    /// its streamed layer's block line observes its device time once the
+    /// step completes.
+    pub(crate) fn block_sampled<P>(&self, graph: &PreparedTargetBlockGraph<P>, index: usize, spans: seismic::NativeSpans) -> Result<(), String> {
+        // Only a graph whose ends are marked is sampled (`Self::samples`).
+        let marks = graph.span.expect("a sampled run's graph is marked at its ends");
+        // Its streamed layer is its block's feed-forward: the sublayer, or a
+        // parallel sublayer's routed branch.
+        let [_, routed] = super::prepared::block_scopes(graph.block)?;
+        let scope = block_scope(routed, graph.block, index)?;
+        let (layer, _) = self
+            .bank
+            .plan()
+            .feed_forward(scope)
+            .ok_or_else(|| format!("{scope:?} has no streamed routed layer"))?;
+        self.bank.block_sampled(self.sequence, layer, spans, marks);
         Ok(())
     }
 

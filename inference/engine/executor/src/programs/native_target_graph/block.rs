@@ -92,6 +92,9 @@ pub(crate) struct PreparedTargetBlockGraph<P = Option<SplitPorts>> {
     pub parks: Vec<(GraphTimeline, NativeTimelinePort)>,
     /// Host constants bound statically with the weights.
     pub constants: Vec<GraphConstant>,
+    /// The span marks at its ends where it is a whole block whose routed
+    /// layer streams (`BlockGraphParts::span`).
+    pub span: Option<(usize, usize)>,
     /// The mixer's state and control ports, of a graph that mixes (a
     /// block's back does not).
     pub mixer: Option<(BlockStatePorts, BlockControlPorts)>,
@@ -218,6 +221,7 @@ impl SealedBlockGraph {
                     banks,
                     parks,
                     constants,
+                    span: parts.span,
                     mixer,
                     taps: parts.taps,
                     per_layer: parts.per_layer,
@@ -320,6 +324,10 @@ struct BlockGraphParts {
     /// The step sequence a run of a graph that sets its step word writes.
     sequence: Option<NativePort>,
     ports: StagePorts,
+    /// The span marks at the ends of a whole block whose routed layer
+    /// streams, which a sampled decode step's run times its block between
+    /// (`BankRun::block_sampled`).
+    span: Option<(usize, usize)>,
 }
 
 impl BlockGraphParts {
@@ -420,10 +428,15 @@ fn block_graph<'a, G: GraphDraft + 'a>(
                 ngram: None,
                 sequence: None,
                 ports,
+                span: None,
             });
         }
         Stage::Run(stage) => stage,
     };
+    // A whole block whose routed layer streams is marked at its ends: a
+    // mark at a graph's edge adds no node and divides nothing, and is
+    // stamped only on a sampled run (`seismic::NativeSpans`).
+    let begun = (stage == RunStage::Whole && feed_forward.bank.is_some()).then(|| graph.span_mark());
     // A front writes the taps before the feed-forward, a back the output's.
     let [entry, middle, output] = stage.taps();
     let mut taps = tap_entry
@@ -494,6 +507,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
             ngram: None,
             sequence,
             ports,
+            span: None,
         });
     }
     let (output, per_layer) =
@@ -551,6 +565,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     if let Some(taps) = taps.as_mut().filter(|taps| taps.positions.output) {
         taps.ports.output = Some(taps.tap(graph, &output)?);
     }
+    let span = begun.map(|begun| (begun, graph.span_mark()));
     Ok(BlockGraphParts {
         residual,
         output,
@@ -560,6 +575,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         ngram,
         sequence,
         ports,
+        span,
     })
 }
 

@@ -45,17 +45,17 @@ pub(crate) struct Stamp {
 
 impl NativeSpans {
     /// The stamps of `marks` marks on `device`, or why its backend times no
-    /// span.
+    /// span: which backends do is `BackendName::times_spans`'s alone.
     pub(crate) fn new(device: &DeviceInner, marks: usize) -> Result<Self, CallError> {
+        let backend = super::backend_name(&device.kind);
+        if !backend.times_spans() {
+            return Err(CallError::Workflow(WorkflowError::SpanTimingUnsupported { backend }));
+        }
         let stamps = match &device.kind {
             OpenedKind::Cuda(opened) => seismic_cuda::direct::Stamps::new(opened.service(), marks).map(Stamps::Cuda),
             #[cfg(not(target_os = "macos"))]
             OpenedKind::Vulkan(opened) => seismic_vulkan::direct::Stamps::new(opened.service(), marks).map(Stamps::Vulkan),
-            kind => {
-                return Err(CallError::Workflow(WorkflowError::SpanTimingUnsupported {
-                    backend: super::backend_name(kind),
-                }))
-            }
+            _ => unreachable!("`{}` times spans and has no stamps", backend.as_str()),
         }
         .map_err(CallError::Execution)?;
         Ok(Self { stamps: Arc::new(stamps), marks })

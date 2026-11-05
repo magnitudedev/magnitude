@@ -5,6 +5,7 @@
 use super::core::Core;
 use super::requests::Service;
 use super::residency::Residency;
+use super::telemetry::CompletionError;
 use super::{Shared, decode, scratch};
 use crate::assessment::{FileLine, ReadLineError};
 use crate::experts::ExchangeTable;
@@ -272,5 +273,16 @@ impl Shared {
     /// as every rule that weighs reads against compute reads that line.
     pub(super) fn lost_read_line(&self, error: ReadLineError) {
         self.end_serving(format!("the served file's read line: {error}"));
+    }
+
+    /// A completed step's costs could not be recorded (`error`): serving
+    /// ends, a lost read line through [`Self::lost_read_line`].
+    pub(super) fn failed_completion(&self, error: CompletionError) {
+        match error {
+            CompletionError::ReadLine(error) => self.lost_read_line(error),
+            CompletionError::Stamps { layer, error } => {
+                self.end_serving(format!("streamed layer {layer}'s sampled block stamps: {error}"));
+            }
+        }
     }
 }

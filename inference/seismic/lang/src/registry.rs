@@ -177,6 +177,16 @@ impl BackendName {
         }
     }
 
+    /// Whether a sampled graph run stamps the device's time at its plan's
+    /// marks (`NativeSpans`): CUDA with events and Vulkan with timestamps.
+    /// Metal and the CPU have no span timing.
+    pub const fn times_spans(self) -> bool {
+        match self {
+            BackendName::Cuda | BackendName::Vulkan => true,
+            BackendName::Cpu | BackendName::Metal => false,
+        }
+    }
+
     /// Whether a native implementation dispatches a block of its launches
     /// more than once (`repeat`): its runtime's encoder replays the block.
     pub const fn repeats_launches(self) -> bool {

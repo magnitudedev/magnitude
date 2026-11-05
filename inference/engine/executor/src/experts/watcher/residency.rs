@@ -376,13 +376,14 @@ impl Residency {
 
     /// Write each layer's line words (`ExpertLines::policy`, this the one
     /// writer) from its lines as the load's own work refines them (its
-    /// landings and what its CPU site's requests take,
-    /// `Telemetry::refined`), and price the promotions' copies on the same
-    /// lines at the site's share of the time now (`Directory::price_copies`
-    /// asks them again only where a price moved). The words are stored only
-    /// where they differ from those last published, so a turn that moved
-    /// none of them takes no steps' lock. Unlike the words a run's encoding
-    /// reads (whole, resolved, home: [`Self::publish_policy`]), the lines decide
+    /// landings, what its CPU site's requests take and what its sampled
+    /// steps' blocks take on the device, `Telemetry::refined`), and price
+    /// the promotions' copies on the same lines at the site's share of the
+    /// time now (`Directory::price_copies` asks them again only where a
+    /// price moved). The words are stored only where they differ from those
+    /// last published, so a turn that moved none of them takes no steps'
+    /// lock. Unlike the words a run's encoding reads (whole, resolved, home:
+    /// [`Self::publish_policy`]), the lines decide
     /// only the route's choice of a miss's site, and any value of each word
     /// is a valid one for any step: so they are stored under the lock every
     /// step begins under (`Steps::unbegun`), as a map entry is

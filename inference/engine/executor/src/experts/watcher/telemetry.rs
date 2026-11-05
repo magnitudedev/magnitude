@@ -563,6 +563,12 @@ struct Costs {
     /// Each streamed layer's CPU site requests, observed as they took
     /// (`Telemetry::complete_step`).
     sites: Vec<SiteRequests>,
+    /// Each streamed layer's block line, observed from sampled decode
+    /// steps (`Telemetry::complete_step`): its block's device time over its
+    /// hits, link misses and sited misses, each an expert of one row, the
+    /// time its rows past each one's first take at the step's lines taken
+    /// from it, as a site's requests are (`SiteRequests`).
+    blocks: Vec<seismic::measure::Line<4>>,
     /// Each bank group's convert in a decode barrier, once the job measured
     /// it ([`Telemetry::device_convert`]).
     convert: Vec<Option<crate::assessment::RecordLine>>,
@@ -785,6 +791,44 @@ pub(super) struct Telemetry {
     /// step's end only raises it, so the thread ending steps never waits
     /// on the stack.
     feedable: AtomicU64,
+    /// Whether a block's span is the device's cost of its work: its backend
+    /// times spans of a graph run (`seismic::BackendName::times_spans`) and
+    /// its parks wait inside kernels (`parks_in_kernels`). Where parks are
+    /// submission boundaries (Vulkan), a block's span holds its parks' host
+    /// answers and its submissions' starts, which its line would price as
+    /// the device's cost of a hit or a link miss. Where either fails, no
+    /// step is sampled and the job's lines stand.
+    spans: bool,
+    /// The block runs a sampled step's streamed layers took, by step and
+    /// layer, until the step completes or ends ([`Self::block_sampled`]);
+    /// under a lock of its own, never held with another.
+    sampled: Mutex<BTreeMap<(Step, usize), Sampled>>,
+}
+
+/// A sampled block run: its spans and the marks at its ends.
+struct Sampled {
+    spans: seismic::NativeSpans,
+    marks: (usize, usize),
+}
+
+/// A completed sampled decode step's blocks: the lines it was sampled by,
+/// whose rows past each expert's first its blocks' times are taken less
+/// (`block_point`), the device seconds of each streamed layer's block that
+/// was sampled (a whole block's, `PreparedTargetBlockGraph::span`), and
+/// what each layer read, none of a whole layer ([`Telemetry::read_rows`]).
+struct SampledBlocks {
+    lines: Arc<[ExpertLines]>,
+    seconds: BTreeMap<usize, f64>,
+    rows: Vec<Option<ReadRows>>,
+}
+
+/// A streamed layer's experts one step read, each as its rows (the choices
+/// that named it), by where its route served them (`Use::of`): its hits
+/// (`Use::Bank`), then its misses, those a record misses land into served
+/// (`Use::Tier`) and those the file's (`Use::File`, as `Telemetry::absent`).
+struct ReadRows {
+    hits: Vec<u64>,
+    misses: Vec<u64>,
 }
 
 impl Costs {
@@ -800,12 +844,52 @@ impl Costs {
     fn site(&self, layer: usize) -> Option<[f64; 2]> {
         self.sites[layer].line()
     }
+
+    /// Streamed layer `layer`'s block line as its sampled steps took,
+    /// `[fixed, per hit, per link miss, per sited miss]` seconds, each an
+    /// expert of one row; none before a step was observed. Its experts'
+    /// costs are seeded lightly by the job's `lines`, which place only what
+    /// the observations leave unplaced: a decode that routes as many
+    /// experts each step pays the fixed term in step with their sum, which
+    /// its observations alone never tell apart.
+    fn block(&self, layer: usize, lines: &ExpertLines) -> Option<[f64; 4]> {
+        let mut line = self.blocks[layer];
+        let cpu = lines.host.cpu.map_or(0., |cpu| cpu.expert.one.get() * 1e-9);
+        for (term, seconds) in [(1, lines.gpu.resident.nanoseconds(1.) * 1e-9), (2, lines.gpu.link.nanoseconds(1.) * 1e-9), (3, cpu)] {
+            line.seed(std::array::from_fn(|at| f64::from(u8::from(at == term))), seconds, BLOCK_SEED_WEIGHT);
+        }
+        match line.state().expect("blocks' counts and device seconds make a line") {
+            seismic::measure::LineState::Pending => None,
+            seismic::measure::LineState::Observed(terms) => Some(terms.costs()),
+            seismic::measure::LineState::Seeded(_) => unreachable!("the seeds leave a block's fixed term unplaced"),
+        }
+    }
+}
+
+/// The weight of each seed of a block line (`Costs::block`): one
+/// observation's, light beside the steps a load samples.
+const BLOCK_SEED_WEIGHT: f64 = 1.;
+
+/// Why a completed step's costs could not be recorded: the served file's
+/// read line is lost, or a sampled block's stamps did not read (the
+/// device's error, the step having passed them). Either ends serving
+/// (`Shared::failed_completion`).
+#[derive(Debug)]
+pub(super) enum CompletionError {
+    ReadLine(ReadLineError),
+    Stamps { layer: usize, error: String },
+}
+
+impl From<ReadLineError> for CompletionError {
+    fn from(error: ReadLineError) -> Self {
+        Self::ReadLine(error)
+    }
 }
 
 /// A streamed layer's CPU site requests as they took, each observed at its
 /// experts against its path's time less its rows past each expert's first
-/// at the job's row cost: the site's line of a row an expert
-/// (`ExpertLines::sited`).
+/// at the job's row cost, as a block's are (`block_point`): the site's line
+/// of a row an expert (`ExpertLines::sited`).
 #[derive(Clone, Copy, Debug, Default)]
 struct SiteRequests(seismic::measure::Line<2>);
 
@@ -842,6 +926,7 @@ impl Telemetry {
         resident: Option<Vec<u64>>,
         ranking: Ranking,
         deliveries: Vec<Arc<magnitude_artifacts::Delivery>>,
+        spans: bool,
     ) -> Self {
         let groups = layers.iter().map(|layer| layer.group + 1).max().unwrap_or(0);
         Self {
@@ -864,6 +949,7 @@ impl Telemetry {
                     line: None,
                     landings: vec![seismic::measure::Line::new(); groups],
                     sites: vec![SiteRequests::default(); layers.len()],
+                    blocks: vec![seismic::measure::Line::new(); layers.len()],
                     convert: vec![None; groups],
                     hints: HintCost::default(),
                     hinted: BTreeMap::new(),
@@ -899,6 +985,8 @@ impl Telemetry {
             stack: Mutex::new(Stack::new(ranking, layers.len(), extents.widest)),
             whole: layers.iter().map(|_| AtomicBool::new(false)).collect(),
             feedable: AtomicU64::new(0),
+            spans,
+            sampled: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -940,14 +1028,74 @@ impl Telemetry {
         self.routing.maps.iter().map(|&(group, _)| recorded.costs.landing(group)).collect()
     }
 
+    /// Whether a decode step `sequence` is sampled for its blocks' device
+    /// time, where the backend times spans: one step of each flight, the
+    /// interval the steps in flight already are, so a block line follows
+    /// the load at a stamp a block in each. The step decides it once, as
+    /// it begins (`ExpertStep::samples`).
+    pub(super) fn samples(&self, sequence: Step) -> bool {
+        self.spans && sequence % self.routing.words.flight == 0
+    }
+
+    /// Step `sequence`'s run of streamed layer `layer`'s block was sampled
+    /// (`spans`, `marks` at its ends): its device time is read once the
+    /// step completes ([`Self::complete_step`]), or dropped as it ends
+    /// ([`Self::end_step`]).
+    pub(super) fn block_sampled(&self, sequence: Step, layer: usize, spans: seismic::NativeSpans, marks: (usize, usize)) {
+        self.sampled.lock().expect("the sampled blocks").insert((sequence, layer), Sampled { spans, marks });
+    }
+
+    /// Completed step `sequence`'s sampled blocks, sampled by `lines`: each
+    /// one's device time, and what each layer read.
+    fn sampled_blocks(&self, sequence: Step, lines: Arc<[ExpertLines]>) -> Result<SampledBlocks, CompletionError> {
+        let runs = {
+            let mut sampled = self.sampled.lock().expect("the sampled blocks");
+            let mut runs = sampled.split_off(&(sequence, 0));
+            sampled.append(&mut runs.split_off(&(sequence + 1, 0)));
+            runs
+        };
+        // The step completed, so its work passed both marks: a stamp that
+        // does not read is the device's error.
+        let seconds = runs
+            .into_iter()
+            .map(|((_, layer), Sampled { spans, marks: (from, to) })| {
+                spans.seconds(from, to).map(|seconds| (layer, seconds)).map_err(|error| CompletionError::Stamps { layer, error: error.to_string() })
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(SampledBlocks { lines, seconds, rows: self.read_rows(sequence) })
+    }
+
+    /// What each streamed layer's routing record of step `sequence` read
+    /// ([`ReadRows`]); none of a whole layer, whose route writes no record
+    /// of the experts its block ran.
+    fn read_rows(&self, sequence: Step) -> Vec<Option<ReadRows>> {
+        let placer = self.routing.placer;
+        self.records(sequence)
+            .map(|(_, record)| {
+                record.written().then(|| {
+                    let [mut hits, mut tiered, mut absent] = [(); 3].map(|_| BTreeMap::new());
+                    for (expert, source) in record.choices() {
+                        let rows = match Use::of(source, placer) {
+                            Use::Bank => &mut hits,
+                            Use::Tier => &mut tiered,
+                            Use::File => &mut absent,
+                        };
+                        *rows.entry(expert).or_insert(0_u64) += 1;
+                    }
+                    ReadRows { hits: hits.into_values().collect(), misses: tiered.into_values().chain(absent.into_values()).collect() }
+                })
+            })
+            .collect()
+    }
+
     /// `lines` refined by the load's real work now ([`Self::with_observed`]):
     /// what the route's policy words are written from.
     pub(super) fn refined(&self, lines: &[ExpertLines]) -> Arc<[ExpertLines]> {
         self.with_observed(&self.lock().costs, lines)
     }
 
-    /// `lines` with each layer's landing line and CPU site line now, which
-    /// the load observes beside the lines it was priced on.
+    /// `lines` with each layer's landing line, CPU site line and GPU lines
+    /// now, which the load observes beside the lines it was priced on.
     fn with_observed(&self, costs: &Costs, lines: &[ExpertLines]) -> Arc<[ExpertLines]> {
         lines
             .iter()
@@ -955,7 +1103,7 @@ impl Telemetry {
             .enumerate()
             .map(|(layer, (lines, &(group, _)))| {
                 let site = costs.site(layer);
-                lines.landing(costs.landing(group), costs.convert.get(group).copied().flatten()).sited(site)
+                lines.landing(costs.landing(group), costs.convert.get(group).copied().flatten()).sited(site).passed(costs.block(layer, lines))
             })
             .collect()
     }
@@ -1126,12 +1274,17 @@ impl Telemetry {
         move |layer, expert| crate::experts::reuse::Reuse::of(&ranking).in_top(layer, expert)
     }
 
-    /// Step `sequence` ended uncompleted: its cost and its rings are
-    /// dropped.
+    /// Step `sequence` ended, completed or not: what it left uncompleted,
+    /// its cost, its rings and its sampled blocks, is dropped.
     pub(super) fn end_step(&self, sequence: Step) {
-        let costs = &mut self.lock().costs;
-        costs.running.remove(&sequence);
-        costs.hinted.retain(|&(hinted, ..), _| hinted != sequence);
+        {
+            let costs = &mut self.lock().costs;
+            costs.running.remove(&sequence);
+            costs.hinted.retain(|&(hinted, ..), _| hinted != sequence);
+        }
+        if self.samples(sequence) {
+            self.sampled.lock().expect("the sampled blocks").retain(|&(step, _), _| step != sequence);
+        }
     }
 
     /// Step `sequence` completed (`completion`): its cost is the last
@@ -1144,13 +1297,14 @@ impl Telemetry {
         completion: CompletedStep,
         sited: &dyn Fn(usize) -> (u64, u64, Duration),
         priced: Option<&[ExpertLines]>,
-    ) -> Result<(), ReadLineError> {
+    ) -> Result<(), CompletionError> {
         // A decode step's routing at each streamed layer, read from its
         // records before anything is recorded.
         let decoded = match completion {
             CompletedStep::Prompt => None,
-            CompletedStep::Decode(decoded) => {
-                Some((decoded, self.routed(sequence), self.tiered(sequence), self.sourced(sequence), self.absent(sequence)))
+            CompletedStep::Decode(mut decoded) => {
+                let blocks = decoded.sampled.take().map(|lines| self.sampled_blocks(sequence, lines)).transpose()?;
+                Some((decoded, self.routed(sequence), self.tiered(sequence), self.sourced(sequence), self.absent(sequence), blocks))
             }
         };
         let mut recorded = self.lock();
@@ -1170,7 +1324,7 @@ impl Telemetry {
         // The step's hint candidates by ring rank, into the window that
         // prices hints ([`Recent`]).
         let mut ranks = Ranks::default();
-        if let Some((_, routed, tiered, sourced, absent)) = &decoded {
+        if let Some((_, routed, tiered, sourced, absent, blocks)) = &decoded {
             for (experts, read) in cost.experts.iter_mut().zip(routed) {
                 experts.routed = Some(read.clone());
             }
@@ -1208,6 +1362,14 @@ impl Telemetry {
                     costs.sites[layer].observe(cpu, rows, path.as_secs_f64(), row);
                 }
                 served_within(cpu, hosted, absent[layer], layer, sequence);
+                // A sampled step's block at this layer, over what it read,
+                // where its route recorded it.
+                if let Some((blocks, read, &seconds)) =
+                    blocks.as_ref().and_then(|blocks| Some((blocks, blocks.rows[layer].as_ref()?, blocks.seconds.get(&layer)?)))
+                {
+                    let (x, seconds) = block_point(&blocks.lines[layer], read, (cpu, rows), seconds);
+                    costs.blocks[layer].observe(x, seconds);
+                }
                 total.sited += cpu;
                 (cost.experts[layer].sited, cost.experts[layer].site_path) = (cpu, path);
                 cost.experts[layer].missed.extend(served.iter().copied());
@@ -1683,6 +1845,28 @@ fn compute(group: &mut GroupCost, facts: &mut GroupFacts, served: Point, interva
     facts.compute[served.layer] = step;
 }
 
+/// A sampled block's point of its layer's block line: its hits, link
+/// misses and sited misses (`sited`: the CPU site's experts and their rows)
+/// as experts of one row, against its device `seconds` less what their rows
+/// past each one's first take at the step's `lines` (the resident line a
+/// hit's, the link line a link miss's, the CPU's row cost a sited one's,
+/// as `SiteRequests` takes it). Which misses the site served is known by
+/// their count and rows alone, so those are taken off the misses' rows
+/// along the link line at their mean rows.
+fn block_point(lines: &ExpertLines, read: &ReadRows, sited: (u64, u64), seconds: f64) -> ([f64; 4], f64) {
+    let (cpu, cpu_rows) = sited;
+    let past = |line: &crate::assessment::PassLine, rows: &[u64]| rows.iter().map(|&rows| ExpertLines::rows_past_first(line, rows as f64)).sum::<f64>();
+    let links = (read.misses.len() as u64).checked_sub(cpu).expect("the CPU site serves only misses");
+    let sited_link = match cpu {
+        0 => 0.,
+        _ => cpu as f64 * ExpertLines::rows_past_first(&lines.gpu.link, cpu_rows as f64 / cpu as f64),
+    };
+    let sited_rows = cpu_rows.checked_sub(cpu).expect("every expert a request serves names a row");
+    let sited_cpu = lines.host.cpu.map_or(0., |site| site.expert.row.bound().get() * 1e-9) * sited_rows as f64;
+    let rows = past(&lines.gpu.resident, &read.hits) + past(&lines.gpu.link, &read.misses) - sited_link + sited_cpu;
+    ([1., read.hits.len() as f64, links as f64, cpu as f64], seconds - rows)
+}
+
 /// Layer `layer`'s CPU site served `cpu` of step `sequence`'s misses, of
 /// which its routing record resolved `tiered` to tier records and `absent`
 /// to the file (landed into the tier during the step): the site serves
@@ -1716,6 +1900,7 @@ fn feed_decode(
         group,
         begun,
         alone,
+        sampled: _,
     } = decoded;
     let (previous, now) = ended;
     let counted = recorded.is_some();

@@ -426,6 +426,13 @@ impl ExpertBank {
         &self.watcher.shared().parks
     }
 
+    /// Step `sequence`'s run of streamed layer `layer`'s block was sampled
+    /// (`spans`, `marks` at its ends), whose device time its completion
+    /// observes into the layer's block line.
+    pub(crate) fn block_sampled(&self, sequence: u64, layer: usize, spans: seismic::NativeSpans, marks: (usize, usize)) {
+        self.watcher.shared().block_sampled(sequence, layer, spans, marks);
+    }
+
     /// The bank's index of the streamed routed layer of `scope`.
     pub(crate) fn streamed_layer(&self, scope: WeightScope) -> Result<usize, String> {
         self.layer(scope).map(|(index, _)| index)

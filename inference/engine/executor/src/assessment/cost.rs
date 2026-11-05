@@ -602,6 +602,29 @@ impl ExpertLines {
         Self { host: HostLines { cpu: Some(cpu), ..self.host }, ..self }
     }
 
+    /// The lines with the GPU's per-expert costs as the load observes its
+    /// sampled steps' blocks take (`[fixed, per hit, per link miss, per
+    /// sited miss]` seconds, an expert of one row, its rows past the first
+    /// at the job's lines, which it keeps): a hit's in place of the
+    /// resident line's weights, a link miss's in place of the link line's,
+    /// what each costs the device beside the machine's other work. A term
+    /// past a policy word is priced at a word's most
+    /// ([`Nanoseconds::saturating`]).
+    pub fn passed(self, observed: Option<[f64; 4]>) -> Self {
+        let Some([_, hit, link, _]) = observed else {
+            return self;
+        };
+        let refined = |line: PassLine, seconds: f64| PassLine { weights: Nanoseconds::saturating(seconds), ..line };
+        Self { gpu: GpuLines { link: refined(self.gpu.link, link), resident: refined(self.gpu.resident, hit) }, ..self }
+    }
+
+    /// What `rows` rows of one expert take past its first along `line`,
+    /// in seconds: what a block's time holds beyond the expert of one row
+    /// its line's term is.
+    pub fn rows_past_first(line: &PassLine, rows: f64) -> f64 {
+        (line.nanoseconds(rows) - line.nanoseconds(1.)) * 1e-9
+    }
+
     /// What `count` file misses of the layer add past their reads' end, at
     /// the site that lands them sooner: the host's, or the device's convert
     /// in their barrier (none measured yet: nothing to price).
@@ -859,6 +882,30 @@ mod tests {
         assert!((ready - (200e-6 + 1_930_000. / 6e9)).abs() < 1e-12);
         let served = lines.serve(Pass::Decode, &hits(9.), &[Miss { rows: 1., ready_seconds: ready }]);
         assert!((served.end_seconds - (ready + 44e-6)).abs() < 1e-9, "{served:?}");
+    }
+
+    /// The GPU's per-hit and per-link-miss costs as sampled blocks took
+    /// replace the resident and link lines' weights, their row costs kept,
+    /// a term past a policy word at a word's most; none observed keeps the
+    /// job's.
+    #[test]
+    fn the_gpu_lines_are_what_sampled_blocks_took() {
+        let lines = lines();
+        let passed = lines.passed(Some([100e-6, 20e-6, 300e-6, 50e-6]));
+        assert_eq!((passed.gpu.resident.weights.get(), passed.gpu.link.weights.get()), (20_000., 300_000.));
+        assert_eq!((passed.gpu.resident.row, passed.gpu.link.row), (lines.gpu.resident.row, lines.gpu.link.row));
+        assert_eq!(lines.passed(Some([100e-6, 20e-6, 5., 0.])).gpu.link.weights.word(), i32::MAX);
+        assert_eq!(lines.passed(None), lines);
+    }
+
+    /// Rows past an expert's first along a GPU line are what its arithmetic
+    /// takes past its record's read: none while the read is the slower.
+    #[test]
+    fn rows_past_an_experts_first_are_its_arithmetic_past_its_read() {
+        let line = PassLine::of(10e-6, 4e-6).unwrap();
+        assert_eq!(ExpertLines::rows_past_first(&line, 1.), 0.);
+        assert_eq!(ExpertLines::rows_past_first(&line, 2.), 0.);
+        assert!((ExpertLines::rows_past_first(&line, 5.) - 10e-6).abs() < 1e-15);
     }
 
     /// The CPU site's line as its requests took replaces the job's where a

@@ -725,6 +725,9 @@ impl Shared {
                 _flight: (route == StepRoute::Decode && self.sites_served.load(std::sync::atomic::Ordering::Acquire))
                     .then(|| self.compute.flight())
                     .flatten(),
+                // A decode step on its flight's stamp times its blocks by
+                // the lines it begins under, once they are priced.
+                sampled: (route == StepRoute::Decode && self.telemetry.samples(admission.next)).then(|| self.priced()).flatten(),
                 route,
                 reads: index,
                 sequence: admission.next,
@@ -758,6 +761,10 @@ pub(crate) struct ExpertStep {
     /// The site flight a decode step issues while it runs, where the load
     /// has site work.
     _flight: Option<crate::experts::compute::Flight>,
+    /// The lines a sampled decode step's blocks are timed by
+    /// (`Telemetry::samples`), decided as it begins; none of a step not
+    /// sampled.
+    sampled: Option<Arc<[ExpertLines]>>,
     /// Its load's pulse's late beats as it began (`Pulse::late_beats`).
     late: u64,
 }
@@ -787,19 +794,27 @@ pub(super) struct DecodeLaunch {
 }
 
 /// A decode step completed: how its load records it, its launch, its
-/// group, when that began and whether it was alone in it.
+/// group, when that began and whether it was alone in it, and the lines its
+/// blocks were sampled by, where they were.
 pub(super) struct Decoded {
     pub(super) recording: Option<Recording>,
     pub(super) launch: Option<DecodeLaunch>,
     pub(super) group: Step,
     pub(super) begun: Instant,
     pub(super) alone: bool,
+    pub(super) sampled: Option<Arc<[ExpertLines]>>,
 }
 
 impl ExpertStep {
     /// The sequence the step's runs set the step word to (`routed_step`).
     pub fn sequence(&self) -> Step {
         self.sequence
+    }
+
+    /// Whether the step's runs time their blocks, each whose ends are
+    /// marked (`Telemetry::samples`).
+    pub fn samples(&self) -> bool {
+        self.sampled.is_some()
     }
 
     /// The group reads record its group's passes write their reads to
@@ -839,6 +854,7 @@ impl ExpertStep {
                     group,
                     begun,
                     alone,
+                    sampled: self.sampled.take(),
                 })
             }
         };
@@ -849,7 +865,7 @@ impl ExpertStep {
             &|layer| shared.compute.sited(layer, sequence),
             shared.priced().as_deref(),
         ) {
-            shared.lost_read_line(error);
+            shared.failed_completion(error);
         }
         if let Some(reason) = shared.life.ended() {
             return Err(StepFailure::Watcher(reason));
@@ -1006,6 +1022,7 @@ impl ExpertStep {
                 None,
                 crate::experts::reuse::Reuse::ranking(&[], &[], Vec::new()),
                 Vec::new(),
+                false,
             ),
             lent: super::lent::LentRecords::new(),
             filled: std::sync::atomic::AtomicBool::new(false),
