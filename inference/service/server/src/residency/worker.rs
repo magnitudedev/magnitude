@@ -458,11 +458,11 @@ fn reported_exit(
     Ok(None)
 }
 
-/// How long a stopped worker is waited for once killed: on Windows, the bound [`stop`] gives
-/// its job object's processes to be proven gone. On Unix a killed process is reaped once the
-/// kernel releases it, which a driver can delay without bound, so a caller that must not wait
-/// on that holds it to the same bound.
-pub(crate) const KILL_REAP: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a stopped worker is waited for once killed, on Windows: the bound [`stop`] gives its
+/// job object's processes to be proven gone. On Unix a killed process is reaped once the kernel
+/// releases it, which a driver can delay without bound, and its owner waits for that.
+#[cfg(windows)]
+const KILL_REAP: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(unix)]
 fn observe_exit(process: &mut BlockingProcess) -> std::io::Result<Option<ExitStatus>> {

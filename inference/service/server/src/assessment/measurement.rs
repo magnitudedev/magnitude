@@ -7,8 +7,8 @@
 //! prices its experts again on what the job stored; and for its time at most
 //! ([`magnitude_executor::assessment::MEASUREMENT_SECONDS`] from its start, the worker's own
 //! start among it): the worker is given what is left of it and starts no point past it, and is
-//! killed at twice it, as a point that has not ended by then has hung, whatever it is doing, and
-//! waited for a bounded time on a detached task. A load wanting the device, or a
+//! killed at twice it, as a point that has not ended by then has hung, whatever it is doing; the
+//! device is released once its process is proven gone. A load wanting the device, or a
 //! request for the idle model it runs beside, preempts it, killing it at once. A killed job's records stand, as each is stored as it is
 //! made; its attempts are released rather than counted, and the next job resumes from what is
 //! stored. Its state moves `Unmeasured → Measuring → Measured | Failed { retry_at }` (a
@@ -32,15 +32,8 @@ use seismic::measure::Record;
 use tokio::sync::{mpsc, watch};
 
 use crate::device_lock::{DeviceJob, DeviceLock, ResidentRoom};
-use crate::residency::controller::GRACEFUL_EXIT;
-use crate::residency::worker::{JobWorker, KILL_REAP};
+use crate::residency::worker::JobWorker;
 use crate::worker_process::WorkerLauncher;
-
-/// How long a job's process is waited for once it reported or was killed: a reported job's own
-/// exit ([`GRACEFUL_EXIT`]), then the kill's reap ([`KILL_REAP`]), the two waits its retirement
-/// makes. Past it the wait goes on detached and the device is released, even though the process
-/// is not proven gone.
-const EXIT_WAIT: Duration = GRACEFUL_EXIT.saturating_add(KILL_REAP);
 
 /// The first retry's delay after a failed job. A retry waits at least twice as long as the failed
 /// job ran, so a job that fails every time occupies the device at most a third of the time, and
@@ -111,8 +104,8 @@ pub enum JobFrame {
 /// A started job's process.
 pub trait JobProcess: Send + 'static {
     /// Return once the process is gone. One that `reported` its outcome is given
-    /// [`GRACEFUL_EXIT`] to exit on its own, as a reported Prepare is; any other is killed.
-    /// Blocking.
+    /// [`GRACEFUL_EXIT`](crate::residency::controller::GRACEFUL_EXIT) to exit on its own, as a
+    /// reported Prepare is; any other is killed. Blocking.
     fn retire(self: Box<Self>, reported: bool) -> std::io::Result<()>;
     /// The process's recent standard error, for a lost job's report.
     fn diagnostics(&self) -> String;
@@ -507,7 +500,7 @@ enum Killed {
 /// it is started, so a point it began by then runs to its end, and its frames are read until it
 /// reports its outcome, twice `time` has passed or residency wants the device, either of which
 /// kills it at once; its process is then
-/// retired, waiting at most [`EXIT_WAIT`] on a detached task, and the device released. A killed
+/// proven retired, and only then the device released. A killed
 /// job's attempts are then released, so a kill never counts against a point.
 async fn run_job<M: MeasuredMachine>(
     machine: &Arc<M>,
@@ -581,44 +574,33 @@ async fn run_job<M: MeasuredMachine>(
         })
     });
     let reported = matches!(outcome, Ok(Ok(_)));
-    let retired = magnitude_service_utils::blocking::run(move || process.retire(reported));
-    match tokio::time::timeout(EXIT_WAIT, retired).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            tracing::warn!(%error, "the measurement job could not be shown to have ended");
+    // The device is released only once the process is proven gone, however long the kernel takes
+    // to reap it, so no load or request starts beside a job still holding memory. The hold moves
+    // with the retirement: a dropped wait detaches it, and the device stays held until it ends.
+    // A process that cannot be shown to have ended holds memory nothing accounts for.
+    magnitude_service_utils::blocking::run(move || {
+        if let Err(error) = process.retire(reported) {
+            panic!("the measurement job could not be shown to have ended: {error}");
         }
-        Err(_) => tracing::warn!(
-            wait = ?EXIT_WAIT,
-            "the measurement job did not end within its exit wait; it is left to end detached"
-        ),
-    }
-    // The device is released: a waiting share proceeds.
-    drop(exclusive);
+        // The device is released: a waiting share proceeds.
+        drop(exclusive);
+    })
+    .await;
     let killed = match outcome {
         Ok(outcome) => return JobEnd::Ended(outcome, recorded),
         Err(killed) => killed,
     };
-    // The frames the job sent before it was killed end once its stream does; an attempt it
-    // reported is one its markers may count, and a record it reported is stored. Read for at
-    // most the exit wait.
-    let drained = tokio::time::timeout(EXIT_WAIT, async {
-        while let Some(frame) = frames.recv().await {
-            match frame {
-                JobFrame::Attempting(key) => attempted.push(key),
-                JobFrame::Recorded(key, record) => {
-                    recorded += 1;
-                    log_record(&key, &record);
-                }
-                JobFrame::Finished(_) => {}
+    // The process is gone, so its stream has ended: every attempt it reported, one its markers may
+    // count, and every record it reported, which is stored, is read.
+    while let Some(frame) = frames.recv().await {
+        match frame {
+            JobFrame::Attempting(key) => attempted.push(key),
+            JobFrame::Recorded(key, record) => {
+                recorded += 1;
+                log_record(&key, &record);
             }
+            JobFrame::Finished(_) => {}
         }
-    })
-    .await;
-    if drained.is_err() {
-        tracing::warn!(
-            wait = ?EXIT_WAIT,
-            "a killed measurement job's stream did not end; attempts it sent after are counted"
-        );
     }
     let released = {
         let machine = Arc::clone(machine);
@@ -752,7 +734,10 @@ mod tests {
             self.started.fetch_add(1, Ordering::SeqCst);
             self.log.lock().unwrap().push("start".into());
             self.given.lock().unwrap().push(time);
-            Ok(self.jobs.lock().unwrap().remove(0))
+            // Past its script, a job fails to start, as one whose worker cannot be spawned.
+            let mut jobs = self.jobs.lock().unwrap();
+            anyhow::ensure!(!jobs.is_empty(), "no job is scripted");
+            Ok(jobs.remove(0))
         }
 
         fn release_killed(&self, job: MeasureJob, keys: &[PointKey]) -> anyhow::Result<()> {
@@ -765,12 +750,16 @@ mod tests {
         }
     }
 
-    /// A process that records how it was retired.
-    struct RecordedProcess(Arc<Mutex<Option<bool>>>);
+    /// A process that records how it was retired, and whose stream ends as it retires, as a real
+    /// one's ends once the process is gone.
+    struct RecordedProcess {
+        retired: Arc<Mutex<Option<bool>>>,
+        _stream: mpsc::Sender<JobFrame>,
+    }
 
     impl JobProcess for RecordedProcess {
         fn retire(self: Box<Self>, reported: bool) -> std::io::Result<()> {
-            *self.0.lock().unwrap() = Some(reported);
+            *self.retired.lock().unwrap() = Some(reported);
             Ok(())
         }
 
@@ -779,23 +768,25 @@ mod tests {
         }
     }
 
-    /// A job that reports `frames` and keeps its stream open, with how it was retired.
+    /// A job that reports `frames` and keeps its stream open until its process retires, with how
+    /// it was retired, and what sends it more frames while it runs.
     fn job(
         frames: Vec<JobFrame>,
-    ) -> (StartedJob, Arc<Mutex<Option<bool>>>, mpsc::Sender<JobFrame>) {
+    ) -> (StartedJob, Arc<Mutex<Option<bool>>>, mpsc::WeakSender<JobFrame>) {
         let (sender, receiver) = mpsc::channel(8);
         for frame in frames {
             assert!(sender.try_send(frame).is_ok());
         }
         let retired = Arc::new(Mutex::new(None));
+        let more = sender.downgrade();
         (
             StartedJob {
                 job: MeasureJob(7),
                 frames: receiver,
-                process: Box::new(RecordedProcess(Arc::clone(&retired))),
+                process: Box::new(RecordedProcess { retired: Arc::clone(&retired), _stream: sender }),
             },
             retired,
-            sender,
+            more,
         )
     }
 
@@ -837,6 +828,8 @@ mod tests {
         for point in 0..7 {
             tokio::time::sleep(tick).await;
             frames
+                .upgrade()
+                .expect("the job runs")
                 .send(JobFrame::Attempting(key(&point.to_string())))
                 .await
                 .unwrap();
@@ -1177,11 +1170,9 @@ mod tests {
             interval: None,
             samples: 1,
         });
-        let (first, _, _first) = job(vec![
-            JobFrame::Recorded(key("a"), record),
-            JobFrame::Finished(Ok(Vec::new())),
-        ]);
-        let (second, _, _second) = job(vec![JobFrame::Finished(Ok(Vec::new()))]);
+        // Neither reports its outcome: each runs until its time ends and it is killed.
+        let (first, _, _first) = job(vec![JobFrame::Recorded(key("a"), record)]);
+        let (second, _, _second) = job(Vec::new());
         let machine = ScriptedMachine::new(vec![first, second], vec![PENDING, PENDING]);
         let began = tokio::time::Instant::now();
         let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled());
@@ -1192,8 +1183,10 @@ mod tests {
             .clone();
         assert_eq!(failed.measurements, PENDING);
         assert_eq!(machine.started.load(Ordering::SeqCst), 2);
+        // Each ran to its kill at twice its time; a backoff between them would add at least
+        // the first retry's delay.
         assert!(
-            began.elapsed() < FIRST_RETRY,
+            began.elapsed() < time() * 4 + FIRST_RETRY,
             "the second job followed the first with no backoff"
         );
     }
