@@ -265,8 +265,12 @@ impl ExecutionPlanDraft {
         definition: &ModelDefinition,
         cache: Option<&crate::KernelCache>,
     ) -> Result<AssessmentMemoryCharge, PlanError> {
-        crate::assessment::execution_memory_charge(definition, self, cache)
-            .map_err(|error| PlanError::ResourcePlanning(error.to_string()))
+        crate::assessment::execution_memory_charge(definition, self, cache).map_err(|error| match error {
+            crate::assessment::AssessmentError::Graph(crate::GraphError::KernelDomain(violation)) => {
+                PlanError::KernelDomain(violation)
+            }
+            error => PlanError::ResourcePlanning(error.to_string()),
+        })
     }
 
     /// What the draft allocates in the device's allocation domain at the

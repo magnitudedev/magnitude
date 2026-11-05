@@ -57,6 +57,10 @@ pub enum PlanError {
     Topology(&'static str),
     Arithmetic(&'static str),
     ResourcePlanning(String),
+    /// A kernel call of the load's programs at statics outside its kernel's
+    /// domain on the backend, found while charging the load's memory: the
+    /// model's shapes are beyond what the engine's kernels execute.
+    KernelDomain(seismic::KernelDomainViolation),
     Resource(CapacityError),
     /// The weight cap is below the weights a load holds with its expert
     /// bank at its minimum: each group's least records, what its steps need
@@ -173,6 +177,7 @@ impl fmt::Display for PlanError {
             Self::ResourcePlanning(detail) => {
                 write!(formatter, "resource planning failed: {detail}")
             }
+            Self::KernelDomain(violation) => violation.fmt(formatter),
             Self::Resource(source) => source.fmt(formatter),
             Self::WeightCap { cap, needed } => write!(
                 formatter,

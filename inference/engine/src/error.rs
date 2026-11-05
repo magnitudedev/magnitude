@@ -560,6 +560,11 @@ pub(crate) fn classify_plan(error: PlanError, backend: seismic::BackendName) -> 
         | PlanError::UnportedScale(_)
         | PlanError::Unstreamed(_)) => unsupported(&error),
         error @ PlanError::WeightCap { .. } => PlanOutcome::Configuration(error.to_string()),
+        PlanError::KernelDomain(violation) => PlanOutcome::Unsupported(kernel_domain(
+            violation.backend.as_str(),
+            violation.entry,
+            violation.statics,
+        )),
         error @ (PlanError::Arithmetic(_)
         | PlanError::ResourcePlanning(_)
         | PlanError::Resource(_)) => PlanOutcome::Internal(error.to_string()),
