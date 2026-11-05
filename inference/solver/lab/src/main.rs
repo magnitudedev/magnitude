@@ -427,14 +427,23 @@ fn verify(args: &Args) -> LabResult<()> {
 }
 
 fn cp_sat(input: &Path, seconds: f64) -> LabResult<reference::ReferenceResult> {
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("reference/cp_sat.py");
     let python = std::env::var("SOLVER_LAB_PYTHON").unwrap_or_else(|_| "python3".into());
-    let output = std::process::Command::new(python)
-        .arg(script)
+    // The reference script is part of the binary; Python reads it from standard input (`-`).
+    let mut child = std::process::Command::new(python)
+        .arg("-")
         .arg(input)
         .arg("--seconds")
         .arg(seconds.to_string())
-        .output()?;
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    // Always reap the child: if it exits before reading the script, its stderr explains why.
+    let written = std::io::Write::write_all(
+        &mut child.stdin.take().expect("piped stdin"),
+        include_bytes!("../reference/cp_sat.py"),
+    );
+    let output = child.wait_with_output()?;
     if !output.status.success() {
         return Err(format!(
             "CP-SAT reference failed: {}",
@@ -442,6 +451,7 @@ fn cp_sat(input: &Path, seconds: f64) -> LabResult<reference::ReferenceResult> {
         )
         .into());
     }
+    written?;
     let raw: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     let result: reference::ReferenceResult = serde_json::from_value(raw.clone())?;
     if let ReferenceOutcome::Optimal(cost) = result.outcome {
