@@ -19,6 +19,21 @@ from pathlib import Path
 from ..engine import NOTE, Headers, Step, Weights
 from ..sources import Source
 
+# The packages of the evaluation workspace (`evaluation/pyproject.toml`'s members).
+WORKSPACE = ("magnitude-fixtures", "magnitude-references", "magnitude-bench", "magnitude-rig")
+
+
+def environment(name: str, *selection: str) -> Step:
+    """The build step that syncs the side's environment (`{venv}`, in its build output) from the
+    evaluation workspace's lock, `selection` choosing what (`--package P`, `--all-packages`).
+    Its packages are installed, not editable, so the environment reads nothing of the checkout
+    once the side releases it, and every workspace package is reinstalled, built from the tree
+    being built: uv keys a local package's built wheel by its project file alone, so it would
+    otherwise install the wheel some other tree built."""
+    reinstall = tuple(argument for package in WORKSPACE for argument in ("--reinstall-package", package))
+    return Step(name, ("uv", "sync", "--frozen", "--no-editable", *reinstall, "--project", "{src}/evaluation",
+                       *selection))
+
 
 @dataclass(frozen=True)
 class Measure:

@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import types
+from pathlib import Path
 
 import pytest
 
@@ -53,7 +54,9 @@ def test_a_run_builds_in_its_checkout_runs_recorded_and_fetches(rig):
     assert staged["tree"] == str(tmp_path / "test-worktree") and staged["commit"] == "c" * 40
     checkout = tmp_path / outcome.host / "checkouts" / "slot-0"
     assert (checkout / "target" / "built").exists() and (checkout / "src" / "data.txt").exists()
-    assert (outcome.results / "job" / "result.txt").read_text() == str(checkout / "target")
+    # The job read the build's output, not the checkout, and the output went with the run.
+    output = Path((outcome.results / "job" / "result.txt").read_text()).parent
+    assert output.parent == tmp_path / outcome.host / "outputs" and not output.exists()
     assert (outcome.results / "job" / "host.json").exists()  # recorded with the host's facts
     assert "the source" in (outcome.results / "logs" / "job-job.log").read_text()
     record = json.loads((outcome.results / "rig.json").read_text())
@@ -102,6 +105,32 @@ def test_a_run_reads_what_its_caller_staged_and_never_waits_on_it(rig):
     assert outcome.codes == {"job": 0} and "the input" in (outcome.results / "logs" / "job-job.log").read_text()
     assert (outcome.results / "inputs" / "prompt.txt").exists()
     assert not list(outcome.results.glob("stage-*"))
+
+
+def test_a_side_releases_its_checkout_as_its_build_ends_unless_a_job_of_it_reads_the_checkout(rig):
+    """A released side's jobs run from its output, without cargo's target or the recording
+    wrapper, and naming its checkout is a planning error; a job that reads the checkout keeps it."""
+    hosts, source, _ = rig
+
+    def ops(job: engine.Step) -> list:
+        run = request(source, jobs=[("job", job)], host="alpha")
+        work = run.work("alpha")
+        candidate = engine.Candidate(connect(hosts.host("alpha")), {}, work,
+                                     {engine.build_key(work, side): 0 for side in work.sides}, 0.0, (60.0,))
+        return engine.plan_for(run, candidate, "planned").ops
+
+    released = ops(engine.Step("job", (PY, "{target}/tool")))
+    (built,) = [op for op in released if op["op"] == "built"]
+    (job,) = [op for op in released if op.get("job") == "job"]
+    assert built["release"] and job["cwd"] == "{output:source}/src" and "{output:source}/target/tool" in job["argv"]
+    assert engine.COMPILER not in job["env"] and "CARGO_TARGET_DIR" not in job["env"]
+    with pytest.raises(ValueError, match="names {checkout}"):
+        ops(engine.Step("job", (PY, "{checkout}/x")))
+    kept = ops(engine.Step("job", (PY, "{checkout}/x"), checkout=True))
+    (built,) = [op for op in kept if op["op"] == "built"]
+    (job,) = [op for op in kept if op.get("job") == "job"]
+    assert not built["release"] and "{checkout:source}/x" in job["argv"]
+    assert job["env"]["CARGO_TARGET_DIR"] == "{checkout:source}/target"
 
 
 def test_placement_plans_each_candidate_and_waits_for_the_hold_of_its_own_work(rig):
@@ -171,7 +200,7 @@ def test_a_warm_checkout_on_a_busy_host_wins_only_while_it_outweighs_the_content
     """A warm build shares the CPU with each owed build for as long as it lasts itself: beside
     two cold builds it still ends before a cold build alone, until its own seconds times three
     pass a cold build's."""
-    warm = {"name": "slot-0", "source": "mine", "size": 0, "warmth": agent.SAME}
+    warm = {"name": "slot-0", "source": "mine", "size": 0, "warmth": agent.SAME, "shared": False}
     idle = _candidate("idle", checkouts=[None], building=[])
     busy = _candidate("busy", checkouts=[warm], building=[1200.0, 1200.0], builds=(60.0,))
     assert engine._start(busy) == 180 and engine._start(idle) == 1200
@@ -279,7 +308,7 @@ def test_a_build_is_priced_by_the_hosts_measured_builds_and_a_derived_estimate_b
     history = [build(1500, None, False), build(900, unrelated, True), build(200, parent, True),
                build(1400, parent, False)]  # cold, near-cold, incremental, first build of it there
     host = lambda builds, checkout: {"checkouts": [checkout], "measured": {key: {"builds": builds}}, "slowest": 1800}
-    claims = lambda commit, built: {"commit": commit, "built": built}
+    claims = lambda commit, built: {"commit": commit, "built": built, "shared": False}
     here = host(history, claims(parent, True))
     assert engine.build_seconds(here, 0, key, head, []) == 200  # incremental: the latest incremental
     for cold in (claims(parent, False), claims(unrelated, True), claims(None, True), None):
@@ -288,6 +317,9 @@ def test_a_build_is_priced_by_the_hosts_measured_builds_and_a_derived_estimate_b
     assert engine.build_seconds(host([], claims(parent, True)), 0, key, head, others) == 1700
     assert engine.build_seconds(host([build(1500, None, False)], claims(parent, True)), 0, key, head, []) == 1500
     assert engine.build_seconds(host([], None), 0, key, head, []) == 1800
+    # A checkout live runs of the tree and build hold: what their build still owes, then fresh.
+    assert engine.build_seconds(host(history, {"commit": parent, "built": True, "shared": True, "owed": 30}),
+                                0, key, head, []) == 30
 
     placed = _candidate("rtx", checkouts=[None], building=[], builds=(1400.0,))
     placed.status["waits"]["device"] = 2000.0  # a run holding the device for 2000 s more

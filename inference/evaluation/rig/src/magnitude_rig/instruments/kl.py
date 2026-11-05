@@ -32,13 +32,12 @@ import json
 from pathlib import Path
 
 from ..engine import Step, Weights
-from . import Answer, Instrument, JobResult, Pairing, Plan, harness
+from . import Answer, Instrument, JobResult, Pairing, Plan, environment, harness
 
 REFERENCES = "{venv}/bin/magnitude-references"
 BUILDS = (
     harness.BUILD,
-    Step("references", ("uv", "sync", "--frozen", "--project", "{src}/evaluation",
-                        "--package", "magnitude-references")),
+    environment("references", "--package", "magnitude-references"),
 )
 
 

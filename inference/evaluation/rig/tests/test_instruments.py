@@ -14,7 +14,7 @@ import pytest
 from magnitude_rig import ab, cli, engine, selectors, store
 from magnitude_rig.build import BuildIdentity
 from magnitude_rig.host import memory
-from magnitude_rig.instruments import REGISTRY, JobResult, Measure, device
+from magnitude_rig.instruments import REGISTRY, WORKSPACE, JobResult, Measure, device
 from magnitude_rig.instruments import step as step_instrument
 from magnitude_rig.instruments.resolution import median_interval
 
@@ -47,18 +47,33 @@ def test_a_model_must_be_in_the_catalog():
         selectors.model(f"{MODEL.split(':')[0]}:nope")
 
 
-def test_test_builds_without_running_then_runs_on_the_device():
+def test_test_builds_without_running_then_runs_its_executables_from_the_output_on_the_device():
     arguments = parse("test", *COMMON, "--", "-p", "magnitude-kernels", "--test", "routed", "--", "general")
     plan = REGISTRY["test"].plan(arguments, None, "alpha")
-    (build,) = plan.builds
+    (build,) = plan.builds  # it names its target, so no documentation tests
     assert build.argv == ("cargo", "test", "--message-format=short", "--no-run", "-p", "magnitude-kernels", "--test", "routed")
     ((_, job),) = plan.jobs
-    assert job.argv == ("cargo", "test", "-p", "magnitude-kernels", "--test", "routed", "--", "general")
-    # A cargo suite has the release catalog's headers, so no test of it lacks its inputs.
+    assert job.argv == ("{python}", "-m", "magnitude_rig.host", "tests", "--list", "{output}/tests.json", "--", "general")
+    # A cargo suite has the release catalog's headers, so no test of it lacks its inputs; the
+    # host package is on PYTHONPATH from the job's `record`, not set again.
     assert plan.device == "device" and job.env == (("MAGNITUDE_CATALOG_HEADERS", "{catalog}/headers"),)
+    # Each executable gets cargo test's name filter first, then what follows `--`, as cargo passes them.
+    for given, passed in ((("-p", "x", "--test", "routed", "general", "--", "--exact"), ("general", "--exact")),
+                          (("--lib", "general", "-p", "x"), ("general",)),
+                          (("--features=a", "-F", "b", "--test", "--lib", "general"), ("general",))):
+        ((_, filtered),) = REGISTRY["test"].plan(parse("test", *COMMON, "--", *given), None, "alpha").jobs
+        assert filtered.argv[filtered.argv.index("--") + 1:] == passed
+    assert not job.checkout
+    # One that runs documentation tests (names no target, or `--doc`) runs cargo in its checkout,
+    # which it keeps for the job.
+    for given in (("-p", "x"), ("-p", "x", "--doc"), ("-p", "x", "--lib", "--doc")):
+        ((_, whole),) = REGISTRY["test"].plan(parse("test", *COMMON, "--", *given, "--", "f"), None, "alpha").jobs
+        assert whole.argv == ("cargo", "test", *given, "--", "f") and whole.checkout
+    ((_, named),) = REGISTRY["test"].plan(parse("test", *COMMON, "--", "-p", "x", "--test=routed"), None, "alpha").jobs
+    assert not named.checkout
     assert plan.acquires == engine.Headers(None)
     vulkan = parse("test", "--backend", "vulkan", "--purpose", "p", "--estimate", "1m", "--", "-p", "x")
-    assert REGISTRY["test"].plan(vulkan, None, "alpha").jobs[0][1].env == (
+    assert REGISTRY["test"].plan(vulkan, None, "alpha").jobs[0][1].env[:2] == (
         ("SEISMIC_TEST_BACKEND", "vulkan"), ("MAGNITUDE_CATALOG_HEADERS", "{catalog}/headers"))
     # One that reads a model's files has the model, not the catalog.
     model = REGISTRY["test"].plan(parse("test", *COMMON, "--model", MODEL, "--", "-p", "x"), None, "alpha")
@@ -77,6 +92,24 @@ def test_python_tests_run_in_the_checkouts_environment_with_the_model_they_check
     job = plan.jobs[0][1]
     assert job.argv[0] == "{venv}/bin/pytest" and job.argv[-3:] == ("evaluation/references/tests/test_released.py", "-k", "qwen")
     assert dict(job.env)["MAGNITUDE_ARTIFACTS"] == "{artifacts}" and plan.acquires == engine.Weights(model)
+
+
+def test_every_environment_reinstalls_the_workspace_packages_from_the_tree_it_builds():
+    """uv keys a local package's built wheel by its project file alone, so a non-editable sync
+    reinstalls every workspace package, rebuilt from the tree, rather than a wheel another tree
+    built; the packages are the workspace's members."""
+    import tomllib
+    workspace = Path(__file__).resolve().parents[2]
+    members = tomllib.loads((workspace / "pyproject.toml").read_text())["tool"]["uv"]["workspace"]["members"]
+    assert set(WORKSPACE) == {tomllib.loads((workspace / member / "pyproject.toml").read_text())["project"]["name"]
+                              for member in members}
+    syncs = [REGISTRY["test"].plan(parse("test", *COMMON, "--suite", "python", "--", "x"), None, "alpha").builds[0],
+             REGISTRY["kl"].plan(parse("kl", "--backend", "metal", "--model", MODEL, "--context", "4096", "--purpose", "p",
+                                       "--estimate", "1m"), None, "alpha").builds[1]]
+    for step in syncs:
+        assert step.argv[:4] == ("uv", "sync", "--frozen", "--no-editable")
+        assert {step.argv[at + 1] for at, argument in enumerate(step.argv) if argument == "--reinstall-package"} \
+            == set(WORKSPACE)
 
 
 def test_python_test_answer_counts_pytests_summary(tmp_path):

@@ -1,5 +1,6 @@
 """`script`: anything no instrument answers. Runs a local file on a host of the backend, with
-the checkout's warm build, the caches, a run directory and a record. A question a script
+the checkout's warm build (kept for the script, which may build or run cargo there:
+`Step.checkout`), the caches, a run directory and a record. A question a script
 answers a second time becomes an instrument, or a case or option of one.
 
 The file runs by its `#!` line (`sh` without one), from the checkout's source root, with
@@ -46,7 +47,7 @@ def plan(arguments, source, host) -> Plan:
     if not arguments.file.is_file():
         raise SystemExit(f"script: {arguments.file} is not a file")
     builds = tuple(Step("prepare", tuple(argv)) for argv in arguments.prepare)
-    job = Step("script", ("{python}", "-c", RUNNER, "{inputs}/" + arguments.file.name), ENV)
+    job = Step("script", ("{python}", "-c", RUNNER, "{inputs}/" + arguments.file.name), ENV, checkout=True)
     device = None if arguments.hold == "build" else arguments.hold
     acquires = None if arguments.model is None else Weights(arguments.model)
     return Plan(builds=builds, jobs=(("script", job),), device=device, acquires=acquires,

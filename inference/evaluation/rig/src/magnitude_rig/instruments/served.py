@@ -23,7 +23,7 @@ import argparse
 import json
 import re
 
-from ..engine import HOST_PACKAGE, Step, Weights
+from ..engine import Step, Weights
 from ..host import served
 from . import Answer, Instrument, JobResult, Plan
 
@@ -53,7 +53,7 @@ def plan(arguments, source, host) -> Plan:
         "{python}", "-m", "magnitude_rig.host.served", "--service", SERVICE, "--bundle", "{catalog}/model-planner-inputs.bundle",
         "--models", "{models}", "--artifacts", "{artifacts}", "--fixtures", f"{{inputs}}/{arguments.fixture.name}", "--scratch", "{root}/served",
         "--run-dir", "{run_dir}", "--model", arguments.model, "--scenario", arguments.scenario, *bounds,
-    ), (("PYTHONPATH", f"{{src}}/{HOST_PACKAGE}"), *HIDDEN.get(arguments.backend, ())), fresh=True)
+    ), HIDDEN.get(arguments.backend, ()), fresh=True)
     return Plan(builds=(BUILD,), jobs=(("served", job),), device="device",
                 acquires=Weights(arguments.model, headers=True), files=(arguments.fixture,))
 

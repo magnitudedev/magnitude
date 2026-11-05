@@ -16,7 +16,7 @@ import argparse
 import json
 
 from .. import store
-from ..engine import HOST_PACKAGE, Refused, Step
+from ..engine import Refused, Step
 from . import Answer, Instrument, JobResult, Plan
 from .binaries import ASSESS, ASSESS_BUILD
 
@@ -31,8 +31,7 @@ def configure(parser: argparse.ArgumentParser) -> None:
 def plan(arguments, source, host) -> Plan:
     builds = [ASSESS_BUILD]
     jobs = [
-        ("host", Step("host", ("{python}", "-m", "magnitude_rig.host", "facts"),
-                      (("PYTHONPATH", f"{{src}}/{HOST_PACKAGE}"),))),
+        ("host", Step("host", ("{python}", "-m", "magnitude_rig.host", "facts"))),
         ("topology", Step("topology", (ASSESS, "--device", arguments.backend, "--kernels", "{engine_cache}/kernels", "--topology"))),
     ]
     if arguments.backend == "vulkan":

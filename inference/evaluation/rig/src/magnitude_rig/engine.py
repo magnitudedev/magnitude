@@ -14,17 +14,23 @@ taking no host hold: only the agent's hold on the run's directory, which keeps e
 until the runner owns it, and which a stop before the start withdraws. The run's runner
 (`host/agent.py`) then depends on nothing off the host: its only waits are on host holds. It:
 
-1. claims a checkout for each side, its alone for the run (one no live run holds, last
-   installed from the side's source if one is free, so its target is warm for exactly what
-   differs: `host/agent.py`), evicts least recently used checkouts and gone runs until every
-   checkout building on the host can add the most a build has added there (the run fails
-   before it builds when they cannot), and installs the side's stage into the checkout's
-   `src`;
+1. claims a checkout for each side: the one live runs of the side's tree and build hold, which
+   it shares (its install skipped, its build fresh once theirs ends), else the warmest no live
+   run holds, its alone until its build ends (its jobs end, for a side a job of which reads the
+   checkout: `Step.checkout`; `host/agent.py`), and the side's build output; evicts least
+   recently used checkouts and gone runs until every checkout building on the host can add the
+   most a build has added there (the run fails before it builds when they cannot), and installs
+   the side's stage into the checkout's `src`;
 2. under a build hold: installs the recording rustc wrapper, runs the build steps with the
    checkout's target, writes the build provenance of every cargo-built executable the
-   side's jobs name and withdraws every other one of the target it cannot tie to the side's
-   source (a job never runs an executable its sources did not produce), and records what the
-   build added to the checkout;
+   side's jobs name and every test executable its build produced, and withdraws every other one of the target it cannot tie to the side's
+   source (a job never runs an executable its sources did not produce), trims the checkout's
+   target to the units its kept builds reference, records what the build added to the checkout,
+   completes the side's build output (its tree, environment and executables) and releases the
+   checkout unless a job of the side reads it, and removes least recently used unheld
+   checkouts until the rig's are within its share of the volume. From then on the steps of a
+   side that released its checkout read its output (`{src}`, `{target}`, `{venv}`), and
+   `{checkout}`, which another tree may be building in, is no longer theirs to name;
 3. under the models hold: acquires the request's model into the host's model store, or, for a
    run that needs only its headers, exports the catalog's headers (each component's exact
    header, sparse at the file's full size, so it opens as the model with zero weights);
@@ -52,9 +58,10 @@ and its justification. On SIGUSR1 the caller writes what it knows now (its phase
 waits behind, its last output, the device's state) to `report.txt` in its results: what its
 caller shows when the run passes its estimate (`results.follow`).
 
-Tokens `{src}`, `{target}`, `{venv}`, `{checkout}` (the side's, which its runner names as it
-claims it), `{root}`, `{models}`,
-`{python}`, `{artifacts}`, `{catalog}` (where the run acquires headers: the header export of
+Tokens `{src}`, `{target}` (the side's: in its checkout, or in its build output once it releases
+the checkout), `{venv}` (the side's environment, in its build output), `{checkout}` (the side's,
+which its runner names as it claims it, until it is released), `{output}` (the side's build
+output), `{root}`, `{models}`, `{python}`, `{artifacts}`, `{catalog}` (where the run acquires headers: the header export of
 the acquiring side's catalog, `catalog_key`), `{engine_cache}` (the
 host's engine cache, laid out as the service's cache root: `{engine_cache}/kernels` is the
 kernel cache every checkout shares, valid by its content-addressed keys), `{runs}` (the run's
@@ -117,6 +124,10 @@ class Step:
     fresh: bool = False
     # A host path whose existence makes the step needless: the host skips it there.
     unless: str | None = None
+    # A job that reads its side's checkout (cargo building or running from its source and
+    # target): the side keeps the checkout until its jobs end, rather than releasing it as its
+    # build ends.
+    checkout: bool = False
 
 
 CATALOG_BUILD = Step("catalog tool", ("cargo", "build", "--release", "-p", "magnitude-service-catalog-tool"))
@@ -249,6 +260,14 @@ def build_steps(work: Work, side: Side) -> tuple[Step, ...]:
     return (*side.builds, dataclasses.replace(CATALOG_BUILD, unless=EXPORTED) if headers else CATALOG_BUILD)
 
 
+def tree_key(source: sources.Source) -> str:
+    """What `source` installs into a checkout: its key, commit and changes (`dirty_digest`), which
+    together fix every byte staged, so runs of one tree and build share a checkout and build it
+    once (`host/agent.py`)."""
+    identity = source.identity
+    return hashlib.sha256(json.dumps([source.key, identity.commit, identity.dirty_digest]).encode()).hexdigest()[:16]
+
+
 def build_key(work: Work, side: Side) -> str:
     """What `side`'s build is, as the hosts measure builds' sizes: its steps' commands, which
     name their targets and profiles (tokens unfilled, so the key is every host's)."""
@@ -315,12 +334,15 @@ def _incremental(built: bool, start: str | None, commit: str) -> bool:
 
 def build_seconds(status: dict, index: int, key: str, commit: str, others: list[dict]) -> float:
     """The seconds side `index`'s build (`key`, of `commit`) should take on the host whose agent
-    reports `status`: incremental when the checkout it would claim has built it at an ancestor of
-    `commit`, else cold; priced by the latest build of that class of it on this host, else the
+    reports `status`: what the build of the live runs whose checkout it would share still owes
+    (it finds every unit fresh after it); incremental when the checkout it would claim has built
+    it at an ancestor of `commit`, else cold; priced by the latest build of that class of it on this host, else the
     slowest of that class on the other candidates of its platform (`others`, their statuses); an incremental one
     unmeasured anywhere as a cold one; else the slowest build of any on this host (the agent's
     prior while none is measured)."""
     checkout = status["checkouts"][index]
+    if checkout is not None and checkout["shared"]:
+        return checkout["owed"]
     incremental = checkout is not None and _incremental(checkout["built"], checkout["commit"], commit)
 
     def measured(found: dict, wanted: bool) -> list[float]:
@@ -355,7 +377,7 @@ def _candidates(request: Request, names: tuple) -> tuple[list[Candidate], list[s
         except Refused as refused:
             return None, f"{config.alias}: {refused}"
         try:
-            sides = [(side.source.key, build_key(work, side)) for side in work.sides]
+            sides = [(side.source.key, tree_key(side.source), build_key(work, side)) for side in work.sides]
             return (remote, host_status(remote, sides), work), None
         except HostError as error:
             return None, f"{config.alias}: {error}"
@@ -480,6 +502,8 @@ def launch_line(request: Request, candidate: Candidate, idle: list[str]) -> str:
     status, found = candidate.status, candidate.status["checkouts"][0]
     if found is None:
         target = "no free checkout (cold build)"
+    elif found["shared"]:
+        target = f"checkout {found['name']}, shared with the live runs of this tree and build (builds once)"
     elif found["warmth"] == SAME:
         target = f"checkout {found['name']}, last built from this source"
     else:
@@ -509,24 +533,39 @@ class Plan:
         exports = isinstance(work.acquires, Headers) or (isinstance(work.acquires, Weights) and work.acquires.headers)
         self.catalog = catalog_key(work.sides[0].source) if exports else None
         self.ops: list[dict] = []
+        self.released: set[str] = set()  # the sides whose checkout is released: their later steps read its output
 
     @staticmethod
     def checkout(side: Side) -> str:
         """The side's checkout, which the runner names once it claims it."""
         return "{checkout:%s}" % side.label
 
+    @staticmethod
+    def output(side: Side) -> str:
+        """The side's build output, which the runner names once it claims the checkout: the tree
+        and what its build produced, which no later build changes (`host/agent.py`)."""
+        return "{output:%s}" % side.label
+
+    def base(self, side: Side) -> str:
+        """Where the side's steps find its tree: its checkout until it is released, then its output."""
+        return self.output(side) if side.label in self.released else self.checkout(side)
+
+    def keeps(self, side: Side) -> bool:
+        """Whether the side keeps its checkout until its jobs end: a job of it reads the checkout."""
+        return any(job.step.checkout for job in self.work.jobs if job.side == side.label)
+
     def stage(self, side: Side) -> str:
         """Where the caller stages the side's source (as `<stage>/src`) before the run starts."""
         return self.remote.path("runs", self.run_id, f"{sync.STAGE}{side.label}")
 
     def tokens(self, side: Side, job: Job | None) -> dict[str, str]:
-        checkout = self.checkout(side)
+        base = self.base(side)
         run_root = self.remote.path("runs", self.run_id)
         tokens = {
-            "checkout": checkout,
-            "src": f"{checkout}/src",
-            "target": f"{checkout}/target",
-            "venv": f"{checkout}/venv",
+            "src": f"{base}/src",
+            "target": f"{base}/target",
+            "venv": f"{self.output(side)}/venv",  # its build syncs it there, from the checkout's source
+            "output": self.output(side),
             "root": self.remote.root,
             "models": self.remote.models,
             "python": self.remote.python,
@@ -535,6 +574,8 @@ class Plan:
             "runs": run_root,
             "inputs": f"{run_root}/{sync.RUN_INPUTS}",
         }
+        if side.label not in self.released:
+            tokens["checkout"] = base
         if self.catalog is not None:
             tokens["catalog"] = self.remote.path("catalog-headers", self.catalog)
         if job is not None:
@@ -543,19 +584,22 @@ class Plan:
         return tokens
 
     def environment(self, step: Step, tokens: dict[str, str]) -> dict[str, str]:
+        """The step's environment: cargo's target and the recording wrapper only while the side
+        holds its checkout (an output is never built in)."""
+        cargo = {"CARGO_TARGET_DIR": tokens["target"], COMPILER: f"{tokens['checkout']}/{WRAPPER}"} \
+            if "checkout" in tokens else {}
         return {
-            "CARGO_TARGET_DIR": tokens["target"],
+            **cargo,
             "UV_CACHE_DIR": f"{self.remote.root}/cache/uv",
             "UV_PROJECT_ENVIRONMENT": tokens["venv"],
             "PIP_CACHE_DIR": f"{self.remote.root}/cache/pip",
             "HF_HUB_CACHE": f"{self.remote.root}/cache/huggingface/hub",
-            COMPILER: f"{tokens['checkout']}/{WRAPPER}",
             **self.remote.env,
             **{name: _fill(value, tokens) for name, value in step.env},
         }
 
     def host_module(self, side: Side, *arguments: str) -> tuple[list[str], dict[str, str]]:
-        return host_module(self.remote, self.checkout(side), *arguments)
+        return host_module(self.remote, self.base(side), *arguments)
 
     def add(self, op: str, **fields) -> None:
         self.ops.append({"op": op, **fields})
@@ -567,7 +611,7 @@ class Plan:
              **fields) -> None:
         """A step run from the side's source root, or, for host housekeeping (which may precede
         that root), from the host's root."""
-        cwd = self.remote.root if housekeeping else f"{self.checkout(side)}/src"
+        cwd = self.remote.root if housekeeping else f"{self.base(side)}/src"
         self.add("run", argv=argv, cwd=cwd, env=env, **fields)
 
     def to_json(self) -> dict:
@@ -594,6 +638,14 @@ def _substitute(argv: tuple[str, ...], tokens: dict[str, str]) -> list[str]:
     return [_fill(argument, tokens) for argument in argv]
 
 
+def _refuse_checkout(step: Step) -> None:
+    """Refuse to plan a job that names the checkout of a side that releases it as its build ends:
+    another tree may be building there when it runs (`Step.checkout` keeps it)."""
+    if any("{checkout}" in text for text in (*step.argv, *(value for _, value in step.env))):
+        raise ValueError(f"job {step.name!r} names {{checkout}}, which its side releases as its build "
+                         "ends: mark it Step(checkout=True)")
+
+
 def _texts(plan: Plan, side: Side) -> list[str]:
     """The side's job texts with host paths, which name the executables to prove."""
     texts = []
@@ -606,18 +658,20 @@ def _texts(plan: Plan, side: Side) -> list[str]:
 
 
 def _prepare(plan: Plan, side: Side) -> None:
-    """The side's checkout, eviction and the install of its staged source. The checkout is the
-    run's alone for its whole life; the install hold covers only the install."""
+    """The side's checkout, eviction and the install of its staged source. The checkout is held
+    until the side's build ends (its jobs end, for a side that keeps it), the install hold only
+    for the install."""
     remote = plan.remote
     build = build_key(plan.work, side)
-    plan.add("checkout", side=side.label, source=side.source.key, build=build, fallback=plan.fallbacks[build],
+    plan.add("checkout", side=side.label, source=side.source.key, tree=tree_key(side.source), build=build,
+             output=f"{tree_key(side.source)}-{build}", fallback=plan.fallbacks[build],
              commit=side.source.identity.commit, seconds=plan.builds[plan.work.sides.index(side)])
     plan.phase(f"queue-install-{side.label}")
     plan.add("hold", kind="install")
     plan.phase(f"install-{side.label}")
     plan.add("evict", side=side.label, host=remote.alias)
     plan.step(side, remote.host(AGENT, "install", "--from", f"{plan.stage(side)}/src",
-                                "--to", f"{plan.checkout(side)}/src"), {}, housekeeping=True)
+                                "--to", f"{plan.checkout(side)}/src"), {}, housekeeping=True, install=side.label)
     plan.add("release", kind="install")
 
 
@@ -631,10 +685,14 @@ def _build(plan: Plan, side: Side) -> None:
         plan.step(side, _substitute(step.argv, tokens), plan.environment(step, tokens), **unless)
     tokens = plan.tokens(side, None)
     output = plan.remote.path("runs", plan.run_id, f"provenance-{side.label}.json")
+    tests = plan.remote.path("runs", plan.run_id, f"tests-{side.label}.json")  # the runner writes it
     argv, env = plan.host_module(side, "provenance", "--output", output, "--source", tokens["src"],
-                                 "--target", tokens["target"], "--", *_texts(plan, side))
-    plan.step(side, argv, env)
-    plan.add("built", side=side.label)
+                                 "--target", tokens["target"], "--tests", tests, "--", *_texts(plan, side))
+    plan.step(side, argv, env, tests=tests)
+    keeps = plan.keeps(side)
+    plan.add("built", side=side.label, release=not keeps, provenance=output)
+    if not keeps:
+        plan.released.add(side.label)
 
 
 def _acquire(plan: Plan, side: Side) -> None:
@@ -684,6 +742,8 @@ def _jobs(plan: Plan) -> None:
         plan.step(side, argv, env)
     for job in work.jobs:
         side = sides[job.side]
+        if side.label in plan.released:
+            _refuse_checkout(job.step)
         plan.phase(f"job-{job.name}")
         tokens = plan.tokens(side, job)
         plan.step(side, [plan.remote.python, "-c", WRITE, tokens["build_file"]], {}, housekeeping=True,
@@ -697,6 +757,8 @@ def _jobs(plan: Plan) -> None:
             )
         else:
             argv = _substitute(job.step.argv, tokens)
+        # The job inherits `record`'s environment, the host package on PYTHONPATH among it, so a
+        # job running a host module names none of its own.
         record, record_env = plan.host_module(
             side, "record", "--run-dir", tokens["run_dir"], "--alias", plan.remote.alias, "--", *argv,
         )

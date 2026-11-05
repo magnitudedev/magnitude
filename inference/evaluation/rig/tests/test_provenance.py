@@ -179,6 +179,31 @@ def test_an_executable_that_names_its_source_tree_is_refused_and_one_that_embeds
 
 
 @needs_cargo
+def test_a_test_executable_the_build_produced_is_verified_and_refused_when_it_names_its_source_tree(tmp_path):
+    """A job runs the test executables of `deps/` the build produced, which no text names."""
+    source, target = workspace(tmp_path / "ws"), tmp_path / "target"
+    wrapper = provenance.install(str(tmp_path / "root"))
+    (source / "lib/tests").mkdir()
+
+    def tests() -> list:
+        env = dict({k: v for k, v in os.environ.items() if k != engine.COMPILER}, **{engine.COMPILER: wrapper})
+        messages = subprocess.run(
+            ["cargo", "test", "--no-run", "--release", "--offline", "--message-format=json", "-p", "my-lib",
+             "--test", "here", "--target-dir", str(target)],
+            cwd=source, env=env, capture_output=True, text=True, check=True).stdout.splitlines()
+        return [[m["executable"], m["manifest_path"]] for m in map(json.loads, messages)
+                if m.get("reason") == "compiler-artifact" and m.get("executable") and m["profile"]["test"]]
+
+    (source / "lib/tests/here.rs").write_text('#[test]\nfn here() { assert!(!env!("CARGO_MANIFEST_DIR").is_empty()); }\n')
+    built = tests()
+    refused = provenance.verify([], [str(source)], str(target), built)
+    assert refused["status"] == "refused" and refused["executables"][0]["status"] == "reads-source-tree"
+    (source / "lib/tests/here.rs").write_text(
+        '#[test]\nfn here() { assert!(!std::env::var("CARGO_MANIFEST_DIR").unwrap().is_empty()); }\n')
+    assert provenance.verify([], [str(source)], str(target), tests())["status"] == "verified"
+
+
+@needs_cargo
 def test_reused_unit_of_other_content_is_contradicted(tmp_path):
     source, target = workspace(tmp_path / "ws"), tmp_path / "target"
     wrapper = provenance.install(str(tmp_path / "root"))
@@ -273,11 +298,14 @@ def test_a_job_finds_only_executables_built_from_its_source(rig):
 
     first = run((build,))
     assert first.codes == {"app": 0} and "first generated" in output(first)
+    kept = json.loads((first.results / "provenance-source.json").read_text())["kept"]
+    assert "my-app" in [Path(path).name for path in kept]  # what its output holds, run from there
     (source.directory / "lib/src/part.rs").write_text(SECOND)
     stale = run(())
     assert stale.codes["app"] != 0 and "first" not in output(stale)
     proof = json.loads((stale.results / "provenance-source.json").read_text())
     assert [Path(e["path"]).name for e in proof["withdrawn"]] == ["my-app"]
+    assert "my-app" not in [Path(path).name for path in proof["kept"]]
     rebuilt = run((build,))
     assert rebuilt.codes == {"app": 0} and "second generated" in output(rebuilt)
 

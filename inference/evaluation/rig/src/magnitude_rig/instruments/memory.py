@@ -41,7 +41,7 @@ constants' comment names, then the fit over those runs' loads:
 import argparse
 import json
 
-from ..engine import HOST_PACKAGE, Step, Weights
+from ..engine import Step, Weights
 from ..host import memory
 from ..host.agent import PLAN
 from ..host.memory import RECOMMIT, RESULTS
@@ -78,8 +78,7 @@ def _measurement(options: tuple[str, ...], fresh: bool) -> Step:
     refused = memory.refusal(memory.parser().parse_args(options))
     if refused is not None:
         raise SystemExit(f"memory: {refused}")
-    return Step("memory", ("{python}", "-m", "magnitude_rig.host.memory", *options),
-                (("PYTHONPATH", f"{{src}}/{HOST_PACKAGE}"),), fresh=fresh)
+    return Step("memory", ("{python}", "-m", "magnitude_rig.host.memory", *options), fresh=fresh)
 
 
 def plan(arguments, source, host) -> Plan:

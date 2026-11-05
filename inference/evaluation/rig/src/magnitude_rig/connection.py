@@ -236,13 +236,14 @@ def setup(config: HostConfig) -> str:
     return _ssh(config, f"sh -c {shlex.quote(script)}")
 
 
-def host_status(remote: Remote, sides: list[tuple[str, str]] = ()) -> dict:
+def host_status(remote: Remote, sides: list[tuple[str, str, str]] = ()) -> dict:
     """The host agent's `status`: live holds and requests, queue estimates, free disk, and, for
-    a run whose sides are `sides` (each its source's key and its build's, `engine.build_key`),
-    the checkout each would claim now, what its build would need and the room it would find."""
+    a run whose sides are `sides` (each its source's key, its tree's, `engine.tree_key`, and its
+    build's, `engine.build_key`), the checkout each would claim or share now, what its build
+    would need and the room it would find."""
     argv = remote.host(AGENT, "status", "--root", remote.root)
-    for source, build in sides:
-        argv += ["--source", source, "--build", build]
+    for source, tree, build in sides:
+        argv += ["--source", source, "--tree", tree, "--build", build]
     return json.loads(_ssh(remote, remote.command(argv)[-1]).strip().splitlines()[-1])
 
 

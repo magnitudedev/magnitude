@@ -20,7 +20,7 @@ import argparse
 
 from .. import sync
 from ..engine import Step, Weights
-from . import Answer, Instrument, JobResult, Plan, harness
+from . import Answer, Instrument, JobResult, Plan, environment, harness
 from .binaries import ASSESS, ASSESS_BUILD, ENGINE, ENGINE_BUILD
 
 BENCH = "{venv}/bin/magnitude-bench"
@@ -44,7 +44,7 @@ def plan(arguments, source, host) -> Plan:
     except ValueError as error:
         raise SystemExit(f"bench: {error}") from None
     engines = arguments.engine or ["magnitude"]
-    builds = [Step("bench", ("uv", "sync", "--frozen", "--project", "{src}/evaluation", "--package", "magnitude-bench"))]
+    builds = [environment("bench", "--package", "magnitude-bench")]
     jobs, ours = [], []
     if "magnitude" in engines:
         if arguments.magnitude_binary is None:

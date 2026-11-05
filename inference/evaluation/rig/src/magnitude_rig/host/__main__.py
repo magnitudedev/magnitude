@@ -7,8 +7,9 @@
     python3 -m magnitude_rig.host record --run-dir DIR [--alias A] -- ARGV...
     python3 -m magnitude_rig.host fresh --artifacts FILE --output FILE --clones DIR -- ARGV...
     python3 -m magnitude_rig.host compiler --root ROOT
-    python3 -m magnitude_rig.host provenance --output FILE --source DIR... --target DIR -- TEXT...
+    python3 -m magnitude_rig.host provenance --output FILE --source DIR... --target DIR [--tests FILE] -- TEXT...
     python3 -m magnitude_rig.host header-artifacts --export DIR --model REF --output FILE
+    python3 -m magnitude_rig.host tests --list FILE -- ARGS...
 
 `record` writes `host.json`, records `thermal.jsonl` around the job, and completes the
 job's `result.json` (when it wrote one) with the host facts and the thermal trace path.
@@ -16,10 +17,13 @@ job's `result.json` (when it wrote one) with the host facts and the thermal trac
 every interval the agent's status of the rig at ROOT with a probe reading and its group
 aggregates (`{"at", "status", "reading", "groups_c"}`).
 `compiler` installs the recording rustc wrapper and prints its path; `provenance` writes the
-build provenance of the cargo-built executables the job's texts name and exits 1 unless
-each is verified, and withdraws every other executable of the target it cannot verify (see
-`provenance.py`). `fresh` runs a job that reads its model from storage
-(see `fresh.py`).
+build provenance of the cargo-built executables the job's texts name and the test executables
+the build produced (`--tests`, which the suite's jobs run) and exits 1 unless each is verified,
+and withdraws every other executable of the target it cannot verify (see `provenance.py`).
+`fresh` runs a job that reads its model from storage (see `fresh.py`). `tests` runs a cargo suite's test executables from a build output instead of
+cargo: each one FILE lists (`host/agent.py`), with ARGS, from its package's directory with
+`CARGO_MANIFEST_DIR` naming it, as cargo runs them; it exits with the first failure's code, 0
+when every one passed.
 """
 
 from __future__ import annotations
@@ -47,7 +51,8 @@ def _compiler(arguments) -> int:
 
 
 def _provenance(arguments) -> int:
-    record = provenance.verify(arguments.texts, arguments.source, arguments.target)
+    tests = json.loads(Path(arguments.tests).read_text()) if arguments.tests is not None else []
+    record = provenance.verify(arguments.texts, arguments.source, arguments.target, tests)
     trace.atomic(Path(arguments.output), record)
     for executable in record["executables"]:
         for reason in executable["reasons"]:
@@ -58,6 +63,19 @@ def _provenance(arguments) -> int:
         print(f"withdrew {executable['path']} ({executable['status']}: no job runs it until a build "
               f"of this source produces it)")
     return 1 if record["status"] == "refused" else 0
+
+
+def _tests(arguments) -> int:
+    failed = 0
+    for test in json.loads(Path(arguments.list).read_text()):
+        sys.stdout.write("     Running %s\n" % test["executable"])
+        sys.stdout.flush()
+        code = subprocess.run([test["executable"], *arguments.argv], cwd=test["directory"],
+                              env=dict(os.environ, CARGO_MANIFEST_DIR=test["directory"])).returncode
+        # A test binary a signal ended exits as a shell reports it, 128 + the signal: an exit
+        # status never negative, and never 0.
+        failed = failed or (128 - code if code < 0 else code)
+    return failed
 
 
 def _header_artifacts(arguments) -> int:
@@ -237,6 +255,10 @@ def main(argv=None) -> int:
     command.add_argument("--model", required=True)
     command.add_argument("--output", required=True)
     command.set_defaults(handler=_header_artifacts)
+    command = commands.add_parser("tests")
+    command.add_argument("--list", required=True)
+    command.add_argument("argv", nargs=argparse.REMAINDER)
+    command.set_defaults(handler=_tests)
     command = commands.add_parser("compiler")
     command.add_argument("--root", required=True)
     command.set_defaults(handler=_compiler)
@@ -244,12 +266,13 @@ def main(argv=None) -> int:
     command.add_argument("--output", required=True)
     command.add_argument("--source", action="append", default=[])
     command.add_argument("--target", required=True)
+    command.add_argument("--tests", help="the test executables the build produced, as JSON (`host/agent.py`)")
     command.add_argument("texts", nargs=argparse.REMAINDER)
     command.set_defaults(handler=_provenance)
     arguments = parser.parse_args(argv)
+    if arguments.command in ("record", "fresh", "tests") and arguments.argv[:1] == ["--"]:
+        arguments.argv = arguments.argv[1:]
     if arguments.command in ("record", "fresh"):
-        if arguments.argv[:1] == ["--"]:
-            arguments.argv = arguments.argv[1:]
         if not arguments.argv:
             parser.error(f"{arguments.command} needs a job command after --")
     if arguments.command == "provenance" and arguments.texts[:1] == ["--"]:

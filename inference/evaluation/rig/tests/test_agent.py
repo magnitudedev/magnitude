@@ -53,9 +53,10 @@ BUILD = "b"  # every test run's build (`engine.build_key`)
 
 
 def status(root: Path, *sources: str) -> dict:
+    """The host's status for a run of `sources`, each of tree `<source>-tree`."""
     argv = [sys.executable, str(AGENT), "status", "--root", str(root)]
     for source in sources:
-        argv += ["--source", source, "--build", BUILD]
+        argv += ["--source", source, "--tree", source + "-tree", "--build", BUILD]
     return json.loads(subprocess.run(argv, capture_output=True, text=True, check=True).stdout)
 
 
@@ -108,10 +109,17 @@ def measured(root: Path, **record: int) -> None:
     (root / "rig" / agent.MEASURED / f"{BUILD}.json").write_text(json.dumps(record))
 
 
-def claim(current: agent.Session, source: str, fallback: int = 0, *, commit: str = "c0", seconds: float = 60) -> str:
-    name, others = current.claim(source, BUILD, fallback, commit, seconds)
-    assert others == []
+def claim(current: agent.Session, source: str, fallback: int = 0, *, commit: str = "c0", seconds: float = 60,
+          shares: bool = False) -> str:
+    """Claim a checkout for a run of `source`, of tree `<source>-tree` and build `BUILD`."""
+    name, shared, others = current.claim(source, source + "-tree", BUILD, fallback, commit, seconds)
+    assert others == [] and shared == shares
     return name
+
+
+def keeps(checkout: Path, *builds: str) -> None:
+    """Record that `checkout` keeps `builds`, referencing no unit."""
+    (checkout / agent.REFERENCES).write_text(json.dumps({build: {"at": time.time(), "units": []} for build in builds}))
 
 
 def test_each_run_claims_a_checkout_of_its_own_last_built_from_its_source_if_free(tmp_path):
@@ -129,8 +137,10 @@ def test_each_run_claims_a_checkout_of_its_own_last_built_from_its_source_if_fre
     (base / "unclaimed").mkdir()  # a directory no run claimed: never preferred
     other, again = session(tmp_path, "other"), session(tmp_path, "again")
     assert status(tmp_path, "b", "a")["checkouts"] == [
-        {"name": "slot-1", "source": "a", "size": 0, "warmth": agent.OTHER, "commit": None, "built": False},
-        {"name": "slot-0", "source": "a", "size": 0, "warmth": agent.SAME, "commit": None, "built": False},
+        {"name": "slot-1", "source": "a", "size": 0, "warmth": agent.OTHER, "commit": None, "built": False,
+         "shared": False},
+        {"name": "slot-0", "source": "a", "size": 0, "warmth": agent.SAME, "commit": None, "built": False,
+         "shared": False},
     ]
     assert claim(other, "b") == "slot-1"  # the most recently used: no free one was built from b
     assert claim(again, "a") == "slot-0"  # the one built from a, though used less recently
@@ -139,24 +149,143 @@ def test_each_run_claims_a_checkout_of_its_own_last_built_from_its_source_if_fre
     end(again)
 
 
-def test_a_claimed_checkout_past_its_bound_builds_cold(tmp_path):
-    """A checkout holding more than CHECKOUT_LIMIT times the most a build has added loses its
-    target (artifacts no build of now needs) and keeps its source."""
-    checkout = tmp_path / "checkouts" / "big"
-    (checkout / "target").mkdir(parents=True)
-    (checkout / "src").mkdir()
-    (checkout / "src" / "lib.rs").write_text("source")
-    (checkout / agent.BUILT).write_text(json.dumps([BUILD]))
-    measured(tmp_path, size=100)
+def test_runs_of_one_tree_and_build_share_its_checkout_once_it_is_installed(tmp_path):
+    """A run shares the checkout live runs of its tree and build hold once they have installed
+    it, and owes the host nothing more than their build; a run of another tree or build, its own
+    other side, or a run arriving before the install, claims its own."""
+    first, early, same, other_build = (session(tmp_path, run) for run in ("first", "early", "same", "other-build"))
+    assert claim(first, "a") == "slot-0"
+    assert claim(early, "a") == "slot-1"  # slot-0 is not installed yet
+    first.installed("slot-0")
+    assert (tmp_path / "checkouts" / "slot-0" / agent.TREE).read_text() == "a-tree"
+    found = status(tmp_path, "a")["checkouts"][0]
+    assert found["name"] == "slot-0" and found["shared"] and found["owed"] == 60 and status(tmp_path, "a")["needs"] == [0]
+    assert claim(same, "a", shares=True) == "slot-0"
+    name, shared, _ = other_build.claim("a", "a-tree", "another build", 0, "c0", 60)
+    assert name == "slot-2" and not shared
+    name, shared, _ = first.claim("a", "a-tree", BUILD, 0, "c0", 60)  # its own second side
+    assert name == "slot-3" and not shared
+    # A sharer waits on its holders' build of this checkout alone, not on their other sides'.
+    assert status(tmp_path, "a")["checkouts"][0]["owed"] == 60
+    # A run whose sides are one tree and build shares on one side only, as its claims would.
+    found = status(tmp_path, "a", "a")["checkouts"]
+    assert found[0]["shared"] and found[1] is None  # the second claims one of its own: none is free
+    # A sharer owes no build: never counted among the host's builds, for room or for CPU.
+    assert "checkout:slot-0" not in same.builds
+    (entry,) = [e for e in status(tmp_path)["entries"] if e["run"] == "same"]
+    assert "build" not in entry and "need" not in entry and "seconds" not in entry
+    end(early), end(other_build)
+    assert status(tmp_path)["building"] == [120]  # first's two sides, never the sharer's
+    same.shared_built("slot-0")  # waited on first's build, found every unit fresh: records nothing
+    assert not (tmp_path / "rig" / agent.MEASURED).exists()
+    assert not (tmp_path / "checkouts" / "slot-0" / agent.REFERENCES).exists()
+    for current in (first, same):
+        end(current)
+
+
+def test_a_free_checkout_is_chosen_by_what_it_keeps_then_its_tree(tmp_path):
+    """Among free checkouts, one that keeps the build and holds the tree, then one that keeps
+    the build, then one that holds the tree, then one of the source."""
+    base = tmp_path / "checkouts"
+    for name in ("source", "tree", "kept", "both"):
+        (base / name).mkdir(parents=True)
+    (base / "source" / agent.SOURCE).write_text("a")
+    for name in ("tree", "both"):
+        (base / name / agent.TREE).write_text("a-tree")
+    for name in ("kept", "both"):
+        keeps(base / name, BUILD)
+    runs = [session(tmp_path, "run-%d" % index) for index in range(4)]
+    assert [claim(current, "a") for current in runs] == ["both", "kept", "tree", "source"]
+    for current in runs:
+        end(current)
+
+
+def test_a_build_keeps_the_units_its_kept_builds_reference_and_trims_the_rest(tmp_path):
+    """After a build, the target keeps each unit a kept build references, removes every other
+    hashed artifact of a unit directory, and leaves what it cannot tie to a unit (a profile's own
+    outputs) and every incremental directory, however long since a build compiled into it (a
+    fresh unit writes nothing there)."""
+    checkout = tmp_path / "checkouts" / "slot-0"
     current = session(tmp_path, "run")
-    assert claim(current, "a") == "big"
-    (checkout / "size").write_text(str(agent.CHECKOUT_LIMIT * 100))
-    assert current.cap("big") is None and (checkout / "target").is_dir()  # at the bound: kept
-    (checkout / "size").write_text(str(agent.CHECKOUT_LIMIT * 100 + 1))
-    assert current.cap("big") == agent.CHECKOUT_LIMIT * 100 + 1
-    assert not (checkout / "target").exists() and (checkout / "src" / "lib.rs").exists()
-    assert not (checkout / agent.BUILT).exists()  # it has built nothing since
-    assert int((checkout / "size").read_text()) < 100  # what is left, recorded for the next build
+    assert claim(current, "a") == "slot-0"
+    target = checkout / "target"
+    keep, stale, other = "0123456789abcdef", "fedcba9876543210", "00112233445566ff"
+    files = [f"release/deps/libfoo-{keep}.rlib", f"release/deps/foo-{keep}.d", f"release/deps/foo-{keep}.provenance.json",
+             f"release/deps/libfoo-{stale}.rlib", f"release/build/foo-{keep}/out/x", f"release/build/foo-{stale}/out/x",
+             f"debug/deps/libbar-{other}.rmeta", "release/magnitude-inference", f"release/.fingerprint/foo-{stale}/x",
+             "debug/incremental/old-1/s", "debug/incremental/new-1/s"]
+    for relative in files:
+        (target / relative).parent.mkdir(parents=True, exist_ok=True)
+        (target / relative).write_bytes(b"\0" * 10)
+    os.utime(target / "debug" / "incremental" / "old-1", (1000, 1000))
+    (checkout / agent.REFERENCES).write_text("{}")  # it has recorded builds: none it keeps
+    units = agent.units_of(str(target), [str(target / f"release/deps/libfoo-{keep}.rlib"),
+                                         str(target / f"release/build/foo-{keep}/out"), str(target / "release" / "x")])
+    assert units == {f"release/deps/{keep}", f"release/build/{keep}"}
+    built = current.built("slot-0", 1.0, units)
+    left = sorted(str(p.relative_to(target)) for p in target.rglob("*") if p.is_file())
+    assert left == sorted(["debug/incremental/new-1/s", "debug/incremental/old-1/s",
+                           "release/.fingerprint/foo-%s/x" % stale, f"release/build/foo-{keep}/out/x",
+                           f"release/deps/foo-{keep}.d", f"release/deps/foo-{keep}.provenance.json",
+                           f"release/deps/libfoo-{keep}.rlib", "release/magnitude-inference"])
+    assert built["trimmed"] == {"bytes": 30, "entries": 3}
+    assert BUILD in json.loads((checkout / agent.REFERENCES).read_text())
+    end(current)
+
+
+def test_a_checkout_that_recorded_no_build_keeps_what_it_held_as_one_more_build(tmp_path):
+    """The first build a checkout records keeps the units the checkout already held."""
+    checkout = tmp_path / "checkouts" / "slot-0"
+    current = session(tmp_path, "run")
+    assert claim(current, "a") == "slot-0"
+    held, mine = "0123456789abcdef", "fedcba9876543210"
+    for name in (f"libheld-{held}.rlib", f"libmine-{mine}.rlib"):
+        (checkout / "target" / "release" / "deps").mkdir(parents=True, exist_ok=True)
+        (checkout / "target" / "release" / "deps" / name).write_text("x")
+    (checkout / "target" / "debug" / "incremental" / "held-1").mkdir(parents=True)
+    os.utime(checkout / "target" / "debug" / "incremental" / "held-1", (1000, 1000))
+    assert current.built("slot-0", 1.0, {f"release/deps/{mine}"})["trimmed"]["bytes"] == 0  # incremental kept too
+    kept = json.loads((checkout / agent.REFERENCES).read_text())
+    assert kept[agent.UNRECORDED]["units"] == [f"release/deps/{held}"] and kept[BUILD]["units"] == [f"release/deps/{mine}"]
+    end(current)
+
+
+def test_what_a_checkout_held_before_recording_goes_once_builds_kept_were_recorded(tmp_path):
+    """The units held before a checkout's first record outlive `BUILDS_KEPT` recorded builds,
+    however few kinds of build they are, and then go."""
+    checkout = tmp_path / "checkouts" / "slot-0"
+    current = session(tmp_path, "run")
+    assert claim(current, "a") == "slot-0"
+    held, mine = "0123456789abcdef", "fedcba9876543210"
+    deps = checkout / "target" / "release" / "deps"
+    deps.mkdir(parents=True)
+    for name in (f"libheld-{held}.rlib", f"libmine-{mine}.rlib"):
+        (deps / name).write_text("x")
+    for _ in range(agent.BUILDS_KEPT):
+        assert (deps / f"libheld-{held}.rlib").exists()
+        current.built("slot-0", 1.0, {f"release/deps/{mine}"})
+        current.builds["checkout:slot-0"] = agent.Owed(agent.SAME, BUILD, 0, 0, "c0", 60)
+    assert agent.UNRECORDED not in json.loads((checkout / agent.REFERENCES).read_text())
+    assert sorted(p.name for p in deps.iterdir()) == [f"libmine-{mine}.rlib"]
+    end(current)
+
+
+def test_a_build_measures_the_room_it_needed_before_its_trim(tmp_path):
+    """What a build added is what it wrote before its trim removed what no kept build
+    references; the checkout's size is what is left."""
+    checkout = tmp_path / "checkouts" / "slot-0"
+    current = session(tmp_path, "run")
+    assert claim(current, "a") == "slot-0"  # a cold checkout
+    deps = checkout / "target" / "release" / "deps"
+    deps.mkdir(parents=True)
+    stale, mine = "0123456789abcdef", "fedcba9876543210"
+    (deps / f"libstale-{stale}.rlib").write_bytes(b"\0" * 300)
+    (deps / f"libmine-{mine}.rlib").write_bytes(b"\0" * 200)
+    (checkout / agent.REFERENCES).write_text("{}")  # it keeps no build: the stale unit goes
+    built = current.built("slot-0", 1.0, {f"release/deps/{mine}"})
+    assert built["trimmed"]["bytes"] == 300 and built["bytes"] == int((checkout / "size").read_text())
+    assert built["added_bytes"] == built["bytes"] + 300
+    assert json.loads((tmp_path / "rig" / agent.MEASURED / f"{BUILD}.json").read_text())["size"] == built["added_bytes"]
     end(current)
 
 
@@ -275,7 +404,7 @@ def test_status_reports_the_builds_live_runs_owe_and_a_build_records_its_seconds
     time.sleep(1.1)
     owed = sorted(status(tmp_path)["building"])
     assert 58 <= owed[0] < 59 and owed[1] == 1200
-    warm.built("a", 42.4)
+    warm.built("a", 42.4, set())
     report = status(tmp_path, "source")
     assert report["building"] == [42] and report["slowest"] == 42  # the staged run, by the build measured
     assert report["measured"][BUILD]["builds"] == [{"seconds": 42, "from": "c0", "to": "c1", "built": False}]
@@ -322,21 +451,20 @@ def test_a_build_records_the_checkout_its_size_and_the_most_a_rebuild_has_added(
     for size in (5000, 5400, 5300):  # from cold, then two warm builds adding less
         (checkout / "target" / "artifact").write_bytes(b"\0" * size)
         recorded = int((checkout / "size").read_text()) if added else 0
-        expected = checkout_bytes(str(checkout))
-        built = current.built("slot-0", 1.0)
+        built = current.built("slot-0", 1.0, set())
         current.builds["checkout:slot-0"] = agent.Owed(agent.SAME, BUILD, 0, 0, "c0", 60)  # built again
-        assert built == {"bytes": expected, "added_bytes": expected - recorded}
-        assert int((checkout / "size").read_text()) == expected
+        assert built["added_bytes"] == built["bytes"] - recorded and built["trimmed"]["bytes"] == 0
+        assert int((checkout / "size").read_text()) == built["bytes"]
         added.append(built["added_bytes"])
     assert added[0] > added[1] > added[2]
     recorded = json.loads((tmp_path / "rig" / agent.MEASURED / f"{BUILD}.json").read_text())
     assert {name: recorded[name] for name in ("size", "growth")} == {"size": added[0], "growth": added[1]}  # its rebuilds' most, not the latest
-    assert json.loads((checkout / agent.BUILT).read_text()) == [BUILD]
+    assert BUILD in json.loads((checkout / agent.REFERENCES).read_text())
     end(current)
     report = status(tmp_path, "source")
     assert report["needs"] == [added[1]] and report["measured"][BUILD]["size"] == added[0]
     assert report["largest"] == added[0]
-    (checkout / agent.BUILT).unlink()  # a checkout that never built it needs its whole size
+    (checkout / agent.REFERENCES).unlink()  # a checkout that does not keep it needs its whole size
     assert status(tmp_path, "source")["needs"] == [added[0]]
 
 
@@ -353,10 +481,10 @@ def test_eviction_counts_what_every_building_checkout_may_still_add(tmp_path):
         (base / key / agent.SOURCE).write_text(key)  # each run claims its own
     (base / "partial" / "size").write_text("100")
     (base / "idle" / "size").write_text("5000")
-    (base / "warm" / agent.BUILT).write_text(json.dumps([BUILD]))
+    keeps(base / "warm", BUILD)
     measured(tmp_path, size=1000, growth=700)
     first, second, building = (session(tmp_path, run) for run in ("first", "second", "building"))
-    for current, key in ((first, "partial"), (second, "fresh"), (building, "warm")):
+    for current, key in ((building, "warm"), (first, "partial"), (second, "fresh")):  # warm keeps the build
         assert claim(current, key) == key
     (base / "warm" / "size").write_text(str(10**6))  # shrunk since (a mirror pruned its source)
     now = {key: checkout_bytes(str(base / key)) for key in holds}
@@ -384,6 +512,28 @@ def _stale(root: Path, name: str, size: int, used: float) -> None:
     (root / "checkouts" / name / "size").write_text(str(size))
     (root / "checkouts" / name / "used").write_text("x")
     os.utime(root / "checkouts" / name / "used", (used, used))
+
+
+def test_after_a_build_the_rig_keeps_its_checkouts_within_its_share_of_the_volume(tmp_path, monkeypatch):
+    """Once a build ends, the rig removes its own checkouts no run holds, least recently used
+    first, until they hold no more than its SHARE of the volume, and no further, however little
+    of the volume is free; it never waits, and never takes a held checkout or a run's directory."""
+    gb = 10**9
+    _stale(tmp_path, "held", 1 * gb, 999)
+    _stale(tmp_path, "oldest", 6 * gb, 1000)
+    _stale(tmp_path, "older", 5 * gb, 1001)
+    _stale(tmp_path, "recent", 4 * gb, 1002)
+    (tmp_path / "runs" / "gone").mkdir(parents=True)
+    total = int(11 * gb / agent.SHARE)  # a share of 11 GB; the other users leave nothing free
+    monkeypatch.setattr(agent.shutil, "disk_usage", lambda path: shutil._ntuple_diskusage(total, total, 0))
+    holding, building = session(tmp_path, "holding"), session(tmp_path, "building")
+    hold(holding, "checkout:held")
+    assert building.reclaim() == {"removed": ["checkouts/oldest"], "freed_bytes": 6 * gb}  # 10 GB left
+    assert building.reclaim() == {"removed": [], "freed_bytes": 0}
+    assert sorted(p.name for p in (tmp_path / "checkouts").iterdir()) == ["held", "older", "recent"]
+    assert (tmp_path / "runs" / "gone").is_dir()
+    end(holding)
+    end(building)
 
 
 def test_room_is_made_from_the_rigs_own_stale_checkouts_least_recently_used_first(tmp_path, monkeypatch):
@@ -646,7 +796,7 @@ def test_a_recorded_job_ends_with_its_runner(tmp_path):
 
 def _room_plan(root: Path) -> list:
     """Claim a checkout, make room for its build under the install hold, then build."""
-    return [{"op": "checkout", "side": "s", "source": "src", "build": BUILD, "fallback": 0, "commit": "c0", "seconds": 60}, {"op": "hold", "kind": "install"},
+    return [{"op": "checkout", "side": "s", "source": "src", "tree": "t", "build": BUILD, "output": "o", "fallback": 0, "commit": "c0", "seconds": 60}, {"op": "hold", "kind": "install"},
             {"op": "evict", "side": "s", "host": "h"}, {"op": "release", "kind": "install"},
             run_op([sys.executable, "-c", "print('built')"], root, job="j")]
 
@@ -1028,7 +1178,7 @@ def test_runs_of_two_protocols_never_wait_on_each_other_in_a_cycle(tmp_path):
         assert old.stdout.readline().strip() == "held " + kind
 
     old_holds("checkout:G")
-    start(tmp_path, "ours", [{"op": "checkout", "side": "s", "source": "U", "build": BUILD, "fallback": 0, "commit": "c0", "seconds": 60}, {"op": "phase", "phase": "job-j"},
+    start(tmp_path, "ours", [{"op": "checkout", "side": "s", "source": "U", "tree": "t", "build": BUILD, "output": "o", "fallback": 0, "commit": "c0", "seconds": 60}, {"op": "phase", "phase": "job-j"},
                              {"op": "hold", "kind": "device"},
                              run_op([sys.executable, "-c", "print('measured')"], tmp_path, job="j")])
     waiting = until(tmp_path, "ours", "waiting")
@@ -1041,7 +1191,7 @@ def test_runs_of_two_protocols_never_wait_on_each_other_in_a_cycle(tmp_path):
     assert ended(tmp_path, "ours")["codes"] == {"j": 0}
 
     # A protocol 2 run that comes while ours is live waits on it whole; ours never on it.
-    start(tmp_path, "later-ours", [{"op": "checkout", "side": "s", "source": "U", "build": BUILD, "fallback": 0, "commit": "c0", "seconds": 60}, until_exists(tmp_path / "go"),
+    start(tmp_path, "later-ours", [{"op": "checkout", "side": "s", "source": "U", "tree": "t", "build": BUILD, "output": "o", "fallback": 0, "commit": "c0", "seconds": 60}, until_exists(tmp_path / "go"),
                                    {"op": "hold", "kind": "device"}])
     until(tmp_path, "later-ours", "output")
     late = subprocess.Popen([sys.executable, "-c", OLD_RUN, str(AGENT.parent), str(tmp_path), "late"],
@@ -1061,17 +1211,186 @@ def test_a_run_shares_no_hold_with_a_run_of_another_protocol(tmp_path):
     current = int(re.search(r"\nPROTOCOL = (\d+)\n", AGENT.read_text())[1])
     other.write_text(AGENT.read_text().replace(f"\nPROTOCOL = {current}\n", f"\nPROTOCOL = {current + 1}\n"))
     root = tmp_path / "root"
-    start(root, "newer", [{"op": "checkout", "side": "s", "source": "a", "build": BUILD, "fallback": 0, "commit": "c0", "seconds": 60}, until_exists(root / "go")],
+    start(root, "newer", [{"op": "checkout", "side": "s", "source": "a", "tree": "t", "build": BUILD, "output": "o", "fallback": 0, "commit": "c0", "seconds": 60}, until_exists(root / "go")],
           agent_path=other)
     until(root, "newer", "output")
     ours = session(root, "ours")
-    name, others = ours.claim("b", BUILD, 0, "c0", 60)
-    assert name is None and [e["run"] for e in others] == ["newer"]  # even a checkout waits
+    name, _, others = ours.claim("b", "t", BUILD, 0, "c0", 60)
+    assert name is None and {e["run"] for e in others} == {"newer"}  # even a checkout waits
     assert not ours.entries
     (root / "go").touch()
     ended(root, "newer")
     deadline = time.monotonic() + 10
-    while ours.claim("b", BUILD, 0, "c0", 60)[0] is None:  # until the newer run has exited
+    while ours.claim("b", "t", BUILD, 0, "c0", 60)[0] is None:  # until the newer run has exited
         assert time.monotonic() < deadline
         time.sleep(0.05)
     end(ours)
+
+
+needs_cargo = pytest.mark.skipif(shutil.which("cargo") is None, reason="needs cargo")
+
+
+def _crate(directory: Path, version: str) -> Path:
+    """A one-crate workspace at `version` (a unit's hash covers it, so a new one is a new unit)."""
+    (directory / "lib" / "src").mkdir(parents=True)
+    (directory / "Cargo.toml").write_text('[workspace]\nmembers = ["lib"]\nresolver = "2"\n')
+    (directory / "lib" / "Cargo.toml").write_text(
+        f'[package]\nname = "my-lib"\nversion = "{version}"\nedition = "2021"\n')
+    (directory / "lib" / "src" / "lib.rs").write_text("pub fn who() -> u32 { let unused = 1; 1 }\n")
+    (directory / "lib" / "tests").mkdir()
+    (directory / "lib" / "tests" / "here.rs").write_text(  # reads its package's directory as cargo gives it
+        '#[test]\nfn here() { assert!(std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())'
+        '.join("Cargo.toml").exists()); }\n')
+    return directory
+
+
+def _build_plan(stage: Path, tree: str, *after: dict) -> list:
+    """Claim, install `stage`, build the crate's tests and record the build, then run them from
+    the output: a run of tree `tree`."""
+    src, env = "{checkout:s}/src", {"CARGO_TARGET_DIR": "{checkout:s}/target"}
+    tests = run_op([sys.executable, "-m", "magnitude_rig.host", "tests", "--list", "{output:s}/tests.json"],
+                   stage, job="tests")
+    tests["env"] = {"PYTHONPATH": str(AGENT.parents[2])}
+    return [*_claim_and_install(stage, tree),
+            {"op": "phase", "phase": "build-s"},
+            {"op": "run", "argv": ["cargo", "test", "--message-format=short", "--no-run", "--release", "--offline",
+                                   "-p", "my-lib"], "cwd": src, "env": env},
+            *_built(stage), tests, *after]
+
+
+def _claim_and_install(stage: Path, tree: str) -> list:
+    """Claim side `s`'s checkout for tree `tree`, make room and install `stage` there."""
+    src = "{checkout:s}/src"
+    return [{"op": "checkout", "side": "s", "source": "src", "tree": tree, "build": BUILD, "output": tree + "-b",
+             "fallback": 0, "commit": "c0", "seconds": 60},
+            {"op": "hold", "kind": "install"}, {"op": "evict", "side": "s", "host": "here"},
+            run_op([sys.executable, str(AGENT), "install", "--from", str(stage), "--to", src], stage, install="s"),
+            {"op": "release", "kind": "install"}]
+
+
+def _built(stage: Path) -> list:
+    """Side `s`'s build provenance (a record that keeps no profile executable: the crate has
+    none) and the end of its build."""
+    proven = str(stage.parent / "provenance.json")
+    write = "import json, sys; json.dump({'kept': []}, open(sys.argv[1], 'w'))"
+    return [run_op([sys.executable, "-c", write, proven], stage),
+            {"op": "built", "side": "s", "release": True, "provenance": proven}]
+
+
+def _hashes(target: Path) -> set:
+    return {found.group(1) for path in (target / "release" / "deps").iterdir()
+            if (found := agent.HASHED.search(path.name))}
+
+
+@needs_cargo
+def test_a_build_runs_from_its_output_releases_its_checkout_and_trims_what_no_kept_build_references(tmp_path):
+    """A build records the units its cargo steps reference, its log as its own format shows it;
+    its tests run from its output, which goes when no live run holds it; the checkout is released
+    when the build ends, and the next build of another version in the same checkout leaves only
+    its own units; a later run of a tree a live run holds finds the checkout warm and the output
+    its own."""
+    target = tmp_path / "checkouts" / "slot-0" / "target"
+    start(tmp_path, "first", _build_plan(_crate(tmp_path / "v1", "0.1.0"), "t1"))
+    assert ended(tmp_path, "first")["failed"] is None
+    log = (tmp_path / "runs" / "first" / "logs" / "build-s.log").read_text()
+    assert re.search(r"lib/src/lib\.rs:1:\d+: warning: unused variable", log)  # as the step's short format shows it
+    assert '"reason"' not in log  # cargo's JSON messages are the runner's own
+    first = _hashes(target)
+    references = json.loads((target.parent / agent.REFERENCES).read_text())
+    assert {unit.rsplit("/", 1)[1] for unit in references[BUILD]["units"]} == first
+    assert ended(tmp_path, "first")["codes"] == {"tests": 0}  # its test ran from the output, and passed
+    assert not (tmp_path / "outputs" / "t1-b").exists()  # and its output went with it
+    stage = _crate(tmp_path / "v2", "0.2.0")
+    start(tmp_path, "second", _build_plan(stage, "t2", until_exists(tmp_path / "go")))
+    until(tmp_path, "second", "held", timeout=60)
+    while not any("released checkout" in e.get("text", "") for e in events(tmp_path, "second")):
+        assert "ended" not in {e["event"] for e in events(tmp_path, "second")}, events(tmp_path, "second")
+        time.sleep(0.1)
+    second = _hashes(target)
+    assert second and not second & first  # the 0.1.0 units are gone
+    output = tmp_path / "outputs" / "t2-b"
+    listed = json.loads((output / agent.TESTS).read_text())  # its library's unit tests and its `here`
+    assert len(listed) == 2 and {test["directory"] for test in listed} == {str(output / "src" / "lib")}
+    assert all(test["executable"].startswith(str(output / "target" / "release" / "deps")) for test in listed)
+    held = {e["kind"] for e in status(tmp_path)["entries"] if e["run"] == "second"}
+    assert "output:t2-b" in held and not any(kind.startswith("checkout:") for kind in held)  # released at its build's end
+    start(tmp_path, "again", _build_plan(stage, "t2"))
+    result = ended(tmp_path, "again")
+    assert result["failed"] is None and result["codes"] == {"tests": 0}
+    log = (tmp_path / "runs" / "again" / "logs" / "build-s.log").read_text()
+    assert "Compiling" not in log  # the checkout the second run released, warm for this tree
+    assert output.exists()  # the second run still holds it
+    (tmp_path / "go").write_text("")
+    assert ended(tmp_path, "second")["failed"] is None
+    assert not output.exists()
+
+
+def test_a_run_sharing_a_checkout_neither_trims_nor_records_it_nor_makes_room(tmp_path):
+    """A run sharing a checkout its holder installed records nothing of the build and trims
+    nothing: its holder's build owns both. It completes the shared output and releases."""
+    stage = tmp_path / "stage"
+    (stage / "data").mkdir(parents=True)
+    checkout = tmp_path / "checkouts" / "slot-0"
+    start(tmp_path, "holder", [*_claim_and_install(stage, "t"), until_exists(tmp_path / "go")])
+    while not (checkout / agent.TREE).exists():  # installed, and its output has the tree
+        time.sleep(0.05)
+    assert (tmp_path / agent.OUTPUTS / "t-b" / "src" / "data").is_dir()
+    stale = checkout / "target" / "release" / "deps" / "libstale-0123456789abcdef.rlib"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("x")
+    keeps(checkout, "another build")
+    kept = (checkout / agent.REFERENCES).read_text()
+    start(tmp_path, "sharer", [*_claim_and_install(tmp_path / "unused", "t"), *_built(stage)])
+    result = ended(tmp_path, "sharer")
+    assert result["failed"] is None, events(tmp_path, "sharer")
+    notes = [e.get("text", "") for e in events(tmp_path, "sharer")]
+    assert any("shared with the live runs" in note for note in notes)
+    assert any("skipped" in note and "holds this tree" in note for note in notes)
+    assert stale.exists() and (checkout / agent.REFERENCES).read_text() == kept  # untrimmed, unrecorded
+    assert not (checkout / "size").exists() and not (tmp_path / "rig" / agent.MEASURED).exists()
+    assert (tmp_path / agent.OUTPUTS / "t-b" / agent.OUTPUT_DONE).exists()  # the holder still holds it
+    (tmp_path / "go").write_text("")
+    assert ended(tmp_path, "holder")["failed"] is None
+
+
+def test_a_suite_run_from_its_output_fails_with_its_first_failure(tmp_path):
+    """`tests` runs each listed executable from its directory with CARGO_MANIFEST_DIR naming it,
+    and exits with the first failure."""
+    host = lambda *argv: subprocess.run([sys.executable, "-m", "magnitude_rig.host", *argv], capture_output=True,
+                                        text=True, env=dict(os.environ, PYTHONPATH=str(AGENT.parents[2])))
+    (tmp_path / "pkg").mkdir()
+    listed = []
+    for name, code in (("passes", 0), ("fails", 7)):
+        script = tmp_path / name
+        script.write_text(f"#!{sys.executable}\nimport os, sys\nprint(os.getcwd() == os.environ['CARGO_MANIFEST_DIR'], "
+                          f"sys.argv[1:])\nraise SystemExit({code})\n")
+        script.chmod(0o755)
+        listed.append({"executable": str(script), "directory": str(tmp_path / "pkg")})
+    (tmp_path / "tests.json").write_text(json.dumps(listed))
+    ran = host("tests", "--list", str(tmp_path / "tests.json"), "--", "filter")
+    assert ran.returncode == 7 and ran.stdout.count("True ['filter']") == 2
+
+
+def test_the_disk_owner_removes_every_build_output_no_live_run_holds(tmp_path):
+    held, left = (tmp_path / agent.OUTPUTS / name for name in ("held", "left"))
+    holding, building = session(tmp_path, "holding"), session(tmp_path, "building")
+    holding.hold_output("held")
+    left.mkdir(parents=True)
+    assert building.reclaim()["removed"] == ["outputs/left"]
+    assert held.is_dir() and not left.exists()
+    assert holding.end_outputs() == ["held"] and not held.exists()
+    end(holding)
+    end(building)
+
+
+def test_an_output_a_dead_run_left_incomplete_is_discarded_and_a_complete_one_reused(tmp_path):
+    partial, complete = (tmp_path / agent.OUTPUTS / name for name in ("partial", "complete"))
+    (partial / "src").mkdir(parents=True)
+    (complete / "src").mkdir(parents=True)
+    (complete / agent.OUTPUT_DONE).write_text("")
+    holding = session(tmp_path, "holding")
+    holding.hold_output("partial")
+    holding.hold_output("complete")
+    assert partial.is_dir() and not (partial / "src").exists()  # held anew, empty
+    assert (complete / "src").is_dir()
+    end(holding)
