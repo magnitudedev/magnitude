@@ -1286,7 +1286,9 @@ impl Scratch {
                 // The rounds past the last with records are answered before
                 // it (its answer releases the device to complete the step):
                 // where kernels wait in place they do not wait (their park
-                // grid is empty, `routed_scratch_grids`), and where a park
+                // grid is empty, `routed_scratch_grids`) but after a round
+                // 0 whose wait expired, whose step's every round parks and
+                // so finds its answer, and where a park
                 // is a submission boundary (`Parks`) each still waits for
                 // its answer; the last round's answer is the seed commit's.
                 let table = &core.layers[layer].scratch;

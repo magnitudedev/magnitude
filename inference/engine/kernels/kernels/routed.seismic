@@ -2458,7 +2458,11 @@ fn routed_scratch_wait[FLIGHT, LANES, LW, V, F, H, E, EL, GV](step: &tensor[STEP
 # N = H rows (its threadgroups stride over a record's items, so any grid
 # converts every one). The rounds after the
 # last with records neither park nor convert, and the host serves none of
-# them.
+# them. A request neither answered nor failed here had round 0's wait end
+# on its still pulse (`streaming_await_slot`), before the count was final:
+# every round parks and none converts, so the device still arrives, in
+# order, at every round the host serves (the step is interrupted, its
+# outputs unused).
 fn routed_scratch_grids[FLIGHT, LANES, R](step: &tensor[STEP_WORDS] i32,
     scratch: &tensor[FLIGHT, SCRATCH_SLOT * LANES] i32,
     grids: &mut tensor[R, ROUND_GRIDS, 3] i32, round_records: i32, rows_groups: i32, columns_groups: i32)
@@ -2466,12 +2470,17 @@ fn routed_scratch_grids[FLIGHT, LANES, R](step: &tensor[STEP_WORDS] i32,
     let q = step_sequence(step)
     let slot = flight_slot[FLIGHT = FLIGHT](q)
     let ask = scratch_lane(SCRATCH_ASK)
+    let answer = pair_at(scratch, slot, ask + SLOT_ANSWER)
+    let failed = q | (u64(u32(SLOT_FAILED)) << u64(32))
     let mut count = i32(0)
-    if pair_at(scratch, slot, ask + SLOT_ANSWER) == q:
+    let mut unanswered = i32(1)
+    if answer == q:
         count = scratch[slot, ask + SCRATCH_STAGED]
+    if answer == q or answer == failed:
+        unanswered = i32(0)
     for round in 0..R:
         let records = min(max(count - i32(round) * round_records, 0), round_records)
-        let parks = min(records, 1)
+        let parks = max(min(records, 1), unanswered)
         grids[round, PARK_GRID, 0] = parks
         grids[round, ROWS_GRID, 0] = rows_groups
         grids[round, COLUMNS_GRID, 0] = columns_groups

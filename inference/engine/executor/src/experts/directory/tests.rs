@@ -10,7 +10,7 @@ fn steps() -> Steps {
 
 impl Directory {
     /// [`Self::retire`] beside steps none of which begins.
-    fn retired(&mut self, progress: Point, commit: impl Fn(usize, BankRecord) -> i32, ending: impl Fn(Step) -> Ending) {
+    fn retired(&mut self, progress: Point, commit: impl Fn(usize, BankRecord) -> i32, ending: impl Fn(Point) -> Ending) {
         self.retire(progress, commit, ending, &steps())
     }
 

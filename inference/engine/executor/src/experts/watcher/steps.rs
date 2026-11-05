@@ -482,13 +482,17 @@ impl Steps {
         self.fail_rows(sequence, FailedRows::Every, reason);
     }
 
-    /// How step `sequence` ended, read under one lock: running, or ended
-    /// whole or tainted. A step is tainted before it ends
+    /// How the work at `point` ended, read under one lock: its step and
+    /// every earlier step of its group, whose scratch rounds converted
+    /// experts it may read (a seed copies them), running still, or all
+    /// ended whole, or one tainted. A step is tainted before it ends
     /// (`ExpertStep::drop`), so one read ended carries its taint.
-    pub(super) fn ending(&self, sequence: Step) -> crate::experts::directory::Ending {
+    pub(super) fn ending(&self, point: Point) -> crate::experts::directory::Ending {
         use crate::experts::directory::Ending;
         let state = self.lock();
-        match (sequence < state.frontier || state.ended.contains(&sequence), state.tainted.contains(&sequence)) {
+        let steps = point.group..=point.sequence;
+        let ended = steps.clone().all(|sequence| sequence < state.frontier || state.ended.contains(&sequence));
+        match (ended, state.tainted.range(steps).next().is_some()) {
             (false, _) => Ending::Running,
             (true, false) => Ending::Ended,
             (true, true) => Ending::Tainted,

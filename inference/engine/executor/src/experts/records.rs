@@ -577,8 +577,8 @@ impl BankRecords {
         self.filling.iter().map(|&taken| self.fill_of(taken).1.group).min()
     }
 
-    /// Retire every fill placed before `progress` whose step has ended
-    /// (`ending`, read once a step, before the steps' lock): it holds its
+    /// Retire every fill placed before `progress` whose step and group
+    /// have ended (`ending`, read once a step, before the steps' lock): it holds its
     /// expert where its step ended whole with the device's commit
     /// (`commit(group, record)` holding the step's low word), mapped from
     /// the first step not yet begun, under the steps' lock (`steps`); else
@@ -587,7 +587,7 @@ impl BankRecords {
         &mut self,
         progress: Point,
         commit: impl Fn(usize, BankRecord) -> i32,
-        mut ending: impl FnMut(Step) -> super::directory::Ending,
+        mut ending: impl FnMut(Point) -> super::directory::Ending,
         steps: &super::watcher::Steps,
     ) -> Vec<(usize, Staged, bool)> {
         use super::directory::Ending;
@@ -596,7 +596,7 @@ impl BankRecords {
         let filling = std::mem::take(&mut self.filling);
         for (group, record) in filling {
             let (staged, point) = self.fill_of((group, record));
-            let ending = (point < progress).then(|| *endings.entry(point.sequence).or_insert_with(|| ending(point.sequence)));
+            let ending = (point < progress).then(|| *endings.entry(point.sequence).or_insert_with(|| ending(point)));
             match ending {
                 None | Some(Ending::Running) => self.filling.push((group, record)),
                 Some(ending) => {

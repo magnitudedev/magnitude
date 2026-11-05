@@ -73,6 +73,8 @@ fn a_step_whose_wait_outlasted_a_still_pulse_is_interrupted_and_the_load_goes_on
     // Its wait at layer 0 outlasted the still pulse, as its kernel records.
     harness.expire(&step, 0);
     let sequence = step.sequence();
+    // A lone step: its group's only one.
+    let starved = crate::experts::directory::Point { group: sequence, layer: 0, sequence };
     match step.complete() {
         Err(StepFailure::Interrupted(reason)) => assert!(reason.contains("pulse"), "{reason}"),
         outcome => panic!("a step whose wait expired completed {:?}", outcome.map(|_| ())),
@@ -80,11 +82,11 @@ fn a_step_whose_wait_outlasted_a_still_pulse_is_interrupted_and_the_load_goes_on
     // The load goes on: a step begun after the beat completes, and the
     // starved step's seeds were never mapped, so a prompt step seeds the
     // same experts afresh.
-    assert_eq!(shared.steps.ending(sequence), crate::experts::directory::Ending::Tainted, "the starved step is tainted");
+    assert_eq!(shared.steps.ending(starved), crate::experts::directory::Ending::Tainted, "the starved step is tainted");
     let counted = |steps: u64| format!("steps interrupted by a wait ending on a still pulse and re-run: {steps} (");
     assert!(shared.steps.interruptions().starts_with(&counted(1)), "{}", shared.steps.interruptions());
     assert!(harness.request(&[1]).complete().is_ok(), "the next step completes");
-    eventually("residency never passed the starved step", || shared.steps.ending(sequence) != crate::experts::directory::Ending::Tainted);
+    eventually("residency never passed the starved step", || shared.steps.ending(starved) != crate::experts::directory::Ending::Tainted);
     let mut seeded = harness.seeded(0, &[3, 4]).into_iter().map(|(expert, _)| expert).collect::<Vec<_>>();
     seeded.sort();
     assert_eq!(seeded, [3, 4], "the starved step's seeds were mapped");

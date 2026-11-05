@@ -144,8 +144,11 @@ const POLICY_WORDS = 11
 # it lives: its load's pulse (`exchange::Pulse`), which every table joins
 # as it is made, advances every slot's SLOT_PULSE every PULSE_MS, and a
 # spinning wait ends, as on its step's failure, once that word has not
-# moved for PULSE_SPINS of its spins: at least 100 ms at the fastest spin
-# measured (70 ns, an idle M4 Pro), under a second at the slowest (535 ns).
+# moved for PULSE_SPINS of its spins, at the device's own cost of a spin:
+# at least 100 ms at the fastest spin measured (70 ns, an idle M4 Pro),
+# under a second on a Mac (535 ns, its slowest), and longer across a
+# discrete device's bus, whose spins read host memory over it (a 3090's and
+# a 4070's waits outlasted 1.2 s of still pulse).
 # A live host meets that end only if its pulse starves for that long (a
 # loaded machine): the wait then stores its step as the slot's SLOT_EXPIRED,
 # and the host interrupts that step, its outputs unused and its seeds never
@@ -248,7 +251,11 @@ const DECODE_GRIDS = 1
 #   begins; its answer, the round's records ready to convert. The host
 #   answers every round of a request, the rounds without records too, and
 #   a failure fails every round not yet answered, the last always among
-#   them.
+#   them. The device arrives at every round the host awaits its arrival
+#   at: each with records, and every round where round 0's wait ended on
+#   its still pulse before the request's answer (`routed_scratch_grids`),
+#   so a host serving a step's rounds in order never waits on an arrival
+#   that an expired wait skipped.
 const SCRATCH_ASK = 0
 const SCRATCH_ROUND = 1
 const SCRATCH_STAGED = 8

@@ -82,15 +82,17 @@ impl Point {
     }
 }
 
-/// How a step that placed a seed ended, as its seed retires by
+/// How a seed's step and the earlier steps of its group, whose scratch
+/// its seed copy reads, ended, as the seed retires by
 /// ([`Directory::retire`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ending {
-    /// It runs still: whether it will end whole is unknown.
+    /// One runs still: whether all end whole is unknown.
     Running,
-    /// It ended, no beat of the host's pulse late across it.
+    /// All ended, no wait of theirs ending on its still pulse.
     Ended,
-    /// It ended across a late beat of the host's pulse.
+    /// All ended, a wait of one ending on its still pulse before its
+    /// answer.
     Tainted,
 }
 
@@ -1166,18 +1168,18 @@ impl Directory {
     }
 
     /// The device is at `progress`: every seed placed before it whose step
-    /// has ended (`ending`) is retired, each placed by a step that ended
-    /// whole holding its expert where the device committed it
-    /// (`commit(group, record)` holds the step's low word), banking any copy
-    /// its host tier keeps; any other leaves its record free: a tainted
-    /// step's (it spanned a late beat of the host's pulse, so its seed copy
-    /// may have read a slot its wait never had answered) whatever the
-    /// device committed. A seed of a step still running stays pending,
-    /// though the device is past its layer: its taint is known only once
-    /// it ends. Every tier record graced through a point the device is past
+    /// and group have ended (`ending`, of its point) is retired, each placed
+    /// by a step that ended whole holding its expert where the device
+    /// committed it (`commit(group, record)` holds the step's low word),
+    /// banking any copy its host tier keeps; any other leaves its record
+    /// free: a tainted one's (a wait of its step or an earlier step of its
+    /// group ended on its still pulse, so its seed copy may have read a
+    /// slot whose round was never answered) whatever the device committed.
+    /// A seed of a group still running stays pending, though the device is
+    /// past its layer: its taint is known only once it ends. Every tier record graced through a point the device is past
     /// is ready. The seeds committed, (layer, expert, record), which the
     /// host maps.
-    pub fn retire(&mut self, progress: Point, commit: impl Fn(usize, BankRecord) -> i32, ending: impl Fn(Step) -> Ending, steps: &Steps) {
+    pub fn retire(&mut self, progress: Point, commit: impl Fn(usize, BankRecord) -> i32, ending: impl Fn(Point) -> Ending, steps: &Steps) {
         // Only the records' change and its mapping under the steps' lock;
         // what the tier and the ranking learn of it after.
         for (group, (layer, expert), committed) in self.bank.retire_fills(progress, commit, ending, steps) {

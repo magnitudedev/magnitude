@@ -8,7 +8,10 @@
 //! no table a device can wait on goes unpulsed. Its thread advances every
 //! live table's pulse every PULSE_MS, from the first table's making until
 //! the last drops. A wait ends only once its pulse stood still for its
-//! least patience (PULSE_SPINS spins at the fastest spin measured, 105 ms),
+//! patience, PULSE_SPINS spins at its device's own cost of a spin (longer
+//! across a discrete device's bus, whose spins read host memory over it),
+//! at least the least patience (PULSE_SPINS spins at the fastest spin
+//! measured, 105 ms),
 //! so a beat that comes later than that less one period ([`late`]: the
 //! host starved, a loaded machine) is the only way a live host's wait can
 //! end before its answer: it is counted ([`Pulse::late_beats`]), and a wait

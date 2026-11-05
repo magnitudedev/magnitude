@@ -5204,6 +5204,17 @@ fn streaming_scratch_rounds_fill_the_scratch_bank() {
         expected_grids(0),
         "a failed step's grids"
     );
+    // A request unanswered past round 0's wait (it ended on its still
+    // pulse): every round parks, so the device arrives at each round the
+    // host serves, and none converts.
+    let mut unanswered = read_i32(&scratch_table);
+    set_pair(&mut unanswered, ask + constants::SLOT_ANSWER, q - 1);
+    let parked = expected_grids(0).chunks(3 * constants::ROUND_GRIDS as usize).flat_map(|round| [&[1][..], &round[1..]].concat()).collect::<Vec<_>>();
+    assert_eq!(
+        read_i32(&grids_of(&shared_i32(&device, &table.extents(), &unanswered))),
+        parked,
+        "an expired round 0's grids"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -6469,9 +6480,9 @@ const EXPIRED: &str = "dead host: its wait stored its expiry";
 
 /// A live host's long wait is answered, not given up: its pulse beats
 /// throughout (the acquire load the wait reads it by sees each beat), so a
-/// tier wait the host answers two seconds on (past any wait's patience,
-/// under a second) returns the answer: its choice sourced from the record
-/// the answer names.
+/// tier wait the host answers two seconds on (past a Mac's patience, under
+/// a second; a discrete device's, its spins across the bus, may be longer)
+/// returns the answer: its choice sourced from the record the answer names.
 #[test]
 fn a_live_hosts_long_wait_is_answered() {
     let Some(device) = streaming_device() else {
@@ -6534,8 +6545,9 @@ fn an_aborted_hosts_wait_ends() {
 /// end a dead process's running kernel (its GPU stayed busy, its memory
 /// held, until a reboot; NVIDIA's driver ends it within a second), so the
 /// wait ends once its slot's pulse, which a live host advances every
-/// PULSE_MS, has stood still for PULSE_SPINS spins (under a second at the
-/// slowest spin measured). The test runs itself as that host (one tier
+/// PULSE_MS, has stood still for PULSE_SPINS spins at the device's own
+/// cost of a spin (under a second on a Mac; longer across a discrete
+/// device's bus). The test runs itself as that host (one tier
 /// wait on a requested slot, pulsed), ends it by `death`, and requires its
 /// GPU idle again within five seconds; it needs the GPU to itself.
 fn dead_hosts_wait_ends(death: &str) {
@@ -6589,7 +6601,7 @@ fn dead_hosts_wait_ends(death: &str) {
         panic!("the host never began its wait: {:?}", host.wait());
     }
     // Its launch spins within a second of its call, and while the host
-    // pulses it spins on past any wait's patience (under a second); an
+    // pulses it spins on past a Mac's patience (under a second); an
     // aborting host aborts, a stalling one stops its pulse, two seconds
     // after its call.
     std::thread::sleep(std::time::Duration::from_millis(1500));

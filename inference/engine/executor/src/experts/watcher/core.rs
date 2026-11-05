@@ -304,11 +304,11 @@ impl Core {
 
     /// The device is at `progress`: retire the seeds and tier graces before
     /// it, each seed committed mapped from the first step not yet begun but
-    /// a tainted step's (it spanned a late beat of the host's pulse,
-    /// `Steps::ending`) (`Directory::retire`).
+    /// a tainted one's (a wait of its step or of an earlier step of its
+    /// group ended on its still pulse, `Steps::ending`) (`Directory::retire`).
     pub(super) fn retire(&mut self, progress: Point) {
         let (groups, steps) = (&self.groups, &self.steps);
-        self.directory.retire(progress, |group, record| groups[group].commits.load(record.index()), |sequence| steps.ending(sequence), steps);
+        self.directory.retire(progress, |group, record| groups[group].commits.load(record.index()), |point| steps.ending(point), steps);
         // A taint is read until every seed of its group has retired.
         let read = self.directory.pending_from().map_or(progress.group, |group| group.min(progress.group));
         steps.untaint_before(read);
