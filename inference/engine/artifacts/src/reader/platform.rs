@@ -263,9 +263,31 @@ pub(crate) fn open_cached(path: &Path) -> Result<File, Error> {
     Ok(file)
 }
 
-/// The file opened for reads through the cache, with the platform's
-/// read-ahead.
-#[cfg(not(target_os = "linux"))]
+/// [`open_cached`] on macOS: read-ahead off (`F_RDAHEAD` 0), which otherwise
+/// fills the cache past a staged resident weight with the expert stacks
+/// beside it, 1275 pages of an LFM2.5 8B load on an M4 Pro.
+#[cfg(target_os = "macos")]
+pub(crate) fn open_cached(path: &Path) -> Result<File, Error> {
+    use std::os::fd::AsRawFd;
+    let file = File::open(path)?;
+    // SAFETY: a flag on a descriptor this function owns; F_RDAHEAD takes an int.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_RDAHEAD, 0) } == -1 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(file)
+}
+
+/// [`open_cached`] on Windows: opened for random access
+/// (`FILE_FLAG_RANDOM_ACCESS`), so the cache manager reads ahead of no range.
+#[cfg(windows)]
+pub(crate) fn open_cached(path: &Path) -> Result<File, Error> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_RANDOM_ACCESS: u32 = 0x1000_0000;
+    Ok(std::fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_RANDOM_ACCESS).open(path)?)
+}
+
+/// [`open_cached`] where no read-ahead control is known: the platform's own.
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub(crate) fn open_cached(path: &Path) -> Result<File, Error> {
     Ok(File::open(path)?)
 }

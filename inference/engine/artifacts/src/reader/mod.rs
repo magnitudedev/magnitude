@@ -19,9 +19,9 @@
 //! `MS_INVALIDATE`).
 //!
 //! **Cached** reads go through the file cache and keep what they fill. The
-//! file is advised
-//! random access on Linux (`POSIX_FADV_RANDOM`: no read-ahead past the
-//! ranges named), and every piece lands through its worker's buffer, then
+//! file is opened with no read-ahead past the ranges named (Linux
+//! `POSIX_FADV_RANDOM`, macOS `F_RDAHEAD` off, Windows
+//! `FILE_FLAG_RANDOM_ACCESS`), and every piece lands through its worker's buffer, then
 //! an exact copy into each sink: reading the cache straight into mapped
 //! staging measured slower on Linux.
 //!
