@@ -77,6 +77,9 @@ pub struct Stack {
     curve: MissCurve,
     /// The last decode step counted.
     counted: Option<Step>,
+    /// The rows of the decode steps `curve` counts, summed: each step's
+    /// launch's, counted with it.
+    rows: u64,
     /// Each prompt group's union by its depth, `steps` the groups counted,
     /// and the last group's read sequence ([`Self::read_group`]).
     group_curve: MissCurve,
@@ -200,6 +203,7 @@ impl Stack {
                 layers: vec![empty.clone(); layers],
             },
             counted: None,
+            rows: 0,
             group_curve: MissCurve {
                 steps: 0,
                 layers: vec![empty.clone(); layers],
@@ -228,10 +232,11 @@ impl Stack {
 
     /// Step `read.sequence` read `read.experts` at `read.layer`, in the
     /// device's order of reads: together, each expert at its depth before
-    /// any of them is ranked again. A decode read is `counted`, and so is its
-    /// step, the first time one of its reads is (a group's steps first read
-    /// in sequence order, and groups in theirs).
-    pub fn read(&mut self, read: &RoutedRead, counted: bool) {
+    /// any of them is ranked again. A decode read is counted where its
+    /// step's launch's rows are given (`counted`), and so is its step, with
+    /// those rows, the first time one of its reads is (a group's steps first
+    /// read in sequence order, and groups in theirs).
+    pub fn read(&mut self, read: &RoutedRead, counted: Option<u64>) {
         let mut experts = read.experts.clone();
         experts.sort_unstable();
         // Each expert with its choices: the rows that chose it.
@@ -244,8 +249,10 @@ impl Stack {
         }
         let depths = self.rank(read, routed);
         count(&mut self.decoded, &mut self.last_decoded, read, &depths);
-        if counted {
-            count(&mut self.curve, &mut self.counted, read, &depths);
+        if let Some(rows) = counted {
+            if count(&mut self.curve, &mut self.counted, read, &depths) {
+                self.rows += rows;
+            }
         }
     }
 
@@ -275,6 +282,11 @@ impl Stack {
         &self.curve
     }
 
+    /// The rows of the decode steps the curve counts, summed.
+    pub fn rows(&self) -> u64 {
+        self.rows
+    }
+
     /// Every decode step read since the load, counted into the record or
     /// not, by depth: the misses of a bank of every size over them, so the
     /// promotions the ranking asks of a layer a step at any share.
@@ -289,9 +301,11 @@ impl Stack {
 }
 
 /// Count `read`, its experts found at `depths`, into `curve`, and its step
-/// the first time one of its reads is, `last` the step counted last.
-fn count(curve: &mut MissCurve, last: &mut Option<Step>, read: &RoutedRead, depths: &[usize]) {
-    if last.is_none_or(|last| last < read.sequence) {
+/// the first time one of its reads is, `last` the step counted last: whether
+/// its step was newly counted.
+fn count(curve: &mut MissCurve, last: &mut Option<Step>, read: &RoutedRead, depths: &[usize]) -> bool {
+    let new = last.is_none_or(|last| last < read.sequence);
+    if new {
         *last = Some(read.sequence);
         curve.steps += 1;
     }
@@ -301,4 +315,5 @@ fn count(curve: &mut MissCurve, last: &mut Option<Step>, read: &RoutedRead, dept
         layer.requests[deepest] += 1;
         layer.choices += read.choices;
     }
+    new
 }

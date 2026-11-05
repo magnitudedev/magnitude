@@ -524,7 +524,7 @@ fn promotions_bring_each_layers_share_into_the_bank() {
 fn the_stack_counts_every_decode_reads_misses_at_its_share() {
     let mut stack = Stack::alone(1, 8, 2);
     for (sequence, experts) in [(1, vec![0, 1]), (2, vec![0, 2]), (3, vec![3])] {
-        stack.read(&RoutedRead { sequence, layer: 0, experts, choices: 2 }, false);
+        stack.read(&RoutedRead { sequence, layer: 0, experts, choices: 2 }, None);
     }
     // At a share of 2: step 1 misses both, step 2 misses 2 (0 at
     // depth 1), step 3 misses 3; at a share of 1, step 2 misses 0 too.

@@ -289,6 +289,8 @@ impl HintCounts {
 pub struct MissRecord {
     /// The decode steps its curves counted: the evidence it is of.
     pub steps: u64,
+    /// Those steps' launches' rows, summed (`r₀` over `steps`).
+    pub rows: u64,
     /// Each streamed layer's, in decoder order.
     pub layers: Vec<MeasuredLayer>,
     /// Its decode requests' demand reads: the served file's read line.
@@ -364,9 +366,10 @@ impl RecordFeed {
     }
 
     /// The record of what was fed, its reads counted in `curve` (the
-    /// ranking's stack's) and `reads` the served file's: none before a
-    /// launch measured `σ` along the recording's lines.
-    pub fn record(&self, curve: &crate::experts::MissCurve, reads: RequestReads) -> Option<MissRecord> {
+    /// ranking's stack's) over steps of `rows` rows in all, and `reads` the
+    /// served file's: none before a launch measured `σ` along the
+    /// recording's lines.
+    pub fn record(&self, curve: &crate::experts::MissCurve, rows: u64, reads: RequestReads) -> Option<MissRecord> {
         let lines = self.lines.as_deref()?;
         let layers = curve
             .layers
@@ -379,7 +382,7 @@ impl RecordFeed {
                 anticipated: self.anticipated[layer],
             })
             .collect();
-        Some(MissRecord { steps: curve.steps, layers, reads, residuals: self.residuals, hints: self.hints })
+        Some(MissRecord { steps: curve.steps, rows, layers, reads, residuals: self.residuals, hints: self.hints })
     }
 }
 
@@ -479,6 +482,7 @@ impl MissRecord {
         };
         Self {
             steps: integer,
+            rows: integer,
             layers: vec![layer; layers],
             reads: RequestReads {
                 requests: integer,
@@ -568,14 +572,13 @@ impl MissRecord {
         self.layers[layer].curve.reads() as f64 / self.steps as f64
     }
 
-    /// The decode rows of the record's steps, `r₀`: its launches' mean
-    /// rows. Why the record has none: no launch measured.
+    /// The decode rows of the record's steps, `r₀`: the mean rows of the
+    /// steps its curves counted, the population its choices are of. Why
+    /// the record has none: it counted no step.
     pub fn rows(&self) -> Result<f64, MissRecordError> {
-        let launches = self.residuals.launches();
-        let rows = (1u64..).zip(&self.residuals.rows).map(|(rows, at)| rows * at.launches).sum::<u64>();
-        match launches {
-            0 => Err(MissRecordError::NoResiduals),
-            launches => Ok(rows as f64 / launches as f64),
+        match self.steps {
+            0 => Err(MissRecordError::NoSteps),
+            steps => Ok(self.rows as f64 / steps as f64),
         }
     }
 
@@ -716,6 +719,7 @@ impl MissRecord {
             .ok_or(MissMergeError::Uncontained)?;
         Ok(Self {
             steps: self.steps.checked_sub(part.steps).ok_or(MissMergeError::Uncontained)?,
+            rows: self.rows.checked_sub(part.rows).ok_or(MissMergeError::Uncontained)?,
             layers,
             reads: self.reads.since(&part.reads),
             residuals: self.residuals.less(&part.residuals).ok_or(MissMergeError::Uncontained)?,
@@ -754,6 +758,7 @@ impl MissRecord {
             .collect::<Result<_, _>>()?;
         Ok(Self {
             steps: self.steps + later.steps,
+            rows: self.rows + later.rows,
             layers,
             reads: self.reads.merge(&later.reads),
             residuals: self.residuals.plus(&later.residuals),
@@ -1004,12 +1009,13 @@ mod tests {
         // Each layer's one read lies at the top of the stack: a bank of
         // a slot misses nothing.
         let quiet = LayerCurve { misses: vec![1, 0, 0], requests: vec![1, 0, 0], choices: 1 };
-        let record = MissRecord { steps: 2, ..measured(vec![layer(quiet); 4]) };
+        let record = MissRecord { steps: 2, rows: 2, ..measured(vec![layer(quiet); 4]) };
         let step = record.step_seconds(HeldSlots::bank(1), 1., 0.02).unwrap();
         assert_eq!(step.exposed_seconds, 0.);
         assert_eq!(step.total_seconds, 0.02, "{step:?}");
+        // `σ` prices nothing: a record no launch measured it on prices the same step.
         let unmeasured = MissRecord { residuals: Residuals::default(), ..record.clone() };
-        assert_eq!(unmeasured.step_seconds(HeldSlots::bank(1), 1., 0.02), Err(MissRecordError::NoResiduals));
+        assert_eq!(unmeasured.step_seconds(HeldSlots::bank(1), 1., 0.02), Ok(step));
         let unread = MissRecord { reads: RequestReads::default(), ..record };
         assert_eq!(
             unread.step_seconds(HeldSlots::bank(1), 1., 0.02),
@@ -1045,6 +1051,7 @@ mod tests {
     fn unpriced(layers: Vec<MeasuredLayer>) -> MissRecord {
         MissRecord {
             steps: 8,
+            rows: 8,
             layers,
             reads: RequestReads::default(),
             residuals: one_row(),
@@ -1131,6 +1138,7 @@ mod tests {
         reads.deliver(2_000_000_000, 1.);
         MissRecord {
             steps,
+            rows: steps,
             layers: vec![layer(LayerCurve { requests: misses.clone(), choices: misses.iter().sum(), misses })],
             reads,
             residuals: Residuals {
@@ -1227,7 +1235,7 @@ mod tests {
                 experts: routed.clone(),
                 choices: chosen as u64,
             };
-            stack.read(&read, true);
+            stack.read(&read, Some(1));
             last = routed;
         }
         let curve = stack.curve();

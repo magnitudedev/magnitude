@@ -1292,6 +1292,7 @@ mod tests {
             model: model.clone(),
             record: MissRecord {
                 steps: 1,
+                rows: 1,
                 layers: Vec::new(),
                 reads: RequestReads::default(),
                 residuals: Residuals::default(),

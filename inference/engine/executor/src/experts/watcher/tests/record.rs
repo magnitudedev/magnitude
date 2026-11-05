@@ -96,7 +96,7 @@ fn a_replay_of_the_recorded_steps_assembles_the_live_record() {
         layers: live.layers.iter().map(|layer| layer.curve.clone()).collect(),
     };
     let reads = serde_json::from_value(bank["reads"].clone()).unwrap();
-    let replayed = feed.record(&curve, reads).expect("the replay sampled σ");
+    let replayed = feed.record(&curve, live.rows, reads).expect("the replay sampled σ");
     let rows = live.residuals.rows.map(|at| at.launches);
     assert!(rows[..4].iter().all(|&launches| launches > 0), "σ sampled at one to four rows: {rows:?}");
     assert_eq!(replayed, *live);

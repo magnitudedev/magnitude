@@ -396,6 +396,7 @@ pub fn misses_at(depth: usize, steps: u64, misses: u64) -> crate::assessment::Mi
     curve.choices = steps * misses;
     crate::assessment::MissRecord {
         steps,
+        rows: steps,
         layers: vec![crate::assessment::MeasuredLayer {
             lines: crate::assessment::ExpertLines::reference(1_000_000),
             curve,

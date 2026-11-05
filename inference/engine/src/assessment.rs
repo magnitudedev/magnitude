@@ -1425,6 +1425,7 @@ mod tests {
         assert_eq!(unmeasured, MissesDigest::of(&Ok(None)));
         let record = MissRecord {
             steps: 2,
+            rows: 2,
             layers: vec![
                 MeasuredLayer {
                     lines: ExpertLines::reference(10),

@@ -762,7 +762,9 @@ struct Feed {
 /// merged at the layer, and the choices its rows routed to each expert read,
 /// in the read's order.
 enum Fed {
-    Decode { counted: bool },
+    /// A decode read, counted into the record with its step's launch's
+    /// rows where the step is (`counted`).
+    Decode { counted: Option<u64> },
     Group { steps: usize, merged: usize, choices: Vec<u32> },
 }
 
@@ -1534,7 +1536,7 @@ impl Telemetry {
             let read = RoutedRead { sequence: first + steps - 1, layer, experts, choices: routed };
             let fed = match prompt {
                 true => Fed::Group { steps: steps as usize, merged, choices },
-                false => Fed::Decode { counted: false },
+                false => Fed::Decode { counted: None },
             };
             recorded.feed.pending.push((first, read, fed));
         }
@@ -1571,7 +1573,7 @@ impl Telemetry {
         }
         // The curves and counts are the load's layers' (`Telemetry::new`).
         // One record, shared by its publication and the latest's readers.
-        let record = Arc::new(feed.record.record(curve, costs.reads)?);
+        let record = Arc::new(feed.record.record(curve, stack.rows(), costs.reads)?);
         feed.published = curve.steps;
         feed.latest = Some(record.clone());
         Some(record)
@@ -1927,7 +1929,10 @@ fn feed_decode(
         sampled: _,
     } = decoded;
     let (previous, now) = ended;
-    let counted = recorded.is_some();
+    // A recorded decode step runs its launch (`ExpertStep::decoding`).
+    let counted = recorded
+        .as_ref()
+        .map(|_| launch.expect("a recorded decode step has its launch").rows as u64);
     feed.pending
         .extend(routed.into_iter().map(|read| (group, read, Fed::Decode { counted })));
     let Some(Recording { lines }) = recorded else {
