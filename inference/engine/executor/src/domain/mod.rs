@@ -328,13 +328,15 @@ pub struct PendingOperationOutcome {
     image: Option<ImageRef>,
 }
 
-/// What a launch's duration is its own across: the device's recorded graphs
-/// (a recording is paid on the host within the duration) and the expert
-/// bank's resizes begun (a resize holds the thread at the boundaries it runs
-/// across, and a growth's new slots or a shrink's evictions change what the
-/// launch misses). A launch is timed only where the epoch at its finish is
-/// the one at its submission, none while a resize runs: a resize changes no
-/// launch cost the draft width is chosen by.
+/// What a launch's duration is its own across: the graphs recorded on the
+/// device, by any load (a recording is paid on the host within the
+/// duration), read from the device's own count at each submission and
+/// finish, and the expert bank's resizes begun (a resize holds the thread
+/// at the boundaries it runs across, and a growth's new slots or a
+/// shrink's evictions change what the launch misses). A launch is timed
+/// only where the epoch at its finish is the one at its submission, none
+/// while a resize runs: a resize changes no launch cost the draft width is
+/// chosen by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LaunchEpoch {
     graphs: u64,
@@ -797,7 +799,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// none while an expert bank resize runs.
     fn launch_epoch(&self) -> Option<LaunchEpoch> {
         (!self.resize_held.runs()).then(|| LaunchEpoch {
-            graphs: self.family.graph_replays().recorded,
+            graphs: self.domain.device().graph_replays().recorded,
             resizes: self.resize_held.begun,
         })
     }
