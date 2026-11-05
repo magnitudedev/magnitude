@@ -1,0 +1,11 @@
+{
+  "memory": {
+    "profile": {"cpu_sites": false},
+    "tail": "pressure-window",
+    "footprint": "holding-store"
+  },
+  "kl": {
+    "unsited_profile": {"cpu_sites": false},
+    "streamed": "equal-logits"
+  }
+}
