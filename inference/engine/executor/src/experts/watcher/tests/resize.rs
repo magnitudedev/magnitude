@@ -172,7 +172,11 @@ fn a_host_shrink_asked_with_a_landing_in_flight_answers_at_once() {
         harness.request(&[expert]).complete().unwrap();
     }
     harness.tier_ready();
-    let ahead = Ahead::queue("shrink-landing-ahead", 16);
+    // The landing ends past its request, so it leaves flight the moment it
+    // ends, kept (`HostRecords::answering`): the reads ahead must outlast the
+    // shrink and its checks. Sixteen uncached 16 MiB reads end within tens
+    // of milliseconds on a fast disk.
+    let ahead = Ahead::queue("shrink-landing-ahead", 384);
     let served = || harness.watcher.shared().costs().layers[0].unanticipated;
     let before = served();
     let step = harness.step();
@@ -216,7 +220,9 @@ fn a_host_shrink_right_after_a_growth_answers_beside_its_landings() {
     shared.join(super::Join::Landed { records: vec![8], views: vec![harness.host.views(8)] });
     shared.joins.wait_taken();
     drop(step);
-    let ahead = Ahead::queue("shrink-grown-ahead", 16);
+    // Enough reads ahead to outlast the shrink, as in
+    // `a_host_shrink_asked_with_a_landing_in_flight_answers_at_once`.
+    let ahead = Ahead::queue("shrink-grown-ahead", 384);
     let floor = || residency::lock(&harness.watcher.state).core.directory.host_floor(0);
     let served = || harness.watcher.shared().costs().layers[0].unanticipated;
     let before = served();
