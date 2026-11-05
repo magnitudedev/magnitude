@@ -35,7 +35,10 @@ use std::sync::{Arc, Mutex};
 /// takes it back. Each process limit enforced against charged memory (a
 /// cgroup's, a Windows job's commit) moves with the device's charges to
 /// host RAM the same way; an address-space or data-segment limit counts the
-/// reservation, which a resize keeps. Another program's hold on a store
+/// reservation, which a resize keeps. The host's wired pages move with the
+/// device's charges too, as a Metal device's allocations are wired, and the
+/// process's footprint is what the device charges host RAM, each release
+/// leaving it at once. Another program's hold on a store
 /// ([`Press`]) takes its bytes of the room left there while it lasts, and,
 /// sharing the process's cgroups, of what each cgroup limit has left.
 struct StillHost {
@@ -128,6 +131,9 @@ impl StatusReading for StillHost {
             let store = topology.host_ram().id();
             host.allocatable.value = moved(host.allocatable.value, store);
             host.obtainable.value = moved(host.obtainable.value, store);
+            if let Some(held) = &mut host.held {
+                held.wired_bytes = used(held.wired_bytes, store, 0);
+            }
             for limit in &mut host.limits {
                 limit.used_bytes = match limit.kind {
                     seismic::ProcessLimitKind::CgroupV1 { .. } | seismic::ProcessLimitKind::CgroupV2 { .. } => {
@@ -145,6 +151,11 @@ impl StatusReading for StillHost {
             }
         }
         seismic::Status { sample, runtime }
+    }
+
+    /// What the device charges host RAM now.
+    fn footprint(&self) -> Option<u64> {
+        Some(Self::charges(&self.device).get(&self.topology.host_ram().id()).copied().unwrap_or(0))
     }
 }
 

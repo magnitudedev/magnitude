@@ -153,11 +153,20 @@ pub trait StatusReading {
     /// A sample with host RAM read now: what a claim, and every observation
     /// between claims ([`DeviceHeap::refresh`]), is judged against.
     fn status(&self, device: &Device) -> seismic::Status;
+
+    /// The process's footprint in host RAM read now: what the system counts
+    /// it holding there, which witnesses the releases of a device whose
+    /// allocations are pages of the process (`ExecutorDomain::host_witness`).
+    fn footprint(&self) -> Option<u64>;
 }
 
 impl StatusReading for Devices {
     fn status(&self, device: &Device) -> seismic::Status {
         Devices::status(self, device.topology(), device.info().id())
+    }
+
+    fn footprint(&self) -> Option<u64> {
+        seismic::ProcessMemory::footprint_now()
     }
 }
 
@@ -239,6 +248,11 @@ impl DeviceHeap {
     /// the physical operation succeeded.
     pub(crate) fn heap_mut(&mut self) -> &mut MemoryHeap {
         &mut self.heap
+    }
+
+    /// The process's host RAM footprint now ([`StatusReading::footprint`]).
+    pub fn footprint(&self) -> Option<u64> {
+        self.reading.footprint()
     }
 
     /// Observe every domain the device uses from a sample read now, set

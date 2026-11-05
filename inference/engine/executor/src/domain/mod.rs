@@ -983,17 +983,24 @@ impl ResizeHeld {
 /// sizes the expert bank's resizes from them.
 ///
 /// Memory available to the process is its headroom and its own charge. A
-/// release drops the charge at once; the host shows it in headroom only later
-/// (a released Metal buffer's pages stay wired until the GPU driver unwires
-/// them). The process knows its own releases exactly, and the readings say
-/// when the host shows them: available memory, counting what is unseen
-/// ([`DomainPace::unseen`]), rises only as a release shows, and falls only as
-/// the host takes. So no lag makes a release answer the same pressure twice,
-/// on any OS: a shrink covers what the reading is below the planning line,
-/// plus what the host takes until the next shrink takes effect, less what is
-/// unseen and what the process released since the reading. What that covers
-/// is awaited, not released again ([`Shortfall::Covered`]). A span across a
-/// fall of the charge measures no taking.
+/// release drops the charge at once; the host may show it in headroom only
+/// later. The process knows its own releases exactly, and a witness says
+/// when the host shows them: a count that falls by a release as headroom
+/// rises by it, and that the rest of the host's demand for free memory moves
+/// none of, but where it wires memory itself (host RAM's,
+/// `ExecutorDomain::host_witness`; a device's own memory shows a release
+/// with its charge). What the process released that
+/// the witness has yet to drop is unseen ([`DomainPace::unseen`]), and
+/// available memory, counting it, rises only as a release shows and falls
+/// only as the host takes. So no lag makes a release answer the same
+/// pressure twice, and a release that lands in a span in which the host
+/// takes as much is seen, not credited until the credit lapses: a shrink
+/// covers what the reading is below the planning line, plus what the host
+/// takes until the next shrink takes effect, less what is unseen and what the
+/// process released since the reading. What that covers is awaited, not
+/// released again ([`Shortfall::Covered`]). Where no witness is read, a
+/// release is taken as shown at the reading after it. A span across a fall
+/// of the charge measures no taking.
 ///
 /// What the host takes is the rate of available memory's fall over the latest
 /// span of at least one reading interval (a probe right after a release spans
@@ -1037,9 +1044,12 @@ struct DomainPace {
     /// The reading's band: Reclaim at or below the planning line, or while
     /// the host is in distress.
     band: MemoryBand,
-    /// What the process released that the readings have yet to show. None
+    /// What the process released that its witness has yet to drop. None
     /// is owed from a reading above the line.
     unseen: u64,
+    /// The witness of the process's releases in the store at this reading;
+    /// none in a device's own memory, or where none is read.
+    witness: Option<u64>,
     /// The memory available at this reading: headroom, charge and `unseen`.
     available: u64,
     /// The probe the rate is measured from, and the memory available then.
@@ -1125,12 +1135,14 @@ impl MemoryPace {
     }
 
     /// Fold in a probe of every domain, the process charging each store as
-    /// `charges` say, `settled` if no bank resize runs, and memory read
-    /// every `reading_interval`.
+    /// `charges` say and host RAM's witness of its releases reading `host`,
+    /// `settled` if no bank resize runs, and memory read every
+    /// `reading_interval`.
     fn observe(
         &mut self,
         readings: &[DomainReading],
         charges: &[(seismic::StoreId, u64)],
+        host: Option<u64>,
         settled: bool,
         reading_interval: Duration,
     ) {
@@ -1152,12 +1164,14 @@ impl MemoryPace {
             );
             let before = self.domains.remove(&reading.domain);
             let shown = reading.headroom_bytes.saturating_add(charged);
+            let witness = host.filter(|_| reading.identity == seismic::StoreIdentity::HostRam);
             let unseen = match (reading.band, &before) {
                 (MemoryBand::Reclaim, Some(before)) => {
                     let owed = before.unseen + before.charged.saturating_sub(charged);
-                    // A rise of what is available is the host showing a
-                    // release, up to what it owes.
-                    owed - (shown + owed).saturating_sub(before.available).min(owed)
+                    // The witness's fall is what of it shows; all of it
+                    // without one.
+                    let shown = before.witness.zip(witness).map_or(owed, |(was, now)| was.saturating_sub(now));
+                    owed - shown.min(owed)
                 }
                 _ => 0,
             };
@@ -1196,6 +1210,7 @@ impl MemoryPace {
                     charged,
                     band: reading.band,
                     unseen,
+                    witness,
                     available,
                     base,
                     rate,
@@ -1209,7 +1224,7 @@ impl MemoryPace {
     /// What a shrink of what is charged in `store` has to do, decided at the
     /// latest probe with the process charging it `charged` now: that domain's
     /// reading below the planning line, plus what the host takes until the
-    /// next shrink takes effect, less what the readings have yet to show and
+    /// next shrink takes effect, less what the witness has yet to drop and
     /// the charge dropped since this one. Only a release charged in a domain
     /// lifts its deficit, so each holding shrinks by its own domain's; a
     /// domain no probe observed is above.
@@ -1237,8 +1252,9 @@ impl MemoryPace {
 
     /// Reclaim outlasted the unload clock on what is unseen: everything
     /// released is taken as shown, and the next decision stands on its
-    /// reading alone. A span in which the host took as it showed a release
-    /// reads as a lag; without this that would wait forever.
+    /// reading alone. A release whose pages the system keeps counting for
+    /// the process (its footprint never falls by it) would be awaited
+    /// forever without this.
     fn lapse_credit(&mut self) {
         for pace in self.domains.values_mut() {
             pace.available -= pace.unseen;

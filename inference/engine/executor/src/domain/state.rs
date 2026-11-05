@@ -851,9 +851,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// after each release while memory is short.
     pub fn probe_memory(&mut self, reading_interval: std::time::Duration) -> Result<(), DomainError> {
         let readings = self.observe_memory()?;
+        let host = self.host_witness(&readings);
         self.pace.borrow_mut().observe(
             &readings,
             &self.domain.device().ledgers().own_claims(),
+            host,
             !self.resize_held.runs(),
             reading_interval,
         );
@@ -863,6 +865,33 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         {
             Some(reading) => Err(DomainError::Reclaim(reading)),
             None => Ok(()),
+        }
+    }
+
+    /// Host RAM's witness of the process's releases at a probe that read
+    /// `readings` (`MemoryPace`): what the system counts the process holding
+    /// out of free memory, which falls by a release as free memory rises by
+    /// it. A Metal device's allocations are wired through its residency set,
+    /// so the host's wired pages (`seismic::HostHeld`): a released buffer
+    /// leaves the footprint at once, but its pages are free only once the
+    /// driver unwires them at its next tick (on an M4 Pro, 0.47 s after a
+    /// 138 MB slot's release free and wired memory moved together; the
+    /// first slot a reserved buffer released was not unwired within 3 s).
+    /// The count is the host's, the process's own wired size counting none
+    /// of the residency set's: another program wiring memory in the span
+    /// holds a release unseen until the credit lapses, and one unwiring
+    /// shows it early. Any other device's allocations are pages of the
+    /// process, so its footprint (`seismic::ProcessMemory`), which the
+    /// system frees as they leave it (a GB10's fell by each bank slot within
+    /// its release). None where the system reports neither.
+    fn host_witness(&self, readings: &[crate::platform::DomainReading]) -> Option<u64> {
+        match self.domain.device().backend() {
+            seismic::BackendName::Metal => readings
+                .iter()
+                .find(|reading| reading.identity == seismic::StoreIdentity::HostRam)
+                .and_then(|reading| reading.held)
+                .map(|held| held.wired_bytes),
+            _ => self.memory.borrow().footprint(),
         }
     }
 
