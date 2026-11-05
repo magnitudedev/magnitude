@@ -397,6 +397,24 @@ fn the_directory_keeps_the_host_tier_inclusive_of_the_bank() {
     assert!(directory.in_tier(0, 3) && alone(&directory) == 2);
 }
 
+/// A landing into the host tier of an expert the bank already holds (the
+/// tier's fill beside a bank imported whole) keeps a banked copy: the tier
+/// holds alone no more experts than the bank lacks, so the experts only
+/// the file holds never underflow.
+#[test]
+fn a_landing_beside_a_whole_bank_is_banked() {
+    let mut directory = Directory::new(&[2], &[0], &[2], HostTier::replay(vec![2]));
+    directory.hold_homes();
+    for expert in 0..2 {
+        let record = directory.land(0, expert, 0).unwrap();
+        directory.landed(0, record, expert, None);
+        assert!(directory.in_tier(0, expert) && !directory.host(0).holds_alone((0, expert)));
+    }
+    let lacked = 2 - directory.held_count(0);
+    assert_eq!(lacked, 0);
+    assert!(directory.alone(0) <= lacked, "the tier holds alone only what the bank lacks");
+}
+
 /// Each group keeps its reserve of tier records: the refill unmaps kept
 /// records first in taking order, publishing the unmapping before it
 /// reads the latest step begun, and a record it unmapped is ready only

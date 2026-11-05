@@ -385,40 +385,19 @@ fn assert_close(name: &str, actual: &[f32], expected: &[f64], tolerance: f64) {
     }
 }
 
-/// The compiled artifacts of the native device's programs, each written to
-/// the directory `SEISMIC_TEST_ARTIFACTS` names as it is formed, numbered in
-/// formation order (`<ordinal>-<namespace>-<key>`): so a run's kernels at
-/// two builds pair up by ordinal and their machine code can be compared.
-/// CUDA, else Metal; `SEISMIC_TEST_BACKEND` explicitly selects CUDA, Metal or Vulkan
-/// and requires that backend to open.
+/// The GPU device under test: the first available of CUDA, Metal and
+/// Vulkan, or the backend `SEISMIC_TEST_BACKEND` selects
+/// (`seismic_native_tests::devices`).
 fn native_device() -> Option<seismic::Device> {
-    let selected = std::env::var("SEISMIC_TEST_BACKEND").ok();
-    let catalog = match (seismic::Devices::discover(&[]), selected.as_ref()) {
-        (Ok(catalog), _) => catalog,
-        (Err(error), Some(backend)) => panic!("device discovery for selected {backend} backend: {error}"),
-        (Err(_), None) => return None,
-    };
-    match selected.as_deref() {
-        // A selected backend must open: never skip silently.
-        Some("cuda") => Some(catalog.open_backend(seismic::BackendName::Cuda).expect("the CUDA device opens")),
-        Some("metal") => Some(catalog.open_backend(seismic::BackendName::Metal).expect("the Metal device opens")),
-        Some("vulkan") => Some(catalog.open_backend(seismic::BackendName::Vulkan).expect("the Vulkan device opens")),
-        Some(other) => panic!("SEISMIC_TEST_BACKEND={other}: only cuda, metal and vulkan are selectable"),
-        None => [seismic::BackendName::Cuda, seismic::BackendName::Metal]
-            .into_iter()
-            .find_map(|backend| catalog.open_backend(backend).ok()),
-    }
+    use seismic::BackendName::{Cuda, Metal, Vulkan};
+    seismic_native_tests::devices(&[Cuda, Metal, Vulkan]).into_iter().next()
 }
 
-/// The GPU device of `native_device` when present, and the CPU device.
+/// Every available device under test, GPUs and the CPU, or the backend
+/// `SEISMIC_TEST_BACKEND` selects (`seismic_native_tests::devices`).
 fn devices() -> Vec<seismic::Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    native_device()
-        .into_iter()
-        .chain(std::iter::once(
-            catalog.open_backend(seismic::BackendName::Cpu).unwrap(),
-        ))
-        .collect()
+    use seismic::BackendName::{Cpu, Cuda, Metal, Vulkan};
+    seismic_native_tests::devices(&[Cuda, Metal, Vulkan, Cpu])
 }
 
 fn is_cpu(device: &seismic::Device) -> bool {

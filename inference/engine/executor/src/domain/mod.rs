@@ -766,11 +766,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(())
     }
 
-    /// Price every miss to land on the device from now on.
+    /// Measure the host's landings slow from now on
+    /// (`Shared::slow_host_landing`).
     #[cfg(test)]
-    pub(crate) fn prefer_device_landing(&self) {
+    pub(crate) fn slow_host_landing(&self) {
         if let Some(bank) = self.family.expert_bank() {
-            bank.prefer_device_landing();
+            bank.slow_host_landing();
         }
     }
 

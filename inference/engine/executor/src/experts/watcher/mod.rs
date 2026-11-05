@@ -403,16 +403,16 @@ impl Shared {
         self.telemetry.device_convert(lines);
     }
 
-    /// Price every miss of `groups` bank groups to land on the device from
-    /// now on: a host line of two counts each, and a device line far under
-    /// it.
+    /// Measure the host's landings at a line of two counts each, each read
+    /// held back 2 ms: beside a device convert line far under it
+    /// (`ExpertMeasures::convert`), every miss is priced to land on the
+    /// device.
     #[cfg(test)]
-    pub(in crate::experts) fn prefer_device_landing(&self, groups: usize) {
+    pub(in crate::experts) fn slow_host_landing(&self) {
         for layer in 0..self.telemetry.landing_lines().len() {
             self.telemetry.landings_ended(layer, 1, 1.);
             self.telemetry.landings_ended(layer, 2, 2.);
         }
-        self.device_convert(&vec![crate::assessment::RecordLine::new(1e-9, 1e-9).expect("a line"); groups]);
         self.landings.held_ms.store(2, std::sync::atomic::Ordering::Relaxed);
     }
 

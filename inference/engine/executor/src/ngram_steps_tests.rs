@@ -361,7 +361,7 @@ fn scored(operation: Operation) -> Operation {
 /// layer and the misses it served there, in step order), each checked as it
 /// was given ([`site_answers`]), and whether the banked load has a site
 /// that may serve a miss (a partial bank's, a site held at a layer, priced
-/// to serve: [`sited_measures`]).
+/// to serve: [`test_measures`]).
 struct Scores {
     resident: Vec<StepBits>,
     banked: Vec<StepBits>,
@@ -546,13 +546,17 @@ fn scores(
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
-        if filled == Filled::DeviceLanded && !matches!(banked, Banked::Resident) {
-            domain.prefer_device_landing();
-        }
         // A site serves only once its load is priced: until then every miss
-        // is served on the GPU's path.
-        if site {
-            domain.measure_experts(sited_measures(&domain)).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+        // is served on the GPU's path. A miss lands on the device once its
+        // convert is priced under the host's landing.
+        let device_landed = filled == Filled::DeviceLanded && !matches!(banked, Banked::Resident);
+        if device_landed {
+            domain.slow_host_landing();
+        }
+        if site || device_landed {
+            domain
+                .measure_experts(test_measures(&domain, site, device_landed))
+                .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
         }
         let request = RequestId(1);
         domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
@@ -587,32 +591,47 @@ fn scores(
     Scores { resident, banked, sited, site }
 }
 
-/// What a sited load is priced on once the measurement job has stored its
-/// lines: each streamed layer's the reference host's at its own record
-/// (`ExpertLines::reference`), at the layer's record bytes, where a one-row
-/// miss ends on the CPU (40 µs and a 4 µs handshake) before the link's
-/// 86 µs, so the route assigns misses to the site, as a real model's on that
-/// host; every other input pending, as a first load's are. The fixture's
-/// experts are too small for a link at their own bytes to lose to a
-/// handshake.
-fn sited_measures(domain: &ExecutorDomain) -> crate::ExpertMeasures {
-    use crate::assessment::{ExpertLines, HostLines, Priced};
-    let reference = ExpertLines::reference(ExpertLines::REFERENCE_RECORD);
-    let lines = domain
-        .expert_bank_lines()
-        .expect("a sited load has a bank")
-        .iter()
-        .map(|bank| ExpertLines { host: HostLines { record_bytes: bank.record_bytes, ..reference.host }, ..reference })
-        .collect();
+/// What a test's banked load is priced on, every other input pending, as a
+/// first load's are. A `sited` load's lines are each streamed layer's the
+/// reference host's at its own record (`ExpertLines::reference`), at the
+/// layer's record bytes, where a one-row miss ends on the CPU (40 µs and a
+/// 4 µs handshake) before the link's 86 µs, so the route assigns misses to
+/// the site, as a real model's on that host; the fixture's experts are too
+/// small for a link at their own bytes to lose to a handshake. A
+/// `device_landed` load's bank groups each convert at a line far under the
+/// host's landing (`Shared::slow_host_landing`).
+fn test_measures(domain: &ExecutorDomain, sited: bool, device_landed: bool) -> crate::ExpertMeasures {
+    use crate::assessment::{ExpertLines, HostLines, Priced, RecordLine};
     let pending = || "not measured by the test".to_owned();
+    let lines = match sited {
+        true => {
+            let reference = ExpertLines::reference(ExpertLines::REFERENCE_RECORD);
+            Priced::Measured(
+                domain
+                    .expert_bank_lines()
+                    .expect("a sited load has a bank")
+                    .iter()
+                    .map(|bank| ExpertLines { host: HostLines { record_bytes: bank.record_bytes, ..reference.host }, ..reference })
+                    .collect(),
+            )
+        }
+        false => Priced::Pending(pending()),
+    };
+    let convert = match device_landed {
+        true => {
+            let groups = domain.expert_bank_plan().expect("a device-landed load has a bank").groups.len();
+            Priced::Measured(Some(vec![RecordLine::new(1e-9, 1e-9).expect("a line"); groups].into()))
+        }
+        false => Priced::Pending(pending()),
+    };
     crate::ExpertMeasures {
-        lines: Priced::Measured(lines),
+        lines,
         store: None,
         resident: Priced::Pending(pending()),
         pass: Priced::Pending(pending()),
         moves: Priced::Pending(pending()),
         tier_copy: Priced::Pending(pending()),
-        convert: Priced::Pending(pending()),
+        convert,
     }
 }
 

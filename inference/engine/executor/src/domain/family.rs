@@ -92,9 +92,10 @@ pub trait ElasticBank {
     /// Each bank group's convert in a decode barrier takes its `lines` from
     /// now on.
     fn device_convert(&self, lines: &[crate::assessment::RecordLine]);
-    /// Price every miss to land on the device from now on.
+    /// Measure the host's landings slow from now on
+    /// (`Shared::slow_host_landing`).
     #[cfg(test)]
-    fn prefer_device_landing(&self);
+    fn slow_host_landing(&self);
     /// The landings the device has converted.
     #[cfg(test)]
     fn device_landed(&self) -> u64;
