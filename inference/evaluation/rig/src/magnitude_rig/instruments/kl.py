@@ -29,11 +29,14 @@ question; a load that held its experts whole streamed nothing.
 
 A load whose CPU site served misses computed them in the site's own arithmetic, which its
 qualification admitted against α, not exact: its logits are not held to equality, only reported
-against its base (KL and top-1). `--without-site` judges such a load on a discrete device:
-beside each streamed load, the same load under a numerical profile that approves no CPU site, so
-it requests and uses no site verdict and every miss is the device's. That load's logits must
-equal the uncapped load's, its site serving nothing, and the other's site must have served misses
-(its stored verdict admitted it). Without it, a sited load's question is unanswered, which fails.
+against its base (KL and top-1). So is any load against a base whose own site served misses: an
+uncapped load that does not fit its device streams too, so the answer says whether its base held
+its experts whole or streamed, and how. `--without-site` judges such loads on a discrete device:
+the base, and beside each streamed load the same load, under a numerical profile that approves no
+CPU site, so neither requests nor uses a site verdict and every miss on either side is the
+device's. That load's logits must equal the base's, its site serving nothing, and the other's site
+must have served misses (its stored verdict admitted it). Without it, a sited load's question is
+unanswered, which fails.
 
 `--between` with two `--weight-cap`s asks the same for a model no uncapped load fits: the
 second streamed load against the first.
@@ -94,8 +97,8 @@ REPEATS = (
 # A streamed load's comparison with its base on the host: whether the logits are equal bit for bit,
 # and where not, the rows that differ, the first and the largest difference, and the candidate's
 # KL against its base (mean, p99 and max over the rows) and top-1 agreement; the rows of each load
-# holding a non-finite logit, the first of them, which no difference or KL covers; beside the
-# candidate's expert misses. The candidate's logits are then removed, and the base's unless a later
+# holding a non-finite logit, the first of them, which no difference or KL covers; beside each
+# load's expert misses. The candidate's logits are then removed, and the base's unless a later
 # comparison reads them (`keep`).
 COMPARE = (
     "import json, os, sys\n"
@@ -125,6 +128,7 @@ COMPARE = (
     "experts = json.load(open(os.path.join(candidate, 'logits.json')))['experts']\n"
     "summary = {'rows': len(a), 'differing': len(differing), 'largest': largest,\n"
     "           'first': header['rows'][differing[0]] if differing else None, 'experts': experts,\n"
+    "           'base_experts': header['experts'],\n"
     "           'nonfinite': {'base': len(unfinished['base']), 'candidate': len(unfinished['candidate']),\n"
     "                         'first': None if first is None else header['rows'][first]},\n"
     "           'kl': {'mean': float(kl.mean()), 'p99': float(numpy.percentile(kl, 99)), 'max': float(kl.max())} if len(kl) else None,\n"
@@ -226,17 +230,18 @@ def _loads(arguments) -> tuple[str | None, list[tuple[str, int, bool]]]:
 def _capped(arguments) -> tuple[tuple[str, Step], ...]:
     """`--weight-cap`'s loads at the defaults, each streamed load on its base's tokens (the
     uncapped load's, or under `--between` the first streamed load's), then each one's comparison
-    with its base."""
+    with its base. Under `--without-site` the base approves no CPU site either, so every miss it
+    takes, where it does not fit its device, is the device's."""
     defaults = ("--tuning-defaults",)
+    unsited = ("--numerical-profile", UNSITED)
     base, loads = _loads(arguments)
     base_run = "logits" if base is None else harness.streamed(base)
-    jobs = [(base_run, logits(arguments, pinning=defaults, weight_cap=base))]
-    if arguments.without_site:
-        jobs.append(("profile", UNSITED_PROFILE))
+    jobs = [("profile", UNSITED_PROFILE)] if arguments.without_site else []
+    jobs.append((base_run, logits(arguments, pinning=(*defaults, *(unsited if arguments.without_site else ())),
+                                  weight_cap=base)))
     for run, cap, approved in loads:
-        profile = () if approved else ("--numerical-profile", UNSITED)
         jobs.append((run, logits(arguments, rendered=f"{{runs}}/{base_run}/rendered.jsonl",
-                                 pinning=(*defaults, *profile), weight_cap=cap)))
+                                 pinning=(*defaults, *(() if approved else unsited)), weight_cap=cap)))
     for index, (run, _, _) in enumerate(loads):
         keep = index + 1 < len(loads)  # a later comparison reads the base's logits
         jobs.append((_compared(run), Step("compare", (
@@ -341,17 +346,34 @@ def _parted(summary: dict) -> str:
             f"top-1 {100 * summary['top1']:.2f}%")
 
 
+def _held(experts: dict | None) -> str:
+    """How a load held its experts: whole, or streamed with its misses."""
+    if experts is None:
+        return "held its experts whole"
+    return f"streamed, fewest misses at a streamed layer {experts['least_layer_misses']}, {experts['sited']} sited"
+
+
+# Whose CPU site served misses, by (the load's, its base's), where either did.
+INEXACT = {(True, False): "its CPU site", (False, True): "its base's CPU site", (True, True): "its and its base's CPU sites"}
+
+
 def _streamed(arguments, results: dict[str, JobResult]) -> Answer:
-    """Each streamed load against its base. A load holds when it missed at every streamed layer
-    and its logits are equal, all of them finite. A load whose CPU site served misses is not an
-    equality check (the site's arithmetic is admitted against α): it is reported, and holds under
-    `--without-site`, whose load approving no CPU site judges its row; there the approved load
-    must have had its site serve misses."""
+    """Each streamed load against its base, which the first line says held its experts whole or
+    streamed. A load holds when it missed at every streamed layer and its logits are equal, all of
+    them finite. A load whose CPU site, or whose base's, served misses is not an equality check
+    (the site's arithmetic is admitted against α): it is reported, and holds under
+    `--without-site`, whose load approving no CPU site judges its row against a base approving none
+    either; there the approved load must have had its site serve misses."""
     base, loads = _loads(arguments)
-    lines = [f"{arguments.model} · {arguments.fixture.stem} @{arguments.context} · against {base or 'uncapped'}"]
+    summaries = [json.loads((results[_compared(run)].directory / "compare.json").read_text()) for run, _, _ in loads]
+    base_experts = summaries[0]["base_experts"]
+    base_sited = 0 if base_experts is None else base_experts["sited"]
+    assert not arguments.without_site or base_sited == 0, (
+        f"the base's CPU site served {base_sited} misses under a profile approving none")
+    lines = [f"{arguments.model} · {arguments.fixture.stem} @{arguments.context} · against {base or 'uncapped'}, "
+             f"which {_held(base_experts)}"]
     holds = True
-    for run, cap, approved in loads:
-        summary = json.loads((results[_compared(run)].directory / "compare.json").read_text())
+    for (run, cap, approved), summary in zip(loads, summaries):
         label = f"streamed {cap}" + ("" if approved else " approving no CPU site")
         experts = summary["experts"]
         if experts is None:
@@ -368,11 +390,11 @@ def _streamed(arguments, results: dict[str, JobResult]) -> Answer:
             held = False
         else:
             compared = f"equal logits ({summary['rows']} rows)" if summary["differing"] == 0 else _parted(summary)
-            if sited:
+            if sited or base_sited:
                 judged = ("the load approving no CPU site judges it" if arguments.without_site
                           else "unjudged: --without-site judges it")
-                outcome = (f"its CPU site served misses in arithmetic admitted against α, so this is not an "
-                           f"equality check ({judged}): {compared}")
+                outcome = (f"{INEXACT[bool(sited), bool(base_sited)]} served misses in arithmetic admitted "
+                           f"against α, so this is not an equality check ({judged}): {compared}")
                 held = arguments.without_site
             elif arguments.without_site and approved:
                 outcome, held = f"{compared}; its CPU site served no miss, so the site went untested", False

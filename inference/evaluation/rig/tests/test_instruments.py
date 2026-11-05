@@ -701,7 +701,9 @@ def test_kl_with_weight_caps_passes_equal_logits_and_says_where_others_part(tmp_
         assert (tmp_path / "logits" / "logits.f32").exists() == (cap == 7)
     results = {name: JobResult(tmp_path / name, tmp_path / "log", 0)
                for name in ("compare-streamed-7", "compare-streamed-9")}
+    assert json.loads((tmp_path / "compare-streamed-7" / "compare.json").read_text())["base_experts"] is None
     answer = REGISTRY["kl"].answer(arguments, results)
+    assert answer.lines[0].endswith("against uncapped, which held its experts whole")
     assert answer.lines[1] == "streamed 7: equal logits (3 rows); fewest misses at a streamed layer 2, 0 sited"
     # The differing row's KL against its base: softmax([2, 3]) against softmax([2, 3.5]).
     p, q = (numpy.exp(row) / numpy.exp(row).sum() for row in (numpy.array([2., 3.]), numpy.array([2., 3.5])))
@@ -718,24 +720,26 @@ def test_kl_with_weight_caps_passes_equal_logits_and_says_where_others_part(tmp_
     (tmp_path / "compare-streamed-9" / "compare.json").write_text(json.dumps(
         {**summary, "differing": 0, "first": None, "experts": {"least_layer_misses": 1, "misses": 3, "sited": 0}}))
     assert REGISTRY["kl"].answer(arguments, results).ok
-    # On a discrete device, each streamed load also runs under a profile approving no CPU site:
-    # that one must equal the uncapped load with its site serving nothing, and the other's site
-    # must have served misses.
+    # On a discrete device, the base and each streamed load beside its own also run under a
+    # profile approving no CPU site, so every miss on either side is the device's: that load must
+    # equal the base with its site serving nothing, and the other's site must have served misses.
     discrete = parse("kl", "--backend", "cuda", "--model", MODEL, "--context", "512", "--purpose", "p",
                      "--estimate", "5m", "--weight-cap", "7", "--without-site")
     jobs = dict(REGISTRY["kl"].plan(discrete, None, "alpha").jobs)
-    assert list(jobs) == ["logits", "profile", "streamed-7", "unsited-7", "compare-streamed-7", "compare-unsited-7"]
+    assert list(jobs) == ["profile", "logits", "streamed-7", "unsited-7", "compare-streamed-7", "compare-unsited-7"]
     assert all("--cache-dir" in jobs[name].argv for name in ("streamed-7", "unsited-7")), "both keep the kernel cache"
     assert "--numerical-profile" not in jobs["streamed-7"].argv
-    unsited = jobs["unsited-7"].argv
-    assert unsited[unsited.index("--numerical-profile") + 1] == "{runs}/profile/unsited.json"
+    for name in ("logits", "unsited-7"):
+        argv = jobs[name].argv
+        assert argv[argv.index("--numerical-profile") + 1] == "{runs}/profile/unsited.json"
     profile = jobs["profile"].argv
     subprocess.run([sys.executable if part == "{python}" else part.replace("{run_dir}", str(tmp_path)) for part in profile],
                    check=True)
     assert json.loads((tmp_path / "unsited.json").read_text()) == {"cpu_sites": False}
-    compared = lambda differing, sited: {"rows": 3, "differing": differing, "largest": 0.5 * differing,
+    compared = lambda differing, sited, base=None: {"rows": 3, "differing": differing, "largest": 0.5 * differing,
                                          "first": rows[1] if differing else None,
                                          "experts": {"least_layer_misses": 2, "misses": 9, "sited": sited},
+                                         "base_experts": base,
                                          "nonfinite": {"base": 0, "candidate": 0, "first": None},
                                          "kl": {"mean": 0.01, "p99": 0.02, "max": 0.03}, "top1": 1.0}
     for name, summary in (("compare-streamed-7", compared(1, 4)), ("compare-unsited-7", compared(0, 0))):
@@ -759,10 +763,21 @@ def test_kl_with_weight_caps_passes_equal_logits_and_says_where_others_part(tmp_
     assert not answer.ok, "an approved site that served nothing was not admitted"
     assert answer.lines[1] == ("streamed 7: equal logits (3 rows); its CPU site served no miss, so the site went untested; "
                                "fewest misses at a streamed layer 2, 0 sited")
-    # A site serving misses under a profile approving none is an invariant violated.
-    (tmp_path / "compare-unsited-7" / "compare.json").write_text(json.dumps(compared(0, 1)))
-    with pytest.raises(AssertionError, match="approving none"):
-        REGISTRY["kl"].answer(discrete, results)
+    # A base that streams says so, and one approving no CPU site is still the reference the load
+    # approving none must equal: every miss on either side is the device's.
+    streaming = {"least_layer_misses": 3, "misses": 11, "sited": 0}
+    for name, sited in (("compare-streamed-7", 4), ("compare-unsited-7", 0)):
+        (tmp_path / name / "compare.json").write_text(json.dumps(compared(0, sited, streaming)))
+    answer = REGISTRY["kl"].answer(discrete, results)
+    assert answer.ok and answer.lines[0].endswith(
+        "against uncapped, which streamed, fewest misses at a streamed layer 3, 0 sited")
+    # A site serving misses under a profile approving none is an invariant violated, the base's
+    # as the load's.
+    for name, summary in (("compare-unsited-7", compared(0, 1)), ("compare-streamed-7", compared(0, 4, {**streaming, "sited": 2}))):
+        (tmp_path / name / "compare.json").write_text(json.dumps(summary))
+        with pytest.raises(AssertionError, match="approving none"):
+            REGISTRY["kl"].answer(discrete, results)
+        (tmp_path / name / "compare.json").write_text(json.dumps(compared(0, 4 if name == "compare-streamed-7" else 0)))
     # Without --without-site, a sited load's row is unjudged.
     sited = parse("kl", "--backend", "cuda", "--model", MODEL, "--context", "512", "--purpose", "p",
                   "--estimate", "5m", "--weight-cap", "7")
@@ -771,6 +786,16 @@ def test_kl_with_weight_caps_passes_equal_logits_and_says_where_others_part(tmp_
     assert not answer.ok and answer.lines[1] == (
         "streamed 7: its CPU site served misses in arithmetic admitted against α, so this is not an equality "
         "check (unjudged: --without-site judges it): equal logits (3 rows); fewest misses at a streamed layer 2, 4 sited")
+    # Against a base whose own site served misses, no load is held to equality either, even one
+    # whose own site served none.
+    (tmp_path / "compare-streamed-7" / "compare.json").write_text(json.dumps(
+        compared(1, 0, {"least_layer_misses": 3, "misses": 11, "sited": 5})))
+    answer = REGISTRY["kl"].answer(sited, {"compare-streamed-7": results["compare-streamed-7"]})
+    assert not answer.ok and answer.lines[0].endswith("which streamed, fewest misses at a streamed layer 3, 5 sited")
+    assert answer.lines[1] == (
+        "streamed 7: its base's CPU site served misses in arithmetic admitted against α, so this is not an equality "
+        "check (unjudged: --without-site judges it): logits differ at 1 of 3 rows, first f@1, largest 0.5; KL against "
+        "its base mean 0.01, p99 0.02, max 0.03, top-1 100.00%; fewest misses at a streamed layer 2, 0 sited")
     # A load that held its experts whole streamed nothing, and says nothing of misses.
     (tmp_path / "compare-streamed-7" / "compare.json").write_text(json.dumps({**compared(0, 0), "experts": None}))
     answer = REGISTRY["kl"].answer(sited, {"compare-streamed-7": results["compare-streamed-7"]})
@@ -785,16 +810,17 @@ def test_kl_with_weight_caps_passes_equal_logits_and_says_where_others_part(tmp_
     # The second cap holds where its logits equal the first's and it missed at every streamed layer.
     (tmp_path / "between").mkdir()
     unfinished = {"base": 0, "candidate": 0, "first": None}
+    first_load = {"least_layer_misses": 2, "misses": 7, "sited": 0}
     (tmp_path / "between" / "compare.json").write_text(json.dumps(
         {"rows": 3, "differing": 0, "largest": 0.0, "first": None, "experts": {"least_layer_misses": 4, "misses": 9, "sited": 0},
-         "nonfinite": unfinished, "kl": {"mean": 0.0, "p99": 0.0, "max": 0.0}, "top1": 1.0}))
+         "base_experts": first_load, "nonfinite": unfinished, "kl": {"mean": 0.0, "p99": 0.0, "max": 0.0}, "top1": 1.0}))
     results = {"compare-streamed-9": JobResult(tmp_path / "between", tmp_path / "log", 0)}
     answer = REGISTRY["kl"].answer(between, results)
-    assert answer.ok and answer.lines[0].endswith("against 7")
+    assert answer.ok and answer.lines[0].endswith("against 7, which streamed, fewest misses at a streamed layer 2, 0 sited")
     assert answer.lines[1] == "streamed 9: equal logits (3 rows); fewest misses at a streamed layer 4, 0 sited"
     (tmp_path / "between" / "compare.json").write_text(json.dumps(
         {"rows": 3, "differing": 1, "largest": 0.5, "first": rows[1], "experts": {"least_layer_misses": 4, "misses": 9, "sited": 0},
-         "nonfinite": unfinished, "kl": {"mean": 0.01, "p99": 0.02, "max": 0.03}, "top1": 1.0}))
+         "base_experts": first_load, "nonfinite": unfinished, "kl": {"mean": 0.01, "p99": 0.02, "max": 0.03}, "top1": 1.0}))
     assert not REGISTRY["kl"].answer(between, results).ok
     # --repeat runs its passes on one load under one cap: neither comparison of loads takes it.
     for refused in (("--weight-cap", "9", "--between"), ("--without-site",)):
