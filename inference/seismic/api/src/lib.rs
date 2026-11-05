@@ -2484,7 +2484,7 @@ impl fmt::Display for KernelDomainViolation {
 impl std::error::Error for NativeGraphMetadataError {}
 
 pub use generated::forget_evaluated_entry_shapes;
-pub use seismic_runtime::native::graph::{HostHeap, NativeGraphStorageBytes};
+pub use seismic_runtime::native::graph::{GraphFamilyCensus, HostHeap, NativeGraphStorageBytes};
 
 #[derive(Clone)]
 pub struct NativeGraphLayout {
@@ -3745,6 +3745,11 @@ impl NativeGraphFamily {
     /// budget: each layout's graph for each run of it one launch makes.
     pub fn slot_graphs(&self) -> GraphCensus {
         self.inner.slot_graphs()
+    }
+    /// What its graphs are made of: its layouts, what a slot instantiates,
+    /// and what each launch's runs replay.
+    pub fn census(&self) -> GraphFamilyCensus {
+        self.inner.census()
     }
     /// What its plans' graphs cost serving so far: graphs recorded and
     /// replays that updated them, this family's alone of what its device

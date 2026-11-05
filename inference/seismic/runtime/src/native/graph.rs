@@ -2934,6 +2934,18 @@ pub struct NativeGraphFamily {
     /// What one slot holds of its device's graph budget
     /// ([`super::SlotGraphs`]): each layout's graph for each of its runs.
     slot_graphs: GraphCensus,
+    /// What each launch's runs replay, by launch, in the order given:
+    /// each run's layout's graph (`GraphFamilyCensus`).
+    launch_graphs: Vec<GraphCensus>,
+}
+
+/// What a family's graphs are made of, for a load's report: its layouts,
+/// what one slot instantiates, and what each launch's runs replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphFamilyCensus {
+    pub layouts: usize,
+    pub slot: GraphCensus,
+    pub launches: Vec<GraphCensus>,
 }
 
 /// A family's plans of one layout, which one graph serves
@@ -3019,10 +3031,17 @@ impl NativeGraphFamily {
                 census.plus(graph.times(graphs.runs as u64)?)
             })
             .expect("a family's graph census fits u64");
+        let graph_of = |plan: &Arc<NativeGraphPlan>| plan.run_graphs(&layouts[at[&plan.shape.layout]].form);
+        let launch_graphs = launches
+            .iter()
+            .map(|runs| runs.iter().try_fold(GraphCensus::default(), |census, plan| census.plus(graph_of(plan))))
+            .collect::<Option<Vec<_>>>()
+            .expect("a family's graph census fits u64");
         let forms = Arc::new(super::LayoutForms::new(
             layouts.iter().map(|graphs| (graphs.plans[0].shape.layout, graphs.form.clone())),
         ));
         Ok(Self {
+            launch_graphs,
             layouts,
             forms,
             slot_graphs,
@@ -3087,6 +3106,11 @@ impl NativeGraphFamily {
     /// budget: each layout's graph for each run of it one launch makes.
     pub fn slot_graphs(&self) -> GraphCensus {
         self.slot_graphs
+    }
+
+    /// What its graphs are made of ([`GraphFamilyCensus`]).
+    pub fn census(&self) -> GraphFamilyCensus {
+        GraphFamilyCensus { layouts: self.layouts.len(), slot: self.slot_graphs, launches: self.launch_graphs.clone() }
     }
 
     /// A slot's share of its device's graph budget ([`super::SlotGraphs`]),
