@@ -757,7 +757,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// flights (the bindings prove none is on the device), so every step is
     /// recorded and priced by the measures it ran under, and the bank's
     /// device-side pricing changes under no step in flight. Its one fallible
-    /// part runs first: a refusal changes nothing.
+    /// part, the tier copy's grid, is written before anything is priced: a
+    /// refusal is the caller's error and changes nothing.
     pub fn measure_experts(
         &mut self,
         measures: ExpertMeasures,

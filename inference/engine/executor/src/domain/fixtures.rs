@@ -684,6 +684,12 @@ pub struct FakeBank {
     /// Whether it holds every expert ([`ElasticBank::whole`]), a test's:
     /// whole unless set; a fake at a weight cap's ceiling is not.
     pub(crate) whole: bool,
+    /// Whether its device refuses a tier copy's grid, a test's: it takes
+    /// one unless set.
+    pub(crate) refuse_tier_copy: bool,
+    /// The tier copy costs it last took: its grid's blocks and its copies'
+    /// price.
+    pub(crate) tier_copy: std::sync::Mutex<Option<crate::assessment::TierCopyCosts>>,
 }
 
 enum FakeResize {
@@ -717,6 +723,8 @@ impl FakeBank {
             rises: std::sync::Mutex::new(()),
             shortfall: 0,
             whole: true,
+            refuse_tier_copy: false,
+            tier_copy: std::sync::Mutex::new(None),
         }
     }
 
@@ -832,7 +840,13 @@ impl ElasticBank for FakeBank {
         Ok(())
     }
 
-    fn tier_copy(&self, _costs: &crate::assessment::TierCopyCosts) -> Result<(), DomainError> {
+    /// As the bank's: the copy is priced only once the device holds its
+    /// grid.
+    fn tier_copy(&self, costs: &crate::assessment::TierCopyCosts) -> Result<(), DomainError> {
+        if self.refuse_tier_copy {
+            return Err(DomainError::invariant("the tier copy's grid could not be written"));
+        }
+        *self.tier_copy.lock().unwrap() = Some(costs.clone());
         Ok(())
     }
 

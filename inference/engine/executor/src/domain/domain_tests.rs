@@ -791,6 +791,36 @@ fn price_growth(domain: &mut ExecutorDomain<TestFamily>, bindings: &mut StateBin
     }, bindings).unwrap();
 }
 
+/// A tier copy whose grid the device refuses is the caller's error and
+/// changes nothing: the bank keeps the copy costs it took before, grid and
+/// price, and the domain the measures it priced by.
+#[test]
+fn a_refused_tier_copy_changes_neither_its_grid_nor_its_price() {
+    let backend = bank_backends()[0];
+    let (mut domain, mut bindings) = banked(backend, 4, 4);
+    let measures = |blocks| crate::ExpertMeasures {
+        lines: crate::assessment::Priced::Measured(std::sync::Arc::from([])),
+        store: None,
+        resident: crate::assessment::Priced::Measured(Box::new(|_, _| Ok(0.015))),
+        pass: crate::assessment::Priced::Pending("unpriced".into()),
+        moves: crate::assessment::Priced::Pending("unmeasured".into()),
+        tier_copy: crate::assessment::Priced::Measured(Some(crate::assessment::TierCopyCosts {
+            blocks,
+            whole_seconds: 0.001,
+            stall_share: 0.1,
+        })),
+        convert: crate::assessment::Priced::Measured(None),
+    };
+    domain.measure_experts(measures(8), &mut bindings).unwrap();
+    domain.family.bank.as_mut().unwrap().refuse_tier_copy = true;
+    let refused = domain.measure_experts(measures(16), &mut bindings).unwrap_err();
+    assert!(matches!(refused, DomainError::Invariant(_)), "{refused}");
+    let bank = domain.family.bank.as_ref().unwrap();
+    assert_eq!(bank.tier_copy.lock().unwrap().as_ref().map(|costs| costs.blocks), Some(8));
+    let kept = domain.experts.as_ref().unwrap().tier_copy.measured().cloned().flatten().map(|costs| costs.blocks);
+    assert_eq!(kept, Some(8));
+}
+
 /// The storage kinds whose bank growth step pays (`expert_bank_growths`),
 /// in turn.
 fn paying(domain: &ExecutorDomain<TestFamily>) -> Vec<crate::planning::BankTier> {

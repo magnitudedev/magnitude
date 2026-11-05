@@ -537,8 +537,11 @@ impl ElasticBank for ServedBank {
     }
 
     fn tier_copy(&self, costs: &crate::assessment::TierCopyCosts) -> Result<(), DomainError> {
+        // The grid first: a copy is priced only by the blocks the device
+        // launches it with.
+        self.bank.tier_copy_blocks(costs.blocks).map_err(DomainError::invariant)?;
         self.bank.watcher.shared().price_copy(costs);
-        self.bank.tier_copy_blocks(costs.blocks).map_err(DomainError::invariant)
+        Ok(())
     }
 
     fn device_convert(&self, lines: &[crate::assessment::RecordLine]) {

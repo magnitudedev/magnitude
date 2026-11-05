@@ -1769,13 +1769,10 @@ trait MemoryStep: MemoryHost + Sized {
         // every decision past it is made on them; the expert bank's resize
         // advances, and a finished one frees what waited on it.
         if let Some(bindings) = bindings.as_deref_mut() {
-            // A refusal (the tier copy's grid could not be written) changes nothing: the
-            // experts stay priced by the measures before, and these, which the device would
-            // not take, are not tried again; the next stored costs reprice.
+            // A refusal (the device would not take the tier copy's grid) is a device
+            // fault the load ends on, the experts still priced as before.
             if let Some(measures) = self.memory().measures.take() {
-                if let Err(error) = self.domain().measure_experts(measures, bindings) {
-                    tracing::warn!(%error, "the newly stored costs were refused; the experts stay priced as before");
-                }
+                self.domain().measure_experts(measures, bindings).map_err(classify_domain_error)?;
             }
             self.advance_expert_bank()?;
             self.advance_slot_release()?;
