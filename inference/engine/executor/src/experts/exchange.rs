@@ -112,8 +112,11 @@ impl ExchangeTable {
     /// Answer lane `lane` for `step` (`failed`: with the failure flag),
     /// after its payload: the answer only moves forward, so an answer for a
     /// step no later than the one it holds, its failure included, leaves
-    /// it. Whether it published.
+    /// it. Whether it published. While a test starves the host
+    /// (`Pulse::starve`), the answering thread stalls until it ends.
     pub(crate) fn answer(&self, step: u64, lane: u64, failed: bool) -> bool {
+        #[cfg(test)]
+        self._pulsed.starved();
         let value = if failed { step | FAILED } else { step };
         self.words.update_u64(self.at(step, lane, constants::SLOT_ANSWER), |held| (held & !FAILED < step).then_some(value))
     }

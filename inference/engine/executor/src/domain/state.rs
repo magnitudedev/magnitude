@@ -1458,13 +1458,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.family.expert_bank().map_or(Ok(()), |bank| bank.wait_tier_filled())
     }
 
-    /// Starve the expert bank's host for `duration` (`ExpertBank::starve`):
-    /// a test's way to end a running step's waits before their answers.
+    /// Starve the expert bank's host for `duration` from now
+    /// (`ExpertBank::starve`): a test's way to end the waits of the steps
+    /// it submits meanwhile before their answers.
     #[cfg(test)]
     pub(crate) fn starve_expert_host(&self, duration: std::time::Duration) {
-        if let Some(bank) = self.family.expert_bank() {
-            bank.starve(duration);
-        }
+        let starved = self.family.expert_bank().is_some_and(|bank| bank.starve(duration));
+        assert!(starved, "a streamed load's host is starved");
     }
 
     /// The release ladder's bank rung: one shrink step

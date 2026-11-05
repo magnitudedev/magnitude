@@ -485,8 +485,9 @@ impl ElasticBank for ServedBank {
     }
 
     #[cfg(test)]
-    fn starve(&self, duration: std::time::Duration) {
+    fn starve(&self, duration: std::time::Duration) -> bool {
         self.bank.starve(duration);
+        true
     }
 
     /// Its tables resize on the domain's thread: only the bank's records

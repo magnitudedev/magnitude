@@ -280,14 +280,6 @@ impl Steps {
         self.state.lock().expect("watcher steps")
     }
 
-    /// Hold the steps' lock while the returned guard lives, under which a
-    /// landing answers its request (`while_owned`): no such answer is
-    /// written meanwhile (a starved host, in a test).
-    #[cfg(test)]
-    pub(in crate::experts) fn hold(&self) -> std::sync::MutexGuard<'_, impl Sized> {
-        self.lock()
-    }
-
     /// The load's events, which every host job of streaming waits on.
     pub(in crate::experts) fn events(&self) -> &Arc<Events> {
         &self.events

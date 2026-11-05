@@ -1419,53 +1419,49 @@ fn load(
     (domain, bindings, pass_rows)
 }
 
-/// A streamed load's decode step whose host starves past every wait's
-/// patience while it runs (no beat of its pulse, no landing's answer: its
-/// waits end before their answers) is interrupted, poisoning nothing:
-/// aborting it returns the sequence's accepted state, and the step run
-/// again from there scores bit for bit as the same step of a sequence of
-/// the same history that was never starved. A stall no wait outlasts
-/// interrupts nothing. Where the round driver re-runs an interrupted round
-/// (`StartedRound::abandon`), this is the physical half it relies on.
+/// A streamed load's step whose host starves past every wait's patience
+/// while it runs (no beat of its pulse, no answer written: its waits end
+/// before their answers) is interrupted, poisoning nothing: aborting it
+/// returns the sequence's accepted state, and the step run again from there
+/// scores bit for bit as the same step of a sequence of the same history
+/// that was never starved. A stall no wait outlasts interrupts nothing.
+/// Where the round driver re-runs an interrupted round
+/// (`StartedRound::abandon`), this is the physical half it relies on. The
+/// starved step is a prompt of a grouped class on a partial bank, whose
+/// first round every streamed layer waits on whatever the bank holds; a
+/// decode step waits only on an absent expert, which no load guarantees.
 #[test]
 fn a_starved_step_is_interrupted_and_its_rerun_scores_as_unstarved() {
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
-    // 128 experts: half its bank stays above the records two sequences'
-    // steps need at once.
     let (directory, definition, package) =
         fixture_with("starved-step", qwen4exp_fixture_definition_of(3, 128), streamed_experts_manifest);
+    let prompt = (0..CHUNK_ROWS as u32).map(|row| (row * 37 + 11) % 256).collect::<Vec<_>>();
     let backends = [seismic::BackendName::Cuda, seismic::BackendName::Metal];
     for backend in backends.into_iter().filter(|&backend| available(&catalog, backend)) {
-        let limits = ResourceLimits { conversations: std::num::NonZeroUsize::new(2).unwrap(), ..limits(2, false, 1, 1) };
+        let limits = ResourceLimits { conversations: std::num::NonZeroUsize::new(2).unwrap(), ..limits(CHUNK_ROWS, false, 1, CHUNK_ROWS) };
         let (mut domain, mut bindings, _) = load(&catalog, &definition, &package, backend, limits, Banked::Half);
         let (unstarved, starved) = (RequestId(1), RequestId(2));
         for request in [unstarved, starved] {
             domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
             domain.open_state(&mut bindings, request, None).unwrap();
-            let (_, returned) =
-                run(&mut domain, bindings, scored(forward(request, WorkKind::Prefill, &[5, 1], 0, true)), false, backend);
-            bindings = returned;
         }
-        for (position, token) in [(2, 74u32), (3, 111)] {
-            let operation = |request| scored(forward(request, WorkKind::Decode, &[token], position, true));
-            let (reference, returned) = run(&mut domain, bindings, operation(unstarved), false, backend);
-            // Past the slowest wait's patience (under a second).
-            let (pending, returned) =
-                starved_step(&mut domain, returned, operation(starved), std::time::Duration::from_millis(1200), backend);
-            assert!(
-                matches!(pending.outcome(), Outcome::Interrupted { resident: true, .. }),
-                "{backend:?} position {position}: a starved step is interrupted: {:?}",
-                pending.outcome()
-            );
-            domain.abort(pending).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
-            let (rerun, returned) = run(&mut domain, returned, operation(starved), false, backend);
-            assert_eq!(step_bits(&rerun), step_bits(&reference), "{backend:?} position {position}: the re-run scores as unstarved");
-            bindings = returned;
-        }
+        let operation = |request| scored(forward(request, WorkKind::Prefill, &prompt, 0, true));
+        let (reference, returned) = run(&mut domain, bindings, operation(unstarved), false, backend);
+        // Past the slowest wait's patience (under a second).
+        let (pending, returned) =
+            starved_step(&mut domain, returned, operation(starved), std::time::Duration::from_millis(1200), backend);
+        assert!(
+            matches!(pending.outcome(), Outcome::Interrupted { resident: true, .. }),
+            "{backend:?}: a starved step is interrupted: {:?}",
+            pending.outcome()
+        );
+        domain.abort(pending).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+        let (rerun, returned) = run(&mut domain, returned, operation(starved), false, backend);
+        assert_eq!(step_bits(&rerun), step_bits(&reference), "{backend:?}: the re-run scores as unstarved");
         // A stall of a tenth of the least patience.
-        let operation = scored(forward(starved, WorkKind::Decode, &[148], 4, true));
-        let (pending, returned) = starved_step(&mut domain, bindings, operation, std::time::Duration::from_millis(10), backend);
+        let operation = scored(forward(starved, WorkKind::Decode, &[148], prompt.len(), true));
+        let (pending, returned) = starved_step(&mut domain, returned, operation, std::time::Duration::from_millis(10), backend);
         assert!(matches!(pending.outcome(), Outcome::Forward { .. }), "{backend:?}: a short stall interrupts: {:?}", pending.outcome());
         domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
         drop(returned);
@@ -1473,9 +1469,10 @@ fn a_starved_step_is_interrupted_and_its_rerun_scores_as_unstarved() {
     std::fs::remove_dir_all(&directory).ok();
 }
 
-/// `operation` submitted alone, its host starved for `starve` while it runs
-/// (`ExecutorDomain::starve_expert_host`), then finished: its pending
-/// outcome, unreconciled.
+/// `operation` submitted alone, its host starved for `starve` from before
+/// its submission (`ExecutorDomain::starve_expert_host`), so whatever
+/// answers its waits is held however soon the host has it, then finished:
+/// its pending outcome, unreconciled.
 fn starved_step(
     domain: &mut ExecutorDomain,
     mut bindings: crate::StateBindings,
@@ -1484,6 +1481,7 @@ fn starved_step(
     backend: seismic::BackendName,
 ) -> (crate::PendingOperationOutcome, crate::StateBindings) {
     let operations = [operation];
+    domain.starve_expert_host(starve);
     let reserved = domain
         .reserve(&mut bindings, &operations)
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"))
@@ -1494,17 +1492,17 @@ fn starved_step(
     let flight = domain
         .submit_target(bindings, &operations, reservation)
         .unwrap_or_else(|failure| panic!("{backend:?}: {}", failure.error()));
-    domain.starve_expert_host(starve);
     let (mut pending, bindings) = domain.finish_target(flight).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     (pending.pop().expect("one operation"), bindings)
 }
 
-/// A chunk of a prompt chain whose host starves past every wait's patience
-/// while it runs is interrupted, its chain released with its holder's
-/// state (`Outcome::Interrupted` not resident): the chain's earlier chunk,
-/// which its round already reconciled, is gone with it, so the sequence
-/// re-prefills, as an evicted one. Re-opened and prefilled again, it
-/// decodes bit for bit as a sequence whose prompt was never starved.
+/// A prompt chain whose host starves past every wait's patience while its
+/// chunks run is interrupted at the chunk that launched it, the chain
+/// released with its holder's state (`Outcome::Interrupted` not resident),
+/// so the sequence re-prefills, as an evicted one. The chain's later chunks
+/// run in its launch (layer-major), so the first chunk's flight is the one
+/// their waits fall in. Re-opened and prefilled again, it decodes bit for
+/// bit as a sequence whose prompt was never starved.
 #[test]
 fn a_starved_chunk_of_a_chain_releases_it_and_the_rerun_scores_as_unstarved() {
     let _placement = crate::test_support::process_placement();
@@ -1534,13 +1532,11 @@ fn a_starved_chunk_of_a_chain_releases_it_and_the_rerun_scores_as_unstarved() {
         let (mut domain, mut bindings, _) = open();
         domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
         domain.open_state(&mut bindings, request, None).unwrap();
-        // The chain opens with its first chunk; the second claims the
-        // queued launch and is starved.
+        // The chain opens with its first chunk, which launches the rest,
+        // and is starved.
         domain.plan_successors((1..chunks).map(|next| prompt_chunk(request, next, chunks, rows)).collect());
-        let (_, returned) = run(&mut domain, bindings, prompt_chunk(request, 0, chunks, rows), false, backend);
-        assert_eq!(domain.chain_holder(), Some(request), "{backend:?}: the chain opened");
         let (pending, returned) =
-            starved_step(&mut domain, returned, prompt_chunk(request, 1, chunks, rows), std::time::Duration::from_millis(1200), backend);
+            starved_step(&mut domain, bindings, prompt_chunk(request, 0, chunks, rows), std::time::Duration::from_millis(1200), backend);
         assert!(
             matches!(pending.outcome(), Outcome::Interrupted { resident: false, .. }),
             "{backend:?}: a starved chunk of a chain is interrupted, its state released: {:?}",

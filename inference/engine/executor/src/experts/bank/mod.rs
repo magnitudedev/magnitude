@@ -138,9 +138,9 @@ impl Drop for ExpertBank {
 }
 
 impl ExpertBank {
-    /// Starve the load's host for `duration`: neither its pulse beats nor a
-    /// landing answers a request meanwhile, so a wait it spins through then
-    /// ends before its answer (a test's).
+    /// Starve the load's host for `duration` from now: its pulse does not
+    /// beat and no answer is written meanwhile, so a wait that spins then
+    /// ends before its answer (a test's; `Pulse::starve`).
     #[cfg(test)]
     pub(crate) fn starve(&self, duration: std::time::Duration) {
         self.watcher.starve(duration);

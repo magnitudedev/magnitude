@@ -57,12 +57,14 @@ pub trait ElasticBank {
     /// Whether the bank holds every expert.
     fn whole(&self) -> bool;
 
-    /// Starve the bank's host for `duration`: neither its pulse beats nor a
-    /// landing answers a request meanwhile, so a running step's waits end
-    /// before their answers (a test's; a bank with no waits has nothing to
-    /// starve).
+    /// Starve the bank's host for `duration` from now: its pulse does not
+    /// beat and no answer is written meanwhile, so a step's waits that spin
+    /// then end before their answers (a test's). Whether it has a host to
+    /// starve: a bank with no waits has none.
     #[cfg(test)]
-    fn starve(&self, _duration: std::time::Duration) {}
+    fn starve(&self, _duration: std::time::Duration) -> bool {
+        false
+    }
 
     /// Hold every rise of the bank's charge off the domain's thread until
     /// the guard drops: the domain holds it across one observation of

@@ -101,6 +101,19 @@ impl Drop for Pulsed {
     }
 }
 
+#[cfg(test)]
+impl Pulsed {
+    /// Stall the calling host thread while its host is starved
+    /// ([`Pulse::starve`]), as a starved host's threads stall: an answer
+    /// to the place's table waits out the starvation before it is written.
+    pub(super) fn starved(&self) {
+        let until = self.inner.beating.lock().expect("a pulse never panics").starved_until;
+        if let Some(wait) = until.and_then(|until| until.checked_duration_since(Instant::now())) {
+            std::thread::sleep(wait);
+        }
+    }
+}
+
 /// What beats a pulse.
 enum Beater {
     /// Nothing: no table lives, so no wait reads the pulse and none can end
@@ -131,6 +144,9 @@ struct Beating {
     generation: u64,
     beat: i32,
     beaten: Instant,
+    /// Until when a test starves the host ([`Pulse::starve`]).
+    #[cfg(test)]
+    starved_until: Option<Instant>,
 }
 
 impl Beating {
@@ -190,7 +206,17 @@ impl Pulse {
     }
 
     fn beaten_by(beater: Beater) -> Self {
-        let beating = Beating { tables: Vec::new(), next_id: 0, beater, thread: None, generation: 0, beat: 1, beaten: Instant::now() };
+        let beating = Beating {
+            tables: Vec::new(),
+            next_id: 0,
+            beater,
+            thread: None,
+            generation: 0,
+            beat: 1,
+            beaten: Instant::now(),
+            #[cfg(test)]
+            starved_until: None,
+        };
         Self { inner: Arc::new(Inner { beating: Mutex::new(beating), changed: Condvar::new(), late: AtomicU64::new(0) }) }
     }
 
@@ -235,11 +261,14 @@ impl Pulse {
         Ok(Pulsed { inner: self.inner.clone(), id })
     }
 
-    /// Hold the pulse's thread while the returned guard lives (a starved
-    /// host, in a test).
+    /// Starve the host for `duration` from now: its pulse does not beat,
+    /// and a host thread about to answer any of its tables stalls until the
+    /// starvation ends, so every wait that spins meanwhile ends on its still
+    /// pulse. Begun before a step is submitted, it holds whatever answers
+    /// the step's waits, however soon the host has them (a test's).
     #[cfg(test)]
-    pub(crate) fn hold(&self) -> std::sync::MutexGuard<'_, impl Sized> {
-        self.inner.beating.lock().expect("a pulse never panics")
+    pub(crate) fn starve(&self, duration: Duration) {
+        self.inner.beating.lock().expect("a pulse never panics").starved_until = Some(Instant::now() + duration);
     }
 
     /// Beat a driven pulse's live tables `gap` after its last beat, as its
@@ -267,6 +296,11 @@ fn beat(inner: &Inner, generation: u64) {
             .0;
         if beating.generation != generation {
             return;
+        }
+        // A starved host's pulse stands still; its next beat comes late.
+        #[cfg(test)]
+        if beating.starved_until.is_some_and(|until| Instant::now() < until) {
+            continue;
         }
         let now = Instant::now();
         let gap = now.duration_since(beating.beaten);

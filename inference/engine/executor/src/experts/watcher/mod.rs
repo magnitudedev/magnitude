@@ -751,13 +751,11 @@ impl Watcher {
         Ok(watcher)
     }
 
-    /// Starve the load's host for `duration`: neither its pulse beats nor a
-    /// landing answers a request meanwhile (`ExpertBank::starve`).
+    /// Starve the load's host for `duration` from now
+    /// (`ExpertBank::starve`).
     #[cfg(test)]
     pub(in crate::experts) fn starve(&self, duration: std::time::Duration) {
-        let _pulse = self.shared.steps.pulse().hold();
-        let _answers = self.shared.steps.hold();
-        std::thread::sleep(duration);
+        self.shared.steps.pulse().starve(duration);
     }
 
     pub fn shared(&self) -> &Arc<Shared> {
