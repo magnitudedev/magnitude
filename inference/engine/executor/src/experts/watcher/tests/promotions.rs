@@ -165,10 +165,15 @@ fn decode_keeps_the_rankings_top_share(harness: &Harness) {
 /// that read an expert from the tier completes, and the expert is copied
 /// into a free bank record and mapped from the first step not yet begun;
 /// the next step's route finds it in the bank. Once the bank is full, an
-/// expert read more recently evicts the least recently read one: its entry
-/// is unmapped from the first step not yet begun, while a step begun before
+/// expert read more recently evicts the least recently read one, read by
+/// a step that ends while a later one runs: the evicted entry is unmapped from the first step not yet begun, while a step begun before
 /// still reads it and its record keeps its bytes until that step has
 /// completed; then the copy takes the record and its expert is mapped.
+/// Then a reserve pays, as the reserve's model prices it: 5 and 7 were
+/// each read again from the top of the stack, and the second record never
+/// hit, so holding it free costs no hit and saves the drain a promotion
+/// would wait; once the decode steps reading 7 have sized it, the bank
+/// releases 6 into the reserve and holds 7 alone.
 #[test]
 fn a_promotion_reuses_its_record_only_once_every_step_that_could_read_it_completed() {
     let harness = promoting("promote", 2, TIER);
@@ -188,10 +193,10 @@ fn a_promotion_reuses_its_record_only_once_every_step_that_could_read_it_complet
     next.complete().unwrap();
     harness.request(&[6]).complete().unwrap();
     eventually("6 was never promoted", || map.held(6).is_some());
-    // 7, read twice after both, is worth more over a stay than 5, read
-    // least recently, and evicts it, while a step begun before the
-    // eviction still runs and reads 5's record.
-    harness.request(&[7]).complete().unwrap();
+    // 7, read after both, is worth more over a stay than 5, read least
+    // recently (the copy is priced at nothing), and evicts it, while a step
+    // begun before the eviction still runs and reads 5's record: begun
+    // before 7's read ends, so before the ranking learns it.
     let seven = harness.step();
     let running = harness.step();
     harness.request_at(&seven, 0, &[7]);
@@ -207,9 +212,17 @@ fn a_promotion_reuses_its_record_only_once_every_step_that_could_read_it_complet
     eventually("7 was never promoted", || map.held(7) == Some(five));
     assert_eq!([0, 1, 2].map(|kind| harness.banked(kind, five)), [7, 107, 207]);
     assert_eq!((map.resolve(5, after), map.resolve(7, after)), (None, Some(five)));
-    // No step read an expert twice, so no reserve pays (the top record of
-    // its stack is never read again): the bank holds both its records.
-    eventually("the bank never held what its map holds", || shared.holdings().0[0] == 2);
+    // Each decode step reading 7 sizes the reserve again; past the change's
+    // hysteresis it holds the one record the model prices as paying,
+    // whichever turns the steps' ends fell in.
+    for _ in 0..4 {
+        let next = harness.step();
+        harness.route_at(&next, 0, &[7]);
+        next.complete().unwrap();
+    }
+    let reserved = || residency::lock(&harness.watcher.state).core.directory.reserved(0);
+    eventually("the reserve never took the record its model prices as paying", || reserved() == 1 && shared.holdings().0[0] == 1);
+    assert_eq!((map.held(6), map.held(7)), (None, Some(five)), "6 released into the reserve, 7 kept");
 }
 
 /// The promotions the ranking asks together copy together: every one
