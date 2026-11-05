@@ -565,7 +565,7 @@ impl Engine {
         if self.domain.chain_holder().is_some() {
             return Ok(());
         }
-        self.domain.plan_prompt(None, true, |chunks| {
+        self.domain.plan_prompt(None, true, true, |chunks| {
             let grouped = InputLayout::new(rest.len(), Vec::new())?
                 .group_chunks(PREFILL_ROWS.min(rest.len()), PREFILL_ROWS, None, chunks)?;
             Ok(grouped

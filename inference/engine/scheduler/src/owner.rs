@@ -2876,7 +2876,9 @@ impl<F: ProgramFamily> Service<F> {
                     .requests
                     .values()
                     .any(|other| competes(other, self.status(other)));
-            let planned = self.domain.plan_prompt(decode_owed, alone, |chunks| {
+            // A chain opens only behind the round's last group: a later one would orphan it.
+            let last = round.groups.is_empty();
+            let planned = self.domain.plan_prompt(decode_owed, alone, last, |chunks| {
                 planned_prefill(&round, group_.operations(), chunk_rows, chunks)
             });
             if let Err(error) = planned {

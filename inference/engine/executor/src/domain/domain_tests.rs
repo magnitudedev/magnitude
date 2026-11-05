@@ -442,7 +442,7 @@ fn a_prompt_chunk_plans_the_rest_of_its_group() {
         let (mut domain, _) = fixture;
         let mut counted = None;
         domain
-            .plan_prompt(None, true, |chunks| {
+            .plan_prompt(None, true, true, |chunks| {
                 counted = Some(chunks);
                 Ok::<_, ()>(Vec::new())
             })
@@ -452,20 +452,36 @@ fn a_prompt_chunk_plans_the_rest_of_its_group() {
 }
 
 /// A pipelined successor, which other work orphans, is planned only for a
-/// request the device serves alone; a chain, never orphaned, regardless.
+/// request the device serves alone; a chain behind its round's last group,
+/// whose holder the scheduler selects first, regardless.
 #[test]
 fn only_a_chain_is_planned_beside_other_work() {
     for (fixture, planned) in [(chain_fixture(), 2), (fixture_with(None, true, false), 0)] {
         let (mut domain, _) = fixture;
         let mut counted = None;
         domain
-            .plan_prompt(None, false, |chunks| {
+            .plan_prompt(None, false, true, |chunks| {
                 counted = Some(chunks);
                 Ok::<_, ()>(Vec::new())
             })
             .unwrap();
         assert_eq!(counted, Some(planned));
     }
+}
+
+/// A group with another of its round submitted after it opens no chain, which
+/// that group would orphan: it plans no chunk behind it.
+#[test]
+fn no_chain_opens_behind_a_group_its_round_follows() {
+    let (mut domain, _) = chain_fixture();
+    let mut counted = None;
+    domain
+        .plan_prompt(None, false, false, |chunks| {
+            counted = Some(chunks);
+            Ok::<_, ()>(Vec::new())
+        })
+        .unwrap();
+    assert_eq!(counted, Some(0));
 }
 
 /// While decode waits, a load that chains plans the rest of a group of the
@@ -478,7 +494,7 @@ fn a_waiting_group_of_one_plans_no_chunk_behind() {
         domain.family.waiting = waiting;
         let mut counted = None;
         domain
-            .plan_prompt(Some(0.5), true, |chunks| {
+            .plan_prompt(Some(0.5), true, true, |chunks| {
                 counted = Some(chunks);
                 Ok::<_, ()>(Vec::new())
             })

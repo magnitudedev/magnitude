@@ -353,18 +353,22 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// without chains the one chunk a pipelined successor runs. That
     /// successor is claimed only when the next group submitted is that chunk,
     /// and any other group waits for it and discards it, so it is planned
-    /// only when the device serves the request `alone`; a chain is never
-    /// orphaned, so it needs no such guard.
+    /// only when the device serves the request `alone`. A chain's holder
+    /// alone continues it, and the scheduler selects it first; but a group
+    /// of its own round submitted after it would orphan it, so one opens
+    /// only behind the round's `last` group.
     pub fn plan_prompt<E>(
         &mut self,
         decode_owed: Option<f64>,
         alone: bool,
+        last: bool,
         chunks: impl FnOnce(usize) -> Result<Vec<Operation>, E>,
     ) -> Result<(), E> {
         // A load that chains runs the rest of the group behind the chunk
         // (`behind_within`); one that doesn't, a pipelined successor.
         let count = match self.chain_capacity() > std::num::NonZeroUsize::MIN {
-            true => self.group_size(decode_owed.is_some()).saturating_sub(1),
+            true if last => self.group_size(decode_owed.is_some()).saturating_sub(1),
+            true => 0,
             false => usize::from(alone),
         };
         let planned = chunks(count)?;
