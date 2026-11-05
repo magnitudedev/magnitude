@@ -528,9 +528,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
             .decode
         {
             RoutedDecodeEntries::Expand(expand) => {
-                if streamed.is_some() {
-                    return Err("a streamed layer's decode needs the shared-route form".into());
-                }
+                super::streamed::expand_form(load, scope)?;
                 let (expert_gate, expert_up) =
                     (gate_records.tensor().clone(), up_records.tensor().clone());
                 let (normalized, coefficient) = route.route(

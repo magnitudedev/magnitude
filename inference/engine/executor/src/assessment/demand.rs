@@ -19,7 +19,7 @@ use super::launches::{operand_recipe, Declarations, Kernel, Launches};
 use super::AssessmentError;
 use crate::operators::attention::graph::selected_segments;
 use crate::operators::gated_delta::graph::StepForm;
-use crate::operators::routed::fused_graph::DecodeForm;
+use crate::operators::routed::{fused_graph::DecodeForm, streamed};
 use crate::operators::streams::{MixSite, StreamsBinding};
 use crate::operators::{parallel::DenseBesideRouted, InputForm};
 use crate::{
@@ -635,17 +635,10 @@ fn ngram(
     )
 }
 
-/// The rows of the sources by which the decode entries of the routed layer
-/// of `scope` read each choice's weights (`decode_source`), as its graph
-/// states them (`DecodeReads`): of a layer `load`'s bank serves, the step's
-/// source rows; of a resident layer none, each expert read from its stacks
-/// by index.
+/// The decode entries' `XS` of the routed layer of `scope`, as its graph
+/// states it (`streamed::source_rows`).
 fn sources(load: &ModelLoadPlan, scope: WeightScope) -> [(&'static str, u64); 1] {
-    let rows = match load.expert_bank().and_then(|bank| bank.layer(scope)) {
-        Some(_) => kernels::constants::SOURCE_ROWS,
-        None => 0,
-    };
-    [("XS", rows)]
+    [("XS", streamed::source_rows(load, scope))]
 }
 
 /// `operators::routed::graph` at decode rows in `scope`: the shared
@@ -1140,6 +1133,7 @@ impl DecodeDemand {
                     let sources = sources(load, scope);
                     match DecodeForm::of(backend).map_err(demand_error)? {
                         DecodeForm::Expand => {
+                            streamed::expand_form(load, scope).map_err(demand_error)?;
                             step.call(Kernel::of::<kernels::routed_route::Entry>(), router)?;
                             step.call(
                                 Kernel::of::<kernels::routed_expand::Entry>(),

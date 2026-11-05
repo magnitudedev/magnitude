@@ -354,6 +354,34 @@ pub(crate) struct BankGraph<'p, 'a, G: GraphDraft + 'a> {
     pub parks: &'p mut Vec<(GraphTimeline, NativeTimelinePort)>,
 }
 
+/// The bank that serves the routed layer of `scope`, and the layer's place
+/// among its layers; none of a layer `load` keeps resident.
+pub(crate) fn served(load: &ModelLoadPlan, scope: WeightScope) -> Option<(&ExpertBankPlan, usize)> {
+    let bank = load.expert_bank()?;
+    Some((bank, bank.layer(scope)?.0))
+}
+
+/// `XS`: the rows of the sources by which the decode entries of the routed
+/// layer of `scope` read each choice ([`DecodeReads`]): of a layer `load`'s
+/// bank serves ([`served`]), the step's source rows; of a resident layer
+/// none, each expert read from its stacks by index.
+pub(crate) fn source_rows(load: &ModelLoadPlan, scope: WeightScope) -> u64 {
+    match served(load, scope) {
+        Some(_) => magnitude_kernels::constants::SOURCE_ROWS,
+        None => 0,
+    }
+}
+
+/// Whether the routed layer of `scope` may decode in the Expand form: a
+/// layer `load`'s bank serves ([`served`]) reads its experts through the bank
+/// in the route's own launch, which only the shared-route form does.
+pub(crate) fn expand_form(load: &ModelLoadPlan, scope: WeightScope) -> Result<(), &'static str> {
+    match served(load, scope) {
+        Some(_) => Err("a streamed layer's decode needs the shared-route form"),
+        None => Ok(()),
+    }
+}
+
 /// A routed layer the load streams: its place among the bank's layers, its
 /// bank's entries, and the bank ports and timeline nodes its graph declares.
 pub(crate) struct StreamedLayer<'p, 'a, G: GraphDraft + 'a> {
@@ -381,10 +409,7 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
         scope: WeightScope,
         bank: Option<BankGraph<'p, 'a, G>>,
     ) -> Result<Option<Self>, GraphError> {
-        let planned = load
-            .expert_bank()
-            .and_then(|plan| Some((plan, plan.layer(scope)?.0)));
-        match (planned, bank) {
+        match (served(load, scope), bank) {
             (Some((plan, index)), Some(BankGraph { mut entries, ports, parks })) => {
                 // The plan alone says which layers have a CPU site
                 // (`ExpertBankPlan::sited`): a layer encodes the load's site
@@ -476,7 +501,7 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
         };
         Ok(DecodeReads {
             sources: locals.snapshot(),
-            rows: magnitude_kernels::constants::SOURCE_ROWS,
+            rows: source_rows(self.load, self.scope),
             tier,
             records: count,
             policy: Some(ports.policy.tensor().clone()),
@@ -1182,8 +1207,8 @@ pub(crate) struct DecodeReads {
 }
 
 impl DecodeReads {
-    /// A resident layer's of `rows` rows of `selected` choices over its
-    /// stacks `stacks`.
+    /// The resident routed layer of `scope`'s of `rows` rows of `selected`
+    /// choices over its stacks `stacks`.
     pub(crate) fn resident<G: GraphDraft>(
         graph: &mut G,
         rows: u64,
