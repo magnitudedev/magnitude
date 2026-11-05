@@ -1215,12 +1215,13 @@ fn share(worker: usize, workers: usize, units: usize) -> std::ops::Range<usize> 
     worker * units / workers..(worker + 1) * units / workers
 }
 
-/// What the site failed of one step: every row its failed requests name,
-/// the layers they were at, and why each failed.
+/// What the site failed of one step: by each layer a request failed at,
+/// the rows it names (its request's own rows, which the step's window at
+/// that layer places in the batch, `Steps::batch_rows`), and why each
+/// failed.
 #[derive(Debug)]
 pub(crate) struct SiteFailure {
-    pub rows: BTreeSet<usize>,
-    pub layers: BTreeSet<usize>,
+    pub rows: BTreeMap<usize, BTreeSet<usize>>,
     pub reasons: Vec<String>,
 }
 
@@ -1376,6 +1377,16 @@ impl Site {
         }
     }
 
+    /// Record that the site failed step `step`'s request at streamed layer
+    /// `layer` for `why`, naming its request's `rows`: the one record of a
+    /// failure, which [`Self::take_failure`] takes.
+    pub(super) fn failed(&self, step: u64, layer: usize, rows: BTreeSet<usize>, why: &str) {
+        let mut failures = self.failures.lock().expect("site failures");
+        let failure = failures.entry(step).or_insert_with(|| SiteFailure { rows: BTreeMap::new(), reasons: Vec::new() });
+        failure.rows.entry(layer).or_default().extend(rows);
+        failure.reasons.push(format!("layer {layer}: {why}"));
+    }
+
     /// What the site failed of step `step`, taken: none where it failed none
     /// of its requests.
     pub(super) fn take_failure(&self, step: u64) -> Option<SiteFailure> {
@@ -1395,21 +1406,7 @@ impl Site {
     /// then publish it, which releases the device.
     fn fail(&self, index: usize, step: u64, rows: BTreeSet<usize>, why: String) {
         let layer = &self.layers[index];
-        {
-            let reason = format!("layer {}: {why}", layer.layer);
-            let mut failures = self.failures.lock().expect("site failures");
-            match failures.entry(step) {
-                std::collections::btree_map::Entry::Vacant(vacant) => {
-                    vacant.insert(SiteFailure { rows, layers: [layer.layer].into(), reasons: vec![reason] });
-                }
-                std::collections::btree_map::Entry::Occupied(mut occupied) => {
-                    let failure = occupied.get_mut();
-                    failure.rows.extend(rows);
-                    failure.layers.insert(layer.layer);
-                    failure.reasons.push(reason);
-                }
-            }
-        }
+        self.failed(step, layer.layer, rows, &why);
         self.answer(layer, step, true);
     }
 

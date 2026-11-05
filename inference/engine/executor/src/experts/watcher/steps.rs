@@ -506,15 +506,22 @@ impl Steps {
         self.lock().windows.insert(sequence, (layer, first));
     }
 
-    /// Step `sequence`'s request at `layer` failed for `reason` at its rows
-    /// `rows`: the step's batch rows they are, past the window the layer is
-    /// served over ([`Self::window`]), fail.
-    pub(super) fn fail_request_rows(&self, sequence: Step, layer: usize, rows: &BTreeSet<usize>, reason: String) {
+    /// The batch rows of step `sequence` that rows `rows` of its request at
+    /// `layer` are: past the window the layer is served over
+    /// ([`Self::window`]). Every failure a request's rows name reaches the
+    /// step through this one translation.
+    fn batch_rows(&self, sequence: Step, layer: usize, rows: &BTreeSet<usize>) -> BTreeSet<usize> {
         let first = match self.lock().windows.get(&sequence) {
             Some(&(from, first)) if layer >= from => first,
             _ => 0,
         };
-        self.fail_rows(sequence, FailedRows::Only(rows.iter().map(|row| first + row).collect()), reason);
+        rows.iter().map(|row| first + row).collect()
+    }
+
+    /// Step `sequence`'s request at `layer` failed for `reason` at its rows
+    /// `rows`: the step's batch rows they are ([`Self::batch_rows`]) fail.
+    pub(super) fn fail_request_rows(&self, sequence: Step, layer: usize, rows: &BTreeSet<usize>, reason: String) {
+        self.fail_rows(sequence, FailedRows::Only(self.batch_rows(sequence, layer, rows)), reason);
     }
 
     /// Step `sequence`'s `rows` fail for `reason` (beside any that failed
@@ -880,9 +887,14 @@ impl ExpertStep {
             (first.0.and(second.0), format!("{}; {}", first.1, second.1))
         };
         let site = shared.compute.take_site_failure(self.sequence).map(|failure| {
-            let layers = failure.layers.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
+            let layers = failure.rows.keys().map(usize::to_string).collect::<Vec<_>>().join(", ");
+            let rows = failure
+                .rows
+                .iter()
+                .flat_map(|(&layer, rows)| shared.steps.batch_rows(self.sequence, layer, rows))
+                .collect();
             (
-                FailedRows::Only(failure.rows),
+                FailedRows::Only(rows),
                 format!(
                     "the CPU site failed step {}'s tier-served choices at streamed layers {layers} ({})",
                     self.sequence,
@@ -1104,6 +1116,25 @@ mod slot_tests {
         shared.steps.fail_request_rows(sequence, 3, &rows(&[0, 1]), "in the window".into());
         let failed = shared.steps.lock().failed.get(&sequence).cloned();
         assert_eq!(failed, Some((FailedRows::Only(rows(&[0, 4, 5])), "before the window".to_owned())));
+    }
+
+    /// A CPU site failure names its request's rows, which its step's window
+    /// at that layer places in the batch as a file read's are: from the
+    /// windowed layer on, the window's from its first row; before it, the
+    /// rows themselves.
+    #[test]
+    fn a_site_failures_rows_are_its_steps_batch_rows() {
+        let shared = ExpertStep::unbanked(FlightDepth::SERIAL, 2);
+        let step = begin(&shared, &[0]).pop().unwrap();
+        let sequence = step.sequence();
+        shared.window(sequence, 2, 4);
+        let rows = |rows: &[usize]| rows.iter().copied().collect::<BTreeSet<_>>();
+        shared.compute.fail_site(sequence, 1, rows(&[0]));
+        shared.compute.fail_site(sequence, 3, rows(&[0, 1]));
+        match step.complete() {
+            Err(StepFailure::Site { rows: failed, .. }) => assert_eq!(failed, FailedRows::Only(rows(&[0, 4, 5]))),
+            outcome => panic!("a step its site failed completed {:?}", outcome.map(|_| ())),
+        }
     }
 
     /// A step still running keeps its routing record however many later

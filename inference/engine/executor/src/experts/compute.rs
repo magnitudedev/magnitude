@@ -497,6 +497,13 @@ impl Compute {
         self.inner.site.gated(gate);
     }
 
+    /// Record that the site failed step `step`'s request at streamed layer
+    /// `layer`, of its request's `rows` (`Site::failed`).
+    #[cfg(test)]
+    pub(crate) fn fail_site(&self, step: u64, layer: usize, rows: std::collections::BTreeSet<usize>) {
+        self.inner.site.failed(step, layer, rows, "a test's failure");
+    }
+
     /// What the site failed of step `step`, taken as the step
     /// completes; none where it failed none of its requests.
     pub(crate) fn take_site_failure(&self, step: u64) -> Option<super::site::SiteFailure> {
