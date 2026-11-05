@@ -1885,7 +1885,7 @@ fn store_pair[S, W](slots: &mut tensor[S, W] i32, slot: i32, at: i32, q: u64):
 fn hint[M, H, PT, NM, E, K, RING](residual: &tensor[M, PT * H] f32, norm: &tensor[NM] NW,
     router: &tensor[E, H] RW, eps: f32, step: &tensor[STEP_WORDS] i32,
     input: &mut tensor[M, H] A, logits: &mut tensor[M, E] f32,
-    ring: &mut tensor[RING] i32) where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and RING >= RING_EXPERTS + M * K:
+    ring: &mut tensor[RING] i32) where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K:
     let mut routes = tensor[M, K] i32
     let mut scores = tensor[M, K] f32
     # `rank_choices` writes every route, but a `&mut` argument is read as
@@ -1907,7 +1907,7 @@ fn hint[M, H, PT, NM, E, K, RING](residual: &tensor[M, PT * H] f32, norm: &tenso
 fn hint_selected[M, H, E, K, RING](residual: &tensor[M, H] f32, router_norm: &tensor[H] RNW,
     router: &tensor[E, H] RW, bias: &tensor[E] f32, score: i32, eps: f32,
     step: &tensor[STEP_WORDS] i32, input: &mut tensor[M, H] A, logits: &mut tensor[M, E] f32,
-    routes: &mut tensor[M, K] i32, ring: &mut tensor[RING] i32) where RING >= RING_EXPERTS + M * K:
+    routes: &mut tensor[M, K] i32, ring: &mut tensor[RING] i32) where RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K:
     let mut scores = tensor[M, E] f32
     rms_norm(residual, router_norm, input, eps)
     linear(input, router, logits)
@@ -1915,14 +1915,15 @@ fn hint_selected[M, H, E, K, RING](residual: &tensor[M, H] f32, router_norm: &te
     publish_hints(routes, step, ring)
 
 # Each predicted expert of `routes` not named before written to `ring`
-# after its header (the step's sequence and the count), in rank order:
-# every row's first choice, then every row's second, and so on, so the ring
-# is best first, the order its readers read ahead in. Its readers keep only
+# after its header (the step's sequence and the count), with the rank of the
+# choice it was predicted as (HINT_EXPERT, HINT_RANK), in rank order: every
+# row's first choice, then every row's second, and so on, so the ring is
+# best first, the order its readers read ahead in. Its readers keep only
 # the experts the layer lacks: the host's hint admission and the prefetch's
 # takes each skip one the layer holds, so the route reads no map of the
 # layer ahead (which, the group's own, its route writes).
 fn publish_hints[M, K, RING](routes: &tensor[M, K] i32,
-    step: &tensor[STEP_WORDS] i32, ring: &mut tensor[RING] i32) where RING >= RING_EXPERTS + M * K:
+    step: &tensor[STEP_WORDS] i32, ring: &mut tensor[RING] i32) where RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K:
     let mut count = 0
     for rank in 0..K:
         for row in 0..M:
@@ -1935,7 +1936,8 @@ fn publish_hints[M, K, RING](routes: &tensor[M, K] i32,
                             if routes[earlier_row, K - 1 - earlier_rank] == expert:
                                 seen = 1
                 if seen == 0:
-                    ring[RING_EXPERTS + count] = expert
+                    ring[RING_EXPERTS + HINT_ENTRY_WORDS * count + HINT_EXPERT] = expert
+                    ring[RING_EXPERTS + HINT_ENTRY_WORDS * count + HINT_RANK] = i32(rank)
                     count = count + 1
     ring[RING_COUNT] = count
     ring[RING_SEQUENCE] = step[STEP_LOW]
@@ -2104,7 +2106,8 @@ fn assign[M, K](routes: &tensor[M, K] i32, policy: &tensor[POLICY_WORDS] i32,
 # Gate-ahead prediction: the hints (`hint`) of the next two streamed
 # layers, each over its norm and router (`next_*` one layer ahead,
 # `after_*` two), from this layer's residual, into the rings' rows
-# `rings[0]` and `rings[1]` (`RING >= RING_EXPERTS + M K` each), which the
+# `rings[0]` and `rings[1]` (`RING >= RING_EXPERTS + HINT_ENTRY_WORDS M K`
+# each), which the
 # host's read-ahead reads while the step runs, at a lead of one layer and of
 # two, while the next layer may lack an expert the read-ahead could read (its
 # policy's POLICY_RESOLVED word, `next_policy`, clear: neither its group
@@ -2131,7 +2134,7 @@ fn routed_route_streamed[M, H, PT, NM, E, K, S, ES, FW, AHEAD, FLIGHT, RING, P, 
     next_policy: &tensor[POLICY_WORDS] i32,
     rings: &mut tensor[AHEAD, RING] i32, routing: &mut tensor[FLIGHT, RING_EXPERTS + 2 * P] i32)
     -> (tensor[M, H] A, tensor[M] f32, tensor[M, S] A)
-    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and operands(SGW) == operands(SUW) and M <= DECODE_ROWS and FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and AHEAD >= 0 and AHEAD <= 2 and FLIGHT > 0 and RING >= RING_EXPERTS + M * K and P >= M * K and EN > 0 and GM >= E and TM >= 0 and (TM == 0 or TM == E):
+    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and operands(SGW) == operands(SUW) and M <= DECODE_ROWS and FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and AHEAD >= 0 and AHEAD <= 2 and FLIGHT > 0 and RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K and P >= M * K and EN > 0 and GM >= E and TM >= 0 and (TM == 0 or TM == E):
     let mut normalized = tensor[M, H] A
     let mut coefficient = tensor[M] f32
     let mut shared_product = tensor[M, S] A
@@ -2175,7 +2178,7 @@ fn routed_select_streamed[M, H, E, K, ES, FW, AHEAD, FLIGHT, RING, P, EN, GM, TM
     next_policy: &tensor[POLICY_WORDS] i32,
     rings: &mut tensor[AHEAD, RING] i32, routing: &mut tensor[FLIGHT, RING_EXPERTS + 2 * P] i32)
     -> tensor[M, H] A
-    where ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and M <= DECODE_ROWS and FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and AHEAD >= 0 and AHEAD <= 2 and FLIGHT > 0 and RING >= RING_EXPERTS + M * K and P >= M * K and EN > 0 and GM >= E and TM >= 0 and (TM == 0 or TM == E):
+    where ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and M <= DECODE_ROWS and FW >= FILE_ENTRIES + FILE_ENTRY_WORDS * P and FW % 2 == 0 and AHEAD >= 0 and AHEAD <= 2 and FLIGHT > 0 and RING >= RING_EXPERTS + HINT_ENTRY_WORDS * M * K and P >= M * K and EN > 0 and GM >= E and TM >= 0 and (TM == 0 or TM == E):
     let normalized = routed_select(residual, norm, router_norm, router, bias, expert_scale, routes,
         weights, epsilon, score, normalization, normalization_epsilon, scale)
     resolve[P = P, E = E](routes, map, tier, policy, sited, step, file, grids, routing, sources)

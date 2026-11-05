@@ -661,7 +661,7 @@ fn general_hints_name_what_routed_select_selects() {
     let (h, e, k, m) = (routing.hidden, routing.experts, routing.selected, 2);
     let case = SelectCase::new(&routing, m);
     let (routes, _, _) = portable_select(&module, &routing, &case, DType::BF16, DType::F32);
-    let ring = constants::RING_EXPERTS as usize + m * k;
+    let ring = (constants::RING_EXPERTS + constants::HINT_ENTRY_WORDS * (m * k) as u64) as usize;
     let sequence = 7;
     let outcome = interpret(
         &module,
@@ -681,12 +681,14 @@ fn general_hints_name_what_routed_select_selects() {
             ints(&[ring], &vec![0; ring]),
         ],
     );
-    let mut wanted = Vec::new();
+    // Each expert once, in rank order across the rows, with the rank of the
+    // choice it was first named as.
+    let mut wanted = Vec::<(i32, i32)>::new();
     for rank in 0..k {
         for row in 0..m {
             let expert = routes[row * k + k - 1 - rank];
-            if !wanted.contains(&expert) {
-                wanted.push(expert);
+            if !wanted.iter().any(|&(named, _)| named == expert) {
+                wanted.push((expert, rank as i32));
             }
         }
     }
@@ -695,7 +697,11 @@ fn general_hints_name_what_routed_select_selects() {
         [constants::RING_SEQUENCE, constants::RING_COUNT, constants::RING_EXPERTS].map(|word| word as usize);
     assert_eq!(published[at_sequence], sequence, "the ring's sequence");
     assert_eq!(published[at_count] as usize, wanted.len(), "the ring's count");
-    assert_eq!(published[at_experts..at_experts + wanted.len()], wanted, "hints in rank order across the rows");
+    let entries = (0..wanted.len())
+        .map(|index| at_experts + constants::HINT_ENTRY_WORDS as usize * index)
+        .map(|entry| (published[entry + constants::HINT_EXPERT as usize], published[entry + constants::HINT_RANK as usize]))
+        .collect::<Vec<_>>();
+    assert_eq!(entries, wanted, "hints in rank order across the rows, each with its rank");
     // The bias reorders: the unbiased scores' top K differ from the choices.
     let logits = input(&outcome, 8);
     let reordered = (0..m).any(|row| {

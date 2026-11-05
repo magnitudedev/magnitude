@@ -384,15 +384,27 @@ impl RegionWords {
         SlotTable::scratch(self.flight, self.rounds)
     }
 
-    /// `RING`: a hint ring's words, room for every choice.
+    /// `RING`: a hint ring's words, an entry (its expert and its rank,
+    /// HINT_ENTRY_WORDS) for every choice.
     pub fn ring_words(&self) -> u64 {
-        constants::RING_EXPERTS + self.choices
+        constants::RING_EXPERTS + constants::HINT_ENTRY_WORDS * self.choices
     }
 
-    /// A routing record's words, RING_EXPERTS + 2 P: a ring's and each
-    /// choice's source (`routed_route_streamed`'s `routing`).
+    /// A routing record's words, RING_EXPERTS + 2 P: each choice's expert
+    /// and each choice's source (`routed_route_streamed`'s `routing`).
     pub fn routing_words(&self) -> u64 {
-        self.ring_words() + self.choices
+        constants::RING_EXPERTS + 2 * self.choices
+    }
+
+    /// The word of a routing record holding choice `choice`'s expert.
+    pub fn routing_expert(&self, choice: u64) -> u64 {
+        constants::RING_EXPERTS + choice
+    }
+
+    /// The word of a routing record holding choice `choice`'s source as its
+    /// route resolved it, after every choice's expert.
+    pub fn routing_source(&self, choice: u64) -> u64 {
+        constants::RING_EXPERTS + self.choices + choice
     }
 }
 

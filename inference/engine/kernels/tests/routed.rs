@@ -6304,7 +6304,7 @@ fn a_streamed_route_assigns_its_misses_only_once_priced() {
                 after_router: &zeros(f32, &[e, h]),
                 after_bias: &zeros(f32, &[e]),
                 next_policy: &shared_i32(&device, &[constants::POLICY_WORDS], &resolved),
-                rings: &mut zeros(seismic::Element::i32(), &[0, constants::RING_EXPERTS + k]),
+                rings: &mut zeros(seismic::Element::i32(), &[0, constants::RING_EXPERTS + constants::HINT_ENTRY_WORDS * k]),
                 routing: &mut words(&[FLIGHT, constants::RING_EXPERTS + 2 * k]),
             })
             .unwrap();

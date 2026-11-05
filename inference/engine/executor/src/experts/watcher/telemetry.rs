@@ -94,7 +94,8 @@ pub struct LayerExperts {
 }
 
 /// One hint candidate of a decode step's ring as admitted: the expert, its
-/// rank (its place in the ring), and whether its hint was read.
+/// rank (the rank of the choice it was hinted as, HINT_RANK: 0 a row's
+/// best, whatever the step's rows), and whether its hint was read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Admitted {
     pub(super) expert: usize,
@@ -392,7 +393,7 @@ const WINDOW: f64 = 1.0;
 /// The latest decode steps, within [`WINDOW`] of decode time: their times
 /// and the time the volume was busy meanwhile
 /// (`magnitude_artifacts::Delivery`), what share of the time it is busy;
-/// and their hint candidates by ring rank, each rank's precision.
+/// and their hint candidates by choice rank, each rank's precision.
 /// Every step it holds is a generation step's since the last prompt step, which
 /// drops its reads and starts the window again (`Telemetry::complete_step`).
 #[derive(Default)]
@@ -448,7 +449,7 @@ impl Recent {
 
 }
 
-/// Each lead's ring ranks' candidates of completed decode steps and those
+/// Each lead's choice ranks' candidates of completed decode steps and those
 /// a hint saves ([`saves`]): each lead's rank's precision, read or not.
 #[derive(Default)]
 struct Ranks([Vec<[u64; 2]>; crate::planning::HINT_LEADS as usize]);
@@ -494,8 +495,8 @@ pub(super) struct HintPrice {
 }
 
 impl HintPrice {
-    /// Whether a hint at rank `rank` pays for its read ([`pays`]): a ring
-    /// names at most a request's choices, each rank of which is priced.
+    /// Whether a hint at rank `rank` pays for its read ([`pays`]): a hint's
+    /// rank is a row's choice's, each of which is priced.
     pub(super) fn pays(&self, rank: usize) -> bool {
         pays(self.precision[rank], self.busy)
     }
@@ -575,7 +576,7 @@ struct Costs {
     convert: Vec<Option<crate::assessment::RecordLine>>,
     hints: HintCost,
     hinted: BTreeMap<(Step, usize, usize), Vec<Admitted>>,
-    /// The latest decode steps' file reads and ring ranks' candidates
+    /// The latest decode steps' file reads and choice ranks' candidates
     /// ([`Recent`]).
     recent: Recent,
     running: BTreeMap<Step, StepCost>,
@@ -724,6 +725,8 @@ struct Routing {
     /// Who places into the bank, which tells what a source `>= 0` is
     /// ([`Use`]).
     placer: crate::planning::Placer,
+    /// `K`: a row's choices, the ranks a hint is hinted at.
+    selected: usize,
     /// Per streamed layer, whether a ring row hints it ([`Layer::hints`]).
     /// The first streamed layer is hinted by none.
     hinted: Vec<bool>,
@@ -942,6 +945,7 @@ impl Telemetry {
                 maps: layers.iter().map(|layer| (layer.group, layer.map.clone())).collect(),
                 records: layers.iter().map(|layer| layer.routing.clone()).collect(),
                 words: extents.words,
+                selected: extents.selected,
                 reads: Mutex::new(reads),
                 experts: layers.iter().map(|layer| layer.experts).collect(),
                 placer: extents.placer,
@@ -1338,7 +1342,7 @@ impl Telemetry {
             .running
             .remove(&sequence)
             .unwrap_or_else(|| StepCost::of(layers));
-        // The step's hint candidates by ring rank, into the window that
+        // The step's hint candidates by choice rank, into the window that
         // prices hints ([`Recent`]).
         let mut ranks = Ranks::default();
         if let Some((_, routed, tiered, sourced, absent, blocks)) = &decoded {
@@ -1592,7 +1596,7 @@ impl Telemetry {
         let Routing { records, words, .. } = &self.routing;
         records.iter().enumerate().map(move |(layer, record)| {
             let whole = self.whole[layer].load(Ordering::Acquire);
-            (layer, if whole { RoutingRecord::unwritten(record) } else { RoutingRecord::read(record, *words, sequence, layer) })
+            (layer, if whole { RoutingRecord::unwritten(record, *words) } else { RoutingRecord::read(record, *words, sequence, layer) })
         })
     }
 
@@ -1748,7 +1752,7 @@ impl Telemetry {
         let recorded = self.lock();
         let costs = &recorded.costs;
         let window = costs.recent.ranks();
-        let ranks = (0..self.routing.words.choices as usize).map(|rank| window.precision(lead, rank)).collect();
+        let ranks = (0..self.routing.selected).map(|rank| window.precision(lead, rank)).collect();
         HintPrice { precision: ranks, busy: costs.recent.busy() }
     }
 

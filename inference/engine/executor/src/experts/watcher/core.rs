@@ -47,7 +47,8 @@ pub(in crate::experts) struct Layer {
     /// a lead its route has.
     pub hints: Vec<usize>,
     /// Its routing records, one for each step in flight
-    /// (`RegionWords::flight`), ring words each.
+    /// (`RegionWords::flight`), routing words each
+    /// (`RegionWords::routing_words`).
     pub routing: Words,
     /// Its policy words (`BankPart::Policy`): those a run's encoding reads
     /// written between flights (`Residency::publish_policy`), its line words
@@ -86,8 +87,8 @@ impl Layer {
 /// the one reader of its words.
 pub(super) struct RoutingRecord<'a> {
     words: &'a Words,
+    shape: RegionWords,
     base: usize,
-    sources: usize,
     count: usize,
     /// Whether its route wrote it: a whole layer's writes none.
     written: bool,
@@ -102,18 +103,18 @@ impl<'a> RoutingRecord<'a> {
         let base = (sequence % shape.flight) as usize * shape.routing_words() as usize;
         let written = words.load(base + constants::RING_SEQUENCE as usize);
         assert_eq!(written, low_word(sequence), "step {sequence}'s routing record at layer {layer} is another step's ({written})");
-        let sources = shape.choices as usize;
         let count = words.load(base + constants::RING_COUNT as usize);
         let count = usize::try_from(count)
             .ok()
-            .filter(|&count| count <= sources)
-            .unwrap_or_else(|| panic!("step {sequence}'s routing record at layer {layer} counts {count} of {sources} choices"));
-        Self { words, base, sources, count, written: true }
+            .filter(|&count| count as u64 <= shape.choices)
+            .unwrap_or_else(|| panic!("step {sequence}'s routing record at layer {layer} counts {count} of {} choices", shape.choices));
+        Self { words, shape, base, count, written: true }
     }
 
-    /// A whole layer's: its route writes none, so it holds no choice.
-    pub(super) fn unwritten(words: &'a Words) -> Self {
-        Self { words, base: 0, sources: 0, count: 0, written: false }
+    /// A whole layer's, of records shaped by `shape`: its route writes none,
+    /// so it holds no choice.
+    pub(super) fn unwritten(words: &'a Words, shape: RegionWords) -> Self {
+        Self { words, shape, base: 0, count: 0, written: false }
     }
 
     /// Whether its route wrote it ([`Self::unwritten`] is a whole layer's).
@@ -128,8 +129,8 @@ impl<'a> RoutingRecord<'a> {
 
     /// Each choice's expert and the source its route resolved it to.
     pub(super) fn choices(&self) -> impl Iterator<Item = (i32, i32)> + '_ {
-        let experts = self.base + constants::RING_EXPERTS as usize;
-        (0..self.count).map(move |choice| (self.words.load(experts + choice), self.words.load(experts + self.sources + choice)))
+        let word = move |at: u64| self.words.load(self.base + at as usize);
+        (0..self.count as u64).map(move |choice| (word(self.shape.routing_expert(choice)), word(self.shape.routing_source(choice))))
     }
 }
 

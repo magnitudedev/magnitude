@@ -22,7 +22,7 @@ use crate::planning::{
 };
 use magnitude_kernels::constants::{
     DECODE_GRIDS, FILE_CHOICE, FILE_COUNT, FILE_RECORD, LIST_COUNT, LIST_ENTRIES, LIST_FROM, LIST_SEQUENCE,
-    LIST_TO, MAP_FROM, MAP_RECORD, MAP_UNTIL, MAP_WORDS, POLICY_HOME, POLICY_PRICED, POLICY_RESOLVED, POLICY_WHOLE, POLICY_WORDS, RING_COUNT, RING_EXPERTS,
+    LIST_TO, MAP_FROM, MAP_RECORD, MAP_UNTIL, MAP_WORDS, POLICY_HOME, POLICY_PRICED, POLICY_RESOLVED, POLICY_WHOLE, POLICY_WORDS, RING_COUNT,
     RING_SEQUENCE, ROUND_GRIDS, SCRATCH_ASK, SCRATCH_ROUND, SCRATCH_STAGED, SLOT_ANSWER, SLOT_REQUEST,
     SOURCE_RECORD, SOURCE_ROWS, SOURCE_SITE, STEP_HIGH, STEP_LOW, STEP_WORDS, WAIT_GRID,
 };
@@ -472,7 +472,7 @@ impl<'a> Served<'a> {
         let (experts, next, selected) = (binding.experts, binding.next_experts, binding.selected);
         let (ring, flight) = (binding.words.ring_words(), binding.words.flight);
         let choices = word(selected, entry, label)?;
-        let (routing_words, places) = (binding.words.routing_words(), binding.words.choices);
+        let routing_words = binding.words.routing_words();
         let record = u64::from(SEQUENCE.unsigned_abs()) % flight * routing_words;
         // Every choice's source none for the GPU, in the sources and the
         // routing record's sources; across a link a layer not whole, sited
@@ -485,7 +485,7 @@ impl<'a> Served<'a> {
             .flat_map(|choice| [(SOURCE_RECORD * selected + choice, -1), (SOURCE_SITE * selected + choice, site)])
             .collect::<Vec<_>>();
         let unrouted = (0..selected)
-            .map(|choice| (record + RING_EXPERTS + places + choice, -1))
+            .map(|choice| (record + binding.words.routing_source(choice), -1))
             .collect::<Vec<_>>();
         // The tier wait's grid of one group.
         let grids_written = (0..3).map(|axis| (WAIT_GRID * 3 + axis, 1)).collect::<Vec<_>>();

@@ -536,8 +536,13 @@ impl Prefetch {
                     .ok()
                     .filter(|&count| count <= words.choices as usize)
                     .unwrap_or_else(|| panic!("a hint ring of {} experts", ring.load(base + constants::RING_COUNT as usize)));
-                let experts = (0..count)
-                    .map(|index| ring.load(base + constants::RING_EXPERTS as usize + index))
+                // Each entry's expert and the rank of the choice it was
+                // hinted as (HINT_EXPERT, HINT_RANK).
+                let entry = |index: usize, word: u64| {
+                    ring.load(base + (constants::RING_EXPERTS + constants::HINT_ENTRY_WORDS * index as u64 + word) as usize)
+                };
+                let entries = (0..count)
+                    .map(|index| (entry(index, constants::HINT_EXPERT), entry(index, constants::HINT_RANK)))
                     .collect::<Vec<_>>();
                 // The ring is a seqlock (lib/streaming/hint): the device
                 // stores sequence 0 before it rewrites the list and the
@@ -559,17 +564,22 @@ impl Prefetch {
                 if served[target] >= sequence {
                     continue;
                 }
-                let experts = experts
+                let hinted = entries
                     .into_iter()
-                    .map(|expert| {
-                        usize::try_from(expert)
+                    .map(|(expert, rank)| {
+                        let expert = usize::try_from(expert)
                             .ok()
                             .filter(|&expert| expert < core.layers[target].experts)
-                            .unwrap_or_else(|| panic!("a hint names expert {expert}"))
+                            .unwrap_or_else(|| panic!("a hint names expert {expert}"));
+                        let rank = usize::try_from(rank)
+                            .ok()
+                            .filter(|&rank| rank < core.extents.selected)
+                            .unwrap_or_else(|| panic!("a hint of expert {expert} names choice rank {rank}"));
+                        (expert, rank)
                     })
                     .collect::<Vec<_>>();
                 let issued = shared.steps.at(sequence, layer, core.layers.len());
-                self.admit(core, shared, target, lead, &experts, issued);
+                self.admit(core, shared, target, lead, &hinted, issued);
             }
         }
         read
@@ -587,8 +597,9 @@ impl Prefetch {
             || staging.keeps(staged))
     }
 
-    /// Admit the hints of `experts` of `target` at lead `lead` (its ring row:
-    /// 0 one layer ahead, 1 two), issued by the route at `issued`: each
+    /// Admit the hints `hinted` (each expert with the rank of the choice it
+    /// was hinted as) of `target` at lead `lead` (its ring row: 0 one layer
+    /// ahead, 1 two), issued by the route at `issued`: each
     /// candidate (an expert whose file is on the path:
     /// nothing holds, keeps or lands it; one a longer lead's hint reads lands
     /// already) whose rank's precision at its lead pays for its read
@@ -601,13 +612,12 @@ impl Prefetch {
     /// tier records fall short, the hints
     /// left are the least likely. Its candidates, each with whether it was
     /// read and its rank, are counted with their step (`Telemetry::hinted`).
-    fn admit(&mut self, core: &mut Core, shared: &Arc<Shared>, target: usize, lead: usize, experts: &[usize], issued: At) {
+    fn admit(&mut self, core: &mut Core, shared: &Arc<Shared>, target: usize, lead: usize, hinted: &[(usize, usize)], issued: At) {
         let mut seen = BTreeSet::new();
-        let ranked = experts
+        let ranked = hinted
             .iter()
-            .enumerate()
-            .filter(|&(_, &expert)| seen.insert(expert) && Self::candidate(core, &self.staging, (target, expert)))
-            .map(|(rank, &expert)| (expert, rank))
+            .copied()
+            .filter(|&(expert, _)| seen.insert(expert) && Self::candidate(core, &self.staging, (target, expert)))
             .collect::<Vec<_>>();
         // A hint takes staging beyond the demand reserve, so a request
         // finds its own, and the ready tier records beyond what the

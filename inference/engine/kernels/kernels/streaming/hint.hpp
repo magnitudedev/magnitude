@@ -4,8 +4,9 @@
 // fused form's `rank_row`, lib/routed/route; the general form's,
 // lib/routed/select), and each one not named before published to a ring the
 // host reads in rank order (every row's first choice, then every row's
-// second, and so on), so the ring is best first and its readers read ahead
-// in its order (they skip what the layer holds),
+// second, and so on), with the rank of the choice it was hinted as
+// (HINT_EXPERT, HINT_RANK), so the ring is best first and its readers read
+// ahead in its order (they skip what the layer holds),
 // as a seqlock: the sequence 0 (none, which the host skips), a system-scope
 // fence, the experts and the count, a fence, then the step's sequence. A
 // host read that finds the same nonzero sequence before and after its loads
@@ -47,8 +48,10 @@ STREAMING_FN void streaming_hint(u32 rows, STREAMING_SYSTEM_WORDS ring, u64 ring
     int count = 0;
     for (u32 o = 0; o < total; ++o)
         if (STREAMING_GROUP(STREAMING_HINT_KEEP(rows, o)) != 0) {
-            streaming_store(STREAMING_AT(ring, (SEISMIC_CONST_RING_EXPERTS + u64(count)) * ring0),
+            const u64 entry = SEISMIC_CONST_RING_EXPERTS + u64(SEISMIC_CONST_HINT_ENTRY_WORDS) * u64(count);
+            streaming_store(STREAMING_AT(ring, (entry + SEISMIC_CONST_HINT_EXPERT) * ring0),
                 STREAMING_GROUP(streaming_hint_choice(rows, o)));
+            streaming_store(STREAMING_AT(ring, (entry + SEISMIC_CONST_HINT_RANK) * ring0), int(o / rows));
             ++count;
         }
     streaming_store(STREAMING_AT(ring, SEISMIC_CONST_RING_COUNT * ring0), count);

@@ -784,8 +784,8 @@ impl Harness {
         let base = (step.sequence() % WORDS.flight) as usize * ring;
         for (choice, (&word, &source)) in choices.iter().zip(sources).enumerate() {
             let expert = if word < 0 { -1 - word } else { word };
-            record.store(base + constants::RING_EXPERTS as usize + choice, expert);
-            record.store(base + WORDS.ring_words() as usize + choice, source);
+            record.store(base + WORDS.routing_expert(choice as u64) as usize, expert);
+            record.store(base + WORDS.routing_source(choice as u64) as usize, source);
         }
         record.store(base + constants::RING_COUNT as usize, choices.len() as i32);
         record.store(base + constants::RING_SEQUENCE as usize, low_word(step.sequence()));
@@ -1121,12 +1121,15 @@ impl Harness {
     }
 
     /// Play layer `layer`'s ring row of lead `lead` hinting `experts` of
-    /// the layer `lead + 1` ahead in `step`.
+    /// the layer `lead + 1` ahead in `step`: a row each, its one choice
+    /// (rank 0) at the harness's one choice a row.
     pub(super) fn hint_at(&self, step: &ExpertStep, layer: usize, lead: usize, experts: &[i32]) {
         let ring = &self.layers[layer].3;
         let base = lead * WORDS.ring_words() as usize;
         for (index, &expert) in experts.iter().enumerate() {
-            ring.store(base + constants::RING_EXPERTS as usize + index, expert);
+            let entry = base + (constants::RING_EXPERTS + constants::HINT_ENTRY_WORDS * index as u64) as usize;
+            ring.store(entry + constants::HINT_EXPERT as usize, expert);
+            ring.store(entry + constants::HINT_RANK as usize, 0);
         }
         ring.store(base + constants::RING_COUNT as usize, experts.len() as i32);
         ring.store(base + constants::RING_SEQUENCE as usize, low_word(step.sequence()));

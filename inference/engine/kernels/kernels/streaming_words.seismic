@@ -261,12 +261,20 @@ const PARK_GRID = 0
 const ROWS_GRID = 1
 const COLUMNS_GRID = 2
 
-# A ring `ring[RING]`, RING >= RING_EXPERTS + M K, a hint ring's or a routing
-# record's: the sequence (the step's low word) and the count, then the
-# experts.
+# A ring `ring[RING]`, a hint ring's or a routing record's: the sequence
+# (the step's low word) and the count, then its entries from RING_EXPERTS. A
+# routing record's are its choices' experts, RING >= RING_EXPERTS + M K (each
+# choice's source after them, `routing` below); a hint ring's are pairs,
+# RING >= RING_EXPERTS + HINT_ENTRY_WORDS M K: each hinted expert
+# (HINT_EXPERT) and the rank of the choice it was hinted as (HINT_RANK, 0 a
+# row's best), by which the host keeps each hint's precision, whatever the
+# rows.
 const RING_SEQUENCE = 0
 const RING_COUNT = 1
 const RING_EXPERTS = 2
+const HINT_ENTRY_WORDS = 2
+const HINT_EXPERT = 0
+const HINT_RANK = 1
 
 # A layer's routing records `routing[FLIGHT, ROUTING]`, ROUTING >=
 # RING_EXPERTS + 2 P, one for each step in flight (the host's bound on steps
