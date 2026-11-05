@@ -860,7 +860,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             };
             let mut primed_here = primed.take_if(|(primed, _)| *primed == request).map(|(_, advance)| advance);
             let (outcome, advance) = match (self.poisoned.get(&request), &interrupted) {
-                (Some(error), _) => (Outcome::WeightReadFailed(error.clone()), Some(advance)),
+                (Some(error), _) if matches!(advance, Advance::Step(_)) => {
+                    (Outcome::WeightReadFailed(error.clone()), Some(advance))
+                }
+                // A chunk of a chain that read weights it could not: its
+                // holder fails and claims no more of the chain, so the chain
+                // is released whole now, its holder's state with it, as an
+                // interrupted chain's is. Held on, the next request's work
+                // would orphan a chain under way.
+                (Some(error), _) => {
+                    let outcome = Outcome::WeightReadFailed(error.clone());
+                    released_chain = Some(self.release_chunk_chain(request, advance, primed_here.take()));
+                    (outcome, None)
+                }
                 (None, None) => (Outcome::Forward { rows: result }, Some(advance)),
                 // Its accepted state returns as its outcome is aborted: it is
                 // re-run from there.
@@ -872,17 +884,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 // this chunk's now. It is released whole, and its holder's
                 // state with it: the request re-prefills, as an evicted one.
                 (None, Some(reason)) => {
-                    match advance {
-                        Advance::Chain(chain) => {
-                            self.target.insert(request, chain.abort());
-                            released_chain = Some(Released::Whole(request));
-                        }
-                        Advance::Chained => released_chain = Some(Released::Held),
-                        Advance::Step(_) => unreachable!("matched above"),
-                    }
-                    if let Some(primed) = primed_here.take() {
-                        self.head.insert(request, primed.abort());
-                    }
+                    released_chain = Some(self.release_chunk_chain(request, advance, primed_here.take()));
                     (Outcome::Interrupted { reason: reason.clone(), resident: false }, None)
                 }
             };
@@ -944,6 +946,24 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.target_timing = Some(timing);
         self.begin_host_turn(pending.iter().map(|item| item.request));
         Ok(pending)
+    }
+
+    /// Release whole the chain `request`'s chunk was of, `advance` (a chunk's, never a step's),
+    /// its holder's state with it, and the drafter state `primed` beside the chunk: the request
+    /// claims no more of the chain. What is released, once every outcome is in.
+    fn release_chunk_chain(&mut self, request: RequestId, advance: Advance, primed: Option<OwnedStateAdvance>) -> Released {
+        let released = match advance {
+            Advance::Chain(chain) => {
+                self.target.insert(request, chain.abort());
+                Released::Whole(request)
+            }
+            Advance::Chained => Released::Held,
+            Advance::Step(_) => unreachable!("a step's advance is of no chain"),
+        };
+        if let Some(primed) = primed {
+            self.head.insert(request, primed.abort());
+        }
+        released
     }
 
     fn finish_priming_work(

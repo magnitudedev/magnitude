@@ -45,7 +45,8 @@
 //! is promoted (never demoted), and withdrawn ([`Job::withdraw`], or dropped):
 //! the pieces no worker has taken are read by none, the ranges they serve
 //! failed [`Error::Withdrawn`], and it ends with the pieces in flight. A
-//! failed piece fails only the ranges it serves, of its job.
+//! failed piece fails only the ranges whose own bytes fail to read: a piece
+//! serving several is read again range by range.
 //!
 //! # How reads share the engine
 //!

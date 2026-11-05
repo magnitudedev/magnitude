@@ -254,10 +254,13 @@ impl Decode {
             let naming = Naming { layer, sequence: waits.at.point.sequence, named: waits.named };
             match core.source.submit(reads, Priority::Demand) {
                 Ok(ticket) => prefetch.demand(ticket, vec![landing], vec![(record, staged, tier, naming.sequence)], naming, None, None, shared),
+                // The read was never made: as a failed read, only the rows that named the
+                // expert fail, and its wait is answered with none, so the rest of the step serves.
                 Err(reason) => {
                     core.directory.unlanded(layer, HostRecord(tier));
                     prefetch.staging.release(record, None);
-                    fail(core, shared, layer, naming.sequence, reason);
+                    shared.steps.fail_request_rows(naming.sequence, layer, &landing.rows, reason);
+                    landing.answer.publish(None);
                 }
             }
         }
@@ -506,7 +509,7 @@ impl Decode {
         // were stored as each claim took its record, before any landing
         // starts: no step after the parked one resolves an unmapped expert
         // to a record a landing writes, however soon the landing answers.
-        let failed = match submitted {
+        match submitted {
             Some((at, Ok(ticket))) => {
                 let timed = (reading == absent.len()).then_some((reading as u64 * record_bytes, at));
                 // Where a request's misses land is priced per request: the
@@ -517,17 +520,22 @@ impl Decode {
                     .filter(|_| convertible && shared.telemetry.device_lands(layer, reading as u64))
                     .map(|words| (words, core.layers[layer].file.clone(), point));
                 prefetch.demand(ticket, landings, tracked, naming, timed, device, shared);
-                None
             }
+            // The reads were never made: as failed reads, only the rows that named their
+            // experts fail, and their waits are answered with none, so the rest of the step
+            // serves.
             Some((_, Err(reason))) => {
                 for (record, (layer, _), tier, _) in tracked {
                     core.directory.unlanded(layer, HostRecord(tier));
                     prefetch.staging.release(record, None);
                 }
-                Some(reason)
+                for landing in landings {
+                    shared.steps.fail_request_rows(sequence, layer, &landing.rows, reason.clone());
+                    landing.answer.publish(None);
+                }
             }
-            None => None,
-        };
+            None => {}
+        }
         for (expert, landed) in others {
             let record = match landed {
                 Landed::Revived { record, grant } => {
@@ -548,9 +556,6 @@ impl Decode {
                 shared.landings.waits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             self.waiting.push(Waiting { at, expert, answer: answer_of(expert), rows: rows_of(expert), named: started, record });
-        }
-        if let Some(reason) = failed {
-            fail(core, shared, layer, sequence, reason);
         }
     }
 }

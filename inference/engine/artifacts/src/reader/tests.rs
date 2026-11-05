@@ -392,6 +392,22 @@ fn sink() -> NonNull<u8> {
     NonNull::dangling()
 }
 
+/// A coalesced piece's parts, each alone, are read over their own aligned
+/// bytes within the piece: a failure the piece read can be told apart by
+/// part, and one in a gap between them fails neither.
+#[test]
+fn a_coalesced_pieces_parts_read_alone_over_their_own_blocks() {
+    let range = |offset: u64, length: usize| Range { offset, length, sink: sink() };
+    let ranges = [range(0, 90), range(ALIGNMENT + 100, 90)];
+    let pieces = pieces(&ranges, &[0, 1], 10_000_000, LEAST_READ);
+    assert_eq!(pieces.len(), 1, "near ranges share one piece");
+    let alone = pieces[0]
+        .parts_alone()
+        .map(|piece| (piece.start, piece.end, piece.parts.iter().map(|part| (part.range, part.from, part.length)).collect::<Vec<_>>()))
+        .collect::<Vec<_>>();
+    assert_eq!(alone, [(0, ALIGNMENT, vec![(0, 0, 90)]), (ALIGNMENT, 2 * ALIGNMENT, vec![(1, 100, 90)])]);
+}
+
 /// Near ranges share a read and far ones do not; a read is split into
 /// pieces of at most `LEAST_READ`, each serving the parts of the ranges it
 /// covers.

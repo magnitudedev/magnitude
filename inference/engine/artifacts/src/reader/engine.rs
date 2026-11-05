@@ -141,16 +141,21 @@ fn work(engine: &'static Engine, flight: &Mutex<Option<Flight>>) {
                 since: Instant::now(),
             });
         // A panic is the job's, whose observer resumes it: the worker serves
-        // on.
-        match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            file.read_piece(&piece, &engine.buffers)
+        // on. A piece serving several parts that fails may have failed in bytes
+        // only some of them need, or in a gap between them none needs: each
+        // part's own span is read again, and only those that fail fail.
+        match std::panic::catch_unwind(AssertUnwindSafe(|| match file.read_piece(&piece, &engine.buffers) {
+            Ok(()) => Vec::new(),
+            Err(error) if piece.parts.len() == 1 => vec![(piece.parts[0].range, Arc::new(error))],
+            Err(_) => piece
+                .parts_alone()
+                .filter_map(|alone| {
+                    let range = alone.parts[0].range;
+                    file.read_piece(&alone, &engine.buffers).err().map(|error| (range, Arc::new(error)))
+                })
+                .collect(),
         })) {
-            Ok(Ok(())) => state.pieces_ended(1, [], None),
-            Ok(Err(error)) => {
-                let error = Arc::new(error);
-                let failed = piece.parts.iter().map(|part| (part.range, error.clone()));
-                state.pieces_ended(1, failed, None);
-            }
+            Ok(failed) => state.pieces_ended(1, failed, None),
             Err(payload) => state.pieces_ended(1, [], Some(Panic::new(payload))),
         }
         PIECES_ENDED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);

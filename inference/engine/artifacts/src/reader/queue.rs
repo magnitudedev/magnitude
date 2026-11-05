@@ -25,6 +25,23 @@ pub(super) struct Part {
     pub(super) sink: NonNull<u8>,
 }
 
+impl Piece {
+    /// Each part as a piece of its own: the aligned span of its own bytes, within this piece's,
+    /// so a read that fails for this piece is told apart by part.
+    pub(super) fn parts_alone(&self) -> impl Iterator<Item = Piece> + '_ {
+        self.parts.iter().map(|part| {
+            let offset = self.start + part.from as u64;
+            let start = offset - offset % ALIGNMENT;
+            let end = (offset + part.length as u64).div_ceil(ALIGNMENT) * ALIGNMENT;
+            Piece {
+                start,
+                end: end.max(start + ALIGNMENT).min(self.end),
+                parts: vec![Part { from: (offset - start) as usize, ..*part }],
+            }
+        })
+    }
+}
+
 // SAFETY: a part's sink is memory its job's submitter handed the pool until
 // the job ends (`ArtifactReader::submit`), written by the one worker that
 // takes the part's piece.
