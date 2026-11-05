@@ -1821,12 +1821,14 @@ mod tests {
             .owned(),
         ];
         for implementation in implementations {
-            for (group, width, max_rows, expected_warps) in [
-                (2, 256, 8, 1),
-                (6, 256, 8, 4),
-                (8, 128, 8, 4),
-                (16, 256, 8, 8),
-                (6, 256, 4, 2),
+            // The affine entry's default SLICES: the fewest that hold a lane
+            // to 32 elements, or the most the group splits into.
+            for (group, width, max_rows, expected_warps, affine_slices) in [
+                (2, 256, 8, 1, 1),
+                (6, 256, 8, 4, 2),
+                (8, 128, 8, 4, 1),
+                (16, 256, 8, 8, 4),
+                (6, 256, 4, 2, 2),
             ] {
                 let mut mix = AttentionMix {
                     codec: magnitude_state::KvCodec::AffineK8V4.spec(
@@ -1881,15 +1883,13 @@ mod tests {
                 assert_eq!(choice.param("WARPS"), Some(expected_warps));
                 assert_eq!(choice.param("COLUMNS"), Some(1));
                 assert_eq!(choice.param("STAGES"), Some(2));
-                // The default is the vector form, except on the affine entry
-                // where a lane of the whole group would hold more than 64
-                // elements and the group splits further.
+                // The default is the vector form, the group whole except on
+                // the affine entry, which splits it so a lane holds at most
+                // 32 elements where it can.
                 let affine = implementation.statics.iter().any(|name| name == "KC");
                 let default = implementation.default_specialization(&statics).unwrap();
-                assert_eq!(
-                    default.param("MATRIX"),
-                    Some(u64::from(affine && group * width / 32 > 64))
-                );
+                assert_eq!(default.param("MATRIX"), Some(0));
+                assert_eq!(default.param("SLICES"), Some(if affine { affine_slices } else { 1 }));
 
                 mix.decode_rows = Some(1..2);
                 assert!(
