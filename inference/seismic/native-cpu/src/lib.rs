@@ -38,7 +38,7 @@ use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry;
 
 #[cfg(target_arch = "aarch64")]
-pub use isa::Neon;
+pub use isa::{Neon, NeonDot};
 #[cfg(target_arch = "x86_64")]
 pub use isa::{X86V4Vnni, X86V2, X86V3, X86V4};
 

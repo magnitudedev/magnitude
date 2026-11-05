@@ -550,13 +550,13 @@ pub(crate) fn on_device(
 
 /// `implementation`'s declared defaults as `device` offers them at
 /// `bindings`. On a CPU whose tier forms quantized dots from vector integer
-/// products (AVX2, AVX-512 or VNNI, `Tier::quantized_dots`, a fact of the
-/// device), a projection over a packed weight the quantized dot takes
-/// (`form(W, INT8)`) prefers its `INT8` form: it quantizes the staged rows
-/// to Q8 blocks and runs the representation's integer dot, and the F32 form
-/// is the challenger. The default is the first configuration the
-/// declaration admits in that order. Elsewhere (x86-64-v2, NEON, dense
-/// weights, GPUs) the declaration's defaults stand.
+/// products (AVX2, AVX-512, VNNI or NEON `sdot`, `Tier::quantized_dots`, a
+/// fact of the device), a projection over a packed weight the quantized dot
+/// takes (`form(W, INT8)`) prefers its `INT8` form: it quantizes the staged
+/// rows to Q8 blocks and runs the representation's integer dot, and the F32
+/// form is the challenger. The default is the first configuration the
+/// declaration admits in that order. Elsewhere (x86-64-v2, NEON without
+/// `dotprod`, dense weights, GPUs) the declaration's defaults stand.
 pub(crate) fn device_defaults(
     device: &DeviceInner,
     mut implementation: NativeImplementation,

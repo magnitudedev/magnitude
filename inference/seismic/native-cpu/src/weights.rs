@@ -104,7 +104,7 @@ macro_rules! vectors {
 #[cfg(target_arch = "x86_64")]
 vectors!(X86V2, X86V3, X86V4, X86V4Vnni);
 #[cfg(target_arch = "aarch64")]
-vectors!(Neon);
+vectors!(Neon, NeonDot);
 
 /// Byte geometry of the rows of one weight operand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -643,7 +643,7 @@ pub trait Codes: Copy + Send + Sync + 'static {
     ///
     /// # Safety
     /// As [`Codes::values`].
-    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[cfg(target_arch = "aarch64")]
     #[inline(always)]
     unsafe fn neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
         use std::arch::aarch64::*;
@@ -761,7 +761,7 @@ impl<const LOW: u32, const HIGH: u32, I, const LEAST: i32, const GREATEST: i32>
         codes
     }
 
-    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[cfg(target_arch = "aarch64")]
     #[inline(always)]
     unsafe fn raw_neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
         const {
@@ -812,7 +812,7 @@ impl<const LOW: u32, const HIGH: u32, const LEAST: i32, const GREATEST: i32> Cod
         values
     }
 
-    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[cfg(target_arch = "aarch64")]
     #[inline(always)]
     unsafe fn neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
         unsafe { Self::raw_neon(at) }
@@ -847,7 +847,7 @@ impl<const LOW: u32, const HIGH: u32, const C: i32, const LEAST: i32, const GREA
         values
     }
 
-    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[cfg(target_arch = "aarch64")]
     #[inline(always)]
     unsafe fn neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
         use std::arch::aarch64::*;
@@ -887,7 +887,7 @@ impl<const LOW: u32, const HIGH: u32, const K: i32, const LEAST: i32, const GREA
     }
 
     // `2 (c - K) + 1` is the doubled code plus `1 - 2 K`.
-    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[cfg(target_arch = "aarch64")]
     #[inline(always)]
     unsafe fn neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
         use std::arch::aarch64::*;
@@ -951,7 +951,7 @@ impl<const ID: usize, const LEAST: i32, const GREATEST: i32> Codes
         values
     }
 
-    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[cfg(target_arch = "aarch64")]
     #[inline(always)]
     unsafe fn neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
         use std::arch::aarch64::*;
@@ -982,7 +982,7 @@ impl<const LEAST: i32, const GREATEST: i32> Codes for Planes<8, 0, Twos, LEAST, 
         unsafe { read(Self::low_bytes(at)) }
     }
 
-    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[cfg(target_arch = "aarch64")]
     #[inline(always)]
     unsafe fn neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
         use std::arch::aarch64::*;
@@ -1442,8 +1442,8 @@ unsafe fn packet_dots<
 ) -> [[[f32; 8]; 2]; M] {
     let halves = const { groups_per_packet(GROUP) };
     let mut exact = [[[0.0f32; 8]; 2]; M];
-    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
-    {
+    #[cfg(target_arch = "aarch64")]
+    if V::QUANTIZED_DOTS >= 1 {
         use std::arch::aarch64::*;
         // A packet's products are four lanes; pairwise adds reduce four
         // packets' into one vector of their sums, which stays a vector (no
@@ -1457,18 +1457,20 @@ unsafe fn packet_dots<
                 let activations = x[m].codes[PACKET * local..].as_ptr();
                 let (first, second) =
                     unsafe { (vld1q_s8(activations), vld1q_s8(activations.add(16))) };
-                let products = if halves == 2 {
-                    [
-                        packed_neon::sdot(zero, weights[0], first),
-                        packed_neon::sdot(zero, weights[1], second),
-                    ]
-                } else {
-                    let products = packed_neon::sdot(
-                        packed_neon::sdot(zero, weights[0], first),
-                        weights[1],
-                        second,
-                    );
-                    [products, zero]
+                let products = unsafe {
+                    if halves == 2 {
+                        [
+                            packed_neon::sdot(zero, weights[0], first),
+                            packed_neon::sdot(zero, weights[1], second),
+                        ]
+                    } else {
+                        let products = packed_neon::sdot(
+                            packed_neon::sdot(zero, weights[0], first),
+                            weights[1],
+                            second,
+                        );
+                        [products, zero]
+                    }
                 };
                 for h in 0..halves {
                     if local % 2 == 0 {
@@ -2084,10 +2086,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
     /// [`Hier::factors`] of the eight lanes of the rows8 tile whose lane 0
     /// is `row`, `group` its storage group: lane `r`'s fields are `r` supers
     /// groups further on, so each field's eight read as one vector.
-    #[cfg(any(
-        all(target_arch = "aarch64", target_feature = "dotprod"),
-        target_arch = "x86_64"
-    ))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[inline(always)]
     unsafe fn tile_factors(row: &Row, group: At) -> [(f32, f32); 8] {
         let (supers, stride) = (
@@ -2165,43 +2164,46 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                 }
             }
         }
-        #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
-        unsafe {
-            use std::arch::aarch64::*;
-            // Each half accumulates in its own lanes: one multiply-add per
-            // half, which the compiler cannot reassociate into a multiply,
-            // a multiply-add and an add.
-            let mut lanes = [[vdupq_n_s32(0); 2]; M];
-            for local in packets_of(packets) {
-                let weights = C::neon(group.packet(local));
-                let [first_code, second_code] = Self::packet_scales(group.packet(local));
-                let zero = vdupq_n_s32(0);
-                for (lanes, x) in lanes.iter_mut().zip(x.iter()) {
-                    let activations = x.codes[PACKET * local..].as_ptr();
-                    let (first, second) = (vld1q_s8(activations), vld1q_s8(activations.add(16)));
-                    if whole {
-                        let products = packed_neon::sdot(
-                            packed_neon::sdot(zero, weights[0], first),
-                            weights[1],
-                            second,
-                        );
-                        lanes[0] = vmlaq_n_s32(lanes[0], products, first_code);
-                    } else {
-                        lanes[0] = vmlaq_n_s32(
-                            lanes[0],
-                            packed_neon::sdot(zero, weights[0], first),
-                            first_code,
-                        );
-                        lanes[1] = vmlaq_n_s32(
-                            lanes[1],
-                            packed_neon::sdot(zero, weights[1], second),
-                            second_code,
-                        );
+        #[cfg(target_arch = "aarch64")]
+        if V::QUANTIZED_DOTS >= 1 {
+            unsafe {
+                use std::arch::aarch64::*;
+                // Each half accumulates in its own lanes: one multiply-add per
+                // half, which the compiler cannot reassociate into a multiply,
+                // a multiply-add and an add.
+                let mut lanes = [[vdupq_n_s32(0); 2]; M];
+                for local in packets_of(packets) {
+                    let weights = C::neon(group.packet(local));
+                    let [first_code, second_code] = Self::packet_scales(group.packet(local));
+                    let zero = vdupq_n_s32(0);
+                    for (lanes, x) in lanes.iter_mut().zip(x.iter()) {
+                        let activations = x.codes[PACKET * local..].as_ptr();
+                        let (first, second) =
+                            (vld1q_s8(activations), vld1q_s8(activations.add(16)));
+                        if whole {
+                            let products = packed_neon::sdot(
+                                packed_neon::sdot(zero, weights[0], first),
+                                weights[1],
+                                second,
+                            );
+                            lanes[0] = vmlaq_n_s32(lanes[0], products, first_code);
+                        } else {
+                            lanes[0] = vmlaq_n_s32(
+                                lanes[0],
+                                packed_neon::sdot(zero, weights[0], first),
+                                first_code,
+                            );
+                            lanes[1] = vmlaq_n_s32(
+                                lanes[1],
+                                packed_neon::sdot(zero, weights[1], second),
+                                second_code,
+                            );
+                        }
                     }
                 }
-            }
-            for (scaled, [first, second]) in scaled.iter_mut().zip(lanes) {
-                *scaled += vaddvq_s32(vaddq_s32(first, second));
+                for (scaled, [first, second]) in scaled.iter_mut().zip(lanes) {
+                    *scaled += vaddvq_s32(vaddq_s32(first, second));
+                }
             }
         }
         #[cfg(target_arch = "x86_64")]
@@ -2242,8 +2244,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                 }
             }
         }
-        #[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
-        if !(cfg!(target_arch = "x86_64") && V::QUANTIZED_DOTS >= 1) {
+        if V::QUANTIZED_DOTS == 0 {
             for local in packets_of(packets) {
                 let values = unsafe { C::values(group.packet(local)) };
                 let exact = scalar_dots::<M, GROUP, V>(&values, x, local);
@@ -2267,10 +2268,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
     /// at `row`) against one activation block, interleaved per packet so an
     /// activation packet loads once for the eight; each row's arithmetic is
     /// [`Hier::dot_row`]'s.
-    #[cfg(any(
-        all(target_arch = "aarch64", target_feature = "dotprod"),
-        target_arch = "x86_64"
-    ))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[inline(always)]
     unsafe fn dot_tile<C: Codes, V: Vectors>(
         row: &Row,
@@ -2295,7 +2293,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
             }
         }
         let mut scaled = [0i32; 8];
-        #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+        #[cfg(target_arch = "aarch64")]
         unsafe {
             use std::arch::aarch64::*;
             let mut lanes = [vdupq_n_s32(0); 8];
@@ -2399,14 +2397,8 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                 }
             }
         }
-        #[cfg(any(
-            all(target_arch = "aarch64", target_feature = "dotprod"),
-            target_arch = "x86_64"
-        ))]
-        if M == 1
-            && (cfg!(target_arch = "aarch64") || V::QUANTIZED_DOTS >= 1)
-            && Row::same_tile(rows)
-        {
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        if M == 1 && V::QUANTIZED_DOTS >= 1 && Row::same_tile(rows) {
             let tile = unsafe { Self::dot_tile::<C, V>(&rows[0], b, packets, x[0], &sums[0]) };
             let mut out = [[0.0f32; M]; R];
             for r in 0..R {
@@ -2508,7 +2500,7 @@ impl<C: Codes, K: Coefficients, const STORAGE: usize> Format for PackedRows<C, K
         const { assert!(STORAGE % PACKET == 0, "storage groups of whole packets") };
         let at = At::of::<STORAGE>(row, p);
         let coefficients = unsafe { K::decode::<STORAGE>(at) };
-        #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+        #[cfg(target_arch = "aarch64")]
         unsafe {
             let values = C::neon(at);
             for half in 0..2 {
@@ -2521,7 +2513,7 @@ impl<C: Codes, K: Coefficients, const STORAGE: usize> Format for PackedRows<C, K
                 }
             }
         }
-        #[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
+        #[cfg(not(target_arch = "aarch64"))]
         {
             let values = unsafe { C::values(at) };
             for half in 0..2 {
@@ -2549,18 +2541,23 @@ impl<C: Codes, K: Coefficients, const STORAGE: usize> Format for PackedRows<C, K
     }
 }
 
-/// Register-resident packet dots for targets whose baseline includes the
-/// dot-product instructions (every Apple silicon target). A packet's values
-/// are formed in two vectors in element order and never leave registers.
-#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+/// Register-resident packet decodes and dots on NEON. A packet's values are
+/// formed in two vectors in element order and never leave registers. The
+/// dots use `sdot`, which only the NeonDot tier's boundaries reach.
+#[cfg(target_arch = "aarch64")]
 mod packed_neon {
     use std::arch::aarch64::*;
 
-    /// `acc` plus the four-way signed byte dot products of `a` and `b`.
-    #[inline(always)]
-    pub(super) fn sdot(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
-        // Rust's dot-product intrinsic is not stable yet; the target
-        // baseline guarantees the instruction.
+    /// `acc` plus the four-way signed byte dot products of `a` and `b`. It
+    /// inlines into the NeonDot tier's boundaries, whose features include
+    /// `dotprod`.
+    ///
+    /// # Safety
+    /// The CPU has `dotprod`.
+    #[inline]
+    #[target_feature(enable = "dotprod")]
+    pub(super) unsafe fn sdot(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+        // Rust's dot-product intrinsic is not stable yet.
         unsafe {
             std::arch::asm!(
                 "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
@@ -2576,7 +2573,7 @@ mod packed_neon {
     /// The 32-value dot of two signed packets.
     ///
     /// # Safety
-    /// Both pointers address 32 values.
+    /// Both pointers address 32 values, and the CPU has `dotprod`.
     #[inline(always)]
     pub(super) unsafe fn dot32(weights: *const i8, activations: *const i8) -> i32 {
         unsafe {
@@ -3013,11 +3010,9 @@ fn dot_i8_i8<V: Vectors>(weights: &[i8; 32], activations: &[i8; 32]) -> i32 {
             ))
         };
     }
-    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
-    return unsafe { packed_neon::dot32(weights.as_ptr(), activations.as_ptr()) };
-    #[cfg(all(target_arch = "aarch64", not(target_feature = "dotprod")))]
-    if std::arch::is_aarch64_feature_detected!("dotprod") {
-        return unsafe { dot_i8_i8_dotprod(weights.as_ptr(), activations.as_ptr()) };
+    #[cfg(target_arch = "aarch64")]
+    if V::QUANTIZED_DOTS >= 1 {
+        return unsafe { packed_neon::dot32(weights.as_ptr(), activations.as_ptr()) };
     }
     #[allow(unreachable_code)]
     weights
@@ -3025,32 +3020,6 @@ fn dot_i8_i8<V: Vectors>(weights: &[i8; 32], activations: &[i8; 32]) -> i32 {
         .zip(activations)
         .map(|(w, a)| i32::from(*w) * i32::from(*a))
         .sum()
-}
-
-/// ARM CPUs whose target baseline lacks the dot-product instructions but
-/// that report them at run time reduce two 16-byte signed packets without
-/// scalar widening or a temporary sum array.
-#[cfg(all(target_arch = "aarch64", not(target_feature = "dotprod")))]
-#[target_feature(enable = "dotprod")]
-unsafe fn dot_i8_i8_dotprod(weights: *const i8, activations: *const i8) -> i32 {
-    use std::arch::aarch64::*;
-    let mut sums = vdupq_n_s32(0);
-    for half in 0..2 {
-        let weight = unsafe { vld1q_s8(weights.add(16 * half)) };
-        let activation = unsafe { vld1q_s8(activations.add(16 * half)) };
-        // Rust's dotprod intrinsic is not stable yet. The target feature
-        // restricts this instruction to CPUs that advertise it.
-        unsafe {
-            std::arch::asm!(
-                "sdot {sum:v}.4s, {weight:v}.16b, {activation:v}.16b",
-                sum = inout(vreg) sums,
-                weight = in(vreg) weight,
-                activation = in(vreg) activation,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-    vaddvq_s32(sums)
 }
 
 #[inline(always)]
@@ -3242,9 +3211,7 @@ pub unsafe fn gemm_q8_rows<W: Format, V: Vectors>(
 mod tests {
     use crate::components::{elements, resolve};
     use crate::isa::Tier;
-    use seismic_lang::registry::{
-        self, CodingAxes, Layout, RepresentationKind, RowPlaneRole,
-    };
+    use seismic_lang::registry::{self, CodingAxes, Layout, RepresentationKind, RowPlaneRole};
 
     /// Every packed weight element decodes rows of random codes to exactly
     /// the registry's decode of the same bytes.

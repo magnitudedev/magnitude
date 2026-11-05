@@ -8992,6 +8992,7 @@ mod tests {
                     variant(Tier::X86V4),
                     variant(Tier::X86V4Vnni),
                     variant(Tier::Neon),
+                    variant(Tier::NeonDot),
                 ],
             }],
         };

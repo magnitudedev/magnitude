@@ -21,23 +21,25 @@ pub enum Tier {
     X86V4,
     X86V4Vnni,
     Neon,
+    NeonDot,
 }
 
 impl Tier {
     /// Every tier of every architecture, as code generators enumerate them.
-    pub const EVERY: [Tier; 5] = [
+    pub const EVERY: [Tier; 6] = [
         Tier::X86V2,
         Tier::X86V3,
         Tier::X86V4,
         Tier::X86V4Vnni,
         Tier::Neon,
+        Tier::NeonDot,
     ];
 
     /// The `target_arch` of the tier.
     pub const fn arch(self) -> &'static str {
         match self {
             Tier::X86V2 | Tier::X86V3 | Tier::X86V4 | Tier::X86V4Vnni => "x86_64",
-            Tier::Neon => "aarch64",
+            Tier::Neon | Tier::NeonDot => "aarch64",
         }
     }
 
@@ -49,6 +51,7 @@ impl Tier {
             Tier::X86V4 => "X86V4",
             Tier::X86V4Vnni => "X86V4Vnni",
             Tier::Neon => "Neon",
+            Tier::NeonDot => "NeonDot",
         }
     }
 
@@ -56,7 +59,7 @@ impl Tier {
     /// whole: SSE's 128 bits, AVX2's 256, AVX-512's 512, NEON's 128.
     pub const fn vector_bytes(self) -> usize {
         match self {
-            Tier::X86V2 | Tier::Neon => 16,
+            Tier::X86V2 | Tier::Neon | Tier::NeonDot => 16,
             Tier::X86V3 => 32,
             Tier::X86V4 | Tier::X86V4Vnni => 64,
         }
@@ -83,7 +86,7 @@ impl Tier {
         }
         #[cfg(target_arch = "aarch64")]
         {
-            &[Tier::Neon]
+            &[Tier::Neon, Tier::NeonDot]
         }
     }
 
@@ -94,6 +97,7 @@ impl Tier {
             Tier::X86V4 => "x86v4",
             Tier::X86V4Vnni => "x86v4vnni",
             Tier::Neon => "neon",
+            Tier::NeonDot => "neondot",
         }
     }
 
@@ -106,15 +110,17 @@ impl Tier {
             Tier::X86V4 => X86V4_FEATURES,
             Tier::X86V4Vnni => X86V4VNNI_FEATURES,
             Tier::Neon => NEON_FEATURES,
+            Tier::NeonDot => NEONDOT_FEATURES,
         }
     }
 
     /// How the tier's quantized (INT8) dots multiply: 0 in portable integer
-    /// loops, 1 with AVX2 byte products, 2 with AVX-512 VNNI.
+    /// loops, 1 with vector byte products (AVX2, or NEON `sdot`), 2 with
+    /// AVX-512 VNNI.
     pub const fn quantized_dots(self) -> u8 {
         match self {
             Tier::X86V2 | Tier::Neon => 0,
-            Tier::X86V3 | Tier::X86V4 => 1,
+            Tier::X86V3 | Tier::X86V4 | Tier::NeonDot => 1,
             Tier::X86V4Vnni => 2,
         }
     }
@@ -132,6 +138,8 @@ impl Tier {
             Tier::X86V4Vnni => X86V4Vnni::detect().is_some(),
             #[cfg(target_arch = "aarch64")]
             Tier::Neon => Neon::detect().is_some(),
+            #[cfg(target_arch = "aarch64")]
+            Tier::NeonDot => NeonDot::detect().is_some(),
             #[allow(unreachable_patterns)]
             _ => false,
         }
@@ -164,6 +172,7 @@ pub const X86V4_FEATURES: &str =
 pub const X86V4VNNI_FEATURES: &str =
     "sse3,ssse3,sse4.1,sse4.2,popcnt,avx,avx2,fma,f16c,bmi1,bmi2,lzcnt,movbe,avx512f,avx512cd,avx512bw,avx512dq,avx512vl,avx512vnni";
 pub const NEON_FEATURES: &str = "neon";
+pub const NEONDOT_FEATURES: &str = "neon,dotprod";
 
 /// An instruction-set tier token.
 ///
@@ -275,6 +284,14 @@ tier!(
     Neon,
     NEON_FEATURES,
     ["neon"],
+    is_aarch64_feature_detected
+);
+#[cfg(target_arch = "aarch64")]
+tier!(
+    NeonDot,
+    NeonDot,
+    NEONDOT_FEATURES,
+    ["neon", "dotprod"],
     is_aarch64_feature_detected
 );
 

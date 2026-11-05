@@ -96,6 +96,7 @@ fn abandoned_native_handoff_does_not_keep_the_device_alive() {
                 variant(Tier::X86V4),
                 variant(Tier::X86V4Vnni),
                 variant(Tier::Neon),
+                variant(Tier::NeonDot),
             ],
         }],
     };
@@ -180,6 +181,7 @@ fn a_promotion_withdraws_the_handoff_it_replaces_and_serving_takes_the_last() {
                 variant(Tier::X86V4),
                 variant(Tier::X86V4Vnni),
                 variant(Tier::Neon),
+                variant(Tier::NeonDot),
             ],
         }],
     };

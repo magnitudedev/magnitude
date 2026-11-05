@@ -282,6 +282,8 @@ tier_components!(
 );
 #[cfg(target_arch = "aarch64")]
 tier_components!(neon, Neon, "neon");
+#[cfg(target_arch = "aarch64")]
+tier_components!(neondot, NeonDot, "neon,dotprod");
 
 /// Every tier's component table of this architecture.
 #[cfg(target_arch = "x86_64")]
@@ -292,7 +294,7 @@ static TABLES: [&[WeightKernels; COMPONENTS]; 4] = [
     &x86v4vnni::KERNELS,
 ];
 #[cfg(target_arch = "aarch64")]
-static TABLES: [&[WeightKernels; COMPONENTS]; 1] = [&neon::KERNELS];
+static TABLES: [&[WeightKernels; COMPONENTS]; 2] = [&neon::KERNELS, &neondot::KERNELS];
 
 /// The name of every element with a component: the floating dense elements
 /// and the storage elements of the CPU row layouts.
@@ -368,7 +370,10 @@ mod tests {
             assert_eq!(x86v4vnni::FEATURES, Tier::X86V4Vnni.features());
         }
         #[cfg(target_arch = "aarch64")]
-        assert_eq!(neon::FEATURES, Tier::Neon.features());
+        {
+            assert_eq!(neon::FEATURES, Tier::Neon.features());
+            assert_eq!(neondot::FEATURES, Tier::NeonDot.features());
+        }
     }
 
     /// A deterministic pseudo-random byte stream.
@@ -826,6 +831,8 @@ mod tests {
             Tier::X86V4Vnni => &x86v4vnni::INLINED,
             #[cfg(target_arch = "aarch64")]
             Tier::Neon => &neon::INLINED,
+            #[cfg(target_arch = "aarch64")]
+            Tier::NeonDot => &neondot::INLINED,
             #[allow(unreachable_patterns)]
             other => panic!("tier {other:?} is not of this architecture"),
         };
