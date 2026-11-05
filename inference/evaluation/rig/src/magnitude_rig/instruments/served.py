@@ -12,11 +12,15 @@ Scenarios, each from an empty kernel cache of the run's own:
 
 - `lifecycle`: a load arrives during the job and preempts it, serves under the no-cost policy,
   the job runs beside the idle load, a request preempts it, `Reprice` reaches the live load, a
-  new service's load starts priced; and each answer is held to a resident load's.
+  new service's load starts priced; and where each answer parts from a resident load's.
 - `stop`: a load stopped while the job runs beside it, then a load in the same service.
-- `repeat`: two prompts answered in turn on one load, each held to its first answer.
+- `repeat`: two prompts answered in turn on one load, where each parts from its first answer.
 - `failure`: a stretch of the model file read as EIO under two answers: those that named it
-  fail, the load serves on and answers as it did.
+  fail, the load serves on, and where its answer parts from the one before.
+
+Whether an answer is admitted is the precision system's, the `kl` instrument's at the same
+weight cap: a served answer is never failed for its text, which paths computing the same
+features in other arithmetic change within it. Each is reported with where it parts.
 """
 
 import argparse
