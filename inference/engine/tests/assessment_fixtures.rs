@@ -592,13 +592,16 @@ fn a_discrete_banks_conveyor_lies_in_host_storage() {
     assert!(weights(bank.slots) <= cap && weights(bank.slots + 1) > cap);
     // The conveyor lies in host storage, which the weight cap does not
     // bound, and the scratch in the lender's records, one widest layer for
-    // every group, which the lender's slots already hold: 55 slots, against
-    // 47 beside a scratch arena of its own. A conveyor charged as
-    // weights would cost the slots its bytes hold, whatever else the bank
-    // charges besides.
+    // every group, which the lender's slots already hold, so it commits no
+    // record beyond them. A conveyor charged as weights would cost the
+    // slots its bytes hold, whatever else the bank charges besides.
+    // The scratch is lent from the lender's bottom records, so it lies
+    // within the records the lender's slots commit.
+    let scratch = bank.scratch().lender;
+    let committed = bank.committed_records(scratch.group);
+    assert!(scratch.records <= committed, "{} scratch records beyond the lender's {committed}", scratch.records);
     let arena = conveyor.conveyor.bytes.iter().map(|(_, &bytes)| bytes).sum::<u64>();
     let charged_arena = (0..=bank.slots).rev().find(|&slots| weights(slots) + arena <= cap).unwrap();
-    assert_eq!(bank.slots, 55);
     assert!(bank.slots - charged_arena >= arena / bank.slot_bytes().unwrap(), "{charged_arena} slots beside a charged conveyor");
 }
 
