@@ -283,10 +283,15 @@ def opening(path: Path, index: int, skip: int = 0) -> list[dict]:
     return kept
 
 
+def fields(line: str) -> dict[str, str]:
+    """The fields a service log line states, each by its name, unquoted."""
+    return {name: value.strip('"') for name, value in re.findall(r'(\w+)=("[^"]*"|\S+)', line)}
+
+
 def priced(line: str) -> dict[str, str]:
     """What a pricing line states of each input, shortened to its state."""
-    fields = dict(re.findall(r'(\w+)=("[^"]*"|\S+)', line))
-    return {name: fields.get(name, "?").strip('"')[:40] for name in ("lines", "resident", "pass", "moves", "tier_copy", "convert")}
+    stated = fields(line)
+    return {name: stated.get(name, "?")[:40] for name in ("lines", "resident", "pass", "moves", "tier_copy", "convert")}
 
 
 def in_thread(work) -> tuple[Callable[[], None], dict]:
@@ -316,8 +321,15 @@ def in_thread(work) -> tuple[Callable[[], None], dict]:
     return join, out
 
 
-def settled(service: Service, run: Run) -> dict[str, str]:
-    """Wait for `Reprice` to bring the live load's lines."""
+def settled(service: Service, run: Run, banked: bool) -> dict[str, str]:
+    """Wait for `Reprice` to bring the live load's lines; a load without an expert bank prices
+    no experts, so for it the job's end, which must have reported."""
+    if not banked:
+        outcome = fields(service.log.wait("measurement job ended", JOB_SECONDS * 3, service.process)).get("outcome", "?")
+        run.note("job ended beside a load with no expert bank", outcome=outcome)
+        if outcome != "reported":
+            raise Failed(f"the measurement job beside a load with no expert bank ended {outcome}")
+        return {}
     while True:
         line = service.log.wait("the experts are priced", JOB_SECONDS * 3, service.process)
         state = priced(line)
@@ -340,6 +352,7 @@ def lifecycle(run: Run) -> None:
         raise Failed(f"cold load: {loaded['error']}")
     run.note("load against the job", preempted="load preempts the job" in capped.log_path.read_text(errors="replace"))
     instance = loaded["result"]
+    banked = streaming(instance) is not None
     run.note("cold load ready", seconds=loaded["seconds"], streaming=json.dumps(streaming(instance))[:300])
     first = capped.chat(model, run.messages)
     run.note("no-cost answer", first=first["first_seconds"], decode_ms=first["decode_ms"], usage=first["usage"], finish=first["finish"], text=first["text"][:60])
@@ -353,7 +366,7 @@ def lifecycle(run: Run) -> None:
     run.note("answer during the job", first=during["first_seconds"], decode_ms=during["decode_ms"], same=during["text"] == first["text"])
     # The job resumes when idle again; `Reprice` reaches the load.
     capped.log.mark()
-    settled(capped, run)
+    settled(capped, run, banked)
     time.sleep(1)
     third = capped.chat(model, run.messages)
     status = streaming(capped.instances())
@@ -374,7 +387,7 @@ def lifecycle(run: Run) -> None:
     second.model(wanted)
     instance = second.load(model)
     loaded = time.monotonic() - started
-    pricing = priced(second.log.wait("the experts are priced", 5, second.process))
+    pricing = priced(second.log.wait("the experts are priced", 5, second.process)) if banked else {}
     run.note("second load ready", seconds=round(loaded, 2), **pricing)
     answer = second.chat(model, run.messages)
     run.note("second load's answer", first=answer["first_seconds"], decode_ms=answer["decode_ms"], same=answer["text"] == first["text"])
