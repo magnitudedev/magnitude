@@ -763,8 +763,8 @@ mod tests {
             "#include <seismic/element.h>\nLIB\n",
         )
         .unwrap();
-        // packets.h includes element.h and tables.h itself; each library file
-        // is inlined once.
+        // packets.h includes element.h, slab.h and tables.h itself; each
+        // library file is inlined once.
         let asset = asset(
             &root,
             "#include <seismic/packets.h>\n#include \"common/lib.h\"\n#include <seismic/element.h>\nBODY\n",
@@ -774,7 +774,7 @@ mod tests {
             includes,
             library,
         } = expand_includes(&asset, "h", &[root.clone()]).unwrap();
-        assert_eq!(library, ["packets.h", "element.h", "tables.h"]);
+        assert_eq!(library, ["packets.h", "element.h", "slab.h", "tables.h"]);
         assert_eq!(
             includes.len(),
             1,
