@@ -5,10 +5,10 @@ same way over HTTP and recorded by its bytes and declared source build.
 
 Prompts are counted, and fixtures sized, host-only by the engine's own serving render path
 (``magnitude-harness render``, run by the runner for every GGUF engine). The engine tunes on its first load under the run's budget
-and appends its tuning trace to the run directory's ``tuning.jsonl``. Like a user's
-installation it keeps a persistent kernel cache (per model and engine binary under the
-kernel cache root, or exactly ``cache_dir``), so later launches reuse stored tuning unless
-the run tunes afresh.
+and appends its tuning trace to the run directory's ``tuning.jsonl``. It serves from the
+kernel cache ``cache_dir`` when given (`mrig bench` gives each run a fresh one, priced by the
+machine's measurement before the engine starts), so later launches of the run reuse its stored
+tuning unless the run tunes afresh.
 """
 
 import json
@@ -31,8 +31,6 @@ class Native(Adapter):
         super().__init__(*args)
         self.magnitude = self.options.magnitude
         self.launches = 0
-        #: The cache the engine is launched with; a root's is resolved by `prepare`.
-        self.kernel_cache = self.magnitude.cache_dir
 
     @property
     def drafting(self) -> str | None:
@@ -45,17 +43,13 @@ class Native(Adapter):
         binary = self.magnitude.binary
         if not binary.is_file() or not os.access(binary, os.X_OK):
             raise ValueError(f"magnitude-engine is unavailable: {binary}")
-        binary_sha256 = file_hash(binary)
-        if self.magnitude.kernel_cache_root is not None:
-            # One persistent cache per model and engine binary, kept across runs.
-            model = self.acquisition.model.replace(":", "-")
-            self.kernel_cache = self.magnitude.kernel_cache_root / model / binary_sha256[:16]
+        cache = self.magnitude.cache_dir
         self.identity = {
             "adapter": "magnitude",
             "binary": str(binary),
-            "binary_sha256": binary_sha256,
+            "binary_sha256": file_hash(binary),
             "binary_bytes": binary.stat().st_size,
-            "kernel_cache": None if self.kernel_cache is None else str(self.kernel_cache),
+            "kernel_cache": None if cache is None else str(cache),
             "drafting": self.drafting,
             "options": self.magnitude.model_dump(mode="json"),
         }
@@ -70,6 +64,10 @@ class Native(Adapter):
             response = await client.get(engine.endpoint + "/v1/memory")
             response.raise_for_status()
             return response.json()
+
+    def expert_bank(self, observation):
+        """The engine's census of its bank (`census.serving.experts`); None for a load without one."""
+        return observation["census"]["serving"]["experts"]
 
     def generation(self) -> list[str]:
         """The catalog drafter, or plain decoding when drafting is off or none is declared."""
@@ -123,7 +121,7 @@ class Native(Adapter):
             str(context),
             "--device",
             magnitude.device,
-            *(["--cache-dir", str(self.kernel_cache)] if self.kernel_cache is not None else []),
+            *(["--cache-dir", str(magnitude.cache_dir)] if magnitude.cache_dir is not None else []),
             "--output-capacity",
             str(OUTPUT_CAPACITY),
             *(
@@ -148,3 +146,11 @@ class Native(Adapter):
             raise ValueError(f"magnitude readiness context mismatch: {data}")
         if type(data.get("vocabulary")) is not int or data["vocabulary"] <= 0:
             raise ValueError(f"magnitude readiness vocabulary missing: {data}")
+        # What the load decodes with, as its resolved policy states it: the method must be the
+        # catalog drafter's the run launched (`plain` when the run drafts nothing), so a drafter
+        # the engine could not admit never measures target-only decoding as drafting. Its budget
+        # policy (adaptive, fixed) is the engine's to choose and is kept with the readiness.
+        served = data["drafting"]["method"]
+        expected = self.drafting or "plain"
+        if served != expected:
+            raise ValueError(f"magnitude serves {served!r} decoding but the run drafts with {expected!r}: {data}")

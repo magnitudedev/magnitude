@@ -94,8 +94,6 @@ def measurement_options(parser: argparse.ArgumentParser) -> None:
     magnitude.add_argument("--magnitude-device", default="auto")
     magnitude.add_argument("--magnitude-cache-dir", type=Path,
                            help="the engine's kernel cache, exactly this directory")
-    magnitude.add_argument("--magnitude-kernel-cache-root", type=Path,
-                           help="persistent per-model, per-binary kernel caches under this root")
     magnitude.add_argument("--magnitude-prefill-tokens", type=int)
     magnitude.add_argument("--magnitude-mtp-proposals", type=int)
     magnitude.add_argument("--magnitude-draft-budget",
@@ -156,7 +154,6 @@ def engine_options(args: argparse.Namespace) -> EngineOptions:
     magnitude = MagnitudeOptions(
         device=args.magnitude_device,
         cache_dir=args.magnitude_cache_dir,
-        kernel_cache_root=args.magnitude_kernel_cache_root,
         prefill_tokens=args.magnitude_prefill_tokens,
         mtp_proposals=args.magnitude_mtp_proposals,
         draft_budget=args.magnitude_draft_budget,

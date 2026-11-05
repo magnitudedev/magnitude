@@ -45,7 +45,7 @@ async def run(args):
                 magnitude=MagnitudeOptions(
                     binary=args.binary,
                     device=args.magnitude_device,
-                    kernel_cache_root=args.cache,
+                    cache_dir=args.cache,
                     tuning_seconds=10,
                 ),
             )
@@ -80,7 +80,6 @@ async def run(args):
                         extensions=adapter.extensions,
                     )
                     engine.finished(request.id)
-                    observation = adapter.verify_observation(observation)
                     store.append("observations.jsonl", observation.model_dump(mode="json"))
                     observations.append(observation)
                     print(observation.model_dump_json(), flush=True)

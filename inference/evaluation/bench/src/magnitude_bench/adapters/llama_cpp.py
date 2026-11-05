@@ -137,3 +137,10 @@ class LlamaCpp(Adapter):
             raise ValueError(
                 f"llama.cpp per-slot context is {settings.get('n_ctx')}, expected {expected}"
             )
+        # The speculative types it serves (`params["speculative.types"]`, "none" without one)
+        # must name the one the run launched, so it never measures target-only decoding as
+        # drafting.
+        served = settings.get("params", {}).get("speculative.types")
+        launched = SPECULATION[self.drafting] if self.drafting is not None else "none"
+        if served is None or launched not in served.split(","):
+            raise ValueError(f"llama.cpp serves speculative types {served!r}, the run launched {launched!r}")
