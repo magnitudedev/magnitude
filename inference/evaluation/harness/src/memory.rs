@@ -432,7 +432,16 @@ fn open_platform(backend: BackendName) -> Result<OpenedPlatform, String> {
 pub fn occupy(backend: BackendName, selected: PressureStore, deficit: u64) -> Result<(), String> {
     let target = store::Target::open(backend, selected)?;
     let before = target.snapshot()?;
-    let ceiling = target.reading()?.ceiling_bytes;
+    let reading = target.reading()?;
+    // Below the line is only the planning reserve: a deeper press would take
+    // more than the store has free, and fail as it allocates.
+    let planning = reading.thresholds.planning_bytes;
+    if deficit > planning {
+        return Err(format!(
+            "a press of {deficit} bytes is deeper than the store's planning reserve of {planning} bytes, all that is free below its line"
+        ));
+    }
+    let ceiling = reading.ceiling_bytes;
     let approach = ceiling.saturating_sub(deficit);
     let approached = target.take(approach, 0)?;
     println!("{}", json!({ "approached": approach, "ceiling": ceiling, "at": unix_seconds(),
