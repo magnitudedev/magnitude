@@ -26,6 +26,13 @@ advances to model-owned Seismic programs.**
 - Equal-shaped roles may share compiled code but retain distinct artifact resources.
 - Resident and streamed policies describe the same numerical values. Recurring
   streaming costs belong to execution; initial import belongs to preparation.
+- A row that names no table row reads zeros, whether the table is held whole or
+  streamed: a failed selection, a padding row past a batch's slots and a row
+  without a slot. -1 is the one encoding of "no row" (`gathered_row`,
+  `target.seismic`); hosts pass it for padding and it brings no row. What a row
+  reads never depends on which rows a streamed table holds, so a load seeded
+  from kept rows computes the same tokens as a cold one, even where a kernel
+  couples rows (Metal's packed projection scales a token pair together).
 
 Device-free artifact interpretation is shared by embedded callers, measurement,
 and explicit serving composition. Local MLX/Safetensors directories and GGUF files

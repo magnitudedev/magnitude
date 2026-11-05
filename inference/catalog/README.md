@@ -52,7 +52,7 @@ the executable.
 `headers` builds that bundle under `--output` (only when it is not current for this lock) and
 writes each component's exact header, extended sparsely to its file's size, to `--output/headers/`
 at `<repository>/<revision>/<path>`, with an index naming the lock. Family and assessment tests read
-that export through `MAGNITUDE_CATALOG_HEADERS` and refuse an export of another lock; the
-evaluation flow's `--catalog-headers` runs the export on the host and sets the variable. A header
+that export through `MAGNITUDE_CATALOG_HEADERS` and refuse an export of another lock; every
+cargo suite `mrig test` runs has the export of its tree's catalog and the variable set. A header
 a test needs outside the lock is a pinned artifact (`magnitude_artifacts::catalog_headers::artifacts`:
 its repository, revision and path), exported beside the catalog's the same way.

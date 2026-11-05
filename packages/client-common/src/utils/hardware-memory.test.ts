@@ -22,6 +22,7 @@ const hardware = (available: number | null = 8 * GiB, discrete = false, bothBack
 const allocation = (domain = "system", modelBytes = 3 * GiB) => Option.some(Schema.decodeUnknownSync(ModelInstanceAllocationSchema)({
   contextWindowTokens: 4096,
   memoryDomains: [{ memoryDomainId: domain, modelBytes, contextBytes: 2 * GiB, computeBytes: GiB / 2, auxiliaryBytes: GiB / 2 }],
+  promptGroupPlaces: { held: 1, capacity: 1 },
 }))
 
 describe("hardware memory breakdown", () => {

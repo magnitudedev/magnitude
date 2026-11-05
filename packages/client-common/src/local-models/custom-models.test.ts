@@ -339,7 +339,7 @@ describe("custom models in client projections", () => {
       acquisitionState: {
         _tag: "External",
         installation: { _tag: "Resolved", installedBytes: 2, primaryPath: "/m.gguf", ownership: "External" },
-        residencyState: { _tag: "Ready", allocation: { contextWindowTokens: 4096, memoryDomains: [] }, device: { deviceId: LocalInferenceDeviceIdSchema.make("cuda:0"), backend: "cuda" } },
+        residencyState: { _tag: "Ready", allocation: { contextWindowTokens: 4096, memoryDomains: [], promptGroupPlaces: { held: 1, capacity: 1 }, streaming: Option.none() }, device: { deviceId: LocalInferenceDeviceIdSchema.make("cuda:0"), backend: "cuda" } },
       },
     })
     const state: LocalModelsState = {

@@ -22,6 +22,9 @@ import {
   ModelOptimizationProgressSchema,
   ModelResidencySchema,
   ModelStoppingAllocationSchema,
+  ModelStreamingStatusSchema,
+  StreamingHostStatusSchema,
+  StreamingTierStatusSchema,
 } from "@magnitudedev/sdk"
 import { Schema, Struct } from "effect"
 
@@ -55,9 +58,15 @@ export const LocalModelAssessmentJsonSchema = Schema.Union(FitsJsonSchema, DoesN
 
 const LoadDeviceJsonSchema = Schema.Struct(Struct.omit(ModelLoadDeviceSchema.fields, "deviceId"))
 const LoadPlanJsonSchema = Schema.Struct({ ...ModelLoadPlanSchema.fields, device: LoadDeviceJsonSchema })
+const StreamingJsonSchema = Schema.Struct({
+  ...ModelStreamingStatusSchema.fields,
+  tiers: Schema.Array(Schema.Struct(Struct.omit(StreamingTierStatusSchema.fields, "memoryDomainId"))),
+  host: optional(Schema.Struct(Struct.omit(StreamingHostStatusSchema.fields, "memoryDomainId"))),
+})
 const AllocationJsonSchema = Schema.Struct({
   ...ModelInstanceAllocationSchema.fields,
   memoryDomains: Schema.Array(Schema.Struct(Struct.omit(ModelInstanceAllocationSchema.fields.memoryDomains.value.fields, "memoryDomainId"))),
+  streaming: optional(StreamingJsonSchema),
 })
 
 const [stoppingPlanned, stoppingResident] = ModelStoppingAllocationSchema.members

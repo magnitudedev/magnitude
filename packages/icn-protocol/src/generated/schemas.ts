@@ -883,6 +883,10 @@ export const ChunkToolCall = S.Struct({
 export type ChunkToolCall = S.Schema.Type<typeof ChunkToolCall>
 export type ChunkToolCallEncoded = S.Schema.Encoded<typeof ChunkToolCall>
 
+export const ColdExperts = S.Union(S.Literal("disk"), S.Literal("host_ram"))
+export type ColdExperts = S.Schema.Type<typeof ColdExperts>
+export type ColdExpertsEncoded = S.Schema.Encoded<typeof ColdExperts>
+
 export const CompletionFunctionCall = S.Struct({
   arguments: S.String,
   name: S.String,
@@ -1622,6 +1626,7 @@ export const HardwareReportedBy = S.Union(
   S.Literal("windows_total_phys"),
   S.Literal("linux_mem_available"),
   S.Literal("mach_movable_pages"),
+  S.Literal("mach_allocatable_pages"),
   S.Literal("windows_physical_and_commit"),
   S.Literal("cpu_address_space"),
   S.Literal("metal_max_buffer_length"),
@@ -2171,9 +2176,9 @@ export const ModelAssessment = S.Union(
       assessmentId: S.suspend((): S.Schema<ModelAssessmentId, ModelAssessmentIdEncoded> => ModelAssessmentId),
       drafter: S.suspend((): S.Schema<DrafterVerdict, DrafterVerdictEncoded> => DrafterVerdict),
       memory: S.Array(S.suspend((): S.Schema<MemoryAssessment, MemoryAssessmentEncoded> => MemoryAssessment)),
-      performance: S.suspend((): S.Schema<ModelPerformance, ModelPerformanceEncoded> => ModelPerformance),
       profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
       projector: S.suspend((): S.Schema<ProjectorVerdict, ProjectorVerdictEncoded> => ProjectorVerdict),
+      residency: S.suspend((): S.Schema<ModelResidency, ModelResidencyEncoded> => ModelResidency),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
@@ -2509,6 +2514,11 @@ export const ModelInstanceAllocation = S.Struct({
   memoryDomains: S.Array(
     S.suspend((): S.Schema<ModelInstanceMemoryDomain, ModelInstanceMemoryDomainEncoded> => ModelInstanceMemoryDomain),
   ),
+  promptGroupPlaces: S.suspend((): S.Schema<PromptGroupPlaces, PromptGroupPlacesEncoded> => PromptGroupPlaces),
+  streaming: S.optionalWith(
+    S.suspend((): S.Schema<ModelStreamingStatus, ModelStreamingStatusEncoded> => ModelStreamingStatus),
+    { exact: true, as: "Option" },
+  ),
 })
 export type ModelInstanceAllocation = S.Schema.Type<typeof ModelInstanceAllocation>
 export type ModelInstanceAllocationEncoded = S.Schema.Encoded<typeof ModelInstanceAllocation>
@@ -2783,6 +2793,29 @@ export const ModelReleaseReason = S.Union(
 export type ModelReleaseReason = S.Schema.Type<typeof ModelReleaseReason>
 export type ModelReleaseReasonEncoded = S.Schema.Encoded<typeof ModelReleaseReason>
 
+export const ModelResidency = S.Union(
+  S.extend(
+    S.TaggedStruct("Resident", {
+      performance: S.suspend((): S.Schema<ModelPerformance, ModelPerformanceEncoded> => ModelPerformance),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Streamed", {
+      bank: S.suspend((): S.Schema<StreamedBank, StreamedBankEncoded> => StreamedBank),
+      floorPerformance: S.suspend(
+        (): S.Schema<StreamedModelPerformance, StreamedModelPerformanceEncoded> => StreamedModelPerformance,
+      ),
+      performance: S.suspend(
+        (): S.Schema<StreamedModelPerformance, StreamedModelPerformanceEncoded> => StreamedModelPerformance,
+      ),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ModelResidency = S.Schema.Type<typeof ModelResidency>
+export type ModelResidencyEncoded = S.Schema.Encoded<typeof ModelResidency>
+
 export const ModelRoot = S.Struct({
   enabled: S.Boolean,
   kind: S.suspend((): S.Schema<ModelRootKind, ModelRootKindEncoded> => ModelRootKind),
@@ -2822,6 +2855,26 @@ export const ModelStoppingAllocation = S.Union(
 )
 export type ModelStoppingAllocation = S.Schema.Type<typeof ModelStoppingAllocation>
 export type ModelStoppingAllocationEncoded = S.Schema.Encoded<typeof ModelStoppingAllocation>
+
+export const ModelStreamingStatus = S.Struct({
+  ceilingSlots: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  diskBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  experts: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+  floorSlots: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  host: S.optionalWith(
+    S.suspend((): S.Schema<StreamingHostStatus, StreamingHostStatusEncoded> => StreamingHostStatus),
+    { exact: true, as: "Option" },
+  ),
+  lastResize: S.optionalWith(
+    S.suspend((): S.Schema<StreamingResize, StreamingResizeEncoded> => StreamingResize),
+    { exact: true, as: "Option" },
+  ),
+  slots: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  tables: S.Array(S.suspend((): S.Schema<StreamingTableStatus, StreamingTableStatusEncoded> => StreamingTableStatus)),
+  tiers: S.Array(S.suspend((): S.Schema<StreamingTierStatus, StreamingTierStatusEncoded> => StreamingTierStatus)),
+})
+export type ModelStreamingStatus = S.Schema.Type<typeof ModelStreamingStatus>
+export type ModelStreamingStatusEncoded = S.Schema.Encoded<typeof ModelStreamingStatus>
 
 export const NamedFunctionCallRequest = S.Struct({
   arguments: S.String,
@@ -2931,6 +2984,13 @@ export const ProjectorVerdict = S.Union(
 )
 export type ProjectorVerdict = S.Schema.Type<typeof ProjectorVerdict>
 export type ProjectorVerdictEncoded = S.Schema.Encoded<typeof ProjectorVerdict>
+
+export const PromptGroupPlaces = S.Struct({
+  capacity: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+  held: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+})
+export type PromptGroupPlaces = S.Schema.Type<typeof PromptGroupPlaces>
+export type PromptGroupPlacesEncoded = S.Schema.Encoded<typeof PromptGroupPlaces>
 
 export const PromptTokensDetails = S.Struct({
   cached_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -3614,6 +3674,93 @@ export type StartModelDownloadResponseEncoded = S.Schema.Encoded<typeof StartMod
 export const StopRequest = S.Union(S.String, S.Array(S.String))
 export type StopRequest = S.Schema.Type<typeof StopRequest>
 export type StopRequestEncoded = S.Schema.Encoded<typeof StopRequest>
+
+export const StreamedBank = S.Struct({
+  coldExperts: S.suspend((): S.Schema<ColdExperts, ColdExpertsEncoded> => ColdExperts),
+  experts: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+  floorSlots: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  slots: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type StreamedBank = S.Schema.Type<typeof StreamedBank>
+export type StreamedBankEncoded = S.Schema.Encoded<typeof StreamedBank>
+
+export const StreamedModelPerformance = S.Union(
+  S.extend(S.TaggedStruct("Pending", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Unavailable", {
+      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(S.TaggedStruct("Unmeasured", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Estimated", {
+      samples: S.Array(S.suspend((): S.Schema<PerformanceEvidence, PerformanceEvidenceEncoded> => PerformanceEvidence)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type StreamedModelPerformance = S.Schema.Type<typeof StreamedModelPerformance>
+export type StreamedModelPerformanceEncoded = S.Schema.Encoded<typeof StreamedModelPerformance>
+
+export const StreamingHostStatus = S.Struct({
+  bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  ceilingSlots: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+  lastResize: S.optionalWith(
+    S.suspend((): S.Schema<StreamingResize, StreamingResizeEncoded> => StreamingResize),
+    { exact: true, as: "Option" },
+  ),
+  memoryDomainId: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
+  slots: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type StreamingHostStatus = S.Schema.Type<typeof StreamingHostStatus>
+export type StreamingHostStatusEncoded = S.Schema.Encoded<typeof StreamingHostStatus>
+
+export const StreamingResize = S.Union(
+  S.extend(
+    S.TaggedStruct("Shrank", {
+      atUnixMs: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      by: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+      cause: S.suspend((): S.Schema<StreamingShrinkCause, StreamingShrinkCauseEncoded> => StreamingShrinkCause),
+      to: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Grew", {
+      atUnixMs: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      by: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+      from: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type StreamingResize = S.Schema.Type<typeof StreamingResize>
+export type StreamingResizeEncoded = S.Schema.Encoded<typeof StreamingResize>
+
+export const StreamingShrinkCause = S.Union(S.Literal("reclaim"), S.Literal("live_claim"), S.Literal("measurement"))
+export type StreamingShrinkCause = S.Schema.Type<typeof StreamingShrinkCause>
+export type StreamingShrinkCauseEncoded = S.Schema.Encoded<typeof StreamingShrinkCause>
+
+export const StreamingTableStatus = S.Struct({
+  bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  ceilingRecords: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+  floorRecords: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  lastResize: S.optionalWith(
+    S.suspend((): S.Schema<StreamingResize, StreamingResizeEncoded> => StreamingResize),
+    { exact: true, as: "Option" },
+  ),
+  records: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type StreamingTableStatus = S.Schema.Type<typeof StreamingTableStatus>
+export type StreamingTableStatusEncoded = S.Schema.Encoded<typeof StreamingTableStatus>
+
+export const StreamingTierStatus = S.Struct({
+  bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  memoryDomainId: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
+})
+export type StreamingTierStatus = S.Schema.Type<typeof StreamingTierStatus>
+export type StreamingTierStatusEncoded = S.Schema.Encoded<typeof StreamingTierStatus>
 
 export const StreamOptions = S.Struct({
   include_usage: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),

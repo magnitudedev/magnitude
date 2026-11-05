@@ -4483,6 +4483,14 @@
         },
         "additionalProperties": false
       },
+      "ColdExperts": {
+        "type": "string",
+        "description": "Where a streamed fit keeps the experts its bank lacks.",
+        "enum": [
+          "disk",
+          "host_ram"
+        ]
+      },
       "CompletionFunctionCall": {
         "type": "object",
         "required": [
@@ -6283,6 +6291,7 @@
           "windows_total_phys",
           "linux_mem_available",
           "mach_movable_pages",
+          "mach_allocatable_pages",
           "windows_physical_and_commit",
           "cpu_address_space",
           "metal_max_buffer_length",
@@ -7490,7 +7499,7 @@
             }
           }
         ],
-        "description": "The state of the measurement job, which measures this machine's selected executor in a\nworker process of its own, only while no model is loaded, loading or being optimized, so that\nspeed estimates can be made. It moves from `Unmeasured` to `Measuring`, then to `Measured`, or\nto `Failed` and back to `Measuring` at its retry, or back to `Unmeasured` when a load\npreempts the job."
+        "description": "The state of the measurement job, which measures this machine's selected executor in a\nworker process of its own, so that speed estimates can be made. It runs while no model is\nloading or being optimized, and while no request holds a loaded model, beside which it runs\nonce that model has made room for it. It moves from `Unmeasured` to `Measuring`, then to\n`Measured`, or to `Failed` and back to `Measuring` at its retry, or back to `Unmeasured` when\na load or a request preempts the job."
       },
       "MemoryAssessment": {
         "type": "object",
@@ -7752,12 +7761,12 @@
         "oneOf": [
           {
             "type": "object",
-            "description": "A fitting model, with its decode-speed estimates.",
+            "description": "A fitting model, how it holds its weights, and its decode-speed estimates held that way.",
             "required": [
               "profile",
               "assessmentId",
               "memory",
-              "performance",
+              "residency",
               "projector",
               "drafter",
               "_tag"
@@ -7775,8 +7784,8 @@
                   "$ref": "#/components/schemas/MemoryAssessment"
                 }
               },
-              "performance": {
-                "$ref": "#/components/schemas/ModelPerformance"
+              "residency": {
+                "$ref": "#/components/schemas/ModelResidency"
               },
               "projector": {
                 "$ref": "#/components/schemas/ProjectorVerdict"
@@ -8640,7 +8649,8 @@
         "type": "object",
         "required": [
           "contextWindowTokens",
-          "memoryDomains"
+          "memoryDomains",
+          "promptGroupPlaces"
         ],
         "properties": {
           "contextWindowTokens": {
@@ -8654,6 +8664,14 @@
               "$ref": "#/components/schemas/ModelInstanceMemoryDomain"
             },
             "description": "The engine heap's observed standing per memory domain at the last observation. Memory is\nelastic, so this is not a fixed reservation."
+          },
+          "promptGroupPlaces": {
+            "$ref": "#/components/schemas/PromptGroupPlaces",
+            "description": "The places granted to the load's prompt groups at the last observation."
+          },
+          "streaming": {
+            "$ref": "#/components/schemas/ModelStreamingStatus",
+            "description": "Where an elastic expert bank's experts are; absent for a load without one."
           }
         },
         "additionalProperties": false
@@ -9301,7 +9319,7 @@
             }
           }
         ],
-        "description": "A fitting model's speed estimates."
+        "description": "A fitting model's speed estimates from this machine's measurements."
       },
       "ModelReasoningCapabilities": {
         "type": "object",
@@ -9341,6 +9359,57 @@
           "memory_pressure",
           "failure"
         ]
+      },
+      "ModelResidency": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Every weight in memory.",
+            "required": [
+              "performance",
+              "_tag"
+            ],
+            "properties": {
+              "performance": {
+                "$ref": "#/components/schemas/ModelPerformance"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Resident"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The routed experts streamed through an expert bank (`bank`). `performance` is at the\nbank's slots; `floor_performance` is at its floor.",
+            "required": [
+              "bank",
+              "performance",
+              "floorPerformance",
+              "_tag"
+            ],
+            "properties": {
+              "bank": {
+                "$ref": "#/components/schemas/StreamedBank"
+              },
+              "performance": {
+                "$ref": "#/components/schemas/StreamedModelPerformance"
+              },
+              "floorPerformance": {
+                "$ref": "#/components/schemas/StreamedModelPerformance"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Streamed"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "How a fitting model holds its weights, and its decode speed held that way."
       },
       "ModelRoot": {
         "type": "object",
@@ -9411,6 +9480,71 @@
             }
           }
         ]
+      },
+      "ModelStreamingStatus": {
+        "type": "object",
+        "description": "Where an elastic expert bank's routed experts are at the last observation: the experts of\neach routed layer it holds (its slots), between the floor it never shrinks below and the\nceiling it never grows past, at most every expert; its bytes in each memory domain; the\nhost-RAM tier holding cold experts beside it; the bytes of the experts in neither, read\nfrom the model file on demand; the stored tables it holds; and its experts' last resize.",
+        "required": [
+          "experts",
+          "slots",
+          "floorSlots",
+          "ceilingSlots",
+          "tiers",
+          "diskBytes",
+          "tables"
+        ],
+        "properties": {
+          "experts": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Each routed layer's experts.",
+            "minimum": 1
+          },
+          "slots": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "floorSlots": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "ceilingSlots": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "tiers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StreamingTierStatus"
+            },
+            "description": "The memory domains holding the bank, device memory first."
+          },
+          "host": {
+            "$ref": "#/components/schemas/StreamingHostStatus",
+            "description": "The host-RAM tier a discrete device's bank keeps its cold experts in,\nexclusive of the bank; absent on unified memory."
+          },
+          "diskBytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The experts in neither the bank nor the host tier, as the model file\nstores them.",
+            "minimum": 0
+          },
+          "tables": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StreamingTableStatus"
+            },
+            "description": "The stored tables (n-gram tables) the bank holds beside its experts."
+          },
+          "lastResize": {
+            "$ref": "#/components/schemas/StreamingResize",
+            "description": "The experts' last resize; absent before their first."
+          }
+        },
+        "additionalProperties": false
       },
       "NamedFunctionCallRequest": {
         "type": "object",
@@ -9661,6 +9795,27 @@
           }
         ],
         "description": "Whether the engine binds a model's projector. `None` means the model has no projector; a\n`Rejected` projector leaves the model assessed and served without it, taking text input only."
+      },
+      "PromptGroupPlaces": {
+        "type": "object",
+        "description": "The places a prompt group holds now, of the most it may take: each place runs one chunk of\na prompt in the group's pass. It holds at most its capacity.",
+        "required": [
+          "held",
+          "capacity"
+        ],
+        "properties": {
+          "held": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "capacity": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
       },
       "PromptTokensDetails": {
         "type": "object",
@@ -11223,6 +11378,281 @@
         "properties": {
           "include_usage": {
             "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "StreamedBank": {
+        "type": "object",
+        "description": "A streamed fit's expert bank: of each routed layer's `experts`, at least `floorSlots` in\nmemory, growing to `slots` where this machine's memory allows, fewer than every expert; and\nwhere the experts it lacks are kept (`coldExperts`).",
+        "required": [
+          "experts",
+          "slots",
+          "floorSlots",
+          "coldExperts"
+        ],
+        "properties": {
+          "experts": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "slots": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "floorSlots": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "coldExperts": {
+            "$ref": "#/components/schemas/ColdExperts"
+          }
+        },
+        "additionalProperties": false
+      },
+      "StreamedModelPerformance": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Pending"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "failure",
+              "_tag"
+            ],
+            "properties": {
+              "failure": {
+                "$ref": "#/components/schemas/ModelFailure"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Unavailable"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Unmeasured"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "samples",
+              "_tag"
+            ],
+            "properties": {
+              "samples": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/PerformanceEvidence"
+                }
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Estimated"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A streamed fit's speed estimates: a [`ModelPerformance`], or unmeasured before the model's\nfirst streamed load, while the record of which experts its routing misses on this machine,\nwhich the estimate is computed from, does not exist yet."
+      },
+      "StreamingHostStatus": {
+        "type": "object",
+        "description": "A discrete device's host-RAM tier, in its memory domain: its host slots now (each an expert\nof every streamed layer) up to its ceiling, the host memory its records take, and its last\nresize.",
+        "required": [
+          "memoryDomainId",
+          "slots",
+          "ceilingSlots",
+          "bytes"
+        ],
+        "properties": {
+          "memoryDomainId": {
+            "$ref": "#/components/schemas/MemoryDomainId"
+          },
+          "slots": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "ceilingSlots": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "lastResize": {
+            "$ref": "#/components/schemas/StreamingResize",
+            "description": "Absent before the tier's first resize."
+          }
+        },
+        "additionalProperties": false
+      },
+      "StreamingResize": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "cause",
+              "to",
+              "by",
+              "atUnixMs",
+              "_tag"
+            ],
+            "properties": {
+              "cause": {
+                "$ref": "#/components/schemas/StreamingShrinkCause"
+              },
+              "to": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "by": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 1
+              },
+              "atUnixMs": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Shrank"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "from",
+              "by",
+              "atUnixMs",
+              "_tag"
+            ],
+            "properties": {
+              "from": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "by": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 1
+              },
+              "atUnixMs": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Grew"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A holding's finished resize, in its units (slots, records or host slots), at `atUnixMs`\n(milliseconds since the Unix epoch): shrunk by `by` to `to`, for its cause, or grown by `by`\nfrom `from` into free memory. Each changes its size by at least one."
+      },
+      "StreamingShrinkCause": {
+        "type": "string",
+        "description": "Why the engine shrank an expert bank's holding.",
+        "enum": [
+          "reclaim",
+          "live_claim",
+          "measurement"
+        ]
+      },
+      "StreamingTableStatus": {
+        "type": "object",
+        "description": "A stored table an expert bank holds: the records its slots use now, between the floor and\nceiling it resizes within; the bytes they hold; and its last resize.",
+        "required": [
+          "records",
+          "floorRecords",
+          "ceilingRecords",
+          "bytes"
+        ],
+        "properties": {
+          "records": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "floorRecords": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "ceilingRecords": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "lastResize": {
+            "$ref": "#/components/schemas/StreamingResize",
+            "description": "Absent before the table's first resize."
+          }
+        },
+        "additionalProperties": false
+      },
+      "StreamingTierStatus": {
+        "type": "object",
+        "required": [
+          "memoryDomainId",
+          "bytes"
+        ],
+        "properties": {
+          "memoryDomainId": {
+            "$ref": "#/components/schemas/MemoryDomainId"
+          },
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         },
         "additionalProperties": false

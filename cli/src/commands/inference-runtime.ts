@@ -7,8 +7,12 @@ import {
   formatStorageSize,
   LOCAL_MODEL_RANKING_SCALE_LABELS,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
+  localModelAllocation,
+  localModelExpertFacts,
+  localModelFitFacts,
   localModelIsInstalled,
   localModelRadarAxes,
+  modelServingFacts,
   rankedLocalModelOptions,
   targetPhysicalMemoryBytes,
 } from "@magnitudedev/client-common"
@@ -216,13 +220,15 @@ export const parseLimit = (input: string, maximum = Number.MAX_SAFE_INTEGER) => 
       }))
 }
 
-const renderRecommendation = (model: CatalogLocalModel, index: number): string => {
+const renderRecommendation = (hardware: LocalInferenceHardware) => (model: CatalogLocalModel, index: number): string => {
   const capabilities = capabilityLabels(model)
+  const expertFields = localModelExpertFacts(model, Option.some(hardware))
   return [
     `${index + 1}. ${labeledModelName(model)}`,
     `   ID: ${model.modelId}`,
     `   ${speedLabel(model)} - ${modelMemory(model)} memory - ${modelContext(model)} context`,
     `   Intelligence ${model.catalogData.intelligence}% - Fidelity ${radarDetail(model, "FIDELITY")} - Acceleration ${accelerationLabel(model)}`,
+    ...(expertFields.length > 0 ? [`   ${expertFields.map(([label, value]) => `${label} ${value}`).join(" - ")}`] : []),
     ...(capabilities.length > 0 ? [`   ${capabilities.join(", ")}`] : []),
   ].join("\n")
 }
@@ -290,7 +296,7 @@ export function renderRecommendations({
     `Local model recommendations - ${preference.label}`,
     `${system} - ${formatMemorySize(hardware.totalSystemMemoryBytes)}`,
     "",
-    ranked.map(renderRecommendation).join("\n\n"),
+    ranked.map(renderRecommendation(hardware)).join("\n\n"),
     ...(notice.length > 0 ? ["", ...notice] : []),
     "",
     "Learn more: magnitude docs recommendations",
@@ -348,6 +354,7 @@ export const renderCatalogDetail = ({ model, models }: CatalogDetailView): strin
     return ["Performance on this machine", renderFields([
       ["Speed", speedLabel(model)],
       ["Fit", radarDetail(model, "FIT")],
+      ...localModelFitFacts(model),
       ["Intelligence", `${model.catalogData.intelligence}%`],
       ["Fidelity", radarDetail(model, "FIDELITY")],
       ["Acceleration", accelerationLabel(model)],
@@ -382,15 +389,6 @@ export const showCatalogModel = (modelInput: string, options: JsonOption = {}) =
   json: asJson(options, catalogDetailJson),
 })
 
-const residentAllocation = (model: LocalModel) => {
-  const residency = residencyState(model)
-  if (residency?._tag === "Ready") return Option.some(residency.allocation)
-  if (residency?._tag === "Stopping" && residency.allocation._tag === "Resident") {
-    return Option.some(residency.allocation.allocation)
-  }
-  return Option.none()
-}
-
 const activePlan = (model: LocalModel) => {
   const residency = residencyState(model)
   if (residency?._tag === "Loading") return residency.plannedAllocation
@@ -413,7 +411,7 @@ const currentModel = (models: readonly LocalModel[]) => models.find((model) => {
 export const renderHardware = ({ hardware, models }: HardwareView): string => {
   const presentation = describeLocalHardware(hardware)
   const current = currentModel(models)
-  const allocation = current === undefined ? Option.none() : residentAllocation(current)
+  const allocation = current === undefined ? Option.none() : localModelAllocation(current)
   const plan = current === undefined ? Option.none() : activePlan(current)
   const memory = deriveHardwareMemoryView(hardware, allocation)
   const sections = [
@@ -445,6 +443,8 @@ export const renderHardware = ({ hardware, models }: HardwareView): string => {
           onSome: (value) => [`  Context ${formatContext(value.contextWindowTokens)} - Device ${formatLocalInferenceBackend(value.device.backend)}`],
         }),
       }),
+      ...Option.match(allocation, { onNone: () => [], onSome: (value) => modelServingFacts(value, Option.some(hardware)) })
+        .map(([label, value]) => `  ${label}: ${value}`),
     ]),
   ]
   return ensureTrailingNewline(sections.join("\n"))

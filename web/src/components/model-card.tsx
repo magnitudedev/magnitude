@@ -4,7 +4,7 @@ import { Menu } from "@base-ui/react/menu"
 import { ArrowClockwiseIcon, ArrowUpRightIcon, CaretDownIcon, DotsThreeVerticalIcon, DownloadSimpleIcon, EyeSlashIcon, LightningIcon, MagnifyingGlassIcon, PlayIcon, PlusIcon, SquareIcon, TrashIcon, XIcon } from "@phosphor-icons/react"
 import {
   catalogComponentName, catalogComponentOffers, catalogModelReplacement, customModelDrafterOffer,
-  formatLocalModelDisplayName, formatMemorySize, formatStorageSize, localModelFacts,
+  formatLocalModelDisplayName, formatMemorySize, formatStorageSize, localModelExpertFacts, localModelFacts,
   localModelIsInstalled, localModelMemoryUse, MODEL_STOPPED_FOR_MEMORY_MESSAGE, modelStoppedForMemory, PENDING_DRAFTER_LABEL, removalKind,
   useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus,
 } from "@magnitudedev/client-common"
@@ -15,6 +15,7 @@ import { ConfirmDialog } from "./confirm-dialog"
 import { ErrorNotice, NoticeAction } from "./error-notice"
 import { HuggingFaceLogo, ModelLogo } from "./model-logo"
 import { QuantizationAwareInfo, SpeedInfo } from "./discovery-visuals"
+import { ModelFacts } from "./model-facts"
 import { DrafterPickerDialog } from "./drafter-list"
 import { customModelSource } from "./custom-model-details"
 import { removalConfirmation } from "./model-remove-action"
@@ -232,6 +233,8 @@ export function ModelCard({ model, models, page, replacing, hardware, onFindOthe
         {Option.match(facts.intelligence, { onNone: () => <span className="truncate text-slate-500">Intelligence not rated</span>, onSome: score => <span className="truncate"><span className="tabular-nums">{score}%</span> <span className="text-slate-500">intelligence</span></span> })}
       </StripCell>
     </dl>
+    <ModelFacts facts={localModelExpertFacts(model, hardware)} label="Expert streaming"
+      className="grid grid-cols-1 gap-3 border-t border-slate-200 px-5 py-2.5 md:grid-cols-3 dark:border-slate-750" />
     <div className="px-5 pb-4 empty:hidden">{notices}</div>
     {replacing && <ConfirmDialog open={confirmingLoad} onOpenChange={setConfirmingLoad} title={`Load ${name}?`}
       description={`Loading ${name} will stop ${replacing}.`} confirmLabel="Load model" onConfirm={() => load(model.modelId)} />}

@@ -1,5 +1,6 @@
-import type { LocalModel, MagnitudeClient, ModelCatalogState } from "@magnitudedev/sdk"
-import { Context, Effect, type Scope } from "effect"
+import { localModelNamesMemory } from "@magnitudedev/client-common"
+import type { LocalInferenceHardware, LocalModel, MagnitudeClient, ModelCatalogState } from "@magnitudedev/sdk"
+import { Context, Effect, Option, type Scope } from "effect"
 import { existingAcnConnection } from "../server/acn-connection"
 
 export type CliModelsClient = Pick<MagnitudeClient, "models" | "huggingFace">
@@ -19,6 +20,14 @@ export const withClient = <A>(use: (client: CliModelsClient) => Effect.Effect<A,
 
 export const readCatalog = (client: CliModelsClient) => client.models.getCatalog({})
 export const readHardware = (client: CliModelsClient) => client.models.getLocalEnvironment({})
+
+/** The hardware a model's facts name its memory by; read only for a model whose facts do. */
+export const readHardwareNaming = (
+  client: CliModelsClient,
+  model: LocalModel,
+): Effect.Effect<Option.Option<LocalInferenceHardware>, unknown> => localModelNamesMemory(model)
+  ? Effect.map(readHardware(client), Option.some)
+  : Effect.succeed(Option.none())
 
 /** Every local product the catalog lists: catalog models and visible custom models. */
 export const catalogProducts = (catalog: ModelCatalogState): readonly LocalModel[] =>

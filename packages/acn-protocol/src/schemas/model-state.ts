@@ -135,6 +135,95 @@ export const ModelLoadPlanSchema = Schema.Struct({
 })
 export type ModelLoadPlan = typeof ModelLoadPlanSchema.Type
 
+/** A memory domain holding an expert bank, and the bank's bytes there. */
+export const StreamingTierStatusSchema = Schema.Struct({
+  memoryDomainId: LocalInferenceMemoryDomainIdSchema,
+  bytes: NonNegativeSafeInteger,
+})
+export type StreamingTierStatus = typeof StreamingTierStatusSchema.Type
+
+/**
+ * Why the engine shrank an expert bank's holding: memory pressure, a live claim, or room for
+ * measuring this machine while the model was idle.
+ */
+export const StreamingShrinkCauseSchema = Schema.Literal("reclaim", "live_claim", "measurement")
+export type StreamingShrinkCause = typeof StreamingShrinkCauseSchema.Type
+
+/**
+ * A holding's finished resize, in its units (slots, records or host slots), at `atUnixMs` (Unix
+ * epoch milliseconds): shrunk by `by` to `to` for its cause, or grown by `by` from `from` into free
+ * memory. The service's contract owns its shape: each changes its size by at least one.
+ */
+export const StreamingResizeSchema = Schema.Union(
+  Schema.TaggedStruct("Shrank", {
+    cause: StreamingShrinkCauseSchema,
+    to: NonNegativeSafeInteger,
+    by: PositiveSafeInteger,
+    atUnixMs: NonNegativeSafeInteger,
+  }),
+  Schema.TaggedStruct("Grew", {
+    from: NonNegativeSafeInteger,
+    by: PositiveSafeInteger,
+    atUnixMs: NonNegativeSafeInteger,
+  }),
+)
+export type StreamingResize = typeof StreamingResizeSchema.Type
+
+/**
+ * A stored table (an n-gram table) an expert bank holds beside its experts: the records its slots
+ * use now, between the floor and ceiling it resizes within (bounds the service's contract owns);
+ * their bytes; and its last resize.
+ */
+export const StreamingTableStatusSchema = Schema.Struct({
+  records: NonNegativeSafeInteger,
+  floorRecords: NonNegativeSafeInteger,
+  ceilingRecords: PositiveSafeInteger,
+  bytes: NonNegativeSafeInteger,
+  lastResize: Schema.optionalWith(StreamingResizeSchema, { as: "Option", exact: true }),
+})
+export type StreamingTableStatus = typeof StreamingTableStatusSchema.Type
+
+/**
+ * A discrete device's host-RAM tier in its memory domain, holding cold experts exclusive of the
+ * bank: its host slots now (each an expert of every streamed layer) up to its ceiling, the host
+ * memory its records take, and its last resize.
+ */
+export const StreamingHostStatusSchema = Schema.Struct({
+  memoryDomainId: LocalInferenceMemoryDomainIdSchema,
+  slots: NonNegativeSafeInteger,
+  ceilingSlots: PositiveSafeInteger,
+  bytes: NonNegativeSafeInteger,
+  lastResize: Schema.optionalWith(StreamingResizeSchema, { as: "Option", exact: true }),
+})
+export type StreamingHostStatus = typeof StreamingHostStatusSchema.Type
+
+/**
+ * Where an elastic expert bank's routed experts are: the experts of each routed layer it holds
+ * (its slots), between its floor and its ceiling, at most every expert (bounds the service's
+ * contract owns); its bytes in each memory domain (device memory first); on a discrete device, the
+ * host-RAM tier holding cold experts it does not; the bytes of the experts in neither, read from
+ * disk on demand; the stored tables it holds beside them; and its experts' last resize.
+ */
+export const ModelStreamingStatusSchema = Schema.Struct({
+  experts: PositiveSafeInteger,
+  slots: NonNegativeSafeInteger,
+  floorSlots: NonNegativeSafeInteger,
+  ceilingSlots: NonNegativeSafeInteger,
+  tiers: Schema.Array(StreamingTierStatusSchema),
+  host: Schema.optionalWith(StreamingHostStatusSchema, { as: "Option", exact: true }),
+  diskBytes: NonNegativeSafeInteger,
+  tables: Schema.Array(StreamingTableStatusSchema),
+  lastResize: Schema.optionalWith(StreamingResizeSchema, { as: "Option", exact: true }),
+})
+export type ModelStreamingStatus = typeof ModelStreamingStatusSchema.Type
+
+/** The places granted to a load's prompt groups now, at most the most they may take. */
+export const PromptGroupPlacesSchema = Schema.Struct({
+  held: PositiveSafeInteger,
+  capacity: PositiveSafeInteger,
+})
+export type PromptGroupPlaces = typeof PromptGroupPlacesSchema.Type
+
 export const ModelInstanceAllocationSchema = Schema.Struct({
   contextWindowTokens: PositiveSafeInteger,
   memoryDomains: Schema.Array(Schema.Struct({
@@ -144,6 +233,9 @@ export const ModelInstanceAllocationSchema = Schema.Struct({
     computeBytes: NonNegativeSafeInteger,
     auxiliaryBytes: NonNegativeSafeInteger,
   })),
+  promptGroupPlaces: PromptGroupPlacesSchema,
+  /** Absent for a load without an elastic expert bank. */
+  streaming: Schema.optionalWith(ModelStreamingStatusSchema, { as: "Option", exact: true }),
 })
 export type ModelInstanceAllocation = typeof ModelInstanceAllocationSchema.Type
 
@@ -479,6 +571,16 @@ export const LocalModelPerformanceSchema = Schema.Union(
 )
 export type LocalModelPerformance = typeof LocalModelPerformanceSchema.Type
 
+/**
+ * A streamed fit's decode speed: a fit's speed, or unmeasured before the model's first streamed
+ * load has recorded which experts its routing misses.
+ */
+export const LocalModelStreamedPerformanceSchema = Schema.Union(
+  ...LocalModelPerformanceSchema.members,
+  Schema.TaggedStruct("Unmeasured", {}),
+)
+export type LocalModelStreamedPerformance = typeof LocalModelStreamedPerformanceSchema.Type
+
 export const localModelPerformanceContexts = (contextLength: number): readonly number[] => [...new Set([
   ...[25_000, 50_000, 75_000].filter((value) => value <= contextLength),
   contextLength,
@@ -759,13 +861,49 @@ export const LocalModelMemorySchema = Schema.Struct({
 }, { message: () => "local model memory totals and domains must agree with their evidence" }))
 export type LocalModelMemory = typeof LocalModelMemorySchema.Type
 
-/** A fitting model, with its decode speed. */
+/**
+ * Where a streamed fit keeps the experts its bank lacks: read from the model file (unified
+ * memory), or in a host-RAM tier as host memory lets it grow, the rest read from the file (a
+ * discrete device).
+ */
+export const ColdExpertsSchema = Schema.Literal("disk", "host_ram")
+export type ColdExperts = typeof ColdExpertsSchema.Type
+
+/**
+ * A streamed fit's expert bank: of each routed layer's `experts`, at least `floorSlots` in memory,
+ * growing to `slots` where this machine's memory allows, fewer than every expert (bounds the
+ * service's contract owns); and where the experts it lacks are kept.
+ */
+export const StreamedBankSchema = Schema.Struct({
+  experts: PositiveSafeInteger,
+  slots: NonNegativeSafeInteger,
+  floorSlots: NonNegativeSafeInteger,
+  coldExperts: ColdExpertsSchema,
+})
+export type StreamedBank = typeof StreamedBankSchema.Type
+
+/**
+ * How a fitting model holds its weights, and its decode speed held that way: every weight
+ * resident, or its routed experts streamed through an expert bank; `performance` is its speed at
+ * the bank's slots, `floorPerformance` at its floor.
+ */
+export const LocalModelFitResidencySchema = Schema.Union(
+  Schema.TaggedStruct("Resident", { performance: LocalModelPerformanceSchema }),
+  Schema.TaggedStruct("Streamed", {
+    bank: StreamedBankSchema,
+    performance: LocalModelStreamedPerformanceSchema,
+    floorPerformance: LocalModelStreamedPerformanceSchema,
+  }),
+)
+export type LocalModelFitResidency = typeof LocalModelFitResidencySchema.Type
+
+/** A fitting model, how it holds its weights, and its decode speed held that way. */
 export const LocalModelFitsAssessmentSchema = Schema.TaggedStruct("Fits", {
   assessmentId: ModelAssessmentIdSchema,
   environmentId: AssessmentEnvironmentIdSchema,
   profile: ServingProfileSchema,
   memory: LocalModelMemorySchema,
-  performance: LocalModelPerformanceSchema,
+  residency: LocalModelFitResidencySchema,
 })
 export type LocalModelFitsAssessment = typeof LocalModelFitsAssessmentSchema.Type
 

@@ -11,6 +11,7 @@ at `inference/Cargo.toml`. Grouping directories are not nested workspaces.
 | `estimator/core/` | Generic prediction contract, traversal and shared service model |
 | `estimator/metal/` | Pure Metal demand rules over shared IR |
 | `backends/{metal,cpu,cuda}/` | Target adapters, native realization and execution |
+| `reservation/` | Reserved ranges backed granule by granule, and the one resize every backend shares |
 | `runtime/` | Invocation binding, workflow admission, memory and submission |
 | `api/`, `build/`, `cli/` | Public API, build integration and command line |
 

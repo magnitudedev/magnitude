@@ -4,9 +4,10 @@ import {
   type GenerationPerformanceEvidence,
   type GenerationPerformanceSamples,
   type LocalModel,
-  type LocalModelPerformance,
   type LocalModelServingState,
+  type LocalModelStreamedPerformance,
   type MachineMeasurement,
+  type SpeculativeMethod,
 } from "@magnitudedev/sdk"
 import { formatMemorySize } from "./format-bytes"
 import { localModelSpeculativeMethodLabel } from "./model-presentation"
@@ -54,21 +55,25 @@ const memoryUseRatio = (assessment: ModelAssessment): number => {
   }, 0)
 }
 
-const speculationValue = (model: LocalModel): number => {
+/** Every speculative method's rank, weakest first; the radar spaces them evenly up to the strongest. */
+const SPECULATION_RANK: Record<SpeculativeMethod["_tag"], number> = {
+  Mtp: 1,
+  DFlash: 2,
+  DSpark: 3,
+  DFlash2: 4,
+  LiLiCorr: 5,
+}
+const STRONGEST_SPECULATION_RANK = Math.max(...Object.values(SPECULATION_RANK))
+
+/** A model's speculation on the radar: none is 0, the strongest method 1. */
+const speculationValue = (method: Option.Option<SpeculativeMethod>): number => Option.match(method, {
+  onNone: () => 0,
+  onSome: ({ _tag }) => SPECULATION_RANK[_tag] / STRONGEST_SPECULATION_RANK,
+})
+
+const modelSpeculationValue = (model: LocalModel): number => {
   const serving = Option.getOrUndefined(localModelServingState(model))
-  if (serving?._tag !== "Assessed") return 0
-  return Option.match(serving.speculativeMethod, {
-    onNone: () => 0,
-    onSome: (method) => {
-      switch (method._tag) {
-        case "Mtp": return 1 / 5
-        case "DFlash": return 2 / 5
-        case "DSpark": return 3 / 5
-        case "DFlash2": return 4 / 5
-        case "LiLiCorr": return 1
-      }
-    },
-  })
+  return serving?._tag === "Assessed" ? speculationValue(serving.speculativeMethod) : 0
 }
 
 const fidelityLabel = (rank: number): string =>
@@ -132,13 +137,15 @@ const measurementLabel = (measurement: MachineMeasurement): string =>
       })}`
     : "Measuring this machine…"
 
+/** A fit's speed, resident or streamed, as offered. */
 export const performanceRangeSpeedLabel = (
-  performance: LocalModelPerformance,
+  performance: LocalModelStreamedPerformance,
   contextLength: number
 ): string => {
   switch (performance._tag) {
     case "Pending": return measurementLabel(performance.measurement)
     case "Unavailable": return performance.failure.message
+    case "Unmeasured": return "Measured on its first streamed load"
     case "Estimated": {
       const speeds = localModelSpeedRangeContexts
         .map((contextTokens) => nearestSample(performance.samples, Math.min(contextTokens, contextLength)))
@@ -153,8 +160,9 @@ export const performanceRangeSpeedLabel = (
 /** The estimated decode speed at the depth models are compared at; none unless the model fits and its speed is estimated. */
 export const localModelEstimatedTokensPerSecond = (model: LocalModel): Option.Option<number> => {
   const serving = Option.getOrUndefined(localModelServingState(model))
-  if (serving?._tag !== "Assessed" || serving.assessment._tag !== "Fits" || serving.assessment.performance._tag !== "Estimated") return Option.none()
-  const { performance, profile } = serving.assessment
+  if (serving?._tag !== "Assessed" || serving.assessment._tag !== "Fits") return Option.none()
+  const { residency: { performance }, profile } = serving.assessment
+  if (performance._tag !== "Estimated") return Option.none()
   return Option.some(nearestSample(performance.samples, Math.min(50_000, profile.contextLength)).estimatedTokensPerSecond)
 }
 
@@ -167,6 +175,7 @@ export const localModelRadarAxes = (
   }
 
   const assessment = serving.assessment
+  const performance = assessment.residency.performance
   const catalog = model._tag === "Catalog" ? Option.some(model.catalogData) : Option.none()
   const speculation = Option.getOrElse(localModelSpeculativeMethodLabel(model), () => "None")
   const variant = String(model.presentation.variantLabel)
@@ -188,10 +197,10 @@ export const localModelRadarAxes = (
     {
       value: Option.map(localModelEstimatedTokensPerSecond(model), normalizeLocalModelRadarSpeed),
       label: "SPEED",
-      detail: performanceRangeSpeedLabel(assessment.performance, assessment.profile.contextLength),
+      detail: performanceRangeSpeedLabel(performance, assessment.profile.contextLength),
     },
     {
-      value: Option.some(speculationValue(model)),
+      value: Option.some(modelSpeculationValue(model)),
       label: "SPECULATION",
       detail: speculation,
     },
@@ -235,6 +244,8 @@ export const localModelFacts = (model: LocalModel): LocalModelFacts => {
   const fits = serving?._tag === "Assessed" && serving.assessment._tag === "Fits" ? serving.assessment : undefined
   return {
     intelligence: model._tag === "Catalog" ? Option.some(model.catalogData.intelligence) : Option.none(),
-    speed: fits === undefined ? Option.none() : Option.some(performanceRangeSpeedLabel(fits.performance, fits.profile.contextLength)),
+    speed: fits === undefined
+      ? Option.none()
+      : Option.some(performanceRangeSpeedLabel(fits.residency.performance, fits.profile.contextLength)),
   }
 }

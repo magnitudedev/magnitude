@@ -18,6 +18,7 @@ export * from './utils/model-presentation'
 export * from './utils/model-load'
 export * from './utils/local-model-radar'
 export * from './utils/hardware-memory'
+export * from './utils/model-streaming'
 
 // Local models and connections
 export * from './local-models/projection'

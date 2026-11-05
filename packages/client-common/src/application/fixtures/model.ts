@@ -1,5 +1,5 @@
 import { Option, Schema } from "effect"
-import { AssessmentEnvironmentIdSchema, CatalogFormModelIdSchema, CustomFormModelIdSchema, ModelAssessmentIdSchema, ModelReleaseDateSchema, ModelVariantLabelSchema, type CustomLocalModel, type LocalModel } from "@magnitudedev/sdk"
+import { AssessmentEnvironmentIdSchema, CatalogFormModelIdSchema, LocalInferenceDeviceIdSchema, CustomFormModelIdSchema, LocalModelFitResidencySchema, ModelAssessmentIdSchema, ModelReleaseDateSchema, ModelStreamingStatusSchema, ModelVariantLabelSchema, type CustomLocalModel, type LocalModel, type LocalModelFitResidency, type ModelInstanceAllocation, type ModelResidency, type ModelStreamingStatus } from "@magnitudedev/sdk"
 export const providerModelId = CatalogFormModelIdSchema.make("setup-model:gguf:q4")
 export const makeSetupModel = (installed: boolean): Extract<LocalModel, { readonly _tag: "Catalog" }> => {
   return {
@@ -64,9 +64,12 @@ export const makeSetupModel = (installed: boolean): Extract<LocalModel, { readon
           totalRequiredBytes: 0,
           requiredSystemMemoryBytes: 0,
         },
-        performance: {
-          _tag: "Estimated",
-          samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 50 }],
+        residency: {
+          _tag: "Resident",
+          performance: {
+            _tag: "Estimated",
+            samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 50 }],
+          },
         },
       },
       rankingScores: {
@@ -130,12 +133,71 @@ export const makeFoundModel = (
       assessmentId: ModelAssessmentIdSchema.make("found-assessment"),
       environmentId: AssessmentEnvironmentIdSchema.make("setup-environment"),
       memory: { domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0 },
-      performance: {
-        _tag: "Estimated",
-        samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 40 }],
+      residency: {
+        _tag: "Resident",
+        performance: {
+          _tag: "Estimated",
+          samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 40 }],
+        },
       },
     },
   },
   storageBytes: 2,
   ...overrides,
+})
+
+const estimated = (estimatedTokensPerSecond: number) => ({
+  _tag: "Estimated",
+  samples: [{ contextTokens: 32_768, estimatedTokensPerSecond }],
+})
+
+/**
+ * A streamed fit as the protocol carries it: 60% of experts in memory at ~20 tok/s, a floor of 1%
+ * (the least its steps hold at once) at ~5 tok/s, the rest kept as `coldExperts` says (read from disk unless given); or, unmeasured,
+ * before its first streamed load.
+ */
+export const streamedFitResidency = (unmeasured = false, coldExperts = "disk"): LocalModelFitResidency =>
+  Schema.decodeUnknownSync(LocalModelFitResidencySchema)({
+    _tag: "Streamed",
+    bank: { experts: 100, slots: 60, floorSlots: 1, coldExperts },
+    performance: unmeasured ? { _tag: "Unmeasured" } : estimated(20.4),
+    floorPerformance: unmeasured ? { _tag: "Unmeasured" } : estimated(5.4),
+  })
+
+/**
+ * An expert bank as the protocol carries it: 40% of every expert held (floor 1%, ceiling 60%),
+ * 300 MB in the first memory domain and 400 MB in any later one; beside a device's own memory
+ * (any domain but host RAM, "system"), a host-RAM tier of 210 MB at half its most, which unified
+ * memory never has; 300 MB on disk, an n-gram table of 126 MB at half its most (floor a quarter);
+ * and its experts' last resize, from 50% to 40% for a request.
+ */
+export const streamingStatus = (memoryDomainIds: readonly string[]): ModelStreamingStatus =>
+  Schema.decodeUnknownSync(ModelStreamingStatusSchema)({
+    experts: 100,
+    slots: 40,
+    floorSlots: 1,
+    ceilingSlots: 60,
+    tiers: memoryDomainIds.map((memoryDomainId, index) => ({ memoryDomainId, bytes: (index === 0 ? 300 : 400) * 1000 ** 2 })),
+    ...(memoryDomainIds.some((memoryDomainId) => memoryDomainId !== "system")
+      ? { host: { memoryDomainId: "system", slots: 30, ceilingSlots: 60, bytes: 210 * 1000 ** 2 } }
+      : {}),
+    diskBytes: 300 * 1000 ** 2,
+    tables: [{ records: 20, floorRecords: 10, ceilingRecords: 40, bytes: 126 * 1000 ** 2 }],
+    lastResize: { _tag: "Shrank", cause: "live_claim", to: 40, by: 10, atUnixMs: 1234 },
+  })
+
+/** How a load serves when its prompt groups are granted one place of eight. */
+export const servingAllocation = {
+  promptGroupPlaces: { held: 1, capacity: 8 },
+} as const satisfies Pick<ModelInstanceAllocation, "promptGroupPlaces">
+
+export const streamedReadyResidency = (memoryDomainIds: readonly string[]): ModelResidency => ({
+  _tag: "Ready",
+  allocation: {
+    contextWindowTokens: 4096,
+    memoryDomains: [],
+    ...servingAllocation,
+    streaming: Option.some(streamingStatus(memoryDomainIds)),
+  },
+  device: { deviceId: LocalInferenceDeviceIdSchema.make("metal:0"), backend: "metal" },
 })

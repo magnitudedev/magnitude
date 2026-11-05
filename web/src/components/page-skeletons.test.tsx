@@ -1,5 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server"
 import { expect, it } from "vitest"
+import { Option } from "effect"
 import { ConnectionsSkeleton, HardwarePending, LoginSkeleton, ModelsSkeleton, RecommendationsSkeleton, UpdatesSkeleton } from "./page-skeletons"
 import { UsageFigures } from "./serving-usage"
 import { MemoryFigures } from "./memory-breakdown"
@@ -20,7 +21,7 @@ it("does not turn unobserved usage or memory into zero or an empty-state claim",
   expect(usage).toContain('data-slot="skeleton"')
   expect(usage).not.toContain('No requests')
   expect(usage).not.toContain('>0<')
-  const memory = renderToStaticMarkup(<MemoryFigures allocation={null} reading />)
+  const memory = renderToStaticMarkup(<MemoryFigures allocation={null} hardware={Option.none()} reading />)
   expect(memory).toContain('data-slot="skeleton"')
   expect(memory).not.toContain('0 MB')
   expect(memory).not.toContain('data-memory-bytes="0"')

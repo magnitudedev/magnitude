@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
-import { Option, Schema } from "effect"
+import { Either, Option, Schema } from "effect"
 import {
+  LocalModelFitsAssessmentSchema,
   CatalogBaseIdSchema,
   CatalogVariantIdSchema,
   CatalogLocalModelServingStateSchema,
@@ -17,6 +18,7 @@ import {
   ModelCapabilitiesSchema,
   ModelIdSchema,
   ModelLocationSchema,
+  StreamingResizeSchema,
   modelLocationState,
   ModelParameterizationSchema,
   ModelReleaseDateSchema,
@@ -267,13 +269,47 @@ describe("LocalModelSchema invariants", () => {
         memory: {
           domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0,
         },
-        performance: {
-          _tag: "Estimated",
-          samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }],
+        residency: {
+          _tag: "Resident",
+          performance: {
+            _tag: "Estimated",
+            samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }],
+          },
         },
       },
     } as const
     expect(() => Schema.decodeUnknownSync(LocalModelServingStateSchema)(assessed)).not.toThrow()
+  })
+
+  it("takes a streamed performance only for a streamed fit", () => {
+    const fit = (residency: unknown) => ({
+      _tag: "Fits",
+      assessmentId: "assessment",
+      environmentId: "environment",
+      profile: { contextLength: 4096 },
+      memory: { domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0 },
+      residency,
+    })
+    const decode = Schema.decodeUnknownEither(LocalModelFitsAssessmentSchema)
+    const estimated = (tokensPerSecond: number) => ({
+      _tag: "Estimated",
+      samples: [{ contextTokens: 4096, estimatedTokensPerSecond: tokensPerSecond }],
+    })
+    const bank = { experts: 256, slots: 154, floorSlots: 26, coldExperts: "host_ram" }
+    const streamed = (performance: unknown, floorPerformance: unknown) =>
+      fit({ _tag: "Streamed", bank, performance, floorPerformance })
+    expect(Either.isRight(decode(streamed(estimated(20), estimated(4))))).toBe(true)
+    expect(Either.isRight(decode(streamed({ _tag: "Unmeasured" }, { _tag: "Unmeasured" })))).toBe(true)
+    expect(Either.isRight(decode(fit({ _tag: "Resident", performance: estimated(20) })))).toBe(true)
+    expect(Either.isLeft(decode(fit({ _tag: "Resident", performance: { _tag: "Unmeasured" } })))).toBe(true)
+  })
+
+  it("takes a resize only as a shrink with its cause or a growth, each by at least one", () => {
+    const decode = Schema.decodeUnknownEither(StreamingResizeSchema)
+    expect(Either.isRight(decode({ _tag: "Shrank", cause: "reclaim", to: 40, by: 1, atUnixMs: 12 }))).toBe(true)
+    expect(Either.isRight(decode({ _tag: "Grew", from: 40, by: 1, atUnixMs: 12 }))).toBe(true)
+    expect(Either.isLeft(decode({ _tag: "Shrank", cause: "growth", to: 40, by: 1, atUnixMs: 12 }))).toBe(true)
+    expect(Either.isLeft(decode({ _tag: "Grew", from: 40, by: 0, atUnixMs: 12 }))).toBe(true)
   })
 
   it("requires estimates for estimated performance and admits Unsupported only for custom models", () => {
@@ -298,35 +334,29 @@ describe("LocalModelSchema invariants", () => {
         memory: {
           domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0,
         },
-        performance: {
-          _tag: "Estimated",
-          samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }],
+        residency: {
+          _tag: "Resident",
+          performance: {
+            _tag: "Estimated",
+            samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }],
+          },
         },
       },
       rankingScores: { intelligence: 0.5, speed: 0.1, fidelity: 0.5 },
     }
-    const withoutPerformance = {
+    const withPerformance = (performance: unknown) => ({
       ...fits,
-      assessment: { ...fits.assessment, performance: { _tag: "Estimated", samples: [] } },
-    }
+      assessment: { ...fits.assessment, residency: { _tag: "Resident", performance } },
+    })
+    const withoutPerformance = withPerformance({ _tag: "Estimated", samples: [] })
     const pending = {
-      ...fits,
-      assessment: {
-        ...fits.assessment,
-        performance: { _tag: "Pending", measurement: { _tag: "Failed", retryAt: 1_000 } },
-      },
+      ...withPerformance({ _tag: "Pending", measurement: { _tag: "Failed", retryAt: 1_000 } }),
       rankingScores: { intelligence: 0.5, fidelity: 0.5 },
     }
-    const unavailable = {
-      ...fits,
-      assessment: {
-        ...fits.assessment,
-        performance: {
-          _tag: "Unavailable",
-          failure: { code: "performance_unavailable", message: "hung", retryable: false },
-        },
-      },
-    }
+    const unavailable = withPerformance({
+      _tag: "Unavailable",
+      failure: { code: "performance_unavailable", message: "hung", retryable: false },
+    })
     const unsupported = {
       ...assessed,
       assessment: {

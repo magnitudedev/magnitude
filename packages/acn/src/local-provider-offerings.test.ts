@@ -51,9 +51,12 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
         totalRequiredBytes: 0,
         requiredSystemMemoryBytes: 0,
       },
-      performance: {
-        _tag: "Estimated",
-        samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 25 }],
+      residency: {
+        _tag: "Resident",
+        performance: {
+          _tag: "Estimated",
+          samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 25 }],
+        },
       },
     },
   } as const

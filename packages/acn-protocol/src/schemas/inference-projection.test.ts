@@ -31,7 +31,7 @@ const instances = (...ready: { id: string; backend: string }[]) => Schema.decode
   revision: 1,
   instances: ready.map((device, index) => ({
     id: `instance-${index}`, modelId: "model",
-    lifecycle: { _tag: "Ready", allocation: { contextWindowTokens: 4096, memoryDomains: [] }, device },
+    lifecycle: { _tag: "Ready", allocation: { contextWindowTokens: 4096, memoryDomains: [], promptGroupPlaces: { held: 1, capacity: 1 } }, device },
   })),
 })
 const none = instances()

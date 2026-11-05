@@ -13,6 +13,9 @@
     "./application/contracts": {
       "types": "./src/application/contracts.ts",
       "import": "./src/application/contracts.ts"
+    },
+    "./fixtures/*": {
+      "magnitude-test": "./src/application/fixtures/*.ts"
     }
   },
   "scripts": {

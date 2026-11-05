@@ -123,7 +123,7 @@ something prices it. Measuring opens executors and runs kernels, so nothing meas
 | --- | --- |
 | `topology()` | the reported structure of the current revision |
 | `refresh()` | the revision after discovering again: the same one when the machine reads the same, a new one when it does not |
-| `sample(topology)` | a timestamped status sample of a revision's stores and grants |
+| `sample(topology, executors)` | a timestamped status sample of a revision's stores and of the grants of `executors` alone. A grant's reading is a driver query (a Vulkan heap budget takes milliseconds), so a load observing its own executor's memory reads no other executor's grant |
 | `host_status()` | one reading of host RAM alone, as a sample reads it |
 | `executor_identity(executor)` | the identity measurements of the executor are keyed by |
 | `volume_available(path)` | the free space of one path's volume, as a sample reads it |
@@ -135,8 +135,8 @@ The topology describes the machine. It knows nothing of models, loads or reserve
 | Owner | Responsibility |
 | --- | --- |
 | `seismic-topology` | What the machine is, as data: the graph, the rules that build it from the reports of the backends and the OS, executor identities, and the recorded machines |
-| Backend crates | Each describes its own devices in the topology's terms (`<backend>::topology`) |
-| `seismic-discovery` | What the machine has: the backends' and the OS's reports gathered into the inventory, and status samples |
+| Backend crates | Each describes its own devices and storage in the topology's terms (`<backend>::topology`) |
+| `seismic-discovery` | What the machine has: the backends' and the OS's reports gathered into the inventory, status samples, and the host's processors and pinning |
 | `seismic-measure` | Timing work: the session, the sustained clock, the statistics and stopping rule, deadlines, and the records of measured points |
 | Seismic runtime | Opening executors by identity, allocation and ledgers, the measurable work (kernel calls, graph runs), kernel identities, and tuning |
 | Engine | Interpreting the topology for inference, in one place per use (below), and which points to measure |

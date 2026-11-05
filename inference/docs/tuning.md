@@ -65,9 +65,12 @@ is a hard constraint, never a term that faster execution can compensate for.
 ## One first-load clock
 
 The serving allowance is 60 seconds for the load's tuning work. Evaluation may select an explicit
-budget. It covers required canonical formation, input construction, default observations,
-yardsticks, search planning, candidate formation, execution, comparisons, confirmation, final
-coverage and result publication. No work moves before the clock or after finalization to make
+budget (`mrig step --tuning-budget SECONDS`, for each load's first tuning); a budget is part of
+every stored result's key. The allowance covers required canonical formation, input construction,
+default observations, yardsticks, search planning, candidate formation, execution, comparisons,
+confirmation, final coverage and result publication. A load whose budget event refused work for
+want of budget did not tune to completion, and a measurement of it measures an unfinished tuning,
+so `mrig step` voids its cell. No work moves before the clock or after finalization to make
 the total appear smaller. Loading and readiness are reported separately from this tuning total.
 
 Counting units and recognizing stored choices is metadata-only. Required canonical artifacts

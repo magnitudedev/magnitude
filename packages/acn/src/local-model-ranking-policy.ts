@@ -1,7 +1,7 @@
 import { Option } from "effect"
 import {
-  type LocalModelPerformance,
   type LocalModelRankingScores,
+  type LocalModelStreamedPerformance,
   type ServingProfile,
 } from "@magnitudedev/acn-protocol"
 
@@ -13,7 +13,8 @@ export interface LocalModelRankingCandidate {
   readonly intelligenceScore: number
   readonly fidelityRank: number
   readonly profile: ServingProfile
-  readonly performance: LocalModelPerformance
+  /** The fit's speed as offered: its residency's `performance`. */
+  readonly performance: LocalModelStreamedPerformance
 }
 
 const clamp01 = (value: number): number => Math.max(0, Math.min(1, value))
@@ -27,7 +28,12 @@ export const normalizedModelSpeedScore = (tokensPerSecond: number): number => {
   return rawScore / maximumScore
 }
 
-/** The speed term is the estimate at the comparison depth; none while speed is not estimated. */
+/**
+ * The speed term is the estimate at the comparison depth; none while speed is not estimated.
+ * A streamed fit's estimate is at the expert share this machine allows, so streamed and resident
+ * fits rank by estimated speed alike: a streamed fit is not judged by its floor, and one still
+ * unmeasured has no speed term, so it ranks after every estimated fit.
+ */
 export const modelRankingScores = (
   candidate: LocalModelRankingCandidate,
 ): LocalModelRankingScores => {
@@ -35,9 +41,10 @@ export const modelRankingScores = (
     COMPARISON_CONTEXT_LENGTH,
     candidate.profile.contextLength,
   )
-  const speed = candidate.performance._tag === "Estimated"
+  const performance = candidate.performance
+  const speed = performance._tag === "Estimated"
     ? Option.map(
-        Option.fromNullable(candidate.performance.samples.find(({ contextTokens }) =>
+        Option.fromNullable(performance.samples.find(({ contextTokens }) =>
           contextTokens === comparisonContext)),
         ({ estimatedTokensPerSecond }) => normalizedModelSpeedScore(estimatedTokensPerSecond),
       )

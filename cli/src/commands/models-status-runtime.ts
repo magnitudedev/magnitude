@@ -12,7 +12,10 @@ import {
   MODEL_OPTIMIZATION_PENDING_DETAIL,
   modelOptimizationFraction,
   formatStorageSize,
+  localModelAllocation,
+  localModelExpertFacts,
   localModelIsInstalled,
+  promptGroupPlacesFact,
   localModelServingState,
   preselectedDrafterCandidate,
   removalKind,
@@ -33,6 +36,7 @@ import {
   type CustomLocalModel,
   type DrafterCandidate,
   type DrafterReference,
+  type LocalInferenceHardware,
   type LocalModel,
   type ModelId,
   type UnsupportedLocalModel,
@@ -44,6 +48,7 @@ import {
   addressableModels,
   catalogProducts,
   readCatalog,
+  readHardwareNaming,
   withClient,
   type CliModelsClient,
 } from "./inference-client"
@@ -399,6 +404,8 @@ export type DrafterChoices =
 export interface ModelDetailView {
   readonly model: LocalModel
   readonly models: readonly LocalModel[]
+  /** The machine the model's memory domains are on; read only when its facts name them. */
+  readonly hardware: Option.Option<LocalInferenceHardware>
   readonly drafters: DrafterChoices
   readonly hidden: boolean
 }
@@ -442,7 +449,9 @@ export const renderModelDetail = (view: ModelDetailView): string => {
       ...installationFields(model),
       ...catalogComponentFields(model),
       ...(localModelIsInstalled(model) ? [["Runtime", residencyLabel(model)]] as const : []),
+      ...Option.match(localModelAllocation(model), { onNone: () => [], onSome: (allocation) => [promptGroupPlacesFact(allocation)] }),
       ...(modelMemoryBytes(model) === undefined ? [] : [["Memory", modelMemory(model)]] as const),
+      ...localModelExpertFacts(model, view.hardware),
       ...(modelContext(model) === "—" ? [] : [["Context", modelContext(model)]] as const),
       ...(model._tag === "Catalog" ? [["Acceleration", accelerationLabel(model)]] as const : []),
     ]),
@@ -527,12 +536,17 @@ export const readModelsStatus = (
   if (unsupported !== undefined) return { _tag: "Unsupported" as const, model: unsupported }
   const models = addressableModels(catalog)
   const model = yield* findModel(models, modelId.value)
+  const { hardware, drafters } = yield* Effect.all(
+    { hardware: readHardwareNaming(client, model), drafters: listModelDrafters(client, model) },
+    { concurrency: "unbounded" },
+  )
   return {
     _tag: "Detail" as const,
     view: {
       model,
       models,
-      drafters: yield* listModelDrafters(client, model),
+      hardware,
+      drafters,
       hidden: catalog.hiddenLocalModels.some((hidden) => hidden.modelId === model.modelId),
     },
   }

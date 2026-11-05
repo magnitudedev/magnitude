@@ -76,3 +76,7 @@ Reclamation requires both the end of logical claims and completion of physical u
 A checkpoint retains numerical state for inexpensive branching; eviction releases it
 and preserves the logical record needed for reconstruction. Input continuation
 follows [inputs](inputs.md); generation recovery follows [generation](generation.md).
+
+Recurrent claim removal updates its existing placement map and advances generation
+once; removal cannot introduce an invalid slot or alias, and generation exhaustion
+precedes mutation.
