@@ -383,7 +383,14 @@ fn stored_cpu_choice_accepts_device_owned_parameters() {
         .with_param("cpu.tier", 0)
         .with_param("cpu.workers.0", 0)
         .with_param("cpu.workers.1", 0);
-    assert!(implementation.validate(&choice).is_err());
+    let declared = seismic::generated::native_implementation_for_backend::<shape_rows::Entry>(BackendName::Cpu)
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(declared.validate(&choice), Err(seismic::NativeSpecializationError::UnknownParameter(_))),
+        "the declaration names no Seismic-owned parameter"
+    );
+    implementation.validate(&choice).unwrap();
     assert!(
         seismic::generated::native_specialization_valid::<shape_rows::Entry>(&device, &choice, &[])
             .unwrap()
@@ -3613,26 +3620,30 @@ fn a_load_reads_records_and_reports_or_serves_defaults_without_searching() {
 }
 
 /// A canonical fallback stored on CPU carries the Seismic-owned worker and
-/// tier parameters; the default it is checked against is the device's, not
-/// the bare declaration's, or every later Prepare refuses to reopen it.
+/// tier parameters, which the declaration does not name; the default it is
+/// checked against is the device's, which carries them, or every later
+/// Prepare refuses to reopen it.
 #[test]
 fn stored_cpu_fallback_matches_the_device_default() {
     let device = seismic::Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();
-    let implementation = seismic::generated::native_implementation::<shape_rows::Entry>(&device)
+    let stored = seismic::generated::native_implementation::<shape_rows::Entry>(&device)
         .unwrap()
-        .unwrap();
-    let declared = implementation
+        .unwrap()
         .default_specialization(&NativeSpecialization::new())
         .unwrap();
-    let stored = declared
-        .clone()
-        .with_param("cpu.tier", 0)
-        .with_param("cpu.workers.0", 0)
-        .with_param("cpu.workers.1", 0);
-    assert_ne!(stored, declared);
+    for parameter in ["cpu.tier", "cpu.workers.0", "cpu.workers.1"] {
+        assert!(stored.param(parameter).is_some(), "the stored fallback carries {parameter}");
+    }
+    let declared = seismic::generated::native_implementation_for_backend::<shape_rows::Entry>(BackendName::Cpu)
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(declared.validate(&stored), Err(seismic::NativeSpecializationError::UnknownParameter(_))),
+        "the declaration names no Seismic-owned parameter"
+    );
     let case = super::readout::ShapeRowsTuning { vocabulary: 1024 };
     assert_eq!(
         offered(&case, &device)
