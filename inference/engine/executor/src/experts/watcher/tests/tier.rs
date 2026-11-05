@@ -48,6 +48,32 @@ fn a_tier_of_every_expert_fills_before_any_step() {
     assert_eq!(policy.load(constants::POLICY_WHOLE as usize), 0, "a bank of two records is not whole");
 }
 
+/// A host tier whose records keep every expert only with its lent records
+/// leaves its layer unresolved: a prompt group's claim of a lent record
+/// unmaps its expert mid-flight, so the decode step chained behind the group
+/// finds it absent and requests the file, which a resolved layer's watcher
+/// takes for an invariant violation and ends serving on ("step N requested
+/// the file at layer L, whose experts cannot be absent").
+#[test]
+fn a_decode_step_behind_a_prompt_group_claiming_the_lent_records_is_served() {
+    // Eight experts: six tier records beyond the conveyor's two lent ones.
+    let harness = lending("lent-complete", EXPERTS, 2, 1, 3 * STAGING, Conveying::of(2), EXPERTS as u32 - 2, Placer::Tier, false);
+    harness.tiering(0, &(0..EXPERTS).collect::<Vec<_>>());
+    let shared = harness.watcher.shared();
+    eventually("the tier never filled", || shared.tier_fill() == crate::TierFill::Filled);
+    // The turn that filled it publishes the policy words next.
+    std::thread::sleep(Duration::from_millis(50));
+    let lent = (0..EXPERTS).filter(|&expert| harness.in_tier(0, expert).is_some_and(|record| record < 2)).collect::<Vec<_>>();
+    assert_eq!(lent.len(), 2, "the fill kept two experts in the lent records");
+    let steps = begin_as(&shared, &[(StepRoute::Grouped, LaunchWork::Prompt), (StepRoute::Decode, LaunchWork::Generation)], true).unwrap();
+    harness.scratch(&steps[0], 0, &lent);
+    eventually("the group never claimed the lent records", || lent.iter().all(|&expert| harness.in_tier(0, expert).is_none()));
+    harness.request_at(&steps[1], 0, &lent);
+    for step in steps {
+        step.complete().unwrap();
+    }
+}
+
 /// A host tier smaller than every expert fills from the bank's open on by
 /// the one rule that fills a tier of every expert: its records beyond the
 /// reserve its landings keep (a record for each staging record), with the

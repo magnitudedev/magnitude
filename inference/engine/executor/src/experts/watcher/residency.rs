@@ -352,10 +352,13 @@ impl Residency {
     /// runs are encoded, so no encoding overlaps a publication. A placement
     /// counts once it holds its record: a group's word turns on a flight
     /// late, never early. Its resolved word is set while it is whole or its
-    /// group's host tier keeps every expert: no route of its can find an
+    /// group's host tier keeps every expert outside the conveyor's lent
+    /// records (`HostRecords::complete`): no route of its can find an
     /// expert absent, so its tier wait is not encoded. The tier gives up a
-    /// kept expert only to land one it lacks, which a complete tier never
-    /// does, or in a shrink between flights, after which this publishes.
+    /// kept expert mid-flight only to land one it lacks, which a complete
+    /// tier never does, or to a prompt group's claim of a lent record,
+    /// which a complete tier keeps none in; otherwise only in a shrink
+    /// between flights, after which this publishes.
     pub(super) fn publish_policy(&mut self) {
         let directory = &self.core.directory;
         let full = (0..self.core.groups.len()).map(|group| directory.group_whole(group) && directory.group_at_home(group)).collect::<Vec<_>>();

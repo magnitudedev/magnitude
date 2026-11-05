@@ -552,10 +552,14 @@ impl HostRecords {
         lacked
     }
 
-    /// Whether every expert of the group is kept: no miss of it reads the
-    /// file.
+    /// Whether every expert of the group is kept where no flight takes it:
+    /// no miss of it reads the file. An expert kept in a lent record is not,
+    /// as a prompt group's claim unmaps it mid-flight
+    /// ([`Self::claim_record`]).
     pub fn complete(&self) -> bool {
-        self.lacking.is_empty() && self.landing.is_empty()
+        self.lacking.is_empty()
+            && self.landing.is_empty()
+            && self.records[..self.lent as usize].iter().all(|record| record.present().is_none())
     }
 
     /// Claim a landing of `staged`: where a record keeps it or a landing of
@@ -1430,6 +1434,23 @@ mod tests {
         tier.landed(grant.record(), (0, 1), Some(5), Kept::Alone);
         assert!(matches!(tier.records[0], Host::Kept(_)), "kept: the device is past its request");
         assert_eq!(tier.shrink_floor(), 0, "nothing in flight");
+    }
+
+    /// A tier keeping an expert in a lent record is not complete: a prompt
+    /// group's claim of that record unmaps the expert mid-flight, so a
+    /// step's route there may find it absent.
+    #[test]
+    fn a_tier_keeping_an_expert_in_a_lent_record_is_not_complete() {
+        let mut tier = HostRecords::new(2, 1, vec![(0, 2, None)], Resolution::AfterStore, 1);
+        for expert in 0..2 {
+            let Claim::Taken(grant) = tier.claim((0, expert), 0) else { panic!("a record is ready") };
+            grant.map(None);
+            tier.landed(grant.record(), (0, expert), None, Kept::Alone);
+        }
+        assert_eq!(tier.lacked(), 0, "every expert is kept");
+        assert!(!tier.complete(), "one is kept in the lent record");
+        assert!(tier.claim_record(0, 10), "a prompt group's claim takes it");
+        assert_eq!(tier.lacked(), 1, "and its expert is absent");
     }
 
     impl HostRecords {
