@@ -224,7 +224,7 @@ fn watch(
     let binding = plan.binding(0)?;
     // The steps the watcher serves, under whose lock the host writes every
     // map entry (`experts::map`).
-    let steps = Arc::new(Steps::new(plan.flights, plan.places, crate::experts::exchange::Pulse::new()));
+    let steps = Arc::new(Steps::new(plan.flights, plan.places, crate::experts::exchange::Pulse::of(layout.load.resident.device().backend())));
     // The floor's placed words, which the bank holds until a group holds
     // more places.
     let PlacedWords { flags, layers: group_reads } = placed_words(plan, floor)?;

@@ -18,6 +18,12 @@
 //! nothing, and so does any while no table lives: no wait reads the pulse.
 //! A test that plays the device itself drives its pulse
 //! ([`Pulse::driven`]), so a late beat is its input, never its host's load.
+//! Where parks are submission boundaries (Vulkan,
+//! `seismic::BackendName::parks_in_kernels` false) a wait reads its slot
+//! once, after the host opened its park, and never its pulse: the load's
+//! pulse is unread ([`Pulse::of`]), beats nothing and runs no thread: no
+//! wait of it ends on its pulse, so none stores an expiry and no step of
+//! it is interrupted.
 //!
 //! The live tables own the thread. The pulse keeps each one's words while
 //! it lives and beats them under its lock, so the thread never holds a
@@ -73,6 +79,9 @@ impl Drop for Pulsed {
     fn drop(&mut self) {
         let thread = {
             let mut beating = self.inner.beating.lock().expect("a pulse never panics");
+            if let Beater::Unread = beating.beater {
+                return;
+            }
             beating.tables.retain(|table| table.id != self.id);
             if !beating.tables.is_empty() {
                 return;
@@ -97,6 +106,10 @@ enum Beater {
     Stopped,
     /// Its thread, every PULSE_MS, while a table lives.
     Running,
+    /// Nothing, ever: no wait of the load reads its pulse, so none can end
+    /// on it, and none stores an expiry (SLOT_EXPIRED) for the host to
+    /// interrupt its step by ([`Pulse::unread`]).
+    Unread,
     /// The test, by [`Pulse::beat_after`]: when a beat comes is its input,
     /// never the host's load. For tables no device waits on (a test that
     /// plays the device).
@@ -156,6 +169,18 @@ impl Pulse {
         Self::beaten_by(Beater::Stopped)
     }
 
+    /// The pulse of a load no wait of which reads it: its waits wait at
+    /// parks the host opens, and read their slots once.
+    fn unread() -> Self {
+        Self::beaten_by(Beater::Unread)
+    }
+
+    /// The pulse of a load on `backend`: beaten where its waits spin in
+    /// their kernels, unread where they park at submission boundaries.
+    pub(crate) fn of(backend: seismic::BackendName) -> Self {
+        if backend.parks_in_kernels() { Self::new() } else { Self::unread() }
+    }
+
     /// A pulse the test beats ([`Self::beat_after`]).
     #[cfg(test)]
     pub(crate) fn driven() -> Self {
@@ -191,6 +216,9 @@ impl Pulse {
         let mut beating = self.inner.beating.lock().expect("a pulse never panics");
         let id = beating.next_id;
         beating.next_id += 1;
+        if let Beater::Unread = beating.beater {
+            return Ok(Pulsed { inner: self.inner.clone(), id });
+        }
         let pulses = (0..table.slots())
             .flat_map(|slot| (0..table.lanes()).map(move |lane| (slot, lane)))
             .map(|(slot, lane)| (table.lane(slot, lane) + constants::SLOT_PULSE) as usize)
