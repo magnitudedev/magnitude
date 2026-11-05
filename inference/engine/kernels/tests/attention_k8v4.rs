@@ -461,31 +461,11 @@ macro_rules! prefill_args {
 }
 
 /// The devices with k8v4 natives: every accelerator present (Metal, CUDA,
-/// Vulkan) and the CPU. A selected backend must open so qualification cannot
-/// pass by silently running on another device.
+/// Vulkan) and the CPU, or the requested backend alone
+/// ([`seismic_native_tests::devices`]).
 fn k8v4_devices() -> Vec<Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    if let Ok(selected) = std::env::var("SEISMIC_TEST_BACKEND") {
-        let backend = match selected.as_str() {
-            "metal" => BackendName::Metal,
-            "cuda" => BackendName::Cuda,
-            "vulkan" => BackendName::Vulkan,
-            "cpu" => BackendName::Cpu,
-            other => panic!("unsupported SEISMIC_TEST_BACKEND={other}"),
-        };
-        return vec![
-            catalog
-                .open_backend(backend)
-                .expect("selected backend opens"),
-        ];
-    }
-    [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]
-        .into_iter()
-        .filter_map(|backend| catalog.open_backend(backend).ok())
-        .chain(std::iter::once(
-            catalog.open_backend(BackendName::Cpu).unwrap(),
-        ))
-        .collect()
+    use BackendName::{Cpu, Cuda, Metal, Vulkan};
+    seismic_native_tests::devices(&[Metal, Cuda, Vulkan, Cpu])
 }
 
 /// Whether Vulkan's vector decode form (SIMDS, SLICES, KEYWISE) is within the

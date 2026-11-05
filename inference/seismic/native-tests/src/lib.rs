@@ -23,28 +23,16 @@ pub fn devices_with(
     backends: &[seismic::BackendName],
     options: seismic::DeviceOptions,
 ) -> Vec<seismic::Device> {
-    use seismic::{Availability, BackendName, Devices};
-    let selected = match std::env::var("SEISMIC_TEST_BACKEND") {
-        Ok(name) => Some(name),
-        Err(std::env::VarError::NotPresent) => None,
-        Err(error) => panic!("invalid SEISMIC_TEST_BACKEND: {error}"),
-    }.map(|name| match name.as_str() {
-        "cpu" => BackendName::Cpu,
-        "metal" => BackendName::Metal,
-        "cuda" => BackendName::Cuda,
-        "vulkan" => BackendName::Vulkan,
-        _ => panic!("unknown SEISMIC_TEST_BACKEND {name:?}"),
-    });
+    use seismic::Devices;
+    let selected = seismic::testing::requested_backend();
     if let Some(backend) = selected.filter(|backend| !backends.contains(backend)) {
         eprintln!("native test backends: none, {backend:?} is outside this test's backend domain");
         return Vec::new();
     }
     let discovery = Devices::discover(&[]).expect("test device discovery");
     let topology = discovery.topology();
-    let opened = backends.iter().copied().filter(|backend| selected.is_none_or(|selected| selected == *backend))
-        .filter_map(|backend| topology.executors().iter().find(|device| {
-            device.backend() == backend && matches!(device.availability(), Availability::Available)
-        }).map(|device| (backend, device.id())))
+    let opened = backends.iter().copied()
+        .filter_map(|backend| seismic::testing::selected(&topology, backend).map(|device| (backend, device.id())))
         .map(|(backend, id)| discovery.open_with(id, options.clone())
             .unwrap_or_else(|error| panic!("available {backend:?} test device must open: {error}")))
         .collect::<Vec<_>>();
@@ -53,4 +41,19 @@ pub fn devices_with(
     }
     eprintln!("native test backends: {:?}", opened.iter().map(seismic::Device::backend).collect::<Vec<_>>());
     opened
+}
+
+/// One device of the first backend of `preferred` the host has, then the
+/// CPU, for a test that checks one accelerator beside the CPU; under a
+/// requested backend ([`seismic::testing::requested_backend`]), that
+/// backend alone where it lies in `domain` and none outside it, as
+/// [`devices`] selects.
+pub fn first_and_cpu(preferred: &[seismic::BackendName], domain: &[seismic::BackendName]) -> Vec<seismic::Device> {
+    if seismic::testing::requested_backend().is_some() {
+        return devices(domain);
+    }
+    let mut chosen = devices(preferred);
+    chosen.truncate(1);
+    chosen.extend(devices(&[seismic::BackendName::Cpu]));
+    chosen
 }

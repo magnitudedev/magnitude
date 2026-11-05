@@ -19,14 +19,12 @@ pub(crate) fn process_placement() -> MutexGuard<'static, ()> {
     PLACEMENT.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Whether discovery found an available executor of `backend`: the one
-/// source of a backend's presence for a test that needs one the host may
-/// lack. Such a test runs on each backend this holds for, and fails where
+/// Whether a test runs on `backend` ([`seismic::testing::selected`]): the
+/// runner requests it or none, and discovery found an available executor
+/// of it. Such a test runs on each backend this holds for, and fails where
 /// an available one does not open.
 pub(crate) fn available(devices: &seismic::Devices, backend: seismic::BackendName) -> bool {
-    devices.topology().executors().iter().any(|executor| {
-        executor.backend() == backend && matches!(executor.availability(), seismic::Availability::Available)
-    })
+    seismic::testing::selected(&devices.topology(), backend).is_some()
 }
 
 /// `sources`, held in memory, checked with each native implementation's

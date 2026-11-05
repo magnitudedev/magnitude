@@ -4446,8 +4446,8 @@ fn file_words(choices: u64, q: u64, requested: &[i32], records: &[(u64, i32)], a
 fn streaming_device() -> Option<seismic::Device> {
     let device = native_device()?;
     let implemented = routed_step::native_implementation(&device).unwrap().is_some();
-    if std::env::var_os("SEISMIC_TEST_BACKEND").is_some() {
-        assert!(implemented, "the selected backend must implement expert streaming");
+    if seismic::testing::requested_backend().is_some() {
+        assert!(implemented, "the requested backend must implement expert streaming");
     }
     implemented.then_some(device)
 }

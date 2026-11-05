@@ -58,22 +58,26 @@ pub(crate) fn unbounded_accounts(facts: &Facts) -> MemoryAccounts {
 }
 
 /// The devices meeting the floor a test exercises; none without a loader,
-/// which a run that selected Vulkan (`SEISMIC_TEST_BACKEND`) refuses, as it
-/// refuses another backend's selection or finding no such device.
+/// or where the runner requests another backend
+/// (`seismic_lang::registry::requested_test_backend`). A run that requests
+/// Vulkan refuses a failed discovery or finding no such device.
 #[cfg(test)]
 pub(crate) fn test_devices() -> Vec<Description> {
-    let selected = std::env::var("SEISMIC_TEST_BACKEND").ok();
-    assert!(selected.as_deref().is_none_or(|name| name == "vulkan"), "this test exercises Vulkan");
+    let requested = seismic_lang::registry::requested_test_backend();
+    if requested.is_some_and(|backend| backend != seismic_lang::registry::BackendName::Vulkan) {
+        return Vec::new();
+    }
+    let selected = requested.is_some();
     let devices = match discover() {
         Ok(devices) => devices,
         Err(error) => {
-            assert!(selected.is_none(), "selected Vulkan discovery failed: {error}");
+            assert!(!selected, "requested Vulkan discovery failed: {error}");
             eprintln!("no Vulkan loader: {error}");
             return Vec::new();
         }
     };
     let devices = devices.into_iter().filter(|description| description.floor.is_ok()).collect::<Vec<_>>();
-    assert!(selected.is_none() || !devices.is_empty(), "no eligible selected Vulkan device");
+    assert!(!selected || !devices.is_empty(), "no eligible requested Vulkan device");
     devices
 }
 

@@ -26,9 +26,27 @@ pub use seismic_lang::checked::{
 };
 pub use seismic_lang::precision::{Limit, PrecisionPolicy, SpecialPolicy, Tolerance};
 pub use seismic_native_cpu::repack::ScaledCodeRows;
-/// Numerical comparison helpers used by validation frontends.
+/// Numerical comparison helpers used by validation frontends, and the one
+/// selector of the backends a test runs on.
 pub mod testing {
     pub use seismic_compiler::numerics::{compare_element, ElementComparison};
+    use super::{Availability, BackendName, DeviceTopology, Executor};
+
+    pub use seismic_lang::registry::requested_test_backend as requested_backend;
+
+    /// The executor a test runs `backend` on: the first available one of
+    /// it in `topology`, where the runner requests `backend` or none. A
+    /// test runs on each backend this names one for, and fails where it
+    /// does not open.
+    pub fn selected(topology: &DeviceTopology, backend: BackendName) -> Option<&Executor> {
+        if requested_backend().is_some_and(|requested| requested != backend) {
+            return None;
+        }
+        topology
+            .executors()
+            .iter()
+            .find(|executor| executor.backend() == backend && matches!(executor.availability(), Availability::Available))
+    }
 }
 pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactStore, DeviceOptions};
 pub use seismic_runtime::probes::{serve_probe_if_asked, KeptProbe, ProbeFailure, ProbeRun, NAMESPACE as PROBE_NAMESPACE};

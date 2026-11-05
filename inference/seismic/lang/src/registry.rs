@@ -4737,3 +4737,22 @@ mod tests {
         );
     }
 }
+
+/// The backend the test runner requests (`SEISMIC_TEST_BACKEND`), the one
+/// owner of that variable: a test then runs on it alone, and is skipped
+/// where it lies outside the test's backends. None when the variable is
+/// unset; a value that names no backend panics.
+pub fn requested_test_backend() -> Option<BackendName> {
+    let name = match std::env::var("SEISMIC_TEST_BACKEND") {
+        Ok(name) => name,
+        Err(std::env::VarError::NotPresent) => return None,
+        Err(error) => panic!("invalid SEISMIC_TEST_BACKEND: {error}"),
+    };
+    Some(match name.as_str() {
+        "cpu" => BackendName::Cpu,
+        "metal" => BackendName::Metal,
+        "cuda" => BackendName::Cuda,
+        "vulkan" => BackendName::Vulkan,
+        _ => panic!("unknown SEISMIC_TEST_BACKEND {name:?}"),
+    })
+}
