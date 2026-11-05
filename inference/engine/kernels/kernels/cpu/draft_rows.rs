@@ -30,7 +30,11 @@ fn draft_rows_join<L: Isa, E: Elements>(
     let token = gathered::row(cx.arg_tokens().get([source_row, 0]), cx.dim_r(), cx.dim_f(), |entry, field| {
         cx.arg_directory().get([entry, field])
     });
-    cx.arg_table().decode_row(token, values);
+    // A row that names no table row embeds zeros.
+    match token {
+        Some(token) => cx.arg_table().decode_row(token, values),
+        None => values.fill(0.0),
+    }
     for value in values.iter_mut() {
         *value = activation::publish::<E::A>(*value);
     }

@@ -25,9 +25,12 @@ void embedding_rows_inverse() {
     const uint width = uint(SEISMIC_DIM_D);
     const uint64_t row = gl_WorkGroupID.x;
     const packets_rows16 geometry = PACKETS_W0_ROWS;
-    const uint64_t token = gathered_row(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY), SEISMIC_DIRECTORY_STRIDE_0,
+    const int64_t held = gathered_row(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY), SEISMIC_DIRECTORY_STRIDE_0,
         SEISMIC_DIM_R, SEISMIC_DIM_F, element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS), row * SEISMIC_TOKENS_STRIDE_0));
-    const uint64_t table_row = SEISMIC_PTR(SEISMIC_BUFFER_TABLE) + token * geometry.stride;
+    // A row that names no table row reads zeros, whatever its inverse.
+    if (held < 0l)
+        return;
+    const uint64_t table_row = SEISMIC_PTR(SEISMIC_BUFFER_TABLE) + uint64_t(held) * geometry.stride;
     const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
     float squares = 0.0;
     for (uint p = gl_LocalInvocationID.x; p * 32u < width; p += gl_WorkGroupSize.x) {
@@ -51,9 +54,20 @@ void embedding_rows() {
     const uint width = uint(SEISMIC_DIM_D);
     const uint64_t row = gl_WorkGroupID.x;
     const packets_rows16 geometry = PACKETS_W0_ROWS;
-    const uint64_t token = gathered_row(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY), SEISMIC_DIRECTORY_STRIDE_0,
+    const int64_t held = gathered_row(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY), SEISMIC_DIRECTORY_STRIDE_0,
         SEISMIC_DIM_R, SEISMIC_DIM_F, element_i32_index(tokens, row * SEISMIC_TOKENS_STRIDE_0));
-    const uint64_t table_row = table + token * geometry.stride;
+    // A row that names no table row reads zeros (the whole workgroup's).
+    if (held < 0l) {
+        for (uint column = gl_LocalInvocationID.x; column < width; column += gl_WorkGroupSize.x) {
+            element_put(ELEMENT_ACT, embedded,
+                row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_0_STRIDE_1, 0.0);
+            element_f32_put(widened
+                    + (row * SEISMIC_RESULT_1_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_1_STRIDE_1) * 4ul,
+                0.0);
+        }
+        return;
+    }
+    const uint64_t table_row = table + uint64_t(held) * geometry.stride;
     const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
     for (uint p = gl_LocalInvocationID.x; p * 32u < width; p += gl_WorkGroupSize.x) {
         const packets_packet packet = packets_load(PACKETS_W0, table_row, geometry, p, width);

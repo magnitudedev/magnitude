@@ -61,7 +61,8 @@ void routed_combine() {
     const bool vector = SEISMIC_EXPERT_OUTPUT_STRIDE_2 == 1ul && (SEISMIC_EXPERT_OUTPUT_STRIDE_1 & 7ul) == 0ul
         && (SEISMIC_EXPERT_OUTPUT_STRIDE_0 & 7ul) == 0ul;
     vec4 selected_even = vec4(0.0), selected_odd = vec4(0.0);
-    for (uint64_t k = 0ul; k < SEISMIC_DIM_K; ++k) {
+    // A 32-bit counter: see `streaming/contract.hpp`.
+    for (uint k = 0u; k < uint(SEISMIC_DIM_K); ++k) {
         const uint64_t position = uint64_t(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_INVERSE)
             + (m * SEISMIC_INVERSE_STRIDE_0 + k * SEISMIC_INVERSE_STRIDE_1) * 4ul));
         const float score = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SCORES)

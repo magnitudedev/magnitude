@@ -1193,9 +1193,10 @@ fn embedding_rows_of_rows16_slots_equal_the_mma16_table(format: Format) {
     }
 }
 
-/// A read through a directory reads each selected row's slot (row 0 for a
-/// row without one and for a failed selection), exactly as a direct read of
-/// that slot does (`projection.rs` covers the rows16 backends).
+/// A read through a directory reads each selected row's slot (zeros for a
+/// row without one and for a failed selection, as a direct read of no row),
+/// exactly as a direct read of that slot does (`projection.rs` covers the
+/// rows16 backends).
 fn embedding_rows_read_the_slots_their_directory_names(format: Format) {
     let Some(device) = cuda() else { return };
     let mut rng = Rng(6);
@@ -1233,7 +1234,7 @@ fn embedding_rows_read_the_slots_their_directory_names(format: Format) {
         let slots = selected
             .chunks_exact(2)
             .flat_map(|pair| {
-                let slot = usize::try_from(pair[0]).map_or(0, |row| directory_values[row].max(0));
+                let slot = usize::try_from(pair[0]).map_or(-1, |row| directory_values[row]);
                 [slot, pair[1]]
             })
             .collect::<Vec<_>>();

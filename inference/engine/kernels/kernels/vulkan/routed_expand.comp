@@ -1,4 +1,4 @@
-// Decode expansion (M <= 8): the K selected experts' gate/up projections and
+// Decode expansion (M <= DECODE_ROWS): the K selected experts' gate/up projections and
 // the shared expert's, each with the SiluMul epilogue, in one launch. The
 // Vulkan form of `metal/routed_expand.metal`. Workgroup row y < M * K is
 // choice (m, k): a K1 paired GEMV over the feature tile `x` of expert
@@ -58,10 +58,10 @@ void routed_expand_bounded(const uint maxm) {
         const projection_prologue x = projection_operands(projection_plain(ROUTED_ACT,
             normalized + m * SEISMIC_NORMALIZED_STRIDE_0 * uint64_t(ELEMENT_BYTES(ROUTED_ACT)), SEISMIC_NORMALIZED_STRIDE_0,
             SEISMIC_NORMALIZED_STRIDE_1, hidden, 0ul), EXPERT_OPERANDS);
-        const projection_weights gate = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), PACKETS_W0_STACKED_ROWS,
-            routed_expert_row(expert, SEISMIC_DIM_F), hidden);
-        const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), PACKETS_W1_STACKED_ROWS,
-            routed_expert_row(expert, SEISMIC_DIM_F), hidden);
+        const projection_weights gate = routed_record_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), expert,
+            PACKETS_W0_STACKED_ROWS, hidden);
+        const projection_weights up = routed_record_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), expert,
+            PACKETS_W1_STACKED_ROWS, hidden);
         const projection_epilogue out_ = projection_scaled(projection_silu_mul(ROUTED_ACT,
                 SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)
                     + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * uint64_t(ELEMENT_BYTES(ROUTED_ACT)),

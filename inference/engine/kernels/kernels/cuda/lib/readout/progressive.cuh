@@ -14,6 +14,7 @@
 // exact logits equal the full pass's bit for bit. View comparisons keep a
 // relative margin of PROGRESSIVE_MARGIN, so F32 rounding only keeps extra rows.
 #include "../projection/projection.cuh"
+#include "../core/arrive.cuh"
 #include "../core/gumbel.cuh"
 
 #define PROGRESSIVE_LOW_PLANES unsigned(SEISMIC_DIM_P)
@@ -212,18 +213,7 @@ __device__ __forceinline__ void publish(const u32 *lowest, u32 *bounds, u32 rows
     __syncthreads();
     if (threadIdx.x < rows)
         atomicMax(&bounds[threadIdx.x], lowest[threadIdx.x]);
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        __threadfence();
-        const bool is_last = atomicAdd(&bounds[PROGRESSIVE_ROWS], 1u) == gridDim.x - 1;
-        if (is_last) {
-            __threadfence();
-            atomicExch(&bounds[PROGRESSIVE_ROWS], 0u);
-        }
-        last = is_last;
-    }
-    __syncthreads();
-    if (last && threadIdx.x < rows) {
+    if (arrive::last(&bounds[PROGRESSIVE_ROWS], gridDim.x, &last) && threadIdx.x < rows) {
         const u32 k = atomicExch(&bounds[threadIdx.x], 0u);
         const float raised = k == 0u ? -infinity() : value_of(k);
         const float floored = floor ? fmaxf(floor[threadIdx.x * floor_stride], raised) : raised;

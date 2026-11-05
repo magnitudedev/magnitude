@@ -4,7 +4,7 @@
 // `dense_up_rows` gives each work item ROWS up weight rows, projected against
 // every normalized row and published A(act(A(up_scale * up))).
 
-use lib::core::{activation, functions};
+use lib::core::functions;
 use lib::projection::projection;
 
 fn dense_up_normalize<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
@@ -46,7 +46,7 @@ fn dense_up_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3
         // SAFETY: each work item writes its own columns of every row.
         let out = unsafe { result.span_mut([row, rows.start], rows.len()) };
         for (target, up) in out.iter_mut().zip(up) {
-            *target = E::A::narrow(functions::activate(function, activation::publish::<E::A>(scale * *up)));
+            *target = functions::activated::<E::A>(function, scale * *up);
         }
     });
 }

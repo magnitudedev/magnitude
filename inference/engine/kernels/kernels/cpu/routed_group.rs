@@ -1,27 +1,26 @@
 // routed_group on CPU (contract and portable body in routed.seismic). One
-// work item builds every table: it counts each expert's choices, places each
-// expert's tiles after the previous experts' (ceil(count / T) blocks each),
-// then walks the choices in flat (row, choice) order so every expert's rows
-// keep that order. Tile slots no choice claims, and unused blocks, are -1.
+// work item builds every table: it counts each expert's grouped choices (the
+// rows[0] rows' from row first[0]), places each expert's tiles after the previous
+// experts' (ceil(count / T) blocks each), then walks the grouped choices in
+// flat (row, choice) order so every expert's rows keep that order. Tile
+// slots no choice claims are -1; blocks past `used` are left as they were.
 
 fn routed_group<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, _group: [u64; 3], _shared: &mut [u8]) {
-    let (m, e, k) = (cx.dim_m() as usize, cx.dim_e() as usize, cx.dim_k() as usize);
-    let (b, t) = (cx.dim_b() as usize, cx.dim_t() as usize);
-    let (routes, counts, order, inverse, blocks) =
-        (cx.arg_routes(), cx.arg_counts(), cx.arg_order(), cx.arg_inverse(), cx.arg_blocks());
+    let (e, k, t) = (cx.dim_e() as usize, cx.dim_k() as usize, cx.dim_t() as usize);
+    let (routes, counts, order, inverse, blocks, used) =
+        (cx.arg_routes(), cx.arg_counts(), cx.arg_order(), cx.arg_inverse(), cx.arg_blocks(), cx.arg_used());
+    let first = usize::try_from(cx.arg_first().get([0])).expect("a first row is not negative");
+    let rows = usize::try_from(cx.arg_rows().get([0])).expect("a row count is not negative");
+    let grouped = first * k..(first + rows) * k;
     let expert_of = |flat: usize| usize::try_from(routes.get([flat / k, flat % k])).expect("a route is an expert index");
     // SAFETY: the launch has one work item, which writes every table.
     unsafe {
         let counts = counts.row_mut([0]);
         counts.fill(0);
-        for flat in 0..m * k {
+        for flat in grouped.clone() {
             counts[expert_of(flat)] += 1;
         }
         let blocks = blocks.row_mut([0]);
-        blocks.fill(-1);
-        for block in 0..b {
-            order.row_mut([block, 0]).fill(-1);
-        }
         // The next tile position of each expert.
         let mut next = Vec::with_capacity(e);
         let mut block = 0;
@@ -29,9 +28,13 @@ fn routed_group<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, _group: [u64; 3
             let tiles = (*count as usize).div_ceil(t);
             next.push(block * t);
             blocks[block..block + tiles].fill(expert as i32);
+            for tile in block..block + tiles {
+                order.row_mut([tile, 0]).fill(-1);
+            }
             block += tiles;
         }
-        for flat in 0..m * k {
+        used.set([0], block as i32);
+        for flat in grouped {
             let expert = expert_of(flat);
             let position = next[expert];
             next[expert] += 1;

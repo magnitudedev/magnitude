@@ -2,7 +2,7 @@
 // `routed_gate_up_stage` stages each normalized row as F32 in scratch, one
 // work item per row. `routed_gate_up_rows`: work item (x, y) owns feature
 // block x of ROWS features of choice y = (m, k), whose expert gate/up rows it
-// expands against row m: A(A(act(A(gs * gate))) * A(us * up)), the scales the
+// expands against row m: the `glu` of gs * gate and us * up, the scales the
 // choice's expert's, 1 where a port is absent.
 
 use lib::projection::projection;
@@ -43,13 +43,22 @@ fn routed_gate_up_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [
         &cx.scratch_quantized().slice::<seismic::cpu::quant::Q8Block>(0, m * blocks)[row * blocks..(row + 1) * blocks]
     });
     let expert = cx.arg_routes().get([row, slot]);
-    let first = routed::expert_row(expert, f) + rows.start;
+    let sources = cx.arg_sources();
     let (gate_scale, up_scale) = (cx.arg_gate_scale(), cx.arg_up_scale());
     // SAFETY: each work item writes its own features of its own choice.
     let out = unsafe { cx.result_0().span_mut([row, slot, rows.start], rows.len()) };
-    routed::glu_into::<E::A>(
-        &cx.arg_expert_gate(),
-        &cx.arg_expert_up(),
+    // A choice its slot map names no record for reads none: a zero product.
+    let Some(place) = routed::decode_source(cx.dim_xs(), || sources.get([0, row, slot]), expert) else {
+        out.fill(E::A::narrow(0.0));
+        return;
+    };
+    let (bank_gate, tier_gate, bank_up, tier_up) =
+        (cx.arg_expert_gate(), cx.arg_tier_gate(), cx.arg_expert_up(), cx.arg_tier_up());
+    let ((gate, record), (up, _)) = (place.of(&bank_gate, &tier_gate), place.of(&bank_up, &tier_up));
+    let first = routed::expert_row(record, f) + rows.start;
+    routed::expand_into::<E::A>(
+        gate,
+        up,
         first,
         &staged[row * h..(row + 1) * h],
         q8,

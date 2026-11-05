@@ -47,8 +47,7 @@ fn per_layer_gate_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [
         // SAFETY: each work item writes its own columns of every row.
         let out = unsafe { result.span_mut([row, rows.start], rows.len()) };
         for ((target, gate), multiplier) in out.iter_mut().zip(gate).zip(multiplier) {
-            let activated = activation::publish::<E::A>(functions::activate(function, activation::publish::<E::A>(scale * *gate)));
-            *target = E::A::narrow(activated * multiplier);
+            *target = E::A::narrow(E::A::widen(functions::activated::<E::A>(function, scale * *gate)) * multiplier);
         }
     });
 }

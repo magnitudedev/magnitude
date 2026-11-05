@@ -5340,8 +5340,9 @@ fn uniform_values(count: usize, seed: u64, scale: f32) -> Vec<f32> {
 }
 
 /// A read of a gathered table through a directory reads, for each selected
-/// row, its slot (row 0 for a row without one and for a failed selection),
-/// exactly as a direct read of that slot does, on every rows16 backend the
+/// row, its slot (zeros for a row without one and for a failed selection,
+/// as a direct read of no row), exactly as a direct read of that slot does,
+/// on every rows16 backend the
 /// host has, over packed and dense tables; the portable body reads the same
 /// rows. (CUDA's mma16 tables: `cuda_projection.rs`.)
 #[test]
@@ -5396,8 +5397,7 @@ fn embedding_rows_read_the_slots_their_directory_names() {
                 let slots = selected
                     .chunks_exact(2)
                     .flat_map(|pair| {
-                        let slot =
-                            usize::try_from(pair[0]).map_or(0, |row| directory_values[row].max(0));
+                        let slot = usize::try_from(pair[0]).map_or(-1, |row| directory_values[row]);
                         [slot, pair[1]]
                     })
                     .collect::<Vec<_>>();
@@ -5425,11 +5425,13 @@ fn embedding_rows_read_the_slots_their_directory_names() {
                 if rows == 3 && backend == BackendName::Cpu {
                     let expected = slots
                         .chunks_exact(2)
-                        .flat_map(|pair| {
-                            table
-                                .row(pair[0] as usize)
+                        .flat_map(|pair| match usize::try_from(pair[0]) {
+                            Ok(slot) => table
+                                .row(slot)
                                 .iter()
                                 .map(|value| act.round(*value))
+                                .collect::<Vec<_>>(),
+                            Err(_) => vec![0.0; d],
                         })
                         .collect::<Vec<_>>();
                     let outcome = interpret(

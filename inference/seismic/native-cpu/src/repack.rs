@@ -1,28 +1,31 @@
 //! Exact conversions of external GGUF weights into resident storage: the
 //! registry's registered conversions, executed from their recipes'
 //! executable form ([`program`]). [`convert`] converts a whole tensor into
-//! any resident layout; into resident `rows16` and `rows8` storage, one
-//! source packet becomes one storage group of its row.
+//! any resident layout. Into a row layout it converts by its
+//! [`RowConversion`], as pieces of whole stored tiles
+//! ([`RowConversion::piece`]); into resident `rows16` and `rows8` storage,
+//! one source packet becomes one storage group of its row.
 //!
 //! A kernel converts through [`External`] and [`Packed`] views of its bound
 //! tensors; [`rows`] resolves the conversion from their representations.
 
 mod program;
 
-use program::{PacketForms, RepackExecutor, RepackProgram, BLOCK, EXECUTION_BYTES};
+use program::{threads, PacketForms, RepackExecutor, RepackProgram, BLOCK, EXECUTION_BYTES};
 pub use program::{ScaledCodeRows, ScaledCodesPlacement};
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry::{
-    self, ConversionLayout, Layout, PackedRowLayout, RepresentationConversion, RepresentationInfo,
+    self, ConversionLayout, PackedRowLayout, RepresentationConversion, RepresentationInfo,
     RepresentationKind, RowGeometry,
 };
+use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
-/// Values of each row of a tile one execution of `RowConversion::chunks`
-/// converts at least, and so the most a row converted whole has: the rows
-/// of a conversion are converted in such chunks only when they are longer.
-/// Measured (`repack_throughput`, M4 Max): sizing a chunk by
+/// Values of each row of a tile one chunk of a chunked conversion
+/// (`RowConversion::chunk`) converts at least, and so the most a row of it
+/// converted whole has: its rows are converted in such chunks only when
+/// they are longer. Measured (`repack_throughput`, M4 Max): sizing a chunk by
 /// [`EXECUTION_BYTES`] across the tile's rows instead chunks `rows8` rows of
 /// 4096 values, which then convert up to 2.6 times slower (`q5_k`, 11.2 to
 /// 4.3 GB/s on one thread), and changes no `rows16` conversion beyond noise.
@@ -37,69 +40,95 @@ fn whole_tiles(tile: usize, row_bytes: usize) -> usize {
         .next_power_of_two()
 }
 
-/// One registered conversion into a resident row layout as a kernel
-/// resolves it.
+/// One registered conversion into a row layout as a kernel resolves it.
+///
+/// A tensor converts as pieces: whole source rows of one matrix, from the
+/// first row of a stored tile, into their stored tiles. Both are contiguous,
+/// and each piece converts apart from every other ([`piece`](Self::piece)),
+/// so a tensor converts across threads, or piece by piece as its source
+/// bytes arrive.
 #[derive(Debug)]
 pub struct RowConversion {
     conversion: &'static RepresentationConversion,
     layout: &'static PackedRowLayout,
     /// Rows of a tile of the layout.
     tile: usize,
-    /// Source packets of a row one execution of [`chunks`](Self::chunks)
-    /// converts.
-    packets: usize,
-    /// The program of [`chunks`](Self::chunks), compiled when first
-    /// converting rows of more than `packets` packets.
-    chunks: OnceLock<RepackProgram>,
-    /// The programs of whole rows of at most `packets` packets, by row
-    /// length (`packets - 1`) and log2 of tiles (up to [`whole_tiles`] of
-    /// the length), each compiled when first converting such rows
-    /// ([`whole_rows`](Self::whole_rows)).
-    whole: Box<[WholeRows]>,
+    /// The source packets of each row of a tile one chunk converts, where
+    /// the layout stores every plane of a tile group-major
+    /// ([`group_major`]): rows of more packets convert in such chunks.
+    /// `None` where it does not (a code plane of `mma16` or `rows32`
+    /// interleaves a tile's rows): rows of any length convert whole.
+    chunk: Option<usize>,
+    /// The programs of the conversion's executions ([`Execution`]), each
+    /// compiled when first run and kept for the process: as many as the
+    /// distinct row lengths and tile remainders the process converts, which
+    /// a model's dimensions bound.
+    programs: RwLock<HashMap<Execution, &'static RepackProgram>>,
 }
 
-/// The programs of whole rows of one length, by log2 of tiles.
-type WholeRows = Box<[OnceLock<Box<RepackProgram>>]>;
+/// One execution of a row conversion's program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Execution {
+    /// `rows` whole rows of `packets` packets: whole tiles (a power of two
+    /// of them, at most `RowConversion::whole_tiles`), or the rows of one
+    /// last tile.
+    Whole { packets: usize, rows: usize },
+    /// A chunk of `packets` packets of `rows` rows of a tile, not its rows'
+    /// last: every plane's shares of the chunk's groups of the tile's rows.
+    Chunk { packets: usize, rows: usize },
+    /// The last chunk (of chunks of `packets` packets) of `rows` rows of a
+    /// tile of rows of `k` values: every plane's shares of its groups to the
+    /// plane's end in the tile.
+    LastChunk { packets: usize, k: usize, rows: usize },
+}
+
+/// Whether `layout` stores every plane of a tile group-major: storage group
+/// `g`'s shares of the tile's rows `r` lie one after another, `(g * tile +
+/// r) * bytes_per_group` bytes past the plane's first share (its share of
+/// row 0's group 0). A chunk of a tile's groups is then one span of each
+/// plane, the same for every chunk but for where it starts.
+fn group_major(layout: &PackedRowLayout) -> bool {
+    let tile = layout.tile_rows();
+    let geometry = layout
+        .geometry(2 * u64::from(layout.packet.group))
+        .expect("a row's geometry");
+    (0..layout.planes.len()).all(|plane| {
+        let bytes = u64::from(layout.planes[plane].bytes_per_group);
+        let share = |row, group| layout.share_byte(&geometry, row, group, plane);
+        share(0, 0).is_some_and(|first| {
+            (0..2).all(|group| {
+                (0..tile).all(|row| share(row, group) == Some(first + (group * tile + row) * bytes))
+            })
+        })
+    })
+}
 
 impl RowConversion {
     fn of(conversion: &'static RepresentationConversion) -> Option<Self> {
         let ConversionLayout::Rows(layout) = conversion.destination_layout else {
             return None;
         };
-        if !matches!(layout.layout, Layout::Rows16 | Layout::Rows8) {
-            return None;
-        }
-        let external = conversion.source_layout;
-        let (group, packet_bytes) = (
-            external.logical_group as usize,
-            external.packet_size as usize,
-        );
+        let group = conversion.source_layout.logical_group as usize;
         let tile = layout.tile_rows() as u32;
         // At least `CHUNK_VALUES` values of each row, and whole blocks of
         // each plane.
         let least = CHUNK_VALUES.div_ceil(group) as u32;
-        let packets = (1..)
-            .map(|times| times * least)
-            .find(|packets| {
-                layout.planes.iter().all(|plane| {
-                    ((packets * tile * plane.bytes_per_group) as usize).is_multiple_of(BLOCK)
+        let chunk = group_major(layout).then(|| {
+            (1..)
+                .map(|times| times * least)
+                .find(|packets| {
+                    layout.planes.iter().all(|plane| {
+                        ((packets * tile * plane.bytes_per_group) as usize).is_multiple_of(BLOCK)
+                    })
                 })
-            })
-            .expect("some multiple of an execution is whole blocks") as usize;
-        let tile = tile as usize;
+                .expect("some multiple of an execution is whole blocks") as usize
+        });
         Some(Self {
             conversion,
             layout,
-            tile,
-            packets,
-            chunks: OnceLock::new(),
-            whole: (1..=packets)
-                .map(|packets| {
-                    (0..=whole_tiles(tile, packets * packet_bytes).ilog2())
-                        .map(|_| OnceLock::new())
-                        .collect()
-                })
-                .collect(),
+            tile: tile as usize,
+            chunk,
+            programs: RwLock::default(),
         })
     }
 
@@ -118,50 +147,247 @@ impl RowConversion {
         self.conversion.source_layout.logical_group as usize
     }
 
+    /// Rows of one stored tile of the target: a piece's rows are whole
+    /// tiles but at the end of their matrix.
+    pub fn tile(&self) -> usize {
+        self.tile
+    }
+
+    /// Bytes of one source row of `k` values.
+    pub fn source_row_bytes(&self, k: usize) -> usize {
+        k.div_ceil(self.group()) * self.packet_bytes()
+    }
+
+    /// Bytes of one stored row of `k` values; `None` where the target holds
+    /// no such row.
+    pub fn stored_row_bytes(&self, k: usize) -> Option<usize> {
+        usize::try_from(self.layout.row_stride_bytes(k as u64)?).ok()
+    }
+
     /// Bytes of one source packet.
     fn packet_bytes(&self) -> usize {
         self.conversion.source_layout.packet_size as usize
     }
 
-    /// The recipe over `packets` packets of each row of a tile, each row an
-    /// input segment, into a segment per plane of the target's layout (in
-    /// plane order) holding those groups of the tile's rows as the layout
-    /// places them: rows longer than `packets` packets convert in such
-    /// chunks.
-    fn chunks(&self) -> &RepackProgram {
-        self.chunks.get_or_init(|| self.compile_chunks())
+    /// Converts one piece of a tensor of rows of `k` values: `source`, whole
+    /// source rows of one matrix from the first row of a stored tile, into
+    /// `destination`, their stored tiles. A piece whose rows are not whole
+    /// tiles ends its matrix: the rows its last tile pads are zero, as is
+    /// every stored byte no plane occupies. `None` when `source` is not
+    /// whole rows or `destination` not their tiles' bytes.
+    pub fn piece(&'static self, k: usize, source: &[u8], destination: &mut [u8]) -> Option<()> {
+        let source_row = self.source_row_bytes(k);
+        if source_row == 0 {
+            // Rows of no values: no bytes either side.
+            return (source.is_empty() && destination.is_empty()).then_some(());
+        }
+        if !source.len().is_multiple_of(source_row) {
+            return None;
+        }
+        let count = source.len() / source_row;
+        if destination.len() != count.div_ceil(self.tile) * self.tile * self.stored_row_bytes(k)? {
+            return None;
+        }
+        if count == 0 {
+            return Some(());
+        }
+        let from = External {
+            base: source.as_ptr(),
+            rows: count,
+            k,
+            id: self.conversion.source,
+            matrix_rows: count,
+            life: PhantomData,
+        };
+        let to = Packed {
+            base: destination.as_mut_ptr(),
+            rows: count,
+            k,
+            element: registry::representation_info(self.conversion.destination),
+            matrix_rows: count,
+            life: PhantomData,
+        };
+        // SAFETY: the views are exactly the borrowed slices: the source's
+        // rows, and the destination's tiles, which nothing else references.
+        unsafe { self::rows(&from, &to, 0..count) };
+        Some(())
     }
 
-    fn compile_chunks(&self) -> RepackProgram {
-        let (layout, tile, packets) = (self.layout, self.tile as u32, self.packets as u32);
-        let placed = layout
-            .geometry(u64::from(packets) * self.group() as u64)
-            .expect("an execution's row geometry");
-        // Plane `p` of a placed tile lies at `offsets[p] * tile`.
-        let planes = placed
-            .offsets
+    /// The pieces of a matrix of `rows` rows of `k` values of at most
+    /// `tiles` stored tiles each, in order: each one's source bytes and
+    /// stored bytes, from the matrix's first of each. `None` where the
+    /// target holds no row of `k` values.
+    pub fn pieces(
+        &self,
+        k: usize,
+        rows: usize,
+        tiles: std::num::NonZeroUsize,
+    ) -> Option<impl Iterator<Item = (std::ops::Range<usize>, std::ops::Range<usize>)>> {
+        let (tile, source_row, tiles) = (self.tile, self.source_row_bytes(k), tiles.get());
+        let stride = self.stored_row_bytes(k)?;
+        Some((0..rows).step_by(tiles * tile).map(move |first| {
+            let end = (first + tiles * tile).min(rows);
+            (
+                first * source_row..end * source_row,
+                first * stride..end.next_multiple_of(tile) * stride,
+            )
+        }))
+    }
+
+    /// The canonical bytes of a tensor of `extents` from its canonical
+    /// source bytes `source`, as pieces across threads when there are many.
+    /// `None` for a tensor of no packing axis.
+    fn tensor(&'static self, extents: &[u64], source: &[u8]) -> Option<Vec<u8>> {
+        let (&k, leading) = extents.split_last()?;
+        let k = k as usize;
+        let n = leading.last().map_or(1, |rows| *rows as usize);
+        let matrices = leading[..leading.len().saturating_sub(1)]
             .iter()
-            .zip(&placed.bytes_per_row)
-            .map(|(offset, bytes)| (offset * u64::from(tile), bytes * u64::from(tile)))
-            .collect::<Vec<_>>();
+            .product::<u64>() as usize;
+        let matrix_tiles = n.div_ceil(self.tile);
+        let (matrix_source, matrix_stored) = (
+            n * self.source_row_bytes(k),
+            matrix_tiles * self.tile * self.stored_row_bytes(k)?,
+        );
+        let mut output = vec![0u8; matrices * matrix_stored];
+        if output.is_empty() {
+            return Some(output);
+        }
+        let threads = threads(source.len());
+        let per_thread = std::num::NonZeroUsize::new((matrices * matrix_tiles).div_ceil(threads))
+            .expect("a tensor of stored bytes has tiles");
+        // Each matrix's pieces of at most a thread's tiles, whose stored
+        // bytes follow one another.
+        let mut rest = output.as_mut_slice();
+        let mut work = Vec::new();
+        for matrix in 0..matrices {
+            for (from, to) in self.pieces(k, n, per_thread)? {
+                let (stored, tail) = std::mem::take(&mut rest).split_at_mut(to.len());
+                let from = matrix * matrix_source + from.start..matrix * matrix_source + from.end;
+                work.push((&source[from], stored));
+                rest = tail;
+            }
+        }
+        let per_thread = work.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            for pieces in work.chunks_mut(per_thread) {
+                scope.spawn(move || {
+                    for (source, stored) in pieces {
+                        self.piece(k, source, stored)
+                            .expect("a tensor's pieces are whole rows and their tiles");
+                    }
+                });
+            }
+        });
+        Some(output)
+    }
+
+    /// The bytes of a tile of rows of `k` values that chunk `chunk` (of
+    /// `packets` packets) writes in each plane: the shares of its groups of the
+    /// tile's rows and, of the last, every byte to the plane's end (the
+    /// alignment past its shares and the shares of padding groups, which hold
+    /// zero).
+    fn chunk_segments(
+        &self,
+        packets: usize,
+        k: usize,
+        chunk: usize,
+    ) -> Vec<std::ops::Range<usize>> {
+        let (layout, tile, packets) = (self.layout, self.tile as u64, packets as u64);
+        let geometry = layout.geometry(k as u64).expect("a row's geometry");
+        let row_packets = k.div_ceil(self.group()) as u64;
+        let first = chunk as u64 * packets;
+        let last = first + packets >= row_packets;
+        (0..layout.planes.len())
+            .map(|plane| {
+                let start = layout
+                    .share_byte(&geometry, 0, first, plane)
+                    .expect("a group-major plane keeps its shares together");
+                let end = if last {
+                    geometry
+                        .offsets
+                        .get(plane + 1)
+                        .map_or(geometry.stride, |offset| *offset)
+                        * tile
+                } else {
+                    start + packets * tile * u64::from(layout.planes[plane].bytes_per_group)
+                };
+                start as usize..end as usize
+            })
+            .collect()
+    }
+
+    /// The program of `execution`, compiled when first run.
+    fn program(&self, execution: Execution) -> &'static RepackProgram {
+        if let Some(program) = self
+            .programs
+            .read()
+            .expect("no thread panics holding the programs")
+            .get(&execution)
+        {
+            return program;
+        }
+        self.programs
+            .write()
+            .expect("no thread panics holding the programs")
+            .entry(execution)
+            .or_insert_with(|| {
+                Box::leak(Box::new(match execution {
+                    Execution::Whole { packets, rows } => self.compile_whole_rows(packets, rows),
+                    Execution::Chunk { packets, rows } => self.compile_chunk(packets, rows, None),
+                    Execution::LastChunk { packets, k, rows } => {
+                        self.compile_chunk(packets, rows, Some(k))
+                    }
+                }))
+            })
+    }
+
+    /// The recipe over a chunk's packets (of `packets` packets) of each of
+    /// `rows` rows of a tile,
+    /// each row an input segment, into a segment per plane of the target's
+    /// layout (in plane order) holding the chunk's groups of every row of
+    /// the tile as the layout places them (`chunk_segments`): any chunk but
+    /// a row's last, or, `last` of rows of `k` values, its last. Every byte
+    /// of a segment no packet bit maps to is zero: those of the rows past
+    /// `rows`, and the plane's bytes past the last chunk's shares.
+    fn compile_chunk(&self, packets: usize, rows: usize, last: Option<usize>) -> RepackProgram {
+        let layout = self.layout;
+        // A chunk but the last converts the same at any row length: chunk 0
+        // of rows two chunks long.
+        let (k, chunk) = match last {
+            Some(k) => (k, k.div_ceil(self.group()).div_ceil(packets) - 1),
+            None => (2 * packets * self.group(), 0),
+        };
+        let geometry = layout.geometry(k as u64).expect("a row's geometry");
+        let segments = self.chunk_segments(packets, k, chunk);
+        let first = chunk * packets;
+        let chunk_packets = (k.div_ceil(self.group()) - first).min(packets);
         RepackProgram::compile(
             self.conversion,
-            tile,
-            packets,
-            &planes
+            rows as u32,
+            chunk_packets as u32,
+            &segments
                 .iter()
-                .map(|(_, bytes)| *bytes as u32)
+                .map(|segment| segment.len() as u32)
                 .collect::<Vec<_>>(),
             |row, packet, plane, bit| {
                 if !layout.occupies(plane, bit) {
                     return None;
                 }
-                let at = layout.packet_bit(&placed, u64::from(row), u64::from(packet), plane, bit);
-                let index = planes
+                let at = layout.packet_bit(
+                    &geometry,
+                    u64::from(row),
+                    (first + packet as usize) as u64,
+                    plane,
+                    bit,
+                );
+                let index = segments
                     .iter()
-                    .position(|(offset, bytes)| (offset * 8..(offset + bytes) * 8).contains(&at))
-                    .expect("a placed bit lies in a plane");
-                Some((index, (at - planes[index].0 * 8) as u32))
+                    .position(|segment| {
+                        (segment.start as u64 * 8..segment.end as u64 * 8).contains(&at)
+                    })
+                    .expect("a placed bit lies in a plane's segment");
+                Some((index, (at - segments[index].start as u64 * 8) as u32))
             },
         )
         .expect("a tile of an execution's chunk of a row fits a program")
@@ -173,18 +399,11 @@ impl RowConversion {
         whole_tiles(self.tile, packets * self.packet_bytes())
     }
 
-    /// The program of `tiles` tiles (a power of two) of whole rows of
-    /// `packets` packets (at most an execution's of `chunks`): the recipe
-    /// over the rows' packets, one input segment, into their stored tiles,
-    /// one output segment, every byte no plane occupies zero.
-    fn whole_rows(&self, packets: usize, tiles: usize) -> &RepackProgram {
-        self.whole[packets - 1][tiles.ilog2() as usize]
-            .get_or_init(|| Box::new(self.compile_whole_rows(packets, tiles)))
-    }
-
-    fn compile_whole_rows(&self, packets: usize, tiles: usize) -> RepackProgram {
+    /// The recipe over `rows` rows' packets, `packets` each, one input
+    /// segment, into their stored tiles, one output segment: every byte no
+    /// plane occupies zero, and so every byte of the rows a last tile pads.
+    fn compile_whole_rows(&self, packets: usize, rows: usize) -> RepackProgram {
         let layout = self.layout;
-        let rows = tiles * self.tile;
         let geometry = layout
             .geometry((packets * self.group()) as u64)
             .expect("a row's geometry");
@@ -195,7 +414,7 @@ impl RowConversion {
             self.conversion,
             1,
             (rows * packets) as u32,
-            &[(rows as u64 * geometry.stride) as u32],
+            &[(rows.div_ceil(self.tile) * self.tile) as u32 * geometry.stride as u32],
             |_, packet, plane, bit| {
                 if !layout.occupies(plane, bit) {
                     return None;
@@ -218,9 +437,9 @@ impl RowConversion {
 /// A registered conversion's CPU executors.
 struct Executors {
     /// The recipe's program writing packet forms, compiled when first
-    /// converting a whole tensor ([`convert`]).
+    /// converting a whole tensor into a packet layout ([`convert`]).
     forms: OnceLock<PacketForms>,
-    /// Its form when it converts into a resident row layout.
+    /// Its form when it converts into a row layout.
     rows: Option<RowConversion>,
 }
 
@@ -239,10 +458,10 @@ fn executors() -> &'static [Executors] {
 }
 
 /// The canonical destination bytes of `conversion` over `source`, the
-/// canonical source bytes of a tensor of `extents`: every packet through
-/// the recipe's program (across threads when there are many), then placed
-/// by the destination layout. `None` when `source` is not the source's
-/// canonical byte count over `extents`.
+/// canonical source bytes of a tensor of `extents`: into a row layout by its
+/// [`RowConversion`], into a packet layout every packet through the
+/// recipe's program; across threads when there are many. `None` when
+/// `source` is not the source's canonical byte count over `extents`.
 pub fn convert(
     conversion: &RepresentationConversion,
     extents: &[u64],
@@ -251,17 +470,17 @@ pub fn convert(
     if registry::canonical_bytes(conversion.source, extents)? != source.len() as u64 {
         return None;
     }
-    let forms = executors()[conversion.id.index()]
-        .forms
-        .get_or_init(|| PacketForms::compile(conversion))
-        .execute(source);
-    Some(match conversion.destination_layout {
-        ConversionLayout::Rows(layout) => layout.place(extents, &forms),
-        ConversionLayout::Packet(_) => forms,
+    let executors = &executors()[conversion.id.index()];
+    Some(match &executors.rows {
+        Some(rows) => rows.tensor(extents, source)?,
+        None => executors
+            .forms
+            .get_or_init(|| PacketForms::compile(conversion))
+            .execute(source),
     })
 }
 
-/// Every registered conversion into a resident row layout.
+/// Every registered conversion into a row layout.
 pub fn conversions() -> impl Iterator<Item = &'static RowConversion> {
     executors()
         .iter()
@@ -276,7 +495,8 @@ pub fn resolve(source: &str, target: &str) -> Option<&'static RowConversion> {
     )
 }
 
-/// The conversion of `source` into `target`, when one is registered.
+/// The conversion of `source` into `target`, when one is registered into a
+/// row layout.
 fn conversion(
     source: RepresentationId,
     target: RepresentationId,
@@ -362,8 +582,8 @@ fn external_packet(element: &RepresentationInfo) -> (usize, usize) {
     (layout.logical_group as usize, layout.packet_size as usize)
 }
 
-/// A bound result tensor of a packed `rows16` or `rows8` element, written
-/// only by a conversion.
+/// A bound result tensor of a packed row-layout element, written only by a
+/// conversion.
 #[derive(Clone, Copy, Debug)]
 pub struct Packed<'a> {
     base: *mut u8,
@@ -479,20 +699,31 @@ struct Rows {
 
 /// How a plan's rows convert.
 enum Form {
-    /// Whole rows by the programs of their length, of each power of two of
-    /// tiles up to an execution's (`RowConversion::whole_tiles`): the
-    /// executor of each, made when first run.
-    Whole(Vec<Option<RepackExecutor<'static>>>),
-    /// Chunks of each row of a tile by `RowConversion::chunks`.
+    /// Whole rows by the programs of their length ([`Whole`]).
+    Whole(Whole),
+    /// Chunks of each row of a tile ([`Chunks`]).
     Chunks(Box<Chunks>),
 }
 
-/// The bytes of a tile no plane of a chunked plan occupies; the executor of
-/// `RowConversion::chunks`, and the bases of an execution in place: per row
-/// of a tile its source, per plane its output.
+/// The executors of a plan's programs of whole rows, each made when first
+/// run: of each power of two of whole tiles up to an execution's
+/// (`RowConversion::whole_tiles`), and of each count of rows of a last
+/// tile short of whole.
+struct Whole {
+    tiles: Vec<Option<RepackExecutor<'static>>>,
+    last: Vec<Option<RepackExecutor<'static>>>,
+}
+
+/// How a chunked plan converts a tile: chunk `c` of each row writes
+/// `segments[c]` of the tile, a span of each plane; the executors of its
+/// programs by rows of the tile present (`rows - 1`), of any chunk but the
+/// last and of the last, each made when first run; and the bases of an
+/// execution in place: per row its source, per plane its output.
 struct Chunks {
-    gaps: Vec<(usize, usize)>,
-    executor: RepackExecutor<'static>,
+    packets: usize,
+    segments: Vec<Vec<std::ops::Range<usize>>>,
+    chunk: Vec<Option<RepackExecutor<'static>>>,
+    last: Vec<Option<RepackExecutor<'static>>>,
     sources: Vec<*const u8>,
     outputs: Vec<*mut u8>,
 }
@@ -516,31 +747,23 @@ impl Plan {
             row_packets,
             source_row: row_packets * conversion.packet_bytes(),
         };
-        let form = if row_packets <= conversion.packets {
-            let tiles = conversion.whole_tiles(row_packets);
-            Form::Whole((0..=tiles.ilog2()).map(|_| None).collect())
-        } else {
-            let mut occupied = (0..conversion.layout.planes.len())
-                .map(|plane| rows.shares(plane, 0..conversion.tile, 0..row_packets))
-                .collect::<Vec<_>>();
-            occupied.sort_by_key(|range| range.start);
-            let (mut gaps, mut end) = (Vec::new(), 0);
-            for range in occupied {
-                if range.start > end {
-                    gaps.push((end, range.start));
-                }
-                end = end.max(range.end);
-            }
-            let stored = conversion.tile * rows.stride();
-            if stored > end {
-                gaps.push((end, stored));
-            }
-            Form::Chunks(Box::new(Chunks {
-                gaps,
-                executor: conversion.chunks().executor(),
-                sources: vec![std::ptr::null(); conversion.tile],
+        let form = match conversion.chunk {
+            Some(packets) if row_packets > packets => Form::Chunks(Box::new(Chunks {
+                packets,
+                segments: (0..row_packets.div_ceil(packets))
+                    .map(|chunk| conversion.chunk_segments(packets, source.k, chunk))
+                    .collect(),
+                chunk: (0..conversion.tile).map(|_| None).collect(),
+                last: (0..conversion.tile).map(|_| None).collect(),
+                sources: Vec::with_capacity(conversion.tile),
                 outputs: vec![std::ptr::null_mut(); conversion.layout.planes.len()],
-            }))
+            })),
+            _ => Form::Whole(Whole {
+                tiles: (0..=conversion.whole_tiles(row_packets).ilog2())
+                    .map(|_| None)
+                    .collect(),
+                last: (0..conversion.tile).map(|_| None).collect(),
+            }),
         };
         Self {
             key: (source.id, destination.element.id, source.k),
@@ -556,41 +779,8 @@ impl Rows {
         self.geometry.stride as usize
     }
 
-    /// The bytes of a tile, from its first, that the shares of storage
-    /// groups `groups` of rows `rows` of the tile occupy in plane `plane`:
-    /// those of the first row's first group to those of the last row's
-    /// last, which the layout places one after another
-    /// (`PackedRowLayout::share_byte`).
-    fn shares(
-        &self,
-        plane: usize,
-        rows: std::ops::Range<usize>,
-        groups: std::ops::Range<usize>,
-    ) -> std::ops::Range<usize> {
-        let layout = self.conversion.layout;
-        let share = |row: usize, group: usize| {
-            layout
-                .share_byte(&self.geometry, row as u64, group as u64, plane)
-                .expect("rows16 and rows8 keep a share's bytes together") as usize
-        };
-        share(rows.start, groups.start)
-            ..share(rows.end - 1, groups.end - 1) + layout.planes[plane].bytes_per_group as usize
-    }
-
-    /// Zeroes the shares of storage groups `groups` of rows `rows` of the
-    /// tile `tile` in every plane.
-    fn zero(&self, tile: &mut [u8], rows: std::ops::Range<usize>, groups: std::ops::Range<usize>) {
-        for plane in 0..self.conversion.layout.planes.len() {
-            for row in rows.clone() {
-                for group in groups.clone() {
-                    tile[self.shares(plane, row..row + 1, group..group + 1)].fill(0);
-                }
-            }
-        }
-    }
-
-    /// The first stored byte of the tile of `row`: in `rows8` padded to
-    /// whole tiles per matrix.
+    /// The first stored byte of the tile of `row`: in a tiled layout padded
+    /// to whole tiles per matrix.
     fn stored(&self, destination: &Packed<'_>, row: usize) -> *mut u8 {
         let (tile, n) = (self.conversion.tile, destination.matrix_rows);
         let stored = row / n * n.div_ceil(tile) * tile + row % n;
@@ -598,63 +788,71 @@ impl Rows {
         unsafe { destination.base.add(stored * self.stride()) }
     }
 
-    /// Converts `rows` by executions of whole tiles: as many as `executions`
-    /// has programs of, the last the fewest a power of two of them covering
-    /// the rows left.
+    /// Converts `rows` by executions of whole rows: of whole tiles, each
+    /// the most a power of two of them up to an execution's, then of the
+    /// rows of a last tile short of whole.
     ///
     /// # Safety
     /// As [`rows`]'s.
     unsafe fn whole(
         &self,
-        executions: &mut [Option<RepackExecutor<'static>>],
+        executions: &mut Whole,
         source: &External<'_>,
         destination: &Packed<'_>,
         rows: std::ops::Range<usize>,
     ) {
-        let (conversion, stride, source_row) = (self.conversion, self.stride(), self.source_row);
+        let (conversion, source_row) = (self.conversion, self.source_row);
         let tile = conversion.tile;
         let source_bytes = source.rows * source_row;
-        let most = tile << (executions.len() - 1);
-        for first in rows.clone().step_by(most) {
-            let present = (rows.end - first).min(most);
-            let tiles = present.div_ceil(tile).next_power_of_two();
-            let executor = executions[tiles.ilog2() as usize]
-                .get_or_insert_with(|| conversion.whole_rows(self.row_packets, tiles).executor());
-            // SAFETY: (all below) this work item owns the rows, and in
-            // `rows8` their entire tiles; the stored tiles of an execution's
-            // rows follow one another.
+        let most = executions.tiles.len() - 1;
+        let mut first = rows.start;
+        while first < rows.end {
+            let left = rows.end - first;
+            let (present, executor) = if left >= tile {
+                let tiles = (left / tile).ilog2().min(most as u32) as usize;
+                let executor = executions.tiles[tiles].get_or_insert_with(|| {
+                    conversion
+                        .program(Execution::Whole {
+                            packets: self.row_packets,
+                            rows: tile << tiles,
+                        })
+                        .executor()
+                });
+                (tile << tiles, executor)
+            } else {
+                let executor = executions.last[left].get_or_insert_with(|| {
+                    conversion
+                        .program(Execution::Whole {
+                            packets: self.row_packets,
+                            rows: left,
+                        })
+                        .executor()
+                });
+                (left, executor)
+            };
+            // SAFETY: (all below) this work item owns the rows, and their
+            // entire tiles; the stored tiles of an execution's rows follow
+            // one another.
             let (input, output) = (
                 unsafe { source.base.add(first * source_row) },
                 self.stored(destination, first),
             );
-            // In place when the execution's rows are all present and the
-            // source holds a block past them.
-            if present == tiles * tile && (first + present) * source_row + BLOCK <= source_bytes {
+            // In place when the source holds a block past the rows.
+            if (first + present) * source_row + BLOCK <= source_bytes {
                 unsafe { executor.run_into(&[input], &[output]) };
-                continue;
+            } else {
+                executor.source().copy_from_slice(unsafe {
+                    std::slice::from_raw_parts(input, present * source_row)
+                });
+                let placed = executor.run();
+                unsafe { std::slice::from_raw_parts_mut(output, placed.len()) }
+                    .copy_from_slice(placed);
             }
-            // Past the rows present, the staging holds what an earlier
-            // execution left: rows convert apart, and the padded rows of the
-            // last tile are zeroed below.
-            let bytes = present * source_row;
-            executor.source()[..bytes]
-                .copy_from_slice(unsafe { std::slice::from_raw_parts(input, bytes) });
-            let placed = executor.run();
-            let stored = present.div_ceil(tile);
-            let out = unsafe { std::slice::from_raw_parts_mut(output, stored * tile * stride) };
-            out.copy_from_slice(&placed[..out.len()]);
-            // The rows the last tile pads with zero.
-            let padded = stored * tile - present;
-            self.zero(
-                &mut out[(stored - 1) * tile * stride..],
-                tile - padded..tile,
-                0..self.row_packets,
-            );
+            first += present;
         }
     }
 
-    /// Converts `rows` tile by tile, each row in chunks of
-    /// `RowConversion::chunks`.
+    /// Converts `rows` tile by tile, each row in chunks ([`Chunks`]).
     ///
     /// # Safety
     /// As [`rows`]'s.
@@ -666,82 +864,80 @@ impl Rows {
         rows: std::ops::Range<usize>,
     ) {
         let Chunks {
-            gaps,
-            executor,
+            packets,
+            segments,
+            chunk,
+            last,
             sources,
             outputs,
         } = chunks;
-        let gaps = &*gaps;
+        let packets = *packets;
         let conversion = self.conversion;
-        // Where a staged execution holds each plane.
-        let staged = conversion.chunks().output_starts();
-        let (tile, row_packets, source_row) = (conversion.tile, self.row_packets, self.source_row);
+        let (tile, source_row, k) = (conversion.tile, self.source_row, source.k);
         let source_bytes = source.rows * source_row;
-        let execution = conversion.packets * conversion.packet_bytes();
+        let (execution, count) = (packets * conversion.packet_bytes(), segments.len());
         for first in rows.clone().step_by(tile) {
             let present = (rows.end - first).min(tile);
-            // SAFETY: this work item owns the rows, and in `rows8` their
-            // entire tile, including its padded rows.
+            // SAFETY: this work item owns the rows, and their entire tile,
+            // including its padded rows.
             let out = unsafe {
                 std::slice::from_raw_parts_mut(
                     self.stored(destination, first),
                     tile * self.stride(),
                 )
             };
-            for (start, end) in gaps {
-                out[*start..*end].fill(0);
-            }
-            for (index, start) in (0..source_row).step_by(execution).enumerate() {
-                let first_group = index * conversion.packets;
-                let groups = first_group..row_packets.min(first_group + conversion.packets);
-                // Each plane's shares of the groups of every row of the tile.
-                let shares = |plane| self.shares(plane, 0..tile, groups.clone());
-                // In place when every row of the tile has the execution's
-                // packets and the source holds a block past them.
-                if groups.len() == conversion.packets
-                    && present == tile
-                    && (first + tile - 1) * source_row + start + execution + BLOCK <= source_bytes
-                {
-                    for (r, base) in sources.iter_mut().enumerate() {
-                        // SAFETY: the row's packets and a block past them lie
-                        // in the source.
-                        *base = unsafe { source.base.add((first + r) * source_row + start) };
-                    }
+            for (index, segments) in segments.iter().enumerate() {
+                let start = index * execution;
+                let bytes = execution.min(source_row - start);
+                let executor = if index + 1 < count {
+                    chunk[present - 1].get_or_insert_with(|| {
+                        conversion
+                            .program(Execution::Chunk { packets, rows: present })
+                            .executor()
+                    })
+                } else {
+                    last[present - 1].get_or_insert_with(|| {
+                        conversion
+                            .program(Execution::LastChunk { packets, k, rows: present })
+                            .executor()
+                    })
+                };
+                // In place when the source holds a block past the chunk's
+                // packets of the last present row.
+                if (first + present - 1) * source_row + start + bytes + BLOCK <= source_bytes {
+                    sources.clear();
+                    // SAFETY: each present row's packets of the chunk and a
+                    // block past them lie in the source.
+                    sources.extend(
+                        (first..first + present)
+                            .map(|row| unsafe { source.base.add(row * source_row + start) }),
+                    );
                     // Every plane's base derives from one pointer to `out`,
                     // which nothing else references until the run is done.
                     let tile_base = out.as_mut_ptr();
-                    for (plane, base) in outputs.iter_mut().enumerate() {
-                        *base = tile_base.wrapping_add(shares(plane).start);
+                    for (base, segment) in outputs.iter_mut().zip(segments) {
+                        *base = tile_base.wrapping_add(segment.start);
                     }
-                    // SAFETY: as above; the planes' groups lie in `out`, each
-                    // apart from the others.
+                    // SAFETY: as above; the planes' segments lie in `out`,
+                    // each apart from the others.
                     unsafe { executor.run_into(sources, outputs) };
                     continue;
                 }
-                // Past each present row's groups, and in the rows the tile
-                // pads, the staging holds what an earlier execution left:
-                // groups convert apart, only the present groups are copied
-                // out, and the padded rows are zeroed below.
-                let bytes = groups.len() * conversion.packet_bytes();
-                let input = executor.source();
-                for (r, input) in input.chunks_exact_mut(execution).take(present).enumerate() {
+                for (r, input) in executor.source().chunks_exact_mut(bytes).enumerate() {
                     // SAFETY: the row lies inside the source (`from_tensor`).
-                    let row = unsafe {
+                    input.copy_from_slice(unsafe {
                         std::slice::from_raw_parts(
                             source.base.add((first + r) * source_row + start),
                             bytes,
                         )
-                    };
-                    input[..bytes].copy_from_slice(row);
+                    });
                 }
                 let placed = executor.run();
-                // Each plane's groups of every row of the tile, then the rows
-                // the tile pads with zero.
-                for (plane, staged) in staged.iter().enumerate() {
-                    let (to, staged) = (shares(plane), *staged as usize);
-                    out[to.clone()].copy_from_slice(&placed[staged..staged + to.len()]);
+                let mut at = 0;
+                for segment in segments {
+                    out[segment.clone()].copy_from_slice(&placed[at..at + segment.len()]);
+                    at += segment.len();
                 }
-                self.zero(out, present..tile, groups);
             }
         }
     }
@@ -757,18 +953,59 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::weights::RowGeometry;
-    use seismic_lang::registry::{pseudo_random_bytes, representation};
+    use seismic_lang::registry::{pseudo_random_bytes, Layout};
 
-    /// Every conversion reproduces the registry's host repack bit for bit,
-    /// on rows whose last packet is partial, staged and in place: over
-    /// tiles with rows missing and whole, executions of whole rows of every
-    /// size with rows missing and whole, and rows of fewer and more packets
-    /// than an execution's.
+    /// Canonical source bytes of `rows` rows of `k` values for `conversion`,
+    /// in the conversion's domain (its scales converted as numbers finite:
+    /// NaN payloads are not part of the conversion contract).
+    fn admitted_source(conversion: &RowConversion, rows: usize, k: usize, seed: u64) -> Vec<u8> {
+        let mut source = pseudo_random_bytes(seed, rows * conversion.source_row_bytes(k));
+        conversion.conversion.admit_source(&mut source);
+        source
+    }
+
+    /// The first byte at which `out` differs from the registry's `expected`
+    /// bytes of rows of `stride` bytes, described.
+    fn difference(
+        conversion: &RowConversion,
+        k: usize,
+        stride: usize,
+        out: &[u8],
+        expected: &[u8],
+    ) -> Option<String> {
+        if out.len() != expected.len() {
+            return Some(format!(
+                "{} bytes, the registry's {}",
+                out.len(),
+                expected.len()
+            ));
+        }
+        let at = out.iter().zip(expected).position(|(a, b)| a != b)?;
+        Some(format!(
+            "{} -> {} k {k}: byte {at} (row {}, offset {}) is {:#04x}, the registry's {:#04x}",
+            conversion.source(),
+            conversion.target(),
+            at / stride,
+            at % stride,
+            out[at],
+            expected[at],
+        ))
+    }
+
+    /// Every conversion into a row layout reproduces the registry's host
+    /// repack bit for bit, on rows whose last packet is partial, staged and
+    /// in place: through kernel work items of six tiles (some ending on an
+    /// execution of fewer tiles than the most, in place or staged, or on a
+    /// matrix's last tile short of whole), through [`convert`], and as
+    /// pieces of every size from one tile, converted last first; over rows
+    /// of fewer and more packets than a chunked execution's.
     #[test]
     fn conversions_match_the_registry_repack() {
+        let mut checked = 0;
         for conversion in conversions() {
-            let execution = conversion.packets * conversion.group();
+            let execution = conversion
+                .chunk
+                .map_or(CHUNK_VALUES, |packets| packets * conversion.group());
             for (rows, k) in [
                 (3, conversion.group()),
                 (3, 3 * conversion.group()),
@@ -777,33 +1014,26 @@ mod tests {
                 (17, 2560 + 40),
                 (11, 2 * execution + conversion.group() + 40),
             ] {
-                let packets = k.div_ceil(conversion.group());
-                let mut source =
-                    pseudo_random_bytes(k as u64, rows * packets * conversion.packet_bytes());
-                let registered = seismic_lang::registry::representation_conversion(
-                    representation(conversion.source()).unwrap(),
-                    representation(conversion.target()).unwrap(),
-                )
-                .expect("registered conversion");
-                // The scales a conversion converts as numbers are finite: NaN
-                // payloads are not part of the conversion contract.
-                registered.admit_source(&mut source);
-                let id = registered.id;
+                if conversion.stored_row_bytes(k).is_none() {
+                    continue;
+                }
+                let source = admitted_source(conversion, rows, k, k as u64);
                 let expected =
-                    seismic_lang::interp::repack(id, &[rows, k], &source).expect("registry repack");
-                let geometry = RowGeometry::of(
-                    registry::representation_info(representation(conversion.target()).unwrap()),
-                    k,
-                    0,
-                );
-                let stride = geometry.stride;
-                let stored_rows = rows.next_multiple_of(conversion.tile);
-                let mut out = vec![0xa5u8; stored_rows * stride];
+                    seismic_lang::interp::repack(conversion.conversion.id, &[rows, k], &source)
+                        .expect("registry repack");
+                let stride = conversion.stored_row_bytes(k).unwrap();
+                let mut out = vec![0xa5u8; rows.next_multiple_of(conversion.tile) * stride];
                 let from = unsafe {
                     External::from_tensor(
                         source.as_ptr(),
                         &[rows as u64, k as u64],
-                        &[packets as u64, 1],
+                        &[
+                            conversion
+                                .source_row_bytes(k)
+                                .div_ceil(conversion.packet_bytes())
+                                as u64,
+                            1,
+                        ],
                         conversion.source(),
                     )
                 };
@@ -815,35 +1045,85 @@ mod tests {
                         conversion.target(),
                     )
                 };
-                // Work items of six tiles: some end on an execution of fewer
-                // tiles than the most, in place or staged.
                 let item = 6 * conversion.tile;
                 for first in (0..rows).step_by(item) {
                     unsafe { super::rows(&from, &to, first..(first + item).min(rows)) };
                 }
-                assert_eq!(
-                    out.len(),
-                    expected.len(),
-                    "{} -> {} k {k}",
-                    conversion.source(),
-                    conversion.target()
-                );
-                if let Some(at) = out.iter().zip(&expected).position(|(a, b)| a != b) {
-                    let word = at / 4 * 4;
-                    panic!(
-                        "{} -> {} k {k}: byte {at} (row {}, offset {}) is {:#04x}, the registry's {:#04x}; words {:?} {:?}",
-                        conversion.source(),
-                        conversion.target(),
-                        at / stride,
-                        at % stride,
-                        out[at],
-                        expected[at],
-                        f32::from_le_bytes(out[word..word + 4].try_into().unwrap()),
-                        f32::from_le_bytes(expected[word..word + 4].try_into().unwrap()),
-                    );
+                if let Some(difference) = difference(conversion, k, stride, &out, &expected) {
+                    panic!("work items: {difference}");
                 }
+                let converted = convert(conversion.conversion, &[rows as u64, k as u64], &source)
+                    .expect("a conversion of canonical bytes");
+                if let Some(difference) = difference(conversion, k, stride, &converted, &expected) {
+                    panic!("convert: {difference}");
+                }
+                for tiles in 1..=rows.div_ceil(conversion.tile) {
+                    let mut pieced = vec![0x5au8; expected.len()];
+                    let tiles = std::num::NonZeroUsize::new(tiles).unwrap();
+                    let pieces = conversion.pieces(k, rows, tiles).unwrap().collect::<Vec<_>>();
+                    for (from, to) in pieces.into_iter().rev() {
+                        conversion
+                            .piece(k, &source[from], &mut pieced[to])
+                            .expect("a piece of whole rows into their tiles");
+                    }
+                    if let Some(difference) = difference(conversion, k, stride, &pieced, &expected)
+                    {
+                        panic!("pieces of {tiles} tiles: {difference}");
+                    }
+                }
+                checked += 1;
             }
         }
+        assert!(checked > 100, "{checked} conversions and shapes checked");
+    }
+
+    /// A tensor of several matrices whose rows are not whole tiles converts
+    /// as the registry repacks it: each matrix padded to whole tiles.
+    #[test]
+    fn stacked_matrices_match_the_registry_repack() {
+        for conversion in conversions() {
+            let k = 4 * conversion.group().max(64);
+            let Some(stride) = conversion.stored_row_bytes(k) else {
+                continue;
+            };
+            let (matrices, rows) = (3, 2 * conversion.tile + 3);
+            let source = admitted_source(conversion, matrices * rows, k, 7);
+            let extents = [matrices as u64, rows as u64, k as u64];
+            let expected = seismic_lang::interp::repack(
+                conversion.conversion.id,
+                &[matrices, rows, k],
+                &source,
+            )
+            .expect("registry repack");
+            let converted = convert(conversion.conversion, &extents, &source).unwrap();
+            if let Some(difference) = difference(conversion, k, stride, &converted, &expected) {
+                panic!("{difference}");
+            }
+        }
+    }
+
+    /// A piece that is not whole rows into their tiles is refused.
+    #[test]
+    fn pieces_are_whole_rows_into_their_tiles() {
+        let conversion = resolve("gguf_q4_k", "q4k@mma16").expect("q4_k into mma16");
+        let (k, tile) = (512, conversion.tile());
+        let (row, stride) = (
+            conversion.source_row_bytes(k),
+            conversion.stored_row_bytes(k).unwrap(),
+        );
+        let source = admitted_source(conversion, tile + 1, k, 3);
+        let mut tiles = vec![0u8; 2 * tile * stride];
+        assert!(conversion
+            .piece(k, &source[..row * tile + 1], &mut tiles[..tile * stride])
+            .is_none());
+        assert!(conversion
+            .piece(k, &source[..row * tile], &mut tiles[..tile * stride - 16])
+            .is_none());
+        // A piece one row into a second tile writes that whole tile.
+        assert!(conversion
+            .piece(k, &source, &mut tiles[..tile * stride])
+            .is_none());
+        assert!(conversion.piece(k, &source, &mut tiles).is_some());
     }
 
     /// Throughput of the CPU import over large random tensors of every GGUF
@@ -855,25 +1135,13 @@ mod tests {
         let threads = std::thread::available_parallelism().unwrap().get();
         let (rows, k) = (4096usize, 4096usize);
         for conversion in conversions() {
-            let packets = k.div_ceil(conversion.group());
-            let mut source = pseudo_random_bytes(0, rows * packets * conversion.packet_bytes());
-            seismic_lang::registry::representation_conversion(
-                representation(conversion.source()).unwrap(),
-                representation(conversion.target()).unwrap(),
-            )
-            .unwrap()
-            .admit_source(&mut source);
-            let geometry = RowGeometry::of(
-                registry::representation_info(representation(conversion.target()).unwrap()),
-                k,
-                0,
-            );
-            let mut out = vec![0u8; rows * geometry.stride];
+            let source = admitted_source(conversion, rows, k, 0);
+            let mut out = vec![0u8; rows * conversion.stored_row_bytes(k).unwrap()];
             let from = unsafe {
                 External::from_tensor(
                     source.as_ptr(),
                     &[rows as u64, k as u64],
-                    &[packets as u64, 1],
+                    &[k.div_ceil(conversion.group()) as u64, 1],
                     conversion.source(),
                 )
             };
@@ -888,17 +1156,9 @@ mod tests {
             // Each thread at the highest quality of service (on the
             // performance cores, where macOS schedules it), over the tensor
             // `PASSES` times so that spawning is a small part of the time.
-            #[cfg(target_os = "macos")]
-            fn interactive() {
-                extern "C" {
-                    fn pthread_set_qos_class_self_np(class: u32, priority: i32) -> i32;
-                }
-                // QOS_CLASS_USER_INTERACTIVE.
-                assert_eq!(unsafe { pthread_set_qos_class_self_np(0x21, 0) }, 0);
-            }
-            #[cfg(not(target_os = "macos"))]
-            fn interactive() {}
             const PASSES: usize = 8;
+            // Items of whole tiles of at least eight rows.
+            let item = conversion.tile.max(8);
             // From the first thread's start to the last one's end.
             let rate = |threads: usize| {
                 let mut best = f64::INFINITY;
@@ -920,8 +1180,12 @@ mod tests {
                                             break;
                                         }
                                         let first = first % rows;
-                                        for item in (first..(first + 64).min(rows)).step_by(8) {
-                                            unsafe { super::rows(from, to, item..item + 8) };
+                                        for item_first in
+                                            (first..(first + 64).min(rows)).step_by(item)
+                                        {
+                                            unsafe {
+                                                super::rows(from, to, item_first..item_first + item)
+                                            };
                                         }
                                     }
                                     (started, std::time::Instant::now())
@@ -947,5 +1211,183 @@ mod tests {
                 rate(threads)
             );
         }
+    }
+
+    /// This thread at the highest quality of service (on the performance
+    /// cores, where macOS schedules it).
+    #[cfg(target_os = "macos")]
+    fn interactive() {
+        extern "C" {
+            fn pthread_set_qos_class_self_np(class: u32, priority: i32) -> i32;
+        }
+        // QOS_CLASS_USER_INTERACTIVE.
+        assert_eq!(unsafe { pthread_set_qos_class_self_np(0x21, 0) }, 0);
+    }
+    #[cfg(not(target_os = "macos"))]
+    fn interactive() {}
+
+    /// Source bytes of one piece of an expert record a landing converts as
+    /// its bytes arrive: the 128 KiB read unit.
+    const PIECE_BYTES: usize = 128 << 10;
+
+    /// The host's conversion of one expert record into CUDA's `mma16`, as a
+    /// file miss lands it: its tensors' rows of the Qwen3.6 35B-A3B
+    /// shapes (gate and up `[512, 2048]`, down `[2048, 512]`), in each
+    /// GGUF source's `mma16` storage, converted piece by piece, each piece
+    /// the most whole tiles of at most [`PIECE_BYTES`] source bytes. Per
+    /// source: GB/s of source bytes on one thread (a record converted whole,
+    /// median of passes), the median and worst µs a piece takes, and the GB/s
+    /// each thread reaches when every available thread converts records of
+    /// its own at once. The q4k/q4k/q5k record of the model's Q4 is reported
+    /// last, as a whole.
+    #[test]
+    #[ignore = "measurement; run with --release --ignored --nocapture"]
+    fn mma16_record_rate() {
+        let threads = std::thread::available_parallelism().unwrap().get();
+        const PASSES: usize = 64;
+        /// The pieces of a `[rows, k]` tensor of `conversion`: source and
+        /// destination ranges.
+        fn pieces(
+            conversion: &RowConversion,
+            rows: usize,
+            k: usize,
+        ) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+            let tiles = PIECE_BYTES / (conversion.tile * conversion.source_row_bytes(k));
+            conversion
+                .pieces(k, rows, std::num::NonZeroUsize::new(tiles.max(1)).unwrap())
+                .unwrap()
+                .collect()
+        }
+        /// A record: per tensor its conversion, rows and k, and source.
+        type Record = Vec<(&'static RowConversion, usize, usize, Vec<u8>)>;
+        let record = |tensors: &[(&'static RowConversion, usize, usize)], seed: u64| -> Record {
+            tensors
+                .iter()
+                .map(|(conversion, rows, k)| {
+                    (
+                        *conversion,
+                        *rows,
+                        *k,
+                        admitted_source(conversion, *rows, *k, seed),
+                    )
+                })
+                .collect()
+        };
+        let source_bytes = |record: &Record| {
+            record
+                .iter()
+                .map(|(_, _, _, source)| source.len())
+                .sum::<usize>()
+        };
+        // Seconds to convert `record` into `out`, piece by piece; each
+        // piece's seconds pushed onto `pieced`.
+        let convert_record = |record: &Record, out: &mut [Vec<u8>], pieced: &mut Vec<f64>| {
+            let started = std::time::Instant::now();
+            for ((conversion, rows, k, source), out) in record.iter().zip(out.iter_mut()) {
+                for (from, to) in pieces(conversion, *rows, *k) {
+                    let piece = std::time::Instant::now();
+                    conversion.piece(*k, &source[from], &mut out[to]).unwrap();
+                    pieced.push(piece.elapsed().as_secs_f64());
+                }
+            }
+            started.elapsed().as_secs_f64()
+        };
+        let outputs = |record: &Record| -> Vec<Vec<u8>> {
+            record
+                .iter()
+                .map(|(conversion, rows, k, _)| {
+                    vec![
+                        0u8;
+                        rows.next_multiple_of(conversion.tile)
+                            * conversion.stored_row_bytes(*k).unwrap()
+                    ]
+                })
+                .collect()
+        };
+        let median = |values: &mut Vec<f64>| {
+            values.sort_by(f64::total_cmp);
+            values[values.len() / 2]
+        };
+        let measure = |name: &str, tensors: &[(&'static RowConversion, usize, usize)]| {
+            interactive();
+            let one = record(tensors, 1);
+            let mut out = outputs(&one);
+            // Equal to the registry's conversion, and warm.
+            convert_record(&one, &mut out, &mut Vec::new());
+            for ((conversion, rows, k, source), out) in one.iter().zip(&out) {
+                let expected =
+                    seismic_lang::interp::repack(conversion.conversion.id, &[*rows, *k], source)
+                        .unwrap();
+                assert!(
+                    out == &expected,
+                    "{name}: {} -> {} differs from the registry",
+                    conversion.source(),
+                    conversion.target()
+                );
+            }
+            let (mut whole, mut pieced) = (Vec::new(), Vec::new());
+            for _ in 0..PASSES {
+                whole.push(convert_record(&one, &mut out, &mut pieced));
+            }
+            let bytes = source_bytes(&one) as f64;
+            let alone = bytes / median(&mut whole) / 1e9;
+            let piece = median(&mut pieced) * 1e6;
+            let worst = pieced.last().copied().unwrap() * 1e6;
+            // Every thread converting records of its own at once.
+            let start = std::sync::Barrier::new(threads);
+            let rates = std::thread::scope(|scope| {
+                let workers = (0..threads)
+                    .map(|index| {
+                        let start = &start;
+                        scope.spawn(move || {
+                            interactive();
+                            let records = (0..4)
+                                .map(|seed| record(tensors, 16 + (index * 4 + seed) as u64))
+                                .collect::<Vec<_>>();
+                            let mut outs = records.iter().map(outputs).collect::<Vec<_>>();
+                            start.wait();
+                            let started = std::time::Instant::now();
+                            for pass in 0..PASSES {
+                                let at = pass % records.len();
+                                convert_record(&records[at], &mut outs[at], &mut Vec::new());
+                            }
+                            (PASSES * source_bytes(&records[0])) as f64
+                                / started.elapsed().as_secs_f64()
+                                / 1e9
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let least = rates.iter().copied().fold(f64::INFINITY, f64::min);
+            let mean = rates.iter().sum::<f64>() / rates.len() as f64;
+            eprintln!(
+                "{name:>42}: {:.3} MB, 1 thread {alone:6.2} GB/s, piece median {piece:6.1} µs worst {worst:6.1} µs, \
+                 {threads} threads {mean:6.2} GB/s each (least {least:6.2})",
+                bytes / 1e6
+            );
+        };
+        let (h, f) = (2048, 512);
+        for conversion in conversions() {
+            if registry::representation_info(conversion.conversion.destination).layout
+                != Layout::Mma16
+            {
+                continue;
+            }
+            let name = format!("{} -> {}", conversion.source(), conversion.target());
+            measure(
+                &name,
+                &[(conversion, f, h), (conversion, f, h), (conversion, h, f)],
+            );
+        }
+        let q4 = resolve("gguf_q4_k", "q4k@mma16").expect("q4_k into mma16");
+        let q5 = resolve("gguf_q5_k", "q5k@mma16").expect("q5_k into mma16");
+        measure(
+            "35B-A3B Q4 record (q4k, q4k, q5k)",
+            &[(q4, f, h), (q4, f, h), (q5, h, f)],
+        );
     }
 }

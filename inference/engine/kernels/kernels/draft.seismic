@@ -6,7 +6,7 @@
 # `tokens` has the `sample_rows` result layout (token, status), so a chained
 # draft step embeds the previous step's selection directly; `directory`
 # addresses the table's rows (`gathered_row`). A failed selection (token -1)
-# embeds row 0; its proposal is discarded by the host.
+# and a row without a slot embed zeros; its proposal is discarded by the host.
 fn draft_rows[M, V, D, S, R, F](tokens: &tensor[M, 2] i32, directory: &tensor[R, F] i32,
     table: &tensor[V, D] EW, conditioning: &tensor[M, S * D] C, embedding_norm: &tensor[D] EN,
     hidden_norm: &tensor[S * D] HN, combine: &tensor[D, 2 * D] CW,
@@ -19,7 +19,10 @@ fn draft_rows[M, V, D, S, R, F](tokens: &tensor[M, 2] i32, directory: &tensor[R,
     parallel for row in 0..M:
         let token = gathered_row(directory, tokens[row, 0])
         parallel for column in 0..D:
-            embedded[row, column] = f32(table[token, column])
+            if token >= 0:
+                embedded[row, column] = f32(table[token, column])
+            else:
+                embedded[row, column] = 0.0
     rms_norm(embedded, embedding_norm, normalized_embedding, epsilon)
     parallel for row in 0..M:
         parallel for stream in 0..S:

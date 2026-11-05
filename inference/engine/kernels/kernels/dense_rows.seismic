@@ -48,7 +48,7 @@
 # tiles). The form needs K a multiple of 128 and has no split-K; where it is
 # admitted it is the default, with the same results as the tiles above.
 # `activation` is the gate's function code (`functions.seismic`: 0 SiLU,
-# 1 GELU-tanh); the product is A(A(act(A(gate))) * A(up)).
+# 1 GELU-tanh); the product is the `glu` of gate and up.
 #
 # Second-level weight scales (every entry reading packed weights): one
 # `<weight>_scale` port per weight, after every other argument, in weight
@@ -86,15 +86,13 @@ fn dense_expand[M, O, H, F, GS, US, GB, UB](residual: &tensor[M, H] f32, norm: &
     let mut up_sum = tensor[O, F] f32
     let mut gate = tensor[O, F] A
     let mut up = tensor[O, F] A
-    let mut activated = tensor[O, F] A
     let mut product = tensor[O, F] A
     rms_norm(selected, norm, normalized, eps)
     linear(normalized, gate_weight, gate_sum)
     linear(normalized, up_weight, up_sum)
     scale_rows(gate_sum, gate_scale, gate)
     scale_rows(up_sum, up_scale, up)
-    activate(gate, activated, activation)
-    multiply(activated, up, product)
+    glu(gate, up, product, activation)
     return product
 
 native dense_expand for metal from "metal/dense_expand.metal":

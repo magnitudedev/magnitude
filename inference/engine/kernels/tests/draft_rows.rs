@@ -267,10 +267,14 @@ fn reference(
     let mut result = Vec::new();
     let mut magnitude = Vec::new();
     for (row, &token) in tokens.iter().enumerate() {
-        let embedded = table[token as usize * width..][..width]
-            .iter()
-            .map(|v| bf16_round(*v))
-            .collect::<Vec<_>>();
+        // A selection that names no row embeds zeros.
+        let embedded = match usize::try_from(token) {
+            Ok(token) => table[token * width..][..width]
+                .iter()
+                .map(|v| bf16_round(*v))
+                .collect::<Vec<_>>(),
+            Err(_) => vec![0.0; width],
+        };
         let mut joined = normalized(&embedded, embedding_norm);
         joined.extend(normalized(
             &conditioning[row * width..][..width],
@@ -367,7 +371,7 @@ fn draft_rows_match_on(device: &Device) {
             .map(|_| bf16_round(2.0 * random.symmetric()))
             .collect::<Vec<_>>();
         // Selection rows (token, status); the last is a failed selection,
-        // which embeds token 0.
+        // which embeds zeros.
         let selections = (0..rows)
             .map(|row| {
                 if row + 1 == rows {
@@ -377,10 +381,7 @@ fn draft_rows_match_on(device: &Device) {
                 }
             })
             .collect::<Vec<_>>();
-        let token_values = selections
-            .iter()
-            .map(|[token, _]| (*token).max(0))
-            .collect::<Vec<_>>();
+        let token_values = selections.iter().map(|[token, _]| *token).collect::<Vec<_>>();
         let token_bytes = selections
             .iter()
             .flatten()
@@ -437,7 +438,7 @@ fn draft_rows_match_on(device: &Device) {
         // Through a directory of a table's slots: a selection reads its
         // row's slot, exactly as a direct read of that slot does. Every
         // other logical row has a slot; a row without one and a failed
-        // selection read slot 0.
+        // selection read zeros, as a selection of no row does directly.
         let logical = 3 * vocabulary;
         let directory_values = (0..logical)
             .map(|row| {
@@ -457,7 +458,7 @@ fn draft_rows_match_on(device: &Device) {
         let slots = selected
             .iter()
             .map(|[row, status]| {
-                let slot = usize::try_from(*row).map_or(0, |row| directory_values[row].max(0));
+                let slot = usize::try_from(*row).map_or(-1, |row| directory_values[row]);
                 [slot, *status]
             })
             .collect::<Vec<_>>();

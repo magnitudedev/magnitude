@@ -5,9 +5,12 @@
 //   its portable body does, slots holding stored rows converted by the
 //   registry's host repack; for IQ4_NL and Q8_0 also exactly as the decode
 //   of the rows as stored does (what the slots held before they were
-//   resident);
+//   resident); its slots in records of several rows, held in one allocation
+//   and, where the device reserves, in reserved storage (Metal's chunks);
 // - `embedding_rows` through a hashed directory reads what a direct read of
-//   the slots it names reads.
+//   the slots it names reads;
+// - a selection that names no row and a row without a slot read zeros,
+//   whatever the slots hold, and a row beside one reads its own values.
 
 mod versions_common;
 
@@ -58,10 +61,13 @@ fn directories(rows: usize, held: &[usize], buckets: usize) -> (Vec<i32>, Vec<i3
     (dense, hashed.into_iter().flatten().collect())
 }
 
-/// The row a read of selection `selected` finds through the dense
-/// directory: its slot, or slot 0.
-fn found(dense: &[i32], selected: i32) -> usize {
-    usize::try_from(selected).map_or(0, |row| dense[row].max(0) as usize)
+/// The slot a read of selection `selected` finds through the dense
+/// directory: `None` of a selection that names no row or a row without a
+/// slot, which reads zeros.
+fn found(dense: &[i32], selected: i32) -> Option<usize> {
+    usize::try_from(selected)
+        .ok()
+        .and_then(|row| usize::try_from(dense[row]).ok())
 }
 
 /// Stored IQ4_NL rows of `width` values: per 32-value block an f16 scale
@@ -140,7 +146,7 @@ fn stored_rows_native(
 /// The portable body's rows, from its interpreter.
 fn stored_rows_portable(
     slots: &[u8],
-    shape: [usize; 2],
+    shape: [usize; 3],
     tokens: &[i32],
     directory: &[i32],
     directory_shape: [usize; 2],
@@ -219,6 +225,8 @@ fn stored_rows_decode_the_rows_their_directory_names() {
 
 fn stored_rows_match(source: &str, resident: &str, as_stored: Option<bool>) {
     let (rows, slots, width, buckets) = (300usize, 24usize, 160usize, 64usize);
+    // The slots as 3 records of 8.
+    let (records, per) = (3usize, 8usize);
     let mut random = Random(41);
     let (source_element, resident_element) =
         (Element::named(source).unwrap(), Element::named(resident).unwrap());
@@ -241,7 +249,7 @@ fn stored_rows_match(source: &str, resident: &str, as_stored: Option<bool>) {
     let decode = |slot: usize| match as_stored {
         Some(q8) => decode(&stored_slots, slot, width, q8),
         None => {
-            let shape = [1, width];
+            let shape = [1, 1, width];
             let row = resident_slots.len() / slots;
             stored_rows_portable(
                 &resident_slots[slot * row..(slot + 1) * row],
@@ -268,9 +276,14 @@ fn stored_rows_match(source: &str, resident: &str, as_stored: Option<bool>) {
             [row, (index % 2) as i32]
         })
         .collect::<Vec<_>>();
+    // A selection that names no row, and a row without a slot, read zeros.
+    let read_slot = |slot: Option<usize>| match slot {
+        Some(slot) => decode(slot),
+        None => vec![0.0; width],
+    };
     let expected = selections
         .chunks_exact(2)
-        .flat_map(|pair| decode(found(&dense, pair[0])))
+        .flat_map(|pair| read_slot(found(&dense, pair[0])))
         .collect::<Vec<_>>();
     let forms = [
         (dense.clone(), [rows, 1]),
@@ -279,16 +292,6 @@ fn stored_rows_match(source: &str, resident: &str, as_stored: Option<bool>) {
         (Vec::new(), [0, 1]),
     ];
     for (directory, shape) in &forms {
-        let expected = match shape[0] {
-            0 => selections
-                .chunks_exact(2)
-                .flat_map(|pair| {
-                    let slot = usize::try_from(pair[0]).map_or(0, |row| row.min(slots - 1));
-                    decode(slot)
-                })
-                .collect::<Vec<_>>(),
-            _ => expected.clone(),
-        };
         let selections = match shape[0] {
             0 => selections
                 .chunks_exact(2)
@@ -296,9 +299,16 @@ fn stored_rows_match(source: &str, resident: &str, as_stored: Option<bool>) {
                 .collect::<Vec<_>>(),
             _ => selections.clone(),
         };
+        let expected = match shape[0] {
+            0 => selections
+                .chunks_exact(2)
+                .flat_map(|pair| read_slot(usize::try_from(pair[0]).ok()))
+                .collect::<Vec<_>>(),
+            _ => expected.clone(),
+        };
         let portable = stored_rows_portable(
             &resident_slots,
-            [slots, width],
+            [records, per, width],
             &selections,
             directory,
             *shape,
@@ -308,14 +318,29 @@ fn stored_rows_match(source: &str, resident: &str, as_stored: Option<bool>) {
             same_bits(&portable, &expected),
             "{source} portable, directory {shape:?}"
         );
-        for device in devices() {
-            let slots_tensor = Tensor::from_host(
-                &device,
-                resident_element,
-                &[slots as u64, width as u64],
-                &resident_slots,
-            )
-            .unwrap();
+        let extents = [records as u64, per as u64, width as u64];
+        let record_bytes = resident_slots.len() / records;
+        // The slots in one allocation, and, where the device reserves, in
+        // reserved storage the host writes record by record (on Metal, chunks
+        // reached through the record table).
+        let placements = devices().into_iter().flat_map(|device| {
+            let whole = Tensor::from_host(&device, resident_element, &extents, &resident_slots).unwrap();
+            let reserved = match Tensor::reserved(&device, resident_element, &extents, records as u64) {
+                Ok(reserved) => Some(reserved),
+                Err(seismic::TensorError::Unreservable { .. }) => None,
+                Err(error) => panic!("{:?} reserves the slots: {error}", device.backend()),
+            }
+            .map(|(reserved, _resizer)| {
+                let placement = reserved.record_placement().unwrap();
+                for (record, bytes) in resident_slots.chunks_exact(record_bytes).enumerate() {
+                    // SAFETY: no device work uses the tensor yet.
+                    unsafe { reserved.write_shared(placement.offset(record as u64), bytes) }.unwrap();
+                }
+                reserved
+            });
+            std::iter::once((device.clone(), whole)).chain(reserved.map(|reserved| (device, reserved)))
+        });
+        for (device, slots_tensor) in placements {
             let result = stored_rows_native(&device, width as u64, resident_element)
                 .call(stored_rows::Args {
                     slots: &slots_tensor,
@@ -374,7 +399,7 @@ fn embedding_rows_through_a_hashed_directory_read_the_slots_it_names() {
         .collect::<Vec<_>>();
     let direct = selections
         .chunks_exact(2)
-        .flat_map(|pair| [found(&dense, pair[0]) as i32, pair[1]])
+        .flat_map(|pair| [found(&dense, pair[0]).map_or(-1, |slot| slot as i32), pair[1]])
         .collect::<Vec<_>>();
     for device in devices() {
         let kernel = embedding_rows::native_for_device_with(
@@ -419,6 +444,122 @@ fn embedding_rows_through_a_hashed_directory_read_the_slots_it_names() {
                 same_bits(&read_through(&selections, directory, shape), &expected),
                 "{:?} directory {shape:?}",
                 device.backend()
+            );
+        }
+    }
+}
+
+/// A selection that names no row (-1: a failed selection, a launch row
+/// outside every batch slot) and a row without a slot read zeros on every
+/// backend, normalized or not, through a dense, a hashed or the empty
+/// directory, while the slots hold other rows' values; the held row beside
+/// them reads exactly its own slot. What a reader finds never depends on
+/// which rows a streamed table holds.
+#[test]
+fn a_row_that_names_no_table_row_reads_zeros() {
+    let (rows, slots, width, buckets) = (64usize, 8usize, 64usize, 16usize);
+    let mut random = Random(3);
+    let values = (0..slots * width)
+        .map(|_| random.next() + 2.0)
+        .collect::<Vec<_>>();
+    let stored_slots = stored(&mut random, slots, width, true);
+    // The slots hold the rows resident, as a stored table converts them.
+    let (source, resident) = (
+        Element::named("gguf_q8_0").unwrap(),
+        Element::named("q8g32s@rows16").unwrap(),
+    );
+    let resident_slots = resident
+        .repack_host(
+            source,
+            &[slots as u64, width as u64],
+            &resident.repack_source(source, stored_slots.clone()).unwrap(),
+        )
+        .unwrap();
+    // Rows 0 and 2 have no slot; the fourth selection's row has slot 3.
+    let held = (0..slots).map(|slot| slot * 5 + 1).collect::<Vec<_>>();
+    let (dense, hashed) = directories(rows, &held, buckets);
+    let selections = [0, 0, 2, 0, -1, 1, held[3] as i32, 0];
+    let unslotted = 3 * width;
+    let forms = [
+        (dense, [rows as u64, 1]),
+        (hashed, [buckets as u64, 2]),
+    ];
+    for device in devices() {
+        let embedding = embedding_rows::native_for_device_with(
+            &device,
+            embedding_rows::Elements {
+                EW: Element::bf16(),
+                A: Element::bf16(),
+            },
+            &seismic::generated::native_implementation::<embedding_rows::Entry>(&device)
+                .unwrap()
+                .unwrap()
+                .default_specialization(&match is_cpu(&device) {
+                    true => NativeSpecialization::new(),
+                    false => NativeSpecialization::new().with_static("D", width as u64),
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        let table = tensor(&device, Element::bf16(), &[slots as u64, width as u64], &values);
+        let slots_tensor = Tensor::from_host(
+            &device,
+            resident,
+            &[slots as u64, width as u64],
+            &resident_slots,
+        )
+        .unwrap();
+        let backend = device.backend();
+        let embed = |tokens: &[i32], directory: &[i32], shape: [u64; 2], normalize: i32| {
+            let result = embedding
+                .call(embedding_rows::Args {
+                    table: &table,
+                    tokens: &ints(&device, &[tokens.len() as u64 / 2, 2], tokens),
+                    directory: &ints(&device, &shape, directory),
+                    scale: 1.0,
+                    normalize,
+                    epsilon: 1e-6,
+                })
+                .unwrap();
+            [read(&result.r0), read(&result.r1)]
+        };
+        for normalize in [0, 1] {
+            // The held row as a table held whole reads it, and a selection
+            // of no row through the empty directory.
+            let [own, _] = embed(&[3, 0], &[], [0, 1], normalize);
+            let [whole, _] = embed(&[-1, 1], &[], [0, 1], normalize);
+            assert!(whole.iter().all(|value| value.to_bits() == 0), "{backend:?} whole");
+            for (directory, shape) in &forms {
+                for output in embed(&selections, directory, *shape, normalize) {
+                    assert!(
+                        output[..unslotted].iter().all(|value| value.to_bits() == 0),
+                        "{backend:?} embedding_rows {shape:?} normalize {normalize}"
+                    );
+                    assert!(
+                        same_bits(&output[unslotted..], &own),
+                        "{backend:?} embedding_rows {shape:?} normalize {normalize}: beside"
+                    );
+                }
+            }
+        }
+        for (directory, shape) in &forms {
+            let stored = read(
+                &stored_rows_native(&device, width as u64, resident)
+                    .call(stored_rows::Args {
+                        slots: &slots_tensor,
+                        tokens: &ints(&device, &[4, 2], &selections),
+                        directory: &ints(&device, shape, directory),
+                    })
+                    .unwrap()
+                    .value,
+            );
+            assert!(
+                stored[..unslotted].iter().all(|value| value.to_bits() == 0),
+                "{backend:?} stored_rows {shape:?}"
+            );
+            assert!(
+                same_bits(&stored[unslotted..], &decode(&stored_slots, 3, width, true)),
+                "{backend:?} stored_rows {shape:?}: beside"
             );
         }
     }

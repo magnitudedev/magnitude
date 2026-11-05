@@ -1,0 +1,94 @@
+#define SELECT_DECODE_ONLY
+#include "lib/routed/selection.glsl"
+#include "lib/routed/streamed.glsl"
+
+void routed_select_gemv() { select_gemv(); }
+
+void routed_select_streamed_select() {
+    select_select();
+    routed_resolve(false);
+}
+void routed_select_whole_select() {
+    select_select();
+    routed_resolve(true);
+}
+
+#undef SELECT_FN
+#define SELECT_FN(name) hint_ ## name
+#undef SELECT_E
+#define SELECT_E uint(SEISMIC_DIM_EN)
+#undef SELECT_ROUTER_NORM_BUFFER
+#define SELECT_ROUTER_NORM_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_NEXT_ROUTER_NORM)
+#undef SELECT_ROUTER_NORM_STRIDE
+#define SELECT_ROUTER_NORM_STRIDE SEISMIC_NEXT_ROUTER_NORM_STRIDE_0
+#undef SELECT_ROUTER_BUFFER
+#define SELECT_ROUTER_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_NEXT_ROUTER)
+#undef SELECT_ROUTER_STRIDE_0
+#define SELECT_ROUTER_STRIDE_0 SEISMIC_NEXT_ROUTER_STRIDE_0
+#undef SELECT_ROUTER_STRIDE_1
+#define SELECT_ROUTER_STRIDE_1 SEISMIC_NEXT_ROUTER_STRIDE_1
+#undef SELECT_ROUTER_ROWS
+#define SELECT_ROUTER_ROWS PACKETS_ROWS_PACKED(SEISMIC_NEXT_ROUTER)
+#undef SELECT_LOGITS
+#define SELECT_LOGITS (SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS) + SEISMIC_DIM_M * SEISMIC_DIM_E * 4ul)
+#undef SELECT_BIAS_BUFFER
+#define SELECT_BIAS_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_NEXT_BIAS)
+#undef SELECT_BIAS_STRIDE
+#define SELECT_BIAS_STRIDE SEISMIC_NEXT_BIAS_STRIDE_0
+#undef SELECT_PUBLISH
+#define SELECT_PUBLISH false
+SELECT_RANKING
+SELECT_NUMERICAL
+// And the selection of the layer two ahead (`after_*`), into the logits
+// after the next layer's [M, EN].
+#undef SELECT_FN
+#define SELECT_FN(name) after_ ## name
+#undef SELECT_E
+#define SELECT_E uint(SEISMIC_DIM_EN)
+#undef SELECT_ROUTER_NORM_BUFFER
+#define SELECT_ROUTER_NORM_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_AFTER_ROUTER_NORM)
+#undef SELECT_ROUTER_NORM_STRIDE
+#define SELECT_ROUTER_NORM_STRIDE SEISMIC_AFTER_ROUTER_NORM_STRIDE_0
+#undef SELECT_ROUTER_BUFFER
+#define SELECT_ROUTER_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_AFTER_ROUTER)
+#undef SELECT_ROUTER_STRIDE_0
+#define SELECT_ROUTER_STRIDE_0 SEISMIC_AFTER_ROUTER_STRIDE_0
+#undef SELECT_ROUTER_STRIDE_1
+#define SELECT_ROUTER_STRIDE_1 SEISMIC_AFTER_ROUTER_STRIDE_1
+#undef SELECT_ROUTER_ROWS
+#define SELECT_ROUTER_ROWS PACKETS_ROWS_PACKED(SEISMIC_AFTER_ROUTER)
+#undef SELECT_LOGITS
+#define SELECT_LOGITS (SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS) + SEISMIC_DIM_M * SEISMIC_DIM_E * 4ul + SEISMIC_DIM_M * SEISMIC_DIM_EN * 4ul)
+#undef SELECT_BIAS_BUFFER
+#define SELECT_BIAS_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_AFTER_BIAS)
+#undef SELECT_BIAS_STRIDE
+#define SELECT_BIAS_STRIDE SEISMIC_AFTER_BIAS_STRIDE_0
+#undef SELECT_PUBLISH
+#define SELECT_PUBLISH false
+SELECT_RANKING
+SELECT_NUMERICAL
+// Each lead's router GEMV (workgroup row y: 0 one layer ahead, 1 two).
+void hint_routed_select_gemv() {
+    if (gl_WorkGroupID.y == 0u)
+        hint_select_gemv();
+    else
+        after_select_gemv();
+}
+
+// Each lead's ranking and hints (workgroup row y), into the lead's ring row.
+void routed_select_hint() {
+    const uint lead = gl_WorkGroupID.y;
+    const uint64_t row = SEISMIC_SUBGROUP;
+    if (row < SEISMIC_DIM_M) {
+        float chosen[SELECT_K];
+        int winners[SELECT_K];
+        if (lead == 0u)
+            hint_select_rank(row, chosen, winners);
+        else
+            after_select_rank(row, chosen, winners);
+        if (SEISMIC_LANE == 0u)
+            for (uint rank = 0u; rank < SELECT_K; ++rank)
+                seismic_shared_i32[uint(row) * SELECT_K + rank] = winners[SELECT_K - 1u - rank];
+    }
+    routed_hint_publish(lead);
+}

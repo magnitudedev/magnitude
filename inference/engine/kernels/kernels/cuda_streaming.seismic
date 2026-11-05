@@ -1,0 +1,256 @@
+# CUDA implementations of the expert-streaming entries (routed.seismic's
+# streaming section), with its predicates and written grids. A waiting
+# launch spins in its block on its slot until the host answers it
+# (`SEISMIC_PARKS_IN_KERNELS` 1, `streaming/park.hpp`), over the protocol
+# every backend shares (`cuda/lib/streaming/control.cuh`). The protocol
+# entries' unmeasured geometry is every backend's (SERIAL_THREADS,
+# LIST_THREADS, REQUEST_THREADS, LIST_GROUPS by LIST_ROWS:
+# streaming_words.seismic); `routed_convert` takes a block per
+# CONVERT_TILE_ROWS-row tile.
+
+# The threads of a block that converts by windows (`routed_convert`): eight warps, each placing
+# tiles from its own stage (`cuda/lib/streaming/window.cuh`, `Shared`).
+const WINDOW_THREADS = 256
+
+# A converting block's mirror of the row tile it converts, written to the
+# record whole (`cuda/lib/streaming/window.cuh`, `Mirror`): its dynamic shared
+# memory: 32 KiB, which holds a 35B row tile.
+const MIRROR_BYTES = 32768
+
+native routed_step for cuda from "cuda/routed_step.cu":
+    launch routed_step:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (SERIAL_THREADS, 1, 1)
+
+# On its list's grid (`routed_list_grid`), each block copying its own
+# LIST_PART-byte parts of the listed records in turn.
+native routed_copy for cuda from "cuda/routed_copy.cu":
+    launch routed_copy:
+        threadgroups (LIST_GROUPS, LIST_ROWS, 1)
+        grid (grid)
+        threads_per_threadgroup (LIST_THREADS, 1, 1)
+
+# The block stages a list into device memory; one thread writes its grid.
+native routed_list_grid for cuda from "cuda/routed_list_grid.cu":
+    launch routed_list_grid:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (LIST_THREADS, 1, 1)
+
+# The block resolves a pass's map into device memory.
+native routed_pass_map for cuda from "cuda/routed_pass_map.cu":
+    launch routed_pass_map:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (LIST_THREADS, 1, 1)
+
+# The block stages a list into device memory.
+native routed_list_stage for cuda from "cuda/routed_list_stage.cu":
+    launch routed_list_stage:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (LIST_THREADS, 1, 1)
+
+# `routed_copy`'s geometry, on every entry (a shrink lists its moves).
+native routed_move for cuda from "cuda/routed_move.cu":
+    launch routed_move:
+        threadgroups (LIST_GROUPS, LIST_ROWS, 1)
+        threads_per_threadgroup (LIST_THREADS, 1, 1)
+
+# A block per CONVERT_TILE_ROWS-row tile of each listed record, converting
+# its windows in turn, on its round's grid (`routed_scratch_grids`), through
+# `cuda/lib/streaming/window.cuh`, the tile mirrored in its dynamic shared
+# memory; a dense record, converted row by row, reserves none.
+native routed_convert for cuda from "cuda/routed_convert.cu":
+    launch routed_convert:
+        threadgroups (ceil_div(N, CONVERT_TILE_ROWS), L, 1)
+        grid (grid)
+        threads_per_threadgroup (WINDOW_THREADS, 1, 1)
+        shared_bytes (packed(U) * MIRROR_BYTES)
+
+# One block counts every choice in shared memory; a resident group's step
+# requests nothing.
+native routed_scratch_request for cuda from "cuda/routed_scratch_request.cu":
+    static (K, E)
+    launch routed_scratch_request:
+        threadgroups (1, 1, 1)
+        unless (resident)
+        threads_per_threadgroup (REQUEST_THREADS, 1, 1)
+
+# A round parks on its written grid (`routed_scratch_grids`): one block while
+# it has records to convert.
+native routed_scratch_wait for cuda from "cuda/routed_scratch_wait.cu":
+    launch routed_scratch_wait:
+        threadgroups (1, 1, 1)
+        grid (grid)
+        threads_per_threadgroup (SERIAL_THREADS, 1, 1)
+
+# Thread 0 writes every round's grids.
+native routed_scratch_grids for cuda from "cuda/routed_scratch_grids.cu":
+    launch routed_scratch_grids:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (SERIAL_THREADS, 1, 1)
+
+# The launch on the route's wait grid over the shared tier wait
+# (`streaming/tier_wait.hpp`): one block, its first thread spinning on the
+# step's slot, its threads then writing the absent choices' sources, while
+# a choice is absent.
+native routed_tier_wait for cuda from "cuda/routed_tier_wait.cu":
+    static (K)
+    launch routed_tier_wait:
+        threadgroups (1, 1, 1)
+        grid (grid)
+        unless (policy[POLICY_RESOLVED])
+        threads_per_threadgroup (SERIAL_THREADS, 1, 1)
+
+# Metal's launches over `routed_select`'s CUDA decode launches and
+# parameters (so its bits, `cuda/lib/routed/selection.cuh`): the GEMV adds
+# AHEAD times ceil(EN / SIMDGROUPS) blocks, per lead (one layer ahead,
+# then two), for that layer's [SPLIT, M, EN] partial logits;
+# block 0 of the select launch selects, resolves and assigns
+# (`streaming/resolve.hpp`), or of a whole layer
+# (`routed_select_whole`) resolves its hits and writes the routing record; block 1 + lead ranks the lead's layer's rows
+# (`select::rank_row`) and publishes the hints into the lead's ring row
+# (`streaming/hint.hpp`).
+native routed_select_streamed for cuda from "cuda/routed_select_streamed.cu":
+    static (H, E, K, ES, AHEAD, EN, TM)
+    params (SIMDGROUPS in [8, 4, 2], arithmetic SPLIT in [8, 4, 16])
+    where H % 32 == 0 and E <= 1024 and K <= E and EN <= 1024 and K <= EN
+    scratch logits bytes ((M * E + AHEAD * M * EN) * SPLIT * 4)
+    launch routed_select_streamed_gemv:
+        threadgroups (ceil_div(E, SIMDGROUPS) + AHEAD * ceil_div(EN, SIMDGROUPS), 1, SPLIT)
+        unless (next_policy[POLICY_RESOLVED])
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+    launch routed_select_streamed_gemv:
+        threadgroups (ceil_div(E, SIMDGROUPS), 1, SPLIT)
+        if (next_policy[POLICY_RESOLVED])
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+    launch routed_select_streamed_select:
+        threadgroups (1 + AHEAD, 1, 1)
+        unless (policy[POLICY_WHOLE])
+        unless (next_policy[POLICY_RESOLVED])
+        threads_per_threadgroup (256, 1, 1)
+    launch routed_select_streamed_select:
+        threadgroups (1, 1, 1)
+        unless (policy[POLICY_WHOLE])
+        if (next_policy[POLICY_RESOLVED])
+        threads_per_threadgroup (256, 1, 1)
+    launch routed_select_whole:
+        threadgroups (1 + AHEAD, 1, 1)
+        if (policy[POLICY_WHOLE])
+        unless (next_policy[POLICY_RESOLVED])
+        threads_per_threadgroup (256, 1, 1)
+    launch routed_select_whole:
+        threadgroups (1, 1, 1)
+        if (policy[POLICY_WHOLE])
+        if (next_policy[POLICY_RESOLVED])
+        threads_per_threadgroup (256, 1, 1)
+
+# `routed_route_shared`'s launch and parameters (so its bits): its router
+# blocks, then with layers ahead (AHEAD 2), while the next layer may lack
+# an expert (its POLICY_RESOLVED clear), the router GEMV blocks of the next layer and of the one after it over EN experts each
+# (`cuda/lib/routed/route.cuh`),
+# dispatched before the shared expert's blocks, each lead's last to arrive ranks
+# its rows (`route::rank_row`) and publishes the hints into the lead's ring row
+# (`streaming/hint.hpp`); the groups count their arrivals
+# apart and none waits for another. Metal's four launches, by this layer's
+# POLICY_WHOLE and the next layer's POLICY_RESOLVED words, each compiled with only its own work:
+# `routed_route_streamed` (`_alone` without the hints) resolves and assigns
+# in its selecting block (`streaming/resolve.hpp`); `routed_route_whole`
+# (`_alone`) writes the routing record from its selecting lanes.
+native routed_route_streamed for cuda from "cuda/routed_route_streamed.cu":
+    static (H, PT, NM, E, K, S, ES, AHEAD, EN, TM)
+    params (SIMDGROUPS in [8, 4, 2], TPW in [1, 2], arithmetic KSPLIT in [1, 2, 4])
+    where H % 64 == 0 and E <= 1024 and EN <= 1024 and K <= 32 and SIMDGROUPS % KSPLIT == 0
+    scratch logits bytes ((M * (E + 1) + AHEAD * M * (EN + 1)) * 4)
+    scratch arrivals bytes (4 * (1 + AHEAD)) sync
+    launch routed_route_streamed:
+        threadgroups (ceil_div(E + 1, SIMDGROUPS) + AHEAD * ceil_div(EN, SIMDGROUPS) + ceil_div(ceil_div(ceil_div(S, 16), TPW), SIMDGROUPS / KSPLIT), 1, 1)
+        unless (policy[POLICY_WHOLE])
+        unless (next_policy[POLICY_RESOLVED])
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (M * H * 2)
+    launch routed_route_streamed_alone:
+        threadgroups (ceil_div(E + 1, SIMDGROUPS) + ceil_div(ceil_div(ceil_div(S, 16), TPW), SIMDGROUPS / KSPLIT), 1, 1)
+        unless (policy[POLICY_WHOLE])
+        if (next_policy[POLICY_RESOLVED])
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (M * H * 2)
+    launch routed_route_whole:
+        threadgroups (ceil_div(E + 1, SIMDGROUPS) + AHEAD * ceil_div(EN, SIMDGROUPS) + ceil_div(ceil_div(ceil_div(S, 16), TPW), SIMDGROUPS / KSPLIT), 1, 1)
+        if (policy[POLICY_WHOLE])
+        unless (next_policy[POLICY_RESOLVED])
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (M * H * 2)
+    launch routed_route_whole_alone:
+        threadgroups (ceil_div(E + 1, SIMDGROUPS) + ceil_div(ceil_div(ceil_div(S, 16), TPW), SIMDGROUPS / KSPLIT), 1, 1)
+        if (policy[POLICY_WHOLE])
+        if (next_policy[POLICY_RESOLVED])
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (M * H * 2)
+
+# One block reads the list's count, then commits after a system-scope fence.
+native routed_seed_commit for cuda from "cuda/routed_seed_commit.cu":
+    static (X)
+    launch routed_seed_commit:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (LIST_THREADS, 1, 1)
+
+# CUDA: `routed_site_request`'s Metal form, one block of 256 threads.
+native routed_site_request for cuda from "cuda/routed_site_request.cu":
+    static (H, K)
+    launch routed_site_request:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CUDA: `routed_down`'s projection launches (`lib/routed/down.cuh`),
+# publishing into the result.
+native routed_down_project for cuda from "cuda/routed_down_project.cu":
+    static (H, K, F)
+    params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
+    where F % 64 == 0
+    scratch operands bytes (M * K * F * 2) when M > 1 and operands(EDW) == 1
+    launch routed_down when M == 1:
+        reads (TPW, KSPLIT)
+        threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * K, 1)
+        threads_per_threadgroup (128, 1, 1)
+        shared_bytes (operands(EDW) * F * 2)
+    launch routed_down_stage when M > 1 and operands(EDW) == 1:
+        threadgroups (M * K, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch routed_down_gathered when M > 1:
+        reads (TPW, KSPLIT)
+        threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * K, 1)
+        threads_per_threadgroup (128, 1, 1)
+
+# CUDA: `routed_down`'s combine launch (`lib/routed/down_sum.cuh`), its
+# block's thread 0 spinning on the CPU's answer before the slot-order sum.
+native routed_down_sited for cuda from "cuda/routed_down_sited.cu":
+    static (H, K)
+    launch routed_down_combine:
+        threadgroups (ceil_div(H, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CUDA: `routed_output`'s projection launches (`lib/routed/output.cuh`),
+# publishing into the result, no block combining.
+native routed_output_project for cuda from "cuda/routed_output_project.cu":
+    static (H, K, F, S)
+    params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
+    scratch expert_operands bytes (M * K * F * 2) when operands(EDW) == 1
+    scratch shared_operands bytes (M * S * 2) when operands(SDW) == 1
+    launch routed_output_stage when operands(EDW) + operands(SDW) > 0:
+        threadgroups (M * (K + 1), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch routed_output when M == 1:
+        reads (TPW, KSPLIT)
+        threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * (K + 1), 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch routed_output_gathered when M > 1:
+        reads (TPW, KSPLIT)
+        threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * (K + 1), 1)
+        threads_per_threadgroup (128, 1, 1)
+
+# CUDA: a thread a channel of a row (`lib/routed/output_sum.cuh`), its
+# block's thread 0 spinning on the CPU's answer before it joins.
+native routed_output_sited for cuda from "cuda/routed_output_sited.cu":
+    static (H, SN, IN, K)
+    launch routed_output_combine:
+        threadgroups (ceil_div(H, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)

@@ -1487,6 +1487,8 @@ fn routed_output(ctx: &Ctx) -> Vec<Variant> {
                                 &[m as u64, ROUTED_HIDDEN as u64],
                                 &activations(&mut rng, m, ROUTED_HIDDEN, 1.0),
                             ),
+                            // No inject: the single residual stream (`IN` 0).
+                            ctx.dense(f32e(), &[m as u64, 0], &[]),
                             ctx.dense(
                                 a,
                                 &[m as u64, k as u64, ROUTED_FFN as u64],
@@ -1501,6 +1503,8 @@ fn routed_output(ctx: &Ctx) -> Vec<Variant> {
                                 &[m as u64, k as u64],
                                 &routes(m, ROUTED_EXPERTS_SMALL, 70 + m as u64),
                             ),
+                            // No sources (`XS` 0): each choice reads its expert's stack row.
+                            ctx.ints(&[0, m as u64, k as u64], &[]),
                             ctx.dense(
                                 f32e(),
                                 &[m as u64, k as u64],
@@ -1508,6 +1512,8 @@ fn routed_output(ctx: &Ctx) -> Vec<Variant> {
                             ),
                             ctx.dense(f32e(), &[m as u64], &uniform(&mut rng, m, 0.1, 0.9)),
                             Arg::Shared(weights.tensors[2].clone()),
+                            // No host tier (`TR` 0): a view of none of the down records.
+                            Arg::Shared(ctx.tensor(weights.elements[2], &[0, ROUTED_HIDDEN as u64, ROUTED_FFN as u64], &[])),
                             Arg::Shared(weights.tensors[5].clone()),
                         ],
                     }
@@ -1522,6 +1528,7 @@ fn routed_output(ctx: &Ctx) -> Vec<Variant> {
                     ("K", ROUTED_CHOICES as u64),
                     ("F", ROUTED_FFN as u64),
                     ("S", ROUTED_SHARED as u64),
+                    ("TR", 0),
                 ],
                 every_configuration: every,
                 cases,
@@ -1539,6 +1546,8 @@ fn routed_group(ctx: &Ctx) -> Vec<Variant> {
             Case {
                 label: format!("m{m}e{e}"),
                 args: vec![
+                    ctx.ints(&[1], &[0]),
+                    ctx.ints(&[1], &[m as i32]),
                     ctx.ints(&[m as u64, k as u64], &routes(m, e, 80 + m as u64)),
                     Arg::Mutable {
                         element: Element::i32(),
@@ -1559,6 +1568,11 @@ fn routed_group(ctx: &Ctx) -> Vec<Variant> {
                         element: Element::i32(),
                         shape: vec![b as u64],
                         bytes: i32_bytes(&vec![-5; b]),
+                    },
+                    Arg::Mutable {
+                        element: Element::i32(),
+                        shape: vec![1],
+                        bytes: i32_bytes(&[-5]),
                     },
                 ],
             }
@@ -1595,9 +1609,12 @@ fn routed_experts(ctx: &Ctx) -> Vec<Variant> {
                     let b = group_blocks(m, e);
                     let routes = routes(m, e, 90 + m as u64);
                     let (order, _, blocks) = host_group(&routes, e, b);
+                    let used = blocks.iter().filter(|expert| **expert >= 0).count() as i32;
                     Case {
                         label: format!("m{m}"),
                         args: vec![
+                            ctx.ints(&[1], &[0]),
+                            ctx.ints(&[1], &[m as i32]),
                             ctx.dense(
                                 a,
                                 &[m as u64, ROUTED_HIDDEN as u64],
@@ -1605,6 +1622,13 @@ fn routed_experts(ctx: &Ctx) -> Vec<Variant> {
                             ),
                             ctx.ints(&[b as u64, ROUTED_TILE as u64], &order),
                             ctx.ints(&[b as u64], &blocks),
+                            ctx.ints(&[1], &[used]),
+                            Arg::Shared(weights.tensors[0].clone()),
+                            Arg::Shared(weights.tensors[1].clone()),
+                            Arg::Shared(weights.tensors[2].clone()),
+                            // No slot map: the stacks also bind as the
+                            // records, never read.
+                            ctx.ints(&[0], &[]),
                             Arg::Shared(weights.tensors[0].clone()),
                             Arg::Shared(weights.tensors[1].clone()),
                             Arg::Shared(weights.tensors[2].clone()),

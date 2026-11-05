@@ -1,0 +1,37 @@
+// Expert streaming, a streamed decode layer's request to the CPU
+// (`routed_site_request` in routed.seismic); the Vulkan form of
+// `metal/routed_site_request.metal`: when a choice is the CPU's, the
+// workgroup's invocations widen the normalized rows into the step's slot's
+// F32 rows, then invocation 0 publishes the request in the slot
+// (`streaming/site.hpp`). The CPU pool sees it once the submission ends at
+// the publication after the call (Vulkan's work shows its writes to the
+// host only at a boundary).
+#include "lib/core/activation.glsl"
+#include "lib/streaming/control.glsl"
+#include "../streaming/site.hpp"
+
+void routed_site_request() {
+    const uint choices = uint(SEISMIC_DIM_M) * uint(SEISMIC_DIM_K);
+    if (!streaming_site_any(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1,
+            SEISMIC_SOURCES_STRIDE_2, choices))
+        return;
+    const uint64_t q = streaming_step(SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0);
+    const uint64_t slot = q % uint64_t(SEISMIC_DIM_FLIGHT);
+    const uint64_t rows = SEISMIC_DIM_M, columns = SEISMIC_DIM_H;
+    for (uint64_t i = gl_LocalInvocationIndex; i < rows * columns; i += gl_WorkGroupSize.x) {
+        const uint64_t m = i / columns, n = i % columns;
+        element_f32_put(SEISMIC_PTR(SEISMIC_BUFFER_SITE_ROWS) + (slot * SEISMIC_SITE_ROWS_STRIDE_0
+                + m * SEISMIC_SITE_ROWS_STRIDE_1 + n * SEISMIC_SITE_ROWS_STRIDE_2) * 4ul,
+            element_at(ELEMENT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
+                m * SEISMIC_NORMALIZED_STRIDE_0 + n * SEISMIC_NORMALIZED_STRIDE_1));
+    }
+    streaming_publish_barrier();
+    if (gl_LocalInvocationIndex != 0u)
+        return;
+    streaming_system_fence();
+    streaming_site_publish(q, SEISMIC_PTR(SEISMIC_BUFFER_ROUTES), SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
+        SEISMIC_PTR(SEISMIC_BUFFER_WEIGHTS), SEISMIC_WEIGHTS_STRIDE_0, SEISMIC_WEIGHTS_STRIDE_1,
+        SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_SOURCES_STRIDE_0, SEISMIC_SOURCES_STRIDE_1,
+        SEISMIC_SOURCES_STRIDE_2, choices,
+        SEISMIC_PTR(SEISMIC_BUFFER_SITE) + slot * SEISMIC_SITE_STRIDE_0 * 4ul, SEISMIC_SITE_STRIDE_1);
+}

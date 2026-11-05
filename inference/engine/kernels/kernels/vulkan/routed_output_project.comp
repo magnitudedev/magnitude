@@ -1,0 +1,11 @@
+// The device's share of a streamed layer of Qwen's fused decode output
+// (`routed_output_project` in routed.seismic): `routed_output`'s projections
+// (`lib/routed/output.glsl`), published in A for `routed_output_sited`.
+#define ROUTED_SOURCE_ROWS SEISMIC_CONST_SOURCE_ROWS
+#define ROUTED_PROJECTED_KIND ROUTED_ACT
+#define ROUTED_PROJECTED_BASE SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)
+#define ROUTED_PROJECTED_INDEX(m, k, n) \
+    ((m) * SEISMIC_RESULT_0_STRIDE_0 + (k) * SEISMIC_RESULT_0_STRIDE_1 + (n) * SEISMIC_RESULT_0_STRIDE_2)
+#include "lib/routed/output.glsl"
+
+void routed_output_project() { routed_output_projection(); }

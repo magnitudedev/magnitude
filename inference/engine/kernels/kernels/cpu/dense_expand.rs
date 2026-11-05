@@ -3,9 +3,9 @@
 // output row (rounded to A) as F32 into scratch, one work item per row.
 // `dense_expand_rows` gives each work item ROWS gate and up weight rows, which
 // it projects against every normalized row and combines as the portable body
-// publishes: A(A(act(A(gate))) * A(up)), `act` by the `activation` code.
+// publishes: the `glu` of gate and up, `act` by the `activation` code.
 
-use lib::core::{activation, functions};
+use lib::core::functions;
 use lib::projection::projection;
 
 fn dense_expand_normalize<L: Isa, E: Elements>(
@@ -67,18 +67,16 @@ fn dense_expand_rows<L: Isa, E: Elements>(
             .slice::<seismic::cpu::quant::Q8Block>(0, o * blocks)
     });
     projection::project_pair_staged_arithmetic(
-        &gate_weight,
-        &up_weight,
-        rows.clone(),
+        (&gate_weight, rows.start),
+        (&up_weight, rows.start),
+        rows.len(),
         normalized,
         quantized,
         |row, gate, up| {
             // SAFETY: each work item writes its own columns of every row.
             let out = unsafe { result.span_mut([row, rows.start], rows.len()) };
             for ((target, gate), up) in out.iter_mut().zip(gate.iter()).zip(up.iter()) {
-                let gate = activation::publish::<E::A>(gate_scale * *gate);
-                let activated = activation::publish::<E::A>(functions::activate(function, gate));
-                *target = E::A::narrow(activated * activation::publish::<E::A>(up_scale * *up));
+                *target = E::A::narrow(functions::glu::<E::A>(function, gate_scale * *gate, up_scale * *up));
             }
         },
     );

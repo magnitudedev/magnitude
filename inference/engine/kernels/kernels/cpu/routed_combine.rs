@@ -2,7 +2,7 @@
 // `routed_combine_stage` stages each normalized row as F32 in scratch, one
 // work item per row. `routed_combine_shared` gives each work item ROWS shared
 // features, which it expands against every row into the `shared_product`
-// scratch [M, S] (A(silu(gate) * up) as F32). `routed_combine` gives each
+// scratch [M, S] (the SiLU `glu` of gate and up, as F32). `routed_combine` gives each
 // work item ROWS output channels: per row it projects the shared expert's
 // down rows, gathers the row's grouped expert outputs (`inverse`) weighted by
 // their scores in slot order, and publishes

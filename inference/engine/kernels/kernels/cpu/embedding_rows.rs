@@ -12,7 +12,11 @@ fn embedding_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 
     });
     // SAFETY: each work item writes its own row of both results.
     let (embedded, widened) = unsafe { (cx.result_0().row_mut([row, 0]), cx.result_1().row_mut([row, 0])) };
-    cx.arg_table().decode_row(token, widened);
+    // A row that names no table row reads zeros.
+    match token {
+        Some(token) => cx.arg_table().decode_row(token, widened),
+        None => widened.fill(0.0),
+    }
     let scale = cx.arg_scale();
     for value in widened.iter_mut() {
         *value *= scale;

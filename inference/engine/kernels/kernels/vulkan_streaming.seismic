@@ -1,0 +1,270 @@
+# Vulkan implementations of the expert-streaming entries (routed.seismic's
+# streaming section), with their predicates and written grids,
+# over the protocol every backend shares (`kernels/streaming/`, the Vulkan
+# shim `vulkan/lib/streaming/control.glsl`). A waiting call waits at a park
+# before it, a submission boundary the host opens once its slot is answered
+# (Vulkan's running work sees no host write: `SEISMIC_PARKS_IN_KERNELS` 0),
+# then reads its slot once (`streaming/park.hpp`). Records of chunked
+# storage are reached through their record tables (`records`), as on Metal.
+# Group words are each call's group memory (`shared_bytes`), viewed as
+# `seismic_shared_i32`.
+
+# Reuse the resident router's numerical launches and the shared expert's
+# paired projection. Streaming adds selection resolution and next-layer hints.
+native routed_route_shared for vulkan from "vulkan/routed_route_shared.comp":
+    static (H, PT, NM, E, K, S, ES)
+    params (SIMDGROUPS in [8, 4, 2], ROWS in [1, 2, 4])
+    where H % 32 == 0 and E <= 1024
+    scratch logits bytes (M * (E + 1) * 4)
+    launch routed_route_gemv:
+        threadgroups (ceil_div(E + 1, SIMDGROUPS), 1, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (4 * DECODE_ROWS * 9)
+    launch routed_route_shared1 when M <= 1:
+        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72))
+    launch routed_route_shared2 when M == 2:
+        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72))
+    launch routed_route_shared4 when M >= 3 and M <= 4:
+        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72))
+    launch routed_route_shared8 when M >= 5:
+        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72))
+
+native routed_route_streamed for vulkan from "vulkan/routed_route_streamed.comp":
+    static (H, PT, NM, E, K, S, ES, AHEAD, EN, TM)
+    params (SIMDGROUPS in [8, 4, 2], ROWS in [1, 2, 4])
+    where H % 32 == 0 and E <= 1024 and EN <= 1024 and K <= E and (AHEAD == 0 or K <= EN)
+    scratch logits bytes ((M * (E + 1) + AHEAD * M * (EN + 1)) * 4)
+    launch routed_route_gemv:
+        threadgroups (ceil_div(E + 1, SIMDGROUPS), 1, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (4 * DECODE_ROWS * 9)
+    launch hint_routed_route_gemv when AHEAD >= 1:
+        threadgroups (ceil_div(EN, SIMDGROUPS), AHEAD, 1)
+        unless (next_policy[POLICY_RESOLVED])
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (4 * DECODE_ROWS * 9)
+    launch routed_route_hint when AHEAD >= 1:
+        threadgroups (1, AHEAD, 1)
+        unless (next_policy[POLICY_RESOLVED])
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (8 * DECODE_ROWS * K)
+    launch routed_route_streamed1 when M <= 1:
+        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
+        unless (policy[POLICY_WHOLE])
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (max(4 * (1 + 4 * DECODE_ROWS * K + POLICY_WORDS), min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72)))
+    launch routed_route_streamed2 when M == 2:
+        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
+        unless (policy[POLICY_WHOLE])
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (max(4 * (1 + 4 * DECODE_ROWS * K + POLICY_WORDS), min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72)))
+    launch routed_route_streamed4 when M >= 3 and M <= 4:
+        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
+        unless (policy[POLICY_WHOLE])
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (max(4 * (1 + 4 * DECODE_ROWS * K + POLICY_WORDS), min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72)))
+    launch routed_route_streamed8 when M >= 5:
+        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
+        unless (policy[POLICY_WHOLE])
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (max(4 * (1 + 4 * DECODE_ROWS * K + POLICY_WORDS), min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72)))
+    launch routed_route_whole1 when M <= 1:
+        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
+        if (policy[POLICY_WHOLE])
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (max(4 * (1 + 4 * DECODE_ROWS * K + POLICY_WORDS), min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72)))
+    launch routed_route_whole2 when M == 2:
+        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
+        if (policy[POLICY_WHOLE])
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (max(4 * (1 + 4 * DECODE_ROWS * K + POLICY_WORDS), min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72)))
+    launch routed_route_whole4 when M >= 3 and M <= 4:
+        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
+        if (policy[POLICY_WHOLE])
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (max(4 * (1 + 4 * DECODE_ROWS * K + POLICY_WORDS), min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72)))
+    launch routed_route_whole8 when M >= 5:
+        threadgroups (1 + ceil_div(S, SIMDGROUPS * ROWS), 1, 1)
+        if (policy[POLICY_WHOLE])
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (max(4 * (1 + 4 * DECODE_ROWS * K + POLICY_WORDS), min(S, 1) * (256 + 32 * operands(SGW) + min(8 * ceil_div(H, 32), 288) * 72)))
+
+native routed_select_streamed for vulkan from "vulkan/routed_select_streamed.comp":
+    static (H, E, K, ES, AHEAD, EN, TM)
+    params (SIMDGROUPS in [8, 4, 2])
+    where H % 32 == 0 and E <= 1024 and EN <= 1024 and K <= E and (AHEAD == 0 or K <= EN)
+    scratch logits bytes ((M * E + AHEAD * M * EN) * 4)
+    launch routed_select_gemv:
+        threadgroups (ceil_div(E, SIMDGROUPS), 1, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (4 * DECODE_ROWS * 9)
+    launch routed_select_streamed_select:
+        threadgroups (1, 1, 1)
+        unless (policy[POLICY_WHOLE])
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (4 * (1 + 4 * DECODE_ROWS * K + POLICY_WORDS))
+    launch routed_select_whole_select:
+        threadgroups (1, 1, 1)
+        if (policy[POLICY_WHOLE])
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (4 * (1 + 4 * DECODE_ROWS * K + POLICY_WORDS))
+    launch hint_routed_select_gemv when AHEAD >= 1:
+        threadgroups (ceil_div(EN, SIMDGROUPS), AHEAD, 1)
+        unless (next_policy[POLICY_RESOLVED])
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (4 * DECODE_ROWS * 9)
+    launch routed_select_hint when AHEAD >= 1:
+        threadgroups (1, AHEAD, 1)
+        unless (next_policy[POLICY_RESOLVED])
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (8 * DECODE_ROWS * K)
+
+native routed_step for vulkan from "vulkan/routed_step.comp":
+    launch routed_step:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (SERIAL_THREADS, 1, 1)
+
+# A written list grid distributes record copies; list words stage one
+# cooperative chunk per workgroup.
+native routed_copy for vulkan from "vulkan/routed_copy.comp":
+    records (source, destination)
+    launch routed_copy:
+        threadgroups (LIST_GROUPS, LIST_ROWS, 1)
+        grid (grid)
+        threads_per_threadgroup (LIST_THREADS, 1, 1)
+        shared_bytes (4 * (LIST_GROUP_CHUNK + LIST_CHUNK * LIST_ENTRY_WORDS))
+
+native routed_list_grid for vulkan from "vulkan/routed_list_grid.comp":
+    launch routed_list_grid:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (LIST_THREADS, 1, 1)
+
+# The block resolves a pass's map into device memory.
+native routed_pass_map for vulkan from "vulkan/routed_pass_map.comp":
+    launch routed_pass_map:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (LIST_THREADS, 1, 1)
+
+native routed_list_stage for vulkan from "vulkan/routed_list_stage.comp":
+    launch routed_list_stage:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (LIST_THREADS, 1, 1)
+
+# The same geometry visits every entry of a bank shrink's move list.
+native routed_move for vulkan from "vulkan/routed_move.comp":
+    records (records)
+    launch routed_move:
+        threadgroups (LIST_GROUPS, LIST_ROWS, 1)
+        threads_per_threadgroup (LIST_THREADS, 1, 1)
+        shared_bytes (4 * (LIST_GROUP_CHUNK + LIST_CHUNK * LIST_ENTRY_WORDS))
+
+# One workgroup counts every choice in its group memory, a
+# word an expert; a resident group's step requests nothing.
+native routed_scratch_request for vulkan from "vulkan/routed_scratch_request.comp":
+    static (K, E)
+    launch routed_scratch_request:
+        threadgroups (1, 1, 1)
+        unless (resident)
+        threads_per_threadgroup (REQUEST_THREADS, 1, 1)
+        shared_bytes (4 * E)
+
+# A round parks on its written grid (`routed_scratch_grids`): one workgroup
+# while it has records to convert.
+native routed_scratch_wait for vulkan from "vulkan/routed_scratch_wait.comp":
+    launch routed_scratch_wait:
+        threadgroups (1, 1, 1)
+        grid (grid)
+        threads_per_threadgroup (SERIAL_THREADS, 1, 1)
+
+native routed_scratch_grids for vulkan from "vulkan/routed_scratch_grids.comp":
+    launch routed_scratch_grids:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (SERIAL_THREADS, 1, 1)
+
+# Metal's launches over the Vulkan windowed conversion
+# (`vulkan/lib/streaming/window.glsl`): a workgroup of 256 invocations places
+# a window of 8 column tiles of a row tile, `repack_weight`'s placement; a
+# workgroup per CONVERT_TILE_ROWS-row tile of the round's records
+# (`routed_scratch_grids`); group words stage the list's cooperative chunk.
+native routed_convert for vulkan from "vulkan/routed_convert.comp":
+    records (conveyor, destination)
+    launch routed_convert:
+        threadgroups (ceil_div(N, CONVERT_TILE_ROWS), L, 1)
+        grid (grid)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (4 * (LIST_GROUP_CHUNK + LIST_CHUNK * LIST_ENTRY_WORDS))
+
+# CUDA's launch on the route's wait grid (`streaming/tier_wait.hpp`): one
+# workgroup, its first invocation reading the step's slot, its invocations
+# then writing the absent choices' sources.
+native routed_tier_wait for vulkan from "vulkan/routed_tier_wait.comp":
+    static (K)
+    launch routed_tier_wait:
+        threadgroups (1, 1, 1)
+        grid (grid)
+        unless (policy[POLICY_RESOLVED])
+        threads_per_threadgroup (SERIAL_THREADS, 1, 1)
+
+# One workgroup reads the list's count into its group memory, then commits.
+native routed_seed_commit for vulkan from "vulkan/routed_seed_commit.comp":
+    static (X)
+    launch routed_seed_commit:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (LIST_THREADS, 1, 1)
+        shared_bytes (4)
+
+# Vulkan: `routed_site_request`'s Metal form, one workgroup of 256
+# invocations over the shared protocol (`streaming/site.hpp`), its stores
+# made visible to the host at device scope while the step runs.
+native routed_site_request for vulkan from "vulkan/routed_site_request.comp":
+    static (H, K)
+    launch routed_site_request:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# Vulkan: `routed_down`'s workgroups over its projection
+# (`lib/routed/down.glsl`), publishing each choice's projection.
+native routed_down_project for vulkan from "vulkan/routed_down_project.comp":
+    static (H, K, F)
+    params (SIMDGROUPS in [2, 4, 8], ROWS in [1, 2, 4])
+    records (expert_down, tier_down)
+    launch routed_down_project:
+        threadgroups (ceil_div(H, SIMDGROUPS * ROWS), M, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (256 + 32 * operands(EDW) + min(ceil_div(F, 32), 288) * 72)
+
+# Vulkan: an invocation a channel of a row (`lib/routed/down_sum.glsl`), its
+# workgroup's invocation 0 reading the CPU's answer after its park
+# (`lib/routed/sited.glsl`).
+native routed_down_sited for vulkan from "vulkan/routed_down_sited.comp":
+    static (H, K)
+    launch routed_down_sited:
+        threadgroups (ceil_div(H, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# Vulkan: `routed_output`'s projection launch (`lib/routed/output.glsl`),
+# publishing into the result.
+native routed_output_project for vulkan from "vulkan/routed_output_project.comp":
+    static (H, K, F, S)
+    params (SIMDGROUPS in [2, 4, 8], ROWS in [1, 2, 4])
+    records (expert_down, tier_down)
+    launch routed_output_project:
+        threadgroups (ceil_div(H, SIMDGROUPS * ROWS), M * (K + 1), 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (256 + 32 * max(operands(EDW), operands(SDW)) + min(ceil_div(max(F, S), 32), 288) * 72)
+
+# Vulkan: `routed_output`'s combine launch (`lib/routed/output_sum.glsl`),
+# its workgroup's invocation 0 reading the CPU's answer after its park.
+native routed_output_sited for vulkan from "vulkan/routed_output_sited.comp":
+    static (H, SN, IN, K)
+    launch routed_output_combine:
+        threadgroups (ceil_div(H, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)

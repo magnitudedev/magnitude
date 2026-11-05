@@ -24,7 +24,8 @@
 # Token contract: `tokens` has the `sample_rows` result layout (token,
 # status), so a step reads host tokens or the previous step's selection.
 # `rows[m * C * P + h]` is (row, status of m's token): the (row, status)
-# layout `gathered_row` reads. Rows outside every slot are (0, 0).
+# layout `gathered_row` reads. Rows outside every slot are (-1, 0): they name
+# no table row, and read zeros.
 #
 # State contract: the token window `window[N, C + T, 1] u32` holds token + 1,
 # 0 for no token (the zero seed: no token precedes a new sequence), under the
@@ -42,7 +43,7 @@ fn ngram_rows[M, B, N, C, P, T](tokens: &tensor[M, 2] i32,
     let mut rows = tensor[M * C * P, 2] i32
     for row in 0..M:
         for head in 0..C * P:
-            rows[row * C * P + head, 0] = 0
+            rows[row * C * P + head, 0] = -1
             rows[row * C * P + head, 1] = 0
     let absent = u32(0)
     let reset_stored = u32(reset + 1)

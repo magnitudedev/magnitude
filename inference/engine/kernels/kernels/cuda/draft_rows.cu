@@ -45,16 +45,20 @@ struct DraftInput {
     SEISMIC_TABLE_STRIDE_0, SEISMIC_TABLE_STRIDE_1, SEISMIC_CONDITIONING_STRIDE_0, \
     SEISMIC_CONDITIONING_STRIDE_1, SEISMIC_EMBEDDING_NORM_STRIDE_0, SEISMIC_HIDDEN_NORM_STRIDE_0}
 
-__device__ __forceinline__ void draft_join(const DraftInput &input, u64 token, u64 row, u64 stream,
+__device__ __forceinline__ void draft_join(const DraftInput &input, long long held, u64 row, u64 stream,
                                           u64 D, float epsilon, float *joined, float *partials) {
     using Conditioning = ELEMENT_OF(SEISMIC_CONDITIONING);
     using EmbeddingNorm = ELEMENT_OF(SEISMIC_EMBEDDING_NORM);
     using HiddenNorm = ELEMENT_OF(SEISMIC_HIDDEN_NORM);
-    // The embedding row rounded to A, and its sum of squares.
+    // The embedding row rounded to A, and its sum of squares: zeros of a
+    // row that names no table row.
     float embedding_squares = 0.0f;
+    const u64 token = (u64)held;
+    for (u64 column = threadIdx.x; held < 0 && column < D; column += blockDim.x)
+        joined[column] = 0.0f;
 #if defined(SEISMIC_TABLE_KIND_PACKED)
     const auto table = input.table;
-    for (u64 item = threadIdx.x; item < D / 64 * 4; item += blockDim.x) {
+    for (u64 item = threadIdx.x; held >= 0 && item < D / 64 * 4; item += blockDim.x) {
         const u64 kb = item / 4;
         const u32 t = (u32)(item % 4);
         const u32 offsets[4] = {2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9};
@@ -79,7 +83,7 @@ __device__ __forceinline__ void draft_join(const DraftInput &input, u64 token, u
     }
 #else
     using Table = ELEMENT_OF(SEISMIC_TABLE);
-    for (u64 column = threadIdx.x; column < D; column += blockDim.x) {
+    for (u64 column = threadIdx.x; held >= 0 && column < D; column += blockDim.x) {
         const float value = Act::round(element::at<Table>(
             input.table_bytes, token * input.table_row_stride + column * input.table_column_stride));
         joined[column] = value;
@@ -120,11 +124,11 @@ extern "C" __global__ void draft_rows(SEISMIC_KERNEL_PARAMS) {
     const u64 stream = blockIdx.y % SEISMIC_DIM_S;
     const float epsilon = __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON);
     const int *tokens = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS));
-    const u64 token = gathered::row(reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY)),
-                                    SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R, SEISMIC_DIM_F,
-                                    tokens[row * SEISMIC_TOKENS_STRIDE_0]);
+    const long long held = gathered::row(reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY)),
+                                         SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R, SEISMIC_DIM_F,
+                                         tokens[row * SEISMIC_TOKENS_STRIDE_0]);
 
-    draft_join(DRAFT_INPUT, token, row, stream, D, epsilon, joined, partials);
+    draft_join(DRAFT_INPUT, held, row, stream, D, epsilon, joined, partials);
     // Four combine rows per warp over the 2D joined inputs.
     const unsigned warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     float *result = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
@@ -172,11 +176,11 @@ extern "C" __global__ void draft_rows_join(SEISMIC_KERNEL_PARAMS) {
     const u64 stream = blockIdx.y % SEISMIC_DIM_S;
     const float epsilon = __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON);
     const int *tokens = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS));
-    const u64 token = gathered::row(reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY)),
-                                    SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R, SEISMIC_DIM_F,
-                                    tokens[row * SEISMIC_TOKENS_STRIDE_0]);
+    const long long held = gathered::row(reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY)),
+                                         SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R, SEISMIC_DIM_F,
+                                         tokens[row * SEISMIC_TOKENS_STRIDE_0]);
 
-    draft_join(DRAFT_INPUT, token, row, stream, D, epsilon, joined, partials);
+    draft_join(DRAFT_INPUT, held, row, stream, D, epsilon, joined, partials);
     auto *staged = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_JOINED);
     for (u64 column = threadIdx.x; column < 2 * D; column += blockDim.x)
         element::put<Act>(staged, (row * SEISMIC_DIM_S + stream) * 2 * D + column, joined[column]);

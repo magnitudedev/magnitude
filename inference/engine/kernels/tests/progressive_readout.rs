@@ -1,12 +1,13 @@
 //! The progressive head readout (`readout.seismic`) on Metal (macOS) and CUDA
 //! (elsewhere): the natives against their portable bodies (the Seismic
 //! interpreter), and certified selections against the full planes readout.
-//! Tests return early without a Metal or CUDA device.
+//! Tests return early when discovery lists no available device of the
+//! backend; one it lists must open.
 
 use magnitude_kernels::{
     readout_exact_rows, readout_planes_rows, readout_refine_rows, readout_top_rows,
 };
-use seismic::{BackendName, Device, Element, NativeSpecialization, Tensor};
+use seismic::{Availability, BackendName, Device, Element, NativeSpecialization, Tensor};
 use seismic_lang::{
     checked::{CheckedModule, SourceFile, check_source},
     entry::ElementBindings,
@@ -19,13 +20,40 @@ use seismic_lang::{
 
 const EPSILON: f32 = 1e-6;
 
+/// The device under test: Metal on macOS, CUDA elsewhere, or the backend
+/// `SEISMIC_TEST_BACKEND` selects (`metal` or `cuda`), which must then be
+/// present. A backend discovery lists as available must open; one it does
+/// not list leaves the tests nothing to run.
 fn device() -> Option<Device> {
-    let backend = if cfg!(target_os = "macos") {
+    let selected =
+        std::env::var("SEISMIC_TEST_BACKEND")
+            .ok()
+            .map(|selected| match selected.as_str() {
+                "metal" => BackendName::Metal,
+                "cuda" => BackendName::Cuda,
+                other => panic!("SEISMIC_TEST_BACKEND={other}: only metal and cuda are selectable"),
+            });
+    let backend = selected.unwrap_or(if cfg!(target_os = "macos") {
         BackendName::Metal
     } else {
         BackendName::Cuda
+    });
+    let devices = seismic::Devices::discover(&[]).expect("device discovery succeeds");
+    let topology = devices.topology();
+    let Some(executor) = topology.executors().iter().find(|executor| {
+        executor.backend() == backend && *executor.availability() == Availability::Available
+    }) else {
+        assert!(
+            selected.is_none(),
+            "SEISMIC_TEST_BACKEND selects {backend:?}, which discovery does not list as available"
+        );
+        return None;
     };
-    seismic::Devices::discover(&[]).ok()?.open_backend(backend).ok()
+    Some(
+        devices
+            .open(executor.id())
+            .unwrap_or_else(|error| panic!("the available {backend:?} executor opens: {error}")),
+    )
 }
 
 /// The launch of the top level's and the full pass's vocabulary projection

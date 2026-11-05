@@ -35,7 +35,8 @@ void corrector_features() {
     const float normalizer = maximum + log(reduce_group_sum(partial, 0u));
 
     const float best = element_f32_at(unary + row * SEISMIC_UNARY_STRIDE_0 * 4ul);
-    for (uint64_t rank = lane; rank < count; rank += threads) {
+    // A 32-bit counter: see `streaming/contract.hpp`.
+    for (uint rank = uint(lane); rank < uint(count); rank += uint(threads)) {
         const float logit = element_f32_at(unary + (row * SEISMIC_UNARY_STRIDE_0 + rank * SEISMIC_UNARY_STRIDE_1) * 4ul);
         const float lp = logit - normalizer;
         float features[5];

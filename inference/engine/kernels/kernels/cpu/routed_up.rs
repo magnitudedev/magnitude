@@ -1,9 +1,10 @@
 // routed_up on CPU (contract and portable body in routed.seismic).
 // `routed_up_stage` stages each normalized row as F32 in scratch, one work
 // item per row. `routed_up_rows`: work item (x, y) owns feature block x of
-// ROWS features of choice y = (m, k), whose expert up rows it projects
-// against row m: A(act(A(us * up))), `us` the choice's expert's scale, 1
-// where the port is absent.
+// ROWS features of choice y = (m, k), whose expert's up rows (its record,
+// `routed::decode_source`) it projects against row m: A(act(A(us * up))),
+// `us` the choice's expert's scale, 1 where the port is absent; a choice
+// with no record has a zero product.
 
 use lib::projection::projection;
 use lib::routed::routed;
@@ -43,13 +44,21 @@ fn routed_up_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 
         &cx.scratch_quantized().slice::<seismic::cpu::quant::Q8Block>(0, m * blocks)[row * blocks..(row + 1) * blocks]
     });
     let expert = cx.arg_routes().get([row, slot]);
-    let first = routed::expert_row(expert, f) + rows.start;
+    let sources = cx.arg_sources();
     let up_scale = cx.arg_up_scale();
     let scale = routed::scale_factor(cx.dim_us(), |e| up_scale.get([e]), expert);
     // SAFETY: each work item writes its own features of its own choice.
     let out = unsafe { cx.result_0().span_mut([row, slot, rows.start], rows.len()) };
+    // A choice its slot map names no record for reads none: a zero product.
+    let Some(place) = routed::decode_source(cx.dim_xs(), || sources.get([0, row, slot]), expert) else {
+        out.fill(E::A::narrow(0.0));
+        return;
+    };
+    let (bank, tier) = (cx.arg_expert_up(), cx.arg_tier_up());
+    let (up, record) = place.of(&bank, &tier);
+    let first = routed::expert_row(record, f) + rows.start;
     routed::activated_into::<E::A>(
-        &cx.arg_expert_up(),
+        up,
         first,
         &staged[row * h..(row + 1) * h],
         q8,

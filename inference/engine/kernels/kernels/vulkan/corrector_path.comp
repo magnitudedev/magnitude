@@ -26,7 +26,8 @@ void corrector_path() {
         const uint64_t other_stride = step == 0ul ? SEISMIC_ANCHOR_STRIDE_1 : SEISMIC_OUTGOING_STRIDE_3;
         float best = -uintBitsToFloat(0x7f800000u);
         uint64_t chosen = 0ul;
-        for (uint64_t candidate = 0ul; candidate < SEISMIC_DIM_K; ++candidate) {
+        // A 32-bit counter: see `streaming/contract.hpp`.
+        for (uint candidate = 0u; candidate < uint(SEISMIC_DIM_K); ++candidate) {
             const uint64_t row = incoming + (slot * SEISMIC_INCOMING_STRIDE_0 + step * SEISMIC_INCOMING_STRIDE_1
                 + candidate * SEISMIC_INCOMING_STRIDE_2) * 4ul;
             float partial = 0.0;

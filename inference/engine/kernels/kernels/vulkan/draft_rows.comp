@@ -70,13 +70,16 @@ void draft_rows() {
     const uint partials = width;   // floats, after the 2D 16-bit joined row
     const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
 
-    // The embedding row in A, packet by packet, and its sum of squares.
+    // The embedding row in A, packet by packet, and its sum of squares:
+    // zeros of a row that names no table row.
     const packets_rows16 table_geometry = PACKETS_W0_ROWS;
-    const uint64_t token = gathered_row(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY), SEISMIC_DIRECTORY_STRIDE_0,
+    const int64_t held = gathered_row(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY), SEISMIC_DIRECTORY_STRIDE_0,
         SEISMIC_DIM_R, SEISMIC_DIM_F, element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS), row * SEISMIC_TOKENS_STRIDE_0));
-    const uint64_t table_row = SEISMIC_PTR(SEISMIC_BUFFER_TABLE) + token * table_geometry.stride;
+    const uint64_t table_row = SEISMIC_PTR(SEISMIC_BUFFER_TABLE) + uint64_t(held) * table_geometry.stride;
     float embedding_squares = 0.0;
-    for (uint p = thread; p * 32u < width; p += threads) {
+    for (uint column = thread; held < 0l && column < width; column += threads)
+        seismic_shared_u16[column] = uint16_t(element_store(DRAFT_ACT, 0.0));
+    for (uint p = thread; held >= 0l && p * 32u < width; p += threads) {
         const packets_packet packet = packets_load(PACKETS_W0, table_row, table_geometry, p, width);
         [[unroll]] for (uint step = 0u; step < 4u; ++step) {
             vec4 even, odd;

@@ -1,0 +1,11 @@
+// The workgroup resolves a merge set's pass's map into device memory
+// (`routed_pass_map` in routed.seismic, streaming/pass_map.hpp).
+#include "lib/streaming/control.glsl"
+#include "../streaming/pass_map.hpp"
+
+void routed_pass_map() {
+    streaming_pass_map(SEISMIC_PTR(SEISMIC_BUFFER_MAP), SEISMIC_MAP_STRIDE_0, SEISMIC_MAP_STRIDE_1, SEISMIC_DIM_E,
+        SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0, SEISMIC_PTR(SEISMIC_BUFFER_RESOLVED),
+        SEISMIC_RESOLVED_STRIDE_0, SEISMIC_RESOLVED_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_PASS_STEP),
+        SEISMIC_PASS_STEP_STRIDE_0, gl_LocalInvocationIndex, gl_WorkGroupSize.x);
+}

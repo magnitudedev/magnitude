@@ -1,27 +1,16 @@
 // Exact GGUF -> resident conversion (the Seismic registry's registered
 // `repack`) into `rows16` storage, the Vulkan resident layout (spec §10.1).
 // E is the GGUF source, U the resident (representation, layout); the entry
-// sees every weight as a [B, N, K] view.
-//
-// The conversion is data: its word form (`seismic_lang::repack::WordTable`,
-// whose docs give the table's format), emitted as SEISMIC_CONVERSION_E_U_*,
-// gives every 32-bit word of a source packet's record, the packet's storage
-// group's share of each row plane, as the OR of pieces: runs of source bits
-// or bits of values its postfix ops compute. The prefix renders it as code
-// (SEISMIC_CONVERSION_E_U_UNIT, a unit of the code planes' words, and
-// SEISMIC_CONVERSION_E_U_FIXED, the other words: the group roles' shares);
-// this kernel places records in rows16.
+// sees every weight as a [B, N, K] view. The placement of each row tile is
+// lib/repack/repack.glsl's, the one expert streaming's slots are written by.
 //
 // Each workgroup (32 invocations) places one row tile: 16 rows x one unit of
-// the span's columns (SEISMIC_CONVERSION_E_U_UNIT_COLUMNS: 32, or more where
-// 32 columns of a code plane are no whole words). A unit divides its group,
-// so a tile covers a whole packet or part of a larger one, and a code
-// plane's share of a tile row is whole record words (a unit of the span);
-// the tile at a group's first column also places that group's other record
-// words. The grid holds a workgroup per unit; those past the row's units
-// place nothing. Stored-but-unoccupied bytes (plane
-// alignment tails) are written as zero, so the result is fully defined.
-#include <seismic/element.glsl>
+// the span's columns (`repack_tile_columns`), an invocation a row. The grid
+// holds a workgroup per unit; those past the row's units place nothing. The
+// result is a record port (bank records, chunked, import through it): matrix
+// b is written from its own record's base.
+#include <seismic/slab.glsl>
+#include "lib/repack/repack.glsl"
 
 #if !defined(SEISMIC_ELEMENT_E_KIND_EXTERNAL) || !defined(SEISMIC_ELEMENT_U_LAYOUT_ROWS16)
 #error "repack_weight converts an external GGUF source into rows16 resident storage"
@@ -37,40 +26,7 @@
 #error "rows16 stores no padding groups"
 #endif
 
-#define GROUP uint(SEISMIC_ELEMENT_E_LOGICAL_GROUP)
-#define TILE_ROWS 16u
-#define TILE_COLUMNS uint(SEISMIC_CONVERSION_E_U_UNIT_COLUMNS)
-
-// ---- rows16: the record is the row planes' shares -------------------------
-
-// A unit's words (a tile's columns of each code plane, `WordSpan`): the codes',
-// then the high codes'.
-#define CODES_WORDS SEISMIC_CONVERSION_E_U_CODES_UNIT_WORDS
-#define HIGH_WORDS SEISMIC_CONVERSION_E_U_HIGH_UNIT_WORDS
-
-// `bytes` bytes of the record words `words` from word `first` at `place`,
-// aligned as `bytes` bytes from a 16-byte aligned plane are (a unit's share
-// of a code plane, or a group role's share): stored in the widest units that
-// alignment allows.
-void store(uint64_t place, uint words[SEISMIC_CONVERSION_E_U_WORDS], uint first, uint bytes) {
-    if (bytes % 16u == 0u) {
-        [[unroll]] for (uint at = 0u; at < bytes / 4u; at += 4u)
-            element_uvec4_put(place + 4u * at,
-                uvec4(words[first + at], words[first + at + 1u], words[first + at + 2u], words[first + at + 3u]));
-    } else if (bytes % 8u == 0u) {
-        [[unroll]] for (uint at = 0u; at < bytes / 4u; at += 2u)
-            element_uvec2_put(place + 4u * at, uvec2(words[first + at], words[first + at + 1u]));
-    } else if (bytes % 4u == 0u) {
-        [[unroll]] for (uint at = 0u; at < bytes / 4u; ++at)
-            element_u32_put(place + 4u * at, words[first + at]);
-    } else if (bytes % 2u == 0u) {
-        [[unroll]] for (uint half_word = 0u; half_word < bytes / 2u; ++half_word)
-            element_u16_put(place + 2u * half_word, words[first + half_word / 2u] >> (16u * (half_word % 2u)));
-    } else {
-        [[unroll]] for (uint byte = 0u; byte < bytes; ++byte)
-            element_u8_put(place + byte, words[first + byte / 4u] >> (8u * (byte % 4u)));
-    }
-}
+REPACK_TILE(repack, SEISMIC_CONVERSION_E_U, SEISMIC_ELEMENT_E, SEISMIC_RESULT_0)
 
 // Source packet `index` of row `n` of matrix `b`.
 uint64_t source_packet(uint64_t source, uint64_t b, uint64_t n, uint64_t index) {
@@ -79,15 +35,10 @@ uint64_t source_packet(uint64_t source, uint64_t b, uint64_t n, uint64_t index) 
         * uint64_t(SEISMIC_ELEMENT_E_PACKET_SIZE);
 }
 
-// Start of stored row `n` of matrix `b`.
+// Start of stored row `n` of matrix `b`, from its record's base in the
+// result's record table.
 uint64_t row_base(uint64_t destination, uint64_t b, uint64_t n) {
-    return destination + (b * SEISMIC_RESULT_0_STRIDE_0 + n * SEISMIC_RESULT_0_STRIDE_1) * SEISMIC_RESULT_0_ROW_STRIDE_BYTES;
-}
-
-// `count` bytes at `place`, zero.
-void zero_bytes(uint64_t place, uint64_t count) {
-    for (uint64_t at = 0ul; at < count; ++at)
-        element_u8_put(place + at, 0u);
+    return slab_region(destination, b) + n * SEISMIC_RESULT_0_STRIDE_1 * SEISMIC_RESULT_0_ROW_STRIDE_BYTES;
 }
 
 void repack_weight() {
@@ -95,43 +46,11 @@ void repack_weight() {
     const uint64_t destination = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
     const uint lane = gl_LocalInvocationID.x;
     const uint64_t b = gl_WorkGroupID.z;
-    const uint64_t n = uint64_t(gl_WorkGroupID.y) * TILE_ROWS + lane;
-    const uint column0 = gl_WorkGroupID.x * TILE_COLUMNS;
-    const uint64_t stored_columns = SEISMIC_RESULT_0_ROW_GROUPS * GROUP;
-    if (lane >= TILE_ROWS || n >= SEISMIC_DIM_N || column0 >= stored_columns)
+    const uint64_t n = uint64_t(gl_WorkGroupID.y) * REPACK_TILE_ROWS + lane;
+    const uint column0 = gl_WorkGroupID.x * repack_tile_columns();
+    const uint64_t stored_columns = SEISMIC_RESULT_0_ROW_GROUPS * uint64_t(SEISMIC_ELEMENT_E_LOGICAL_GROUP);
+    if (lane >= REPACK_TILE_ROWS || n >= SEISMIC_DIM_N || column0 >= stored_columns)
         return;
-    const uint64_t group = column0 / GROUP;
-    const uint within = column0 % GROUP;
-    const uint64_t packet = source_packet(source, b, n, group);
-    const uint64_t row = row_base(destination, b, n);
-
-    // Code planes: the tile's columns of the row are one unit of each,
-    // the unit `within / TILE_COLUMNS` of the group, its words all computed
-    // before any is stored.
-    const uint unit = column0 / TILE_COLUMNS;
-    uint words[SEISMIC_CONVERSION_E_U_WORDS];
-    SEISMIC_CONVERSION_E_U_UNIT(packet, within / TILE_COLUMNS, words);
-    store(row + SEISMIC_RESULT_0_ROW_CODES + uint64_t(unit) * (4u * CODES_WORDS), words, 0u, 4u * CODES_WORDS);
-    store(row + SEISMIC_RESULT_0_ROW_HIGH + uint64_t(unit) * (4u * HIGH_WORDS), words, CODES_WORDS, 4u * HIGH_WORDS);
-
-    // Group planes, once per group (at its first tile): the fixed words
-    // computed, then each role's share stored.
-    if (within == 0u) {
-        SEISMIC_CONVERSION_E_U_FIXED(packet, words);
-        store(row + SEISMIC_RESULT_0_ROW_SCALES + group * SEISMIC_CONVERSION_E_U_SCALES_BYTES, words,
-            SEISMIC_CONVERSION_E_U_SCALES_WORD, SEISMIC_CONVERSION_E_U_SCALES_BYTES);
-        store(row + SEISMIC_RESULT_0_ROW_SUPERS + group * SEISMIC_CONVERSION_E_U_SUPERS_BYTES, words,
-            SEISMIC_CONVERSION_E_U_SUPERS_WORD, SEISMIC_CONVERSION_E_U_SUPERS_BYTES);
-    }
-
-    // Alignment tails of every plane, from its end to the next plane's start
-    // (or the row's end), at the row's last stored tile.
-    if (column0 + TILE_COLUMNS == stored_columns) {
-        zero_bytes(row + SEISMIC_RESULT_0_ROW_CODES + SEISMIC_RESULT_0_ROW_CODES_BYTES, SEISMIC_RESULT_0_ROW_CODES_TAIL);
-        zero_bytes(row + SEISMIC_RESULT_0_ROW_HIGH + SEISMIC_RESULT_0_ROW_HIGH_BYTES, SEISMIC_RESULT_0_ROW_HIGH_TAIL);
-        zero_bytes(row + SEISMIC_RESULT_0_ROW_SCALES + SEISMIC_RESULT_0_ROW_SCALES_BYTES,
-            SEISMIC_RESULT_0_ROW_SCALES_TAIL);
-        zero_bytes(row + SEISMIC_RESULT_0_ROW_SUPERS + SEISMIC_RESULT_0_ROW_SUPERS_BYTES,
-            SEISMIC_RESULT_0_ROW_SUPERS_TAIL);
-    }
+    repack_place(source_packet(source, b, n, column0 / uint(SEISMIC_ELEMENT_E_LOGICAL_GROUP)), row_base(destination, b, n),
+        column0);
 }

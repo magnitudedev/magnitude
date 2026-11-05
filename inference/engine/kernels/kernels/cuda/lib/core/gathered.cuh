@@ -7,7 +7,8 @@
 // `entries` rows of `fields` I32 (`stride` elements apart, fields adjacent),
 // is dense (`fields` 1: every table row's slot or -1) or hashed (`fields` 2:
 // `entries` linearly probed (row, slot) buckets, a power of two; row -1 is
-// empty and ends a probe, -2 a tombstone a probe passes). A failed selection (-1) and a row without a slot read row 0.
+// empty and ends a probe, -2 a tombstone a probe passes). A selection that
+// names no row (-1) and a row without a slot give -1: the reader reads zeros.
 //
 // This file is independent of any entry ABI.
 
@@ -24,25 +25,25 @@ __device__ __forceinline__ unsigned bucket(int row, unsigned buckets) {
     return h & (buckets - 1u);
 }
 
-__device__ __forceinline__ unsigned long long row(const int *directory, unsigned long long stride,
-                                                  unsigned long long entries,
-                                                  unsigned long long fields, int selected) {
+__device__ __forceinline__ long long row(const int *directory, unsigned long long stride,
+                                         unsigned long long entries, unsigned long long fields,
+                                         int selected) {
     if (selected < 0)
-        return 0ull;
+        return -1ll;
     if (entries == 0)
-        return (unsigned long long)selected;
+        return (long long)selected;
     if (fields == 1)
-        return (unsigned long long)max(directory[(unsigned long long)selected * stride], 0);
+        return (long long)directory[(unsigned long long)selected * stride];
     const unsigned mask = (unsigned)entries - 1u;
     unsigned probe = bucket(selected, (unsigned)entries);
     for (unsigned long long visited = 0; visited < entries; ++visited, probe = (probe + 1u) & mask) {
         const int key = directory[(unsigned long long)probe * stride];
         if (key == selected)
-            return (unsigned long long)max(directory[(unsigned long long)probe * stride + 1], 0);
+            return (long long)directory[(unsigned long long)probe * stride + 1];
         if (key == -1)
             break;
     }
-    return 0ull;
+    return -1ll;
 }
 
 } // namespace gathered

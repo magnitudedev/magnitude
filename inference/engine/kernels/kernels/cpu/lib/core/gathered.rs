@@ -7,8 +7,8 @@
 // `entries` rows of `fields` I32 read by `entry(row, field)`, is dense
 // (`fields` 1: every table row's slot or -1) or hashed (`fields` 2: `entries`
 // linearly probed (row, slot) buckets, a power of two; row -1 is empty and
-// ends a probe, -2 a tombstone a probe passes). A failed selection (-1) and a
-// row without a slot read row 0.
+// ends a probe, -2 a tombstone a probe passes). A selection that names no row
+// (-1) and a row without a slot give `None`: the reader reads zeros.
 
 /// murmur3's 32-bit finalizer of `row`, masked to `buckets` (a power of two).
 #[inline(always)]
@@ -23,27 +23,25 @@ pub fn bucket(row: i32, buckets: u32) -> u32 {
 }
 
 #[inline(always)]
-pub fn row(selected: i32, entries: u64, fields: u64, entry: impl Fn(usize, usize) -> i32) -> usize {
-    let Ok(index) = usize::try_from(selected) else {
-        return 0;
-    };
+pub fn row(selected: i32, entries: u64, fields: u64, entry: impl Fn(usize, usize) -> i32) -> Option<usize> {
+    let index = usize::try_from(selected).ok()?;
     if entries == 0 {
-        return index;
+        return Some(index);
     }
     if fields == 1 {
-        return entry(index, 0).max(0) as usize;
+        return usize::try_from(entry(index, 0)).ok();
     }
     let mask = (entries as u32).wrapping_sub(1);
     let mut probe = bucket(selected, entries as u32);
     for _ in 0..entries {
         let key = entry(probe as usize, 0);
         if key == selected {
-            return entry(probe as usize, 1).max(0) as usize;
+            return usize::try_from(entry(probe as usize, 1)).ok();
         }
         if key == -1 {
             break;
         }
         probe = probe.wrapping_add(1) & mask;
     }
-    0
+    None
 }

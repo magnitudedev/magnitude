@@ -1,7 +1,7 @@
 // ngram_rows (contract and portable body in ngram.seismic): the n-gram table
 // rows of each launch row from its token and its predecessors, the ones
 // before the slot read from the slot's token window. A thread owns one item:
-// item y < M forms row y's C * P rows ((0, 0) past the slots), item M + b
+// item y < M forms row y's C * P rows ((-1, 0) past the slots), item M + b
 // publishes slot b's successor window. The hash is the body's u64 words, so
 // every backend names the same rows. The successor window is no slot's
 // source, so the publishing threads run beside the row threads.
@@ -58,7 +58,7 @@ extern "C" __global__ void ngram_rows(SEISMIC_KERNEL_PARAMS) {
     const u64 slot_index = versions::slot_index_of_row(slots, row, seismic_words_value);
     if (slot_index == SEISMIC_DIM_B) {
         for (u64 head = 0; head < heads; ++head) {
-            rows[(first + head) * SEISMIC_RESULT_0_STRIDE_0] = 0;
+            rows[(first + head) * SEISMIC_RESULT_0_STRIDE_0] = -1;
             rows[(first + head) * SEISMIC_RESULT_0_STRIDE_0 + SEISMIC_RESULT_0_STRIDE_1] = 0;
         }
         return;

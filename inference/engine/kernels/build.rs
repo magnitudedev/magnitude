@@ -22,8 +22,8 @@ const BACKENDS: [BackendName; 4] = [
 const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     (
         "routed_route_shared",
-        &[BackendName::Metal],
-        "decode routing that also expands the shared expert in the router launch; the other backends run `routed_route`, then `routed_expand`, until the form is measured there",
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
+        "decode routing that also expands the shared expert, the decode form of the backends that stream decode; the other backends run `routed_route`, then `routed_expand`",
     ),
     (
         "gated_delta_project_convolved",
@@ -62,13 +62,58 @@ const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     ),
 ];
 
+/// Expert streaming's entries (routed.seismic's streaming section), on the
+/// backends that stream (`STREAMING_BACKENDS`): the CPU backend streams no
+/// experts.
+const STREAMING_ENTRIES: &[&str] = &[
+    "routed_route_streamed",
+    "routed_select_streamed",
+    "routed_tier_wait",
+    "routed_site_request",
+    "routed_down_project",
+    "routed_down_sited",
+    "routed_output_project",
+    "routed_output_sited",
+    "routed_step",
+    "routed_scratch_request",
+    "routed_scratch_wait",
+    "routed_scratch_grids",
+    "routed_copy",
+    "routed_list_grid",
+    "routed_pass_map",
+    "routed_list_stage",
+    "routed_move",
+    "routed_convert",
+    "routed_seed_commit",
+];
+
+const STREAMING_BACKENDS: &[BackendName] =
+    &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan];
+
+/// Every entry exception: `ENTRY_EXCEPTIONS`, then `STREAMING_ENTRIES`.
+fn entry_exceptions() -> impl Iterator<Item = (&'static str, &'static [BackendName], &'static str)>
+{
+    let streaming = "expert streaming's entry, on the backends that stream";
+    ENTRY_EXCEPTIONS.iter().copied().chain(
+        STREAMING_ENTRIES
+            .iter()
+            .map(move |&entry| (entry, STREAMING_BACKENDS, streaming)),
+    )
+}
+
 /// Files of the per-backend trees that exist on only some backends: (path
 /// relative to `kernels/<backend>/`, without extension; the backends that have
 /// it; why). Every other file — entry asset or library file, at any depth —
-/// exists on all of `BACKENDS`. An exception whose actual presence differs,
+/// exists on all of `BACKENDS`, apart from `STREAMING_LIBRARIES` and the
+/// assets of `entry_exceptions`. An exception whose actual presence differs,
 /// including one now on every backend, fails the build so this list cannot go
 /// stale.
 const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
+    (
+        "lib/routed/resolve",
+        &[BackendName::Cuda],
+        "the streamed routes' resolve over their bank ports is separate from CUDA's streaming shim so the other streaming entries bind none of them",
+    ),
     (
         "lib/attention/inputs",
         &[BackendName::Cuda],
@@ -96,8 +141,8 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     ),
     (
         "lib/core/arrive",
-        &[BackendName::Metal],
-        "last-threadgroup arrival over `sync` scratch; only Metal natives declare sync scratch so far",
+        &[BackendName::Metal, BackendName::Cuda],
+        "last-threadgroup arrival over `sync` scratch, for the GPU natives that declare sync scratch",
     ),
     (
         "lib/core/gumbel",
@@ -135,29 +180,100 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "decode router logits shared by the Metal route and select GEMVs over the projection GEMV body (any activation element, unlike `routed.h`); CUDA and Vulkan keep their router GEMVs inline",
     ),
     (
-        "lib/routed/route",
+        "lib/routed/shared",
+        &[BackendName::Metal, BackendName::Cuda],
+        "the shared expert's expansion in a decode route's launch, shared by `routed_route_shared` and `routed_route_streamed`, on the backends that declare them",
+    ),
+    (
+        "lib/routed/logits",
         &[BackendName::Metal],
-        "decode router threadgroups of the `routed_route` contract, shared by `routed_route` and the Metal-only `routed_route_shared`",
+        "the prefill router logits tile on F32 simdgroup matrices, shared by the Metal route and select GEMMs; CUDA and Vulkan keep their router GEMMs inline",
+    ),
+    (
+        "lib/routed/route_body",
+        &[BackendName::Vulkan],
+        "Vulkan resident router arithmetic rebound to the current or next-layer router's ports",
+    ),
+    (
+        "lib/routed/selection_body",
+        &[BackendName::Vulkan],
+        "Vulkan resident selection arithmetic rebound to the current or next-layer router's ports",
+    ),
+    (
+        "lib/routed/route_shared",
+        &[BackendName::Vulkan],
+        "Vulkan shared expert projection over the resident paired GEMV implementation",
+    ),
+    (
+        "lib/routed/streamed",
+        &[BackendName::Vulkan],
+        "Vulkan workgroup adapters to the shared streaming resolution and hint protocol",
     ),
 ];
 
+/// Expert streaming's library files, on the backends that stream
+/// (`STREAMING_BACKENDS`): (path as in `TREE_EXCEPTIONS`; why it is a file of
+/// its own). The CPU backend streams no experts and keeps the resident bodies
+/// these share inline in its entries.
+const STREAMING_LIBRARIES: &[(&str, &str)] = &[
+    (
+        "lib/routed/down",
+        "the general decode combine's projections, shared by `routed_down` and `routed_down_project`, apart from `routed.h` so the entries that include that bind none of the combine's ports",
+    ),
+    (
+        "lib/routed/down_sum",
+        "the general decode combine's slot-order sum, shared by `routed_down` and `routed_down_sited`, apart from the projections so the sited sum binds no weights",
+    ),
+    (
+        "lib/routed/output",
+        "the fused decode output's projections, shared by `routed_output` and `routed_output_project`, apart from `routed.h` so the entries that include that bind none of the combine's ports",
+    ),
+    (
+        "lib/routed/output_sum",
+        "the fused decode output's join, shared by `routed_output` and `routed_output_sited`, apart from the projections so the sited join binds no weights",
+    ),
+    (
+        "lib/routed/sited",
+        "the wait for the CPU's answer of the streamed decode sums, apart from them so the resident combines bind no answer port",
+    ),
+    (
+        "lib/routed/route",
+        "decode router threadgroups of the `routed_route` contract, shared by `routed_route`, `routed_route_shared` and `routed_route_streamed`",
+    ),
+    (
+        "lib/repack/repack",
+        "the GGUF -> resident tile conversion over a binding (templates; on Vulkan, macros), so `repack_weight` and the streaming convert hold one conversion each per tensor pair; the CPU keeps it in `repack_weight`",
+    ),
+    (
+        "lib/streaming/control",
+        "expert streaming's backend shim (system-coherent accesses, system-scope fences, barriers, the spin wait, byte copies) under the protocol the GPU backends share in `kernels/streaming/`, for the streaming entries",
+    ),
+    (
+        "lib/routed/selection",
+        "the decode launches' bodies of the `routed_select` contract, shared by `routed_select` and `routed_select_streamed`",
+    ),
+    (
+        "lib/streaming/window",
+        "expert streaming's windowed conversion of host-staged records over `lib/repack`, used by `routed_convert`",
+    ),
+];
+
+/// Every tree exception: `TREE_EXCEPTIONS`, then `STREAMING_LIBRARIES`.
+fn tree_exceptions() -> impl Iterator<Item = (&'static str, &'static [BackendName], &'static str)>
+{
+    TREE_EXCEPTIONS.iter().copied().chain(
+        STREAMING_LIBRARIES
+            .iter()
+            .map(|&(path, reason)| (path, STREAMING_BACKENDS, reason)),
+    )
+}
+
 fn main() {
+    // The one source is the `kernels` directory, which the build reruns on
+    // (`cargo:rerun-if-changed` of a directory watches every file under it,
+    // a new one included).
     let artifacts = seismic_build::Build::new("kernels")
         .source("kernels")
-        // Keep newly introduced stage roots explicit so Cargo notices their
-        // first addition; the recursive directory source deduplicates them.
-        .source("kernels/draft.seismic")
-        .source("kernels/readout.seismic")
-        .source("kernels/clustered_readout.seismic")
-        .source("kernels/vision.seismic")
-        .source("kernels/recurrent.seismic")
-        .source("kernels/short_conv.seismic")
-        .source("kernels/state_space.seismic")
-        .source("kernels/residual.seismic")
-        .source("kernels/streams.seismic")
-        .source("kernels/ngram.seismic")
-        .source("kernels/indexer.seismic")
-        .source("kernels/functions.seismic")
         .run()
         .unwrap_or_else(|error| {
             panic!("checking engine Seismic sources and generating bindings failed: {error}")
@@ -283,7 +399,8 @@ const fn library_extension(backend: BackendName) -> &'static str {
 
 /// Every entry with a native implementation has one on each of `BACKENDS`
 /// (on exactly its listed backends, for an `ENTRY_EXCEPTIONS` entry), at the
-/// path named after the entry.
+/// path named after the entry, and every file directly in a backend's tree
+/// is an entry's asset.
 fn entry_parity(kernels: &Path, natives: &[NativeCoverage]) -> Vec<String> {
     let mut by_entry = BTreeMap::<&str, BTreeMap<BackendName, &Path>>::new();
     for native in natives {
@@ -293,23 +410,33 @@ fn entry_parity(kernels: &Path, natives: &[NativeCoverage]) -> Vec<String> {
             .insert(native.backend, &native.asset);
     }
     let mut violations = Vec::new();
-    for (entry, _, _) in ENTRY_EXCEPTIONS {
+    for backend in BACKENDS {
+        let tree = kernels.join(backend.as_str());
+        let assets = std::fs::read_dir(&tree)
+            .unwrap_or_else(|error| panic!("reading {}: {error}", tree.display()));
+        for asset in assets {
+            let path = asset.expect("a kernel directory entry").path();
+            let entry = path.file_stem().and_then(|stem| stem.to_str());
+            if path.is_file() && !entry.is_some_and(|entry| by_entry.contains_key(entry)) {
+                violations.push(format!("`{}` is no entry's asset", relative(kernels, &path).display()));
+            }
+        }
+    }
+    for (entry, _, _) in entry_exceptions() {
         if !by_entry.contains_key(entry) {
             violations.push(format!(
-                "ENTRY_EXCEPTIONS lists `{entry}`, but no backend implements it; remove the exception"
+                "the entry exceptions list `{entry}`, but no backend implements it; remove the exception"
             ));
         }
     }
     for (entry, assets) in by_entry {
-        let exception = ENTRY_EXCEPTIONS
-            .iter()
-            .find(|(candidate, _, _)| *candidate == entry);
+        let exception = entry_exceptions().find(|(candidate, _, _)| *candidate == entry);
         if let Some((_, declared, _)) = exception {
             let declared = declared.iter().copied().collect::<BTreeSet<_>>();
             let actual = assets.keys().copied().collect::<BTreeSet<_>>();
             if declared != actual {
                 violations.push(format!(
-                    "ENTRY_EXCEPTIONS lists `{entry}` on {}, but it is implemented on {}; update or remove the exception",
+                    "the entry exceptions list `{entry}` on {}, but it is implemented on {}; update or remove the exception",
                     names(&declared),
                     names(&actual)
                 ));
@@ -344,7 +471,7 @@ fn entry_parity(kernels: &Path, natives: &[NativeCoverage]) -> Vec<String> {
 
 /// The per-backend trees `kernels/<backend>/` of `BACKENDS` hold the same
 /// files — entry assets and library files, at any depth — by relative path
-/// without extension, apart from `TREE_EXCEPTIONS`.
+/// without extension, apart from `tree_exceptions` and `entry_exceptions`.
 fn tree_parity(kernels: &Path) -> Vec<String> {
     let mut presence = BTreeMap::<String, BTreeSet<BackendName>>::new();
     let mut violations = Vec::new();
@@ -370,10 +497,9 @@ fn tree_parity(kernels: &Path) -> Vec<String> {
             presence.entry(stem).or_default().insert(backend);
         }
     }
-    let exceptions: BTreeMap<&str, (BTreeSet<BackendName>, &str)> = TREE_EXCEPTIONS
-        .iter()
-        .chain(ENTRY_EXCEPTIONS)
-        .map(|(stem, backends, reason)| (*stem, (backends.iter().copied().collect(), *reason)))
+    let exceptions: BTreeMap<&str, (BTreeSet<BackendName>, &str)> = tree_exceptions()
+        .chain(entry_exceptions())
+        .map(|(stem, backends, reason)| (stem, (backends.iter().copied().collect(), reason)))
         .collect();
     for (stem, backends) in &presence {
         let complete = backends.len() == BACKENDS.len();
@@ -385,7 +511,7 @@ fn tree_parity(kernels: &Path) -> Vec<String> {
                 names(&BACKENDS.iter().copied().filter(|backend| !backends.contains(backend)).collect())
             )),
             Some((declared, _)) if declared != backends => violations.push(format!(
-                "TREE_EXCEPTIONS lists `{stem}` on {}, but it exists on {}; update or remove the exception",
+                "`{stem}` is excepted on {}, but it exists on {}; update or remove the exception",
                 names(declared),
                 names(backends)
             )),
@@ -395,7 +521,7 @@ fn tree_parity(kernels: &Path) -> Vec<String> {
     for (stem, (declared, _)) in &exceptions {
         if !presence.contains_key(*stem) {
             violations.push(format!(
-                "TREE_EXCEPTIONS lists `{stem}` on {}, but no backend has it; remove the exception",
+                "`{stem}` is excepted on {}, but no backend has it; remove the exception",
                 names(declared)
             ));
         }
@@ -403,13 +529,14 @@ fn tree_parity(kernels: &Path) -> Vec<String> {
     violations
 }
 
-/// A Metal entry that counts arrivals over atomic scratch, so that the last of
-/// its threadgroups finishes the work (`arrive::last`), declares every other
-/// writable scratch buffer device-coherent (`arrive::coherent_device`): the
-/// last threadgroup's plain loads of another threadgroup's stores are
+/// A Metal kernel that counts arrivals over atomic scratch, so that the last
+/// of its threadgroups finishes the work (`arrive::last`), declares every
+/// other writable scratch buffer device-coherent (`arrive::coherent_device`):
+/// the last threadgroup's plain loads of another threadgroup's stores are
 /// otherwise served from a stale cache on M1 Max-class GPUs
 /// (`lib/core/arrive.h`). Read-only (`const`) scratch was written by an
-/// earlier launch and needs nothing.
+/// earlier launch and needs nothing, and so does the scratch of another
+/// launch of the entry that counts none.
 fn metal_arrival_coherence(metal: &Path) -> Vec<String> {
     let mut violations = Vec::new();
     let entries = std::fs::read_dir(metal)
@@ -421,25 +548,28 @@ fn metal_arrival_coherence(metal: &Path) -> Vec<String> {
         }
         let mut seen = BTreeSet::new();
         let text = expand_includes(metal, &path, &mut seen);
-        let declarations = scratch_declarations(&text);
-        // An entry that binds atomic scratch counts arrivals over it (the
-        // `sync` scratch of `arrive::last`).
-        if !declarations
-            .iter()
-            .any(|declaration| declaration.contains("atomic_"))
-        {
-            continue;
-        }
         let name = relative(metal, &path).display().to_string();
-        for declaration in declarations {
-            let coherent = declaration.contains("coherent");
-            let atomic = declaration.contains("atomic_");
-            let read_only = declaration.contains("const ");
-            if !(coherent || atomic || read_only) {
-                violations.push(format!(
-                    "`metal/{name}` hands work to its last-arriving threadgroup but declares writable scratch `{}` without `arrive::coherent_device` (lib/core/arrive.h)",
-                    declaration.split_whitespace().collect::<Vec<_>>().join(" ")
-                ));
+        // Each kernel's parameters, from its `kernel` to the next one's.
+        for kernel in text.split("kernel void").skip(1) {
+            let declarations = scratch_declarations(kernel);
+            // A kernel that binds atomic scratch counts arrivals over it
+            // (the `sync` scratch of `arrive::last`).
+            if !declarations
+                .iter()
+                .any(|declaration| declaration.contains("atomic_"))
+            {
+                continue;
+            }
+            for declaration in declarations {
+                let coherent = declaration.contains("coherent");
+                let atomic = declaration.contains("atomic_");
+                let read_only = declaration.contains("const ");
+                if !(coherent || atomic || read_only) {
+                    violations.push(format!(
+                        "`metal/{name}` hands work to its last-arriving threadgroup but declares writable scratch `{}` without `arrive::coherent_device` (lib/core/arrive.h)",
+                        declaration.split_whitespace().collect::<Vec<_>>().join(" ")
+                    ));
+                }
             }
         }
     }

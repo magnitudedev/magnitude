@@ -1,0 +1,38 @@
+// Expert streaming, a scratch round's stored records (`routed_convert` in
+// routed.seismic); the Vulkan form of `metal/routed_convert.metal`: when the
+// list's sequence is this step's, entry i below its count converts record
+// `from` into scratch slot `to` (below S) by windows
+// (lib/streaming/window.glsl), `repack_weight`'s placement, or a dense record
+// by rows, `import_dense`'s: `from` is a conveyor record, below V. The
+// conveyor and the destination are record ports (views of lent records, the
+// destination the scratch lender's), each record read or written at its own
+// base. Workgroups stride over the listed records' items, so a launch costs
+// what its list holds.
+#include <seismic/slab.glsl>
+#include "lib/streaming/control.glsl"
+#include "lib/streaming/window.glsl"
+#include "../streaming/list.hpp"
+
+#if defined(SEISMIC_ELEMENT_U_KIND_DENSE)
+STREAMING_DENSE(conveyed, SEISMIC_ELEMENT_ST, SEISMIC_ELEMENT_U, SEISMIC_CONVEYOR, SEISMIC_DESTINATION, SEISMIC_DIM_N, SEISMIC_DIM_K)
+#else
+REPACK_TILE(conveyed, SEISMIC_CONVERSION_ST_U, SEISMIC_ELEMENT_ST, SEISMIC_DESTINATION)
+STREAMING_PACKED(conveyed, SEISMIC_ELEMENT_ST, SEISMIC_CONVEYOR, SEISMIC_DESTINATION, SEISMIC_DIM_N, SEISMIC_DIM_K)
+#endif
+
+void routed_convert() {
+    const uint64_t list = SEISMIC_PTR(SEISMIC_BUFFER_LIST);
+    const uint tid = gl_LocalInvocationIndex;
+    const uint64_t stride = SEISMIC_LIST_STRIDE_0;
+    const uint entries =
+        streaming_step_entries(list, stride, element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_STEP)), 0u, tid);
+    const uint per_record = uint(conveyed_items());
+    STREAMING_LIST_ITEMS(at, entries, per_record, gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.y,
+        gl_NumWorkGroups.x * gl_NumWorkGroups.y) {
+        streaming_list_pair(list, stride, at, per_record, entries, 0u, tid, gl_WorkGroupSize.x);
+        const int from = streaming_list_from(0u), to = streaming_list_to(0u);
+        const uint64_t item = uint64_t(at % per_record);
+        const uint64_t destination = slab_region(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATION), uint64_t(to));
+        conveyed_convert(slab_region(SEISMIC_PTR(SEISMIC_BUFFER_CONVEYOR), uint64_t(from)), destination, item);
+    }
+}

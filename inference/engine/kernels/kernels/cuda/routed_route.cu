@@ -1,71 +1,31 @@
 // Routing for M rows; the CUDA form of `metal/routed_route.metal`, in
-// four launches: `routed_route_stage` (M > 8, one block per row) publishes
-// the normalized rows once; `routed_route_gemv` (M <= 8, one warp per
-// logit column, normalizing on the fly and publishing the normalized rows) or
-// `routed_route_gemm` (32 rows x 32 columns x one hidden share of SPLIT
-// per block over shared tiles) forms the [M, E + 1] logits, column E being
-// the shared-expert gate, as SPLIT partial planes; the selection (one warp
-// per row: the last GEMV block to arrive, or `routed_route_select` after the
-// GEMM) sums the planes, forms the softmax, selects the K winners by K rounds
-// of warp argmax (ties to the higher expert index) and computes the
-// shared-expert coefficient from column E. Every logit accumulates over the
-// hidden axis in the same order for every expert, so experts with equal router
-// rows tie exactly.
+// four launches: `routed_route_stage` (M > DECODE_ROWS, one block per row) publishes
+// the normalized rows once; `routed_route_gemv` (M <= DECODE_ROWS, one warp per
+// logit column, normalizing on the fly and publishing the normalized rows,
+// `lib/routed/route.cuh`) or `routed_route_gemm` (32 rows x 32 columns x
+// one hidden share of SPLIT per block over shared tiles) forms the
+// [M, E + 1] logits, column E being the shared-expert gate, as SPLIT
+// partial planes; the selection (one warp per row: the last GEMV block to
+// arrive, or `routed_route_select` after the GEMM) sums the planes, forms
+// the softmax, selects the K winners by K rounds of warp argmax
+// (`route::select_row`) and computes the shared-expert coefficient from
+// column E. Every logit accumulates over the hidden axis in the same order
+// for every expert, so experts with equal router rows tie exactly.
 
-#include "lib/core/activation.cuh"
-#include "lib/core/reduce.cuh"
-#if defined(SEISMIC_ROUTER_KIND_PACKED)
-#define KERNEL_W0 SEISMIC_ROUTER
-#include <seismic/packets.cuh>
-#endif
-
-namespace {
-
-using element::Act;
-// The norm is dense; packed routers use the resident mma16 packet decoder.
-typedef ELEMENT_OF(SEISMIC_NORM) Norm;
-#if !defined(SEISMIC_ROUTER_KIND_PACKED)
-typedef ELEMENT_OF(SEISMIC_ROUTER) Router;
-#endif
-
-} // namespace
+#include "lib/routed/route.cuh"
 
 SEISMIC_PROGRAMMATIC_DEPENDENCY
 
-constexpr unsigned ROUTE_THREADS = 256;
-constexpr unsigned ROUTE_WARPS = ROUTE_THREADS / 32;
-// Whether the input is RMS-normalized (`form_input` with a norm), else the
-// sum of a mix site's partials.
-constexpr bool ROUTE_NORMED = SEISMIC_DIM_NM != 0;
-
-// The routed input at (row, source), rounded to A (`form_input`): the
-// residual times its row's RMS `inverse` and the norm, or (no norm) the sum in
-// part order of a mix site's PT partials.
-__device__ __forceinline__ float routed_input(const float *residual, const unsigned char *norm,
-                                              unsigned long long row, unsigned long long source, float inverse,
-                                              const seismic_words_t &seismic_words_value) {
-    if constexpr (!ROUTE_NORMED) {
-        float sum = 0.0f;
-        for (unsigned long long part = 0; part < SEISMIC_DIM_PT; ++part)
-            sum = seismic_add_rn(sum, residual[row * SEISMIC_RESIDUAL_STRIDE_0
-                                               + (part * SEISMIC_DIM_H + source) * SEISMIC_RESIDUAL_STRIDE_1]);
-        return Act::round(sum);
-    } else {
-        const float value = residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1];
-        return Act::round(seismic_mul_rn(seismic_mul_rn(value, inverse),
-            element::at<Norm>(norm, source * SEISMIC_NORM_STRIDE_0)));
-    }
-}
-
-// Row `row`'s RMS inverse (the whole block reduces it), or 0 without a norm.
+// Row `row`'s RMS inverse (the whole block reduces it), or 0 without a norm:
+// the sum order `route::decode_inverses` keeps.
 __device__ __forceinline__ float routed_inverse(const float *residual, unsigned long long row, float eps,
                                                 const seismic_words_t &seismic_words_value) {
-    if constexpr (!ROUTE_NORMED) {
+    if constexpr (!route::NORMED) {
         return 0.0f;
     } else {
-        __shared__ float partials[ROUTE_WARPS];
+        __shared__ float partials[route::WARPS];
         float squares = 0.0f;
-        for (unsigned source = threadIdx.x; source < SEISMIC_DIM_H; source += ROUTE_THREADS) {
+        for (unsigned source = threadIdx.x; source < SEISMIC_DIM_H; source += route::THREADS) {
             const float value = residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1];
             squares = seismic_fma_rn(value, value, squares);
         }
@@ -76,333 +36,34 @@ __device__ __forceinline__ float routed_inverse(const float *residual, unsigned 
 
 extern "C" __global__ void routed_route_stage(SEISMIC_KERNEL_PARAMS) {
     seismic_dependency_start();
-    const float *residual = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL));
-    const unsigned char *norm = SEISMIC_PTR(SEISMIC_BUFFER_NORM);
+    const route::Input in = ROUTE_INPUT;
     unsigned char *normalized = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
     const unsigned thread = threadIdx.x;
     const unsigned long long row = blockIdx.x;
     const float inverse =
-        routed_inverse(residual, row, __uint_as_float(static_cast<unsigned>(SEISMIC_PARAM_EPS)), seismic_words_value);
-    for (unsigned source = thread; source < SEISMIC_DIM_H; source += ROUTE_THREADS)
-        element::put<Act>(normalized, row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
-            routed_input(residual, norm, row, source, inverse, seismic_words_value));
+        routed_inverse(in.residual, row, __uint_as_float(static_cast<unsigned>(SEISMIC_PARAM_EPS)), seismic_words_value);
+    for (unsigned source = thread; source < SEISMIC_DIM_H; source += route::THREADS)
+        element::put<route::Act>(normalized, row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
+            in.value(row, source, inverse, seismic_words_value));
 }
 
-// The router logits scratch is SPLIT planes [M, E + 1]: column E holds the
-// shared-expert gate logit (normalized . shared_router), formed like an
-// expert's logit. The GEMV (M <= 8) writes plane 0 whole; the GEMM (M > 8)
-// writes plane p with the hidden share p of SPLIT, and the selection sums the
-// planes in order.
-__device__ __forceinline__ unsigned long long routed_logit_index(unsigned long long row, unsigned long long expert) {
-    return row * (SEISMIC_DIM_E + 1) + expert;
-}
+// The router logits scratch is SPLIT planes [M, E + 1]: the GEMV (M <= DECODE_ROWS)
+// writes plane 0 whole; the GEMM (M > DECODE_ROWS) writes plane p with the hidden
+// share p of SPLIT, and the selection sums the planes in order.
 
-#if !defined(SEISMIC_ROUTER_KIND_PACKED)
-// Dense weight of logit column `expert` at hidden coordinate `source`.
-__device__ __forceinline__ float routed_column_weight(const unsigned char *router, const float *shared_router,
-    unsigned long long expert, unsigned long long source) {
-    return expert < SEISMIC_DIM_E
-        ? element::at<Router>(router, expert * SEISMIC_ROUTER_STRIDE_0 + source * SEISMIC_ROUTER_STRIDE_1)
-        : shared_router[source * SEISMIC_SHARED_ROUTER_STRIDE_0];
-}
-#endif
-
-// Descending probability, ties to the higher expert index.
-__device__ __forceinline__ bool routed_precedes(float probability, int expert, float best, int best_expert) {
-    return probability > best || (probability == best && expert > best_expert);
-}
-
-// The selection's outputs.
-struct RoutedSelection {
-    int *routes;
-    unsigned long long route_row, route_slot;
-    float *scores;
-    unsigned long long score_row, score_slot;
-    float *coefficient;
-    unsigned long long coefficient_row;
-    bool normalize;
-    // The `expert_scale` port (static extent ES; read only where present).
-    const float *expert_scale;
-    unsigned long long expert_scale_stride;
-};
-
-// The selection of `row` by one warp over the logits scratch, its column e
-// the sum of its `parts` partial planes of `plane` logits in plane order (L2
-// reads: the planes may have been written by other blocks of this launch);
-// each score optionally renormalized, then multiplied by its expert's
-// `expert_scale` where the port is present.
-__device__ __forceinline__ void routed_select_row(const float *logits, unsigned long long plane, unsigned long long parts,
-    const RoutedSelection &out, unsigned long long row, unsigned lane) {
-    // Lane `lane` holds experts lane + 32 i, ceil(E / 32) registers; when E
-    // is not a multiple of 32 the last register of lanes at or past E % 32 is
-    // excluded (never read, summed or selected). `held` is PER_LANE when 32
-    // divides E.
-    constexpr unsigned PER_LANE = (static_cast<unsigned>(SEISMIC_DIM_E) + 31) / 32;
-    constexpr unsigned REMAINDER = static_cast<unsigned>(SEISMIC_DIM_E) % 32;
-    const unsigned held = static_cast<unsigned>(SEISMIC_DIM_E) / 32 + (REMAINDER != 0 && lane < REMAINDER ? 1u : 0u);
-    const float negative_infinity = -__int_as_float(0x7f800000);
-    const float *values = logits + routed_logit_index(row, 0);
-    const auto logit = [&](unsigned long long expert) {
-        float sum = __ldcg(values + expert);
-        for (unsigned long long p = 1; p < parts; ++p)
-            sum = seismic_add_rn(sum, __ldcg(values + p * plane + expert));
-        return sum;
-    };
-    float probability[PER_LANE];
-    float maximum = negative_infinity;
-#pragma unroll
-    for (unsigned i = 0; i < PER_LANE; ++i) {
-        probability[i] = i < held ? logit(lane + 32 * i) : negative_infinity;
-        maximum = fmaxf(maximum, probability[i]);
-    }
-    maximum = seismic_warp_max_f32(maximum);
-    float total = 0.0f;
-#pragma unroll
-    for (unsigned i = 0; i < PER_LANE; ++i) {
-        if (i < held) {
-            probability[i] = expf(probability[i] - maximum);
-            total = seismic_add_rn(total, probability[i]);
-        }
-    }
-    total = seismic_warp_sum_f32(total);
-#pragma unroll
-    for (unsigned i = 0; i < PER_LANE; ++i)
-        if (i < held)
-            probability[i] = probability[i] / total;
-
-    float chosen[SEISMIC_DIM_K];
-    int winners[SEISMIC_DIM_K];
-    for (unsigned rank = 0; rank < SEISMIC_DIM_K; ++rank) {
-        float best = negative_infinity;
-        int best_expert = -1;
-#pragma unroll
-        for (unsigned i = 0; i < PER_LANE; ++i) {
-            const int expert = static_cast<int>(lane + 32 * i);
-            if (i < held && routed_precedes(probability[i], expert, best, best_expert)) {
-                best = probability[i];
-                best_expert = expert;
-            }
-        }
-        float winner_probability;
-        const int winner = reduce::argmax<reduce::HigherIndex>(best, best_expert, winner_probability);
-#pragma unroll
-        for (unsigned i = 0; i < PER_LANE; ++i)
-            if (winner >= 0 && static_cast<unsigned>(winner) == lane + 32 * i)
-                probability[i] = negative_infinity;
-        chosen[rank] = winner_probability;
-        winners[rank] = winner;
-        if (lane == 0) {
-            const unsigned long long slot = SEISMIC_DIM_K - 1 - rank;
-            out.routes[row * out.route_row + slot * out.route_slot] = winner;
-        }
-    }
-    // The slot-order sum: slot s holds rank K - 1 - s.
-    float denominator = 0.0f;
-    if (out.normalize)
-        for (unsigned slot = 0; slot < SEISMIC_DIM_K; ++slot)
-            denominator = seismic_add_rn(denominator, chosen[SEISMIC_DIM_K - 1 - slot]);
-    if (lane == 0)
-        for (unsigned slot = 0; slot < SEISMIC_DIM_K; ++slot) {
-            const unsigned rank = SEISMIC_DIM_K - 1 - slot;
-            float score = out.normalize ? chosen[rank] / denominator : chosen[rank];
-            if (SEISMIC_DIM_ES != 0)
-                score = seismic_mul_rn(score,
-                    out.expert_scale[static_cast<unsigned long long>(winners[rank]) * out.expert_scale_stride]);
-            out.scores[row * out.score_row + slot * out.score_slot] = score;
-        }
-
-    if (lane == 0)
-        out.coefficient[row * out.coefficient_row] = 1.0f / (1.0f + expf(-logit(SEISMIC_DIM_E)));
-}
-
-#define ROUTED_SELECTION                                                                                  \
-    RoutedSelection {                                                                                     \
-        reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)), SEISMIC_ROUTES_STRIDE_0,             \
-            SEISMIC_ROUTES_STRIDE_1, reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCORES)),       \
-            SEISMIC_SCORES_STRIDE_0, SEISMIC_SCORES_STRIDE_1,                                             \
-            reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER)), SEISMIC_RESULT_1_STRIDE_0,   \
-            SEISMIC_PARAM_NORMALIZE != 0,                                                                 \
-            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_SCALE)),                    \
-            SEISMIC_EXPERT_SCALE_STRIDE_0                                                                 \
-    }
-
-// M <= 8, one launch: the block computes its rows' RMS inverses (in the
-// normalize launch's order), then each warp forms one logit column,
-// normalizing each element as it reads it; block 0 publishes the normalized
-// rows. The last block to arrive selects (sync scratch `arrivals`: zero when
-// the launch starts, restored by the last).
+// M <= DECODE_ROWS, one launch of router blocks (`route::route_block`): the block
+// computes its rows' RMS inverses (in the normalize launch's order), then
+// each warp forms one logit column; block 0 publishes the normalized rows;
+// the last block to arrive selects.
 extern "C" __global__ void routed_route_gemv(SEISMIC_KERNEL_PARAMS) {
-    const float *residual = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL));
-    const unsigned char *norm = SEISMIC_PTR(SEISMIC_BUFFER_NORM);
-    const unsigned char *router = SEISMIC_PTR(SEISMIC_BUFFER_ROUTER);
-    const float *shared_router = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_ROUTER));
-    unsigned char *normalized = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
-    float *logits = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));
-    __shared__ float parts[8][ROUTE_WARPS];
-    __shared__ float inverses[8];
+    __shared__ float parts[SEISMIC_CONST_DECODE_ROWS][route::WARPS];
+    __shared__ float inverses[SEISMIC_CONST_DECODE_ROWS];
     __shared__ unsigned last;
-    const unsigned thread = threadIdx.x, lane = thread % 32, warp = thread / 32;
-    const unsigned rows = static_cast<unsigned>(SEISMIC_DIM_M);
-    const float eps = __uint_as_float(static_cast<unsigned>(SEISMIC_PARAM_EPS));
-    const unsigned long long expert = static_cast<unsigned long long>(blockIdx.x) * SEISMIC_TUNE_SIMDGROUPS + warp;
-    const bool owns = expert <= SEISMIC_DIM_E;
-#if !defined(SEISMIC_ROUTER_KIND_PACKED)
-    // The warp's logit column streams into L2 while the launch before
-    // finishes.
-    if (owns && SEISMIC_ROUTER_STRIDE_1 == 1 && SEISMIC_SHARED_ROUTER_STRIDE_0 == 1) {
-        const unsigned char *column = expert < SEISMIC_DIM_E
-            ? router + expert * SEISMIC_ROUTER_STRIDE_0 * Router::bytes
-            : reinterpret_cast<const unsigned char *>(shared_router);
-        const unsigned long long bytes = SEISMIC_DIM_H * (expert < SEISMIC_DIM_E ? Router::bytes : 4u);
-        for (unsigned long long byte = 128ull * lane; byte < bytes; byte += 128ull * 32)
-            seismic_prefetch_l2(column + byte);
-    }
-#endif
-    seismic_dependency_start();
-    if constexpr (ROUTE_NORMED) {
-        // The normalize launch's sum order (256 strided partials, warp sums,
-        // then the eight warp partials in order): item (row, part) is part
-        // `part`'s warp sum, and the items spread over every warp.
-        for (unsigned item = warp; item < rows * ROUTE_WARPS; item += SEISMIC_TUNE_SIMDGROUPS) {
-            const unsigned row = item / ROUTE_WARPS, part = item % ROUTE_WARPS;
-            float squares = 0.0f;
-            for (unsigned source = part * 32 + lane; source < SEISMIC_DIM_H; source += ROUTE_THREADS) {
-                const float value = residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1];
-                squares = seismic_fma_rn(value, value, squares);
-            }
-            squares = seismic_warp_sum_f32(squares);
-            if (lane == 0)
-                parts[row][part] = squares;
-        }
-        __syncthreads();
-        if (thread < rows) {
-            float total = 0.0f;
-            for (unsigned part = 0; part < ROUTE_WARPS; ++part)
-                total = seismic_add_rn(total, parts[thread][part]);
-            inverses[thread] = rsqrtf(seismic_add_rn(total / static_cast<float>(SEISMIC_DIM_H), eps));
-        }
-    } else {
-        if (thread < 8)
-            inverses[thread] = 0.0f;
-    }
-    __syncthreads();
-    if (blockIdx.x == 0) {
-        for (unsigned item = thread; item < rows * static_cast<unsigned>(SEISMIC_DIM_H); item += 32 * SEISMIC_TUNE_SIMDGROUPS) {
-            const unsigned long long row = item / SEISMIC_DIM_H, source = item % SEISMIC_DIM_H;
-            element::put<Act>(normalized, row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
-                routed_input(residual, norm, row, source, inverses[row], seismic_words_value));
-        }
-    }
-    float sums[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    if (owns) {
-#if defined(SEISMIC_ROUTER_KIND_PACKED)
-        const auto router_rows = KERNEL_W0_AT(router);
-        // One lane decodes a 16-value register chunk of an mma16 router row.
-        for (unsigned item = lane; item < SEISMIC_DIM_H / 64 * 4; item += 32) {
-            const unsigned long long kb = item / 4;
-            const unsigned t = item % 4;
-            const unsigned offsets[4] = {2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9};
-            float values[16];
-            if (expert < SEISMIC_DIM_E)
-                packets::row_values16(router_rows, expert, kb, t, values);
-#pragma unroll
-            for (unsigned s = 0; s < 4; ++s)
-#pragma unroll
-                for (unsigned j = 0; j < 4; ++j) {
-                    const unsigned long long source = 64 * kb + 16 * s + offsets[j];
-                    const float weight = expert < SEISMIC_DIM_E
-                        ? values[4 * s + j] : shared_router[source * SEISMIC_SHARED_ROUTER_STRIDE_0];
-#pragma unroll
-                    for (unsigned row = 0; row < 8; ++row)
-                        if (row < rows)
-                            sums[row] = seismic_fma_rn(routed_input(residual, norm, row, source, inverses[row], seismic_words_value),
-                                weight, sums[row]);
-                }
-        }
-#else
-        // Dense lane l owns sources 4l + 128 i .. + 3. The loads of BATCH
-        // consecutive i are issued before their products, so a warp waits on
-        // memory once per batch rather than once per i; each row still
-        // accumulates its sources in i order, then j order.
-        constexpr unsigned BATCH = 4;
-        if constexpr (!ROUTE_NORMED) {
-        // The mix site's partials: each source's input sums PT reads.
-        for (unsigned first = 4 * lane; first < SEISMIC_DIM_H; first += 128) {
-#pragma unroll
-            for (unsigned j = 0; j < 4; ++j) {
-                const float weight = first + j < SEISMIC_DIM_H
-                    ? routed_column_weight(router, shared_router, expert, first + j) : 0.0f;
-#pragma unroll
-                for (unsigned row = 0; row < 8; ++row)
-                    if (row < rows && first + j < SEISMIC_DIM_H)
-                        sums[row] = seismic_fma_rn(routed_input(residual, norm, row, first + j, 0.0f, seismic_words_value), weight,
-                            sums[row]);
-            }
-        }
-        } else {
-        for (unsigned first = 4 * lane; first < SEISMIC_DIM_H; first += 128 * BATCH) {
-            float weight[BATCH][4], scale[BATCH][4];
-#pragma unroll
-            for (unsigned b = 0; b < BATCH; ++b) {
-                const unsigned base = first + 128 * b;
-#pragma unroll
-                for (unsigned j = 0; j < 4; ++j) {
-                    weight[b][j] = base < SEISMIC_DIM_H ? routed_column_weight(router, shared_router, expert, base + j) : 0.0f;
-                    scale[b][j] = base < SEISMIC_DIM_H ? element::at<Norm>(norm, (base + j) * SEISMIC_NORM_STRIDE_0) : 0.0f;
-                }
-            }
-#pragma unroll
-            for (unsigned row = 0; row < 8; ++row) {
-                if (row < rows) {
-                    float value[BATCH][4];
-#pragma unroll
-                    for (unsigned b = 0; b < BATCH; ++b) {
-                        const unsigned base = first + 128 * b;
-#pragma unroll
-                        for (unsigned j = 0; j < 4; ++j)
-                            value[b][j] = base < SEISMIC_DIM_H
-                                ? residual[row * SEISMIC_RESIDUAL_STRIDE_0 + (base + j) * SEISMIC_RESIDUAL_STRIDE_1]
-                                : 0.0f;
-                    }
-#pragma unroll
-                    for (unsigned b = 0; b < BATCH; ++b) {
-                        if (first + 128 * b >= SEISMIC_DIM_H)
-                            break;
-#pragma unroll
-                        for (unsigned j = 0; j < 4; ++j)
-                            sums[row] = seismic_fma_rn(Act::round(seismic_mul_rn(seismic_mul_rn(value[b][j], inverses[row]),
-                                scale[b][j])), weight[b][j], sums[row]);
-                    }
-                }
-            }
-        }
-        }
-#endif
-#pragma unroll
-        for (unsigned row = 0; row < 8; ++row) {
-            const float sum = seismic_warp_sum_f32(sums[row]);
-            if (row < rows && lane == 0)
-                logits[routed_logit_index(row, expert)] = sum;
-        }
-    }
-
-    // Arrive; the last block selects every row.
-    __syncthreads();
-    if (thread == 0) {
-        __threadfence();
-        unsigned *arrivals = reinterpret_cast<unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ARRIVALS));
-        const bool is_last = atomicAdd(arrivals, 1u) == gridDim.x - 1;
-        if (is_last) {
-            __threadfence();
-            atomicExch(arrivals, 0u);
-        }
-        last = is_last;
-    }
-    __syncthreads();
-    if (!last)
-        return;
-    for (unsigned row = warp; row < rows; row += SEISMIC_TUNE_SIMDGROUPS)
-        routed_select_row(logits, SEISMIC_DIM_M * (SEISMIC_DIM_E + 1), 1, ROUTED_SELECTION, row, lane);
+    route::route_block(ROUTE_INPUT, ROUTE_COLUMNS, ROUTE_SELECTION, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
+        SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
+        reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS)),
+        reinterpret_cast<unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_ARRIVALS)), blockIdx.x, parts, inverses,
+        &last, seismic_words_value);
 }
 
 // Rows and logit columns per GEMM block, and hidden coordinates per stage.
@@ -411,12 +72,11 @@ constexpr unsigned ROUTE_DEPTH = 128;
 
 extern "C" __global__ void routed_route_gemm(SEISMIC_KERNEL_PARAMS) {
     seismic_dependency_start();
-    const unsigned char *router = SEISMIC_PTR(SEISMIC_BUFFER_ROUTER);
-    const float *shared_router = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_ROUTER));
+    const route::Columns columns = ROUTE_COLUMNS;
     const unsigned char *normalized = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
     float *logits = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));
 #if defined(SEISMIC_ROUTER_KIND_PACKED)
-    const auto router_rows = KERNEL_W0_AT(router);
+    const auto router_rows = KERNEL_W0_AT(columns.router);
 #endif
     // Row pitch ROUTE_DEPTH + 1 = 1 (mod 32 banks): the eight column groups of
     // a warp read eight banks.
@@ -437,24 +97,24 @@ extern "C" __global__ void routed_route_gemm(SEISMIC_KERNEL_PARAMS) {
     for (unsigned long long k0 = kbegin; k0 < kend; k0 += ROUTE_DEPTH) {
         const unsigned depth = static_cast<unsigned>(min(static_cast<unsigned long long>(ROUTE_DEPTH), kend - k0));
         __syncthreads();
-        for (unsigned item = thread; item < ROUTE_TILE * ROUTE_DEPTH; item += ROUTE_THREADS) {
+        for (unsigned item = thread; item < ROUTE_TILE * ROUTE_DEPTH; item += route::THREADS) {
             const unsigned i = item / ROUTE_DEPTH, k = item % ROUTE_DEPTH;
             if (k >= depth)
                 continue;
             const unsigned long long row = row0 + i, expert = expert0 + i;
             rows_tile[i][k] = row < SEISMIC_DIM_M
-                ? element::at<Act>(normalized, row * SEISMIC_RESULT_0_STRIDE_0 + (k0 + k) * SEISMIC_RESULT_0_STRIDE_1)
+                ? element::at<route::Act>(normalized, row * SEISMIC_RESULT_0_STRIDE_0 + (k0 + k) * SEISMIC_RESULT_0_STRIDE_1)
                 : 0.0f;
 #if !defined(SEISMIC_ROUTER_KIND_PACKED)
             experts_tile[i][k] = expert <= SEISMIC_DIM_E
-                ? routed_column_weight(router, shared_router, expert, k0 + k) : 0.0f;
+                ? route::weight(columns, expert, k0 + k, seismic_words_value) : 0.0f;
 #endif
         }
 #if defined(SEISMIC_ROUTER_KIND_PACKED)
         // Each item decodes 16 values into one expert's shared-memory row.
         const unsigned long long first_kb = k0 / 64;
         const unsigned blocks = static_cast<unsigned>((k0 + depth + 63) / 64 - first_kb);
-        for (unsigned item = thread; item < ROUTE_TILE * blocks * 4; item += ROUTE_THREADS) {
+        for (unsigned item = thread; item < ROUTE_TILE * blocks * 4; item += route::THREADS) {
             const unsigned i = item / (blocks * 4);
             const unsigned piece = item % (blocks * 4);
             const unsigned long long expert = expert0 + i;
@@ -473,7 +133,7 @@ extern "C" __global__ void routed_route_gemm(SEISMIC_KERNEL_PARAMS) {
                     const unsigned k = static_cast<unsigned>(source - k0);
                     experts_tile[i][k] = expert < SEISMIC_DIM_E ? values[4 * s + j]
                         : expert == SEISMIC_DIM_E
-                            ? shared_router[(k0 + k) * SEISMIC_SHARED_ROUTER_STRIDE_0] : 0.0f;
+                            ? columns.shared_router[(k0 + k) * columns.shared_router0] : 0.0f;
                 }
         }
 #endif
@@ -491,15 +151,25 @@ extern "C" __global__ void routed_route_gemm(SEISMIC_KERNEL_PARAMS) {
     for (unsigned j = 0; j < 4; ++j) {
         const unsigned long long expert = expert0 + e0 + j;
         if (row < SEISMIC_DIM_M && expert <= SEISMIC_DIM_E)
-            logits[routed_logit_index(row, expert)] = acc[j];
+            logits[route::logit_index(row, expert, seismic_words_value)] = acc[j];
     }
 }
 
-// M > 8: the selection after the GEMM.
+// M > DECODE_ROWS: the selection after the GEMM, each logit the sum of its SPLIT
+// partial planes in plane order (L2 reads: other blocks wrote them).
 extern "C" __global__ void routed_route_select(SEISMIC_KERNEL_PARAMS) {
     seismic_dependency_start();
-    const unsigned long long row = static_cast<unsigned long long>(blockIdx.x) * ROUTE_WARPS + threadIdx.x / 32;
-    if (row < SEISMIC_DIM_M)
-        routed_select_row(reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS)),
-            SEISMIC_DIM_M * (SEISMIC_DIM_E + 1), SEISMIC_TUNE_SPLIT, ROUTED_SELECTION, row, threadIdx.x % 32);
+    const unsigned long long row = static_cast<unsigned long long>(blockIdx.x) * route::WARPS + threadIdx.x / 32;
+    if (row >= SEISMIC_DIM_M)
+        return;
+    const unsigned long long plane = SEISMIC_DIM_M * (SEISMIC_DIM_E + 1);
+    const float *values = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS))
+        + route::logit_index(row, 0, seismic_words_value);
+    const auto logit = [&](unsigned long long expert) {
+        float sum = __ldcg(values + expert);
+        for (unsigned long long p = 1; p < SEISMIC_TUNE_SPLIT; ++p)
+            sum = seismic_add_rn(sum, __ldcg(values + p * plane + expert));
+        return sum;
+    };
+    route::select_row(logit, ROUTE_SELECTION, row, threadIdx.x % 32, seismic_words_value);
 }

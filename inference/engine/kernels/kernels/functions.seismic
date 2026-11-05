@@ -1,5 +1,5 @@
-# Pointwise functions shared by the feed-forward and readout entries. Natives
-# evaluate the same expressions (`<backend>/lib/core/functions.*`).
+# Functions shared by entries. Natives evaluate the same expressions (the
+# pointwise ones in `<backend>/lib/core/functions.*`).
 
 # Feed-forward activation by code:
 #   0  SiLU       a / (1 + exp(-a))
@@ -19,6 +19,16 @@ fn activate[M, N](x: &tensor[M, N] T, result: &mut tensor[M, N] U, function: i32
                 let r = max(a, 0.0)
                 value = r * r
             result[rows, cols] = value
+
+# The gated expansion, the one formula of every gate/up pair (dense, routed
+# and shared experts) and of its natives (the projection library's `Glu`
+# epilogue): with `gate` and `up` the F32 accumulators times their scales,
+# published in A, result = A(A(act(gate)) * up) (`activate`'s codes).
+fn glu[M, N](gate: &tensor[M, N] A, up: &tensor[M, N] A, result: &mut tensor[M, N] A, function: i32):
+    activate(gate, result, function)
+    parallel for rows in 0..M:
+        parallel for cols in 0..N:
+            result[rows, cols] = f32(result[rows, cols]) * f32(up[rows, cols])
 
 # A projection entry's input rows, rounded to the result's element: the
 # RMS-normalized residual (`N = H`, `P = 1`), or the sum in part order of the
@@ -87,3 +97,117 @@ fn cap_logit(z: f32, softcap: f32) -> f32:
     if softcap > 0.0:
         result = softcap * (2.0 / (1.0 + exp(-2.0 * z / softcap)) - 1.0)
     return result
+
+# The order of every expert selection (`rank_choices` and `select_experts`):
+# each row's values ranked, a NaN as -inf (in place), then its K distinct
+# experts by descending ranked value with ties to the higher expert, rank r
+# stored at slot K - 1 - r. Ranked values are totally ordered, so every rank
+# names an expert, whatever the row holds.
+fn rank_experts[M, E, K](values: &mut tensor[M, E] f32, routes: &mut tensor[M, K] i32):
+    for row in 0..M:
+        let mut open = tensor[E] f32
+        let mut taken = tensor[E] i32
+        for expert in 0..E:
+            if values[row, expert] != values[row, expert]:
+                values[row, expert] = -inf
+            open[expert] = values[row, expert]
+            taken[expert] = 0
+        for rank in 0..K:
+            # A taken expert holds -inf, so the maximum is an open expert's.
+            let best = reduce(open, 0, max)
+            let mut candidates = tensor[E] i32
+            for expert in 0..E:
+                candidates[expert] = -1
+                if taken[expert] == 0 and open[expert] == best:
+                    candidates[expert] = i32(expert)
+            let winner = reduce(i32(candidates), 0, max)
+            routes[row, K - 1 - rank] = winner
+            for expert in 0..E:
+                if i32(expert) == winner:
+                    open[expert] = -inf
+                    taken[expert] = 1
+
+# Each row's K choices from its router logits: probabilities are the softmax
+# over every expert, the winners ranked by `rank_experts`, each choice's
+# score its ranked probability.
+fn rank_choices[M, E, K](logits: &tensor[M, E] f32, routes: &mut tensor[M, K] i32,
+    scores: &mut tensor[M, K] f32):
+    let mut probabilities = tensor[M, E] f32
+    for row in 0..M:
+        let values = f32(logits[row])
+        let maximum = reduce(values, 0, max)
+        let exponentials = exp(values - maximum)
+        let total = reduce(exponentials, 0, sum)
+        for expert in 0..E:
+            probabilities[row, expert] = exponentials[expert] / total
+    rank_experts(probabilities, routes)
+    for row in 0..M:
+        for choice in 0..K:
+            scores[row, choice] = probabilities[row, routes[row, choice]]
+
+# The general routed form's selection order (`routed_select` and its hints):
+# each row's scores s[e] = score(logit[e]) into `scores` (0 softmax over all
+# E, 1 sigmoid, 2 sqrt(softplus)), then its K choices ranked on s[e] + bias[e]
+# (the selection-only bias; a family without one binds zeros) by
+# `rank_experts`.
+fn select_experts[M, E, K](logits: &tensor[M, E] f32, bias: &tensor[E] f32, score: i32,
+    routes: &mut tensor[M, K] i32, scores: &mut tensor[M, E] f32):
+    let mut ranked = tensor[M, E] f32
+    for row in 0..M:
+        let values = f32(logits[row])
+        let maximum = reduce(values, 0, max)
+        let exponentials = exp(values - maximum)
+        let total = reduce(exponentials, 0, sum)
+        for expert in 0..E:
+            let logit = logits[row, expert]
+            let mut s = exponentials[expert] / total
+            if score == 1:
+                s = 1.0 / (1.0 + exp(-logit))
+            if score == 2:
+                s = sqrt(max(logit, 0.0) + log(1.0 + exp(-abs(logit))))
+            scores[row, expert] = s
+            ranked[row, expert] = s + bias[expert]
+    rank_experts(ranked, routes)
+
+# Decode routing with the shared expert, the reference body of
+# `routed_route_shared` and `routed_route_streamed` (routed.seismic): the
+# normalized rows, each row's K choices (`rank_choices`) and their scores,
+# normalized when `normalize` is set and scaled by `expert_scale` when
+# ES > 0, the shared gate's coefficient, and the shared expert's SiLU `glu`.
+fn route_shared[M, H, PT, NM, E, K, S, ES](residual: &tensor[M, PT * H] f32,
+    norm: &tensor[NM] NW, router: &tensor[E, H] RW, shared_router: &tensor[H] f32,
+    shared_gate: &tensor[S, H] SGW, shared_up: &tensor[S, H] SUW,
+    eps: f32, normalize: i32, expert_scale: &tensor[ES] f32,
+    routes: &mut tensor[M, K] i32, scores: &mut tensor[M, K] f32,
+    normalized: &mut tensor[M, H] A, coefficient: &mut tensor[M] f32,
+    shared_product: &mut tensor[M, S] A)
+    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and operands(SGW) == operands(SUW):
+    let mut logits = tensor[M, E] f32
+    let mut gates = tensor[M, S] A
+    let mut ups = tensor[M, S] A
+    form_input(residual, norm, normalized, eps)
+    linear(normalized, router, logits)
+    rank_choices(logits, routes, scores)
+    for row in 0..M:
+        if normalize != 0:
+            let denominator = reduce(f32(scores[row]), 0, sum)
+            for choice in 0..K:
+                scores[row, choice] = scores[row, choice] / denominator
+        if ES > 0:
+            for choice in 0..K:
+                scores[row, choice] = scores[row, choice] * expert_scale[routes[row, choice]]
+        let shared_logit = reduce(f32(normalized[row]) * f32(shared_router), 0, sum)
+        coefficient[row] = 1.0 / (1.0 + exp(-shared_logit))
+        let mut gate_row = tensor[H] f32
+        let mut up_row = tensor[H] f32
+        operand_row(normalized[row], operands(shared_gate), gate_row)
+        operand_row(normalized[row], operands(shared_up), up_row)
+        for feature in 0..S:
+            let mut gate = f32(0.0)
+            let mut up = f32(0.0)
+            for source in 0..H:
+                gate = fma(gate_row[source], f32(shared_gate[feature, source]), gate)
+                up = fma(up_row[source], f32(shared_up[feature, source]), up)
+            gates[row, feature] = gate
+            ups[row, feature] = up
+    glu(gates, ups, shared_product, 0)

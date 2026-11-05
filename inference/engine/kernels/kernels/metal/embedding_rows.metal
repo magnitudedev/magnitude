@@ -28,8 +28,20 @@ kernel void embedding_rows(
     const uint width = uint(SEISMIC_DIM_D);
     const float scale = as_type<float>(uint(SEISMIC_PARAM_SCALE));
     projection::Weights<packets::W0> rows{table, KERNEL_W0_LAYOUT(width), width, nullptr};
-    const uint token = uint(gathered::row(directory, SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R,
-        SEISMIC_DIM_F, tokens[ulong(row) * SEISMIC_TOKENS_STRIDE_0]));
+    device typename activation::storage *out =
+        reinterpret_cast<device typename activation::storage *>(embedded);
+    const long held = gathered::row(directory, SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R,
+        SEISMIC_DIM_F, tokens[ulong(row) * SEISMIC_TOKENS_STRIDE_0]);
+    // A row that names no table row reads zeros (the whole threadgroup's).
+    if (held < 0) {
+        for (uint column = thread_index; column < width; column += embedding_threads) {
+            out[ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + ulong(column) * SEISMIC_RESULT_0_STRIDE_1] =
+                activation::store(0.0f);
+            widened[ulong(row) * SEISMIC_RESULT_1_STRIDE_0 + ulong(column) * SEISMIC_RESULT_1_STRIDE_1] = 0.0f;
+        }
+        return;
+    }
+    const uint token = uint(held);
     float inverse = 1.0f;
     if (SEISMIC_PARAM_NORMALIZE != 0) {
         float squares = 0.0f;
@@ -43,8 +55,6 @@ kernel void embedding_rows(
         const float total = reduce::group_sum<embedding_threads / 32>(squares, partials, sg, lane);
         inverse = metal::rsqrt(total / float(width) + as_type<float>(uint(SEISMIC_PARAM_EPSILON)));
     }
-    device typename activation::storage *out =
-        reinterpret_cast<device typename activation::storage *>(embedded);
     for (uint p = thread_index; p * 32u < width; p += embedding_threads) {
         typename packets::W0::packet packet = rows.packet(token, p);
         for (uint step = 0; step < 4; ++step) {

@@ -22,13 +22,20 @@ use seismic_lang::registry;
 
 include!(concat!(env!("OUT_DIR"), "/elements.rs"));
 
-/// Row blocks of the dot component, in the order of [`WeightKernels::dot`].
-pub const ROW_BLOCKS: [usize; 4] = [1, 2, 4, 8];
+/// Row blocks of the dot component, in the order of [`WeightKernels::dot`]:
+/// up to the largest row group a layout's rows share their bytes in
+/// (`weights::Placement::row_block`).
+pub const ROW_BLOCKS: [usize; 5] = [1, 2, 4, 8, 16];
+
+/// Activation rows of one quantized dot component call, in the order of
+/// [`WeightKernels::dot_q8`]'s instances: what `Format::dot_q8` decodes a
+/// weight block once for.
+const ACTIVATION_GROUPS: [usize; 3] = [1, 2, 4];
 
 type DecodeFn = unsafe fn(*const u8, &RowGeometry, usize, *mut f32);
 type DotFn = unsafe fn(*const u8, &RowGeometry, *const f32, usize, *mut f32);
 type DotQ8Fn = unsafe fn(*const u8, &RowGeometry, *const Q8Block, usize, *mut f32);
-type GemmQ8Fn = unsafe fn(*const u8, &RowGeometry, *const Q8Block, usize, *mut f32);
+type DotQ8TilesFn = unsafe fn(*const u8, &RowGeometry, *const Q8Block, usize, *mut f32, usize) -> bool;
 
 /// The instances of one component on one tier.
 #[derive(Clone, Copy)]
@@ -36,11 +43,13 @@ pub struct WeightKernels {
     pub tier: Tier,
     decode: DecodeFn,
     /// One instance per entry of [`ROW_BLOCKS`].
-    dot: [DotFn; 4],
-    /// The same against quantized activations.
-    dot_q8: [DotQ8Fn; 4],
-    /// Four activation rows by eight weight rows, all reduced over K.
-    gemm_q8: GemmQ8Fn,
+    dot: [DotFn; 5],
+    /// The same against quantized activation rows, one instance per entry
+    /// of [`ROW_BLOCKS`] by entry of [`ACTIVATION_GROUPS`].
+    dot_q8: [[DotQ8Fn; 3]; 5],
+    /// Whole 16-row tiles against quantized activations, where the element
+    /// has a whole-tile form (`Format::dot_q8_tiles`).
+    dot_q8_tiles: DotQ8TilesFn,
 }
 
 impl std::fmt::Debug for WeightKernels {
@@ -70,8 +79,8 @@ impl WeightKernels {
         unsafe { (self.decode)(row, geometry, k, out.as_mut_ptr()) }
     }
 
-    /// `out[r] = row r · x` for the `out.len()` rows from `rows` (1, 2, 4 or
-    /// 8), `geometry.stride` bytes apart.
+    /// `out[r] = row r · x` for the `out.len()` rows from `rows` (an entry
+    /// of [`ROW_BLOCKS`]), `geometry.stride` bytes apart.
     ///
     /// # Safety
     /// `rows` addresses that many rows with `geometry` and `x.len()` values.
@@ -81,8 +90,14 @@ impl WeightKernels {
         unsafe { (self.dot[block])(rows, geometry, x.as_ptr(), x.len(), out.as_mut_ptr()) }
     }
 
-    /// As [`WeightKernels::dot`], against the activations of a `k`-value row
-    /// quantized into `x` (`quant::blocks(k)` blocks).
+    /// As [`WeightKernels::dot`] of a block of `R = out.len() / m` rows,
+    /// against each of the `m` activation rows of `k` values quantized into
+    /// `x` (`quant::blocks(k)` blocks each, row after row), activation-major:
+    /// `out[a R + r] = row r · activation a`. The activation rows go in the
+    /// largest groups that fit ([`ACTIVATION_GROUPS`]), each one pass over
+    /// the weight rows decoding every block once for the group
+    /// (`weights::dot_q8_rows`); every activation row's sums are the ones it
+    /// has alone.
     ///
     /// # Safety
     /// `rows` addresses that many rows with `geometry` and `k` values.
@@ -95,30 +110,39 @@ impl WeightKernels {
         k: usize,
         out: &mut [f32],
     ) {
-        assert_eq!(
+        let blocks = crate::quant::blocks(k);
+        let activations = x.len() / blocks;
+        assert!(
+            activations > 0 && x.len() == activations * blocks && out.len() % activations == 0,
+            "{} quantized activation blocks of {k}-value rows for {} sums",
             x.len(),
-            crate::quant::blocks(k),
-            "quantized activation blocks of a {k}-value row"
+            out.len()
         );
-        let block = row_block(out.len());
-        unsafe { (self.dot_q8[block])(rows, geometry, x.as_ptr(), k, out.as_mut_ptr()) }
+        let width = out.len() / activations;
+        let block = row_block(width);
+        let mut done = 0;
+        while done < activations {
+            let group = ACTIVATION_GROUPS
+                .iter()
+                .rposition(|group| *group <= activations - done)
+                .expect("the one-row group fits any remainder");
+            let (x, out) = (x[done * blocks..].as_ptr(), out[done * width..].as_mut_ptr());
+            unsafe { (self.dot_q8[block][group])(rows, geometry, x, k, out) };
+            done += ACTIVATION_GROUPS[group];
+        }
     }
 
-    /// Four quantized activation rows by eight weight rows. Output is
-    /// activation-major: four consecutive blocks of eight projections.
+    /// `out.len()` rows from `rows` (a multiple of 16, each 16 a tile)
+    /// against quantized activations `x`, where the element has a
+    /// whole-tile form for them (`Format::dot_q8_tiles`): the sums
+    /// [`Self::dot_q8`] gives, bit for bit. False, `out` untouched, where it
+    /// has none.
     ///
     /// # Safety
-    /// `rows` addresses eight rows with `geometry` and `k` values.
-    pub unsafe fn gemm_q8(
-        &self,
-        rows: *const u8,
-        geometry: &RowGeometry,
-        x: &[Q8Block],
-        k: usize,
-        out: &mut [f32; 32],
-    ) {
-        assert_eq!(x.len(), 4 * crate::quant::blocks(k));
-        unsafe { (self.gemm_q8)(rows, geometry, x.as_ptr(), k, out.as_mut_ptr()) }
+    /// `rows` addresses `out.len()` rows with `geometry` and `k` values.
+    pub unsafe fn dot_q8_tiles(&self, rows: *const u8, geometry: &RowGeometry, x: &[Q8Block], k: usize, out: &mut [f32]) -> bool {
+        assert_eq!(x.len(), crate::quant::blocks(k), "quantized activation blocks of a {k}-value row");
+        unsafe { (self.dot_q8_tiles)(rows, geometry, x.as_ptr(), k, out.as_mut_ptr(), out.len()) }
     }
 }
 
@@ -140,6 +164,7 @@ macro_rules! inlined_table {
             inlined::<$component, 2>,
             inlined::<$component, 4>,
             inlined::<$component, 8>,
+            inlined::<$component, 16>,
         ]),*]
     };
 }
@@ -190,7 +215,7 @@ macro_rules! tier_components {
 
             /// Each component's inlined dots, per row block.
             #[cfg(test)]
-            pub(crate) static INLINED: [[super::tests::InlinedFn; 4]; COMPONENTS] =
+            pub(crate) static INLINED: [[super::tests::InlinedFn; ROW_BLOCKS.len()]; COMPONENTS] =
                 with_components!(inlined_table);
 
             #[target_feature(enable = $features)]
@@ -208,50 +233,47 @@ macro_rules! tier_components {
             }
 
             #[target_feature(enable = $features)]
-            unsafe fn dot_q8<W: Format, const R: usize>(
+            unsafe fn dot_q8<W: Format, const R: usize, const M: usize>(
                 rows: *const u8,
                 geometry: &RowGeometry,
                 x: *const Q8Block,
                 k: usize,
                 out: *mut f32,
             ) {
-                let x = unsafe { std::slice::from_raw_parts(x, crate::quant::blocks(k)) };
+                let x = unsafe { std::slice::from_raw_parts(x, M * crate::quant::blocks(k)) };
                 let result = unsafe {
-                    weights::dot_q8_rows::<W, R, crate::isa::$tier>(rows, geometry, x, k)
+                    weights::dot_q8_rows::<W, R, M, crate::isa::$tier>(rows, geometry, x, k)
                 };
-                unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, R) };
+                unsafe { std::ptr::copy_nonoverlapping(result.as_ptr().cast::<f32>(), out, M * R) };
             }
 
-            /// A whole K reduction for a 4×8 tile: the same weight block
-            /// serves four activation rows.
             #[target_feature(enable = $features)]
-            unsafe fn gemm_q8<W: Format>(
+            unsafe fn dot_q8_tiles<W: Format>(
                 rows: *const u8,
                 geometry: &RowGeometry,
                 x: *const Q8Block,
                 k: usize,
                 out: *mut f32,
-            ) {
-                let x = unsafe { std::slice::from_raw_parts(x, 4 * crate::quant::blocks(k)) };
-                let accumulators =
-                    unsafe { weights::gemm_q8_rows::<W, crate::isa::$tier>(rows, geometry, x, k) };
-                unsafe {
-                    std::ptr::copy_nonoverlapping(accumulators.as_ptr().cast::<f32>(), out, 32)
-                };
+                len: usize,
+            ) -> bool {
+                let x = unsafe { std::slice::from_raw_parts(x, crate::quant::blocks(k)) };
+                let out = unsafe { std::slice::from_raw_parts_mut(out, len) };
+                unsafe { W::dot_q8_tiles::<crate::isa::$tier>(rows, geometry, x, k, out) }
             }
 
             const fn kernels<W: Format>() -> WeightKernels {
                 WeightKernels {
                     tier: Tier::$tier,
                     decode: decode::<W>,
-                    dot: [dot::<W, 1>, dot::<W, 2>, dot::<W, 4>, dot::<W, 8>],
+                    dot: [dot::<W, 1>, dot::<W, 2>, dot::<W, 4>, dot::<W, 8>, dot::<W, 16>],
                     dot_q8: [
-                        dot_q8::<W, 1>,
-                        dot_q8::<W, 2>,
-                        dot_q8::<W, 4>,
-                        dot_q8::<W, 8>,
+                        [dot_q8::<W, 1, 1>, dot_q8::<W, 1, 2>, dot_q8::<W, 1, 4>],
+                        [dot_q8::<W, 2, 1>, dot_q8::<W, 2, 2>, dot_q8::<W, 2, 4>],
+                        [dot_q8::<W, 4, 1>, dot_q8::<W, 4, 2>, dot_q8::<W, 4, 4>],
+                        [dot_q8::<W, 8, 1>, dot_q8::<W, 8, 2>, dot_q8::<W, 8, 4>],
+                        [dot_q8::<W, 16, 1>, dot_q8::<W, 16, 2>, dot_q8::<W, 16, 4>],
                     ],
-                    gemm_q8: gemm_q8::<W>,
+                    dot_q8_tiles: dot_q8_tiles::<W>,
                 }
             }
 
@@ -371,6 +393,9 @@ mod tests {
         assert_eq!(neon::FEATURES, Tier::Neon.features());
     }
 
+    /// Rows of the largest component block.
+    const BLOCK_ROWS: usize = ROW_BLOCKS[ROW_BLOCKS.len() - 1];
+
     /// A deterministic pseudo-random byte stream.
     fn bytes(seed: u64, count: usize) -> Vec<u8> {
         let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
@@ -448,39 +473,129 @@ mod tests {
     /// The inlined dots of one component and row block.
     pub(crate) type InlinedFn = unsafe fn(*const u8, usize, &RowGeometry, &[f32], &mut [f32]);
 
+    /// The row layout of packed rows `id`.
+    fn packed_rows(id: RepresentationId) -> &'static registry::PackedRowLayout {
+        match &registry::representation_info(id).kind {
+            RepresentationKind::PackedRows(layout) => layout,
+            _ => panic!("`{}` is no row layout", registry::representation_info(id).name),
+        }
+    }
+
+    /// Every row-layout storage element has components (a device's layout
+    /// too, `mma16`'s records included), and each, beside its rows16
+    /// element's: the same packets read in either layout are the same
+    /// values (decoded bit for bit) and the same products (quantized dots
+    /// bit for bit), every row block and tier, at every column window (its
+    /// storage groups from the first a multiple of its group on, and up to
+    /// one).
+    #[test]
+    fn every_layout_reads_its_packets_as_rows16_does() {
+        let tier = Tier::detected().unwrap();
+        for info in registry::representations() {
+            if matches!(info.kind, RepresentationKind::PackedRows(_)) && registry::storage_of(info.id) == info.id {
+                assert!(resolve(tier, info.id).is_some(), "`{}` has no components", info.name);
+            }
+        }
+        let mut compared = 0;
+        for name in elements() {
+            let id = registry::representation(name).unwrap();
+            let info = registry::representation_info(id);
+            if info.layout == Layout::Rows16 || !matches!(info.kind, RepresentationKind::PackedRows(_)) {
+                continue;
+            }
+            let row_major = registry::storage(info.representation, Layout::Rows16).unwrap();
+            let group = packed_rows(id).group() as usize;
+            // Two tiles of rows32 and a partial mma16 tile; whole k-blocks,
+            // and an odd count of them (K = 64 x odd).
+            for (rows, k) in [(40, 1024usize), (19, 576)] {
+                if k % group != 0 {
+                    continue;
+                }
+                let (data, geometry) = self::rows(name, rows, k, 5);
+                // The reference: the same packets placed in rows16.
+                let extents = [rows as u64, k as u64];
+                let packets = packed_rows(id).packets(&extents, &data);
+                let reference = packed_rows(row_major).place(&extents, &packets);
+                let reference_geometry = RowGeometry::of(registry::representation_info(row_major), k, 0);
+                let x = bytes(9, k).iter().map(|byte| (*byte as f32 - 128.0) / 100.0).collect::<Vec<_>>();
+                let mut q8 = vec![crate::quant::Q8Block::ZERO; crate::quant::blocks(k)];
+                crate::quant::quantize(&x, &mut q8);
+                for tier in tier.at_or_below() {
+                    let (kernels, reference_kernels) = (resolve(tier, id).unwrap(), resolve(tier, row_major).unwrap());
+                    for row in 0..rows {
+                        let (mut values, mut expected) = (vec![0.0f32; k], vec![0.0f32; k]);
+                        unsafe {
+                            kernels.decode(data.as_ptr().add(row * geometry.stride), &geometry, k, &mut values);
+                            reference_kernels.decode(
+                                reference.as_ptr().add(row * reference_geometry.stride),
+                                &reference_geometry,
+                                k,
+                                &mut expected,
+                            );
+                        }
+                        let bits = |values: &[f32]| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+                        assert_eq!(bits(&values), bits(&expected), "{name} {tier:?} k {k} row {row}");
+                    }
+                    for block in ROW_BLOCKS {
+                        for first in (0..rows - block + 1).step_by(block) {
+                            let (mut out, mut expected) = (vec![0.0f32; block], vec![0.0f32; block]);
+                            unsafe {
+                                kernels.dot_q8(data.as_ptr().add(first * geometry.stride), &geometry, &q8, k, &mut out);
+                                reference_kernels.dot_q8(
+                                    reference.as_ptr().add(first * reference_geometry.stride),
+                                    &reference_geometry,
+                                    &q8,
+                                    k,
+                                    &mut expected,
+                                );
+                            }
+                            let bits = |values: &[f32]| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+                            assert_eq!(bits(&out), bits(&expected), "{name} {tier:?} k {k} block {block} rows {first}..");
+                        }
+                    }
+                }
+                // Column windows, read where they lie, as the same columns of
+                // the rows16 rows.
+                for start in (0..k).step_by(group) {
+                    let end = (start + 2 * group).min(k);
+                    let mut window = geometry;
+                    window.first_group += start / group;
+                    let mut reference_window = reference_geometry;
+                    reference_window.first_group += start / group;
+                    let kernels = resolve(tier, id).unwrap();
+                    let reference_kernels = resolve(tier, row_major).unwrap();
+                    for row in [0, rows - 1] {
+                        let (mut values, mut expected) = (vec![0.0f32; end - start], vec![0.0f32; end - start]);
+                        unsafe {
+                            kernels.decode(data.as_ptr().add(row * geometry.stride), &window, end - start, &mut values);
+                            reference_kernels.decode(
+                                reference.as_ptr().add(row * reference_geometry.stride),
+                                &reference_window,
+                                end - start,
+                                &mut expected,
+                            );
+                        }
+                        assert_eq!(values, expected, "{name} k {k} columns {start}..{end} row {row}");
+                    }
+                }
+                compared += 1;
+            }
+        }
+        assert!(compared >= 20, "{compared} layouts compared");
+    }
+
     /// Rows of `representation` whose scales and factors are finite and
     /// small.
     fn rows(representation: &str, rows: usize, k: usize, seed: u64) -> (Placed<u8>, RowGeometry) {
         let id = registry::representation(representation).unwrap();
         let info = registry::representation_info(id);
-        if info.layout == Layout::Rows8 {
-            // The rows16 rows, each plane's storage groups interleaved by tile.
+        if info.layout != Layout::Rows16 && matches!(info.kind, RepresentationKind::PackedRows(_)) {
+            // The rows16 rows' packets, placed in this layout (one matrix).
             let row_major = registry::storage(info.representation, Layout::Rows16).unwrap();
-            let (source, source_geometry) =
-                self::rows(registry::representation_info(row_major).name, rows, k, seed);
+            let (source, _) = self::rows(registry::representation_info(row_major).name, rows, k, seed);
+            let extents = [rows as u64, k as u64];
+            let data = Placed::of(&packed_rows(id).place(&extents, &packed_rows(row_major).packets(&extents, &source)));
             let mut geometry = RowGeometry::of(info, k, 0);
-            let mut data = Placed::<u8>::zeroed(rows.div_ceil(8) * 8 * geometry.stride);
-            let RepresentationKind::PackedRows(layout) = &info.kind else {
-                unreachable!("a rows8 element is packed rows")
-            };
-            let groups = layout.row_groups(k as u64).unwrap() as usize;
-            for row in 0..rows {
-                let (tile, lane) = (row / 8, row % 8);
-                for (offset, bytes) in geometry.offsets.iter().zip(geometry.groups) {
-                    if bytes == 0 {
-                        continue;
-                    }
-                    for group in 0..groups {
-                        let from = row * geometry.stride + offset + group * bytes;
-                        let to = tile * 8 * geometry.stride
-                            + offset * 8
-                            + group * bytes * 8
-                            + lane * bytes;
-                        data[to..to + bytes].copy_from_slice(&source[from..from + bytes]);
-                    }
-                }
-            }
-            assert_eq!(source_geometry.offsets, geometry.offsets);
             geometry.base = data.as_ptr() as usize;
             geometry.matrix_rows = rows;
             return (data, geometry);
@@ -538,10 +653,10 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         for representation in elements() {
-            let (data, geometry) = rows(representation, 8, k, 11);
+            let (data, geometry) = rows(representation, BLOCK_ROWS, k, 11);
             let reference = kernels_of(Tier::detected().unwrap(), representation);
             // The single-row dot against the decoded row, in the defined order.
-            let mut expected = [0.0f32; 8];
+            let mut expected = [0.0f32; BLOCK_ROWS];
             let mut decoded = vec![0.0f32; k];
             for (row, expected) in expected.iter_mut().enumerate() {
                 unsafe {
@@ -557,7 +672,7 @@ mod tests {
             for tier in Tier::detected().unwrap().at_or_below() {
                 let kernels = kernels_of(tier, representation);
                 for block in ROW_BLOCKS {
-                    for first in (0..8).step_by(block) {
+                    for first in (0..BLOCK_ROWS).step_by(block) {
                         let mut out = vec![0.0f32; block];
                         unsafe {
                             kernels.dot(
@@ -624,105 +739,61 @@ mod tests {
         }
     }
 
+    /// A quantized dot of `m` activation rows gives each row the sums it has
+    /// alone, bit for bit, for every element, row block and `m` (each `M`
+    /// grouping of `Format::dot_q8` the body takes).
     #[test]
-    fn four_by_eight_q8_tile_matches_individual_dots() {
+    fn many_activation_rows_match_individual_dots() {
         let k = 2 * 256 + 32;
         let tier = Tier::detected().unwrap();
-        let mut activations = vec![0.0f32; 4 * k];
+        const MOST: usize = 9;
+        let mut activations = vec![0.0f32; MOST * k];
         for (i, value) in activations.iter_mut().enumerate() {
             *value = ((i * 37 % 251) as f32 - 125.0) / 113.0;
         }
         let blocks = crate::quant::blocks(k);
-        let mut quantized = vec![Q8Block::ZERO; 4 * blocks];
-        for m in 0..4 {
+        let mut quantized = vec![Q8Block::ZERO; MOST * blocks];
+        for m in 0..MOST {
             crate::quant::quantize(
                 &activations[m * k..(m + 1) * k],
                 &mut quantized[m * blocks..(m + 1) * blocks],
             );
         }
         for representation in elements() {
-            let (data, geometry) = rows(representation, 8, k, 31);
+            let (data, geometry) = rows(representation, 16, k, 31);
             let kernels = kernels_of(tier, representation);
-            let mut tile = [0.0f32; 32];
-            unsafe { kernels.gemm_q8(data.as_ptr(), &geometry, &quantized, k, &mut tile) };
-            for m in 0..4 {
-                let mut expected = [0.0f32; 8];
-                unsafe {
-                    kernels.dot_q8(
-                        data.as_ptr(),
-                        &geometry,
-                        &quantized[m * blocks..(m + 1) * blocks],
-                        k,
-                        &mut expected,
-                    )
-                };
-                for r in 0..8 {
-                    assert_eq!(
-                        tile[m * 8 + r].to_bits(),
-                        expected[r].to_bits(),
-                        "{representation} m {m} r {r}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "measurement; run in release mode to compare the four-row tile with separate row dots"]
-    fn four_by_eight_q8_tile_throughput() {
-        let tier = Tier::detected().unwrap();
-        let k = 4096;
-        let blocks = crate::quant::blocks(k);
-        let activations = bytes(37, 4 * k)
-            .iter()
-            .map(|byte| (*byte as f32 - 128.0) / 113.0)
-            .collect::<Vec<_>>();
-        let mut quantized = vec![Q8Block::ZERO; 4 * blocks];
-        for m in 0..4 {
-            crate::quant::quantize(
-                &activations[m * k..(m + 1) * k],
-                &mut quantized[m * blocks..(m + 1) * blocks],
-            );
-        }
-        for representation in ["q4k@rows8", "q5k@rows8", "q6k@rows8"] {
-            let (data, geometry) = rows(representation, 8, k, 31);
-            let kernels = kernels_of(tier, representation);
-            let mut tile = [0.0f32; 32];
-            let measure = |f: &dyn Fn(&mut [f32; 32]), tile: &mut [f32; 32]| {
-                (0..5)
-                    .map(|_| {
-                        let began = std::time::Instant::now();
-                        for _ in 0..1000 {
-                            f(std::hint::black_box(tile));
-                        }
-                        began.elapsed().as_secs_f64()
-                    })
-                    .fold(f64::INFINITY, f64::min)
-            };
-            let separate = measure(
-                &|tile| {
-                    for m in 0..4 {
+            for block in ROW_BLOCKS {
+                let alone = (0..MOST)
+                    .map(|m| {
+                        let mut expected = vec![0.0f32; block];
                         unsafe {
                             kernels.dot_q8(
                                 data.as_ptr(),
                                 &geometry,
                                 &quantized[m * blocks..(m + 1) * blocks],
                                 k,
-                                &mut tile[m * 8..(m + 1) * 8],
+                                &mut expected,
                             )
+                        };
+                        expected
+                    })
+                    .collect::<Vec<_>>();
+                for count in 1..=MOST {
+                    let mut together = vec![0.0f32; count * block];
+                    unsafe {
+                        kernels.dot_q8(data.as_ptr(), &geometry, &quantized[..count * blocks], k, &mut together)
+                    };
+                    for m in 0..count {
+                        for r in 0..block {
+                            assert_eq!(
+                                together[m * block + r].to_bits(),
+                                alone[m][r].to_bits(),
+                                "{representation} block {block} of {count} rows: m {m} r {r}"
+                            );
                         }
                     }
-                },
-                &mut tile,
-            );
-            let fused = measure(
-                &|tile| unsafe { kernels.gemm_q8(data.as_ptr(), &geometry, &quantized, k, tile) },
-                &mut tile,
-            );
-            eprintln!(
-                "{representation}: separate {separate:.3} s, fused {fused:.3} s, speedup {:.2}x",
-                separate / fused
-            );
+                }
+            }
         }
     }
 
@@ -815,7 +886,7 @@ mod tests {
         x: &[f32],
         out: &mut [f32],
     ) {
-        let table: &[[InlinedFn; 4]; COMPONENTS] = match tier {
+        let table: &[[InlinedFn; ROW_BLOCKS.len()]; COMPONENTS] = match tier {
             #[cfg(target_arch = "x86_64")]
             Tier::X86V2 => &x86v2::INLINED,
             #[cfg(target_arch = "x86_64")]
@@ -992,7 +1063,7 @@ mod tests {
                         let started = std::time::Instant::now();
                         for first in (0..rows).step_by(8) {
                             unsafe {
-                                kernels.gemm_q8(
+                                kernels.dot_q8(
                                     data.as_ptr().add(first * geometry.stride),
                                     &geometry,
                                     &four,
@@ -1005,7 +1076,7 @@ mod tests {
                         best = best.min(started.elapsed().as_secs_f64());
                     }
                     eprintln!(
-                        "{representation:>14} {tier:?} rows 8 quantized 4-row tile: {:6.2} Gweights/s",
+                        "{representation:>14} {tier:?} rows 8 quantized, four activation rows: {:6.2} Gweights/s",
                         (4 * rows * k) as f64 / best / 1e9
                     );
                 }
@@ -1030,9 +1101,9 @@ mod tests {
         quantize(&x, &mut xq);
         let detected = Tier::detected().unwrap();
         for representation in elements() {
-            let (data, geometry) = rows(representation, 8, k, 11);
+            let (data, geometry) = rows(representation, BLOCK_ROWS, k, 11);
             let reference = kernels_of(detected, representation);
-            let mut first_tier = [0.0f32; 8];
+            let mut first_tier = [0.0f32; BLOCK_ROWS];
             unsafe { reference.dot_q8(data.as_ptr(), &geometry, &xq, k, &mut first_tier) };
             let mut decoded = vec![0.0f32; k];
             for (row, value) in first_tier.iter().enumerate() {
@@ -1068,7 +1139,7 @@ mod tests {
             for tier in detected.at_or_below() {
                 let kernels = kernels_of(tier, representation);
                 for block in ROW_BLOCKS {
-                    for first in (0..8).step_by(block) {
+                    for first in (0..BLOCK_ROWS).step_by(block) {
                         let mut out = vec![0.0f32; block];
                         unsafe {
                             kernels.dot_q8(
@@ -1089,6 +1160,44 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Whole 16-row tiles in one call (`dot_q8_tiles`) give each tile's
+    /// quantized dots of the lowest tier bit for bit, on every tier where an
+    /// element has a whole-tile form, and some element has one on x86 with
+    /// quantized dots.
+    #[test]
+    fn whole_tiles_match_the_lowest_tiers_tile_dots() {
+        use crate::quant::{blocks, quantize, Q8Block};
+        let (k, tiles) = (2 * 256 + 128, 3);
+        let x = bytes(5, k).iter().map(|byte| (*byte as f32 - 128.0) / 90.0).collect::<Vec<_>>();
+        let mut xq = vec![Q8Block::ZERO; blocks(k)];
+        quantize(&x, &mut xq);
+        let (lowest, detected) = (Tier::all()[0], Tier::detected().unwrap());
+        let mut whole = 0;
+        for representation in elements() {
+            let (data, geometry) = rows(representation, 16 * tiles, k, 13);
+            if geometry.placement.row_block() != 16 {
+                continue;
+            }
+            let reference = kernels_of(lowest, representation);
+            let mut expected = vec![0.0f32; 16 * tiles];
+            for (tile, expected) in expected.chunks_exact_mut(16).enumerate() {
+                unsafe { reference.dot_q8(data.as_ptr().add(16 * tile * geometry.stride), &geometry, &xq, k, expected) };
+            }
+            for tier in detected.at_or_below() {
+                let mut out = vec![0.0f32; 16 * tiles];
+                if unsafe { kernels_of(tier, representation).dot_q8_tiles(data.as_ptr(), &geometry, &xq, k, &mut out) } {
+                    whole += 1;
+                    for (row, (value, expected)) in out.iter().zip(&expected).enumerate() {
+                        assert_eq!(value.to_bits(), expected.to_bits(), "{representation} {tier:?} row {row}");
+                    }
+                }
+            }
+        }
+        if cfg!(target_arch = "x86_64") && detected.quantized_dots() >= 1 {
+            assert!(whole > 0, "no element has a whole-tile form");
         }
     }
 
@@ -1118,9 +1227,9 @@ mod tests {
                 quantize(&x, &mut quantized[m * blocks..(m + 1) * blocks]);
             }
             for representation in elements() {
-                let (data, geometry) = rows(representation, 8, k, 17 + k as u64);
+                let (data, geometry) = rows(representation, BLOCK_ROWS, k, 17 + k as u64);
                 let reference = kernels_of(lowest, representation);
-                let mut expected = [[0.0f32; 8]; 4];
+                let mut expected = [[0.0f32; BLOCK_ROWS]; 4];
                 for (m, expected) in expected.iter_mut().enumerate() {
                     let x = &quantized[m * blocks..(m + 1) * blocks];
                     unsafe { reference.dot_q8(data.as_ptr(), &geometry, x, k, expected) };
@@ -1130,7 +1239,7 @@ mod tests {
                     for (m, expected) in expected.iter().enumerate() {
                         let x = &quantized[m * blocks..(m + 1) * blocks];
                         for block in ROW_BLOCKS {
-                            for first in (0..8).step_by(block) {
+                            for first in (0..BLOCK_ROWS).step_by(block) {
                                 let mut out = vec![0.0f32; block];
                                 let rows = unsafe { data.as_ptr().add(first * geometry.stride) };
                                 unsafe { kernels.dot_q8(rows, &geometry, x, k, &mut out) };
@@ -1145,15 +1254,18 @@ mod tests {
                             }
                         }
                     }
-                    let mut tile = [0.0f32; 32];
-                    unsafe { kernels.gemm_q8(data.as_ptr(), &geometry, &quantized, k, &mut tile) };
-                    for (m, expected) in expected.iter().enumerate() {
-                        for (r, expected) in expected.iter().enumerate() {
-                            assert_eq!(
-                                tile[m * 8 + r].to_bits(),
-                                expected.to_bits(),
-                                "{representation} {tier:?} k {k} tile m {m} row {r}"
-                            );
+                    // The four activation rows at once, each block's.
+                    for block in ROW_BLOCKS {
+                        let mut together = vec![0.0f32; 4 * block];
+                        unsafe { kernels.dot_q8(data.as_ptr(), &geometry, &quantized, k, &mut together) };
+                        for (m, expected) in expected.iter().enumerate() {
+                            for (r, expected) in expected.iter().enumerate().take(block) {
+                                assert_eq!(
+                                    together[m * block + r].to_bits(),
+                                    expected.to_bits(),
+                                    "{representation} {tier:?} k {k} four rows, block {block}: m {m} row {r}"
+                                );
+                            }
                         }
                     }
                 }

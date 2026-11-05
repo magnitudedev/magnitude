@@ -1,0 +1,14 @@
+#define ROUTE_DECODE_ONLY
+#define ROUTE_PROJECTION
+#define KERNEL_W1 SEISMIC_SHARED_GATE
+#define KERNEL_W2 SEISMIC_SHARED_UP
+#include "lib/routed/route.glsl"
+// Resident selection has no routing record or bank protocol.
+#define ROUTE_FINISH_SELECTION(whole)
+#include "lib/routed/route_shared.glsl"
+
+void routed_route_gemv() { route_gemv(); }
+void routed_route_shared1() { routed_route_shared_dispatch(1u, false); }
+void routed_route_shared2() { routed_route_shared_dispatch(2u, false); }
+void routed_route_shared4() { routed_route_shared_dispatch(4u, false); }
+void routed_route_shared8() { routed_route_shared_dispatch(8u, false); }

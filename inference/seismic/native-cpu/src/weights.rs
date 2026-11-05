@@ -4,8 +4,10 @@
 //! A weight row of `k` logical values is read in packets of 32 consecutive
 //! values. Dense rows (`f32`, `bf16`, `f16`) hold the values contiguously; a
 //! partial final packet decodes its missing values as zero. Packed rows are
-//! the registry's row layouts (`rows16`, `rows8`) with the registry's
-//! geometry ([`RowGeometry::of`]), decoded by the components the registry's
+//! the registry's row layouts (the CPU's `rows16` and `rows8`, and the
+//! devices' `rows32` and `mma16`, read where they lie, [`Placement`]) with
+//! the registry's geometry ([`RowGeometry::of`]), decoded by the components
+//! the registry's
 //! decode axes name (`registry::decode_axes`, instantiated by build.rs): a
 //! code component ([`Planes`], [`Grid`]) gives a packet's exact integer
 //! values, and a coefficient component ([`Direct`], [`Hier`]) the scale (and
@@ -27,13 +29,63 @@ use crate::quant::{Q8Block, Q8_BLOCK};
 use crate::reduce::{combine, LANES};
 use magnitude_ggml::tables;
 use seismic_lang::registry::{
-    GridSigns, Layout, LocalBias, MinimumSign, RepresentationInfo, RepresentationKind,
-    RowPlaneRole,
+    self, GridSigns, Layout, LocalBias, MinimumSign, RepresentationInfo, RepresentationKind,
+    RowPlaneContent, RowPlaneRole,
 };
 use std::marker::PhantomData;
 
 /// Values of one packet.
 pub const PACKET: usize = 32;
+
+/// How a row layout places its tile's rows (`registry::Layout`), as the
+/// components address them (`PackedRowLayout::code_bit`, `share_byte`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// Dense rows and `rows16`: each row's planes within the row, a
+    /// storage group's share of a plane its bytes together.
+    Rows,
+    /// `rows8`: a tile's corresponding storage groups of its eight rows
+    /// adjacent in each plane.
+    Rows8,
+    /// `rows32`: a tile's planes one after another, a group plane its rows'
+    /// shares row by row, a code plane each packet's 32 columns of its rows
+    /// together (`[packet][row][packet bytes]`).
+    Rows32,
+    /// `mma16`: group planes as `rows16`'s; a tile's code plane spread over
+    /// its rows' code planes, each k-block of 64 columns of the tile its
+    /// GEMV lanes (codes: `[k-block][lane 4g + t][4 steps of 16 columns]`,
+    /// row `g` and `g + 8` sharing each lane) or rows (grids: `[k-block][row]`).
+    Mma16,
+    /// `mma16` of a carried grid representation: its one `records` plane, a
+    /// tile's bytes whole (`PackedRowLayout::record_byte`), each storage
+    /// group's `entries` bytes of its rows' grid entries in GEMV lane order
+    /// (`PackedRowLayout::record_entry`), then every group's factors.
+    Records { entries: usize },
+}
+
+impl Placement {
+    /// Rows of one tile.
+    pub const fn tile(self) -> usize {
+        match self {
+            Self::Rows => 1,
+            Self::Rows8 => 8,
+            Self::Rows32 => 32,
+            Self::Mma16 | Self::Records { .. } => 16,
+        }
+    }
+
+    /// Rows of the dot block a projection takes at a time
+    /// (`components::ROW_BLOCKS`): an `mma16` tile, whose rows `g` and
+    /// `g + 8` share their code bytes (read once for both); eight rows of
+    /// every other layout, whose rows share none (a rows8 tile's eight are
+    /// its dot block too).
+    pub const fn row_block(self) -> usize {
+        match self {
+            Self::Mma16 => 16,
+            Self::Rows | Self::Rows8 | Self::Rows32 | Self::Records { .. } => 8,
+        }
+    }
+}
 
 /// The stack alignment every frame has (the x86-64 and AArch64 ABIs').
 const STACK_ALIGNMENT: usize = 16;
@@ -115,26 +167,44 @@ pub struct RowGeometry {
     /// and its bytes per storage group; zero for a role the element lacks.
     pub offsets: [usize; 4],
     pub groups: [usize; 4],
+    /// Per plane role, its payload bytes of one row (`bytes_per_row`).
+    pub row_bytes: [usize; 4],
+    /// Packets (of 32 values) of one storage group.
+    pub group_packets: usize,
+    /// Storage groups of every row before the operand's first value (a
+    /// window of its columns, `Weights::columns`).
+    pub first_group: usize,
+    pub placement: Placement,
+    /// Whether the code plane holds grid entries (`RowPlaneContent::Grids`).
+    pub grids: bool,
     /// Row addressing of the bound tensor. Zero base is used for unbound geometry.
     pub base: usize,
     pub matrix_rows: usize,
-    pub rows8: bool,
+    /// Per code role of an `mma16` layout, the bytes of one unit of a
+    /// tile's `V`, the units of one row's payload and their division by
+    /// multiplication (`Mma16Plane`): derived once, not per row.
+    pub mma16_units: [(usize, usize, u64); 2],
 }
 
 impl RowGeometry {
     /// The geometry of rows of `k` values of weight element `element` (dense,
-    /// or packed `rows16` or `rows8`); `dense_stride` is the bound tensor's
-    /// row stride in bytes, which only dense rows use. Packed rows follow the
-    /// registry's row layout (`PackedRowLayout::geometry`), computed without
-    /// allocating.
+    /// or packed in any row layout);
+    /// `dense_stride` is the bound tensor's row stride in bytes, which only
+    /// dense rows use. Packed rows follow the registry's row layout
+    /// (`PackedRowLayout::geometry`), computed without allocating.
     pub fn of(element: &RepresentationInfo, k: usize, dense_stride: usize) -> Self {
         let mut geometry = Self {
             stride: dense_stride,
             offsets: [0; 4],
             groups: [0; 4],
+            row_bytes: [0; 4],
+            group_packets: 1,
+            first_group: 0,
+            placement: Placement::Rows,
+            grids: false,
             base: 0,
             matrix_rows: 0,
-            rows8: false,
+            mma16_units: [(0, 0, 0); 2],
         };
         match &element.kind {
             RepresentationKind::Dense(_) => {}
@@ -147,18 +217,43 @@ impl RowGeometry {
                         rows.plane_row_offset(plane, k)
                             .expect("a weight plane's offset") as usize;
                     geometry.groups[role] = row_plane.bytes_per_group as usize;
+                    geometry.row_bytes[role] = rows
+                        .plane_bytes_per_row(plane, k)
+                        .expect("a weight plane's bytes") as usize;
+                    if matches!(row_plane.content, RowPlaneContent::Grids { .. }) {
+                        geometry.grids = true;
+                    }
                 }
-                geometry.rows8 = match element.layout {
-                    Layout::Rows16 => false,
-                    Layout::Rows8 => true,
-                    other => panic!(
-                        "CPU weight rows are rows16 or rows8, not {}",
-                        other.as_str()
-                    ),
+                geometry.group_packets = rows.group() as usize / PACKET;
+                let records = rows
+                    .planes
+                    .iter()
+                    .any(|plane| matches!(plane.content, RowPlaneContent::Records { .. }));
+                geometry.placement = match element.layout {
+                    Layout::Rows16 => Placement::Rows,
+                    Layout::Rows8 => Placement::Rows8,
+                    Layout::Rows32 => Placement::Rows32,
+                    Layout::Mma16 if records => {
+                        Placement::Records { entries: rows.record_entry_bytes() as usize }
+                    }
+                    Layout::Mma16 => Placement::Mma16,
+                    Layout::Packet => unreachable!("a row layout is never `packet`"),
                 };
             }
             RepresentationKind::Packed(_) | RepresentationKind::External(_) => {
                 panic!("`{}` is no CPU weight element", element.name)
+            }
+        }
+        if geometry.placement == Placement::Mma16 {
+            for role in RowPlaneRole::CODES {
+                let role = role as usize;
+                // A lane holds a packet's bytes of one k-block (four steps
+                // of 16 columns, two rows); a grid row's k-block is two
+                // packets.
+                let packet = geometry.packet_bytes(role);
+                let unit = if geometry.grids { 2 * packet } else { packet };
+                let units = (geometry.row_bytes[role] / unit.max(1)).max(1);
+                geometry.mma16_units[role] = (unit, units, (1u64 << 40) / units as u64 + 1);
             }
         }
         geometry
@@ -170,58 +265,246 @@ impl RowGeometry {
         self
     }
 
-    /// The rows8 tile base and lane of the row at `row`.
+    /// Bytes of one packet's codes of one row in code plane `role`.
     #[inline(always)]
-    fn tile_lane(&self, row: *const u8) -> (usize, usize) {
+    fn packet_bytes(&self, role: usize) -> usize {
+        self.groups[role] / self.group_packets
+    }
+
+    /// The tile base and the row within the tile of the row at `row`
+    /// (every matrix's rows padded to whole tiles).
+    #[inline(always)]
+    fn tile_row(&self, row: *const u8) -> (*const u8, usize) {
+        let tile = self.placement.tile();
         let index = (row as usize - self.base) / self.stride;
         let n = self.matrix_rows;
-        let stored = index / n * n.div_ceil(8) * 8 + index % n;
-        (self.base + stored / 8 * self.stride * 8, stored % 8)
+        let stored = index / n * n.div_ceil(tile) * tile + index % n;
+        (
+            (self.base + stored / tile * self.stride * tile) as *const u8,
+            stored % tile,
+        )
+    }
+
+    /// `R` consecutive rows from `first`, each resolved as [`Self::row`]
+    /// resolves it, with one division for all: a row's place in its tile
+    /// advances by one, past each matrix's padding to the next.
+    #[inline(always)]
+    pub(crate) fn rows<const R: usize>(&self, first: *const u8) -> [Row; R] {
+        if self.placement == Placement::Rows {
+            return std::array::from_fn(|r| self.row_in(first.wrapping_add(r * self.stride), (first.wrapping_add(r * self.stride), 0)));
+        }
+        let tile = self.placement.tile();
+        let n = self.matrix_rows;
+        let index = (first as usize - self.base) / self.stride;
+        let (mut matrix, mut within) = (index / n, index % n);
+        let padded = n.div_ceil(tile) * tile;
+        std::array::from_fn(|r| {
+            // Tiles are powers of two: a mask, no division a row.
+            let stored = matrix * padded + within;
+            let lane = stored & (tile - 1);
+            let place = ((self.base + (stored - lane) * self.stride) as *const u8, lane);
+            let row = self.row_in(first.wrapping_add(r * self.stride), place);
+            within += 1;
+            if within == n {
+                (matrix, within) = (matrix + 1, 0);
+            }
+            row
+        })
     }
 
     /// The row at `row`, resolved once for the component call that reads
     /// it.
     #[inline(always)]
     pub(crate) fn row(&self, row: *const u8) -> Row {
-        let (base, scale, lane, tile) = if self.rows8 {
-            let (tile, lane) = self.tile_lane(row);
-            (tile as *const u8, 8, lane, Some((tile, lane)))
-        } else {
-            (row, 1, 0, None)
+        let place = match self.placement {
+            Placement::Rows => (row, 0),
+            _ => self.tile_row(row),
         };
-        let mut planes = [base; 4];
+        self.row_in(row, place)
+    }
+
+    /// The row at `row`, its tile's first byte and its place in it `(tile,
+    /// r)`.
+    #[inline(always)]
+    fn row_in(&self, row: *const u8, (tile, r): (*const u8, usize)) -> Row {
+        let mut planes = [row; 4];
         let mut steps = self.groups;
+        let mut packet_steps = [0; 2];
+        for role in RowPlaneRole::CODES {
+            packet_steps[role as usize] = self.packet_bytes(role as usize);
+        }
         for plane in 0..4 {
-            let (start, bytes) = (self.offsets[plane], self.groups[plane]);
-            planes[plane] = base.wrapping_add(start * scale + lane * bytes);
-            steps[plane] = bytes * scale;
+            let (offset, bytes) = (self.offsets[plane], self.groups[plane]);
+            let code = plane < 2;
+            planes[plane] = match self.placement {
+                Placement::Rows => row.wrapping_add(offset),
+                Placement::Rows8 => {
+                    steps[plane] = bytes * 8;
+                    tile.wrapping_add(offset * 8 + r * bytes)
+                }
+                Placement::Rows32 if code => {
+                    let packet = self.packet_bytes(plane);
+                    steps[plane] = bytes * 32;
+                    packet_steps[plane] = packet * 32;
+                    tile.wrapping_add(offset * 32 + r * packet)
+                }
+                Placement::Rows32 => tile.wrapping_add(offset * 32 + r * self.row_bytes[plane]),
+                Placement::Mma16 if code => std::ptr::null(),
+                Placement::Mma16 => tile.wrapping_add(r * self.stride + offset),
+                // The one plane's storage groups: their entries (at
+                // `record_entry` of each), and, past every stored group's
+                // entries, their factors, the row's at `record_factor`.
+                Placement::Records { entries } => {
+                    let record = self.groups[RowPlaneRole::Codes as usize];
+                    let factors = registry::MMA_TILE_ROWS as usize * record - entries;
+                    match RowPlaneRole::ALL[plane] {
+                        RowPlaneRole::Codes => {
+                            steps[plane] = entries;
+                            tile
+                        }
+                        RowPlaneRole::Supers => {
+                            steps[plane] = factors;
+                            let stored = self.row_bytes[RowPlaneRole::Codes as usize] / record;
+                            let width = factors / registry::MMA_TILE_ROWS as usize;
+                            let place = registry::PackedRowLayout::record_factor(r as u64) as usize;
+                            tile.wrapping_add(stored * entries + place * width)
+                        }
+                        RowPlaneRole::High | RowPlaneRole::Scales => std::ptr::null(),
+                    }
+                }
+            };
+            planes[plane] = planes[plane].wrapping_add(self.first_group * steps[plane]);
         }
         Row {
             start: row,
             planes,
             steps,
             groups: self.groups,
-            tile,
+            packet_steps,
+            tile: (self.placement == Placement::Rows8).then_some((tile as usize, r)),
+            mma16: (self.placement == Placement::Mma16).then(|| Mma16Row::of(self, tile, r)),
+            record: matches!(self.placement, Placement::Records { .. }).then_some(r),
         }
     }
 }
 
+/// A row's code planes of an `mma16` tile: each plane's bytes of the tile,
+/// `V`, are its 16 rows' plane payloads one after another
+/// (`PackedRowLayout::code_bit`), so `V`'s units (a lane's or a row's bytes
+/// of one k-block) lie in the rows' planes in turn.
+#[derive(Clone, Copy, Debug)]
+struct Mma16Row {
+    /// The row within its tile.
+    row: usize,
+    /// The view's first packet of a row, and the packets of a storage group.
+    first_packet: usize,
+    group_packets: usize,
+    planes: [Mma16Plane; 2],
+}
+
+/// One code plane of an `mma16` tile (`Mma16Row`).
+#[derive(Clone, Copy, Debug)]
+struct Mma16Plane {
+    /// The plane's first byte in the tile's first row.
+    start: *const u8,
+    stride: usize,
+    /// Bytes of one unit of `V`: a lane's bytes of one k-block (codes), or
+    /// a row's (grids); and the units of one row's payload, with its
+    /// division by multiplication (`units * magic` within `2^40` of a
+    /// multiple of `2^40`, exact for every unit of a tile).
+    unit: usize,
+    units: usize,
+    magic: u64,
+    /// Whether it holds grid entries or their further bits (`[k-block][row]`,
+    /// a grid high plane placed as its grids plane), else codes by lanes.
+    grid: bool,
+}
+
+impl Mma16Row {
+    fn of(geometry: &RowGeometry, tile: *const u8, row: usize) -> Self {
+        let plane = |role: usize| {
+            let (unit, units, magic) = geometry.mma16_units[role];
+            Mma16Plane {
+                start: tile.wrapping_add(geometry.offsets[role]),
+                stride: geometry.stride,
+                unit,
+                units,
+                magic,
+                grid: geometry.grids,
+            }
+        };
+        Self {
+            row,
+            first_packet: geometry.first_group * geometry.group_packets,
+            group_packets: geometry.group_packets,
+            planes: [plane(0), plane(1)],
+        }
+    }
+}
+
+impl Mma16Plane {
+    /// The first byte of unit `unit` of the tile's `V`.
+    #[inline(always)]
+    fn unit(&self, unit: usize) -> *const u8 {
+        self.at(self.place(unit))
+    }
+
+    /// The row of the tile and the unit within its payload holding unit
+    /// `unit` of `V`: the same in every code plane of the tile with as many
+    /// units a row (a codes plane and its high plane).
+    #[inline(always)]
+    fn place(&self, unit: usize) -> (usize, usize) {
+        let row = ((unit as u64 * self.magic) >> 40) as usize;
+        (row, unit - row * self.units)
+    }
+
+    /// The first bytes of lane quads `4g ..4g + 4` of the k-block whose
+    /// lane 0 is unit `first` of `V` (each quad together: `Row::lanes_whole`),
+    /// with one division where the k-block lies in one row's payload. The
+    /// x86 tile path's alone.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    fn quads(&self, first: usize) -> [*const u8; 8] {
+        let (row, within) = self.place(first);
+        if within + 32 <= self.units {
+            let base = self.at((row, within));
+            std::array::from_fn(|g| base.wrapping_add(4 * g * self.unit))
+        } else {
+            std::array::from_fn(|g| self.unit(first + 4 * g))
+        }
+    }
+
+    /// The first byte of unit `within` of the tile's row `row`'s payload.
+    #[inline(always)]
+    fn at(&self, (row, within): (usize, usize)) -> *const u8 {
+        self.start.wrapping_add(row * self.stride + within * self.unit)
+    }
+}
+
 /// One row of a weight operand, resolved once per component call: where
-/// each plane's storage groups lie, the same for every layout.
+/// each plane's storage groups lie.
 #[derive(Clone, Copy, Debug)]
 pub struct Row {
     /// The row's first byte: a dense row's values.
     start: *const u8,
     /// Per plane role (`RowPlaneRole` order), the first byte of storage
-    /// group 0 and the bytes from one storage group to the next; a group's
-    /// bytes are contiguous in every layout.
+    /// group 0 and the bytes from one storage group to the next, a group's
+    /// share of a plane at its first byte (but an `mma16` code plane's,
+    /// `mma16`).
     planes: [*const u8; 4],
     steps: [usize; 4],
     /// Per plane role, the bytes of a storage group: in a rows8 tile, from
     /// one lane's group to the next.
     groups: [usize; 4],
+    /// Per code role, the bytes from one packet's codes to the next within
+    /// a storage group's share.
+    packet_steps: [usize; 2],
     /// The rows8 tile base and lane.
     tile: Option<(usize, usize)>,
+    /// An `mma16` row's code planes.
+    mma16: Option<Mma16Row>,
+    /// A `records` row's place in its tile.
+    record: Option<usize>,
 }
 
 impl Row {
@@ -233,6 +516,47 @@ impl Row {
         R == 8
             && rows[0].tile.is_some_and(|(base, lane)| {
                 lane == 0 && (1..R).all(|r| rows[r].tile == Some((base, r)))
+            })
+    }
+
+    /// The row `bytes` on, in a layout whose rows (and an `mma16` tile's
+    /// code planes) lie at a constant pitch: the same place in a tile
+    /// `bytes` further. The x86 tile path's alone.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    fn shifted(&self, bytes: usize) -> Row {
+        let mut row = *self;
+        row.start = self.start.wrapping_add(bytes);
+        for role in [RowPlaneRole::Scales, RowPlaneRole::Supers] {
+            let role = role as usize;
+            row.planes[role] = self.planes[role].wrapping_add(bytes);
+        }
+        if let Some(mma16) = row.mma16.as_mut() {
+            for plane in &mut mma16.planes {
+                plane.start = plane.start.wrapping_add(bytes);
+            }
+        }
+        row
+    }
+
+    /// Whether every four lanes `4g ..4g + 4` of a k-block of this `mma16`
+    /// row's code planes lie together in one row's payload: a row's payload
+    /// being whole lane quads. The x86 tile path's alone.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    fn lanes_whole(&self) -> bool {
+        self.mma16.as_ref().is_some_and(|mma16| !mma16.planes[0].grid && mma16.planes[0].units % 4 == 0)
+    }
+
+    /// Whether sixteen rows are rows 0..16 of one `mma16` tile whose code
+    /// plane holds lanes, in order: rows `g` and `g + 8` then share their
+    /// code bytes (`Codes::neon_partners`).
+    #[inline(always)]
+    fn partners<const R: usize>(rows: &[Row; R]) -> bool {
+        let tile = |row: &Row| row.mma16.as_ref().filter(|mma16| !mma16.planes[0].grid).map(|mma16| (mma16.planes[0].start, mma16.row));
+        R == 16
+            && tile(&rows[0]).is_some_and(|(start, row)| {
+                row == 0 && (1..R).all(|r| tile(&rows[r]) == Some((start, r)))
             })
     }
 
@@ -288,6 +612,20 @@ pub trait Format: Copy + Send + Sync + 'static {
         k: usize,
         x: [&Q8Block; M],
     ) -> [[f32; M]; R];
+
+    /// [`dot_q8_rows`] of `out.len()` rows from `first` against one
+    /// activation row, every 16 a tile,
+    /// written into `out` where the format has a whole-tile form for them on
+    /// tier `V` (an `mma16` tile of nibble-lane codes): the same sums bit for
+    /// bit. False, with `out` untouched, where it has none.
+    ///
+    /// # Safety
+    /// As [`dot_q8_rows`], for `out.len()` rows.
+    #[inline(always)]
+    unsafe fn dot_q8_tiles<V: Vectors>(first: *const u8, geometry: &RowGeometry, x: &[Q8Block], k: usize, out: &mut [f32]) -> bool {
+        let _ = (first, geometry, x, k, out);
+        false
+    }
 }
 
 /// Packets `0..count` of a block (`count` at most 8) as a loop bounded by
@@ -457,27 +795,137 @@ impl<E: Dense> Format for DenseRows<E> {
 }
 
 /// Where a packet lies: the first byte of its storage group in each plane
-/// (`RowPlaneRole` order), resolved once per row and storage group, and the
-/// packet within the group.
+/// (`RowPlaneRole` order), resolved once per row and storage group, the
+/// group and the packet within it, and its row (whose code planes say where
+/// its codes lie, [`At::code`]).
 #[derive(Clone, Copy, Debug)]
-pub struct At {
+pub struct At<'a> {
     planes: [*const u8; 4],
+    group: usize,
     pub packet: usize,
+    row: &'a Row,
 }
 
-impl At {
+/// Where one packet's codes of one row lie in a code plane.
+#[derive(Clone, Copy, Debug)]
+enum CodeBytes {
+    /// Together from this byte, in the packet's order (`rows16`'s): every
+    /// layout's but an `mma16` codes plane's.
+    Packet(*const u8),
+    /// An `mma16` codes plane's lanes ([`Lanes`]).
+    Lanes(Lanes),
+}
+
+/// One packet's codes of one row of an `mma16` codes plane: in each of the
+/// four lanes `t` of its row pair (`g`, `g + 8`), the k-block's four steps
+/// of 16 columns, a quarter of the lane each, the packet's two (its half
+/// `half` of the k-block) steps `2 half + s`, each step a word holding slot
+/// `j` of its eight slots at bits `bits * j`, slot `2 b + upper` this row's
+/// code of column `16 s + [2t, 2t + 8, 2t + 1, 2t + 9][b]` of step `s`.
+#[derive(Clone, Copy, Debug)]
+struct Lanes {
+    /// Lanes 0 and 1, and lanes 2 and 3, each pair's bytes together.
+    pairs: [*const u8; 2],
+    /// Bytes of one lane of a k-block (from one lane to the next).
+    unit: usize,
+    half: usize,
+    /// Whether the row is its pair's second (`g + 8`).
+    upper: bool,
+}
+
+impl Lanes {
+    /// The packet's steps of lane `t`.
+    #[inline(always)]
+    fn lane(self, t: usize) -> *const u8 {
+        self.pairs[t / 2].wrapping_add(t % 2 * self.unit + self.half * self.unit / 2)
+    }
+}
+
+impl<'a> At<'a> {
     /// Packet 0 of storage group `index` of `row`.
     #[inline(always)]
-    fn group(row: &Row, index: usize) -> Self {
+    fn group(row: &'a Row, index: usize) -> Self {
         Self {
             planes: row.group(index),
+            group: index,
             packet: 0,
+            row,
         }
+    }
+
+    /// Where this packet's codes of code plane `role` lie.
+    #[inline(always)]
+    fn code(self, role: RowPlaneRole) -> CodeBytes {
+        let role = role as usize;
+        let Some(mma16) = &self.row.mma16 else {
+            return CodeBytes::Packet(
+                self.planes[role].wrapping_add(self.packet * self.row.packet_steps[role]),
+            );
+        };
+        let plane = &mma16.planes[role];
+        if plane.grid {
+            // A grid row's k-block: its two packets one after the other.
+            let (block, half) = self.block(mma16);
+            let first = plane.unit(16 * block + mma16.row);
+            return CodeBytes::Packet(first.wrapping_add(half * plane.unit / 2));
+        }
+        CodeBytes::Lanes(self.lanes_and_high()[role])
+    }
+
+    /// The first byte of grid entry `e` (of four) of this packet, entries of
+    /// `bytes` bytes: one after another in a grids plane, a `records`
+    /// tile's at `record_entry`.
+    #[inline(always)]
+    fn entry(self, e: usize, bytes: usize) -> *const u8 {
+        let Some(row) = self.row.record else {
+            return packet_bytes(self, RowPlaneRole::Codes).wrapping_add(bytes * e);
+        };
+        // The packet's half of its k-block holds the k-block's entries
+        // 4 half..4 half + 4.
+        let (block, half) = (self.packet / 2, self.packet % 2);
+        let within = registry::PackedRowLayout::record_entry(row as u64, block as u64, (4 * half + e) as u64);
+        self.planes[RowPlaneRole::Codes as usize].wrapping_add(within as usize)
+    }
+
+    /// The `mma16` k-block holding this packet, and the packet's half of it.
+    #[inline(always)]
+    fn block(self, mma16: &Mma16Row) -> (usize, usize) {
+        let packet = mma16.first_packet + self.group * mma16.group_packets + self.packet;
+        (packet / 2, packet % 2)
+    }
+
+    /// Whether the codes lie in `mma16` lanes (`CodeBytes::Lanes`): the
+    /// row's layout is `mma16` and its code plane holds codes, not grids.
+    #[inline(always)]
+    fn in_lanes(self) -> bool {
+        self.row.mma16.as_ref().is_some_and(|mma16| !mma16.planes[0].grid)
+    }
+
+    /// Where this packet's codes lie in an `mma16` codes plane and its high
+    /// plane, which place their lanes alike (as many a row): one placement
+    /// for both.
+    #[inline(always)]
+    fn lanes_and_high(self) -> [Lanes; 2] {
+        let mma16 = self.row.mma16.as_ref().expect("an mma16 row's lanes");
+        let (block, half) = self.block(mma16);
+        // A lane holds four steps, the packet's two its half; a k-block's
+        // lanes 4g..4g + 4 are the pair's (two lanes of a pair never lie
+        // apart, a row's payload being whole lane pairs).
+        let first = 32 * block + 4 * (mma16.row % 8);
+        let [low, high] = &mma16.planes;
+        let places = [low.place(first), low.place(first + 2)];
+        let lanes = |plane: &Mma16Plane| Lanes {
+            pairs: places.map(|place| plane.at(place)),
+            unit: plane.unit,
+            half,
+            upper: mma16.row >= 8,
+        };
+        [lanes(low), lanes(high)]
     }
 
     /// Packet `p` of `row`, of `STORAGE`-value storage groups.
     #[inline(always)]
-    fn of<const STORAGE: usize>(row: &Row, p: usize) -> Self {
+    fn of<const STORAGE: usize>(row: &'a Row, p: usize) -> Self {
         let packets = STORAGE / PACKET;
         Self::group(row, p / packets).packet(p % packets)
     }
@@ -517,14 +965,14 @@ impl At {
 /// groups (a divisor of the block): its first storage group and the bytes
 /// from one group to the next in each plane.
 #[derive(Clone, Copy, Debug)]
-struct Block {
-    first: At,
+struct Block<'a> {
+    first: At<'a>,
     steps: [usize; 4],
 }
 
-impl Block {
+impl<'a> Block<'a> {
     #[inline(always)]
-    fn of<const STORAGE: usize>(row: &Row, b: usize) -> Self {
+    fn of<const STORAGE: usize>(row: &'a Row, b: usize) -> Self {
         const {
             assert!(
                 Q8_BLOCK % STORAGE == 0 && STORAGE % PACKET == 0,
@@ -539,13 +987,14 @@ impl Block {
 
     /// Packet `local` of the block.
     #[inline(always)]
-    fn at<const STORAGE: usize>(&self, local: usize) -> At {
+    fn at<const STORAGE: usize>(&self, local: usize) -> At<'a> {
         let packets = STORAGE / PACKET;
         let group = local / packets;
         let mut at = self.first.packet(local % packets);
         for plane in 0..4 {
             at.planes[plane] = at.planes[plane].wrapping_add(group * self.steps[plane]);
         }
+        at.group += group;
         at
     }
 }
@@ -575,12 +1024,32 @@ use codes::{Odd, Offset, Table, Twos, Unsigned};
 /// A raw code's exact integer value.
 pub trait Interpretation: Copy + Send + Sync + 'static {
     fn value<const BITS: u32>(raw: u32) -> i32;
+
+    /// [`Interpretation::value`] of each i32 lane of `raw`.
+    ///
+    /// # Safety
+    /// The caller's tier has 256-bit integer vectors.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn values8<const BITS: u32>(raw: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
+        use std::arch::x86_64::*;
+        let mut lanes = [0u32; 8];
+        unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast(), raw) };
+        let values = lanes.map(|lane| Self::value::<BITS>(lane));
+        unsafe { _mm256_loadu_si256(values.as_ptr().cast()) }
+    }
 }
 
 impl Interpretation for Unsigned {
     #[inline(always)]
     fn value<const BITS: u32>(raw: u32) -> i32 {
         raw as i32
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn values8<const BITS: u32>(raw: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
+        raw
     }
 }
 
@@ -589,12 +1058,27 @@ impl Interpretation for Twos {
     fn value<const BITS: u32>(raw: u32) -> i32 {
         ((raw << (32 - BITS)) as i32) >> (32 - BITS)
     }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn values8<const BITS: u32>(raw: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
+        use std::arch::x86_64::*;
+        let shift = _mm_cvtsi32_si128(32 - BITS as i32);
+        unsafe { _mm256_sra_epi32(_mm256_sll_epi32(raw, shift), shift) }
+    }
 }
 
 impl<const C: i32> Interpretation for Offset<C> {
     #[inline(always)]
     fn value<const BITS: u32>(raw: u32) -> i32 {
         raw as i32 - C
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn values8<const BITS: u32>(raw: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
+        use std::arch::x86_64::*;
+        unsafe { _mm256_sub_epi32(raw, _mm256_set1_epi32(C)) }
     }
 }
 
@@ -633,6 +1117,13 @@ pub trait Codes: Copy + Send + Sync + 'static {
     const LEAST: i32;
     const GREATEST: i32;
 
+    /// Where an `mma16` tile's codes are 4-bit lanes (with a high plane of
+    /// `HIGH` bits a code, at most 2) whose joined raw code `r` is the value
+    /// `r + offset`: `(HIGH, offset)`, which a 16-row tile's quantized dot
+    /// reads with no unpermuting (`Hier::dot_tile16`). None for any other
+    /// codes.
+    const NIBBLE_LANES: Option<(u32, i32)> = None;
+
     /// The values of packet `at`, in element order.
     ///
     /// # Safety
@@ -651,6 +1142,31 @@ pub trait Codes: Copy + Send + Sync + 'static {
         unsafe { [vld1q_s8(values.as_ptr()), vld1q_s8(values.as_ptr().add(16))] }
     }
 
+    /// [`Codes::neon`] of packet `at` and the next, `at` the first of a
+    /// k-block's two (an even packet of its storage group, which holds whole
+    /// k-blocks): one read where a layout keeps a k-block's together
+    /// (`mma16`).
+    ///
+    /// # Safety
+    /// As [`Codes::values`], of both packets.
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[inline(always)]
+    unsafe fn neon_pair(at: At) -> [[std::arch::aarch64::int8x16_t; 2]; 2] {
+        unsafe { [Self::neon(at), Self::neon(at.packet(at.packet + 1))] }
+    }
+
+    /// [`Codes::neon_pair`] of the same packet of rows `g` and `g + 8` of
+    /// an `mma16` tile (`Row::partners`): one read of their shared bytes
+    /// where the codes lie in its lanes.
+    ///
+    /// # Safety
+    /// As [`Codes::neon_pair`], of both rows.
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[inline(always)]
+    unsafe fn neon_partners(g: At, partner: At) -> [[[std::arch::aarch64::int8x16_t; 2]; 2]; 2] {
+        unsafe { [Self::neon_pair(g), Self::neon_pair(partner)] }
+    }
+
     /// The values in one register.
     ///
     /// # Safety
@@ -660,6 +1176,27 @@ pub trait Codes: Copy + Send + Sync + 'static {
     unsafe fn x86(at: At) -> std::arch::x86_64::__m256i {
         let values = unsafe { Self::values(at) };
         unsafe { packed_x86::load(values.as_ptr()) }
+    }
+
+    /// [`Codes::x86`] of packet `at` and the next, as [`Codes::neon_pair`].
+    ///
+    /// # Safety
+    /// As [`Codes::x86`], of both packets.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86_pair(at: At) -> [std::arch::x86_64::__m256i; 2] {
+        unsafe { [Self::x86(at), Self::x86(at.packet(at.packet + 1))] }
+    }
+
+    /// [`Codes::x86_pair`] of rows `g` and `g + 8`, as
+    /// [`Codes::neon_partners`].
+    ///
+    /// # Safety
+    /// As [`Codes::x86_pair`], of both rows.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86_partners(g: At, partner: At) -> [[std::arch::x86_64::__m256i; 2]; 2] {
+        unsafe { [Self::x86_pair(g), Self::x86_pair(partner)] }
     }
 
     /// The values minus [`Codes::LEAST`] in one register, as unsigned bytes.
@@ -685,6 +1222,36 @@ pub struct Planes<const LOW: u32, const HIGH: u32, I, const LEAST: i32, const GR
     PhantomData<I>,
 );
 
+/// Lane `t` and slot pair `b` holding column `k` of a 16-column step of an
+/// `mma16` codes plane (`Lanes`).
+const fn lane_slot(k: usize) -> (usize, usize) {
+    ((k % 8) / 2, k / 8 + 2 * (k % 2))
+}
+
+/// The packet's raw `bits`-bit codes (`bits` dividing 8) of an `mma16`
+/// codes plane, in element order.
+#[inline(always)]
+unsafe fn lane_codes(lanes: Lanes, bits: usize) -> [u8; PACKET] {
+    let mask = ((1u16 << bits) - 1) as u8;
+    let mut codes = [0u8; PACKET];
+    for (c, code) in codes.iter_mut().enumerate() {
+        let (step, (t, b)) = (c / 16, lane_slot(c % 16));
+        let bit = bits * (2 * b + lanes.upper as usize);
+        let byte = unsafe { *lanes.lane(t).add(bits * step + bit / 8) };
+        *code = (byte >> (bit % 8)) & mask;
+    }
+    codes
+}
+
+/// The bytes a code plane `at` lies in keeps together (`At::code`).
+#[inline(always)]
+fn packet_bytes(at: At, role: RowPlaneRole) -> *const u8 {
+    match at.code(role) {
+        CodeBytes::Packet(bytes) => bytes,
+        CodeBytes::Lanes(_) => unreachable!("a code plane keeps its packet together or none does"),
+    }
+}
+
 impl<const LOW: u32, const HIGH: u32, I, const LEAST: i32, const GREATEST: i32>
     Planes<LOW, HIGH, I, LEAST, GREATEST>
 {
@@ -697,24 +1264,6 @@ impl<const LOW: u32, const HIGH: u32, I, const LEAST: i32, const GREATEST: i32>
         (LEAST, GREATEST)
     };
 
-    /// The packet's `4 LOW` low-plane bytes.
-    #[inline(always)]
-    unsafe fn low_bytes(at: At) -> *const u8 {
-        unsafe {
-            at.plane(RowPlaneRole::Codes)
-                .add(4 * LOW as usize * at.packet)
-        }
-    }
-
-    /// The packet's `4 HIGH` high-plane bytes.
-    #[inline(always)]
-    unsafe fn high_bytes(at: At) -> *const u8 {
-        unsafe {
-            at.plane(RowPlaneRole::High)
-                .add(4 * HIGH as usize * at.packet)
-        }
-    }
-
     /// The packet's raw codes.
     #[inline(always)]
     unsafe fn raw(at: At) -> [u8; PACKET] {
@@ -724,11 +1273,26 @@ impl<const LOW: u32, const HIGH: u32, I, const LEAST: i32, const GREATEST: i32>
                 "a 1-, 2- or 4-bit low plane and a high plane of at most 2 bits"
             )
         };
+        let mut codes = [0u8; PACKET];
+        if at.in_lanes() {
+            let [low, high] = at.lanes_and_high();
+            codes = unsafe { lane_codes(low, LOW as usize) };
+            if HIGH > 0 {
+                let high = unsafe { lane_codes(high, HIGH as usize) };
+                for (code, high) in codes.iter_mut().zip(high) {
+                    *code |= high << LOW;
+                }
+            }
+            return codes;
+        }
         let mut bytes = [0u8; 16];
         unsafe {
-            std::ptr::copy_nonoverlapping(Self::low_bytes(at), bytes.as_mut_ptr(), 4 * LOW as usize)
+            std::ptr::copy_nonoverlapping(
+                packet_bytes(at, RowPlaneRole::Codes),
+                bytes.as_mut_ptr(),
+                4 * LOW as usize,
+            )
         };
-        let mut codes = [0u8; PACKET];
         // Code `(8 / LOW) i + j` is bits `LOW j ..` of byte `i`.
         if LOW == 4 {
             for (i, byte) in bytes.iter().enumerate() {
@@ -749,9 +1313,10 @@ impl<const LOW: u32, const HIGH: u32, I, const LEAST: i32, const GREATEST: i32>
             }
         }
         if HIGH > 0 {
+            let high_bytes = packet_bytes(at, RowPlaneRole::High);
             let high: u64 = match HIGH {
-                1 => u64::from(unsafe { read::<u32>(Self::high_bytes(at)) }),
-                _ => unsafe { read(Self::high_bytes(at)) },
+                1 => u64::from(unsafe { read::<u32>(high_bytes) }),
+                _ => unsafe { read(high_bytes) },
             };
             let mask = (1u64 << HIGH) - 1;
             for (i, code) in codes.iter_mut().enumerate() {
@@ -770,11 +1335,20 @@ impl<const LOW: u32, const HIGH: u32, I, const LEAST: i32, const GREATEST: i32>
                 "a 2-bit high plane joins a nibble low plane"
             )
         };
-        let low = unsafe { Self::low_bytes(at) };
+        if at.in_lanes() {
+            let [low, high] = at.lanes_and_high();
+            let codes = unsafe { packed_neon::lane_codes::<LOW>(low) };
+            return match HIGH {
+                0 => codes,
+                _ => unsafe { packed_neon::with_high::<LOW>(codes, high, HIGH) },
+            };
+        }
+        let low = packet_bytes(at, RowPlaneRole::Codes);
+        let high = || packet_bytes(at, RowPlaneRole::High);
         match HIGH {
             0 => unsafe { packed_neon::codes::<LOW>(low, 0) },
-            1 => unsafe { packed_neon::codes::<LOW>(low, read(Self::high_bytes(at))) },
-            _ => unsafe { packed_neon::nibbles2(low, Self::high_bytes(at)) },
+            1 => unsafe { packed_neon::codes::<LOW>(low, read(high())) },
+            _ => unsafe { packed_neon::nibbles2(low, high()) },
         }
     }
 
@@ -787,11 +1361,123 @@ impl<const LOW: u32, const HIGH: u32, I, const LEAST: i32, const GREATEST: i32>
                 "a 2-bit high plane joins a nibble low plane"
             )
         };
-        let low = unsafe { Self::low_bytes(at) };
+        if at.in_lanes() {
+            let [low, high] = at.lanes_and_high();
+            let codes = unsafe { packed_x86::lane_codes::<LOW>(low) };
+            return match HIGH {
+                0 => codes,
+                _ => unsafe { packed_x86::with_high::<LOW>(codes, high, HIGH) },
+            };
+        }
+        let low = packet_bytes(at, RowPlaneRole::Codes);
+        let high = || packet_bytes(at, RowPlaneRole::High);
         match HIGH {
             0 => unsafe { packed_x86::codes::<LOW>(low) },
-            1 => unsafe { packed_x86::codes1::<LOW>(low, read(Self::high_bytes(at))) },
-            _ => unsafe { packed_x86::nibbles2(low, Self::high_bytes(at)) },
+            1 => unsafe { packed_x86::codes1::<LOW>(low, read(high())) },
+            _ => unsafe { packed_x86::nibbles2(low, high()) },
+        }
+    }
+
+    /// [`Self::raw_neon`] of packet `at` and the next (`Codes::neon_pair`):
+    /// an `mma16` k-block's nibble lanes read once (lanes of narrower codes
+    /// are read packet by packet, [`packed_neon::lane_codes`]).
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[inline(always)]
+    unsafe fn raw_neon_pair(at: At) -> [[std::arch::aarch64::int8x16_t; 2]; 2] {
+        if !at.in_lanes() || LOW != 4 {
+            return unsafe { [Self::raw_neon(at), Self::raw_neon(at.packet(at.packet + 1))] };
+        }
+        let [low, high] = at.lanes_and_high();
+        let codes = unsafe { packed_neon::block_nibbles(low) };
+        match HIGH {
+            0 => codes,
+            _ => unsafe {
+                [
+                    packed_neon::with_high::<LOW>(codes[0], Lanes { half: 0, ..high }, HIGH),
+                    packed_neon::with_high::<LOW>(codes[1], Lanes { half: 1, ..high }, HIGH),
+                ]
+            },
+        }
+    }
+
+    /// [`Self::raw_x86`] of packet `at` and the next, as
+    /// [`Self::raw_neon_pair`].
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn raw_x86_pair(at: At) -> [std::arch::x86_64::__m256i; 2] {
+        if !at.in_lanes() || LOW != 4 {
+            return unsafe { [Self::raw_x86(at), Self::raw_x86(at.packet(at.packet + 1))] };
+        }
+        let [low, high] = at.lanes_and_high();
+        match HIGH {
+            0 => unsafe { packed_x86::block_nibbles(low) },
+            _ => unsafe {
+                let codes = packed_x86::block_nibbles(low);
+                [
+                    packed_x86::with_high::<LOW>(codes[0], Lanes { half: 0, ..high }, HIGH),
+                    packed_x86::with_high::<LOW>(codes[1], Lanes { half: 1, ..high }, HIGH),
+                ]
+            },
+        }
+    }
+
+    /// [`Self::raw_neon_pair`] of rows `g` and `g + 8` (`Codes::neon_partners`):
+    /// their shared nibble lanes read once.
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[inline(always)]
+    unsafe fn raw_neon_partners(g: At, partner: At) -> [[[std::arch::aarch64::int8x16_t; 2]; 2]; 2] {
+        if !g.in_lanes() || LOW != 4 {
+            return unsafe { [Self::raw_neon_pair(g), Self::raw_neon_pair(partner)] };
+        }
+        let [low, high] = g.lanes_and_high();
+        let codes = unsafe { packed_neon::block_partners(low) };
+        match HIGH {
+            0 => codes,
+            _ => {
+                let [_, partner_high] = partner.lanes_and_high();
+                unsafe {
+                    [
+                        [
+                            packed_neon::with_high::<LOW>(codes[0][0], Lanes { half: 0, ..high }, HIGH),
+                            packed_neon::with_high::<LOW>(codes[0][1], Lanes { half: 1, ..high }, HIGH),
+                        ],
+                        [
+                            packed_neon::with_high::<LOW>(codes[1][0], Lanes { half: 0, ..partner_high }, HIGH),
+                            packed_neon::with_high::<LOW>(codes[1][1], Lanes { half: 1, ..partner_high }, HIGH),
+                        ],
+                    ]
+                }
+            }
+        }
+    }
+
+    /// [`Self::raw_x86_pair`] of rows `g` and `g + 8`, as
+    /// [`Self::raw_neon_partners`].
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn raw_x86_partners(g: At, partner: At) -> [[std::arch::x86_64::__m256i; 2]; 2] {
+        if !g.in_lanes() || LOW != 4 {
+            return unsafe { [Self::raw_x86_pair(g), Self::raw_x86_pair(partner)] };
+        }
+        let [low, high] = g.lanes_and_high();
+        let codes = unsafe { packed_x86::block_partners(low) };
+        match HIGH {
+            0 => codes,
+            _ => {
+                let [_, partner_high] = partner.lanes_and_high();
+                unsafe {
+                    [
+                        [
+                            packed_x86::with_high::<LOW>(codes[0][0], Lanes { half: 0, ..high }, HIGH),
+                            packed_x86::with_high::<LOW>(codes[0][1], Lanes { half: 1, ..high }, HIGH),
+                        ],
+                        [
+                            packed_x86::with_high::<LOW>(codes[1][0], Lanes { half: 0, ..partner_high }, HIGH),
+                            packed_x86::with_high::<LOW>(codes[1][1], Lanes { half: 1, ..partner_high }, HIGH),
+                        ],
+                    ]
+                }
+            }
         }
     }
 }
@@ -801,6 +1487,7 @@ impl<const LOW: u32, const HIGH: u32, const LEAST: i32, const GREATEST: i32> Cod
 {
     const LEAST: i32 = Self::DOMAIN.0;
     const GREATEST: i32 = Self::DOMAIN.1;
+    const NIBBLE_LANES: Option<(u32, i32)> = if LOW == 4 && HIGH <= 2 { Some((HIGH, 0)) } else { None };
 
     #[inline(always)]
     unsafe fn values(at: At) -> [i8; PACKET] {
@@ -818,10 +1505,34 @@ impl<const LOW: u32, const HIGH: u32, const LEAST: i32, const GREATEST: i32> Cod
         unsafe { Self::raw_neon(at) }
     }
 
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[inline(always)]
+    unsafe fn neon_pair(at: At) -> [[std::arch::aarch64::int8x16_t; 2]; 2] {
+        unsafe { Self::raw_neon_pair(at) }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[inline(always)]
+    unsafe fn neon_partners(g: At, partner: At) -> [[[std::arch::aarch64::int8x16_t; 2]; 2]; 2] {
+        unsafe { Self::raw_neon_partners(g, partner) }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn x86(at: At) -> std::arch::x86_64::__m256i {
         unsafe { Self::raw_x86(at) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86_pair(at: At) -> [std::arch::x86_64::__m256i; 2] {
+        unsafe { Self::raw_x86_pair(at) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86_partners(g: At, partner: At) -> [[std::arch::x86_64::__m256i; 2]; 2] {
+        unsafe { Self::raw_x86_partners(g, partner) }
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -836,6 +1547,7 @@ impl<const LOW: u32, const HIGH: u32, const C: i32, const LEAST: i32, const GREA
 {
     const LEAST: i32 = Self::DOMAIN.0;
     const GREATEST: i32 = Self::DOMAIN.1;
+    const NIBBLE_LANES: Option<(u32, i32)> = if LOW == 4 && HIGH <= 2 { Some((HIGH, -C)) } else { None };
 
     #[inline(always)]
     unsafe fn values(at: At) -> [i8; PACKET] {
@@ -855,12 +1567,59 @@ impl<const LOW: u32, const HIGH: u32, const C: i32, const LEAST: i32, const GREA
         unsafe { Self::raw_neon(at) }.map(|codes| unsafe { vsubq_s8(codes, offset) })
     }
 
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[inline(always)]
+    unsafe fn neon_pair(at: At) -> [[std::arch::aarch64::int8x16_t; 2]; 2] {
+        use std::arch::aarch64::*;
+        let offset = unsafe { vdupq_n_s8(C as i8) };
+        unsafe { Self::raw_neon_pair(at) }.map(|packet| packet.map(|codes| unsafe { vsubq_s8(codes, offset) }))
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[inline(always)]
+    unsafe fn neon_partners(g: At, partner: At) -> [[[std::arch::aarch64::int8x16_t; 2]; 2]; 2] {
+        use std::arch::aarch64::*;
+        let offset = unsafe { vdupq_n_s8(C as i8) };
+        let mut codes = unsafe { Self::raw_neon_partners(g, partner) };
+        for row in &mut codes {
+            for packet in row {
+                for half in packet {
+                    *half = unsafe { vsubq_s8(*half, offset) };
+                }
+            }
+        }
+        codes
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn x86(at: At) -> std::arch::x86_64::__m256i {
         use std::arch::x86_64::*;
         let offset = _mm256_set1_epi8(C as i8);
         unsafe { _mm256_sub_epi8(Self::raw_x86(at), offset) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86_pair(at: At) -> [std::arch::x86_64::__m256i; 2] {
+        use std::arch::x86_64::*;
+        let offset = _mm256_set1_epi8(C as i8);
+        let [first, second] = unsafe { Self::raw_x86_pair(at) };
+        unsafe { [_mm256_sub_epi8(first, offset), _mm256_sub_epi8(second, offset)] }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86_partners(g: At, partner: At) -> [[std::arch::x86_64::__m256i; 2]; 2] {
+        use std::arch::x86_64::*;
+        let offset = _mm256_set1_epi8(C as i8);
+        let [[a, b], [c, d]] = unsafe { Self::raw_x86_partners(g, partner) };
+        unsafe {
+            [
+                [_mm256_sub_epi8(a, offset), _mm256_sub_epi8(b, offset)],
+                [_mm256_sub_epi8(c, offset), _mm256_sub_epi8(d, offset)],
+            ]
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -896,6 +1655,25 @@ impl<const LOW: u32, const HIGH: u32, const K: i32, const LEAST: i32, const GREA
             .map(|codes| unsafe { vaddq_s8(vaddq_s8(codes, codes), offset) })
     }
 
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[inline(always)]
+    unsafe fn neon_pair(at: At) -> [[std::arch::aarch64::int8x16_t; 2]; 2] {
+        use std::arch::aarch64::*;
+        let offset = unsafe { vdupq_n_s8((1 - 2 * K) as i8) };
+        unsafe { Self::raw_neon_pair(at) }
+            .map(|packet| packet.map(|codes| unsafe { vaddq_s8(vaddq_s8(codes, codes), offset) }))
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[inline(always)]
+    unsafe fn neon_partners(g: At, partner: At) -> [[[std::arch::aarch64::int8x16_t; 2]; 2]; 2] {
+        use std::arch::aarch64::*;
+        let offset = unsafe { vdupq_n_s8((1 - 2 * K) as i8) };
+        unsafe { Self::raw_neon_partners(g, partner) }.map(|row| {
+            row.map(|packet| packet.map(|codes| unsafe { vaddq_s8(vaddq_s8(codes, codes), offset) }))
+        })
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn x86(at: At) -> std::arch::x86_64::__m256i {
@@ -907,6 +1685,25 @@ impl<const LOW: u32, const HIGH: u32, const K: i32, const LEAST: i32, const GREA
                 _mm256_set1_epi8((1 - 2 * K) as i8),
             )
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86_pair(at: At) -> [std::arch::x86_64::__m256i; 2] {
+        use std::arch::x86_64::*;
+        let offset = _mm256_set1_epi8((1 - 2 * K) as i8);
+        unsafe { Self::raw_x86_pair(at) }
+            .map(|codes| unsafe { _mm256_add_epi8(_mm256_add_epi8(codes, codes), offset) })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86_partners(g: At, partner: At) -> [[std::arch::x86_64::__m256i; 2]; 2] {
+        use std::arch::x86_64::*;
+        let offset = _mm256_set1_epi8((1 - 2 * K) as i8);
+        unsafe { Self::raw_x86_partners(g, partner) }.map(|row| {
+            row.map(|codes| unsafe { _mm256_add_epi8(_mm256_add_epi8(codes, codes), offset) })
+        })
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -960,10 +1757,56 @@ impl<const ID: usize, const LEAST: i32, const GREATEST: i32> Codes
             .map(|codes| unsafe { vqtbl1q_s8(table, vreinterpretq_u8_s8(codes)) })
     }
 
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[inline(always)]
+    unsafe fn neon_pair(at: At) -> [[std::arch::aarch64::int8x16_t; 2]; 2] {
+        use std::arch::aarch64::*;
+        let table = unsafe { vld1q_s8(Table::<ID>::VALUES.as_ptr()) };
+        unsafe { Self::raw_neon_pair(at) }
+            .map(|packet| packet.map(|codes| unsafe { vqtbl1q_s8(table, vreinterpretq_u8_s8(codes)) }))
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+    #[inline(always)]
+    unsafe fn neon_partners(g: At, partner: At) -> [[[std::arch::aarch64::int8x16_t; 2]; 2]; 2] {
+        use std::arch::aarch64::*;
+        let table = unsafe { vld1q_s8(Table::<ID>::VALUES.as_ptr()) };
+        let mut codes = unsafe { Self::raw_neon_partners(g, partner) };
+        for row in &mut codes {
+            for packet in row {
+                for half in packet {
+                    *half = unsafe { vqtbl1q_s8(table, vreinterpretq_u8_s8(*half)) };
+                }
+            }
+        }
+        codes
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn x86(at: At) -> std::arch::x86_64::__m256i {
         unsafe { packed_x86::lookup(packed_x86::table(&Table::<ID>::VALUES), Self::raw_x86(at)) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86_pair(at: At) -> [std::arch::x86_64::__m256i; 2] {
+        let table = unsafe { packed_x86::table(&Table::<ID>::VALUES) };
+        let [first, second] = unsafe { Self::raw_x86_pair(at) };
+        unsafe { [packed_x86::lookup(table, first), packed_x86::lookup(table, second)] }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86_partners(g: At, partner: At) -> [[std::arch::x86_64::__m256i; 2]; 2] {
+        let table = unsafe { packed_x86::table(&Table::<ID>::VALUES) };
+        let [[a, b], [c, d]] = unsafe { Self::raw_x86_partners(g, partner) };
+        unsafe {
+            [
+                [packed_x86::lookup(table, a), packed_x86::lookup(table, b)],
+                [packed_x86::lookup(table, c), packed_x86::lookup(table, d)],
+            ]
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -979,21 +1822,32 @@ impl<const LEAST: i32, const GREATEST: i32> Codes for Planes<8, 0, Twos, LEAST, 
 
     #[inline(always)]
     unsafe fn values(at: At) -> [i8; PACKET] {
-        unsafe { read(Self::low_bytes(at)) }
+        match at.code(RowPlaneRole::Codes) {
+            CodeBytes::Packet(bytes) => unsafe { read(bytes) },
+            CodeBytes::Lanes(lanes) => unsafe { lane_codes(lanes, 8) }.map(|code| code as i8),
+        }
     }
 
     #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
     #[inline(always)]
     unsafe fn neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
         use std::arch::aarch64::*;
-        let bytes = unsafe { Self::low_bytes(at) }.cast::<i8>();
-        unsafe { [vld1q_s8(bytes), vld1q_s8(bytes.add(16))] }
+        match at.code(RowPlaneRole::Codes) {
+            CodeBytes::Packet(bytes) => unsafe {
+                let bytes = bytes.cast::<i8>();
+                [vld1q_s8(bytes), vld1q_s8(bytes.add(16))]
+            },
+            CodeBytes::Lanes(lanes) => unsafe { packed_neon::lane_bytes(lanes) },
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn x86(at: At) -> std::arch::x86_64::__m256i {
-        unsafe { packed_x86::load(Self::low_bytes(at).cast()) }
+        match at.code(RowPlaneRole::Codes) {
+            CodeBytes::Packet(bytes) => unsafe { packed_x86::load(bytes.cast()) },
+            CodeBytes::Lanes(lanes) => unsafe { packed_x86::lane_bytes(lanes) },
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1006,8 +1860,8 @@ impl<const LEAST: i32, const GREATEST: i32> Codes for Planes<8, 0, Twos, LEAST, 
 
 /// Grid codes (`registry::GridCodes`): entries of grid `GRID` (its position
 /// in `tables::GRIDS`), one per eight values, their `BYTES` whole bytes in
-/// the codes plane and their `HIGH` further bits in the high plane (entry
-/// `e`'s at bit `HIGH e` of its storage group's). An entry holds `8 / lanes`
+/// the codes plane and their `HIGH` further bits in the high plane
+/// ([`grid_entry`]). An entry holds `8 / lanes`
 /// `INDEX_BITS`-bit point indices, first lowest, then the sign bits of
 /// `registry::GridSigns::ALL[SIGNS]`, then delta `D`'s bit. The value at
 /// lane `j` of an entry is byte `j % lanes` of its point `j / lanes`,
@@ -1090,31 +1944,41 @@ impl<
         (LEAST, GREATEST)
     };
 
-    /// Entry `e` of the storage group of `at`.
-    #[inline(always)]
-    unsafe fn entry(at: At, e: usize) -> u32 {
-        let at_entry = unsafe { at.plane(RowPlaneRole::Codes).add(BYTES * e) };
-        (0..BYTES).fold(0, |entry, byte| {
-            entry | (u32::from(unsafe { *at_entry.add(byte) }) << (8 * byte))
-        }) | unsafe { Self::high(at, e) }
-    }
+}
 
-    /// The high bits of entry `e` of the storage group of `at`, at the
-    /// entry's bit `8 BYTES`.
-    #[inline(always)]
-    unsafe fn high(at: At, e: usize) -> u32 {
-        const { assert!(HIGH <= 8, "an entry's high bits lie within two bytes") };
-        if HIGH == 0 {
-            return 0;
-        }
-        let bit = HIGH as usize * e;
-        let high = unsafe { at.plane(RowPlaneRole::High).add(bit / 8) };
-        let mut bits = u32::from(unsafe { *high });
-        if bit % 8 + HIGH as usize > 8 {
-            bits |= u32::from(unsafe { *high.add(1) }) << 8;
-        }
-        ((bits >> (bit % 8)) & ((1 << HIGH) - 1)) << (8 * BYTES)
+/// Entry `e` (of four) of the packet of `at`: its `BYTES` whole bytes in its
+/// grids or records plane, then its `HIGH` further bits ([`grid_high`]) from
+/// bit `8 BYTES`.
+#[inline(always)]
+unsafe fn grid_entry<const BYTES: usize, const HIGH: u32>(at: At, e: usize) -> u32 {
+    let bytes = at.entry(e, BYTES);
+    (0..BYTES).fold(0, |entry, byte| {
+        entry | (u32::from(unsafe { *bytes.add(byte) }) << (8 * byte))
+    }) | (unsafe { grid_high::<HIGH>(at, e) } << (8 * BYTES))
+}
+
+/// The `HIGH` further bits of entry `e` (of four) of the packet of `at`, in
+/// its grid high plane (`RowPlaneContent::GridHigh`, placed as its grids
+/// plane is): a packet's are whole bytes ([`packet_bytes`]), entry `e`'s at
+/// their bit `HIGH e`.
+#[inline(always)]
+unsafe fn grid_high<const HIGH: u32>(at: At, e: usize) -> u32 {
+    const {
+        assert!(
+            HIGH <= 8 && HIGH % 2 == 0,
+            "a packet's further entry bits are whole bytes, an entry's within two"
+        )
+    };
+    if HIGH == 0 {
+        return 0;
     }
+    let bit = HIGH as usize * e;
+    let high = packet_bytes(at, RowPlaneRole::High).wrapping_add(bit / 8);
+    let mut bits = u32::from(unsafe { *high });
+    if bit % 8 + HIGH as usize > 8 {
+        bits |= u32::from(unsafe { *high.add(1) }) << 8;
+    }
+    (bits >> (bit % 8)) & ((1 << HIGH) - 1)
 }
 
 /// The eight values one grid entry gives: `point`'s bytes (byte `j` lane
@@ -1151,7 +2015,7 @@ impl<
         let mask = (1u32 << INDEX_BITS) - 1;
         let mut values = [0i8; PACKET];
         for e in 0..PACKET / 8 {
-            let entry = unsafe { Self::entry(at, 4 * at.packet + e) };
+            let entry = unsafe { grid_entry::<BYTES, HIGH>(at, e) };
             // The point and the entry's bits past its indices.
             let (point, rest) = match Self::POINTS {
                 tables::GridPoints::Lanes8(points) => {
@@ -1378,6 +2242,16 @@ pub trait Coefficients: Copy + Send + Sync + 'static {
         packets: usize,
         x: [&Q8Block; M],
     ) -> [[f32; M]; R];
+
+    /// [`Format::dot_q8_tiles`] of rows whose codes are `C`.
+    ///
+    /// # Safety
+    /// As [`Format::dot_q8_tiles`].
+    #[inline(always)]
+    unsafe fn dot_q8_tiles<C: Codes, V: Vectors>(first: *const u8, geometry: &RowGeometry, x: &[Q8Block], k: usize, out: &mut [f32]) -> bool {
+        let _ = (first, geometry, x, k, out);
+        false
+    }
 }
 
 /// The activation code sum of values `16 h .. 16 h + 16` of packet `local`
@@ -1388,6 +2262,136 @@ fn activation_sum(x: &Q8Block, local: usize, half: usize, whole: bool) -> i32 {
         i32::from(x.sums[2 * local]) + i32::from(x.sums[2 * local + 1])
     } else {
         i32::from(x.sums[2 * local + half])
+    }
+}
+
+/// The sum of the eight i32 lanes of `lanes`.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn sum_lanes(lanes: std::arch::x86_64::__m256i) -> i32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let half = _mm_add_epi32(_mm256_castsi256_si128(lanes), _mm256_extracti128_si256::<1>(lanes));
+        let pair = _mm_add_epi32(half, _mm_shuffle_epi32::<0b01_00_11_10>(half));
+        _mm_cvtsi128_si32(_mm_add_epi32(pair, _mm_shuffle_epi32::<0b10_11_00_01>(pair)))
+    }
+}
+
+/// A k-block's 64 activation codes at `x` in the byte order of an `mma16`
+/// lane pair's code bytes (`Hier::dot_tile16`): register `p` holds lanes
+/// `2p` and `2p + 1`, byte `16t + 4s + j` column `16s + [2t, 2t + 8, 2t +
+/// 1, 2t + 9][j]`.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn permuted_activations(x: *const i8) -> [std::arch::x86_64::__m256i; 2] {
+    use std::arch::x86_64::*;
+    // The byte of step `s` of lane `t` taking column `c` of the step, or
+    // none (0x80).
+    const fn masks() -> [[[i8; 32]; 4]; 2] {
+        let mut masks = [[[-128i8; 32]; 4]; 2];
+        let mut pair = 0;
+        while pair < 2 {
+            let mut s = 0;
+            while s < 4 {
+                let mut half = 0;
+                while half < 2 {
+                    let t = 2 * pair + half;
+                    let columns = [2 * t, 2 * t + 8, 2 * t + 1, 2 * t + 9];
+                    let mut j = 0;
+                    while j < 4 {
+                        masks[pair][s][16 * half + 4 * s + j] = columns[j] as i8;
+                        j += 1;
+                    }
+                    half += 1;
+                }
+                s += 1;
+            }
+            pair += 1;
+        }
+        masks
+    }
+    const MASKS: [[[i8; 32]; 4]; 2] = masks();
+    // Loops, not closures: a closure would not take the caller's target
+    // features, and its intrinsics would not inline.
+    let mut out = [unsafe { _mm256_setzero_si256() }; 2];
+    for s in 0..4 {
+        unsafe {
+            let step = _mm256_broadcastsi128_si256(_mm_loadu_si128(x.add(16 * s).cast()));
+            for pair in 0..2 {
+                out[pair] = _mm256_or_si256(out[pair], _mm256_shuffle_epi8(step, _mm256_loadu_si256(MASKS[pair][s].as_ptr().cast())));
+            }
+        }
+    }
+    out
+}
+
+/// The high bits of an `mma16` lane pair's codes at `bytes` (`high` bits a
+/// code: a lane's step of `high` bytes, slot `q` at bit `high q`), shifted
+/// to bit 4, in the byte order of its low nibbles (`permuted_activations`'):
+/// row `g`'s (slot `2j` of byte `j`'s step), then row `g + 8`'s (slot
+/// `2j + 1`).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn high_bits(bytes: *const u8, high: u32) -> [std::arch::x86_64::__m256i; 2] {
+    use std::arch::x86_64::*;
+    unsafe {
+        match high {
+            1 => {
+                // Lane t's step s is byte 4t + s; slot q is bit q.
+                const SPREAD: [i8; 32] = {
+                    let mut spread = [0i8; 32];
+                    let mut i = 0;
+                    while i < 32 {
+                        spread[i] = (4 * (i / 16) + (i % 16) / 4) as i8;
+                        i += 1;
+                    }
+                    spread
+                };
+                let lanes = _mm256_set1_epi64x(std::ptr::read_unaligned(bytes.cast::<i64>()));
+                let spread = _mm256_shuffle_epi8(lanes, _mm256_loadu_si256(SPREAD.as_ptr().cast()));
+                // Byte j of a step: bits 2j (row g) and 2j + 1 (row g + 8).
+                let mut rows = [_mm256_setzero_si256(); 2];
+                for (upper, first) in [1i32, 2].into_iter().enumerate() {
+                    let bits = _mm256_set1_epi32(first | first << 10 | first << 20 | first << 30);
+                    let set = _mm256_cmpeq_epi8(_mm256_and_si256(spread, bits), bits);
+                    rows[upper] = _mm256_and_si256(set, _mm256_set1_epi8(0x10));
+                }
+                rows
+            }
+            2 => {
+                // Lane t's step s is bytes 8t + 2s, +1; slot q is bits 2q,
+                // byte q / 4 of the step: byte j's slots 2j, 2j + 1 lie in
+                // the step's byte j / 2, at bits 4 (j % 2) and 4 (j % 2) + 2.
+                const SPREAD: [i8; 32] = {
+                    let mut spread = [0i8; 32];
+                    let mut i = 0;
+                    while i < 32 {
+                        let (t, s, j) = (i / 16, (i % 16) / 4, i % 4);
+                        spread[i] = (8 * t + 2 * s + j / 2) as i8;
+                        i += 1;
+                    }
+                    spread
+                };
+                const ODD: [i8; 32] = {
+                    let mut odd = [0i8; 32];
+                    let mut i = 0;
+                    while i < 32 {
+                        odd[i] = if i % 2 == 1 { -1 } else { 0 };
+                        i += 1;
+                    }
+                    odd
+                };
+                let lanes = _mm256_broadcastsi128_si256(_mm_loadu_si128(bytes.cast()));
+                let spread = _mm256_shuffle_epi8(lanes, _mm256_loadu_si256(SPREAD.as_ptr().cast()));
+                // Odd bytes j take the step byte's upper nibble.
+                let nibbles = _mm256_blendv_epi8(spread, _mm256_srli_epi16::<4>(spread), _mm256_loadu_si256(ODD.as_ptr().cast()));
+                let two = _mm256_set1_epi8(0x03);
+                let first = _mm256_and_si256(nibbles, two);
+                let second = _mm256_and_si256(_mm256_srli_epi16::<2>(nibbles), two);
+                [_mm256_slli_epi16::<4>(first), _mm256_slli_epi16::<4>(second)]
+            }
+            _ => unreachable!("a high plane of at most 2 bits"),
+        }
     }
 }
 
@@ -1813,6 +2817,26 @@ pub trait Locals: Copy + Send + Sync + 'static {
     /// The groups' bias term, if any.
     const BIAS: Option<LocalBias>;
 
+    /// Whether [`Locals::x86_groups`] decodes the codes as vectors.
+    const X86_GROUPS: bool = false;
+
+    /// The (scale, bias) codes' values of every `GROUP`-value coefficient
+    /// group of the storage group of `at`, as vectors of i32 lanes in group
+    /// order (groups `0..8` in `[0]`, `8..16` in `[1]`): `[scales,
+    /// biases]`, the bias codes 0 without a bias. None without a vector
+    /// form ([`Locals::X86_GROUPS`]).
+    ///
+    /// # Safety
+    /// `scales` is the storage group's scales field (`At::plane` of
+    /// `RowPlaneRole::Scales`); the caller's tier has 256-bit integer
+    /// vectors.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86_groups<const GROUP: usize>(scales: *const u8) -> Option<[[std::arch::x86_64::__m256i; 2]; 2]> {
+        let _ = scales;
+        None
+    }
+
     /// The (scale, bias) codes' values of `GROUP`-value coefficient group
     /// `local` of the storage group of `at`; the bias code is 0 without a
     /// bias.
@@ -1906,6 +2930,61 @@ impl<L: Interpretation, const BITS: u32, B: PlaneBias> Scales<L, BITS, B> {
 
 impl<L: Interpretation, const BITS: u32, B: PlaneBias> Locals for Scales<L, BITS, B> {
     const BIAS: Option<LocalBias> = B::BIAS;
+    // Each group's field within three bytes from its first.
+    const X86_GROUPS: bool = Self::WIDTH <= 17;
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn x86_groups<const GROUP: usize>(scales: *const u8) -> Option<[[std::arch::x86_64::__m256i; 2]; 2]> {
+        use std::arch::x86_64::*;
+        if !Self::X86_GROUPS {
+            return None;
+        }
+        let groups = Q8_BLOCK / GROUP;
+        let bytes = (groups * Self::WIDTH).div_ceil(8);
+        let mut fields = [0u8; 16];
+        unsafe { std::ptr::copy_nonoverlapping(scales, fields.as_mut_ptr(), bytes.min(16)) };
+        // Lane `i` of vector `v` takes group `8v + i`'s field: its first
+        // byte and the next two as the lane's low bytes, shifted down by its
+        // first bit's place in its first byte.
+        let (select, shifts) = const {
+            let groups = Q8_BLOCK / GROUP;
+            let mut select = [[-128i8; 32]; 2];
+            let mut shifts = [[0i32; 8]; 2];
+            let mut group = 0;
+            while group < groups && group < 16 {
+                let (vector, lane) = (group / 8, group % 8);
+                let bit = group * Self::WIDTH;
+                let mut byte = 0;
+                while byte < 3 {
+                    let at = bit / 8 + byte;
+                    if at < 16 {
+                        select[vector][4 * lane + byte] = at as i8;
+                    }
+                    byte += 1;
+                }
+                shifts[vector][lane] = (bit % 8) as i32;
+                group += 1;
+            }
+            (select, shifts)
+        };
+        let mask = unsafe { _mm256_set1_epi32((1 << BITS) - 1) };
+        let mut out = [[unsafe { _mm256_setzero_si256() }; 2]; 2];
+        unsafe {
+            let fields = _mm256_broadcastsi128_si256(_mm_loadu_si128(fields.as_ptr().cast()));
+            for vector in 0..groups.div_ceil(8) {
+                let field = _mm256_srlv_epi32(
+                    _mm256_shuffle_epi8(fields, _mm256_loadu_si256(select[vector].as_ptr().cast())),
+                    _mm256_loadu_si256(shifts[vector].as_ptr().cast()),
+                );
+                out[0][vector] = L::values8::<BITS>(_mm256_and_si256(field, mask));
+                if Self::MINIMUM {
+                    out[1][vector] = L::values8::<BITS>(_mm256_and_si256(_mm256_srl_epi32(field, _mm_cvtsi32_si128(BITS as i32)), mask));
+                }
+            }
+        }
+        Some(out)
+    }
 
     #[inline(always)]
     unsafe fn block<const GROUP: usize>(at: At) -> [[(i32, i32); 2]; 8] {
@@ -2002,25 +3081,22 @@ impl<
     #[inline(always)]
     unsafe fn read<const GROUP: usize>(at: At, local: usize) -> (i32, i32) {
         let width = (BITS + B::SIGN_BITS) as usize;
-        let code = if (BIT as usize) < 8 * ENTRY_BYTES {
-            let entries = unsafe {
-                at.plane(RowPlaneRole::Codes)
-                    .add(ENTRY_BYTES * (GROUP / 8) * local)
+        // The group's entries from its first, four a packet: bit `j` of the
+        // code at entry bit `BIT` of entry `j`, in its whole bytes or past
+        // them in its further bits (`grid_entry`).
+        let first = (GROUP / 8) * local;
+        let code = (0..width).fold(0u32, |code, j| {
+            let entry = first + j;
+            let at = at.packet(entry / 4);
+            let bit = if (BIT as usize) < 8 * ENTRY_BYTES {
+                let byte = unsafe { *at.entry(entry % 4, ENTRY_BYTES).add(BIT as usize / 8) };
+                u32::from(byte) >> (BIT % 8)
+            } else {
+                let high = unsafe { grid_high::<HIGH>(at, entry % 4) };
+                high >> (BIT as usize - 8 * ENTRY_BYTES)
             };
-            let (byte, bit) = (BIT as usize / 8, BIT % 8);
-            (0..width).fold(0u32, |code, j| {
-                code | (((u32::from(unsafe { *entries.add(ENTRY_BYTES * j + byte) }) >> bit) & 1)
-                    << j)
-            })
-        } else {
-            // Entry `e`'s bit is high-plane bit `HIGH e + BIT - 8 ENTRY_BYTES`.
-            let high = at.plane(RowPlaneRole::High);
-            let first = HIGH as usize * (GROUP / 8) * local + BIT as usize - 8 * ENTRY_BYTES;
-            (0..width).fold(0u32, |code, j| {
-                let bit = first + HIGH as usize * j;
-                code | (((u32::from(unsafe { *high.add(bit / 8) }) >> (bit % 8)) & 1) << j)
-            })
-        };
+            code | ((bit & 1) << j)
+        });
         let scale = L::value::<BITS>(code & ((1 << BITS) - 1));
         let bias = if B::SIGN_BITS == 0 {
             0
@@ -2136,31 +3212,40 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         [first, second]
     }
 
-    /// One row's [`Coefficients::dot_q8`] over the block's first
-    /// `packets` packets, with the activation blocks' code sums `sums`.
+    /// [`Coefficients::dot_q8`] of `N` rows over the block's first `packets`
+    /// packets, with the activation blocks' code sums `sums`: one row, or
+    /// rows `g` and `g + 8` of an `mma16` tile (`Row::partners`), whose
+    /// shared code bytes each k-block reads once for both
+    /// (`Codes::neon_partners`).
     #[inline(always)]
-    unsafe fn dot_row<C: Codes, const M: usize, V: Vectors>(
-        row: &Row,
+    unsafe fn dot_rows<C: Codes, const N: usize, const M: usize, V: Vectors>(
+        rows: [&Row; N],
         b: usize,
         packets: usize,
         x: [&Q8Block; M],
         sums: &[[[i32; 2]; 8]; M],
-    ) -> [f32; M] {
+    ) -> [[f32; M]; N] {
+        const { assert!(N == 1 || N == 2, "a row or a row pair") };
         let halves = const { groups_per_packet(GROUP) };
         let whole = halves == 1;
-        let group = At::group(row, b);
+        let groups = rows.map(|row| At::group(row, b));
         // The block's codes, read once: the minimum terms', and the scale
         // codes that x86 broadcasts from memory (a load operand). NEON reads
         // each packet's scale codes where used instead: its broadcast from a
         // general register replaces the block's round trip through memory.
-        let codes = unsafe { L::block::<GROUP>(group) };
-        let mut scaled = [0i32; M];
-        let mut minimums = [0i32; M];
+        let mut codes = [unsafe { L::block::<GROUP>(groups[0]) }; N];
+        for n in 1..N {
+            codes[n] = unsafe { L::block::<GROUP>(groups[n]) };
+        }
+        let mut scaled = [[0i32; M]; N];
+        let mut minimums = [[0i32; M]; N];
         if Self::BIASED {
-            for m in 0..M {
-                for local in packets_of(packets) {
-                    for h in 0..halves {
-                        minimums[m] += codes[local][h].1 * sums[m][local][h];
+            for n in 0..N {
+                for m in 0..M {
+                    for local in packets_of(packets) {
+                        for h in 0..halves {
+                            minimums[n][m] += codes[n][local][h].1 * sums[m][local][h];
+                        }
                     }
                 }
             }
@@ -2171,37 +3256,52 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
             // Each half accumulates in its own lanes: one multiply-add per
             // half, which the compiler cannot reassociate into a multiply,
             // a multiply-add and an add.
-            let mut lanes = [[vdupq_n_s32(0); 2]; M];
-            for local in packets_of(packets) {
-                let weights = C::neon(group.packet(local));
-                let [first_code, second_code] = Self::packet_scales(group.packet(local));
-                let zero = vdupq_n_s32(0);
-                for (lanes, x) in lanes.iter_mut().zip(x.iter()) {
-                    let activations = x.codes[PACKET * local..].as_ptr();
-                    let (first, second) = (vld1q_s8(activations), vld1q_s8(activations.add(16)));
-                    if whole {
-                        let products = packed_neon::sdot(
-                            packed_neon::sdot(zero, weights[0], first),
-                            weights[1],
-                            second,
-                        );
-                        lanes[0] = vmlaq_n_s32(lanes[0], products, first_code);
-                    } else {
-                        lanes[0] = vmlaq_n_s32(
-                            lanes[0],
-                            packed_neon::sdot(zero, weights[0], first),
-                            first_code,
-                        );
-                        lanes[1] = vmlaq_n_s32(
-                            lanes[1],
-                            packed_neon::sdot(zero, weights[1], second),
-                            second_code,
-                        );
+            let mut lanes = [[[vdupq_n_s32(0); 2]; M]; N];
+            // A k-block's two packets read together (`Codes::neon_pair`;
+            // the group's packets are whole k-blocks), of both rows of a
+            // pair at once.
+            for pair in packets_of(packets.div_ceil(2)) {
+                let first = 2 * pair;
+                let weights: [[[int8x16_t; 2]; 2]; N] = if N == 2 {
+                    let both = C::neon_partners(groups[0].packet(first), groups[N - 1].packet(first));
+                    std::array::from_fn(|n| both[n])
+                } else {
+                    [C::neon_pair(groups[0].packet(first)); N]
+                };
+                for n in 0..N {
+                    for (local, weights) in (first..(first + 2).min(packets)).zip(weights[n]) {
+                        let [first_code, second_code] = Self::packet_scales(groups[n].packet(local));
+                        let zero = vdupq_n_s32(0);
+                        for (lanes, x) in lanes[n].iter_mut().zip(x.iter()) {
+                            let activations = x.codes[PACKET * local..].as_ptr();
+                            let (first, second) = (vld1q_s8(activations), vld1q_s8(activations.add(16)));
+                            if whole {
+                                let products = packed_neon::sdot(
+                                    packed_neon::sdot(zero, weights[0], first),
+                                    weights[1],
+                                    second,
+                                );
+                                lanes[0] = vmlaq_n_s32(lanes[0], products, first_code);
+                            } else {
+                                lanes[0] = vmlaq_n_s32(
+                                    lanes[0],
+                                    packed_neon::sdot(zero, weights[0], first),
+                                    first_code,
+                                );
+                                lanes[1] = vmlaq_n_s32(
+                                    lanes[1],
+                                    packed_neon::sdot(zero, weights[1], second),
+                                    second_code,
+                                );
+                            }
+                        }
                     }
                 }
             }
-            for (scaled, [first, second]) in scaled.iter_mut().zip(lanes) {
-                *scaled += vaddvq_s32(vaddq_s32(first, second));
+            for (scaled, lanes) in scaled.iter_mut().zip(lanes) {
+                for (scaled, [first, second]) in scaled.iter_mut().zip(lanes) {
+                    *scaled += vaddvq_s32(vaddq_s32(first, second));
+                }
             }
         }
         #[cfg(target_arch = "x86_64")]
@@ -2210,55 +3310,74 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
                 use std::arch::x86_64::*;
                 // The pair products take one 16-bit scale code per half.
                 let unsigned = unsigned::<C>(128);
-                let mut lanes = [_mm256_setzero_si256(); M];
-                for local in packets_of(packets) {
-                    let (first, second) = (codes[local][0].0, codes[local][1].0);
-                    let scales = if whole {
-                        _mm256_set1_epi16(first as i16)
+                let mut lanes = [[_mm256_setzero_si256(); M]; N];
+                // A k-block's two packets read together (`Codes::x86_pair`;
+                // the group's packets are whole k-blocks), of both rows of a
+                // pair at once.
+                for pair in packets_of(packets.div_ceil(2)) {
+                    let first = 2 * pair;
+                    let weights: [[__m256i; 2]; N] = if N == 2 {
+                        let both = C::x86_partners(groups[0].packet(first), groups[N - 1].packet(first));
+                        std::array::from_fn(|n| both[n])
                     } else {
-                        _mm256_set_m128i(
-                            _mm_set1_epi16(second as i16),
-                            _mm_set1_epi16(first as i16),
-                        )
+                        [C::x86_pair(groups[0].packet(first)); N]
                     };
-                    let weights = C::x86(group.packet(local));
-                    let magnitudes = _mm256_abs_epi8(weights);
-                    for m in 0..M {
-                        let activations = packed_x86::load(x[m].codes.as_ptr().add(PACKET * local));
-                        lanes[m] = if unsigned {
-                            packed_x86::dot_scaled(lanes[m], weights, activations, scales)
-                        } else {
-                            packed_x86::dot_scaled(
-                                lanes[m],
-                                magnitudes,
-                                _mm256_sign_epi8(activations, weights),
-                                scales,
-                            )
-                        };
+                    for n in 0..N {
+                        for (local, weights) in (first..(first + 2).min(packets)).zip(weights[n]) {
+                            let (first, second) = (codes[n][local][0].0, codes[n][local][1].0);
+                            let scales = if whole {
+                                _mm256_set1_epi16(first as i16)
+                            } else {
+                                _mm256_set_m128i(
+                                    _mm_set1_epi16(second as i16),
+                                    _mm_set1_epi16(first as i16),
+                                )
+                            };
+                            let magnitudes = _mm256_abs_epi8(weights);
+                            for m in 0..M {
+                                let activations =
+                                    packed_x86::load(x[m].codes.as_ptr().add(PACKET * local));
+                                lanes[n][m] = if unsigned {
+                                    packed_x86::dot_scaled(lanes[n][m], weights, activations, scales)
+                                } else {
+                                    packed_x86::dot_scaled(
+                                        lanes[n][m],
+                                        magnitudes,
+                                        _mm256_sign_epi8(activations, weights),
+                                        scales,
+                                    )
+                                };
+                            }
+                        }
                     }
                 }
                 for (scaled, lanes) in scaled.iter_mut().zip(lanes) {
-                    *scaled += packed_x86::sum(lanes);
+                    for (scaled, lanes) in scaled.iter_mut().zip(lanes) {
+                        *scaled += packed_x86::sum(lanes);
+                    }
                 }
             }
         }
         #[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
         if !(cfg!(target_arch = "x86_64") && V::QUANTIZED_DOTS >= 1) {
-            for local in packets_of(packets) {
-                let values = unsafe { C::values(group.packet(local)) };
-                let exact = scalar_dots::<M, GROUP, V>(&values, x, local);
-                for m in 0..M {
-                    for h in 0..halves {
-                        scaled[m] += codes[local][h].0 * exact[m][h];
+            for n in 0..N {
+                for local in packets_of(packets) {
+                    let values = unsafe { C::values(groups[n].packet(local)) };
+                    let exact = scalar_dots::<M, GROUP, V>(&values, x, local);
+                    for m in 0..M {
+                        for h in 0..halves {
+                            scaled[n][m] += codes[n][local][h].0 * exact[m][h];
+                        }
                     }
                 }
             }
         }
-        let factors = unsafe { Self::factors(group) };
-        let mut out = [0.0f32; M];
-        for (((out, scaled), minimums), x) in out.iter_mut().zip(scaled).zip(minimums).zip(x.iter())
-        {
-            *out = x.d * Self::combine(factors, scaled, minimums);
+        let mut out = [[0.0f32; M]; N];
+        for n in 0..N {
+            let factors = unsafe { Self::factors(groups[n]) };
+            for m in 0..M {
+                out[n][m] = x[m].d * Self::combine(factors, scaled[n][m], minimums[n][m]);
+            }
         }
         out
     }
@@ -2266,7 +3385,7 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
     /// The eight rows of one rows8 tile (`Row::same_tile`, lane 0's
     /// at `row`) against one activation block, interleaved per packet so an
     /// activation packet loads once for the eight; each row's arithmetic is
-    /// [`Hier::dot_row`]'s.
+    /// [`Hier::dot_rows`]'s.
     #[cfg(any(
         all(target_arch = "aarch64", target_feature = "dotprod"),
         target_arch = "x86_64"
@@ -2380,6 +3499,212 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
         out
     }
 
+    /// [`Coefficients::dot_q8`] of the 16 rows of one `mma16` tile
+    /// (row 0 `row`, rows `stride` apart) of nibble-lane codes (`Codes::NIBBLE_LANES`)
+    /// against block `b` of the activations on x86, over whole k-blocks. A
+    /// k-block's 64 code bytes of row pair `g` hold, in byte `16t + 4s +
+    /// j`, row `g`'s code (low nibble) and row `g + 8`'s (high nibble) of
+    /// column `16s + [2t, 2t + 8, 2t + 1, 2t + 9][j]` (`code_bit`); so the
+    /// activations are permuted into that order (`activations`, once a call,
+    /// `permuted_activations`), and every pair's bytes are multiplied where
+    /// they lie, both rows at once, into each row's exact sum of every step
+    /// of 16 columns. Each row's coefficient codes are decoded as vectors
+    /// (`Locals::x86_groups`) and applied to its sixteen step sums, its
+    /// minimum and offset terms to the block's group sums (`groups`), all in
+    /// i32, then eight rows' factors read and combined at once, each lane's
+    /// arithmetic `Self::combine`'s: the result is [`Hier::dot_rows`]'s bit
+    /// for bit.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn dot_tile16<C: Codes>(
+        row: &Row,
+        stride: usize,
+        b: usize,
+        packets: usize,
+        x: &Q8Block,
+        activations: &[[std::arch::x86_64::__m256i; 2]],
+        groups: &[std::arch::x86_64::__m256i; 2],
+    ) -> [f32; 16] {
+        use std::arch::x86_64::*;
+        let (high, offset) = C::NIBBLE_LANES.expect("nibble lanes");
+        let blocks = packets / 2;
+        let mma16 = row.mma16.as_ref().expect("an mma16 tile");
+        let first = (mma16.first_packet + b * mma16.group_packets) / 2;
+        let [low_plane, high_plane] = &mma16.planes;
+        // Each k-block's lanes `4g ..4g + 4` of each code plane: together
+        // (`Row::lanes_whole`), wherever the k-block's lanes lie.
+        let mut low = [[std::ptr::null(); 8]; 4];
+        let mut highs = [[std::ptr::null(); 8]; 4];
+        for block in 0..blocks {
+            let lanes = 32 * (first + block);
+            for (plane, quads) in [(low_plane, &mut low[block]), (high_plane, &mut highs[block])].into_iter().take(1 + (high > 0) as usize) {
+                *quads = plane.quads(lanes);
+                // Lines read ahead, so a cold matrix streams instead of
+                // stalling a call at a time: this tile's next storage
+                // group's same lanes, which this call reads next, and the
+                // next tile's, which the next tile reads (a prefetch past
+                // the matrix is a hint, never a fault).
+                let next = plane.quads(lanes + 128);
+                for g in 0..8 {
+                    for at in [next[g], quads[g].wrapping_add(16 * plane.stride)] {
+                        unsafe { _mm_prefetch::<_MM_HINT_T0>(at.cast()) };
+                    }
+                }
+            }
+        }
+        // Each row's step sums, k-block `block`'s four in lanes `4 block`
+        // on: `[steps 0..8, steps 8..16]`. Two row pairs an iteration, so
+        // their loads and multiplies overlap.
+        let mut steps = [[unsafe { _mm_setzero_si128() }; 4]; 16];
+        for block in 0..blocks {
+            let activations = activations[block];
+            for pairs in 0..4 {
+                unsafe {
+                    let nibble = _mm256_set1_epi8(0x0f);
+                    let mut products = [[_mm256_setzero_si256(); 2]; 2];
+                    for half in 0..2 {
+                        for (pair, products) in products.iter_mut().enumerate() {
+                            let g = 2 * pairs + pair;
+                            // Lanes `4g + 2 half` and the next.
+                            let bytes = _mm256_loadu_si256(low[block][g].add(2 * half * low_plane.unit).cast());
+                            let mut first = _mm256_and_si256(bytes, nibble);
+                            let mut second = _mm256_and_si256(_mm256_srli_epi16::<4>(bytes), nibble);
+                            if high > 0 {
+                                let [first_high, second_high] = high_bits(highs[block][g].add(2 * half * high_plane.unit), high);
+                                first = _mm256_or_si256(first, first_high);
+                                second = _mm256_or_si256(second, second_high);
+                            }
+                            // Codes below 64 times activations of at most
+                            // 127: two products a pair and two pairs fit 16
+                            // bits.
+                            products[0] = _mm256_add_epi16(products[0], _mm256_maddubs_epi16(first, activations[half]));
+                            products[1] = _mm256_add_epi16(products[1], _mm256_maddubs_epi16(second, activations[half]));
+                        }
+                    }
+                    let ones = _mm256_set1_epi16(1);
+                    for (pair, products) in products.iter().enumerate() {
+                        for upper in 0..2 {
+                            // Lanes `[s0..s4 | s0..s4]` of lanes t and
+                            // t + 1: their halves added, the k-block's four
+                            // steps.
+                            let lanes = _mm256_madd_epi16(products[upper], ones);
+                            steps[2 * pairs + pair + 8 * upper][block] =
+                                _mm_add_epi32(_mm256_castsi256_si128(lanes), _mm256_extracti128_si256::<1>(lanes));
+                        }
+                    }
+                }
+            }
+        }
+        // Each row's coefficient terms in i32, then eight rows' factors and
+        // combine at once, each lane as `Self::combine` computes it.
+        let group = At::group(row, b);
+        let (scales_plane, supers) = (group.plane(RowPlaneRole::Scales), group.plane(RowPlaneRole::Supers));
+        let mut scaled = [0i32; 16];
+        let mut minimums = [0i32; 16];
+        for r in 0..16 {
+            unsafe {
+                let [scales, minimum_codes] = L::x86_groups::<GROUP>(scales_plane.add(r * stride)).expect("vector coefficient codes");
+                // Each step's scale code: a group of 32 is two steps.
+                let step_scales = if GROUP == 16 {
+                    scales
+                } else {
+                    [
+                        _mm256_permutevar8x32_epi32(scales[0], _mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3)),
+                        _mm256_permutevar8x32_epi32(scales[0], _mm256_setr_epi32(4, 4, 5, 5, 6, 6, 7, 7)),
+                    ]
+                };
+                let mut sum = _mm256_setzero_si256();
+                for (pair, step_scales) in step_scales.iter().enumerate() {
+                    let sums = _mm256_set_m128i(steps[r][2 * pair + 1], steps[r][2 * pair]);
+                    sum = _mm256_add_epi32(sum, _mm256_mullo_epi32(sums, *step_scales));
+                }
+                let mut terms = [_mm256_setzero_si256(); 2];
+                for half in 0..32 / GROUP {
+                    if offset != 0 {
+                        terms[0] = _mm256_add_epi32(terms[0], _mm256_mullo_epi32(scales[half], groups[half]));
+                    }
+                    if Self::BIASED {
+                        terms[1] = _mm256_add_epi32(terms[1], _mm256_mullo_epi32(minimum_codes[half], groups[half]));
+                    }
+                }
+                scaled[r] = sum_lanes(sum) + offset * sum_lanes(terms[0]);
+                minimums[r] = sum_lanes(terms[1]);
+            }
+        }
+        let mut out = [0.0f32; 16];
+        for eight in 0..2 {
+            unsafe {
+                let supers = supers.add(8 * eight * stride);
+                let factor = F::read8(supers, stride);
+                let scale = if CODE_EXPONENT == 0 && EXPONENT == 0 {
+                    factor
+                } else {
+                    let factor = if EXPONENT == 0 { factor } else { _mm256_mul_ps(factor, _mm256_set1_ps(const { power2(EXPONENT) })) };
+                    if CODE_EXPONENT == 0 { factor } else { _mm256_mul_ps(factor, _mm256_set1_ps(const { power2(CODE_EXPONENT) })) }
+                };
+                let at = |values: &[i32; 16]| _mm256_cvtepi32_ps(_mm256_loadu_si256(values.as_ptr().add(8 * eight).cast()));
+                let mut value = _mm256_mul_ps(scale, at(&scaled));
+                if Self::BIASED {
+                    let bias = match L::BIAS {
+                        Some(LocalBias::Minimum(_)) => {
+                            let minimum = F::read8(supers.add(F::BYTES), stride);
+                            if EXPONENT == 0 { minimum } else { _mm256_mul_ps(minimum, _mm256_set1_ps(const { power2(EXPONENT) })) }
+                        }
+                        Some(LocalBias::Signed { exponent }) => _mm256_mul_ps(factor, _mm256_set1_ps(power2(EXPONENT + exponent))),
+                        None => _mm256_setzero_ps(),
+                    };
+                    let term = _mm256_mul_ps(bias, at(&minimums));
+                    value = if Self::SUBTRACT { _mm256_sub_ps(value, term) } else { _mm256_add_ps(value, term) };
+                }
+                _mm256_storeu_ps(out.as_mut_ptr().add(8 * eight), _mm256_mul_ps(_mm256_set1_ps(x.d), value));
+            }
+        }
+        out
+    }
+
+    /// [`Coefficients::dot_q8_tiles`] on x86: every 16 rows of `out` a tile
+    /// (`Self::dot_tile16`), the activations permuted and the group sums
+    /// formed once for every tile, each tile's blocks summed in block order
+    /// as [`dot_q8_rows`].
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn tiles16<C: Codes>(row: &Row, stride: usize, x: &[Q8Block], k: usize, out: &mut [f32]) {
+        use std::arch::x86_64::*;
+        // Blocks a chunk at a time, on the stack: each chunk's activations
+        // permuted and group sums formed once for every tile.
+        const CHUNK: usize = 8;
+        out.fill(0.0);
+        for (chunk, blocks) in x.chunks(CHUNK).enumerate() {
+            let mut activations = [[unsafe { _mm256_setzero_si256() }; 2]; 4 * CHUNK];
+            let mut groups = [[unsafe { _mm256_setzero_si256() }; 2]; CHUNK];
+            for (index, block) in blocks.iter().enumerate() {
+                for kblock in 0..4 {
+                    activations[4 * index + kblock] = unsafe { permuted_activations(block.codes.as_ptr().add(64 * kblock)) };
+                }
+                // The block's activation code sum of each coefficient group.
+                groups[index] = unsafe {
+                    let sums = _mm256_loadu_si256(block.sums.as_ptr().cast());
+                    if GROUP == 16 {
+                        [_mm256_cvtepi16_epi32(_mm256_castsi256_si128(sums)), _mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(sums))]
+                    } else {
+                        [_mm256_madd_epi16(sums, _mm256_set1_epi16(1)), _mm256_setzero_si256()]
+                    }
+                };
+            }
+            for (tile, out) in out.chunks_exact_mut(16).enumerate() {
+                let first = row.shifted(16 * tile * stride);
+                for (index, block) in blocks.iter().enumerate() {
+                    let b = CHUNK * chunk + index;
+                    let packets = block_packets(b, k).len();
+                    let values = unsafe { Self::dot_tile16::<C>(&first, stride, b, packets, block, &activations[4 * index..], &groups[index]) };
+                    for (sum, value) in out.iter_mut().zip(values) {
+                        *sum += value;
+                    }
+                }
+            }
+        }
+    }
+
     /// [`Coefficients::dot_q8`] over the block's first `packets` packets.
     #[inline(always)]
     unsafe fn dot_block<C: Codes, const R: usize, const M: usize, V: Vectors>(
@@ -2414,10 +3739,19 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
             }
             return out;
         }
-        // Row by row, each whole.
         let mut out = [[0.0f32; M]; R];
+        // An mma16 tile's row pairs, each pair's shared bytes read once.
+        if Row::partners(rows) {
+            for g in 0..R / 2 {
+                let [first, second] =
+                    unsafe { Self::dot_rows::<C, 2, M, V>([&rows[g], &rows[g + R / 2]], b, packets, x, &sums) };
+                (out[g], out[g + R / 2]) = (first, second);
+            }
+            return out;
+        }
+        // Row by row, each whole.
         for (out, row) in out.iter_mut().zip(rows) {
-            *out = unsafe { Self::dot_row::<C, M, V>(row, b, packets, x, &sums) };
+            [*out] = unsafe { Self::dot_rows::<C, 1, M, V>([row], b, packets, x, &sums) };
         }
         out
     }
@@ -2458,6 +3792,31 @@ impl<F: Scale, const EXPONENT: i32, const CODE_EXPONENT: i32, L: Locals, const G
     Coefficients for Hier<F, EXPONENT, CODE_EXPONENT, L, GROUP>
 {
     const BIASED: bool = L::BIAS.is_some();
+
+    /// On x86 with quantized dots, `mma16` tiles of nibble-lane codes
+    /// (`Codes::NIBBLE_LANES`) whose coefficient codes decode as vectors
+    /// (`Locals::X86_GROUPS`), from a tile's first row, in matrices of whole
+    /// tiles, over whole k-blocks ([`Hier::tiles16`]).
+    #[inline(always)]
+    unsafe fn dot_q8_tiles<C: Codes, V: Vectors>(first: *const u8, geometry: &RowGeometry, x: &[Q8Block], k: usize, out: &mut [f32]) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        if V::QUANTIZED_DOTS >= 1
+            && C::NIBBLE_LANES.is_some()
+            && L::X86_GROUPS
+            && (GROUP == 16 || GROUP == 32)
+            && k % 64 == 0
+            && geometry.matrix_rows % 16 == 0
+            && out.len() % 16 == 0
+        {
+            let row = geometry.row(first);
+            if row.lanes_whole() && row.mma16.as_ref().is_some_and(|mma16| mma16.row == 0) {
+                unsafe { Self::tiles16::<C>(&row, geometry.stride, x, k, out) };
+                return true;
+            }
+        }
+        let _ = (first, geometry, x, k, out);
+        false
+    }
 
     #[inline(always)]
     unsafe fn decode<const STORAGE: usize>(at: At) -> [(f32, f32); 2] {
@@ -2546,6 +3905,11 @@ impl<C: Codes, K: Coefficients, const STORAGE: usize> Format for PackedRows<C, K
     ) -> [[f32; M]; R] {
         let packets = block_packets(b, k).len();
         unsafe { K::dot_q8::<C, STORAGE, R, M, V>(rows, b, packets, x) }
+    }
+
+    #[inline(always)]
+    unsafe fn dot_q8_tiles<V: Vectors>(first: *const u8, geometry: &RowGeometry, x: &[Q8Block], k: usize, out: &mut [f32]) -> bool {
+        unsafe { K::dot_q8_tiles::<C, V>(first, geometry, x, k, out) }
     }
 }
 
@@ -2754,6 +4118,241 @@ mod packed_neon {
             ]
         }
     }
+
+    use super::{lane_order, Lanes};
+
+    /// Each step's columns in element order, in a table of the four lanes'
+    /// bytes (`lane_order`): of the whole k-block for 4-bit codes (a byte a
+    /// slot pair), a 1-bit plane (a byte a step) and a 2-bit plane (two
+    /// bytes a step), each before its packet's half's steps; of the
+    /// packet's steps for 8-bit codes (two bytes a slot pair, before the
+    /// row's slot).
+    const STEP_ORDER: [u8; 16] = lane_order(4, 0, 1, 1)[0];
+    const BYTES: [[u8; 16]; 2] = lane_order(16, 8, 2, 1);
+    const ONE_BIT: [[u8; 16]; 2] = lane_order(4, 1, 0, 1);
+    const TWO_BITS: [[u8; 16]; 2] = lane_order(8, 2, 1, 2);
+    /// Per column, its slot pair's bit of a 1-bit step byte (the pair's
+    /// first slot), and its shift in its byte of a 2-bit step word.
+    const ONE_BIT_MASKS: [u8; 16] = {
+        let mut masks = [0u8; 16];
+        let mut k = 0;
+        while k < 16 {
+            masks[k] = 1 << (2 * super::lane_slot(k).1);
+            k += 1;
+        }
+        masks
+    };
+    const TWO_BIT_SHIFTS: [i8; 16] = {
+        let mut shifts = [0i8; 16];
+        let mut k = 0;
+        while k < 16 {
+            shifts[k] = -4 * (super::lane_slot(k).1 % 2) as i8;
+            k += 1;
+        }
+        shifts
+    };
+
+    /// Each step's table indices `order`, at the packet's half (`half`
+    /// steps of `step` bytes further).
+    #[inline(always)]
+    unsafe fn at_half(order: &[[u8; 16]; 2], half: usize, step: u8) -> [uint8x16_t; 2] {
+        unsafe {
+            let offset = vdupq_n_u8(2 * half as u8 * step);
+            [
+                vaddq_u8(vld1q_u8(order[0].as_ptr()), offset),
+                vaddq_u8(vld1q_u8(order[1].as_ptr()), offset),
+            ]
+        }
+    }
+
+    /// The row's 4-bit codes of an `mma16` codes plane in element order.
+    #[inline(always)]
+    pub(super) unsafe fn lane_nibbles(lanes: Lanes) -> [int8x16_t; 2] {
+        unsafe {
+            // Each lane's two steps of the packet, then each step's four
+            // lanes (`[t][b]`), in element order.
+            let steps = |pair: *const u8| {
+                vcombine_u8(vld1_u8(pair.add(8 * lanes.half)), vld1_u8(pair.add(lanes.unit + 8 * lanes.half)))
+            };
+            let (first, second) = (
+                vreinterpretq_u32_u8(steps(lanes.pairs[0])),
+                vreinterpretq_u32_u8(steps(lanes.pairs[1])),
+            );
+            let order = vld1q_u8(STEP_ORDER.as_ptr());
+            let bytes = [
+                vqtbl1q_u8(vreinterpretq_u8_u32(vuzp1q_u32(first, second)), order),
+                vqtbl1q_u8(vreinterpretq_u8_u32(vuzp2q_u32(first, second)), order),
+            ];
+            let nibble = |bytes: uint8x16_t| {
+                if lanes.upper {
+                    vshrq_n_u8(bytes, 4)
+                } else {
+                    vandq_u8(bytes, vdupq_n_u8(15))
+                }
+            };
+            [vreinterpretq_s8_u8(nibble(bytes[0])), vreinterpretq_s8_u8(nibble(bytes[1]))]
+        }
+    }
+
+    /// The four steps of an `mma16` 4-bit k-block of a row pair, each in
+    /// element order, both rows' codes in each byte (row `g` low, `g + 8`
+    /// high): the four lanes whole, their four steps transposed.
+    #[inline(always)]
+    unsafe fn block_steps(lanes: Lanes) -> [uint8x16_t; 4] {
+        unsafe {
+            let (first, second) = (vld1q_u8_x2(lanes.pairs[0]), vld1q_u8_x2(lanes.pairs[1]));
+            let words = |lane: uint8x16_t| vreinterpretq_u32_u8(lane);
+            let (l0, l1, l2, l3) = (words(first.0), words(first.1), words(second.0), words(second.1));
+            let (even01, odd01) = (vtrn1q_u32(l0, l1), vtrn2q_u32(l0, l1));
+            let (even23, odd23) = (vtrn1q_u32(l2, l3), vtrn2q_u32(l2, l3));
+            let quads = |words: uint32x4_t| vreinterpretq_u64_u32(words);
+            let order = vld1q_u8(STEP_ORDER.as_ptr());
+            let step = |low: uint32x4_t, high: uint32x4_t, second: bool| {
+                let words = if second {
+                    vtrn2q_u64(quads(low), quads(high))
+                } else {
+                    vtrn1q_u64(quads(low), quads(high))
+                };
+                vqtbl1q_u8(vreinterpretq_u8_u64(words), order)
+            };
+            [
+                step(even01, even23, false),
+                step(odd01, odd23, false),
+                step(even01, even23, true),
+                step(odd01, odd23, true),
+            ]
+        }
+    }
+
+    /// One row's nibbles of a step's bytes: the low (`g`) or the high
+    /// (`g + 8`).
+    #[inline(always)]
+    fn nibbles_of(bytes: uint8x16_t, upper: bool) -> int8x16_t {
+        unsafe {
+            vreinterpretq_s8_u8(if upper {
+                vshrq_n_u8(bytes, 4)
+            } else {
+                vandq_u8(bytes, vdupq_n_u8(15))
+            })
+        }
+    }
+
+    /// The row's 4-bit codes of both packets of an `mma16` k-block, each in
+    /// element order.
+    #[inline(always)]
+    pub(super) unsafe fn block_nibbles(lanes: Lanes) -> [[int8x16_t; 2]; 2] {
+        let [s0, s1, s2, s3] = unsafe { block_steps(lanes) };
+        let row = |step| nibbles_of(step, lanes.upper);
+        [[row(s0), row(s1)], [row(s2), row(s3)]]
+    }
+
+    /// [`block_nibbles`] of both rows of the pair (`g`, then `g + 8`), the
+    /// k-block's bytes read once.
+    #[inline(always)]
+    pub(super) unsafe fn block_partners(lanes: Lanes) -> [[[int8x16_t; 2]; 2]; 2] {
+        let [s0, s1, s2, s3] = unsafe { block_steps(lanes) };
+        [false, true].map(|upper| {
+            let row = |step| nibbles_of(step, upper);
+            [[row(s0), row(s1)], [row(s2), row(s3)]]
+        })
+    }
+
+    /// The row's `bits`-bit codes (1 or 2) of an `mma16` codes or high plane
+    /// in element order.
+    #[inline(always)]
+    unsafe fn lane_bits(lanes: Lanes, bits: u32) -> [uint8x16_t; 2] {
+        unsafe {
+            if bits == 1 {
+                let table = vcombine_u8(vld1_u8(lanes.pairs[0]), vld1_u8(lanes.pairs[1]));
+                let masks = vshlq_u8(vld1q_u8(ONE_BIT_MASKS.as_ptr()), vdupq_n_s8(lanes.upper as i8));
+                let one = vdupq_n_u8(1);
+                let order = at_half(&ONE_BIT, lanes.half, 1);
+                let bit = |order: uint8x16_t| vandq_u8(vtstq_u8(vqtbl1q_u8(table, order), masks), one);
+                [bit(order[0]), bit(order[1])]
+            } else {
+                let table = uint8x16x2_t(vld1q_u8(lanes.pairs[0]), vld1q_u8(lanes.pairs[1]));
+                let shifts = vsubq_s8(vld1q_s8(TWO_BIT_SHIFTS.as_ptr()), vdupq_n_s8(2 * lanes.upper as i8));
+                let three = vdupq_n_u8(3);
+                let order = at_half(&TWO_BITS, lanes.half, 2);
+                let pair = |order: uint8x16_t| vandq_u8(vshlq_u8(vqtbl2q_u8(table, order), shifts), three);
+                [pair(order[0]), pair(order[1])]
+            }
+        }
+    }
+
+    /// The row's `LOW`-bit codes (1, 2 or 4) of an `mma16` codes plane in
+    /// element order.
+    #[inline(always)]
+    pub(super) unsafe fn lane_codes<const LOW: u32>(lanes: Lanes) -> [int8x16_t; 2] {
+        match LOW {
+            4 => unsafe { lane_nibbles(lanes) },
+            _ => unsafe { lane_bits(lanes, LOW) }.map(|codes| unsafe { vreinterpretq_s8_u8(codes) }),
+        }
+    }
+
+    /// `codes` joined at bit `LOW` with the row's `bits`-bit codes (1 or 2)
+    /// of an `mma16` high plane.
+    #[inline(always)]
+    pub(super) unsafe fn with_high<const LOW: u32>(
+        codes: [int8x16_t; 2],
+        lanes: Lanes,
+        bits: u32,
+    ) -> [int8x16_t; 2] {
+        unsafe {
+            let high = lane_bits(lanes, bits);
+            let shift = vdupq_n_s8(LOW as i8);
+            [0, 1].map(|half| {
+                vreinterpretq_s8_u8(vorrq_u8(
+                    vreinterpretq_u8_s8(codes[half]),
+                    vshlq_u8(high[half], shift),
+                ))
+            })
+        }
+    }
+
+    /// The row's 8-bit codes of an `mma16` codes plane in element order.
+    #[inline(always)]
+    pub(super) unsafe fn lane_bytes(lanes: Lanes) -> [int8x16_t; 2] {
+        unsafe {
+            let table = uint8x16x4_t(
+                vld1q_u8(lanes.lane(0)),
+                vld1q_u8(lanes.lane(1)),
+                vld1q_u8(lanes.lane(2)),
+                vld1q_u8(lanes.lane(3)),
+            );
+            let upper = vdupq_n_u8(lanes.upper as u8);
+            [
+                vreinterpretq_s8_u8(vqtbl4q_u8(table, vaddq_u8(vld1q_u8(BYTES[0].as_ptr()), upper))),
+                vreinterpretq_s8_u8(vqtbl4q_u8(table, vaddq_u8(vld1q_u8(BYTES[1].as_ptr()), upper))),
+            ]
+        }
+    }
+}
+
+/// Per step `s` of a packet of an `mma16` codes plane, each column's index
+/// in the lanes' bytes of the packet's steps gathered lane by lane (`lane`
+/// bytes a lane, `step` a step): its lane's, its step's, then its slot
+/// pair `b`'s `b * numerator / denominator`.
+#[cfg_attr(
+    not(any(
+        all(target_arch = "aarch64", target_feature = "dotprod"),
+        target_arch = "x86_64"
+    )),
+    allow(dead_code)
+)]
+const fn lane_order(lane: usize, step: usize, numerator: usize, denominator: usize) -> [[u8; 16]; 2] {
+    let mut order = [[0u8; 16]; 2];
+    let mut s = 0;
+    while s < 2 {
+        let mut k = 0;
+        while k < 16 {
+            let (t, b) = lane_slot(k);
+            order[s][k] = (t * lane + s * step + b * numerator / denominator) as u8;
+            k += 1;
+        }
+        s += 1;
+    }
+    order
 }
 
 /// Register-resident packet dots for the x86 tiers with 256-bit integer
@@ -2994,6 +4593,224 @@ mod packed_x86 {
     pub(super) unsafe fn table(values: &[i8; 16]) -> __m256i {
         unsafe { _mm256_broadcastsi128_si256(_mm_loadu_si128(values.as_ptr().cast())) }
     }
+
+    use super::{lane_order, Lanes};
+
+    /// Per half (step `s`), each column's index in a half of the lanes'
+    /// step words gathered step by step (`steps`); in a lane's two step
+    /// words broadcast (a 1-bit plane), or its four (a 2-bit plane); and in
+    /// a lane's two step words of eight bytes, a slot pair's first byte
+    /// (8-bit codes: the step's four slots of the row, then the next
+    /// step's, `SELECT`).
+    const STEPS: [u8; 32] = halves(lane_order(4, 0, 1, 1));
+    const ONE_BIT: [u8; 32] = halves(lane_order(2, 1, 0, 1));
+    const TWO_BITS: [u8; 32] = halves(lane_order(4, 2, 1, 2));
+    const SELECT: [u8; 32] = {
+        let mut select = [0x80u8; 32];
+        let mut at = 0;
+        while at < 8 {
+            let (s, b) = (at / 4, at % 4);
+            select[at] = (s * 8 + 2 * b) as u8;
+            select[16 + at] = select[at];
+            at += 1;
+        }
+        select
+    };
+    /// Per column, its slot pair's bit of a 1-bit step byte, and whether
+    /// its code is in the high nibble of its byte of a 2-bit step word.
+    const ONE_BIT_MASKS: [u8; 32] = {
+        let mut masks = [0u8; 32];
+        let mut at = 0;
+        while at < 32 {
+            masks[at] = 1 << (2 * super::lane_slot(at % 16).1);
+            at += 1;
+        }
+        masks
+    };
+    const TWO_BIT_HIGH: [u8; 32] = {
+        let mut high = [0u8; 32];
+        let mut at = 0;
+        while at < 32 {
+            high[at] = if super::lane_slot(at % 16).1 % 2 == 1 { 0x80 } else { 0 };
+            at += 1;
+        }
+        high
+    };
+
+    /// Two 16-entry orders as the halves of one.
+    const fn halves(order: [[u8; 16]; 2]) -> [u8; 32] {
+        let mut both = [0u8; 32];
+        let mut at = 0;
+        while at < 16 {
+            both[at] = order[0][at];
+            both[16 + at] = order[1][at];
+            at += 1;
+        }
+        both
+    }
+
+    #[inline(always)]
+    unsafe fn constant(bytes: &[u8; 32]) -> __m256i {
+        unsafe { _mm256_loadu_si256(bytes.as_ptr().cast()) }
+    }
+
+    /// The packet's steps of lane `t`, as `T`.
+    #[inline(always)]
+    unsafe fn lane<T: Copy>(lanes: Lanes, t: usize) -> T {
+        unsafe { lanes.lane(t).cast::<T>().read_unaligned() }
+    }
+
+    /// Step words of four bytes, lane by lane (`[t0 s0, t0 s1, t1 s0, ..]`),
+    /// as the packet's columns in element order: step 0's words of every
+    /// lane in the low half, step 1's in the high, each half reordered
+    /// (`STEPS`).
+    #[inline(always)]
+    unsafe fn steps(words: __m256i, order: __m256i) -> __m256i {
+        unsafe { _mm256_shuffle_epi8(_mm256_permutevar8x32_epi32(words, order), constant(&STEPS)) }
+    }
+
+    /// Both packets of an `mma16` 4-bit k-block of a row pair, each in
+    /// element order, both rows' codes in each byte (row `g` low, `g + 8`
+    /// high): the four lanes whole, each step's words gathered.
+    #[inline(always)]
+    unsafe fn block_packets(lanes: Lanes) -> [__m256i; 2] {
+        unsafe {
+            // [t0 | t1] and [t2 | t3], each lane's four step words; then
+            // per half of the k-block [t0 s, t2 s, t0 s', t2 s' | t1 ..].
+            let first = _mm256_loadu_si256(lanes.pairs[0].cast());
+            let second = _mm256_loadu_si256(lanes.pairs[1].cast());
+            let order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+            [
+                steps(_mm256_unpacklo_epi32(first, second), order),
+                steps(_mm256_unpackhi_epi32(first, second), order),
+            ]
+        }
+    }
+
+    /// One row's nibbles of a packet's bytes: the low (`g`) or the high
+    /// (`g + 8`).
+    #[inline(always)]
+    unsafe fn nibbles_of(bytes: __m256i, upper: bool) -> __m256i {
+        unsafe {
+            let count = _mm_cvtsi32_si128(4 * upper as i32);
+            _mm256_and_si256(_mm256_srl_epi16(bytes, count), _mm256_set1_epi8(15))
+        }
+    }
+
+    /// The row's 4-bit codes of both packets of an `mma16` k-block, each in
+    /// element order.
+    #[inline(always)]
+    pub(super) unsafe fn block_nibbles(lanes: Lanes) -> [__m256i; 2] {
+        unsafe {
+            let [first, second] = block_packets(lanes);
+            [nibbles_of(first, lanes.upper), nibbles_of(second, lanes.upper)]
+        }
+    }
+
+    /// [`block_nibbles`] of both rows of the pair (`g`, then `g + 8`), the
+    /// k-block's bytes read once.
+    #[inline(always)]
+    pub(super) unsafe fn block_partners(lanes: Lanes) -> [[__m256i; 2]; 2] {
+        unsafe {
+            let [first, second] = block_packets(lanes);
+            [
+                [nibbles_of(first, false), nibbles_of(second, false)],
+                [nibbles_of(first, true), nibbles_of(second, true)],
+            ]
+        }
+    }
+
+    /// The row's 4-bit codes of an `mma16` codes plane in element order.
+    #[inline(always)]
+    pub(super) unsafe fn lane_nibbles(lanes: Lanes) -> __m256i {
+        unsafe {
+            // Lanes 0 and 1, and 2 and 3, whole; each lane's half of its
+            // steps a quadword: [t0, t2 | t1, t3].
+            let first = _mm256_loadu_si256(lanes.pairs[0].cast());
+            let second = _mm256_loadu_si256(lanes.pairs[1].cast());
+            let words = if lanes.half == 0 {
+                _mm256_unpacklo_epi64(first, second)
+            } else {
+                _mm256_unpackhi_epi64(first, second)
+            };
+            let shifted = _mm256_srl_epi16(words, _mm_cvtsi32_si128(4 * lanes.upper as i32));
+            let nibbles = _mm256_and_si256(shifted, _mm256_set1_epi8(15));
+            steps(nibbles, _mm256_setr_epi32(0, 4, 2, 6, 1, 5, 3, 7))
+        }
+    }
+
+    /// The row's `bits`-bit codes (1 or 2) of an `mma16` codes or high plane
+    /// in element order.
+    #[inline(always)]
+    unsafe fn lane_bits(lanes: Lanes, bits: u32) -> __m256i {
+        unsafe {
+            if bits == 1 {
+                let word = u64::from(lane::<u16>(lanes, 0))
+                    | (u64::from(lane::<u16>(lanes, 1)) << 16)
+                    | (u64::from(lane::<u16>(lanes, 2)) << 32)
+                    | (u64::from(lane::<u16>(lanes, 3)) << 48);
+                let bytes = _mm256_shuffle_epi8(_mm256_set1_epi64x(word as i64), constant(&ONE_BIT));
+                let base = constant(&ONE_BIT_MASKS);
+                let masks = if lanes.upper { _mm256_add_epi8(base, base) } else { base };
+                let set = _mm256_cmpeq_epi8(_mm256_and_si256(bytes, masks), masks);
+                _mm256_and_si256(set, _mm256_set1_epi8(1))
+            } else {
+                let words = _mm_setr_epi32(
+                    lane::<i32>(lanes, 0),
+                    lane::<i32>(lanes, 1),
+                    lane::<i32>(lanes, 2),
+                    lane::<i32>(lanes, 3),
+                );
+                let bytes = _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(words), constant(&TWO_BITS));
+                let shift = 2 * lanes.upper as i32;
+                let low = _mm256_srl_epi16(bytes, _mm_cvtsi32_si128(shift));
+                let high = _mm256_srl_epi16(bytes, _mm_cvtsi32_si128(shift + 4));
+                let picked = _mm256_blendv_epi8(low, high, constant(&TWO_BIT_HIGH));
+                _mm256_and_si256(picked, _mm256_set1_epi8(3))
+            }
+        }
+    }
+
+    /// The row's `LOW`-bit codes (1, 2 or 4) of an `mma16` codes plane in
+    /// element order.
+    #[inline(always)]
+    pub(super) unsafe fn lane_codes<const LOW: u32>(lanes: Lanes) -> __m256i {
+        match LOW {
+            4 => unsafe { lane_nibbles(lanes) },
+            _ => unsafe { lane_bits(lanes, LOW) },
+        }
+    }
+
+    /// `codes` joined at bit `LOW` with the row's `bits`-bit codes (1 or 2)
+    /// of an `mma16` high plane: each at most 3, so no shift crosses its
+    /// byte.
+    #[inline(always)]
+    pub(super) unsafe fn with_high<const LOW: u32>(codes: __m256i, lanes: Lanes, bits: u32) -> __m256i {
+        unsafe {
+            let high = _mm256_sll_epi16(lane_bits(lanes, bits), _mm_cvtsi32_si128(LOW as i32));
+            _mm256_or_si256(codes, high)
+        }
+    }
+
+    /// The row's 8-bit codes of an `mma16` codes plane in element order.
+    #[inline(always)]
+    pub(super) unsafe fn lane_bytes(lanes: Lanes) -> __m256i {
+        unsafe {
+            let select = _mm256_add_epi8(constant(&SELECT), _mm256_set1_epi8(lanes.upper as i8));
+            let (first, second) = (
+                _mm256_loadu2_m128i(lanes.lane(1).cast(), lanes.lane(0).cast()),
+                _mm256_loadu2_m128i(lanes.lane(3).cast(), lanes.lane(2).cast()),
+            );
+            let (first, second) = (
+                _mm256_shuffle_epi8(first, select),
+                _mm256_shuffle_epi8(second, select),
+            );
+            steps(
+                _mm256_unpacklo_epi64(first, second),
+                _mm256_setr_epi32(0, 4, 2, 6, 1, 5, 3, 7),
+            )
+        }
+    }
 }
 
 /// Integer dot of 32 signed weight values and signed activation codes.
@@ -3157,7 +4974,7 @@ pub unsafe fn dot_rows<W: Format, const R: usize, V: Vectors>(
     let mut storage = V::ZERO;
     let packet = V::packet(&mut storage);
     let rows =
-        std::array::from_fn::<_, R, _>(|r| geometry.row(rows.wrapping_add(r * geometry.stride)));
+        geometry.rows::<R>(rows);
     let full = k / PACKET;
     for p in 0..full {
         let xs: &[f32; PACKET] = x[p * PACKET..(p + 1) * PACKET]
@@ -3181,61 +4998,40 @@ pub unsafe fn dot_rows<W: Format, const R: usize, V: Vectors>(
 }
 
 /// The body of the quantized dot component: rows `0..R` (from `rows`,
-/// `geometry.stride` apart) of `k` values against quantized activations
-/// `x`, accumulating each row's block dots in block order.
+/// `geometry.stride` apart) of `k` values against the `M` activation rows
+/// quantized into `x` (`quant::blocks(k)` blocks each, row after row),
+/// activation-major: `[m][r]` accumulates row `r`'s block dots with
+/// activation row `m` in block order. One pass over the weight rows decodes
+/// every block's codes and coefficients once for all `M`
+/// ([`Format::dot_q8`]), whose sums are the same for every `M`: so every
+/// activation row's sums are the ones it has alone.
 ///
 /// # Safety
 /// `rows` addresses `R` rows of `W` with `geometry` and `k` values, and `x`
-/// holds `quant::blocks(k)` blocks.
+/// holds `quant::blocks(k)` blocks of each of `M` activation rows.
 #[inline(always)]
-pub unsafe fn dot_q8_rows<W: Format, const R: usize, V: Vectors>(
+pub unsafe fn dot_q8_rows<W: Format, const R: usize, const M: usize, V: Vectors>(
     rows: *const u8,
     geometry: &RowGeometry,
     x: &[Q8Block],
     k: usize,
-) -> [f32; R] {
-    let x = &x[..crate::quant::blocks(k)];
-    let rows =
-        std::array::from_fn::<_, R, _>(|r| geometry.row(rows.wrapping_add(r * geometry.stride)));
-    let mut sums = [0.0f32; R];
-    for (b, block) in x.iter().enumerate() {
-        let values = unsafe { W::dot_q8::<R, 1, V>(&rows, b, k, [block]) };
-        for (sum, value) in sums.iter_mut().zip(values) {
-            *sum += value[0];
-        }
-    }
-    sums
-}
-
-/// The body of the quantized GEMM component: eight rows (from `rows`,
-/// `geometry.stride` apart) of `k` values against four quantized activation
-/// rows (`x`, `quant::blocks(k)` blocks each), activation-major: `out[m][r]`
-/// accumulates row `r`'s block dots with activation row `m` in block order.
-///
-/// # Safety
-/// `rows` addresses eight rows of `W` with `geometry` and `k` values, and
-/// `x` holds `4 quant::blocks(k)` blocks.
-#[inline(always)]
-pub unsafe fn gemm_q8_rows<W: Format, V: Vectors>(
-    rows: *const u8,
-    geometry: &RowGeometry,
-    x: &[Q8Block],
-    k: usize,
-) -> [[f32; 8]; 4] {
+) -> [[f32; R]; M] {
     let blocks = crate::quant::blocks(k);
-    let mut accumulators = [[0.0f32; 8]; 4];
-    let rows =
-        std::array::from_fn::<_, 8, _>(|r| geometry.row(rows.wrapping_add(r * geometry.stride)));
+    let x: [&[Q8Block]; M] = std::array::from_fn(|m| &x[m * blocks..(m + 1) * blocks]);
+    let mut sums = [[0.0f32; R]; M];
+    if R == 16 && M == 1 && unsafe { W::dot_q8_tiles::<V>(rows, geometry, x[0], k, &mut sums[0]) } {
+        return sums;
+    }
+    let rows = geometry.rows::<R>(rows);
     for b in 0..blocks {
-        let activations = std::array::from_fn(|m| &x[m * blocks + b]);
-        for r in 0..8 {
-            let [products] = unsafe { W::dot_q8::<1, 4, V>(&[rows[r]], b, k, activations) };
-            for m in 0..4 {
-                accumulators[m][r] += products[m];
+        let values = unsafe { W::dot_q8::<R, M, V>(&rows, b, k, std::array::from_fn(|m| &x[m][b])) };
+        for (r, values) in values.iter().enumerate() {
+            for (sums, value) in sums.iter_mut().zip(values) {
+                sums[r] += value;
             }
         }
     }
-    accumulators
+    sums
 }
 
 #[cfg(test)]
@@ -3320,5 +5116,63 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every element a row conversion writes, in its own layout (the CPU's
+    /// and the devices' alike, tiles included), decodes through the CPU's
+    /// components to exactly the registry's decode of the converted bytes:
+    /// what a host reference that decodes such records natively (a CPU
+    /// site's admission) stands on.
+    #[test]
+    fn every_row_conversion_decodes_as_the_registry() {
+        use seismic_lang::interp::TensorData;
+        use seismic_lang::registry::ConversionLayout;
+        let tier = Tier::detected().unwrap();
+        let mut checked = 0;
+        for conversion in registry::representation_conversions() {
+            let ConversionLayout::Rows(layout) = conversion.destination_layout else {
+                continue;
+            };
+            let Some(operand) = crate::WeightOperand::of(tier, conversion.destination) else {
+                continue;
+            };
+            let name = registry::representation_info(conversion.destination).name;
+            // Whole tiles, and whole storage groups and source packets of
+            // 32 and 256 values.
+            let (rows, k) = (2 * layout.tile_rows() as usize, 768usize);
+            assert_eq!(k % layout.group() as usize, 0, "{name}");
+            let extents = [rows as u64, k as u64];
+            let length = registry::canonical_bytes(conversion.source, &extents)
+                .unwrap_or_else(|| panic!("{name}: no source bytes of {extents:?}"));
+            let mut state = 0x2545_f491_4f6c_dd1du64 ^ conversion.id.index() as u64;
+            let mut source = (0..length)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 24) as u8
+                })
+                .collect::<Vec<_>>();
+            conversion.finite_source(&mut source);
+            let converted = crate::repack::convert(conversion, &extents, &source).unwrap();
+            let reference = TensorData::encoded(conversion.destination, vec![rows, k], converted.clone())
+                .unwrap()
+                .values()
+                .unwrap();
+            // SAFETY: `converted` is the destination's canonical bytes of
+            // `extents`.
+            let weights = unsafe {
+                crate::Weights::from_tensor(converted.as_ptr(), &extents, &[k as u64, 1], operand)
+            };
+            let mut out = vec![0.0f32; k];
+            for row in 0..rows {
+                weights.decode_row(row, &mut out);
+                for (i, value) in out.iter().enumerate() {
+                    assert_eq!(f64::from(*value), reference[row * k + i], "{name} row {row} value {i}");
+                }
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no row conversion's element is read by the CPU");
     }
 }

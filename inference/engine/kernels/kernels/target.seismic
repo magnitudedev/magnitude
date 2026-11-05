@@ -22,24 +22,27 @@ fn gathered_bucket(row: i32, buckets: u32) -> u32:
 #   bucket's row is -1 when it is empty, which ends a probe, and -2 when its
 #   row left (a tombstone), which a probe passes. No empty bucket lies
 #   between a row's first bucket and its own, and at least one is empty.
-# A failed selection (-1) and a row without a slot read row 0; the step that
-# reads it is never used. Every reader of a gathered table addresses its rows
-# through this (`<backend>/lib/core/gathered.*`).
+# -1 is the one encoding of "no row". A selection that names no row (-1: a
+# failed selection, a launch row outside every batch slot) and a row without
+# a slot give -1, and the reader reads zeros: what a row reads never depends
+# on which rows a streamed table holds, and a table held whole reads the
+# same. Every reader of a gathered table addresses its rows through this
+# (`<backend>/lib/core/gathered.*`).
 fn gathered_row[R, F](directory: &tensor[R, F] i32, selected: i32) -> i32 where R >= 0 and F >= 1:
-    let mut row = max(selected, 0)
+    let mut row = max(selected, -1)
     if R > 0:
         if selected >= 0:
             if F == 1:
-                row = max(directory[selected, 0], 0)
+                row = directory[selected, 0]
             else:
-                row = 0
+                row = -1
                 let mut bucket = gathered_bucket(selected, u32(R))
                 let mut searching = 1
                 for probe in 0..R:
                     if searching == 1:
                         let key = directory[i32(bucket), 0]
                         if key == selected:
-                            row = max(directory[i32(bucket), 1], 0)
+                            row = directory[i32(bucket), 1]
                             searching = 0
                         if key == -1:
                             searching = 0
@@ -50,8 +53,8 @@ fn gathered_row[R, F](directory: &tensor[R, F] i32, selected: i32) -> i32 where 
 # K1 packet decoders; one threadgroup per token row.
 # `tokens` has the `sample_rows` result layout (token, status), so a step can
 # embed the previous step's selection directly on the device; `directory`
-# addresses the table's rows (`gathered_row`).
-# The decoded row is multiplied by `scale` (√D for Gemma's text rows, 1
+# addresses the table's rows (`gathered_row`), and a row it names none for is
+# zeros. The decoded row is multiplied by `scale` (√D for Gemma's text rows, 1
 # elsewhere) and, with `normalize` nonzero, RMS-normalized without a weight
 # (`epsilon`; Muse) before its one rounding to A. Both results hold that
 # rounded row.
@@ -61,11 +64,15 @@ fn embedding_rows[M, V, D, R, F](table: &tensor[V, D] EW, tokens: &tensor[M, 2] 
     let mut embedded = tensor[M, D] A
     parallel for row in 0..M:
         let token = gathered_row(directory, tokens[row, 0])
-        let value = f32(table[token]) * scale
-        let mut inverse = f32(1.0)
-        if normalize != 0:
-            inverse = rsqrt(sum_any_order(value * value) / f32(D) + epsilon)
-        embedded[row] = value * inverse
+        if token >= 0:
+            let value = f32(table[token]) * scale
+            let mut inverse = f32(1.0)
+            if normalize != 0:
+                inverse = rsqrt(sum_any_order(value * value) / f32(D) + epsilon)
+            embedded[row] = value * inverse
+        else:
+            for column in 0..D:
+                embedded[row, column] = 0.0
     return embedded, f32(embedded)
 
 # Metal: 256 threads, each decoding whole 32-value rows16 packets. (CUDA: 128
@@ -134,24 +141,31 @@ native conditioning_overlay for cpu from "cpu/conditioning_overlay.rs":
         threads_per_threadgroup (1, 1, 1)
 
 # Rows of a streamed table whose slots the host fills (an n-gram table,
-# `TableFill::Stored`): `slots[s]` is a resident row of W values. Row m of
-# the result is the slot `gathered_row` names for `tokens[m, 0]` (a (row,
-# status) selection), decoded and rounded once to A. A failed selection and a
-# row without a slot read slot 0. Unlike `embedding_rows`, no F32 copy, scale
-# or normalization.
-fn stored_rows[M, S, W, R, F](slots: &tensor[S, W] E, tokens: &tensor[M, 2] i32,
-    directory: &tensor[R, F] i32) -> tensor[M, W] A where R >= 0 and F >= 1:
+# `TableFill::Stored`): slot s is the resident row `slots[s / P, s % P]` of W
+# values, the slots in C records of P each (the units its storage commits and
+# releases). Row m of the result is the slot `gathered_row` names for
+# `tokens[m, 0]` (a (row, status) selection), decoded and rounded once to A.
+# A selection that names no row and a row without a slot read zeros. Unlike
+# `embedding_rows`, no F32 copy, scale or normalization.
+fn stored_rows[M, C, P, W, R, F](slots: &tensor[C, P, W] E, tokens: &tensor[M, 2] i32,
+    directory: &tensor[R, F] i32) -> tensor[M, W] A where P >= 1 and R >= 0 and F >= 1:
     let mut rows = tensor[M, W] A
     parallel for row in 0..M:
         let slot = gathered_row(directory, tokens[row, 0])
-        rows[row] = f32(slots[slot])
+        if slot >= 0:
+            rows[row] = f32(slots[slot / P, slot % P])
+        else:
+            for column in 0..W:
+                rows[row, column] = 0.0
     return rows
 
 # Each native decodes the slots' rows16 rows through the shared decoders.
 # Metal, CUDA and Vulkan: one threadgroup per row and 256 columns, a thread
-# per value.
+# per value. Metal reads a record where its storage holds it (a reserved
+# table's chunks); the others address the slots' contiguous rows.
 native stored_rows for metal from "metal/stored_rows.metal":
     static (W)
+    records (slots)
     launch stored_rows:
         threadgroups (M, ceil_div(W, 256), 1)
         threads_per_threadgroup (256, 1, 1)

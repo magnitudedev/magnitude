@@ -10,7 +10,11 @@ fn stored_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3],
         cx.arg_directory().get([entry, field])
     });
     let values = seismic::cpu::tensor::floats(shared, cx.dim_w() as usize);
-    cx.arg_slots().decode_row(slot, values);
+    // A row without a slot reads zeros.
+    match slot {
+        Some(slot) => cx.arg_slots().decode_row(slot, values),
+        None => values.fill(0.0),
+    }
     for value in values.iter_mut() {
         *value = activation::publish::<E::A>(*value);
     }

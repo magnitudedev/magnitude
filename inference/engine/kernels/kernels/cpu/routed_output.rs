@@ -94,6 +94,9 @@ fn routed_output_rows<L: Isa, E: Elements>(
             .slice::<seismic::cpu::quant::Q8Block>(0, m * shared_blocks)
     });
     let (routes, scores, down) = (cx.arg_routes(), cx.arg_scores(), cx.arg_expert_down());
+    let tier = cx.arg_tier_down();
+    let sources = cx.arg_sources();
+    let record = |slot: usize| routed::decode_source(cx.dim_xs(), || sources.get([0, row, slot]), routes.get([row, slot]));
     let mut selected = [0.0f32; projection::MAX_ROWS];
     let mut projected = [0.0f32; projection::MAX_ROWS];
     let (selected, projected) = (
@@ -102,15 +105,17 @@ fn routed_output_rows<L: Isa, E: Elements>(
     );
     for slot in 0..k {
         let choice = row * k + slot;
-        let first = routed::expert_row(routes.get([row, slot]), h) + columns.start;
-        let q8 = expert_q8.map(|q8| &q8[choice * expert_blocks..(choice + 1) * expert_blocks]);
-        projection::project_arithmetic(
-            &down,
-            first,
-            &expert[choice * f..(choice + 1) * f],
-            q8,
-            projected,
-        );
+        // A choice its slot map names no record for reads none: a zero
+        // projection.
+        match record(slot) {
+            Some(place) => {
+                let (down, record) = place.of(&down, &tier);
+                let first = routed::expert_row(record, h) + columns.start;
+                let q8 = expert_q8.map(|q8| &q8[choice * expert_blocks..(choice + 1) * expert_blocks]);
+                projection::project_arithmetic(down, first, &expert[choice * f..(choice + 1) * f], q8, projected);
+            }
+            None => projected.fill(0.0),
+        }
         let score = scores.get([row, slot]);
         for (selected, projected) in selected.iter_mut().zip(projected.iter()) {
             *selected = score.mul_add(activation::publish::<E::A>(*projected), *selected);

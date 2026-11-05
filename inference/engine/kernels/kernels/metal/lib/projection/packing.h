@@ -346,13 +346,13 @@ struct packing_factors<packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, L, GROUP
     static_assert(K::groups == 1 || !biased, "a block of two runs has no min term");
     static constant constexpr bool implemented = true;
     typedef typename K::run run;
-    static run start(device const uchar *row, Rows16 layout, uint block) {
+    static run start(packets::weight_bytes row, Rows16 layout, uint block) {
         return K::start(row, layout, block * K::packets);
     }
     static float2 take(thread run &state) {
         return packing_block_factors<K, CENTRE, OFFSET>(K::form(K::next(state), state.factor));
     }
-    static float reach(device const uchar *row, Rows16 layout, uint block) {
+    static float reach(packets::weight_bytes row, Rows16 layout, uint block) {
         const typename K::group_factors factors = K::factors(row, layout, block);
         const float scale = (512.0f + 128.0f * metal::abs(packing_shift<CENTRE, OFFSET>())) * metal::abs(factors.scale(0));
         return float(L::largest) * (MIN ? metal::fma(128.0f, metal::abs(factors.bias(0)), scale) : scale);
@@ -370,22 +370,22 @@ struct packing_factors<packets::Direct<S, GROUP, BIAS, STORAGE, 0>, CENTRE, OFFS
     static constant constexpr bool implemented = true;
     // A 256-column block's share of the supers plane, from its first
     // group's scale: a packet's place in it is its index in the block.
-    static device const uchar *block_supers(device const uchar *row, Rows16 layout, uint block) {
+    static packets::weight_bytes block_supers(packets::weight_bytes row, Rows16 layout, uint block) {
         return layout.super_at(row, 0ul) + ulong(K::scale_offset(block * (256u / GROUP)));
     }
     // The block's supers and the next packet taken.
     struct run {
-        device const uchar *supers;
+        packets::weight_bytes supers;
         uint p;
     };
-    static run start(device const uchar *row, Rows16 layout, uint block) {
+    static run start(packets::weight_bytes row, Rows16 layout, uint block) {
         return run{block_supers(row, layout, block), 0u};
     }
     static float2 take(thread run &state) {
         return packing_block_factors<K, CENTRE, OFFSET>(K::at(state.supers, state.p++));
     }
-    static float reach(device const uchar *row, Rows16 layout, uint block) {
-        device const uchar *supers = block_supers(row, layout, block);
+    static float reach(packets::weight_bytes row, Rows16 layout, uint block) {
+        packets::weight_bytes supers = block_supers(row, layout, block);
         // Without a min term the bound is 512 times the largest scale,
         // exactly: a power of two scales every term alike.
         float largest = 0.0f;
@@ -816,7 +816,7 @@ inline void packing_coefficients(thread const Weights<W> &w, thread const packin
         typedef typename packing_codes<W>::factors coded;
         const uint groups = columns / 32u, blocks = columns / 256u;
         const uint tile = n / 32u, within = n % 32u;
-        device const uchar *row = w.row(n);
+        packets::weight_bytes row = w.row(n);
         const Rows16 layout = w.geometry(n);
         float largest = 0.0f;
         for (uint block = lane; block < blocks; block += 32u)
