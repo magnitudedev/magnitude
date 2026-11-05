@@ -13,6 +13,7 @@ seismic-cpu.workspace = true
 seismic-native-cpu.workspace = true
 seismic-cuda.workspace = true
 seismic-metal.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(unix)'.dependencies]

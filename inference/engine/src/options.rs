@@ -68,7 +68,7 @@ impl PackageOptions {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub enum ModelMethod {
     /// A package's separate draft when it has one, else its draft head,
     /// else plain generation.
@@ -125,7 +125,7 @@ impl ModelMethod {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ModelPolicy {
     /// How each round takes the proposals it generates and offers to
     /// verification. None with an explicit `mtp_proposals` generates and
@@ -136,6 +136,7 @@ pub struct ModelPolicy {
     /// and sampled requests. When absent, the width is the widest the drafter
     /// has: all a separate draft's block holds, or all a head chains.
     pub mtp_proposals: Option<u8>,
+    #[serde(with = "KvCodecEncoding")]
     pub kv_codec: KvCodec,
     /// Queue each plain decode step's successor on the device before the
     /// step completes (cross-step pipelining).
@@ -374,7 +375,6 @@ pub struct ExecutionManifest {
     pub package: PackageManifest,
     pub definition: ModelDefinition,
     pub model: ResolvedModelPolicy,
-    #[serde(with = "ServiceLimitsEncoding")]
     pub service: ServiceLimits,
     pub path: ExecutionPath,
     pub device: DeviceRequest,
@@ -466,7 +466,6 @@ pub struct ReadyInfo {
     /// package's family and the definition it executes.
     pub modalities: InputModalities,
     pub model: ResolvedModelPolicy,
-    #[serde(with = "ServiceLimitsEncoding")]
     pub service: ServiceLimits,
     pub resources: ResourcePlanSummary,
     pub path: ExecutionPath,
@@ -476,17 +475,6 @@ pub struct ReadyInfo {
     pub backend: seismic::BackendName,
     /// The memory heap's standing when readiness was published.
     pub census: AllocationCensus,
-}
-
-/// The serialized form of [`ServiceLimits`] (a scheduler value).
-#[derive(Serialize, Deserialize)]
-#[serde(remote = "ServiceLimits")]
-struct ServiceLimitsEncoding {
-    prefill_tokens: usize,
-    decode_tokens: usize,
-    decode_share: f64,
-    locality_seconds: f64,
-    conversations: std::num::NonZeroUsize,
 }
 
 /// The serialized form of [`KvCodec`] (a state value).

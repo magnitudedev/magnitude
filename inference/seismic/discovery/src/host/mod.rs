@@ -469,7 +469,7 @@ impl ProcessMemoryLimit {
 }
 
 /// An OS limit on this process's memory.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum ProcessLimitKind {
     /// cgroup v1 `memory.limit_in_bytes` of this process's cgroup or a
     /// visible ancestor in the v1 memory hierarchy, enforced against that
@@ -488,7 +488,7 @@ pub enum ProcessLimitKind {
 }
 
 /// Whether a sample's process limits are all the limits that apply.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum LimitVisibility {
     /// Every limit applicable to this process was observed.
     Complete,

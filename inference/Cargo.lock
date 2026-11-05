@@ -4240,6 +4240,7 @@ dependencies = [
  "seismic-native-cpu",
  "seismic-topology",
  "seismic-vulkan",
+ "serde",
  "serde_json",
  "windows",
  "windows-sys 0.61.2",

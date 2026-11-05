@@ -160,7 +160,7 @@ fn structure_identity(structure: &AssessmentStructure) -> anyhow::Result<serde_j
     let process_limits = host
         .limits
         .iter()
-        .map(|limit| json!({ "kind": format!("{:?}", limit.kind), "bytes": limit.limit_bytes }))
+        .map(|limit| json!({ "kind": limit.kind, "bytes": limit.limit_bytes }))
         .collect::<Vec<_>>();
     Ok(json!({
         "engine_build": EngineBuild::current().0,
@@ -168,10 +168,10 @@ fn structure_identity(structure: &AssessmentStructure) -> anyhow::Result<serde_j
         "graph_cost": structure.selected.graph_cost,
         "topology": structure.topology.normalized(),
         "process_limits": process_limits,
-        "limit_visibility": format!("{:?}", host.limit_visibility),
+        "limit_visibility": host.limit_visibility,
         "reserves": structure.reserves.identity(),
-        "policy": format!("{:?}", structure.policy),
-        "service": format!("{:?}", structure.service),
+        "policy": structure.policy,
+        "service": structure.service,
     }))
 }
 

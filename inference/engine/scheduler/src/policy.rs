@@ -6,7 +6,7 @@ pub enum Phase {
     Prefill,
     Decode,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ServiceLimits {
     pub prefill_tokens: usize,
     pub decode_tokens: usize,
