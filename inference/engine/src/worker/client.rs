@@ -105,9 +105,22 @@ struct State {
     next_claim: u64,
     /// Why the connection ended; every later operation fails with it.
     closed: Option<RequestError>,
+    /// The host asked the worker to shut down ([`EngineClient::shutdown`]): a connection that
+    /// ends after that ends for the stop, however the worker's end came (its own unload, or
+    /// its kill once it overran its exit).
+    shutting_down: bool,
 }
 
 impl State {
+    /// Why a connection whose worker ended for `reason` ended: the host's stop, where the host
+    /// asked for one, so a stopped model's requests end alike whenever its worker ends.
+    fn lost(&self, reason: String) -> RequestError {
+        match self.shutting_down {
+            true => RequestError::ModelUnloaded { cause: crate::error::UnloadCause::Shutdown },
+            false => RequestError::WorkerLost { reason },
+        }
+    }
+
     fn close(&mut self, error: RequestError) {
         if self.closed.is_some() {
             return;
@@ -331,10 +344,9 @@ pub fn connect_worker(
                 Ok(None) => "the worker ended".to_owned(),
                 Err(error) => error.to_string(),
             };
-            reading
-                .lock()
-                .unwrap()
-                .close(RequestError::WorkerLost { reason: failure });
+            let mut state = reading.lock().unwrap();
+            let lost = state.lost(failure);
+            state.close(lost);
             return;
         })
         .map_err(|error| LoadError::Internal {
@@ -536,6 +548,7 @@ impl EngineClient {
     /// Ask the worker to unload and exit. Open requests fail with
     /// `ModelUnloaded { cause: Shutdown }`.
     pub fn shutdown(&self) -> Result<(), RequestError> {
+        self.connection.state.lock().unwrap().shutting_down = true;
         self.connection.send(HostMessage::Shutdown)
     }
 
@@ -726,5 +739,18 @@ mod tests {
         state.deliver(WorkerMessage::MeasurementRoom { claim, room: short.clone() }).unwrap();
         assert_eq!(second.lock().unwrap().value, Some(short.clone()));
         assert_eq!(joined.lock().unwrap().value, Some(short));
+    }
+
+    /// A worker that ends after the host asked it to shut down ended for the stop, whether it
+    /// unloaded or was killed for overrunning its exit; one the host never stopped was lost.
+    #[test]
+    fn a_stopped_workers_end_is_the_stop_however_it_ends() {
+        let mut state = State::default();
+        assert!(matches!(state.lost("the worker ended".into()), RequestError::WorkerLost { .. }));
+        state.shutting_down = true;
+        assert_eq!(
+            state.lost("the worker ended".into()),
+            RequestError::ModelUnloaded { cause: crate::error::UnloadCause::Shutdown }
+        );
     }
 }
