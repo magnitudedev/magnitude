@@ -3,8 +3,9 @@
 //! routing the ranking's stack is fed (the performance model's inputs, and
 //! the one ranking's feed: `Reuse`).
 
+use crate::operation::LaunchWork;
 use super::core::{Extents, Layer, RoutingRecord};
-use super::steps::{CompletedStep, Decoded, EndedReads, Recording, Step};
+use super::steps::{CompletedRoute, CompletedStep, Decoded, EndedReads, Recording, Step};
 use crate::assessment::{
     ExpertLines, ExpertPass, FileLine, GroupLayerTerms, GroupReads, GroupUnion, LaunchSample, LayerStep, MissRecord, Notice, ReadLine,
     ReadLineError, RecordFeed, RequestReads, Stages, MISS_RATE_ERROR,
@@ -87,7 +88,7 @@ pub struct LayerExperts {
     pub sited: u64,
     pub site_path: Duration,
     /// Every expert the step routed to here, ascending, and its choices,
-    /// from its routing record; none of a prompt step
+    /// from its routing record; none of a grouped step
     /// ([`Telemetry::routed`]).
     pub routed: Option<RoutedRead>,
 }
@@ -392,7 +393,7 @@ const WINDOW: f64 = 1.0;
 /// and the time the volume was busy meanwhile
 /// (`magnitude_artifacts::Delivery`), what share of the time it is busy;
 /// and their hint candidates by ring rank, each rank's precision.
-/// Every step it holds is a decode step's since the last prompt step, which
+/// Every step it holds is a generation step's since the last prompt step, which
 /// drops its reads and starts the window again (`Telemetry::complete_step`).
 #[derive(Default)]
 struct Recent {
@@ -1262,6 +1263,14 @@ impl Telemetry {
         )
     }
 
+    /// Whether layer `layer` holds a group union, every ended step's group
+    /// fed: a prompt group's read there ([`GroupFacts::unions`]).
+    #[cfg(test)]
+    pub(super) fn group_union(&self, layer: usize) -> bool {
+        drop(self.fed());
+        self.lock().facts.unions[layer].is_some()
+    }
+
     /// The step the stack last fed a read of a layer's expert into the
     /// ranking: the reads of every ended step's group; none for an expert
     /// no step has read.
@@ -1303,11 +1312,12 @@ impl Telemetry {
         sited: &dyn Fn(usize) -> (u64, u64, Duration),
         priced: Option<&[ExpertLines]>,
     ) -> Result<(), CompletionError> {
+        let CompletedStep { work, begun, route } = completion;
         // A decode step's routing at each streamed layer, read from its
         // records before anything is recorded.
-        let decoded = match completion {
-            CompletedStep::Prompt => None,
-            CompletedStep::Decode(mut decoded) => {
+        let decoded = match route {
+            CompletedRoute::Grouped => None,
+            CompletedRoute::Decode(mut decoded) => {
                 let blocks = decoded.sampled.take().map(|lines| self.sampled_blocks(sequence, lines)).transpose()?;
                 Some((decoded, self.routed(sequence), self.tiered(sequence), self.sourced(sequence), self.absent(sequence), blocks))
             }
@@ -1427,17 +1437,18 @@ impl Telemetry {
         // Every step's end, from which the next decode step's time is taken.
         let now = Instant::now();
         let ended = (feed.ended.replace(now), now);
-        // What the volumes read since the step before: a decode step's busy
-        // time, over its time. A prompt step's reads drain a burst no decode
-        // step measured: the window starts again (as busy as can be until
-        // it is whole).
-        match &decoded {
-            Some((decoded, ..)) => {
-                cost.seconds = step_seconds(ended.0, decoded.begun, ended.1);
+        // What the volumes read since the step before: a generation step's
+        // busy time, over its time, whatever its form (a verify wider than
+        // the decode form ranks no hints). A prompt step's reads drain a
+        // burst no generation step measured: the window starts again (as busy
+        // as can be until it is whole).
+        match work {
+            LaunchWork::Generation => {
+                cost.seconds = step_seconds(ended.0, begun, ended.1);
                 let busy = self.delivered(&mut costs.reads);
                 costs.recent.step(cost.seconds, ranks, busy);
             }
-            None => {
+            LaunchWork::Prompt => {
                 self.delivered(&mut costs.reads);
                 costs.recent = Recent::default();
             }
@@ -1449,7 +1460,7 @@ impl Telemetry {
             if let Some(Recording { lines: Some(lines) }) = &mut decoded.recording {
                 *lines = self.with_observed(costs, lines);
             }
-            feed_decode(feed, &mut cost, routed, decoded, ended, costs.line);
+            feed_decode(feed, &mut cost, routed, decoded, begun, ended, costs.line);
         }
         // What the step cost in reads, for whoever traces steps (a step slow
         // of its own is read by its misses and reads).
@@ -1496,12 +1507,17 @@ impl Telemetry {
         }
     }
 
-    /// A prompt group ended (`reads`): each streamed layer's experts its
-    /// passes grouped a choice to, at any of its places, are read at its
-    /// last step, in the device's order, with the choices routed to each
-    /// over its places and the steps the layer's pass merged.
+    /// A group of grouped steps ended (`reads`): each streamed layer's
+    /// experts its passes grouped a choice to, at any of its places, are
+    /// read at its last step, in the device's order. A prompt group's are
+    /// its group read, with the choices routed to each over its places and
+    /// the steps the layer's pass merged; a generation group's (a verify
+    /// wider than the decode form) are a decode's reads, each expert read
+    /// once, which rank the bank as any decode's do and price no prompt.
+    /// Neither is counted into the decode record, which counts the decode
+    /// form's routing records alone.
     pub(super) fn group_read(&self, reads: EndedReads) {
-        let EndedReads { first, steps, record, merges } = reads;
+        let EndedReads { first, steps, record, merges, prompt } = reads;
         let mut choices = self.routing.experts.iter().map(|&experts| vec![0u32; experts]).collect::<Vec<_>>();
         for place in 0..steps as usize {
             self.reads_at(record, place, |layer, words, base, _| {
@@ -1516,7 +1532,10 @@ impl Telemetry {
                 choices.into_iter().enumerate().filter(|&(_, count)| count > 0).unzip();
             let routed = choices.iter().map(|&count| u64::from(count)).sum();
             let read = RoutedRead { sequence: first + steps - 1, layer, experts, choices: routed };
-            let fed = Fed::Group { steps: steps as usize, merged, choices };
+            let fed = match prompt {
+                true => Fed::Group { steps: steps as usize, merged, choices },
+                false => Fed::Decode { counted: false },
+            };
             recorded.feed.pending.push((first, read, fed));
         }
     }
@@ -1887,15 +1906,16 @@ fn served_within(cpu: u64, tiered: u64, absent: u64, layer: usize, sequence: Ste
 /// `routed`, is fed. While its load records it, the step is counted into
 /// the record ([`RecordFeed::decode`]), along the read `line` and the
 /// recording's lines; alone in its group, its
-/// launch is sampled for σ ([`LaunchSample`]) from its group's beginning or
-/// the step before's end, whichever is later, to its end (`ended`: those
-/// two ends), and the cost keeps that sample, so a replay of the run feeds
-/// the record the same step.
+/// launch is sampled for σ ([`LaunchSample`]) from its group's beginning
+/// (`begun`) or the step before's end, whichever is later, to its end
+/// (`ended`: those two ends), and the cost keeps that sample, so a replay of
+/// the run feeds the record the same step.
 fn feed_decode(
     feed: &mut Feed,
     cost: &mut StepCost,
     routed: Vec<RoutedRead>,
     decoded: Decoded,
+    begun: Instant,
     ended: (Option<Instant>, Instant),
     line: Option<ReadLine>,
 ) {
@@ -1903,7 +1923,6 @@ fn feed_decode(
         recording: recorded,
         launch,
         group,
-        begun,
         alone,
         sampled: _,
     } = decoded;

@@ -810,11 +810,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 }
 
-/// How a completed step's misses are recorded by a load measuring its
-/// experts by `experts`: not before [`ExecutorDomain::measure_experts`]; then
-/// by each layer's lines where the load has them, which σ's residuals need.
-fn recording(experts: Option<&ExpertMeasures>) -> Option<crate::experts::Recording> {
-    experts.map(|measures| crate::experts::Recording {
+/// How a completed step of `work` has its misses recorded by a load
+/// measuring its experts by `experts`: not before
+/// [`ExecutorDomain::measure_experts`], and only generation's (a prompt's
+/// rows, even in the decode form, are no decode step the record prices);
+/// then by each layer's lines where the load has them, which σ's residuals
+/// need.
+fn recording(experts: Option<&ExpertMeasures>, work: crate::operation::LaunchWork) -> Option<crate::experts::Recording> {
+    experts.filter(|_| work == crate::operation::LaunchWork::Generation).map(|measures| crate::experts::Recording {
         lines: measures.lines.measured().cloned(),
     })
 }

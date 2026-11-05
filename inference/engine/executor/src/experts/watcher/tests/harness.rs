@@ -8,6 +8,7 @@ pub(super) use crate::experts::conveyor::{Carrier, LentPool, Lending};
 pub(super) use crate::experts::landing::TierTensor;
 pub(super) use crate::experts::map::{LandingMap, MapView, StampedMap};
 pub(super) use crate::experts::source::{ExpertSource, Outcome, Read, Records, Ticket};
+pub(super) use crate::operation::LaunchWork;
 pub(super) use crate::planning::{Placer, RegionWords};
 pub(super) use magnitude_artifacts::Priority;
 pub(super) use magnitude_kernels::constants;
@@ -603,12 +604,23 @@ pub(super) fn eventually(what: &str, check: impl Fn() -> bool) {
 }
 
 /// Begin a group of steps of `routes`, at least one, `scratch`-served
-/// (`Shared::begin`): the steps, in sequence order.
+/// (`Shared::begin`): the steps, in sequence order. Its grouped steps are a
+/// prompt's, its decode steps generation's.
 pub(super) fn begin(shared: &Arc<Shared>, routes: &[StepRoute], scratch: bool) -> Result<Vec<ExpertStep>, String> {
-    let (first, rest) = routes.split_first().expect("a group of steps");
+    let work = |route: StepRoute| match route {
+        StepRoute::Grouped => LaunchWork::Prompt,
+        StepRoute::Decode => LaunchWork::Generation,
+    };
+    let launches = routes.iter().map(|&route| (route, work(route))).collect::<Vec<_>>();
+    begin_as(shared, &launches, scratch)
+}
+
+/// [`begin`] of steps each of its route and its work.
+pub(super) fn begin_as(shared: &Arc<Shared>, launches: &[(StepRoute, LaunchWork)], scratch: bool) -> Result<Vec<ExpertStep>, String> {
+    let (first, rest) = launches.split_first().expect("a group of steps");
     let mut chain = crate::programs::Chain::one(*first);
-    rest.iter().for_each(|&route| chain.push(route));
-    let steps = shared.begin(chain, |&route| route, || Ok(scratch)).map_err(|(error, _)| error)?.0;
+    rest.iter().for_each(|&launch| chain.push(launch));
+    let steps = shared.begin(chain, |&(route, _)| route, |&(_, work)| work, || Ok(scratch)).map_err(|(error, _)| error)?.0;
     Ok(steps.into_iter().map(|(_, step)| step).collect())
 }
 
@@ -722,7 +734,7 @@ impl Harness {
 
     /// Begin a prompt step, a group of one.
     pub(super) fn prompt_step(&self) -> ExpertStep {
-        self.group(&[StepRoute::Prompt]).pop().unwrap()
+        self.group(&[StepRoute::Grouped]).pop().unwrap()
     }
 
     /// Begin a scratch-served group of steps of `routes`.

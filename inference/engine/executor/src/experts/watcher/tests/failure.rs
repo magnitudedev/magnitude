@@ -103,7 +103,7 @@ fn a_step_spanning_a_late_pulse_is_interrupted_and_the_load_goes_on() {
 fn a_failed_steps_experts_are_the_next_routing_steps() {
     // The file holds 6 experts of each tensor: expert 7's reads fail.
     let harness = prompted("forfeit", 6, 4);
-    let steps = harness.group(&[StepRoute::Prompt; 2]);
+    let steps = harness.group(&[StepRoute::Grouped; 2]);
     harness.publish(&steps[0], 0, &[1, 7]);
     harness.publish(&steps[1], 0, &[0, 1]);
     assert_eq!(harness.every_round(&steps[0], 0), Answer::Failed);
@@ -131,7 +131,7 @@ fn a_failed_read_taken_over_is_read_again_by_the_later_step() {
         ("retake-round", Conveying::of(ROUND_RECORDS)),
     ] {
         let harness = lending(name, 6, 4, 1, STAGING, conveying, TIER, Placer::Tier, false);
-        let steps = harness.group(&[StepRoute::Prompt; 2]);
+        let steps = harness.group(&[StepRoute::Grouped; 2]);
         harness.publish(&steps[0], 0, &[1, 7]);
         harness.publish(&steps[1], 0, &[1, 7]);
         for step in &steps {
@@ -153,7 +153,7 @@ fn a_failed_read_taken_over_is_read_again_by_the_later_step() {
 fn a_failed_steps_request_the_device_passed_is_not_served() {
     // The file holds 6 experts of each tensor: expert 7's reads fail.
     let harness = layered_over("passed", 6, 12, 3, STAGING, WHOLE);
-    let steps = harness.group(&[StepRoute::Prompt; 2]);
+    let steps = harness.group(&[StepRoute::Grouped; 2]);
     harness.publish(&steps[0], 0, &[7]);
     harness.publish(&steps[1], 0, &[0]);
     assert_eq!(harness.every_round(&steps[0], 0), Answer::Failed);

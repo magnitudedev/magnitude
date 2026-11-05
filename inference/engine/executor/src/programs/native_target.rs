@@ -1254,14 +1254,15 @@ impl NativeTargetProgram {
         let refused = |error, chain| super::ChainRefusal { error, chain, misses: None };
         // A streamed load's steps, in chain order, one group: the watcher
         // serves each from before its first run is queued until it
-        // completes. Scratch-served where a prompt group is not resident.
+        // completes. Scratch-served where a group of grouped launches is not
+        // resident.
         let route = |launch: &ValidatedTargetLaunch| {
             match crate::operators::routed::fused_graph::decodes(launch.batch().upload().class.rows() as u64) {
                 true => StepRoute::Decode,
-                false => StepRoute::Prompt,
+                false => StepRoute::Grouped,
             }
         };
-        let prompt = chain.iter().any(|launch| route(launch) == StepRoute::Prompt);
+        let grouped = chain.iter().any(|launch| route(launch) == StepRoute::Grouped);
         // Per block, the steps of the merge set its group ends with
         // (`Shared::begin`): the whole group but at a streamed layer of a
         // group that is not resident (`ExpertBank::resident`).
@@ -1271,9 +1272,9 @@ impl NativeTargetProgram {
         // launch's rows are at their positions (validated nonnegative).
         let steps = match &self.graphs.bank {
             Some(bank) => {
-                let begun = bank.begin(chain, |launch| route(launch), || {
+                let begun = bank.begin(chain, |launch| route(launch), |launch| launch.work(), || {
                     let resident = bank.resident()?;
-                    scratch = prompt && !resident;
+                    scratch = grouped && !resident;
                     Ok(scratch)
                 });
                 let (steps, merges) = begun.map_err(|(error, chain)| refused(invalid(error), chain))?;
@@ -1283,7 +1284,7 @@ impl NativeTargetProgram {
                         StepRoute::Decode => {
                             step.decoding(upload.coordinates[..upload.actual_rows].iter().map(|row| row[0] as u64))
                         }
-                        StepRoute::Prompt => step,
+                        StepRoute::Grouped => step,
                     };
                     (launch, Some((bank.clone(), step)))
                 });

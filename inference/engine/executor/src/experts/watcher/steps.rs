@@ -14,6 +14,7 @@ use crate::assessment::{ExpertLines, MissRecord};
 use crate::experts::directory::Point;
 use crate::experts::events::Events;
 use crate::FlightDepth;
+use crate::operation::LaunchWork;
 use crate::programs::Chain;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
@@ -105,9 +106,12 @@ struct Begun {
     /// Each streamed layer's merge set, the steps the group ends with
     /// whose backs run in one pass (`Telemetry::merge_sets`).
     merges: Vec<usize>,
-    /// The group reads record a group of prompt steps holds
+    /// The group reads record a group of grouped steps holds
     /// (`BankPart::GroupReads`), until every step of it has ended.
     reads: Option<GroupRecord>,
+    /// Whether a launch of it is a prompt's (`LaunchWork::Prompt`): its
+    /// reads are a prompt's, and it runs as one.
+    prompt: bool,
 }
 
 /// A group's hold of one of the group reads records, one for each group in
@@ -116,22 +120,26 @@ struct Begun {
 /// returned once every step of it has ended.
 struct GroupRecord(usize);
 
-/// What a step's launch routes by: a prompt launch's rows run its group's
-/// passes, which record the group's reads (`BankPart::GroupReads`); a
-/// decode launch's route writes its routing record.
+/// What a step's launch routes by, its form's protocol: a grouped launch's
+/// rows (more than the decode form's) run its group's passes, which record
+/// the group's reads (`BankPart::GroupReads`); a decode launch's route
+/// writes its routing record. Which work the rows are, a prompt's or
+/// generation's, is the launch's own (`LaunchWork`), apart from its form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepRoute {
-    Prompt,
+    Grouped,
     Decode,
 }
 
-/// A group whose every step has ended, with the group reads record it held
-/// and each streamed layer's merge set.
+/// A group of grouped steps whose every step has ended, with the group
+/// reads record it held, each streamed layer's merge set, and whether it
+/// was a prompt's: only a prompt's reads price a prompt's group reads.
 pub(super) struct EndedReads {
     pub first: Step,
     pub steps: u64,
     pub record: usize,
     pub merges: Vec<usize>,
+    pub prompt: bool,
 }
 
 /// The steps' state, under one lock.
@@ -331,6 +339,7 @@ impl Steps {
         let (first, group) = state.group(sequence);
         group.ended += 1;
         let steps = group.steps;
+        let prompt = group.prompt;
         let held = match group.ended == steps {
             true => group.reads.take().map(|record| (record, group.merges.clone())),
             false => None,
@@ -343,7 +352,7 @@ impl Steps {
             .find(|(_, group)| group.ended < group.steps)
             .map_or(state.last + 1, |(&first, _)| first);
         let (record, reads) = held
-            .map(|(GroupRecord(record), merges)| (GroupRecord(record), EndedReads { first, steps, record, merges }))
+            .map(|(GroupRecord(record), merges)| (GroupRecord(record), EndedReads { first, steps, record, merges, prompt }))
             .unzip();
         ended(reads, earliest);
         state.records.extend(record);
@@ -443,7 +452,7 @@ impl Steps {
     /// Whether a running group is a prompt group's, however it is served
     /// (scratch or resident): its steps run many at once.
     pub(super) fn prompt_running(&self) -> bool {
-        self.lock().groups.values().any(|group| group.reads.is_some() && group.ended < group.steps)
+        self.lock().groups.values().any(|group| group.prompt && group.ended < group.steps)
     }
 
     /// Steps through `last` begun, where a test plays them without
@@ -611,7 +620,7 @@ impl Shared {
     /// then reads `scratch` again; or for serving's end, why it cannot
     /// begin. Each streamed layer's merge set comes with them: the
     /// priced one (`Telemetry::merge_sets`) for a scratch-served group, the
-    /// whole group otherwise. A group with a prompt step takes a group reads
+    /// whole group otherwise. A group with a grouped step takes a group reads
     /// record from the pool, one for each group the queue can have in
     /// flight (`FlightDepth::groups`), zeroed for its steps' places before any
     /// is queued. No group begins beyond the steps in flight (`Steps::flight`):
@@ -622,9 +631,11 @@ impl Shared {
         self: &Arc<Self>,
         launches: Chain<L>,
         route: impl Fn(&L) -> StepRoute,
+        work: impl Fn(&L) -> LaunchWork,
         mut scratch: impl FnMut() -> Result<bool, String>,
     ) -> Result<(Chain<(L, ExpertStep)>, Vec<usize>), (String, Chain<L>)> {
-        let prompt = launches.iter().any(|launch| route(launch) == StepRoute::Prompt);
+        let grouped = launches.iter().any(|launch| route(launch) == StepRoute::Grouped);
+        let prompt = launches.iter().any(|launch| work(launch) == LaunchWork::Prompt);
         // Whether the group holds the lent records reserved (`lent`): a
         // scratch-served group does before any of its steps begins, until
         // it retires. Where a copy into them runs it waits outside the lock
@@ -660,13 +671,13 @@ impl Shared {
                     self.lent.release();
                     reserved = false;
                 }
-                let reads = match prompt {
+                let reads = match grouped {
                     false => None,
                     true => {
                         let record = state
                             .records
                             .pop()
-                            .ok_or("a prompt group begun beyond the groups the queue holds in flight")?;
+                            .ok_or("a group of grouped steps begun beyond the groups the queue holds in flight")?;
                         self.telemetry.clear_reads(record.0, launches.len());
                         Some(record)
                     }
@@ -689,6 +700,7 @@ impl Shared {
                         scratch,
                         merges: merges.clone(),
                         reads,
+                        prompt,
                     },
                 );
                 for sequence in first..first + count {
@@ -724,6 +736,7 @@ impl Shared {
         let mut admission = Admission { shared: self, next: first, remaining: launches.len() };
         let steps = launches.map(|launch| {
             let route = route(&launch);
+            let work = work(&launch);
             let step = ExpertStep {
                 // A decode step issues a site flight, through which one of
                 // the executor's workers polls the site's requests: none
@@ -736,6 +749,7 @@ impl Shared {
                 // the lines it begins under, once they are priced.
                 sampled: (route == StepRoute::Decode && self.telemetry.samples(admission.next)).then(|| self.priced()).flatten(),
                 route,
+                work,
                 reads: index,
                 sequence: admission.next,
                 shared: self.clone(),
@@ -759,10 +773,12 @@ impl Shared {
 pub(crate) struct ExpertStep {
     sequence: Step,
     route: StepRoute,
-    /// Its group's group reads record, of a group with a prompt step.
+    /// Its launch's work, a prompt's or generation's.
+    work: LaunchWork,
+    /// Its group's group reads record, of a group with a grouped step.
     reads: Option<usize>,
     shared: Arc<Shared>,
-    /// Its decode launch's rows and context; none of a prompt step.
+    /// Its decode launch's rows and context; none of a grouped step.
     launch: Option<DecodeLaunch>,
     recorded: Option<Recording>,
     /// The site flight a decode step issues while it runs, where the load
@@ -784,11 +800,19 @@ pub(crate) struct Recording {
     pub(crate) lines: Option<Arc<[ExpertLines]>>,
 }
 
-/// A step completed: a prompt step, whose reads its group's passes
-/// recorded (fed when the group ends), or a decode step, fed from its
+/// A step completed: its launch's work, when its group began, and how its
+/// route feeds it.
+pub(super) struct CompletedStep {
+    pub(super) work: LaunchWork,
+    pub(super) begun: Instant,
+    pub(super) route: CompletedRoute,
+}
+
+/// How a completed step is fed: a grouped step, whose reads its group's
+/// passes recorded (fed when the group ends), or a decode step, fed from its
 /// routing record.
-pub(super) enum CompletedStep {
-    Prompt,
+pub(super) enum CompletedRoute {
+    Grouped,
     Decode(Decoded),
 }
 
@@ -801,13 +825,12 @@ pub(super) struct DecodeLaunch {
 }
 
 /// A decode step completed: how its load records it, its launch, its
-/// group, when that began and whether it was alone in it, and the lines its
-/// blocks were sampled by, where they were.
+/// group and whether it was alone in it, and the lines its blocks were
+/// sampled by, where they were.
 pub(super) struct Decoded {
     pub(super) recording: Option<Recording>,
     pub(super) launch: Option<DecodeLaunch>,
     pub(super) group: Step,
-    pub(super) begun: Instant,
     pub(super) alone: bool,
     pub(super) sampled: Option<Arc<[ExpertLines]>>,
 }
@@ -825,7 +848,7 @@ impl ExpertStep {
     }
 
     /// The group reads record its group's passes write their reads to
-    /// (`BankPart::GroupReads`), of a group with a prompt step.
+    /// (`BankPart::GroupReads`), of a group with a grouped step.
     pub fn group_reads(&self) -> Option<usize> {
         self.reads
     }
@@ -856,20 +879,18 @@ impl ExpertStep {
     /// stopped serving every step completes with why.
     pub fn complete(mut self) -> Result<Option<Arc<MissRecord>>, StepFailure> {
         let shared = &self.shared;
-        let completion = match self.route {
-            StepRoute::Prompt => CompletedStep::Prompt,
-            StepRoute::Decode => {
-                let (group, begun, alone) = shared.steps.begun(self.sequence);
-                CompletedStep::Decode(Decoded {
-                    recording: self.recorded.take(),
-                    launch: self.launch,
-                    group,
-                    begun,
-                    alone,
-                    sampled: self.sampled.take(),
-                })
-            }
+        let (group, begun, alone) = shared.steps.begun(self.sequence);
+        let route = match self.route {
+            StepRoute::Grouped => CompletedRoute::Grouped,
+            StepRoute::Decode => CompletedRoute::Decode(Decoded {
+                recording: self.recorded.take(),
+                launch: self.launch,
+                group,
+                alone,
+                sampled: self.sampled.take(),
+            }),
         };
+        let completion = CompletedStep { work: self.work, begun, route };
         let sequence = self.sequence;
         if let Err(error) = shared.telemetry.complete_step(
             sequence,
@@ -1000,7 +1021,7 @@ impl ExpertStep {
     /// for the domain's failure tests.
     pub fn failed(reason: &str) -> Self {
         let shared = Self::unbanked(FlightDepth::PIPELINED, 1);
-        let begun = shared.begin(Chain::one(()), |_| StepRoute::Decode, || Ok(false));
+        let begun = shared.begin(Chain::one(()), |_| StepRoute::Decode, |_| LaunchWork::Generation, || Ok(false));
         let ((_, step), _) = begun.map_err(|(error, _)| error).unwrap().0.split_first();
         shared.steps.fail(step.sequence, reason.to_owned());
         step
@@ -1079,7 +1100,7 @@ mod slot_tests {
     fn begin(shared: &Arc<Shared>, labels: &[usize]) -> Vec<ExpertStep> {
         let mut chain = Chain::one(labels[0]);
         for &label in &labels[1..] { chain.push(label); }
-        shared.begin(chain, |_| StepRoute::Decode, || Ok(false))
+        shared.begin(chain, |_| StepRoute::Decode, |_| LaunchWork::Generation, || Ok(false))
             .map_err(|(error, _)| error).unwrap().0.into_iter().map(|(_, step)| step).collect()
     }
 
@@ -1154,7 +1175,7 @@ mod slot_tests {
                 (state.last, state.running, state.slots.clone())
             };
             for _ in 0..3 {
-                let refused = shared.begin(Chain::one(91usize), |_| StepRoute::Decode,
+                let refused = shared.begin(Chain::one(91usize), |_| StepRoute::Decode, |_| LaunchWork::Generation,
                     || panic!("a refused admission prepares nothing"));
                 let (error, labels) = match refused { Err(refused) => refused, Ok(_) => panic!("a live record overwritten") };
                 assert!(error.contains("routing record"), "{error}");
@@ -1218,10 +1239,10 @@ mod slot_tests {
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = shared.begin(launches, |_| {
                 calls.set(calls.get() + 1);
-                // The prompt scan routes all three; then the second mapping panics.
+                // The grouped scan routes all three; then the second mapping panics.
                 if calls.get() == 5 { panic!("second step mapping"); }
                 StepRoute::Decode
-            }, || Ok(false));
+            }, |_| LaunchWork::Generation, || Ok(false));
         }));
         assert!(unwind.is_err());
         assert_eq!(shared.steps.in_flight(), 0);
@@ -1237,7 +1258,7 @@ mod slot_tests {
         shared.steps.lock().last = Step::MAX - 2;
         drop(begin(&shared, &[1]));
         assert_eq!(shared.steps.lock().last, Step::MAX - 1);
-        let (reason, launches) = match shared.begin(Chain::one(2usize), |_| StepRoute::Decode,
+        let (reason, launches) = match shared.begin(Chain::one(2usize), |_| StepRoute::Decode, |_| LaunchWork::Generation,
             || panic!("sequence refusal precedes preparation")) {
             Err(error) => error, Ok(_) => panic!("an unrepresentable watermark admitted"),
         };
@@ -1249,7 +1270,7 @@ mod slot_tests {
     /// steps it began, or why it could not begin.
     fn prompt(shared: &Arc<Shared>, scratch: bool) -> Result<usize, String> {
         shared
-            .begin(Chain::one(0usize), |_| StepRoute::Prompt, || Ok(scratch))
+            .begin(Chain::one(0usize), |_| StepRoute::Grouped, |_| LaunchWork::Prompt, || Ok(scratch))
             .map(|(steps, _)| steps.len())
             .map_err(|(error, _)| error)
     }

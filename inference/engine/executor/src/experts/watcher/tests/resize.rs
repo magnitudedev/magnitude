@@ -111,13 +111,13 @@ fn a_groups_places_are_served_from_the_words_handed_over_between_flights() {
     let [first, second] = flags;
     (harness.load.0, harness.second) = (first, second);
     harness.reads = reads;
-    let steps = harness.group(&[StepRoute::Prompt; 2]);
+    let steps = harness.group(&[StepRoute::Grouped; 2]);
     assert_eq!(harness.converted(&steps[0], 0, &[0, 1]).concat().len(), 2);
     assert_eq!(harness.converted(&steps[1], 0, &[1, 2]).concat(), [2], "each place served");
     for step in steps {
         step.complete().unwrap();
     }
-    let steps = begin(&shared, &[StepRoute::Prompt; 2], false).unwrap();
+    let steps = begin(&shared, &[StepRoute::Grouped; 2], false).unwrap();
     let record = steps[0].group_reads().unwrap();
     harness.reads[1].store((record * 2 + 1) * EXPERTS + 6, 1);
     let last = steps[1].sequence();

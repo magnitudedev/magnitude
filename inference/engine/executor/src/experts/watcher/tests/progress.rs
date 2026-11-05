@@ -206,7 +206,7 @@ fn a_bank_at_its_minimum_makes_progress() {
             // ahead, and once that ends, a decode step begun behind the
             // group: two groups in flight at every point (`FlightDepth::groups`).
             if round % 2 == 1 {
-                let group = harness.group(&[StepRoute::Prompt; 2]);
+                let group = harness.group(&[StepRoute::Grouped; 2]);
                 decode(&ahead, round);
                 ahead.complete().unwrap();
                 ahead = harness.step();

@@ -6,6 +6,7 @@ use crate::{
     NativeGraphOutputLease, NativeGraphWorkspaceLease, PoolClass, ResourceDomainId,
     TargetGraphOutputLease, TargetGraphWorkspaceLease,
 };
+use crate::operation::LaunchWork;
 use magnitude_batching::ValidatedTargetBatch;
 use magnitude_state::{StateStore, TentativeAdvance};
 use std::rc::Rc;
@@ -22,6 +23,8 @@ pub enum TargetTokens {
 
 pub struct TargetLaunchInputs {
     batch: ValidatedTargetBatch,
+    /// What its rows are (`LaunchWork::of` its requests' kinds).
+    work: LaunchWork,
     tokens: TargetTokens,
     advances: Vec<TentativeAdvance>,
     conditioning: Vec<Option<ConditioningRef>>,
@@ -50,6 +53,7 @@ pub struct ConditioningSlice {
 impl TargetLaunchInputs {
     pub fn new(
         batch: ValidatedTargetBatch,
+        work: LaunchWork,
         tokens: TargetTokens,
         advances: Vec<TentativeAdvance>,
         conditioning: Vec<Option<ConditioningRef>>,
@@ -61,6 +65,7 @@ impl TargetLaunchInputs {
     ) -> Self {
         Self {
             batch,
+            work,
             tokens,
             advances,
             conditioning,
@@ -379,6 +384,7 @@ impl ValidatedTargetLaunch {
         }
         let TargetLaunchInputs {
             batch,
+            work,
             tokens,
             advances,
             conditioning,
@@ -393,6 +399,7 @@ impl ValidatedTargetLaunch {
         Ok(Self {
             core: TargetLaunchCore {
                 batch,
+                work,
                 tokens,
                 advances,
                 conditioning,
@@ -415,6 +422,10 @@ impl ValidatedTargetLaunch {
 
     pub(crate) fn batch(&self) -> &ValidatedTargetBatch {
         self.core.batch()
+    }
+
+    pub(crate) fn work(&self) -> LaunchWork {
+        self.core.work
     }
 
     pub fn domain(&self) -> &ResourceDomainId {
@@ -474,6 +485,9 @@ pub struct TargetLaunchWorkspace {
 /// physical finish.
 pub struct TargetLaunchCore {
     batch: ValidatedTargetBatch,
+    /// What its rows are: policy that tells a prompt from generation reads
+    /// this, never the launch's form.
+    work: LaunchWork,
     /// Selected tokens stay held until the launch that reads them completes.
     tokens: TargetTokens,
     advances: Vec<TentativeAdvance>,
@@ -494,6 +508,10 @@ impl TargetLaunchCore {
 
     pub fn batch(&self) -> &ValidatedTargetBatch {
         &self.batch
+    }
+
+    pub fn work(&self) -> LaunchWork {
+        self.work
     }
 
     pub fn store(&self) -> &Rc<StateStore> {

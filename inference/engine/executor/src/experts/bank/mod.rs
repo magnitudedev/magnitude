@@ -304,9 +304,10 @@ impl ExpertBank {
         &self,
         launches: Chain<L>,
         route: impl Fn(&L) -> StepRoute,
+        work: impl Fn(&L) -> crate::operation::LaunchWork,
         scratch: impl FnMut() -> Result<bool, String>,
     ) -> Result<(Chain<(L, ExpertStep)>, Vec<(WeightScope, usize)>), (String, Chain<L>)> {
-        let (steps, merges) = self.watcher.shared().begin(launches, route, scratch)?;
+        let (steps, merges) = self.watcher.shared().begin(launches, route, work, scratch)?;
         Ok((steps, self.plan.layers.iter().map(|layer| layer.scope).zip(merges).collect()))
     }
 

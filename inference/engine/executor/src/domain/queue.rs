@@ -264,7 +264,7 @@ impl<F: ProgramFamily> QueuedStep<F> {
         // failures fail nothing, as no sequence takes its outputs.
         let finished = self.flight.submission.finish().map(|completed| {
             let (core, output) = completed.into_parts();
-            output.complete(core.batch(), super::recording(experts)).map(|output| match output.experts {
+            output.complete(core.batch(), super::recording(experts, core.work())).map(|output| match output.experts {
                 crate::programs::native_target::ExpertStepEnd::Ran(record) => super::publish_misses(experts, record),
                 crate::programs::native_target::ExpertStepEnd::Interrupted(_) => {}
             })
@@ -1052,8 +1052,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             None
         };
         let count = predicted.len();
+        let work = crate::operation::LaunchWork::of(predicted.iter().filter_map(|operation| match operation {
+            Operation::Forward { kind, .. } => Some(*kind),
+            _ => None,
+        }));
         let inputs = TargetLaunchInputs::new(
             batch,
+            work,
             tokens,
             advances,
             vec![None; count],

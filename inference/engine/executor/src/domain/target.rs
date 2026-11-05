@@ -469,8 +469,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .iter()
             .map(|(_, _, lease, _, _)| lease.clone())
             .collect();
+        let work = crate::operation::LaunchWork::of(metadata.iter().map(|&(_, _, _, kind, _)| kind));
         let inputs = TargetLaunchInputs::new(
             batch,
+            work,
             TargetTokens::Host,
             advances,
             conditioning,
@@ -671,7 +673,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             boundary,
             failures,
             experts,
-        } = output.complete(batch, super::recording(self.experts.as_ref())).map_err(DomainError::Invariant)?;
+        } = output.complete(batch, super::recording(self.experts.as_ref(), core.work())).map_err(DomainError::Invariant)?;
         let interrupted = match experts {
             crate::programs::native_target::ExpertStepEnd::Ran(record) => {
                 super::publish_misses(self.experts.as_ref(), record);

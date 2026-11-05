@@ -144,6 +144,30 @@ pub enum WorkKind {
     Verify,
 }
 
+/// What a target launch's rows are, as policy tells them apart: a prompt's
+/// (any of its requests prefills or replays), or generation's (each of its
+/// requests decodes or verifies). Independent of the launch's form: a
+/// generation launch wider than the decode form runs the grouped form, and a
+/// short prompt tail the decode form, and neither is the other's work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchWork {
+    Prompt,
+    Generation,
+}
+
+impl LaunchWork {
+    /// The work of a launch of requests of `kinds`, at least one: a launch
+    /// of no request is the caller's broken invariant.
+    pub fn of(kinds: impl IntoIterator<Item = WorkKind>) -> Self {
+        let mut kinds = kinds.into_iter().peekable();
+        assert!(kinds.peek().is_some(), "a launch runs a request");
+        match kinds.any(|kind| matches!(kind, WorkKind::Prefill | WorkKind::Replay)) {
+            true => Self::Prompt,
+            false => Self::Generation,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Sampling {
     Greedy,

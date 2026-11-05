@@ -202,7 +202,7 @@ fn an_expert_banked_after_its_prompt_group_began_fills_its_scratch_slot() {
 #[test]
 fn a_groups_steps_read_each_expert_once_per_layer() {
     let harness = layered_over("union", EXPERTS, 12, 2, STAGING, WHOLE);
-    let steps = harness.group(&[StepRoute::Prompt; 2]);
+    let steps = harness.group(&[StepRoute::Grouped; 2]);
     let listed = |flagged: &[usize], step: &ExpertStep, layer| {
         let mut experts = harness.converted(step, layer, flagged).concat();
         experts.sort_unstable();
@@ -244,7 +244,7 @@ fn a_groups_steps_read_each_expert_once_per_layer() {
 #[test]
 fn a_conveyor_reads_experts_in_the_order_the_device_converts_them() {
     let harness = lending("order", EXPERTS, 4, 1, STAGING, Conveying::of(ROUND_RECORDS), TIER, Placer::Tier, false);
-    let steps = harness.group(&[StepRoute::Prompt; 2]);
+    let steps = harness.group(&[StepRoute::Grouped; 2]);
     harness.publish(&steps[0], 0, &[4, 5]);
     harness.publish(&steps[1], 0, &[0, 1]);
     std::thread::sleep(Duration::from_millis(50));
@@ -262,7 +262,7 @@ fn a_conveyor_reads_experts_in_the_order_the_device_converts_them() {
 #[test]
 fn a_groups_requests_of_a_layer_are_served_in_order_once_their_rounds_arrive() {
     let harness = prompted("fronts", EXPERTS, 4);
-    let steps = harness.group(&[StepRoute::Prompt; 2]);
+    let steps = harness.group(&[StepRoute::Grouped; 2]);
     let scratch = &harness.layer.2;
     for expert in 0..EXPERTS {
         harness.load.0.store(expert, i32::from(expert < 2));
@@ -345,7 +345,7 @@ fn a_scratch_request_awaiting_its_arrival_holds_back_no_decode_request() {
 fn a_wavefront_reads_the_next_layers_experts_as_their_records_free() {
     for (name, conveying) in [("wavefront", WHOLE), ("wavefront-five", Conveying::of(5))] {
         let harness = lending(name, EXPERTS, 12, 2, STAGING, conveying, TIER, Placer::Tier, false);
-        let steps = harness.group(&[StepRoute::Prompt; 2]);
+        let steps = harness.group(&[StepRoute::Grouped; 2]);
         harness.publish(&steps[0], 0, &[0, 1]);
         harness.publish(&steps[1], 0, &[1, 3]);
         assert_eq!(harness.from_conveyor(&harness.rounds(&steps[0], 0).concat()), [0, 1]);
@@ -388,7 +388,7 @@ fn a_wavefront_reads_the_next_layers_experts_as_their_records_free() {
 #[test]
 fn a_groups_last_step_seeds_the_most_recent_experts() {
     let harness = prompted("seeds", EXPERTS, 4);
-    let steps = harness.group(&[StepRoute::Prompt; 2]);
+    let steps = harness.group(&[StepRoute::Grouped; 2]);
     let seeds = &harness.load.2;
     harness.scratch(&steps[0], 0, &[6, 7]);
     assert_ne!(seeds.load(constants::LIST_SEQUENCE as usize), low_word(steps[0].sequence()));
@@ -584,7 +584,7 @@ fn a_hit_the_layer_befores_seeding_evicts_is_read() {
         // The refill past the step, which decides what the group finds in
         // the tier.
         harness.tier_ready();
-        let steps = harness.group(&[StepRoute::Prompt; 2]);
+        let steps = harness.group(&[StepRoute::Grouped; 2]);
         harness.publish(&steps[0], 0, &[0, 1]);
         harness.publish(&steps[1], 0, &[0, 1, 2, 3]);
         harness.rounds(&steps[0], 0);
@@ -778,7 +778,7 @@ fn the_one_stores_conveyor_reads_the_next_layer_ahead_of_its_rounds() {
 fn the_one_stores_two_round_conveyor_reads_the_next_layer_ahead() {
     let conveying = Conveying { conveyed: 2 * ROUND_RECORDS, lent: 2 * ROUND_RECORDS as usize, bytes: RECORD };
     let harness = lending("ahead-rounds", EXPERTS, 2 * EXPERTS as u64, 2, STAGING, conveying, 2 * EXPERTS as u32, Placer::Bank, false);
-    let steps = harness.group(&[StepRoute::Prompt; 2]);
+    let steps = harness.group(&[StepRoute::Grouped; 2]);
     harness.publish(&steps[0], 0, &[0, 1]);
     harness.publish(&steps[1], 0, &[0]);
     assert_eq!(harness.from_conveyor(&harness.rounds(&steps[0], 0).concat()), [0, 1]);
@@ -810,7 +810,7 @@ fn the_one_stores_two_round_conveyor_reads_the_next_layer_ahead() {
 }
 
 fn conveys_the_next_layer_ahead(harness: &Harness) {
-    let steps = harness.group(&[StepRoute::Prompt; 2]);
+    let steps = harness.group(&[StepRoute::Grouped; 2]);
     let cold = [0, 1, 2, 3, 4, 5];
     harness.publish(&steps[0], 0, &cold);
     harness.publish(&steps[1], 0, &[0]);
@@ -871,7 +871,7 @@ fn a_whole_banks_prompt_group_reads_nothing_and_claims_no_lent_record() {
     let harness = lending_bank("whole-store", EXPERTS, 2 * EXPERTS as u64, 2, STAGING, conveying, 2 * EXPERTS as u32, Placer::Bank, false, 0, true);
     let whole = (0..2).all(|layer| harness.layers[layer].5.load(constants::POLICY_WHOLE as usize) == 1);
     assert!(whole, "a bank imported whole into the one store is whole");
-    let steps = begin(harness.watcher.shared(), &[StepRoute::Prompt; 2], !whole).unwrap();
+    let steps = begin(harness.watcher.shared(), &[StepRoute::Grouped; 2], !whole).unwrap();
     for step in steps {
         step.complete().unwrap();
     }
@@ -888,7 +888,7 @@ fn a_whole_banks_prompt_group_reads_nothing_and_claims_no_lent_record() {
 #[test]
 fn a_resident_prompt_groups_reads_reach_the_stack() {
     let harness = layered("group-reads", EXPERTS, 12, 2, STAGING);
-    let steps = begin(harness.watcher.shared(), &[StepRoute::Prompt; 2], false).unwrap();
+    let steps = begin(harness.watcher.shared(), &[StepRoute::Grouped; 2], false).unwrap();
     let record = steps[0].group_reads().unwrap();
     assert_eq!(steps[1].group_reads(), Some(record), "one record a group");
     let last = steps[1].sequence();
@@ -919,6 +919,37 @@ fn a_resident_prompt_groups_reads_reach_the_stack() {
     decode.complete().unwrap();
     let read = harness.watcher.shared().telemetry.last_read();
     assert_eq!([read(0, 2), read(1, 5), read(0, 1)], [Some(sequence), Some(sequence), Some(last)]);
+}
+
+/// A generation group in the grouped form (a verify wider than the decode
+/// form) is no prompt group: no prompt runs while it does, its reads rank
+/// the bank as a decode's do, and no layer takes its union as a prompt
+/// group's read, which prices a prompt's places.
+#[test]
+fn a_generation_group_in_the_grouped_form_prices_no_prompt() {
+    let harness = layered("generation-group", EXPERTS, 12, 2, STAGING);
+    let shared = harness.watcher.shared();
+    let steps = begin_as(shared, &[(StepRoute::Grouped, LaunchWork::Generation)], false).unwrap();
+    assert!(!shared.steps.prompt_running(), "a verify is no prompt");
+    let record = steps[0].group_reads().expect("the grouped form records its reads");
+    harness.reads[0].store(record * 2 * EXPERTS + 3, 2);
+    let sequence = steps[0].sequence();
+    for step in steps {
+        step.complete().unwrap();
+    }
+    let read = shared.telemetry.last_read();
+    assert_eq!(read(0, 3), Some(sequence), "its reads rank the bank");
+    drop(read);
+    assert!(!shared.telemetry.group_union(0), "no prompt's union");
+    // A prompt group's reads are its union.
+    let steps = begin(shared, &[StepRoute::Grouped], false).unwrap();
+    assert!(shared.steps.prompt_running());
+    let record = steps[0].group_reads().unwrap();
+    harness.reads[0].store(record * 2 * EXPERTS + 5, 1);
+    for step in steps {
+        step.complete().unwrap();
+    }
+    assert!(shared.telemetry.group_union(0));
 }
 
 /// A prompt group routing every expert of every layer leaves each layer at

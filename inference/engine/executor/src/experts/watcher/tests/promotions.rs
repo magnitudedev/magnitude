@@ -36,7 +36,7 @@ fn a_hit_a_promotion_evicts_during_its_group_is_never_seeded() {
     // A decode step reading 7, begun before the group: its read is ranked
     // once it ends, which every step before it has.
     let seven = harness.request(&[7]);
-    let steps = harness.group(&[StepRoute::Prompt; 2]);
+    let steps = harness.group(&[StepRoute::Grouped; 2]);
     // Step 0 routes 5, a hit: read where the bank holds it.
     harness.publish(&steps[0], 0, &[5]);
     harness.rounds(&steps[0], 0);
