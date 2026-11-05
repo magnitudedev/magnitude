@@ -1364,11 +1364,14 @@ fn routed_scatter[M, H, K, B, T](base: &tensor[M, H] f32,
 # bound); a row's bits are its one-row bits in either form, since a lane
 # reduces the same packets in the same order whatever the rows staged. CPU: the normalized rows staged once as F32;
 # work item (x, y) expands ROWS features of choice y.
+# Defaults SIMDGROUPS 8, LANES 16 (M4 Pro): Qwen3.6 35B's recorded search
+# chose 8 x 16 for its Q4_K and Q5_K experts (at their best; the old 2 x 32
+# default ran 1.38x and 1.89x).
 native routed_gate_up for metal from "metal/routed_gate_up.metal":
     static (H, K, F, GS, US)
     records (expert_gate, expert_up, tier_gate, tier_up)
     launch routed_gate_up:
-        params (SIMDGROUPS in [2, 4, 8, 16] default 2, ROWS in [1, 2, 4] default 1, arithmetic LANES in [32, 16] default 32)
+        params (SIMDGROUPS in [2, 4, 8, 16] default 8, ROWS in [1, 2, 4] default 1, arithmetic LANES in [32, 16] default 16)
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), M * K, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (min(ceil_div(H, 32), 448) * 64)

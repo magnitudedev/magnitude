@@ -1407,11 +1407,15 @@ native attention_decode_k8v4 for cuda from "cuda/attention_decode_k8v4.cu":
 # alignment. MATRIX selects `attention_decode`'s matrix
 # form, history tiles decoded to f16 as they are staged (as
 # `attention_prefill_k8v4`).
+# Defaults KEYWISE 1, SIMDS 2: KEYWISE 0 with SIMDS 4 reaches the RTX 3090's
+# 255-register ceiling and spills (NVIDIA 595), and Qwen3.6 35B's recorded
+# searches chose KEYWISE 1, SIMDS 2 on the RTX 3090 and on GB10, 3x (GB10)
+# and up to 18x (RTX 3090, 3838 tokens) faster than KEYWISE 0, SIMDS 4.
 native attention_decode_k8v4 for vulkan from "vulkan/attention_decode_k8v4.comp":
     static (KV, G, P, S, I, U, F, N, NV, KC, KP, VC, VP, SK)
     params (arithmetic SPAN in [32, 64, 128, 256] default 32, arithmetic PARTS in [16, 8, 32, 64, 128, 256, 512] default 16,
-        arithmetic SIMDS in [4, 8, 1, 2] default 4, arithmetic SLICES in [1, 2, 4, 8] default 1,
-        arithmetic form MATRIX in [0, 1] default 0, arithmetic form KEYWISE in [0, 1] default 0)
+        arithmetic SIMDS in [4, 8, 1, 2] default 2, arithmetic SLICES in [1, 2, 4, 8] default 1,
+        arithmetic form MATRIX in [0, 1] default 0, arithmetic form KEYWISE in [0, 1] default 1)
     where SK <= 1 and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0 and G % SLICES == 0 and SIMDS % SLICES == 0 and (MATRIX == 1 or KEYWISE == 1 or SIMDS >= 4) and (MATRIX == 0 or KEYWISE == 0) and (MATRIX == 1 or SIMDS * (G / SLICES) * 8 + (1 - KEYWISE) * max(SIMDS, ceil_div(G, 2)) * (2 * P + S) * 4 + KEYWISE * max(SIMDS * (2 * P + S) * 4, 32 + G * (2 * P + S) * 4 + SIMDS * (G / SLICES) * 128 + G * (2 * P + S) / 8 + SIMDS * 512 * (max(min((2 * P + S), 128) / 16, (2 * P + S) / 32 + ceil_div((2 * P + S), 128)) + 1)) <= 32768) and (MATRIX == 0 or (SLICES == 1 and SPAN == 32 and G <= SIMDS * 16 and ((2 * P + S) <= 64 or (2 * P + S) % 64 == 0) and ((2 * P + S) <= 256 or (2 * P + S) % 256 == 0) and 64 * (min((2 * P + S), 256) + 8) + SIMDS * 2048 + SIMDS * 16 * ((2 * P + S) + 8) * 2 <= 32768))
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * G * PARTS * 8)
